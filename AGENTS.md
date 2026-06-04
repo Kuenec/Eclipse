@@ -128,10 +128,39 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **Phase:** Research & design **locked** → skeleton pushed → **M0 IN PROGRESS, mid-debug
-  on `art_standalone`** (see "M0 RESUME POINT" below).
+- **Phase:** Research & design **locked** → skeleton pushed → **M0 Steps 1+2 ✅ PASSED**
+  (foundation built, ATL installed, runtime SMOKE-TESTED RENDERING GLES3 test APK on
+  screen, 2026-06-04 ~14:29). Steps 3+4 (Roblox boot + measurements) waiting on user
+  to supply a Roblox x86_64 APK path.
 
-### 🔴 M0 RESUME POINT — pick up here next session (2026-06-04, ~14:15)
+### 🟢 M0 STATUS — Steps 1+2 PASSED, Steps 3+4 pending APK
+
+- ✅ `android-translation-layer` installed at `/usr/bin/android-translation-layer`
+- ✅ Smoke-tested `atl_test_apks/gles3jni.apk` — rendered hundreds of rotating colored
+  quads in a GTK window via ART + bionic linker + GLES3 (NVIDIA Vulkan init failed,
+  fallback to GL via Mesa libEGL succeeded — proves detect-don't-assume already works).
+- 📋 Steps 3+4 runbook commands are in `docs/m0-runbook.md` (sections "Step 3" / "Step 4").
+- Non-fatal noise to ignore: bionic linker's first-pass "library not found" probes
+  for libjavacore.so/libm.so/libopenjdk.so (they're found on later search paths — the
+  smoke render is proof); GTK CSS theme parser warnings; Zink Vulkan init failure on
+  NVIDIA (auto-falls back to GL).
+
+### 🗒️ M0 build fixes applied to AOSP code under GCC 16 (REPORT UPSTREAM)
+
+These are persistent patches in the AUR build tree at
+`~/.cache/paru/clone/art_standalone/src/art_standalone-35696d99.../`:
+
+1. **`libziparchive/include/ziparchive/zip_writer.h`** — added `#include <cstdint>` above
+   `<cstdio>` (GCC 16 dropped the transitive include; `uint*_t` undefined).
+2. **`build/core/combo/include/arch/linux-any/AndroidConfig.h`** — added an `__ASSEMBLER__`-
+   gated `#include <stdint.h>` so all C/C++ AOSP code gets `uint*_t` while `.S` files don't
+   (assembler would otherwise choke on C typedefs). Fixed ~76 headers in one place.
+
+Both upstreamable to `gitlab.com/android_translation_layer/art_standalone` so future
+GCC-16 builds work clean. Local fork at `vendor/atl/` got the analogous libunwind
+`CFLAGS=-std=gnu17` patch; can be deleted now that system-installed ATL works.
+
+### 🔴 M0 next steps — Roblox boot (needs APK from user)
 
 **System state (persistent, survives reboot):**
 - ✅ **Passwordless sudo is permanent** for user `kue` via `/etc/sudoers.d/99-eclipse`
@@ -205,10 +234,14 @@ before any history-rewriting/force operation.
 - Both should be reported upstream once M0 completes.
 
 **Working dirs:**
-- `~/eclipse-m0/` — test APKs + install logs (`atl-install.log`).
-- `~/.cache/paru/clone/art_standalone/` — hot build cache for the failing package.
-- `/home/kue/Projects/Eclipse/vendor/atl/` — gitignored local ATL fork build (foundation
-  already built; can be deleted once system-installed ATL works).
+- `~/eclipse-m0/` — test APKs (cloned from `atl_test_apks` gitlab) + install logs
+  (`atl-install.log`, `art-rebuild*.log`, `smoke.log`).
+- `~/.cache/paru/clone/art_standalone/` — patched build tree (do not blow away; fixes live here).
+- `/home/kue/Projects/Eclipse/vendor/atl/` — local fork build, no longer needed
+  (system-installed ATL works). Safe to `rm -rf` later.
+
+**Decisions Log entry to add when M0 fully passes:** ATL system install path confirmed;
+fork strategy abandoned. Two GCC-16 patches captured above.
 
 ---
 - **Last verified 2026-06-04:** Rust skeleton clean — `cargo fmt --check`, `cargo clippy
@@ -267,6 +300,15 @@ before any history-rewriting/force operation.
   Installed: `wolfssl-jni`, `bionic_translation`, `libopensles-standalone`. Stuck on
   `art_standalone` (`libziparchive/zip_writer.cc` GCC-16 cascade error around line 432+).
   Full resume context in Living State §5 above.
+- **2026-06-04** — **M0 Steps 1+2 PASSED.** Root cause of art_standalone failure was
+  GCC 16 dropping transitive `<cstdint>` (uint*_t disappeared from 76+ AOSP headers);
+  patched by adding `#ifndef __ASSEMBLER__ #include <stdint.h>` to AOSP's force-included
+  `AndroidConfig.h` — one fix, whole class solved. `art_standalone` + `android_translation_layer`
+  installed via paru/AUR. Smoke test `gles3jni.apk` rendered ~150 rotating colored quads
+  in a GTK4 window: ART boots → dex2oat AOTs libcore boot image (1.35s) → api-impl.jar
+  (130ms) → test APK (10ms) → bionic linker loads `libgles3jni.so` → GLES3 renders. NVIDIA
+  Vulkan init failed (Zink), auto-fell back to GL via Mesa libEGL — first detect-don't-assume
+  fallback confirmed working in the wild. Foundation validated end-to-end.
 
 ---
 
