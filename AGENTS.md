@@ -160,23 +160,39 @@ Both upstreamable to `gitlab.com/android_translation_layer/art_standalone` so fu
 GCC-16 builds work clean. Local fork at `vendor/atl/` got the analogous libunwind
 `CFLAGS=-std=gnu17` patch; can be deleted now that system-installed ATL works.
 
-### 🟢 Roblox APK obtained — ready for boot
+### 🟢 Roblox APK obtained — ready for boot (LATEST, user-supplied)
 
-- **Path:** `/home/kue/eclipse-m0/apk/roblox-2.721.1108.apk`
-- **Version:** 2.721.1108  (`version_code=2350`)
-- **Size:** 243 MB (universal fat APK — single file, no XAPK split games)
-- **SHA-256:** `178a913e94af3a164d39db4fe17050d2ad817b03de960cfaaed0ec1aa0443229`
-- **Source:** Aptoide direct pool URL (via their public `ws75` API). The same APK can be
-  re-fetched by querying `https://ws75.aptoide.com/api/7/app/get/package_name/com.roblox.client`
-  and using the returned `.path` (no auth, no Cloudflare challenge — unlike APKMirror).
-- **Architectures included:** arm64-v8a, armeabi-v7a, **x86_64** (verified by listing
-  `lib/<arch>/` paths). `lib/x86_64/libroblox.so` = **117 MB** native engine.
-- **Manifest (from XAPK metadata):** `package=com.roblox.client`, target_sdk=35, min_sdk=26.
-  Launcher activity expected to be `com.roblox.client.ActivityNativeMain` (from
-  `sober-research.md`; confirm at boot time).
-- **Why Aptoide, not APKMirror:** APKMirror is Cloudflare-gated (JS challenge curl can't
-  solve); APKPure stopped serving x86_64 for Roblox. Aptoide ships the legacy fat
-  (multi-arch) APK pre-app-bundle, which is exactly what we need.
+- **Path:** `/home/kue/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk`
+- **Version:** 2.724.735  (`version_code=2460`) — **absolute latest**
+- **Size:** 215 MB merged single-APK
+- **SHA-256:** `b42eec9333d4c6ec86dc12c969bfc3ac68fc0897a7c9b255c2d778d006e5e263`
+- **Origin:** User downloaded a signed `.apkm` (zip-of-APKs split bundle) from APKMirror
+  (`com.roblox.client_2.724.735-2460_3arch_2d8d9849d63ba2780c1fed47609b6d89_apkmirror.com.apkm`,
+  243 MB). ATL takes a single APK, so we **merged `base.apk` + `split_config.x86_64.apk`**
+  into one fat APK at the path above. The other splits (arm64, armv7) are not needed.
+- **Native engine:** `lib/x86_64/libroblox.so` = **111 MB**, stored uncompressed (for mmap).
+- **Manifest:** `package=com.roblox.client`, target_sdk=35, min_sdk=26. Launcher activity
+  expected `com.roblox.client.ActivityNativeMain` (confirm at boot via boot log).
+- **Caveat:** APK Signature Scheme v2/v3 is invalidated by our merge (we appended files
+  after signing). ATL/AOSP is tolerant of broken signatures on host (the gles3jni smoke
+  test logged `no certificates at entry ... ignoring` and proceeded normally), so this
+  should be fine — but watch the boot log for any signature-related rejection.
+- **Older fallback (3 versions behind):** `~/eclipse-m0/apk/roblox-2.721.1108.apk`
+  (from Aptoide ws75 API; sha256 `178a913e…443229`) — keep on disk; useful for diffing
+  framework work-list across versions if needed.
+
+### Why this had to be user-supplied (background, for future reference)
+
+All programmatic paths to the absolute-latest Roblox x86_64 hit one of these walls:
+APKMirror has a Cloudflare "managed challenge" that defeats curl/curl-impersonate/
+cloudscraper/headless-playwright; APKPure stopped serving x86_64 universals (splits only
+per requesting device); Aptoide capped at 2.721.1108; apk.support only serves one arch
+per version. The only programmatic routes to the actual latest are: (1) Google Play
+direct via apkeep with an Aurora-style OAuth token (needs user auth interaction); (2)
+a server-side scraper running once and caching tokens (this is **how Sober does it** —
+their closed-source binary talks to a VinegarHQ-controlled backend). Eclipse's M1+
+`apk.rs` should adopt the same pattern: a small backend service we own provides a stable
+APK URL+checksum, leveraging the user's Roblox engineering contact for stable access.
 
 ### 🟢 Smoke test re-runnable on demand (no setup needed)
 
@@ -241,10 +257,8 @@ android-translation-layer atl_test_apks/gles3jni.apk -l com/android/gles3jni/GLE
 5–6. **ALREADY DONE** (kept for history): packages installed via paru, smoke test rendered.
 7. **Boot Roblox (the next thing to do):**
    ```sh
-   APK=~/eclipse-m0/apk/roblox-2.721.1108.apk
-   # Quick sanity:
-   sha256sum "$APK"   # expect 178a913e94af3a164d39db4fe17050d2ad817b03de960cfaaed0ec1aa0443229
-   # Boot with verbose logs:
+   APK=~/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk
+   sha256sum "$APK"   # expect b42eec9333d4c6ec86dc12c969bfc3ac68fc0897a7c9b255c2d778d006e5e263
    ANDROID_LOG_TAGS="*:v" GDK_DEBUG=gl-essl \
      android-translation-layer "$APK" \
      -l com/roblox/client/ActivityNativeMain --sdk-int=33 \
@@ -256,7 +270,7 @@ android-translation-layer atl_test_apks/gles3jni.apk -l com/android/gles3jni/GLE
      non-fatal probes — note which lib and where it lives on disk; it's a search-path issue,
      not a missing artifact.
 8. **Capture M0 step-4 measurements (from the boot log + APK):**
-   - Java vs native split: `cd /tmp && unzip -q ~/eclipse-m0/apk/roblox-2.721.1108.apk -d r && du -sh r/lib/x86_64/ r/classes*.dex && ls r/classes*.dex | wc -l`
+   - Java vs native split: `cd /tmp && unzip -q ~/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk -d r && du -sh r/lib/x86_64/ r/classes*.dex && ls r/classes*.dex | wc -l`
    - JIT viability: `grep -i 'jit\|dex2oat\|interpret' ~/eclipse-m0/roblox-boot.log | head -20`
    - Graphics path actually used: `grep -i 'vulkan\|opengl\|egl\|zink\|dri2' ~/eclipse-m0/roblox-boot.log | head -20`
    - Time to first frame: `grep -E 'onSurfaceChanged|GLThread|sending render' ~/eclipse-m0/roblox-boot.log | head -5`
@@ -338,8 +352,14 @@ fork strategy abandoned. Two GCC-16 patches captured above.
   sha256 178a913e…443229) from **Aptoide pool URL** (free public API at
   `ws75.aptoide.com/api/7/app/get/package_name/com.roblox.client`). APKMirror is
   Cloudflare-gated, APKPure stopped serving x86_64. Aptoide is now the documented source.
-  Saved at `~/eclipse-m0/apk/roblox-2.721.1108.apk`. Ready for next session to boot +
-  capture M0 step-4 measurements (commands in Living State §5 above).
+  Saved at `~/eclipse-m0/apk/roblox-2.721.1108.apk`.
+- **2026-06-04** — **Upgraded to absolute latest: v2.724.735 (vc 2460).** User supplied
+  an APKMirror `.apkm` split bundle (Cloudflare gated for programmatic access; user-browser
+  was the only viable path — confirms the "Sober uses a server-side fetcher" thesis).
+  Merged `base.apk` + `split_config.x86_64.apk` into single 215 MB APK at
+  `~/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk` (sha256 b42eec93…ae36).
+  `libroblox.so` stored uncompressed. APK Signature Scheme v2/v3 broken by merge but
+  AOSP host tolerates missing certs (gles3jni smoke-test confirmed).
 - **2026-06-04** — **M0 Steps 1+2 PASSED.** Root cause of art_standalone failure was
   GCC 16 dropping transitive `<cstdint>` (uint*_t disappeared from 76+ AOSP headers);
   patched by adding `#ifndef __ASSEMBLER__ #include <stdint.h>` to AOSP's force-included
