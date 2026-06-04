@@ -128,27 +128,31 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **Phase:** Research & design **complete and locked** → compiling skeleton in place →
-  **next: M0** (manual foundation validation, `docs/m0-runbook.md`).
-- **Last verified:** **2026-06-04** — `cargo build`, `cargo run -- help/--version`, and
-  `cargo test` all pass; **0 warnings**. (Re-verify clippy/fmt/release per §4 and record.)
-- **Repo state:** not a git repo yet (not initialized — awaiting user go-ahead).
-- **What exists:**
-  - Docs: `sober-research`, `component-map` (authoritative), `tech-selection`,
-    `art-and-runtime`, `dependency-plan`, `m0-runbook`, plus `README.md`.
-  - Code: `eclipse` crate skeleton — `main.rs` (placeholder CLI) + `lib.rs` + 10 documented
-    subsystem stubs (`config, apk, bionic, runtime, framework, graphics, audio, input,
-    services, diagnostics`). **No external deps yet** (compiles with just rustc).
-  - `Cargo.toml` has the `[lints]` + optimized `[profile.release]` enforcing §2.
-- **Open items:**
-  - License: `TBD` (deferred by user). Influenced by GPLv3 ATL reuse vs replacement.
-  - M0 not yet run (needs a Linux box, the ATL build, and a user-supplied Roblox APK).
-  - Real dependencies not yet wired (added per-subsystem during M1+).
+- **Phase:** Research & design **locked** → skeleton pushed → **M0 partially executed**
+  (C foundation builds; final stage + Roblox boot blocked — see below).
+- **Last verified 2026-06-04:** Rust skeleton clean — `cargo fmt --check`, `cargo clippy
+  --all-targets --all-features -- -D warnings`, `cargo test`, `cargo build --release` (0 warnings).
+- **Repo:** git initialized; committed & pushed to `origin/main`
+  (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
+- **M0 results (2026-06-04, this dev box, NO sudo):**
+  - ✅ Cloned ATL fork → `vendor/atl` (gitignored; bundled `thirdparty/` incl. 276M `art_standalone`).
+  - ✅ Built the C foundation: **wolfSSL → libunwind → bionic_translation** → `build/lib/lib*_bio.so`
+    (the bionic→glibc shim + apkenv-derived linker — our #1 Rust-port reference, now local).
+  - 🔧 Fix: bundled **libunwind breaks under GCC 16** (C23 empty-paren) → built with
+    `CFLAGS=-std=gnu17`. Documented in `docs/m0-runbook.md`; report upstream.
+  - ⛔ Need **sudo** (absent here): `libwebkitgtk-6.0-dev`, `libopenxr-dev` (final ATL link);
+    `openjdk-21-jdk ant aapt` (`art_standalone`).
+  - ⛔ Need from user: a **Roblox x86_64 APK** for the boot + the four measurements.
+- **What exists:** 7 docs + `README` + `eclipse` skeleton (`main.rs` + `lib.rs` + 10 stub
+  modules, no external deps) + enforcing `[lints]`/`[profile.release]`.
+- **Open items:** license `TBD`; M0 final stage + boot pending (sudo box + APK); real deps unwired.
 - **Next actions (pick up here):**
-  1. Run **M0** (`docs/m0-runbook.md`) to validate the foundation, **or**
-  2. Start **M1**: implement `diagnostics` (tracing), `config` (serde), `apk` (fetch/verify),
-     and `runtime` (ART boot → `onCreate`), wiring the first real deps from `dependency-plan.md`.
-  3. (If user asks) `git init` + first commit.
+  1. **Finish M0 on a sudo-capable Linux box:** `apt install` the missing `-dev` packages
+     (see `docs/m0-runbook.md`), `cmake --build build`, then
+     `./run-atl.sh <roblox>.apk -l com/roblox/client/ActivityNativeMain` → capture
+     log/screenshots/`framework-worklist.txt`/measurements.
+  2. Or start **M1** Rust now against the built foundation: `diagnostics` (tracing),
+     `config` (serde), `apk` (fetch/verify), `runtime` (ART boot → `onCreate`).
 
 ---
 
@@ -172,6 +176,10 @@ before any history-rewriting/force operation.
   conformance suite (do it **last**, not first — highest risk).
 - **2026-06-04** — Strategic/external risk (Roblox blocking, open-source detection) is **not
   a concern** — user has a Roblox-engineer relationship. No open technical levers remain.
+- **2026-06-04** — Repo live at <https://github.com/Kuenec/Eclipse> (push as Kuenec, no
+  co-author). **M0 partially executed:** built wolfSSL + libunwind (patched for GCC-16/C23)
+  + **bionic_translation**; `art_standalone`/final-ATL/Roblox-boot blocked by no-sudo
+  (webkitgtk/openxr/jdk) and no APK. Foundation validated as buildable.
 
 ---
 

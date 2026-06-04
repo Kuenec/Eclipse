@@ -137,3 +137,31 @@ screen? join an experience? render the 3D world? Capture screenshots + the full 
 - The confirmed launcher activity + `--sdk-int` + graphics path that worked.
 
 These become the fixtures and the work backlog for the Rust layer.
+
+---
+
+## M0 progress log — 2026-06-04 (partial; performed by the assistant)
+
+Environment: dev box, **no `sudo`**. Present: cmake 4.3, ninja, meson, gcc 16, clang 22, and
+dev headers for gtk4, vulkan, wayland, gl/egl, alsa, sqlite3, libdrm, libportal, ffmpeg,
+gudev, fontconfig. **Missing:** `javac`/JDK, `ant`, `aapt`, `libwebkitgtk-6.0-dev`,
+`libopenxr-dev`.
+
+**Done:** cloned the ATL fork to `vendor/atl` (bundled `thirdparty/` sources present, incl.
+the 276M `art_standalone`). Built the C foundation:
+**wolfSSL ✅ → libunwind ✅ → bionic_translation ✅** → outputs
+`build/lib/lib{c,dl,pthread,stdc++}_bio.so` (the bionic→glibc shim + apkenv-derived dynamic
+linker — our #1 Rust-port reference, now available locally).
+
+**Known build issue + fix (report upstream):** the bundled **libunwind** fails under
+**GCC 16** — `too many arguments to function 'func'` — because GCC's C23 default treats
+`int func()` as zero-arg. Fix: configure libunwind with **`CFLAGS=-std=gnu17`** (patched into
+`vendor/atl/CMakeLists.txt`). Newer AOSP `art_standalone` C/C++ may need analogous std pins.
+
+**Blocked here (need a sudo-capable box):** `art_standalone` needs `openjdk-21-jdk ant aapt`;
+the final `android_translation_layer` link needs `libwebkitgtk-6.0-dev libopenxr-dev`. The
+**boot test also needs a Roblox x86_64 APK** (user-supplied).
+
+**To finish on a proper box:** install the missing packages (Prerequisites above), then
+`cmake --build build` (or per-target `art_standalone` then `android_translation_layer`), then
+run Step 3 with the Roblox APK and capture the Step 4 measurements.
