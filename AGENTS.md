@@ -128,8 +128,89 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **Phase:** Research & design **locked** → skeleton pushed → **M0 partially executed**
-  (C foundation builds; final stage + Roblox boot blocked — see below).
+- **Phase:** Research & design **locked** → skeleton pushed → **M0 IN PROGRESS, mid-debug
+  on `art_standalone`** (see "M0 RESUME POINT" below).
+
+### 🔴 M0 RESUME POINT — pick up here next session (2026-06-04, ~14:15)
+
+**System state (persistent, survives reboot):**
+- ✅ **Passwordless sudo is permanent** for user `kue` via `/etc/sudoers.d/99-eclipse`
+  (had to be `99-*` not `00-*` so it sorts after `/etc/sudoers.d/10-installer`'s wheel
+  rule and wins last-match). `sudo -n true` works from any shell.
+- ✅ **Java 8 selected as default** via `archlinux-java set java-8-openjdk` (was java-26;
+  AOSP-era `art_standalone` needs `javac 1.8`). Switch back later with
+  `sudo archlinux-java set java-26-openjdk` once builds are done.
+- ✅ **Installed packages:** `wolfssl-jni 5.9.1-1`, `bionic_translation r107.026ea254-1`,
+  `libopensles-standalone r281.bdb857a-1`, plus repo deps (`jdk8-openjdk`, `openxr`,
+  `webkitgtk-6.0`, etc.). Confirm with `pacman -Q wolfssl-jni bionic_translation
+  libopensles-standalone`.
+- ❌ **Not installed:** `art_standalone`, `android_translation_layer` (depends on
+  art_standalone).
+
+**The active blocker — `art_standalone` build error:**
+- AUR pkg: `aur/art_standalone r213.35696d99-2` (snapshot commit `35696d99`).
+- Fails compiling **`libziparchive/zip_writer.cc`** under **GCC 16.1.1** with errors like
+  `struct ZipWriter::FileEntry has no member named 'compressed_size'` and `buffer_ was
+  not declared in this scope` at lines **440, 451, 456, 473, 486, 487, 528–533**.
+- **NOT a real header mismatch:** the bundled header
+  `libziparchive/include/ziparchive/zip_writer.h` *does* declare `buffer_` (line 192) and
+  the full `FileEntry` struct (lines 79–89, incl. all the named members). Earlier uses of
+  the same names in the *same* `.cc` (lines 95, 345, etc.) compile fine. So the failure is
+  a localized GCC-16/C++ standards issue starting around line 432–445 that **cascades**
+  into the "no member" / "not declared" noise after it. Likely an earlier syntax/type
+  error makes GCC drop into recovery mode where every subsequent symbol looks undeclared.
+- Build cache is hot — most of ART + libcore already compiled — so patching and resuming
+  `make` is cheap; don't `--clean`.
+
+**Resume steps (do these in order next session):**
+1. Verify resume context still holds:
+   ```sh
+   sudo -n true && echo OK            # passwordless sudo
+   archlinux-java status               # should show java-8-openjdk (default)
+   pacman -Q wolfssl-jni bionic_translation libopensles-standalone
+   ```
+2. Read the failing region (lines ~428–500 of zip_writer.cc); identify the **first** real
+   error (not the cascade), likely a type/initializer mismatch GCC 16 now rejects.
+3. Patch the bundled source in
+   `~/.cache/paru/clone/art_standalone/src/art_standalone-35696d993a60434622f44b68ab4d882836683a73/libziparchive/zip_writer.cc`
+   (and matching `.h` if needed). Apply the **minimum** fix per CLAUDE.md (root-cause, no
+   workarounds). Candidates to investigate first: the `std::vector<uint32_t>` brace-init at
+   line 485–487 (GCC 16 may now reject the narrowing/cast from `uint16_t crc32` member),
+   or a missing `<cstdint>`/`<vector>` include after a libstdc++ header reshuffle.
+4. Resume the build from the paru clone (no re-download):
+   ```sh
+   cd ~/.cache/paru/clone/art_standalone
+   makepkg -ef --noconfirm --nocheck     # -e = no extract, reuse patched src; -f = force
+   sudo pacman -U *.pkg.tar.zst
+   ```
+5. Then install ATL itself:
+   ```sh
+   paru -S --needed --skipreview --noconfirm --nocheck android_translation_layer
+   command -v android-translation-layer
+   ```
+6. Smoke test (no Roblox needed for this step):
+   ```sh
+   cd ~/eclipse-m0   # already has atl_test_apks/ cloned
+   android-translation-layer atl_test_apks/gles3jni.apk -l com/android/gles3jni/GLES3JNIActivity
+   ```
+7. Roblox boot — needs an **x86_64 Roblox APK** from the user (path TBD):
+   ```sh
+   ANDROID_LOG_TAGS="*:v" GDK_DEBUG=gl-essl android-translation-layer /path/to/roblox.apk \
+       -l com/roblox/client/ActivityNativeMain --sdk-int=33 2>&1 | tee ~/eclipse-m0/roblox-boot.log
+   ```
+
+**Earlier fixes already applied (don't redo):**
+- libunwind in our local `vendor/atl` clone patched with `CFLAGS=-std=gnu17` for GCC 16.
+- `wolfssl-jni` ChaCha self-test failure under znver4 → bypassed with `--nocheck`.
+- Both should be reported upstream once M0 completes.
+
+**Working dirs:**
+- `~/eclipse-m0/` — test APKs + install logs (`atl-install.log`).
+- `~/.cache/paru/clone/art_standalone/` — hot build cache for the failing package.
+- `/home/kue/Projects/Eclipse/vendor/atl/` — gitignored local ATL fork build (foundation
+  already built; can be deleted once system-installed ATL works).
+
+---
 - **Last verified 2026-06-04:** Rust skeleton clean — `cargo fmt --check`, `cargo clippy
   --all-targets --all-features -- -D warnings`, `cargo test`, `cargo build --release` (0 warnings).
 - **Repo:** git initialized; committed & pushed to `origin/main`
@@ -180,6 +261,12 @@ before any history-rewriting/force operation.
   co-author). **M0 partially executed:** built wolfSSL + libunwind (patched for GCC-16/C23)
   + **bionic_translation**; `art_standalone`/final-ATL/Roblox-boot blocked by no-sudo
   (webkitgtk/openxr/jdk) and no APK. Foundation validated as buildable.
+- **2026-06-04** — Switched M0 strategy from local-fork build → **AUR upstream install**
+  on CachyOS. Set up **permanent passwordless sudo** (`/etc/sudoers.d/99-eclipse`, must
+  sort after `10-installer`'s wheel rule). Selected Java 8 (`archlinux-java`).
+  Installed: `wolfssl-jni`, `bionic_translation`, `libopensles-standalone`. Stuck on
+  `art_standalone` (`libziparchive/zip_writer.cc` GCC-16 cascade error around line 432+).
+  Full resume context in Living State §5 above.
 
 ---
 
