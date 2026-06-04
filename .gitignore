@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Vendored runtime build artifacts (ART/ATL — large, built/pinned in CI, never committed)
+/vendor/
+/build/
+
+# Roblox APKs must never be committed (we do not redistribute Roblox)
+*.apk
+*.apks
+*.xapk
+
+# M0 / diagnostic outputs
+*.log
+/m0-artifacts/
+framework-worklist.txt
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
