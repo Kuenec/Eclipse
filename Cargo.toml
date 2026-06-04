@@ -1,8 +1,9 @@
-# Eclipse — buildable skeleton manifest.
+# Eclipse — crate manifest.
 #
-# Intentionally has NO external dependencies yet: the scaffold compiles anywhere with just
-# rustc, and we don't pull unverified crate versions or system libs (vulkan/pulse/gtk dev
-# headers, the vendored ART) until the subsystem that needs them is actually built.
+# Deps are added per subsystem, only when that subsystem is actually built — we don't pull
+# unverified crate versions or system libs (vulkan/pulse/gtk dev headers, the vendored ART)
+# ahead of need. M1 has wired the launcher foundation (diagnostics + config); the remaining
+# subsystems (apk, runtime, graphics, audio, …) are still dependency-free stubs.
 #
 # The full, annotated dependency PLAN (what each subsystem will use, and why) lives in
 # docs/dependency-plan.md. Add deps to this file only when wiring up the subsystem, after
@@ -20,7 +21,13 @@ license = "TBD"            # deferred per project decision
 publish = false
 
 [dependencies]
-# (none yet — see docs/dependency-plan.md)
+# --- Launcher foundation: diagnostics + config (M1) -----------------------------
+tracing = "0.1"                                                     # structured diagnostics facade
+tracing-subscriber = { version = "0.3", features = ["env-filter"] } # RUST_LOG-driven subscriber
+serde = { version = "1", features = ["derive"] }                    # config.json (mirror Sober schema)
+serde_json = "1"                                                    # config.json (de)serialization
+directories = "6"                                                   # portable XDG dirs (no hardcoded paths)
+# Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.
 
 # Enforce the project requirements (see AGENTS.md). CI/local gate before any commit:
 #   cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test

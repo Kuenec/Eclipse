@@ -128,11 +128,11 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **Phase:** Research & design **locked** → skeleton pushed → **M0 Steps 1+2 ✅ PASSED**
-  (foundation built, ATL installed, runtime SMOKE-TESTED RENDERING GLES3 test APK on
-  screen, 2026-06-04 ~14:29). **Step 3 IN PROGRESS** — Roblox APK boots into ART, clears
-  the heap-size blocker via `-XX:DisableHSpaceCompactForOOM`, then hits a deeper
-  **low_4gb-window exhaustion** blocker in ART's `LargeObjectMapSpace`.
+- **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
+  (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
+  asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
+  PROGRESS** — launcher foundation built: `diagnostics` (tracing) + `config` (serde/JSON)
+  done & gated (2026-06-04). Next M1 crates: `apk`, then `runtime`.
 
 ### 🟡 M0 STATUS — Steps 1+2 PASSED, Step 3 in progress (low_4gb blocker)
 
@@ -355,20 +355,40 @@ android-translation-layer atl_test_apks/gles3jni.apk -l com/android/gles3jni/GLE
   MessageQueue — before hitting low_4gb exhaustion in ATL's GTK4 layer. ART and
   libroblox.so are confirmed bootable. The GTK4 low_4gb crowding is an ATL issue
   that Eclipse's `winit` design avoids by construction (see Step 3.5 analysis above).
-- Step 4 measurements can be extracted from `roblox-boot-nodiscard.log` (13.8k lines):
+**Step 4 measurements — RESULTS (measured 2026-06-04 from the APK + boot log):**
 
+- **Java vs native split:** native `lib/x86_64/` ≈ **119 MB** (of which `libroblox.so` =
+  **111 MB**, 93% of native), dex = **19 MB** across **3** files (`classes.dex` 8.8 MB,
+  `classes2.dex` 7.1 MB, `classes3.dex` 3.4 MB). Engine is ~**86% native by size** →
+  confirms ART sits off the gameplay hot path, exactly as the architecture assumes.
+- **JIT / dex2oat:** AOT path works — ATL runs `dex2oat` to compile the libcore boot image
+  + framework jars. ⚠️ It invokes dex2oat with
+  `--instruction-set-features=-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-popcnt` — a *conservative
+  baseline ISA* (no SSE4.1/4.2/AVX in generated code). Sober requires SSE4.1+SSE4.2 at the
+  CPU level (`docs/sober-research.md` §5.3); **Eclipse's `runtime` crate should detect the
+  host ISA and pass the real `--instruction-set-features` for better codegen perf** (perf
+  priority — see §6 Vulkan/perf decision). Detect-don't-assume applies here too.
+- **Graphics path:** ⚠️ **not reached in the Roblox boot** — it dies at low_4gb during
+  `AssetManager.extractFromAPK → ZipFile.<init>` (asset loading), *before* graphics init.
+  The graphics evidence is in `smoke.log` (gles3jni): NVIDIA Vulkan/Zink failed
+  (`ZINK: vkEnumeratePhysicalDevices failed`) → fell back to GL/EGL via Mesa →
+  `onSurfaceChanged(960, 494)` real surface. Confirms the detect→fallback path works; does
+  **not** prove native Vulkan — that was a Zink/loader quirk to re-verify with `ash` in M-graphics.
+- **Framework work-list:** ⚠️ **cannot be harvested yet.** The boot dies during asset/ZIP
+  loading, before Roblox's Java shell loads far enough to surface missing framework
+  classes/methods (`framework-worklist.txt` came back **empty**). This deferred data must
+  wait until M1's `winit`-based `runtime` boots past the low_4gb wall. Not a regression —
+  the boot simply doesn't reach that stage under ATL/GTK4.
+
+Re-derive any of the above with (kept for reference):
 ```sh
-# Java vs native split
-cd /tmp && unzip -q ~/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk -d r \
-  && du -sh r/lib/x86_64/ r/classes*.dex && ls r/classes*.dex | wc -l
-
-# JIT / dex2oat path
-grep -i 'jit\|dex2oat\|interpret' ~/eclipse-m0/roblox-boot-nodiscard.log | head -20
-
-# Graphics path
-grep -i 'vulkan\|opengl\|egl\|zink\|dri2' ~/eclipse-m0/roblox-boot-nodiscard.log | head -20
-
-# Framework work-list (missing classes/methods Roblox calls that we'll need stubs for)
+# Java vs native split (no extraction needed — read the central directory)
+APK=~/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk
+unzip -l "$APK" | grep -E 'lib/x86_64/|classes.*\.dex'
+# JIT / dex2oat path · graphics path
+grep -iE 'jit|dex2oat|interpret' ~/eclipse-m0/roblox-boot-nodiscard.log | head
+grep -iE 'vulkan|opengl|egl|zink|dri' ~/eclipse-m0/smoke.log | head
+# Framework work-list (empty until the boot reaches Roblox's Java shell under winit)
 grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementation' \
   ~/eclipse-m0/roblox-boot-nodiscard.log | sort -u > ~/eclipse-m0/framework-worklist.txt
 ```
@@ -386,20 +406,33 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 - `/home/kue/Projects/Eclipse/vendor/atl/` — local fork build, no longer needed. Safe to `rm -rf` later.
 
 ---
-- **Last verified 2026-06-04:** Rust skeleton clean — `cargo fmt --check`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test`, `cargo build --release` (0 warnings).
+- **Last verified 2026-06-04:** full gate clean with the M1 foundation wired —
+  `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy --all-targets
+  --all-features -- -D warnings`, `cargo test` (6 pass), `cargo build --release`
+  (0 warnings). Binary smoke-tested: `eclipse --version`, `eclipse config` (prints resolved
+  `~/.config/eclipse/config.json` + effective config; partial on-disk file merges over
+  defaults), `RUST_LOG=debug` toggles the startup trace line.
 - **Repo:** git initialized; committed & pushed to `origin/main`
   (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
-- **What exists:** 7 docs + `README` + `eclipse` skeleton (`main.rs` + `lib.rs` + 10 stub
-  modules, no external deps) + enforcing `[lints]`/`[profile.release]`.
-- **Open items:** license `TBD`; M1 Rust implementation.
-- **Next actions (pick up here — M1 Rust):**
-  1. Extract Step 4 measurements from `roblox-boot-nodiscard.log` (commands above).
-  2. Start M1 Rust crates in order: `diagnostics` (tracing subscriber), `config`
-     (serde + TOML), `apk` (fetch/verify Roblox APK), `runtime` (ART boot → `onCreate`).
-  3. The `runtime` crate's ART launcher should use `winit` (not GTK4) for the window,
-     which naturally avoids the low_4gb crowding ATL/GTK4 hits. This is the architectural
-     fix for Step 3.5 — no ART patches needed, Eclipse's design just works.
+- **What exists:** 7 docs + `README` + `eclipse` crate. **M1 foundation done:**
+  `diagnostics` (tracing + tracing-subscriber, `RUST_LOG`→`info` default, idempotent
+  `init`) and `config` (serde/serde_json + `directories`; full Sober schema mirrored with
+  typed enums, `#[serde(default)]` partial-file tolerance, typed no-panic `ConfigError`).
+  `eclipse config` is live. The other 8 modules are still dependency-free stubs.
+- **Deps wired (M1):** `tracing 0.1`, `tracing-subscriber 0.3` (env-filter), `serde 1`,
+  `serde_json 1`, `directories 6`. Cargo.lock committed. (`clap`/`rustix` deferred until
+  the CLI grows — manual arg dispatch is enough for now.)
+- **Open items:** license `TBD`; M1 `apk` + `runtime` crates.
+- **Next actions (pick up here — M1 Rust, continue the order):**
+  1. `apk` crate: fetch/verify the Roblox APK (`ureq` + `rustls` + `zip` + `sha2`,
+     `axmldecoder` for the manifest). See `docs/dependency-plan.md` + the "why user-supplied"
+     note above for the fetch-source strategy (backend service, M1+).
+  2. `runtime` crate: ART boot → `onCreate`. Launcher uses **`winit`** (not GTK4) — this is
+     the architectural fix for Step 3.5 (frees the low_4gb window). Prefer **Vulkan via
+     `ash`** for the surface, GL/EGL fallback (perf — see §6). Also: detect host ISA and
+     pass real `--instruction-set-features` to dex2oat (Step 4 finding).
+  3. With a winit-based boot, re-attempt the Roblox boot to finally harvest
+     `framework-worklist.txt` (the deferred Step 4 data).
 
 ---
 
@@ -500,6 +533,30 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (130ms) → test APK (10ms) → bionic linker loads `libgles3jni.so` → GLES3 renders. NVIDIA
   Vulkan init failed (Zink), auto-fell back to GL via Mesa libEGL — first detect-don't-assume
   fallback confirmed working in the wild. Foundation validated end-to-end.
+- **2026-06-04** — **M0 Step 4 measurements captured** (results in §5). Native:Java ≈
+  86%:14% by size (libroblox.so 111 MB; 3 dex = 19 MB) → ART is off the hot path. dex2oat
+  AOT works but ATL forces a baseline ISA (`-sse4.1,-sse4.2,-avx`) — Eclipse's `runtime`
+  should detect host ISA and pass real `--instruction-set-features`. Graphics path not
+  reached in the Roblox boot (dies at asset loading); graphics evidence is from the smoke
+  test. Framework work-list **could not be harvested** — boot dies before Roblox's Java
+  shell surfaces missing classes; deferred to the winit-based M1 boot.
+- **2026-06-04** — **Perf priority reaffirmed (user): take performance any way we can.**
+  Graphics path is **Vulkan-first** (best FPS — lower driver overhead, explicit
+  multithreaded submission) via `ash`; **OpenGL/EGL is the fallback**, support BOTH.
+  This is already encoded: `config.use_opengl` defaults `false` (Vulkan), `true` only to
+  *force* GL where Vulkan can't init; dep plan makes `ash` primary, `khronos-egl` fallback.
+  M0's GL fallback on NVIDIA was a Zink/loader quirk in ATL, not a Vulkan limitation —
+  re-verify native Vulkan with `ash` in M-graphics. Also feeds the dex2oat ISA-detection
+  item above. Balance against CLAUDE.md "optimize with evidence / simplicity first".
+- **2026-06-04** — **M1 launcher foundation implemented.** `diagnostics`: `tracing` +
+  `tracing-subscriber` (env-filter), `RUST_LOG`-driven with `info` default, idempotent
+  `init` (try_init). `config`: full Sober `config.json` schema mirrored (12 typed options +
+  open `fflags` map) via `serde`/`serde_json` + `directories` (portable XDG path, no
+  hardcoded paths); typed `ConfigError` (no panics), `#[serde(default)]` so partial/first-run
+  files work, unknown keys ignored (forward-compat). `eclipse config` prints the resolved
+  path + effective config. Deps: tracing 0.1.44, tracing-subscriber 0.3.23, serde 1.0.228,
+  serde_json 1.0.150, directories 6.0.0 (versions via `cargo add`, APIs via Context7). Full
+  gate clean (fmt/build/clippy -D warnings/6 tests/release) + binary smoke-tested.
 
 ---
 

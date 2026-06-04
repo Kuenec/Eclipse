@@ -14,7 +14,7 @@ USAGE:
 
 COMMANDS:
     run        Launch Roblox            (not yet implemented)
-    config     Edit/show configuration  (not yet implemented)
+    config     Show effective configuration and its path
     help       Show this help
     --version  Show version
 
@@ -27,6 +27,11 @@ fn main() -> ExitCode {
     eclipse::diagnostics::init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    tracing::debug!(
+        version = eclipse::VERSION,
+        command = args.first(),
+        "eclipse starting"
+    );
     match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
             println!("eclipse {}", eclipse::VERSION);
@@ -39,13 +44,13 @@ fn main() -> ExitCode {
             );
             ExitCode::FAILURE
         }
-        Some("config") => {
-            eprintln!(
-                "`eclipse config` is not implemented yet.\n\
-                 The config schema will live in src/config.rs (mirrors Sober's config.json)."
-            );
-            ExitCode::FAILURE
-        }
+        Some("config") => match show_config() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("eclipse config: {e}");
+                ExitCode::FAILURE
+            }
+        },
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{HELP}");
             ExitCode::SUCCESS
@@ -55,4 +60,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Print the effective configuration (file values merged over defaults) and its path.
+fn show_config() -> Result<(), eclipse::config::ConfigError> {
+    let path = eclipse::config::Config::config_path()?;
+    let config = eclipse::config::Config::load()?;
+    println!("# {}", path.display());
+    println!("{}", config.to_json_pretty()?);
+    Ok(())
 }
