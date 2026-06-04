@@ -160,7 +160,33 @@ Both upstreamable to `gitlab.com/android_translation_layer/art_standalone` so fu
 GCC-16 builds work clean. Local fork at `vendor/atl/` got the analogous libunwind
 `CFLAGS=-std=gnu17` patch; can be deleted now that system-installed ATL works.
 
-### 🔴 M0 next steps — Roblox boot (needs APK from user)
+### 🟢 Roblox APK obtained — ready for boot
+
+- **Path:** `/home/kue/eclipse-m0/apk/roblox-2.721.1108.apk`
+- **Version:** 2.721.1108  (`version_code=2350`)
+- **Size:** 243 MB (universal fat APK — single file, no XAPK split games)
+- **SHA-256:** `178a913e94af3a164d39db4fe17050d2ad817b03de960cfaaed0ec1aa0443229`
+- **Source:** Aptoide direct pool URL (via their public `ws75` API). The same APK can be
+  re-fetched by querying `https://ws75.aptoide.com/api/7/app/get/package_name/com.roblox.client`
+  and using the returned `.path` (no auth, no Cloudflare challenge — unlike APKMirror).
+- **Architectures included:** arm64-v8a, armeabi-v7a, **x86_64** (verified by listing
+  `lib/<arch>/` paths). `lib/x86_64/libroblox.so` = **117 MB** native engine.
+- **Manifest (from XAPK metadata):** `package=com.roblox.client`, target_sdk=35, min_sdk=26.
+  Launcher activity expected to be `com.roblox.client.ActivityNativeMain` (from
+  `sober-research.md`; confirm at boot time).
+- **Why Aptoide, not APKMirror:** APKMirror is Cloudflare-gated (JS challenge curl can't
+  solve); APKPure stopped serving x86_64 for Roblox. Aptoide ships the legacy fat
+  (multi-arch) APK pre-app-bundle, which is exactly what we need.
+
+### 🟢 Smoke test re-runnable on demand (no setup needed)
+
+```sh
+cd ~/eclipse-m0
+android-translation-layer atl_test_apks/gles3jni.apk -l com/android/gles3jni/GLES3JNIActivity
+# A GTK window with ~150 rotating colored quads = foundation OK.
+```
+
+### 🔴 M0 next steps — Roblox boot (run these next session)
 
 **System state (persistent, survives reboot):**
 - ✅ **Passwordless sudo is permanent** for user `kue` via `/etc/sudoers.d/99-eclipse`
@@ -212,21 +238,29 @@ GCC-16 builds work clean. Local fork at `vendor/atl/` got the analogous libunwin
    makepkg -ef --noconfirm --nocheck     # -e = no extract, reuse patched src; -f = force
    sudo pacman -U *.pkg.tar.zst
    ```
-5. Then install ATL itself:
+5–6. **ALREADY DONE** (kept for history): packages installed via paru, smoke test rendered.
+7. **Boot Roblox (the next thing to do):**
    ```sh
-   paru -S --needed --skipreview --noconfirm --nocheck android_translation_layer
-   command -v android-translation-layer
+   APK=~/eclipse-m0/apk/roblox-2.721.1108.apk
+   # Quick sanity:
+   sha256sum "$APK"   # expect 178a913e94af3a164d39db4fe17050d2ad817b03de960cfaaed0ec1aa0443229
+   # Boot with verbose logs:
+   ANDROID_LOG_TAGS="*:v" GDK_DEBUG=gl-essl \
+     android-translation-layer "$APK" \
+     -l com/roblox/client/ActivityNativeMain --sdk-int=33 \
+     2>&1 | tee ~/eclipse-m0/roblox-boot.log
    ```
-6. Smoke test (no Roblox needed for this step):
-   ```sh
-   cd ~/eclipse-m0   # already has atl_test_apks/ cloned
-   android-translation-layer atl_test_apks/gles3jni.apk -l com/android/gles3jni/GLES3JNIActivity
-   ```
-7. Roblox boot — needs an **x86_64 Roblox APK** from the user (path TBD):
-   ```sh
-   ANDROID_LOG_TAGS="*:v" GDK_DEBUG=gl-essl android-translation-layer /path/to/roblox.apk \
-       -l com/roblox/client/ActivityNativeMain --sdk-int=33 2>&1 | tee ~/eclipse-m0/roblox-boot.log
-   ```
+   - If launcher-activity wrong: `unzip -p "$APK" AndroidManifest.xml | strings | grep -i 'activity\|roblox.client' | head` (the binary XML is unreadable directly; use axmldecoder or apktool if needed). The XAPK metadata listed `com.roblox.client` as the package; `ActivityNativeMain` is the documented launcher.
+   - If Vulkan init fails (likely on NVIDIA — same as smoke test), the runtime auto-falls back to GL via Mesa libEGL. No action needed.
+   - If bionic linker can't find a `lib*.so`: that may be more serious than the smoke test's
+     non-fatal probes — note which lib and where it lives on disk; it's a search-path issue,
+     not a missing artifact.
+8. **Capture M0 step-4 measurements (from the boot log + APK):**
+   - Java vs native split: `cd /tmp && unzip -q ~/eclipse-m0/apk/roblox-2.721.1108.apk -d r && du -sh r/lib/x86_64/ r/classes*.dex && ls r/classes*.dex | wc -l`
+   - JIT viability: `grep -i 'jit\|dex2oat\|interpret' ~/eclipse-m0/roblox-boot.log | head -20`
+   - Graphics path actually used: `grep -i 'vulkan\|opengl\|egl\|zink\|dri2' ~/eclipse-m0/roblox-boot.log | head -20`
+   - Time to first frame: `grep -E 'onSurfaceChanged|GLThread|sending render' ~/eclipse-m0/roblox-boot.log | head -5`
+   - Framework work-list (missing `android.*`): `grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementation' ~/eclipse-m0/roblox-boot.log | sort -u > ~/eclipse-m0/framework-worklist.txt`
 
 **Earlier fixes already applied (don't redo):**
 - libunwind in our local `vendor/atl` clone patched with `CFLAGS=-std=gnu17` for GCC 16.
@@ -300,6 +334,12 @@ fork strategy abandoned. Two GCC-16 patches captured above.
   Installed: `wolfssl-jni`, `bionic_translation`, `libopensles-standalone`. Stuck on
   `art_standalone` (`libziparchive/zip_writer.cc` GCC-16 cascade error around line 432+).
   Full resume context in Living State §5 above.
+- **2026-06-04** — **Roblox APK obtained** (v2.721.1108, 243 MB universal, x86_64 included,
+  sha256 178a913e…443229) from **Aptoide pool URL** (free public API at
+  `ws75.aptoide.com/api/7/app/get/package_name/com.roblox.client`). APKMirror is
+  Cloudflare-gated, APKPure stopped serving x86_64. Aptoide is now the documented source.
+  Saved at `~/eclipse-m0/apk/roblox-2.721.1108.apk`. Ready for next session to boot +
+  capture M0 step-4 measurements (commands in Living State §5 above).
 - **2026-06-04** — **M0 Steps 1+2 PASSED.** Root cause of art_standalone failure was
   GCC 16 dropping transitive `<cstdint>` (uint*_t disappeared from 76+ AOSP headers);
   patched by adding `#ifndef __ASSEMBLER__ #include <stdint.h>` to AOSP's force-included
