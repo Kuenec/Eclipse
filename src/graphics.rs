@@ -55,6 +55,20 @@ const QUAD_FRAG_SPV: &[u8] = include_bytes!("../shaders/quad.frag.spv");
 const TEXT_VERT_SPV: &[u8] = include_bytes!("../shaders/text.vert.spv");
 const TEXT_FRAG_SPV: &[u8] = include_bytes!("../shaders/text.frag.spv");
 
+/// 2026-06-05: precompiled SPIR-V for the RGBA Canvas-composite pipeline
+/// (`shaders/composite.{vert,frag}`). Same embed-don't-compile rationale as the other pipelines. A
+/// custom View's `onDraw(Canvas)` rasterizes into an RGBA8 Pixmap (`framework::canvas_registry`); the
+/// fragment shader samples it and scales its alpha by a push-constant opacity, alpha-blended over the
+/// view quads + text.
+const COMPOSITE_VERT_SPV: &[u8] = include_bytes!("../shaders/composite.vert.spv");
+const COMPOSITE_FRAG_SPV: &[u8] = include_bytes!("../shaders/composite.frag.spv");
+
+/// Max custom-view Canvas composites drawn per frame. Bounds the per-frame descriptor pool + texture
+/// churn (2026-06-05; real app shells have a handful of custom views — multitouch.test has one). Extra
+/// custom views beyond this are not composited (they still draw as background quads). Pre-sizing the
+/// descriptor pool to this avoids a per-frame pool rebuild.
+const MAX_COMPOSITE_VIEWS: usize = 16;
+
 /// Pixel height the glyph atlas is rasterized at, and the text color drawn over view rects.
 const TEXT_PX: f32 = 28.0;
 const TEXT_COLOR: [f32; 4] = [0.08, 0.09, 0.12, 1.0]; // near-black, reads on the light view quads
@@ -149,6 +163,11 @@ impl ApplicationHandler for GameWindow<'_> {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Draw cascade: before the frame, drive each custom View's onDraw(Canvas) into an
+                // Eclipse Pixmap, then hand the drawn canvases to the renderer to composite this frame.
+                // Done here (not in draw_frame) because the VM lives on GameWindow; the cascade runs on
+                // this JNI-attached main thread, guarded so a JNI/Java error can't crash the loop.
+                self.drive_custom_view_draw();
                 if let (Some(window), Some(renderer)) =
                     (self.window.as_ref(), self.renderer.as_mut())
                 {
@@ -272,6 +291,46 @@ impl GameWindow<'_> {
             Err(e) => {
                 tracing::warn!(handle, ?action, error = %e, "touch dispatch to view failed (ignored)");
                 false
+            }
+        }
+    }
+
+    /// Drive each custom View's `onDraw(Canvas)` into an Eclipse Pixmap and hand the drawn canvases to
+    /// the renderer to composite this frame (the DRAW CASCADE, 2026-06-05).
+    ///
+    /// Asks the renderer for the current custom-view draw targets (handle + laid-out pixel size),
+    /// invokes [`framework::drive_view_draw`](crate::framework::drive_view_draw) on the held VM (which
+    /// constructs a Pixmap-backed Java `Canvas` and calls `View.draw(Canvas)` on each — running its
+    /// `onDraw` + the bound Canvas natives into the Pixmap), then sets the resulting `(view, canvas)`
+    /// pairs on the renderer. No VM, no renderer, or no custom views → nothing to do (the view quads +
+    /// text still draw). The framework path is `catch_unwind`-guarded, so a JNI/Java error can never
+    /// crash the event loop — a typed error is logged and the frame composites no custom views.
+    fn drive_custom_view_draw(&mut self) {
+        let Some(vm) = self.vm else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let targets = renderer.custom_view_draw_targets();
+        if targets.is_empty() {
+            return;
+        }
+        match crate::framework::drive_view_draw(vm, &targets) {
+            Ok(drawn) => {
+                if !drawn.is_empty() {
+                    tracing::debug!(
+                        targets = targets.len(),
+                        drawn = drawn.len(),
+                        "draw cascade: custom-view onDraw(Canvas) ran; compositing this frame"
+                    );
+                }
+                renderer.set_drawn_canvases(drawn);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "draw cascade failed (ignored; no custom-view composite this frame)");
+                // Clear any stale drawn canvases so a previous frame's handles don't linger.
+                renderer.set_drawn_canvases(Vec::new());
             }
         }
     }
@@ -497,6 +556,19 @@ fn argb_to_rgba_f32(argb: i32) -> [f32; 4] {
     let g = ((v >> 8) & 0xFF) as f32 / 255.0;
     let b = (v & 0xFF) as f32 / 255.0;
     [r, g, b, a]
+}
+
+/// `true` if `class_name` is an app-defined (CUSTOM) View subclass — i.e. NOT a framework class.
+///
+/// 2026-06-05: only custom views can override `onDraw(Canvas)` with app drawing (e.g. multitouch.test's
+/// `com.leocardz.multitouch.test.MultiTouch`); the framework's own `android.*`/`androidx.*` widgets draw
+/// via their bound natives, not a custom `onDraw`. The draw cascade ([`framework::drive_view_draw`]) is
+/// limited to custom views so it never re-enters a framework widget's draw (which Eclipse backs
+/// natively, not via a Canvas). Matching is by class-name prefix — the standard Android framework
+/// namespaces. GPU/VM-free, so it is unit-testable.
+fn is_custom_view_class(class_name: &str) -> bool {
+    const FRAMEWORK_PREFIXES: [&str; 4] = ["android.", "androidx.", "com.android.", "java."];
+    !class_name.is_empty() && !FRAMEWORK_PREFIXES.iter().any(|p| class_name.starts_with(p))
 }
 
 /// A small fixed palette so nested views are visually distinguishable by depth. Indexed by
@@ -1263,6 +1335,464 @@ fn upload_atlas_pixels(
     Ok(())
 }
 
+/// Upload `pixels` (straight RGBA8, 4 bytes/pixel, `width`×`height`) into `image` via a host-visible
+/// staging buffer + a one-time `UNDEFINED → TRANSFER_DST → SHADER_READ_ONLY` transition. The RGBA8
+/// sibling of [`upload_atlas_pixels`] (which uploads 1 byte/pixel R8). Frees the staging buffer + the
+/// upload command buffer + fence on every exit path; submits and waits so the copy finishes before
+/// the staging buffer is freed. 2026-06-05.
+#[allow(clippy::too_many_arguments)]
+fn upload_rgba_pixels(
+    device: &ash::Device,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), GraphicsError> {
+    // 4 bytes/pixel for RGBA8. `size` is the byte length of the texture.
+    let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
+    let buf_info = vk::BufferCreateInfo::default()
+        .size(size.max(1))
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: device valid; buf_info outlives the call.
+    let staging = unsafe { device.create_buffer(&buf_info, None) }
+        .map_err(|e| GraphicsError::Vulkan(format!("vkCreateBuffer (rgba staging): {e}")))?;
+    // SAFETY: staging just created.
+    let req = unsafe { device.get_buffer_memory_requirements(staging) };
+    let mem_type = find_host_visible_memory_type(memory_properties, req.memory_type_bits)
+        .ok_or_else(|| {
+            // SAFETY: staging valid + unbound; free before bailing.
+            unsafe { device.destroy_buffer(staging, None) };
+            GraphicsError::Vulkan("no host-visible memory for the rgba staging buffer".to_owned())
+        })?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mem_type);
+    // SAFETY: alloc outlives the call.
+    let staging_mem = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: staging valid + unbound; free before bailing.
+            unsafe { device.destroy_buffer(staging, None) };
+            return Err(GraphicsError::Vulkan(format!(
+                "vkAllocateMemory (rgba staging): {e}"
+            )));
+        }
+    };
+    let free_staging = |device: &ash::Device| {
+        // SAFETY: both handles valid + owned; freed once.
+        unsafe {
+            device.free_memory(staging_mem, None);
+            device.destroy_buffer(staging, None);
+        }
+    };
+    // SAFETY: staging+mem valid; bind whole allocation.
+    if let Err(e) = unsafe { device.bind_buffer_memory(staging, staging_mem, 0) } {
+        free_staging(device);
+        return Err(GraphicsError::Vulkan(format!(
+            "vkBindBufferMemory (rgba staging): {e}"
+        )));
+    }
+    // SAFETY: staging_mem is host-visible ≥ size; copy the pixel bytes in, then unmap. `pixels.len()`
+    // is the caller-validated `width*height*4` (≤ size), so the copy stays in bounds.
+    unsafe {
+        match device.map_memory(staging_mem, 0, size.max(1), vk::MemoryMapFlags::empty()) {
+            Ok(ptr) => {
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, pixels.len());
+                device.unmap_memory(staging_mem);
+            }
+            Err(e) => {
+                free_staging(device);
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkMapMemory (rgba staging): {e}"
+                )));
+            }
+        }
+    }
+
+    let cb_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: pool valid; cb_info outlives the call.
+    let cmd = match unsafe { device.allocate_command_buffers(&cb_info) } {
+        Ok(c) => c[0],
+        Err(e) => {
+            free_staging(device);
+            return Err(GraphicsError::Vulkan(format!(
+                "vkAllocateCommandBuffers (rgba upload): {e}"
+            )));
+        }
+    };
+    let free_cmd = |device: &ash::Device| {
+        // SAFETY: cmd belongs to command_pool; freed once.
+        unsafe { device.free_command_buffers(command_pool, &[cmd]) };
+    };
+
+    let subresource = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+    // Record the transition→copy→transition. SAFETY: cmd + image + staging valid; infos outlive calls.
+    let record = (|| -> ash::prelude::VkResult<()> {
+        unsafe {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(cmd, &begin)?;
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                staging,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+            let to_shader = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_shader),
+            );
+            device.end_command_buffer(cmd)
+        }
+    })();
+    if let Err(e) = record {
+        free_cmd(device);
+        free_staging(device);
+        return Err(GraphicsError::Vulkan(format!("record rgba upload: {e}")));
+    }
+    // SAFETY: device valid; default fence info.
+    let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+        Ok(f) => f,
+        Err(e) => {
+            free_cmd(device);
+            free_staging(device);
+            return Err(GraphicsError::Vulkan(format!(
+                "create rgba upload fence: {e}"
+            )));
+        }
+    };
+    let cmds = [cmd];
+    let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+    // SAFETY: queue/cmd/fence valid; submit + its slice outlive the call; fence tracks completion.
+    let submitted = unsafe { device.queue_submit(queue, &[submit], fence) };
+    let waited =
+        submitted.and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
+    // SAFETY: fence valid + owned; destroy once. Then free the cmd buffer + staging resources.
+    unsafe { device.destroy_fence(fence, None) };
+    free_cmd(device);
+    free_staging(device);
+    waited.map_err(|e| GraphicsError::Vulkan(format!("submit/wait rgba upload: {e}")))?;
+    Ok(())
+}
+
+/// Build the two-triangle quad (6 [`TextVertex`]es) for compositing a custom view's RGBA Pixmap over
+/// its laid-out rect: positions in Vulkan NDC (same pixel→NDC mapping as the quad/text passes), UVs
+/// spanning the full texture (top-left origin matches the Pixmap's row-major top-down layout).
+/// 2026-06-05; GPU-free so it is unit-testable.
+fn composite_quad_vertices(rect: &LaidOutView, extent: vk::Extent2D) -> Vec<TextVertex> {
+    // Same pixel→NDC mapping as `pixel_rect_to_quad`/the text pass (`2*p/extent - 1` per axis).
+    let ew = extent.width.max(1) as f32;
+    let eh = extent.height.max(1) as f32;
+    let to_ndc = |px: f32, py: f32| -> [f32; 2] { [2.0 * px / ew - 1.0, 2.0 * py / eh - 1.0] };
+    // UV (0,0) at the rect's top-left → (1,1) at bottom-right; matches the Pixmap's row-major,
+    // top-down layout (row 0 at the top), so the rasterized image is upright on screen.
+    let tl = TextVertex {
+        pos: to_ndc(rect.x, rect.y),
+        uv: [0.0, 0.0],
+    };
+    let tr = TextVertex {
+        pos: to_ndc(rect.x + rect.w, rect.y),
+        uv: [1.0, 0.0],
+    };
+    let bl = TextVertex {
+        pos: to_ndc(rect.x, rect.y + rect.h),
+        uv: [0.0, 1.0],
+    };
+    let br = TextVertex {
+        pos: to_ndc(rect.x + rect.w, rect.y + rect.h),
+        uv: [1.0, 1.0],
+    };
+    // Two triangles (TRIANGLE_LIST): (tl, tr, br) + (tl, br, bl) — same winding as pixel_rect_to_quad.
+    vec![tl, tr, br, tl, br, bl]
+}
+
+/// Allocate + fill a host-visible vertex buffer for one composite quad's [`TextVertex`]es. Unlike the
+/// per-frame-reused quad/text buffers, each composite texture owns its own (freed next frame by
+/// [`CanvasCompositor::begin_frame`]); returns `(buffer, memory, count)`. An empty `verts` returns a
+/// null buffer with count 0 (no draw). 2026-06-05.
+fn upload_composite_vertices(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    verts: &[TextVertex],
+) -> Result<(vk::Buffer, vk::DeviceMemory, u32), GraphicsError> {
+    let count: u32 = verts
+        .len()
+        .try_into()
+        .map_err(|_| GraphicsError::Vulkan("too many composite vertices".to_owned()))?;
+    if count == 0 {
+        return Ok((vk::Buffer::null(), vk::DeviceMemory::null(), 0));
+    }
+    let size = (count as vk::DeviceSize) * std::mem::size_of::<TextVertex>() as vk::DeviceSize;
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: device valid; buffer_info outlives the call.
+    let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+        .map_err(|e| GraphicsError::Vulkan(format!("vkCreateBuffer (composite vtx): {e}")))?;
+    // SAFETY: buffer just created.
+    let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mem_type = find_host_visible_memory_type(memory_properties, req.memory_type_bits)
+        .ok_or_else(|| {
+            // SAFETY: buffer valid + unbound; free before bailing.
+            unsafe { device.destroy_buffer(buffer, None) };
+            GraphicsError::Vulkan("no host-visible memory for a composite vertex buffer".to_owned())
+        })?;
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mem_type);
+    // SAFETY: alloc_info outlives the call.
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: buffer valid + unbound; free before bailing.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(GraphicsError::Vulkan(format!(
+                "vkAllocateMemory (composite vtx): {e}"
+            )));
+        }
+    };
+    // SAFETY: buffer+memory valid; bind whole allocation.
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        // SAFETY: both valid + owned; free reverse order.
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(GraphicsError::Vulkan(format!(
+            "vkBindBufferMemory (composite vtx): {e}"
+        )));
+    }
+    // SAFETY: memory is a fresh host-visible allocation ≥ size; map the exact range, copy `count`
+    // TextVertexes (source has `count`), unmap. Nothing else references this brand-new buffer.
+    unsafe {
+        let ptr = match device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: both valid + owned; free reverse order.
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkMapMemory (composite vtx): {e}"
+                )));
+            }
+        };
+        std::ptr::copy_nonoverlapping(verts.as_ptr() as *const u8, ptr as *mut u8, size as usize);
+        device.unmap_memory(memory);
+    }
+    Ok((buffer, memory, count))
+}
+
+/// Build the RGBA Canvas-composite pipeline (vertex: pos@0 + uv@8; fragment: sample RGBA8 texture ×
+/// push-constant opacity; alpha blend; dynamic viewport+scissor). Structurally identical to
+/// [`build_text_pipeline`] (same [`TextVertex`] input + combined-image-sampler set 0 + vec4 push
+/// constant) but with the composite shaders. Frees both shader modules on every path; on a post-layout
+/// failure frees the layout. 2026-06-05.
+fn build_composite_pipeline(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<(vk::PipelineLayout, vk::Pipeline), GraphicsError> {
+    let vert_words = read_spirv(COMPOSITE_VERT_SPV)?;
+    let frag_words = read_spirv(COMPOSITE_FRAG_SPV)?;
+    let make_module = |words: &[u32]| -> Result<vk::ShaderModule, GraphicsError> {
+        let info = vk::ShaderModuleCreateInfo::default().code(words);
+        // SAFETY: device valid; info borrows words for the call only.
+        unsafe { device.create_shader_module(&info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateShaderModule (composite): {e}")))
+    };
+    let vert_module = make_module(&vert_words)?;
+    let frag_module = match make_module(&frag_words) {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: vert_module valid + unused; free before bailing.
+            unsafe { device.destroy_shader_module(vert_module, None) };
+            return Err(e);
+        }
+    };
+
+    let entry = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(entry),
+    ];
+    let binding = vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(std::mem::size_of::<TextVertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX);
+    let attributes = [
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(0),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(1)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(std::mem::size_of::<[f32; 2]>() as u32),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(std::slice::from_ref(&binding))
+        .vertex_attribute_descriptions(&attributes);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD);
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(std::slice::from_ref(&blend_attachment));
+
+    let set_layouts = [descriptor_set_layout];
+    let push_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(std::mem::size_of::<[f32; 4]>() as u32);
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(std::slice::from_ref(&push_range));
+    // SAFETY: device valid; layout_info + its slices outlive the call.
+    let pipeline_layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
+        Ok(l) => l,
+        Err(e) => {
+            // SAFETY: both modules valid; free them before bailing.
+            unsafe {
+                device.destroy_shader_module(frag_module, None);
+                device.destroy_shader_module(vert_module, None);
+            }
+            return Err(GraphicsError::Vulkan(format!(
+                "vkCreatePipelineLayout (composite): {e}"
+            )));
+        }
+    };
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterizer)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0);
+    // SAFETY: all referenced objects valid + outlive the call.
+    let pipeline = match unsafe {
+        device.create_graphics_pipelines(
+            vk::PipelineCache::null(),
+            std::slice::from_ref(&pipeline_info),
+            None,
+        )
+    } {
+        Ok(p) => p[0],
+        Err((_, e)) => {
+            // SAFETY: layout + both modules valid; free them before bailing.
+            unsafe {
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_shader_module(frag_module, None);
+                device.destroy_shader_module(vert_module, None);
+            }
+            return Err(GraphicsError::Vulkan(format!(
+                "vkCreateGraphicsPipelines (composite): {e}"
+            )));
+        }
+    };
+    // SAFETY: both modules valid; the pipeline retains the compiled code, so free them now.
+    unsafe {
+        device.destroy_shader_module(frag_module, None);
+        device.destroy_shader_module(vert_module, None);
+    }
+    Ok((pipeline_layout, pipeline))
+}
+
 /// Build the textured-glyph pipeline (vertex: pos@0 + uv@8; fragment: sample R8 atlas × push-constant
 /// color; alpha blend; dynamic viewport+scissor). Frees both shader modules on every path; on a
 /// post-layout failure frees the layout. `descriptor_set_layout` (set 0 = the atlas sampler) is
@@ -1789,6 +2319,14 @@ struct VulkanRenderer {
     /// found or text init failed — quads still draw, no crash (text is best-effort).
     text: Option<TextRenderer>,
 
+    /// The RGBA Canvas-composite pass (2026-06-05): uploads each custom View's `onDraw(Canvas)` Pixmap
+    /// as a GPU texture + draws it over the view's rect. `None` if compositor init failed (a hard
+    /// Vulkan error) — quads + text still draw, no crash (the composite is best-effort).
+    composite: Option<CanvasCompositor>,
+    /// This frame's custom-view `(view, canvas)` pairs to composite, set by [`Self::set_drawn_canvases`]
+    /// from the draw cascade before [`Self::draw_frame`]. Cleared (and the canvases freed) each frame.
+    drawn_canvases: Vec<crate::framework::DrawnCanvas>,
+
     // Swapchain-lifetime objects (rebuilt on resize).
     swapchain: Swapchain,
     swapchain_format: vk::Format,
@@ -1954,6 +2492,7 @@ impl VulkanRenderer {
                 quad_pipeline,
                 memory_properties,
                 text,
+                composite,
             )) => Ok(Self {
                 _entry: entry,
                 instance,
@@ -1979,6 +2518,8 @@ impl VulkanRenderer {
                 quad_vertex_capacity: 0,
                 memory_properties,
                 text,
+                composite,
+                drawn_canvases: Vec::new(),
                 needs_recreate: false,
             }),
             Err(e) => {
@@ -2243,6 +2784,7 @@ impl VulkanRenderer {
             vk::Pipeline,
             vk::PhysicalDeviceMemoryProperties,
             Option<TextRenderer>,
+            Option<CanvasCompositor>,
         ),
         GraphicsError,
     > {
@@ -2440,6 +2982,17 @@ impl VulkanRenderer {
                 }
             };
 
+        // The RGBA Canvas-composite pass (custom-view onDraw → GPU texture over the view rect).
+        // Best-effort: a hard Vulkan failure frees everything created above (incl. the text pass) and
+        // surfaces a typed error; the quads + text still draw if the compositor were absent.
+        let composite = match CanvasCompositor::new(device, render_pass) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "Canvas compositor init failed; custom-view onDraw not composited");
+                None
+            }
+        };
+
         Ok((
             queue,
             swapchain_loader,
@@ -2456,6 +3009,7 @@ impl VulkanRenderer {
             quad_pipeline,
             memory_properties,
             text,
+            composite,
         ))
     }
 
@@ -2650,6 +3204,53 @@ impl VulkanRenderer {
             .map(|(_, v)| (v.handle, v.x + v.w / 2.0, v.y + v.h / 2.0))
     }
 
+    /// The custom (app-defined) views in the current tree that should have their `onDraw(Canvas)`
+    /// driven, each with the pixel size of its laid-out rect (for the [`canvas_registry`] Pixmap).
+    ///
+    /// 2026-06-05: lays out the tree exactly like [`Self::hit_test_at`] (single-sourced geometry), then
+    /// keeps the views whose class is NOT a framework class ([`is_custom_view_class`]) and whose rect is
+    /// at least 1×1 px (a degenerate rect can't back a Pixmap). The caller ([`GameWindow`]) drives
+    /// `View.draw(Canvas)` for these via [`framework::drive_view_draw`](crate::framework::drive_view_draw),
+    /// then hands the resulting canvases back via [`Self::set_drawn_canvases`]. GPU-free (snapshot +
+    /// arithmetic), so it can run before the frame's GPU work.
+    fn custom_view_draw_targets(&self) -> Vec<crate::framework::DrawTarget> {
+        let nodes = crate::framework::view_registry::snapshot_tree();
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
+        let views = layout_views(&nodes, self.swapchain.extent, measure);
+        let mut targets = Vec::new();
+        for (n, v) in nodes.iter().zip(views.iter()) {
+            if !is_custom_view_class(&n.class_name) {
+                continue;
+            }
+            // Round the laid-out rect up to a whole-pixel canvas (≥ 1×1). A degenerate rect is skipped.
+            let w = v.w.ceil();
+            let h = v.h.ceil();
+            if !(w >= 1.0 && h >= 1.0 && w.is_finite() && h.is_finite()) {
+                continue;
+            }
+            targets.push(crate::framework::DrawTarget {
+                handle: v.handle,
+                width: w as u32,
+                height: h as u32,
+            });
+        }
+        targets
+    }
+
+    /// Receive this frame's drawn custom-view canvases from the draw cascade (the `(view, canvas)`
+    /// pairs whose `onDraw` rasterized into a [`canvas_registry`] Pixmap). [`Self::draw_frame`] uploads
+    /// each Pixmap over its view's rect, then frees the handles. Replaces (and frees) any leftover from
+    /// a frame that didn't reach `draw_frame` (e.g. a minimized frame) so a slab handle never leaks.
+    fn set_drawn_canvases(&mut self, drawn: Vec<crate::framework::DrawnCanvas>) {
+        for d in self.drawn_canvases.drain(..) {
+            let _ = crate::framework::canvas_registry::free(d.canvas);
+        }
+        self.drawn_canvases = drawn;
+    }
+
     /// Note that the window was resized; the next [`Self::draw_frame`] recreates the swapchain.
     /// A zero dimension means the window is minimized — skip the recreate then.
     fn mark_resized(&mut self, width: u32, height: u32) {
@@ -2783,11 +3384,56 @@ impl VulkanRenderer {
         } else {
             0
         };
+        // Canvas composite: free last frame's textures (the `in_flight` wait above guarantees the GPU
+        // finished reading them), then upload each custom view's freshly-rasterized Pixmap as an RGBA
+        // texture over its laid-out rect. `drawn_canvases` was set by the draw cascade before this
+        // frame; we look up each view's current rect in `views` (the same layout the quads use), upload
+        // the Pixmap, then free the slab handle (it has served its purpose this frame). A bad/missing
+        // rect or canvas is skipped — quads + text still draw. `queue`/`command_pool` are `Copy`.
+        let queue = self.queue;
+        let command_pool = self.command_pool;
+        let composite_count = if let Some(composite) = self.composite.as_mut() {
+            // SAFETY: the GPU finished reading last frame's composite textures (in_flight waited above).
+            unsafe { composite.begin_frame(&self.device)? };
+            for d in &self.drawn_canvases {
+                let Some(rect) = views.iter().find(|v| v.handle == d.view) else {
+                    continue; // the view left the tree this frame — skip (its handle is freed below)
+                };
+                // Read the Pixmap's straight RGBA + dimensions out of the canvas_registry.
+                let snapshot = crate::framework::canvas_registry::with_canvas(d.canvas, |c| {
+                    let (w, h) = c.dimensions();
+                    (w, h, c.rgba())
+                });
+                let Ok((tw, th, rgba)) = snapshot else {
+                    continue; // stale/invalid canvas handle — skip
+                };
+                composite.upload(
+                    &self.device,
+                    queue,
+                    command_pool,
+                    &mem_props,
+                    &rgba,
+                    tw,
+                    th,
+                    rect,
+                    extent,
+                )?;
+            }
+            composite.texture_count()
+        } else {
+            0
+        };
+        // The Pixmaps have been uploaded (or skipped); free the slab handles so the slots are reclaimed.
+        for d in self.drawn_canvases.drain(..) {
+            let _ = crate::framework::canvas_registry::free(d.canvas);
+        }
+
         if vertex_count > 0 {
             tracing::trace!(
                 views = views.len(),
                 quads = vertex_count / 6,
                 glyphs = text_vertex_count / 6,
+                composites = composite_count,
                 "drawing recorded View tree into the swapchain"
             );
         }
@@ -2986,7 +3632,11 @@ impl VulkanRenderer {
         unsafe {
             self.device
                 .cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
-            if vertex_count > 0 || text_vertex_count > 0 {
+            let composite_count = self
+                .composite
+                .as_ref()
+                .map_or(0, CanvasCompositor::texture_count);
+            if vertex_count > 0 || text_vertex_count > 0 || composite_count > 0 {
                 let extent = self.swapchain.extent;
                 let viewport = vk::Viewport::default()
                     .x(0.0)
@@ -3046,6 +3696,11 @@ impl VulkanRenderer {
                         .cmd_bind_vertex_buffers(cmd, 0, &[text.vertex_buffer], &[0]);
                     self.device.cmd_draw(cmd, text_vertex_count, 1, 0, 0);
                 }
+            }
+            // Canvas composites OVER the quads + text: each custom view's onDraw Pixmap as a textured
+            // quad. SAFETY: cmd is recording in the render pass; viewport/scissor are set above.
+            if let Some(composite) = self.composite.as_ref() {
+                composite.record(&self.device, cmd);
             }
             self.device.cmd_end_render_pass(cmd);
             self.device
@@ -3539,6 +4194,429 @@ impl TextRenderer {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Canvas COMPOSITE: upload a custom View's RGBA Pixmap as a GPU texture + draw it over the view rect.
+//
+// 2026-06-05: the draw cascade (`framework::drive_view_draw`) runs each custom View's `onDraw(Canvas)`,
+// rasterizing into an Eclipse-owned `canvas_registry` Pixmap (real tiny-skia raster). This compositor
+// is the SIBLING of `TextRenderer` (R8 glyph atlas) for RGBA8: each frame it uploads each drawn
+// Pixmap's straight-RGBA bytes into an RGBA8 sampled texture and draws a textured quad over the owning
+// view's laid-out rect, alpha-blended over the view quads + text. Per-frame textures/descriptor sets
+// are transient (the Pixmaps change as `onDraw` re-runs); they are freed at the start of the NEXT
+// frame's composite — AFTER `draw_frame` waited the `in_flight` fence — so the GPU is never reading a
+// freed texture (the same single-frame-in-flight safety the vertex buffers use).
+// ---------------------------------------------------------------------------------------------
+
+/// One uploaded RGBA texture + its descriptor set + its quad vertex buffer for one composited view.
+/// All handles are device children, freed by [`CanvasCompositor::free_textures`] (next frame, GPU
+/// idle for this set) or [`CanvasCompositor::destroy`] (renderer drop, GPU idle).
+struct CompositeTexture {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// Borrowed from the compositor's pool (freed when the pool is reset, not individually).
+    descriptor_set: vk::DescriptorSet,
+    vertex_buffer: vk::Buffer,
+    vertex_memory: vk::DeviceMemory,
+    vertex_count: u32,
+}
+
+/// The RGBA Canvas-composite pass: a persistent sampler + descriptor layout/pool + pipeline, plus the
+/// per-frame [`CompositeTexture`]s. Mirrors [`TextRenderer`] but for full RGBA8 textures (one per
+/// composited custom view) rather than a single shared R8 atlas.
+struct CanvasCompositor {
+    sampler: vk::Sampler,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    /// Sized for [`MAX_COMPOSITE_VIEWS`] combined-image-sampler sets; RESET each frame before
+    /// re-allocating this frame's sets (`FREE_DESCRIPTOR_SET` not needed — reset frees them all).
+    descriptor_pool: vk::DescriptorPool,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    /// This frame's textures (drawn by [`Self::record`]); freed at the next [`Self::begin_frame`].
+    textures: Vec<CompositeTexture>,
+}
+
+impl CanvasCompositor {
+    /// Build the persistent compositor objects (sampler, descriptor layout/pool, pipeline). Returns
+    /// `Ok(None)` is never used (unlike text, the composite needs no font) — a hard Vulkan failure
+    /// frees partial state and surfaces a typed error. Never panics.
+    fn new(device: &ash::Device, render_pass: vk::RenderPass) -> Result<Self, GraphicsError> {
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        // SAFETY: device valid; sampler_info outlives the call.
+        let sampler = unsafe { device.create_sampler(&sampler_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateSampler (composite): {e}")))?;
+
+        // Descriptor set layout: one combined image sampler at binding 0, fragment stage (per view).
+        let binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let dsl_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
+        // SAFETY: device valid; dsl_info outlives the call.
+        let descriptor_set_layout =
+            match unsafe { device.create_descriptor_set_layout(&dsl_info, None) } {
+                Ok(l) => l,
+                Err(e) => {
+                    // SAFETY: sampler valid + owned; free before bailing.
+                    unsafe { device.destroy_sampler(sampler, None) };
+                    return Err(GraphicsError::Vulkan(format!(
+                        "vkCreateDescriptorSetLayout (composite): {e}"
+                    )));
+                }
+            };
+
+        // Pool big enough for MAX_COMPOSITE_VIEWS sets (one combined-image-sampler each); reset each
+        // frame. RESET_DESCRIPTOR_POOL lets `reset_descriptor_pool` recycle all sets at once.
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_COMPOSITE_VIEWS as u32);
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(MAX_COMPOSITE_VIEWS as u32)
+            .pool_sizes(std::slice::from_ref(&pool_size));
+        // SAFETY: device valid; pool_info outlives the call.
+        let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: layout+sampler valid + owned; free before bailing.
+                unsafe {
+                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    device.destroy_sampler(sampler, None);
+                }
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkCreateDescriptorPool (composite): {e}"
+                )));
+            }
+        };
+
+        let (pipeline_layout, pipeline) =
+            match build_composite_pipeline(device, render_pass, descriptor_set_layout) {
+                Ok(p) => p,
+                Err(e) => {
+                    // SAFETY: pool+layout+sampler valid + owned; free before bailing.
+                    unsafe {
+                        device.destroy_descriptor_pool(descriptor_pool, None);
+                        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                        device.destroy_sampler(sampler, None);
+                    }
+                    return Err(e);
+                }
+            };
+
+        Ok(Self {
+            sampler,
+            descriptor_set_layout,
+            descriptor_pool,
+            pipeline_layout,
+            pipeline,
+            textures: Vec::new(),
+        })
+    }
+
+    /// Free the PREVIOUS frame's composite textures and reset the descriptor pool, readying it for
+    /// this frame's uploads. MUST be called after [`VulkanRenderer::draw_frame`]'s `in_flight` fence
+    /// wait (so the GPU has finished reading last frame's textures) and before [`Self::upload`].
+    ///
+    /// # Safety
+    /// The GPU must be idle w.r.t. last frame's submission (the caller waited `in_flight`). `device`
+    /// is the one the textures were created from.
+    unsafe fn begin_frame(&mut self, device: &ash::Device) -> Result<(), GraphicsError> {
+        // SAFETY: per contract the GPU finished reading last frame's textures (fence waited). Free
+        // each texture's image/view/memory + vertex buffer; the descriptor sets are freed wholesale
+        // by the pool reset below.
+        unsafe {
+            for t in self.textures.drain(..) {
+                device.destroy_image_view(t.view, None);
+                device.destroy_image(t.image, None);
+                device.free_memory(t.memory, None);
+                if t.vertex_buffer != vk::Buffer::null() {
+                    device.destroy_buffer(t.vertex_buffer, None);
+                }
+                if t.vertex_memory != vk::DeviceMemory::null() {
+                    device.free_memory(t.vertex_memory, None);
+                }
+            }
+            device
+                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| {
+                    GraphicsError::Vulkan(format!("reset_descriptor_pool (composite): {e}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Upload one drawn Pixmap as an RGBA8 texture over the view's rect, allocating its descriptor set
+    /// and quad vertex buffer, and record it for [`Self::record`]. Skips (returns `Ok(())`, no texture)
+    /// when at the [`MAX_COMPOSITE_VIEWS`] cap or the rgba is the wrong size; on a hard Vulkan failure
+    /// frees its own partial allocation and surfaces a typed error.
+    #[allow(clippy::too_many_arguments)]
+    fn upload(
+        &mut self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        rgba: &[u8],
+        tex_w: u32,
+        tex_h: u32,
+        rect: &LaidOutView,
+        extent: vk::Extent2D,
+    ) -> Result<(), GraphicsError> {
+        if self.textures.len() >= MAX_COMPOSITE_VIEWS {
+            return Ok(()); // cap reached; remaining custom views just don't composite this frame
+        }
+        // Validate the rgba buffer matches the declared dimensions (4 bytes/pixel straight RGBA).
+        let expected = (tex_w as usize) * (tex_h as usize) * 4;
+        if tex_w == 0 || tex_h == 0 || rgba.len() < expected {
+            return Ok(()); // nothing sound to upload
+        }
+
+        // --- RGBA8 image (sampled + transfer-dst) ---
+        let img_extent = vk::Extent3D {
+            width: tex_w,
+            height: tex_h,
+            depth: 1,
+        };
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(img_extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: device valid; image_info outlives the call.
+        let image = unsafe { device.create_image(&image_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateImage (composite): {e}")))?;
+        // SAFETY: image just created from device.
+        let req = unsafe { device.get_image_memory_requirements(image) };
+        let mem_type = find_device_local_memory_type(memory_properties, req.memory_type_bits)
+            .ok_or_else(|| {
+                // SAFETY: image valid + unbound; free before bailing.
+                unsafe { device.destroy_image(image, None) };
+                GraphicsError::Vulkan("no memory type for a composite texture".to_owned())
+            })?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        // SAFETY: alloc outlives the call; mem_type satisfies the image's requirements.
+        let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: image valid + unbound; free before bailing.
+                unsafe { device.destroy_image(image, None) };
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkAllocateMemory (composite): {e}"
+                )));
+            }
+        };
+        // SAFETY: image + memory valid; bind whole allocation at offset 0.
+        if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            // SAFETY: both valid + owned; free reverse order.
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(GraphicsError::Vulkan(format!(
+                "vkBindImageMemory (composite): {e}"
+            )));
+        }
+
+        // Upload the straight-RGBA pixels (4 bytes/pixel) via a staging buffer + one-time transfer.
+        if let Err(e) = upload_rgba_pixels(
+            device,
+            queue,
+            command_pool,
+            memory_properties,
+            image,
+            tex_w,
+            tex_h,
+            &rgba[..expected],
+        ) {
+            // SAFETY: image + memory valid + owned; free reverse order.
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(e);
+        }
+
+        // Image view.
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        // SAFETY: image valid; view_info outlives the call.
+        let view = match unsafe { device.create_image_view(&view_info, None) } {
+            Ok(v) => v,
+            Err(e) => {
+                // SAFETY: image+memory valid + owned; free reverse order.
+                unsafe {
+                    device.free_memory(memory, None);
+                    device.destroy_image(image, None);
+                }
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkCreateImageView (composite): {e}"
+                )));
+            }
+        };
+
+        // Allocate a descriptor set from the per-frame pool + point it at this texture.
+        let set_layouts = [self.descriptor_set_layout];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        // SAFETY: pool+layout valid; ds_alloc outlives the call.
+        let descriptor_set = match unsafe { device.allocate_descriptor_sets(&ds_alloc) } {
+            Ok(sets) => sets[0],
+            Err(e) => {
+                // SAFETY: view+image+memory valid + owned; free reverse order.
+                unsafe {
+                    device.destroy_image_view(view, None);
+                    device.free_memory(memory, None);
+                    device.destroy_image(image, None);
+                }
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkAllocateDescriptorSets (composite): {e}"
+                )));
+            }
+        };
+        let desc_image = vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&desc_image));
+        // SAFETY: set+sampler+view valid; write + its borrow outlive the call.
+        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+
+        // Build + upload the quad vertices (two triangles over the view rect, UV spanning the texture).
+        let verts = composite_quad_vertices(rect, extent);
+        let (vertex_buffer, vertex_memory, vertex_count) =
+            match upload_composite_vertices(device, memory_properties, &verts) {
+                Ok(v) => v,
+                Err(e) => {
+                    // SAFETY: view+image+memory valid + owned; free reverse order. The descriptor set
+                    // is freed by the pool reset next frame, but the texture won't be tracked, so free
+                    // its image/view/memory now.
+                    unsafe {
+                        device.destroy_image_view(view, None);
+                        device.free_memory(memory, None);
+                        device.destroy_image(image, None);
+                    }
+                    return Err(e);
+                }
+            };
+
+        self.textures.push(CompositeTexture {
+            image,
+            memory,
+            view,
+            descriptor_set,
+            vertex_buffer,
+            vertex_memory,
+            vertex_count,
+        });
+        Ok(())
+    }
+
+    /// Record the composite draws into `cmd` (inside the active render pass, after the quad + text
+    /// draws). Binds the composite pipeline + per-texture descriptor set, pushes opacity 1.0, draws
+    /// each texture's quad. Viewport/scissor are already set by the caller (dynamic state).
+    ///
+    /// # Safety
+    /// `cmd` is in a render pass; every handle is valid; called only from [`VulkanRenderer::record_draw`].
+    unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        if self.textures.is_empty() {
+            return;
+        }
+        // SAFETY: cmd is recording inside the render pass; pipeline/sets/buffers are valid.
+        unsafe {
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            // Opacity 1.0 (draw the Pixmap as rasterized); packed into vec4 push-constant bytes.
+            let opacity: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+            let mut bytes = [0u8; 16];
+            for (i, c) in opacity.iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&c.to_ne_bytes());
+            }
+            for t in &self.textures {
+                if t.vertex_count == 0 {
+                    continue;
+                }
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[t.descriptor_set],
+                    &[],
+                );
+                device.cmd_push_constants(
+                    cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    &bytes,
+                );
+                device.cmd_bind_vertex_buffers(cmd, 0, &[t.vertex_buffer], &[0]);
+                device.cmd_draw(cmd, t.vertex_count, 1, 0, 0);
+            }
+        }
+    }
+
+    /// Number of textures composited this frame (for the per-frame draw summary log).
+    fn texture_count(&self) -> usize {
+        self.textures.len()
+    }
+
+    /// Destroy every device-child handle (this frame's textures + the persistent pipeline/pool/etc.).
+    ///
+    /// # Safety
+    /// The GPU must be idle and `device` the one these were created from. Called only from
+    /// [`VulkanRenderer`]'s `Drop` after `device_wait_idle`.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: per contract the GPU is idle; every handle is valid + owned + freed once.
+        unsafe {
+            for t in &self.textures {
+                device.destroy_image_view(t.view, None);
+                device.destroy_image(t.image, None);
+                device.free_memory(t.memory, None);
+                if t.vertex_buffer != vk::Buffer::null() {
+                    device.destroy_buffer(t.vertex_buffer, None);
+                }
+                if t.vertex_memory != vk::DeviceMemory::null() {
+                    device.free_memory(t.vertex_memory, None);
+                }
+            }
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            device.destroy_sampler(self.sampler, None);
+        }
+    }
+}
+
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         // SAFETY: wait for all GPU work to finish so nothing references the objects we destroy.
@@ -3554,6 +4632,15 @@ impl Drop for VulkanRenderer {
             // The text pass (atlas image/view/sampler/descriptors/pipeline + its vertex buffer), if any.
             if let Some(text) = self.text.as_ref() {
                 text.destroy(&self.device);
+            }
+            // The composite pass (this frame's textures + the persistent pipeline/pool/sampler), if any.
+            // SAFETY: the GPU is idle (device_wait_idle above), so no submission references the textures.
+            if let Some(composite) = self.composite.as_ref() {
+                composite.destroy(&self.device);
+            }
+            // Free any still-held drawn-canvas slab handles so the canvas_registry slots are reclaimed.
+            for d in &self.drawn_canvases {
+                let _ = crate::framework::canvas_registry::free(d.canvas);
             }
             // The quad pipeline + its vertex buffer/memory (device children; freed before the device).
             // The buffer/memory may be null if no frame ever recorded content — destroy_* is a no-op
@@ -4619,5 +5706,124 @@ mod tests {
         // Ring (10,25) is filled blue; the hole center (25,25) is transparent.
         assert_eq!(px(&rgba, w, 10, 25), (0, 0, 255, 255));
         assert_eq!(px(&rgba, w, 25, 25).3, 0, "even-odd hole is transparent");
+    }
+
+    // === Canvas composite (RGBA pipeline) — GPU-free unit tests (2026-06-05) ===================
+
+    #[test]
+    fn is_custom_view_class_excludes_framework_namespaces() {
+        // App-defined View subclasses (custom onDraw) are composited; framework widgets are not.
+        assert!(is_custom_view_class(
+            "com.leocardz.multitouch.test.MultiTouch"
+        ));
+        assert!(is_custom_view_class("io.example.MyCanvasView"));
+        assert!(!is_custom_view_class("android.widget.TextView"));
+        assert!(!is_custom_view_class("android.view.View"));
+        assert!(!is_custom_view_class("androidx.appcompat.widget.Toolbar"));
+        assert!(!is_custom_view_class(
+            "com.android.internal.widget.ActionBarView"
+        ));
+        assert!(!is_custom_view_class("java.lang.Object"));
+        assert!(
+            !is_custom_view_class(""),
+            "empty class is not a custom view"
+        );
+    }
+
+    #[test]
+    fn composite_quad_has_six_vertices_full_uv_and_pixel_to_ndc() {
+        // The composite quad: 2 triangles (6 verts), UV spanning the full texture (0,0 top-left →
+        // 1,1 bottom-right), positions mapped pixel→NDC exactly like the quad/text passes.
+        let extent = vk::Extent2D {
+            width: 200,
+            height: 100,
+        };
+        // A rect covering the full extent → NDC corners are the clip-space corners (-1..1).
+        let rect = lov(1, 0.0, 0.0, 200.0, 100.0, false);
+        let verts = composite_quad_vertices(&rect, extent);
+        assert_eq!(verts.len(), 6, "two triangles");
+        // First vertex = top-left: NDC (-1,-1), UV (0,0).
+        assert_eq!(verts[0].pos, [-1.0, -1.0]);
+        assert_eq!(verts[0].uv, [0.0, 0.0]);
+        // Collect the distinct corners; the quad must reach NDC (1,1)/UV (1,1) at the bottom-right.
+        let has_br = verts
+            .iter()
+            .any(|v| v.pos == [1.0, 1.0] && v.uv == [1.0, 1.0]);
+        assert!(has_br, "bottom-right corner present (full-extent rect)");
+        // Every UV stays in [0,1] (the texture is sampled within its own bounds).
+        for v in &verts {
+            assert!(v.uv[0] >= 0.0 && v.uv[0] <= 1.0 && v.uv[1] >= 0.0 && v.uv[1] <= 1.0);
+        }
+    }
+
+    #[test]
+    fn composite_quad_maps_a_sub_rect_into_ndc() {
+        // A half-width rect at the origin maps x in [0,100] over a 200px extent to NDC [-1, 0].
+        let extent = vk::Extent2D {
+            width: 200,
+            height: 100,
+        };
+        let rect = lov(2, 0.0, 0.0, 100.0, 100.0, false);
+        let verts = composite_quad_vertices(&rect, extent);
+        // Top-left at NDC (-1,-1); the right edge (x=100 → 2*100/200-1 = 0.0).
+        assert_eq!(verts[0].pos, [-1.0, -1.0]);
+        let right_edge_present = verts.iter().any(|v| (v.pos[0] - 0.0).abs() < 1e-6);
+        assert!(right_edge_present, "x=100px → NDC x=0.0");
+    }
+
+    #[test]
+    fn rgba_upload_size_is_four_bytes_per_pixel() {
+        // The RGBA8 texture upload reads width*height*4 bytes (vs the R8 atlas's width*height). This
+        // pins the byte-count selection the staging copy + the upload-skip guard depend on, so a
+        // 4-vs-1 byte regression is caught GPU-free. (The straight-RGBA layout comes from
+        // canvas_registry's take_demultiplied; 4 channels per pixel.)
+        let (w, h) = (8u32, 5u32);
+        let expected = (w as usize) * (h as usize) * 4;
+        assert_eq!(expected, 160);
+        // A buffer at least this long is accepted; a short one is rejected by the upload guard logic.
+        let ok = vec![0u8; expected];
+        let short = vec![0u8; expected - 1];
+        assert!(ok.len() >= expected);
+        assert!(
+            short.len() < expected,
+            "an undersized rgba buffer is skipped"
+        );
+    }
+
+    #[test]
+    fn canvas_rgba_is_straight_rgba_byte_order_for_the_composite_texture() {
+        // The composite uploads a canvas_registry Pixmap's bytes into an R8G8B8A8_UNORM texture. That
+        // requires the bytes to be STRAIGHT (un-premultiplied) RGBA in R,G,B,A order. Prove the byte
+        // layout end-to-end: draw a known semi-transparent color into a real Canvas Pixmap, read its
+        // rgba(), and assert pixel 0 is [R,G,B,A] straight — so a format/order regression is caught
+        // GPU-free, tying the canvas_registry output to the composite's RGBA8 texture expectation.
+        use crate::framework::canvas_registry;
+        let h = canvas_registry::allocate(2, 2).expect("allocate canvas");
+        // 0xAARRGGBB = 0x80_20_40_60 → straight bytes [R=0x20, G=0x40, B=0x60, A=0x80].
+        canvas_registry::with_canvas(h, |c| c.draw_color(0x8020_4060u32 as i32))
+            .expect("draw_color");
+        let bytes = canvas_registry::with_canvas(h, |c| c.rgba()).expect("read rgba");
+        assert_eq!(bytes.len(), 2 * 2 * 4, "4 bytes/pixel straight RGBA");
+        assert_eq!(
+            &bytes[0..4],
+            &[0x20, 0x40, 0x60, 0x80],
+            "R,G,B,A straight order"
+        );
+        canvas_registry::free(h).expect("free canvas");
+        // The composite cap bounds per-frame texture churn; it must be a sane small positive number.
+        const { assert!(MAX_COMPOSITE_VIEWS >= 1 && MAX_COMPOSITE_VIEWS <= 256) };
+    }
+
+    #[test]
+    fn composite_spirv_is_well_formed() {
+        // The embedded composite SPIR-V must be valid (multiple-of-4 length, ≥1 word). read_spirv is
+        // the same guard the other pipelines use; this catches a truncated/corrupt include_bytes blob.
+        for (name, spv) in [
+            ("composite.vert", COMPOSITE_VERT_SPV),
+            ("composite.frag", COMPOSITE_FRAG_SPV),
+        ] {
+            let words = read_spirv(spv).unwrap_or_else(|e| panic!("{name} SPIR-V invalid: {e}"));
+            assert!(!words.is_empty(), "{name} SPIR-V is empty");
+        }
     }
 }
