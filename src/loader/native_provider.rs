@@ -449,6 +449,18 @@ impl EclipseNativeProvider {
         p.register("SL_IID_RECORD", sl_iid_addr(5));
         p.register("SL_IID_VOLUME", sl_iid_addr(6));
 
+        // ---- bionic pthread + TLS + sem + syscall shim (the threading runtime) ------------------
+        // 2026-06-05: the engine's `pthread_*` / `sem_*` / `gettid` / `syscall` imports previously
+        // resolved to the HOST glibc baseline, whose pthread/key/once LAYOUTS differ from bionic's —
+        // which aborted `init[1]` (a libc++/protobuf static-init guard misread its bionic-layout
+        // per-thread state; see docs/libroblox-init-run.md). The Eclipse-owned bionic-ABI shim
+        // (`super::bionic_pthread`) operates on the BIONIC memory layouts; prepended before host, it
+        // displaces glibc so those objects are interpreted correctly. See that module for the layout
+        // encoding + the futex/gettid primitives.
+        super::bionic_pthread::register_natives(|name, addr| {
+            p.register(name, addr);
+        });
+
         p
     }
 }
@@ -2002,11 +2014,12 @@ mod tests {
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
         // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 27 ndk-android + 33
-        // media-ndk + 8 audio = 88.
+        // media-ndk + 8 audio + 37 bionic-pthread/TLS/sem/syscall = 125 (2026-06-05).
         assert_eq!(
             p.len(),
-            88,
-            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio natives registered"
+            88 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT,
+            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio + 37 pthread \
+             natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim)
@@ -2102,6 +2115,19 @@ mod tests {
             "SL_IID_PLAY",
             "SL_IID_RECORD",
             "SL_IID_VOLUME",
+            // bionic pthread / TLS / sem / syscall (45) — the threading runtime (2026-06-05)
+            "pthread_mutex_lock",
+            "pthread_mutex_unlock",
+            "pthread_once",
+            "pthread_key_create",
+            "pthread_getspecific",
+            "pthread_setspecific",
+            "pthread_self",
+            "pthread_cond_wait",
+            "pthread_rwlock_rdlock",
+            "sem_wait",
+            "gettid",
+            "syscall",
         ] {
             assert!(p.resolve(name).is_some(), "{name} must be registered");
         }

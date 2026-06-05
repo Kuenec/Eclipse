@@ -1,10 +1,13 @@
 //! Eclipse build script — 2026-06-05.
 //!
-//! Compiles the clean-room liblog VARIADIC shim (`src/loader/liblog_shim.c`) into a static
-//! library that is linked into the crate. The shim DEFINES the two C-variadic bionic liblog
-//! functions (`__android_log_print` / `__android_log_assert`) that Rust stable cannot define
-//! (the `c_variadic` feature is nightly-only); they forward to the Rust sink `eclipse_liblog_emit`.
-//! See `src/loader/liblog_shim.c` and `src/loader/native_provider.rs` for the full rationale.
+//! Compiles the clean-room C VARIADIC shims (`src/loader/liblog_shim.c`,
+//! `src/loader/bionic_syscall_shim.c`) into static libraries linked into the crate. They DEFINE the
+//! C-variadic bionic functions Rust stable cannot define (the `c_variadic` feature is nightly-only):
+//! the liblog `__android_log_print` / `__android_log_assert` (forward to the Rust sink
+//! `eclipse_liblog_emit`), and `eclipse_bionic_syscall(long, ...)` (forwards varargs to the host
+//! `syscall(3)` for the bionic `syscall` import — called directly for `SYS_gettid` in the init path).
+//! See `src/loader/liblog_shim.c` / `src/loader/bionic_syscall_shim.c` / `src/loader/native_provider.rs`
+//! / `src/loader/bionic_pthread.rs` for the full rationale.
 //!
 //! ## Why the `cc` crate (justified per AGENTS.md §2.1 / §5)
 //! `cc` is the standard, well-established Rust build-time bridge for compiling a small C source as
@@ -19,8 +22,9 @@
 //! compiler is the documented build requirement for this shim.
 
 fn main() {
-    // Rebuild if the shim changes (the only C input). 2026-06-05.
+    // Rebuild if either C shim changes. 2026-06-05.
     println!("cargo:rerun-if-changed=src/loader/liblog_shim.c");
+    println!("cargo:rerun-if-changed=src/loader/bionic_syscall_shim.c");
 
     // `compile` emits `cargo:rustc-link-lib=static=eclipse_liblog_shim` + the link-search path, so
     // the archive is linked into the lib, the bin, AND the test harness. The shim's two symbols are
@@ -32,4 +36,13 @@ fn main() {
     cc::Build::new()
         .file("src/loader/liblog_shim.c")
         .compile("eclipse_liblog_shim");
+
+    // The clean-room bionic `syscall(2)` VARIADIC shim: DEFINES `eclipse_bionic_syscall(long, ...)`
+    // (forwards varargs to the host `syscall(3)`) so the engine's bionic `syscall` import — called
+    // directly for `SYS_gettid` in the init path — binds to a real, ABI-correct kernel trampoline.
+    // Variadic *definitions* need nightly Rust; this C shim provides it on stable, like liblog above.
+    // See `src/loader/bionic_pthread.rs` for why a host forward of this stateless trampoline is sound.
+    cc::Build::new()
+        .file("src/loader/bionic_syscall_shim.c")
+        .compile("eclipse_bionic_syscall_shim");
 }

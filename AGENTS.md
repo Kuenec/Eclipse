@@ -525,6 +525,32 @@ before any history-rewriting/force operation.
   arithmetic + async-signal-safe-formatter tests; fmt/build/clippy `-D warnings`/test/release all clean — the harness
   compiles clean even though RUNNING it aborts at init[1], which is runtime, not a build/test failure). Full analysis:
   [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md). See §6 (2026-06-05 init-execution harness).
+- **2026-06-05 UPDATE — the BIONIC PTHREAD+TLS SHIM is BUILT, REGISTERED, TESTED; it advanced the diagnosis by
+  RULING OUT pthread as the init[1] cause (honest, evidence-based).** New module `src/loader/bionic_pthread.rs`: 37
+  Eclipse-owned `extern "C"` natives operating on the **bionic memory layouts** (mutex 40 B, cond 48 B, rwlock 56 B,
+  sem 16 B, key/once 4 B) — futex-backed mutex (NORMAL/RECURSIVE/ERRORCHECK)/cond/rwlock/sem, a 3-state futex
+  `pthread_once`, TLS keys over a real Rust per-thread table (NO `%fs` — no PT_TLS), `pthread_self`/`equal`/`gettid_np`/
+  `exit`, `gettid`, and a C-variadic `syscall` shim (`src/loader/bionic_syscall_shim.c`, `cc` via build.rs — the one
+  pthread-family symbol where a host forward is correct: a stateless kernel trampoline). Registered in
+  `EclipseNativeProvider` (prepended before host) so those imports bind to the bionic-correct shim, not glibc. **RE-RUN
+  RESULT (dev host): still 1 of 3,427; init[1] aborts at the SAME instruction.** This is a *valuable* result — an
+  env-gated trace captured the exact pthread sequence libroblox issues right before the abort: `key_create→key 0`,
+  `getspecific(0)→NULL`, `key_create→key 1`, `setspecific(1)=p`, `getspecific(1)→p` (round-trips EXACTLY) — the shim is
+  **correct**; the abort is *downstream*. gdb+objdump (disable-randomization) re-pin the real death point: the faulting
+  ret `base+0x287ef15` is the insn after `call abort@plt` at `0x287ef10`, reached by `je` on **"the allocator returned
+  NULL"** (`call 0x1bbce22` = libroblox's own **tcmalloc-/arena-style per-thread allocator**; `test rax; je abort`).
+  §4's `0x287eeb6` power-of-two-capacity guess is a *different* basic block proven (breakpoints) **never executed**.
+  **REVISED next obstacle = libroblox's internal allocator bootstrap** (its central refill `0x1bbdcfa`/heap-config
+  `0x65089c9` returns NULL on the first init-time allocation — likely a sysconf/getauxval/mmap/arena dependency unmet
+  under the bare harness), NOT a libc ABI gap (identical abort with glibc AND with the correct bionic shim, *after*
+  correct pthread calls). The shim stays — it is required + correct; it simply was not the init[1] blocker. Gate now
+  **358 unit + 2 doctests** (11 new GPU/VM-free shim tests: 2-thread mutex exclusion, once-exactly-once under 8-thread
+  contention, per-thread TLS isolation across 2 threads, recursive/errorcheck semantics, dtor-on-exit, bionic layout
+  sizes; fmt/build/clippy `-D warnings`/test/release all clean; full-resolution invariant unchanged — work-list 88→0,
+  the 37 pthread natives were always host-resolvable so they don't change the *unresolved* set, only displace glibc).
+  Cyber-safeguard NOT tripped (clean-room from the public bionic pthread C-ABI + Linux futex/gettid + Eclipse's own
+  src/loader; no apkenv/bionic/NDK/linker/ATL source read). Full analysis: [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md)
+  §6. See §6 (2026-06-05 bionic pthread+TLS shim).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3407,6 +3433,40 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   0-warning/0-error (the harness compiles clean; RUNNING it aborts at init[1] = runtime, not a build/test failure). **NEXT =
   the Eclipse-owned bionic pthread+TLS shim, prepended in `BionicEnv`; then re-run `eclipse __run-libroblox-init` to advance
   past init[1].**
+- **2026-06-05** — 🟢 **ENGINE-LOAD: the bionic pthread+TLS shim is BUILT, REGISTERED, TESTED — and it advanced the
+  diagnosis by RULING OUT pthread as the init[1] cause (durable, evidence-based, NOT faked).** New module
+  `src/loader/bionic_pthread.rs` — 37 Eclipse-owned `extern "C"` natives operating on the **bionic memory layouts**
+  (the crux: a glibc forward is wrong because libroblox's embedded objects are bionic-sized — mutex 40 B, cond 48 B,
+  rwlock 56 B, sem 16 B, key/once 4 B): futex-backed mutex (NORMAL/RECURSIVE/ERRORCHECK)/cond/rwlock/sem, a 3-state
+  futex `pthread_once`, TLS keys (`key_create`/`delete`/`getspecific`/`setspecific`) over a real Rust per-thread table
+  (NO `%fs`/static-TLS — libroblox has no PT_TLS; key dtors run on `pthread_exit`, native-thread-teardown delivery
+  documented-deferred), `pthread_self`/`equal`/`gettid_np`/`exit`, `gettid`, and a C-variadic `syscall` shim
+  (`src/loader/bionic_syscall_shim.c`, compiled by build.rs via `cc` — the one pthread-family symbol where a host
+  forward is *correct*: a stateless kernel trampoline, ABI-identical glibc↔bionic). Registered in
+  `EclipseNativeProvider` (prepended before host) so the engine's `pthread_*`/`sem_*`/`gettid`/`syscall` imports bind
+  to the bionic-correct shim, not glibc. **RE-RUN (dev host): STILL 1 of 3,427; init[1] aborts at the SAME insn** —
+  and that is the *valuable* finding: an env-gated trace showed the exact pthread sequence right before the abort
+  (`key_create→0`, `getspecific(0)→NULL`, `key_create→1`, `setspecific(1)=p`, `getspecific(1)→p` round-tripping
+  EXACTLY) → **the shim is correct; the abort is downstream.** gdb+objdump (disable-randomization) re-pin the real
+  death point: faulting ret `base+0x287ef15` = insn after `call abort@plt` at `0x287ef10`, reached by `je` on **"the
+  allocator returned NULL"** (`call 0x1bbce22` = libroblox's own **tcmalloc/arena per-thread allocator**). §4's
+  `0x287eeb6` power-of-two-capacity guess is a different basic block proven (breakpoints) NEVER executed. **REVISED
+  next obstacle = libroblox's internal allocator bootstrap** (central refill `0x1bbdcfa`/heap-config `0x65089c9`
+  returns NULL on its first init-time allocation — a sysconf/getauxval/mmap/arena dependency unmet under the bare
+  harness), NOT a libc ABI gap (identical abort with glibc AND the correct bionic shim, *after* correct pthread calls).
+  The shim stays (required + correct). *Regression guard:* 11 GPU/VM-free unit tests (`cargo test loader::bionic_pthread`):
+  2-thread mutex exclusion, once-exactly-once under 8-thread contention, per-thread TLS isolation across 2 threads,
+  recursive/errorcheck semantics, dtor-on-exit, bionic layout sizes; plus the full-resolution invariant
+  (`real_libroblox_eclipse_natives_fully_resolve_all_imports`) unchanged (work-list 88→0 — the 37 pthread natives were
+  always host-resolvable so they don't move the *unresolved* set, only displace glibc). *Cyber-safeguard: NOT tripped*
+  — clean-room from the PUBLIC bionic pthread C-ABI (documented opaque layouts/type values) + Linux futex/gettid +
+  Eclipse's own `src/loader`; no apkenv/bionic/NDK/linker/ATL source read. Files: `src/loader/bionic_pthread.rs` (new),
+  `src/loader/bionic_syscall_shim.c` (new), `src/loader.rs` (+`pub mod bionic_pthread`), `src/loader/native_provider.rs`
+  (register the 37), `build.rs` (compile the syscall shim), `docs/libroblox-init-run.md` (§6 re-run analysis). **Gate:**
+  fmt --all --check / build --all-targets / clippy (-D warnings) / test (**358 unit + 2 doctests**) / release — all
+  0-warning/0-error (harness compiles clean; the init[1] abort is runtime). **NEXT = trace libroblox's central allocator
+  path (`0x1bbdcfa`/`0x65089c9`) under the harness — which mmap/sysconf/getauxval/arena call returns the wrong value —
+  and supply the bionic-correct behavior, to advance past init[1].**
 
 ---
 
