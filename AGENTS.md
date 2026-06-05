@@ -565,9 +565,14 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      pack/unpack, bounds+generation-checked so a stale/fabricated `jlong` is a typed `Err` not UB,
      `jlong=0` reserved, 6 unit tests), and `drive_steps_1_to_3` now passes a real
      `window_registry::allocate()` handle to `createApplication(J)` instead of `0` (still only *stored*
-     in steps 1–3). **NEXT (in order): (1)** the owed dev-host steps-1–3 validation — `cargo run -- run
-     …/demo_app.apk` reaches `Application.onCreate` (or names the next `UnsatisfiedLinkError`), opens the
-     window, exits 0, no `libgtk-4` in `/proc/self/maps`; then **(2)** the deref-ing Window natives for
+     in steps 1–3). **NEXT (in order): (1) CONTINUE THE DEV-HOST DISCOVERY LOOP from the next missing
+     native.** Via the loop (`cargo run -- run …/demo_app.apk`) the lifecycle now advances through
+     `Context` static-init into `createApplication` and currently stops at the next missing native
+     **`AssetManager.native_setApkAssets ([Ljava/lang/Object;I)V`** (the first native that touches
+     `mObject`; see §6 2026-06-05). `Log.println_native`/`AssetManager.init`/`Environment.native_get_app_data_dir`
+     are now bound (non-GTK Rust). Continue: bind each surfaced native (non-GTK Rust) and re-run until
+     steps 1–3 cleanly reach `Application.onCreate` — `onCreate` is **NOT yet reached**; also confirm the
+     window opens, exit 0, no `libgtk-4` in `/proc/self/maps`. Then **(2)** the deref-ing Window natives for
      step 4 (`set_jobject`/`set_title`/`set_layout` metadata via `register_native_methods` + a descriptor
      guard vs `Window.java`, then the deferred `set_widget_as_root`/`take_input_queue`) + associating the
      real winit `Window` with the registry slot. **BIGGEST RISK recorded:** the View hierarchy is fully
@@ -1025,6 +1030,41 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `Context` natives, drive steps 1–3 with the real handle, log "framework bridge proven", reach
   `Application.onCreate` or name the next missing native, open the window, exit 0, **no `libgtk-4` in
   `/proc/self/maps`**.
+- **2026-06-05** — **Dev-host discovery loop advanced: bound Eclipse's own non-GTK backings for
+  `Log.println_native`, `AssetManager.init`, `Environment.native_get_app_data_dir`.** Running the loop
+  (`cargo run -- run …/demo_app.apk`) surfaced these three natives in turn as the lifecycle drove
+  `Context` static-init into `createApplication`; each is now bound (non-GTK Rust, `RegisterNatives` on
+  its own class, registered before step 1) in `src/framework.rs`, grounded in the vendored ATL Java
+  source (NOT the api-impl-jni C, unread under the cyber-safeguard): **`android.util.Log.println_native`**
+  (`Log.java:367`, static `(IILjava/lang/String;Ljava/lang/String;)I`) forwards `[tag] msg` to the
+  `tracing` log at the priority-mapped level (VERBOSE=2…ASSERT=7, `Log.java:56-81`) and returns the
+  message byte length, with ATL's null-`msg`/`bufID∉0..LOG_ID_MAX(=4)` → `-1` guards
+  (`LOG_ID_MAIN=0…LOG_ID_SYSTEM=3`, `Log.java:350-362`) — no liblog, no GTK; **`AssetManager.init(I)V`**
+  (`AssetManager.java:779`, instance) is a GTK-free **no-op stub** leaving `mObject` at Java zero-init
+  `0` so the constructor proceeds (sound, not behavior-faking — it surfaces the *next* native rather
+  than pulling ATL's C asset layer); **`Environment.native_get_app_data_dir()Ljava/lang/String;`**
+  (`Environment.java:336`, static; caller `getExternalStorageDirectory` does `new File(<string>)` at
+  L330, so a non-null return is **required**, not optional) returns a real portable
+  `$XDG_DATA_HOME/eclipse/app-data` via `directories::ProjectDirs` (`ECLIPSE_APP_DATA_DIR`-overridable;
+  never a hardcoded `/data`/`/sdcard`/`/home`/`/tmp` path — §9, CLAUDE.md portability), mirroring
+  `runtime::native_lib_cache_dir`. Minimal impls are flagged minimal/stub with `YYYY-MM-DD` where the
+  api-impl-jni C is unread — refine when behavior matters. **Result:** the demo-APK lifecycle now
+  advances through `Context` static-init into `createApplication` and currently stops at the next
+  missing native **`AssetManager.native_setApkAssets ([Ljava/lang/Object;I)V`** (the first native that
+  touches `mObject`). **`Application.onCreate` is NOT yet reached.** Each native is an `extern "system"`
+  fn matching jni 0.22.4's static/instance native ABI; the body runs inside `EnvUnowned::with_env`
+  (`catch_unwind`-wrapped) + `resolve::<LogErrorAndDefault>` returns a sound neutral default
+  (`-1`/`0` byte count, `()`, or null `JString` on unrecoverable error), and the driver closure is
+  additionally `catch_unwind`-guarded — no Rust panic can cross into ART (`panic = "abort"` kept); all
+  JNI errors are typed `FrameworkError` (no unwrap/expect — only two total `unwrap_or` saturations). The
+  new `jni::refs::Reference` import is load-bearing (provides `JString::is_null`). Regression guard: 3
+  host-independent unit tests pin each native's class + method name + JNI descriptor (plus the Log
+  priority/`LOG_ID_MAX` constants) against the Java source so a transcription regression throws
+  `NoSuchMethodError`/`NoSuchFieldError` at boot and fails the test. Code-reviewed against the checklist
+  (signature/GTK-free/panic-guard/no-unwrap/typed-error/per-class-before-step-1) — **no defects found**.
+  Full gate green: fmt / build --all-targets / clippy `-D warnings` / test (**52 unit + 2 compile_fail
+  doctests**) / release (`panic = "abort"`/LTO retained). No new deps (`jni 0.22.4`, `directories 6`
+  already in tree). **NEXT:** continue the discovery loop from `AssetManager.native_setApkAssets`.
 
 ---
 

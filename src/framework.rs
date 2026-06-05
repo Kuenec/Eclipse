@@ -73,8 +73,10 @@ use std::sync::OnceLock;
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JClass, JObject, JString};
+use jni::refs::Reference;
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
+use jni::sys::jint;
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
@@ -235,6 +237,356 @@ fn register_context_natives(env: &mut Env, apk_path: &str) -> Result<(), Framewo
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.util.Log.println_native ========================
+//
+// 2026-06-05: `android.util.Log` (ATL `api-impl/android/util/Log.java`) routes every log call
+// (`v`/`d`/`i`/`w`/`e`/`println`/`wtf`) through the single native
+// `static native int println_native(int bufID, int priority, String tag, String msg)` (line 367).
+// ATL backs it in C (`api-impl-jni/android_util_Log.c`): it null-checks `msg` (→ -1), range-checks
+// `bufID` against `LOG_ID_MAX` (= 4: LOG_ID_MAIN..LOG_ID_SYSTEM, util.h:23-30) (→ -1), then forwards
+// to `__android_log_buf_write(bufID, priority, tag, msg)` (liblog) and returns its byte count. That
+// path is GTK-free — it only writes to the Android log buffer (host: stderr/logcat). Eclipse's
+// GTK-free equivalent forwards the `[tag] msg` to the `tracing` log (the `diagnostics` module) at the
+// priority-mapped level and returns the message byte count, matching `Log.println`'s documented
+// "number of bytes written" contract without pulling liblog or GTK.
+
+/// `android.util.Log` (internal/slashed name for `find_class`) — hosts the single `println_native`.
+pub const LOG_CLASS: &JNIStr = jni_str!("android/util/Log");
+
+// JNI name + descriptor for the one Log native, exactly as declared in `Log.java` (2026-06-05):
+// `public static native int println_native(int bufID, int priority, String tag, String msg);`.
+const PRINTLN_NATIVE_NAME: &JNIStr = jni_str!("println_native");
+const PRINTLN_NATIVE_SIG: &JNIStr = jni_str!("(IILjava/lang/String;Ljava/lang/String;)I");
+
+/// `android.util.Log`'s priority constants (`Log.java` lines 56-81): the `priority` arg's meaning.
+/// Used only to map to a `tracing` level for the GTK-free forward; an unknown value falls through to
+/// a default level (never an error — ATL does not validate `priority`).
+const LOG_PRIORITY_VERBOSE: jint = 2;
+const LOG_PRIORITY_DEBUG: jint = 3;
+const LOG_PRIORITY_INFO: jint = 4;
+const LOG_PRIORITY_WARN: jint = 5;
+const LOG_PRIORITY_ERROR: jint = 6;
+const LOG_PRIORITY_ASSERT: jint = 7;
+
+/// Number of Android log buffer IDs (`LOG_ID_MAIN`=0 … `LOG_ID_SYSTEM`=3, then `LOG_ID_MAX`), from
+/// ATL `util.h` (`log_id_t`). `bufID` outside `0..LOG_ID_MAX` is rejected with `-1`, mirroring
+/// `android_util_Log.c`'s `bufID < 0 || bufID >= LOG_ID_MAX` guard.
+const LOG_ID_MAX: jint = 4;
+
+/// `Log.println_native(int bufID, int priority, String tag, String msg)` → bytes written.
+///
+/// Mirrors ATL's `android_util_Log.c` observable behavior, GTK-free: returns `-1` if `msg` is null
+/// or `bufID` is out of `0..LOG_ID_MAX`; otherwise forwards `[tag] msg` to `tracing` at the
+/// priority-mapped level and returns the message's byte length (ATL returns
+/// `__android_log_buf_write`'s byte count, which `Log.println` documents as "number of bytes
+/// written").
+///
+/// JNI ABI: a `static` native, so the second argument is the `JClass`. The body runs inside
+/// [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can never unwind into
+/// ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>` returns the
+/// `jint` default (`0`) on any error/panic — a sound neutral byte count.
+extern "system" fn println_native<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    buf_id: jint,
+    priority: jint,
+    tag: JString<'local>,
+    msg: JString<'local>,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        // ATL: `if (msgObj == NULL) return -1;` — a null message is a caller error, not logged.
+        if msg.is_null() {
+            return Ok(-1);
+        }
+        // ATL: `if (bufID < 0 || bufID >= LOG_ID_MAX) return -1;`.
+        if !(0..LOG_ID_MAX).contains(&buf_id) {
+            return Ok(-1);
+        }
+
+        // ATL reads `tag` only if non-null (GetStringUTFChars else NULL); mirror that.
+        let tag_str = if tag.is_null() {
+            None
+        } else {
+            Some(tag.try_to_string(env)?)
+        };
+        let msg_str = msg.try_to_string(env)?;
+
+        // GTK-free forward: route to `tracing` at the priority-mapped level (the diagnostics module),
+        // the host equivalent of ATL's `__android_log_buf_write` → log buffer/stderr. `target` carries
+        // the Android tag so existing `RUST_LOG`/EnvFilter setups can filter on it.
+        let tag_ref = tag_str.as_deref().unwrap_or("");
+        match priority {
+            LOG_PRIORITY_VERBOSE => {
+                tracing::trace!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+            }
+            LOG_PRIORITY_DEBUG => {
+                tracing::debug!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+            }
+            LOG_PRIORITY_INFO => {
+                tracing::info!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+            }
+            LOG_PRIORITY_WARN => {
+                tracing::warn!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+            }
+            LOG_PRIORITY_ERROR | LOG_PRIORITY_ASSERT => {
+                tracing::error!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
+            }
+            // ATL does not validate `priority`; an unknown value still logs. Use info as the neutral
+            // default rather than dropping the message.
+            _ => tracing::info!(target: "android.util.Log", tag = tag_ref, priority, "{msg_str}"),
+        }
+
+        // ATL returns `__android_log_buf_write`'s byte count; report the message byte length, which
+        // `Log.println` documents as the return value. `jint` is i32; a message longer than i32::MAX
+        // bytes cannot occur in practice, but saturate to stay total (no overflow panic).
+        Ok(jint::try_from(msg_str.len()).unwrap_or(jint::MAX))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.util.Log`'s `println_native`.
+///
+/// Locates `android/util/Log` and registers the native via `RegisterNatives` (which wins over
+/// name-based lazy binding — JNI 1.1 spec), so ATL's liblog-backed C symbol is not used. Like
+/// [`register_context_natives`], this MUST run before anything triggers `Log`'s first active use;
+/// it is registered before the lifecycle drive (ART resolves natives lazily during the lifecycle).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
+/// signature. It does, by construction — [`println_native`] is written to the exact
+/// `(IILjava/lang/String;Ljava/lang/String;)I` descriptor. The native body is `catch_unwind`-guarded
+/// via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
+fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(LOG_CLASS)?;
+    let methods = [
+        // SAFETY: `println_native` matches the paired signature (see the native's docs); casting the
+        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PRINTLN_NATIVE_NAME,
+                PRINTLN_NATIVE_SIG,
+                println_native as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/util/Log; `methods` holds a valid fn pointer whose
+    // signature matches the class's `native` declaration (verified against Log.java, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/util/Log",
+        "registered Eclipse's non-GTK backing for println_native"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.content.res.AssetManager.init ==================
+//
+// 2026-06-05: `android.content.res.AssetManager`'s constructors (ATL `api-impl/android/content/res/
+// AssetManager.java`) call `init(android.os.Build.VERSION.RESOURCES_SDK_INT)` as the first native
+// before any asset path is set (lines 112, 160); the declaration is
+// `private native final void init(int sdk_version);` (line 779) — an INSTANCE native, JNI signature
+// `(I)V`, exactly the signature ART reported missing. In AOSP/ATL, `init` creates the native
+// asset-manager object and stores its handle in the `private long mObject` field
+// ("For communication with native code." — line 87); subsequent natives (`native_setApkAssets`,
+// `addAssetPathNative`, the `openAsset*`/resource lookups) consume `mObject`. ATL backs all of these
+// in C against its own asset/zip machinery; Eclipse must NOT pull in that GTK-coupled native layer.
+//
+// MINIMAL STUB (to be refined when its behavior actually matters): Eclipse's `init` is a GTK-free
+// no-op. `mObject` is left at its Java zero-init `0` — the AssetManager exists but holds no native
+// asset table yet. This is sound, not behavior-faking: it lets `<init>` proceed past `init` so the
+// re-run empirically reveals the NEXT native the constructor reaches (`native_setApkAssets(Object[],
+// int)`, the first to touch `mObject`), which is the diagnostic discovery loop. When real asset
+// access is needed, this native gains an Eclipse-owned asset-table handle (mirroring the
+// window_registry pattern) stored back into `mObject` and the path/read natives are bound against it.
+
+/// `android.content.res.AssetManager` (internal/slashed name for `find_class`) — hosts the `init`
+/// native the constructor calls before setting any asset paths.
+pub const ASSET_MANAGER_CLASS: &JNIStr = jni_str!("android/content/res/AssetManager");
+
+// JNI name + descriptor for AssetManager's init native, exactly as declared in `AssetManager.java`
+// (2026-06-05, line 779): `private native final void init(int sdk_version);`.
+const ASSET_MANAGER_INIT_NAME: &JNIStr = jni_str!("init");
+const ASSET_MANAGER_INIT_SIG: &JNIStr = jni_str!("(I)V");
+
+/// `AssetManager.init(int sdk_version)` → GTK-free no-op (minimal stub, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native (the Java method is not `static`), so the second argument is the
+/// `JObject` receiver (`this`), then the `int sdk_version` (the resources SDK version the
+/// constructor passes). Per the AssetManager native-backing note above, this is intentionally a
+/// no-op for now: it leaves the receiver's `mObject` native handle at `0` (Java zero-init) so the
+/// AssetManager constructs without pulling ATL's C asset layer, and the re-run surfaces the next
+/// native (`native_setApkAssets`) — the diagnostic discovery loop, not a behavior fake.
+///
+/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
+/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
+/// returns the `()` default on any error/panic — the correct neutral value for this `void` native.
+extern "system" fn asset_manager_init<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    sdk_version: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // 2026-06-05: minimal stub — no native asset table is created yet. Tracing records the call
+        // (and the SDK version) so the dev-host boot log shows the constructor reached `init`.
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            sdk_version,
+            "AssetManager.init: GTK-free no-op (native asset table deferred; mObject stays 0)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.content.res.AssetManager`'s `init` native.
+///
+/// Locates `android/content/res/AssetManager` and registers the native via `RegisterNatives` (which
+/// wins over name-based lazy binding — JNI 1.1 spec). Like [`register_context_natives`]/
+/// [`register_log_natives`], this MUST run before anything triggers `AssetManager`'s first active use
+/// (an `AssetManager` constructor); it is registered before the lifecycle drive, since ART resolves
+/// natives lazily during the lifecycle and the framework builds an `AssetManager` early in init.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
+/// signature. It does, by construction — [`asset_manager_init`] is written to the exact `(I)V`
+/// descriptor as an instance native (`EnvUnowned, JObject this, jint`). The native body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary
+/// (AGENTS.md §2.8).
+fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(ASSET_MANAGER_CLASS)?;
+    let methods = [
+        // SAFETY: `asset_manager_init` matches the paired `(I)V` signature as an instance native
+        // (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_INIT_NAME,
+                ASSET_MANAGER_INIT_SIG,
+                asset_manager_init as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/content/res/AssetManager; `methods` holds a valid fn
+    // pointer whose signature matches the class's `native` declaration (verified against
+    // AssetManager.java line 779, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/content/res/AssetManager",
+        "registered Eclipse's non-GTK backing for AssetManager.init"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.os.Environment.native_get_app_data_dir =========
+//
+// 2026-06-05: `android.os.Environment` (ATL `api-impl/android/os/Environment.java`) declares
+// `private static native String native_get_app_data_dir();` (line 336) — a STATIC native, JNI
+// signature `()Ljava/lang/String;`, exactly the signature ART reported missing. Its only caller is
+// `getExternalStorageDirectory()` (lines 328–334): `app_data_dir_file = new File(native_get_app_data_dir())`
+// — i.e. the returned String is the app's external-storage / data directory root, cached as a `File`.
+// ATL backs this in C; Eclipse must NOT pull GTK and must not hardcode an Android-device path like
+// `/data` or `/sdcard` (those do not exist on the Linux host; §9 detect-don't-assume).
+//
+// Eclipse's GTK-free equivalent returns a REAL, portable, host-valid directory derived from the XDG
+// data dir via `directories::ProjectDirs` — the same portable pattern as
+// `runtime::native_lib_cache_dir` (`$XDG_DATA_HOME/eclipse/app-data`, never a hardcoded
+// `/tmp`/`/home`/username/`/data` path; CLAUDE.md "Build & Environment Portability"). Returning a
+// non-null path is required, not optional: the Java caller does `new File(<string>)`, so a null
+// would throw `NullPointerException` and stall the lifecycle — a null "stub" would NOT let the
+// lifecycle proceed. This is minimal-but-correct, grounded in the Java caller + standard Android
+// semantics, not behavior-faking. The directory is not created here (Android's contract: the path
+// may not yet exist — `getExternalStorageDirectory` docs); a later increment can `mkdirs` it when an
+// app actually reads/writes app data.
+
+/// `android.os.Environment` (internal/slashed name for `find_class`) — hosts the static
+/// `native_get_app_data_dir` the framework calls from `getExternalStorageDirectory()`.
+pub const ENVIRONMENT_CLASS: &JNIStr = jni_str!("android/os/Environment");
+
+// JNI name + descriptor for Environment's native, exactly as declared in `Environment.java`
+// (2026-06-05, line 336): `private static native String native_get_app_data_dir();`.
+const GET_APP_DATA_DIR_NAME: &JNIStr = jni_str!("native_get_app_data_dir");
+const GET_APP_DATA_DIR_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
+
+/// Resolve Eclipse's portable per-app data directory (the value `native_get_app_data_dir` returns).
+///
+/// 2026-06-05: mirrors [`runtime::native_lib_cache_dir`](crate::runtime::native_lib_cache_dir)'s
+/// portable `directories::ProjectDirs` pattern — `$XDG_DATA_HOME/eclipse/app-data`
+/// (`~/.local/share/eclipse/app-data` by default), overridable via `ECLIPSE_APP_DATA_DIR`, never a
+/// hardcoded `/data`/`/sdcard`/`/home`/`/tmp` path (§9, CLAUDE.md portability). Returns `None` only
+/// when no home/data base can be determined (e.g. `$HOME` unset) — the native then surfaces a JNI
+/// error rather than fabricating a path.
+fn app_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("ECLIPSE_APP_DATA_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    let dirs = directories::ProjectDirs::from("", "", "eclipse")?;
+    Some(dirs.data_dir().join("app-data"))
+}
+
+/// `Environment.native_get_app_data_dir()` → the app's data directory path as a `java.lang.String`.
+///
+/// JNI ABI: a `static` native (the Java method is `static`), so the second argument is the `JClass`.
+/// Returns a real, portable, host-valid directory (see the Environment native-backing note above);
+/// the Java caller wraps it in `new File(...)`, so it must be non-null. The body runs inside
+/// [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can never unwind into
+/// ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>` returns a
+/// null `JString` only on an unrecoverable error (no XDG base, or string conversion failure) rather
+/// than propagating — surfaced as a JNI error the dev-host log shows.
+extern "system" fn native_get_app_data_dir<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        // No XDG/home base ⇒ we must not fabricate a path (§9); surface a JNI error → null JString.
+        let dir =
+            app_data_dir().ok_or(jni::errors::Error::JniCall(jni::errors::JniError::Unknown))?;
+        // `to_string_lossy` keeps this total for non-UTF-8 paths (rare on Linux); a fabricated path
+        // is never produced — `dir` is the resolved XDG/override directory.
+        env.new_string(dir.to_string_lossy())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.os.Environment`'s `native_get_app_data_dir`.
+///
+/// Locates `android/os/Environment` and registers the native via `RegisterNatives` (which wins over
+/// name-based lazy binding — JNI 1.1 spec). Like [`register_context_natives`]/[`register_log_natives`]/
+/// [`register_asset_manager_natives`], this MUST run before anything triggers `Environment`'s first
+/// active use (`Environment.<clinit>` / `getExternalStorageDirectory`); it is registered before the
+/// lifecycle drive, since ART resolves natives lazily during the lifecycle and the framework queries
+/// external storage early in init.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
+/// signature. It does, by construction — [`native_get_app_data_dir`] is written to the exact
+/// `()Ljava/lang/String;` descriptor as a static native (`EnvUnowned, JClass`). The native body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary
+/// (AGENTS.md §2.8).
+fn register_environment_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(ENVIRONMENT_CLASS)?;
+    let methods = [
+        // SAFETY: `native_get_app_data_dir` matches the paired `()Ljava/lang/String;` signature as a
+        // static native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void`
+        // is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                GET_APP_DATA_DIR_NAME,
+                GET_APP_DATA_DIR_SIG,
+                native_get_app_data_dir as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/os/Environment; `methods` holds a valid fn pointer whose
+    // signature matches the class's `native` declaration (verified against Environment.java line 336,
+    // 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/os/Environment",
+        "registered Eclipse's non-GTK backing for native_get_app_data_dir"
+    );
+    Ok(())
+}
+
 // === The confirmed onCreate recipe, encoded as typed constants ===================
 //
 // 2026-06-04: class internal names (slashed, for `find_class`) and JNI method descriptors,
@@ -389,6 +741,17 @@ fn drive_steps_1_to_3(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress
     // are already resolvable, non-GTK, when <clinit> later calls them. RegisterNatives wins over
     // name-based lazy binding (JNI 1.1 spec), so ATL's GTK-backed symbols are not used.
     register_context_natives(env, apk_path)?;
+    // Bind android.util.Log.println_native on its own class. ART resolves natives lazily during the
+    // lifecycle, so all discovered natives are registered (per class) BEFORE step 1; the framework
+    // logs heavily during init, so this must be bound before createApplication touches Log.
+    register_log_natives(env)?;
+    // Bind android.content.res.AssetManager.init on its own class — the framework builds an
+    // AssetManager early in init (Resources/asset access), so this must be bound before step 1.
+    register_asset_manager_natives(env)?;
+    // Bind android.os.Environment.native_get_app_data_dir on its own class — the framework queries
+    // external storage early in init (`getExternalStorageDirectory`), so this must be bound before
+    // step 1.
+    register_environment_natives(env)?;
 
     // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
     // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
@@ -630,5 +993,53 @@ mod tests {
         assert_eq!(SCREEN_WIDTH_DP_FIELD.to_str(), "screenWidthDp");
         assert_eq!(SCREEN_HEIGHT_DP_FIELD.to_str(), "screenHeightDp");
         assert_eq!(INT_SIG.to_str(), "I");
+    }
+
+    #[test]
+    fn log_native_name_sig_and_class_match_log_java() {
+        // Pin android.util.Log.println_native's class, method name, and JNI descriptor against
+        // `Log.java` (line 367) + the generated header `android_util_Log.h` (Signature
+        // `(IILjava/lang/String;Ljava/lang/String;)I`): a transcription regression would make
+        // RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
+        assert_eq!(LOG_CLASS.to_str(), "android/util/Log");
+        assert_eq!(PRINTLN_NATIVE_NAME.to_str(), "println_native");
+        assert_eq!(
+            PRINTLN_NATIVE_SIG.to_str(),
+            "(IILjava/lang/String;Ljava/lang/String;)I"
+        );
+        // Buffer-ID upper bound mirrors ATL `util.h` log_id_t (LOG_ID_MAIN..LOG_ID_SYSTEM, then MAX).
+        assert_eq!(LOG_ID_MAX, 4);
+        // Priority constants mirror Log.java VERBOSE=2 … ASSERT=7.
+        assert_eq!(LOG_PRIORITY_VERBOSE, 2);
+        assert_eq!(LOG_PRIORITY_DEBUG, 3);
+        assert_eq!(LOG_PRIORITY_INFO, 4);
+        assert_eq!(LOG_PRIORITY_WARN, 5);
+        assert_eq!(LOG_PRIORITY_ERROR, 6);
+        assert_eq!(LOG_PRIORITY_ASSERT, 7);
+    }
+
+    #[test]
+    fn asset_manager_init_name_sig_and_class_match_asset_manager_java() {
+        // Pin android.content.res.AssetManager.init's class, method name, and JNI descriptor against
+        // `AssetManager.java` line 779 (`private native final void init(int sdk_version);` → `(I)V`):
+        // a transcription regression would make RegisterNatives throw NoSuchMethodError at boot, or
+        // (worse) bind the wrong arity. Host-independent constants.
+        assert_eq!(
+            ASSET_MANAGER_CLASS.to_str(),
+            "android/content/res/AssetManager"
+        );
+        assert_eq!(ASSET_MANAGER_INIT_NAME.to_str(), "init");
+        assert_eq!(ASSET_MANAGER_INIT_SIG.to_str(), "(I)V");
+    }
+
+    #[test]
+    fn environment_native_name_sig_and_class_match_environment_java() {
+        // Pin android.os.Environment.native_get_app_data_dir's class, method name, and JNI descriptor
+        // against `Environment.java` line 336 (`private static native String native_get_app_data_dir();`
+        // → `()Ljava/lang/String;`): a transcription regression would make RegisterNatives throw
+        // NoSuchMethodError at boot. Host-independent constants.
+        assert_eq!(ENVIRONMENT_CLASS.to_str(), "android/os/Environment");
+        assert_eq!(GET_APP_DATA_DIR_NAME.to_str(), "native_get_app_data_dir");
+        assert_eq!(GET_APP_DATA_DIR_SIG.to_str(), "()Ljava/lang/String;");
     }
 }
