@@ -131,6 +131,14 @@ impl XmlBlock {
             _ => None,
         }
     }
+
+    /// The block's pooled string at `index`, or `None` if out of range. Backs
+    /// `XmlBlock.nativeGetPooledString(state, idx)` — reached when a `TYPE_STRING` styled attribute's
+    /// `TypedArray` cookie marks it XmlBlock-owned and `TypedArray.getString` calls
+    /// `mXml.getPooledString(data)` with `data` = the source string-pool index.
+    pub fn pooled_string(&self, index: usize) -> Option<&str> {
+        self.doc.strings.get(index).map(String::as_str)
+    }
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -248,6 +256,7 @@ mod tests {
             elements: Vec::new(),
             texts: Vec::new(),
             namespaces: Vec::new(),
+            strings: Vec::new(),
         }
     }
 
@@ -314,6 +323,7 @@ mod tests {
             elements: Vec::new(),
             texts: Vec::new(),
             namespaces: Vec::new(),
+            strings: Vec::new(),
         };
         let h = store(doc).expect("store");
         assert_eq!(
@@ -327,6 +337,30 @@ mod tests {
         assert_eq!(with_block(h, |b| b.next_event()), Ok(None));
         // Past the end stays None (saturating cursor — no overflow/panic).
         assert_eq!(with_block(h, |b| b.next_event()), Ok(None));
+        free(h).expect("free");
+    }
+
+    #[test]
+    fn pooled_string_returns_by_index_or_none() {
+        // Backs XmlBlock.nativeGetPooledString: an in-range index returns its string; out-of-range
+        // returns None (the native then yields null), never a panic.
+        let doc = XmlDocument {
+            events: Vec::new(),
+            elements: Vec::new(),
+            texts: Vec::new(),
+            namespaces: Vec::new(),
+            strings: vec!["zero".to_owned(), "Hello World!".to_owned()],
+        };
+        let h = store(doc).expect("store");
+        assert_eq!(
+            with_block(h, |b| b.pooled_string(0).map(str::to_owned)),
+            Ok(Some("zero".to_owned()))
+        );
+        assert_eq!(
+            with_block(h, |b| b.pooled_string(1).map(str::to_owned)),
+            Ok(Some("Hello World!".to_owned()))
+        );
+        assert_eq!(with_block(h, |b| b.pooled_string(2).is_none()), Ok(true));
         free(h).expect("free");
     }
 }

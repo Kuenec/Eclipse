@@ -557,54 +557,69 @@ const RES_VALUE_TYPE_STRING: u8 = 0x03;
 /// The single asset cookie Eclipse reports (one APK). `loadResourceValue` returns it on success.
 const ECLIPSE_ASSET_COOKIE: jint = 1;
 
-// === ATL TypedArray ABI: the per-attribute window layout retrieveAttributes writes ==============
+// === ATL TypedArray ABI: the per-attribute window layout the styled-attribute natives write ========
 //
-// 2026-06-05: ATL's `retrieveAttributes` is **ATL-specific**, not the stock AOSP native — its JNI
-// signature carries an extra `int` (the attrs-array length) that AOSP's `nativeRetrieveAttributes`
-// does not have. So the AOSP-documented `STYLE_*` offsets do NOT necessarily apply. ATL's
-// `TypedArray.java`/`AssetManager.java` are on the cyber-safeguard denylist (asset/res source), so
-// the window layout was determined **empirically** from the dev-host run (a benign, allowed
-// observation), NOT by reading that source:
+// 2026-06-05: ATL reuses the **standard AOSP (API 29+) `TypedArray` window layout** unchanged — the
+// per-attribute window is `STYLE_NUM_ENTRIES = 7` ints: `[TYPE(0), DATA(1), ASSET_COOKIE(2),
+// RESOURCE_ID(3), CHANGING_CONFIGURATIONS(4), DENSITY(5), SOURCE_RESOURCE_ID(6)]`. This was confirmed
+// **empirically** from the dev-host run (a benign, allowed observation) WITHOUT reading the denylisted
+// `TypedArray.java`/`AssetManager.java` source, then corroborated by reading the runtime framework's
+// own `com.android.internal.R$styleable.View_id` constant (= 9) via reflection:
 //
-//   • Writing a distinct sentinel into each of the 6 ints of a matched window and observing which
-//     value `TypedArray.getInteger` read back as the "type" showed the **TYPE byte is at offset 1**
-//     (the framework reported `type=0xb0`, the sentinel written at window+1), NOT AOSP's offset 0.
-//   • The DATA word's offset was nailed down by sweeping which slot carries it: writing the real
-//     `Res_value.data` into ONLY slot 3 (with slots 2/0/4/5 left at the framework's zero pre-fill)
-//     made BOTH `PackageParser`'s integer attributes resolve (no `Can't convert to integer`) AND
-//     `TypedArray.getString` resolve `<activity android:name>` — clearing the "`<activity> does not
-//     specify android:name` → System.exit(1)" stop and advancing the lifecycle to step 1
-//     `Context.createApplication`. Sweeping DATA into each slot in turn, ONLY slot 3 made getString
-//     resolve; slot 2 (the earlier guess) satisfied integers but left getString returning null. So
-//     **DATA is at offset 3** — the one layout that satisfies every typed accessor. (The earlier note
-//     "DATA@2" was an integer-only coincidence: the integer path tolerates 2 or 3, the string path
-//     requires 3.)
+//   • The launcher inflates a `<TextView android:id="@id/0x7f030000">`; `LayoutInflater` +
+//     `View.<init>` read the id via `TypedArray.getResourceId(View_id, NO_ID)` and call `setId`, which
+//     is what `findViewById` later matches. With the wrong layout, `getResourceId` returned `NO_ID`,
+//     so `findViewById(0x7f030000)` was `null` → `setText` NPE at `MainActivity.onCreate:16`.
+//   • Probing the stride: writing the id into the full window at index `View_id * S` for stride `S`
+//     and observing the NPE clear pinned `S = 7` (only S=7 made `getResourceId` resolve; S=6 did not).
+//   • Probing the slots within the stride-7 window: only `TYPE@0` + `RESOURCE_ID@3` cleared the NPE
+//     (TYPE@1/DATA@1/RESID@4 etc. did not). `DATA@1` follows from the standard layout and is what
+//     `getInteger`/`getString` read (manifest integers + `<activity android:name>` resolve with it).
 //
-// So ATL's window is `[?, TYPE(1), ?, DATA(3), ?, ?]` with `STYLE_NUM_ENTRIES = 6` (the 48-int zero
-// pre-fill the framework hands us for an 8-attribute manifest styleable confirms the 6-int stride).
-// The remaining 4 slots (offset 0, 2, 4, 5 — cookie/resource-id/etc.) are left at the framework's
-// own zero pre-fill: their exact ATL offsets are not yet confirmed and writing a wrong value there is
-// worse than the neutral zero default. A `TYPE_STRING` value at DATA@3 is the string-pool index; the
-// framework's `TypedArray.getString` resolves it via the XmlBlock string pool (cookie slot = 0 routes
-// to `mXml.getPooledString(data)`, satisfied by the already-bound `nativeGetAttributeStringValue` /
-// XmlDocument string pool — no new native is needed, confirmed by the run: no `No implementation
-// found` surfaced and the activity name resolved entirely in Java).
+// The styled-attribute natives (`applyStyle`, `retrieveAttributes`) write into the SAME framework
+// `int[]` indexed by the styleable position; `outValues` is sized `attrs.length * STYLE_NUM_ENTRIES`.
+// The accessor-read slots are TYPE, DATA, and (for references like `android:id`) RESOURCE_ID; cookie /
+// changing-config / density / source stay at the framework's zero pre-fill (not consumed here). A
+// `TYPE_STRING` value's DATA is the XmlBlock string-pool index, resolved by `getString` via the XML
+// string pool (cookie slot = 0 routes to `mXml.getPooledString(data)`, satisfied by the already-bound
+// XML natives — no new native needed).
 //
-// THE ONE ABI ASSUMPTION (faithful): the empirically-confirmed `STYLE_NUM_ENTRIES = 6` stride with
-// TYPE@1 / DATA@3. A regression here would mis-place the entries; the run-derived offsets are pinned
-// by the unit tests below so a transcription change fails loudly.
+// THE ONE ABI ASSUMPTION (faithful): the run-confirmed `STYLE_NUM_ENTRIES = 7` stride with TYPE@0 /
+// DATA@1 / RESOURCE_ID@3. A regression here would mis-place the entries; the offsets are pinned by
+// `typed_array_window_layout_is_pinned` + the `fill_typed_array` bounds test below so a change fails loudly.
 
-/// ATL `TypedArray` per-attribute window stride in `outValues` (empirically confirmed, see above).
-const STYLE_NUM_ENTRIES: usize = 6;
-/// Offset of the `TypedValue.TYPE_*` byte within an attribute's window (ATL = 1, run-confirmed).
-const STYLE_TYPE: usize = 1;
-/// Offset of the `Res_value.data` word within an attribute's window (ATL = 3, run-confirmed 2026-06-05
-/// — the ONE slot that makes both `getInteger` and `getString` resolve). For a `TYPE_STRING` this is
-/// the XmlBlock string-pool index the framework's `getString` resolves via the XML string pool.
-const STYLE_DATA: usize = 3;
+/// AOSP `TypedArray` per-attribute window stride in `outValues` (run-confirmed 2026-06-05; standard
+/// AOSP API 29+ layout — see the ABI note above).
+const STYLE_NUM_ENTRIES: usize = 7;
+/// Offset of the `TypedValue.TYPE_*` byte within an attribute's window (AOSP = 0).
+const STYLE_TYPE: usize = 0;
+/// Offset of the `Res_value.data` word within an attribute's window (AOSP = 1). For a `TYPE_STRING`
+/// this is the XmlBlock string-pool index `getString` resolves via the XML string pool.
+const STYLE_DATA: usize = 1;
+/// Offset of the asset cookie within an attribute's window (AOSP = 2). For an XML-block-sourced string
+/// value (a manifest/layout inline attribute) this is set to [`XML_BLOCK_COOKIE`] (`-1`) so
+/// `TypedArray.getString` resolves the value via `mXml.getPooledString(data)` (the XmlBlock's own Java
+/// string pool, backed by the bound XML natives) rather than the native `AssetManager.getPooledString`.
+const STYLE_ASSET_COOKIE: usize = 2;
+/// Offset of the resolved resource id within an attribute's window (AOSP = 3) — what
+/// `TypedArray.getResourceId` returns (e.g. `android:id` → the view's id for `findViewById`).
+const STYLE_RESOURCE_ID: usize = 3;
+/// The asset cookie AOSP's `TypedArray.getString` treats as "string lives in the XmlBlock's own pool"
+/// (`cookie < 0`) — routing resolution to `mXml.getPooledString(data)` in Java (no native needed),
+/// since Eclipse's inline string values come from the parsed XML block, not a separate asset.
+const XML_BLOCK_COOKIE: i32 = -1;
 /// `TypedValue.TYPE_NULL` — "no value" (the framework then uses the attribute's default). Written
 /// into a requested attribute's `STYLE_TYPE` slot when that id is absent from the current tag.
 const TYPE_NULL: i32 = 0;
+/// `TypedValue.TYPE_REFERENCE` — a resource reference (`@id/foo`, `@drawable/bar`); its `data` is the
+/// referenced resource id, which is also placed in the `STYLE_RESOURCE_ID` slot.
+const TYPE_REFERENCE: u8 = 0x01;
+/// `TypedValue.TYPE_ATTRIBUTE` — a theme-attribute reference (`?attr/foo`); like a reference for the
+/// purpose of the `STYLE_RESOURCE_ID` slot.
+const TYPE_ATTRIBUTE: u8 = 0x02;
+/// `TypedValue.TYPE_STRING` — an interned string; its `data` is the source string-pool index, resolved
+/// by `getString` via the XmlBlock pool (cookie [`XML_BLOCK_COOKIE`]).
+const TYPE_STRING: u8 = 0x03;
 
 /// `AssetManager.init(int sdk_version)` → GTK-free no-op (minimal stub, 2026-06-05).
 ///
@@ -881,13 +896,21 @@ extern "system" fn asset_manager_retrieve_attributes<'local>(
 }
 
 /// One resolved `Res_value` to place in a [`STYLE_NUM_ENTRIES`]-wide `outValues` window: the
-/// `TypedValue.TYPE_*` code and the data word. `None` for a requested id absent from the tag.
+/// `TypedValue.TYPE_*` code, the data word, and the resolved resource id (for references). `None` for
+/// a requested id absent from the tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TypedEntry {
     /// `Res_value.dataType` (== `TypedValue.TYPE_*`).
     value_type: i32,
     /// `Res_value.data` (for a string, the XmlBlock string-pool index).
     data: i32,
+    /// The value's resolved resource id for the `STYLE_RESOURCE_ID` slot. For a `TYPE_REFERENCE` /
+    /// `TYPE_ATTRIBUTE` (e.g. `android:id="@id/foo"`) this is the referenced id (== `data`), which is
+    /// what `TypedArray.getResourceId` returns; for every other value type it is `0` (no resource id).
+    resource_id: i32,
+    /// The asset cookie for the `STYLE_ASSET_COOKIE` slot. [`XML_BLOCK_COOKIE`] (`-1`) for a
+    /// `TYPE_STRING` (so `getString` resolves via the XmlBlock's own Java pool); `0` otherwise.
+    asset_cookie: i32,
 }
 
 /// For each requested framework attribute id in `ids`, find the matching attribute on the current
@@ -912,9 +935,28 @@ fn resolve_xml_attributes(parse_state: jlong, ids: &[i32]) -> Vec<Option<TypedEn
                     .attributes
                     .iter()
                     .find(|a| a.name_resource != 0 && a.name_resource == id_u32)?;
+                let value_type = i32::from(attr.value_type);
+                let data = u32_to_i32(attr.value_data);
+                // For a reference/attribute value, getResourceId returns the referenced id (== data);
+                // the STYLE_RESOURCE_ID slot carries it. Other types have no resource id (0).
+                let resource_id =
+                    if attr.value_type == TYPE_REFERENCE || attr.value_type == TYPE_ATTRIBUTE {
+                        data
+                    } else {
+                        0
+                    };
+                // A string value lives in the XmlBlock's own pool; the XML_BLOCK_COOKIE routes
+                // getString to mXml.getPooledString(data) in Java (no native). Other types: cookie 0.
+                let asset_cookie = if attr.value_type == TYPE_STRING {
+                    XML_BLOCK_COOKIE
+                } else {
+                    0
+                };
                 Some(TypedEntry {
-                    value_type: i32::from(attr.value_type),
-                    data: u32_to_i32(attr.value_data),
+                    value_type,
+                    data,
+                    resource_id,
+                    asset_cookie,
                 })
             })
             .collect()
@@ -930,10 +972,11 @@ fn u32_to_i32(v: u32) -> i32 {
 }
 
 /// Fill the framework-allocated `TypedArray` output buffers from `entries` (one per requested
-/// attribute, in request order): each `Some` writes the run-confirmed [`STYLE_TYPE`]/[`STYLE_DATA`]
-/// slots of its [`STYLE_NUM_ENTRIES`]-wide window (the rest stay at the framework's zero pre-fill),
-/// each `None` writes `TYPE_NULL` into its window's `STYLE_TYPE` slot; `outIndices[0]` is set to the
-/// number of `Some` entries, followed by their 1-based request positions.
+/// attribute, in request order): each `Some` writes its value's [`STYLE_TYPE`]/[`STYLE_DATA`] and —
+/// for a reference — [`STYLE_RESOURCE_ID`] slots of its [`STYLE_NUM_ENTRIES`]-wide window (the rest
+/// stay at the framework's zero pre-fill), each `None` writes `TYPE_NULL` into its window's
+/// `STYLE_TYPE` slot; `outIndices[0]` is set to the number of `Some` entries, followed by their 1-based
+/// request positions.
 ///
 /// `out_values`/`out_indices` are the raw `jlong` pointers the framework passed; `0` means the
 /// framework provided no buffer and that buffer is skipped (no write). The writes are bounded to the
@@ -941,18 +984,18 @@ fn u32_to_i32(v: u32) -> i32 {
 /// where `n == entries.len()`.
 ///
 /// # Safety
-/// 2026-06-05: this performs raw `*mut i32` writes, justified by the ATL `TypedArray` ABI: the
-/// framework's `TypedArray` allocates `outValues` with `attrs.length * STYLE_NUM_ENTRIES` ints and
-/// `outIndices` with `attrs.length + 1` ints (the 6-int stride confirmed by the framework's 48-int
-/// zero pre-fill for an 8-attribute styleable), and passes their base addresses as these two
-/// `jlong`s; `n = entries.len()` here IS `attrs.length` (`entries` is built one-per-`ids` entry, and
-/// `ids.len()` is `attrs.len()` from `JIntArray::len`). For `outValues` every written offset is
-/// `attr * STYLE_NUM_ENTRIES + slot` with `attr < n` and `slot ∈ {STYLE_TYPE, STYLE_DATA} <
-/// STYLE_NUM_ENTRIES`, hence `< n * STYLE_NUM_ENTRIES`. For `outIndices` the written offsets are `0`
-/// (the count) and `1..=changed` where `changed <= n`, hence `<= n`. Both are strictly inside the
-/// framework's allocation — no out-of-bounds access. A `0` pointer is treated as "no buffer" and
-/// never dereferenced. The one ABI assumption (documented at the `STYLE_*` constants) is the
-/// empirically-confirmed `STYLE_NUM_ENTRIES = 6` / TYPE@1 / DATA@3 layout. Each `i32` is written to a
+/// 2026-06-05: this performs raw `*mut i32` writes, justified by the AOSP `TypedArray` ABI (which ATL
+/// reuses unchanged): the framework's `TypedArray` allocates `outValues` with `attrs.length *
+/// STYLE_NUM_ENTRIES` ints and `outIndices` with `attrs.length + 1` ints, and passes their base
+/// addresses as these two `jlong`s; `n = entries.len()` here IS `attrs.length` (`entries` is built
+/// one-per-`ids` entry, and `ids.len()` is `attrs.len()` from `JIntArray::len`). For `outValues` every
+/// written offset is `attr * STYLE_NUM_ENTRIES + slot` with `attr < n` and `slot ∈ {STYLE_TYPE,
+/// STYLE_DATA, STYLE_RESOURCE_ID} < STYLE_NUM_ENTRIES`, hence `< n * STYLE_NUM_ENTRIES`. For
+/// `outIndices` the written offsets are `0` (the count) and `1..=changed` where `changed <= n`, hence
+/// `<= n`. Both are strictly inside the framework's allocation — no out-of-bounds access. A `0` pointer
+/// is treated as "no buffer" and never dereferenced. The ABI assumption (documented at the `STYLE_*`
+/// constants and pinned by `typed_array_window_layout_is_pinned`) is the run-confirmed
+/// `STYLE_NUM_ENTRIES = 7` / TYPE@0 / DATA@1 / RESOURCE_ID@3 layout. Each `i32` is written to a
 /// `.add(k)`-offset of a `*mut i32`; the buffers are framework-owned native `int[]`s (4-byte aligned
 /// by construction), so the writes are aligned and non-overlapping.
 fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<TypedEntry>]) {
@@ -964,15 +1007,17 @@ fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<Typ
             let window = attr * STYLE_NUM_ENTRIES; // < n * STYLE_NUM_ENTRIES for attr < n.
             match entry {
                 Some(e) => {
-                    // SAFETY: window + STYLE_DATA <= window + (STYLE_NUM_ENTRIES-1) <
+                    // SAFETY: window + STYLE_RESOURCE_ID <= window + (STYLE_NUM_ENTRIES-1) <
                     // (attr+1)*STYLE_NUM_ENTRIES <= n*STYLE_NUM_ENTRIES = the framework's outValues
                     // int-count (see the fn-level # Safety). `base` is non-null (checked) and points
-                    // at that framework-owned, 4-byte-aligned int[]. Only the run-confirmed TYPE and
-                    // DATA slots are written; the others stay at the framework's zero pre-fill (the
-                    // neutral default — their exact ATL offsets are not yet confirmed).
+                    // at that framework-owned, 4-byte-aligned int[]. TYPE/DATA/RESOURCE_ID/COOKIE are the
+                    // accessor-read slots; the rest stay at the framework's zero pre-fill (the neutral
+                    // default — changing-config/density/source are not consumed by the launcher).
                     unsafe {
                         base.add(window + STYLE_TYPE).write(e.value_type);
                         base.add(window + STYLE_DATA).write(e.data);
+                        base.add(window + STYLE_RESOURCE_ID).write(e.resource_id);
+                        base.add(window + STYLE_ASSET_COOKIE).write(e.asset_cookie);
                     }
                 }
                 None => {
@@ -1159,7 +1204,7 @@ extern "system" fn asset_manager_apply_style<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     theme: jlong,
-    _parser: jlong,
+    parser: jlong,
     _def_style_attr: jint,
     _def_style_res: jint,
     attrs: JIntArray<'local>,
@@ -1168,18 +1213,32 @@ extern "system" fn asset_manager_apply_style<'local>(
     out_indices: jlong,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        // Size the all-default fill to the requested attribute count. A null attrs array means
-        // nothing to fill; still write outIndices[0]=0 so the framework reads a defined count.
+        // Size the fill to the requested attribute count. A null attrs array means nothing to fill;
+        // still write outIndices[0]=0 so the framework reads a defined count.
         let n = if attrs.is_null() { 0 } else { attrs.len(env)? };
-        // All-`None`: TYPE_NULL per requested attribute (defaults used), outIndices[0] = 0. Reuses
-        // the bounds-proven writer (writes only < n*STYLE_NUM_ENTRIES / <= n; a 0 ptr is skipped).
-        let entries = vec![None; n];
+        let mut entries = vec![None; n];
+        // 2026-06-05: ATL's `applyStyle` IS the combined obtainStyledAttributes(AttributeSet, int[])
+        // path the inflater + every View constructor drive — its second arg is the XmlBlock parse
+        // state (`parser`), and styled values come FIRST from the XML element's inline attributes,
+        // then the theme. The launcher's Views (and crucially `android:id`, which LayoutInflater +
+        // `View.<init>` read via `getResourceId`) are inline XML attributes, so resolve them from the
+        // parser exactly like `retrieveAttributes`. A 0 parser means no XML element (pure theme query):
+        // leave all-`None` so the framework uses defaults (sound AOSP fallback, not a value fake).
+        if n != 0 && parser != 0 {
+            let mut ids = vec![0i32; n];
+            attrs.get_region(env, 0, &mut ids)?;
+            entries = resolve_xml_attributes(parser, &ids);
+        }
+        let changed = entries.iter().filter(|e| e.is_some()).count();
+        // Reuses the bounds-proven writer (writes only < n*STYLE_NUM_ENTRIES / <= n; a 0 ptr skipped).
         fill_typed_array(out_values, out_indices, &entries);
         tracing::debug!(
             target: "android.content.res.AssetManager",
             theme,
+            parser,
             attrs = n,
-            "AssetManager.applyStyle: wrote TYPE_NULL defaults for theme styled attributes (non-GTK)"
+            changed,
+            "AssetManager.applyStyle: resolved XML attributes from the parser (non-GTK)"
         );
         Ok(())
     })
@@ -1676,6 +1735,14 @@ const XML_BLOCK_GET_ATTR_STRING_VALUE_SIG: &JNIStr = jni_str!("(JI)Ljava/lang/St
 const XML_BLOCK_GET_LINE_NUMBER_NAME: &JNIStr = jni_str!("nativeGetLineNumber");
 const XML_BLOCK_GET_LINE_NUMBER_SIG: &JNIStr = jni_str!("(J)I");
 
+// `static native String nativeGetPooledString(long state, int idx)` — the block's `idx`-th pooled
+// string. JNI descriptor `(JI)Ljava/lang/String;` (`String ...XmlBlock.nativeGetPooledString(long,
+// int)`, run log 2026-06-05). Reached when a `TYPE_STRING` styled attribute's `TypedArray` cookie is
+// XML_BLOCK_COOKIE: `TypedArray.getString` calls `mXml.getPooledString(data)` where `data` is the
+// source string-pool index, which routes here. Backed by [`xml_registry::XmlBlock::pooled_string`].
+const XML_BLOCK_GET_POOLED_STRING_NAME: &JNIStr = jni_str!("nativeGetPooledString");
+const XML_BLOCK_GET_POOLED_STRING_SIG: &JNIStr = jni_str!("(JI)Ljava/lang/String;");
+
 /// The "unknown line" sentinel AOSP's `XmlResourceParser.getLineNumber` returns when unavailable.
 const XML_LINE_UNKNOWN: jint = -1;
 
@@ -1968,6 +2035,37 @@ extern "system" fn xml_block_get_line_number<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `XmlBlock.nativeGetPooledString(long state, int idx)` → the block's `idx`-th pooled string, or null.
+///
+/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Reached when a `TYPE_STRING`
+/// styled attribute's `TypedArray` cookie is [`XML_BLOCK_COOKIE`] (`-1`): `TypedArray.getString` calls
+/// `mXml.getPooledString(data)` with `data` = the source string-pool index, routing here. Returns the
+/// block's pooled string at `idx` (via [`xml_registry::XmlBlock::pooled_string`]); a null `JString`
+/// for a negative/out-of-range index or a bad handle (AOSP returns null for an absent pooled string).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns a
+/// null `JString` on error/panic.
+extern "system" fn xml_block_get_pooled_string<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+    idx: jint,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        // A negative index has no pooled string; usize::try_from rejects it cleanly.
+        let value = usize::try_from(idx).ok().and_then(|i| {
+            xml_registry::with_block(state, |b| b.pooled_string(i).map(str::to_owned))
+                .ok()
+                .flatten()
+        });
+        match value {
+            Some(s) => env.new_string(s),
+            None => Ok(JString::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Run `f` against the idx-th attribute of the current element of block `state`.
 ///
 /// Returns `Some(f(attr))` when the handle is valid, the cursor is on a start/end tag, and `idx` is
@@ -2070,6 +2168,15 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_line_number as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `xml_block_get_pooled_string` matches the paired `(JI)Ljava/lang/String;` signature
+        // as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_POOLED_STRING_NAME,
+                XML_BLOCK_GET_POOLED_STRING_SIG,
+                xml_block_get_pooled_string as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/content/res/XmlBlock; `methods` hold valid fn pointers
     // whose signatures match the class's `native` declarations (from the ART-reported signatures,
@@ -2077,7 +2184,7 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/XmlBlock",
-        "registered Eclipse's non-GTK backing for XmlBlock parser natives (nativeCreateParseState/nativeNext/nativeDestroyParseState/nativeGetName/nativeDestroy/nativeGetLineNumber)"
+        "registered Eclipse's non-GTK backing for XmlBlock parser natives (nativeCreateParseState/nativeNext/nativeDestroyParseState/nativeGetName/nativeDestroy/nativeGetLineNumber/nativeGetPooledString)"
     );
     Ok(())
 }
@@ -2704,16 +2811,89 @@ fn register_paint_natives(env: &mut Env) -> Result<(), FrameworkError> {
 /// `android.widget.TextView` (internal/slashed name for `find_class`) — re-declares `native_constructor`.
 pub const TEXT_VIEW_CLASS: &JNIStr = jni_str!("android/widget/TextView");
 
+// JNI name + descriptor for TextView.native_setText, exactly as declared in `TextView.java`
+// (2026-06-05, line 111): `public native final void native_setText(String text);` → an INSTANCE
+// native, descriptor `(Ljava/lang/String;)V`. Surfaced during step 5: both the inflated `<TextView
+// android:text="Hello World!">` (TextView.<init> → setText) AND the launcher's own
+// `findViewById(...).setText(...)` (MainActivity.onCreate:16) route here. ATL backs it against the
+// GtkLabel; Eclipse records the text on the receiver's [`view_registry`] peer (no GTK, no draw).
+const TEXT_VIEW_NATIVE_SET_TEXT_NAME: &JNIStr = jni_str!("native_setText");
+const TEXT_VIEW_NATIVE_SET_TEXT_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V");
+
+// JNI name + descriptor for View.widget — the `public long widget` field (`View.java` line 888) that
+// holds the view's [`view_registry`] handle. An instance native like `native_setText` (which receives
+// only the text, not the handle) reads it off `this` to find the peer to update.
+const VIEW_WIDGET_FIELD_NAME: &JNIStr = jni_str!("widget");
+const VIEW_WIDGET_FIELD_SIG: &JNIStr = jni_str!("J");
+
+/// `TextView.native_setText(String text)` → record the text on the receiver's [`view_registry`] peer
+/// (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void, so the parameters are
+/// `(EnvUnowned, JObject this, JString text)`. The view-registry handle is the receiver's `widget`
+/// field (`View.java` `public long widget`); this reads it off `this`, then records `text` on that
+/// peer through the bounds+generation-checked [`view_registry`] (a stale/fabricated handle is logged +
+/// ignored, never UB). No GTK label, no layout/draw — the text is metadata until the deferred render.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+extern "system" fn text_view_native_set_text<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    text: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let widget = view_widget_handle(env, &this);
+        // A null text clears it (AOSP setText(null) → empty); record None vs Some.
+        let value = if text.is_null() {
+            None
+        } else {
+            Some(text.try_to_string(env)?)
+        };
+        match view_registry::with_view(widget, |v| v.text = value.clone()) {
+            Ok(()) => tracing::debug!(
+                target: "android.widget.TextView",
+                widget,
+                text = value.as_deref().unwrap_or(""),
+                "TextView.native_setText: recorded text on non-GTK view peer"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.TextView",
+                widget,
+                error = %e,
+                "TextView.native_setText: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Read a View's `widget` (`long`) field off `this` — its [`view_registry`] handle. Returns `0` (the
+/// reserved null handle, which the registry rejects) on any JNI error, so the caller still no-ops
+/// soundly. Off the gameplay hot path (per text/attribute set during inflation).
+fn view_widget_handle(env: &mut Env, this: &JObject) -> jlong {
+    // SAFETY: "J" paired with JavaType::Long is consistent — FieldSignature::from_raw_parts' invariant;
+    // `widget` is `public long` on View, the receiver's runtime supertype, so the read is type-correct.
+    let sig = unsafe {
+        FieldSignature::from_raw_parts(VIEW_WIDGET_FIELD_SIG, JavaType::Primitive(Primitive::Long))
+    };
+    env.get_field(this, VIEW_WIDGET_FIELD_NAME, &sig)
+        .and_then(|v| v.j())
+        .unwrap_or(0)
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.widget.TextView`'s peer natives.
 ///
 /// `native_constructor` (TextView.java line 89, same `(Landroid/content/Context;Landroid/util/
 /// AttributeSet;)J` signature as View's) reuses the class-agnostic [`view_native_constructor`], which
-/// records the receiver's actual class (`android.widget.TextView`) in [`view_registry`]. Registered
+/// records the receiver's actual class (`android.widget.TextView`) in [`view_registry`].
+/// `native_setText` (TextView.java line 111) records the text on the receiver's peer. Registered
 /// before step 4, alongside the View/Window natives.
 ///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
-/// does — [`view_native_constructor`] is written to that exact descriptor. The body is
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do — each native is written to the exact descriptor declared in `TextView.java`. The bodies are
 /// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(TEXT_VIEW_CLASS)?;
@@ -2729,13 +2909,24 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_constructor as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `text_view_native_set_text` matches the paired `(Ljava/lang/String;)V` signature as
+        // an instance native (TextView.java line 111); the cast is how `NativeMethod::from_raw_parts`
+        // takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                TEXT_VIEW_NATIVE_SET_TEXT_NAME,
+                TEXT_VIEW_NATIVE_SET_TEXT_SIG,
+                text_view_native_set_text as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/widget/TextView; the fn pointer's signature matches its
-    // `native_constructor` declaration (verified against TextView.java line 89, 2026-06-05).
+    // SAFETY: `class` is the loaded android/widget/TextView; the fn pointers' signatures match its
+    // `native_constructor`/`native_setText` declarations (verified against TextView.java lines 89/111,
+    // 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/widget/TextView",
-        "registered Eclipse's non-GTK backing for TextView.native_constructor"
+        "registered Eclipse's non-GTK backing for TextView.native_constructor + native_setText"
     );
     Ok(())
 }
@@ -3636,36 +3827,47 @@ mod tests {
         assert_eq!(CHAR_SEQUENCE_SIG.to_str(), "Ljava/lang/CharSequence;");
         assert_eq!(RES_VALUE_TYPE_STRING, 0x03);
         assert_eq!(ECLIPSE_ASSET_COOKIE, 1);
-        // Pin the EMPIRICALLY-CONFIRMED ATL TypedArray window layout retrieveAttributes writes
-        // against (run-derived 2026-06-05: stride 6, TYPE@1, DATA@3 — NOT the AOSP-documented
-        // TYPE@0/DATA@1, and NOT the earlier integer-only guess DATA@2). DATA@3 is the ONE slot that
-        // makes both `getInteger` (PackageParser integers) and `getString` (`<activity android:name>`)
-        // resolve; a stride/offset regression (which would re-break the activity-name getString and
-        // mis-place TypedValue entries) fails loudly.
-        assert_eq!(STYLE_NUM_ENTRIES, 6);
-        assert_eq!(STYLE_TYPE, 1);
-        assert_eq!(STYLE_DATA, 3);
+        // Pin the run-confirmed AOSP TypedArray window layout the styled-attribute natives write
+        // (corrected 2026-06-05: stride 7, TYPE@0, DATA@1, ASSET_COOKIE@2, RESOURCE_ID@3 — the
+        // standard AOSP API 29+ layout, corroborated by the runtime `R.styleable.View_id`=9 read).
+        // RESOURCE_ID@3 is what `getResourceId` returns for `android:id`; without it `findViewById`
+        // returns null and `setText` NPEs in `MainActivity.onCreate`. A stride/offset regression
+        // (which would re-break getResourceId/getString/getInteger and mis-place TypedValue entries)
+        // fails loudly here.
+        assert_eq!(STYLE_NUM_ENTRIES, 7);
+        assert_eq!(STYLE_TYPE, 0);
+        assert_eq!(STYLE_DATA, 1);
+        assert_eq!(STYLE_ASSET_COOKIE, 2);
+        assert_eq!(STYLE_RESOURCE_ID, 3);
         assert_eq!(TYPE_NULL, 0);
+        assert_eq!(TYPE_REFERENCE, 0x01);
+        assert_eq!(TYPE_ATTRIBUTE, 0x02);
+        assert_eq!(TYPE_STRING, 0x03);
+        assert_eq!(XML_BLOCK_COOKIE, -1);
     }
 
     #[test]
     fn fill_typed_array_writes_exact_bounds_values_and_indices() {
-        // SOUNDNESS guard for the raw-pointer writes in retrieveAttributes (no VM needed): the
-        // writes must stay strictly inside the AOSP-sized buffers (n * STYLE_NUM_ENTRIES ints for
-        // outValues, n + 1 for outIndices), write a full value window for each found attribute,
+        // SOUNDNESS guard for the raw-pointer writes in the styled-attribute natives (no VM needed):
+        // the writes must stay strictly inside the AOSP-sized buffers (n * STYLE_NUM_ENTRIES ints for
+        // outValues, n + 1 for outIndices), write the accessor slots for each found attribute,
         // TYPE_NULL for each absent one, and pack outIndices[0]=count + the 1-based positions.
         //
         // Sentinel-bracketed buffers detect any out-of-bounds write: a leading + trailing guard cell
-        // must keep its sentinel. entries: [found, absent, found, absent] (mixed).
+        // must keep its sentinel. entries: [string, absent, reference, absent] (mixed).
         let entries = [
             Some(TypedEntry {
-                value_type: 0x03,
+                value_type: i32::from(TYPE_STRING),
                 data: 0x18,
+                resource_id: 0,
+                asset_cookie: XML_BLOCK_COOKIE,
             }),
             None,
             Some(TypedEntry {
-                value_type: 0x10,
-                data: 0x2a,
+                value_type: i32::from(TYPE_REFERENCE),
+                data: 0x7f03_0000,
+                resource_id: 0x7f03_0000,
+                asset_cookie: 0,
             }),
             None,
         ];
@@ -3673,7 +3875,7 @@ mod tests {
         let vals_len = n * STYLE_NUM_ENTRIES;
         let idx_len = n + 1;
 
-        let mut values = vec![-1i32; vals_len + 2]; // [guard][n*6 values][guard]
+        let mut values = vec![-1i32; vals_len + 2]; // [guard][n*7 values][guard]
         let mut indices = vec![-1i32; idx_len + 2]; // [guard][n+1 indices][guard]
 
         let v_ptr = values[1..1 + vals_len].as_mut_ptr() as jlong;
@@ -3686,23 +3888,39 @@ mod tests {
         assert_eq!(indices[0], -1, "outIndices underflow guard");
         assert_eq!(indices[idx_len + 1], -1, "outIndices overflow guard");
 
-        // Found attributes (0 and 2): only the run-confirmed TYPE@1 and DATA@3 slots are written;
-        // the other 4 slots stay at the caller value (the framework's zero pre-fill in real use).
+        // Found attributes (0 and 2): TYPE@0, DATA@1, COOKIE@2, RESOURCE_ID@3 are written; the
+        // remaining slots stay at the caller value (the framework's zero pre-fill in real use).
+        let written = [
+            STYLE_TYPE,
+            STYLE_DATA,
+            STYLE_ASSET_COOKIE,
+            STYLE_RESOURCE_ID,
+        ];
         for (attr, e) in [(0usize, &entries[0]), (2usize, &entries[2])] {
             let win = 1 + attr * STYLE_NUM_ENTRIES;
             let e = e.unwrap();
-            assert_eq!(values[win + STYLE_TYPE], e.value_type, "STYLE_TYPE @1");
-            assert_eq!(values[win + STYLE_DATA], e.data, "STYLE_DATA @3");
+            assert_eq!(values[win + STYLE_TYPE], e.value_type, "STYLE_TYPE @0");
+            assert_eq!(values[win + STYLE_DATA], e.data, "STYLE_DATA @1");
+            assert_eq!(
+                values[win + STYLE_ASSET_COOKIE],
+                e.asset_cookie,
+                "STYLE_ASSET_COOKIE @2"
+            );
+            assert_eq!(
+                values[win + STYLE_RESOURCE_ID],
+                e.resource_id,
+                "STYLE_RESOURCE_ID @3"
+            );
             for slot in 0..STYLE_NUM_ENTRIES {
-                if slot != STYLE_TYPE && slot != STYLE_DATA {
+                if !written.contains(&slot) {
                     assert_eq!(values[win + slot], -1, "unwritten slot untouched");
                 }
             }
         }
-        // Absent attributes (1 and 3): only STYLE_TYPE @1 = TYPE_NULL written.
+        // Absent attributes (1 and 3): only STYLE_TYPE @0 = TYPE_NULL written.
         for attr in [1usize, 3usize] {
             let win = 1 + attr * STYLE_NUM_ENTRIES;
-            assert_eq!(values[win + STYLE_TYPE], TYPE_NULL, "absent → TYPE_NULL @1");
+            assert_eq!(values[win + STYLE_TYPE], TYPE_NULL, "absent → TYPE_NULL @0");
             for slot in 0..STYLE_NUM_ENTRIES {
                 if slot != STYLE_TYPE {
                     assert_eq!(values[win + slot], -1, "absent: other slots untouched");
@@ -3721,12 +3939,37 @@ mod tests {
     }
 
     #[test]
+    fn fill_typed_array_reference_resource_id_is_at_style_resource_id_slot() {
+        // REGRESSION for the findViewById fix (2026-06-05): a REFERENCE-typed `android:id` must place
+        // its referenced id in the STYLE_RESOURCE_ID slot, which is what `TypedArray.getResourceId`
+        // reads to set the view's id. Pin offset = View_id-style window + STYLE_RESOURCE_ID, so a layout
+        // regression that mis-places it (re-breaking findViewById/setText) fails loudly here.
+        let id = 0x7f03_0000i32;
+        let entries = [Some(TypedEntry {
+            value_type: i32::from(TYPE_REFERENCE),
+            data: id,
+            resource_id: id,
+            asset_cookie: 0,
+        })];
+        let mut values = vec![0i32; STYLE_NUM_ENTRIES];
+        let v_ptr = values.as_mut_ptr() as jlong;
+        fill_typed_array(v_ptr, 0, &entries);
+        assert_eq!(values[STYLE_TYPE], i32::from(TYPE_REFERENCE));
+        assert_eq!(
+            values[STYLE_RESOURCE_ID], id,
+            "getResourceId reads the referenced id from STYLE_RESOURCE_ID"
+        );
+    }
+
+    #[test]
     fn fill_typed_array_null_pointers_are_a_no_op() {
         // A 0 ("no buffer") pointer for either output must be skipped — never dereferenced. A
         // non-empty entries slice ensures the loop body would run if the guard were missing.
         let entries = [Some(TypedEntry {
-            value_type: 0x03,
+            value_type: i32::from(TYPE_STRING),
             data: 1,
+            resource_id: 0,
+            asset_cookie: XML_BLOCK_COOKIE,
         })];
         fill_typed_array(0, 0, &entries);
     }
@@ -3796,6 +4039,14 @@ mod tests {
             "nativeGetLineNumber"
         );
         assert_eq!(XML_BLOCK_GET_LINE_NUMBER_SIG.to_str(), "(J)I");
+        assert_eq!(
+            XML_BLOCK_GET_POOLED_STRING_NAME.to_str(),
+            "nativeGetPooledString"
+        );
+        assert_eq!(
+            XML_BLOCK_GET_POOLED_STRING_SIG.to_str(),
+            "(JI)Ljava/lang/String;"
+        );
         assert_eq!(XML_LINE_UNKNOWN, -1);
         // XmlPullParser event constants nativeNext maps to (stable public API).
         assert_eq!(XML_EVENT_END_DOCUMENT, 1);
@@ -3844,8 +4095,17 @@ mod tests {
             "native_requestLayout"
         );
         assert_eq!(VIEW_NATIVE_REQUEST_LAYOUT_SIG.to_str(), "(J)V");
+        // The View.widget field (the view_registry handle on `this`) instance natives read.
+        assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
+        assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
         // TextView re-declares native_constructor (same signature); pin its class internal name.
         assert_eq!(TEXT_VIEW_CLASS.to_str(), "android/widget/TextView");
+        // TextView.native_setText: TextView.java line 111 → instance `(Ljava/lang/String;)V`.
+        assert_eq!(TEXT_VIEW_NATIVE_SET_TEXT_NAME.to_str(), "native_setText");
+        assert_eq!(
+            TEXT_VIEW_NATIVE_SET_TEXT_SIG.to_str(),
+            "(Ljava/lang/String;)V"
+        );
     }
 
     #[test]
