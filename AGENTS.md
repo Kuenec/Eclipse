@@ -433,6 +433,29 @@ before any history-rewriting/force operation.
   audio 8). NEXT native category = ndk-android (27)** (AAsset*/AAssetManager* reuse Eclipse's AssetManager; ANativeWindow_*
   → host surface; ALooper_* → an Eclipse NDK looper; AConfiguration_* → device config). See §6 (2026-06-05 Eclipse-native
   provider tier).
+  **2026-06-05 UPDATE — the ndk-android (libandroid) tier is built + tested + PROVEN on the real engine (work-list 70 →
+  43):** `src/loader/native_provider.rs` now registers all **27** `libandroid` natives (provider total **45** = liblog 3 +
+  bionic-libc 15 + ndk-android 27). New `src/loader/ndk_registry.rs` (`pub mod ndk_registry;`, `#![forbid(unsafe_code)]`)
+  is a generic process-global **generational-slab** registry (the `window_registry` soundness pattern): opaque NDK
+  pointers (`AAssetManager*`/`AAsset*`/`AConfiguration*`/`ALooper*`/`ANativeWindow*`) are Eclipse-owned generational
+  indices cast to `*mut T`, so a stale/fabricated handle is a bounds+generation-checked typed `Err` → NDK sentinel
+  (NULL/negative), **never UB**. **Each native labelled real/minimal-correct/sound-stub:** AAsset*/AAssetManager* (6)
+  **REAL** — route to Eclipse's own `src/apk` reader (`AAssetManager_open` reads `assets/<name>` real bytes,
+  `AAsset_getBuffer`/`getLength` hand them back; `AAsset_openFileDescriptor` is a sound-stub returning -1 = NDK "no direct
+  fd" → buffer fallback); AConfiguration* (9) **minimal-correct** (Eclipse device config: xhdpi/320 portrait, real
+  getters); ALooper* (7) **minimal-correct** (Eclipse per-thread looper + fd registry; `pollOnce` → `ALOOPER_POLL_TIMEOUT`
+  for a finite wait / `ALOOPER_POLL_ERROR` for an infinite wait with no event source — documented sentinel, NOT a fake
+  CALLBACK); ANativeWindow* (5) **sound-stub** (real geometry getters; surface/buffer **deferred-to-render-integration**;
+  acquire/release sound no-ops). Boot path (`src/main.rs`) calls `ndk_registry::set_apk_path(apk)` so the asset natives
+  serve real bytes. REAL gated test `link::tests::real_libroblox_eclipse_natives_resolve_liblog_libc_and_ndk_android`:
+  work-list **88 → 43**, `applied_nonnull` **553 → 580** (+27), **45** Eclipse-native GOT slots read-back = the Eclipse
+  addr (all 27 ndk-android among them; host `dlsym` = None). `unsafe` confined to the native FFI bodies (dated `// SAFETY:`),
+  `ndk_registry`/reloc/elf/resolve stay `#![forbid(unsafe_code)]`; ZERO new crates. Gate **337 unit + 2 doctests** (fmt/
+  build/clippy `-D warnings`/test/release all clean). **Engine-load frontier: liblog (3/5) + bionic-libc (15/15) +
+  ndk-android (27/27) DONE; work-list now 43 (2 variadic liblog + media-ndk 33 + audio 8). NEXT native category =
+  media-ndk (33) + audio (8)** (bridges to host codecs / host audio), then full-resolution apply + the 3,427
+  `DT_INIT_ARRAY` ctors (RELRO+BIND_NOW, no `%fs`/TCB — no PT_TLS; main-loop/dev-host only). See §6 (2026-06-05
+  ndk-android tier).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3178,6 +3201,39 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   **NEXT native category = ndk-android (27)** — `AAsset*`/`AAssetManager*` reuse Eclipse's AssetManager, `ANativeWindow_*`
   → host surface, `ALooper_*` → an Eclipse NDK looper, `AConfiguration_*` → device config; then media-ndk (33) + audio (8)
   + the 2 deferred variadic liblog; then bind + run the 3,427 DT_INIT_ARRAY ctors (no `%fs`/TCB — no PT_TLS), main-loop only.
+- **2026-06-05** — **ndk-android (libandroid) Eclipse-native tier — all 27 done; work-list 70 → 43.** Added the 27
+  `libandroid` C-ABI natives to `src/loader/native_provider.rs` (provider total 18 → 45) + a new
+  `src/loader/ndk_registry.rs` — a generic process-global **generational-slab** registry (`#![forbid(unsafe_code)]`,
+  std-only, the `framework::window_registry` soundness pattern generalized over `T`). **Decision: opaque NDK pointers are
+  Eclipse-owned generational registry indices cast to `*mut T`, NOT `Box::into_raw`** — so a stale/double-freed/fabricated
+  `AAsset*`/`AAssetManager*`/`AConfiguration*`/`ALooper*`/`ANativeWindow*` is a bounds+generation-checked typed `Err` →
+  NDK sentinel (NULL/negative), never a wild deref / UB across the C ABI. **Honesty labels (AGENTS.md core principle):**
+  AAsset*/AAssetManager* (6) **REAL** — routed to Eclipse's OWN benign `src/apk` reader (`AAssetManager_open` reads
+  `assets/<name>`'s real bytes; `getBuffer` returns a lifetime-stable pointer into the owned `Box<[u8]>`; `getLength`=len;
+  `openFileDescriptor` is a sound-stub returning -1 = NDK "no direct fd, use the buffer", NOT a fake fd); AConfiguration*
+  (9) **minimal-correct** (Eclipse device config — xhdpi/320 portrait 1080x1920 → 540x960 dp, real getters from the public
+  `<android/configuration.h>` constants verified via Context7 `/websites/developer_android_ndk_reference`); ALooper* (7)
+  **minimal-correct** (per-thread looper + fd registry; `pollOnce` → `ALOOPER_POLL_TIMEOUT`(-3) finite / `ALOOPER_POLL_ERROR`
+  (-4) infinite — a documented sentinel a caller must handle, never a fake CALLBACK landmine; acquire/release sound no-ops
+  for registry-lifetime loopers); ANativeWindow* (5) **sound-stub** (getters return real geometry; `fromSurface` mints a
+  geometry handle but the surface/buffer bind is **deferred-to-render-integration** = the upcoming GLES2/EGL path).
+  `src/main.rs` boot path calls `ndk_registry::set_apk_path(apk)` so the asset natives serve real bytes. **REAL gated proof**
+  (`link::tests::real_libroblox_eclipse_natives_resolve_liblog_libc_and_ndk_android`, renamed): work-list **88 → 43**,
+  `applied_nonnull` **553 → 580** (+27), all 27 ndk-android resolve to Eclipse addrs, 45 GOT slots verified, no
+  panic/leak/exec. **Regression guards (tied to root cause = no-UB opaque handles + real asset bytes):** 6 ndk_registry
+  unit tests (distinct non-NULL handles, freed-handle-is-Stale-not-aliasing, OOB/NULL/fabricated→Err, double-free, stable
+  asset-buffer address) + 5 native_provider unit tests (AAsset open→getBuffer/getLength real-bytes round-trip via a temp
+  APK + missing-asset→NULL + stale-manager→NULL + double-close-no-UB; AConfiguration getters return set values; ALooper
+  idempotent-prepare + pollOnce sentinels + addFd/removeFd; ANativeWindow real geometry + stale→-1) + the gated real test's
+  27-name assertion. `unsafe` confined to the native FFI bodies (dated `// SAFETY:`); `ndk_registry`/reloc/elf/resolve stay
+  `#![forbid(unsafe_code)]`; ZERO new crates. **Cyber-safeguard: clean — wrote Eclipse's OWN clean-room Rust grounded only
+  in the public NDK C-ABI (Context7-verified) + Eclipse's own `src/apk`; did NOT read apkenv/bionic/NDK source, the flagged
+  framework asset/window sections, or any dynamic-linker source.** Files: `native_provider.rs` (+27 natives, +tests, docs),
+  `ndk_registry.rs` (new), `loader.rs` (mod), `main.rs` (set_apk_path), `link.rs` (gated test renamed + 88→43/45-name
+  assertions), `docs/bionic-env-worklist.md` (ndk-android checked off, real vs stub noted). **Gate:** fmt --check/build
+  --all-targets/clippy (-D warnings)/test (**337 unit + 2 doctests**)/release all 0-warning/0-error. **NEXT = media-ndk
+  (33) + audio (8)** bridges, then the 2 deferred variadic liblog, then full-resolution apply + the 3,427 DT_INIT_ARRAY
+  ctors (RELRO+BIND_NOW, no `%fs`/TCB — no PT_TLS), main-loop/dev-host only.
 
 ---
 

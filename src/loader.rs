@@ -95,6 +95,7 @@ pub mod elf;
 pub mod link;
 pub mod map;
 pub mod native_provider;
+pub mod ndk_registry;
 pub mod reloc;
 pub mod resolve;
 pub mod tls;

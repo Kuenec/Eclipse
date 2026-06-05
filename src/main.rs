@@ -87,6 +87,10 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut apk = eclipse::apk::Apk::open(std::path::Path::new(apk_path))?;
+    // 2026-06-05: configure the asset source for Eclipse's ndk-android natives (libandroid). The
+    // engine's `AAssetManager_fromJava`/`AAssetManager_open` serve `assets/*` from this APK via
+    // Eclipse's own `src/apk` reader (set once; idempotent — no-op if a later call repeats it).
+    eclipse::loader::ndk_registry::set_apk_path(std::path::PathBuf::from(apk_path));
     let manifest = apk.manifest()?;
     let config = eclipse::config::Config::load()?;
     let plan = eclipse::runtime::BootPlan::new(&manifest, &config);

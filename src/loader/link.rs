@@ -1743,13 +1743,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- REAL test: the ECLIPSE-NATIVE tier resolves liblog + bionic-libc on libroblox -----------
+    // ---- REAL test: the ECLIPSE-NATIVE tier resolves liblog + bionic-libc + ndk-android ----------
     // (skips cleanly if the APK is absent — never fails / fabricates). With the EclipseNativeProvider
-    // PREPENDED before the host baseline, the engine's liblog (3 fixed-arity) + bionic-libc (15)
-    // imports now resolve to ECLIPSE addresses (NOT host glibc), and the work-list shrinks 88 -> 70.
+    // PREPENDED before the host baseline, the engine's liblog (3 fixed-arity) + bionic-libc (15) +
+    // ndk-android (27) imports now resolve to ECLIPSE addresses (NOT host glibc), and the work-list
+    // shrinks 88 -> 43 (the 2 deferred variadic liblog + media-ndk 33 + audio 8).
 
     #[test]
-    fn real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc() {
+    fn real_libroblox_eclipse_natives_resolve_liblog_libc_and_ndk_android() {
         use crate::loader::bionic_env::{categorize_imports, BionicEnv};
         use crate::loader::native_provider::EclipseNativeProvider;
         use crate::loader::resolve::{HostDlsymProvider, SymbolProvider};
@@ -1811,15 +1812,16 @@ mod tests {
             88,
             "host-baseline work-list is the documented 88"
         );
-        // The Eclipse tier resolves the 3 fixed-arity liblog + 15 bionic-libc = 18 names, shrinking
-        // the work-list from 88 to 70 (the 2 deferred variadic liblog + ndk 27 + media 33 + audio 8).
+        // The Eclipse tier resolves 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android = 45
+        // names, shrinking the work-list from 88 to 43 (2 deferred variadic liblog + media 33 +
+        // audio 8).
         assert_eq!(
             with_eclipse.unresolved_count(),
-            70,
-            "Eclipse natives shrink the work-list 88 -> 70 (18 liblog+libc resolved)"
+            43,
+            "Eclipse natives shrink the work-list 88 -> 43 (45 liblog+libc+ndk resolved)"
         );
 
-        // The 18 newly-resolved names are EXACTLY the ones the Eclipse provider registers, and they
+        // The 45 newly-resolved names are EXACTLY the ones the Eclipse provider registers, and they
         // resolve to ECLIPSE addresses, not host ones: prove it by resolving each against an
         // Eclipse-only provider AND confirming the host (`dlsym`) has no such symbol.
         let eclipse_only = EclipseNativeProvider::with_bionic_natives();
@@ -1837,9 +1839,44 @@ mod tests {
         );
         assert_eq!(
             newly_resolved.len(),
-            18,
-            "exactly 18 imports move from work-list to Eclipse-resolved"
+            45,
+            "exactly 45 imports move from work-list to Eclipse-resolved"
         );
+        // All 27 ndk-android names must be among the newly-resolved set (resolve to Eclipse).
+        for ndk in [
+            "AAssetManager_fromJava",
+            "AAssetManager_open",
+            "AAsset_close",
+            "AAsset_getBuffer",
+            "AAsset_getLength",
+            "AAsset_openFileDescriptor",
+            "AConfiguration_new",
+            "AConfiguration_delete",
+            "AConfiguration_fromAssetManager",
+            "AConfiguration_getCountry",
+            "AConfiguration_getLanguage",
+            "AConfiguration_getNavHidden",
+            "AConfiguration_getScreenHeightDp",
+            "AConfiguration_getScreenSize",
+            "AConfiguration_getScreenWidthDp",
+            "ALooper_prepare",
+            "ALooper_forThread",
+            "ALooper_acquire",
+            "ALooper_release",
+            "ALooper_pollOnce",
+            "ALooper_addFd",
+            "ALooper_removeFd",
+            "ANativeWindow_fromSurface",
+            "ANativeWindow_getWidth",
+            "ANativeWindow_getHeight",
+            "ANativeWindow_acquire",
+            "ANativeWindow_release",
+        ] {
+            assert!(
+                newly_resolved.contains(ndk),
+                "{ndk} (ndk-android) must resolve to Eclipse"
+            );
+        }
         for name in &newly_resolved {
             let e = eclipse_only
                 .resolve(name)
@@ -1877,8 +1914,8 @@ mod tests {
             "Eclipse-native partial apply: applied_nonnull={} applied_weak_zero={} unresolved_strong={} (work-list={})",
             stats.applied_nonnull, stats.applied_weak_zero, stats.unresolved_strong, stats.unresolved.len(),
         );
-        // The apply's work-list must equal the categorization's (consistency), and shrink to 70.
-        assert_eq!(stats.unresolved.len(), 70, "applied work-list is 70");
+        // The apply's work-list must equal the categorization's (consistency), and shrink to 43.
+        assert_eq!(stats.unresolved.len(), 43, "applied work-list is 43");
         assert!(
             stats.applied_nonnull > 0,
             "Eclipse + host fill a non-trivial GOT subset"

@@ -47,18 +47,40 @@
 //! that cross the C ABI (raw-pointer args, forwarding to glibc), each with a dated `// SAFETY:` note.
 //! [`super::reloc`]/[`super::elf`]/[`super::resolve`] stay `#![forbid(unsafe_code)]`.
 //!
+//! ## ndk-android (libandroid) tier — the 27 NDK natives (added 2026-06-05)
+//! The second Eclipse-native category: the 27 `libandroid` C-ABI imports from
+//! `docs/bionic-env-worklist.md`. Each is labelled at its definition:
+//! - **AAsset / AAssetManager (6) — real:** route to Eclipse's own [`crate::apk`] reader.
+//!   `AAssetManager_open` reads the named `assets/<name>` zip entry's real bytes; `AAsset_getBuffer`
+//!   /`AAsset_getLength` hand them back; `AAsset_close` frees the owned-handle slot. Handles are
+//!   Eclipse-owned generational [`super::ndk_registry`] indices cast to the opaque NDK pointers, so a
+//!   stale/fabricated `AAsset*`/`AAssetManager*` is a typed `Err` → NDK sentinel, never UB.
+//! - **AConfiguration (9) — minimal-correct:** an Eclipse `AConfiguration` holding sane device values
+//!   (mdpi/160, the window geometry in dp, portrait); the getters read them back.
+//! - **ALooper (7) — minimal-correct:** a small Eclipse per-thread looper (an fd registry); `pollOnce`
+//!   returns the documented `ALOOPER_POLL_*` sentinel a caller must handle (NOT a fake-success
+//!   landmine).
+//! - **ANativeWindow (5) — sound-stub:** the getters return the real window geometry; the
+//!   surface/buffer bits whose real behavior is the upcoming GLES2/EGL render integration return
+//!   documented sound sentinels (valid-but-empty handle / negative error per the NDK contract) so
+//!   resolution + early init proceed WITHOUT pretending a frame was presented. Deferred-to-render.
+//!
 //! ## What this is NOT (honest scope, dated 2026-06-05)
-//! Registering a correct address makes the relocation land *and* (for the forward/minimal natives)
-//! makes a **call** to that symbol behave per its public contract. It does **not** by itself make
-//! `libroblox.so` runnable — that needs the rest of the work-list (ndk-android / media-ndk / audio),
-//! binding the image to execution, and running the `DT_INIT_ARRAY` constructors (the runtime tail,
-//! main-loop / dev-host only).
+//! Registering a correct address makes the relocation land *and* (for the forward/minimal/real
+//! natives) makes a **call** to that symbol behave per its public contract. It does **not** by itself
+//! make `libroblox.so` runnable — that needs the rest of the work-list (media-ndk / audio + the 2
+//! variadic liblog), binding the image to execution, and running the `DT_INIT_ARRAY` constructors
+//! (the runtime tail, main-loop / dev-host only). The ANativeWindow surface/buffer natives are
+//! explicitly **deferred to the render integration** (documented sound sentinels until then).
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+use super::ndk_registry::{
+    self, AssetManagerState, AssetState, ConfigurationState, LooperState, NativeWindowState,
+};
 use super::resolve::{ResolvedSym, SymbolProvider};
 
 // =================================================================================================
@@ -104,16 +126,17 @@ impl EclipseNativeProvider {
         self.natives.is_empty()
     }
 
-    /// Build the provider with the **fixed-arity liblog (3)** + **bionic-specific libc (15)** natives
-    /// this module implements registered. Taking each native's address is safe Rust (a function/data
-    /// item coerced to a pointer then to `u64`).
+    /// Build the provider with the **fixed-arity liblog (3)** + **bionic-specific libc (15)** +
+    /// **ndk-android libandroid (27)** natives this module implements registered. Taking each
+    /// native's address is safe Rust (a function/data item coerced to a pointer then to `u64`).
     ///
     /// The names are the real work-list from `loader::link::tests::real_libroblox_bionic_env_*`
     /// (`docs/bionic-env-worklist.md`): of liblog's 5, the 2 **variadic** ones
     /// (`__android_log_print`/`__android_log_assert`) stay on the work-list (see the module docs); of
-    /// bionic-libc's 15, all are implemented. **18** symbols total — registering them shrinks the
-    /// engine's work-list from 88 to **70** (the 2 deferred variadic liblog + ndk-android 27 +
-    /// media-ndk 33 + audio 8).
+    /// bionic-libc's 15, all are implemented; of ndk-android's 27, all are implemented (AAsset* real
+    /// via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub). **45**
+    /// symbols total — registering them shrinks the engine's work-list from 88 to **43** (the 2
+    /// deferred variadic liblog + media-ndk 33 + audio 8).
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -157,6 +180,114 @@ impl EclipseNativeProvider {
         // bionic data OBJECTs (not functions): the SSP guard word and the stdio FILE table.
         p.register("__stack_chk_guard", eclipse_stack_chk_guard_addr());
         p.register("__sF", eclipse_sf_addr());
+
+        // ---- ndk-android (libandroid) — the 27 NDK natives -------------------------------------
+        // AAsset / AAssetManager (6) — REAL, routed to Eclipse's own `src/apk` reader.
+        p.register(
+            "AAssetManager_fromJava",
+            eclipse_aassetmanager_fromjava as *const () as u64,
+        );
+        p.register(
+            "AAssetManager_open",
+            eclipse_aassetmanager_open as *const () as u64,
+        );
+        p.register("AAsset_close", eclipse_aasset_close as *const () as u64);
+        p.register(
+            "AAsset_getBuffer",
+            eclipse_aasset_getbuffer as *const () as u64,
+        );
+        p.register(
+            "AAsset_getLength",
+            eclipse_aasset_getlength as *const () as u64,
+        );
+        p.register(
+            "AAsset_openFileDescriptor",
+            eclipse_aasset_openfiledescriptor as *const () as u64,
+        );
+        // AConfiguration (9) — MINIMAL-CORRECT, real getters over Eclipse device values.
+        p.register(
+            "AConfiguration_new",
+            eclipse_aconfiguration_new as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_delete",
+            eclipse_aconfiguration_delete as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_fromAssetManager",
+            eclipse_aconfiguration_fromassetmanager as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_getCountry",
+            eclipse_aconfiguration_getcountry as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_getLanguage",
+            eclipse_aconfiguration_getlanguage as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_getNavHidden",
+            eclipse_aconfiguration_getnavhidden as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_getScreenHeightDp",
+            eclipse_aconfiguration_getscreenheightdp as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_getScreenSize",
+            eclipse_aconfiguration_getscreensize as *const () as u64,
+        );
+        p.register(
+            "AConfiguration_getScreenWidthDp",
+            eclipse_aconfiguration_getscreenwidthdp as *const () as u64,
+        );
+        // ALooper (7) — MINIMAL-CORRECT Eclipse per-thread looper; pollOnce returns ALOOPER_POLL_*.
+        p.register(
+            "ALooper_prepare",
+            eclipse_alooper_prepare as *const () as u64,
+        );
+        p.register(
+            "ALooper_forThread",
+            eclipse_alooper_forthread as *const () as u64,
+        );
+        p.register(
+            "ALooper_acquire",
+            eclipse_alooper_acquire as *const () as u64,
+        );
+        p.register(
+            "ALooper_release",
+            eclipse_alooper_release as *const () as u64,
+        );
+        p.register(
+            "ALooper_pollOnce",
+            eclipse_alooper_pollonce as *const () as u64,
+        );
+        p.register("ALooper_addFd", eclipse_alooper_addfd as *const () as u64);
+        p.register(
+            "ALooper_removeFd",
+            eclipse_alooper_removefd as *const () as u64,
+        );
+        // ANativeWindow (5) — SOUND-STUB; getters return real geometry, refcount ops are no-ops.
+        p.register(
+            "ANativeWindow_fromSurface",
+            eclipse_anativewindow_fromsurface as *const () as u64,
+        );
+        p.register(
+            "ANativeWindow_getWidth",
+            eclipse_anativewindow_getwidth as *const () as u64,
+        );
+        p.register(
+            "ANativeWindow_getHeight",
+            eclipse_anativewindow_getheight as *const () as u64,
+        );
+        p.register(
+            "ANativeWindow_acquire",
+            eclipse_anativewindow_acquire as *const () as u64,
+        );
+        p.register(
+            "ANativeWindow_release",
+            eclipse_anativewindow_release as *const () as u64,
+        );
 
         p
     }
@@ -613,6 +744,542 @@ fn eclipse_sf_addr() -> u64 {
     std::ptr::addr_of!(t.0) as u64
 }
 
+// =================================================================================================
+// ndk-android (libandroid) — the 27 NDK natives. Opaque NDK pointers are Eclipse-owned generational
+// registry handles ([`super::ndk_registry`]) cast to `*mut T`, so a stale/fabricated handle is a
+// typed `Err` → NDK sentinel (NULL / negative), never a wild dereference / UB.
+// =================================================================================================
+
+// ---- shared handle <-> opaque-pointer casts -----------------------------------------------------
+
+/// Cast an Eclipse [`ndk_registry::NdkHandle`] to the opaque NDK `*mut T` returned to C. The handle's
+/// generation is ≥ 1, so a live handle is never NULL.
+fn handle_to_ptr<T>(h: ndk_registry::NdkHandle) -> *mut T {
+    h as usize as *mut T
+}
+
+/// Cast an opaque NDK `*const T`/`*mut T` from C back to an Eclipse [`ndk_registry::NdkHandle`].
+fn ptr_to_handle<T>(p: *const T) -> ndk_registry::NdkHandle {
+    p as usize as ndk_registry::NdkHandle
+}
+
+// ---- device defaults (minimal-correct AConfiguration / sound ANativeWindow geometry) ------------
+//
+// 2026-06-05: sane defaults for a generic portrait phone surface until a real device-config / live
+// winit-window geometry source is wired (the winit window does not exist at engine-init time). These
+// are documented constants, not magic: a 1080x1920 portrait display at xhdpi (320). dp = px*160/dpi.
+
+/// `ACONFIGURATION_DENSITY_MEDIUM` baseline dpi (1 dp == 1 px). From `<android/configuration.h>`.
+const ACONFIGURATION_DENSITY_BASELINE: i32 = 160;
+/// `ACONFIGURATION_DENSITY_XHIGH` — Eclipse's default display density (xhdpi).
+const ACONFIGURATION_DENSITY_XHIGH: i32 = 320;
+/// `ACONFIGURATION_ORIENTATION_PORT` — portrait. From `<android/configuration.h>`.
+const ACONFIGURATION_ORIENTATION_PORT: i32 = 1;
+/// `ACONFIGURATION_SCREENSIZE_NORMAL` — a normal-size screen. From `<android/configuration.h>`.
+const ACONFIGURATION_SCREENSIZE_NORMAL: i32 = 2;
+/// `ACONFIGURATION_NAVHIDDEN_YES` — no exposed hardware nav keys (a touchscreen surface).
+const ACONFIGURATION_NAVHIDDEN_YES: i32 = 2;
+/// Default display width in pixels (portrait phone).
+const DEFAULT_DISPLAY_WIDTH_PX: i32 = 1080;
+/// Default display height in pixels (portrait phone).
+const DEFAULT_DISPLAY_HEIGHT_PX: i32 = 1920;
+/// `AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM` / `WINDOW_FORMAT_RGBA_8888` = 1 — the default surface
+/// format. From `<android/hardware_buffer.h>` / `<android/native_window.h>`.
+const WINDOW_FORMAT_RGBA_8888: i32 = 1;
+
+/// Eclipse's default [`ConfigurationState`]: xhdpi portrait phone (see the device-default constants).
+/// dp = px * 160 / dpi, so at 320 dpi the 1080x1920 display is 540x960 dp.
+fn default_configuration() -> ConfigurationState {
+    let to_dp = |px: i32| px * ACONFIGURATION_DENSITY_BASELINE / ACONFIGURATION_DENSITY_XHIGH;
+    ConfigurationState {
+        density: ACONFIGURATION_DENSITY_XHIGH,
+        screen_width_dp: to_dp(DEFAULT_DISPLAY_WIDTH_PX),
+        screen_height_dp: to_dp(DEFAULT_DISPLAY_HEIGHT_PX),
+        screen_size: ACONFIGURATION_SCREENSIZE_NORMAL,
+        orientation: ACONFIGURATION_ORIENTATION_PORT,
+        nav_hidden: ACONFIGURATION_NAVHIDDEN_YES,
+        language: *b"en",
+        country: *b"US",
+    }
+}
+
+/// Eclipse's default [`NativeWindowState`]: the default portrait display geometry, RGBA8888.
+fn default_native_window() -> NativeWindowState {
+    NativeWindowState {
+        width: DEFAULT_DISPLAY_WIDTH_PX,
+        height: DEFAULT_DISPLAY_HEIGHT_PX,
+        format: WINDOW_FORMAT_RGBA_8888,
+    }
+}
+
+// ---- AAsset / AAssetManager (6) — REAL: route to Eclipse's own `src/apk` reader -----------------
+
+/// The APK zip prefix Android assets live under (`AAssetManager_open("foo")` → `assets/foo`).
+const ASSET_ENTRY_PREFIX: &str = "assets/";
+
+/// `AAssetManager* AAssetManager_fromJava(JNIEnv* env, jobject assetManager)` — obtain a native asset
+/// manager from a Java `AssetManager`. **real:** Eclipse owns the asset backing; it serves assets from
+/// the APK path the boot path configured via [`ndk_registry::set_apk_path`] (the opaque JNI args
+/// cannot yield the APK without the cyber-safeguarded framework code). Returns an Eclipse
+/// `AAssetManager*` handle, or NULL if no APK path is configured (a sound "no source", not a fake).
+///
+/// # Safety
+/// `env`/`asset_manager` are the JNI args; this native does not dereference them (Eclipse derives the
+/// asset source from its own configured APK path), so any pointer value is accepted safely.
+unsafe extern "C" fn eclipse_aassetmanager_fromjava(
+    _env: *mut c_void,
+    _asset_manager: *mut c_void,
+) -> *mut c_void {
+    match ndk_registry::apk_path() {
+        Some(path) => {
+            let state = AssetManagerState {
+                apk_path: path.clone(),
+            };
+            match ndk_registry::asset_managers().insert(state) {
+                Ok(h) => handle_to_ptr(h),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        None => std::ptr::null_mut(), // no configured APK → no asset source (sound, not a fake)
+    }
+}
+
+/// `AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode)` — open an asset
+/// for reading. **real:** reads the `assets/<filename>` zip entry's real bytes via Eclipse's
+/// [`crate::apk::Apk`] reader and stores them in an owned `AAsset*` handle. Returns NULL if the
+/// manager handle is stale/fabricated, the APK cannot be opened, or the entry is absent — the bionic
+/// contract for a missing asset (the caller checks for NULL). `mode` (BUFFER/RANDOM/STREAMING) is
+/// advisory; Eclipse always buffers the whole entry (the assets here are small config/XML files).
+///
+/// # Safety
+/// `mgr` must be an `AAssetManager*` previously returned by an Eclipse asset native (or NULL/garbage,
+/// which is rejected by the generation check); `filename` must be a valid NUL-terminated C string.
+unsafe extern "C" fn eclipse_aassetmanager_open(
+    mgr: *mut c_void,
+    filename: *const c_char,
+    _mode: c_int,
+) -> *mut c_void {
+    // SAFETY: 2026-06-05 — `filename` is the public C-string arg (null-or-valid NUL-terminated).
+    let Some(name) = (unsafe { cstr_opt(filename) }) else {
+        return std::ptr::null_mut();
+    };
+    // Look up the manager's APK path (stale/fabricated handle → Err → NULL, never a deref).
+    let apk_path =
+        match ndk_registry::asset_managers().with(ptr_to_handle(mgr), |m| m.apk_path.clone()) {
+            Ok(p) => p,
+            Err(_) => return std::ptr::null_mut(),
+        };
+    // Read the real bytes of `assets/<name>` through Eclipse's own benign APK reader.
+    let entry = format!("{ASSET_ENTRY_PREFIX}{name}");
+    let bytes = match crate::apk::Apk::open(&apk_path).and_then(|mut a| a.read_entry(&entry)) {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(), // missing/unreadable asset → NULL (bionic contract)
+    };
+    let state = AssetState {
+        bytes: bytes.into_boxed_slice(),
+        cursor: 0,
+    };
+    match ndk_registry::assets().insert(state) {
+        Ok(h) => handle_to_ptr(h),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// `void AAsset_close(AAsset* asset)` — free an asset opened by [`eclipse_aassetmanager_open`].
+/// **real:** frees the owned-handle slot (and its bytes). A stale/double-close handle is a typed
+/// `Err` that is ignored (closing an invalid handle is a harmless no-op, never UB).
+///
+/// # Safety
+/// `asset` must be an `AAsset*` from an Eclipse asset native (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_aasset_close(asset: *mut c_void) {
+    let _ = ndk_registry::assets().remove(ptr_to_handle(asset));
+}
+
+/// `const void* AAsset_getBuffer(AAsset* asset)` — get a pointer to the whole asset contents.
+/// **real:** returns a pointer to the owned bytes (stable for the asset's lifetime — see
+/// [`ndk_registry`]'s pointer-stability note). Returns NULL for a stale/fabricated handle (bionic
+/// returns NULL on failure).
+///
+/// # Safety
+/// `asset` must be an `AAsset*` from an Eclipse asset native (or garbage, which is rejected). The
+/// returned pointer is valid until [`eclipse_aasset_close`] of the same handle.
+unsafe extern "C" fn eclipse_aasset_getbuffer(asset: *mut c_void) -> *const c_void {
+    // SAFETY of the returned pointer: 2026-06-05 — `bytes` is a `Box<[u8]>` whose contents have a
+    // stable heap address that does not move while the slot lives (read-only after open, never
+    // re-allocated); the slot is freed only by `AAsset_close`. So the pointer stays valid for the
+    // asset's lifetime, exactly the `AAsset_getBuffer` contract. Returning the address out of the
+    // lock is sound because nothing mutates or moves the bytes.
+    match ndk_registry::assets().with(ptr_to_handle(asset), |a| a.bytes.as_ptr() as *const c_void) {
+        Ok(p) => p,
+        Err(_) => std::ptr::null(),
+    }
+}
+
+/// `off_t AAsset_getLength(AAsset* asset)` — the asset's total length in bytes. **real:** returns
+/// `bytes.len()`. Returns 0 for a stale/fabricated handle (a sound "empty", not a wrong non-zero).
+///
+/// # Safety
+/// `asset` must be an `AAsset*` from an Eclipse asset native (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_aasset_getlength(asset: *mut c_void) -> libc::off_t {
+    match ndk_registry::assets().with(ptr_to_handle(asset), |a| a.bytes.len()) {
+        Ok(n) => libc::off_t::try_from(n).unwrap_or(libc::off_t::MAX),
+        Err(_) => 0,
+    }
+}
+
+/// `int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength)` — get a file
+/// descriptor for direct asset access. **sound-stub:** Eclipse serves assets from in-memory bytes
+/// (read from the APK zip), so there is no backing file descriptor for the asset region. The NDK
+/// contract is to return `< 0` "if direct fd access is not possible (for example, if the asset is
+/// compressed)" — Eclipse returns `-1`, the documented sound failure, so callers fall back to
+/// `AAsset_getBuffer`/`AAsset_read` (which Eclipse serves with real bytes). NOT a fake fd.
+///
+/// # Safety
+/// `asset` must be an `AAsset*` from an Eclipse asset native; `out_start`/`out_length` are null or
+/// valid `off_t*`. This native writes neither (it returns the failure sentinel), so they are unused.
+unsafe extern "C" fn eclipse_aasset_openfiledescriptor(
+    _asset: *mut c_void,
+    _out_start: *mut libc::off_t,
+    _out_length: *mut libc::off_t,
+) -> c_int {
+    -1 // direct fd access not possible (in-memory asset) — bionic's documented "< 0" → buffer fallback
+}
+
+// ---- AConfiguration (9) — MINIMAL-CORRECT: real getters over Eclipse device values --------------
+
+/// `AConfiguration* AConfiguration_new(void)` — create a configuration object. **minimal-correct:**
+/// allocates an Eclipse `AConfiguration*` handle holding [`default_configuration`] (sane device
+/// values), or NULL on registry exhaustion.
+extern "C" fn eclipse_aconfiguration_new() -> *mut c_void {
+    match ndk_registry::configurations().insert(default_configuration()) {
+        Ok(h) => handle_to_ptr(h),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// `void AConfiguration_delete(AConfiguration* config)` — free a configuration. **minimal-correct:**
+/// frees the owned-handle slot; a stale handle is a harmless ignored `Err`.
+///
+/// # Safety
+/// `config` must be an `AConfiguration*` from an Eclipse native (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_aconfiguration_delete(config: *mut c_void) {
+    let _ = ndk_registry::configurations().remove(ptr_to_handle(config));
+}
+
+/// `void AConfiguration_fromAssetManager(AConfiguration* out, AAssetManager* am)` — fill `out` with
+/// the configuration in use by the asset manager. **minimal-correct:** Eclipse has one device
+/// configuration, so it copies [`default_configuration`] into the existing `out` handle (the engine
+/// passes an `AConfiguration*` it got from `AConfiguration_new`). A stale `out` handle is ignored.
+///
+/// # Safety
+/// `out` must be an `AConfiguration*` from [`eclipse_aconfiguration_new`]; `am` is unused (Eclipse's
+/// config is manager-independent here) and may be any value.
+unsafe extern "C" fn eclipse_aconfiguration_fromassetmanager(out: *mut c_void, _am: *mut c_void) {
+    let _ =
+        ndk_registry::configurations().with(ptr_to_handle(out), |c| *c = default_configuration());
+}
+
+/// `void AConfiguration_getCountry(AConfiguration* config, char* outCountry)` — write the 2-char
+/// country code (no NUL). **minimal-correct.**
+///
+/// # Safety
+/// `config` must be an Eclipse `AConfiguration*`; `out_country` must point to ≥ 2 writable bytes (the
+/// `AConfiguration_getCountry` contract). On a stale handle nothing is written.
+unsafe extern "C" fn eclipse_aconfiguration_getcountry(
+    config: *mut c_void,
+    out_country: *mut c_char,
+) {
+    if out_country.is_null() {
+        return;
+    }
+    if let Ok(country) = ndk_registry::configurations().with(ptr_to_handle(config), |c| c.country) {
+        // SAFETY: 2026-06-05 — the public contract guarantees `out_country` has ≥ 2 writable bytes;
+        // we write exactly the 2 country chars (no NUL, per the NDK contract).
+        unsafe {
+            out_country.write(country[0] as c_char);
+            out_country.add(1).write(country[1] as c_char);
+        }
+    }
+}
+
+/// `void AConfiguration_getLanguage(AConfiguration* config, char* outLanguage)` — write the 2-char
+/// language code (no NUL). **minimal-correct.**
+///
+/// # Safety
+/// `config` must be an Eclipse `AConfiguration*`; `out_language` must point to ≥ 2 writable bytes.
+unsafe extern "C" fn eclipse_aconfiguration_getlanguage(
+    config: *mut c_void,
+    out_language: *mut c_char,
+) {
+    if out_language.is_null() {
+        return;
+    }
+    if let Ok(language) = ndk_registry::configurations().with(ptr_to_handle(config), |c| c.language)
+    {
+        // SAFETY: 2026-06-05 — the public contract guarantees `out_language` has ≥ 2 writable bytes;
+        // we write exactly the 2 language chars (no NUL, per the NDK contract).
+        unsafe {
+            out_language.write(language[0] as c_char);
+            out_language.add(1).write(language[1] as c_char);
+        }
+    }
+}
+
+/// `int32_t AConfiguration_getNavHidden(AConfiguration* config)`. **minimal-correct.** Stale handle →
+/// `ACONFIGURATION_NAVHIDDEN_ANY` (0), the "unset" sentinel.
+///
+/// # Safety
+/// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_aconfiguration_getnavhidden(config: *mut c_void) -> i32 {
+    ndk_registry::configurations()
+        .with(ptr_to_handle(config), |c| c.nav_hidden)
+        .unwrap_or(0)
+}
+
+/// `int32_t AConfiguration_getScreenHeightDp(AConfiguration* config)`. **minimal-correct.** Stale
+/// handle → `ACONFIGURATION_SCREEN_HEIGHT_DP_ANY` (0).
+///
+/// # Safety
+/// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_aconfiguration_getscreenheightdp(config: *mut c_void) -> i32 {
+    ndk_registry::configurations()
+        .with(ptr_to_handle(config), |c| c.screen_height_dp)
+        .unwrap_or(0)
+}
+
+/// `int32_t AConfiguration_getScreenSize(AConfiguration* config)`. **minimal-correct.** Stale handle
+/// → `ACONFIGURATION_SCREENSIZE_ANY` (0).
+///
+/// # Safety
+/// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_aconfiguration_getscreensize(config: *mut c_void) -> i32 {
+    ndk_registry::configurations()
+        .with(ptr_to_handle(config), |c| c.screen_size)
+        .unwrap_or(0)
+}
+
+/// `int32_t AConfiguration_getScreenWidthDp(AConfiguration* config)`. **minimal-correct.** Stale
+/// handle → `ACONFIGURATION_SCREEN_WIDTH_DP_ANY` (0).
+///
+/// # Safety
+/// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_aconfiguration_getscreenwidthdp(config: *mut c_void) -> i32 {
+    ndk_registry::configurations()
+        .with(ptr_to_handle(config), |c| c.screen_width_dp)
+        .unwrap_or(0)
+}
+
+// ---- ALooper (7) — MINIMAL-CORRECT Eclipse per-thread looper ------------------------------------
+//
+// 2026-06-05: a thread-local Eclipse looper handle + an fd-registry. `pollOnce` returns the
+// documented `ALOOPER_POLL_*` sentinel (TIMEOUT when given a finite timeout, ERROR when blocking
+// forever with no event source) — a sentinel the NDK contract requires callers to handle, NOT a
+// fake "an event happened" success. Real epoll wiring is deferred until there is an event source
+// (the render/input integration).
+
+// (`ALOOPER_POLL_WAKE` = -1 and `ALOOPER_POLL_CALLBACK` = -2 are part of the public looper contract
+// but Eclipse's natives never return them — `ALooper_wake` is not in libroblox's 27-symbol set and
+// `pollOnce` never fakes a CALLBACK — so they are intentionally not defined here. 2026-06-05.)
+/// `ALOOPER_POLL_TIMEOUT` = -3: no data before the timeout expired. From `<android/looper.h>`.
+const ALOOPER_POLL_TIMEOUT: c_int = -3;
+/// `ALOOPER_POLL_ERROR` = -4: no associated looper / unrecoverable error. From `<android/looper.h>`.
+const ALOOPER_POLL_ERROR: c_int = -4;
+
+thread_local! {
+    /// The calling thread's Eclipse looper handle, set by `ALooper_prepare`, read by
+    /// `ALooper_forThread`. `None` until this thread calls `prepare` (then `forThread` → NULL, the
+    /// NDK contract for a thread with no looper).
+    static THREAD_LOOPER: std::cell::Cell<Option<ndk_registry::NdkHandle>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `ALooper* ALooper_prepare(int opts)` — associate a looper with the calling thread and return it.
+/// **minimal-correct:** returns the thread's existing looper if any (the NDK contract), else creates
+/// an Eclipse looper handle, stores it thread-locally, and returns it. `opts`
+/// (`ALOOPER_PREPARE_ALLOW_NON_CALLBACKS`) is accepted; Eclipse's looper always allows non-callback
+/// fds. Returns NULL only on registry exhaustion.
+extern "C" fn eclipse_alooper_prepare(_opts: c_int) -> *mut c_void {
+    THREAD_LOOPER.with(|tl| {
+        if let Some(h) = tl.get() {
+            return handle_to_ptr(h); // existing looper for this thread (NDK: prepare is idempotent)
+        }
+        match ndk_registry::loopers().insert(LooperState::default()) {
+            Ok(h) => {
+                tl.set(Some(h));
+                handle_to_ptr(h)
+            }
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// `ALooper* ALooper_forThread(void)` — the calling thread's looper, or NULL if none has been
+/// prepared. **minimal-correct:** returns the thread-local looper handle set by `ALooper_prepare`, or
+/// NULL (the exact NDK contract for a thread with no looper).
+extern "C" fn eclipse_alooper_forthread() -> *mut c_void {
+    THREAD_LOOPER.with(|tl| match tl.get() {
+        Some(h) => handle_to_ptr(h),
+        None => std::ptr::null_mut(),
+    })
+}
+
+/// `void ALooper_acquire(ALooper* looper)` — add a reference. **minimal-correct:** Eclipse loopers
+/// live in the process-global registry for the process lifetime (no per-reference free), so this is a
+/// correct no-op — the looper is already kept alive. NOT a landmine (the contract is only "prevent
+/// deletion", which Eclipse already guarantees).
+///
+/// # Safety
+/// `looper` must be an `ALooper*` from an Eclipse looper native (unused here; any value is accepted).
+unsafe extern "C" fn eclipse_alooper_acquire(_looper: *mut c_void) {}
+
+/// `void ALooper_release(ALooper* looper)` — remove a reference. **minimal-correct:** the matching
+/// no-op for [`eclipse_alooper_acquire`] (Eclipse does not refcount-free loopers). NOT a landmine.
+///
+/// # Safety
+/// `looper` must be an `ALooper*` from an Eclipse looper native (unused here; any value is accepted).
+unsafe extern "C" fn eclipse_alooper_release(_looper: *mut c_void) {}
+
+/// `int ALooper_pollOnce(int timeoutMillis, int* outFd, int* outEvents, void** outData)` — wait for
+/// an event. **minimal-correct (documented sentinel, NOT a fake success):** Eclipse's looper has no
+/// event source yet (deferred to the render/input integration), so it cannot deliver a real event.
+/// Per the NDK contract it clears the out-params and returns the *correct* sentinel for the situation:
+/// `ALOOPER_POLL_TIMEOUT` for a finite (≥ 0) timeout (no data arrived), and `ALOOPER_POLL_ERROR` for
+/// an infinite (< 0) wait — blocking forever with no source would hang, so reporting the
+/// no-source error is the sound, non-hanging answer a caller must handle. Never returns
+/// `ALOOPER_POLL_CALLBACK` or a fd id (no fake "an event happened").
+///
+/// # Safety
+/// `out_fd`/`out_events`/`out_data` must each be null or valid writable pointers (the NDK contract);
+/// this native writes the documented "no event" values to the non-null ones.
+unsafe extern "C" fn eclipse_alooper_pollonce(
+    timeout_millis: c_int,
+    out_fd: *mut c_int,
+    out_events: *mut c_int,
+    out_data: *mut *mut c_void,
+) -> c_int {
+    // Clear the out-params to the "no fd / no events / no data" values (NDK: set when no fd fires).
+    if !out_fd.is_null() {
+        // SAFETY: 2026-06-05 — caller-provided writable `int*` per the contract; write the no-fd value.
+        unsafe { out_fd.write(0) };
+    }
+    if !out_events.is_null() {
+        // SAFETY: 2026-06-05 — caller-provided writable `int*`; write the no-events value.
+        unsafe { out_events.write(0) };
+    }
+    if !out_data.is_null() {
+        // SAFETY: 2026-06-05 — caller-provided writable `void**`; write the no-data null.
+        unsafe { out_data.write(std::ptr::null_mut()) };
+    }
+    if timeout_millis >= 0 {
+        ALOOPER_POLL_TIMEOUT // finite wait, nothing arrived — the honest sentinel
+    } else {
+        ALOOPER_POLL_ERROR // infinite wait with no event source: report error, never hang
+    }
+}
+
+/// `int ALooper_addFd(ALooper* looper, int fd, int ident, int events, ALooper_callbackFunc callback,
+/// void* data)` — register a file descriptor with the looper. **minimal-correct:** records `(fd,
+/// ident)` in the Eclipse looper's fd set (bookkeeping-correct for `removeFd`); returns `1` on
+/// success and `-1` on failure (the NDK contract). Eclipse does not yet poll the fd (no epoll until
+/// the event integration), so `pollOnce` will not deliver its events — documented, not a fake.
+///
+/// # Safety
+/// `looper` must be an `ALooper*` from an Eclipse looper native; `callback`/`data` are stored by value
+/// (callback unused here) and are not dereferenced.
+unsafe extern "C" fn eclipse_alooper_addfd(
+    looper: *mut c_void,
+    fd: c_int,
+    ident: c_int,
+    _events: c_int,
+    _callback: *mut c_void,
+    _data: *mut c_void,
+) -> c_int {
+    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| l.fds.push((fd, ident))) {
+        Ok(()) => 1,  // NDK: 1 on success
+        Err(_) => -1, // NDK: -1 on failure (stale/fabricated looper handle)
+    }
+}
+
+/// `int ALooper_removeFd(ALooper* looper, int fd)` — unregister a file descriptor. **minimal-correct:**
+/// removes all entries for `fd` from the Eclipse looper's fd set; returns `1` if the looper handle is
+/// valid (the fd may or may not have been present — the NDK returns 1 for "removed or not present"),
+/// `-1` for a stale/fabricated handle.
+///
+/// # Safety
+/// `looper` must be an `ALooper*` from an Eclipse looper native (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_alooper_removefd(looper: *mut c_void, fd: c_int) -> c_int {
+    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| l.fds.retain(|&(f, _)| f != fd)) {
+        Ok(()) => 1,
+        Err(_) => -1,
+    }
+}
+
+// ---- ANativeWindow (5) — SOUND-STUB: real geometry getters; refcount ops no-op ------------------
+//
+// 2026-06-05: `ANativeWindow_fromSurface` mints an Eclipse window handle holding the default display
+// geometry; the getters return that real geometry. The surface/buffer-presentation natives
+// (`setBuffersGeometry`/`lock`/`unlockAndPost`) are NOT in libroblox's 27-symbol set — when the
+// render integration lands they will route to the GLES2/EGL surface. `acquire`/`release` are correct
+// no-ops (Eclipse windows live for the process lifetime in the registry). DEFERRED-TO-RENDER for the
+// surface/buffer behavior; the geometry returned here is real.
+
+/// `ANativeWindow* ANativeWindow_fromSurface(JNIEnv* env, jobject surface)` — get a native window for
+/// a Java `Surface`. **sound-stub:** Eclipse mints an `ANativeWindow*` handle holding
+/// [`default_native_window`] (the real default display geometry); the actual GLES2/EGL surface
+/// binding is deferred to the render integration. Returns a valid Eclipse handle (so the getters
+/// return real geometry), or NULL on registry exhaustion — never a fake non-window pointer.
+///
+/// # Safety
+/// `env`/`surface` are the JNI args; this native does not dereference them (the surface binding is
+/// deferred), so any value is accepted safely.
+unsafe extern "C" fn eclipse_anativewindow_fromsurface(
+    _env: *mut c_void,
+    _surface: *mut c_void,
+) -> *mut c_void {
+    match ndk_registry::native_windows().insert(default_native_window()) {
+        Ok(h) => handle_to_ptr(h),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// `int32_t ANativeWindow_getWidth(ANativeWindow* window)` — the window width in pixels. **sound:**
+/// returns the real stored geometry; a stale/fabricated handle → `-1` (the NDK negative-error
+/// contract), never a fake positive size.
+///
+/// # Safety
+/// `window` must be an `ANativeWindow*` from an Eclipse window native (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_anativewindow_getwidth(window: *mut c_void) -> i32 {
+    ndk_registry::native_windows()
+        .with(ptr_to_handle(window), |w| w.width)
+        .unwrap_or(-1)
+}
+
+/// `int32_t ANativeWindow_getHeight(ANativeWindow* window)` — the window height in pixels. **sound:**
+/// real stored geometry; stale/fabricated handle → `-1`.
+///
+/// # Safety
+/// `window` must be an `ANativeWindow*` from an Eclipse window native (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_anativewindow_getheight(window: *mut c_void) -> i32 {
+    ndk_registry::native_windows()
+        .with(ptr_to_handle(window), |w| w.height)
+        .unwrap_or(-1)
+}
+
+/// `void ANativeWindow_acquire(ANativeWindow* window)` — add a reference. **sound-stub:** Eclipse
+/// windows live in the process-global registry for the process lifetime, so this is a correct no-op
+/// (the window is already kept alive). NOT a landmine.
+///
+/// # Safety
+/// `window` must be an `ANativeWindow*` from an Eclipse window native (unused; any value accepted).
+unsafe extern "C" fn eclipse_anativewindow_acquire(_window: *mut c_void) {}
+
+/// `void ANativeWindow_release(ANativeWindow* window)` — remove a reference. **sound-stub:** the
+/// matching no-op for [`eclipse_anativewindow_acquire`]. NOT a landmine.
+///
+/// # Safety
+/// `window` must be an `ANativeWindow*` from an Eclipse window native (unused; any value accepted).
+unsafe extern "C" fn eclipse_anativewindow_release(_window: *mut c_void) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,14 +1311,20 @@ mod tests {
     }
 
     #[test]
-    fn with_bionic_natives_registers_the_two_implemented_categories() {
+    fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
-        // 3 fixed-arity liblog + 15 bionic-libc = 18 registered natives.
-        assert_eq!(p.len(), 18, "3 liblog + 15 bionic-libc natives registered");
+        // 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android = 45 registered natives.
+        assert_eq!(
+            p.len(),
+            45,
+            "3 liblog + 15 bionic-libc + 27 ndk-android natives registered"
+        );
         for name in [
+            // liblog (3 fixed-arity)
             "__android_log_write",
             "__android_log_buf_write",
             "android_set_abort_message",
+            // bionic-libc (15)
             "__strlen_chk",
             "__strchr_chk",
             "__strncpy_chk2",
@@ -667,6 +1340,34 @@ mod tests {
             "__system_property_get",
             "__stack_chk_guard",
             "__sF",
+            // ndk-android (27)
+            "AAssetManager_fromJava",
+            "AAssetManager_open",
+            "AAsset_close",
+            "AAsset_getBuffer",
+            "AAsset_getLength",
+            "AAsset_openFileDescriptor",
+            "AConfiguration_new",
+            "AConfiguration_delete",
+            "AConfiguration_fromAssetManager",
+            "AConfiguration_getCountry",
+            "AConfiguration_getLanguage",
+            "AConfiguration_getNavHidden",
+            "AConfiguration_getScreenHeightDp",
+            "AConfiguration_getScreenSize",
+            "AConfiguration_getScreenWidthDp",
+            "ALooper_prepare",
+            "ALooper_forThread",
+            "ALooper_acquire",
+            "ALooper_release",
+            "ALooper_pollOnce",
+            "ALooper_addFd",
+            "ALooper_removeFd",
+            "ANativeWindow_fromSurface",
+            "ANativeWindow_getWidth",
+            "ANativeWindow_getHeight",
+            "ANativeWindow_acquire",
+            "ANativeWindow_release",
         ] {
             assert!(p.resolve(name).is_some(), "{name} must be registered");
         }
@@ -793,5 +1494,255 @@ mod tests {
             slot, eclipse_addr,
             "the GOT slot holds the Eclipse native address"
         );
+    }
+
+    // ---- ndk-android: AAsset round-trips REAL APK bytes via src/apk -----------------------------
+
+    /// Build an in-memory APK (zip) with the given Stored entries and write it to a unique temp file.
+    fn write_test_apk(tag: &str, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            w.start_file(*name, opts).expect("start_file");
+            w.write_all(bytes).expect("write_all");
+        }
+        let bytes = w.finish().expect("finish").into_inner();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eclipse-ndk-asset-{tag}-{:?}.apk",
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &bytes).expect("write temp apk");
+        path
+    }
+
+    #[test]
+    fn aasset_open_getbuffer_getlength_round_trips_real_apk_bytes() {
+        // REAL bytes through Eclipse's own src/apk reader: an assets/ entry opened via
+        // AAssetManager_open, read back via AAsset_getBuffer + AAsset_getLength, then closed.
+        let payload: &[u8] = b"ECLIPSE-ASSET-CONTENTS-1234567890";
+        let apk = write_test_apk("rt", &[("assets/config/app.txt", payload)]);
+
+        // Mint an AAssetManager* over this APK (the boot path would do this via fromJava).
+        let mgr_h = ndk_registry::asset_managers()
+            .insert(AssetManagerState {
+                apk_path: apk.clone(),
+            })
+            .expect("insert asset manager");
+        let mgr = handle_to_ptr::<c_void>(mgr_h);
+
+        // AAssetManager_open("config/app.txt") → real bytes from assets/config/app.txt.
+        let name = std::ffi::CString::new("config/app.txt").unwrap();
+        // SAFETY: `mgr` is a live Eclipse AAssetManager*; `name` is a valid NUL-terminated C string.
+        let asset = unsafe { eclipse_aassetmanager_open(mgr, name.as_ptr(), 0) };
+        assert!(!asset.is_null(), "opening a present asset must succeed");
+
+        // AAsset_getLength == payload length.
+        // SAFETY: `asset` is a live Eclipse AAsset*.
+        let len = unsafe { eclipse_aasset_getlength(asset) };
+        assert_eq!(len as usize, payload.len(), "getLength == real byte count");
+
+        // AAsset_getBuffer holds the real bytes.
+        // SAFETY: `asset` is live; the returned pointer is valid until AAsset_close and covers `len`.
+        let buf = unsafe { eclipse_aasset_getbuffer(asset) };
+        assert!(!buf.is_null(), "getBuffer must return the asset bytes");
+        // SAFETY: `buf` covers `len` readable bytes (the asset contents) per getBuffer's contract.
+        let got = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+        assert_eq!(got, payload, "getBuffer returns the exact APK entry bytes");
+
+        // A missing asset → NULL (bionic contract), not a panic / fake.
+        let missing = std::ffi::CString::new("does/not/exist").unwrap();
+        // SAFETY: `mgr` live; `missing` valid C string.
+        let none = unsafe { eclipse_aassetmanager_open(mgr, missing.as_ptr(), 0) };
+        assert!(none.is_null(), "a missing asset must open to NULL");
+
+        // AAsset_close frees the handle; a second close is a harmless no-op (stale, ignored).
+        // SAFETY: `asset` is live; closing it is the documented free.
+        unsafe { eclipse_aasset_close(asset) };
+        // SAFETY: `asset` is now stale; close must be an ignored no-op (no UB / double-free).
+        unsafe { eclipse_aasset_close(asset) };
+        // getBuffer on the now-stale handle → NULL (rejected by the generation check, never UB).
+        // SAFETY: `asset` is stale; the registry rejects it and returns NULL.
+        assert!(unsafe { eclipse_aasset_getbuffer(asset) }.is_null());
+
+        ndk_registry::asset_managers().remove(mgr_h).ok();
+        std::fs::remove_file(&apk).ok();
+    }
+
+    #[test]
+    fn aasset_open_with_stale_manager_returns_null() {
+        // A stale/fabricated AAssetManager* must open to NULL (typed Err → sentinel), never a deref.
+        let stale_mgr = handle_to_ptr::<c_void>(0xDEAD_BEEF_0000_0001);
+        let name = std::ffi::CString::new("anything").unwrap();
+        // SAFETY: `stale_mgr` is a fabricated handle; the registry rejects it (bounds/gen check).
+        let asset = unsafe { eclipse_aassetmanager_open(stale_mgr, name.as_ptr(), 0) };
+        assert!(asset.is_null(), "a stale manager handle must open to NULL");
+    }
+
+    #[test]
+    fn aasset_openfiledescriptor_reports_no_direct_fd() {
+        // Eclipse serves in-memory assets → no backing fd → the documented "< 0" (buffer fallback).
+        let s = ndk_registry::assets()
+            .insert(AssetState {
+                bytes: Box::from(&b"x"[..]),
+                cursor: 0,
+            })
+            .expect("insert asset");
+        let asset = handle_to_ptr::<c_void>(s);
+        // SAFETY: `asset` is live; out-params are null (the native returns the failure sentinel).
+        let fd = unsafe {
+            eclipse_aasset_openfiledescriptor(asset, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert!(
+            fd < 0,
+            "no direct fd access for an in-memory asset (bionic < 0)"
+        );
+        ndk_registry::assets().remove(s).ok();
+    }
+
+    // ---- ndk-android: AConfiguration getters return the set device values ----------------------
+
+    #[test]
+    fn aconfiguration_getters_return_device_values() {
+        let cfg = eclipse_aconfiguration_new();
+        assert!(!cfg.is_null(), "AConfiguration_new must allocate");
+        let def = default_configuration();
+
+        // SAFETY: `cfg` is a live Eclipse AConfiguration* for every getter below.
+        unsafe {
+            assert_eq!(
+                eclipse_aconfiguration_getscreenwidthdp(cfg),
+                def.screen_width_dp
+            );
+            assert_eq!(
+                eclipse_aconfiguration_getscreenheightdp(cfg),
+                def.screen_height_dp
+            );
+            assert_eq!(eclipse_aconfiguration_getscreensize(cfg), def.screen_size);
+            assert_eq!(eclipse_aconfiguration_getnavhidden(cfg), def.nav_hidden);
+
+            // Country / language fill a 2-char buffer (no NUL).
+            let mut country = [0u8; 2];
+            eclipse_aconfiguration_getcountry(cfg, country.as_mut_ptr().cast());
+            assert_eq!(&country, &def.country);
+            let mut language = [0u8; 2];
+            eclipse_aconfiguration_getlanguage(cfg, language.as_mut_ptr().cast());
+            assert_eq!(&language, &def.language);
+
+            // fromAssetManager refills the same handle with the device config (idempotent here).
+            eclipse_aconfiguration_fromassetmanager(cfg, std::ptr::null_mut());
+            assert_eq!(
+                eclipse_aconfiguration_getscreenwidthdp(cfg),
+                def.screen_width_dp
+            );
+
+            eclipse_aconfiguration_delete(cfg);
+        }
+        // A getter on the deleted handle → the "unset" 0 sentinel (rejected, never UB).
+        // SAFETY: `cfg` is now stale; the registry rejects it.
+        assert_eq!(unsafe { eclipse_aconfiguration_getscreenwidthdp(cfg) }, 0);
+    }
+
+    // ---- ndk-android: ALooper minimal-correct sentinels ----------------------------------------
+
+    #[test]
+    fn alooper_prepare_is_idempotent_per_thread_and_pollonce_returns_documented_sentinels() {
+        // prepare returns the same thread looper twice (NDK: idempotent); forThread matches.
+        let l1 = eclipse_alooper_prepare(0);
+        assert!(!l1.is_null(), "ALooper_prepare must return a looper");
+        let l2 = eclipse_alooper_prepare(0);
+        assert_eq!(l1, l2, "prepare is idempotent for the calling thread");
+        assert_eq!(
+            eclipse_alooper_forthread(),
+            l1,
+            "forThread == the prepared looper"
+        );
+
+        // addFd records the fd (returns 1); removeFd removes it (returns 1).
+        // SAFETY: `l1` is a live Eclipse ALooper*; callback/data are null (unused).
+        let added = unsafe {
+            eclipse_alooper_addfd(l1, 7, 1, 0, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(added, 1, "addFd on a valid looper returns 1");
+        // SAFETY: `l1` is live.
+        let removed = unsafe { eclipse_alooper_removefd(l1, 7) };
+        assert_eq!(removed, 1, "removeFd on a valid looper returns 1");
+
+        // pollOnce: finite timeout → TIMEOUT; infinite → ERROR (never a fake CALLBACK / fd id).
+        // SAFETY: out-params are null (allowed by the contract).
+        let finite = unsafe {
+            eclipse_alooper_pollonce(
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            finite, ALOOPER_POLL_TIMEOUT,
+            "finite-timeout pollOnce → TIMEOUT"
+        );
+        // SAFETY: out-params are null.
+        let infinite = unsafe {
+            eclipse_alooper_pollonce(
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            infinite, ALOOPER_POLL_ERROR,
+            "infinite pollOnce (no source) → ERROR"
+        );
+
+        // addFd / removeFd on a stale looper → -1 (rejected, never UB).
+        let stale = handle_to_ptr::<c_void>(0xCAFE_0000_0000_0001);
+        // SAFETY: `stale` is fabricated; the registry rejects it.
+        let bad_add = unsafe {
+            eclipse_alooper_addfd(stale, 1, 1, 0, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(bad_add, -1, "addFd on a stale looper returns -1");
+
+        // acquire/release are sound no-ops (no panic, no UB).
+        // SAFETY: refcount no-ops accept any value.
+        unsafe {
+            eclipse_alooper_acquire(l1);
+            eclipse_alooper_release(l1);
+        }
+        // Note: the thread-local looper is intentionally not removed (prepare keeps it for the thread).
+    }
+
+    // ---- ndk-android: ANativeWindow sound-stub geometry ----------------------------------------
+
+    #[test]
+    fn anativewindow_getters_return_real_geometry_and_stale_is_negative() {
+        // SAFETY: JNI args are unused by the stub; any value is accepted.
+        let win = unsafe {
+            eclipse_anativewindow_fromsurface(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert!(!win.is_null(), "fromSurface must mint a window handle");
+        let def = default_native_window();
+        // SAFETY: `win` is a live Eclipse ANativeWindow*.
+        unsafe {
+            assert_eq!(eclipse_anativewindow_getwidth(win), def.width);
+            assert_eq!(eclipse_anativewindow_getheight(win), def.height);
+            // acquire/release are sound no-ops.
+            eclipse_anativewindow_acquire(win);
+            eclipse_anativewindow_release(win);
+        }
+        // A stale/fabricated window → -1 (NDK negative-error contract), never a fake positive size.
+        let stale = handle_to_ptr::<c_void>(0xBEEF_0000_0000_0001);
+        // SAFETY: `stale` is fabricated; the registry rejects it.
+        assert_eq!(unsafe { eclipse_anativewindow_getwidth(stale) }, -1);
+        // SAFETY: `stale` is fabricated; rejected.
+        assert_eq!(unsafe { eclipse_anativewindow_getheight(stale) }, -1);
+        // Free the live window's slot to keep the registry tidy.
+        ndk_registry::native_windows()
+            .remove(ptr_to_handle(win))
+            .ok();
     }
 }

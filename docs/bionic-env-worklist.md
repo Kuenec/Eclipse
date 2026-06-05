@@ -30,23 +30,24 @@ cargo test -p eclipse --lib \
 
 ---
 
-## STATUS UPDATE — 2026-06-05: the Eclipse-native tier landed (work-list 88 → 70)
+## STATUS UPDATE — 2026-06-05: the Eclipse-native tier landed + ndk-android (work-list 88 → 70 → 43)
 
 The **`EclipseNativeProvider`** (`src/loader/native_provider.rs`) is now PREPENDED before the host
 baseline in [`BionicEnv`](../src/loader/bionic_env.rs) (`with_host_baseline(try_host_gl,
-eclipse_natives=true)`). It registers **18** Eclipse-owned `extern "C"` natives — **liblog 3** (the
-fixed-arity ones) + **bionic-libc 15** — so those imports now resolve to **Eclipse addresses, not
-host glibc**. The gated real test
-`loader::link::tests::real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc` proves it on the
-real engine: work-list **88 → 70**, `applied_nonnull` **535 → 553** (+18 Eclipse-native GOT slots,
-all verified holding the Eclipse address; the host has no such symbol under these bionic names).
+eclipse_natives=true)`). It registers **45** Eclipse-owned `extern "C"` natives — **liblog 3** (the
+fixed-arity ones) + **bionic-libc 15** + **ndk-android 27** — so those imports now resolve to
+**Eclipse addresses, not host glibc**. The gated real test
+`loader::link::tests::real_libroblox_eclipse_natives_resolve_liblog_libc_and_ndk_android` proves it on
+the real engine: work-list **88 → 43**, `applied_nonnull` **535 → 580** (+45 Eclipse-native GOT slots,
+all verified holding the Eclipse address; the host has no such symbol under these bionic/NDK names).
 
-**Done (✅ below):** liblog (3 of 5) + bionic-libc (15 of 15). **Deferred (2):** the C-variadic
-liblog natives `__android_log_print` / `__android_log_assert` — defining a variadic `extern "C"` fn
-needs Rust's unstable `c_variadic` feature; Eclipse builds on **stable** (clean-checkout portability,
-AGENTS.md §2.11). Registering a non-variadic fn under a variadic name would be an ABI landmine, so
-they stay on the work-list (no landmine). **Remaining: 70** = 2 variadic liblog + ndk-android 27 +
-media-ndk 33 + audio 8.
+**Done (✅ below):** liblog (3 of 5) + bionic-libc (15 of 15) + ndk-android (27 of 27 — AAsset* REAL
+via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub deferred-to-render).
+**Deferred (2):** the C-variadic liblog natives `__android_log_print` / `__android_log_assert` —
+defining a variadic `extern "C"` fn needs Rust's unstable `c_variadic` feature; Eclipse builds on
+**stable** (clean-checkout portability, AGENTS.md §2.11). Registering a non-variadic fn under a
+variadic name would be an ABI landmine, so they stay on the work-list (no landmine). **Remaining:
+43** = 2 variadic liblog + media-ndk 33 + audio 8.
 
 ## Headline
 
@@ -54,11 +55,11 @@ media-ndk 33 + audio 8.
 |---|---:|---:|
 | UND imports (reloc-referenced; = GNU_HASH-authoritative) | **584** | **584** |
 | host-resolved (BASELINE, not ABI-correct) | **490** | 490 |
-| Eclipse-native-resolved (bionic-ABI-correct/minimal/forward) | 0 | **18** |
-| **work-list (need Eclipse-owned bionic natives)** | **88** | **70** |
-| symbol relocs applied (non-null addr) | 535 | **553** |
+| Eclipse-native-resolved (bionic-ABI-correct/minimal/forward/real) | 0 | **45** |
+| **work-list (need Eclipse-owned bionic natives)** | **88** | **43** |
+| symbol relocs applied (non-null addr) | 535 | **580** |
 | symbol relocs applied weak-undef → 0 (legal) | 12 | 12 |
-| symbol relocs unresolved-strong (recorded, no GOT write) | 88 | **70** |
+| symbol relocs unresolved-strong (recorded, no GOT write) | 88 | **43** |
 | symbol relocs deferred (TPOFF64/IRELATIVE) | 0 | 0 |
 
 The 584 imports are counted from the **relocations**, not the raw dynamic symtab — this is
@@ -79,11 +80,11 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 | bionic-libc | 303 | 21 | partly — 21 are bionic-specific (glibc lacks them) |
 | cxa-runtime | 3  | 0  | yes (baseline; glibc atexit semantics) |
 | dl          | 5  | 0  | baseline only — must route to Eclipse's OWN loader |
-| ndk-android | 0  | 27 | **no host equivalent** |
+| ndk-android | 0  | ✅ 0 (was 27) | **no host equiv → all 27 Eclipse-owned (2026-06-05)** |
 | media-ndk   | 0  | 33 | **no host equivalent** |
 | audio       | 0  | 8  | **no host equivalent** |
 | liblog      | 0  | 5  | no host equiv — **Eclipse already owns these** |
-| **TOTAL**   | **490** | **88** | |
+| **TOTAL (host-baseline view; Eclipse-native work-list now 43)**   | **490** | **88** | |
 
 > `egl-gles` resolves a real **91** because this dev-host has Mesa `libEGL.so`/`libGLESv2.so`. On a
 > GL-less host these would all be in the work-list (route to a host-GL/ANGLE bridge). `pthread`,
@@ -124,21 +125,35 @@ All 15 implemented in `src/loader/native_provider.rs` (each labelled forward / m
 (303 other libc names resolve from glibc as a baseline; only these 15 were missing entirely. The
 older "21" figure in this doc was prose; the real test reports exactly **15** bionic-libc names.)
 
-### 3. ndk-android — libandroid (27), NO host equivalent
+### 3. ndk-android — libandroid (27) — ✅ DONE (2026-06-05): all 27 Eclipse-owned natives
+`src/loader/native_provider.rs` implements all 27, each labelled real / minimal-correct / sound-stub;
+opaque NDK pointers are Eclipse-owned generational [`ndk_registry`](../src/loader/ndk_registry.rs)
+handles cast to `*mut T` (a stale/fabricated pointer is a typed `Err` → NDK sentinel, never UB).
 ```
-AAssetManager_fromJava  AAssetManager_open
-AAsset_close  AAsset_getBuffer  AAsset_getLength  AAsset_openFileDescriptor
-AConfiguration_delete  AConfiguration_fromAssetManager  AConfiguration_getCountry
-AConfiguration_getLanguage  AConfiguration_getNavHidden  AConfiguration_getScreenHeightDp
-AConfiguration_getScreenSize  AConfiguration_getScreenWidthDp  AConfiguration_new
-ALooper_acquire  ALooper_addFd  ALooper_forThread  ALooper_pollOnce  ALooper_prepare
-ALooper_release  ALooper_removeFd
-ANativeWindow_acquire  ANativeWindow_fromSurface  ANativeWindow_getHeight
-ANativeWindow_getWidth  ANativeWindow_release
+# AAsset / AAssetManager (6) — REAL: route to Eclipse's own src/apk reader (real bytes):
+✅ AAssetManager_fromJava      # real: AAssetManager* over the boot-configured APK path
+✅ AAssetManager_open          # real: reads assets/<name> bytes via crate::apk; NULL if absent
+✅ AAsset_getBuffer            # real: stable pointer into the owned asset bytes; NULL if stale
+✅ AAsset_getLength            # real: bytes.len() (off_t); 0 if stale
+✅ AAsset_close                # real: frees the owned handle slot
+✅ AAsset_openFileDescriptor   # sound-stub: in-memory asset → returns -1 (NDK "no direct fd" → buffer fallback)
+# AConfiguration (9) — MINIMAL-CORRECT: real getters over Eclipse device values (xhdpi portrait):
+✅ AConfiguration_new  ✅ AConfiguration_delete  ✅ AConfiguration_fromAssetManager
+✅ AConfiguration_getCountry  ✅ AConfiguration_getLanguage  ✅ AConfiguration_getNavHidden
+✅ AConfiguration_getScreenHeightDp  ✅ AConfiguration_getScreenSize  ✅ AConfiguration_getScreenWidthDp
+# ALooper (7) — MINIMAL-CORRECT Eclipse per-thread looper (fd registry); pollOnce → ALOOPER_POLL_*:
+✅ ALooper_prepare  ✅ ALooper_forThread  ✅ ALooper_acquire  ✅ ALooper_release
+✅ ALooper_pollOnce            # minimal: finite timeout → POLL_TIMEOUT, infinite → POLL_ERROR (NOT fake CALLBACK)
+✅ ALooper_addFd  ✅ ALooper_removeFd
+# ANativeWindow (5) — SOUND-STUB: getters return real geometry; surface/buffer DEFERRED-TO-RENDER:
+✅ ANativeWindow_fromSurface   # sound-stub: mints a window handle w/ default geometry (surface bind deferred)
+✅ ANativeWindow_getWidth  ✅ ANativeWindow_getHeight   # real geometry; -1 if stale
+✅ ANativeWindow_acquire  ✅ ANativeWindow_release       # sound no-ops (registry-lifetime windows)
 ```
-Asset access (`AAsset*`/`AAssetManager*`) overlaps Eclipse's existing AssetManager work in
-`src/framework.rs`; `ANativeWindow_*` maps to the host window/surface; `ALooper_*` is the NDK event
-loop. `AConfiguration_*` is device config.
+DEFERRED-TO-RENDER-INTEGRATION: the ANativeWindow surface/buffer behavior (`fromSurface` binding,
+plus the not-in-the-27 `setBuffersGeometry`/`lock`/`unlockAndPost`) lands with the GLES2/EGL render +
+input integration. The boot path calls `ndk_registry::set_apk_path` so the asset natives serve real
+bytes from the opened Roblox APK.
 
 ### 4. media-ndk — libmediandk (33), NO host equivalent (bridge to host codecs)
 ```
@@ -175,9 +190,12 @@ in this build, so it is not on the work-list despite being a `DT_NEEDED`.)
 2. ~~**bionic-libc bionic-specific (15)**~~ — ✅ DONE: Eclipse-owned natives for all 15 glibc-missing
    names (`__system_property_get`, `__sF`, `__errno`, the `_chk` FORTIFY family, `__stack_chk_guard`),
    each labelled forward/minimal-correct. Prepended before the host tier (Eclipse wins).
-3. **ndk-android (27)** — ⏭️ NEXT. `AAsset*`/`AAssetManager*` reuse Eclipse's AssetManager;
-   `ANativeWindow_*` → host surface; `ALooper_*` → an Eclipse NDK looper; `AConfiguration_*` → config.
-4. **media-ndk (33)** + **audio (8)** — bridges to host codecs / host audio.
+3. ~~**ndk-android (27)**~~ — ✅ DONE (2026-06-05). All 27 in `src/loader/native_provider.rs`:
+   `AAsset*`/`AAssetManager*` REAL via Eclipse's own `src/apk` reader (opaque handles =
+   `src/loader/ndk_registry.rs` generational indices, no UB); `AConfiguration_*`/`ALooper_*`
+   minimal-correct; `ANativeWindow_*` sound-stub (real geometry getters, surface/buffer
+   deferred-to-render). Work-list 70 → 43.
+4. **media-ndk (33)** + **audio (8)** — ⏭️ NEXT. Bridges to host codecs / host audio.
    + the **2 deferred variadic liblog** natives (need a nightly toolchain or a justified clean-room C shim).
 5. After the work-list is satisfied: bind the assembled image to execution and run the **3,427
    `DT_INIT_ARRAY` constructors** in order, honoring RELRO + BIND_NOW (no `%fs`/TCB needed — no
