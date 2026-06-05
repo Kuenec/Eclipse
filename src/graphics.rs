@@ -34,7 +34,7 @@ use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::error::{EventLoopError, OsError};
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -62,7 +62,7 @@ const TEXT_COLOR: [f32; 4] = [0.08, 0.09, 0.12, 1.0]; // near-black, reads on th
 const TEXT_PAD_X: f32 = 12.0;
 
 /// The host game window + event loop (winit application state).
-struct GameWindow {
+struct GameWindow<'vm> {
     title: String,
     /// `None` until the event loop is `resumed` and the window is created.
     window: Option<Window>,
@@ -71,9 +71,27 @@ struct GameWindow {
     renderer: Option<VulkanRenderer>,
     /// Set if window creation failed, so [`run_windowed`] can surface a typed error.
     create_error: Option<OsError>,
+    /// 2026-06-05: a borrow of the live [`Vm`](crate::runtime::Vm) (from `boot()`, kept alive by
+    /// `main` on this thread). Used to dispatch `View.performClick()` to a hit view via JNI on a
+    /// pointer click. `None` if `run_windowed` was called without a VM (e.g. a future preview mode) —
+    /// then clicks are hit-tested but not dispatched. The borrow keeps the VM alive for the whole
+    /// event loop; the loop runs on the JNI-attached main thread, so the VM is reachable here.
+    vm: Option<&'vm crate::runtime::Vm>,
+    /// The last pointer position in window pixels (top-left origin), updated on `CursorMoved`. `None`
+    /// until the pointer first moves over the window. The press/release click uses this position.
+    cursor: Option<(f32, f32)>,
+    /// `true` between a primary-button press and its release, with the press position. A click is a
+    /// press+release pair; we hit-test + dispatch on release (Android `performClick` semantics), only
+    /// if the release lands on the same view the press hit. `None` when no primary press is in flight.
+    primary_press: Option<(f32, f32)>,
+    /// 2026-06-05: set once the env-gated one-shot synthetic tap has run, so it fires at most once.
+    /// The synthetic tap (only when `ECLIPSE_SYNTHETIC_TAP` is set) is a dev-host diagnostic that taps
+    /// the center of the first clickable view to prove the hit-test→performClick chain end-to-end on a
+    /// real run, since a headless run cannot physically click. Never fires in normal operation.
+    synthetic_tap_done: bool,
 }
 
-impl ApplicationHandler for GameWindow {
+impl ApplicationHandler for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // winit requires the window to be created on/after `resumed` (the platform display is
         // ready here). Eclipse uses winit directly — no GTK — so process startup never maps the
@@ -138,25 +156,131 @@ impl ApplicationHandler for GameWindow {
                     // Drive a continuous clear-and-present loop so the surface keeps presenting.
                     window.request_redraw();
                 }
+                // Dev-host diagnostic: a one-shot synthetic tap (env-gated) proves the
+                // hit-test→performClick chain end-to-end on a real run (a headless run cannot click).
+                self.maybe_synthetic_tap();
             }
+            // 2026-06-05: minimal sound input path — track the pointer and dispatch a click to the
+            // hit Android view. Full MotionEvent/InputQueue touch+move+key dispatch is the follow-up.
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some((position.x as f32, position.y as f32));
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    // Remember where the primary press landed; the click completes on release.
+                    self.primary_press = self.cursor;
+                }
+                ElementState::Released => {
+                    self.handle_primary_click();
+                    self.primary_press = None;
+                }
+            },
             _ => {}
         }
+    }
+}
+
+impl GameWindow<'_> {
+    /// Complete a primary-button click: hit-test the rendered View tree at the release position and,
+    /// if it resolves to the SAME clickable view the press hit, dispatch `View.performClick()` to it.
+    ///
+    /// 2026-06-05: a click is a press+release on the same target (Android semantics — a release that
+    /// drifts off the pressed view is not a click). The hit-test is GPU-free geometry over the laid-out
+    /// rects (the same layout the renderer draws); dispatch goes through
+    /// [`framework::dispatch_click_to_view`](crate::framework::dispatch_click_to_view) on the held VM,
+    /// which is guarded (catch_unwind + pending-exception check) so a JNI/Java error can never crash
+    /// the event loop. No VM or no Vulkan renderer → hit-test only / no-op (logged).
+    fn handle_primary_click(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let Some((px, py)) = self.cursor else {
+            return;
+        };
+        // Require the release to land on the same view the press hit (a real click, not a drag-off).
+        let pressed = self
+            .primary_press
+            .and_then(|(x, y)| renderer.hit_test_at(x, y));
+        let released = renderer.hit_test_at(px, py);
+        let Some(handle) = released else { return };
+        if pressed != Some(handle) {
+            return;
+        }
+        let Some(vm) = self.vm else {
+            tracing::debug!(
+                handle,
+                "click hit a view but no VM is held; not dispatching"
+            );
+            return;
+        };
+        match crate::framework::dispatch_click_to_view(vm, handle) {
+            Ok(clicked) => tracing::info!(
+                handle,
+                x = px,
+                y = py,
+                performed = clicked,
+                "pointer click dispatched to view (View.performClick)"
+            ),
+            Err(e) => {
+                tracing::warn!(handle, error = %e, "click dispatch to view failed (ignored)")
+            }
+        }
+    }
+
+    /// One-shot, env-gated synthetic tap (dev-host diagnostic). When `ECLIPSE_SYNTHETIC_TAP` is set,
+    /// the FIRST redraw aims a tap at the center of the first clickable view, hit-tests it, and
+    /// dispatches `View.performClick()` — proving the hit-test→dispatch chain end-to-end on a real run
+    /// (a headless run cannot physically click). Fires at most once and never in normal operation
+    /// (no env var → immediate return), so it adds no behavior to the shipped click path.
+    fn maybe_synthetic_tap(&mut self) {
+        if self.synthetic_tap_done || std::env::var_os("ECLIPSE_SYNTHETIC_TAP").is_none() {
+            return;
+        }
+        self.synthetic_tap_done = true;
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let Some((cx, cy)) = renderer.first_clickable_center() else {
+            tracing::info!("synthetic tap: no clickable view in the tree (nothing to tap)");
+            return;
+        };
+        tracing::info!(
+            x = cx,
+            y = cy,
+            "synthetic tap: aiming at first clickable view center"
+        );
+        // Drive the same press→release path a real pointer would, so it exercises the real wiring.
+        self.cursor = Some((cx, cy));
+        self.primary_press = Some((cx, cy));
+        self.handle_primary_click();
+        self.primary_press = None;
     }
 }
 
 /// Open the host game window and run the winit event loop until the window is closed.
 ///
 /// MUST be called on the process main thread (winit requires the event loop there on Linux);
-/// `eclipse run` calls this from `main` after the ART VM is booted. Returns when the window is
-/// closed, or a typed [`GraphicsError`] if the event loop or window cannot be created. A Vulkan
-/// init failure is NOT returned here — it is logged and the window stays open blank (no crash).
-pub fn run_windowed(title: &str) -> Result<(), GraphicsError> {
+/// `eclipse run` calls this from `main` after the ART VM is booted. `vm` is a borrow of the live
+/// [`Vm`](crate::runtime::Vm) (kept alive by the caller on this thread) used to dispatch
+/// `View.performClick()` to a hit view on a pointer click; pass `None` to run with no click dispatch
+/// (hit-test only). Returns when the window is closed, or a typed [`GraphicsError`] if the event loop
+/// or window cannot be created. A Vulkan init failure is NOT returned here — it is logged and the
+/// window stays open blank.
+pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), GraphicsError> {
     let event_loop = EventLoop::new().map_err(GraphicsError::EventLoop)?;
     let mut app = GameWindow {
         title: title.to_owned(),
         window: None,
         renderer: None,
         create_error: None,
+        vm,
+        cursor: None,
+        primary_press: None,
+        synthetic_tap_done: false,
     };
     event_loop
         .run_app(&mut app)
@@ -241,7 +365,7 @@ fn choose_image_count(caps: &vk::SurfaceCapabilitiesKHR) -> u32 {
 // alignment, scrolling. The functions here do NO Vulkan work so they are unit-testable without a GPU.
 // ---------------------------------------------------------------------------------------------
 
-use crate::framework::view_registry::{LayoutParams, RenderNode, MATCH_PARENT};
+use crate::framework::view_registry::{LayoutParams, RenderNode, ViewHandle, MATCH_PARENT};
 
 /// One vertex for the colored-quad pipeline: a position already in Vulkan NDC (x,y ∈ [-1,1], y down)
 /// plus an RGBA color. `#[repr(C)]` so the in-memory layout matches the vertex input description the
@@ -259,6 +383,9 @@ struct QuadVertex {
 /// [`pixel_rect_to_quad`]. Kept separate from [`QuadVertex`] so the layout pass is GPU-free.
 #[derive(Debug, Clone, PartialEq)]
 struct LaidOutView {
+    /// The view's registry handle (the same `jlong` the View native peer holds). 2026-06-05: carried
+    /// so [`hit_test`] can return the hit view's handle for click dispatch. Opaque index, not a pointer.
+    handle: ViewHandle,
     /// Top-left x in pixels.
     x: f32,
     /// Top-left y in pixels.
@@ -267,6 +394,9 @@ struct LaidOutView {
     w: f32,
     /// Height in pixels.
     h: f32,
+    /// `true` if the view recorded a click listener (`View.nativeSetOnClickListener`). 2026-06-05:
+    /// [`hit_test`] only targets clickable views, so an inert container/label is never clicked.
+    clickable: bool,
     /// Fill color (RGBA, 0..1).
     color: [f32; 4],
     /// The view's text, if any — drawn over the rect by the text pass (when present).
@@ -697,16 +827,36 @@ fn layout_views(
         .map(|(node, b)| {
             let color = DEPTH_PALETTE[(node.depth as usize).min(DEPTH_PALETTE.len() - 1)];
             LaidOutView {
+                handle: node.handle,
                 x: b.x,
                 y: b.y,
                 // Clamp to >= 1 so a zero-measured view never produces a degenerate (invalid) quad.
                 w: b.mw.max(1.0),
                 h: b.mh.max(1.0),
+                clickable: node.clickable,
                 color,
                 text: node.text.clone(),
             }
         })
         .collect()
+}
+
+/// Hit-test a laid-out view tree for the **topmost clickable** view at window pixel `(x, y)`.
+///
+/// 2026-06-05: pure geometry over the recorded rects — no GPU, no VM — so it is fully unit-testable.
+/// `views` is the pre-order [`layout_views`] output (parent before children, siblings left-to-right),
+/// which is also the draw order, so a later entry is drawn ON TOP of an earlier one. We therefore scan
+/// in REVERSE and return the first (i.e. last-drawn / deepest / topmost) view that (a) is `clickable`
+/// and (b) whose half-open rect `[x, x+w) × [y, y+h)` contains the point. Returns the hit view's
+/// [`ViewHandle`] (the caller dispatches `performClick` to it via JNI), or `None` if no clickable view
+/// is under the point. A zero/negative-size view never matches (half-open interval). The point is in
+/// the same top-left-origin pixel space the layout pass produced.
+fn hit_test(views: &[LaidOutView], x: f32, y: f32) -> Option<ViewHandle> {
+    views
+        .iter()
+        .rev()
+        .find(|v| v.clickable && x >= v.x && x < v.x + v.w && y >= v.y && y < v.y + v.h)
+        .map(|v| v.handle)
 }
 
 /// Convert a top-left-origin pixel rect into 6 [`QuadVertex`]es (two triangles) in Vulkan NDC.
@@ -2325,6 +2475,39 @@ impl VulkanRenderer {
         self.swapchain.framebuffers.len()
     }
 
+    /// Hit-test the current View tree at window pixel `(x, y)` for the topmost clickable view.
+    ///
+    /// 2026-06-05: reproduces EXACTLY the layout the draw path uses — `snapshot_tree()` →
+    /// [`layout_views`] at the current swapchain extent with the same text measurer — then runs the
+    /// pure [`hit_test`]. Single-sources the geometry so a click hits the same rects that are drawn.
+    /// Returns the hit view's [`ViewHandle`] (for click dispatch), or `None` if no clickable view is
+    /// under the point. Pure read of the registry + arithmetic (no GPU work).
+    fn hit_test_at(&self, x: f32, y: f32) -> Option<ViewHandle> {
+        let nodes = crate::framework::view_registry::snapshot_tree();
+        if nodes.is_empty() {
+            return None;
+        }
+        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
+        let views = layout_views(&nodes, self.swapchain.extent, measure);
+        hit_test(&views, x, y)
+    }
+
+    /// The window-pixel center of the first clickable laid-out view, if any. 2026-06-05: used only by
+    /// the env-gated dev-host synthetic-tap diagnostic to aim a tap at a real clickable view. Lays out
+    /// the tree exactly like [`Self::hit_test_at`]; `None` when no clickable view exists.
+    fn first_clickable_center(&self) -> Option<(f32, f32)> {
+        let nodes = crate::framework::view_registry::snapshot_tree();
+        if nodes.is_empty() {
+            return None;
+        }
+        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
+        let views = layout_views(&nodes, self.swapchain.extent, measure);
+        views
+            .iter()
+            .find(|v| v.clickable)
+            .map(|v| (v.x + v.w / 2.0, v.y + v.h / 2.0))
+    }
+
     /// Note that the window was resized; the next [`Self::draw_frame`] recreates the swapchain.
     /// A zero dimension means the window is minimized — skip the recreate then.
     fn mark_resized(&mut self, width: u32, height: u32) {
@@ -3520,10 +3703,12 @@ mod tests {
 
     fn node(class: &str, text: Option<&str>, depth: u32) -> RenderNode {
         RenderNode {
+            handle: 0,
             class_name: class.to_owned(),
             text: text.map(str::to_owned),
             depth,
             layout: LayoutParams::default(),
+            clickable: false,
             children: Vec::new(),
         }
     }
@@ -3537,10 +3722,12 @@ mod tests {
         kids: &[usize],
     ) -> RenderNode {
         RenderNode {
+            handle: 0,
             class_name: class.to_owned(),
             text: text.map(str::to_owned),
             depth,
             layout: lp,
+            clickable: false,
             children: kids.to_vec(),
         }
     }
@@ -3873,6 +4060,93 @@ mod tests {
         assert!(verts[0..6].iter().all(|v| v.color == views[0].color));
     }
 
+    // 2026-06-05: the hit-test the event loop runs on a pointer click — pure geometry over the laid-
+    // out rects, no VM/GPU. These guard the minimal click path: a point in/out of a rect, nested
+    // (topmost/last-drawn wins), and that a non-clickable view is never targeted.
+    /// Build a [`LaidOutView`] for the hit-test tests (color/text irrelevant here).
+    fn lov(handle: ViewHandle, x: f32, y: f32, w: f32, h: f32, clickable: bool) -> LaidOutView {
+        LaidOutView {
+            handle,
+            x,
+            y,
+            w,
+            h,
+            clickable,
+            color: [1.0; 4],
+            text: None,
+        }
+    }
+
+    #[test]
+    fn hit_test_returns_clickable_view_containing_the_point() {
+        let views = [lov(7, 10.0, 10.0, 100.0, 50.0, true)];
+        // Inside the rect → the view's handle; outside → None.
+        assert_eq!(hit_test(&views, 50.0, 30.0), Some(7));
+        assert_eq!(hit_test(&views, 5.0, 30.0), None, "left of the rect");
+        assert_eq!(hit_test(&views, 200.0, 30.0), None, "right of the rect");
+        assert_eq!(hit_test(&views, 50.0, 5.0), None, "above the rect");
+        assert_eq!(hit_test(&views, 50.0, 100.0), None, "below the rect");
+    }
+
+    #[test]
+    fn hit_test_topmost_last_drawn_wins_for_overlapping_views() {
+        // Pre-order = draw order: a later entry is drawn on top. Two overlapping clickable views at
+        // the same point → the LAST one (topmost) is returned.
+        let views = [
+            lov(1, 0.0, 0.0, 100.0, 100.0, true), // drawn first (under)
+            lov(2, 20.0, 20.0, 40.0, 40.0, true), // drawn last (on top)
+        ];
+        assert_eq!(
+            hit_test(&views, 30.0, 30.0),
+            Some(2),
+            "topmost overlapping wins"
+        );
+        // A point only inside the lower view still hits it.
+        assert_eq!(hit_test(&views, 5.0, 5.0), Some(1));
+    }
+
+    #[test]
+    fn hit_test_ignores_non_clickable_views() {
+        // A non-clickable view under the point is skipped; a clickable one below it is found instead.
+        let views = [
+            lov(1, 0.0, 0.0, 100.0, 100.0, true),  // clickable, under
+            lov(2, 0.0, 0.0, 100.0, 100.0, false), // NON-clickable, on top → must be skipped
+        ];
+        assert_eq!(
+            hit_test(&views, 50.0, 50.0),
+            Some(1),
+            "the non-clickable top view is ignored, the clickable one below is hit"
+        );
+
+        // No clickable view under the point at all → None (the click is a no-op).
+        let inert = [lov(9, 0.0, 0.0, 100.0, 100.0, false)];
+        assert_eq!(hit_test(&inert, 50.0, 50.0), None);
+        // Empty tree → None.
+        assert_eq!(hit_test(&[], 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn hit_test_rect_is_half_open() {
+        // The rect is half-open [x,x+w)×[y,y+h): the top-left corner is inside, the bottom-right is not
+        // (so adjacent tiled views never both claim a shared edge).
+        let views = [lov(3, 10.0, 10.0, 20.0, 20.0, true)];
+        assert_eq!(
+            hit_test(&views, 10.0, 10.0),
+            Some(3),
+            "top-left corner is inside"
+        );
+        assert_eq!(
+            hit_test(&views, 30.0, 20.0),
+            None,
+            "right edge is exclusive"
+        );
+        assert_eq!(
+            hit_test(&views, 20.0, 30.0),
+            None,
+            "bottom edge is exclusive"
+        );
+    }
+
     #[test]
     fn embedded_spirv_is_well_formed() {
         // The embedded shader blobs must decode to u32 words (length multiple of 4) and start with
@@ -3948,10 +4222,12 @@ mod tests {
         let atlas = synthetic_atlas();
         // "A A" → two visible 'A' glyphs (6 verts each) + one space (advance only) + the gap.
         let views = [LaidOutView {
+            handle: 0,
             x: 0.0,
             y: 0.0,
             w: 200.0,
             h: 64.0,
+            clickable: false,
             color: [1.0; 4],
             text: Some("A A".to_owned()),
         }];
@@ -3960,10 +4236,12 @@ mod tests {
 
         // A view with only unknown (non-atlas) chars produces no vertices.
         let only_unknown = [LaidOutView {
+            handle: 0,
             x: 0.0,
             y: 0.0,
             w: 200.0,
             h: 64.0,
+            clickable: false,
             color: [1.0; 4],
             text: Some("€£¥".to_owned()),
         }];
@@ -3971,10 +4249,12 @@ mod tests {
 
         // A view with no text produces no vertices.
         let no_text = [LaidOutView {
+            handle: 0,
             x: 0.0,
             y: 0.0,
             w: 200.0,
             h: 64.0,
+            clickable: false,
             color: [1.0; 4],
             text: None,
         }];
