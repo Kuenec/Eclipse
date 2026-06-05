@@ -380,6 +380,50 @@ type JniCreateJavaVm = unsafe extern "system" fn(
     *mut c_void,
 ) -> jni_sys::jint;
 
+/// An owned handle to the live ART VM this process booted via [`boot`].
+///
+/// 2026-06-04: carries the raw `*mut jni_sys::JavaVM` that `JNI_CreateJavaVM` produced. The raw
+/// pointer field alone makes `Vm` auto-`!Send` + `!Sync` (it is deliberately **not** marked
+/// `unsafe impl Send`/`Sync`), which pins the VM to the thread that booted it — Eclipse's main
+/// thread. That is the encoded thread/loop-ownership model: ART boots on the process main thread,
+/// winit's event loop runs on that **same** main thread, and future JNI calls (e.g. `onCreate`)
+/// happen from inside the event-loop callbacks on this already-attached main thread — never an
+/// `AttachCurrentThread`/cross-thread `JNIEnv`. Holding the handle alive keeps a reachable VM on
+/// the main thread for those later calls.
+///
+/// The libart mapping itself is kept resident for the process lifetime by [`boot`]'s
+/// `std::mem::forget(lib)` (see [`boot`]'s docs), so `Vm` does not own the `libloading::Library`
+/// and has **no** `Drop`: tearing the VM down (`DestroyJavaVM` + unload) is a separately-designed
+/// later increment, because a running VM's GC/JIT daemon threads still execute libart's code.
+///
+/// # Regression guard: `Vm` must stay `!Send` + `!Sync`
+///
+/// These doctests fail to compile iff someone makes `Vm` `Send`/`Sync` (e.g. by adding an
+/// `unsafe impl Send for Vm`), which would break the main-thread pinning invariant above. They
+/// pass today (compile error ⇒ `compile_fail` ⇒ test passes) because the raw-pointer field keeps
+/// `Vm` auto-`!Send`/`!Sync`. Dependency-free (only `std` + the public `Vm` type).
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<eclipse::runtime::Vm>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<eclipse::runtime::Vm>();
+/// ```
+pub struct Vm {
+    /// The `JavaVM` pointer returned by `JNI_CreateJavaVM`. Raw-pointer field → `Vm` is `!Send`
+    /// + `!Sync`, pinning it to the booting (main) thread. Read by the next increment's JNI calls.
+    // 2026-06-04: held-for-next-increment, not dead — `expect` (not `allow`) so it self-warns and
+    // must be removed the moment the JNI-call increment reads `vm`, preventing a stale annotation.
+    #[expect(
+        dead_code,
+        reason = "carries the JavaVM for the next increment's main-thread JNI calls"
+    )]
+    vm: *mut jni_sys::JavaVM,
+}
+
 /// Boot the vendored ART VM for the given plan, optionally with an app on the classpath.
 ///
 /// `dlopen`s the vendored `libart.so` and calls `JNI_CreateJavaVM` with the discovered boot
@@ -402,15 +446,23 @@ type JniCreateJavaVm = unsafe extern "system" fn(
 /// `System.loadLibrary("roblox")` resolves `libroblox.so`. It is only meaningful alongside
 /// `apk_path`; passing it with `apk_path = None` has no effect (no classpath/library.path is set).
 ///
-/// `libart.so` is intentionally **never unloaded**: a running ART VM has daemon threads
-/// (GC/JIT) executing libart's code, so unmapping it would be undefined behavior. The VM lives
-/// for the process; proper `DestroyJavaVM`-then-unload teardown is future work. Consequently
-/// only one VM can be created per process (`JNI_CreateJavaVM` returns an error on a second call).
+/// On success returns an owned [`Vm`] handle carrying the live `JavaVM` pointer. The handle is
+/// `!Send`/`!Sync`, so it stays on the booting (main) thread — keep it alive (e.g. across the
+/// winit event loop) to give the next increment's JNI calls a reachable VM on that thread.
+///
+/// 2026-06-04: `libart.so` is intentionally **never unloaded** via the `std::mem::forget(lib)`
+/// below: a running ART VM has daemon threads (GC/JIT) executing libart's code, so unmapping it
+/// (which `libloading::Library`'s `Drop` would do) is undefined behavior — even at process exit,
+/// since those daemon threads are still alive when destructors run. The mapping therefore lives
+/// for the process; the returned [`Vm`] deliberately does **not** hold the `Library` and has no
+/// `Drop`. Proper `DestroyJavaVM`-then-unload teardown is a separately-designed future increment.
+/// Consequently only one VM can be created per process (`JNI_CreateJavaVM` returns an error on a
+/// second call).
 pub fn boot(
     plan: &BootPlan,
     apk_path: Option<&Path>,
     app_lib_dir: Option<&Path>,
-) -> Result<(), RuntimeError> {
+) -> Result<Vm, RuntimeError> {
     let libart = find_libart()?;
     let boot_image = find_boot_image()?;
 
@@ -478,9 +530,10 @@ pub fn boot(
     std::mem::forget(lib);
 
     // JNI_OK with a live JavaVM + JNIEnv is definitive: ART loaded the boot image and libcore's
-    // native backends and attached this thread before returning. Driving the env (calls,
-    // classes, the Activity) is the next step — see the module docs.
-    Ok(())
+    // native backends and attached this thread before returning. Return the owned `Vm` handle so
+    // the caller keeps the VM reachable on this (main) thread for the next increment's JNI calls;
+    // driving the env (calls, classes, the Activity) is that next step — see the module docs.
+    Ok(Vm { vm })
 }
 
 /// Build a `CString` from an ART option, mapping an embedded NUL to a typed error.
