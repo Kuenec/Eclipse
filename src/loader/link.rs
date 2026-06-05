@@ -1578,10 +1578,14 @@ mod tests {
         let all_relas = img.relocations().expect("decode libroblox relocations");
         drop(img);
 
-        let bionic = BionicEnv::with_host_baseline(true);
+        // eclipse_natives=false: this test is the HOST-BASELINE pipeline proof (NDK/media/audio/log
+        // have 0 host-resolved). The Eclipse-native tier is exercised by the sibling test
+        // `real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc` below.
+        let bionic = BionicEnv::with_host_baseline(true, false);
         eprintln!(
-            "BionicEnv: host_libc_present={} missing_gl={:?}",
+            "BionicEnv: host_libc_present={} eclipse_natives={} missing_gl={:?}",
             bionic.host_libc_present(),
+            bionic.eclipse_natives_present(),
             bionic.missing_gl()
         );
 
@@ -1732,6 +1736,192 @@ mod tests {
         assert!(
             !cat_worklist.is_empty(),
             "the Eclipse-bionic-native work-list must be non-empty (NDK/media/audio/log)"
+        );
+
+        // No leak: dropping the set munmaps the 112 MiB region.
+        drop(set);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- REAL test: the ECLIPSE-NATIVE tier resolves liblog + bionic-libc on libroblox -----------
+    // (skips cleanly if the APK is absent — never fails / fabricates). With the EclipseNativeProvider
+    // PREPENDED before the host baseline, the engine's liblog (3 fixed-arity) + bionic-libc (15)
+    // imports now resolve to ECLIPSE addresses (NOT host glibc), and the work-list shrinks 88 -> 70.
+
+    #[test]
+    fn real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc() {
+        use crate::loader::bionic_env::{categorize_imports, BionicEnv};
+        use crate::loader::native_provider::EclipseNativeProvider;
+        use crate::loader::resolve::{HostDlsymProvider, SymbolProvider};
+
+        let Some(apk_path) = find_roblox_apk() else {
+            eprintln!("real_libroblox_eclipse_natives_...: no Roblox APK; skipping");
+            return;
+        };
+
+        let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
+        let so_bytes = apk
+            .read_entry("lib/x86_64/libroblox.so")
+            .expect("read lib/x86_64/libroblox.so from APK");
+        let dir = temp_dir("libroblox-eclipse-natives");
+        let so_path = dir.join("libroblox.so");
+        std::fs::write(&so_path, &so_bytes).expect("stage libroblox.so");
+
+        // 1) Map + base-relocate root-only (deps env-provided, host fallback off).
+        let linker = Linker::new(Vec::<PathBuf>::new())
+            .with_host_fallback(false)
+            .with_tolerate_missing_deps(true);
+        let mut set = linker
+            .load(&so_path)
+            .unwrap_or_else(|e| panic!("root-only map+base-relocate of libroblox: {e}"));
+        let page = host_page_size();
+
+        let base = set.objects[0].load_base();
+        let img = set.objects[0].image().expect("re-parse libroblox");
+        let dynsyms = img.dynsyms.clone();
+        let all_relas = img.relocations().expect("decode libroblox relocations");
+        drop(img);
+
+        // 2) Build TWO scopes from the SAME provider config to compare:
+        //    (a) host-baseline only (eclipse_natives=false) — the 88 work-list,
+        //    (b) Eclipse natives PREPENDED (eclipse_natives=true) — the shrunk work-list.
+        let mut baseline_scope = Scope::new();
+        baseline_scope.push(Box::new(LoadedObjectProvider::new(base, &dynsyms)));
+        for p in BionicEnv::with_host_baseline(true, false).into_providers() {
+            baseline_scope.push(p);
+        }
+        let baseline = categorize_imports(&all_relas, &dynsyms, &baseline_scope);
+
+        let mut eclipse_scope = Scope::new();
+        eclipse_scope.push(Box::new(LoadedObjectProvider::new(base, &dynsyms)));
+        for p in BionicEnv::with_host_baseline(true, true).into_providers() {
+            eclipse_scope.push(p);
+        }
+        let with_eclipse = categorize_imports(&all_relas, &dynsyms, &eclipse_scope);
+
+        eprintln!(
+            "work-list: host-baseline={} | with-Eclipse-natives={}",
+            baseline.unresolved_count(),
+            with_eclipse.unresolved_count()
+        );
+
+        // The host baseline is the documented 88-import work-list.
+        assert_eq!(
+            baseline.unresolved_count(),
+            88,
+            "host-baseline work-list is the documented 88"
+        );
+        // The Eclipse tier resolves the 3 fixed-arity liblog + 15 bionic-libc = 18 names, shrinking
+        // the work-list from 88 to 70 (the 2 deferred variadic liblog + ndk 27 + media 33 + audio 8).
+        assert_eq!(
+            with_eclipse.unresolved_count(),
+            70,
+            "Eclipse natives shrink the work-list 88 -> 70 (18 liblog+libc resolved)"
+        );
+
+        // The 18 newly-resolved names are EXACTLY the ones the Eclipse provider registers, and they
+        // resolve to ECLIPSE addresses, not host ones: prove it by resolving each against an
+        // Eclipse-only provider AND confirming the host (`dlsym`) has no such symbol.
+        let eclipse_only = EclipseNativeProvider::with_bionic_natives();
+        let host_only = HostDlsymProvider;
+        let newly_resolved: std::collections::BTreeSet<&str> = baseline
+            .host_unresolved
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !with_eclipse.host_unresolved.iter().any(|m| m == n))
+            .collect();
+        eprintln!(
+            "Eclipse-native newly-resolved ({}): {:?}",
+            newly_resolved.len(),
+            newly_resolved
+        );
+        assert_eq!(
+            newly_resolved.len(),
+            18,
+            "exactly 18 imports move from work-list to Eclipse-resolved"
+        );
+        for name in &newly_resolved {
+            let e = eclipse_only
+                .resolve(name)
+                .unwrap_or_else(|| panic!("Eclipse provider must own {name}"));
+            assert!(e.addr != 0, "Eclipse native {name} address is non-null");
+            // The full scope must resolve this name to the EXACT Eclipse address (Eclipse tier is
+            // prepended → wins). This is the "in the Eclipse module's address range, NOT host" proof:
+            // the address is an Eclipse `extern "C"` fn / data symbol, not a host glibc/GL one.
+            let scoped = eclipse_scope
+                .resolve(name)
+                .unwrap_or_else(|| panic!("full Eclipse scope resolves {name}"));
+            assert_eq!(
+                scoped.addr, e.addr,
+                "{name} must resolve to the Eclipse-native address (Eclipse tier wins over host)"
+            );
+            // The host has NO such symbol under this exact bionic name (proving it is NOT a host addr).
+            assert!(
+                host_only.resolve(name).is_none(),
+                "{name} is a bionic-only name the host glibc does not export"
+            );
+        }
+        // The 2 VARIADIC liblog natives stay on the work-list (deferred — no landmine).
+        for deferred in ["__android_log_print", "__android_log_assert"] {
+            assert!(
+                with_eclipse.host_unresolved.iter().any(|n| n == deferred),
+                "{deferred} (variadic) stays on the work-list"
+            );
+        }
+
+        // 3) Apply the Eclipse-tier-resolvable subset on the mapped engine and verify the new slots.
+        let stats = set
+            .relocate_object_symbols_partial("libroblox.so", &eclipse_scope, page)
+            .expect("partial symbol relocation with Eclipse natives");
+        eprintln!(
+            "Eclipse-native partial apply: applied_nonnull={} applied_weak_zero={} unresolved_strong={} (work-list={})",
+            stats.applied_nonnull, stats.applied_weak_zero, stats.unresolved_strong, stats.unresolved.len(),
+        );
+        // The apply's work-list must equal the categorization's (consistency), and shrink to 70.
+        assert_eq!(stats.unresolved.len(), 70, "applied work-list is 70");
+        assert!(
+            stats.applied_nonnull > 0,
+            "Eclipse + host fill a non-trivial GOT subset"
+        );
+
+        // Every applied GOT slot for an Eclipse-native import holds the Eclipse address (non-null).
+        let obj = &set.objects[0];
+        let mut checked_eclipse_slots = 0usize;
+        for r in &all_relas {
+            if !matches!(
+                r.r_type,
+                reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
+            ) {
+                continue;
+            }
+            let name = dynsyms
+                .get(r.sym_index as usize)
+                .map(|s| s.name.as_str())
+                .unwrap_or("");
+            if !newly_resolved.contains(name) {
+                continue;
+            }
+            let expected = eclipse_only.resolve(name).expect("eclipse addr").addr;
+            let off = r.offset as usize;
+            if off + 8 <= obj.mapped.span() {
+                let slot = obj.mapped.read_u64(off).expect("read GOT slot");
+                // For GLOB_DAT/JUMP_SLOT the slot holds the symbol address; R_X86_64_64 adds addend.
+                let want = if r.r_type == reloc::R_X86_64_64 {
+                    expected.wrapping_add(r.addend as u64)
+                } else {
+                    expected
+                };
+                assert_eq!(
+                    slot, want,
+                    "GOT slot for Eclipse native {name} must hold the Eclipse address"
+                );
+                checked_eclipse_slots += 1;
+            }
+        }
+        eprintln!("verified {checked_eclipse_slots} GOT slots hold Eclipse-native addresses");
+        assert!(
+            checked_eclipse_slots > 0,
+            "at least one Eclipse-native GOT slot was verified"
         );
 
         // No leak: dropping the set munmaps the 112 MiB region.

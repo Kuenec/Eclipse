@@ -94,6 +94,7 @@ pub mod bionic_env;
 pub mod elf;
 pub mod link;
 pub mod map;
+pub mod native_provider;
 pub mod reloc;
 pub mod resolve;
 pub mod tls;

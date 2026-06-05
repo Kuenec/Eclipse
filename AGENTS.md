@@ -415,6 +415,24 @@ before any history-rewriting/force operation.
   `__errno`/`_chk` FORTIFY/`__stack_chk_guard`), then ndk-android (27) / media-ndk (33) / audio (8); then bind +
   run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW (no `%fs`/TCB — no PT_TLS), main-loop/dev-host only.**
   See §6 (2026-06-05 bionic-env first cut).
+  **2026-06-05 UPDATE — the FIRST Eclipse-OWNED bionic-native provider tier is built + tested + PROVEN on the real
+  engine (work-list 88 → 70):** `src/loader/native_provider.rs` (`pub mod native_provider;`) is an
+  **`EclipseNativeProvider`** (`resolve::SymbolProvider`: a NAME→Eclipse-`extern "C"`-addr registry) **PREPENDED** before
+  the host tier in `BionicEnv` (`with_host_baseline` gained an `eclipse_natives` flag), so Eclipse's impls WIN over the
+  glibc baseline (gABI first-match). **18 natives, each labelled forward/minimal-correct (NO stub):** liblog 3 fixed-arity
+  (`__android_log_write`/`__android_log_buf_write`/`android_set_abort_message` → Eclipse's `tracing`, real emit) + bionic-
+  libc 15 — the `_FORTIFY` `_chk` family + `__errno` + `__gnu_strerror_r` + `__sF` **forward** to the ABI-identical glibc op
+  (honoring the `_chk` bound, abort on overflow), `__assert2`/`__stack_chk_guard`/`__system_property_get` **minimal-correct**
+  (assert+abort; SSP guard word; empty property store → 0/""). **DEFERRED (2, honest, NO landmine):** `__android_log_print`/
+  `__android_log_assert` are C-variadic → need nightly `c_variadic`; Eclipse builds on stable, so they STAY on the work-list.
+  REAL gated test `link::tests::real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc`: work-list **88 → 70**,
+  `applied_nonnull` **535 → 553**, all 18 Eclipse-native GOT slots read-back = the Eclipse addr (host `dlsym` = None for each
+  bionic name → proof it's an Eclipse addr, not host). `unsafe` confined to the native FFI bodies (dated `// SAFETY:`);
+  reloc.rs/elf.rs/resolve.rs stay `#![forbid(unsafe_code)]`; ZERO new crates. Gate **325 unit + 2 doctests**. **Engine-load
+  frontier: liblog (3/5) + bionic-libc (15/15) DONE; work-list now 70 (2 variadic liblog + ndk-android 27 + media-ndk 33 +
+  audio 8). NEXT native category = ndk-android (27)** (AAsset*/AAssetManager* reuse Eclipse's AssetManager; ANativeWindow_*
+  → host surface; ALooper_* → an Eclipse NDK looper; AConfiguration_* → device config). See §6 (2026-06-05 Eclipse-native
+  provider tier).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3117,6 +3135,49 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   work-list, STARTING with liblog (5, already owned in src/framework.rs — route them), then the 21 bionic-specific libc
   names, then ndk-android (27)/media-ndk (33)/audio (8); then bind + run the 3,427 DT_INIT_ARRAY ctors honoring
   RELRO+BIND_NOW (no `%fs`/TCB — no PT_TLS), main-loop/dev-host only.**
+
+- **2026-06-05 (Eclipse-native provider tier — liblog + bionic-libc)** — 🟢 **ENGINE-LOAD: the FIRST Eclipse-OWNED
+  bionic-native provider tier is built + tested + PROVEN on the real `libroblox.so` — work-list 88 → 70.** New module
+  `src/loader/native_provider.rs` (`pub mod native_provider;`): an **`EclipseNativeProvider`** implementing
+  `resolve::SymbolProvider` — a registry mapping a bionic C-ABI symbol NAME → the address of an Eclipse-owned `extern "C"`
+  fn/data symbol; `resolve(name)` returns the registered addr as a STRONG def, `None` otherwise. It is **PREPENDED** before
+  the host tier in the `BionicEnv` scope (`with_host_baseline(try_host_gl, eclipse_natives)` gained the 2nd flag; the scope
+  doc's stale "(future) not yet present" note is corrected), so Eclipse's impls WIN over the host-glibc baseline (gABI
+  first-match). **18 natives registered, each labelled forward / minimal-correct (NO documented-stub in the set):**
+  liblog 3 fixed-arity — `__android_log_write`/`__android_log_buf_write`/`android_set_abort_message` (minimal-correct →
+  Eclipse's `tracing` sink, real emit, priority-mapped, contract return); bionic-libc 15 — the `_FORTIFY` `_chk` family
+  (`__strlen_chk`/`__strchr_chk`/`__strncpy_chk2`/`__write_chk`/`__fwrite_chk`/`__sendto_chk`/`__FD_SET/CLR/ISSET_chk`)
+  **forward** to the ABI-identical glibc op honoring the bound (abort on overflow per the public `_FORTIFY` contract);
+  `__errno` **forward** → glibc `__errno_location` (identical C contract); `__gnu_strerror_r` **forward** → glibc GNU
+  char*-returning `strerror_r`; `__assert2` **minimal-correct** (emit FATAL + `abort()`, noreturn, fixed 4-arg — NOT
+  variadic); `__system_property_get` **minimal-correct** (empty store: writes ""/returns 0 = bionic "property unset");
+  `__stack_chk_guard` **minimal-correct** (Eclipse-owned SSP guard word, low byte 0); `__sF` **forward** (table of the 3
+  host glibc `FILE*` stdin/stdout/stderr). **DEFERRED — honest, NO landmine (2):** `__android_log_print` /
+  `__android_log_assert` are **C-variadic**; defining a variadic `extern "C"` fn needs Rust's unstable `c_variadic`
+  (nightly-only) and Eclipse builds on **stable** (clean-checkout portability §2.11). A non-variadic fn under a variadic
+  symbol = an ABI landmine, so they STAY on the work-list (per the task rule). **REAL VALIDATION (gated test
+  `link::tests::real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc`, skips cleanly if no APK):** with the
+  Eclipse tier prepended, the work-list shrinks **88 → 70** (the 18 newly-resolved names are EXACTLY the 3+15; the 2
+  variadic stay listed), `applied_nonnull` **535 → 553** (+18), every one of the 18 Eclipse-native GOT slots read-back =
+  the Eclipse address (and the host `dlsym` returns None for each bionic name → proof the slot holds an ECLIPSE addr, not a
+  host glibc/GL one), apply work-list == categorization work-list == 70, no panic/leak (Drop munmaps 112 MiB). The
+  existing host-baseline real test is UNCHANGED (now `with_host_baseline(true,false)`) — still 490/88, a kept regression
+  guard. **`unsafe`:** confined to the native FFI bodies (raw-pointer C-ABI args, glibc forwards), each dated `// SAFETY:`;
+  the provider/registry + address-taking (`f as *const () as u64`) are SAFE Rust; reloc.rs/elf.rs/resolve.rs's scope stay
+  `#![forbid(unsafe_code)]`. **ZERO new crates** (`libc` + `tracing` already in tree). **Cyber-safeguard honored:** written
+  ONLY from the public bionic/NDK C-ABI symbol contracts (documented `__android_log_*`/`__errno`/`__system_property_get`/
+  `_chk`/`__stack_chk_guard`/`__sF` signatures — own general knowledge) + Eclipse's own `src/`; NO bionic/NDK/linker/ATL
+  source read; libroblox parsed as data; nothing executed. **Did NOT trip the safeguard.** **Regression guard:** 12 new
+  tests — 10 GPU/VM-free unit in native_provider (registry resolve/reject, exactly-18 registration, Eclipse-beats-host
+  scope ordering, `__strlen_chk`/`__strchr_chk` per-contract, `__errno`==glibc location, `__system_property_get` unset,
+  guard stable+low-byte-0, `__sF` 3 host streams, GOT-fill via the reloc core) + 1 unit in bionic_env (Eclipse tier wins
+  for `__errno`/`__strlen_chk`, host still resolves `memcpy`) + the gated REAL libroblox test. Files: `native_provider.rs`
+  (new), `loader.rs` (mod), `bionic_env.rs` (prepend + `eclipse_natives` flag + accessor + test), `link.rs` (new gated
+  real test + baseline call updated), `docs/bionic-env-worklist.md` (liblog+libc checked off, 2 variadic deferred noted).
+  **Gate:** fmt/build --all-targets/clippy (-D warnings)/test (**325 unit + 2 doctests**)/release all 0-warning/0-error.
+  **NEXT native category = ndk-android (27)** — `AAsset*`/`AAssetManager*` reuse Eclipse's AssetManager, `ANativeWindow_*`
+  → host surface, `ALooper_*` → an Eclipse NDK looper, `AConfiguration_*` → device config; then media-ndk (33) + audio (8)
+  + the 2 deferred variadic liblog; then bind + run the 3,427 DT_INIT_ARRAY ctors (no `%fs`/TCB — no PT_TLS), main-loop only.
 
 ---
 

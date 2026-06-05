@@ -30,17 +30,36 @@ cargo test -p eclipse --lib \
 
 ---
 
+## STATUS UPDATE — 2026-06-05: the Eclipse-native tier landed (work-list 88 → 70)
+
+The **`EclipseNativeProvider`** (`src/loader/native_provider.rs`) is now PREPENDED before the host
+baseline in [`BionicEnv`](../src/loader/bionic_env.rs) (`with_host_baseline(try_host_gl,
+eclipse_natives=true)`). It registers **18** Eclipse-owned `extern "C"` natives — **liblog 3** (the
+fixed-arity ones) + **bionic-libc 15** — so those imports now resolve to **Eclipse addresses, not
+host glibc**. The gated real test
+`loader::link::tests::real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc` proves it on the
+real engine: work-list **88 → 70**, `applied_nonnull` **535 → 553** (+18 Eclipse-native GOT slots,
+all verified holding the Eclipse address; the host has no such symbol under these bionic names).
+
+**Done (✅ below):** liblog (3 of 5) + bionic-libc (15 of 15). **Deferred (2):** the C-variadic
+liblog natives `__android_log_print` / `__android_log_assert` — defining a variadic `extern "C"` fn
+needs Rust's unstable `c_variadic` feature; Eclipse builds on **stable** (clean-checkout portability,
+AGENTS.md §2.11). Registering a non-variadic fn under a variadic name would be an ABI landmine, so
+they stay on the work-list (no landmine). **Remaining: 70** = 2 variadic liblog + ndk-android 27 +
+media-ndk 33 + audio 8.
+
 ## Headline
 
-| metric | value |
-|---|---:|
-| UND imports (reloc-referenced; = the GNU_HASH-authoritative count) | **584** |
-| host-resolved (BASELINE, not ABI-correct) | **490** |
-| **work-list (need Eclipse-owned bionic natives)** | **88** |
-| symbol relocs applied (non-null host addr) | 535 |
-| symbol relocs applied weak-undef → 0 (legal) | 12 |
-| symbol relocs unresolved-strong (recorded, no GOT write) | 88 |
-| symbol relocs deferred (TPOFF64/IRELATIVE) | 0 |
+| metric | host-baseline only | + Eclipse-native tier (2026-06-05) |
+|---|---:|---:|
+| UND imports (reloc-referenced; = GNU_HASH-authoritative) | **584** | **584** |
+| host-resolved (BASELINE, not ABI-correct) | **490** | 490 |
+| Eclipse-native-resolved (bionic-ABI-correct/minimal/forward) | 0 | **18** |
+| **work-list (need Eclipse-owned bionic natives)** | **88** | **70** |
+| symbol relocs applied (non-null addr) | 535 | **553** |
+| symbol relocs applied weak-undef → 0 (legal) | 12 | 12 |
+| symbol relocs unresolved-strong (recorded, no GOT write) | 88 | **70** |
+| symbol relocs deferred (TPOFF64/IRELATIVE) | 0 | 0 |
 
 The 584 imports are counted from the **relocations**, not the raw dynamic symtab — this is
 immune to `elf.rs`'s documented symtab over-read (it reads trailing VERSYM/GNU_HASH bytes as extra
@@ -76,27 +95,34 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 
 Grouped by category, in the priority order to implement (NEXT step first).
 
-### 1. liblog (5) — Eclipse ALREADY owns these in `src/framework.rs`; just route them
-The loader must route these to Eclipse's existing log natives (not the host). Smallest first step.
+### 1. liblog (5) — ✅ DONE (3) routed to Eclipse's `tracing`; 2 variadic DEFERRED (2026-06-05)
+`src/loader/native_provider.rs` implements the 3 fixed-arity ones as Eclipse-owned `extern "C"`
+natives that emit to Eclipse's `tracing` sink (real emit, priority-mapped). The 2 **C-variadic**
+ones cannot be defined on stable Rust (`c_variadic` is nightly-only) — registering a non-variadic fn
+under them would be an ABI landmine, so they stay here (no landmine).
 ```
-__android_log_assert  __android_log_buf_write  __android_log_print  __android_log_write
-android_set_abort_message
+✅ __android_log_write        # minimal-correct → tracing (returns byte count ≥ 1)
+✅ __android_log_buf_write    # minimal-correct → tracing (bufID ignored; single sink)
+✅ android_set_abort_message  # minimal-correct → tracing (ERROR; void)
+⏳ __android_log_print         # DEFERRED — C-variadic (needs nightly c_variadic)
+⏳ __android_log_assert        # DEFERRED — C-variadic + noreturn
 ```
 
-### 2. bionic-libc — the 21 bionic-specific names glibc does NOT provide
-These need Eclipse-owned bionic-libc natives (bionic-only entry points / objects):
+### 2. bionic-libc — ✅ DONE: the 15 bionic-specific names glibc does NOT provide (2026-06-05)
+All 15 implemented in `src/loader/native_provider.rs` (each labelled forward / minimal-correct):
 ```
-__system_property_get          # Android system properties (no glibc equivalent)
-__sF                           # bionic stdio FILE table (object; glibc has no __sF)
-__errno                        # bionic errno fn (glibc exports __errno_location, not __errno)
-__assert2                      # bionic 4-arg assert
-__gnu_strerror_r               # bionic GNU strerror_r alias
-__stack_chk_guard              # bionic SSP guard OBJECT (glibc puts it in TLS, not exported)
-# bionic FORTIFY (_chk) variants glibc lacks under these exact names:
-__FD_CLR_chk  __FD_ISSET_chk  __FD_SET_chk
-__fwrite_chk  __sendto_chk  __strchr_chk  __strlen_chk  __strncpy_chk2  __write_chk
+✅ __system_property_get   # minimal-correct: empty store → writes ""/returns 0 (bionic "unset")
+✅ __sF                    # forward: table of the 3 host glibc FILE* (stdin/stdout/stderr)
+✅ __errno                 # forward: → glibc __errno_location (identical C contract)
+✅ __assert2               # minimal-correct: emit FATAL + abort (noreturn, fixed 4-arg)
+✅ __gnu_strerror_r        # forward: → glibc GNU (char*-returning) strerror_r
+✅ __stack_chk_guard       # minimal-correct: Eclipse-owned SSP guard word (low byte 0)
+# bionic FORTIFY (_chk) — forward to the ABI-identical glibc op, honoring the bound (abort on overflow):
+✅ __FD_CLR_chk  ✅ __FD_ISSET_chk  ✅ __FD_SET_chk
+✅ __fwrite_chk  ✅ __sendto_chk  ✅ __strchr_chk  ✅ __strlen_chk  ✅ __strncpy_chk2  ✅ __write_chk
 ```
-(303 other libc names resolve from glibc as a baseline; only these 21 are missing entirely.)
+(303 other libc names resolve from glibc as a baseline; only these 15 were missing entirely. The
+older "21" figure in this doc was prose; the real test reports exactly **15** bionic-libc names.)
 
 ### 3. ndk-android — libandroid (27), NO host equivalent
 ```
@@ -144,15 +170,15 @@ in this build, so it is not on the work-list despite being a `DT_NEEDED`.)
 
 ## Recommended implementation order (NEXT steps)
 
-1. **liblog (5)** — route to Eclipse's existing `src/framework.rs` log natives. Smallest, already
-   owned; proves the loader→Eclipse-native binding path.
-2. **bionic-libc bionic-specific (21)** — Eclipse-owned bionic-libc natives for the glibc-missing
-   names (`__system_property_get`, `__sF`, `__errno`, the `_chk` FORTIFY family, `__stack_chk_guard`).
-   This also begins the honest displacement of the 303 glibc-baseline libc symbols with
-   bionic-ABI-correct ones (prepend the Eclipse-native provider before the host tier).
-3. **ndk-android (27)** — `AAsset*`/`AAssetManager*` reuse Eclipse's AssetManager; `ANativeWindow_*`
-   → host surface; `ALooper_*` → an Eclipse NDK looper; `AConfiguration_*` → device config.
+1. ~~**liblog (5)**~~ — ✅ DONE (3 fixed-arity routed to Eclipse's `tracing`; 2 variadic deferred).
+   The `EclipseNativeProvider` is the loader→Eclipse-native binding path, prepended before host.
+2. ~~**bionic-libc bionic-specific (15)**~~ — ✅ DONE: Eclipse-owned natives for all 15 glibc-missing
+   names (`__system_property_get`, `__sF`, `__errno`, the `_chk` FORTIFY family, `__stack_chk_guard`),
+   each labelled forward/minimal-correct. Prepended before the host tier (Eclipse wins).
+3. **ndk-android (27)** — ⏭️ NEXT. `AAsset*`/`AAssetManager*` reuse Eclipse's AssetManager;
+   `ANativeWindow_*` → host surface; `ALooper_*` → an Eclipse NDK looper; `AConfiguration_*` → config.
 4. **media-ndk (33)** + **audio (8)** — bridges to host codecs / host audio.
+   + the **2 deferred variadic liblog** natives (need a nightly toolchain or a justified clean-room C shim).
 5. After the work-list is satisfied: bind the assembled image to execution and run the **3,427
    `DT_INIT_ARRAY` constructors** in order, honoring RELRO + BIND_NOW (no `%fs`/TCB needed — no
    PT_TLS). This is **main-loop / dev-host only** (the cyber-safeguard).
