@@ -16,6 +16,11 @@
 /m0-artifacts/
 framework-worklist.txt
 
+# Workflow/agent internals — worktrees and harness state, never committed (2026-06-05)
+.claude/
+# Local scratch examples (ad-hoc dump/probe binaries, not part of the crate) (2026-06-05)
+/examples/
+
 # Editor / OS
 .idea/
 .vscode/

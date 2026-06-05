@@ -596,10 +596,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      advances **past `PackageParser.parsePackage`** (the `getInteger type=0x1` error is gone). **NEW STOP
      (faithful): `<activity> does not specify android:name` → `System.exit(1)`** — a `getString`
      resolution that needs ATL's pooled-string/cookie ABI (`TypedArray.getString`, denylisted). `onCreate`
-     is **NOT reached** (reported faithfully, not faked). **NEXT (in order): (1) the String-attribute
-     TypedArray path** — determine ATL's `getString` cookie/string-pool offsets empirically (the cookie
-     swept to −1 across the unknown slots did not resolve it) so `<activity android:name>` reads; this
-     may need the XmlBlock string pool exposed by index or the asset-cookie slot. Then **(2)** the deref-ing Window natives for
+     is **NOT reached** (reported faithfully, not faked). **NEXT (in order): (a) finish String-attribute
+     resolution for `<activity android:name>` via the EXISTING `nativeGetAttributeStringValue`/XML-pool
+     path** — NOT a new native: a 2026-06-05 DIAG probe (since reverted) confirmed only
+     `AssetManager.getCookieName` exists among the candidate string natives, and none of the dedicated
+     string-pool-resolution natives (`getPooledStringForCookie`/`getResourceString`/`getNativeStringBlock`/
+     `nativeGetStringBlock`) exist — so ATL's `TypedArray.getString` resolves through the already-bound
+     `nativeGetAttributeStringValue` + the `XmlBlock` string pool (the value is already in the parsed
+     `XmlDocument`); surface that string to the framework. Then **(b) wire `apk::arsc` into
+     `retrieveAttributes` for `@`-references** — when an attribute's `Res_value` is `TYPE_REFERENCE`,
+     resolve it through `arsc::ResTable::resource_value` against the APK's `resources.arsc`. Then **(2)** the deref-ing Window natives for
      step 4 (`set_jobject`/`set_title`/`set_layout` metadata via `register_native_methods` + a descriptor
      guard vs `Window.java`, then the deferred `set_widget_as_root`/`take_input_queue`) + associating the
      real winit `Window` with the registry slot. **BIGGEST RISK recorded:** the View hierarchy is fully
@@ -1209,6 +1215,31 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `/tmp/eclipse-run.log` (EXIT=1, the expected stop at the activity-name `getString`). **NEXT:** crack
   ATL's `getString`/string-pool TypedArray ABI empirically so `<activity android:name>` reads, then
   continue toward `createApplication`/`onCreate`.
+- **2026-06-05** — **Standalone `resources.arsc` (ResTable) reader integrated to main**
+  (`src/apk/arsc.rs`, `#![forbid(unsafe_code)]` via the crate, no new dep). Self-contained
+  (own LE `read_u16`/`read_u32`, bounds-checked/total like `apk::axml`; never panics on
+  truncated/mutated input — proven by `reader_is_total_under_truncation_and_mutation`).
+  Public API: `parse_arsc(&[u8]) -> Result<ResTable, ArscError>`, `ResTable::resource_value(id)`,
+  `ResTable::resolve(package_id, type_id, entry_id)`, `ResTable::value_string(index)` (plus
+  `type_name`/`key_name`/`package_ids`). Wired via `pub mod arsc;` next to `pub mod axml;`;
+  tests parse the **real** demo `resources.arsc` (`Apk::read_entry`, `pub` on main) and fall
+  back to a hand-built fixture when the asset is absent. Brought over WITHOUT merging the stale
+  `worktree-wf_d4fe9b72-077-1` branch (it was based on old commit `020c48e`; a merge would
+  conflict on `mod.rs`) — only the self-contained file was taken via `git show <branch>:…/arsc.rs`,
+  then the branch + worktree were removed. **Ready to wire into `retrieveAttributes` for
+  `@`-reference (`TYPE_REFERENCE`) resolution.** Full gate green: fmt / build --all-targets /
+  clippy `-D warnings` / test (**71 unit** [+5 arsc] **+ 2 compile_fail doctests**) / release.
+- **2026-06-05** — **`getString` diagnostic finding RECORDED** (from a now-reverted DIAG probe
+  in `framework.rs` — the probe was investigative scaffolding, not a feature, so it was
+  discarded; only the knowledge is kept): among the candidate string natives
+  (`getPooledStringForCookie`/`getResourceString`/`getCookieName`/`getNativeStringBlock`/
+  `nativeGetStringBlock`), **ONLY `AssetManager.getCookieName` exists**; the dedicated
+  string-pool-resolution natives do **NOT** exist. So ATL's `TypedArray.getString` resolves
+  strings **without a new native** — most likely via the already-bound
+  `nativeGetAttributeStringValue` + the `XmlBlock` string pool (the value already present in
+  the parsed `XmlDocument`). That XML-pool path — not a new native — is the next frontier for
+  `<activity android:name>`. Also `.gitignore`d `.claude/` (worktree/harness internals) and
+  `/examples/` (local scratch probe binaries) so they are never committed.
 
 ---
 

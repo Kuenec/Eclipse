@@ -1,0 +1,945 @@
+//! Binary `resources.arsc` (ResTable) reader — total, never-panicking (component-map B).
+//!
+//! 2026-06-05: Eclipse owns this reader so `AssetManager.retrieveAttributes` / `Resources`
+//! can resolve a packed resource id (`0xPPTTEEEE`) to its concrete `Res_value` `(type, data)`
+//! without depending on ATL's GTK-coupled `AssetManager` C backing. It is built on the **same**
+//! `ResChunk_header` + `ResStringPool` primitives as the binary `AndroidManifest.xml` reader
+//! ([`super::axml`]), with the identical totality discipline: every byte is read through
+//! bounds-checked little-endian helpers and checked integer math, so any malformed/short/
+//! hostile input yields a typed [`ArscError`] and never panics or reads out of bounds. Under
+//! the release `panic = "abort"` profile (AGENTS.md §2.4/§2.8) a panic would abort the whole
+//! process, so a reader of untrusted resource tables must be total. `#![forbid(unsafe_code)]`
+//! (§2.3) keeps it free of raw/unaligned loads.
+//!
+//! Only the surface attribute/resource resolution needs is exposed: the global value string
+//! pool, each package's type-name and key-name pools, and a resolver from a packed resource id
+//! to a single `Res_value`. Complex (bag/map) entries, multiple configurations, and reference
+//! chasing are intentionally **not** resolved here — the resolver returns the first
+//! configuration's simple value (the common case for app resources); a complex entry surfaces
+//! as [`ResolvedValue::is_complex`] so a caller can decide how to handle it.
+//!
+//! ## Format (verified 2026-06-05 against the demo APK's `resources.arsc`)
+//! `resources.arsc` is a sequence of little-endian chunks, each led by the 8-byte
+//! `ResChunk_header` (`type:u16, headerSize:u16, size:u32`) shared with AXML. The file is one
+//! outer `RES_TABLE_TYPE` chunk: a 12-byte header (`ResChunk_header` + `packageCount:u32`)
+//! whose body is the **global value string pool** (`RES_STRING_POOL_TYPE`) followed by
+//! `packageCount` `RES_TABLE_PACKAGE_TYPE` chunks. Each package chunk's header (≥284 bytes;
+//! the demo's is 288 — newer AOSP appends a `typeIdOffset:u32`) holds the `ResChunk_header`,
+//! `id:u32`, a `name:[u16;128]`, then `typeStrings:u32`, `lastPublicType:u32`, `keyStrings:u32`,
+//! `lastPublicKey:u32`, where `typeStrings`/`keyStrings` are byte offsets relative to the package
+//! chunk start that locate that package's type-name and key-name string pools. The package body
+//! then holds, per type, a `RES_TABLE_TYPE_SPEC_TYPE` chunk
+//! (`id:u8, res0:u8, res1:u16, entryCount:u32`) and one or more `RES_TABLE_TYPE_TYPE` chunks
+//! (`id:u8, res0:u8, res1:u16, entryCount:u32, entriesStart:u32, config{...}`). A type chunk's
+//! entry-offset array (`entryCount` x `u32`, `0xFFFFFFFF` = absent) begins at `headerSize`; each
+//! present offset locates a `ResTable_entry` (`size:u16, flags:u16, key:u32`) at
+//! `chunk + entriesStart + offset`. A simple entry (flag `FLAG_COMPLEX` clear) is followed by a
+//! `Res_value` (`size:u16, res0:u8, dataType:u8, data:u32`). Layout follows AOSP
+//! `frameworks/base/libs/androidfw/include/androidfw/ResourceTypes.h`.
+
+#![forbid(unsafe_code)]
+
+use std::fmt;
+
+// --- ResChunk_header types (the `type` field) ---------------------------------------------
+const RES_STRING_POOL_TYPE: u16 = 0x0001;
+const RES_TABLE_TYPE: u16 = 0x0002;
+const RES_TABLE_PACKAGE_TYPE: u16 = 0x0200;
+const RES_TABLE_TYPE_TYPE: u16 = 0x0201;
+const RES_TABLE_TYPE_SPEC_TYPE: u16 = 0x0202;
+
+// --- Fixed struct sizes / field offsets (bytes) ------------------------------------------
+/// `ResChunk_header`: type(u16) + headerSize(u16) + size(u32).
+const CHUNK_HEADER_SIZE: usize = 8;
+/// `ResTable_header`: `ResChunk_header` + packageCount(u32).
+const TABLE_HEADER_SIZE: usize = 12;
+/// Minimum `ResTable_package` header: `ResChunk_header`(8) + id(u32) + name(256) + the four
+/// `typeStrings`/`lastPublicType`/`keyStrings`/`lastPublicKey` u32 fields = 284. (Newer AOSP
+/// adds a trailing `typeIdOffset` u32, making the real header 288; that is `>= 284`, so both the
+/// 284-byte classic and 288-byte modern packages are accepted — detect, don't assume the size.)
+const PACKAGE_HEADER_MIN: usize = 284;
+/// Minimum `ResTable_type` header up to and including `entriesStart` (config follows).
+const TYPE_HEADER_MIN: usize = 20;
+/// Minimum `ResTable_entry`: size(u16) + flags(u16) + key(u32).
+const ENTRY_MIN_SIZE: usize = 8;
+/// `Res_value`: size(u16) + res0(u8) + dataType(u8) + data(u32).
+const RES_VALUE_SIZE: usize = 8;
+
+/// `ResTable_package` field offsets, relative to the package chunk start.
+const PKG_ID_OFFSET: usize = 8;
+const PKG_TYPE_STRINGS_OFFSET: usize = 268; // 8 (header) + 4 (id) + 256 (name)
+const PKG_KEY_STRINGS_OFFSET: usize = 276; // + 4 (typeStrings) + 4 (lastPublicType)
+
+/// `ResTable_entry.flags` bit: the entry is a complex (bag/map) entry, not a simple value.
+const ENTRY_FLAG_COMPLEX: u16 = 0x0001;
+
+/// The "no entry at this index" sentinel in a type chunk's entry-offset array.
+const NO_ENTRY: u32 = 0xFFFF_FFFF;
+
+/// Upper bound on packages / types / entries parsed from one table, so a hostile count field
+/// (e.g. `packageCount = 0xFFFF_FFFF`) cannot drive an unbounded loop or pre-allocation.
+/// Real app tables have a handful of packages, dozens of types, and thousands of entries; these
+/// caps (2026-06-05) sit well above any legitimate value while bounding work on malformed input.
+const MAX_PACKAGES: usize = 256;
+const MAX_TYPES: usize = 4096;
+
+/// Errors from reading a binary `resources.arsc`.
+///
+/// Every malformed/short/out-of-bounds input maps to one of these instead of a panic — the
+/// totality guarantee that lets the release profile keep `panic = "abort"` (AGENTS.md §2.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArscError {
+    /// A fixed-size structure was read past the end of the buffer (or a chunk's bounds).
+    Truncated,
+    /// A chunk header was invalid (bad `type`, or `size`/`headerSize` out of range / would not
+    /// advance the cursor).
+    BadChunk,
+    /// The file did not start with an outer `RES_TABLE_TYPE` chunk.
+    NotResTable,
+    /// The global value string pool chunk was absent (the table references it by index).
+    NoValuePool,
+    /// A package chunk was malformed (header too small, bad string-pool offset).
+    BadPackage,
+    /// A string-pool chunk inside the table was malformed (bad offset / length / encoding).
+    BadStringPool,
+    /// A `ResStringPool_ref` referenced an index outside its string pool.
+    StringIndexOutOfRange,
+    /// Integer overflow occurred in offset/length arithmetic on hostile input.
+    Overflow,
+    /// The table declared more packages/types than [`MAX_PACKAGES`]/[`MAX_TYPES`] allow.
+    TooManyChunks,
+}
+
+impl fmt::Display for ArscError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("resources.arsc ended unexpectedly (truncated)"),
+            Self::BadChunk => f.write_str("resources.arsc chunk header is invalid"),
+            Self::NotResTable => f.write_str("not a resources.arsc (no RES_TABLE root chunk)"),
+            Self::NoValuePool => f.write_str("resources.arsc has no global value string pool"),
+            Self::BadPackage => f.write_str("resources.arsc package chunk is malformed"),
+            Self::BadStringPool => f.write_str("resources.arsc string pool is malformed"),
+            Self::StringIndexOutOfRange => {
+                f.write_str("resources.arsc string index is out of range")
+            }
+            Self::Overflow => f.write_str("resources.arsc offset/length arithmetic overflowed"),
+            Self::TooManyChunks => f.write_str("resources.arsc declares too many packages/types"),
+        }
+    }
+}
+
+impl std::error::Error for ArscError {}
+
+/// A resolved resource value: a single `Res_value` (type + data), plus its key (entry) name.
+///
+/// `type_` is the `Res_value.dataType` byte (e.g. `0x1c` ARGB8 color, `0x10` decimal int,
+/// `0x03` string-pool reference, `0x01` resource reference). `data` is the raw 32-bit payload;
+/// for `type_ == 0x03` (string) it is an index into the global value string pool, resolvable
+/// via [`ResTable::value_string`]. A complex (bag/map) entry has no single `Res_value`; it is
+/// reported with `is_complex = true` and `type_`/`data` zeroed so a caller can branch on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedValue {
+    /// `Res_value.dataType`.
+    pub type_: u8,
+    /// `Res_value.data` (raw 32-bit payload; a global-value-pool index when `type_ == 0x03`).
+    pub data: u32,
+    /// The entry's key-name index into the owning package's key-string pool.
+    pub key_index: u32,
+    /// `true` when the entry is complex (bag/map): `type_`/`data` are then `0`.
+    pub is_complex: bool,
+}
+
+/// A parsed package within a `resources.arsc`: its id plus the byte ranges of its type-name and
+/// key-name string pools and of its `RES_TABLE_TYPE_TYPE` chunks (decoded lazily on lookup).
+struct Package {
+    /// The package id (the high byte `PP` of a `0xPPTTEEEE` resource id; typically `0x7f`).
+    id: u8,
+    /// `[start, end)` of this package's type-name string pool chunk in the file (or `None`).
+    type_pool: Option<(usize, usize)>,
+    /// `[start, end)` of this package's key-name string pool chunk in the file (or `None`).
+    key_pool: Option<(usize, usize)>,
+    /// `[start, end)` of each `RES_TABLE_TYPE_TYPE` chunk in the file, in file order.
+    type_chunks: Vec<(usize, usize)>,
+}
+
+/// A parsed `resources.arsc` ready for resource-id resolution.
+///
+/// Borrows the source bytes (`'a`): string pools and entries are decoded on demand from the
+/// original buffer, so construction allocates only the small package/type index, not the data.
+pub struct ResTable<'a> {
+    buf: &'a [u8],
+    /// `[start, end)` of the global value string pool chunk.
+    value_pool: (usize, usize),
+    packages: Vec<Package>,
+}
+
+impl<'a> ResTable<'a> {
+    /// Resolve a packed resource id (`0xPPTTEEEE`: package `PP`, type `TT`, entry `EEEE`) to its
+    /// `Res_value`, scanning the type's `RES_TABLE_TYPE_TYPE` chunks for the first that defines
+    /// the entry.
+    ///
+    /// Returns `None` when the package/type/entry is absent (an unknown id, or an entry not
+    /// defined in any configuration). Never panics: malformed offsets within a candidate chunk
+    /// are skipped, so a corrupt chunk cannot crash resolution.
+    ///
+    /// Multiple configurations (locale/density/...) are not selected between — the first chunk
+    /// that defines the entry wins (the default/only config for typical app resources). This is
+    /// the smallest surface attribute resolution needs; richer config matching can layer on top.
+    pub fn resource_value(&self, resource_id: u32) -> Option<ResolvedValue> {
+        let package_id = (resource_id >> 24) as u8;
+        let type_id = ((resource_id >> 16) & 0xff) as u8;
+        let entry_id = (resource_id & 0xffff) as u16;
+        self.resolve(package_id, type_id, entry_id)
+    }
+
+    /// Resolve by the three components (package id, 1-based type id, entry index) directly.
+    pub fn resolve(&self, package_id: u8, type_id: u8, entry_id: u16) -> Option<ResolvedValue> {
+        let package = self.packages.iter().find(|p| p.id == package_id)?;
+        for &(start, end) in &package.type_chunks {
+            let chunk = self.buf.get(start..end)?;
+            // Skip a chunk whose declared type id doesn't match; read_u8 is bounds-checked.
+            if read_u8(chunk, CHUNK_HEADER_SIZE).ok()? != type_id {
+                continue;
+            }
+            if let Some(value) = resolve_in_type_chunk(chunk, entry_id) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Resolve a global value-pool string index (e.g. a [`ResolvedValue`] with `type_ == 0x03`,
+    /// whose `data` is the index). Returns `None` for out-of-range/absent, `Err` for corruption.
+    pub fn value_string(&self, index: u32) -> Result<Option<String>, ArscError> {
+        let pool = self.value_pool()?;
+        pool.get(index)
+    }
+
+    /// The type name for a 1-based `type_id` in the given package (e.g. `color`, `string`),
+    /// resolved from that package's type-name string pool. `None` if absent/out of range.
+    pub fn type_name(&self, package_id: u8, type_id: u8) -> Result<Option<String>, ArscError> {
+        let Some(package) = self.packages.iter().find(|p| p.id == package_id) else {
+            return Ok(None);
+        };
+        let Some((start, end)) = package.type_pool else {
+            return Ok(None);
+        };
+        // Type ids are 1-based; index 0 is the first type name.
+        let Some(index) = type_id.checked_sub(1) else {
+            return Ok(None);
+        };
+        let pool = self.pool_at(start, end)?;
+        pool.get(u32::from(index))
+    }
+
+    /// The key (entry) name for a key index in the given package, resolved from that package's
+    /// key-name string pool. `None` if the package/pool is absent or the index is out of range.
+    pub fn key_name(&self, package_id: u8, key_index: u32) -> Result<Option<String>, ArscError> {
+        let Some(package) = self.packages.iter().find(|p| p.id == package_id) else {
+            return Ok(None);
+        };
+        let Some((start, end)) = package.key_pool else {
+            return Ok(None);
+        };
+        let pool = self.pool_at(start, end)?;
+        pool.get(key_index)
+    }
+
+    /// The package ids present in this table (typically just `0x7f` for an app).
+    pub fn package_ids(&self) -> Vec<u8> {
+        self.packages.iter().map(|p| p.id).collect()
+    }
+
+    fn value_pool(&self) -> Result<StringPool<'a>, ArscError> {
+        self.pool_at(self.value_pool.0, self.value_pool.1)
+    }
+
+    /// Re-parse a string pool from a recorded `[start, end)` range. Cheap: [`StringPool::parse`]
+    /// only validates the header + offset array and borrows the data (no per-string allocation).
+    fn pool_at(&self, start: usize, end: usize) -> Result<StringPool<'a>, ArscError> {
+        let bytes = self.buf.get(start..end).ok_or(ArscError::Truncated)?;
+        StringPool::parse(bytes)
+    }
+}
+
+/// Parse a binary `resources.arsc` into a [`ResTable`] borrowing `bytes`.
+///
+/// Returns a typed [`ArscError`] for any malformed input — never panics, never reads out of
+/// bounds (the totality guarantee that lets the release profile keep `panic = "abort"`).
+pub fn parse_arsc(bytes: &[u8]) -> Result<ResTable<'_>, ArscError> {
+    let root = ChunkRef::parse(bytes, 0)?;
+    if root.kind != RES_TABLE_TYPE {
+        return Err(ArscError::NotResTable);
+    }
+    if root.header_size < TABLE_HEADER_SIZE {
+        return Err(ArscError::BadChunk);
+    }
+
+    let mut value_pool: Option<(usize, usize)> = None;
+    let mut packages: Vec<Package> = Vec::new();
+
+    // The table body (after its 12-byte header) is: the global value string pool, then the
+    // package chunks. Iterate children, advancing by each child's `size`.
+    for child in root.children() {
+        let child = child?;
+        match child.kind {
+            RES_STRING_POOL_TYPE if value_pool.is_none() => {
+                value_pool = Some((child.start, child.end));
+            }
+            RES_TABLE_PACKAGE_TYPE => {
+                if packages.len() >= MAX_PACKAGES {
+                    return Err(ArscError::TooManyChunks);
+                }
+                packages.push(parse_package(bytes, &child)?);
+            }
+            _ => {} // chunk types we don't use are skipped by size.
+        }
+    }
+
+    let value_pool = value_pool.ok_or(ArscError::NoValuePool)?;
+    Ok(ResTable {
+        buf: bytes,
+        value_pool,
+        packages,
+    })
+}
+
+/// Parse one `RES_TABLE_PACKAGE_TYPE` chunk: record its id, type/key string-pool ranges, and
+/// the file ranges of its `RES_TABLE_TYPE_TYPE` chunks.
+fn parse_package(buf: &[u8], pkg: &ChunkRef) -> Result<Package, ArscError> {
+    let chunk = buf.get(pkg.start..pkg.end).ok_or(ArscError::Truncated)?;
+    if pkg.header_size < PACKAGE_HEADER_MIN {
+        return Err(ArscError::BadPackage);
+    }
+    // The id is a u32 but only the low byte is the package id (per the resource-id layout).
+    let id = read_u8(chunk, PKG_ID_OFFSET).map_err(|_| ArscError::BadPackage)?;
+    let type_strings =
+        read_u32(chunk, PKG_TYPE_STRINGS_OFFSET).map_err(|_| ArscError::BadPackage)?;
+    let key_strings = read_u32(chunk, PKG_KEY_STRINGS_OFFSET).map_err(|_| ArscError::BadPackage)?;
+
+    // typeStrings/keyStrings are byte offsets relative to the package chunk start; 0 = absent.
+    let type_pool = pool_range_in_chunk(pkg, type_strings as usize)?;
+    let key_pool = pool_range_in_chunk(pkg, key_strings as usize)?;
+
+    // The package body (after its header) holds the type-spec and type chunks. The string pools
+    // live inside that body too, so iterate everything after the header and collect the type
+    // chunks (the string pools are already located above via the header offsets).
+    let mut type_chunks: Vec<(usize, usize)> = Vec::new();
+    for child in pkg.children() {
+        let child = child?;
+        match child.kind {
+            RES_TABLE_TYPE_TYPE => {
+                if type_chunks.len() >= MAX_TYPES {
+                    return Err(ArscError::TooManyChunks);
+                }
+                type_chunks.push((child.start, child.end));
+            }
+            RES_TABLE_TYPE_SPEC_TYPE => {} // spec carries flags only; not needed for value lookup.
+            _ => {}
+        }
+    }
+
+    Ok(Package {
+        id,
+        type_pool,
+        key_pool,
+        type_chunks,
+    })
+}
+
+/// Convert a package-relative string-pool offset to an absolute `[start, end)` file range,
+/// validating that it names a `RES_STRING_POOL_TYPE` chunk fully inside the package. A `0`
+/// offset (or an offset that does not parse as a string pool) yields `None`, not an error, so a
+/// package that legitimately omits a pool is handled gracefully.
+fn pool_range_in_chunk(pkg: &ChunkRef, rel: usize) -> Result<Option<(usize, usize)>, ArscError> {
+    if rel == 0 {
+        return Ok(None);
+    }
+    let abs = pkg.start.checked_add(rel).ok_or(ArscError::Overflow)?;
+    if abs >= pkg.end {
+        return Err(ArscError::BadPackage);
+    }
+    // Parse the pool chunk against the FULL file buffer at its absolute offset, so the recorded
+    // [start, end) range is absolute (re-sliceable from `ResTable.buf`). It must stay inside the
+    // enclosing package chunk.
+    let pool = ChunkRef::parse(pkg.buf, abs)?;
+    if pool.kind != RES_STRING_POOL_TYPE || pool.end > pkg.end {
+        return Ok(None);
+    }
+    Ok(Some((pool.start, pool.end)))
+}
+
+/// Resolve `entry_id` within one `RES_TABLE_TYPE_TYPE` chunk, or `None` if it has no such entry.
+///
+/// Total: any malformed offset/length within the chunk returns `None` rather than panicking.
+fn resolve_in_type_chunk(chunk: &[u8], entry_id: u16) -> Option<ResolvedValue> {
+    let header_size = read_u16(chunk, 2).ok()? as usize;
+    if header_size < TYPE_HEADER_MIN {
+        return None;
+    }
+    let entry_count = read_u32(chunk, 12).ok()? as usize;
+    let entries_start = read_u32(chunk, 16).ok()? as usize;
+    let index = entry_id as usize;
+    if index >= entry_count {
+        return None;
+    }
+
+    // Entry-offset array (u32 each) begins at headerSize.
+    let off_pos = header_size.checked_add(index.checked_mul(4)?)?;
+    let entry_off = read_u32(chunk, off_pos).ok()?;
+    if entry_off == NO_ENTRY {
+        return None; // entry absent in this configuration
+    }
+    let entry_at = entries_start.checked_add(entry_off as usize)?;
+
+    // ResTable_entry: size(u16), flags(u16), key(u32).
+    let entry_size = read_u16(chunk, entry_at).ok()? as usize;
+    if entry_size < ENTRY_MIN_SIZE {
+        return None;
+    }
+    let flags = read_u16(chunk, entry_at.checked_add(2)?).ok()?;
+    let key_index = read_u32(chunk, entry_at.checked_add(4)?).ok()?;
+
+    if flags & ENTRY_FLAG_COMPLEX != 0 {
+        // A bag/map entry has no single Res_value; report it as complex.
+        return Some(ResolvedValue {
+            type_: 0,
+            data: 0,
+            key_index,
+            is_complex: true,
+        });
+    }
+
+    // A simple entry is followed by a Res_value at entry_at + entry_size.
+    let value_at = entry_at.checked_add(entry_size)?;
+    // Bound the Res_value within the chunk before reading its fields.
+    let value_end = value_at.checked_add(RES_VALUE_SIZE)?;
+    if value_end > chunk.len() {
+        return None;
+    }
+    let type_ = read_u8(chunk, value_at.checked_add(3)?).ok()?; // size(2)+res0(1) then dataType
+    let data = read_u32(chunk, value_at.checked_add(4)?).ok()?;
+    Some(ResolvedValue {
+        type_,
+        data,
+        key_index,
+        is_complex: false,
+    })
+}
+
+// --- String pool (`RES_STRING_POOL_TYPE`) ------------------------------------------------
+//
+// Self-contained reader modeled on `super::axml`'s string pool (same `ResStringPool_header`
+// layout and the same UTF-8/UTF-16 length-prefixed string forms), kept inside this module so
+// `arsc.rs` is a standalone unit that does not depend on `axml.rs`'s private internals.
+
+/// String pool header flag: strings are UTF-8 (else UTF-16LE).
+const UTF8_FLAG: u32 = 0x0100;
+/// `ResStringPool_header` size (the fixed prefix before the offset array).
+const STRING_POOL_HEADER_SIZE: usize = 28;
+/// `ResStringPool_ref` "no string" sentinel.
+const NO_STRING: u32 = 0xFFFF_FFFF;
+
+/// A validated, lazily-decoded string pool. Holds the pool chunk bytes plus the parsed header
+/// fields; individual strings are decoded on demand by [`StringPool::get`].
+struct StringPool<'a> {
+    /// The whole string-pool chunk bytes.
+    chunk: &'a [u8],
+    string_count: usize,
+    /// Offset array start (relative to `chunk`).
+    offsets_start: usize,
+    /// String data start (relative to `chunk`).
+    data_start: usize,
+    is_utf8: bool,
+}
+
+impl<'a> StringPool<'a> {
+    /// Parse and validate a `RES_STRING_POOL_TYPE` chunk (`chunk` is exactly the pool chunk).
+    fn parse(chunk: &'a [u8]) -> Result<Self, ArscError> {
+        if read_u16(chunk, 0)? != RES_STRING_POOL_TYPE {
+            return Err(ArscError::BadStringPool);
+        }
+        // ResStringPool_header fields (offsets within the chunk).
+        let string_count = read_u32(chunk, 8)? as usize;
+        let flags = read_u32(chunk, 16)?;
+        let strings_start = read_u32(chunk, 20)? as usize;
+        let is_utf8 = flags & UTF8_FLAG != 0;
+
+        // The offset array follows the 28-byte header; require it to fit in the chunk.
+        let offsets_start = STRING_POOL_HEADER_SIZE;
+        let offsets_len = string_count.checked_mul(4).ok_or(ArscError::Overflow)?;
+        let offsets_end = offsets_start
+            .checked_add(offsets_len)
+            .ok_or(ArscError::Overflow)?;
+        if offsets_end > chunk.len() {
+            return Err(ArscError::BadStringPool);
+        }
+        // strings_start is relative to the chunk; it must be inside the chunk.
+        if strings_start > chunk.len() {
+            return Err(ArscError::BadStringPool);
+        }
+        Ok(Self {
+            chunk,
+            string_count,
+            offsets_start,
+            data_start: strings_start,
+            is_utf8,
+        })
+    }
+
+    /// Resolve a `ResStringPool_ref`: `Ok(None)` for the sentinel (no string),
+    /// `Err(StringIndexOutOfRange)` for an index past the pool, and a decoded `String` otherwise.
+    fn get(&self, index: u32) -> Result<Option<String>, ArscError> {
+        if index == NO_STRING {
+            return Ok(None);
+        }
+        let index = index as usize;
+        if index >= self.string_count {
+            return Err(ArscError::StringIndexOutOfRange);
+        }
+        let off_pos = self
+            .offsets_start
+            .checked_add(index.checked_mul(4).ok_or(ArscError::Overflow)?)
+            .ok_or(ArscError::Overflow)?;
+        let rel = read_u32(self.chunk, off_pos)? as usize;
+        let start = self
+            .data_start
+            .checked_add(rel)
+            .ok_or(ArscError::Overflow)?;
+        let s = if self.is_utf8 {
+            decode_utf8(self.chunk, start)?
+        } else {
+            decode_utf16(self.chunk, start)?
+        };
+        Ok(Some(s))
+    }
+}
+
+/// Decode a UTF-8 length-prefixed pool string at `start` (char-len field, then byte-len field,
+/// then the bytes; each length is one byte, or two when the high bit `0x80` is set). The byte
+/// length is authoritative; the trailing NUL is not consumed.
+fn decode_utf8(buf: &[u8], start: usize) -> Result<String, ArscError> {
+    let (_, after_char) = read_var_len_u8(buf, start)?;
+    let (byte_len, after_len) = read_var_len_u8(buf, after_char)?;
+    let end = after_len.checked_add(byte_len).ok_or(ArscError::Overflow)?;
+    let data = buf.get(after_len..end).ok_or(ArscError::BadStringPool)?;
+    std::str::from_utf8(data)
+        .map(str::to_owned)
+        .map_err(|_| ArscError::BadStringPool)
+}
+
+/// Decode a UTF-16LE length-prefixed pool string at `start` (u16 char-count, or a 31-bit count
+/// when the high bit `0x8000` is set; then `count` UTF-16LE units, NUL-terminated).
+fn decode_utf16(buf: &[u8], start: usize) -> Result<String, ArscError> {
+    let first = read_u16(buf, start)? as usize;
+    let (char_len, data_start) = if first & 0x8000 != 0 {
+        let next = read_u16(buf, start.checked_add(2).ok_or(ArscError::Overflow)?)? as usize;
+        let len = ((first & 0x7FFF) << 16) | next;
+        (len, start.checked_add(4).ok_or(ArscError::Overflow)?)
+    } else {
+        (first, start.checked_add(2).ok_or(ArscError::Overflow)?)
+    };
+    let byte_len = char_len.checked_mul(2).ok_or(ArscError::Overflow)?;
+    let end = data_start
+        .checked_add(byte_len)
+        .ok_or(ArscError::Overflow)?;
+    let data = buf.get(data_start..end).ok_or(ArscError::BadStringPool)?;
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Ok(String::from_utf16_lossy(&units))
+}
+
+/// Read a variable-length `u8`/`u16` length field (UTF-8 pool form): one byte, or two when the
+/// high bit `0x80` is set. Returns the value and the offset just past it.
+fn read_var_len_u8(buf: &[u8], off: usize) -> Result<(usize, usize), ArscError> {
+    let first = read_u8(buf, off)? as usize;
+    if first & 0x80 != 0 {
+        let next = read_u8(buf, off.checked_add(1).ok_or(ArscError::Overflow)?)? as usize;
+        Ok((
+            ((first & 0x7F) << 8) | next,
+            off.checked_add(2).ok_or(ArscError::Overflow)?,
+        ))
+    } else {
+        Ok((first, off.checked_add(1).ok_or(ArscError::Overflow)?))
+    }
+}
+
+/// A validated chunk view into the original file buffer: its `[start, end)` bounds are
+/// guaranteed inside `buf` and `end - start == size`. Mirrors [`super::axml`]'s `Chunk` but
+/// records absolute file offsets so ranges can be stored in the [`ResTable`] index and re-sliced
+/// for lazy decoding.
+struct ChunkRef<'a> {
+    buf: &'a [u8],
+    kind: u16,
+    header_size: usize,
+    /// Absolute `[start, end)` of this chunk (header + body) in `buf`.
+    start: usize,
+    end: usize,
+}
+
+impl<'a> ChunkRef<'a> {
+    /// Parse the chunk at `off` in `buf`, validating all bounds (mirrors `axml::Chunk::parse`).
+    fn parse(buf: &'a [u8], off: usize) -> Result<Self, ArscError> {
+        let kind = read_u16(buf, off)?;
+        let header_size = read_u16(buf, off.checked_add(2).ok_or(ArscError::Overflow)?)? as usize;
+        let size = read_u32(buf, off.checked_add(4).ok_or(ArscError::Overflow)?)? as usize;
+        // size >= headerSize >= 8 guarantees forward progress when advancing by size, and that
+        // the declared header fits the chunk.
+        if header_size < CHUNK_HEADER_SIZE || size < header_size {
+            return Err(ArscError::BadChunk);
+        }
+        let end = off.checked_add(size).ok_or(ArscError::Overflow)?;
+        if end > buf.len() {
+            return Err(ArscError::Truncated);
+        }
+        Ok(Self {
+            buf,
+            kind,
+            header_size,
+            start: off,
+            end,
+        })
+    }
+
+    /// Iterate this chunk's child chunks, parsing each within this chunk's body and reporting
+    /// absolute file offsets.
+    fn children(&self) -> ChildIter<'a> {
+        ChildIter {
+            buf: self.buf,
+            end: self.end,
+            // Children begin right after this chunk's header.
+            off: self.start.saturating_add(self.header_size),
+        }
+    }
+}
+
+/// Iterator over child chunks of a parent, advancing by each child's `size`, bounded by the
+/// parent's `end`. Mirrors `axml::ChunkIter` but over absolute offsets.
+struct ChildIter<'a> {
+    buf: &'a [u8],
+    end: usize,
+    off: usize,
+}
+
+impl<'a> Iterator for ChildIter<'a> {
+    type Item = Result<ChunkRef<'a>, ArscError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Need a full ResChunk_header before the parent's end to have another child.
+        if self.off.checked_add(CHUNK_HEADER_SIZE)? > self.end {
+            return None;
+        }
+        match ChunkRef::parse(self.buf, self.off) {
+            Ok(chunk) => {
+                if chunk.end > self.end {
+                    // Child overruns the parent — stop (do not yield a chunk past the parent).
+                    self.off = self.end;
+                    return None;
+                }
+                // size >= 8 (validated in parse) guarantees off strictly advances.
+                self.off = chunk.end;
+                Some(Ok(chunk))
+            }
+            Err(e) => {
+                self.off = self.end; // stop after an error
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+// --- Bounds-checked little-endian readers (mirror axml's; the only raw-byte → integer sites) --
+
+fn read_u8(buf: &[u8], off: usize) -> Result<u8, ArscError> {
+    buf.get(off).copied().ok_or(ArscError::Truncated)
+}
+
+fn read_u16(buf: &[u8], off: usize) -> Result<u16, ArscError> {
+    let end = off.checked_add(2).ok_or(ArscError::Overflow)?;
+    let b = buf.get(off..end).ok_or(ArscError::Truncated)?;
+    let arr: [u8; 2] = b.try_into().map_err(|_| ArscError::Truncated)?;
+    Ok(u16::from_le_bytes(arr))
+}
+
+fn read_u32(buf: &[u8], off: usize) -> Result<u32, ArscError> {
+    let end = off.checked_add(4).ok_or(ArscError::Overflow)?;
+    let b = buf.get(off..end).ok_or(ArscError::Truncated)?;
+    let arr: [u8; 4] = b.try_into().map_err(|_| ArscError::Truncated)?;
+    Ok(u32::from_le_bytes(arr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apk::Apk;
+
+    /// Path to the demo APK whose `resources.arsc` the tests parse. It is a checked-in test
+    /// asset under `~/eclipse-m0/atl_test_apks` (see AGENTS.md); the env override keeps the test
+    /// portable (no hardcoded developer path baked into a passing run).
+    fn demo_apk_path() -> std::path::PathBuf {
+        if let Ok(p) = std::env::var("ECLIPSE_DEMO_APK") {
+            return std::path::PathBuf::from(p);
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        std::path::Path::new(&home).join("eclipse-m0/atl_test_apks/demo_app.apk")
+    }
+
+    /// Read `resources.arsc` from the demo APK, or `None` if the asset is unavailable on this
+    /// machine (so CI without the asset falls back to the hand-built fixture below).
+    fn demo_arsc() -> Option<Vec<u8>> {
+        let path = demo_apk_path();
+        let mut apk = Apk::open(&path).ok()?;
+        // read_entry is a private sibling method (same `apk` module tree) — usable from tests.
+        apk.read_entry("resources.arsc").ok()
+    }
+
+    #[test]
+    fn parses_real_demo_arsc_and_resolves_a_known_value() {
+        let Some(bytes) = demo_arsc() else {
+            eprintln!("demo_app.apk unavailable; covered by hand-built fixture test instead");
+            return;
+        };
+        let table = parse_arsc(&bytes).expect("parse demo resources.arsc");
+
+        // The demo package id is 0x7f (the standard application package id).
+        assert!(
+            table.package_ids().contains(&0x7f),
+            "expected package 0x7f, got {:?}",
+            table.package_ids()
+        );
+
+        // Type/key string pools are non-empty and indexable. Type id 1 is `color` (verified
+        // 2026-06-05 from the type-name pool: color, drawable, id, layout, mipmap, string).
+        let color = table
+            .type_name(0x7f, 1)
+            .expect("type pool readable")
+            .expect("type id 1 present");
+        assert_eq!(color, "color");
+
+        // A known resource resolves to a Res_value of the expected type. The first color entry
+        // (0x7f010000) is `black` = ARGB8 0xff000000 (Res_value dataType 0x1c) — verified
+        // 2026-06-05 from the raw bytes.
+        let v = table
+            .resource_value(0x7f01_0000)
+            .expect("0x7f010000 resolves");
+        assert!(!v.is_complex);
+        assert_eq!(v.type_, 0x1c, "expected TYPE_INT_COLOR_ARGB8");
+        assert_eq!(v.data, 0xff00_0000);
+
+        // Its key name resolves through the package key-string pool.
+        let key = table
+            .key_name(0x7f, v.key_index)
+            .expect("key pool readable")
+            .expect("key present");
+        assert_eq!(key, "black");
+
+        // A string resource resolves to a string-pool index that dereferences via the global
+        // value pool (type 0x03). `app_name` lives under the `string` type (id 6).
+        let app_name_id = find_entry(&table, 0x7f, 6, "app_name").expect("app_name present");
+        let sv = table
+            .resource_value(app_name_id)
+            .expect("app_name resolves");
+        assert_eq!(sv.type_, 0x03, "expected TYPE_STRING");
+        let s = table
+            .value_string(sv.data)
+            .expect("value pool readable")
+            .expect("string present");
+        assert!(!s.is_empty(), "app_name string should be non-empty");
+    }
+
+    /// Scan a type's entries for one whose key name matches, returning its packed resource id.
+    fn find_entry(table: &ResTable, pkg: u8, type_id: u8, key: &str) -> Option<u32> {
+        for entry in 0u16..0x1000 {
+            if let Some(v) = table.resolve(pkg, type_id, entry) {
+                if let Ok(Some(name)) = table.key_name(pkg, v.key_index) {
+                    if name == key {
+                        return Some(
+                            (u32::from(pkg) << 24) | (u32::from(type_id) << 16) | u32::from(entry),
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A tiny hand-built `resources.arsc` for host-independent coverage: package 0x7f, one type
+    /// (id 1) with one simple entry (id 0, key index 0) carrying a Res_value of dataType 0x10
+    /// (decimal int) data 42. No string pools beyond the minimal empty global value pool, so the
+    /// fixture exercises the chunk + entry + Res_value path even without the demo asset.
+    fn build_fixture() -> Vec<u8> {
+        // --- global value string pool (empty: 0 strings) ---
+        // ResStringPool_header (28 bytes): type, headerSize, size, stringCount, styleCount,
+        // flags, stringsStart, stylesStart.
+        let mut pool = Vec::new();
+        push_u16(&mut pool, RES_STRING_POOL_TYPE);
+        push_u16(&mut pool, 28); // headerSize
+        push_u32(&mut pool, 28); // size (header only, no strings)
+        push_u32(&mut pool, 0); // stringCount
+        push_u32(&mut pool, 0); // styleCount
+        push_u32(&mut pool, 0); // flags
+        push_u32(&mut pool, 28); // stringsStart
+        push_u32(&mut pool, 0); // stylesStart
+
+        // --- type chunk (RES_TABLE_TYPE_TYPE) ---
+        // header (20 bytes used): type, headerSize, size, id, res0, res1, entryCount,
+        // entriesStart, then a minimal 0-length config (we set config size 0 so headerSize=20).
+        // entry-offset array (1 x u32) at headerSize=20; entries at entriesStart=24.
+        // ResTable_entry (8) + Res_value (8) = 16 bytes of entry data.
+        let mut type_chunk = Vec::new();
+        let type_header_size = 20u16;
+        let entries_start = 24u32; // header(20) + offset array(1*4)
+        push_u16(&mut type_chunk, RES_TABLE_TYPE_TYPE);
+        push_u16(&mut type_chunk, type_header_size);
+        // size = header(20) + offsets(4) + entry(8) + value(8) = 40
+        push_u32(&mut type_chunk, 40);
+        type_chunk.push(1); // id (type id 1)
+        type_chunk.push(0); // res0
+        push_u16(&mut type_chunk, 0); // res1
+        push_u32(&mut type_chunk, 1); // entryCount
+        push_u32(&mut type_chunk, entries_start);
+        // entry-offset array: entry 0 at offset 0 within the entries region.
+        push_u32(&mut type_chunk, 0);
+        // ResTable_entry: size(8), flags(0 = simple), key(0).
+        push_u16(&mut type_chunk, 8); // entry size
+        push_u16(&mut type_chunk, 0); // flags
+        push_u32(&mut type_chunk, 0); // key index
+                                      // Res_value: size(8), res0(0), dataType(0x10 = TYPE_INT_DEC), data(42).
+        push_u16(&mut type_chunk, 8); // value size
+        type_chunk.push(0); // res0
+        type_chunk.push(0x10); // dataType
+        push_u32(&mut type_chunk, 42); // data
+
+        // --- package chunk (RES_TABLE_PACKAGE_TYPE) ---
+        // header 288 bytes; body = the type chunk. typeStrings/keyStrings = 0 (absent).
+        let mut pkg = Vec::new();
+        push_u16(&mut pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut pkg, PACKAGE_HEADER_MIN as u16); // headerSize 288
+        push_u32(&mut pkg, (PACKAGE_HEADER_MIN + type_chunk.len()) as u32); // size
+        push_u32(&mut pkg, 0x7f); // id
+        pkg.resize(pkg.len() + 256, 0); // name[128] u16, zeroed
+        push_u32(&mut pkg, 0); // typeStrings offset (absent)
+        push_u32(&mut pkg, 0); // lastPublicType
+        push_u32(&mut pkg, 0); // keyStrings offset (absent)
+        push_u32(&mut pkg, 0); // lastPublicKey
+        debug_assert_eq!(pkg.len(), PACKAGE_HEADER_MIN);
+        pkg.extend_from_slice(&type_chunk);
+
+        // --- table chunk (RES_TABLE_TYPE) ---
+        let mut table = Vec::new();
+        push_u16(&mut table, RES_TABLE_TYPE);
+        push_u16(&mut table, TABLE_HEADER_SIZE as u16); // headerSize 12
+        push_u32(
+            &mut table,
+            (TABLE_HEADER_SIZE + pool.len() + pkg.len()) as u32,
+        ); // size
+        push_u32(&mut table, 1); // packageCount
+        table.extend_from_slice(&pool);
+        table.extend_from_slice(&pkg);
+        table
+    }
+
+    fn push_u16(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn push_u32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_hand_built_fixture_and_resolves_int_value() {
+        // Host-independent coverage of the parse + resolve path (no external asset needed).
+        let bytes = build_fixture();
+        let table = parse_arsc(&bytes).expect("parse fixture");
+        assert_eq!(table.package_ids(), vec![0x7f]);
+
+        let v = table.resource_value(0x7f01_0000).expect("entry 0 resolves");
+        assert!(!v.is_complex);
+        assert_eq!(v.type_, 0x10, "TYPE_INT_DEC");
+        assert_eq!(v.data, 42);
+        assert_eq!(v.key_index, 0);
+
+        // Unknown ids resolve to None, not a panic: wrong package, type, and entry.
+        assert!(
+            table.resource_value(0x7e01_0000).is_none(),
+            "unknown package"
+        );
+        assert!(table.resource_value(0x7f02_0000).is_none(), "unknown type");
+        assert!(table.resource_value(0x7f01_0001).is_none(), "unknown entry");
+    }
+
+    #[test]
+    fn rejects_non_table_root() {
+        // A valid chunk that is not RES_TABLE_TYPE must be a typed error, not a panic.
+        let mut buf = Vec::new();
+        push_u16(&mut buf, RES_STRING_POOL_TYPE);
+        push_u16(&mut buf, 8);
+        push_u32(&mut buf, 8);
+        let err = parse_arsc(&buf).err().expect("non-table root must fail");
+        assert_eq!(err, ArscError::NotResTable);
+    }
+
+    #[test]
+    fn table_without_value_pool_is_typed_error() {
+        // A table with a package but no global value string pool must surface NoValuePool.
+        let mut pkg = Vec::new();
+        push_u16(&mut pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut pkg, PACKAGE_HEADER_MIN as u16);
+        push_u32(&mut pkg, PACKAGE_HEADER_MIN as u32);
+        push_u32(&mut pkg, 0x7f);
+        pkg.resize(pkg.len() + 256, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+        push_u32(&mut pkg, 0);
+
+        let mut table = Vec::new();
+        push_u16(&mut table, RES_TABLE_TYPE);
+        push_u16(&mut table, TABLE_HEADER_SIZE as u16);
+        push_u32(&mut table, (TABLE_HEADER_SIZE + pkg.len()) as u32);
+        push_u32(&mut table, 1);
+        table.extend_from_slice(&pkg);
+        let err = parse_arsc(&table)
+            .err()
+            .expect("missing value pool must fail");
+        assert_eq!(err, ArscError::NoValuePool);
+    }
+
+    #[test]
+    fn reader_is_total_under_truncation_and_mutation() {
+        // TOTALITY guard (the confirmed root cause a non-total parser would reintroduce: a panic
+        // under panic=abort aborts the process). Starting from a known-good table (the demo arsc
+        // when available, else the hand-built fixture), this exhaustively:
+        //   (a) truncates at every prefix length, and
+        //   (b) flips bytes at a strided set of offsets to 0x00 / 0x7F / 0xFF,
+        // calling parse_arsc — and on any Ok, exercising the resolver — on each input, requiring
+        // a Result (never a panic). The test process completing is the proof of totality.
+        let base = demo_arsc().unwrap_or_else(build_fixture);
+
+        for len in 0..=base.len() {
+            if let Ok(table) = parse_arsc(&base[..len]) {
+                // Drive the resolver too: it must also be total on a truncated-but-parsed table.
+                let _ = table.resource_value(0x7f01_0000);
+                let _ = table.type_name(0x7f, 1);
+            }
+        }
+
+        let stride = 7; // coprime-ish with struct sizes to hit varied fields cheaply
+        for off in (0..base.len()).step_by(stride) {
+            for &val in &[0x00u8, 0x7F, 0xFF] {
+                let mut buf = base.clone();
+                buf[off] = val;
+                if let Ok(table) = parse_arsc(&buf) {
+                    for entry in 0u16..8 {
+                        let _ = table.resolve(0x7f, 1, entry);
+                    }
+                    let _ = table.type_name(0x7f, 1);
+                    let _ = table.key_name(0x7f, 0);
+                    let _ = table.value_string(0);
+                }
+            }
+        }
+    }
+}
