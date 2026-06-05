@@ -485,19 +485,33 @@ struct BareSoname {
     host_candidates: &'static [&'static str],
 }
 
-/// The bare host sonames Eclipse provisions onto the bionic search path.
+/// The bare host sonames Eclipse provisions onto the bionic search path as symlinks to a host
+/// versioned ELF (the [`BareSoname`] → host-provider mechanism).
 ///
-/// 2026-06-05: scoped to exactly what the Roblox run reports missing — `libm.so` (zstd-jni's
-/// transitive `NEEDED`, and `libroblox.so`'s). `libc.so`/`libdl.so` already resolve (cfg.d aliases
-/// `libc.so → libc_bio.so.0`; the shim linker self-provides `libdl.so`), so they are deliberately
-/// NOT listed (provision only what is genuinely missing, AGENTS.md "Simplicity First"). The host
-/// `libm.so.6` is plain glibc math: C-ABI compatible with the bare Android `libm.so` for the math
-/// functions these JNI libs import, and its own `NEEDED libc.so.6` resolves via the host-glibc
-/// fallback (the same path `liblog`/`libc` already use).
-const BIONIC_BARE_SONAMES: &[BareSoname] = &[BareSoname {
-    soname: "libm.so",
-    host_candidates: &["libm.so.6"],
-}];
+/// 2026-06-05: **currently empty.** `libm.so` USED to be here (symlinked to the host glibc
+/// `libm.so.6`), but that was the *root cause* of the `androidx.startup`/zstd-jni SIGSEGV: the host
+/// `libm.so.6` carries an `R_X86_64_TPOFF64` (modern TLS reloc — apkenv's "unknown reloc type 18") +
+/// a `.relr.dyn` packed-reloc section the older apkenv shim linker cannot apply, so following
+/// zstd-jni's `NEEDED libm.so` to it aborted the load. `libm.so` is now provided by Eclipse's own
+/// **apkenv-loadable** shim ([`provision_eclipse_libm`]) — a clean-relocation, correct-math cdylib —
+/// NOT a host symlink. `libc.so`/`libdl.so` still resolve via cfg.d / the shim linker's self-provide
+/// (deliberately not listed). The table + [`find_host_lib`]/[`is_real_elf`] machinery stays as the
+/// general mechanism for any FUTURE bare soname that genuinely IS satisfiable by a host versioned
+/// ELF the apkenv linker can load (provision only what is genuinely needed, AGENTS.md "Simplicity
+/// First").
+const BIONIC_BARE_SONAMES: &[BareSoname] = &[];
+
+/// The bare Android soname Eclipse provides via its own apkenv-loadable shim (not a host symlink).
+const ECLIPSE_LIBM_SONAME: &str = "libm.so";
+
+/// The Eclipse apkenv-loadable `libm` shim `.so`, built by `build.rs` from `crates/libm-shim` and its
+/// absolute path baked in at compile time via `cargo:rustc-env=ECLIPSE_LIBM_SHIM_SO`.
+///
+/// 2026-06-05: this is a standalone `#![no_std]` cdylib re-exporting the pure-Rust `libm` crate's
+/// CORRECT math under the C libm symbol names, with ONLY `R_X86_64_{64,GLOB_DAT,RELATIVE}` relocs
+/// (no `R_X86_64_TPOFF64`, no RELR, no `NEEDED`, no PT_TLS) — so the apkenv shim linker CAN load it as
+/// the app's `libm.so`. See `crates/libm-shim/src/lib.rs` and `build.rs::build_libm_shim`.
+const ECLIPSE_LIBM_SHIM_SO: &str = env!("ECLIPSE_LIBM_SHIM_SO");
 
 /// Standard host directories searched for a versioned ELF provider when `cc -print-file-name`
 /// cannot resolve it (no compiler installed).
@@ -533,11 +547,63 @@ const HOST_LIB_DIRS: &[&str] = &[
 /// `System.loadLibrary` that pulls a lib `NEEDED`-ing these sonames.
 pub fn provision_bionic_sonames(dir: &Path) -> Result<(), RuntimeError> {
     std::fs::create_dir_all(dir).map_err(|e| RuntimeError::ProvisionSoname(dir.to_owned(), e))?;
+    // `libm.so` is provided by Eclipse's own apkenv-loadable shim, NOT a host symlink (the host glibc
+    // `libm.so.6` has modern relocs the apkenv linker cannot apply — the original SIGSEGV root cause).
+    provision_eclipse_libm(dir)?;
+    // Any FUTURE bare soname genuinely satisfiable by a host versioned ELF the apkenv linker can load
+    // (currently none — see BIONIC_BARE_SONAMES) is symlinked here.
     for entry in BIONIC_BARE_SONAMES {
         let target = find_host_lib(entry)?;
         let link = dir.join(entry.soname);
         symlink_idempotent(&target, &link)?;
     }
+    Ok(())
+}
+
+/// Provision the app's `libm.so` from Eclipse's apkenv-loadable shim ([`ECLIPSE_LIBM_SHIM_SO`]) by
+/// **copying** it to `dir/libm.so`.
+///
+/// 2026-06-05 — root cause this fixes: the apkenv / `bionic_translation` shim linker resolves an app
+/// lib's `NEEDED libm.so` by mmap-parsing a file named exactly `libm.so` on its search path. The host
+/// glibc `libm.so.6` (which Eclipse previously symlinked there) carries an `R_X86_64_TPOFF64` (modern
+/// TLS reloc — apkenv's "unknown reloc type 18") + a `.relr.dyn` packed-reloc section the older apkenv
+/// linker cannot apply (and `NEEDED ld-linux-x86-64.so.2`), so loading it aborts (SIGSEGV) during
+/// Roblox's `androidx.startup` `System.loadLibrary("zstd-jni")` (zstd-jni `NEEDED libm.so`). The
+/// Eclipse shim is a clean-relocation ELF (`R_X86_64_{64,GLOB_DAT,RELATIVE}` only, no TLS, no
+/// `NEEDED`) the apkenv linker CAN load, with CORRECT math (the pure-Rust `libm` crate).
+///
+/// A **copy** (not a symlink to the build-artifact path) keeps the provisioned `libm.so` valid after a
+/// `cargo clean` removes `target/`, and avoids leaking the build machine's `target/` path into the
+/// runtime search dir. Idempotent: an up-to-date copy (matching size) is left as-is; otherwise the
+/// shim is (re)copied, replacing any stale file or wrong-target symlink at that name.
+///
+/// Returns [`RuntimeError::HostLibNotFound`] (soname `"libm.so"`) if the shim artifact is missing
+/// (e.g. the source tree was moved after build without rebuilding) — an actionable typed failure, not
+/// a silent skip that would re-surface as the apkenv "library not found"/abort.
+fn provision_eclipse_libm(dir: &Path) -> Result<(), RuntimeError> {
+    let shim = Path::new(ECLIPSE_LIBM_SHIM_SO);
+    let link = dir.join(ECLIPSE_LIBM_SONAME);
+    let shim_len = match std::fs::metadata(shim) {
+        Ok(m) => m.len(),
+        // The build-time-baked shim path no longer exists (tree moved without rebuild). Surface it.
+        Err(_) => {
+            return Err(RuntimeError::HostLibNotFound {
+                soname: ECLIPSE_LIBM_SONAME,
+                candidates: &[],
+            })
+        }
+    };
+    // Idempotent fast path: an existing regular-file copy of the right size is treated as up-to-date.
+    // (A symlink at `link` returns its target's metadata via `metadata`; we only short-circuit for a
+    // real file via `symlink_metadata` to avoid mistaking a stale symlink for a good copy.)
+    if let Ok(meta) = std::fs::symlink_metadata(&link) {
+        if meta.file_type().is_file() && meta.len() == shim_len {
+            return Ok(());
+        }
+        // Stale file or a (wrong) symlink — remove before copying.
+        std::fs::remove_file(&link).map_err(|e| RuntimeError::ProvisionSoname(link.clone(), e))?;
+    }
+    std::fs::copy(shim, &link).map_err(|e| RuntimeError::ProvisionSoname(link.clone(), e))?;
     Ok(())
 }
 
@@ -1262,16 +1328,16 @@ mod tests {
     }
 
     #[test]
-    fn provisioned_sonames_are_nonempty_and_unique() {
-        // 2026-06-05: the provisioning table must list at least the run-confirmed missing soname
-        // (libm.so) and never duplicate a soname (a dup would symlink twice / churn). Host-independent.
+    fn host_symlinked_sonames_are_wellformed_and_libm_is_not_among_them() {
+        // 2026-06-05: `libm.so` must NOT be host-symlinked (that was the SIGSEGV root cause — the host
+        // glibc libm.so.6 has modern relocs the apkenv linker cannot apply); it is now provided by the
+        // Eclipse apkenv-loadable shim instead. The host-symlink table is for sonames genuinely
+        // satisfiable by a host versioned ELF the apkenv linker CAN load — each must be `.so`-named,
+        // have ≥1 host candidate, and be unique. Host-independent.
         assert!(
-            !BIONIC_BARE_SONAMES.is_empty(),
-            "must provision at least the run-confirmed missing soname (libm.so)"
-        );
-        assert!(
-            BIONIC_BARE_SONAMES.iter().any(|s| s.soname == "libm.so"),
-            "libm.so (zstd-jni/libroblox transitive NEEDED) must be provisioned"
+            !BIONIC_BARE_SONAMES.iter().any(|s| s.soname == "libm.so"),
+            "libm.so must be Eclipse-shim-provided, NEVER host-symlinked (the host libm.so.6 modern \
+             relocs abort the apkenv linker)"
         );
         for entry in BIONIC_BARE_SONAMES {
             assert!(
@@ -1289,6 +1355,128 @@ mod tests {
                 .filter(|s| s.soname == entry.soname)
                 .count();
             assert_eq!(count, 1, "duplicate soname entry: {}", entry.soname);
+        }
+    }
+
+    #[test]
+    fn eclipse_libm_shim_is_apkenv_loadable_and_provisions_libm_so() {
+        // 2026-06-05 regression guard for the zstd-jni/androidx.startup SIGSEGV root cause. The shim
+        // `.so` build.rs produced (ECLIPSE_LIBM_SHIM_SO) MUST be a real ELF with NO modern relocs the
+        // apkenv linker chokes on (R_X86_64_TPOFF64 = "unknown reloc type 18", or a packed `.relr.dyn`
+        // section), and provisioning must place a copy at `<dir>/libm.so`. Host-independent (reads the
+        // built artifact + a temp dir).
+        let shim = Path::new(ECLIPSE_LIBM_SHIM_SO);
+        let bytes = std::fs::read(shim).expect("the build.rs-built libm shim .so must exist");
+        assert_eq!(
+            &bytes[..4],
+            b"\x7fELF",
+            "the shim must be a real ELF object"
+        );
+        assert!(
+            is_real_elf(shim),
+            "the shim must pass the apkenv real-ELF gate"
+        );
+
+        // Parse the dynamic relocations via Eclipse's own ELF decoder and assert NONE is the modern
+        // TLS reloc R_X86_64_TPOFF64 (type 18) — the exact reloc that aborts the apkenv linker.
+        let img = crate::loader::elf::ElfImage::parse(&bytes).expect("decode shim ELF");
+        for rela in img.relocations().expect("decode shim relocations") {
+            assert_ne!(
+                rela.r_type,
+                crate::loader::reloc::R_X86_64_TPOFF64,
+                "the libm shim regressed: an R_X86_64_TPOFF64 reloc would abort the apkenv linker"
+            );
+        }
+        // A packed RELR section is equally unsupported by the older apkenv linker.
+        assert!(
+            img.relr().expect("decode shim relr").is_empty(),
+            "the libm shim must have no RELR (packed) relocations — the apkenv linker cannot apply them"
+        );
+
+        // Provisioning copies the shim to `<dir>/libm.so`, idempotently.
+        let dir = std::env::temp_dir().join(format!("eclipse-libm-prov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        provision_eclipse_libm(&dir).expect("provision libm shim");
+        let provisioned = dir.join("libm.so");
+        let copied = std::fs::read(&provisioned).expect("provisioned libm.so must exist");
+        assert_eq!(
+            copied, bytes,
+            "provisioned libm.so must be the shim's bytes"
+        );
+        // Idempotent second call leaves the up-to-date copy in place.
+        provision_eclipse_libm(&dir).expect("provision libm shim (idempotent)");
+        assert!(provisioned.is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eclipse_libm_shim_math_values_are_correct() {
+        // 2026-06-05: the shim must return CORRECT math, not stubs — a wrong `sin` would corrupt the
+        // engine. dlopen the built shim and check representative symbols (single-arg f64/f32, two-arg,
+        // and a pointer-out function) against known values. This is the correct-math half of the
+        // regression guard (the reloc/RELR half is the test above). Host-independent (loads the built
+        // artifact). `RTLD_LOCAL` (libloading default) keeps the shim's `sin`/`cos`/… from leaking
+        // into the process-global scope.
+        use core::ffi::c_int;
+        let lib = unsafe { libloading::Library::new(ECLIPSE_LIBM_SHIM_SO) }
+            .expect("dlopen the built libm shim");
+        const EPS: f64 = 1e-12;
+        const EPSF: f32 = 1e-6;
+        unsafe {
+            let sin: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> =
+                lib.get(b"sin\0").expect("sin");
+            assert!(
+                (sin(core::f64::consts::FRAC_PI_2) - 1.0).abs() < EPS,
+                "sin(pi/2)=1"
+            );
+            assert!(sin(0.0).abs() < EPS, "sin(0)=0");
+
+            let cos: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> =
+                lib.get(b"cos\0").expect("cos");
+            assert!((cos(0.0) - 1.0).abs() < EPS, "cos(0)=1");
+            assert!(cos(core::f64::consts::PI).abs() - 1.0 < EPS, "cos(pi)=-1");
+
+            let pow: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
+                lib.get(b"pow\0").expect("pow");
+            assert!((pow(2.0, 10.0) - 1024.0).abs() < EPS, "2^10=1024");
+            assert!((pow(9.0, 0.5) - 3.0).abs() < EPS, "9^0.5=3 (sqrt)");
+
+            let log: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> =
+                lib.get(b"log\0").expect("log");
+            assert!((log(core::f64::consts::E) - 1.0).abs() < EPS, "ln(e)=1");
+
+            let exp: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> =
+                lib.get(b"exp\0").expect("exp");
+            assert!((exp(0.0) - 1.0).abs() < EPS, "exp(0)=1");
+
+            let fmod: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
+                lib.get(b"fmod\0").expect("fmod");
+            assert!((fmod(10.0, 3.0) - 1.0).abs() < EPS, "fmod(10,3)=1");
+
+            let atan2: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
+                lib.get(b"atan2\0").expect("atan2");
+            assert!(
+                (atan2(1.0, 1.0) - core::f64::consts::FRAC_PI_4).abs() < EPS,
+                "atan2(1,1)=pi/4"
+            );
+
+            let sinf: libloading::Symbol<unsafe extern "C" fn(f32) -> f32> =
+                lib.get(b"sinf\0").expect("sinf");
+            assert!((sinf(0.0)).abs() < EPSF, "sinf(0)=0");
+
+            let powf: libloading::Symbol<unsafe extern "C" fn(f32, f32) -> f32> =
+                lib.get(b"powf\0").expect("powf");
+            assert!((powf(2.0, 8.0) - 256.0).abs() < EPSF, "2^8=256 (f32)");
+
+            // A pointer-out function: frexp(8.0, &e) -> mantissa 0.5, exponent 4 (8.0 = 0.5 * 2^4).
+            let frexp: libloading::Symbol<unsafe extern "C" fn(f64, *mut c_int) -> f64> =
+                lib.get(b"frexp\0").expect("frexp");
+            let mut e: c_int = 0;
+            let m = frexp(8.0, &mut e);
+            assert!(
+                (m - 0.5).abs() < EPS && e == 4,
+                "frexp(8)=(0.5, 4), got ({m}, {e})"
+            );
         }
     }
 

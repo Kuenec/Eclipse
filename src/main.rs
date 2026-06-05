@@ -158,16 +158,17 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("ART VM booted with Roblox's Java on the classpath ✓");
 
-    // Provision the bare host sonames the bionic shim linker needs (e.g. libm.so) as symlinks to the
-    // host's real-ELF versioned libs (libm.so.6) in the app-lib dir. The shim linker resolves a
-    // NEEDED entry by searching its path for a file named exactly the bare Android soname and parsing
-    // it as ELF; the host ships versioned names (and a bare `/usr/lib/libm.so` that is an ld *linker
-    // script*, not ELF), so without this a transitive `NEEDED libm.so` (zstd-jni, libroblox) fails as
-    // "library 'libm.so' not found". This is the same Android-soname → host-provider mapping cfg.d does
-    // for libEGL/libOpenSLES, for the sonames cfg.d omits. Must run before the whitelist + lifecycle.
-    println!("# Provisioning bare host sonames (libm.so → libm.so.6) for the bionic linker…");
+    // Provision the bare Android sonames the bionic shim linker needs into the app-lib dir. The shim
+    // linker resolves a NEEDED entry by searching its path for a file named exactly the bare soname
+    // and mmap-parsing it as ELF. 2026-06-05: `libm.so` is provided by Eclipse's OWN apkenv-loadable
+    // shim (a clean-relocation, correct-math cdylib copied to <dir>/libm.so), NOT a symlink to the
+    // host glibc libm.so.6 — the host libm.so.6 carries an R_X86_64_TPOFF64 ("unknown reloc type 18")
+    // + a .relr.dyn section the older apkenv linker cannot apply, so following zstd-jni's
+    // `NEEDED libm.so` to it aborted (SIGSEGV) during Roblox's androidx.startup. Must run before the
+    // whitelist + lifecycle.
+    println!("# Provisioning bionic sonames (libm.so → Eclipse apkenv-loadable shim) …");
     eclipse::runtime::provision_bionic_sonames(&app_lib_dir)?;
-    println!("bionic bare-soname symlinks provisioned ✓");
+    println!("bionic sonames provisioned (Eclipse libm shim) ✓");
 
     // Whitelist the framework natives dir + the extracted app-lib dir in the bionic shim linker's
     // own search path (apkenv_ldpaths[]) via libdl_bio's dl_parse_library_path. ART's

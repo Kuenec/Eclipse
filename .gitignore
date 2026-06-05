@@ -1,5 +1,7 @@
 # Rust
 /target/
+# Sub-crate build dirs (e.g. crates/libm-shim/target/ when built standalone) — 2026-06-05
+**/target/
 **/*.rs.bk
 
 # Vendored runtime build artifacts (ART/ATL — large, built/pinned in CI, never committed)

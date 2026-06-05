@@ -558,3 +558,89 @@ init/`JNI_OnLoad` paths), and `apk::native_lib_filenames_lists_flat_so_files_for
 enumeration for the ABI, sorted, excluding nested/wrong-ABI/non-`.so`, and empty for a pure-Java APK — the gate that
 skips the pre-load loop). The live `eclipse run` is the integration evidence; `demo_app` reaching `ActivityResumed`
 with the loader skipped is the no-regression check.
+
+## 11. ROOT CAUSE FOUND + FIXED: the PROVISIONED `libm.so` was glibc `libm.so.6` (modern relocs apkenv can't apply) — an apkenv-LOADABLE libm shim is now provisioned; the TPOFF64 wall is durably gone (2026-06-05)
+
+§9/§10's wall — `androidx.startup` → `System.loadLibrary("zstd-jni")` → apkenv linker → `NEEDED libm.so` →
+`unknown reloc type 18` (`R_X86_64_TPOFF64`) → `failed to link libm.so` → SIGSEGV — is now **fixed at the root cause,
+which was a PROVISIONING bug**, not a missing capability.
+
+### The root cause (measured with `readelf`, 2026-06-05)
+Eclipse's `runtime::provision_bionic_sonames` symlinked the app's bare `libm.so` to the **host glibc `libm.so.6`**.
+The apkenv / `bionic_translation` shim linker resolves an app lib's `NEEDED libm.so` by mmap-parsing whatever file is
+named `libm.so` on its search path — so it tried to relocate glibc's `libm.so.6`, which carries relocs the older
+apkenv linker cannot apply:
+
+```
+$ readelf -rW $(cc -print-file-name=libm.so.6) | awk '/R_X86_64/{print $3}' | sort | uniq -c
+     32 R_X86_64_GLOB_DAT
+      1 R_X86_64_TPOFF64        # <- apkenv "unknown reloc type 18"
+$ readelf -SW libm.so.6 | grep relr
+  [ 9] .relr.dyn  RELR ...      # <- packed relocs apkenv also cannot apply
+$ readelf -d libm.so.6 | grep NEEDED
+  NEEDED  libc.so.6
+  NEEDED  ld-linux-x86-64.so.2  # <- a glibc-internal dep
+```
+
+Note: zstd-jni / eigen_blas / eigen_lapack each carry `NEEDED libm.so` but import **ZERO** math from it (their UND
+symbols are all `@LIBC`). Only `libroblox` imports real math (49 symbols, measured via `readelf --dyn-syms` on the 4
+`NEEDED libm.so` libs) — and libroblox is loaded by Eclipse's OWN Rust loader (its math binds via `BionicEnv`), NOT by
+apkenv. So for the apkenv-loaded libs, `libm.so` must merely be **loadable**; for durable correctness the shim still
+provides the full, correct math surface (a wrong `sin` would corrupt the engine).
+
+### The fix: an apkenv-loadable, correct-math libm shim (benign provisioning, no linker-source change)
+A new `crates/libm-shim` sub-crate — a `#![no_std]` cdylib (`panic="abort"`, own `#[panic_handler]`) re-exporting the
+**pure-Rust `libm` crate** (rust-lang/compiler-builtins; Context7-confirmed API) under the C libm symbol names. 56
+symbols exported (the 49 the libs need + the f32 two-arg variants); pointer-out functions (`frexp`/`modf`/`sincos`/
+`remquof`) wrap the crate's tuple returns into the C out-pointer ABI; `lround`/`llround`/`nan` (not in the crate) sit
+on `libm::round`. `build.rs::build_libm_shim` builds it via `$CARGO build` into `OUT_DIR/libm-shim-target` (no
+recursion into the outer target dir → no lock contention; portable, no hardcoded paths) and bakes the `.so` path via
+`cargo:rustc-env=ECLIPSE_LIBM_SHIM_SO`; `runtime::provision_eclipse_libm` **copies** it to `<app-lib>/libm.so`. The
+host-symlink table `BIONIC_BARE_SONAMES` is now empty (no host glibc lib is wrongly handed to apkenv as a `NEEDED`).
+
+The produced `.so` is apkenv-safe — only the reloc types zstd-jni itself uses (which apkenv provably handles):
+
+```
+$ readelf -rW libeclipse_libm_shim.so | awk '/R_X86_64/{print $3}' | sort | uniq -c
+      4 R_X86_64_GLOB_DAT
+      6 R_X86_64_RELATIVE
+# 0 R_X86_64_TPOFF64, no .relr.dyn section, no NEEDED, no PT_TLS
+```
+
+### THE REAL ROBLOX RUN RESULT (dev host, 2026-06-05, `/tmp/eclipse-roblox-run4.log`, EXIT=139)
+```
+# Provisioning bionic sonames (libm.so → Eclipse apkenv-loadable shim) …  ✓
+…
+creating androidx.startup.InitializationProvider
+W bionic_linker: `…/libzstd-jni-1.5.7-6.so` is not a prelinked library   ← apkenv proceeds (was: ERROR)
+W bionic_linker: `libm.so` is not a prelinked library                    ← apkenv LOADS our shim libm
+Fatal signal 11 (SIGSEGV) … Thread "AppStartupTaskM"
+```
+**`unknown reloc type 18` + `failed to link libm.so`: 0× (was 2× in run2/run3).** The TPOFF64 wall is durably gone;
+apkenv now parses BOTH zstd-jni AND `libm.so` without aborting.
+
+### The new frontier (gdb-proven) — INSIDE the apkenv linker (cyber-safeguard region)
+```
+#0 apkenv_find_library    (libdl_bio.so.0)   ← SIGSEGV (rax=0, fault 0x18); rdi="\001", rsi=0 (NOT a named lookup)
+#1 apkenv_find_library    (libdl_bio.so.0)   ← recursing the dependency graph
+#2 bionic_dlopen          (libdl_bio.so.0)
+#3 art::JavaVMExt::LoadNativeLibrary  (libart.so)
+#4 JVM_NativeLoad         (libopenjdkjvm.so)
+```
+A NULL deref **inside the apkenv linker's own dependency-graph walk** while ART's `System.loadLibrary("zstd-jni")`
+re-loads zstd-jni through apkenv (the Eclipse-pre-loaded copy stays inert without the registry-consult — §10). The
+`rdi`/`rsi` at the crash prove it is NOT a missing/glibc-provisioned `NEEDED` lib (no benign provisioning gap remains);
+it is an apkenv-internal fault. **The durable fix is the Rust-loader `System.loadLibrary`/`Runtime.nativeLoad`
+registry-consult so a pre-loaded soname short-circuits the apkenv `apkenv_find_library` walk entirely — that is INSIDE
+the cyber-safeguard boundary (the apkenv/bionic_translation linker + `nativeLoad` region) and is MAIN-LOOP ONLY,
+FORBIDDEN for subagents.**
+
+### Regression protection (this step)
+2 GPU/VM-free unit tests in `src/runtime.rs` (`cargo test runtime::tests::eclipse_libm`):
+`eclipse_libm_shim_is_apkenv_loadable_and_provisions_libm_so` (decodes the built shim via Eclipse's own `elf.rs`,
+asserts NO `R_X86_64_TPOFF64` + NO RELR, then provisions a `<dir>/libm.so` copy idempotently) and
+`eclipse_libm_shim_math_values_are_correct` (dlopens the shim, checks `sin`/`cos`/`pow`/`log`/`exp`/`fmod`/`atan2`/
+`sinf`/`powf`/`frexp` vs known values). `host_symlinked_sonames_…` now asserts `libm.so` is NEVER host-symlinked;
+`build.rs` adds a `readelf` build-time TPOFF64 guard; `crates/libm-shim` has its own clippy/fmt-clean gate. `demo_app`
+still reaches `ActivityResumed` (provisioning runs cleanly on a pure-Java APK; engine loader skipped) — no regression.
+The live `eclipse run` is the integration evidence (libm wall gone, run4).
