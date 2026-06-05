@@ -134,11 +134,14 @@ before any history-rewriting/force operation.
   PROGRESS** — `diagnostics` (tracing) + `config` (serde/JSON) + **`apk`** (zip + own total
   AXML reader + SHA-256) + **`runtime`** (host-ISA detection + `BootPlan` + **ART VM boot**)
   all done & gated (2026-06-04). 🎉 **`runtime::boot()` boots the vendored ART VM from pure
-  Rust** (`dlopen` libart + `JNI_CreateJavaVM`, libcore VM, JNI_OK) — `eclipse run <apk>`
-  boots it on this host (EXIT 0). This **validates the Step 3.5 thesis end-to-end**: a
-  graphics-free Rust process boots ART with a clean low_4gb window where ATL+GTK4 exhausted it.
-  Remaining M1: reach Roblox `onCreate` (app classpath = api-impl.jar:apk, the Activity,
-  `System.loadLibrary`→`libroblox.so`, a `winit` window + `ash` Vulkan surface).
+  Rust** (`dlopen` libart + `JNI_CreateJavaVM`, JNI_OK) AND, with an APK, **loads Roblox's own
+  Java** onto the classpath (`api-impl.jar:apk:framework-res.apk`; `FindClass` resolves
+  `com.roblox.*` incl. the engine JNI classes — C-probe verified). `eclipse run <apk>` boots it
+  on this host (EXIT 0). **Step 3.5 thesis validated end-to-end**: a graphics-free Rust process
+  boots ART with a clean low_4gb window where ATL+GTK4 exhausted it. **Remaining M1→M2:** reach
+  Roblox `onCreate` — needs a *framework* (ATL's `api-impl.jar` is GTK-coupled; Eclipse's own
+  **winit + `ash`/EGL** framework is the production path) to drive the Activity +
+  `System.loadLibrary`→`libroblox.so`.
 
 ### 🟡 M0 STATUS — Steps 1+2 PASSED, Step 3 in progress (low_4gb blocker)
 
@@ -446,20 +449,27 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `rustls`/`clap`/`rustix`. `winit`/`ash` deferred to the windowed boot.
 - **Open items:** license `TBD`; M1 reach Roblox `onCreate` (+ later: APK fetch backend).
 - **Next actions (pick up here — drive ART to Roblox's `onCreate`):**
-  1. Extend `runtime::boot()` from the libcore smoke boot to the app: add the classpath
-     (`-Djava.class.path` / a `PathClassLoader`) = `api-impl.jar : <APK>`, instantiate the
-     Application, drive the launcher Activity (`BootPlan::launcher_activity` = `ActivitySplash`,
-     or `.with_activity_override(...)` for `ActivityNativeMain`) to `onCreate`. ART loads
-     `libroblox.so` via the translation linker on `System.loadLibrary`. Add the full `jni`
-     crate here for safe JNI calls; **wrap every Rust JNI callback in `catch_unwind`** (§2.8,
-     keep `panic = "abort"`). Boot from the **main thread** (the cargo-test harness can't boot
-     ART — see §6 / the note in `runtime.rs` tests; validate via `eclipse run`).
-  2. Add a **`winit`** window + an **`ash` Vulkan** surface (GL/EGL fallback per
-     `BootPlan::graphics_backend`) and hand it to the engine (Surface/View). Still no GTK4 —
-     that is what keeps the low_4gb window clear (Step 3.5, now proven).
-  3. With the real boot reaching Roblox's Java shell, harvest `framework-worklist.txt` (the
-     missing `android.*` classes/methods to stub) — the deferred Step 4 data.
-  4. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
+  ✅ DONE: VM boot (libcore) + app classpath (`api-impl.jar:apk:framework-res.apk`) — `boot(plan,
+  Some(apk))` boots with Roblox's Java loadable (`FindClass` resolves `com.roblox.*`).
+  1. **The framework decision (the crux).** ATL's onCreate recipe (from its `src/main-executable/
+     main.c` `create_vm` + boot sequence, cloned to `/tmp/atl-src`): `prepare_main_looper` →
+     `extract_from_apk("lib/x86_64/","lib/")` → `Context.createApplication(J window)` →
+     `ContentProvider.createContentProviders()` → `Application.onCreate()` →
+     `Activity.createMainActivity(String activityClass, J window, String uri)`. The `J` is a
+     **GtkWidget\*** — `api-impl.jar` is GTK-coupled, so reusing it for onCreate pulls in GTK
+     (re-crowding low_4gb). PRODUCTION PATH = Eclipse's own **winit + `ash`/EGL** framework
+     (component-map F) providing the View/Surface/Window + the `create*` natives against a winit
+     window handle. This is the big M2 build. (A GTK-based bring-up could validate the full chain
+     first, but only the winit framework preserves the Step 3.5 win.)
+  2. Native libs: before onCreate, **extract `lib/x86_64/*.so` from the APK** to a dir and add it
+     to `java.library.path` (Roblox manifest has `extractNativeLibs=true`) so `System.loadLibrary`
+     finds `libroblox.so` (the apk crate can read the entries).
+  3. JNI calls: add the full **`jni`** crate for safe `FindClass`/`CallStaticObjectMethod`/…;
+     **wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot from
+     the **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).
+  4. Once Roblox's Java shell runs, harvest `framework-worklist.txt` (missing `android.*` the
+     framework must implement) — the deferred Step 4 data, and the spec for the winit framework.
+  5. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
 
 ---
 
@@ -661,6 +671,23 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `libjavacore.so`/`libopenjdk.so` "not found" stderr lines are the known non-fatal bionic-linker
   first-pass probes (it loads them from the natives dir next). Also resolved here: the deferred
   `vm_options()`/`dex2oat_options()` split (only `-X*` flags go to `JNI_CreateJavaVM`).
+- **2026-06-04** — 🎉 **ART loads Roblox's own Java** + ATL onCreate recipe extracted; the
+  framework crux identified. `boot(plan, Some(apk))` adds `-Djava.class.path=api-impl.jar : APK :
+  framework-res.apk` + `-Djava.library.path=<framework natives>` ([`find_framework`], env-
+  overridable); a C probe with this classpath returns `JNI_OK` and `FindClass` resolves
+  `android/app/Application`, `com/roblox/client/startup/ActivitySplash`,
+  `com/roblox/client/ActivityNativeMain`, and `com/roblox/engine/jni/NativeGLInterface` —
+  Roblox's Java shell + engine JNI classes load into Eclipse's ART, GTK-free. `eclipse run <apk>`
+  does this from `main()` (EXIT 0). Cloned ATL source to `/tmp/atl-src` and read the authoritative
+  onCreate recipe (`src/main-executable/main.c`): `create_vm` (the classpath/library.path above)
+  → `prepare_main_looper` → `extract_from_apk("lib/x86_64/")` → `Context.createApplication(J)` →
+  `ContentProvider.createContentProviders()` → `Application.onCreate()` →
+  `Activity.createMainActivity(String,J,String)`. **The `J` params are GtkWidget\*** — ATL's
+  `api-impl.jar` framework is GTK-coupled, so reaching onCreate through it re-introduces GTK
+  (re-crowding low_4gb). **Conclusion:** the production onCreate path is Eclipse's own
+  **winit + `ash`/EGL** framework (component-map F) — the major M2 build (see §5 next-actions).
+  No new deps this step (still `libloading`+`jni-sys`); the full `jni` crate lands with the JNI
+  call sequence in the onCreate work.
 
 ---
 

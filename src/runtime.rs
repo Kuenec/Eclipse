@@ -15,18 +15,23 @@
 //!     detection. [`BootPlan::vm_options`] are the `-X*` flags passed to `JNI_CreateJavaVM`;
 //!     [`BootPlan::dex2oat_options`] is the dex2oat-only `--instruction-set-features` flag
 //!     (a *separate* tool — never a `JavaVMOption`).
-//!  3. [`boot`] — `dlopen` libart + `JNI_CreateJavaVM` to bring up a **libcore** VM and prove
-//!     the JNI env works (a `GetVersion` call). 2026-06-04: verified to boot ART on this host
-//!     from a bare process (no GTK4/Mesa/winit), which is the decisive test of Eclipse's
-//!     Step 3.5 thesis — a graphics-stack-free process has a clean low_4gb window, so ART boots
-//!     where ATL+GTK4 exhausted it. ART self-loads libcore's native backends via the
-//!     translation linker (libart's `NEEDED libdl_bio`), so no explicit bionic_translation
-//!     setup is needed for a libcore boot.
+//!  3. [`boot`] — `dlopen` libart + `JNI_CreateJavaVM` to bring up the VM (returning `JNI_OK`
+//!     with a live `JavaVM`+`JNIEnv`). 2026-06-04: verified to boot ART on this host from a
+//!     bare process (no GTK4/Mesa/winit) — the decisive test of Eclipse's Step 3.5 thesis (a
+//!     graphics-stack-free process has a clean low_4gb window, so ART boots where ATL+GTK4
+//!     exhausted it). ART self-loads libcore's native backends via the translation linker
+//!     (libart's `NEEDED libdl_bio`), so no explicit bionic_translation setup is needed.
+//!     With an APK ([`find_framework`]) it also puts the app + `android.*` framework on the
+//!     classpath, so ART loads Roblox's Java (verified: `FindClass` resolves `com.roblox.*`).
 //!
 //! ## Not here yet
-//! Reaching Roblox's `onCreate` (api-impl.jar classpath, the Activity, `System.loadLibrary`
-//! pulling `libroblox.so` via the translation linker, a `winit` window + an `ash` Vulkan
-//! surface) builds on [`boot`] and is the next step (see `docs/art-and-runtime.md`).
+//! Reaching Roblox's `onCreate` — driving the launcher Activity via JNI (ATL's recipe:
+//! `Context.createApplication` → `ContentProvider.createContentProviders` →
+//! `Application.onCreate` → `Activity.createMainActivity(window)`), with `System.loadLibrary`
+//! pulling `libroblox.so` via the translation linker. That needs a *framework*: ATL's
+//! `api-impl.jar` is GTK-coupled (its `create*` entry points take a `GtkWidget*` window), so
+//! the production path is Eclipse's own **winit + `ash`/EGL** framework — see
+//! `docs/art-and-runtime.md` ("VM boot — implementation plan").
 //!
 //! ## `unsafe`
 //! 2026-06-04: this module is no longer `#![forbid(unsafe_code)]` — [`boot`] needs FFI. All
@@ -280,6 +285,64 @@ fn env_path(var: &str) -> Option<PathBuf> {
     }
 }
 
+/// Default install dir of the vendored Android framework (ATL's `api-impl.jar`,
+/// `framework-res.apk`, `natives/`). Overridable via `ECLIPSE_ANDROID_FRAMEWORK_DIR`.
+const FRAMEWORK_DIR_DEFAULT: &str = "/usr/lib/java/dex/android_translation_layer";
+
+/// Paths to the vendored Android framework Eclipse boots the app against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameworkPaths {
+    /// `api-impl.jar` — the `android.*` framework reimplementation (on the VM classpath).
+    pub api_impl_jar: PathBuf,
+    /// `framework-res.apk` — the framework resources (on the VM classpath).
+    pub framework_res_apk: PathBuf,
+    /// The framework's JNI native backends dir (on `java.library.path`).
+    pub natives_dir: PathBuf,
+}
+
+/// Locate the vendored Android framework (`ECLIPSE_ANDROID_FRAMEWORK_DIR` override, else default).
+///
+/// Returns [`RuntimeError::FrameworkNotFound`] if `api-impl.jar` is absent (detect-don't-assume,
+/// §9).
+///
+/// 2026-06-04: this `api-impl.jar` is ATL's framework and is **GTK-coupled** — its
+/// Activity/View/Surface backends and `createApplication`/`createMainActivity` take a
+/// `GtkWidget*` window handle. It is sufficient to put the app's dex + the framework on the
+/// classpath so ART loads Roblox's Java (verified: `FindClass` resolves `com.roblox.*`), but
+/// driving the Activity to `onCreate` *through it* pulls in GTK. Eclipse's own winit/Vulkan
+/// framework is the production replacement (component-map F) — see `docs/art-and-runtime.md`.
+pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
+    let dir = env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR")
+        .unwrap_or_else(|| PathBuf::from(FRAMEWORK_DIR_DEFAULT));
+    let api_impl_jar = dir.join("api-impl.jar");
+    if !api_impl_jar.exists() {
+        return Err(RuntimeError::FrameworkNotFound(api_impl_jar));
+    }
+    Ok(FrameworkPaths {
+        framework_res_apk: dir.join("framework-res.apk"),
+        natives_dir: dir.join("natives"),
+        api_impl_jar,
+    })
+}
+
+/// Build the `-Djava.class.path=` value: `api-impl.jar : APK : framework-res.apk` (ART's
+/// classpath separator is `:`). Mirrors ATL's `create_vm` so the app's dex and the framework
+/// both load into the VM.
+fn class_path_option(fw: &FrameworkPaths, apk: &Path) -> String {
+    format!(
+        "-Djava.class.path={}:{}:{}",
+        fw.api_impl_jar.display(),
+        apk.display(),
+        fw.framework_res_apk.display()
+    )
+}
+
+/// Build the `-Djava.library.path=` value (the framework natives dir). The app's own extracted
+/// native libs (`libroblox.so`, …) are added when `System.loadLibrary` support lands.
+fn library_path_option(fw: &FrameworkPaths) -> String {
+    format!("-Djava.library.path={}", fw.natives_dir.display())
+}
+
 /// `JNI_CreateJavaVM` as resolved from `libart.so`: `(JavaVM**, void**, void*) -> jint`.
 type JniCreateJavaVm = unsafe extern "system" fn(
     *mut *mut jni_sys::JavaVM,
@@ -287,21 +350,27 @@ type JniCreateJavaVm = unsafe extern "system" fn(
     *mut c_void,
 ) -> jni_sys::jint;
 
-/// Boot a **libcore** ART VM for the given plan and confirm its JNI env works.
+/// Boot the vendored ART VM for the given plan, optionally with an app on the classpath.
 ///
 /// `dlopen`s the vendored `libart.so` and calls `JNI_CreateJavaVM` with the discovered boot
 /// image + the plan's [`vm_options`](BootPlan::vm_options), succeeding when ART returns
 /// `JNI_OK` with a live `JavaVM` + `JNIEnv`. ART completes all initialization — boot-image
 /// load, libcore native backends, runtime threads, attaching this thread — before returning
-/// `JNI_OK`, so that status is definitive proof the VM booted. This is the libcore-only smoke
-/// boot (no app classpath / Activity / native libs yet) — the decisive Step 3.5 thesis test
-/// (see the module docs).
+/// `JNI_OK`, so that status is definitive proof the VM booted.
+///
+/// - `apk_path = None`: a **libcore-only** smoke boot — the decisive Step 3.5 thesis test (a
+///   graphics-free process boots ART past the low_4gb wall; see the module docs).
+/// - `apk_path = Some(apk)`: also put the **app on the classpath** — `api-impl.jar : APK :
+///   framework-res.apk` ([`find_framework`]) plus the framework `java.library.path` — so ART
+///   loads Roblox's Java (verified 2026-06-04: `FindClass` resolves `com.roblox.*`). This is
+///   the foundation for reaching `onCreate`; driving the Activity itself needs the framework
+///   (currently GTK-coupled — see [`find_framework`]).
 ///
 /// `libart.so` is intentionally **never unloaded**: a running ART VM has daemon threads
 /// (GC/JIT) executing libart's code, so unmapping it would be undefined behavior. The VM lives
 /// for the process; proper `DestroyJavaVM`-then-unload teardown is future work. Consequently
 /// only one VM can be created per process (`JNI_CreateJavaVM` returns an error on a second call).
-pub fn boot(plan: &BootPlan) -> Result<(), RuntimeError> {
+pub fn boot(plan: &BootPlan, apk_path: Option<&Path>) -> Result<(), RuntimeError> {
     let libart = find_libart()?;
     let boot_image = find_boot_image()?;
 
@@ -311,6 +380,13 @@ pub fn boot(plan: &BootPlan) -> Result<(), RuntimeError> {
     option_strings.push(make_cstring(format!("-Ximage:{}", boot_image.display()))?);
     for opt in plan.vm_options() {
         option_strings.push(make_cstring(opt)?);
+    }
+    // With an APK, add the app + framework to the classpath (and the framework natives to
+    // java.library.path) so Roblox's Java and the android.* framework load into the VM.
+    if let Some(apk) = apk_path {
+        let fw = find_framework()?;
+        option_strings.push(make_cstring(class_path_option(&fw, apk))?);
+        option_strings.push(make_cstring(library_path_option(&fw))?);
     }
     let mut options: Vec<jni_sys::JavaVMOption> = option_strings
         .iter()
@@ -379,6 +455,8 @@ pub enum RuntimeError {
     LibartNotFound(PathBuf),
     /// The ART boot-image location's directory was not found.
     BootImageNotFound(PathBuf),
+    /// The vendored Android framework (`api-impl.jar`) was not found.
+    FrameworkNotFound(PathBuf),
     /// `dlopen` of `libart.so` failed.
     LoadLibart(libloading::Error),
     /// Resolving the `JNI_CreateJavaVM` symbol failed.
@@ -405,6 +483,13 @@ impl fmt::Display for RuntimeError {
                 write!(
                     f,
                     "ART boot image not found near {} (set ECLIPSE_ART_BOOT_IMAGE to override)",
+                    p.display()
+                )
+            }
+            Self::FrameworkNotFound(p) => {
+                write!(
+                    f,
+                    "Android framework not found at {} (set ECLIPSE_ANDROID_FRAMEWORK_DIR to override)",
                     p.display()
                 )
             }
@@ -554,6 +639,44 @@ mod tests {
         let r = find_libart();
         unsafe { std::env::remove_var("ECLIPSE_LIBART") };
         assert!(matches!(r, Err(RuntimeError::LibartNotFound(_))), "{r:?}");
+    }
+
+    #[test]
+    fn find_framework_reports_typed_error_for_missing_override() {
+        // Override the framework dir to one with no api-impl.jar → typed FrameworkNotFound.
+        // SAFETY: single-threaded test; set then remove the env var around the call.
+        unsafe { std::env::set_var("ECLIPSE_ANDROID_FRAMEWORK_DIR", "/nonexistent/eclipse/fw") };
+        let r = find_framework();
+        unsafe { std::env::remove_var("ECLIPSE_ANDROID_FRAMEWORK_DIR") };
+        assert!(
+            matches!(r, Err(RuntimeError::FrameworkNotFound(_))),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn class_path_option_orders_framework_apk_and_res() {
+        // ATL's order: api-impl.jar : APK : framework-res.apk, ':'-separated, under -Djava.class.path.
+        let fw = FrameworkPaths {
+            api_impl_jar: PathBuf::from("/fw/api-impl.jar"),
+            framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
+            natives_dir: PathBuf::from("/fw/natives"),
+        };
+        let opt = class_path_option(&fw, Path::new("/apps/roblox.apk"));
+        assert_eq!(
+            opt,
+            "-Djava.class.path=/fw/api-impl.jar:/apps/roblox.apk:/fw/framework-res.apk"
+        );
+    }
+
+    #[test]
+    fn library_path_option_points_at_framework_natives() {
+        let fw = FrameworkPaths {
+            api_impl_jar: PathBuf::from("/fw/api-impl.jar"),
+            framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
+            natives_dir: PathBuf::from("/fw/natives"),
+        };
+        assert_eq!(library_path_option(&fw), "-Djava.library.path=/fw/natives");
     }
 
     // The real ART VM boot is intentionally NOT an in-harness test: ART's `JNI_CreateJavaVM`
