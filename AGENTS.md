@@ -494,26 +494,35 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      `bionic_android_dlopen_ext` ignoring `dlextinfo` matters — all settle with one load probe.
   3. ✅ Thread/loop ownership now **encoded in a type**: `boot()` returns an owned, `!Send`/`!Sync`
      `runtime::Vm` (raw `*mut JavaVM` field, NO `unsafe impl Send`/`Sync`); `main.rs` binds it
-     `let _vm = …` and keeps it alive across `graphics::run_windowed(…)`, pinning the VM to the
+     `let vm = …` and keeps it alive across `graphics::run_windowed(…)`, pinning the VM to the
      JNI-attached main thread so the next increment's JNI calls run from inside the event loop with
      a reachable VM (2026-06-04). ✅ **onCreate JNI sequence now SPEC'D + grounded** (2026-06-04):
      confirmed signatures, recipe table, bootstrap class, and the `jlong` window-handle passing are
-     in `docs/art-and-runtime.md` ("onCreate JNI recipe (confirmed)"). **NEXT IMPLEMENTATION
-     INCREMENT — write that sequence:** add the full **`jni = "0.22"`** crate (keep `jni-sys`;
-     verified against **docs.rs/jni** — Context7 does not index `jni`); wrap the held `Vm`'s raw
-     `*mut JavaVM` with `jni::JavaVM::from_raw`, get an `Env` via `attach_current_thread(|env| …)`
-     (cheap — main thread already attached; there is **no** standalone `get_env()` in 0.22), and
-     from **inside the winit event loop on the held `Vm`/main thread** drive:
-     `Context.createApplication((J)→Application)` → `ContentProvider.createContentProviders(()V)` →
-     `Application.onCreate(()V)` → `Activity.createMainActivity((Ljava/lang/String;JLjava/lang/String;)→Activity)`
-     → `Activity.onCreate((Landroid/os/Bundle;)V)` — the host window is a **`jlong`/intptr_t handle,
-     NOT a Surface object**. **Wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep
-     `panic = "abort"`). Boot stays on the **main thread** (the cargo-test harness aborts ART —
-     **validate via a dev-host `eclipse run`**, not an in-harness test). Residual UNCONFIRMED to
-     resolve at implement time (read `api-impl.jar` via `javap -s` + iterate on a real run): whether
-     `Activity.onCreate` is called directly or via `activity_start`/the event loop;
-     Looper/MessageQueue ordering vs the sequence; the exact winit window-handle type for the
-     `jlong`; and the compiled `createMainActivity` signature/visibility in `api-impl.jar`.
+     in `docs/art-and-runtime.md` ("onCreate JNI recipe (confirmed)"). ✅ **onCreate driver
+     FOUNDATION implemented** (2026-06-04): added the full **`jni = "0.22"`** crate (0.22.4; kept
+     `jni-sys`); `Vm::as_raw()` exposes the held `*mut JavaVM`; new `framework::drive_application_lifecycle(&Vm)`
+     wraps it with `jni::vm::JavaVM::from_raw` (null-guarded), enters `attach_current_thread(|env| …)`
+     on the main thread, and resolves the recipe's bootstrap classes (`android/content/Context`,
+     `android/app/Application`) via `find_class` to **prove the typed-`Env` bridge** reaches the
+     loaded `android.*` framework — the JNI closure body is `catch_unwind`-guarded (§2.8, `panic =
+     "abort"` kept); the 5-step recipe is encoded as typed `RecipeStep` constants. **Application.onCreate
+     is NOT yet reached** — the driver stops *before* step 1 (`createApplication(J)`): every
+     `jlong`-window-taking call is deferred because the window-handle type is UNCONFIRMED for
+     Eclipse's non-GTK winit window and `api-impl.jar` casts that `jlong` to `GtkWidget*`. Wired into
+     `main.rs::run_apk` after boot, before the winit loop. **NEXT IMPLEMENTATION INCREMENT — drive
+     the actual lifecycle with the real surface:** resolve the framework/Surface window-handle design
+     (component-map F: which winit `RawWindowHandle` variant → `intptr_t` Eclipse's own — not GTK —
+     native expects), then drive step 1 `Context.createApplication(J)` → 2 `createContentProviders` →
+     3 `Application.onCreate` from inside the winit event loop on the held `Vm`/main thread, then
+     **steps 4–5** `Activity.createMainActivity((Ljava/lang/String;JLjava/lang/String;)→Activity)` →
+     `Activity.onCreate((Landroid/os/Bundle;)V)`. Boot stays on the **main thread** (the cargo-test
+     harness aborts ART — **validate via a dev-host `eclipse run`**, not an in-harness test). Residual
+     UNCONFIRMED to resolve at implement time (read `api-impl.jar` via `javap -s` + iterate on a real
+     run): whether `Activity.onCreate` is called directly or via `activity_start`/the event loop;
+     Looper/MessageQueue ordering vs the sequence; and the compiled `createMainActivity`
+     signature/visibility in `api-impl.jar`. **Separately:** the deferred **bionic NDK-shim** step
+     (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent cyber-safeguard blocker) so the
+     Roblox engine's transitive natives resolve and `libroblox.so` links past relocation.
   4. Once Roblox's Java shell runs, harvest `framework-worklist.txt` (missing `android.*` the
      framework must implement) — the deferred Step 4 data, and the spec for the winit framework.
   5. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
@@ -836,6 +845,36 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   sequence is the next framework increment. Owed dev-host check (cannot run in-harness): `cargo run --
   run ~/eclipse-m0/atl_test_apks/demo_app.apk` must still boot ART + open the window + exit 0 (the
   held-Vm change must not alter observable boot/window behavior).
+- **2026-06-04** — **onCreate driver FOUNDATION implemented (the `jni`-crate bridge); window-dependent
+  steps deferred.** Added `jni = "0.22"` (resolves 0.22.4; kept `jni-sys 0.4`). New
+  `Vm::as_raw() -> *mut jni_sys::JavaVM` exposes the held VM pointer (removed the now-satisfied
+  `#[expect(dead_code)]` on `vm`). New `framework::drive_application_lifecycle(&Vm)` wraps that
+  pointer with `jni::vm::JavaVM::from_raw` (verified vs the extracted 0.22.4 crate source: `from_raw`
+  is `unsafe` + does `assert!(!ptr.is_null())`, so a defensive null-guard returns the typed
+  `FrameworkError::NullVm` *before* `from_raw` to avoid that panic), enters
+  `attach_current_thread(|env| …)` (the main thread is already attached after `JNI_CreateJavaVM`, so
+  cheap; `F: FnOnce(&mut Env)->Result<T,E>, E: From<Error>` — matched by `impl From<jni::errors::Error>
+  for FrameworkError`), and resolves the recipe's bootstrap classes `android/content/Context` +
+  `android/app/Application` via `find_class` to **prove the typed-`Env` bridge** reaches the loaded
+  `android.*` framework. The JNI closure body is wrapped in `std::panic::catch_unwind`
+  (`AssertUnwindSafe`) so a Rust panic can never unwind into ART's C++ under `panic = "abort"` (§2.8);
+  all JNI errors are typed (no unwrap/expect/panic). The full 5-step recipe is encoded as typed
+  `RecipeStep` constants (STEP1..STEP5) with the confirmed class/method/JNI-descriptor strings; two
+  unit tests pin those descriptors + the slashed bootstrap-class names against transcription
+  regressions. Wired into `main.rs::run_apk` on the main thread after `boot()`, before the winit event
+  loop. **`Application.onCreate` is NOT yet proven reached** — the driver deliberately stops *before*
+  step 1 (`createApplication(J)`): every `jlong`-window-taking call (steps 1–5) is **deferred** because
+  the window-handle type Eclipse passes as the `jlong` is UNCONFIRMED for its non-GTK winit window and
+  the vendored `api-impl.jar` is ATL's GTK-coupled jar that casts that `jlong` to `GtkWidget*` —
+  passing a guessed winit handle into a GTK-expecting native is forbidden (CLAUDE.md: no guessing;
+  type-confused deref risk). `jni 0.22.4`'s API was verified against the extracted crate source (not a
+  guess) since docs.rs is JS-rendered. Full gate green: fmt / build --all-targets / clippy `-D
+  warnings` / test (43: +2 framework descriptor/name guards) / release (`panic=abort` retained). Owed
+  dev-host check (cannot run in-harness — ART aborts on worker threads): `cargo run -- run
+  ~/eclipse-m0/atl_test_apks/demo_app.apk` should boot ART, log "framework bridge proven" (bootstrap
+  classes resolved via JNI), open the window, and exit 0. **NEXT:** steps 1–5 with the real surface
+  (resolve the winit→`intptr_t` window-handle design), and separately the deferred bionic NDK-shim for
+  the Roblox engine.
 
 ---
 

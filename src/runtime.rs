@@ -413,15 +413,25 @@ type JniCreateJavaVm = unsafe extern "system" fn(
 /// assert_sync::<eclipse::runtime::Vm>();
 /// ```
 pub struct Vm {
-    /// The `JavaVM` pointer returned by `JNI_CreateJavaVM`. Raw-pointer field → `Vm` is `!Send`
-    /// + `!Sync`, pinning it to the booting (main) thread. Read by the next increment's JNI calls.
-    // 2026-06-04: held-for-next-increment, not dead — `expect` (not `allow`) so it self-warns and
-    // must be removed the moment the JNI-call increment reads `vm`, preventing a stale annotation.
-    #[expect(
-        dead_code,
-        reason = "carries the JavaVM for the next increment's main-thread JNI calls"
-    )]
+    /// The `JavaVM` pointer returned by `JNI_CreateJavaVM`. The raw-pointer field makes `Vm`
+    /// auto-`!Send`/`!Sync`, pinning it to the booting (main) thread. Read via [`Vm::as_raw`] by
+    /// the framework lifecycle driver's main-thread JNI calls.
     vm: *mut jni_sys::JavaVM,
+}
+
+impl Vm {
+    /// The live `*mut JavaVM` this process booted, for wrapping with the `jni` crate
+    /// (`jni::vm::JavaVM::from_raw`) on this (main) thread.
+    ///
+    /// 2026-06-04: returns the raw pointer rather than the `jni` wrapper so `runtime` keeps no
+    /// `jni`-crate dependency in its public API (the framework driver in [`crate::framework`]
+    /// owns that). The pointer is non-null (verified by [`boot`]'s `NullEnv` check) and valid for
+    /// the process lifetime (the VM is never destroyed — see [`boot`]'s never-unload note); `&self`
+    /// borrows the `!Send`/`!Sync` `Vm`, so callers stay on the VM's main thread.
+    #[must_use]
+    pub fn as_raw(&self) -> *mut jni_sys::JavaVM {
+        self.vm
+    }
 }
 
 /// Boot the vendored ART VM for the given plan, optionally with an app on the classpath.

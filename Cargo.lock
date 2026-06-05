@@ -386,6 +386,7 @@ name = "eclipse"
 version = "0.0.0"
 dependencies = [
  "directories",
+ "jni",
  "jni-sys 0.4.1",
  "libloading 0.9.0",
  "serde",
