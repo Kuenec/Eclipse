@@ -2394,6 +2394,108 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.os.MessageQueue.nativeInit ====================
+//
+// 2026-06-05: step 0 (`Looper.prepareMainLooper`) builds the main thread's `MessageQueue`, whose
+// constructor calls `nativeInit()` and stores the returned `long` as `mPtr`. The first native the
+// dev-host run surfaces inside `prepareMainLooper` is `MessageQueue.nativeInit()` (`No
+// implementation found for long android.os.MessageQueue.nativeInit()`, run log 2026-06-05 against
+// com.ashwin.example.accelerometerdemo). AOSP's `MessageQueue.java` declares it
+//   `private native long nativeInit();`
+// — an INSTANCE native returning the native message-queue handle. `MessageQueue.<init>` then does
+// `if (mPtr == 0) throw new IllegalStateException("Unable to allocate native queue");`, so the only
+// Java-side contract is that the returned handle is **non-zero**.
+//
+// Eclipse drives the lifecycle on a single attached main thread and **never runs `Looper.loop()`**,
+// so the queue's polling/wake/destroy natives (`nativePollOnce`/`nativeWake`/`nativeIsPolling`/
+// `nativeDestroy`) are never invoked — none are bound, and if one ever were called it would raise a
+// clean `UnsatisfiedLinkError` (not UB). Because the returned handle therefore has NO dereferencing
+// consumer, a full generational-slab registry (as for window/view/paint handles, which ARE
+// dereferenced by later natives) would be dead weight (Simplicity First, AGENTS.md §Surgical). The
+// minimal-sound backing returns a stable non-zero sentinel that is plainly NOT a pointer, satisfying
+// the `mPtr != 0` contract without faking any message-loop behavior. If a queue-consuming native is
+// ever bound (i.e. the lifecycle starts running `Looper.loop()`), this must become a real registry
+// handle (mirroring `paint_registry`) so the consumer can validate it — flagged here for that step.
+
+/// `android.os.MessageQueue` (internal/slashed name for `find_class`) — hosts the `nativeInit`
+/// queue-allocation native.
+pub const MESSAGE_QUEUE_CLASS: &JNIStr = jni_str!("android/os/MessageQueue");
+
+// JNI name + descriptor for MessageQueue's native, exactly as declared in AOSP's `MessageQueue.java`:
+// `private native long nativeInit();` → an INSTANCE native, descriptor `()J`. (The ATL framework is
+// AOSP-derived; the run's `No implementation found for long android.os.MessageQueue.nativeInit()`
+// line + the `MessageQueue.<init> → nativeInit` stack confirm the name/arity/return.)
+const MESSAGE_QUEUE_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
+const MESSAGE_QUEUE_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
+
+/// The non-zero, non-pointer sentinel `MessageQueue.nativeInit()` returns as `mPtr`.
+///
+/// 2026-06-05: Java only checks `mPtr != 0`; this value is never dereferenced (no queue-consuming
+/// native is bound — see the section comment). A small, recognizable, plainly-not-a-pointer constant.
+const MESSAGE_QUEUE_HANDLE_SENTINEL: jlong = 0x4d51; // 'MQ' — a non-zero, non-pointer marker.
+
+/// `MessageQueue.nativeInit()` → a stable non-zero handle (`mPtr`).
+///
+/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are `(EnvUnowned, JObject this)`.
+/// `this` is not dereferenced. Returns [`MESSAGE_QUEUE_HANDLE_SENTINEL`] — non-zero so
+/// `MessageQueue.<init>`'s `mPtr == 0` guard passes; never a pointer (the handle has no dereferencing
+/// consumer in Eclipse's no-`Looper.loop()` lifecycle — see the section comment).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
+/// error/panic — but the body is infallible, so the sentinel is always returned.
+extern "system" fn message_queue_native_init<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        tracing::debug!(
+            target: "android.os.MessageQueue",
+            handle = MESSAGE_QUEUE_HANDLE_SENTINEL,
+            "MessageQueue.nativeInit: returning non-GTK non-zero queue sentinel (no Looper.loop)"
+        );
+        Ok(MESSAGE_QUEUE_HANDLE_SENTINEL)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.os.MessageQueue`'s `nativeInit`.
+///
+/// Locates `android/os/MessageQueue` and registers the native via `RegisterNatives` (which wins over
+/// name-based lazy binding — JNI 1.1 spec). MUST run before step 0 (`Looper.prepareMainLooper`), which
+/// constructs the main `MessageQueue` and calls `nativeInit`; it is registered before the lifecycle
+/// drive alongside the other `android.os.*` natives.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI signature.
+/// It does, by construction — [`message_queue_native_init`] is written to the exact `()J` descriptor
+/// as an instance native (`EnvUnowned, JObject this`). The native body is `catch_unwind`-guarded via
+/// [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
+fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(MESSAGE_QUEUE_CLASS)?;
+    let methods = [
+        // SAFETY: `message_queue_native_init` matches the paired `()J` signature as an instance
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                MESSAGE_QUEUE_NATIVE_INIT_NAME,
+                MESSAGE_QUEUE_NATIVE_INIT_SIG,
+                message_queue_native_init as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/os/MessageQueue; `methods` holds a valid fn pointer whose
+    // signature matches the class's `native` declaration (AOSP `MessageQueue.java`,
+    // `private native long nativeInit()`, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/os/MessageQueue",
+        "registered Eclipse's non-GTK backing for nativeInit"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.view.View native peer construction =============
 //
 // 2026-06-05: step 4 (`Activity.createMainActivity`) constructs the launcher Activity, whose
@@ -3034,6 +3136,158 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.widget.ImageView native peer construction ======
+//
+// 2026-06-05: a launcher layout containing an `<ImageView>` (e.g. AdaptiveIconDemo) makes step 5
+// (`setContentView` → `LayoutInflater`) construct an `android.widget.ImageView`, surfacing
+// `ImageView.native_constructor(Context, AttributeSet)` (run log 2026-06-05 against AdaptiveIconDemo).
+// Exactly like `TextView`, ART resolves natives per declaring class and `ImageView.java` re-declares
+// its own `protected native long native_constructor(Context, AttributeSet);` (same signature as
+// `View.native_constructor`). The backing is class-agnostic (records the receiver's ACTUAL class name
+// into [`view_registry`]), so the SAME [`view_native_constructor`] fn is registered on
+// `android/widget/ImageView` — recording `android.widget.ImageView` in the view tree. ImageView's
+// image-source natives (`native_setImage*`) are added here if/when a run surfaces them; the demo's
+// drawable rendering is the deferred render build (no GTK, no draw here).
+
+/// `android.widget.ImageView` (internal/slashed name for `find_class`) — re-declares `native_constructor`.
+pub const IMAGE_VIEW_CLASS: &JNIStr = jni_str!("android/widget/ImageView");
+
+/// Bind Eclipse's own (non-GTK) backing for `android.widget.ImageView`'s peer natives.
+///
+/// `native_constructor` (same `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as
+/// View's/TextView's) reuses the class-agnostic [`view_native_constructor`], which records the
+/// receiver's actual class (`android.widget.ImageView`) in [`view_registry`]. Registered before step 4,
+/// alongside the View/TextView natives, because ART resolves natives per declaring class.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It does
+/// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
+/// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_image_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(IMAGE_VIEW_CLASS)?;
+    let methods = [
+        // SAFETY: `view_native_constructor` matches the paired
+        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
+        // (shared with View/TextView native_constructor); casting the `extern "system"` fn to a
+        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_CONSTRUCTOR_NAME,
+                VIEW_NATIVE_CONSTRUCTOR_SIG,
+                view_native_constructor as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/widget/ImageView; the fn pointer's signature matches its
+    // re-declared `native_constructor` (same as View/TextView, surfaced by the run line 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/widget/ImageView",
+        "registered Eclipse's non-GTK backing for ImageView.native_constructor"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.graphics.drawable.Drawable.native_constructor ===
+//
+// 2026-06-05: a launcher that loads a drawable in onCreate (e.g. AdaptiveIconDemo's
+// `Context.getDrawable` → `Resources.loadDrawable` → `Drawable.createFromXml` →
+// `AdaptiveIconDrawable.<init>` → `Drawable.<init>`) calls `Drawable.native_constructor()`, surfacing
+// `No implementation found for long android.graphics.drawable.Drawable.native_constructor()` (run log
+// 2026-06-05 against AdaptiveIconDemo). AOSP's `Drawable.java` declares it
+//   `private native long native_constructor();`
+// — an INSTANCE native (called from `Drawable.<init>` on `this`, no Java args) returning the native
+// drawable peer handle (`Drawable.mNativePtr`). `Drawable.<init>` then registers `mNativePtr` for
+// native-allocation cleanup, so the handle must be **non-zero**.
+//
+// Like `MessageQueue.nativeInit`, Eclipse drives the lifecycle WITHOUT a draw pass, so the drawable's
+// drawing/bounds natives (`native_draw`/`native_setBounds`/…) are never invoked — none are bound, and
+// if one ever were it would raise a clean `UnsatisfiedLinkError` (not UB). The returned handle thus
+// has NO dereferencing consumer, so a full generational-slab registry would be dead weight (Simplicity
+// First, AGENTS.md §Surgical). The minimal-sound backing returns a stable non-zero sentinel that is
+// plainly NOT a pointer, satisfying the non-zero contract without faking any drawing. If a drawable
+// draw/bounds native is ever bound (i.e. the deferred render build draws drawables), this must become
+// a real registry handle (mirroring `paint_registry`) so the consumer can validate it — flagged here.
+
+/// `android.graphics.drawable.Drawable` (internal/slashed name) — hosts the `native_constructor` peer
+/// allocation native.
+pub const DRAWABLE_CLASS: &JNIStr = jni_str!("android/graphics/drawable/Drawable");
+
+// JNI name + descriptor for Drawable's native, exactly as declared in AOSP's `Drawable.java`:
+// `private native long native_constructor();` → an INSTANCE native, descriptor `()J`. (Confirmed by
+// the run's `No implementation found for long android.graphics.drawable.Drawable.native_constructor()`
+// line + the `Drawable.<init> → native_constructor` stack.)
+const DRAWABLE_NATIVE_CONSTRUCTOR_NAME: &JNIStr = jni_str!("native_constructor");
+const DRAWABLE_NATIVE_CONSTRUCTOR_SIG: &JNIStr = jni_str!("()J");
+
+/// The non-zero, non-pointer sentinel `Drawable.native_constructor()` returns as `mNativePtr`.
+///
+/// 2026-06-05: Java only needs `mNativePtr != 0` (for the native-allocation registration); this value
+/// is never dereferenced (no drawable draw/bounds native is bound — see the section comment). A small,
+/// recognizable, plainly-not-a-pointer constant.
+const DRAWABLE_HANDLE_SENTINEL: jlong = 0x4452; // 'DR' — a non-zero, non-pointer marker.
+
+/// `Drawable.native_constructor()` → a stable non-zero peer handle (`mNativePtr`).
+///
+/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are `(EnvUnowned, JObject this)`.
+/// `this` is not dereferenced. Returns [`DRAWABLE_HANDLE_SENTINEL`] — non-zero so `Drawable.<init>`'s
+/// native-allocation registration accepts it; never a pointer (the handle has no dereferencing consumer
+/// in Eclipse's draw-free lifecycle — see the section comment).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
+/// error/panic — but the body is infallible, so the sentinel is always returned.
+extern "system" fn drawable_native_constructor<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        tracing::debug!(
+            target: "android.graphics.drawable.Drawable",
+            handle = DRAWABLE_HANDLE_SENTINEL,
+            "Drawable.native_constructor: returning non-GTK non-zero drawable sentinel (no draw pass)"
+        );
+        Ok(DRAWABLE_HANDLE_SENTINEL)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.graphics.drawable.Drawable`'s `native_constructor`.
+///
+/// Locates `android/graphics/drawable/Drawable` and registers the native via `RegisterNatives` (which
+/// wins over name-based lazy binding — JNI 1.1 spec). MUST run before step 4, since a launcher's
+/// onCreate may load a drawable. Registered alongside the View/widget natives.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI signature.
+/// It does — [`drawable_native_constructor`] is written to the exact `()J` descriptor as an instance
+/// native (`EnvUnowned, JObject this`). The native body is `catch_unwind`-guarded via
+/// [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
+fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(DRAWABLE_CLASS)?;
+    let methods = [
+        // SAFETY: `drawable_native_constructor` matches the paired `()J` signature as an instance
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                DRAWABLE_NATIVE_CONSTRUCTOR_NAME,
+                DRAWABLE_NATIVE_CONSTRUCTOR_SIG,
+                drawable_native_constructor as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/graphics/drawable/Drawable; the fn pointer's signature
+    // matches its `native_constructor` (AOSP `Drawable.java`, `private native long native_constructor()`,
+    // surfaced by the run line 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/graphics/drawable/Drawable",
+        "registered Eclipse's non-GTK backing for Drawable.native_constructor"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.view.Window native window setup ================
 //
 // 2026-06-05: step 4 (`Activity.createMainActivity` → `internalCreateActivity` → `Window.<init>` →
@@ -3306,6 +3560,18 @@ pub const APPLICATION_CLASS: &JNIStr = jni_str!("android/app/Application");
 /// `createContentProviders()` entry point.
 pub const CONTENT_PROVIDER_CLASS: &JNIStr = jni_str!("android/content/ContentProvider");
 
+/// `android.os.Looper` (internal name) — hosts the `static prepareMainLooper()` entry point.
+///
+/// 2026-06-05: the lifecycle runs on a single JNI-attached main thread that has no Android
+/// `Looper` of its own. Android's `Handler.<init>` requires `Looper.myLooper() != null`, and a
+/// real Activity (e.g. any `AppCompatActivity`/`FragmentActivity`, which build a `Handler` in a
+/// field initializer) is constructed during step 4 — so the main `Looper` must be prepared first,
+/// matching ATL's recipe (its boot sequence starts with `prepare_main_looper`). The pure-Java
+/// `demo_app` Activity never touched a `Handler`, so this gap only surfaced with the second app
+/// (`com.ashwin.example.accelerometerdemo`): step 4 threw
+/// `RuntimeException: Can't create handler inside thread that has not called Looper.prepare()`.
+pub const LOOPER_CLASS: &JNIStr = jni_str!("android/os/Looper");
+
 /// Step 1: `static Context.createApplication(jlong native_window) -> Application`.
 ///
 /// 2026-06-05: descriptor RE-VERIFIED against the compiled framework. `api-impl.jar` packages a
@@ -3519,6 +3785,10 @@ fn drive_lifecycle(
     // may query the monotonic clock during step 1 (observed for Roblox's RobloxApplication.<init>),
     // so this must be bound before step 1. GTK-free; std::time::Instant-backed.
     register_system_clock_natives(env)?;
+    // Bind android.os.MessageQueue.nativeInit on its own class — step 0 (Looper.prepareMainLooper)
+    // builds the main thread's MessageQueue, which calls nativeInit() in its constructor, so this must
+    // be bound before step 0. GTK-free; returns a non-zero non-pointer sentinel (no Looper.loop runs).
+    register_message_queue_natives(env)?;
     // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
@@ -3531,6 +3801,15 @@ fn drive_lifecycle(
     // <TextView> during step 5, and ART resolves natives per declaring class (TextView re-declares
     // native_constructor), so this must be bound before step 4. Reuses the View constructor backing.
     register_text_view_natives(env)?;
+    // Bind android.widget.ImageView's native_constructor on its own class — a launcher layout may
+    // inflate an <ImageView> during step 5 (e.g. AdaptiveIconDemo), and ART resolves natives per
+    // declaring class (ImageView re-declares native_constructor), so this must be bound before step 4.
+    // Reuses the class-agnostic View constructor backing (records android.widget.ImageView in the tree).
+    register_image_view_natives(env)?;
+    // Bind android.graphics.drawable.Drawable's native_constructor on its own class — a launcher's
+    // onCreate may load a drawable during step 5 (e.g. AdaptiveIconDemo's getDrawable), so this must be
+    // bound before step 4. GTK-free; returns a non-zero non-pointer sentinel (no draw pass runs).
+    register_drawable_natives(env)?;
     // Bind android.view.ViewGroup's tree-wiring natives on its own class — setContentView's
     // LayoutInflater wires children via ViewGroup.addView during step 5, so this must be bound before
     // step 4. Bound non-GTK against view_registry (records the tree edges).
@@ -3550,6 +3829,26 @@ fn drive_lifecycle(
         application = STEP3_APPLICATION_ON_CREATE.class,
         "framework bridge proven: Context static-init natives registered + bootstrap classes resolved via JNI"
     );
+
+    // Step 0: `static Looper.prepareMainLooper() -> void` on the attached main thread, matching
+    // ATL's recipe (its boot sequence's first step is `prepare_main_looper`). Android's
+    // `Handler.<init>` requires `Looper.myLooper() != null`; a real launcher Activity constructs a
+    // `Handler` in a field initializer (every `AppCompatActivity`/`FragmentActivity` does), so the
+    // main `Looper` must exist before step 4 builds the Activity — otherwise the Activity ctor throws
+    // `RuntimeException: Can't create handler inside thread that has not called Looper.prepare()`
+    // (2026-06-05, surfaced by com.ashwin.example.accelerometerdemo; the pure-Java demo_app Activity
+    // never touched a Handler, so this gap was previously latent). Idempotent for the process: the
+    // main Looper is prepared once. `.v()` asserts the void return.
+    let looper_class = env.find_class(LOOPER_CLASS)?;
+    checked(env, "step 0 Looper.prepareMainLooper", |env| {
+        env.call_static_method(
+            &looper_class,
+            jni_str!("prepareMainLooper"),
+            jni_sig!("()V"),
+            &[],
+        )?
+        .v()
+    })?;
 
     // Step 1: `static Context.createApplication(jlong native_window) -> Application`.
     // 2026-06-05: the handle is now a REAL Eclipse-owned registry handle (was the placeholder `0`):
@@ -4259,6 +4558,24 @@ mod tests {
     }
 
     #[test]
+    fn message_queue_native_name_sig_and_class_match_art_reported() {
+        // Pin android.os.MessageQueue.nativeInit's class, method name, and JNI descriptor against the
+        // exact signature ART reported missing (`No implementation found for long
+        // android.os.MessageQueue.nativeInit()`, run log 2026-06-05) + AOSP `MessageQueue.java`'s
+        // `private native long nativeInit();`: a transcription regression would make RegisterNatives
+        // throw NoSuchMethodError at step 0 (or the native go unbound, re-throwing the
+        // UnsatisfiedLinkError that blocked Looper.prepareMainLooper). Host-independent constants.
+        assert_eq!(MESSAGE_QUEUE_CLASS.to_str(), "android/os/MessageQueue");
+        assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_NAME.to_str(), "nativeInit");
+        assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_SIG.to_str(), "()J");
+        // The Looper class whose static prepareMainLooper() (step 0) builds the MessageQueue.
+        assert_eq!(LOOPER_CLASS.to_str(), "android/os/Looper");
+        // Java's MessageQueue.<init> requires mPtr != 0; the sentinel must be non-zero (and is a
+        // plainly-non-pointer marker, never dereferenced — see register_message_queue_natives docs).
+        assert_ne!(MESSAGE_QUEUE_HANDLE_SENTINEL, 0);
+    }
+
+    #[test]
     fn monotonic_anchor_clock_is_non_decreasing() {
         // The elapsedRealtime contract guarantees monotonicity (SystemClock.java lines 52–56). Prove
         // the process-anchored clock never goes backwards across calls. Host-independent (uses only
@@ -4341,6 +4658,38 @@ mod tests {
         assert_eq!(PAINT_CLASS.to_str(), "android/graphics/Paint");
         assert_eq!(PAINT_NATIVE_CREATE_NAME.to_str(), "native_create");
         assert_eq!(PAINT_NATIVE_CREATE_SIG.to_str(), "()J");
+    }
+
+    #[test]
+    fn image_view_class_is_slashed_internal_name() {
+        // Pin android.widget.ImageView's internal name: ImageView re-declares native_constructor (same
+        // signature as View/TextView, surfaced by the run line 2026-06-05), and ART resolves natives per
+        // declaring class, so register_image_view_natives must find the class by this exact name or
+        // RegisterNatives throws NoClassDefFoundError. The shared constructor name/sig are pinned by
+        // view_native_names_sigs_and_class_match_view_java. Host-independent constant.
+        assert_eq!(IMAGE_VIEW_CLASS.to_str(), "android/widget/ImageView");
+    }
+
+    #[test]
+    fn drawable_native_name_sig_and_class_match_art_reported() {
+        // Pin android.graphics.drawable.Drawable.native_constructor's class, method name, and JNI
+        // descriptor against the exact signature ART reported missing (`No implementation found for long
+        // android.graphics.drawable.Drawable.native_constructor()`, run log 2026-06-05) + AOSP
+        // `Drawable.java`'s `private native long native_constructor();`: a transcription regression
+        // would make RegisterNatives throw NoSuchMethodError when a launcher loads a drawable.
+        // Host-independent constants.
+        assert_eq!(
+            DRAWABLE_CLASS.to_str(),
+            "android/graphics/drawable/Drawable"
+        );
+        assert_eq!(
+            DRAWABLE_NATIVE_CONSTRUCTOR_NAME.to_str(),
+            "native_constructor"
+        );
+        assert_eq!(DRAWABLE_NATIVE_CONSTRUCTOR_SIG.to_str(), "()J");
+        // Java's Drawable.<init> registers mNativePtr for native-allocation cleanup; it must be non-zero
+        // (and is a plainly-non-pointer marker, never dereferenced — see register_drawable_natives docs).
+        assert_ne!(DRAWABLE_HANDLE_SENTINEL, 0);
     }
 
     #[test]
