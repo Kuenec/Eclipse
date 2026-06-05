@@ -36,16 +36,23 @@
 //! This is the one module that uses `unsafe` (the `mmap`/`mprotect`/`munmap` syscalls + the write
 //! through the mapping), each block carrying a `// SAFETY:` justification (AGENTS.md §2.3).
 //!
+//! [`resolve`] — the **symbol-resolution scope**: a [`reloc::SymbolResolver`] backed by an ordered
+//! list of pluggable providers (a [`resolve::LoadedObjectProvider`] over a mapped object's exported
+//! definitions; a [`resolve::HostDlsymProvider`] over the host process via `dlsym(RTLD_DEFAULT)`).
+//! It applies the System V gABI rules (defined-export-only, first-wins with a global overriding a
+//! weak, weak-undef → 0, strong-undef → unresolved). With it, [`map`] applies the
+//! symbol-dependent relocations (`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`) it previously deferred.
+//!
 //! `elf.rs` decodes the file format; `reloc.rs` applies relocations; `map.rs` lays the segments
-//! out and drives the base relocations — a clean three-way boundary (the decoded `reloc::Rela` is
-//! the applier's input type, with no glue).
+//! out and drives both base and (via `resolve.rs`) symbol relocations — a clean boundary (the
+//! decoded `reloc::Rela` is the applier's input type, with no glue).
 //!
 //! ## What this module deliberately does NOT do (the broader loader, built on this core)
-//! This is the **decode + map + base-relocate core**, not a full working loader. It does **not**
-//! allocate the static-TLS block, set up the thread pointer (`%fs`/TCB), resolve real symbols
-//! across libraries (so `JUMP_SLOT`/`GLOB_DAT`/`64` and `TPOFF64` are deferred), execute the
-//! library's `IRELATIVE` ifunc resolvers, run init functions, model the bionic two-namespace
-//! scope, or replace/augment the apkenv linker. Those are the next steps that build on this core
+//! This is the **decode + map + relocate core**, not a full working loader. It does **not**
+//! allocate the static-TLS block, set up the thread pointer (`%fs`/TCB), so `R_X86_64_TPOFF64`
+//! stays deferred; nor does it execute the library's `IRELATIVE` ifunc resolvers, run init
+//! functions, model the bionic two-namespace scope, or replace/augment the apkenv linker. Those
+//! are the next steps that build on this core
 //! (see the submodule docs and AGENTS.md §5 next-actions). Wiring it into the engine-load path
 //! requires that broader loader and is **main-loop / dev-host only** (the cyber-safeguard
 //! false-positives on linker work).
@@ -53,3 +60,4 @@
 pub mod elf;
 pub mod map;
 pub mod reloc;
+pub mod resolve;

@@ -54,6 +54,12 @@ winit = "0.30"                                    # Wayland/X11 window + event l
 # adds ZERO new transitive crates (verified `cargo tree`); more pure-Rust than `libc` (linux_raw backend
 # issues syscalls directly, no C-library link) — aligns with §2.1 pure-Rust + §9 portability + §2.5 no-bloat.
 rustix = { version = "1", default-features = false, features = ["mm", "param"] }
+# 2026-06-05: dlsym(RTLD_DEFAULT) for the bionic-loader's host-symbol provider (src/loader/resolve.rs's
+# HostDlsymProvider, the "satisfy an import from an already-loaded provider" path). `rustix` has NO
+# dlopen/dlsym API (it deliberately omits dynamic linking), so `libc` is the ONLY sound dlsym path; it is
+# ALREADY in the tree (transitively via directories/winit — `cargo tree -i libc`), so this adds ZERO new
+# crates (§2.5 no-bloat). The dlsym FFI is the one unavoidable `unsafe`, confined to resolve.rs (§2.3).
+libc = "0.2"
 # 2026-06-05: Vulkan surface+swapchain+present foundation on the winit window. `loaded` makes ash
 # dlopen the host libvulkan.so at runtime (Entry::load) — detect-don't-assume, no link-time Vulkan
 # dep (§9 portability). `std` gives std::error::Error on vk::Result; `debug` gives the Debug impls.

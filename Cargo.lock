@@ -447,6 +447,7 @@ dependencies = [
  "directories",
  "jni",
  "jni-sys 0.4.1",
+ "libc",
  "libloading 0.9.0",
  "raw-window-handle",
  "rustix 1.1.4",
