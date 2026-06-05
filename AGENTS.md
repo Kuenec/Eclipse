@@ -157,6 +157,19 @@ before any history-rewriting/force operation.
   smallest step = the throwaway TLS-reloc probe) — **main-loop / dev-host only** (cyber-safeguard
   blocks subagents on linker source). Full consolidation + roadmap:
   [`docs/project-state-2026-06-05.md`](docs/project-state-2026-06-05.md).
+  **2026-06-05 UPDATE — the durable Rust-loader's FIRST foundational piece is built + tested:**
+  `src/loader/reloc.rs` is a **pure-Rust x86-64 ELF relocation applier** (the exact modern relocs
+  the apkenv linker lacks). It applies `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`/**`TPOFF64`
+  (type 18)** from `.rela.dyn`/`.rela.plt`, decodes the **`DT_RELR`** compressed-relative bitmap
+  (address + multi-bitmap, advancing the cursor), and documents `BIND_NOW` = the eager `JUMP_SLOT`
+  resolution it already does — over a safe `&mut [u8]` `RelocImage` (`#![forbid(unsafe_code)]`, all
+  writes bounds-checked → typed `RelocError`, never UB). Exhaustive type dispatch: unknown type →
+  `RelocError::UnsupportedType` (the apkenv `unknown reloc type` abort, now a clean error). 16 unit
+  tests over hand-built fixtures (gate now **226 unit + 2 doctests**). This is the **standalone,
+  unit-tested core ONLY** — it does NOT parse ELF, mmap, allocate the static-TLS block / set up
+  `%fs`, resolve real cross-lib symbols, model the bionic two-namespace scope, or touch the apkenv
+  linker (that wiring is main-loop / dev-host only, cyber-safeguard). See §6 (2026-06-05 reloc-core)
+  + §5 next-actions for the loader build that consumes it.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -668,6 +681,25 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel track, and the engine will
   eventually render into THIS window's swapchain via WSI translation. Stay non-GTK; validate via dev-host
   `eclipse run`.
+  ✅ **DONE 2026-06-05: ENGINE-LOAD track — the durable Rust loader's RELOCATION CORE is built + unit-tested**
+  (`src/loader/reloc.rs`; gate-green, subagent, NO linker source read). A pure-Rust x86-64 ELF relocation
+  applier over a safe `&mut [u8]` `RelocImage` (`#![forbid(unsafe_code)]`): applies `R_X86_64_RELATIVE`/
+  `GLOB_DAT`/`JUMP_SLOT`/`64`/**`TPOFF64` (type 18, the apkenv wall)** from `.rela.dyn`/`.rela.plt`, decodes
+  the **`DT_RELR`** compressed-relative bitmap (address + multi-bitmap, cursor-advance), documents `BIND_NOW`
+  = the eager `JUMP_SLOT` resolution it already does; all writes bounds-checked → typed `RelocError` (unknown
+  type → `UnsupportedType`, never UB / never the apkenv `abort`). 16 GPU/VM-free unit tests prove each type +
+  RELR fixtures + OOB/unresolved/unsupported error paths + exhaustive dispatch. Grounded ONLY in the public
+  x86-64 psABI + Eclipse's own `src/` + docs. **This is the standalone reloc CORE only.**
+  🟠 **NEXT (loader build, main-loop / dev-host — consumes `src/loader/reloc.rs`):** build the rest of the
+  Eclipse-owned Rust bionic loader on top of this core, in this order — (1) **ELF parse** (decode the
+  `Elf64_Ehdr`/`Phdr`, `PT_DYNAMIC`, `.dynsym`/`.dynstr`, the `.rela.dyn`/`.rela.plt`/`DT_RELR` tables into the
+  `Rela`/RELR inputs this core takes); (2) **mmap** the `PT_LOAD` segments at a chosen base to form the
+  `RelocImage`; (3) **static-TLS block allocation + thread-pointer (`%fs`/TCB) setup** that assigns the
+  per-module `static_tls_offset` + per-symbol TLS offsets this core's `TPOFF64` path + `SymbolResolver` consume
+  (the host-glibc-TCB-interop step the core deliberately defers — `docs/bionic-loader-strategy.md` §2a); (4)
+  **symbol resolution** (a real `SymbolResolver` over the bionic two-namespace scope + the Rust shim for
+  unresolved bionic symbols); then (5) **wire/augment** vs the apkenv linker (cyber-safeguard: main-loop only).
+  This core is the conformance target for all of the above.
   ✅ **DONE 2026-06-05: FRAMEWORK-BREADTH track — ran TWO more ATL Java/UI demos via the discovery loop;
   bound 3 generalizing benign natives; mapped 2 honest out-of-scope frontiers (NO regression to demo_app).**
   Goal: validate the runtime generalizes beyond demo_app. Picked Java/Kotlin UI demos with classes.dex and
@@ -2475,5 +2507,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   one line where it fits.
 - **Never commit:** Roblox APKs or vendored ART/ATL artifacts (`.gitignore` guards
   `/vendor`, `/build`, `*.apk`).
-- Pushing is authorized; still confirm before any destructive/history-rewriting action
-  (force-push, rebase of shared history, etc.).
+- **Push policy (owner-authorized 2026-06-05):** commit to `main` **and** push to
+  `origin/main` after each green-gate commit. **Never force-push. Never push a red or
+  un-gated tree** (the §4 quality gate must be clean first). Still confirm before any
+  destructive/history-rewriting action (force-push, rebase of shared history, etc.).
