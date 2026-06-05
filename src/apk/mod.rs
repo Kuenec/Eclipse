@@ -2,8 +2,9 @@
 //!
 //! Opens a *local* Roblox Android APK (a zip), reads the binary `AndroidManifest.xml`
 //! (package id, launcher Activity, sdk levels, `largeHeap`), enumerates the native ABIs
-//! present and locates the x86-64 engine (`lib/x86_64/libroblox.so`), and verifies file
-//! integrity with a streaming SHA-256.
+//! present and locates the x86-64 engine (`lib/x86_64/libroblox.so`), extracts the native
+//! libraries to disk (for `System.loadLibrary`), and verifies file integrity with a streaming
+//! SHA-256.
 //!
 //! Network acquisition (fetch from a backend service), APK-signature (v2/v3) verification,
 //! and full ARSC/resource decoding are intentionally **deferred** — see
@@ -181,6 +182,47 @@ impl Apk {
     /// The path this APK was opened from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Extract the native libraries under `lib/<abi>/` to `dest_dir` (flat layout), returning
+    /// the extracted file paths.
+    ///
+    /// Roblox's manifest sets `extractNativeLibs=true`, so the engine's `.so`s must live on the
+    /// filesystem for the translation linker to load them via `java.library.path` on
+    /// `System.loadLibrary` — this is the runtime's prerequisite for reaching `onCreate`.
+    /// Streams each entry to disk (constant memory — `libroblox.so` is ~111 MB) and is
+    /// **idempotent**: an entry whose destination already exists with the same uncompressed size
+    /// is skipped, so repeat boots don't re-extract ~119 MB.
+    pub fn extract_native_libs(
+        &mut self,
+        abi: &str,
+        dest_dir: &Path,
+    ) -> Result<Vec<PathBuf>, ApkError> {
+        let prefix = format!("lib/{abi}/");
+        // Collect matching entry names first (immutable borrow), then extract (mutable borrow).
+        let names: Vec<String> = self
+            .archive
+            .file_names()
+            .filter(|n| n.starts_with(&prefix) && n.ends_with(".so"))
+            .map(str::to_owned)
+            .collect();
+        std::fs::create_dir_all(dest_dir)?;
+        let mut extracted = Vec::with_capacity(names.len());
+        for name in names {
+            // Entries are lib/<abi>/<base>.so (no nested dirs expected); flatten to the basename.
+            let base = name.rsplit('/').next().unwrap_or(name.as_str());
+            let dest = dest_dir.join(base);
+            let mut entry = self.archive.by_name(&name)?;
+            // Idempotent: skip if already extracted with the right (uncompressed) size.
+            if std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(entry.size()) {
+                extracted.push(dest);
+                continue;
+            }
+            let mut out = File::create(&dest)?;
+            io::copy(&mut entry, &mut out)?;
+            extracted.push(dest);
+        }
+        Ok(extracted)
     }
 
     /// Read a named zip entry fully into memory.
@@ -619,6 +661,49 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(engine.size, payload.len() as u64);
         assert!(!engine.stored);
+    }
+
+    #[test]
+    fn extract_native_libs_extracts_matching_abi_only_and_is_idempotent() {
+        let bytes = build_apk(&[
+            ("lib/x86_64/libroblox.so", b"ENGINE-BYTES"),
+            ("lib/x86_64/libother.so", b"OTHER"),
+            ("lib/arm64-v8a/libfoo.so", b"ARM-ONLY"), // wrong ABI: must NOT be extracted
+            ("classes.dex", b"dex"),                  // non-.so: must NOT be extracted
+        ]);
+        let (mut apk, apk_path) = open_apk(&bytes, "extract");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let extracted = apk.extract_native_libs("x86_64", &dir).expect("extract");
+        let mut names: Vec<String> = extracted
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["libother.so", "libroblox.so"]);
+        assert_eq!(
+            std::fs::read(dir.join("libroblox.so")).unwrap(),
+            b"ENGINE-BYTES"
+        );
+        assert!(
+            !dir.join("libfoo.so").exists(),
+            "wrong-ABI lib must not extract"
+        );
+        assert!(
+            !dir.join("classes.dex").exists(),
+            "non-.so must not extract"
+        );
+
+        // Idempotent: a second call returns the same set (skipping already-extracted files).
+        let again = apk.extract_native_libs("x86_64", &dir).expect("re-extract");
+        assert_eq!(again.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&apk_path).ok();
     }
 
     #[test]
