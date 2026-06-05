@@ -130,7 +130,12 @@ before any history-rewriting/force operation.
 
 - **2026-06-05 CAPSTONE (verified at HEAD `16cb2e2`):** the **demo APK** runs the full path
   **boot → lifecycle CREATED → STARTED → RESUMED → faithful Vulkan view+text render**, with
-  **zero VK errors** (`eclipse run …/demo_app.apk`; gate clean: **131 unit + 2 doctests**). The
+  **zero VK errors** (`eclipse run …/demo_app.apk`; gate clean: **131 unit + 2 doctests**).
+  **2026-06-05 UPDATE — a SECOND real app, the `accelerometerdemo` AppCompat APK, now also runs the
+  full boot → CREATED → STARTED → RESUMED → faithful Vulkan render** (views=8 quads=8 glyphs=11, 0 VK
+  errors), after binding an **honest no-sensor `SensorManager.register_accelerometer_listener_native`**
+  (no accelerometer on this Linux desktop → registers no source, delivers no events; §6). Gate now
+  **160 unit + 2 doctests**. The
   real Roblox APK reaches its **own `RobloxApplication.onCreate` + startup tasks**
   (previously-verified, §6). **#1 frontier = ENGINE-LOAD: the bionic-shim relocation wall**
   (`R_X86_64_TPOFF64`/`RELR`/`BIND_NOW`; v1 = HYBRID extend-C-then-Rust;
@@ -2087,6 +2092,45 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   Next: when Path construction/op natives surface, build the real `path_registry` geometry buffer (Vec<PathVerb>) + a
   software 2D rasterizer (tiny-skia) feeding the Vulkan compositor; orthogonally, `SensorManager` sensor bridge for
   accelerometerdemo and `?attr`-in-inline-XML resolution (needs a theme handle threaded into the inline path).
+- **2026-06-05** — 🟢 **HONEST no-sensor `SensorManager` bound — accelerometerdemo reaches RESUMED + renders: Eclipse's
+  SECOND real AppCompat app end-to-end.** Started at the frontier the previous entry left: accelerometerdemo's
+  `MainActivity.initViews` (`MainActivity.kt:23`) called `getSystemService(SENSOR_SERVICE) →
+  getDefaultSensor(ACCELEROMETER) → registerListener`, which ART surfaced as `No implementation found for void
+  android.hardware.SensorManager.register_accelerometer_listener_native(android.hardware.SensorEventListener,
+  android.hardware.Sensor, int)` (run log `/tmp/eclipse-sensor.log`); the `UnsatisfiedLinkError` propagated out of
+  step-5 `Activity.onCreate` and aborted the lifecycle before onStart/onResume. ATL's own `SensorManager.registerListener`
+  Java (NOT stock AOSP `SystemSensorManager.nativeEnableSensor`) calls this **instance** native, descriptor
+  `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V`, returning **void**. **Bound HONESTLY (no fake
+  data):** `register_sensor_manager_natives` registers `android/hardware/SensorManager.register_accelerometer_listener_native`
+  via `RegisterNatives` (same per-class pattern as MessageQueue/SystemClock; registered before the lifecycle drive); the
+  `extern "system"` native validates its args (none dereferenced), logs, and returns — it registers **no event source and
+  delivers no `onSensorChanged` callbacks**, because this Linux desktop has **no accelerometer device**. That is the
+  TRUTHFUL behavior a real Android device gives an app that registers a listener for an absent sensor (vacuous success, no
+  events) — NOT a fabricated sample (forbidden, §Core Principle). No GTK, no registry handle (the native is void — nothing
+  is dereferenced), no event-delivery thread (none exists to start). **FAITHFUL status — accelerometerdemo now reaches
+  RESUMED + renders** (`/tmp/eclipse-sensor2.log`, EXIT=124 = clean 60 s present loop): step 5 `Activity.onCreate` completes
+  (`- onCreate - yay!`), then steps 6–7 drive `- onStart - yay!` → `- onResume - yay!` → `Activity resumed: recipe steps
+  1–7 driven` + `framework lifecycle driven: ActivityResumed ✓`; the winit host window + Vulkan swapchain stand up
+  (`B8G8R8A8_SRGB extent=800x600 images=3`) and (trace `/tmp/eclipse-sensor-trace.log`) the layout pass resolves the real
+  AppCompat decor tree (`FrameLayout → ActionBarOverlayLayout → ContentFrameLayout → ConstraintLayout → AppCompatTextView +
+  Toolbar`) and draws `views=8 quads=8 glyphs=11` per frame — **0 VK_ERROR/panic/abort/draw-failed/validation**. This is
+  **Eclipse's SECOND real AppCompat app driven boot→CREATED→STARTED→RESUMED→faithful Vulkan view+text render**, after
+  demo_app. Remaining surfaced native is `Path.native_reset(long,long)` on the **GC/finalizer thread** (an abandoned Path's
+  `finalize→reset`, NOT a reachable construction native) — ART logs+discards it on the finalizer thread; it does NOT block
+  the main lifecycle and is the same deferred 2D-Path/Skia frontier as before (not chased — Simplicity First). **NO
+  REGRESSION:** demo_app still drives steps 1–7 → ActivityResumed + Vulkan swapchain render, 0 VK_ERROR/panic
+  (`/tmp/eclipse-demo-regress-sensor.log`, EXIT=124 clean). **Regression guard:** the new native's class/method/descriptor
+  are pinned in the new `sensor_manager_native_name_sig_and_class_match_art_reported` test (a name/descriptor drift would
+  make `RegisterNatives` throw `NoSuchMethodError` or re-throw the `UnsatisfiedLinkError` — the test fails the build; no new
+  script). Gate clean: fmt / build --all-targets / clippy `-D warnings` / **test 160 unit + 2 doctests** (+1: the sensor
+  name/sig pin) / release all 0-warning. Files: `src/framework.rs` only (1 native binding + its register helper + call site
+  + 1 pin test). No new deps, no new registry (void native, nothing dereferenced). Cyber-safeguard did NOT trip (the native
+  signature came from the benign ART `No implementation found` line + the general AOSP `SensorManager.registerListener`
+  contract; only targeted `grep -n` + small windows on `src/framework.rs`; NO vendor/atl, NO bionic/linker source, NO web,
+  NO framework.rs wholesale read). Next: the deferred 2D Path/Skia rasterizer (unblocks AppCompat vector drawables —
+  accelerometerdemo's `<vector>`/drawable `Log.ERROR` inflation warnings + AdaptiveIconDemo's `Path.native_create_builder`);
+  orthogonally `?attr`-in-inline-XML resolution. A real host-sensor bridge is the single seam in
+  `sensor_manager_register_accelerometer_listener` if a future host gains a sensor.
 
 ---
 

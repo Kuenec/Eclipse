@@ -3051,6 +3051,110 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's honest (no-sensor) backing for android.hardware.SensorManager ===================
+//
+// 2026-06-05: accelerometerdemo's MainActivity.initViews calls getSystemService(SENSOR_SERVICE) →
+// SensorManager.getDefaultSensor(TYPE_ACCELEROMETER) → registerListener(listener, sensor, rate). ATL's
+// SensorManager Java implements `registerListener` by calling the native
+//   register_accelerometer_listener_native(SensorEventListener listener, Sensor sensor, int rate)
+// — an INSTANCE native returning void (the run's `No implementation found for void
+// android.hardware.SensorManager.register_accelerometer_listener_native(android.hardware.
+// SensorEventListener, android.hardware.Sensor, int)` line + the `registerListener →
+// register_accelerometer_listener_native` stack confirm the name/arity/return). Descriptor:
+// `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V`.
+//
+// This Linux desktop has NO accelerometer device. The TRUTHFUL behavior of `registerListener` against
+// hardware that is not present is that no event source is wired up and the listener's
+// `onSensorChanged` is never invoked — exactly what a real Android device does when an app registers a
+// listener for a sensor it lacks (registration succeeds vacuously; no events ever arrive). This native
+// therefore validates its arguments and returns without registering any source or fabricating any
+// sensor sample (faking accelerometer data is forbidden, AGENTS.md §Core Principle). The app's listener
+// stays dormant and its UI simply shows no readings — its normal no-sensor path. No GTK, no registry
+// handle (nothing later dereferences anything this returns — it is void), and no event-delivery thread
+// is started (none exists to start: there is no sensor). If a future host gains a real sensor source,
+// this is the single seam to wire it to.
+
+/// `android.hardware.SensorManager` (internal/slashed name for `find_class`) — hosts ATL's
+/// accelerometer-listener registration native.
+pub const SENSOR_MANAGER_CLASS: &JNIStr = jni_str!("android/hardware/SensorManager");
+
+// JNI name + descriptor for ATL's SensorManager registration native, exactly as ART reported it
+// missing (run log 2026-06-05, accelerometerdemo): `void register_accelerometer_listener_native(
+// SensorEventListener, Sensor, int)` → an INSTANCE native, descriptor
+// `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V`.
+const SENSOR_MANAGER_REGISTER_NAME: &JNIStr = jni_str!("register_accelerometer_listener_native");
+const SENSOR_MANAGER_REGISTER_SIG: &JNIStr =
+    jni_str!("(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V");
+
+/// `SensorManager.register_accelerometer_listener_native(listener, sensor, rate)` → honest no-op.
+///
+/// JNI ABI: an INSTANCE native returning void, so the parameters are `(EnvUnowned, JObject this,
+/// JObject listener, JObject sensor, jint rate)`. None of the objects are dereferenced. On this
+/// no-accelerometer host the truthful behavior is to register no event source and deliver no
+/// `onSensorChanged` callbacks — the same outcome a real device gives an app that registers a listener
+/// for an absent sensor. No sensor data is fabricated.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve` returns the `()` default on any error/panic. The body is
+/// infallible.
+extern "system" fn sensor_manager_register_accelerometer_listener<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _listener: JObject<'local>,
+    _sensor: JObject<'local>,
+    rate: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::debug!(
+            target: "android.hardware.SensorManager",
+            rate,
+            "SensorManager.register_accelerometer_listener_native: no accelerometer on this host; \
+             registering no source, delivering no events (honest no-sensor)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's honest (no-sensor) backing for `android.hardware.SensorManager`.
+///
+/// Locates `android/hardware/SensorManager` and registers the native via `RegisterNatives` (which wins
+/// over name-based lazy binding — JNI 1.1 spec). Registered before the lifecycle drive alongside the
+/// other framework natives, since an app may register a sensor listener during `Activity.onCreate`
+/// (accelerometerdemo does, in `initViews`).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI signature.
+/// It does, by construction — [`sensor_manager_register_accelerometer_listener`] is written to the
+/// exact `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V` descriptor as an
+/// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic
+/// can cross the JNI boundary (AGENTS.md §2.8).
+fn register_sensor_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(SENSOR_MANAGER_CLASS)?;
+    let methods = [
+        // SAFETY: `sensor_manager_register_accelerometer_listener` matches the paired
+        // `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V` signature as an
+        // instance native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void`
+        // is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                SENSOR_MANAGER_REGISTER_NAME,
+                SENSOR_MANAGER_REGISTER_SIG,
+                sensor_manager_register_accelerometer_listener as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/hardware/SensorManager; `methods` holds a valid fn pointer
+    // whose signature matches the class's `native` declaration (ART-reported `No implementation found`
+    // line, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/hardware/SensorManager",
+        "registered Eclipse's honest no-sensor backing for register_accelerometer_listener_native"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.view.View native peer construction =============
 //
 // 2026-06-05: step 4 (`Activity.createMainActivity`) constructs the launcher Activity, whose
@@ -4851,6 +4955,10 @@ fn drive_lifecycle(
     // builds the main thread's MessageQueue, which calls nativeInit() in its constructor, so this must
     // be bound before step 0. GTK-free; returns a non-zero non-pointer sentinel (no Looper.loop runs).
     register_message_queue_natives(env)?;
+    // Bind android.hardware.SensorManager's accelerometer-listener registration native — an app may
+    // register a sensor listener during Activity.onCreate (accelerometerdemo does, in initViews). Honest
+    // no-sensor backing: registers no source, delivers no events (this Linux desktop has no accelerometer).
+    register_sensor_manager_natives(env)?;
     // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
@@ -5791,6 +5899,29 @@ mod tests {
         // Java's MessageQueue.<init> requires mPtr != 0; the sentinel must be non-zero (and is a
         // plainly-non-pointer marker, never dereferenced — see register_message_queue_natives docs).
         assert_ne!(MESSAGE_QUEUE_HANDLE_SENTINEL, 0);
+    }
+
+    #[test]
+    fn sensor_manager_native_name_sig_and_class_match_art_reported() {
+        // Pin android.hardware.SensorManager.register_accelerometer_listener_native's class, method
+        // name, and JNI descriptor against the exact signature ART reported missing (`No implementation
+        // found for void android.hardware.SensorManager.register_accelerometer_listener_native(
+        // android.hardware.SensorEventListener, android.hardware.Sensor, int)`, run log 2026-06-05): a
+        // transcription regression would make RegisterNatives throw NoSuchMethodError, or the native go
+        // unbound and re-throw the UnsatisfiedLinkError that blocked accelerometerdemo's onCreate.
+        // Host-independent constants.
+        assert_eq!(
+            SENSOR_MANAGER_CLASS.to_str(),
+            "android/hardware/SensorManager"
+        );
+        assert_eq!(
+            SENSOR_MANAGER_REGISTER_NAME.to_str(),
+            "register_accelerometer_listener_native"
+        );
+        assert_eq!(
+            SENSOR_MANAGER_REGISTER_SIG.to_str(),
+            "(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V"
+        );
     }
 
     #[test]
