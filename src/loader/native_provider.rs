@@ -65,6 +65,22 @@
 //!   documented sound sentinels (valid-but-empty handle / negative error per the NDK contract) so
 //!   resolution + early init proceed WITHOUT pretending a frame was presented. Deferred-to-render.
 //!
+//! ## media-ndk (libmediandk, 33) + audio (OpenSL ES, 8) — sound-stubs (added 2026-06-05)
+//! The final two work-list categories. Both are **gameplay-time** subsystems (video playback, sound)
+//! — NOT needed to start/render — so the soundest minimal step is a contract-correct "unavailable"
+//! stub: each native returns its public-ABI failure/unavailable sentinel so a caller cleanly detects
+//! "no media / no audio" and never acts on a fabricated success. NO global state, NO UB.
+//! - **media-ndk (33) — sound-stub: media playback deferred (gameplay-time):** `AMediaCodec_*` /
+//!   `AMediaFormat_*` pointer-returning fns → `NULL`; [`media_status_t`](MEDIA_STATUS)-returning fns
+//!   → `AMEDIA_ERROR_UNSUPPORTED`; the `ssize_t` dequeue fns → that error (negative); `bool` getters
+//!   → `false`; `delete`/setters → safe no-ops; `AMediaFormat_toString` → a stable empty C string.
+//!   The 10 `AMEDIAFORMAT_KEY_*` are real `const char*` data objects holding the documented public
+//!   key strings (minimal-correct data, not a stub).
+//! - **audio (8) — sound-stub: audio deferred (gameplay-time):** `slCreateEngine` →
+//!   `SL_RESULT_FEATURE_UNSUPPORTED` (the public OpenSL ES result a caller checks for "no audio");
+//!   the 7 `SL_IID_*` are real, stable, distinct `SLInterfaceID` data objects (valid non-null
+//!   addresses; never queried because `slCreateEngine` fails first).
+//!
 //! ## What this is NOT (honest scope, dated 2026-06-05)
 //! Registering a correct address makes the relocation land *and* (for the forward/minimal/real
 //! natives) makes a **call** to that symbol behave per its public contract. It does **not** by itself
@@ -288,6 +304,138 @@ impl EclipseNativeProvider {
             "ANativeWindow_release",
             eclipse_anativewindow_release as *const () as u64,
         );
+
+        // ---- media-ndk (libmediandk) — the 33 NDK media natives (sound-stub: gameplay-time) -------
+        // AMediaCodec (14) — sound-stub: pointer fns → NULL, media_status_t → AMEDIA_ERROR_UNSUPPORTED,
+        // ssize_t dequeue → negative AMEDIA_ERROR_UNSUPPORTED, delete → no-op.
+        p.register(
+            "AMediaCodec_configure",
+            eclipse_amediacodec_configure as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_createDecoderByType",
+            eclipse_amediacodec_createdecoderbytype as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_createEncoderByType",
+            eclipse_amediacodec_createencoderbytype as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_delete",
+            eclipse_amediacodec_delete as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_dequeueInputBuffer",
+            eclipse_amediacodec_dequeueinputbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_dequeueOutputBuffer",
+            eclipse_amediacodec_dequeueoutputbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_flush",
+            eclipse_amediacodec_flush as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_getInputBuffer",
+            eclipse_amediacodec_getinputbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_getOutputBuffer",
+            eclipse_amediacodec_getoutputbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_getOutputFormat",
+            eclipse_amediacodec_getoutputformat as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_queueInputBuffer",
+            eclipse_amediacodec_queueinputbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_releaseOutputBuffer",
+            eclipse_amediacodec_releaseoutputbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_start",
+            eclipse_amediacodec_start as *const () as u64,
+        );
+        p.register(
+            "AMediaCodec_stop",
+            eclipse_amediacodec_stop as *const () as u64,
+        );
+        // AMediaFormat (9) — sound-stub: new → NULL, getters → false, setters/delete → no-op,
+        // toString → stable empty string.
+        p.register(
+            "AMediaFormat_delete",
+            eclipse_amediaformat_delete as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_getBuffer",
+            eclipse_amediaformat_getbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_getInt32",
+            eclipse_amediaformat_getint32 as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_new",
+            eclipse_amediaformat_new as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_setBuffer",
+            eclipse_amediaformat_setbuffer as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_setFloat",
+            eclipse_amediaformat_setfloat as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_setInt32",
+            eclipse_amediaformat_setint32 as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_setString",
+            eclipse_amediaformat_setstring as *const () as u64,
+        );
+        p.register(
+            "AMediaFormat_toString",
+            eclipse_amediaformat_tostring as *const () as u64,
+        );
+        // AMEDIAFORMAT_KEY_* (10) — DATA objects: `const char*` holding the documented key string.
+        // These public key constants are real values (minimal-correct data, not a stub) — a caller
+        // that reads/passes them gets the canonical MediaFormat key string.
+        p.register("AMEDIAFORMAT_KEY_BIT_RATE", amediaformat_key_addr(0));
+        p.register("AMEDIAFORMAT_KEY_CHANNEL_COUNT", amediaformat_key_addr(1));
+        p.register("AMEDIAFORMAT_KEY_COLOR_FORMAT", amediaformat_key_addr(2));
+        p.register("AMEDIAFORMAT_KEY_FRAME_RATE", amediaformat_key_addr(3));
+        p.register("AMEDIAFORMAT_KEY_HEIGHT", amediaformat_key_addr(4));
+        p.register(
+            "AMEDIAFORMAT_KEY_I_FRAME_INTERVAL",
+            amediaformat_key_addr(5),
+        );
+        p.register("AMEDIAFORMAT_KEY_MIME", amediaformat_key_addr(6));
+        p.register("AMEDIAFORMAT_KEY_SAMPLE_RATE", amediaformat_key_addr(7));
+        p.register("AMEDIAFORMAT_KEY_STRIDE", amediaformat_key_addr(8));
+        p.register("AMEDIAFORMAT_KEY_WIDTH", amediaformat_key_addr(9));
+
+        // ---- audio (OpenSL ES) — the 8 audio natives (sound-stub: gameplay-time) ----------------
+        // slCreateEngine → SL_RESULT_FEATURE_UNSUPPORTED so the caller cleanly detects "no audio".
+        p.register(
+            "slCreateEngine",
+            eclipse_sl_create_engine as *const () as u64,
+        );
+        // SL_IID_* (7) — DATA objects of type `SLInterfaceID` (a pointer to a 128-bit interface UUID
+        // struct). Each resolves to a stable, valid, distinct Eclipse-owned `SLInterfaceID_` object so
+        // the relocation has a real non-null address; audio being unavailable, no engine ever queries
+        // them (slCreateEngine fails first).
+        p.register("SL_IID_ANDROIDCONFIGURATION", sl_iid_addr(0));
+        p.register("SL_IID_ANDROIDSIMPLEBUFFERQUEUE", sl_iid_addr(1));
+        p.register("SL_IID_BUFFERQUEUE", sl_iid_addr(2));
+        p.register("SL_IID_ENGINE", sl_iid_addr(3));
+        p.register("SL_IID_PLAY", sl_iid_addr(4));
+        p.register("SL_IID_RECORD", sl_iid_addr(5));
+        p.register("SL_IID_VOLUME", sl_iid_addr(6));
 
         p
     }
@@ -1280,6 +1428,449 @@ unsafe extern "C" fn eclipse_anativewindow_acquire(_window: *mut c_void) {}
 /// `window` must be an `ANativeWindow*` from an Eclipse window native (unused; any value accepted).
 unsafe extern "C" fn eclipse_anativewindow_release(_window: *mut c_void) {}
 
+// =================================================================================================
+// media-ndk (libmediandk) — the 33 NDK media natives. SOUND-STUB: media playback deferred
+// (gameplay-time). 2026-06-05.
+//
+// Media (video decode/encode) is a gameplay-time subsystem libroblox does not need to start/render,
+// so each native returns its PUBLIC-ABI failure/unavailable sentinel (per `media/NdkMediaCodec.h`,
+// `media/NdkMediaFormat.h`, `media/NdkMediaError.h`): a caller cleanly detects "no media" and never
+// acts on a fabricated success. NO opaque handle is ever minted (codec/format constructors return
+// NULL), so there is NO global state and the getters/setters/delete are trivial no-ops over a NULL
+// the engine never holds — no UB. If the DT_INIT_ARRAY discovery loop later proves any of these is
+// init-critical (not gameplay-time), it gets a real host-codec bridge then.
+// =================================================================================================
+
+/// `media_status_t` is an `enum` → C `int` (from the public `media/NdkMediaError.h`).
+type MediaStatus = c_int;
+/// `AMEDIA_ERROR_BASE = -10000` (public `media/NdkMediaError.h`).
+const AMEDIA_ERROR_BASE: MediaStatus = -10000;
+/// `AMEDIA_ERROR_UNSUPPORTED = AMEDIA_ERROR_BASE - 9 = -10009` ("the required operation or media
+/// formats are not supported") — the apt sentinel for an unavailable media subsystem (a caller checks
+/// `!= AMEDIA_OK`/`AMEDIA_OK = 0`). 2026-06-05.
+const AMEDIA_ERROR_UNSUPPORTED: MediaStatus = AMEDIA_ERROR_BASE - 9;
+
+// ---- AMediaCodec (14) ---------------------------------------------------------------------------
+
+/// `media_status_t AMediaCodec_configure(AMediaCodec*, const AMediaFormat*, ANativeWindow*,
+/// AMediaCrypto*, uint32_t flags)`. **sound-stub:** no codec exists (constructors return NULL), so
+/// configure reports the media subsystem is unsupported.
+///
+/// # Safety
+/// The pointer args are accepted but never dereferenced (the codec is always NULL here).
+unsafe extern "C" fn eclipse_amediacodec_configure(
+    _codec: *mut c_void,
+    _format: *const c_void,
+    _surface: *mut c_void,
+    _crypto: *mut c_void,
+    _flags: u32,
+) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+/// `AMediaCodec* AMediaCodec_createDecoderByType(const char* mime_type)`. **sound-stub:** no host
+/// codec bridge yet → NULL (the documented failure: "NULL if the codec cannot be created"). A caller
+/// checks for NULL before using the codec.
+///
+/// # Safety
+/// `mime_type` is the C-string arg; it is not dereferenced (always returns NULL).
+unsafe extern "C" fn eclipse_amediacodec_createdecoderbytype(
+    _mime_type: *const c_char,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `AMediaCodec* AMediaCodec_createEncoderByType(const char* mime_type)`. **sound-stub:** NULL.
+///
+/// # Safety
+/// `mime_type` is the C-string arg; it is not dereferenced (always returns NULL).
+unsafe extern "C" fn eclipse_amediacodec_createencoderbytype(
+    _mime_type: *const c_char,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `media_status_t AMediaCodec_delete(AMediaCodec*)`. **sound-stub:** no codec was ever minted, so
+/// deleting a NULL is a no-op → `AMEDIA_OK`-equivalent is wrong here (we never owned it); the public
+/// contract returns a status, and reporting unsupported is consistent with "this subsystem is off".
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced (always NULL here).
+unsafe extern "C" fn eclipse_amediacodec_delete(_codec: *mut c_void) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+/// `ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec*, int64_t timeoutUs)`. **sound-stub:** the
+/// public contract returns a buffer index ≥ 0 on success or a negative `AMEDIA_ERROR_*` on failure;
+/// no codec → the unsupported error (negative). A caller checks `< 0`.
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediacodec_dequeueinputbuffer(
+    _codec: *mut c_void,
+    _timeout_us: i64,
+) -> isize {
+    AMEDIA_ERROR_UNSUPPORTED as isize
+}
+
+/// `ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec*, AMediaCodecBufferInfo*, int64_t timeoutUs)`.
+/// **sound-stub:** negative unsupported error (no codec). A caller checks `< 0`.
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediacodec_dequeueoutputbuffer(
+    _codec: *mut c_void,
+    _info: *mut c_void,
+    _timeout_us: i64,
+) -> isize {
+    AMEDIA_ERROR_UNSUPPORTED as isize
+}
+
+/// `media_status_t AMediaCodec_flush(AMediaCodec*)`. **sound-stub:** unsupported (no codec).
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediacodec_flush(_codec: *mut c_void) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+/// `uint8_t* AMediaCodec_getInputBuffer(AMediaCodec*, size_t idx, size_t* out_size)`. **sound-stub:**
+/// NULL (no codec → no buffer; the documented failure). The `out_size` out-param is left untouched;
+/// callers that get NULL must not read it.
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced (always returns NULL).
+unsafe extern "C" fn eclipse_amediacodec_getinputbuffer(
+    _codec: *mut c_void,
+    _idx: usize,
+    _out_size: *mut usize,
+) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+/// `uint8_t* AMediaCodec_getOutputBuffer(AMediaCodec*, size_t idx, size_t* out_size)`. **sound-stub:**
+/// NULL (no codec).
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced (always returns NULL).
+unsafe extern "C" fn eclipse_amediacodec_getoutputbuffer(
+    _codec: *mut c_void,
+    _idx: usize,
+    _out_size: *mut usize,
+) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+/// `AMediaFormat* AMediaCodec_getOutputFormat(AMediaCodec*)`. **sound-stub:** NULL (no codec → no
+/// format).
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced (always returns NULL).
+unsafe extern "C" fn eclipse_amediacodec_getoutputformat(_codec: *mut c_void) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `media_status_t AMediaCodec_queueInputBuffer(AMediaCodec*, size_t idx, off_t offset, size_t size,
+/// uint64_t time, uint32_t flags)`. **sound-stub:** unsupported (no codec).
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediacodec_queueinputbuffer(
+    _codec: *mut c_void,
+    _idx: usize,
+    _offset: libc::off_t,
+    _size: usize,
+    _time: u64,
+    _flags: u32,
+) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+/// `media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec*, size_t idx, bool render)`.
+/// **sound-stub:** unsupported (no codec).
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediacodec_releaseoutputbuffer(
+    _codec: *mut c_void,
+    _idx: usize,
+    _render: bool,
+) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+/// `media_status_t AMediaCodec_start(AMediaCodec*)`. **sound-stub:** unsupported (no codec).
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediacodec_start(_codec: *mut c_void) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+/// `media_status_t AMediaCodec_stop(AMediaCodec*)`. **sound-stub:** unsupported (no codec).
+///
+/// # Safety
+/// `codec` is accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediacodec_stop(_codec: *mut c_void) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+// ---- AMediaFormat (9) ---------------------------------------------------------------------------
+
+/// `AMediaFormat* AMediaFormat_new(void)`. **sound-stub:** the media subsystem is deferred, so no
+/// format object is minted → NULL. A caller checks for NULL before using the format (and the codec
+/// path that would consume a format is itself unavailable).
+extern "C" fn eclipse_amediaformat_new() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `media_status_t AMediaFormat_delete(AMediaFormat*)`. **sound-stub:** no format was minted → no-op
+/// over a NULL; reports unsupported for consistency with the off subsystem.
+///
+/// # Safety
+/// `format` is accepted but never dereferenced (always NULL here).
+unsafe extern "C" fn eclipse_amediaformat_delete(_format: *mut c_void) -> MediaStatus {
+    AMEDIA_ERROR_UNSUPPORTED
+}
+
+/// `bool AMediaFormat_getInt32(AMediaFormat*, const char* name, int32_t* out)`. **sound-stub:** the
+/// public contract returns `false` if the key is absent / cannot be read; with no format that is
+/// always the case. The `out` param is left untouched (the caller must not read it on `false`).
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced (always returns false).
+unsafe extern "C" fn eclipse_amediaformat_getint32(
+    _format: *mut c_void,
+    _name: *const c_char,
+    _out: *mut i32,
+) -> bool {
+    false
+}
+
+/// `bool AMediaFormat_getBuffer(AMediaFormat*, const char* name, void** data, size_t* size)`.
+/// **sound-stub:** `false` (no format → no buffer). Out-params untouched.
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced (always returns false).
+unsafe extern "C" fn eclipse_amediaformat_getbuffer(
+    _format: *mut c_void,
+    _name: *const c_char,
+    _data: *mut *mut c_void,
+    _size: *mut usize,
+) -> bool {
+    false
+}
+
+/// `void AMediaFormat_setInt32(AMediaFormat*, const char* name, int32_t value)`. **sound-stub:** no
+/// format to mutate → no-op (the function is `void`; no caller depends on a result).
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediaformat_setint32(
+    _format: *mut c_void,
+    _name: *const c_char,
+    _value: i32,
+) {
+}
+
+/// `void AMediaFormat_setFloat(AMediaFormat*, const char* name, float value)`. **sound-stub:** no-op.
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediaformat_setfloat(
+    _format: *mut c_void,
+    _name: *const c_char,
+    _value: f32,
+) {
+}
+
+/// `void AMediaFormat_setString(AMediaFormat*, const char* name, const char* value)`. **sound-stub:**
+/// no-op.
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediaformat_setstring(
+    _format: *mut c_void,
+    _name: *const c_char,
+    _value: *const c_char,
+) {
+}
+
+/// `void AMediaFormat_setBuffer(AMediaFormat*, const char* name, const void* data, size_t size)`.
+/// **sound-stub:** no-op.
+///
+/// # Safety
+/// the pointer args are accepted but never dereferenced.
+unsafe extern "C" fn eclipse_amediaformat_setbuffer(
+    _format: *mut c_void,
+    _name: *const c_char,
+    _data: *const c_void,
+    _size: usize,
+) {
+}
+
+/// A stable, process-global empty NUL-terminated C string for [`eclipse_amediaformat_tostring`].
+static EMPTY_CSTR: [u8; 1] = [0];
+
+/// `const char* AMediaFormat_toString(AMediaFormat*)`. **sound-stub:** the public contract returns a
+/// human-readable string owned by the format. With no format, returning a stable empty C string
+/// (`""`) is the soundest answer — never NULL (so a naive `printf("%s")` cannot crash) and clearly
+/// empty (so a caller learns nothing was set). NOT a fake non-empty description.
+///
+/// # Safety
+/// `format` is accepted but never dereferenced; the returned pointer is a process-lifetime static.
+unsafe extern "C" fn eclipse_amediaformat_tostring(_format: *mut c_void) -> *const c_char {
+    EMPTY_CSTR.as_ptr() as *const c_char
+}
+
+// ---- AMEDIAFORMAT_KEY_* (10) — `const char*` DATA objects holding the public key strings ---------
+//
+// 2026-06-05: each `AMEDIAFORMAT_KEY_*` is declared `extern const char*` (public
+// `media/NdkMediaFormat.h`) — a DATA symbol whose VALUE is a pointer to the canonical MediaFormat key
+// string (the same strings as the Java `android.media.MediaFormat.KEY_*`). A relocation reads the
+// symbol's value (the `char*`), so Eclipse provides, per key, a `*const c_char` static initialized to
+// point at a static NUL-terminated key string; the registered address is that pointer object's
+// address (the data symbol). These are REAL public constants (minimal-correct data, not a stub).
+
+/// The 10 canonical MediaFormat key strings, in the registration index order used by
+/// [`amediaformat_key_addr`]. NUL-terminated for C consumption.
+static AMEDIAFORMAT_KEY_STRINGS: [&[u8]; 10] = [
+    b"bitrate\0",          // 0: BIT_RATE
+    b"channel-count\0",    // 1: CHANNEL_COUNT
+    b"color-format\0",     // 2: COLOR_FORMAT
+    b"frame-rate\0",       // 3: FRAME_RATE
+    b"height\0",           // 4: HEIGHT
+    b"i-frame-interval\0", // 5: I_FRAME_INTERVAL
+    b"mime\0",             // 6: MIME
+    b"sample-rate\0",      // 7: SAMPLE_RATE
+    b"stride\0",           // 8: STRIDE
+    b"width\0",            // 9: WIDTH
+];
+
+/// The 10 `const char*` DATA objects: each holds a pointer to the matching key string. This is the
+/// actual storage the `AMEDIAFORMAT_KEY_*` data symbols resolve to (the symbol's value == this
+/// pointer). Initialized once by [`amediaformat_key_addr`].
+struct KeyPtrTable([*const c_char; 10]);
+// SAFETY: 2026-06-05 — the table holds pointers into `AMEDIAFORMAT_KEY_STRINGS`, a process-lifetime
+// `static` whose bytes never move and are never mutated. Sharing these read-only pointers across
+// threads is sound.
+unsafe impl Sync for KeyPtrTable {}
+// SAFETY: see the `Sync` note — process-lifetime, read-only static string pointers.
+unsafe impl Send for KeyPtrTable {}
+
+static AMEDIAFORMAT_KEY_PTRS: OnceLock<KeyPtrTable> = OnceLock::new();
+
+/// Initialize (once) the `const char*` key-pointer table and return the address of entry `idx` — the
+/// `AMEDIAFORMAT_KEY_*` data symbol (a `const char**`-shaped data object whose value is the key
+/// string pointer). `idx` is the registration index into [`AMEDIAFORMAT_KEY_STRINGS`].
+fn amediaformat_key_addr(idx: usize) -> u64 {
+    let t = AMEDIAFORMAT_KEY_PTRS.get_or_init(|| {
+        let mut ptrs = [std::ptr::null::<c_char>(); 10];
+        for (slot, s) in ptrs.iter_mut().zip(AMEDIAFORMAT_KEY_STRINGS.iter()) {
+            *slot = s.as_ptr() as *const c_char;
+        }
+        KeyPtrTable(ptrs)
+    });
+    std::ptr::addr_of!(t.0[idx]) as u64
+}
+
+// =================================================================================================
+// audio (OpenSL ES) — the 8 audio natives. SOUND-STUB: audio deferred (gameplay-time). 2026-06-05.
+//
+// Sound is a gameplay-time subsystem libroblox does not need to start/render. Per the PUBLIC OpenSL
+// ES 1.0.1 C-ABI (`SLES/OpenSLES.h`): `slCreateEngine` returns `SL_RESULT_FEATURE_UNSUPPORTED`
+// (0x0000000C = 12) — the documented result a caller checks to detect "no audio" cleanly. The 7
+// `SL_IID_*` are DATA objects of type `SLInterfaceID` (a pointer to a 128-bit interface-UUID struct);
+// each resolves to a stable, valid, distinct Eclipse-owned `SLInterfaceID_` so the relocation has a
+// real non-null address. Audio being unavailable, no engine is ever created to query them.
+// =================================================================================================
+
+/// `SLresult` is `SLuint32` → C `u32`. `SL_RESULT_FEATURE_UNSUPPORTED = 0x0000000C` from the public
+/// OpenSL ES 1.0.1 header — "the requested feature is not supported", the clean "no audio" sentinel.
+const SL_RESULT_FEATURE_UNSUPPORTED: u32 = 0x0000_000C;
+
+/// `SLresult slCreateEngine(SLObjectItf* pEngine, SLuint32 numOptions,
+/// const SLEngineOption* pEngineOptions, SLuint32 numInterfaces, const SLInterfaceID* pInterfaceIDs,
+/// const SLboolean* pInterfaceRequired)`. **sound-stub:** audio is deferred, so the engine cannot be
+/// created → `SL_RESULT_FEATURE_UNSUPPORTED`. Per the OpenSL ES contract a non-success result means no
+/// object was produced, so `*pEngine` is left untouched and the caller must not use it. NOT a fake
+/// engine the caller would `Realize`/`GetInterface` and then crash on.
+///
+/// # Safety
+/// the pointer args are the OpenSL ES C-ABI params; none is dereferenced (the call fails before
+/// producing an object), so any value (incl. null) is accepted safely.
+unsafe extern "C" fn eclipse_sl_create_engine(
+    _p_engine: *mut c_void,
+    _num_options: u32,
+    _p_engine_options: *const c_void,
+    _num_interfaces: u32,
+    _p_interface_ids: *const c_void,
+    _p_interface_required: *const c_void,
+) -> u32 {
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+/// The public `SLInterfaceID_` struct layout (a 128-bit interface UUID), from `SLES/OpenSLES.h`:
+/// `{ SLuint32 time_low; SLuint16 time_mid; SLuint16 time_hi_and_version; SLuint16 clock_seq;
+/// SLuint8 node[6]; }`. `SLInterfaceID` is a pointer to a `const` one of these. Eclipse provides a
+/// stable, distinct instance per `SL_IID_*` so the data symbols resolve to valid non-null addresses.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SlInterfaceId {
+    time_low: u32,
+    time_mid: u16,
+    time_hi_and_version: u16,
+    clock_seq: u16,
+    node: [u8; 6],
+}
+
+/// The 7 Eclipse-owned `SLInterfaceID_` backing structs. Distinct `time_low` values (the registration
+/// index) keep them distinguishable; the exact UUID bytes are irrelevant because audio is unavailable
+/// (no engine is ever created to query an interface). Process-lifetime → stable struct addresses.
+struct SlIidStructs([SlInterfaceId; 7]);
+// SAFETY: 2026-06-05 — process-lifetime `static` (via `OnceLock`); never mutated after init. Sharing
+// read-only references/pointers across threads is sound.
+unsafe impl Sync for SlIidStructs {}
+// SAFETY: see the `Sync` note — process-lifetime, read-only.
+unsafe impl Send for SlIidStructs {}
+
+/// The 7 `SLInterfaceID` DATA objects (each a pointer to the matching backing struct) — these are the
+/// symbol *values* the relocations read. A SEPARATE `OnceLock` so the pointers are computed from the
+/// backing structs' FINAL stable addresses (after they live in [`SL_IID_STRUCTS`]), never from a
+/// moved-from local.
+struct SlIidPtrs([*const SlInterfaceId; 7]);
+// SAFETY: 2026-06-05 — the pointers reference [`SL_IID_STRUCTS`], a process-lifetime static whose
+// structs never move. Sharing these read-only pointers across threads is sound.
+unsafe impl Sync for SlIidPtrs {}
+// SAFETY: see the `Sync` note — process-lifetime, read-only.
+unsafe impl Send for SlIidPtrs {}
+
+static SL_IID_STRUCTS: OnceLock<SlIidStructs> = OnceLock::new();
+static SL_IID_PTRS: OnceLock<SlIidPtrs> = OnceLock::new();
+
+/// Initialize (once) the `SL_IID_*` storage and return the address of the `SLInterfaceID` data object
+/// at index `idx` — a data symbol whose value is a pointer to the backing `SLInterfaceID_` struct.
+fn sl_iid_addr(idx: usize) -> u64 {
+    // Phase 1: place the backing structs in their final (stable) static location.
+    let structs = SL_IID_STRUCTS.get_or_init(|| {
+        let mut ids = [SlInterfaceId {
+            time_low: 0,
+            time_mid: 0,
+            time_hi_and_version: 0,
+            clock_seq: 0,
+            node: [0; 6],
+        }; 7];
+        for (i, id) in ids.iter_mut().enumerate() {
+            id.time_low = i as u32; // distinct per IID (the exact UUID is irrelevant — audio is off)
+        }
+        SlIidStructs(ids)
+    });
+    // Phase 2: capture pointers to those FINAL stable struct addresses (never a moved-from local).
+    let ptrs = SL_IID_PTRS
+        .get_or_init(|| SlIidPtrs(std::array::from_fn(|i| std::ptr::addr_of!(structs.0[i]))));
+    std::ptr::addr_of!(ptrs.0[idx]) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,11 +1904,11 @@ mod tests {
     #[test]
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
-        // 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android = 45 registered natives.
+        // 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio = 86.
         assert_eq!(
             p.len(),
-            45,
-            "3 liblog + 15 bionic-libc + 27 ndk-android natives registered"
+            86,
+            "3 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio natives registered"
         );
         for name in [
             // liblog (3 fixed-arity)
@@ -1368,6 +1959,49 @@ mod tests {
             "ANativeWindow_getHeight",
             "ANativeWindow_acquire",
             "ANativeWindow_release",
+            // media-ndk (33)
+            "AMediaCodec_configure",
+            "AMediaCodec_createDecoderByType",
+            "AMediaCodec_createEncoderByType",
+            "AMediaCodec_delete",
+            "AMediaCodec_dequeueInputBuffer",
+            "AMediaCodec_dequeueOutputBuffer",
+            "AMediaCodec_flush",
+            "AMediaCodec_getInputBuffer",
+            "AMediaCodec_getOutputBuffer",
+            "AMediaCodec_getOutputFormat",
+            "AMediaCodec_queueInputBuffer",
+            "AMediaCodec_releaseOutputBuffer",
+            "AMediaCodec_start",
+            "AMediaCodec_stop",
+            "AMediaFormat_delete",
+            "AMediaFormat_getBuffer",
+            "AMediaFormat_getInt32",
+            "AMediaFormat_new",
+            "AMediaFormat_setBuffer",
+            "AMediaFormat_setFloat",
+            "AMediaFormat_setInt32",
+            "AMediaFormat_setString",
+            "AMediaFormat_toString",
+            "AMEDIAFORMAT_KEY_BIT_RATE",
+            "AMEDIAFORMAT_KEY_CHANNEL_COUNT",
+            "AMEDIAFORMAT_KEY_COLOR_FORMAT",
+            "AMEDIAFORMAT_KEY_FRAME_RATE",
+            "AMEDIAFORMAT_KEY_HEIGHT",
+            "AMEDIAFORMAT_KEY_I_FRAME_INTERVAL",
+            "AMEDIAFORMAT_KEY_MIME",
+            "AMEDIAFORMAT_KEY_SAMPLE_RATE",
+            "AMEDIAFORMAT_KEY_STRIDE",
+            "AMEDIAFORMAT_KEY_WIDTH",
+            // audio (8)
+            "slCreateEngine",
+            "SL_IID_ANDROIDCONFIGURATION",
+            "SL_IID_ANDROIDSIMPLEBUFFERQUEUE",
+            "SL_IID_BUFFERQUEUE",
+            "SL_IID_ENGINE",
+            "SL_IID_PLAY",
+            "SL_IID_RECORD",
+            "SL_IID_VOLUME",
         ] {
             assert!(p.resolve(name).is_some(), "{name} must be registered");
         }
@@ -1744,5 +2378,178 @@ mod tests {
         ndk_registry::native_windows()
             .remove(ptr_to_handle(win))
             .ok();
+    }
+
+    // ---- media-ndk: sound-stub sentinels --------------------------------------------------------
+
+    #[test]
+    fn media_ndk_natives_return_unavailable_sentinels() {
+        // Pointer-returning codec/format constructors → NULL (the documented failure).
+        // SAFETY: the C-string mime arg is not dereferenced by the stub; null is accepted.
+        assert!(unsafe { eclipse_amediacodec_createdecoderbytype(std::ptr::null()) }.is_null());
+        // SAFETY: see above.
+        assert!(unsafe { eclipse_amediacodec_createencoderbytype(std::ptr::null()) }.is_null());
+        assert!(eclipse_amediaformat_new().is_null());
+        // SAFETY: codec arg is NULL (never dereferenced); getOutputFormat → NULL.
+        assert!(unsafe { eclipse_amediacodec_getoutputformat(std::ptr::null_mut()) }.is_null());
+
+        // media_status_t-returning fns → AMEDIA_ERROR_UNSUPPORTED (a caller checks != AMEDIA_OK).
+        // SAFETY: codec arg is NULL (never dereferenced) for each status-returning stub.
+        unsafe {
+            assert_eq!(
+                eclipse_amediacodec_start(std::ptr::null_mut()),
+                AMEDIA_ERROR_UNSUPPORTED
+            );
+            assert_eq!(
+                eclipse_amediacodec_stop(std::ptr::null_mut()),
+                AMEDIA_ERROR_UNSUPPORTED
+            );
+            assert_eq!(
+                eclipse_amediacodec_flush(std::ptr::null_mut()),
+                AMEDIA_ERROR_UNSUPPORTED
+            );
+            assert_eq!(
+                eclipse_amediacodec_configure(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                AMEDIA_ERROR_UNSUPPORTED
+            );
+        }
+        // The documented numeric value of AMEDIA_ERROR_UNSUPPORTED (NdkMediaError.h: BASE-9).
+        assert_eq!(AMEDIA_ERROR_UNSUPPORTED, -10009);
+
+        // ssize_t dequeue fns → negative error (a caller checks < 0).
+        // SAFETY: codec/info args are NULL (never dereferenced).
+        unsafe {
+            assert!(eclipse_amediacodec_dequeueinputbuffer(std::ptr::null_mut(), 0) < 0);
+            assert!(
+                eclipse_amediacodec_dequeueoutputbuffer(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0
+                ) < 0
+            );
+        }
+
+        // bool getters → false (key absent / no format). Out-params untouched.
+        // SAFETY: format/name/out args are NULL (never dereferenced when returning false).
+        unsafe {
+            assert!(!eclipse_amediaformat_getint32(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ));
+            assert!(!eclipse_amediaformat_getbuffer(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ));
+        }
+
+        // toString → a stable, non-null, EMPTY C string (never NULL → no printf crash).
+        // SAFETY: format arg is NULL (never dereferenced); the return is a process-lifetime static.
+        let s = unsafe { eclipse_amediaformat_tostring(std::ptr::null_mut()) };
+        assert!(!s.is_null(), "toString must never return NULL");
+        // SAFETY: `s` points at the static EMPTY_CSTR (a single NUL byte).
+        assert_eq!(unsafe { *s }, 0, "toString returns an empty string");
+    }
+
+    #[test]
+    fn amediaformat_key_data_objects_hold_the_public_key_strings() {
+        // Each AMEDIAFORMAT_KEY_* data symbol's VALUE is a `const char*` to the canonical key string.
+        // The registered address is a `*const c_char` (the data object); read it and check the string.
+        let cases = [
+            ("AMEDIAFORMAT_KEY_MIME", "mime"),
+            ("AMEDIAFORMAT_KEY_WIDTH", "width"),
+            ("AMEDIAFORMAT_KEY_HEIGHT", "height"),
+            ("AMEDIAFORMAT_KEY_BIT_RATE", "bitrate"),
+            ("AMEDIAFORMAT_KEY_SAMPLE_RATE", "sample-rate"),
+            ("AMEDIAFORMAT_KEY_I_FRAME_INTERVAL", "i-frame-interval"),
+        ];
+        let p = EclipseNativeProvider::with_bionic_natives();
+        for (name, want) in cases {
+            let addr = p.resolve(name).expect("key registered").addr;
+            assert!(addr != 0, "{name} data symbol must be non-null");
+            // SAFETY: the data symbol stores a `*const c_char`; read it and the string it points to.
+            let strp = unsafe { *(addr as *const *const c_char) };
+            assert!(!strp.is_null(), "{name} value (the char*) must be non-null");
+            // SAFETY: `strp` is a valid NUL-terminated static key string.
+            let got = unsafe { std::ffi::CStr::from_ptr(strp) };
+            assert_eq!(got.to_str().unwrap(), want, "{name} == \"{want}\"");
+        }
+    }
+
+    // ---- audio: sound-stub sentinels ------------------------------------------------------------
+
+    #[test]
+    fn sl_create_engine_reports_feature_unsupported() {
+        // slCreateEngine → SL_RESULT_FEATURE_UNSUPPORTED (0x0C); the caller cleanly detects "no audio"
+        // and must NOT use *pEngine (left untouched). NOT a fake engine.
+        let mut engine: *mut c_void = 0xDEAD as *mut c_void; // poison; must stay untouched
+                                                             // SAFETY: the OpenSL ES params are not dereferenced (the call fails before producing an object).
+        let r = unsafe {
+            eclipse_sl_create_engine(
+                std::ptr::addr_of_mut!(engine).cast(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(r, SL_RESULT_FEATURE_UNSUPPORTED);
+        assert_eq!(
+            r, 0x0000_000C,
+            "OpenSL ES public value of FEATURE_UNSUPPORTED"
+        );
+        assert_eq!(
+            engine, 0xDEAD as *mut c_void,
+            "a failed slCreateEngine must not write *pEngine"
+        );
+    }
+
+    #[test]
+    fn sl_iid_data_objects_are_stable_distinct_nonnull_pointers() {
+        // Each SL_IID_* data symbol's VALUE is an `SLInterfaceID` (a pointer to a 128-bit struct).
+        let names = [
+            "SL_IID_ANDROIDCONFIGURATION",
+            "SL_IID_ANDROIDSIMPLEBUFFERQUEUE",
+            "SL_IID_BUFFERQUEUE",
+            "SL_IID_ENGINE",
+            "SL_IID_PLAY",
+            "SL_IID_RECORD",
+            "SL_IID_VOLUME",
+        ];
+        let p = EclipseNativeProvider::with_bionic_natives();
+        let mut iface_ptrs = std::collections::BTreeSet::new();
+        for name in names {
+            let addr = p.resolve(name).expect("iid registered").addr;
+            assert!(addr != 0, "{name} data symbol must be non-null");
+            // SAFETY: the data symbol stores an `SLInterfaceID` (a *const SlInterfaceId); read it.
+            let iid = unsafe { *(addr as *const *const SlInterfaceId) };
+            assert!(
+                !iid.is_null(),
+                "{name} interface-id pointer must be non-null"
+            );
+            // Distinct backing struct per IID.
+            assert!(
+                iface_ptrs.insert(iid as usize),
+                "{name} must be a distinct IID"
+            );
+        }
+        // Stability: a second resolve returns the same data-symbol address (process-lifetime static).
+        assert_eq!(
+            p.resolve("SL_IID_ENGINE").unwrap().addr,
+            EclipseNativeProvider::with_bionic_natives()
+                .resolve("SL_IID_ENGINE")
+                .unwrap()
+                .addr,
+            "SL_IID_ENGINE address is stable across providers"
+        );
     }
 }
