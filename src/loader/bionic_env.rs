@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 
 use super::elf::DynSym;
+use super::native_provider::EclipseNativeProvider;
 use super::reloc::{self, Rela};
 use super::resolve::{HostDlsymProvider, ResolvedSym, Scope, SymbolProvider};
 
@@ -452,38 +453,52 @@ pub fn categorize_imports(relas: &[Rela], dynsyms: &[DynSym], scope: &Scope) -> 
 
 /// A configurable, ordered bionic-environment resolution [`Scope`] for `libroblox.so`.
 ///
-/// 2026-06-05 — the **first** bionic-env cut. The provider order is:
-/// 1. **(future)** Eclipse-owned bionic-native providers — *not yet present*; the scope is built so
-///    they can be **prepended** before the host tier (displacing glibc for the bionic-libc surface).
+/// 2026-06-05 — the provider order (System V gABI first-match) is:
+/// 1. **Eclipse-owned bionic natives** — an [`EclipseNativeProvider`] PREPENDED before the host
+///    tier, so Eclipse's bionic-ABI-correct implementations win over the host-glibc baseline for the
+///    names it registers (liblog 3 fixed-arity + bionic-libc 15 in this cut). Present when built with
+///    [`BionicEnv::with_host_baseline`]'s `eclipse_natives = true`.
 /// 2. **Host GL** — if the host has `libEGL.so`/`libGLESv2.so`, a [`DlopenLibProvider`] over each
 ///    (the engine renders via EGL/GLES2). If absent, skipped and recorded in [`Self::missing_gl`].
 /// 3. **Host libc/m/dl/pthread** — a single [`HostDlsymProvider`] (`dlsym(RTLD_DEFAULT)`) over the
 ///    host process (glibc/libm/libdl/libpthread are all in the default search order). This is the
 ///    BASELINE tier (see the module-level honest caveat).
 ///
-/// The host tiers prove the relocation pipeline; they are **not** bionic-ABI-correct. Build with
-/// [`BionicEnv::with_host_baseline`] (the current first cut) and read [`BionicEnv::into_scope`].
+/// The host tiers prove the relocation pipeline and are **not** bionic-ABI-correct; the prepended
+/// Eclipse tier (1) is where bionic-correct natives displace the glibc baseline. Build with
+/// [`BionicEnv::with_host_baseline`] and read [`BionicEnv::into_scope`].
 pub struct BionicEnv {
     scope: Scope,
     /// Host GL sonames that could NOT be `dlopen`ed (recorded so EGL/GLES are reported unresolved).
     missing_gl: Vec<String>,
     /// Whether the host libc/m/dl/pthread tier (`HostDlsymProvider`) is present.
     host_libc_present: bool,
+    /// Whether the prepended Eclipse-owned bionic-native tier (`EclipseNativeProvider`) is present.
+    eclipse_natives_present: bool,
 }
 
 impl BionicEnv {
-    /// Build the **host-baseline** bionic-env scope (the first cut): host GL (if present) then the
-    /// host libc/m/dl/pthread `dlsym(RTLD_DEFAULT)` tier. Eclipse-owned bionic-native providers are
-    /// not present yet; the scope is structured so they can later be prepended.
+    /// Build the bionic-env scope: optionally an [`EclipseNativeProvider`] PREPENDED first (Eclipse's
+    /// bionic-correct natives win), then host GL (if present), then the host libc/m/dl/pthread
+    /// `dlsym(RTLD_DEFAULT)` baseline tier.
     ///
     /// `try_host_gl` controls whether to `dlopen` the host `libEGL.so`/`libGLESv2.so` (set false to
     /// model a GL-less host, e.g. a headless CI box, in which case EGL/GLES report unresolved).
-    pub fn with_host_baseline(try_host_gl: bool) -> Self {
+    /// `eclipse_natives` controls whether to prepend the Eclipse-owned bionic natives (liblog 3
+    /// fixed-arity + bionic-libc 15) before the host tier — when true, those names resolve to Eclipse
+    /// addresses, NOT host glibc.
+    pub fn with_host_baseline(try_host_gl: bool, eclipse_natives: bool) -> Self {
         let mut scope = Scope::new();
         let mut missing_gl = Vec::new();
 
-        // 1) Host GL providers (EGL/GLES2 → host GL forwarding), first so a `gl*`/`egl*` symbol
-        //    resolves from the GL libs rather than (accidentally) the host process default scope.
+        // 0) Eclipse-owned bionic natives FIRST (prepended) so they win over the host baseline for
+        //    the names they register (gABI first-match). This is the bionic-ABI-correct tier.
+        if eclipse_natives {
+            scope.push(Box::new(EclipseNativeProvider::with_bionic_natives()));
+        }
+
+        // 1) Host GL providers (EGL/GLES2 → host GL forwarding), first among the HOST tiers so a
+        //    `gl*`/`egl*` symbol resolves from the GL libs rather than the host process default scope.
         if try_host_gl {
             for soname in ["libEGL.so", "libGLESv2.so"] {
                 match DlopenLibProvider::open(soname) {
@@ -505,6 +520,7 @@ impl BionicEnv {
             scope,
             missing_gl,
             host_libc_present: true,
+            eclipse_natives_present: eclipse_natives,
         }
     }
 
@@ -516,6 +532,7 @@ impl BionicEnv {
             scope: Scope::new(),
             missing_gl: vec!["libEGL.so".to_string(), "libGLESv2.so".to_string()],
             host_libc_present: false,
+            eclipse_natives_present: false,
         }
     }
 
@@ -527,6 +544,11 @@ impl BionicEnv {
     /// Whether the host libc/m/dl/pthread baseline tier is present.
     pub fn host_libc_present(&self) -> bool {
         self.host_libc_present
+    }
+
+    /// Whether the prepended Eclipse-owned bionic-native tier is present (liblog + bionic-libc).
+    pub fn eclipse_natives_present(&self) -> bool {
+        self.eclipse_natives_present
     }
 
     /// Borrow the underlying [`Scope`] (e.g. to [`categorize_imports`] against it).
@@ -807,7 +829,8 @@ mod tests {
         ];
         let relas = vec![glob_dat(0), glob_dat(1), glob_dat(2)];
         // try_host_gl=false to keep the test independent of host GL presence; libc tier still on.
-        let env = BionicEnv::with_host_baseline(false);
+        // eclipse_natives=false: this test exercises the host-baseline tier specifically.
+        let env = BionicEnv::with_host_baseline(false, false);
         let report = categorize_imports(&relas, &syms, env.scope());
         assert_eq!(report.total, 3);
         // The two libc symbols resolve from the host process; the NDK one does not.
@@ -824,13 +847,35 @@ mod tests {
 
     #[test]
     fn bionic_env_host_baseline_has_libc_tier() {
-        let env = BionicEnv::with_host_baseline(false);
+        let env = BionicEnv::with_host_baseline(false, false);
         assert!(env.host_libc_present());
+        assert!(!env.eclipse_natives_present());
         // The host libc tier resolves a known libc symbol through the scope.
         let got = env.scope().resolve("memcpy");
         assert!(got.is_some_and(|r| r.addr != 0));
         // GL disabled → both GL sonames recorded missing.
         assert_eq!(env.missing_gl().len(), 2);
+    }
+
+    #[test]
+    fn bionic_env_eclipse_natives_win_over_host() {
+        // With the Eclipse-native tier prepended, a bionic-libc name glibc lacks (`__errno`) resolves
+        // to an Eclipse address, and a name glibc HAS (`memcpy`) still resolves (from the host tier).
+        let env = BionicEnv::with_host_baseline(false, true);
+        assert!(env.eclipse_natives_present());
+        // `__errno` is NOT a glibc symbol (glibc has `__errno_location`) — only the Eclipse tier
+        // provides it, proving the prepended tier is consulted.
+        assert!(
+            env.scope().resolve("__errno").is_some_and(|r| r.addr != 0),
+            "the Eclipse tier must resolve __errno (glibc lacks this exact name)"
+        );
+        // `__strlen_chk` likewise comes from the Eclipse tier (glibc lacks the bionic name).
+        assert!(env
+            .scope()
+            .resolve("__strlen_chk")
+            .is_some_and(|r| r.addr != 0));
+        // A plain host symbol still resolves via the host tier behind the Eclipse one.
+        assert!(env.scope().resolve("memcpy").is_some_and(|r| r.addr != 0));
     }
 
     #[test]
