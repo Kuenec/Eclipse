@@ -197,6 +197,13 @@ satisfy bionic imports), each must resolve to an Eclipse-provided bionic `.so`/s
    assert that libroblox's decoded reloc count == 527,297 and the type histogram matches.
 2. **Bionic-env provider objects** — stand up the shim sonames as `SymbolProvider`s exporting the
    584-symbol surface (libc/m/dl/log/android/SLES/MAXAL/mediandk) + route EGL/GLES2 to host GL.
+   **DONE (first cut, 2026-06-05):** `src/loader/bionic_env.rs` is the first bionic-env resolution
+   scope — host libc/m/dl/pthread (`dlsym(RTLD_DEFAULT)`) + host `libEGL`/`libGLESv2` (`dlopen`) —
+   that resolves **490 / 584** UND imports as a host **BASELINE** (NOT bionic-ABI-correct) and
+   applies **535** GOT/PLT slots on the mapped engine, proving the symbol-reloc pipeline. The
+   remaining **88** are the Eclipse-bionic-native work-list: see
+   [`docs/bionic-env-worklist.md`](bionic-env-worklist.md) (liblog 5, bionic-specific libc 21,
+   ndk-android 27, media-ndk 33, audio 8). NEXT = implement those natives per category, then (3).
 3. **Runtime integration tail (main-loop / dev-host only):** bind the assembled image to execution —
    `%fs`/TCB is **not** needed by libroblox (no PT_TLS), simplifying this step; then run the
    **3,427 DT_INIT_ARRAY constructors** in order after relocation, honoring **PT_GNU_RELRO**

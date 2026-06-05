@@ -60,7 +60,8 @@ use std::path::{Path, PathBuf};
 
 use super::elf::{ElfError, ElfImage};
 use super::map::{
-    host_page_size, MapError, MapStats, MappedObject, SymbolRelocStats, TlsRelocStats,
+    host_page_size, MapError, MapStats, MappedObject, PartialSymbolStats, SymbolRelocStats,
+    TlsRelocStats,
 };
 use super::reloc::{self, Rela, SymbolResolver};
 use super::resolve::{HostDlsymProvider, LoadedObjectProvider, Scope, ScopedResolver};
@@ -251,6 +252,51 @@ impl LoadedImageSet {
     /// Find a loaded object by soname.
     pub fn object(&self, soname: &str) -> Option<&LoadedObject> {
         self.objects.iter().find(|o| o.soname == soname)
+    }
+
+    /// Apply a **partial** symbol-relocation pass (the bionic-env BASELINE) to the object named by
+    /// `soname`, against an externally-built `scope` — typically a
+    /// [`super::bionic_env::BionicEnv`]'s scope (host libc/m/dl/pthread + host GL). Fills the GOT/PLT
+    /// slots for the host-resolvable subset of the object's imports and records the rest (the
+    /// Eclipse-bionic-native work-list); never aborts, never fabricates an address.
+    ///
+    /// 2026-06-05 — this is how the engine's symbol-relocation pipeline is *proven* end-to-end after
+    /// the root-only map+base-relocate pass: the symbol relocs that the root-only [`Linker::load`]
+    /// deferred (no providers) are now applied for whatever the host can supply. **HONEST:** host
+    /// addresses are a relocation-pipeline baseline, NOT bionic-ABI-correct execution (see
+    /// `bionic_env.rs`). Returns the object's [`PartialSymbolStats`] (applied / unresolved work-list).
+    pub fn relocate_object_symbols_partial(
+        &mut self,
+        soname: &str,
+        scope: &Scope,
+        page_size: u64,
+    ) -> Result<PartialSymbolStats, LinkError> {
+        let idx = self
+            .objects
+            .iter()
+            .position(|o| o.soname == soname)
+            .ok_or_else(|| LinkError::MissingDependency {
+                soname: soname.to_string(),
+                needed_by: "relocate_object_symbols_partial".to_string(),
+            })?;
+        // Disjoint field borrows: the parsed image borrows `bytes`, the apply needs `&mut mapped`.
+        let obj = &mut self.objects[idx];
+        let LoadedObject {
+            soname: obj_soname,
+            bytes,
+            mapped,
+            ..
+        } = obj;
+        let img = ElfImage::parse(bytes).map_err(|error| LinkError::Parse {
+            object: obj_soname.clone(),
+            error,
+        })?;
+        mapped
+            .relocate_symbols_partial(&img, scope, page_size)
+            .map_err(|error| LinkError::Map {
+                object: obj_soname.clone(),
+                error,
+            })
     }
 }
 
@@ -1482,6 +1528,210 @@ mod tests {
             set.unresolved.len(),
             set.missing_deps.len(),
             elapsed,
+        );
+
+        // No leak: dropping the set munmaps the 112 MiB region.
+        drop(set);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- REAL test: resolve + categorize + PARTIALLY apply libroblox's symbol relocs via BionicEnv
+    // (skips cleanly if the APK is absent — never fails / fabricates). This proves the symbol-reloc
+    // pipeline on the real engine for the HOST-resolvable subset (a baseline, NOT bionic-ABI-correct
+    // execution) and enumerates the Eclipse-bionic-native work-list.
+
+    #[test]
+    fn real_libroblox_bionic_env_resolves_categorizes_and_partially_applies() {
+        use crate::loader::bionic_env::{categorize_imports, BionicEnv};
+
+        let Some(apk_path) = find_roblox_apk() else {
+            eprintln!("real_libroblox_bionic_env_...: no Roblox APK; skipping");
+            return;
+        };
+
+        let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
+        let so_bytes = apk
+            .read_entry("lib/x86_64/libroblox.so")
+            .expect("read lib/x86_64/libroblox.so from APK");
+        let dir = temp_dir("libroblox-bionic-env");
+        let so_path = dir.join("libroblox.so");
+        std::fs::write(&so_path, &so_bytes).expect("stage libroblox.so");
+
+        // 1) Map + base-relocate the engine root-only (deps env-provided, host fallback off).
+        let linker = Linker::new(Vec::<PathBuf>::new())
+            .with_host_fallback(false)
+            .with_tolerate_missing_deps(true);
+        let mut set = linker
+            .load(&so_path)
+            .unwrap_or_else(|e| panic!("root-only map+base-relocate of libroblox: {e}"));
+        assert_eq!(set.objects.len(), 1, "root-only: only libroblox is mapped");
+        let page = host_page_size();
+
+        // 2) Build the BionicEnv scope (host libc/m/dl/pthread + host GL if present) and a FULL scope
+        //    that also includes a LoadedObjectProvider of libroblox itself (gABI: an object's own
+        //    exports satisfy self-references). The host tiers are the BASELINE (see bionic_env.rs).
+        let base = set.objects[0].load_base();
+        let img = set.objects[0].image().expect("re-parse libroblox");
+        let dynsyms = img.dynsyms.clone();
+        // The relocations drive categorization (reloc-referenced imports, immune to the elf.rs symtab
+        // over-read — docs/libroblox-characterization.md §2).
+        let all_relas = img.relocations().expect("decode libroblox relocations");
+        drop(img);
+
+        let bionic = BionicEnv::with_host_baseline(true);
+        eprintln!(
+            "BionicEnv: host_libc_present={} missing_gl={:?}",
+            bionic.host_libc_present(),
+            bionic.missing_gl()
+        );
+
+        // Build the FULL gABI scope `[LoadedObjectProvider(libroblox), env-providers...]` so the
+        // categorization split matches exactly what the partial apply will do. Consume the BionicEnv
+        // into its providers and chain them after libroblox's own provider.
+        let mut full_scope = Scope::new();
+        full_scope.push(Box::new(LoadedObjectProvider::new(base, &dynsyms)));
+        for p in bionic.into_providers() {
+            full_scope.push(p);
+        }
+
+        let report = categorize_imports(&all_relas, &dynsyms, &full_scope);
+
+        // ---- per-soname-bucket / per-category categorization report ------------------------------
+        eprintln!(
+            "\n=== libroblox UND import categorization (total={}) ===",
+            report.total
+        );
+        eprintln!("{:<14} {:>9} {:>11}", "category", "resolved", "unresolved");
+        let mut total_resolved = 0usize;
+        let mut total_unresolved = 0usize;
+        for (cat, (res, unres)) in &report.category_counts {
+            eprintln!("{cat:<14} {res:>9} {unres:>11}");
+            total_resolved += res;
+            total_unresolved += unres;
+        }
+        eprintln!(
+            "{:<14} {:>9} {:>11}",
+            "TOTAL", total_resolved, total_unresolved
+        );
+        eprintln!(
+            "host-resolved (baseline): {} | work-list (Eclipse-native): {}",
+            report.resolved_count(),
+            report.unresolved_count()
+        );
+
+        // Dump the work-list (unresolved-strong names) grouped by category — the exact set the
+        // next Eclipse-owned bionic natives must implement (mirrored into docs/bionic-env-worklist.md).
+        eprintln!("\n--- Eclipse-bionic-native WORK-LIST (88 unresolved-strong, by category) ---");
+        let worklist: std::collections::BTreeSet<&str> =
+            report.host_unresolved.iter().map(String::as_str).collect();
+        for (cat, names) in &report.by_category {
+            let in_wl: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|n| worklist.contains(n))
+                .collect();
+            if !in_wl.is_empty() {
+                eprintln!("[{cat}] ({}) {}", in_wl.len(), in_wl.join(", "));
+            }
+        }
+
+        // The categorization must account for the documented 584 UND surface (reloc-referenced =
+        // exactly the GNU_HASH-authoritative count, immune to elf.rs's symtab over-read).
+        assert!(
+            report.total >= 584,
+            "libroblox UND import surface ≥ 584, got {}",
+            report.total
+        );
+        // NDK/media/audio/log have NO host equivalent → they must ALL be in the work-list.
+        for cat in ["ndk-android", "media-ndk", "audio", "liblog"] {
+            if let Some((res, _unres)) = report.category_counts.get(cat) {
+                assert_eq!(
+                    *res, 0,
+                    "category {cat} has no host equivalent → 0 host-resolved"
+                );
+            }
+        }
+
+        // 3) Apply the host-resolvable subset on the mapped engine (the partial GOT/PLT fill).
+        let stats = set
+            .relocate_object_symbols_partial("libroblox.so", &full_scope, page)
+            .expect("partial symbol relocation of libroblox");
+        eprintln!(
+            "\npartial symbol apply: applied_nonnull={} applied_weak_zero={} unresolved_strong={} deferred={} (work-list names={})",
+            stats.applied_nonnull,
+            stats.applied_weak_zero,
+            stats.unresolved_strong,
+            stats.deferred,
+            stats.unresolved.len(),
+        );
+
+        // ---- consistency assertions (the categorization MATCHES the applied pipeline) ------------
+        // Every applied non-null slot wrote a non-null address (proven by reading back the slots).
+        let obj = &set.objects[0];
+        let resolver_scope = &full_scope;
+        // Verify each applied slot is non-null where the resolved address is non-null (all 635 symbol
+        // relocs are small, so check them all). Reuses `all_relas`/`dynsyms` decoded above.
+        let mut checked_nonnull = 0usize;
+        for r in &all_relas {
+            let is_sym = matches!(
+                r.r_type,
+                reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
+            );
+            if !is_sym {
+                continue;
+            }
+            // Resolve the symbol name through the scope; a non-null hit means the slot must be set.
+            let name = dynsyms
+                .get(r.sym_index as usize)
+                .map(|s| s.name.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let resolved = resolver_scope.resolve(name).map(|s| s.addr);
+            if let Some(addr) = resolved {
+                if addr != 0 {
+                    // For GLOB_DAT/JUMP_SLOT the slot holds `sym`; for R_X86_64_64 `sym+addend`.
+                    let off = r.offset as usize;
+                    if off + 8 <= obj.mapped.span() {
+                        let slot = obj.mapped.read_u64(off).expect("read GOT slot");
+                        assert_ne!(
+                            slot, 0,
+                            "applied GOT/PLT slot for resolved symbol {name} must be non-null"
+                        );
+                        checked_nonnull += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("verified {checked_nonnull} applied GOT/PLT slots hold a non-null host address");
+
+        // The partial pass's non-null applied count must equal the categorization's resolved count
+        // (both are "the host-resolvable subset"). A symbol may back several relocs, so compare the
+        // reloc-level applied count to the per-reloc resolvable count, and the distinct work-list
+        // names to the categorization's unresolved set.
+        assert!(
+            stats.applied_nonnull > 0,
+            "the host MUST resolve a non-trivial subset (libc/m/pthread) — pipeline proof"
+        );
+        assert!(
+            checked_nonnull > 0,
+            "at least one applied slot was verified non-null"
+        );
+        // The distinct unresolved-strong names from the apply == the categorization's work-list.
+        let mut apply_worklist = stats.unresolved.clone();
+        apply_worklist.sort();
+        let mut cat_worklist = report.host_unresolved.clone();
+        cat_worklist.sort();
+        assert_eq!(
+            apply_worklist, cat_worklist,
+            "the partial apply's unresolved-strong set must equal the categorization work-list"
+        );
+
+        // Honest baseline: the work-list MUST be non-empty (NDK/media/audio/log have no host equiv).
+        assert!(
+            !cat_worklist.is_empty(),
+            "the Eclipse-bionic-native work-list must be non-empty (NDK/media/audio/log)"
         );
 
         // No leak: dropping the set munmaps the 112 MiB region.

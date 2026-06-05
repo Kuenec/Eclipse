@@ -385,6 +385,36 @@ before any history-rewriting/force operation.
   MAXAL/mediandk — EGL/GLES2→host GL; the rest Eclipse-owned shim natives) to resolve the 584 UND imports +
   apply the deferred GLOB_DAT/JUMP_SLOT/64, then run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW (no
   `%fs`/TCB — no PT_TLS).** See §6 (2026-06-05 libroblox map+RELRO+root-only).
+  **2026-06-05 UPDATE — the FIRST bionic-env resolution cut is built + tested + PROVEN ON `libroblox.so`:**
+  `src/loader/bionic_env.rs` (`pub mod bionic_env;`) is a configurable, ordered bionic-env [`resolve::Scope`]
+  tailored to the engine — host `libEGL.so`/`libGLESv2.so` (`dlopen`, present on this dev-host) + a host
+  libc/m/dl/pthread [`HostDlsymProvider`] (`dlsym(RTLD_DEFAULT)`) — plus a name-based categorizer
+  (`categorize_imports`, walks the RELOCATIONS not the raw symtab → immune to elf.rs's symtab over-read →
+  reports EXACTLY the 584 GNU_HASH-authoritative UND imports) that buckets every import into the
+  Eclipse-bionic-native work-list. A new partial-apply pass (`map::MappedObject::relocate_symbols_partial`
+  + `link::LoadedImageSet::relocate_object_symbols_partial`) fills the GOT/PLT for the host-resolvable subset
+  ONLY and records the rest (never aborts like the all-or-nothing `relocate_symbols`, never fabricates).
+  **REAL breakdown (gated test `loader::link::tests::real_libroblox_bionic_env_*`, skips if no APK):
+  490 / 584 host-resolved (BASELINE) + 88 work-list; per-category resolved/unresolved: egl-gles 91/0,
+  pthread 45/0, libm 43/0, bionic-libc 303/21, cxa 3/0, dl 5/0, ndk-android 0/27, media-ndk 0/33, audio 0/8,
+  liblog 0/5. Partial apply: 535 GOT/PLT slots filled non-null (ALL verified non-null) + 12 weak-undef→0 +
+  88 unresolved-strong recorded + 0 deferred; the apply work-list == the categorization work-list exactly.**
+  **HONEST BASELINE CAVEAT (code + docs + here):** the 490 host-resolved are glibc/host-GL addresses — a
+  relocation-pipeline BASELINE, NOT bionic-ABI-correct execution (bionic vs glibc struct/errno/pthread/FILE/
+  cxa differ). libroblox is **NOT runnable** from this; it proves the symbol-reloc mechanism + produces the
+  work-list. The scope is built so Eclipse-owned bionic natives can be PREPENDED before the host tier. `unsafe`:
+  ONE new confined block — the `dlopen`/`dlsym` FFI in `DlopenLibProvider` (dated `// SAFETY:`); reloc.rs/elf.rs
+  stay `#![forbid(unsafe_code)]`. ZERO new crates (`libc` `dlopen`/`dlsym` already in tree). **Full work-list:**
+  [`docs/bionic-env-worklist.md`](docs/bionic-env-worklist.md). 11 new tests (10 bionic_env unit: classify
+  GL/NDK/media/audio/log/libc/pthread/dl/cxa/math, categorize over fixtures, host-baseline scope ordering,
+  DlopenLibProvider; + 1 gated REAL libroblox). Gate now **313 unit + 2 doctests** (fmt/build/clippy
+  `-D warnings`/test/release all clean). **Engine-load frontier: bionic-env FIRST CUT done — 490/584 host-baseline
+  resolved + 535 GOT slots filled (pipeline proven on the real engine); 88-import work-list enumerated. NEXT =
+  implement the Eclipse-owned bionic natives per category, STARTING WITH liblog (5; Eclipse already owns them in
+  src/framework.rs — just route them), then the 21 bionic-specific libc names (`__system_property_get`/`__sF`/
+  `__errno`/`_chk` FORTIFY/`__stack_chk_guard`), then ndk-android (27) / media-ndk (33) / audio (8); then bind +
+  run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW (no `%fs`/TCB — no PT_TLS), main-loop/dev-host only.**
+  See §6 (2026-06-05 bionic-env first cut).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3042,6 +3072,51 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   provider surface (resolve the 584 UND imports → apply the 635 deferred GLOB_DAT/JUMP_SLOT/64; EGL/GLES2→host
   GL, the rest Eclipse-owned shim natives), then run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW (no
   `%fs`/TCB — no PT_TLS).**
+- **2026-06-05 (bionic-env first cut)** — 🟢 **ENGINE-LOAD: the FIRST bionic-env resolution scope — host-baseline
+  resolve + categorize + PARTIAL GOT-fill, PROVEN on the real `libroblox.so`.** New module `src/loader/bionic_env.rs`
+  (`pub mod bionic_env;`): a configurable, ordered [`resolve::Scope`] tailored to the engine — host `libEGL.so`/
+  `libGLESv2.so` opened via a new `DlopenLibProvider` (`dlopen` RTLD_NOW|RTLD_LOCAL, kept process-lifetime; `dlsym`
+  per symbol) THEN a host libc/m/dl/pthread `HostDlsymProvider` (`dlsym(RTLD_DEFAULT)`). Built so Eclipse-owned bionic
+  natives can later be PREPENDED before the host tier (displacing glibc for the libc surface). A name-based categorizer
+  `categorize_imports(relas, dynsyms, scope)` — walks the **RELOCATIONS** (not the raw symtab) so it is immune to
+  elf.rs's documented symtab over-read and reports EXACTLY the **584** GNU_HASH-authoritative UND imports — buckets every
+  import into 11 `ImportCategory`s (bionic-libc/libm/pthread/dl/cxa/liblog/ndk-android/egl-gles/media-ndk/audio/
+  uncategorized) by public NDK/bionic name conventions (clean-room: documented prefixes only, NO shim source read).
+  **New partial-apply pass** (root-cause, NOT a workaround for the all-or-nothing `relocate_symbols`):
+  `map::MappedObject::relocate_symbols_partial` + `link::LoadedImageSet::relocate_object_symbols_partial` apply ONLY the
+  symbol relocs the scope resolves (via the existing `reloc::apply_one` per-reloc) and RECORD the rest — never abort,
+  never fabricate (strong-unresolved → recorded work-list, no GOT write; weak-undef → 0, legal). This is the honest
+  BASELINE GOT-fill the all-or-nothing pass cannot do (libroblox always has NDK/media/audio unresolved). **HONEST BASELINE
+  CAVEAT (code + docs/bionic-env-worklist.md + §5):** host-resolved = glibc/host-GL addresses → a relocation-pipeline
+  baseline, NOT bionic-ABI-correct execution (bionic vs glibc struct/errno/pthread/FILE/cxa differ); libroblox is **NOT
+  runnable** from this — it proves the symbol-reloc mechanism + yields the work-list. **REAL VALIDATION (gated test
+  `link::tests::real_libroblox_bionic_env_resolves_categorizes_and_partially_applies`, skips cleanly if no APK):
+  490 / 584 host-resolved (BASELINE) + 88 work-list; per-category resolved/unresolved — egl-gles 91/0 (real host Mesa GL),
+  pthread 45/0, libm 43/0, bionic-libc 303/21, cxa 3/0, dl 5/0, ndk-android 0/27, media-ndk 0/33, audio 0/8, liblog 0/5;
+  partial apply: 535 GOT/PLT slots filled non-null (ALL read-back-verified non-null) + 12 weak-undef→0 + 88
+  unresolved-strong recorded + 0 deferred; the apply work-list == the categorization work-list EXACTLY; no panic, no leak
+  (Drop munmaps 112 MiB).** Work-list (88): liblog 5 (Eclipse already owns these — just route), bionic-specific libc 21
+  (`__system_property_get`/`__sF`/`__errno`/the `_chk` FORTIFY family/`__stack_chk_guard` — glibc lacks these names),
+  ndk-android 27, media-ndk 33, audio 8 (OpenMAXAL contributes 0 — no reloc references its `XA_*`). Full list +
+  implementation order: [`docs/bionic-env-worklist.md`](docs/bionic-env-worklist.md). **`unsafe`:** exactly ONE new
+  confined block — the `dlopen`/`dlsym` FFI in `DlopenLibProvider` (dated `// SAFETY:`; `HostLibHandle` Send/Sync sound:
+  read-only `dlsym` on a never-closed handle); `reloc.rs`/`elf.rs` stay `#![forbid(unsafe_code)]`. **ZERO new crates**
+  (`libc` `dlopen`/`dlsym`/`RTLD_*` already in tree). **Cyber-safeguard honored:** written ONLY from public ELF
+  symbol-resolution + `dlsym(3)`/`dlopen(3)` semantics + public NDK/bionic symbol NAMES + Eclipse's own resolve/reloc/map/
+  link cores; NO apkenv/bionic/ATL/NDK linker or shim source read; parsing libroblox bytes as data is benign; nothing
+  executed. **Did NOT trip the safeguard.** **Regression guard:** 11 new tests — 10 GPU/VM-free unit (classify GL/NDK/
+  media/audio/log/libc/pthread/dl/cxa/math, categorize over reloc+dynsym fixtures incl. def-skip + dedup + weak-not-in-
+  worklist, host-baseline scope ordering + empty scope, `DlopenLibProvider` resolves/absent/interior-NUL) + the gated REAL
+  libroblox test (asserts total≥584, NDK/media/audio/log = 0 host-resolved, applied_nonnull>0, every applied slot non-null,
+  apply work-list == categorization work-list, work-list non-empty). Files: `src/loader/bionic_env.rs` (new),
+  `src/loader.rs` (mod + doc), `src/loader/resolve.rs` (`Scope::into_providers`), `src/loader/map.rs`
+  (`PartialSymbolStats` + `relocate_symbols_partial` + `SymbolResolver` import), `src/loader/link.rs`
+  (`relocate_object_symbols_partial` + the gated real test), `docs/bionic-env-worklist.md` (new),
+  `docs/libroblox-characterization.md` (§4b pointer). **Gate:** fmt/build --all-targets/clippy (-D warnings)/test
+  (**313 unit + 2 doctests**)/release all 0-warning/0-error. **NEXT = implement the Eclipse-owned bionic natives per the
+  work-list, STARTING with liblog (5, already owned in src/framework.rs — route them), then the 21 bionic-specific libc
+  names, then ndk-android (27)/media-ndk (33)/audio (8); then bind + run the 3,427 DT_INIT_ARRAY ctors honoring
+  RELRO+BIND_NOW (no `%fs`/TCB — no PT_TLS), main-loop/dev-host only.**
 
 ---
 

@@ -65,6 +65,15 @@
 //! the env/shim (the bionic load shape — e.g. `libroblox.so`'s 10 bionic deps). It maps + relocates;
 //! it does **not** bind `%fs`/TCB, execute ifunc resolvers, or run init — the runtime integration tail.
 //!
+//! [`bionic_env`] — the **first bionic-env resolution scope** tailored to `libroblox.so`: a
+//! configurable, ordered [`resolve::Scope`] of providers (host `libEGL`/`libGLESv2` via `dlopen`
+//! if present, then a host libc/m/dl/pthread [`resolve::HostDlsymProvider`]) that resolves the
+//! subset of the engine's 584 UND imports the **host** can supply, plus a name-based categorizer
+//! ([`bionic_env::categorize_imports`]) that buckets every import into the Eclipse-bionic-native
+//! work-list. **HONEST BASELINE:** host glibc/GL addresses prove the symbol-relocation pipeline but
+//! are **not** bionic-ABI-correct execution (struct/errno/pthread/FILE differ); the scope is built
+//! so Eclipse-owned bionic natives can be prepended later (see `bionic_env.rs` + AGENTS.md §5).
+//!
 //! `elf.rs` decodes the file format; `reloc.rs` applies relocations; `map.rs` lays the segments
 //! out and drives both base and (via `resolve.rs`) symbol relocations — a clean boundary (the
 //! decoded `reloc::Rela` is the applier's input type, with no glue). `link.rs` ties them into a
@@ -81,6 +90,7 @@
 //! requires that broader loader and is **main-loop / dev-host only** (the cyber-safeguard
 //! false-positives on linker work).
 
+pub mod bionic_env;
 pub mod elf;
 pub mod link;
 pub mod map;

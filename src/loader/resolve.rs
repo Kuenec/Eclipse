@@ -223,6 +223,13 @@ impl Scope {
         self
     }
 
+    /// Consume the scope into its ordered provider list (so callers can prepend a
+    /// [`LoadedObjectProvider`] of the relocated object itself, then chain these env providers — the
+    /// gABI scope `[own-object, env...]`). 2026-06-05: used by the bionic-env first cut.
+    pub fn into_providers(self) -> Vec<Box<dyn SymbolProvider>> {
+        self.providers
+    }
+
     /// Resolve `name` across the scope. Returns the winning definition, or `None` if no provider
     /// defines it. A weak definition is provisional: scanning continues so a later global overrides
     /// it; a global match short-circuits.
