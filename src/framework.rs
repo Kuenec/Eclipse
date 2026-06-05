@@ -83,6 +83,7 @@ use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 use crate::runtime::Vm;
 
 pub mod window_registry;
+pub mod xml_registry;
 
 // === Eclipse's own (non-GTK) backing for android.content.Context's static-init natives =========
 //
@@ -432,14 +433,18 @@ const ASSET_MANAGER_SET_CONFIGURATION_NAME: &JNIStr = jni_str!("setConfiguration
 const ASSET_MANAGER_SET_CONFIGURATION_SIG: &JNIStr =
     jni_str!("(IILjava/lang/String;IIIIIIIIIIIIII)V");
 
-// 2026-06-05: AssetManager is DENYLISTED, so this native is bound SIGNATURE-ONLY from the exact JNI
-// signature ART reported missing (`No implementation found for long
-// android.content.res.AssetManager.openXmlAssetNative(int, java.lang.String)`; mangled
-// `...openXmlAssetNative__ILjava_lang_String_2`), WITHOUT reading the class's source. JNI descriptor
-// `(ILjava/lang/String;)J` — an INSTANCE native returning a `long` (an XML-asset handle). The sound
-// neutral value for a handle return is `0` (the standard "no asset" sentinel); this does NOT fake a
-// successful XML open — if the framework later dereferences the `0` handle, the next native surfaces
-// (the discovery loop). DISCOVERY-LOOP STUB: refine once Eclipse has its own asset-table handle.
+// 2026-06-05: `openXmlAssetNative(int cookie, String fileName)` is the native AOSP's
+// `AssetManager.openXmlBlockAsset` calls to parse a binary-XML asset into a native tree and return a
+// `long` handle (the framework wraps it as an `XmlBlock`/`XmlResourceParser`). The JNI signature ART
+// reported missing was `(ILjava/lang/String;)J` (`No implementation found for long
+// android.content.res.AssetManager.openXmlAssetNative(int, java.lang.String)`). The earlier no-op
+// `0` return made `openXmlBlockAsset` throw `FileNotFoundException: Asset XML file:
+// AndroidManifest.xml` (run log 2026-06-05), stalling `Context.<clinit>`. This is now a REAL
+// Eclipse-owned backing (NOT ATL's C asset layer, NOT GTK): it reads `fileName` from the APK zip via
+// the `apk` crate, parses it with the `axml` reader into an [`crate::apk::axml::XmlDocument`], stores
+// it in the Eclipse-owned [`xml_registry`] generational slab, and returns the slab handle (≥ 1, never
+// the reserved `0`). A genuine open failure (missing entry / parse error) returns `0`, which is the
+// correct trigger for the framework's `FileNotFoundException` — not a fake success.
 const ASSET_MANAGER_OPEN_XML_ASSET_NAME: &JNIStr = jni_str!("openXmlAssetNative");
 const ASSET_MANAGER_OPEN_XML_ASSET_SIG: &JNIStr = jni_str!("(ILjava/lang/String;)J");
 
@@ -558,37 +563,116 @@ extern "system" fn asset_manager_set_configuration<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.openXmlAssetNative(int cookie, String fileName)` → `0` handle (signature-only
-/// discovery-loop stub, 2026-06-05).
+/// `AssetManager.openXmlAssetNative(int cookie, String fileName)` → a real Eclipse-owned
+/// [`xml_registry`] block handle (2026-06-05), or `0` on a genuine open failure.
 ///
 /// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
-/// `(EnvUnowned, JObject this, jint cookie, JObject fileName)`. `fileName` is a `jobject` at the ABI
-/// level, taken as a `JObject` and **never dereferenced** (AssetManager is DENYLISTED — bound from
-/// the ART-reported signature alone, without reading its source). Returns `0` — the neutral "no
-/// asset" sentinel for a handle `long`; this does NOT fake a successful XML open. If the framework
-/// later dereferences the `0` handle, the next native surfaces (the discovery loop).
+/// `(EnvUnowned, JObject this, jint cookie, JString fileName)`. Reads `fileName` from the APK zip
+/// (path stashed in [`APK_PATH`]) via [`crate::apk::Apk::read_entry`], parses it with
+/// [`crate::apk::axml::parse_document`], stores the parsed [`crate::apk::axml::XmlDocument`] in
+/// [`xml_registry`], and returns the slab handle (≥ 1, never `0`). A missing entry or parse failure
+/// returns `0` — the "no asset" sentinel the framework turns into `FileNotFoundException` (correct
+/// behavior, not a fake success). `cookie` is the APK-set index; Eclipse keys assets by the single
+/// stashed APK path, so it is logged but not used to select an archive.
 ///
 /// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
 /// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns the `jlong` default (`0`) on any error/panic — the same neutral handle value.
+/// returns the `jlong` default (`0`) on any error/panic — the same neutral "no asset" handle.
 extern "system" fn asset_manager_open_xml_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     cookie: jint,
-    _file_name: JObject<'local>,
+    file_name: JString<'local>,
 ) -> jlong {
-    env.with_env(|_env| -> jni::errors::Result<jlong> {
-        // 2026-06-05: signature-only stub (AssetManager denylisted). No native asset table exists,
-        // so no XML asset can be opened; return the `0` "no asset" sentinel. `_file_name` is not
-        // inspected. `cookie` is traced as a low-noise call marker for the dev-host log.
-        tracing::debug!(
-            target: "android.content.res.AssetManager",
-            cookie,
-            "AssetManager.openXmlAssetNative: GTK-free stub returning 0 (no native asset table)"
-        );
-        Ok(0)
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        if file_name.is_null() {
+            // A null asset name cannot name an entry; return the "no asset" sentinel (the framework
+            // throws FileNotFoundException), never a panic.
+            return Ok(0);
+        }
+        let name = file_name.try_to_string(env)?;
+        match open_xml_block(&name) {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.content.res.AssetManager",
+                    cookie,
+                    asset = %name,
+                    handle,
+                    "AssetManager.openXmlAssetNative: parsed XML asset from APK (Eclipse axml)"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                // Genuine failure (entry absent, not binary-XML, malformed, or no APK path). Return
+                // 0 so the framework raises FileNotFoundException — the correct, non-faked outcome.
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    cookie,
+                    asset = %name,
+                    error = %e,
+                    "AssetManager.openXmlAssetNative: could not open XML asset → 0 (FileNotFound)"
+                );
+                Ok(0)
+            }
+        }
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+/// Read `name` from the APK zip, parse it as binary XML, and store it as an [`xml_registry`] block.
+///
+/// Returns the non-zero block handle, or a typed [`AssetError`] on any failure (no stashed APK path,
+/// missing entry, parse error, or registry error) — the caller maps that to the `0` "no asset"
+/// sentinel. Opens the APK fresh per call (the launcher opens few XML assets; this avoids holding a
+/// `ZipArchive` across the JNI boundary and keeps the asset state a single `OnceLock<String>` path).
+fn open_xml_block(name: &str) -> Result<jlong, AssetError> {
+    let apk_path = APK_PATH.get().ok_or(AssetError::NoApkPath)?;
+    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path))?;
+    let bytes = apk.read_entry(name)?;
+    let doc = crate::apk::axml::parse_document(&bytes)?;
+    let handle = xml_registry::store(doc)?;
+    Ok(handle)
+}
+
+/// Errors from opening an XML asset out of the APK for [`open_xml_block`]. Internal to the asset
+/// backing; surfaced only as a log line + the `0` sentinel return (never panics across JNI).
+#[derive(Debug)]
+enum AssetError {
+    /// No APK path was stashed before the asset call (a registration ordering bug).
+    NoApkPath,
+    /// Reading the entry from the APK zip failed (missing entry, zip error, I/O).
+    Apk(crate::apk::ApkError),
+    /// The entry was not parseable binary XML.
+    Axml(crate::apk::axml::AxmlError),
+    /// Storing the parsed block in the registry failed (poisoned mutex / slab full).
+    Registry(xml_registry::XmlRegistryError),
+}
+
+impl fmt::Display for AssetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoApkPath => f.write_str("no APK path was stashed for asset access"),
+            Self::Apk(e) => write!(f, "APK read error: {e}"),
+            Self::Axml(e) => write!(f, "binary-XML parse error: {e}"),
+            Self::Registry(e) => write!(f, "xml-block registry error: {e}"),
+        }
+    }
+}
+
+impl From<crate::apk::ApkError> for AssetError {
+    fn from(e: crate::apk::ApkError) -> Self {
+        Self::Apk(e)
+    }
+}
+impl From<crate::apk::axml::AxmlError> for AssetError {
+    fn from(e: crate::apk::axml::AxmlError) -> Self {
+        Self::Axml(e)
+    }
+}
+impl From<xml_registry::XmlRegistryError> for AssetError {
+    fn from(e: xml_registry::XmlRegistryError) -> Self {
+        Self::Registry(e)
+    }
 }
 
 /// Bind Eclipse's own (non-GTK) backing for `android.content.res.AssetManager`'s `init` native.
@@ -658,6 +742,428 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/content/res/AssetManager",
         "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.content.res.XmlBlock parser natives ===========
+//
+// 2026-06-05: once `openXmlAssetNative` returns a real block handle (above), AOSP's framework wraps
+// it as an `android.content.res.XmlBlock` and walks it through a set of `static native` methods on
+// `XmlBlock` (the `XmlBlock.Parser`/`XmlResourceParser` event cursor). Discovered via the dev-host
+// run, the first is `nativeCreateParseState(long block)` (`No implementation found for long
+// android.content.res.XmlBlock.nativeCreateParseState(long)`, run log 2026-06-05). These are the
+// standard AOSP `XmlBlock` parser natives (stable public XmlPullParser semantics), bound against the
+// Eclipse-owned [`xml_registry`] block + cursor — NOT ATL's C asset layer, NOT GTK. Each new native
+// the run surfaces is added here, implemented against the parsed [`crate::apk::axml::XmlDocument`].
+
+/// `android.content.res.XmlBlock` (internal/slashed name for `find_class`) — hosts the parser walk
+/// natives the framework calls on the handle `openXmlAssetNative` returned.
+pub const XML_BLOCK_CLASS: &JNIStr = jni_str!("android/content/res/XmlBlock");
+
+// `static native long nativeCreateParseState(long block)` — create a parser cursor over `block` and
+// return a parse-state handle. JNI descriptor `(J)J`, from the ART-reported signature
+// `long ...XmlBlock.nativeCreateParseState(long)` (run log 2026-06-05).
+const XML_BLOCK_CREATE_PARSE_STATE_NAME: &JNIStr = jni_str!("nativeCreateParseState");
+const XML_BLOCK_CREATE_PARSE_STATE_SIG: &JNIStr = jni_str!("(J)J");
+
+// `static native int nativeNext(long state)` — advance the parser cursor and return the next
+// XmlPullParser event. JNI descriptor `(J)I` (`int ...XmlBlock.nativeNext(long)`, run log 2026-06-05).
+const XML_BLOCK_NEXT_NAME: &JNIStr = jni_str!("nativeNext");
+const XML_BLOCK_NEXT_SIG: &JNIStr = jni_str!("(J)I");
+
+// `static native void nativeDestroyParseState(long state)` — release the parser cursor. JNI
+// descriptor `(J)V` (`void ...XmlBlock.nativeDestroyParseState(long)`, run log 2026-06-05).
+const XML_BLOCK_DESTROY_PARSE_STATE_NAME: &JNIStr = jni_str!("nativeDestroyParseState");
+const XML_BLOCK_DESTROY_PARSE_STATE_SIG: &JNIStr = jni_str!("(J)V");
+
+// `static native String nativeGetName(long state)` — the current tag's name. JNI descriptor
+// `(J)Ljava/lang/String;` (`String ...XmlBlock.nativeGetName(long)`, run log 2026-06-05).
+const XML_BLOCK_GET_NAME_NAME: &JNIStr = jni_str!("nativeGetName");
+const XML_BLOCK_GET_NAME_SIG: &JNIStr = jni_str!("(J)Ljava/lang/String;");
+
+// `static native void nativeDestroy(long block)` — release the parsed block itself (distinct from
+// nativeDestroyParseState). JNI descriptor `(J)V` (`void ...XmlBlock.nativeDestroy(long)`, run log
+// 2026-06-05).
+const XML_BLOCK_DESTROY_NAME: &JNIStr = jni_str!("nativeDestroy");
+const XML_BLOCK_DESTROY_SIG: &JNIStr = jni_str!("(J)V");
+
+// `static native int nativeGetAttributeIndex(long state, String namespace, String name)` — the
+// index of the (namespace, name) attribute on the current tag, or -1. JNI descriptor
+// `(JLjava/lang/String;Ljava/lang/String;)I` (run log 2026-06-05).
+const XML_BLOCK_GET_ATTR_INDEX_NAME: &JNIStr = jni_str!("nativeGetAttributeIndex");
+const XML_BLOCK_GET_ATTR_INDEX_SIG: &JNIStr = jni_str!("(JLjava/lang/String;Ljava/lang/String;)I");
+
+/// The "attribute not found" sentinel AOSP's `XmlResourceParser` accessors return.
+const XML_ATTR_NOT_FOUND: jint = -1;
+
+// `static native String nativeGetAttributeStringValue(long state, int idx)` — the string value of
+// the idx-th attribute on the current tag. JNI descriptor `(JI)Ljava/lang/String;` (run log
+// 2026-06-05).
+const XML_BLOCK_GET_ATTR_STRING_VALUE_NAME: &JNIStr = jni_str!("nativeGetAttributeStringValue");
+const XML_BLOCK_GET_ATTR_STRING_VALUE_SIG: &JNIStr = jni_str!("(JI)Ljava/lang/String;");
+
+// org.xmlpull.v1.XmlPullParser event constants (stable public API) that AOSP's XmlBlock.Parser
+// returns from nativeNext. Namespace nodes are tracked internally and NOT surfaced as pull events.
+// (START_DOCUMENT=0 is the Java-side pre-first-`next` state, never returned by nativeNext, so it is
+// not encoded here.)
+const XML_EVENT_END_DOCUMENT: jint = 1;
+const XML_EVENT_START_TAG: jint = 2;
+const XML_EVENT_END_TAG: jint = 3;
+const XML_EVENT_TEXT: jint = 4;
+
+/// `XmlBlock.nativeCreateParseState(long block)` → a parse-state handle.
+///
+/// JNI ABI: a `static` native, so the second argument is the `JClass`, then the `jlong block`
+/// handle. Eclipse's [`xml_registry`] block already owns its own parser cursor, so the parse state
+/// **is** the block: this validates the handle (a bounds+generation-checked [`xml_registry::with_block`]
+/// lookup — a stale/fabricated handle is rejected, never UB) and returns the same handle for the
+/// subsequent walk natives to use. Returns `0` (the "no state" sentinel) if the handle is invalid.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on
+/// any error/panic — a sound neutral "no state" handle.
+extern "system" fn xml_block_create_parse_state<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    block: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        // Reset the cursor to the start of the document so each parser begins at START_DOCUMENT, and
+        // validate the handle. A bad handle → 0 (the framework treats it as a failed parser create).
+        match xml_registry::with_block(block, |b| {
+            b.cursor = 0;
+            b.current = None;
+        }) {
+            Ok(()) => Ok(block),
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.content.res.XmlBlock",
+                    block,
+                    error = %e,
+                    "XmlBlock.nativeCreateParseState: invalid block handle → 0"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeNext(long state)` → the next XmlPullParser event constant.
+///
+/// JNI ABI: a `static` native (`JClass`, then the `jlong state` handle — the same registry handle
+/// `nativeCreateParseState` returned). Advances the block's cursor past any namespace nodes (AOSP's
+/// `XmlBlock.Parser` tracks namespaces internally and does not surface them as pull events) and maps
+/// the node under the cursor to its [`XmlPullParser`](https://developer.android.com) event int:
+/// `START_TAG`(2)/`END_TAG`(3)/`TEXT`(4); `END_DOCUMENT`(1) at/after the end. A bad/stale handle
+/// yields `END_DOCUMENT` so the framework's walk loop terminates cleanly rather than spinning.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8). `resolve` returns
+/// the `jint` default (`0` = `START_DOCUMENT`) on error/panic — a neutral, non-advancing event.
+extern "system" fn xml_block_next<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        let event = xml_registry::with_block(state, |b| {
+            // Skip namespace bookkeeping nodes; return the first content event (or end).
+            loop {
+                match b.next_event() {
+                    Some(crate::apk::axml::XmlEventKind::StartTag(_)) => break XML_EVENT_START_TAG,
+                    Some(crate::apk::axml::XmlEventKind::EndTag(_)) => break XML_EVENT_END_TAG,
+                    Some(crate::apk::axml::XmlEventKind::Text(_)) => break XML_EVENT_TEXT,
+                    Some(crate::apk::axml::XmlEventKind::StartNamespace(_))
+                    | Some(crate::apk::axml::XmlEventKind::EndNamespace(_)) => continue,
+                    None => break XML_EVENT_END_DOCUMENT,
+                }
+            }
+        });
+        match event {
+            Ok(ev) => Ok(ev),
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.content.res.XmlBlock",
+                    state,
+                    error = %e,
+                    "XmlBlock.nativeNext: invalid state handle → END_DOCUMENT"
+                );
+                Ok(XML_EVENT_END_DOCUMENT)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeDestroyParseState(long state)` → release the parser cursor.
+///
+/// JNI ABI: a `static` native returning void. In Eclipse's model the parse state and the block are
+/// the **same** [`xml_registry`] entry (one cursor per block), and the framework destroys the parse
+/// state *before* the block (`nativeDestroy`). So this must NOT free the entry — doing so would
+/// invalidate the block handle the framework still holds. It only validates the handle (a stale one
+/// is logged + ignored); the entry is freed by [`xml_block_destroy`] (`nativeDestroy`). Idempotent;
+/// never UB or panic — the registry rejects a bad handle.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic — the correct neutral value for this `void` native.
+extern "system" fn xml_block_destroy_parse_state<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // Validate-only (do NOT free): the block handle equals the parse-state handle in Eclipse's
+        // model and is freed later by nativeDestroy. with_block bounds+generation-checks it.
+        if let Err(e) = xml_registry::with_block(state, |_b| ()) {
+            tracing::debug!(
+                target: "android.content.res.XmlBlock",
+                state,
+                error = %e,
+                "XmlBlock.nativeDestroyParseState: handle invalid (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeGetName(long state)` → the current tag's local name as a `java.lang.String`.
+///
+/// JNI ABI: a `static` native returning a `String` (`JClass`, then the `jlong state`). Returns the
+/// current element's resolved name when the cursor is on a start/end tag; a null `JString` otherwise
+/// (text node, document edges, or an invalid handle) — AOSP's `XmlResourceParser.getName` returns
+/// null when not positioned on a tag.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns a
+/// null `JString` on error/panic.
+extern "system" fn xml_block_get_name<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        // Resolve the current element's name under the registry lock, then build the JString outside
+        // it (new_string needs &mut Env; the lock guard is dropped first).
+        let name =
+            xml_registry::with_block(state, |b| b.current_element().and_then(|e| e.name.clone()))
+                .ok()
+                .flatten();
+        match name {
+            Some(n) => env.new_string(n),
+            // Not on a tag (or bad handle): null name, matching getName()'s contract.
+            None => Ok(JString::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeDestroy(long block)` → release the parsed block.
+///
+/// JNI ABI: a `static` native returning void. Frees the [`xml_registry`] entry — the parsed document
+/// is no longer needed once the framework finished walking the asset and destroyed its parse state.
+/// A bad/stale/already-freed handle is logged and ignored (idempotent; the registry rejects it,
+/// never UB or panic).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn xml_block_destroy<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    block: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = xml_registry::free(block) {
+            tracing::debug!(
+                target: "android.content.res.XmlBlock",
+                block,
+                error = %e,
+                "XmlBlock.nativeDestroy: handle already freed/invalid (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeGetAttributeIndex(long state, String namespace, String name)` → the attribute's
+/// index on the current tag, or `-1`.
+///
+/// JNI ABI: a `static` native (`JClass`, `jlong state`, then two `JString`s). Matches an attribute
+/// by name and namespace: a null/empty `namespace` argument matches an attribute with no namespace
+/// (AOSP treats the empty namespace as "no namespace"); a non-empty `namespace` must equal the
+/// attribute's resolved namespace URI. Returns the 0-based index into the current element's
+/// attributes, or `-1` if not found / not on a tag / bad handle.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `jint` default (`0`) on error/panic — but every real path returns an explicit value, so an
+/// error yields `-1` (not found).
+extern "system" fn xml_block_get_attribute_index<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+    namespace: JString<'local>,
+    name: JString<'local>,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        // A null name cannot match; not found.
+        if name.is_null() {
+            return Ok(XML_ATTR_NOT_FOUND);
+        }
+        let want_name = name.try_to_string(env)?;
+        // Empty / null namespace means "no namespace" (AOSP semantics).
+        let want_ns = if namespace.is_null() {
+            String::new()
+        } else {
+            namespace.try_to_string(env)?
+        };
+        let idx = xml_registry::with_block(state, |b| {
+            b.current_element().and_then(|e| {
+                e.attributes.iter().position(|a| {
+                    let a_ns = a.namespace.as_deref().unwrap_or("");
+                    let a_name = a.name.as_deref().unwrap_or("");
+                    a_name == want_name && a_ns == want_ns
+                })
+            })
+        })
+        .ok()
+        .flatten();
+        match idx {
+            Some(i) => Ok(jint::try_from(i).unwrap_or(XML_ATTR_NOT_FOUND)),
+            None => Ok(XML_ATTR_NOT_FOUND),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeGetAttributeStringValue(long state, int idx)` → the idx-th attribute's string
+/// value as a `java.lang.String`, or null.
+///
+/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the resolved string for
+/// a `TYPE_STRING` attribute; null for a non-string-typed attribute (AOSP's
+/// `getAttributeValue`/`nativeGetAttributeStringValue` returns the pooled string only when the
+/// value is string-typed), for an out-of-range index, when not on a tag, or for a bad handle.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns a
+/// null `JString` on error/panic.
+extern "system" fn xml_block_get_attribute_string_value<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+    idx: jint,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let value = current_attribute(state, idx, |a| a.value_string.clone());
+        match value.flatten() {
+            Some(s) => env.new_string(s),
+            None => Ok(JString::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Run `f` against the idx-th attribute of the current element of block `state`.
+///
+/// Returns `Some(f(attr))` when the handle is valid, the cursor is on a start/end tag, and `idx` is
+/// in range; `None` otherwise. Centralizes the handle + bounds checks the per-attribute `nativeGet*`
+/// accessors share, so a bad handle or out-of-range index is always a clean `None`, never UB/panic.
+fn current_attribute<R>(
+    state: jlong,
+    idx: jint,
+    f: impl FnOnce(&crate::apk::axml::XmlAttribute) -> R,
+) -> Option<R> {
+    let i = usize::try_from(idx).ok()?;
+    xml_registry::with_block(state, |b| {
+        b.current_element().and_then(|e| e.attributes.get(i)).map(f)
+    })
+    .ok()
+    .flatten()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.content.res.XmlBlock`'s parser natives.
+///
+/// Registered before the lifecycle drive, alongside the AssetManager natives, since the framework
+/// constructs an `XmlBlock` parser during `Context.<clinit>` (reading `AndroidManifest.xml`). Each
+/// native is added as the dev-host run surfaces it (`No implementation found …`).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
+/// They do, by construction — each native is written to the exact descriptor the run reported. Every
+/// native body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic crosses the
+/// JNI boundary (AGENTS.md §2.8).
+fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(XML_BLOCK_CLASS)?;
+    let methods = [
+        // SAFETY: `xml_block_create_parse_state` matches the paired `(J)J` signature as a static
+        // native; casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_CREATE_PARSE_STATE_NAME,
+                XML_BLOCK_CREATE_PARSE_STATE_SIG,
+                xml_block_create_parse_state as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_next` matches the paired `(J)I` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_NEXT_NAME,
+                XML_BLOCK_NEXT_SIG,
+                xml_block_next as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_destroy_parse_state` matches the paired `(J)V` signature as a static
+        // native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_DESTROY_PARSE_STATE_NAME,
+                XML_BLOCK_DESTROY_PARSE_STATE_SIG,
+                xml_block_destroy_parse_state as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_get_name` matches the paired `(J)Ljava/lang/String;` signature as a
+        // static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_NAME_NAME,
+                XML_BLOCK_GET_NAME_SIG,
+                xml_block_get_name as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_destroy` matches the paired `(J)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_DESTROY_NAME,
+                XML_BLOCK_DESTROY_SIG,
+                xml_block_destroy as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_get_attribute_index` matches the paired
+        // `(JLjava/lang/String;Ljava/lang/String;)I` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_ATTR_INDEX_NAME,
+                XML_BLOCK_GET_ATTR_INDEX_SIG,
+                xml_block_get_attribute_index as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_get_attribute_string_value` matches the paired
+        // `(JI)Ljava/lang/String;` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_ATTR_STRING_VALUE_NAME,
+                XML_BLOCK_GET_ATTR_STRING_VALUE_SIG,
+                xml_block_get_attribute_string_value as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/content/res/XmlBlock; `methods` hold valid fn pointers
+    // whose signatures match the class's `native` declarations (from the ART-reported signatures,
+    // 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/content/res/XmlBlock",
+        "registered Eclipse's non-GTK backing for XmlBlock parser natives (nativeCreateParseState/nativeNext/nativeDestroyParseState/nativeGetName/nativeDestroy)"
     );
     Ok(())
 }
@@ -933,6 +1439,10 @@ fn drive_steps_1_to_3(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress
     // Bind android.content.res.AssetManager.init on its own class — the framework builds an
     // AssetManager early in init (Resources/asset access), so this must be bound before step 1.
     register_asset_manager_natives(env)?;
+    // Bind android.content.res.XmlBlock's parser natives on its own class — once openXmlAssetNative
+    // returns a real block handle, the framework walks it via XmlBlock (reading AndroidManifest.xml
+    // during Context.<clinit>), so these must be bound before step 1.
+    register_xml_block_natives(env)?;
     // Bind android.os.Environment.native_get_app_data_dir on its own class — the framework queries
     // external storage early in init (`getExternalStorageDirectory`), so this must be bound before
     // step 1.
@@ -1245,6 +1755,53 @@ mod tests {
             ASSET_MANAGER_OPEN_XML_ASSET_SIG.to_str(),
             "(ILjava/lang/String;)J"
         );
+    }
+
+    #[test]
+    fn xml_block_native_names_sigs_and_class_match_art_reported() {
+        // Pin android.content.res.XmlBlock's parser-native class, method names, and JNI descriptors
+        // against the exact signatures ART reported missing (run log 2026-06-05) and the standard
+        // AOSP XmlBlock parser ABI. A transcription regression would make RegisterNatives throw
+        // NoSuchMethodError at boot (or bind a wrong arity). Host-independent constants.
+        assert_eq!(XML_BLOCK_CLASS.to_str(), "android/content/res/XmlBlock");
+        assert_eq!(
+            XML_BLOCK_CREATE_PARSE_STATE_NAME.to_str(),
+            "nativeCreateParseState"
+        );
+        assert_eq!(XML_BLOCK_CREATE_PARSE_STATE_SIG.to_str(), "(J)J");
+        assert_eq!(XML_BLOCK_NEXT_NAME.to_str(), "nativeNext");
+        assert_eq!(XML_BLOCK_NEXT_SIG.to_str(), "(J)I");
+        assert_eq!(
+            XML_BLOCK_DESTROY_PARSE_STATE_NAME.to_str(),
+            "nativeDestroyParseState"
+        );
+        assert_eq!(XML_BLOCK_DESTROY_PARSE_STATE_SIG.to_str(), "(J)V");
+        assert_eq!(XML_BLOCK_GET_NAME_NAME.to_str(), "nativeGetName");
+        assert_eq!(XML_BLOCK_GET_NAME_SIG.to_str(), "(J)Ljava/lang/String;");
+        assert_eq!(XML_BLOCK_DESTROY_NAME.to_str(), "nativeDestroy");
+        assert_eq!(XML_BLOCK_DESTROY_SIG.to_str(), "(J)V");
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_INDEX_NAME.to_str(),
+            "nativeGetAttributeIndex"
+        );
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_INDEX_SIG.to_str(),
+            "(JLjava/lang/String;Ljava/lang/String;)I"
+        );
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_STRING_VALUE_NAME.to_str(),
+            "nativeGetAttributeStringValue"
+        );
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_STRING_VALUE_SIG.to_str(),
+            "(JI)Ljava/lang/String;"
+        );
+        // XmlPullParser event constants nativeNext maps to (stable public API).
+        assert_eq!(XML_EVENT_END_DOCUMENT, 1);
+        assert_eq!(XML_EVENT_START_TAG, 2);
+        assert_eq!(XML_EVENT_END_TAG, 3);
+        assert_eq!(XML_EVENT_TEXT, 4);
+        assert_eq!(XML_ATTR_NOT_FOUND, -1);
     }
 
     #[test]

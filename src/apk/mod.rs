@@ -25,7 +25,7 @@
 
 #![forbid(unsafe_code)]
 
-mod axml;
+pub mod axml;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -235,7 +235,14 @@ impl Apk {
     }
 
     /// Read a named zip entry fully into memory.
-    fn read_entry(&mut self, name: &str) -> Result<Vec<u8>, ApkError> {
+    ///
+    /// 2026-06-05: `pub` so Eclipse's own (non-GTK) AssetManager XML backing can read a binary-XML
+    /// asset (e.g. `AndroidManifest.xml`) straight from the APK zip to parse via
+    /// [`axml::parse_document`], replacing the no-op `openXmlAssetNative` stub. Returns
+    /// [`ApkError::EntryMissing`] when the named entry is absent (the framework maps that to the
+    /// Java `FileNotFoundException` its asset API expects), and the speculative-allocation cap still
+    /// applies (an untrusted uncompressed-size field cannot force a large up-front allocation).
+    pub fn read_entry(&mut self, name: &str) -> Result<Vec<u8>, ApkError> {
         let mut entry = match self.archive.by_name(name) {
             Ok(e) => e,
             Err(zip::result::ZipError::FileNotFound) => {
@@ -568,6 +575,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parse_document_walks_manifest_events_and_attributes() {
+        // Regression guard tied to the asset-XML root cause (2026-06-05): the general event walk
+        // axml::parse_document must actually parse a real binary manifest into START_TAG events with
+        // resolved tag names + attributes — this is what backs the framework's openXmlAssetNative /
+        // XmlBlock parser natives. Drive BOTH string-pool encodings (UTF-8 + the real-Roblox UTF-16).
+        for base in [FIXTURE_MANIFEST, FIXTURE_UTF16] {
+            let doc = axml::parse_document(base).expect("parse_document on a valid manifest");
+            // The root <manifest> must appear as a start-tag with a `package` attribute.
+            let manifest_el = doc
+                .elements
+                .iter()
+                .find(|e| e.name.as_deref() == Some("manifest"))
+                .expect("manifest element present");
+            let pkg = manifest_el
+                .attributes
+                .iter()
+                .find(|a| a.name.as_deref() == Some("package"))
+                .expect("package attribute present");
+            assert_eq!(pkg.value_string.as_deref(), Some("com.example.app"));
+            // The launcher <activity> tag is reached as a start-tag event.
+            assert!(
+                doc.elements
+                    .iter()
+                    .any(|e| e.name.as_deref() == Some("activity")),
+                "activity element must appear in the event walk"
+            );
+            // Events must be balanced: equal number of start- and end-tags (the manifest is well-formed).
+            let starts = doc
+                .events
+                .iter()
+                .filter(|e| matches!(e, axml::XmlEventKind::StartTag(_)))
+                .count();
+            let ends = doc
+                .events
+                .iter()
+                .filter(|e| matches!(e, axml::XmlEventKind::EndTag(_)))
+                .count();
+            assert_eq!(
+                starts, ends,
+                "start/end tags must balance in a well-formed manifest"
+            );
+            assert!(
+                starts >= 2,
+                "manifest has at least <manifest> and <application>"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_document_is_total_on_garbage() {
+        // Totality: non-AXML bytes are a typed AxmlError, never a panic (same guarantee as
+        // read_manifest — both go through the bounds-checked chunk/string-pool readers).
+        assert!(axml::parse_document(b"not binary xml at all").is_err());
+        assert!(axml::parse_document(&[]).is_err());
     }
 
     #[test]
