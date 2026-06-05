@@ -435,10 +435,11 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**72 unit + 2 compile_fail doctests
+  --all-targets --all-features -- -D warnings`, `cargo test` (**94 unit + 2 compile_fail doctests
   pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
-  Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock` natives via
-  `RegisterNatives` before `Context.<clinit>`, then drives recipe steps 1–3. **Eclipse-owned non-GTK
+  Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock`/**`View`/
+  `ViewGroup`/`TextView`/`Window`/`Paint`** natives via `RegisterNatives` before `Context.<clinit>`,
+  then drives recipe steps 1–**5** (now `drive_lifecycle`, not `drive_steps_1_to_3`). **Eclipse-owned non-GTK
   AssetManager XML backing now built** (`apk`+`axml`: `openXmlAssetNative` really reads+parses the APK's
   binary XML via `axml::parse_document` into the `framework::xml_registry` generational slab; the
   `XmlBlock` parser natives walk it). **`AssetManager.retrieveAttributes(J[IIJJ)Z` now bound** — real
@@ -457,8 +458,34 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   JCA provider via `System.loadLibrary("wolfssljni")`, and `libwolfssljni.so` left `__android_log_print`
   undefined → the bionic shim's glibc-dlopen fallback failed → `UnsatisfiedLinkError` (an `Error`, not
   caught by `<clinit>`'s `catch(Exception)`) → `Context` erroneous → method-ID NULL. Fixed by opening
-  libart `RTLD_GLOBAL` so `liblog.so`/`__android_log_print` is process-global. **Next frontier: step 4
-  `Activity.createMainActivity` (deferred — window/Surface design).** The live JNI path is dev-host-only (ART aborts on worker
+  libart `RTLD_GLOBAL` so `liblog.so`/`__android_log_print` is process-global. **STEPS 4–5 NOW DRIVEN
+  (2026-06-05, §6): `Activity.createMainActivity(className, window, null)` → `Activity.onCreate(null
+  Bundle)`, and the launcher `Activity.onCreate` IS REACHED + RUNS ITS OWN JAVA** (the demo logs
+  `- onCreate - yay! / - setContentView - yay! / - onContentChanged - yay!`; the View hierarchy
+  inflates). The `jlong` window handle is the same Eclipse-owned `window_registry` index steps 1–4 got;
+  Eclipse owns BOTH sides of it (it supplies the non-GTK Window/View natives via `RegisterNatives`,
+  which win over ATL's GTK name-binding), so it is **never** cast to a `GtkWidget*`. The whole step-4/5
+  cascade was bound non-GTK + minimal-sound via the discovery loop (each native from the ART `No
+  implementation found` line + `View.java`/`Window.java`/`ViewGroup.java`/`TextView.java` modifiers,
+  android/view+widget+graphics — NOT content/res, no api-impl-jni C, no web): **View** (`native_constructor`
+  → a `view_registry` peer keyed on the receiver class; `native_setPadding`/`native_setLayoutParams`/
+  `native_requestLayout` validate-handle no-ops, layout deferred), **ViewGroup** (`native_addView` records
+  the real parent→child tree edge in `view_registry.children`), **TextView** (re-declared
+  `native_constructor`, same backing), **Window** (`set_jobject`/`set_title`/`set_layout`/`set_widget_as_root`
+  → `window_registry` metadata: jobject-set flag, title, root_view handle), **Paint** (`native_create` → a
+  `paint_registry` config handle), **Theme** (`AssetManager.newTheme`/`applyThemeStyle`/`copyTheme` →
+  `theme_registry`; `applyStyle` writes TYPE_NULL defaults via the bounds-proven `fill_typed_array`), and
+  the resource path (`AssetManager.getResourceName`/`loadResourceValue` resolve the APP `resources.arsc` via
+  `apk::arsc` — added a `package_name` accessor; `XmlBlock.nativeGetLineNumber` → -1 honest). Three new
+  sound generational-slab registries mirror `window_registry`/`xml_registry`: **`view_registry`**,
+  **`theme_registry`**, **`paint_registry`** (each `#![forbid(unsafe_code)]`, jlong index NOT a raw
+  pointer, stale/oob/double-free → typed `Err`, 6 soundness tests each). **FAITHFUL STOP (not faked, not a
+  missing native): `MainActivity.onCreate` line 16 does `findViewById(android.R.id.text1).setText(...)` and
+  NPEs** because `getResourceName/loadResourceValue` only read the APP `resources.arsc`; `android.R.id.text1`
+  = `0x01020002` is in package `0x01` = the **AOSP framework resource table** (ATL's `framework-res.apk`),
+  which Eclipse does not yet load. So `findViewById` returns null → the demo's own NPE. **Next frontier: load
+  + merge `framework-res.apk`'s ARSC so `android.R.*` (package 0x01) resolves** (then the demo's onCreate
+  completes); after that, the real ash/Vulkan surface + draw is the deferred big build.** The live JNI path is dev-host-only (ART aborts on worker
   threads), so it is validated via `eclipse run`. The `apk` reader was validated against the **real**
   Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 / largeHeap=false).
   **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK) on this host.
@@ -1323,6 +1350,33 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   comment records the source-vs-dex-jar verification. Full gate green: fmt --check / build --all-targets /
   clippy `-D warnings` / test (**72 unit + 2 compile_fail doctests**, +1 = the new guard) / release
   (`panic = "abort"`/LTO retained). No new deps (libloading already present). Run log: `/tmp/eclipse-run.log`.
+- **2026-06-05** — **STEPS 4–5 DRIVEN: launcher `Activity.onCreate` reached + runs its own Java
+  (view hierarchy inflates).** Renamed `drive_steps_1_to_3` → `drive_lifecycle`;
+  `drive_application_lifecycle(&Vm, apk_path, launcher_activity)` now drives step 4
+  `Activity.createMainActivity(className, window, null)` → step 5 `Activity.onCreate(null Bundle)` after
+  steps 1–3, reusing the same `window_registry` handle (Eclipse owns both sides → never a `GtkWidget*`
+  cast). New `LifecycleProgress::ActivityOnCreate`. The step-4/5 native cascade was bound one-by-one via
+  the dev-host discovery loop (each from the ART `No implementation found` line; modifiers/signatures
+  cross-checked against `View.java`/`Window.java`/`ViewGroup.java`/`TextView.java` in android/view+widget,
+  NOT content/res, no api-impl-jni C, no web): **17 natives** —
+  `View.{native_constructor,native_setPadding,native_setLayoutParams,native_requestLayout}`,
+  `ViewGroup.native_addView` (records the real parent→child tree edge),
+  `TextView.native_constructor`, `Window.{set_jobject,set_title,set_layout,set_widget_as_root}`,
+  `Paint.native_create`, `AssetManager.{newTheme,applyThemeStyle,copyTheme,applyStyle,getResourceName,
+  loadResourceValue}`, `XmlBlock.nativeGetLineNumber`. Three new sound generational-slab registries
+  (`view_registry`/`theme_registry`/`paint_registry`, each `#![forbid(unsafe_code)]`, jlong index NOT a
+  raw pointer, 6 soundness tests each mirroring `window_registry`'s stale/oob/double-free). `window_registry.WindowState`
+  gained `jobject`/`root_view`; `apk::arsc` gained a `package_name(id)` accessor (UTF-16 header decode) +
+  `getResourceName`/`loadResourceValue` resolve the APP `resources.arsc`. All non-GTK, minimal-and-sound:
+  the View/Window natives record tree/metadata only — NO GTK, NO layout/measure/draw, NO surface (the
+  ash/Vulkan render stays the deferred big build). **FAITHFUL STOP (honest, not faked):**
+  `MainActivity.onCreate` line 16 = `findViewById(android.R.id.text1).setText(...)` NPEs because
+  `android.R.id.text1` = `0x01020002` is in package `0x01` (the AOSP **framework** resource table /
+  `framework-res.apk`), which Eclipse's app-only ARSC reader doesn't load → `getResourceName/loadResourceValue`
+  return null → `findViewById` returns null → the demo's own NPE. Not a missing native, not the surface —
+  the framework resource table is the next subsystem. Full gate green: fmt --check / build --all-targets /
+  clippy `-D warnings` / **test 94 unit + 2 compile_fail doctests** (+22: 18 registry soundness + 4 native-pin
+  expansions) / release (`panic = "abort"`/LTO retained). No new deps. Run log: `/tmp/eclipse-run.log`.
 
 ---
 
