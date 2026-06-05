@@ -475,29 +475,39 @@ const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG: &JNIStr = jni_str!("(J[IIJJ)Z");
 //   • Writing a distinct sentinel into each of the 6 ints of a matched window and observing which
 //     value `TypedArray.getInteger` read back as the "type" showed the **TYPE byte is at offset 1**
 //     (the framework reported `type=0xb0`, the sentinel written at window+1), NOT AOSP's offset 0.
-//   • Writing the real `Res_value.dataType` at offset 1 and the real `Res_value.data` at offset 2
-//     made `PackageParser`'s `getInteger` succeed for `<manifest android:versionCode>` (the boot
-//     advanced past `parsePackage`), confirming **DATA is at offset 2**.
+//   • The DATA word's offset was nailed down by sweeping which slot carries it: writing the real
+//     `Res_value.data` into ONLY slot 3 (with slots 2/0/4/5 left at the framework's zero pre-fill)
+//     made BOTH `PackageParser`'s integer attributes resolve (no `Can't convert to integer`) AND
+//     `TypedArray.getString` resolve `<activity android:name>` — clearing the "`<activity> does not
+//     specify android:name` → System.exit(1)" stop and advancing the lifecycle to step 1
+//     `Context.createApplication`. Sweeping DATA into each slot in turn, ONLY slot 3 made getString
+//     resolve; slot 2 (the earlier guess) satisfied integers but left getString returning null. So
+//     **DATA is at offset 3** — the one layout that satisfies every typed accessor. (The earlier note
+//     "DATA@2" was an integer-only coincidence: the integer path tolerates 2 or 3, the string path
+//     requires 3.)
 //
-// So ATL's window is `[?, TYPE(1), DATA(2), ...]` with `STYLE_NUM_ENTRIES = 6` (the 48-int zero
+// So ATL's window is `[?, TYPE(1), ?, DATA(3), ?, ?]` with `STYLE_NUM_ENTRIES = 6` (the 48-int zero
 // pre-fill the framework hands us for an 8-attribute manifest styleable confirms the 6-int stride).
-// The remaining 4 slots (offset 0, 3, 4, 5 — cookie/resource-id/etc.) are left at the framework's
+// The remaining 4 slots (offset 0, 2, 4, 5 — cookie/resource-id/etc.) are left at the framework's
 // own zero pre-fill: their exact ATL offsets are not yet confirmed and writing a wrong value there is
-// worse than the neutral zero default. The `String`-valued attribute path (`getString`, e.g.
-// `<activity android:name>`) needs ATL's pooled-string/cookie ABI, which is the next frontier (it
-// could not be resolved by sweeping the cookie to -1 across the unknown slots) and stays denylisted.
+// worse than the neutral zero default. A `TYPE_STRING` value at DATA@3 is the string-pool index; the
+// framework's `TypedArray.getString` resolves it via the XmlBlock string pool (cookie slot = 0 routes
+// to `mXml.getPooledString(data)`, satisfied by the already-bound `nativeGetAttributeStringValue` /
+// XmlDocument string pool — no new native is needed, confirmed by the run: no `No implementation
+// found` surfaced and the activity name resolved entirely in Java).
 //
 // THE ONE ABI ASSUMPTION (faithful): the empirically-confirmed `STYLE_NUM_ENTRIES = 6` stride with
-// TYPE@1 / DATA@2. A regression here would mis-place the entries; the run-derived offsets are pinned
+// TYPE@1 / DATA@3. A regression here would mis-place the entries; the run-derived offsets are pinned
 // by the unit tests below so a transcription change fails loudly.
 
 /// ATL `TypedArray` per-attribute window stride in `outValues` (empirically confirmed, see above).
 const STYLE_NUM_ENTRIES: usize = 6;
 /// Offset of the `TypedValue.TYPE_*` byte within an attribute's window (ATL = 1, run-confirmed).
 const STYLE_TYPE: usize = 1;
-/// Offset of the `Res_value.data` word within an attribute's window (ATL = 2, run-confirmed). For a
-/// `TYPE_STRING` this is the string-pool index.
-const STYLE_DATA: usize = 2;
+/// Offset of the `Res_value.data` word within an attribute's window (ATL = 3, run-confirmed 2026-06-05
+/// — the ONE slot that makes both `getInteger` and `getString` resolve). For a `TYPE_STRING` this is
+/// the XmlBlock string-pool index the framework's `getString` resolves via the XML string pool.
+const STYLE_DATA: usize = 3;
 /// `TypedValue.TYPE_NULL` — "no value" (the framework then uses the attribute's default). Written
 /// into a requested attribute's `STYLE_TYPE` slot when that id is absent from the current tag.
 const TYPE_NULL: i32 = 0;
@@ -698,14 +708,16 @@ extern "system" fn asset_manager_open_xml_asset<'local>(
 ///
 /// For each requested id the window's run-confirmed slots are filled: `STYLE_TYPE` (ATL offset 1) =
 /// the value's `Res_value.dataType` (the same byte as `TypedValue.TYPE_*`), `STYLE_DATA` (ATL offset
-/// 2) = the value's `Res_value.data` word (for a `TYPE_STRING` this is the string-pool index). The
-/// remaining slots stay at the framework's zero pre-fill (their exact ATL offsets are not yet
-/// confirmed). A requested id not present on the tag gets `STYLE_TYPE = TYPE_NULL` (the framework then
-/// uses the attribute's default). `outIndices[0]` is the count of attributes that were found, and
+/// 3) = the value's `Res_value.data` word (for a `TYPE_STRING` this is the XmlBlock string-pool
+/// index). The remaining slots stay at the framework's zero pre-fill (their exact ATL offsets are not
+/// yet confirmed). A requested id not present on the tag gets `STYLE_TYPE = TYPE_NULL` (the framework
+/// then uses the attribute's default). `outIndices[0]` is the count of attributes that were found, and
 /// `outIndices[1..=count]` are their 1-based positions in `attrs`. The return is `true` iff at least
-/// one attribute was found. Integer/boolean attributes resolve correctly (the boot advances past
-/// `PackageParser.parsePackage`); `String`-valued attributes (`getString`) need ATL's pooled-string
-/// ABI — the next, denylisted frontier (see the `STYLE_*` constants' note).
+/// one attribute was found. Both integer/boolean attributes (the boot advances past
+/// `PackageParser.parsePackage`) AND `String`-valued attributes (e.g. `<activity android:name>`)
+/// resolve: `TypedArray.getString` reads the string-pool index from DATA@3 (cookie slot = 0) and
+/// resolves it via the XmlBlock string pool — satisfied by the already-bound XML natives, no new
+/// native needed (run-confirmed 2026-06-05; see the `STYLE_*` constants' note).
 ///
 /// ## Bounds soundness (the raw-pointer writes)
 /// `out_values`/`out_indices` are written via `*mut i32` derived from the `jlong`s. The writes are
@@ -846,7 +858,7 @@ fn u32_to_i32(v: u32) -> i32 {
 /// (the count) and `1..=changed` where `changed <= n`, hence `<= n`. Both are strictly inside the
 /// framework's allocation — no out-of-bounds access. A `0` pointer is treated as "no buffer" and
 /// never dereferenced. The one ABI assumption (documented at the `STYLE_*` constants) is the
-/// empirically-confirmed `STYLE_NUM_ENTRIES = 6` / TYPE@1 / DATA@2 layout. Each `i32` is written to a
+/// empirically-confirmed `STYLE_NUM_ENTRIES = 6` / TYPE@1 / DATA@3 layout. Each `i32` is written to a
 /// `.add(k)`-offset of a `*mut i32`; the buffers are framework-owned native `int[]`s (4-byte aligned
 /// by construction), so the writes are aligned and non-overlapping.
 fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<TypedEntry>]) {
@@ -2055,12 +2067,14 @@ mod tests {
         );
         assert_eq!(ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG.to_str(), "(J[IIJJ)Z");
         // Pin the EMPIRICALLY-CONFIRMED ATL TypedArray window layout retrieveAttributes writes
-        // against (run-derived 2026-06-05: stride 6, TYPE@1, DATA@2 — NOT the AOSP-documented
-        // TYPE@0/DATA@1), so a stride/offset regression (which would mis-place TypedValue entries and
-        // re-break PackageParser's getInteger) fails loudly.
+        // against (run-derived 2026-06-05: stride 6, TYPE@1, DATA@3 — NOT the AOSP-documented
+        // TYPE@0/DATA@1, and NOT the earlier integer-only guess DATA@2). DATA@3 is the ONE slot that
+        // makes both `getInteger` (PackageParser integers) and `getString` (`<activity android:name>`)
+        // resolve; a stride/offset regression (which would re-break the activity-name getString and
+        // mis-place TypedValue entries) fails loudly.
         assert_eq!(STYLE_NUM_ENTRIES, 6);
         assert_eq!(STYLE_TYPE, 1);
-        assert_eq!(STYLE_DATA, 2);
+        assert_eq!(STYLE_DATA, 3);
         assert_eq!(TYPE_NULL, 0);
     }
 
@@ -2102,13 +2116,13 @@ mod tests {
         assert_eq!(indices[0], -1, "outIndices underflow guard");
         assert_eq!(indices[idx_len + 1], -1, "outIndices overflow guard");
 
-        // Found attributes (0 and 2): only the run-confirmed TYPE@1 and DATA@2 slots are written;
+        // Found attributes (0 and 2): only the run-confirmed TYPE@1 and DATA@3 slots are written;
         // the other 4 slots stay at the caller value (the framework's zero pre-fill in real use).
         for (attr, e) in [(0usize, &entries[0]), (2usize, &entries[2])] {
             let win = 1 + attr * STYLE_NUM_ENTRIES;
             let e = e.unwrap();
             assert_eq!(values[win + STYLE_TYPE], e.value_type, "STYLE_TYPE @1");
-            assert_eq!(values[win + STYLE_DATA], e.data, "STYLE_DATA @2");
+            assert_eq!(values[win + STYLE_DATA], e.data, "STYLE_DATA @3");
             for slot in 0..STYLE_NUM_ENTRIES {
                 if slot != STYLE_TYPE && slot != STYLE_DATA {
                     assert_eq!(values[win + slot], -1, "unwritten slot untouched");
