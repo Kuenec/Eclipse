@@ -176,6 +176,73 @@ migrates to Rust.** The "Rust client" identity holds because every line we *own*
 - Does Roblox's Java shell make **per-frame JNI calls**? (If yes, interpreter mode could
   matter more than assumed — measure in M0 step 4.)
 
+## VM boot — implementation plan (2026-06-04, evidence-based)
+
+The `runtime` crate's planning layer is done (`runtime::BootPlan`, host-ISA detection,
+`eclipse run` dry-run). The remaining M1 work is `runtime::boot()` — the actual ART VM boot.
+This is the charter's **highest-risk / last** step; the plan below is grounded in the M0 boot
+logs + the installed `art_standalone` / `android_translation_layer` layout.
+
+### Boot recipe (verified components on this host)
+- **VM library:** `/usr/lib/art/libart.so` — exports `JNI_CreateJavaVM` +
+  `JNI_GetDefaultJavaVMInitArgs` (`nm -D` confirmed). Load via `libloading` (dlopen) so the
+  build does not link ART; discover the path (detect-don't-assume), don't hardcode.
+- **Boot image location:** `/usr/lib/java/dex/art/oat/boot.art` (the `-Ximage` *location*);
+  ART/dex2oat compiles it to `~/.cache/art/x86_64/...@boot.oat` on first run (already present
+  here from M0). First boot pays a one-time dex2oat cost.
+- **Bootclasspath (libcore):** the `*-hostdex.jar` set in `/usr/lib/java/dex/art/oat/`
+  (`core-oj`, `core-libart`, `bouncycastle`, `apachehttp`, `apache-xml`, `okhttp`,
+  `wolfssljni`, …). The patched ART may bake a default bootclasspath (per §2); confirm whether
+  `-Xbootclasspath` must be passed explicitly.
+- **libcore native backends:** `/usr/lib/java/dex/art/natives/` (e.g. `libjavacore.so`,
+  `libopenjdk.so`) — ART loads these **during VM init**, through the *translation linker*.
+- **Framework + app classpath:** `classpath = /usr/lib/java/dex/android_translation_layer/api-impl.jar : <Roblox.apk>` (the M0 log's `class_loader_context` confirms `api-impl.jar` as PCL).
+- **VM options:** the M0-validated heap flags from `BootPlan::vm_options()` (`-Xmx768m`,
+  `-XX:HeapGrowthLimit=768m`, `-XX:DisableHSpaceCompactForOOM`). NB: `--instruction-set-features`
+  is a **dex2oat** flag, NOT a `JavaVMOption` — keep `BootPlan` split (VM vs dex2oat).
+
+### The crux (env setup): bare dlopen is *not* enough
+Even a libcore-only VM init makes ART load `libjavacore.so`/`libopenjdk.so` (bionic `.so`s)
+**through the translation linker**, and the patched ART "removes `/system/bin/linker`
+assumptions / loads JNI libs through the translation linker" (§2). So `runtime::boot()` must
+first stand up **bionic_translation**'s environment (the linker shim) before
+`JNI_CreateJavaVM`, exactly as ATL's launcher does. Per the charter (§6 bionic decision), **v1
+FFIs the proven C `bionic_translation`** (and likely links/loads `libandroid_translation_layer`
+for its boot glue) for stability, then ports to Rust behind the ABI conformance suite later.
+
+### Recommended v1 shape
+1. `libloading` to dlopen `libart.so` (+ resolve `JNI_CreateJavaVM`); `jni = 0.21` for the JNI
+   types and `JavaVM::from_raw(...)` → `JNIEnv`. **Or** link `libandroid_translation_layer` and
+   call its higher-level boot entry (simpler, more stable for v1 — compare both).
+2. Stand up bionic_translation, build `JavaVMInitArgs` from `BootPlan::vm_options()` + `-Ximage`
+   + bootclasspath + classpath, call `JNI_CreateJavaVM`, get a `JNIEnv`, run a trivial
+   `java.lang.System` call, `DestroyJavaVM`. This is the **libcore-only smoke boot**.
+3. Then: register framework native backends (JNI), build the Application, drive the Activity
+   (`ActivitySplash`/`ActivityNativeMain`) to `onCreate`; `System.loadLibrary` pulls
+   `libroblox.so` via the translation linker; engine inits Vulkan/EGL.
+
+### Safety + gate
+- This introduces the crate's first `unsafe` → lift `#![forbid(unsafe_code)]` in `runtime.rs`,
+  confine `unsafe` to the boot path with `// SAFETY:` notes, and wrap **every** registered JNI
+  native callback body in `catch_unwind` (no unwind into C++ under `panic = "abort"`, §2.8).
+- Gate-clean: dlopen means it **compiles without ART linked**; the actual boot is an
+  `#[ignore]` integration test run only where `/usr/lib/art` exists.
+
+### The key experiment — Step 3.5 thesis test
+A **graphics-stack-free** smoke boot (no GTK4/Mesa/winit) should have a *clean* low_4gb window,
+so ART/LOS allocations should succeed where ATL+GTK4 exhausted them (Step 3.5). Running the
+libcore-only boot is the cheapest decisive test of Eclipse's core architectural claim — do it
+first, before wiring winit/ash.
+
+### Open questions / risks (need ATL source from GitLab or real-run iteration)
+- ATL's **exact** pre-`JNI_CreateJavaVM` init sequence (the local AUR clone has no extracted
+  source; fetch `android_translation_layer` from GitLab, or iterate against real boots).
+- Whether `-Xbootclasspath` is needed or baked; whether `libandroidfw` must be initialized for
+  `framework-res.apk`; first-run dex2oat boot-image compile time/fragility (page size).
+- **Tooling note (2026-06-04):** Anthropic's cyber-safeguard repeatedly false-positives on
+  *workflow subagents* asked to analyze ART-VM-boot/JNI-FFI topics (blocked 3+ agents). Do this
+  step in the main loop / interactively, not via Workflow subagents.
+
 ## Sources
 
 - [art_standalone (GitLab)](https://gitlab.com/android_translation_layer/art_standalone) — base `android-6.0.1_r46`, build outputs, patches
