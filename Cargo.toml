@@ -3,7 +3,8 @@
 # Deps are added per subsystem, only when that subsystem is actually built — we don't pull
 # unverified crate versions or system libs (vulkan/pulse/gtk dev headers, the vendored ART)
 # ahead of need. M1 has wired diagnostics + config + apk + the runtime ART-boot FFI; the
-# remaining subsystems (graphics, audio, input, services, bionic, framework) are still stubs.
+# remaining subsystems (audio, input, services, bionic, framework) are still stubs (graphics
+# has the winit host window; ash/EGL forwarding is next).
 #
 # The full, annotated dependency PLAN (what each subsystem will use, and why) lives in
 # docs/dependency-plan.md. Add deps to this file only when wiring up the subsystem, after
@@ -40,7 +41,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"                                     # streaming artifact-integrity hash (lowercase hex via std::fmt, no `hex` crate)
 # --- Runtime: boot the vendored ART VM (M1) -------------------------------------
 libloading = "0.9"                                # dlopen the vendored /usr/lib/art/libart.so (no link-time ART dep)
-jni-sys = "0.4.1"
+jni-sys = "0.4"                                   # raw JNI invocation types (full `jni` crate added with the onCreate JNI calls)
+# --- Graphics/window: the host game window (M2) ----------------------------------
+winit = "0.30"                                    # Wayland/X11 window + event loop (NO GTK — keeps low_4gb clear for ART; ash/khronos-egl for forwarding come later)
 # 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
 # The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.
