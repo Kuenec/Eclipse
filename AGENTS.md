@@ -557,9 +557,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   type 18 @ 0x… → linker.c:2901 failed to link libm.so`. Reloc type **18** on x86-64 = `R_X86_64_TPOFF64` (TLS
   thread-pointer offset); the host `libm.so.6` carries 1 such reloc (it has `STATIC_TLS`) + `RELR`-compressed
   relatives + `BIND_NOW` (benign `readelf -r`/`-d`), which the apkenv-era bionic shim linker doesn't implement.
-  Fixing it = either teach the bionic shim linker `R_X86_64_TPOFF64`/`RELR` (flagged linker source work) OR a
-  bionic-ABI re-export `libm.so` shim (the hard NDK-shim track) — both flagged, NOT done here. Same track as
-  `libroblox.so`'s `libmediandk.so`/`libOpenMAXAL.so` shims. Roblox's `AppStartupTaskManager` background thread
+  **v1 PATH CHOSEN 2026-06-05 (§6 + [`docs/bionic-loader-strategy.md`](docs/bionic-loader-strategy.md)): HYBRID —
+  minimally EXTEND the C `bionic_translation` linker for `R_X86_64_TPOFF64`/`RELR`/`BIND_NOW` to unblock NOW
+  (charter-sanctioned v1 FFI), keep the from-scratch Rust bionic-loader as the durable do-LAST replacement behind
+  an ABI conformance suite.** A reloc-clean shim was assessed INFEASIBLE for `libm`/errno (TLS is semantic, not
+  cosmetic — the per-thread `errno` reappears at the forward boundary); a newer-AOSP-linker swap imports a
+  glibc-vs-bionic TLS-interop project at linker scope with worse charter fit. **Smallest first step = a throwaway
+  probe** that `bionic_dlopen`s the provisioned `libm.so` in isolation (no ART/engine), confirms `reloc type 18` in
+  the small, then proves the fix on ONE reloc (`R_X86_64_TPOFF64` → `libm.so` links + `errno==EDOM` per-thread) —
+  main-loop only (cyber-safeguard). The relocation wall is UPSTREAM of the `libmediandk.so`/`libOpenMAXAL.so`
+  soname shims (`libm.so` is a `DT_NEEDED` of both zstd-jni and `libroblox.so`). Roblox's `AppStartupTaskManager` background thread
   also NPEs on `Looper.mQueue` (background threads have no Looper) then a fatal SIGSEGV during
   `androidx.startup.InitializationProvider` (engine-load native track, NOT the Rust FFI — the provisioning +
   whitelist calls are clean, no Rust panic/RuntimeError, grep count 0). Faithful run log: `/tmp/eclipse-roblox.log`
@@ -1622,6 +1629,33 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   the bionic-shim RELOCATION/NDK-shim work — `R_X86_64_TPOFF64`/`RELR` support OR re-export shims for
   `libm`/`libmediandk`/`libOpenMAXAL` so the engine's transitive libs link past relocation; + Roblox's
   background-thread `Looper` provisioning.**
+- **2026-06-05** — 🧭 **Bionic-loader v1 strategy DECIDED — the relocation wall is the engine-load frontier; v1 =
+  HYBRID (extend C now, Rust port last).** New decision doc [`docs/bionic-loader-strategy.md`](docs/bionic-loader-strategy.md)
+  (strategy/decision altitude — NO linker source read, NO reloc code written). **The wall (from the faithful run,
+  not inference):** with whitelist + bare-soname provisioning done, the apkenv-era shim linker (`libdl_bio.so.0`)
+  FINDS+OPENS the libs but cannot RELOCATE them — `unknown reloc type 18 → failed to link libm.so`. Type 18 =
+  `R_X86_64_TPOFF64` (TLS thread-pointer offset, used for per-thread `errno`); host `libm.so.6` also carries
+  `RELR`-compressed relatives + `BIND_NOW` (modern-toolchain defaults). These are PERVASIVE (TLS errno is
+  universal; RELR/BIND_NOW are PIE defaults), so provisioning host libs is NECESSARY-BUT-INSUFFICIENT — **the
+  limitation is the LINKER, not the libs**. `libm.so` is a `DT_NEEDED` of BOTH zstd-jni and `libroblox.so`, so the
+  wall is UPSTREAM of the `bionic-loader-plan.md` §4 soname shims (`libmediandk.so`/`libOpenMAXAL.so`/`liblog.so`).
+  **Options weighed (clears `R_X86_64_TPOFF64`?):** (a) extend the C shim linker — YES, most direct, but TLS math
+  is hard/safeguard-hot; (b) from-scratch Rust loader — YES by construction, the durable charter answer but the
+  largest/highest-risk do-LAST item; (c) reloc-clean shim libs — NO, INFEASIBLE for `libm`/errno (TLS is semantic;
+  errno reappears at the forward boundary — a CLAUDE.md symptom-hider); (d) newer-AOSP-`linker64` — YES but imports
+  a glibc-vs-bionic TLS/TCB interop project at linker scope, worse §2.1 fit; (e) HYBRID = (a) now + (b) last.
+  **CHOSEN: (e) HYBRID** — the only short path that actually clears `R_X86_64_TPOFF64`, it is exactly the
+  charter's "v1 may FFI the proven C `bionic_translation`, port behind an ABI suite, do it last" (refined: the
+  apkenv C linker must be EXTENDED for modern relocs first), and the C extension doubles as the conformance spec
+  for the Rust port. Honors Priority #1 (Stability) over #2 (Purely-Rust). **Smallest first step = de-risk with a
+  probe:** a throwaway C/Rust probe that `bionic_dlopen`s the already-provisioned `libm.so` in isolation (no
+  ART/engine), reproduces `reloc type 18` in seconds, then proves the fix on ONE reloc (handle `R_X86_64_TPOFF64`
+  → `libm.so` links + a `sqrt(-1.0)` sets `errno==EDOM` per-thread); RELR/BIND_NOW are then incremental. The probe
+  + extension are dynamic-linker work → **main-loop / dev-host only, never a subagent** (cyber-safeguard). This doc
+  is decision-only; no implementation, no reloc code. Doc-only change → full gate untouched (`cargo build
+  --all-targets` clean, no code edited). The cyber-safeguard did NOT trip (grounded only in AGENTS.md run evidence,
+  `src/runtime.rs` strategy, `bionic-loader-plan.md`, and general public ELF knowledge — no linker `.c`/`.h` read,
+  no web).
 
 ---
 
@@ -1637,6 +1671,9 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 | `docs/art-and-runtime.md` | Vendored ART/runtime: build, performance, stability. |
 | `docs/dependency-plan.md` | What each subsystem will depend on. |
 | `docs/m0-runbook.md` | The next step: validate the foundation. |
+| `docs/bionic-loader-plan.md` | Build-ready bionic NDK-soname-shim spec (DEFERRED, main-loop). |
+| `docs/bionic-loader-strategy.md` | Bionic-loader v1 strategy: the modern-relocation wall + chosen path. |
+| `docs/dev-host-runbook.md` | Dev-host execution steps the cargo-test harness can't run. |
 
 ---
 
