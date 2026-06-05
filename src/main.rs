@@ -180,7 +180,10 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // Step 3.5 win). The Activity Surface + engine rendering will hang off this window next; for
     // now it opens the window and runs the event loop until closed. Runs on the main thread, with
     // `vm` (the booted VM) still alive on it.
+    // Pass a borrow of the live VM so a pointer click in the window can dispatch View.performClick()
+    // to the hit Android view via JNI (the minimal sound input path). `vm` stays alive (bound above)
+    // for the whole event loop on this main thread, so the borrow is valid for its duration.
     println!("# Opening the host window (winit; close it to exit)…");
-    eclipse::graphics::run_windowed(&format!("Eclipse — {}", manifest.package))?;
+    eclipse::graphics::run_windowed(&format!("Eclipse — {}", manifest.package), Some(&vm))?;
     Ok(())
 }

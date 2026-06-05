@@ -3250,6 +3250,31 @@ extern "system" fn view_native_constructor<'local>(
         let class_name = view_class_name(env, &this).unwrap_or_default();
         match view_registry::allocate(&class_name) {
             Ok(handle) => {
+                // 2026-06-05: record a JNI global ref to the Java View object so a pointer click
+                // resolved to this view (by handle) can dispatch View.performClick() on the REAL
+                // object from the event loop (firing its OnClickListener). A failure to create the
+                // global ref (or to store it) leaves the view non-dispatchable but still drawn —
+                // logged, never fatal. `new_global_ref` over a non-null `this` is sound here.
+                match env.new_global_ref(&this) {
+                    Ok(global) => {
+                        if let Err(e) = view_registry::set_jobject(handle, global) {
+                            tracing::debug!(
+                                target: "android.view.View",
+                                class = %class_name,
+                                handle,
+                                error = %e,
+                                "View.native_constructor: could not store view jobject (non-dispatchable)"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::debug!(
+                        target: "android.view.View",
+                        class = %class_name,
+                        handle,
+                        error = %e,
+                        "View.native_constructor: new_global_ref failed (view non-dispatchable)"
+                    ),
+                }
                 tracing::debug!(
                     target: "android.view.View",
                     class = %class_name,
@@ -4611,14 +4636,16 @@ pub const IMAGE_BUTTON_CLASS: &JNIStr = jni_str!("android/widget/ImageButton");
 const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
 const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 
-/// `View.nativeSetOnClickListener(long widget)` → validate the view handle; no-op (no input dispatch
-/// in the draw-free lifecycle, 2026-06-05).
+/// `View.nativeSetOnClickListener(long widget)` → mark the view clickable on its [`view_registry`]
+/// peer (2026-06-05).
 ///
 /// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle.
-/// Validates it through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
-/// ignored, never UB) and no-ops: Eclipse's lifecycle dispatches no touch events yet, so marking the
-/// view clickable has no consumer (input dispatch is the deferred build). Surfaced 2026-06-05 by
-/// AppCompat's Toolbar setting its navigation button's click listener.
+/// Android calls this from `View.setOnClickListener` to mark the native peer clickable; Eclipse
+/// records `clickable = true` on the peer through the bounds+generation-checked [`view_registry`] (a
+/// bad handle is logged + ignored, never UB). The renderer's hit-test then targets this view on a
+/// pointer click and dispatches `View.performClick()` to it (the minimal click path, 2026-06-05);
+/// full `MotionEvent`/`InputQueue` touch+move+key dispatch is the documented follow-up. Surfaced
+/// 2026-06-05 by AppCompat's Toolbar setting its navigation button's click listener.
 ///
 /// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
 /// `()` default on error/panic.
@@ -4628,13 +4655,18 @@ extern "system" fn image_button_set_on_click_listener<'local>(
     widget: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
-            tracing::debug!(
+        match view_registry::set_clickable(widget) {
+            Ok(()) => tracing::debug!(
+                target: "android.widget.ImageButton",
+                widget,
+                "View.nativeSetOnClickListener: marked view clickable (hit-test will target it)"
+            ),
+            Err(e) => tracing::debug!(
                 target: "android.widget.ImageButton",
                 widget,
                 error = %e,
                 "ImageButton.nativeSetOnClickListener: invalid view handle (ignored)"
-            );
+            ),
         }
         Ok(())
     })
@@ -5338,6 +5370,76 @@ pub fn drive_application_lifecycle(
             Err(_) => Err(FrameworkError::Panicked),
         }
     })
+}
+
+/// Dispatch a click to the [`view_registry`] view identified by `handle` by calling the public Java
+/// `View.performClick()Z` on its recorded global object — firing the registered `OnClickListener`.
+///
+/// 2026-06-05: the minimal SOUND click path. The winit event loop (`graphics.rs`) hit-tests the laid-
+/// out view tree on a primary pointer press+release, then calls this with the hit view's handle and a
+/// borrow of the held [`Vm`]. The `&Vm` keeps the VM alive (and pins us to its main thread) for the
+/// call; the event loop runs on that same JNI-attached main thread, so re-attaching is cheap and the
+/// VM is reachable. The full `MotionEvent`/`InputQueue` touch+move+key dispatch is the documented
+/// follow-up.
+///
+/// The JNI work is `catch_unwind`-guarded so a Rust panic can never unwind into ART's C++; a thrown
+/// Java exception is described + cleared by [`checked`]. Returns `true` iff `performClick` ran and
+/// returned `true` (Android: a listener was invoked); `false`/typed `Err` otherwise — never a panic
+/// across the boundary.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
+/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn dispatch_click_to_view(
+    vm: &Vm,
+    handle: view_registry::ViewHandle,
+) -> Result<bool, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
+    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
+    // process VM singleton (idempotent across calls).
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| perform_click(env, handle))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Call `View.performClick()Z` on the global object recorded for `handle`. Returns `false` (not an
+/// error) when the handle is valid but has no recorded global object (a non-dispatchable view) or is
+/// stale/fabricated — those are normal "nothing to click" outcomes the event loop ignores. A thrown
+/// Java exception inside `performClick` is turned into a typed [`FrameworkError::Jni`] by [`checked`].
+fn perform_click(env: &mut Env, handle: view_registry::ViewHandle) -> Result<bool, FrameworkError> {
+    // Hold the registry lock only long enough to read the global ref into a `call_method`. The
+    // closure makes exactly one JNI call (no registry re-entry), so the lock contract of
+    // `with_jobject` is honored.
+    let result = view_registry::with_jobject(handle, |global| {
+        checked(env, "View.performClick", |env| {
+            env.call_method(
+                global.as_obj(),
+                jni_str!("performClick"),
+                jni_sig!("()Z"),
+                &[],
+            )?
+            .z()
+        })
+    });
+    match result {
+        Ok(Some(Ok(clicked))) => Ok(clicked),
+        Ok(Some(Err(e))) => Err(e),
+        // Valid handle but no recorded jobject: a non-dispatchable view — nothing to click.
+        Ok(None) => Ok(false),
+        // Stale/fabricated handle or poisoned lock: nothing to click (logged, not fatal).
+        Err(e) => {
+            tracing::debug!(handle, error = %e, "performClick: view not dispatchable (ignored)");
+            Ok(false)
+        }
+    }
 }
 
 /// Prove the bridge, then drive recipe steps 1–5 to the launcher Activity's `onCreate`. Split out so

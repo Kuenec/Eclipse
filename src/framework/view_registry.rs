@@ -34,6 +34,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+use jni::objects::JObject;
+use jni::refs::Global;
 use jni::sys::jlong;
 
 /// Process-global slab of [`ViewState`], guarded by a [`Mutex`]. Initialized on first use.
@@ -151,6 +153,17 @@ pub struct ViewState {
     /// The view's requested [`LayoutParams`], recorded by `native_setLayoutParams`/`native_setPadding`.
     /// Defaults to `WRAP_CONTENT` on both axes (Android's default) until those natives set it.
     pub layout: LayoutParams,
+    /// 2026-06-05: `true` once `View.nativeSetOnClickListener` recorded a click listener on this view
+    /// (Android marks the native peer clickable). The renderer's hit-test only dispatches a click to a
+    /// clickable view, so an inert container/text view is never targeted. Defaults `false`.
+    pub clickable: bool,
+    /// 2026-06-05: a JNI **global** reference to this view's Java `View` object, recorded by the view's
+    /// native constructor from its `this`. Held so a pointer click resolved to this view (by handle)
+    /// can dispatch `View.performClick()` on the **real** Java object from the event loop, firing the
+    /// registered `OnClickListener`. `None` if the constructor could not create the global ref (the
+    /// view is then non-dispatchable — logged, never UB). A `Global` is `Send`, so it lives soundly in
+    /// this process-global slab; it is released when the slot is [`free`]d (its `Drop` deletes the ref).
+    pub jobject: Option<Global<JObject<'static>>>,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -198,6 +211,8 @@ pub fn allocate(class_name: &str) -> Result<ViewHandle, ViewRegistryError> {
         text: None,
         children: Vec::new(),
         layout: LayoutParams::default(),
+        clickable: false,
+        jobject: None,
     };
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -260,6 +275,42 @@ pub fn free(handle: ViewHandle) -> Result<(), ViewRegistryError> {
     Ok(())
 }
 
+/// Mark the view a `handle` refers to as clickable (a click listener was recorded by
+/// `View.nativeSetOnClickListener`). 2026-06-05: the renderer's hit-test only dispatches a click to a
+/// clickable view. Validates the handle exactly like [`with_view`], so a stale/fabricated handle is a
+/// typed `Err`, never UB.
+pub fn set_clickable(handle: ViewHandle) -> Result<(), ViewRegistryError> {
+    with_view(handle, |v| v.clickable = true)
+}
+
+/// Record the JNI **global** reference to a view's Java `View` object onto its registry slot, so a
+/// click resolved to this view (by handle) can later call `View.performClick()` on the real object.
+///
+/// 2026-06-05: called by the view's native constructor from a global ref it created over `this`. A
+/// `Global` is `Send` and owns the underlying JNI global reference (released on `Drop` when the slot
+/// is [`free`]d or this `Option` is replaced). Validates the handle like [`with_view`].
+pub fn set_jobject(
+    handle: ViewHandle,
+    jobject: Global<JObject<'static>>,
+) -> Result<(), ViewRegistryError> {
+    with_view(handle, move |v| v.jobject = Some(jobject))
+}
+
+/// Run `f` with a **borrow** of the view's stored Java-object global reference, if one is recorded.
+///
+/// 2026-06-05: the click-dispatch path. Returns `Ok(None)` when the handle is valid but no global ref
+/// was recorded (a non-dispatchable view — e.g. its constructor failed to create the ref); `Ok(Some(r))`
+/// with `f`'s result otherwise; `Err` for a stale/fabricated handle or a poisoned lock. `f` receives
+/// `&Global<JObject<'static>>` (not ownership), so the slot keeps the ref alive across the dispatch.
+/// The registry lock is held for the duration of `f`, so `f` must not re-enter the registry (the
+/// dispatch only makes a JNI call, which does not).
+pub fn with_jobject<R>(
+    handle: ViewHandle,
+    f: impl FnOnce(&Global<JObject<'static>>) -> R,
+) -> Result<Option<R>, ViewRegistryError> {
+    with_view(handle, |v| v.jobject.as_ref().map(f))
+}
+
 /// Publish `handle` as the window's content-root view (called by `Window.set_widget_as_root`), so
 /// the renderer's per-frame [`snapshot_tree`] knows which subtree to draw. Passing `0` clears it.
 ///
@@ -284,6 +335,11 @@ pub fn active_root() -> ViewHandle {
 /// `layout` + `class_name`; `depth` is kept for depth-distinguished fill colors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderNode {
+    /// The view's registry [`ViewHandle`] (the same `jlong` the View native peer holds). 2026-06-05:
+    /// carried into the snapshot so the renderer's hit-test can map a hit rect back to the live view
+    /// (to dispatch a click via [`with_jobject`]) without re-walking the tree. An opaque index, never
+    /// a pointer.
+    pub handle: ViewHandle,
     /// The Java class that constructed the view (e.g. `android.widget.TextView`).
     pub class_name: String,
     /// The view's text, if any (`TextView.setText`). `None` for non-text containers.
@@ -292,6 +348,9 @@ pub struct RenderNode {
     pub depth: u32,
     /// The view's requested layout parameters (sizing/gravity/weight/margins/padding).
     pub layout: LayoutParams,
+    /// 2026-06-05: mirrors [`ViewState::clickable`] — `true` if a click listener was recorded. The
+    /// hit-test only targets clickable views.
+    pub clickable: bool,
     /// Indices (into the flat snapshot `Vec`) of this node's children, in their recorded order.
     pub children: Vec<usize>,
 }
@@ -342,10 +401,12 @@ pub fn snapshot_tree() -> Vec<RenderNode> {
         };
         let my_idx = out.len();
         out.push(RenderNode {
+            handle,
             class_name: state.class_name.clone(),
             text: state.text.clone(),
             depth,
             layout: state.layout,
+            clickable: state.clickable,
             children: Vec::new(),
         });
         if let Some(parent) = out.get_mut(parent_idx) {
@@ -554,5 +615,53 @@ mod tests {
             "stale root handle → empty snapshot (no UB)"
         );
         set_active_root(0);
+    }
+
+    // 2026-06-05: the click-path additions. `set_clickable` flips the flag (carried into the
+    // snapshot the hit-test reads); `with_jobject` returns `None` for a view with no recorded
+    // global ref and `Err` for a stale/fabricated handle — both are "nothing to click" outcomes the
+    // event loop treats as no-ops, never UB. (Recording/calling a real jobject needs a VM and is
+    // validated on the dev-host run, not in-harness.)
+    #[test]
+    fn set_clickable_marks_view_and_flows_into_snapshot() {
+        let h = allocate("android.widget.ImageButton").expect("alloc");
+        // Default is not clickable.
+        assert_eq!(with_view(h, |v| v.clickable), Ok(false));
+        set_clickable(h).expect("set clickable");
+        assert_eq!(with_view(h, |v| v.clickable), Ok(true));
+
+        set_active_root(h);
+        let snap = snapshot_tree();
+        set_active_root(0);
+        free(h).expect("free");
+        assert!(
+            snap[0].clickable,
+            "clickable must flow into the snapshot node"
+        );
+        assert_eq!(snap[0].handle, h, "the snapshot carries the view's handle");
+    }
+
+    #[test]
+    fn set_clickable_on_stale_or_fabricated_handle_is_err() {
+        let h = allocate("x").expect("alloc");
+        free(h).expect("free");
+        assert_eq!(set_clickable(h), Err(ViewRegistryError::StaleHandle));
+        assert_eq!(
+            set_clickable(pack(u32::MAX, 1)),
+            Err(ViewRegistryError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn with_jobject_is_none_without_a_recorded_object_and_err_when_stale() {
+        let h = allocate("android.widget.ImageButton").expect("alloc");
+        // No jobject recorded (no VM in-harness) → Ok(None): a valid but non-dispatchable view.
+        assert_eq!(with_jobject(h, |_| 1i32), Ok(None));
+        free(h).expect("free");
+        // Stale handle → Err, never UB.
+        assert_eq!(
+            with_jobject(h, |_| 1i32),
+            Err(ViewRegistryError::StaleHandle)
+        );
     }
 }
