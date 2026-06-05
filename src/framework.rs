@@ -80,7 +80,7 @@ use jni::objects::{JClass, JIntArray, JObject, JString};
 use jni::refs::Reference;
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
-use jni::sys::{jboolean, jint, jlong, jshort};
+use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
@@ -88,6 +88,7 @@ use crate::runtime::Vm;
 
 pub mod matrix_registry;
 pub mod paint_registry;
+pub mod path_registry;
 pub mod theme_registry;
 pub mod view_registry;
 pub mod window_registry;
@@ -3980,6 +3981,432 @@ fn register_matrix_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.graphics.Path vector geometry ==================
+//
+// 2026-06-05: `AdaptiveIconDrawable.<init> → PathParser.createPathFromPathData → Path.moveTo` builds
+// the adaptive-icon mask, surfacing `long android.graphics.Path.native_create_builder(long, long)`
+// (run log 2026-06-05, AdaptiveIconDemo). This ART build routes `Path` construction through a builder:
+// `Path.getBuilder()` calls `native_create_builder` once (lazily), then each `moveTo`/`lineTo`/
+// `quadTo`/`cubicTo`/`close` is a native op on that builder handle. A `Path` is REAL vector geometry,
+// so it is backed by the Eclipse-owned [`path_registry`] generational slab (a slab index, NOT a raw
+// pointer). The geometry is recorded faithfully (the actual parsed coordinates) — never a sentinel;
+// faking the shape is forbidden (AGENTS.md core principle). Each Path native is added here as the
+// discovery loop surfaces it, with the descriptor taken from the exact ART `No implementation found`
+// line + the AOSP `Path.java` native declarations.
+
+/// `android.graphics.Path` (internal/slashed name for `find_class`) — hosts the Path natives.
+pub const PATH_CLASS: &JNIStr = jni_str!("android/graphics/Path");
+
+// JNI name + descriptor for Path.native_create_builder, from the ART-reported signature `long
+// android.graphics.Path.native_create_builder(long, long)` (run log 2026-06-05): a static native,
+// descriptor `(JJ)J`. The first `long` is the existing native path object to seed the builder from
+// (`0` = empty); the second `long` is a reserve/hint AOSP passes through. Eclipse allocates a fresh
+// path_registry geometry slot (seeded from the source path's geometry when non-zero) and returns its
+// slab handle; the subsequent moveTo/lineTo/… ops mutate that slot's geometry.
+const PATH_NATIVE_CREATE_BUILDER_NAME: &JNIStr = jni_str!("native_create_builder");
+const PATH_NATIVE_CREATE_BUILDER_SIG: &JNIStr = jni_str!("(JJ)J");
+
+// JNI names + descriptors for the Path builder mutation ops, from the ART-reported signatures (run
+// log 2026-06-05) + AOSP `Path.java`'s native declarations. The first `long` of each is the builder
+// handle returned by `native_create_builder`; the trailing `float`s are the contour coordinates.
+// `native_move_to(long, float, float)` was confirmed surfaced by the discovery loop; `line_to`/
+// `quad_to`/`cubic_to`/`close` follow the same builder-op pattern (each is bound here and confirmed/
+// corrected by the loop). They record the REAL parsed geometry on the builder's path_registry slot.
+const PATH_NATIVE_MOVE_TO_NAME: &JNIStr = jni_str!("native_move_to");
+const PATH_NATIVE_MOVE_TO_SIG: &JNIStr = jni_str!("(JFF)V");
+const PATH_NATIVE_LINE_TO_NAME: &JNIStr = jni_str!("native_line_to");
+const PATH_NATIVE_LINE_TO_SIG: &JNIStr = jni_str!("(JFF)V");
+const PATH_NATIVE_QUAD_TO_NAME: &JNIStr = jni_str!("native_quad_to");
+const PATH_NATIVE_QUAD_TO_SIG: &JNIStr = jni_str!("(JFFFF)V");
+const PATH_NATIVE_CUBIC_TO_NAME: &JNIStr = jni_str!("native_cubic_to");
+const PATH_NATIVE_CUBIC_TO_SIG: &JNIStr = jni_str!("(JFFFFFF)V");
+const PATH_NATIVE_CLOSE_NAME: &JNIStr = jni_str!("native_close");
+const PATH_NATIVE_CLOSE_SIG: &JNIStr = jni_str!("(J)V");
+
+// JNI name + descriptor for Path.native_create_path, from the ART-reported signature `long
+// android.graphics.Path.native_create_path(long)` (run log 2026-06-05): a static native, descriptor
+// `(J)J`. AOSP's `Path.getGskPath()`/`Path.<init>` calls it to FOLD the builder back into a finalized
+// native path object — the `long` arg is the builder handle, the return is the finalized path's
+// handle. Eclipse allocates a new path_registry slot holding a COPY of the builder's real geometry
+// (the finalized, immutable path) and returns its slab handle.
+const PATH_NATIVE_CREATE_PATH_NAME: &JNIStr = jni_str!("native_create_path");
+const PATH_NATIVE_CREATE_PATH_SIG: &JNIStr = jni_str!("(J)J");
+
+// JNI name + descriptor for Path.native_ref_path, from the ART-reported signature `long
+// android.graphics.Path.native_ref_path(long)` (run log 2026-06-05): a static native, descriptor
+// `(J)J`. In AOSP-GSK's refcounted model `Path.<init>` calls it to take ownership of the GSK path
+// into `mNativePath`, returning the native handle. Eclipse's registry is a generational slab (not a
+// refcount), so this allocates a new slot holding a COPY of the source geometry — independent
+// ownership matching `Path(Path src)` semantics, never a shared-mutation alias across the slab.
+const PATH_NATIVE_REF_PATH_NAME: &JNIStr = jni_str!("native_ref_path");
+const PATH_NATIVE_REF_PATH_SIG: &JNIStr = jni_str!("(J)J");
+
+/// `Path.native_create_builder(long nativePath, long reserve)` → a real Eclipse-owned
+/// [`path_registry`] geometry handle (2026-06-05).
+///
+/// JNI ABI: a `static` native (`(JJ)J`), so the parameters are
+/// `(EnvUnowned, JClass, jlong native_path, jlong reserve)`. `native_path == 0` allocates a fresh
+/// empty path; a non-zero `native_path` seeds the builder with a COPY of that path's geometry (exact,
+/// via [`path_registry::get`]) so `getBuilder` can continue appending to an existing `Path`. The
+/// `reserve` hint is not load-bearing for a `Vec`-backed buffer (it grows on demand) and is logged
+/// only. Returns the new slab handle (≥ 1, never `0`). On a registry error returns `0` (AOSP treats a
+/// `0` native object as an empty path, so this degrades to an empty path rather than UB).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
+/// error/panic.
+extern "system" fn path_native_create_builder<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_path: jlong,
+    reserve: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        // Seed the builder from the source path's geometry (empty when native_path == 0) — a COPY, so
+        // it never aliases the source slot.
+        let geometry = if native_path == 0 {
+            path_registry::PathGeometry::default()
+        } else {
+            match path_registry::get(native_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "android.graphics.Path",
+                        native_path,
+                        error = %e,
+                        "Path.native_create_builder: source handle invalid → empty path"
+                    );
+                    path_registry::PathGeometry::default()
+                }
+            }
+        };
+        match path_registry::allocate(geometry) {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.graphics.Path",
+                    native_path,
+                    reserve,
+                    handle,
+                    "Path.native_create_builder: allocated non-GTK path-registry geometry handle"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.Path",
+                    error = %e,
+                    "Path.native_create_builder: path-registry allocate failed → 0 (empty path)"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Record a geometry op on the builder handle's [`path_registry`] slot. Shared by the move/line/quad/
+/// cubic/close natives: it locates the slot (bounds+generation-checked), runs `op` against its real
+/// geometry, and logs a debug line. A stale/fabricated handle is logged at warn and ignored (the
+/// registry rejects it — never UB). `op_name` names the op for the log only.
+fn path_record(
+    handle: jlong,
+    op_name: &'static str,
+    op: impl FnOnce(&mut path_registry::PathGeometry),
+) {
+    match path_registry::with_path(handle, op) {
+        Ok(()) => {
+            tracing::trace!(
+                target: "android.graphics.Path",
+                handle,
+                op = op_name,
+                "Path builder op recorded on path-registry geometry"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "android.graphics.Path",
+                handle,
+                op = op_name,
+                error = %e,
+                "Path builder op: builder handle invalid (ignored)"
+            );
+        }
+    }
+}
+
+/// `Path.native_move_to(long builder, float x, float y)` → record a `moveTo` on the builder's geometry.
+///
+/// JNI ABI: a `static` native returning void (`(JFF)V`), so the parameters are
+/// `(EnvUnowned, JClass, jlong builder, jfloat x, jfloat y)`. Records the REAL coordinates on the
+/// builder's [`path_registry`] slot. `catch_unwind`-guarded via `with_env`; `resolve` returns `()`.
+extern "system" fn path_native_move_to<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    builder: jlong,
+    x: jfloat,
+    y: jfloat,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        path_record(builder, "moveTo", |g| g.move_to(x, y));
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Path.native_line_to(long builder, float x, float y)` → record a `lineTo` on the builder's geometry.
+///
+/// JNI ABI: a `static` native returning void (`(JFF)V`). See [`path_native_move_to`] for the contract.
+extern "system" fn path_native_line_to<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    builder: jlong,
+    x: jfloat,
+    y: jfloat,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        path_record(builder, "lineTo", |g| g.line_to(x, y));
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Path.native_quad_to(long builder, float cx, float cy, float x, float y)` → record a quadratic
+/// Bézier on the builder's geometry.
+///
+/// JNI ABI: a `static` native returning void (`(JFFFF)V`). See [`path_native_move_to`] for the contract.
+extern "system" fn path_native_quad_to<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    builder: jlong,
+    cx: jfloat,
+    cy: jfloat,
+    x: jfloat,
+    y: jfloat,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        path_record(builder, "quadTo", |g| g.quad_to(cx, cy, x, y));
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Path.native_cubic_to(long builder, float c1x, float c1y, float c2x, float c2y, float x, float y)`
+/// → record a cubic Bézier on the builder's geometry.
+///
+/// JNI ABI: a `static` native returning void (`(JFFFFFF)V`). See [`path_native_move_to`] for the
+/// contract.
+extern "system" fn path_native_cubic_to<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    builder: jlong,
+    c1x: jfloat,
+    c1y: jfloat,
+    c2x: jfloat,
+    c2y: jfloat,
+    x: jfloat,
+    y: jfloat,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        path_record(builder, "cubicTo", |g| g.cubic_to(c1x, c1y, c2x, c2y, x, y));
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Path.native_close(long builder)` → record a `close` on the builder's geometry.
+///
+/// JNI ABI: a `static` native returning void (`(J)V`). See [`path_native_move_to`] for the contract.
+extern "system" fn path_native_close<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    builder: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        path_record(builder, "close", |g| g.close());
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Allocate a new [`path_registry`] slot holding a COPY of `source`'s geometry, returning its slab
+/// handle. Shared by `native_create_path` (fold builder → finalized path) and `native_ref_path` (take
+/// independent ownership into a `Path`): both produce a new, independently-owned native path object
+/// from a source handle in Eclipse's generational-slab model. A `0`/stale `source` yields an empty
+/// path (logged); a registry-allocate error yields `0` (AOSP treats `0` as an empty native path →
+/// degrades, never UB). `op_name` names the op for the log only.
+fn path_clone_handle(source: jlong, op_name: &'static str) -> jlong {
+    let geometry = if source == 0 {
+        path_registry::PathGeometry::default()
+    } else {
+        match path_registry::get(source) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.Path",
+                    source,
+                    op = op_name,
+                    error = %e,
+                    "Path clone: source handle invalid → empty path"
+                );
+                path_registry::PathGeometry::default()
+            }
+        }
+    };
+    match path_registry::allocate(geometry) {
+        Ok(handle) => {
+            tracing::debug!(
+                target: "android.graphics.Path",
+                source,
+                handle,
+                op = op_name,
+                "Path clone: allocated independently-owned path-registry geometry"
+            );
+            handle
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "android.graphics.Path",
+                op = op_name,
+                error = %e,
+                "Path clone: path-registry allocate failed → 0 (empty path)"
+            );
+            0
+        }
+    }
+}
+
+/// `Path.native_create_path(long builder)` → fold the builder into a finalized native path
+/// (2026-06-05).
+///
+/// JNI ABI: a `static` native (`(J)J`), so the parameters are `(EnvUnowned, JClass, jlong builder)`.
+/// Allocates a new [`path_registry`] slot holding a COPY of the builder's real geometry (the finalized
+/// path) and returns its slab handle (via [`path_clone_handle`]).
+///
+/// `catch_unwind`-guarded via `with_env`; `resolve::<LogErrorAndDefault>` returns the `jlong` default
+/// (`0`) on error/panic.
+extern "system" fn path_native_create_path<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    builder: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        Ok(path_clone_handle(builder, "native_create_path"))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Path.native_ref_path(long src)` → take independent ownership of the source path's geometry into a
+/// `Path`'s `mNativePath` (2026-06-05).
+///
+/// JNI ABI: a `static` native (`(J)J`), so the parameters are `(EnvUnowned, JClass, jlong src)`.
+/// Allocates a new [`path_registry`] slot holding a COPY of `src`'s geometry (via
+/// [`path_clone_handle`]) — Eclipse's slab models AOSP-GSK's ref by independent ownership.
+///
+/// `catch_unwind`-guarded via `with_env`; `resolve::<LogErrorAndDefault>` returns the `jlong` default
+/// (`0`) on error/panic.
+extern "system" fn path_native_ref_path<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    src: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        Ok(path_clone_handle(src, "native_ref_path"))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Path`'s natives.
+///
+/// Registered before step 4, alongside the View/Paint/Matrix natives, since a launcher's onCreate may
+/// build a vector-drawable path during step 5 (AdaptiveIconDemo's `getDrawable` →
+/// `AdaptiveIconDrawable.<init>` → `PathParser`). Each native is implemented against [`path_registry`]
+/// recording the REAL parsed geometry (no GTK, no Skia-C).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do — each native is written to the exact descriptor the run reported. Every native body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(PATH_CLASS)?;
+    let methods = [
+        // SAFETY: `path_native_create_builder` matches the paired `(JJ)J` signature as a static
+        // native; casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_CREATE_BUILDER_NAME,
+                PATH_NATIVE_CREATE_BUILDER_SIG,
+                path_native_create_builder as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `path_native_move_to` matches the paired `(JFF)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_MOVE_TO_NAME,
+                PATH_NATIVE_MOVE_TO_SIG,
+                path_native_move_to as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `path_native_line_to` matches the paired `(JFF)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_LINE_TO_NAME,
+                PATH_NATIVE_LINE_TO_SIG,
+                path_native_line_to as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `path_native_quad_to` matches the paired `(JFFFF)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_QUAD_TO_NAME,
+                PATH_NATIVE_QUAD_TO_SIG,
+                path_native_quad_to as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `path_native_cubic_to` matches the paired `(JFFFFFF)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_CUBIC_TO_NAME,
+                PATH_NATIVE_CUBIC_TO_SIG,
+                path_native_cubic_to as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `path_native_close` matches the paired `(J)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_CLOSE_NAME,
+                PATH_NATIVE_CLOSE_SIG,
+                path_native_close as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `path_native_create_path` matches the paired `(J)J` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_CREATE_PATH_NAME,
+                PATH_NATIVE_CREATE_PATH_SIG,
+                path_native_create_path as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `path_native_ref_path` matches the paired `(J)J` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_REF_PATH_NAME,
+                PATH_NATIVE_REF_PATH_SIG,
+                path_native_ref_path as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/graphics/Path; the fn pointers' signatures match its
+    // `native_create_builder`/`native_move_to`/… declarations (from the ART-reported signatures,
+    // 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/graphics/Path",
+        "registered Eclipse's non-GTK backing for Path.native_create_builder + move/line/quad/cubic/close"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.widget.TextView native peer construction =======
 //
 // 2026-06-05: the launcher layout contains a `<TextView>`, so step 5 (`setContentView` →
@@ -4997,6 +5424,11 @@ fn drive_lifecycle(
     // constructs a Matrix during step 5's setContentView (drawable manager), so this must be bound
     // before step 4. Bound non-GTK against matrix_registry with exact 3x3 affine math (no drawing).
     register_matrix_natives(env)?;
+    // Bind android.graphics.Path's geometry natives on its own class — a launcher's onCreate may
+    // build a vector-drawable path during step 5 (e.g. AdaptiveIconDemo's getDrawable →
+    // AdaptiveIconDrawable → PathParser → Path.moveTo), so this must be bound before step 4. Bound
+    // non-GTK against path_registry, recording the REAL parsed contour geometry (no GTK, no Skia-C).
+    register_path_natives(env)?;
 
     // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
     // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
@@ -6044,6 +6476,37 @@ mod tests {
         // finalizer(long) → `(J)V`, surfaced 2026-06-05; frees the matrix_registry slot.
         assert_eq!(MATRIX_FINALIZER_NAME.to_str(), "finalizer");
         assert_eq!(MATRIX_FINALIZER_SIG.to_str(), "(J)V");
+    }
+
+    #[test]
+    fn path_native_names_sigs_and_class_match_art_reported() {
+        // Pin android.graphics.Path's class + the geometry natives' names/descriptors against the exact
+        // signatures ART reported missing during AdaptiveIconDemo's adaptive-icon path build (run logs
+        // 2026-06-05: `native_create_builder(long, long)`, then `native_move_to(long, float, float)`,
+        // then `native_create_path(long)`, then `native_ref_path(long)`). A transcription regression
+        // would make RegisterNatives throw NoSuchMethodError when PathParser builds the mask path. The
+        // line/quad/cubic/close ops follow the same builder-op pattern (the loop bound them with no new
+        // UnsatisfiedLinkError). Host-independent constants.
+        assert_eq!(PATH_CLASS.to_str(), "android/graphics/Path");
+        assert_eq!(
+            PATH_NATIVE_CREATE_BUILDER_NAME.to_str(),
+            "native_create_builder"
+        );
+        assert_eq!(PATH_NATIVE_CREATE_BUILDER_SIG.to_str(), "(JJ)J");
+        assert_eq!(PATH_NATIVE_MOVE_TO_NAME.to_str(), "native_move_to");
+        assert_eq!(PATH_NATIVE_MOVE_TO_SIG.to_str(), "(JFF)V");
+        assert_eq!(PATH_NATIVE_LINE_TO_NAME.to_str(), "native_line_to");
+        assert_eq!(PATH_NATIVE_LINE_TO_SIG.to_str(), "(JFF)V");
+        assert_eq!(PATH_NATIVE_QUAD_TO_NAME.to_str(), "native_quad_to");
+        assert_eq!(PATH_NATIVE_QUAD_TO_SIG.to_str(), "(JFFFF)V");
+        assert_eq!(PATH_NATIVE_CUBIC_TO_NAME.to_str(), "native_cubic_to");
+        assert_eq!(PATH_NATIVE_CUBIC_TO_SIG.to_str(), "(JFFFFFF)V");
+        assert_eq!(PATH_NATIVE_CLOSE_NAME.to_str(), "native_close");
+        assert_eq!(PATH_NATIVE_CLOSE_SIG.to_str(), "(J)V");
+        assert_eq!(PATH_NATIVE_CREATE_PATH_NAME.to_str(), "native_create_path");
+        assert_eq!(PATH_NATIVE_CREATE_PATH_SIG.to_str(), "(J)J");
+        assert_eq!(PATH_NATIVE_REF_PATH_NAME.to_str(), "native_ref_path");
+        assert_eq!(PATH_NATIVE_REF_PATH_SIG.to_str(), "(J)J");
     }
 
     #[test]

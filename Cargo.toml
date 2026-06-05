@@ -60,6 +60,12 @@ raw-window-handle = "0.6"                         # the window/display handle ab
 # no C/system font lib (§2.1); the system font FILE is found portably at runtime via fontconfig
 # `fc-match` / known font dirs (detect-don't-assume §9), never linking fontconfig.
 ab_glyph = "0.2"
+# 2026-06-05: pure-Rust software 2D rasterizer (a Skia subset, no C/Skia link) for the vector-drawable
+# pass — fills each android.graphics.Path's REAL recorded geometry (path_registry) into an RGBA Pixmap
+# the renderer uploads as a GPU texture (mirroring the glyph atlas). `std` + `simd` (default) kept;
+# `png-format` dropped (no PNG encode/decode — Eclipse uploads raw RGBA straight to the GPU; no bloat
+# §2.5). Pure Rust (tiny-skia-path/png/fdeflate), no GTK/Cairo/Skia-C (§2.1).
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 # 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
 # The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.

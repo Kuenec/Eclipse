@@ -3251,6 +3251,145 @@ impl Drop for VulkanRenderer {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Vector-drawable RASTER: fill an android.graphics.Path's REAL geometry into an RGBA pixmap.
+//
+// 2026-06-05: a launcher's onCreate may build a vector-drawable path (AdaptiveIconDemo's adaptive-icon
+// mask: `getDrawable` → `AdaptiveIconDrawable` → `PathParser` → `Path.moveTo/lineTo/cubicTo`). Those
+// natives record the REAL parsed contour geometry into [`path_registry`] (a verb+point buffer — NOT a
+// fabricated shape). This module rasterizes that geometry, transformed by the owning Canvas/view
+// matrix ([`matrix_registry::Affine`]) and filled with the paint color ([`paint_registry`]'s ARGB),
+// into an RGBA [`Pixmap`] via the pure-Rust tiny-skia software rasterizer. The pixmap is then uploaded
+// as a GPU texture and drawn over the owning view's rect — MIRRORING the glyph-atlas texture upload +
+// textured pipeline above (the documented next compositing step; the upload path generalizes the R8
+// atlas to RGBA). The raster itself is GPU-free, so it is unit-tested without Vulkan.
+// ---------------------------------------------------------------------------------------------
+
+use crate::framework::matrix_registry::Affine;
+use crate::framework::path_registry::{PathGeometry, Verb};
+use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
+
+/// How a [`PathGeometry`] is filled: the ARGB color (AOSP `Paint.getColor()`, the `paint_registry`
+/// value) and the even-odd vs winding fill rule (AOSP `Path.getFillType()`). Vector-drawable masks use
+/// non-zero winding by default; this stays explicit so the raster matches the source path's rule.
+#[derive(Debug, Clone, Copy)]
+pub struct FillStyle {
+    /// ARGB color as AOSP `Paint.setColor` stores it (0xAARRGGBB).
+    pub argb: i32,
+    /// `true` for even-odd, `false` for non-zero winding (AOSP default).
+    pub even_odd: bool,
+}
+
+impl Default for FillStyle {
+    fn default() -> Self {
+        // Opaque black, non-zero winding — AOSP's default Paint color + Path fill type.
+        Self {
+            argb: 0xFF00_0000u32 as i32,
+            even_odd: false,
+        }
+    }
+}
+
+/// Convert an AOSP 0xAARRGGBB `argb` int into tiny-skia's straight (un-premultiplied) RGBA8 channels.
+fn argb_to_rgba8(argb: i32) -> (u8, u8, u8, u8) {
+    let v = argb as u32;
+    let a = (v >> 24) as u8;
+    let r = (v >> 16) as u8;
+    let g = (v >> 8) as u8;
+    let b = v as u8;
+    (r, g, b, a)
+}
+
+/// Build a tiny-skia [`tiny_skia::Path`] from Eclipse's real [`PathGeometry`] verb/point buffer.
+///
+/// Walks the verbs in order, consuming the flat point buffer per [`Verb::point_count`]. A malformed
+/// buffer (a verb wanting more points than remain — impossible from the registry ops, but checked so a
+/// fabricated geometry can never panic/overrun) ends the walk early. Returns `None` for an empty path
+/// or one tiny-skia rejects (e.g. all points coincident / non-finite), matching `PathBuilder::finish`.
+fn build_tiny_skia_path(geometry: &PathGeometry) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    let pts = &geometry.points;
+    let mut i = 0usize; // index into the flat point buffer (2 floats per point)
+    for verb in &geometry.verbs {
+        let need = verb.point_count() * 2;
+        if i + need > pts.len() {
+            // Defensive: a fabricated geometry could under-supply points. Stop cleanly (no panic).
+            break;
+        }
+        match verb {
+            Verb::MoveTo => pb.move_to(pts[i], pts[i + 1]),
+            Verb::LineTo => pb.line_to(pts[i], pts[i + 1]),
+            Verb::QuadTo => pb.quad_to(pts[i], pts[i + 1], pts[i + 2], pts[i + 3]),
+            Verb::CubicTo => pb.cubic_to(
+                pts[i],
+                pts[i + 1],
+                pts[i + 2],
+                pts[i + 3],
+                pts[i + 4],
+                pts[i + 5],
+            ),
+            Verb::Close => pb.close(),
+        }
+        i += need;
+    }
+    pb.finish()
+}
+
+/// AOSP `Matrix` (row-major 3x3) → tiny-skia [`Transform`] (its 6 affine coefficients).
+///
+/// tiny-skia is affine-only (no perspective row); AOSP `Matrix` row 2 is `[MPERSP_0, MPERSP_1,
+/// MPERSP_2]`. Vector-drawable / Canvas matrices are affine (perspective row `[0,0,1]`), so the affine
+/// coefficients map directly: `Transform { sx, kx, ky, sy, tx, ty }` from AOSP indices
+/// `[MSCALE_X, MSKEW_X, MTRANS_X, MSKEW_Y, MSCALE_Y, MTRANS_Y]`.
+fn affine_to_transform(m: &Affine) -> Transform {
+    Transform::from_row(m.m[0], m.m[3], m.m[1], m.m[4], m.m[2], m.m[5])
+}
+
+/// Rasterize `geometry` (transformed by `matrix`, filled with `style`) into a fresh `width`×`height`
+/// RGBA [`Pixmap`] (premultiplied storage, transparent-black background). Returns the pixmap, or `None`
+/// if the dimensions are zero or the path is empty/degenerate (nothing to draw).
+///
+/// 2026-06-05: this is the REAL fill of the parsed path — anti-aliased, via the pure-Rust tiny-skia
+/// rasterizer. GPU-free; the caller uploads `pixmap.data()` (or [`rasterize_path_rgba`]'s straight
+/// bytes) as a texture. No GTK/Cairo/Skia-C.
+pub fn rasterize_path(
+    geometry: &PathGeometry,
+    matrix: &Affine,
+    style: FillStyle,
+    width: u32,
+    height: u32,
+) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(width, height)?;
+    let path = build_tiny_skia_path(geometry)?;
+    let (r, g, b, a) = argb_to_rgba8(style.argb);
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(r, g, b, a);
+    paint.anti_alias = true;
+    let fill_rule = if style.even_odd {
+        FillRule::EvenOdd
+    } else {
+        FillRule::Winding
+    };
+    pixmap.fill_path(&path, &paint, fill_rule, affine_to_transform(matrix), None);
+    Some(pixmap)
+}
+
+/// Rasterize `geometry` into straight (un-premultiplied) RGBA8 bytes ready for a GPU texture upload,
+/// returning `(rgba, width, height)`. Convenience over [`rasterize_path`] for the compositor; returns
+/// `None` on the same empty/degenerate/zero-size conditions. `take_demultiplied` yields straight RGBA
+/// (tiny-skia stores premultiplied), which is what a non-premultiplied-alpha sampler expects.
+pub fn rasterize_path_rgba(
+    geometry: &PathGeometry,
+    matrix: &Affine,
+    style: FillStyle,
+    width: u32,
+    height: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let pixmap = rasterize_path(geometry, matrix, style, width, height)?;
+    let (w, h) = (pixmap.width(), pixmap.height());
+    Some((pixmap.take_demultiplied(), w, h))
+}
+
 /// Errors from the graphics/window subsystem.
 #[derive(Debug)]
 pub enum GraphicsError {
@@ -3881,5 +4020,133 @@ mod tests {
         assert_eq!(find_host_visible_memory_type(&props, filter), Some(2));
         // Filter allowing only the device-local type → None.
         assert_eq!(find_host_visible_memory_type(&props, 0b001), None);
+    }
+
+    // --- Vector-drawable raster (tiny-skia), GPU-free -------------------------------------------
+
+    // 2026-06-05: prove the REAL parsed Path geometry rasterizes to the expected pixels — the raster
+    // is the durable half of the vector-drawable pipeline (the Vulkan composite is the next step).
+
+    /// Read the straight-RGBA pixel at (x, y) from a row-major `w`×`h` RGBA8 buffer.
+    fn px(rgba: &[u8], w: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let i = ((y * w + x) * 4) as usize;
+        (rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3])
+    }
+
+    /// A closed axis-aligned rectangle path covering [x0,x1]×[y0,y1].
+    fn rect_path(x0: f32, y0: f32, x1: f32, y1: f32) -> PathGeometry {
+        let mut g = PathGeometry::default();
+        g.move_to(x0, y0);
+        g.line_to(x1, y0);
+        g.line_to(x1, y1);
+        g.line_to(x0, y1);
+        g.close();
+        g
+    }
+
+    #[test]
+    fn argb_to_rgba8_splits_channels() {
+        // 0xAARRGGBB = 0x80123456 → a=0x80 r=0x12 g=0x34 b=0x56.
+        let (r, g, b, a) = argb_to_rgba8(0x8012_3456u32 as i32);
+        assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x80));
+    }
+
+    #[test]
+    fn affine_to_transform_maps_affine_coefficients() {
+        // translate(10, 20) in AOSP Matrix order → tiny-skia Transform tx=10, ty=20, identity scale.
+        let mut m = Affine::IDENTITY;
+        m.set_translate(10.0, 20.0);
+        let t = affine_to_transform(&m);
+        assert_eq!((t.sx, t.sy, t.tx, t.ty), (1.0, 1.0, 10.0, 20.0));
+        assert_eq!((t.kx, t.ky), (0.0, 0.0));
+    }
+
+    #[test]
+    fn rasterize_filled_rect_has_opaque_interior_and_clear_exterior() {
+        // Fill a 10..30 × 10..30 red rect into a 40×40 pixmap with the identity transform.
+        let geometry = rect_path(10.0, 10.0, 30.0, 30.0);
+        let style = FillStyle {
+            argb: 0xFFFF_0000u32 as i32, // opaque red
+            even_odd: false,
+        };
+        let (rgba, w, h) =
+            rasterize_path_rgba(&geometry, &Affine::IDENTITY, style, 40, 40).expect("rasterizes");
+        assert_eq!((w, h), (40, 40));
+        assert_eq!(rgba.len(), (40 * 40 * 4) as usize);
+        // Interior center (20,20) is opaque red.
+        assert_eq!(px(&rgba, w, 20, 20), (255, 0, 0, 255));
+        // Exterior corners are transparent (untouched background).
+        assert_eq!(px(&rgba, w, 0, 0), (0, 0, 0, 0));
+        assert_eq!(px(&rgba, w, 39, 39), (0, 0, 0, 0));
+        // A point just outside the rect edge is still clear; well inside is filled.
+        assert_eq!(px(&rgba, w, 5, 5), (0, 0, 0, 0));
+        assert_eq!(px(&rgba, w, 25, 15).3, 255, "inside the rect is opaque");
+    }
+
+    #[test]
+    fn rasterize_honors_the_transform() {
+        // The same small rect at the origin, translated by +20,+20, lands in the lower-right quadrant.
+        let geometry = rect_path(0.0, 0.0, 10.0, 10.0);
+        let mut m = Affine::IDENTITY;
+        m.set_translate(20.0, 20.0);
+        let style = FillStyle {
+            argb: 0xFF00_FF00u32 as i32, // opaque green
+            even_odd: false,
+        };
+        let (rgba, w, _h) = rasterize_path_rgba(&geometry, &m, style, 40, 40).expect("rasterizes");
+        // Translated rect now covers ~[20,30]×[20,30]: (25,25) filled green, the original (5,5) clear.
+        assert_eq!(px(&rgba, w, 25, 25), (0, 255, 0, 255));
+        assert_eq!(px(&rgba, w, 5, 5), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn empty_path_does_not_rasterize() {
+        // An empty geometry has no contour to fill → None (nothing to upload).
+        assert!(rasterize_path(
+            &PathGeometry::default(),
+            &Affine::IDENTITY,
+            FillStyle::default(),
+            16,
+            16
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn zero_size_pixmap_is_rejected() {
+        let geometry = rect_path(0.0, 0.0, 5.0, 5.0);
+        assert!(
+            rasterize_path(&geometry, &Affine::IDENTITY, FillStyle::default(), 0, 16).is_none()
+        );
+    }
+
+    #[test]
+    fn build_path_is_safe_against_undersupplied_points() {
+        // Defensive: a fabricated geometry whose verbs want more points than the buffer holds must
+        // not panic/overrun — the walk stops cleanly. Here a lone CubicTo (needs 6 floats) with only
+        // 2 supplied yields no usable contour → finish() returns None.
+        let geometry = PathGeometry {
+            verbs: vec![Verb::CubicTo],
+            points: vec![1.0, 2.0],
+        };
+        assert!(build_tiny_skia_path(&geometry).is_none());
+    }
+
+    #[test]
+    fn even_odd_donut_leaves_a_hole() {
+        // Two concentric rects with EvenOdd: the inner region is a hole (transparent), the ring filled.
+        let mut geometry = rect_path(5.0, 5.0, 45.0, 45.0); // outer
+        let inner = rect_path(20.0, 20.0, 30.0, 30.0); // inner
+        geometry.verbs.extend(inner.verbs);
+        geometry.points.extend(inner.points);
+        let style = FillStyle {
+            argb: 0xFF00_00FFu32 as i32, // opaque blue
+            even_odd: true,
+        };
+        let (rgba, w, _h) =
+            rasterize_path_rgba(&geometry, &Affine::IDENTITY, style, 50, 50).expect("rasterizes");
+        // Ring (10,25) is filled blue; the hole center (25,25) is transparent.
+        assert_eq!(px(&rgba, w, 10, 25), (0, 0, 255, 255));
+        assert_eq!(px(&rgba, w, 25, 25).3, 0, "even-odd hole is transparent");
     }
 }
