@@ -145,6 +145,17 @@ pub struct UnresolvedSymbol {
     pub sym_index: u32,
 }
 
+/// One `DT_NEEDED` dependency that could not be located on any search path, **tolerated** (not
+/// errored) because the linker is in the root-only / env-provided-deps mode
+/// ([`Linker::with_tolerate_missing_deps`]). Records what the bionic environment/shim must supply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingDep {
+    /// The `DT_NEEDED` soname that was not found (e.g. `libc.so`, `libGLESv2.so`).
+    pub soname: String,
+    /// The soname of the object that declared the dependency (the root, for libroblox's 10 deps).
+    pub needed_by: String,
+}
+
 /// Aggregate relocation counts across the whole linked graph, for verification/reporting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RelocStats {
@@ -228,6 +239,12 @@ pub struct LoadedImageSet {
     /// Unresolved **strong** symbols recorded across the graph (empty = every strong reference
     /// resolved). Never fabricated; an object with any has its symbol pass skipped (no partial GOT).
     pub unresolved: Vec<UnresolvedSymbol>,
+    /// `DT_NEEDED` dependencies that could not be located, **tolerated** under
+    /// [`Linker::with_tolerate_missing_deps`] (always empty in the strict default mode, which errors
+    /// on a missing dep). For the bionic load these are the env-provided sonames (libc/m/dl/…).
+    pub missing_deps: Vec<MissingDep>,
+    /// Number of objects whose `PT_GNU_RELRO` region was hardened read-only after relocation.
+    pub relro_applied: usize,
 }
 
 impl LoadedImageSet {
@@ -246,6 +263,7 @@ impl LoadedImageSet {
 pub struct Linker {
     search_paths: Vec<PathBuf>,
     host_fallback: bool,
+    tolerate_missing_deps: bool,
 }
 
 impl Linker {
@@ -259,6 +277,7 @@ impl Linker {
         Self {
             search_paths: search_paths.into_iter().map(Into::into).collect(),
             host_fallback: false,
+            tolerate_missing_deps: false,
         }
     }
 
@@ -267,6 +286,23 @@ impl Linker {
     /// process (`dlsym(RTLD_DEFAULT)`). Off for the bionic load (host glibc must not leak in).
     pub fn with_host_fallback(mut self, enabled: bool) -> Self {
         self.host_fallback = enabled;
+        self
+    }
+
+    /// Enable (or disable) the **root-only / env-provided-deps** mode: when on, a `DT_NEEDED`
+    /// dependency that cannot be located on any search path is **recorded** (in
+    /// [`LoadedImageSet::missing_deps`]) instead of erroring, and the load continues with whatever
+    /// objects are present. Off by default (a missing dep is a hard [`LinkError::MissingDependency`]).
+    ///
+    /// 2026-06-05: This is exactly what the bionic load needs — Roblox's `libroblox.so` declares 10
+    /// bionic `DT_NEEDED` (libc/m/dl/log/android/EGL/GLESv2/SLES/MAXAL/mediandk), **none of which
+    /// ship in the APK**; they are supplied by the Eclipse bionic-env/shim, not found on disk. In
+    /// this mode the root maps + base-relocates (RELATIVE/RELR) and honors `PT_GNU_RELRO`, while its
+    /// symbol relocations against the absent deps' exports are **deferred** (recorded in
+    /// [`LoadedImageSet::unresolved`], never fabricated). Pair with `with_host_fallback(false)` so
+    /// host glibc cannot accidentally satisfy a bionic import.
+    pub fn with_tolerate_missing_deps(mut self, enabled: bool) -> Self {
+        self.tolerate_missing_deps = enabled;
         self
     }
 
@@ -286,6 +322,8 @@ impl Linker {
         // the breadth-first walk; the load order (objects' index order) is the BFS order.
         let mut objects: Vec<LoadedObject> = Vec::new();
         let mut loaded: HashMap<String, usize> = HashMap::new();
+        // DT_NEEDED deps that could not be located, recorded (not errored) in the root-only mode.
+        let mut missing_deps: Vec<MissingDep> = Vec::new();
         // BFS frontier: each entry is (path-to-load, requested-soname-or-None-for-root,
         // needed-by-soname-for-error-context).
         let mut queue: Vec<PendingLoad> = vec![PendingLoad {
@@ -327,6 +365,19 @@ impl Linker {
                     continue; // already loaded / already queued-and-loaded
                 }
                 let Some(dep_path) = self.locate(dep) else {
+                    if self.tolerate_missing_deps {
+                        // Root-only / env-provided-deps mode: record the absent dep (it is supplied
+                        // by the bionic env/shim, not found on disk) and continue. Its symbol relocs
+                        // resolve to nothing now → deferred (recorded in `unresolved`), never faked.
+                        // Dedup so a dep needed by several objects is recorded once.
+                        if !missing_deps.iter().any(|m| m.soname == *dep) {
+                            missing_deps.push(MissingDep {
+                                soname: dep.clone(),
+                                needed_by: soname.clone(),
+                            });
+                        }
+                        continue;
+                    }
                     return Err(LinkError::MissingDependency {
                         soname: dep.clone(),
                         needed_by: soname.clone(),
@@ -459,12 +510,35 @@ impl Linker {
             *obj_tls_stats = tls_stats;
         }
 
+        // ---- 4) Honor PT_GNU_RELRO: harden each object's read-only-after-reloc region -----------
+        // Run AFTER every relocation pass (base + symbol + TLS) so the GOT/relocated data was fully
+        // written first, then `mprotect` the RELRO region read-only. An object without PT_GNU_RELRO
+        // (most of glibc's helper graph) is skipped.
+        let mut relro_applied = 0usize;
+        for obj in &objects {
+            let img = obj.image().map_err(|error| LinkError::Parse {
+                object: obj.soname.clone(),
+                error,
+            })?;
+            if let Some(relro) = img.relro {
+                obj.mapped
+                    .apply_relro(&relro, page)
+                    .map_err(|error| LinkError::Map {
+                        object: obj.soname.clone(),
+                        error,
+                    })?;
+                relro_applied += 1;
+            }
+        }
+
         Ok(LoadedImageSet {
             objects,
             scope,
             tls_layout,
             stats,
             unresolved,
+            missing_deps,
+            relro_applied,
         })
     }
 
@@ -999,6 +1073,60 @@ mod tests {
     }
 
     #[test]
+    fn tolerate_missing_deps_records_instead_of_erroring() {
+        // 2026-06-05: the root-only / env-provided-deps mode. A root with a DT_NEEDED that is NOT on
+        // the search path must, under with_tolerate_missing_deps(true), be RECORDED (not a hard
+        // LinkError::MissingDependency) so the root still maps + base-relocates. This is the libroblox
+        // load shape (its 10 bionic deps are env-provided, not on disk).
+        let dir = temp_dir("tolerate");
+        // Root needs two absent deps and imports a strong symbol they would have defined.
+        let root = build_so(
+            "root.so",
+            &["env_a.so", "env_b.so"],
+            None,
+            Some("missing_sym"),
+        );
+        let root_path = write_so(&dir, "root.so", &root);
+
+        // Strict mode (default): a missing dep is a hard error.
+        let strict = Linker::new([dir.clone()]);
+        match strict.load(&root_path) {
+            Err(LinkError::MissingDependency { soname, needed_by }) => {
+                assert!(soname == "env_a.so" || soname == "env_b.so");
+                assert_eq!(needed_by, "root.so");
+            }
+            Err(other) => panic!("strict mode: expected MissingDependency, got {other:?}"),
+            Ok(_) => panic!("strict mode must error on a missing dep, but load succeeded"),
+        }
+
+        // Root-only mode: the two missing deps are recorded, the root maps, the symbol reloc against
+        // the (now-undefinable) import is deferred/recorded — never fabricated.
+        let tolerant = Linker::new([dir.clone()])
+            .with_host_fallback(false)
+            .with_tolerate_missing_deps(true);
+        let set = tolerant
+            .load(&root_path)
+            .expect("root-only load succeeds despite absent deps");
+        assert_eq!(set.objects.len(), 1, "only the root mapped");
+        assert_eq!(set.objects[0].soname, "root.so");
+        // Both absent deps recorded (deduped, each once), attributed to the root.
+        assert_eq!(set.missing_deps.len(), 2, "{:?}", set.missing_deps);
+        let names: Vec<&str> = set.missing_deps.iter().map(|m| m.soname.as_str()).collect();
+        assert!(names.contains(&"env_a.so") && names.contains(&"env_b.so"));
+        for m in &set.missing_deps {
+            assert_eq!(m.needed_by, "root.so");
+        }
+        // The strong import the deps would have defined is unresolved → recorded, GOT left at 0.
+        assert_eq!(set.unresolved.len(), 1);
+        assert_eq!(set.unresolved[0].name, "missing_sym");
+        assert_eq!(set.stats.glob_dat_applied, 0);
+        assert_eq!(read_word(&set.objects[0], GLOB_TARGET), 0);
+        // Base relocs still ran (RELATIVE applied by the base pass).
+        assert!(set.objects[0].map_stats.segments_mapped > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn drop_unmaps_whole_graph_without_leak() {
         // Repeatedly link a small graph; if Drop didn't munmap every object, address space would
         // exhaust. Exercises LoadedImageSet → LoadedObject → MappedObject Drop chaining.
@@ -1128,5 +1256,236 @@ mod tests {
 
         // No leak: dropping the set munmaps the whole graph.
         drop(set);
+    }
+
+    // ---- REAL test: map + base-relocate the engine `libroblox.so` from the APK in root-only mode -
+    // (skips cleanly if the Roblox APK is absent — never fails / fabricates).
+
+    /// The Roblox APK candidates: the explicit env override, then the default dev-host location.
+    fn find_roblox_apk() -> Option<PathBuf> {
+        std::env::var_os("ECLIPSE_ROBLOX_APK")
+            .map(PathBuf::from)
+            .into_iter()
+            .chain(std::env::var_os("HOME").map(|home| {
+                Path::new(&home).join("eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk")
+            }))
+            .find(|p| p.exists())
+    }
+
+    #[test]
+    fn real_libroblox_maps_base_relocates_and_honors_relro_root_only() {
+        // 2026-06-05: map + BASE-relocate the real ~112 MiB engine end-to-end at scale, honoring
+        // PT_GNU_RELRO, in the root-only / env-provided-deps mode (the 10 bionic DT_NEEDED are absent
+        // on the host → recorded, not errored). Symbol relocs (the 635 against the 584 bionic UND
+        // imports) are DEFERRED until the bionic-env provider lands. SKIP (not fail) if no APK.
+        let Some(apk_path) = find_roblox_apk() else {
+            eprintln!("real_libroblox_maps_...: no Roblox APK; skipping");
+            return;
+        };
+
+        // Eclipse's own apk reader → the engine .so bytes. The entry is stored uncompressed.
+        let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
+        let so_bytes = apk
+            .read_entry("lib/x86_64/libroblox.so")
+            .expect("read lib/x86_64/libroblox.so from APK");
+        // Stage the extracted .so in a temp dir so the Linker (which reads from disk) can load it as
+        // the graph root. (We do NOT commit it; .gitignore guards APKs, and this temp file is removed.)
+        let dir = temp_dir("libroblox");
+        let so_path = dir.join("libroblox.so");
+        std::fs::write(&so_path, &so_bytes).expect("stage libroblox.so");
+
+        // Root-only mode ON, host fallback OFF: no bionic dep is on disk, none must be faked from
+        // host glibc. Empty search paths → all 10 DT_NEEDED are "missing" (env-provided).
+        let linker = Linker::new(Vec::<PathBuf>::new())
+            .with_host_fallback(false)
+            .with_tolerate_missing_deps(true);
+
+        let t0 = std::time::Instant::now();
+        let set = linker
+            .load(&so_path)
+            .unwrap_or_else(|e| panic!("root-only map+base-relocate of libroblox: {e}"));
+        let elapsed = t0.elapsed();
+
+        // ---- exactly one object loaded (the root) — deps tolerated absent -----------------------
+        assert_eq!(set.objects.len(), 1, "root-only: only libroblox is mapped");
+        let obj = &set.objects[0];
+        assert_eq!(obj.soname, "libroblox.so");
+
+        // ---- the ~112 MiB span: 3 PT_LOAD at the right vaddrs, bss zeroed -----------------------
+        let img = obj.image().expect("re-parse libroblox image");
+        assert_eq!(
+            obj.map_stats.segments_mapped, 3,
+            "libroblox has 3 PT_LOAD segments"
+        );
+        let base = obj.load_base();
+        let span = obj.mapped.span() as u64;
+        // docs/libroblox-characterization.md: mapped span 0x0..0x70b4a80 ≈ 112.7 MiB (page-ceiled).
+        assert!(
+            (0x70a_0000..=0x70c_0000).contains(&span),
+            "libroblox mapped span ≈ 112.7 MiB, got {span:#x}"
+        );
+        // Each PT_LOAD's last bss byte (vaddr + memsz - 1) reads 0 when memsz > filesz (fresh anon).
+        for seg in &img.loads {
+            if seg.mem_size > seg.file_size && seg.mem_size > 0 {
+                let last = (seg.vaddr + seg.mem_size - 1) as usize;
+                let last_aligned = last & !7; // read_u64 reads 8 bytes; align down to stay in-region.
+                let w = obj.mapped.read_u64(last_aligned).expect("read bss tail");
+                // The very last word of a zero-filled bss tail must be 0 (no file bytes copied there).
+                assert_eq!(
+                    w, 0,
+                    "bss tail of segment vaddr={:#x} must be zero",
+                    seg.vaddr
+                );
+            }
+        }
+
+        // ---- EXACTLY 527,208 RELATIVE applied; every relocated target inside [base, base+span) ---
+        assert_eq!(
+            set.stats.relative_applied, 527_208,
+            "libroblox RELATIVE relocs applied"
+        );
+        assert_eq!(
+            obj.map_stats.relative_applied, 527_208,
+            "per-object RELATIVE count matches"
+        );
+        // Verify in-range: an R_X86_64_RELATIVE writes `base + addend` into its slot. We assert
+        // (a) every RELATIVE addend is within [0, span) (definitional: base+addend ∈ [base,base+span)),
+        // and (b) read back a large sample of the actual written slots and confirm each value lands
+        // in [base, base+span). Reading all 527k slots would be slow; a 1-in-64 stride is a large,
+        // uniformly-distributed sample across the whole table.
+        let relas = img.relocations().expect("decode relocations");
+        let relatives: Vec<&Rela> = relas
+            .iter()
+            .filter(|r| r.r_type == reloc::R_X86_64_RELATIVE)
+            .collect();
+        assert_eq!(relatives.len(), 527_208, "decoded RELATIVE count");
+        let mut addends_in_range = 0usize;
+        let mut sampled = 0usize;
+        let mut sample_values_in_range = 0usize;
+        for (i, r) in relatives.iter().enumerate() {
+            // The RELATIVE addend (the in-object target it points at) must be within the object.
+            if (r.addend as u64) < span {
+                addends_in_range += 1;
+            }
+            // Read back a sample of the actual written GOT/data slots (the slot is at r.offset,
+            // an in-object vaddr for this PIE → region-relative byte offset).
+            if i % 64 == 0 {
+                let off = r.offset as usize;
+                if off + 8 <= set.objects[0].mapped.span() {
+                    let v = obj.mapped.read_u64(off).expect("read relocated slot");
+                    sampled += 1;
+                    if (base..base + span).contains(&v) {
+                        sample_values_in_range += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            addends_in_range, 527_208,
+            "every RELATIVE addend points within the object [0, span)"
+        );
+        assert!(
+            sampled > 8_000,
+            "expected a large RELATIVE sample, got {sampled}"
+        );
+        assert_eq!(
+            sample_values_in_range, sampled,
+            "every sampled relocated slot value lands in [base, base+span)"
+        );
+
+        // ---- RELRO mprotect succeeded ------------------------------------------------------------
+        assert!(
+            img.relro.is_some(),
+            "libroblox declares PT_GNU_RELRO (the doc-confirmed region)"
+        );
+        assert_eq!(
+            set.relro_applied, 1,
+            "the one PT_GNU_RELRO region was hardened read-only after relocation"
+        );
+
+        // ---- the 635 symbol relocs are DEFERRED (recorded as unresolved, never fabricated) ------
+        // 67 GLOB_DAT + 22 R_X86_64_64 + 546 JUMP_SLOT = 635, all against the absent bionic deps.
+        let count_type = |t: u32| relas.iter().filter(|r| r.r_type == t).count();
+        let glob_dat = count_type(reloc::R_X86_64_GLOB_DAT);
+        let abs64 = count_type(reloc::R_X86_64_64);
+        let jump_slot = count_type(reloc::R_X86_64_JUMP_SLOT);
+        assert_eq!(glob_dat, 67, "libroblox GLOB_DAT count");
+        assert_eq!(abs64, 22, "libroblox R_X86_64_64 count");
+        assert_eq!(jump_slot, 546, "libroblox JUMP_SLOT count");
+        assert_eq!(glob_dat + abs64 + jump_slot, 635, "total symbol relocs");
+        // With no providers (deps absent, host fallback off) every symbol reloc against a STRONG
+        // import is unresolved → recorded, the symbol pass skipped (no GOT writes). Some imports are
+        // referenced by several relocs; the recorded count is the per-reloc strong gaps.
+        assert_eq!(
+            set.stats.glob_dat_applied + set.stats.jump_slot_applied + set.stats.abs64_applied,
+            0,
+            "no symbol reloc applied in root-only mode (deps absent)"
+        );
+        assert!(
+            !set.unresolved.is_empty(),
+            "the symbol relocs are recorded as deferred/unresolved (not faked)"
+        );
+        for u in &set.unresolved {
+            assert_eq!(u.object, "libroblox.so");
+        }
+        eprintln!(
+            "libroblox deferred symbol relocs: {} recorded unresolved (of 635: {glob_dat} GLOB_DAT + {abs64} ABS64 + {jump_slot} JUMP_SLOT)",
+            set.unresolved.len()
+        );
+
+        // ---- the 584 UND imports + the 10 missing bionic deps (the bionic-env surface) ----------
+        let und_imports = img
+            .dynsyms
+            .iter()
+            .filter(|s| s.shndx == 0 && !s.name.is_empty())
+            .count();
+        // docs/libroblox-characterization.md: 584 GNU_HASH-authoritative UND. elf.rs's heuristic
+        // symtab over-read (documented) reports more; assert the real surface is AT LEAST 584.
+        assert!(
+            und_imports >= 584,
+            "libroblox UND import surface ≥ 584 (the bionic-env symbols), got {und_imports}"
+        );
+        // All 10 bionic DT_NEEDED are missing on the host → recorded (not errored).
+        assert_eq!(
+            set.missing_deps.len(),
+            10,
+            "all 10 bionic DT_NEEDED recorded as missing (env-provided): {:?}",
+            set.missing_deps
+        );
+        for dep in [
+            "libc.so",
+            "libm.so",
+            "libdl.so",
+            "liblog.so",
+            "libandroid.so",
+            "libEGL.so",
+            "libGLESv2.so",
+            "libOpenSLES.so",
+            "libOpenMAXAL.so",
+            "libmediandk.so",
+        ] {
+            assert!(
+                set.missing_deps.iter().any(|m| m.soname == dep),
+                "missing-dep surface must include {dep}: {:?}",
+                set.missing_deps
+            );
+        }
+
+        // ---- perf sanity + report ---------------------------------------------------------------
+        eprintln!(
+            "real_libroblox root-only: span={span:#x} (~{} MiB) segments={} RELATIVE_applied={} (all in-range; {sampled} slots sampled) RELR_applied={} RELRO_applied={} symbol_relocs_deferred=635 unresolved_recorded={} UND_imports={und_imports} missing_deps={} reloc_wall_time={:?}",
+            span / (1024 * 1024),
+            obj.map_stats.segments_mapped,
+            set.stats.relative_applied,
+            set.stats.relr_applied,
+            set.relro_applied,
+            set.unresolved.len(),
+            set.missing_deps.len(),
+            elapsed,
+        );
+
+        // No leak: dropping the set munmaps the 112 MiB region.
+        drop(set);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

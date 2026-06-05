@@ -58,8 +58,12 @@
 //! combined cross-object symbol [`resolve::Scope`] + a multi-module [`tls::TlsLayout`], and
 //! relocates every loaded object against that global scope (base + symbol + static-TLS). It counts
 //! `IRELATIVE` as deferred (the ifunc tail), records unresolved-strong symbols without fabricating
-//! addresses, and RAII-`munmap`s the whole graph on drop. It maps + relocates; it does **not** bind
-//! `%fs`/TCB, execute ifunc resolvers, or run init — the documented runtime integration tail.
+//! addresses, and RAII-`munmap`s the whole graph on drop. After relocation it honors `PT_GNU_RELRO`
+//! ([`map::MappedObject::apply_relro`] — `mprotect`s the read-only-after-reloc region RO). A
+//! **root-only / env-provided-deps** mode ([`link::Linker::with_tolerate_missing_deps`]) records an
+//! absent `DT_NEEDED` instead of erroring, so a root maps + base-relocates with its deps supplied by
+//! the env/shim (the bionic load shape — e.g. `libroblox.so`'s 10 bionic deps). It maps + relocates;
+//! it does **not** bind `%fs`/TCB, execute ifunc resolvers, or run init — the runtime integration tail.
 //!
 //! `elf.rs` decodes the file format; `reloc.rs` applies relocations; `map.rs` lays the segments
 //! out and drives both base and (via `resolve.rs`) symbol relocations — a clean boundary (the
