@@ -535,6 +535,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   real **ash/Vulkan surface + draw** (the big build — the View tree + ids + text are all recorded in
   `view_registry`, ready to render). For Roblox specifically, the engine-load bionic-shim work (Section B
   of the dev-host runbook) is the parallel track. Stay non-GTK; validate via dev-host `eclipse run`.
+  🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
+  REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
+  surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
+  monotonic `std::time::Instant`-anchored, non-GTK). After that, Roblox's `Application.onCreate` executes:
+  `roblox.config` (`setBaseUrl → www.roblox.com`), `AppStartupTaskManager` tasks, `androidx.startup.
+  InitializationProvider`. **NEW FRONTIER for Roblox = the BIONIC-LOADER path (class D, engine-load track,
+  main-loop only):** `System.loadLibrary("zstd-jni-1.5.7-6")` → the shim bionic linker reports the lib
+  **"not found" EVEN THOUGH it is extracted** to `~/.cache/eclipse/native-libs/libzstd-jni-1.5.7-6.so`
+  (726 KB, present). Root cause = `-Djava.library.path` is set but the app-lib cache dir is NOT whitelisted
+  in the bionic linker's own search path via **`dl_parse_library_path`** (the libdl_bio call ATL uses; the
+  2026-06-04 entry already flagged "java.library.path alone is NOT enough"). This is the bionic/engine-load
+  track — do NOT wire it from a subagent (cyber-safeguard); it is the same main-loop bionic work as the
+  `libmediandk`/`libOpenMAXAL` shims and `libroblox.so` relocation. Roblox then NPEs on `Looper.mQueue`
+  (background threads have no Looper) and calls `System.exit(10)`. Faithful run log: `/tmp/eclipse-roblox2.log`.
   📋 **Dev-host execution runbook:** the two frontiers' next concrete steps (which need
   main-thread `cargo run -- run …`, not the cargo-test harness or subagents) are consolidated
   into an executable, decision-driven script in [`docs/dev-host-runbook.md`](docs/dev-host-runbook.md)
@@ -1471,6 +1485,42 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `xml_registry::pooled_string_returns_by_index_or_none`, and the XmlBlock/TextView name+sig pins. Gate
   green: fmt / build / clippy `-D warnings` / **test 97 unit + 2 doctests** / release. No new deps. The
   cyber-safeguard did NOT trip. Run log: `/tmp/eclipse-final.log`.
+- **2026-06-05** — 🎉 **FIRST REAL ROBLOX RUN through the framework: Roblox's OWN `Application.onCreate`
+  REACHED + runs its own startup; next frontier is the bionic-loader `System.loadLibrary` path (class D).**
+  Ran the actual target — the merged Roblox APK (`~/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk`,
+  the base+x86_64-split merge: AndroidManifest.xml + 3 classes.dex + resources.arsc + `lib/x86_64/`
+  incl. `libroblox.so` 111 MB, all in ONE archive) via `cargo run --release -- run <merged.apk>`. **FAITHFUL
+  first run (`/tmp/eclipse-roblox.log`, EXIT=1):** ART booted with Roblox on the classpath, 11 native libs
+  extracted, `Context.<clinit>` ran fully — `PackageParser.parsePackage` walked Roblox's REAL manifest
+  (`<queries>`/`<profileable>`/`<meta-data>`/`<property>` warnings = PackageParser succeeding), certificates
+  collected, WolfSSL loaded — and step 1 `Context.createApplication` **instantiated Roblox's own
+  `com.roblox.client.RobloxApplication`** via `Constructor.newInstance`. The ONLY blocker: `RobloxApplication.
+  <init>` called `android.os.SystemClock.elapsedRealtime()` → `No implementation found` → `UnsatisfiedLinkError`
+  (the demo APK never calls it, so it only surfaces under a real app). **CLASS (A) — a benign framework
+  timekeeping native, bindable here.** **FIX (surgical, class A):** bound Eclipse's own non-GTK
+  **`SystemClock.elapsedRealtime()J`** in `src/framework.rs` — static native, process-anchored monotonic
+  `std::time::Instant` (CLOCK_MONOTONIC on Linux), returns ms since first call; the contract guarantees
+  MONOTONICITY (not a true since-boot value) — honored, no `unsafe`, no libc, no GTK. Grounded in
+  `vendor/atl/.../android/os/SystemClock.java` L148 (`native public static long elapsedRealtime();`) +
+  L52–56 (monotonic contract). Registered before step 1 via `register_native_methods` (wins over name-based
+  binding). **FAITHFUL second run (`/tmp/eclipse-roblox2.log`, EXIT=10):** the `elapsedRealtime` block is
+  GONE and **Roblox's `Application.onCreate` now RUNS its own startup** — `roblox.config` (`setBaseUrl() →
+  www.roblox.com`, `Incoming base url`), `AppStartupTaskManager` tasks, `androidx.startup.InitializationProvider`.
+  **NEW FRONTIER (class D, engine-load/bionic, main-loop only):** `System.loadLibrary("zstd-jni-1.5.7-6")` →
+  the shim bionic linker (`apkenv_load_library`) reports `libzstd-jni-1.5.7-6.so` **"not found" THOUGH it IS
+  extracted** (verified present, 726 KB, in `~/.cache/eclipse/native-libs/`). Root cause: `-Djava.library.path`
+  is set but the app-lib cache dir is NOT whitelisted in the bionic linker's path via **`dl_parse_library_path`**
+  (the libdl_bio call ATL uses; the 2026-06-04 engine-load entry already noted "java.library.path alone is NOT
+  enough"). This is the SAME bionic/engine-load track as the `libmediandk`/`libOpenMAXAL` shims + `libroblox.so`
+  relocation — **STOPPED here, did NOT touch the bionic shim** (cyber-safeguard + main-loop-only per AGENTS.md).
+  Roblox then NPEs on `Looper.mQueue` (background startup threads have no Looper) + `System.exit(10)`.
+  Regression guards (host-independent): `system_clock_native_name_sig_and_class_match_system_clock_java`
+  (pins class/name/`()J` vs SystemClock.java L148 — a transcription regression re-throws the cleared
+  UnsatisfiedLinkError) + `monotonic_anchor_clock_is_non_decreasing` (proves the contract's monotonicity).
+  Full gate green: fmt --check / build --all-targets / clippy `-D warnings` / **test 99 unit (+2) + 2
+  compile_fail doctests** / release (`panic = "abort"`/LTO retained). No new deps (`std::time::Instant`).
+  **NEXT (main-loop): the bionic-loader `dl_parse_library_path` whitelisting of the app-lib cache dir so
+  `System.loadLibrary` resolves the extracted libs — then `libroblox.so` relocation + the NDK shims.**
 
 ---
 
