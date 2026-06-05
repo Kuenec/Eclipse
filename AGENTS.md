@@ -472,6 +472,37 @@ before any history-rewriting/force operation.
   584-import bionic surface now resolves to Eclipse/host EXCEPT the 2 variadic liblog. NEXT = the variadic cc shim
   (`__android_log_print`/`__android_log_assert`) → FULL resolution (work-list 2 → 0), then run the 3,427 DT_INIT_ARRAY
   ctors (RELRO+BIND_NOW, no `%fs`/TCB — no PT_TLS; main-loop/dev-host only).** See §6 (2026-06-05 media+audio sound-stubs).
+  **2026-06-05 UPDATE — the variadic liblog C shim landed → FULL resolution of all 584 libroblox imports (work-list 2 →
+  0):** the last 2 work-list entries — the C-variadic liblog natives `__android_log_print` /
+  `__android_log_assert` — Rust **stable** cannot DEFINE (the `c_variadic` feature is nightly-only). The durable fix is a
+  clean-room C shim **`src/loader/liblog_shim.c`** (compiled by a new **`build.rs`** via the **`cc`** build-dependency —
+  the standard varargs bridge; `cc` was ALREADY transitive in `Cargo.lock` → **ZERO new crates**; it DISCOVERS the host C
+  compiler with no hardcoded paths and fails with an actionable error if none exists, §2/§9 portability). The shim DEFINES
+  both functions per the PUBLIC liblog C-ABI: format the varargs with `vsnprintf` into a bounded stack buffer (truncate +
+  NUL-terminate safely; no heap, no UB, reentrant), then forward to the Eclipse-owned **non-variadic** `extern "C"` sink
+  **`eclipse_liblog_emit`** (a `#[no_mangle]` Rust fn → the same `emit_log`/`tracing` sink the fixed-arity liblog natives
+  use); `__android_log_print` returns the emitted byte count (> 0) per contract, `__android_log_assert` emits FATAL then
+  `abort()` (noreturn). Rust **DECLARES** the two variadic externs (variadic *declarations* are stable; only *definitions*
+  need nightly) and registers their ADDRESSES in `EclipseNativeProvider::with_bionic_natives` (provider **86 → 88**); the
+  static archive's symbols are kept because the addresses are taken, and the shim's one undefined symbol
+  (`eclipse_liblog_emit`) is satisfied by the Rust sink (verified: `nm libeclipse_liblog_shim.a` shows `T
+  __android_log_print`/`T __android_log_assert`/`U eclipse_liblog_emit`). **VALIDATED:** (a) a SHIM-EXECUTION unit test
+  CALLS `__android_log_print` with a real format string + args (`"n=%d s=%s hex=0x%x"`, 42, "hi", 0xbeef) through the C
+  shim and asserts `eclipse_liblog_emit` received the EXACT formatted `"n=42 s=hi hex=0xbeef"` at the right priority/tag,
+  and that the return value (> 0) equals the byte count — proving the Rust→C-varargs→vsnprintf→Rust-sink bridge end-to-end
+  (a null-tag/empty-format test too); (b) the gated REAL test
+  `loader::link::tests::real_libroblox_eclipse_natives_fully_resolve_all_imports` (APK present → RAN): **work-list 88 → 0**,
+  all **88** imports resolve to Eclipse addresses (both variadic liblog to the shim, verified == the shim address + absent
+  from host dlsym), `applied_nonnull` **621 → 623** (the 2 extra = the variadic-liblog GOT slots), **`unresolved_strong =
+  0`**, 12 legal weak-undef→0, **88** GOT slots verified holding the Eclipse addresses, no panic/leak. **FULL resolution of
+  all 584 libroblox imports to Eclipse/host.** `unsafe` confined to the FFI bodies + the test's shim call (dated `//
+  SAFETY:`); reloc.rs/elf.rs/resolve.rs/ndk_registry.rs stay `#![forbid(unsafe_code)]`. Cyber-safeguard NOT tripped
+  (clean-room from the public liblog C-ABI + Eclipse's own src/; no apkenv/bionic/NDK/liblog/linker source read; libroblox
+  parsed as data only). Gate now **343 unit + 2 doctests** (fmt/build/clippy `-D warnings`/test/release all clean; the cc
+  build step succeeds wherever a C compiler exists). **Engine-load frontier: the 584-import bionic work-list is CLOSED (0)
+  — FULL resolution. NEXT = bind the relocated + fully-resolved image to execution and run the 3,427 `DT_INIT_ARRAY`
+  constructors in an isolated harness (RELRO+BIND_NOW; no `%fs`/TCB — no PT_TLS; main-loop/dev-host only).** See §6
+  (2026-06-05 variadic liblog cc shim). [`docs/bionic-env-worklist.md`](docs/bionic-env-worklist.md) marked **COMPLETE**.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3285,6 +3316,37 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `__android_log_assert`) via a variadic cc shim (or nightly `c_variadic`) → **full resolution (work-list 2 → 0)**, then
   bind the assembled image to execution + run the **3,427 DT_INIT_ARRAY** ctors in order (RELRO+BIND_NOW, no `%fs`/TCB —
   no PT_TLS), main-loop/dev-host only (cyber-safeguard).
+- **2026-06-05 — the variadic liblog cc shim — work-list 2 → 0, FULL resolution of all 584 libroblox imports (PROVEN on
+  the real engine).** *Root cause it removes:* Rust **stable** cannot DEFINE a C-variadic `extern "C"` fn (`c_variadic` is
+  nightly-only), so the last 2 bionic imports — `__android_log_print` / `__android_log_assert` — could not be Eclipse
+  natives without an ABI landmine; they sat on the work-list. *Durable fix (NOT a swallow — a real forwarding shim):* a
+  clean-room C shim **`src/loader/liblog_shim.c`** compiled by a new **`build.rs`** via the **`cc`** `[build-dependencies]`
+  crate (the standard, justified varargs bridge; ALREADY transitive in `Cargo.lock` → **ZERO new crates**; `cc` discovers
+  the host C compiler — no hardcoded paths — and fails with an actionable error if none exists, §2/§9). The shim DEFINES
+  both per the PUBLIC liblog C-ABI: `vsnprintf` the varargs into a bounded stack buffer (safe truncate + NUL-terminate; no
+  heap, no UB, reentrant, no global state), then forward to the Eclipse-owned **non-variadic** `extern "C"` sink
+  **`eclipse_liblog_emit`** (a `#[no_mangle]` Rust fn → the same `emit_log`/`tracing` sink); `__android_log_print` returns
+  the emitted byte count (> 0), `__android_log_assert` emits FATAL then `abort()` (noreturn). Rust DECLARES the two
+  variadic externs (declarations are stable) and registers their addresses in
+  `EclipseNativeProvider::with_bionic_natives` (provider **86 → 88**); the static archive's symbols are kept by the
+  address-taking, and its one undefined symbol is satisfied by the Rust sink (`nm libeclipse_liblog_shim.a`: `T
+  __android_log_print`/`T __android_log_assert`/`U eclipse_liblog_emit`). *Audit:* the two variadic natives were the ONLY
+  remaining work-list entries (the categorizer over the relocations confirms 0 after). *Regression guard:* (1) a
+  shim-EXECUTION unit test (`native_provider::tests::variadic_shim_formats_and_forwards_to_eclipse_sink`) CALLS
+  `__android_log_print` through the C shim and asserts the exact formatted `"n=42 s=hi hex=0xbeef"` + the > 0 byte-count
+  return (plus a null-tag/empty-format test) — would fail if the bridge or formatting broke; (2) the gated REAL test
+  `loader::link::tests::real_libroblox_eclipse_natives_fully_resolve_all_imports` asserts work-list **88 → 0**, 88
+  newly-resolved (both variadic to the shim addr, absent from host dlsym), `applied_nonnull == 623`, `unresolved_strong ==
+  0`, 88 verified GOT slots — would fail if a regression reopened the work-list. *Cyber-safeguard: NOT tripped* —
+  clean-room from the PUBLIC liblog C-ABI signatures + Eclipse's own src/; no apkenv/bionic/NDK/liblog/ATL/linker source
+  read; `libroblox.so` parsed as data only, only Eclipse's own trivial unit-tested C executed. Files: `build.rs` (new),
+  `src/loader/liblog_shim.c` (new), `Cargo.toml` (`cc` build-dep), `native_provider.rs` (+2 variadic externs + the
+  `eclipse_liblog_emit` sink + 2 shim-exec tests + a test-only emit capture; 86→88; doc fix), `link.rs` (gated test
+  renamed + 2→0 / 86→88 / `applied_nonnull == 623` assertions), `docs/bionic-env-worklist.md` (**COMPLETE**). **Gate:**
+  fmt --all --check / build --all-targets / clippy (-D warnings) / test (**343 unit + 2 doctests**) / release — all
+  0-warning/0-error; the cc build step succeeds wherever a C compiler exists. **NEXT = bind the relocated + fully-resolved
+  image to execution + run the 3,427 DT_INIT_ARRAY ctors in an isolated harness (RELRO+BIND_NOW, no `%fs`/TCB — no
+  PT_TLS), main-loop/dev-host only (cyber-safeguard).**
 
 ---
 

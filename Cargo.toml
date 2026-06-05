@@ -81,6 +81,15 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std", "si
 # The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.
 
+[build-dependencies]
+# 2026-06-05: compile the clean-room liblog VARIADIC shim (src/loader/liblog_shim.c) — the two
+# C-variadic bionic natives (`__android_log_print`/`__android_log_assert`) Rust stable cannot DEFINE
+# (the `c_variadic` feature is nightly-only; Eclipse builds on stable, §2.11). `cc` is the standard
+# build-time bridge for compiling a small C source; it DISCOVERS the host C compiler (no hardcoded
+# paths, §9) and fails with an actionable error if none exists. Already present transitively in
+# Cargo.lock → promoting it to a direct build-dep adds ZERO new crates (§2.5). See build.rs.
+cc = "1"
+
 # Enforce the project requirements (see AGENTS.md). CI/local gate before any commit:
 #   cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
 [lints.rust]

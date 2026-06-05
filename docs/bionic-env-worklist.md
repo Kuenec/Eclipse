@@ -1,5 +1,19 @@
 # Eclipse bionic-env work-list (libroblox.so x86-64) — 2026-06-05
 
+> ## ✅ COMPLETE (2026-06-05) — work-list 0; FULL resolution of all 584 libroblox imports
+> The final 2 entries (the C-variadic liblog natives `__android_log_print` / `__android_log_assert`)
+> are now DEFINED by a clean-room C shim (`src/loader/liblog_shim.c`, compiled by `build.rs` via the
+> `cc` build-dependency) that formats varargs with `vsnprintf` into a bounded buffer and forwards to
+> the Eclipse `extern "C"` sink `eclipse_liblog_emit` → `tracing`. The `EclipseNativeProvider` now
+> registers **88** natives; the gated REAL test
+> `loader::link::tests::real_libroblox_eclipse_natives_fully_resolve_all_imports` proves on the real
+> engine: **work-list 88 → 0**, all 88 imports resolve to Eclipse addresses (the 2 variadic liblog to
+> the shim), `applied_nonnull = 623` (621 + the 2 shim slots), `unresolved_strong = 0`, 88 GOT slots
+> verified holding the Eclipse addresses, no panic/leak. **NEXT (the only remaining engine-load
+> step): bind the relocated + fully-resolved image to execution and run the 3,427 `DT_INIT_ARRAY`
+> constructors in an isolated harness (honoring RELRO + BIND_NOW; no `%fs`/TCB — no PT_TLS),
+> main-loop / dev-host only.**
+
 The **first bionic-env resolution cut**: resolve every one of `libroblox.so`'s 584 undefined (UND)
 imports against a host-baseline [`BionicEnv`](../src/loader/bionic_env.rs) scope, categorize them,
 and apply the host-resolvable subset on the mapped engine (proving the symbol-relocation pipeline).
@@ -41,35 +55,38 @@ fixed-arity ones) + **bionic-libc 15** + **ndk-android 27** — so those imports
 the real engine: work-list **88 → 43**, `applied_nonnull` **535 → 580** (+45 Eclipse-native GOT slots,
 all verified holding the Eclipse address; the host has no such symbol under these bionic/NDK names).
 
-**Done (✅ below):** liblog (3 of 5) + bionic-libc (15 of 15) + ndk-android (27 of 27 — AAsset* REAL
-via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub deferred-to-render)
-+ **media-ndk (33 of 33) + audio (8 of 8) — sound-stubs (2026-06-05): gameplay-time, deferred** (see
-§4/§5 below). **Deferred (2):** the C-variadic liblog natives `__android_log_print` /
-`__android_log_assert` — defining a variadic `extern "C"` fn needs Rust's unstable `c_variadic`
-feature; Eclipse builds on **stable** (clean-checkout portability, AGENTS.md §2.11). Registering a
-non-variadic fn under a variadic name would be an ABI landmine, so they stay on the work-list (no
-landmine). **Remaining: 2** = the 2 variadic liblog (the NEXT step = a variadic cc shim → full
-resolution, then run the 3,427 DT_INIT_ARRAY).
+**Done (✅ below):** liblog (5 of 5 — 3 fixed-arity Rust + the 2 C-variadic via the clean-room C
+shim, 2026-06-05) + bionic-libc (15 of 15) + ndk-android (27 of 27 — AAsset* REAL via `src/apk`,
+AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub deferred-to-render) + **media-ndk
+(33 of 33) + audio (8 of 8) — sound-stubs (2026-06-05): gameplay-time, deferred** (see §4/§5 below).
+**The 2 C-variadic liblog natives `__android_log_print` / `__android_log_assert`** are now DEFINED by
+`src/loader/liblog_shim.c` (compiled by `build.rs` via the `cc` build-dep — the standard, justified
+varargs bridge): each `vsnprintf`s its varargs into a bounded buffer and forwards to the Eclipse
+`extern "C"` sink `eclipse_liblog_emit`. Rust DECLARES the variadic externs + takes their addresses
+on stable (variadic *declarations* are stable; only *definitions* need nightly `c_variadic`), so no
+ABI landmine and no nightly toolchain. **Remaining: 0** — FULL resolution of all 584 imports. The
+NEXT step is to run the 3,427 DT_INIT_ARRAY constructors in an isolated harness.
 
 ## Headline
 
-| metric | host-baseline only | + Eclipse-native tier (2026-06-05) |
+| metric | host-baseline only | + Eclipse-native tier (2026-06-05, FULL) |
 |---|---:|---:|
 | UND imports (reloc-referenced; = GNU_HASH-authoritative) | **584** | **584** |
 | host-resolved (BASELINE, not ABI-correct) | **490** | 490 |
-| Eclipse-native-resolved (bionic-ABI-correct/minimal/forward/real/sound-stub) | 0 | **86** |
-| **work-list (need Eclipse-owned bionic natives)** | **88** | **2** |
-| symbol relocs applied (non-null addr) | 535 | **621** |
+| Eclipse-native-resolved (bionic-ABI-correct/minimal/forward/real/sound-stub/C-shim) | 0 | **88** |
+| **work-list (need Eclipse-owned bionic natives)** | **88** | **0** |
+| symbol relocs applied (non-null addr) | 535 | **623** |
 | symbol relocs applied weak-undef → 0 (legal) | 12 | 12 |
-| symbol relocs unresolved-strong (recorded, no GOT write) | 88 | **2** |
+| symbol relocs unresolved-strong (recorded, no GOT write) | 88 | **0** |
 | symbol relocs deferred (TPOFF64/IRELATIVE) | 0 | 0 |
 
-> 2026-06-05: the **86** = liblog 3 + bionic-libc 15 + ndk-android 27 + **media-ndk 33 + audio 8**.
-> Media + audio are **sound-stubs** (gameplay-time, deferred): each returns its public-ABI
-> failure/unavailable sentinel (media `media_status_t` → `AMEDIA_ERROR_UNSUPPORTED`, pointer fns →
-> NULL; `slCreateEngine` → `SL_RESULT_FEATURE_UNSUPPORTED`) so a caller cleanly detects "no media /
-> no audio", never a fake success. The `AMEDIAFORMAT_KEY_*` (real key strings) + `SL_IID_*` (stable
-> distinct interface-id pointers) are real data objects. Work-list now = ONLY the 2 variadic liblog.
+> 2026-06-05: the **88** = liblog 5 (3 fixed-arity Rust + 2 C-variadic shim) + bionic-libc 15 +
+> ndk-android 27 + **media-ndk 33 + audio 8**. Media + audio are **sound-stubs** (gameplay-time,
+> deferred): each returns its public-ABI failure/unavailable sentinel (media `media_status_t` →
+> `AMEDIA_ERROR_UNSUPPORTED`, pointer fns → NULL; `slCreateEngine` → `SL_RESULT_FEATURE_UNSUPPORTED`)
+> so a caller cleanly detects "no media / no audio", never a fake success. The `AMEDIAFORMAT_KEY_*`
+> (real key strings) + `SL_IID_*` (stable distinct interface-id pointers) are real data objects.
+> **Work-list now = 0 — FULL resolution of all 584 imports** (the variadic cc shim closed the last 2).
 
 The 584 imports are counted from the **relocations**, not the raw dynamic symtab — this is
 immune to `elf.rs`'s documented symtab over-read (it reads trailing VERSYM/GNU_HASH bytes as extra
@@ -93,7 +110,7 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 | media-ndk   | 0  | ✅ 0 (was 33) | **no host equiv → all 33 Eclipse sound-stub (2026-06-05)** |
 | audio       | 0  | ✅ 0 (was 8)  | **no host equiv → all 8 Eclipse sound-stub (2026-06-05)** |
 | liblog      | 0  | 5  | no host equiv — **Eclipse already owns these** |
-| **TOTAL (host-baseline view; Eclipse-native work-list now 2)**   | **490** | **88** | |
+| **TOTAL (host-baseline view; Eclipse-native work-list now 0 — FULL)**   | **490** | **88** | |
 
 > `egl-gles` resolves a real **91** because this dev-host has Mesa `libEGL.so`/`libGLESv2.so`. On a
 > GL-less host these would all be in the work-list (route to a host-GL/ANGLE bridge). `pthread`,
@@ -101,21 +118,24 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 
 ---
 
-## THE WORK-LIST — 88 imports (2026-06-05: 86 now Eclipse-owned; only 2 variadic liblog remain)
+## THE WORK-LIST — 88 imports (2026-06-05: ✅ ALL 88 now Eclipse-owned — work-list 0, FULL resolution)
 
 Grouped by category, in the priority order they were implemented (NEXT step first).
 
-### 1. liblog (5) — ✅ DONE (3) routed to Eclipse's `tracing`; 2 variadic DEFERRED (2026-06-05)
+### 1. liblog (5) — ✅ DONE — all 5 (3 fixed-arity Rust + 2 variadic C-shim) (2026-06-05)
 `src/loader/native_provider.rs` implements the 3 fixed-arity ones as Eclipse-owned `extern "C"`
 natives that emit to Eclipse's `tracing` sink (real emit, priority-mapped). The 2 **C-variadic**
-ones cannot be defined on stable Rust (`c_variadic` is nightly-only) — registering a non-variadic fn
-under them would be an ABI landmine, so they stay here (no landmine).
+ones are now DEFINED by the clean-room C shim `src/loader/liblog_shim.c` (compiled by `build.rs` via
+the `cc` build-dep): each formats its varargs with `vsnprintf` into a bounded stack buffer and
+forwards the finished line to the Eclipse `extern "C"` sink `eclipse_liblog_emit` → the same
+`tracing` sink (`__android_log_assert` emits FATAL then `abort()`, noreturn). Rust declares the
+variadic externs + takes their addresses on stable; no ABI landmine.
 ```
 ✅ __android_log_write        # minimal-correct → tracing (returns byte count ≥ 1)
 ✅ __android_log_buf_write    # minimal-correct → tracing (bufID ignored; single sink)
 ✅ android_set_abort_message  # minimal-correct → tracing (ERROR; void)
-⏳ __android_log_print         # DEFERRED — C-variadic (needs nightly c_variadic)
-⏳ __android_log_assert        # DEFERRED — C-variadic + noreturn
+✅ __android_log_print         # C-shim → vsnprintf → eclipse_liblog_emit (returns byte count > 0)
+✅ __android_log_assert        # C-shim → vsnprintf → eclipse_liblog_emit (FATAL) → abort() (noreturn)
 ```
 
 ### 2. bionic-libc — ✅ DONE: the 15 bionic-specific names glibc does NOT provide (2026-06-05)
@@ -208,7 +228,8 @@ in this build, so it is not on the work-list despite being a `DT_NEEDED`.)
 
 ## Recommended implementation order (NEXT steps)
 
-1. ~~**liblog (5)**~~ — ✅ DONE (3 fixed-arity routed to Eclipse's `tracing`; 2 variadic deferred).
+1. ~~**liblog (5)**~~ — ✅ DONE (3 fixed-arity routed to Eclipse's `tracing`; the 2 C-variadic now
+   DEFINED by the clean-room C shim `src/loader/liblog_shim.c` via the `cc` build-dep — 2026-06-05).
    The `EclipseNativeProvider` is the loader→Eclipse-native binding path, prepended before host.
 2. ~~**bionic-libc bionic-specific (15)**~~ — ✅ DONE: Eclipse-owned natives for all 15 glibc-missing
    names (`__system_property_get`, `__sF`, `__errno`, the `_chk` FORTIFY family, `__stack_chk_guard`),
@@ -224,13 +245,15 @@ in this build, so it is not on the work-list despite being a `DT_NEEDED`.)
    `SL_RESULT_FEATURE_UNSUPPORTED`; `AMEDIAFORMAT_KEY_*`/`SL_IID_*` real data objects. Work-list
    43 → 2. If the DT_INIT_ARRAY discovery loop later proves any is init-critical, it gets a real
    host bridge then.
-5. **⏭️ NEXT — the 2 deferred variadic liblog** (`__android_log_print`/`__android_log_assert`): need
-   a nightly toolchain or a justified clean-room C (cc) shim → **full resolution** (work-list 2 → 0).
-6. After the work-list is satisfied: bind the assembled image to execution and run the **3,427
-   `DT_INIT_ARRAY` constructors** in order, honoring RELRO + BIND_NOW (no `%fs`/TCB needed — no
-   PT_TLS). This is **main-loop / dev-host only** (the cyber-safeguard).
+5. ~~**the 2 variadic liblog** (`__android_log_print`/`__android_log_assert`)~~ — ✅ DONE (2026-06-05):
+   the clean-room C (cc) shim `src/loader/liblog_shim.c` DEFINES both (vsnprintf → `eclipse_liblog_emit`),
+   bringing the work-list 2 → 0 → **full resolution** of all 584 imports.
+6. **⏭️ NEXT — bind + run the constructors:** bind the relocated + fully-resolved image to execution
+   and run the **3,427 `DT_INIT_ARRAY` constructors** in order in an isolated harness, honoring
+   RELRO + BIND_NOW (no `%fs`/TCB needed — no PT_TLS). This is **main-loop / dev-host only** (the
+   cyber-safeguard).
 
-> The pipeline is **proven**: with the Eclipse-native tier prepended, **621** GOT/PLT slots are filled
-> on the mapped 112 MiB engine (86 of them at verified Eclipse-native addresses), the work-list is
-> down to the **2** variadic liblog, and nothing is fabricated. The remaining work is the variadic cc
-> shim (then the DT_INIT_ARRAY run), not the relocation machinery.
+> The pipeline is **proven and CLOSED**: with the Eclipse-native tier prepended, **623** GOT/PLT slots
+> are filled on the mapped 112 MiB engine (88 of them at verified Eclipse-native addresses, incl. the 2
+> variadic liblog C-shim), the work-list is **0** (FULL resolution), and nothing is fabricated. The
+> remaining work is binding + the DT_INIT_ARRAY run, not the relocation machinery.

@@ -147,12 +147,12 @@ impl EclipseNativeProvider {
     /// native's address is safe Rust (a function/data item coerced to a pointer then to `u64`).
     ///
     /// The names are the real work-list from `loader::link::tests::real_libroblox_bionic_env_*`
-    /// (`docs/bionic-env-worklist.md`): of liblog's 5, the 2 **variadic** ones
-    /// (`__android_log_print`/`__android_log_assert`) stay on the work-list (see the module docs); of
-    /// bionic-libc's 15, all are implemented; of ndk-android's 27, all are implemented (AAsset* real
-    /// via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub). **45**
-    /// symbols total — registering them shrinks the engine's work-list from 88 to **43** (the 2
-    /// deferred variadic liblog + media-ndk 33 + audio 8).
+    /// (`docs/bionic-env-worklist.md`): liblog's full 5 (the 3 fixed-arity Rust natives plus the 2
+    /// **variadic** ones — `__android_log_print`/`__android_log_assert` — now DEFINED by the
+    /// clean-room C shim, 2026-06-05); bionic-libc's 15; ndk-android's 27 (AAsset* real via
+    /// `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub); media-ndk's 33
+    /// and audio's 8 sound-stubs. **88** symbols total — registering them shrinks the engine's
+    /// work-list from 88 to **0** (FULL resolution of all 584 libroblox imports to Eclipse/host).
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -168,6 +168,18 @@ impl EclipseNativeProvider {
         p.register(
             "android_set_abort_message",
             eclipse_android_set_abort_message as *const () as u64,
+        );
+        // The 2 VARIADIC liblog natives — DEFINED by the clean-room C shim (src/loader/liblog_shim.c,
+        // compiled by build.rs via the `cc` crate) because Rust stable cannot define a C-variadic
+        // `extern "C"` fn. Rust DECLARES them as variadic externs (stable) and takes their addresses
+        // here; the shim forwards the formatted line to `eclipse_liblog_emit` → `emit_log`. 2026-06-05.
+        p.register(
+            "__android_log_print",
+            __android_log_print as *const () as u64,
+        );
+        p.register(
+            "__android_log_assert",
+            __android_log_assert as *const () as u64,
         );
 
         // ---- bionic-specific libc (15) — glibc lacks these exact names --------------------------
@@ -472,6 +484,13 @@ const ANDROID_LOG_FATAL: c_int = 7;
 /// Emit a `[tag] msg` line to Eclipse's `tracing` sink at the priority-mapped level (the host
 /// equivalent of bionic writing to the log buffer). `tag`/`msg` are already owned Rust strings.
 fn emit_log(priority: c_int, tag: &str, msg: &str) {
+    // 2026-06-05: in tests, route through the per-thread capture (if armed) so the variadic-shim
+    // unit test can observe the exact message the C shim formatted, without changing the production
+    // path. Production builds compile only the `tracing` arm below.
+    #[cfg(test)]
+    if tests::capture_emit(priority, tag, msg) {
+        return;
+    }
     match priority {
         ANDROID_LOG_VERBOSE => tracing::trace!(target: "liblog", tag, "{msg}"),
         ANDROID_LOG_DEBUG => tracing::debug!(target: "liblog", tag, "{msg}"),
@@ -546,6 +565,46 @@ unsafe extern "C" fn eclipse_android_set_abort_message(msg: *const c_char) {
     // SAFETY: 2026-06-05 — `msg` is the public C-string arg (null-or-valid NUL-terminated).
     let msg = unsafe { cstr_opt(msg) }.unwrap_or_default();
     emit_log(ANDROID_LOG_ERROR, "abort", &msg);
+}
+
+// =================================================================================================
+// liblog — the 2 VARIADIC natives: clean-room C shim → Eclipse sink (added 2026-06-05).
+// =================================================================================================
+//
+// `__android_log_print` / `__android_log_assert` are C-variadic; Rust stable cannot DEFINE a
+// variadic `extern "C"` fn (`c_variadic` is nightly-only) but it CAN declare one and take its
+// address. The definitions live in the clean-room C shim `src/loader/liblog_shim.c` (compiled by
+// build.rs via the `cc` crate); each formats its varargs with `vsnprintf` into a bounded stack
+// buffer and forwards the finished line to the Eclipse-owned non-variadic sink below.
+
+extern "C" {
+    /// `int __android_log_print(int prio, const char* tag, const char* fmt, ...)` — DEFINED in the
+    /// C shim (`src/loader/liblog_shim.c`). Variadic externs are stable to declare; the address is
+    /// taken in [`EclipseNativeProvider::with_bionic_natives`] to bind the engine's relocation.
+    fn __android_log_print(prio: c_int, tag: *const c_char, fmt: *const c_char, ...) -> c_int;
+
+    /// `void __android_log_assert(const char* cond, const char* tag, const char* fmt, ...)` —
+    /// DEFINED in the C shim (noreturn: emits FATAL then `abort()`). Address-only use here.
+    fn __android_log_assert(cond: *const c_char, tag: *const c_char, fmt: *const c_char, ...);
+}
+
+/// Eclipse-owned **non-variadic** liblog sink, called by the C variadic shim
+/// (`src/loader/liblog_shim.c`) after it formats the varargs into a NUL-terminated message. Routes
+/// to [`emit_log`] (Eclipse's `tracing`), the same sink the fixed-arity liblog natives use. The
+/// shim guarantees `tag`/`msg` are non-null NUL-terminated C strings (it substitutes `""` for a
+/// null tag/fmt). 2026-06-05.
+///
+/// # Safety
+/// `tag`/`msg` must be valid NUL-terminated C strings for the duration of the call (the C shim
+/// passes its bounded stack buffer + the caller's tag, satisfying this).
+#[no_mangle]
+pub unsafe extern "C" fn eclipse_liblog_emit(prio: c_int, tag: *const c_char, msg: *const c_char) {
+    // SAFETY: 2026-06-05 — `tag`/`msg` are the shim's NUL-terminated C strings (non-null per the
+    // shim's contract); `cstr_opt`'s null-or-valid-NUL-terminated contract covers them.
+    let tag = unsafe { cstr_opt(tag) }.unwrap_or_default();
+    // SAFETY: 2026-06-05 — same contract as `tag` above.
+    let msg = unsafe { cstr_opt(msg) }.unwrap_or_default();
+    emit_log(prio, &tag, &msg);
 }
 
 // =================================================================================================
@@ -1875,6 +1934,39 @@ fn sl_iid_addr(idx: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::loader::reloc::{apply_one, Rela, SliceImage, SymbolResolver, R_X86_64_GLOB_DAT};
+    use std::cell::RefCell;
+
+    // ---- liblog emit capture (test-only) -------------------------------------------------------
+    //
+    // 2026-06-05: a per-thread capture armed by the variadic-shim test. When armed, `emit_log`
+    // pushes `(priority, tag, msg)` here and returns instead of hitting `tracing` — so the test
+    // observes the EXACT message the C shim formatted from a real format string + varargs. Per
+    // thread + RefCell → no cross-test interference, no global lock.
+    thread_local! {
+        static EMIT_CAPTURE: RefCell<Option<Vec<(c_int, String, String)>>> = const { RefCell::new(None) };
+    }
+
+    /// Called by [`emit_log`] in test builds. Returns `true` (consumed) iff a capture is armed on
+    /// this thread, recording `(priority, tag, msg)`; otherwise `false` (fall through to `tracing`).
+    pub(super) fn capture_emit(priority: c_int, tag: &str, msg: &str) -> bool {
+        EMIT_CAPTURE.with(|c| {
+            let mut slot = c.borrow_mut();
+            match slot.as_mut() {
+                Some(buf) => {
+                    buf.push((priority, tag.to_owned(), msg.to_owned()));
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// Arm the capture, run `body` (which calls into the shim), and return the captured emits.
+    fn with_capture(body: impl FnOnce()) -> Vec<(c_int, String, String)> {
+        EMIT_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        body();
+        EMIT_CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
+    }
 
     // ---- provider registry behavior ------------------------------------------------------------
 
@@ -1893,9 +1985,14 @@ mod tests {
         assert!(p.resolve("__errno").is_some_and(|r| r.addr != 0));
         assert!(p.resolve("__stack_chk_guard").is_some_and(|r| r.addr != 0));
         assert!(p.resolve("__sF").is_some_and(|r| r.addr != 0));
-        // The two VARIADIC liblog natives are deliberately NOT registered (work-list; no landmine).
-        assert_eq!(p.resolve("__android_log_print"), None);
-        assert_eq!(p.resolve("__android_log_assert"), None);
+        // The two VARIADIC liblog natives are now registered (DEFINED by the C shim, 2026-06-05):
+        // they resolve to the shim's strong, non-null addresses.
+        assert!(p
+            .resolve("__android_log_print")
+            .is_some_and(|r| r.addr != 0));
+        assert!(p
+            .resolve("__android_log_assert")
+            .is_some_and(|r| r.addr != 0));
         // An unregistered name → None (falls through to the host tier).
         assert_eq!(p.resolve("memcpy"), None);
         assert_eq!(p.resolve("__eclipse_no_such_native__"), None);
@@ -1904,17 +2001,20 @@ mod tests {
     #[test]
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
-        // 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio = 86.
+        // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 27 ndk-android + 33
+        // media-ndk + 8 audio = 88.
         assert_eq!(
             p.len(),
-            86,
-            "3 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio natives registered"
+            88,
+            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio natives registered"
         );
         for name in [
-            // liblog (3 fixed-arity)
+            // liblog (3 fixed-arity Rust + 2 variadic C-shim)
             "__android_log_write",
             "__android_log_buf_write",
             "android_set_abort_message",
+            "__android_log_print",
+            "__android_log_assert",
             // bionic-libc (15)
             "__strlen_chk",
             "__strchr_chk",
@@ -2005,6 +2105,81 @@ mod tests {
         ] {
             assert!(p.resolve(name).is_some(), "{name} must be registered");
         }
+    }
+
+    // ---- the VARIADIC liblog C shim: EXECUTE it and verify the formatted message ---------------
+    //
+    // 2026-06-05: this test CALLS `__android_log_print` (DEFINED in src/loader/liblog_shim.c via the
+    // cc crate) through the real shim, with a real format string + args, and asserts the C side
+    // formatted the line correctly and forwarded it to `eclipse_liblog_emit` → `emit_log`. This is
+    // the proof that the variadic bridge works end-to-end (Rust → C varargs → vsnprintf → Rust
+    // sink). Safe: it executes ONLY Eclipse's own trivial, unit-tested C shim.
+
+    extern "C" {
+        // Re-declare the shim entry points for the test (they are private to the module otherwise).
+        fn __android_log_print(prio: c_int, tag: *const c_char, fmt: *const c_char, ...) -> c_int;
+    }
+
+    #[test]
+    fn variadic_shim_formats_and_forwards_to_eclipse_sink() {
+        use std::ffi::CString;
+
+        let tag = CString::new("EclipseTag").unwrap();
+        let fmt = CString::new("n=%d s=%s hex=0x%x").unwrap();
+        let s_arg = CString::new("hi").unwrap();
+
+        let mut ret = 0;
+        let emits = with_capture(|| {
+            // SAFETY: 2026-06-05 — `__android_log_print` is Eclipse's own C shim; `tag`/`fmt` are
+            // valid NUL-terminated C strings kept alive across the call, and the varargs (i32,
+            // *const c_char, u32) match the `%d %s %x` conversions in `fmt`.
+            ret = unsafe {
+                __android_log_print(
+                    ANDROID_LOG_INFO,
+                    tag.as_ptr(),
+                    fmt.as_ptr(),
+                    42_i32,
+                    s_arg.as_ptr(),
+                    0xbeef_u32,
+                )
+            };
+        });
+
+        // Exactly one line was forwarded, with the priority, tag, and the vsnprintf-formatted body.
+        assert_eq!(emits.len(), 1, "shim forwards exactly one line per call");
+        let (prio, got_tag, got_msg) = &emits[0];
+        assert_eq!(*prio, ANDROID_LOG_INFO, "priority passes through unchanged");
+        assert_eq!(got_tag, "EclipseTag", "tag passes through unchanged");
+        assert_eq!(
+            got_msg, "n=42 s=hi hex=0xbeef",
+            "the C shim's vsnprintf formatted the varargs correctly"
+        );
+
+        // __android_log_print returns the emitted byte count (> 0) per the liblog contract.
+        assert!(ret > 0, "__android_log_print returns the byte count (> 0)");
+        assert_eq!(
+            ret as usize,
+            "n=42 s=hi hex=0xbeef".len(),
+            "the returned byte count matches the formatted message length"
+        );
+    }
+
+    #[test]
+    fn variadic_shim_handles_null_tag_and_empty_format() {
+        use std::ffi::CString;
+
+        let fmt = CString::new("plain").unwrap();
+        let emits = with_capture(|| {
+            // SAFETY: 2026-06-05 — null tag is explicitly handled by the shim (substitutes ""); the
+            // format has no conversions so no varargs are consumed.
+            let _ =
+                unsafe { __android_log_print(ANDROID_LOG_WARN, std::ptr::null(), fmt.as_ptr()) };
+        });
+        assert_eq!(emits.len(), 1);
+        let (prio, got_tag, got_msg) = &emits[0];
+        assert_eq!(*prio, ANDROID_LOG_WARN);
+        assert_eq!(got_tag, "", "a null tag becomes an empty string");
+        assert_eq!(got_msg, "plain");
     }
 
     // ---- provider tier ordering: Eclipse beats host --------------------------------------------
