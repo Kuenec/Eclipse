@@ -675,8 +675,14 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   release all 0-warning. The two next framework-breadth tracks: ✅ **(A) ARSC theme parent-chain +
   `obtainStyledAttributes(int[])` resolution is now DONE (2026-06-05, §6) — the `Theme.AppCompat` IllegalState is GONE;
   accelerometerdemo advances PAST AppCompat theme validation into the drawable manager, stopping at the deferred
-  `Matrix.native_create` (track B).** (B) the 2D Path/Matrix/Skia-equivalent vector-graphics engine → unblocks drawable
-  rendering (accelerometerdemo's `Matrix.native_create`, AdaptiveIconDemo's `Path.native_create_builder`) — still deferred.
+  `Matrix.native_create` (track B).** ✅ **(B) android.graphics.Matrix is now bound with REAL 3x3 affine math + the
+  vector-drawable inflation path is crossed (2026-06-05, §6 Matrix/vector-drawable entry) — accelerometerdemo now
+  drives `MainActivity.onCreate → setContentView` (full AppCompat sub-decor + content-layout inflation) → its own
+  `initViews`, stopping at the app's `SensorManager.register_accelerometer_listener_native` (a hardware-sensor
+  feature, NOT graphics).** The remaining 2D Skia-equivalent piece is the Path GEOMETRY+RASTER engine — `Path`
+  construction/op natives (`native_create_builder`/`moveTo`/`lineTo`/`cubicTo`) have NOT yet surfaced on a reachable
+  path (only a finalizer-thread `Path.native_reset` on an abandoned object), so the real path-geometry buffer +
+  software rasterizer (tiny-skia) into the Vulkan compositor is the next graphics build when those ops surface.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -2038,6 +2044,49 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `grep -n` + small windows on src/framework.rs's theme/applyStyle natives; NO vendor/atl, NO bionic/linker, NO web, NO
   framework.rs wholesale read). Next: track (B) the 2D Path/Matrix/Skia-equivalent vector-graphics engine → unblocks
   AppCompat drawables (accelerometerdemo's `Matrix.native_create`, AdaptiveIconDemo's `Path.native_create_builder`).
+- **2026-06-05 — Matrix bound with REAL 3x3 affine math; the vector-drawable inflation path is CROSSED; accelerometerdemo
+  reaches its own `initViews` (stops at a hardware-sensor native, NOT graphics).** Started at the deferred frontier `No
+  implementation found for long android.graphics.Matrix.native_create(long)` (accelerometerdemo, `VectorDrawableCompat.<init>
+  → Matrix.<clinit>`). Built **`src/framework/matrix_registry.rs`** — a sound generational-slab (mirrors `paint_registry`:
+  `#![forbid(unsafe_code)]`, jlong = packed index+generation NOT a raw pointer, stale/oob/double-free → typed `Err`) holding
+  an `Affine` = the full AOSP 3x3 matrix (`[f32;9]`, MSCALE_X..MPERSP_2 order) with **REAL exact math** (multiply/setConcat
+  [a*b]/pre[this*m]/post[m*this]/setTranslate/setScale[±pivot]/setRotate[±pivot]/mapPoint [full perspective divide]) — NO
+  sentinel, NO Skia, NO GTK (a Matrix is pure float). Bound **`Matrix.native_create(J)J`** (src 0 → identity, non-0 → exact
+  copy via registry `get`) + **`Matrix.finalizer(J)V`** (frees the slab slot; runs on the GC thread). Then drove the
+  discovery loop native-by-native through the whole vector-drawable + AppCompat-sub-decor inflation, binding each surfaced
+  benign native against EXISTING Eclipse machinery (each from the exact ART `No implementation found` line, name/sig-pinned):
+  **XmlBlock** `nativeGetAttributeDataType`/`nativeGetAttributeData`/`nativeGetAttributeCount`/`nativeGetAttributeResource`
+  (`(JI)I`/`(J)I` — return the parsed attr's `value_type`/`value_data`/element attr-count/name-`name_resource`, all already
+  in `apk::axml::XmlAttribute`); **Paint** `native_set_color(JI)V` (writes `paint_registry.color`); **AssetManager**
+  `loadThemeAttributeValue(JILandroid/util/TypedValue;Z)I` (resolves a `?attr` theme id via the existing
+  `resolve_theme_attr` against the theme handle's merged map + writes the public `TypedValue` fields, mirroring
+  `loadResourceValue`); **View** `native_setVisibility(JIF)V` (validate-handle no-op); **ImageButton** `native_constructor`
+  (reuses the class-agnostic `view_native_constructor`) + `nativeSetOnClickListener(J)V` (no-op); **Drawable**
+  `native_unref(J)V` (sentinel no-op); **SystemClock** `uptimeMillis()J` (shares the `elapsedRealtime` monotonic
+  `Instant` anchor). **Root-cause fix (same-pattern audit)**: `resolve_xml_attributes` (the inline-XML styled-attr path)
+  did NOT follow `TYPE_REFERENCE` values into `resources.arsc`, so a vector drawable's `fillColor="@color/x"` reached
+  `TypedArray.getColor` as `type=0x1` → `UnsupportedOperationException: Can't convert to color`; the THEME path
+  (`resolve_theme_attr`) already chased references — fixed by factoring `resolve_inline_attr_value` (chases `TYPE_REFERENCE`
+  via the same `resolve_res_value`, keeps the referenced id in `STYLE_RESOURCE_ID`), making both paths resolve references
+  uniformly. **FAITHFUL status (release `eclipse run`, `/tmp/eclipse-vec.log`):** accelerometerdemo now runs
+  `MainActivity.onCreate → setContentView` (full AppCompat sub-decor: theme resolve, ActionBarOverlay, Toolbar + nav
+  ImageButton, ColorStateList inflation, content `AppCompatTextView`) → its own `initViews`, stopping at the app's
+  `SensorManager.register_accelerometer_listener_native(SensorEventListener,Sensor,int)` — a **hardware-sensor** feature,
+  the natural non-graphics STOP (no accelerometer device backing). Matrix natives are exercised (debug log: many
+  `native_create src=0 → identity` handles). **Path:** the only Path native reached is `native_reset(JJ)V` on the
+  GC/finalizer thread (an abandoned Path's `finalize→reset`), NOT a reachable construction/op native — so the real
+  path-geometry buffer + rasterizer is deferred until `native_create_builder`/`moveTo`/… surface on the reachable path (NO
+  speculative code added — Simplicity First). **NO regression**: demo_app still drives steps 1–7 → ActivityResumed + Vulkan
+  swapchain render (extent 800×600, zero VK_ERROR/panic, EXIT=124 clean, `/tmp/eclipse-demo-regress.log`). Gate clean: fmt /
+  build --all-targets / clippy `-D warnings` / **test 159 unit + 2 doctests** (matrix_registry: 17 soundness+affine-math
+  tests [identity/translate/scale±pivot/rotate90±pivot/setConcat=a*b/pre≠post/reset/set_from + slab stale/oob/double-free/
+  null-sentinel/pack-roundtrip]; +8 name/sig pins for the bound natives) / release all 0-warning. Files:
+  `src/framework/matrix_registry.rs` (new), `src/framework.rs`. No new deps (tiny-skia NOT yet added — no rasterization
+  reached). Cyber-safeguard did NOT trip (every native from the benign ART `No implementation found` line; only targeted
+  `grep -n` + small windows on src/framework.rs; NO vendor/atl, NO bionic/linker, NO web, NO framework.rs wholesale read).
+  Next: when Path construction/op natives surface, build the real `path_registry` geometry buffer (Vec<PathVerb>) + a
+  software 2D rasterizer (tiny-skia) feeding the Vulkan compositor; orthogonally, `SensorManager` sensor bridge for
+  accelerometerdemo and `?attr`-in-inline-XML resolution (needs a theme handle threaded into the inline path).
 
 ---
 
