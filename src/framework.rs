@@ -12,10 +12,21 @@
 //! held VM with [`jni::vm::JavaVM::from_raw`], attaches the (already-attached) main thread via
 //! `attach_current_thread`, **binds Eclipse's own non-GTK backing for the two natives
 //! `android.content.Context`'s static initializer calls** (`native_get_apk_path` +
-//! `native_updateConfig`) via `RegisterNatives`, then resolves the recipe's bootstrap classes
+//! `native_updateConfig`) via `RegisterNatives`, resolves the recipe's bootstrap classes
 //! ([`CONTEXT_CLASS`]/[`APPLICATION_CLASS`]) with `find_class` to prove the typed-`Env` bridge
-//! reaches the loaded `android.*` framework. The recipe steps are encoded as typed constants
-//! ([`STEP1_CREATE_APPLICATION`] … [`STEP5_ACTIVITY_ON_CREATE`]).
+//! reaches the loaded `android.*` framework, and then **drives recipe steps 1–3** —
+//! `Context.createApplication(J)` → `ContentProvider.createContentProviders()` →
+//! `Application.onCreate()` — to reach `Application.onCreate` for a pure-Java APK. The recipe
+//! steps are encoded as typed constants ([`STEP1_CREATE_APPLICATION`] … [`STEP5_ACTIVITY_ON_CREATE`]).
+//!
+//! ### Why passing `0` (a null handle) to `createApplication(J)` is safe for steps 1–3
+//! 2026-06-05: steps 1–3 are **pure Java** — they only *store* the `jlong native_window` in an
+//! `Application` field; they do **not** dereference it (`docs/art-and-runtime.md` "Tier A":
+//! `createApplication`/`createContentProviders`/`Application.onCreate` invoke no native that
+//! touches the handle). The handle is first dereferenced at step 4 (`Activity.createMainActivity`
+//! → the Window natives), which is deferred. So `0` is a confirmed-safe placeholder for steps 1–3,
+//! not a guess; the real Eclipse-owned handle arrives with the framework/Surface design
+//! (component-map F) when steps 4–5 are driven.
 //!
 //! ### Why bind those two natives (the non-GTK backing — confirmed)
 //! ATL's `api-impl.jar` declares `native_get_apk_path`/`native_updateConfig` and backs them in C
@@ -28,17 +39,19 @@
 //! static initializer reaches for the pure-Java demo APK (`Context.java` `static { … }`).
 //!
 //! ## What is deferred (and why)
-//! Step 1 itself — `Context.createApplication(J)→Application` — and steps 2–5 are **not** driven
-//! yet. They are gated on a single unresolved input: the **window handle** passed as the
-//! `jlong`. The vendored framework Eclipse loads is ATL's GTK-coupled `api-impl.jar`, whose
-//! `create*` natives ultimately cast that `jlong` to a `GtkWidget*`; the handle Eclipse's winit
-//! window yields is **not** a `GtkWidget*`, and the committed recipe lists "the exact
-//! window-handle type Eclipse passes as the `jlong`" as **UNCONFIRMED**
-//! (`docs/art-and-runtime.md` "UNCONFIRMED"). Passing a winit raw handle into a GTK-expecting
-//! native would be a *guessed* pointer (CLAUDE.md: no guessing) and risks type-confused
-//! dereference. So this increment builds the grounded bridge and stops *before* the first
-//! window-dependent call; driving step 1 onward is unblocked by the framework/Surface design
-//! (component-map F) that defines Eclipse's own window handle. See [`LifecycleProgress`].
+//! Steps **4–5** — `Activity.createMainActivity(String, jlong, String)→Activity` and
+//! `Activity.onCreate(Bundle)` — are **not** driven yet. They are gated on a single unresolved
+//! input: the **window handle** passed as the `jlong`, which step 4's Window natives actually
+//! *dereference* (unlike steps 1–3, which only store it). The vendored framework Eclipse loads is
+//! ATL's GTK-coupled `api-impl.jar`, whose `create*` natives ultimately cast that `jlong` to a
+//! `GtkWidget*`; the handle Eclipse's winit window yields is **not** a `GtkWidget*`, and the
+//! committed recipe lists "the exact window-handle type Eclipse passes as the `jlong`" as
+//! **UNCONFIRMED** (`docs/art-and-runtime.md` "UNCONFIRMED"). Passing a winit raw handle into a
+//! GTK-expecting native would be a *guessed* pointer (CLAUDE.md: no guessing) and risks
+//! type-confused dereference. So this increment drives steps 1–3 (which never dereference the
+//! handle) and stops *before* the first handle-dereferencing call; driving step 4 onward is
+//! unblocked by the framework/Surface design (component-map F) that defines Eclipse's own window
+//! handle. See [`LifecycleProgress`].
 //!
 //! ## `unsafe`
 //! 2026-06-05: confined to the JNI FFI surface, each block carrying a `// SAFETY:` note —
@@ -59,7 +72,7 @@ use jni::objects::{JClass, JObject, JString};
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
 use jni::vm::JavaVM;
-use jni::{jni_str, Env, EnvUnowned, NativeMethod};
+use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use crate::runtime::Vm;
 
@@ -229,6 +242,9 @@ pub const CONTEXT_CLASS: &JNIStr = jni_str!("android/content/Context");
 /// The `android.app.Application` class (internal name) — the object step 1 returns and step 3
 /// (`Application.onCreate`) is invoked on.
 pub const APPLICATION_CLASS: &JNIStr = jni_str!("android/app/Application");
+/// Step-2 class: `android.content.ContentProvider` (internal name) — hosts the `static`
+/// `createContentProviders()` entry point.
+pub const CONTENT_PROVIDER_CLASS: &JNIStr = jni_str!("android/content/ContentProvider");
 
 /// Step 1 (deferred): `static Context.createApplication(jlong native_window) -> Application`.
 pub const STEP1_CREATE_APPLICATION: RecipeStep = RecipeStep {
@@ -276,27 +292,34 @@ pub struct RecipeStep {
 
 /// How far the lifecycle driver progressed before stopping.
 ///
-/// This increment reaches [`BridgeProven`](LifecycleProgress::BridgeProven): the typed-`Env`
-/// bridge resolved the recipe's bootstrap classes against the loaded framework. The
-/// window-dependent calls (step 1 onward) are deferred — see the module docs and
+/// This increment reaches [`ApplicationOnCreate`](LifecycleProgress::ApplicationOnCreate): it
+/// proves the bridge, then drives recipe steps 1–3 to `Application.onCreate`. The
+/// handle-dereferencing calls (step 4 onward) are deferred — see the module docs and
 /// [`drive_application_lifecycle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleProgress {
     /// `find_class` resolved both [`CONTEXT_CLASS`] and [`APPLICATION_CLASS`] from the attached
     /// main thread: the `from_raw` + `attach_current_thread` + `find_class` bridge to the loaded
-    /// `android.*` framework works. The window-dependent `createApplication(J)` call (step 1) is
-    /// the next increment, blocked only on the framework/Surface window-handle design.
+    /// `android.*` framework works. An intermediate milestone on the way to
+    /// [`ApplicationOnCreate`](Self::ApplicationOnCreate).
     BridgeProven,
+    /// Recipe steps 1–3 ran on the attached main thread: `Context.createApplication(0)` returned an
+    /// `Application`, `ContentProvider.createContentProviders()` completed, and
+    /// `Application.onCreate()` was invoked on the returned object. Steps 4–5 (which dereference the
+    /// `jlong` window handle) remain deferred on the framework/Surface window-handle design.
+    ApplicationOnCreate,
 }
 
-/// Drive the booted ART VM toward Roblox's `Application.onCreate` — the grounded foundation.
+/// Drive the booted ART VM to Roblox's `Application.onCreate` (recipe steps 1–3).
 ///
 /// Wraps the held [`Vm`]'s raw `*mut JavaVM` with [`jni::vm::JavaVM::from_raw`], attaches the
 /// current (main) thread, binds Eclipse's own non-GTK backing for `android.content.Context`'s two
 /// static-init natives (`native_get_apk_path` returns `apk_path`; `native_updateConfig` sets the
-/// `Configuration` screen dims to safe defaults), then resolves the recipe's bootstrap classes
+/// `Configuration` screen dims to safe defaults), resolves the recipe's bootstrap classes
 /// ([`CONTEXT_CLASS`], [`APPLICATION_CLASS`]) to prove the typed-`Env` bridge reaches the loaded
-/// `android.*` framework. Returns [`LifecycleProgress::BridgeProven`] on success.
+/// `android.*` framework, then **drives steps 1–3**: `Context.createApplication(0)` →
+/// `ContentProvider.createContentProviders()` → `Application.onCreate()`. Returns
+/// [`LifecycleProgress::ApplicationOnCreate`] on success.
 ///
 /// `apk_path` is the on-disk APK path the framework's `native_get_apk_path` must return (the same
 /// path passed to [`runtime::boot`](crate::runtime::boot)); it is stashed before the natives are
@@ -308,14 +331,17 @@ pub enum LifecycleProgress {
 /// already JNI-attached after `JNI_CreateJavaVM`, so `attach_current_thread` is cheap.
 ///
 /// The JNI closure body is wrapped in `std::panic::catch_unwind` so a Rust panic can never
-/// unwind into ART's C++ under the release `panic = "abort"` profile (AGENTS.md §2.8). On a
-/// pending Java exception the typed [`FrameworkError::Jni`] is returned (never a panic/unwrap).
+/// unwind into ART's C++ under the release `panic = "abort"` profile (AGENTS.md §2.8). Each step's
+/// failure — including a pending Java exception — surfaces as the typed [`FrameworkError::Jni`]
+/// (never a panic/unwrap); a thrown exception is additionally described to stderr (to name the next
+/// missing native/class for the dev-host discovery loop) and cleared before returning.
 ///
 /// # Deferred (not a failure)
-/// This stops *before* step 1 (`createApplication(J)`): that and steps 2–5 take a `jlong` window
-/// handle whose type is UNCONFIRMED for Eclipse's (non-GTK) window — see the module docs. Calling
-/// them with a guessed handle is forbidden (CLAUDE.md); they are unblocked by the framework/Surface
-/// design (component-map F).
+/// This stops *before* step 4 (`Activity.createMainActivity`): steps 4–5 take a `jlong` window
+/// handle that the Window natives **dereference**, and that handle's type is UNCONFIRMED for
+/// Eclipse's (non-GTK) window — see the module docs. Steps 1–3 only *store* the handle, so the
+/// safe placeholder `0` is passed; step 4 onward is unblocked by the framework/Surface design
+/// (component-map F).
 pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
@@ -335,34 +361,117 @@ pub fn drive_application_lifecycle(
     // is cheap and does not detach on return). Wrap the closure body in catch_unwind so a panic
     // from inside JNI/ART can never unwind across the FFI boundary (panic = "abort"; §2.8).
     java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| prove_bridge(env, apk_path))) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| drive_steps_1_to_3(env, apk_path))) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
         }
     })
 }
 
-/// Bind Eclipse's non-GTK Context static-init natives, then resolve the recipe's bootstrap classes
-/// to prove the bridge to the loaded `android.*` framework. Split out so the panic guard in
-/// [`drive_application_lifecycle`] wraps a single named call.
-fn prove_bridge(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress, FrameworkError> {
+/// Prove the bridge, then drive recipe steps 1–3 to `Application.onCreate`. Split out so the panic
+/// guard in [`drive_application_lifecycle`] wraps a single named call.
+///
+/// All JNI calls go through [`checked`], so a thrown Java exception is described + cleared and
+/// surfaced as the typed [`FrameworkError::Jni`] rather than left pending or panicking. The recipe
+/// class names / descriptors are the [`RecipeStep`] constants ([`STEP1_CREATE_APPLICATION`] …);
+/// the matching compile-time `jni_str!`/`jni_sig!` literals at the call sites are pinned equal to
+/// those constants by the unit test `call_site_literals_match_recipe_constants` (single source of
+/// truth, no per-call allocation or fallible runtime signature parse).
+fn drive_steps_1_to_3(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress, FrameworkError> {
     // Bind native_get_apk_path + native_updateConfig BEFORE Context's static initializer can run
     // (find_class loads/links the class but does not initialize it — JNI spec), so the two natives
     // are already resolvable, non-GTK, when <clinit> later calls them. RegisterNatives wins over
     // name-based lazy binding (JNI 1.1 spec), so ATL's GTK-backed symbols are not used.
     register_context_natives(env, apk_path)?;
 
-    // Step-1 host class. `find_class` takes a `&JNIStr`; the `jni_str!` constants are MUTF-8
-    // encoded at compile time. A pending Java exception surfaces as the typed Jni error (via the
-    // `From<jni::errors::Error>` impl below) through `?`.
+    // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
+    // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
+    // constants are MUTF-8 encoded at compile time.
     env.find_class(CONTEXT_CLASS)?;
     env.find_class(APPLICATION_CLASS)?;
     tracing::info!(
         context = STEP1_CREATE_APPLICATION.class,
         application = STEP3_APPLICATION_ON_CREATE.class,
-        "framework bridge proven: Context static-init natives registered + bootstrap classes resolved via JNI (createApplication deferred — window handle UNCONFIRMED)"
+        "framework bridge proven: Context static-init natives registered + bootstrap classes resolved via JNI"
     );
-    Ok(LifecycleProgress::BridgeProven)
+
+    // Step 1: `static Context.createApplication(jlong native_window) -> Application`. The handle is
+    // passed as `0` (null): steps 1–3 only STORE it, never dereference it (module docs; deref begins
+    // at the deferred step 4). `<clinit>` runs here on first active use of Context, calling the two
+    // natives bound above. `.l()` unwraps the returned Application JObject; a wrong return type is a
+    // typed error, not a panic.
+    let context = env.find_class(CONTEXT_CLASS)?;
+    let app = checked(env, "step 1 Context.createApplication", |env| {
+        env.call_static_method(
+            &context,
+            jni_str!("createApplication"),
+            jni_sig!("(J)Landroid/app/Application;"),
+            &[JValue::Long(0)],
+        )?
+        .l()
+    })?;
+
+    // Step 2: `static ContentProvider.createContentProviders() -> void` — instantiate the
+    // manifest-declared providers. `.v()` asserts the void return.
+    let content_provider = env.find_class(CONTENT_PROVIDER_CLASS)?;
+    checked(
+        env,
+        "step 2 ContentProvider.createContentProviders",
+        |env| {
+            env.call_static_method(
+                &content_provider,
+                jni_str!("createContentProviders"),
+                jni_sig!("()V"),
+                &[],
+            )?
+            .v()
+        },
+    )?;
+
+    // Step 3: instance `Application.onCreate() -> void` on the object from step 1 — the app's Java
+    // shell self-init. Reaching this is the increment's milestone.
+    checked(env, "step 3 Application.onCreate", |env| {
+        env.call_method(&app, jni_str!("onCreate"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+
+    tracing::info!(
+        "Application.onCreate reached: recipe steps 1–3 driven (createMainActivity/step 4 deferred — window handle UNCONFIRMED)"
+    );
+    Ok(LifecycleProgress::ApplicationOnCreate)
+}
+
+/// Run a single JNI step, turning a thrown Java exception into a typed [`FrameworkError::Jni`].
+///
+/// 2026-06-05: the closure's `&mut Env<'local>` and the returned `T` share the **named** outer
+/// `'local`, so a local ref the step produces (e.g. step 1's `Application` `JObject<'local>`) is
+/// tied to the attachment scope and stays usable in later steps — not to a short reborrow inside
+/// this helper. An elided `&mut Env` here would pin `T` to that reborrow and reject any
+/// lifetime-bearing return (`error: lifetime may not live long enough`).
+///
+/// 2026-06-05: the `jni` crate's `call_*` return `Err(Error::JavaException)` on a thrown exception
+/// but **leave it pending** (verified in the crate source, env.rs "this will _not_ clear the
+/// exception"). A still-pending exception poisons the next JNI call, so on any error we
+/// `exception_describe` it (prints the Java stack trace to stderr — names the next missing
+/// native/class for the dev-host discovery loop) and `exception_clear` it before returning. The
+/// `exception_check` guard avoids describing when the error was not a Java throw (e.g. a Rust-side
+/// `WrongJValueType`). No unwrap/expect — the typed error propagates via `?`.
+fn checked<'local, T>(
+    env: &mut Env<'local>,
+    what: &str,
+    op: impl FnOnce(&mut Env<'local>) -> Result<T, jni::errors::Error>,
+) -> Result<T, FrameworkError> {
+    match op(env) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            tracing::error!(step = what, error = %e, "framework lifecycle step failed");
+            Err(FrameworkError::Jni(e))
+        }
+    }
 }
 
 /// Errors from the framework lifecycle driver.
@@ -444,6 +553,40 @@ mod tests {
         // `JNIStr::to_str` returns the MUTF-8-decoded `Cow<str>`; these ASCII names round-trip.
         assert_eq!(CONTEXT_CLASS.to_str(), "android/content/Context");
         assert_eq!(APPLICATION_CLASS.to_str(), "android/app/Application");
+    }
+
+    #[test]
+    fn call_site_literals_match_recipe_constants() {
+        // 2026-06-05: the steps-1–3 call sites in `drive_steps_1_to_3` use inline compile-time
+        // `jni_str!`/`jni_sig!` literals (not the `RecipeStep` constants, which the `jni` API cannot
+        // take directly). Pin those literals equal to the documented constants so the two cannot
+        // drift — a mismatch would call the wrong method/signature at boot with no compile error.
+        // `jni_str!` yields a `&JNIStr` (the method name); `jni_sig!` yields a `MethodSignature`
+        // whose `.sig()` is the raw descriptor `&JNIStr`.
+        assert_eq!(
+            jni_str!("createApplication").to_str(),
+            STEP1_CREATE_APPLICATION.method
+        );
+        assert_eq!(
+            jni_sig!("(J)Landroid/app/Application;").sig().to_str(),
+            STEP1_CREATE_APPLICATION.descriptor
+        );
+        assert_eq!(
+            jni_str!("createContentProviders").to_str(),
+            STEP2_CREATE_CONTENT_PROVIDERS.method
+        );
+        assert_eq!(
+            jni_sig!("()V").sig().to_str(),
+            STEP2_CREATE_CONTENT_PROVIDERS.descriptor
+        );
+        assert_eq!(
+            jni_str!("onCreate").to_str(),
+            STEP3_APPLICATION_ON_CREATE.method
+        );
+        assert_eq!(
+            jni_sig!("()V").sig().to_str(),
+            STEP3_APPLICATION_ON_CREATE.descriptor
+        );
     }
 
     #[test]
