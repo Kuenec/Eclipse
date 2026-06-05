@@ -672,9 +672,11 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   app + benefits Roblox. **3 natives bound** (`MessageQueue.nativeInit`, `ImageView.native_constructor`,
   `Drawable.native_constructor`) + step-0 `Looper.prepareMainLooper`. Gate clean: **134 unit + 2 doctests**
   (3 new name/sig-pin tests: `message_queue_…`/`image_view_…`/`drawable_native_…`), fmt/clippy `-D warnings`/
-  release all 0-warning. The two next framework-breadth tracks (both deferred, not subagent-safe): (A) ARSC
-  theme parent-chain + `obtainStyledAttributes(int[])` resolution → unblocks every AppCompat app; (B) the 2D
-  Path/Skia-equivalent vector-graphics engine → unblocks drawable rendering.
+  release all 0-warning. The two next framework-breadth tracks: ✅ **(A) ARSC theme parent-chain +
+  `obtainStyledAttributes(int[])` resolution is now DONE (2026-06-05, §6) — the `Theme.AppCompat` IllegalState is GONE;
+  accelerometerdemo advances PAST AppCompat theme validation into the drawable manager, stopping at the deferred
+  `Matrix.native_create` (track B).** (B) the 2D Path/Matrix/Skia-equivalent vector-graphics engine → unblocks drawable
+  rendering (accelerometerdemo's `Matrix.native_create`, AdaptiveIconDemo's `Path.native_create_builder`) — still deferred.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -1995,6 +1997,47 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   benign ART `No implementation found` lines + AOSP Java contracts; NO vendor/atl, NO bionic/linker, NO web, NO
   framework.rs wholesale read). Two next deferred framework-breadth tracks: (A) ARSC theme parent-chain → every
   AppCompat app; (B) 2D Path/Skia engine → drawable rendering. Committed to main as Kuenec, no co-author, NOT pushed.
+- **2026-06-05** — 🟢 **FRAMEWORK BREADTH track (A) DONE: ARSC theme/style + parent-chain + `obtainStyledAttributes(int[])`
+  resolution — the `Theme.AppCompat` `IllegalStateException` is GONE; accelerometerdemo now advances PAST AppCompat's
+  theme validation.** ROOT CAUSE (confirmed by evidence, not inferred): `Theme.obtainStyledAttributes(R.styleable.
+  AppCompatTheme)` calls `AssetManager.applyStyle(theme, parser=0, attrs=[122 ids])`; that native was a TYPE_NULL stub
+  for the `parser==0` (theme-only) path, so every AppCompat attr (`windowActionBar`/`colorPrimary`/…) resolved to NULL →
+  `AppCompatDelegateImplV9.createSubDecor` threw. The theme's STYLE entry + its PARENT CHAIN were never resolved from
+  the ARSC. **THREE durable, surgical fixes (no faking — real theme values resolved):**
+  (1) **`src/apk/arsc.rs`: COMPLEX (bag/style) decode added.** New `ResTable::resolve_style(id) → ResolvedStyle{parent_id,
+  Vec<StyleEntry{attr_id,type_,data}>}` — a bounds-checked, total reader for `ResTable_map_entry` (FLAG_COMPLEX:
+  `ResTable_entry`(8) + parent(u32) + count(u32), then `count` × `ResTable_map`(name:u32 + Res_value:8)). Verified
+  against the REAL demo APK (theme `0x7f0800a3` → parent `0x7f08010a`, 3 own entries; chain 7 styles deep ending at
+  framework `0x0103000c`). `count` capped + every map read bounds-checked → never panics under `panic=abort`.
+  (2) **`src/framework/theme_registry.rs` + `applyThemeStyle`: theme model = merged attr map.** `ThemeState` gained
+  `attrs: HashMap<i32, ThemeAttr{type_,data}>`. `applyThemeStyle(theme, styleRes, force)` now LOADS the style bag +
+  walks its PARENT CHAIN (`merge_theme_style`, cross-package via `arsc_bytes_for` — app chain ends in a framework
+  `android:Theme.*` package 0x01; child overrides parent via insert-if-absent walking child→parent; depth-capped 64,
+  cycle-safe), merging into the theme map; `force` overrides existing. `copyTheme` now copies the **attr map**, not just
+  `styles`. Run evidence: `applyThemeStyle … style_res=0x7f0800a3 force=true resolved=437 total=437`.
+  (3) **`applyStyle` theme path:** when `parser==0`, each requested attr is resolved from the theme map (`resolve_theme_attr`
+  follows `TYPE_REFERENCE`→ARSC concrete value + `TYPE_ATTRIBUTE`→theme-indirection, bounded), written into the stride-7
+  TypedArray window; absent → TYPE_NULL (the framework default, the sound AOSP fallback). When `parser!=0`, XML attrs win
+  and the theme fills the gaps (correct AOSP layering, no demo_app regression). Run evidence: `applyStyle … parser=0
+  attrs=122 changed=7` (was `changed=0`). **FAITHFUL outcome — accelerometerdemo:** `- onCreate - yay!` runs, the
+  `Theme.AppCompat` IllegalState is GONE, `createSubDecor` no longer appears; the app advances into AppCompat's drawable
+  manager and STOPs at **`android.graphics.Matrix.native_create(long)`** (via `AppCompatDrawableManager →
+  VectorDrawableCompat → Matrix.<clinit>`) — the deferred 2D vector-graphics (Skia-equivalent) engine, track (B); a
+  sentinel would FAKE matrix geometry (forbidden). **NO REGRESSION + same-pattern audit:** the theme now resolving
+  `android:windowBackground` made demo_app reach `setContentView → setBackgroundDrawable`, surfacing two previously-
+  unreached benign Window/View natives, both bound non-GTK validate-handle no-ops (the GTK-teardown is a no-op on
+  Eclipse, the drawable draw is the deferred Skia path): **`android.view.Window.remove_gtk_background(long)`** + **`android.
+  view.View.native_setBackgroundDrawable(long,long)`** (the `drawable` arg is a Drawable peer sentinel, not dereferenced).
+  demo_app now drives **steps 1–7 → ActivityResumed + Vulkan swapchain + 60 s render, 0 VK_ERROR/panic** (`/tmp/eclipse-
+  demo-regress3.log`, EXIT=124 clean). Gate clean: fmt / build --all-targets / clippy `-D warnings` / **test 140 unit +
+  2 doctests** (+6: arsc style-bag decode + real-APK style decode; theme `resolve_theme_attr` concrete/missing +
+  `?attr` indirection + cycle-bounded; `resolve_theme_attributes` registry + bad-handle totality; theme_registry attr-map
+  round-trip/independent-copy; +2 Window/View name-sig pins) / release all 0-warning. Files: `src/apk/arsc.rs`,
+  `src/framework/theme_registry.rs`, `src/framework.rs`. No new deps. Cyber-safeguard did NOT trip (ARSC bag format
+  verified empirically against the LOCAL demo APK + the benign ART `No implementation found` lines; only targeted
+  `grep -n` + small windows on src/framework.rs's theme/applyStyle natives; NO vendor/atl, NO bionic/linker, NO web, NO
+  framework.rs wholesale read). Next: track (B) the 2D Path/Matrix/Skia-equivalent vector-graphics engine → unblocks
+  AppCompat drawables (accelerometerdemo's `Matrix.native_create`, AdaptiveIconDemo's `Path.native_create_builder`).
 
 ---
 

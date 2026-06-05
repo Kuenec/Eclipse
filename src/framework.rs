@@ -974,6 +974,161 @@ fn u32_to_i32(v: u32) -> i32 {
     i32::from_ne_bytes(v.to_ne_bytes())
 }
 
+/// Maximum theme parent-chain depth walked by [`merge_theme_style`]. Real Material/AppCompat chains
+/// are ~6–8 deep (verified 2026-06-05: the accelerometer demo's AppTheme chain is 7 styles); this cap
+/// (2026-06-05) sits well above any legitimate depth while bounding work and breaking any cycle a
+/// malformed/hostile table might encode.
+const MAX_THEME_PARENT_DEPTH: usize = 64;
+
+/// Merge a style resource id's bag + its parent chain into `out` (attribute id → resolved value),
+/// child overriding parent. Returns the number of attributes the chain contributed.
+///
+/// 2026-06-05: an AOSP theme is a `<style>` (a `resources.arsc` bag of attribute id → `Res_value`,
+/// plus a parent style id). The activity's theme (from the manifest `android:theme` or the AppCompat
+/// default) is applied via `applyThemeStyle(styleRes)`; resolving the theme's full attribute set —
+/// which `obtainStyledAttributes(int[])` reads — requires walking the parent chain so AppCompat's own
+/// attributes (`windowActionBar`/`colorPrimary`/…), defined up the chain in the app's bundled
+/// AppCompat resources, are present. Walk from the applied style UPWARD: insert each attribute only if
+/// absent, so the more-specific (child) value wins over the parent's. Parents can cross packages
+/// (e.g. the app theme's chain ends in a framework `android:Theme.*`, package `0x01`), so each node is
+/// read through [`arsc_bytes_for`] (framework table for package `0x01`, app table otherwise).
+///
+/// Total + bounded: [`MAX_THEME_PARENT_DEPTH`] caps the walk (breaking any cycle), a node whose ARSC
+/// is missing/corrupt/absent simply ends the walk, and the underlying [`apk::arsc`](crate::apk::arsc)
+/// decode is itself never-panicking. Re-parses the ARSC per node (off the gameplay hot path — themes
+/// are set up once during activity create).
+fn merge_theme_style(
+    out: &mut std::collections::HashMap<i32, theme_registry::ThemeAttr>,
+    style_res: u32,
+) -> usize {
+    let mut contributed = 0usize;
+    let mut current = style_res;
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..MAX_THEME_PARENT_DEPTH {
+        if current == 0 || !visited.insert(current) {
+            break; // no parent, or a cycle — stop.
+        }
+        let Some(bytes) = arsc_bytes_for(current) else {
+            break; // the table for this node is unavailable — end the walk.
+        };
+        let Ok(table) = crate::apk::arsc::parse_arsc(&bytes) else {
+            break;
+        };
+        let Some(style) = table.resolve_style(current) else {
+            break; // not a style/bag (or absent) — nothing more to merge.
+        };
+        for entry in &style.entries {
+            // attr_id 0 is not a real attribute; skip it (defensive against malformed bags).
+            if entry.attr_id == 0 {
+                continue;
+            }
+            let key = u32_to_i32(entry.attr_id);
+            // Insert only if absent → the child (seen first, walking upward) overrides the parent.
+            out.entry(key).or_insert_with(|| {
+                contributed += 1;
+                theme_registry::ThemeAttr {
+                    type_: entry.type_,
+                    data: entry.data,
+                }
+            });
+        }
+        current = style.parent_id;
+    }
+    contributed
+}
+
+/// Maximum reference-chase depth when resolving a theme attribute's value to a concrete one
+/// (`TYPE_REFERENCE`/`TYPE_ATTRIBUTE` hops). Real chains are 1–3 deep; this cap (2026-06-05) bounds
+/// work and breaks any cycle.
+const MAX_ATTR_RESOLVE_DEPTH: usize = 16;
+
+/// Resolve one theme attribute id to the [`TypedEntry`] `obtainStyledAttributes(int[])` writes.
+///
+/// 2026-06-05: looks `attr_id` up in the theme's merged attribute map (`attrs`). For a concrete value
+/// (boolean/int/color/dimension/…) returns it directly. For a `TYPE_REFERENCE` (`@id/@color/…`),
+/// follows it into `resources.arsc` to a concrete `Res_value` (so e.g. `colorPrimary → @color/x →
+/// ARGB` resolves) while keeping the original referenced id in the `STYLE_RESOURCE_ID` slot (what
+/// `getResourceId` returns). For a `TYPE_ATTRIBUTE` (`?attr/foo`), looks the referenced attribute back
+/// up in the SAME theme map (one theme-indirection hop). Returns `None` when the attribute is not in
+/// the theme — the caller then writes `TYPE_NULL` (the framework uses the attribute's default), the
+/// sound AOSP fallback, not a value fake. Bounded by [`MAX_ATTR_RESOLVE_DEPTH`]; never panics.
+fn resolve_theme_attr(
+    attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>,
+    attr_id: i32,
+) -> Option<TypedEntry> {
+    let mut cur = *attrs.get(&attr_id)?;
+    // The resource id reported by getResourceId: for a reference, the FIRST referenced id.
+    let mut resource_id = if cur.type_ == TYPE_REFERENCE {
+        u32_to_i32(cur.data)
+    } else {
+        0
+    };
+    for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
+        match cur.type_ {
+            // A theme-attribute reference (`?attr/foo`): re-resolve against the theme map.
+            TYPE_ATTRIBUTE => {
+                let next_id = u32_to_i32(cur.data);
+                cur = *attrs.get(&next_id)?;
+                if cur.type_ == TYPE_REFERENCE {
+                    resource_id = u32_to_i32(cur.data);
+                }
+            }
+            // A resource reference (`@color/x`): follow into resources.arsc to a concrete value.
+            TYPE_REFERENCE => {
+                // A 0 reference (`@null` / @0) is the explicit null value: keep it as a reference
+                // with no concrete target (getResourceId returns 0).
+                if cur.data == 0 {
+                    break;
+                }
+                match resolve_res_value(cur.data) {
+                    Some(v) => {
+                        cur = theme_registry::ThemeAttr {
+                            type_: u8::try_from(v.type_).unwrap_or(0),
+                            data: u32::from_ne_bytes(v.data.to_ne_bytes()),
+                        };
+                        // If it points to ANOTHER reference, keep chasing and update resource_id.
+                        if cur.type_ == TYPE_REFERENCE {
+                            resource_id = v.data;
+                        }
+                    }
+                    // The reference target is not a single value (a bag) or is absent: keep the
+                    // reference itself (its resource id is still useful to getResourceId).
+                    None => break,
+                }
+            }
+            // A concrete value: done.
+            _ => break,
+        }
+    }
+    let asset_cookie = if cur.type_ == TYPE_STRING {
+        XML_BLOCK_COOKIE
+    } else {
+        0
+    };
+    Some(TypedEntry {
+        value_type: i32::from(cur.type_),
+        data: u32_to_i32(cur.data),
+        resource_id,
+        asset_cookie,
+    })
+}
+
+/// Resolve the requested attribute ids against a theme handle's merged attribute map, returning the
+/// per-attribute [`TypedEntry`]s `obtainStyledAttributes(int[])` (the no-parser path) writes.
+///
+/// 2026-06-05: this is the theme-only branch of AOSP's `applyStyle`/`Theme.obtainStyledAttributes` —
+/// AppCompat's `theme.obtainStyledAttributes(R.styleable.AppCompatTheme)` drives it with `parser == 0`.
+/// A stale/fabricated theme handle (or an empty theme) yields all-`None` (every attribute `TYPE_NULL`)
+/// — never UB — which is what triggered AppCompat's IllegalStateException before themes resolved.
+fn resolve_theme_attributes(theme: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>> {
+    theme_registry::with_theme(theme, |t| {
+        ids.iter()
+            .map(|&id| resolve_theme_attr(&t.attrs, id))
+            .collect()
+    })
+    .unwrap_or_else(|_| vec![None; ids.len()])
+}
+
 /// Fill the framework-allocated `TypedArray` output buffers from `entries` (one per requested
 /// attribute, in request order): each `Some` writes its value's [`STYLE_TYPE`]/[`STYLE_DATA`] and —
 /// for a reference — [`STYLE_RESOURCE_ID`] slots of its [`STYLE_NUM_ENTRIES`]-wide window (the rest
@@ -1112,18 +1267,40 @@ extern "system" fn asset_manager_apply_theme_style<'local>(
     force: jboolean,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        match theme_registry::with_theme(theme, |t| t.styles.push(style_res)) {
-            Ok(()) => tracing::debug!(
+        // Resolve the applied style's bag + its parent chain from resources.arsc into a fresh map
+        // (child overriding parent). This happens OUTSIDE the registry lock (it reads the APK), then
+        // the result is merged into the theme under the lock.
+        let mut chain = std::collections::HashMap::new();
+        let style_u32 = u32::from_ne_bytes(style_res.to_ne_bytes());
+        let resolved = merge_theme_style(&mut chain, style_u32);
+
+        let merged = theme_registry::with_theme(theme, |t| {
+            t.styles.push(style_res);
+            // `force` (AOSP): the applied style overrides existing theme values; otherwise it only
+            // fills attributes the theme does not already define.
+            for (attr, val) in &chain {
+                if force {
+                    t.attrs.insert(*attr, *val);
+                } else {
+                    t.attrs.entry(*attr).or_insert(*val);
+                }
+            }
+            t.attrs.len()
+        });
+        match merged {
+            Ok(total) => tracing::debug!(
                 target: "android.content.res.AssetManager",
                 theme,
-                style_res,
+                style_res = format_args!("0x{style_u32:08x}"),
                 force,
-                "AssetManager.applyThemeStyle: recorded style on non-GTK theme"
+                resolved,
+                total,
+                "AssetManager.applyThemeStyle: merged style + parent chain into non-GTK theme"
             ),
             Err(e) => tracing::debug!(
                 target: "android.content.res.AssetManager",
                 theme,
-                style_res,
+                style_res = format_args!("0x{style_u32:08x}"),
                 error = %e,
                 "AssetManager.applyThemeStyle: invalid theme handle (ignored)"
             ),
@@ -1152,10 +1329,15 @@ extern "system" fn asset_manager_copy_theme<'local>(
     source: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        let src_styles = theme_registry::with_theme(source, |t| t.styles.clone());
-        match src_styles {
-            Ok(styles) => {
-                if let Err(e) = theme_registry::with_theme(dest, |t| t.styles = styles) {
+        // Copy both the applied-style ids AND the merged attribute map (the latter is what
+        // obtainStyledAttributes reads — copying only `styles` would leave the dest theme empty).
+        let src = theme_registry::with_theme(source, |t| (t.styles.clone(), t.attrs.clone()));
+        match src {
+            Ok((styles, attrs)) => {
+                if let Err(e) = theme_registry::with_theme(dest, |t| {
+                    t.styles = styles;
+                    t.attrs = attrs;
+                }) {
                     tracing::debug!(
                         target: "android.content.res.AssetManager",
                         dest,
@@ -1186,17 +1368,21 @@ extern "system" fn asset_manager_copy_theme<'local>(
 }
 
 /// `AssetManager.applyStyle(long theme, long parser, int defStyleAttr, int defStyleRes,
-/// int[] attrs, int length, long outValues, long outIndices)` → write `TYPE_NULL` for every
-/// requested attribute (the theme resolves no styled values for a fresh View — it uses defaults).
+/// int[] attrs, int length, long outValues, long outIndices)` → resolve each requested styled
+/// attribute from the XML element (when `parser != 0`) and/or the theme's merged attribute map, and
+/// write the per-attribute `TypedArray` windows.
 ///
 /// JNI ABI: an INSTANCE native returning void. `outValues`/`outIndices` are the framework's
 /// `TypedArray` off-heap buffers (same ABI as [`asset_manager_retrieve_attributes`]). 2026-06-05:
-/// minimal-and-sound — a freshly constructed View has no theme-resolved style values, so this writes
-/// `TYPE_NULL` into each requested attribute's window and `outIndices[0] = 0` (nothing changed),
-/// which makes the framework's `TypedArray` use each attribute's built-in default. That is exactly
-/// AOSP's behavior when a styleable attribute is unset — not a value fake. Theme-driven resolution
-/// against `resources.arsc` is a later increment (would read [`theme_registry`] styles + the ARSC
-/// bag); it is not needed to construct the launcher's default Views.
+/// this is AOSP's combined `obtainStyledAttributes(AttributeSet, int[], defStyleAttr, defStyleRes)`.
+/// Values layer theme < XML element (the inline XML attributes win; the theme fills the rest). The
+/// **theme** path (`parser == 0`) is what `Theme.obtainStyledAttributes(int[])` drives — including
+/// AppCompat's `theme.obtainStyledAttributes(R.styleable.AppCompatTheme)`; each requested attribute is
+/// looked up in the theme's merged map (built by [`merge_theme_style`] from the applied style's bag +
+/// parent chain in `resources.arsc`) and any `TYPE_REFERENCE`/`TYPE_ATTRIBUTE` is resolved to a
+/// concrete value (see [`resolve_theme_attr`]). An attribute absent from both the XML and the theme
+/// gets `TYPE_NULL` (the framework uses its built-in default — the sound AOSP fallback, not a value
+/// fake). A stale/fabricated theme handle yields all-`None` for the theme part — never UB.
 ///
 /// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
 /// `panic = "abort"` kept). `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
@@ -1221,16 +1407,29 @@ extern "system" fn asset_manager_apply_style<'local>(
         let n = if attrs.is_null() { 0 } else { attrs.len(env)? };
         let mut entries = vec![None; n];
         // 2026-06-05: ATL's `applyStyle` IS the combined obtainStyledAttributes(AttributeSet, int[])
-        // path the inflater + every View constructor drive — its second arg is the XmlBlock parse
-        // state (`parser`), and styled values come FIRST from the XML element's inline attributes,
-        // then the theme. The launcher's Views (and crucially `android:id`, which LayoutInflater +
-        // `View.<init>` read via `getResourceId`) are inline XML attributes, so resolve them from the
-        // parser exactly like `retrieveAttributes`. A 0 parser means no XML element (pure theme query):
-        // leave all-`None` so the framework uses defaults (sound AOSP fallback, not a value fake).
-        if n != 0 && parser != 0 {
+        // path. AOSP layers the result: theme < (def-style) < XML-style < explicit XML attributes. Two
+        // distinct callers:
+        //   • parser != 0 — a View constructor / inflater with an XML element: styled values come FIRST
+        //     from the element's inline attributes (e.g. `android:id`, which LayoutInflater + `View.
+        //     <init>` read via `getResourceId`), then the theme fills any attribute the XML did not set.
+        //   • parser == 0 — `Theme.obtainStyledAttributes(int[])` (no XML): every value comes from the
+        //     theme's merged attribute map. THIS is the path AppCompat's
+        //     `theme.obtainStyledAttributes(R.styleable.AppCompatTheme)` drives; before themes resolved,
+        //     it returned all-NULL → `windowActionBar` unset → the "Theme.AppCompat" IllegalStateException.
+        if n != 0 {
             let mut ids = vec![0i32; n];
             attrs.get_region(env, 0, &mut ids)?;
-            entries = resolve_xml_attributes(parser, &ids);
+            if parser != 0 {
+                entries = resolve_xml_attributes(parser, &ids);
+            }
+            // Theme fallback: fill any attribute not already resolved from the XML element. For
+            // parser == 0 this resolves ALL of them from the theme.
+            let theme_entries = resolve_theme_attributes(theme, &ids);
+            for (slot, theme_entry) in entries.iter_mut().zip(theme_entries) {
+                if slot.is_none() {
+                    *slot = theme_entry;
+                }
+            }
         }
         let changed = entries.iter().filter(|e| e.is_some()).count();
         // Reuses the bounds-proven writer (writes only < n*STYLE_NUM_ENTRIES / <= n; a 0 ptr skipped).
@@ -1241,7 +1440,7 @@ extern "system" fn asset_manager_apply_style<'local>(
             parser,
             attrs = n,
             changed,
-            "AssetManager.applyStyle: resolved XML attributes from the parser (non-GTK)"
+            "AssetManager.applyStyle: resolved styled attributes (XML element + theme, non-GTK)"
         );
         Ok(())
     })
@@ -2546,6 +2745,16 @@ const VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG: &JNIStr = jni_str!("(JIIIFIIII)V");
 const VIEW_NATIVE_REQUEST_LAYOUT_NAME: &JNIStr = jni_str!("native_requestLayout");
 const VIEW_NATIVE_REQUEST_LAYOUT_SIG: &JNIStr = jni_str!("(J)V");
 
+// 2026-06-05: `View.setBackgroundDrawable` calls `native_setBackgroundDrawable(widget, drawable)` to
+// attach a background drawable to a view. It was unreached until themes resolved
+// `android:windowBackground` (which makes `setContentView → Window/View.setBackgroundDrawable` run);
+// the ART error line gives the exact signature `void android.view.View.native_setBackgroundDrawable(
+// long, long)` → `(JJ)V` instance. `drawable` is a Drawable peer handle (the non-pointer sentinel
+// from `Drawable.native_constructor`), NOT a view/registry handle, so it is taken but not dereferenced;
+// the real background draw is the deferred 2D/Skia path. Validates the view handle + no-op.
+const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME: &JNIStr = jni_str!("native_setBackgroundDrawable");
+const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
+
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
 /// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
@@ -2735,6 +2944,46 @@ extern "system" fn view_native_request_layout<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.native_setBackgroundDrawable(long widget, long drawable)` → validate the view handle; no-op
+/// (background draw deferred to the 2D/Skia path, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle;
+/// `drawable` is a `Drawable` peer handle (the non-pointer sentinel from `Drawable.native_constructor`)
+/// — taken but NOT dereferenced (it is not a registry handle). Validates the `widget` handle through
+/// the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored, never UB) and
+/// no-ops; the actual background rasterization is the deferred drawable/Skia render. Surfaced once
+/// theme resolution let `setContentView → setBackgroundDrawable` run.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn view_native_set_background_drawable<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    drawable: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                drawable,
+                error = %e,
+                "View.native_setBackgroundDrawable: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget,
+                drawable,
+                "View.native_setBackgroundDrawable: validated handle, no-op (drawable draw deferred)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -2791,14 +3040,24 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_request_layout as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `view_native_set_background_drawable` matches the paired `(JJ)V` signature as an
+        // instance native (see the native's docs); casting the `extern "system"` fn to a
+        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME,
+                VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG,
+                view_native_set_background_drawable as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
-    // 2026-06-05).
+    // 2026-06-05; `native_setBackgroundDrawable` from the ART No-implementation-found line, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable"
     );
     Ok(())
 }
@@ -3316,6 +3575,14 @@ const WINDOW_SET_LAYOUT_NAME: &JNIStr = jni_str!("set_layout");
 const WINDOW_SET_LAYOUT_SIG: &JNIStr = jni_str!("(JII)V");
 const WINDOW_SET_WIDGET_AS_ROOT_NAME: &JNIStr = jni_str!("set_widget_as_root");
 const WINDOW_SET_WIDGET_AS_ROOT_SIG: &JNIStr = jni_str!("(JJ)V");
+// 2026-06-05: `Window.setBackgroundDrawable` (ATL) calls `remove_gtk_background(native_window)` to
+// drop any prior GTK background before applying a new one. It was unreached until themes resolved
+// `android:windowBackground` (which makes `setContentView → setBackgroundDrawable` run); the ART
+// error line gives the exact signature `void android.view.Window.remove_gtk_background(long)` → `(J)V`
+// instance. Eclipse is non-GTK (no GTK background exists), so this is a validate-handle no-op,
+// matching the other Window natives.
+const WINDOW_REMOVE_GTK_BACKGROUND_NAME: &JNIStr = jni_str!("remove_gtk_background");
+const WINDOW_REMOVE_GTK_BACKGROUND_SIG: &JNIStr = jni_str!("(J)V");
 
 /// `Window.set_jobject(long ptr, Window obj)` → record that the Java Window back-reference is set on
 /// the [`window_registry`] window.
@@ -3434,6 +3701,43 @@ extern "system" fn window_set_layout<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `Window.remove_gtk_background(long native_window)` → validate the window handle; no-op (Eclipse is
+/// non-GTK, so there is no GTK background to remove, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void. ATL's `Window.setBackgroundDrawable` calls this to drop
+/// any prior GTK background before applying a new one; on Eclipse the Window is non-GTK (it has no GTK
+/// background), so this validates the `native_window` handle through the bounds+generation-checked
+/// [`window_registry`] (a bad handle is logged + ignored, never UB) and no-ops. A new
+/// `android:windowBackground` is recorded by the renderer's view tree, not a GTK widget. Surfaced once
+/// theme resolution let `setContentView → setBackgroundDrawable` run.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn window_remove_gtk_background<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = window_registry::with_window(native_window, |_w| ()) {
+            tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                error = %e,
+                "Window.remove_gtk_background: invalid window handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.Window",
+                native_window,
+                "Window.remove_gtk_background: validated handle, no-op (non-GTK)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// `Window.set_widget_as_root(long native_window, long widget)` → record the root view handle on the
 /// [`window_registry`] window (the content-view tree root).
 ///
@@ -3531,14 +3835,23 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 window_set_widget_as_root as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `window_remove_gtk_background` matches the paired `(J)V` signature as an instance
+        // native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_REMOVE_GTK_BACKGROUND_NAME,
+                WINDOW_REMOVE_GTK_BACKGROUND_SIG,
+                window_remove_gtk_background as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/view/Window; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against Window.java lines 184–188,
-    // 2026-06-05).
+    // 2026-06-05; `remove_gtk_background` from the ART No-implementation-found line, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/Window",
-        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root"
+        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root + remove_gtk_background"
     );
     Ok(())
 }
@@ -4169,6 +4482,114 @@ mod tests {
     }
 
     #[test]
+    fn resolve_theme_attr_returns_concrete_values_and_none_for_missing() {
+        // GPU-free guard for the theme obtainStyledAttributes(int[]) value resolution. A concrete
+        // (non-reference) attribute is returned verbatim; an attribute absent from the theme is None
+        // (the caller then writes TYPE_NULL → the framework default, NOT a fake value — the exact
+        // behavior that, when the map was empty, threw AppCompat's IllegalStateException).
+        use crate::framework::theme_registry::ThemeAttr;
+        let mut attrs = std::collections::HashMap::new();
+        // windowActionBar (0x7f010058) = TYPE_INT_BOOLEAN(0x12) true — the AppCompat check attribute.
+        let win_action_bar = u32_to_i32(0x7f01_0058);
+        attrs.insert(
+            win_action_bar,
+            ThemeAttr {
+                type_: 0x12,
+                data: 0xffff_ffff,
+            },
+        );
+        let e = resolve_theme_attr(&attrs, win_action_bar).expect("present attr resolves");
+        assert_eq!(e.value_type, 0x12, "TYPE_INT_BOOLEAN preserved");
+        assert_eq!(
+            e.data,
+            u32_to_i32(0xffff_ffff),
+            "boolean true data preserved"
+        );
+        assert_eq!(e.resource_id, 0, "a concrete value has no resource id");
+
+        // A missing attribute is None (→ TYPE_NULL by the caller).
+        assert!(
+            resolve_theme_attr(&attrs, u32_to_i32(0x7f01_9999)).is_none(),
+            "an attribute absent from the theme must be None, not a fabricated value"
+        );
+    }
+
+    #[test]
+    fn resolve_theme_attr_follows_theme_attribute_indirection_and_breaks_cycles() {
+        // A `?attr/foo` (TYPE_ATTRIBUTE) value re-resolves against the SAME theme map (one hop), and a
+        // self/loop reference is bounded (no infinite loop / panic — totality under panic=abort).
+        use crate::framework::theme_registry::ThemeAttr;
+        let mut attrs = std::collections::HashMap::new();
+        let alias = u32_to_i32(0x7f01_0001);
+        let target = u32_to_i32(0x7f01_0002);
+        // alias = ?attr/target ; target = a concrete int 7.
+        attrs.insert(
+            alias,
+            ThemeAttr {
+                type_: TYPE_ATTRIBUTE,
+                data: u32::from_ne_bytes(target.to_ne_bytes()),
+            },
+        );
+        attrs.insert(
+            target,
+            ThemeAttr {
+                type_: 0x10,
+                data: 7,
+            },
+        );
+        let e = resolve_theme_attr(&attrs, alias).expect("indirection resolves");
+        assert_eq!(e.value_type, 0x10, "resolved to the target's concrete type");
+        assert_eq!(e.data, 7, "resolved to the target's concrete data");
+
+        // A self-referential ?attr cycle must terminate (bounded by MAX_ATTR_RESOLVE_DEPTH).
+        let mut cyc = std::collections::HashMap::new();
+        let a = u32_to_i32(0x7f01_00aa);
+        cyc.insert(
+            a,
+            ThemeAttr {
+                type_: TYPE_ATTRIBUTE,
+                data: u32::from_ne_bytes(a.to_ne_bytes()),
+            },
+        );
+        // Must return (not hang); the value stays the unresolved attribute reference.
+        let e = resolve_theme_attr(&cyc, a).expect("cycle terminates with a value");
+        assert_eq!(e.value_type, i32::from(TYPE_ATTRIBUTE));
+    }
+
+    #[test]
+    fn resolve_theme_attributes_reads_a_registered_theme_and_is_total_on_bad_handles() {
+        // The theme handle path: a registered theme's merged attrs resolve in request order; a
+        // stale/fabricated handle yields all-None (every requested attr → TYPE_NULL), never UB.
+        use crate::framework::theme_registry;
+        let theme = theme_registry::allocate().expect("allocate theme");
+        let attr_a = u32_to_i32(0x7f01_0058);
+        let attr_b = u32_to_i32(0x7f01_00a9);
+        theme_registry::with_theme(theme, |t| {
+            t.attrs.insert(
+                attr_a,
+                theme_registry::ThemeAttr {
+                    type_: 0x12,
+                    data: 1,
+                },
+            );
+        })
+        .expect("populate theme");
+
+        // attr_a present, attr_b absent → Some/None in request order.
+        let out = resolve_theme_attributes(theme, &[attr_a, attr_b]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_some(), "registered attr resolves");
+        assert!(out[1].is_none(), "unset attr is None (→ TYPE_NULL default)");
+
+        // A fabricated handle yields all-None of the right length (no panic, no UB).
+        let bogus = i64::MAX;
+        let out = resolve_theme_attributes(bogus, &[attr_a, attr_b]);
+        assert_eq!(out, vec![None, None]);
+
+        theme_registry::free(theme).expect("free theme");
+    }
+
+    #[test]
     fn context_native_names_and_sigs_match_context_java() {
         // Pin the two Context static-init native method names + JNI descriptors against
         // `Context.java` (2026-06-05): a transcription regression (wrong name or sig) would make
@@ -4617,6 +5038,12 @@ mod tests {
             "native_requestLayout"
         );
         assert_eq!(VIEW_NATIVE_REQUEST_LAYOUT_SIG.to_str(), "(J)V");
+        // native_setBackgroundDrawable: the ART No-implementation-found line → `(JJ)V`.
+        assert_eq!(
+            VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME.to_str(),
+            "native_setBackgroundDrawable"
+        );
+        assert_eq!(VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG.to_str(), "(JJ)V");
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
@@ -4648,6 +5075,11 @@ mod tests {
             "set_widget_as_root"
         );
         assert_eq!(WINDOW_SET_WIDGET_AS_ROOT_SIG.to_str(), "(JJ)V");
+        assert_eq!(
+            WINDOW_REMOVE_GTK_BACKGROUND_NAME.to_str(),
+            "remove_gtk_background"
+        );
+        assert_eq!(WINDOW_REMOVE_GTK_BACKGROUND_SIG.to_str(), "(J)V");
     }
 
     #[test]

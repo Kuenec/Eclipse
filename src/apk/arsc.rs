@@ -64,6 +64,16 @@ const TYPE_HEADER_MIN: usize = 20;
 const ENTRY_MIN_SIZE: usize = 8;
 /// `Res_value`: size(u16) + res0(u8) + dataType(u8) + data(u32).
 const RES_VALUE_SIZE: usize = 8;
+/// A complex entry's extra `ResTable_map_entry` fields after the base `ResTable_entry`:
+/// parent(ResTable_ref: u32) + count(u32). So the map array begins `8 + 8 = 16` bytes into the entry
+/// (2026-06-05: matches AOSP `ResTable_map_entry` and the real demo APK's `<style>` bags).
+const MAP_ENTRY_EXTRA: usize = 8;
+/// One `ResTable_map`: name(ResTable_ref: u32) + value(`Res_value`: 8) = 12 bytes.
+const MAP_SIZE: usize = 12;
+/// Upper bound on bag entries parsed from one complex entry, so a hostile `count` field cannot drive
+/// an unbounded loop / pre-allocation. Real themes have ~150 entries; this sits well above that
+/// while bounding work on malformed input (2026-06-05).
+const MAX_MAP_ENTRIES: usize = 65536;
 
 /// `ResTable_package` field offsets, relative to the package chunk start.
 const PKG_ID_OFFSET: usize = 8;
@@ -153,6 +163,35 @@ pub struct ResolvedValue {
     pub is_complex: bool,
 }
 
+/// One attribute entry of a complex (bag/style) entry: the attribute resource id it sets plus the
+/// `Res_value` (`type` + `data`) it sets it to. 2026-06-05: a `<style>`/theme entry in `resources.arsc`
+/// is a `ResTable_map_entry` — a bag of these, keyed by `ResTable_map.name` (the attribute id, a
+/// `0xPPTTEEEE` resource id), each carrying a `Res_value`. A theme's `obtainStyledAttributes(int[])`
+/// looks each requested attr id up in the merged bag (see [`ResTable::resolve_style`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StyleEntry {
+    /// The attribute resource id this entry sets (`ResTable_map.name`, a `0xPPTTEEEE` id).
+    pub attr_id: u32,
+    /// `Res_value.dataType` (== `TypedValue.TYPE_*`) of the value this attribute is set to.
+    pub type_: u8,
+    /// `Res_value.data` (raw 32-bit payload; a referenced resource id for `TYPE_REFERENCE`).
+    pub data: u32,
+}
+
+/// A resolved complex (bag/style) entry: its parent style id plus its own attribute entries.
+///
+/// 2026-06-05: `parent_id` is `ResTable_map_entry.parent.ident` — the style this one extends
+/// (`0` = no parent). Resolving a theme's full attribute set walks this chain (child overrides
+/// parent); see the theme registry's merge in `framework`. `entries` are this style's OWN
+/// attribute settings (not yet merged with the parent), in file order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStyle {
+    /// `ResTable_map_entry.parent.ident`: the parent style's resource id, or `0` for no parent.
+    pub parent_id: u32,
+    /// This style's own attribute entries (the bag), in file order.
+    pub entries: Vec<StyleEntry>,
+}
+
 /// A parsed package within a `resources.arsc`: its id plus the byte ranges of its type-name and
 /// key-name string pools and of its `RES_TABLE_TYPE_TYPE` chunks (decoded lazily on lookup).
 struct Package {
@@ -211,6 +250,34 @@ impl<'a> ResTable<'a> {
             }
             if let Some(value) = resolve_in_type_chunk(chunk, entry_id) {
                 return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Resolve a packed `0xPPTTEEEE` style/bag resource id to its [`ResolvedStyle`]: the parent
+    /// style id plus this style's own attribute entries (the bag).
+    ///
+    /// Returns `None` when the id is absent, or when its entry is a SIMPLE (non-complex) value
+    /// rather than a bag (a style/theme is always complex). Never panics: a malformed bag within a
+    /// candidate chunk is skipped, and the map array is read through bounds-checked helpers, so a
+    /// corrupt entry cannot crash resolution.
+    ///
+    /// Only this style's OWN entries are returned; resolving a theme's FULL attribute set requires
+    /// walking `parent_id` recursively (child overrides parent). That chain walk lives in the caller
+    /// (the theme registry merge) so this reader stays a single-entry, total decode.
+    pub fn resolve_style(&self, resource_id: u32) -> Option<ResolvedStyle> {
+        let package_id = (resource_id >> 24) as u8;
+        let type_id = ((resource_id >> 16) & 0xff) as u8;
+        let entry_id = (resource_id & 0xffff) as u16;
+        let package = self.packages.iter().find(|p| p.id == package_id)?;
+        for &(start, end) in &package.type_chunks {
+            let chunk = self.buf.get(start..end)?;
+            if read_u8(chunk, CHUNK_HEADER_SIZE).ok()? != type_id {
+                continue;
+            }
+            if let Some(style) = resolve_style_in_type_chunk(chunk, entry_id) {
+                return Some(style);
             }
         }
         None
@@ -462,6 +529,72 @@ fn resolve_in_type_chunk(chunk: &[u8], entry_id: u16) -> Option<ResolvedValue> {
         key_index,
         is_complex: false,
     })
+}
+
+/// Resolve `entry_id` within one `RES_TABLE_TYPE_TYPE` chunk as a complex (bag/style) entry, or
+/// `None` if it has no such entry or the entry is a simple (non-complex) value.
+///
+/// Total: any malformed offset/length/count within the chunk returns `None` rather than panicking,
+/// and every map entry is read through bounds-checked helpers. The `count` is capped by
+/// [`MAX_MAP_ENTRIES`] so a hostile count cannot drive an unbounded loop; iteration also stops at
+/// the first map entry that would read past the chunk.
+fn resolve_style_in_type_chunk(chunk: &[u8], entry_id: u16) -> Option<ResolvedStyle> {
+    let header_size = read_u16(chunk, 2).ok()? as usize;
+    if header_size < TYPE_HEADER_MIN {
+        return None;
+    }
+    let entry_count = read_u32(chunk, 12).ok()? as usize;
+    let entries_start = read_u32(chunk, 16).ok()? as usize;
+    let index = entry_id as usize;
+    if index >= entry_count {
+        return None;
+    }
+
+    let off_pos = header_size.checked_add(index.checked_mul(4)?)?;
+    let entry_off = read_u32(chunk, off_pos).ok()?;
+    if entry_off == NO_ENTRY {
+        return None;
+    }
+    let entry_at = entries_start.checked_add(entry_off as usize)?;
+
+    // ResTable_entry: size(u16), flags(u16), key(u32). A complex (bag) entry has FLAG_COMPLEX set
+    // and a larger header (ResTable_map_entry = ResTable_entry + parent(u32) + count(u32)).
+    let entry_size = read_u16(chunk, entry_at).ok()? as usize;
+    if entry_size < ENTRY_MIN_SIZE.checked_add(MAP_ENTRY_EXTRA)? {
+        return None; // not a complex entry header (no room for parent + count)
+    }
+    let flags = read_u16(chunk, entry_at.checked_add(2)?).ok()?;
+    if flags & ENTRY_FLAG_COMPLEX == 0 {
+        return None; // a simple value, not a style/bag
+    }
+    // ResTable_map_entry: parent(ResTable_ref: u32) then count(u32), after the base ResTable_entry.
+    let parent_id = read_u32(chunk, entry_at.checked_add(ENTRY_MIN_SIZE)?).ok()?;
+    let count = read_u32(chunk, entry_at.checked_add(ENTRY_MIN_SIZE + 4)?).ok()? as usize;
+    let count = count.min(MAX_MAP_ENTRIES);
+
+    // The ResTable_map array begins right after the entry header (entry_at + entry_size).
+    let mut map_at = entry_at.checked_add(entry_size)?;
+    let mut entries = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        // ResTable_map: name(ResTable_ref: u32), then value(Res_value: size(u16) res0(u8)
+        // dataType(u8) data(u32)). Stop if this map entry would read past the chunk.
+        let end = map_at.checked_add(MAP_SIZE)?;
+        if end > chunk.len() {
+            break;
+        }
+        let attr_id = read_u32(chunk, map_at).ok()?;
+        // Res_value within the map: dataType at +7 (size:2 + res0:1 then dataType), data at +8.
+        let type_ = read_u8(chunk, map_at.checked_add(7)?).ok()?;
+        let data = read_u32(chunk, map_at.checked_add(8)?).ok()?;
+        entries.push(StyleEntry {
+            attr_id,
+            type_,
+            data,
+        });
+        map_at = end;
+    }
+
+    Some(ResolvedStyle { parent_id, entries })
 }
 
 // --- String pool (`RES_STRING_POOL_TYPE`) ------------------------------------------------
@@ -907,6 +1040,161 @@ mod tests {
         assert!(table.resource_value(0x7f01_0001).is_none(), "unknown entry");
     }
 
+    /// A hand-built `resources.arsc` with package 0x7f, type id 8 (`style`), and one COMPLEX
+    /// (bag/style) entry (entry id 0 = `0x7f080000`): parent `0x7f08000a`, two attribute entries
+    /// (`0x7f010058` → TYPE_INT_BOOLEAN(0x12) data 0xffffffff; `0x7f0100a9` → TYPE_REFERENCE(0x01)
+    /// data 0x7f0a0014). Mirrors the real demo APK's `<style>` bag layout verified 2026-06-05.
+    fn build_style_fixture() -> Vec<u8> {
+        // empty global value pool (28 bytes), same as build_fixture.
+        let mut pool = Vec::new();
+        push_u16(&mut pool, RES_STRING_POOL_TYPE);
+        push_u16(&mut pool, 28);
+        push_u32(&mut pool, 28);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 0);
+        push_u32(&mut pool, 28);
+        push_u32(&mut pool, 0);
+
+        // type chunk: type id 8 (style), 1 entry, complex.
+        // entry region = ResTable_map_entry(16) + 2 x ResTable_map(12) = 40 bytes.
+        let mut type_chunk = Vec::new();
+        let type_header_size = 20u16;
+        let entries_start = 24u32; // header(20) + offset array(1*4)
+        push_u16(&mut type_chunk, RES_TABLE_TYPE_TYPE);
+        push_u16(&mut type_chunk, type_header_size);
+        // size = header(20) + offsets(4) + map_entry(16) + 2*map(12) = 64
+        push_u32(&mut type_chunk, 64);
+        type_chunk.push(8); // id (type id 8 = style)
+        type_chunk.push(0); // res0
+        push_u16(&mut type_chunk, 0); // res1
+        push_u32(&mut type_chunk, 1); // entryCount
+        push_u32(&mut type_chunk, entries_start);
+        // entry-offset array: entry 0 at offset 0.
+        push_u32(&mut type_chunk, 0);
+        // ResTable_map_entry: size(16 = ResTable_entry(8) + parent(4) + count(4)), flags(COMPLEX),
+        // key(0), parent(0x7f08000a), count(2).
+        push_u16(&mut type_chunk, 16); // entry size (the map_entry header)
+        push_u16(&mut type_chunk, ENTRY_FLAG_COMPLEX); // flags
+        push_u32(&mut type_chunk, 0); // key index
+        push_u32(&mut type_chunk, 0x7f08_000a); // parent style id
+        push_u32(&mut type_chunk, 2); // count
+                                      // ResTable_map[0]: name=0x7f010058, value size(8) res0(0) type(0x12) data(0xffffffff).
+        push_u32(&mut type_chunk, 0x7f01_0058);
+        push_u16(&mut type_chunk, 8);
+        type_chunk.push(0);
+        type_chunk.push(0x12); // TYPE_INT_BOOLEAN
+        push_u32(&mut type_chunk, 0xffff_ffff);
+        // ResTable_map[1]: name=0x7f0100a9, value size(8) res0(0) type(0x01 REFERENCE) data(0x7f0a0014).
+        push_u32(&mut type_chunk, 0x7f01_00a9);
+        push_u16(&mut type_chunk, 8);
+        type_chunk.push(0);
+        type_chunk.push(0x01); // TYPE_REFERENCE
+        push_u32(&mut type_chunk, 0x7f0a_0014);
+
+        // package chunk (288-byte header), body = the type chunk.
+        let mut pkg = Vec::new();
+        push_u16(&mut pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut pkg, PACKAGE_HEADER_MIN as u16);
+        push_u32(&mut pkg, (PACKAGE_HEADER_MIN + type_chunk.len()) as u32);
+        push_u32(&mut pkg, 0x7f);
+        pkg.resize(pkg.len() + 256, 0);
+        push_u32(&mut pkg, 0); // typeStrings
+        push_u32(&mut pkg, 0); // lastPublicType
+        push_u32(&mut pkg, 0); // keyStrings
+        push_u32(&mut pkg, 0); // lastPublicKey
+        debug_assert_eq!(pkg.len(), PACKAGE_HEADER_MIN);
+        pkg.extend_from_slice(&type_chunk);
+
+        let mut table = Vec::new();
+        push_u16(&mut table, RES_TABLE_TYPE);
+        push_u16(&mut table, TABLE_HEADER_SIZE as u16);
+        push_u32(
+            &mut table,
+            (TABLE_HEADER_SIZE + pool.len() + pkg.len()) as u32,
+        );
+        push_u32(&mut table, 1);
+        table.extend_from_slice(&pool);
+        table.extend_from_slice(&pkg);
+        table
+    }
+
+    #[test]
+    fn resolves_hand_built_style_bag_and_parent() {
+        // Host-independent coverage of the complex (bag/style) decode + parent id.
+        let bytes = build_style_fixture();
+        let table = parse_arsc(&bytes).expect("parse style fixture");
+
+        // The simple-value resolver reports it as complex (no single Res_value).
+        let v = table.resource_value(0x7f08_0000).expect("entry resolves");
+        assert!(v.is_complex, "a style entry must surface as complex");
+
+        // The bag resolver returns the parent + the two attribute entries.
+        let style = table.resolve_style(0x7f08_0000).expect("style resolves");
+        assert_eq!(style.parent_id, 0x7f08_000a, "parent style id");
+        assert_eq!(style.entries.len(), 2);
+        assert_eq!(style.entries[0].attr_id, 0x7f01_0058);
+        assert_eq!(style.entries[0].type_, 0x12, "TYPE_INT_BOOLEAN");
+        assert_eq!(style.entries[0].data, 0xffff_ffff);
+        assert_eq!(style.entries[1].attr_id, 0x7f01_00a9);
+        assert_eq!(style.entries[1].type_, 0x01, "TYPE_REFERENCE");
+        assert_eq!(style.entries[1].data, 0x7f0a_0014);
+
+        // A simple entry is NOT a style: resolve_style returns None for it (use the fixture's int).
+        let simple_bytes = build_fixture();
+        let simple = parse_arsc(&simple_bytes).expect("parse simple fixture");
+        assert!(
+            simple.resolve_style(0x7f01_0000).is_none(),
+            "a simple value entry is not a style bag"
+        );
+        // An unknown id is None, not a panic.
+        assert!(simple.resolve_style(0x7f08_0000).is_none(), "unknown style");
+    }
+
+    #[test]
+    fn resolves_real_demo_style_when_available() {
+        // If the demo arsc has a style/theme entry, decode it and assert the bag is non-empty.
+        // The accelerometer demo's theme 0x7f0800a3 (verified 2026-06-05) has parent 0x7f08010a and
+        // 3 entries; gate behind ECLIPSE_THEME_STYLE_ID so the assertion stays APK-agnostic.
+        let Some(bytes) = demo_arsc() else {
+            eprintln!("demo arsc unavailable; covered by hand-built style fixture");
+            return;
+        };
+        let table = parse_arsc(&bytes).expect("parse demo arsc");
+        // Find ANY complex entry under the style type, proving the bag decode works on a real table.
+        // Type id for `style` is discovered via the type-name pool (not hardcoded — APK-agnostic).
+        let mut style_type: Option<u8> = None;
+        for tid in 1u8..=64 {
+            if let Ok(Some(name)) = table.type_name(0x7f, tid) {
+                if name == "style" {
+                    style_type = Some(tid);
+                    break;
+                }
+            }
+        }
+        let Some(tid) = style_type else {
+            eprintln!("demo arsc has no `style` type; skipping");
+            return;
+        };
+        // Scan style entries for the first complex one and decode its bag totally.
+        let mut found = false;
+        for entry in 0u16..0x1000 {
+            let id = (0x7fu32 << 24) | (u32::from(tid) << 16) | u32::from(entry);
+            if let Some(style) = table.resolve_style(id) {
+                // A real style bag has entries and/or a parent; the decode must not panic and the
+                // attr ids must be plausible resource ids (non-zero for the ones present).
+                if !style.entries.is_empty() || style.parent_id != 0 {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found,
+            "expected at least one decodable style bag in the demo arsc"
+        );
+    }
+
     #[test]
     fn rejects_non_table_root() {
         // A valid chunk that is not RES_TABLE_TYPE must be a typed error, not a panic.
@@ -957,8 +1245,9 @@ mod tests {
 
         for len in 0..=base.len() {
             if let Ok(table) = parse_arsc(&base[..len]) {
-                // Drive the resolver too: it must also be total on a truncated-but-parsed table.
+                // Drive the resolvers too: each must be total on a truncated-but-parsed table.
                 let _ = table.resource_value(0x7f01_0000);
+                let _ = table.resolve_style(0x7f08_0000);
                 let _ = table.type_name(0x7f, 1);
             }
         }
@@ -971,6 +1260,7 @@ mod tests {
                 if let Ok(table) = parse_arsc(&buf) {
                     for entry in 0u16..8 {
                         let _ = table.resolve(0x7f, 1, entry);
+                        let _ = table.resolve_style(0x7f08_0000 | u32::from(entry));
                     }
                     let _ = table.type_name(0x7f, 1);
                     let _ = table.key_name(0x7f, 0);
