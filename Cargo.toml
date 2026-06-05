@@ -3,8 +3,9 @@
 # Deps are added per subsystem, only when that subsystem is actually built — we don't pull
 # unverified crate versions or system libs (vulkan/pulse/gtk dev headers, the vendored ART)
 # ahead of need. M1 has wired diagnostics + config + apk + the runtime ART-boot FFI; the
-# remaining subsystems (audio, input, services, bionic, framework) are still stubs (graphics
-# has the winit host window; ash/EGL forwarding is next).
+# remaining subsystems (audio, input, services, bionic) are still stubs (graphics has the winit
+# host window + an ash/Vulkan surface+swapchain+clear-present loop; the View-tree draw / engine
+# WSI forwarding are next).
 #
 # The full, annotated dependency PLAN (what each subsystem will use, and why) lives in
 # docs/dependency-plan.md. Add deps to this file only when wiring up the subsystem, after
@@ -48,6 +49,12 @@ jni-sys = "0.4"                                   # raw JNI invocation types use
 jni = "0.22"                                      # safe JNI wrapper for the onCreate framework driver (wraps the held *mut JavaVM)
 # --- Graphics/window: the host game window (M2) ----------------------------------
 winit = "0.30"                                    # Wayland/X11 window + event loop (NO GTK — keeps low_4gb clear for ART; ash/khronos-egl for forwarding come later)
+# 2026-06-05: Vulkan surface+swapchain+present foundation on the winit window. `loaded` makes ash
+# dlopen the host libvulkan.so at runtime (Entry::load) — detect-don't-assume, no link-time Vulkan
+# dep (§9 portability). `std` gives std::error::Error on vk::Result; `debug` gives the Debug impls.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
+ash-window = "0.13"                               # ash ↔ raw-window-handle interop: required surface extensions + VkSurfaceKHR from the window
+raw-window-handle = "0.6"                         # the window/display handle abstraction (deduped with winit 0.30's own dep)
 # 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
 # The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.

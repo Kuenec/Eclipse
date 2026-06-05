@@ -530,11 +530,25 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `findViewById`/`setId`/`getId` are pure Java over `View.id`; the fix made `getResourceId` return the
   REFERENCE id so the inflater + `View.<init>` set it. Plus two surfaced natives bound:
   `XmlBlock.nativeGetPooledString` + `TextView.native_setText`.
-  🔜 **IMMEDIATE FRONTIER (2026-06-05): drive the post-onCreate lifecycle and/or the deferred render.**
-  The recipe stops at `Activity.onCreate`; next is `onStart`/`onResume` (if needed for the demo) and the
-  real **ash/Vulkan surface + draw** (the big build — the View tree + ids + text are all recorded in
-  `view_registry`, ready to render). For Roblox specifically, the engine-load bionic-shim work (Section B
-  of the dev-host runbook) is the parallel track. Stay non-GTK; validate via dev-host `eclipse run`.
+  ✅ **DONE 2026-06-05: the ash/Vulkan surface + swapchain + clear-and-present FOUNDATION is built**
+  (`src/graphics.rs` `VulkanRenderer`; §6 2026-06-05 Vulkan-surface entry). On the demo run, after the
+  lifecycle reaches `Activity.onCreate`, the winit window now stands up a real GPU surface: `ash::Entry::load`
+  (runtime libvulkan, no link-time dep) → `vkCreateInstance` with the `ash_window`-discovered surface
+  extensions → `VkSurfaceKHR` from the window's raw Wayland/Xlib handle → physical device + graphics/present
+  queue that supports the surface → swapchain (BGRA8_SRGB, FIFO, min+1 images) → a per-frame render-pass
+  **clear-to-Roblox-blue + present** loop, recreating the swapchain on resize. **FAITHFUL status:** on the
+  dev-host demo run it logs `Vulkan surface + swapchain initialized; clear-and-present loop active
+  format=B8G8R8A8_SRGB extent=800x600 images=3` and presents for the full 60 s with **zero `VK_ERROR`/panic/
+  draw-failed** (`/tmp/eclipse-render.log`). If Vulkan can't init (no ICD), it logs a typed warning and the
+  window stays open blank (no crash). Sound owner struct: every handle freed in reverse order after
+  `device_wait_idle` in `Drop`; no leaks/UB.
+  🔜 **IMMEDIATE FRONTIER (2026-06-05): draw the View tree into the surface.** The clear-and-present loop
+  proves the GPU path end-to-end; the **next step is rendering** the framework's recorded View tree (the
+  TextViews + ids + text are all in `framework::view_registry`, ready) — text/quads into the same swapchain
+  (needs a pipeline + glyph/quad draw, not just a clear). Then `onStart`/`onResume` if the demo needs it. For
+  Roblox specifically, the engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel
+  track, and the engine will eventually render into THIS window's swapchain via WSI translation. Stay non-GTK;
+  validate via dev-host `eclipse run`.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -1656,6 +1670,38 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   --all-targets` clean, no code edited). The cyber-safeguard did NOT trip (grounded only in AGENTS.md run evidence,
   `src/runtime.rs` strategy, `bionic-loader-plan.md`, and general public ELF knowledge — no linker `.c`/`.h` read,
   no web).
+- **2026-06-05** — 🟢 **ash/Vulkan surface + swapchain + clear-and-present FOUNDATION built on the winit window**
+  (`src/graphics.rs`). **What:** added `ash 0.38` (features `loaded,std,debug` — `loaded` makes ash `dlopen` the
+  host `libvulkan.so` at runtime via `ash::Entry::load`, so there is **no link-time Vulkan dep**: detect-don't-assume
+  §9), `ash-window 0.13` (required surface extensions + `VkSurfaceKHR` from a raw handle), `raw-window-handle 0.6`
+  (deduped with winit 0.30's own rwh_06 — one lock entry). New `VulkanRenderer` owner struct: `Entry::load` →
+  `vkCreateInstance` with `ash_window::enumerate_required_extensions(display_handle)` (Wayland vs Xlib/Xcb,
+  discovered not assumed) → `ash_window::create_surface` from the window's raw display+window handle → physical
+  device + a queue family with **graphics + present-to-this-surface + `VK_KHR_swapchain`** (prefers discrete GPU,
+  falls back; never assumes one GPU) → logical device → swapchain (format `choose_surface_format` = prefer
+  B8G8R8A8_SRGB else first; extent `choose_swap_extent` = fixed `current_extent` on Wayland else clamp window size
+  on X11; `choose_image_count` = min+1 clamped to max; **FIFO** present mode = the only spec-guaranteed one) →
+  single-attachment render pass (CLEAR→PRESENT_SRC) + framebuffers + command pool/buffer + per-frame
+  semaphores/fence. `draw_frame` = wait fence → acquire → record clear-to-Roblox-blue render pass → submit →
+  `pre_present_notify` → present, with **swapchain recreate on resize / OUT_OF_DATE / SUBOPTIMAL**. **Sound
+  lifetimes:** the module dropped `#![forbid(unsafe_code)]` (raw Vulkan is the §2.3-sanctioned unsafe site); every
+  `unsafe` block carries a `// SAFETY:` note; each fallible build step tears down already-created handles on its
+  error path (no partial leak); `Drop` calls `device_wait_idle` then destroys every handle in strict reverse order
+  (no leak/UB). **Init failure is non-fatal:** no ICD / unsupported display → typed `GraphicsError::Vulkan` logged
+  as a warning, the window stays open blank (no crash). **FAITHFUL status — VALIDATED on the demo** (`timeout 60
+  cargo run --release -- run demo_app.apk`, `/tmp/eclipse-render.log`, EXIT=124 = the present loop ran the full
+  60 s): after the lifecycle reaches `Activity.onCreate`, the window logs `Vulkan surface + swapchain initialized;
+  clear-and-present loop active format=B8G8R8A8_SRGB extent=800x600 images=3` and presents with **zero
+  `VK_ERROR`/panic/draw-failed** (grep count 0). So: Vulkan init + swapchain + presented frames succeed on the
+  demo, no Vk errors, clear-frame loop running. **Regression guard:** 6 GPU-free unit tests on the pure selection
+  logic (`choose_surface_format` prefer/fallback/empty, `choose_swap_extent` Wayland-fixed vs X11-clamp incl.
+  min/max clamp, `choose_image_count` min+1/max-clamp/no-limit) — `cargo test` 110 pass. The live present is
+  dev-host-validated (winit needs the main thread; ART aborts under the cargo-test harness). **Deferred:** drawing
+  the recorded View tree (text/quads) into the surface — needs a pipeline, not just a clear. **Context7:**
+  `/ash-rs/ash` (instance/surface/swapchain/frame-loop + ash-window `enumerate_required_extensions`/`create_surface`
+  signatures) + read the local `ash-window 0.13.0`/`winit 0.30.13` sources to confirm `create_surface` returns
+  `VkSurfaceKHR` and `Window` impls rwh_06 `HasDisplayHandle`/`HasWindowHandle`. Cyber-safeguard did NOT trip
+  (graphics only — no bionic/JNI-C/content-res source read).
 
 ---
 
