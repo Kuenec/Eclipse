@@ -16,14 +16,16 @@
 //! - **RELOCATE (base-only):** with the region writable, apply via [`reloc`] ONLY the relocations
 //!   that need just the load base: `R_X86_64_RELATIVE` (from `.rela.dyn`) and `DT_RELR`. Then
 //!   `mprotect` each segment to its `p_flags` (`PF_R/W/X` → `PROT_READ/WRITE/EXEC`).
-//! - **DEFERRED — not attempted here (documented why):**
-//!   - `R_X86_64_JUMP_SLOT` / `GLOB_DAT` / `R_X86_64_64` need the cross-library
-//!     [`reloc::SymbolResolver`] (step 5) — they reference dynamic symbols, not just the base.
+//! - **SYMBOL RELOCATIONS (step 5) — [`MappedObject::relocate_symbols`]:** a follow-on pass applies
+//!   `R_X86_64_JUMP_SLOT` / `GLOB_DAT` / `R_X86_64_64` through a [`Scope`]
+//!   ([`reloc::SymbolResolver`]); [`MappedObject::map_and_relocate_with_scope`] does both passes in
+//!   one call. They reference dynamic symbols, so the caller supplies the resolution scope.
+//! - **DEFERRED — still not attempted here (documented why):**
 //!   - `R_X86_64_TPOFF64` needs the static-TLS block + `%fs`/TCB (step 4) — there is no
 //!     thread-pointer-relative base assigned yet.
 //!   - `R_X86_64_IRELATIVE` needs **executing** the library's ifunc resolver functions — explicitly
 //!     out of scope; this module **never executes, jumps into, or runs init functions** of the
-//!     mapped object. It maps + base-relocates + verifies only.
+//!     mapped object. It maps + relocates + verifies only.
 //!
 //! ## Safety
 //! Unlike `reloc.rs`/`elf.rs` (`#![forbid(unsafe_code)]`), this module performs the raw
@@ -41,7 +43,8 @@ use std::ptr::NonNull;
 use rustix::mm::{mmap_anonymous, mprotect, munmap, MapFlags, MprotectFlags, ProtFlags};
 
 use super::elf::{ElfImage, LoadSegment, PF_R, PF_W, PF_X};
-use super::reloc::{self, RelocError};
+use super::reloc::{self, RelocError, RelocImage};
+use super::resolve::{Scope, ScopedResolver};
 
 /// Errors from mapping or base-relocating a parsed ELF image.
 #[derive(Debug)]
@@ -85,6 +88,11 @@ impl From<RelocError> for MapError {
     }
 }
 
+/// x86-64 `R_X86_64_IRELATIVE` (type 37): an ifunc relocation whose value is produced by
+/// **executing** the library's resolver function — explicitly out of scope for this map/relocate
+/// core (nothing is executed). Counted as deferred by [`MappedObject::relocate_symbols`].
+const R_X86_64_IRELATIVE: u32 = 37;
+
 /// Counts from a successful [`MappedObject::map_and_relocate`], for verification/reporting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MapStats {
@@ -98,6 +106,32 @@ pub struct MapStats {
     /// and any other non-base type, which need the symbol resolver / static-TLS block / ifunc
     /// execution (out of scope for this map+base-relocate step).
     pub skipped_by_type: usize,
+}
+
+/// Counts from a [`MappedObject::relocate_symbols`] pass, for verification/reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SymbolRelocStats {
+    /// Number of `R_X86_64_GLOB_DAT` relocations applied (GOT entries → symbol addresses).
+    pub glob_dat_applied: usize,
+    /// Number of `R_X86_64_JUMP_SLOT` relocations applied (PLT entries → symbol addresses; eager
+    /// under `BIND_NOW`).
+    pub jump_slot_applied: usize,
+    /// Number of `R_X86_64_64` relocations applied (`sym + addend`).
+    pub abs64_applied: usize,
+    /// Number of symbol relocations that resolved to a **non-null** address (a real definition).
+    /// The remainder (`total_symbol - resolved_nonnull`) are weak-undef → 0, which is legal.
+    pub resolved_nonnull: usize,
+    /// Number of relocations deferred (not applied) by this pass: `R_X86_64_TPOFF64` (needs the
+    /// static-TLS block + `%fs`/TCB) and `R_X86_64_IRELATIVE` (needs executing ifunc resolvers),
+    /// plus any other non-symbol type already handled by the base pass.
+    pub deferred: usize,
+}
+
+impl SymbolRelocStats {
+    /// Total symbol-dependent relocations applied in this pass.
+    pub fn total_applied(&self) -> usize {
+        self.glob_dat_applied + self.jump_slot_applied + self.abs64_applied
+    }
 }
 
 /// Round `addr` down to the start of its page.
@@ -293,6 +327,125 @@ impl MappedObject {
         }
 
         Ok((obj, stats))
+    }
+
+    /// Apply the **symbol-dependent** relocations through a resolution [`Scope`], the step
+    /// [`Self::map_and_relocate`] deferred. Resolves `R_X86_64_GLOB_DAT` / `R_X86_64_JUMP_SLOT`
+    /// (eager — `BIND_NOW`) / `R_X86_64_64` for `img`'s `.rela.dyn` + `.rela.plt`, writing each
+    /// resolved symbol address into its GOT/PLT slot via the [`reloc`] core.
+    ///
+    /// `img` must be the same parsed image [`Self::map_and_relocate`] mapped (its `dynsyms` index
+    /// the relocations' `sym_index`es, and its `relocations()` name the slots). `scope` is the
+    /// ordered provider scope (typically a [`super::resolve::LoadedObjectProvider`] of this object
+    /// followed by a [`super::resolve::HostDlsymProvider`]); build it with this object's
+    /// [`Self::load_base`] + `img.dynsyms`.
+    ///
+    /// `R_X86_64_TPOFF64` (static-TLS) and `R_X86_64_IRELATIVE` (ifunc) are **counted as deferred**
+    /// and not applied — TLS needs the `%fs`/TCB step and ifunc needs executing resolvers, both out
+    /// of scope here. `R_X86_64_RELATIVE`/`DT_RELR` were already applied by the base pass.
+    ///
+    /// The relocation targets (GOT/PLT) sit in writable or RELRO-but-still-RW segments, which
+    /// `map_and_relocate` left writable (RELRO hardening is a later step). This pass makes every
+    /// segment writable, applies, then restores each segment's final `p_flags` protection — so a
+    /// GOT slot in a nominally read-only-after-reloc region is still patchable here.
+    pub fn relocate_symbols(
+        &mut self,
+        img: &ElfImage<'_>,
+        scope: &Scope,
+        page_size: u64,
+    ) -> Result<SymbolRelocStats, MapError> {
+        let min_vaddr = img
+            .loads
+            .iter()
+            .map(|s| s.vaddr)
+            .min()
+            .ok_or(MapError::NoLoadSegments)?;
+        let region_start = page_floor(min_vaddr, page_size);
+
+        // Partition the relocations: apply only the symbol-address types; count TPOFF64/IRELATIVE
+        // (and any leftover non-symbol type) as deferred.
+        let relas = img
+            .relocations()
+            .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
+        let mut symbol_relas: Vec<reloc::Rela> = Vec::new();
+        let mut stats = SymbolRelocStats::default();
+        for r in &relas {
+            match r.r_type {
+                reloc::R_X86_64_GLOB_DAT => {
+                    stats.glob_dat_applied += 1;
+                    symbol_relas.push(*r);
+                }
+                reloc::R_X86_64_JUMP_SLOT => {
+                    stats.jump_slot_applied += 1;
+                    symbol_relas.push(*r);
+                }
+                reloc::R_X86_64_64 => {
+                    stats.abs64_applied += 1;
+                    symbol_relas.push(*r);
+                }
+                reloc::R_X86_64_TPOFF64 | R_X86_64_IRELATIVE => stats.deferred += 1,
+                // RELATIVE / DT_RELR were applied by the base pass; anything else is not a symbol
+                // reloc this pass owns. Don't double-count base types as deferred.
+                _ => {}
+            }
+        }
+
+        let resolver = ScopedResolver::new(scope, &img.dynsyms);
+        let load_base = self.load_base().wrapping_sub(region_start);
+        let tls_off = self.static_tls_offset;
+
+        // Make every segment writable for the patch, apply, then restore final protections.
+        for seg in &img.loads {
+            self.mprotect_segment_pages(
+                seg,
+                region_start,
+                page_size,
+                ProtFlags::READ | ProtFlags::WRITE,
+            )?;
+        }
+
+        let resolved_nonnull = {
+            // SAFETY: 2026-06-05 — every segment was just made RW above; `image_bytes` exposes the
+            // mapping as `&mut [u8]` of exactly `span` bytes (see its SAFETY); the reloc core only
+            // writes within `[0, span)`, all bounds-checked.
+            let bytes = unsafe { self.image_bytes() };
+            let mut image = reloc::SliceImage::new(load_base, tls_off, bytes);
+            reloc::apply_rela(&mut image, &resolver, &symbol_relas)?;
+            // Count how many slots now hold a non-null address (a real definition; weak-undef = 0).
+            let mut nonnull = 0usize;
+            for r in &symbol_relas {
+                let off = usize::try_from(r.offset)
+                    .map_err(|_| MapError::SpanOverflow("reloc offset as usize"))?;
+                if image.read_u64(off)? != 0 {
+                    nonnull += 1;
+                }
+            }
+            nonnull
+        };
+        stats.resolved_nonnull = resolved_nonnull;
+
+        // Restore each segment's final protection (the post-reloc state map_and_relocate set).
+        for seg in &img.loads {
+            self.protect_segment(seg, region_start, page_size)?;
+        }
+
+        Ok(stats)
+    }
+
+    /// Map + base-relocate (via [`Self::map_and_relocate`]) **and** apply symbol relocations through
+    /// `build_scope`, in one call. `build_scope` is given this object's run-time load base and the
+    /// image's dynamic symbols so it can construct the resolution [`Scope`] (which must reference
+    /// this object's definitions plus any host/already-loaded providers).
+    pub fn map_and_relocate_with_scope(
+        img: &ElfImage<'_>,
+        file: &[u8],
+        page_size: u64,
+        build_scope: impl FnOnce(u64, &[super::elf::DynSym]) -> Scope,
+    ) -> Result<(Self, MapStats, SymbolRelocStats), MapError> {
+        let (mut obj, map_stats) = Self::map_and_relocate(img, file, page_size)?;
+        let scope = build_scope(obj.load_base(), &img.dynsyms);
+        let sym_stats = obj.relocate_symbols(img, &scope, page_size)?;
+        Ok((obj, map_stats, sym_stats))
     }
 
     /// Copy one segment's file bytes into the mapped region and ensure its pages are writable for
@@ -854,5 +1007,146 @@ mod tests {
         );
         assert_eq!(stats.relative_applied, checked_relative);
         assert_eq!(stats.relr_applied, relr_count);
+    }
+
+    // ---- REAL test: resolve + apply libm.so.6's symbol relocations through a Scope --------------
+
+    #[test]
+    fn real_libm_resolves_and_applies_symbol_relocations() {
+        // 2026-06-05: the step-5 end-to-end. Map libm, build a Scope = [LoadedObjectProvider(libm),
+        // HostDlsymProvider], and apply its GLOB_DAT (+ any JUMP_SLOT / R_X86_64_64) symbol relocs.
+        // Asserts: no unresolved-STRONG error, no panic, and every STRONG symbol reloc resolved to a
+        // non-null address in a sane range — while WEAK-undef ones legitimately resolve to 0.
+        // libm's symbol relocs are 32 GLOB_DAT (no JUMP_SLOT) per `readelf -r`; of these a handful
+        // are weak-undef in this process (`__gmon_start__`, `_ITM_*`) → 0, which is correct.
+        // SKIP (not fail) if no host libm — never fabricate.
+        use super::super::resolve::{
+            HostDlsymProvider, LoadedObjectProvider, Scope, SymbolProvider,
+        };
+
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/libm.so.6",
+            "/usr/lib/x86_64-linux-gnu/libm.so.6",
+            "/lib/x86_64-linux-gnu/libm.so.6",
+        ];
+        let Some(path) = CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()) else {
+            eprintln!(
+                "real_libm_resolves_and_applies_symbol_relocations: no host libm.so.6; skipping"
+            );
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read libm bytes");
+        let img = ElfImage::parse(&bytes).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+        let page = host_page_size();
+
+        let (mut obj, sym_stats) = {
+            let (obj, map_stats) =
+                MappedObject::map_and_relocate(&img, &bytes, page).expect("map+base-relocate libm");
+            let base = obj.load_base();
+            // Scope: libm's own exported definitions first (resolves its self-references like
+            // __signgam / _LIB_VERSION), then the host process (resolves libc imports via dlsym).
+            let mut scope = Scope::new();
+            scope
+                .push(Box::new(LoadedObjectProvider::new(base, &img.dynsyms)))
+                .push(Box::new(HostDlsymProvider));
+            let mut obj = obj;
+            let sym_stats = obj
+                .relocate_symbols(&img, &scope, page)
+                .unwrap_or_else(|e| panic!("symbol relocate {path}: {e}"));
+            // Sanity: the base pass deferred exactly these symbol relocs to us.
+            assert_eq!(
+                sym_stats.total_applied() + sym_stats.deferred,
+                map_stats.skipped_by_type,
+                "every base-deferred reloc is accounted for as applied or deferred"
+            );
+            (obj, sym_stats)
+        };
+
+        let base = obj.load_base();
+        let span = obj.span() as u64;
+
+        // Independently classify each symbol reloc and verify the written slot value matches the
+        // gABI rules: STRONG symbol → non-null, in a sane range; WEAK-undef → 0.
+        let relas = img.relocations().unwrap();
+        let mut scope = Scope::new();
+        scope
+            .push(Box::new(LoadedObjectProvider::new(base, &img.dynsyms)))
+            .push(Box::new(HostDlsymProvider));
+        let mut strong_count = 0usize;
+        let mut weak_zero_count = 0usize;
+        let mut total_symbol = 0usize;
+        {
+            // SAFETY (test): region readable post-reloc; symbol-reloc r_offsets are in-object vaddrs.
+            let image = unsafe { obj.image_bytes() };
+            for r in &relas {
+                let is_symbol = matches!(
+                    r.r_type,
+                    reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
+                );
+                if !is_symbol {
+                    continue;
+                }
+                total_symbol += 1;
+                let off = r.offset as usize;
+                let word = u64::from_le_bytes(image[off..off + 8].try_into().unwrap());
+
+                let sym = &img.dynsyms[r.sym_index as usize];
+                let scope_hit = scope.resolve(&sym.name);
+                if scope_hit.is_some() {
+                    // A resolved (strong or scope-found) symbol must be written non-null. For
+                    // R_X86_64_64 the addend is folded in, but libm has none of those; GLOB_DAT/
+                    // JUMP_SLOT write the bare address.
+                    assert_ne!(word, 0, "resolved {} wrote a null slot", sym.name);
+                    strong_count += 1;
+                    // A definition from libm itself must land inside the mapped object; a host
+                    // (dlsym) definition is outside it. Only check in-object for the self-defined.
+                    if let Some(off_in_obj) = LoadedObjectProvider::new(base, &img.dynsyms)
+                        .resolve(&sym.name)
+                        .filter(|s| !s.weak || scope_hit == Some(*s))
+                        .map(|s| s.addr)
+                    {
+                        if off_in_obj == word {
+                            assert!(
+                                word >= base && word < base + span,
+                                "self-defined {} → {word:#x} not in [{base:#x}, {:#x})",
+                                sym.name,
+                                base + span
+                            );
+                        }
+                    }
+                } else {
+                    // No definition in scope: this is only legal for a WEAK reference (→ 0).
+                    assert_eq!(
+                        sym.bind, 2, /* STB_WEAK */
+                        "STRONG symbol {} was unresolved (would be a typed error)",
+                        sym.name
+                    );
+                    assert_eq!(word, 0, "weak-undef {} must be 0", sym.name);
+                    weak_zero_count += 1;
+                }
+            }
+        }
+
+        eprintln!(
+            "real_libm_resolves_and_applies_symbol_relocations: {path} — total_symbol_relocs={total_symbol} \
+             GLOB_DAT={} JUMP_SLOT={} ABS64={} resolved_nonnull={} weak_undef_zero={} deferred(TPOFF64/IRELATIVE)={} \
+             (strong_resolved={strong_count})",
+            sym_stats.glob_dat_applied,
+            sym_stats.jump_slot_applied,
+            sym_stats.abs64_applied,
+            sym_stats.resolved_nonnull,
+            weak_zero_count,
+            sym_stats.deferred,
+        );
+
+        // Every symbol reloc is either a non-null strong resolution or a legal weak-undef zero.
+        assert_eq!(strong_count + weak_zero_count, total_symbol);
+        assert_eq!(sym_stats.total_applied(), total_symbol);
+        assert_eq!(sym_stats.resolved_nonnull, strong_count);
+        // libm must have at least the well-known libc imports resolved (sanity floor).
+        assert!(
+            strong_count >= 20,
+            "expected most of libm's symbol relocs to resolve, got {strong_count}/{total_symbol}"
+        );
     }
 }

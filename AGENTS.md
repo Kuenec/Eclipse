@@ -209,6 +209,37 @@ before any history-rewriting/force operation.
   base-relocate DONE on libm.so.6; NEXT = the static-TLS block + `%fs`/TCB for `TPOFF64`, then the real
   `SymbolResolver` (two-namespace scope) for GLOB_DAT/JUMP_SLOT/64 — main-loop only for the apkenv-wiring tail.**
   See §6 (2026-06-05 segment-mapper).
+  **2026-06-05 UPDATE — the loader's FIFTH piece, the `SymbolResolver` SCOPE, is built + tested + PROVEN ON
+  `libm.so.6`:** `src/loader/resolve.rs` (`pub mod resolve;` in `src/loader.rs`) is the symbol-resolution seam the
+  symbol-dependent relocs needed. A `Scope` is an ordered list of pluggable `SymbolProvider`s: a
+  `LoadedObjectProvider` (a mapped object's load base + a name→(st_value, weak) map of its DEFINED, EXPORTED
+  symbols only — `shndx != SHN_UNDEF`/`!SHN_ABS`, bind GLOBAL/WEAK, type FUNC/OBJECT/NOTYPE/GNU_IFUNC; LOCAL/UNDEF/
+  named-null excluded) and a `HostDlsymProvider` (`dlsym(RTLD_DEFAULT, name)`, the "satisfy from an already-loaded
+  provider" tier — lets a glibc `.so` resolve its libc imports). `Scope::resolve` applies the System V gABI rules:
+  FIRST scope match wins, EXCEPT a strong (GLOBAL) definition anywhere beats an earlier weak; only-weak → the first
+  weak; none → None. `ScopedResolver` wraps a `Scope` + the relocated object's own dynsym table, implements
+  reloc.rs's `SymbolResolver` (maps a reloc's `sym_index` → dynsym → name → scope), and finishes the gABI rules:
+  scope hit → the address; WEAK-undef with no def → **0** (psABI weak-undef, NOT an error); STRONG-undef → None →
+  reloc.rs's typed `UnresolvedSymbol` (NO fabricated address); LOCAL/out-of-range → None. **map.rs WIRED:** a new
+  `MappedObject::relocate_symbols(img, &scope, page)` follow-on pass (and a one-call
+  `map_and_relocate_with_scope`) applies GLOB_DAT/JUMP_SLOT/`R_X86_64_64` through the scope (makes every segment
+  RW, patches the GOT/PLT slots, restores final protections), counting GLOB_DAT/JUMP_SLOT/ABS64 applied +
+  resolved-nonnull + deferred. `TPOFF64`/`IRELATIVE` stay DEFERRED + counted; nothing is executed/jumped/init-run.
+  **`unsafe`:** exactly ONE new block — the `dlsym` FFI in resolve.rs, confined with a dated `// SAFETY:`; reloc.rs
+  + elf.rs stay `#![forbid(unsafe_code)]`. **Dep:** `libc = "0.2"` for `dlsym`/`RTLD_DEFAULT` (rustix has NO
+  dlopen/dlsym; libc is the ONLY sound path and is ALREADY in `Cargo.lock` (0.2.186) → ZERO new crates, lock stays
+  229 pkgs). **Tests (12; GPU/VM-free except the real one):** provider export-only filtering (LOCAL/UNDEF/ABS
+  excluded), weak tracking, Scope first-wins / global-beats-weak / only-weak / no-match, resolver
+  defined→base+value / weak-undef→0 / strong-undef→None / LOCAL→None / out-of-range→None / never-resolves-TLS, and
+  HostDlsymProvider resolves `memcpy`/`malloc` non-null + returns None for gibberish + an interior-NUL name. A
+  **REAL** test maps `/usr/lib/libm.so.6`, builds `Scope = [LoadedObjectProvider(libm), HostDlsymProvider]`, and
+  applies its symbol relocs: **total_symbol_relocs=32 GLOB_DAT (0 JUMP_SLOT, 0 ABS64) → 29 resolved non-null + 3
+  weak-undef→0 (`__gmon_start__`, `_ITM_deregisterTMCloneTable`, `_ITM_registerTMCloneTable` — all WEAK), 1
+  TPOFF64 deferred** — NO unresolved-strong error, NO panic; 32+1 = the base pass's 33 `skipped_by_type` (every
+  deferred reloc accounted for). All of libm's 32 GLOB_DAT now resolve + apply. **Engine-load frontier:
+  SymbolResolver DONE — libm.so.6's 32 GLOB_DAT now resolve+apply; only `TPOFF64`/TLS + `IRELATIVE` remain before a
+  fully-relocated object; NEXT = static-TLS block + `%fs`/TCB for `TPOFF64`** (main-loop only for the apkenv-wiring
+  tail). See §6 (2026-06-05 symbol-resolver). Gate now **265 unit + 2 doctests**.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2631,6 +2662,63 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   --all-targets` + `clippy --all-targets --all-features -D warnings` + `test` (**250 unit + 2 doctests**) + `build
   --release` all 0-warning/0-error. Files: `src/loader/map.rs` (new), `src/loader.rs` (`pub mod map;` + module
   doc), `Cargo.toml` (`rustix {mm,param}`, justified above).
+
+- **2026-06-05 — symbol-resolver: the `SymbolResolver` SCOPE over pluggable providers (`src/loader/resolve.rs`,
+  `pub mod resolve;` in `src/loader.rs`).** **What/why:** the loader's STEP 5 — the seam map.rs deferred. The base
+  pass applies only RELATIVE/RELR; GLOB_DAT/JUMP_SLOT/`R_X86_64_64` reference dynamic symbols and need a resolution
+  scope. This module supplies it, end-to-end on a real library. **Providers (`SymbolProvider` trait, `resolve(name)
+  -> Option<ResolvedSym{addr,weak}>`):** (1) `LoadedObjectProvider` — wraps a mapped object's load base + a
+  name→(st_value, is_weak) map of its DEFINED, EXPORTED symbols ONLY (`is_exported_definition`: `st_shndx !=
+  SHN_UNDEF` and `!= SHN_ABS`, bind GLOBAL/WEAK never LOCAL, type FUNC/OBJECT/NOTYPE/GNU_IFUNC, non-empty name);
+  `resolve` → `base + value`, tracking weak-vs-global so a strong def wins. (2) `HostDlsymProvider` —
+  `dlsym(RTLD_DEFAULT, name)`, treats a non-null result as a STRONG host definition (the "satisfy an import from an
+  already-loaded provider" tier; lets a glibc `.so` resolve its libc imports). **Scope (ordered `Vec<Box<dyn
+  SymbolProvider>>`):** `resolve(name)` = System V gABI first-wins, EXCEPT a global anywhere overrides an earlier
+  weak (scan continues past a weak hit for a strong; a strong short-circuits); only-weak → first weak; none → None.
+  **`ScopedResolver`** wraps a Scope + the relocated object's OWN dynsym table and implements reloc.rs's
+  `SymbolResolver`: maps `sym_index` → dynsym → name → `scope.resolve`; scope hit → addr; WEAK-undef with no def →
+  **`Some(0)`** (psABI weak-undef = 0, NOT an error); STRONG-undef → **`None`** → reloc.rs surfaces its typed
+  `UnresolvedSymbol` (NO fabricated address); LOCAL ref / out-of-range index → None; `resolve_tls_offset` → always
+  None (TPOFF64/static-TLS is a separate deferred step). **The self-reference pattern (key grounding):** a `.so`'s
+  dynsym holds BOTH an UND and a DEFINED entry for the same name (libm: `__signgam`/`_LIB_VERSION` UND for the
+  GLOB_DAT ref + DEFINED as exports); resolving by NAME through a scope that includes the object's own
+  `LoadedObjectProvider` finds the defined entry — exactly how the linker satisfies an object's references to its
+  own globals. **map.rs WIRED:** `MappedObject::relocate_symbols(img, &scope, page)` (follow-on pass) +
+  `map_and_relocate_with_scope` (one call) partition GLOB_DAT/JUMP_SLOT/`R_X86_64_64` out, make every segment RW,
+  apply through the reloc core, count `SymbolRelocStats{glob_dat/jump_slot/abs64_applied, resolved_nonnull,
+  deferred}`, then restore final protections (so a GOT slot in a still-RW RELRO region is patchable now; RELRO
+  hardening stays a later step). `TPOFF64` + `IRELATIVE` (new local const, type 37) are counted DEFERRED, never
+  applied; nothing is executed/jumped/init-run. **`unsafe`:** exactly ONE new block — the `dlsym` FFI — confined to
+  resolve.rs with a dated `// SAFETY:`; reloc.rs + elf.rs stay `#![forbid(unsafe_code)]`. **Dep (§2.1/§2.5/§3):**
+  `libc = "0.2"` — `rustix` deliberately has NO dlopen/dlsym API, so `libc` is the ONLY sound dlsym path; it is
+  ALREADY in `Cargo.lock` (0.2.186, transitively via directories/winit), so adding it as a direct dep pulls **ZERO
+  new crates** (lock stays **229 packages**), same precedent as rustix. **Tests (12, GPU/VM-free except the real
+  one):** provider export-only filtering (LOCAL/UNDEF/ABS/named-null excluded) + weak tracking; Scope first-strong-
+  wins / global-beats-earlier-weak / only-weak-returns-first-weak / no-match→None; resolver defined→base+value
+  (self-ref) / weak-undef→0 / strong-undef→None / LOCAL-ref→None / out-of-range→None / never-resolves-TLS;
+  HostDlsymProvider resolves `memcpy`+`malloc` non-null & strong, returns None for a gibberish name + an
+  interior-NUL name (no panic). A **REAL** test maps `/usr/lib/libm.so.6` (3 std paths, **skips cleanly** if
+  absent), builds `Scope = [LoadedObjectProvider(libm), HostDlsymProvider]`, and applies its symbol relocs:
+  **total_symbol_relocs=32 GLOB_DAT (0 JUMP_SLOT, 0 ABS64) → 29 resolved non-null + 3 weak-undef→0 (the three WEAK
+  imports `__gmon_start__`/`_ITM_deregisterTMCloneTable`/`_ITM_registerTMCloneTable`, null via this process's dlsym)
+  + 1 TPOFF64 deferred** — an EXACT cross-check vs `readelf -r` (32 GLOB_DAT + 1 TPOFF64); 32 applied + 1 deferred =
+  the base pass's 33 `skipped_by_type` (every base-deferred reloc accounted for); NO unresolved-STRONG error, NO
+  panic; each strong resolution non-null, each self-defined target verified in `[base, base+span)`. **All of libm's
+  32 GLOB_DAT now resolve + apply.** **Scope (honest):** resolve + apply symbol relocs ONLY — does NOT allocate the
+  static-TLS block / set `%fs` (so TPOFF64 stays deferred), execute ifunc/init, model the bionic TWO-namespace scope
+  (a single ordered scope, not yet the bionic local+global namespace split), or wire vs apkenv; **NEXT = static-TLS
+  block + `%fs`/TCB for `TPOFF64`** (main-loop only for the apkenv-wiring tail). **Grounding (cyber-safeguard
+  honored):** written from the PUBLIC System V gABI symbol-resolution semantics (binding/visibility/weak-vs-global,
+  UNDEF, first-wins scope order) + the x86-64 psABI (weak-undef = 0) + the PUBLIC `dlsym(3)`/`RTLD_DEFAULT` contract
+  (own general knowledge) + the `libc` crate's `dlsym`/`RTLD_DEFAULT` (verified compiles) + Eclipse's own
+  `src/loader/` ONLY — **no apkenv/bionic LINKER source, no ATL/asset source was read**; resolving symbol NAMES over
+  a real `.so`'s decoded dynsym table + issuing the public `dlsym` call is benign (WRITING Eclipse's own from-scratch
+  Rust resolver, not reading the apkenv linker). **The clean-room own-Rust resolver work is confirmed
+  SUBAGENT-FEASIBLE — it does NOT trip the cyber-safeguard.** **Gate:** `cargo fmt --all --check` + `build
+  --all-targets` + `clippy --all-targets --all-features -D warnings` + `test` (**265 unit + 2 doctests**) + `build
+  --release` all 0-warning/0-error. Files: `src/loader/resolve.rs` (new), `src/loader/map.rs`
+  (`relocate_symbols`/`map_and_relocate_with_scope` + `SymbolRelocStats` + real symbol-reloc test), `src/loader.rs`
+  (`pub mod resolve;` + module doc), `Cargo.toml` (`libc = "0.2"`, justified above).
 
 ---
 
