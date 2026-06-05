@@ -435,7 +435,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**66 unit + 2 compile_fail doctests
+  --all-targets --all-features -- -D warnings`, `cargo test` (**71 unit + 2 compile_fail doctests
   pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
   Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock` natives via
   `RegisterNatives` before `Context.<clinit>`, then drives recipe steps 1–3. **Eclipse-owned non-GTK
@@ -445,15 +445,17 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   XML-attribute extraction by `name_resource` into the framework's off-heap `outValues`/`outIndices`
   (bounds-proven raw writes); needed an `axml` `RES_XML_RESOURCE_MAP_TYPE` decode (so `name_resource`
   is populated, was always 0) + the empirically-found ATL TypedArray window layout (stride 6, TYPE@1,
-  DATA@2). On the dev-host run, `Context.<clinit>` parses+walks `AndroidManifest.xml` end-to-end AND now
-  advances **past `PackageParser.parsePackage`** (integer manifest attrs resolve; the prior `getInteger
-  type=0x1` is gone); it stops at the framework's **`<activity> does not specify android:name` →
-  `System.exit(1)`** — a `getString` path needing ATL's pooled-string/cookie ABI (denylisted).
-  `Application.onCreate` NOT yet reached (faithful, not faked; §6 2026-06-05). The live JNI path is
-  dev-host-only (ART aborts on worker threads), so it is validated via `eclipse run`. The `apk` reader
-  was validated against the **real** Roblox manifest → ground truth (com.roblox.client / ActivitySplash
-  / 26 / 35 / largeHeap=false). **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK) on
-  this host.
+  **DATA@3** — corrected from the earlier integer-only guess DATA@2; see §6 2026-06-05). On the dev-host
+  run, `Context.<clinit>` parses+walks `AndroidManifest.xml` end-to-end, integer manifest attrs resolve,
+  **`<activity android:name>` now resolves via `TypedArray.getString` (the XmlBlock string pool, no new
+  native), `PackageParser.parsePackage` completes (incl. certificate collection), and the lifecycle
+  advances to step 1 `Context.createApplication`** — which now stops at a NEW, unrelated frontier:
+  `GetStaticMethodID(createApplication, (J)Landroid/app/Application;)` returns NULL (the framework's
+  `createApplication(J)` method-ID lookup, not the asset/XML path). `Application.onCreate` NOT yet
+  reached (faithful, not faked; §6 2026-06-05). The live JNI path is dev-host-only (ART aborts on worker
+  threads), so it is validated via `eclipse run`. The `apk` reader was validated against the **real**
+  Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 / largeHeap=false).
+  **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK) on this host.
 - **Repo:** git initialized; committed & pushed to `origin/main`
   (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
 - **What exists:** 7 docs + `README` + `eclipse` crate. **M1 done so far:**
@@ -595,17 +597,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      (NOT the AOSP-documented TYPE@0/DATA@1). Result: integer manifest attributes resolve and the boot
      advances **past `PackageParser.parsePackage`** (the `getInteger type=0x1` error is gone). **NEW STOP
      (faithful): `<activity> does not specify android:name` → `System.exit(1)`** — a `getString`
-     resolution that needs ATL's pooled-string/cookie ABI (`TypedArray.getString`, denylisted). `onCreate`
-     is **NOT reached** (reported faithfully, not faked). **NEXT (in order): (a) finish String-attribute
-     resolution for `<activity android:name>` via the EXISTING `nativeGetAttributeStringValue`/XML-pool
-     path** — NOT a new native: a 2026-06-05 DIAG probe (since reverted) confirmed only
-     `AssetManager.getCookieName` exists among the candidate string natives, and none of the dedicated
-     string-pool-resolution natives (`getPooledStringForCookie`/`getResourceString`/`getNativeStringBlock`/
-     `nativeGetStringBlock`) exist — so ATL's `TypedArray.getString` resolves through the already-bound
-     `nativeGetAttributeStringValue` + the `XmlBlock` string pool (the value is already in the parsed
-     `XmlDocument`); surface that string to the framework. Then **(b) wire `apk::arsc` into
-     `retrieveAttributes` for `@`-references** — when an attribute's `Res_value` is `TYPE_REFERENCE`,
-     resolve it through `arsc::ResTable::resource_value` against the APK's `resources.arsc`. Then **(2)** the deref-ing Window natives for
+     resolution. ✅ **CRACKED 2026-06-05 (§6): the fix was a TypedArray-window OFFSET, not a missing
+     native.** Empirically sweeping which `outValues` slot carries the DATA word showed `getString` reads
+     the string-pool index from **DATA@3, not DATA@2** (the prior integer-only guess). With `STYLE_DATA=3`,
+     `<activity android:name>` resolves via `TypedArray.getString` → the XmlBlock string pool (cookie slot
+     = 0 routes to `mXml.getPooledString(data)`, satisfied by the already-bound XML natives — NO new
+     native; confirmed by the run surfacing no `No implementation found`). `PackageParser.parsePackage`
+     completes and the lifecycle reaches step 1 `Context.createApplication`. **NEXT (in order): (a)** the
+     **new step-1 frontier** — `GetStaticMethodID(createApplication, (J)Landroid/app/Application;)` returns
+     NULL: resolve why ART can't find `Context.createApplication(J)` (method visibility/signature/the
+     `createApplication` descriptor vs `Context.java`; the recipe-constant `STEP1` may need correcting, or
+     the method is non-static/instance, or the class needs the method bound/declared). Then **(b) wire
+     `apk::arsc` into `retrieveAttributes` for `@`-references** — when an attribute's `Res_value` is
+     `TYPE_REFERENCE`, resolve it through `arsc::ResTable::resource_value` against the APK's
+     `resources.arsc`. Then **(2)** the deref-ing Window natives for
      step 4 (`set_jobject`/`set_title`/`set_layout` metadata via `register_native_methods` + a descriptor
      guard vs `Window.java`, then the deferred `set_widget_as_root`/`take_input_queue`) + associating the
      real winit `Window` with the registry slot. **BIGGEST RISK recorded:** the View hierarchy is fully
@@ -1240,6 +1245,36 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   the parsed `XmlDocument`). That XML-pool path — not a new native — is the next frontier for
   `<activity android:name>`. Also `.gitignore`d `.claude/` (worktree/harness internals) and
   `/examples/` (local scratch probe binaries) so they are never committed.
+- **2026-06-05** — 🎉 **`<activity android:name>` (and all String attrs) now RESOLVE — root cause was a
+  TypedArray-window DATA OFFSET (DATA@2 → DATA@3), not ATL's pooled-string/cookie ABI.** The hypothesis
+  that `getString` needed a sentinel/negative cookie slot was **disproven empirically**: sweeping a
+  sentinel (−1, −2, and the data index) across every unknown window slot (0,3,4,5) changed nothing, and
+  no new native surfaced. The real bug was found by sweeping **which slot carries the DATA word**: writing
+  `Res_value.data` into ONLY slot 3 (slot 2 left at the framework's zero pre-fill) made `TypedArray.
+  getString` resolve `<activity android:name>` (the `<activity> does not specify android:name` →
+  `System.exit(1)` stop is GONE) AND kept `PackageParser`'s integer attributes resolving. Isolating each
+  slot: DATA@2 satisfied integers but left `getString` returning null; **DATA@3 satisfies BOTH** — the one
+  layout for every typed accessor. The earlier "DATA@2" note was an integer-only coincidence (the integer
+  path tolerates 2 or 3; the string path requires 3). So the empirically-confirmed ATL TypedArray window
+  is `[?, TYPE(1), ?, DATA(3), ?, ?]`, stride 6. `getString` resolves the `TYPE_STRING` DATA@3 index via
+  the **XmlBlock string pool** (cookie slot = 0 → `mXml.getPooledString(data)`, satisfied by the
+  already-bound `nativeGetAttributeStringValue` / parsed `XmlDocument`) — **NO new native** (confirmed: the
+  run surfaces no `No implementation found`, the activity name resolves entirely in Java). **The fix is a
+  one-line `STYLE_DATA: 2 → 3`** in `framework.rs` plus dated comments; purely empirical (sentinel write +
+  run + read log — NO web, nothing read outside `src/`). **FAITHFUL lifecycle progress:** `Context.<clinit>`
+  parses+walks `AndroidManifest.xml`, integer + string attrs resolve, `PackageParser.parsePackage`
+  completes (incl. certificate collection), and the lifecycle advances to **step 1
+  `Context.createApplication`**, which stops at a NEW, unrelated frontier:
+  `GetStaticMethodID(createApplication, (J)Landroid/app/Application;)` returns NULL (the framework's
+  `createApplication(J)` method-ID lookup — not the asset/XML path). **`Application.onCreate` is NOT
+  reached** (reported faithfully, not faked). Regression guard: the existing `framework` test pinning the
+  layout constants now pins **`STYLE_DATA == 3`** (a revert to 2 re-breaks the activity-name `getString`
+  and fails the test), and `fill_typed_array_writes_exact_bounds_values_and_indices` verifies the DATA@3
+  raw-pointer write stays in bounds (sentinel-bracketed buffers). Full gate green: fmt --check / build
+  --all-targets / clippy `-D warnings` / test (**71 unit + 2 compile_fail doctests**) / release
+  (`panic = "abort"`/LTO retained). No new deps. Run log: `/tmp/eclipse-run.log` (EXIT=1, the expected stop
+  at the `createApplication` method-ID lookup). **NEXT:** the step-1 `createApplication` method-ID frontier
+  (why ART can't find `Context.createApplication(J)`).
 
 ---
 
