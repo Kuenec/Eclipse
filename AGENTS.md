@@ -575,12 +575,40 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   **zero VK_ERROR/panic/validation/draw-failed** — the demo's TextView text is rasterized + drawn over the
   depth-colored view quads. GPU-free unit tests: text-vertices (6/visible-glyph, skip whitespace/unknown/no-text),
   device-local memory selection, and a font-present-guarded atlas build. **122 unit + 2 doctests pass.**
-  🔜 **IMMEDIATE FRONTIER (2026-06-05): a faithful layout pass + `onStart`/`onResume`.** The minimal vertical-stack
-  layout makes the tree visible but ignores `LayoutParams`/gravity/weight (those view natives are no-op stubs);
-  the next refinement is a real measure/layout pass (and implementing those natives to record sizes/gravity).
-  Then `onStart`/`onResume` if the demo needs it. For Roblox specifically, the engine-load bionic-shim work
-  (Section B of the dev-host runbook) is the parallel track, and the engine will eventually render into THIS
-  window's swapchain via WSI translation. Stay non-GTK; validate via dev-host `eclipse run`.
+  ✅ **DONE 2026-06-05: a FAITHFUL measure+layout pass now computes each view's real rect (replaces the
+  minimal vertical-stack).** Root design: the renderer reads the tree from `view_registry::snapshot_tree`,
+  NOT Java `getWidth`, and Android's measure/layout cascade is driven by Java `ViewRootImpl` which Eclipse's
+  minimal lifecycle never runs — so (per the sanctioned snapshot-time-cascade option) the natives RECORD the
+  real params and the cascade runs ONCE over the recorded tree at the render snapshot, avoiding ATL's traversal
+  driver. (1) `View.native_setLayoutParams`/`native_setPadding` now RECORD width/height/gravity/weight/margins/
+  padding onto a new `view_registry::LayoutParams` on the `ViewState` (they were validate-only no-ops). (2)
+  `RenderNode`/`snapshot_tree` now carry each node's `LayoutParams` + snapshot-local child indices (was a flat
+  depth list) so the renderer has the tree structure. (3) `graphics.rs` replaced the minimal `layout_views`
+  with a real cascade: `MeasureSpec` (UNSPECIFIED/EXACTLY/AT_MOST) resolution, top-down measure (root measured
+  EXACTLY at the swapchain extent; MATCH_PARENT→parent size, WRAP_CONTENT→content [a TextView's content =
+  its glyph-measured text via the atlas advances/line-height; a container's = its laid-out children], else
+  exact px), top-down layout (vertical LinearLayout stacks children top-to-bottom honoring gravity + trivial
+  `layout_weight`; FrameLayout/unknown stacks at the origin by gravity; padding insets children), then flattens
+  absolute rects into `LaidOutView` (text positioned within its rect). **FAITHFUL status — VALIDATED on the
+  demo** (`/tmp/eclipse-render.log`, `RUST_LOG=eclipse::graphics=debug` logs each `laid-out view rect`): the
+  demo's real tree is `FrameLayout(MATCH×MATCH) → LinearLayout(MATCH×MATCH) → 2×TextView(WRAP×WRAP)`; computed
+  rects = FrameLayout (0,0,800×600), LinearLayout (0,0,800×600), TextView#1 (0,0,180.5×28), TextView#2
+  (0,28,204.3×28) — i.e. both layouts fill the window and the two WRAP TextViews size to their glyph-measured
+  text and stack vertically (y=0 then y=28=line-height). 8606 frames over 60 s, **zero VK_ERROR/panic/
+  draw-failed/validation**. **Key bug found + fixed (regression-guarded):** every inflated view reports
+  `gravity = -1` (Android's `UNSPECIFIED_GRAVITY`, NOT a bitmask) — `-1 & RIGHT==RIGHT` would wrongly push
+  children bottom-right; `gravity_dx/dy` now treat `gravity < 0` as default top-left. **OUT OF SCOPE (documented):**
+  RelativeLayout/ConstraintLayout, exact multi-pass weight, baseline alignment, scrolling, and **LinearLayout
+  `orientation` detection** — `orientation` is a Java field not threaded through any native, so a `LinearLayout`
+  defaults to **vertical** (the demo's + typical app-shell case); a horizontal `LinearLayout` currently stacks
+  vertically. GPU-free unit tests added for MeasureSpec resolution (match/wrap/exact + unspecified parent),
+  root MATCH_PARENT fills the extent, LinearLayout vertical stacking, FrameLayout gravity (incl. the -1 guard),
+  WRAP-to-glyph-metrics, trivial weight, and padding insets. **131 unit + 2 doctests pass.**
+  🔜 **IMMEDIATE FRONTIER (2026-06-05): `onStart`/`onResume`.** With the faithful layout done, the next
+  framework refinement is driving `onStart`/`onResume` if the demo needs it (the recipe targets `onCreate`).
+  For Roblox specifically, the engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel
+  track, and the engine will eventually render into THIS window's swapchain via WSI translation. Stay non-GTK;
+  validate via dev-host `eclipse run`.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -1802,6 +1830,37 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   aborts under cargo-test). **Context7:** `/alexheretic/ab-glyph` (FontRef/FontVec, `outline_glyph`,
   `OutlinedGlyph::draw`/`px_bounds`, `ScaleFont` ascent/h_advance) + `/ash-rs/ash` (image/sampler/descriptor/
   push-constant/buffer-image-copy/pipeline-barrier). Cyber-safeguard did NOT trip (Eclipse's own graphics only).
+- **2026-06-05** — 🟢 **FAITHFUL measure+layout pass replaces the minimal vertical-stack — real per-view rects.**
+  **Why here, not per-view natives:** the renderer reads the tree from `view_registry::snapshot_tree` (not Java
+  `getWidth`), and Android's measure/layout cascade is driven by Java `ViewRootImpl` which Eclipse's minimal
+  lifecycle never runs — so binding empty `native_measure`/`native_layout` natives would be dead speculative
+  code (§ Simplicity). The sound, sanctioned path: the View natives RECORD the real params, and the cascade runs
+  ONCE over the recorded tree at the render snapshot. **What changed (surgical):** (1) `View.native_setLayoutParams`/
+  `native_setPadding` now RECORD width/height/gravity/weight/margins/padding onto a new
+  `view_registry::LayoutParams` field on `ViewState` (they were validate-only no-ops). (2) `RenderNode`/
+  `snapshot_tree` now carry each node's `LayoutParams` + snapshot-local child indices (was a flat depth list);
+  the walk stayed iterative + generation-checked (no UB). (3) `graphics.rs` replaced minimal `layout_views`
+  with a real cascade — `MeasureSpec`(UNSPECIFIED/EXACTLY/AT_MOST) resolution, top-down measure (root EXACTLY
+  at the swapchain extent; MATCH_PARENT→parent size, WRAP_CONTENT→content [TextView = glyph-measured text via
+  the atlas advances/line-height; container = laid-out children], else exact px), top-down layout (vertical
+  LinearLayout stacks top-to-bottom honoring gravity + trivial `layout_weight`; FrameLayout/unknown stacks at
+  the origin by gravity; padding insets children), flattened to absolute `LaidOutView` rects. **Bug found +
+  fixed (regression-guarded):** every inflated view reports `gravity = -1` (`UNSPECIFIED_GRAVITY`, NOT a
+  bitmask) — `-1 & RIGHT==RIGHT` would push children bottom-right; `gravity_dx/dy` now treat `gravity < 0` as
+  default top-left (`unspecified_gravity_minus_one_is_top_left_not_a_bitmask` test). **FAITHFUL status —
+  VALIDATED on the demo** (`/tmp/eclipse-render.log`): real tree `FrameLayout(M×M)→LinearLayout(M×M)→
+  2×TextView(W×W)`; computed rects FrameLayout (0,0,800×600), LinearLayout (0,0,800×600), TextView#1
+  (0,0,180.5×28), TextView#2 (0,28,204.3×28) — both layouts fill the window, the two WRAP TextViews size to
+  their glyph-measured text and stack vertically (y=0 then y=28=line-height); 8606 frames over 60 s, **zero
+  VK_ERROR/panic/draw-failed/validation**. **OUT OF SCOPE (documented):** RelativeLayout/ConstraintLayout,
+  exact multi-pass weight, baseline alignment, scrolling, and **LinearLayout `orientation` detection**
+  (`orientation` is a Java field not threaded through any native → `LinearLayout` defaults to vertical, the
+  demo's + app-shell common case; horizontal currently stacks vertically). **Regression guard:** GPU-free unit
+  tests for MeasureSpec resolution (match/wrap/exact + unspecified parent), root MATCH_PARENT fills the extent,
+  LinearLayout vertical stacking, FrameLayout gravity (incl. the -1 guard), WRAP-to-glyph-metrics, trivial
+  weight, padding insets, + snapshot now carries `LayoutParams`/child-indices. **131 unit + 2 doctests pass**
+  (was 122); fmt/build/clippy -D warnings/release all clean. No new dep. Cyber-safeguard did NOT trip (Eclipse's
+  own view_registry + graphics only — NO vendor/atl, framework.rs read only at the targeted View-native ranges).
 
 ---
 

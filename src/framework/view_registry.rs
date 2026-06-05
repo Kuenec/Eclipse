@@ -82,13 +82,62 @@ impl fmt::Display for ViewRegistryError {
 
 impl std::error::Error for ViewRegistryError {}
 
+/// `LayoutParams.width`/`height` sentinel: the view fills the parent's available size.
+/// 2026-06-05: standard Android encoding (`ViewGroup.LayoutParams.MATCH_PARENT`).
+pub const MATCH_PARENT: i32 = -1;
+/// `LayoutParams.width`/`height` sentinel: the view sizes itself to its content.
+/// 2026-06-05: standard Android encoding (`ViewGroup.LayoutParams.WRAP_CONTENT`).
+pub const WRAP_CONTENT: i32 = -2;
+
+/// The requested layout parameters of a view, as Android encodes them.
+///
+/// 2026-06-05: recorded verbatim from `View.native_setLayoutParams`/`native_setPadding` (the values
+/// `LayoutInflater` parsed from `layout_width`/`layout_height`/`layout_gravity`/`layout_weight`/
+/// margins/padding). `width`/`height` use Android's sentinels: [`MATCH_PARENT`] (-1), [`WRAP_CONTENT`]
+/// (-2), else an exact pixel count. `gravity` is the packed `Gravity` bitmask the parent honors when
+/// positioning the child (default `0` → top|left). Eclipse's measure/layout pass (in `graphics.rs`)
+/// consumes these to compute each view's absolute rect — there is no GTK and no per-view native
+/// measure/layout driver, so the cascade runs once over the recorded tree at render time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutParams {
+    /// Requested width: [`MATCH_PARENT`], [`WRAP_CONTENT`], or an exact pixel count (`>= 0`).
+    pub width: i32,
+    /// Requested height: [`MATCH_PARENT`], [`WRAP_CONTENT`], or an exact pixel count (`>= 0`).
+    pub height: i32,
+    /// The child's `layout_gravity` bitmask (how the parent positions it within the slot). `0` = default.
+    pub gravity: i32,
+    /// The child's `layout_weight` (LinearLayout leftover-space distribution). `0.0` = no weight.
+    pub weight: f32,
+    /// Left/top/right/bottom margins in pixels (the gap the parent leaves around the child).
+    pub margins: [i32; 4],
+    /// Left/top/right/bottom padding in pixels (the gap inside the view, around its content).
+    pub padding: [i32; 4],
+}
+
+impl Default for LayoutParams {
+    /// Android's default for an un-parameterized view: `WRAP_CONTENT` on both axes, no gravity/weight,
+    /// no margins/padding. A view never sized by `setLayoutParams` still lays out sanely.
+    fn default() -> Self {
+        Self {
+            width: WRAP_CONTENT,
+            height: WRAP_CONTENT,
+            gravity: 0,
+            weight: 0.0,
+            margins: [0; 4],
+            padding: [0; 4],
+        }
+    }
+}
+
 /// Per-view state held in a registry slot: the non-GTK view-tree metadata the View natives set.
 ///
-/// 2026-06-05: minimal by design — records what is needed to track the view hierarchy's shape
-/// without GTK, layout, or draw. The view's `class_name` (which `View`/`ViewGroup`/`FrameLayout`/
-/// `TextView` subclass constructed it), an optional `text` (`TextView.setText`/`Window.setTitle`),
-/// and `children` (the ordered child view handles a `ViewGroup.addView` wires in). The real winit
-/// `Window`/Vulkan surface association is a later, deferred step.
+/// 2026-06-05: records what is needed to track the view hierarchy's shape **and lay it out** without
+/// GTK. The view's `class_name` (which `View`/`ViewGroup`/`FrameLayout`/`TextView` subclass
+/// constructed it), an optional `text` (`TextView.setText`/`Window.setTitle`), its `children` (the
+/// ordered child view handles a `ViewGroup.addView` wires in), and its requested [`LayoutParams`]
+/// (`native_setLayoutParams`/`native_setPadding`). The real winit `Window`/Vulkan surface
+/// association is a later, deferred step; the absolute rect is computed by the renderer's
+/// measure/layout pass from these params, not stored here.
 #[derive(Debug, Default)]
 pub struct ViewState {
     /// The Java class name that constructed this view (e.g. `android.widget.FrameLayout`), recorded
@@ -99,6 +148,9 @@ pub struct ViewState {
     /// Ordered child view handles wired into this view by `ViewGroup.addView` (the tree edges).
     /// Stored as handles (not references) so the slab stays a flat `Vec` with no internal aliasing.
     pub children: Vec<ViewHandle>,
+    /// The view's requested [`LayoutParams`], recorded by `native_setLayoutParams`/`native_setPadding`.
+    /// Defaults to `WRAP_CONTENT` on both axes (Android's default) until those natives set it.
+    pub layout: LayoutParams,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -145,6 +197,7 @@ pub fn allocate(class_name: &str) -> Result<ViewHandle, ViewRegistryError> {
         class_name: class_name.to_owned(),
         text: None,
         children: Vec::new(),
+        layout: LayoutParams::default(),
     };
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -225,9 +278,11 @@ pub fn active_root() -> ViewHandle {
 ///
 /// 2026-06-05: a depth-first, owned copy (no registry handles / locks held by the renderer) so the
 /// GPU code never touches the live slab while drawing. `depth` is the nesting level (root = 0);
-/// `class_name`/`text` mirror [`ViewState`]. The renderer derives a rect + color from `depth` and
-/// the node's order; layout/measure per real `LayoutParams` is a documented follow-up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `class_name`/`text`/`layout` mirror [`ViewState`]. `children` are **indices into the same
+/// snapshot `Vec`** (not registry handles) so the renderer can run a measure/layout cascade over the
+/// owned tree without re-locking the slab. The renderer computes each node's absolute rect from
+/// `layout` + `class_name`; `depth` is kept for depth-distinguished fill colors.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RenderNode {
     /// The Java class that constructed the view (e.g. `android.widget.TextView`).
     pub class_name: String,
@@ -235,6 +290,10 @@ pub struct RenderNode {
     pub text: Option<String>,
     /// Nesting depth in the tree: the root view is `0`, its children `1`, and so on.
     pub depth: u32,
+    /// The view's requested layout parameters (sizing/gravity/weight/margins/padding).
+    pub layout: LayoutParams,
+    /// Indices (into the flat snapshot `Vec`) of this node's children, in their recorded order.
+    pub children: Vec<usize>,
 }
 
 /// Walk the recorded view tree from the published [`active_root`] into a flat, depth-first
@@ -258,11 +317,16 @@ pub fn snapshot_tree() -> Vec<RenderNode> {
     let Ok(reg) = lock() else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    // Explicit stack of (handle, depth) so the walk is iterative (no recursion / stack-depth risk).
-    // Push in reverse so children are visited in their recorded (left-to-right) order on pop.
-    let mut stack = vec![(root, 0u32)];
-    while let Some((handle, depth)) = stack.pop() {
+    let mut out: Vec<RenderNode> = Vec::new();
+    // Explicit stack of (registry handle, depth, parent's snapshot index | usize::MAX for root). A
+    // popped node is appended to `out` (taking the next snapshot index), linked onto its parent's
+    // `children`, then its children are pushed in REVERSE so they pop in recorded (left-to-right)
+    // order — yielding the documented pre-order (parent before its children). The parent is always
+    // appended before any of its children pop, so the recorded parent index is valid when a child
+    // links back. Iterative (no recursion / stack-depth risk); generation/bounds-checked so a
+    // stale/cyclic handle is skipped, never UB.
+    let mut stack: Vec<(ViewHandle, u32, usize)> = vec![(root, 0, usize::MAX)];
+    while let Some((handle, depth, parent_idx)) = stack.pop() {
         if depth >= MAX_DEPTH {
             continue;
         }
@@ -276,14 +340,20 @@ pub fn snapshot_tree() -> Vec<RenderNode> {
         let Some(state) = slot.state.as_ref() else {
             continue;
         };
+        let my_idx = out.len();
         out.push(RenderNode {
             class_name: state.class_name.clone(),
             text: state.text.clone(),
             depth,
+            layout: state.layout,
+            children: Vec::new(),
         });
-        // Push children reversed so the first child is processed next (pre-order, left-to-right).
+        if let Some(parent) = out.get_mut(parent_idx) {
+            parent.children.push(my_idx);
+        }
+        // Push children reversed so the first child pops next (pre-order, left-to-right).
         for &child in state.children.iter().rev() {
-            stack.push((child, depth + 1));
+            stack.push((child, depth + 1, my_idx));
         }
     }
     // `reg` is dropped here, releasing the lock before the owned `Vec` is returned to the renderer.
@@ -429,9 +499,45 @@ mod tests {
         assert_eq!(snap[1].text.as_deref(), Some("hello"));
         assert_eq!(snap[3].text.as_deref(), Some("x"));
 
+        // The snapshot-local child indices: root → [1, 2], child1 (idx 2) → [3]; leaves have none.
+        // These are what the renderer's measure/layout cascade walks (not registry handles).
+        assert_eq!(
+            snap[0].children,
+            vec![1, 2],
+            "root links its two children by snapshot index"
+        );
+        assert_eq!(
+            snap[2].children,
+            vec![3],
+            "the LinearLayout links its grandchild"
+        );
+        assert!(snap[1].children.is_empty() && snap[3].children.is_empty());
+
         for h in [grandchild, child0, child1, root] {
             free(h).expect("free");
         }
+    }
+
+    #[test]
+    fn snapshot_carries_recorded_layout_params() {
+        // The recorded LayoutParams (set by native_setLayoutParams/native_setPadding) must flow
+        // through the snapshot so the renderer can measure/lay out the view.
+        let h = allocate("android.widget.TextView").expect("alloc");
+        with_view(h, |s| {
+            s.layout.width = MATCH_PARENT;
+            s.layout.height = 120;
+            s.layout.gravity = 0x11;
+            s.layout.padding = [1, 2, 3, 4];
+        })
+        .expect("set layout");
+        set_active_root(h);
+        let snap = snapshot_tree();
+        set_active_root(0);
+        free(h).expect("free");
+        assert_eq!(snap[0].layout.width, MATCH_PARENT);
+        assert_eq!(snap[0].layout.height, 120);
+        assert_eq!(snap[0].layout.gravity, 0x11);
+        assert_eq!(snap[0].layout.padding, [1, 2, 3, 4]);
     }
 
     #[test]
