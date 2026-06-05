@@ -31,12 +31,22 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use jni::sys::jlong;
 
 /// Process-global slab of [`ViewState`], guarded by a [`Mutex`]. Initialized on first use.
 static VIEWS: OnceLock<Mutex<Registry>> = OnceLock::new();
+
+/// 2026-06-05: the handle of the window's content-root view, published by
+/// `Window.set_widget_as_root`. The renderer reads it each frame (via [`snapshot_tree`]) to know
+/// which view subtree to draw — a single source of truth for "what is on screen". `0` = none set yet.
+///
+/// An `AtomicI64` (not behind the slab `Mutex`) so a frame read is lock-free and cannot deadlock
+/// against a concurrent view mutation; it stores only the packed `jlong` handle (an opaque index,
+/// not a pointer), validated against the slab on use, so a stale value is a checked `Err`, not UB.
+static ACTIVE_ROOT: AtomicI64 = AtomicI64::new(0);
 
 /// A view-registry handle as it travels across JNI: a `jlong` (`i64`) packing the slot index (low 32
 /// bits) and the slot's generation (high 32 bits). `0` is the reserved "no view" / null sentinel.
@@ -197,6 +207,90 @@ pub fn free(handle: ViewHandle) -> Result<(), ViewRegistryError> {
     Ok(())
 }
 
+/// Publish `handle` as the window's content-root view (called by `Window.set_widget_as_root`), so
+/// the renderer's per-frame [`snapshot_tree`] knows which subtree to draw. Passing `0` clears it.
+///
+/// Lock-free (a single atomic store); does not validate the handle here — [`snapshot_tree`]
+/// validates it against the slab when it reads, so a stale value yields an empty snapshot, not UB.
+pub fn set_active_root(handle: ViewHandle) {
+    ACTIVE_ROOT.store(handle, Ordering::Release);
+}
+
+/// The currently published content-root view handle, or `0` if none has been set yet.
+pub fn active_root() -> ViewHandle {
+    ACTIVE_ROOT.load(Ordering::Acquire)
+}
+
+/// A flattened, owned snapshot of one view in the recorded tree — what the renderer reads per frame.
+///
+/// 2026-06-05: a depth-first, owned copy (no registry handles / locks held by the renderer) so the
+/// GPU code never touches the live slab while drawing. `depth` is the nesting level (root = 0);
+/// `class_name`/`text` mirror [`ViewState`]. The renderer derives a rect + color from `depth` and
+/// the node's order; layout/measure per real `LayoutParams` is a documented follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderNode {
+    /// The Java class that constructed the view (e.g. `android.widget.TextView`).
+    pub class_name: String,
+    /// The view's text, if any (`TextView.setText`). `None` for non-text containers.
+    pub text: Option<String>,
+    /// Nesting depth in the tree: the root view is `0`, its children `1`, and so on.
+    pub depth: u32,
+}
+
+/// Walk the recorded view tree from the published [`active_root`] into a flat, depth-first
+/// [`Vec`] of [`RenderNode`]s for the renderer. Returns an empty `Vec` when no root is set, the
+/// root handle is stale/invalid, or the registry mutex is poisoned (the renderer then draws no
+/// view quads — never a panic across the frame loop).
+///
+/// 2026-06-05: depth-first pre-order (parent before children), the order `setContentView`'s
+/// inflater wired the tree, so the renderer paints containers before their content. A depth cap
+/// (matching `axml`'s element-nesting guard) bounds the walk so a (registry-impossible but
+/// defensive) cycle cannot loop forever.
+pub fn snapshot_tree() -> Vec<RenderNode> {
+    /// Mirrors the `axml` element-nesting cap: real Android layouts nest far shallower; this only
+    /// guards against a malformed/cyclic registry, which the generational slab already prevents.
+    const MAX_DEPTH: u32 = 256;
+
+    let root = active_root();
+    if root == 0 {
+        return Vec::new();
+    }
+    let Ok(reg) = lock() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    // Explicit stack of (handle, depth) so the walk is iterative (no recursion / stack-depth risk).
+    // Push in reverse so children are visited in their recorded (left-to-right) order on pop.
+    let mut stack = vec![(root, 0u32)];
+    while let Some((handle, depth)) = stack.pop() {
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let (index, generation) = unpack(handle);
+        let Some(slot) = reg.slots.get(index as usize) else {
+            continue;
+        };
+        if slot.generation != generation {
+            continue;
+        }
+        let Some(state) = slot.state.as_ref() else {
+            continue;
+        };
+        out.push(RenderNode {
+            class_name: state.class_name.clone(),
+            text: state.text.clone(),
+            depth,
+        });
+        // Push children reversed so the first child is processed next (pre-order, left-to-right).
+        for &child in state.children.iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+    // `reg` is dropped here, releasing the lock before the owned `Vec` is returned to the renderer.
+    drop(reg);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +387,66 @@ mod tests {
             let handle = pack(index, generation);
             assert_eq!(unpack(handle), (index, generation));
         }
+    }
+
+    // 2026-06-05: the snapshot walk the renderer reads each frame. These tests exercise it against
+    // the live process-global slab (no VM/display), proving pre-order + depth + that a stale/empty
+    // root yields an empty snapshot (never UB / never the wrong subtree). `set_active_root(0)` is
+    // restored after each so the global cell does not leak into other tests (order-independent).
+    #[test]
+    fn snapshot_tree_walks_preorder_with_depth() {
+        // root[FrameLayout] → child0[TextView "hello"], child1[LinearLayout] → grandchild[TextView "x"]
+        let grandchild = allocate("android.widget.TextView").expect("alloc grandchild");
+        with_view(grandchild, |s| s.text = Some("x".to_owned())).expect("text grandchild");
+        let child0 = allocate("android.widget.TextView").expect("alloc child0");
+        with_view(child0, |s| s.text = Some("hello".to_owned())).expect("text child0");
+        let child1 = allocate("android.widget.LinearLayout").expect("alloc child1");
+        with_view(child1, |s| s.children.push(grandchild)).expect("wire grandchild");
+        let root = allocate("android.widget.FrameLayout").expect("alloc root");
+        with_view(root, |s| {
+            s.children.push(child0);
+            s.children.push(child1);
+        })
+        .expect("wire children");
+
+        set_active_root(root);
+        let snap = snapshot_tree();
+        set_active_root(0);
+
+        // Pre-order, left-to-right: root, child0, child1, grandchild.
+        let names: Vec<_> = snap.iter().map(|n| n.class_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "android.widget.FrameLayout",
+                "android.widget.TextView",
+                "android.widget.LinearLayout",
+                "android.widget.TextView",
+            ]
+        );
+        let depths: Vec<_> = snap.iter().map(|n| n.depth).collect();
+        assert_eq!(depths, vec![0, 1, 1, 2]);
+        assert_eq!(snap[1].text.as_deref(), Some("hello"));
+        assert_eq!(snap[3].text.as_deref(), Some("x"));
+
+        for h in [grandchild, child0, child1, root] {
+            free(h).expect("free");
+        }
+    }
+
+    #[test]
+    fn snapshot_tree_empty_when_no_or_stale_root() {
+        set_active_root(0);
+        assert!(snapshot_tree().is_empty(), "no root → empty snapshot");
+
+        let h = allocate("android.widget.FrameLayout").expect("alloc");
+        free(h).expect("free");
+        // h is now stale; publishing it must yield an empty snapshot, never a wrong/aliased subtree.
+        set_active_root(h);
+        assert!(
+            snapshot_tree().is_empty(),
+            "stale root handle → empty snapshot (no UB)"
+        );
+        set_active_root(0);
     }
 }

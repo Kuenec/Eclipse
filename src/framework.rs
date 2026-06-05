@@ -3191,6 +3191,9 @@ extern "system" fn window_set_widget_as_root<'local>(
     env.with_env(|_env| -> jni::errors::Result<()> {
         // Validate the view handle (the root) before recording it as the window's root edge.
         let view_ok = view_registry::with_view(widget, |_v| ()).is_ok();
+        // Publish the content-root handle so the renderer's per-frame snapshot draws this subtree
+        // (the single source of truth for "what is on screen"); clear it if the view handle is bad.
+        view_registry::set_active_root(if view_ok { widget } else { 0 });
         match window_registry::with_window(native_window, |w| {
             // The window's "children" is its single content root; replace any prior root.
             w.root_view = if view_ok { Some(widget) } else { None };

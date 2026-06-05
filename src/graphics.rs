@@ -42,6 +42,13 @@ use winit::window::{Window, WindowId};
 /// distinct from black so a working present is visually unambiguous on the dev host.
 const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
 
+/// 2026-06-05: precompiled SPIR-V for the colored-quad pipeline (`shaders/quad.{vert,frag}`),
+/// embedded so the build needs no shader compiler and no network (portability §9 — builds from a
+/// clean checkout anywhere). Regenerate via `shaders/README.md`. SPIR-V is a stream of `u32` words,
+/// so the byte length is a multiple of 4 — checked at module-create time via `read_spirv`.
+const QUAD_VERT_SPV: &[u8] = include_bytes!("../shaders/quad.vert.spv");
+const QUAD_FRAG_SPV: &[u8] = include_bytes!("../shaders/quad.frag.spv");
+
 /// The host game window + event loop (winit application state).
 struct GameWindow {
     title: String,
@@ -199,6 +206,168 @@ fn choose_image_count(caps: &vk::SurfaceCapabilitiesKHR) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// View-tree draw: layout + colored-quad geometry (2026-06-05)
+//
+// The framework records the inflated View tree in `framework::view_registry`
+// (`snapshot_tree()` → a flat depth-first `Vec<RenderNode>`). To make that content VISIBLE in the
+// swapchain we (1) assign each node a screen rect (a MINIMAL layout — a vertical stack, indented by
+// nesting depth), then (2) emit two triangles per rect as `QuadVertex`es the quad pipeline draws.
+//
+// This layout is intentionally minimal and documented as such: real measure/layout per
+// `LayoutParams`/gravity/weight (the recorded params were no-op stubs) is a follow-up. The goal of
+// this increment is a visible, non-blank rendering of the recorded tree shape + text, not a faithful
+// Android layout engine. The functions here do NO Vulkan work so they are unit-testable without a GPU.
+// ---------------------------------------------------------------------------------------------
+
+use crate::framework::view_registry::RenderNode;
+
+/// One vertex for the colored-quad pipeline: a position already in Vulkan NDC (x,y ∈ [-1,1], y down)
+/// plus an RGBA color. `#[repr(C)]` so the in-memory layout matches the vertex input description the
+/// pipeline declares (pos at offset 0, color at offset 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QuadVertex {
+    pos: [f32; 2],
+    color: [f32; 4],
+}
+
+/// A laid-out view: its pixel rect in the swapchain + a fill color + the (optional) text to draw.
+///
+/// Pixel coordinates with the origin at the top-left (Android/winit convention); converted to NDC by
+/// [`pixel_rect_to_quad`]. Kept separate from [`QuadVertex`] so the layout pass is GPU-free.
+#[derive(Debug, Clone, PartialEq)]
+struct LaidOutView {
+    /// Top-left x in pixels.
+    x: f32,
+    /// Top-left y in pixels.
+    y: f32,
+    /// Width in pixels.
+    w: f32,
+    /// Height in pixels.
+    h: f32,
+    /// Fill color (RGBA, 0..1).
+    color: [f32; 4],
+    /// The view's text, if any — drawn over the rect by the text pass (when present).
+    text: Option<String>,
+}
+
+/// Height in pixels of one stacked view row, and the padding/indent step. Small fixed values keep
+/// the minimal layout readable; a real layout pass replaces these with measured sizes.
+const ROW_HEIGHT_PX: f32 = 64.0;
+const ROW_GAP_PX: f32 = 8.0;
+const INDENT_PX: f32 = 24.0;
+const MARGIN_PX: f32 = 16.0;
+
+/// A small fixed palette so nested views are visually distinguishable by depth. Indexed by
+/// `depth % len`. Colors are mid-tones that read against the blue clear background.
+const DEPTH_PALETTE: [[f32; 4]; 4] = [
+    [0.93, 0.94, 0.96, 1.0], // depth 0: near-white container
+    [0.80, 0.85, 0.92, 1.0], // depth 1
+    [0.66, 0.74, 0.86, 1.0], // depth 2
+    [0.55, 0.64, 0.80, 1.0], // depth 3+
+];
+
+/// Assign each recorded view a screen rect via a MINIMAL vertical-stack layout against `extent`.
+///
+/// 2026-06-05: each node becomes one full-width (minus margins, minus a per-depth indent) row,
+/// stacked top-to-bottom in the snapshot's pre-order. This is deliberately not a faithful Android
+/// layout — `LayoutParams`/gravity/weight are ignored (they were no-op stubs in the framework) — it
+/// just turns the recorded tree shape + text into visible, depth-distinguished rectangles. Pure
+/// function (no Vulkan) so it is unit-testable without a GPU.
+fn layout_views(nodes: &[RenderNode], extent: vk::Extent2D) -> Vec<LaidOutView> {
+    let width = extent.width as f32;
+    let mut out = Vec::with_capacity(nodes.len());
+    let mut y = MARGIN_PX;
+    for node in nodes {
+        let indent = INDENT_PX * node.depth as f32;
+        let x = MARGIN_PX + indent;
+        // Clamp width so deep indents never produce a negative/zero width.
+        let w = (width - x - MARGIN_PX).max(1.0);
+        let color = DEPTH_PALETTE[(node.depth as usize).min(DEPTH_PALETTE.len() - 1)];
+        out.push(LaidOutView {
+            x,
+            y,
+            w,
+            h: ROW_HEIGHT_PX,
+            color,
+            text: node.text.clone(),
+        });
+        y += ROW_HEIGHT_PX + ROW_GAP_PX;
+    }
+    out
+}
+
+/// Convert a top-left-origin pixel rect into 6 [`QuadVertex`]es (two triangles) in Vulkan NDC.
+///
+/// Vulkan NDC has the origin at center, x right, **y down** (matching pixel space), so a pixel
+/// `p` maps to NDC `2*p/extent - 1` on each axis. Returns the triangles in the winding the pipeline
+/// expects (no face culling is enabled, so winding is not load-bearing, but kept consistent).
+fn pixel_rect_to_quad(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [f32; 4],
+    extent: vk::Extent2D,
+) -> [QuadVertex; 6] {
+    let ew = extent.width.max(1) as f32;
+    let eh = extent.height.max(1) as f32;
+    let to_ndc = |px: f32, py: f32| -> [f32; 2] { [2.0 * px / ew - 1.0, 2.0 * py / eh - 1.0] };
+    let tl = to_ndc(x, y);
+    let tr = to_ndc(x + w, y);
+    let bl = to_ndc(x, y + h);
+    let br = to_ndc(x + w, y + h);
+    let v = |pos: [f32; 2]| QuadVertex { pos, color };
+    // Triangle 1: tl, tr, br. Triangle 2: tl, br, bl.
+    [v(tl), v(tr), v(br), v(tl), v(br), v(bl)]
+}
+
+/// Build the full vertex buffer (CPU side) for a set of laid-out views: 6 vertices per quad, in
+/// order. Empty input → empty output (the draw pass then draws zero vertices). Pure/GPU-free.
+fn build_quad_vertices(views: &[LaidOutView], extent: vk::Extent2D) -> Vec<QuadVertex> {
+    let mut verts = Vec::with_capacity(views.len() * 6);
+    for v in views {
+        verts.extend_from_slice(&pixel_rect_to_quad(v.x, v.y, v.w, v.h, v.color, extent));
+    }
+    verts
+}
+
+/// Decode embedded SPIR-V bytes into the `u32` words `vkCreateShaderModule` requires.
+///
+/// Returns a typed error (never panics) if the blob length is not a multiple of 4 (not valid
+/// SPIR-V) — guarding the `include_bytes!` blobs against truncation/corruption. The words are read
+/// little-endian (the SPIR-V on-disk encoding `glslangValidator` emits on an LE host; Eclipse's
+/// targets — x86_64 / aarch64 — are little-endian, AGENTS.md §9).
+fn read_spirv(bytes: &[u8]) -> Result<Vec<u32>, GraphicsError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(GraphicsError::Vulkan(format!(
+            "embedded SPIR-V length {} is not a multiple of 4 (corrupt shader blob)",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Pick a memory type index that is HOST_VISIBLE|HOST_COHERENT and allowed by `type_filter` (the
+/// buffer's `memoryTypeBits`). Host-coherent means CPU writes are visible to the GPU without an
+/// explicit flush — the simplest correct path for the small, per-frame-rewritten vertex buffer.
+/// Free function (no device calls) so it is unit-testable with a synthetic memory-properties table.
+fn find_host_visible_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+) -> Option<u32> {
+    let needed = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    (0..props.memory_type_count).find(|&i| {
+        let supported = (type_filter & (1 << i)) != 0;
+        let flags = props.memory_types[i as usize].property_flags;
+        supported && flags.contains(needed)
+    })
+}
+
 /// The per-swapchain resources that must be rebuilt on resize / out-of-date. Kept separate from
 /// the device-lifetime objects in [`VulkanRenderer`] so a resize recreates only these.
 struct Swapchain {
@@ -232,6 +401,18 @@ struct VulkanRenderer {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
+
+    // The colored-quad pipeline for drawing the recorded View tree (2026-06-05). The pipeline uses
+    // dynamic viewport+scissor so it survives swapchain resize without rebuilding.
+    quad_pipeline_layout: vk::PipelineLayout,
+    quad_pipeline: vk::Pipeline,
+    /// Host-visible vertex buffer holding the current frame's quads, grown on demand. `capacity` is
+    /// in vertices; `0`/`null` until the first frame with content allocates it.
+    quad_vertex_buffer: vk::Buffer,
+    quad_vertex_memory: vk::DeviceMemory,
+    quad_vertex_capacity: u32,
+    /// Memory properties (for choosing a host-visible|coherent memory type for the vertex buffer).
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
 
     // Swapchain-lifetime objects (rebuilt on resize).
     swapchain: Swapchain,
@@ -394,6 +575,9 @@ impl VulkanRenderer {
                 swapchain,
                 swapchain_format,
                 swapchain_extent,
+                quad_pipeline_layout,
+                quad_pipeline,
+                memory_properties,
             )) => Ok(Self {
                 _entry: entry,
                 instance,
@@ -412,6 +596,12 @@ impl VulkanRenderer {
                 swapchain,
                 swapchain_format,
                 swapchain_extent,
+                quad_pipeline_layout,
+                quad_pipeline,
+                quad_vertex_buffer: vk::Buffer::null(),
+                quad_vertex_memory: vk::DeviceMemory::null(),
+                quad_vertex_capacity: 0,
+                memory_properties,
                 needs_recreate: false,
             }),
             Err(e) => {
@@ -492,6 +682,160 @@ impl VulkanRenderer {
         })
     }
 
+    /// Create the colored-quad graphics pipeline (+ its empty pipeline layout) for `render_pass`.
+    ///
+    /// Uses the embedded SPIR-V ([`QUAD_VERT_SPV`]/[`QUAD_FRAG_SPV`]), a single vertex binding
+    /// matching [`QuadVertex`] (`vec2` pos @0, `vec4` color @8), a triangle-list topology, no
+    /// culling, alpha blending (so text-over-quad later composites), and **dynamic** viewport +
+    /// scissor (so a swapchain resize needs no pipeline rebuild). Returns `(layout, pipeline)` or a
+    /// typed error after destroying any partial objects (the shader modules are always freed).
+    fn create_quad_pipeline(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), GraphicsError> {
+        let vert_words = read_spirv(QUAD_VERT_SPV)?;
+        let frag_words = read_spirv(QUAD_FRAG_SPV)?;
+
+        // SAFETY: `device` is valid; the create-info borrows the word slices for the call only.
+        let make_module = |words: &[u32]| -> Result<vk::ShaderModule, GraphicsError> {
+            let info = vk::ShaderModuleCreateInfo::default().code(words);
+            unsafe { device.create_shader_module(&info, None) }
+                .map_err(|e| GraphicsError::Vulkan(format!("vkCreateShaderModule: {e}")))
+        };
+        let vert_module = make_module(&vert_words)?;
+        let frag_module = match make_module(&frag_words) {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: vert_module is valid and unused; free it before bailing.
+                unsafe { device.destroy_shader_module(vert_module, None) };
+                return Err(e);
+            }
+        };
+
+        // The pipeline + its modules are built inside this closure so BOTH shader modules are freed
+        // exactly once on every path (success or failure) — they are not needed after creation.
+        let result = Self::build_quad_pipeline_inner(device, render_pass, vert_module, frag_module);
+        // SAFETY: both modules are valid handles created above; destroy each exactly once. The
+        // pipeline (on success) retains the compiled code, so freeing the modules now is correct.
+        unsafe {
+            device.destroy_shader_module(frag_module, None);
+            device.destroy_shader_module(vert_module, None);
+        }
+        result
+    }
+
+    /// Inner pipeline assembly (shader modules already created; freed by the caller). Split out so
+    /// the caller can free the modules on every path without duplicating the free in each branch.
+    fn build_quad_pipeline_inner(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        vert_module: vk::ShaderModule,
+        frag_module: vk::ShaderModule,
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), GraphicsError> {
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert_module)
+                .name(entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag_module)
+                .name(entry),
+        ];
+
+        // One vertex binding == sizeof(QuadVertex); two attributes (pos vec2 @0, color vec4 @8).
+        let binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<QuadVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX);
+        let attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(std::mem::size_of::<[f32; 2]>() as u32),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding))
+            .vertex_attribute_descriptions(&attributes);
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        // Dynamic viewport + scissor: one of each, set at record time (so resize needs no rebuild).
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        // Standard straight-alpha blending so a later text pass can composite over the quads.
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(std::slice::from_ref(&blend_attachment));
+
+        // No descriptors/push-constants for the quad pipeline (color is per-vertex).
+        let layout_info = vk::PipelineLayoutCreateInfo::default();
+        // SAFETY: `device` is valid; `layout_info` outlives the call.
+        let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreatePipelineLayout: {e}")))?;
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+        // SAFETY: all referenced objects are valid and outlive the call. `create_graphics_pipelines`
+        // returns `Err((pipelines, result))`; on failure the partial vec holds no valid handle to free.
+        let pipeline = match unsafe {
+            device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&pipeline_info),
+                None,
+            )
+        } {
+            Ok(p) => p[0],
+            Err((_, e)) => {
+                // SAFETY: the layout is valid and was created above; free it before bailing.
+                unsafe { device.destroy_pipeline_layout(pipeline_layout, None) };
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkCreateGraphicsPipelines: {e}"
+                )));
+            }
+        };
+        Ok((pipeline_layout, pipeline))
+    }
+
     /// Create the device-lifetime objects (queue, swapchain loader, render pass, command pool +
     /// buffer, sync primitives) and the first swapchain. Returned as a tuple so [`Self::build`]
     /// can destroy `device` if any step fails without partially-initializing `self`.
@@ -518,12 +862,18 @@ impl VulkanRenderer {
             Swapchain,
             vk::Format,
             vk::Extent2D,
+            vk::PipelineLayout,
+            vk::Pipeline,
+            vk::PhysicalDeviceMemoryProperties,
         ),
         GraphicsError,
     > {
         // SAFETY: queue family index was validated by `pick_device`; queue 0 always exists when
         // the family was requested with one priority.
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+        // Memory properties (for the vertex buffer's host-visible allocation). SAFETY: reads only.
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let swapchain_loader = khr::swapchain::Device::new(instance, device);
 
         // Choose the surface format up-front (the render pass color attachment must match it).
@@ -672,6 +1022,25 @@ impl VulkanRenderer {
             }
         };
 
+        // The colored-quad pipeline. Created LAST so no later error path needs to free it; on its
+        // own failure, free everything created above (reverse order) before returning the error.
+        let (quad_pipeline_layout, quad_pipeline) =
+            match Self::create_quad_pipeline(device, render_pass) {
+                Ok(p) => p,
+                Err(e) => {
+                    // SAFETY: every handle below is valid and owned here; freed once, reverse order.
+                    unsafe {
+                        device.destroy_semaphore(image_available, None);
+                        device.destroy_semaphore(render_finished, None);
+                        device.destroy_fence(in_flight, None);
+                        device.destroy_command_pool(command_pool, None);
+                        swapchain.destroy(device, &swapchain_loader);
+                        device.destroy_render_pass(render_pass, None);
+                    }
+                    return Err(e);
+                }
+            };
+
         Ok((
             queue,
             swapchain_loader,
@@ -684,6 +1053,9 @@ impl VulkanRenderer {
             swapchain,
             surface_format.format,
             extent,
+            quad_pipeline_layout,
+            quad_pipeline,
+            memory_properties,
         ))
     }
 
@@ -909,7 +1281,22 @@ impl VulkanRenderer {
                 .map_err(|e| GraphicsError::Vulkan(format!("reset_fences: {e}")))?;
         }
 
-        self.record_clear(image_index as usize)?;
+        // Read the framework's recorded View tree, lay it out against the current extent, and upload
+        // the per-view quads. The fence above guarantees the previous frame's GPU read of the vertex
+        // buffer has completed, so re-uploading here is safe. An empty tree → 0 vertices → clear-only.
+        let nodes = crate::framework::view_registry::snapshot_tree();
+        let views = layout_views(&nodes, self.swapchain.extent);
+        let verts = build_quad_vertices(&views, self.swapchain.extent);
+        let vertex_count = self.upload_vertices(&verts)?;
+        if vertex_count > 0 {
+            tracing::trace!(
+                views = views.len(),
+                quads = vertex_count / 6,
+                "drawing recorded View tree into the swapchain"
+            );
+        }
+
+        self.record_draw(image_index as usize, vertex_count)?;
 
         let wait_semaphores = [self.image_available];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -956,8 +1343,116 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    /// Record the clear-only render pass into the (reset) command buffer for `image_index`.
-    fn record_clear(&self, image_index: usize) -> Result<(), GraphicsError> {
+    /// Ensure the host-visible vertex buffer can hold `needed` vertices, (re)allocating it (larger)
+    /// when it cannot, then copy `verts` into it. Returns the number of vertices uploaded.
+    ///
+    /// 2026-06-05: safe to reallocate/overwrite each frame because [`Self::draw_frame`] already
+    /// waited on `in_flight` (single frame in flight) before calling this — the previous frame's GPU
+    /// read of this buffer has completed, so no in-use memory is freed/overwritten. Host-coherent
+    /// memory means the mapped write is visible to the GPU without an explicit flush. An empty
+    /// `verts` uploads nothing and returns 0 (the draw then issues no `cmd_draw`).
+    fn upload_vertices(&mut self, verts: &[QuadVertex]) -> Result<u32, GraphicsError> {
+        let count: u32 = verts.len().try_into().map_err(|_| {
+            GraphicsError::Vulkan("too many quad vertices for one frame".to_owned())
+        })?;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // Grow (never shrink) the buffer when the current capacity is too small. Allocate a fresh
+        // buffer+memory and free the old one (GPU idle for this buffer per the fn contract).
+        if count > self.quad_vertex_capacity {
+            let size =
+                (count as vk::DeviceSize) * std::mem::size_of::<QuadVertex>() as vk::DeviceSize;
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: `device` valid; `buffer_info` outlives the call.
+            let buffer = unsafe { self.device.create_buffer(&buffer_info, None) }
+                .map_err(|e| GraphicsError::Vulkan(format!("vkCreateBuffer (vertex): {e}")))?;
+            // SAFETY: `buffer` was just created from `device`.
+            let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+            let mem_type =
+                find_host_visible_memory_type(&self.memory_properties, req.memory_type_bits)
+                    .ok_or_else(|| {
+                        // SAFETY: `buffer` is valid and unbound; free it before bailing.
+                        unsafe { self.device.destroy_buffer(buffer, None) };
+                        GraphicsError::Vulkan(
+                            "no HOST_VISIBLE|HOST_COHERENT memory type for the vertex buffer"
+                                .to_owned(),
+                        )
+                    })?;
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            // SAFETY: `alloc_info` outlives the call; `mem_type` satisfies `buffer`'s requirements.
+            let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
+                Ok(m) => m,
+                Err(e) => {
+                    // SAFETY: `buffer` is valid and unbound; free it before bailing.
+                    unsafe { self.device.destroy_buffer(buffer, None) };
+                    return Err(GraphicsError::Vulkan(format!(
+                        "vkAllocateMemory (vertex): {e}"
+                    )));
+                }
+            };
+            // SAFETY: `buffer`+`memory` are valid; bind at offset 0 (whole allocation for this buffer).
+            if let Err(e) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+                // SAFETY: both handles are valid and owned here; free them before bailing.
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_buffer(buffer, None);
+                }
+                return Err(GraphicsError::Vulkan(format!("vkBindBufferMemory: {e}")));
+            }
+
+            // Free the previous buffer (if any) — the GPU finished reading it (fence waited).
+            // SAFETY: prior handles are either null (no-op-guarded below) or valid+idle; freed once.
+            unsafe {
+                if self.quad_vertex_buffer != vk::Buffer::null() {
+                    self.device.destroy_buffer(self.quad_vertex_buffer, None);
+                }
+                if self.quad_vertex_memory != vk::DeviceMemory::null() {
+                    self.device.free_memory(self.quad_vertex_memory, None);
+                }
+            }
+            self.quad_vertex_buffer = buffer;
+            self.quad_vertex_memory = memory;
+            self.quad_vertex_capacity = count;
+        }
+
+        // Map, copy, unmap. The buffer is host-coherent so no explicit flush is needed.
+        let copy_bytes =
+            (count as vk::DeviceSize) * std::mem::size_of::<QuadVertex>() as vk::DeviceSize;
+        // SAFETY: `quad_vertex_memory` is a valid host-visible allocation ≥ `copy_bytes`; we map the
+        // exact range we write, copy `count` `QuadVertex`es (the source slice has `count` elements),
+        // then unmap. No aliasing: the GPU is not reading this buffer (fence waited) during the copy.
+        unsafe {
+            let ptr = self
+                .device
+                .map_memory(
+                    self.quad_vertex_memory,
+                    0,
+                    copy_bytes,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(|e| GraphicsError::Vulkan(format!("vkMapMemory (vertex): {e}")))?;
+            std::ptr::copy_nonoverlapping(
+                verts.as_ptr() as *const u8,
+                ptr as *mut u8,
+                copy_bytes as usize,
+            );
+            self.device.unmap_memory(self.quad_vertex_memory);
+        }
+        Ok(count)
+    }
+
+    /// Record the render pass for `image_index`: clear to [`CLEAR_COLOR`], then (when there are
+    /// vertices) bind the quad pipeline + vertex buffer, set the dynamic viewport+scissor to the
+    /// current extent, and draw the laid-out View-tree quads. A `vertex_count` of `0` is the
+    /// clear-only path (no content recorded yet) — identical to the previous foundation behavior.
+    fn record_draw(&self, image_index: usize, vertex_count: u32) -> Result<(), GraphicsError> {
         let cmd = self.command_buffer;
         // SAFETY: the command buffer was allocated with RESET_COMMAND_BUFFER; reset then begin.
         unsafe {
@@ -984,11 +1479,35 @@ impl VulkanRenderer {
                 extent: self.swapchain.extent,
             })
             .clear_values(&clear);
-        // SAFETY: framebuffer index is in range (acquired image), render pass + cmd are valid.
+        // SAFETY: framebuffer index is in range (acquired image), render pass + cmd are valid. The
+        // CLEAR load-op paints CLEAR_COLOR; the quad draw (if any) then composites on top.
         unsafe {
             self.device
                 .cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
-            // Clear-only: no draw calls. The CLEAR load-op paints CLEAR_COLOR; STORE keeps it.
+            if vertex_count > 0 {
+                let extent = self.swapchain.extent;
+                let viewport = vk::Viewport::default()
+                    .x(0.0)
+                    .y(0.0)
+                    .width(extent.width as f32)
+                    .height(extent.height as f32)
+                    .min_depth(0.0)
+                    .max_depth(1.0);
+                let scissor = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                };
+                self.device.cmd_set_viewport(cmd, 0, &[viewport]);
+                self.device.cmd_set_scissor(cmd, 0, &[scissor]);
+                self.device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.quad_pipeline,
+                );
+                self.device
+                    .cmd_bind_vertex_buffers(cmd, 0, &[self.quad_vertex_buffer], &[0]);
+                self.device.cmd_draw(cmd, vertex_count, 1, 0, 0);
+            }
             self.device.cmd_end_render_pass(cmd);
             self.device
                 .end_command_buffer(cmd)
@@ -1032,6 +1551,18 @@ impl Drop for VulkanRenderer {
             self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_command_pool(self.command_pool, None);
+            // The quad pipeline + its vertex buffer/memory (device children; freed before the device).
+            // The buffer/memory may be null if no frame ever recorded content — destroy_* is a no-op
+            // on a null handle, but guard anyway to be explicit.
+            self.device.destroy_pipeline(self.quad_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.quad_pipeline_layout, None);
+            if self.quad_vertex_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.quad_vertex_buffer, None);
+            }
+            if self.quad_vertex_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.quad_vertex_memory, None);
+            }
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_device(None);
@@ -1163,5 +1694,134 @@ mod tests {
         assert_eq!(choose_image_count(&caps(3, 3, 800, 600)), 3);
         // max==0 means "no limit" → min+1 unclamped.
         assert_eq!(choose_image_count(&caps(2, 0, 800, 600)), 3);
+    }
+
+    // 2026-06-05: View-tree draw — layout + quad geometry. GPU-free (no device), so these run in the
+    // normal `cargo test` harness and guard the rect/NDC/vertex math the renderer feeds the pipeline.
+
+    fn node(class: &str, text: Option<&str>, depth: u32) -> RenderNode {
+        RenderNode {
+            class_name: class.to_owned(),
+            text: text.map(str::to_owned),
+            depth,
+        }
+    }
+
+    #[test]
+    fn layout_stacks_rows_and_indents_by_depth() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let nodes = [
+            node("android.widget.FrameLayout", None, 0),
+            node("android.widget.TextView", Some("hello"), 1),
+        ];
+        let views = layout_views(&nodes, extent);
+        assert_eq!(views.len(), 2);
+
+        // Row 0: top margin, no indent, full width minus both margins.
+        assert_eq!(views[0].x, MARGIN_PX);
+        assert_eq!(views[0].y, MARGIN_PX);
+        assert_eq!(views[0].w, 800.0 - 2.0 * MARGIN_PX);
+        assert_eq!(views[0].h, ROW_HEIGHT_PX);
+
+        // Row 1: stacked below row 0 (by ROW_HEIGHT + gap), indented one step, narrower by the indent.
+        assert_eq!(views[1].y, MARGIN_PX + ROW_HEIGHT_PX + ROW_GAP_PX);
+        assert_eq!(views[1].x, MARGIN_PX + INDENT_PX);
+        assert_eq!(views[1].w, 800.0 - (MARGIN_PX + INDENT_PX) - MARGIN_PX);
+        assert_eq!(views[1].text.as_deref(), Some("hello"));
+
+        // Deeper rows are visually distinct (palette differs by depth).
+        assert_ne!(views[0].color, views[1].color);
+    }
+
+    #[test]
+    fn layout_clamps_width_to_at_least_one_for_deep_indent() {
+        // A tiny window with a deep node must never produce a <= 0 width (would be an invalid quad).
+        let extent = vk::Extent2D {
+            width: 40,
+            height: 600,
+        };
+        let nodes = [node("android.widget.View", None, 100)];
+        let views = layout_views(&nodes, extent);
+        assert!(
+            views[0].w >= 1.0,
+            "width must clamp to >= 1, got {}",
+            views[0].w
+        );
+    }
+
+    #[test]
+    fn empty_tree_produces_no_geometry() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        assert!(layout_views(&[], extent).is_empty());
+        assert!(build_quad_vertices(&[], extent).is_empty());
+    }
+
+    #[test]
+    fn pixel_rect_maps_corners_to_expected_ndc() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        // A rect filling the whole surface maps its corners to NDC [-1,-1] (top-left) .. [1,1] (br).
+        let q = pixel_rect_to_quad(0.0, 0.0, 800.0, 600.0, [1.0; 4], extent);
+        // First vertex is the top-left corner.
+        assert_eq!(q[0].pos, [-1.0, -1.0]);
+        // Third vertex is the bottom-right corner.
+        assert_eq!(q[2].pos, [1.0, 1.0]);
+        // A centered point maps to NDC origin.
+        let mid = pixel_rect_to_quad(400.0, 300.0, 0.0, 0.0, [0.0; 4], extent);
+        assert_eq!(mid[0].pos, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn build_quad_vertices_emits_six_per_view() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let views = layout_views(
+            &[node("a", None, 0), node("b", None, 1), node("c", None, 2)],
+            extent,
+        );
+        let verts = build_quad_vertices(&views, extent);
+        assert_eq!(verts.len(), 3 * 6, "six vertices (two triangles) per view");
+        // Each view's six vertices share its fill color.
+        assert!(verts[0..6].iter().all(|v| v.color == views[0].color));
+    }
+
+    #[test]
+    fn embedded_spirv_is_well_formed() {
+        // The embedded shader blobs must decode to u32 words (length multiple of 4) and start with
+        // the SPIR-V magic number 0x07230203 — guards against a truncated/corrupt `include_bytes!`.
+        for (name, spv) in [("vert", QUAD_VERT_SPV), ("frag", QUAD_FRAG_SPV)] {
+            let words = read_spirv(spv).unwrap_or_else(|e| panic!("{name} SPIR-V invalid: {e}"));
+            assert!(!words.is_empty(), "{name} SPIR-V is empty");
+            assert_eq!(words[0], 0x0723_0203, "{name} SPIR-V magic mismatch");
+        }
+    }
+
+    #[test]
+    fn host_visible_memory_type_selected_by_flags_and_filter() {
+        let mut props = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            ..Default::default()
+        };
+        // type 0: device-local only (not host visible). type 1: host visible+coherent. type 2: same.
+        props.memory_types[0].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        props.memory_types[1].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        props.memory_types[2].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // Filter allowing only type 0 and 2 → must pick type 2 (the host-visible one in the filter).
+        let filter = 0b101;
+        assert_eq!(find_host_visible_memory_type(&props, filter), Some(2));
+        // Filter allowing only the device-local type → None.
+        assert_eq!(find_host_visible_memory_type(&props, 0b001), None);
     }
 }
