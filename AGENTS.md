@@ -164,7 +164,7 @@ before any history-rewriting/force operation.
   (address + multi-bitmap, advancing the cursor), and documents `BIND_NOW` = the eager `JUMP_SLOT`
   resolution it already does — over a safe `&mut [u8]` `RelocImage` (`#![forbid(unsafe_code)]`, all
   writes bounds-checked → typed `RelocError`, never UB). Exhaustive type dispatch: unknown type →
-  `RelocError::UnsupportedType` (the apkenv `unknown reloc type` abort, now a clean error). 16 unit
+  `RelocError::UnsupportedType` (the apkenv `unknown reloc type` abort, now a clean error). 15 unit
   tests over hand-built fixtures (gate now **226 unit + 2 doctests**). This is the **standalone,
   unit-tested core ONLY** — it does NOT parse ELF, mmap, allocate the static-TLS block / set up
   `%fs`, resolve real cross-lib symbols, model the bionic two-namespace scope, or touch the apkenv
@@ -687,7 +687,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `GLOB_DAT`/`JUMP_SLOT`/`64`/**`TPOFF64` (type 18, the apkenv wall)** from `.rela.dyn`/`.rela.plt`, decodes
   the **`DT_RELR`** compressed-relative bitmap (address + multi-bitmap, cursor-advance), documents `BIND_NOW`
   = the eager `JUMP_SLOT` resolution it already does; all writes bounds-checked → typed `RelocError` (unknown
-  type → `UnsupportedType`, never UB / never the apkenv `abort`). 16 GPU/VM-free unit tests prove each type +
+  type → `UnsupportedType`, never UB / never the apkenv `abort`). 15 GPU/VM-free unit tests prove each type +
   RELR fixtures + OOB/unresolved/unsupported error paths + exhaustive dispatch. Grounded ONLY in the public
   x86-64 psABI + Eclipse's own `src/` + docs. **This is the standalone reloc CORE only.**
   🟠 **NEXT (loader build, main-loop / dev-host — consumes `src/loader/reloc.rs`):** build the rest of the
@@ -2475,6 +2475,39 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `DrawnCanvas`, `is_custom_view_class`, composite-quad geometry, RGBA upload size + straight-RGBA byte order,
   composite SPIR-V). No new deps (reuses tiny-skia + ash). Files: `src/framework.rs`, `src/graphics.rs`,
   `shaders/composite.{vert,frag}{,.spv}`, `shaders/README.md`.
+- **2026-06-05** — 🟢 **ENGINE-LOAD: the durable Rust bionic-loader's RELOCATION CORE is built + unit-tested**
+  (the modern relocations the apkenv-era C shim linker lacks — the #1 frontier's first self-contained,
+  GPU/VM-free, unit-testable piece; `docs/bionic-loader-strategy.md` §1–3). **What:** new `src/loader.rs`
+  (`pub mod reloc`) + `src/loader/reloc.rs` — a **pure-Rust x86-64 ELF relocation applier** over a
+  `RelocImage` trait whose concrete `SliceImage` is a **safe `&mut [u8]`** (`#![forbid(unsafe_code)]`: no
+  unsafe, no raw pointers — every read/write is slice-indexed + bounds-checked → typed `RelocError`, never
+  UB; AGENTS.md §2.3). Applies the exact types that wall `libroblox.so`: `R_X86_64_RELATIVE`(8)=`base+addend`,
+  `GLOB_DAT`(6)/`JUMP_SLOT`(7)=`sym`, `R_X86_64_64`(1)=`sym+addend`, **`R_X86_64_TPOFF64`(18)** =
+  `static_tls_offset + sym_tls_offset + addend` (the `unknown reloc type 18` the apkenv linker `abort`ed on),
+  from `.rela.dyn`/`.rela.plt`; decodes **`DT_RELR`** (the standard compressed-relative bitmap: even word =
+  address advancing the cursor + relocated, odd word = bitmap relocating the 63-word run per set data bit,
+  cursor += 63 words after each bitmap); documents **`BIND_NOW`** = the eager `JUMP_SLOT` resolution the
+  applier already does (apply `.rela.plt` alongside `.rela.dyn`; no lazy path). **Static-TLS model (documented):**
+  the applier takes the module's tp-relative `static_tls_offset` + the symbol's within-block TLS offset (via
+  `SymbolResolver`) as INPUTS and only applies the reloc; the static-TLS-block ALLOCATION + `%fs`/TCB setup
+  (host-glibc-interop) is a SEPARATE later loader step. **Exhaustive dispatch:** any unhandled type →
+  `RelocError::UnsupportedType(n)` (a clean typed error, not the apkenv abort). **Tests (15, GPU/VM-free, over
+  hand-built in-memory fixtures):** RELATIVE→base+addend; GLOB_DAT/JUMP_SLOT→sym (addend ignored); 64→sym+addend;
+  TPOFF64→tp-off+sym-off+addend (verified == the expected negative offset); RELR single-address, exact-set-bits
+  bitmap, and multi-bitmap + address-advance + 63-word cursor advance; OOB offset (incl. straddling end) →
+  typed `OutOfBounds` with NO write; below-base RELR address → `RelrAddressInvalid`; unresolved symbol → typed
+  err; `apply_rela` stops at the first error (good entry applied, bad not); and an **exhaustiveness guard** that
+  every supported type dispatches + a representative unknown type → `UnsupportedType` (the regression guard tied
+  to the apkenv `unknown reloc type` abort). **Scope (honest):** standalone reloc CORE only — does NOT parse ELF,
+  mmap, allocate the TLS block / set `%fs`, resolve real cross-lib symbols, model the bionic two-namespace scope,
+  or touch the apkenv linker; the next loader steps (ELF parse → mmap → TLS-block+TP setup → real
+  `SymbolResolver`/scope → wire/augment vs apkenv, main-loop only) build on it and use it as their conformance
+  target (§5 next-actions). **Grounding (cyber-safeguard honored):** written from the public x86-64 psABI / ELF
+  relocation semantics + Eclipse's own `src/` + `docs/` ONLY — **no linker source was read**; this is WRITING
+  Eclipse's own from-scratch Rust loader code, not reading the apkenv linker. **Gate:** `cargo fmt --all` +
+  `build --all-targets` + `clippy --all-targets --all-features -D warnings` + `test` (**226 unit + 2 doctests**)
+  + `build --release` all 0-warning/0-error. No new deps (std-only). Files: `src/loader.rs`, `src/loader/reloc.rs`,
+  `src/lib.rs` (`pub mod loader;`).
 
 ---
 
