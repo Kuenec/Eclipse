@@ -560,14 +560,27 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (pipeline+layout+vertex buffer/memory freed in `Drop` after `device_wait_idle`; no leaks/UB). GPU-free unit
   tests cover layout (stack/indent/clamp), pixel→NDC, 6-verts-per-quad, SPIR-V well-formedness, host-visible
   memory selection, and the snapshot walk (pre-order/depth, stale-root→empty). **119 unit + 2 doctests pass.**
-  🔜 **IMMEDIATE FRONTIER (2026-06-05): TEXT — rasterize each TextView's text into the quads.** The quad draw
-  proves the pipeline path end-to-end; the next step is a **font + glyph atlas**: load a system TTF portably
-  (`fc-match`/known `/usr/share/fonts` paths — detect, don't hardcode), rasterize with **ab_glyph** (API
-  confirmed via Context7) into an **R8** atlas texture, add a textured-quad pipeline (sampler + descriptor set)
-  and draw each `RenderNode.text` over its view rect. Then `onStart`/`onResume` if the demo needs it. For Roblox
-  specifically, the engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel track, and
-  the engine will eventually render into THIS window's swapchain via WSI translation. Stay non-GTK; validate via
-  dev-host `eclipse run`.
+  ✅ **DONE 2026-06-05: TEXT is now RASTERIZED + DRAWN over the quads (font + R8 glyph atlas + textured pipeline).**
+  Added `ab_glyph 0.2` (pure-Rust glyph rasterizer). A system TTF is found portably at runtime (`fc-match` for
+  `sans-serif`, then known `/usr/share/fonts`-style dirs, `ECLIPSE_FONT` override — detect-don't-assume §9, never
+  hardcoding/linking fontconfig; no font → text disabled, quads still draw, no crash). Printable ASCII (32..126)
+  is rasterized ONCE into a single **R8 coverage atlas** (shelf-packed) uploaded to a GPU image (staging buffer +
+  one-time transition UNDEFINED→TRANSFER_DST→SHADER_READ_ONLY); a **textured-glyph pipeline** (embedded SPIR-V
+  `shaders/text.*`, combined-image-sampler descriptor set + a `vec4` push-constant text color, alpha blend,
+  dynamic viewport/scissor) draws each `RenderNode.text`'s glyphs over its view rect (per-frame text vertex
+  buffer, same in-flight-fence safety as the quads). All handles freed in `Drop` via `TextRenderer::destroy`.
+  **FAITHFUL status — VALIDATED on the demo** (`/tmp/eclipse-render.log`): `text: discovered system font + built
+  R8 glyph atlas font=/usr/share/fonts/noto/NotoSans-Regular.ttf atlas_w=1015 atlas_h=28 glyphs=95`, then
+  `drawing recorded View tree into the swapchain views=4 quads=4 glyphs=31` for **8601 frames over 60 s** with
+  **zero VK_ERROR/panic/validation/draw-failed** — the demo's TextView text is rasterized + drawn over the
+  depth-colored view quads. GPU-free unit tests: text-vertices (6/visible-glyph, skip whitespace/unknown/no-text),
+  device-local memory selection, and a font-present-guarded atlas build. **122 unit + 2 doctests pass.**
+  🔜 **IMMEDIATE FRONTIER (2026-06-05): a faithful layout pass + `onStart`/`onResume`.** The minimal vertical-stack
+  layout makes the tree visible but ignores `LayoutParams`/gravity/weight (those view natives are no-op stubs);
+  the next refinement is a real measure/layout pass (and implementing those natives to record sizes/gravity).
+  Then `onStart`/`onResume` if the demo needs it. For Roblox specifically, the engine-load bionic-shim work
+  (Section B of the dev-host runbook) is the parallel track, and the engine will eventually render into THIS
+  window's swapchain via WSI translation. Stay non-GTK; validate via dev-host `eclipse run`.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -1757,6 +1770,38 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (pipeline/vertex-input/vertex-buffer/`cmd_draw`/dynamic-state) + `/alexheretic/ab-glyph` (FontRef/outline_glyph/
   draw/ScaleFont — for the deferred text step). Cyber-safeguard did NOT trip (Eclipse's own graphics + view_registry
   only — no bionic/JNI-C/content-res source read).
+- **2026-06-05** — 🟢 **TEXT drawn: portable font discovery + R8 glyph atlas + textured-glyph pipeline** (the
+  same-turn follow-up to the quad draw above; both validated on the demo). **What:** added **`ab_glyph 0.2`**
+  (pure-Rust rasterizer, no C/system font lib — §2.1; the font FILE is found at runtime, fontconfig is not linked).
+  `discover_font_path()` finds a usable TTF/OTF portably (detect-don't-assume §9): `ECLIPSE_FONT` override →
+  `fc-match --format=%{file} sans-serif` → a bounded scan of known font dirs (`/usr/share/fonts`, …, the flatpak
+  `/run/host/fonts`); no font → `Ok(None)`, text disabled, **quads still draw**, never a crash. `build_glyph_atlas`
+  rasterizes printable ASCII (32..126) ONCE at 28px into a single shelf-packed **R8 coverage atlas** (pure/GPU-
+  free) recording per-glyph atlas-rect + bearing/advance metrics. The `TextRenderer` sub-struct (built once in
+  `build_device_objects`, after the quad pipeline; best-effort `Option`) uploads the atlas to an `R8_UNORM` image
+  via a host-visible **staging buffer + a one-time-submit command buffer** that transitions
+  UNDEFINED→TRANSFER_DST→SHADER_READ_ONLY_OPTIMAL (fence-waited at init, off the frame loop), creates a sampler +
+  a **combined-image-sampler descriptor set** + a **textured-glyph pipeline** (embedded SPIR-V `shaders/text.{vert,
+  frag}.spv`; vertex pos@0+uv@8; a fragment `vec4` **push-constant** text color × the sampled R8 coverage; straight-
+  alpha blend; dynamic viewport/scissor). Per frame, `build_text_vertices` lays each `RenderNode.text`'s glyphs on
+  a baseline inside its view rect (6 verts/visible glyph; whitespace advance-only; non-ASCII skipped) into a
+  per-frame text vertex buffer (same single-frame-in-flight fence safety as the quads); `record_draw` draws the
+  quads then binds the text pipeline+descriptor, pushes the color, and draws the glyphs ON TOP (alpha-composited).
+  `TextRenderer::destroy` frees image/view/sampler/descriptors/pipeline/VB in `Drop` after `device_wait_idle`.
+  **Sound:** every new `unsafe` has a `// SAFETY:` note; the upload + each `finish_gpu` step tears down already-
+  created handles on its error path (no partial leak); the atlas-record `?` is scoped to a typed inner closure so
+  it can't propagate `vk::Result` to the `GraphicsError`-returning fn; the push-constant color is built with safe
+  `to_ne_bytes` (no transmute). **FAITHFUL status — VALIDATED on the demo** (`RUST_LOG=eclipse=trace`,
+  `/tmp/eclipse-render.log`): `text: discovered system font + built R8 glyph atlas font=…/NotoSans-Regular.ttf
+  atlas_w=1015 atlas_h=28 glyphs=95`, then `drawing recorded View tree into the swapchain views=4 quads=4
+  glyphs=31` for **8601 frames over 60 s** with **zero VK_ERROR/panic/validation/draw-failed** (grep count 0) —
+  the demo's TextView text is rasterized + drawn over the depth-colored view quads. **Regression guard:** GPU-free
+  unit tests — `build_text_vertices` (6/visible-glyph, skip whitespace + non-atlas + no-text), `find_device_local_
+  memory_type` (prefer device-local then any-in-filter), and a font-present-guarded `build_glyph_atlas` smoke test;
+  `cargo test` **122 unit + 2 doctests pass** (was 119). Live draw is dev-host-validated (winit main-thread; ART
+  aborts under cargo-test). **Context7:** `/alexheretic/ab-glyph` (FontRef/FontVec, `outline_glyph`,
+  `OutlinedGlyph::draw`/`px_bounds`, `ScaleFont` ascent/h_advance) + `/ash-rs/ash` (image/sampler/descriptor/
+  push-constant/buffer-image-copy/pipeline-barrier). Cyber-safeguard did NOT trip (Eclipse's own graphics only).
 
 ---
 

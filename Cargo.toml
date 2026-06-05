@@ -55,6 +55,11 @@ winit = "0.30"                                    # Wayland/X11 window + event l
 ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
 ash-window = "0.13"                               # ash ↔ raw-window-handle interop: required surface extensions + VkSurfaceKHR from the window
 raw-window-handle = "0.6"                         # the window/display handle abstraction (deduped with winit 0.30's own dep)
+# 2026-06-05: pure-Rust glyph rasterizer for the View-tree TEXT pass — rasterizes each TextView's
+# text into an R8 glyph atlas the text pipeline samples. Pure Rust (ttf-parser/owned_ttf_parser),
+# no C/system font lib (§2.1); the system font FILE is found portably at runtime via fontconfig
+# `fc-match` / known font dirs (detect-don't-assume §9), never linking fontconfig.
+ab_glyph = "0.2"
 # 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
 # The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.
