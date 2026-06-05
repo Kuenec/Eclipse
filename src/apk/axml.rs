@@ -245,6 +245,11 @@ pub struct XmlDocument {
     pub texts: Vec<XmlText>,
     /// Namespace table referenced by [`XmlEventKind::StartNamespace`]/[`EndNamespace`](XmlEventKind::EndNamespace).
     pub namespaces: Vec<XmlNamespace>,
+    /// The fully materialized string pool, indexed by `ResStringPool_ref`. The framework's
+    /// `XmlBlock.nativeGetPooledString(idx)` (reached for a `TYPE_STRING` styled attribute whose
+    /// `TypedArray` cookie marks it as XmlBlock-owned) returns `strings[idx]`. An index whose pool
+    /// entry was the `NO_STRING` sentinel or otherwise empty is an empty `String` (never panics).
+    pub strings: Vec<String>,
 }
 
 /// Parse binary AXML `bytes` into an owned [`XmlDocument`] event sequence with all strings resolved.
@@ -270,6 +275,7 @@ pub fn parse_document(bytes: &[u8]) -> Result<XmlDocument, AxmlError> {
         elements: Vec::new(),
         texts: Vec::new(),
         namespaces: Vec::new(),
+        strings: pool.materialize()?,
     };
     let mut depth: usize = 0;
 
@@ -593,6 +599,18 @@ impl<'a> StringPool<'a> {
             decode_utf16(self.chunk, start)?
         };
         Ok(Some(s))
+    }
+
+    /// Materialize the whole pool into a `Vec<String>` indexed by `ResStringPool_ref`, so the parsed
+    /// document can answer `XmlBlock.nativeGetPooledString(idx)` in O(1) without re-walking the chunk.
+    /// A `NO_STRING`/empty entry becomes an empty `String` (never panics); a truly corrupt in-range
+    /// entry is a typed `Err` (same totality as [`get`](Self::get)).
+    fn materialize(&self) -> Result<Vec<String>, AxmlError> {
+        let mut out = Vec::with_capacity(self.string_count);
+        for i in 0..self.string_count {
+            out.push(self.get(i as u32)?.unwrap_or_default());
+        }
+        Ok(out)
     }
 }
 

@@ -435,7 +435,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**95 unit + 2 compile_fail doctests
+  --all-targets --all-features -- -D warnings`, `cargo test` (**97 unit + 2 compile_fail doctests
   pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
   Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock`/**`View`/
   `ViewGroup`/`TextView`/`Window`/`Paint`** natives via `RegisterNatives` before `Context.<clinit>`,
@@ -445,8 +445,12 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `XmlBlock` parser natives walk it). **`AssetManager.retrieveAttributes(J[IIJJ)Z` now bound** — real
   XML-attribute extraction by `name_resource` into the framework's off-heap `outValues`/`outIndices`
   (bounds-proven raw writes); needed an `axml` `RES_XML_RESOURCE_MAP_TYPE` decode (so `name_resource`
-  is populated, was always 0) + the empirically-found ATL TypedArray window layout (stride 6, TYPE@1,
-  **DATA@3** — corrected from the earlier integer-only guess DATA@2; see §6 2026-06-05). On the dev-host
+  is populated, was always 0) + the TypedArray window layout. ⚠️ **THE WINDOW LAYOUT WAS CORRECTED
+  2026-06-05 (§6): the real layout is the standard AOSP API-29+ one — `STYLE_NUM_ENTRIES = 7`, TYPE@0,
+  DATA@1, ASSET_COOKIE@2, RESOURCE_ID@3 (the earlier "stride 6 / TYPE@1 / DATA@3" was WRONG — a
+  coincidence that satisfied only getInteger/getString; getResourceId needs RESOURCE_ID@3 with stride 7).
+  Run-confirmed empirically (probe pinned stride 7, then TYPE@0+RESOURCE_ID@3 cleared the NPE) and
+  corroborated by reading the runtime `com.android.internal.R$styleable.View_id`=9 via reflection.** On the dev-host
   run, `Context.<clinit>` parses+walks `AndroidManifest.xml` end-to-end, integer manifest attrs resolve,
   **`<activity android:name>` now resolves via `TypedArray.getString` (the XmlBlock string pool, no new
   native), `PackageParser.parsePackage` completes (incl. certificate collection), and the lifecycle
@@ -483,16 +487,23 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (package 0x01) IS NOW LOADED (2026-06-05, §6): a cached `OnceLock<Vec<u8>>` reads `framework-res.apk`'s
   `resources.arsc` once; `arsc_bytes_for(resid)` dispatches by the id's high byte (0x01 → framework table,
   else → app table); `getResourceName`/`loadResourceValue` route through it. So `android.R.*` resolves now.**
-  ⚠️ **EVIDENCE-CORRECTED FAITHFUL STOP (the earlier `0x01020002` premise was disproven by decompiling the
-  demo): `MainActivity.onCreate` line 16 calls `findViewById(R.id.…)` with the demo's OWN R (package 0x7f,
-  e.g. `0x7f030000` — confirmed in `classes.dex` + the layout's REFERENCE-typed `android:id`), NOT
-  `android.R.id.text1`.** The persisting NPE is therefore `findViewById` returning null because the inflater
-  does not yet track the view's assigned id for lookup (`setId`/`findViewById` through the View natives +
-  inflation path) — the **deferred-rendering/inflation frontier**, a different scope from resource-table
-  dispatch. The framework table is still required infrastructure (Roblox + any app reference `android.R.*`
-  framework attrs/defaults via `loadResourceValue`); it is landed durably regardless. After the inflation
-  frontier, the real ash/Vulkan surface + draw is the deferred big build. The live JNI path is dev-host-only (ART aborts on worker
-  threads), so it is validated via `eclipse run`. The `apk` reader was validated against the **real**
+  ✅ **THE findViewById/onCreate FRONTIER IS NOW CROSSED (2026-06-05, §6): `MainActivity.onCreate`
+  COMPLETES — `findViewById(0x7f030000).setText("…")` succeeds (no NPE), `onContentChanged - yay!` runs,
+  and the lifecycle reports "Activity.onCreate reached: recipe steps 1–5 driven", then opens the host
+  winit window.** Root cause was twofold and entirely in the styled-attribute path (NOT a resource-table
+  miss): (1) the TypedArray window layout was wrong (see the stride-7 correction above) — `android:id`
+  is a REFERENCE whose resolved id belongs in RESOURCE_ID@3, which `TypedArray.getResourceId` reads (the
+  inflater + `View.<init>` then `setId` it, and `View/ViewGroup.findViewById` match it in pure Java); and
+  (2) `AssetManager.applyStyle` (the combined `obtainStyledAttributes(AttributeSet,int[])` native every
+  View constructor + the inflater drive — NOT `retrieveAttributes` for the layout) was a TYPE_NULL stub
+  that ignored its `parser` arg; it now resolves each requested attribute from the XML parse-state
+  (reusing `resolve_xml_attributes`). With those fixed, the inflated TextViews carry their real ids and
+  text; the discovery loop then surfaced + bound two more natives: `XmlBlock.nativeGetPooledString(J,I)`
+  (string values route here via the `XML_BLOCK_COOKIE = -1` `getString` path; backed by a materialized
+  `XmlDocument.strings` pool) and `TextView.native_setText(String)` (records text on the view peer, reading
+  the receiver's `View.widget` registry handle). After onCreate, onStart/onResume are NOT driven (the
+  recipe targets onCreate) and the real ash/Vulkan surface + draw is the deferred big build. The live JNI
+  path is dev-host-only (ART aborts on worker threads), so it is validated via `eclipse run`. The `apk` reader was validated against the **real**
   Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 / largeHeap=false).
   **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK) on this host.
 - **Repo:** git initialized; committed & pushed to `origin/main`
@@ -511,17 +522,19 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   deferred to the framework-lifecycle work). Cargo.lock committed. NO `axmldecoder`/`jni`/`ureq`/
   `rustls`/`clap`/`rustix`. `winit`/`ash` deferred to the windowed boot.
 - **Open items:** license `TBD`; M1 reach Roblox `onCreate` (+ later: APK fetch backend).
-- **Next actions (pick up here — drive ART to Roblox's `onCreate`):**
-  🔜 **IMMEDIATE FRONTIER (evidence-corrected 2026-06-05): the demo's NPE is the inflation/`findViewById`
-  id-tracking path, NOT the resource table.** The framework table (package 0x01) is now loaded + dispatched
-  by id high byte (§6 2026-06-05); the demo's `MainActivity.onCreate:16` `findViewById(R.id.…)` uses the
-  demo's OWN R (package 0x7f, `0x7f030000` — proven from `classes.dex` + the layout's REFERENCE-typed
-  `android:id`), so it returns null because the inflater does not yet record the view's assigned id for
-  lookup. NEXT: make `setContentView`→`LayoutInflater` apply each inflated view's `android:id`
-  (REFERENCE-typed attribute value, e.g. `0x7f030000`) to its `view_registry` peer, and make `findViewById`
-  walk the recorded parent→child tree (`view_registry.children`) matching that id — so `findViewById` returns
-  the real TextView and `setText` succeeds (then onCreate completes → onStart/onResume). Stay non-GTK,
-  metadata-only (no measure/draw/surface). Validate via dev-host `eclipse run` (ART aborts on worker threads).
+- **Next actions (pick up here — the demo's `onCreate` now COMPLETES; advance the lifecycle / engine):**
+  ✅ **DONE 2026-06-05: the demo `MainActivity.onCreate` completes** — `findViewById(0x7f030000).setText(…)`
+  succeeds, `onContentChanged - yay!` runs, "recipe steps 1–5 driven". Root cause was the styled-attribute
+  path, NOT the resource table: the TypedArray window layout was wrong (now the standard AOSP stride-7
+  TYPE@0/DATA@1/RESOURCE_ID@3) AND `applyStyle` ignored its `parser` arg (now resolves XML attrs from it).
+  `findViewById`/`setId`/`getId` are pure Java over `View.id`; the fix made `getResourceId` return the
+  REFERENCE id so the inflater + `View.<init>` set it. Plus two surfaced natives bound:
+  `XmlBlock.nativeGetPooledString` + `TextView.native_setText`.
+  🔜 **IMMEDIATE FRONTIER (2026-06-05): drive the post-onCreate lifecycle and/or the deferred render.**
+  The recipe stops at `Activity.onCreate`; next is `onStart`/`onResume` (if needed for the demo) and the
+  real **ash/Vulkan surface + draw** (the big build — the View tree + ids + text are all recorded in
+  `view_registry`, ready to render). For Roblox specifically, the engine-load bionic-shim work (Section B
+  of the dev-host runbook) is the parallel track. Stay non-GTK; validate via dev-host `eclipse run`.
   📋 **Dev-host execution runbook:** the two frontiers' next concrete steps (which need
   main-thread `cargo run -- run …`, not the cargo-test harness or subagents) are consolidated
   into an executable, decision-driven script in [`docs/dev-host-runbook.md`](docs/dev-host-runbook.md)
@@ -1422,6 +1435,42 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   onCreate REACHES + runs the demo's Java (`onCreate`/`setContentView`/`onContentChanged` all log "yay!", view
   hierarchy inflates) then NPEs at line 16 on `findViewById` → onStart/onResume NOT yet reached. Run log:
   `/tmp/eclipse-run2.log`.
+- **2026-06-05** — 🎉 **`MainActivity.onCreate` COMPLETES — findViewById/setText work; root cause was the
+  TypedArray window layout + a stubbed `applyStyle`, NOT the resource table.** Two durable fixes in
+  `framework.rs`:
+  1. **TypedArray window layout corrected to the standard AOSP API-29+ one: `STYLE_NUM_ENTRIES = 7`,
+     TYPE@0, DATA@1, ASSET_COOKIE@2, RESOURCE_ID@3** (was the WRONG "stride 6 / TYPE@1 / DATA@3", a
+     coincidence that satisfied only `getInteger`/`getString`). `android:id` is a `TYPE_REFERENCE` whose
+     resolved id belongs in **RESOURCE_ID@3**, which `TypedArray.getResourceId` reads; the inflater
+     (`LayoutInflater` L334 `getResourceId(0,0)`→`setId`) + `View.<init>` (L968 `getResourceId(View_id,
+     NO_ID)`) then set `View.id`, which `View/ViewGroup.findViewById` match in **pure Java**. `TypedEntry`
+     gained `resource_id` (=`data` for REFERENCE/ATTRIBUTE, else 0) and `asset_cookie`
+     (`XML_BLOCK_COOKIE = -1` for strings, so `getString` resolves via `mXml.getPooledString` not the
+     native AssetManager path); `fill_typed_array` writes TYPE/DATA/COOKIE/RESOURCE_ID.
+  2. **`AssetManager.applyStyle` now resolves XML attributes from its `parser` arg** (was a TYPE_NULL
+     stub that ignored it). `applyStyle` IS the combined `obtainStyledAttributes(AttributeSet,int[])`
+     native every View constructor + the inflater drive for the LAYOUT (the manifest path uses
+     `retrieveAttributes`); both now share `resolve_xml_attributes`.
+  **METHOD (faithful):** the layout was found EMPIRICALLY via the dev-host run (temp `fill_typed_array`
+  slot/stride probes, all removed before commit) — pinned stride 7, then TYPE@0+RESOURCE_ID@3 cleared the
+  NPE — and corroborated by reading the runtime `com.android.internal.R$styleable.View_id`=9 via
+  reflection. **NO denylisted source was read** (no content/res Java, no api-impl-jni C, no bionic, no
+  web): only `View.java`/`LayoutInflater.java`/`TextView.java`/`ViewGroup.java` (view+widget, allowed),
+  the generated `com/android/internal/R.java` constants, the local demo `classes.dex`/AXML, and
+  reflection. The discovery loop then surfaced + bound two more natives:
+  **`XmlBlock.nativeGetPooledString(JI)Ljava/lang/String;`** (backed by a newly-materialized
+  `XmlDocument.strings` pool + `XmlBlock::pooled_string`) and **`TextView.native_setText(Ljava/lang/
+  String;)V`** (records text on the receiver's `view_registry` peer, reading the `View.widget` handle off
+  `this`). **FAITHFUL outcome:** the demo logs `- onCreate/setContentView/onContentChanged - yay!`,
+  `findViewById(0x7f030000).setText(…)` succeeds (NO NPE), and the lifecycle reports
+  "Activity.onCreate reached: recipe steps 1–5 driven" then opens the winit window. onStart/onResume are
+  NOT driven (recipe targets onCreate); the ash/Vulkan draw is the deferred big build. Regression guards:
+  `typed_array_window_layout_is_pinned` (pins stride 7 + all slot offsets + the TYPE_* constants),
+  `fill_typed_array_reference_resource_id_is_at_style_resource_id_slot` (the findViewById fix),
+  `fill_typed_array_writes_exact_bounds_values_and_indices` (updated for the 4-slot/stride-7 writes),
+  `xml_registry::pooled_string_returns_by_index_or_none`, and the XmlBlock/TextView name+sig pins. Gate
+  green: fmt / build / clippy `-D warnings` / **test 97 unit + 2 doctests** / release. No new deps. The
+  cyber-safeguard did NOT trip. Run log: `/tmp/eclipse-final.log`.
 
 ---
 
