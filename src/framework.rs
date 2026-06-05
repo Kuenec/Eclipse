@@ -71,6 +71,7 @@
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JClass, JIntArray, JObject, JString};
@@ -2299,6 +2300,98 @@ fn register_environment_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.os.SystemClock's monotonic clock ==============
+//
+// 2026-06-05: the Roblox-APK run surfaced `No implementation found for long
+// android.os.SystemClock.elapsedRealtime()` (run log /tmp/eclipse-roblox.log) — thrown from inside
+// Roblox's own `com.roblox.client.RobloxApplication.<init>` during step 1 `Context.createApplication`
+// (the demo APK never calls it, so it only appears under a real app). This is a benign framework
+// timekeeping native, NOT an asset/resource/GTK/engine concern. `SystemClock.java` line 148 declares
+//   `native public static long elapsedRealtime();`
+// → static native `()J`, documented as "elapsed milliseconds since boot, including time spent in
+// sleep" and "guaranteed to be monotonic" (SystemClock.java lines 52–56, 143–148). The load-bearing
+// contract is MONOTONICITY (the value is used only as an interval-timing reference). Eclipse backs it
+// GTK-free with a process-anchored monotonic clock (`std::time::Instant`, which uses CLOCK_MONOTONIC
+// on Linux), returning milliseconds since the first call — sound, no `unsafe`, no libc dep, honoring
+// the monotonic guarantee. ATL backs this in C; we do not read that source (denylisted) — the Java
+// contract above is the ground truth.
+
+/// `android.os.SystemClock` (internal/slashed name for `find_class`) — hosts the static
+/// `elapsedRealtime` monotonic-clock native.
+pub const SYSTEM_CLOCK_CLASS: &JNIStr = jni_str!("android/os/SystemClock");
+
+// JNI name + descriptor for SystemClock's native, exactly as declared in `SystemClock.java`
+// (2026-06-05, line 148): `native public static long elapsedRealtime();`.
+const ELAPSED_REALTIME_NAME: &JNIStr = jni_str!("elapsedRealtime");
+const ELAPSED_REALTIME_SIG: &JNIStr = jni_str!("()J");
+
+/// Process-wide monotonic anchor for [`system_clock_elapsed_realtime`]. Set once on the first call,
+/// so `elapsedRealtime()` returns milliseconds since the first query — a correct monotonic clock
+/// (the contract guarantees monotonicity, not a true since-boot value). `Instant` is monotonic on
+/// Linux (CLOCK_MONOTONIC); `OnceLock` makes the anchor sound across the VM/winit main thread.
+static MONOTONIC_ANCHOR: OnceLock<Instant> = OnceLock::new();
+
+/// `SystemClock.elapsedRealtime()` → monotonic milliseconds since the first call, as a `jlong`.
+///
+/// JNI ABI: a `static` native (the Java method is `static`), so the second argument is the `JClass`.
+/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
+/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
+/// returns the `jlong` default (`0`) on any error/panic — a sound neutral timestamp. The
+/// `OnceLock::get_or_init` anchors the clock on first use; subsequent calls are monotonically
+/// non-decreasing. `as_millis()` is `u128`; a 32-bit-day overflow cannot occur in a session, but the
+/// `try_from`/`unwrap_or` saturation keeps the native total (no overflow panic).
+extern "system" fn system_clock_elapsed_realtime<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        let elapsed_ms = MONOTONIC_ANCHOR
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis();
+        Ok(jlong::try_from(elapsed_ms).unwrap_or(jlong::MAX))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.os.SystemClock`'s `elapsedRealtime`.
+///
+/// Locates `android/os/SystemClock` and registers the native via `RegisterNatives` (which wins over
+/// name-based lazy binding — JNI 1.1 spec). Like [`register_environment_natives`], this MUST run
+/// before anything triggers `SystemClock`'s first active use; it is registered before the lifecycle
+/// drive, since ART resolves natives lazily and a real app's `Application.<init>` may query the clock
+/// during step 1 `Context.createApplication` (observed for Roblox's `RobloxApplication.<init>`).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
+/// signature. It does, by construction — [`system_clock_elapsed_realtime`] is written to the exact
+/// `()J` descriptor as a static native (`EnvUnowned, JClass`). The native body is `catch_unwind`-
+/// guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
+fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(SYSTEM_CLOCK_CLASS)?;
+    let methods = [
+        // SAFETY: `system_clock_elapsed_realtime` matches the paired `()J` signature as a static
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ELAPSED_REALTIME_NAME,
+                ELAPSED_REALTIME_SIG,
+                system_clock_elapsed_realtime as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/os/SystemClock; `methods` holds a valid fn pointer whose
+    // signature matches the class's `native` declaration (verified against SystemClock.java line 148,
+    // 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/os/SystemClock",
+        "registered Eclipse's non-GTK backing for elapsedRealtime"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.view.View native peer construction =============
 //
 // 2026-06-05: step 4 (`Activity.createMainActivity`) constructs the launcher Activity, whose
@@ -3384,6 +3477,10 @@ fn drive_lifecycle(
     // external storage early in init (`getExternalStorageDirectory`), so this must be bound before
     // step 1.
     register_environment_natives(env)?;
+    // Bind android.os.SystemClock.elapsedRealtime on its own class — a real app's Application.<init>
+    // may query the monotonic clock during step 1 (observed for Roblox's RobloxApplication.<init>),
+    // so this must be bound before step 1. GTK-free; std::time::Instant-backed.
+    register_system_clock_natives(env)?;
     // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
@@ -4065,6 +4162,33 @@ mod tests {
         assert_eq!(ENVIRONMENT_CLASS.to_str(), "android/os/Environment");
         assert_eq!(GET_APP_DATA_DIR_NAME.to_str(), "native_get_app_data_dir");
         assert_eq!(GET_APP_DATA_DIR_SIG.to_str(), "()Ljava/lang/String;");
+    }
+
+    #[test]
+    fn system_clock_native_name_sig_and_class_match_system_clock_java() {
+        // Pin android.os.SystemClock.elapsedRealtime's class, method name, and JNI descriptor against
+        // `SystemClock.java` line 148 (`native public static long elapsedRealtime();` → `()J`) and the
+        // ART `No implementation found for long android.os.SystemClock.elapsedRealtime()` line: a
+        // transcription regression would make RegisterNatives throw NoSuchMethodError at boot (or the
+        // native go unbound, re-throwing the UnsatisfiedLinkError that this binding cleared).
+        // Host-independent constants.
+        assert_eq!(SYSTEM_CLOCK_CLASS.to_str(), "android/os/SystemClock");
+        assert_eq!(ELAPSED_REALTIME_NAME.to_str(), "elapsedRealtime");
+        assert_eq!(ELAPSED_REALTIME_SIG.to_str(), "()J");
+    }
+
+    #[test]
+    fn monotonic_anchor_clock_is_non_decreasing() {
+        // The elapsedRealtime contract guarantees monotonicity (SystemClock.java lines 52–56). Prove
+        // the process-anchored clock never goes backwards across calls. Host-independent (uses only
+        // the monotonic Instant anchor, no JNI). Anchor on first read, then read again.
+        let anchor = MONOTONIC_ANCHOR.get_or_init(Instant::now);
+        let first = anchor.elapsed().as_millis();
+        let second = anchor.elapsed().as_millis();
+        assert!(
+            second >= first,
+            "elapsedRealtime must be monotonic: {first} then {second}"
+        );
     }
 
     #[test]
