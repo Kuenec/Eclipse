@@ -496,12 +496,24 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      `runtime::Vm` (raw `*mut JavaVM` field, NO `unsafe impl Send`/`Sync`); `main.rs` binds it
      `let _vm = …` and keeps it alive across `graphics::run_windowed(…)`, pinning the VM to the
      JNI-attached main thread so the next increment's JNI calls run from inside the event loop with
-     a reachable VM (2026-06-04). NEXT framework step — the JNI call sequence: add the full **`jni`**
-     crate (verify its API against **docs.rs/jni** — Context7 does not index `jni`) and drive ATL's
-     onCreate recipe from the event loop: `createApplication(J window)` →
-     `createContentProviders()` → `Application.onCreate()` → `createMainActivity(…)`. **Wrap every
-     Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot stays on the
-     **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).
+     a reachable VM (2026-06-04). ✅ **onCreate JNI sequence now SPEC'D + grounded** (2026-06-04):
+     confirmed signatures, recipe table, bootstrap class, and the `jlong` window-handle passing are
+     in `docs/art-and-runtime.md` ("onCreate JNI recipe (confirmed)"). **NEXT IMPLEMENTATION
+     INCREMENT — write that sequence:** add the full **`jni = "0.22"`** crate (keep `jni-sys`;
+     verified against **docs.rs/jni** — Context7 does not index `jni`); wrap the held `Vm`'s raw
+     `*mut JavaVM` with `jni::JavaVM::from_raw`, get an `Env` via `attach_current_thread(|env| …)`
+     (cheap — main thread already attached; there is **no** standalone `get_env()` in 0.22), and
+     from **inside the winit event loop on the held `Vm`/main thread** drive:
+     `Context.createApplication((J)→Application)` → `ContentProvider.createContentProviders(()V)` →
+     `Application.onCreate(()V)` → `Activity.createMainActivity((Ljava/lang/String;JLjava/lang/String;)→Activity)`
+     → `Activity.onCreate((Landroid/os/Bundle;)V)` — the host window is a **`jlong`/intptr_t handle,
+     NOT a Surface object**. **Wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep
+     `panic = "abort"`). Boot stays on the **main thread** (the cargo-test harness aborts ART —
+     **validate via a dev-host `eclipse run`**, not an in-harness test). Residual UNCONFIRMED to
+     resolve at implement time (read `api-impl.jar` via `javap -s` + iterate on a real run): whether
+     `Activity.onCreate` is called directly or via `activity_start`/the event loop;
+     Looper/MessageQueue ordering vs the sequence; the exact winit window-handle type for the
+     `jlong`; and the compiled `createMainActivity` signature/visibility in `api-impl.jar`.
   4. Once Roblox's Java shell runs, harvest `framework-worklist.txt` (missing `android.*` the
      framework must implement) — the deferred Step 4 data, and the spec for the winit framework.
   5. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.

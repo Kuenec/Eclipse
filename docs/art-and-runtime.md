@@ -256,6 +256,91 @@ first, before wiring winit/ash.
   *workflow subagents* asked to analyze ART-VM-boot/JNI-FFI topics (blocked 3+ agents). Do this
   step in the main loop / interactively, not via Workflow subagents.
 
+## onCreate JNI recipe (confirmed) — 2026-06-04
+
+> **Status:** Spec'd and grounded for implementation. The libcore boot + Roblox classpath
+> + native-lib path + the `!Send`/`!Sync` `Vm` handle are all DONE (§5 of `AGENTS.md`); this
+> section pins the **next** increment: the JNI call sequence that drives ART from
+> `JNI_CreateJavaVM` to Roblox's `onCreate`. Sources read 2026-06-04: ATL's
+> `src/main-executable/main.c` (onCreate recipe) + `api-impl/android/{content,app}/*.java` +
+> `api-impl-jni/handle_cache.c`; the `jni` crate API on **docs.rs/jni** (Context7 does not
+> index `jni`); `~/eclipse-m0/framework-worklist.txt`.
+
+### `jni` crate to add (verified against docs.rs/jni)
+
+- **Pin `jni = "0.22"`** (current 0.22.4; pin to `0.22.*` for stability). It wraps the raw
+  `jni-sys 0.4` already in the tree — compatible, same FFI layer. Add it alongside `jni-sys`
+  (do **not** drop `jni-sys`: `boot()` still uses its raw invocation types).
+- **Obtain the handle, don't re-create the VM.** `boot()` already holds the live VM as the
+  `!Send`/`!Sync` `runtime::Vm` (raw `*mut JavaVM`). Wrap that pointer with
+  `unsafe { jni::JavaVM::from_raw(ptr) }` — **safety contract:** the pointer must come from a
+  live `JNI_CreateJavaVM` and support JNI ≥ 1.4 (it does; `from_raw` only null-checks).
+- **Get an `Env` on the attached main thread.** There is **no** standalone `get_env()` in
+  0.22. Use `vm.attach_current_thread(|env| { … })` — the callback receives `&mut Env<'_>`.
+  The main thread is already JNI-attached after `JNI_CreateJavaVM`, so this is cheap (no real
+  attach). `Env` is `!Send`/`!Sync` (tied to this thread) — matches the pinned-main-thread
+  model (`Vm` is `!Send`/`!Sync`; boot ART on main, run winit's loop on main, call JNI from
+  inside event-loop callbacks; never `AttachCurrentThread` a cross-thread env).
+- **Call shapes:** `find_class("java/lang/String")` (slashed internal name, **not** dotted) →
+  `JClass`; `call_static_method(class, name, sig, &[JValue])` and
+  `call_method(obj, name, sig, &[JValue])` → `Result<JValueOwned>`. `JValue`/`JValueOwned` is
+  an enum (`Object/Byte/Char/Short/Int/Long/Bool/Float/Double/Void`); unwrap a return via
+  `.l()`/`.i()`/`.j()`/`.z()`/`.v()` etc. Errors are typed `Result` (`JavaException`,
+  `MethodNotFound`, `NullPtr`) — no panics.
+
+### The step-by-step recipe (from ATL `main.c` + `api-impl` sources)
+
+Each row is a JNI call from the held `Env` on the main thread, in order. The host window is
+passed as a **`long` / `jlong` (intptr_t)** — a raw handle, **not** an `android.view.Surface`
+object. (ATL passes a `GtkWidget*`; Eclipse passes its winit window handle — exact handle
+type is the one UNCONFIRMED below.)
+
+| # | Java class (internal name) | Method | JNI descriptor | Arg types | Static/Instance | Purpose |
+|---|---|---|---|---|---|---|
+| 1 | `android/content/Context` | `createApplication` | `(J)Landroid/app/Application;` | `jlong native_window` | **static** | Build + init the `Application`, attach it to the window handle, set base context from the parsed manifest. Returns the `Application` used in step 3. |
+| 2 | `android/content/ContentProvider` | `createContentProviders` | `()V` | none | **static** | Instantiate all manifest-declared `ContentProvider`s (same-process) and call their `onCreate`. |
+| 3 | `android/app/Application` | `onCreate` | `()V` | none (on the obj from step 1) | **instance** | `Application.onCreate()` lifecycle — app's Java shell self-init before the Activity. |
+| 4 | `android/app/Activity` | `createMainActivity` | `(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;` | `String className`, `jlong native_window`, `String uri` | **static** | Instantiate the launcher Activity (`className`, or `null` → auto-resolve manifest MAIN/LAUNCHER), create its Window on the window handle, build the Intent. |
+| 5 | `android/app/Activity` | `onCreate` | `(Landroid/os/Bundle;)V` | `Bundle savedInstanceState` (`null` first launch) | **instance** | Activity `onCreate(Bundle)` — completes init; Roblox's shell sets up UI and calls `System.loadLibrary("roblox")`. |
+
+- **Bootstrap class:** ATL does **not** hardcode one — it resolves the manifest MAIN/LAUNCHER
+  intent-filter. For this APK that is `com.roblox.client.startup.ActivitySplash`; ATL's M0
+  boots `-l com/roblox/client/ActivityNativeMain` to **bypass the splash**. Eclipse passes the
+  chosen class to step 4 (or `null` to auto-resolve). `createMainActivity` is `private static`
+  in the Java source but is invoked from native via `CallStaticObjectMethod` (JNI may call
+  private methods).
+- **`System.loadLibrary("roblox")`** fires from inside step 5; per the framework work-list it
+  then loads `libroblox.so` via the bionic translation linker, which needs the NDK shims
+  `libmediandk.so` / `libOpenMAXAL.so` (the separately-tracked native-shim increment).
+
+### catch_unwind requirement (mandatory, §2.8 + CLAUDE.md)
+
+Release keeps `panic = "abort"`, so a Rust panic unwinding into ART's C++ is UB. **Wrap every
+Rust-side JNI/`extern "C"` callback body in `std::panic::catch_unwind`** (registered framework
+native backends, and any closure run under `attach_current_thread`). `jni-rs` itself installs
+`catch_unwind` on `EnvUnowned::with_env` and reports panics via its `Outcome`/`ErrorPolicy`
+path — but the project's standing rule still applies: wrap defensively at every boundary; never
+let a panic cross into C++.
+
+### UNCONFIRMED — the implementer must resolve these at implement time
+
+These are **not** yet proven (CLAUDE.md: known vs suspected). Resolve before/while coding,
+primarily by reading the installed `api-impl.jar` (e.g. `javap -s` on the compiled classes)
+and by a dev-host `eclipse run` — the cargo test harness aborts ART (worker-thread
+`scoped_thread_state_change`), so the sequence is validated only from `main()`:
+
+- **Whether step 5 (`Activity.onCreate`) is called directly from JNI or indirectly via the
+  event loop.** ATL's `main.c` excerpt shows `createMainActivity` → `activity_start(activity)`
+  (which drives `onStart`/`onResume` and input registration); the exact point `onCreate` fires
+  may be inside `createMainActivity`/`internalCreateActivity` rather than a separate JNI call.
+- **Looper/MessageQueue ordering:** whether `Looper.prepareMainLooper` / `Looper.loop` must run
+  before or after this sequence (ATL calls `prepare_main_looper` early).
+- **The exact window-handle type Eclipse passes as the `jlong`** (winit raw window handle vs a
+  Vulkan/EGL surface vs raw Wayland/X11 id). ATL passes `GtkWidget*`; Eclipse's winit will
+  differ — this is the framework/Surface design (component-map F), not a fixed value.
+- **Whether `createMainActivity`'s compiled signature/visibility in `api-impl.jar` matches the
+  source** (`javap -s` the jar to confirm descriptors before binding them).
+
 ## Sources
 
 - [art_standalone (GitLab)](https://gitlab.com/android_translation_layer/art_standalone) — base `android-6.0.1_r46`, build outputs, patches
