@@ -552,8 +552,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      read the boot log — the registered natives + driven steps 1–3 should reach `Application.onCreate` or
      surface the **next `UnsatisfiedLinkError`**, which *names the next native to bind*. Iterate: bind each
      surfaced native (non-GTK Rust) and re-run until steps 1–3 cleanly reach `onCreate`. Then **steps 4–5**
-     (`Activity.createMainActivity`/`Activity.onCreate`) with the **Window/Surface non-GTK natives** + the
-     owned-handle/`ash`-Vulkan surface (the non-null `jlong` window-handle design, still UNCONFIRMED).
+     (`Activity.createMainActivity`/`Activity.onCreate`) with the **Window/Surface non-GTK natives** — now
+     **DESIGNED 2026-06-05** (`docs/art-and-runtime.md` "Non-GTK Window/Surface backing — design"): the
+     `jlong` is an **Eclipse-owned generational-slab registry index** (NOT `Box::into_raw`, NOT a raw
+     pointer — a wrong `jlong` becomes a bounds-checked `Err`, never UB; `WindowState` is `!Send`/`!Sync`,
+     touched only on the VM/winit main thread); the per-native plan binds `set_jobject`/`set_title`/
+     `set_layout` (winit metadata) and **defers** `set_widget_as_root`/`take_input_queue`; **no surface is
+     needed to reach `onCreate`** (the engine makes its own `VkInstance` later) so **no `ash`/EGL dep this
+     step**; render stack stays **ash/Vulkan-first, EGL fallback** (settled). **Smallest first Window step
+     (the next framework build, AFTER the dev-host steps-1–3 run):** the `window_registry`
+     (`allocate`/`with_window` + pack/unpack with stale-generation rejection + `jlong=0` reserved,
+     unit-tested) + the 3 metadata Window natives via `register_native_methods` + a descriptor guard vs
+     `Window.java` — all in-harness-compilable. **BIGGEST RISK recorded:** the View hierarchy is fully
+     native-handle-backed (`View.java` L888/L965), so `set_widget_as_root` needs the whole
+     View/ViewGroup/FrameLayout `native_*` cascade — steps 4–5 are the **big M2/M3 build, not a small one**.
      Verify on the dev host (onCreate reached, window opens, exit 0, **no `libgtk-4` in `/proc/self/maps`**).
      **Separately (a distinct main-loop item):** the deferred **bionic NDK-shim** step
      (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent cyber-safeguard blocker) so the

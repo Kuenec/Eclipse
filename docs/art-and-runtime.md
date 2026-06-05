@@ -467,6 +467,132 @@ Provide Eclipse's own non-GTK backing for **exactly the two Tier-A natives**, ag
 - Whether a real (non-demo) Roblox APK reaches further natives before the bionic NDK-shim frontier
   (separate work-stream).
 
+## Non-GTK Window/Surface backing — design (2026-06-05)
+
+> **Status:** Design, grounded for the framework increment **after** the dev-host steps-1–3
+> validation. Extends "Non-GTK api-impl backing — design (2026-06-04)" Tier B (steps 4–5) with the
+> concrete handle/registry/surface model. Sources read 2026-06-05 (api-impl Java only — not the
+> bionic linker C): ATL `api-impl/android/view/Window.java` (natives at L184–188; `set_native_window`
+> L58–60; `set_widget_as_root(native_window, decorView.widget)` L78; `decorView = new FrameLayout(context)`
+> L46) and `api-impl/android/view/View.java` (`public long widget; // pointer` L888; `widget =
+> native_constructor(context, attrs)` L965, "will create a custom GtkWidget" L1166; the
+> `native_constructor`/`native_addView`/`native_measure`/`native_layout`/`native_drawContent` cascade);
+> the existing `framework.rs` Context-native pattern (`EnvUnowned::with_env` + `resolve::<LogErrorAndDefault>`
+> + `register_native_methods`); winit 0.30 `raw-window-handle` re-exports (Context7).
+
+### Owned-handle contract (the `jlong` meaning)
+
+The `jlong` window handle passed to `createApplication`/`createMainActivity` is an **Eclipse-owned
+registry index into a process-global generational slab — NOT `Box::into_raw` and NOT a raw pointer.**
+ATL casts that `jlong` to `GtkWidget*`; Eclipse owns **both sides** of the `jlong`, so it is free to
+define its own meaning. Why a registry index over `Box::into_raw(WindowState)`:
+
+1. **Soundness / no UB.** A stale or fabricated `jlong` (the engine, or a buggy framework path) becomes
+   a **bounds-checked slot lookup that returns `Err`**, never a wild deref / use-after-free.
+   `Box::into_raw` would turn any wrong `jlong` into UB.
+2. **`!Send`/`!Sync` respect.** `WindowState` owns the winit `Window` (`!Send` on some platforms) and
+   later `ash` surfaces; the registry lives behind a thread-checking accessor so `WindowState` is only
+   ever touched on the main thread that owns the VM and the winit loop.
+
+Concrete shape (std-only, **no new dep**): `static WINDOWS: OnceLock<Mutex<…>>` over a small hand-rolled
+`Vec<Option<WindowState>>` + freelist (or a `Slab`), keyed by a `u32` index packed into the low bits of
+the `i64` `jlong` with a `u32` **generation** in the high bits, so a reused slot with a new generation
+**rejects a stale handle**. Allocation returns the packed `i64`; each Window native unpacks
+index+generation, locks the registry, validates the generation, and operates on the `WindowState`.
+`jlong = 0` stays the reserved null sentinel (steps 1–3 store-only, never look up). For the **first**
+increment `WindowState` holds **only metadata** (title/size + a `jni` `GlobalRef`); the live winit
+`Window` is reached through the event-loop callback, **not** the registry, so no aliasing with the event
+loop's `&mut` access arises yet (see risks).
+
+### Per-native, non-GTK plan (Tier B — Window)
+
+Behavior is Eclipse's own; the **contract** (which natives exist + their roles) is confirmed from
+`Window.java`. ATL's analogue is listed for reference, not to reimplement (no GTK).
+
+| `Java_*` native (descriptor) | ATL analogue | Eclipse (non-GTK) behavior |
+|---|---|---|
+| `Window.set_native_window(long)` | (pure Java) | **No Eclipse native.** `Window.java` L58–60 stores `this.native_window` then calls `set_jobject(native_window, this)`. |
+| `Window.set_jobject(long, Window)` *(static)* | `g_object_set_data` weak ref | Look up the slot; store a `jni` `GlobalRef` (or `WeakGlobalRef`, mirroring ATL's `_WEAK_REF`, to avoid pinning the `Window` for GC) of `obj` in `WindowState.jobject` for later input/lifecycle dispatch back to Java. |
+| `Window.set_title(long, String)` | `gtk_window_set_title` | `env.get_string` → winit `Window::set_title`; the `JString` releases via the `jni` crate's RAII. |
+| `Window.set_layout(long, int w, int h)` | `gtk_window_set_default_size` (`w>0 && h>0`) | If `w>0 && h>0`, winit `Window::request_inner_size(PhysicalSize)` (winit 0.30 returns `Option` — **best-effort**, matching `set_default_size`'s advisory nature). |
+| `Window.set_widget_as_root(long, long widget)` | `gtk_window_set_child` | **The render binding.** Attach the View tree's root surface/canvas as window content. **Deferred** to the full-rendering increment (initial stub records widget-as-root in `WindowState`). |
+| `Window.take_input_queue(long, Callback, InputQueue)` | `gtk_event_controller_legacy` + `SetLongField native_ptr` | Create an `InputQueueState`, `SetLongField` the `InputQueue.native_ptr` to its registry handle, store `GlobalRef`s of callback+queue for later dispatch from the winit event loop. **Deferred** to the input increment. |
+
+### Surface plan + render-stack decision
+
+- **To reach `Activity.onCreate`, NO surface is needed.** Steps 1–3 only store the `jlong`; step 4
+  `createMainActivity` builds the Window+DecorView and (per `Window.java`) calls
+  `set_jobject`/`set_title`/`set_layout`/`set_widget_as_root`, but none require a live `VkSurface` to
+  return — `set_widget_as_root` can **record** the root without presenting. The engine creates its own
+  `VkInstance`/surface via the libvulkan shim **later** (onStart/onResume/first frame), not during
+  `onCreate`. So the surface is **decoupled** from reaching `onCreate`.
+- **Render stack = ash/Vulkan-first, EGL fallback** — settled, not re-litigated (`config.use_opengl`
+  defaults `false` → Vulkan; AGENTS.md 2026-06-04 perf decision; `docs/tech-selection.md` §C). For the
+  **first** Window increment **neither `ash` nor EGL is added** (smallest change).
+- **Full-rendering path (later):** winit 0.30 re-exports `raw-window-handle`, so
+  `window.window_handle()?.as_raw()` → `RawWindowHandle::Wayland{surface}` | `Xlib{window,..}` and
+  `event_loop.display_handle()?.as_raw()` → the matching `RawDisplayHandle`; feed both to ash-window
+  `create_surface(&entry,&instance,display,window,None)` → `vk::SurfaceKHR` stored in `WindowState`. The
+  engine never sees the winit handle: Eclipse's libvulkan shim backs the Android
+  `ANativeWindow`/`vkCreateAndroidSurfaceKHR` with the winit-derived host surface (WSI translation —
+  component-map F, a separate later increment, gated on the engine actually loading).
+
+### BIGGEST RISK — `set_widget_as_root` is not bindable in isolation
+
+The View hierarchy is **entirely native-handle-backed** in ATL (`View.java` L888 `public long widget;
+// pointer`, L965 `native_constructor`). Constructing the Window's `DecorView` (`new FrameLayout(context)`,
+`Window.java` L46) calls `View.native_constructor`; `setContentView`/measure/layout/draw call
+`native_addView`/`native_measure`/`native_layout`/`native_drawContent`. So reaching `set_widget_as_root`
+**requires Eclipse non-GTK backings for the whole View/ViewGroup/FrameLayout `native_*` cascade too** —
+a much larger Tier-B surface than the ~6 Window natives, and the real reason **steps 4–5 are the big
+M2/M3 build, not a small one.** This must be acknowledged before estimating step 4 as small.
+
+### Smallest first implementation increment
+
+Build the owned-handle registry + bind the GTK-free **Window metadata** natives, deferring
+`set_widget_as_root` presentation, `take_input_queue`, the View `native_*` cascade, and **all**
+surface/`ash` work — **after** the dev-host steps-1–3 validation surfaces the next `UnsatisfiedLinkError`.
+In-harness-compilable (registry + native fns compile and unit-test under `cargo test` with no
+display/VM, exactly like the existing Context-native pattern):
+
+1. New `src/framework/window_registry.rs` (or inline in `framework.rs`): the generational-slab registry
+   (std-only), `allocate() -> i64`, `with_window(jlong, |&mut WindowState|) -> Result`; pack/unpack
+   unit-tested (round-trip, **stale-generation rejection**, `jlong = 0` reserved).
+2. Define `set_jobject`/`set_title`/`set_layout` as `extern "system"` `catch_unwind`-wrapped Rust fns
+   following the existing `native_get_apk_path`/`native_update_config` pattern (`EnvUnowned::with_env` +
+   `resolve::<LogErrorAndDefault>`), registered via `register_native_methods` on `android/view/Window`
+   **before** `Window` is first used. `set_title`/`set_layout` operate on `WindowState` metadata for now
+   (the live winit `Window` is threaded in by the event-loop increment).
+3. A unit test pins the Window native names/descriptors against `Window.java` (mirroring
+   `context_native_names_and_sigs_match_context_java`).
+
+**Not in this increment:** driving step 4 end-to-end (blocked on the View `native_*` cascade), surface
+creation, input. The dev-host discovery loop then surfaces the View natives as the next
+`UnsatisfiedLinkError`s.
+
+### UNCONFIRMED — resolve at implement time (dev-host `eclipse run` + `javap -s`)
+
+- Whether `Activity.onCreate` fires directly from a JNI call or indirectly via
+  `createMainActivity`/`internalCreateActivity`/`activity_start` or the Looper (ATL `main.c` shows
+  `createMainActivity → activity_start`).
+- The **complete** set of natives the View/ViewGroup/FrameLayout construction + `setContentView` cascade
+  invokes for the real Roblox APK (enumerate by running until no `UnsatisfiedLinkError`). The Window
+  natives are **necessary but not sufficient**.
+- Whether `set_jobject` should store a `GlobalRef` or `WeakGlobalRef` (ATL uses `_WEAK_REF`; affects GC
+  pinning of the Java `Window`), and how a slab-stored `jni 0.22` `GlobalRef` interacts with attach
+  lifetimes.
+- Whether `jni 0.22` `register_native_methods` reliably intercepts ATL's name-based lazy binding for
+  `android/view/Window`, and whether ATL's GTK natives dir must be dropped from `java.library.path`
+  (`library_path_option` also feeds libcore/other framework JNI backends — dropping it wholesale could
+  break the boot; resolve which natives must come from ATL vs Eclipse on the dev host).
+- Exact winit 0.30.x `request_inner_size` behavior and which handle API (concrete `Window` vs trait
+  object) this tree uses in `resumed()`.
+- The precise runtime `RawWindowHandle`/`RawDisplayHandle` variant (Wayland vs X11) and the ash-window
+  `create_surface` signature for the pinned `ash`/rwh versions (which must match winit's rwh exactly) —
+  deferred to the surface increment.
+- Whether `jlong = 0` is the only null the framework passes, or if `createMainActivity` is ever called
+  with a pre-existing non-null handle from `createApplication` (handle identity across steps 1→4).
+
 ## Sources
 
 - [art_standalone (GitLab)](https://gitlab.com/android_translation_layer/art_standalone) — base `android-6.0.1_r46`, build outputs, patches
