@@ -629,6 +629,52 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel track, and the engine will
   eventually render into THIS window's swapchain via WSI translation. Stay non-GTK; validate via dev-host
   `eclipse run`.
+  ✅ **DONE 2026-06-05: FRAMEWORK-BREADTH track — ran TWO more ATL Java/UI demos via the discovery loop;
+  bound 3 generalizing benign natives; mapped 2 honest out-of-scope frontiers (NO regression to demo_app).**
+  Goal: validate the runtime generalizes beyond demo_app. Picked Java/Kotlin UI demos with classes.dex and
+  **no `lib/*.so` engine** (no bionic-reloc wall). Faithful results:
+  • **`com.ashwin.example.accelerometerdemo.apk`** (Kotlin, `MainActivity : AppCompatActivity`, classes.dex,
+    sensor app). First run: step 4 `Activity.createMainActivity` threw
+    `RuntimeException: Can't create handler inside thread that has not called Looper.prepare()` — every
+    `AppCompatActivity`/`FragmentActivity` builds a `Handler` in a field initializer, and Eclipse's lifecycle
+    driver ran on a JNI-attached main thread with **no prepared Looper** (demo_app's plain Activity never
+    touched a Handler, so this gap was latent). **ROOT-CAUSE FIX:** added **step 0 `Looper.prepareMainLooper()`**
+    to `drive_lifecycle` (matching ATL's recipe, whose boot sequence starts with `prepare_main_looper`) BEFORE
+    step 1. Discovery loop then surfaced **`android.os.MessageQueue.nativeInit()J`** (the main MessageQueue's
+    ctor) → bound non-GTK (instance native; returns a non-zero non-pointer sentinel — no `Looper.loop()` runs,
+    so the handle has no dereferencing consumer; documented to become a real registry if a queue native is ever
+    bound). Re-run: step 0 + step 4 pass, **`Activity.onCreate` IS REACHED and runs the app's own Kotlin**
+    (`- onCreate - yay!`), then `setContentView` hits the app's BUNDLED AppCompat support lib:
+    `java.lang.IllegalStateException: You need to use a Theme.AppCompat theme (or descendant) with this activity`
+    (`android.support.v7.app.AppCompatDelegateImplV9.createSubDecor`). **OUT-OF-SCOPE STOP (faithful):** this is
+    a Java exception in the app's own bundled library, raised because the activity's Theme doesn't resolve the
+    `AppCompatTheme.windowActionBar` styled attribute — it needs deep ARSC theme/style **parent-chain** resolution
+    (`@style/AppTheme` → `Theme.AppCompat.*` applied into the theme registry + `obtainStyledAttributes(int[])`
+    resolving each `AppCompatTheme` attr from `resources.arsc`) — a resource/asset render-build, NOT a benign
+    `android.* No implementation found` native (grep confirmed **0** `No implementation found` in the run).
+    Faithful log: `/tmp/eclipse-demo2.log`.
+  • **`AdaptiveIconDemo.apk`** (Java, plain Activity, no AppCompat). Discovery loop surfaced + bound two more
+    benign View-family peer-constructor natives: **`android.widget.ImageView.native_constructor(Context,
+    AttributeSet)J`** (re-declared per-class like TextView → reuses the class-agnostic `view_native_constructor`,
+    records `android.widget.ImageView` in `view_registry`) and **`android.graphics.drawable.Drawable.
+    native_constructor()J`** (instance, no args; non-zero non-pointer sentinel — `Drawable.<init>` only needs
+    `mNativePtr != 0`; no draw pass runs). With those, AdaptiveIconDemo reaches **the SAME depth as demo_app**:
+    `onCreate → setContentView → onContentChanged` (all "yay!"), full inflation. **OUT-OF-SCOPE STOP (faithful):**
+    next native is **`android.graphics.Path.native_create_builder(long,long)J`** via
+    `AdaptiveIconDrawable.<init> → PathParser.createPathFromPathData → Path.moveTo` — the start of the **2D
+    vector-path geometry engine** (Skia-equivalent: `native_create_builder` returns a builder that subsequent
+    `moveTo`/`lineTo`/`close` calls really mutate + read back to build the adaptive-icon mask). A sentinel here
+    would FAKE geometry (forbidden); this is the deferred render build. Faithful log: `/tmp/eclipse-AdaptiveIconDemo.log`.
+  • **multitouch.test_19** + AdaptiveIcon/accelerometer all reach `Application.onCreate` (steps 1–3) cleanly;
+    multitouch hits the same AppCompat-theme wall.
+  **NO REGRESSION:** demo_app still drives **steps 1–7 → ActivityResumed + Vulkan render**, zero VK_ERROR/panic
+  (`/tmp/eclipse-demo1-final.log`); step 0 Looper is harmless for demo_app and required for any real AppCompat
+  app + benefits Roblox. **3 natives bound** (`MessageQueue.nativeInit`, `ImageView.native_constructor`,
+  `Drawable.native_constructor`) + step-0 `Looper.prepareMainLooper`. Gate clean: **134 unit + 2 doctests**
+  (3 new name/sig-pin tests: `message_queue_…`/`image_view_…`/`drawable_native_…`), fmt/clippy `-D warnings`/
+  release all 0-warning. The two next framework-breadth tracks (both deferred, not subagent-safe): (A) ARSC
+  theme parent-chain + `obtainStyledAttributes(int[])` resolution → unblocks every AppCompat app; (B) the 2D
+  Path/Skia-equivalent vector-graphics engine → unblocks drawable rendering.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -1920,6 +1966,35 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   build). Cyber-safeguard did NOT trip (read CLAUDE.md/AGENTS.md + ran the demo + grepped logs; NO vendor/atl, NO
   bionic/linker source, NO src/framework.rs wholesale, NO web). Committed to main as Kuenec, no co-author trailer,
   NOT pushed.
+- **2026-06-05** — 🟢 **FRAMEWORK BREADTH: drove two more ATL Java/UI demos via the discovery loop; bound 3
+  generalizing benign natives + step-0 Looper; mapped 2 honest out-of-scope frontiers; NO regression.** Goal: prove
+  the runtime generalizes past demo_app. Ran (`timeout 90 cargo run --release -- run <apk>`) Java/Kotlin UI demos
+  with classes.dex and **no `lib/*.so`** (no bionic-reloc wall). **ROOT CAUSE #1 (accelerometerdemo, a Kotlin
+  `AppCompatActivity`): step 4 threw `Can't create handler inside thread that has not called Looper.prepare()`** —
+  the lifecycle ran on a JNI-attached main thread with no prepared Looper, and `FragmentActivity` builds a `Handler`
+  in a field initializer (demo_app's plain Activity never did, so the gap was latent). Fixed by adding **step 0
+  `Looper.prepareMainLooper()`** to `drive_lifecycle` BEFORE step 1 (matches ATL's recipe, whose boot starts with
+  `prepare_main_looper`); the loop then surfaced **`android.os.MessageQueue.nativeInit()J`** → bound non-GTK
+  (instance native, non-zero non-pointer sentinel; no `Looper.loop()` runs so the handle is never dereferenced —
+  documented to become a registry if a queue native is ever bound). accelerometerdemo now **reaches `Activity.onCreate`
+  running its own Kotlin** (`- onCreate - yay!`), then STOPs at its **bundled** AppCompat lib:
+  `IllegalStateException: You need to use a Theme.AppCompat theme` (`AppCompatDelegateImplV9.createSubDecor`) — an
+  app-library Java exception needing deep ARSC theme parent-chain + `obtainStyledAttributes(int[])` resolution
+  (resource/render build), **not** a benign `No implementation found` native (0 in the run). **ROOT CAUSE #2
+  (AdaptiveIconDemo, plain Activity): two View-family peer ctors surfaced** → bound **`android.widget.ImageView.
+  native_constructor(Context,AttributeSet)J`** (reuses the class-agnostic `view_native_constructor`) +
+  **`android.graphics.drawable.Drawable.native_constructor()J`** (instance, non-zero non-pointer sentinel; only
+  `mNativePtr != 0` required, no draw pass). AdaptiveIconDemo now reaches **demo_app depth** (onCreate →
+  setContentView → onContentChanged), then STOPs at **`android.graphics.Path.native_create_builder(long,long)J`**
+  via `AdaptiveIconDrawable → PathParser → Path.moveTo` — the 2D vector-path (Skia-equivalent) geometry engine; a
+  sentinel would FAKE geometry (forbidden), so this is the deferred render build. **NO REGRESSION:** demo_app still
+  drives steps 1–7 → ActivityResumed + Vulkan render, 0 VK_ERROR/panic (step-0 Looper harmless for it, required for
+  AppCompat apps + Roblox). Gate clean: **134 unit + 2 doctests** (3 new name/sig-pin tests
+  `message_queue_/image_view_/drawable_native_`), fmt/clippy `-D warnings`/release all 0-warning. Files:
+  `src/framework.rs` only (3 native bindings + step 0 + 3 tests). Cyber-safeguard did NOT trip (signatures from the
+  benign ART `No implementation found` lines + AOSP Java contracts; NO vendor/atl, NO bionic/linker, NO web, NO
+  framework.rs wholesale read). Two next deferred framework-breadth tracks: (A) ARSC theme parent-chain → every
+  AppCompat app; (B) 2D Path/Skia engine → drawable rendering. Committed to main as Kuenec, no co-author, NOT pushed.
 
 ---
 
