@@ -181,16 +181,16 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     eclipse::runtime::whitelist_bionic_library_path(&fw, Some(&app_lib_dir))?;
     println!("bionic linker search path whitelisted (dl_parse_library_path) ✓");
 
-    // Route the native engine `libroblox.so` through Eclipse's OWN Rust loader (NOT the apkenv shim
-    // linker, which aborts on the engine's modern relocs). Map + relocate (527,843) + fully resolve
-    // (all 584 imports) + run the 3,427 DT_INIT_ARRAY constructors, then call the engine's exported
-    // JNI_OnLoad with the REAL ART JavaVM (registering its native methods). The returned LoadedEngine
-    // is BOUND for the process lifetime (its mapping must stay live — the engine spawns background
-    // workers that execute the mapped text). Skipped (None) for APKs without lib/x86_64/libroblox.so
-    // (e.g. the pure-Java demo_app), so the demo lifecycle path is unchanged. Runs on this (main)
-    // thread, with the VM alive and JNI-attached, BEFORE the lifecycle drives Roblox's onCreate (where
-    // its Java would otherwise call System.loadLibrary("roblox")).
-    let _engine = load_engine_via_rust_loader(&mut apk, std::path::Path::new(apk_path), &vm)?;
+    // Route the app's x86_64 JNI libs through Eclipse's OWN Rust loader (NOT the apkenv shim linker,
+    // which aborts on their modern relocs — R_X86_64_TPOFF64). Each is mapped + relocated + fully
+    // resolved + init-run + (if it exports JNI_OnLoad) handed the REAL ART JavaVM. The returned images
+    // are BOUND for the process lifetime (libroblox spawns workers that execute the mapped text).
+    // Skipped entirely for APKs without lib/x86_64/libroblox.so (e.g. the pure-Java demo_app), so the
+    // demo lifecycle path is unchanged. Runs on this (main) thread, VM alive + JNI-attached, BEFORE the
+    // lifecycle drives Roblox's onCreate (where androidx.startup would call System.loadLibrary for
+    // libroblox AND zstd-jni — both now already loaded here, so neither falls to apkenv).
+    let _engines =
+        preload_app_native_libs(&mut apk, std::path::Path::new(apk_path), &app_lib_dir, &vm)?;
 
     // Drive the confirmed lifecycle recipe on this (main) thread, with the VM alive: wrap the held VM
     // with the `jni` crate, bind Eclipse's own non-GTK backing for the framework natives via
@@ -217,48 +217,109 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Load the native engine `libroblox.so` through Eclipse's own Rust loader (map, relocate, resolve,
-/// run `DT_INIT_ARRAY`), then call its exported `JNI_OnLoad` with the live ART `JavaVM`. Returns the
-/// persistent [`LoadedEngine`](eclipse::loader::engine::LoadedEngine) the caller binds for the process
-/// lifetime, or `None` for an APK without `lib/x86_64/libroblox.so` (the pure-Java demo APKs keep the
-/// existing framework-only path, no regression).
+/// The ABI Eclipse runs (Android x86-64) and the engine's file name — kept here so the pre-load loop
+/// names them once.
+const TARGET_ABI: &str = "x86_64";
+const ENGINE_FILENAME: &str = "libroblox.so";
+
+/// Pre-load the app's x86-64 JNI libs through Eclipse's own Rust loader (map, relocate, resolve, init,
+/// `JNI_OnLoad`), so each is already loaded — and its native methods registered — BEFORE the framework
+/// lifecycle, instead of falling to ART's `Runtime.nativeLoad` → the apkenv shim linker (which aborts
+/// on their modern relocations). Returns the persistent
+/// [`PreloadedLib`](eclipse::loader::engine::PreloadedLib)s the caller binds for the process lifetime,
+/// or an empty `Vec` for an APK without `lib/x86_64/libroblox.so` (pure-Java demo APKs keep the
+/// framework-only path — no regression).
 ///
-/// This is the engine-load INTERCEPTION: it routes libroblox through the Rust loader instead of ART's
-/// `Runtime.nativeLoad` → apkenv shim linker (which aborts on the engine's modern relocations). Runs
-/// on the process main thread with the VM alive and JNI-attached.
-fn load_engine_via_rust_loader(
+/// `libroblox` is loaded FIRST and is **mandatory** (its workers + `JNI_OnLoad` are load-bearing; a
+/// failure aborts the boot). The remaining libs (e.g. `libzstd-jni`, which `androidx.startup` loads in
+/// `onCreate`) are loaded next, each **tolerant of failure** (a per-lib error logs a warning and the
+/// loop continues — one optional lib must not abort the boot). Dedup is by soname, so a lib already
+/// pulled in as a sibling `DT_NEEDED` is skipped. Runs on the process main thread, VM alive + JNI-attached.
+fn preload_app_native_libs(
     apk: &mut eclipse::apk::Apk,
     apk_path: &std::path::Path,
+    app_lib_dir: &std::path::Path,
     vm: &eclipse::runtime::Vm,
-) -> Result<Option<eclipse::loader::engine::LoadedEngine>, Box<dyn std::error::Error>> {
+) -> Result<Vec<eclipse::loader::engine::PreloadedLib>, Box<dyn std::error::Error>> {
     // Cheap presence check (file-name scan, no 111 MiB read): only route when the x86_64 engine is in
     // the APK. demo_app/accelerometerdemo have no native lib here → skip, preserving the framework path.
     let has_engine = apk
         .native_abis()
         .iter()
-        .any(|abi| abi.name == "x86_64" && abi.has_engine);
+        .any(|abi| abi.name == TARGET_ABI && abi.has_engine);
     if !has_engine {
         println!("# No lib/x86_64/libroblox.so in APK — skipping the Rust engine loader (framework-only path).");
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    println!("# Loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…");
     let mut log = std::io::stdout();
-    let mut engine = eclipse::loader::engine::load_libroblox(apk_path, &mut log)?;
-    // Run the 3,427 DT_INIT_ARRAY constructors (proven deterministic, EXIT=0; spawns the engine's
-    // background workers — `engine` must stay alive past here, which the caller's binding ensures).
-    let completed = engine.run_init_array(&mut log)?;
-    println!("engine static-init: {completed} DT_INIT_ARRAY constructor(s) completed ✓");
+    let vm_raw = vm.as_raw();
+    let mut loaded: Vec<eclipse::loader::engine::PreloadedLib> = Vec::new();
 
-    // Hand the engine the REAL ART JavaVM via JNI_OnLoad so it RegisterNatives its methods against ART.
-    let version = eclipse::loader::engine::call_jni_onload(&engine, vm.as_raw(), &mut log)?;
-    if version < 0 {
-        // A negative return = the engine's JNI_OnLoad reported an error (the next discovery frontier).
-        println!(
-            "engine JNI_OnLoad returned an error sentinel ({version:#x}) — see the log above."
-        );
-    } else {
-        println!("engine JNI_OnLoad returned JNI version {version:#x} ✓ (native methods registered against ART)");
+    // 1) The engine FIRST + mandatory: a failure here is a real boot blocker (its DT_INIT_ARRAY workers
+    //    + JNI_OnLoad must run before the lifecycle).
+    println!("# Pre-loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…");
+    let engine = eclipse::loader::engine::load_app_native_lib(
+        apk_path,
+        ENGINE_FILENAME,
+        vm_raw,
+        app_lib_dir,
+        &mut log,
+    )?
+    .ok_or("libroblox.so unexpectedly deduped on first load")?;
+    report_preloaded(&engine);
+    loaded.push(engine);
+
+    // 2) The app's other x86_64 JNI libs, each TOLERANT of failure (an optional lib must not abort the
+    //    boot). zstd-jni (androidx.startup) is the immediate one; the rest are pre-loaded too so their
+    //    later System.loadLibrary also skips apkenv. Dedup by soname skips libroblox (already loaded).
+    let filenames = apk.native_lib_filenames(TARGET_ABI);
+    println!(
+        "# Pre-loading {} other x86_64 JNI lib(s) via the Rust loader (tolerant of per-lib failure)…",
+        filenames.iter().filter(|f| *f != ENGINE_FILENAME).count()
+    );
+    for filename in &filenames {
+        if filename == ENGINE_FILENAME {
+            continue; // already loaded (step 1)
+        }
+        match eclipse::loader::engine::load_app_native_lib(
+            apk_path,
+            filename,
+            vm_raw,
+            app_lib_dir,
+            &mut log,
+        ) {
+            Ok(Some(lib)) => {
+                report_preloaded(&lib);
+                loaded.push(lib);
+            }
+            Ok(None) => {} // deduped (already pulled in as a sibling DT_NEEDED)
+            Err(e) => {
+                // Tolerate: log + continue. An optional JNI lib that fails to pre-load falls back to
+                // ART's nativeLoad if its Java ever loads it; it must not abort the whole boot.
+                eprintln!("# WARNING: pre-load of {filename} failed (continuing): {e}");
+            }
+        }
     }
-    Ok(Some(engine))
+
+    println!(
+        "engine pre-load complete: {} x86_64 JNI lib(s) loaded via the Rust loader ✓",
+        loaded.len()
+    );
+    Ok(loaded)
+}
+
+/// Print a one-line summary of a pre-loaded lib (constructors run + `JNI_OnLoad` result).
+fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
+    let ctors = if lib.constructors_run > 0 {
+        format!("{} ctor(s)", lib.constructors_run)
+    } else {
+        "no ctors".to_string()
+    };
+    let onload = match lib.jni_onload_version {
+        Some(v) if v < 0 => format!("JNI_OnLoad error {v:#x}"),
+        Some(v) => format!("JNI_OnLoad → {v:#x}"),
+        None => "lazy natives (no JNI_OnLoad)".to_string(),
+    };
+    println!("  {} ✓ ({ctors}; {onload})", lib.soname);
 }

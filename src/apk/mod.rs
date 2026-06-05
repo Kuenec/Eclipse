@@ -160,6 +160,27 @@ impl Apk {
             .collect()
     }
 
+    /// List the `.so` file names directly under `lib/<abi>/` (flat — no nested dirs), sorted.
+    ///
+    /// 2026-06-05: the engine pre-load loop ([`crate::loader::engine::load_app_native_lib`]) enumerates
+    /// the app's x86-64 JNI libs to route each through Eclipse's Rust loader before the framework
+    /// lifecycle (so `androidx.startup`'s `System.loadLibrary("zstd-jni")` finds it already loaded
+    /// instead of falling to the apkenv shim linker). `file_names()` borrows immutably (`&self`); the
+    /// result is the bare file names (e.g. `libzstd-jni-1.5.7-6.so`), not full entry paths.
+    pub fn native_lib_filenames(&self, abi: &str) -> Vec<String> {
+        let prefix = format!("lib/{abi}/");
+        let mut names: Vec<String> = self
+            .archive
+            .file_names()
+            .filter_map(|n| n.strip_prefix(&prefix))
+            // Only flat `.so` files directly under lib/<abi>/ (no nested-dir entries, no the dir itself).
+            .filter(|rest| !rest.is_empty() && !rest.contains('/') && rest.ends_with(".so"))
+            .map(str::to_owned)
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Locate the x86-64 engine library and report whether it is stored uncompressed.
     ///
     /// Returns [`ApkError::EngineMissing`] if `lib/x86_64/libroblox.so` is not present —
@@ -692,6 +713,37 @@ mod tests {
                 .unwrap()
                 .has_engine
         );
+    }
+
+    #[test]
+    fn native_lib_filenames_lists_flat_so_files_for_the_abi_sorted() {
+        // The engine pre-load loop enumerates lib/x86_64/*.so. Pin: only flat `.so` files under the
+        // requested ABI, bare file names, sorted, deduped of the dir entry / wrong ABI / non-.so / nested.
+        let bytes = build_apk(&[
+            ("lib/x86_64/libroblox.so", b"engine"),
+            ("lib/x86_64/libzstd-jni-1.5.7-6.so", b"zstd"),
+            ("lib/x86_64/libeigen_blas.so", b"blas"),
+            ("lib/x86_64/notashared.txt", b"txt"), // non-.so under the ABI: excluded
+            ("lib/x86_64/nested/deep.so", b"nested"), // nested dir: excluded (flat only)
+            ("lib/arm64-v8a/libroblox.so", b"arm"), // wrong ABI: excluded
+            ("classes.dex", b"dex"),
+        ]);
+        let (apk, path) = open_apk(&bytes, "lib-filenames");
+        let names = apk.native_lib_filenames("x86_64");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            names,
+            vec![
+                "libeigen_blas.so".to_string(),
+                "libroblox.so".to_string(),
+                "libzstd-jni-1.5.7-6.so".to_string(),
+            ]
+        );
+        // A pure-Java APK (no lib/<abi>/) yields an empty list — the gate that skips the pre-load loop.
+        let java_only = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST), ("classes.dex", b"dex")]);
+        let (apk2, p2) = open_apk(&java_only, "lib-filenames-empty");
+        assert!(apk2.native_lib_filenames("x86_64").is_empty());
+        std::fs::remove_file(&p2).ok();
     }
 
     #[test]

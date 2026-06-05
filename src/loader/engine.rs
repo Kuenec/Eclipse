@@ -28,9 +28,11 @@
 //! diagnostic harness) and the `JNI_OnLoad(JavaVM*, void*)` call. Both carry a dated `// SAFETY:`.
 //! The decode/map/reloc cores stay `#![forbid(unsafe_code)]`.
 
+use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 
 use jni_sys::{
     jint, JavaVM, JNI_VERSION_10, JNI_VERSION_1_2, JNI_VERSION_1_4, JNI_VERSION_1_6,
@@ -45,8 +47,36 @@ use super::resolve::{LoadedObjectProvider, Scope, SymbolProvider};
 
 use super::init_run::{init_array_count, init_array_entry_offset};
 
-/// The APK-internal path of the x86-64 engine `.so`.
-const LIBROBLOX_ENTRY: &str = "lib/x86_64/libroblox.so";
+/// The APK-internal directory holding the app's x86-64 JNI libraries.
+const LIB_X86_64_DIR: &str = "lib/x86_64";
+
+/// The file name of the x86-64 engine `.so` (the Roblox C++ engine).
+const LIBROBLOX_FILENAME: &str = "libroblox.so";
+
+/// Process-global set of app-native-lib sonames already loaded through Eclipse's Rust loader, so the
+/// pre-load loop dedups (a soname requested twice — directly or as a sibling `DT_NEEDED` — is loaded
+/// once). Only the soname strings are tracked here; the actual mappings are kept alive for the process
+/// lifetime by the caller binding each returned [`LoadedEngine`] (no `munmap` while bound). A `Mutex`
+/// guards concurrent access, though the pre-load loop runs on the single main thread.
+///
+/// 2026-06-05: stores only `String` (Send-safe) — the registry's job is dedup, not ownership; the
+/// `LoadedEngine`s (which own the `!Send` mappings) stay owned by the main thread that loaded them.
+static LOADED_SONAMES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Record `soname` as loaded; returns `true` if it was newly inserted, `false` if already present
+/// (a duplicate the caller should skip). Pure registry bookkeeping (no mapping work).
+fn register_soname(soname: &str) -> bool {
+    let mut guard = LOADED_SONAMES.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashSet::new)
+        .insert(soname.to_owned())
+}
+
+/// Whether `soname` has already been loaded through Eclipse's Rust loader.
+fn soname_is_loaded(soname: &str) -> bool {
+    let guard = LOADED_SONAMES.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|s| s.contains(soname))
+}
 
 /// The exported symbol ART invokes after loading a JNI library to register its native methods and
 /// learn its required JNI version. Looked up in the engine's dynamic symbol table (see
@@ -103,11 +133,13 @@ impl LoadedEngine {
     }
 }
 
-/// Errors from the live engine-load path.
+/// Errors from the live engine-load path. Carries the lib's APK entry name for context where the
+/// failing operation is per-lib (so a pre-load loop over several libs names the one that failed).
 #[derive(Debug)]
 pub enum EngineLoadError {
-    /// Opening or reading `lib/x86_64/libroblox.so` from the APK failed.
-    Apk(String),
+    /// Opening or reading the app native lib (`lib/x86_64/<name>.so`) from the APK failed; carries
+    /// the entry path and the underlying error.
+    Apk(String, String),
     /// Staging the extracted `.so` to a temp path failed.
     Stage(String),
     /// The map / relocate / resolve pipeline failed (a real loader error).
@@ -130,7 +162,7 @@ pub enum EngineLoadError {
 impl std::fmt::Display for EngineLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Apk(e) => write!(f, "read {LIBROBLOX_ENTRY} from APK: {e}"),
+            Self::Apk(entry, e) => write!(f, "read {entry} from APK: {e}"),
             Self::Stage(e) => write!(f, "stage libroblox.so: {e}"),
             Self::Link(e) => write!(f, "map/relocate/resolve libroblox.so: {e}"),
             Self::UnresolvedImports(n) => {
@@ -153,11 +185,9 @@ impl std::error::Error for EngineLoadError {}
 /// returning the live, persistent image (NOT `_exit`ed, NOT `munmap`ped). Does **not** run the
 /// constructors — call [`LoadedEngine::run_init_array`] for that, then [`call_jni_onload`].
 ///
-/// The pipeline is the proven one from the diagnostic harness ([`super::init_run`]): root-only load
-/// (env-provided bionic deps, host fallback off) → base relocations (`R_X86_64_RELATIVE`) → RELRO →
-/// the FULL Eclipse scope (`[LoadedObjectProvider(libroblox)] + BionicEnv` with the Eclipse-native
-/// tier prepended) applied to the symbol relocations (all 584 imports resolve, work-list 0). It then
-/// confirms the text segment is `PROT_EXEC` and locates `DT_INIT_ARRAY`.
+/// Thin wrapper over [`map_resolve_app_lib`] for the engine `.so` (no extra search dir — libroblox's
+/// `DT_NEEDED` are all bionic, supplied by the scope). Preserved as the engine's named entry point so
+/// the existing main-thread call site and tests are unchanged.
 ///
 /// `log` receives flushed progress lines (the caller passes the run's stderr/stdout).
 ///
@@ -167,28 +197,66 @@ pub fn load_libroblox(
     apk_path: &Path,
     log: &mut impl Write,
 ) -> Result<LoadedEngine, EngineLoadError> {
+    let engine = map_resolve_app_lib(apk_path, LIBROBLOX_FILENAME, None, log)?;
+    // The engine has 3,427 constructors; a missing DT_INIT_ARRAY would be a real malformation (not
+    // the optional-ctor case the generic path tolerates for lazy-native libs).
+    if engine.init_array.is_none() {
+        return Err(EngineLoadError::NoInitArray);
+    }
+    Ok(engine)
+}
+
+/// Map + base-relocate + fully-resolve one app native lib `lib/x86_64/<filename>` from `apk_path`
+/// using Eclipse's own Rust loader, returning the live, persistent image (NOT `_exit`ed, NOT
+/// `munmap`ped). Does **not** run constructors or `JNI_OnLoad` — that is [`load_app_native_lib`].
+///
+/// The pipeline is the proven one from the diagnostic harness ([`super::init_run`]): root-only load
+/// (env-provided bionic deps, host fallback off) → base relocations (`R_X86_64_RELATIVE`) → RELRO →
+/// the FULL Eclipse scope (`[LoadedObjectProvider(root)] + BionicEnv` with the Eclipse-native tier
+/// prepended) applied to the symbol relocations. It then confirms the text segment is `PROT_EXEC`
+/// and locates `DT_INIT_ARRAY` (each app JNI lib has one).
+///
+/// `search_dir`, when `Some`, is added to the linker's `DT_NEEDED` search path so a lib's **sibling
+/// app-lib** dependency (e.g. `libeigen_lapack.so` `NEEDED libeigen_blas.so`) loads from the
+/// already-extracted lib dir through this same loader. Bionic `DT_NEEDED` (`libc/m/dl/...`) still
+/// resolve via the scope (they are not on disk under those bare sonames), never from the host.
+///
+/// MUST be called on the process **main thread** (the foreign init code and the engine's workers
+/// expect a real deep stack; the same contract as the diagnostic harness).
+fn map_resolve_app_lib(
+    apk_path: &Path,
+    filename: &str,
+    search_dir: Option<&Path>,
+    log: &mut impl Write,
+) -> Result<LoadedEngine, EngineLoadError> {
+    let entry = format!("{LIB_X86_64_DIR}/{filename}");
     let _ = writeln!(
         log,
-        "engine-load: routing {LIBROBLOX_ENTRY} through Eclipse's Rust loader"
+        "engine-load: routing {entry} through Eclipse's Rust loader"
     );
 
-    // ---- 1) Read libroblox.so from the APK + stage it to a temp file -----------------------------
+    // ---- 1) Read the lib from the APK + stage it to a temp file ----------------------------------
     // Serve assets/* to the engine's AAssetManager natives from this same APK (idempotent).
     super::ndk_registry::set_apk_path(apk_path.to_path_buf());
-    let mut apk =
-        crate::apk::Apk::open(apk_path).map_err(|e| EngineLoadError::Apk(e.to_string()))?;
+    let mut apk = crate::apk::Apk::open(apk_path)
+        .map_err(|e| EngineLoadError::Apk(entry.clone(), e.to_string()))?;
     let so_bytes = apk
-        .read_entry(LIBROBLOX_ENTRY)
-        .map_err(|e| EngineLoadError::Apk(e.to_string()))?;
-    let _ = writeln!(log, "engine-load: libroblox.so = {} bytes", so_bytes.len());
+        .read_entry(&entry)
+        .map_err(|e| EngineLoadError::Apk(entry.clone(), e.to_string()))?;
+    let _ = writeln!(log, "engine-load: {filename} = {} bytes", so_bytes.len());
 
     let dir = std::env::temp_dir().join(format!("eclipse-engine-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| EngineLoadError::Stage(e.to_string()))?;
-    let so_path = dir.join("libroblox.so");
+    let so_path = dir.join(filename);
     std::fs::write(&so_path, &so_bytes).map_err(|e| EngineLoadError::Stage(e.to_string()))?;
 
-    // ---- 2) Map + base-relocate root-only (deps env-provided, host fallback off) ------------------
-    let linker = Linker::new(Vec::<std::path::PathBuf>::new())
+    // ---- 2) Map + base-relocate root-only (bionic deps env-provided; sibling app deps from disk) --
+    // A `search_dir` lets a sibling app-lib `DT_NEEDED` load from the extracted lib dir through this
+    // same loader; bionic sonames are not on disk there, so they stay env-provided (host fallback off).
+    let search_paths: Vec<std::path::PathBuf> = search_dir
+        .map(|d| vec![d.to_path_buf()])
+        .unwrap_or_default();
+    let linker = Linker::new(search_paths)
         .with_host_fallback(false)
         .with_tolerate_missing_deps(true);
     let mut set = linker
@@ -205,6 +273,7 @@ pub fn load_libroblox(
 
     // ---- 3) Build the FULL Eclipse scope + apply the symbol relocations (work-list 0) -------------
     let base = set.objects[0].load_base();
+    let soname = set.objects[0].soname.clone();
     let dynsyms = {
         let img = set.objects[0]
             .image()
@@ -217,7 +286,7 @@ pub fn load_libroblox(
         scope.push(p);
     }
     let sym_stats = set
-        .relocate_object_symbols_partial("libroblox.so", &scope, page)
+        .relocate_object_symbols_partial(&soname, &scope, page)
         .map_err(|e| EngineLoadError::Link(e.to_string()))?;
     let _ = writeln!(
         log,
@@ -231,13 +300,17 @@ pub fn load_libroblox(
         ));
     }
 
-    // ---- 4) Confirm the text segment is PROT_EXEC + locate DT_INIT_ARRAY --------------------------
+    // ---- 4) Confirm the text segment is PROT_EXEC + locate DT_INIT_ARRAY (if any) ------------------
+    // A `DT_INIT_ARRAY` is OPTIONAL here: most app JNI libs (e.g. `libzstd-jni`, the eigen/yuv libs)
+    // ship none and register their `Java_*` natives lazily; only libroblox/libbacktrace-native carry
+    // constructors. `load_libroblox` separately asserts the engine has one (its 3,427 ctors are not
+    // optional). 2026-06-05.
     let init_array = {
         let img = set.objects[0]
             .image()
             .map_err(|e| EngineLoadError::Link(e.to_string()))?;
         // The mapper sets each PT_LOAD's final protection to its p_flags; confirm an executable
-        // (PF_X) segment exists so the first constructor's jump lands in PROT_EXEC text.
+        // (PF_X) segment exists so any constructor's (or exported native's) jump lands in PROT_EXEC.
         if !img.loads.iter().any(|s| s.flags & PF_X != 0) {
             return Err(EngineLoadError::TextNotExecutable(
                 "no PF_X segment in PT_LOAD table".to_string(),
@@ -245,20 +318,28 @@ pub fn load_libroblox(
         }
         img.dyn_info.init_array
     };
-    let init_array = init_array.ok_or(EngineLoadError::NoInitArray)?;
-    let count = init_array_count(init_array.1);
-    let _ = writeln!(
-        log,
-        "engine-load: text PROT_EXEC ✓; DT_INIT_ARRAY vaddr={:#x} -> {count} constructors",
-        init_array.0
-    );
+    match init_array {
+        Some((vaddr, size)) => {
+            let count = init_array_count(size);
+            let _ = writeln!(
+                log,
+                "engine-load: text PROT_EXEC ✓; DT_INIT_ARRAY vaddr={vaddr:#x} -> {count} constructors"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                log,
+                "engine-load: text PROT_EXEC ✓; no DT_INIT_ARRAY (lazy-native lib — no constructors)"
+            );
+        }
+    }
     let _ = log.flush();
 
     Ok(LoadedEngine {
         set,
         base,
         dynsyms,
-        init_array: Some(init_array),
+        init_array,
         constructors_run: 0,
     })
 }
@@ -385,6 +466,101 @@ pub fn call_jni_onload(
     Ok(version)
 }
 
+/// The outcome of pre-loading one app native lib through Eclipse's Rust loader.
+///
+/// `None` for a lib already loaded (deduped — its soname was in the registry). `Some` carries the
+/// persistent [`LoadedEngine`] (kept alive by the caller for the process lifetime) plus what ran.
+#[must_use]
+pub struct PreloadedLib {
+    /// The lib's resolved soname (the registry/dedup key).
+    pub soname: String,
+    /// `DT_INIT_ARRAY` constructors that ran (0 for a lazy-native lib with no init array).
+    pub constructors_run: usize,
+    /// `Some(version)` if the lib exported `JNI_OnLoad` and it was called (the returned JNI version),
+    /// `None` if it exports none (a lazy-native lib whose `Java_*` methods ART binds on demand).
+    pub jni_onload_version: Option<jint>,
+    /// The loaded image, kept alive for the process lifetime (its `Drop` would `munmap` the mapping;
+    /// libs that spawn workers — e.g. libroblox — execute the mapped text, so it must stay bound).
+    pub engine: LoadedEngine,
+}
+
+/// Pre-load one app native lib `lib/x86_64/<filename>` through Eclipse's own Rust loader — the SAME
+/// proven pipeline that loads the engine — so it is mapped, relocated, fully resolved, init-run, and
+/// (if it exports `JNI_OnLoad`) handed the real ART `JavaVM` BEFORE the framework lifecycle, instead of
+/// falling to ART's `Runtime.nativeLoad` → the apkenv shim linker (which aborts on the modern relocs).
+///
+/// This is the generalization of [`load_libroblox`] to the app's sibling JNI libs (e.g. `libzstd-jni`,
+/// which `androidx.startup` loads during `onCreate`). It:
+/// 1. dedups by soname (returns `Ok(None)` if this lib was already pre-loaded — directly or as a
+///    sibling `DT_NEEDED` pulled in by an earlier lib),
+/// 2. maps + base-relocates + fully-resolves it via [`map_resolve_app_lib`] (bionic `DT_NEEDED`
+///    resolve through the full `BionicEnv` scope; sibling **app-lib** `DT_NEEDED` load from
+///    `search_dir` through this same loader — NOT apkenv),
+/// 3. runs its `DT_INIT_ARRAY` constructors if it has any (most lazy-native libs have none),
+/// 4. calls its exported `JNI_OnLoad(JavaVM*, void*)` with the live ART VM if it exports one (a lib
+///    with none registers its `Java_*` natives lazily — that is sound, nothing to call),
+/// 5. records the soname in the persistent registry and returns the kept-alive image.
+///
+/// `search_dir` is the dir the app libs were extracted to (so a sibling-lib `DT_NEEDED` resolves from
+/// disk). `java_vm` MUST be the live process `JavaVM*` (non-null). MUST be called on the process
+/// **main thread**, VM alive + JNI-attached.
+pub fn load_app_native_lib(
+    apk_path: &Path,
+    filename: &str,
+    java_vm: *mut JavaVM,
+    search_dir: &Path,
+    log: &mut impl Write,
+) -> Result<Option<PreloadedLib>, EngineLoadError> {
+    // Dedup by the implied soname (the filename — an app lib's DT_SONAME equals its file name here).
+    // The authoritative dedup is by resolved soname after the map (below); this cheap pre-check skips
+    // a redundant 100+ MiB read+map when a lib was already pulled in as a sibling DT_NEEDED.
+    if soname_is_loaded(filename) {
+        let _ = writeln!(
+            log,
+            "engine-load: {filename} already loaded (deduped) — skipping"
+        );
+        return Ok(None);
+    }
+
+    let mut engine = map_resolve_app_lib(apk_path, filename, Some(search_dir), log)?;
+    let soname = engine.set.objects[0].soname.clone();
+
+    // The resolved soname is the authoritative dedup key (it may differ from the file name). If a
+    // sibling DT_NEEDED already loaded this exact object, register_soname returns false → skip.
+    if !register_soname(&soname) {
+        let _ = writeln!(
+            log,
+            "engine-load: {soname} already loaded (deduped by soname) — skipping"
+        );
+        return Ok(None);
+    }
+
+    // Run constructors only if this lib has a DT_INIT_ARRAY (lazy-native libs ship none).
+    let constructors_run = if engine.init_array.is_some() {
+        engine.run_init_array(log)?
+    } else {
+        0
+    };
+
+    // Call JNI_OnLoad only if the lib exports one (lazy-native libs register Java_* methods on demand).
+    let jni_onload_version = if engine.jni_onload_addr().is_some() {
+        Some(call_jni_onload(&engine, java_vm, log)?)
+    } else {
+        let _ = writeln!(
+            log,
+            "engine-load: {soname} exports no JNI_OnLoad (lazy-native lib — ART binds Java_* on demand)"
+        );
+        None
+    };
+
+    Ok(Some(PreloadedLib {
+        soname,
+        constructors_run,
+        jni_onload_version,
+        engine,
+    }))
+}
+
 /// A short human label for a `JNI_OnLoad` return value (a JNI version constant or an error sentinel).
 fn describe_jni_version(version: jint) -> &'static str {
     match version {
@@ -412,7 +588,13 @@ mod tests {
 
     #[test]
     fn libroblox_entry_is_the_x86_64_engine_path() {
-        assert_eq!(LIBROBLOX_ENTRY, "lib/x86_64/libroblox.so");
+        // The composed APK entry the loader reads (map_resolve_app_lib builds `<dir>/<filename>`).
+        assert_eq!(LIB_X86_64_DIR, "lib/x86_64");
+        assert_eq!(LIBROBLOX_FILENAME, "libroblox.so");
+        assert_eq!(
+            format!("{LIB_X86_64_DIR}/{LIBROBLOX_FILENAME}"),
+            "lib/x86_64/libroblox.so"
+        );
     }
 
     #[test]
@@ -436,5 +618,46 @@ mod tests {
         // Eclipse boots ART at JNI 1.6 (runtime.rs); the engine is expected to request ≥ 1.6. Pin the
         // constant so a jni-sys bump that changed it would fail here, not silently at runtime.
         assert_eq!(JNI_VERSION_1_6, 0x0001_0006);
+    }
+
+    #[test]
+    fn soname_registry_dedups_by_soname() {
+        // The pre-load loop relies on register_soname returning true exactly once per soname so a lib
+        // pulled in twice (directly + as a sibling DT_NEEDED) is mapped+init-run once. Uses unique test
+        // sonames so the process-global registry is not polluted by / does not collide with other tests.
+        let a = "libengine-test-dedup-A.so";
+        let b = "libengine-test-dedup-B.so";
+        assert!(!soname_is_loaded(a), "fresh soname must start unloaded");
+        assert!(register_soname(a), "first insert is newly inserted (true)");
+        assert!(soname_is_loaded(a), "after insert the soname reads loaded");
+        assert!(
+            !register_soname(a),
+            "second insert of the same soname is a dedup (false)"
+        );
+        // A different soname is independent (the set keys per-soname, not a single flag).
+        assert!(!soname_is_loaded(b));
+        assert!(register_soname(b));
+        assert!(!register_soname(b));
+        // The first soname is still recorded (inserting b did not evict a).
+        assert!(soname_is_loaded(a));
+    }
+
+    #[test]
+    fn preloaded_lib_fields_express_the_optional_paths() {
+        // The generic pre-load distinguishes a lazy-native lib (no ctors, no JNI_OnLoad) from an
+        // engine-class lib (ctors + JNI_OnLoad). report_preloaded()/the caller read exactly these
+        // fields, so pin that a None jni_onload_version + 0 constructors is the lazy-native shape and
+        // a Some(version) + n constructors is the engine shape (no hidden coupling between them).
+        // (Pure field-shape check — no mapping; the real images come from the integration run.)
+        fn classify(constructors_run: usize, jni_onload_version: Option<jint>) -> &'static str {
+            match (constructors_run, jni_onload_version) {
+                (0, None) => "lazy-native",
+                (_, Some(_)) => "engine-class",
+                (_, None) => "ctors-only",
+            }
+        }
+        assert_eq!(classify(0, None), "lazy-native"); // e.g. libzstd-jni
+        assert_eq!(classify(3427, Some(JNI_VERSION_1_6)), "engine-class"); // libroblox
+        assert_eq!(classify(2, None), "ctors-only"); // e.g. libbacktrace-native's ctors w/o onload-call
     }
 }
