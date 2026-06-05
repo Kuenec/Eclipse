@@ -47,7 +47,7 @@ use std::ptr::NonNull;
 use rustix::mm::{mmap_anonymous, mprotect, munmap, MapFlags, MprotectFlags, ProtFlags};
 
 use super::elf::{ElfImage, LoadSegment, RelroSegment, PF_R, PF_W, PF_X};
-use super::reloc::{self, RelocError, RelocImage};
+use super::reloc::{self, RelocError, RelocImage, SymbolResolver};
 use super::resolve::{Scope, ScopedResolver};
 use super::tls::{TlsLayout, TlsResolver};
 
@@ -147,6 +147,38 @@ pub struct TlsRelocStats {
     /// Number of relocations still deferred after this pass: only `R_X86_64_IRELATIVE` (needs
     /// **executing** the library's ifunc resolvers — explicitly out of scope; nothing is executed).
     pub deferred: usize,
+}
+
+/// Counts from a [`MappedObject::relocate_symbols_partial`] pass — the **bionic-env baseline**
+/// partial GOT/PLT fill. Unlike [`MappedObject::relocate_symbols`] (all-or-nothing: it aborts on the
+/// first unresolved-strong symbol), this pass applies **only** the symbol relocations the scope
+/// resolves and records the rest, never aborting and never fabricating an address.
+///
+/// 2026-06-05 — HONEST: a resolved address here is a **host** (glibc/host-GL) address, a
+/// relocation-pipeline baseline, NOT bionic-ABI-correct execution (see `bionic_env.rs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialSymbolStats {
+    /// Symbol relocations (`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`) applied with a **non-null** resolved
+    /// address (the meaningful host-baseline GOT/PLT fill).
+    pub applied_nonnull: usize,
+    /// Symbol relocations applied as a **weak-undef → 0** (legal per the psABI; the slot is 0).
+    pub applied_weak_zero: usize,
+    /// Symbol relocations **left unapplied** because the referenced **strong** symbol did not resolve
+    /// in the scope (recorded in [`Self::unresolved`], the Eclipse-bionic-native work-list — never
+    /// fabricated, no GOT write).
+    pub unresolved_strong: usize,
+    /// `R_X86_64_TPOFF64` + `R_X86_64_IRELATIVE` counted as deferred (this pass owns neither).
+    pub deferred: usize,
+    /// The names of the unresolved **strong** symbols (sorted, de-duped), the work-list this object
+    /// still needs Eclipse-owned bionic natives for.
+    pub unresolved: Vec<String>,
+}
+
+impl PartialSymbolStats {
+    /// Total symbol relocations applied (non-null + weak-zero) by this partial pass.
+    pub fn total_applied(&self) -> usize {
+        self.applied_nonnull + self.applied_weak_zero
+    }
 }
 
 /// Round `addr` down to the start of its page.
@@ -446,6 +478,114 @@ impl MappedObject {
         stats.resolved_nonnull = resolved_nonnull;
 
         // Restore each segment's final protection (the post-reloc state map_and_relocate set).
+        for seg in &img.loads {
+            self.protect_segment(seg, region_start, page_size)?;
+        }
+
+        Ok(stats)
+    }
+
+    /// **Partial** symbol-relocation pass (the bionic-env BASELINE): apply only the symbol
+    /// relocations (`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`) whose referenced symbol `scope` resolves,
+    /// and **record** the rest — never abort, never fabricate.
+    ///
+    /// 2026-06-05 — This differs from [`Self::relocate_symbols`] (all-or-nothing: it runs
+    /// [`reloc::apply_rela`] over every symbol reloc and aborts on the first unresolved-strong one).
+    /// For the engine's first bionic-env cut, the host can resolve only a *subset* of the 584 UND
+    /// imports; the rest need Eclipse-owned bionic natives (`bionic_env.rs`). This pass fills the
+    /// GOT/PLT slots for the host-resolvable subset (proving the symbol-reloc pipeline on the real
+    /// engine) and leaves every unresolved-strong slot untouched (recorded in
+    /// [`PartialSymbolStats::unresolved`]). A weak-undef the scope does not define is applied as 0
+    /// (legal per the psABI). **HONEST:** the resolved addresses are host (glibc/host-GL) addresses —
+    /// a relocation-pipeline baseline, NOT bionic-ABI-correct execution (see `bionic_env.rs`).
+    ///
+    /// Like [`Self::relocate_symbols`], this makes every segment writable, applies, then restores the
+    /// final protections (so a GOT slot in a RELRO-but-still-RW region is patchable here).
+    pub fn relocate_symbols_partial(
+        &mut self,
+        img: &ElfImage<'_>,
+        scope: &Scope,
+        page_size: u64,
+    ) -> Result<PartialSymbolStats, MapError> {
+        let min_vaddr = img
+            .loads
+            .iter()
+            .map(|s| s.vaddr)
+            .min()
+            .ok_or(MapError::NoLoadSegments)?;
+        let region_start = page_floor(min_vaddr, page_size);
+
+        let relas = img
+            .relocations()
+            .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
+
+        // Partition: for each symbol reloc, ask the scope's resolver. A `Some(nonzero)` → apply
+        // (host baseline fill); `Some(0)` → weak-undef, apply as 0 (legal); `None` → unresolved
+        // strong, RECORD (no write). TPOFF64/IRELATIVE → deferred (this pass owns neither).
+        let resolver = ScopedResolver::new(scope, &img.dynsyms);
+        let mut to_apply: Vec<reloc::Rela> = Vec::new();
+        let mut stats = PartialSymbolStats::default();
+        let mut unresolved_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for r in &relas {
+            match r.r_type {
+                reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64 => {
+                    match resolver.resolve_symbol(r.sym_index) {
+                        Some(0) => {
+                            // Weak-undef → 0 (legal). The slot is already 0 in a fresh GOT, but
+                            // applying it keeps the count honest and is a correct no-op write.
+                            stats.applied_weak_zero += 1;
+                            to_apply.push(*r);
+                        }
+                        Some(_) => {
+                            stats.applied_nonnull += 1;
+                            to_apply.push(*r);
+                        }
+                        None => {
+                            // Unresolved STRONG: record (the work-list), never fabricate, no write.
+                            stats.unresolved_strong += 1;
+                            let name = img
+                                .dynsyms
+                                .get(r.sym_index as usize)
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default();
+                            if !name.is_empty() {
+                                unresolved_names.insert(name);
+                            }
+                        }
+                    }
+                }
+                reloc::R_X86_64_TPOFF64 | R_X86_64_IRELATIVE => stats.deferred += 1,
+                // RELATIVE / DT_RELR were applied by the base pass; nothing else this pass owns.
+                _ => {}
+            }
+        }
+        stats.unresolved = unresolved_names.into_iter().collect();
+
+        let load_base = self.load_base().wrapping_sub(region_start);
+        let tls_off = self.static_tls_offset;
+
+        // Make every segment writable, apply the resolvable subset, restore final protections.
+        for seg in &img.loads {
+            self.mprotect_segment_pages(
+                seg,
+                region_start,
+                page_size,
+                ProtFlags::READ | ProtFlags::WRITE,
+            )?;
+        }
+        {
+            // SAFETY: 2026-06-05 — every segment was just made RW above; `image_bytes` exposes the
+            // mapping as `&mut [u8]` of exactly `span` bytes (see its SAFETY); the reloc core only
+            // writes within `[0, span)`, all bounds-checked. Only the pre-filtered resolvable relocs
+            // are applied, so `apply_one` cannot hit an `UnresolvedSymbol` (the strong-unresolved
+            // ones were partitioned out above).
+            let bytes = unsafe { self.image_bytes() };
+            let mut image = reloc::SliceImage::new(load_base, tls_off, bytes);
+            for r in &to_apply {
+                reloc::apply_one(&mut image, &resolver, r)?;
+            }
+        }
         for seg in &img.loads {
             self.protect_segment(seg, region_start, page_size)?;
         }
