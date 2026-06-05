@@ -131,8 +131,8 @@ before any history-rewriting/force operation.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
-  PROGRESS** — launcher foundation built: `diagnostics` (tracing) + `config` (serde/JSON)
-  done & gated (2026-06-04). Next M1 crates: `apk`, then `runtime`.
+  PROGRESS** — `diagnostics` (tracing) + `config` (serde/JSON) + **`apk`** (zip + own total
+  AXML reader + SHA-256) all done & gated (2026-06-04). Next M1 crate: **`runtime`**.
 
 ### 🟡 M0 STATUS — Steps 1+2 PASSED, Step 3 in progress (low_4gb blocker)
 
@@ -147,6 +147,17 @@ before any history-rewriting/force operation.
   NVIDIA (auto-falls back to GL).
 
 ### 🟡 Step 3 — Roblox boot: ART heap sizing (ACTIVE BLOCKER as of 2026-06-04)
+
+> ⚠️ **CORRECTED 2026-06-04 (manifest now decoded, not inferred):** the `largeHeap="true"`
+> claim below was an **unverified inference** (we had no AXML decoder then). Eclipse's own
+> `apk` reader + two independent tools (pyaxmlparser + raw-byte parse) decode the real
+> v2.724.735 manifest's `android:largeHeap = **false**` (raw bytes @0x7ee4, `TYPE_INT_BOOLEAN`
+> data 0). So the OOM was **not** a largeHeap request — ATL's 256 MB default is simply too small
+> for Roblox's real working set; `-Xmx768m` still got the boot 13.8k lines deep. The largeHeap=true
+> premise is **retracted**; the empirical heap-sizing observations below stand. Also corrected:
+> the manifest's MAIN/LAUNCHER activity is **`com.roblox.client.startup.ActivitySplash`**, not
+> `ActivityNativeMain` (which has no intent-filter); the boot `-l ActivityNativeMain` deliberately
+> bypasses the splash. See §6 (2026-06-04 apk entries).
 
 **What we know (evidence from boot logs in `~/eclipse-m0/`):**
 
@@ -406,33 +417,37 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 - `/home/kue/Projects/Eclipse/vendor/atl/` — local fork build, no longer needed. Safe to `rm -rf` later.
 
 ---
-- **Last verified 2026-06-04:** full gate clean with the M1 foundation wired —
+- **Last verified 2026-06-04:** full gate clean with `diagnostics`+`config`+`apk` wired —
   `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, `cargo test` (6 pass), `cargo build --release`
-  (0 warnings). Binary smoke-tested: `eclipse --version`, `eclipse config` (prints resolved
-  `~/.config/eclipse/config.json` + effective config; partial on-disk file merges over
-  defaults), `RUST_LOG=debug` toggles the startup trace line.
+  --all-features -- -D warnings`, `cargo test` (**24 pass**), `cargo build --release`
+  (0 warnings). The `apk` reader was validated against the **real** Roblox manifest (full
+  zip+deflate+AXML path) → exactly the ground truth: package `com.roblox.client`, launcher
+  `com.roblox.client.startup.ActivitySplash`, min 26, target 35, `largeHeap=false`.
 - **Repo:** git initialized; committed & pushed to `origin/main`
   (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
-- **What exists:** 7 docs + `README` + `eclipse` crate. **M1 foundation done:**
-  `diagnostics` (tracing + tracing-subscriber, `RUST_LOG`→`info` default, idempotent
-  `init`) and `config` (serde/serde_json + `directories`; full Sober schema mirrored with
-  typed enums, `#[serde(default)]` partial-file tolerance, typed no-panic `ConfigError`).
-  `eclipse config` is live. The other 8 modules are still dependency-free stubs.
-- **Deps wired (M1):** `tracing 0.1`, `tracing-subscriber 0.3` (env-filter), `serde 1`,
-  `serde_json 1`, `directories 6`. Cargo.lock committed. (`clap`/`rustix` deferred until
-  the CLI grows — manual arg dispatch is enough for now.)
-- **Open items:** license `TBD`; M1 `apk` + `runtime` crates.
-- **Next actions (pick up here — M1 Rust, continue the order):**
-  1. `apk` crate: fetch/verify the Roblox APK (`ureq` + `rustls` + `zip` + `sha2`,
-     `axmldecoder` for the manifest). See `docs/dependency-plan.md` + the "why user-supplied"
-     note above for the fetch-source strategy (backend service, M1+).
-  2. `runtime` crate: ART boot → `onCreate`. Launcher uses **`winit`** (not GTK4) — this is
-     the architectural fix for Step 3.5 (frees the low_4gb window). Prefer **Vulkan via
-     `ash`** for the surface, GL/EGL fallback (perf — see §6). Also: detect host ISA and
-     pass real `--instruction-set-features` to dex2oat (Step 4 finding).
-  3. With a winit-based boot, re-attempt the Roblox boot to finally harvest
+- **What exists:** 7 docs + `README` + `eclipse` crate. **M1 done so far:**
+  `diagnostics` (tracing, `RUST_LOG`→`info`, idempotent), `config` (serde/JSON + `directories`,
+  full Sober schema, typed no-panic `ConfigError`), **`apk`** (`src/apk/`: open local APK zip,
+  **own total pure-Rust binary AXML reader** `src/apk/axml.rs` — replaced panic-prone
+  `axmldecoder`; package/launcher/sdk/largeHeap; native-ABI + x86_64-engine detection;
+  streaming SHA-256 `verify_integrity`; 24 tests incl. UTF-8/UTF-16 + truncation/mutation
+  totality fuzz). The other 7 modules are still dependency-free stubs.
+- **Deps wired (M1):** `tracing 0.1`, `tracing-subscriber 0.3`, `serde 1`, `serde_json 1`,
+  `directories 6`, **`zip 2` (`deflate`, default-features off)**, **`sha2 0.10`**. Cargo.lock
+  committed. NO `axmldecoder` (own reader); `ureq`/`rustls` (APK fetch) deferred — no stable
+  programmatic source yet (see "why user-supplied"); `clap`/`rustix` deferred.
+- **Open items:** license `TBD`; M1 `runtime` crate (+ later: APK fetch backend).
+- **Next actions (pick up here — M1 `runtime`):**
+  1. `runtime` crate: ART boot → `onCreate`. Launcher uses **`winit`** (not GTK4) — the
+     architectural fix for Step 3.5 (frees the low_4gb window). Prefer **Vulkan via `ash`**
+     for the surface, GL/EGL fallback (perf — see §6). Detect host ISA and pass real
+     `--instruction-set-features` to dex2oat (Step 4 finding). Boot the activity the `apk`
+     reader resolves (`ActivitySplash`), or `-l ActivityNativeMain` to skip the splash.
+     Keep release `panic = "abort"`: wrap **every** JNI/`extern "C"` boundary in `catch_unwind`
+     so a Rust panic can never unwind into ART's C++ (§2.8) — see §6 panic decision.
+  2. With a winit-based boot, re-attempt the Roblox boot to finally harvest
      `framework-worklist.txt` (the deferred Step 4 data).
+  3. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
 
 ---
 
@@ -557,6 +572,41 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   path + effective config. Deps: tracing 0.1.44, tracing-subscriber 0.3.23, serde 1.0.228,
   serde_json 1.0.150, directories 6.0.0 (versions via `cargo add`, APIs via Context7). Full
   gate clean (fmt/build/clippy -D warnings/6 tests/release) + binary smoke-tested.
+- **2026-06-04** — **M1 `apk` crate implemented** (multi-agent workflow + adversarial review).
+  `src/apk/` opens a local APK zip (`zip 2`, `deflate`, default-features off), reads the binary
+  `AndroidManifest.xml`, detects native ABIs + the x86_64 engine (Stored/mmap-ready check), and
+  verifies integrity with a streaming SHA-256 (`sha2`). Adversarial review caught a real bug the
+  author's own tests masked: `zip` `default-features=false` (no `deflate`) made `manifest()` fail
+  on **every** real APK (the manifest is Deflate-compressed; only `libroblox.so` is Stored) —
+  fixed + regression-tested. APK fetch (`ureq`/`rustls`) deferred (no stable source); signature
+  v2/v3 + ARSC deferred. `Manifest` exposes `min_sdk`/`target_sdk` as `Option` (never fabricated).
+- **2026-06-04** — **Dropped `axmldecoder`; wrote our own AXML reader; kept `panic = "abort"`.**
+  `axmldecoder 0.3` *panics* (unwrap/assert/unimplemented; ~20 unchecked offset reads) on hostile
+  AXML. The first fix flipped release to `panic = "unwind"` so `catch_unwind` could catch it — a
+  charter-level change I **rejected** after an independent red-team: §2.4 mandates abort, and for an
+  FFI-heavy runtime vendoring ART (C++ over JNI) abort makes "panic unwinds into C++" UB
+  *structurally impossible* with zero per-boundary discipline; flipping to unwind to rescue one
+  panic-prone parser is the opposite of surgical and inverts §3 (Stability, not perf, is the axis).
+  Per CLAUDE.md (root-cause, not narrowing) the durable fix is to make the parser not panic:
+  replaced `axmldecoder` with Eclipse's own **total** pure-Rust reader (`src/apk/axml.rs`, ~250
+  lines, `#![forbid(unsafe_code)]`) — every byte read via `.get()`/checked arithmetic, iterative
+  depth-capped element walk, typed `AxmlError` for every malformed input; proven by a
+  truncation+mutation totality fuzz over both UTF-8 and UTF-16 string pools. §2.1/2.5/2.8 all win:
+  pure-Rust-we-own, one fewer dep, no panics in library code. **Standing rule for `runtime`:** keep
+  `panic = "abort"`; wrap every JNI/`extern "C"` boundary in `catch_unwind`.
+- **2026-06-04** — **Manifest ground truth decoded (Step 3 corrections).** Eclipse's own `apk`
+  reader + two independent tools (pyaxmlparser + raw-byte parse) decode real v2.724.735:
+  `package=com.roblox.client`, launcher `com.roblox.client.startup.ActivitySplash` (NOT
+  `ActivityNativeMain`, which has no intent-filter), `minSdk=26`, `targetSdk=35`,
+  **`largeHeap=false`** (raw bytes @0x7ee4, `TYPE_INT_BOOLEAN` data 0). This **retracts** Step 3's
+  inferred `largeHeap=true` (we had no decoder then); the heap OOM was ATL's 256 MB default being
+  too small, not a largeHeap request — the empirical `-Xmx768m` sizing still stands. Reader output
+  matches all five values exactly (full zip+deflate+AXML path), validating the crate end-to-end.
+- **2026-06-04** — **Workflow lesson:** schema'd subagents intermittently fail "completed without
+  calling StructuredOutput" (twice cost a full workflow). Mitigation: make writing/analysis-heavy
+  agents **schemaless** (prose) and re-verify gate results myself. Also: a content-filter
+  false-positive ("cyber safeguards") can kill an agent that's asked to decode a binary parser —
+  re-run or verify that dimension manually.
 
 ---
 

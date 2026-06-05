@@ -27,6 +27,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] } # RUST_LOG-d
 serde = { version = "1", features = ["derive"] }                    # config.json (mirror Sober schema)
 serde_json = "1"                                                    # config.json (de)serialization
 directories = "6"                                                   # portable XDG dirs (no hardcoded paths)
+# --- APK parse / verify (M1) ----------------------------------------------------
+# Local-only: open the APK zip, read binary AndroidManifest.xml, verify SHA-256.
+# Network fetch (ureq/rustls) stays deferred — see docs/dependency-plan.md.
+# APK container. `deflate` decompresses the Deflate-compressed AndroidManifest.xml (libroblox.so
+# is Stored). 2026-06-04: `deflate` is the ONLY pure-Rust deflate option in zip 2.4.2 — it pulls
+# flate2/rust_backend (miniz_oxide) and, unavoidably, the zopfli compressor we never use; the
+# zopfli-free alternatives (`deflate-zlib`/`-zlib-ng`) link a C zlib, violating pure-Rust/
+# portability (§2.1/§9), and `deflate-flate2` alone has no backend (won't compile). So zopfli's
+# ~2 crates are accepted as the cost of a pure-Rust decoder; revisit if zip exposes a leaner path.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"                                     # streaming artifact-integrity hash (lowercase hex via std::fmt, no `hex` crate)
+# 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
+# The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.
 
 # Enforce the project requirements (see AGENTS.md). CI/local gate before any commit:
@@ -44,5 +57,11 @@ all = { level = "warn", priority = -1 }   # promoted to errors in CI via -D warn
 opt-level = 3
 lto = true              # fat LTO: best runtime perf (trades build time — fine, we have few deps)
 codegen-units = 1       # better optimization at the cost of parallel codegen
-panic = "abort"         # smaller/faster, and safer across the FFI/JNI boundary (no unwinding); revisitable
+# 2026-06-04: panic = "abort" per AGENTS.md §2.4 (smallest binary, best codegen, and a strict
+# no-unwind posture for the future FFI/JNI boundaries — a panic must never unwind across them).
+# This is safe because the only untrusted-input parser, the binary AndroidManifest.xml reader
+# (src/apk/axml.rs), is now *total*: it returns a typed ApkError::Axml(AxmlError) for every
+# malformed/hostile manifest and never panics (§2.8). The previous catch_unwind-based guard
+# (which required unwind) is gone with the panic-prone axmldecoder dependency it protected.
+panic = "abort"
 strip = true            # strip symbols from the shipped binary

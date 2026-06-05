@@ -57,7 +57,7 @@ and exactly one big vendored black box (ART)."**
 | HTTP fetch/update | `ureq` | 🟢 | Blocking, no async runtime → no `tokio` bloat. |
 | TLS (our downloads) | `rustls` | 🟢 | Pure-Rust TLS; no system OpenSSL. |
 | Zip container | `zip` | 🟢 | Open the APK. |
-| Binary manifest (AXML) | `axmldecoder` | 🟢 | Lightweight; `apk-info` only if we need full ARSC. |
+| Binary manifest (AXML) | **own reader** (`src/apk/axml.rs`) | 🟢 | 2026-06-04: dropped `axmldecoder` (it panicked on hostile AXML → abort); our total pure-Rust reader replaces it. `apk-info` only if we need full ARSC. |
 | Integrity hash | `sha2` | 🟢 | Verify artifacts. |
 | APK signature v2/v3 (optional) | `ring` or pure-Rust `rsa`+`sha2` | 🟢/🟡 | Only if we verify sigs vs trust source — decide M0. |
 
@@ -105,7 +105,7 @@ and exactly one big vendored black box (ART)."**
 | Need | Pick | Tier | Notes |
 |---|---|---|---|
 | `/data/data`, `/storage/emulated/0`, OBB mapping | own Rust + `rustix`/`std::fs` | 🟢 | Map Android paths → host dirs (Flatpak `~/.var/app/...`). |
-| Asset/resource access (`resources.arsc`) | reuse `libandroidfw` (**v1**) → own Rust (**target**) | 🔴 / 🟢 | Grow our `axmldecoder`/`apk-info` into the asset path over time. |
+| Asset/resource access (`resources.arsc`) | reuse `libandroidfw` (**v1**) → own Rust (**target**) | 🔴 / 🟢 | Grow our own `axml` reader (`src/apk/axml.rs`) into the ARSC/asset path over time. |
 
 ### J. Networking
 | Need | Pick | Tier | Notes |

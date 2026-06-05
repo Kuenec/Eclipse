@@ -142,7 +142,7 @@ reason Sober can match/beat the Windows client.
 | Component | Rust-able eventually? | Notes |
 |---|---|---|
 | `bionic_translation` (libc/linker shim) | ✅ Yes (target) | Onto `elf_loader`/`dlopen-rs` + Rust ABI wrappers. Highest value Rust port. |
-| `libandroidfw` (assets/`resources.arsc`) | ✅ Plausible | We already pick `axmldecoder`/`apk-info`; could grow into the asset path. |
+| `libandroidfw` (assets/`resources.arsc`) | ✅ Plausible | We have our own `axml` reader (`src/apk/axml.rs`); could grow it into the ARSC/asset path. |
 | `libOpenSLES` (audio entry) | ✅ Yes | Route OpenSL ES/AAudio calls to our `libpulse-binding` Rust audio. |
 | wolfSSL (libcore TLS) | ⚠️ Hard | libcore expects a specific JNI TLS provider; swapping to rustls means reimplementing that provider. Low priority. |
 | libunwind | ⚠️ Low value | Reuse; little benefit to porting. |

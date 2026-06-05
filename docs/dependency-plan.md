@@ -22,9 +22,11 @@ rustix = "0.38"                                        # 🟢 flock (single-inst
 # --- APK fetch / parse / verify (src/apk.rs) ---------------------------------
 ureq = "2"                                             # 🟢 blocking HTTP, no async runtime
 rustls = "0.23"                                        # 🟢 pure-Rust TLS (no system OpenSSL)
-zip = "2"                                              # 🟢 APK container
-axmldecoder = "0.3"                                    # 🟢 binary AndroidManifest.xml
-sha2 = "0.10"                                          # 🟢 artifact integrity
+zip = { version = "2", default-features = false, features = ["deflate"] }  # 🟢 APK container (WIRED M1)
+# binary AndroidManifest.xml: Eclipse OWNS the reader (src/apk/axml.rs) — NO dep. 2026-06-04:
+# dropped `axmldecoder 0.3` — it *panics* on hostile AXML (aborts under panic=abort); our reader
+# is total (typed errors, never panics) + pure-Rust-we-own (§2.1/2.5/2.8).
+sha2 = "0.10"                                          # 🟢 artifact integrity (WIRED M1)
 # apk-info = "*"        # 🟢 OPTIONAL: full AXML+ARSC if we need resources
 # ring = "0.17"         # 🟢/🟡 OPTIONAL: APK signature v2/v3 verification
 
