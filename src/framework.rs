@@ -19,14 +19,18 @@
 //! `Application.onCreate()` — to reach `Application.onCreate` for a pure-Java APK. The recipe
 //! steps are encoded as typed constants ([`STEP1_CREATE_APPLICATION`] … [`STEP5_ACTIVITY_ON_CREATE`]).
 //!
-//! ### Why passing `0` (a null handle) to `createApplication(J)` is safe for steps 1–3
-//! 2026-06-05: steps 1–3 are **pure Java** — they only *store* the `jlong native_window` in an
-//! `Application` field; they do **not** dereference it (`docs/art-and-runtime.md` "Tier A":
-//! `createApplication`/`createContentProviders`/`Application.onCreate` invoke no native that
-//! touches the handle). The handle is first dereferenced at step 4 (`Activity.createMainActivity`
-//! → the Window natives), which is deferred. So `0` is a confirmed-safe placeholder for steps 1–3,
-//! not a guess; the real Eclipse-owned handle arrives with the framework/Surface design
-//! (component-map F) when steps 4–5 are driven.
+//! ### The `jlong` handle passed to `createApplication(J)` (real, Eclipse-owned)
+//! 2026-06-05: step 1 now passes a **real Eclipse-owned window-registry handle** from
+//! [`window_registry::allocate`] — the design-confirmed contract (`docs/art-and-runtime.md`
+//! "Non-GTK Window/Surface backing — design"): the `jlong` is a generational-slab **registry
+//! index**, NOT `Box::into_raw` and NOT a raw pointer, so a stale/fabricated handle is a
+//! bounds+generation-checked `Err`, never UB. It is still safe for steps 1–3 because those are
+//! **pure Java** — they only *store* the `jlong native_window` in an `Application` field; they do
+//! **not** dereference it (`docs/art-and-runtime.md` "Tier A":
+//! `createApplication`/`createContentProviders`/`Application.onCreate` invoke no native that touches
+//! the handle). The handle is first dereferenced at step 4 (`Activity.createMainActivity` → the
+//! Window natives), which is deferred — that step (and its dev-host-gated Window natives) consumes
+//! the same handle, so the slot is intentionally not freed during the run.
 //!
 //! ### Why bind those two natives (the non-GTK backing — confirmed)
 //! ATL's `api-impl.jar` declares `native_get_apk_path`/`native_updateConfig` and backs them in C
@@ -75,6 +79,8 @@ use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use crate::runtime::Vm;
+
+pub mod window_registry;
 
 // === Eclipse's own (non-GTK) backing for android.content.Context's static-init natives =========
 //
@@ -338,10 +344,10 @@ pub enum LifecycleProgress {
 ///
 /// # Deferred (not a failure)
 /// This stops *before* step 4 (`Activity.createMainActivity`): steps 4–5 take a `jlong` window
-/// handle that the Window natives **dereference**, and that handle's type is UNCONFIRMED for
-/// Eclipse's (non-GTK) window — see the module docs. Steps 1–3 only *store* the handle, so the
-/// safe placeholder `0` is passed; step 4 onward is unblocked by the framework/Surface design
-/// (component-map F).
+/// handle that the Window natives **dereference**, and those (non-GTK) Window natives are not yet
+/// bound — see the module docs. Steps 1–3 only *store* the handle, so the real Eclipse-owned
+/// registry handle from [`window_registry::allocate`] is passed and the slot is left allocated for
+/// step 4; driving step 4 onward is unblocked by the framework/Surface design (component-map F).
 pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
@@ -395,18 +401,25 @@ fn drive_steps_1_to_3(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress
         "framework bridge proven: Context static-init natives registered + bootstrap classes resolved via JNI"
     );
 
-    // Step 1: `static Context.createApplication(jlong native_window) -> Application`. The handle is
-    // passed as `0` (null): steps 1–3 only STORE it, never dereference it (module docs; deref begins
-    // at the deferred step 4). `<clinit>` runs here on first active use of Context, calling the two
-    // natives bound above. `.l()` unwraps the returned Application JObject; a wrong return type is a
-    // typed error, not a panic.
+    // Step 1: `static Context.createApplication(jlong native_window) -> Application`.
+    // 2026-06-05: the handle is now a REAL Eclipse-owned registry handle (was the placeholder `0`):
+    // `window_registry::allocate()` reserves a generational-slab slot and returns its packed `jlong`
+    // (`docs/art-and-runtime.md` "Non-GTK Window/Surface backing — design"). This is the
+    // design-confirmed contract — a genuine Eclipse-owned handle, not a raw pointer — and is still
+    // safe for steps 1–3, which only STORE the handle and never dereference it (deref begins at the
+    // deferred step 4; "Tier A"). A stale/fabricated handle would be a bounds+generation-checked
+    // `Err`, never UB. The slot is intentionally NOT freed during the short run: it stays valid for
+    // step 4 (a later, dev-host-gated increment) and the process exits with the window closed.
+    // `<clinit>` runs here on first active use of Context, calling the two natives bound above.
+    // `.l()` unwraps the returned Application JObject; a wrong return type is a typed error.
+    let window_handle = window_registry::allocate()?;
     let context = env.find_class(CONTEXT_CLASS)?;
     let app = checked(env, "step 1 Context.createApplication", |env| {
         env.call_static_method(
             &context,
             jni_str!("createApplication"),
             jni_sig!("(J)Landroid/app/Application;"),
-            &[JValue::Long(0)],
+            &[JValue::Long(window_handle)],
         )?
         .l()
     })?;
@@ -483,6 +496,8 @@ pub enum FrameworkError {
     Jni(jni::errors::Error),
     /// A Rust panic was caught at the JNI boundary (it must never unwind into ART's C++).
     Panicked,
+    /// Allocating the Eclipse-owned window-registry handle passed to `createApplication` failed.
+    WindowRegistry(window_registry::WindowRegistryError),
 }
 
 impl fmt::Display for FrameworkError {
@@ -493,6 +508,7 @@ impl fmt::Display for FrameworkError {
             Self::Panicked => {
                 f.write_str("a panic was caught at the framework JNI boundary (not propagated)")
             }
+            Self::WindowRegistry(e) => write!(f, "window-registry handle allocation failed: {e}"),
         }
     }
 }
@@ -501,8 +517,17 @@ impl std::error::Error for FrameworkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Jni(e) => Some(e),
+            Self::WindowRegistry(e) => Some(e),
             Self::NullVm | Self::Panicked => None,
         }
+    }
+}
+
+// 2026-06-05: `?` on `window_registry::allocate()` in `drive_steps_1_to_3` folds a registry error
+// into the typed `WindowRegistry` variant (no unwrap/expect, §2.8).
+impl From<window_registry::WindowRegistryError> for FrameworkError {
+    fn from(e: window_registry::WindowRegistryError) -> Self {
+        Self::WindowRegistry(e)
     }
 }
 

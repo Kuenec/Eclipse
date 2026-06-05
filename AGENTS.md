@@ -559,14 +559,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      touched only on the VM/winit main thread); the per-native plan binds `set_jobject`/`set_title`/
      `set_layout` (winit metadata) and **defers** `set_widget_as_root`/`take_input_queue`; **no surface is
      needed to reach `onCreate`** (the engine makes its own `VkInstance` later) so **no `ash`/EGL dep this
-     step**; render stack stays **ash/Vulkan-first, EGL fallback** (settled). **Smallest first Window step
-     (the next framework build, AFTER the dev-host steps-1–3 run):** the `window_registry`
-     (`allocate`/`with_window` + pack/unpack with stale-generation rejection + `jlong=0` reserved,
-     unit-tested) + the 3 metadata Window natives via `register_native_methods` + a descriptor guard vs
-     `Window.java` — all in-harness-compilable. **BIGGEST RISK recorded:** the View hierarchy is fully
+     step**; render stack stays **ash/Vulkan-first, EGL fallback** (settled). ✅ **`window_registry`
+     DONE (2026-06-05, §6):** `src/framework/window_registry.rs` (std-only, `#![forbid(unsafe_code)]`,
+     no new dep) is the sound generational-slab owned-handle registry (`allocate`/`with_window`/`free` +
+     pack/unpack, bounds+generation-checked so a stale/fabricated `jlong` is a typed `Err` not UB,
+     `jlong=0` reserved, 6 unit tests), and `drive_steps_1_to_3` now passes a real
+     `window_registry::allocate()` handle to `createApplication(J)` instead of `0` (still only *stored*
+     in steps 1–3). **NEXT (in order): (1)** the owed dev-host steps-1–3 validation — `cargo run -- run
+     …/demo_app.apk` reaches `Application.onCreate` (or names the next `UnsatisfiedLinkError`), opens the
+     window, exits 0, no `libgtk-4` in `/proc/self/maps`; then **(2)** the deref-ing Window natives for
+     step 4 (`set_jobject`/`set_title`/`set_layout` metadata via `register_native_methods` + a descriptor
+     guard vs `Window.java`, then the deferred `set_widget_as_root`/`take_input_queue`) + associating the
+     real winit `Window` with the registry slot. **BIGGEST RISK recorded:** the View hierarchy is fully
      native-handle-backed (`View.java` L888/L965), so `set_widget_as_root` needs the whole
      View/ViewGroup/FrameLayout `native_*` cascade — steps 4–5 are the **big M2/M3 build, not a small one**.
-     Verify on the dev host (onCreate reached, window opens, exit 0, **no `libgtk-4` in `/proc/self/maps`**).
      **Separately (a distinct main-loop item):** the deferred **bionic NDK-shim** step
      (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent cyber-safeguard blocker) so the
      Roblox engine's transitive natives resolve and `libroblox.so` links past relocation.
@@ -982,6 +988,43 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   reaching `onCreate` (or surfacing the next `UnsatisfiedLinkError`) is **pending the dev-host run**.
   Full gate green: fmt/build/clippy `-D warnings`/test (**43 unit + 2 compile_fail doctests**)/release
   (`panic = "abort"`/LTO retained). No new deps (`jni 0.22.4`/`jni-sys 0.4` already in tree).
+- **2026-06-05** — **Sound generational-slab owned-handle window registry added;
+  `createApplication` now gets a REAL handle (was `0`).** New `src/framework/window_registry.rs`
+  (std-only, `#![forbid(unsafe_code)]`, **no new dep**) realizes the design-confirmed contract
+  (`docs/art-and-runtime.md` "Non-GTK Window/Surface backing — design", commit def0bd9): the `jlong`
+  Eclipse passes to the launcher lifecycle natives is an **Eclipse-owned registry index** — NOT
+  `Box::into_raw`, NOT a raw pointer — into a process-global `OnceLock<Mutex<Registry>>` slab+freelist.
+  A handle packs a `u32` slot index (low 32) + `u32` generation (high 32); `allocate()` returns a
+  packed `jlong`, `with_window()` **bounds-checks then generation-checks** (a stale/out-of-range/
+  fabricated `jlong` is a typed `WindowRegistryError` Err — never a deref/use-after-free/UB/panic),
+  and `free()` bumps the generation (saturating) so the freed handle and any copy become `StaleHandle`
+  and can never alias a reused slot. Generations start at 1, so a valid handle is never `0` — `jlong=0`
+  stays the reserved null sentinel. `WindowState` is the **minimal placeholder** the design requires:
+  `title: String` + a documented `Option<()>` jobject TODO slot, and holds **NO winit `Window`** (none
+  exists at allocate time — `createApplication` runs after boot but before the window is created —
+  which avoids the event-loop aliasing hazard). Wired surgically into `framework.rs::drive_steps_1_to_3`:
+  step 1 now passes `JValue::Long(window_registry::allocate()?)` to `Context.createApplication(J)`
+  instead of `0`; added `FrameworkError::WindowRegistry` + `From` impl so `?` stays typed (no unwrap).
+  **Still safe for steps 1–3** — they only *store* the handle and never dereference it ("Tier A");
+  deref begins at the deferred, dev-host-gated step 4, which consumes the same handle, so the slot is
+  intentionally left allocated (not freed) during the run. The **deref-ing Window natives**
+  (`set_jobject`/`set_title`/`set_layout`/`set_widget_as_root`/`take_input_queue`), associating the
+  real winit `Window`, and the View/ViewGroup/FrameLayout `native_*` cascade are **deferred to step 4**.
+  Regression guard: 6 in-harness unit tests pin the soundness contract — the load-bearing one
+  (`freed_handle_is_stale_and_does_not_alias_reused_slot`) proves a freed handle is `StaleHandle` and
+  the reused slot's new state is unaffected; others cover out-of-range/fabricated/null-`0`/double-free
+  rejection, right-slot mutation, distinct-nonzero handles, and pack/unpack round-trip
+  (incl. `(u32::MAX,u32::MAX)`). Soundness review (read CLAUDE.md/AGENTS.md in full) found **no
+  BLOCKERs** — bad-handle path sound, generation check correct, tests real, no aliasing, no new dep,
+  no UB, surgical. Full gate green: fmt / build --all-targets / clippy `-D warnings` / test (**49
+  unit + 2 compile_fail doctests**) / release (`panic = "abort"`/LTO retained). **`Application.onCreate`
+  is NOT yet proven reached** — this only swaps the placeholder for the real owned handle and adds the
+  registry; reaching `onCreate` (or surfacing the next `UnsatisfiedLinkError`) is **pending the dev-host
+  run**. Owed dev-host check (cannot run in this worker-thread harness — ART aborts off the main
+  thread): `cargo run -- run ~/eclipse-m0/atl_test_apks/demo_app.apk` — boot ART, register the two
+  `Context` natives, drive steps 1–3 with the real handle, log "framework bridge proven", reach
+  `Application.onCreate` or name the next missing native, open the window, exit 0, **no `libgtk-4` in
+  `/proc/self/maps`**.
 
 ---
 
