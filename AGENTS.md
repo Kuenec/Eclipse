@@ -334,6 +334,31 @@ before any history-rewriting/force operation.
   Eclipse's own `apk` reader, asserts class/machine/PT_LOAD>0/SONAME/DT_NEEDED-non-empty + the key bionic deps +
   BIND_NOW + no-PT_TLS + RELRO; SKIPS cleanly if the APK is absent). NO libroblox exec/map — parse only. See §6
   (2026-06-05 libroblox characterization). Gate now **287 unit + 2 doctests**.
+  **2026-06-05 UPDATE — the ENGINE-LOAD gating work is DONE: `elf.rs` now decodes libroblox's
+  Android-packed (`APS2`) relocations, so `relocations()` returns ALL 527,843 of its relocs.** Added
+  a bounds-checked `read_sleb128` reader + `ElfImage::decode_android_packed_rela(vaddr,size,out)` that
+  validates the `APS2` magic and decodes the full SLEB128 group stream (`[reloc_count][reloc_base_offset]`
+  then groups: `[group_size][group_flags]` with the four flag bits — GROUPED_BY_OFFSET_DELTA / _BY_INFO /
+  _BY_ADDEND / GROUP_HAS_ADDEND — running offset + running addend that carry across groups; addend resets to
+  0 per reloc when HAS_ADDEND is clear) into the SAME `Vec<reloc::Rela>` the applier already consumes.
+  `DynInfo` recognizes `DT_ANDROID_RELA 0x60000011` / `DT_ANDROID_RELASZ 0x60000012` (confirmed from the file
+  via `llvm-readelf --dynamic-table`; the doc sketch's `0x6000000f` alt is `DT_ANDROID_REL`, the implicit-addend
+  form x86-64 does NOT use) + `DT_ANDROID_RELR`/`…SZ`/`…ENT` for completeness; `relocations()` folds the APS2
+  table in between std `DT_RELA` and `.rela.plt`, `relr()` also accepts `DT_ANDROID_RELR`. The std `DT_RELA`
+  path (the other 10 libs + libm/glibc) is UNCHANGED — APS2 is unique to libroblox. **`#![forbid(unsafe_code)]`
+  preserved** — every SLEB128/section read bounds-checked into typed `ElfError` (new variants `BadAndroidMagic`/
+  `BadSleb128`/`BadAndroidReloc`); a truncated/overshooting stream → typed error, never a panic. **VALIDATED:**
+  11 new tests (9 APS2 + 2 SLEB128, GPU/VM-free over hand-built streams: single RELATIVE group, GROUPED_BY_OFFSET
+  +INFO run, group WITH addend (accumulating), GROUPED_BY_ADDEND one-delta, mixed groups carrying offset+addend,
+  per-reloc info, truncated/bad-magic/overshoot → typed errors, SLEB128 signed round-trip + truncation) + the
+  REAL gated test now asserts the EXACT decode of libroblox's APS2 block: **527,297 relocs = RELATIVE 527,208 +
+  GLOB_DAT 67 + R_X86_64_64 22**, and `relocations()` total incl. the 546 std JUMP_SLOT = **527,843** — an EXACT
+  match to `llvm-readelf -r` (cross-checked: same histogram, all 1,887,001 APS2 bytes consumed). Gate now
+  **298 unit + 2 doctests**. **Engine-load frontier: the APS2 decoder is DONE — the loader cores can now fully
+  relocate the real engine (every reloc TYPE was already applied by reloc.rs; the packing was the only gap).
+  NEXT = map+relocate libroblox end-to-end (point `link.rs` at it), then the 10-soname bionic-env provider
+  surface (584 UND imports; EGL/GLES2→host GL) + run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW
+  (no `%fs`/TCB needed — no PT_TLS).** See §6 (2026-06-05 APS2 decoder).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2920,6 +2945,38 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   is absent — never fails/fabricates). **Gate:** fmt/build/clippy(-D warnings)/test (**287 unit + 2 doctests**)/
   release all 0-warning/0-error. Files: `src/loader/elf.rs` (1 new gated test), `docs/libroblox-characterization.md`
   (new).
+- **2026-06-05 APS2 decoder** — Closed the #1 engine-load gap: `elf.rs` now decodes libroblox's Android-packed
+  (`APS2`) `DT_ANDROID_RELA` relocations into the existing `reloc::Rela` path, so `relocations()` returns ALL
+  527,843 of libroblox's relocs (was 546). **Built:** (1) `read_sleb128(bytes,&mut cursor)` — a bounds-checked
+  signed-LEB128 reader (7 payload bits/byte, `0x80` continue, `0x40` sign of the final byte; rejects a run past
+  64 bits → `BadSleb128`; a missing continuation → `Truncated`). (2) `ElfImage::decode_android_packed_rela(vaddr,
+  size,&mut out)` — confines reads to the declared section, validates the 4-byte `APS2` magic, then decodes the
+  SLEB128 stream `[reloc_count][reloc_base_offset]` + groups `[group_size][group_flags]` per the PUBLIC Android
+  packed format: GROUPED_BY_OFFSET_DELTA(2) reads one group offset delta else per-reloc; GROUPED_BY_INFO(1) one
+  `r_info` else per-reloc; GROUP_HAS_ADDEND(8) carries addends, with GROUPED_BY_ADDEND(4) one group addend delta
+  else per-reloc accumulated; the running offset + running addend carry ACROSS groups, and the addend resets to
+  0 per reloc when HAS_ADDEND is clear. Each reloc → `Rela{offset, sym_index=info>>32, r_type=info&0xffffffff,
+  addend}`. (3) `DynInfo` gained `android_rela`/`android_relr`; `parse_dynamic` recognizes `DT_ANDROID_RELA
+  0x60000011`/`…RELASZ 0x60000012`/`…RELR 0x6fffe000`/`…RELRSZ`/`…RELRENT`; `relocations()` folds the APS2 table
+  between std `DT_RELA` and `.rela.plt`; `relr()` also accepts `DT_ANDROID_RELR`. **CORRECTION to the task sketch
+  (per the file + llvm-readelf, never fabricated):** the tag is `0x60000011` (the sketch's `0x6000000f` is
+  `DT_ANDROID_REL`, implicit-addend, which x86-64 does NOT use); confirmed via `llvm-readelf --dynamic-table`.
+  **Std `DT_RELA` path UNCHANGED** (the other 10 libs + libm/glibc) — APS2 is unique to libroblox. `#![forbid(
+  unsafe_code)]` preserved; new typed errors `BadAndroidMagic`/`BadSleb128`/`BadAndroidReloc`; truncated/overshoot
+  → typed error, no panic. **Cyber-safeguard honored:** written ONLY from the public ELF gABI / x86-64 psABI / the
+  public Android `APS2` (`relocation_packer` group-encoding) format + Eclipse's own `reloc`/`elf` cores — parsing
+  the `.so`'s bytes as DATA + cross-checking with `llvm-readelf` is benign; NO apkenv/bionic/ATL LINKER or asset
+  source was read. **Did NOT trip the safeguard.** **Regression guard:** 11 new tests (9 APS2 + 2 SLEB128) over
+  hand-built fixtures (single RELATIVE group; GROUPED_BY_OFFSET+INFO run; group WITH accumulating addend;
+  GROUPED_BY_ADDEND one-delta; mixed groups carrying offset+addend across the boundary; per-reloc info; truncated/
+  bad-magic/overshoot → typed errors; SLEB128 signed round-trip incl. `i64::MIN`/`MAX` + truncation), PLUS the
+  gated REAL test now asserts the EXACT libroblox APS2 decode: **527,297 = RELATIVE 527,208 + GLOB_DAT 67 +
+  R_X86_64_64 22**, and `relocations()` total incl. 546 std JUMP_SLOT = **527,843** — an EXACT cross-check vs
+  `llvm-readelf -r` (same histogram; all 1,887,001 APS2 bytes consumed). **Gate:** fmt/build --all-targets/clippy
+  (-D warnings; fixed one `manual_saturating_arithmetic`)/test (**298 unit + 2 doctests**)/release all
+  0-warning/0-error. Files: `src/loader/elf.rs` (SLEB128 reader + APS2 decoder + DynInfo fields/tags + 11 tests +
+  real-test exact asserts). **NEXT = map+relocate libroblox end-to-end (point `link.rs` at it), then the
+  10-soname bionic-env provider surface + run the 3,427 DT_INIT_ARRAY ctors (no `%fs`/TCB — no PT_TLS).**
 
 ---
 

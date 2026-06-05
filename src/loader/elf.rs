@@ -110,6 +110,36 @@ const DT_RELR: i64 = 36;
 const DT_RELRSZ: i64 = 35;
 /// `DT_RELRENT` — `DT_RELR` entry size (always 8 for `Elf64`).
 const DT_RELRENT: i64 = 37;
+/// `DT_ANDROID_RELA` — Android-packed (`APS2`) explicit-addend relocation table (vaddr).
+/// 2026-06-05: confirmed value in libroblox.so via `llvm-readelf --dynamic-table` (the doc sketch
+/// listed `0x6000000f` as an alternative — that is `DT_ANDROID_REL` (implicit-addend); x86-64 uses
+/// the `RELA` form `0x60000011`).
+const DT_ANDROID_RELA: i64 = 0x6000_0011;
+/// `DT_ANDROID_RELASZ` — size in bytes of the `DT_ANDROID_RELA` packed table.
+const DT_ANDROID_RELASZ: i64 = 0x6000_0012;
+/// `DT_ANDROID_RELR` — Android packed `RELR` relative relocations (vaddr). Same encoding as the
+/// generic `DT_RELR`; recognized here so an object that uses this OS-specific tag is decoded too.
+/// libroblox.so does NOT use it (no RELR at all — see the characterization doc), but the other
+/// APS2-era Android tooling may, so the loader recognizes it for completeness.
+const DT_ANDROID_RELR: i64 = 0x6fff_e000;
+/// `DT_ANDROID_RELRSZ` — size in bytes of the `DT_ANDROID_RELR` table.
+const DT_ANDROID_RELRSZ: i64 = 0x6fff_e001;
+/// `DT_ANDROID_RELRENT` — `DT_ANDROID_RELR` entry size (8 for `Elf64`).
+const DT_ANDROID_RELRENT: i64 = 0x6fff_e003;
+
+/// APS2 packed-relocation magic: the section begins with the 4 bytes `'A' 'P' 'S' '2'`.
+const APS2_MAGIC: [u8; 4] = [b'A', b'P', b'S', b'2'];
+
+// APS2 group_flags bits (public Android packed-relocation format — `relocation_packer`/bionic
+// `linker_reloc_iterators`; general format knowledge, no linker source read — 2026-06-05).
+/// All relocations in the group share one `r_info` (read once for the group).
+const RELOCATION_GROUPED_BY_INFO_FLAG: i64 = 1;
+/// All relocations in the group share one offset delta (read once for the group).
+const RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG: i64 = 2;
+/// All relocations in the group share one addend delta (read once for the group).
+const RELOCATION_GROUPED_BY_ADDEND_FLAG: i64 = 4;
+/// The group carries addends at all (RELA). When clear, the running addend resets to 0 per reloc.
+const RELOCATION_GROUP_HAS_ADDEND_FLAG: i64 = 8;
 /// `DT_GNU_HASH` — the GNU-style symbol hash table.
 const DT_GNU_HASH: i64 = 0x6fff_fef5;
 /// `DT_FLAGS_1` — state flags (extended).
@@ -162,6 +192,16 @@ pub enum ElfError {
     /// A required dynamic entry was missing (e.g. `DT_RELA` present but no `DT_SYMTAB`). Carries a
     /// short static description of what was expected.
     MissingDynamic(&'static str),
+    /// An Android-packed (`APS2`) relocation section did not begin with the `APS2` magic. Carries
+    /// the file offset of the (would-be) magic.
+    BadAndroidMagic(usize),
+    /// A `SLEB128` value in an Android-packed relocation stream was malformed (ran past 64 bits
+    /// without terminating). Carries the file offset the value started at.
+    BadSleb128(usize),
+    /// An Android-packed relocation stream declared a relocation count that the decoded groups
+    /// could not satisfy (a group ran the running total past the declared count, or the stream
+    /// ended before the count was reached). Carries `(declared, produced_so_far)`.
+    BadAndroidReloc(u64, u64),
 }
 
 impl fmt::Display for ElfError {
@@ -189,6 +229,24 @@ impl fmt::Display for ElfError {
                 )
             }
             Self::MissingDynamic(what) => write!(f, "missing required dynamic entry: {what}"),
+            Self::BadAndroidMagic(off) => {
+                write!(
+                    f,
+                    "Android-packed relocations: bad APS2 magic at offset {off}"
+                )
+            }
+            Self::BadSleb128(off) => {
+                write!(
+                    f,
+                    "Android-packed relocations: malformed SLEB128 at offset {off}"
+                )
+            }
+            Self::BadAndroidReloc(declared, produced) => {
+                write!(
+                    f,
+                    "Android-packed relocations: declared {declared} relocs, decoded {produced}"
+                )
+            }
         }
     }
 }
@@ -248,6 +306,14 @@ pub struct DynInfo {
     pub pltrel: Option<u64>,
     /// `DT_RELR` (vaddr) / `DT_RELRSZ` (bytes): the compressed relative-relocation bitmap.
     pub relr: Option<(u64, u64)>,
+    /// `DT_ANDROID_RELA` (vaddr) / `DT_ANDROID_RELASZ` (bytes): the Android-packed (`APS2`)
+    /// explicit-addend relocation table. libroblox.so packs its 527,297 dynamic relocations here;
+    /// [`ElfImage::relocations`] decodes it via [`ElfImage::decode_android_packed_rela`] and folds
+    /// the result into the flat `Rela` list alongside the standard tables.
+    pub android_rela: Option<(u64, u64)>,
+    /// `DT_ANDROID_RELR` (vaddr) / `DT_ANDROID_RELRSZ` (bytes): the OS-specific RELR table (same
+    /// `u64`-word encoding as `DT_RELR`). Decoded by [`ElfImage::relr`] when present.
+    pub android_relr: Option<(u64, u64)>,
     /// `DT_SYMTAB` (vaddr): the dynamic symbol table base.
     pub symtab: Option<u64>,
     /// `DT_STRTAB` (vaddr) / `DT_STRSZ` (bytes): the dynamic string table.
@@ -359,6 +425,41 @@ fn read_u64(bytes: &[u8], off: usize) -> Result<u64, ElfError> {
         need: 8,
     })?;
     Ok(u64::from_le_bytes(s.try_into().expect("8-byte slice")))
+}
+
+/// Read one signed-LEB128 (`SLEB128`) value from `bytes` starting at `*cursor`, advancing the
+/// cursor past the bytes consumed. Bounds-checked into [`ElfError::Truncated`] — never reads past
+/// the slice and never panics.
+///
+/// 2026-06-05: SLEB128 is the variable-length signed integer encoding (DWARF / Android packed
+/// relocations): 7 payload bits per byte, the high bit (`0x80`) continues, and the sign is the
+/// second-highest bit (`0x40`) of the final byte, extended into the unread high bits. A 64-bit
+/// value uses at most 10 bytes (`ceil(64/7)`); a longer run is a malformed stream and is rejected
+/// so a corrupt section cannot spin or overflow the shift.
+fn read_sleb128(bytes: &[u8], cursor: &mut usize) -> Result<i64, ElfError> {
+    let start = *cursor;
+    let mut result: i64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let byte = *bytes.get(*cursor).ok_or(ElfError::Truncated {
+            offset: *cursor,
+            need: 1,
+        })?;
+        *cursor += 1;
+        // 10 bytes is the max for a 64-bit SLEB128; more means the stream is malformed.
+        if shift >= 64 {
+            return Err(ElfError::BadSleb128(start));
+        }
+        result |= i64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            // Sign-extend if the value is negative and there are unfilled high bits.
+            if shift < 64 && byte & 0x40 != 0 {
+                result |= -1i64 << shift;
+            }
+            return Ok(result);
+        }
+    }
 }
 
 impl<'a> ElfImage<'a> {
@@ -518,6 +619,7 @@ impl<'a> ElfImage<'a> {
                     return Err(ElfError::BadEntSize(tag, val, reloc_ent_size()));
                 }
                 DT_RELRENT if val != 8 => return Err(ElfError::BadEntSize(tag, val, 8)),
+                DT_ANDROID_RELRENT if val != 8 => return Err(ElfError::BadEntSize(tag, val, 8)),
                 DT_SYMENT if val != SYM_SIZE as u64 => {
                     return Err(ElfError::BadEntSize(tag, val, SYM_SIZE as u64));
                 }
@@ -526,6 +628,10 @@ impl<'a> ElfImage<'a> {
                 DT_PLTREL => info.pltrel = Some(val),
                 DT_RELR => info.relr.get_or_insert((0, 0)).0 = val,
                 DT_RELRSZ => info.relr.get_or_insert((0, 0)).1 = val,
+                DT_ANDROID_RELA => info.android_rela.get_or_insert((0, 0)).0 = val,
+                DT_ANDROID_RELASZ => info.android_rela.get_or_insert((0, 0)).1 = val,
+                DT_ANDROID_RELR => info.android_relr.get_or_insert((0, 0)).0 = val,
+                DT_ANDROID_RELRSZ => info.android_relr.get_or_insert((0, 0)).1 = val,
                 DT_SYMTAB => info.symtab = Some(val),
                 DT_STRTAB => info.strtab.get_or_insert((0, 0)).0 = val,
                 DT_STRSZ => info.strtab.get_or_insert((0, 0)).1 = val,
@@ -662,18 +768,138 @@ impl<'a> ElfImage<'a> {
         Ok(syms)
     }
 
-    /// Decode `.rela.dyn` (`DT_RELA`) **and** `.rela.plt` (`DT_JMPREL`) into the flat list of
-    /// [`reloc::Rela`] entries the applier consumes. `.rela.plt` is appended after `.rela.dyn` so a
-    /// `BIND_NOW` caller applies both in one pass (see [`DynInfo::bind_now`] / [`reloc::apply_rela`]).
+    /// Decode every dynamic relocation into the flat list of [`reloc::Rela`] entries the applier
+    /// consumes: the standard `.rela.dyn` (`DT_RELA`), the Android-packed (`APS2`) table
+    /// (`DT_ANDROID_RELA`), and `.rela.plt` (`DT_JMPREL`), in that order. A `BIND_NOW` caller
+    /// applies the whole list in one pass (see [`DynInfo::bind_now`] / [`reloc::apply_rela`]).
+    ///
+    /// 2026-06-05: libroblox.so has **no** `DT_RELA` — its 527,297 dynamic relocations live in the
+    /// `DT_ANDROID_RELA` `APS2`-packed table, so including that table here is what makes the engine's
+    /// base/GOT relocations visible (previously `relocations()` saw only the 546 `.rela.plt`
+    /// JUMP_SLOTs). Objects with a standard `DT_RELA` (the other 10 libs + host glibc) are unchanged.
     pub fn relocations(&self) -> Result<Vec<Rela>, ElfError> {
         let mut out = Vec::new();
         if let Some((vaddr, size)) = self.dyn_info.rela {
             self.read_rela_table(vaddr, size, &mut out)?;
         }
+        if let Some((vaddr, size)) = self.dyn_info.android_rela {
+            self.decode_android_packed_rela(vaddr, size, &mut out)?;
+        }
         if let Some((vaddr, size)) = self.dyn_info.jmprel {
             self.read_rela_table(vaddr, size, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// Decode the Android-packed (`APS2`) relocation table at `vaddr`/`size`, appending the decoded
+    /// [`reloc::Rela`] entries to `out`. The result is identical in form to the standard `.rela.dyn`
+    /// the applier already consumes — only the on-disk **packing** differs.
+    ///
+    /// ## APS2 format (public Android packed-relocation encoding — 2026-06-05)
+    /// The section starts with the 4-byte magic `APS2`, then a stream of `SLEB128` values:
+    /// `[reloc_count][reloc_base_offset]`, then groups until `reloc_count` relocations are produced.
+    /// Each group is `[group_size][group_flags]` followed by per-group or per-reloc deltas selected
+    /// by `group_flags`:
+    /// - `RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG`: one `group_offset_delta` for the whole group;
+    ///   else a per-reloc `offset_delta`. The running offset accumulates each reloc.
+    /// - `RELOCATION_GROUPED_BY_INFO_FLAG`: one `r_info` for the group; else a per-reloc `r_info`.
+    /// - `RELOCATION_GROUP_HAS_ADDEND_FLAG`: the group carries addends. With
+    ///   `RELOCATION_GROUPED_BY_ADDEND_FLAG`, one `addend_delta` for the group; else a per-reloc
+    ///   `addend_delta`. The running addend accumulates (and carries across groups). When
+    ///   `HAS_ADDEND` is clear, the running addend resets to 0 for each reloc.
+    ///
+    /// Bounds-checked throughout (every `SLEB128` read is `read_sleb128`); a stream that overshoots
+    /// or undershoots the declared count, or runs off the end, returns a typed [`ElfError`].
+    fn decode_android_packed_rela(
+        &self,
+        vaddr: u64,
+        size: u64,
+        out: &mut Vec<Rela>,
+    ) -> Result<(), ElfError> {
+        let base = self.vaddr_to_off(vaddr)?;
+        // Confine all reads to the declared section so a truncated/garbage tail cannot be walked.
+        let end = base
+            .saturating_add(usize::try_from(size).unwrap_or(usize::MAX))
+            .min(self.bytes.len());
+        let section = self.bytes.get(base..end).ok_or(ElfError::Truncated {
+            offset: base,
+            need: usize::try_from(size).unwrap_or(usize::MAX),
+        })?;
+
+        if section.get(0..4) != Some(&APS2_MAGIC[..]) {
+            return Err(ElfError::BadAndroidMagic(base));
+        }
+
+        let mut cur = 4usize;
+        let reloc_count = read_sleb128(section, &mut cur)?;
+        let reloc_count =
+            u64::try_from(reloc_count).map_err(|_| ElfError::BadAndroidReloc(0, 0))?;
+        // The running offset is seeded with reloc_base_offset and accumulates each group's deltas.
+        let mut offset = read_sleb128(section, &mut cur)?;
+        let mut addend: i64 = 0;
+        let mut produced: u64 = 0;
+
+        while produced < reloc_count {
+            let group_size = read_sleb128(section, &mut cur)?;
+            let group_size = u64::try_from(group_size)
+                .map_err(|_| ElfError::BadAndroidReloc(reloc_count, produced))?;
+            let group_flags = read_sleb128(section, &mut cur)?;
+
+            let grouped_by_offset = group_flags & RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG != 0;
+            let grouped_by_info = group_flags & RELOCATION_GROUPED_BY_INFO_FLAG != 0;
+            let grouped_by_addend = group_flags & RELOCATION_GROUPED_BY_ADDEND_FLAG != 0;
+            let group_has_addend = group_flags & RELOCATION_GROUP_HAS_ADDEND_FLAG != 0;
+
+            // A group must not push the running total past the declared count.
+            if produced
+                .checked_add(group_size)
+                .is_none_or(|t| t > reloc_count)
+            {
+                return Err(ElfError::BadAndroidReloc(reloc_count, produced));
+            }
+
+            let group_offset_delta = if grouped_by_offset {
+                read_sleb128(section, &mut cur)?
+            } else {
+                0
+            };
+            let group_info = if grouped_by_info {
+                Some(read_sleb128(section, &mut cur)?)
+            } else {
+                None
+            };
+            if group_has_addend && grouped_by_addend {
+                addend = addend.wrapping_add(read_sleb128(section, &mut cur)?);
+            }
+
+            for _ in 0..group_size {
+                offset = if grouped_by_offset {
+                    offset.wrapping_add(group_offset_delta)
+                } else {
+                    offset.wrapping_add(read_sleb128(section, &mut cur)?)
+                };
+                let info = match group_info {
+                    Some(i) => i,
+                    None => read_sleb128(section, &mut cur)?,
+                };
+                if group_has_addend {
+                    if !grouped_by_addend {
+                        addend = addend.wrapping_add(read_sleb128(section, &mut cur)?);
+                    }
+                } else {
+                    addend = 0;
+                }
+                let info = info as u64;
+                out.push(Rela {
+                    offset: offset as u64,
+                    sym_index: rela_sym(info),
+                    r_type: rela_type(info),
+                    addend,
+                });
+            }
+            produced += group_size;
+        }
+        Ok(())
     }
 
     /// Read one `Elf64_Rela` table (`r_offset@0`, `r_info@8`, `r_addend@16`) at `vaddr`/`size`,
@@ -697,9 +923,10 @@ impl<'a> ElfImage<'a> {
     }
 
     /// Read the raw `DT_RELR` table as a slice of `u64` words (the form [`reloc::apply_relr`] takes).
-    /// Returns an empty `Vec` if the object has no `DT_RELR`.
+    /// Recognizes both the generic `DT_RELR` and the OS-specific `DT_ANDROID_RELR` (identical
+    /// `u64`-word encoding). Returns an empty `Vec` if the object has neither. 2026-06-05.
     pub fn relr(&self) -> Result<Vec<u64>, ElfError> {
-        let Some((vaddr, size)) = self.dyn_info.relr else {
+        let Some((vaddr, size)) = self.dyn_info.relr.or(self.dyn_info.android_relr) else {
             return Ok(Vec::new());
         };
         let base = self.vaddr_to_off(vaddr)?;
@@ -1140,6 +1367,370 @@ mod tests {
         );
     }
 
+    // ---- APS2 packed-relocation decoder tests --------------------------------------------------
+    //
+    // 2026-06-05: The decoder is exercised through `ElfImage::decode_android_packed_rela`, which
+    // needs a `vaddr_to_off`. We build a 1:1 PT_LOAD ELF whose only PT_LOAD maps vaddr==offset and
+    // place a hand-encoded APS2 stream inside it, then assert the exact decoded `Rela` list. The
+    // encoder below is the inverse of `read_sleb128` (LEB128 of the same values), so the fixtures
+    // are self-checking: only a correct decoder reproduces the relocations we encoded.
+
+    /// Encode one value as SLEB128 (the inverse of [`read_sleb128`]) — appends to `out`.
+    fn enc_sleb128(out: &mut Vec<u8>, mut value: i64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7; // arithmetic shift keeps the sign
+            let sign_bit = byte & 0x40 != 0;
+            if (value == 0 && !sign_bit) || (value == -1 && sign_bit) {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    const GROUPED_BY_INFO: i64 = 1;
+    const GROUPED_BY_OFFSET_DELTA: i64 = 2;
+    const GROUPED_BY_ADDEND: i64 = 4;
+    const GROUP_HAS_ADDEND: i64 = 8;
+
+    /// Build a minimal 1:1 ELF whose single PT_LOAD covers `bytes`, with an APS2 section at
+    /// `aps2_off` of length `aps2_len`, reachable via `DT_ANDROID_RELA`. Returns the full image.
+    fn build_aps2_image(aps2_stream: &[u8]) -> (Vec<u8>, u64) {
+        const APS2_VADDR: u64 = 0x400;
+        let mut buf = vec![0u8; IMG_SIZE];
+
+        buf[0..4].copy_from_slice(&ELF_MAGIC);
+        buf[EI_CLASS] = ELFCLASS64;
+        buf[EI_DATA] = ELFDATA2LSB;
+        buf[6] = 1;
+        put_u16(&mut buf, 16, ET_DYN);
+        put_u16(&mut buf, 18, EM_X86_64);
+        put_u32(&mut buf, 20, 1);
+        put_u64(&mut buf, 32, PH_OFF as u64);
+        put_u16(&mut buf, 52, EHDR_SIZE as u16);
+        put_u16(&mut buf, 54, PHDR_SIZE as u16);
+        put_u16(&mut buf, 56, 2); // PT_LOAD + PT_DYNAMIC
+
+        put_phdr(
+            &mut buf,
+            0,
+            PT_LOAD,
+            PF_R | PF_W,
+            0,
+            0,
+            IMG_SIZE as u64,
+            IMG_SIZE as u64,
+            0x1000,
+        );
+        put_phdr(
+            &mut buf,
+            1,
+            PT_DYNAMIC,
+            PF_R | PF_W,
+            DYN_OFF,
+            DYN_OFF,
+            0x100,
+            0x100,
+            8,
+        );
+
+        // Place the APS2 stream at APS2_VADDR (== file offset, 1:1 load).
+        buf[APS2_VADDR as usize..APS2_VADDR as usize + aps2_stream.len()]
+            .copy_from_slice(aps2_stream);
+
+        // .dynamic: DT_ANDROID_RELA + DT_ANDROID_RELASZ (+ a strtab so str lookups never panic).
+        let mut slot = 0;
+        let mut dyn_entry = |buf: &mut [u8], tag: i64, val: u64| {
+            put_dyn(buf, slot, tag, val);
+            slot += 1;
+        };
+        dyn_entry(&mut buf, DT_ANDROID_RELA, APS2_VADDR);
+        dyn_entry(&mut buf, DT_ANDROID_RELASZ, aps2_stream.len() as u64);
+        dyn_entry(&mut buf, DT_STRTAB, STR_OFF);
+        dyn_entry(&mut buf, DT_STRSZ, 0x40);
+        dyn_entry(&mut buf, DT_NULL, 0);
+
+        (buf, APS2_VADDR)
+    }
+
+    /// Decode an APS2 stream through a real `ElfImage` and return the `Rela` list.
+    fn decode_aps2(stream: &[u8]) -> Vec<Rela> {
+        let (buf, _) = build_aps2_image(stream);
+        let img = ElfImage::parse(&buf).expect("aps2 fixture parses");
+        img.relocations().expect("aps2 decodes")
+    }
+
+    #[test]
+    fn aps2_single_relative_group() {
+        // One RELATIVE reloc: count=1, base_offset=0x1000, one group of size 1, grouped by
+        // offset+info (the common encoding), no addend. offset = 0x1000 + 0x8 = 0x1008.
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 1); // reloc_count
+        enc_sleb128(&mut s, 0x1000); // reloc_base_offset
+        enc_sleb128(&mut s, 1); // group_size
+        enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO); // flags
+        enc_sleb128(&mut s, 0x8); // group_offset_delta
+        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64); // r_info (sym 0, type 8)
+
+        let relas = decode_aps2(&s);
+        assert_eq!(relas.len(), 1);
+        assert_eq!(
+            relas[0],
+            Rela {
+                offset: 0x1008,
+                sym_index: 0,
+                r_type: R_X86_64_RELATIVE,
+                addend: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn aps2_grouped_by_offset_and_info_runs_offsets() {
+        // The dominant libroblox case: a run of RELATIVE relocs grouped by a constant offset delta
+        // AND a shared r_info. count=3, base=0x2000, delta=0x8 → offsets 0x2008/0x2010/0x2018.
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 3);
+        enc_sleb128(&mut s, 0x2000);
+        enc_sleb128(&mut s, 3); // group_size = 3
+        enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO);
+        enc_sleb128(&mut s, 0x8); // shared offset delta
+        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64); // shared r_info
+
+        let relas = decode_aps2(&s);
+        assert_eq!(relas.len(), 3);
+        for (i, want_off) in [0x2008u64, 0x2010, 0x2018].into_iter().enumerate() {
+            assert_eq!(relas[i].offset, want_off);
+            assert_eq!(relas[i].r_type, R_X86_64_RELATIVE);
+            assert_eq!(relas[i].sym_index, 0);
+            assert_eq!(relas[i].addend, 0);
+        }
+    }
+
+    #[test]
+    fn aps2_group_with_addend_accumulates() {
+        // A GLOB_DAT-style group WITH addends, NOT grouped-by-addend (per-reloc addend deltas that
+        // accumulate). count=2, base=0, offset deltas 0x10 each, r_info = sym 5 GLOB_DAT(6).
+        // addend deltas: +0x100, +0x40 → running addends 0x100, 0x140.
+        let info = ((5u64 << 32) | u64::from(reloc::R_X86_64_GLOB_DAT)) as i64;
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 2);
+        enc_sleb128(&mut s, 0);
+        enc_sleb128(&mut s, 2); // group_size
+        enc_sleb128(&mut s, GROUPED_BY_INFO | GROUP_HAS_ADDEND); // per-reloc offset+addend, shared info
+        enc_sleb128(&mut s, info); // shared r_info
+                                   // reloc 0: offset_delta, addend_delta
+        enc_sleb128(&mut s, 0x10);
+        enc_sleb128(&mut s, 0x100);
+        // reloc 1: offset_delta, addend_delta
+        enc_sleb128(&mut s, 0x10);
+        enc_sleb128(&mut s, 0x40);
+
+        let relas = decode_aps2(&s);
+        assert_eq!(relas.len(), 2);
+        assert_eq!(
+            relas[0],
+            Rela {
+                offset: 0x10,
+                sym_index: 5,
+                r_type: reloc::R_X86_64_GLOB_DAT,
+                addend: 0x100,
+            }
+        );
+        assert_eq!(
+            relas[1],
+            Rela {
+                offset: 0x20,
+                sym_index: 5,
+                r_type: reloc::R_X86_64_GLOB_DAT,
+                addend: 0x140, // accumulated: 0x100 + 0x40
+            }
+        );
+    }
+
+    #[test]
+    fn aps2_grouped_by_addend_reads_one_delta_for_group() {
+        // GROUP_HAS_ADDEND + GROUPED_BY_ADDEND: one addend delta read once for the whole group, so
+        // every reloc in the group shares the same accumulated addend.
+        let info = ((9u64 << 32) | u64::from(R_X86_64_RELATIVE)) as i64;
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 2);
+        enc_sleb128(&mut s, 0x100);
+        enc_sleb128(&mut s, 2);
+        enc_sleb128(
+            &mut s,
+            GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO | GROUP_HAS_ADDEND | GROUPED_BY_ADDEND,
+        );
+        enc_sleb128(&mut s, 0x8); // group offset delta
+        enc_sleb128(&mut s, info); // group r_info
+        enc_sleb128(&mut s, 0x2000); // group addend delta (applied ONCE)
+
+        let relas = decode_aps2(&s);
+        assert_eq!(relas.len(), 2);
+        assert_eq!(relas[0].offset, 0x108);
+        assert_eq!(relas[1].offset, 0x110);
+        assert_eq!(relas[0].addend, 0x2000);
+        assert_eq!(relas[1].addend, 0x2000); // same group addend, not re-accumulated
+        assert_eq!(relas[0].sym_index, 9);
+    }
+
+    #[test]
+    fn aps2_mixed_groups_carry_offset_and_addend() {
+        // Two groups in one stream proving the running offset AND addend carry across the group
+        // boundary. Group A: 2 RELATIVE (grouped offset 0x8, no addend → addend resets to 0).
+        // Group B: 1 GLOB_DAT WITH addend (per-reloc), proving the offset continues from group A's
+        // last offset and the addend accumulates from 0 (group A had no addend → running addend 0).
+        let glob = ((3u64 << 32) | u64::from(reloc::R_X86_64_GLOB_DAT)) as i64;
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 3); // total relocs across both groups
+        enc_sleb128(&mut s, 0x4000); // base offset
+
+        // Group A — 2 RELATIVE, grouped by offset+info, NO addend.
+        enc_sleb128(&mut s, 2);
+        enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO);
+        enc_sleb128(&mut s, 0x8);
+        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64);
+
+        // Group B — 1 GLOB_DAT, per-reloc offset+addend, shared info, HAS addend.
+        enc_sleb128(&mut s, 1);
+        enc_sleb128(&mut s, GROUPED_BY_INFO | GROUP_HAS_ADDEND);
+        enc_sleb128(&mut s, glob);
+        enc_sleb128(&mut s, 0x20); // offset delta
+        enc_sleb128(&mut s, 0x77); // addend delta
+
+        let relas = decode_aps2(&s);
+        assert_eq!(relas.len(), 3);
+        // Group A: offsets 0x4008, 0x4010, addend 0.
+        assert_eq!(relas[0].offset, 0x4008);
+        assert_eq!(relas[0].r_type, R_X86_64_RELATIVE);
+        assert_eq!(relas[0].addend, 0);
+        assert_eq!(relas[1].offset, 0x4010);
+        assert_eq!(relas[1].addend, 0);
+        // Group B: offset continues from 0x4010 + 0x20 = 0x4030; addend 0 + 0x77 = 0x77.
+        assert_eq!(relas[2].offset, 0x4030);
+        assert_eq!(relas[2].r_type, reloc::R_X86_64_GLOB_DAT);
+        assert_eq!(relas[2].sym_index, 3);
+        assert_eq!(relas[2].addend, 0x77);
+    }
+
+    #[test]
+    fn aps2_per_reloc_info_not_grouped() {
+        // A group NOT grouped by info: each reloc carries its own r_info (different types/syms).
+        let r0 = R_X86_64_RELATIVE as i64;
+        let r1 = ((7u64 << 32) | u64::from(R_X86_64_RELATIVE)) as i64;
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 2);
+        enc_sleb128(&mut s, 0);
+        enc_sleb128(&mut s, 2);
+        enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA); // only offset grouped; info per-reloc
+        enc_sleb128(&mut s, 0x8); // group offset delta
+        enc_sleb128(&mut s, r0); // reloc 0 r_info
+        enc_sleb128(&mut s, r1); // reloc 1 r_info
+
+        let relas = decode_aps2(&s);
+        assert_eq!(relas.len(), 2);
+        assert_eq!(relas[0].sym_index, 0);
+        assert_eq!(relas[1].sym_index, 7);
+        assert_eq!(relas[0].offset, 0x8);
+        assert_eq!(relas[1].offset, 0x10);
+    }
+
+    #[test]
+    fn aps2_truncated_stream_is_typed_err() {
+        // A stream that declares 5 relocs but ends after the header → typed error, never a panic.
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 5); // claims 5 relocs
+        enc_sleb128(&mut s, 0); // base
+                                // ...and then nothing. The first group_size read runs off the section end.
+        let (buf, _) = build_aps2_image(&s);
+        let img = ElfImage::parse(&buf).unwrap();
+        let err = img.relocations().unwrap_err();
+        assert!(
+            matches!(err, ElfError::Truncated { .. }),
+            "expected Truncated, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn aps2_bad_magic_is_typed_err() {
+        // A section whose first 4 bytes are not "APS2" → BadAndroidMagic, not a misdecode.
+        let mut s = vec![b'A', b'P', b'S', b'1']; // wrong version byte
+        enc_sleb128(&mut s, 1);
+        enc_sleb128(&mut s, 0);
+        let (buf, _) = build_aps2_image(&s);
+        let img = ElfImage::parse(&buf).unwrap();
+        assert!(matches!(
+            img.relocations().unwrap_err(),
+            ElfError::BadAndroidMagic(_)
+        ));
+    }
+
+    #[test]
+    fn aps2_overshooting_group_is_typed_err() {
+        // A group whose size pushes the running total past the declared count → BadAndroidReloc,
+        // not an over-read past the count.
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, 1); // declares only 1 reloc
+        enc_sleb128(&mut s, 0);
+        enc_sleb128(&mut s, 4); // but the group claims 4
+        enc_sleb128(&mut s, GROUPED_BY_OFFSET_DELTA | GROUPED_BY_INFO);
+        enc_sleb128(&mut s, 0x8);
+        enc_sleb128(&mut s, R_X86_64_RELATIVE as i64);
+        let (buf, _) = build_aps2_image(&s);
+        let img = ElfImage::parse(&buf).unwrap();
+        assert!(matches!(
+            img.relocations().unwrap_err(),
+            ElfError::BadAndroidReloc(1, 0)
+        ));
+    }
+
+    #[test]
+    fn read_sleb128_negative_and_multibyte() {
+        // Direct SLEB128 round-trips, including negative deltas (offset deltas can be negative).
+        for v in [
+            0i64,
+            1,
+            -1,
+            63,
+            64,
+            -64,
+            -65,
+            0x7f,
+            -0x80,
+            12345,
+            -12345,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let mut enc = Vec::new();
+            enc_sleb128(&mut enc, v);
+            let mut cur = 0usize;
+            let got = read_sleb128(&enc, &mut cur).expect("decode");
+            assert_eq!(got, v, "round-trip {v}");
+            assert_eq!(cur, enc.len(), "consumed all bytes for {v}");
+        }
+    }
+
+    #[test]
+    fn read_sleb128_truncated_is_typed_err() {
+        // A continuation byte with no successor → Truncated, not a panic/spin.
+        let bytes = [0x80u8]; // says "more follows" but there is none
+        let mut cur = 0usize;
+        assert!(matches!(
+            read_sleb128(&bytes, &mut cur),
+            Err(ElfError::Truncated { .. })
+        ));
+    }
+
     // 2026-06-05: Re-parse the REAL Roblox x86-64 engine `libroblox.so` through this decoder,
     // reading the entry's bytes via Eclipse's own `apk` reader (benign data parse — no exec/mmap),
     // and assert the headline facts from `docs/libroblox-characterization.md`. SKIPs cleanly (never
@@ -1203,14 +1794,71 @@ mod tests {
             "libroblox.so: expected PT_GNU_RELRO (relro mprotect)"
         );
 
-        // Diagnostic, documenting the APS2-packing gap (elf.rs sees only the std .rela.plt JUMP_SLOTs
-        // until the Android-packed DT_ANDROID_RELA decoder lands — see the characterization doc).
+        // 2026-06-05: the Android-packed (APS2) DT_ANDROID_RELA table is now decoded, so
+        // `relocations()` returns ALL of libroblox's relocations. Assert the EXACT count + histogram
+        // from docs/libroblox-characterization.md (cross-checked against `llvm-readelf -r`):
+        //   APS2 .rela.dyn: RELATIVE 527,208 + GLOB_DAT 67 + R_X86_64_64 22 = 527,297
+        //   std .rela.plt:  JUMP_SLOT 546
+        //   total:          527,843
+        // libroblox confirms DT_ANDROID_RELA is present and DT_RELA is absent (the whole point).
+        assert!(
+            img.dyn_info.android_rela.is_some(),
+            "libroblox.so: expected DT_ANDROID_RELA (APS2-packed .rela.dyn)"
+        );
+        assert!(
+            img.dyn_info.rela.is_none(),
+            "libroblox.so: expected NO standard DT_RELA (packing is APS2-only)"
+        );
+
+        // Decode the APS2 block in isolation: EXACTLY 527,297 relocs with the documented histogram.
+        let (av, asz) = img.dyn_info.android_rela.unwrap();
+        let mut packed = Vec::new();
+        img.decode_android_packed_rela(av, asz, &mut packed)
+            .expect("APS2 decode");
+        assert_eq!(
+            packed.len(),
+            527_297,
+            "libroblox.so: APS2 decoded reloc count"
+        );
+        let count_type = |t: u32| packed.iter().filter(|r| r.r_type == t).count();
+        assert_eq!(
+            count_type(R_X86_64_RELATIVE),
+            527_208,
+            "libroblox.so: APS2 RELATIVE count"
+        );
+        assert_eq!(
+            count_type(reloc::R_X86_64_GLOB_DAT),
+            67,
+            "libroblox.so: APS2 GLOB_DAT count"
+        );
+        assert_eq!(
+            count_type(reloc::R_X86_64_64),
+            22,
+            "libroblox.so: APS2 R_X86_64_64 count"
+        );
+
+        // The full relocations() = APS2 (527,297) + std .rela.plt JUMP_SLOTs (546) = 527,843.
         let relas = img.relocations().expect("relocations decode");
+        assert_eq!(
+            relas.len(),
+            527_843,
+            "libroblox.so: total relocations (APS2 + .rela.plt)"
+        );
+        assert_eq!(
+            relas
+                .iter()
+                .filter(|r| r.r_type == reloc::R_X86_64_JUMP_SLOT)
+                .count(),
+            546,
+            "libroblox.so: std .rela.plt JUMP_SLOT count"
+        );
         eprintln!(
-            "real_libroblox_engine_decodes_headline_facts: loads={} needed={} init_arraysz={:?} std_relocs_seen={} (packed .rela.dyn NOT yet decoded)",
+            "real_libroblox_engine_decodes_headline_facts: loads={} needed={} init_arraysz={:?} APS2_decoded={} (RELATIVE 527208 + GLOB_DAT 67 + 64×22) + std_relocs={} → total {}",
             img.loads.len(),
             needed.len(),
             img.dyn_info.init_array.map(|(_, sz)| sz),
+            packed.len(),
+            relas.len() - packed.len(),
             relas.len(),
         );
     }
