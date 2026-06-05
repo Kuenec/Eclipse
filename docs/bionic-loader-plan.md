@@ -63,6 +63,11 @@ symbols (`SL_IID_*`, `slCreateEngine`) → satisfiable from `libOpenSLES.so`. So
 genuinely missing pieces are the **sonames** `libmediandk.so` and `libOpenMAXAL.so`; the
 underlying symbols already live in `libandroid.so` / `libOpenSLES.so`.
 
+> **Refined 2026-06-04 (§4b, readelf/nm):** the missing-soname count is **three**, not two —
+> `liblog.so` is also missing as a file on the bionic ldpath (its `__android_log_*` symbols
+> exist only at `/usr/lib/art/liblog.so`). And `libroblox.so` imports **0** direct
+> `libOpenMAXAL.so` symbols, so that shim can be a stub/alias. See §4b.1/§4b.3.
+
 ### Where `java.library.path` now points, and why it is necessary-but-not-sufficient
 
 **Confirmed (this just-landed wiring, `src/runtime.rs`):** on `eclipse run <apk>`, the
@@ -192,11 +197,161 @@ ensuring the shim dir is among the dirs registered with the bionic linker.
 
 ---
 
+## 4b. Confirmed evidence (readelf/nm) — 2026-06-04
+
+This subsection promotes the §5 UNCONFIRMED items that are answerable by **pure
+ELF/symbol/config inspection** (`readelf`, `nm`, `objdump` on the `.so` files; `cat` on the
+`.cfg`) into **CONFIRMED** facts. It does **not** touch the linker-source / build-recipe
+questions, which stay UNCONFIRMED in §5 (main-loop only). Source `.so`:
+`/home/kue/eclipse-m0/apk/v2.724.735/_split/lib/x86_64/libroblox.so`.
+
+### 4b.1 `libroblox.so` `DT_NEEDED` — CONFIRMED (exact list, 10 entries)
+
+```
+libOpenMAXAL.so  libmediandk.so  libOpenSLES.so  libGLESv2.so  libEGL.so
+libandroid.so    liblog.so       libm.so         libdl.so      libc.so
+```
+
+Matches the §2 list. Classification by how each resolves in the bionic namespace:
+
+| soname | status | provider / note |
+|---|---|---|
+| `libc.so` | cfg-aliased | → `libc_bio.so.0` (present, `/usr/lib`) |
+| `libdl.so` | cfg-aliased / present | `libdl_bio.so.0` present; bionic linker self-init |
+| `libm.so` | provider on system | glibc `libm.so.6` via `ld.so.cache` |
+| `libandroid.so` | cfg-aliased | → `libandroid.so.0` (ATL, **198 exports**) |
+| `libOpenSLES.so` | cfg-aliased | → `libOpenSLES.so.1` (`libopensles-standalone`) |
+| `libEGL.so` | cfg-aliased | → `libEGL.so.1` (Mesa) |
+| `libGLESv2.so` | cfg-aliased | → `libGLESv2.so.2` (Mesa) |
+| `liblog.so` | **MISSING-needs-shim** | only at `/usr/lib/art/liblog.so`, outside the bionic ldpath |
+| `libmediandk.so` | **MISSING-needs-shim** | absent system-wide; symbols live in `libandroid.so.0` |
+| `libOpenMAXAL.so` | **MISSING-needs-shim** | absent system-wide; **0** direct imports (see 4b.3) |
+
+So **7 of 10** `DT_NEEDED` resolve today (5 cfg-aliased + `libm`/`libdl`), and **3** are
+genuinely missing as files: `liblog.so`, `libmediandk.so`, `libOpenMAXAL.so`. This sharpens
+§2's "only two missing sonames" — `liblog.so` is a **third** missing soname (its symbols
+exist at `/usr/lib/art/liblog.so` but that path is not on the bionic ldpath).
+
+### 4b.2 `libmediandk.so` imported symbol set — CONFIRMED (23 symbols, 100% in `libandroid.so.0`)
+
+The `AMedia*` surface `libroblox.so` imports under the `libmediandk.so` soname (function
+symbols), **all 23 present** as exports in ATL's `libandroid.so.0`:
+
+```
+AMediaCodec_configure              AMediaCodec_createDecoderByType
+AMediaCodec_createEncoderByType    AMediaCodec_delete
+AMediaCodec_dequeueInputBuffer     AMediaCodec_dequeueOutputBuffer
+AMediaCodec_flush                  AMediaCodec_getInputBuffer
+AMediaCodec_getOutputBuffer        AMediaCodec_getOutputFormat
+AMediaCodec_queueInputBuffer       AMediaCodec_releaseOutputBuffer
+AMediaCodec_start                  AMediaCodec_stop
+AMediaFormat_delete                AMediaFormat_getBuffer
+AMediaFormat_getInt32              AMediaFormat_new
+AMediaFormat_setBuffer             AMediaFormat_setFloat
+AMediaFormat_setInt32              AMediaFormat_setString
+AMediaFormat_toString
+```
+
+`AMediaFormat_delete` (the symbol that aborted relocation in §2) is in this set. This is the
+precise export table the `libmediandk.so` shim must forward — **function coverage is 100%**.
+
+> **CAVEAT — `AMEDIAFORMAT_KEY_*` data symbols (UNCONFIRMED gap).** `libroblox.so` also
+> imports the `AMEDIAFORMAT_KEY_*` **data** symbols (`..._BIT_RATE`, `_COLOR_FORMAT`,
+> `_FRAME_RATE`, `_HEIGHT`, `_WIDTH`, `_STRIDE`, `_I_FRAME_INTERVAL`). These are **not** in
+> the function-export check above and their presence in `libandroid.so.0` was **not**
+> confirmed here. If ATL's `libandroid.so.0` does not export these data globals, the
+> `libmediandk.so` shim must define/forward them too. **Verify in the main loop.**
+
+### 4b.3 `libOpenMAXAL.so` imported symbol set — CONFIRMED (0 direct imports)
+
+`libroblox.so` imports **zero** `XA*`/OpenMAXAL symbols directly. `libOpenMAXAL.so` is a
+`DT_NEEDED` entry with no directly-referenced symbols in `libroblox.so` — i.e. a transitive
+or dormant soname, not a directly-used API. This **revises** §4's plan: the
+`libOpenMAXAL.so` shim may be an **empty/stub** bionic-ABI `.so` (or a `cfg.d` alias to
+`libOpenSLES.so.1`) purely to satisfy the soname; it need not export an OpenSL ES surface
+for `libroblox.so` itself. (Whether a *transitive* consumer pulled in by another `DT_NEEDED`
+needs real OpenMAXAL symbols is still **UNCONFIRMED** — it depends on the load graph, not on
+`libroblox.so`'s own undefined-symbol table.)
+
+### 4b.4 What `libandroid.so.0` covers vs the gaps — CONFIRMED
+
+ATL's `libandroid.so.0` exports **198** symbols and covers **100%** of the `AMedia*`
+function family above. The `libroblox.so` undefined symbols it does **not** cover fall into
+families that belong to **other** `DT_NEEDED` libs, not to a `libandroid` gap:
+
+- `egl*` (≈29 symbols) → from `libEGL.so` (cfg-aliased `libEGL.so.1`).
+- `gl*` (≈140 symbols, the GLES2 surface) → from `libGLESv2.so` (cfg-aliased `libGLESv2.so.2`).
+- `__android_log_*` (`_print`, `_write`, `_buf_write`, `_assert`) → from `liblog.so`
+  (the **MISSING** soname — these are why `liblog.so` matters).
+- `AConfiguration_getScreenWidthDp` / `_getScreenHeightDp` — **UNCONFIRMED** whether
+  `libandroid.so.0` exports these two (§2 claimed `AConfiguration* 4/4`; this pass found
+  them in the not-covered-by-the-AMedia-check set). Re-check against `libandroid.so.0`'s full
+  export table in the main loop.
+- `getentropy` (glibc), `__gcov_*` (coverage stubs) — host/toolchain symbols, out of shim scope.
+
+Conclusion: the EGL/GLES/log symbols are **not** a `libandroid` shim concern — EGL/GLES are
+already cfg-aliased to Mesa and are Eclipse's `ash`/EGL graphics-forwarding scope, not the
+bionic media-shim scope. The media shim's job is narrowly the **23 `AMedia*` functions**
+(plus the `AMEDIAFORMAT_KEY_*` data symbols, pending 4b.2's caveat).
+
+### 4b.5 Other-NEEDED bionic-alias status — CONFIRMED
+
+The §5 "`libm.so` / `libc.so` / `libdl.so` bionic-alias handling" question is resolved for
+the resolution-today part:
+
+- `libc.so` → `libc_bio.so.0` — **cfg-aliased, provider present.**
+- `libdl.so` → `libdl_bio.so.0` — **present**; pulled in transitively by `libart.so` and
+  self-initializes the translation linker (matches the §0 / AGENTS.md ART-VM-boot note).
+- `libm.so` — **no `cfg.d` entry**; resolves to glibc `libm.so.6` via `ld.so.cache`. (Whether
+  the bionic namespace is content with the glibc `libm` for a bionic-linked consumer, vs
+  needing a `libm_bio`, is a **loader-behavior** question → stays UNCONFIRMED in §5.)
+- `libandroid.so` → `libandroid.so.0` — **cfg-aliased, present, 198 exports.**
+- `libOpenSLES.so` → `libOpenSLES.so.1` — **cfg-aliased, present.**
+
+### 4b.6 Full installed `cfg.d` map — CONFIRMED (verbatim)
+
+`/usr/share/bionic_translation/cfg.d/bionic_translation.cfg` (read 2026-06-04), verbatim:
+
+```
+# libc_bio.so pulls in libptread_bio.so (pthreads are in libc.so on android)
+libc.so             libc_bio.so.0
+libstdc++.so        libstdc++_bio.so.0
+# TODO: put in separate cfg file, installed by atl
+libandroid.so       libandroid.so.0
+libopenxr_loader.so libopenxr_loader.so.1
+# TODO: put in separate cfg file, installed by libsles_standalone
+libOpenSLES.so      libOpenSLES.so.1
+# TODO: not sure where to put these
+libEGL.so           libEGL.so.1
+libGLESv2.so        libGLESv2.so.2
+libGLESv3.so        libGLESv2.so.2 # GLESv3 is a symlink to GLESv2 if it exists at all
+```
+
+Confirms §3.3: **no** entry for `libmediandk.so`, `libOpenMAXAL.so`, or `liblog.so`. Adding
+`cfg.d` mappings for these three (or placing real shim `.so` on the ldpath) is the
+registration half of §4.
+
+---
+
 ## 5. Open questions / UNCONFIRMED items (resolve in the main loop before coding the shim)
 
 Mark these as the entry checklist for the deferred step. None is settled by the digest or
 the safe files; do not write shim code until each is confirmed against the actual source /
 a probe in the main loop.
+
+> **Resolved 2026-06-04 by §4b (readelf/nm) — struck from this checklist:**
+> - ~~exact symbol set `libroblox.so` imports from each NDK soname~~ → **CONFIRMED** in
+>   §4b.2 (`libmediandk.so`: 23 `AMedia*` functions, 100% in `libandroid.so.0`) and §4b.3
+>   (`libOpenMAXAL.so`: **0** direct imports → stub/alias suffices). Remaining sub-gaps:
+>   the `AMEDIAFORMAT_KEY_*` **data** symbols (§4b.2 caveat) and the two `AConfiguration_*Dp`
+>   symbols (§4b.4) — narrow, kept as data-symbol checks below.
+> - ~~`libc.so` / `libdl.so` bionic-alias handling~~ → **CONFIRMED** in §4b.5
+>   (`libc`→`libc_bio.so.0`, `libdl_bio.so.0` self-init). The `libm`/`liblog` **resolution
+>   policy** parts remain open (below).
+> - The full `DT_NEEDED` list (§4b.1) and the verbatim `cfg.d` map (§4b.6) are now CONFIRMED.
+
+Still open (linker-source / build-recipe / loader-behavior — none answerable by ELF
+inspection alone):
 
 - **UNCONFIRMED — re-export mechanism that satisfies the bionic resolver.** Whether a shim
   `.so` whose own `DT_NEEDED` points at the bionic provider (`libandroid.so.0` /
@@ -206,17 +361,20 @@ a probe in the main loop.
   not verified against the vendored linker's symbol-registration behavior.
 - **UNCONFIRMED — `cfg.d` vs ldpath precedence / sufficiency.** Whether adding a `cfg.d`
   soname mapping alone resolves the `DT_NEEDED`, whether the shim file on the ldpath alone
-  suffices, or whether **both** are required. §3.3 shows the mapping format but not the
+  suffices, or whether **both** are required. §3.3/§4b.6 show the mapping format but not the
   resolution precedence between the two.
-- **UNCONFIRMED — exact symbol set `libroblox.so` imports from each NDK soname.** The
-  *families* are known to be fully covered by ATL (§2), but the precise per-soname imported
-  symbol list (to size each shim's export table and avoid missing a relocation) must be read
-  from `libroblox.so` with `readelf` in the main loop.
-- **UNCONFIRMED — `libm.so` / `libc.so` / `libdl.so` bionic-alias handling.** The work-list
-  notes `libm.so` needs a bionic alias/fallback (host has `libm.so.6`). `cfg.d` maps
-  `libc.so`→`libc_bio.so.0` but has **no** `libm.so` entry. Whether `libm`/`libdl`/`liblog`
-  already resolve in the bionic namespace for `libroblox.so` (vs needing an added mapping)
-  is unconfirmed and must be checked at the same time as the media shims.
+- **UNCONFIRMED — `liblog.so` resolution + `libm.so` bionic-alias policy.** §4b.1 newly
+  CONFIRMED `liblog.so` is a **third** missing soname (symbols exist only at
+  `/usr/lib/art/liblog.so`, off the bionic ldpath); §4b.5 CONFIRMED `libm.so` has no `cfg.d`
+  entry and resolves to glibc `libm.so.6`. What stays UNCONFIRMED is the **loader behavior**:
+  whether registering `/usr/lib/art` on the bionic ldpath (or adding a `liblog.so` cfg
+  mapping) is enough for `liblog.so`, and whether a bionic-linked consumer is content with
+  the glibc `libm.so.6` or needs a `libm_bio`. Resolve alongside the media shims.
+- **UNCONFIRMED — `AMEDIAFORMAT_KEY_*` and `AConfiguration_*Dp` data-symbol coverage.**
+  §4b.2/§4b.4: `libroblox.so` imports the `AMEDIAFORMAT_KEY_*` data globals and two
+  `AConfiguration_getScreen*Dp` symbols; whether `libandroid.so.0` exports these (so the
+  media shim can forward them) was not confirmed by the function-export pass. Check
+  `libandroid.so.0`'s full export table in the main loop before sizing the shim.
 - **UNCONFIRMED — bionic-ABI build recipe for the shims.** How to compile a "proper
   bionic-ABI .so" (vs a host glibc .so, which §3.2 proved crashes) on this host — toolchain,
   whether ATL ships a build mode for translation-layer providers, or whether linking against

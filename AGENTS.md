@@ -477,9 +477,15 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      (streamed + idempotent) runs on boot into the XDG cache dir (`runtime::native_lib_cache_dir`,
      `ECLIPSE_NATIVE_LIB_DIR`-overridable); `boot(plan, Some(apk), Some(app_lib_dir))` appends that
      dir **after** the framework natives dir on `-Djava.library.path` so `System.loadLibrary("roblox")`
-     can find `libroblox.so`. NEXT: write the committed `docs/bionic-loader-plan.md` design note,
-     then the deferred bionic-shim step (`libmediandk.so`/`libOpenMAXAL.so`) — **main-loop only** due
-     to the subagent cyber-safeguard blocker.
+     can find `libroblox.so`. `docs/bionic-loader-plan.md` design note is **written + enriched with
+     confirmed readelf/nm evidence** (§4b, 2026-06-04): `libroblox.so` NEEDs 10 libs, 7 resolve today
+     (5 cfg-aliased + libm/libdl), **3 missing sonames** — `libmediandk.so` (23 `AMedia*` fns, 100% in
+     ATL `libandroid.so.0`), `libOpenMAXAL.so` (**0** direct imports → stub/alias suffices), and
+     `liblog.so` (symbols only at `/usr/lib/art/liblog.so`, off the bionic ldpath). NEXT: the deferred
+     bionic-shim step — **main-loop only** (subagent cyber-safeguard blocker). Remaining UNCONFIRMED
+     (linker-source/build-recipe, in the doc §5): shim re-export mechanism, `cfg.d`-vs-ldpath
+     precedence, `liblog`/`libm` resolution policy, `AMEDIAFORMAT_KEY_*` data-symbol coverage, the
+     bionic-ABI build recipe.
   3. JNI calls: add the full **`jni`** crate for safe `FindClass`/`CallStaticObjectMethod`/…;
      **wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot from
      the **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).
