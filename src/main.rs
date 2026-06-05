@@ -13,16 +13,16 @@ USAGE:
     eclipse <COMMAND>
 
 COMMANDS:
-    run <APK>  Parse the APK, print the ART boot plan, and boot the ART VM
+    run <APK>  Parse the APK, boot the ART VM (Roblox on the classpath), open the window
     config     Show effective configuration and its path
     help       Show this help
     --version  Show version
 
 STATUS:
-    `run` opens the APK, parses the manifest, prints the ART boot plan (heap, host ISA,
-    graphics backend, launcher), then boots the vendored ART VM. Today that brings up a
-    libcore VM (proving ART boots from Eclipse's graphics-free process); reaching Roblox's
-    onCreate (app classpath/Activity/native-lib/winit) is the next step. See docs/.
+    `run` parses the manifest, prints the ART boot plan, boots the vendored ART VM with
+    Roblox's Java on the classpath, then opens the host game window (winit, no GTK). The
+    framework that drives the launcher Activity to onCreate and renders the engine into the
+    window is the next phase (component-map F). See docs/.
 ";
 
 fn main() -> ExitCode {
@@ -117,6 +117,12 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // (dex2oat compiles the boot image once).
     println!("\n# Booting the ART VM with Roblox on the classpath…");
     eclipse::runtime::boot(&plan, Some(std::path::Path::new(apk_path)))?;
-    println!("ART VM booted with Roblox's Java on the classpath ✓ (onCreate pending)");
+    println!("ART VM booted with Roblox's Java on the classpath ✓");
+
+    // Open the host game window via winit (no GTK — keeps the low_4gb window clear for ART, the
+    // Step 3.5 win). The Activity Surface + engine rendering will hang off this window next; for
+    // now it opens the window and runs the event loop until closed. Runs on the main thread.
+    println!("# Opening the host window (winit; close it to exit)…");
+    eclipse::graphics::run_windowed(&format!("Eclipse — {}", manifest.package))?;
     Ok(())
 }

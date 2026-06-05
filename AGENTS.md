@@ -136,10 +136,12 @@ before any history-rewriting/force operation.
   all done & gated (2026-06-04). 🎉 **`runtime::boot()` boots the vendored ART VM from pure
   Rust** (`dlopen` libart + `JNI_CreateJavaVM`, JNI_OK) AND, with an APK, **loads Roblox's own
   Java** onto the classpath (`api-impl.jar:apk:framework-res.apk`; `FindClass` resolves
-  `com.roblox.*` incl. the engine JNI classes — C-probe verified). `eclipse run <apk>` boots it
-  on this host (EXIT 0). **Step 3.5 thesis validated end-to-end**: a graphics-free Rust process
-  boots ART with a clean low_4gb window where ATL+GTK4 exhausted it. **Remaining M1→M2:** reach
-  Roblox `onCreate` — needs a *framework* (ATL's `api-impl.jar` is GTK-coupled; Eclipse's own
+  `com.roblox.*` incl. the engine JNI classes — C-probe verified) and then **opens the host
+  game window via `winit` (no GTK)** that coexists with the running VM (`eclipse run <apk>` →
+  boots ART + opens the window on Wayland, verified). **Step 3.5 thesis validated end-to-end**:
+  a graphics-free Rust process boots ART with a clean low_4gb window where ATL+GTK4 exhausted it.
+  **Remaining M2/M3:** drive the window's Activity to `onCreate` + render — needs a *framework*
+  (ATL's `api-impl.jar` is GTK-coupled; Eclipse's own
   **winit + `ash`/EGL** framework is the production path) to drive the Activity +
   `System.loadLibrary`→`libroblox.so`.
 
@@ -693,6 +695,17 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   **winit + `ash`/EGL** framework (component-map F) — the major M2 build (see §5 next-actions).
   No new deps this step (still `libloading`+`jni-sys`); the full `jni` crate lands with the JNI
   call sequence in the onCreate work.
+- **2026-06-04** — **Host window via `winit` (no GTK) — framework foundation started
+  (component-map F).** `graphics::run_windowed()` creates the host game window with `winit 0.30`
+  (Wayland/X11) and runs the event loop; `eclipse run <apk>` now boots the ART VM (Roblox on the
+  classpath) on the main thread, then opens the window — verified on Wayland (`host window
+  created (winit, no GTK)`, window coexists with the running VM, no low_4gb issue). This settles
+  the thread model: **boot ART on the main thread first, then run winit's event loop on it**
+  (winit needs the main thread; the booted VM lives on its own daemon threads; future JNI calls
+  like `createApplication(window)` happen from inside the event loop, still on the attached main
+  thread). Dep added: `winit 0.30` (no GTK — deliberately, to keep low_4gb clear, the Step 3.5
+  win). `#![forbid(unsafe_code)]` in `graphics.rs` (winit needs no unsafe). Next: hand the window
+  to the framework's Activity/Surface and forward the engine's Vulkan/GL into it.
 
 ---
 
