@@ -140,12 +140,17 @@ before any history-rewriting/force operation.
   the laid-out rects, topmost clickable wins) and dispatches `View.performClick()` to the hit view via
   JNI on the held VM (guarded; `catch_unwind`+pending-exception check). `nativeSetOnClickListener` now
   marks the view clickable; the view's `native_constructor` records a JNI global ref so the click reaches
-  the real Java object. FAITHFUL: the wiring is ACTIVE on the accelerometerdemo run (the AppCompat
-  Toolbar nav ImageButton is marked clickable); the only honest gap is that the Toolbar wires that child
-  internally (not via the bound `ViewGroup.addView`) so it is not yet in the snapshot subtree — the
-  hit-test/dispatch dispatches correctly to any clickable view that IS in the tree. **Full
-  `MotionEvent`/`InputQueue` touch+move+key dispatch is the documented follow-up.** Gate now
-  **185 unit + 2 doctests**. The
+  the real Java object. **2026-06-05 UPDATE — INPUT v1: a REAL Android `MotionEvent` (`ACTION_DOWN`/`ACTION_UP`)
+  is now dispatched** (§6 INPUT v1 entry): a winit pointer PRESS hit-tests the View tree and dispatches
+  `ACTION_DOWN` via `MotionEvent.obtain` + `View.dispatchTouchEvent` on the held VM (guarded;
+  `catch_unwind`+pending-exception check; the event is `recycle()`d), and the matching RELEASE on the same view
+  dispatches `ACTION_UP` (with a `performClick()` fallback) — replacing v0's bare `performClick()`. FAITHFUL: the
+  touch path is ACTIVE on the dev-host run, which reached `ActivityResumed` with it wired; the real interactive
+  verification is the dev-host VISUAL check (a live pointer press/release on the rendered window), not an automated
+  end-to-end touch — unit tests cover the geometry + the `MotionAction` action-code mapping. **DEFERRED (documented
+  follow-up):** multi-touch / `ACTION_MOVE` / key + focus events, and the NDK `AInputQueue` native-input path
+  (Roblox's engine reads input via `AInputQueue`, not the Java View tree). Gate now
+  **188 unit + 2 doctests**. The
   real Roblox APK reaches its **own `RobloxApplication.onCreate` + startup tasks**
   (previously-verified, §6). **#1 frontier = ENGINE-LOAD: the bionic-shim relocation wall**
   (`R_X86_64_TPOFF64`/`RELR`/`BIND_NOW`; v1 = HYBRID extend-C-then-Rust;
@@ -732,6 +737,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   0-warning. Files: `src/framework/path_registry.rs` (new), `src/framework.rs` (Path natives + sig-pin test),
   `src/graphics.rs` (rasterizer + 8 tests), `Cargo.toml`/`docs/dependency-plan.md` (tiny-skia dep). Faithful log:
   `/tmp/eclipse-path5.log`.
+  ✅ **DONE 2026-06-05: INPUT v1 — a REAL Android `MotionEvent` (`ACTION_DOWN`/`ACTION_UP`) is dispatched from the
+  winit pointer press/release via `View.dispatchTouchEvent` on the hit view** (§6 INPUT v1 entry), replacing v0's bare
+  `performClick()`. PRESS → `MotionEvent.obtain(..., ACTION_DOWN, x, y, ...)` + `dispatchTouchEvent` on the hit view's
+  recorded global ref (held VM, guarded, `recycle()`d); matching RELEASE on the same view → `ACTION_UP` (+ a
+  `performClick()` fallback). FAITHFUL: the touch path is ACTIVE and the run reached `ActivityResumed` with it wired;
+  the genuine interactive verification is the dev-host VISUAL check, not an automated end-to-end touch (unit tests
+  cover the geometry + the `MotionAction` action-code mapping). **DEFERRED:** multi-touch / `ACTION_MOVE` / key + focus
+  events, and the NDK `AInputQueue` native-input path (Roblox's native input). Gate clean: **188 unit + 2 doctests**
+  (+3), fmt / build --all-targets / clippy `-D warnings` / release all 0-warning. Files: `src/framework.rs`,
+  `src/graphics.rs`. No new deps. **Next input step = `ACTION_MOVE`/multi-touch then the `AInputQueue` path for Roblox.**
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -2268,6 +2283,29 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   framework.rs wholesale/asset-section read). Faithful logs: `/tmp/eclipse-input.log`, `/tmp/eclipse-input-tap2.log`,
   `/tmp/eclipse-tree.log`. Next: full `MotionEvent`/`InputQueue` touch+move+key dispatch; thread the Toolbar's internal
   children into the render tree so its nav button is hit-testable.
+- **2026-06-05** — 🟢 **INPUT v1: a REAL Android `MotionEvent` (`ACTION_DOWN`/`ACTION_UP`) is now dispatched from the
+  winit pointer press/release through `View.dispatchTouchEvent` on the hit view — replacing v0's bare `performClick()`.**
+  Root motivation: real apps (and Roblox) drive touch via `View.dispatchTouchEvent(MotionEvent)`, not a synthetic
+  `performClick()`; v0 dispatched a click but never produced a `MotionEvent`, so any view overriding `onTouchEvent`
+  saw nothing. Built on v0's sound hit-test + jobject recording: on a primary pointer **PRESS**, `hit_test_at` finds
+  the topmost clickable view; Eclipse obtains a real `MotionEvent` via `MotionEvent.obtain(downTime, eventTime, action,
+  x, y, metaState)` (`ACTION_DOWN`) and calls `View.dispatchTouchEvent(MotionEvent)Z` on that view's recorded global
+  ref through the held VM, then `recycle()`s the event. On the matching pointer **RELEASE** over the same view, the same
+  path dispatches `ACTION_UP` (with a `performClick()` fallback so a click still fires for views relying on the
+  framework's tap synthesis). All JNI is guarded (`checked()`/pending-exception described+cleared, `catch_unwind` at the
+  FFI boundary, no unwrap, never UB across JNI). The `obtain`/`recycle` pairing matches AOSP's `MotionEvent` recycling
+  contract so no event object leaks. **FAITHFUL status:** the touch path is ACTIVE on the dev-host run and the run
+  reached `ActivityResumed` with it wired; the genuine interactive verification is the dev-host visual check (a real
+  pointer press/release on the rendered window), NOT an automated end-to-end touch — the unit tests cover the geometry
+  + the `MotionAction` action-code mapping, not a live GPU dispatch. **DEFERRED (documented follow-up):** multi-touch
+  (multiple pointers / `ACTION_POINTER_DOWN`/`UP`), `ACTION_MOVE` (drag), key + focus events, and the **NDK
+  `AInputQueue`** native-input path (Roblox's engine reads input via `AInputQueue`/`ANativeActivity`, not the Java
+  `View` tree). **Regression guard:** GPU-free unit tests for the new touch dispatch + `MotionAction` action-code
+  mapping (added alongside v0's `hit_test`/`view_registry` tests); a mapping or geometry regression fails the build (no
+  new script). **NO REGRESSION:** demo_app + accelerometerdemo still reach ActivityResumed + render, 0 VK_ERROR/panic.
+  Gate clean: fmt / build --all-targets / clippy `-D warnings` / **test 188 unit + 2 doctests** (+3 over v0's 185) /
+  release — all 0-warning. Files: `src/framework.rs` (MotionEvent obtain/dispatch/recycle + `MotionAction` + tests),
+  `src/graphics.rs` (press/release pointer handling threads the hit view + action into dispatch). No new deps.
 
 ---
 

@@ -80,10 +80,12 @@ struct GameWindow<'vm> {
     /// The last pointer position in window pixels (top-left origin), updated on `CursorMoved`. `None`
     /// until the pointer first moves over the window. The press/release click uses this position.
     cursor: Option<(f32, f32)>,
-    /// `true` between a primary-button press and its release, with the press position. A click is a
-    /// press+release pair; we hit-test + dispatch on release (Android `performClick` semantics), only
-    /// if the release lands on the same view the press hit. `None` when no primary press is in flight.
-    primary_press: Option<(f32, f32)>,
+    /// The view a primary-button press landed on (its [`ViewHandle`]) plus the press position, set on
+    /// press and cleared on release. A touch is a press+release pair: an ACTION_DOWN dispatches on
+    /// press to this view, and an ACTION_UP on release dispatches to it only if the release still
+    /// lands on the SAME view (Android touch semantics — a release that drifts off is not a tap).
+    /// `None` when no primary press is in flight (or the press hit no clickable view).
+    primary_press: Option<(ViewHandle, f32, f32)>,
     /// 2026-06-05: set once the env-gated one-shot synthetic tap has run, so it fires at most once.
     /// The synthetic tap (only when `ECLIPSE_SYNTHETIC_TAP` is set) is a dev-host diagnostic that taps
     /// the center of the first clickable view to prove the hit-test→performClick chain end-to-end on a
@@ -160,8 +162,10 @@ impl ApplicationHandler for GameWindow<'_> {
                 // hit-test→performClick chain end-to-end on a real run (a headless run cannot click).
                 self.maybe_synthetic_tap();
             }
-            // 2026-06-05: minimal sound input path — track the pointer and dispatch a click to the
-            // hit Android view. Full MotionEvent/InputQueue touch+move+key dispatch is the follow-up.
+            // 2026-06-05: sound single-pointer touch path — track the pointer and dispatch real
+            // Android `MotionEvent`s (ACTION_DOWN on press, ACTION_UP on release) to the hit view via
+            // `View.dispatchTouchEvent`, which runs the View's own touch handling + click detection.
+            // Multi-touch / ACTION_MOVE / key / NDK-AInputQueue dispatch is the documented follow-up.
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some((position.x as f32, position.y as f32));
             }
@@ -170,14 +174,8 @@ impl ApplicationHandler for GameWindow<'_> {
                 button: MouseButton::Left,
                 ..
             } => match state {
-                ElementState::Pressed => {
-                    // Remember where the primary press landed; the click completes on release.
-                    self.primary_press = self.cursor;
-                }
-                ElementState::Released => {
-                    self.handle_primary_click();
-                    self.primary_press = None;
-                }
+                ElementState::Pressed => self.handle_primary_press(),
+                ElementState::Released => self.handle_primary_release(),
             },
             _ => {}
         }
@@ -185,57 +183,130 @@ impl ApplicationHandler for GameWindow<'_> {
 }
 
 impl GameWindow<'_> {
-    /// Complete a primary-button click: hit-test the rendered View tree at the release position and,
-    /// if it resolves to the SAME clickable view the press hit, dispatch `View.performClick()` to it.
+    /// Begin a primary-button touch: hit-test the rendered View tree at the press position and, if it
+    /// resolves to a clickable view, remember it and dispatch a real Android `MotionEvent` of
+    /// `ACTION_DOWN` to it via `View.dispatchTouchEvent`.
     ///
-    /// 2026-06-05: a click is a press+release on the same target (Android semantics — a release that
-    /// drifts off the pressed view is not a click). The hit-test is GPU-free geometry over the laid-out
-    /// rects (the same layout the renderer draws); dispatch goes through
-    /// [`framework::dispatch_click_to_view`](crate::framework::dispatch_click_to_view) on the held VM,
-    /// which is guarded (catch_unwind + pending-exception check) so a JNI/Java error can never crash
-    /// the event loop. No VM or no Vulkan renderer → hit-test only / no-op (logged).
-    fn handle_primary_click(&mut self) {
+    /// 2026-06-05: the DOWN half of the single-pointer touch. The hit-test is GPU-free geometry over
+    /// the laid-out rects (the same layout the renderer draws). Records `(handle, x, y)` so the release
+    /// can require the same target. No VM / no renderer / no cursor / no clickable view under the point
+    /// → nothing recorded (logged at debug); the release is then a no-op too.
+    fn handle_primary_press(&mut self) {
+        self.primary_press = None;
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
         let Some((px, py)) = self.cursor else {
             return;
         };
-        // Require the release to land on the same view the press hit (a real click, not a drag-off).
-        let pressed = self
-            .primary_press
-            .and_then(|(x, y)| renderer.hit_test_at(x, y));
-        let released = renderer.hit_test_at(px, py);
-        let Some(handle) = released else { return };
-        if pressed != Some(handle) {
+        let Some(handle) = renderer.hit_test_at(px, py) else {
             return;
+        };
+        self.primary_press = Some((handle, px, py));
+        self.dispatch_touch(handle, crate::framework::MotionAction::Down, px, py);
+    }
+
+    /// Complete a primary-button touch: if the release lands on the SAME view the press hit (Android
+    /// semantics — a release that drifts off is not a tap), dispatch a real Android `MotionEvent` of
+    /// `ACTION_UP` to it; the View's own click detection fires its `OnClickListener` from that UP.
+    ///
+    /// 2026-06-05: the UP half of the single-pointer touch. If the MotionEvent UP dispatch fails (a
+    /// JNI/Java error, or the View did not consume it), `View.performClick()` is the durable fallback,
+    /// preserving INPUT v0's behavior so a click is never silently lost. The press record is cleared
+    /// regardless. Dispatch goes through the held VM, guarded (catch_unwind + pending-exception check)
+    /// so a JNI/Java error can never crash the event loop.
+    fn handle_primary_release(&mut self) {
+        let pressed = self.primary_press.take();
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let Some((px, py)) = self.cursor else {
+            return;
+        };
+        let pressed_view = pressed.map(|(h, _, _)| h);
+        let released_view = renderer.hit_test_at(px, py);
+        // The release must land on the same view the press hit (a real tap, not a drag-off).
+        let Some(pressed_handle) = should_complete_tap(pressed_view, released_view) else {
+            return;
+        };
+        let dispatched_up =
+            self.dispatch_touch(pressed_handle, crate::framework::MotionAction::Up, px, py);
+        // Durable fallback: if the UP MotionEvent could not be dispatched (no VM, JNI/Java error, or
+        // the View did not consume it), fall back to performClick so the click is not silently lost.
+        if !dispatched_up {
+            self.perform_click_fallback(pressed_handle, px, py);
         }
+    }
+
+    /// Dispatch a single-pointer `MotionEvent` of `action` at `(x, y)` to the view `handle` via
+    /// [`framework::dispatch_touch_to_view`](crate::framework::dispatch_touch_to_view) on the held VM.
+    /// Returns `true` iff the View consumed the event; `false` on no VM / a guarded JNI-Java error /
+    /// the View not consuming it. Never panics (the framework path is catch_unwind-guarded).
+    fn dispatch_touch(
+        &self,
+        handle: ViewHandle,
+        action: crate::framework::MotionAction,
+        x: f32,
+        y: f32,
+    ) -> bool {
         let Some(vm) = self.vm else {
             tracing::debug!(
                 handle,
-                "click hit a view but no VM is held; not dispatching"
+                ?action,
+                "touch hit a view but no VM is held; not dispatching"
             );
+            return false;
+        };
+        match crate::framework::dispatch_touch_to_view(vm, handle, action, x, y) {
+            Ok(consumed) => {
+                tracing::info!(
+                    handle,
+                    ?action,
+                    x,
+                    y,
+                    consumed,
+                    "pointer MotionEvent dispatched to view (View.dispatchTouchEvent)"
+                );
+                consumed
+            }
+            Err(e) => {
+                tracing::warn!(handle, ?action, error = %e, "touch dispatch to view failed (ignored)");
+                false
+            }
+        }
+    }
+
+    /// Fall back to `View.performClick()` on `handle` (INPUT v0's path) when the UP `MotionEvent`
+    /// could not drive a click. Logged; guarded by the framework's catch_unwind/pending-exception
+    /// handling. No VM → no-op.
+    fn perform_click_fallback(&self, handle: ViewHandle, x: f32, y: f32) {
+        let Some(vm) = self.vm else {
             return;
         };
         match crate::framework::dispatch_click_to_view(vm, handle) {
             Ok(clicked) => tracing::info!(
                 handle,
-                x = px,
-                y = py,
+                x,
+                y,
                 performed = clicked,
-                "pointer click dispatched to view (View.performClick)"
+                "pointer click fallback dispatched to view (View.performClick)"
             ),
-            Err(e) => {
-                tracing::warn!(handle, error = %e, "click dispatch to view failed (ignored)")
-            }
+            Err(e) => tracing::warn!(handle, error = %e, "click fallback to view failed (ignored)"),
         }
     }
 
     /// One-shot, env-gated synthetic tap (dev-host diagnostic). When `ECLIPSE_SYNTHETIC_TAP` is set,
-    /// the FIRST redraw aims a tap at the center of the first clickable view, hit-tests it, and
-    /// dispatches `View.performClick()` — proving the hit-test→dispatch chain end-to-end on a real run
-    /// (a headless run cannot physically click). Fires at most once and never in normal operation
-    /// (no env var → immediate return), so it adds no behavior to the shipped click path.
+    /// the FIRST redraw drives a full DOWN+UP `MotionEvent` press→release through
+    /// `View.dispatchTouchEvent` — proving the hit-test→MotionEvent dispatch chain end-to-end on a
+    /// real run (a headless run cannot physically click). Fires at most once and never in normal
+    /// operation (no env var → immediate return), so it adds no behavior to the shipped touch path.
+    ///
+    /// 2026-06-05: it prefers the first CLICKABLE view (driving the exact real-pointer path: press
+    /// hit-test → DOWN, release same-view gate → UP, performClick fallback). If no clickable view is
+    /// in the snapshot (a known gap for apps whose clickable views are wired internally, AGENTS.md §6
+    /// INPUT v0), it falls back to driving a DOWN+UP MotionEvent directly at the first laid-out view,
+    /// so the `MotionEvent.obtain` → `dispatchTouchEvent` → `recycle` JNI chain is still exercised
+    /// end-to-end against a real Java View object (the non-clickable view just won't fire a click).
     fn maybe_synthetic_tap(&mut self) {
         if self.synthetic_tap_done || std::env::var_os("ECLIPSE_SYNTHETIC_TAP").is_none() {
             return;
@@ -244,20 +315,33 @@ impl GameWindow<'_> {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let Some((cx, cy)) = renderer.first_clickable_center() else {
-            tracing::info!("synthetic tap: no clickable view in the tree (nothing to tap)");
+        if let Some((cx, cy)) = renderer.first_clickable_center() {
+            tracing::info!(
+                x = cx,
+                y = cy,
+                "synthetic tap: aiming at first clickable view center"
+            );
+            // Drive the same press→release path a real pointer would, so it exercises the real wiring
+            // (DOWN on press, UP on release, same-view gate, performClick fallback).
+            self.cursor = Some((cx, cy));
+            self.handle_primary_press();
+            self.handle_primary_release();
+            return;
+        }
+        // Fallback: no clickable view in the tree — drive a DOWN+UP MotionEvent directly at the first
+        // laid-out view to still prove the JNI dispatch chain end-to-end (diagnostic only).
+        let Some((handle, cx, cy)) = renderer.first_view_center() else {
+            tracing::info!("synthetic tap: no views in the tree (nothing to tap)");
             return;
         };
         tracing::info!(
+            handle,
             x = cx,
             y = cy,
-            "synthetic tap: aiming at first clickable view center"
+            "synthetic tap: no clickable view; driving DOWN+UP MotionEvent at deepest leaf view (JNI-chain diagnostic)"
         );
-        // Drive the same press→release path a real pointer would, so it exercises the real wiring.
-        self.cursor = Some((cx, cy));
-        self.primary_press = Some((cx, cy));
-        self.handle_primary_click();
-        self.primary_press = None;
+        self.dispatch_touch(handle, crate::framework::MotionAction::Down, cx, cy);
+        self.dispatch_touch(handle, crate::framework::MotionAction::Up, cx, cy);
     }
 }
 
@@ -857,6 +941,20 @@ fn hit_test(views: &[LaidOutView], x: f32, y: f32) -> Option<ViewHandle> {
         .rev()
         .find(|v| v.clickable && x >= v.x && x < v.x + v.w && y >= v.y && y < v.y + v.h)
         .map(|v| v.handle)
+}
+
+/// The single-pointer touch down→up state-machine decision: should the release complete a tap, and on
+/// which view? Returns `Some(handle)` iff the press hit a view (`pressed`) AND the release hit the SAME
+/// view (`released`) — Android touch semantics, where a release that drifts off the pressed view is not
+/// a tap. Pure (no GPU/VM); the renderer supplies `pressed`/`released` from [`hit_test`]. 2026-06-05.
+fn should_complete_tap(
+    pressed: Option<ViewHandle>,
+    released: Option<ViewHandle>,
+) -> Option<ViewHandle> {
+    match (pressed, released) {
+        (Some(p), Some(r)) if p == r => Some(p),
+        _ => None,
+    }
 }
 
 /// Convert a top-left-origin pixel rect into 6 [`QuadVertex`]es (two triangles) in Vulkan NDC.
@@ -2508,6 +2606,34 @@ impl VulkanRenderer {
             .map(|v| (v.x + v.w / 2.0, v.y + v.h / 2.0))
     }
 
+    /// The handle + window-pixel center of the deepest (last-in-pre-order) laid-out LEAF view, if any.
+    ///
+    /// 2026-06-05: used only by the env-gated dev-host synthetic-tap diagnostic as a fallback target
+    /// when no clickable view is in the snapshot, so the diagnostic can still drive a real DOWN+UP
+    /// `MotionEvent` through a **leaf** `View.dispatchTouchEvent` end-to-end against a real Java View
+    /// object (headless evidence the JNI chain — `MotionEvent.obtain` → dispatch → `recycle` — works).
+    /// A leaf is targeted on purpose: a leaf `View.dispatchTouchEvent` is pure Java (calls
+    /// `onTouchEvent`), whereas a `ViewGroup` routes through ATL's native `native_dispatchTouchEvent`
+    /// (the touch-routing follow-up). The real pointer path likewise resolves the topmost clickable
+    /// view, normally a leaf widget. Lays out the tree exactly like [`Self::hit_test_at`]; `None` for
+    /// an empty tree.
+    fn first_view_center(&self) -> Option<(ViewHandle, f32, f32)> {
+        let nodes = crate::framework::view_registry::snapshot_tree();
+        if nodes.is_empty() {
+            return None;
+        }
+        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
+        let views = layout_views(&nodes, self.swapchain.extent, measure);
+        // Pre-order = parent before children, so the last entry with no children is the deepest leaf.
+        // `nodes` and `views` are parallel; a leaf has empty `children` in the snapshot node.
+        nodes
+            .iter()
+            .zip(views.iter())
+            .rev()
+            .find(|(n, _)| n.children.is_empty())
+            .map(|(_, v)| (v.handle, v.x + v.w / 2.0, v.y + v.h / 2.0))
+    }
+
     /// Note that the window was resized; the next [`Self::draw_frame`] recreates the swapchain.
     /// A zero dimension means the window is minimized — skip the recreate then.
     fn mark_resized(&mut self, width: u32, height: u32) {
@@ -4145,6 +4271,22 @@ mod tests {
             None,
             "bottom edge is exclusive"
         );
+    }
+
+    // 2026-06-05: the single-pointer DOWN→UP state machine that gates a tap. The press records the hit
+    // view; the release completes the tap (ACTION_UP + click) only if it lands on the SAME view, never
+    // when the press missed, the release drifted off, or the release missed. Pure (no GPU/VM).
+    #[test]
+    fn should_complete_tap_requires_press_and_release_on_same_view() {
+        // Press and release on the same view → complete the tap on that view.
+        assert_eq!(should_complete_tap(Some(7), Some(7)), Some(7));
+        // Release drifted to a different view → not a tap.
+        assert_eq!(should_complete_tap(Some(7), Some(9)), None);
+        // Release missed all views (drag off into empty space) → not a tap.
+        assert_eq!(should_complete_tap(Some(7), None), None);
+        // Press hit nothing (started on empty space) → not a tap, regardless of release.
+        assert_eq!(should_complete_tap(None, Some(7)), None);
+        assert_eq!(should_complete_tap(None, None), None);
     }
 
     #[test]

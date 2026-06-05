@@ -3174,6 +3174,31 @@ fn register_sensor_manager_natives(env: &mut Env) -> Result<(), FrameworkError> 
 /// `android.view.View` (internal/slashed name for `find_class`) — hosts the View peer natives.
 pub const VIEW_CLASS: &JNIStr = jni_str!("android/view/View");
 
+// === Eclipse → real Android MotionEvent touch dispatch (2026-06-05) ===========================
+//
+// 2026-06-05: the proper Android input event for a pointer touch is a `MotionEvent` routed to the
+// hit View via `dispatchTouchEvent` (which itself calls `onTouchEvent` + the View's click
+// detection). This is the faithful follow-up to INPUT v0's `performClick`-only path. We build the
+// event with the PUBLIC Java factory `MotionEvent.obtain(...)` (a recycler-pool allocation, all
+// Java; no Eclipse native is needed unless the ART surfaces one), dispatch it, then `recycle()` it.
+// Single-pointer DOWN/UP only this increment; multi-touch/MOVE/key are the documented follow-ups.
+
+/// `android.view.MotionEvent` (internal/slashed name for `find_class`) — hosts the public static
+/// `obtain(...)` factory and the instance `recycle()`. 2026-06-05.
+///
+/// The touch-dispatch call sites use inline `jni_str!`/`jni_sig!` literals (single source of truth,
+/// no runtime signature parse), pinned against this module's documented descriptors by the unit test
+/// `motion_event_dispatch_descriptors_are_the_public_android_api`:
+///   * `MotionEvent.obtain(long downTime, long eventTime, int action, float x, float y, int metaState)`
+///     → `(JJIFFI)Landroid/view/MotionEvent;` (the public Java recycler-pool factory; Eclipse calls,
+///     does not back it).
+///   * `MotionEvent.recycle()` → `()V` (returns the event to the recycler pool).
+///   * `View.dispatchTouchEvent(MotionEvent)` → `(Landroid/view/MotionEvent;)Z` (routes through
+///     `onTouchEvent` + the View's click detection).
+///
+/// All three are stable, general public Android API.
+pub const MOTION_EVENT_CLASS: &JNIStr = jni_str!("android/view/MotionEvent");
+
 // JNI name + descriptor for View's native peer constructor, exactly as declared in `View.java`
 // (2026-06-05, line 1166): `protected native long native_constructor(Context context, AttributeSet
 // attrs);` → an instance native, descriptor `(Landroid/content/Context;Landroid/util/AttributeSet;)J`.
@@ -5442,6 +5467,161 @@ fn perform_click(env: &mut Env, handle: view_registry::ViewHandle) -> Result<boo
     }
 }
 
+/// A single-pointer touch action — the subset Eclipse dispatches this increment (DOWN/UP). 2026-06-05:
+/// `MOVE` and multi-touch/key are documented follow-ups. The discriminant maps to the public Android
+/// `MotionEvent` action code via [`Self::code`] (`ACTION_DOWN = 0`, `ACTION_UP = 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionAction {
+    /// `MotionEvent.ACTION_DOWN` — the pointer first contacts the view (press).
+    Down,
+    /// `MotionEvent.ACTION_UP` — the pointer leaves the view (release); the View's own click
+    /// detection fires its `OnClickListener` on an UP that completes a tap.
+    Up,
+}
+
+impl MotionAction {
+    /// The public Android `MotionEvent` action code (`android.view.MotionEvent.ACTION_*`): a stable
+    /// part of the Android API. `ACTION_DOWN = 0`, `ACTION_UP = 1`. Pure (GPU/VM-free) so it is
+    /// unit-testable; passed verbatim as the `action` arg to `MotionEvent.obtain`.
+    pub fn code(self) -> jint {
+        match self {
+            Self::Down => 0, // MotionEvent.ACTION_DOWN
+            Self::Up => 1,   // MotionEvent.ACTION_UP
+        }
+    }
+}
+
+/// Dispatch a real Android [`MotionEvent`] of `action` at window pixel `(x, y)` to the
+/// [`view_registry`] view identified by `handle`, by building the event with the public Java factory
+/// `MotionEvent.obtain(...)` and routing it through `View.dispatchTouchEvent(MotionEvent)`.
+///
+/// 2026-06-05: the faithful Android-input follow-up to [`dispatch_click_to_view`] (which only fired
+/// `View.performClick`). The winit event loop (`graphics.rs`) calls this with `Down` on a primary
+/// press over a clickable hit view, then `Up` on the release over the same view; the View's own click
+/// detection then fires the registered `OnClickListener` from the UP. The event's `downTime`/
+/// `eventTime` come from `SystemClock.uptimeMillis()` (Eclipse's bound monotonic clock), exactly as
+/// Android's input pipeline times them; `metaState` is `0` (no modifier keys this increment). Full
+/// `MotionEvent` MOVE/multi-touch/key dispatch is the documented follow-up.
+///
+/// Mirrors [`dispatch_click_to_view`]'s soundness: attaches the held VM's main thread (the `&Vm`
+/// borrow keeps it alive + pins us to that thread), wraps the JNI work in `catch_unwind` so a Rust
+/// panic can never unwind into ART's C++ (`panic = "abort"`, §2.8), and routes every JNI call through
+/// [`checked`] (a thrown Java exception is described + cleared into a typed [`FrameworkError::Jni`]).
+/// The obtained `MotionEvent` is `recycle()`d after dispatch on every path.
+///
+/// Returns `true` iff `dispatchTouchEvent` returned `true` (the View consumed the event); `false`
+/// when the view has no dispatchable Java object, or `dispatchTouchEvent` returned `false`; a typed
+/// `Err` on a VM/JNI/Java error — never a panic across the boundary.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
+/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn dispatch_touch_to_view(
+    vm: &Vm,
+    handle: view_registry::ViewHandle,
+    action: MotionAction,
+    x: f32,
+    y: f32,
+) -> Result<bool, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
+    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
+    // process VM singleton (idempotent across calls), same as `dispatch_click_to_view`.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| touch_view(env, handle, action, x, y))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Build a [`MotionEvent`] for `action` at `(x, y)` and dispatch it to the global object recorded for
+/// `handle` via `View.dispatchTouchEvent`, then `recycle()` the event. Returns `false` (not an error)
+/// when the handle is valid but has no recorded global object (a non-dispatchable view) or is
+/// stale/fabricated — the event loop treats those as no-ops. A thrown Java exception is turned into a
+/// typed [`FrameworkError::Jni`] by [`checked`].
+fn touch_view(
+    env: &mut Env,
+    handle: view_registry::ViewHandle,
+    action: MotionAction,
+    x: f32,
+    y: f32,
+) -> Result<bool, FrameworkError> {
+    // Hold the registry lock only long enough to dispatch (the closure makes JNI calls but never
+    // re-enters the registry), honoring `with_jobject`'s contract.
+    let result = view_registry::with_jobject(handle, |global| {
+        // Monotonic event time from Eclipse's bound SystemClock.uptimeMillis (the time Android's
+        // input pipeline stamps a MotionEvent with). One call serves as both downTime and eventTime
+        // for a single isolated press/release — adequate for the single-pointer DOWN/UP this increment.
+        let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
+        let now = checked(env, "SystemClock.uptimeMillis", |env| {
+            env.call_static_method(
+                &system_clock,
+                jni_str!("uptimeMillis"),
+                jni_sig!("()J"),
+                &[],
+            )?
+            .j()
+        })?;
+
+        // MotionEvent.obtain(downTime, eventTime, action, x, y, metaState) — the public Java factory.
+        let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
+        let event = checked(env, "MotionEvent.obtain", |env| {
+            env.call_static_method(
+                &motion_event_class,
+                jni_str!("obtain"),
+                jni_sig!("(JJIFFI)Landroid/view/MotionEvent;"),
+                &[
+                    JValue::Long(now),
+                    JValue::Long(now),
+                    JValue::Int(action.code()),
+                    JValue::Float(x),
+                    JValue::Float(y),
+                    JValue::Int(0), // metaState: no modifier keys this increment
+                ],
+            )?
+            .l()
+        })?;
+
+        // View.dispatchTouchEvent(event) — routes through onTouchEvent + the View's click detection.
+        let consumed = checked(env, "View.dispatchTouchEvent", |env| {
+            env.call_method(
+                global.as_obj(),
+                jni_str!("dispatchTouchEvent"),
+                jni_sig!("(Landroid/view/MotionEvent;)Z"),
+                &[JValue::Object(&event)],
+            )?
+            .z()
+        });
+
+        // Recycle the event on EVERY path (success or dispatch error) — it is pooled, not GC-freed
+        // promptly, so returning it avoids exhausting the recycler over many touches. A recycle
+        // failure is logged but does not mask the dispatch result.
+        if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
+            env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
+                .v()
+        }) {
+            tracing::debug!(handle, error = %e, "MotionEvent.recycle failed (ignored)");
+        }
+        consumed
+    });
+    match result {
+        Ok(Some(Ok(consumed))) => Ok(consumed),
+        Ok(Some(Err(e))) => Err(e),
+        // Valid handle but no recorded jobject: a non-dispatchable view — nothing to touch.
+        Ok(None) => Ok(false),
+        // Stale/fabricated handle or poisoned lock: nothing to touch (logged, not fatal).
+        Err(e) => {
+            tracing::debug!(handle, error = %e, "dispatchTouchEvent: view not dispatchable (ignored)");
+            Ok(false)
+        }
+    }
+}
+
 /// Prove the bridge, then drive recipe steps 1–5 to the launcher Activity's `onCreate`. Split out so
 /// the panic guard in [`drive_application_lifecycle`] wraps a single named call.
 ///
@@ -5798,6 +5978,52 @@ mod tests {
         assert_eq!(STEP7_ACTIVITY_ON_RESUME.class, "android/app/Activity");
         assert_eq!(STEP7_ACTIVITY_ON_RESUME.method, "onResume");
         assert_eq!(STEP7_ACTIVITY_ON_RESUME.descriptor, "()V");
+    }
+
+    // 2026-06-05: the MotionEvent touch-dispatch path. The action codes are the stable public Android
+    // `MotionEvent.ACTION_*` constants — a regression here would dispatch the wrong gesture (e.g. a
+    // DOWN that never lifts). Pure data, host-thread-independent (no VM), so unit-tested in-harness.
+    #[test]
+    fn motion_action_codes_match_public_android_constants() {
+        // android.view.MotionEvent.ACTION_DOWN = 0, ACTION_UP = 1 (public Android API).
+        assert_eq!(MotionAction::Down.code(), 0, "ACTION_DOWN must be 0");
+        assert_eq!(MotionAction::Up.code(), 1, "ACTION_UP must be 1");
+    }
+
+    // 2026-06-05: pin the touch-dispatch class + the call-site `jni_str!`/`jni_sig!` literals against
+    // the documented public Android API (single source of truth — the call sites in `touch_view` use
+    // these exact literals). A transcription regression (wrong descriptor / method name) fails loudly,
+    // the same regression guard the recipe descriptors use. `jni_sig!` yields a `MethodSignature`; its
+    // `.sig()` is the `&JNIStr` descriptor we compare.
+    #[test]
+    fn motion_event_dispatch_descriptors_are_the_public_android_api() {
+        assert_eq!(MOTION_EVENT_CLASS.to_str(), "android/view/MotionEvent");
+        // MotionEvent.obtain(downTime, eventTime, action, x, y, metaState) → MotionEvent.
+        assert_eq!(jni_str!("obtain").to_str(), "obtain");
+        assert_eq!(
+            jni_sig!("(JJIFFI)Landroid/view/MotionEvent;")
+                .sig()
+                .to_str(),
+            "(JJIFFI)Landroid/view/MotionEvent;"
+        );
+        // View.dispatchTouchEvent(MotionEvent) → boolean.
+        assert_eq!(
+            jni_str!("dispatchTouchEvent").to_str(),
+            "dispatchTouchEvent"
+        );
+        assert_eq!(
+            jni_sig!("(Landroid/view/MotionEvent;)Z").sig().to_str(),
+            "(Landroid/view/MotionEvent;)Z"
+        );
+        // MotionEvent.recycle() → void.
+        assert_eq!(jni_str!("recycle").to_str(), "recycle");
+        assert_eq!(jni_sig!("()V").sig().to_str(), "()V");
+        // SystemClock.uptimeMillis() → long (the event-time source; matches the bound native).
+        assert_eq!(
+            jni_str!("uptimeMillis").to_str(),
+            UPTIME_MILLIS_NAME.to_str()
+        );
+        assert_eq!(jni_sig!("()J").sig().to_str(), "()J");
     }
 
     #[test]
