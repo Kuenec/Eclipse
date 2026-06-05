@@ -540,15 +540,19 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
   monotonic `std::time::Instant`-anchored, non-GTK). After that, Roblox's `Application.onCreate` executes:
   `roblox.config` (`setBaseUrl → www.roblox.com`), `AppStartupTaskManager` tasks, `androidx.startup.
-  InitializationProvider`. **NEW FRONTIER for Roblox = the BIONIC-LOADER path (class D, engine-load track,
-  main-loop only):** `System.loadLibrary("zstd-jni-1.5.7-6")` → the shim bionic linker reports the lib
-  **"not found" EVEN THOUGH it is extracted** to `~/.cache/eclipse/native-libs/libzstd-jni-1.5.7-6.so`
-  (726 KB, present). Root cause = `-Djava.library.path` is set but the app-lib cache dir is NOT whitelisted
-  in the bionic linker's own search path via **`dl_parse_library_path`** (the libdl_bio call ATL uses; the
-  2026-06-04 entry already flagged "java.library.path alone is NOT enough"). This is the bionic/engine-load
-  track — do NOT wire it from a subagent (cyber-safeguard); it is the same main-loop bionic work as the
-  `libmediandk`/`libOpenMAXAL` shims and `libroblox.so` relocation. Roblox then NPEs on `Looper.mQueue`
-  (background threads have no Looper) and calls `System.exit(10)`. Faithful run log: `/tmp/eclipse-roblox2.log`.
+  InitializationProvider`. ✅ **RESOLVED 2026-06-05 (§6 dl_parse_library_path entry): `System.loadLibrary("zstd-jni-1.5.7-6")`
+  NOW RESOLVES the extracted lib** — `runtime::whitelist_bionic_library_path` calls libdl_bio's
+  `dl_parse_library_path(<fw-natives>:<app-lib cache dir>, ":")` from the RTLD_GLOBAL scope (resolvable
+  because `boot()` opens libart RTLD_GLOBAL, promoting its NEEDED `libdl_bio.so.0`), wired in `main.rs::run_apk`
+  AFTER `boot()` and BEFORE the lifecycle. The bionic linker now OPENS the .so (log: "is not a prelinked library"
+  progress msg, the "not found" is GONE). **NEXT FRONTIER for Roblox = the BIONIC-SHIM SONAME track (class D,
+  engine-load, main-loop only — STOP here for subagents/cyber-safeguard):** zstd-jni loads far enough to need its
+  own transitive `NEEDED libm.so`, which the shim linker can't resolve (bare soname; host has `libm.so.6`) → the
+  same soname-shim gap as `libroblox.so`'s `libmediandk.so`/`libOpenMAXAL.so`. Roblox's `AppStartupTaskManager`
+  background thread also NPEs on `Looper.mQueue` (background threads have no Looper) then a fatal SIGSEGV during
+  `androidx.startup.InitializationProvider` (engine-load native track, NOT the Rust FFI — the whitelist call is
+  clean, no Rust panic). Faithful run log: `/tmp/eclipse-roblox.log` (EXIT=139 SIGSEGV, further than the prior
+  `System.exit(10)` in `/tmp/eclipse-roblox2.log`).
   📋 **Dev-host execution runbook:** the two frontiers' next concrete steps (which need
   main-thread `cargo run -- run …`, not the cargo-test harness or subagents) are consolidated
   into an executable, decision-driven script in [`docs/dev-host-runbook.md`](docs/dev-host-runbook.md)
@@ -1521,6 +1525,45 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   compile_fail doctests** / release (`panic = "abort"`/LTO retained). No new deps (`std::time::Instant`).
   **NEXT (main-loop): the bionic-loader `dl_parse_library_path` whitelisting of the app-lib cache dir so
   `System.loadLibrary` resolves the extracted libs — then `libroblox.so` relocation + the NDK shims.**
+- **2026-06-05** — 🎉 **`dl_parse_library_path` WIRED — `System.loadLibrary("zstd-jni-1.5.7-6")` now RESOLVES
+  the extracted lib; the bionic "not found" is GONE.** Root cause (confirmed by the prior run + the §4c
+  diagnosis): ART boots with `-Djava.library.path` set, so the JVM hands the apkenv/bionic shim linker the
+  **absolute** path of the extracted `.so`, but the shim linker's `apkenv_load_library` consults its OWN
+  search-path array (`apkenv_ldpaths[]`); a dir not in it is rejected as "library not found" even though the
+  file exists at that absolute path (the prior run logged `libzstd-jni-1.5.7-6.so' not found` ×2 → `System.exit(10)`
+  despite the 726 KB file being present). **FIX (surgical):** new `runtime::whitelist_bionic_library_path(fw,
+  app_lib_dir)` resolves libdl_bio's `void dl_parse_library_path(const char*, char*)` from the **process-global
+  scope** and calls it once with `<fw-natives>:<app-lib cache dir>` + delim `":"`. Symbol acquisition is sound:
+  `libloading::os::unix::Library::open(None::<&Path>, RTLD_NOW|RTLD_GLOBAL)` (the `dlopen(NULL,…)` global-scope
+  handle), `.get(b"dl_parse_library_path\0")` — resolvable because `boot()` opens libart RTLD_GLOBAL, promoting
+  its direct `NEEDED libdl_bio.so.0` (and its exported symbol) into the global scope (verified: `readelf -d
+  libart.so` lists `NEEDED libdl_bio.so.0`; `nm -D libdl_bio.so.0` shows `T dl_parse_library_path` @0xa710).
+  Both `CString`s are held alive across the call (no dangling pointer, independent of the callee's copy
+  semantics). Two new typed errors — `RuntimeError::OpenGlobalScope` / `ResolveDlParse` (the latter names "is
+  libart opened RTLD_GLOBAL?") — surface a missing symbol clearly; NO silent skip (a skip would re-surface as
+  the misleading downstream "library not found"). The directory list mirrors `library_path_option`'s ordering
+  EXACTLY (framework natives FIRST, app-lib SECOND, `:`-joined) so the bionic linker and ART's `java.library.path`
+  agree on which `.so` a name resolves to. Wired in `main.rs::run_apk` AFTER `boot()` and BEFORE
+  `drive_application_lifecycle` (so libart→libdl_bio is loaded global, and the whitelist is in place before any
+  `System.loadLibrary`). **FAITHFUL run (`/tmp/eclipse-roblox.log`):** `bionic linker search path whitelisted
+  (dl_parse_library_path) ✓`, then `System.loadLibrary("zstd-jni-1.5.7-6")` **OPENS the .so** (`linker.c:879
+  WARNING: …/libzstd-jni-1.5.7-6.so is not a prelinked library` — a progress message; the "not found" is GONE,
+  grep count 0 vs 2 before). **NEXT FRONTIER = the bionic-shim SONAME track (class D, engine-load, STOPPED here
+  per cyber-safeguard / main-loop-only):** zstd-jni loads far enough to need its own `NEEDED libm.so`, which the
+  shim linker can't resolve (bare soname; host has `libm.so.6`) → `linker.c:1333 ERROR: library 'libm.so' not
+  found` — the SAME soname-shim gap as `libroblox.so`'s `libmediandk.so`/`libOpenMAXAL.so`. Roblox's
+  `AppStartupTaskManager` background thread then NPEs on `Looper.mQueue` (no Looper on background threads) and a
+  fatal SIGSEGV hits during `androidx.startup.InitializationProvider` (EXIT=139). This is the engine-load NATIVE
+  track, NOT the Rust FFI: the whitelist call is clean (no Rust panic, no `RuntimeError`). Eclipse now reaches
+  FURTHER than the prior `System.exit(10)` frontier. **Regression guard (host-independent):**
+  `bionic_library_path_framework_first_then_app_lib_colon_joined` pins the dir-list ordering + `:` delim AND
+  asserts the bionic whitelist equals ART's `java.library.path` value (minus its prefix) — a drift in either
+  re-surfaces the bionic "not found"; `bionic_library_path_framework_only_when_no_app_lib` pins the no-app-lib
+  shape. Full gate green: `fmt --all --check` / `build --all-targets` / `clippy --all-targets --all-features -D
+  warnings` / **test 101 unit (+2 new) + 2 compile_fail doctests** / `release` (panic=abort/LTO retained). No new
+  deps (`libloading` already in tree). All `unsafe` (`Library::open`, `.get`, the FFI call) carries `// SAFETY:`.
+  **NEXT (main-loop, engine-load track): the bionic-shim sonames (`libm.so`, then `libmediandk.so`/`libOpenMAXAL.so`)
+  so zstd-jni + `libroblox.so` link past relocation — and Roblox's background-thread `Looper` provisioning.**
 
 ---
 

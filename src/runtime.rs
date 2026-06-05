@@ -40,7 +40,7 @@
 //! release `panic = "abort"` profile (§2.4), a panic can never unwind across this FFI; when we
 //! later register Rust JNI *callbacks*, each must wrap its body in `catch_unwind` (§2.8).
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_char, c_void, CString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -380,6 +380,90 @@ type JniCreateJavaVm = unsafe extern "system" fn(
     *mut c_void,
 ) -> jni_sys::jint;
 
+/// The bionic translation linker's library-path whitelisting entry point, as exported by
+/// `libdl_bio.so.0` (a direct `NEEDED` of `libart.so`): `(const char *path, char *delim) -> void`.
+///
+/// 2026-06-05: `path` is a `:`-delimited list of directories appended to the shim linker's own
+/// search path (`apkenv_ldpaths[]`); `delim` is the separator string (`":"`). It copies the parsed
+/// directory strings internally, so the input buffers need only outlive the call. The signature is
+/// the §4c-confirmed `void dl_parse_library_path(const char *path, char *delim)`. `delim` is
+/// declared `*const c_char` (the function only reads it); the symbol's C prototype types it
+/// non-const but a read-only `":"` literal is ABI-compatible and the function does not mutate it.
+type DlParseLibraryPath = unsafe extern "C" fn(*const c_char, *const c_char);
+
+/// The delimiter the bionic linker expects in a `dl_parse_library_path` path list (and the same
+/// separator ART uses for `-Djava.library.path` — see [`library_path_option`]).
+const BIONIC_LDPATH_DELIM: &str = ":";
+
+/// Compose the `:`-delimited directory list whitelisted into the bionic shim linker's search path.
+///
+/// Mirrors [`library_path_option`]'s ordering exactly: the framework natives dir **first**, then
+/// (when the app's native libs have been extracted) the app-lib dir **second**. Keeping the two
+/// orderings identical means the bionic linker and ART's `java.library.path` agree on precedence,
+/// so a `System.loadLibrary` name resolves to the same `.so` regardless of which layer locates it.
+fn bionic_library_path(fw: &FrameworkPaths, app_lib_dir: Option<&Path>) -> String {
+    match app_lib_dir {
+        Some(dir) => format!(
+            "{}{BIONIC_LDPATH_DELIM}{}",
+            fw.natives_dir.display(),
+            dir.display()
+        ),
+        None => fw.natives_dir.display().to_string(),
+    }
+}
+
+/// Whitelist the framework natives dir + the extracted app-lib dir in the bionic shim linker's
+/// own library search path, so `System.loadLibrary` can resolve the extracted Roblox native libs
+/// (`libzstd-jni-*.so`, …).
+///
+/// 2026-06-05 — root cause this fixes: ART boots with `-Djava.library.path` set (so the JVM hands
+/// the shim linker the **absolute** path of the extracted `.so`), but the apkenv/bionic shim linker
+/// has its **own** search-path array (`apkenv_ldpaths[]`) that it consults in `apkenv_load_library`;
+/// a directory not present there is rejected as "library not found" even when the file exists at the
+/// absolute path the JVM passed (observed: `libzstd-jni-1.5.7-6.so` extracted to the cache dir, 726 KB,
+/// yet "not found"). The libdl_bio function `dl_parse_library_path` populates that array. Stock ATL
+/// calls it before any `System.loadLibrary`; Eclipse must do the same.
+///
+/// The symbol is resolved from the **process-global scope**: [`boot`] dlopens `libart.so` with
+/// `RTLD_GLOBAL`, which promotes its direct `NEEDED libdl_bio.so.0` (and that lib's exported
+/// `dl_parse_library_path`) into the global scope, so `dlopen(NULL, RTLD_NOW|RTLD_GLOBAL)` — the
+/// handle [`libloading::os::unix::Library::open(None, …)`] returns — can `dlsym` it. Therefore this
+/// MUST be called **after** [`boot`] (so libart, hence libdl_bio, is loaded global) and **before** the
+/// framework lifecycle drives any `System.loadLibrary`.
+///
+/// Returns [`RuntimeError::ResolveDlParse`] if the symbol is absent (e.g. libart was not opened
+/// `RTLD_GLOBAL`, or this build of libdl_bio lacks it) — a clear typed failure, never a silent skip
+/// (a silent skip would re-surface as the misleading "library not found" downstream).
+pub fn whitelist_bionic_library_path(
+    fw: &FrameworkPaths,
+    app_lib_dir: Option<&Path>,
+) -> Result<(), RuntimeError> {
+    let path = bionic_library_path(fw, app_lib_dir);
+    // Keep both CStrings alive across the call. dl_parse_library_path copies the parsed paths, but
+    // we hold these regardless so no dangling pointer can be passed (soundness, not just reliance on
+    // the callee's copy semantics).
+    let path_c = make_cstring(path)?;
+    let delim_c = make_cstring(BIONIC_LDPATH_DELIM.to_owned())?;
+
+    // SAFETY: `dlopen(NULL, RTLD_NOW|RTLD_GLOBAL)` returns a handle that searches the process-global
+    // scope; libart was opened RTLD_GLOBAL by `boot()`, so its NEEDED `libdl_bio.so.0` and the
+    // `dl_parse_library_path` symbol it exports are resolvable here. libloading upholds the handle
+    // invariants; the handle is dropped at end of scope (closing only this NULL reference, never
+    // unmapping any library).
+    let global = unsafe { libloading::os::unix::Library::open(None::<&Path>, LIBART_DLOPEN_FLAGS) }
+        .map_err(RuntimeError::OpenGlobalScope)?;
+    // SAFETY: the symbol has the `dl_parse_library_path` C ABI (verified exported by libdl_bio.so.0);
+    // we cast to the matching `DlParseLibraryPath` fn type.
+    let parse: libloading::os::unix::Symbol<DlParseLibraryPath> =
+        unsafe { global.get(b"dl_parse_library_path\0") }.map_err(RuntimeError::ResolveDlParse)?;
+
+    // SAFETY: `parse` is libdl_bio's `dl_parse_library_path`; `path_c`/`delim_c` are valid,
+    // NUL-terminated C strings live for this call. The callee reads (and copies) both; it does not
+    // retain the pointers past return.
+    unsafe { parse(path_c.as_ptr(), delim_c.as_ptr()) };
+    Ok(())
+}
+
 /// dlopen flags for `libart.so` (see [`boot`]).
 ///
 /// 2026-06-05: `RTLD_GLOBAL` is **required** (not the RTLD_LOCAL default of the cross-platform
@@ -602,6 +686,11 @@ pub enum RuntimeError {
     LoadLibart(libloading::Error),
     /// Resolving the `JNI_CreateJavaVM` symbol failed.
     ResolveSymbol(libloading::Error),
+    /// `dlopen(NULL, …)` to obtain a global-scope handle for `dl_parse_library_path` failed.
+    OpenGlobalScope(libloading::Error),
+    /// Resolving the bionic `dl_parse_library_path` symbol from the global scope failed (libart
+    /// not opened `RTLD_GLOBAL`, or libdl_bio lacks the symbol).
+    ResolveDlParse(libloading::Error),
     /// An ART option string contained an interior NUL byte.
     OptionHasNul,
     /// `JNI_CreateJavaVM` returned a non-`JNI_OK` status code.
@@ -640,6 +729,14 @@ impl fmt::Display for RuntimeError {
             ),
             Self::LoadLibart(e) => write!(f, "failed to dlopen libart.so: {e}"),
             Self::ResolveSymbol(e) => write!(f, "failed to resolve JNI_CreateJavaVM: {e}"),
+            Self::OpenGlobalScope(e) => {
+                write!(f, "failed to open the process-global symbol scope: {e}")
+            }
+            Self::ResolveDlParse(e) => write!(
+                f,
+                "failed to resolve dl_parse_library_path from libdl_bio.so.0 \
+                 (is libart opened RTLD_GLOBAL?): {e}"
+            ),
             Self::OptionHasNul => f.write_str("an ART VM option contained an interior NUL byte"),
             Self::CreateVm(rc) => write!(f, "JNI_CreateJavaVM failed (status {rc})"),
             Self::NullEnv => f.write_str("JNI_CreateJavaVM returned a null JNIEnv"),
@@ -650,7 +747,10 @@ impl fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::LoadLibart(e) | Self::ResolveSymbol(e) => Some(e),
+            Self::LoadLibart(e)
+            | Self::ResolveSymbol(e)
+            | Self::OpenGlobalScope(e)
+            | Self::ResolveDlParse(e) => Some(e),
             _ => None,
         }
     }
@@ -867,6 +967,44 @@ mod tests {
         let value = opt.strip_prefix("-Djava.library.path=").expect("prefix");
         let parts: Vec<&str> = value.split(':').collect();
         assert_eq!(parts, vec!["/fw/natives", "/cache/eclipse/native-libs"]);
+    }
+
+    #[test]
+    fn bionic_library_path_framework_first_then_app_lib_colon_joined() {
+        // 2026-06-05 regression guard: the bionic shim linker's whitelist (dl_parse_library_path)
+        // MUST receive the framework natives dir FIRST then the extracted app-lib dir, ':'-joined —
+        // identical ordering/separator to `library_path_option` so the two layers agree on which
+        // .so a `System.loadLibrary` name resolves to. A reorder or wrong delimiter re-surfaces as
+        // the misleading bionic "library not found". Machine-independent (PathBufs only).
+        let fw = FrameworkPaths {
+            api_impl_jar: PathBuf::from("/fw/api-impl.jar"),
+            framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
+            natives_dir: PathBuf::from("/fw/natives"),
+        };
+        let path = bionic_library_path(&fw, Some(Path::new("/cache/eclipse/native-libs")));
+        assert_eq!(path, "/fw/natives:/cache/eclipse/native-libs");
+        // The delimiter passed to dl_parse_library_path must be exactly the one used to join.
+        assert_eq!(BIONIC_LDPATH_DELIM, ":");
+        let parts: Vec<&str> = path.split(BIONIC_LDPATH_DELIM).collect();
+        assert_eq!(parts, vec!["/fw/natives", "/cache/eclipse/native-libs"]);
+        // The bionic whitelist and ART's java.library.path must stay in lockstep: the joined
+        // directory list is exactly the java.library.path value minus its `-Djava.library.path=`
+        // prefix. If either ordering drifts, this fails.
+        let lib_opt = library_path_option(&fw, Some(Path::new("/cache/eclipse/native-libs")));
+        assert_eq!(
+            lib_opt.strip_prefix("-Djava.library.path="),
+            Some(path.as_str())
+        );
+    }
+
+    #[test]
+    fn bionic_library_path_framework_only_when_no_app_lib() {
+        let fw = FrameworkPaths {
+            api_impl_jar: PathBuf::from("/fw/api-impl.jar"),
+            framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
+            natives_dir: PathBuf::from("/fw/natives"),
+        };
+        assert_eq!(bionic_library_path(&fw, None), "/fw/natives");
     }
 
     // The real ART VM boot is intentionally NOT an in-harness test: ART's `JNI_CreateJavaVM`

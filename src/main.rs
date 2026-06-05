@@ -140,6 +140,18 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("ART VM booted with Roblox's Java on the classpath ✓");
 
+    // Whitelist the framework natives dir + the extracted app-lib dir in the bionic shim linker's
+    // own search path (apkenv_ldpaths[]) via libdl_bio's dl_parse_library_path. ART's
+    // `-Djava.library.path` alone is NOT enough: the shim linker's apkenv_load_library consults its
+    // own path array, so an un-whitelisted dir is rejected as "library not found" even when the
+    // extracted .so exists at the absolute path the JVM passes. Must run AFTER boot (libart opened
+    // RTLD_GLOBAL, so libdl_bio's symbol is global-scope) and BEFORE any System.loadLibrary the
+    // framework lifecycle drives (e.g. Roblox's Application.onCreate loading libzstd-jni / libroblox).
+    let fw = eclipse::runtime::find_framework()?;
+    println!("# Whitelisting the app-lib dir in the bionic linker search path…");
+    eclipse::runtime::whitelist_bionic_library_path(&fw, Some(&app_lib_dir))?;
+    println!("bionic linker search path whitelisted (dl_parse_library_path) ✓");
+
     // Drive the confirmed onCreate recipe on this (main) thread, with the VM alive: wrap the held VM
     // with the `jni` crate, bind Eclipse's own non-GTK backing for the framework natives via
     // RegisterNatives, then drive recipe steps 1–5 — Context.createApplication → createContentProviders
