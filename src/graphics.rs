@@ -49,6 +49,18 @@ const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
 const QUAD_VERT_SPV: &[u8] = include_bytes!("../shaders/quad.vert.spv");
 const QUAD_FRAG_SPV: &[u8] = include_bytes!("../shaders/quad.frag.spv");
 
+/// 2026-06-05: precompiled SPIR-V for the textured-glyph (text) pipeline (`shaders/text.{vert,frag}`).
+/// Same embed-don't-compile rationale as the quad shaders. The fragment shader samples the R8 glyph
+/// atlas as coverage and tints it with a push-constant color.
+const TEXT_VERT_SPV: &[u8] = include_bytes!("../shaders/text.vert.spv");
+const TEXT_FRAG_SPV: &[u8] = include_bytes!("../shaders/text.frag.spv");
+
+/// Pixel height the glyph atlas is rasterized at, and the text color drawn over view rects.
+const TEXT_PX: f32 = 28.0;
+const TEXT_COLOR: [f32; 4] = [0.08, 0.09, 0.12, 1.0]; // near-black, reads on the light view quads
+/// Left/top inset of text inside its view rect (pixels).
+const TEXT_PAD_X: f32 = 12.0;
+
 /// The host game window + event loop (winit application state).
 struct GameWindow {
     title: String,
@@ -368,6 +380,702 @@ fn find_host_visible_memory_type(
     })
 }
 
+/// Pick a DEVICE_LOCAL memory type allowed by `type_filter` (the image's `memoryTypeBits`) — used
+/// for the glyph-atlas image (GPU-resident, sampled). Falls back to any allowed type if no device-
+/// local one is advertised (spec-rare). Free function — unit-testable with a synthetic table.
+fn find_device_local_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+) -> Option<u32> {
+    let device_local = (0..props.memory_type_count).find(|&i| {
+        let supported = (type_filter & (1 << i)) != 0;
+        let flags = props.memory_types[i as usize].property_flags;
+        supported && flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    });
+    device_local.or_else(|| (0..props.memory_type_count).find(|&i| (type_filter & (1 << i)) != 0))
+}
+
+/// Upload `pixels` (R8, `width`×`height`) into `image` via a host-visible staging buffer + a
+/// one-time-submit command buffer that transitions UNDEFINED→TRANSFER_DST, copies, then
+/// TRANSFER_DST→SHADER_READ_ONLY_OPTIMAL. Blocks on a fence until the copy completes (init-time
+/// only, off the frame loop). Frees the staging buffer/command buffer/fence on every path.
+#[allow(clippy::too_many_arguments)]
+fn upload_atlas_pixels(
+    device: &ash::Device,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), GraphicsError> {
+    let size = (width as vk::DeviceSize) * (height as vk::DeviceSize);
+    // --- Staging buffer (host visible) ---
+    let buf_info = vk::BufferCreateInfo::default()
+        .size(size.max(1))
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: device valid; buf_info outlives the call.
+    let staging = unsafe { device.create_buffer(&buf_info, None) }
+        .map_err(|e| GraphicsError::Vulkan(format!("vkCreateBuffer (staging): {e}")))?;
+    // SAFETY: staging just created.
+    let req = unsafe { device.get_buffer_memory_requirements(staging) };
+    let mem_type = find_host_visible_memory_type(memory_properties, req.memory_type_bits)
+        .ok_or_else(|| {
+            // SAFETY: staging valid + unbound; free before bailing.
+            unsafe { device.destroy_buffer(staging, None) };
+            GraphicsError::Vulkan("no host-visible memory for the atlas staging buffer".to_owned())
+        })?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mem_type);
+    // SAFETY: alloc outlives the call.
+    let staging_mem = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: staging valid + unbound; free before bailing.
+            unsafe { device.destroy_buffer(staging, None) };
+            return Err(GraphicsError::Vulkan(format!(
+                "vkAllocateMemory (staging): {e}"
+            )));
+        }
+    };
+    // A small RAII-ish cleanup closure for the staging resources on every exit path below.
+    let free_staging = |device: &ash::Device| {
+        // SAFETY: both handles valid + owned; freed once.
+        unsafe {
+            device.free_memory(staging_mem, None);
+            device.destroy_buffer(staging, None);
+        }
+    };
+    // SAFETY: staging+mem valid; bind whole allocation.
+    if let Err(e) = unsafe { device.bind_buffer_memory(staging, staging_mem, 0) } {
+        free_staging(device);
+        return Err(GraphicsError::Vulkan(format!(
+            "vkBindBufferMemory (staging): {e}"
+        )));
+    }
+    // SAFETY: staging_mem is host-visible ≥ size; copy the pixel bytes in, then unmap.
+    unsafe {
+        match device.map_memory(staging_mem, 0, size.max(1), vk::MemoryMapFlags::empty()) {
+            Ok(ptr) => {
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, pixels.len());
+                device.unmap_memory(staging_mem);
+            }
+            Err(e) => {
+                free_staging(device);
+                return Err(GraphicsError::Vulkan(format!("vkMapMemory (staging): {e}")));
+            }
+        }
+    }
+
+    // --- One-time command buffer: transition, copy, transition ---
+    let cb_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: pool valid; cb_info outlives the call.
+    let cmd = match unsafe { device.allocate_command_buffers(&cb_info) } {
+        Ok(c) => c[0],
+        Err(e) => {
+            free_staging(device);
+            return Err(GraphicsError::Vulkan(format!(
+                "vkAllocateCommandBuffers (upload): {e}"
+            )));
+        }
+    };
+    let free_cmd = |device: &ash::Device| {
+        // SAFETY: cmd belongs to command_pool; freed once.
+        unsafe { device.free_command_buffers(command_pool, &[cmd]) };
+    };
+
+    let subresource = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+    // Record. SAFETY: cmd valid; all handles below are valid; the create-infos outlive the calls.
+    // An inner closure typed `-> ash::prelude::VkResult<()>` so its `?` propagates `vk::Result`
+    // locally (not to this fn, which returns `GraphicsError`); the result is `map_err`'d below.
+    let record = (|| -> ash::prelude::VkResult<()> {
+        unsafe {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(cmd, &begin)?;
+
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                staging,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+
+            let to_shader = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_shader),
+            );
+            device.end_command_buffer(cmd)
+        }
+    })();
+    if let Err(e) = record {
+        free_cmd(device);
+        free_staging(device);
+        return Err(GraphicsError::Vulkan(format!("record atlas upload: {e}")));
+    }
+
+    // Submit + wait on a fence so the copy finishes before the staging buffer is freed.
+    // SAFETY: device valid; default fence info.
+    let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+        Ok(f) => f,
+        Err(e) => {
+            free_cmd(device);
+            free_staging(device);
+            return Err(GraphicsError::Vulkan(format!("create upload fence: {e}")));
+        }
+    };
+    let cmds = [cmd];
+    let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+    // SAFETY: queue/cmd/fence valid; submit + its slice outlive the call; fence tracks completion.
+    let submitted = unsafe { device.queue_submit(queue, &[submit], fence) };
+    let waited =
+        submitted.and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
+    // SAFETY: fence valid + owned; destroy once. Then free the cmd buffer + staging resources.
+    unsafe { device.destroy_fence(fence, None) };
+    free_cmd(device);
+    free_staging(device);
+    waited.map_err(|e| GraphicsError::Vulkan(format!("submit/wait atlas upload: {e}")))?;
+    Ok(())
+}
+
+/// Build the textured-glyph pipeline (vertex: pos@0 + uv@8; fragment: sample R8 atlas × push-constant
+/// color; alpha blend; dynamic viewport+scissor). Frees both shader modules on every path; on a
+/// post-layout failure frees the layout. `descriptor_set_layout` (set 0 = the atlas sampler) is
+/// referenced by the pipeline layout but owned by the caller.
+fn build_text_pipeline(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<(vk::PipelineLayout, vk::Pipeline), GraphicsError> {
+    let vert_words = read_spirv(TEXT_VERT_SPV)?;
+    let frag_words = read_spirv(TEXT_FRAG_SPV)?;
+    let make_module = |words: &[u32]| -> Result<vk::ShaderModule, GraphicsError> {
+        let info = vk::ShaderModuleCreateInfo::default().code(words);
+        // SAFETY: device valid; info borrows words for the call only.
+        unsafe { device.create_shader_module(&info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateShaderModule (text): {e}")))
+    };
+    let vert_module = make_module(&vert_words)?;
+    let frag_module = match make_module(&frag_words) {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: vert_module valid + unused; free before bailing.
+            unsafe { device.destroy_shader_module(vert_module, None) };
+            return Err(e);
+        }
+    };
+
+    let entry = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(entry),
+    ];
+    let binding = vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(std::mem::size_of::<TextVertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX);
+    let attributes = [
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(0),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(1)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(std::mem::size_of::<[f32; 2]>() as u32),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(std::slice::from_ref(&binding))
+        .vertex_attribute_descriptions(&attributes);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD);
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(std::slice::from_ref(&blend_attachment));
+
+    // Pipeline layout: set 0 = the atlas sampler; a fragment-stage vec4 push constant = text color.
+    let set_layouts = [descriptor_set_layout];
+    let push_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(std::mem::size_of::<[f32; 4]>() as u32);
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(std::slice::from_ref(&push_range));
+    // SAFETY: device valid; layout_info + its slices outlive the call.
+    let pipeline_layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
+        Ok(l) => l,
+        Err(e) => {
+            // SAFETY: both modules valid; free them before bailing.
+            unsafe {
+                device.destroy_shader_module(frag_module, None);
+                device.destroy_shader_module(vert_module, None);
+            }
+            return Err(GraphicsError::Vulkan(format!(
+                "vkCreatePipelineLayout (text): {e}"
+            )));
+        }
+    };
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterizer)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0);
+    // SAFETY: all referenced objects valid + outlive the call.
+    let pipeline = match unsafe {
+        device.create_graphics_pipelines(
+            vk::PipelineCache::null(),
+            std::slice::from_ref(&pipeline_info),
+            None,
+        )
+    } {
+        Ok(p) => p[0],
+        Err((_, e)) => {
+            // SAFETY: layout + both modules valid; free them before bailing.
+            unsafe {
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_shader_module(frag_module, None);
+                device.destroy_shader_module(vert_module, None);
+            }
+            return Err(GraphicsError::Vulkan(format!(
+                "vkCreateGraphicsPipelines (text): {e}"
+            )));
+        }
+    };
+    // SAFETY: both modules valid; the pipeline retains the compiled code, so free them now.
+    unsafe {
+        device.destroy_shader_module(frag_module, None);
+        device.destroy_shader_module(vert_module, None);
+    }
+    Ok((pipeline_layout, pipeline))
+}
+
+// ---------------------------------------------------------------------------------------------
+// View-tree TEXT: portable font discovery + R8 glyph atlas + textured glyph quads (2026-06-05)
+//
+// Each `RenderNode.text` (a TextView's text) is drawn over its view rect. We rasterize a fixed
+// printable-ASCII glyph set ONCE into a single R8 coverage atlas (ab_glyph), then per frame emit a
+// textured quad per glyph. The font FILE is discovered portably at runtime (fontconfig `fc-match`,
+// then known font dirs) — detect-don't-assume (§9), never linking fontconfig. If no font is found,
+// text is skipped (the quads still draw); never a crash.
+// ---------------------------------------------------------------------------------------------
+
+use ab_glyph::{Font, FontVec, ScaleFont};
+
+/// One vertex for the text pipeline: NDC position + atlas UV. `#[repr(C)]`, matching the text
+/// pipeline's vertex input (pos @0, uv @8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TextVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+}
+
+/// Per-glyph placement in the atlas: pixel rect in the atlas + the glyph's bearing/advance metrics
+/// (in pixels at [`TEXT_PX`]) needed to position it on a baseline.
+#[derive(Debug, Clone, Copy)]
+struct GlyphInfo {
+    /// Atlas pixel rect (top-left x,y and size).
+    ax: u32,
+    ay: u32,
+    aw: u32,
+    ah: u32,
+    /// Offset from the pen position (baseline origin) to the glyph bitmap's top-left, in pixels.
+    bearing_x: f32,
+    bearing_y: f32,
+    /// Horizontal advance to the next glyph, in pixels.
+    advance: f32,
+}
+
+/// A CPU-side R8 glyph atlas: the coverage bitmap + a sparse map from `char` to its [`GlyphInfo`],
+/// plus the scaled font's ascent (for baseline placement). Built once; uploaded to a GPU image.
+struct GlyphAtlas {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    glyphs: std::collections::HashMap<char, GlyphInfo>,
+    ascent: f32,
+    line_height: f32,
+}
+
+/// The printable-ASCII set rasterized into the atlas. Bounded + covers the demo's text; non-ASCII
+/// chars are simply skipped at layout time (advance-only fallback would be the next refinement).
+const ATLAS_CHARS: std::ops::RangeInclusive<u8> = 32..=126;
+
+/// Find a usable TrueType/OpenType font file portably, without linking fontconfig.
+///
+/// Order (detect-don't-assume §9): (1) `fc-match` (fontconfig CLI, present on virtually every Linux
+/// desktop) for `sans-serif`; (2) a scan of the well-known system font dirs for any `.ttf`/`.otf`.
+/// Returns `None` (text disabled, quads still draw) if nothing is found — never panics, never
+/// hardcodes a single file path. An env override (`ECLIPSE_FONT`) wins for testing/packaging.
+fn discover_font_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("ECLIPSE_FONT") {
+        let path = std::path::PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // (1) fontconfig CLI — asks the system which file backs the generic "sans-serif" family.
+    if let Ok(out) = std::process::Command::new("fc-match")
+        .args(["--format=%{file}", "sans-serif"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            let path = std::path::PathBuf::from(s.trim());
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    // (2) Fallback: scan known font dirs for the first .ttf/.otf (portable across distros).
+    const FONT_DIRS: [&str; 4] = [
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/usr/share/fonts/truetype",
+        "/run/host/fonts", // flatpak host-fonts mount
+    ];
+    for dir in FONT_DIRS {
+        if let Some(p) = first_font_in_dir(std::path::Path::new(dir)) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Recursively find the first `.ttf`/`.otf` under `dir` (bounded, no symlink loops via `read_dir`).
+fn first_font_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if let Some(ext) = path.extension() {
+            let ext = ext.to_ascii_lowercase();
+            if ext == "ttf" || ext == "otf" {
+                return Some(path);
+            }
+        }
+    }
+    // Shallow recursion into subdirs (font trees are not deep); first hit wins.
+    subdirs.into_iter().find_map(|d| first_font_in_dir(&d))
+}
+
+/// Rasterize [`ATLAS_CHARS`] from `font` at [`TEXT_PX`] into a single R8 atlas using simple shelf
+/// packing (rows of glyphs, wrapping at `max_width`). Pure/GPU-free — unit-testable without a GPU.
+///
+/// Returns `None` only if the atlas would be empty (no glyph produced an outline), which the caller
+/// treats as "no text" (quads still draw). 1-px padding between glyphs avoids bilinear bleed.
+fn build_glyph_atlas(font: &FontVec, max_width: u32) -> Option<GlyphAtlas> {
+    let scaled = font.as_scaled(TEXT_PX);
+    let ascent = scaled.ascent();
+    let line_height = scaled.height() + scaled.line_gap();
+
+    const PAD: u32 = 1;
+    // First pass: rasterize each glyph to its own small bitmap + record metrics.
+    struct Raster {
+        ch: char,
+        w: u32,
+        h: u32,
+        pixels: Vec<u8>,
+        bearing_x: f32,
+        bearing_y: f32,
+        advance: f32,
+    }
+    let mut rasters: Vec<Raster> = Vec::new();
+    for byte in ATLAS_CHARS {
+        let ch = byte as char;
+        let advance = scaled.h_advance(scaled.glyph_id(ch));
+        let glyph = font
+            .glyph_id(ch)
+            .with_scale_and_position(TEXT_PX, ab_glyph::point(0.0, 0.0));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            let w = bounds.width().ceil() as u32;
+            let h = bounds.height().ceil() as u32;
+            if w == 0 || h == 0 {
+                // Whitespace-like glyph with an advance but no pixels (e.g. space).
+                rasters.push(Raster {
+                    ch,
+                    w: 0,
+                    h: 0,
+                    pixels: Vec::new(),
+                    bearing_x: bounds.min.x,
+                    bearing_y: bounds.min.y,
+                    advance,
+                });
+                continue;
+            }
+            let mut pixels = vec![0u8; (w * h) as usize];
+            outlined.draw(|x, y, c| {
+                let idx = (y * w + x) as usize;
+                if idx < pixels.len() {
+                    pixels[idx] = (c.clamp(0.0, 1.0) * 255.0) as u8;
+                }
+            });
+            rasters.push(Raster {
+                ch,
+                w,
+                h,
+                pixels,
+                bearing_x: bounds.min.x,
+                bearing_y: bounds.min.y,
+                advance,
+            });
+        } else {
+            // No outline (e.g. space): advance-only.
+            rasters.push(Raster {
+                ch,
+                w: 0,
+                h: 0,
+                pixels: Vec::new(),
+                bearing_x: 0.0,
+                bearing_y: 0.0,
+                advance,
+            });
+        }
+    }
+
+    // Second pass: shelf-pack the non-empty bitmaps into rows, wrapping at `max_width`, building each
+    // glyph's final [`GlyphInfo`] (atlas rect + metrics) directly — no intermediate tuple.
+    let max_width = max_width.max(1);
+    let mut pen_x = PAD;
+    let mut pen_y = PAD;
+    let mut row_h = 0u32;
+    let mut atlas_w = 0u32;
+    let mut placements: Vec<(char, GlyphInfo)> = Vec::with_capacity(rasters.len());
+    for r in &rasters {
+        if r.w == 0 || r.h == 0 {
+            // Whitespace: no atlas rect, but still record the advance (zero-size rect).
+            placements.push((
+                r.ch,
+                GlyphInfo {
+                    ax: 0,
+                    ay: 0,
+                    aw: 0,
+                    ah: 0,
+                    bearing_x: r.bearing_x,
+                    bearing_y: r.bearing_y,
+                    advance: r.advance,
+                },
+            ));
+            continue;
+        }
+        if pen_x + r.w + PAD > max_width {
+            // Wrap to a new shelf.
+            pen_x = PAD;
+            pen_y += row_h + PAD;
+            row_h = 0;
+        }
+        placements.push((
+            r.ch,
+            GlyphInfo {
+                ax: pen_x,
+                ay: pen_y,
+                aw: r.w,
+                ah: r.h,
+                bearing_x: r.bearing_x,
+                bearing_y: r.bearing_y,
+                advance: r.advance,
+            },
+        ));
+        pen_x += r.w + PAD;
+        row_h = row_h.max(r.h);
+        atlas_w = atlas_w.max(pen_x);
+    }
+    let atlas_h = pen_y + row_h + PAD;
+    if atlas_w == 0 || atlas_h == 0 {
+        return None;
+    }
+
+    // Third pass: blit each glyph bitmap into the atlas + build the char → GlyphInfo map.
+    let mut pixels = vec![0u8; (atlas_w * atlas_h) as usize];
+    let mut glyphs = std::collections::HashMap::new();
+    for (r, &(ch, info)) in rasters.iter().zip(placements.iter()) {
+        if info.aw > 0 && info.ah > 0 {
+            for gy in 0..info.ah {
+                for gx in 0..info.aw {
+                    let src = (gy * info.aw + gx) as usize;
+                    let dst = ((info.ay + gy) * atlas_w + (info.ax + gx)) as usize;
+                    if src < r.pixels.len() && dst < pixels.len() {
+                        pixels[dst] = r.pixels[src];
+                    }
+                }
+            }
+        }
+        glyphs.insert(ch, info);
+    }
+
+    Some(GlyphAtlas {
+        width: atlas_w,
+        height: atlas_h,
+        pixels,
+        glyphs,
+        ascent,
+        line_height,
+    })
+}
+
+/// Emit textured glyph quads (6 [`TextVertex`]es each) for every laid-out view's text, positioned
+/// within its rect on a baseline. Pure/GPU-free (just arithmetic over the atlas metrics) so it is
+/// unit-testable without a GPU. Glyphs not in the atlas (non-ASCII) are skipped but still advance.
+fn build_text_vertices(
+    views: &[LaidOutView],
+    atlas: &GlyphAtlas,
+    extent: vk::Extent2D,
+) -> Vec<TextVertex> {
+    let ew = extent.width.max(1) as f32;
+    let eh = extent.height.max(1) as f32;
+    let aw = atlas.width.max(1) as f32;
+    let ah = atlas.height.max(1) as f32;
+    let to_ndc = |px: f32, py: f32| -> [f32; 2] { [2.0 * px / ew - 1.0, 2.0 * py / eh - 1.0] };
+
+    let mut verts = Vec::new();
+    for v in views {
+        let Some(text) = v.text.as_deref() else {
+            continue;
+        };
+        // Baseline: top of the rect + a little padding + the font ascent (so glyphs sit inside).
+        let mut pen_x = v.x + TEXT_PAD_X;
+        let baseline_y = v.y + (v.h - atlas.line_height).max(0.0) * 0.5 + atlas.ascent;
+        for ch in text.chars() {
+            let Some(g) = atlas.glyphs.get(&ch) else {
+                continue; // not in the atlas (non-ASCII); skip (no advance known)
+            };
+            if g.aw > 0 && g.ah > 0 {
+                // Glyph top-left in pixels: pen + bearing (bearing_y is negative-up from baseline).
+                let gx = pen_x + g.bearing_x;
+                let gy = baseline_y + g.bearing_y;
+                let gw = g.aw as f32;
+                let gh = g.ah as f32;
+                let u0 = g.ax as f32 / aw;
+                let v0 = g.ay as f32 / ah;
+                let u1 = (g.ax + g.aw) as f32 / aw;
+                let v1 = (g.ay + g.ah) as f32 / ah;
+                let tl = TextVertex {
+                    pos: to_ndc(gx, gy),
+                    uv: [u0, v0],
+                };
+                let tr = TextVertex {
+                    pos: to_ndc(gx + gw, gy),
+                    uv: [u1, v0],
+                };
+                let bl = TextVertex {
+                    pos: to_ndc(gx, gy + gh),
+                    uv: [u0, v1],
+                };
+                let br = TextVertex {
+                    pos: to_ndc(gx + gw, gy + gh),
+                    uv: [u1, v1],
+                };
+                verts.extend_from_slice(&[tl, tr, br, tl, br, bl]);
+            }
+            pen_x += g.advance;
+        }
+    }
+    verts
+}
+
 /// The per-swapchain resources that must be rebuilt on resize / out-of-date. Kept separate from
 /// the device-lifetime objects in [`VulkanRenderer`] so a resize recreates only these.
 struct Swapchain {
@@ -413,6 +1121,10 @@ struct VulkanRenderer {
     quad_vertex_capacity: u32,
     /// Memory properties (for choosing a host-visible|coherent memory type for the vertex buffer).
     memory_properties: vk::PhysicalDeviceMemoryProperties,
+
+    /// The text pass (font atlas image + textured-glyph pipeline). `None` if no system font was
+    /// found or text init failed — quads still draw, no crash (text is best-effort).
+    text: Option<TextRenderer>,
 
     // Swapchain-lifetime objects (rebuilt on resize).
     swapchain: Swapchain,
@@ -578,6 +1290,7 @@ impl VulkanRenderer {
                 quad_pipeline_layout,
                 quad_pipeline,
                 memory_properties,
+                text,
             )) => Ok(Self {
                 _entry: entry,
                 instance,
@@ -602,6 +1315,7 @@ impl VulkanRenderer {
                 quad_vertex_memory: vk::DeviceMemory::null(),
                 quad_vertex_capacity: 0,
                 memory_properties,
+                text,
                 needs_recreate: false,
             }),
             Err(e) => {
@@ -865,6 +1579,7 @@ impl VulkanRenderer {
             vk::PipelineLayout,
             vk::Pipeline,
             vk::PhysicalDeviceMemoryProperties,
+            Option<TextRenderer>,
         ),
         GraphicsError,
     > {
@@ -1041,6 +1756,27 @@ impl VulkanRenderer {
                 }
             };
 
+        // The text pass (font atlas + textured-glyph pipeline). Best-effort: `Ok(None)` if no system
+        // font is found (quads still draw). A hard Vulkan error frees everything created above.
+        let text =
+            match TextRenderer::new(device, queue, command_pool, render_pass, &memory_properties) {
+                Ok(t) => t,
+                Err(e) => {
+                    // SAFETY: every handle below is valid + owned; freed once, reverse order.
+                    unsafe {
+                        device.destroy_pipeline(quad_pipeline, None);
+                        device.destroy_pipeline_layout(quad_pipeline_layout, None);
+                        device.destroy_semaphore(image_available, None);
+                        device.destroy_semaphore(render_finished, None);
+                        device.destroy_fence(in_flight, None);
+                        device.destroy_command_pool(command_pool, None);
+                        swapchain.destroy(device, &swapchain_loader);
+                        device.destroy_render_pass(render_pass, None);
+                    }
+                    return Err(e);
+                }
+            };
+
         Ok((
             queue,
             swapchain_loader,
@@ -1056,6 +1792,7 @@ impl VulkanRenderer {
             quad_pipeline_layout,
             quad_pipeline,
             memory_properties,
+            text,
         ))
     }
 
@@ -1285,18 +2022,31 @@ impl VulkanRenderer {
         // the per-view quads. The fence above guarantees the previous frame's GPU read of the vertex
         // buffer has completed, so re-uploading here is safe. An empty tree → 0 vertices → clear-only.
         let nodes = crate::framework::view_registry::snapshot_tree();
-        let views = layout_views(&nodes, self.swapchain.extent);
-        let verts = build_quad_vertices(&views, self.swapchain.extent);
+        let extent = self.swapchain.extent;
+        let views = layout_views(&nodes, extent);
+        let verts = build_quad_vertices(&views, extent);
         let vertex_count = self.upload_vertices(&verts)?;
+
+        // Text: lay out each view's text into glyph quads and upload them to the text vertex buffer.
+        // `memory_properties` is `Copy`, so taking it by value frees `self` for the disjoint
+        // `self.text.as_mut()` borrow. No text renderer (no font) → no text vertices, quads still draw.
+        let mem_props = self.memory_properties;
+        let text_vertex_count = if let Some(text) = self.text.as_mut() {
+            let tverts = build_text_vertices(&views, &text.atlas, extent);
+            text.upload(&self.device, &mem_props, &tverts)?
+        } else {
+            0
+        };
         if vertex_count > 0 {
             tracing::trace!(
                 views = views.len(),
                 quads = vertex_count / 6,
+                glyphs = text_vertex_count / 6,
                 "drawing recorded View tree into the swapchain"
             );
         }
 
-        self.record_draw(image_index as usize, vertex_count)?;
+        self.record_draw(image_index as usize, vertex_count, text_vertex_count)?;
 
         let wait_semaphores = [self.image_available];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -1448,11 +2198,16 @@ impl VulkanRenderer {
         Ok(count)
     }
 
-    /// Record the render pass for `image_index`: clear to [`CLEAR_COLOR`], then (when there are
-    /// vertices) bind the quad pipeline + vertex buffer, set the dynamic viewport+scissor to the
-    /// current extent, and draw the laid-out View-tree quads. A `vertex_count` of `0` is the
-    /// clear-only path (no content recorded yet) — identical to the previous foundation behavior.
-    fn record_draw(&self, image_index: usize, vertex_count: u32) -> Result<(), GraphicsError> {
+    /// Record the render pass for `image_index`: clear to [`CLEAR_COLOR`], draw the View-tree quads
+    /// (when `vertex_count > 0`), then draw the text glyphs on top (when `text_vertex_count > 0` and
+    /// the text pass exists). All-zero counts is the clear-only path (no content recorded yet) —
+    /// identical to the previous foundation behavior.
+    fn record_draw(
+        &self,
+        image_index: usize,
+        vertex_count: u32,
+        text_vertex_count: u32,
+    ) -> Result<(), GraphicsError> {
         let cmd = self.command_buffer;
         // SAFETY: the command buffer was allocated with RESET_COMMAND_BUFFER; reset then begin.
         unsafe {
@@ -1480,11 +2235,12 @@ impl VulkanRenderer {
             })
             .clear_values(&clear);
         // SAFETY: framebuffer index is in range (acquired image), render pass + cmd are valid. The
-        // CLEAR load-op paints CLEAR_COLOR; the quad draw (if any) then composites on top.
+        // CLEAR load-op paints CLEAR_COLOR; the quad draw (if any) then composites on top, and the
+        // text draw composites over the quads (alpha-blended).
         unsafe {
             self.device
                 .cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
-            if vertex_count > 0 {
+            if vertex_count > 0 || text_vertex_count > 0 {
                 let extent = self.swapchain.extent;
                 let viewport = vk::Viewport::default()
                     .x(0.0)
@@ -1499,6 +2255,8 @@ impl VulkanRenderer {
                 };
                 self.device.cmd_set_viewport(cmd, 0, &[viewport]);
                 self.device.cmd_set_scissor(cmd, 0, &[scissor]);
+            }
+            if vertex_count > 0 {
                 self.device.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -1507,6 +2265,41 @@ impl VulkanRenderer {
                 self.device
                     .cmd_bind_vertex_buffers(cmd, 0, &[self.quad_vertex_buffer], &[0]);
                 self.device.cmd_draw(cmd, vertex_count, 1, 0, 0);
+            }
+            // Text glyphs over the quads: bind the text pipeline + atlas descriptor, push the text
+            // color, draw. Guarded on the text pass existing + having vertices this frame.
+            if text_vertex_count > 0 {
+                if let Some(text) = self.text.as_ref() {
+                    self.device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        text.pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        text.pipeline_layout,
+                        0,
+                        &[text.descriptor_set],
+                        &[],
+                    );
+                    // Pack the vec4 text color into push-constant bytes (host-endian = what the GPU
+                    // on this host reads). Safe byte construction — no transmute.
+                    let mut color_bytes = [0u8; 16];
+                    for (i, c) in TEXT_COLOR.iter().enumerate() {
+                        color_bytes[i * 4..i * 4 + 4].copy_from_slice(&c.to_ne_bytes());
+                    }
+                    self.device.cmd_push_constants(
+                        cmd,
+                        text.pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        &color_bytes,
+                    );
+                    self.device
+                        .cmd_bind_vertex_buffers(cmd, 0, &[text.vertex_buffer], &[0]);
+                    self.device.cmd_draw(cmd, text_vertex_count, 1, 0, 0);
+                }
             }
             self.device.cmd_end_render_pass(cmd);
             self.device
@@ -1539,6 +2332,467 @@ impl Swapchain {
     }
 }
 
+/// The text pass: an R8 glyph-atlas image (sampled) + a textured-glyph pipeline + a per-frame text
+/// vertex buffer. Built once at renderer init from a discovered system font; all handles are device
+/// children freed by [`Self::destroy`] (called from [`VulkanRenderer`]'s `Drop` after the GPU is idle).
+struct TextRenderer {
+    atlas_image: vk::Image,
+    atlas_memory: vk::DeviceMemory,
+    atlas_view: vk::ImageView,
+    sampler: vk::Sampler,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_set: vk::DescriptorSet,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    /// CPU-side atlas metrics (glyph map + ascent), kept to lay out text into vertices each frame.
+    atlas: GlyphAtlas,
+    /// Per-frame text vertex buffer (grown on demand, same single-frame-in-flight safety as quads).
+    vertex_buffer: vk::Buffer,
+    vertex_memory: vk::DeviceMemory,
+    vertex_capacity: u32,
+}
+
+impl TextRenderer {
+    /// Try to build the text pass: discover a system font, rasterize the atlas, upload it to a GPU
+    /// image, and create the sampler/descriptor/pipeline. Returns `Ok(None)` (text disabled, quads
+    /// still draw) if no font is found or the atlas is empty; `Err` only on a hard Vulkan failure
+    /// after partial allocation (which it tears down). Never panics.
+    fn new(
+        device: &ash::Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+        render_pass: vk::RenderPass,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    ) -> Result<Option<Self>, GraphicsError> {
+        let Some(font_path) = discover_font_path() else {
+            tracing::warn!("no system font found (fc-match / font dirs); text drawing disabled");
+            return Ok(None);
+        };
+        let bytes = match std::fs::read(&font_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %font_path.display(), error = %e, "font read failed; text disabled");
+                return Ok(None);
+            }
+        };
+        let font = match FontVec::try_from_vec(bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(path = %font_path.display(), error = %e, "font parse failed; text disabled");
+                return Ok(None);
+            }
+        };
+        // Cap atlas width at a device-safe size; printable ASCII at 28px fits well under 1024.
+        let Some(atlas) = build_glyph_atlas(&font, 1024) else {
+            tracing::warn!("glyph atlas came out empty; text disabled");
+            return Ok(None);
+        };
+        tracing::info!(
+            font = %font_path.display(),
+            atlas_w = atlas.width,
+            atlas_h = atlas.height,
+            glyphs = atlas.glyphs.len(),
+            "text: discovered system font + built R8 glyph atlas"
+        );
+
+        // Build the GPU side. On any failure here, free what was made and surface a typed error.
+        Self::build_gpu(
+            device,
+            queue,
+            command_pool,
+            render_pass,
+            memory_properties,
+            atlas,
+        )
+        .map(Some)
+    }
+
+    /// Create the atlas image + upload its pixels + the sampler/descriptor/pipeline. Split out so
+    /// [`Self::new`]'s font/atlas discovery stays readable. Tears down partial state on error.
+    #[allow(clippy::too_many_arguments)]
+    fn build_gpu(
+        device: &ash::Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+        render_pass: vk::RenderPass,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        atlas: GlyphAtlas,
+    ) -> Result<Self, GraphicsError> {
+        // --- Atlas image (R8_UNORM, sampled + transfer-dst) ---
+        let extent = vk::Extent3D {
+            width: atlas.width,
+            height: atlas.height,
+            depth: 1,
+        };
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8_UNORM)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: device valid; image_info outlives the call.
+        let atlas_image = unsafe { device.create_image(&image_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateImage (atlas): {e}")))?;
+        // SAFETY: atlas_image just created from device.
+        let req = unsafe { device.get_image_memory_requirements(atlas_image) };
+        let mem_type = find_device_local_memory_type(memory_properties, req.memory_type_bits)
+            .ok_or_else(|| {
+                // SAFETY: image valid + unbound; free before bailing.
+                unsafe { device.destroy_image(atlas_image, None) };
+                GraphicsError::Vulkan("no memory type for the glyph atlas image".to_owned())
+            })?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        // SAFETY: alloc outlives the call; mem_type satisfies the image's requirements.
+        let atlas_memory = match unsafe { device.allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: image valid + unbound; free before bailing.
+                unsafe { device.destroy_image(atlas_image, None) };
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkAllocateMemory (atlas): {e}"
+                )));
+            }
+        };
+        // SAFETY: image + memory valid; bind whole allocation at offset 0.
+        if let Err(e) = unsafe { device.bind_image_memory(atlas_image, atlas_memory, 0) } {
+            // SAFETY: both valid + owned; free reverse order.
+            unsafe {
+                device.free_memory(atlas_memory, None);
+                device.destroy_image(atlas_image, None);
+            }
+            return Err(GraphicsError::Vulkan(format!("vkBindImageMemory: {e}")));
+        }
+
+        // --- Upload the atlas pixels via a staging buffer + one-time transfer ---
+        if let Err(e) = upload_atlas_pixels(
+            device,
+            queue,
+            command_pool,
+            memory_properties,
+            atlas_image,
+            atlas.width,
+            atlas.height,
+            &atlas.pixels,
+        ) {
+            // SAFETY: image + memory valid + owned; free reverse order.
+            unsafe {
+                device.free_memory(atlas_memory, None);
+                device.destroy_image(atlas_image, None);
+            }
+            return Err(e);
+        }
+
+        // From here, helper assembles the rest; on its error it frees image+memory.
+        Self::finish_gpu(device, render_pass, atlas, atlas_image, atlas_memory)
+    }
+
+    /// Create the image view, sampler, descriptor (layout+pool+set), and the text pipeline over an
+    /// already-uploaded atlas image. Frees `atlas_image`/`atlas_memory` on its own error paths.
+    fn finish_gpu(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        atlas: GlyphAtlas,
+        atlas_image: vk::Image,
+        atlas_memory: vk::DeviceMemory,
+    ) -> Result<Self, GraphicsError> {
+        // Helper to free the image+memory on any error below (the only handles made before this fn).
+        let free_image = |device: &ash::Device| {
+            // SAFETY: both handles valid + owned; freed once on the error path.
+            unsafe {
+                device.free_memory(atlas_memory, None);
+                device.destroy_image(atlas_image, None);
+            }
+        };
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(atlas_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8_UNORM)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        // SAFETY: image valid; view_info outlives the call.
+        let atlas_view = match unsafe { device.create_image_view(&view_info, None) } {
+            Ok(v) => v,
+            Err(e) => {
+                free_image(device);
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkCreateImageView (atlas): {e}"
+                )));
+            }
+        };
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        // SAFETY: device valid; sampler_info outlives the call.
+        let sampler = match unsafe { device.create_sampler(&sampler_info, None) } {
+            Ok(s) => s,
+            Err(e) => {
+                // SAFETY: view valid; free it + image before bailing.
+                unsafe { device.destroy_image_view(atlas_view, None) };
+                free_image(device);
+                return Err(GraphicsError::Vulkan(format!("vkCreateSampler: {e}")));
+            }
+        };
+
+        // Descriptor set layout: one combined image sampler at binding 0, fragment stage.
+        let binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let dsl_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
+        // SAFETY: device valid; dsl_info outlives the call.
+        let descriptor_set_layout =
+            match unsafe { device.create_descriptor_set_layout(&dsl_info, None) } {
+                Ok(l) => l,
+                Err(e) => {
+                    // SAFETY: sampler+view valid; free them + image.
+                    unsafe {
+                        device.destroy_sampler(sampler, None);
+                        device.destroy_image_view(atlas_view, None);
+                    }
+                    free_image(device);
+                    return Err(GraphicsError::Vulkan(format!(
+                        "vkCreateDescriptorSetLayout: {e}"
+                    )));
+                }
+            };
+
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1);
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(std::slice::from_ref(&pool_size));
+        // SAFETY: device valid; pool_info outlives the call.
+        let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: layout+sampler+view valid; free them + image.
+                unsafe {
+                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    device.destroy_sampler(sampler, None);
+                    device.destroy_image_view(atlas_view, None);
+                }
+                free_image(device);
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkCreateDescriptorPool: {e}"
+                )));
+            }
+        };
+
+        let set_layouts = [descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&set_layouts);
+        // SAFETY: pool+layout valid; alloc_info outlives the call.
+        let descriptor_set = match unsafe { device.allocate_descriptor_sets(&alloc_info) } {
+            Ok(sets) => sets[0],
+            Err(e) => {
+                // SAFETY: pool+layout+sampler+view valid; free them + image.
+                unsafe {
+                    device.destroy_descriptor_pool(descriptor_pool, None);
+                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    device.destroy_sampler(sampler, None);
+                    device.destroy_image_view(atlas_view, None);
+                }
+                free_image(device);
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkAllocateDescriptorSets: {e}"
+                )));
+            }
+        };
+
+        // Point the descriptor at the atlas (image is in SHADER_READ_ONLY_OPTIMAL after upload).
+        let image_info = vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(atlas_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&image_info));
+        // SAFETY: set+sampler+view valid; write + its borrow outlive the call.
+        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+
+        // Pipeline (with a vec4 push constant for the text color).
+        let (pipeline_layout, pipeline) =
+            match build_text_pipeline(device, render_pass, descriptor_set_layout) {
+                Ok(p) => p,
+                Err(e) => {
+                    // SAFETY: all descriptor/sampler/view handles valid; free them + image.
+                    unsafe {
+                        device.destroy_descriptor_pool(descriptor_pool, None);
+                        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                        device.destroy_sampler(sampler, None);
+                        device.destroy_image_view(atlas_view, None);
+                    }
+                    free_image(device);
+                    return Err(e);
+                }
+            };
+
+        Ok(Self {
+            atlas_image,
+            atlas_memory,
+            atlas_view,
+            sampler,
+            descriptor_pool,
+            descriptor_set_layout,
+            descriptor_set,
+            pipeline_layout,
+            pipeline,
+            atlas,
+            vertex_buffer: vk::Buffer::null(),
+            vertex_memory: vk::DeviceMemory::null(),
+            vertex_capacity: 0,
+        })
+    }
+
+    /// (Re)upload this frame's text vertices into the host-visible text vertex buffer, growing it
+    /// on demand. Returns the vertex count to draw. Same single-frame-in-flight safety as the quad
+    /// buffer: the caller waited the `in_flight` fence before this, so re-upload cannot race the GPU.
+    fn upload(
+        &mut self,
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        verts: &[TextVertex],
+    ) -> Result<u32, GraphicsError> {
+        let count: u32 = verts.len().try_into().map_err(|_| {
+            GraphicsError::Vulkan("too many text vertices for one frame".to_owned())
+        })?;
+        if count == 0 {
+            return Ok(0);
+        }
+        if count > self.vertex_capacity {
+            let size =
+                (count as vk::DeviceSize) * std::mem::size_of::<TextVertex>() as vk::DeviceSize;
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: device valid; buffer_info outlives the call.
+            let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+                .map_err(|e| GraphicsError::Vulkan(format!("vkCreateBuffer (text): {e}")))?;
+            // SAFETY: buffer just created.
+            let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+            let mem_type = find_host_visible_memory_type(memory_properties, req.memory_type_bits)
+                .ok_or_else(|| {
+                // SAFETY: buffer valid + unbound; free before bailing.
+                unsafe { device.destroy_buffer(buffer, None) };
+                GraphicsError::Vulkan(
+                    "no host-visible memory for the text vertex buffer".to_owned(),
+                )
+            })?;
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            // SAFETY: alloc_info outlives the call.
+            let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+                Ok(m) => m,
+                Err(e) => {
+                    // SAFETY: buffer valid + unbound; free before bailing.
+                    unsafe { device.destroy_buffer(buffer, None) };
+                    return Err(GraphicsError::Vulkan(format!(
+                        "vkAllocateMemory (text): {e}"
+                    )));
+                }
+            };
+            // SAFETY: buffer+memory valid; bind whole allocation.
+            if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+                // SAFETY: both valid + owned; free reverse order.
+                unsafe {
+                    device.free_memory(memory, None);
+                    device.destroy_buffer(buffer, None);
+                }
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkBindBufferMemory (text): {e}"
+                )));
+            }
+            // Free the previous text buffer (GPU finished reading — fence waited).
+            // SAFETY: prior handles null-guarded or valid+idle; freed once.
+            unsafe {
+                if self.vertex_buffer != vk::Buffer::null() {
+                    device.destroy_buffer(self.vertex_buffer, None);
+                }
+                if self.vertex_memory != vk::DeviceMemory::null() {
+                    device.free_memory(self.vertex_memory, None);
+                }
+            }
+            self.vertex_buffer = buffer;
+            self.vertex_memory = memory;
+            self.vertex_capacity = count;
+        }
+
+        let copy_bytes =
+            (count as vk::DeviceSize) * std::mem::size_of::<TextVertex>() as vk::DeviceSize;
+        // SAFETY: vertex_memory is a valid host-visible allocation ≥ copy_bytes; map the exact range,
+        // copy `count` TextVertexes (source has `count`), unmap. GPU not reading (fence waited).
+        unsafe {
+            let ptr = device
+                .map_memory(
+                    self.vertex_memory,
+                    0,
+                    copy_bytes,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(|e| GraphicsError::Vulkan(format!("vkMapMemory (text): {e}")))?;
+            std::ptr::copy_nonoverlapping(
+                verts.as_ptr() as *const u8,
+                ptr as *mut u8,
+                copy_bytes as usize,
+            );
+            device.unmap_memory(self.vertex_memory);
+        }
+        Ok(count)
+    }
+
+    /// Destroy every device-child handle (image/view/sampler/descriptors/pipeline/vertex buffer).
+    ///
+    /// # Safety
+    /// The GPU must be idle and `device` the one these were created from. Called only from
+    /// [`VulkanRenderer`]'s `Drop` after `device_wait_idle`.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: per contract the GPU is idle; every handle is valid + owned + freed once.
+        unsafe {
+            if self.vertex_buffer != vk::Buffer::null() {
+                device.destroy_buffer(self.vertex_buffer, None);
+            }
+            if self.vertex_memory != vk::DeviceMemory::null() {
+                device.free_memory(self.vertex_memory, None);
+            }
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_image_view(self.atlas_view, None);
+            device.destroy_image(self.atlas_image, None);
+            device.free_memory(self.atlas_memory, None);
+        }
+    }
+}
+
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         // SAFETY: wait for all GPU work to finish so nothing references the objects we destroy.
@@ -1551,6 +2805,10 @@ impl Drop for VulkanRenderer {
             self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_command_pool(self.command_pool, None);
+            // The text pass (atlas image/view/sampler/descriptors/pipeline + its vertex buffer), if any.
+            if let Some(text) = self.text.as_ref() {
+                text.destroy(&self.device);
+            }
             // The quad pipeline + its vertex buffer/memory (device children; freed before the device).
             // The buffer/memory may be null if no frame ever recorded content — destroy_* is a no-op
             // on a null handle, but guard anyway to be explicit.
@@ -1804,6 +3062,125 @@ mod tests {
             assert!(!words.is_empty(), "{name} SPIR-V is empty");
             assert_eq!(words[0], 0x0723_0203, "{name} SPIR-V magic mismatch");
         }
+    }
+
+    #[test]
+    fn device_local_memory_type_prefers_device_local_then_any_in_filter() {
+        let mut props = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            ..Default::default()
+        };
+        props.memory_types[0].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        props.memory_types[1].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        props.memory_types[2].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        // Filter allows 0 and 1 → picks 1 (the device-local one).
+        assert_eq!(find_device_local_memory_type(&props, 0b011), Some(1));
+        // Filter allows only the host-visible type 0 → no device-local; falls back to type 0.
+        assert_eq!(find_device_local_memory_type(&props, 0b001), Some(0));
+        // Filter allows nothing → None.
+        assert_eq!(find_device_local_memory_type(&props, 0b000), None);
+    }
+
+    fn synthetic_atlas() -> GlyphAtlas {
+        // A 2-glyph atlas: 'A' (a 4x4 rect at 0,0) + ' ' (whitespace, advance only). Enough to test
+        // build_text_vertices' positioning + UV math without a font/GPU.
+        let mut glyphs = std::collections::HashMap::new();
+        glyphs.insert(
+            'A',
+            GlyphInfo {
+                ax: 0,
+                ay: 0,
+                aw: 4,
+                ah: 4,
+                bearing_x: 0.0,
+                bearing_y: -4.0,
+                advance: 6.0,
+            },
+        );
+        glyphs.insert(
+            ' ',
+            GlyphInfo {
+                ax: 0,
+                ay: 0,
+                aw: 0,
+                ah: 0,
+                bearing_x: 0.0,
+                bearing_y: 0.0,
+                advance: 5.0,
+            },
+        );
+        GlyphAtlas {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 64],
+            glyphs,
+            ascent: 6.0,
+            line_height: 8.0,
+        }
+    }
+
+    #[test]
+    fn text_vertices_six_per_visible_glyph_skip_whitespace_and_unknown() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let atlas = synthetic_atlas();
+        // "A A" → two visible 'A' glyphs (6 verts each) + one space (advance only) + the gap.
+        let views = [LaidOutView {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 64.0,
+            color: [1.0; 4],
+            text: Some("A A".to_owned()),
+        }];
+        let verts = build_text_vertices(&views, &atlas, extent);
+        assert_eq!(verts.len(), 2 * 6, "two visible glyphs, 6 verts each");
+
+        // A view with only unknown (non-atlas) chars produces no vertices.
+        let only_unknown = [LaidOutView {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 64.0,
+            color: [1.0; 4],
+            text: Some("€£¥".to_owned()),
+        }];
+        assert!(build_text_vertices(&only_unknown, &atlas, extent).is_empty());
+
+        // A view with no text produces no vertices.
+        let no_text = [LaidOutView {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 64.0,
+            color: [1.0; 4],
+            text: None,
+        }];
+        assert!(build_text_vertices(&no_text, &atlas, extent).is_empty());
+    }
+
+    #[test]
+    fn glyph_atlas_builds_from_discovered_font_when_present() {
+        // Environment-dependent: only runs the assertion when a system font is discoverable
+        // (fc-match / font dirs). On a headless box with no fonts it is a no-op (text is best-effort).
+        let Some(path) = discover_font_path() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let Ok(font) = FontVec::try_from_vec(bytes) else {
+            return;
+        };
+        let atlas = build_glyph_atlas(&font, 1024).expect("atlas builds from a real font");
+        assert!(atlas.width > 0 && atlas.height > 0);
+        assert_eq!(atlas.pixels.len(), (atlas.width * atlas.height) as usize);
+        // Printable ASCII letters must be present with a positive advance.
+        let a = atlas.glyphs.get(&'A').expect("'A' in atlas");
+        assert!(a.advance > 0.0);
+        assert!(a.aw > 0 && a.ah > 0, "'A' has a non-empty bitmap");
     }
 
     #[test]
