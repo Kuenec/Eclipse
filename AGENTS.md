@@ -138,9 +138,14 @@ before any history-rewriting/force operation.
   Java** onto the classpath (`api-impl.jar:apk:framework-res.apk`; `FindClass` resolves
   `com.roblox.*` incl. the engine JNI classes — C-probe verified) and then **opens the host
   game window via `winit` (no GTK)** that coexists with the running VM (`eclipse run <apk>` →
-  boots ART + opens the window on Wayland, verified). **Step 3.5 thesis validated end-to-end**:
-  a graphics-free Rust process boots ART with a clean low_4gb window where ATL+GTK4 exhausted it.
-  **Remaining M2/M3:** drive the window's Activity to `onCreate` + render — needs a *framework*
+  boots ART + opens the window on Wayland, verified). Further: the native engine **`libroblox.so`
+  (111 MB) links into Eclipse's ART to the relocation stage** (`dl_parse_library_path` whitelists
+  the lib dir, `System.loadLibrary("roblox")`), revealing the exact native gap — the **framework
+  work-list (deferred Step 4) is now obtained** (`~/eclipse-m0/framework-worklist.txt`: needs
+  `libmediandk.so`/`libOpenMAXAL.so` NDK shims, absent system-wide). **Step 3.5 thesis validated
+  end-to-end**: a graphics-free Rust process boots ART with a clean low_4gb window where ATL+GTK4
+  exhausted it. **Remaining M2/M3:** native NDK shims (so the engine fully loads) + drive the
+  window's Activity to `onCreate` + render — needs a *framework*
   (ATL's `api-impl.jar` is GTK-coupled; Eclipse's own
   **winit + `ash`/EGL** framework is the production path) to drive the Activity +
   `System.loadLibrary`→`libroblox.so`.
@@ -706,6 +711,21 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   thread). Dep added: `winit 0.30` (no GTK — deliberately, to keep low_4gb clear, the Step 3.5
   win). `#![forbid(unsafe_code)]` in `graphics.rs` (winit needs no unsafe). Next: hand the window
   to the framework's Activity/Surface and forward the engine's Vulkan/GL into it.
+- **2026-06-04** — 🎉 **The native engine `libroblox.so` links into Eclipse's ART — framework
+  work-list (deferred Step 4) OBTAINED.** Via a C probe: boot ART + Roblox classpath, extract
+  `lib/x86_64/*.so` to `/tmp/rbxlibs`, **`dl_parse_library_path("/tmp/rbxlibs", ":")`** (the
+  libdl_bio bionic-linker call ATL uses to whitelist the app lib dir — `java.library.path` alone
+  is NOT enough; that was the missing piece), then `System.loadLibrary("roblox")`. Result:
+  `libroblox.so` (111 MB) is **found and links to the relocation stage**, then fails on specific
+  Android NDK natives the host/ATL env lacks: NEEDED `libmediandk.so`, `libOpenMAXAL.so`,
+  `libandroid.so.0`, `libm.so`, and the unresolved symbol `AMediaFormat_delete`. Key facts:
+  `libmediandk.so` + `libOpenMAXAL.so` are **absent system-wide** — ATL implements the `AMedia*`
+  symbols inside its `libandroid.so` (`src/api-impl-jni/.../media.c`), not under the NDK lib name
+  Roblox needs. So loading the engine fully requires the **bionic-loader env + native NDK shims**
+  (component-map: bionic loader = #1 Rust-port priority, "do it last"): whitelist the shim dirs
+  on the bionic path and provide `libmediandk.so`/`libOpenMAXAL.so` (re-export ATL's libandroid
+  symbols). Full list in `~/eclipse-m0/framework-worklist.txt`. This is the concrete next-phase
+  spec and the proof the engine is one native-shim layer away from loading.
 
 ---
 
