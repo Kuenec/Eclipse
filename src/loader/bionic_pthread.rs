@@ -54,8 +54,8 @@
 //! reloc/elf/resolve cores stay `#![forbid(unsafe_code)]`.
 
 use std::cell::RefCell;
-use std::ffi::{c_int, c_long, c_void};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 // =================================================================================================
@@ -104,6 +104,11 @@ const SYS_FUTEX: c_long = 202;
 const FUTEX_WAIT: c_int = 0;
 const FUTEX_WAKE: c_int = 1;
 const FUTEX_PRIVATE_FLAG: c_int = 128;
+/// `SYS_tgkill` on x86-64 — send a signal to a specific (tgid, tid). The kernel primitive behind a
+/// TID-keyed `pthread_kill` (avoids the glibc-`pthread_t` ABI the host export would need). 2026-06-05.
+const SYS_TGKILL: c_long = 234;
+/// `SYS_getpid` on x86-64 — the calling process's thread-group id (the `tgid` for `tgkill`).
+const SYS_GETPID: c_long = 39;
 
 // =================================================================================================
 // Low-level: gettid + futex (the only raw syscalls; everything else is built on these + atomics).
@@ -1177,6 +1182,557 @@ unsafe extern "C" fn eclipse_pthread_exit(_retval: *mut c_void) -> ! {
 }
 
 // =================================================================================================
+// pthread_create / join / detach / attr / setname / kill / sched — Eclipse-owned thread LIFECYCLE.
+// =================================================================================================
+//
+// 2026-06-05 — ROOT CAUSE of the init[~414] SIGSEGV (gdb-proven, docs/libroblox-init-run.md §8):
+// libroblox spawns a worker thread during init (its job system); the worker's entry runs
+// `pthread_setname_np(pthread_self(), name)`. `pthread_self` resolves to the Eclipse shim (returns
+// the kernel TID as the opaque `pthread_t`), but `pthread_create`/`pthread_setname_np` previously
+// fell through to **host glibc**, whose `pthread_setname_np` treats its first arg as a glibc
+// `struct pthread*` and dereferences `arg + 0x2d0`. Passing it a TID → wild deref → SIGSEGV on the
+// worker (the old harness mis-attributed it to whatever main-thread init index was current, hence
+// the run-to-run "drift": the fault address == TID + 0x2d0, and the TID differs each run).
+//
+// FIX (durable, root cause): own the WHOLE thread lifecycle so `pthread_t` is consistently the
+// kernel TID everywhere (matching `pthread_self`/`pthread_equal`/`pthread_gettid_np`). Eclipse spawns
+// the real OS thread via the host `pthread_create` (the glibc handle is Eclipse-private, NEVER given
+// to libroblox) and exposes only the child TID; a TID→handle registry backs join/detach. Every
+// `pthread_t`-consuming import (create/join/detach/setname_np/kill/getschedparam/setschedparam/
+// getattr_np) is now Eclipse-owned and TID-based — closing the mixed-ABI class of bug, not just the
+// one call that crashed first. `pthread_attr_*` own the 56-byte bionic attr (detachstate + stacksize).
+
+/// Whether `ECLIPSE_TRACE_THREADS=1` is set — gates a one-line stderr log of each `pthread_create`
+/// (entry fn, arg) and lifecycle event. Read once (threads-in-init is a rare diagnostic). 2026-06-05.
+fn trace_threads() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ECLIPSE_TRACE_THREADS").is_some_and(|v| v == "1"))
+}
+
+/// The Linux thread-name limit (`TASK_COMM_LEN` = 16 incl. the NUL) — bionic/glibc both truncate to
+/// 15 visible chars. Used by `pthread_setname_np`.
+const TASK_COMM_LEN: usize = 16;
+/// `PR_SET_NAME` — the `prctl(2)` op that sets the *calling* thread's name. 2026-06-05.
+const PR_SET_NAME: c_int = 15;
+/// bionic `PTHREAD_CREATE_JOINABLE` (0) / `PTHREAD_CREATE_DETACHED` (1) — the detach-state values.
+const PTHREAD_CREATE_JOINABLE: c_int = 0;
+const PTHREAD_CREATE_DETACHED: c_int = 1;
+
+/// One spawned thread's join state, keyed by kernel TID in [`THREAD_REGISTRY`]. Holds the
+/// Eclipse-private host (glibc) `pthread_t` so `pthread_join`/`pthread_detach` reach the real thread,
+/// plus the start routine's return value once it finishes.
+struct ThreadEntry {
+    /// The Eclipse-private host `pthread_t` (glibc handle) — NEVER exposed to libroblox.
+    host_handle: libc::pthread_t,
+    /// `true` once `pthread_detach` was called for this thread (join is then invalid).
+    detached: bool,
+}
+
+/// TID → join state for Eclipse-spawned threads. A small `Mutex<Vec>` (thread create/join/detach are
+/// rare relative to the lock/once hot paths). Removed on join (the host handle is consumed there).
+static THREAD_REGISTRY: Mutex<Vec<(i32, ThreadEntry)>> = Mutex::new(Vec::new());
+
+/// The hand-off block the parent boxes and the trampoline consumes: the libroblox start routine + its
+/// arg, plus a futex slot the child publishes its TID into so `pthread_create` can return that TID.
+struct SpawnArgs {
+    start: extern "C" fn(*mut c_void) -> *mut c_void,
+    arg: *mut c_void,
+    /// 0 until the child has published its TID here (then the parent reads it). A futex word.
+    child_tid: AtomicU32,
+}
+
+/// The Eclipse trampoline the host OS thread actually starts on: publish this thread's TID (so the
+/// parent's `pthread_create` can return it as the bionic `pthread_t`), wake the parent, then run
+/// libroblox's `start(arg)` and return its result to the host join machinery.
+///
+/// # Safety
+/// `raw` is the `Box<SpawnArgs>` leaked by [`eclipse_pthread_create`]; this reclaims it.
+extern "C" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
+    // SAFETY: 2026-06-05 — `raw` is exactly the `Box<SpawnArgs>` `eclipse_pthread_create` leaked into
+    // the host `pthread_create`; we own it here and reclaim it once.
+    let boxed = unsafe { Box::from_raw(raw as *mut SpawnArgs) };
+    let tid = gettid();
+    // Publish our TID + wake the parent (it parks on `child_tid == 0`).
+    boxed.child_tid.store(tid as u32, Ordering::Release);
+    futex_wake_u32(&boxed.child_tid, 1);
+    if trace_threads() {
+        trace_line("pthread_create child running tid=", tid as i64);
+    }
+    let start = boxed.start;
+    let arg = boxed.arg;
+    // Run libroblox's start routine. Returning from it ends the host thread normally; the host join
+    // machinery captures the returned pointer for `pthread_join`'s `retval`. We also run this thread's
+    // TLS destructors here (bionic runs key destructors on a normal thread return, not only on an
+    // explicit `pthread_exit`) so a worker that stored TLS values gets them cleaned up.
+    let ret = start(arg);
+    run_thread_key_destructors();
+    ret
+}
+
+/// `futex_wake` for a plain `AtomicU32` (the child-TID hand-off word). Same kernel op as the
+/// `AtomicI32` variant; a separate fn keeps the borrow types clean.
+fn futex_wake_u32(addr: &AtomicU32, count: c_int) {
+    // SAFETY: 2026-06-05 — `addr` is a live `AtomicU32`; `FUTEX_WAKE` only reads the address as a
+    // wait-queue key and wakes waiters, writing nothing through the pointer.
+    unsafe {
+        libc::syscall(
+            SYS_FUTEX,
+            addr.as_ptr(),
+            FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+            count,
+        );
+    }
+}
+
+/// `futex_wait` for a plain `AtomicU32` (block while `*addr == expected`).
+fn futex_wait_u32(addr: &AtomicU32, expected: u32) {
+    // SAFETY: 2026-06-05 — `addr` is a live `AtomicU32`; the kernel reads `*addr`, compares it to
+    // `expected`, and parks. A spurious/early return is re-checked by the caller's loop.
+    unsafe {
+        libc::syscall(
+            SYS_FUTEX,
+            addr.as_ptr(),
+            FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+            expected,
+            std::ptr::null::<c_void>(),
+        );
+    }
+}
+
+/// Async-ish stderr trace line "`label`<n>" for `ECLIPSE_TRACE_THREADS` (uses normal `eprintln!`; the
+/// thread path is not a signal context). 2026-06-05.
+fn trace_line(label: &str, n: i64) {
+    eprintln!("[threads] {label}{n}");
+}
+
+/// `int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*),
+/// void* arg)` — spawn a real OS thread running `start(arg)`. Eclipse owns the lifecycle: the host
+/// (glibc) thread is created with a private handle, and `*thread` is set to the **child's kernel
+/// TID** (the bionic `pthread_t` identity the rest of the shim uses). Honors the attr's detach-state
+/// and stack-size. Returns 0, or an errno on failure.
+///
+/// # Safety
+/// `thread` is null or a writable `pthread_t*`; `attr` is null or a valid 56-byte bionic attr;
+/// `start` is a valid `extern "C"` thread entry; `arg` is opaque.
+unsafe extern "C" fn eclipse_pthread_create(
+    thread: *mut c_void,
+    attr: *const c_void,
+    start: Option<extern "C" fn(*mut c_void) -> *mut c_void>,
+    arg: *mut c_void,
+) -> c_int {
+    let Some(start) = start else {
+        return EINVAL;
+    };
+    if trace_threads() {
+        trace_line("pthread_create entry=", start as usize as i64);
+        trace_line("pthread_create arg=", arg as usize as i64);
+    }
+
+    // Decode the bionic attr (detach-state + stack-size) the engine passed.
+    let (detached, stacksize) = if attr.is_null() {
+        (false, 0usize)
+    } else {
+        // SAFETY: 2026-06-05 — `attr` is a valid bionic `pthread_attr_t`; read the two fields the
+        // Eclipse attr natives wrote (see `ATTR_DETACH`/`ATTR_STACKSIZE`).
+        unsafe {
+            let d = *(attr as *const c_int).add(ATTR_DETACH);
+            let s = *((attr as *const c_int).add(ATTR_STACKSIZE) as *const usize);
+            (d == PTHREAD_CREATE_DETACHED, s)
+        }
+    };
+
+    // Build the host attr (translate stack-size; default otherwise). We always create the host thread
+    // JOINABLE and Eclipse-detach it after if requested, so the registry's TID hand-off is reliable.
+    // SAFETY: 2026-06-05 — `host_attr` is a fresh, owned glibc `pthread_attr_t`; we init it, optionally
+    // set its stack size to the engine's request (clamped to the platform minimum), and destroy it.
+    let mut host_attr: libc::pthread_attr_t = unsafe { std::mem::zeroed() };
+    // SAFETY: 2026-06-05 — `&mut host_attr` is a valid attr; `pthread_attr_init` initializes it.
+    if unsafe { libc::pthread_attr_init(&mut host_attr) } != 0 {
+        return EINVAL;
+    }
+    if stacksize >= libc::PTHREAD_STACK_MIN {
+        // SAFETY: 2026-06-05 — `host_attr` is initialized; the size is ≥ the platform minimum.
+        unsafe { libc::pthread_attr_setstacksize(&mut host_attr, stacksize) };
+    }
+
+    let spawn = Box::new(SpawnArgs {
+        start,
+        arg,
+        child_tid: AtomicU32::new(0),
+    });
+    // A raw pointer the parent keeps to read the published TID; ownership passes to the trampoline.
+    let spawn_ptr = Box::into_raw(spawn);
+    let mut host_handle: libc::pthread_t = 0;
+    // SAFETY: 2026-06-05 — `thread_trampoline` is a valid `extern "C"` entry of exactly the type
+    // `pthread_create` expects; `spawn_ptr` is the leaked `Box<SpawnArgs>` it reclaims.
+    // `host_handle`/`host_attr` are valid out/in params.
+    let rc = unsafe {
+        libc::pthread_create(
+            &mut host_handle,
+            &host_attr,
+            thread_trampoline,
+            spawn_ptr as *mut c_void,
+        )
+    };
+    // SAFETY: 2026-06-05 — destroy the now-consumed host attr (the thread copied it).
+    unsafe { libc::pthread_attr_destroy(&mut host_attr) };
+    if rc != 0 {
+        // Spawn failed: reclaim the leaked SpawnArgs so it does not leak, and report the errno.
+        // SAFETY: 2026-06-05 — the trampoline never ran (create failed), so `spawn_ptr` is still the
+        // sole owner; reclaim it.
+        unsafe { drop(Box::from_raw(spawn_ptr)) };
+        return rc;
+    }
+
+    // Wait for the child to publish its TID (the bionic `pthread_t` we must return). The child stores
+    // its TID and futex-wakes us; loop to tolerate spurious wakes. The `SpawnArgs` is owned by the
+    // child now, but `child_tid` lives until the child reads `start`/`arg` — we only touch it via the
+    // raw pointer until we have the TID, and the child's `Box::from_raw` keeps the storage alive for
+    // the whole trampoline, so this read is valid until at least after the store+wake.
+    // SAFETY: 2026-06-05 — `spawn_ptr` points at the live `SpawnArgs` (the child has not freed it; it
+    // is dropped only when the trampoline's `Box` goes out of scope at thread end, long after the
+    // store+wake). Reading its `child_tid` atomically is sound.
+    let child_tid_ref: &AtomicU32 = unsafe { &(*spawn_ptr).child_tid };
+    let mut tid = child_tid_ref.load(Ordering::Acquire);
+    while tid == 0 {
+        futex_wait_u32(child_tid_ref, 0);
+        tid = child_tid_ref.load(Ordering::Acquire);
+    }
+    let tid = tid as i32;
+
+    // Record the join state (or detach immediately if the engine asked for a detached thread).
+    if detached {
+        // SAFETY: 2026-06-05 — `host_handle` is the just-created joinable thread; detaching it hands
+        // its resources to the runtime (no later join). Eclipse keeps no registry entry for it.
+        unsafe { libc::pthread_detach(host_handle) };
+    } else {
+        let mut reg = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        reg.push((
+            tid,
+            ThreadEntry {
+                host_handle,
+                detached: false,
+            },
+        ));
+    }
+
+    if !thread.is_null() {
+        // SAFETY: 2026-06-05 — `thread` is the caller's `pthread_t*` out-param; write the child TID
+        // (the bionic-`pthread_t` identity consistent with `pthread_self`).
+        unsafe { *(thread as *mut usize) = tid as usize };
+    }
+    0
+}
+
+/// `int pthread_join(pthread_t thread, void** retval)` — wait for `thread` (a kernel TID) to finish;
+/// store its start routine's return in `*retval`. Looks the TID up in the Eclipse registry to reach
+/// the private host handle. Returns 0, `ESRCH`(3) if unknown, or `EINVAL` if it was detached.
+///
+/// # Safety
+/// `retval` is null or a writable `void**`.
+unsafe extern "C" fn eclipse_pthread_join(thread: usize, retval: *mut *mut c_void) -> c_int {
+    let tid = thread as i32;
+    let host_handle = {
+        let mut reg = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        match reg.iter().position(|(t, _)| *t == tid) {
+            Some(i) => {
+                if reg[i].1.detached {
+                    return EINVAL; // joining a detached thread is invalid (the bionic contract).
+                }
+                reg.swap_remove(i).1.host_handle
+            }
+            None => return 3, // ESRCH: no such (Eclipse-tracked) thread.
+        }
+    };
+    if trace_threads() {
+        trace_line("pthread_join tid=", tid as i64);
+    }
+    // SAFETY: 2026-06-05 — `host_handle` is the live, joinable glibc handle for this thread, removed
+    // from the registry so no double-join is possible; `retval` is null-or-writable. `pthread_join`
+    // blocks until the thread ends and stores its return value.
+    unsafe { libc::pthread_join(host_handle, retval) }
+}
+
+/// `int pthread_detach(pthread_t thread)` — mark `thread` (a kernel TID) detached so its resources are
+/// reclaimed on exit (no later join). Returns 0, or `ESRCH`(3) if unknown.
+unsafe extern "C" fn eclipse_pthread_detach(thread: usize) -> c_int {
+    let tid = thread as i32;
+    let host_handle = {
+        let mut reg = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        match reg.iter_mut().find(|(t, _)| *t == tid) {
+            Some((_, entry)) => {
+                if entry.detached {
+                    return 0; // already detached — idempotent.
+                }
+                entry.detached = true;
+                entry.host_handle
+            }
+            None => return 3, // ESRCH
+        }
+    };
+    if trace_threads() {
+        trace_line("pthread_detach tid=", tid as i64);
+    }
+    // SAFETY: 2026-06-05 — `host_handle` is the live glibc handle for this thread; `pthread_detach`
+    // hands its resources to the runtime. We keep the registry entry (marked detached) so a later
+    // erroneous join returns EINVAL rather than touching a freed handle.
+    unsafe { libc::pthread_detach(host_handle) }
+}
+
+/// `int pthread_setname_np(pthread_t thread, const char* name)` — set a thread's name (the call that
+/// crashed init under the host-glibc baseline). TID-based: for the calling thread, `prctl(PR_SET_NAME)`;
+/// for another thread, write `/proc/self/task/<tid>/comm`. Truncates to 15 chars (`TASK_COMM_LEN`-1),
+/// the Linux/bionic limit. Returns 0, or an errno.
+///
+/// # Safety
+/// `name` is null or a valid NUL-terminated C string.
+unsafe extern "C" fn eclipse_pthread_setname_np(thread: usize, name: *const c_char) -> c_int {
+    if name.is_null() {
+        return EINVAL;
+    }
+    // SAFETY: 2026-06-05 — `name` is a valid NUL-terminated C string (the public ABI); read it into a
+    // bounded buffer truncated to TASK_COMM_LEN-1 + NUL (the kernel rejects longer names with ERANGE).
+    let cname = unsafe { std::ffi::CStr::from_ptr(name) };
+    let bytes = cname.to_bytes();
+    let n = bytes.len().min(TASK_COMM_LEN - 1);
+    let mut buf = [0u8; TASK_COMM_LEN];
+    buf[..n].copy_from_slice(&bytes[..n]);
+    // buf[n] stays 0 (NUL terminator).
+
+    let tid = thread as i32;
+    if tid == gettid() {
+        // SAFETY: 2026-06-05 — `prctl(PR_SET_NAME, buf)` sets the calling thread's name from a
+        // NUL-terminated ≤16-byte buffer (`buf` is exactly that). Returns 0 on success.
+        let rc = unsafe { libc::prctl(PR_SET_NAME, buf.as_ptr() as c_ulong, 0, 0, 0) };
+        return if rc == 0 { 0 } else { eclipse_errno_value() };
+    }
+    // Another thread: write /proc/self/task/<tid>/comm (the kernel's per-thread name file).
+    let path = format!("/proc/self/task/{tid}/comm");
+    match std::fs::write(&path, &buf[..n]) {
+        Ok(()) => 0,
+        Err(_) => 3, // ESRCH (the thread is gone / not ours).
+    }
+}
+
+/// `int pthread_kill(pthread_t thread, int sig)` — send `sig` to `thread` (a kernel TID) via
+/// `tgkill(getpid(), tid, sig)`. TID-based, so no glibc `pthread_t` struct is involved. `sig == 0`
+/// is the existence probe (the kernel validates the target without delivering). Returns 0/errno.
+unsafe extern "C" fn eclipse_pthread_kill(thread: usize, sig: c_int) -> c_int {
+    let tid = thread as i64;
+    // SAFETY: 2026-06-05 — `tgkill(2)` takes (tgid, tid, sig) integers and delivers a signal (or, for
+    // sig 0, only checks the target). No pointers are dereferenced.
+    let tgid = unsafe { libc::syscall(SYS_GETPID) };
+    // SAFETY: 2026-06-05 — see above; the three integer args are valid.
+    let rc = unsafe { libc::syscall(SYS_TGKILL, tgid, tid, sig as i64) };
+    if rc == 0 {
+        0
+    } else {
+        eclipse_errno_value()
+    }
+}
+
+/// The calling thread's current `errno` value (positive), for natives that map a failed syscall to
+/// the POSIX `pthread_*` return convention (which returns the errno rather than setting it).
+fn eclipse_errno_value() -> c_int {
+    // SAFETY: 2026-06-05 — `__errno_location()` returns a valid pointer to this thread's `int errno`.
+    unsafe { *libc::__errno_location() }
+}
+
+// ---- pthread_attr_* — the 56-byte bionic attr (detach-state + stack-size the engine sets) --------
+//
+// 2026-06-05: bionic `pthread_attr_t` is an opaque 56-byte struct (`{ uint32_t flags; void* stack_base;
+// size_t stack_size; size_t guard_size; int32_t sched_policy; int32_t sched_priority; ... }`). Eclipse
+// owns it as a run of words and stores only what `pthread_create` reads back: the detach-state and the
+// stack-size, at fixed Eclipse-owned word offsets (the object never reaches glibc — like the mutex).
+
+/// Number of 4-byte words in a bionic `pthread_attr_t` (56 bytes).
+const ATTR_WORDS: usize = 14;
+/// Word index of the detach-state (`PTHREAD_CREATE_JOINABLE`/`DETACHED`) in the Eclipse attr encoding.
+const ATTR_DETACH: usize = 0;
+/// Word index (as a `usize`-aligned pair, i.e. words [2..4)) of the stack size in the Eclipse attr.
+/// Kept 8-byte aligned (word 2) so the `*const usize` read in `pthread_create` is well-aligned.
+const ATTR_STACKSIZE: usize = 2;
+
+/// `int pthread_attr_init(pthread_attr_t*)` — zero the attr (default = joinable, default stack).
+///
+/// # Safety
+/// `a` is null or a valid 56-byte bionic attr.
+unsafe extern "C" fn eclipse_pthread_attr_init(a: *mut c_void) -> c_int {
+    if a.is_null() {
+        return EINVAL;
+    }
+    // SAFETY: 2026-06-05 — `a` is a valid 56-byte attr; zero all 14 words (joinable, no stack request).
+    unsafe {
+        let words = a as *mut c_int;
+        for i in 0..ATTR_WORDS {
+            *words.add(i) = 0;
+        }
+    }
+    0
+}
+
+/// `int pthread_attr_destroy(pthread_attr_t*)` — no owned resources; validate only.
+///
+/// # Safety
+/// `a` is null or a valid bionic attr.
+unsafe extern "C" fn eclipse_pthread_attr_destroy(a: *mut c_void) -> c_int {
+    if a.is_null() {
+        EINVAL
+    } else {
+        0
+    }
+}
+
+/// `int pthread_attr_setdetachstate(pthread_attr_t*, int state)` — record JOINABLE/DETACHED.
+///
+/// # Safety
+/// `a` is null or a valid bionic attr.
+unsafe extern "C" fn eclipse_pthread_attr_setdetachstate(a: *mut c_void, state: c_int) -> c_int {
+    if a.is_null() {
+        return EINVAL;
+    }
+    if state != PTHREAD_CREATE_JOINABLE && state != PTHREAD_CREATE_DETACHED {
+        return EINVAL;
+    }
+    // SAFETY: 2026-06-05 — `a` valid; store the validated detach-state at the Eclipse-owned word.
+    unsafe { *(a as *mut c_int).add(ATTR_DETACH) = state };
+    0
+}
+
+/// `int pthread_attr_setstacksize(pthread_attr_t*, size_t size)` — record the requested stack size.
+///
+/// # Safety
+/// `a` is null or a valid bionic attr.
+unsafe extern "C" fn eclipse_pthread_attr_setstacksize(a: *mut c_void, size: usize) -> c_int {
+    if a.is_null() {
+        return EINVAL;
+    }
+    // SAFETY: 2026-06-05 — `a` valid; store the size at the 8-byte-aligned Eclipse stack-size slot.
+    unsafe { *((a as *mut c_int).add(ATTR_STACKSIZE) as *mut usize) = size };
+    0
+}
+
+/// `int pthread_attr_setschedparam(pthread_attr_t*, const sched_param*)` — accepted and ignored by
+/// Eclipse's scheduler model (the host scheduler governs the real thread). Validates non-null.
+///
+/// # Safety
+/// `a`/`param` are null or valid.
+unsafe extern "C" fn eclipse_pthread_attr_setschedparam(
+    a: *mut c_void,
+    _param: *const c_void,
+) -> c_int {
+    if a.is_null() {
+        EINVAL
+    } else {
+        0
+    }
+}
+
+/// `int pthread_attr_getstack(const pthread_attr_t*, void** base, size_t* size)` — report the stack.
+/// Eclipse does not pre-allocate the stack (the host runtime owns it), so it returns base=NULL and the
+/// recorded size (or 0). Callers use this only informationally during init.
+///
+/// # Safety
+/// `a` is null or a valid attr; `base`/`size` are null or writable out-params.
+unsafe extern "C" fn eclipse_pthread_attr_getstack(
+    a: *const c_void,
+    base: *mut *mut c_void,
+    size: *mut usize,
+) -> c_int {
+    if a.is_null() {
+        return EINVAL;
+    }
+    // SAFETY: 2026-06-05 — `a` is a valid attr; read the recorded stack size. `base`/`size` are
+    // null-or-writable out-params; we report base=NULL (host-owned stack) + the recorded size.
+    unsafe {
+        let recorded = *((a as *const c_int).add(ATTR_STACKSIZE) as *const usize);
+        if !base.is_null() {
+            *base = std::ptr::null_mut();
+        }
+        if !size.is_null() {
+            *size = recorded;
+        }
+    }
+    0
+}
+
+/// `int pthread_getattr_np(pthread_t, pthread_attr_t* attr)` — fill `attr` with the thread's
+/// attributes. Eclipse returns a default (joinable, default stack) initialized attr; the engine uses
+/// this informationally. Returns 0/EINVAL.
+///
+/// # Safety
+/// `attr` is null or a valid 56-byte bionic attr.
+unsafe extern "C" fn eclipse_pthread_getattr_np(_thread: usize, attr: *mut c_void) -> c_int {
+    if attr.is_null() {
+        return EINVAL;
+    }
+    // SAFETY: 2026-06-05 — initialize `attr` to the joinable/default state (same as attr_init).
+    unsafe { eclipse_pthread_attr_init(attr) }
+}
+
+/// `int pthread_getschedparam(pthread_t, int* policy, sched_param* param)` — report the thread's
+/// scheduling policy/priority via the TID-based `sched_getscheduler`/`sched_getparam`. Returns 0/errno.
+///
+/// # Safety
+/// `policy`/`param` are null or writable out-params (the `sched_param`'s first int is the priority).
+unsafe extern "C" fn eclipse_pthread_getschedparam(
+    thread: usize,
+    policy: *mut c_int,
+    param: *mut c_int,
+) -> c_int {
+    let tid = thread as c_int;
+    // SAFETY: 2026-06-05 — `sched_getscheduler(tid)` returns the policy (or -1/errno); `policy` is
+    // null-or-writable.
+    let pol = unsafe { libc::sched_getscheduler(tid) };
+    if pol < 0 {
+        return eclipse_errno_value();
+    }
+    if !policy.is_null() {
+        // SAFETY: 2026-06-05 — `policy` is a writable `int*` out-param.
+        unsafe { *policy = pol };
+    }
+    if !param.is_null() {
+        // SAFETY: 2026-06-05 — `param` points to a `sched_param` whose first field is `sched_priority`
+        // (an int); `sched_getparam` fills it for `tid`.
+        let mut sp: libc::sched_param = unsafe { std::mem::zeroed() };
+        // SAFETY: 2026-06-05 — `&mut sp` is a valid `sched_param`; `sched_getparam(tid, &sp)` fills it.
+        if unsafe { libc::sched_getparam(tid, &mut sp) } == 0 {
+            // SAFETY: 2026-06-05 — write the priority into the caller's `sched_param`'s first int.
+            unsafe { *param = sp.sched_priority };
+        }
+    }
+    0
+}
+
+/// `int pthread_setschedparam(pthread_t, int policy, const sched_param* param)` — set the thread's
+/// scheduling policy/priority via the TID-based `sched_setscheduler`. A permission failure (`EPERM`,
+/// common for real-time policies as a normal user) is reported, never fatal. Returns 0/errno.
+///
+/// # Safety
+/// `param` is null or a valid `sched_param` (first int = priority).
+unsafe extern "C" fn eclipse_pthread_setschedparam(
+    thread: usize,
+    policy: c_int,
+    param: *const c_int,
+) -> c_int {
+    let tid = thread as c_int;
+    let mut sp: libc::sched_param = unsafe { std::mem::zeroed() };
+    if !param.is_null() {
+        // SAFETY: 2026-06-05 — `param`'s first int is the requested priority.
+        sp.sched_priority = unsafe { *param };
+    }
+    // SAFETY: 2026-06-05 — `sched_setscheduler(tid, policy, &sp)` sets the TID's policy/priority; a
+    // failure returns -1 and sets errno (we surface it as the POSIX `pthread_*` return value).
+    let rc = unsafe { libc::sched_setscheduler(tid, policy, &sp) };
+    if rc == 0 {
+        0
+    } else {
+        eclipse_errno_value()
+    }
+}
+
+// =================================================================================================
 // syscall(2) — the init path calls syscall() directly (for SYS_gettid). Forward to the real kernel.
 // =================================================================================================
 
@@ -1199,11 +1755,13 @@ extern "C" {
 
 /// The number of pthread/TLS/sem/syscall natives this shim registers — the stateful threading
 /// primitives the init path needs. Breakdown: mutex 5, mutexattr 3, cond 6, condattr 3, rwlock 5,
-/// once 1, TLS keys 4, identity/lifecycle 5, sem 4, syscall 1 = **37**. The remaining `pthread_*`
-/// category imports (thread create/join/detach, `pthread_attr_*`, scheduling, signals,
-/// `__cxa_thread_atexit_impl`) stay on the host baseline until Eclipse owns thread creation; they
-/// are not exercised by the init path (see `docs/libroblox-init-run.md` for the deferral).
-pub const PTHREAD_NATIVE_COUNT: usize = 37;
+/// once 1, TLS keys 4, identity/lifecycle 5, sem 4, syscall 1 = 37, **plus** the thread LIFECYCLE
+/// (2026-06-05): create/join/detach 3, setname_np 1, kill 1, getattr_np 1, get/setschedparam 2,
+/// attr_* 6 = 14 → **51**. The lifecycle is now Eclipse-owned (TID-based `pthread_t`) because the init
+/// path DOES spawn threads, and the mixed Eclipse-`pthread_self`/host-glibc-`pthread_setname_np` ABI
+/// crashed the worker (gdb-proven, `docs/libroblox-init-run.md` §8). `pthread_sigmask` (sigset-only,
+/// no `pthread_t`) and `__cxa_thread_atexit_impl` stay on the host baseline (ABI-identical).
+pub const PTHREAD_NATIVE_COUNT: usize = 51;
 
 /// Append every Eclipse-owned bionic pthread/TLS/sem/syscall native to `register` as
 /// `(name, address)` pairs. Called by [`super::native_provider::EclipseNativeProvider`] so the
@@ -1271,6 +1829,32 @@ pub fn register_natives(mut register: impl FnMut(&'static str, u64)) {
     reg!("pthread_gettid_np", eclipse_pthread_gettid_np);
     reg!("pthread_exit", eclipse_pthread_exit);
     reg!("gettid", eclipse_gettid);
+
+    // ---- thread lifecycle (14) — Eclipse-owned, TID-based pthread_t (2026-06-05 init[~414] fix) ----
+    // create/join/detach 3, setname_np 1, kill 1, getattr_np 1, get/setschedparam 2, attr_* 6.
+    reg!("pthread_create", eclipse_pthread_create);
+    reg!("pthread_join", eclipse_pthread_join);
+    reg!("pthread_detach", eclipse_pthread_detach);
+    reg!("pthread_setname_np", eclipse_pthread_setname_np);
+    reg!("pthread_kill", eclipse_pthread_kill);
+    reg!("pthread_getattr_np", eclipse_pthread_getattr_np);
+    reg!("pthread_getschedparam", eclipse_pthread_getschedparam);
+    reg!("pthread_setschedparam", eclipse_pthread_setschedparam);
+    reg!("pthread_attr_init", eclipse_pthread_attr_init);
+    reg!("pthread_attr_destroy", eclipse_pthread_attr_destroy);
+    reg!(
+        "pthread_attr_setdetachstate",
+        eclipse_pthread_attr_setdetachstate
+    );
+    reg!(
+        "pthread_attr_setstacksize",
+        eclipse_pthread_attr_setstacksize
+    );
+    reg!(
+        "pthread_attr_setschedparam",
+        eclipse_pthread_attr_setschedparam
+    );
+    reg!("pthread_attr_getstack", eclipse_pthread_attr_getstack);
 
     // ---- sem (4) ----
     reg!("sem_init", eclipse_sem_init);
@@ -1735,6 +2319,164 @@ mod tests {
             assert_eq!(eclipse_pthread_once(n, None), EINVAL);
             assert_eq!(eclipse_sem_wait(n), EINVAL);
             assert_eq!(eclipse_pthread_key_create(n, None), EINVAL);
+        }
+    }
+
+    // ---- thread lifecycle: create runs the entry on a real thread; join returns its result --------
+
+    #[test]
+    fn create_runs_entry_on_real_thread_and_join_returns_its_result() {
+        use std::sync::atomic::{AtomicI32 as A32, Ordering as O};
+
+        // The start routine records the TID it actually ran on (a fresh OS thread → != the test
+        // thread's TID) and returns a sentinel pointer the join must hand back verbatim.
+        static RAN_TID: A32 = A32::new(0);
+        RAN_TID.store(0, O::SeqCst);
+        extern "C" fn start(arg: *mut c_void) -> *mut c_void {
+            RAN_TID.store(gettid(), O::SeqCst);
+            // Echo the arg back + 1 so the test proves the arg reached the entry and the result
+            // round-trips through join.
+            (arg as usize + 1) as *mut c_void
+        }
+
+        let mut tid: usize = 0;
+        let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+        // SAFETY: `tp` is a valid `pthread_t*` out-param; `start` is a valid entry; arg is opaque.
+        let rc = unsafe {
+            eclipse_pthread_create(tp, std::ptr::null(), Some(start), 0x41 as *mut c_void)
+        };
+        assert_eq!(rc, 0, "pthread_create succeeds");
+        assert!(tid != 0, "create wrote a non-zero TID as the pthread_t");
+        assert_ne!(
+            tid as i32,
+            gettid(),
+            "the entry ran on a DIFFERENT (spawned) OS thread, not the caller"
+        );
+
+        let mut retval: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `tid` is the just-created joinable thread; `&mut retval` is a writable out-param.
+        let jrc = unsafe { eclipse_pthread_join(tid, &mut retval) };
+        assert_eq!(jrc, 0, "join succeeds");
+        assert_eq!(
+            retval as usize, 0x42,
+            "join returns the entry's result (arg+1)"
+        );
+        assert_eq!(
+            RAN_TID.load(O::SeqCst),
+            tid as i32,
+            "pthread_self() inside the thread == the pthread_t create returned (TID identity)"
+        );
+
+        // Joining a now-finished/removed thread reports ESRCH (3), never UB.
+        // SAFETY: `tid` is no longer tracked (join consumed it).
+        let again = unsafe { eclipse_pthread_join(tid, std::ptr::null_mut()) };
+        assert_eq!(again, 3, "re-join of a consumed thread → ESRCH");
+    }
+
+    #[test]
+    fn create_detached_is_not_joinable_and_runs() {
+        use std::sync::atomic::{AtomicBool as AB, Ordering as O};
+        static RAN: AB = AB::new(false);
+        RAN.store(false, O::SeqCst);
+        extern "C" fn start(_a: *mut c_void) -> *mut c_void {
+            RAN.store(true, O::SeqCst);
+            std::ptr::null_mut()
+        }
+
+        // A DETACHED attr.
+        let mut attr = [0i32; ATTR_WORDS];
+        let ap = attr.as_mut_ptr() as *mut c_void;
+        // SAFETY: `ap` is a valid 56-byte attr; set DETACHED.
+        unsafe {
+            assert_eq!(eclipse_pthread_attr_init(ap), 0);
+            assert_eq!(
+                eclipse_pthread_attr_setdetachstate(ap, PTHREAD_CREATE_DETACHED),
+                0
+            );
+        }
+        let mut tid: usize = 0;
+        let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+        // SAFETY: valid out-param + attr + entry.
+        let rc = unsafe {
+            eclipse_pthread_create(tp, ap as *const c_void, Some(start), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "detached create succeeds");
+        // A detached thread keeps no registry entry → join reports ESRCH (3), not 0.
+        // SAFETY: `tid` is a detached thread (untracked).
+        let jrc = unsafe { eclipse_pthread_join(tid, std::ptr::null_mut()) };
+        assert_eq!(jrc, 3, "a detached thread is not joinable → ESRCH");
+        // Give the detached thread a moment to run, then confirm it executed.
+        for _ in 0..1000 {
+            if RAN.load(O::SeqCst) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(RAN.load(O::SeqCst), "the detached thread ran its entry");
+        // SAFETY: destroy the attr (no owned resources).
+        unsafe { assert_eq!(eclipse_pthread_attr_destroy(ap), 0) };
+    }
+
+    #[test]
+    fn setname_np_on_self_succeeds_and_is_truncated() {
+        // Setting the CALLING thread's name via prctl must succeed (0) for a normal and an
+        // over-length name (truncated to TASK_COMM_LEN-1, never ERANGE).
+        let me = gettid() as usize;
+        let short = c"ecl-test";
+        let long = c"this-name-is-way-too-long-for-comm";
+        // SAFETY: both are valid NUL-terminated C strings; `me` is this thread's TID.
+        unsafe {
+            assert_eq!(eclipse_pthread_setname_np(me, short.as_ptr()), 0);
+            assert_eq!(
+                eclipse_pthread_setname_np(me, long.as_ptr()),
+                0,
+                "an over-length name is truncated, not rejected"
+            );
+            // A null name is EINVAL, never a crash.
+            assert_eq!(eclipse_pthread_setname_np(me, std::ptr::null()), EINVAL);
+        }
+    }
+
+    #[test]
+    fn attr_records_detachstate_and_stacksize() {
+        let mut attr = [0i32; ATTR_WORDS];
+        let ap = attr.as_mut_ptr() as *mut c_void;
+        // SAFETY: `ap` is a valid 56-byte attr; exercise the setters/getters.
+        unsafe {
+            assert_eq!(eclipse_pthread_attr_init(ap), 0);
+            // Default detach-state is JOINABLE (0) after init.
+            assert_eq!(
+                *(ap as *const c_int).add(ATTR_DETACH),
+                PTHREAD_CREATE_JOINABLE
+            );
+            // setstacksize records the value at the 8-byte-aligned slot; getstack reads it back.
+            assert_eq!(eclipse_pthread_attr_setstacksize(ap, 0x40000), 0);
+            // A non-null sentinel so the test proves getstack OVERWRITES it to NULL.
+            let mut base: *mut c_void = std::ptr::without_provenance_mut(0x1);
+            let mut size: usize = 0;
+            assert_eq!(eclipse_pthread_attr_getstack(ap, &mut base, &mut size), 0);
+            assert!(base.is_null(), "host-owned stack → base reported NULL");
+            assert_eq!(size, 0x40000, "getstack reports the recorded stack size");
+            // An invalid detach-state is rejected.
+            assert_eq!(eclipse_pthread_attr_setdetachstate(ap, 99), EINVAL);
+            assert_eq!(eclipse_pthread_attr_destroy(ap), 0);
+        }
+    }
+
+    #[test]
+    fn kill_signal_zero_probes_a_live_thread() {
+        // `pthread_kill(self, 0)` is the existence probe: the calling thread is alive → 0, never a
+        // delivered signal, never UB. A bogus TID → ESRCH(3) (the kernel rejects the unknown target).
+        let me = gettid() as usize;
+        // SAFETY: TID-based tgkill with sig 0 only checks the target.
+        unsafe {
+            assert_eq!(eclipse_pthread_kill(me, 0), 0, "self is alive");
+            // A TID that is not in our thread group → ESRCH.
+            assert_eq!(
+                eclipse_pthread_kill(0x7fff_fffe, 0),
+                3,
+                "unknown TID → ESRCH"
+            );
         }
     }
 }

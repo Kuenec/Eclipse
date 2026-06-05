@@ -583,9 +583,33 @@ before any history-rewriting/force operation.
   safeguard NOT tripped (clean-room from the public bionic `_SC_*`/`AT_*`/`getcpu`/`sysinfo` C-ABI +
   Linux syscalls + Eclipse's own src/loader; no apkenv/bionic/NDK/linker source read; libroblox parsed
   as data + executed by OUR loader). Full analysis: [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md)
-  §7. **Engine-load frontier: the allocator bootstraps; NEXT = the static-global-pointer dependency at
-  `init[~426]` (the deref of `0x6a5a4a0`) — instrument which prior ctor/data-reloc populates it.**
-  See §6 (2026-06-05 bionic sysconf system-query tier).
+  §7. See §6 (2026-06-05 bionic sysconf system-query tier).
+- **2026-06-05 UPDATE — INIT-ARRAY COMPLETE: 3427/3427 constructors run, EXIT=0, DETERMINISTIC.** The
+  `init[~426]` SIGSEGV was NOT a "global `0x6a5a4a0`" deref — gdb (ASLR off) + `ECLIPSE_TRACE_THREADS=1`
+  proved it was a **WORKER THREAD** crash: libroblox spawns one thread during init (its job system,
+  later named **"RBX Worker A"**); the worker ran `pthread_setname_np(pthread_self(), name)`. ROOT CAUSE
+  = a **mixed `pthread_t` ABI**: `pthread_self`/`equal`/`gettid_np` were Eclipse (return the kernel
+  **TID**), but `pthread_create`/`setname_np`/join/detach/kill/sched/attr_* fell through to **host
+  glibc** (`pthread_t` = `struct pthread*`), so glibc `setname_np` dereferenced the TID as a struct →
+  fault at `TID+0x2d0` (the "drift" = the TID differs each run). FIX (`src/loader/bionic_pthread.rs`):
+  Eclipse now OWNS the whole thread lifecycle, TID-based (`PTHREAD_NATIVE_COUNT` 37 → **51**, +14):
+  `pthread_create` (real OS thread via a private glibc handle never exposed; trampoline publishes its
+  TID + runs `start(arg)`; honors the bionic attr's detach-state/stack-size), join/detach (TID→handle
+  registry), `setname_np` (TID: `prctl(PR_SET_NAME)`/`/proc/self/task/<tid>/comm`), `kill`
+  (`tgkill`), getattr_np, get/setschedparam (TID `sched_*`), attr_* (6). With the worker fixed, init
+  ran 3427/3427, exposing two **process-exit** harness artifacts (NOT init bugs, both gdb-proven):
+  `drop(set)` `munmap`ped libroblox under the live worker, and `exit()` ran libroblox's C++ finalizers
+  that `fflush` an engine `FILE*` via the host-stdio-pointer `__sF` table → bad deref. FIX
+  (`src/loader/init_run.rs`): once all ctors complete (the diagnostic's job), `_exit(0)` immediately —
+  no unmap, no destructors, no teardown of live workers (the OS reclaims all). 5 new GPU/VM-free unit
+  tests (create runs the entry on a real thread + join returns its result + TID identity; detached;
+  setname self/truncate; attr detach/stacksize; kill sig-0 probe). Gate now **373 unit + 2 doctests**
+  (fmt/build/clippy `-D warnings`/test/release all clean). Cyber-safeguard NOT tripped (clean-room from
+  the public bionic pthread C-ABI + Linux `futex`/`tgkill`/`prctl`/`clone` syscalls + gdb/objdump on
+  the mapped image; no apkenv/bionic/NDK/linker source read). **Engine-load frontier: init-array is
+  DONE; NEXT = post-init engine bring-up — drive the worker/job system + the engine's real entry
+  (`JNI_OnLoad`/the Activity-native path), NOT init.** Full analysis:
+  [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md) §8. See §6 (2026-06-05 thread-lifecycle).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3534,6 +3558,43 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   doctests**) / release — all 0-warning/0-error (harness compiles clean; the init[~426] SEGV is runtime). **NEXT =
   the static-global-pointer dependency at `init[~426]` (the deref of `0x6a5a4a0`) — instrument which prior ctor /
   data-reloc should populate it.**
+- **2026-06-05** — 🟢 **ENGINE-LOAD: INIT-ARRAY COMPLETE — 3427/3427 constructors run, EXIT=0, DETERMINISTIC.**
+  (2026-06-05 thread-lifecycle.) §7's "`init[~426]` reads uninitialized global `0x6a5a4a0`" was WRONG. gdb (ASLR
+  off) + `ECLIPSE_TRACE_THREADS=1` PROVED the real init[~414] crash was on a **spawned WORKER THREAD**: libroblox
+  spawns ONE thread during init (its job system, later named **"RBX Worker A"** via `pthread_setname_np`); the
+  worker's entry runs `pthread_setname_np(pthread_self(), name)`. **ROOT CAUSE = a mixed `pthread_t` ABI:**
+  `pthread_self`/`equal`/`gettid_np` resolved to the **Eclipse shim** (return the kernel **TID** as the opaque
+  bionic `pthread_t`), but `pthread_create`/`setname_np` + the whole lifecycle family fell through to **host glibc**
+  (`pthread_t` = `struct pthread*`). The worker passed the Eclipse TID to glibc `setname_np`, which dereferenced it
+  as a struct at `TID+0x2d0` → SIGSEGV; the "414↔426 drift" = the TID-derived fault address differing each run, and
+  the old signal handler mis-attributed a worker crash to whatever main-thread init index was current. **FIX**
+  (`src/loader/bionic_pthread.rs`): Eclipse now OWNS the whole thread lifecycle, TID-based (`PTHREAD_NATIVE_COUNT`
+  37 → **51**, +14 natives): `pthread_create` (spawns a real OS thread via a PRIVATE glibc handle never exposed; an
+  Eclipse trampoline publishes its TID to the parent + runs libroblox's `start(arg)`; honors the bionic attr's
+  detach-state + stack-size), `pthread_join`/`detach` (a TID→handle registry), `pthread_setname_np` (TID-based:
+  `prctl(PR_SET_NAME)` for self, `/proc/self/task/<tid>/comm` for others, truncated to `TASK_COMM_LEN-1`),
+  `pthread_kill` (`tgkill(getpid(),tid,sig)`), `pthread_getattr_np`, `pthread_get/setschedparam` (TID `sched_*`),
+  `pthread_attr_init/destroy/setdetachstate/setstacksize/setschedparam/getstack`. (`pthread_sigmask` — sigset-only,
+  no `pthread_t` — and `__cxa_thread_atexit_impl` stay host-baseline, ABI-identical.) With the worker fixed, init
+  ran **3427/3427**, exposing two **process-EXIT** harness artifacts (NOT init bugs, both gdb-proven): (1) the
+  success path `drop(set)` `munmap`ped libroblox under the live worker → worker faulted on freed text; (2) returning
+  through `main` let glibc `exit()` run libroblox's C++ static destructors / `atexit` finalizers, one of which
+  `fflush`es an engine `FILE*` taken as `&__sF[i]` — Eclipse's `__sF` is a host-stdio POINTER table, so the slot
+  address derefs as a bad glibc `FILE*` → fault on the main thread at exit. **FIX** (`src/loader/init_run.rs`): once
+  ALL ctors complete (the diagnostic's defined job — init, not shutdown), `_exit(0)` IMMEDIATELY (async-signal-safe;
+  no unmap, no destructors/finalizers, no teardown of live workers; the OS reclaims everything). **RE-RUN RESULT
+  (dev host, 9/9 runs): `ALL 3427/3427 constructors completed without a crash`, EXIT=0, deterministic** (drift gone;
+  the engine even spawns + names "RBX Worker A" that keeps running). *Regression:* 5 new GPU/VM-free unit tests
+  (`cargo test loader::bionic_pthread`, 16 total): create runs the entry on a DIFFERENT OS thread + join returns its
+  result + `pthread_self()` inside == the returned `pthread_t` + re-join → ESRCH; detached-not-joinable; setname
+  self/truncate; attr detach/stacksize; kill sig-0 probe. The `native_provider` count test tracks
+  `PTHREAD_NATIVE_COUNT` (now 51). *Cyber-safeguard: NOT tripped* — clean-room from the PUBLIC bionic pthread C-ABI +
+  Linux `futex`/`tgkill`/`prctl`/`clone` syscalls + gdb/objdump on the mapped image; no apkenv/bionic/NDK/linker
+  source read; libroblox parsed as data + executed by OUR loader. Files: `src/loader/bionic_pthread.rs` (+14 natives,
+  registry, trace, 5 tests), `src/loader/init_run.rs` (success-path `_exit`), `src/loader/native_provider.rs` (count
+  comment), `AGENTS.md` §5/§6, `docs/libroblox-init-run.md` (§8). **Gate:** fmt --all --check / build --all-targets /
+  clippy (-D warnings) / test (**373 unit + 2 doctests**) / release — all 0-warning/0-error. **NEXT = post-init engine
+  bring-up: drive the worker/job system + the engine's real entry (`JNI_OnLoad`/the Activity-native path), NOT init.**
 
 ---
 

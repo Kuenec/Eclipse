@@ -303,3 +303,79 @@ not yet applied in this isolated harness). NEXT = instrument init[~426]'s read o
 prior constructor writes it, and whether it is a GOT/data slot the harness should have relocated) and
 satisfy that dependency. The system-query tier stays — it is required and correct; it advanced init
 from 1 to 400+ constructors.
+
+---
+
+## 8. ROOT CAUSE FOUND + FIXED: a WORKER THREAD + mixed pthread_t ABI — init now runs 3427/3427 (2026-06-05)
+
+§7's "next frontier" hypothesis (a ctor reading uninitialized global `0x6a5a4a0`) was **wrong**, and
+gdb proved it. The real init[~414] crash was on a **spawned worker thread**, not the init-array.
+
+### The trace + gdb evidence (ASLR off, `ECLIPSE_TRACE_THREADS=1`)
+- **libroblox spawns ONE thread during init** (its job system): `pthread_create` fires once; the
+  child is later named **"RBX Worker A"** via `pthread_setname_np`.
+- The SIGSEGV is on **Thread 2 (the worker)**, in **host glibc `pthread_setname_np`** at
+  `mov 0x2d0(%r12),%r8d`, with `%r12` = a small value == the worker's **kernel TID** (e.g. `0x97b80`
+  = 621440 = the LWP). The faulting address = `TID + 0x2d0`, which **drifts run-to-run because the
+  TID differs** — that is the "414 vs 426 drift", not ctor ordering.
+- The worker's libroblox entry does exactly: `call pthread_self@plt; mov %rax,%rdi; mov name,%rsi;
+  call pthread_setname_np@plt` — i.e. `pthread_setname_np(pthread_self(), name)`.
+
+### Root cause: a MIXED pthread_t ABI (Eclipse identity vs host-glibc struct)
+`pthread_self`/`pthread_equal`/`pthread_gettid_np` resolved to the **Eclipse shim** (which returns the
+**kernel TID** as the opaque bionic `pthread_t`), but `pthread_create`/`pthread_setname_np` (and the
+whole thread-lifecycle family: join/detach/kill/getschedparam/setschedparam/getattr_np/attr_*) fell
+through to **host glibc**, whose `pthread_t` is a `struct pthread*`. The worker passed the Eclipse
+`pthread_self()` (a TID) to glibc `pthread_setname_np`, which dereferenced it as a struct → fault. The
+old §3 "init[1] aborted in a pthread-TLS guard" and §7's "global `0x6a5a4a0`" were the signal handler
+mis-attributing a **worker** crash to whatever **main-thread** init index was current at the time
+(`CURRENT_INIT_INDEX`), and a coincidental disassembly of a *different* ctor at that index.
+
+### The fix (`src/loader/bionic_pthread.rs`) — own the WHOLE thread lifecycle, TID-based
+14 new Eclipse-owned natives so `pthread_t` is **consistently the kernel TID** everywhere
+(`PTHREAD_NATIVE_COUNT` 37 → 51): `pthread_create` (spawns a real OS thread via a private glibc
+handle — NEVER exposed — running an Eclipse trampoline that publishes its TID to the parent and runs
+libroblox's `start(arg)`; honors the bionic attr's detach-state + stack-size), `pthread_join`/
+`pthread_detach` (TID→handle registry), `pthread_setname_np` (TID-based: `prctl(PR_SET_NAME)` for self,
+`/proc/self/task/<tid>/comm` for others — truncated to `TASK_COMM_LEN-1`), `pthread_kill`
+(`tgkill(getpid(),tid,sig)`), `pthread_getattr_np`, `pthread_get/setschedparam` (TID-based `sched_*`),
+and `pthread_attr_init/destroy/setdetachstate/setstacksize/setschedparam/getstack`. `pthread_sigmask`
+(sigset-only, no `pthread_t`) + `__cxa_thread_atexit_impl` stay on the host baseline (ABI-identical).
+
+### Two follow-on harness-teardown faults (also gdb-proven, fixed in `src/loader/init_run.rs`)
+With the worker no longer crashing, the init-array ran to **3427/3427**, exposing two **process-exit**
+artifacts (NOT init failures — the harness's job was already done):
+1. **Unmap-under-live-worker:** the success path `drop(set)` `munmap`ped libroblox while "RBX Worker A"
+   was still executing its text → the worker faulted on freed text (gdb: its PC landed in the
+   now-unmapped `[base,base+size)`).
+2. **Exit-time finalizer + `__sF` layout:** returning through `main` let glibc `exit()` run libroblox's
+   C++ static destructors / `atexit` finalizers, one of which `fflush`es an engine `FILE*` taken as
+   `&__sF[i]`; Eclipse's `__sF` is a host-stdio **pointer** table, so the slot address derefs as a
+   bad glibc `FILE*` → fault on the **main thread** at exit.
+   Fix: once **all** constructors complete, the diagnostic's defined job is done, so it `_exit(0)`s
+   **immediately** (async-signal-safe; no unmap, no destructors/finalizers, no teardown of live
+   workers; the OS reclaims everything). Init — not shutdown — is this harness's scope.
+
+### THE RE-RUN RESULT (real, dev host, 2026-06-05) — DETERMINISTIC
+```
+init[0/3427]      COMPLETED
+…
+init[3426/3427]   COMPLETED
+ALL 3427/3427 constructors completed without a crash
+EXIT=0
+```
+**Constructors completed: ~414 → 3427/3427 (ALL), EXIT=0, across 9/9 runs.** The run-to-run drift is
+**gone** (it was the worker's TID-derived fault address). libroblox's entire `DT_INIT_ARRAY` now
+executes under Eclipse's loader; the engine even spawns + names a background worker ("RBX Worker A")
+that keeps running. The init phase is **complete**; the next frontier is **post-init engine bring-up**
+(driving the worker/job system + the engine's real entry, the `JNI_OnLoad`/Activity path), not init.
+
+### Regression protection (this step)
+5 new GPU/VM-free unit tests in `src/loader/bionic_pthread.rs` (16 total;
+`cargo test loader::bionic_pthread`): `create_runs_entry_on_real_thread_and_join_returns_its_result`
+(the entry runs on a DIFFERENT OS thread; `pthread_self()` inside == the returned `pthread_t`; join
+returns the entry's result; a re-join → ESRCH), `create_detached_is_not_joinable_and_runs`,
+`setname_np_on_self_succeeds_and_is_truncated`, `attr_records_detachstate_and_stacksize`,
+`kill_signal_zero_probes_a_live_thread`. The `native_provider` registration-count test tracks
+`PTHREAD_NATIVE_COUNT` (now 51). The harness re-run (3427/3427, EXIT=0) is the integration evidence — a
+diagnostic, not a `#[test]` assertion.
