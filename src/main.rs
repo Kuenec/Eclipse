@@ -54,6 +54,20 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Hidden dev-host diagnostic (NOT in HELP): map+relocate+fully-resolve libroblox.so and run
+        // its DT_INIT_ARRAY constructors in order on this (main) thread. A crash is the EXPECTED,
+        // VALUABLE result (host-glibc libc baseline is not bionic-ABI-correct); the harness's own
+        // signal handler logs the faulting constructor + exits non-zero. See src/loader/init_run.rs.
+        Some("__run-libroblox-init") => match eclipse::loader::init_run::run_libroblox_init() {
+            Ok(completed) => {
+                println!("__run-libroblox-init: {completed} constructor(s) completed");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("__run-libroblox-init: {e}");
+                ExitCode::FAILURE
+            }
+        },
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{HELP}");
             ExitCode::SUCCESS
