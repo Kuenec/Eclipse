@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -64,16 +65,33 @@ impl fmt::Display for ThemeRegistryError {
 
 impl std::error::Error for ThemeRegistryError {}
 
+/// One resolved theme attribute value: the `Res_value` type + data a theme attribute is set to.
+///
+/// 2026-06-05: a theme is, after style + parent-chain merge, a map of attribute resource id →
+/// this value. `obtainStyledAttributes(int[])` (the no-parser path) looks each requested attr id up
+/// here. `type_` is the `Res_value.dataType` (== `TypedValue.TYPE_*`); `data` is the raw 32-bit
+/// payload (a referenced resource id for `TYPE_REFERENCE`, an attribute id for `TYPE_ATTRIBUTE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeAttr {
+    /// `Res_value.dataType` (== `TypedValue.TYPE_*`).
+    pub type_: u8,
+    /// `Res_value.data` (raw 32-bit payload).
+    pub data: u32,
+}
+
 /// Per-theme state held in a registry slot: the non-GTK theme attribute set.
 ///
-/// 2026-06-05: minimal by design — `styles` accumulates the `(resource id, applied)` style entries a
-/// theme native records; empty until a theme native sets one. Holds no GTK style context and resolves
-/// no real attributes yet (the View cascade only needs a valid theme handle to proceed).
+/// 2026-06-05: `attrs` is the theme's MERGED attribute map (attribute resource id → [`ThemeAttr`]),
+/// built by `framework`'s `applyThemeStyle` from the applied style's bag + its parent chain in
+/// `resources.arsc` (child overrides parent). `obtainStyledAttributes(int[])` resolves each requested
+/// attribute from it. `styles` records the applied style resource ids in application order (kept for
+/// diagnostics + `force` semantics; a freshly created theme has both empty).
 #[derive(Debug, Default)]
 pub struct ThemeState {
-    /// Applied style resource ids (`Resources.Theme.applyStyle`), in application order. A placeholder
-    /// for theme metadata a later increment reads back; recording it keeps the handle meaningful.
+    /// Applied style resource ids (`Resources.Theme.applyStyle`), in application order.
     pub styles: Vec<i32>,
+    /// The merged theme attribute map: attribute resource id → resolved value.
+    pub attrs: HashMap<i32, ThemeAttr>,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -246,6 +264,64 @@ mod tests {
         let h = allocate().expect("allocate");
         free(h).expect("first free");
         assert_eq!(free(h), Err(ThemeRegistryError::StaleHandle));
+    }
+
+    #[test]
+    fn attrs_map_round_trips_and_copies_independently() {
+        // 2026-06-05: the merged theme attribute map is what obtainStyledAttributes(int[]) reads;
+        // copyTheme must copy it (not just `styles`). Guard the round-trip + the copy independence.
+        let src = allocate().expect("allocate src");
+        with_theme(src, |t| {
+            t.attrs.insert(
+                0x7f01_0058,
+                ThemeAttr {
+                    type_: 0x12,
+                    data: 0xffff_ffff,
+                },
+            );
+        })
+        .expect("populate src");
+
+        // Read it back.
+        let got = with_theme(src, |t| t.attrs.get(&0x7f01_0058).copied())
+            .expect("read src")
+            .expect("attr present");
+        assert_eq!(
+            got,
+            ThemeAttr {
+                type_: 0x12,
+                data: 0xffff_ffff
+            }
+        );
+
+        // Copy into a dest theme (as copyTheme does), then mutate src and confirm dest is unaffected.
+        let dest = allocate().expect("allocate dest");
+        let snapshot = with_theme(src, |t| t.attrs.clone()).expect("clone src attrs");
+        with_theme(dest, |t| t.attrs = snapshot).expect("write dest attrs");
+        with_theme(src, |t| {
+            t.attrs.insert(
+                0x7f01_0058,
+                ThemeAttr {
+                    type_: 0x10,
+                    data: 0,
+                },
+            );
+        })
+        .expect("mutate src");
+        let dest_val = with_theme(dest, |t| t.attrs.get(&0x7f01_0058).copied())
+            .expect("read dest")
+            .expect("dest attr present");
+        assert_eq!(
+            dest_val,
+            ThemeAttr {
+                type_: 0x12,
+                data: 0xffff_ffff
+            },
+            "the copied map is independent of later src mutation"
+        );
+
+        free(src).expect("free src");
+        free(dest).expect("free dest");
     }
 
     #[test]
