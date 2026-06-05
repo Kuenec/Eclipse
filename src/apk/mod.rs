@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arsc;
 pub mod axml;
 
 use std::collections::BTreeMap;
