@@ -10,10 +10,22 @@
 //! [`drive_application_lifecycle`] runs the **window-independent foundation** of the confirmed
 //! onCreate recipe (`docs/art-and-runtime.md` "onCreate JNI recipe (confirmed)"): it wraps the
 //! held VM with [`jni::vm::JavaVM::from_raw`], attaches the (already-attached) main thread via
-//! `attach_current_thread`, and resolves the recipe's bootstrap classes
+//! `attach_current_thread`, **binds Eclipse's own non-GTK backing for the two natives
+//! `android.content.Context`'s static initializer calls** (`native_get_apk_path` +
+//! `native_updateConfig`) via `RegisterNatives`, then resolves the recipe's bootstrap classes
 //! ([`CONTEXT_CLASS`]/[`APPLICATION_CLASS`]) with `find_class` to prove the typed-`Env` bridge
 //! reaches the loaded `android.*` framework. The recipe steps are encoded as typed constants
 //! ([`STEP1_CREATE_APPLICATION`] … [`STEP5_ACTIVITY_ON_CREATE`]).
+//!
+//! ### Why bind those two natives (the non-GTK backing — confirmed)
+//! ATL's `api-impl.jar` declares `native_get_apk_path`/`native_updateConfig` and backs them in C
+//! against GTK/GDK (`libtranslation_layer_main.so`). Eclipse must NOT pull in GTK (it re-crowds
+//! the low_4gb window — AGENTS.md §5 Step 3.5), so it supplies its OWN Rust implementations and
+//! binds them by name via `RegisterNatives` (which takes precedence over the lazy symbol-name
+//! binding ATL relies on — JNI 1.1 spec). They are registered BEFORE `Context.<clinit>` can run
+//! (`find_class` loads/links but does not initialize the class), so the static initializer finds
+//! them already bound and GTK-free. Only these two are bound — they are the only natives the
+//! static initializer reaches for the pure-Java demo APK (`Context.java` `static { … }`).
 //!
 //! ## What is deferred (and why)
 //! Step 1 itself — `Context.createApplication(J)→Application` — and steps 2–5 are **not** driven
@@ -29,20 +41,180 @@
 //! (component-map F) that defines Eclipse's own window handle. See [`LifecycleProgress`].
 //!
 //! ## `unsafe`
-//! 2026-06-04: confined to the single [`jni::vm::JavaVM::from_raw`] call in
-//! [`drive_application_lifecycle`], which carries a `// SAFETY:` note. The JNI work runs under
-//! `attach_current_thread`, and the closure body is additionally wrapped in
-//! `std::panic::catch_unwind` so a Rust panic can never unwind into ART's C++ under the release
-//! `panic = "abort"` profile (AGENTS.md §2.8; CLAUDE.md).
+//! 2026-06-05: confined to the JNI FFI surface, each block carrying a `// SAFETY:` note —
+//! [`jni::vm::JavaVM::from_raw`] in [`drive_application_lifecycle`], the
+//! [`NativeMethod::from_raw_parts`]/`register_native_methods` calls that bind the two Context
+//! natives, and the [`FieldSignature::from_raw_parts`] pairing the `"I"` signature with
+//! `JavaType::Int`. The JNI work runs under `attach_current_thread`; the driver closure is wrapped
+//! in `std::panic::catch_unwind`, and each registered native body runs inside
+//! [`EnvUnowned::with_env`] (which `catch_unwind`-wraps it), so a Rust panic can never unwind into
+//! ART's C++ under the release `panic = "abort"` profile (AGENTS.md §2.8; CLAUDE.md).
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
+use std::sync::OnceLock;
 
+use jni::errors::LogErrorAndDefault;
+use jni::objects::{JClass, JObject, JString};
+use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
 use jni::vm::JavaVM;
-use jni::{jni_str, Env};
+use jni::{jni_str, Env, EnvUnowned, NativeMethod};
 
 use crate::runtime::Vm;
+
+// === Eclipse's own (non-GTK) backing for android.content.Context's static-init natives =========
+//
+// 2026-06-05: `android.content.Context`'s static initializer (ATL `api-impl/android/content/
+// Context.java` `static { … }`, lines 113–155) invokes exactly two native methods before the
+// launcher lifecycle begins — `native_updateConfig(Configuration)` (line 117) and
+// `native_get_apk_path()` (lines 121, 136). ATL backs these in C against GTK/GDK
+// (`api-impl-jni/content/android_content_Context.c`: `native_get_apk_path` returns
+// `NewStringUTF(apk_path)`; `native_updateConfig` sets `Configuration.screenWidthDp`/
+// `screenHeightDp` from `gdk_monitor_get_geometry`). Eclipse must NOT pull in GTK/GDK (it would
+// re-crowd the low_4gb window — AGENTS.md §5 Step 3.5), so we bind our OWN Rust backing for those
+// two symbols via `RegisterNatives` (which wins over name-based lazy binding — JNI 1.1 spec)
+// BEFORE the class is statically initialized. Only these two are bound; the other Context natives
+// (`nativeOpenFile`, `nativeExportUnifiedPush`, …) are NOT reached by static init for the pure-Java
+// demo APK and remain unbound (deferred).
+
+/// The real on-disk APK path `native_get_apk_path` returns. Stashed once by
+/// [`register_context_natives`] before the natives are registered (hence before
+/// `Context.<clinit>` can call them), then read by the native on the main thread.
+///
+/// 2026-06-05: a process-wide `OnceLock<String>` is the simplest sound carrier — the value is set
+/// once before any native call and only read afterward, and the lifecycle runs solely on the
+/// attached main thread, so there is no contention and no per-call allocation beyond the JNI
+/// string the JVM copies. `Env::new_string` takes `impl AsRef<str>`, so a `String` suffices.
+static APK_PATH: OnceLock<String> = OnceLock::new();
+
+/// Configuration screen dimensions Eclipse reports at `Context.<clinit>` (density-independent
+/// pixels). ATL reads these from the real monitor via GDK; Eclipse uses safe, non-zero defaults so
+/// the framework's `Resources`/`Configuration` are well-formed without querying GTK/GDK. 720p-class
+/// dp values are a neutral, widely-valid baseline; a real surface size can replace them once the
+/// window/Surface design (component-map F) lands.
+const DEFAULT_SCREEN_WIDTH_DP: i32 = 1280;
+const DEFAULT_SCREEN_HEIGHT_DP: i32 = 720;
+
+// JNI method names + descriptors for the two Context static-init natives, exactly as declared in
+// `Context.java` (2026-06-05): `private static native String native_get_apk_path();` and
+// `protected static native void native_updateConfig(Configuration config);`.
+const NATIVE_GET_APK_PATH_NAME: &JNIStr = jni_str!("native_get_apk_path");
+const NATIVE_GET_APK_PATH_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
+const NATIVE_UPDATE_CONFIG_NAME: &JNIStr = jni_str!("native_updateConfig");
+const NATIVE_UPDATE_CONFIG_SIG: &JNIStr = jni_str!("(Landroid/content/res/Configuration;)V");
+
+/// `Context.native_get_apk_path()` → the real APK path as a `java.lang.String`.
+///
+/// JNI ABI: a `static` native, so the second argument is the `JClass`. The body runs inside
+/// [`EnvUnowned::with_env`], which wraps it in `catch_unwind` internally so a Rust panic can never
+/// unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
+/// returns a neutral default (a null `JString`) on any error/panic rather than propagating.
+extern "system" fn native_get_apk_path<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        // Stashed by register_context_natives before this native could be called. Absent ⇒ a logic
+        // error (registration without a path); surface it as a JNI error, not a panic/unwrap.
+        let path = APK_PATH
+            .get()
+            .ok_or(jni::errors::Error::JniCall(jni::errors::JniError::Unknown))?;
+        env.new_string(path)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Context.native_updateConfig(Configuration)` → set `screenWidthDp`/`screenHeightDp` to safe,
+/// GTK-free defaults.
+///
+/// JNI ABI: a `static` native taking one object argument, so the parameters are
+/// `(EnvUnowned, JClass, JObject config)`. Sets the two `int` fields ATL's GDK-backed version sets,
+/// but with fixed defaults — Eclipse must NOT query GDK/GTK (AGENTS.md §5 Step 3.5). The body is
+/// `catch_unwind`-guarded by `with_env`; `resolve::<LogErrorAndDefault>` returns the `()` default on
+/// error/panic. `()` is the correct neutral value for this `void` native.
+extern "system" fn native_update_config<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    config: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        // SAFETY: "screenWidthDp"/"screenHeightDp" are `public int` fields of
+        // android.content.res.Configuration (ATL `api-impl/android/content/res/Configuration.java`
+        // lines 600/615), so the "I" signature paired with JavaType::Int is consistent — exactly
+        // FieldSignature::from_raw_parts' invariant. `set_field` additionally re-checks the value
+        // type against the field at runtime, so a mismatch returns a typed error, never UB.
+        let int_sig =
+            unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
+        env.set_field(
+            &config,
+            SCREEN_WIDTH_DP_FIELD,
+            &int_sig,
+            DEFAULT_SCREEN_WIDTH_DP.into(),
+        )?;
+        env.set_field(
+            &config,
+            SCREEN_HEIGHT_DP_FIELD,
+            &int_sig,
+            DEFAULT_SCREEN_HEIGHT_DP.into(),
+        )?;
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+// Field names + the primitive-int signature used by native_update_config.
+const SCREEN_WIDTH_DP_FIELD: &JNIStr = jni_str!("screenWidthDp");
+const SCREEN_HEIGHT_DP_FIELD: &JNIStr = jni_str!("screenHeightDp");
+const INT_SIG: &JNIStr = jni_str!("I");
+
+/// Bind Eclipse's own (non-GTK) backing for `android.content.Context`'s two static-init natives.
+///
+/// Stashes the real `apk_path` for [`native_get_apk_path`], then locates `android/content/Context`
+/// and registers both natives via `RegisterNatives`. MUST be called BEFORE anything triggers the
+/// class's static initializer (`<clinit>`) — `find_class` loads and links the class but does not
+/// initialize it (JNI spec: `<clinit>` runs on first active use), so registering here means the two
+/// natives are already bound when `<clinit>` later calls them.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the function pointers must match the declared JNI
+/// signatures. They do, by construction — [`native_get_apk_path`]/[`native_update_config`] are
+/// written to the exact `()Ljava/lang/String;` / `(Landroid/content/res/Configuration;)V`
+/// descriptors. Each native body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust
+/// panic can cross the JNI boundary (AGENTS.md §2.8).
+fn register_context_natives(env: &mut Env, apk_path: &str) -> Result<(), FrameworkError> {
+    // Set-once; a second call (only one boot per process) keeps the first value — harmless.
+    let _ = APK_PATH.set(apk_path.to_owned());
+
+    let class = env.find_class(CONTEXT_CLASS)?;
+    let methods = [
+        // SAFETY: each fn matches the paired signature (see the natives' docs); casting the
+        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                NATIVE_GET_APK_PATH_NAME,
+                NATIVE_GET_APK_PATH_SIG,
+                native_get_apk_path as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: as above for native_update_config / native_updateConfig.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                NATIVE_UPDATE_CONFIG_NAME,
+                NATIVE_UPDATE_CONFIG_SIG,
+                native_update_config as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/content/Context; `methods` hold valid fn pointers whose
+    // signatures match the class's `native` declarations (verified against Context.java, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/content/Context",
+        "registered Eclipse's non-GTK backing for native_get_apk_path + native_updateConfig"
+    );
+    Ok(())
+}
 
 // === The confirmed onCreate recipe, encoded as typed constants ===================
 //
@@ -120,9 +292,15 @@ pub enum LifecycleProgress {
 /// Drive the booted ART VM toward Roblox's `Application.onCreate` — the grounded foundation.
 ///
 /// Wraps the held [`Vm`]'s raw `*mut JavaVM` with [`jni::vm::JavaVM::from_raw`], attaches the
-/// current (main) thread, and resolves the recipe's bootstrap classes ([`CONTEXT_CLASS`],
-/// [`APPLICATION_CLASS`]) to prove the typed-`Env` bridge reaches the loaded `android.*`
-/// framework. Returns [`LifecycleProgress::BridgeProven`] on success.
+/// current (main) thread, binds Eclipse's own non-GTK backing for `android.content.Context`'s two
+/// static-init natives (`native_get_apk_path` returns `apk_path`; `native_updateConfig` sets the
+/// `Configuration` screen dims to safe defaults), then resolves the recipe's bootstrap classes
+/// ([`CONTEXT_CLASS`], [`APPLICATION_CLASS`]) to prove the typed-`Env` bridge reaches the loaded
+/// `android.*` framework. Returns [`LifecycleProgress::BridgeProven`] on success.
+///
+/// `apk_path` is the on-disk APK path the framework's `native_get_apk_path` must return (the same
+/// path passed to [`runtime::boot`](crate::runtime::boot)); it is stashed before the natives are
+/// registered, so it is available the moment `Context.<clinit>` calls the native.
 ///
 /// MUST be called on the process **main thread** — the thread that booted the VM
 /// ([`runtime::boot`](crate::runtime::boot)) and on which winit's event loop runs. `Vm` is
@@ -138,7 +316,10 @@ pub enum LifecycleProgress {
 /// handle whose type is UNCONFIRMED for Eclipse's (non-GTK) window — see the module docs. Calling
 /// them with a guessed handle is forbidden (CLAUDE.md); they are unblocked by the framework/Surface
 /// design (component-map F).
-pub fn drive_application_lifecycle(vm: &Vm) -> Result<LifecycleProgress, FrameworkError> {
+pub fn drive_application_lifecycle(
+    vm: &Vm,
+    apk_path: &str,
+) -> Result<LifecycleProgress, FrameworkError> {
     // SAFETY: `vm.as_raw()` is the live `*mut JavaVM` that this process's `JNI_CreateJavaVM`
     // returned (verified non-null by `boot()`'s `NullEnv` check), supporting JNI 1.6 ≥ 1.4 —
     // exactly `from_raw`'s contract. We guard null here too so a null can never reach
@@ -154,17 +335,23 @@ pub fn drive_application_lifecycle(vm: &Vm) -> Result<LifecycleProgress, Framewo
     // is cheap and does not detach on return). Wrap the closure body in catch_unwind so a panic
     // from inside JNI/ART can never unwind across the FFI boundary (panic = "abort"; §2.8).
     java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| prove_bridge(env))) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| prove_bridge(env, apk_path))) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
         }
     })
 }
 
-/// Resolve the recipe's bootstrap classes via `find_class` to prove the bridge to the loaded
-/// `android.*` framework. Split out so the panic guard in [`drive_application_lifecycle`] wraps a
-/// single named call.
-fn prove_bridge(env: &mut Env) -> Result<LifecycleProgress, FrameworkError> {
+/// Bind Eclipse's non-GTK Context static-init natives, then resolve the recipe's bootstrap classes
+/// to prove the bridge to the loaded `android.*` framework. Split out so the panic guard in
+/// [`drive_application_lifecycle`] wraps a single named call.
+fn prove_bridge(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress, FrameworkError> {
+    // Bind native_get_apk_path + native_updateConfig BEFORE Context's static initializer can run
+    // (find_class loads/links the class but does not initialize it — JNI spec), so the two natives
+    // are already resolvable, non-GTK, when <clinit> later calls them. RegisterNatives wins over
+    // name-based lazy binding (JNI 1.1 spec), so ATL's GTK-backed symbols are not used.
+    register_context_natives(env, apk_path)?;
+
     // Step-1 host class. `find_class` takes a `&JNIStr`; the `jni_str!` constants are MUTF-8
     // encoded at compile time. A pending Java exception surfaces as the typed Jni error (via the
     // `From<jni::errors::Error>` impl below) through `?`.
@@ -173,7 +360,7 @@ fn prove_bridge(env: &mut Env) -> Result<LifecycleProgress, FrameworkError> {
     tracing::info!(
         context = STEP1_CREATE_APPLICATION.class,
         application = STEP3_APPLICATION_ON_CREATE.class,
-        "framework bridge proven: bootstrap classes resolved via JNI (createApplication deferred — window handle UNCONFIRMED)"
+        "framework bridge proven: Context static-init natives registered + bootstrap classes resolved via JNI (createApplication deferred — window handle UNCONFIRMED)"
     );
     Ok(LifecycleProgress::BridgeProven)
 }
@@ -257,5 +444,23 @@ mod tests {
         // `JNIStr::to_str` returns the MUTF-8-decoded `Cow<str>`; these ASCII names round-trip.
         assert_eq!(CONTEXT_CLASS.to_str(), "android/content/Context");
         assert_eq!(APPLICATION_CLASS.to_str(), "android/app/Application");
+    }
+
+    #[test]
+    fn context_native_names_and_sigs_match_context_java() {
+        // Pin the two Context static-init native method names + JNI descriptors against
+        // `Context.java` (2026-06-05): a transcription regression (wrong name or sig) would make
+        // RegisterNatives throw NoSuchMethodError at boot. These are host-independent constants.
+        assert_eq!(NATIVE_GET_APK_PATH_NAME.to_str(), "native_get_apk_path");
+        assert_eq!(NATIVE_GET_APK_PATH_SIG.to_str(), "()Ljava/lang/String;");
+        assert_eq!(NATIVE_UPDATE_CONFIG_NAME.to_str(), "native_updateConfig");
+        assert_eq!(
+            NATIVE_UPDATE_CONFIG_SIG.to_str(),
+            "(Landroid/content/res/Configuration;)V"
+        );
+        // The Configuration int fields native_updateConfig writes, and their JNI type.
+        assert_eq!(SCREEN_WIDTH_DP_FIELD.to_str(), "screenWidthDp");
+        assert_eq!(SCREEN_HEIGHT_DP_FIELD.to_str(), "screenHeightDp");
+        assert_eq!(INT_SIG.to_str(), "I");
     }
 }

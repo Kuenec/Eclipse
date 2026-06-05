@@ -433,12 +433,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 - `/home/kue/Projects/Eclipse/vendor/atl/` — local fork build, no longer needed. Safe to `rm -rf` later.
 
 ---
-- **Last verified 2026-06-04:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`
-  wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, `cargo test` (**34 pass**), `cargo build --release`
-  (0 warnings). The `apk` reader was validated against the **real** Roblox manifest →
-  ground truth (com.roblox.client / ActivitySplash / 26 / 35 / largeHeap=false). **`eclipse
-  run <apk>` boots the vendored ART VM** (libcore, JNI_OK, EXIT 0) on this host.
+- **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
+  +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
+  --all-targets --all-features -- -D warnings`, `cargo test` (**42 unit + 2 compile_fail doctests
+  pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` now binds
+  Eclipse's own non-GTK backing for `Context`'s two static-init natives (`native_get_apk_path`/
+  `native_updateConfig`) via `RegisterNatives` before `Context.<clinit>` (§6 2026-06-05); the live JNI
+  path is dev-host-only (ART aborts on worker threads). The `apk` reader was validated against the
+  **real** Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 /
+  largeHeap=false). **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK, EXIT 0) on this
+  host.
 - **Repo:** git initialized; committed & pushed to `origin/main`
   (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
 - **What exists:** 7 docs + `README` + `eclipse` crate. **M1 done so far:**
@@ -525,15 +529,22 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      `api-impl.jar`'s `native` backing (`libtranslation_layer_main.so`) is GTK-4-linked (`readelf`),
      but `api-impl.jar` itself is **GTK-free** and ATL binds natives **by symbol name** (no
      `RegisterNatives`). **Chosen approach:** supply Eclipse's OWN non-GTK `Java_*` symbols for those
-     names + **drop ATL's GTK natives dir from `java.library.path`** — do NOT fork the Java. **Smallest
-     first step:** against pure-Java `demo_app.apk`, bind just the **2** natives in `Context`'s static
-     init — `Context.native_updateConfig`/`native_get_apk_path` (steps 1–3 are pure Java; the `jlong`
-     can be any stable non-null Eclipse handle since they only store it) — then drive steps 1–3 to
-     `Application.onCreate` and verify on the dev host (`cargo run -- run …/demo_app.apk`: onCreate
-     reached, window opens, exit 0, **no `libgtk-4` in `/proc/self/maps`**). **Separately:** the
-     deferred **bionic NDK-shim** step (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent
-     cyber-safeguard blocker) so the Roblox engine's transitive natives resolve and `libroblox.so`
-     links past relocation.
+     names — but via `RegisterNatives` (which WINS over name-based lazy binding, JNI 1.1 spec), so we
+     neither fork the Java nor need to drop ATL's GTK natives dir. ✅ **Smallest first step DONE
+     (2026-06-05):** against pure-Java `demo_app.apk`, the **2** natives `Context`'s static init reaches
+     — `native_get_apk_path`/`native_updateConfig` — are now bound to Eclipse's own non-GTK Rust backing
+     via `jni 0.22.4 env.register_native_methods`, registered BEFORE `Context.<clinit>` runs (see §6
+     2026-06-05). **NEXT (dev-host discovery loop):** run `cargo run -- run …/demo_app.apk` on the dev
+     host and read the boot log — the registered natives make `Context.<clinit>` resolve GTK-free, so the
+     next failure is the **next `UnsatisfiedLinkError`**, which *names the next native to bind*. Iterate:
+     bind each surfaced native (non-GTK Rust) and re-run, until static-init + steps 1–3 reach
+     `Application.onCreate` (onCreate NOT yet proven reached — only these two natives are bound + the
+     bridge resolves bootstrap classes). Then the **Window/Surface non-GTK natives** with the
+     owned-handle/`ash`-Vulkan surface (the `jlong` window-handle design, still UNCONFIRMED). Verify on
+     the dev host (onCreate reached, window opens, exit 0, **no `libgtk-4` in `/proc/self/maps`**).
+     **Separately (a distinct main-loop item):** the deferred **bionic NDK-shim** step
+     (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent cyber-safeguard blocker) so the
+     Roblox engine's transitive natives resolve and `libroblox.so` links past relocation.
   4. Once Roblox's Java shell runs, harvest `framework-worklist.txt` (missing `android.*` the
      framework must implement) — the deferred Step 4 data, and the spec for the winit framework.
   5. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
@@ -886,6 +897,41 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   classes resolved via JNI), open the window, and exit 0. **NEXT:** steps 1–5 with the real surface
   (resolve the winit→`intptr_t` window-handle design), and separately the deferred bionic NDK-shim for
   the Roblox engine.
+- **2026-06-05** — **Eclipse's FIRST non-GTK `api-impl` natives bound — the non-GTK backing seeded.**
+  Bound Eclipse's own non-GTK Rust backing for the **exactly two** natives `android.content.Context`'s
+  static initializer reaches — `native_get_apk_path` (`()Ljava/lang/String;` → returns the real APK
+  path) and `native_updateConfig` (`(Landroid/content/res/Configuration;)V` → sets the `public int`
+  fields `screenWidthDp`/`screenHeightDp` to safe GTK-free defaults 1280×720 dp, NO GDK) — via
+  `jni 0.22.4 env.register_native_methods` on `android/content/Context`, registered BEFORE
+  `Context.<clinit>` runs (`find_class` loads/links but does not initialize; `RegisterNatives` wins over
+  ATL's name-based lazy binding — JNI 1.1 spec). This is the concrete realization of the 2026-06-04
+  "Non-GTK api-impl backing" design: ATL backs these in C against GTK/GDK
+  (`api-impl-jni/.../android_content_Context.c`), Eclipse must not pull GTK (re-crowds low_4gb, Step
+  3.5), so we supply our own. **Grounded, not guessed:** verified against the vendored ATL source —
+  `Context.java`'s `static { … }` (lines 113–155) calls only `native_updateConfig(config)` (117) +
+  `native_get_apk_path()` (121, 136); declarations at lines 157–158; `Configuration.screenWidthDp`/
+  `screenHeightDp` are `public int` (lines 600/615). `nativeExportUnifiedPush` (line 150) is reached
+  only for UnifiedPush-receiver APKs (not the pure-Java demo), so the other 4 Context natives are
+  correctly left unbound. **Safety:** each native is an `extern "system"` fn matching jni 0.22.4's
+  documented static-native ABI (`EnvUnowned`,`JClass`[,`JObject`]); the body runs inside
+  `EnvUnowned::with_env`, which `catch_unwind`-wraps it internally (verified in the crate source,
+  env.rs:4801), and `resolve::<LogErrorAndDefault>` returns a neutral default (null `JString` / `()`) on
+  any error/panic — no Rust panic can cross into ART (`panic = "abort"` kept); the driver closure is
+  additionally `catch_unwind`-guarded. The APK path is carried in a process-wide `OnceLock<String>` set
+  before registration (sound: set-once before any call, read only on the attached main thread). Wired
+  into `framework::drive_application_lifecycle(&Vm, apk_path)` before bootstrap-class resolution;
+  `main.rs` threads the same `apk_path` it passes to `runtime::boot`. No new deps (`jni 0.22.4`/`jni-sys
+  0.4` already in tree), no C toolchain, no GTK. Regression guard: a host-independent unit test
+  (`context_native_names_and_sigs_match_context_java`) pins the two native names + JNI descriptors +
+  `Configuration` field names against `Context.java` so a transcription regression (which would throw
+  `NoSuchMethodError`/`NoSuchFieldError` at boot) fails loudly. Full gate green:
+  fmt/build/clippy `-D warnings`/test (42 unit + 2 compile_fail doctests)/release. **`Application.onCreate`
+  is NOT yet proven reached** — this only seeds the non-GTK backing + proves the bridge resolves the
+  bootstrap classes; step 1 (`createApplication(J)`) onward stays deferred on the UNCONFIRMED `jlong`
+  window-handle. **Owed dev-host check** (cannot run in this worker-thread harness — ART aborts off the
+  main thread): `cargo run -- run ~/eclipse-m0/atl_test_apks/demo_app.apk` — boot ART, register the two
+  natives, log "framework bridge proven", open the window, exit 0, and confirm **no `libgtk-4` in
+  `/proc/self/maps`**; the next `UnsatisfiedLinkError` in the log names the next native to bind.
 
 ---
 
