@@ -1139,4 +1139,79 @@ mod tests {
             img.dyn_info.bind_now(),
         );
     }
+
+    // 2026-06-05: Re-parse the REAL Roblox x86-64 engine `libroblox.so` through this decoder,
+    // reading the entry's bytes via Eclipse's own `apk` reader (benign data parse — no exec/mmap),
+    // and assert the headline facts from `docs/libroblox-characterization.md`. SKIPs cleanly (never
+    // fails/fabricates) when the session APK is absent, mirroring `real_shared_object_decodes_sanely`.
+    // The APK path is the documented session location (AGENTS.md §5) or `ECLIPSE_ROBLOX_APK`.
+    #[test]
+    fn real_libroblox_engine_decodes_headline_facts() {
+        let candidates: Vec<std::path::PathBuf> = std::env::var_os("ECLIPSE_ROBLOX_APK")
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .chain(std::env::var_os("HOME").map(|home| {
+                std::path::Path::new(&home)
+                    .join("eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk")
+            }))
+            .collect();
+        let Some(apk_path) = candidates.iter().find(|p| p.exists()) else {
+            eprintln!(
+                "real_libroblox_engine_decodes_headline_facts: no Roblox APK in {candidates:?}; skipping"
+            );
+            return;
+        };
+
+        let mut apk = crate::apk::Apk::open(apk_path).expect("open Roblox APK");
+        let bytes = apk
+            .read_entry("lib/x86_64/libroblox.so")
+            .expect("read lib/x86_64/libroblox.so from APK");
+        let img = ElfImage::parse(&bytes).expect("parse libroblox.so as ELF");
+
+        // Class/machine/type: an `ElfImage::parse` success enforces ELFCLASS64 + EM_X86_64 + ET_DYN
+        // (parse_header), so reaching here proves all three. Headline structural facts:
+        assert!(!img.loads.is_empty(), "libroblox.so: expected PT_LOAD>0");
+        assert_eq!(
+            img.soname().expect("soname decode").as_deref(),
+            Some("libroblox.so"),
+            "libroblox.so: SONAME mismatch"
+        );
+        let needed = img.needed().expect("needed decode");
+        assert!(
+            !needed.is_empty(),
+            "libroblox.so: expected a non-empty DT_NEEDED graph"
+        );
+        // The bionic dependency surface the env must provide (subset assert — robust to ordering).
+        for dep in [
+            "libc.so",
+            "libm.so",
+            "liblog.so",
+            "libGLESv2.so",
+            "libEGL.so",
+        ] {
+            assert!(
+                needed.iter().any(|n| n == dep),
+                "libroblox.so: DT_NEEDED missing {dep}"
+            );
+        }
+        // libroblox uses BIND_NOW eager binding and has init constructors but NO PT_TLS — the facts
+        // that shape the runtime tail (no %fs binding needed; eager PLT; run DT_INIT_ARRAY).
+        assert!(img.dyn_info.bind_now(), "libroblox.so: expected BIND_NOW");
+        assert!(img.tls.is_none(), "libroblox.so: expected NO PT_TLS");
+        assert!(
+            img.relro.is_some(),
+            "libroblox.so: expected PT_GNU_RELRO (relro mprotect)"
+        );
+
+        // Diagnostic, documenting the APS2-packing gap (elf.rs sees only the std .rela.plt JUMP_SLOTs
+        // until the Android-packed DT_ANDROID_RELA decoder lands — see the characterization doc).
+        let relas = img.relocations().expect("relocations decode");
+        eprintln!(
+            "real_libroblox_engine_decodes_headline_facts: loads={} needed={} init_arraysz={:?} std_relocs_seen={} (packed .rela.dyn NOT yet decoded)",
+            img.loads.len(),
+            needed.len(),
+            img.dyn_info.init_array.map(|(_, sz)| sz),
+            relas.len(),
+        );
+    }
 }
