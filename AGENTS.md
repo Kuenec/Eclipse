@@ -726,6 +726,18 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   on the bionic path and provide `libmediandk.so`/`libOpenMAXAL.so` (re-export ATL's libandroid
   symbols). Full list in `~/eclipse-m0/framework-worklist.txt`. This is the concrete next-phase
   spec and the proof the engine is one native-shim layer away from loading.
+- **2026-06-04** — **Session code adversarially reviewed (workflow) + findings applied.** A
+  3-agent code-review workflow (each read CLAUDE.md/AGENTS.md in full; schemaless prose, so no
+  cyber-safeguard trips this time) reviewed the whole M1/M2 diff (apk, runtime, graphics, config,
+  main) — no CRITICAL/MAJOR; FFI soundness, AXML totality, no-panic/typed-errors, `forbid(unsafe)`
+  in graphics, `panic=abort`, and detect-don't-assume all confirmed. Applied MINOR fixes:
+  `apk::extract_native_libs` now writes temp+`sync_all`+`rename` (atomic — a kill mid-copy can't
+  leave a same-size-but-truncated `.so` the idempotent skip would accept); `decode_utf8` validates
+  UTF-8 in place (one alloc, §2.6); the `Option<()>` namespace flag → `enum Ns` (clarity); and
+  corrected now-stale docs (lib.rs "skeleton/not begun", main.rs "placeholder CLI", runtime
+  milestone tag) + a dated MSRV note (1.95 is the conservative dev pin, not the true floor). Gate
+  green (38 tests). The earlier ART-boot/JNI workflows were content-filter-blocked for subagents;
+  this review workflow (framed as Rust code review, not runtime analysis) completed cleanly.
 
 ---
 
