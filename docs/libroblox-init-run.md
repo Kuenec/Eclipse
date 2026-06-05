@@ -379,3 +379,113 @@ returns the entry's result; a re-join → ESRCH), `create_detached_is_not_joinab
 `kill_signal_zero_probes_a_live_thread`. The `native_provider` registration-count test tracks
 `PTHREAD_NATIVE_COUNT` (now 51). The harness re-run (3427/3427, EXIT=0) is the integration evidence — a
 diagnostic, not a `#[test]` assertion.
+
+---
+
+## 9. THE RUST LOADER, INTEGRATED INTO THE LIVE `eclipse run` — libroblox loads + inits + JNI_OnLoad in the running ART runtime (2026-06-05)
+
+The isolated harness (§1–§8) proved the loader; this step **wires it into the live `eclipse run` path**
+so the real engine loads, initializes, and registers its JNI **against Eclipse's actual booted ART VM** —
+then runs the real Roblox APK end-to-end. Nothing here is faked; the REAL run result + the new post-load
+frontier are reported exactly.
+
+> Reproduce (dev host):
+> ```sh
+> cargo build --release
+> timeout 180 ./target/release/eclipse run ~/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk \
+>   > /tmp/eclipse-roblox-run.log 2>&1; echo "EXIT=$?"
+> ```
+
+### What was wired (`src/loader/engine.rs` + `src/main.rs`)
+A new `src/loader/engine.rs` factors the proven load pipeline into a **persistent** form (no `_exit`, no
+`munmap` — the image stays mapped for the process lifetime so the engine's background workers keep running):
+
+- `load_libroblox(apk_path, log) -> LoadedEngine` — reads `lib/x86_64/libroblox.so` from the APK, maps the
+  3 PT_LOAD, applies the 527,208 `R_X86_64_RELATIVE`, honors `PT_GNU_RELRO`, builds the FULL Eclipse scope
+  (`[LoadedObjectProvider(libroblox)] + BionicEnv::with_host_baseline(true, true)`, the Eclipse-native tier
+  prepended) and applies the symbol relocations (**work-list 0 — all 584 imports resolve**), confirms text
+  `PROT_EXEC`, and locates `DT_INIT_ARRAY`. Returns the live `LoadedEngine` (owns the `LoadedImageSet`).
+- `LoadedEngine::run_init_array(log)` — calls all **3,427** `DT_INIT_ARRAY` constructors in order (shares the
+  init-array arithmetic with `init_run.rs`). Unlike the diagnostic harness it installs **no** crash handler
+  and does **not** `_exit` (the run is proven deterministic, §8); the engine spawns its background workers
+  here, so `LoadedEngine` MUST stay alive afterward.
+- `call_jni_onload(engine, java_vm, log) -> jint` — looks up the engine's exported `JNI_OnLoad` (GLOBAL FUNC
+  at vaddr `0x1f3d5b1`) via the same `LoadedObjectProvider` the scope uses (`base + st_value`), then calls
+  `JNI_OnLoad(JavaVM*, void*)` with Eclipse's REAL ART `JavaVM` (`runtime::Vm::as_raw()`), returning the JNI
+  version it reports.
+
+`src/main.rs::run_apk` calls `load_engine_via_rust_loader(&mut apk, apk_path, &vm)` on the **main thread**,
+with the VM alive + JNI-attached, **after** the bionic library-path whitelist and **before** driving the
+framework lifecycle (where Roblox's Java would call `System.loadLibrary("roblox")`). It is gated on the APK
+actually containing `lib/x86_64/libroblox.so` (a cheap file-name scan via `Apk::native_abis`), so the
+pure-Java demo APKs **skip** the loader and keep the existing framework-only path — **no regression**
+(`demo_app` still reaches `ActivityResumed` + opens the window). The two `unsafe` foreign jumps (the
+constructors + the `JNI_OnLoad` call) are confined with dated `// SAFETY:`; `reloc.rs`/`elf.rs`/`resolve.rs`
+stay `#![forbid(unsafe_code)]`. ZERO new crates.
+
+### THE REAL ROBLOX RUN RESULT (dev host, 2026-06-05, deterministic across 2/2 runs)
+```
+# Loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…
+engine-load: libroblox.so = 111823960 bytes
+engine-load: mapped objects=1 RELATIVE_applied=527208 RELRO_applied=1
+engine-load: symbol relocs applied_nonnull=623 weak_zero=12 unresolved_strong=0
+engine-load: text PROT_EXEC ✓; DT_INIT_ARRAY vaddr=0x6a52240 -> 3427 constructors
+engine-load: 3427/3427 constructors completed ✓
+engine-load: calling JNI_OnLoad @ base+0x1f3d5b1 (abs 0x…423e05b1) with the ART JavaVM…
+  liblog WARN tag="JNIMain": LoggingProtocol::getProcessTimestamp() threw an exception …
+  liblog WARN tag="JNIMain": DeviceStaticParams is null.
+engine-load: JNI_OnLoad returned 0x10006 (JNI_VERSION_1_6)
+# Driving the framework lifecycle (JNI; steps 1–7) …
+  roblox.config: setBaseUrl() null => www.roblox.com    ← Roblox's OWN Java onCreate running
+  rbx.baseurl: Incoming base url: www.roblox.com
+  creating androidx.startup.InitializationProvider
+  W bionic_linker: `…/libzstd-jni-1.5.7-6.so` is not a prelinked library
+  W bionic_linker: `libm.so` is not a prelinked library
+  E bionic_linker: unknown reloc type 18 @ 0x… (5)         ← R_X86_64_TPOFF64, the apkenv wall
+  E bionic_linker: failed to link libm.so
+  Fatal signal 11 (SIGSEGV) … fault addr 0x18  Thread: "AppStartupTaskM"
+EXIT=139
+```
+
+**Milestones reached (all REAL, in the live runtime):**
+1. **The engine-load interception fired** — libroblox routed to Eclipse's Rust loader, NOT the apkenv linker.
+2. **libroblox loaded + relocated + RELRO-hardened** in the live process: 527,208 RELATIVE + 623 symbol relocs,
+   `unresolved_strong=0`.
+3. **All 3,427 `DT_INIT_ARRAY` constructors ran** in the live runtime (the engine even emits its own liblog
+   warnings through Eclipse's liblog natives).
+4. **`JNI_OnLoad` ran against the REAL ART `JavaVM` and returned `JNI_VERSION_1_6`** — the engine's native
+   methods are now registered against Eclipse's ART. (During it the engine's `JNIMain` code executed.)
+5. **The framework lifecycle then drove Roblox's own `Application.onCreate`** — real Roblox Java ran
+   (`roblox.config setBaseUrl → www.roblox.com`, `rbx.baseurl`).
+
+### The new post-load frontier (root cause, evidence-based)
+The crash is **NOT** in Eclipse's loader or in libroblox — it is the **apkenv shim linker hitting the exact
+original modern-reloc wall (`unknown reloc type 18` = `R_X86_64_TPOFF64`) on a DIFFERENT library**. During
+`Application.onCreate`, `androidx.startup.InitializationProvider` triggers `System.loadLibrary("zstd-jni")`,
+which goes through ART's `Runtime.nativeLoad` → the **apkenv** linker (Eclipse only intercepts `libroblox`).
+`libzstd-jni` has `NEEDED libm.so`; the apkenv linker parses the provisioned host `libm.so.6`, hits its
+`R_X86_64_TPOFF64`, and **fails to link libm.so** → `libzstd-jni`'s load returns broken → a NULL deref on the
+`AppStartupTaskM` thread (`rax=0`, fault addr `0x18`) → SIGSEGV.
+
+This is the documented engine-load wall, now reached by the engine's **sibling JNI libs** rather than by
+libroblox itself. The fix is the same routing extended to those libs: **route `System.loadLibrary` for the
+app's other native libs (libzstd-jni and its transitive `libm`/bionic deps) through Eclipse's Rust loader
+too** — either by intercepting ART's `Runtime.nativeLoad` JNI native, or by pre-loading the app's full
+`lib/x86_64/*.so` set through `link.rs` (with a proper dependency graph + a bionic `libm` provider) before the
+lifecycle, the same way libroblox is pre-loaded now.
+
+### Recommended next step
+Extend the interception from "just libroblox" to "the app's native-lib set": pre-load `libzstd-jni` (and any
+other app `.so` ART's `nativeLoad` would hand to the apkenv linker) through `link.rs`, supplying a
+bionic-correct `libm`/`libc` provider (Eclipse already owns the relocation cores + the bionic-native tiers),
+so the modern relocs are applied by Eclipse's `reloc.rs` instead of aborting in apkenv. Then re-run to advance
+past the `androidx.startup` task into the rest of `onCreate`.
+
+### Regression protection (this step)
+4 GPU/VM-free unit tests in `src/loader/engine.rs` (`cargo test loader::engine`): the `JNI_OnLoad` symbol name
+is exactly `"JNI_OnLoad"` (a typo would silently make the lookup return `None`), the engine entry path is
+`lib/x86_64/libroblox.so`, `describe_jni_version` labels the common JNI constants (and reports a negative
+return as an error sentinel, not a version), and `JNI_VERSION_1_6 == 0x00010006` (the ART default; a jni-sys
+bump that changed it fails here, not silently at runtime). The full-resolution + map invariants are the
+existing gated `link.rs` real-libroblox tests (work-list 0, 527,208 RELATIVE). The live `eclipse run` is the
+integration evidence; `demo_app` reaching `ActivityResumed` (engine loader skipped) is the no-regression check.
