@@ -380,6 +380,17 @@ type JniCreateJavaVm = unsafe extern "system" fn(
     *mut c_void,
 ) -> jni_sys::jint;
 
+/// dlopen flags for `libart.so` (see [`boot`]).
+///
+/// 2026-06-05: `RTLD_GLOBAL` is **required** (not the RTLD_LOCAL default of the cross-platform
+/// `libloading::Library::new`): it promotes libart's symbols and its NEEDED `liblog.so`
+/// (`__android_log_print`) into the process-global scope, so the JCA/WolfSSL provider that
+/// `Context.<clinit>` loads during APK signature verification (`System.loadLibrary("wolfssljni")`)
+/// resolves that symbol via the bionic shim's glibc-dlopen fallback. `RTLD_NOW` binds eagerly so a
+/// missing symbol surfaces at load, not mid-lifecycle.
+const LIBART_DLOPEN_FLAGS: std::os::raw::c_int =
+    libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL;
+
 /// An owned handle to the live ART VM this process booted via [`boot`].
 ///
 /// 2026-06-04: carries the raw `*mut jni_sys::JavaVM` that `JNI_CreateJavaVM` produced. The raw
@@ -392,7 +403,7 @@ type JniCreateJavaVm = unsafe extern "system" fn(
 /// the main thread for those later calls.
 ///
 /// The libart mapping itself is kept resident for the process lifetime by [`boot`]'s
-/// `std::mem::forget(lib)` (see [`boot`]'s docs), so `Vm` does not own the `libloading::Library`
+/// `Library::into_raw()` leak (see [`boot`]'s docs), so `Vm` does not own the `libloading::Library`
 /// and has **no** `Drop`: tearing the VM down (`DestroyJavaVM` + unload) is a separately-designed
 /// later increment, because a running VM's GC/JIT daemon threads still execute libart's code.
 ///
@@ -460,14 +471,18 @@ impl Vm {
 /// `!Send`/`!Sync`, so it stays on the booting (main) thread — keep it alive (e.g. across the
 /// winit event loop) to give the next increment's JNI calls a reachable VM on that thread.
 ///
-/// 2026-06-04: `libart.so` is intentionally **never unloaded** via the `std::mem::forget(lib)`
-/// below: a running ART VM has daemon threads (GC/JIT) executing libart's code, so unmapping it
-/// (which `libloading::Library`'s `Drop` would do) is undefined behavior — even at process exit,
-/// since those daemon threads are still alive when destructors run. The mapping therefore lives
-/// for the process; the returned [`Vm`] deliberately does **not** hold the `Library` and has no
-/// `Drop`. Proper `DestroyJavaVM`-then-unload teardown is a separately-designed future increment.
-/// Consequently only one VM can be created per process (`JNI_CreateJavaVM` returns an error on a
-/// second call).
+/// 2026-06-04 (updated 2026-06-05): `libart.so` is intentionally **never unloaded** — the handle
+/// is leaked via `Library::into_raw()` below: a running ART VM has daemon threads (GC/JIT)
+/// executing libart's code, so unmapping it (which the `Library`'s `Drop` would do) is undefined
+/// behavior — even at process exit, since those daemon threads are still alive when destructors
+/// run. The mapping therefore lives for the process; the returned [`Vm`] deliberately does **not**
+/// hold the `Library` and has no `Drop`. Proper `DestroyJavaVM`-then-unload teardown is a
+/// separately-designed future increment. Consequently only one VM can be created per process
+/// (`JNI_CreateJavaVM` returns an error on a second call).
+///
+/// 2026-06-05: libart is opened with `RTLD_NOW | RTLD_GLOBAL` (see the `boot` body) so libart's
+/// symbols and its NEEDED `liblog.so` (`__android_log_print`) join the process-global scope — the
+/// JCA/WolfSSL provider `Context.<clinit>` loads during APK signature verification depends on it.
 pub fn boot(
     plan: &BootPlan,
     apk_path: Option<&Path>,
@@ -506,22 +521,43 @@ pub fn boot(
         ignoreUnrecognized: jni_sys::JNI_TRUE,
     };
 
-    // SAFETY: dlopen of a path we verified exists; libloading upholds the handle invariants.
-    let lib = unsafe { libloading::Library::new(&libart) }.map_err(RuntimeError::LoadLibart)?;
-
-    // Resolve JNI_CreateJavaVM and copy out the (Copy) fn pointer so the Symbol's borrow of
-    // `lib` is released before we `forget(lib)` below.
+    // 2026-06-05: dlopen libart with RTLD_NOW|RTLD_GLOBAL (not the cross-platform `Library::new`,
+    // which is RTLD_LOCAL). RTLD_GLOBAL promotes libart AND its NEEDED deps (incl. `liblog.so`,
+    // which libart links via its `${ORIGIN}` RPATH) into the process-global symbol scope. This
+    // matches a direct-linked ATL executable, where those symbols are global. It is REQUIRED for
+    // the lifecycle: `Context.<clinit>` verifies the APK signature (`PackageParser.collectCertificates`),
+    // which loads the WolfSSL JCA provider via `System.loadLibrary("wolfssljni")`. `libwolfssljni.so`
+    // leaves `__android_log_print` undefined (no `liblog.so` in its DT_NEEDED — it expects the symbol
+    // already global). With RTLD_LOCAL the bionic shim's glibc-dlopen fallback failed with
+    // "undefined symbol: __android_log_print", so `<clinit>` died with an UnsatisfiedLinkError
+    // (an Error, not caught by its `catch (Exception)`), marking `Context` erroneous → step 1's
+    // `GetStaticMethodID(Context.createApplication)` returned NULL. RTLD_GLOBAL makes the symbol
+    // resolvable and unblocks the load (evidence: stock ATL loads the same lib "with glibc dlopen").
     let create: JniCreateJavaVm = {
+        // SAFETY: dlopen of a path we verified exists; libloading upholds the handle invariants.
+        // RTLD_NOW resolves all relocations eagerly (surfacing any missing symbol now, not later);
+        // RTLD_GLOBAL adds libart's symbols + its NEEDED deps to the global scope (see above).
+        let lib =
+            unsafe { libloading::os::unix::Library::open(Some(&libart), LIBART_DLOPEN_FLAGS) }
+                .map_err(RuntimeError::LoadLibart)?;
+        // Resolve JNI_CreateJavaVM and copy out the (Copy) fn pointer, then leak the handle: a
+        // running ART VM has daemon threads executing libart's code, so unmapping libart (which
+        // `Library`'s Drop would do) is UB — even at process exit. Same rationale as the prior
+        // `mem::forget(lib)`; `into_raw()` is the os::unix equivalent (consumes the handle without
+        // closing it). RTLD_GLOBAL must persist for the whole process so later `System.loadLibrary`
+        // loads keep resolving against libart's deps.
         // SAFETY: the symbol has the JNI_CreateJavaVM ABI; we cast to the matching fn type.
-        let sym: libloading::Symbol<JniCreateJavaVm> =
+        let sym: libloading::os::unix::Symbol<JniCreateJavaVm> =
             unsafe { lib.get(b"JNI_CreateJavaVM\0") }.map_err(RuntimeError::ResolveSymbol)?;
-        *sym
+        let create = *sym;
+        lib.into_raw();
+        create
     };
 
     let mut vm: *mut jni_sys::JavaVM = std::ptr::null_mut();
     let mut env: *mut c_void = std::ptr::null_mut();
     // SAFETY: `create` is libart's JNI_CreateJavaVM; `args`/`options`/`option_strings` are live
-    // for the call; `vm`/`env` are valid out-pointers. `lib` is still loaded (not yet forgotten).
+    // for the call; `vm`/`env` are valid out-pointers. libart stays mapped (leaked via `into_raw`).
     let rc = unsafe {
         create(
             &mut vm,
@@ -536,8 +572,8 @@ pub fn boot(
         return Err(RuntimeError::NullEnv);
     }
 
-    // Keep libart mapped for the VM's lifetime (its daemon threads reference its code).
-    std::mem::forget(lib);
+    // libart is already kept mapped for the VM's lifetime (leaked via `into_raw()` above; its
+    // daemon threads reference its code, so unmapping it would be UB).
 
     // JNI_OK with a live JavaVM + JNIEnv is definitive: ART loaded the boot image and libcore's
     // native backends and attached this thread before returning. Return the owned `Vm` handle so
@@ -738,6 +774,25 @@ mod tests {
             "{vm:?}"
         );
         assert!(vm.contains(&"-Xmx768m".to_owned()), "{vm:?}");
+    }
+
+    #[test]
+    fn libart_dlopen_flags_are_global_and_eager() {
+        // 2026-06-05 regression guard: the createApplication frontier was blocked because libart was
+        // dlopen'd RTLD_LOCAL (libloading's `Library::new` default), so its NEEDED `liblog.so`
+        // (`__android_log_print`) was not global → the WolfSSL provider `Context.<clinit>` loads
+        // failed to link → `Context` erroneous → `GetStaticMethodID(createApplication)` == NULL.
+        // RTLD_GLOBAL is the fix; pin it (and eager RTLD_NOW) so a revert re-breaks this test.
+        assert_ne!(
+            LIBART_DLOPEN_FLAGS & libloading::os::unix::RTLD_GLOBAL,
+            0,
+            "libart must be dlopen'd RTLD_GLOBAL so liblog/__android_log_print is process-global"
+        );
+        assert_ne!(
+            LIBART_DLOPEN_FLAGS & libloading::os::unix::RTLD_NOW,
+            0,
+            "libart must be dlopen'd RTLD_NOW so a missing symbol surfaces at load, not mid-lifecycle"
+        );
     }
 
     #[test]

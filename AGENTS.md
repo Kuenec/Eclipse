@@ -435,7 +435,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**71 unit + 2 compile_fail doctests
+  --all-targets --all-features -- -D warnings`, `cargo test` (**72 unit + 2 compile_fail doctests
   pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
   Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock` natives via
   `RegisterNatives` before `Context.<clinit>`, then drives recipe steps 1–3. **Eclipse-owned non-GTK
@@ -449,10 +449,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   run, `Context.<clinit>` parses+walks `AndroidManifest.xml` end-to-end, integer manifest attrs resolve,
   **`<activity android:name>` now resolves via `TypedArray.getString` (the XmlBlock string pool, no new
   native), `PackageParser.parsePackage` completes (incl. certificate collection), and the lifecycle
-  advances to step 1 `Context.createApplication`** — which now stops at a NEW, unrelated frontier:
-  `GetStaticMethodID(createApplication, (J)Landroid/app/Application;)` returns NULL (the framework's
-  `createApplication(J)` method-ID lookup, not the asset/XML path). `Application.onCreate` NOT yet
-  reached (faithful, not faked; §6 2026-06-05). The live JNI path is dev-host-only (ART aborts on worker
+  drives steps 1–3 — `Context.createApplication(J)` → `ContentProvider.createContentProviders()` →
+  `Application.onCreate()` — and `Application.onCreate` IS NOW REACHED** (faithful; §6 2026-06-05
+  RTLD_GLOBAL fix). The earlier `GetStaticMethodID(createApplication, (J)Landroid/app/Application;)`
+  NULL was NOT a wrong signature (the descriptor matches `Context.java` source exactly) but a failed
+  `Context.<clinit>`: APK signature verification (`PackageParser.collectCertificates`) loads the WolfSSL
+  JCA provider via `System.loadLibrary("wolfssljni")`, and `libwolfssljni.so` left `__android_log_print`
+  undefined → the bionic shim's glibc-dlopen fallback failed → `UnsatisfiedLinkError` (an `Error`, not
+  caught by `<clinit>`'s `catch(Exception)`) → `Context` erroneous → method-ID NULL. Fixed by opening
+  libart `RTLD_GLOBAL` so `liblog.so`/`__android_log_print` is process-global. **Next frontier: step 4
+  `Activity.createMainActivity` (deferred — window/Surface design).** The live JNI path is dev-host-only (ART aborts on worker
   threads), so it is validated via `eclipse run`. The `apk` reader was validated against the **real**
   Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 / largeHeap=false).
   **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK) on this host.
@@ -603,11 +609,19 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      `<activity android:name>` resolves via `TypedArray.getString` → the XmlBlock string pool (cookie slot
      = 0 routes to `mXml.getPooledString(data)`, satisfied by the already-bound XML natives — NO new
      native; confirmed by the run surfacing no `No implementation found`). `PackageParser.parsePackage`
-     completes and the lifecycle reaches step 1 `Context.createApplication`. **NEXT (in order): (a)** the
-     **new step-1 frontier** — `GetStaticMethodID(createApplication, (J)Landroid/app/Application;)` returns
-     NULL: resolve why ART can't find `Context.createApplication(J)` (method visibility/signature/the
-     `createApplication` descriptor vs `Context.java`; the recipe-constant `STEP1` may need correcting, or
-     the method is non-static/instance, or the class needs the method bound/declared). Then **(b) wire
+     completes and the lifecycle reaches step 1 `Context.createApplication`. ✅ **CRACKED 2026-06-05 (§6):
+     the step-1 `GetStaticMethodID … NULL` was NOT a wrong signature — `STEP1 (J)Landroid/app/Application;`
+     matches `Context.java` source exactly — but a failed `Context.<clinit>`.** APK signature verification
+     (`PackageParser.collectCertificates`) loads the WolfSSL JCA provider via
+     `System.loadLibrary("wolfssljni")`; `libwolfssljni.so` leaves `__android_log_print` undefined (relies
+     on `liblog.so` already being global), and Eclipse opened libart `RTLD_LOCAL` (libloading's
+     `Library::new` default), so the bionic shim's glibc-dlopen fallback failed (`undefined symbol:
+     __android_log_print`) → `UnsatisfiedLinkError` (an `Error`, not caught by `<clinit>`'s
+     `catch(Exception)`) → `Context` erroneous → method-ID NULL. **Fix (one line + flags const): open
+     libart `RTLD_NOW|RTLD_GLOBAL`** so libart's NEEDED `liblog.so` symbols are process-global (matching a
+     direct-linked ATL executable). **`Application.onCreate` IS NOW REACHED** (steps 1–3 driven; WolfSSL
+     loads). **NEXT (in order): (a)** step 4 `Activity.createMainActivity` + the deref-ing Window natives
+     (the big M2/M3 build below). Then **(b) wire
      `apk::arsc` into `retrieveAttributes` for `@`-references** — when an attribute's `Res_value` is
      `TYPE_REFERENCE`, resolve it through `arsc::ResTable::resource_value` against the APK's
      `resources.arsc`. Then **(2)** the deref-ing Window natives for
@@ -1275,6 +1289,40 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (`panic = "abort"`/LTO retained). No new deps. Run log: `/tmp/eclipse-run.log` (EXIT=1, the expected stop
   at the `createApplication` method-ID lookup). **NEXT:** the step-1 `createApplication` method-ID frontier
   (why ART can't find `Context.createApplication(J)`).
+- **2026-06-05** — 🎉 **`Application.onCreate` REACHED — the createApplication frontier was a libart
+  symbol-scope bug, NOT a wrong signature.** Root cause (evidence, not inference): step 1
+  `GetStaticMethodID(Context, createApplication, (J)Landroid/app/Application;)` returned NULL because
+  `Context.<clinit>` had failed, leaving the class erroneous. The `class_linker.cc` stack dump in
+  `/tmp/eclipse-run.log` showed `Context.<clinit>` → `PackageParser.collectCertificates` →
+  `JarFile.initializeVerifier` → `sun.security.jca.Providers.<clinit>` → `WolfSSL.loadLibrary` →
+  `System.loadLibrary("wolfssljni")` → `UnsatisfiedLinkError`. Verbose bionic tracing pinned the exact
+  failure: `failed to load …/libwolfssljni.so with glibc dlopen (error: undefined symbol:
+  __android_log_print)`. `libwolfssljni.so` (a glibc lib) leaves `__android_log_print` undefined and does
+  NOT list `liblog.so` in DT_NEEDED — it expects the symbol already in the global scope. Eclipse opened
+  `libart.so` with `libloading::Library::new` = **RTLD_LOCAL**, so libart's NEEDED `liblog.so`
+  (`/usr/lib/art/liblog.so`, via libart's `${ORIGIN}` RPATH) was NOT promoted to the process-global scope
+  → WolfSSL's glibc-dlopen fallback couldn't resolve `__android_log_print`. Since `UnsatisfiedLinkError`
+  is an `Error` (not an `Exception`), `Context.<clinit>`'s `try/catch(Exception)` did NOT catch it → the
+  class went erroneous → the NULL method-ID. **The recipe was correct all along:** `Context.java` L164
+  `static Application createApplication(long native_window)` = package-private static
+  `(J)Landroid/app/Application;`, matching `STEP1` exactly (the compiled `api-impl.jar` is a single
+  `classes.dex`, so `javap` can't read it; the api-impl source it's built from is the ground truth — and
+  no compiled-jar contradiction exists). **Fix (surgical, root-cause):** open libart with
+  `RTLD_NOW | RTLD_GLOBAL` via `libloading::os::unix::Library::open` (new `LIBART_DLOPEN_FLAGS` const;
+  handle leaked with `into_raw()` instead of `mem::forget`, same never-unload rationale). RTLD_GLOBAL
+  promotes libart + its NEEDED deps (incl. `liblog.so`) to the global scope — matching a direct-linked
+  ATL executable, where stock ATL loads the same lib "with glibc dlopen" (empirically confirmed by running
+  stock `android-translation-layer` on the demo APK). **FAITHFUL result:** `eclipse run …/demo_app.apk`
+  now drives steps 1–3 (`Context.createApplication(J)` → `ContentProvider.createContentProviders()` →
+  `Application.onCreate()`); `wolfssljni` loads + logs, and the run prints **`Application.onCreate reached`
+  + `ApplicationOnCreate ✓`**, then opens the host winit window — NO `GetStaticMethodID … NULL`, no
+  `lifecycle step failed`, no `UnsatisfiedLinkError`. **Next frontier: step 4 `Activity.createMainActivity`**
+  (deferred — the window/Surface + View-cascade design, the big M2/M3 build). Regression guard:
+  `runtime::tests::libart_dlopen_flags_are_global_and_eager` pins `LIBART_DLOPEN_FLAGS & RTLD_GLOBAL != 0`
+  (and `RTLD_NOW`); a revert to RTLD_LOCAL re-breaks the WolfSSL load and fails the test. `STEP1`'s dated
+  comment records the source-vs-dex-jar verification. Full gate green: fmt --check / build --all-targets /
+  clippy `-D warnings` / test (**72 unit + 2 compile_fail doctests**, +1 = the new guard) / release
+  (`panic = "abort"`/LTO retained). No new deps (libloading already present). Run log: `/tmp/eclipse-run.log`.
 
 ---
 

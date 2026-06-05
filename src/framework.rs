@@ -1598,7 +1598,16 @@ pub const APPLICATION_CLASS: &JNIStr = jni_str!("android/app/Application");
 /// `createContentProviders()` entry point.
 pub const CONTENT_PROVIDER_CLASS: &JNIStr = jni_str!("android/content/ContentProvider");
 
-/// Step 1 (deferred): `static Context.createApplication(jlong native_window) -> Application`.
+/// Step 1: `static Context.createApplication(jlong native_window) -> Application`.
+///
+/// 2026-06-05: descriptor RE-VERIFIED against the compiled framework. `api-impl.jar` packages a
+/// single `classes.dex` (no per-class `.class`), so `javap` cannot read it; the ground truth is
+/// the api-impl source the jar is built from: `Context.java` L164
+/// `static Application createApplication(long native_window)` → package-private **static**,
+/// descriptor `(J)Landroid/app/Application;`. This matches the constant exactly — the earlier
+/// `GetStaticMethodID(... createApplication ...) returning NULL` was NOT a signature mismatch but a
+/// failed `Context.<clinit>` (an `UnsatisfiedLinkError` from the WolfSSL JCA provider load left the
+/// class erroneous → method-ID lookup returns NULL). Fixed in `runtime::boot` (RTLD_GLOBAL); see §6.
 pub const STEP1_CREATE_APPLICATION: RecipeStep = RecipeStep {
     class: "android/content/Context",
     method: "createApplication",
