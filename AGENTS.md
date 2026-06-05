@@ -463,6 +463,10 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `rustls`/`clap`/`rustix`. `winit`/`ash` deferred to the windowed boot.
 - **Open items:** license `TBD`; M1 reach Roblox `onCreate` (+ later: APK fetch backend).
 - **Next actions (pick up here — drive ART to Roblox's `onCreate`):**
+  📋 **Dev-host execution runbook:** the two frontiers' next concrete steps (which need
+  main-thread `cargo run -- run …`, not the cargo-test harness or subagents) are consolidated
+  into an executable, decision-driven script in [`docs/dev-host-runbook.md`](docs/dev-host-runbook.md)
+  (Section A = framework→`onCreate`, Section B = engine-load bionic shims, 2026-06-05).
   ✅ DONE: VM boot (libcore) + app classpath (`api-impl.jar:apk:framework-res.apk`) — `boot(plan,
   Some(apk))` boots with Roblox's Java loadable (`FindClass` resolves `com.roblox.*`).
   1. **The framework decision (the crux).** ATL's onCreate recipe (from its `src/main-executable/
