@@ -435,17 +435,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**43 unit + 2 compile_fail doctests
+  --all-targets --all-features -- -D warnings`, `cargo test` (**60 unit + 2 compile_fail doctests
   pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
-  Eclipse's own non-GTK backing for `Context`'s two static-init natives (`native_get_apk_path`/
-  `native_updateConfig`) via `RegisterNatives` before `Context.<clinit>`, then **drives recipe steps
-  1–3** `Context.createApplication(0)` → `ContentProvider.createContentProviders()` →
-  `Application.onCreate()` (the `0`/null handle is confirmed-safe for steps 1–3; §6 2026-06-05); the live
-  JNI path is dev-host-only (ART aborts on worker threads), so reaching `onCreate` is pending the dev-host
-  run. The `apk` reader was validated against the
-  **real** Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 /
-  largeHeap=false). **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK, EXIT 0) on this
-  host.
+  Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock` natives via
+  `RegisterNatives` before `Context.<clinit>`, then drives recipe steps 1–3. **Eclipse-owned non-GTK
+  AssetManager XML backing now built** (`apk`+`axml`: `openXmlAssetNative` really reads+parses the APK's
+  binary XML via `axml::parse_document` into the `framework::xml_registry` generational slab; the
+  `XmlBlock` parser natives walk it). On the dev-host run, `Context.<clinit>` now parses+walks
+  `AndroidManifest.xml` end-to-end (the prior `FileNotFoundException` is gone) and stops at the next
+  asset native **`AssetManager.retrieveAttributes(long,int[],int,long,long)Z`** (ARSC/TypedArray
+  frontier) — `Application.onCreate` NOT yet reached (faithful, not faked; §6 2026-06-05). The live
+  JNI path is dev-host-only (ART aborts on worker threads), so it is validated via `eclipse run`. The
+  `apk` reader was validated against the **real** Roblox manifest → ground truth (com.roblox.client /
+  ActivitySplash / 26 / 35 / largeHeap=false). **`eclipse run <apk>` boots the vendored ART VM**
+  (libcore, JNI_OK) on this host.
 - **Repo:** git initialized; committed & pushed to `origin/main`
   (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
 - **What exists:** 7 docs + `README` + `eclipse` crate. **M1 done so far:**
@@ -565,22 +568,28 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      pack/unpack, bounds+generation-checked so a stale/fabricated `jlong` is a typed `Err` not UB,
      `jlong=0` reserved, 6 unit tests), and `drive_steps_1_to_3` now passes a real
      `window_registry::allocate()` handle to `createApplication(J)` instead of `0` (still only *stored*
-     in steps 1–3). **NEXT (in order): (1) THE ASSET-LOADING FRONTIER — the discovery loop hit the
-     denylisted real-asset boundary.** Via the loop (`cargo run -- run …/demo_app.apk`) the lifecycle
-     advances through `Context` static-init into `createApplication`; the three signature-only no-op
-     AssetManager stubs `native_setApkAssets`/`setConfiguration`/`openXmlAssetNative` are now bound
-     (DENYLISTED → signature-only, see §6 2026-06-05), and `Log.println_native`/`AssetManager.init`/
-     `Environment.native_get_app_data_dir` are bound (non-GTK Rust). **It is NO LONGER a missing-native
-     gap — it is a Java exception:** `Context.<clinit>` (`openXmlResourceParser` →
-     `AssetManager.openXmlBlockAsset`) throws **`java.io.FileNotFoundException: Asset XML file:
-     AndroidManifest.xml`** → `ExceptionInInitializerError` at step 1 `createApplication`, because the
-     signature-only `openXmlAssetNative` soundly returns the `0` "no-asset" handle (a no-op stub cannot
-     read the APK's `AndroidManifest.xml` — the asset/zip/XML machinery is denylisted). `onCreate` is
-     **NOT reached.** Reaching it requires a **functioning AssetManager** that actually reads
-     `AndroidManifest.xml` (and resources) from the APK — i.e. Eclipse's own asset-table handle stored
-     in `mObject` + real `openXmlAssetNative`/asset-read natives backed by the `apk` crate's zip reader
-     (NOT ATL's C asset layer, NOT GTK). This is a real subsystem (component-map: assets), main-loop /
-     non-subagent work given the cyber-safeguard on asset internals. Then **(2)** the deref-ing Window natives for
+     in steps 1–3). ✅ **THE ASSET-XML FRONTIER IS NOW CROSSED (2026-06-05, §6):** Eclipse-owned,
+     non-GTK AssetManager XML backing built on the `apk`+`axml` crate. `openXmlAssetNative` now
+     **really** reads the named entry from the APK zip (`Apk::read_entry`, made `pub`), parses it via a
+     new **general AXML event walk** `axml::parse_document` → `XmlDocument` (events + resolved
+     elements/attributes/text/namespaces; the 5-field `read_manifest` path is untouched), stores it in a
+     sound generational-slab **`framework::xml_registry`** (mirrors `window_registry`: index handle, NOT
+     a raw pointer — a stale/fabricated `jlong` is a typed `Err`, never UB), and returns the non-zero
+     block handle. The `FileNotFoundException` is **gone**; the surfaced `XmlBlock` parser natives are
+     bound against the parsed tree (`nativeCreateParseState`/`nativeNext`/`nativeGetName`/
+     `nativeGetAttributeIndex`/`nativeGetAttributeStringValue`/`nativeDestroyParseState`/`nativeDestroy`,
+     all non-GTK, signatures from the ART `No implementation found` lines + standard XmlPullParser/
+     XmlBlock semantics). **NEXT (in order): (1) THE RESOURCE-TABLE / TypedArray FRONTIER (new stop, the
+     genuine next asset subsystem).** The lifecycle now advances past the whole XML parse and stops at
+     **`AssetManager.retrieveAttributes(long parseState, int[] attrs, int parser, long outValues, long
+     outIndices)Z`** (run log `/tmp/eclipse-run.log`, EXIT=1) — the styled-attribute path that resolves a
+     tag's framework attributes against **`resources.arsc` (ARSC)** and writes packed `TypedValue`
+     entries into **native off-heap buffers addressed by raw `long` pointers**. This is a distinct,
+     larger asset subsystem (ARSC decode + the native TypedArray ABI), NOT one more easy native;
+     `onCreate` is **NOT reached** (reported faithfully, not faked). It needs: an Eclipse-owned ARSC
+     reader (grow `axml`/`apk` into a `resources.arsc` reader — component-map note line 145) + a sound
+     way to fill the framework's native `long` output arrays. Main-loop / non-subagent work (asset
+     internals denylisted). Then **(2)** the deref-ing Window natives for
      step 4 (`set_jobject`/`set_title`/`set_layout` metadata via `register_native_methods` + a descriptor
      guard vs `Window.java`, then the deferred `set_widget_as_root`/`take_input_queue`) + associating the
      real winit `Window` with the registry slot. **BIGGEST RISK recorded:** the View hierarchy is fully
@@ -1103,6 +1112,50 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `#[allow]`/`#[expect]` left behind (§2.2). Full gate green: fmt --check / build --all-targets /
   clippy `-D warnings` / test (**52 unit + 2 compile_fail doctests**) / release (`panic = "abort"`/LTO
   retained). No new deps. Run log: `/tmp/eclipse-run.log` (EXIT=1, the expected typed-exception exit).
+- **2026-06-05** — 🎉 **Asset-XML frontier CROSSED: Eclipse-owned non-GTK AssetManager XML backing
+  (apk+axml), `FileNotFoundException` cleared, full `AndroidManifest.xml` parse+walk; new stop is the
+  ARSC/TypedArray frontier.** Built the smallest REAL Eclipse-owned AssetManager backing on Eclipse's
+  own `apk`/`axml` crates (NOT ATL's C asset layer, NOT GTK — asset internals denylisted; grounded in
+  `src/apk/**`, `src/axml`, the ART `No implementation found` lines, and standard XmlPullParser/XmlBlock
+  semantics). **(a)** `src/apk/axml.rs` gained a **general, total event-walk** `parse_document(&[u8])
+  -> XmlDocument` (flat `events` + resolved `elements`/`attributes`(with raw `Res_value` type/data +
+  resolved string)/`texts`/`namespaces`; handles START/END element, CDATA, start/end-namespace chunks;
+  same bounds-checked `Chunk`/`StringPool`/checked-reader machinery → never panics; the 5-field
+  `read_manifest` is unchanged). `axml` is now `pub mod`; `Apk::read_entry` is now `pub`. **(b)** New
+  sound generational-slab **`src/framework/xml_registry.rs`** (`#![forbid(unsafe_code)]`, std-only, no
+  new dep) — mirrors `window_registry`: the `jlong` block handle is an **index** (NOT `Box::into_raw`),
+  bounds+generation-checked, a stale/fabricated handle is a typed `Err` not UB; holds the parsed
+  `XmlDocument` + a parser cursor (`cursor`/`current`). **(c)** `openXmlAssetNative(int, String)` is now
+  **REAL**: it reads the named entry from the APK zip via `Apk::read_entry` (APK path from the existing
+  `APK_PATH` OnceLock), parses it with `parse_document`, stores it, returns the non-zero handle; a
+  genuine open/parse failure returns `0` (→ the framework's `FileNotFoundException`, the correct,
+  non-faked trigger). **(d)** Bound the `XmlBlock` parser natives the dev-host run surfaced in turn
+  (each from the exact ART `No implementation found` signature), all against the parsed tree via the
+  registry: `nativeCreateParseState (J)J`, `nativeNext (J)I` (XmlPullParser event ints, skipping ns
+  nodes), `nativeDestroyParseState (J)V` (validate-only — block==parse-state, freed by nativeDestroy),
+  `nativeGetName (J)Ljava/lang/String;`, `nativeDestroy (J)V`, `nativeGetAttributeIndex
+  (JLjava/lang/String;Ljava/lang/String;)I`, `nativeGetAttributeStringValue (JI)Ljava/lang/String;`.
+  Each is `extern "system"` under `EnvUnowned::with_env` (`catch_unwind`) + `resolve::<LogErrorAndDefault>`
+  neutral default; all handles go through the bounds+generation-checked registry — no raw deref, no
+  panic across JNI (`panic = "abort"` kept). **FAITHFUL lifecycle progress:** the demo-APK run
+  (`cargo run --release -- run …/demo_app.apk`) now drives `Context.<clinit>` **through** the entire
+  `openXmlResourceParser`→`openXmlBlockAsset`→`XmlBlock` parse+walk of `AndroidManifest.xml` (the
+  `FileNotFoundException` is gone; no invalid-handle warnings) and stops at the **next** native
+  **`AssetManager.retrieveAttributes(long, int[], int, long, long)Z`** — the styled-attribute path that
+  needs **`resources.arsc` (ARSC) resolution + writing packed `TypedValue`s into native off-heap buffers
+  via raw `long` pointers**. That is a distinct, larger asset subsystem (ARSC + TypedArray ABI), NOT one
+  more easy native; **`Application.onCreate` is NOT reached** (reported faithfully, not faked; this is a
+  DECIDE=stop subsystem boundary). Regression guards (host-independent, in-harness): 2 `apk` tests
+  (`parse_document` walks both UTF-8 + UTF-16 fixture manifests with resolved attrs/balanced events;
+  totality on garbage), 5 `xml_registry` tests (distinct-nonzero handles, freed-handle-stale/no-alias,
+  out-of-range/null/fabricated rejection, double-free, cursor walk), and 1 `framework` test pinning all
+  7 XmlBlock native names+JNI descriptors + the event constants against the ART-reported signatures
+  (a transcription regression → `NoSuchMethodError` at boot). Full gate green: fmt --check / build
+  --all-targets / clippy `-D warnings` / test (**60 unit + 2 compile_fail doctests**) / release
+  (`panic = "abort"`/LTO retained). No new deps (`zip`/`sha2` already in `apk`; std-only registry). Run
+  log: `/tmp/eclipse-run.log` (EXIT=1, the expected stop at `retrieveAttributes`). **NEXT:** the
+  ARSC/TypedArray frontier — grow an Eclipse-owned `resources.arsc` reader + a sound way to fill the
+  framework's native `long` output arrays (see §5 next-actions item 1).
 
 ---
 

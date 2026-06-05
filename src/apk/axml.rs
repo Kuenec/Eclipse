@@ -30,8 +30,11 @@ use std::fmt;
 // --- ResChunk_header types (the `type` field) ---------------------------------------------
 const RES_STRING_POOL_TYPE: u16 = 0x0001;
 const RES_XML_TYPE: u16 = 0x0003;
+const RES_XML_START_NAMESPACE_TYPE: u16 = 0x0100;
+const RES_XML_END_NAMESPACE_TYPE: u16 = 0x0101;
 const RES_XML_START_ELEMENT_TYPE: u16 = 0x0102;
 const RES_XML_END_ELEMENT_TYPE: u16 = 0x0103;
+const RES_XML_CDATA_TYPE: u16 = 0x0104;
 
 // --- String pool flags ---
 const UTF8_FLAG: u32 = 0x0100;
@@ -144,6 +147,290 @@ pub(super) fn read_manifest(bytes: &[u8]) -> Result<AxmlManifest, AxmlError> {
 
     // Second pass: walk the node stream, resolving strings on demand.
     walk(&root, &pool)
+}
+
+// === General XML event document (for the framework's XmlResourceParser) ===================
+//
+// 2026-06-05: AOSP's `AssetManager.openXmlBlockAsset` parses a binary-XML asset into a native
+// `ResXMLTree`, wraps it as an `XmlBlock`, and exposes an `XmlBlock.Parser` (an
+// `XmlResourceParser`/`XmlPullParser`) that the framework walks event-by-event (START_TAG,
+// END_TAG, TEXT, …) reading attributes by index. The flat AXML node stream this reader already
+// iterates for the manifest IS that event sequence; [`parse_document`] materializes it as an owned,
+// fully-string-resolved [`XmlDocument`] so Eclipse's own (non-GTK) XmlBlock/parser natives can walk
+// it without re-reading the raw bytes per call. The five-field [`read_manifest`] path is unchanged.
+
+/// XmlPullParser event types, matching `org.xmlpull.v1.XmlPullParser` (stable public constants
+/// AOSP's `XmlBlock.Parser.next()` returns). Only the events a binary-XML asset produces are
+/// represented; the parser cursor reports `START_DOCUMENT` before the first event and
+/// `END_DOCUMENT` after the last (synthesized by the walk natives, not stored as nodes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XmlEventKind {
+    /// `XmlPullParser.START_TAG` (2): an element opened. Index into [`XmlDocument::elements`].
+    StartTag(usize),
+    /// `XmlPullParser.END_TAG` (3): an element closed. Index into [`XmlDocument::elements`].
+    EndTag(usize),
+    /// `XmlPullParser.TEXT` (4): a CDATA/text node. Index into [`XmlDocument::texts`].
+    Text(usize),
+    /// `XmlPullParser.START_DOCUMENT`-adjacent namespace bookkeeping (`startNamespace`). Carries
+    /// the (prefix, uri) string-pool refs resolved to indices in [`XmlDocument::namespaces`].
+    StartNamespace(usize),
+    /// `endNamespace` bookkeeping (closing a prefix scope).
+    EndNamespace(usize),
+}
+
+/// One element (start-tag) with its resolved tag, optional namespace, and attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlElement {
+    /// Resolved element namespace URI, if any.
+    pub namespace: Option<String>,
+    /// Resolved element local name (e.g. `manifest`, `activity`).
+    pub name: Option<String>,
+    /// The element's attributes, in declaration order.
+    pub attributes: Vec<XmlAttribute>,
+    /// Source line number from the AXML node header (0 if absent) — AOSP's `getLineNumber`.
+    pub line: u32,
+}
+
+/// One attribute of a start-tag, fully decoded: resolved strings plus the raw `Res_value`
+/// type/data the parser natives expose (`getAttributeValueType`/`getAttributeValueData`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlAttribute {
+    /// Resolved attribute namespace URI, if any (`android:*` → [`ANDROID_NS_URI`]).
+    pub namespace: Option<String>,
+    /// Resolved attribute local name (e.g. `name`, `minSdkVersion`).
+    pub name: Option<String>,
+    /// The attribute's resource id (`ResXMLTree_attribute.name` resolves to a resource id via the
+    /// resource-map chunk); `0` when not a framework resource attribute. AOSP's
+    /// `getAttributeNameResource`.
+    pub name_resource: u32,
+    /// The `Res_value.dataType` byte (e.g. [`TYPE_STRING`], [`TYPE_INT_DEC`]).
+    pub value_type: u8,
+    /// The `Res_value.data` word (a string-pool ref for [`TYPE_STRING`], else the raw int/bool/etc.).
+    pub value_data: u32,
+    /// The resolved string value when `value_type == TYPE_STRING`, else `None`.
+    pub value_string: Option<String>,
+}
+
+/// A CDATA/text node with its resolved text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlText {
+    /// The resolved text content.
+    pub text: Option<String>,
+    /// Source line number (0 if absent).
+    pub line: u32,
+}
+
+/// A resolved namespace declaration (prefix → uri) from a start/end-namespace node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlNamespace {
+    /// The namespace prefix (e.g. `android`), if resolvable.
+    pub prefix: Option<String>,
+    /// The namespace URI (e.g. [`ANDROID_NS_URI`]), if resolvable.
+    pub uri: Option<String>,
+}
+
+/// A fully-parsed binary-XML document as an event sequence with resolved strings.
+///
+/// The owned, allocation-once representation the framework's (non-GTK) XmlBlock/parser natives walk
+/// (see the module note above). Built by [`parse_document`]; never panics on hostile input (every
+/// field comes through the same bounds-checked readers as [`read_manifest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlDocument {
+    /// The flat event stream, in document order.
+    pub events: Vec<XmlEventKind>,
+    /// Element table referenced by [`XmlEventKind::StartTag`]/[`EndTag`](XmlEventKind::EndTag).
+    pub elements: Vec<XmlElement>,
+    /// Text table referenced by [`XmlEventKind::Text`].
+    pub texts: Vec<XmlText>,
+    /// Namespace table referenced by [`XmlEventKind::StartNamespace`]/[`EndNamespace`](XmlEventKind::EndNamespace).
+    pub namespaces: Vec<XmlNamespace>,
+}
+
+/// Parse binary AXML `bytes` into an owned [`XmlDocument`] event sequence with all strings resolved.
+///
+/// Returns a typed [`AxmlError`] for any malformed input — never panics, never reads out of bounds
+/// (the same totality guarantee as [`read_manifest`]; both go through [`Chunk`]/[`StringPool`] and
+/// the checked little-endian readers). Used by Eclipse's own AssetManager XML backing to satisfy
+/// `openXmlAssetNative` for `AndroidManifest.xml` (and other XML assets) without the GTK-coupled C
+/// asset layer.
+pub fn parse_document(bytes: &[u8]) -> Result<XmlDocument, AxmlError> {
+    let root = Chunk::parse(bytes, 0)?;
+    if root.kind != RES_XML_TYPE {
+        return Err(AxmlError::NoXmlRoot);
+    }
+    let pool = find_string_pool(&root)?;
+
+    let mut doc = XmlDocument {
+        events: Vec::new(),
+        elements: Vec::new(),
+        texts: Vec::new(),
+        namespaces: Vec::new(),
+    };
+    let mut depth: usize = 0;
+
+    for child in root.children() {
+        let child = child?;
+        match child.kind {
+            RES_XML_START_ELEMENT_TYPE => {
+                // Cap nesting like the manifest walk so a hostile deeply-nested asset cannot grow
+                // the events/elements vectors without bound via the start/end pairing.
+                depth = depth.checked_add(1).ok_or(AxmlError::Overflow)?;
+                if depth > MAX_DEPTH {
+                    return Err(AxmlError::TooDeep);
+                }
+                let element = parse_full_element(&child, &pool)?;
+                let idx = doc.elements.len();
+                doc.elements.push(element);
+                doc.events.push(XmlEventKind::StartTag(idx));
+            }
+            RES_XML_END_ELEMENT_TYPE => {
+                depth = depth.checked_sub(1).ok_or(AxmlError::UnbalancedElement)?;
+                // The end-tag mirrors the most recent still-open start-tag's element index. AOSP's
+                // parser reports the same element (name/ns) for END_TAG; recover it by scanning the
+                // event stack for the matching unclosed StartTag.
+                let idx = matching_start_index(&doc.events).ok_or(AxmlError::UnbalancedElement)?;
+                doc.events.push(XmlEventKind::EndTag(idx));
+            }
+            RES_XML_CDATA_TYPE => {
+                let text = parse_cdata(&child, &pool)?;
+                let idx = doc.texts.len();
+                doc.texts.push(text);
+                doc.events.push(XmlEventKind::Text(idx));
+            }
+            RES_XML_START_NAMESPACE_TYPE => {
+                let ns = parse_namespace(&child, &pool)?;
+                let idx = doc.namespaces.len();
+                doc.namespaces.push(ns);
+                doc.events.push(XmlEventKind::StartNamespace(idx));
+            }
+            RES_XML_END_NAMESPACE_TYPE => {
+                let ns = parse_namespace(&child, &pool)?;
+                let idx = doc.namespaces.len();
+                doc.namespaces.push(ns);
+                doc.events.push(XmlEventKind::EndNamespace(idx));
+            }
+            _ => {} // string pool / resource map / unknown chunks are skipped by size.
+        }
+    }
+    Ok(doc)
+}
+
+/// Find the element index of the innermost still-open start-tag, given the events so far (the last
+/// event being the end-tag we are pairing). Counts start/end tags from the end to find the match.
+fn matching_start_index(events: &[XmlEventKind]) -> Option<usize> {
+    let mut closed = 0usize;
+    for ev in events.iter().rev() {
+        match ev {
+            XmlEventKind::EndTag(_) => closed += 1,
+            XmlEventKind::StartTag(idx) => {
+                if closed == 0 {
+                    return Some(*idx);
+                }
+                closed -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse a start-element chunk into a fully-resolved [`XmlElement`] (tag + ns + all attributes with
+/// raw type/data). Mirrors [`parse_start_element`]'s bounds checks but keeps every attribute and its
+/// `Res_value` type/data so the parser natives can report them.
+fn parse_full_element(chunk: &Chunk, pool: &StringPool) -> Result<XmlElement, AxmlError> {
+    let buf = chunk.bytes;
+    let line = read_u32(buf, 8)?; // ResXMLTree_node.lineNumber (offset 8 within the node).
+    let ext = XML_NODE_HEADER_SIZE;
+    let ns_ref = read_u32(buf, ext)?;
+    let name_ref = read_u32(buf, ext.checked_add(4).ok_or(AxmlError::Overflow)?)?;
+    let attribute_start = read_u16(buf, ext.checked_add(8).ok_or(AxmlError::Overflow)?)? as usize;
+    let attribute_size = read_u16(buf, ext.checked_add(10).ok_or(AxmlError::Overflow)?)? as usize;
+    let attribute_count = read_u16(buf, ext.checked_add(12).ok_or(AxmlError::Overflow)?)? as usize;
+
+    let namespace = pool.get(ns_ref)?;
+    let name = pool.get(name_ref)?;
+
+    if attribute_size < ATTRIBUTE_MIN_SIZE && attribute_count > 0 {
+        return Err(AxmlError::BadChunk);
+    }
+    let attrs_base = ext
+        .checked_add(attribute_start)
+        .ok_or(AxmlError::Overflow)?;
+    let array_len = attribute_count
+        .checked_mul(attribute_size)
+        .ok_or(AxmlError::Overflow)?;
+    let attrs_end = attrs_base
+        .checked_add(array_len)
+        .ok_or(AxmlError::Overflow)?;
+    if attrs_end > buf.len() {
+        return Err(AxmlError::Truncated);
+    }
+
+    let mut attributes = Vec::with_capacity(attribute_count);
+    for i in 0..attribute_count {
+        let base = attrs_base
+            .checked_add(i.checked_mul(attribute_size).ok_or(AxmlError::Overflow)?)
+            .ok_or(AxmlError::Overflow)?;
+        let a_ns_ref = read_u32(buf, base)?;
+        let a_name_ref = read_u32(buf, base.checked_add(4).ok_or(AxmlError::Overflow)?)?;
+        let value_type = read_u8(buf, base.checked_add(15).ok_or(AxmlError::Overflow)?)?;
+        let value_data = read_u32(buf, base.checked_add(16).ok_or(AxmlError::Overflow)?)?;
+
+        let a_ns = pool.get(a_ns_ref)?;
+        let a_name = pool.get(a_name_ref)?;
+        // For TYPE_STRING the data word is itself a string-pool ref; resolve it for value_string.
+        let value_string = if value_type == TYPE_STRING {
+            pool.get(value_data)?
+        } else {
+            None
+        };
+        attributes.push(XmlAttribute {
+            namespace: a_ns,
+            name: a_name,
+            // The attribute's resource id is not in the string pool; aapt stores it in the
+            // resource-map chunk indexed by attribute position. We don't decode that chunk here
+            // (the framework reads framework-resource attrs by name in this asset), so report 0 —
+            // never a fabricated id. A later increment can decode RES_XML_RESOURCE_MAP_TYPE.
+            name_resource: 0,
+            value_type,
+            value_data,
+            value_string,
+        });
+    }
+    Ok(XmlElement {
+        namespace,
+        name,
+        attributes,
+        line,
+    })
+}
+
+/// Parse a CDATA chunk into a resolved [`XmlText`].
+fn parse_cdata(chunk: &Chunk, pool: &StringPool) -> Result<XmlText, AxmlError> {
+    let buf = chunk.bytes;
+    let line = read_u32(buf, 8)?;
+    // ResXMLTree_cdataExt follows the 16-byte node header: `data` (ResStringPool_ref) then a
+    // Res_value; the resolved text comes from the `data` string-pool ref.
+    let data_ref = read_u32(buf, XML_NODE_HEADER_SIZE)?;
+    let text = pool.get(data_ref)?;
+    Ok(XmlText { text, line })
+}
+
+/// Parse a start/end-namespace chunk into a resolved [`XmlNamespace`].
+fn parse_namespace(chunk: &Chunk, pool: &StringPool) -> Result<XmlNamespace, AxmlError> {
+    let buf = chunk.bytes;
+    // ResXMLTree_namespaceExt follows the 16-byte node header: `prefix` then `uri`
+    // (both ResStringPool_ref).
+    let prefix_ref = read_u32(buf, XML_NODE_HEADER_SIZE)?;
+    let uri_ref = read_u32(
+        buf,
+        XML_NODE_HEADER_SIZE
+            .checked_add(4)
+            .ok_or(AxmlError::Overflow)?,
+    )?;
+    let prefix = pool.get(prefix_ref)?;
+    let uri = pool.get(uri_ref)?;
+    Ok(XmlNamespace { prefix, uri })
 }
 
 /// A validated chunk view: its bounds are guaranteed inside `buf`, and `body()` returns only
