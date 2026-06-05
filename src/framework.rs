@@ -2508,15 +2508,15 @@ fn view_class_name(env: &mut Env, obj: &JObject) -> Option<String> {
     name.try_to_string(env).ok()
 }
 
-/// `View.native_setPadding(long widget, int left, int top, int right, int bottom)` → validate the
-/// view handle; no-op (2026-06-05).
+/// `View.native_setPadding(long widget, int left, int top, int right, int bottom)` → record the
+/// padding on the view's [`view_registry`] peer (2026-06-05).
 ///
 /// JNI ABI: an INSTANCE native returning void, so the parameters are
 /// `(EnvUnowned, JObject this, jlong widget, jint left, jint top, jint right, jint bottom)`. Padding
-/// is layout data Eclipse does not act on yet (no layout/measure/draw without the deferred surface),
-/// so this validates the `widget` handle through the bounds+generation-checked [`view_registry`]
-/// (a stale/fabricated handle is logged + ignored, never UB) and otherwise no-ops. Binding it lets
-/// the View constructor proceed; the padding can be recorded once layout lands.
+/// is the gap inside the view around its content; Eclipse's measure/layout pass (`graphics.rs`) honors
+/// it when sizing/positioning. This records `[left, top, right, bottom]` onto the peer's
+/// [`view_registry::LayoutParams::padding`] through the bounds+generation-checked registry (a
+/// stale/fabricated handle is logged + ignored, never UB).
 ///
 /// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
 /// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
@@ -2530,19 +2530,20 @@ extern "system" fn view_native_set_padding<'local>(
     bottom: jint,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
-            tracing::debug!(
+        match view_registry::with_view(widget, |v| {
+            v.layout.padding = [left, top, right, bottom];
+        }) {
+            Ok(()) => tracing::trace!(
+                target: "android.view.View",
+                widget, left, top, right, bottom,
+                "View.native_setPadding: recorded padding on view peer"
+            ),
+            Err(e) => tracing::debug!(
                 target: "android.view.View",
                 widget,
                 error = %e,
                 "View.native_setPadding: invalid view handle (ignored)"
-            );
-        } else {
-            tracing::trace!(
-                target: "android.view.View",
-                widget, left, top, right, bottom,
-                "View.native_setPadding: validated handle, no-op (layout deferred)"
-            );
+            ),
         }
         Ok(())
     })
@@ -2550,13 +2551,15 @@ extern "system" fn view_native_set_padding<'local>(
 }
 
 /// `View.native_setLayoutParams(long widget, int width, int height, int gravity, float weight,
-/// int leftMargin, int topMargin, int rightMargin, int bottomMargin)` → validate handle; no-op
-/// (layout deferred, 2026-06-05).
+/// int leftMargin, int topMargin, int rightMargin, int bottomMargin)` → record the layout params on
+/// the view's [`view_registry`] peer (2026-06-05).
 ///
-/// JNI ABI: an INSTANCE native returning void (`View.java` line 1167). Layout sizing/margins/gravity
-/// are applied once real layout lands (deferred); for now this validates the `widget` handle through
-/// the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored, never UB) and
-/// no-ops, letting `ViewGroup.addView` proceed.
+/// JNI ABI: an INSTANCE native returning void (`View.java` line 1167). `width`/`height` use Android's
+/// sentinels (`MATCH_PARENT` = -1, `WRAP_CONTENT` = -2, else exact px), `gravity` is the packed
+/// `layout_gravity` bitmask, `weight` the `layout_weight`. Eclipse's measure/layout pass (`graphics.rs`)
+/// consumes these to compute each view's absolute rect. This records them onto the peer's
+/// [`view_registry::LayoutParams`] through the bounds+generation-checked registry (a bad handle is
+/// logged + ignored, never UB), preserving any padding already set by `native_setPadding`.
 ///
 /// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
 /// the `()` default on error/panic.
@@ -2567,29 +2570,34 @@ extern "system" fn view_native_set_layout_params<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     widget: jlong,
-    _width: jint,
-    _height: jint,
-    _gravity: jint,
-    _weight: f32,
-    _left_margin: jint,
-    _top_margin: jint,
-    _right_margin: jint,
-    _bottom_margin: jint,
+    width: jint,
+    height: jint,
+    gravity: jint,
+    weight: f32,
+    left_margin: jint,
+    top_margin: jint,
+    right_margin: jint,
+    bottom_margin: jint,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
-            tracing::debug!(
+        match view_registry::with_view(widget, |v| {
+            v.layout.width = width;
+            v.layout.height = height;
+            v.layout.gravity = gravity;
+            v.layout.weight = weight;
+            v.layout.margins = [left_margin, top_margin, right_margin, bottom_margin];
+        }) {
+            Ok(()) => tracing::trace!(
+                target: "android.view.View",
+                widget, width, height, gravity, weight,
+                "View.native_setLayoutParams: recorded layout params on view peer"
+            ),
+            Err(e) => tracing::debug!(
                 target: "android.view.View",
                 widget,
                 error = %e,
                 "View.native_setLayoutParams: invalid view handle (ignored)"
-            );
-        } else {
-            tracing::trace!(
-                target: "android.view.View",
-                widget,
-                "View.native_setLayoutParams: validated handle, no-op (layout deferred)"
-            );
+            ),
         }
         Ok(())
     })

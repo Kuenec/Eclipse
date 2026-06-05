@@ -219,20 +219,29 @@ fn choose_image_count(caps: &vk::SurfaceCapabilitiesKHR) -> u32 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// View-tree draw: layout + colored-quad geometry (2026-06-05)
+// View-tree draw: measure + layout + colored-quad geometry (2026-06-05)
 //
 // The framework records the inflated View tree in `framework::view_registry`
-// (`snapshot_tree()` → a flat depth-first `Vec<RenderNode>`). To make that content VISIBLE in the
-// swapchain we (1) assign each node a screen rect (a MINIMAL layout — a vertical stack, indented by
-// nesting depth), then (2) emit two triangles per rect as `QuadVertex`es the quad pipeline draws.
+// (`snapshot_tree()` → a flat pre-order `Vec<RenderNode>`, each node carrying its `LayoutParams` +
+// child indices). To make that content VISIBLE in the swapchain we (1) run a real Android-style
+// measure + layout cascade over the tree to compute each view's absolute pixel rect, then (2) emit
+// two triangles per rect as `QuadVertex`es the quad pipeline draws.
 //
-// This layout is intentionally minimal and documented as such: real measure/layout per
-// `LayoutParams`/gravity/weight (the recorded params were no-op stubs) is a follow-up. The goal of
-// this increment is a visible, non-blank rendering of the recorded tree shape + text, not a faithful
-// Android layout engine. The functions here do NO Vulkan work so they are unit-testable without a GPU.
+// Measure/layout follows common-case Android semantics (general public Android docs, implemented
+// from first principles here — see `measure_node`/`layout_node`):
+//   * LayoutParams.width/height: MATCH_PARENT (-1) → the parent's available size; WRAP_CONTENT (-2)
+//     → the view's content size (a TextView's measured text extent; a container's laid-out children);
+//     else the exact pixel count.
+//   * MeasureSpec packs a mode (UNSPECIFIED / EXACTLY / AT_MOST) with a size; the root is measured
+//     EXACTLY at the swapchain extent and the cascade flows top-down.
+//   * FrameLayout (and any unknown container) stacks children at the parent origin honoring gravity.
+//   * LinearLayout(vertical) stacks children top-to-bottom, (horizontal) left-to-right, honoring
+//     gravity; a trivial layout_weight distributes leftover space.
+// Out of scope (documented): RelativeLayout / ConstraintLayout, exact multi-pass weight, baseline
+// alignment, scrolling. The functions here do NO Vulkan work so they are unit-testable without a GPU.
 // ---------------------------------------------------------------------------------------------
 
-use crate::framework::view_registry::RenderNode;
+use crate::framework::view_registry::{LayoutParams, RenderNode, MATCH_PARENT};
 
 /// One vertex for the colored-quad pipeline: a position already in Vulkan NDC (x,y ∈ [-1,1], y down)
 /// plus an RGBA color. `#[repr(C)]` so the in-memory layout matches the vertex input description the
@@ -264,13 +273,6 @@ struct LaidOutView {
     text: Option<String>,
 }
 
-/// Height in pixels of one stacked view row, and the padding/indent step. Small fixed values keep
-/// the minimal layout readable; a real layout pass replaces these with measured sizes.
-const ROW_HEIGHT_PX: f32 = 64.0;
-const ROW_GAP_PX: f32 = 8.0;
-const INDENT_PX: f32 = 24.0;
-const MARGIN_PX: f32 = 16.0;
-
 /// A small fixed palette so nested views are visually distinguishable by depth. Indexed by
 /// `depth % len`. Colors are mid-tones that read against the blue clear background.
 const DEPTH_PALETTE: [[f32; 4]; 4] = [
@@ -280,34 +282,431 @@ const DEPTH_PALETTE: [[f32; 4]; 4] = [
     [0.55, 0.64, 0.80, 1.0], // depth 3+
 ];
 
-/// Assign each recorded view a screen rect via a MINIMAL vertical-stack layout against `extent`.
-///
-/// 2026-06-05: each node becomes one full-width (minus margins, minus a per-depth indent) row,
-/// stacked top-to-bottom in the snapshot's pre-order. This is deliberately not a faithful Android
-/// layout — `LayoutParams`/gravity/weight are ignored (they were no-op stubs in the framework) — it
-/// just turns the recorded tree shape + text into visible, depth-distinguished rectangles. Pure
-/// function (no Vulkan) so it is unit-testable without a GPU.
-fn layout_views(nodes: &[RenderNode], extent: vk::Extent2D) -> Vec<LaidOutView> {
-    let width = extent.width as f32;
-    let mut out = Vec::with_capacity(nodes.len());
-    let mut y = MARGIN_PX;
-    for node in nodes {
-        let indent = INDENT_PX * node.depth as f32;
-        let x = MARGIN_PX + indent;
-        // Clamp width so deep indents never produce a negative/zero width.
-        let w = (width - x - MARGIN_PX).max(1.0);
-        let color = DEPTH_PALETTE[(node.depth as usize).min(DEPTH_PALETTE.len() - 1)];
-        out.push(LaidOutView {
-            x,
-            y,
-            w,
-            h: ROW_HEIGHT_PX,
-            color,
-            text: node.text.clone(),
-        });
-        y += ROW_HEIGHT_PX + ROW_GAP_PX;
+/// Fallback content size (pixels) for a `WRAP_CONTENT` view with no measurable content (e.g. a leaf
+/// `View` with no text, or a `TextView` measured without a font). Small but non-zero so the quad is
+/// visible. A real font replaces the height with the line height for text.
+const WRAP_FALLBACK_W: f32 = 64.0;
+const WRAP_FALLBACK_H: f32 = TEXT_PX;
+
+/// A `MeasureSpec` mode — how the parent constrains a child's size during measure. Standard Android
+/// semantics (`android.view.View.MeasureSpec`): `Unspecified` = no constraint (size yourself to
+/// content), `Exactly` = take exactly this size, `AtMost` = at most this size (size to content,
+/// clamped). 2026-06-05.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecMode {
+    Unspecified,
+    Exactly,
+    AtMost,
+}
+
+/// A measure constraint passed top-down: a [`SpecMode`] plus a size in pixels. Mirrors a packed
+/// Android `MeasureSpec` (mode + size) but kept as a struct since Eclipse never crosses the JNI
+/// boundary with it (the cascade runs entirely renderer-side over the snapshot).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeasureSpec {
+    mode: SpecMode,
+    size: f32,
+}
+
+impl MeasureSpec {
+    /// Resolve a child's measured size on one axis from its `LayoutParams` dimension and the parent's
+    /// spec for that axis, returning `(measured_size, child_spec_for_recursing_into_the_child)`.
+    ///
+    /// 2026-06-05, standard Android `getChildMeasureSpec` logic, common case:
+    ///   * exact px (`>= 0`)        → `Exactly(px)`.
+    ///   * `MATCH_PARENT` (-1)      → fill the parent's available size: `Exactly(parent.size)` when the
+    ///     parent is `Exactly`/`AtMost`, else `Unspecified` (parent has no bound to match).
+    ///   * `WRAP_CONTENT` (-2)      → size to content, bounded by the parent: `AtMost(parent.size)`
+    ///     (or `Unspecified` when the parent is unbounded).
+    ///
+    /// `content` is the view's own measured content size (text/children extent), used only to settle
+    /// the returned `measured_size` for the `WRAP`/`Unspecified` cases.
+    fn resolve(self, dimension: i32, content: f32) -> (f32, MeasureSpec) {
+        let avail = self.size.max(0.0);
+        if dimension >= 0 {
+            let px = dimension as f32;
+            return (
+                px,
+                MeasureSpec {
+                    mode: SpecMode::Exactly,
+                    size: px,
+                },
+            );
+        }
+        match dimension {
+            MATCH_PARENT => match self.mode {
+                SpecMode::Exactly | SpecMode::AtMost => (
+                    avail,
+                    MeasureSpec {
+                        mode: SpecMode::Exactly,
+                        size: avail,
+                    },
+                ),
+                SpecMode::Unspecified => (
+                    content,
+                    MeasureSpec {
+                        mode: SpecMode::Unspecified,
+                        size: 0.0,
+                    },
+                ),
+            },
+            // WRAP_CONTENT (and any other negative sentinel → treat as wrap).
+            _ => match self.mode {
+                SpecMode::Exactly | SpecMode::AtMost => (
+                    content.min(avail),
+                    MeasureSpec {
+                        mode: SpecMode::AtMost,
+                        size: avail,
+                    },
+                ),
+                SpecMode::Unspecified => (
+                    content,
+                    MeasureSpec {
+                        mode: SpecMode::Unspecified,
+                        size: 0.0,
+                    },
+                ),
+            },
+        }
     }
-    out
+}
+
+/// Measures the pixel extent of a single line of text. Built from the renderer's [`GlyphAtlas`] so
+/// `WRAP_CONTENT` TextViews size to their real glyph metrics; when no font is available the cascade
+/// uses [`WRAP_FALLBACK_W`]/[`WRAP_FALLBACK_H`] instead. Pure data (no GPU) so the cascade stays
+/// unit-testable.
+#[derive(Clone, Copy)]
+struct TextMeasure<'a> {
+    atlas: &'a GlyphAtlas,
+}
+
+impl TextMeasure<'_> {
+    /// The pixel width of `text` = the sum of each glyph's advance (unknown glyphs contribute 0, as
+    /// they are skipped at draw time too). Plus the text inset so the rect encloses the drawn glyphs.
+    fn width(&self, text: &str) -> f32 {
+        let advances: f32 = text
+            .chars()
+            .map(|ch| self.atlas.glyphs.get(&ch).map_or(0.0, |g| g.advance))
+            .sum();
+        advances + 2.0 * TEXT_PAD_X
+    }
+
+    /// The pixel height of one line of text = the atlas line height.
+    fn height(&self) -> f32 {
+        self.atlas.line_height
+    }
+}
+
+/// The computed geometry of one measured/laid-out node, indexed parallel to the input `nodes` slice.
+/// Internal to the cascade; [`layout_views`] flattens the absolute rects into [`LaidOutView`]s.
+#[derive(Debug, Clone, Copy, Default)]
+struct NodeBox {
+    /// Measured width/height in pixels (set by the measure pass).
+    mw: f32,
+    mh: f32,
+    /// Absolute top-left position in pixels (set by the layout pass).
+    x: f32,
+    y: f32,
+}
+
+/// True when `class_name` names a `LinearLayout`, which Eclipse lays out as a **vertical** stack.
+///
+/// 2026-06-05: the runtime `orientation` field is a Java field on `LinearLayout`, not threaded
+/// through any native into the snapshot, so Eclipse cannot read it here. We default a `LinearLayout`
+/// to vertical (the orientation the demo + typical app shells use; confirmed by the demo run).
+/// Horizontal-`LinearLayout` orientation detection is documented as out of scope — a horizontal
+/// `LinearLayout` currently stacks vertically. Any non-`LinearLayout` container is laid out
+/// FrameLayout-style (children stacked at the origin, positioned by gravity).
+fn is_vertical_linear(class_name: &str) -> bool {
+    class_name.ends_with("LinearLayout")
+}
+
+/// `Gravity` bits (subset we honor): standard `android.view.Gravity` constants. 2026-06-05.
+const GRAVITY_CENTER_HORIZONTAL: i32 = 0x01;
+const GRAVITY_RIGHT: i32 = 0x05;
+const GRAVITY_CENTER_VERTICAL: i32 = 0x10;
+const GRAVITY_BOTTOM: i32 = 0x50;
+
+/// Android's "no gravity specified" sentinel (`FrameLayout/LinearLayout.LayoutParams` default
+/// `gravity = -1`, `Gravity.UNSPECIFIED_GRAVITY`). A negative gravity means "use the default
+/// placement" (top|left), NOT a bitmask — `-1 & 0x05 == 0x05` would otherwise read as right|bottom.
+/// 2026-06-05: confirmed empirically on the demo run — every inflated view reports `gravity=-1`.
+fn gravity_specified(gravity: i32) -> bool {
+    gravity >= 0
+}
+
+/// Horizontal offset of a child of measured width `cw` within a slot of width `slot_w`, per `gravity`.
+/// Default (unspecified gravity or no horizontal gravity bits) = left (0).
+fn gravity_dx(gravity: i32, slot_w: f32, cw: f32) -> f32 {
+    if !gravity_specified(gravity) {
+        return 0.0;
+    }
+    let slack = (slot_w - cw).max(0.0);
+    if gravity & GRAVITY_RIGHT == GRAVITY_RIGHT {
+        slack
+    } else if gravity & GRAVITY_CENTER_HORIZONTAL != 0 {
+        slack * 0.5
+    } else {
+        0.0
+    }
+}
+
+/// Vertical offset of a child of measured height `ch` within a slot of height `slot_h`, per `gravity`.
+/// Default (unspecified gravity or no vertical gravity bits) = top (0).
+fn gravity_dy(gravity: i32, slot_h: f32, ch: f32) -> f32 {
+    if !gravity_specified(gravity) {
+        return 0.0;
+    }
+    let slack = (slot_h - ch).max(0.0);
+    if gravity & GRAVITY_BOTTOM == GRAVITY_BOTTOM {
+        slack
+    } else if gravity & GRAVITY_CENTER_VERTICAL != 0 {
+        slack * 0.5
+    } else {
+        0.0
+    }
+}
+
+/// Total horizontal margins of a view (left + right).
+fn margin_h(lp: &LayoutParams) -> f32 {
+    (lp.margins[0] + lp.margins[2]).max(0) as f32
+}
+/// Total vertical margins of a view (top + bottom).
+fn margin_v(lp: &LayoutParams) -> f32 {
+    (lp.margins[1] + lp.margins[3]).max(0) as f32
+}
+
+/// MEASURE pass (top-down): compute each node's measured size into `boxes[idx].{mw,mh}` given the
+/// parent's `w_spec`/`h_spec`. Recurses into children (the recursion depth is bounded by the
+/// snapshot's `MAX_DEPTH` cap). 2026-06-05.
+///
+/// A container's `WRAP_CONTENT` content size is the extent of its laid-out children (sum along the
+/// stacking axis for a vertical LinearLayout, max across for the cross axis; max of both for a
+/// FrameLayout). A leaf TextView's content size is its measured text; any other leaf's is the
+/// `WRAP_FALLBACK_*`. `idx_guard` prevents a (registry-impossible) cycle from looping forever.
+fn measure_node(
+    nodes: &[RenderNode],
+    boxes: &mut [NodeBox],
+    idx: usize,
+    w_spec: MeasureSpec,
+    h_spec: MeasureSpec,
+    text: Option<TextMeasure>,
+    depth_guard: u32,
+) {
+    const MAX_DEPTH: u32 = 256;
+    let Some(node) = nodes.get(idx) else {
+        return;
+    };
+    if depth_guard >= MAX_DEPTH {
+        return;
+    }
+    let lp = &node.layout;
+    let pad_h = (lp.padding[0] + lp.padding[2]).max(0) as f32;
+    let pad_v = (lp.padding[1] + lp.padding[3]).max(0) as f32;
+
+    // Available interior space the children may use (parent spec minus this view's padding).
+    let inner_w = (w_spec.size - pad_h).max(0.0);
+    let inner_h = (h_spec.size - pad_v).max(0.0);
+
+    if node.children.is_empty() {
+        // Leaf: content is the text extent (TextView) or the fallback box.
+        let (content_w, content_h) = match (&node.text, text) {
+            (Some(t), Some(tm)) => (tm.width(t), tm.height()),
+            (Some(t), None) if !t.is_empty() => (WRAP_FALLBACK_W, WRAP_FALLBACK_H),
+            _ => (WRAP_FALLBACK_W, WRAP_FALLBACK_H),
+        };
+        let (mw, _) = w_spec.resolve(lp.width, content_w + pad_h);
+        let (mh, _) = h_spec.resolve(lp.height, content_h + pad_v);
+        boxes[idx].mw = mw.max(0.0);
+        boxes[idx].mh = mh.max(0.0);
+        return;
+    }
+
+    // Container: measure children under the interior spec, then settle this view's size.
+    let child_w_spec = MeasureSpec {
+        mode: if w_spec.mode == SpecMode::Unspecified {
+            SpecMode::Unspecified
+        } else {
+            SpecMode::AtMost
+        },
+        size: inner_w,
+    };
+    let child_h_spec = MeasureSpec {
+        mode: if h_spec.mode == SpecMode::Unspecified {
+            SpecMode::Unspecified
+        } else {
+            SpecMode::AtMost
+        },
+        size: inner_h,
+    };
+
+    let vertical = is_vertical_linear(&node.class_name);
+    let mut sum_h = 0.0f32; // total stacked height (vertical LinearLayout main axis)
+    let mut max_w = 0.0f32; // widest child including its margins (cross axis / Frame width)
+    let mut max_h = 0.0f32; // tallest child including its margins (Frame height)
+
+    for &ci in &node.children {
+        if ci >= nodes.len() {
+            continue;
+        }
+        measure_node(
+            nodes,
+            boxes,
+            ci,
+            child_w_spec,
+            child_h_spec,
+            text,
+            depth_guard + 1,
+        );
+        let clp = &nodes[ci].layout;
+        let cw = boxes[ci].mw + margin_h(clp);
+        let ch = boxes[ci].mh + margin_v(clp);
+        sum_h += ch;
+        max_w = max_w.max(cw);
+        max_h = max_h.max(ch);
+    }
+
+    // This container's content size depends on its layout kind: a vertical LinearLayout is as tall as
+    // its stacked children and as wide as its widest; a FrameLayout/unknown is the bounding box.
+    let (content_w, content_h) = if vertical {
+        (max_w + pad_h, sum_h + pad_v)
+    } else {
+        (max_w + pad_h, max_h + pad_v)
+    };
+
+    let (mw, _) = w_spec.resolve(lp.width, content_w);
+    let (mh, _) = h_spec.resolve(lp.height, content_h);
+    boxes[idx].mw = mw.max(0.0);
+    boxes[idx].mh = mh.max(0.0);
+}
+
+/// LAYOUT pass (top-down): position node `idx` at absolute `(x, y)` and recursively position its
+/// children within its content box, honoring layout kind + gravity + a trivial weight. 2026-06-05.
+fn layout_node(
+    nodes: &[RenderNode],
+    boxes: &mut [NodeBox],
+    idx: usize,
+    x: f32,
+    y: f32,
+    depth_guard: u32,
+) {
+    const MAX_DEPTH: u32 = 256;
+    if depth_guard >= MAX_DEPTH || idx >= nodes.len() {
+        return;
+    }
+    boxes[idx].x = x;
+    boxes[idx].y = y;
+    let node = &nodes[idx];
+    if node.children.is_empty() {
+        return;
+    }
+    let lp = &node.layout;
+    let inner_x = x + lp.padding[0].max(0) as f32;
+    let inner_y = y + lp.padding[1].max(0) as f32;
+    let inner_w = (boxes[idx].mw - (lp.padding[0] + lp.padding[2]).max(0) as f32).max(0.0);
+    let inner_h = (boxes[idx].mh - (lp.padding[1] + lp.padding[3]).max(0) as f32).max(0.0);
+
+    if is_vertical_linear(&node.class_name) {
+        // Vertical LinearLayout: stack children top-to-bottom, advancing a cursor; distribute leftover
+        // vertical space by `layout_weight` (a trivial single pass); honor horizontal gravity per child.
+        let used: f32 = node
+            .children
+            .iter()
+            .filter(|&&ci| ci < nodes.len())
+            .map(|&ci| boxes[ci].mh + margin_v(&nodes[ci].layout))
+            .sum();
+        let total_weight: f32 = node
+            .children
+            .iter()
+            .filter(|&&ci| ci < nodes.len())
+            .map(|&ci| nodes[ci].layout.weight.max(0.0))
+            .sum();
+        let leftover = (inner_h - used).max(0.0);
+
+        let mut cursor = inner_y;
+        for &ci in &node.children {
+            if ci >= nodes.len() {
+                continue;
+            }
+            let clp = nodes[ci].layout;
+            // Grow this child by its share of the leftover space (weighted), if any.
+            if total_weight > 0.0 && clp.weight > 0.0 {
+                boxes[ci].mh += leftover * (clp.weight / total_weight);
+            }
+            let cw = boxes[ci].mw;
+            let ch = boxes[ci].mh;
+            // Cross axis = horizontal: gravity positions the child within the inner width.
+            let dx = gravity_dx(clp.gravity, inner_w - margin_h(&clp), cw);
+            let cx = inner_x + clp.margins[0].max(0) as f32 + dx;
+            let cy = cursor + clp.margins[1].max(0) as f32;
+            layout_node(nodes, boxes, ci, cx, cy, depth_guard + 1);
+            cursor += ch + margin_v(&clp);
+        }
+    } else {
+        // FrameLayout / unknown container: every child at the parent origin, positioned by gravity.
+        for &ci in &node.children {
+            if ci >= nodes.len() {
+                continue;
+            }
+            let clp = nodes[ci].layout;
+            let cw = boxes[ci].mw;
+            let ch = boxes[ci].mh;
+            let dx = gravity_dx(clp.gravity, inner_w - margin_h(&clp), cw);
+            let dy = gravity_dy(clp.gravity, inner_h - margin_v(&clp), ch);
+            let cx = inner_x + clp.margins[0].max(0) as f32 + dx;
+            let cy = inner_y + clp.margins[1].max(0) as f32 + dy;
+            layout_node(nodes, boxes, ci, cx, cy, depth_guard + 1);
+        }
+    }
+}
+
+/// Run the measure + layout cascade over the recorded view tree and flatten each node's absolute
+/// rect into a [`LaidOutView`] (parallel to `nodes`, so text/quad builders keep their indexing).
+///
+/// 2026-06-05: the root (node 0) is measured `Exactly` at the swapchain `extent` (the window is the
+/// device the root fills, like Android's `ViewRootImpl`), then laid out at the origin. Each node's
+/// fill color stays depth-distinguished. An empty tree → empty output (clear-only frame). `text` is
+/// the optional glyph-metric measurer for `WRAP_CONTENT` TextViews; `None` (no font) → fallback box.
+/// Pure (no Vulkan) so it is unit-testable without a GPU.
+fn layout_views(
+    nodes: &[RenderNode],
+    extent: vk::Extent2D,
+    text: Option<TextMeasure>,
+) -> Vec<LaidOutView> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    let ew = extent.width.max(1) as f32;
+    let eh = extent.height.max(1) as f32;
+    let mut boxes = vec![NodeBox::default(); nodes.len()];
+
+    let root_w = MeasureSpec {
+        mode: SpecMode::Exactly,
+        size: ew,
+    };
+    let root_h = MeasureSpec {
+        mode: SpecMode::Exactly,
+        size: eh,
+    };
+    measure_node(nodes, &mut boxes, 0, root_w, root_h, text, 0);
+    layout_node(nodes, &mut boxes, 0, 0.0, 0.0, 0);
+
+    nodes
+        .iter()
+        .zip(boxes.iter())
+        .map(|(node, b)| {
+            let color = DEPTH_PALETTE[(node.depth as usize).min(DEPTH_PALETTE.len() - 1)];
+            LaidOutView {
+                x: b.x,
+                y: b.y,
+                // Clamp to >= 1 so a zero-measured view never produces a degenerate (invalid) quad.
+                w: b.mw.max(1.0),
+                h: b.mh.max(1.0),
+                color,
+                text: node.text.clone(),
+            }
+        })
+        .collect()
 }
 
 /// Convert a top-left-origin pixel rect into 6 [`QuadVertex`]es (two triangles) in Vulkan NDC.
@@ -2023,7 +2422,29 @@ impl VulkanRenderer {
         // buffer has completed, so re-uploading here is safe. An empty tree → 0 vertices → clear-only.
         let nodes = crate::framework::view_registry::snapshot_tree();
         let extent = self.swapchain.extent;
-        let views = layout_views(&nodes, extent);
+        // Measure WRAP_CONTENT text against the real glyph atlas when a font is loaded (else the
+        // cascade falls back to a default box). Built from a shared (immutable) borrow of the atlas,
+        // dropped before the disjoint `self.text.as_mut()` upload borrow below.
+        let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
+        let views = layout_views(&nodes, extent, measure);
+        // One-shot observability: log each computed view rect the first time a non-empty tree is laid
+        // out, so the measure/layout result is inspectable without spamming every frame (the per-frame
+        // summary below stays at TRACE). 2026-06-05.
+        if !views.is_empty() {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                for (i, (n, v)) in nodes.iter().zip(views.iter()).enumerate() {
+                    tracing::debug!(
+                        target: "eclipse::graphics::layout",
+                        i,
+                        class = %n.class_name,
+                        x = v.x, y = v.y, w = v.w, h = v.h,
+                        depth = n.depth,
+                        "laid-out view rect"
+                    );
+                }
+            });
+        }
         let verts = build_quad_vertices(&views, extent);
         let vertex_count = self.upload_vertices(&verts)?;
 
@@ -2865,6 +3286,7 @@ impl std::error::Error for GraphicsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::view_registry::WRAP_CONTENT;
 
     fn caps(min: u32, max: u32, cur_w: u32, cur_h: u32) -> vk::SurfaceCapabilitiesKHR {
         vk::SurfaceCapabilitiesKHR {
@@ -2962,52 +3384,297 @@ mod tests {
             class_name: class.to_owned(),
             text: text.map(str::to_owned),
             depth,
+            layout: LayoutParams::default(),
+            children: Vec::new(),
         }
     }
 
+    /// A node with an explicit `LayoutParams` and child indices — for the cascade tests.
+    fn node_lp(
+        class: &str,
+        text: Option<&str>,
+        depth: u32,
+        lp: LayoutParams,
+        kids: &[usize],
+    ) -> RenderNode {
+        RenderNode {
+            class_name: class.to_owned(),
+            text: text.map(str::to_owned),
+            depth,
+            layout: lp,
+            children: kids.to_vec(),
+        }
+    }
+
+    fn exact(px: i32) -> i32 {
+        px
+    }
+
     #[test]
-    fn layout_stacks_rows_and_indents_by_depth() {
+    fn measure_spec_resolves_match_wrap_and_exact() {
+        // EXACTLY(800) parent.
+        let parent = MeasureSpec {
+            mode: SpecMode::Exactly,
+            size: 800.0,
+        };
+        // exact px → that px, child EXACTLY.
+        let (size, child) = parent.resolve(exact(120), 999.0);
+        assert_eq!(size, 120.0);
+        assert_eq!(child.mode, SpecMode::Exactly);
+        assert_eq!(child.size, 120.0);
+        // MATCH_PARENT → fills parent, child EXACTLY(parent).
+        let (size, child) = parent.resolve(MATCH_PARENT, 50.0);
+        assert_eq!(size, 800.0);
+        assert_eq!(child.mode, SpecMode::Exactly);
+        // WRAP_CONTENT → content, clamped to parent; child AtMost(parent).
+        let (size, child) = parent.resolve(WRAP_CONTENT, 200.0);
+        assert_eq!(size, 200.0);
+        assert_eq!(child.mode, SpecMode::AtMost);
+        assert_eq!(child.size, 800.0);
+        // WRAP_CONTENT bigger than parent clamps to the parent's size.
+        let (size, _) = parent.resolve(WRAP_CONTENT, 9000.0);
+        assert_eq!(size, 800.0);
+    }
+
+    #[test]
+    fn measure_spec_unspecified_parent_yields_content_size() {
+        let parent = MeasureSpec {
+            mode: SpecMode::Unspecified,
+            size: 0.0,
+        };
+        // MATCH_PARENT with an unbounded parent → fall back to content, child Unspecified.
+        let (size, child) = parent.resolve(MATCH_PARENT, 77.0);
+        assert_eq!(size, 77.0);
+        assert_eq!(child.mode, SpecMode::Unspecified);
+    }
+
+    #[test]
+    fn root_match_parent_fills_the_swapchain_extent() {
+        // A single MATCH_PARENT root measured EXACTLY at the extent fills the whole surface at origin.
         let extent = vk::Extent2D {
             width: 800,
             height: 600,
         };
-        let nodes = [
-            node("android.widget.FrameLayout", None, 0),
-            node("android.widget.TextView", Some("hello"), 1),
-        ];
-        let views = layout_views(&nodes, extent);
-        assert_eq!(views.len(), 2);
-
-        // Row 0: top margin, no indent, full width minus both margins.
-        assert_eq!(views[0].x, MARGIN_PX);
-        assert_eq!(views[0].y, MARGIN_PX);
-        assert_eq!(views[0].w, 800.0 - 2.0 * MARGIN_PX);
-        assert_eq!(views[0].h, ROW_HEIGHT_PX);
-
-        // Row 1: stacked below row 0 (by ROW_HEIGHT + gap), indented one step, narrower by the indent.
-        assert_eq!(views[1].y, MARGIN_PX + ROW_HEIGHT_PX + ROW_GAP_PX);
-        assert_eq!(views[1].x, MARGIN_PX + INDENT_PX);
-        assert_eq!(views[1].w, 800.0 - (MARGIN_PX + INDENT_PX) - MARGIN_PX);
-        assert_eq!(views[1].text.as_deref(), Some("hello"));
-
-        // Deeper rows are visually distinct (palette differs by depth).
-        assert_ne!(views[0].color, views[1].color);
+        let lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: MATCH_PARENT,
+            ..Default::default()
+        };
+        let nodes = [node_lp("android.widget.FrameLayout", None, 0, lp, &[])];
+        let views = layout_views(&nodes, extent, None);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].x, 0.0);
+        assert_eq!(views[0].y, 0.0);
+        assert_eq!(views[0].w, 800.0);
+        assert_eq!(views[0].h, 600.0);
     }
 
     #[test]
-    fn layout_clamps_width_to_at_least_one_for_deep_indent() {
-        // A tiny window with a deep node must never produce a <= 0 width (would be an invalid quad).
+    fn linear_layout_vertical_stacks_children_top_to_bottom() {
+        // A vertical LinearLayout (MATCH x MATCH) with two fixed-height MATCH-width children: child 0
+        // sits at the top, child 1 directly below it (no gravity → left/top).
         let extent = vk::Extent2D {
-            width: 40,
+            width: 400,
             height: 600,
         };
-        let nodes = [node("android.widget.View", None, 100)];
-        let views = layout_views(&nodes, extent);
-        assert!(
-            views[0].w >= 1.0,
-            "width must clamp to >= 1, got {}",
-            views[0].w
+        let root_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: MATCH_PARENT,
+            ..Default::default()
+        };
+        let child_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: 100,
+            ..Default::default()
+        };
+        let nodes = [
+            node_lp("android.widget.LinearLayout", None, 0, root_lp, &[1, 2]),
+            node_lp("android.widget.TextView", Some("a"), 1, child_lp, &[]),
+            node_lp("android.widget.TextView", Some("b"), 1, child_lp, &[]),
+        ];
+        let views = layout_views(&nodes, extent, None);
+        // Root fills the surface.
+        assert_eq!(
+            (views[0].x, views[0].y, views[0].w, views[0].h),
+            (0.0, 0.0, 400.0, 600.0)
         );
+        // Child 0 at top, full width, 100 tall.
+        assert_eq!((views[1].x, views[1].y), (0.0, 0.0));
+        assert_eq!((views[1].w, views[1].h), (400.0, 100.0));
+        // Child 1 stacked directly below child 0.
+        assert_eq!((views[2].x, views[2].y), (0.0, 100.0));
+        assert_eq!((views[2].w, views[2].h), (400.0, 100.0));
+    }
+
+    #[test]
+    fn frame_layout_honors_child_gravity() {
+        // A FrameLayout (200x200) with a 50x50 child whose gravity = bottom|right → placed at (150,150).
+        let extent = vk::Extent2D {
+            width: 200,
+            height: 200,
+        };
+        let root_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: MATCH_PARENT,
+            ..Default::default()
+        };
+        let child_lp = LayoutParams {
+            width: 50,
+            height: 50,
+            gravity: GRAVITY_RIGHT | GRAVITY_BOTTOM,
+            ..Default::default()
+        };
+        let nodes = [
+            node_lp("android.widget.FrameLayout", None, 0, root_lp, &[1]),
+            node_lp("android.view.View", None, 1, child_lp, &[]),
+        ];
+        let views = layout_views(&nodes, extent, None);
+        assert_eq!((views[1].x, views[1].y), (150.0, 150.0));
+        assert_eq!((views[1].w, views[1].h), (50.0, 50.0));
+
+        // Center gravity → centered.
+        let center_lp = LayoutParams {
+            width: 50,
+            height: 50,
+            gravity: GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL,
+            ..Default::default()
+        };
+        let nodes = [
+            node_lp("android.widget.FrameLayout", None, 0, root_lp, &[1]),
+            node_lp("android.view.View", None, 1, center_lp, &[]),
+        ];
+        let views = layout_views(&nodes, extent, None);
+        assert_eq!((views[1].x, views[1].y), (75.0, 75.0));
+    }
+
+    #[test]
+    fn wrap_content_text_measures_to_glyph_metrics() {
+        // A WRAP_CONTENT TextView measures to its text width (sum of advances + 2*pad) and the atlas
+        // line height — proving WRAP resolution uses the real glyph metrics, not the fallback box.
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let atlas = synthetic_atlas(); // 'A' advance 6.0, line_height 8.0
+        let measure = TextMeasure { atlas: &atlas };
+        let lp = LayoutParams {
+            width: WRAP_CONTENT,
+            height: WRAP_CONTENT,
+            ..Default::default()
+        };
+        let nodes = [node_lp("android.widget.TextView", Some("AAA"), 0, lp, &[])];
+        let views = layout_views(&nodes, extent, Some(measure));
+        // width = 3 * 6.0 advances + 2 * TEXT_PAD_X.
+        assert_eq!(views[0].w, 3.0 * 6.0 + 2.0 * TEXT_PAD_X);
+        // height = atlas line height.
+        assert_eq!(views[0].h, 8.0);
+    }
+
+    #[test]
+    fn linear_layout_weight_distributes_leftover_space() {
+        // Vertical LinearLayout 100 tall, two height-0 weighted children (1:1) → each gets 50.
+        let extent = vk::Extent2D {
+            width: 100,
+            height: 100,
+        };
+        let root_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: MATCH_PARENT,
+            ..Default::default()
+        };
+        let w_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: 0,
+            weight: 1.0,
+            ..Default::default()
+        };
+        let nodes = [
+            node_lp("android.widget.LinearLayout", None, 0, root_lp, &[1, 2]),
+            node_lp("android.view.View", None, 1, w_lp, &[]),
+            node_lp("android.view.View", None, 2, w_lp, &[]),
+        ];
+        let views = layout_views(&nodes, extent, None);
+        assert_eq!(views[1].h, 50.0, "first weighted child gets half");
+        assert_eq!(views[2].h, 50.0, "second weighted child gets half");
+        assert_eq!(views[2].y, 50.0, "second child stacked below the first");
+    }
+
+    #[test]
+    fn unspecified_gravity_minus_one_is_top_left_not_a_bitmask() {
+        // Regression guard: Android's UNSPECIFIED_GRAVITY is -1 (all bits set). Treated as a bitmask,
+        // `-1 & RIGHT == RIGHT` and `-1 & BOTTOM == BOTTOM` would wrongly push the child bottom-right.
+        // It must be treated as "no gravity" → top-left. (Confirmed on the demo: every view reports -1.)
+        assert_eq!(gravity_dx(-1, 200.0, 50.0), 0.0, "unspecified → left");
+        assert_eq!(gravity_dy(-1, 200.0, 50.0), 0.0, "unspecified → top");
+        // A FrameLayout child with the real demo gravity (-1) sits at the (padding-inset) origin.
+        let extent = vk::Extent2D {
+            width: 200,
+            height: 200,
+        };
+        let root_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: MATCH_PARENT,
+            ..Default::default()
+        };
+        let child_lp = LayoutParams {
+            width: 50,
+            height: 50,
+            gravity: -1,
+            ..Default::default()
+        };
+        let nodes = [
+            node_lp("android.widget.FrameLayout", None, 0, root_lp, &[1]),
+            node_lp("android.view.View", None, 1, child_lp, &[]),
+        ];
+        let views = layout_views(&nodes, extent, None);
+        assert_eq!(
+            (views[1].x, views[1].y),
+            (0.0, 0.0),
+            "unspecified gravity → origin"
+        );
+    }
+
+    #[test]
+    fn padding_insets_children() {
+        // A FrameLayout with 10px uniform padding and a 20x20 child → child at (10,10).
+        let extent = vk::Extent2D {
+            width: 100,
+            height: 100,
+        };
+        let root_lp = LayoutParams {
+            width: MATCH_PARENT,
+            height: MATCH_PARENT,
+            padding: [10, 10, 10, 10],
+            ..Default::default()
+        };
+        let child_lp = LayoutParams {
+            width: 20,
+            height: 20,
+            ..Default::default()
+        };
+        let nodes = [
+            node_lp("android.widget.FrameLayout", None, 0, root_lp, &[1]),
+            node_lp("android.view.View", None, 1, child_lp, &[]),
+        ];
+        let views = layout_views(&nodes, extent, None);
+        assert_eq!((views[1].x, views[1].y), (10.0, 10.0));
+    }
+
+    #[test]
+    fn layout_clamps_width_to_at_least_one() {
+        // A zero-measured view must never produce a <= 0 width/height (would be an invalid quad).
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let lp = LayoutParams {
+            width: 0,
+            height: 0,
+            ..Default::default()
+        };
+        let nodes = [node_lp("android.view.View", None, 0, lp, &[])];
+        let views = layout_views(&nodes, extent, None);
+        assert!(views[0].w >= 1.0 && views[0].h >= 1.0);
     }
 
     #[test]
@@ -3016,7 +3683,7 @@ mod tests {
             width: 800,
             height: 600,
         };
-        assert!(layout_views(&[], extent).is_empty());
+        assert!(layout_views(&[], extent, None).is_empty());
         assert!(build_quad_vertices(&[], extent).is_empty());
     }
 
@@ -3043,12 +3710,26 @@ mod tests {
             width: 800,
             height: 600,
         };
-        let views = layout_views(
-            &[node("a", None, 0), node("b", None, 1), node("c", None, 2)],
-            extent,
-        );
+        // Three sibling children of a root container → four laid-out views, all non-degenerate.
+        let nodes = [
+            node_lp(
+                "android.widget.LinearLayout",
+                None,
+                0,
+                LayoutParams {
+                    width: MATCH_PARENT,
+                    height: MATCH_PARENT,
+                    ..Default::default()
+                },
+                &[1, 2, 3],
+            ),
+            node("a", None, 1),
+            node("b", None, 1),
+            node("c", None, 1),
+        ];
+        let views = layout_views(&nodes, extent, None);
         let verts = build_quad_vertices(&views, extent);
-        assert_eq!(verts.len(), 3 * 6, "six vertices (two triangles) per view");
+        assert_eq!(verts.len(), 4 * 6, "six vertices (two triangles) per view");
         // Each view's six vertices share its fill color.
         assert!(verts[0..6].iter().all(|v| v.color == views[0].color));
     }
