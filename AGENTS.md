@@ -481,11 +481,17 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      confirmed readelf/nm evidence** (§4b, 2026-06-04): `libroblox.so` NEEDs 10 libs, 7 resolve today
      (5 cfg-aliased + libm/libdl), **3 missing sonames** — `libmediandk.so` (23 `AMedia*` fns, 100% in
      ATL `libandroid.so.0`), `libOpenMAXAL.so` (**0** direct imports → stub/alias suffices), and
-     `liblog.so` (symbols only at `/usr/lib/art/liblog.so`, off the bionic ldpath). NEXT: the deferred
-     bionic-shim step — **main-loop only** (subagent cyber-safeguard blocker). Remaining UNCONFIRMED
-     (linker-source/build-recipe, in the doc §5): shim re-export mechanism, `cfg.d`-vs-ldpath
-     precedence, `liblog`/`libm` resolution policy, `AMEDIAFORMAT_KEY_*` data-symbol coverage, the
-     bionic-ABI build recipe.
+     `liblog.so` (symbols only at `/usr/lib/art/liblog.so`, off the bionic ldpath). The shim spec is
+     now **build-ready** (doc §4c, 2026-06-04, readelf/nm + meson.build): the **media shim must DEFINE
+     7 `AMEDIAFORMAT_KEY_*` data globals** (only 3/10 are in `libandroid.so.0`: CHANNEL_COUNT/MIME/
+     SAMPLE_RATE) **+ 2 `AConfiguration_getScreen*Dp` fns** (0/2 in `libandroid.so.0`) — the 23 `AMedia*`
+     functions forward 100%; the bionic-ABI build recipe is Meson + host `cc`, `-fPIC -D_GNU_SOURCE`,
+     `b_lundef=false`/`-Wl,--no-as-needed`, `soversion 0`, with `-Wl,--defsym`/C-definition as the
+     symbol-supply precedent; `liblog.so` resolves via cfg.d abs-mapping or `dl_parse_library_path("/usr/lib/art")`.
+     NEXT: the deferred bionic-shim step — **main-loop only** (subagent cyber-safeguard blocker).
+     Remaining UNCONFIRMED (linker/loader behavior only, doc §5): shim re-export acceptance by the
+     bionic resolver, `cfg.d`-vs-ldpath precedence, `liblog`/`libm` load behavior, and whether
+     `bionic_android_dlopen_ext` ignoring `dlextinfo` matters — all settle with one load probe.
   3. JNI calls: add the full **`jni`** crate for safe `FindClass`/`CallStaticObjectMethod`/…;
      **wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot from
      the **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).

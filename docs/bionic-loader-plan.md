@@ -30,11 +30,16 @@ outside the repo). It records:
    successful read of the vendored linker source plus `readelf`. Each claim is marked
    **confirmed** or **UNCONFIRMED**.
 3. **The shim plan** (§4) — what `libmediandk.so` / `libOpenMAXAL.so` must be and how they
-   register in the bionic namespace.
+   register in the bionic namespace; with the **build-ready** data-symbol coverage + build
+   recipe + concrete add-a-shim steps in §4c.
 4. **Open questions** (§5) to resolve in the main loop *before* writing shim code.
 
 Nothing in §4 is implemented. The just-landed `java.library.path` / native-lib-extraction
-wiring (§2) is the prerequisite that is done; the shim layer is what remains.
+wiring (§2) is the prerequisite that is done; the shim layer is what remains. As of
+**2026-06-04 (§4c)** the shim spec is **build-ready**: the symbol/data-coverage and the
+bionic-ABI build recipe are CONFIRMED by `readelf`/`nm` + `meson.build`, leaving only
+**linker/loader runtime behavior** (re-export acceptance, cfg.d-vs-ldpath precedence,
+`liblog`/`libm` resolution, `dlextinfo`) for a main-loop load probe — see §5.
 
 ---
 
@@ -333,6 +338,148 @@ registration half of §4.
 
 ---
 
+## 4c. Build recipe & data-symbol coverage — 2026-06-04
+
+This subsection promotes the remaining **build-recipe** and **data-symbol coverage**
+questions from §5 into CONFIRMED facts, using only permitted inputs: `readelf`/`nm` on the
+`.so` files and the `bionic_translation` **meson.build** (a BUILD file — the linker `*.c`
+was **not** opened). It makes the shim step build-ready; what remains in §5 is strictly
+**linker/loader runtime behavior**, which ELF + build-file inspection cannot settle.
+
+Inputs of record (read 2026-06-04):
+`/home/kue/eclipse-m0/apk/v2.724.735/_split/lib/x86_64/libroblox.so` (the engine),
+`/usr/lib/libandroid.so.0` (ATL provider, 198 exports), `/usr/lib/art/liblog.so`,
+`/tmp/bionic_translation-026ea2542258a7e0cbb52f22d7475aea68cbcbf5/meson.build` (also
+vendored at `vendor/atl/thirdparty/bionic_translation/meson.build`).
+
+### 4c.1 `AMEDIAFORMAT_KEY_*` data-symbol coverage — CONFIRMED (3 exported, 7 gap)
+
+`libroblox.so` imports **10** `AMEDIAFORMAT_KEY_*` symbols (`readelf --dyn-syms`, type
+`OBJECT` i.e. **data globals**, all `UND`). They are the key-name string-pointer constants
+the NDK `media/NdkMediaFormat.h` declares as `extern const char*`:
+
+```
+AMEDIAFORMAT_KEY_MIME            AMEDIAFORMAT_KEY_WIDTH
+AMEDIAFORMAT_KEY_HEIGHT          AMEDIAFORMAT_KEY_COLOR_FORMAT
+AMEDIAFORMAT_KEY_STRIDE          AMEDIAFORMAT_KEY_BIT_RATE
+AMEDIAFORMAT_KEY_FRAME_RATE      AMEDIAFORMAT_KEY_I_FRAME_INTERVAL
+AMEDIAFORMAT_KEY_CHANNEL_COUNT   AMEDIAFORMAT_KEY_SAMPLE_RATE
+```
+
+`/usr/lib/libandroid.so.0` exports **only 3** of these (`nm -D --defined-only`, type `D`):
+
+```
+AMEDIAFORMAT_KEY_CHANNEL_COUNT   AMEDIAFORMAT_KEY_MIME   AMEDIAFORMAT_KEY_SAMPLE_RATE
+```
+
+So **7 `AMEDIAFORMAT_KEY_*` data globals are a genuine gap** the `libmediandk.so` shim must
+itself **define as data globals** (it cannot forward them — the provider lacks them):
+
+```
+AMEDIAFORMAT_KEY_WIDTH   AMEDIAFORMAT_KEY_HEIGHT   AMEDIAFORMAT_KEY_COLOR_FORMAT
+AMEDIAFORMAT_KEY_STRIDE  AMEDIAFORMAT_KEY_BIT_RATE AMEDIAFORMAT_KEY_FRAME_RATE
+AMEDIAFORMAT_KEY_I_FRAME_INTERVAL
+```
+
+This resolves the §4b.2 caveat: the media shim is **not** a pure thin re-export. Its 23
+`AMedia*` **functions** forward 100% to `libandroid.so.0` (§4b.2, re-confirmed: `comm` of
+the two symbol sets is empty), but it must **supply** these 7 string-constant data globals
+itself. The constant values are fixed NDK string literals (e.g. `"width"`, `"height"`,
+`"color-format"`, `"stride"`, `"bitrate"`, `"frame-rate"`, `"i-frame-interval"`); the shim
+defines `const char* AMEDIAFORMAT_KEY_WIDTH = "width";` etc. (exact strings to be taken from
+the NDK header / `media.c` at build time, not guessed).
+
+### 4c.2 `AConfiguration_getScreen*Dp` coverage — CONFIRMED (2 gap, function symbols)
+
+`libroblox.so` imports `AConfiguration_getScreenWidthDp` and
+`AConfiguration_getScreenHeightDp` (`readelf --dyn-syms` UND, `FUNC`).
+`/usr/lib/libandroid.so.0` exports the `AConfiguration_getScreen{Size,Long,Round}` family
+but **not** the two `*Dp` variants. So these are **2 missing function symbols** the shim
+must supply (compute Dp from density+pixels, or forward to an ATL helper if one exists).
+This corrects §2's "`AConfiguration* 4/4`" overcount: function coverage for the *Dp pair is
+**0/2** in `libandroid.so.0`. The other `AConfiguration_*` symbols Roblox imports
+(`getScreenSize`, `getNavHidden`, `delete`, `fromAssetManager`, `getCountry`, `getLanguage`,
+`new`) **are** present in `libandroid.so.0`.
+
+### 4c.3 `liblog.so` resolution plan — CONFIRMED inventory
+
+`/usr/lib/art/liblog.so` is an ELF 64-bit x86-64 shared object (host build, stripped) that
+exports the `__android_log_*` family `libroblox.so` needs — confirmed present:
+`__android_log_print`, `__android_log_write`, `__android_log_buf_write`,
+`__android_log_buf_print`, `__android_log_assert`, `__android_log_bwrite`,
+`__android_log_btwrite`, `__android_log_vprint`, `__android_log_dev_available`. The file
+simply sits **outside the bionic ldpath** (`/usr/lib/art`, not `/usr/lib`). Two candidate
+resolutions (the choice between them is a §5 loader-behavior question, not settled here):
+1. **cfg.d mapping** — add `liblog.so  /usr/lib/art/liblog.so` (absolute) to the cfg, if the
+   loader accepts an absolute provider; simplest.
+2. **ldpath registration** — `dl_parse_library_path("/usr/lib/art", ":")` from the Eclipse
+   runtime so the bionic namespace finds `liblog.so` by name on transitive resolution. This
+   is the same `dl_parse_library_path` call Eclipse already uses for the app lib dir, so it
+   is low-risk; it must be registered so it does **not** shadow `/usr/lib` providers.
+
+### 4c.4 Bionic-ABI build recipe — CONFIRMED from meson.build
+
+The `bionic_translation` providers are built with **Meson**, the **host C compiler**
+(`cc = meson.get_compiler('c')` — no cross-toolchain, no sysroot; this is a host x86_64
+build), with these project-level and per-target settings (verbatim from the build file):
+
+- `project(..., default_options: ['b_lundef=false', 'b_asneeded=false'])` —
+  **`b_lundef=false`** permits undefined symbols in the final link (the basis of thin
+  re-export); **`b_asneeded=false`** keeps `DT_NEEDED` entries the consumer relies on.
+- Common per-target C args: **`-fPIC -D_GNU_SOURCE`** (the static `wrapper` adds
+  `-fvisibility=hidden`; `dl_bio` adds `-D_LARGEFILE64_SOURCE` + debug defines).
+- Common link args on the shims: **`-Wl,--no-as-needed`** (force `DT_NEEDED` even for libs
+  not directly referenced — see the line-123 comment in the build file).
+- Stable-ABI shims carry **`soversion: 0`** (`libc_bio`, `pthread_bio`, `stdc++_bio`);
+  `dl_bio` carries `version: '0.0.1'`. A new media shim should mirror `soversion: 0`.
+- cfg.d ships via `install_data(['cfg.d/bionic_translation.cfg'], install_dir:
+  datadir/'bionic_translation/cfg.d')` — the mechanism for shipping a new soname mapping.
+
+**Symbol-supply precedent (CONFIRMED, the key build-file finding):** `libc_bio` defines a
+`libc_bio_hardcoded_symbols` list applied via **`-Wl,--defsym`** — `-Wl,--defsym,__fe_dfl_env=-1`
+(and, on 32-bit, `-Wl,--defsym,__bionic_brk=0x123`). This proves the project's established
+pattern that a shim **supplies symbols the host provider defines differently or lacks**, at
+link time. For the 7 `AMEDIAFORMAT_KEY_*` **string-pointer data globals** (§4c.1), a small C
+source defining them (`const char* AMEDIAFORMAT_KEY_WIDTH = "width";`) is the natural form;
+`--defsym` fits scalar symbols, a C definition fits string-pointer data. Either way the
+precedent for "the shim provides what the provider can't" is in-tree.
+
+### 4c.5 Concrete add-a-shim steps (build-ready)
+
+Given §4c.1–§4c.4, the deferred shim step is now a concrete build task (do it in the main
+loop; the only residual unknowns are the §5 loader-behavior items, which a single load probe
+resolves):
+
+1. **`libmediandk.so` shim** — add a `shared_library('mediandk', ['shim/libmediandk.c'],
+   soversion: 0, install: true, dependencies: [...], link_args: ['-Wl,--no-as-needed'])`
+   target to `meson.build`. `shim/libmediandk.c` (a) `DT_NEEDED`s the provider so the 23
+   `AMedia*` **functions** forward to `libandroid.so.0`, and (b) **defines the 7 missing
+   `AMEDIAFORMAT_KEY_*` data globals** (§4c.1) as `const char*` constants. Result:
+   `libmediandk.so.0`. (`b_lundef=false` + `--no-as-needed` mirror the project pattern.)
+2. **`AConfiguration_*Dp`** — define `AConfiguration_getScreenWidthDp` /
+   `_getScreenHeightDp` (§4c.2) in the same shim source or a small `libandroid` companion
+   (compute Dp from `getDensity`/screen size).
+3. **`libOpenMAXAL.so` shim** — per §4b.3 (0 direct imports), a **stub** is enough:
+   `shared_library('OpenMAXAL', sources: [], soversion: 0, install: true, link_args:
+   ['-Wl,--no-as-needed'])`, or a cfg.d alias to `libOpenSLES.so.1`.
+4. **`liblog.so`** — resolve per §4c.3 (cfg.d absolute mapping **or**
+   `dl_parse_library_path("/usr/lib/art", ":")` from the runtime).
+5. **Registration** — install a cfg.d file mapping `libmediandk.so`/`libOpenMAXAL.so`
+   (/`liblog.so`) to their providers, **and/or** place the built shim `.so` on the dir
+   Eclipse registers via `dl_parse_library_path`. (Which of cfg.d-vs-ldpath suffices is the
+   §5 precedence question — a probe answers it.)
+6. **ABI**: build as a **bionic-ABI .so** (the providers' own build mode above — host cc,
+   `-fPIC -D_GNU_SOURCE`, `b_lundef=false`, linked against the `*_bio.so.0` providers, **not**
+   a plain host glibc .so — §3.2 proved a host-glibc copy crashes).
+
+**Re-export pattern (CONFIRMED in-build):** thin re-export = `DT_NEEDED [provider]` +
+`-Wl,--no-as-needed` + `b_lundef=false`; symbol-supply for what the provider lacks =
+`-Wl,--defsym` (scalars) or a C definition (data/string globals), per §4c.4. Whether thin
+re-export alone satisfies the **bionic** resolver (vs needing each symbol physically
+defined/aliased) is the §5 loader-behavior question.
+
+---
+
 ## 5. Open questions / UNCONFIRMED items (resolve in the main loop before coding the shim)
 
 Mark these as the entry checklist for the deferred step. None is settled by the digest or
@@ -342,16 +489,30 @@ a probe in the main loop.
 > **Resolved 2026-06-04 by §4b (readelf/nm) — struck from this checklist:**
 > - ~~exact symbol set `libroblox.so` imports from each NDK soname~~ → **CONFIRMED** in
 >   §4b.2 (`libmediandk.so`: 23 `AMedia*` functions, 100% in `libandroid.so.0`) and §4b.3
->   (`libOpenMAXAL.so`: **0** direct imports → stub/alias suffices). Remaining sub-gaps:
->   the `AMEDIAFORMAT_KEY_*` **data** symbols (§4b.2 caveat) and the two `AConfiguration_*Dp`
->   symbols (§4b.4) — narrow, kept as data-symbol checks below.
+>   (`libOpenMAXAL.so`: **0** direct imports → stub/alias suffices).
 > - ~~`libc.so` / `libdl.so` bionic-alias handling~~ → **CONFIRMED** in §4b.5
->   (`libc`→`libc_bio.so.0`, `libdl_bio.so.0` self-init). The `libm`/`liblog` **resolution
->   policy** parts remain open (below).
+>   (`libc`→`libc_bio.so.0`, `libdl_bio.so.0` self-init). The `libm` part remains open (below).
 > - The full `DT_NEEDED` list (§4b.1) and the verbatim `cfg.d` map (§4b.6) are now CONFIRMED.
+>
+> **Resolved 2026-06-04 by §4c (readelf/nm + meson.build) — struck from this checklist:**
+> - ~~`AMEDIAFORMAT_KEY_*` and `AConfiguration_*Dp` data-symbol coverage~~ → **CONFIRMED**
+>   in §4c.1/§4c.2: of the 10 `AMEDIAFORMAT_KEY_*` data globals Roblox imports,
+>   `libandroid.so.0` exports only **3** (`CHANNEL_COUNT`, `MIME`, `SAMPLE_RATE`); the
+>   **7 others are a gap the shim must DEFINE as data globals** (it cannot forward them).
+>   The two `AConfiguration_getScreen{Width,Height}Dp` functions are **0/2** in
+>   `libandroid.so.0` → the shim must supply them too. (The 23 `AMedia*` functions forward
+>   100%.)
+> - ~~bionic-ABI build recipe for the shims~~ → **CONFIRMED** in §4c.4: Meson, host `cc`
+>   (no cross-toolchain/sysroot), `-fPIC -D_GNU_SOURCE`, `b_lundef=false` + `b_asneeded=false`
+>   + `-Wl,--no-as-needed`, `soversion: 0`; symbol-supply precedent = `-Wl,--defsym` in
+>   `libc_bio` (scalars) / a C definition for string-pointer data. Add-a-shim steps in §4c.5.
+> - ~~`liblog.so` resolution inventory~~ → **CONFIRMED** in §4c.3: `/usr/lib/art/liblog.so`
+>   exports the needed `__android_log_*` family; resolve via cfg.d absolute mapping **or**
+>   `dl_parse_library_path("/usr/lib/art", ":")`. (Which mechanism the loader honors is the
+>   precedence item below.)
 
-Still open (linker-source / build-recipe / loader-behavior — none answerable by ELF
-inspection alone):
+Still open (linker-source / loader-behavior — none answerable by ELF or build-file
+inspection alone; each needs the vendored linker or a load probe in the main loop):
 
 - **UNCONFIRMED — re-export mechanism that satisfies the bionic resolver.** Whether a shim
   `.so` whose own `DT_NEEDED` points at the bionic provider (`libandroid.so.0` /
@@ -363,23 +524,15 @@ inspection alone):
   soname mapping alone resolves the `DT_NEEDED`, whether the shim file on the ldpath alone
   suffices, or whether **both** are required. §3.3/§4b.6 show the mapping format but not the
   resolution precedence between the two.
-- **UNCONFIRMED — `liblog.so` resolution + `libm.so` bionic-alias policy.** §4b.1 newly
-  CONFIRMED `liblog.so` is a **third** missing soname (symbols exist only at
-  `/usr/lib/art/liblog.so`, off the bionic ldpath); §4b.5 CONFIRMED `libm.so` has no `cfg.d`
-  entry and resolves to glibc `libm.so.6`. What stays UNCONFIRMED is the **loader behavior**:
-  whether registering `/usr/lib/art` on the bionic ldpath (or adding a `liblog.so` cfg
-  mapping) is enough for `liblog.so`, and whether a bionic-linked consumer is content with
-  the glibc `libm.so.6` or needs a `libm_bio`. Resolve alongside the media shims.
-- **UNCONFIRMED — `AMEDIAFORMAT_KEY_*` and `AConfiguration_*Dp` data-symbol coverage.**
-  §4b.2/§4b.4: `libroblox.so` imports the `AMEDIAFORMAT_KEY_*` data globals and two
-  `AConfiguration_getScreen*Dp` symbols; whether `libandroid.so.0` exports these (so the
-  media shim can forward them) was not confirmed by the function-export pass. Check
-  `libandroid.so.0`'s full export table in the main loop before sizing the shim.
-- **UNCONFIRMED — bionic-ABI build recipe for the shims.** How to compile a "proper
-  bionic-ABI .so" (vs a host glibc .so, which §3.2 proved crashes) on this host — toolchain,
-  whether ATL ships a build mode for translation-layer providers, or whether linking against
-  the `*_bio.so.0` providers is sufficient. This is the practical blocker and is entirely
-  unverified.
+- **UNCONFIRMED — `liblog.so` load + `libm.so` bionic-alias *behavior*.** §4c.3 CONFIRMED
+  `/usr/lib/art/liblog.so` exports the needed `__android_log_*` family and gave two candidate
+  resolutions (cfg.d absolute mapping vs `dl_parse_library_path("/usr/lib/art", ":")`); §4b.5
+  CONFIRMED `libm.so` has no `cfg.d` entry and resolves to glibc `libm.so.6`. What stays
+  UNCONFIRMED is the **loader behavior**: which of the two `liblog` resolutions the linker
+  actually honors (does it accept an absolute cfg.d provider? does the extra ldpath shadow
+  `/usr/lib`?), and whether a bionic-linked consumer is content with glibc `libm.so.6` or
+  needs a `libm_bio` (the meson.build itself flags this — line 109 `libm_dep, # TODO: have
+  separate libm_bio?`). Resolve alongside the media shims with a load probe.
 - **UNCONFIRMED — whether `bionic_android_dlopen_ext` ignoring `dlextinfo` matters here.**
   §3.1 notes it ignores `dlextinfo`; whether the engine relies on `android_dlopen_ext`
   namespace flags (and is therefore affected) is unknown.
@@ -392,6 +545,12 @@ inspection alone):
   (author's own notes; outside the repo).
 - `/usr/share/bionic_translation/cfg.d/bionic_translation.cfg` — installed soname-alias map
   (§3.3, read 2026-06-04).
+- `vendor/atl/thirdparty/bionic_translation/meson.build` (also
+  `/tmp/bionic_translation-026ea2542258a7e0cbb52f22d7475aea68cbcbf5/meson.build`) — the
+  bionic-ABI build recipe of record (§4c.4; a BUILD file — safe to read, unlike `linker/*.c`).
+- `/usr/lib/libandroid.so.0` (ATL provider, 198 exports), `/usr/lib/art/liblog.so`,
+  `/home/kue/eclipse-m0/apk/v2.724.735/_split/lib/x86_64/libroblox.so` — the `readelf`/`nm`
+  inputs for §4b/§4c (read 2026-06-04).
 - `vendor/atl/thirdparty/bionic_translation/linker/` (`linker.c`) and
   `/usr/lib/libdl_bio.so.0` — the loader source/binary of record (referenced, not opened
   here; do not enumerate its symbol-walk mechanics in a workflow subagent — cyber-safeguard).
