@@ -487,6 +487,18 @@ struct LaidOutView {
     text: Option<String>,
 }
 
+/// Convert an AOSP `0xAARRGGBB` `argb` int (`View.setBackgroundColor`) into the renderer's straight
+/// RGBA float channels (0..1). 2026-06-05: the quad pipeline blends with straight alpha (over the blue
+/// clear), so a fully transparent background (alpha 0) leaves the clear color showing through.
+fn argb_to_rgba_f32(argb: i32) -> [f32; 4] {
+    let v = argb as u32;
+    let a = ((v >> 24) & 0xFF) as f32 / 255.0;
+    let r = ((v >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((v >> 8) & 0xFF) as f32 / 255.0;
+    let b = (v & 0xFF) as f32 / 255.0;
+    [r, g, b, a]
+}
+
 /// A small fixed palette so nested views are visually distinguishable by depth. Indexed by
 /// `depth % len`. Colors are mid-tones that read against the blue clear background.
 const DEPTH_PALETTE: [[f32; 4]; 4] = [
@@ -909,7 +921,11 @@ fn layout_views(
         .iter()
         .zip(boxes.iter())
         .map(|(node, b)| {
-            let color = DEPTH_PALETTE[(node.depth as usize).min(DEPTH_PALETTE.len() - 1)];
+            // A real `View.setBackgroundColor` (ARGB) wins over the synthetic depth color, for fidelity.
+            let color = match node.background_color {
+                Some(argb) => argb_to_rgba_f32(argb),
+                None => DEPTH_PALETTE[(node.depth as usize).min(DEPTH_PALETTE.len() - 1)],
+            };
             LaidOutView {
                 handle: node.handle,
                 x: b.x,
@@ -3835,6 +3851,7 @@ mod tests {
             depth,
             layout: LayoutParams::default(),
             clickable: false,
+            background_color: None,
             children: Vec::new(),
         }
     }
@@ -3854,6 +3871,7 @@ mod tests {
             depth,
             layout: lp,
             clickable: false,
+            background_color: None,
             children: kids.to_vec(),
         }
     }
@@ -3956,6 +3974,37 @@ mod tests {
         // Child 1 stacked directly below child 0.
         assert_eq!((views[2].x, views[2].y), (0.0, 100.0));
         assert_eq!((views[2].w, views[2].h), (400.0, 100.0));
+    }
+
+    #[test]
+    fn argb_to_rgba_f32_splits_channels() {
+        // 0xAARRGGBB → straight RGBA floats in 0..1. Opaque red.
+        let c = argb_to_rgba_f32(0xFFFF_0000u32 as i32);
+        assert_eq!(c, [1.0, 0.0, 0.0, 1.0]);
+        // Half-alpha pure green.
+        let g = argb_to_rgba_f32(0x8000_FF00u32 as i32);
+        assert!((g[0]).abs() < 1e-6);
+        assert!((g[1] - 1.0).abs() < 1e-6);
+        assert!((g[2]).abs() < 1e-6);
+        assert!((g[3] - 128.0 / 255.0).abs() < 1e-6);
+        // Fully transparent → alpha 0 (clear shows through).
+        assert_eq!(argb_to_rgba_f32(0x0000_0000), [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn background_color_overrides_depth_palette_in_layout() {
+        // A view with a recorded `View.setBackgroundColor` (ARGB) gets that color, not the depth palette.
+        let extent = vk::Extent2D {
+            width: 100,
+            height: 100,
+        };
+        let mut n = node("android.view.View", None, 0);
+        n.background_color = Some(0xFF00_00FFu32 as i32); // opaque blue
+        let views = layout_views(&[n], extent, None);
+        assert_eq!(views[0].color, [0.0, 0.0, 1.0, 1.0]);
+        // Without a background color, the depth palette is used (depth 0 entry).
+        let plain = layout_views(&[node("android.view.View", None, 0)], extent, None);
+        assert_eq!(plain[0].color, DEPTH_PALETTE[0]);
     }
 
     #[test]

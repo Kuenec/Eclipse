@@ -747,6 +747,30 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   events, and the NDK `AInputQueue` native-input path (Roblox's native input). Gate clean: **188 unit + 2 doctests**
   (+3), fmt / build --all-targets / clippy `-D warnings` / release all 0-warning. Files: `src/framework.rs`,
   `src/graphics.rs`. No new deps. **Next input step = `ACTION_MOVE`/multi-touch then the `AInputQueue` path for Roblox.**
+  ✅ **DONE 2026-06-05: multitouch.test (a CUSTOM-View Canvas app) now drives the full lifecycle to RESUMED**
+  (§6 multitouch-RESUMED entry). Root-cause fix + 8 surfaced benign natives via the discovery loop. The app is an
+  **AppCompat `ActionBarActivity`**; `setContentView` → `ensureSubDecor` → inflating the ActionBar's `HomeView`/
+  `ImageView` threw `UnsupportedOperationException: Failed to resolve attribute at index N: TypedValue{t=0x2/...}`
+  — an **inline-XML `?attr/` (`TYPE_ATTRIBUTE`) value left UNRESOLVED**. **ROOT-CAUSE FIX:** `applyStyle` now
+  resolves inline `TYPE_ATTRIBUTE` values against the active theme (`resolve_inline_theme_refs` → the existing
+  `resolve_theme_attr`), exactly as AOSP's `Theme.resolveAttribute` does — surgical, threaded through the theme
+  handle the native already holds. Then the discovery loop surfaced + bound (real behavior, never sentinels):
+  **`ImageView.native_setScaleType(JI)V`** + **`native_setDrawable(JJ)V`** (handle-validating no-ops; no ImageView
+  image raster yet), **`View.nativeSetOnClickListener(J)V`** (reuses the class-agnostic clickable marker — the
+  custom View registers a listener), **`View.native_setBackgroundColor(JI)V`** (RECORDS the ARGB on the
+  `view_registry` peer → the renderer FILLS the view rect with it, real fidelity over the depth color),
+  **`Paint.native_set_stroke_width(JF)V`** + **`native_set_style(JI)V`** + **`native_set_text_size(JF)V`** (RECORD the
+  draw config on `paint_registry` — added `PaintStyle` FILL/STROKE + `stroke_width`), and
+  **`ViewGroup.native_removeView(JJ)V`** (removes the parent→child edge — the app re-parents its content). With these,
+  multitouch drives **steps 0–7 → onCreate/onStart/onResume "yay!" → ActivityResumed + Vulkan swapchain, 0
+  VK_ERROR/panic/lifecycle-failure, EXIT=124 clean** (`/tmp/eclipse-canvas10.log`). **FAITHFUL — the CUSTOM View's
+  `onDraw(Canvas)` does NOT yet run:** Eclipse's minimal lifecycle drives `onResume` but never runs
+  `ViewRootImpl.performTraversals` → `View.draw(canvas)`, so `onDraw` is not invoked and **0 Canvas draw natives
+  surface** (grep `No implementation` = 0). The **draw-cascade driver** (construct a Java `Canvas` backed by an
+  Eclipse Pixmap + invoke each custom view's `onDraw`, then composite) is the next build — see the Canvas-raster +
+  composite entry below + §5 next-actions. **NO REGRESSION:** demo_app + accelerometerdemo still reach ActivityResumed
+  + swapchain, 0 VK_ERROR/panic (`/tmp/eclipse-demo-reg.log`, `/tmp/eclipse-accel-reg.log`). Gate clean: **193 unit
+  + 2 doctests** (+5), fmt/clippy `-D warnings`/release all 0-warning.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;

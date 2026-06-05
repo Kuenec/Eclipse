@@ -1181,6 +1181,31 @@ fn resolve_theme_attributes(theme: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>
     .unwrap_or_else(|_| vec![None; ids.len()])
 }
 
+/// In-place: resolve any `entries` slot still holding a `TYPE_ATTRIBUTE` (`?attr/foo`) inline-XML value
+/// against the active `theme`'s merged attribute map.
+///
+/// 2026-06-05: an inline `AttributeSet` value can be a theme reference (`android:background="?attr/…"`).
+/// [`resolve_xml_attributes`] records it as a `TYPE_ATTRIBUTE` `TypedEntry` whose `data` is the
+/// referenced attribute id (it has no theme to resolve against). AOSP's `TypedArray.getDrawable`/
+/// `getColor`/… throw `UnsupportedOperationException` on an unresolved `TYPE_ATTRIBUTE`, so this hop
+/// must happen before the framework reads the slot. [`resolve_theme_attr`] looks the referenced
+/// attribute id up in the theme map and resolves its value (chasing references), exactly as AOSP's
+/// `Theme.resolveAttribute` does. A stale/empty theme, or an attribute the theme does not define,
+/// leaves the slot unchanged (the faithful "not in theme" outcome — not a fabricated value).
+fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>]) {
+    let _ = theme_registry::with_theme(theme, |t| {
+        for slot in entries.iter_mut() {
+            if let Some(entry) = slot {
+                if entry.value_type == i32::from(TYPE_ATTRIBUTE) {
+                    if let Some(resolved) = resolve_theme_attr(&t.attrs, entry.data) {
+                        *slot = Some(resolved);
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Fill the framework-allocated `TypedArray` output buffers from `entries` (one per requested
 /// attribute, in request order): each `Some` writes its value's [`STYLE_TYPE`]/[`STYLE_DATA`] and —
 /// for a reference — [`STYLE_RESOURCE_ID`] slots of its [`STYLE_NUM_ENTRIES`]-wide window (the rest
@@ -1473,6 +1498,15 @@ extern "system" fn asset_manager_apply_style<'local>(
             attrs.get_region(env, 0, &mut ids)?;
             if parser != 0 {
                 entries = resolve_xml_attributes(parser, &ids);
+                // 2026-06-05: an inline XML attribute value can itself be a theme reference
+                // (`?attr/foo`, `TYPE_ATTRIBUTE`) — e.g. AppCompat's `ActionBarView$HomeView`/
+                // `ImageView` set `android:background="?attr/…"`. `resolve_xml_attributes` cannot
+                // resolve it (it has no theme), so the unresolved `TYPE_ATTRIBUTE` would reach
+                // `TypedArray.getDrawable`/`getColor`, which throw `UnsupportedOperationException:
+                // Failed to resolve attribute at index N`. Resolve each such value HERE against the
+                // active theme (the handle this native already holds) — the same theme map the
+                // `parser == 0` path uses. Surfaced by multitouch.test's AppCompat ActionBar inflation.
+                resolve_inline_theme_refs(theme, &mut entries);
             }
             // Theme fallback: fill any attribute not already resolved from the XML element. For
             // parser == 0 this resolves ALL of them from the theme.
@@ -3252,6 +3286,23 @@ const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
 const VIEW_NATIVE_SET_VISIBILITY_NAME: &JNIStr = jni_str!("native_setVisibility");
 const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIF)V");
 
+// 2026-06-05: `View.setOnClickListener` calls `nativeSetOnClickListener(widget)` directly on the
+// `android.view.View` class (multitouch.test's custom View registers a click listener — run log
+// `No implementation found for void android.view.View.nativeSetOnClickListener(long)`). The same
+// native was already bound on `ImageButton` (resolved per declaring class); the handler
+// [`image_button_set_on_click_listener`] is class-agnostic (it marks the peer clickable in
+// [`view_registry`]), so the View-class binding reuses it. Instance native, descriptor `(J)V`.
+const VIEW_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
+const VIEW_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
+
+// 2026-06-05: `View.setBackgroundColor` calls `native_setBackgroundColor(long widget, int color)` to
+// set a solid background fill on the native peer; surfaced by multitouch.test (run log `No
+// implementation found for void android.view.View.native_setBackgroundColor(long, int)`). `color` is
+// `Color.argb`/`0xAARRGGBB`. Eclipse RECORDS it on the `view_registry` peer; the renderer fills the
+// view's rect with this color (real fidelity over the synthetic depth color). Instance native, `(JI)V`.
+const VIEW_SET_BACKGROUND_COLOR_NAME: &JNIStr = jni_str!("native_setBackgroundColor");
+const VIEW_SET_BACKGROUND_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
+
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
 /// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
@@ -3542,6 +3593,43 @@ extern "system" fn view_native_set_visibility<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.native_setBackgroundColor(long widget, int color)` → record the solid ARGB background color
+/// on the view's [`view_registry`] peer (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle;
+/// `color` is `Color.argb`/`0xAARRGGBB`. Eclipse records it through the bounds+generation-checked
+/// [`view_registry::set_background_color`] (a bad handle is logged + ignored, never UB); the renderer's
+/// layout pass fills the view's rect with this color for real fidelity (vs the synthetic depth color).
+/// Surfaced 2026-06-05 by multitouch.test setting a background on its content view.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn view_native_set_background_color<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    color: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::set_background_color(widget, color) {
+            Ok(()) => tracing::trace!(
+                target: "android.view.View",
+                widget,
+                color = format_args!("0x{:08x}", u32::from_ne_bytes(color.to_ne_bytes())),
+                "View.native_setBackgroundColor: recorded background color on view peer"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_setBackgroundColor: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -3618,15 +3706,34 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_set_visibility as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `image_button_set_on_click_listener` is the class-agnostic `(J)V` instance native
+        // that marks the peer clickable in `view_registry`; bound here for `View.nativeSetOnClickListener`
+        // (surfaced by multitouch.test's custom View, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_SET_ON_CLICK_LISTENER_NAME,
+                VIEW_SET_ON_CLICK_LISTENER_SIG,
+                image_button_set_on_click_listener as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `view_native_set_background_color` matches the paired `(JI)V` signature as an instance
+        // native (surfaced by multitouch.test, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_SET_BACKGROUND_COLOR_NAME,
+                VIEW_SET_BACKGROUND_COLOR_SIG,
+                view_native_set_background_color as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
-    // 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility` from the ART
-    // No-implementation-found lines, 2026-06-05).
+    // 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility`/`nativeSetOnClickListener` from
+    // the ART No-implementation-found lines, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor"
     );
     Ok(())
 }
@@ -3652,6 +3759,13 @@ pub const VIEW_GROUP_CLASS: &JNIStr = jni_str!("android/view/ViewGroup");
 const VIEW_GROUP_NATIVE_ADD_VIEW_NAME: &JNIStr = jni_str!("native_addView");
 const VIEW_GROUP_NATIVE_ADD_VIEW_SIG: &JNIStr =
     jni_str!("(JJILandroid/view/ViewGroup$LayoutParams;)V");
+
+// JNI name + descriptor for ViewGroup.native_removeView, from the ART-reported signature `void
+// android.view.ViewGroup.native_removeView(long, long)` (run log 2026-06-05, multitouch.test's
+// `MultitouchTest.onCreate` re-parenting its content): an instance native, descriptor `(JJ)V` (the
+// parent widget handle + the child widget handle).
+const VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME: &JNIStr = jni_str!("native_removeView");
+const VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG: &JNIStr = jni_str!("(JJ)V");
 
 /// `ViewGroup.native_addView(long parent, long child, int index, ViewGroup.LayoutParams params)` →
 /// record the parent→child tree edge in [`view_registry`].
@@ -3708,6 +3822,47 @@ extern "system" fn view_group_native_add_view<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `ViewGroup.native_removeView(long parent, long child)` → remove the parent→child tree edge in
+/// [`view_registry`] (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void, so the parameters are
+/// `(EnvUnowned, JObject this, jlong parent, jlong child)`. Removes the `child` handle from the
+/// `parent` view's `children` list through the bounds+generation-checked [`view_registry`] (a bad
+/// parent handle is logged + ignored, never UB). Mirrors [`view_group_native_add_view`]'s edge
+/// recording so a view re-parented during `onCreate` (multitouch.test detaches its content view before
+/// re-adding it) leaves the recorded tree consistent. Surfaced 2026-06-05 by multitouch.test.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn view_group_native_remove_view<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    parent: jlong,
+    child: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(parent, |p| {
+            p.children.retain(|&c| c != child);
+        }) {
+            Ok(()) => tracing::debug!(
+                target: "android.view.ViewGroup",
+                parent,
+                child,
+                "ViewGroup.native_removeView: removed parent→child tree edge (non-GTK)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.ViewGroup",
+                parent,
+                child,
+                error = %e,
+                "ViewGroup.native_removeView: invalid parent handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.ViewGroup`'s tree-wiring natives.
 ///
 /// Registered before step 4, alongside the View/Window natives. Each is implemented against
@@ -3730,13 +3885,23 @@ fn register_view_group_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_group_native_add_view as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `view_group_native_remove_view` matches the paired `(JJ)V` signature as an instance
+        // native (surfaced by multitouch.test re-parenting its content, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME,
+                VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG,
+                view_group_native_remove_view as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/view/ViewGroup; the fn pointer's signature matches its
-    // `native_addView` declaration (verified against ViewGroup.java line 186, 2026-06-05).
+    // SAFETY: `class` is the loaded android/view/ViewGroup; the fn pointers' signatures match its
+    // `native_addView` (ViewGroup.java line 186) and `native_removeView` (ART-reported line 2026-06-05)
+    // declarations.
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/ViewGroup",
-        "registered Eclipse's non-GTK backing for ViewGroup.native_addView"
+        "registered Eclipse's non-GTK backing for ViewGroup.native_addView + native_removeView"
     );
     Ok(())
 }
@@ -3766,6 +3931,26 @@ const PAINT_NATIVE_CREATE_SIG: &JNIStr = jni_str!("()J");
 // as its first arg), descriptor `(JI)V`.
 const PAINT_NATIVE_SET_COLOR_NAME: &JNIStr = jni_str!("native_set_color");
 const PAINT_NATIVE_SET_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
+
+// JNI name + descriptor for Paint.native_set_stroke_width, from the ART-reported signature `void
+// android.graphics.Paint.native_set_stroke_width(long, float)` (run log 2026-06-05, multitouch.test's
+// custom View `MultiTouch.<init>` → Paint.setStrokeWidth): a static native (the handle is the first
+// arg), descriptor `(JF)V`.
+const PAINT_NATIVE_SET_STROKE_WIDTH_NAME: &JNIStr = jni_str!("native_set_stroke_width");
+const PAINT_NATIVE_SET_STROKE_WIDTH_SIG: &JNIStr = jni_str!("(JF)V");
+
+// JNI name + descriptor for Paint.native_set_style, from the ART-reported signature `void
+// android.graphics.Paint.native_set_style(long, int)` (run log 2026-06-05, multitouch.test's custom
+// View `MultiTouch.<init>` → Paint.setStyle): a static native, descriptor `(JI)V`. The int is the
+// `Paint.Style` ordinal (FILL=0, STROKE=1, FILL_AND_STROKE=2).
+const PAINT_NATIVE_SET_STYLE_NAME: &JNIStr = jni_str!("native_set_style");
+const PAINT_NATIVE_SET_STYLE_SIG: &JNIStr = jni_str!("(JI)V");
+
+// JNI name + descriptor for Paint.native_set_text_size, from the ART-reported signature `void
+// android.graphics.Paint.native_set_text_size(long, float)` (run log 2026-06-05, multitouch.test's
+// custom View `MultiTouch.<init>` → Paint.setTextSize): a static native, descriptor `(JF)V`.
+const PAINT_NATIVE_SET_TEXT_SIZE_NAME: &JNIStr = jni_str!("native_set_text_size");
+const PAINT_NATIVE_SET_TEXT_SIZE_SIG: &JNIStr = jni_str!("(JF)V");
 
 /// `Paint.native_create()` → a real Eclipse-owned [`paint_registry`] handle (2026-06-05).
 ///
@@ -3833,6 +4018,100 @@ extern "system" fn paint_native_set_color<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `Paint.native_set_stroke_width(long native_paint, float width)` → record the stroke width on the
+/// paint (2026-06-05).
+///
+/// JNI ABI: a `static` native returning void, so the parameters are `(EnvUnowned, JClass, jlong
+/// native_paint, float width)`. Writes `width` into the paint's [`paint_registry`] slot; the Canvas
+/// stroke draws (`drawCircle`/`drawPath` with a STROKE style) read it for the tiny-skia `Stroke::width`.
+/// A bad/stale handle is logged and ignored (the registry rejects it — never UB or panic). Surfaced
+/// 2026-06-05 by multitouch.test's custom-View Paint setup.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn paint_native_set_stroke_width<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    width: f32,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = paint_registry::with_paint(native_paint, |p| p.stroke_width = width) {
+            tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                error = %e,
+                "Paint.native_set_stroke_width: invalid paint handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_set_style(long native_paint, int style)` → record the fill/stroke style on the paint
+/// (2026-06-05).
+///
+/// JNI ABI: a `static` native returning void, so the parameters are `(EnvUnowned, JClass, jlong
+/// native_paint, jint style)`. `style` is the AOSP `Paint.Style` ordinal (FILL=0, STROKE=1,
+/// FILL_AND_STROKE=2), mapped via [`paint_registry::PaintStyle::from_ordinal`] (unknown → FILL). The
+/// Canvas draws read it to choose tiny-skia fill vs stroke. A bad/stale handle is logged + ignored
+/// (the registry rejects it — never UB or panic). Surfaced 2026-06-05 by multitouch.test's custom View.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn paint_native_set_style<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    style: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let resolved = paint_registry::PaintStyle::from_ordinal(style);
+        if let Err(e) = paint_registry::with_paint(native_paint, |p| p.style = resolved) {
+            tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                style,
+                error = %e,
+                "Paint.native_set_style: invalid paint handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_set_text_size(long native_paint, float size)` → record the text size on the paint
+/// (2026-06-05).
+///
+/// JNI ABI: a `static` native returning void, so the parameters are `(EnvUnowned, JClass, jlong
+/// native_paint, float size)`. Writes `size` into the paint's [`paint_registry`] slot (the `text_size`
+/// field `PaintState` already holds; `Canvas.drawText` reads it). A bad/stale handle is logged +
+/// ignored (the registry rejects it — never UB or panic). Surfaced 2026-06-05 by multitouch.test.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn paint_native_set_text_size<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    size: f32,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = paint_registry::with_paint(native_paint, |p| p.text_size = size) {
+            tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                error = %e,
+                "Paint.native_set_text_size: invalid paint handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.graphics.Paint`'s natives.
 ///
 /// Registered before step 4, alongside the View/Window natives, since the View hierarchy's
@@ -3863,13 +4142,41 @@ fn register_paint_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 paint_native_set_color as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `paint_native_set_stroke_width` matches the paired `(JF)V` signature as a static
+        // native (surfaced by multitouch.test's custom-View Paint setup, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PAINT_NATIVE_SET_STROKE_WIDTH_NAME,
+                PAINT_NATIVE_SET_STROKE_WIDTH_SIG,
+                paint_native_set_stroke_width as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `paint_native_set_style` matches the paired `(JI)V` signature as a static native
+        // (surfaced by multitouch.test's custom-View Paint setup, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PAINT_NATIVE_SET_STYLE_NAME,
+                PAINT_NATIVE_SET_STYLE_SIG,
+                paint_native_set_style as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `paint_native_set_text_size` matches the paired `(JF)V` signature as a static native
+        // (surfaced by multitouch.test's custom-View Paint setup, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PAINT_NATIVE_SET_TEXT_SIZE_NAME,
+                PAINT_NATIVE_SET_TEXT_SIZE_SIG,
+                paint_native_set_text_size as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/graphics/Paint; the fn pointers' signatures match its
-    // `native_create`/`native_set_color` declarations (from the ART-reported signatures, 2026-06-05).
+    // `native_create`/`native_set_color`/`native_set_stroke_width`/`native_set_style`/
+    // `native_set_text_size` declarations (from the ART-reported signatures, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/graphics/Paint",
-        "registered Eclipse's non-GTK backing for Paint.native_create + native_set_color"
+        "registered Eclipse's non-GTK backing for Paint.native_create + native_set_color + native_set_stroke_width + native_set_style + native_set_text_size"
     );
     Ok(())
 }
@@ -4608,6 +4915,100 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
 /// `android.widget.ImageView` (internal/slashed name for `find_class`) — re-declares `native_constructor`.
 pub const IMAGE_VIEW_CLASS: &JNIStr = jni_str!("android/widget/ImageView");
 
+// 2026-06-05: `ImageView.setScaleType` calls `native_setScaleType(long, int)` to record the
+// scale type on its native peer; surfaced by multitouch.test's AppCompat `ActionBarView`/`HomeView`
+// `ImageView` (run log `No implementation found for void android.widget.ImageView.native_setScaleType(
+// long, int)`). The scale type is a draw-time hint for how an ImageView fits its image to its bounds;
+// no ImageView image-source native is bound yet (the layered-drawable bitmap path is deferred), so
+// this validates the `widget` handle + no-ops. Instance native, descriptor `(JI)V`.
+const IMAGE_VIEW_SET_SCALE_TYPE_NAME: &JNIStr = jni_str!("native_setScaleType");
+const IMAGE_VIEW_SET_SCALE_TYPE_SIG: &JNIStr = jni_str!("(JI)V");
+
+// 2026-06-05: `ImageView.setImageDrawable` calls `native_setDrawable(long widget, long drawable)` to
+// attach the image drawable to its native peer; surfaced by multitouch.test's AppCompat ActionBar
+// `HomeView` ImageView (run log `No implementation found for void android.widget.ImageView.
+// native_setDrawable(long, long)`). `drawable` is a `Drawable` native handle. ImageView image drawing
+// has no draw consumer yet (the layered-drawable bitmap raster is deferred), so this validates the
+// `widget` view handle + no-ops. Instance native, descriptor `(JJ)V`.
+const IMAGE_VIEW_SET_DRAWABLE_NAME: &JNIStr = jni_str!("native_setDrawable");
+const IMAGE_VIEW_SET_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
+
+/// `ImageView.native_setScaleType(long widget, int scaleType)` → validate the handle; no-op
+/// (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void. `widget` is the ImageView's [`view_registry`] handle;
+/// `scaleType` is the `ImageView.ScaleType` ordinal. Scale type only affects how an image is fitted
+/// when the ImageView draws it; no ImageView image-source native is bound (the layered-drawable bitmap
+/// path is the deferred render build), so there is no draw consumer to record it for. Validates the
+/// handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored,
+/// never UB) so a fabricated `widget` can never reach a wild dereference.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn image_view_set_scale_type<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    scale_type: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => tracing::trace!(
+                target: "android.widget.ImageView",
+                widget,
+                scale_type,
+                "ImageView.native_setScaleType: validated handle (no-op; no image draw consumer yet)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.ImageView",
+                widget,
+                error = %e,
+                "ImageView.native_setScaleType: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `ImageView.native_setDrawable(long widget, long drawable)` → validate the handle; no-op
+/// (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void. `widget` is the ImageView's [`view_registry`] handle;
+/// `drawable` is the image `Drawable`'s native handle. ImageView image drawing has no draw consumer
+/// yet (the layered-drawable bitmap raster + composite for an ImageView's image is deferred), so this
+/// validates the `widget` handle through the bounds+generation-checked [`view_registry`] (a bad handle
+/// is logged + ignored, never UB) and no-ops. When the ImageView image raster lands, the `drawable`
+/// handle is recorded on the peer here.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn image_view_set_drawable<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    drawable: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => tracing::trace!(
+                target: "android.widget.ImageView",
+                widget,
+                drawable,
+                "ImageView.native_setDrawable: validated handle (no-op; no image draw consumer yet)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.ImageView",
+                widget,
+                error = %e,
+                "ImageView.native_setDrawable: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.widget.ImageView`'s peer natives.
 ///
 /// `native_constructor` (same `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as
@@ -4633,13 +5034,32 @@ fn register_image_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_constructor as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `image_view_set_scale_type` matches the paired `(JI)V` signature as an instance
+        // native (surfaced by multitouch.test's ImageView, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                IMAGE_VIEW_SET_SCALE_TYPE_NAME,
+                IMAGE_VIEW_SET_SCALE_TYPE_SIG,
+                image_view_set_scale_type as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `image_view_set_drawable` matches the paired `(JJ)V` signature as an instance native
+        // (surfaced by multitouch.test's ImageView, run log 2026-06-05).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                IMAGE_VIEW_SET_DRAWABLE_NAME,
+                IMAGE_VIEW_SET_DRAWABLE_SIG,
+                image_view_set_drawable as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/widget/ImageView; the fn pointer's signature matches its
-    // re-declared `native_constructor` (same as View/TextView, surfaced by the run line 2026-06-05).
+    // SAFETY: `class` is the loaded android/widget/ImageView; the fn pointers' signatures match its
+    // re-declared `native_constructor` (same as View/TextView), `native_setScaleType`, and
+    // `native_setDrawable` (surfaced by the run lines 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/widget/ImageView",
-        "registered Eclipse's non-GTK backing for ImageView.native_constructor"
+        "registered Eclipse's non-GTK backing for ImageView.native_constructor + native_setScaleType + native_setDrawable"
     );
     Ok(())
 }
@@ -6216,6 +6636,76 @@ mod tests {
     }
 
     #[test]
+    fn resolve_inline_theme_refs_resolves_attribute_values_against_the_theme() {
+        // 2026-06-05 root-cause regression guard for multitouch.test's AppCompat ActionBar inflation:
+        // an inline XML attribute whose value is a `?attr/foo` (TYPE_ATTRIBUTE) must be resolved
+        // against the active theme before the framework reads it; otherwise TypedArray.getDrawable/
+        // getColor throw `UnsupportedOperationException: Failed to resolve attribute at index N`.
+        use crate::framework::theme_registry;
+        let theme = theme_registry::allocate().expect("allocate theme");
+        // The theme defines attr 0x7f010001 = a concrete int 42.
+        let referenced_attr = 0x7f01_0001u32;
+        theme_registry::with_theme(theme, |t| {
+            t.attrs.insert(
+                u32_to_i32(referenced_attr),
+                theme_registry::ThemeAttr {
+                    type_: 0x10, // TYPE_INT_DEC
+                    data: 42,
+                },
+            );
+        })
+        .expect("populate theme");
+
+        // Slot 0: an inline `?attr/0x7f010001` value (what resolve_xml_attributes records). Slot 1: an
+        // already-concrete value (must be left untouched). Slot 2: None (must stay None).
+        let mut entries = vec![
+            Some(TypedEntry {
+                value_type: i32::from(TYPE_ATTRIBUTE),
+                data: u32_to_i32(referenced_attr),
+                resource_id: u32_to_i32(referenced_attr),
+                asset_cookie: 0,
+            }),
+            Some(TypedEntry {
+                value_type: 0x1c, // TYPE_INT_COLOR_ARGB8 — concrete
+                data: 0x1234_5678,
+                resource_id: 0,
+                asset_cookie: 0,
+            }),
+            None,
+        ];
+        resolve_inline_theme_refs(theme, &mut entries);
+
+        let resolved = entries[0].expect("the ?attr value resolved against the theme");
+        assert_eq!(
+            resolved.value_type, 0x10,
+            "resolved to the theme attr's type"
+        );
+        assert_eq!(resolved.data, 42, "resolved to the theme attr's data");
+        assert_eq!(
+            entries[1].expect("concrete slot untouched").data,
+            0x1234_5678
+        );
+        assert!(entries[2].is_none(), "absent slot stays None");
+
+        // An attribute the theme does not define is left as the unresolved reference (faithful
+        // "not in theme" outcome, not a fabricated value).
+        let mut undefined = vec![Some(TypedEntry {
+            value_type: i32::from(TYPE_ATTRIBUTE),
+            data: u32_to_i32(0x7f01_9999),
+            resource_id: u32_to_i32(0x7f01_9999),
+            asset_cookie: 0,
+        })];
+        resolve_inline_theme_refs(theme, &mut undefined);
+        assert_eq!(
+            undefined[0].expect("slot present").value_type,
+            i32::from(TYPE_ATTRIBUTE),
+            "an attr absent from the theme stays an unresolved reference"
+        );
+
+        theme_registry::free(theme).expect("free theme");
+    }
+
+    #[test]
     fn context_native_names_and_sigs_match_context_java() {
         // Pin the two Context static-init native method names + JNI descriptors against
         // `Context.java` (2026-06-05): a transcription regression (wrong name or sig) would make
@@ -6739,6 +7229,20 @@ mod tests {
             "native_setVisibility"
         );
         assert_eq!(VIEW_NATIVE_SET_VISIBILITY_SIG.to_str(), "(JIF)V");
+        // nativeSetOnClickListener(long) → `(J)V`, surfaced 2026-06-05 by multitouch.test's custom View
+        // (same native already bound on ImageButton; reuses the class-agnostic handler).
+        assert_eq!(
+            VIEW_SET_ON_CLICK_LISTENER_NAME.to_str(),
+            "nativeSetOnClickListener"
+        );
+        assert_eq!(VIEW_SET_ON_CLICK_LISTENER_SIG.to_str(), "(J)V");
+        // native_setBackgroundColor(long, int) → `(JI)V`, surfaced 2026-06-05 by multitouch.test
+        // (records the ARGB background on the view_registry peer). Pinned to the ART-reported sig.
+        assert_eq!(
+            VIEW_SET_BACKGROUND_COLOR_NAME.to_str(),
+            "native_setBackgroundColor"
+        );
+        assert_eq!(VIEW_SET_BACKGROUND_COLOR_SIG.to_str(), "(JI)V");
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
@@ -6788,6 +7292,24 @@ mod tests {
         // native_set_color(long, int) — surfaced 2026-06-05 by ColorDrawable.<init> → Paint.setColor.
         assert_eq!(PAINT_NATIVE_SET_COLOR_NAME.to_str(), "native_set_color");
         assert_eq!(PAINT_NATIVE_SET_COLOR_SIG.to_str(), "(JI)V");
+        // native_set_stroke_width(long, float) — surfaced 2026-06-05 by multitouch.test's custom-View
+        // Paint.setStrokeWidth. Pinned to the exact ART-reported descriptor.
+        assert_eq!(
+            PAINT_NATIVE_SET_STROKE_WIDTH_NAME.to_str(),
+            "native_set_stroke_width"
+        );
+        assert_eq!(PAINT_NATIVE_SET_STROKE_WIDTH_SIG.to_str(), "(JF)V");
+        // native_set_style(long, int) — surfaced 2026-06-05 by multitouch.test's custom-View
+        // Paint.setStyle. Pinned to the exact ART-reported descriptor.
+        assert_eq!(PAINT_NATIVE_SET_STYLE_NAME.to_str(), "native_set_style");
+        assert_eq!(PAINT_NATIVE_SET_STYLE_SIG.to_str(), "(JI)V");
+        // native_set_text_size(long, float) — surfaced 2026-06-05 by multitouch.test's custom-View
+        // Paint.setTextSize. Pinned to the exact ART-reported descriptor.
+        assert_eq!(
+            PAINT_NATIVE_SET_TEXT_SIZE_NAME.to_str(),
+            "native_set_text_size"
+        );
+        assert_eq!(PAINT_NATIVE_SET_TEXT_SIZE_SIG.to_str(), "(JF)V");
     }
 
     #[test]
@@ -6845,6 +7367,17 @@ mod tests {
         // RegisterNatives throws NoClassDefFoundError. The shared constructor name/sig are pinned by
         // view_native_names_sigs_and_class_match_view_java. Host-independent constant.
         assert_eq!(IMAGE_VIEW_CLASS.to_str(), "android/widget/ImageView");
+        // native_setScaleType(long, int) → `(JI)V`, surfaced 2026-06-05 by multitouch.test's
+        // AppCompat ActionBar ImageView (no-op handle-validation). Pinned to the ART-reported sig.
+        assert_eq!(
+            IMAGE_VIEW_SET_SCALE_TYPE_NAME.to_str(),
+            "native_setScaleType"
+        );
+        assert_eq!(IMAGE_VIEW_SET_SCALE_TYPE_SIG.to_str(), "(JI)V");
+        // native_setDrawable(long, long) → `(JJ)V`, surfaced 2026-06-05 by multitouch.test's
+        // AppCompat ActionBar ImageView (no-op handle-validation). Pinned to the ART-reported sig.
+        assert_eq!(IMAGE_VIEW_SET_DRAWABLE_NAME.to_str(), "native_setDrawable");
+        assert_eq!(IMAGE_VIEW_SET_DRAWABLE_SIG.to_str(), "(JJ)V");
     }
 
     #[test]
@@ -6901,6 +7434,13 @@ mod tests {
             VIEW_GROUP_NATIVE_ADD_VIEW_SIG.to_str(),
             "(JJILandroid/view/ViewGroup$LayoutParams;)V"
         );
+        // native_removeView(long, long) → `(JJ)V`, surfaced 2026-06-05 by multitouch.test re-parenting
+        // its content view (removes the parent→child edge). Pinned to the ART-reported descriptor.
+        assert_eq!(
+            VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME.to_str(),
+            "native_removeView"
+        );
+        assert_eq!(VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG.to_str(), "(JJ)V");
     }
 
     /// A hand-built `resources.arsc` for a package whose id is `package_id`, with one type (id 1)
