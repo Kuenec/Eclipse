@@ -170,6 +170,23 @@ before any history-rewriting/force operation.
   `%fs`, resolve real cross-lib symbols, model the bionic two-namespace scope, or touch the apkenv
   linker (that wiring is main-loop / dev-host only, cyber-safeguard). See §6 (2026-06-05 reloc-core)
   + §5 next-actions for the loader build that consumes it.
+  **2026-06-05 UPDATE — the loader's SECOND piece, the ELF DECODER that FEEDS the reloc core, is built +
+  tested:** `src/loader/elf.rs` parses a 64-bit LE x86-64 `ET_DYN` `.so` from a `&[u8]` (`#![forbid(unsafe_code)]`,
+  every read bounds-checked → typed `ElfError`, no panic/UB) and produces EXACTLY reloc.rs's inputs: a
+  `Vec<reloc::Rela>` from `.rela.dyn`+`.rela.plt`, the raw `DT_RELR` `u64` table, the dynamic symbol table
+  (`Elf64_Sym` name/value/bind/type/shndx), the parsed `DynInfo` (RELA/RELR/JMPREL/SYMTAB/STRTAB/HASH/GNU_HASH/
+  NEEDED/SONAME/INIT*/FLAGS+FLAGS_1 with `BIND_NOW` detection via DF_BIND_NOW/DF_1_NOW/DT_BIND_NOW), and the
+  `PT_LOAD` layout (+ `PT_TLS`/`PT_GNU_RELRO`) for the later mmap step. Virtual→file-offset conversion walks the
+  `PT_LOAD` table. **`elf.rs` decodes; `reloc.rs` applies** — clean two-half boundary, the decoded `Rela` IS the
+  applier's input type (an integration test decodes a fixture's `.rela` and applies it through `reloc::apply_rela`
+  on a `SliceImage`). 16 new tests: hand-built in-memory ELF fixtures (header/PT/dynamic/symtab/vaddr-map/RELA-
+  roundtrip/RELR) + bad-magic/wrong-class/wrong-endian/wrong-machine/not-DYN/truncated/bad-entsize → typed errors
+  (no panic) + a REAL-FILE test that parses `/usr/lib/libm.so.6` as DATA (skips cleanly if no host `.so` exists):
+  decoded loads=4, dynsyms=1422, relas=33, relr_words=3, soname=`libm.so.6`, needed=2, bind_now=true — all
+  cross-check `readelf -d/-l` exactly (RELASZ 792/24=33, RELRSZ 24/8=3). Gate now **242 unit + 2 doctests**.
+  **Engine-load frontier: ELF decoder DONE, feeds the reloc core; NEXT = mmap the PT_LOAD segments** (then
+  static-TLS block + `%fs`/TCB → real `SymbolResolver`/two-namespace scope → wire/augment vs apkenv, main-loop
+  only). See §6 (2026-06-05 elf-decoder).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2508,6 +2525,40 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `build --all-targets` + `clippy --all-targets --all-features -D warnings` + `test` (**226 unit + 2 doctests**)
   + `build --release` all 0-warning/0-error. No new deps (std-only). Files: `src/loader.rs`, `src/loader/reloc.rs`,
   `src/lib.rs` (`pub mod loader;`).
+- **2026-06-05 — elf-decoder: the ELF FILE-FORMAT DECODER that feeds the reloc core (`src/loader/elf.rs`,
+  `pub mod elf;` in `src/loader.rs`).** **What/why:** the reloc core (above) takes already-decoded inputs; this
+  is the next loader step that PRODUCES them from a real bionic `.so`. **Decodes** (64-bit LE x86-64 `ET_DYN`,
+  `#![forbid(unsafe_code)]`): the ELF header (magic/ELFCLASS64/ELFDATA2LSB/ET_DYN/EM_X86_64, e_phoff/phnum/
+  phentsize); program headers → `PT_LOAD` segments (offset/vaddr/filesz/memsz/flags/align), `PT_DYNAMIC`,
+  `PT_TLS` (for the static-TLS step), `PT_GNU_RELRO`; the `.dynamic` array → `DynInfo` (DT_RELA/RELASZ/RELAENT,
+  DT_RELR/RELRSZ/RELRENT, DT_JMPREL/PLTRELSZ/PLTREL, DT_SYMTAB/SYMENT, DT_STRTAB/STRSZ, DT_HASH/GNU_HASH,
+  DT_NEEDED list, DT_SONAME, DT_INIT/INIT_ARRAY*/FINI_ARRAY*, DT_FLAGS/FLAGS_1 with `BIND_NOW` via DF_BIND_NOW/
+  DF_1_NOW/DT_BIND_NOW); the dynamic symbol table (`Elf64_Sym` name←DT_STRTAB / value / bind / type / shndx).
+  **vaddr→file-offset** conversion walks the `PT_LOAD` table (dynamic-section addresses are virtual). **Output =
+  reloc.rs inputs, no glue:** `relocations()` → `Vec<reloc::Rela>` from `.rela.dyn`+`.rela.plt` (PLT appended so
+  a `BIND_NOW` caller applies both), `relr()` → raw `DT_RELR` `u64` words, the dynsyms, the `DynInfo`, and the
+  `PT_LOAD` layout for mmap. **Boundary kept clean:** elf.rs decodes, reloc.rs applies; the decoded `Rela` IS the
+  applier's input type. **Totality:** every read bounds-checked → typed `ElfError` (Truncated/BadMagic/NotElf64/
+  NotLittleEndian/NotSharedObject/NotX86_64/BadPhEntSize/BadEntSize/UnmappedVaddr/MissingDynamic); a malformed/
+  truncated/hostile file is an `Err`, never a panic (consistent with the `axml` total parser + `panic=abort`).
+  **Tests (16, GPU/VM-free):** hand-built in-memory ELF fixtures assert each header/PT/dynamic/symtab field, the
+  vaddr→offset map, a `.rela` round-trips into `reloc::Rela`, `DT_RELR` decodes to words, `BIND_NOW` is detected,
+  SONAME/NEEDED resolve; bad-magic/wrong-class/wrong-endian/wrong-machine/not-DYN/truncated/bad-entsize → typed
+  errors with no panic; an **integration test** decodes a fixture's `.rela` and applies it through
+  `reloc::apply_rela` on a `SliceImage` (proves the two halves compose); and a **REAL-FILE test** parses
+  `/usr/lib/libm.so.6` (tries 3 standard paths, **skips cleanly** with no host `.so`) — got loads=4, dynsyms=1422,
+  relas=33, relr_words=3, soname=`libm.so.6`, needed=2, bind_now=true, an EXACT cross-check vs `readelf -d/-l`
+  (RELASZ 792/24=33, RELRSZ 24/8=3). One off-by-one in the fixture's `st_name` was found+fixed by the dynsym test
+  (the decoder was correct). **Scope (honest):** decode ONLY — does NOT mmap, allocate the TLS block / set `%fs`,
+  resolve real cross-lib symbols, model the bionic two-namespace scope, or execute/wire vs apkenv; **NEXT = mmap
+  the PT_LOAD segments** (main-loop only for the apkenv-wiring tail). **Grounding (cyber-safeguard honored):**
+  written from the PUBLIC ELF-64 gABI / x86-64 psABI format (own general knowledge) + Eclipse's own `src/loader/`
+  ONLY — **no linker/ATL/bionic source was read**; parsing the BYTES of a real `.so` as data is benign (like the
+  zip/axml byte parsers). **Confirmed: clean-room own-Rust loader work (decode + relocate) is SUBAGENT-FEASIBLE —
+  it does NOT trip the cyber-safeguard**, unlike reading the apkenv linker source (which remains main-loop only).
+  **Gate:** `cargo fmt --all --check` + `build --all-targets` + `clippy --all-targets --all-features -D warnings`
+  + `test` (**242 unit + 2 doctests**) + `build --release` all 0-warning/0-error. No new deps (std-only). Files:
+  `src/loader/elf.rs` (new), `src/loader.rs` (`pub mod elf;` + module doc).
 
 ---
 
