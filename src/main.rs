@@ -13,15 +13,16 @@ USAGE:
     eclipse <COMMAND>
 
 COMMANDS:
-    run <APK>  Show the ART boot plan for an APK (dry run; VM boot not yet implemented)
+    run <APK>  Parse the APK, print the ART boot plan, and boot the ART VM
     config     Show effective configuration and its path
     help       Show this help
     --version  Show version
 
 STATUS:
-    `run` is a dry run: it opens the APK, parses the manifest, and prints the ART boot
-    plan (heap, host ISA, graphics backend, launcher) that the runtime will pass — the
-    VM boot itself (ART FFI) is pending. See docs/ for the full design.
+    `run` opens the APK, parses the manifest, prints the ART boot plan (heap, host ISA,
+    graphics backend, launcher), then boots the vendored ART VM. Today that brings up a
+    libcore VM (proving ART boots from Eclipse's graphics-free process); reaching Roblox's
+    onCreate (app classpath/Activity/native-lib/winit) is the next step. See docs/.
 ";
 
 fn main() -> ExitCode {
@@ -38,7 +39,7 @@ fn main() -> ExitCode {
             println!("eclipse {}", eclipse::VERSION);
             ExitCode::SUCCESS
         }
-        Some("run") => match run_dry(args.get(1).map(String::as_str)) {
+        Some("run") => match run_apk(args.get(1).map(String::as_str)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("eclipse run: {e}");
@@ -72,14 +73,14 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
     Ok(())
 }
 
-/// Dry run for `eclipse run <APK>`: open the APK, parse its manifest, build the ART
-/// [`BootPlan`](eclipse::runtime::BootPlan) from the manifest + effective config, and print
-/// the plan plus the ART options it would pass. The VM boot itself is not implemented yet
-/// (ART FFI pending) — this is the honest, demonstrable step before that lands.
+/// `eclipse run <APK>`: open the APK, parse its manifest, build the ART
+/// [`BootPlan`](eclipse::runtime::BootPlan) from the manifest + effective config, print the
+/// plan and the options it implies, then boot the ART VM from this (main) thread. Today this
+/// brings up a libcore VM; reaching Roblox's onCreate is the next step.
 ///
 /// Returns `Box<dyn Error>` because this `main`/setup-layer code composes several typed
-/// library errors (APK, config); the library crates themselves stay strictly typed (§2.8).
-fn run_dry(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+/// library errors (APK, config, runtime); the library crates themselves stay strictly typed (§2.8).
+fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(apk_path) = apk_path else {
         return Err("missing APK path (usage: eclipse run <APK>)".into());
     };
@@ -99,17 +100,22 @@ fn run_dry(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("graphics_backend:   {}", plan.graphics_backend.as_str());
     println!("instruction_set:    {}", plan.instruction_set_features);
-    println!("\n# ART/dex2oat options this plan would pass:");
-    for opt in plan.art_options() {
+    // Two distinct destinations: VM options go to JNI_CreateJavaVM, the ISA flag to dex2oat.
+    println!("\n# VM options (-> JNI_CreateJavaVM):");
+    for opt in plan.vm_options() {
+        println!("    {opt}");
+    }
+    println!("# dex2oat options (-> dex2oat AOT compiler):");
+    for opt in plan.dex2oat_options() {
         println!("    {opt}");
     }
 
-    // Do not fake a boot: report that the VM boot is pending, the same honest posture as the
-    // rest of the launcher. boot() returns NotImplemented by design (see runtime::boot).
-    println!();
-    match eclipse::runtime::boot(&plan) {
-        Ok(()) => println!("VM booted."),
-        Err(e) => println!("VM boot not started: {e}"),
-    }
+    // Boot the ART VM from this (main) thread — the production entry point. Today this brings up
+    // a libcore VM (proving ART boots from Eclipse's graphics-free process — the Step 3.5
+    // thesis); reaching Roblox's onCreate (app classpath/Activity/native-lib/winit) is the next
+    // step. ART logs verbosely to stderr on first run (dex2oat compiles the boot image once).
+    println!("\n# Booting the ART VM (libcore; Roblox onCreate pending)…");
+    eclipse::runtime::boot(&plan)?;
+    println!("libcore ART VM booted ✓");
     Ok(())
 }
