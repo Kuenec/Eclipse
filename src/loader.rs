@@ -28,16 +28,28 @@
 //! all bounds-checked with typed [`reloc::RelocError`] (never UB), and an exhaustive type
 //! dispatch (unknown type → `Err`, the exact gap the apkenv linker hit).
 //!
-//! `elf.rs` decodes the file format; `reloc.rs` applies relocations — a clean two-half boundary
-//! (the decoded `reloc::Rela` is the applier's input type, with no glue).
+//! [`map`] — the **PT_LOAD segment mapper + base relocator**: it reserves one contiguous
+//! anonymous region for a parsed `ElfImage`, copies each `PT_LOAD`'s file bytes to `base + vaddr`
+//! (the bss tail zero-filled by fresh anonymous pages, page-overlap correct by construction),
+//! applies the **base-only** relocations through [`reloc`] (`R_X86_64_RELATIVE` + `DT_RELR`), and
+//! `mprotect`s each segment to its final `p_flags`. RAII: [`map::MappedObject`] `munmap`s on drop.
+//! This is the one module that uses `unsafe` (the `mmap`/`mprotect`/`munmap` syscalls + the write
+//! through the mapping), each block carrying a `// SAFETY:` justification (AGENTS.md §2.3).
+//!
+//! `elf.rs` decodes the file format; `reloc.rs` applies relocations; `map.rs` lays the segments
+//! out and drives the base relocations — a clean three-way boundary (the decoded `reloc::Rela` is
+//! the applier's input type, with no glue).
 //!
 //! ## What this module deliberately does NOT do (the broader loader, built on this core)
-//! This is the **standalone, tested decode + relocate core**, not a working loader. It does
-//! **not** `mmap` segments, allocate the static-TLS block, set up the thread pointer, resolve
-//! real symbols across libraries, model the bionic two-namespace scope, or replace/augment the
-//! apkenv linker. Those are the next steps that build on this core (see the submodule docs and
-//! AGENTS.md §5 next-actions). Wiring it into the engine-load path requires that broader loader
-//! and is **main-loop / dev-host only** (the cyber-safeguard false-positives on linker work).
+//! This is the **decode + map + base-relocate core**, not a full working loader. It does **not**
+//! allocate the static-TLS block, set up the thread pointer (`%fs`/TCB), resolve real symbols
+//! across libraries (so `JUMP_SLOT`/`GLOB_DAT`/`64` and `TPOFF64` are deferred), execute the
+//! library's `IRELATIVE` ifunc resolvers, run init functions, model the bionic two-namespace
+//! scope, or replace/augment the apkenv linker. Those are the next steps that build on this core
+//! (see the submodule docs and AGENTS.md §5 next-actions). Wiring it into the engine-load path
+//! requires that broader loader and is **main-loop / dev-host only** (the cyber-safeguard
+//! false-positives on linker work).
 
 pub mod elf;
+pub mod map;
 pub mod reloc;

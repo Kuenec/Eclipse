@@ -49,6 +49,11 @@ jni-sys = "0.4"                                   # raw JNI invocation types use
 jni = "0.22"                                      # safe JNI wrapper for the onCreate framework driver (wraps the held *mut JavaVM)
 # --- Graphics/window: the host game window (M2) ----------------------------------
 winit = "0.30"                                    # Wayland/X11 window + event loop (NO GTK — keeps low_4gb clear for ART; ash/khronos-egl for forwarding come later)
+# 2026-06-05: mmap/mprotect/munmap for the bionic-loader's PT_LOAD segment mapper (src/loader/map.rs).
+# `mm` feature ONLY. rustix is ALREADY in the tree (winit→x11rb/wayland/polling pull rustix 1.x), so this
+# adds ZERO new transitive crates (verified `cargo tree`); more pure-Rust than `libc` (linux_raw backend
+# issues syscalls directly, no C-library link) — aligns with §2.1 pure-Rust + §9 portability + §2.5 no-bloat.
+rustix = { version = "1", default-features = false, features = ["mm", "param"] }
 # 2026-06-05: Vulkan surface+swapchain+present foundation on the winit window. `loaded` makes ash
 # dlopen the host libvulkan.so at runtime (Entry::load) — detect-don't-assume, no link-time Vulkan
 # dep (§9 portability). `std` gives std::error::Error on vk::Result; `debug` gives the Debug impls.

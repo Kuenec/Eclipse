@@ -449,6 +449,7 @@ dependencies = [
  "jni-sys 0.4.1",
  "libloading 0.9.0",
  "raw-window-handle",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",

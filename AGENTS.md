@@ -187,6 +187,28 @@ before any history-rewriting/force operation.
   **Engine-load frontier: ELF decoder DONE, feeds the reloc core; NEXT = mmap the PT_LOAD segments** (then
   static-TLS block + `%fs`/TCB → real `SymbolResolver`/two-namespace scope → wire/augment vs apkenv, main-loop
   only). See §6 (2026-06-05 elf-decoder).
+  **2026-06-05 UPDATE — the loader's THIRD piece, the PT_LOAD MAPPER + BASE RELOCATOR, is built + tested + PROVEN
+  ON `libm.so.6`:** `src/loader/map.rs` reserves ONE contiguous anonymous region (`mmap` PROT_NONE/MAP_PRIVATE,
+  page-rounded `max(vaddr+memsz)-min(vaddr)`) to claim a load base, copies each `PT_LOAD`'s `p_filesz` file bytes
+  to `base+vaddr` (the `[filesz,memsz)` bss tail is zero from the fresh anon pages; standard ELF page-overlap is
+  correct by construction — one reservation, bytes placed by vaddr), applies the **base-only** relocs through the
+  reloc core (`R_X86_64_RELATIVE` + `DT_RELR`, rebasing the RELR address words file-vaddr→runtime at the boundary),
+  then `mprotect`s each segment to its final `p_flags`. RAII `MappedObject` `munmap`s on Drop; the region is exposed
+  to the reloc pass as a safe `&mut [u8]` (`RelocImage`). **This is the FIRST loader module that uses `unsafe`**
+  (the mmap/mprotect/munmap syscalls + the write through the mapping), confined here with a `// SAFETY:` on every
+  block (reloc.rs/elf.rs stay `#![forbid(unsafe_code)]`). mmap crate = **`rustix` (`mm`+`param`), ALREADY in the
+  tree (winit) → ZERO new crates**, more pure-Rust than libc. **DEFERRED (documented):** JUMP_SLOT/GLOB_DAT/64
+  (need the `SymbolResolver`, step 5), TPOFF64 (needs the static-TLS block + `%fs`/TCB, step 4), IRELATIVE (needs
+  EXECUTING the lib's ifunc resolvers — explicitly out of scope; nothing is executed/jumped-into, no init run).
+  8 tests (gate now **250 unit + 2 doctests**): a two-PT_LOAD (R-X + RW+bss) fixture proves segment bytes land at
+  the right offsets, bss is zeroed, RELATIVE rewrites `base+addend`, RELR does `*p+=base`, page-rounding (span =
+  2 pages), Drop munmaps (256× no leak); + a **REAL** parse+map of `/usr/lib/libm.so.6` (skips cleanly if absent):
+  segments=4, RELATIVE_applied=0, RELR_applied=5, skipped_by_type=33 — an EXACT cross-check vs `readelf -r` (libm's
+  33 `.rela.dyn` = 32 GLOB_DAT + 1 TPOFF64, ALL correctly deferred; the 3 RELR words expand to 5 base-relatives,
+  ALL applied; every relocated relative target lands inside `[base, base+span)`). **Engine-load frontier: mmap +
+  base-relocate DONE on libm.so.6; NEXT = the static-TLS block + `%fs`/TCB for `TPOFF64`, then the real
+  `SymbolResolver` (two-namespace scope) for GLOB_DAT/JUMP_SLOT/64 — main-loop only for the apkenv-wiring tail.**
+  See §6 (2026-06-05 segment-mapper).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2559,6 +2581,56 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   **Gate:** `cargo fmt --all --check` + `build --all-targets` + `clippy --all-targets --all-features -D warnings`
   + `test` (**242 unit + 2 doctests**) + `build --release` all 0-warning/0-error. No new deps (std-only). Files:
   `src/loader/elf.rs` (new), `src/loader.rs` (`pub mod elf;` + module doc).
+- **2026-06-05 — segment-mapper: the PT_LOAD MAPPER + BASE RELOCATOR (`src/loader/map.rs`, `pub mod map;` in
+  `src/loader.rs`).** **What/why:** elf.rs decodes + reloc.rs applies; this is the step BETWEEN — it lays the
+  `.so`'s segments out in memory (forming the `RelocImage`) and drives the relocations that need only the load
+  base, end-to-end on a real library. **MAP:** reserve ONE contiguous anonymous region (`rustix::mm::mmap_anonymous`
+  PROT_NONE/MAP_PRIVATE, length = page-rounded `max(vaddr+memsz) − page_floor(min(vaddr))`) to claim a load base +
+  guarantee contiguity; for each `PT_LOAD`, make its page range RW and copy `p_filesz` file bytes to `base+vaddr` —
+  the `[filesz,memsz)` bss tail is already zero (fresh anon pages), and the standard ELF page-overlap (a segment's
+  final partial page shared with the next segment's first page) is correct BY CONSTRUCTION because all bytes are
+  placed by vaddr into the single reservation (no per-segment mmap). Track each segment's `p_flags` → final
+  PROT bits. **RELOCATE (base-only):** apply via the reloc core ONLY `R_X86_64_RELATIVE` (partitioned out of
+  `.rela.dyn`/`.rela.plt`) + `DT_RELR`; **root-cause boundary fix:** `DT_RELR` ADDRESS words are in-object vaddrs
+  (image base 0) but `reloc::apply_relr` expects run-time addresses (`base+vaddr`) like its `.rela` sibling, so
+  map.rs rebases each EVEN (address) word by `load_base` before the pass (ODD bitmap words pass through) — keeps
+  reloc.rs's contract + reloc.rs UNCHANGED. Then `mprotect` each segment to its final `p_flags` (`PF_R/W/X` →
+  PROT_READ/WRITE/EXEC), page-rounded. **DEFERRED (documented why):** JUMP_SLOT/GLOB_DAT/`R_X86_64_64` (need the
+  cross-lib `SymbolResolver`, step 5), `R_X86_64_TPOFF64` (needs the static-TLS block + `%fs`/TCB, step 4),
+  `R_X86_64_IRELATIVE` (needs EXECUTING the lib's ifunc resolvers — explicitly out of scope). This module **never
+  executes, jumps into, or runs init functions** of the mapped object — map + base-relocate + verify ONLY.
+  **RAII/soundness:** `MappedObject` `munmap`s the whole span on Drop (no leak); the region is exposed to the
+  reloc pass as a safe `&mut [u8]` so the relocation arithmetic stays in the bounds-checked `unsafe`-free core.
+  **`unsafe`:** this is the FIRST loader module with `unsafe` (the mmap/mprotect/munmap syscalls + the write
+  through the returned pointer) — confined here, every block carries a dated `// SAFETY:` (AGENTS.md §2.3);
+  reloc.rs + elf.rs remain `#![forbid(unsafe_code)]`. **Dep (§2.1/§2.5/§5):** `rustix` `{mm, param}` — chosen over
+  `libc` because (a) it is ALREADY in the dependency tree (winit → x11rb/wayland/polling pull rustix 1.x), so it
+  adds **ZERO new transitive crates** (verified `cargo tree`: 229 → 229 packages), and (b) its `linux_raw` backend
+  issues syscalls directly with no C-library link → more pure-Rust than libc's FFI bindings (§3 priority 2), and
+  detect-don't-assume keeps the page size a runtime query (`rustix::param::page_size`, 4K/16K). **Tests (8,
+  GPU/VM-free except the real-file one):** a two-`PT_LOAD` (R-X text + RW data+bss) in-memory fixture asserts the
+  text marker copied at its vaddr, the bss tail zeroed, `RELATIVE` rewrites `base+addend`, `DT_RELR` does `*p+=base`
+  (both targets land inside `[base, base+span)`), page-rounding gives a 2-page span, `NoLoadSegments` is a typed
+  err, and Drop munmaps 256× with no leak; `count_relr_targets` matches the encoding. A **REAL-FILE** test parses +
+  maps + base-relocates `/usr/lib/libm.so.6` (3 standard paths, **skips cleanly** with no host libm): segments=4,
+  RELATIVE_applied=0, RELR_applied=5, skipped_by_type=33 — an EXACT cross-check vs `readelf -r` (libm's 33
+  `.rela.dyn` = 32 `GLOB_DAT` + 1 `TPOFF64`, ALL deferred; the 3 RELR words → 5 base-relatives, ALL applied; each
+  relocated relative target verified inside the mapped object). Two fixture bugs FOUND+FIXED by the tests (the
+  mapper was correct): a missing `DT_SYMTAB` (elf.rs rightly rejects `.rela`-present-but-no-symtab) and the RELR
+  file-vaddr→runtime rebase (surfaced by libm's `DT_RELR relocated address 0x105cb8 not a valid in-image offset`,
+  fixed at the map.rs boundary as above). **Scope (honest):** map + base-relocate ONLY — does NOT allocate the
+  static-TLS block / set `%fs`, resolve real cross-lib symbols, model the bionic two-namespace scope, harden
+  `PT_GNU_RELRO`, execute ifuncs/init, or wire vs apkenv; **NEXT = static-TLS block + `%fs`/TCB (TPOFF64), then the
+  real `SymbolResolver`** (main-loop only for the apkenv-wiring tail). **Grounding (cyber-safeguard honored):**
+  written from the PUBLIC System V gABI / x86-64 psABI ELF segment + page-rounding semantics + the PUBLIC
+  `mmap(2)`/`mprotect(2)`/`munmap(2)` contract (own general knowledge) + the `rustix` `mm` docs (Context7) +
+  Eclipse's own `src/loader/` ONLY — **no linker/ATL/bionic source was read**; mapping the BYTES of a real `.so`
+  as data + issuing standard public syscalls is benign (this is WRITING Eclipse's own from-scratch Rust loader,
+  not reading the apkenv linker). **The clean-room own-Rust loader work (decode + map + relocate) is confirmed
+  SUBAGENT-FEASIBLE — it does NOT trip the cyber-safeguard.** **Gate:** `cargo fmt --all --check` + `build
+  --all-targets` + `clippy --all-targets --all-features -D warnings` + `test` (**250 unit + 2 doctests**) + `build
+  --release` all 0-warning/0-error. Files: `src/loader/map.rs` (new), `src/loader.rs` (`pub mod map;` + module
+  doc), `Cargo.toml` (`rustix {mm,param}`, justified above).
 
 ---
 
