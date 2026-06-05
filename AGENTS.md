@@ -435,11 +435,14 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**42 unit + 2 compile_fail doctests
-  pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` now binds
+  --all-targets --all-features -- -D warnings`, `cargo test` (**43 unit + 2 compile_fail doctests
+  pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
   Eclipse's own non-GTK backing for `Context`'s two static-init natives (`native_get_apk_path`/
-  `native_updateConfig`) via `RegisterNatives` before `Context.<clinit>` (§6 2026-06-05); the live JNI
-  path is dev-host-only (ART aborts on worker threads). The `apk` reader was validated against the
+  `native_updateConfig`) via `RegisterNatives` before `Context.<clinit>`, then **drives recipe steps
+  1–3** `Context.createApplication(0)` → `ContentProvider.createContentProviders()` →
+  `Application.onCreate()` (the `0`/null handle is confirmed-safe for steps 1–3; §6 2026-06-05); the live
+  JNI path is dev-host-only (ART aborts on worker threads), so reaching `onCreate` is pending the dev-host
+  run. The `apk` reader was validated against the
   **real** Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 /
   largeHeap=false). **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK, EXIT 0) on this
   host.
@@ -534,14 +537,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      (2026-06-05):** against pure-Java `demo_app.apk`, the **2** natives `Context`'s static init reaches
      — `native_get_apk_path`/`native_updateConfig` — are now bound to Eclipse's own non-GTK Rust backing
      via `jni 0.22.4 env.register_native_methods`, registered BEFORE `Context.<clinit>` runs (see §6
-     2026-06-05). **NEXT (dev-host discovery loop):** run `cargo run -- run …/demo_app.apk` on the dev
-     host and read the boot log — the registered natives make `Context.<clinit>` resolve GTK-free, so the
-     next failure is the **next `UnsatisfiedLinkError`**, which *names the next native to bind*. Iterate:
-     bind each surfaced native (non-GTK Rust) and re-run, until static-init + steps 1–3 reach
-     `Application.onCreate` (onCreate NOT yet proven reached — only these two natives are bound + the
-     bridge resolves bootstrap classes). Then the **Window/Surface non-GTK natives** with the
-     owned-handle/`ash`-Vulkan surface (the `jlong` window-handle design, still UNCONFIRMED). Verify on
-     the dev host (onCreate reached, window opens, exit 0, **no `libgtk-4` in `/proc/self/maps`**).
+     2026-06-05). ✅ **Steps 1–3 now DRIVEN (2026-06-05, §6):** `drive_application_lifecycle` calls
+     step 1 `Context.createApplication(0) -> Application` → step 2 `ContentProvider.createContentProviders()`
+     → step 3 instance `Application.onCreate()` on the held `Vm`/attached main thread; the `jlong` handle
+     is `0` (confirmed safe — steps 1–3 only store it, never deref; deref begins at step 4). Each call
+     goes through `checked()` (describes + clears any thrown exception, surfaces typed `FrameworkError::Jni`,
+     no poisoned pending-exception, no unwrap); body under `catch_unwind`; named `Env<'local>` lifetime so
+     step 1's `Application` lives across to step 3 (no `unsafe` lifetime dodge). **NEXT (dev-host discovery
+     loop — onCreate NOT yet proven reached):** run `cargo run -- run …/demo_app.apk` on the dev host and
+     read the boot log — the registered natives + driven steps 1–3 should reach `Application.onCreate` or
+     surface the **next `UnsatisfiedLinkError`**, which *names the next native to bind*. Iterate: bind each
+     surfaced native (non-GTK Rust) and re-run until steps 1–3 cleanly reach `onCreate`. Then **steps 4–5**
+     (`Activity.createMainActivity`/`Activity.onCreate`) with the **Window/Surface non-GTK natives** + the
+     owned-handle/`ash`-Vulkan surface (the non-null `jlong` window-handle design, still UNCONFIRMED).
+     Verify on the dev host (onCreate reached, window opens, exit 0, **no `libgtk-4` in `/proc/self/maps`**).
      **Separately (a distinct main-loop item):** the deferred **bionic NDK-shim** step
      (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent cyber-safeguard blocker) so the
      Roblox engine's transitive natives resolve and `libroblox.so` links past relocation.
@@ -932,6 +941,31 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   main thread): `cargo run -- run ~/eclipse-m0/atl_test_apks/demo_app.apk` — boot ART, register the two
   natives, log "framework bridge proven", open the window, exit 0, and confirm **no `libgtk-4` in
   `/proc/self/maps`**; the next `UnsatisfiedLinkError` in the log names the next native to bind.
+- **2026-06-05** — **Framework driver now CALLS recipe steps 1–3 (no longer stops before step 1).**
+  `framework::drive_application_lifecycle(&Vm, apk_path)` registers the two non-GTK `Context` natives,
+  proves the bridge, then drives **step 1** `Context.createApplication(0) -> Application` → **step 2**
+  `ContentProvider.createContentProviders() -> void` → **step 3** instance `Application.onCreate() -> void`
+  (on the step-1 object) from the JNI-attached main thread, via the held `Vm` + the bound `Context`
+  natives. The `jlong` window handle is passed as **`0` (null)** — confirmed safe for steps 1–3, which
+  only *store* the handle and never dereference it (`docs/art-and-runtime.md` "Tier A"; deref begins at
+  the deferred step 4). Every JNI call goes through a `checked()` helper that, on a thrown Java
+  exception, `exception_describe`s (names the next missing native/class for the dev-host discovery loop)
+  + `exception_clear`s it and surfaces the typed `FrameworkError::Jni` — so a pending exception never
+  poisons the next call and nothing unwraps. The body stays under `catch_unwind` (steps run inside
+  `AssertUnwindSafe(|| drive_steps_1_to_3(env, apk_path))`; `panic = "abort"` kept). The `checked`
+  helper's `Env<'local>`/return share a **named** lifetime so step 1's `Application` `JObject` lives
+  across to the step-3 instance call (an elided `&mut Env` rejected the value-returning step 1 with
+  "lifetime may not live long enough"); **no `unsafe` was used to dodge the lifetime**. New
+  `LifecycleProgress::{BridgeProven, ApplicationOnCreate}` reports how far it got. Steps **4–5**
+  (`Activity.createMainActivity`/`Activity.onCreate`) stay deferred on the still-UNCONFIRMED non-null
+  window-handle type (step 4's Window natives dereference it). Regression guard: new host-independent
+  unit test `call_site_literals_match_recipe_constants` pins the steps-1–3 call-site `jni_str!`/`jni_sig!`
+  literals equal to the `RecipeStep` constants (a drift would call the wrong method/sig at boot with no
+  compile error); also fixes a stale docstring that named this guard before it existed. **`Application.onCreate`
+  is NOT yet proven reached** — only that steps 1–3 are now driven and the crate builds/tests clean;
+  reaching `onCreate` (or surfacing the next `UnsatisfiedLinkError`) is **pending the dev-host run**.
+  Full gate green: fmt/build/clippy `-D warnings`/test (**43 unit + 2 compile_fail doctests**)/release
+  (`panic = "abort"`/LTO retained). No new deps (`jni 0.22.4`/`jni-sys 0.4` already in tree).
 
 ---
 
