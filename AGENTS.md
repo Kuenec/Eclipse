@@ -459,11 +459,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      **GtkWidget\*** — `api-impl.jar` is GTK-coupled, so reusing it for onCreate pulls in GTK
      (re-crowding low_4gb). PRODUCTION PATH = Eclipse's own **winit + `ash`/EGL** framework
      (component-map F) providing the View/Surface/Window + the `create*` natives against a winit
-     window handle. This is the big M2 build. (A GTK-based bring-up could validate the full chain
-     first, but only the winit framework preserves the Step 3.5 win.)
-  2. Native libs: before onCreate, **extract `lib/x86_64/*.so` from the APK** to a dir and add it
-     to `java.library.path` (Roblox manifest has `extractNativeLibs=true`) so `System.loadLibrary`
-     finds `libroblox.so` (the apk crate can read the entries).
+     window handle. This is the big M2/M3 build. **It is REQUIRED, not optional:** a GTK-based
+     bring-up (ATL's own path) cannot even reach `onCreate` for this APK — ATL+GTK exhausts the
+     low_4gb window during asset loading *before* `onCreate` (M0 `roblox-boot-nodiscard.log`,
+     Step 3.5). Only a graphics-stack-free (winit, no GTK-at-startup) framework keeps low_4gb
+     clear enough for Roblox to boot. **Design first:** winit's event loop wants the main thread
+     and ART must also be created on the main thread (the cargo-harness abort showed ART's
+     main-thread sensitivity) — settle the thread/loop ownership model before building.
+  2. ✅ Native-lib extraction DONE (`apk::extract_native_libs`, streamed + idempotent). Remaining:
+     extract on boot to a cache dir and add it to `java.library.path` so `System.loadLibrary`
+     finds `libroblox.so` (wire into the boot env alongside the framework natives dir).
   3. JNI calls: add the full **`jni`** crate for safe `FindClass`/`CallStaticObjectMethod`/…;
      **wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot from
      the **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).
