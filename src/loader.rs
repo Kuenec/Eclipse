@@ -92,6 +92,7 @@
 
 pub mod bionic_env;
 pub mod elf;
+pub mod init_run;
 pub mod link;
 pub mod map;
 pub mod native_provider;

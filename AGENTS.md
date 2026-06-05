@@ -503,6 +503,28 @@ before any history-rewriting/force operation.
   — FULL resolution. NEXT = bind the relocated + fully-resolved image to execution and run the 3,427 `DT_INIT_ARRAY`
   constructors in an isolated harness (RELRO+BIND_NOW; no `%fs`/TCB — no PT_TLS; main-loop/dev-host only).** See §6
   (2026-06-05 variadic liblog cc shim). [`docs/bionic-env-worklist.md`](docs/bionic-env-worklist.md) marked **COMPLETE**.
+- **2026-06-05 UPDATE — the INIT-EXECUTION harness is BUILT + RAN; libroblox's own code executed for the FIRST time
+  under Eclipse's loader.** `src/loader/init_run.rs` (hidden subcommand `eclipse __run-libroblox-init`, main-thread,
+  NOT a `#[test]` so a crash can't poison the suite) maps + base-relocates + FULLY-resolves the engine (Eclipse-native
+  tier prepended → `unresolved_strong=0`), confirms text `PROT_EXEC` (segment flags **and** `/proc/self/maps`), reads
+  `DT_INIT_ARRAY` (3,427 ctors) and **calls each in order** as `extern "C" fn(int,char**,char**)` (argc=1/argv=["libroblox",NULL]/
+  envp=[NULL] — bionic init-array convention, ABI-safe for void(void) too). The one `unsafe` (the jump into foreign code)
+  is confined + dated-`// SAFETY:`; a minimal `SA_SIGINFO` handler logs the faulting ctor index+addr async-signal-safely
+  then `_exit`s. **THE REAL RUN RESULT (dev host):** 527,208 RELATIVE applied, RELRO hardened, 623 symbol relocs applied,
+  text confirmed R+X; **constructor init[0] COMPLETED** (engine code ran!), **init[1] @ base+0x1bbca75 ABORTED via
+  `abort()` (SIGABRT, EXIT=134)** → **1 of 3,427 constructors completed.** gdb+objdump pin it: init[1] is a protobuf
+  default-instance (`__start_pb_defaults`) static-init whose libc++ guard uses `pthread_getspecific`/`setspecific`/`once`/
+  `mutex`/`syscall(gettid)`-backed TLS; with those resolving to **host glibc (baseline, NOT bionic-ABI-correct)** the
+  per-thread state is wrong and an internal capacity invariant traps to `abort()`. **DIAGNOSED NEXT OBSTACLE = an
+  Eclipse-owned bionic-ABI-correct pthread+TLS shim** (the 45 `pthread_*` + the `pthread_*specific`/`key_create`/`once` key
+  store; no static-TLS template needed — libroblox has no PT_TLS) **prepended before the host tier in `BionicEnv`**, then
+  re-run the harness to advance past init[1]. This is the exact documented HONEST-BASELINE caveat materializing at the
+  first pthread-TLS-using constructor — the loader itself is correct (init[0] proves it). Cyber-safeguard NOT tripped
+  (clean-room harness from the public ELF init-array gABI + Eclipse's own src/loader; libroblox parsed as data + executed
+  by OUR loader; no apkenv/bionic/NDK/linker source read). Gate now **347 unit + 2 doctests** (4 new pure init-array-
+  arithmetic + async-signal-safe-formatter tests; fmt/build/clippy `-D warnings`/test/release all clean — the harness
+  compiles clean even though RUNNING it aborts at init[1], which is runtime, not a build/test failure). Full analysis:
+  [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md). See §6 (2026-06-05 init-execution harness).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3347,6 +3369,44 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   0-warning/0-error; the cc build step succeeds wherever a C compiler exists. **NEXT = bind the relocated + fully-resolved
   image to execution + run the 3,427 DT_INIT_ARRAY ctors in an isolated harness (RELRO+BIND_NOW, no `%fs`/TCB — no
   PT_TLS), main-loop/dev-host only (cyber-safeguard).**
+- **2026-06-05 — the INIT-EXECUTION harness — RAN libroblox's DT_INIT_ARRAY; 1/3,427 ctors completed, init[1] aborts in a
+  pthread-TLS-using static-init guard (the bionic-vs-glibc ABI frontier, pinpointed).** *What was built:*
+  `src/loader/init_run.rs` + a **hidden** `eclipse __run-libroblox-init` subcommand (NOT a `#[test]` — runs on the process
+  MAIN thread so a crash aborts cleanly without poisoning the suite). It maps + base-relocates + FULLY-resolves the engine
+  (the Eclipse-native tier prepended → `unresolved_strong=0`), confirms text `PROT_EXEC` (segment `p_flags` **and** a
+  `/proc/self/maps` cross-check — detect-don't-assume), reads `DT_INIT_ARRAY` (3,427 entries; each post-`RELATIVE` slot =
+  the absolute ctor addr) and **calls each in order** as `extern "C" fn(int,char**,char**)` with `argc=1/argv=["libroblox",
+  NULL]/envp=[NULL]` (the gABI/bionic init-array convention; a `void(void)` ctor ignores the 3 SysV-register args, so it is
+  ABI-safe either way). The lone `unsafe` (the jump into mapped foreign code) is confined here + dated-`// SAFETY:`
+  (reloc.rs/elf.rs stay `#![forbid(unsafe_code)]`); a minimal `SA_SIGINFO` handler for SEGV/ABRT/BUS/ILL/FPE logs the
+  faulting ctor index + published addr + `si_addr` using only async-signal-safe primitives (`write`/`_exit`/atomics/integer
+  formatting), then `_exit`s `128+signo`. *THE REAL RUN RESULT (dev host, captured to `/tmp/eclipse-libroblox-init.log`):*
+  527,208 RELATIVE applied, RELRO=1, 623 symbol relocs applied, text confirmed R+X; **init[0] @ base+0x283aa10 COMPLETED**
+  (libroblox's own code executed for the FIRST time under our loader), **init[1] @ base+0x1bbca75 ABORTED via libc
+  `abort()` → SIGABRT, EXIT=134** → **1 of 3,427 constructors completed.** *Death-point analysis (gdb `bt` + objdump on the
+  data copy):* init[1] tail-jumps to a protobuf default-instance static initializer (`__start_pb_defaults`/`__stop_pb_defaults`);
+  its libc++ static-init guard is built on `pthread_mutex_lock`/`syscall(SYS_gettid=186)`/`pthread_once`+`pthread_key_create`/
+  `pthread_getspecific`/`pthread_setspecific` to track the initializing thread in TLS; the abort is `call abort@plt` at file
+  offset `0x287ef15` reached when a per-thread structure read out of that TLS slot yields a value violating an internal
+  capacity invariant. *Root cause / diagnosed NEXT obstacle:* the **45 `pthread_*` imports + the pthread-keyed TLS resolve
+  to HOST GLIBC as a baseline, NOT bionic-ABI-correct** (`pthread_t`/`pthread_key_t`/`pthread_once_t`/mutex/TLS-slot
+  semantics differ) — exactly the documented HONEST-BASELINE caveat materializing at the first constructor that exercises
+  pthread-TLS. The loader is correct (init[0] proves map/reloc/RELRO/PROT_EXEC); the fix is an **Eclipse-owned bionic-ABI-
+  correct pthread+TLS shim** (the `pthread_*specific`/`key_create`/`once` key store over a real thread pointer; NO static-TLS
+  template — libroblox has no PT_TLS) **prepended before the host tier in `BionicEnv`**, then re-run the harness to advance
+  past init[1]. *Ruled out by evidence:* not the loader (init[0] ran), not unresolved imports (`unresolved_strong=0`), not
+  the init-array convention (init[0] ran), not our liblog/assert natives (no `tracing` FATAL before the abort → it is
+  libroblox's own invariant `abort()`). *Regression guard:* 4 pure GPU/VM-free unit tests in `init_run.rs` —
+  `init_array_count(27_416)==3_427`, the `*8` entry stride, and the bounded async-signal-safe dec/hex writers
+  (`cargo test loader::init_run`); the crash itself is a DIAGNOSTIC (main-thread, expected to change as the shim lands), not
+  a test assertion. *Cyber-safeguard: NOT tripped* — clean-room harness grounded ONLY in the PUBLIC ELF init-array gABI +
+  Eclipse's own `src/loader`; libroblox is loaded as data + executed by OUR loader (running the binary != reading linker
+  source); no apkenv/bionic/NDK/ATL/linker source read. Files: `src/loader/init_run.rs` (new), `src/loader.rs` (+`pub mod
+  init_run`), `src/main.rs` (hidden subcommand), `docs/libroblox-init-run.md` (new — full run analysis). **Gate:** fmt
+  --all --check / build --all-targets / clippy (-D warnings) / test (**347 unit + 2 doctests**) / release — all
+  0-warning/0-error (the harness compiles clean; RUNNING it aborts at init[1] = runtime, not a build/test failure). **NEXT =
+  the Eclipse-owned bionic pthread+TLS shim, prepended in `BionicEnv`; then re-run `eclipse __run-libroblox-init` to advance
+  past init[1].**
 
 ---
 
