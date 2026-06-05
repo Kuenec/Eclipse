@@ -688,6 +688,40 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   construction/op natives (`native_create_builder`/`moveTo`/`lineTo`/`cubicTo`) have NOT yet surfaced on a reachable
   path (only a finalizer-thread `Path.native_reset` on an abandoned object), so the real path-geometry buffer +
   software rasterizer (tiny-skia) into the Vulkan compositor is the next graphics build when those ops surface.
+  ✅ **DONE 2026-06-05: the 2D VECTOR-PATH GEOMETRY engine + the tiny-skia raster-to-pixmap are built (real
+  geometry + real raster; no fabricated shape).** Running AdaptiveIconDemo surfaced the Path natives on a
+  REACHABLE path — `MainActivity.onCreate → getDrawable → AdaptiveIconDrawable.<init> → PathParser.createPathFromPathData
+  → Path.getBuilder → native_create_builder` — so the discovery loop bound the whole Path construction cascade
+  non-GTK against a new **`path_registry`** (a generational slab holding a REAL verb+point buffer:
+  `MoveTo/LineTo/QuadTo/CubicTo/Close` + flat `[x,y,…]` floats — `#![forbid(unsafe_code)]`, jlong index NOT a raw
+  pointer, stale/oob/double-free → typed `Err`, 9 soundness+geometry tests; mirrors matrix/paint registries). This
+  ART build routes Path through a builder (`Path.getBuilder()` pattern, GTK-`getGskPath`-backed in ATL): bound
+  `native_create_builder(JJ)J` (fresh/seeded geometry slot), `native_move_to/line_to(JFF)V`, `native_quad_to(JFFFF)V`,
+  `native_cubic_to(JFFFFFF)V`, `native_close(J)V` (each RECORDS the real parsed coordinates on the builder slot),
+  and `native_create_path(J)J` + `native_ref_path(J)J` (fold builder → finalized path / take independent ownership;
+  both allocate a COPY of the source geometry in Eclipse's slab model). Descriptors taken from the exact ART
+  `No implementation found` lines (pinned by `path_native_names_sigs_and_class_match_art_reported`). Added the
+  pure-Rust **tiny-skia 0.12** software rasterizer (Skia subset, no C/GTK/Cairo; `png-format` off — raw RGBA → GPU):
+  `graphics::rasterize_path[_rgba]` walks `path_registry::PathGeometry` into a tiny-skia `Path`, fills it with the
+  `paint_registry` ARGB color (winding/even-odd) transformed by the `matrix_registry::Affine` (→ tiny-skia
+  `Transform`), into an RGBA `Pixmap` (8 GPU-free unit tests: a known filled rect → opaque-red interior +
+  transparent exterior, the transform shifts the fill, even-odd donut leaves a hole, ARGB split, empty/zero-size/
+  undersupplied-geometry → safe `None`). **FAITHFUL status — VALIDATED:** AdaptiveIconDemo now builds the
+  adaptive-icon MASK PATH end-to-end (onCreate→setContentView→onContentChanged "yay!", PathParser + Path.<init>
+  complete with NO UnsatisfiedLinkError on any Path native); it does NOT yet reach RESUMED — the next surfaced
+  native is `AssetManager.openAsset(String,int)J` (`AdaptiveIconDrawable.inflateLayers → updateLayerFromTypedArray
+  → getDrawable → openNonAsset`), i.e. loading the icon's foreground/background LAYER BITMAPS — a separate
+  asset-stream + Bitmap-decode subsystem, NOT the Path/Canvas raster. **Next step = the Vulkan COMPOSITE** (upload
+  the rasterized pixmap as an RGBA GPU texture + draw a textured quad over the owning view's rect, generalizing the
+  R8 glyph-atlas upload + textured pipeline in src/graphics.rs) once a Canvas draw native is on a reachable path,
+  AND the `AssetManager.openAsset`/Bitmap path for layered drawables. The raster half is done + unit-tested; the
+  composite has no reachable consumer yet (the AdaptiveIconDrawable would only draw its mask after the layer
+  bitmaps load). **NO REGRESSION:** demo_app + accelerometerdemo both still drive steps 0–7 → ActivityResumed +
+  Vulkan swapchain, **0 VK_ERROR/panic/draw-failed/validation** (`/tmp/eclipse-demo-regress.log`,
+  `/tmp/eclipse-accel-regress.log`). Gate clean: **178 unit + 2 doctests**, fmt/clippy `-D warnings`/release all
+  0-warning. Files: `src/framework/path_registry.rs` (new), `src/framework.rs` (Path natives + sig-pin test),
+  `src/graphics.rs` (rasterizer + 8 tests), `Cargo.toml`/`docs/dependency-plan.md` (tiny-skia dep). Faithful log:
+  `/tmp/eclipse-path5.log`.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -2131,6 +2165,50 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   accelerometerdemo's `<vector>`/drawable `Log.ERROR` inflation warnings + AdaptiveIconDemo's `Path.native_create_builder`);
   orthogonally `?attr`-in-inline-XML resolution. A real host-sensor bridge is the single seam in
   `sensor_manager_register_accelerometer_listener` if a future host gains a sensor.
+- **2026-06-05** — 🟢 **2D VECTOR-PATH GEOMETRY engine + tiny-skia raster-to-pixmap built (REAL geometry + REAL
+  raster, never a fabricated shape).** Ran AdaptiveIconDemo (`/tmp/eclipse-path*.log`): its `MainActivity.onCreate
+  → getDrawable → AdaptiveIconDrawable.<init> → PathParser.createPathFromPathData → Path.getBuilder` puts the Path
+  natives on a REACHABLE path (the prior `native_reset` was a finalizer-thread abandoned object — not chased). The
+  discovery loop surfaced + bound, one ART `No implementation found` line at a time, the full Path construction
+  cascade: `native_create_builder(JJ)J`, `native_move_to(JFF)V`, `native_line_to(JFF)V`, `native_quad_to(JFFFF)V`,
+  `native_cubic_to(JFFFFFF)V`, `native_close(J)V`, `native_create_path(J)J`, `native_ref_path(J)J`. **ROOT-CAUSE,
+  NON-GTK, REAL:** added `src/framework/path_registry.rs` — a generational-slab registry (mirroring matrix/paint:
+  `#![forbid(unsafe_code)]`, jlong = packed slot+generation index NOT a raw pointer, stale/oob/double-free → typed
+  `Err`) holding a **real `PathGeometry` = ordered `Verb` (MoveTo/LineTo/QuadTo/CubicTo/Close) + flat `[x,y,…]`
+  buffer**; the move/line/quad/cubic/close natives RECORD the actual parsed coordinates onto the builder slot, and
+  create_path/ref_path fold/copy the geometry (independent ownership in the slab model; AOSP-GSK refcount → copy).
+  This ART build is the ATL **`Path.getBuilder()` + GTK `getGskPath`** variant; Eclipse owns both sides of the
+  builder handle (RegisterNatives wins over GTK name-binding), so the jlong is never cast to a GSK/Gtk pointer.
+  Added the pure-Rust **tiny-skia 0.12** software rasterizer (a Skia subset, no C/GTK/Cairo/Skia-link; Context7-
+  confirmed `PathBuilder`/`Pixmap`/`fill_path`/`Transform` API; `default-features = false`, `std`+`simd`,
+  `png-format` dropped — Eclipse uploads raw RGBA straight to the GPU, no PNG, no bloat §2.5). `graphics::
+  rasterize_path[_rgba]` walks the `path_registry` geometry into a tiny-skia `Path`, fills it (winding/even-odd)
+  with the `paint_registry` ARGB color, transformed by the `matrix_registry::Affine` (mapped to tiny-skia
+  `Transform::from_row` affine coefficients), into an RGBA `Pixmap` → straight RGBA bytes ready for texture upload.
+  **FAITHFUL status:** AdaptiveIconDemo builds the adaptive-icon MASK PATH end-to-end with **zero
+  UnsatisfiedLinkError on any Path native** (onCreate→setContentView→onContentChanged all "yay!"); it does NOT yet
+  reach RESUMED — the NEXT surfaced native is `AssetManager.openAsset(Ljava/lang/String;I)J` (`inflateLayers →
+  updateLayerFromTypedArray → getDrawable → openNonAsset`), i.e. loading the icon's foreground/background LAYER
+  BITMAPS, a separate asset-stream + Bitmap-decode subsystem (NOT Path/Canvas raster — the honest next frontier).
+  **The Vulkan COMPOSITE (upload pixmap as RGBA texture + textured quad over the view rect, generalizing the R8
+  glyph-atlas pipeline in src/graphics.rs) is the documented next step** — deferred this turn because it has no
+  reachable consumer yet (no Canvas draw native surfaced; the AdaptiveIconDrawable only draws its mask after the
+  layer bitmaps load). Per the task's stage-it guidance, committed the working geometry + unit-tested raster first.
+  **Regression guard:** `path_native_names_sigs_and_class_match_art_reported` pins every Path native's
+  class/name/descriptor to the ART-reported lines (a drift → `RegisterNatives` `NoSuchMethodError` → build fails);
+  9 `path_registry` soundness+geometry tests; 8 GPU-free `graphics` raster tests (known filled rect → opaque-red
+  interior + transparent exterior; the transform shifts the fill; even-odd donut → transparent hole; ARGB split;
+  empty/zero-size/undersupplied-geometry → safe `None`). **NO REGRESSION:** demo_app + accelerometerdemo both still
+  drive steps 0–7 → ActivityResumed + Vulkan swapchain, 0 VK_ERROR/panic/draw-failed/validation
+  (`/tmp/eclipse-demo-regress.log`, `/tmp/eclipse-accel-regress.log`). Gate clean: fmt / build --all-targets /
+  clippy `-D warnings` / **test 178 unit + 2 doctests** / release — all 0-warning. Files: `src/framework/
+  path_registry.rs` (new), `src/framework.rs` (Path natives + register helper + call site + sig-pin test),
+  `src/graphics.rs` (rasterizer + 8 tests), `Cargo.toml` + `docs/dependency-plan.md` (tiny-skia 0.12 dep).
+  Cyber-safeguard did NOT trip (every Path native's signature came from the benign ART `No implementation found`
+  line + general AOSP Path API knowledge; only targeted `grep -n` + small windows on `src/framework.rs`, full reads
+  only of the benign sibling registries + `src/graphics.rs`; NO vendor/atl, NO bionic/linker source, NO web, NO
+  framework.rs wholesale read). Next: the Vulkan composite (when a Canvas draw native is reachable) + the
+  `AssetManager.openAsset`/Bitmap-decode path for the adaptive-icon layer bitmaps.
 
 ---
 

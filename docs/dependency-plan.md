@@ -49,6 +49,8 @@ ash-window = "0.13"                                    # 🟡 VkSurface from win
 raw-window-handle = "0.6"                              # 🟢 handle interchange
 khronos-egl = { version = "6", features = ["dynamic"] }# 🟡 EGL for the GLES fallback path
 winit = "0.30"                                         # 🟢 window + Wayland/X11 + kbd/mouse
+ab_glyph = "0.2"                                       # 🟢 WIRED 2026-06-05: pure-Rust glyph rasterizer for the View-tree TEXT pass (R8 glyph atlas)
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }  # 🟢 WIRED 2026-06-05: pure-Rust software 2D rasterizer (Skia subset, no C) — fills android.graphics.Path's REAL geometry into an RGBA pixmap for the vector-drawable pass; png-format dropped (no PNG, raw RGBA → GPU)
 # gbm / drm   # 🟡 OPTIONAL: DMA-BUF buffer interop (gralloc/AHardwareBuffer) — confirm M0
 
 # --- Audio (src/audio.rs) ----------------------------------------------------
