@@ -86,13 +86,17 @@ impl std::error::Error for WindowRegistryError {}
 /// `jni` `GlobalRef` lifetime is taken before the design for it is settled).
 #[derive(Debug, Default)]
 pub struct WindowState {
-    /// Window title (`Window.set_title` will set this once that native is bound).
+    /// Window title (`Window.set_title` stores this; applied to the real winit window when associated).
     pub title: String,
-    /// TODO(framework Tier-B): the Java `android.view.Window` back-reference (a `jni` `GlobalRef`
-    /// or `WeakGlobalRef`) `set_jobject` will store for input/lifecycle dispatch. Held as
-    /// `Option<()>` for now so this increment takes no `GlobalRef`/attach lifetime — the unit just
-    /// records "set or not". Replaced with the real ref type when `set_jobject` is bound.
+    /// 2026-06-05: whether the Java `android.view.Window` back-reference has been set (`Window.set_jobject`).
+    /// The real `GlobalRef`/`WeakGlobalRef` for input/lifecycle dispatch is a later increment; held as
+    /// `Option<()>` so this increment takes no `GlobalRef`/attach lifetime — the unit just records
+    /// "set or not". Replaced with the real ref type when input dispatch is wired.
     pub jobject: Option<()>,
+    /// 2026-06-05: the content-root view handle (`Window.set_widget_as_root`), an index into the
+    /// [`view_registry`](super::view_registry) slab — the root of this window's view tree, or `None`
+    /// until set. Stored as a handle (not a reference), so no cross-registry aliasing.
+    pub root_view: Option<i64>,
 }
 
 /// A generational slot: the current generation plus the optional occupant. A live slot is

@@ -16,8 +16,10 @@
 //! ([`CONTEXT_CLASS`]/[`APPLICATION_CLASS`]) with `find_class` to prove the typed-`Env` bridge
 //! reaches the loaded `android.*` framework, and then **drives recipe steps 1–3** —
 //! `Context.createApplication(J)` → `ContentProvider.createContentProviders()` →
-//! `Application.onCreate()` — to reach `Application.onCreate` for a pure-Java APK. The recipe
-//! steps are encoded as typed constants ([`STEP1_CREATE_APPLICATION`] … [`STEP5_ACTIVITY_ON_CREATE`]).
+//! `Application.onCreate()` → `Activity.createMainActivity(String, J, String)` →
+//! `Activity.onCreate(Bundle)` — driving the launcher Activity to `onCreate` for a pure-Java APK.
+//! The recipe steps are encoded as typed constants
+//! ([`STEP1_CREATE_APPLICATION`] … [`STEP5_ACTIVITY_ON_CREATE`]).
 //!
 //! ### The `jlong` handle passed to `createApplication(J)` (real, Eclipse-owned)
 //! 2026-06-05: step 1 now passes a **real Eclipse-owned window-registry handle** from
@@ -29,8 +31,8 @@
 //! **not** dereference it (`docs/art-and-runtime.md` "Tier A":
 //! `createApplication`/`createContentProviders`/`Application.onCreate` invoke no native that touches
 //! the handle). The handle is first dereferenced at step 4 (`Activity.createMainActivity` → the
-//! Window natives), which is deferred — that step (and its dev-host-gated Window natives) consumes
-//! the same handle, so the slot is intentionally not freed during the run.
+//! Window/View natives), which now reuse the **same** handle (one window per launch), so the slot is
+//! intentionally not freed during the run.
 //!
 //! ### Why bind those two natives (the non-GTK backing — confirmed)
 //! ATL's `api-impl.jar` declares `native_get_apk_path`/`native_updateConfig` and backs them in C
@@ -42,20 +44,19 @@
 //! them already bound and GTK-free. Only these two are bound — they are the only natives the
 //! static initializer reaches for the pure-Java demo APK (`Context.java` `static { … }`).
 //!
-//! ## What is deferred (and why)
+//! ## Steps 4–5 (driven against Eclipse-owned handles, 2026-06-05)
 //! Steps **4–5** — `Activity.createMainActivity(String, jlong, String)→Activity` and
-//! `Activity.onCreate(Bundle)` — are **not** driven yet. They are gated on a single unresolved
-//! input: the **window handle** passed as the `jlong`, which step 4's Window natives actually
-//! *dereference* (unlike steps 1–3, which only store it). The vendored framework Eclipse loads is
-//! ATL's GTK-coupled `api-impl.jar`, whose `create*` natives ultimately cast that `jlong` to a
-//! `GtkWidget*`; the handle Eclipse's winit window yields is **not** a `GtkWidget*`, and the
-//! committed recipe lists "the exact window-handle type Eclipse passes as the `jlong`" as
-//! **UNCONFIRMED** (`docs/art-and-runtime.md` "UNCONFIRMED"). Passing a winit raw handle into a
-//! GTK-expecting native would be a *guessed* pointer (CLAUDE.md: no guessing) and risks
-//! type-confused dereference. So this increment drives steps 1–3 (which never dereference the
-//! handle) and stops *before* the first handle-dereferencing call; driving step 4 onward is
-//! unblocked by the framework/Surface design (component-map F) that defines Eclipse's own window
-//! handle. See [`LifecycleProgress`].
+//! `Activity.onCreate(Bundle)` — are now driven. The `jlong` is the **same Eclipse-owned
+//! [`window_registry`] handle** step 1 received; because Eclipse owns BOTH sides of the `jlong` (it
+//! supplies the non-GTK Window/View natives via `RegisterNatives`, which win over ATL's GTK
+//! symbol-name binding — JNI 1.1 spec), the handle never reaches a `GtkWidget*` cast. The
+//! handle-dereferencing Window/View natives the `setContentView` cascade reaches
+//! (`Window.set_*`, the `View`/`ViewGroup`/`FrameLayout`/`TextView` `native_constructor`/`native_*`)
+//! are bound minimal-and-sound against [`window_registry`]/[`view_registry`] — they record the
+//! view-tree shape (class names, text, child edges) with **no** GTK widget and **no** real
+//! layout/measure/draw; the ash/Vulkan surface + rendering is the deferred big build (AGENTS.md §5).
+//! Each such native is added as the dev-host run surfaces it (`No implementation found …`). See
+//! [`LifecycleProgress`].
 //!
 //! ## `unsafe`
 //! 2026-06-05: confined to the JNI FFI surface, each block carrying a `// SAFETY:` note —
@@ -76,12 +77,15 @@ use jni::objects::{JClass, JIntArray, JObject, JString};
 use jni::refs::Reference;
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jint, jlong, jshort};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use crate::runtime::Vm;
 
+pub mod paint_registry;
+pub mod theme_registry;
+pub mod view_registry;
 pub mod window_registry;
 pub mod xml_registry;
 
@@ -189,6 +193,9 @@ extern "system" fn native_update_config<'local>(
 const SCREEN_WIDTH_DP_FIELD: &JNIStr = jni_str!("screenWidthDp");
 const SCREEN_HEIGHT_DP_FIELD: &JNIStr = jni_str!("screenHeightDp");
 const INT_SIG: &JNIStr = jni_str!("I");
+/// JNI field descriptor for a `java.lang.CharSequence` field (the `TypedValue.string` field that
+/// `loadResourceValue` sets to a resolved pooled string).
+const CHAR_SEQUENCE_SIG: &JNIStr = jni_str!("Ljava/lang/CharSequence;");
 
 /// Bind Eclipse's own (non-GTK) backing for `android.content.Context`'s two static-init natives.
 ///
@@ -462,6 +469,93 @@ const ASSET_MANAGER_OPEN_XML_ASSET_SIG: &JNIStr = jni_str!("(ILjava/lang/String;
 // (ARSC + the TypedArray ABI), not one more easy native.
 const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_NAME: &JNIStr = jni_str!("retrieveAttributes");
 const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG: &JNIStr = jni_str!("(J[IIJJ)Z");
+
+// 2026-06-05: `newTheme()` is the native AOSP's `Resources.newTheme()`/`AssetManager.createTheme()`
+// calls to create a native theme object and return its `long` handle (the framework wraps it as a
+// `Resources$Theme`; later `applyStyle`/`resolveAttributes`/`releaseTheme` consume the handle).
+// Surfaced by the dev-host run during step 4 (`View.<init>` → `Context.obtainStyledAttributes` →
+// `getTheme` → `Resources.newTheme` → `AssetManager.newTheme()`). AssetManager is DENYLISTED, so this
+// is bound from the exact JNI signature ART reported missing (`No implementation found for long
+// android.content.res.AssetManager.newTheme()`, run log 2026-06-05) WITHOUT reading the class's
+// source. JNI descriptor `()J` — an INSTANCE native returning the theme handle. Backed non-GTK by the
+// Eclipse-owned [`theme_registry`] (a generational-slab index, NOT a raw pointer — a stale/fabricated
+// theme handle from a later native is a bounds+generation-checked `Err`, never UB).
+const ASSET_MANAGER_NEW_THEME_NAME: &JNIStr = jni_str!("newTheme");
+const ASSET_MANAGER_NEW_THEME_SIG: &JNIStr = jni_str!("()J");
+
+// 2026-06-05: `applyThemeStyle(long theme, int styleRes, boolean force)` is the native AOSP's
+// `Resources$Theme.applyStyle` calls to merge a style resource into a theme. Surfaced by the dev-host
+// run during step 4 (`View.<init>` → `obtainStyledAttributes` → `getTheme` → `Theme.applyStyle` →
+// `AssetManager.applyThemeStyle`). AssetManager is DENYLISTED, so this is bound from the exact JNI
+// signature ART reported missing (`No implementation found for void
+// android.content.res.AssetManager.applyThemeStyle(long, int, boolean)`, mangled `...__JIZ`, run log
+// 2026-06-05) WITHOUT reading the class's source. JNI descriptor `(JIZ)V` — an INSTANCE native
+// (theme handle, style resource id, force flag). Records the applied style id on the
+// [`theme_registry`] theme (bounds+generation-checked — a bad theme handle is a typed Err, never UB);
+// no real style resolution yet (the View cascade only needs the call to succeed).
+const ASSET_MANAGER_APPLY_THEME_STYLE_NAME: &JNIStr = jni_str!("applyThemeStyle");
+const ASSET_MANAGER_APPLY_THEME_STYLE_SIG: &JNIStr = jni_str!("(JIZ)V");
+
+// 2026-06-05: `copyTheme(long dest, long source)` is the native AOSP's `Resources$Theme.setTo` calls
+// to copy one theme's state into another. Surfaced by the dev-host run during step 4
+// (`Theme.setTo` → `AssetManager.copyTheme`). AssetManager is DENYLISTED, so this is bound from the
+// exact JNI signature ART reported missing (`No implementation found for void
+// android.content.res.AssetManager.copyTheme(long, long)`, mangled `...__JJ`, run log 2026-06-05)
+// WITHOUT reading the class's source. JNI descriptor `(JJ)V` — an INSTANCE native (dest handle,
+// source handle). Copies the source [`theme_registry`] theme's recorded styles into the dest theme
+// (both bounds+generation-checked — a bad handle is a typed Err, never UB).
+const ASSET_MANAGER_COPY_THEME_NAME: &JNIStr = jni_str!("copyTheme");
+const ASSET_MANAGER_COPY_THEME_SIG: &JNIStr = jni_str!("(JJ)V");
+
+// 2026-06-05: `applyStyle(long theme, long parser, int defStyleAttr, int defStyleRes, int[] attrs,
+// int length, long outValues, long outIndices)` is the THEME styled-attribute path AOSP's
+// `Resources$Theme.obtainStyledAttributes` drives (the theme-resolved counterpart of the XML-driven
+// `retrieveAttributes`). Surfaced by the dev-host run during step 4 (`View.<init>` →
+// `Context.obtainStyledAttributes` → `Theme.obtainStyledAttributes` → `AssetManager.applyStyle`).
+// AssetManager is DENYLISTED, so this is bound from the exact JNI signature ART reported missing
+// (`No implementation found for void android.content.res.AssetManager.applyStyle(long, long, int,
+// int, int[], int, long, long)`, mangled `...__JJII_3IIJJ`, run log 2026-06-05) WITHOUT reading the
+// class's source. JNI descriptor `(JJII[IIJJ)V` — an INSTANCE native; `outValues`/`outIndices` are
+// the same framework-allocated `TypedArray` off-heap buffers `retrieveAttributes` fills. A fresh
+// View carries no theme-resolved style values yet, so Eclipse writes `TYPE_NULL` for every requested
+// attribute (the View then uses its built-in defaults — sound AOSP fallback, NOT a value fake) and
+// `outIndices[0] = 0`. Reuses the bounds-proven `fill_typed_array` writer.
+const ASSET_MANAGER_APPLY_STYLE_NAME: &JNIStr = jni_str!("applyStyle");
+const ASSET_MANAGER_APPLY_STYLE_SIG: &JNIStr = jni_str!("(JJII[IIJJ)V");
+
+// 2026-06-05: `getResourceName(int resid)` is the native AOSP's `Resources.getResourceName` calls to
+// turn a packed resource id into its full `package:type/entry` name. Surfaced by the dev-host run
+// during step 5 (`MainActivity.onCreate` → `setContentView` → `LayoutInflater.inflate` →
+// `Resources.getResourceName`). AssetManager is DENYLISTED, so this is bound from the exact JNI
+// signature ART reported missing (`No implementation found for java.lang.String
+// android.content.res.AssetManager.getResourceName(int)`, mangled `...__I`, run log 2026-06-05)
+// WITHOUT reading the class's source. JNI descriptor `(I)Ljava/lang/String;` — an INSTANCE native.
+// Backed by Eclipse's own [`apk::arsc`](crate::apk::arsc) `resources.arsc` reader: resolves the id's
+// package/type/entry names and returns `package:type/entry`. Returns null for an unresolvable id
+// (the framework then throws `NotFoundException` — the correct, non-faked outcome).
+const ASSET_MANAGER_GET_RESOURCE_NAME_NAME: &JNIStr = jni_str!("getResourceName");
+const ASSET_MANAGER_GET_RESOURCE_NAME_SIG: &JNIStr = jni_str!("(I)Ljava/lang/String;");
+
+// 2026-06-05: `loadResourceValue(int resid, short density, TypedValue outValue, boolean resolveRefs)`
+// is the native AOSP's `AssetManager.getResourceValue`/`Resources.getValue` calls to resolve a
+// resource id into a `Res_value` written onto a `TypedValue`. Surfaced by the dev-host run during
+// step 5 (`setContentView` → `LayoutInflater.inflate` → `getLayout` → `loadXmlResourceParser` →
+// `Resources.getValue` → `AssetManager.getResourceValue` → `loadResourceValue`). AssetManager is
+// DENYLISTED, so this is bound from the exact JNI signature ART reported missing (`No implementation
+// found for int android.content.res.AssetManager.loadResourceValue(int, short,
+// android.util.TypedValue, boolean)`, mangled `...__ISLandroid_util_TypedValue_2Z`, run log
+// 2026-06-05) WITHOUT reading the class's source. JNI descriptor `(ISLandroid/util/TypedValue;Z)I`.
+// Backed by Eclipse's own `resources.arsc` reader: resolves the id and writes type/data (+ the
+// resolved string for a `TYPE_STRING`, e.g. a layout file path) onto the public `TypedValue` fields.
+// Returns the asset cookie (1) on success, 0 if the id is absent (the framework treats 0 as
+// not-found — correct, not a fake value).
+const ASSET_MANAGER_LOAD_RESOURCE_VALUE_NAME: &JNIStr = jni_str!("loadResourceValue");
+const ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG: &JNIStr = jni_str!("(ISLandroid/util/TypedValue;Z)I");
+
+/// `Res_value.dataType` for a string-pool reference (`TYPE_STRING`); its `data` is a value-pool index.
+const RES_VALUE_TYPE_STRING: u8 = 0x03;
+/// The single asset cookie Eclipse reports (one APK). `loadResourceValue` returns it on success.
+const ECLIPSE_ASSET_COOKIE: jint = 1;
 
 // === ATL TypedArray ABI: the per-attribute window layout retrieveAttributes writes ==============
 //
@@ -912,6 +1006,382 @@ fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<Typ
     }
 }
 
+/// `AssetManager.newTheme()` → a real Eclipse-owned [`theme_registry`] theme handle (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are `(EnvUnowned, JObject this)`.
+/// Allocates a [`theme_registry`] slot and returns its slab handle (≥ 1, never `0`). The framework
+/// wraps it as a `Resources$Theme`; later theme natives (`applyStyle`/`resolveAttributes`/
+/// `releaseTheme`) look it up through the bounds+generation-checked registry. Returns `0` (no theme)
+/// only on a registry error — which the framework treats as a failed theme create, never a fake
+/// success.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
+/// error/panic — a sound neutral "no theme" handle.
+extern "system" fn asset_manager_new_theme<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        match theme_registry::allocate() {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.content.res.AssetManager",
+                    handle,
+                    "AssetManager.newTheme: allocated non-GTK theme-registry handle"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    error = %e,
+                    "AssetManager.newTheme: theme-registry allocate failed → 0 (no theme)"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.applyThemeStyle(long theme, int styleRes, boolean force)` → record the applied
+/// style id on the [`theme_registry`] theme (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void, so the parameters are
+/// `(EnvUnowned, JObject this, jlong theme, jint style_res, jboolean force)`. Looks the theme handle
+/// up through the bounds+generation-checked [`theme_registry`] and appends `style_res` to its applied
+/// styles (a stale/fabricated theme handle is a typed `Err` — logged + ignored, never UB). No real
+/// style resolution is performed yet (the View cascade only needs the call to succeed without GTK).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+extern "system" fn asset_manager_apply_theme_style<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    theme: jlong,
+    style_res: jint,
+    force: jboolean,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match theme_registry::with_theme(theme, |t| t.styles.push(style_res)) {
+            Ok(()) => tracing::debug!(
+                target: "android.content.res.AssetManager",
+                theme,
+                style_res,
+                force,
+                "AssetManager.applyThemeStyle: recorded style on non-GTK theme"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.content.res.AssetManager",
+                theme,
+                style_res,
+                error = %e,
+                "AssetManager.applyThemeStyle: invalid theme handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.copyTheme(long dest, long source)` → copy the source [`theme_registry`] theme's
+/// recorded styles into the dest theme (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void, so the parameters are
+/// `(EnvUnowned, JObject this, jlong dest, jlong source)`. Reads the source theme's styles, then
+/// writes them onto the dest theme — both through the bounds+generation-checked [`theme_registry`]
+/// (a stale/fabricated handle on either side is a typed `Err`, logged + ignored, never UB). Two
+/// separate `with_theme` locks (read-then-write) avoid holding the registry lock across both; the
+/// launcher is single-threaded on the VM main thread, so no interleaving occurs.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+extern "system" fn asset_manager_copy_theme<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    dest: jlong,
+    source: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let src_styles = theme_registry::with_theme(source, |t| t.styles.clone());
+        match src_styles {
+            Ok(styles) => {
+                if let Err(e) = theme_registry::with_theme(dest, |t| t.styles = styles) {
+                    tracing::debug!(
+                        target: "android.content.res.AssetManager",
+                        dest,
+                        source,
+                        error = %e,
+                        "AssetManager.copyTheme: invalid dest theme handle (ignored)"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "android.content.res.AssetManager",
+                        dest,
+                        source,
+                        "AssetManager.copyTheme: copied non-GTK theme styles"
+                    );
+                }
+            }
+            Err(e) => tracing::debug!(
+                target: "android.content.res.AssetManager",
+                dest,
+                source,
+                error = %e,
+                "AssetManager.copyTheme: invalid source theme handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.applyStyle(long theme, long parser, int defStyleAttr, int defStyleRes,
+/// int[] attrs, int length, long outValues, long outIndices)` → write `TYPE_NULL` for every
+/// requested attribute (the theme resolves no styled values for a fresh View — it uses defaults).
+///
+/// JNI ABI: an INSTANCE native returning void. `outValues`/`outIndices` are the framework's
+/// `TypedArray` off-heap buffers (same ABI as [`asset_manager_retrieve_attributes`]). 2026-06-05:
+/// minimal-and-sound — a freshly constructed View has no theme-resolved style values, so this writes
+/// `TYPE_NULL` into each requested attribute's window and `outIndices[0] = 0` (nothing changed),
+/// which makes the framework's `TypedArray` use each attribute's built-in default. That is exactly
+/// AOSP's behavior when a styleable attribute is unset — not a value fake. Theme-driven resolution
+/// against `resources.arsc` is a later increment (would read [`theme_registry`] styles + the ARSC
+/// bag); it is not needed to construct the launcher's default Views.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept). `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+//
+// 2026-06-05: arity is fixed by the JNI signature ART reported (8 args after `this`); a stub must
+// match it exactly. clippy's `too_many_arguments` does not fire on `extern "system"` fns.
+extern "system" fn asset_manager_apply_style<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    theme: jlong,
+    _parser: jlong,
+    _def_style_attr: jint,
+    _def_style_res: jint,
+    attrs: JIntArray<'local>,
+    _length: jint,
+    out_values: jlong,
+    out_indices: jlong,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        // Size the all-default fill to the requested attribute count. A null attrs array means
+        // nothing to fill; still write outIndices[0]=0 so the framework reads a defined count.
+        let n = if attrs.is_null() { 0 } else { attrs.len(env)? };
+        // All-`None`: TYPE_NULL per requested attribute (defaults used), outIndices[0] = 0. Reuses
+        // the bounds-proven writer (writes only < n*STYLE_NUM_ENTRIES / <= n; a 0 ptr is skipped).
+        let entries = vec![None; n];
+        fill_typed_array(out_values, out_indices, &entries);
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            theme,
+            attrs = n,
+            "AssetManager.applyStyle: wrote TYPE_NULL defaults for theme styled attributes (non-GTK)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.getResourceName(int resid)` → the resource's full `package:type/entry` name, or
+/// null if it cannot be resolved (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning a `String`, so the parameters are
+/// `(EnvUnowned, JObject this, jint resid)`. Resolves the packed id via Eclipse's own
+/// [`apk::arsc`](crate::apk::arsc) `resources.arsc` reader (see [`resolve_resource_name`]) and returns
+/// `package:type/entry`. A null `JString` is returned for an unresolvable id — which the framework
+/// turns into a `Resources.NotFoundException` (the correct outcome, not a fake name).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns a null `JString` on error/panic.
+extern "system" fn asset_manager_get_resource_name<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    resid: jint,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let resid_u32 = u32::from_ne_bytes(resid.to_ne_bytes());
+        match resolve_resource_name(resid_u32) {
+            Some(name) => {
+                tracing::debug!(
+                    target: "android.content.res.AssetManager",
+                    resid = format_args!("0x{resid_u32:08x}"),
+                    name = %name,
+                    "AssetManager.getResourceName: resolved via resources.arsc"
+                );
+                env.new_string(name)
+            }
+            None => {
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    resid = format_args!("0x{resid_u32:08x}"),
+                    "AssetManager.getResourceName: id not in resources.arsc → null (NotFoundException)"
+                );
+                Ok(JString::default())
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Resolve a packed resource id to its full `package:type/entry` name via the APK's `resources.arsc`.
+///
+/// Reads `resources.arsc` from the APK (path in [`APK_PATH`]), parses it with
+/// [`apk::arsc::parse_arsc`](crate::apk::arsc::parse_arsc), then composes the package name + 1-based
+/// type name + entry (key) name. Returns `None` for any failure (no APK path, missing/corrupt ARSC,
+/// or an id whose package/type/entry is absent) — never panics. Opens the APK fresh per call (the
+/// launcher resolves few resource names; this avoids holding a borrowed `ResTable` across the JNI
+/// boundary, mirroring [`open_xml_block`]).
+fn resolve_resource_name(resid: u32) -> Option<String> {
+    let apk_path = APK_PATH.get()?;
+    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
+    let bytes = apk.read_entry("resources.arsc").ok()?;
+    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+
+    let package_id = (resid >> 24) as u8;
+    let type_id = ((resid >> 16) & 0xff) as u8;
+    let resolved = table.resource_value(resid)?;
+    let type_name = table.type_name(package_id, type_id).ok().flatten()?;
+    let entry_name = table
+        .key_name(package_id, resolved.key_index)
+        .ok()
+        .flatten()?;
+    // AOSP getResourceName format is `package:type/entry`; the package name is optional in the ARSC.
+    match table.package_name(package_id) {
+        Some(pkg) => Some(format!("{pkg}:{type_name}/{entry_name}")),
+        None => Some(format!("{type_name}/{entry_name}")),
+    }
+}
+
+/// A resource value resolved from `resources.arsc` for `loadResourceValue`: the `Res_value`
+/// type/data plus, for a `TYPE_STRING`, the resolved pooled string (e.g. a layout file path).
+struct ResolvedResValue {
+    type_: i32,
+    data: i32,
+    string: Option<String>,
+}
+
+/// Resolve a packed resource id to its `Res_value` (and pooled string for a `TYPE_STRING`) via the
+/// APK's `resources.arsc`. `None` for any failure (no APK path, missing/corrupt ARSC, complex/absent
+/// entry) — never panics. Opens the APK fresh per call (mirrors [`resolve_resource_name`]).
+fn resolve_res_value(resid: u32) -> Option<ResolvedResValue> {
+    let apk_path = APK_PATH.get()?;
+    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
+    let bytes = apk.read_entry("resources.arsc").ok()?;
+    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+    let resolved = table.resource_value(resid)?;
+    // A complex (bag/map) entry has no single Res_value; loadResourceValue cannot represent it here.
+    if resolved.is_complex {
+        return None;
+    }
+    let string = if resolved.type_ == RES_VALUE_TYPE_STRING {
+        table.value_string(resolved.data).ok().flatten()
+    } else {
+        None
+    };
+    Some(ResolvedResValue {
+        type_: i32::from(resolved.type_),
+        data: u32_to_i32(resolved.data),
+        string,
+    })
+}
+
+/// `AssetManager.loadResourceValue(int resid, short density, TypedValue outValue, boolean
+/// resolveRefs)` → write the resolved `Res_value` onto `outValue`; return the asset cookie or 0.
+///
+/// JNI ABI: an INSTANCE native returning `jint`, so the parameters are
+/// `(EnvUnowned, JObject this, jint resid, jshort density, JObject out_value, jboolean resolve_refs)`.
+/// Resolves `resid` via Eclipse's own [`apk::arsc`](crate::apk::arsc) reader and writes the public
+/// `TypedValue` fields (`type`/`data`/`assetCookie`/`resourceId`/`density`, and `string` for a
+/// `TYPE_STRING`). Returns [`ECLIPSE_ASSET_COOKIE`] on success, `0` if the id is absent/complex (the
+/// framework then reports not-found — the correct outcome, not a fake value).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jint` default (`0`) on
+/// error/panic — the same neutral "not found".
+extern "system" fn asset_manager_load_resource_value<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    resid: jint,
+    density: jshort,
+    out_value: JObject<'local>,
+    _resolve_refs: jboolean,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        let resid_u32 = u32::from_ne_bytes(resid.to_ne_bytes());
+        let Some(resolved) = resolve_res_value(resid_u32) else {
+            tracing::warn!(
+                target: "android.content.res.AssetManager",
+                resid = format_args!("0x{resid_u32:08x}"),
+                "AssetManager.loadResourceValue: id not in resources.arsc → 0 (not found)"
+            );
+            return Ok(0);
+        };
+        if out_value.is_null() {
+            // No TypedValue to fill; report not-found rather than risk a null write.
+            return Ok(0);
+        }
+
+        // SAFETY: "type"/"data"/"assetCookie"/"resourceId"/"density" are `public int` fields of
+        // android.util.TypedValue (TypedValue.java lines 242/252/258/263/274), so the "I" signature
+        // paired with JavaType::Int is consistent — exactly FieldSignature::from_raw_parts' invariant.
+        // set_field re-checks the value type at runtime, so a mismatch is a typed error, never UB.
+        let int_sig =
+            unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
+        env.set_field(
+            &out_value,
+            jni_str!("type"),
+            &int_sig,
+            resolved.type_.into(),
+        )?;
+        env.set_field(&out_value, jni_str!("data"), &int_sig, resolved.data.into())?;
+        env.set_field(
+            &out_value,
+            jni_str!("assetCookie"),
+            &int_sig,
+            ECLIPSE_ASSET_COOKIE.into(),
+        )?;
+        env.set_field(&out_value, jni_str!("resourceId"), &int_sig, resid.into())?;
+        env.set_field(
+            &out_value,
+            jni_str!("density"),
+            &int_sig,
+            jint::from(density).into(),
+        )?;
+        // For a TYPE_STRING, set the `string` CharSequence field to the resolved pooled string (e.g.
+        // the layout file path the framework opens). new_string yields a java.lang.String, which IS a
+        // CharSequence, so the field set is type-correct.
+        if let Some(s) = &resolved.string {
+            let jstr = env.new_string(s)?;
+            // SAFETY: `string` is a `public CharSequence` field of android.util.TypedValue
+            // (TypedValue.java line 247), so the `Ljava/lang/CharSequence;` descriptor paired with
+            // `JavaType::Object` is consistent — exactly FieldSignature::from_raw_parts' invariant.
+            // set_field re-checks the value (a java.lang.String IS a CharSequence) at runtime.
+            let cs_sig =
+                unsafe { FieldSignature::from_raw_parts(CHAR_SEQUENCE_SIG, JavaType::Object) };
+            env.set_field(
+                &out_value,
+                jni_str!("string"),
+                &cs_sig,
+                JValue::Object(&jstr),
+            )?;
+        }
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            resid = format_args!("0x{resid_u32:08x}"),
+            type_ = resolved.type_,
+            data = resolved.data,
+            string = ?resolved.string,
+            "AssetManager.loadResourceValue: wrote TypedValue from resources.arsc"
+        );
+        Ok(ECLIPSE_ASSET_COOKIE)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Read `name` from the APK zip, parse it as binary XML, and store it as an [`xml_registry`] block.
 ///
 /// Returns the non-zero block handle, or a typed [`AssetError`] on any failure (no stashed APK path,
@@ -1036,6 +1506,67 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_retrieve_attributes as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `asset_manager_new_theme` matches the paired `()J` signature as an instance native
+        // returning `jlong` (see the native's docs); casting the `extern "system"` fn to a
+        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_NEW_THEME_NAME,
+                ASSET_MANAGER_NEW_THEME_SIG,
+                asset_manager_new_theme as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_apply_theme_style` matches the paired `(JIZ)V` signature as an
+        // instance native (see the native's docs); casting the `extern "system"` fn to a
+        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_APPLY_THEME_STYLE_NAME,
+                ASSET_MANAGER_APPLY_THEME_STYLE_SIG,
+                asset_manager_apply_theme_style as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_copy_theme` matches the paired `(JJ)V` signature as an instance
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_COPY_THEME_NAME,
+                ASSET_MANAGER_COPY_THEME_SIG,
+                asset_manager_copy_theme as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_apply_style` matches the paired `(JJII[IIJJ)V` signature as an
+        // instance native (see the native's docs); casting the `extern "system"` fn to a
+        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_APPLY_STYLE_NAME,
+                ASSET_MANAGER_APPLY_STYLE_SIG,
+                asset_manager_apply_style as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_get_resource_name` matches the paired `(I)Ljava/lang/String;`
+        // signature as an instance native (see the native's docs); casting the `extern "system"` fn
+        // to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_GET_RESOURCE_NAME_NAME,
+                ASSET_MANAGER_GET_RESOURCE_NAME_SIG,
+                asset_manager_get_resource_name as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_load_resource_value` matches the paired
+        // `(ISLandroid/util/TypedValue;Z)I` signature as an instance native (see the native's docs);
+        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
+        // takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_LOAD_RESOURCE_VALUE_NAME,
+                ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG,
+                asset_manager_load_resource_value as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/content/res/AssetManager; `methods` hold valid fn
     // pointers whose signatures match the class's `native` declarations (`init` verified against
@@ -1044,7 +1575,7 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/AssetManager",
-        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes"
+        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes + newTheme + applyThemeStyle + copyTheme + applyStyle + getResourceName + loadResourceValue"
     );
     Ok(())
 }
@@ -1105,6 +1636,16 @@ const XML_ATTR_NOT_FOUND: jint = -1;
 // 2026-06-05).
 const XML_BLOCK_GET_ATTR_STRING_VALUE_NAME: &JNIStr = jni_str!("nativeGetAttributeStringValue");
 const XML_BLOCK_GET_ATTR_STRING_VALUE_SIG: &JNIStr = jni_str!("(JI)Ljava/lang/String;");
+
+// `static native int nativeGetLineNumber(long state)` — the current node's source line number (used
+// only by `getPositionDescription` for error messages). JNI descriptor `(J)I` (run log 2026-06-05).
+// Eclipse's axml reader does not track source line numbers, so this honestly returns -1 ("unknown"),
+// which AOSP's XmlResourceParser uses when a line is unavailable.
+const XML_BLOCK_GET_LINE_NUMBER_NAME: &JNIStr = jni_str!("nativeGetLineNumber");
+const XML_BLOCK_GET_LINE_NUMBER_SIG: &JNIStr = jni_str!("(J)I");
+
+/// The "unknown line" sentinel AOSP's `XmlResourceParser.getLineNumber` returns when unavailable.
+const XML_LINE_UNKNOWN: jint = -1;
 
 // org.xmlpull.v1.XmlPullParser event constants (stable public API) that AOSP's XmlBlock.Parser
 // returns from nativeNext. Namespace nodes are tracked internally and NOT surfaced as pull events.
@@ -1365,6 +1906,36 @@ extern "system" fn xml_block_get_attribute_string_value<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `XmlBlock.nativeGetLineNumber(long state)` → the current node's source line, or `-1` (unknown).
+///
+/// JNI ABI: a `static` native (`JClass`, then the `jlong state`). Eclipse's axml reader does not
+/// retain source line numbers (binary XML carries them but the reader discards them), so this
+/// honestly returns [`XML_LINE_UNKNOWN`] (`-1`) — the value AOSP's `XmlResourceParser` uses when a
+/// line is unavailable. It is only consumed by `getPositionDescription` for error messages, so `-1`
+/// is correct, not a fake. Validates the handle so an invalid one is logged (still returns `-1`).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `jint` default (`0`) on error/panic, but every path returns an explicit value (`-1`).
+extern "system" fn xml_block_get_line_number<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        if let Err(e) = xml_registry::with_block(state, |_b| ()) {
+            tracing::debug!(
+                target: "android.content.res.XmlBlock",
+                state,
+                error = %e,
+                "XmlBlock.nativeGetLineNumber: invalid state handle → -1 (unknown)"
+            );
+        }
+        // axml does not track source lines; -1 ("unknown") is the honest AOSP sentinel.
+        Ok(XML_LINE_UNKNOWN)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Run `f` against the idx-th attribute of the current element of block `state`.
 ///
 /// Returns `Some(f(attr))` when the handle is valid, the cursor is on a start/end tag, and `idx` is
@@ -1459,6 +2030,14 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_attribute_string_value as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `xml_block_get_line_number` matches the paired `(J)I` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_LINE_NUMBER_NAME,
+                XML_BLOCK_GET_LINE_NUMBER_SIG,
+                xml_block_get_line_number as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/content/res/XmlBlock; `methods` hold valid fn pointers
     // whose signatures match the class's `native` declarations (from the ART-reported signatures,
@@ -1466,7 +2045,7 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/XmlBlock",
-        "registered Eclipse's non-GTK backing for XmlBlock parser natives (nativeCreateParseState/nativeNext/nativeDestroyParseState/nativeGetName/nativeDestroy)"
+        "registered Eclipse's non-GTK backing for XmlBlock parser natives (nativeCreateParseState/nativeNext/nativeDestroyParseState/nativeGetName/nativeDestroy/nativeGetLineNumber)"
     );
     Ok(())
 }
@@ -1581,6 +2160,806 @@ fn register_environment_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.view.View native peer construction =============
+//
+// 2026-06-05: step 4 (`Activity.createMainActivity`) constructs the launcher Activity, whose
+// view hierarchy is fully native-handle-backed. The first native the dev-host run surfaces is
+// `View.native_constructor(Context, AttributeSet)` (`No implementation found for long
+// android.view.View.native_constructor(...)`, run log 2026-06-05). `View.java` line 1166 declares it
+//   `protected native long native_constructor(Context context, AttributeSet attrs);` // GtkWidget
+// — an INSTANCE native returning the native View peer handle (a `long`). ATL's C backing creates a
+// GtkWidget; Eclipse must NOT pull in GTK (AGENTS.md §5 Step 3.5). Eclipse's GTK-free equivalent
+// allocates a sound [`view_registry`] slot (keyed on the receiver's actual Java class name, so the
+// recorded tree shows FrameLayout/TextView/etc.) and returns that slab handle — a generational index,
+// NOT a raw pointer, so a stale/fabricated handle from later View natives is a bounds+generation-
+// checked `Err`, never UB. No layout/measure/draw and no winit/Vulkan surface is created here (the
+// deferred big build); only the view-tree metadata is recorded — sound, not behavior-faking.
+
+/// `android.view.View` (internal/slashed name for `find_class`) — hosts the View peer natives.
+pub const VIEW_CLASS: &JNIStr = jni_str!("android/view/View");
+
+// JNI name + descriptor for View's native peer constructor, exactly as declared in `View.java`
+// (2026-06-05, line 1166): `protected native long native_constructor(Context context, AttributeSet
+// attrs);` → an instance native, descriptor `(Landroid/content/Context;Landroid/util/AttributeSet;)J`.
+const VIEW_NATIVE_CONSTRUCTOR_NAME: &JNIStr = jni_str!("native_constructor");
+const VIEW_NATIVE_CONSTRUCTOR_SIG: &JNIStr =
+    jni_str!("(Landroid/content/Context;Landroid/util/AttributeSet;)J");
+
+// JNI name + descriptor for View.native_setPadding, exactly as declared in `View.java` (2026-06-05,
+// line 1310): `public native void native_setPadding(long widget, int left, int top, int right, int
+// bottom);` → an instance native, descriptor `(JIIII)V`. Surfaced by the dev-host run during
+// `View.<init>` (run log 2026-06-05). Padding is layout data Eclipse does not act on yet (no
+// layout/draw without the deferred surface), so the backing validates the view handle and no-ops.
+const VIEW_NATIVE_SET_PADDING_NAME: &JNIStr = jni_str!("native_setPadding");
+const VIEW_NATIVE_SET_PADDING_SIG: &JNIStr = jni_str!("(JIIII)V");
+
+// JNI name + descriptor for View.native_setLayoutParams, exactly as declared in `View.java`
+// (2026-06-05, line 1167): `public native void native_setLayoutParams(long widget, int width, int
+// height, int gravity, float weight, int leftMargin, int topMargin, int rightMargin, int
+// bottomMargin);` → an instance native, descriptor `(JIIIFIIII)V`. Surfaced during `ViewGroup.addView`
+// (run log 2026-06-05). Layout sizing/margins are data Eclipse does not act on yet (deferred layout),
+// so the backing validates the view handle and no-ops.
+const VIEW_NATIVE_SET_LAYOUT_PARAMS_NAME: &JNIStr = jni_str!("native_setLayoutParams");
+const VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG: &JNIStr = jni_str!("(JIIIFIIII)V");
+
+// JNI name + descriptor for View.native_requestLayout, exactly as declared in `View.java`
+// (2026-06-05, line 1175): `protected native void native_requestLayout(long widget);` → an instance
+// native, descriptor `(J)V`. Surfaced during `ViewGroup.addView` → `View.requestLayout` (run log
+// 2026-06-05). Layout invalidation is a no-op until real layout lands; the backing validates the
+// handle and no-ops.
+const VIEW_NATIVE_REQUEST_LAYOUT_NAME: &JNIStr = jni_str!("native_requestLayout");
+const VIEW_NATIVE_REQUEST_LAYOUT_SIG: &JNIStr = jni_str!("(J)V");
+
+/// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
+///
+/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
+/// `(EnvUnowned, JObject this, JObject context, JObject attrs)`. `context`/`attrs` are not
+/// dereferenced (a GTK widget would consume them; Eclipse records metadata only). Resolves the
+/// receiver's actual Java class name (`this.getClass().getName()`) so the recorded view tree names
+/// the concrete subclass (e.g. `android.widget.FrameLayout`), allocates a [`view_registry`] slot with
+/// it, and returns the slab handle (≥ 1, never `0`). On any failure returns `0` (no peer) — which the
+/// framework treats as a failed construct, never a fake success.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
+/// error/panic — a sound neutral "no peer" handle.
+extern "system" fn view_native_constructor<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    _context: JObject<'local>,
+    _attrs: JObject<'local>,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        let class_name = view_class_name(env, &this).unwrap_or_default();
+        match view_registry::allocate(&class_name) {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.view.View",
+                    class = %class_name,
+                    handle,
+                    "View.native_constructor: allocated non-GTK view-registry peer"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.view.View",
+                    class = %class_name,
+                    error = %e,
+                    "View.native_constructor: view-registry allocate failed → 0 (no peer)"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Resolve a Java object's concrete class name (dotted, e.g. `android.widget.FrameLayout`) via
+/// `obj.getClass().getName()`. Returns `None` on any JNI error (the caller then records an empty
+/// class name — harmless for the tree shape). Off the gameplay hot path (view construction only).
+fn view_class_name(env: &mut Env, obj: &JObject) -> Option<String> {
+    let class = env.get_object_class(obj).ok()?;
+    let name = env
+        .call_method(
+            &class,
+            jni_str!("getName"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+    // getName() returns a java.lang.String; cast_local is a safe, runtime-checked JObject→JString
+    // cast (returns Err if it were ever not a String — never UB).
+    let name = JString::cast_local(env, name).ok()?;
+    name.try_to_string(env).ok()
+}
+
+/// `View.native_setPadding(long widget, int left, int top, int right, int bottom)` → validate the
+/// view handle; no-op (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void, so the parameters are
+/// `(EnvUnowned, JObject this, jlong widget, jint left, jint top, jint right, jint bottom)`. Padding
+/// is layout data Eclipse does not act on yet (no layout/measure/draw without the deferred surface),
+/// so this validates the `widget` handle through the bounds+generation-checked [`view_registry`]
+/// (a stale/fabricated handle is logged + ignored, never UB) and otherwise no-ops. Binding it lets
+/// the View constructor proceed; the padding can be recorded once layout lands.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+extern "system" fn view_native_set_padding<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    left: jint,
+    top: jint,
+    right: jint,
+    bottom: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_setPadding: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget, left, top, right, bottom,
+                "View.native_setPadding: validated handle, no-op (layout deferred)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_setLayoutParams(long widget, int width, int height, int gravity, float weight,
+/// int leftMargin, int topMargin, int rightMargin, int bottomMargin)` → validate handle; no-op
+/// (layout deferred, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void (`View.java` line 1167). Layout sizing/margins/gravity
+/// are applied once real layout lands (deferred); for now this validates the `widget` handle through
+/// the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored, never UB) and
+/// no-ops, letting `ViewGroup.addView` proceed.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+//
+// 2026-06-05: arity is fixed by View.java's declaration (9 args after `this`); clippy's
+// `too_many_arguments` does not fire on `extern "system"` fns.
+extern "system" fn view_native_set_layout_params<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    _width: jint,
+    _height: jint,
+    _gravity: jint,
+    _weight: f32,
+    _left_margin: jint,
+    _top_margin: jint,
+    _right_margin: jint,
+    _bottom_margin: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_setLayoutParams: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget,
+                "View.native_setLayoutParams: validated handle, no-op (layout deferred)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_requestLayout(long widget)` → validate handle; no-op (layout deferred, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void (`View.java` line 1175). Layout invalidation is a no-op
+/// until real layout lands; validates the `widget` handle through the bounds+generation-checked
+/// [`view_registry`] (a bad handle is logged + ignored, never UB).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn view_native_request_layout<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_requestLayout: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
+///
+/// Registered before the lifecycle drive, alongside the other framework natives, since step 4
+/// (`Activity.createMainActivity`) constructs Views during the lifecycle. Each new View native the
+/// dev-host run surfaces (`No implementation found …`) is added here, implemented against
+/// [`view_registry`].
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
+/// They do, by construction — each native is written to the exact descriptor declared in `View.java`.
+/// Every native body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic crosses
+/// the JNI boundary (AGENTS.md §2.8).
+fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(VIEW_CLASS)?;
+    let methods = [
+        // SAFETY: `view_native_constructor` matches the paired
+        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
+        // (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_CONSTRUCTOR_NAME,
+                VIEW_NATIVE_CONSTRUCTOR_SIG,
+                view_native_constructor as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `view_native_set_padding` matches the paired `(JIIII)V` signature as an instance
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_SET_PADDING_NAME,
+                VIEW_NATIVE_SET_PADDING_SIG,
+                view_native_set_padding as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `view_native_set_layout_params` matches the paired `(JIIIFIIII)V` signature as an
+        // instance native (see the native's docs); casting the `extern "system"` fn to a
+        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_SET_LAYOUT_PARAMS_NAME,
+                VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG,
+                view_native_set_layout_params as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `view_native_request_layout` matches the paired `(J)V` signature as an instance
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_REQUEST_LAYOUT_NAME,
+                VIEW_NATIVE_REQUEST_LAYOUT_SIG,
+                view_native_request_layout as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
+    // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
+    // 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/view/View",
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.view.ViewGroup tree wiring =====================
+//
+// 2026-06-05: `setContentView` → `LayoutInflater.rInflate` → `ViewGroup.addView` wires the inflated
+// child views into their parent, surfacing `ViewGroup.native_addView(long parent, long child, int
+// index, ViewGroup$LayoutParams params)` (run log 2026-06-05). `ViewGroup.java` (line 186) declares
+//   `protected native void native_addView(long widget, long child, int index, LayoutParams params);`
+// — an INSTANCE native. ATL's C backing reparents GtkWidgets; Eclipse must NOT pull GTK (AGENTS.md
+// §5 Step 3.5), so it records the parent→child TREE EDGE in [`view_registry`] (the `children` field) —
+// the actual view hierarchy, sound + handle-checked, with no GTK and no layout/draw (deferred). This
+// is what `set_widget_as_root` + `native_addView` together make into a queryable view tree.
+
+/// `android.view.ViewGroup` (internal/slashed name for `find_class`) — hosts the tree-wiring natives.
+pub const VIEW_GROUP_CLASS: &JNIStr = jni_str!("android/view/ViewGroup");
+
+// JNI name + descriptor for ViewGroup.native_addView, exactly as declared in `ViewGroup.java`
+// (2026-06-05, line 186): `protected native void native_addView(long widget, long child, int index,
+// LayoutParams params);` → an instance native, descriptor
+// `(JJILandroid/view/ViewGroup$LayoutParams;)V`.
+const VIEW_GROUP_NATIVE_ADD_VIEW_NAME: &JNIStr = jni_str!("native_addView");
+const VIEW_GROUP_NATIVE_ADD_VIEW_SIG: &JNIStr =
+    jni_str!("(JJILandroid/view/ViewGroup$LayoutParams;)V");
+
+/// `ViewGroup.native_addView(long parent, long child, int index, ViewGroup.LayoutParams params)` →
+/// record the parent→child tree edge in [`view_registry`].
+///
+/// JNI ABI: an INSTANCE native returning void, so the parameters are
+/// `(EnvUnowned, JObject this, jlong parent, jlong child, jint index, JObject params)`. Validates the
+/// `child` handle, then inserts it into the `parent` view's `children` at `index` (clamped into
+/// range) — both through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
+/// ignored, never UB). `params` is not dereferenced (layout deferred). This builds the real view tree
+/// edges without GTK.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+extern "system" fn view_group_native_add_view<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    parent: jlong,
+    child: jlong,
+    index: jint,
+    _params: JObject<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // Only record a valid child handle as an edge (a bad child would record a dangling edge).
+        let child_ok = view_registry::with_view(child, |_v| ()).is_ok();
+        match view_registry::with_view(parent, |p| {
+            if child_ok {
+                // Clamp the insertion index into [0, len]; AOSP allows index -1 (= append).
+                let pos = if index < 0 {
+                    p.children.len()
+                } else {
+                    (index as usize).min(p.children.len())
+                };
+                p.children.insert(pos, child);
+            }
+        }) {
+            Ok(()) => tracing::debug!(
+                target: "android.view.ViewGroup",
+                parent,
+                child,
+                index,
+                child_ok,
+                "ViewGroup.native_addView: recorded parent→child tree edge (non-GTK)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.ViewGroup",
+                parent,
+                child,
+                error = %e,
+                "ViewGroup.native_addView: invalid parent handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.view.ViewGroup`'s tree-wiring natives.
+///
+/// Registered before step 4, alongside the View/Window natives. Each is implemented against
+/// [`view_registry`]; new ViewGroup natives the run surfaces are added here.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
+/// does — [`view_group_native_add_view`] is written to ViewGroup.java line 186's exact descriptor.
+/// The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_view_group_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(VIEW_GROUP_CLASS)?;
+    let methods = [
+        // SAFETY: `view_group_native_add_view` matches the paired
+        // `(JJILandroid/view/ViewGroup$LayoutParams;)V` signature as an instance native; casting the
+        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
+                VIEW_GROUP_NATIVE_ADD_VIEW_SIG,
+                view_group_native_add_view as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/view/ViewGroup; the fn pointer's signature matches its
+    // `native_addView` declaration (verified against ViewGroup.java line 186, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/view/ViewGroup",
+        "registered Eclipse's non-GTK backing for ViewGroup.native_addView"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.graphics.Paint native objects =================
+//
+// 2026-06-05: a `<TextView>` constructs a `TextPaint`/`Paint` during step 5's `setContentView`,
+// surfacing `Paint.native_create()` (run log 2026-06-05). `Paint` is on the graphics subsystem; ATL
+// backs it in C against GTK/Cairo. Eclipse must NOT pull GTK (AGENTS.md §5 Step 3.5) and does NO
+// drawing at onCreate (the ash/Vulkan render is the deferred big build), so a Paint is backed by the
+// Eclipse-owned [`paint_registry`] — a generational-slab index (NOT a raw pointer), holding only the
+// drawing config (color, text size). A fresh Paint with defaults is a valid Paint; recording its
+// config soundly lets the TextView construct without GTK. Each Paint native the run surfaces is added
+// here. (Paint's native signatures are taken from the ART `No implementation found` lines.)
+
+/// `android.graphics.Paint` (internal/slashed name for `find_class`) — hosts the Paint natives.
+pub const PAINT_CLASS: &JNIStr = jni_str!("android/graphics/Paint");
+
+// JNI name + descriptor for Paint.native_create, from the ART-reported signature `long
+// android.graphics.Paint.native_create()` (run log 2026-06-05): a static native, descriptor `()J`.
+const PAINT_NATIVE_CREATE_NAME: &JNIStr = jni_str!("native_create");
+const PAINT_NATIVE_CREATE_SIG: &JNIStr = jni_str!("()J");
+
+/// `Paint.native_create()` → a real Eclipse-owned [`paint_registry`] handle (2026-06-05).
+///
+/// JNI ABI: a `static` native returning `jlong` (the mangled name has no receiver-typed overload), so
+/// the parameters are `(EnvUnowned, JClass)`. Allocates a [`paint_registry`] slot (default config)
+/// and returns its slab handle (≥ 1, never `0`). On a registry error returns `0` (no paint).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
+/// error/panic — a sound neutral "no paint" handle.
+extern "system" fn paint_native_create<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        match paint_registry::allocate() {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.graphics.Paint",
+                    handle,
+                    "Paint.native_create: allocated non-GTK paint-registry handle"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.Paint",
+                    error = %e,
+                    "Paint.native_create: paint-registry allocate failed → 0 (no paint)"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Paint`'s natives.
+///
+/// Registered before step 4, alongside the View/Window natives, since the View hierarchy's
+/// `TextPaint`/`Paint` construct during step 5. Each native is implemented against [`paint_registry`].
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do — each native is written to the exact descriptor the run reported. Every native body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_paint_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(PAINT_CLASS)?;
+    let methods = [
+        // SAFETY: `paint_native_create` matches the paired `()J` signature as a static native;
+        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
+        // takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PAINT_NATIVE_CREATE_NAME,
+                PAINT_NATIVE_CREATE_SIG,
+                paint_native_create as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/graphics/Paint; the fn pointer's signature matches its
+    // `native_create` declaration (from the ART-reported signature, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/graphics/Paint",
+        "registered Eclipse's non-GTK backing for Paint.native_create"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.widget.TextView native peer construction =======
+//
+// 2026-06-05: the launcher layout contains a `<TextView>`, so step 5 (`setContentView` →
+// `LayoutInflater`) constructs an `android.widget.TextView`, surfacing
+// `TextView.native_constructor(Context, AttributeSet)` (run log 2026-06-05). ART resolves natives
+// per declaring class, and `TextView.java` (line 89) re-declares its own
+// `protected native long native_constructor(Context, AttributeSet);` (same signature as
+// `View.native_constructor`). The backing is class-agnostic (it records the receiver's ACTUAL class
+// name into [`view_registry`]), so the SAME [`view_native_constructor`] fn is registered on
+// `android/widget/TextView` — recording `android.widget.TextView` in the view tree. TextView-specific
+// natives (`native_setText`, …) are added here as the run surfaces them.
+
+/// `android.widget.TextView` (internal/slashed name for `find_class`) — re-declares `native_constructor`.
+pub const TEXT_VIEW_CLASS: &JNIStr = jni_str!("android/widget/TextView");
+
+/// Bind Eclipse's own (non-GTK) backing for `android.widget.TextView`'s peer natives.
+///
+/// `native_constructor` (TextView.java line 89, same `(Landroid/content/Context;Landroid/util/
+/// AttributeSet;)J` signature as View's) reuses the class-agnostic [`view_native_constructor`], which
+/// records the receiver's actual class (`android.widget.TextView`) in [`view_registry`]. Registered
+/// before step 4, alongside the View/Window natives.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
+/// does — [`view_native_constructor`] is written to that exact descriptor. The body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(TEXT_VIEW_CLASS)?;
+    let methods = [
+        // SAFETY: `view_native_constructor` matches the paired
+        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
+        // (shared with View.native_constructor); casting the `extern "system"` fn to a `*mut c_void`
+        // is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_CONSTRUCTOR_NAME,
+                VIEW_NATIVE_CONSTRUCTOR_SIG,
+                view_native_constructor as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/widget/TextView; the fn pointer's signature matches its
+    // `native_constructor` declaration (verified against TextView.java line 89, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/widget/TextView",
+        "registered Eclipse's non-GTK backing for TextView.native_constructor"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.view.Window native window setup ================
+//
+// 2026-06-05: step 4 (`Activity.createMainActivity` → `internalCreateActivity` → `Window.<init>` →
+// `Window.set_native_window`) wires the launcher's Window onto the native window handle. The Window
+// natives the dev-host run surfaces are declared in `View.java`'s sibling `Window.java` (lines
+// 184–188, android/view — read for the exact modifiers/signatures, NOT content/res):
+//   L188 `private static native void set_jobject(long ptr, Window obj);`            → static (JLandroid/view/Window;)V
+//   L185 `private native void set_title(long native_window, String title);`         → instance (JLjava/lang/String;)V
+//   L187 `public native void set_layout(long native_window, int width, int height);`→ instance (JII)V
+//   L184 `public native void set_widget_as_root(long native_window, long widget);`  → instance (JJ)V
+// The `long native_window` is the SAME Eclipse-owned [`window_registry`] handle steps 1–4 received,
+// so these dereference it through the bounds+generation-checked registry — NEVER a GtkWidget* cast,
+// never UB. ATL's C backing drives GTK; Eclipse records the window metadata (jobject set, title,
+// layout, root view handle) with no GTK and no real surface/layout/draw (the deferred big build).
+
+/// `android.view.Window` (internal/slashed name for `find_class`) — hosts the window-setup natives.
+pub const WINDOW_CLASS: &JNIStr = jni_str!("android/view/Window");
+
+// JNI names + descriptors for Window's natives, exactly as declared in `Window.java` (2026-06-05).
+// `set_jobject` is STATIC (line 188); the others are instance methods on the Java Window.
+const WINDOW_SET_JOBJECT_NAME: &JNIStr = jni_str!("set_jobject");
+const WINDOW_SET_JOBJECT_SIG: &JNIStr = jni_str!("(JLandroid/view/Window;)V");
+const WINDOW_SET_TITLE_NAME: &JNIStr = jni_str!("set_title");
+const WINDOW_SET_TITLE_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
+const WINDOW_SET_LAYOUT_NAME: &JNIStr = jni_str!("set_layout");
+const WINDOW_SET_LAYOUT_SIG: &JNIStr = jni_str!("(JII)V");
+const WINDOW_SET_WIDGET_AS_ROOT_NAME: &JNIStr = jni_str!("set_widget_as_root");
+const WINDOW_SET_WIDGET_AS_ROOT_SIG: &JNIStr = jni_str!("(JJ)V");
+
+/// `Window.set_jobject(long ptr, Window obj)` → record that the Java Window back-reference is set on
+/// the [`window_registry`] window.
+///
+/// JNI ABI: a STATIC native returning void (`Window.java` line 188), so the parameters are
+/// `(EnvUnowned, JClass, jlong ptr, JObject window)`. `ptr` is the Eclipse-owned window-registry
+/// handle; `window` is the Java `android.view.Window` (not dereferenced — Eclipse records only that
+/// it was set; the design's `WindowState.jobject` is the documented slot for the real `GlobalRef` a
+/// later input/lifecycle increment will store). Validates the handle through the
+/// bounds+generation-checked [`window_registry`] (a bad handle is logged + ignored, never UB).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+extern "system" fn window_set_jobject<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+    _window: JObject<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // Record "jobject set" on the window slot. The unit placeholder is the design's documented
+        // stand-in for the real GlobalRef (window_registry.rs ViewState.jobject docs).
+        match window_registry::with_window(ptr, |w| w.jobject = Some(())) {
+            Ok(()) => tracing::debug!(
+                target: "android.view.Window",
+                ptr,
+                "Window.set_jobject: recorded Java Window back-reference on non-GTK window"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.Window",
+                ptr,
+                error = %e,
+                "Window.set_jobject: invalid window handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Window.set_title(long native_window, String title)` → store the title on the [`window_registry`]
+/// window (applied to the real winit window when one is associated).
+///
+/// JNI ABI: an INSTANCE native returning void (`Window.java` line 185), so the parameters are
+/// `(EnvUnowned, JObject this, jlong native_window, JString title)`. Reads the title string and
+/// stores it on the window slot (the design's `WindowState.title`); a null title stores empty. The
+/// handle is bounds+generation-checked (a bad handle is logged + ignored, never UB).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn window_set_title<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+    title: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let title_str = if title.is_null() {
+            String::new()
+        } else {
+            title.try_to_string(env)?
+        };
+        match window_registry::with_window(native_window, |w| w.title = title_str.clone()) {
+            Ok(()) => tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                title = %title_str,
+                "Window.set_title: stored window title (non-GTK)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                error = %e,
+                "Window.set_title: invalid window handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Window.set_layout(long native_window, int width, int height)` → validate the window handle;
+/// no-op (layout deferred, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void (`Window.java` line 187). Window layout sizing is
+/// applied once a real winit window/surface is associated (deferred); for now this validates the
+/// `native_window` handle through the bounds+generation-checked [`window_registry`] (a bad handle is
+/// logged + ignored, never UB) and no-ops, letting the Window setup proceed.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn window_set_layout<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+    width: jint,
+    height: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = window_registry::with_window(native_window, |_w| ()) {
+            tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                error = %e,
+                "Window.set_layout: invalid window handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.Window",
+                native_window, width, height,
+                "Window.set_layout: validated handle, no-op (layout deferred)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Window.set_widget_as_root(long native_window, long widget)` → record the root view handle on the
+/// [`window_registry`] window (the content-view tree root).
+///
+/// JNI ABI: an INSTANCE native returning void (`Window.java` line 184), so the parameters are
+/// `(EnvUnowned, JObject this, jlong native_window, jlong widget)`. `widget` is the
+/// [`view_registry`] handle of the View made the window's content root. Validates BOTH handles
+/// (window + view, each bounds+generation-checked — a bad handle is logged + ignored, never UB). The
+/// root view handle is recorded as the window's sole child edge so the view tree's root is known
+/// without GTK; no real attach/layout/draw is performed (deferred surface).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn window_set_widget_as_root<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // Validate the view handle (the root) before recording it as the window's root edge.
+        let view_ok = view_registry::with_view(widget, |_v| ()).is_ok();
+        match window_registry::with_window(native_window, |w| {
+            // The window's "children" is its single content root; replace any prior root.
+            w.root_view = if view_ok { Some(widget) } else { None };
+        }) {
+            Ok(()) => tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                widget,
+                view_ok,
+                "Window.set_widget_as_root: recorded content-root view handle (non-GTK)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                widget,
+                error = %e,
+                "Window.set_widget_as_root: invalid window handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.view.Window`'s window-setup natives.
+///
+/// Registered before the lifecycle drive, alongside the other framework natives, since step 4
+/// (`Activity.createMainActivity`) sets up the Window during the lifecycle. Each is implemented
+/// against [`window_registry`] / [`view_registry`].
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
+/// They do, by construction — each native is written to the exact descriptor declared in
+/// `Window.java` (lines 184–188). Every native body is `catch_unwind`-guarded via
+/// [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
+fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(WINDOW_CLASS)?;
+    let methods = [
+        // SAFETY: `window_set_jobject` matches the paired `(JLandroid/view/Window;)V` signature as a
+        // static native; the cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_SET_JOBJECT_NAME,
+                WINDOW_SET_JOBJECT_SIG,
+                window_set_jobject as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `window_set_title` matches the paired `(JLjava/lang/String;)V` signature as an
+        // instance native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_SET_TITLE_NAME,
+                WINDOW_SET_TITLE_SIG,
+                window_set_title as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `window_set_layout` matches the paired `(JII)V` signature as an instance native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_SET_LAYOUT_NAME,
+                WINDOW_SET_LAYOUT_SIG,
+                window_set_layout as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `window_set_widget_as_root` matches the paired `(JJ)V` signature as an instance
+        // native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_SET_WIDGET_AS_ROOT_NAME,
+                WINDOW_SET_WIDGET_AS_ROOT_SIG,
+                window_set_widget_as_root as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/view/Window; `methods` hold valid fn pointers whose
+    // signatures match the class's `native` declarations (verified against Window.java lines 184–188,
+    // 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/view/Window",
+        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root"
+    );
+    Ok(())
+}
+
 // === The confirmed onCreate recipe, encoded as typed constants ===================
 //
 // 2026-06-04: class internal names (slashed, for `find_class`) and JNI method descriptors,
@@ -1625,18 +3004,26 @@ pub const STEP3_APPLICATION_ON_CREATE: RecipeStep = RecipeStep {
     method: "onCreate",
     descriptor: "()V",
 };
-/// Step 4 (deferred): `static Activity.createMainActivity(String, jlong, String) -> Activity`.
+/// Step 4: `static Activity.createMainActivity(String className, jlong native_window, String uri)
+/// -> Activity`. The `className` is the launcher Activity's dotted Java class name (from the
+/// manifest's MAIN/LAUNCHER intent-filter); `native_window` is the same Eclipse-owned
+/// [`window_registry`] handle step 1 received (step 4's Window natives dereference it); `uri` is the
+/// launch URI (`null` for a plain launch). 2026-06-05: driven (the prior "deferred" note is stale).
 pub const STEP4_CREATE_MAIN_ACTIVITY: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "createMainActivity",
     descriptor: "(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;",
 };
-/// Step 5 (deferred): instance `Activity.onCreate(Bundle) -> void` (on the step-4 object).
+/// Step 5: instance `Activity.onCreate(Bundle) -> void` (on the step-4 object), invoked with a
+/// `null` `Bundle` (a fresh launch has no saved instance state). 2026-06-05: driven.
 pub const STEP5_ACTIVITY_ON_CREATE: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "onCreate",
     descriptor: "(Landroid/os/Bundle;)V",
 };
+/// The `android.app.Activity` class (internal name) — hosts the `static` `createMainActivity` entry
+/// point (step 4) and the instance `onCreate(Bundle)` (step 5).
+pub const ACTIVITY_CLASS: &JNIStr = jni_str!("android/app/Activity");
 
 /// One step of the confirmed launcher-lifecycle JNI recipe: a `class.method` and its JNI
 /// descriptor. Encoded so the (still-deferred, window-dependent) call sites bind verified
@@ -1653,10 +3040,13 @@ pub struct RecipeStep {
 
 /// How far the lifecycle driver progressed before stopping.
 ///
-/// This increment reaches [`ApplicationOnCreate`](LifecycleProgress::ApplicationOnCreate): it
-/// proves the bridge, then drives recipe steps 1–3 to `Application.onCreate`. The
-/// handle-dereferencing calls (step 4 onward) are deferred — see the module docs and
-/// [`drive_application_lifecycle`].
+/// 2026-06-05: the driver now attempts the full recipe 1–5. It reaches
+/// [`ApplicationOnCreate`](LifecycleProgress::ApplicationOnCreate) (steps 1–3 proven), then drives
+/// step 4 (`Activity.createMainActivity`) and step 5 (`Activity.onCreate`); reaching the latter is
+/// [`ActivityOnCreate`](LifecycleProgress::ActivityOnCreate). Step 4 onward consume the `jlong`
+/// window handle, which the Window/View natives **dereference** (unlike steps 1–3, which only store
+/// it) — those natives are bound non-GTK against [`window_registry`]/[`view_registry`] as the
+/// dev-host run surfaces them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleProgress {
     /// `find_class` resolved both [`CONTEXT_CLASS`] and [`APPLICATION_CLASS`] from the attached
@@ -1664,11 +3054,14 @@ pub enum LifecycleProgress {
     /// `android.*` framework works. An intermediate milestone on the way to
     /// [`ApplicationOnCreate`](Self::ApplicationOnCreate).
     BridgeProven,
-    /// Recipe steps 1–3 ran on the attached main thread: `Context.createApplication(0)` returned an
-    /// `Application`, `ContentProvider.createContentProviders()` completed, and
-    /// `Application.onCreate()` was invoked on the returned object. Steps 4–5 (which dereference the
-    /// `jlong` window handle) remain deferred on the framework/Surface window-handle design.
+    /// Recipe steps 1–3 ran on the attached main thread: `Context.createApplication(window)` returned
+    /// an `Application`, `ContentProvider.createContentProviders()` completed, and
+    /// `Application.onCreate()` was invoked on the returned object.
     ApplicationOnCreate,
+    /// Recipe steps 4–5 also ran: `Activity.createMainActivity(className, window, uri)` returned an
+    /// `Activity` and `Activity.onCreate(null Bundle)` was invoked on it. The launcher Activity's
+    /// `onCreate` reached — the increment's milestone.
+    ActivityOnCreate,
 }
 
 /// Drive the booted ART VM to Roblox's `Application.onCreate` (recipe steps 1–3).
@@ -1697,15 +3090,18 @@ pub enum LifecycleProgress {
 /// (never a panic/unwrap); a thrown exception is additionally described to stderr (to name the next
 /// missing native/class for the dev-host discovery loop) and cleared before returning.
 ///
-/// # Deferred (not a failure)
-/// This stops *before* step 4 (`Activity.createMainActivity`): steps 4–5 take a `jlong` window
-/// handle that the Window natives **dereference**, and those (non-GTK) Window natives are not yet
-/// bound — see the module docs. Steps 1–3 only *store* the handle, so the real Eclipse-owned
-/// registry handle from [`window_registry::allocate`] is passed and the slot is left allocated for
-/// step 4; driving step 4 onward is unblocked by the framework/Surface design (component-map F).
+/// # Steps 4–5
+/// Drives step 4 (`Activity.createMainActivity(launcher_activity, window, null)`) and step 5
+/// (`Activity.onCreate(null Bundle)`) after steps 1–3. `launcher_activity` is the dotted Java class
+/// name of the manifest's MAIN/LAUNCHER Activity. The `jlong` window handle is the same Eclipse-owned
+/// [`window_registry`] handle steps 1–3 received; step 4's Window/View natives dereference it (bound
+/// non-GTK against [`window_registry`]/[`view_registry`]). Returns
+/// [`LifecycleProgress::ActivityOnCreate`] on success; if a step's native is not yet bound the run's
+/// `No implementation found` line names the next one to add (the dev-host discovery loop).
 pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
+    launcher_activity: &str,
 ) -> Result<LifecycleProgress, FrameworkError> {
     // SAFETY: `vm.as_raw()` is the live `*mut JavaVM` that this process's `JNI_CreateJavaVM`
     // returned (verified non-null by `boot()`'s `NullEnv` check), supporting JNI 1.6 ≥ 1.4 —
@@ -1722,15 +3118,17 @@ pub fn drive_application_lifecycle(
     // is cheap and does not detach on return). Wrap the closure body in catch_unwind so a panic
     // from inside JNI/ART can never unwind across the FFI boundary (panic = "abort"; §2.8).
     java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| drive_steps_1_to_3(env, apk_path))) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            drive_lifecycle(env, apk_path, launcher_activity)
+        })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
         }
     })
 }
 
-/// Prove the bridge, then drive recipe steps 1–3 to `Application.onCreate`. Split out so the panic
-/// guard in [`drive_application_lifecycle`] wraps a single named call.
+/// Prove the bridge, then drive recipe steps 1–5 to the launcher Activity's `onCreate`. Split out so
+/// the panic guard in [`drive_application_lifecycle`] wraps a single named call.
 ///
 /// All JNI calls go through [`checked`], so a thrown Java exception is described + cleared and
 /// surfaced as the typed [`FrameworkError::Jni`] rather than left pending or panicking. The recipe
@@ -1738,7 +3136,11 @@ pub fn drive_application_lifecycle(
 /// the matching compile-time `jni_str!`/`jni_sig!` literals at the call sites are pinned equal to
 /// those constants by the unit test `call_site_literals_match_recipe_constants` (single source of
 /// truth, no per-call allocation or fallible runtime signature parse).
-fn drive_steps_1_to_3(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress, FrameworkError> {
+fn drive_lifecycle(
+    env: &mut Env,
+    apk_path: &str,
+    launcher_activity: &str,
+) -> Result<LifecycleProgress, FrameworkError> {
     // Bind native_get_apk_path + native_updateConfig BEFORE Context's static initializer can run
     // (find_class loads/links the class but does not initialize it — JNI spec), so the two natives
     // are already resolvable, non-GTK, when <clinit> later calls them. RegisterNatives wins over
@@ -1759,6 +3161,26 @@ fn drive_steps_1_to_3(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress
     // external storage early in init (`getExternalStorageDirectory`), so this must be bound before
     // step 1.
     register_environment_natives(env)?;
+    // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
+    // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
+    // against view_registry; each new View native the run surfaces is added to register_view_natives.
+    register_view_natives(env)?;
+    // Bind android.view.Window's window-setup natives on its own class — step 4 wires the launcher's
+    // Window onto the native window handle (set_jobject/set_title/set_layout/set_widget_as_root), so
+    // these must be bound before step 4. Bound non-GTK against window_registry/view_registry.
+    register_window_natives(env)?;
+    // Bind android.widget.TextView's peer natives on its own class — the launcher layout inflates a
+    // <TextView> during step 5, and ART resolves natives per declaring class (TextView re-declares
+    // native_constructor), so this must be bound before step 4. Reuses the View constructor backing.
+    register_text_view_natives(env)?;
+    // Bind android.view.ViewGroup's tree-wiring natives on its own class — setContentView's
+    // LayoutInflater wires children via ViewGroup.addView during step 5, so this must be bound before
+    // step 4. Bound non-GTK against view_registry (records the tree edges).
+    register_view_group_natives(env)?;
+    // Bind android.graphics.Paint's natives on its own class — the View hierarchy's TextPaint/Paint
+    // construct during step 5's setContentView, so this must be bound before step 4. Bound non-GTK
+    // against paint_registry (config only; no drawing).
+    register_paint_natives(env)?;
 
     // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
     // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
@@ -1812,16 +3234,55 @@ fn drive_steps_1_to_3(env: &mut Env, apk_path: &str) -> Result<LifecycleProgress
     )?;
 
     // Step 3: instance `Application.onCreate() -> void` on the object from step 1 — the app's Java
-    // shell self-init. Reaching this is the increment's milestone.
+    // shell self-init.
     checked(env, "step 3 Application.onCreate", |env| {
         env.call_method(&app, jni_str!("onCreate"), jni_sig!("()V"), &[])?
             .v()
     })?;
+    tracing::info!("Application.onCreate reached: recipe steps 1–3 driven");
+
+    // Step 4: `static Activity.createMainActivity(String className, jlong native_window, String uri)
+    // -> Activity`. `className` is the launcher Activity's dotted Java class name; `native_window` is
+    // the SAME Eclipse-owned window-registry handle step 1 received (one window per launch), which
+    // step 4's Window/View natives now dereference through window_registry/view_registry (bounds+
+    // generation-checked — a bad handle is a typed Err, never UB); `uri` is null (a plain launch, no
+    // deep-link). This is the first call that triggers the Window/setContentView/View native cascade.
+    // `.l()` unwraps the returned Activity JObject; a wrong return type is a typed error.
+    let activity_class = env.find_class(ACTIVITY_CLASS)?;
+    let class_name_jstr = env.new_string(launcher_activity)?;
+    let activity = checked(env, "step 4 Activity.createMainActivity", |env| {
+        env.call_static_method(
+            &activity_class,
+            jni_str!("createMainActivity"),
+            jni_sig!("(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;"),
+            &[
+                JValue::Object(&class_name_jstr),
+                JValue::Long(window_handle),
+                // null uri (a fresh launch has no launch URI). A null JObject is the JNI null arg.
+                JValue::Object(&JObject::null()),
+            ],
+        )?
+        .l()
+    })?;
+
+    // Step 5: instance `Activity.onCreate(Bundle) -> void` on the object from step 4, with a null
+    // Bundle (a fresh launch has no saved instance state). Reaching this — which runs the Activity's
+    // setContentView → View-hierarchy inflation — is the increment's milestone. `.v()` asserts void.
+    checked(env, "step 5 Activity.onCreate", |env| {
+        env.call_method(
+            &activity,
+            jni_str!("onCreate"),
+            jni_sig!("(Landroid/os/Bundle;)V"),
+            &[JValue::Object(&JObject::null())],
+        )?
+        .v()
+    })?;
 
     tracing::info!(
-        "Application.onCreate reached: recipe steps 1–3 driven (createMainActivity/step 4 deferred — window handle UNCONFIRMED)"
+        activity = launcher_activity,
+        "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
     );
-    Ok(LifecycleProgress::ApplicationOnCreate)
+    Ok(LifecycleProgress::ActivityOnCreate)
 }
 
 /// Run a single JNI step, turning a thrown Java exception into a typed [`FrameworkError::Jni`].
@@ -1982,6 +3443,29 @@ mod tests {
             jni_sig!("()V").sig().to_str(),
             STEP3_APPLICATION_ON_CREATE.descriptor
         );
+        // Step 4 createMainActivity + step 5 Activity.onCreate call-site literals (2026-06-05).
+        assert_eq!(
+            jni_str!("createMainActivity").to_str(),
+            STEP4_CREATE_MAIN_ACTIVITY.method
+        );
+        assert_eq!(
+            jni_sig!("(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;")
+                .sig()
+                .to_str(),
+            STEP4_CREATE_MAIN_ACTIVITY.descriptor
+        );
+        assert_eq!(
+            jni_str!("onCreate").to_str(),
+            STEP5_ACTIVITY_ON_CREATE.method
+        );
+        assert_eq!(
+            jni_sig!("(Landroid/os/Bundle;)V").sig().to_str(),
+            STEP5_ACTIVITY_ON_CREATE.descriptor
+        );
+        // The step-4/5 Activity class internal (slashed) name used by find_class.
+        assert_eq!(ACTIVITY_CLASS.to_str(), "android/app/Activity");
+        assert_eq!(STEP4_CREATE_MAIN_ACTIVITY.class, "android/app/Activity");
+        assert_eq!(STEP5_ACTIVITY_ON_CREATE.class, "android/app/Activity");
     }
 
     #[test]
@@ -2075,6 +3559,51 @@ mod tests {
             "retrieveAttributes"
         );
         assert_eq!(ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG.to_str(), "(J[IIJJ)Z");
+        // newTheme bound signature-only (AssetManager denylisted) from the ART-reported signature
+        // `()J`; pin name + descriptor so a transcription regression throws NoSuchMethodError at boot.
+        assert_eq!(ASSET_MANAGER_NEW_THEME_NAME.to_str(), "newTheme");
+        assert_eq!(ASSET_MANAGER_NEW_THEME_SIG.to_str(), "()J");
+        // applyThemeStyle bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature `(JIZ)V` (mangled `...__JIZ`); pin name + descriptor so a transcription
+        // regression throws NoSuchMethodError at boot.
+        assert_eq!(
+            ASSET_MANAGER_APPLY_THEME_STYLE_NAME.to_str(),
+            "applyThemeStyle"
+        );
+        assert_eq!(ASSET_MANAGER_APPLY_THEME_STYLE_SIG.to_str(), "(JIZ)V");
+        // copyTheme bound signature-only (AssetManager denylisted) from the ART-reported signature
+        // `(JJ)V` (mangled `...__JJ`); pin name + descriptor so a regression throws NoSuchMethodError.
+        assert_eq!(ASSET_MANAGER_COPY_THEME_NAME.to_str(), "copyTheme");
+        assert_eq!(ASSET_MANAGER_COPY_THEME_SIG.to_str(), "(JJ)V");
+        // applyStyle bound signature-only (AssetManager denylisted) from the ART-reported signature
+        // `(JJII[IIJJ)V` (mangled `...__JJII_3IIJJ`); pin name + descriptor so a transcription
+        // regression throws NoSuchMethodError at boot.
+        assert_eq!(ASSET_MANAGER_APPLY_STYLE_NAME.to_str(), "applyStyle");
+        assert_eq!(ASSET_MANAGER_APPLY_STYLE_SIG.to_str(), "(JJII[IIJJ)V");
+        // getResourceName bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature `(I)Ljava/lang/String;` (mangled `...__I`); pin name + descriptor.
+        assert_eq!(
+            ASSET_MANAGER_GET_RESOURCE_NAME_NAME.to_str(),
+            "getResourceName"
+        );
+        assert_eq!(
+            ASSET_MANAGER_GET_RESOURCE_NAME_SIG.to_str(),
+            "(I)Ljava/lang/String;"
+        );
+        // loadResourceValue bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature `(ISLandroid/util/TypedValue;Z)I` (mangled `...__ISLandroid_util_TypedValue_2Z`);
+        // pin name + descriptor. Also pin the TypedValue field constants it sets.
+        assert_eq!(
+            ASSET_MANAGER_LOAD_RESOURCE_VALUE_NAME.to_str(),
+            "loadResourceValue"
+        );
+        assert_eq!(
+            ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG.to_str(),
+            "(ISLandroid/util/TypedValue;Z)I"
+        );
+        assert_eq!(CHAR_SEQUENCE_SIG.to_str(), "Ljava/lang/CharSequence;");
+        assert_eq!(RES_VALUE_TYPE_STRING, 0x03);
+        assert_eq!(ECLIPSE_ASSET_COOKIE, 1);
         // Pin the EMPIRICALLY-CONFIRMED ATL TypedArray window layout retrieveAttributes writes
         // against (run-derived 2026-06-05: stride 6, TYPE@1, DATA@3 — NOT the AOSP-documented
         // TYPE@0/DATA@1, and NOT the earlier integer-only guess DATA@2). DATA@3 is the ONE slot that
@@ -2229,6 +3758,13 @@ mod tests {
             XML_BLOCK_GET_ATTR_STRING_VALUE_SIG.to_str(),
             "(JI)Ljava/lang/String;"
         );
+        // nativeGetLineNumber: `(J)I`, returns -1 (axml does not track source lines).
+        assert_eq!(
+            XML_BLOCK_GET_LINE_NUMBER_NAME.to_str(),
+            "nativeGetLineNumber"
+        );
+        assert_eq!(XML_BLOCK_GET_LINE_NUMBER_SIG.to_str(), "(J)I");
+        assert_eq!(XML_LINE_UNKNOWN, -1);
         // XmlPullParser event constants nativeNext maps to (stable public API).
         assert_eq!(XML_EVENT_END_DOCUMENT, 1);
         assert_eq!(XML_EVENT_START_TAG, 2);
@@ -2246,5 +3782,82 @@ mod tests {
         assert_eq!(ENVIRONMENT_CLASS.to_str(), "android/os/Environment");
         assert_eq!(GET_APP_DATA_DIR_NAME.to_str(), "native_get_app_data_dir");
         assert_eq!(GET_APP_DATA_DIR_SIG.to_str(), "()Ljava/lang/String;");
+    }
+
+    #[test]
+    fn view_native_names_sigs_and_class_match_view_java() {
+        // Pin android.view.View's peer-native class, method name, and JNI descriptor against
+        // `View.java` line 1166 (`protected native long native_constructor(Context context,
+        // AttributeSet attrs);` → `(Landroid/content/Context;Landroid/util/AttributeSet;)J`) and the
+        // exact signature ART reported missing (run log 2026-06-05): a transcription regression would
+        // make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
+        assert_eq!(VIEW_CLASS.to_str(), "android/view/View");
+        assert_eq!(VIEW_NATIVE_CONSTRUCTOR_NAME.to_str(), "native_constructor");
+        assert_eq!(
+            VIEW_NATIVE_CONSTRUCTOR_SIG.to_str(),
+            "(Landroid/content/Context;Landroid/util/AttributeSet;)J"
+        );
+        // native_setPadding: View.java line 1310 → `(JIIII)V`.
+        assert_eq!(VIEW_NATIVE_SET_PADDING_NAME.to_str(), "native_setPadding");
+        assert_eq!(VIEW_NATIVE_SET_PADDING_SIG.to_str(), "(JIIII)V");
+        // native_setLayoutParams: View.java line 1167 → `(JIIIFIIII)V`.
+        assert_eq!(
+            VIEW_NATIVE_SET_LAYOUT_PARAMS_NAME.to_str(),
+            "native_setLayoutParams"
+        );
+        assert_eq!(VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG.to_str(), "(JIIIFIIII)V");
+        // native_requestLayout: View.java line 1175 → `(J)V`.
+        assert_eq!(
+            VIEW_NATIVE_REQUEST_LAYOUT_NAME.to_str(),
+            "native_requestLayout"
+        );
+        assert_eq!(VIEW_NATIVE_REQUEST_LAYOUT_SIG.to_str(), "(J)V");
+        // TextView re-declares native_constructor (same signature); pin its class internal name.
+        assert_eq!(TEXT_VIEW_CLASS.to_str(), "android/widget/TextView");
+    }
+
+    #[test]
+    fn window_native_names_sigs_and_class_match_window_java() {
+        // Pin android.view.Window's window-setup native class, method names, and JNI descriptors
+        // against `Window.java` lines 184–188 (set_jobject is static; the rest are instance) and the
+        // exact signatures ART reported missing (run log 2026-06-05): a transcription regression would
+        // make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
+        assert_eq!(WINDOW_CLASS.to_str(), "android/view/Window");
+        assert_eq!(WINDOW_SET_JOBJECT_NAME.to_str(), "set_jobject");
+        assert_eq!(WINDOW_SET_JOBJECT_SIG.to_str(), "(JLandroid/view/Window;)V");
+        assert_eq!(WINDOW_SET_TITLE_NAME.to_str(), "set_title");
+        assert_eq!(WINDOW_SET_TITLE_SIG.to_str(), "(JLjava/lang/String;)V");
+        assert_eq!(WINDOW_SET_LAYOUT_NAME.to_str(), "set_layout");
+        assert_eq!(WINDOW_SET_LAYOUT_SIG.to_str(), "(JII)V");
+        assert_eq!(
+            WINDOW_SET_WIDGET_AS_ROOT_NAME.to_str(),
+            "set_widget_as_root"
+        );
+        assert_eq!(WINDOW_SET_WIDGET_AS_ROOT_SIG.to_str(), "(JJ)V");
+    }
+
+    #[test]
+    fn paint_native_name_sig_and_class_match_art_reported() {
+        // Pin android.graphics.Paint.native_create's class, method name, and JNI descriptor against
+        // the exact signature ART reported missing (run log 2026-06-05): a transcription regression
+        // would make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
+        assert_eq!(PAINT_CLASS.to_str(), "android/graphics/Paint");
+        assert_eq!(PAINT_NATIVE_CREATE_NAME.to_str(), "native_create");
+        assert_eq!(PAINT_NATIVE_CREATE_SIG.to_str(), "()J");
+    }
+
+    #[test]
+    fn view_group_native_name_sig_and_class_match_view_group_java() {
+        // Pin android.view.ViewGroup.native_addView's class, method name, and JNI descriptor against
+        // `ViewGroup.java` line 186 (`protected native void native_addView(long widget, long child,
+        // int index, LayoutParams params);` → `(JJILandroid/view/ViewGroup$LayoutParams;)V`) and the
+        // exact signature ART reported missing (run log 2026-06-05): a transcription regression would
+        // make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
+        assert_eq!(VIEW_GROUP_CLASS.to_str(), "android/view/ViewGroup");
+        assert_eq!(VIEW_GROUP_NATIVE_ADD_VIEW_NAME.to_str(), "native_addView");
+        assert_eq!(
+            VIEW_GROUP_NATIVE_ADD_VIEW_SIG.to_str(),
+            "(JJILandroid/view/ViewGroup$LayoutParams;)V"
+        );
     }
 }

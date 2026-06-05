@@ -67,6 +67,10 @@ const RES_VALUE_SIZE: usize = 8;
 
 /// `ResTable_package` field offsets, relative to the package chunk start.
 const PKG_ID_OFFSET: usize = 8;
+/// Byte offset of the package `name` field (a NUL-terminated UTF-16LE string), after header(8)+id(4).
+const PKG_NAME_OFFSET: usize = 12;
+/// Length of the package `name` field in bytes (128 UTF-16 code units).
+const PKG_NAME_LEN: usize = 256;
 const PKG_TYPE_STRINGS_OFFSET: usize = 268; // 8 (header) + 4 (id) + 256 (name)
 const PKG_KEY_STRINGS_OFFSET: usize = 276; // + 4 (typeStrings) + 4 (lastPublicType)
 
@@ -154,6 +158,10 @@ pub struct ResolvedValue {
 struct Package {
     /// The package id (the high byte `PP` of a `0xPPTTEEEE` resource id; typically `0x7f`).
     id: u8,
+    /// The package name (e.g. `com.example.demo_application`), decoded from the package header's
+    /// fixed UTF-16LE `name` field, or `None` if absent/empty. Used by `getResourceName`'s
+    /// `package:type/entry` prefix.
+    name: Option<String>,
     /// `[start, end)` of this package's type-name string pool chunk in the file (or `None`).
     type_pool: Option<(usize, usize)>,
     /// `[start, end)` of this package's key-name string pool chunk in the file (or `None`).
@@ -250,6 +258,16 @@ impl<'a> ResTable<'a> {
         self.packages.iter().map(|p| p.id).collect()
     }
 
+    /// The package name (e.g. `com.example.demo_application`) for a package id, from its header's
+    /// UTF-16 `name` field. `None` if the package is absent or its name field is empty/truncated.
+    /// Used to build `getResourceName`'s `package:type/entry` form.
+    pub fn package_name(&self, package_id: u8) -> Option<&str> {
+        self.packages
+            .iter()
+            .find(|p| p.id == package_id)
+            .and_then(|p| p.name.as_deref())
+    }
+
     fn value_pool(&self) -> Result<StringPool<'a>, ArscError> {
         self.pool_at(self.value_pool.0, self.value_pool.1)
     }
@@ -313,6 +331,7 @@ fn parse_package(buf: &[u8], pkg: &ChunkRef) -> Result<Package, ArscError> {
     }
     // The id is a u32 but only the low byte is the package id (per the resource-id layout).
     let id = read_u8(chunk, PKG_ID_OFFSET).map_err(|_| ArscError::BadPackage)?;
+    let name = read_package_name(chunk);
     let type_strings =
         read_u32(chunk, PKG_TYPE_STRINGS_OFFSET).map_err(|_| ArscError::BadPackage)?;
     let key_strings = read_u32(chunk, PKG_KEY_STRINGS_OFFSET).map_err(|_| ArscError::BadPackage)?;
@@ -341,10 +360,28 @@ fn parse_package(buf: &[u8], pkg: &ChunkRef) -> Result<Package, ArscError> {
 
     Ok(Package {
         id,
+        name,
         type_pool,
         key_pool,
         type_chunks,
     })
+}
+
+/// Decode the package header's fixed UTF-16LE `name` field (NUL-terminated, 128 code units) into a
+/// `String`. Returns `None` if the field is truncated or empty. Total: stops at the first NUL or at
+/// the field boundary, and any unpaired surrogate becomes U+FFFD (lossless-enough for a package name;
+/// never panics, never reads out of bounds).
+fn read_package_name(chunk: &[u8]) -> Option<String> {
+    let bytes = chunk.get(PKG_NAME_OFFSET..PKG_NAME_OFFSET + PKG_NAME_LEN)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&units))
 }
 
 /// Convert a package-relative string-pool offset to an absolute `[start, end)` file range,
