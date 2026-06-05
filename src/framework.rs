@@ -1227,18 +1227,51 @@ extern "system" fn asset_manager_get_resource_name<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Resolve a packed resource id to its full `package:type/entry` name via the APK's `resources.arsc`.
+/// The framework `resources.arsc` bytes (from `framework-res.apk`), cached once.
 ///
-/// Reads `resources.arsc` from the APK (path in [`APK_PATH`]), parses it with
+/// 2026-06-05: `android.R.*` ids live in package `0x01` (the AOSP framework resource table), which
+/// the app's own `resources.arsc` (package `0x7f`) does not contain — e.g. `android.R.id.text1`
+/// (`0x01020002`). The app side reads its ARSC fresh per call from the zip; here we read
+/// `framework-res.apk`'s `resources.arsc` **once** and own the bytes for the rest of the process
+/// (parsed per call into a borrowed [`ResTable`](crate::apk::arsc::ResTable), mirroring the app
+/// path — no self-referential struct, no UB). The lifecycle runs solely on the attached main
+/// thread, so `OnceLock` has no contention.
+static FRAMEWORK_ARSC: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Owned `resources.arsc` bytes for the table that serves `resid`, dispatched by its high byte
+/// (the package id): `0x01` → the framework table ([`FRAMEWORK_ARSC`], from `framework-res.apk`),
+/// anything else → the app table (read fresh from the APK at [`APK_PATH`], preserving the existing
+/// per-call behavior). Returns `None` on any failure (no path, missing/corrupt entry) — never panics.
+fn arsc_bytes_for(resid: u32) -> Option<Vec<u8>> {
+    if (resid >> 24) as u8 == 0x01 {
+        // Framework table: load+cache framework-res.apk's resources.arsc bytes once.
+        if let Some(bytes) = FRAMEWORK_ARSC.get() {
+            return Some(bytes.clone());
+        }
+        let fw = crate::runtime::find_framework().ok()?;
+        let mut apk = crate::apk::Apk::open(&fw.framework_res_apk).ok()?;
+        let bytes = apk.read_entry("resources.arsc").ok()?;
+        // Race-free: another caller may have set it first; either way we end up with cached bytes.
+        Some(FRAMEWORK_ARSC.get_or_init(|| bytes).clone())
+    } else {
+        // App table: read fresh from the APK zip (the launcher resolves few names; avoids holding a
+        // borrowed ResTable across the JNI boundary).
+        let apk_path = APK_PATH.get()?;
+        let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
+        apk.read_entry("resources.arsc").ok()
+    }
+}
+
+/// Resolve a packed resource id to its full `package:type/entry` name via the matching `resources.arsc`.
+///
+/// Reads the right table's `resources.arsc` bytes via [`arsc_bytes_for`] (framework table for
+/// package `0x01`, app table otherwise), parses it with
 /// [`apk::arsc::parse_arsc`](crate::apk::arsc::parse_arsc), then composes the package name + 1-based
-/// type name + entry (key) name. Returns `None` for any failure (no APK path, missing/corrupt ARSC,
-/// or an id whose package/type/entry is absent) — never panics. Opens the APK fresh per call (the
-/// launcher resolves few resource names; this avoids holding a borrowed `ResTable` across the JNI
-/// boundary, mirroring [`open_xml_block`]).
+/// type name + entry (key) name. Returns `None` for any failure (no path, missing/corrupt ARSC,
+/// or an id whose package/type/entry is absent) — never panics. Parses fresh per call (avoids
+/// holding a borrowed `ResTable` across the JNI boundary, mirroring [`open_xml_block`]).
 fn resolve_resource_name(resid: u32) -> Option<String> {
-    let apk_path = APK_PATH.get()?;
-    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
-    let bytes = apk.read_entry("resources.arsc").ok()?;
+    let bytes = arsc_bytes_for(resid)?;
     let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
 
     let package_id = (resid >> 24) as u8;
@@ -1265,12 +1298,11 @@ struct ResolvedResValue {
 }
 
 /// Resolve a packed resource id to its `Res_value` (and pooled string for a `TYPE_STRING`) via the
-/// APK's `resources.arsc`. `None` for any failure (no APK path, missing/corrupt ARSC, complex/absent
-/// entry) — never panics. Opens the APK fresh per call (mirrors [`resolve_resource_name`]).
+/// matching `resources.arsc` (framework table for package `0x01`, app table otherwise; see
+/// [`arsc_bytes_for`]). `None` for any failure (no path, missing/corrupt ARSC, complex/absent
+/// entry) — never panics. Parses fresh per call (mirrors [`resolve_resource_name`]).
 fn resolve_res_value(resid: u32) -> Option<ResolvedResValue> {
-    let apk_path = APK_PATH.get()?;
-    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
-    let bytes = apk.read_entry("resources.arsc").ok()?;
+    let bytes = arsc_bytes_for(resid)?;
     let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
     let resolved = table.resource_value(resid)?;
     // A complex (bag/map) entry has no single Res_value; loadResourceValue cannot represent it here.
@@ -3859,5 +3891,129 @@ mod tests {
             VIEW_GROUP_NATIVE_ADD_VIEW_SIG.to_str(),
             "(JJILandroid/view/ViewGroup$LayoutParams;)V"
         );
+    }
+
+    /// A hand-built `resources.arsc` for a package whose id is `package_id`, with one type (id 1)
+    /// holding one simple entry (id 0) carrying `TYPE_INT_DEC` data 7. Mirrors `arsc::build_fixture`
+    /// but is parameterized on the package id so a host-independent framework table (id 0x01) can be
+    /// built. Kept local to this guard (the only place needing a 0x01-package fixture).
+    fn build_arsc_package(package_id: u32) -> Vec<u8> {
+        fn u16(v: &mut Vec<u8>, x: u16) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn u32(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        // Empty global value string pool (RES_STRING_POOL_TYPE = 0x0001, header-only 28 bytes).
+        let mut pool = Vec::new();
+        u16(&mut pool, 0x0001);
+        u16(&mut pool, 28);
+        u32(&mut pool, 28);
+        u32(&mut pool, 0);
+        u32(&mut pool, 0);
+        u32(&mut pool, 0);
+        u32(&mut pool, 28);
+        u32(&mut pool, 0);
+        // Type chunk (RES_TABLE_TYPE_TYPE = 0x0201): type id 1, one simple entry.
+        let mut type_chunk = Vec::new();
+        u16(&mut type_chunk, 0x0201);
+        u16(&mut type_chunk, 20); // headerSize (0-length config)
+        u32(&mut type_chunk, 40); // size = 20 + 4 + 8 + 8
+        type_chunk.push(1); // type id 1
+        type_chunk.push(0); // res0
+        u16(&mut type_chunk, 0); // res1
+        u32(&mut type_chunk, 1); // entryCount
+        u32(&mut type_chunk, 24); // entriesStart = header(20) + offsets(4)
+        u32(&mut type_chunk, 0); // entry 0 offset
+        u16(&mut type_chunk, 8); // ResTable_entry size
+        u16(&mut type_chunk, 0); // flags (simple)
+        u32(&mut type_chunk, 0); // key index
+        u16(&mut type_chunk, 8); // Res_value size
+        type_chunk.push(0); // res0
+        type_chunk.push(0x10); // dataType = TYPE_INT_DEC
+        u32(&mut type_chunk, 7); // data
+                                 // Package chunk (RES_TABLE_PACKAGE_TYPE = 0x0200): header(8)+id(4)+name[128]u16(256)+
+                                 // 4×u32(16) = 284 bytes (matches arsc::PACKAGE_HEADER_MIN), then the type chunk.
+        const PKG_HEADER: usize = 284;
+        let mut pkg = Vec::new();
+        u16(&mut pkg, 0x0200);
+        u16(&mut pkg, PKG_HEADER as u16);
+        u32(&mut pkg, (PKG_HEADER + type_chunk.len()) as u32);
+        u32(&mut pkg, package_id);
+        pkg.resize(pkg.len() + 256, 0); // name[128] u16
+        u32(&mut pkg, 0); // typeStrings (absent)
+        u32(&mut pkg, 0); // lastPublicType
+        u32(&mut pkg, 0); // keyStrings (absent)
+        u32(&mut pkg, 0); // lastPublicKey
+        debug_assert_eq!(pkg.len(), PKG_HEADER);
+        pkg.extend_from_slice(&type_chunk);
+        // Table chunk (RES_TABLE_TYPE = 0x0002): 12-byte header + pool + package.
+        let mut table = Vec::new();
+        u16(&mut table, 0x0002);
+        u16(&mut table, 12);
+        u32(&mut table, (12 + pool.len() + pkg.len()) as u32);
+        u32(&mut table, 1); // packageCount
+        table.extend_from_slice(&pool);
+        table.extend_from_slice(&pkg);
+        table
+    }
+
+    /// Regression guard for the by-package dispatch (2026-06-05): an id whose high byte is `0x01`
+    /// (the framework package, e.g. `android.R.*`) must be served by `framework-res.apk`'s table, not
+    /// the app's `resources.arsc` (package `0x7f`). Before the fix, only the app table was loaded, so
+    /// every `0x01`-package lookup returned `None`. Builds a host-independent synthetic
+    /// `framework-res.apk` in a temp dir (no machine assumptions), points
+    /// `ECLIPSE_ANDROID_FRAMEWORK_DIR` at it, and asserts `arsc_bytes_for(0x01…)` yields a table
+    /// whose package id is `0x01`.
+    #[test]
+    fn arsc_bytes_for_routes_framework_package_to_framework_res_apk() {
+        use std::io::Write;
+
+        // Unique temp dir holding a dummy api-impl.jar (find_framework requires it) + a synthetic
+        // framework-res.apk whose resources.arsc declares package 0x01.
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-fwarsc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp framework dir");
+        std::fs::write(dir.join("api-impl.jar"), b"dummy").expect("write api-impl.jar");
+
+        let arsc = build_arsc_package(0x01);
+        let apk_bytes = {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("resources.arsc", opts).expect("zip entry");
+            zw.write_all(&arsc).expect("write arsc");
+            zw.finish().expect("finish zip").into_inner()
+        };
+        std::fs::write(dir.join("framework-res.apk"), &apk_bytes).expect("write framework-res.apk");
+
+        // SAFETY: set_var is unsafe (Rust 2024); this test owns the var for its duration and removes
+        // it before returning. No other test reads ECLIPSE_ANDROID_FRAMEWORK_DIR concurrently here.
+        unsafe {
+            std::env::set_var("ECLIPSE_ANDROID_FRAMEWORK_DIR", &dir);
+        }
+
+        let bytes = arsc_bytes_for(0x0101_0000).expect("framework id routes to a loadable table");
+        let table = crate::apk::arsc::parse_arsc(&bytes).expect("framework arsc parses");
+        assert_eq!(
+            table.package_ids(),
+            vec![0x01],
+            "high-byte-0x01 id must be served by the framework table (package 0x01)"
+        );
+        let v = table
+            .resource_value(0x0101_0000)
+            .expect("framework entry resolves");
+        assert_eq!(
+            v.data, 7,
+            "resolved from the framework table, not the app table"
+        );
+
+        unsafe {
+            std::env::remove_var("ECLIPSE_ANDROID_FRAMEWORK_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

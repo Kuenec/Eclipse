@@ -435,7 +435,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**94 unit + 2 compile_fail doctests
+  --all-targets --all-features -- -D warnings`, `cargo test` (**95 unit + 2 compile_fail doctests
   pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
   Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock`/**`View`/
   `ViewGroup`/`TextView`/`Window`/`Paint`** natives via `RegisterNatives` before `Context.<clinit>`,
@@ -479,13 +479,19 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `apk::arsc` — added a `package_name` accessor; `XmlBlock.nativeGetLineNumber` → -1 honest). Three new
   sound generational-slab registries mirror `window_registry`/`xml_registry`: **`view_registry`**,
   **`theme_registry`**, **`paint_registry`** (each `#![forbid(unsafe_code)]`, jlong index NOT a raw
-  pointer, stale/oob/double-free → typed `Err`, 6 soundness tests each). **FAITHFUL STOP (not faked, not a
-  missing native): `MainActivity.onCreate` line 16 does `findViewById(android.R.id.text1).setText(...)` and
-  NPEs** because `getResourceName/loadResourceValue` only read the APP `resources.arsc`; `android.R.id.text1`
-  = `0x01020002` is in package `0x01` = the **AOSP framework resource table** (ATL's `framework-res.apk`),
-  which Eclipse does not yet load. So `findViewById` returns null → the demo's own NPE. **Next frontier: load
-  + merge `framework-res.apk`'s ARSC so `android.R.*` (package 0x01) resolves** (then the demo's onCreate
-  completes); after that, the real ash/Vulkan surface + draw is the deferred big build.** The live JNI path is dev-host-only (ART aborts on worker
+  pointer, stale/oob/double-free → typed `Err`, 6 soundness tests each). **The framework resource table
+  (package 0x01) IS NOW LOADED (2026-06-05, §6): a cached `OnceLock<Vec<u8>>` reads `framework-res.apk`'s
+  `resources.arsc` once; `arsc_bytes_for(resid)` dispatches by the id's high byte (0x01 → framework table,
+  else → app table); `getResourceName`/`loadResourceValue` route through it. So `android.R.*` resolves now.**
+  ⚠️ **EVIDENCE-CORRECTED FAITHFUL STOP (the earlier `0x01020002` premise was disproven by decompiling the
+  demo): `MainActivity.onCreate` line 16 calls `findViewById(R.id.…)` with the demo's OWN R (package 0x7f,
+  e.g. `0x7f030000` — confirmed in `classes.dex` + the layout's REFERENCE-typed `android:id`), NOT
+  `android.R.id.text1`.** The persisting NPE is therefore `findViewById` returning null because the inflater
+  does not yet track the view's assigned id for lookup (`setId`/`findViewById` through the View natives +
+  inflation path) — the **deferred-rendering/inflation frontier**, a different scope from resource-table
+  dispatch. The framework table is still required infrastructure (Roblox + any app reference `android.R.*`
+  framework attrs/defaults via `loadResourceValue`); it is landed durably regardless. After the inflation
+  frontier, the real ash/Vulkan surface + draw is the deferred big build. The live JNI path is dev-host-only (ART aborts on worker
   threads), so it is validated via `eclipse run`. The `apk` reader was validated against the **real**
   Roblox manifest → ground truth (com.roblox.client / ActivitySplash / 26 / 35 / largeHeap=false).
   **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK) on this host.
@@ -506,6 +512,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `rustls`/`clap`/`rustix`. `winit`/`ash` deferred to the windowed boot.
 - **Open items:** license `TBD`; M1 reach Roblox `onCreate` (+ later: APK fetch backend).
 - **Next actions (pick up here — drive ART to Roblox's `onCreate`):**
+  🔜 **IMMEDIATE FRONTIER (evidence-corrected 2026-06-05): the demo's NPE is the inflation/`findViewById`
+  id-tracking path, NOT the resource table.** The framework table (package 0x01) is now loaded + dispatched
+  by id high byte (§6 2026-06-05); the demo's `MainActivity.onCreate:16` `findViewById(R.id.…)` uses the
+  demo's OWN R (package 0x7f, `0x7f030000` — proven from `classes.dex` + the layout's REFERENCE-typed
+  `android:id`), so it returns null because the inflater does not yet record the view's assigned id for
+  lookup. NEXT: make `setContentView`→`LayoutInflater` apply each inflated view's `android:id`
+  (REFERENCE-typed attribute value, e.g. `0x7f030000`) to its `view_registry` peer, and make `findViewById`
+  walk the recorded parent→child tree (`view_registry.children`) matching that id — so `findViewById` returns
+  the real TextView and `setText` succeeds (then onCreate completes → onStart/onResume). Stay non-GTK,
+  metadata-only (no measure/draw/surface). Validate via dev-host `eclipse run` (ART aborts on worker threads).
   📋 **Dev-host execution runbook:** the two frontiers' next concrete steps (which need
   main-thread `cargo run -- run …`, not the cargo-test harness or subagents) are consolidated
   into an executable, decision-driven script in [`docs/dev-host-runbook.md`](docs/dev-host-runbook.md)
@@ -1377,6 +1393,35 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   the framework resource table is the next subsystem. Full gate green: fmt --check / build --all-targets /
   clippy `-D warnings` / **test 94 unit + 2 compile_fail doctests** (+22: 18 registry soundness + 4 native-pin
   expansions) / release (`panic = "abort"`/LTO retained). No new deps. Run log: `/tmp/eclipse-run.log`.
+- **2026-06-05** — **Framework resource table (package 0x01) now LOADED + by-package dispatch added.**
+  `framework.rs`: a process-wide `static FRAMEWORK_ARSC: OnceLock<Vec<u8>>` lazily reads
+  `framework-res.apk`'s `resources.arsc` once (via `runtime::find_framework().framework_res_apk` +
+  `apk::Apk::read_entry`) and **owns** the bytes (no self-referential struct, no UB — parsed per call into
+  a borrowed `ResTable`, exactly like the app path). New `arsc_bytes_for(resid)` dispatches by the id's high
+  byte: `(resid>>24)==0x01` → the cached framework bytes; else → the app APK's `resources.arsc` (unchanged
+  per-call read). Both `resolve_resource_name` + `resolve_res_value` (backing
+  `AssetManager.getResourceName`/`loadResourceValue`) route through it, so `android.R.*` (package 0x01) now
+  resolves against the framework table (`apk::arsc` is already multi-package + selects by id high byte).
+  Smallest edit: 1 static + 1 helper + 2 call-site swaps. Regression guard
+  `framework::tests::arsc_bytes_for_routes_framework_package_to_framework_res_apk` builds a **host-independent**
+  synthetic `framework-res.apk` (zip + a hand-built package-0x01 ARSC) in a temp dir, points
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR` at it, and asserts a `0x0101_0000` lookup yields a table whose package id is
+  `0x01` (would have failed before — only the 0x7f app table was loaded). Gate green: fmt / build / clippy
+  `-D warnings` / **test 95 unit + 2 doctests** (+1 guard) / release. No new deps.
+  ⚠️ **EVIDENCE CORRECTION (the 2026-06-05 STEPS-4–5 entry's `0x01020002` premise was WRONG):** decompiling
+  the demo's `classes.dex` (string refs) + decoding `res/layout/activity_main.xml` (binary XML) shows the demo
+  references **`Lcom/example/demo_application/R$id;`** (the APP's own R, package **0x7f**) — there is **no**
+  `android.R`/`0102…` reference. The layout's two `<TextView>`s carry `android:id` = REFERENCE values
+  **`0x7f030000`/`0x7f030001`** (app ids), and `MainActivity.onCreate:16` calls `findViewById(R.id.…)` =
+  `0x7f030000`. So the persisting NPE (`TextView.setText` on null) is **NOT** the framework-table gap — it is
+  `findViewById` returning null because the inflater does not yet track the view's assigned id for lookup
+  (the `setId`/`findViewById` id-tracking through the View natives + inflation path). That is the
+  **deferred-rendering/inflation frontier**, a different scope from resource-table dispatch. The framework
+  table is still required infrastructure (any app + Roblox reference `android.R.*` framework attrs/defaults via
+  `loadResourceValue`); this change lands it durably. **FAITHFUL lifecycle status (unchanged by this change):**
+  onCreate REACHES + runs the demo's Java (`onCreate`/`setContentView`/`onContentChanged` all log "yay!", view
+  hierarchy inflates) then NPEs at line 16 on `findViewById` → onStart/onResume NOT yet reached. Run log:
+  `/tmp/eclipse-run2.log`.
 
 ---
 
