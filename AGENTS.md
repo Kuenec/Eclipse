@@ -240,6 +240,38 @@ before any history-rewriting/force operation.
   SymbolResolver DONE — libm.so.6's 32 GLOB_DAT now resolve+apply; only `TPOFF64`/TLS + `IRELATIVE` remain before a
   fully-relocated object; NEXT = static-TLS block + `%fs`/TCB for `TPOFF64`** (main-loop only for the apkenv-wiring
   tail). See §6 (2026-06-05 symbol-resolver). Gate now **265 unit + 2 doctests**.
+  **2026-06-05 UPDATE — the loader's SIXTH/FINAL relocation piece, the STATIC-TLS LAYOUT + `TPOFF64`, is built +
+  tested + PROVEN ON `libm.so.6`:** `src/loader/tls.rs` (`pub mod tls;` in `src/loader.rs`) is the x86-64 **variant-II**
+  static-TLS layout + the `R_X86_64_TPOFF64` (`unknown reloc type 18`) applier — the LAST non-ifunc relocation class.
+  A `TlsLayout` stacks one or more modules' `PT_TLS` blocks BELOW the thread pointer per the PUBLIC psABI variant-II
+  model (`offset_1 = roundup(size_1, align_1)`; `offset_i = offset_{i-1} + roundup(size_i, align_i)`; module i occupies
+  `[TP - offset_i, TP - offset_i + size_i)`), ASSEMBLES the init block (`.tdata` copied + `.tbss` zeroed + aligned) as
+  Eclipse-owned `Vec<u8>`, records each module's `tp_offset` (NEGATIVE) + per-symbol tp-relative value (`-offset_i +
+  st_value`), and indexes every module's DEFINED TLS symbols by name (cross-module: a `TPOFF64` against an imported TLS
+  symbol resolves to the DEFINING module's block). A `TlsResolver` wraps the non-TLS `ScopedResolver` + implements
+  `reloc::SymbolResolver::resolve_tls_offset` (delegating non-TLS lookups). **map.rs WIRED:** a new
+  `MappedObject::relocate_tls(img, inner, &layout, page)` pass applies `TPOFF64` through the layout (writes `tp_offset +
+  addend`), counting applied + `IRELATIVE` deferred. `#![forbid(unsafe_code)]` (the assembled block is a plain Vec; map.rs
+  keeps its existing confined `unsafe`). ZERO new crates. **HONEST scope (dated 2026-06-05, in code + here):** the
+  computed offsets + assembled block are CORRECT per the psABI, but they are NOT runtime-reachable until the block is
+  bound to a live thread pointer (`%fs`/TCB) — Eclipse runs on glibc, which OWNS the main thread's `%fs`/static-TLS, so
+  binding is a SEPARATE integration step with real tradeoffs: (a) glibc static-TLS surplus, (b) a private TCB with `%fs`
+  swapped at call boundaries, (c) dynamic-TLS via `__tls_get_addr`. This step delivers the layout/offset math + `TPOFF64`
+  application + tests, NOT `%fs` reachability; it does NOT modify `%fs` or execute the loaded code. **Tests (12; GPU/VM-
+  free except the real one):** single-module offset = `-roundup(size,align)+st_value`, size-rounding, multi-module
+  stacking+alignment, tdata-copied/tbss-zeroed, bad-align/filesz>memsz/tdata-past-file typed errors, `TPOFF64` through
+  reloc.rs writes `tp_offset+addend`, a non-TLS symbol still goes through the inner resolver, an unresolved TLS import →
+  None. A **REAL** test maps `/usr/lib/libm.so.6` (base + symbol + TLS passes), lays out `/usr/lib/libc.so.6`'s `PT_TLS`
+  (libm has NO `PT_TLS`; its 1 `TPOFF64` references `errno@GLIBC_PRIVATE`, TLS GLOBAL **UND** in libm, DEFINED in libc's
+  `PT_TLS`), and applies libm's `TPOFF64`: `errno` tp_offset = `-roundup(0x80,8)+0x30 = -0x50` (libc PT_TLS memsz=0x80
+  align=8, errno st_value=0x30), the written slot = `0xffffffffffffffb0` (= -0x50, addend 0) — EXACTLY the hand-computed
+  variant-II value; and since **libm has 0 IRELATIVE**, all 33 `.rela` (32 GLOB_DAT + 1 TPOFF64) + the RELR relatives are
+  now applied with **NOTHING deferred → libm.so.6 is FULLY RELOCATED modulo ifunc**. **Engine-load frontier: every
+  relocation class an Eclipse-loaded `.so` needs is now applied (RELATIVE/RELR/GLOB_DAT/JUMP_SLOT/64/TPOFF64); only
+  IRELATIVE/ifunc (needs executing resolvers) stays out of scope. The `%fs` runtime-binding + dependency-graph + ifunc +
+  init are the remaining INTEGRATION steps. NEXT = the dependency-graph object loader tying elf+map+resolve+tls together
+  (load `DT_NEEDED` deps, build the cross-module scope + a multi-module TlsLayout, relocate in order), then the `%fs`/init
+  integration tail (main-loop only for the apkenv-wiring).** See §6 (2026-06-05 static-TLS). Gate now **277 unit + 2 doctests**.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2719,6 +2751,54 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   --release` all 0-warning/0-error. Files: `src/loader/resolve.rs` (new), `src/loader/map.rs`
   (`relocate_symbols`/`map_and_relocate_with_scope` + `SymbolRelocStats` + real symbol-reloc test), `src/loader.rs`
   (`pub mod resolve;` + module doc), `Cargo.toml` (`libc = "0.2"`, justified above).
+
+- **2026-06-05 — static-TLS: the variant-II STATIC-TLS LAYOUT + `R_X86_64_TPOFF64` applier (`src/loader/tls.rs`,
+  `pub mod tls;` in `src/loader.rs`).** **What/why:** the loader's STEP 4 — the LAST non-ifunc relocation class
+  (`unknown reloc type 18`, the apkenv linker's abort). `TlsLayout` stacks one or more modules' `PT_TLS` blocks BELOW
+  the thread pointer per the PUBLIC x86-64 psABI **variant-II** TLS model: `offset_1 = roundup(size_1, align_1)`,
+  `offset_i = offset_{i-1} + roundup(size_i, align_i)`; module i occupies `[TP - offset_i, TP - offset_i + size_i)`; a
+  symbol's tp-relative value is `-offset_i + st_value` (NEGATIVE). `add_module(tls, file, tdata_off, dynsyms)` assembles
+  the init block (`.tdata` copied + `.tbss` zeroed + aligned) in an Eclipse-owned `Vec<u8>`, records each module's
+  `TlsModule{tp_offset, block_offset, size}`, and indexes every module's DEFINED TLS symbols (`STT_TLS`, `shndx !=
+  SHN_UNDEF`) by name → `tp_offset_of(name) = tp_offset(defining module) + st_value`. `TlsResolver<R>` wraps the non-TLS
+  resolver `R` (a `ScopedResolver`) + the relocated object's dynsyms + the layout, implements reloc.rs's
+  `SymbolResolver`: `resolve_tls_offset(sym_index)` → dynsym name → `layout.tp_offset_of` (the COMPLETE tp-relative
+  value); `resolve_symbol` forwards to `R`. **Contract with reloc.rs:** apply_one computes `static_tls_offset() +
+  resolve_tls_offset() + addend`; the resolver returns the full `-offset_i + st_value`, so the image carries
+  `static_tls_offset == 0` → written value = `tp_offset + addend` exactly. **map.rs WIRED:**
+  `MappedObject::relocate_tls(img, inner, &layout, page)` partitions `TPOFF64` out, makes every segment RW, applies
+  through the reloc core with a `static_tls_offset=0` image, restores final protections, counts
+  `TlsRelocStats{tpoff64_applied, deferred}` (only IRELATIVE deferred). **Cross-module is the norm:** libm's 1 TPOFF64
+  references `errno@GLIBC_PRIVATE` — TLS GLOBAL **UND** in libm (libm has NO PT_TLS), DEFINED in libc's PT_TLS — so the
+  offset is `errno`'s within-libc tp-relative value, resolved through a layout that includes libc; mirrors resolve.rs's
+  cross-module symbol scope. **`unsafe`:** ZERO new — tls.rs is `#![forbid(unsafe_code)]` (the assembled block is a
+  plain Vec); map.rs keeps its existing confined `unsafe`. **Dep:** ZERO new crates. **HONEST scope (critical — in code
+  + §5):** the computed offsets + assembled block are CORRECT per the psABI but are NOT runtime-reachable until the block
+  is bound to a live thread pointer (`%fs`/TCB). Eclipse runs on glibc, which OWNS the main thread's `%fs`/static-TLS, so
+  binding is a SEPARATE integration step with real tradeoffs — (a) glibc static-TLS surplus, (b) a private TCB with `%fs`
+  swapped at call boundaries, (c) dynamic-TLS via `__tls_get_addr`. This step delivers the layout/offset math + `TPOFF64`
+  application + tests, NOT `%fs` reachability; it does NOT modify `%fs`, set up a TCB, or execute the loaded code.
+  **Tests (12, GPU/VM-free except the real one):** round_up identity; single-module offset = `-roundup(size,align)+
+  st_value`; size-rounding (memsz 13 align 8 → -16); multi-module stacking+alignment (-16/-32/-40 with per-symbol
+  values); tdata-copied/tbss-zeroed in the assembled block; bad-align / filesz>memsz / tdata-past-file typed errors;
+  `TPOFF64` through reloc.rs writes `tp_offset+addend` (-0x30+8 = -0x28); a non-TLS `resolve_symbol` still delegates to
+  the inner resolver; unresolved TLS import → None. A **REAL** test (in map.rs) maps `/usr/lib/libm.so.6` (base +
+  symbol + TLS passes), lays out `/usr/lib/libc.so.6`'s PT_TLS, computes `errno` tp_offset INDEPENDENTLY
+  (`-roundup(memsz=0x80, align=8) + st_value=0x30 = -0x50`), asserts `TlsLayout` agrees, applies libm's TPOFF64 and
+  asserts the written slot = `0xffffffffffffffb0` (= -0x50, addend 0) = `tp_offset+addend`; and since **libm has 0
+  IRELATIVE**, all 33 `.rela` (32 GLOB_DAT + 1 TPOFF64) are now applied with **NOTHING deferred → libm.so.6 FULLY
+  RELOCATED modulo ifunc** (skips cleanly if no host libm/libc). **Grounding (cyber-safeguard honored):** written from
+  the PUBLIC ELF / x86-64 psABI Thread-Local-Storage (variant II) spec — TP→TCB, static blocks below TP at negative
+  offsets, per-module aligned stacking, `TPOFF = block offset + symbol value` — + Eclipse's own `src/loader/` ONLY; **no
+  apkenv/bionic LINKER source, no ATL/bionic/glibc source was read.** Computing offsets + assembling a byte block +
+  applying TPOFF64 over a decoded `.so` is benign (WRITING Eclipse's own from-scratch Rust, not reading the linker).
+  **The clean-room own-Rust TLS work is confirmed SUBAGENT-FEASIBLE — it did NOT trip the cyber-safeguard.** **NEXT =
+  the dependency-graph object loader** tying elf+map+resolve+tls together (load `DT_NEEDED` deps, build the cross-module
+  scope + a multi-module `TlsLayout`, relocate in dependency order), then the `%fs`/init integration tail (main-loop only
+  for the apkenv-wiring). **Gate:** `cargo fmt --all --check` + `build --all-targets` + `clippy --all-targets
+  --all-features -D warnings` + `test` (**277 unit + 2 doctests**) + `build --release` all 0-warning/0-error. Files:
+  `src/loader/tls.rs` (new), `src/loader/map.rs` (`relocate_tls` + `TlsRelocStats` + real TPOFF64 test), `src/loader.rs`
+  (`pub mod tls;` + module doc).
 
 ---
 

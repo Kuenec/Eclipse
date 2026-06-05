@@ -20,9 +20,13 @@
 //!   `R_X86_64_JUMP_SLOT` / `GLOB_DAT` / `R_X86_64_64` through a [`Scope`]
 //!   ([`reloc::SymbolResolver`]); [`MappedObject::map_and_relocate_with_scope`] does both passes in
 //!   one call. They reference dynamic symbols, so the caller supplies the resolution scope.
+//! - **STATIC-TLS RELOCATIONS (step 4) — [`MappedObject::relocate_tls`]:** a follow-on pass applies
+//!   `R_X86_64_TPOFF64` through a [`TlsLayout`] ([`super::tls`]) + a [`TlsResolver`]. It writes the
+//!   variant-II tp-relative offset (`-offset_i + st_value`) the static-TLS symbol resolves to. The
+//!   computed offsets are correct per the psABI; **binding the assembled TLS block to a live thread
+//!   pointer (`%fs`/TCB) is a separate integration step** (see `tls.rs` / AGENTS.md §5) — this pass
+//!   does the offset math + application, not runtime `%fs` reachability.
 //! - **DEFERRED — still not attempted here (documented why):**
-//!   - `R_X86_64_TPOFF64` needs the static-TLS block + `%fs`/TCB (step 4) — there is no
-//!     thread-pointer-relative base assigned yet.
 //!   - `R_X86_64_IRELATIVE` needs **executing** the library's ifunc resolver functions — explicitly
 //!     out of scope; this module **never executes, jumps into, or runs init functions** of the
 //!     mapped object. It maps + relocates + verifies only.
@@ -45,6 +49,7 @@ use rustix::mm::{mmap_anonymous, mprotect, munmap, MapFlags, MprotectFlags, Prot
 use super::elf::{ElfImage, LoadSegment, PF_R, PF_W, PF_X};
 use super::reloc::{self, RelocError, RelocImage};
 use super::resolve::{Scope, ScopedResolver};
+use super::tls::{TlsLayout, TlsResolver};
 
 /// Errors from mapping or base-relocating a parsed ELF image.
 #[derive(Debug)]
@@ -132,6 +137,16 @@ impl SymbolRelocStats {
     pub fn total_applied(&self) -> usize {
         self.glob_dat_applied + self.jump_slot_applied + self.abs64_applied
     }
+}
+
+/// Counts from a [`MappedObject::relocate_tls`] pass, for verification/reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TlsRelocStats {
+    /// Number of `R_X86_64_TPOFF64` relocations applied (static-TLS tp-relative offsets written).
+    pub tpoff64_applied: usize,
+    /// Number of relocations still deferred after this pass: only `R_X86_64_IRELATIVE` (needs
+    /// **executing** the library's ifunc resolvers — explicitly out of scope; nothing is executed).
+    pub deferred: usize,
 }
 
 /// Round `addr` down to the start of its page.
@@ -341,8 +356,9 @@ impl MappedObject {
     /// [`Self::load_base`] + `img.dynsyms`.
     ///
     /// `R_X86_64_TPOFF64` (static-TLS) and `R_X86_64_IRELATIVE` (ifunc) are **counted as deferred**
-    /// and not applied — TLS needs the `%fs`/TCB step and ifunc needs executing resolvers, both out
-    /// of scope here. `R_X86_64_RELATIVE`/`DT_RELR` were already applied by the base pass.
+    /// by *this* pass: `TPOFF64` is applied by the separate [`Self::relocate_tls`] pass (it needs a
+    /// [`TlsLayout`]), and ifunc needs executing resolvers (out of scope). `R_X86_64_RELATIVE`/
+    /// `DT_RELR` were already applied by the base pass.
     ///
     /// The relocation targets (GOT/PLT) sit in writable or RELRO-but-still-RW segments, which
     /// `map_and_relocate` left writable (RELRO hardening is a later step). This pass makes every
@@ -425,6 +441,94 @@ impl MappedObject {
         stats.resolved_nonnull = resolved_nonnull;
 
         // Restore each segment's final protection (the post-reloc state map_and_relocate set).
+        for seg in &img.loads {
+            self.protect_segment(seg, region_start, page_size)?;
+        }
+
+        Ok(stats)
+    }
+
+    /// Apply the **static-TLS** relocations (`R_X86_64_TPOFF64`) through a [`TlsLayout`], the last
+    /// non-ifunc relocation class. For each `TPOFF64` in `img`'s `.rela.dyn`/`.rela.plt`, a
+    /// [`TlsResolver`] (wrapping `inner` for any non-TLS lookup) resolves the referenced TLS symbol
+    /// to its tp-relative value (`-offset_i + st_value` of the **defining** module in `layout`), and
+    /// the [`reloc`] core writes `tp_offset + addend` into the slot.
+    ///
+    /// `inner` is the non-TLS resolver (typically a [`ScopedResolver`]); it is delegated to but
+    /// `TPOFF64` only consults the TLS path. `layout` must already contain the module that **defines**
+    /// each referenced TLS symbol (e.g. for `libm.so.6`'s `errno` import, the layout of `libc.so.6`).
+    ///
+    /// ## tp-offset reachability (HONEST scope — 2026-06-05)
+    /// The written values are the correct tp-relative offsets per the x86-64 variant-II psABI, but
+    /// they are only *reachable at runtime* once the assembled TLS block is bound to a live thread
+    /// pointer (`%fs`/TCB) — a **separate** integration step this loader does not take (see
+    /// `tls.rs` and AGENTS.md §5). This pass delivers the offset computation + `TPOFF64` application.
+    ///
+    /// `R_X86_64_IRELATIVE` (ifunc) stays **deferred** (needs executing resolvers; nothing is run).
+    /// The relocation targets sit in writable/RELRO-but-still-RW segments, so this pass makes every
+    /// segment writable, applies, then restores each segment's final `p_flags` protection.
+    pub fn relocate_tls<R: reloc::SymbolResolver>(
+        &mut self,
+        img: &ElfImage<'_>,
+        inner: &R,
+        layout: &TlsLayout,
+        page_size: u64,
+    ) -> Result<TlsRelocStats, MapError> {
+        let min_vaddr = img
+            .loads
+            .iter()
+            .map(|s| s.vaddr)
+            .min()
+            .ok_or(MapError::NoLoadSegments)?;
+        let region_start = page_floor(min_vaddr, page_size);
+
+        let relas = img
+            .relocations()
+            .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
+        let mut tls_relas: Vec<reloc::Rela> = Vec::new();
+        let mut stats = TlsRelocStats::default();
+        for r in &relas {
+            match r.r_type {
+                reloc::R_X86_64_TPOFF64 => {
+                    stats.tpoff64_applied += 1;
+                    tls_relas.push(*r);
+                }
+                R_X86_64_IRELATIVE => stats.deferred += 1,
+                // RELATIVE/RELR (base pass) and GLOB_DAT/JUMP_SLOT/64 (symbol pass) are not this
+                // pass's; don't double-count them.
+                _ => {}
+            }
+        }
+
+        if tls_relas.is_empty() {
+            return Ok(stats);
+        }
+
+        let resolver = TlsResolver::new(inner, &img.dynsyms, layout);
+        let load_base = self.load_base().wrapping_sub(region_start);
+
+        for seg in &img.loads {
+            self.mprotect_segment_pages(
+                seg,
+                region_start,
+                page_size,
+                ProtFlags::READ | ProtFlags::WRITE,
+            )?;
+        }
+
+        {
+            // SAFETY: 2026-06-05 — every segment was just made RW above; `image_bytes` exposes the
+            // mapping as `&mut [u8]` of exactly `span` bytes (see its SAFETY); the reloc core only
+            // writes within `[0, span)`, all bounds-checked.
+            //
+            // The image's `static_tls_offset` is 0 by contract: `TlsResolver::resolve_tls_offset`
+            // already returns the COMPLETE tp-relative value (`-offset_i + st_value`), so the
+            // applier's `static_tls_offset + tls_offset + addend` yields exactly `tp_offset + addend`.
+            let bytes = unsafe { self.image_bytes() };
+            let mut image = reloc::SliceImage::new(load_base, 0, bytes);
+            reloc::apply_rela(&mut image, &resolver, &tls_relas)?;
+        }
+
         for seg in &img.loads {
             self.protect_segment(seg, region_start, page_size)?;
         }
@@ -1147,6 +1251,150 @@ mod tests {
         assert!(
             strong_count >= 20,
             "expected most of libm's symbol relocs to resolve, got {strong_count}/{total_symbol}"
+        );
+    }
+
+    // ---- REAL test: apply libm.so.6's single TPOFF64 through a libc.so.6 static-TLS layout -------
+
+    #[test]
+    fn real_libm_applies_tpoff64_through_libc_tls_layout() {
+        // 2026-06-05: the step-4 end-to-end. libm.so.6 has exactly ONE R_X86_64_TPOFF64, against
+        // `errno@GLIBC_PRIVATE` — a TLS GLOBAL **UND** import (libm itself has NO PT_TLS). `errno`
+        // is DEFINED in libc.so.6's PT_TLS. So we lay out libc's static-TLS block (variant II),
+        // which assigns `errno` a tp-relative offset (`-roundup(memsz, align) + st_value`), and apply
+        // libm's TPOFF64 through that layout. The written slot must equal `tp_offset + addend`, and —
+        // since libm has 0 IRELATIVE — every one of libm's 33 relocs is now applied (base + symbol +
+        // TLS) with NOTHING deferred: libm is fully relocated modulo ifunc. SKIP if no host libs.
+        use super::super::resolve::{HostDlsymProvider, LoadedObjectProvider, Scope};
+        use super::super::tls::TlsLayout;
+
+        const LIBM: &[&str] = &[
+            "/usr/lib/libm.so.6",
+            "/usr/lib/x86_64-linux-gnu/libm.so.6",
+            "/lib/x86_64-linux-gnu/libm.so.6",
+        ];
+        const LIBC: &[&str] = &[
+            "/usr/lib/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+        ];
+        let (Some(libm_path), Some(libc_path)) = (
+            LIBM.iter().find(|p| std::path::Path::new(p).exists()),
+            LIBC.iter().find(|p| std::path::Path::new(p).exists()),
+        ) else {
+            eprintln!(
+                "real_libm_applies_tpoff64_through_libc_tls_layout: no host libm/libc; skipping"
+            );
+            return;
+        };
+
+        let page = host_page_size();
+
+        // --- Lay out libc.so.6's PT_TLS so `errno` gets a tp-relative offset. ---
+        let libc_bytes = std::fs::read(libc_path).expect("read libc bytes");
+        let libc_img =
+            ElfImage::parse(&libc_bytes).unwrap_or_else(|e| panic!("parse {libc_path}: {e}"));
+        let libc_tls = libc_img
+            .tls
+            .expect("libc.so.6 must have a PT_TLS (it defines errno/etc.)");
+        let tdata_off = libc_img
+            .vaddr_to_off(libc_tls.vaddr)
+            .expect("libc PT_TLS vaddr maps to a file offset");
+        let mut tls_layout = TlsLayout::new();
+        tls_layout
+            .add_module(&libc_tls, &libc_bytes, tdata_off as u64, &libc_img.dynsyms)
+            .unwrap_or_else(|e| panic!("layout libc TLS: {e}"));
+
+        // Independently compute the expected `errno` tp-offset from libc's PT_TLS + its st_value, so
+        // the assertion does not just re-run the code under test.
+        let errno_sym = libc_img
+            .dynsyms
+            .iter()
+            .find(
+                |s| s.name == "errno" && s.shndx != 0 && s.sym_type == 6, /* STT_TLS */
+            )
+            .expect("libc defines a TLS `errno`");
+        let memsz = libc_tls.mem_size;
+        let align = libc_tls.align.max(1);
+        let offset_1 = memsz.div_ceil(align) * align; // roundup(memsz, align)
+        let expected_errno_tp = -(offset_1 as i64) + errno_sym.value as i64;
+        assert_eq!(
+            tls_layout.tp_offset_of("errno"),
+            Some(expected_errno_tp),
+            "TlsLayout's errno tp-offset must match the variant-II hand computation"
+        );
+
+        // --- Map libm.so.6 fully: base + symbol + TLS passes. ---
+        let libm_bytes = std::fs::read(libm_path).expect("read libm bytes");
+        let libm_img =
+            ElfImage::parse(&libm_bytes).unwrap_or_else(|e| panic!("parse {libm_path}: {e}"));
+
+        let (mut obj, map_stats) = MappedObject::map_and_relocate(&libm_img, &libm_bytes, page)
+            .expect("map+base-relocate libm");
+        let base = obj.load_base();
+
+        // Symbol pass (GLOB_DAT) so we can assert the full deferred-accounting at the end.
+        let mut scope = Scope::new();
+        scope
+            .push(Box::new(LoadedObjectProvider::new(base, &libm_img.dynsyms)))
+            .push(Box::new(HostDlsymProvider));
+        let sym_stats = obj
+            .relocate_symbols(&libm_img, &scope, page)
+            .expect("symbol relocate libm");
+
+        // TLS pass: apply libm's TPOFF64 through the libc layout. The inner resolver is the same
+        // scope (TPOFF64 only consults the TLS path, but the wrapper requires an inner resolver).
+        let inner = ScopedResolver::new(&scope, &libm_img.dynsyms);
+        let tls_stats = obj
+            .relocate_tls(&libm_img, &inner, &tls_layout, page)
+            .expect("tls relocate libm");
+
+        // libm has exactly one TPOFF64 and zero IRELATIVE → one applied, none deferred.
+        assert_eq!(tls_stats.tpoff64_applied, 1, "libm has exactly one TPOFF64");
+        assert_eq!(
+            tls_stats.deferred, 0,
+            "libm has zero IRELATIVE → nothing deferred"
+        );
+
+        // --- Verify the written slot value == tp_offset + addend. ---
+        let relas = libm_img.relocations().unwrap();
+        let tpoff = relas
+            .iter()
+            .find(|r| r.r_type == reloc::R_X86_64_TPOFF64)
+            .expect("libm has a TPOFF64");
+        let sym_name = libm_img.dynsyms[tpoff.sym_index as usize].name.clone();
+        let expected = expected_errno_tp.wrapping_add(tpoff.addend) as u64;
+        let written = {
+            // SAFETY (test): region readable post-reloc; r_offset is an in-object vaddr in [0, span).
+            let image = unsafe { obj.image_bytes() };
+            let off = tpoff.offset as usize;
+            u64::from_le_bytes(image[off..off + 8].try_into().unwrap())
+        };
+        assert_eq!(
+            written, expected,
+            "TPOFF64 for {sym_name} wrote {written:#x}, expected tp_offset+addend {expected:#x}"
+        );
+
+        // --- libm is now FULLY relocated modulo ifunc: base + symbol + TLS account for all relocs,
+        // and there is no IRELATIVE to defer. ---
+        let total_relocs = relas.len();
+        let applied =
+            map_stats.relative_applied + sym_stats.total_applied() + tls_stats.tpoff64_applied;
+        // RELR-encoded relatives are separate from the .rela count; the .rela relocs are all applied.
+        assert_eq!(
+            applied, total_relocs,
+            "every libm .rela reloc applied (base RELATIVE + symbol + TPOFF64): {applied} of {total_relocs}"
+        );
+        assert_eq!(
+            tls_stats.deferred, 0,
+            "nothing deferred (libm has no IRELATIVE)"
+        );
+
+        eprintln!(
+            "real_libm_applies_tpoff64_through_libc_tls_layout: {libm_path} — TPOFF64 sym={sym_name} \
+             tp_offset={expected_errno_tp:#x} (errno st_value={:#x}, libc PT_TLS memsz={memsz:#x} align={align:#x}) \
+             written={written:#x} addend={} — libm FULLY relocated modulo ifunc (IRELATIVE deferred=0)",
+            errno_sym.value, tpoff.addend,
         );
     }
 }
