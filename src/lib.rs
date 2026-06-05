@@ -39,6 +39,7 @@ pub mod diagnostics;
 pub mod framework;
 pub mod graphics;
 pub mod input;
+pub mod loader;
 pub mod runtime;
 pub mod services;
 
