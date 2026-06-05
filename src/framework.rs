@@ -14,12 +14,12 @@
 //! `android.content.Context`'s static initializer calls** (`native_get_apk_path` +
 //! `native_updateConfig`) via `RegisterNatives`, resolves the recipe's bootstrap classes
 //! ([`CONTEXT_CLASS`]/[`APPLICATION_CLASS`]) with `find_class` to prove the typed-`Env` bridge
-//! reaches the loaded `android.*` framework, and then **drives recipe steps 1–3** —
+//! reaches the loaded `android.*` framework, and then **drives recipe steps 1–7** —
 //! `Context.createApplication(J)` → `ContentProvider.createContentProviders()` →
 //! `Application.onCreate()` → `Activity.createMainActivity(String, J, String)` →
-//! `Activity.onCreate(Bundle)` — driving the launcher Activity to `onCreate` for a pure-Java APK.
-//! The recipe steps are encoded as typed constants
-//! ([`STEP1_CREATE_APPLICATION`] … [`STEP5_ACTIVITY_ON_CREATE`]).
+//! `Activity.onCreate(Bundle)` → `Activity.onStart()` → `Activity.onResume()` — driving the launcher
+//! Activity to the RESUMED (running/interactive) state for a pure-Java APK. The recipe steps are
+//! encoded as typed constants ([`STEP1_CREATE_APPLICATION`] … [`STEP7_ACTIVITY_ON_RESUME`]).
 //!
 //! ### The `jlong` handle passed to `createApplication(J)` (real, Eclipse-owned)
 //! 2026-06-05: step 1 now passes a **real Eclipse-owned window-registry handle** from
@@ -44,9 +44,11 @@
 //! them already bound and GTK-free. Only these two are bound — they are the only natives the
 //! static initializer reaches for the pure-Java demo APK (`Context.java` `static { … }`).
 //!
-//! ## Steps 4–5 (driven against Eclipse-owned handles, 2026-06-05)
-//! Steps **4–5** — `Activity.createMainActivity(String, jlong, String)→Activity` and
-//! `Activity.onCreate(Bundle)` — are now driven. The `jlong` is the **same Eclipse-owned
+//! ## Steps 4–7 (driven against Eclipse-owned handles, 2026-06-05)
+//! Steps **4–7** — `Activity.createMainActivity(String, jlong, String)→Activity`,
+//! `Activity.onCreate(Bundle)`, then `Activity.onStart()` and `Activity.onResume()` (ATL's
+//! `activity_start`, no-arg instance calls on the step-4 object that drive the launcher Activity to
+//! the RESUMED state) — are now driven. The `jlong` is the **same Eclipse-owned
 //! [`window_registry`] handle** step 1 received; because Eclipse owns BOTH sides of the `jlong` (it
 //! supplies the non-GTK Window/View natives via `RegisterNatives`, which win over ATL's GTK
 //! symbol-name binding — JNI 1.1 spec), the handle never reaches a `GtkWidget*` cast. The
@@ -3348,8 +3350,24 @@ pub const STEP5_ACTIVITY_ON_CREATE: RecipeStep = RecipeStep {
     method: "onCreate",
     descriptor: "(Landroid/os/Bundle;)V",
 };
+/// Step 6: instance `Activity.onStart() -> void` (on the step-4 object). The first half of ATL's
+/// `activity_start` (`main.c`): after `onCreate`, the launcher Activity is moved to the STARTED
+/// state. No-arg instance method. 2026-06-05: driven.
+pub const STEP6_ACTIVITY_ON_START: RecipeStep = RecipeStep {
+    class: "android/app/Activity",
+    method: "onStart",
+    descriptor: "()V",
+};
+/// Step 7: instance `Activity.onResume() -> void` (on the step-4 object). The second half of ATL's
+/// `activity_start`: the Activity reaches the RESUMED (running/interactive) state — the app is now
+/// live. No-arg instance method. 2026-06-05: driven.
+pub const STEP7_ACTIVITY_ON_RESUME: RecipeStep = RecipeStep {
+    class: "android/app/Activity",
+    method: "onResume",
+    descriptor: "()V",
+};
 /// The `android.app.Activity` class (internal name) — hosts the `static` `createMainActivity` entry
-/// point (step 4) and the instance `onCreate(Bundle)` (step 5).
+/// point (step 4) and the instance `onCreate(Bundle)`/`onStart()`/`onResume()` (steps 5–7).
 pub const ACTIVITY_CLASS: &JNIStr = jni_str!("android/app/Activity");
 
 /// One step of the confirmed launcher-lifecycle JNI recipe: a `class.method` and its JNI
@@ -3367,13 +3385,15 @@ pub struct RecipeStep {
 
 /// How far the lifecycle driver progressed before stopping.
 ///
-/// 2026-06-05: the driver now attempts the full recipe 1–5. It reaches
+/// 2026-06-05: the driver now attempts the full recipe 1–7. It reaches
 /// [`ApplicationOnCreate`](LifecycleProgress::ApplicationOnCreate) (steps 1–3 proven), then drives
-/// step 4 (`Activity.createMainActivity`) and step 5 (`Activity.onCreate`); reaching the latter is
-/// [`ActivityOnCreate`](LifecycleProgress::ActivityOnCreate). Step 4 onward consume the `jlong`
-/// window handle, which the Window/View natives **dereference** (unlike steps 1–3, which only store
-/// it) — those natives are bound non-GTK against [`window_registry`]/[`view_registry`] as the
-/// dev-host run surfaces them.
+/// step 4 (`Activity.createMainActivity`) and step 5 (`Activity.onCreate`) —
+/// [`ActivityOnCreate`](LifecycleProgress::ActivityOnCreate) — then steps 6–7 (`Activity.onStart` +
+/// `Activity.onResume`, ATL's `activity_start`), reaching
+/// [`ActivityResumed`](LifecycleProgress::ActivityResumed). Step 4 onward consume the `jlong` window
+/// handle, which the Window/View natives **dereference** (unlike steps 1–3, which only store it) —
+/// those natives are bound non-GTK against [`window_registry`]/[`view_registry`] as the dev-host run
+/// surfaces them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleProgress {
     /// `find_class` resolved both [`CONTEXT_CLASS`] and [`APPLICATION_CLASS`] from the attached
@@ -3387,8 +3407,12 @@ pub enum LifecycleProgress {
     ApplicationOnCreate,
     /// Recipe steps 4–5 also ran: `Activity.createMainActivity(className, window, uri)` returned an
     /// `Activity` and `Activity.onCreate(null Bundle)` was invoked on it. The launcher Activity's
-    /// `onCreate` reached — the increment's milestone.
+    /// `onCreate` reached.
     ActivityOnCreate,
+    /// Recipe steps 6–7 also ran: `Activity.onStart()` then `Activity.onResume()` were invoked on the
+    /// step-4 `Activity` object (ATL's `activity_start`). The launcher Activity reached the RESUMED
+    /// (running/interactive) state — the increment's milestone.
+    ActivityResumed,
 }
 
 /// Drive the booted ART VM to Roblox's `Application.onCreate` (recipe steps 1–3).
@@ -3417,14 +3441,17 @@ pub enum LifecycleProgress {
 /// (never a panic/unwrap); a thrown exception is additionally described to stderr (to name the next
 /// missing native/class for the dev-host discovery loop) and cleared before returning.
 ///
-/// # Steps 4–5
-/// Drives step 4 (`Activity.createMainActivity(launcher_activity, window, null)`) and step 5
-/// (`Activity.onCreate(null Bundle)`) after steps 1–3. `launcher_activity` is the dotted Java class
-/// name of the manifest's MAIN/LAUNCHER Activity. The `jlong` window handle is the same Eclipse-owned
+/// # Steps 4–7
+/// Drives step 4 (`Activity.createMainActivity(launcher_activity, window, null)`), step 5
+/// (`Activity.onCreate(null Bundle)`), then step 6 (`Activity.onStart()`) and step 7
+/// (`Activity.onResume()`) after steps 1–3. `launcher_activity` is the dotted Java class name of the
+/// manifest's MAIN/LAUNCHER Activity. The `jlong` window handle is the same Eclipse-owned
 /// [`window_registry`] handle steps 1–3 received; step 4's Window/View natives dereference it (bound
-/// non-GTK against [`window_registry`]/[`view_registry`]). Returns
-/// [`LifecycleProgress::ActivityOnCreate`] on success; if a step's native is not yet bound the run's
-/// `No implementation found` line names the next one to add (the dev-host discovery loop).
+/// non-GTK against [`window_registry`]/[`view_registry`]). Steps 6–7 are ATL's `activity_start`: they
+/// call `onStart()` then `onResume()` on the step-4 `Activity` object (no args), driving it to the
+/// RESUMED state. Returns [`LifecycleProgress::ActivityResumed`] on success; if a step's native is
+/// not yet bound the run's `No implementation found` line names the next one to add (the dev-host
+/// discovery loop).
 pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
@@ -3608,12 +3635,32 @@ fn drive_lifecycle(
         )?
         .v()
     })?;
-
     tracing::info!(
         activity = launcher_activity,
         "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
     );
-    Ok(LifecycleProgress::ActivityOnCreate)
+
+    // Step 6: instance `Activity.onStart() -> void` on the step-4 object — the first half of ATL's
+    // `activity_start` (`main.c`): the launcher Activity moves to the STARTED state, running the
+    // app's own `onStart` override. No args. `.v()` asserts the void return.
+    checked(env, "step 6 Activity.onStart", |env| {
+        env.call_method(&activity, jni_str!("onStart"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+
+    // Step 7: instance `Activity.onResume() -> void` on the step-4 object — the second half of
+    // `activity_start`: the Activity reaches the RESUMED (running/interactive) state, running the
+    // app's own `onResume` override. No args. `.v()` asserts the void return.
+    checked(env, "step 7 Activity.onResume", |env| {
+        env.call_method(&activity, jni_str!("onResume"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+
+    tracing::info!(
+        activity = launcher_activity,
+        "Activity resumed: recipe steps 1–7 driven (launcher Activity onStart + onResume)"
+    );
+    Ok(LifecycleProgress::ActivityResumed)
 }
 
 /// Run a single JNI step, turning a thrown Java exception into a typed [`FrameworkError::Jni`].
@@ -3732,6 +3779,13 @@ mod tests {
             STEP5_ACTIVITY_ON_CREATE.descriptor,
             "(Landroid/os/Bundle;)V"
         );
+        // Steps 6–7: Activity.onStart/onResume are no-arg void instance methods (2026-06-05).
+        assert_eq!(STEP6_ACTIVITY_ON_START.class, "android/app/Activity");
+        assert_eq!(STEP6_ACTIVITY_ON_START.method, "onStart");
+        assert_eq!(STEP6_ACTIVITY_ON_START.descriptor, "()V");
+        assert_eq!(STEP7_ACTIVITY_ON_RESUME.class, "android/app/Activity");
+        assert_eq!(STEP7_ACTIVITY_ON_RESUME.method, "onResume");
+        assert_eq!(STEP7_ACTIVITY_ON_RESUME.descriptor, "()V");
     }
 
     #[test]
@@ -3793,10 +3847,26 @@ mod tests {
             jni_sig!("(Landroid/os/Bundle;)V").sig().to_str(),
             STEP5_ACTIVITY_ON_CREATE.descriptor
         );
-        // The step-4/5 Activity class internal (slashed) name used by find_class.
+        // Step 6 onStart + step 7 onResume call-site literals (2026-06-05).
+        assert_eq!(jni_str!("onStart").to_str(), STEP6_ACTIVITY_ON_START.method);
+        assert_eq!(
+            jni_sig!("()V").sig().to_str(),
+            STEP6_ACTIVITY_ON_START.descriptor
+        );
+        assert_eq!(
+            jni_str!("onResume").to_str(),
+            STEP7_ACTIVITY_ON_RESUME.method
+        );
+        assert_eq!(
+            jni_sig!("()V").sig().to_str(),
+            STEP7_ACTIVITY_ON_RESUME.descriptor
+        );
+        // The step-4–7 Activity class internal (slashed) name used by find_class.
         assert_eq!(ACTIVITY_CLASS.to_str(), "android/app/Activity");
         assert_eq!(STEP4_CREATE_MAIN_ACTIVITY.class, "android/app/Activity");
         assert_eq!(STEP5_ACTIVITY_ON_CREATE.class, "android/app/Activity");
+        assert_eq!(STEP6_ACTIVITY_ON_START.class, "android/app/Activity");
+        assert_eq!(STEP7_ACTIVITY_ON_RESUME.class, "android/app/Activity");
     }
 
     #[test]

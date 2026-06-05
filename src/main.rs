@@ -163,14 +163,15 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     eclipse::runtime::whitelist_bionic_library_path(&fw, Some(&app_lib_dir))?;
     println!("bionic linker search path whitelisted (dl_parse_library_path) ✓");
 
-    // Drive the confirmed onCreate recipe on this (main) thread, with the VM alive: wrap the held VM
+    // Drive the confirmed lifecycle recipe on this (main) thread, with the VM alive: wrap the held VM
     // with the `jni` crate, bind Eclipse's own non-GTK backing for the framework natives via
-    // RegisterNatives, then drive recipe steps 1–5 — Context.createApplication → createContentProviders
-    // → Application.onCreate → Activity.createMainActivity → Activity.onCreate — to reach the launcher
-    // Activity's onCreate. The jlong window handle is an Eclipse-owned window_registry index (sound,
-    // bounds+generation-checked — never a GtkWidget* cast). Runs before the blocking event loop so the
-    // lifecycle is driven while still on the attached main thread.
-    println!("# Driving the framework lifecycle (JNI; steps 1–5 to Activity.onCreate)…");
+    // RegisterNatives, then drive recipe steps 1–7 — Context.createApplication → createContentProviders
+    // → Application.onCreate → Activity.createMainActivity → Activity.onCreate → Activity.onStart →
+    // Activity.onResume — to reach the launcher Activity's RESUMED state. The jlong window handle is an
+    // Eclipse-owned window_registry index (sound, bounds+generation-checked — never a GtkWidget* cast).
+    // Runs before the blocking event loop so the lifecycle is driven while still on the attached main
+    // thread.
+    println!("# Driving the framework lifecycle (JNI; steps 1–7 to Activity.onResume / RESUMED)…");
     let progress =
         eclipse::framework::drive_application_lifecycle(&vm, apk_path, &plan.launcher_activity)?;
     println!("framework lifecycle driven: {progress:?} (non-GTK Context/Window/View natives bound; launcher Activity = {}) ✓", plan.launcher_activity);
