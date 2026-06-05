@@ -141,15 +141,17 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     println!("ART VM booted with Roblox's Java on the classpath ✓");
 
     // Drive the grounded foundation of the confirmed onCreate recipe on this (main) thread, with
-    // the VM alive: wrap the held VM with the `jni` crate and resolve the framework's bootstrap
-    // classes to prove the typed-Env bridge reaches the loaded android.* framework. The
-    // window-dependent createApplication(J) call (step 1 onward) is deferred — its jlong window
-    // handle is UNCONFIRMED for Eclipse's non-GTK window (see docs/art-and-runtime.md). Runs
-    // before the blocking event loop so the bridge is proven while still on the attached main
-    // thread; once the window-handle design lands, step 1+ move into the event loop.
+    // the VM alive: wrap the held VM with the `jni` crate, bind Eclipse's own non-GTK backing for
+    // the two natives Context's static initializer calls (native_get_apk_path/native_updateConfig)
+    // via RegisterNatives, then resolve the framework's bootstrap classes to prove the typed-Env
+    // bridge reaches the loaded android.* framework. The window-dependent createApplication(J) call
+    // (step 1 onward) is deferred — its jlong window handle is UNCONFIRMED for Eclipse's non-GTK
+    // window (see docs/art-and-runtime.md). Runs before the blocking event loop so the bridge is
+    // proven while still on the attached main thread; once the window-handle design lands, step 1+
+    // move into the event loop.
     println!("# Driving the framework lifecycle foundation (JNI bridge)…");
-    let progress = eclipse::framework::drive_application_lifecycle(&vm)?;
-    println!("framework bridge proven: {progress:?} (createApplication deferred — window handle UNCONFIRMED) ✓");
+    let progress = eclipse::framework::drive_application_lifecycle(&vm, apk_path)?;
+    println!("framework bridge proven: {progress:?} (Context static-init natives bound non-GTK; createApplication deferred — window handle UNCONFIRMED) ✓");
 
     // Open the host game window via winit (no GTK — keeps the low_4gb window clear for ART, the
     // Step 3.5 win). The Activity Surface + engine rendering will hang off this window next; for
