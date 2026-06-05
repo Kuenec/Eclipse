@@ -457,6 +457,9 @@ impl MappedObject {
     /// `inner` is the non-TLS resolver (typically a [`ScopedResolver`]); it is delegated to but
     /// `TPOFF64` only consults the TLS path. `layout` must already contain the module that **defines**
     /// each referenced TLS symbol (e.g. for `libm.so.6`'s `errno` import, the layout of `libc.so.6`).
+    /// `own_tp_offset` is this object's **own** TLS module tp-relative base in `layout` (`None` if it
+    /// declares no `PT_TLS`); it resolves a self-referential `STN_UNDEF` (sym 0) `TPOFF64` — the
+    /// relocation against the object's own thread-locals (e.g. `libc.so.6`'s 15 sym-0 TPOFF64).
     ///
     /// ## tp-offset reachability (HONEST scope — 2026-06-05)
     /// The written values are the correct tp-relative offsets per the x86-64 variant-II psABI, but
@@ -472,6 +475,7 @@ impl MappedObject {
         img: &ElfImage<'_>,
         inner: &R,
         layout: &TlsLayout,
+        own_tp_offset: Option<i64>,
         page_size: u64,
     ) -> Result<TlsRelocStats, MapError> {
         let min_vaddr = img
@@ -504,7 +508,7 @@ impl MappedObject {
             return Ok(stats);
         }
 
-        let resolver = TlsResolver::new(inner, &img.dynsyms, layout);
+        let resolver = TlsResolver::new(inner, &img.dynsyms, layout, own_tp_offset);
         let load_base = self.load_base().wrapping_sub(region_start);
 
         for seg in &img.loads {
@@ -677,6 +681,25 @@ impl MappedObject {
     /// Total length (bytes) of the reserved region.
     pub fn span(&self) -> usize {
         self.span
+    }
+
+    /// Read a little-endian `u64` from the mapped image at region-relative byte offset `off` (an
+    /// in-object vaddr for a PIE). Returns [`MapError::SpanOverflow`] if `[off, off+8)` is outside
+    /// the region. A safe read accessor (e.g. to inspect a relocated GOT/PLT slot after a symbol
+    /// pass) — the mapped pages are readable in their final protection here, so the read is sound.
+    pub fn read_u64(&self, off: usize) -> Result<u64, MapError> {
+        let end = off
+            .checked_add(8)
+            .ok_or(MapError::SpanOverflow("read offset + 8"))?;
+        if end > self.span {
+            return Err(MapError::SpanOverflow("read past span"));
+        }
+        // SAFETY: 2026-06-05 — `[off, off+8)` is within `[0, span)` (checked above) of this object's
+        // own readable mapping; `u8` has no alignment requirement; the bytes are read into an owned
+        // array (no aliasing). The mapper sets every segment's final protection to include
+        // `PROT_READ`, so the region is readable for the object's whole life.
+        let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr().add(off), 8) };
+        Ok(u64::from_le_bytes(bytes.try_into().expect("8-byte slice")))
     }
 
     /// A safe `&mut [u8]` over the whole mapped region, for the relocation pass.
@@ -1345,8 +1368,10 @@ mod tests {
         // TLS pass: apply libm's TPOFF64 through the libc layout. The inner resolver is the same
         // scope (TPOFF64 only consults the TLS path, but the wrapper requires an inner resolver).
         let inner = ScopedResolver::new(&scope, &libm_img.dynsyms);
+        // libm declares no PT_TLS, so its own tp-offset is None (its one TPOFF64 references `errno`,
+        // a named cross-module symbol — sym_index != 0 — resolved via the libc layout, not sym 0).
         let tls_stats = obj
-            .relocate_tls(&libm_img, &inner, &tls_layout, page)
+            .relocate_tls(&libm_img, &inner, &tls_layout, None, page)
             .expect("tls relocate libm");
 
         // libm has exactly one TPOFF64 and zero IRELATIVE → one applied, none deferred.

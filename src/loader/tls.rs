@@ -280,31 +280,50 @@ impl TlsLayout {
 /// every **non-TLS** relocation to an inner resolver (typically a
 /// [`super::resolve::ScopedResolver`]).
 ///
-/// `resolve_tls_offset(sym_index)` maps the relocated object's `sym_index` → its [`DynSym`] name →
-/// the layout's [`TlsLayout::tp_offset_of`] (the **full** tp-relative value `-offset_i + st_value`
-/// of the defining module). `resolve_symbol` forwards to the inner resolver unchanged.
+/// `resolve_tls_offset(sym_index)`:
+/// - **`sym_index == 0` (`STN_UNDEF`)** — a self-referential TPOFF64 against the **referencing
+///   object's own** TLS block (no named symbol; the relocation's addend is the within-block
+///   offset). The x86-64 psABI computes `S + A` with `S` the symbol's tp-relative address; with no
+///   symbol, `S` is the referencing module's own tp-relative base. Returns that base (`own_tp_offset`,
+///   supplied at construction). This is glibc's own thread-locals' self-relocation (`libc.so.6`'s 15
+///   sym-0 TPOFF64 entries).
+/// - **`sym_index != 0`** — maps the object's `sym_index` → its [`DynSym`] name → the layout's
+///   [`TlsLayout::tp_offset_of`] (the **full** tp-relative value `-offset_i + st_value` of the
+///   defining module — possibly a *different* module, e.g. `libm`'s `errno` import resolving into
+///   `libc`'s block).
+///
+/// `resolve_symbol` forwards to the inner resolver unchanged.
 ///
 /// ## Contract with [`reloc::apply_one`]
 /// `reloc::apply_one` computes the `TPOFF64` value as
 /// `image.static_tls_offset() + resolve_tls_offset(idx) + addend`. Because `resolve_tls_offset`
-/// here already returns the **complete** module-relative-to-TP offset (`-offset_i + st_value`), the
-/// image must carry `static_tls_offset == 0` so the written value is exactly `(-offset_i +
-/// st_value) + addend = tp_offset + addend`. Callers ([`super::map`]) build the relocation image
-/// with `static_tls_offset == 0` for the TLS pass.
+/// here already returns the **complete** module-relative-to-TP offset, the image must carry
+/// `static_tls_offset == 0` so the written value is exactly `tp_offset + addend`. Callers
+/// ([`super::map`]) build the relocation image with `static_tls_offset == 0` for the TLS pass.
 pub struct TlsResolver<'a, R: SymbolResolver> {
     inner: &'a R,
     dynsyms: &'a [DynSym],
     layout: &'a TlsLayout,
+    /// The referencing object's own TLS module tp-relative base (`None` if the object has no
+    /// `PT_TLS`). Used for a self-referential `sym_index == 0` TPOFF64.
+    own_tp_offset: Option<i64>,
 }
 
 impl<'a, R: SymbolResolver> TlsResolver<'a, R> {
     /// Wrap `inner` (the non-TLS resolver) with TLS resolution over `layout`, for an object whose
-    /// relocations index into `dynsyms`.
-    pub fn new(inner: &'a R, dynsyms: &'a [DynSym], layout: &'a TlsLayout) -> Self {
+    /// relocations index into `dynsyms` and whose own TLS module has tp-relative base
+    /// `own_tp_offset` (`None` if the object declares no `PT_TLS`).
+    pub fn new(
+        inner: &'a R,
+        dynsyms: &'a [DynSym],
+        layout: &'a TlsLayout,
+        own_tp_offset: Option<i64>,
+    ) -> Self {
         Self {
             inner,
             dynsyms,
             layout,
+            own_tp_offset,
         }
     }
 }
@@ -315,6 +334,12 @@ impl<R: SymbolResolver> SymbolResolver for TlsResolver<'_, R> {
     }
 
     fn resolve_tls_offset(&self, sym_index: u32) -> Option<u64> {
+        // sym_index 0 = STN_UNDEF: a self-referential TPOFF64 against this object's OWN TLS block.
+        // S is the object's own tp-relative base; apply_one adds the addend (the within-block
+        // offset). Without an own PT_TLS this is malformed → None (typed UnresolvedSymbol).
+        if sym_index == 0 {
+            return self.own_tp_offset.map(|v| v as u64);
+        }
         let sym = self.dynsyms.get(sym_index as usize)?;
         // The full tp-relative value of the defining module's symbol (negative), as a u64 bit
         // pattern. apply_one adds the addend (and the image's static_tls_offset, which is 0 here).
@@ -487,10 +512,14 @@ mod tests {
         // Layout: one module, symbol "tlsvar" at +0x10 within a memsz-0x40 align-0x10 block.
         // offset_1 = roundup(0x40, 0x10) = 0x40 → tp_offset -0x40; sym tp-relative = -0x40 + 0x10 =
         // -0x30. With addend 8 the TPOFF64 must write -0x30 + 8 = -0x28.
+        //
+        // 2026-06-05: the named import lives at index 1 (index 0 is ALWAYS the reserved STN_UNDEF
+        // null symbol — a real toolchain never places a named symbol there). A sym-0 TPOFF64 is the
+        // separate self-reference case (see `tpoff64_sym0_resolves_own_module_block`).
         let file = vec![0u8; 0x20];
         let dynsyms = vec![
-            // index 0: the relocated object's UND TLS import of "tlsvar".
-            tls_undef("tlsvar"),
+            tls_undef(""),       // index 0: the reserved null symbol
+            tls_undef("tlsvar"), // index 1: the relocated object's UND TLS import of "tlsvar"
         ];
         let mut layout = TlsLayout::new();
         // The DEFINING module supplies "tlsvar" at +0x10. (Defining-module dynsyms below.)
@@ -499,7 +528,9 @@ mod tests {
             .unwrap();
 
         let inner = InnerFixed;
-        let resolver = TlsResolver::new(&inner, &dynsyms, &layout);
+        // The referencing object has no own PT_TLS → own_tp_offset None (the import is named,
+        // sym_index 1, resolved cross-module via the layout — not the sym-0 self path).
+        let resolver = TlsResolver::new(&inner, &dynsyms, &layout, None);
 
         // The image carries static_tls_offset == 0 (the resolver returns the full tp-relative
         // value; see the TlsResolver contract). One word at offset 0.
@@ -508,7 +539,7 @@ mod tests {
         let mut img = SliceImage::new(BASE, 0, &mut buf);
         let rela = Rela {
             offset: 0,
-            sym_index: 0, // names "tlsvar" via the relocated object's dynsyms
+            sym_index: 1, // names "tlsvar" via the relocated object's dynsyms
             r_type: R_X86_64_TPOFF64,
             addend: 8,
         };
@@ -521,30 +552,66 @@ mod tests {
     }
 
     #[test]
+    fn tpoff64_sym0_resolves_own_module_block() {
+        // 2026-06-05: a self-referential TPOFF64 (sym_index 0 = STN_UNDEF) resolves against the
+        // REFERENCING object's OWN TLS block (libc.so.6's 15 sym-0 TPOFF64 entries). S = own
+        // tp_offset; the addend is the within-block offset. With own tp_offset -0x80 and addend
+        // 0x40, the written value is -0x80 + 0x40 = -0x40.
+        use crate::loader::reloc::{apply_one, Rela, SliceImage, R_X86_64_TPOFF64};
+
+        let dynsyms = vec![tls_undef("")]; // index 0: the reserved null symbol
+        let layout = TlsLayout::new(); // no named TLS def needed for the self path
+        let inner = InnerFixed;
+        // The referencing object's own TLS module sits at tp_offset -0x80.
+        let resolver = TlsResolver::new(&inner, &dynsyms, &layout, Some(-0x80));
+
+        const BASE: u64 = 0x5555_5000_0000;
+        let mut buf = vec![0u8; 8];
+        let mut img = SliceImage::new(BASE, 0, &mut buf);
+        let rela = Rela {
+            offset: 0,
+            sym_index: 0, // STN_UNDEF: own-module self-reference
+            r_type: R_X86_64_TPOFF64,
+            addend: 0x40, // within-block offset
+        };
+        apply_one(&mut img, &resolver, &rela).unwrap();
+
+        let written = u64::from_le_bytes(buf[..8].try_into().unwrap()) as i64;
+        assert_eq!(written, -0x80 + 0x40);
+        assert_eq!(written, -0x40);
+
+        // Without an own PT_TLS, a sym-0 TPOFF64 is unresolved (None → typed error, never faked).
+        let no_own = TlsResolver::new(&inner, &dynsyms, &layout, None);
+        assert_eq!(no_own.resolve_tls_offset(0), None);
+    }
+
+    #[test]
     fn non_tls_symbol_still_goes_through_inner_resolver() {
         // A GLOB_DAT-style resolve_symbol must delegate to the inner resolver unchanged.
-        let dynsyms = vec![tls_undef("ignored")];
+        let dynsyms = vec![tls_undef(""), tls_undef("ignored")];
         let layout = TlsLayout::new();
         let inner = InnerFixed;
-        let resolver = TlsResolver::new(&inner, &dynsyms, &layout);
+        // No own PT_TLS → a sym-0 TLS lookup is None (and the named imports below are unresolved).
+        let resolver = TlsResolver::new(&inner, &dynsyms, &layout, None);
         // Inner resolves index 1 to a fixed address; the wrapper forwards it.
         assert_eq!(resolver.resolve_symbol(1), Some(0x7fff_1234_0000));
         assert_eq!(resolver.resolve_symbol(2), None);
-        // A TLS lookup against an empty layout is None (no defining module).
+        // A sym-0 TLS lookup with no own block is None (no self module).
         assert_eq!(resolver.resolve_tls_offset(0), None);
     }
 
     #[test]
     fn unresolved_tls_import_is_none() {
-        // The relocated object imports "errno" but no module in the layout defines it → None,
-        // which the applier turns into a typed UnresolvedSymbol (never a fabricated offset).
-        let dynsyms = vec![tls_undef("errno")];
+        // The relocated object imports "errno" (named, index 1) but no module in the layout defines
+        // it → None, which the applier turns into a typed UnresolvedSymbol (never a fabricated
+        // offset). The referencing object has no own PT_TLS (own_tp_offset None).
+        let dynsyms = vec![tls_undef(""), tls_undef("errno")];
         let mut layout = TlsLayout::new();
         layout
             .add_module(&seg(0, 0, 16, 8), &[], 0, &[tls_def("other", 0)])
             .unwrap();
         let inner = InnerFixed;
-        let resolver = TlsResolver::new(&inner, &dynsyms, &layout);
-        assert_eq!(resolver.resolve_tls_offset(0), None);
+        let resolver = TlsResolver::new(&inner, &dynsyms, &layout, None);
+        assert_eq!(resolver.resolve_tls_offset(1), None);
     }
 }

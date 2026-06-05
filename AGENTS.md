@@ -272,6 +272,40 @@ before any history-rewriting/force operation.
   init are the remaining INTEGRATION steps. NEXT = the dependency-graph object loader tying elf+map+resolve+tls together
   (load `DT_NEEDED` deps, build the cross-module scope + a multi-module TlsLayout, relocate in order), then the `%fs`/init
   integration tail (main-loop only for the apkenv-wiring).** See §6 (2026-06-05 static-TLS). Gate now **277 unit + 2 doctests**.
+  **2026-06-05 UPDATE — the DEPENDENCY-GRAPH LINKER (step 6a) is built + tested + PROVEN ON A REAL libm→libc→ld-linux
+  GRAPH:** `src/loader/link.rs` (`pub mod link;` in `src/loader.rs`) is the orchestrator that ties the four cores into the
+  actual dynamic linker. A `Linker` (search-path list + opt-in host fallback) `load(root)`s a whole graph: (1) **transitive
+  `DT_NEEDED` load** — BFS from the root, read+`elf::parse`+`map::map_and_relocate` (reserve+place PT_LOAD + base RELATIVE/
+  RELR) each object, **soname-deduped** (a diamond `A→B,C→D` loads D once) + **cycle-safe** (in-progress objects already
+  recorded, never re-entered), deterministic BFS load order; (2) **combined scope** — a `LoadedObjectProvider` per object in
+  BFS order (ELF first-wins = breadth order), optional `HostDlsymProvider` LAST (opt-in; **OFF** for the bionic load so host
+  glibc can't satisfy bionic imports) + a multi-module `TlsLayout` (`add_module` every object with PT_TLS); (3) **relocate
+  every object deps-first** — symbol relocs (GLOB_DAT/JUMP_SLOT/64) via the scope + static-TLS (TPOFF64) via the layout;
+  `IRELATIVE` counted as deferred (ifunc tail); unresolved-STRONG symbols **enumerated + recorded** (per object+index, ALL
+  of them), NEVER fabricated (an object with any has its symbol pass SKIPPED → no partial/inconsistent GOT). RAII: dropping
+  the `LoadedImageSet` munmaps the whole graph. `#![forbid(unsafe_code)]` (orchestration only; all unsafe stays in map.rs's
+  syscalls + resolve.rs's one dlsym). **ROOT-CAUSE FIX surfaced by the real graph:** `libc.so.6` has **15 self-referential
+  TPOFF64 with sym_index 0 (STN_UNDEF)** — relocations against libc's OWN thread-locals (addend = within-block offset). The
+  `tls::TlsResolver` only handled NAMED (cross-module) TLS symbols; sym-0 fell through to `tp_offset_of("")`→None→a typed
+  `UnresolvedSymbol(0)` that aborted libc's relocation. Per the x86-64 psABI (`R_X86_64_TPOFF64` = `S+A`, with `S` the
+  referencing module's own tp-relative base when the symbol is `STN_UNDEF`), `TlsResolver::new` now takes the object's OWN
+  module `tp_offset` (`Option<i64>`, None if no PT_TLS) and returns it for sym 0; `map::relocate_tls` threads it; the
+  orchestrator records each object's own module base from `add_module`. **The REAL test** (`load(/usr/lib/libm.so.6)` with
+  the standard host lib dirs, host fallback OFF; skips cleanly if absent) loads **3 objects** — libm (root) + libc + ld-linux
+  (deduped: libm AND libc both NEEDED it) — and fully relocates them: **0 unresolved-strong**, 110 GLOB_DAT (libm 32 + libc
+  78), 8 R_X86_64_64, **16 TPOFF64** (libm's 1 `errno` CROSS-MODULE into libc's PT_TLS + libc's 15 OWN-block sym-0), 1115
+  RELR, **46 IRELATIVE deferred** (libc 45 + ld-linux 1 — the documented ifunc tail, NOT a failure) — every count an exact
+  cross-check vs `readelf -r`. The cross-module errno TLS resolves to libc's loaded block (NOT host-dlsym), proving the
+  multi-module layout. **Tests (9 new; GPU/VM-free except the real one):** cross-object symbol resolves (root imports, dep
+  exports → GOT slot = dep_base+value), diamond soname-dedup (A,B,C,D — D once), missing-dep → typed `LinkError::Missing
+  Dependency`, deterministic BFS order (stable across 5 runs), cycle terminates (P↔Q each once), unresolved-strong recorded-
+  not-fabricated (no GOT write, host fallback off), Drop munmaps the whole graph (128× no leak) + the real libm graph + a
+  new tls sym-0 self-reference unit test. Also added a safe `MappedObject::read_u64` read accessor (confined unsafe in
+  map.rs) so link.rs's tests inspect a relocated GOT slot without unsafe. **Engine-load frontier: the dep-graph linker is
+  DONE — it loads + relocates a real multi-object glibc graph (libm→libc→ld-linux) modulo ifunc. NEXT = the runtime
+  integration tail: %fs/TCB binding (make the assembled TLS block reachable) + IRELATIVE ifunc execution + DT_INIT/
+  init_array, then point the linker at the APK's bionic libs toward `libroblox.so`** (main-loop / dev-host only for the
+  apkenv-wiring). See §6 (2026-06-05 dep-graph linker). Gate now **286 unit + 2 doctests**.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2799,6 +2833,37 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   --all-features -D warnings` + `test` (**277 unit + 2 doctests**) + `build --release` all 0-warning/0-error. Files:
   `src/loader/tls.rs` (new), `src/loader/map.rs` (`relocate_tls` + `TlsRelocStats` + real TPOFF64 test), `src/loader.rs`
   (`pub mod tls;` + module doc).
+- **2026-06-05 dep-graph linker** — Built `src/loader/link.rs`, the **dependency-graph object loader** (step 6a): the
+  orchestrator that ties elf+map+resolve+tls into the actual dynamic linker. A `Linker` (search paths + opt-in host
+  fallback) `load(root)`s a whole graph — transitive `DT_NEEDED` BFS load, **soname-deduped** (diamond loads a shared dep
+  once) + **cycle-safe**, deterministic load order; a combined global symbol `Scope` (a `LoadedObjectProvider` per object,
+  ELF first-wins = breadth order, optional `HostDlsymProvider` LAST/opt-in **OFF** for bionic) + a multi-module `TlsLayout`;
+  then relocates every object deps-first (GLOB_DAT/JUMP_SLOT/64 via the scope, TPOFF64 via the layout), counting IRELATIVE
+  deferred (ifunc tail) and **recording** unresolved-STRONG symbols (enumerated, never fabricated; the symbol pass is
+  SKIPPED for an object with any → no partial GOT). RAII: dropping the `LoadedImageSet` munmaps the whole graph.
+  `#![forbid(unsafe_code)]` (orchestration only). **Root-cause fix the real graph surfaced:** `libc.so.6`'s **15
+  self-referential `R_X86_64_TPOFF64` with `sym_index 0` (STN_UNDEF)** — relocations against libc's OWN thread-locals — were
+  unresolvable by the cross-module-only `TlsResolver` (sym-0 → `tp_offset_of("")` → None → typed `UnresolvedSymbol(0)`
+  abort). Per the x86-64 psABI (`TPOFF64 = S + A`; `S` = the referencing module's own tp base when the symbol is
+  `STN_UNDEF`), `tls::TlsResolver::new` now takes the object's OWN module `tp_offset` (`Option<i64>`) and returns it for sym
+  0; `map::relocate_tls` threads it; `link.rs` records each object's own base from `add_module`. (Two existing tls.rs tests
+  that unrealistically placed a NAMED import at index 0 were corrected to index ≥1 — index 0 is ALWAYS the reserved null
+  symbol — and a sym-0 self-reference test added.) Added a safe `MappedObject::read_u64` accessor (confined unsafe in
+  map.rs) so the link tests inspect a relocated GOT slot without unsafe. **REAL proof** (`load(/usr/lib/libm.so.6)`, host
+  lib dirs, host fallback OFF, skips if absent): **3 objects** — libm→libc→ld-linux (ld-linux **deduped**) — fully
+  relocate; **0 unresolved-strong**; 110 GLOB_DAT, 8 ABS64, **16 TPOFF64** (libm's `errno` CROSS-MODULE into libc's block +
+  libc's 15 own-block sym-0), 1115 RELR, **46 IRELATIVE deferred** (the documented ifunc tail) — exact cross-check vs
+  `readelf -r`. **Grounding (cyber-safeguard honored):** written ONLY from the PUBLIC System V gABI dynamic-linking model
+  (DT_NEEDED transitive load, soname dedup, global breadth-first first-wins scope, dependency-order relocation) + the x86-64
+  psABI TLS rule + Eclipse's own `src/loader/` cores. **No apkenv/bionic LINKER source, no ATL/bionic/glibc source was
+  read** — loading/parsing real `.so` files as DATA + applying relocations over Eclipse's own from-scratch Rust is benign.
+  **The clean-room dep-graph linker is confirmed SUBAGENT-FEASIBLE — it did NOT trip the cyber-safeguard.** **NEXT = the
+  runtime integration tail:** `%fs`/TCB binding (make the assembled TLS block reachable) + IRELATIVE ifunc execution +
+  DT_INIT/init_array, then point the linker at the APK's bionic libs toward `libroblox.so` (main-loop / dev-host only).
+  **Gate:** `cargo fmt --all --check` + `build --all-targets` + `clippy --all-targets --all-features -D warnings` + `test`
+  (**286 unit + 2 doctests**) + `build --release` all 0-warning/0-error. Files: `src/loader/link.rs` (new), `src/loader/
+  tls.rs` (`TlsResolver` own-module sym-0 path + tests), `src/loader/map.rs` (`relocate_tls` own-tp-offset param +
+  `read_u64`), `src/loader.rs` (`pub mod link;` + module doc).
 
 ---
 

@@ -53,9 +53,18 @@
 //! bind the block to a live thread pointer (`%fs`/TCB) — that is a separate integration step (see
 //! `tls.rs` and AGENTS.md §5).**
 //!
+//! [`link`] — the **dependency-graph orchestrator** built on the four cores: given a root `.so`,
+//! it transitively loads the `DT_NEEDED` graph (BFS, soname-deduped, cycle-safe), builds the
+//! combined cross-object symbol [`resolve::Scope`] + a multi-module [`tls::TlsLayout`], and
+//! relocates every loaded object against that global scope (base + symbol + static-TLS). It counts
+//! `IRELATIVE` as deferred (the ifunc tail), records unresolved-strong symbols without fabricating
+//! addresses, and RAII-`munmap`s the whole graph on drop. It maps + relocates; it does **not** bind
+//! `%fs`/TCB, execute ifunc resolvers, or run init — the documented runtime integration tail.
+//!
 //! `elf.rs` decodes the file format; `reloc.rs` applies relocations; `map.rs` lays the segments
 //! out and drives both base and (via `resolve.rs`) symbol relocations — a clean boundary (the
-//! decoded `reloc::Rela` is the applier's input type, with no glue).
+//! decoded `reloc::Rela` is the applier's input type, with no glue). `link.rs` ties them into a
+//! whole-graph loader.
 //!
 //! ## What this module deliberately does NOT do (the broader loader, built on this core)
 //! This is the **decode + map + relocate core**, not a full working loader. It assembles the
@@ -69,6 +78,7 @@
 //! false-positives on linker work).
 
 pub mod elf;
+pub mod link;
 pub mod map;
 pub mod reloc;
 pub mod resolve;
