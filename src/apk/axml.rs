@@ -30,6 +30,7 @@ use std::fmt;
 // --- ResChunk_header types (the `type` field) ---------------------------------------------
 const RES_STRING_POOL_TYPE: u16 = 0x0001;
 const RES_XML_TYPE: u16 = 0x0003;
+const RES_XML_RESOURCE_MAP_TYPE: u16 = 0x0180;
 const RES_XML_START_NAMESPACE_TYPE: u16 = 0x0100;
 const RES_XML_END_NAMESPACE_TYPE: u16 = 0x0101;
 const RES_XML_START_ELEMENT_TYPE: u16 = 0x0102;
@@ -259,6 +260,10 @@ pub fn parse_document(bytes: &[u8]) -> Result<XmlDocument, AxmlError> {
         return Err(AxmlError::NoXmlRoot);
     }
     let pool = find_string_pool(&root)?;
+    // The optional resource-map chunk maps attribute name string-index → framework resource id, so
+    // parse_full_element can populate XmlAttribute.name_resource (the id the framework's
+    // retrieveAttributes matches against). Absent ⇒ empty ⇒ ids stay 0 (never fabricated).
+    let resource_map = find_resource_map(&root)?;
 
     let mut doc = XmlDocument {
         events: Vec::new(),
@@ -278,7 +283,7 @@ pub fn parse_document(bytes: &[u8]) -> Result<XmlDocument, AxmlError> {
                 if depth > MAX_DEPTH {
                     return Err(AxmlError::TooDeep);
                 }
-                let element = parse_full_element(&child, &pool)?;
+                let element = parse_full_element(&child, &pool, &resource_map)?;
                 let idx = doc.elements.len();
                 doc.elements.push(element);
                 doc.events.push(XmlEventKind::StartTag(idx));
@@ -337,7 +342,11 @@ fn matching_start_index(events: &[XmlEventKind]) -> Option<usize> {
 /// Parse a start-element chunk into a fully-resolved [`XmlElement`] (tag + ns + all attributes with
 /// raw type/data). Mirrors [`parse_start_element`]'s bounds checks but keeps every attribute and its
 /// `Res_value` type/data so the parser natives can report them.
-fn parse_full_element(chunk: &Chunk, pool: &StringPool) -> Result<XmlElement, AxmlError> {
+fn parse_full_element(
+    chunk: &Chunk,
+    pool: &StringPool,
+    resource_map: &[u32],
+) -> Result<XmlElement, AxmlError> {
     let buf = chunk.bytes;
     let line = read_u32(buf, 8)?; // ResXMLTree_node.lineNumber (offset 8 within the node).
     let ext = XML_NODE_HEADER_SIZE;
@@ -384,14 +393,18 @@ fn parse_full_element(chunk: &Chunk, pool: &StringPool) -> Result<XmlElement, Ax
         } else {
             None
         };
+        // 2026-06-05: the attribute's framework resource id comes from the resource-map chunk,
+        // indexed by the attribute NAME string index (`a_name_ref`): `resource_map[a_name_ref]`. An
+        // index past the (possibly absent/short) map ⇒ 0 ("not a framework resource attribute"),
+        // never a fabricated id. This is what the framework's retrieveAttributes matches against.
+        let name_resource = usize::try_from(a_name_ref)
+            .ok()
+            .and_then(|i| resource_map.get(i).copied())
+            .unwrap_or(0);
         attributes.push(XmlAttribute {
             namespace: a_ns,
             name: a_name,
-            // The attribute's resource id is not in the string pool; aapt stores it in the
-            // resource-map chunk indexed by attribute position. We don't decode that chunk here
-            // (the framework reads framework-resource attrs by name in this asset), so report 0 —
-            // never a fabricated id. A later increment can decode RES_XML_RESOURCE_MAP_TYPE.
-            name_resource: 0,
+            name_resource,
             value_type,
             value_data,
             value_string,
@@ -652,6 +665,44 @@ fn find_string_pool<'a>(root: &Chunk<'a>) -> Result<StringPool<'a>, AxmlError> {
         }
     }
     Err(AxmlError::NoStringPool)
+}
+
+/// Decode the optional `RES_XML_RESOURCE_MAP_TYPE` chunk into the resource-id array.
+///
+/// 2026-06-05: aapt does not store an attribute's framework resource id in the AXML node; instead it
+/// emits one `RES_XML_RESOURCE_MAP_TYPE` chunk whose body is a flat `u32[]` of resource ids, parallel
+/// to the string pool: the attribute whose **name** is string index `i` has resource id
+/// `resource_map[i]` (AOSP `ResXMLParser::getAttributeNameResID` does exactly this lookup). The chunk
+/// is optional — a manifest may omit it, in which case attribute resource ids are simply unknown
+/// (`0`), never fabricated. Returns an empty `Vec` when the chunk is absent.
+///
+/// Each id is read with the same bounds-checked [`read_u32`] as everything else, so a truncated or
+/// malformed chunk yields a typed [`AxmlError`], never a panic (totality preserved). The number of
+/// ids is `(chunk size - headerSize) / 4`, clamped to what actually fits in the chunk body.
+fn find_resource_map(root: &Chunk<'_>) -> Result<Vec<u32>, AxmlError> {
+    for child in root.children() {
+        let child = child?;
+        if child.kind != RES_XML_RESOURCE_MAP_TYPE {
+            continue;
+        }
+        let buf = child.bytes;
+        // The id array is the chunk body (after headerSize). Each entry is a 4-byte resource id.
+        let body_start = child.header_size;
+        if body_start > buf.len() {
+            return Err(AxmlError::Truncated);
+        }
+        let count = (buf.len() - body_start) / 4;
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = body_start
+                .checked_add(i.checked_mul(4).ok_or(AxmlError::Overflow)?)
+                .ok_or(AxmlError::Overflow)?;
+            ids.push(read_u32(buf, off)?);
+        }
+        return Ok(ids);
+    }
+    // No resource-map chunk: attribute resource ids are unknown (0), never fabricated.
+    Ok(Vec::new())
 }
 
 /// A typed attribute value, decoded from a `Res_value` for the fields we care about.
@@ -939,4 +990,183 @@ fn read_u32(buf: &[u8], off: usize) -> Result<u32, AxmlError> {
     let b = buf.get(off..end).ok_or(AxmlError::Truncated)?;
     let arr: [u8; 4] = b.try_into().map_err(|_| AxmlError::Truncated)?;
     Ok(u32::from_le_bytes(arr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 2026-06-05: regression guard tied to the confirmed root cause that broke retrieveAttributes —
+    // attribute resource ids (XmlAttribute.name_resource) were always 0 because the
+    // RES_XML_RESOURCE_MAP_TYPE chunk was not decoded, so the framework's retrieveAttributes (which
+    // matches requested ids against name_resource) found nothing and `<activity>`'s android:name was
+    // unreadable. This builds a minimal in-memory AXML carrying a resource-map chunk and asserts
+    // parse_document now populates name_resource from it (index = the attribute NAME string index).
+    //
+    // Layout helpers: build little-endian chunks by hand per the format in this module's docs.
+
+    fn u16b(buf: &mut Vec<u8>, v: u16) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u32b(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Build a UTF-8 string-pool chunk for the given strings (each < 128 bytes so the length fields
+    /// are single-byte), returning the chunk bytes. The string order defines each string's index.
+    fn build_utf8_string_pool(strings: &[&str]) -> Vec<u8> {
+        // Encode the string data (offset table is relative to data_start).
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        for s in strings {
+            offsets.push(data.len() as u32);
+            let bytes = s.as_bytes();
+            data.push(bytes.len() as u8); // char count (ASCII: == byte count)
+            data.push(bytes.len() as u8); // byte count
+            data.extend_from_slice(bytes);
+            data.push(0); // trailing NUL
+        }
+        let header_size = STRING_POOL_HEADER_SIZE; // 28
+        let offsets_len = offsets.len() * 4;
+        let strings_start = header_size + offsets_len; // relative to chunk start
+        let total = strings_start + data.len();
+
+        let mut chunk = Vec::new();
+        u16b(&mut chunk, RES_STRING_POOL_TYPE);
+        u16b(&mut chunk, header_size as u16);
+        u32b(&mut chunk, total as u32);
+        u32b(&mut chunk, strings.len() as u32); // stringCount
+        u32b(&mut chunk, 0); // styleCount
+        u32b(&mut chunk, UTF8_FLAG); // flags: UTF-8
+        u32b(&mut chunk, strings_start as u32); // stringsStart
+        u32b(&mut chunk, 0); // stylesStart
+        for o in &offsets {
+            u32b(&mut chunk, *o);
+        }
+        chunk.extend_from_slice(&data);
+        chunk
+    }
+
+    /// Build a RES_XML_RESOURCE_MAP_TYPE chunk from the given resource-id array (parallel to the
+    /// string pool by index).
+    fn build_resource_map(ids: &[u32]) -> Vec<u8> {
+        let total = CHUNK_HEADER_SIZE + ids.len() * 4;
+        let mut chunk = Vec::new();
+        u16b(&mut chunk, RES_XML_RESOURCE_MAP_TYPE);
+        u16b(&mut chunk, CHUNK_HEADER_SIZE as u16);
+        u32b(&mut chunk, total as u32);
+        for id in ids {
+            u32b(&mut chunk, *id);
+        }
+        chunk
+    }
+
+    /// Build a RES_XML_START_ELEMENT_TYPE chunk with one attribute (the layout this reader parses).
+    fn build_start_element(
+        name_ref: u32,
+        attr_name_ref: u32,
+        value_type: u8,
+        value_data: u32,
+    ) -> Vec<u8> {
+        // node header (16) + element ext + 1 attribute (20).
+        let attr_start: u16 = 20; // attrs begin 20 bytes after the ext (node offset 16+20 = 36).
+        let attr_size: u16 = ATTRIBUTE_MIN_SIZE as u16; // 20
+        let mut chunk = Vec::new();
+        u16b(&mut chunk, RES_XML_START_ELEMENT_TYPE);
+        u16b(&mut chunk, XML_NODE_HEADER_SIZE as u16); // headerSize 16
+        let size_pos = chunk.len();
+        u32b(&mut chunk, 0); // size, patched below
+        u32b(&mut chunk, 1); // lineNumber
+        u32b(&mut chunk, NO_STRING); // comment ref
+                                     // --- ResXMLTree_attrExt (the "ext" the reader reads from offset 16) ---
+        u32b(&mut chunk, NO_STRING); // ns ref (no namespace)
+        u32b(&mut chunk, name_ref); // element name ref
+        u16b(&mut chunk, attr_start); // attributeStart
+        u16b(&mut chunk, attr_size); // attributeSize
+        u16b(&mut chunk, 1); // attributeCount
+        u16b(&mut chunk, 0); // idIndex
+        u16b(&mut chunk, 0); // classIndex
+        u16b(&mut chunk, 0); // styleIndex
+                             // attrExt is 20 bytes (ns+name+attrStart+attrSize+attrCount+idIndex+classIndex+styleIndex),
+                             // so with attr_start=20 the attributes follow immediately (node offset 16+20 = 36).
+                             // --- one ResXMLTree_attribute (20 bytes) ---
+        u32b(&mut chunk, NO_STRING); // attr ns ref
+        u32b(&mut chunk, attr_name_ref); // attr name ref (index into string pool)
+        u32b(
+            &mut chunk,
+            if value_type == TYPE_STRING {
+                value_data
+            } else {
+                NO_STRING
+            },
+        ); // rawValue ref
+        u16b(&mut chunk, 8); // Res_value.size
+        chunk.push(0); // Res_value.res0
+        chunk.push(value_type); // Res_value.dataType (offset 15)
+        u32b(&mut chunk, value_data); // Res_value.data (offset 16)
+        let total = chunk.len() as u32;
+        chunk[size_pos..size_pos + 4].copy_from_slice(&total.to_le_bytes());
+        chunk
+    }
+
+    /// Wrap children in a RES_XML_TYPE root chunk.
+    fn build_axml(children: &[&[u8]]) -> Vec<u8> {
+        let body: usize = children.iter().map(|c| c.len()).sum();
+        let total = CHUNK_HEADER_SIZE + body;
+        let mut buf = Vec::new();
+        u16b(&mut buf, RES_XML_TYPE);
+        u16b(&mut buf, CHUNK_HEADER_SIZE as u16);
+        u32b(&mut buf, total as u32);
+        for c in children {
+            buf.extend_from_slice(c);
+        }
+        buf
+    }
+
+    #[test]
+    fn parse_document_populates_name_resource_from_resource_map() {
+        // Strings: [0]="activity", [1]="name", [2]="MyActivity". The resource map gives string index
+        // 1 ("name") the framework id android.R.attr.name = 0x01010003 (what retrieveAttributes
+        // requests). The attribute's name_ref is 1, so name_resource must resolve to 0x01010003.
+        let pool = build_utf8_string_pool(&["activity", "name", "MyActivity"]);
+        let resmap = build_resource_map(&[0x0000_0000, 0x0101_0003, 0x0000_0000]);
+        let elem = build_start_element(0, 1, TYPE_STRING, 2); // name="activity", attr name idx 1, value idx 2
+        let axml = build_axml(&[&pool, &resmap, &elem]);
+
+        let doc = parse_document(&axml).expect("parse minimal axml with resource map");
+        let activity = doc
+            .elements
+            .iter()
+            .find(|e| e.name.as_deref() == Some("activity"))
+            .expect("activity element");
+        let name_attr = activity
+            .attributes
+            .iter()
+            .find(|a| a.name.as_deref() == Some("name"))
+            .expect("name attribute");
+        // The root-cause fix: name_resource is now the resource-map id, not 0.
+        assert_eq!(
+            name_attr.name_resource, 0x0101_0003,
+            "name_resource must come from the resource-map chunk (was always 0 before the fix)"
+        );
+        assert_eq!(name_attr.value_type, TYPE_STRING);
+        assert_eq!(name_attr.value_string.as_deref(), Some("MyActivity"));
+    }
+
+    #[test]
+    fn parse_document_name_resource_zero_when_no_resource_map() {
+        // No resource-map chunk ⇒ name_resource stays 0 (never fabricated) — the documented absent
+        // case. Same element, but no resource map between the pool and the element.
+        let pool = build_utf8_string_pool(&["activity", "name", "MyActivity"]);
+        let elem = build_start_element(0, 1, TYPE_STRING, 2);
+        let axml = build_axml(&[&pool, &elem]);
+
+        let doc = parse_document(&axml).expect("parse minimal axml without resource map");
+        let activity = doc
+            .elements
+            .iter()
+            .find(|e| e.name.as_deref() == Some("activity"))
+            .expect("activity element");
+        assert_eq!(activity.attributes[0].name_resource, 0, "absent map ⇒ id 0");
+    }
 }

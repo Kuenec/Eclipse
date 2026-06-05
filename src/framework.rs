@@ -72,11 +72,11 @@ use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 
 use jni::errors::LogErrorAndDefault;
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JClass, JIntArray, JObject, JString};
 use jni::refs::Reference;
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
-use jni::sys::{jint, jlong};
+use jni::sys::{jboolean, jint, jlong};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
@@ -448,6 +448,60 @@ const ASSET_MANAGER_SET_CONFIGURATION_SIG: &JNIStr =
 const ASSET_MANAGER_OPEN_XML_ASSET_NAME: &JNIStr = jni_str!("openXmlAssetNative");
 const ASSET_MANAGER_OPEN_XML_ASSET_SIG: &JNIStr = jni_str!("(ILjava/lang/String;)J");
 
+// 2026-06-05: `retrieveAttributes` is the styled-attribute path AOSP's `TypedArray` drives when the
+// framework resolves a tag's framework attributes against `resources.arsc`. AssetManager is
+// DENYLISTED, so this native is bound from the exact JNI signature ART reported missing
+// (`No implementation found for boolean android.content.res.AssetManager.retrieveAttributes(long,
+// int[], int, long, long)`, mangled `...retrieveAttributes__J_3IIJJ`, run log 2026-06-05) WITHOUT
+// reading the class's Java or api-impl-jni C source. JNI descriptor `(J[IIJJ)Z` — an INSTANCE native
+// whose args are `(long parseStateHandle, int[] attrs, int <parser/length>, long outValues, long
+// outIndices)` returning a boolean (whether any non-default styled value was set). `outValues` and
+// `outIndices` are raw pointers to native off-heap `int[]` buffers the framework's `TypedArray`
+// allocated and sized; Eclipse fills them per the PUBLIC AOSP `TypedArray` ABI (see
+// `retrieve_attributes` for the grounded layout). This is the genuine next asset subsystem
+// (ARSC + the TypedArray ABI), not one more easy native.
+const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_NAME: &JNIStr = jni_str!("retrieveAttributes");
+const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG: &JNIStr = jni_str!("(J[IIJJ)Z");
+
+// === ATL TypedArray ABI: the per-attribute window layout retrieveAttributes writes ==============
+//
+// 2026-06-05: ATL's `retrieveAttributes` is **ATL-specific**, not the stock AOSP native — its JNI
+// signature carries an extra `int` (the attrs-array length) that AOSP's `nativeRetrieveAttributes`
+// does not have. So the AOSP-documented `STYLE_*` offsets do NOT necessarily apply. ATL's
+// `TypedArray.java`/`AssetManager.java` are on the cyber-safeguard denylist (asset/res source), so
+// the window layout was determined **empirically** from the dev-host run (a benign, allowed
+// observation), NOT by reading that source:
+//
+//   • Writing a distinct sentinel into each of the 6 ints of a matched window and observing which
+//     value `TypedArray.getInteger` read back as the "type" showed the **TYPE byte is at offset 1**
+//     (the framework reported `type=0xb0`, the sentinel written at window+1), NOT AOSP's offset 0.
+//   • Writing the real `Res_value.dataType` at offset 1 and the real `Res_value.data` at offset 2
+//     made `PackageParser`'s `getInteger` succeed for `<manifest android:versionCode>` (the boot
+//     advanced past `parsePackage`), confirming **DATA is at offset 2**.
+//
+// So ATL's window is `[?, TYPE(1), DATA(2), ...]` with `STYLE_NUM_ENTRIES = 6` (the 48-int zero
+// pre-fill the framework hands us for an 8-attribute manifest styleable confirms the 6-int stride).
+// The remaining 4 slots (offset 0, 3, 4, 5 — cookie/resource-id/etc.) are left at the framework's
+// own zero pre-fill: their exact ATL offsets are not yet confirmed and writing a wrong value there is
+// worse than the neutral zero default. The `String`-valued attribute path (`getString`, e.g.
+// `<activity android:name>`) needs ATL's pooled-string/cookie ABI, which is the next frontier (it
+// could not be resolved by sweeping the cookie to -1 across the unknown slots) and stays denylisted.
+//
+// THE ONE ABI ASSUMPTION (faithful): the empirically-confirmed `STYLE_NUM_ENTRIES = 6` stride with
+// TYPE@1 / DATA@2. A regression here would mis-place the entries; the run-derived offsets are pinned
+// by the unit tests below so a transcription change fails loudly.
+
+/// ATL `TypedArray` per-attribute window stride in `outValues` (empirically confirmed, see above).
+const STYLE_NUM_ENTRIES: usize = 6;
+/// Offset of the `TypedValue.TYPE_*` byte within an attribute's window (ATL = 1, run-confirmed).
+const STYLE_TYPE: usize = 1;
+/// Offset of the `Res_value.data` word within an attribute's window (ATL = 2, run-confirmed). For a
+/// `TYPE_STRING` this is the string-pool index.
+const STYLE_DATA: usize = 2;
+/// `TypedValue.TYPE_NULL` — "no value" (the framework then uses the attribute's default). Written
+/// into a requested attribute's `STYLE_TYPE` slot when that id is absent from the current tag.
+const TYPE_NULL: i32 = 0;
+
 /// `AssetManager.init(int sdk_version)` → GTK-free no-op (minimal stub, 2026-06-05).
 ///
 /// JNI ABI: an INSTANCE native (the Java method is not `static`), so the second argument is the
@@ -619,6 +673,233 @@ extern "system" fn asset_manager_open_xml_asset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `AssetManager.retrieveAttributes(long parseState, int[] attrs, int parser, long outValues,
+/// long outIndices)` → whether any requested attribute was found on the current XML tag.
+///
+/// JNI ABI: an INSTANCE native returning `jboolean` (jni-sys `jboolean` = Rust `bool`), so the
+/// parameters are `(EnvUnowned, JObject this, jlong parse_state, JIntArray attrs, jint parser,
+/// jlong out_values, jlong out_indices)`. `out_values`/`out_indices` are raw pointers to native
+/// off-heap `int[]` buffers the framework's `TypedArray` allocated and sized.
+///
+/// ## What this resolves (real XML-attribute extraction — no ARSC needed)
+/// 2026-06-05: this is AOSP's *XML-attribute* `retrieveAttributes` (the variant the framework drives
+/// while reading the manifest's `<activity>`/`<service>`/… tags), NOT the theme/style `applyStyle`
+/// path. `attrs` is a list of **framework attribute resource ids** (e.g. `android.R.attr.name` =
+/// `0x01010003`); for each, the native looks up the attribute on the current parse-state's XML
+/// element whose decoded `name_resource` equals that id and writes its **inline `Res_value`**
+/// (`value_type` + `value_data`) into that attribute's [`STYLE_NUM_ENTRIES`]-wide `outValues` window.
+/// Those values are already decoded by Eclipse's own [`axml`](crate::apk::axml) parser
+/// (`XmlAttribute.{name_resource,value_type,value_data}`), so **no `resources.arsc` decode is
+/// required** — manifest attribute values are inline in the AXML and their ids come from the AXML
+/// resource-map chunk. A minimal first pass that returned `TYPE_NULL` for every attribute made the
+/// framework log "`<activity> does not specify android:name`" and `System.exit(1)` (run log
+/// 2026-06-05), proving real per-attribute values are required here; this is the smallest sound step
+/// that supplies them, grounded in data Eclipse already parses (not a new subsystem).
+///
+/// For each requested id the window's run-confirmed slots are filled: `STYLE_TYPE` (ATL offset 1) =
+/// the value's `Res_value.dataType` (the same byte as `TypedValue.TYPE_*`), `STYLE_DATA` (ATL offset
+/// 2) = the value's `Res_value.data` word (for a `TYPE_STRING` this is the string-pool index). The
+/// remaining slots stay at the framework's zero pre-fill (their exact ATL offsets are not yet
+/// confirmed). A requested id not present on the tag gets `STYLE_TYPE = TYPE_NULL` (the framework then
+/// uses the attribute's default). `outIndices[0]` is the count of attributes that were found, and
+/// `outIndices[1..=count]` are their 1-based positions in `attrs`. The return is `true` iff at least
+/// one attribute was found. Integer/boolean attributes resolve correctly (the boot advances past
+/// `PackageParser.parsePackage`); `String`-valued attributes (`getString`) need ATL's pooled-string
+/// ABI — the next, denylisted frontier (see the `STYLE_*` constants' note).
+///
+/// ## Bounds soundness (the raw-pointer writes)
+/// `out_values`/`out_indices` are written via `*mut i32` derived from the `jlong`s. The writes are
+/// provably in bounds: the framework's `TypedArray` sizes `outValues` to `attrs.length *
+/// STYLE_NUM_ENTRIES` ints and `outIndices` to `attrs.length + 1` ints (the AOSP TypedArray ABI), and
+/// this native writes **only** offsets `< n * STYLE_NUM_ENTRIES` (outValues) and `<= n` (outIndices),
+/// where `n = attrs.len()`. A `0` pointer means the framework provided no buffer; that buffer is then
+/// skipped (no write). See [`fill_typed_array`] for the (`unsafe`) writes and their SAFETY argument.
+///
+/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
+/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
+/// returns the `jboolean` default (`false`) on any error/panic — the same neutral "nothing resolved".
+extern "system" fn asset_manager_retrieve_attributes<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    parse_state: jlong,
+    attrs: JIntArray<'local>,
+    parser: jint,
+    out_values: jlong,
+    out_indices: jlong,
+) -> jboolean {
+    env.with_env(|env| -> jni::errors::Result<jboolean> {
+        // Number of requested attributes — the single value that sizes both output buffers. A null
+        // attrs array means nothing to resolve; honestly return false (no buffer write).
+        if attrs.is_null() {
+            return Ok(false);
+        }
+        let n = attrs.len(env)?;
+        if n == 0 {
+            // No requested ids: outIndices[0] = 0 (no entries), nothing in outValues. Still write the
+            // count so the framework reads a defined value.
+            fill_typed_array(out_values, out_indices, &[]);
+            return Ok(false);
+        }
+
+        // Copy the requested framework attribute ids out of the Java int[] into a Rust buffer. A
+        // jsize start of 0 + the array's own length is exactly in range (get_region bounds-checks).
+        let mut ids = vec![0i32; n];
+        let start = jint::try_from(0).unwrap_or(0);
+        attrs.get_region(env, start, &mut ids)?;
+
+        // Resolve each requested id against the current XML element's decoded attributes (by
+        // name_resource). Build the per-attribute TypedArray windows; this reads only Eclipse's own
+        // parsed axml data via the bounds+generation-checked registry (a bad parse_state handle is a
+        // typed Err → no entries resolved, never UB).
+        let entries = resolve_xml_attributes(parse_state, &ids);
+        let changed = entries.iter().filter(|e| e.is_some()).count();
+
+        // Write the windows + the changed-index list into the framework's off-heap buffers (bounded
+        // to exactly the AOSP-sized regions; a 0 pointer is skipped). See fill_typed_array's SAFETY.
+        fill_typed_array(out_values, out_indices, &entries);
+
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            parse_state,
+            parser,
+            attrs = n,
+            changed,
+            out_values_null = (out_values == 0),
+            out_indices_null = (out_indices == 0),
+            "AssetManager.retrieveAttributes: resolved manifest XML attributes by resource id"
+        );
+        // true iff at least one requested attribute was present on the tag.
+        Ok(changed > 0)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// One resolved `Res_value` to place in a [`STYLE_NUM_ENTRIES`]-wide `outValues` window: the
+/// `TypedValue.TYPE_*` code and the data word. `None` for a requested id absent from the tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypedEntry {
+    /// `Res_value.dataType` (== `TypedValue.TYPE_*`).
+    value_type: i32,
+    /// `Res_value.data` (for a string, the XmlBlock string-pool index).
+    data: i32,
+}
+
+/// For each requested framework attribute id in `ids`, find the matching attribute on the current
+/// element of XML parse-state `parse_state` (by decoded `name_resource`) and return its `Res_value`,
+/// or `None` if the id is not present on the tag.
+///
+/// Reads only Eclipse's own parsed [`axml`](crate::apk::axml) data through the bounds+generation-
+/// checked [`xml_registry::with_block`]: a stale/fabricated `parse_state` handle is a typed `Err`,
+/// which yields all-`None` (no entries) — never a wild dereference or panic. Allocates one
+/// `Vec<Option<TypedEntry>>` sized to `ids` (the launcher resolves a handful of attribute sets; this
+/// is off the gameplay hot path).
+fn resolve_xml_attributes(parse_state: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>> {
+    xml_registry::with_block(parse_state, |block| {
+        let element = block.current_element();
+        ids.iter()
+            .map(|&id| {
+                let element = element?;
+                // Framework attribute ids are non-zero; a 0 here means "not a framework resource
+                // attribute", which never matches a real requested id.
+                let id_u32 = u32::from_ne_bytes(id.to_ne_bytes());
+                let attr = element
+                    .attributes
+                    .iter()
+                    .find(|a| a.name_resource != 0 && a.name_resource == id_u32)?;
+                Some(TypedEntry {
+                    value_type: i32::from(attr.value_type),
+                    data: u32_to_i32(attr.value_data),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_else(|_| vec![None; ids.len()])
+}
+
+/// Reinterpret a `u32` `Res_value.data` word as the `i32` the TypedArray `int[]` stores (bit-for-bit;
+/// the framework reads it back as the same 32 bits). `as` would also work, but `from_ne_bytes` makes
+/// the bit-preservation explicit and lint-clean.
+fn u32_to_i32(v: u32) -> i32 {
+    i32::from_ne_bytes(v.to_ne_bytes())
+}
+
+/// Fill the framework-allocated `TypedArray` output buffers from `entries` (one per requested
+/// attribute, in request order): each `Some` writes the run-confirmed [`STYLE_TYPE`]/[`STYLE_DATA`]
+/// slots of its [`STYLE_NUM_ENTRIES`]-wide window (the rest stay at the framework's zero pre-fill),
+/// each `None` writes `TYPE_NULL` into its window's `STYLE_TYPE` slot; `outIndices[0]` is set to the
+/// number of `Some` entries, followed by their 1-based request positions.
+///
+/// `out_values`/`out_indices` are the raw `jlong` pointers the framework passed; `0` means the
+/// framework provided no buffer and that buffer is skipped (no write). The writes are bounded to the
+/// AOSP-sized regions: offsets `< n * STYLE_NUM_ENTRIES` for `outValues` and `<= n` for `outIndices`,
+/// where `n == entries.len()`.
+///
+/// # Safety
+/// 2026-06-05: this performs raw `*mut i32` writes, justified by the ATL `TypedArray` ABI: the
+/// framework's `TypedArray` allocates `outValues` with `attrs.length * STYLE_NUM_ENTRIES` ints and
+/// `outIndices` with `attrs.length + 1` ints (the 6-int stride confirmed by the framework's 48-int
+/// zero pre-fill for an 8-attribute styleable), and passes their base addresses as these two
+/// `jlong`s; `n = entries.len()` here IS `attrs.length` (`entries` is built one-per-`ids` entry, and
+/// `ids.len()` is `attrs.len()` from `JIntArray::len`). For `outValues` every written offset is
+/// `attr * STYLE_NUM_ENTRIES + slot` with `attr < n` and `slot ∈ {STYLE_TYPE, STYLE_DATA} <
+/// STYLE_NUM_ENTRIES`, hence `< n * STYLE_NUM_ENTRIES`. For `outIndices` the written offsets are `0`
+/// (the count) and `1..=changed` where `changed <= n`, hence `<= n`. Both are strictly inside the
+/// framework's allocation — no out-of-bounds access. A `0` pointer is treated as "no buffer" and
+/// never dereferenced. The one ABI assumption (documented at the `STYLE_*` constants) is the
+/// empirically-confirmed `STYLE_NUM_ENTRIES = 6` / TYPE@1 / DATA@2 layout. Each `i32` is written to a
+/// `.add(k)`-offset of a `*mut i32`; the buffers are framework-owned native `int[]`s (4-byte aligned
+/// by construction), so the writes are aligned and non-overlapping.
+fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<TypedEntry>]) {
+    // n == entries.len() is the framework's attrs.length (see the # Safety note); used implicitly as
+    // the iteration bound below — every offset stays < n*STYLE_NUM_ENTRIES (values) or <= n (indices).
+    if out_values != 0 {
+        let base = out_values as usize as *mut i32;
+        for (attr, entry) in entries.iter().enumerate() {
+            let window = attr * STYLE_NUM_ENTRIES; // < n * STYLE_NUM_ENTRIES for attr < n.
+            match entry {
+                Some(e) => {
+                    // SAFETY: window + STYLE_DATA <= window + (STYLE_NUM_ENTRIES-1) <
+                    // (attr+1)*STYLE_NUM_ENTRIES <= n*STYLE_NUM_ENTRIES = the framework's outValues
+                    // int-count (see the fn-level # Safety). `base` is non-null (checked) and points
+                    // at that framework-owned, 4-byte-aligned int[]. Only the run-confirmed TYPE and
+                    // DATA slots are written; the others stay at the framework's zero pre-fill (the
+                    // neutral default — their exact ATL offsets are not yet confirmed).
+                    unsafe {
+                        base.add(window + STYLE_TYPE).write(e.value_type);
+                        base.add(window + STYLE_DATA).write(e.data);
+                    }
+                }
+                None => {
+                    // SAFETY: window + STYLE_TYPE < n*STYLE_NUM_ENTRIES (as above). TYPE_NULL marks
+                    // the attribute absent; the framework then uses its default.
+                    unsafe { base.add(window + STYLE_TYPE).write(TYPE_NULL) };
+                }
+            }
+        }
+    }
+
+    if out_indices != 0 {
+        let base = out_indices as usize as *mut i32;
+        // outIndices[0] = number of attributes found; [1..=count] = their 1-based request positions
+        // (AOSP packs only the changed indices). count <= n, so the last write is at offset count <= n,
+        // strictly inside the n+1-int allocation.
+        let mut count: i32 = 0;
+        for (attr, entry) in entries.iter().enumerate() {
+            if entry.is_some() {
+                count += 1;
+                // SAFETY: count <= attr+1 <= n, so `count` is a valid offset into the n+1-int buffer.
+                // `base` is non-null (checked) and 4-byte-aligned by construction. The 1-based request
+                // position (attr+1) fits i32 (attr < n <= i32 array length).
+                let pos = i32::try_from(attr + 1).unwrap_or(i32::MAX);
+                unsafe { base.add(count as usize).write(pos) };
+            }
+        }
+        // SAFETY: offset 0 is within the n+1-int buffer (always >= 1 int). Written last so a found
+        // attribute's index write above never clobbers the count.
+        unsafe { base.write(count) };
+    }
+}
+
 /// Read `name` from the APK zip, parse it as binary XML, and store it as an [`xml_registry`] block.
 ///
 /// Returns the non-zero block handle, or a typed [`AssetError`] on any failure (no stashed APK path,
@@ -733,6 +1014,16 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_open_xml_asset as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `asset_manager_retrieve_attributes` matches the paired `(J[IIJJ)Z` signature as an
+        // instance native returning `jboolean` (see the native's docs); casting the `extern "system"`
+        // fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_RETRIEVE_ATTRIBUTES_NAME,
+                ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG,
+                asset_manager_retrieve_attributes as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/content/res/AssetManager; `methods` hold valid fn
     // pointers whose signatures match the class's `native` declarations (`init` verified against
@@ -741,7 +1032,7 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/AssetManager",
-        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative"
+        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes"
     );
     Ok(())
 }
@@ -1755,6 +2046,125 @@ mod tests {
             ASSET_MANAGER_OPEN_XML_ASSET_SIG.to_str(),
             "(ILjava/lang/String;)J"
         );
+        // retrieveAttributes bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature `(J[IIJJ)Z` (mangled `...retrieveAttributes__J_3IIJJ`); pin name + descriptor so
+        // a transcription regression throws NoSuchMethodError at boot.
+        assert_eq!(
+            ASSET_MANAGER_RETRIEVE_ATTRIBUTES_NAME.to_str(),
+            "retrieveAttributes"
+        );
+        assert_eq!(ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG.to_str(), "(J[IIJJ)Z");
+        // Pin the EMPIRICALLY-CONFIRMED ATL TypedArray window layout retrieveAttributes writes
+        // against (run-derived 2026-06-05: stride 6, TYPE@1, DATA@2 — NOT the AOSP-documented
+        // TYPE@0/DATA@1), so a stride/offset regression (which would mis-place TypedValue entries and
+        // re-break PackageParser's getInteger) fails loudly.
+        assert_eq!(STYLE_NUM_ENTRIES, 6);
+        assert_eq!(STYLE_TYPE, 1);
+        assert_eq!(STYLE_DATA, 2);
+        assert_eq!(TYPE_NULL, 0);
+    }
+
+    #[test]
+    fn fill_typed_array_writes_exact_bounds_values_and_indices() {
+        // SOUNDNESS guard for the raw-pointer writes in retrieveAttributes (no VM needed): the
+        // writes must stay strictly inside the AOSP-sized buffers (n * STYLE_NUM_ENTRIES ints for
+        // outValues, n + 1 for outIndices), write a full value window for each found attribute,
+        // TYPE_NULL for each absent one, and pack outIndices[0]=count + the 1-based positions.
+        //
+        // Sentinel-bracketed buffers detect any out-of-bounds write: a leading + trailing guard cell
+        // must keep its sentinel. entries: [found, absent, found, absent] (mixed).
+        let entries = [
+            Some(TypedEntry {
+                value_type: 0x03,
+                data: 0x18,
+            }),
+            None,
+            Some(TypedEntry {
+                value_type: 0x10,
+                data: 0x2a,
+            }),
+            None,
+        ];
+        let n = entries.len();
+        let vals_len = n * STYLE_NUM_ENTRIES;
+        let idx_len = n + 1;
+
+        let mut values = vec![-1i32; vals_len + 2]; // [guard][n*6 values][guard]
+        let mut indices = vec![-1i32; idx_len + 2]; // [guard][n+1 indices][guard]
+
+        let v_ptr = values[1..1 + vals_len].as_mut_ptr() as jlong;
+        let i_ptr = indices[1..1 + idx_len].as_mut_ptr() as jlong;
+        fill_typed_array(v_ptr, i_ptr, &entries);
+
+        // Guards untouched (no underflow / overflow write).
+        assert_eq!(values[0], -1, "outValues underflow guard");
+        assert_eq!(values[vals_len + 1], -1, "outValues overflow guard");
+        assert_eq!(indices[0], -1, "outIndices underflow guard");
+        assert_eq!(indices[idx_len + 1], -1, "outIndices overflow guard");
+
+        // Found attributes (0 and 2): only the run-confirmed TYPE@1 and DATA@2 slots are written;
+        // the other 4 slots stay at the caller value (the framework's zero pre-fill in real use).
+        for (attr, e) in [(0usize, &entries[0]), (2usize, &entries[2])] {
+            let win = 1 + attr * STYLE_NUM_ENTRIES;
+            let e = e.unwrap();
+            assert_eq!(values[win + STYLE_TYPE], e.value_type, "STYLE_TYPE @1");
+            assert_eq!(values[win + STYLE_DATA], e.data, "STYLE_DATA @2");
+            for slot in 0..STYLE_NUM_ENTRIES {
+                if slot != STYLE_TYPE && slot != STYLE_DATA {
+                    assert_eq!(values[win + slot], -1, "unwritten slot untouched");
+                }
+            }
+        }
+        // Absent attributes (1 and 3): only STYLE_TYPE @1 = TYPE_NULL written.
+        for attr in [1usize, 3usize] {
+            let win = 1 + attr * STYLE_NUM_ENTRIES;
+            assert_eq!(values[win + STYLE_TYPE], TYPE_NULL, "absent → TYPE_NULL @1");
+            for slot in 0..STYLE_NUM_ENTRIES {
+                if slot != STYLE_TYPE {
+                    assert_eq!(values[win + slot], -1, "absent: other slots untouched");
+                }
+            }
+        }
+
+        // outIndices: [0] = count of found (2); [1..=2] = 1-based positions (1 and 3).
+        assert_eq!(indices[1], 2, "outIndices[0] = number found");
+        assert_eq!(indices[2], 1, "first found at request position 1 (1-based)");
+        assert_eq!(
+            indices[3], 3,
+            "second found at request position 3 (1-based)"
+        );
+        assert_eq!(indices[1 + 3], -1, "outIndices beyond count untouched");
+    }
+
+    #[test]
+    fn fill_typed_array_null_pointers_are_a_no_op() {
+        // A 0 ("no buffer") pointer for either output must be skipped — never dereferenced. A
+        // non-empty entries slice ensures the loop body would run if the guard were missing.
+        let entries = [Some(TypedEntry {
+            value_type: 0x03,
+            data: 1,
+        })];
+        fill_typed_array(0, 0, &entries);
+    }
+
+    #[test]
+    fn fill_typed_array_zero_attrs_writes_only_changed_count() {
+        // n == 0: outValues has no windows; outIndices is a single int (the count) set to 0.
+        let mut indices = [-1i32; 3]; // [guard][count][guard]
+        let i_ptr = indices[1..2].as_mut_ptr() as jlong;
+        fill_typed_array(0, i_ptr, &[]);
+        assert_eq!(indices[0], -1, "underflow guard untouched");
+        assert_eq!(indices[1], 0, "outIndices[0] = 0 with zero attrs");
+        assert_eq!(indices[2], -1, "overflow guard untouched");
+    }
+
+    #[test]
+    fn u32_to_i32_preserves_all_bits() {
+        // The Res_value.data word must be stored bit-for-bit (the framework reads back the same 32
+        // bits); spot-check the boundary values incl. the 0xffffffff bool-true the manifest uses.
+        for &v in &[0u32, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x0101_0003] {
+            assert_eq!(u32_to_i32(v).to_ne_bytes(), v.to_ne_bytes());
+        }
     }
 
     #[test]

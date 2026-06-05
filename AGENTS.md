@@ -435,20 +435,25 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 ---
 - **Last verified 2026-06-05:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`+`graphics`
   +`framework` wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo test` (**60 unit + 2 compile_fail doctests
+  --all-targets --all-features -- -D warnings`, `cargo test` (**66 unit + 2 compile_fail doctests
   pass**), `cargo build --release` (0 warnings). `framework::drive_application_lifecycle` binds
   Eclipse's own non-GTK backing for `Context`/`Log`/`AssetManager`/`Environment`/`XmlBlock` natives via
   `RegisterNatives` before `Context.<clinit>`, then drives recipe steps 1–3. **Eclipse-owned non-GTK
   AssetManager XML backing now built** (`apk`+`axml`: `openXmlAssetNative` really reads+parses the APK's
   binary XML via `axml::parse_document` into the `framework::xml_registry` generational slab; the
-  `XmlBlock` parser natives walk it). On the dev-host run, `Context.<clinit>` now parses+walks
-  `AndroidManifest.xml` end-to-end (the prior `FileNotFoundException` is gone) and stops at the next
-  asset native **`AssetManager.retrieveAttributes(long,int[],int,long,long)Z`** (ARSC/TypedArray
-  frontier) — `Application.onCreate` NOT yet reached (faithful, not faked; §6 2026-06-05). The live
-  JNI path is dev-host-only (ART aborts on worker threads), so it is validated via `eclipse run`. The
-  `apk` reader was validated against the **real** Roblox manifest → ground truth (com.roblox.client /
-  ActivitySplash / 26 / 35 / largeHeap=false). **`eclipse run <apk>` boots the vendored ART VM**
-  (libcore, JNI_OK) on this host.
+  `XmlBlock` parser natives walk it). **`AssetManager.retrieveAttributes(J[IIJJ)Z` now bound** — real
+  XML-attribute extraction by `name_resource` into the framework's off-heap `outValues`/`outIndices`
+  (bounds-proven raw writes); needed an `axml` `RES_XML_RESOURCE_MAP_TYPE` decode (so `name_resource`
+  is populated, was always 0) + the empirically-found ATL TypedArray window layout (stride 6, TYPE@1,
+  DATA@2). On the dev-host run, `Context.<clinit>` parses+walks `AndroidManifest.xml` end-to-end AND now
+  advances **past `PackageParser.parsePackage`** (integer manifest attrs resolve; the prior `getInteger
+  type=0x1` is gone); it stops at the framework's **`<activity> does not specify android:name` →
+  `System.exit(1)`** — a `getString` path needing ATL's pooled-string/cookie ABI (denylisted).
+  `Application.onCreate` NOT yet reached (faithful, not faked; §6 2026-06-05). The live JNI path is
+  dev-host-only (ART aborts on worker threads), so it is validated via `eclipse run`. The `apk` reader
+  was validated against the **real** Roblox manifest → ground truth (com.roblox.client / ActivitySplash
+  / 26 / 35 / largeHeap=false). **`eclipse run <apk>` boots the vendored ART VM** (libcore, JNI_OK) on
+  this host.
 - **Repo:** git initialized; committed & pushed to `origin/main`
   (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
 - **What exists:** 7 docs + `README` + `eclipse` crate. **M1 done so far:**
@@ -579,17 +584,22 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      bound against the parsed tree (`nativeCreateParseState`/`nativeNext`/`nativeGetName`/
      `nativeGetAttributeIndex`/`nativeGetAttributeStringValue`/`nativeDestroyParseState`/`nativeDestroy`,
      all non-GTK, signatures from the ART `No implementation found` lines + standard XmlPullParser/
-     XmlBlock semantics). **NEXT (in order): (1) THE RESOURCE-TABLE / TypedArray FRONTIER (new stop, the
-     genuine next asset subsystem).** The lifecycle now advances past the whole XML parse and stops at
-     **`AssetManager.retrieveAttributes(long parseState, int[] attrs, int parser, long outValues, long
-     outIndices)Z`** (run log `/tmp/eclipse-run.log`, EXIT=1) — the styled-attribute path that resolves a
-     tag's framework attributes against **`resources.arsc` (ARSC)** and writes packed `TypedValue`
-     entries into **native off-heap buffers addressed by raw `long` pointers**. This is a distinct,
-     larger asset subsystem (ARSC decode + the native TypedArray ABI), NOT one more easy native;
-     `onCreate` is **NOT reached** (reported faithfully, not faked). It needs: an Eclipse-owned ARSC
-     reader (grow `axml`/`apk` into a `resources.arsc` reader — component-map note line 145) + a sound
-     way to fill the framework's native `long` output arrays. Main-loop / non-subagent work (asset
-     internals denylisted). Then **(2)** the deref-ing Window natives for
+     XmlBlock semantics). ✅ **retrieveAttributes CROSSED + resource-map decode added (2026-06-05, §6).**
+     `AssetManager.retrieveAttributes(J[IIJJ)Z` is now bound (Eclipse-owned, non-GTK): it copies the
+     requested framework attribute-ids out of the Java `int[]`, looks each up on the current XML
+     element by **`name_resource`**, and writes the real `Res_value` `(type,data)` into the framework's
+     off-heap `outValues`/`outIndices` buffers via bounds-proven `*mut i32` writes. Required a
+     root-cause `axml` fix: **decode `RES_XML_RESOURCE_MAP_TYPE`** so `XmlAttribute.name_resource` is
+     populated (was always `0` → nothing matched). The ATL TypedArray window layout was found
+     **empirically** (run sentinels, NOT denylisted source): stride 6, **TYPE@offset 1, DATA@offset 2**
+     (NOT the AOSP-documented TYPE@0/DATA@1). Result: integer manifest attributes resolve and the boot
+     advances **past `PackageParser.parsePackage`** (the `getInteger type=0x1` error is gone). **NEW STOP
+     (faithful): `<activity> does not specify android:name` → `System.exit(1)`** — a `getString`
+     resolution that needs ATL's pooled-string/cookie ABI (`TypedArray.getString`, denylisted). `onCreate`
+     is **NOT reached** (reported faithfully, not faked). **NEXT (in order): (1) the String-attribute
+     TypedArray path** — determine ATL's `getString` cookie/string-pool offsets empirically (the cookie
+     swept to −1 across the unknown slots did not resolve it) so `<activity android:name>` reads; this
+     may need the XmlBlock string pool exposed by index or the asset-cookie slot. Then **(2)** the deref-ing Window natives for
      step 4 (`set_jobject`/`set_title`/`set_layout` metadata via `register_native_methods` + a descriptor
      guard vs `Window.java`, then the deferred `set_widget_as_root`/`take_input_queue`) + associating the
      real winit `Window` with the registry slot. **BIGGEST RISK recorded:** the View hierarchy is fully
@@ -1156,6 +1166,49 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   log: `/tmp/eclipse-run.log` (EXIT=1, the expected stop at `retrieveAttributes`). **NEXT:** the
   ARSC/TypedArray frontier — grow an Eclipse-owned `resources.arsc` reader + a sound way to fill the
   framework's native `long` output arrays (see §5 next-actions item 1).
+- **2026-06-05** — 🎉 **retrieveAttributes CROSSED (real XML-attribute extraction) + axml resource-map
+  decode; lifecycle now advances past `PackageParser.parsePackage` to the `getString`/activity-name
+  frontier.** Bound Eclipse's own non-GTK **`AssetManager.retrieveAttributes(J[IIJJ)Z`** (descriptor
+  from the exact ART `No implementation found … retrieveAttributes(long, int[], int, long, long)` /
+  mangled `…__J_3IIJJ` — instance native: `parseStateHandle, int[] attrs, int attrsLen, long
+  outValues, long outIndices`). It copies the requested framework attribute-ids out of the Java `int[]`
+  (`JIntArray::len`/`get_region`), resolves each against the current XML element of the `xml_registry`
+  parse-state **by `name_resource`**, and writes the real `Res_value` `(type, data)` into the
+  framework's off-heap `outValues`/`outIndices` via **bounds-proven `*mut i32` writes** (each offset
+  `< n*STYLE_NUM_ENTRIES` / `<= n`; a `0` pointer = "no buffer" → skipped; never UB, never a fake). **Root-cause
+  `axml` fix:** decode **`RES_XML_RESOURCE_MAP_TYPE` (0x0180)** — the `u32[]` parallel to the string
+  pool — so `XmlAttribute.name_resource = resource_map[name_string_index]` (was hard-coded `0`, so
+  `retrieveAttributes` matched nothing and `<activity android:name>` was unreadable). `read_manifest`'s
+  5-field path is untouched; totality preserved (bounds-checked reads). **The ATL TypedArray window
+  layout is ATL-specific (its `retrieveAttributes` has an extra `int` arg AOSP lacks) and its
+  `TypedArray.java`/`AssetManager.java` are denylisted, so the layout was determined EMPIRICALLY from
+  the dev-host run (a benign observation, NOT by reading that source):** writing distinct sentinels
+  per window int showed **TYPE@offset 1** (framework read back the offset-1 sentinel as the "type");
+  writing real type@1 + data@2 made `PackageParser`'s `getInteger` succeed for `<manifest
+  versionCode>`, confirming **DATA@offset 2** (stride 6, from the framework's 48-int zero pre-fill for
+  an 8-attr styleable). NOT the AOSP-documented TYPE@0/DATA@1 — the documented layout would (and did)
+  mis-place every entry. **FAITHFUL lifecycle progress:** the `retrieveAttributes` "No implementation
+  found" is gone; integer manifest attributes resolve; the boot advances **past `PackageParser.
+  parsePackage`** (the `Can't convert to integer: type=0x1` exception is cleared). **New stop:** the
+  framework logs **`<activity> does not specify android:name` → `System.exit(1)`** — the activity-name
+  is read via `TypedArray.getString`, whose ATL pooled-string/cookie ABI (which slot the cookie is in,
+  and whether it resolves via the XmlBlock string pool by index) could NOT be cracked by sweeping the
+  cookie to −1 across the unknown window slots, and `TypedArray.getString`/`AssetManager` source is
+  denylisted. So the String-attribute path is the next, denylisted-bounded frontier. **`Application.
+  onCreate` is NOT reached** (reported faithfully, not faked; DECIDE=stop at an ABI boundary, per the
+  cyber-safeguard — stopped the ATL string-ABI reverse-engineering and committed the gate-green sound
+  state). Regression guards (host-independent, in-harness): `framework` test pins the new native
+  name+descriptor `(J[IIJJ)Z` + the run-confirmed `STYLE_NUM_ENTRIES=6`/`STYLE_TYPE=1`/`STYLE_DATA=2`
+  layout constants; 3 `fill_typed_array` soundness tests (sentinel-bracketed buffers prove the writes
+  stay in bounds, write TYPE/DATA for found + TYPE_NULL for absent, pack `outIndices[0]=count` +
+  positions, and skip null pointers); a `u32_to_i32` bit-preservation test; and 2 `axml` tests building
+  a minimal in-memory AXML that prove `parse_document` populates `name_resource` from the resource-map
+  chunk (and leaves it `0` when the chunk is absent — never fabricated). Full gate green: fmt --check /
+  build --all-targets / clippy `-D warnings` / test (**66 unit + 2 compile_fail doctests**) / release
+  (`panic = "abort"`/LTO retained). No new deps (`jni`/`zip`/`sha2` already in tree). Run log:
+  `/tmp/eclipse-run.log` (EXIT=1, the expected stop at the activity-name `getString`). **NEXT:** crack
+  ATL's `getString`/string-pool TypedArray ABI empirically so `<activity android:name>` reads, then
+  continue toward `createApplication`/`onCreate`.
 
 ---
 
