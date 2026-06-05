@@ -86,6 +86,7 @@ use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use crate::runtime::Vm;
 
+pub mod matrix_registry;
 pub mod paint_registry;
 pub mod theme_registry;
 pub mod view_registry;
@@ -555,6 +556,24 @@ const ASSET_MANAGER_GET_RESOURCE_NAME_SIG: &JNIStr = jni_str!("(I)Ljava/lang/Str
 const ASSET_MANAGER_LOAD_RESOURCE_VALUE_NAME: &JNIStr = jni_str!("loadResourceValue");
 const ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG: &JNIStr = jni_str!("(ISLandroid/util/TypedValue;Z)I");
 
+// 2026-06-05: `loadThemeAttributeValue(long theme, int ident, TypedValue outValue, boolean
+// resolveRefs)` is the native AOSP's `AssetManager.getThemeValue` / `Resources$Theme.resolveAttribute`
+// calls to resolve a THEME attribute id (`?attr/foo`) against an applied theme into a `TypedValue`.
+// Surfaced by the dev-host run during step 5 (accelerometerdemo's `setContentView` →
+// `AppCompatDelegateImplV9.createSubDecor` → `Theme.resolveAttribute` → `AssetManager.getThemeValue`).
+// AssetManager is DENYLISTED, so this is bound from the exact JNI signature ART reported missing (`No
+// implementation found for int android.content.res.AssetManager.loadThemeAttributeValue(long, int,
+// android.util.TypedValue, boolean)`, mangled `...__JILandroid_util_TypedValue_2Z`, run log
+// 2026-06-05) WITHOUT reading the class's source. JNI descriptor `(JILandroid/util/TypedValue;Z)I` —
+// an INSTANCE native. Backed by the theme handle's merged attribute map (built by applyThemeStyle):
+// resolves `ident` via the same [`resolve_theme_attr`] reference-chasing the styled-attribute path
+// uses and writes type/data/resourceId onto the public `TypedValue` fields. Returns the asset cookie
+// (1) when the attribute is in the theme, 0 when absent (the framework treats 0 as not-resolved —
+// correct, not a fake value).
+const ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME: &JNIStr = jni_str!("loadThemeAttributeValue");
+const ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG: &JNIStr =
+    jni_str!("(JILandroid/util/TypedValue;Z)I");
+
 /// `Res_value.dataType` for a string-pool reference (`TYPE_STRING`); its `data` is a value-pool index.
 const RES_VALUE_TYPE_STRING: u8 = 0x03;
 /// The single asset cookie Eclipse reports (one APK). `loadResourceValue` returns it on success.
@@ -938,33 +957,65 @@ fn resolve_xml_attributes(parse_state: jlong, ids: &[i32]) -> Vec<Option<TypedEn
                     .attributes
                     .iter()
                     .find(|a| a.name_resource != 0 && a.name_resource == id_u32)?;
-                let value_type = i32::from(attr.value_type);
-                let data = u32_to_i32(attr.value_data);
-                // For a reference/attribute value, getResourceId returns the referenced id (== data);
-                // the STYLE_RESOURCE_ID slot carries it. Other types have no resource id (0).
-                let resource_id =
-                    if attr.value_type == TYPE_REFERENCE || attr.value_type == TYPE_ATTRIBUTE {
-                        data
-                    } else {
-                        0
-                    };
-                // A string value lives in the XmlBlock's own pool; the XML_BLOCK_COOKIE routes
-                // getString to mXml.getPooledString(data) in Java (no native). Other types: cookie 0.
-                let asset_cookie = if attr.value_type == TYPE_STRING {
-                    XML_BLOCK_COOKIE
-                } else {
-                    0
-                };
-                Some(TypedEntry {
-                    value_type,
-                    data,
-                    resource_id,
-                    asset_cookie,
-                })
+                Some(resolve_inline_attr_value(attr.value_type, attr.value_data))
             })
             .collect()
     })
     .unwrap_or_else(|_| vec![None; ids.len()])
+}
+
+/// Resolve one inline XML attribute `(value_type, value_data)` to the [`TypedEntry`] that
+/// `applyStyle`/`obtainStyledAttributes(AttributeSet, int[])` writes into the `TypedArray` window.
+///
+/// 2026-06-05: a concrete value (color/int/float/dimension/boolean/string) is returned directly. A
+/// `TYPE_REFERENCE` (`@color/x`, `@drawable/y`, …) is FOLLOWED into `resources.arsc` to a concrete
+/// `Res_value` (so e.g. a vector drawable's `android:fillColor="@color/c"` resolves to its ARGB
+/// before `TypedArray.getColor` reads it — without this, `getColor` throws
+/// `UnsupportedOperationException: Can't convert to color: type=0x1`, surfaced 2026-06-05 by
+/// accelerometerdemo's `VectorDrawableCompat`). The original referenced id is kept in the
+/// `STYLE_RESOURCE_ID` slot (what `getResourceId` returns). This mirrors [`resolve_theme_attr`]'s
+/// reference chase, fixing the same-pattern gap where the THEME path resolved references but the
+/// inline-XML path did not. Bounded by [`MAX_ATTR_RESOLVE_DEPTH`]; never panics. An unresolvable
+/// reference (`@null`, a bag, or an absent target) keeps the reference itself (its resource id stays
+/// useful to `getResourceId`) — the sound AOSP fallback, not a value fake.
+fn resolve_inline_attr_value(value_type: u8, value_data: u32) -> TypedEntry {
+    let mut cur_type = value_type;
+    let mut cur_data = value_data;
+    // getResourceId reports the FIRST referenced id (for a reference/attribute); 0 otherwise.
+    let resource_id = if value_type == TYPE_REFERENCE || value_type == TYPE_ATTRIBUTE {
+        u32_to_i32(value_data)
+    } else {
+        0
+    };
+    // Follow resource references (`@…`) to a concrete value. `TYPE_ATTRIBUTE` (`?attr/…`) has no
+    // theme context here (this is an inline AttributeSet value, not a theme bag), so it is left as-is
+    // for the framework to resolve against the active theme.
+    for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
+        if cur_type != TYPE_REFERENCE || cur_data == 0 {
+            break; // concrete value, a non-reference, or the explicit @null reference: done.
+        }
+        match resolve_res_value(cur_data) {
+            Some(v) => {
+                cur_type = u8::try_from(v.type_).unwrap_or(0);
+                cur_data = u32::from_ne_bytes(v.data.to_ne_bytes());
+            }
+            // Target is a bag / absent: keep the reference itself (resource_id still set).
+            None => break,
+        }
+    }
+    // A string value lives in the XmlBlock's own pool; the XML_BLOCK_COOKIE routes getString to
+    // mXml.getPooledString(data) in Java (no native). Other types: cookie 0.
+    let asset_cookie = if cur_type == TYPE_STRING {
+        XML_BLOCK_COOKIE
+    } else {
+        0
+    };
+    TypedEntry {
+        value_type: i32::from(cur_type),
+        data: u32_to_i32(cur_data),
+        resource_id,
+        asset_cookie,
+    }
 }
 
 /// Reinterpret a `u32` `Res_value.data` word as the `i32` the TypedArray `int[]` stores (bit-for-bit;
@@ -1675,6 +1726,89 @@ extern "system" fn asset_manager_load_resource_value<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `AssetManager.loadThemeAttributeValue(long theme, int ident, TypedValue outValue, boolean
+/// resolveRefs)` → resolve theme attribute `ident` against the applied theme and write it onto
+/// `outValue`; return the asset cookie or 0 (2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning `jint`, so the parameters are
+/// `(EnvUnowned, JObject this, jlong theme, jint ident, JObject out_value, jboolean resolve_refs)`.
+/// Looks `ident` up in the theme handle's merged attribute map (built by `applyThemeStyle`) via the
+/// same [`resolve_theme_attr`] reference chase the styled-attribute path uses, then writes the public
+/// `TypedValue` fields (`type`/`data`/`assetCookie`/`resourceId`/`density`, and `string` for a
+/// `TYPE_STRING`). Returns [`ECLIPSE_ASSET_COOKIE`] when the attribute is present in the theme, `0`
+/// when absent / the theme handle is stale (AOSP's `resolveAttribute` returns false for an unresolved
+/// theme attribute — the correct outcome, not a faked value).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jint` default (`0`) on
+/// error/panic — the same neutral "not resolved".
+extern "system" fn asset_manager_load_theme_attribute_value<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    theme: jlong,
+    ident: jint,
+    out_value: JObject<'local>,
+    _resolve_refs: jboolean,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        if out_value.is_null() {
+            // No TypedValue to fill; report not-resolved rather than risk a null write.
+            return Ok(0);
+        }
+        // Resolve `ident` against the theme's merged attribute map (reference-chased to a concrete
+        // value). A stale/empty theme or an absent attribute → None → not-resolved (0).
+        let entry = theme_registry::with_theme(theme, |t| resolve_theme_attr(&t.attrs, ident))
+            .ok()
+            .flatten();
+        let Some(entry) = entry else {
+            tracing::debug!(
+                target: "android.content.res.AssetManager",
+                theme,
+                ident = format_args!("0x{:08x}", u32::from_ne_bytes(ident.to_ne_bytes())),
+                "AssetManager.loadThemeAttributeValue: attr not in theme → 0 (not resolved)"
+            );
+            return Ok(0);
+        };
+
+        // SAFETY: "type"/"data"/"assetCookie"/"resourceId" are `public int` fields of
+        // android.util.TypedValue, so the "I" signature paired with JavaType::Int is consistent —
+        // exactly FieldSignature::from_raw_parts' invariant. set_field re-checks the value type at
+        // runtime, so a mismatch is a typed error, never UB.
+        let int_sig =
+            unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
+        env.set_field(
+            &out_value,
+            jni_str!("type"),
+            &int_sig,
+            entry.value_type.into(),
+        )?;
+        env.set_field(&out_value, jni_str!("data"), &int_sig, entry.data.into())?;
+        env.set_field(
+            &out_value,
+            jni_str!("assetCookie"),
+            &int_sig,
+            ECLIPSE_ASSET_COOKIE.into(),
+        )?;
+        env.set_field(
+            &out_value,
+            jni_str!("resourceId"),
+            &int_sig,
+            entry.resource_id.into(),
+        )?;
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            theme,
+            ident = format_args!("0x{:08x}", u32::from_ne_bytes(ident.to_ne_bytes())),
+            type_ = entry.value_type,
+            data = entry.data,
+            resource_id = entry.resource_id,
+            "AssetManager.loadThemeAttributeValue: wrote TypedValue from theme attrs"
+        );
+        Ok(ECLIPSE_ASSET_COOKIE)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Read `name` from the APK zip, parse it as binary XML, and store it as an [`xml_registry`] block.
 ///
 /// Returns the non-zero block handle, or a typed [`AssetError`] on any failure (no stashed APK path,
@@ -1860,6 +1994,15 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_load_resource_value as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `asset_manager_load_theme_attribute_value` matches the paired
+        // `(JILandroid/util/TypedValue;Z)I` signature as an instance native (see the native's docs).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME,
+                ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG,
+                asset_manager_load_theme_attribute_value as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/content/res/AssetManager; `methods` hold valid fn
     // pointers whose signatures match the class's `native` declarations (`init` verified against
@@ -1868,7 +2011,7 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/AssetManager",
-        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes + newTheme + applyThemeStyle + copyTheme + applyStyle + getResourceName + loadResourceValue"
+        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes + newTheme + applyThemeStyle + copyTheme + applyStyle + getResourceName + loadResourceValue + loadThemeAttributeValue"
     );
     Ok(())
 }
@@ -1929,6 +2072,42 @@ const XML_ATTR_NOT_FOUND: jint = -1;
 // 2026-06-05).
 const XML_BLOCK_GET_ATTR_STRING_VALUE_NAME: &JNIStr = jni_str!("nativeGetAttributeStringValue");
 const XML_BLOCK_GET_ATTR_STRING_VALUE_SIG: &JNIStr = jni_str!("(JI)Ljava/lang/String;");
+
+// `static native int nativeGetAttributeDataType(long state, int idx)` — the `Res_value.dataType`
+// byte of the idx-th attribute on the current tag (a `TypedValue.TYPE_*` constant). JNI descriptor
+// `(JI)I` (`int ...XmlBlock.nativeGetAttributeDataType(long, int)`, run log 2026-06-05,
+// accelerometerdemo's VectorDrawableCompat reads its <vector>/<path> attribute types via
+// AttributeSet.getAttributeValue → TypedArrayUtils.getNamedFloat).
+const XML_BLOCK_GET_ATTR_DATA_TYPE_NAME: &JNIStr = jni_str!("nativeGetAttributeDataType");
+const XML_BLOCK_GET_ATTR_DATA_TYPE_SIG: &JNIStr = jni_str!("(JI)I");
+
+// `static native int nativeGetAttributeCount(long state)` — the number of attributes on the current
+// tag. JNI descriptor `(J)I` (`int ...XmlBlock.nativeGetAttributeCount(long)`, run log 2026-06-05,
+// AppCompatColorStateListInflater iterating a <selector>'s attributes). Returns the current element's
+// attribute count, or 0 when not on a tag / bad handle.
+const XML_BLOCK_GET_ATTR_COUNT_NAME: &JNIStr = jni_str!("nativeGetAttributeCount");
+const XML_BLOCK_GET_ATTR_COUNT_SIG: &JNIStr = jni_str!("(J)I");
+
+// `static native int nativeGetAttributeResource(long state, int idx)` — the RESOURCE ID OF THE
+// ATTRIBUTE'S NAME (`AttributeSet.getAttributeNameResource`), i.e. the framework attr id the attribute
+// binds to (e.g. `android:color` → `0x010101...`), or 0 if the attribute's name is not a framework
+// resource. JNI descriptor `(JI)I` (`int ...XmlBlock.nativeGetAttributeResource(long, int)`, run log
+// 2026-06-05, AppCompatColorStateListInflater). This is the decoded `name_resource` Eclipse's axml
+// reader already stores, NOT the value — distinct from nativeGetAttributeData (the value word).
+const XML_BLOCK_GET_ATTR_RESOURCE_NAME: &JNIStr = jni_str!("nativeGetAttributeResource");
+const XML_BLOCK_GET_ATTR_RESOURCE_SIG: &JNIStr = jni_str!("(JI)I");
+
+// `static native int nativeGetAttributeData(long state, int idx)` — the `Res_value.data` word of the
+// idx-th attribute on the current tag (the raw int / boolean / float-bits / packed-color / resource
+// ref, paired with the dataType). JNI descriptor `(JI)I` (`int
+// ...XmlBlock.nativeGetAttributeData(long, int)`, run log 2026-06-05). Consulted right after
+// nativeGetAttributeDataType by AttributeSet / TypedArrayUtils to read the typed value.
+const XML_BLOCK_GET_ATTR_DATA_NAME: &JNIStr = jni_str!("nativeGetAttributeData");
+const XML_BLOCK_GET_ATTR_DATA_SIG: &JNIStr = jni_str!("(JI)I");
+
+/// `TypedValue.TYPE_NULL` — the data type AOSP returns for an absent attribute. Matches AOSP's
+/// `XmlBlock` returning `TYPE_NULL` (`0x00`) for an out-of-range index / not-on-a-tag.
+const XML_TYPE_NULL: jint = 0x00;
 
 // `static native int nativeGetLineNumber(long state)` — the current node's source line number (used
 // only by `getPositionDescription` for error messages). JNI descriptor `(J)I` (run log 2026-06-05).
@@ -2207,6 +2386,110 @@ extern "system" fn xml_block_get_attribute_string_value<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `XmlBlock.nativeGetAttributeDataType(long state, int idx)` → the idx-th attribute's
+/// `Res_value.dataType` (a `TypedValue.TYPE_*` constant), or `TYPE_NULL`.
+///
+/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the attribute's parsed
+/// `value_type` byte (e.g. `TYPE_STRING`=3, `TYPE_INT_DEC`=0x10, `TYPE_FLOAT`=4) widened to `jint` —
+/// the exact byte Eclipse's axml reader stored from the binary XML `Res_value`. Returns
+/// [`XML_TYPE_NULL`] (`0`) for an out-of-range index, when not on a tag, or for a bad handle, matching
+/// AOSP `XmlBlock` returning `TYPE_NULL` for an absent attribute. This is the type discriminator
+/// `AttributeSet.getAttributeValue`/`TypedArrayUtils.getNamedFloat` consult before reading the value.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `jint` default (`0` = `TYPE_NULL`) on error/panic — the correct neutral value.
+extern "system" fn xml_block_get_attribute_data_type<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+    idx: jint,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        // value_type is the Res_value.dataType byte; widen to jint. Absent attr → TYPE_NULL.
+        let data_type = current_attribute(state, idx, |a| jint::from(a.value_type));
+        Ok(data_type.unwrap_or(XML_TYPE_NULL))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeGetAttributeData(long state, int idx)` → the idx-th attribute's `Res_value.data`
+/// word (the raw typed value), or `0`.
+///
+/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the attribute's parsed
+/// `value_data` word — the raw 32-bit value whose interpretation is given by the paired
+/// `nativeGetAttributeDataType` (an int for `TYPE_INT_*`, the IEEE-754 bits for `TYPE_FLOAT`, the
+/// packed ARGB for `TYPE_*_COLOR`, the string-pool index for `TYPE_STRING`, the resource id for
+/// `TYPE_REFERENCE`). The `u32` data word is reinterpreted as `jint` (the JNI return type) with the
+/// same bit pattern — AOSP's `nativeGetAttributeData` returns the raw `Res_value.data` int unchanged.
+/// Returns `0` for an out-of-range index, when not on a tag, or for a bad handle.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `jint` default (`0`) on error/panic — the correct neutral value.
+extern "system" fn xml_block_get_attribute_data<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+    idx: jint,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        // value_data is the raw Res_value.data word; reinterpret the u32 bits as jint (AOSP returns
+        // the raw int unchanged — TYPE_FLOAT carries IEEE-754 bits, colors are packed ARGB, etc.).
+        let data = current_attribute(state, idx, |a| a.value_data as i32);
+        Ok(data.unwrap_or(0))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeGetAttributeCount(long state)` → the number of attributes on the current tag, or
+/// `0`.
+///
+/// JNI ABI: a `static` native (`JClass`, `jlong state`). Returns the current element's attribute count
+/// (what `XmlPullParser.getAttributeCount` returns, the loop bound the attribute accessors are indexed
+/// within). Returns `0` when not on a start/end tag or for a bad handle (AOSP returns `0`/`-1` when no
+/// attributes — `0` is the safe "no attributes" loop bound).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `jint` default (`0`) on error/panic — the correct neutral count.
+extern "system" fn xml_block_get_attribute_count<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        let count = xml_registry::with_block(state, |b| {
+            b.current_element().map(|e| e.attributes.len()).unwrap_or(0)
+        })
+        .unwrap_or(0);
+        Ok(jint::try_from(count).unwrap_or(jint::MAX))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `XmlBlock.nativeGetAttributeResource(long state, int idx)` → the resource id of the idx-th
+/// attribute's NAME (`getAttributeNameResource`), or `0`.
+///
+/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the decoded
+/// `name_resource` Eclipse's axml reader stored for the attribute (the framework attr id its name binds
+/// to, e.g. `android:color`), reinterpreted to `jint`; `0` when the name is not a framework resource,
+/// for an out-of-range index, when not on a tag, or for a bad handle. Distinct from
+/// `nativeGetAttributeData` (which returns the attribute's VALUE word).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `jint` default (`0`) on error/panic — the correct neutral value.
+extern "system" fn xml_block_get_attribute_resource<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state: jlong,
+    idx: jint,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        // name_resource is the decoded framework attr id of the attribute's NAME; reinterpret u32 bits.
+        let res = current_attribute(state, idx, |a| u32_to_i32(a.name_resource));
+        Ok(res.unwrap_or(0))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// `XmlBlock.nativeGetLineNumber(long state)` → the current node's source line, or `-1` (unknown).
 ///
 /// JNI ABI: a `static` native (`JClass`, then the `jlong state`). Eclipse's axml reader does not
@@ -2360,6 +2643,42 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 XML_BLOCK_GET_ATTR_STRING_VALUE_NAME,
                 XML_BLOCK_GET_ATTR_STRING_VALUE_SIG,
                 xml_block_get_attribute_string_value as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_get_attribute_count` matches the paired `(J)I` signature as a static
+        // native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_ATTR_COUNT_NAME,
+                XML_BLOCK_GET_ATTR_COUNT_SIG,
+                xml_block_get_attribute_count as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_get_attribute_resource` matches the paired `(JI)I` signature as a static
+        // native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_ATTR_RESOURCE_NAME,
+                XML_BLOCK_GET_ATTR_RESOURCE_SIG,
+                xml_block_get_attribute_resource as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_get_attribute_data_type` matches the paired `(JI)I` signature as a
+        // static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_ATTR_DATA_TYPE_NAME,
+                XML_BLOCK_GET_ATTR_DATA_TYPE_SIG,
+                xml_block_get_attribute_data_type as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `xml_block_get_attribute_data` matches the paired `(JI)I` signature as a static
+        // native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                XML_BLOCK_GET_ATTR_DATA_NAME,
+                XML_BLOCK_GET_ATTR_DATA_SIG,
+                xml_block_get_attribute_data as *mut std::ffi::c_void,
             )
         },
         // SAFETY: `xml_block_get_line_number` matches the paired `(J)I` signature as a static native.
@@ -2526,6 +2845,14 @@ pub const SYSTEM_CLOCK_CLASS: &JNIStr = jni_str!("android/os/SystemClock");
 const ELAPSED_REALTIME_NAME: &JNIStr = jni_str!("elapsedRealtime");
 const ELAPSED_REALTIME_SIG: &JNIStr = jni_str!("()J");
 
+// JNI name + descriptor for SystemClock.uptimeMillis, from the ART-reported signature `long
+// android.os.SystemClock.uptimeMillis()` (run log 2026-06-05, accelerometerdemo's Handler.postDelayed
+// timing): a static native, descriptor `()J`. AOSP defines uptimeMillis as "milliseconds since boot,
+// not counting deep sleep" and "the basis for most interval timing" — its load-bearing contract is the
+// same MONOTONICITY as elapsedRealtime, so it shares the same process-anchored monotonic source.
+const UPTIME_MILLIS_NAME: &JNIStr = jni_str!("uptimeMillis");
+const UPTIME_MILLIS_SIG: &JNIStr = jni_str!("()J");
+
 /// Process-wide monotonic anchor for [`system_clock_elapsed_realtime`]. Set once on the first call,
 /// so `elapsedRealtime()` returns milliseconds since the first query — a correct monotonic clock
 /// (the contract guarantees monotonicity, not a true since-boot value). `Instant` is monotonic on
@@ -2545,14 +2872,35 @@ extern "system" fn system_clock_elapsed_realtime<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jlong {
-    env.with_env(|_env| -> jni::errors::Result<jlong> {
-        let elapsed_ms = MONOTONIC_ANCHOR
-            .get_or_init(Instant::now)
-            .elapsed()
-            .as_millis();
-        Ok(jlong::try_from(elapsed_ms).unwrap_or(jlong::MAX))
-    })
-    .resolve::<LogErrorAndDefault>()
+    env.with_env(|_env| -> jni::errors::Result<jlong> { Ok(monotonic_millis()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `SystemClock.uptimeMillis()` → monotonic milliseconds since the first call, as a `jlong`.
+///
+/// JNI ABI: a `static` native (the Java method is `static`), so the second argument is the `JClass`.
+/// Shares [`MONOTONIC_ANCHOR`] with [`system_clock_elapsed_realtime`] — AOSP's `uptimeMillis` and
+/// `elapsedRealtime` differ only in whether deep sleep is counted, which is irrelevant here (no device
+/// sleep), and both must be monotonic. The body is `catch_unwind`-wrapped via [`EnvUnowned::with_env`]
+/// (AGENTS.md §2.8); `resolve` returns the `jlong` default (`0`) on error/panic — a sound neutral
+/// timestamp.
+extern "system" fn system_clock_uptime_millis<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> { Ok(monotonic_millis()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// Monotonic milliseconds since the process's first clock query (the shared body of
+/// `elapsedRealtime`/`uptimeMillis`). Anchors [`MONOTONIC_ANCHOR`] on first use; subsequent calls are
+/// non-decreasing. `as_millis()` is `u128`; the `try_from`/`unwrap_or` saturates (no overflow panic).
+fn monotonic_millis() -> jlong {
+    let elapsed_ms = MONOTONIC_ANCHOR
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis();
+    jlong::try_from(elapsed_ms).unwrap_or(jlong::MAX)
 }
 
 /// Bind Eclipse's own (non-GTK) backing for `android.os.SystemClock`'s `elapsedRealtime`.
@@ -2581,14 +2929,22 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 system_clock_elapsed_realtime as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `system_clock_uptime_millis` matches the paired `()J` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                UPTIME_MILLIS_NAME,
+                UPTIME_MILLIS_SIG,
+                system_clock_uptime_millis as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/os/SystemClock; `methods` holds a valid fn pointer whose
-    // signature matches the class's `native` declaration (verified against SystemClock.java line 148,
-    // 2026-06-05).
+    // SAFETY: `class` is the loaded android/os/SystemClock; `methods` hold valid fn pointers whose
+    // signatures match the class's `native` declarations (verified against SystemClock.java line 148 +
+    // the ART-reported `uptimeMillis()J`, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/SystemClock",
-        "registered Eclipse's non-GTK backing for elapsedRealtime"
+        "registered Eclipse's non-GTK backing for elapsedRealtime + uptimeMillis"
     );
     Ok(())
 }
@@ -2754,6 +3110,17 @@ const VIEW_NATIVE_REQUEST_LAYOUT_SIG: &JNIStr = jni_str!("(J)V");
 // the real background draw is the deferred 2D/Skia path. Validates the view handle + no-op.
 const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME: &JNIStr = jni_str!("native_setBackgroundDrawable");
 const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
+
+// 2026-06-05: `View.<init>` (and `setVisibility`/`setAlpha`) call `native_setVisibility(widget,
+// visibility, alpha)` to push the view's visibility (VISIBLE=0/INVISIBLE=4/GONE=8) and alpha onto its
+// native peer. Surfaced when AppCompat's sub-decor inflation constructed an `ActionBarContextView`
+// (`View.<init>` → `native_setVisibility`, run log 2026-06-05). The ART error line gives the exact
+// signature `void android.view.View.native_setVisibility(long, int, float)` → `(JIF)V` instance.
+// Validates the view handle + no-op: the snapshot renderer does not yet consume visibility/alpha (a
+// GONE view should be skipped in layout — documented follow-up), so recording them is not yet
+// load-bearing; the handle check keeps it sound.
+const VIEW_NATIVE_SET_VISIBILITY_NAME: &JNIStr = jni_str!("native_setVisibility");
+const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIF)V");
 
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
@@ -2984,6 +3351,42 @@ extern "system" fn view_native_set_background_drawable<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.native_setVisibility(long widget, int visibility, float alpha)` → validate the view handle;
+/// no-op (visibility/alpha not yet consumed by the snapshot renderer, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle;
+/// `visibility` is `View.VISIBLE`(0)/`INVISIBLE`(4)/`GONE`(8) and `alpha` is `[0,1]`. Validates the
+/// handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored,
+/// never UB) and no-ops: the snapshot layout/draw pass does not yet honor visibility/alpha (a GONE
+/// view should be excluded from layout — a documented follow-up), so recording them is not yet
+/// load-bearing for advancing. Surfaced when AppCompat's sub-decor inflation built an
+/// `ActionBarContextView` (`View.<init>` → `native_setVisibility`).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn view_native_set_visibility<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    visibility: jint,
+    alpha: f32,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                visibility,
+                alpha,
+                error = %e,
+                "View.native_setVisibility: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -3050,14 +3453,25 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_set_background_drawable as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `view_native_set_visibility` matches the paired `(JIF)V` signature as an instance
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_SET_VISIBILITY_NAME,
+                VIEW_NATIVE_SET_VISIBILITY_SIG,
+                view_native_set_visibility as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
-    // 2026-06-05; `native_setBackgroundDrawable` from the ART No-implementation-found line, 2026-06-05).
+    // 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility` from the ART
+    // No-implementation-found lines, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility"
     );
     Ok(())
 }
@@ -3191,6 +3605,13 @@ pub const PAINT_CLASS: &JNIStr = jni_str!("android/graphics/Paint");
 const PAINT_NATIVE_CREATE_NAME: &JNIStr = jni_str!("native_create");
 const PAINT_NATIVE_CREATE_SIG: &JNIStr = jni_str!("()J");
 
+// JNI name + descriptor for Paint.native_set_color, from the ART-reported signature `void
+// android.graphics.Paint.native_set_color(long, int)` (run log 2026-06-05, accelerometerdemo's
+// ColorDrawable.<init> → Paint.setColor): a static native (the mangled name takes the paint handle
+// as its first arg), descriptor `(JI)V`.
+const PAINT_NATIVE_SET_COLOR_NAME: &JNIStr = jni_str!("native_set_color");
+const PAINT_NATIVE_SET_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
+
 /// `Paint.native_create()` → a real Eclipse-owned [`paint_registry`] handle (2026-06-05).
 ///
 /// JNI ABI: a `static` native returning `jlong` (the mangled name has no receiver-typed overload), so
@@ -3227,6 +3648,36 @@ extern "system" fn paint_native_create<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `Paint.native_set_color(long native_paint, int color)` → record the ARGB color on the paint
+/// (2026-06-05).
+///
+/// JNI ABI: a `static` native returning void (the mangled name has no receiver-typed overload), so
+/// the parameters are `(EnvUnowned, JClass, jlong native_paint, jint color)`. Writes `color` into the
+/// paint's [`paint_registry`] slot (the same `color` field `PaintState` already holds). A bad/stale
+/// handle is logged and ignored (the registry rejects it — never UB or panic).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic — the correct neutral value for this `void` native.
+extern "system" fn paint_native_set_color<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    color: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = paint_registry::with_paint(native_paint, |p| p.color = color) {
+            tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                error = %e,
+                "Paint.native_set_color: invalid paint handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.graphics.Paint`'s natives.
 ///
 /// Registered before step 4, alongside the View/Window natives, since the View hierarchy's
@@ -3249,13 +3700,178 @@ fn register_paint_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 paint_native_create as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `paint_native_set_color` matches the paired `(JI)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PAINT_NATIVE_SET_COLOR_NAME,
+                PAINT_NATIVE_SET_COLOR_SIG,
+                paint_native_set_color as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/graphics/Paint; the fn pointer's signature matches its
-    // `native_create` declaration (from the ART-reported signature, 2026-06-05).
+    // SAFETY: `class` is the loaded android/graphics/Paint; the fn pointers' signatures match its
+    // `native_create`/`native_set_color` declarations (from the ART-reported signatures, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/graphics/Paint",
-        "registered Eclipse's non-GTK backing for Paint.native_create"
+        "registered Eclipse's non-GTK backing for Paint.native_create + native_set_color"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.graphics.Matrix native objects =================
+//
+// 2026-06-05: AppCompat's `VectorDrawableCompat.<init>` constructs an `android.graphics.Matrix`
+// during step 5 (`setContentView` → `AppCompatDrawableManager.checkVectorDrawableSetup`), surfacing
+// `long android.graphics.Matrix.native_create(long)` (run log 2026-06-05, accelerometerdemo). A
+// `Matrix` is AOSP's 3x3 transform — **pure float math, no GPU/raster/GTK needed** — so it is backed
+// by the Eclipse-owned [`matrix_registry`] generational slab (a slab index, NOT a raw pointer). The
+// math is REAL and exact (3x3 multiply / perspective map), never a sentinel: a Matrix's transform is
+// load-bearing for the vector-drawable geometry, so faking it is forbidden (AGENTS.md core principle).
+// Each Matrix native is added here as the run surfaces it, with the descriptor taken from the exact
+// ART `No implementation found` line + the AOSP `Matrix.java` native declarations.
+
+/// `android.graphics.Matrix` (internal/slashed name for `find_class`) — hosts the Matrix natives.
+pub const MATRIX_CLASS: &JNIStr = jni_str!("android/graphics/Matrix");
+
+// JNI name + descriptor for Matrix.native_create, from the ART-reported signature `long
+// android.graphics.Matrix.native_create(long)` (run log 2026-06-05): a static native, descriptor
+// `(J)J`. The `long` arg is the source Matrix's native handle (`0` = a fresh identity matrix; a
+// non-zero handle = copy that matrix), per AOSP `Matrix(Matrix src)` / `Matrix()`.
+const MATRIX_NATIVE_CREATE_NAME: &JNIStr = jni_str!("native_create");
+const MATRIX_NATIVE_CREATE_SIG: &JNIStr = jni_str!("(J)J");
+
+// JNI name + descriptor for Matrix.finalizer, from the ART-reported signature `void
+// android.graphics.Matrix.finalizer(long)` (run log 2026-06-05): a static native, descriptor `(J)V`.
+// AOSP's `Matrix` registers `finalizer` as its `sNativeFinalizer` via `sun.misc.Cleaner`/`NativeAllocationRegistry`;
+// it frees the native matrix object. Eclipse frees the matrix_registry slot (so the handle becomes
+// stale and the slot can be reused) — runs on the GC/finalizer thread.
+const MATRIX_FINALIZER_NAME: &JNIStr = jni_str!("finalizer");
+const MATRIX_FINALIZER_SIG: &JNIStr = jni_str!("(J)V");
+
+/// `Matrix.native_create(long src)` → a real Eclipse-owned [`matrix_registry`] handle (2026-06-05).
+///
+/// JNI ABI: a `static` native (`(J)J`), so the parameters are `(EnvUnowned, JClass, jlong src)`.
+/// `src == 0` allocates a fresh identity matrix; a non-zero `src` allocates a COPY of that matrix's
+/// value (exact, via [`matrix_registry::get`]). Returns the new slab handle (≥ 1, never `0`). On a
+/// registry error returns `0` (AOSP treats a `0` native instance as the identity, so this degrades to
+/// an identity Matrix rather than UB).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
+/// error/panic.
+extern "system" fn matrix_native_create<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    src: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        // Copy the source matrix's value (identity when src == 0), then allocate a new slab slot
+        // holding that value — exact, no aliasing of the source slot.
+        let value = match matrix_registry::get(src) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.Matrix",
+                    src,
+                    error = %e,
+                    "Matrix.native_create: source handle invalid → identity"
+                );
+                matrix_registry::Affine::IDENTITY
+            }
+        };
+        match matrix_registry::allocate(value) {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.graphics.Matrix",
+                    src,
+                    handle,
+                    "Matrix.native_create: allocated non-GTK matrix-registry handle"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.Matrix",
+                    error = %e,
+                    "Matrix.native_create: matrix-registry allocate failed → 0 (identity)"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Matrix.finalizer(long native_instance)` → free the Eclipse-owned [`matrix_registry`] slot
+/// (2026-06-05).
+///
+/// JNI ABI: a `static` native returning void (AOSP registers it as the `sNativeFinalizer` run by
+/// `NativeAllocationRegistry`/`Cleaner` on the GC/finalizer thread), so the parameters are
+/// `(EnvUnowned, JClass, jlong native_instance)`. Frees the matrix slot so its handle becomes stale
+/// and the slot can be reused. A `0` handle (the identity sentinel, which has no slot) or a
+/// stale/already-freed handle is logged at debug and ignored (the registry rejects it — never UB or
+/// double-free; the generational slab makes a freed handle permanently stale).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic — the correct neutral value for this `void` native.
+extern "system" fn matrix_finalizer<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_instance: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = matrix_registry::free(native_instance) {
+            tracing::debug!(
+                target: "android.graphics.Matrix",
+                native_instance,
+                error = %e,
+                "Matrix.finalizer: handle already freed / identity sentinel (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Matrix`'s natives.
+///
+/// Registered before step 4, alongside the View/Paint natives, since AppCompat's drawable manager
+/// constructs a `Matrix` during step 5. Each native is implemented against [`matrix_registry`] with
+/// exact 3x3 affine/perspective math (no GTK, no raster).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do — each native is written to the exact descriptor the run reported. Every native body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_matrix_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(MATRIX_CLASS)?;
+    let methods = [
+        // SAFETY: `matrix_native_create` matches the paired `(J)J` signature as a static native;
+        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
+        // takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                MATRIX_NATIVE_CREATE_NAME,
+                MATRIX_NATIVE_CREATE_SIG,
+                matrix_native_create as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `matrix_finalizer` matches the paired `(J)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                MATRIX_FINALIZER_NAME,
+                MATRIX_FINALIZER_SIG,
+                matrix_finalizer as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/graphics/Matrix; the fn pointers' signatures match its
+    // `native_create`/`finalizer` declarations (from the ART-reported signatures, 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/graphics/Matrix",
+        "registered Eclipse's non-GTK backing for Matrix.native_create + finalizer"
     );
     Ok(())
 }
@@ -3447,6 +4063,98 @@ fn register_image_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+/// `android.widget.ImageButton` (internal/slashed name) — re-resolves `native_constructor` per class.
+///
+/// 2026-06-05: AppCompat's `Toolbar` builds an `AppCompatImageButton` (extends `ImageButton extends
+/// ImageView`) for its navigation button; ART resolved `native_constructor` against the `ImageButton`
+/// class (`No implementation found for long android.widget.ImageButton.native_constructor(Context,
+/// AttributeSet)`, run log 2026-06-05). Same `(Context, AttributeSet)J` signature as View/ImageView,
+/// so it reuses the class-agnostic [`view_native_constructor`] (records `android.widget.ImageButton`).
+pub const IMAGE_BUTTON_CLASS: &JNIStr = jni_str!("android/widget/ImageButton");
+
+// 2026-06-05: `View.setOnClickListener` calls `nativeSetOnClickListener(widget)` to mark the view
+// clickable on its native peer; ART resolved it against the ImageButton class (`No implementation
+// found for void android.widget.ImageButton.nativeSetOnClickListener(long)`, run log 2026-06-05, the
+// Toolbar nav button). Instance native, descriptor `(J)V`. The draw-free lifecycle dispatches no
+// input, so this validates the handle + no-ops (click dispatch is the deferred input/render build).
+const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
+const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
+
+/// `View.nativeSetOnClickListener(long widget)` → validate the view handle; no-op (no input dispatch
+/// in the draw-free lifecycle, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle.
+/// Validates it through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
+/// ignored, never UB) and no-ops: Eclipse's lifecycle dispatches no touch events yet, so marking the
+/// view clickable has no consumer (input dispatch is the deferred build). Surfaced 2026-06-05 by
+/// AppCompat's Toolbar setting its navigation button's click listener.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn image_button_set_on_click_listener<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.widget.ImageButton",
+                widget,
+                error = %e,
+                "ImageButton.nativeSetOnClickListener: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.widget.ImageButton`'s peer natives.
+///
+/// `native_constructor` reuses the class-agnostic [`view_native_constructor`] (records the receiver's
+/// actual class in [`view_registry`]); `nativeSetOnClickListener` validates the handle + no-ops.
+/// Registered before step 4, alongside the View/ImageView natives, because ART resolves natives per
+/// declaring class.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do — `view_native_constructor` is the exact `(Context, AttributeSet)J` instance native and
+/// `image_button_set_on_click_listener` the `(J)V` instance native. Each body is `catch_unwind`-guarded
+/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(IMAGE_BUTTON_CLASS)?;
+    let methods = [
+        // SAFETY: `view_native_constructor` matches the paired
+        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
+        // (shared with View/ImageView native_constructor).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_CONSTRUCTOR_NAME,
+                VIEW_NATIVE_CONSTRUCTOR_SIG,
+                view_native_constructor as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `image_button_set_on_click_listener` matches the paired `(J)V` signature as an
+        // instance native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME,
+                IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG,
+                image_button_set_on_click_listener as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/widget/ImageButton; the fn pointers' signatures match its
+    // re-resolved `native_constructor`/`nativeSetOnClickListener` (surfaced by the run lines 2026-06-05).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/widget/ImageButton",
+        "registered Eclipse's non-GTK backing for ImageButton.native_constructor + nativeSetOnClickListener"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.graphics.drawable.Drawable.native_constructor ===
 //
 // 2026-06-05: a launcher that loads a drawable in onCreate (e.g. AdaptiveIconDemo's
@@ -3478,6 +4186,14 @@ pub const DRAWABLE_CLASS: &JNIStr = jni_str!("android/graphics/drawable/Drawable
 // line + the `Drawable.<init> → native_constructor` stack.)
 const DRAWABLE_NATIVE_CONSTRUCTOR_NAME: &JNIStr = jni_str!("native_constructor");
 const DRAWABLE_NATIVE_CONSTRUCTOR_SIG: &JNIStr = jni_str!("()J");
+
+// JNI name + descriptor for Drawable.native_unref, from the ART-reported signature `void
+// android.graphics.drawable.Drawable.native_unref(long)` (run log 2026-06-05): a static native,
+// descriptor `(J)V`. AOSP registers it as the drawable's native-allocation free callback (run on the
+// GC/finalizer thread). The handle is the non-pointer [`DRAWABLE_HANDLE_SENTINEL`] (no registry slot
+// backs it), so unref is a sound no-op.
+const DRAWABLE_NATIVE_UNREF_NAME: &JNIStr = jni_str!("native_unref");
+const DRAWABLE_NATIVE_UNREF_SIG: &JNIStr = jni_str!("(J)V");
 
 /// The non-zero, non-pointer sentinel `Drawable.native_constructor()` returns as `mNativePtr`.
 ///
@@ -3511,6 +4227,31 @@ extern "system" fn drawable_native_constructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `Drawable.native_unref(long native_ptr)` → free the native drawable peer (2026-06-05).
+///
+/// JNI ABI: a `static` native returning void (AOSP runs it as the drawable's native-allocation free
+/// callback on the GC/finalizer thread), so the parameters are `(EnvUnowned, JClass, jlong native_ptr)`.
+/// `native_ptr` is the non-pointer [`DRAWABLE_HANDLE_SENTINEL`] (no registry slot backs it — see the
+/// section comment), so unref is a sound no-op. It is NOT dereferenced.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic — the correct neutral value for this `void` native.
+extern "system" fn drawable_native_unref<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_ptr: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.drawable.Drawable",
+            native_ptr,
+            "Drawable.native_unref: no-op (sentinel handle, no registry slot)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.graphics.drawable.Drawable`'s `native_constructor`.
 ///
 /// Locates `android/graphics/drawable/Drawable` and registers the native via `RegisterNatives` (which
@@ -3535,14 +4276,22 @@ fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 drawable_native_constructor as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `drawable_native_unref` matches the paired `(J)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                DRAWABLE_NATIVE_UNREF_NAME,
+                DRAWABLE_NATIVE_UNREF_SIG,
+                drawable_native_unref as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/graphics/drawable/Drawable; the fn pointer's signature
-    // matches its `native_constructor` (AOSP `Drawable.java`, `private native long native_constructor()`,
-    // surfaced by the run line 2026-06-05).
+    // SAFETY: `class` is the loaded android/graphics/drawable/Drawable; the fn pointers' signatures
+    // match its `native_constructor`/`native_unref` (AOSP `Drawable.java` + the ART-reported signatures,
+    // surfaced by the run lines 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/graphics/drawable/Drawable",
-        "registered Eclipse's non-GTK backing for Drawable.native_constructor"
+        "registered Eclipse's non-GTK backing for Drawable.native_constructor + native_unref"
     );
     Ok(())
 }
@@ -4119,6 +4868,11 @@ fn drive_lifecycle(
     // declaring class (ImageView re-declares native_constructor), so this must be bound before step 4.
     // Reuses the class-agnostic View constructor backing (records android.widget.ImageView in the tree).
     register_image_view_natives(env)?;
+    // Bind android.widget.ImageButton's native_constructor on its own class — AppCompat's Toolbar
+    // builds an AppCompatImageButton (extends ImageButton) during step 5's setContentView, and ART
+    // resolves natives per declaring class, so this must be bound before step 4. Reuses the
+    // class-agnostic View constructor backing (records android.widget.ImageButton in the tree).
+    register_image_button_natives(env)?;
     // Bind android.graphics.drawable.Drawable's native_constructor on its own class — a launcher's
     // onCreate may load a drawable during step 5 (e.g. AdaptiveIconDemo's getDrawable), so this must be
     // bound before step 4. GTK-free; returns a non-zero non-pointer sentinel (no draw pass runs).
@@ -4131,6 +4885,10 @@ fn drive_lifecycle(
     // construct during step 5's setContentView, so this must be bound before step 4. Bound non-GTK
     // against paint_registry (config only; no drawing).
     register_paint_natives(env)?;
+    // Bind android.graphics.Matrix's natives on its own class — AppCompat's VectorDrawableCompat
+    // constructs a Matrix during step 5's setContentView (drawable manager), so this must be bound
+    // before step 4. Bound non-GTK against matrix_registry with exact 3x3 affine math (no drawing).
+    register_matrix_natives(env)?;
 
     // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
     // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
@@ -4722,6 +5480,17 @@ mod tests {
             ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG.to_str(),
             "(ISLandroid/util/TypedValue;Z)I"
         );
+        // loadThemeAttributeValue bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature `(JILandroid/util/TypedValue;Z)I` (mangled `...__JILandroid_util_TypedValue_2Z`,
+        // run log 2026-06-05, accelerometerdemo's Theme.resolveAttribute); pin name + descriptor.
+        assert_eq!(
+            ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME.to_str(),
+            "loadThemeAttributeValue"
+        );
+        assert_eq!(
+            ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG.to_str(),
+            "(JILandroid/util/TypedValue;Z)I"
+        );
         assert_eq!(CHAR_SEQUENCE_SIG.to_str(), "Ljava/lang/CharSequence;");
         assert_eq!(RES_VALUE_TYPE_STRING, 0x03);
         assert_eq!(ECLIPSE_ASSET_COOKIE, 1);
@@ -4931,6 +5700,31 @@ mod tests {
             XML_BLOCK_GET_ATTR_STRING_VALUE_SIG.to_str(),
             "(JI)Ljava/lang/String;"
         );
+        // nativeGetAttributeCount: `(J)I` — surfaced 2026-06-05 by AppCompatColorStateListInflater.
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_COUNT_NAME.to_str(),
+            "nativeGetAttributeCount"
+        );
+        assert_eq!(XML_BLOCK_GET_ATTR_COUNT_SIG.to_str(), "(J)I");
+        // nativeGetAttributeResource: `(JI)I` — the attribute NAME's resource id
+        // (getAttributeNameResource), surfaced 2026-06-05 by AppCompatColorStateListInflater.
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_RESOURCE_NAME.to_str(),
+            "nativeGetAttributeResource"
+        );
+        assert_eq!(XML_BLOCK_GET_ATTR_RESOURCE_SIG.to_str(), "(JI)I");
+        // nativeGetAttributeDataType/Data: `(JI)I` — surfaced 2026-06-05 by VectorDrawableCompat
+        // reading <vector>/<path> attribute types+values via AttributeSet/TypedArrayUtils.
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_DATA_TYPE_NAME.to_str(),
+            "nativeGetAttributeDataType"
+        );
+        assert_eq!(XML_BLOCK_GET_ATTR_DATA_TYPE_SIG.to_str(), "(JI)I");
+        assert_eq!(
+            XML_BLOCK_GET_ATTR_DATA_NAME.to_str(),
+            "nativeGetAttributeData"
+        );
+        assert_eq!(XML_BLOCK_GET_ATTR_DATA_SIG.to_str(), "(JI)I");
         // nativeGetLineNumber: `(J)I`, returns -1 (axml does not track source lines).
         assert_eq!(
             XML_BLOCK_GET_LINE_NUMBER_NAME.to_str(),
@@ -4976,6 +5770,9 @@ mod tests {
         assert_eq!(SYSTEM_CLOCK_CLASS.to_str(), "android/os/SystemClock");
         assert_eq!(ELAPSED_REALTIME_NAME.to_str(), "elapsedRealtime");
         assert_eq!(ELAPSED_REALTIME_SIG.to_str(), "()J");
+        // uptimeMillis() → `()J`, surfaced 2026-06-05 by Handler.postDelayed; same monotonic source.
+        assert_eq!(UPTIME_MILLIS_NAME.to_str(), "uptimeMillis");
+        assert_eq!(UPTIME_MILLIS_SIG.to_str(), "()J");
     }
 
     #[test]
@@ -5044,6 +5841,13 @@ mod tests {
             "native_setBackgroundDrawable"
         );
         assert_eq!(VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG.to_str(), "(JJ)V");
+        // native_setVisibility: the ART No-implementation-found line → `(JIF)V` (long widget, int
+        // visibility, float alpha), surfaced 2026-06-05 by AppCompat sub-decor View.<init>.
+        assert_eq!(
+            VIEW_NATIVE_SET_VISIBILITY_NAME.to_str(),
+            "native_setVisibility"
+        );
+        assert_eq!(VIEW_NATIVE_SET_VISIBILITY_SIG.to_str(), "(JIF)V");
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
@@ -5090,6 +5894,25 @@ mod tests {
         assert_eq!(PAINT_CLASS.to_str(), "android/graphics/Paint");
         assert_eq!(PAINT_NATIVE_CREATE_NAME.to_str(), "native_create");
         assert_eq!(PAINT_NATIVE_CREATE_SIG.to_str(), "()J");
+        // native_set_color(long, int) — surfaced 2026-06-05 by ColorDrawable.<init> → Paint.setColor.
+        assert_eq!(PAINT_NATIVE_SET_COLOR_NAME.to_str(), "native_set_color");
+        assert_eq!(PAINT_NATIVE_SET_COLOR_SIG.to_str(), "(JI)V");
+    }
+
+    #[test]
+    fn matrix_native_name_sig_and_class_match_art_reported() {
+        // Pin android.graphics.Matrix.native_create's class, method name, and JNI descriptor against
+        // the exact signature ART reported missing (`No implementation found for long
+        // android.graphics.Matrix.native_create(long)`, run log 2026-06-05, accelerometerdemo): a
+        // transcription regression would make RegisterNatives throw NoSuchMethodError when AppCompat's
+        // VectorDrawableCompat constructs a Matrix. The arg is the source Matrix native handle (0 =
+        // identity). Host-independent constants.
+        assert_eq!(MATRIX_CLASS.to_str(), "android/graphics/Matrix");
+        assert_eq!(MATRIX_NATIVE_CREATE_NAME.to_str(), "native_create");
+        assert_eq!(MATRIX_NATIVE_CREATE_SIG.to_str(), "(J)J");
+        // finalizer(long) → `(J)V`, surfaced 2026-06-05; frees the matrix_registry slot.
+        assert_eq!(MATRIX_FINALIZER_NAME.to_str(), "finalizer");
+        assert_eq!(MATRIX_FINALIZER_SIG.to_str(), "(J)V");
     }
 
     #[test]
@@ -5100,6 +5923,22 @@ mod tests {
         // RegisterNatives throws NoClassDefFoundError. The shared constructor name/sig are pinned by
         // view_native_names_sigs_and_class_match_view_java. Host-independent constant.
         assert_eq!(IMAGE_VIEW_CLASS.to_str(), "android/widget/ImageView");
+    }
+
+    #[test]
+    fn image_button_class_is_slashed_internal_name() {
+        // Pin android.widget.ImageButton's internal name: AppCompat's Toolbar builds an
+        // AppCompatImageButton (extends ImageButton) and ART resolved native_constructor against the
+        // ImageButton class (run log 2026-06-05), so register_image_button_natives must find the class
+        // by this exact name or RegisterNatives throws NoClassDefFoundError. The shared constructor
+        // name/sig are pinned by view_native_names_sigs_and_class_match_view_java. Host-independent.
+        assert_eq!(IMAGE_BUTTON_CLASS.to_str(), "android/widget/ImageButton");
+        // nativeSetOnClickListener(long) → `(J)V`, surfaced 2026-06-05 by Toolbar nav button (no-op).
+        assert_eq!(
+            IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME.to_str(),
+            "nativeSetOnClickListener"
+        );
+        assert_eq!(IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG.to_str(), "(J)V");
     }
 
     #[test]
@@ -5119,6 +5958,9 @@ mod tests {
             "native_constructor"
         );
         assert_eq!(DRAWABLE_NATIVE_CONSTRUCTOR_SIG.to_str(), "()J");
+        // native_unref(long) → `(J)V`, surfaced 2026-06-05; the drawable peer free callback (no-op).
+        assert_eq!(DRAWABLE_NATIVE_UNREF_NAME.to_str(), "native_unref");
+        assert_eq!(DRAWABLE_NATIVE_UNREF_SIG.to_str(), "(J)V");
         // Java's Drawable.<init> registers mNativePtr for native-allocation cleanup; it must be non-zero
         // (and is a plainly-non-pointer marker, never dereferenced — see register_drawable_natives docs).
         assert_ne!(DRAWABLE_HANDLE_SENTINEL, 0);
