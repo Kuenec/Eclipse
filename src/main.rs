@@ -110,12 +110,13 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("    {opt}");
     }
 
-    // Boot the ART VM from this (main) thread — the production entry point. Today this brings up
-    // a libcore VM (proving ART boots from Eclipse's graphics-free process — the Step 3.5
-    // thesis); reaching Roblox's onCreate (app classpath/Activity/native-lib/winit) is the next
-    // step. ART logs verbosely to stderr on first run (dex2oat compiles the boot image once).
-    println!("\n# Booting the ART VM (libcore; Roblox onCreate pending)…");
-    eclipse::runtime::boot(&plan)?;
-    println!("libcore ART VM booted ✓");
+    // Boot the ART VM from this (main) thread — the production entry point — with the APK on the
+    // classpath, so ART loads Roblox's Java (+ the android.* framework) alongside libcore.
+    // Driving the launcher Activity to onCreate (the GTK-coupled framework / Eclipse's own
+    // winit+Vulkan framework) is the next step. ART logs verbosely to stderr on first run
+    // (dex2oat compiles the boot image once).
+    println!("\n# Booting the ART VM with Roblox on the classpath…");
+    eclipse::runtime::boot(&plan, Some(std::path::Path::new(apk_path)))?;
+    println!("ART VM booted with Roblox's Java on the classpath ✓ (onCreate pending)");
     Ok(())
 }
