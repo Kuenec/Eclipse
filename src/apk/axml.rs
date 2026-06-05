@@ -299,15 +299,18 @@ impl<'a> StringPool<'a> {
 /// Decode a UTF-8 length-prefixed pool string at `start`.
 ///
 /// Layout: a *character* length, then a *byte* length; each is one byte, or — if the high bit
-/// `0x80` is set — two bytes `((first & 0x7F) << 8) | next`. The byte length governs the
-/// slice; the bytes are NUL-terminated UTF-8.
+/// `0x80` is set — two bytes `((first & 0x7F) << 8) | next`. The *byte length* is authoritative
+/// for the slice; a trailing NUL follows the data but is not part of it and is not consumed here.
 fn decode_utf8(buf: &[u8], start: usize) -> Result<String, AxmlError> {
     // Skip the character-count field, then read the byte-count field.
     let (_, after_char) = read_var_len_u8(buf, start)?;
     let (byte_len, after_len) = read_var_len_u8(buf, after_char)?;
     let end = after_len.checked_add(byte_len).ok_or(AxmlError::Overflow)?;
     let data = buf.get(after_len..end).ok_or(AxmlError::BadString)?;
-    String::from_utf8(data.to_vec()).map_err(|_| AxmlError::BadString)
+    // Validate UTF-8 in place (no intermediate Vec copy) and allocate the String once (§2.6).
+    std::str::from_utf8(data)
+        .map(str::to_owned)
+        .map_err(|_| AxmlError::BadString)
 }
 
 /// Decode a UTF-16LE length-prefixed pool string at `start`.
@@ -426,20 +429,20 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
                 match tag_str {
                     Some("manifest") => {
                         saw_manifest = true;
-                        if let Some(p) = attr_string(&attrs, None, "package") {
+                        if let Some(p) = attr_string(&attrs, Ns::None, "package") {
                             package = Some(p);
                         }
                     }
                     Some("uses-sdk") => {
-                        if let Some(v) = attr_int(&attrs, Some(()), "minSdkVersion") {
+                        if let Some(v) = attr_int(&attrs, Ns::Android, "minSdkVersion") {
                             min_sdk = Some(v);
                         }
-                        if let Some(v) = attr_int(&attrs, Some(()), "targetSdkVersion") {
+                        if let Some(v) = attr_int(&attrs, Ns::Android, "targetSdkVersion") {
                             target_sdk = Some(v);
                         }
                     }
                     Some("application") => {
-                        if let Some(b) = attr_bool(&attrs, Some(()), "largeHeap") {
+                        if let Some(b) = attr_bool(&attrs, Ns::Android, "largeHeap") {
                             large_heap = b;
                         }
                     }
@@ -450,8 +453,8 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
                 // turns out to be the MAIN/LAUNCHER one). targetActivity wins for aliases.
                 let activity_name = if matches!(tag_str, Some("activity") | Some("activity-alias"))
                 {
-                    attr_string(&attrs, Some(()), "targetActivity")
-                        .or_else(|| attr_string(&attrs, Some(()), "name"))
+                    attr_string(&attrs, Ns::Android, "targetActivity")
+                        .or_else(|| attr_string(&attrs, Ns::Android, "name"))
                 } else {
                     None
                 };
@@ -460,7 +463,7 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
                 // enclosing filter's stack entry.
                 if matches!(tag_str, Some("action") | Some("category")) {
                     if let Some(filter) = stack.last_mut() {
-                        if let Some(name) = attr_string(&attrs, Some(()), "name") {
+                        if let Some(name) = attr_string(&attrs, Ns::Android, "name") {
                             match (tag_str, name.as_str()) {
                                 (Some("action"), "android.intent.action.MAIN") => {
                                     filter.saw_main = true;
@@ -577,13 +580,19 @@ fn parse_start_element(
     Ok((tag, attrs))
 }
 
-/// Find an attribute by name (and namespace constraint) and return its string value.
-///
-/// `require_android`: `None` = the attribute must have **no** namespace (e.g. `package`);
-/// `Some(())` = the attribute must be in the android namespace (e.g. `android:name`).
-fn attr_string(attrs: &[Attribute], require_android: Option<()>, name: &str) -> Option<String> {
+/// Namespace constraint for an attribute lookup (clearer than a bare `Option<()>` flag).
+#[derive(Clone, Copy)]
+enum Ns {
+    /// The attribute must have **no** namespace (e.g. the root `package`).
+    None,
+    /// The attribute must be in the android namespace (e.g. `android:name`).
+    Android,
+}
+
+/// Find an attribute by name + namespace constraint and return its string value.
+fn attr_string(attrs: &[Attribute], ns: Ns, name: &str) -> Option<String> {
     for a in attrs {
-        if a.name.as_deref() == Some(name) && ns_matches(a, require_android) {
+        if a.name.as_deref() == Some(name) && ns_matches(a, ns) {
             if let AttrValue::Str(s) = &a.value {
                 return Some(s.clone());
             }
@@ -592,10 +601,10 @@ fn attr_string(attrs: &[Attribute], require_android: Option<()>, name: &str) -> 
     None
 }
 
-/// Find an android-namespace integer attribute (`TYPE_INT_DEC`/`HEX`) by name.
-fn attr_int(attrs: &[Attribute], require_android: Option<()>, name: &str) -> Option<u32> {
+/// Find an integer attribute (`TYPE_INT_DEC`/`HEX`) by name + namespace constraint.
+fn attr_int(attrs: &[Attribute], ns: Ns, name: &str) -> Option<u32> {
     for a in attrs {
-        if a.name.as_deref() == Some(name) && ns_matches(a, require_android) {
+        if a.name.as_deref() == Some(name) && ns_matches(a, ns) {
             if let AttrValue::Int(v) = &a.value {
                 return Some(*v);
             }
@@ -604,10 +613,10 @@ fn attr_int(attrs: &[Attribute], require_android: Option<()>, name: &str) -> Opt
     None
 }
 
-/// Find an android-namespace boolean attribute (`TYPE_INT_BOOLEAN`) by name.
-fn attr_bool(attrs: &[Attribute], require_android: Option<()>, name: &str) -> Option<bool> {
+/// Find a boolean attribute (`TYPE_INT_BOOLEAN`) by name + namespace constraint.
+fn attr_bool(attrs: &[Attribute], ns: Ns, name: &str) -> Option<bool> {
     for a in attrs {
-        if a.name.as_deref() == Some(name) && ns_matches(a, require_android) {
+        if a.name.as_deref() == Some(name) && ns_matches(a, ns) {
             if let AttrValue::Bool(b) = &a.value {
                 return Some(*b);
             }
@@ -616,11 +625,11 @@ fn attr_bool(attrs: &[Attribute], require_android: Option<()>, name: &str) -> Op
     None
 }
 
-/// Namespace gate: `None` requires no namespace; `Some(())` requires the android namespace.
-fn ns_matches(a: &Attribute, require_android: Option<()>) -> bool {
-    match require_android {
-        Some(()) => a.is_android(),
-        None => a.ns.is_none(),
+/// Namespace gate for [`Ns`].
+fn ns_matches(a: &Attribute, ns: Ns) -> bool {
+    match ns {
+        Ns::Android => a.is_android(),
+        Ns::None => a.ns.is_none(),
     }
 }
 

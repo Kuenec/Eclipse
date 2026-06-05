@@ -3,12 +3,16 @@
 //! Open-source, Rust, distro-agnostic runtime for running the **Android x86-64 build of
 //! Roblox** natively on Linux — an open alternative to the closed-source Sober.
 //!
-//! ## Status
-//! Research/scoping is **complete** and the architecture + component set are **locked**.
-//! This crate is currently a **skeleton**: each module below documents a locked subsystem
-//! and its chosen library, but implementation has not begun. The first build step is the
-//! manual foundation-validation in `docs/m0-runbook.md` (M0), which runs *before* wiring
-//! up these modules.
+//! ## Status (2026-06-04)
+//! M0 (foundation validation) is **complete** and M1/M2 are underway. Implemented:
+//! [`diagnostics`] (tracing), [`config`] (Sober-schema config.json), [`apk`] (open a local
+//! APK, own total binary-AXML reader, native-ABI/engine detection, native-lib extraction,
+//! streaming SHA-256), [`runtime`] (host-ISA detection, `BootPlan`, and **booting the
+//! vendored ART VM** — `dlopen libart` + `JNI_CreateJavaVM` — with Roblox's Java on the
+//! classpath), and [`graphics`] (the host window via `winit`, no GTK). `eclipse run <apk>`
+//! boots the VM and opens the window. The remaining modules ([`audio`], [`input`],
+//! [`services`], [`bionic`], [`framework`]) are stubs; driving the Activity to `onCreate` +
+//! rendering (the `framework`) is the next phase. See `AGENTS.md` §5 for live state.
 //!
 //! ## Architecture (see `docs/` for the full picture)
 //! Eclipse follows the Android-Translation-Layer approach: run Roblox's own native engine
@@ -23,9 +27,9 @@
 //! - `docs/m0-runbook.md` — the foundation-validation step that comes next
 //!
 //! ## Subsystem modules
-//! Each module below is a documented stub mapping to a locked subsystem in
-//! `docs/component-map.md`; a `TODO(Mn)` note marks the milestone that implements it.
-//! See `AGENTS.md` for the project's engineering requirements.
+//! Each module maps to a subsystem in `docs/component-map.md`; some are implemented (above),
+//! the rest are documented stubs with a `TODO(Mn)` note marking the milestone that implements
+//! them. See `AGENTS.md` for the project's engineering requirements.
 
 pub mod apk;
 pub mod audio;

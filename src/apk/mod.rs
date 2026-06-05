@@ -213,13 +213,22 @@ impl Apk {
             let base = name.rsplit('/').next().unwrap_or(name.as_str());
             let dest = dest_dir.join(base);
             let mut entry = self.archive.by_name(&name)?;
-            // Idempotent: skip if already extracted with the right (uncompressed) size.
+            // Idempotent: skip if already extracted with the right (uncompressed) size. Safe
+            // because we publish only fully-written files (atomic temp+rename below), so a
+            // size match means the bytes are complete — never a truncated mid-copy file.
             if std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(entry.size()) {
                 extracted.push(dest);
                 continue;
             }
-            let mut out = File::create(&dest)?;
+            // 2026-06-04: write to a temp sibling, fsync, then rename into place. A kill mid-copy
+            // of the 111 MB libroblox.so leaves only a `.partial` file (never a same-size-but-
+            // corrupt dest the skip above would accept and System.loadLibrary would then load).
+            let tmp = dest_dir.join(format!("{base}.partial"));
+            let mut out = File::create(&tmp)?;
             io::copy(&mut entry, &mut out)?;
+            out.sync_all()?;
+            drop(out);
+            std::fs::rename(&tmp, &dest)?;
             extracted.push(dest);
         }
         Ok(extracted)

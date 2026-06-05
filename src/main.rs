@@ -1,8 +1,9 @@
 //! Eclipse launcher entry point.
 //!
-//! This is a placeholder CLI: the subsystems it will drive are still stubs (see
-//! `src/lib.rs`). It dispatches the intended subcommands and reports honest status so the
-//! binary is runnable today (`cargo run -- help`).
+//! Thin launcher CLI: `run` parses the APK, builds the ART [`BootPlan`](eclipse::runtime),
+//! boots the vendored ART VM (Roblox's Java on the classpath) and opens the host window;
+//! `config` shows the effective configuration. The framework that drives the Activity to
+//! `onCreate` and renders the engine is the next phase (see `docs/`).
 
 use std::process::ExitCode;
 
