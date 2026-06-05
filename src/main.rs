@@ -130,7 +130,10 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // winit+Vulkan framework) is the next step. ART logs verbosely to stderr on first run
     // (dex2oat compiles the boot image once).
     println!("\n# Booting the ART VM with Roblox on the classpath…");
-    eclipse::runtime::boot(
+    // Bind the owned VM handle (never `let _`, which would drop it immediately) and keep it alive
+    // across the winit event loop below: it is `!Send`/`!Sync`, pinning the VM to this main thread
+    // so the next increment's JNI calls (driven from inside the event loop) have a reachable VM.
+    let _vm = eclipse::runtime::boot(
         &plan,
         Some(std::path::Path::new(apk_path)),
         Some(&app_lib_dir),
@@ -139,7 +142,8 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
 
     // Open the host game window via winit (no GTK — keeps the low_4gb window clear for ART, the
     // Step 3.5 win). The Activity Surface + engine rendering will hang off this window next; for
-    // now it opens the window and runs the event loop until closed. Runs on the main thread.
+    // now it opens the window and runs the event loop until closed. Runs on the main thread, with
+    // `_vm` (the booted VM) still alive on it.
     println!("# Opening the host window (winit; close it to exit)…");
     eclipse::graphics::run_windowed(&format!("Eclipse — {}", manifest.package))?;
     Ok(())

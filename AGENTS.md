@@ -492,9 +492,16 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      Remaining UNCONFIRMED (linker/loader behavior only, doc §5): shim re-export acceptance by the
      bionic resolver, `cfg.d`-vs-ldpath precedence, `liblog`/`libm` load behavior, and whether
      `bionic_android_dlopen_ext` ignoring `dlextinfo` matters — all settle with one load probe.
-  3. JNI calls: add the full **`jni`** crate for safe `FindClass`/`CallStaticObjectMethod`/…;
-     **wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot from
-     the **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).
+  3. ✅ Thread/loop ownership now **encoded in a type**: `boot()` returns an owned, `!Send`/`!Sync`
+     `runtime::Vm` (raw `*mut JavaVM` field, NO `unsafe impl Send`/`Sync`); `main.rs` binds it
+     `let _vm = …` and keeps it alive across `graphics::run_windowed(…)`, pinning the VM to the
+     JNI-attached main thread so the next increment's JNI calls run from inside the event loop with
+     a reachable VM (2026-06-04). NEXT framework step — the JNI call sequence: add the full **`jni`**
+     crate (verify its API against **docs.rs/jni** — Context7 does not index `jni`) and drive ATL's
+     onCreate recipe from the event loop: `createApplication(J window)` →
+     `createContentProviders()` → `Application.onCreate()` → `createMainActivity(…)`. **Wrap every
+     Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot stays on the
+     **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).
   4. Once Roblox's Java shell runs, harvest `framework-worklist.txt` (missing `android.*` the
      framework must implement) — the deferred Step 4 data, and the spec for the winit framework.
   5. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
@@ -790,6 +797,33 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `docs/bionic-loader-plan.md` design note, then the deferred bionic-shim step
   (`libmediandk.so`/`libOpenMAXAL.so`) so the engine's transitive NDK natives resolve in the bionic
   namespace and `libroblox.so` links past relocation.
+- **2026-06-04** — **Thread/loop-ownership model encoded as the `!Send`/`!Sync` `Vm` handle (framework
+  frontier item 1).** `runtime::boot()` no longer discards the live VM: it returns an owned
+  `pub struct Vm { vm: *mut jni_sys::JavaVM }`. The raw-pointer field **alone** makes `Vm` auto-`!Send`
+  + `!Sync` (deliberately **no** `unsafe impl Send`/`Sync`), which pins the VM to the thread that
+  booted it — encoding the settled model at the type level: ART boots on the process **main** thread,
+  winit's event loop runs on that **same** main thread, the main thread stays JNI-attached after
+  `JNI_CreateJavaVM`, and the next increment's JNI calls (`onCreate`) happen from inside event-loop
+  callbacks on that attached main thread — never `AttachCurrentThread`/a cross-thread `JNIEnv`.
+  `main.rs::run_apk` binds `let _vm = boot(…)?` (never `let _`, which would drop it) and keeps it alive
+  across `graphics::run_windowed(…)` so the held VM is reachable for those later calls. **Libart
+  never-dlclose invariant preserved unchanged:** kept the existing `std::mem::forget(lib)` exactly
+  (a running VM's GC/JIT daemon threads execute libart's code, so `dlclose` is UB even at exit); `Vm`
+  therefore carries ONLY the `JavaVM` pointer, owns no `libloading::Library`, and has **no** `Drop`
+  (smallest clearly-correct mechanism, no UB). `DestroyJavaVM`-then-unload teardown stays a separately-
+  designed later increment. Regression guard: two dependency-free `compile_fail` doctests on `Vm`
+  (`assert_send`/`assert_sync`) that PASS today (Vm is `!Send`/`!Sync` ⇒ snippet fails to compile ⇒
+  `compile_fail` passes) and would FAIL the instant someone adds `unsafe impl Send`/`Sync` — proven
+  load-bearing (temporarily adding `unsafe impl Send for Vm` flipped the test to FAILED, then
+  reverted). The not-yet-read `vm` field is annotated `#[expect(dead_code, reason = …)]` (expect, not
+  allow, so it self-warns the moment the JNI increment reads it). No new deps (still `libloading` +
+  `jni-sys`; the full `jni` crate lands with the onCreate JNI sequence — its API verified against
+  docs.rs/jni since Context7 does not index it). Full gate green: fmt/build/clippy `-D warnings`/test
+  (39 unit + 2 new compile_fail doctests)/release. **onCreate is NOT reached yet** — this only makes
+  the booted VM an owned, thread-pinned, kept-alive handle; the createApplication/onCreate JNI call
+  sequence is the next framework increment. Owed dev-host check (cannot run in-harness): `cargo run --
+  run ~/eclipse-m0/atl_test_apks/demo_app.apk` must still boot ART + open the window + exit 0 (the
+  held-Vm change must not alter observable boot/window behavior).
 
 ---
 
