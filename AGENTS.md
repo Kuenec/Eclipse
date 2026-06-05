@@ -542,13 +542,32 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   draw-failed** (`/tmp/eclipse-render.log`). If Vulkan can't init (no ICD), it logs a typed warning and the
   window stays open blank (no crash). Sound owner struct: every handle freed in reverse order after
   `device_wait_idle` in `Drop`; no leaks/UB.
-  🔜 **IMMEDIATE FRONTIER (2026-06-05): draw the View tree into the surface.** The clear-and-present loop
-  proves the GPU path end-to-end; the **next step is rendering** the framework's recorded View tree (the
-  TextViews + ids + text are all in `framework::view_registry`, ready) — text/quads into the same swapchain
-  (needs a pipeline + glyph/quad draw, not just a clear). Then `onStart`/`onResume` if the demo needs it. For
-  Roblox specifically, the engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel
-  track, and the engine will eventually render into THIS window's swapchain via WSI translation. Stay non-GTK;
-  validate via dev-host `eclipse run`.
+  ✅ **DONE 2026-06-05: the recorded View tree is now DRAWN into the swapchain (layout + colored-quad
+  pipeline).** `view_registry` gained a lock-free `ACTIVE_ROOT` cell (published by `Window.set_widget_as_root`)
+  + `snapshot_tree()` (a depth-first, owned `Vec<RenderNode>` — class_name/text/depth — the renderer reads each
+  frame, depth-capped, stale/empty root → empty snapshot, never UB). `graphics.rs` gained: a GPU-free MINIMAL
+  layout (`layout_views` — a vertical stack indented by nesting depth against the swapchain extent; real
+  measure/layout per LayoutParams/gravity is the documented follow-up since those natives were no-op stubs), a
+  colored-quad **graphics pipeline** (embedded precompiled SPIR-V in `shaders/quad.{vert,frag}.spv` via
+  `include_bytes!` — no build-time shader compiler, no network; regenerable per `shaders/README.md`), a
+  host-visible|coherent vertex buffer rebuilt each frame (safe: the single-frame-in-flight `in_flight` fence is
+  waited before re-upload), dynamic viewport+scissor (no rebuild on resize), and a `record_draw` that clears
+  then binds+draws the per-view quads (alpha-blended so text can composite later). **FAITHFUL status:** on the
+  dev-host demo run (`/tmp/eclipse-render.log`) it logs `Vulkan surface + swapchain initialized … extent=800x600
+  images=3`, then `drawing recorded View tree into the swapchain views=4 quads=4` for **8606 frames over 60 s**
+  with **zero VK_ERROR / panic / draw-failed / validation** — the demo's 4 recorded views (FrameLayout root +
+  the inflated TextViews) are laid out + drawn as 4 depth-colored quads and presented. Teardown extended
+  (pipeline+layout+vertex buffer/memory freed in `Drop` after `device_wait_idle`; no leaks/UB). GPU-free unit
+  tests cover layout (stack/indent/clamp), pixel→NDC, 6-verts-per-quad, SPIR-V well-formedness, host-visible
+  memory selection, and the snapshot walk (pre-order/depth, stale-root→empty). **119 unit + 2 doctests pass.**
+  🔜 **IMMEDIATE FRONTIER (2026-06-05): TEXT — rasterize each TextView's text into the quads.** The quad draw
+  proves the pipeline path end-to-end; the next step is a **font + glyph atlas**: load a system TTF portably
+  (`fc-match`/known `/usr/share/fonts` paths — detect, don't hardcode), rasterize with **ab_glyph** (API
+  confirmed via Context7) into an **R8** atlas texture, add a textured-quad pipeline (sampler + descriptor set)
+  and draw each `RenderNode.text` over its view rect. Then `onStart`/`onResume` if the demo needs it. For Roblox
+  specifically, the engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel track, and
+  the engine will eventually render into THIS window's swapchain via WSI translation. Stay non-GTK; validate via
+  dev-host `eclipse run`.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -1702,6 +1721,42 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   signatures) + read the local `ash-window 0.13.0`/`winit 0.30.13` sources to confirm `create_surface` returns
   `VkSurfaceKHR` and `Window` impls rwh_06 `HasDisplayHandle`/`HasWindowHandle`. Cyber-safeguard did NOT trip
   (graphics only — no bionic/JNI-C/content-res source read).
+- **2026-06-05** — 🟢 **The recorded View tree is now DRAWN into the swapchain (layout + colored-quad pipeline)**
+  — the framework's render capstone, the increment beyond the clear. **What:** (1) `framework::view_registry`
+  gained a lock-free process-global `ACTIVE_ROOT: AtomicI64` (published by `Window.set_widget_as_root` — the
+  single source of truth for "what is on screen") + `snapshot_tree()` → an owned, depth-first `Vec<RenderNode>`
+  (`class_name`/`text`/`depth`) the renderer reads each frame; the walk is iterative, depth-capped (256, matching
+  axml), validates each handle against the generational slab so a stale/empty root yields an EMPTY snapshot (never
+  UB / wrong subtree). (2) `src/graphics.rs` gained a **GPU-free MINIMAL layout** `layout_views` (a vertical stack,
+  each node one full-width row indented `INDENT_PX*depth`, depth-colored from a 4-entry palette, width clamped ≥1
+  so deep indents can't make an invalid quad) — documented as minimal; real measure/layout per LayoutParams/
+  gravity/weight is the follow-up (those view natives were no-op stubs). (3) A **colored-quad graphics pipeline**:
+  embedded precompiled SPIR-V (`shaders/quad.{vert,frag}` + committed `.spv`, `include_bytes!`-loaded — **no
+  build-time shader compiler, no network**, portability §9; regen instructions in `shaders/README.md`), one vertex
+  binding matching `#[repr(C)] QuadVertex { pos:[f32;2]@0, color:[f32;4]@8 }`, TRIANGLE_LIST, no cull, straight-
+  alpha blend (so text composites later), **dynamic viewport+scissor** (resize needs no pipeline rebuild), empty
+  pipeline layout (color is per-vertex). (4) A host-visible|coherent **vertex buffer** rebuilt each frame
+  (`upload_vertices` grows-on-demand; **sound** because `draw_frame` waits the single-frame-in-flight `in_flight`
+  fence before re-upload, so the prior frame's GPU read has completed; coherent memory → no explicit flush).
+  (5) `record_clear` → `record_draw`: clears to Roblox-blue then, when there are vertices, sets the dynamic
+  viewport/scissor to the extent, binds the pipeline + VB, and `cmd_draw`s 6 verts/quad. Pixel→NDC via
+  `pixel_rect_to_quad` (Vulkan y-down matches pixel space). **Sound teardown:** pipeline+layout+VB/memory freed in
+  `Drop` after `device_wait_idle`, reverse order, null-guarded; every new `unsafe` has a `// SAFETY:` note; each
+  fallible build step tears down already-created handles (no partial leak). **FAITHFUL status — VALIDATED on the
+  demo** (`RUST_LOG=eclipse=trace timeout 60 cargo run --release -- run demo_app.apk`, `/tmp/eclipse-render.log`,
+  EXIT=124 = present loop ran the full 60 s): after `Activity.onCreate`, the log shows `Vulkan surface + swapchain
+  initialized … extent=800x600 images=3`, then `drawing recorded View tree into the swapchain views=4 quads=4` for
+  **8606 frames** with **zero `VK_ERROR`/panic/draw-failed/validation** (grep count 0). So: the layout+draw path
+  runs every frame and presents the demo's 4 recorded views (FrameLayout root + inflated TextViews) as 4 depth-
+  colored quads. **TEXT is NOT YET DRAWN** — the next increment (ab_glyph R8 glyph atlas + textured-quad pipeline;
+  font found portably via fc-match/known font dirs). **Regression guard:** GPU-free unit tests on the new pure
+  logic — layout stack/indent/width-clamp/empty, pixel→NDC corners, 6-verts-per-quad + shared color, embedded
+  SPIR-V well-formedness (magic+length), host-visible memory-type selection, and the snapshot walk (pre-order +
+  depth, stale-root→empty) — `cargo test` **119 unit + 2 doctests pass** (was 97). The live draw is dev-host-
+  validated (winit needs the main thread; ART aborts under the cargo-test harness). **Context7:** `/ash-rs/ash`
+  (pipeline/vertex-input/vertex-buffer/`cmd_draw`/dynamic-state) + `/alexheretic/ab-glyph` (FontRef/outline_glyph/
+  draw/ScaleFont — for the deferred text step). Cyber-safeguard did NOT trip (Eclipse's own graphics + view_registry
+  only — no bionic/JNI-C/content-res source read).
 
 ---
 
