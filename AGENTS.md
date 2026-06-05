@@ -604,11 +604,22 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   vertically. GPU-free unit tests added for MeasureSpec resolution (match/wrap/exact + unspecified parent),
   root MATCH_PARENT fills the extent, LinearLayout vertical stacking, FrameLayout gravity (incl. the -1 guard),
   WRAP-to-glyph-metrics, trivial weight, and padding insets. **131 unit + 2 doctests pass.**
-  🔜 **IMMEDIATE FRONTIER (2026-06-05): `onStart`/`onResume`.** With the faithful layout done, the next
-  framework refinement is driving `onStart`/`onResume` if the demo needs it (the recipe targets `onCreate`).
-  For Roblox specifically, the engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel
-  track, and the engine will eventually render into THIS window's swapchain via WSI translation. Stay non-GTK;
-  validate via dev-host `eclipse run`.
+  ✅ **DONE 2026-06-05: `onStart`/`onResume` DRIVEN — the demo reaches the RESUMED (running/interactive)
+  state.** `drive_lifecycle` (src/framework.rs) now drives recipe steps 1–**7**: after step 5
+  (`Activity.onCreate`) it calls the **same step-4 `Activity` object**'s `onStart()` `()V` then `onResume()`
+  `()V` (no-arg instance calls = ATL's `activity_start`), each through `checked()` (typed `FrameworkError::Jni`,
+  pending-exception described+cleared, no unwrap). Added typed constants `STEP6_ACTIVITY_ON_START` +
+  `STEP7_ACTIVITY_ON_RESUME` and `LifecycleProgress::ActivityResumed`. **FAITHFUL status — VALIDATED on the demo**
+  (`/tmp/eclipse-render.log`): the demo's OWN overrides run — `- onStart - yay!` then `- onResume - yay!` — then
+  `Activity resumed: recipe steps 1–7 driven` + `framework lifecycle driven: ActivityResumed ✓`; the winit window
+  then stands up the Vulkan swapchain (`extent=800x600 images=3`) and runs the full 60 s with **zero
+  VK_ERROR/panic/Exception/draw-failed** (EXIT=124 = timeout, i.e. clean). Regression-guarded: the two new step
+  constants' class/method/descriptor + their call-site `jni_str!`/`jni_sig!` literals are pinned by the existing
+  `recipe_descriptors_match_confirmed_spec` + `call_site_literals_match_recipe_constants` tests (no new script).
+  The framework Activity lifecycle is now **created → started → resumed**. For Roblox specifically, the
+  engine-load bionic-shim work (Section B of the dev-host runbook) is the parallel track, and the engine will
+  eventually render into THIS window's swapchain via WSI translation. Stay non-GTK; validate via dev-host
+  `eclipse run`.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -1861,6 +1872,27 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   weight, padding insets, + snapshot now carries `LayoutParams`/child-indices. **131 unit + 2 doctests pass**
   (was 122); fmt/build/clippy -D warnings/release all clean. No new dep. Cyber-safeguard did NOT trip (Eclipse's
   own view_registry + graphics only — NO vendor/atl, framework.rs read only at the targeted View-native ranges).
+- **2026-06-05** — 🟢 **`onStart`/`onResume` DRIVEN — the framework Activity lifecycle is now created → started
+  → resumed (RESUMED state reached).** `drive_lifecycle` (src/framework.rs) drives recipe steps 1–**7**: after
+  step 5 (`Activity.onCreate`) it calls the **same step-4 `Activity` object**'s `onStart()` `()V` then
+  `onResume()` `()V` — no-arg instance calls = ATL's `activity_start` (general-Android contract; ATL Java NOT
+  read, cyber-safeguard honored). **What changed (surgical):** added typed constants `STEP6_ACTIVITY_ON_START`
+  + `STEP7_ACTIVITY_ON_RESUME` and the `LifecycleProgress::ActivityResumed` variant; the two new `checked(env, …)`
+  call sites reuse the held `activity` `JObject` (the same one step 5 used) and `call_method` it — failures
+  surface as typed `FrameworkError::Jni` with the pending Java exception described+cleared (no unwrap/expect, §2.8;
+  the `catch_unwind` panic guard already wraps the whole driver). `main.rs`'s comment + banner updated to "steps
+  1–7 … RESUMED". **FAITHFUL status — VALIDATED on the demo** (`/tmp/eclipse-render.log`): the demo's OWN Java
+  overrides run — `- onStart - yay!` then `- onResume - yay!` (lines 82–83) — then `Activity resumed: recipe steps
+  1–7 driven` + `framework lifecycle driven: ActivityResumed ✓`; the winit window then stands up the Vulkan
+  swapchain (`extent=800x600 images=3`) and runs the full 60 s with **zero VK_ERROR/panic/Exception/draw-failed**
+  (EXIT=124 = the 60 s timeout firing cleanly, the success outcome). The only log "errors" are the documented
+  benign noise (bionic first-pass library probes; "no certificates … ignoring" on the merged APK). **Regression
+  guard:** the two new step constants' class/method/descriptor + their call-site `jni_str!`/`jni_sig!` literals
+  are pinned in the existing `recipe_descriptors_match_confirmed_spec` + `call_site_literals_match_recipe_constants`
+  tests (a method-name/descriptor drift fails the build — no new script). **131 unit + 2 doctests pass**;
+  fmt/build/clippy -D warnings/release all clean. No new dep, no new native (onStart/onResume are pure-Java base
+  methods + the demo's own overrides). Cyber-safeguard did NOT trip (framework.rs read only at the targeted
+  drive_lifecycle/STEP4-5/checked ranges; NO vendor/atl, NO bionic source, NO web).
 
 ---
 
