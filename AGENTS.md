@@ -128,6 +128,15 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-05 CAPSTONE (verified at HEAD `16cb2e2`):** the **demo APK** runs the full path
+  **boot → lifecycle CREATED → STARTED → RESUMED → faithful Vulkan view+text render**, with
+  **zero VK errors** (`eclipse run …/demo_app.apk`; gate clean: **131 unit + 2 doctests**). The
+  real Roblox APK reaches its **own `RobloxApplication.onCreate` + startup tasks**
+  (previously-verified, §6). **#1 frontier = ENGINE-LOAD: the bionic-shim relocation wall**
+  (`R_X86_64_TPOFF64`/`RELR`/`BIND_NOW`; v1 = HYBRID extend-C-then-Rust;
+  smallest step = the throwaway TLS-reloc probe) — **main-loop / dev-host only** (cyber-safeguard
+  blocks subagents on linker source). Full consolidation + roadmap:
+  [`docs/project-state-2026-06-05.md`](docs/project-state-2026-06-05.md).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -1893,6 +1902,24 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   fmt/build/clippy -D warnings/release all clean. No new dep, no new native (onStart/onResume are pure-Java base
   methods + the demo's own overrides). Cyber-safeguard did NOT trip (framework.rs read only at the targeted
   drive_lifecycle/STEP4-5/checked ranges; NO vendor/atl, NO bionic source, NO web).
+- **2026-06-05** — 📌 **SESSION CAPSTONE (doc-only): verified the demo milestone at HEAD `16cb2e2` + consolidated
+  the project state into one doc.** Re-ran the full gate (`fmt --all --check` / `build --all-targets` / `clippy
+  --all-targets --all-features -D warnings` / `test` = **131 unit + 2 compile_fail doctests, 0 failed** / `release`)
+  — all clean. Re-verified the demo end-to-end (`timeout 60 cargo run --release -- run …/demo_app.apk`,
+  `/tmp/eclipse-capstone.log`, EXIT=124 = the 60 s present loop ran full): ART boots ✓; lifecycle steps 1–7 drive
+  `Application.onCreate` → launcher `Activity.onCreate`/`setContentView`/`onContentChanged` (the demo's own "yay!"
+  logs) → `onStart` → `onResume` (`ActivityResumed ✓`); measure/layout resolves the real
+  `FrameLayout→LinearLayout→2×TextView` rects (debug log); the winit window stands up the Vulkan swapchain
+  (`B8G8R8A8_SRGB extent=800x600 images=3`) and (trace log) draws `views=4 quads=4 glyphs=31` per frame —
+  **grep count 0 for `VK_ERROR`/`panic`/`Exception`/`draw-failed`/`UnsatisfiedLink`/`abort`/`validation`**. Wrote
+  [`docs/project-state-2026-06-05.md`](docs/project-state-2026-06-05.md) — a faithful, dated capstone: (a) what
+  works now (demo verified here; Roblox `RobloxApplication.onCreate` marked previously-verified, not re-run), (b)
+  the Eclipse-owned subsystem inventory, (c) the two remaining tracks (engine-load relocation wall = #1 frontier;
+  framework breadth). Surgical AGENTS.md edits: a one-line capstone pointer atop §5, the new doc in the §7 index,
+  this entry — NO duplication of the capstone into AGENTS.md. Doc-only → no code touched (gate above covers the
+  build). Cyber-safeguard did NOT trip (read CLAUDE.md/AGENTS.md + ran the demo + grepped logs; NO vendor/atl, NO
+  bionic/linker source, NO src/framework.rs wholesale, NO web). Committed to main as Kuenec, no co-author trailer,
+  NOT pushed.
 
 ---
 
@@ -1911,6 +1938,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 | `docs/bionic-loader-plan.md` | Build-ready bionic NDK-soname-shim spec (DEFERRED, main-loop). |
 | `docs/bionic-loader-strategy.md` | Bionic-loader v1 strategy: the modern-relocation wall + chosen path. |
 | `docs/dev-host-runbook.md` | Dev-host execution steps the cargo-test harness can't run. |
+| `docs/project-state-2026-06-05.md` | Session capstone: verified demo lifecycle+render; full state + engine-load roadmap. |
 
 ---
 
