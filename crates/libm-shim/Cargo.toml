@@ -1,0 +1,55 @@
+# Eclipse apkenv-loadable libm shim — 2026-06-05.
+#
+# A standalone `#![no_std]` cdylib that re-exports the pure-Rust `libm` crate's correct math under
+# the C libm symbol names, producing a `libeclipse_libm_shim.so` the apkenv/bionic_translation shim
+# linker CAN load. Provisioned (symlinked as the app's `libm.so`) by the main crate's
+# `runtime::provision_bionic_sonames`.
+#
+# WHY a separate cdylib (not the main crate, not a build.rs `cc` static lib):
+#   * The apkenv linker resolves an app lib's `NEEDED libm.so` by mmap-parsing a *standalone ELF
+#     shared object* named `libm.so` on its search path. The host glibc `libm.so.6` we previously
+#     symlinked there carries an `R_X86_64_TPOFF64` (modern TLS reloc, "unknown reloc type 18") and a
+#     `.relr.dyn` packed-reloc section the older apkenv linker cannot apply, plus `NEEDED
+#     ld-linux-x86-64.so.2` — so loading it aborts (SIGSEGV) during Roblox's `androidx.startup`
+#     `System.loadLibrary("zstd-jni")` (zstd-jni `NEEDED libm.so`). This shim is a *separate* ELF so
+#     it can be the provisioned `libm.so` file.
+#   * `#![no_std]` + `panic="abort"` avoids the std TLS that would reintroduce `R_X86_64_TPOFF64`.
+#     Verified: the produced .so has ONLY R_X86_64_{64,GLOB_DAT,RELATIVE} — the same reloc types
+#     zstd-jni itself uses (which apkenv provably handles) — NO TPOFF64, NO RELR, NO NEEDED.
+#   * The pure-Rust `libm` crate (rust-lang/compiler-builtins) provides the CORRECT, self-contained
+#     math implementations (no host-libm dependency), so the math values are right (a wrong sin would
+#     corrupt the engine) — NOT stubs.
+#
+# Portability (CLAUDE.md "Build & Environment Portability"): built from a clean checkout by the main
+# crate's build.rs via `$CARGO build` into the main `OUT_DIR`; no hardcoded paths, no extra toolchain.
+
+[package]
+name = "eclipse-libm-shim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "apkenv-loadable, clean-relocation libm.so providing correct math from the pure-Rust libm crate"
+
+[lib]
+name = "eclipse_libm_shim"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pure-Rust, no_std, self-contained C-math implementations (rust-lang/compiler-builtins `libm`).
+# Provides the correct math values; no host libm.so.6 dependency (so no modern TLS relocs).
+libm = "0.2"
+
+# A standalone optimized cdylib: smallest, no unwinding across the C-ABI boundary (panic=abort), and
+# no eh_personality lang item needed on stable (the no_std lib defines its own #[panic_handler]).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# `panic = "abort"` is REQUIRED in every profile: a `#![no_std]` crate has no unwinding panic runtime,
+# so the default dev/check `panic = "unwind"` fails to build ("unwinding panics are not supported
+# without std"). This keeps `cargo clippy`/`cargo check` (dev profile) building the cdylib too.
+[profile.dev]
+panic = "abort"
