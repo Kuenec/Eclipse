@@ -308,11 +308,29 @@ pub fn run_libroblox_init() -> Result<usize, InitRunError> {
         "ALL {completed}/{count} constructors completed without a crash"
     );
     let _ = log.flush();
+    let _ = std::io::stdout().flush();
 
-    // Clean up the staged temp (best-effort; only reached on the no-crash path).
-    drop(set);
-    std::fs::remove_dir_all(&dir).ok();
-    Ok(completed)
+    // 2026-06-05 — The diagnostic's defined job (run every DT_INIT_ARRAY constructor and report how
+    // far it got) is now COMPLETE: all `count` constructors ran. We must NOT return through `main`
+    // here, because process teardown would run two things this bare init harness cannot support:
+    //   1. `munmap`ping libroblox (RAII drop of `set`, see `link::LoadedImageSet`) — but the engine's
+    //      constructors spawned BACKGROUND WORKER THREADS (its job system; `ECLIPSE_TRACE_THREADS=1`
+    //      shows one `pthread_create` → a thread named "RBX Worker A") that keep executing libroblox
+    //      text. Unmapping it out from under a live worker faults it (gdb-proven).
+    //   2. glibc `exit()` running libroblox's C++ static destructors / `atexit` finalizers — a SHUTDOWN
+    //      lifecycle phase (distinct from init) that flushes engine-owned `FILE*`s through the bionic
+    //      `__sF` table. `__sF` is the documented host-stdio *pointer* table (native_provider.rs); a
+    //      finalizer that takes `&__sF[i]` as a bionic `FILE` struct address then `fflush`es it
+    //      derefs the table-slot address as a glibc `FILE*` → fault (gdb-proven, exit-time, main
+    //      thread). Orderly engine shutdown is out of this init harness's scope.
+    // So once init has fully succeeded, exit the process IMMEDIATELY and cleanly with `_exit(0)`: it
+    // bypasses destructors/finalizers and the still-running workers, and the OS reclaims the mapping,
+    // the staged temp file's mapping, and the worker threads. This is correct for a diagnostic that
+    // measures INIT (not shutdown); `set`/`dir` are intentionally left for the OS to reclaim.
+    let _ = (&set, &dir);
+    // SAFETY: 2026-06-05 — `_exit(2)` is async-signal-safe and terminates the process without running
+    // atexit/finalizers or unwinding; all output is already flushed above. This never returns.
+    unsafe { libc::_exit(0) };
 }
 
 /// Best-effort check that the live mapping containing `addr` is executable, by scanning

@@ -2027,14 +2027,16 @@ mod tests {
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
         // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 27 ndk-android + 33
-        // media-ndk + 8 audio + 37 bionic-pthread/TLS/sem/syscall + 5 bionic-sysconf system-query
+        // media-ndk + 8 audio + 51 bionic-pthread/TLS/sem/syscall (37 + the 14 thread-lifecycle
+        // natives added 2026-06-05: create/join/detach/setname_np/kill/getattr_np/get+setschedparam/
+        // attr_*) + 5 bionic-sysconf system-query
         // (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo — the allocator-bootstrap fix,
-        // 2026-06-05) = 130.
+        // 2026-06-05) = 144.
         assert_eq!(
             p.len(),
             88 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
-            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio + 37 pthread + 5 \
+            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio + 51 pthread + 5 \
              sysconf system-query natives registered"
         );
         for name in [
