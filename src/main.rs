@@ -181,6 +181,17 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     eclipse::runtime::whitelist_bionic_library_path(&fw, Some(&app_lib_dir))?;
     println!("bionic linker search path whitelisted (dl_parse_library_path) ✓");
 
+    // Route the native engine `libroblox.so` through Eclipse's OWN Rust loader (NOT the apkenv shim
+    // linker, which aborts on the engine's modern relocs). Map + relocate (527,843) + fully resolve
+    // (all 584 imports) + run the 3,427 DT_INIT_ARRAY constructors, then call the engine's exported
+    // JNI_OnLoad with the REAL ART JavaVM (registering its native methods). The returned LoadedEngine
+    // is BOUND for the process lifetime (its mapping must stay live — the engine spawns background
+    // workers that execute the mapped text). Skipped (None) for APKs without lib/x86_64/libroblox.so
+    // (e.g. the pure-Java demo_app), so the demo lifecycle path is unchanged. Runs on this (main)
+    // thread, with the VM alive and JNI-attached, BEFORE the lifecycle drives Roblox's onCreate (where
+    // its Java would otherwise call System.loadLibrary("roblox")).
+    let _engine = load_engine_via_rust_loader(&mut apk, std::path::Path::new(apk_path), &vm)?;
+
     // Drive the confirmed lifecycle recipe on this (main) thread, with the VM alive: wrap the held VM
     // with the `jni` crate, bind Eclipse's own non-GTK backing for the framework natives via
     // RegisterNatives, then drive recipe steps 1–7 — Context.createApplication → createContentProviders
@@ -204,4 +215,50 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     println!("# Opening the host window (winit; close it to exit)…");
     eclipse::graphics::run_windowed(&format!("Eclipse — {}", manifest.package), Some(&vm))?;
     Ok(())
+}
+
+/// Load the native engine `libroblox.so` through Eclipse's own Rust loader (map, relocate, resolve,
+/// run `DT_INIT_ARRAY`), then call its exported `JNI_OnLoad` with the live ART `JavaVM`. Returns the
+/// persistent [`LoadedEngine`](eclipse::loader::engine::LoadedEngine) the caller binds for the process
+/// lifetime, or `None` for an APK without `lib/x86_64/libroblox.so` (the pure-Java demo APKs keep the
+/// existing framework-only path, no regression).
+///
+/// This is the engine-load INTERCEPTION: it routes libroblox through the Rust loader instead of ART's
+/// `Runtime.nativeLoad` → apkenv shim linker (which aborts on the engine's modern relocations). Runs
+/// on the process main thread with the VM alive and JNI-attached.
+fn load_engine_via_rust_loader(
+    apk: &mut eclipse::apk::Apk,
+    apk_path: &std::path::Path,
+    vm: &eclipse::runtime::Vm,
+) -> Result<Option<eclipse::loader::engine::LoadedEngine>, Box<dyn std::error::Error>> {
+    // Cheap presence check (file-name scan, no 111 MiB read): only route when the x86_64 engine is in
+    // the APK. demo_app/accelerometerdemo have no native lib here → skip, preserving the framework path.
+    let has_engine = apk
+        .native_abis()
+        .iter()
+        .any(|abi| abi.name == "x86_64" && abi.has_engine);
+    if !has_engine {
+        println!("# No lib/x86_64/libroblox.so in APK — skipping the Rust engine loader (framework-only path).");
+        return Ok(None);
+    }
+
+    println!("# Loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…");
+    let mut log = std::io::stdout();
+    let mut engine = eclipse::loader::engine::load_libroblox(apk_path, &mut log)?;
+    // Run the 3,427 DT_INIT_ARRAY constructors (proven deterministic, EXIT=0; spawns the engine's
+    // background workers — `engine` must stay alive past here, which the caller's binding ensures).
+    let completed = engine.run_init_array(&mut log)?;
+    println!("engine static-init: {completed} DT_INIT_ARRAY constructor(s) completed ✓");
+
+    // Hand the engine the REAL ART JavaVM via JNI_OnLoad so it RegisterNatives its methods against ART.
+    let version = eclipse::loader::engine::call_jni_onload(&engine, vm.as_raw(), &mut log)?;
+    if version < 0 {
+        // A negative return = the engine's JNI_OnLoad reported an error (the next discovery frontier).
+        println!(
+            "engine JNI_OnLoad returned an error sentinel ({version:#x}) — see the log above."
+        );
+    } else {
+        println!("engine JNI_OnLoad returned JNI version {version:#x} ✓ (native methods registered against ART)");
+    }
+    Ok(Some(engine))
 }
