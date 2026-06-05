@@ -16,6 +16,9 @@
 name = "eclipse"
 version = "0.0.0"
 edition = "2021"
+# 2026-06-04: pinned to the dev/CI toolchain (conservative). The code itself needs far less
+# (let-else = 1.65); the true MSRV floor is a dependency's (winit/jni-sys/zip) — lower this
+# once verified against older toolchains (none installed here). Pinned, not minimal (§2.11).
 rust-version = "1.95"
 description = "Open-source, Rust, distro-agnostic runtime for running the Android Roblox build on Linux"
 license = "TBD"            # deferred per project decision

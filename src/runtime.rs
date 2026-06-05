@@ -6,7 +6,7 @@
 //! implementation plan". ART is **unavoidable** for Roblox (component-map §3) and sits **off
 //! the gameplay hot path**, so it costs no FPS.
 //!
-//! ## What this module implements *now* (M1)
+//! ## What this module implements *now* (M1–M2)
 //!  1. [`instruction_set_features`] — runtime host-CPU detection producing the real
 //!     `dex2oat --instruction-set-features` string (detect-don't-assume, AGENTS.md §9; the M0
 //!     Step 4 fix for ATL's hardcoded baseline ISA).
