@@ -489,3 +489,72 @@ return as an error sentinel, not a version), and `JNI_VERSION_1_6 == 0x00010006`
 bump that changed it fails here, not silently at runtime). The full-resolution + map invariants are the
 existing gated `link.rs` real-libroblox tests (work-list 0, 527,208 RELATIVE). The live `eclipse run` is the
 integration evidence; `demo_app` reaching `ActivityResumed` (engine loader skipped) is the no-regression check.
+
+## 10. App-JNI-lib PRE-LOAD generalized — `libzstd-jni` relocates cleanly via the Rust loader; the boot does NOT yet advance (2026-06-05)
+
+### What was generalized
+`engine::load_libroblox` was factored into a reusable, lib-agnostic pipeline:
+
+- `engine::map_resolve_app_lib(apk_path, filename, search_dir, log)` — the shared map + base-relocate +
+  full-resolve core. Reads `lib/x86_64/<filename>` via `src/apk`, root-only loads it through `link.rs`
+  (`with_host_fallback(false)`, `with_tolerate_missing_deps(true)`) with the FULL `BionicEnv::with_host_baseline`
+  scope applied to the symbol relocations. A `DT_INIT_ARRAY` is now **optional** (most app JNI libs ship none —
+  lazy-native). `search_dir`, when set, is the extracted-libs dir added to the linker's `DT_NEEDED` search path so a
+  sibling **app-lib** dependency (e.g. `libeigen_lapack.so` `NEEDED libeigen_blas.so`) loads from disk through this
+  same loader; bionic `DT_NEEDED` (`libc/m/dl/...`) still resolve via the scope (never from the host).
+- `engine::load_libroblox` — now a thin wrapper over the core (no search dir) that additionally asserts the engine
+  has a `DT_INIT_ARRAY` (its 3,427 ctors are not optional).
+- `engine::load_app_native_lib(apk_path, filename, java_vm, search_dir, log) -> Option<PreloadedLib>` — the generic
+  full pipeline: dedup by soname → map/resolve via the core → run `DT_INIT_ARRAY` **iff present** → call `JNI_OnLoad`
+  **iff exported** → record the soname in a process-global dedup registry. Returns `None` when the lib was already
+  loaded (deduped), else the kept-alive `PreloadedLib`.
+- Registry: `static LOADED_SONAMES: Mutex<Option<HashSet<String>>>` — **dedup only** (stores sonames, which are
+  `Send`); the actual mappings are kept alive for the process lifetime by the caller binding each `PreloadedLib`.
+- `src/apk`: `Apk::native_lib_filenames(abi)` lists the flat `.so` file names under `lib/<abi>/` (sorted).
+- `src/main.rs::run_apk`: `load_engine_via_rust_loader` → `preload_app_native_libs` — pre-loads libroblox FIRST
+  (mandatory) then every other `lib/x86_64/*.so` TOLERANT of per-lib failure (warn + continue), before the lifecycle.
+  Pure-Java APKs (no `lib/x86_64/libroblox.so`) skip it (`demo_app` still reaches `ActivityResumed`).
+
+### THE REAL ROBLOX RUN RESULT (dev host, 2026-06-05, `/tmp/eclipse-roblox-run3.log`, EXIT=139)
+Six x86_64 JNI libs pre-loaded cleanly via Eclipse's Rust loader (work-list 0 each):
+`libroblox.so` (3427 ctors + `JNI_OnLoad → 1.6`), `libdatastore_shared_counter`, `libeigen_blas`,
+`libeigen_lapack` (loaded its sibling `libeigen_blas` from the search dir), `libyuv_shared`, and crucially
+**`libzstd-jni-1.5.7-6.so`** (23 RELATIVE + 432 symbol relocs, `unresolved_strong=0`, lazy-native — no ctors,
+no `JNI_OnLoad`). Four others (`libbacktrace-native`, `libimage_processing_util_jni`, `librenderscript-toolkit`,
+`libsurface_util_jni`, `libtrampoline`) have a few unresolved-strong NDK imports (`libjnigraphics`/etc.) and were
+TOLERATED (warned + skipped) — none is on the immediate `onCreate` path.
+
+`onCreate` runs as before (`roblox.config setBaseUrl → www.roblox.com`, `setChannel()`,
+`creating androidx.startup.InitializationProvider`), then SIGSEGVs at the **byte-for-byte identical** prior point.
+
+### Root cause (evidence) — the pre-load is inert without the `nativeLoad` consult
+The crash is unchanged from the pre-change run (`run2`): during `androidx.startup`, `InitializationProvider` calls
+`System.loadLibrary("zstd-jni-1.5.7-6")`; ART's `Runtime.nativeLoad` STILL hands the load to the **apkenv** linker
+(log: `` `…/libzstd-jni-1.5.7-6.so` is not a prelinked library ``), which follows `NEEDED libm.so`, hits
+`bionic_translation linker.c:2128 unknown reloc type 18` (`R_X86_64_TPOFF64`), `failed to link libm.so`, and the
+broken load NULL-derefs (fault `0x18`, `rax=0`) on the `AppStartupTaskM` thread → SIGSEGV. Registers match `run2`
+almost exactly.
+
+So **ART's `System.loadLibrary` does not consult Eclipse's pre-load/loaded-lib registry.** Pre-loading a lib into
+our address space makes its symbols live for *us*, but `loadLibrary` independently re-loads it through apkenv. The
+prior belief that "the framework consults the registry, which is why libroblox skipped apkenv" is **not borne out**:
+libroblox skipped apkenv only because Roblox never issues `System.loadLibrary("roblox")` before this crash (its
+natives are already registered by our `JNI_OnLoad`). `androidx.startup` *does* issue `loadLibrary` for zstd-jni, and
+that call bypasses the registry.
+
+### Recommended next step (safeguard-gated — main loop only)
+The pre-load half is done and proven (zstd-jni relocates with work-list 0). The missing half is the **registry
+CONSULT**: make ART's `Runtime.nativeLoad`/`System.loadLibrary` short-circuit to Eclipse's loaded-lib registry so a
+pre-loaded soname is reported already-loaded instead of being re-loaded via apkenv. That is the `nativeLoad`
+interception, which lies **inside the cyber-safeguard boundary** — it must be done in the main loop, not by a
+workflow subagent, and only after explicit re-authorization. The pre-load PATTERN added here is safe; the
+`nativeLoad`/`loadLibrary` interception is the forbidden region for automated agents.
+
+### Regression protection (this step)
+3 GPU/VM-free unit tests: `engine::soname_registry_dedups_by_soname` (the registry inserts a soname once and dedups
+the second insert — the property the pre-load loop relies on), `engine::preloaded_lib_fields_express_the_optional_paths`
+(the lazy-native shape `(0 ctors, no JNI_OnLoad)` vs the engine shape `(n ctors, Some(version))` — the optional
+init/`JNI_OnLoad` paths), and `apk::native_lib_filenames_lists_flat_so_files_for_the_abi_sorted` (flat `.so`
+enumeration for the ABI, sorted, excluding nested/wrong-ABI/non-`.so`, and empty for a pure-Java APK — the gate that
+skips the pre-load loop). The live `eclipse run` is the integration evidence; `demo_app` reaching `ActivityResumed`
+with the loader skipped is the no-regression check.

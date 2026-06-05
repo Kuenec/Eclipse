@@ -646,6 +646,25 @@ before any history-rewriting/force operation.
   doctests** (4 new GPU/VM-free `engine.rs` tests; fmt/build/clippy `-D warnings`/test/release all clean).
   Full analysis: [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md) §9. See §6 (2026-06-05 engine
   loader integrated into eclipse-run).
+- **2026-06-05 UPDATE — APP-JNI-LIB PRE-LOAD GENERALIZED; `libzstd-jni` now relocates cleanly through Eclipse's
+  Rust loader (work-list 0); the boot does NOT yet advance — the new frontier is the safeguard-gated `nativeLoad`
+  registry-consult.** `engine::load_libroblox` is now a thin wrapper over a reusable
+  `engine::load_app_native_lib(apk_path, filename, java_vm, search_dir, log)` (shared `map_resolve_app_lib` core):
+  it maps+relocates+fully-resolves any `lib/x86_64/<filename>` through `link.rs` with the FULL `BionicEnv` scope
+  (sibling APP-lib `DT_NEEDED` load from the extracted lib dir; bionic deps via the scope), runs `DT_INIT_ARRAY`
+  **only if present** + calls `JNI_OnLoad` **only if exported** (most app libs are lazy-native), and records the
+  soname in a process-global dedup registry. `main.rs::run_apk` pre-loads libroblox FIRST+mandatory then every
+  other `lib/x86_64/*.so` (`Apk::native_lib_filenames`) TOLERANT of per-lib failure, before driving the lifecycle;
+  pure-Java APKs still skip it (`demo_app` → `ActivityResumed`, NO regression). **REAL ROBLOX RUN**
+  (`/tmp/eclipse-roblox-run3.log`, EXIT=139): 6 libs pre-loaded clean incl. **`libzstd-jni-1.5.7-6.so`**
+  (`unresolved_strong=0`, lazy-native) — the modern-reloc wall does NOT fire in OUR loader. **BUT the crash is the
+  byte-for-byte prior one:** `androidx.startup` → `System.loadLibrary("zstd-jni-1.5.7-6")` → ART's `Runtime.nativeLoad`
+  STILL routes to the apkenv linker (`unknown reloc type 18` on `NEEDED libm.so` → SIGSEGV `0x18` on `AppStartupTaskM`).
+  **Root cause: ART's `loadLibrary` does NOT consult Eclipse's pre-load registry** — pre-loading is correct + necessary
+  but inert until the `nativeLoad` consult is wired, which is **inside the cyber-safeguard boundary** (pre-load PATTERN
+  = safe; `nativeLoad`/`loadLibrary` interception = forbidden region). Gate now **380 unit + 2 doctests** (3 new
+  GPU/VM-free tests; fmt/build/clippy `-D warnings`/test/release all clean). Full analysis:
+  [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md) §10. See §6 (2026-06-05 App-JNI-lib pre-load generalized).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3678,6 +3697,46 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `libm`/`libc`) through `link.rs` with a bionic-correct `libm` provider, so Eclipse's `reloc.rs` applies the modern
   relocs instead of apkenv aborting — OR intercept ART's `Runtime.nativeLoad` wholesale — then re-run to advance past
   the `androidx.startup` task into the rest of `onCreate`.**
+- **2026-06-05 — App-JNI-lib PRE-LOAD generalized; `libzstd-jni` now relocates cleanly through Eclipse's Rust loader
+  (work-list 0); BUT the boot does NOT yet advance — root cause confirmed: ART's `System.loadLibrary` does not consult
+  Eclipse's pre-load registry.** Generalized `load_libroblox` → a reusable `engine::load_app_native_lib(apk_path,
+  filename, java_vm, search_dir, log)` (delegates to a shared `map_resolve_app_lib` core; `load_libroblox` is now a thin
+  wrapper that still asserts the engine has a `DT_INIT_ARRAY`). The generic path: reads `lib/x86_64/<filename>` via
+  `src/apk`, maps+base-relocates+fully-resolves through `link.rs` with the FULL `BionicEnv` scope (bionic `DT_NEEDED`
+  resolve via the scope; sibling APP-lib `DT_NEEDED` — e.g. `libeigen_lapack`→`libeigen_blas` — load from the extracted
+  `app_lib_dir` search path through this SAME loader), runs `DT_INIT_ARRAY` **only if present** (most app JNI libs ship
+  none — lazy-native), and calls `JNI_OnLoad` **only if exported** (most export none — ART binds `Java_*` on demand).
+  A process-global soname registry (`Mutex<Option<HashSet<String>>>`, dedup-only; the mappings are kept alive by the
+  caller binding each returned `PreloadedLib`) dedups a lib pulled in twice. `main.rs::run_apk` replaced
+  `load_engine_via_rust_loader` with `preload_app_native_libs`: libroblox FIRST + mandatory, then every other
+  `lib/x86_64/*.so` (new `Apk::native_lib_filenames`) TOLERANT of per-lib failure (warn + continue). Gate stays at the
+  pure-Java gate (no `lib/x86_64/libroblox.so` → skip; `demo_app` still reaches `ActivityResumed`, NO regression).
+  **THE REAL ROBLOX RUN (`/tmp/eclipse-roblox-run3.log`, EXIT=139):** 6 libs pre-loaded clean via the Rust loader incl.
+  **`libzstd-jni-1.5.7-6.so` (23 RELATIVE + 432 symbol relocs, `unresolved_strong=0`, lazy-native)** — the modern-reloc
+  wall does NOT fire in OUR loader. **BUT the crash is byte-for-byte the prior one** (`run2`): `androidx.startup`'s
+  `InitializationProvider` calls `System.loadLibrary("zstd-jni-1.5.7-6")`, ART's `Runtime.nativeLoad` STILL hands it to
+  the **apkenv** linker (`bionic_translation linker.c:2128 unknown reloc type 18` on `NEEDED libm.so` → `failed to link
+  libm.so` → NULL deref fault `0x18` on `AppStartupTaskM` → SIGSEGV). *Root cause (evidence):* ART's `loadLibrary` does
+  NOT consult Eclipse's pre-load/loaded-lib registry — pre-loading a lib into our address space makes its symbols live
+  for US, but `System.loadLibrary` independently re-loads it via apkenv. The earlier belief that "the framework consults
+  the registry, which is why libroblox skipped apkenv" is **not borne out**: libroblox skipped apkenv only because
+  Roblox never issues `System.loadLibrary("roblox")` before this point (its natives are already registered by our
+  `JNI_OnLoad`); `androidx.startup` DOES issue `loadLibrary` for zstd-jni, bypassing the registry. **The pre-load
+  infrastructure is correct + necessary but inert until `nativeLoad` consults the registry** — which is the **NEXT
+  frontier and is INSIDE the cyber-safeguard boundary** (the pre-load PATTERN is safe; `nativeLoad`/`loadLibrary`
+  interception is the forbidden region). Same-pattern audit: the pre-load loop already covers every `lib/x86_64/*.so`
+  the app ships (not just zstd-jni). *Regression guard:* +3 GPU/VM-free unit tests — `engine::soname_registry_dedups_by_soname`
+  (insert-once/dedup), `engine::preloaded_lib_fields_express_the_optional_paths` (lazy-native vs engine-class shape),
+  `apk::native_lib_filenames_lists_flat_so_files_for_the_abi_sorted` (flat `.so` enumeration + empty for pure-Java);
+  `demo_app` reaching `ActivityResumed` with the loader skipped is the no-regression check. *Cyber-safeguard: NOT
+  tripped* — only `src/loader/engine.rs`, `src/main.rs::run_apk`, `src/apk` (benign reader) touched; the loader uses
+  Eclipse's own `link.rs`/`reloc.rs`/`BionicEnv`; NO read of `nativeLoad`/`loadLibrary`/`dlopen`/apkenv/bionic-linker
+  source or `framework.rs`'s native-load/asset/resource sections. Files: `src/loader/engine.rs`, `src/main.rs`,
+  `src/apk/mod.rs` (+`native_lib_filenames`), `docs/libroblox-init-run.md` (§10), `AGENTS.md` §5/§6. **Gate:** fmt --all
+  --check / build --all-targets / clippy (-D warnings) / test (**380 unit + 2 doctests**) / release — all
+  0-warning/0-error. **NEXT (safeguard-gated, main-loop only):** make ART's `Runtime.nativeLoad`/`System.loadLibrary`
+  consult Eclipse's loaded-lib registry so a pre-loaded soname short-circuits the apkenv path — this is the registry
+  CONSULT (interception) half that pairs with the pre-load half done here.**
 
 ---
 
