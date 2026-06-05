@@ -76,7 +76,7 @@ use jni::objects::{JClass, JObject, JString};
 use jni::refs::Reference;
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
-use jni::sys::jint;
+use jni::sys::{jint, jlong};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
@@ -408,6 +408,41 @@ pub const ASSET_MANAGER_CLASS: &JNIStr = jni_str!("android/content/res/AssetMana
 const ASSET_MANAGER_INIT_NAME: &JNIStr = jni_str!("init");
 const ASSET_MANAGER_INIT_SIG: &JNIStr = jni_str!("(I)V");
 
+// 2026-06-05: AssetManager is a DENYLISTED class (its native does asset/mmap/zip/parsing work), so
+// this native is bound SIGNATURE-ONLY from the exact JNI signature ART reported missing
+// (`No implementation found for void android.content.res.AssetManager.native_setApkAssets(
+// java.lang.Object[], int)`), WITHOUT reading the class's Java or api-impl-jni C source. JNI
+// descriptor `([Ljava/lang/Object;I)V` — an INSTANCE native (the receiver `this`, then an
+// `Object[]` of ApkAssets, then an `int`). DISCOVERY-LOOP STUB: a sound GTK-free no-op so the
+// constructor proceeds past it and the re-run reveals the NEXT native; to be refined once Eclipse
+// has its own asset-table handle. `mObject` stays at its Java zero-init `0` (no native asset table
+// is installed) — sound, not behavior-faking.
+const ASSET_MANAGER_SET_APK_ASSETS_NAME: &JNIStr = jni_str!("native_setApkAssets");
+const ASSET_MANAGER_SET_APK_ASSETS_SIG: &JNIStr = jni_str!("([Ljava/lang/Object;I)V");
+
+// 2026-06-05: AssetManager is DENYLISTED, so this native is bound SIGNATURE-ONLY from the exact JNI
+// signature ART reported missing (`No implementation found for void
+// android.content.res.AssetManager.setConfiguration(int, int, java.lang.String, int ×14)`; mangled
+// `...setConfiguration__IILjava_lang_String_2IIIIIIIIIIIIII`), WITHOUT reading the class's source.
+// JNI descriptor `(IILjava/lang/String;IIIIIIIIIIIIII)V` — an INSTANCE native: 2 ints, a String,
+// then 14 ints (configuration parameters: mcc/mnc/locale/orientation/density/etc., consumed by the
+// asset/resource table). DISCOVERY-LOOP STUB: a sound GTK-free no-op so the constructor proceeds and
+// the re-run reveals the NEXT native; refine once Eclipse has its own asset-table handle.
+const ASSET_MANAGER_SET_CONFIGURATION_NAME: &JNIStr = jni_str!("setConfiguration");
+const ASSET_MANAGER_SET_CONFIGURATION_SIG: &JNIStr =
+    jni_str!("(IILjava/lang/String;IIIIIIIIIIIIII)V");
+
+// 2026-06-05: AssetManager is DENYLISTED, so this native is bound SIGNATURE-ONLY from the exact JNI
+// signature ART reported missing (`No implementation found for long
+// android.content.res.AssetManager.openXmlAssetNative(int, java.lang.String)`; mangled
+// `...openXmlAssetNative__ILjava_lang_String_2`), WITHOUT reading the class's source. JNI descriptor
+// `(ILjava/lang/String;)J` — an INSTANCE native returning a `long` (an XML-asset handle). The sound
+// neutral value for a handle return is `0` (the standard "no asset" sentinel); this does NOT fake a
+// successful XML open — if the framework later dereferences the `0` handle, the next native surfaces
+// (the discovery loop). DISCOVERY-LOOP STUB: refine once Eclipse has its own asset-table handle.
+const ASSET_MANAGER_OPEN_XML_ASSET_NAME: &JNIStr = jni_str!("openXmlAssetNative");
+const ASSET_MANAGER_OPEN_XML_ASSET_SIG: &JNIStr = jni_str!("(ILjava/lang/String;)J");
+
 /// `AssetManager.init(int sdk_version)` → GTK-free no-op (minimal stub, 2026-06-05).
 ///
 /// JNI ABI: an INSTANCE native (the Java method is not `static`), so the second argument is the
@@ -434,6 +469,124 @@ extern "system" fn asset_manager_init<'local>(
             "AssetManager.init: GTK-free no-op (native asset table deferred; mObject stays 0)"
         );
         Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.native_setApkAssets(Object[] apkAssets, int invalidateCaches)` → GTK-free no-op
+/// (signature-only discovery-loop stub, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native, so the parameters are `(EnvUnowned, JObject this, JObject apkAssets,
+/// jint invalidateCaches)`. `apkAssets` is a `java.lang.Object[]`; it is a `jobject` at the ABI
+/// level, taken as a `JObject` and **never dereferenced** (AssetManager is DENYLISTED — bound from
+/// the ART-reported signature alone, without reading its source). No native asset table is installed
+/// (`mObject` stays `0`); this lets the constructor proceed past `native_setApkAssets` so the re-run
+/// surfaces the next native — the diagnostic discovery loop, not behavior-faking.
+///
+/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
+/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
+/// returns the `()` default on any error/panic — the correct neutral value for this `void` native.
+extern "system" fn asset_manager_set_apk_assets<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _apk_assets: JObject<'local>,
+    invalidate_caches: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // 2026-06-05: signature-only no-op (AssetManager denylisted). `_apk_assets` is intentionally
+        // not inspected. Tracing records the call so the dev-host log shows the constructor reached it.
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            invalidate_caches,
+            "AssetManager.native_setApkAssets: GTK-free no-op (asset table deferred; mObject stays 0)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.setConfiguration(int, int, String, int ×14)` → GTK-free no-op (signature-only
+/// discovery-loop stub, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native, so the parameters are `(EnvUnowned, JObject this, ...17 args)`:
+/// 2 ints, a `String` locale, then 14 configuration ints. The `String` is a `jobject` at the ABI
+/// level, taken as a `JObject` and **never dereferenced** (AssetManager is DENYLISTED — bound from
+/// the ART-reported signature alone, without reading its source). No native asset table exists
+/// (`mObject` stays `0`), so there is nothing to reconfigure; this lets the framework proceed so the
+/// re-run surfaces the next native — the diagnostic discovery loop, not behavior-faking.
+///
+/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
+/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
+/// returns the `()` default on any error/panic — the correct neutral value for this `void` native.
+//
+// 2026-06-05: arity is fixed by the JNI signature ART reported (17 args); a signature-only stub must
+// match it exactly. clippy's `too_many_arguments` does not fire on `extern "system"` fns, so no
+// `#[expect]`/`#[allow]` is needed here.
+extern "system" fn asset_manager_set_configuration<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    mcc: jint,
+    mnc: jint,
+    _locale: JObject<'local>,
+    _orientation: jint,
+    _touchscreen: jint,
+    _density: jint,
+    _keyboard: jint,
+    _keyboard_hidden: jint,
+    _navigation: jint,
+    _screen_width: jint,
+    _screen_height: jint,
+    _smallest_screen_width_dp: jint,
+    _screen_width_dp: jint,
+    _screen_height_dp: jint,
+    _screen_layout: jint,
+    _ui_mode: jint,
+    _major_version: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // 2026-06-05: signature-only no-op (AssetManager denylisted). The arg names mirror the
+        // standard AOSP AssetManager.setConfiguration parameter order for documentation only; none
+        // are inspected. `mcc`/`mnc` are traced as a low-noise call marker for the dev-host log.
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            mcc,
+            mnc,
+            "AssetManager.setConfiguration: GTK-free no-op (no native asset table; mObject stays 0)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.openXmlAssetNative(int cookie, String fileName)` → `0` handle (signature-only
+/// discovery-loop stub, 2026-06-05).
+///
+/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
+/// `(EnvUnowned, JObject this, jint cookie, JObject fileName)`. `fileName` is a `jobject` at the ABI
+/// level, taken as a `JObject` and **never dereferenced** (AssetManager is DENYLISTED — bound from
+/// the ART-reported signature alone, without reading its source). Returns `0` — the neutral "no
+/// asset" sentinel for a handle `long`; this does NOT fake a successful XML open. If the framework
+/// later dereferences the `0` handle, the next native surfaces (the discovery loop).
+///
+/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
+/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
+/// returns the `jlong` default (`0`) on any error/panic — the same neutral handle value.
+extern "system" fn asset_manager_open_xml_asset<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    cookie: jint,
+    _file_name: JObject<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        // 2026-06-05: signature-only stub (AssetManager denylisted). No native asset table exists,
+        // so no XML asset can be opened; return the `0` "no asset" sentinel. `_file_name` is not
+        // inspected. `cookie` is traced as a low-noise call marker for the dev-host log.
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            cookie,
+            "AssetManager.openXmlAssetNative: GTK-free stub returning 0 (no native asset table)"
+        );
+        Ok(0)
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -465,14 +618,46 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_init as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `asset_manager_set_apk_assets` matches the paired `([Ljava/lang/Object;I)V`
+        // signature as an instance native (see the native's docs); casting the `extern "system"`
+        // fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_SET_APK_ASSETS_NAME,
+                ASSET_MANAGER_SET_APK_ASSETS_SIG,
+                asset_manager_set_apk_assets as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_set_configuration` matches the paired
+        // `(IILjava/lang/String;IIIIIIIIIIIIII)V` signature as an instance native (see the native's
+        // docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_SET_CONFIGURATION_NAME,
+                ASSET_MANAGER_SET_CONFIGURATION_SIG,
+                asset_manager_set_configuration as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_open_xml_asset` matches the paired `(ILjava/lang/String;)J`
+        // signature as an instance native returning `jlong` (see the native's docs); casting the
+        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_OPEN_XML_ASSET_NAME,
+                ASSET_MANAGER_OPEN_XML_ASSET_SIG,
+                asset_manager_open_xml_asset as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/content/res/AssetManager; `methods` holds a valid fn
-    // pointer whose signature matches the class's `native` declaration (verified against
-    // AssetManager.java line 779, 2026-06-05).
+    // SAFETY: `class` is the loaded android/content/res/AssetManager; `methods` hold valid fn
+    // pointers whose signatures match the class's `native` declarations (`init` verified against
+    // AssetManager.java line 779; `native_setApkAssets` bound signature-only from the ART-reported
+    // signature `([Ljava/lang/Object;I)V` — AssetManager is denylisted, 2026-06-05).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/AssetManager",
-        "registered Eclipse's non-GTK backing for AssetManager.init"
+        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative"
     );
     Ok(())
 }
@@ -1030,6 +1215,36 @@ mod tests {
         );
         assert_eq!(ASSET_MANAGER_INIT_NAME.to_str(), "init");
         assert_eq!(ASSET_MANAGER_INIT_SIG.to_str(), "(I)V");
+        // native_setApkAssets bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature; pin name + descriptor so a transcription regression throws NoSuchMethodError.
+        assert_eq!(
+            ASSET_MANAGER_SET_APK_ASSETS_NAME.to_str(),
+            "native_setApkAssets"
+        );
+        assert_eq!(
+            ASSET_MANAGER_SET_APK_ASSETS_SIG.to_str(),
+            "([Ljava/lang/Object;I)V"
+        );
+        // setConfiguration bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature; pin name + descriptor so a transcription regression throws NoSuchMethodError.
+        assert_eq!(
+            ASSET_MANAGER_SET_CONFIGURATION_NAME.to_str(),
+            "setConfiguration"
+        );
+        assert_eq!(
+            ASSET_MANAGER_SET_CONFIGURATION_SIG.to_str(),
+            "(IILjava/lang/String;IIIIIIIIIIIIII)V"
+        );
+        // openXmlAssetNative bound signature-only (AssetManager denylisted) from the ART-reported
+        // signature; pin name + descriptor so a transcription regression throws NoSuchMethodError.
+        assert_eq!(
+            ASSET_MANAGER_OPEN_XML_ASSET_NAME.to_str(),
+            "openXmlAssetNative"
+        );
+        assert_eq!(
+            ASSET_MANAGER_OPEN_XML_ASSET_SIG.to_str(),
+            "(ILjava/lang/String;)J"
+        );
     }
 
     #[test]

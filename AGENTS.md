@@ -565,14 +565,22 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      pack/unpack, bounds+generation-checked so a stale/fabricated `jlong` is a typed `Err` not UB,
      `jlong=0` reserved, 6 unit tests), and `drive_steps_1_to_3` now passes a real
      `window_registry::allocate()` handle to `createApplication(J)` instead of `0` (still only *stored*
-     in steps 1–3). **NEXT (in order): (1) CONTINUE THE DEV-HOST DISCOVERY LOOP from the next missing
-     native.** Via the loop (`cargo run -- run …/demo_app.apk`) the lifecycle now advances through
-     `Context` static-init into `createApplication` and currently stops at the next missing native
-     **`AssetManager.native_setApkAssets ([Ljava/lang/Object;I)V`** (the first native that touches
-     `mObject`; see §6 2026-06-05). `Log.println_native`/`AssetManager.init`/`Environment.native_get_app_data_dir`
-     are now bound (non-GTK Rust). Continue: bind each surfaced native (non-GTK Rust) and re-run until
-     steps 1–3 cleanly reach `Application.onCreate` — `onCreate` is **NOT yet reached**; also confirm the
-     window opens, exit 0, no `libgtk-4` in `/proc/self/maps`. Then **(2)** the deref-ing Window natives for
+     in steps 1–3). **NEXT (in order): (1) THE ASSET-LOADING FRONTIER — the discovery loop hit the
+     denylisted real-asset boundary.** Via the loop (`cargo run -- run …/demo_app.apk`) the lifecycle
+     advances through `Context` static-init into `createApplication`; the three signature-only no-op
+     AssetManager stubs `native_setApkAssets`/`setConfiguration`/`openXmlAssetNative` are now bound
+     (DENYLISTED → signature-only, see §6 2026-06-05), and `Log.println_native`/`AssetManager.init`/
+     `Environment.native_get_app_data_dir` are bound (non-GTK Rust). **It is NO LONGER a missing-native
+     gap — it is a Java exception:** `Context.<clinit>` (`openXmlResourceParser` →
+     `AssetManager.openXmlBlockAsset`) throws **`java.io.FileNotFoundException: Asset XML file:
+     AndroidManifest.xml`** → `ExceptionInInitializerError` at step 1 `createApplication`, because the
+     signature-only `openXmlAssetNative` soundly returns the `0` "no-asset" handle (a no-op stub cannot
+     read the APK's `AndroidManifest.xml` — the asset/zip/XML machinery is denylisted). `onCreate` is
+     **NOT reached.** Reaching it requires a **functioning AssetManager** that actually reads
+     `AndroidManifest.xml` (and resources) from the APK — i.e. Eclipse's own asset-table handle stored
+     in `mObject` + real `openXmlAssetNative`/asset-read natives backed by the `apk` crate's zip reader
+     (NOT ATL's C asset layer, NOT GTK). This is a real subsystem (component-map: assets), main-loop /
+     non-subagent work given the cyber-safeguard on asset internals. Then **(2)** the deref-ing Window natives for
      step 4 (`set_jobject`/`set_title`/`set_layout` metadata via `register_native_methods` + a descriptor
      guard vs `Window.java`, then the deferred `set_widget_as_root`/`take_input_queue`) + associating the
      real winit `Window` with the registry slot. **BIGGEST RISK recorded:** the View hierarchy is fully
@@ -1065,6 +1073,36 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   Full gate green: fmt / build --all-targets / clippy `-D warnings` / test (**52 unit + 2 compile_fail
   doctests**) / release (`panic = "abort"`/LTO retained). No new deps (`jni 0.22.4`, `directories 6`
   already in tree). **NEXT:** continue the discovery loop from `AssetManager.native_setApkAssets`.
+- **2026-06-05** — **Discovery loop advanced 3 natives, then hit the asset-loading frontier (a Java
+  exception, NOT a missing native).** Ran the dev-host loop (`cargo run --release -- run
+  …/demo_app.apk`) and bound, in turn, the three AssetManager natives the lifecycle surfaced — all
+  **DENYLISTED → bound SIGNATURE-ONLY** from the exact ART `No implementation found` line, WITHOUT
+  reading AssetManager's Java or api-impl-jni C (cyber-safeguard): **`native_setApkAssets
+  ([Ljava/lang/Object;I)V`** (instance, GTK-free no-op — `mObject` stays `0`), **`setConfiguration
+  (IILjava/lang/String;IIIIIIIIIIIIII)V`** (instance, 17 args = 2 ints + locale String + 14 config
+  ints; GTK-free no-op), **`openXmlAssetNative (ILjava/lang/String;)J`** (instance, returns the `0`
+  "no-asset" sentinel — a sound neutral handle, NOT a fake successful open). Each is an
+  `extern "system"` fn under `EnvUnowned::with_env` (`catch_unwind`) + `resolve::<LogErrorAndDefault>`
+  → neutral default (`()`/`0`); array/String args taken as `JObject` and never dereferenced;
+  registered on `android/content/res/AssetManager` before step 1. **Result (FAITHFUL): `Application.
+  onCreate` is NOT reached.** With `openXmlAssetNative` bound (no more missing native), `Context.
+  <clinit>` proceeds into `openXmlResourceParser` → `AssetManager.openXmlBlockAsset`, which throws
+  **`java.io.FileNotFoundException: Asset XML file: AndroidManifest.xml, errno : 0`** →
+  `ExceptionInInitializerError`, surfaced as the typed `FrameworkError::Jni("Exception in
+  initializer")` at step 1 `Context.createApplication`. This is the **DECIDE=stop** case (a Java
+  exception, not a missing native): NOT masked with a fake impl. **Root cause:** the framework's
+  static init genuinely needs a *functioning* AssetManager to read `AndroidManifest.xml` from the
+  APK; a signature-only no-op cannot (asset/zip/XML machinery is denylisted). This is the
+  **asset-loading frontier**, not a binding gap. **Fix vector (next, main-loop):** give AssetManager
+  an Eclipse-owned asset-table handle in `mObject` + a real `openXmlAssetNative`/asset-read backing
+  driven by the `apk` crate's zip reader (NOT ATL's C asset layer, NOT GTK). Regression guard: the
+  existing `asset_manager_init_name_sig_and_class_match_asset_manager_java` unit test was extended to
+  pin all three new natives' names + JNI descriptors (a transcription regression → `NoSuchMethodError`
+  at boot). The speculative `#[expect(clippy::too_many_arguments)]` on `setConfiguration` was removed
+  after clippy reported it `unfulfilled` (the lint does not fire on `extern "system"` fns) — no
+  `#[allow]`/`#[expect]` left behind (§2.2). Full gate green: fmt --check / build --all-targets /
+  clippy `-D warnings` / test (**52 unit + 2 compile_fail doctests**) / release (`panic = "abort"`/LTO
+  retained). No new deps. Run log: `/tmp/eclipse-run.log` (EXIT=1, the expected typed-exception exit).
 
 ---
 
