@@ -44,7 +44,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"                                     # streaming artifact-integrity hash (lowercase hex via std::fmt, no `hex` crate)
 # --- Runtime: boot the vendored ART VM (M1) -------------------------------------
 libloading = "0.9"                                # dlopen the vendored /usr/lib/art/libart.so (no link-time ART dep)
-jni-sys = "0.4"                                   # raw JNI invocation types (full `jni` crate added with the onCreate JNI calls)
+jni-sys = "0.4"                                   # raw JNI invocation types used by boot()'s JNI_CreateJavaVM
+jni = "0.22"                                      # safe JNI wrapper for the onCreate framework driver (wraps the held *mut JavaVM)
 # --- Graphics/window: the host game window (M2) ----------------------------------
 winit = "0.30"                                    # Wayland/X11 window + event loop (NO GTK — keeps low_4gb clear for ART; ash/khronos-egl for forwarding come later)
 # 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
