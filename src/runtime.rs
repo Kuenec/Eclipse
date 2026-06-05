@@ -43,6 +43,7 @@
 use std::ffi::{c_char, c_void, CString};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use directories::ProjectDirs;
 
@@ -464,6 +465,169 @@ pub fn whitelist_bionic_library_path(
     Ok(())
 }
 
+/// A bare Android soname the bionic shim linker resolves, paired with the host's *versioned*
+/// ELF candidate filenames (most-current first) that actually provide that ABI.
+///
+/// 2026-06-05: the bionic shim linker (`linker.c`) resolves a `NEEDED` entry by searching its
+/// `apkenv_ldpaths[]` for a file *named exactly the bare soname* (`libm.so`) and mmap-parsing it
+/// as ELF. Android ships bare `.so` sonames; the host glibc ships *versioned* ones (`libm.so.6`),
+/// and its bare `/usr/lib/libm.so` is a GNU **ld linker script** (ASCII text — `GROUP(libm.so.6 …)`),
+/// not an ELF object, so the bionic linker cannot load it → "library 'libm.so' not found". Eclipse
+/// must therefore put a real-ELF file named `libm.so` (a symlink to the host `libm.so.6`) on the
+/// bionic search path — the same Android-soname → host-provider mapping that
+/// `/usr/share/bionic_translation/cfg.d` performs for `libEGL.so → libEGL.so.1` etc., but for the
+/// sonames cfg.d omits, done Eclipse-owned + portable instead of editing the system config.
+struct BareSoname {
+    /// The bare Android soname the engine's libs `NEEDED` (e.g. `"libm.so"`).
+    soname: &'static str,
+    /// Host versioned ELF filenames providing that ABI, most-current first (e.g. `"libm.so.6"`).
+    /// Multiple entries allow a graceful match if a distro carries a different soversion.
+    host_candidates: &'static [&'static str],
+}
+
+/// The bare host sonames Eclipse provisions onto the bionic search path.
+///
+/// 2026-06-05: scoped to exactly what the Roblox run reports missing — `libm.so` (zstd-jni's
+/// transitive `NEEDED`, and `libroblox.so`'s). `libc.so`/`libdl.so` already resolve (cfg.d aliases
+/// `libc.so → libc_bio.so.0`; the shim linker self-provides `libdl.so`), so they are deliberately
+/// NOT listed (provision only what is genuinely missing, AGENTS.md "Simplicity First"). The host
+/// `libm.so.6` is plain glibc math: C-ABI compatible with the bare Android `libm.so` for the math
+/// functions these JNI libs import, and its own `NEEDED libc.so.6` resolves via the host-glibc
+/// fallback (the same path `liblog`/`libc` already use).
+const BIONIC_BARE_SONAMES: &[BareSoname] = &[BareSoname {
+    soname: "libm.so",
+    host_candidates: &["libm.so.6"],
+}];
+
+/// Standard host directories searched for a versioned ELF provider when `cc -print-file-name`
+/// cannot resolve it (no compiler installed).
+///
+/// 2026-06-05: detect-don't-assume (AGENTS.md §9) — these are the conventional glibc lib dirs across
+/// distros (multilib `/usr/lib64`, Debian/Ubuntu multiarch, classic `/lib`); the list is a *fallback*
+/// scanned only if the portable `cc -print-file-name` route fails, and each candidate is verified to
+/// be a real ELF (not a linker script) before use. Not a single hardcoded path — the first that
+/// holds a real ELF wins.
+const HOST_LIB_DIRS: &[&str] = &[
+    "/usr/lib",
+    "/lib",
+    "/usr/lib64",
+    "/lib64",
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/x86_64-linux-gnu",
+];
+
+/// Provision the bare host sonames the bionic shim linker needs ([`BIONIC_BARE_SONAMES`]) as
+/// symlinks into `dir`, which must be on the bionic search path (see
+/// [`whitelist_bionic_library_path`]).
+///
+/// For each bare soname (`libm.so`) this resolves the host's *real-ELF* versioned provider
+/// (`libm.so.6`) portably ([`find_host_lib`]) and creates/refreshes a symlink `dir/<soname> →
+/// <host provider>`. Idempotent: an existing correct symlink is left as-is; a stale/wrong link (or
+/// any other file at that name) is replaced. So the bionic linker, searching `dir` for `libm.so`,
+/// finds a real ELF and loads the host math lib — clearing `library 'libm.so' not found`.
+///
+/// Returns [`RuntimeError::HostLibNotFound`] if a required host provider is genuinely absent (no
+/// `cc -print-file-name` match and none of [`HOST_LIB_DIRS`] holds a real ELF) — an actionable
+/// typed failure naming what to install, never a silent skip (a skip would re-surface as the
+/// misleading bionic "library not found"). Must run **before** the lifecycle drives any
+/// `System.loadLibrary` that pulls a lib `NEEDED`-ing these sonames.
+pub fn provision_bionic_sonames(dir: &Path) -> Result<(), RuntimeError> {
+    std::fs::create_dir_all(dir).map_err(|e| RuntimeError::ProvisionSoname(dir.to_owned(), e))?;
+    for entry in BIONIC_BARE_SONAMES {
+        let target = find_host_lib(entry)?;
+        let link = dir.join(entry.soname);
+        symlink_idempotent(&target, &link)?;
+    }
+    Ok(())
+}
+
+/// Resolve the host's real-ELF provider for a bare soname, trying `cc -print-file-name` first
+/// (the canonical, portable compiler-driver resolution) then scanning [`HOST_LIB_DIRS`].
+///
+/// Only a path that is a *real ELF object* is accepted: the host's bare `libm.so` is an ld linker
+/// script (ASCII), which the bionic linker cannot parse — accepting it would not fix the failure.
+/// `cc -print-file-name=<name>` echoes the input unchanged when it finds nothing, so its result is
+/// validated by [`is_real_elf`] like any other candidate.
+fn find_host_lib(entry: &BareSoname) -> Result<PathBuf, RuntimeError> {
+    for candidate in entry.host_candidates {
+        // Portable route: the compiler driver knows the real lib dir for this host/triple.
+        if let Some(p) = cc_print_file_name(candidate) {
+            if is_real_elf(&p) {
+                return Ok(p);
+            }
+        }
+        // Fallback: scan the conventional glibc lib dirs; first real ELF wins.
+        for base in HOST_LIB_DIRS {
+            let p = Path::new(base).join(candidate);
+            if is_real_elf(&p) {
+                return Ok(p);
+            }
+        }
+    }
+    Err(RuntimeError::HostLibNotFound {
+        soname: entry.soname,
+        candidates: entry.host_candidates,
+    })
+}
+
+/// Ask the C compiler driver for the absolute path of a library filename
+/// (`cc -print-file-name=libm.so.6`), canonicalized. `None` if no compiler is present, the command
+/// fails, or the driver echoed the name unchanged (its "not found" behavior — a bare filename with
+/// no directory, which `canonicalize` then rejects).
+fn cc_print_file_name(name: &str) -> Option<PathBuf> {
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let out = Command::new(cc)
+        .arg(format!("-print-file-name={name}"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8(out.stdout).ok()?;
+    let reported = Path::new(line.trim());
+    // The driver echoes the input unchanged when it finds nothing (no directory component).
+    if reported.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return None;
+    }
+    std::fs::canonicalize(reported).ok()
+}
+
+/// Whether `path` is a regular file beginning with the ELF magic (`\x7fELF`).
+///
+/// Excludes the GNU ld *linker scripts* glibc installs as bare `.so` names (e.g. `/usr/lib/libm.so`
+/// = `GROUP(libm.so.6 …)` ASCII text): they are not ELF, so the bionic linker cannot load them, and
+/// symlinking to one would not fix the failure. A short read is sufficient and cannot panic.
+fn is_real_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
+}
+
+/// Create (or refresh) a symlink `link -> target`, idempotently.
+///
+/// If `link` already resolves to `target`, it is left untouched. Otherwise any existing entry at
+/// `link` (a stale symlink, or any other file) is removed and a fresh symlink is created. The
+/// "already correct" fast path keeps repeat boots cheap and avoids needless churn.
+fn symlink_idempotent(target: &Path, link: &Path) -> Result<(), RuntimeError> {
+    if let Ok(existing) = std::fs::read_link(link) {
+        if existing == target {
+            return Ok(());
+        }
+    }
+    // Replace whatever is there (stale link / wrong target / regular file). `remove_file` removes
+    // a symlink without following it; ignore "not present" so this stays idempotent.
+    match std::fs::remove_file(link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(RuntimeError::ProvisionSoname(link.to_owned(), e)),
+    }
+    std::os::unix::fs::symlink(target, link)
+        .map_err(|e| RuntimeError::ProvisionSoname(link.to_owned(), e))
+}
+
 /// dlopen flags for `libart.so` (see [`boot`]).
 ///
 /// 2026-06-05: `RTLD_GLOBAL` is **required** (not the RTLD_LOCAL default of the cross-platform
@@ -691,6 +855,17 @@ pub enum RuntimeError {
     /// Resolving the bionic `dl_parse_library_path` symbol from the global scope failed (libart
     /// not opened `RTLD_GLOBAL`, or libdl_bio lacks the symbol).
     ResolveDlParse(libloading::Error),
+    /// A required host library providing a bare Android soname was not found (no
+    /// `cc -print-file-name` match and none of the standard host lib dirs holds a real ELF).
+    HostLibNotFound {
+        /// The bare Android soname that could not be satisfied (e.g. `"libm.so"`).
+        soname: &'static str,
+        /// The host versioned ELF filenames that were searched for (e.g. `["libm.so.6"]`).
+        candidates: &'static [&'static str],
+    },
+    /// Provisioning a bare-soname symlink onto the bionic search path failed (create-dir, remove,
+    /// or symlink I/O error at the given path).
+    ProvisionSoname(PathBuf, std::io::Error),
     /// An ART option string contained an interior NUL byte.
     OptionHasNul,
     /// `JNI_CreateJavaVM` returned a non-`JNI_OK` status code.
@@ -737,6 +912,19 @@ impl fmt::Display for RuntimeError {
                 "failed to resolve dl_parse_library_path from libdl_bio.so.0 \
                  (is libart opened RTLD_GLOBAL?): {e}"
             ),
+            Self::HostLibNotFound { soname, candidates } => write!(
+                f,
+                "no host library found to provide the bare Android soname '{soname}' \
+                 (searched for {candidates:?} via `cc -print-file-name` and the standard host lib \
+                 dirs); install the host package that provides one of these (e.g. glibc)"
+            ),
+            Self::ProvisionSoname(p, e) => {
+                write!(
+                    f,
+                    "failed to provision a bionic-soname symlink at {}: {e}",
+                    p.display()
+                )
+            }
             Self::OptionHasNul => f.write_str("an ART VM option contained an interior NUL byte"),
             Self::CreateVm(rc) => write!(f, "JNI_CreateJavaVM failed (status {rc})"),
             Self::NullEnv => f.write_str("JNI_CreateJavaVM returned a null JNIEnv"),
@@ -751,6 +939,7 @@ impl std::error::Error for RuntimeError {
             | Self::ResolveSymbol(e)
             | Self::OpenGlobalScope(e)
             | Self::ResolveDlParse(e) => Some(e),
+            Self::ProvisionSoname(_, e) => Some(e),
             _ => None,
         }
     }
@@ -1005,6 +1194,102 @@ mod tests {
             natives_dir: PathBuf::from("/fw/natives"),
         };
         assert_eq!(bionic_library_path(&fw, None), "/fw/natives");
+    }
+
+    #[test]
+    fn is_real_elf_rejects_linker_script_accepts_elf_magic() {
+        // 2026-06-05 regression guard for the libm.so root cause: the host's bare `/usr/lib/libm.so`
+        // is a GNU ld *linker script* (ASCII text), which the bionic linker cannot parse — accepting
+        // it would NOT fix "library 'libm.so' not found". is_real_elf must reject it and accept only a
+        // file beginning with the ELF magic. Host-independent (writes its own fixtures to a temp dir).
+        let dir = std::env::temp_dir().join(format!("eclipse-elf-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk temp dir");
+
+        let script = dir.join("libm.so");
+        std::fs::write(
+            &script,
+            b"/* GNU ld script */\nGROUP ( /usr/lib/libm.so.6 )\n",
+        )
+        .expect("write script");
+        assert!(
+            !is_real_elf(&script),
+            "a linker-script .so must be rejected (it is not loadable ELF)"
+        );
+
+        let elf = dir.join("libm.so.6");
+        std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00rest-of-header").expect("write elf");
+        assert!(is_real_elf(&elf), "a file with ELF magic must be accepted");
+
+        assert!(
+            !is_real_elf(&dir.join("does-not-exist.so")),
+            "a missing file must be rejected, not panic"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn symlink_idempotent_creates_keeps_and_replaces() {
+        // 2026-06-05 regression guard: provisioning must be idempotent — create the link, leave a
+        // correct one untouched, and replace a stale/wrong one. Host-independent (temp dir + symlinks).
+        let dir = std::env::temp_dir().join(format!("eclipse-symlink-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        let target_a = dir.join("libm.so.6");
+        let target_b = dir.join("libm.so.7");
+        std::fs::write(&target_a, b"\x7fELFa").expect("write a");
+        std::fs::write(&target_b, b"\x7fELFb").expect("write b");
+        let link = dir.join("libm.so");
+
+        // Create.
+        symlink_idempotent(&target_a, &link).expect("create");
+        assert_eq!(std::fs::read_link(&link).expect("readlink"), target_a);
+
+        // Keep (already correct — no error, still points at A).
+        symlink_idempotent(&target_a, &link).expect("keep");
+        assert_eq!(std::fs::read_link(&link).expect("readlink"), target_a);
+
+        // Replace a stale link pointing at the wrong target.
+        symlink_idempotent(&target_b, &link).expect("replace");
+        assert_eq!(std::fs::read_link(&link).expect("readlink"), target_b);
+
+        // Replace a non-symlink file occupying the name.
+        std::fs::remove_file(&link).ok();
+        std::fs::write(&link, b"not a link").expect("write regular file");
+        symlink_idempotent(&target_a, &link).expect("replace regular file");
+        assert_eq!(std::fs::read_link(&link).expect("readlink"), target_a);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provisioned_sonames_are_nonempty_and_unique() {
+        // 2026-06-05: the provisioning table must list at least the run-confirmed missing soname
+        // (libm.so) and never duplicate a soname (a dup would symlink twice / churn). Host-independent.
+        assert!(
+            !BIONIC_BARE_SONAMES.is_empty(),
+            "must provision at least the run-confirmed missing soname (libm.so)"
+        );
+        assert!(
+            BIONIC_BARE_SONAMES.iter().any(|s| s.soname == "libm.so"),
+            "libm.so (zstd-jni/libroblox transitive NEEDED) must be provisioned"
+        );
+        for entry in BIONIC_BARE_SONAMES {
+            assert!(
+                entry.soname.ends_with(".so"),
+                "a bare Android soname ends in .so: {}",
+                entry.soname
+            );
+            assert!(
+                !entry.host_candidates.is_empty(),
+                "{} needs at least one host candidate",
+                entry.soname
+            );
+            let count = BIONIC_BARE_SONAMES
+                .iter()
+                .filter(|s| s.soname == entry.soname)
+                .count();
+            assert_eq!(count, 1, "duplicate soname entry: {}", entry.soname);
+        }
     }
 
     // The real ART VM boot is intentionally NOT an in-harness test: ART's `JNI_CreateJavaVM`
