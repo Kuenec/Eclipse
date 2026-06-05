@@ -92,6 +92,7 @@
 
 pub mod bionic_env;
 pub mod bionic_pthread;
+pub mod bionic_sysconf;
 pub mod elf;
 pub mod init_run;
 pub mod link;

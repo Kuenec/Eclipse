@@ -461,6 +461,19 @@ impl EclipseNativeProvider {
             p.register(name, addr);
         });
 
+        // ---- bionic system-query natives (the allocator-bootstrap fix) --------------------------
+        // 2026-06-05: the engine's `sysconf` / `getauxval` / `sched_getcpu` / `getpagesize` /
+        // `sysinfo` imports previously resolved to the HOST glibc baseline, whose `sysconf`
+        // mis-answers the BIONIC `_SC_*` constant numbering (bionic `_SC_NPROCESSORS_ONLN` = 97,
+        // which glibc's `sysconf(97)` answers as **-1**; bionic `_SC_PAGESIZE` = 39 → glibc 1000).
+        // libroblox's own per-thread allocator sized its arena table from those bad values and its
+        // first central refill returned NULL → `init[1]` `abort()` (docs/libroblox-init-run.md §7).
+        // The Eclipse-owned bionic-correct natives (`super::bionic_sysconf`), prepended before host,
+        // answer with the bionic constant meaning. See that module for the constant mapping + trace.
+        super::bionic_sysconf::register_natives(|name, addr| {
+            p.register(name, addr);
+        });
+
         p
     }
 }
@@ -2014,12 +2027,15 @@ mod tests {
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
         // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 27 ndk-android + 33
-        // media-ndk + 8 audio + 37 bionic-pthread/TLS/sem/syscall = 125 (2026-06-05).
+        // media-ndk + 8 audio + 37 bionic-pthread/TLS/sem/syscall + 5 bionic-sysconf system-query
+        // (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo — the allocator-bootstrap fix,
+        // 2026-06-05) = 130.
         assert_eq!(
             p.len(),
-            88 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT,
-            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio + 37 pthread \
-             natives registered"
+            88 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+                + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
+            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio + 37 pthread + 5 \
+             sysconf system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim)
@@ -2128,6 +2144,12 @@ mod tests {
             "sem_wait",
             "gettid",
             "syscall",
+            // bionic system-query (5) — the allocator-bootstrap fix (2026-06-05)
+            "sysconf",
+            "getauxval",
+            "sched_getcpu",
+            "getpagesize",
+            "sysinfo",
         ] {
             assert!(p.resolve(name).is_some(), "{name} must be registered");
         }

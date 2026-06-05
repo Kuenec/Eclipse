@@ -218,3 +218,88 @@ The shim logic is unit-tested (`cargo test loader::bionic_pthread` — 11 GPU/VM
 holds: work-list 88 → 0 (the 37 pthread natives were always host-resolvable, so they do not change
 the *unresolved* work-list; they only displace glibc with the bionic-correct impls). The harness
 re-run is the integration evidence and remains a diagnostic, not a `#[test]` assertion.
+
+---
+
+## 7. ROOT CAUSE FOUND + FIXED: the bionic-vs-glibc `sysconf` constant mismatch (2026-06-05)
+
+§6's revised obstacle — "libroblox's own per-thread allocator returns NULL on its first refill during
+init[1]" — is now **trace-proven to the exact bad value and fixed at the root cause.**
+
+### The trace that pinned it (`ECLIPSE_TRACE_SYSQ=1`)
+A new Eclipse-owned, bionic-ABI-correct system-query tier (`src/loader/bionic_sysconf.rs`) implements
+`sysconf` / `getauxval` / `sched_getcpu` / `getpagesize` / `sysinfo`, **prepended before the host
+glibc baseline** in `BionicEnv`, each logging `name(raw constant) -> return` under the env gate. The
+allocator-bootstrap calls it makes at init[1], captured live:
+```
+[sysq] sysconf(name=39) -> 4096      # bionic _SC_PAGESIZE — now answered correctly
+[sysq] sysinfo(...)      -> 0        # real RAM
+[sysq] sysconf(name=39) -> 4096
+[sysq] sysconf(name=39) -> 4096
+[sysq] sched_getcpu()   -> 9 (raw=9) # valid per-CPU bucket index
+[sysq] sched_getcpu()   -> 3 (raw=3)
+```
+
+### The bad value (measured on this dev host — `docs`/tests cross-check)
+`libroblox.so` is compiled against the **bionic** headers, whose `sysconf(3)` `_SC_*` constant
+**values differ from glibc's**. With the engine's `sysconf` import bound to the **host glibc**
+baseline, a call the engine believes is `sysconf(_SC_PAGESIZE)` / `sysconf(_SC_NPROCESSORS_ONLN)`
+actually passes the **bionic** numbers, which glibc mis-answers:
+
+| query                  | bionic value | host glibc `sysconf(value)` returns |
+|------------------------|-------------:|------------------------------------:|
+| `_SC_PAGESIZE`         | `39`         | `1000`  (NOT 4096)                  |
+| `_SC_NPROCESSORS_CONF` | `96`         | `200809` (a POSIX-version constant) |
+| `_SC_NPROCESSORS_ONLN` | `97`         | **`-1`** (unknown to glibc)         |
+| `_SC_PHYS_PAGES`       | `98`         | `1`                                 |
+| `_SC_CLK_TCK`          | `6`          | **`-1`**                            |
+
+The allocator sized its arena table / page-heap from `sysconf(39)` = page-size = **1000** (and, in the
+arena-count path, `sysconf(97)` = **-1**), computed a garbage/zero capacity, so its first central
+refill (`0x1bbdcfa`) returned NULL → the `je 0x287ef10`/`call abort@plt` at init[1]. NOT a libc/pthread
+ABI bug (those were already ruled out, §6) — a **system-query constant mismatch**, exactly the prime
+suspect.
+
+### The fix (`src/loader/bionic_sysconf.rs`, prepended before host in `BionicEnv`)
+A clean-room, bionic-ABI-correct `sysconf` that maps the **bionic** `_SC_*` numbers to the correct
+runtime answers: bionic `39`/`40` ⇒ the real host page size (4096), bionic `97` ⇒ the online CPU count
+(via `sched_getaffinity` bit-count, never 0/-1), bionic `96` ⇒ configured CPUs, bionic `6` ⇒ CLK_TCK,
+bionic `98`/`99` ⇒ RAM pages — each delegating to glibc's **own** correct constant where one exists. An
+unmapped bionic constant returns `-1` (POSIX indeterminate), never a forwarded-to-glibc wrong answer.
+`getauxval`/`sched_getcpu`/`getpagesize`/`sysinfo` forward to the host (their `AT_*` / kernel ABIs are
+identical for bionic and glibc) with tracing. `#[forbid(unsafe_code)]` stays on reloc/elf/resolve; the
+new `unsafe` is confined to the syscall/FFI bodies (dated `// SAFETY:`).
+
+### THE RE-RUN RESULT (real, dev host, 2026-06-05)
+```
+init[0/3427]   COMPLETED
+init[1/3427]   COMPLETED   ← was SIGABRT; the allocator now bootstraps
+…
+init[426/3427] SIGSEGV (signal 11) @ base+0x2cf1ec7  fault=0x966da
+EXIT=139
+```
+**Constructors completed: 1 → ~426** (the exact index drifts a few entries run-to-run: 414 / 426 —
+the new failure is a near-null pointer deref that depends on prior-ctor ordering, not the allocator).
+The `init[1]` allocator-bootstrap SIGABRT is **durably gone**; init now advances **400+ constructors**
+deep. New death point = a **different subsystem**: `init[426]` (a protobuf default-instance ctor in
+the `…DesignFoundations…` family) does `mov 0x3d685c9(%rip),%rbx  # 6a5a4a0` then `mov (%rbx),%rax` —
+it loads a pointer from a static global `0x6a5a4a0` that is still near-NULL and dereferences it (fault
+`~0x966da`, a small address). This is a **new frontier**, not the same bug.
+
+### Regression protection (this step)
+10 GPU/VM-free unit tests in `src/loader/bionic_sysconf.rs` (`cargo test loader::bionic_sysconf`):
+`sysconf(_SC_PAGESIZE)` == the real page size (≥4096, NOT 1000), `sysconf(_SC_NPROCESSORS_ONLN)` > 0
+(NOT -1) and ≤ CONF, `sysconf(_SC_CLK_TCK)` > 0, `sysconf(_SC_PHYS_PAGES)` > 0, an unmapped constant ⇒
+-1 (never a wrong value), `getauxval(AT_PAGESZ)` == page size, `getpagesize()` == host, `sched_getcpu()`
+≥ 0, the CPU-count helper never returns 0/-1, and the registration set is exactly the 5 expected names.
+The `native_provider` count test asserts the 5 system-query natives are registered. The harness re-run
+is the integration evidence (constructors 1 → ~426), a diagnostic, not a `#[test]` assertion.
+
+### Diagnosed next obstacle (the new frontier)
+A constructor reading an **uninitialized static global pointer** (`0x6a5a4a0`) that an earlier
+constructor or a runtime-init data dependency should have populated — most likely a default-instance /
+global-registry pointer the engine expects to be set up by a prior init step (or by a data relocation
+not yet applied in this isolated harness). NEXT = instrument init[~426]'s read of `0x6a5a4a0` (which
+prior constructor writes it, and whether it is a GOT/data slot the harness should have relocated) and
+satisfy that dependency. The system-query tier stays — it is required and correct; it advanced init
+from 1 to 400+ constructors.

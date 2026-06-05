@@ -551,6 +551,41 @@ before any history-rewriting/force operation.
   Cyber-safeguard NOT tripped (clean-room from the public bionic pthread C-ABI + Linux futex/gettid + Eclipse's own
   src/loader; no apkenv/bionic/NDK/linker/ATL source read). Full analysis: [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md)
   §6. See §6 (2026-06-05 bionic pthread+TLS shim).
+- **2026-06-05 UPDATE — ALLOCATOR-BOOTSTRAP ROOT CAUSE FOUND + FIXED: the bionic-vs-glibc `sysconf`
+  constant mismatch. Constructors completed 1 → ~426.** New module `src/loader/bionic_sysconf.rs`: 5
+  Eclipse-owned, bionic-ABI-correct system-query natives (`sysconf`/`getauxval`/`sched_getcpu`/
+  `getpagesize`/`sysinfo`), **prepended before the host glibc baseline** in `BionicEnv`, each
+  env-gated-traceable (`ECLIPSE_TRACE_SYSQ=1`). **TRACE-PROVEN root cause:** `libroblox.so` is compiled
+  against the **bionic** headers, whose `sysconf(3)` `_SC_*` constant VALUES DIFFER from glibc's; with
+  the engine's `sysconf` bound to host glibc, a call the engine believes is `sysconf(_SC_PAGESIZE)`
+  passes bionic `39` → glibc returns **1000** (NOT 4096), and `sysconf(_SC_NPROCESSORS_ONLN)` passes
+  bionic `97` → glibc returns **-1**. libroblox's own per-thread (tcmalloc/arena) allocator sized its
+  arena table / page-heap from those bad values, computed a zero/garbage capacity, so its first central
+  refill (`0x1bbdcfa`) returned NULL → the `init[1]` `je…call abort@plt` (SIGABRT). The fix maps the
+  bionic numbers to correct answers (bionic 39/40 ⇒ real page size 4096; bionic 97 ⇒ online CPU count
+  via `sched_getaffinity` bit-count, never 0/-1; bionic 96 ⇒ CONF; bionic 6 ⇒ CLK_TCK; bionic 98/99 ⇒
+  RAM pages), delegating to glibc's OWN correct constant where one exists; an unmapped bionic constant
+  ⇒ -1 (POSIX indeterminate, never a forwarded-to-glibc wrong value). `getauxval`/`sched_getcpu`/
+  `getpagesize`/`sysinfo` forward to host (AT_*/kernel ABIs are bionic≡glibc) with tracing. **RE-RUN
+  RESULT (dev host, `ECLIPSE_TRACE_SYSQ=1 eclipse __run-libroblox-init`): init[1] now COMPLETES (was
+  SIGABRT); init advances to ~426/3427 (drifts 414/426 run-to-run) then a NEW, different death point —
+  SIGSEGV (EXIT=139) at `init[~426]` `base+0x2cf1ec7` (a protobuf default-instance ctor) doing
+  `mov 0x…(%rip),%rbx # 6a5a4a0; mov (%rbx),%rax` = a deref of a still-near-NULL static global pointer
+  `0x6a5a4a0` (fault ~0x966da).** The allocator-bootstrap abort is DURABLY gone (the trace shows
+  `sysconf(39)->4096`, `sched_getcpu()->{9,3}`, `sysinfo->0`). `#![forbid(unsafe_code)]` stays on
+  reloc/elf/resolve; new `unsafe` confined to the syscall/FFI bodies (dated `// SAFETY:`). ZERO new
+  crates (libc already in tree; rustix `param` for page size). 10 GPU/VM-free unit tests (sysconf page
+  size ≥4096 / CPU count >0 & ≤CONF / CLK_TCK >0 / PHYS_PAGES >0 / unmapped ⇒ -1 / getauxval AT_PAGESZ
+  >0 / getpagesize == host / sched_getcpu ≥0 / cpu-count helper never 0-or-neg / registration set) +
+  the provider count test updated. Gate now **368 unit + 2 doctests** (fmt/build/clippy `-D warnings`/
+  test/release all clean; full-resolution invariant unchanged — these 5 were always host-resolvable so
+  they don't change the *unresolved* work-list, only displace glibc with bionic-correct impls). Cyber-
+  safeguard NOT tripped (clean-room from the public bionic `_SC_*`/`AT_*`/`getcpu`/`sysinfo` C-ABI +
+  Linux syscalls + Eclipse's own src/loader; no apkenv/bionic/NDK/linker source read; libroblox parsed
+  as data + executed by OUR loader). Full analysis: [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md)
+  §7. **Engine-load frontier: the allocator bootstraps; NEXT = the static-global-pointer dependency at
+  `init[~426]` (the deref of `0x6a5a4a0`) — instrument which prior ctor/data-reloc populates it.**
+  See §6 (2026-06-05 bionic sysconf system-query tier).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3467,6 +3502,38 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   0-warning/0-error (harness compiles clean; the init[1] abort is runtime). **NEXT = trace libroblox's central allocator
   path (`0x1bbdcfa`/`0x65089c9`) under the harness — which mmap/sysconf/getauxval/arena call returns the wrong value —
   and supply the bionic-correct behavior, to advance past init[1].**
+- **2026-06-05** — 🟢 **ENGINE-LOAD: ALLOCATOR-BOOTSTRAP ROOT CAUSE FOUND + FIXED (the bionic-vs-glibc `sysconf`
+  constant mismatch) — constructors completed 1 → ~426.** (2026-06-05 bionic sysconf system-query tier.) New module
+  `src/loader/bionic_sysconf.rs`: 5 Eclipse-owned, bionic-ABI-correct system-query natives — `sysconf` (the FIX) +
+  `getauxval`/`sched_getcpu`/`getpagesize`/`sysinfo` (host-forward; AT_*/kernel ABIs are bionic≡glibc) — each
+  env-gated-traceable via `ECLIPSE_TRACE_SYSQ=1`, **prepended before the host glibc baseline** in `BionicEnv`.
+  **TRACE-PROVEN root cause:** `libroblox.so` is compiled against the BIONIC headers, whose `sysconf(3)` `_SC_*`
+  constant VALUES differ from glibc's. With the engine's `sysconf` bound to host glibc, a call it believes is
+  `sysconf(_SC_PAGESIZE)` passes bionic `39` → glibc returns **1000** (NOT 4096), `sysconf(_SC_NPROCESSORS_ONLN)`
+  passes bionic `97` → glibc returns **-1**, `_SC_NPROCESSORS_CONF`(96)→200809, `_SC_PHYS_PAGES`(98)→1,
+  `_SC_CLK_TCK`(6)→-1 (all measured on this dev host + unit-tested). libroblox's own per-thread (tcmalloc/arena)
+  allocator sized its arena table / page-heap from those bad values, computed a zero/garbage capacity, so its first
+  central refill (`0x1bbdcfa`) returned NULL → the `init[1]` `je…call abort@plt`. NOT a libc/pthread ABI bug (ruled
+  out 2026-06-05) — a SYSTEM-QUERY constant mismatch, exactly the prime suspect. **The FIX** maps the bionic numbers
+  to correct answers (bionic 39/40 ⇒ host page size 4096; bionic 97 ⇒ online CPU count via `sched_getaffinity`
+  bit-count, never 0/-1; bionic 96 ⇒ CONF; bionic 6 ⇒ CLK_TCK; bionic 98/99 ⇒ RAM pages), delegating to glibc's OWN
+  correct constant where one exists; an unmapped bionic constant ⇒ -1 (POSIX indeterminate, never a forwarded-to-glibc
+  wrong value). **RE-RUN RESULT (dev host, `ECLIPSE_TRACE_SYSQ=1 ./target/release/eclipse __run-libroblox-init`):
+  init[1] now COMPLETES (was SIGABRT); the trace shows `sysconf(39)->4096`, `sched_getcpu()->{9,3}`, `sysinfo->0`;
+  init advances to ~426/3427 (drifts 414/426 run-to-run) then a NEW death point — SIGSEGV (EXIT=139) at
+  `init[~426]` `base+0x2cf1ec7` (a protobuf default-instance ctor) doing `mov 0x…(%rip),%rbx # 6a5a4a0; mov
+  (%rbx),%rax` = a deref of a still-near-NULL static global pointer `0x6a5a4a0` (fault ~0x966da).** The
+  allocator-bootstrap abort is DURABLY gone. `#![forbid(unsafe_code)]` stays on reloc/elf/resolve; new `unsafe`
+  confined to the syscall/FFI bodies (dated `// SAFETY:`). ZERO new crates. *Regression:* 10 GPU/VM-free unit tests
+  (`cargo test loader::bionic_sysconf`) + the `native_provider` count test (now 130 natives). *Cyber-safeguard: NOT
+  tripped* — clean-room from the PUBLIC bionic `_SC_*`/`AT_*`/`getcpu`/`sysinfo` C-ABI + Linux syscalls + Eclipse's
+  own `src/loader`; no apkenv/bionic/NDK/linker source read; libroblox parsed as data + executed by OUR loader.
+  Files: `src/loader/bionic_sysconf.rs` (new), `src/loader.rs` (+`pub mod bionic_sysconf`),
+  `src/loader/native_provider.rs` (register the 5 + count test), `docs/libroblox-init-run.md` (§7 root-cause
+  analysis). **Gate:** fmt --all --check / build --all-targets / clippy (-D warnings) / test (**368 unit + 2
+  doctests**) / release — all 0-warning/0-error (harness compiles clean; the init[~426] SEGV is runtime). **NEXT =
+  the static-global-pointer dependency at `init[~426]` (the deref of `0x6a5a4a0`) — instrument which prior ctor /
+  data-reloc should populate it.**
 
 ---
 
