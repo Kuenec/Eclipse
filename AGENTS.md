@@ -306,6 +306,34 @@ before any history-rewriting/force operation.
   integration tail: %fs/TCB binding (make the assembled TLS block reachable) + IRELATIVE ifunc execution + DT_INIT/
   init_array, then point the linker at the APK's bionic libs toward `libroblox.so`** (main-loop / dev-host only for the
   apkenv-wiring). See §6 (2026-06-05 dep-graph linker). Gate now **286 unit + 2 doctests**.
+  **2026-06-05 UPDATE — the REAL `libroblox.so` (x86-64) + the whole APK x86-64 native set are now CHARACTERIZED via
+  `elf.rs` (benign data parse of the binary bytes; cross-checked vs `readelf`/`llvm-readelf`). Full intel:
+  [`docs/libroblox-characterization.md`](docs/libroblox-characterization.md). HEADLINE: `lib/x86_64/libroblox.so`
+  PRESENT = 111,823,960 B (~111 MiB); the APK ships **only `lib/x86_64/`** (11 `.so`s, merged single-arch — no
+  arm64/armv7). libroblox = ELFCLASS64/EM_X86_64/ET_DYN, NDK r28c / API 26, SONAME `libroblox.so`. **3 PT_LOAD**
+  (R-X/RW/RW), mapped span `0x0..0x70b4a80` ≈ **112.7 MiB**; **PT_GNU_RELRO present; NO PT_TLS**; **BIND_NOW**
+  (FLAGS+FLAGS_1 NOW); **DT_INIT_ARRAY = 27,416 B → 3,427 constructors** (no legacy DT_INIT). **DT_NEEDED (10, none
+  shipped → all bionic-env): libOpenMAXAL libmediandk libOpenSLES libGLESv2 libEGL libandroid liblog libm libdl
+  libc.** Reloc histogram (REAL, via llvm-readelf which decodes APS2): **RELATIVE 527,208 + GLOB_DAT 67 + 64×22 +
+  JUMP_SLOT 546 = 527,843; NO TPOFF64 / DTPMOD64 / DTPOFF64 / COPY / IRELATIVE / RELR.** **UND imports = 584**
+  (~360 bionic libc, 91 GLES2/EGL, 45 pthread, 31 NDK libandroid, 23 libmediandk, 8 OpenSL/MAXAL, 6 dl, 3 `__cxa_*`;
+  **libc++ STATICALLY linked** — no libc++_shared.so, no Vulkan — GLES2/EGL render path). **THE #1 NEW WORK = the
+  Android `APS2` packed-relocation decoder in `elf.rs`:** libroblox's `.rela.dyn` is `SHT_ANDROID_RELA` (magic
+  `APS2`) at the OS-specific tags `DT_ANDROID_RELA 0x60000011`/`DT_ANDROID_RELASZ 0x60000012`, which `elf.rs` does
+  NOT yet read — so today its `relocations()` sees only the **546** std `.rela.plt` JUMP_SLOTs, MISSING the 527,297
+  packed dynamic relocs the image depends on. Every reloc *type* is already applied by `reloc.rs`; the gap is the
+  *packing*, a pure bounds-checked SLEB128 decoder addition (feeds the existing `Rela` path). The other 10 libs all
+  use standard `SHT_RELA` (elf.rs decodes them in full, exact match to llvm-readelf) — APS2 is UNIQUE to libroblox.
+  **Frontier revised (NARROWER than the old "TPOFF64/RELR/BIND_NOW wall"):** for libroblox there is NO TLS, NO
+  ifunc, NO RELR, and BIND_NOW is supported — so the runtime tail needs (1) the APS2 decoder, (2) the bionic-env
+  provider surface (10 sonames + 584 imports; +libz/libjnigraphics for helpers; EGL/GLES2→host GL), (3) run the
+  3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW; NO `%fs`/TCB needed (no PT_TLS). Honest caveat surfaced +
+  documented (not fixed, harmless to reloc): `elf.rs::parse_dynsyms`'s heuristic over-reads libroblox's symtab
+  (VERSYM/GNU_HASH/VER* sit between SYMTAB and STRTAB) → reports 1344/611 vs the GNU_HASH-authoritative 1096/584.
+  Regression guard: gated `loader::elf::tests::real_libroblox_engine_decodes_headline_facts` (reads the APK entry via
+  Eclipse's own `apk` reader, asserts class/machine/PT_LOAD>0/SONAME/DT_NEEDED-non-empty + the key bionic deps +
+  BIND_NOW + no-PT_TLS + RELRO; SKIPS cleanly if the APK is absent). NO libroblox exec/map — parse only. See §6
+  (2026-06-05 libroblox characterization). Gate now **287 unit + 2 doctests**.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2864,6 +2892,34 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (**286 unit + 2 doctests**) + `build --release` all 0-warning/0-error. Files: `src/loader/link.rs` (new), `src/loader/
   tls.rs` (`TlsResolver` own-module sym-0 path + tests), `src/loader/map.rs` (`relocate_tls` own-tp-offset param +
   `read_u64`), `src/loader.rs` (`pub mod link;` + module doc).
+- **2026-06-05 — libroblox.so characterization (engine-load intel).** Parsed the REAL x86-64 `lib/x86_64/libroblox.so`
+  + all 11 APK-shipped x86-64 `.so`s with Eclipse's own `src/loader/elf.rs` (benign data parse of binary bytes — NO
+  exec/mmap; the entry bytes read via Eclipse's own `apk` reader), cross-checked vs `readelf 2.46` and `llvm-readelf`
+  (the latter decodes Android `APS2` packed relocs, which GNU readelf cannot). Wrote
+  `docs/libroblox-characterization.md` (all REAL parsed numbers, no estimates). **Findings:** libroblox PRESENT =
+  111,823,960 B; APK ships **only `lib/x86_64/`** (no arm64/armv7); ELFCLASS64/EM_X86_64/ET_DYN, NDK r28c/API 26;
+  **3 PT_LOAD** span `0x0..0x70b4a80` (~112.7 MiB); **PT_GNU_RELRO yes, PT_TLS NO; BIND_NOW**; **3,427 DT_INIT_ARRAY
+  ctors**; **DT_NEEDED ×10** (libOpenMAXAL/libmediandk/libOpenSLES/libGLESv2/libEGL/libandroid/liblog/libm/libdl/libc
+  — none shipped → all bionic-env). **Reloc histogram (REAL): RELATIVE 527,208 + GLOB_DAT 67 + 64×22 + JUMP_SLOT 546
+  = 527,843; NO TPOFF64/DTPMOD64/DTPOFF64/COPY/IRELATIVE/RELR.** **UND imports 584** (bionic libc ~360, GLES2/EGL 91,
+  pthread 45, NDK libandroid 31, libmediandk 23, OpenSL/MAXAL 8, dl 6, 3 `__cxa_*`; **static libc++, no Vulkan**).
+  **DECISION / #1 new work = an Android `APS2` packed-relocation decoder in `elf.rs`:** libroblox's `.rela.dyn` is
+  `SHT_ANDROID_RELA` at `DT_ANDROID_RELA (0x60000011)`/`DT_ANDROID_RELASZ (0x60000012)`; `elf.rs` reads only standard
+  `DT_RELA/DT_JMPREL/DT_RELR`, so it currently sees only the 546 std PLT JUMP_SLOTs and MISSES the 527,297 packed
+  dynamic relocs. Every reloc *type* is already applied by `reloc.rs` — the gap is the *packing* (a pure SLEB128
+  decoder addition feeding the existing `Rela` path), UNIQUE to libroblox (the other 10 libs use std `SHT_RELA`,
+  which elf.rs decodes in full, exact-matching llvm-readelf). The old "TPOFF64/RELR/BIND_NOW relocation wall" is a
+  **non-issue for libroblox** (no TLS/RELR; BIND_NOW supported) — the frontier is narrower than feared. Honest caveat
+  logged (not fixed — harmless to relocation, out of this task's scope): `parse_dynsyms`'s heuristic over-reads
+  libroblox's symtab (VER*/GNU_HASH interleaved before STRTAB) → 1344/611 vs the authoritative 1096/584; a follow-up
+  is to derive the count from GNU_HASH. **Cyber-safeguard honored:** written ONLY from the public ELF gABI / x86-64
+  psABI / the public Android APS2 format + Eclipse's own cores — parsing a `.so`'s bytes as DATA + reading symbol
+  names is benign; NO apkenv/bionic/ATL LINKER or asset source was read. The characterization did NOT trip the
+  safeguard. **Regression guard:** gated `loader::elf::tests::real_libroblox_engine_decodes_headline_facts` (asserts
+  class/machine/PT_LOAD/SONAME/DT_NEEDED + key bionic deps + BIND_NOW + no-PT_TLS + RELRO; SKIPS cleanly if the APK
+  is absent — never fails/fabricates). **Gate:** fmt/build/clippy(-D warnings)/test (**287 unit + 2 doctests**)/
+  release all 0-warning/0-error. Files: `src/loader/elf.rs` (1 new gated test), `docs/libroblox-characterization.md`
+  (new).
 
 ---
 
@@ -2883,6 +2939,7 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 | `docs/bionic-loader-strategy.md` | Bionic-loader v1 strategy: the modern-relocation wall + chosen path. |
 | `docs/dev-host-runbook.md` | Dev-host execution steps the cargo-test harness can't run. |
 | `docs/project-state-2026-06-05.md` | Session capstone: verified demo lifecycle+render; full state + engine-load roadmap. |
+| `docs/libroblox-characterization.md` | REAL x86-64 `libroblox.so` + APK native-lib intel (DT_NEEDED, reloc histogram, APS2 gap, bionic-env surface). |
 
 ---
 
