@@ -545,14 +545,25 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `dl_parse_library_path(<fw-natives>:<app-lib cache dir>, ":")` from the RTLD_GLOBAL scope (resolvable
   because `boot()` opens libart RTLD_GLOBAL, promoting its NEEDED `libdl_bio.so.0`), wired in `main.rs::run_apk`
   AFTER `boot()` and BEFORE the lifecycle. The bionic linker now OPENS the .so (log: "is not a prelinked library"
-  progress msg, the "not found" is GONE). **NEXT FRONTIER for Roblox = the BIONIC-SHIM SONAME track (class D,
-  engine-load, main-loop only — STOP here for subagents/cyber-safeguard):** zstd-jni loads far enough to need its
-  own transitive `NEEDED libm.so`, which the shim linker can't resolve (bare soname; host has `libm.so.6`) → the
-  same soname-shim gap as `libroblox.so`'s `libmediandk.so`/`libOpenMAXAL.so`. Roblox's `AppStartupTaskManager`
-  background thread also NPEs on `Looper.mQueue` (background threads have no Looper) then a fatal SIGSEGV during
-  `androidx.startup.InitializationProvider` (engine-load native track, NOT the Rust FFI — the whitelist call is
-  clean, no Rust panic). Faithful run log: `/tmp/eclipse-roblox.log` (EXIT=139 SIGSEGV, further than the prior
-  `System.exit(10)` in `/tmp/eclipse-roblox2.log`).
+  progress msg, the "not found" is GONE). ✅ **RESOLVED 2026-06-05 (§6 provision_bionic_sonames entry): the bare
+  `NEEDED libm.so` NOW RESOLVES** — `runtime::provision_bionic_sonames(app_lib_dir)` symlinks each run-confirmed
+  bare host soname (currently just `libm.so`) to the host's real-ELF versioned provider (`/usr/lib/libm.so.6`,
+  found portably via `cc -print-file-name=libm.so.6` with a real-ELF check that rejects the host's bare
+  `/usr/lib/libm.so` GNU **ld linker script**), into the same app-lib dir already whitelisted on the bionic path.
+  Wired in `main.rs::run_apk` after extraction, before the whitelist + lifecycle. The bionic linker now FINDS +
+  OPENS `libm.so` (the `library 'libm.so' not found` is GONE, grep count 0). **NEXT FRONTIER for Roblox = the
+  BIONIC-SHIM RELOCATION track (class D/relocation, engine-load, main-loop only — STOP here for
+  subagents/cyber-safeguard):** the shim linker now FAILS to *relocate* libm.so — `linker.c:2128 unknown reloc
+  type 18 @ 0x… → linker.c:2901 failed to link libm.so`. Reloc type **18** on x86-64 = `R_X86_64_TPOFF64` (TLS
+  thread-pointer offset); the host `libm.so.6` carries 1 such reloc (it has `STATIC_TLS`) + `RELR`-compressed
+  relatives + `BIND_NOW` (benign `readelf -r`/`-d`), which the apkenv-era bionic shim linker doesn't implement.
+  Fixing it = either teach the bionic shim linker `R_X86_64_TPOFF64`/`RELR` (flagged linker source work) OR a
+  bionic-ABI re-export `libm.so` shim (the hard NDK-shim track) — both flagged, NOT done here. Same track as
+  `libroblox.so`'s `libmediandk.so`/`libOpenMAXAL.so` shims. Roblox's `AppStartupTaskManager` background thread
+  also NPEs on `Looper.mQueue` (background threads have no Looper) then a fatal SIGSEGV during
+  `androidx.startup.InitializationProvider` (engine-load native track, NOT the Rust FFI — the provisioning +
+  whitelist calls are clean, no Rust panic/RuntimeError, grep count 0). Faithful run log: `/tmp/eclipse-roblox.log`
+  (EXIT=139 SIGSEGV; the libm "not found" frontier is now PAST — the relocation frontier is the next stop).
   📋 **Dev-host execution runbook:** the two frontiers' next concrete steps (which need
   main-thread `cargo run -- run …`, not the cargo-test harness or subagents) are consolidated
   into an executable, decision-driven script in [`docs/dev-host-runbook.md`](docs/dev-host-runbook.md)
@@ -1564,6 +1575,53 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   deps (`libloading` already in tree). All `unsafe` (`Library::open`, `.get`, the FFI call) carries `// SAFETY:`.
   **NEXT (main-loop, engine-load track): the bionic-shim sonames (`libm.so`, then `libmediandk.so`/`libOpenMAXAL.so`)
   so zstd-jni + `libroblox.so` link past relocation — and Roblox's background-thread `Looper` provisioning.**
+- **2026-06-05** — 🎉 **Bare host soname `libm.so` PROVISIONED — the bionic `library 'libm.so' not found` is GONE;
+  next frontier is the bionic-shim RELOCATION track (`unknown reloc type 18`).** Root cause (confirmed by evidence,
+  not inference): the bionic shim linker (`linker.c`) resolves a `NEEDED` entry by searching its `apkenv_ldpaths[]`
+  for a file *named exactly the bare Android soname* (`libm.so`) and mmap-parsing it as ELF. zstd-jni `NEEDED`
+  `libm.so`/`libdl.so`/`libc.so` (`readelf -d`); `libc.so` resolves via cfg.d's `libc.so → libc_bio.so.0` alias and
+  `libdl.so` is self-provided by the shim linker, but **`libm.so` has no cfg.d alias and no `_bio` shim**, and the
+  host's bare `/usr/lib/libm.so` is a GNU **ld linker script** (ASCII `GROUP(libm.so.6 …)`, `file` = "ASCII text"),
+  not ELF — so the bionic linker can't load it → `linker.c:1333 library 'libm.so' not found`. The real ELF64 glibc
+  math lib is `/usr/lib/libm.so.6` (`cc -print-file-name=libm.so.6` resolves it; exports the math symbols versioned;
+  its own `NEEDED libc.so.6` resolves via the host-glibc fallback, same as `liblog`/`libc`). **Fix (surgical,
+  ATL-design-faithful, portable):** new `runtime::provision_bionic_sonames(dir)` symlinks each run-confirmed bare
+  soname (`BIONIC_BARE_SONAMES`, currently just `libm.so` → candidate `libm.so.6`) to the host's real-ELF provider,
+  found portably by `find_host_lib` (`cc -print-file-name` first — honors `$CC`/`$CC=cc` — then scanning standard
+  glibc dirs `HOST_LIB_DIRS`, each validated by `is_real_elf`, which reads the 4-byte `\x7fELF` magic and **rejects
+  the linker-script** trap), into the same app-lib cache dir already whitelisted on the bionic path. Symlinks are
+  idempotent (`symlink_idempotent`: keep a correct link, replace a stale link / regular file, ignore "not present").
+  Two new typed errors — `RuntimeError::HostLibNotFound { soname, candidates }` (actionable: names what to install,
+  NO silent skip — a skip would re-surface as the misleading "not found") and `ProvisionSoname(PathBuf, io::Error)`.
+  This is the SAME Android-soname → host-provider mapping `/usr/share/bionic_translation/cfg.d` does for
+  `libEGL.so → libEGL.so.1` / `libOpenSLES.so → libOpenSLES.so.1`, but Eclipse-owned + portable for the sonames
+  cfg.d omits — NOT editing the system cfg.d. Wired in `main.rs::run_apk` after extraction, before the bionic
+  whitelist + lifecycle. **FAITHFUL run (`/tmp/eclipse-roblox.log`, EXIT=139):** `bionic bare-soname symlinks
+  provisioned ✓`, the symlink `~/.cache/eclipse/native-libs/libm.so → /usr/lib/libm.so.6` exists (verified
+  on-disk, resolves to a real ELF64), and the bionic linker **FINDS + OPENS** libm.so (`linker.c:879 libm.so is not
+  a prelinked library` progress msg; the `library 'libm.so' not found` is GONE — grep count 0 vs 1 before). **NEW
+  FRONTIER = the BIONIC-SHIM RELOCATION track (class D, engine-load, main-loop only — STOPPED per cyber-safeguard):**
+  the shim linker now FAILS to *relocate* libm.so — `linker.c:2128 unknown reloc type 18 @ 0x… → linker.c:2901
+  failed to link libm.so`. Reloc type **18** on x86-64 = `R_X86_64_TPOFF64` (TLS thread-pointer offset); the host
+  `libm.so.6` carries 1 such reloc (`STATIC_TLS`) + `RELR`-compressed relatives + `BIND_NOW` (benign `readelf -r`/
+  `-d` confirmed: `32 R_X86_64_GLOB_DAT`, `1 R_X86_64_TPOFF64`, RELR present, no IFUNC), which the apkenv-era bionic
+  shim linker doesn't implement. Resolving it = either teach the bionic shim linker `R_X86_64_TPOFF64`/`RELR`
+  (flagged linker source work) OR build a bionic-ABI re-export `libm.so` shim (the hard NDK-shim track) — both
+  flagged, NOT done here. SAME track as `libroblox.so`'s `libmediandk.so`/`libOpenMAXAL.so` shims. The
+  background-thread `Looper.mQueue` NPE + the `androidx.startup.InitializationProvider` SIGSEGV (on `AppStartupTaskM`)
+  are the engine-load native track, NOT the Rust FFI — the provisioning + whitelist calls are clean (no Rust
+  panic/RuntimeError, grep count 0). The cyber-safeguard did NOT trip (only filesystem + `readelf`/`nm`/`file`/`ls`
+  data inspection — never the bionic linker source). Regression guards (host-independent, in-harness):
+  `is_real_elf_rejects_linker_script_accepts_elf_magic` (writes a linker-script fixture + an ELF-magic fixture to a
+  temp dir, proves the script is rejected and ELF accepted — the exact root-cause trap), `symlink_idempotent_creates_keeps_and_replaces`
+  (create / keep-correct / replace-stale-link / replace-regular-file), `provisioned_sonames_are_nonempty_and_unique`
+  (the table lists `libm.so`, every soname ends `.so`, has a candidate, no dups). Full gate green: `fmt --all
+  --check` / `build --all-targets` / `clippy --all-targets --all-features -D warnings` / **test 104 unit (+3 new) +
+  2 compile_fail doctests** / `release` (panic=abort/LTO retained). No new deps (`std::process::Command` +
+  `std::os::unix::fs::symlink`, std-only). Run log: `/tmp/eclipse-roblox.log`. **NEXT (main-loop, flagged track):
+  the bionic-shim RELOCATION/NDK-shim work — `R_X86_64_TPOFF64`/`RELR` support OR re-export shims for
+  `libm`/`libmediandk`/`libOpenMAXAL` so the engine's transitive libs link past relocation; + Roblox's
+  background-thread `Looper` provisioning.**
 
 ---
 
