@@ -132,10 +132,13 @@ before any history-rewriting/force operation.
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
   PROGRESS** — `diagnostics` (tracing) + `config` (serde/JSON) + **`apk`** (zip + own total
-  AXML reader + SHA-256) + **`runtime`** (host-ISA detection + `BootPlan` + `eclipse run`
-  dry-run) all done & gated (2026-06-04). Remaining M1: the `runtime` **VM boot FFI**
-  (`dlopen` libart + `JNI_CreateJavaVM` + winit + ash) — the charter's high-risk/last step,
-  needs the vendored ART linked.
+  AXML reader + SHA-256) + **`runtime`** (host-ISA detection + `BootPlan` + **ART VM boot**)
+  all done & gated (2026-06-04). 🎉 **`runtime::boot()` boots the vendored ART VM from pure
+  Rust** (`dlopen` libart + `JNI_CreateJavaVM`, libcore VM, JNI_OK) — `eclipse run <apk>`
+  boots it on this host (EXIT 0). This **validates the Step 3.5 thesis end-to-end**: a
+  graphics-free Rust process boots ART with a clean low_4gb window where ATL+GTK4 exhausted it.
+  Remaining M1: reach Roblox `onCreate` (app classpath = api-impl.jar:apk, the Activity,
+  `System.loadLibrary`→`libroblox.so`, a `winit` window + `ash` Vulkan surface).
 
 ### 🟡 M0 STATUS — Steps 1+2 PASSED, Step 3 in progress (low_4gb blocker)
 
@@ -420,54 +423,42 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
 - `/home/kue/Projects/Eclipse/vendor/atl/` — local fork build, no longer needed. Safe to `rm -rf` later.
 
 ---
-- **Last verified 2026-06-04:** full gate clean with `diagnostics`+`config`+`apk` wired —
-  `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, `cargo test` (**24 pass**), `cargo build --release`
-  (0 warnings). The `apk` reader was validated against the **real** Roblox manifest (full
-  zip+deflate+AXML path) → exactly the ground truth: package `com.roblox.client`, launcher
-  `com.roblox.client.startup.ActivitySplash`, min 26, target 35, `largeHeap=false`.
+- **Last verified 2026-06-04:** full gate clean with `diagnostics`+`config`+`apk`+`runtime`
+  wired — `cargo fmt --all --check`, `cargo build --all-targets`, `cargo clippy --all-targets
+  --all-features -- -D warnings`, `cargo test` (**34 pass**), `cargo build --release`
+  (0 warnings). The `apk` reader was validated against the **real** Roblox manifest →
+  ground truth (com.roblox.client / ActivitySplash / 26 / 35 / largeHeap=false). **`eclipse
+  run <apk>` boots the vendored ART VM** (libcore, JNI_OK, EXIT 0) on this host.
 - **Repo:** git initialized; committed & pushed to `origin/main`
   (<https://github.com/Kuenec/Eclipse>) as **Kuenec**, **no co-author trailer**.
 - **What exists:** 7 docs + `README` + `eclipse` crate. **M1 done so far:**
-  `diagnostics` (tracing, `RUST_LOG`→`info`, idempotent), `config` (serde/JSON + `directories`,
-  full Sober schema, typed no-panic `ConfigError`), **`apk`** (`src/apk/`: open local APK zip,
-  **own total pure-Rust binary AXML reader** `src/apk/axml.rs` — replaced panic-prone
-  `axmldecoder`; package/launcher/sdk/largeHeap; native-ABI + x86_64-engine detection;
-  streaming SHA-256 `verify_integrity`; 24 tests incl. UTF-8/UTF-16 + truncation/mutation
-  totality fuzz), **`runtime`** (`src/runtime.rs`: `instruction_set_features()` runtime CPUID
-  ISA detection for dex2oat — the Step 4 fix; `BootPlan` derived from manifest+config+host
-  with `art_options()`; `boot()` honestly returns `NotImplemented`; `eclipse run <apk>`
-  dry-run prints the plan; 13 tests). **37 tests total, all green.** The other 6 modules are
-  dependency-free stubs.
+  `diagnostics` (tracing), `config` (serde/JSON + `directories`, full Sober schema, typed
+  no-panic `ConfigError`), **`apk`** (`src/apk/`: own total pure-Rust binary AXML reader
+  replacing `axmldecoder`; native-ABI/engine detection; streaming SHA-256), **`runtime`**
+  (`src/runtime.rs`: host-CPUID ISA detection for dex2oat [Step 4 fix]; `BootPlan` with
+  `vm_options()`/`dex2oat_options()` [the two destinations split]; **`boot()` = `dlopen`
+  libart + `JNI_CreateJavaVM` → a live libcore VM**; `eclipse run` derives the plan + boots).
+  **34 tests, all green.** The other 6 modules are dependency-free stubs.
 - **Deps wired (M1):** `tracing 0.1`, `tracing-subscriber 0.3`, `serde 1`, `serde_json 1`,
-  `directories 6`, **`zip 2` (`deflate`, default-features off)**, **`sha2 0.10`**. Cargo.lock
-  committed. `runtime` host detection is **std-only** (no new dep). NO `axmldecoder` (own
-  reader); `ureq`/`rustls` (APK fetch) deferred — no stable programmatic source yet (see "why
-  user-supplied"); `clap`/`rustix`/`jni`/`winit`/`ash` deferred to the VM-boot FFI.
-- **Open items:** license `TBD`; M1 `runtime` **VM boot FFI** (+ later: APK fetch backend).
-- **Next actions (pick up here — M1 `runtime` VM boot FFI):**
-  1. Implement `runtime::boot()`: `dlopen` libart + `JNI_CreateJavaVM` (boot image +
-     bootclasspath + classpath = api-impl.jar : APK), a **`winit`** window (not GTK4 — the
-     Step 3.5 fix that frees the low_4gb window), and an **`ash` Vulkan** surface (GL/EGL
-     fallback). This introduces the crate's first `unsafe` → lift `#![forbid(unsafe_code)]`
-     in `runtime.rs` and **wrap every JNI/`extern "C"` boundary in `catch_unwind`** so a Rust
-     panic can never unwind into ART's C++ under `panic = "abort"` (§2.8, see §6 decision).
-     Consume the existing `BootPlan`/`art_options()` (heap, ISA, sdk-int, activity, backend).
-     **Follow the evidence-based recipe in `docs/art-and-runtime.md` → "VM boot —
-     implementation plan"**: verified paths (libart.so, boot image, libcore hostdex jars,
-     api-impl.jar, libcore natives), the env-setup crux (ART loads libcore natives via the
-     translation linker → v1 must stand up `bionic_translation` first, not a bare dlopen), the
-     libloading+jni shape, and the Step 3.5 thesis test (do a graphics-free libcore-only smoke
-     boot FIRST — it's the cheapest decisive test that a clean low_4gb window lets ART boot).
-     **Do this step in the main loop / interactively** — workflow subagents are content-filter
-     -blocked on ART-VM-boot/JNI topics (see §6).
-  2. **Deferred from the BootPlan review (do at boot time):** (a) split `art_options()` VM
-     options (`-X*` → `JavaVMOption`) from the dex2oat flag (`--instruction-set-features` → a
-     separate dex2oat invocation) at the type level so neither is sent to the wrong target;
-     (b) canonicalize the launcher-activity name (manifest dotted vs `-l` slashed form) to
-     whatever ART's `-l` actually expects.
-  3. With the winit-based boot, re-attempt the Roblox boot to finally harvest
-     `framework-worklist.txt` (the deferred Step 4 data).
+  `directories 6`, `zip 2` (`deflate`, default-features off), `sha2 0.10`, **`libloading 0.9`**
+  (dlopen libart), **`jni-sys 0.4`** (raw JNI invocation types; the full `jni` crate is
+  deferred to the framework-lifecycle work). Cargo.lock committed. NO `axmldecoder`/`jni`/`ureq`/
+  `rustls`/`clap`/`rustix`. `winit`/`ash` deferred to the windowed boot.
+- **Open items:** license `TBD`; M1 reach Roblox `onCreate` (+ later: APK fetch backend).
+- **Next actions (pick up here — drive ART to Roblox's `onCreate`):**
+  1. Extend `runtime::boot()` from the libcore smoke boot to the app: add the classpath
+     (`-Djava.class.path` / a `PathClassLoader`) = `api-impl.jar : <APK>`, instantiate the
+     Application, drive the launcher Activity (`BootPlan::launcher_activity` = `ActivitySplash`,
+     or `.with_activity_override(...)` for `ActivityNativeMain`) to `onCreate`. ART loads
+     `libroblox.so` via the translation linker on `System.loadLibrary`. Add the full `jni`
+     crate here for safe JNI calls; **wrap every Rust JNI callback in `catch_unwind`** (§2.8,
+     keep `panic = "abort"`). Boot from the **main thread** (the cargo-test harness can't boot
+     ART — see §6 / the note in `runtime.rs` tests; validate via `eclipse run`).
+  2. Add a **`winit`** window + an **`ash` Vulkan** surface (GL/EGL fallback per
+     `BootPlan::graphics_backend`) and hand it to the engine (Surface/View). Still no GTK4 —
+     that is what keeps the low_4gb window clear (Step 3.5, now proven).
+  3. With the real boot reaching Roblox's Java shell, harvest `framework-worklist.txt` (the
+     missing `android.*` classes/methods to stub) — the deferred Step 4 data.
   4. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
 
 ---
@@ -652,6 +643,24 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   *workflow subagents* doing ART-VM-boot/JNI analysis (blocked the apk/runtime correctness
   reviewers AND both boot-research agents); main-loop work on the same legitimate task is
   unaffected → implement the boot in the main loop / interactively, not via Workflow subagents.
+- **2026-06-04** — 🎉 **`runtime::boot()` boots the vendored ART VM from pure Rust — Step 3.5
+  thesis VALIDATED.** Implemented in the main loop (workflow subagents are content-filter-blocked
+  on this topic). Earlier research wrongly feared a bare boot needs explicit bionic_translation
+  setup; a C probe then proved otherwise — `libart.so` is a **host (glibc) build** (`readelf`:
+  `libc.so.6`/`libstdc++.so.6`) and its libcore native backends are host libs, and it pulls the
+  translation linker (`NEEDED libdl_bio.so.0`) as a transitive dep that **self-initializes**, so
+  `dlopen(libart.so)` + `JNI_CreateJavaVM(-Ximage:.../boot.art + the M0 heap flags)` boots a
+  libcore VM (returns `JNI_OK`) from a bare, **graphics-stack-free** process with NO low_4gb
+  exhaustion — the decisive proof of the Step 3.5 thesis (no GTK4/Mesa crowding the low window).
+  Rust impl: `libloading` (dlopen) + `jni-sys` (raw invocation types), `unsafe` confined to
+  `boot()` with `// SAFETY:` notes, `panic = "abort"` kept, `#![forbid(unsafe_code)]` lifted in
+  `runtime.rs` only. `eclipse run <apk>` boots it from `main()` (EXIT 0). Caveat: ART must be
+  created on a clean process **main thread** — the cargo-test harness (worker thread) aborts with
+  a `scoped_thread_state_change` check, so the real boot is validated via `eclipse run`, not an
+  in-harness test (the discovery + option-split logic IS unit-tested). The two
+  `libjavacore.so`/`libopenjdk.so` "not found" stderr lines are the known non-fatal bionic-linker
+  first-pass probes (it loads them from the natives dir next). Also resolved here: the deferred
+  `vm_options()`/`dex2oat_options()` split (only `-X*` flags go to `JNI_CreateJavaVM`).
 
 ---
 

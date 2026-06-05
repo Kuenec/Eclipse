@@ -178,10 +178,23 @@ migrates to Rust.** The "Rust client" identity holds because every line we *own*
 
 ## VM boot — implementation plan (2026-06-04, evidence-based)
 
+> ✅ **UPDATE 2026-06-04 — the libcore boot is IMPLEMENTED and the thesis is VALIDATED.**
+> `runtime::boot()` `dlopen`s `libart.so` and calls `JNI_CreateJavaVM` (with `-Ximage` + the M0
+> heap flags) to bring up a **libcore** ART VM — it returns `JNI_OK` from a bare, graphics-free
+> Rust process (`eclipse run <apk>`, EXIT 0), with **no low_4gb exhaustion**. This proves the
+> Step 3.5 thesis. **The "crux" below was disproven:** a bare `dlopen` IS enough for a libcore
+> boot — `libart.so` is a host (glibc) build whose libcore native backends are host libs, and it
+> pulls the translation linker (`NEEDED libdl_bio.so.0`) transitively, which self-initializes; no
+> explicit `bionic_translation` setup is needed until the *app's* `libroblox.so` is loaded.
+> Impl: `libloading` + `jni-sys`. Caveat: boot from the process **main thread** (the cargo-test
+> harness aborts via `scoped_thread_state_change`). Remaining: reach Roblox `onCreate` (app
+> classpath + Activity + `System.loadLibrary` + winit/ash). The recipe below stays accurate for
+> paths/options; treat the "crux/recommended v1" as superseded by the simpler reality.
+
 The `runtime` crate's planning layer is done (`runtime::BootPlan`, host-ISA detection,
-`eclipse run` dry-run). The remaining M1 work is `runtime::boot()` — the actual ART VM boot.
-This is the charter's **highest-risk / last** step; the plan below is grounded in the M0 boot
-logs + the installed `art_standalone` / `android_translation_layer` layout.
+`eclipse run`). The libcore `runtime::boot()` is done (above); the remaining work is driving ART
+to Roblox's `onCreate`. The plan below is grounded in the M0 boot logs + the installed
+`art_standalone` / `android_translation_layer` layout.
 
 ### Boot recipe (verified components on this host)
 - **VM library:** `/usr/lib/art/libart.so` — exports `JNI_CreateJavaVM` +

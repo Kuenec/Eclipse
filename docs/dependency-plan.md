@@ -31,7 +31,9 @@ sha2 = "0.10"                                          # 🟢 artifact integrity
 # ring = "0.17"         # 🟢/🟡 OPTIONAL: APK signature v2/v3 verification
 
 # --- Bind to vendored ART (src/runtime.rs) -----------------------------------
-jni = "0.21"                                           # 🟢 crate; calls ART's JNI_CreateJavaVM (🔴 ART)
+libloading = "0.9"                                     # 🟢 WIRED M1: dlopen /usr/lib/art/libart.so (🔴 ART) — no link-time ART dep
+jni-sys = "0.4"                                        # 🟢 WIRED M1: raw JNI invocation types for JNI_CreateJavaVM (libcore boot proven)
+# jni = "0.22"   # 🟢 full safe JNIEnv wrappers — DEFERRED to the framework-lifecycle work (driving onCreate)
 
 # --- bionic loader / shim (src/bionic.rs) ------------------------------------
 object = "0.36"                                        # 🟢 ELF parsing (rustc-grade)
