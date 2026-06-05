@@ -1580,7 +1580,7 @@ mod tests {
 
         // eclipse_natives=false: this test is the HOST-BASELINE pipeline proof (NDK/media/audio/log
         // have 0 host-resolved). The Eclipse-native tier is exercised by the sibling test
-        // `real_libroblox_eclipse_natives_resolve_liblog_and_bionic_libc` below.
+        // `real_libroblox_eclipse_natives_fully_resolve_all_imports` below.
         let bionic = BionicEnv::with_host_baseline(true, false);
         eprintln!(
             "BionicEnv: host_libc_present={} eclipse_natives={} missing_gl={:?}",
@@ -1743,14 +1743,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- REAL test: the ECLIPSE-NATIVE tier resolves liblog + libc + ndk + media-ndk + audio ------
+    // ---- REAL test: the ECLIPSE-NATIVE tier FULLY resolves liblog + libc + ndk + media + audio ----
     // (skips cleanly if the APK is absent — never fails / fabricates). With the EclipseNativeProvider
-    // PREPENDED before the host baseline, the engine's liblog (3 fixed-arity) + bionic-libc (15) +
-    // ndk-android (27) + media-ndk (33) + audio (8) imports now resolve to ECLIPSE addresses (NOT
-    // host glibc), and the work-list shrinks 88 -> 2 (only the 2 deferred variadic liblog remain).
+    // PREPENDED before the host baseline, the engine's liblog (5: 3 fixed-arity Rust + 2 variadic
+    // C-shim) + bionic-libc (15) + ndk-android (27) + media-ndk (33) + audio (8) imports now resolve
+    // to ECLIPSE addresses (NOT host glibc), and the work-list shrinks 88 -> 0 — FULL resolution of
+    // every libroblox import to an Eclipse/host address (2026-06-05: the variadic cc shim closed it).
 
     #[test]
-    fn real_libroblox_eclipse_natives_resolve_liblog_libc_ndk_media_and_audio() {
+    fn real_libroblox_eclipse_natives_fully_resolve_all_imports() {
         use crate::loader::bionic_env::{categorize_imports, BionicEnv};
         use crate::loader::native_provider::EclipseNativeProvider;
         use crate::loader::resolve::{HostDlsymProvider, SymbolProvider};
@@ -1812,16 +1813,16 @@ mod tests {
             88,
             "host-baseline work-list is the documented 88"
         );
-        // The Eclipse tier resolves 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android + 33
-        // media-ndk + 8 audio = 86 names, shrinking the work-list from 88 to 2 (only the 2 deferred
-        // variadic liblog remain).
+        // The Eclipse tier resolves all 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15
+        // bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio = 88 names, shrinking the work-list
+        // from 88 to 0 — FULL resolution of every libroblox import to Eclipse/host (2026-06-05).
         assert_eq!(
             with_eclipse.unresolved_count(),
-            2,
-            "Eclipse natives shrink the work-list 88 -> 2 (86 liblog+libc+ndk+media+audio resolved)"
+            0,
+            "Eclipse natives shrink the work-list 88 -> 0 (FULL resolution; the variadic liblog C shim closed the last 2)"
         );
 
-        // The 86 newly-resolved names are EXACTLY the ones the Eclipse provider registers, and they
+        // The 88 newly-resolved names are EXACTLY the ones the Eclipse provider registers, and they
         // resolve to ECLIPSE addresses, not host ones: prove it by resolving each against an
         // Eclipse-only provider AND confirming the host (`dlsym`) has no such symbol.
         let eclipse_only = EclipseNativeProvider::with_bionic_natives();
@@ -1839,9 +1840,17 @@ mod tests {
         );
         assert_eq!(
             newly_resolved.len(),
-            86,
-            "exactly 86 imports move from work-list to Eclipse-resolved"
+            88,
+            "exactly 88 imports move from work-list to Eclipse-resolved (FULL resolution)"
         );
+        // The 2 VARIADIC liblog natives (DEFINED by the clean-room C shim, 2026-06-05) are now among
+        // the newly-resolved set — they no longer sit on the work-list.
+        for variadic in ["__android_log_print", "__android_log_assert"] {
+            assert!(
+                newly_resolved.contains(variadic),
+                "{variadic} (variadic liblog) resolves to the Eclipse C-shim address"
+            );
+        }
         // All 27 ndk-android names must be among the newly-resolved set (resolve to Eclipse).
         for ndk in [
             "AAssetManager_fromJava",
@@ -1954,14 +1963,6 @@ mod tests {
                 "{name} is a bionic-only name the host glibc does not export"
             );
         }
-        // The 2 VARIADIC liblog natives stay on the work-list (deferred — no landmine).
-        for deferred in ["__android_log_print", "__android_log_assert"] {
-            assert!(
-                with_eclipse.host_unresolved.iter().any(|n| n == deferred),
-                "{deferred} (variadic) stays on the work-list"
-            );
-        }
-
         // 3) Apply the Eclipse-tier-resolvable subset on the mapped engine and verify the new slots.
         let stats = set
             .relocate_object_symbols_partial("libroblox.so", &eclipse_scope, page)
@@ -1970,12 +1971,25 @@ mod tests {
             "Eclipse-native partial apply: applied_nonnull={} applied_weak_zero={} unresolved_strong={} (work-list={})",
             stats.applied_nonnull, stats.applied_weak_zero, stats.unresolved_strong, stats.unresolved.len(),
         );
-        // The apply's work-list must equal the categorization's (consistency), and shrink to 2.
-        assert_eq!(stats.unresolved.len(), 2, "applied work-list is 2");
-        assert!(
-            stats.applied_nonnull > 0,
-            "Eclipse + host fill a non-trivial GOT subset"
+        // The apply's work-list must equal the categorization's (consistency), and shrink to 0 —
+        // FULL resolution: every libroblox symbol relocation now resolves to an Eclipse/host address.
+        assert_eq!(
+            stats.unresolved.len(),
+            0,
+            "applied work-list is 0 (FULL resolution — no unresolved-strong symbols remain)"
         );
+        assert_eq!(
+            stats.unresolved_strong, 0,
+            "no unresolved-strong symbol relocations remain"
+        );
+        // 2026-06-05: FULL resolution fills exactly 623 GOT/PLT slots non-null — the previous 621
+        // (host baseline + 86 Eclipse natives) plus the 2 variadic liblog C-shim slots. The 12
+        // legal weak-undef→0 are recorded separately (not counted here).
+        assert_eq!(
+            stats.applied_nonnull, 623,
+            "FULL resolution fills 623 GOT/PLT slots (621 + the 2 variadic liblog shim slots)"
+        );
+        assert_eq!(stats.applied_weak_zero, 12, "12 legal weak-undef → 0");
 
         // Every applied GOT slot for an Eclipse-native import holds the Eclipse address (non-null).
         let obj = &set.objects[0];

@@ -444,6 +444,7 @@ dependencies = [
  "ab_glyph",
  "ash",
  "ash-window",
+ "cc",
  "directories",
  "jni",
  "jni-sys 0.4.1",
