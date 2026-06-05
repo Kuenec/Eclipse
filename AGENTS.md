@@ -520,9 +520,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      UNCONFIRMED to resolve at implement time (read `api-impl.jar` via `javap -s` + iterate on a real
      run): whether `Activity.onCreate` is called directly or via `activity_start`/the event loop;
      Looper/MessageQueue ordering vs the sequence; and the compiled `createMainActivity`
-     signature/visibility in `api-impl.jar`. **Separately:** the deferred **bionic NDK-shim** step
-     (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent cyber-safeguard blocker) so the
-     Roblox engine's transitive natives resolve and `libroblox.so` links past relocation.
+     signature/visibility in `api-impl.jar`. **Framework-frontier crux — DESIGNED 2026-06-04
+     (`docs/art-and-runtime.md` "Non-GTK api-impl backing — design"):** the blocker is that
+     `api-impl.jar`'s `native` backing (`libtranslation_layer_main.so`) is GTK-4-linked (`readelf`),
+     but `api-impl.jar` itself is **GTK-free** and ATL binds natives **by symbol name** (no
+     `RegisterNatives`). **Chosen approach:** supply Eclipse's OWN non-GTK `Java_*` symbols for those
+     names + **drop ATL's GTK natives dir from `java.library.path`** — do NOT fork the Java. **Smallest
+     first step:** against pure-Java `demo_app.apk`, bind just the **2** natives in `Context`'s static
+     init — `Context.native_updateConfig`/`native_get_apk_path` (steps 1–3 are pure Java; the `jlong`
+     can be any stable non-null Eclipse handle since they only store it) — then drive steps 1–3 to
+     `Application.onCreate` and verify on the dev host (`cargo run -- run …/demo_app.apk`: onCreate
+     reached, window opens, exit 0, **no `libgtk-4` in `/proc/self/maps`**). **Separately:** the
+     deferred **bionic NDK-shim** step (`libmediandk.so`/`libOpenMAXAL.so`, main-loop only — subagent
+     cyber-safeguard blocker) so the Roblox engine's transitive natives resolve and `libroblox.so`
+     links past relocation.
   4. Once Roblox's Java shell runs, harvest `framework-worklist.txt` (missing `android.*` the
      framework must implement) — the deferred Step 4 data, and the spec for the winit framework.
   5. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.

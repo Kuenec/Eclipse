@@ -341,6 +341,132 @@ and by a dev-host `eclipse run` — the cargo test harness aborts ART (worker-th
 - **Whether `createMainActivity`'s compiled signature/visibility in `api-impl.jar` matches the
   source** (`javap -s` the jar to confirm descriptors before binding them).
 
+## Non-GTK api-impl backing — design (2026-06-04)
+
+> **Status:** Design, grounded for the next framework increment. Resolves the "framework
+> frontier" crux (`AGENTS.md` §5 next-actions): the `jlong`-window/onCreate steps are gated on
+> the backing for `api-impl.jar`'s `native` methods being **GTK-coupled**. This section pins the
+> non-GTK replacement and the smallest first step. Companion to "onCreate JNI recipe (confirmed)"
+> above. Sources read 2026-06-04: ATL's `api-impl/android/{content,view}/*.java` +
+> `api-impl-jni/*.c` (the JNI/GTK backing) + `main-executable/main.c`; `readelf -d` on the
+> installed `libtranslation_layer_main.so`; the winit 0.30 `raw-window-handle` API.
+
+### Approach + rationale (why a native backing, not a Java fork)
+
+Build **Eclipse's own non-GTK native backing** for `api-impl.jar`'s declared `native` methods —
+a replacement for ATL's GTK-linked `libtranslation_layer_main.so` — and bind it into ART, keeping
+ATL's `api-impl.jar` unchanged on the classpath. Evidence forcing this:
+
+- **ATL binds natives by symbol name (no `RegisterNatives`).** There is no `JNI_OnLoad`/
+  `RegisterNatives` anywhere in ATL; each native lazy-binds at its **first call** by the
+  `Java_<class>_<method>` symbol name, from whatever `.so` is on `java.library.path`.
+- **The GTK coupling is in the C backing, not the Java.** The installed
+  `.../android_translation_layer/natives/libtranslation_layer_main.so` exports every `api-impl`
+  native **and** is directly GTK-4/GDK/pango/webkitgtk-linked (`readelf -d` shows the GTK-family
+  `NEEDED` entries). The moment ART resolves any of those natives, GTK loads and re-crowds
+  low_4gb — exactly the Step 3.5 blocker winit avoids. `api-impl.jar` itself is **GTK-free**: it
+  stores the `jlong` opaquely and only *declares* `native` methods.
+
+So the durable, surgical fix (CLAUDE.md root-cause, smallest change) is to **supply Eclipse's own
+non-GTK symbols for those exact `Java_*` names** and **remove ATL's GTK natives dir from
+`java.library.path`** so Eclipse's symbols are the ones bound. Forking `api-impl.jar` is rejected
+(large, non-surgical, duplicates a vendored artifact, and **no Java change is needed** to reach
+onCreate); a hybrid Java-patch is rejected for the same reason.
+
+### Minimal native-method contract
+
+Two tiers of name-based `Java_*` symbols Eclipse defines (non-GTK) and binds via the `jni` crate's
+`register_native_methods` (or by being the only matching symbol on `java.library.path` once ATL's
+GTK natives dir is dropped):
+
+**Tier A — reach `Application.onCreate` against a pure-Java APK.** Steps 1–3 of the confirmed
+recipe (`Context.createApplication(J)` → `ContentProvider.createContentProviders()` →
+`Application.onCreate()`) are **pure Java** — no native call; the `jlong` window is only stored as
+a field. The only natives actually invoked up to `onCreate` are the **two** in `Context`'s static
+initializer (runs at class-load):
+
+| `Java_*` symbol | Descriptor | Eclipse (non-GTK) behavior |
+|---|---|---|
+| `android/content/Context.native_updateConfig` | `(Landroid/content/res/Configuration;)V` | Set `Configuration.screenWidthDp`/`screenHeightDp` from a winit `MonitorHandle` if a window exists, else safe constants. ATL queries GDK here — Eclipse does **not**. |
+| `android/content/Context.native_get_apk_path` | `()Ljava/lang/String;` | Return the APK path as a `jstring`. Trivial, no GTK. |
+
+**Tier B — present a surface / drive a real Activity.** Step 4 `Activity.createMainActivity(String,
+J,String)` builds a `Window` (→ `Window.set_native_window` → `set_jobject`) and calls
+`setTitle`/`setLayout`. Adds (all GTK-free, winit-backed):
+
+| `Java_*` symbol | Eclipse (non-GTK) behavior |
+|---|---|
+| `android/view/Window.set_jobject` | Store the Java `Window` ref keyed by handle in a Rust-side map (replaces ATL's `g_object_set_data`). |
+| `android/view/Window.set_title` | winit `Window::set_title`. |
+| `android/view/Window.set_layout` | winit set size. |
+| `android/view/Window.set_widget_as_root` | Attach view → surface (the real render binding; a stub initially). |
+| `android/view/Window.take_input_queue` | winit input bridge. |
+| `android/os/MessageQueue.nativeInit` / `nativePollOnce` | Looper/event-loop integration. |
+
+`Activity.nativeStartActivity`/`nativeResumeActivity` are pure state (no GTK); they need no
+Eclipse-specific work except dropping ATL's GTK window-close in `nativeFinish`.
+
+### Render stack + window-handle mapping
+
+Render surface is **ash/Vulkan-first, EGL fallback** (`docs/tech-selection.md` §C; the 2026-06-04
+perf decision; `config.use_opengl=false` defaults to Vulkan). Eclipse does **not** render — it
+provides the `libvulkan`/`libEGL` the engine links and forwards to the host ICD, translating WSI.
+
+The `jlong` passed to `createApplication(J)`/`createMainActivity` is an **Eclipse-owned
+`intptr_t`** — **not** a `GtkWidget*` and **not** raw-window-handle bytes. Keep a Rust-side
+registry of Eclipse window objects and pass the registry handle (or `Box::into_raw` of an Eclipse
+`WindowState`) as the `jlong`; Eclipse's own natives cast it back to the `WindowState`, which holds
+the winit `Window` and later the `ash` `vk::SurfaceKHR`/EGL surface created from
+`window.window_handle()`. Context7-confirmed (winit 0.30): `window.window_handle()?.as_raw()` →
+`RawWindowHandle::Wayland(WaylandWindowHandle{ surface })` or `Xlib(XlibWindowHandle{ window, .. })`;
+ash-window consumes the matching display+window handle to build the `VkSurface`. The engine never
+sees the winit handle directly — it sees an Android `ANativeWindow`/`Surface` that Eclipse's WSI
+shim backs with the winit surface. **For Tier A no surface is needed:** the `jlong` can be any
+stable non-null Eclipse handle because steps 1–3 only store it.
+
+### Smallest first implementation increment
+
+Provide Eclipse's own non-GTK backing for **exactly the two Tier-A natives**, against the pure-Java
+`demo_app.apk`, deferring all Window/Surface natives:
+
+1. In `framework.rs`, after `from_raw` + attach, call `register_native_methods` to bind
+   `android/content/Context` natives `native_updateConfig` (`(Landroid/content/res/Configuration;)V`)
+   and `native_get_apk_path` (`()Ljava/lang/String;`) to two `extern "C"` Rust fns (both
+   `catch_unwind`-wrapped, §2.8). Register **before** the `find_class` that triggers `Context`'s
+   static initializer so the binding wins over lazy lookup.
+2. In `runtime.rs` `library_path_option`, stop putting ATL's GTK-linked natives dir on
+   `java.library.path` for this path (so `libtranslation_layer_main.so`/GTK is never `dlopen`ed);
+   keep only the app-lib dir (none for demo_app).
+3. Extend `drive_application_lifecycle` past `BridgeProven`: call step 1 `Context.createApplication(J)`
+   with an Eclipse-owned non-null `jlong`, step 2 `ContentProvider.createContentProviders()`, step 3
+   `Application.onCreate()` — all pure Java, no further natives.
+4. Verify on the dev host: `cargo run -- run ~/eclipse-m0/atl_test_apks/demo_app.apk` boots ART,
+   registers the 2 natives, runs `Context` static-init + steps 1–3, logs "Application.onCreate
+   reached", opens the window, exits 0 — with **no GTK** in the process map (`/proc/self/maps`:
+   no `libgtk-4`).
+
+### UNCONFIRMED — resolve at implement time (dev-host `eclipse run` + `javap -s`)
+
+- Whether `jni` 0.22.4 `register_native_methods` reliably **intercepts** ATL's name-based
+  lazy-bound natives, and the registration **ordering** vs `Context`'s static init. If
+  `RegisterNatives` needs the class already loaded (which triggers the static init that *calls*
+  the natives), the symbols must instead be resolvable at first call — i.e. supply them as a real
+  Eclipse `.so` on `java.library.path`. Validate which path works on the dev host.
+- The **complete set** of natives `Context`'s static initializer + `PackageParser` transitively
+  invoke for `demo_app.apk` beyond these two (enumerate by running until no `UnsatisfiedLinkError`;
+  stub each GTK-free). Dropping ATL's natives dir could surface more framework natives than the two
+  identified.
+- The **compiled** `api-impl.jar` signatures/field names (`native_updateConfig`,
+  `native_get_apk_path`, `Configuration.screenWidthDp`/`screenHeightDp`) — verify via `javap -s` on
+  the installed jar, not the source (compiled jar could differ).
+- Exact winit 0.30.x point release and whether `window_handle()` is used from the concrete
+  `resumed()` API or the trait-object API in this tree.
+- Tier B only: the precise winit `RawWindowHandle` variant → ash-window `VkSurface` (Wayland surface
+  vs X11 XID) and how the engine's `ANativeWindow`/`vkCreateAndroidSurfaceKHR` maps onto it —
+  deferred, not needed for `onCreate`.
+- Whether a real (non-demo) Roblox APK reaches further natives before the bionic NDK-shim frontier
+  (separate work-stream).
+
 ## Sources
 
 - [art_standalone (GitLab)](https://gitlab.com/android_translation_layer/art_standalone) — base `android-6.0.1_r46`, build outputs, patches
