@@ -473,9 +473,13 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
      clear enough for Roblox to boot. **Design first:** winit's event loop wants the main thread
      and ART must also be created on the main thread (the cargo-harness abort showed ART's
      main-thread sensitivity) — settle the thread/loop ownership model before building.
-  2. ✅ Native-lib extraction DONE (`apk::extract_native_libs`, streamed + idempotent). Remaining:
-     extract on boot to a cache dir and add it to `java.library.path` so `System.loadLibrary`
-     finds `libroblox.so` (wire into the boot env alongside the framework natives dir).
+  2. ✅ Native-lib extraction + `java.library.path` wiring DONE. `apk::extract_native_libs`
+     (streamed + idempotent) runs on boot into the XDG cache dir (`runtime::native_lib_cache_dir`,
+     `ECLIPSE_NATIVE_LIB_DIR`-overridable); `boot(plan, Some(apk), Some(app_lib_dir))` appends that
+     dir **after** the framework natives dir on `-Djava.library.path` so `System.loadLibrary("roblox")`
+     can find `libroblox.so`. NEXT: write the committed `docs/bionic-loader-plan.md` design note,
+     then the deferred bionic-shim step (`libmediandk.so`/`libOpenMAXAL.so`) — **main-loop only** due
+     to the subagent cyber-safeguard blocker.
   3. JNI calls: add the full **`jni`** crate for safe `FindClass`/`CallStaticObjectMethod`/…;
      **wrap every Rust JNI callback in `catch_unwind`** (§2.8, keep `panic = "abort"`). Boot from
      the **main thread** (the cargo-test harness aborts ART — validate via `eclipse run`).
@@ -755,6 +759,25 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `loadLibrary`. So Eclipse's no-GTK path already reaches **further** than ATL on this APK (to the
   engine load itself); this is new territory, not copyable from a working ATL run. Full spec:
   `~/eclipse-m0/framework-worklist.txt`.
+- **2026-06-04** — **Native-lib extraction wired into `-Djava.library.path` on boot (§5 work-list
+  item 2 remaining half DONE).** On `eclipse run <apk>`, the app's `lib/x86_64/*.so` (incl. the
+  111 MB `libroblox.so`) are now extracted to an **XDG cache dir** before the VM boots, and that dir
+  is placed on the engine's library search path so `System.loadLibrary("roblox")` can resolve the
+  engine. New `runtime::native_lib_cache_dir()` mirrors the `config` module's portable `directories`
+  (`ProjectDirs`) pattern → `$XDG_CACHE_HOME/eclipse/native-libs` (`~/.cache/eclipse/native-libs`
+  default), **overridable via `ECLIPSE_NATIVE_LIB_DIR`** and failing with the actionable typed
+  `RuntimeError::NoCacheDir` when no home/cache base can be determined — never a hardcoded
+  `/tmp`/`/home`/username path (§9, CLAUDE.md portability). `boot()` gained an `app_lib_dir` param;
+  `library_path_option` now joins the **framework natives dir FIRST, the extracted app-lib dir
+  SECOND** (`:`-joined) so the framework's own JNI backends keep resolving unchanged while the engine
+  becomes findable. Regression guard: a unit test pins that exact path order + separator so a
+  reordering or wrong-separator regression fails loudly. Reuses the existing idempotent streamed
+  `apk::extract_native_libs`, so repeat boots are cheap. No new dep (`directories` already in tree);
+  `forbid(unsafe)` unaffected (the new code is safe Rust). Full gate green (39 tests incl. the new
+  guard). **NEXT (main-loop only — subagent cyber-safeguard blocker):** write the committed
+  `docs/bionic-loader-plan.md` design note, then the deferred bionic-shim step
+  (`libmediandk.so`/`libOpenMAXAL.so`) so the engine's transitive NDK natives resolve in the bionic
+  namespace and `libroblox.so` links past relocation.
 
 ---
 

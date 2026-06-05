@@ -111,13 +111,30 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("    {opt}");
     }
 
+    // Extract the app's x86_64 native libs (incl. libroblox.so) to the XDG cache dir before boot
+    // so `System.loadLibrary("roblox")` can find the engine via java.library.path. The extractor
+    // streams (~119 MB) and is idempotent (skips already-extracted files), so repeat boots are
+    // cheap. The dir is appended after the framework natives dir on java.library.path in boot().
+    let app_lib_dir = eclipse::runtime::native_lib_cache_dir()?;
+    println!(
+        "\n# Extracting native libs (lib/x86_64/) to {}…",
+        app_lib_dir.display()
+    );
+    let extracted = apk.extract_native_libs("x86_64", &app_lib_dir)?;
+    println!("extracted {} native lib(s) ✓", extracted.len());
+
     // Boot the ART VM from this (main) thread — the production entry point — with the APK on the
-    // classpath, so ART loads Roblox's Java (+ the android.* framework) alongside libcore.
+    // classpath, so ART loads Roblox's Java (+ the android.* framework) alongside libcore, and the
+    // extracted app-lib dir on java.library.path so System.loadLibrary finds libroblox.so.
     // Driving the launcher Activity to onCreate (the GTK-coupled framework / Eclipse's own
     // winit+Vulkan framework) is the next step. ART logs verbosely to stderr on first run
     // (dex2oat compiles the boot image once).
     println!("\n# Booting the ART VM with Roblox on the classpath…");
-    eclipse::runtime::boot(&plan, Some(std::path::Path::new(apk_path)))?;
+    eclipse::runtime::boot(
+        &plan,
+        Some(std::path::Path::new(apk_path)),
+        Some(&app_lib_dir),
+    )?;
     println!("ART VM booted with Roblox's Java on the classpath ✓");
 
     // Open the host game window via winit (no GTK — keeps the low_4gb window clear for ART, the

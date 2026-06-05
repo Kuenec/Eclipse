@@ -44,6 +44,8 @@ use std::ffi::{c_void, CString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use directories::ProjectDirs;
+
 use crate::apk::Manifest;
 use crate::config::Config;
 
@@ -325,6 +327,22 @@ pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
     })
 }
 
+/// Resolve the XDG cache directory the app's extracted native libs (`libroblox.so`, …) live in.
+///
+/// 2026-06-04: mirrors [`Config::config_path`](crate::config::Config)'s portable `directories`
+/// pattern — `$XDG_CACHE_HOME/eclipse/native-libs` (`~/.cache/eclipse/native-libs` by default),
+/// never a hardcoded `/tmp`/`/home`/username path (§9, CLAUDE.md "Build & Environment
+/// Portability"). Overridable via `ECLIPSE_NATIVE_LIB_DIR` for distros/layouts whose cache base
+/// differs (detect-don't-assume). Returns [`RuntimeError::NoCacheDir`] only when no home/cache
+/// base can be determined (e.g. `$HOME` unset) — an actionable failure, not a silent fallback.
+pub fn native_lib_cache_dir() -> Result<PathBuf, RuntimeError> {
+    if let Some(dir) = env_path("ECLIPSE_NATIVE_LIB_DIR") {
+        return Ok(dir);
+    }
+    let dirs = ProjectDirs::from("", "", "eclipse").ok_or(RuntimeError::NoCacheDir)?;
+    Ok(dirs.cache_dir().join("native-libs"))
+}
+
 /// Build the `-Djava.class.path=` value: `api-impl.jar : APK : framework-res.apk` (ART's
 /// classpath separator is `:`). Mirrors ATL's `create_vm` so the app's dex and the framework
 /// both load into the VM.
@@ -337,10 +355,22 @@ fn class_path_option(fw: &FrameworkPaths, apk: &Path) -> String {
     )
 }
 
-/// Build the `-Djava.library.path=` value (the framework natives dir). The app's own extracted
-/// native libs (`libroblox.so`, …) are added when `System.loadLibrary` support lands.
-fn library_path_option(fw: &FrameworkPaths) -> String {
-    format!("-Djava.library.path={}", fw.natives_dir.display())
+/// Build the `-Djava.library.path=` value: the framework natives dir, then (when the app's
+/// native libs have been extracted) the app-lib dir, `:`-joined.
+///
+/// 2026-06-04: the framework natives dir MUST stay **first** so the framework's own JNI
+/// backends resolve as before; the extracted app-lib dir (holding `libroblox.so`, …) is
+/// appended **second** so `System.loadLibrary("roblox")` can find the engine. ART's
+/// `java.library.path` separator is `:` (the platform path separator on Linux).
+fn library_path_option(fw: &FrameworkPaths, app_lib_dir: Option<&Path>) -> String {
+    match app_lib_dir {
+        Some(dir) => format!(
+            "-Djava.library.path={}:{}",
+            fw.natives_dir.display(),
+            dir.display()
+        ),
+        None => format!("-Djava.library.path={}", fw.natives_dir.display()),
+    }
 }
 
 /// `JNI_CreateJavaVM` as resolved from `libart.so`: `(JavaVM**, void**, void*) -> jint`.
@@ -366,11 +396,21 @@ type JniCreateJavaVm = unsafe extern "system" fn(
 ///   the foundation for reaching `onCreate`; driving the Activity itself needs the framework
 ///   (currently GTK-coupled — see [`find_framework`]).
 ///
+/// `app_lib_dir` is the directory the app's native libs were extracted to
+/// (see [`crate::apk::Apk::extract_native_libs`] + [`native_lib_cache_dir`]); when `Some`, it is
+/// appended **after** the framework natives dir on `java.library.path` so
+/// `System.loadLibrary("roblox")` resolves `libroblox.so`. It is only meaningful alongside
+/// `apk_path`; passing it with `apk_path = None` has no effect (no classpath/library.path is set).
+///
 /// `libart.so` is intentionally **never unloaded**: a running ART VM has daemon threads
 /// (GC/JIT) executing libart's code, so unmapping it would be undefined behavior. The VM lives
 /// for the process; proper `DestroyJavaVM`-then-unload teardown is future work. Consequently
 /// only one VM can be created per process (`JNI_CreateJavaVM` returns an error on a second call).
-pub fn boot(plan: &BootPlan, apk_path: Option<&Path>) -> Result<(), RuntimeError> {
+pub fn boot(
+    plan: &BootPlan,
+    apk_path: Option<&Path>,
+    app_lib_dir: Option<&Path>,
+) -> Result<(), RuntimeError> {
     let libart = find_libart()?;
     let boot_image = find_boot_image()?;
 
@@ -386,7 +426,7 @@ pub fn boot(plan: &BootPlan, apk_path: Option<&Path>) -> Result<(), RuntimeError
     if let Some(apk) = apk_path {
         let fw = find_framework()?;
         option_strings.push(make_cstring(class_path_option(&fw, apk))?);
-        option_strings.push(make_cstring(library_path_option(&fw))?);
+        option_strings.push(make_cstring(library_path_option(&fw, app_lib_dir))?);
     }
     let mut options: Vec<jni_sys::JavaVMOption> = option_strings
         .iter()
@@ -457,6 +497,8 @@ pub enum RuntimeError {
     BootImageNotFound(PathBuf),
     /// The vendored Android framework (`api-impl.jar`) was not found.
     FrameworkNotFound(PathBuf),
+    /// No home/cache base directory could be determined for the native-lib cache dir.
+    NoCacheDir,
     /// `dlopen` of `libart.so` failed.
     LoadLibart(libloading::Error),
     /// Resolving the `JNI_CreateJavaVM` symbol failed.
@@ -493,6 +535,10 @@ impl fmt::Display for RuntimeError {
                     p.display()
                 )
             }
+            Self::NoCacheDir => f.write_str(
+                "could not determine a cache directory for extracted native libs \
+                 (set ECLIPSE_NATIVE_LIB_DIR to override)",
+            ),
             Self::LoadLibart(e) => write!(f, "failed to dlopen libart.so: {e}"),
             Self::ResolveSymbol(e) => write!(f, "failed to resolve JNI_CreateJavaVM: {e}"),
             Self::OptionHasNul => f.write_str("an ART VM option contained an interior NUL byte"),
@@ -676,7 +722,33 @@ mod tests {
             framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
             natives_dir: PathBuf::from("/fw/natives"),
         };
-        assert_eq!(library_path_option(&fw), "-Djava.library.path=/fw/natives");
+        // No extracted app libs yet: just the framework natives dir.
+        assert_eq!(
+            library_path_option(&fw, None),
+            "-Djava.library.path=/fw/natives"
+        );
+    }
+
+    #[test]
+    fn library_path_option_framework_first_then_app_lib_colon_joined() {
+        // The exact invariant System.loadLibrary("roblox") depends on: the framework natives dir
+        // stays FIRST, the extracted app-lib dir (holding libroblox.so) is appended SECOND, and
+        // the two are ':'-joined under -Djava.library.path. Machine-independent (PathBufs only).
+        let fw = FrameworkPaths {
+            api_impl_jar: PathBuf::from("/fw/api-impl.jar"),
+            framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
+            natives_dir: PathBuf::from("/fw/natives"),
+        };
+        let opt = library_path_option(&fw, Some(Path::new("/cache/eclipse/native-libs")));
+        assert_eq!(
+            opt,
+            "-Djava.library.path=/fw/natives:/cache/eclipse/native-libs"
+        );
+        // Guard the ordering + separator explicitly so a regression (app-lib first, or wrong
+        // separator) fails loudly rather than silently breaking engine resolution.
+        let value = opt.strip_prefix("-Djava.library.path=").expect("prefix");
+        let parts: Vec<&str> = value.split(':').collect();
+        assert_eq!(parts, vec!["/fw/natives", "/cache/eclipse/native-libs"]);
     }
 
     // The real ART VM boot is intentionally NOT an in-harness test: ART's `JNI_CreateJavaVM`
