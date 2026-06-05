@@ -552,6 +552,20 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   `rustls`/`clap`/`rustix`. `winit`/`ash` deferred to the windowed boot.
 - **Open items:** license `TBD`; M1 reach Roblox `onCreate` (+ later: APK fetch backend).
 - **Next actions (pick up here — the demo's `onCreate` now COMPLETES; advance the lifecycle / engine):**
+  🟢 **NEXT GRAPHICS BUILD = the CANVAS DRAW CASCADE + RGBA COMPOSITE (2026-06-05).** The tiny-skia Canvas
+  raster is DONE + pixel-tested (`canvas_registry`, §5/§6 Canvas entry); multitouch.test reaches RESUMED but
+  its custom-View `onDraw(Canvas)` never runs (Eclipse drives `onResume` but not `ViewRootImpl.performTraversals`,
+  so 0 Canvas natives surface). Two concrete steps, smallest-sound first: **(1) draw-cascade driver** —
+  after RESUMED, walk the laid-out tree (`view_registry::snapshot_tree` + the renderer's layout) for CUSTOM
+  (non-`android.*`) views, allocate a `canvas_registry` Pixmap sized to each view's rect, construct a Java
+  `Canvas` whose native handle is that slab index (bind `Canvas`'s init native + `nDrawColor`/`nDrawRect`/
+  `nDrawCircle`/`nDrawPath`/`nDrawText` → the `canvas_registry` methods + `paint_registry`/`path_registry`),
+  and invoke `View.draw(canvas)`/`onDraw` via JNI (guarded, `catch_unwind`); each native fills the Pixmap.
+  **(2) RGBA composite** — sibling of `graphics::TextRenderer` (R8) for an RGBA8 sampled texture: upload the
+  Pixmap + draw a textured quad over the view's rect (reuse the text pipeline's vertex-input + combined-image-
+  sampler descriptor; sound reverse-order teardown). Validate on multitouch.test (touch circles composite) +
+  keep demo_app/accelerometerdemo rendering. The Canvas op→Pixmap pixels are already GPU-free unit-tested;
+  add a composite-quad geometry test when the RGBA pipeline lands.
   ✅ **DONE 2026-06-05: the demo `MainActivity.onCreate` completes** — `findViewById(0x7f030000).setText(…)`
   succeeds, `onContentChanged - yay!` runs, "recipe steps 1–5 driven". Root cause was the styled-attribute
   path, NOT the resource table: the TypedArray window layout was wrong (now the standard AOSP stride-7
@@ -771,6 +785,34 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   composite entry below + §5 next-actions. **NO REGRESSION:** demo_app + accelerometerdemo still reach ActivityResumed
   + swapchain, 0 VK_ERROR/panic (`/tmp/eclipse-demo-reg.log`, `/tmp/eclipse-accel-reg.log`). Gate clean: **193 unit
   + 2 doctests** (+5), fmt/clippy `-D warnings`/release all 0-warning.
+  ✅ **DONE 2026-06-05: the CANVAS DRAW path (real tiny-skia raster, no fake pixels) is built + pixel-tested**
+  (`src/framework/canvas_registry.rs`, new). A new generational-slab **`canvas_registry`** (mirrors the
+  paint/path/matrix registries: jlong = slab index NOT a raw pointer, `#![forbid(unsafe_code)]`, stale/oob/
+  double-free → typed `Err`) where each `CanvasState` owns a pure-Rust **tiny-skia `Pixmap`** draw target (no
+  GTK/Cairo/Skia-C). It exposes the common AOSP Canvas ops as REAL draws driven by a snapshotted `PaintConfig`
+  (color/`PaintStyle` FILL-STROKE-FILL_AND_STROKE/`stroke_width`/even-odd) + `path_registry` geometry:
+  **`draw_color`** (`Pixmap::fill`), **`draw_rect`** (`fill_rect` + closed-path `stroke_path`), **`draw_circle`**
+  (`PathBuilder::push_circle` → `fill_path`/`stroke_path`), **`draw_path`** (`PathGeometry` → tiny-skia path →
+  `fill_path`/`stroke_path`). **9 GPU-free pixel tests** prove the raster is real: drawColor fills every pixel,
+  drawRect fills its interior + leaves the exterior transparent, drawCircle fills the center + leaves corners
+  transparent, drawPath fills a triangle interior, a STROKE-only circle is hollow, plus the slab soundness
+  contract (distinct/nonzero handles, bad-dimensions reject, stale-after-free no-alias, double-free `Err`).
+  Context7-checked tiny-skia 0.12 API (`/websites/rs_tiny-skia`: `Pixmap::fill`/`fill_rect`/`fill_path`/
+  `stroke_path`, `PathBuilder::push_circle`, `Stroke::width`, `Paint::set_color_rgba8`). **FAITHFUL —
+  NOT YET WIRED to the app's onDraw / the GPU:** the Canvas DRAW NATIVES are not yet bound and the Pixmap is
+  not yet uploaded to the swapchain. The blocker is the **draw cascade**: the custom View's `onDraw(Canvas)`
+  is only invoked by `ViewRootImpl.performTraversals → View.draw(canvas)`, which Eclipse's minimal lifecycle
+  never runs (so 0 Canvas natives surface on multitouch.test even at RESUMED). Gate clean: **202 unit + 2
+  doctests** (+9), fmt/clippy `-D warnings`/release all 0-warning. **THE NEXT TWO CONCRETE STEPS (the deferred
+  composite, see §5 next-actions):** (1) the **draw-cascade driver** — after RESUMED, for each laid-out CUSTOM
+  view, allocate a `canvas_registry` Pixmap sized to its rect, construct a Java `Canvas` whose native handle is
+  that slab index (bind `Canvas`'s init native + `nDrawColor`/`nDrawRect`/`nDrawCircle`/`nDrawPath` → the
+  `canvas_registry` methods), and invoke `View.draw(canvas)` via JNI (guarded) so the natives fill the Pixmap;
+  (2) the **RGBA composite** — a sibling of `graphics::TextRenderer` (R8) but RGBA8: upload the Pixmap as a
+  sampled GPU texture + draw a textured quad over the view's rect (reusing the text pipeline's vertex-input/
+  combined-image-sampler shape; sound teardown in reverse order). Files: `src/framework/canvas_registry.rs`
+  (new), `src/framework.rs` (module decl), `src/framework/paint_registry.rs` (`PaintStyle` + `stroke_width`).
+  Faithful log: `/tmp/eclipse-canvas10.log` (multitouch RESUMED, 0 onDraw).
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;

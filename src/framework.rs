@@ -86,6 +86,7 @@ use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use crate::runtime::Vm;
 
+pub mod canvas_registry;
 pub mod matrix_registry;
 pub mod paint_registry;
 pub mod path_registry;
