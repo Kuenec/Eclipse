@@ -46,7 +46,7 @@ use std::ptr::NonNull;
 
 use rustix::mm::{mmap_anonymous, mprotect, munmap, MapFlags, MprotectFlags, ProtFlags};
 
-use super::elf::{ElfImage, LoadSegment, PF_R, PF_W, PF_X};
+use super::elf::{ElfImage, LoadSegment, RelroSegment, PF_R, PF_W, PF_X};
 use super::reloc::{self, RelocError, RelocImage};
 use super::resolve::{Scope, ScopedResolver};
 use super::tls::{TlsLayout, TlsResolver};
@@ -188,6 +188,10 @@ pub struct MappedObject {
     /// Module static-TLS tp-relative base offset, forwarded to the [`RelocImage`]. Unused by the
     /// base-only relocations applied here (TPOFF64 is deferred) — kept 0 until the static-TLS step.
     static_tls_offset: i64,
+    /// Page-floored lowest `PT_LOAD` vaddr (image-vaddr space; 0 for a PIE). The reserved region's
+    /// address corresponds to this vaddr, so a vaddr's region-relative byte offset is
+    /// `vaddr - region_start`. Stored at map time so [`Self::apply_relro`] need not re-derive it.
+    region_start: u64,
 }
 
 // SAFETY: 2026-06-05 — `MappedObject` owns an exclusive mmap'd region (created `MAP_PRIVATE`, never
@@ -266,6 +270,7 @@ impl MappedObject {
             base,
             span,
             static_tls_offset: 0,
+            region_start,
         };
 
         // 3) For each PT_LOAD: make its pages writable, copy filesz file bytes to base+vaddr (the
@@ -668,6 +673,55 @@ impl MappedObject {
         .map_err(MapError::Os)
     }
 
+    /// Honor `PT_GNU_RELRO`: after all relocations have been applied, `mprotect` the read-only-
+    /// after-relocation region to `PROT_READ` (no write). The dynamic linker writes the GOT and
+    /// other relocated data while relocating, then hardens this region read-only so a later bug or
+    /// exploit cannot rewrite it.
+    ///
+    /// 2026-06-05: The region is `[vaddr, vaddr + memsz)`. The ELF/psABI guarantee is that
+    /// `PT_GNU_RELRO`'s start is page-aligned and its size, while not necessarily a page multiple,
+    /// covers only data meant to become read-only; the linker rounds the protected range to whole
+    /// pages. Per the glibc/bionic convention we page-floor the start (already page-aligned) and
+    /// page-floor the end so we never make a page read-only that also holds still-writable data
+    /// past the RELRO region (a partial trailing page stays RW). Call this **after** every
+    /// relocation pass (base + symbol + TLS) — the caller's responsibility; in the root-only map
+    /// mode (no symbol providers) the base pass is the only one that wrote into this region.
+    pub fn apply_relro(&self, relro: &RelroSegment, page_size: u64) -> Result<(), MapError> {
+        let prot_start = page_floor(relro.vaddr, page_size);
+        let end_unaligned = relro
+            .vaddr
+            .checked_add(relro.mem_size)
+            .ok_or(MapError::SpanOverflow("relro vaddr + memsz"))?;
+        // Page-FLOOR the end: only whole pages fully inside the RELRO region are hardened, so a
+        // partial trailing page (which may share data with the following writable area) stays RW.
+        let prot_end = page_floor(end_unaligned, page_size);
+        if prot_end <= prot_start {
+            return Ok(()); // RELRO covers less than one whole page → nothing to harden.
+        }
+        let off_in_region = prot_start
+            .checked_sub(self.region_start)
+            .ok_or(MapError::SpanOverflow("relro start - region_start"))?;
+        let off = usize::try_from(off_in_region)
+            .map_err(|_| MapError::SpanOverflow("relro offset as usize"))?;
+        let len = usize::try_from(prot_end - prot_start)
+            .map_err(|_| MapError::SpanOverflow("relro len as usize"))?;
+        if off.checked_add(len).map(|e| e > self.span).unwrap_or(true) {
+            return Err(MapError::SpanOverflow("relro range past span"));
+        }
+        // SAFETY: 2026-06-05 — `[off, off+len)` is within `[0, span)` (checked above) of this
+        // object's own mapping, and both `off` and `len` are page-multiples (page_floor). Marking a
+        // sub-range of an owned mapping read-only is sound; no later code writes the RELRO region in
+        // this map-only mode (relocations already applied), so no write fault can follow.
+        unsafe {
+            mprotect(
+                self.base.as_ptr().add(off).cast(),
+                len,
+                mprotect_flags(ProtFlags::READ),
+            )
+        }
+        .map_err(MapError::Os)
+    }
+
     /// The run-time load base relocations are computed against (`load_base + vaddr` = run-time
     /// address of `vaddr`). For a PIE (lowest vaddr 0) this equals the mapping address.
     pub fn load_base(&self) -> u64 {
@@ -818,6 +872,7 @@ mod tests {
     const DYN_SIZE: usize = 16;
     const PT_LOAD: u32 = 1;
     const PT_DYNAMIC: u32 = 2;
+    const PT_GNU_RELRO: u32 = 0x6474_e552;
     const DT_NULL: i64 = 0;
     const DT_RELA: i64 = 7;
     const DT_RELASZ: i64 = 8;
@@ -957,6 +1012,27 @@ mod tests {
         buf
     }
 
+    /// The two-segment fixture plus a `PT_GNU_RELRO` program header covering the whole RW data page
+    /// (`[0x1000, 0x2000)`), so [`MappedObject::apply_relro`] hardens a real, page-aligned region.
+    /// Identical to [`build_two_segment_fixture`] except `e_phnum = 4` and a 4th phdr is written.
+    fn build_relro_fixture() -> Vec<u8> {
+        let mut buf = build_two_segment_fixture();
+        put_u16(&mut buf, 56, 4); // LOAD0, LOAD1, DYNAMIC, GNU_RELRO
+                                  // RELRO over the full data page [0x1000, 0x2000): page-aligned start, one whole page.
+        put_phdr(
+            &mut buf,
+            3,
+            PT_GNU_RELRO,
+            PF_R,
+            0x1000,
+            0x1000,
+            PAGE,
+            PAGE,
+            1,
+        );
+        buf
+    }
+
     fn read_word(obj: &mut MappedObject, vaddr: u64) -> u64 {
         // SAFETY (test-only): the region is mapped readable; vaddr < span. We read after relocation
         // and after final protections, all of which include PROT_READ for these segments.
@@ -1057,6 +1133,50 @@ mod tests {
             assert_eq!(obj.span(), 0x2000);
             drop(obj);
         }
+    }
+
+    #[test]
+    fn apply_relro_hardens_region_and_keeps_it_readable() {
+        // 2026-06-05: map a fixture with a PT_GNU_RELRO over the RW data page, apply the base relocs,
+        // then harden RELRO. The helper must succeed (the mprotect syscall returns Ok) and the region
+        // must stay READABLE (RELRO = read-only, not no-access): the relocated values are read back
+        // intact. This exercises the apply_relro offset/length math + the syscall on a real mapping.
+        let buf = build_relro_fixture();
+        let img = ElfImage::parse(&buf).expect("relro fixture parses");
+        assert!(img.relro.is_some(), "fixture declares PT_GNU_RELRO");
+        let relro = img.relro.unwrap();
+        assert_eq!(relro.vaddr, 0x1000);
+        assert_eq!(relro.mem_size, PAGE);
+
+        let (mut obj, stats) =
+            MappedObject::map_and_relocate(&img, &buf, PAGE).expect("map+base-relocate");
+        assert_eq!(stats.relative_applied, 1);
+        let base = obj.load_base();
+
+        // Harden the RELRO region read-only after relocation.
+        obj.apply_relro(&relro, PAGE).expect("apply_relro succeeds");
+
+        // The RELATIVE target (0x1000, inside RELRO) holds base+addend and is still readable.
+        assert_eq!(read_word(&mut obj, RELA_TARGET), base + RELA_ADDEND as u64);
+        // The RELR target (0x1008, inside RELRO) holds seed+base and is still readable.
+        assert_eq!(read_word(&mut obj, RELR_TARGET), RELR_SEED + base);
+    }
+
+    #[test]
+    fn apply_relro_subpage_region_is_a_clean_noop() {
+        // 2026-06-05: a RELRO region smaller than one whole page page-floors to a zero-length range
+        // → apply_relro is a clean Ok no-op (it never makes a partial trailing page read-only, which
+        // could clobber adjacent still-writable data). Proves the page-floor-end boundary math.
+        let buf = build_two_segment_fixture();
+        let img = ElfImage::parse(&buf).unwrap();
+        let (obj, _) = MappedObject::map_and_relocate(&img, &buf, PAGE).unwrap();
+        // A sub-page RELRO at the data page start (0x40 bytes < PAGE): floors to no whole page.
+        let tiny = RelroSegment {
+            vaddr: 0x1000,
+            mem_size: 0x40,
+        };
+        obj.apply_relro(&tiny, PAGE)
+            .expect("sub-page relro is a no-op Ok");
     }
 
     #[test]

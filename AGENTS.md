@@ -359,6 +359,32 @@ before any history-rewriting/force operation.
   NEXT = map+relocate libroblox end-to-end (point `link.rs` at it), then the 10-soname bionic-env provider
   surface (584 UND imports; EGL/GLES2→host GL) + run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW
   (no `%fs`/TCB needed — no PT_TLS).** See §6 (2026-06-05 APS2 decoder).
+  **2026-06-05 UPDATE — the REAL engine `libroblox.so` is now MAPPED + BASE-RELOCATED END-TO-END AT SCALE +
+  RELRO-hardened, via Eclipse's own loader (root-only mode).** Two surgical additions: (1) `map.rs` gained
+  `MappedObject::apply_relro(relro, page)` — honors `PT_GNU_RELRO` by `mprotect`ing the read-only-after-reloc
+  region to `PROT_READ` (page-floor start AND end, so a partial trailing page stays RW; one confined `unsafe`
+  with a dated `// SAFETY:`; reloc.rs/elf.rs stay `#![forbid(unsafe_code)]`); `MappedObject` now stores
+  `region_start` so the RELRO offset math needs no re-derivation. (2) `link.rs` gained a **root-only /
+  env-provided-deps** mode (`Linker::with_tolerate_missing_deps(true)`): a `DT_NEEDED` that can't be located is
+  **recorded** in `LoadedImageSet::missing_deps` (not a hard `LinkError::MissingDependency`), so the root maps +
+  base-relocates with its deps absent; the linker then applies `PT_GNU_RELRO` to every loaded object
+  (`relro_applied` count) after all reloc passes. This is exactly the bionic load shape — libroblox's 10 bionic
+  `DT_NEEDED` are env/shim-provided, not on disk. **VALIDATED (gated REAL test
+  `loader::link::tests::real_libroblox_maps_base_relocates_and_honors_relro_root_only`, skips cleanly if the APK
+  is absent):** maps the engine from the APK via Eclipse's own apk reader → `elf::parse` → `link::load` in
+  root-only mode — **span `0x70b5000` (~112 MiB), 3 PT_LOAD, bss tails zeroed; EXACTLY 527,208 RELATIVE applied,
+  every addend within `[0,span)` + 8,238 sampled relocated slots all landing in `[base, base+span)`; 1
+  `PT_GNU_RELRO` region hardened RO (`relro_applied=1`); the 635 symbol relocs (67 GLOB_DAT + 22 R_X86_64_64 +
+  546 JUMP_SLOT) DEFERRED — 0 applied, 618 recorded as unresolved-strong (the rest are weak-undef→0, never
+  fabricated); 611 UND imports (≥584 bionic surface) + ALL 10 missing bionic deps enumerated; reloc wall-time
+  ≈ 0.16 s for 527k relocs; no panic, no leak (Drop munmaps the 112 MiB).** 4 new tests (2 RELRO-helper + 1
+  root-only fixture, GPU/VM-free + the gated real one). Gate now **302 unit + 2 doctests** (fmt/build/clippy
+  `-D warnings`/test/release all clean). **Engine-load frontier: libroblox is MAPPED + base-relocated end-to-end
+  at scale (527,208 RELATIVE) + RELRO-hardened; the 635 symbol relocs / 584 imports / 10 bionic deps are the
+  recorded next-phase surface. NEXT = the 10-soname bionic-env provider (libc/m/dl/log/android/EGL/GLESv2/SLES/
+  MAXAL/mediandk — EGL/GLES2→host GL; the rest Eclipse-owned shim natives) to resolve the 584 UND imports +
+  apply the deferred GLOB_DAT/JUMP_SLOT/64, then run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW (no
+  `%fs`/TCB — no PT_TLS).** See §6 (2026-06-05 libroblox map+RELRO+root-only).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -2977,6 +3003,45 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   0-warning/0-error. Files: `src/loader/elf.rs` (SLEB128 reader + APS2 decoder + DynInfo fields/tags + 11 tests +
   real-test exact asserts). **NEXT = map+relocate libroblox end-to-end (point `link.rs` at it), then the
   10-soname bionic-env provider surface + run the 3,427 DT_INIT_ARRAY ctors (no `%fs`/TCB — no PT_TLS).**
+- **2026-06-05 (libroblox map+RELRO+root-only)** — 🟢 **ENGINE-LOAD: the REAL `libroblox.so` is MAPPED +
+  BASE-RELOCATED END-TO-END AT SCALE + RELRO-hardened via Eclipse's own loader.** Two surgical, root-cause
+  additions (smallest necessary; no workarounds). **(1) RELRO (`map.rs`):** `MappedObject::apply_relro(relro,
+  page)` honors `PT_GNU_RELRO` by `mprotect`ing the read-only-after-reloc region to `PROT_READ`. Page-floors
+  BOTH the start (already page-aligned per psABI) and the END, so only whole pages fully inside the RELRO region
+  are hardened — a partial trailing page that may share data with the following still-writable area stays RW
+  (the glibc/bionic convention). Must run AFTER every relocation pass (the caller's responsibility). Added one
+  confined `unsafe` block (the `mprotect` syscall) with a dated `// SAFETY:`; `reloc.rs`/`elf.rs` stay
+  `#![forbid(unsafe_code)]`. `MappedObject` now stores `region_start` (computed at map time) so the RELRO offset
+  math is exact, not re-derived/guessed. **(2) Root-only mode (`link.rs`):**
+  `Linker::with_tolerate_missing_deps(true)` — a `DT_NEEDED` that can't be located is RECORDED (in
+  `LoadedImageSet::missing_deps: Vec<MissingDep>`), not a hard `LinkError::MissingDependency`, so the root maps +
+  base-relocates with its deps absent; the linker then applies `PT_GNU_RELRO` to every loaded object
+  (`relro_applied`). This is the bionic load shape — libroblox's 10 bionic `DT_NEEDED` are env/shim-provided, not
+  on disk; in this mode its symbol relocs against the absent deps' exports defer (recorded in `unresolved`, NEVER
+  fabricated — strict gABI). **`#![forbid(unsafe_code)]` preserved in link.rs** (orchestration only; all unsafe
+  stays in map.rs's syscalls + resolve.rs's one dlsym). ZERO new crates. **Cyber-safeguard honored:** written
+  ONLY from the public ELF/gABI `PT_GNU_RELRO` + `mprotect` semantics + Eclipse's own `map`/`link` cores; mapping
+  the `.so` as DATA (not executed — no DT_INIT, no jump) is benign; NO apkenv/bionic/ATL linker or asset source
+  read. **Did NOT trip the safeguard.** **Regression guard:** 4 new tests (GPU/VM-free except the gated real
+  one): `map::tests::apply_relro_hardens_region_and_keeps_it_readable` (RELRO region hardens + stays readable,
+  relocated values intact), `apply_relro_subpage_region_is_a_clean_noop` (sub-page RELRO page-floors to a
+  no-op Ok — the boundary math), `link::tests::tolerate_missing_deps_records_instead_of_erroring` (strict errors
+  vs root-only records, deduped, symbol reloc deferred not faked), and the gated REAL
+  `link::tests::real_libroblox_maps_base_relocates_and_honors_relro_root_only` (skips cleanly if the APK is
+  absent). **REAL VALIDATION (engine from the APK via Eclipse's own apk reader → `elf::parse` → `link::load`
+  root-only):** span `0x70b5000` (~112 MiB), **3 PT_LOAD**, bss tails zeroed; **EXACTLY 527,208 RELATIVE
+  applied**, every addend within `[0, span)` + **8,238 sampled relocated slots all in `[base, base+span)`**;
+  **1 `PT_GNU_RELRO` hardened RO** (`relro_applied=1`); the **635 symbol relocs (67 GLOB_DAT + 22 R_X86_64_64 +
+  546 JUMP_SLOT) DEFERRED** — 0 applied, **618 recorded unresolved-strong** (the remainder weak-undef→0); **611
+  UND imports** (elf.rs's documented heuristic over-read; ≥584 bionic surface) + **ALL 10 missing bionic deps**
+  (libc/m/dl/log/android/EGL/GLESv2/SLES/MAXAL/mediandk) enumerated; **reloc wall-time ≈ 0.16 s** for 527k
+  relocs; **no panic, no leak** (Drop munmaps the 112 MiB; mapped once — no 112 MiB clone). Files:
+  `src/loader/map.rs` (apply_relro + region_start + 2 tests), `src/loader/link.rs` (MissingDep + root-only mode +
+  RELRO pass + missing_deps/relro_applied on LoadedImageSet + 2 tests). **Gate:** fmt/build --all-targets/clippy
+  (-D warnings)/test (**302 unit + 2 doctests**)/release all 0-warning/0-error. **NEXT = the 10-soname bionic-env
+  provider surface (resolve the 584 UND imports → apply the 635 deferred GLOB_DAT/JUMP_SLOT/64; EGL/GLES2→host
+  GL, the rest Eclipse-owned shim natives), then run the 3,427 DT_INIT_ARRAY ctors honoring RELRO+BIND_NOW (no
+  `%fs`/TCB — no PT_TLS).**
 
 ---
 
