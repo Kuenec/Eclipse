@@ -456,6 +456,22 @@ before any history-rewriting/force operation.
   media-ndk (33) + audio (8)** (bridges to host codecs / host audio), then full-resolution apply + the 3,427
   `DT_INIT_ARRAY` ctors (RELRO+BIND_NOW, no `%fs`/TCB — no PT_TLS; main-loop/dev-host only). See §6 (2026-06-05
   ndk-android tier).
+  **2026-06-05 UPDATE — media-ndk (33) + audio (8) SOUND-STUBS done + tested + PROVEN on the real engine (work-list
+  43 → 2):** `src/loader/native_provider.rs` now registers the final two categories (provider total **45 → 86**) as
+  Eclipse-owned `extern "C"` **sound-stubs** (gameplay-time, deferred — video/sound are NOT needed to start/render).
+  Sentinels from the PUBLIC NDK media + Khronos OpenSL ES C-ABI: media pointer fns → NULL, `media_status_t` →
+  `AMEDIA_ERROR_UNSUPPORTED` (-10009), `ssize_t` dequeue → negative, `bool` getters → false, setters/delete → no-op,
+  `toString` → stable empty C string; the 10 `AMEDIAFORMAT_KEY_*` are real `const char*` key strings; `slCreateEngine`
+  → `SL_RESULT_FEATURE_UNSUPPORTED` (0x0C, `*pEngine` untouched); the 7 `SL_IID_*` are real stable distinct
+  `SLInterfaceID` data objects. NO global state beyond two read-only OnceLock tables, NO UB (no media/audio handle ever
+  minted). REAL gated test (APK present → RAN): work-list **88 → 2**, **86** newly-resolved to Eclipse (all 41 media+audio,
+  each verified == Eclipse addr + absent from host dlsym), `applied_nonnull` **580 → 621**, 86 GOT slots hold the Eclipse
+  addr, no panic/leak. NONE flagged plausibly-init-critical (gameplay-time). ZERO new crates; cyber-safeguard NOT tripped
+  (clean-room from public C-ABIs; no apkenv/bionic/NDK/Khronos/linker source read; libroblox parsed as data only). Gate
+  now **341 unit + 2 doctests** (fmt/build/clippy `-D warnings`/test/release all clean). **Engine-load frontier: the entire
+  584-import bionic surface now resolves to Eclipse/host EXCEPT the 2 variadic liblog. NEXT = the variadic cc shim
+  (`__android_log_print`/`__android_log_assert`) → FULL resolution (work-list 2 → 0), then run the 3,427 DT_INIT_ARRAY
+  ctors (RELRO+BIND_NOW, no `%fs`/TCB — no PT_TLS; main-loop/dev-host only).** See §6 (2026-06-05 media+audio sound-stubs).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3234,6 +3250,41 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   --all-targets/clippy (-D warnings)/test (**337 unit + 2 doctests**)/release all 0-warning/0-error. **NEXT = media-ndk
   (33) + audio (8)** bridges, then the 2 deferred variadic liblog, then full-resolution apply + the 3,427 DT_INIT_ARRAY
   ctors (RELRO+BIND_NOW, no `%fs`/TCB — no PT_TLS), main-loop/dev-host only.
+- **2026-06-05 — media-ndk (33) + audio (8) SOUND-STUBS — work-list 43 → 2 (PROVEN on the real engine).**
+  `src/loader/native_provider.rs` now registers the final two work-list categories (provider total **45 → 86**): the
+  **33** `libmediandk` + **8** OpenSL ES imports, each an Eclipse-owned `extern "C"` **sound-stub** labelled
+  `sound-stub: media/audio deferred (gameplay-time)`. Media + audio are gameplay-time subsystems (video playback, sound)
+  libroblox does NOT need to start/render, so a contract-correct "unavailable" stub is the right minimal step (the
+  DT_INIT_ARRAY discovery loop will reveal if any is hard-required at init; implement-for-real then). **Chosen sentinels
+  (grounded in the PUBLIC NDK media + Khronos OpenSL ES C-ABI, Context7 + the Khronos OpenSLES.h):** media pointer-returning
+  fns (`AMediaCodec_createDecoderByType`/`createEncoderByType`/`AMediaFormat_new`/`getInputBuffer`/`getOutputBuffer`/
+  `getOutputFormat`) → **NULL**; `media_status_t`-returning fns (configure/start/stop/flush/queue/release/delete) →
+  **`AMEDIA_ERROR_UNSUPPORTED` (-10009 = AMEDIA_ERROR_BASE-9)**; `ssize_t` dequeue fns → that error (negative, caller checks
+  `<0`); `bool` getters (`getInt32`/`getBuffer`) → **false**; setters → no-op; `AMediaFormat_toString` → a stable EMPTY C
+  string (never NULL → no `printf` crash); the 10 `AMEDIAFORMAT_KEY_*` → **real `const char*` data objects** holding the
+  canonical key strings (`"mime"`/`"width"`/… — minimal-correct data); `slCreateEngine` →
+  **`SL_RESULT_FEATURE_UNSUPPORTED` (0x0C = 12)** leaving `*pEngine` untouched (caller cleanly detects "no audio", never a
+  fake engine); the 7 `SL_IID_*` → **real, stable, distinct `SLInterfaceID` data objects** (valid non-null pointers; never
+  queried because slCreateEngine fails first). **NO global state beyond two read-only `OnceLock` data tables, NO UB**
+  (no opaque media/audio handle is ever minted, so the getters/setters/delete are trivial over a NULL the engine never
+  holds). **REAL gated test** `loader::link::tests::real_libroblox_eclipse_natives_resolve_liblog_libc_ndk_media_and_audio`
+  (skips if no APK; the APK IS present on this dev-host so it RAN): work-list **88 → 2**, **86** imports newly-resolved to
+  Eclipse addresses (all 41 media+audio among them, each verified == the Eclipse-native addr AND absent from host `dlsym`),
+  `applied_nonnull` **580 → 621** (+41), **86 GOT slots read back holding the Eclipse-native address**, no panic/leak (Drop
+  munmaps the 112 MiB). **Plausibly-init-critical flagged: NONE** — media/audio are gameplay-time; if the later
+  DT_INIT_ARRAY run proves otherwise for a specific symbol, it gets a real bridge then. `unsafe` confined to the native
+  FFI bodies (dated `// SAFETY:`); `reloc`/`elf`/`resolve`/`ndk_registry` stay `#![forbid(unsafe_code)]`; **ZERO new
+  crates**. **Cyber-safeguard: NOT tripped** — wrote Eclipse's OWN clean-room Rust from the PUBLIC NDK media C-ABI
+  (`AMediaCodec_*`/`AMediaFormat_*`, `media_status_t`) + PUBLIC OpenSL ES 1.0.1 C-ABI (`slCreateEngine`, `SLresult`,
+  `SLInterfaceID`), Context7-verified (NDK reference) + the Khronos OpenSLES.h (result-code values + struct layout); did
+  NOT read apkenv/bionic/NDK/Khronos/ATL/linker source; `libroblox.so` parsed as data only, nothing executed. Files:
+  `native_provider.rs` (+41 natives, +4 sentinel tests, +module docs), `link.rs` (gated test renamed + 43→2 / 45→86
+  assertions + media/audio name lists), `docs/bionic-env-worklist.md` (media+audio checked off as sound-stubs; work-list
+  now the 2 variadic liblog). **Gate:** fmt --check/build --all-targets/clippy (-D warnings)/test (**341 unit + 2
+  doctests**)/release all 0-warning/0-error. **NEXT = the 2 deferred variadic liblog** (`__android_log_print`/
+  `__android_log_assert`) via a variadic cc shim (or nightly `c_variadic`) → **full resolution (work-list 2 → 0)**, then
+  bind the assembled image to execution + run the **3,427 DT_INIT_ARRAY** ctors in order (RELRO+BIND_NOW, no `%fs`/TCB —
+  no PT_TLS), main-loop/dev-host only (cyber-safeguard).
 
 ---
 

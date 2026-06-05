@@ -42,12 +42,14 @@ the real engine: work-list **88 → 43**, `applied_nonnull` **535 → 580** (+45
 all verified holding the Eclipse address; the host has no such symbol under these bionic/NDK names).
 
 **Done (✅ below):** liblog (3 of 5) + bionic-libc (15 of 15) + ndk-android (27 of 27 — AAsset* REAL
-via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub deferred-to-render).
-**Deferred (2):** the C-variadic liblog natives `__android_log_print` / `__android_log_assert` —
-defining a variadic `extern "C"` fn needs Rust's unstable `c_variadic` feature; Eclipse builds on
-**stable** (clean-checkout portability, AGENTS.md §2.11). Registering a non-variadic fn under a
-variadic name would be an ABI landmine, so they stay on the work-list (no landmine). **Remaining:
-43** = 2 variadic liblog + media-ndk 33 + audio 8.
+via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub deferred-to-render)
++ **media-ndk (33 of 33) + audio (8 of 8) — sound-stubs (2026-06-05): gameplay-time, deferred** (see
+§4/§5 below). **Deferred (2):** the C-variadic liblog natives `__android_log_print` /
+`__android_log_assert` — defining a variadic `extern "C"` fn needs Rust's unstable `c_variadic`
+feature; Eclipse builds on **stable** (clean-checkout portability, AGENTS.md §2.11). Registering a
+non-variadic fn under a variadic name would be an ABI landmine, so they stay on the work-list (no
+landmine). **Remaining: 2** = the 2 variadic liblog (the NEXT step = a variadic cc shim → full
+resolution, then run the 3,427 DT_INIT_ARRAY).
 
 ## Headline
 
@@ -55,12 +57,19 @@ variadic name would be an ABI landmine, so they stay on the work-list (no landmi
 |---|---:|---:|
 | UND imports (reloc-referenced; = GNU_HASH-authoritative) | **584** | **584** |
 | host-resolved (BASELINE, not ABI-correct) | **490** | 490 |
-| Eclipse-native-resolved (bionic-ABI-correct/minimal/forward/real) | 0 | **45** |
-| **work-list (need Eclipse-owned bionic natives)** | **88** | **43** |
-| symbol relocs applied (non-null addr) | 535 | **580** |
+| Eclipse-native-resolved (bionic-ABI-correct/minimal/forward/real/sound-stub) | 0 | **86** |
+| **work-list (need Eclipse-owned bionic natives)** | **88** | **2** |
+| symbol relocs applied (non-null addr) | 535 | **621** |
 | symbol relocs applied weak-undef → 0 (legal) | 12 | 12 |
-| symbol relocs unresolved-strong (recorded, no GOT write) | 88 | **43** |
+| symbol relocs unresolved-strong (recorded, no GOT write) | 88 | **2** |
 | symbol relocs deferred (TPOFF64/IRELATIVE) | 0 | 0 |
+
+> 2026-06-05: the **86** = liblog 3 + bionic-libc 15 + ndk-android 27 + **media-ndk 33 + audio 8**.
+> Media + audio are **sound-stubs** (gameplay-time, deferred): each returns its public-ABI
+> failure/unavailable sentinel (media `media_status_t` → `AMEDIA_ERROR_UNSUPPORTED`, pointer fns →
+> NULL; `slCreateEngine` → `SL_RESULT_FEATURE_UNSUPPORTED`) so a caller cleanly detects "no media /
+> no audio", never a fake success. The `AMEDIAFORMAT_KEY_*` (real key strings) + `SL_IID_*` (stable
+> distinct interface-id pointers) are real data objects. Work-list now = ONLY the 2 variadic liblog.
 
 The 584 imports are counted from the **relocations**, not the raw dynamic symtab — this is
 immune to `elf.rs`'s documented symtab over-read (it reads trailing VERSYM/GNU_HASH bytes as extra
@@ -81,10 +90,10 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 | cxa-runtime | 3  | 0  | yes (baseline; glibc atexit semantics) |
 | dl          | 5  | 0  | baseline only — must route to Eclipse's OWN loader |
 | ndk-android | 0  | ✅ 0 (was 27) | **no host equiv → all 27 Eclipse-owned (2026-06-05)** |
-| media-ndk   | 0  | 33 | **no host equivalent** |
-| audio       | 0  | 8  | **no host equivalent** |
+| media-ndk   | 0  | ✅ 0 (was 33) | **no host equiv → all 33 Eclipse sound-stub (2026-06-05)** |
+| audio       | 0  | ✅ 0 (was 8)  | **no host equiv → all 8 Eclipse sound-stub (2026-06-05)** |
 | liblog      | 0  | 5  | no host equiv — **Eclipse already owns these** |
-| **TOTAL (host-baseline view; Eclipse-native work-list now 43)**   | **490** | **88** | |
+| **TOTAL (host-baseline view; Eclipse-native work-list now 2)**   | **490** | **88** | |
 
 > `egl-gles` resolves a real **91** because this dev-host has Mesa `libEGL.so`/`libGLESv2.so`. On a
 > GL-less host these would all be in the work-list (route to a host-GL/ANGLE bridge). `pthread`,
@@ -92,9 +101,9 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 
 ---
 
-## THE WORK-LIST — 88 imports needing Eclipse-owned bionic natives
+## THE WORK-LIST — 88 imports (2026-06-05: 86 now Eclipse-owned; only 2 variadic liblog remain)
 
-Grouped by category, in the priority order to implement (NEXT step first).
+Grouped by category, in the priority order they were implemented (NEXT step first).
 
 ### 1. liblog (5) — ✅ DONE (3) routed to Eclipse's `tracing`; 2 variadic DEFERRED (2026-06-05)
 `src/loader/native_provider.rs` implements the 3 fixed-arity ones as Eclipse-owned `extern "C"`
@@ -155,28 +164,42 @@ plus the not-in-the-27 `setBuffersGeometry`/`lock`/`unlockAndPost`) lands with t
 input integration. The boot path calls `ndk_registry::set_apk_path` so the asset natives serve real
 bytes from the opened Roblox APK.
 
-### 4. media-ndk — libmediandk (33), NO host equivalent (bridge to host codecs)
+### 4. media-ndk — libmediandk (33) — ✅ DONE (2026-06-05): sound-stubs (gameplay-time, deferred)
+`src/loader/native_provider.rs` implements all 33 as Eclipse-owned `extern "C"` sound-stubs. Media
+(video decode/encode) is a gameplay-time subsystem libroblox does not need to start/render, so each
+returns its public-ABI failure/unavailable sentinel (per `media/NdkMediaCodec.h`/`NdkMediaFormat.h`/
+`NdkMediaError.h`): pointer fns → NULL; `media_status_t` fns → `AMEDIA_ERROR_UNSUPPORTED` (-10009);
+`ssize_t` dequeue → negative; `bool` getters → false; setters/delete → no-op; `toString` → a stable
+empty string. The 10 `AMEDIAFORMAT_KEY_*` are real `const char*` data objects (the canonical key
+strings). NO global state, NO UB. If the DT_INIT_ARRAY discovery loop later proves any is
+init-critical, it gets a real host-codec bridge then.
 ```
-AMediaCodec_configure  AMediaCodec_createDecoderByType  AMediaCodec_createEncoderByType
-AMediaCodec_delete  AMediaCodec_dequeueInputBuffer  AMediaCodec_dequeueOutputBuffer
-AMediaCodec_flush  AMediaCodec_getInputBuffer  AMediaCodec_getOutputBuffer
-AMediaCodec_getOutputFormat  AMediaCodec_queueInputBuffer  AMediaCodec_releaseOutputBuffer
-AMediaCodec_start  AMediaCodec_stop
-AMediaFormat_delete  AMediaFormat_getBuffer  AMediaFormat_getInt32  AMediaFormat_new
-AMediaFormat_setBuffer  AMediaFormat_setFloat  AMediaFormat_setInt32  AMediaFormat_setString
-AMediaFormat_toString
-# AMEDIAFORMAT_KEY_* constant OBJECTs (the format-key strings):
-AMEDIAFORMAT_KEY_BIT_RATE  AMEDIAFORMAT_KEY_CHANNEL_COUNT  AMEDIAFORMAT_KEY_COLOR_FORMAT
-AMEDIAFORMAT_KEY_FRAME_RATE  AMEDIAFORMAT_KEY_HEIGHT  AMEDIAFORMAT_KEY_I_FRAME_INTERVAL
-AMEDIAFORMAT_KEY_MIME  AMEDIAFORMAT_KEY_SAMPLE_RATE  AMEDIAFORMAT_KEY_STRIDE
-AMEDIAFORMAT_KEY_WIDTH
+✅ AMediaCodec_configure  ✅ AMediaCodec_createDecoderByType  ✅ AMediaCodec_createEncoderByType
+✅ AMediaCodec_delete  ✅ AMediaCodec_dequeueInputBuffer  ✅ AMediaCodec_dequeueOutputBuffer
+✅ AMediaCodec_flush  ✅ AMediaCodec_getInputBuffer  ✅ AMediaCodec_getOutputBuffer
+✅ AMediaCodec_getOutputFormat  ✅ AMediaCodec_queueInputBuffer  ✅ AMediaCodec_releaseOutputBuffer
+✅ AMediaCodec_start  ✅ AMediaCodec_stop
+✅ AMediaFormat_delete  ✅ AMediaFormat_getBuffer  ✅ AMediaFormat_getInt32  ✅ AMediaFormat_new
+✅ AMediaFormat_setBuffer  ✅ AMediaFormat_setFloat  ✅ AMediaFormat_setInt32  ✅ AMediaFormat_setString
+✅ AMediaFormat_toString
+# AMEDIAFORMAT_KEY_* DATA objects — real `const char*` key strings (minimal-correct data):
+✅ AMEDIAFORMAT_KEY_BIT_RATE  ✅ AMEDIAFORMAT_KEY_CHANNEL_COUNT  ✅ AMEDIAFORMAT_KEY_COLOR_FORMAT
+✅ AMEDIAFORMAT_KEY_FRAME_RATE  ✅ AMEDIAFORMAT_KEY_HEIGHT  ✅ AMEDIAFORMAT_KEY_I_FRAME_INTERVAL
+✅ AMEDIAFORMAT_KEY_MIME  ✅ AMEDIAFORMAT_KEY_SAMPLE_RATE  ✅ AMEDIAFORMAT_KEY_STRIDE
+✅ AMEDIAFORMAT_KEY_WIDTH
 ```
 
-### 5. audio — OpenSL ES (8), NO host equivalent (bridge to host audio)
+### 5. audio — OpenSL ES (8) — ✅ DONE (2026-06-05): sound-stubs (gameplay-time, deferred)
+`src/loader/native_provider.rs` implements all 8 as Eclipse-owned `extern "C"` sound-stubs. Sound is
+a gameplay-time subsystem. Per the public OpenSL ES 1.0.1 C-ABI (`SLES/OpenSLES.h`), `slCreateEngine`
+returns `SL_RESULT_FEATURE_UNSUPPORTED` (0x0C) — the documented result a caller checks to detect "no
+audio" cleanly (it leaves `*pEngine` untouched, never a fake engine). The 7 `SL_IID_*` are real,
+stable, distinct `SLInterfaceID` data objects (valid non-null pointers; never queried because
+slCreateEngine fails first). NO global state, NO UB.
 ```
-slCreateEngine
-SL_IID_ANDROIDCONFIGURATION  SL_IID_ANDROIDSIMPLEBUFFERQUEUE  SL_IID_BUFFERQUEUE
-SL_IID_ENGINE  SL_IID_PLAY  SL_IID_RECORD  SL_IID_VOLUME
+✅ slCreateEngine  # → SL_RESULT_FEATURE_UNSUPPORTED (no engine produced; *pEngine untouched)
+✅ SL_IID_ANDROIDCONFIGURATION  ✅ SL_IID_ANDROIDSIMPLEBUFFERQUEUE  ✅ SL_IID_BUFFERQUEUE
+✅ SL_IID_ENGINE  ✅ SL_IID_PLAY  ✅ SL_IID_RECORD  ✅ SL_IID_VOLUME
 ```
 (`OpenMAXAL` — `XA_*` — contributes **0** here: none of its symbols is referenced by a relocation
 in this build, so it is not on the work-list despite being a `DT_NEEDED`.)
@@ -195,12 +218,19 @@ in this build, so it is not on the work-list despite being a `DT_NEEDED`.)
    `src/loader/ndk_registry.rs` generational indices, no UB); `AConfiguration_*`/`ALooper_*`
    minimal-correct; `ANativeWindow_*` sound-stub (real geometry getters, surface/buffer
    deferred-to-render). Work-list 70 → 43.
-4. **media-ndk (33)** + **audio (8)** — ⏭️ NEXT. Bridges to host codecs / host audio.
-   + the **2 deferred variadic liblog** natives (need a nightly toolchain or a justified clean-room C shim).
-5. After the work-list is satisfied: bind the assembled image to execution and run the **3,427
+4. ~~**media-ndk (33)** + **audio (8)**~~ — ✅ DONE (2026-06-05): all 41 Eclipse-owned `extern "C"`
+   **sound-stubs** (gameplay-time, deferred — video/sound are NOT needed to start/render). Media
+   pointer fns → NULL, `media_status_t` → `AMEDIA_ERROR_UNSUPPORTED`; `slCreateEngine` →
+   `SL_RESULT_FEATURE_UNSUPPORTED`; `AMEDIAFORMAT_KEY_*`/`SL_IID_*` real data objects. Work-list
+   43 → 2. If the DT_INIT_ARRAY discovery loop later proves any is init-critical, it gets a real
+   host bridge then.
+5. **⏭️ NEXT — the 2 deferred variadic liblog** (`__android_log_print`/`__android_log_assert`): need
+   a nightly toolchain or a justified clean-room C (cc) shim → **full resolution** (work-list 2 → 0).
+6. After the work-list is satisfied: bind the assembled image to execution and run the **3,427
    `DT_INIT_ARRAY` constructors** in order, honoring RELRO + BIND_NOW (no `%fs`/TCB needed — no
    PT_TLS). This is **main-loop / dev-host only** (the cyber-safeguard).
 
-> The pipeline is **proven**: 535 GOT/PLT slots were filled with real (host) addresses on the mapped
-> 112 MiB engine, every one verified non-null, with the 88-import work-list recorded and never
-> fabricated. The remaining work is **implementing the natives above**, not the relocation machinery.
+> The pipeline is **proven**: with the Eclipse-native tier prepended, **621** GOT/PLT slots are filled
+> on the mapped 112 MiB engine (86 of them at verified Eclipse-native addresses), the work-list is
+> down to the **2** variadic liblog, and nothing is fabricated. The remaining work is the variadic cc
+> shim (then the DT_INIT_ARRAY run), not the relocation machinery.

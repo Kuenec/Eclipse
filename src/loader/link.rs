@@ -1743,20 +1743,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- REAL test: the ECLIPSE-NATIVE tier resolves liblog + bionic-libc + ndk-android ----------
+    // ---- REAL test: the ECLIPSE-NATIVE tier resolves liblog + libc + ndk + media-ndk + audio ------
     // (skips cleanly if the APK is absent — never fails / fabricates). With the EclipseNativeProvider
     // PREPENDED before the host baseline, the engine's liblog (3 fixed-arity) + bionic-libc (15) +
-    // ndk-android (27) imports now resolve to ECLIPSE addresses (NOT host glibc), and the work-list
-    // shrinks 88 -> 43 (the 2 deferred variadic liblog + media-ndk 33 + audio 8).
+    // ndk-android (27) + media-ndk (33) + audio (8) imports now resolve to ECLIPSE addresses (NOT
+    // host glibc), and the work-list shrinks 88 -> 2 (only the 2 deferred variadic liblog remain).
 
     #[test]
-    fn real_libroblox_eclipse_natives_resolve_liblog_libc_and_ndk_android() {
+    fn real_libroblox_eclipse_natives_resolve_liblog_libc_ndk_media_and_audio() {
         use crate::loader::bionic_env::{categorize_imports, BionicEnv};
         use crate::loader::native_provider::EclipseNativeProvider;
         use crate::loader::resolve::{HostDlsymProvider, SymbolProvider};
 
         let Some(apk_path) = find_roblox_apk() else {
-            eprintln!("real_libroblox_eclipse_natives_...: no Roblox APK; skipping");
+            eprintln!("real_libroblox_eclipse_natives_resolve_liblox_libc_ndk_media_and_audio: no Roblox APK; skipping");
             return;
         };
 
@@ -1812,16 +1812,16 @@ mod tests {
             88,
             "host-baseline work-list is the documented 88"
         );
-        // The Eclipse tier resolves 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android = 45
-        // names, shrinking the work-list from 88 to 43 (2 deferred variadic liblog + media 33 +
-        // audio 8).
+        // The Eclipse tier resolves 3 fixed-arity liblog + 15 bionic-libc + 27 ndk-android + 33
+        // media-ndk + 8 audio = 86 names, shrinking the work-list from 88 to 2 (only the 2 deferred
+        // variadic liblog remain).
         assert_eq!(
             with_eclipse.unresolved_count(),
-            43,
-            "Eclipse natives shrink the work-list 88 -> 43 (45 liblog+libc+ndk resolved)"
+            2,
+            "Eclipse natives shrink the work-list 88 -> 2 (86 liblog+libc+ndk+media+audio resolved)"
         );
 
-        // The 45 newly-resolved names are EXACTLY the ones the Eclipse provider registers, and they
+        // The 86 newly-resolved names are EXACTLY the ones the Eclipse provider registers, and they
         // resolve to ECLIPSE addresses, not host ones: prove it by resolving each against an
         // Eclipse-only provider AND confirming the host (`dlsym`) has no such symbol.
         let eclipse_only = EclipseNativeProvider::with_bionic_natives();
@@ -1839,8 +1839,8 @@ mod tests {
         );
         assert_eq!(
             newly_resolved.len(),
-            45,
-            "exactly 45 imports move from work-list to Eclipse-resolved"
+            86,
+            "exactly 86 imports move from work-list to Eclipse-resolved"
         );
         // All 27 ndk-android names must be among the newly-resolved set (resolve to Eclipse).
         for ndk in [
@@ -1875,6 +1875,62 @@ mod tests {
             assert!(
                 newly_resolved.contains(ndk),
                 "{ndk} (ndk-android) must resolve to Eclipse"
+            );
+        }
+        // All 33 media-ndk + 8 audio names must be among the newly-resolved set (resolve to Eclipse).
+        for media in [
+            "AMediaCodec_configure",
+            "AMediaCodec_createDecoderByType",
+            "AMediaCodec_createEncoderByType",
+            "AMediaCodec_delete",
+            "AMediaCodec_dequeueInputBuffer",
+            "AMediaCodec_dequeueOutputBuffer",
+            "AMediaCodec_flush",
+            "AMediaCodec_getInputBuffer",
+            "AMediaCodec_getOutputBuffer",
+            "AMediaCodec_getOutputFormat",
+            "AMediaCodec_queueInputBuffer",
+            "AMediaCodec_releaseOutputBuffer",
+            "AMediaCodec_start",
+            "AMediaCodec_stop",
+            "AMediaFormat_delete",
+            "AMediaFormat_getBuffer",
+            "AMediaFormat_getInt32",
+            "AMediaFormat_new",
+            "AMediaFormat_setBuffer",
+            "AMediaFormat_setFloat",
+            "AMediaFormat_setInt32",
+            "AMediaFormat_setString",
+            "AMediaFormat_toString",
+            "AMEDIAFORMAT_KEY_BIT_RATE",
+            "AMEDIAFORMAT_KEY_CHANNEL_COUNT",
+            "AMEDIAFORMAT_KEY_COLOR_FORMAT",
+            "AMEDIAFORMAT_KEY_FRAME_RATE",
+            "AMEDIAFORMAT_KEY_HEIGHT",
+            "AMEDIAFORMAT_KEY_I_FRAME_INTERVAL",
+            "AMEDIAFORMAT_KEY_MIME",
+            "AMEDIAFORMAT_KEY_SAMPLE_RATE",
+            "AMEDIAFORMAT_KEY_STRIDE",
+            "AMEDIAFORMAT_KEY_WIDTH",
+        ] {
+            assert!(
+                newly_resolved.contains(media),
+                "{media} (media-ndk) must resolve to Eclipse"
+            );
+        }
+        for audio in [
+            "slCreateEngine",
+            "SL_IID_ANDROIDCONFIGURATION",
+            "SL_IID_ANDROIDSIMPLEBUFFERQUEUE",
+            "SL_IID_BUFFERQUEUE",
+            "SL_IID_ENGINE",
+            "SL_IID_PLAY",
+            "SL_IID_RECORD",
+            "SL_IID_VOLUME",
+        ] {
+            assert!(
+                newly_resolved.contains(audio),
+                "{audio} (audio) must resolve to Eclipse"
             );
         }
         for name in &newly_resolved {
@@ -1914,8 +1970,8 @@ mod tests {
             "Eclipse-native partial apply: applied_nonnull={} applied_weak_zero={} unresolved_strong={} (work-list={})",
             stats.applied_nonnull, stats.applied_weak_zero, stats.unresolved_strong, stats.unresolved.len(),
         );
-        // The apply's work-list must equal the categorization's (consistency), and shrink to 43.
-        assert_eq!(stats.unresolved.len(), 43, "applied work-list is 43");
+        // The apply's work-list must equal the categorization's (consistency), and shrink to 2.
+        assert_eq!(stats.unresolved.len(), 2, "applied work-list is 2");
         assert!(
             stats.applied_nonnull > 0,
             "Eclipse + host fill a non-trivial GOT subset"
