@@ -63,17 +63,50 @@ impl fmt::Display for PaintRegistryError {
 
 impl std::error::Error for PaintRegistryError {}
 
+/// `android.graphics.Paint.Style` — how a shape is painted: filled, stroked (outlined), or both.
+/// 2026-06-05: the Canvas draw natives (drawRect/drawCircle/drawPath) read this to choose tiny-skia
+/// `fill_path`/`fill_rect` vs `stroke_path`. Ordinals match AOSP `Paint.Style` (FILL=0, STROKE=1,
+/// FILL_AND_STROKE=2), which is what `Paint.setStyle` passes to `native_setStyle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaintStyle {
+    /// Fill the shape's interior (AOSP default).
+    #[default]
+    Fill,
+    /// Stroke the shape's outline only.
+    Stroke,
+    /// Fill the interior AND stroke the outline.
+    FillAndStroke,
+}
+
+impl PaintStyle {
+    /// Map an AOSP `Paint.Style` ordinal (FILL=0, STROKE=1, FILL_AND_STROKE=2) to a [`PaintStyle`].
+    /// An unknown ordinal falls back to `Fill` (the AOSP default) — never panics.
+    pub fn from_ordinal(ordinal: i32) -> Self {
+        match ordinal {
+            1 => Self::Stroke,
+            2 => Self::FillAndStroke,
+            _ => Self::Fill,
+        }
+    }
+}
+
 /// Per-paint state held in a registry slot: the non-GTK drawing configuration.
 ///
-/// 2026-06-05: minimal by design — `color` (ARGB, `Paint.native_setColor`) and `text_size`
-/// (`Paint.native_setTextSize`). Holds no GTK/Cairo context and performs no drawing (deferred). More
-/// fields (typeface, stroke, flags) are added when their setters are bound.
+/// 2026-06-05: the config the Canvas draw natives consume — `color` (ARGB, `Paint.native_setColor`),
+/// `text_size` (`Paint.native_setTextSize`), `stroke_width` (`Paint.native_set_stroke_width`), and
+/// `style` (`Paint.native_setStyle`). Holds no GTK/Cairo context and performs no drawing itself; the
+/// Canvas natives read it to drive tiny-skia. More fields (typeface, flags) are added when their
+/// setters are bound.
 #[derive(Debug, Default)]
 pub struct PaintState {
     /// ARGB color (`Paint.setColor`); 0 (transparent black) until set.
     pub color: i32,
     /// Text size in pixels (`Paint.setTextSize`); 0.0 until set.
     pub text_size: f32,
+    /// Stroke width in pixels (`Paint.setStrokeWidth`); 0.0 until set (a 0 width is AOSP's "hairline").
+    pub stroke_width: f32,
+    /// Fill vs stroke style (`Paint.setStyle`); [`PaintStyle::Fill`] (AOSP default) until set.
+    pub style: PaintStyle,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -247,6 +280,31 @@ mod tests {
         let h = allocate().expect("allocate");
         free(h).expect("first free");
         assert_eq!(free(h), Err(PaintRegistryError::StaleHandle));
+    }
+
+    #[test]
+    fn paint_style_from_ordinal_maps_aosp_values_and_defaults_to_fill() {
+        // AOSP Paint.Style ordinals: FILL=0, STROKE=1, FILL_AND_STROKE=2; anything else → Fill.
+        assert_eq!(PaintStyle::from_ordinal(0), PaintStyle::Fill);
+        assert_eq!(PaintStyle::from_ordinal(1), PaintStyle::Stroke);
+        assert_eq!(PaintStyle::from_ordinal(2), PaintStyle::FillAndStroke);
+        assert_eq!(PaintStyle::from_ordinal(99), PaintStyle::Fill);
+        assert_eq!(PaintStyle::from_ordinal(-1), PaintStyle::Fill);
+        assert_eq!(PaintStyle::default(), PaintStyle::Fill);
+    }
+
+    #[test]
+    fn with_paint_records_stroke_width_and_style() {
+        let h = allocate().expect("allocate");
+        with_paint(h, |s| {
+            s.stroke_width = 6.5;
+            s.style = PaintStyle::Stroke;
+        })
+        .expect("write");
+        let (w, st) = with_paint(h, |s| (s.stroke_width, s.style)).expect("read");
+        assert_eq!(w, 6.5);
+        assert_eq!(st, PaintStyle::Stroke);
+        free(h).expect("free");
     }
 
     #[test]

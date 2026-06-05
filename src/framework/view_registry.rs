@@ -164,6 +164,11 @@ pub struct ViewState {
     /// view is then non-dispatchable — logged, never UB). A `Global` is `Send`, so it lives soundly in
     /// this process-global slab; it is released when the slot is [`free`]d (its `Drop` deletes the ref).
     pub jobject: Option<Global<JObject<'static>>>,
+    /// 2026-06-05: the view's solid background color (`View.setBackgroundColor`, ARGB as
+    /// `Color.argb`/`0xAARRGGBB`), recorded by `View.native_setBackgroundColor`. `None` until set; the
+    /// renderer fills the view's rect with this color (real fidelity) and otherwise uses a synthetic
+    /// depth-distinguished color. A drawable background (`native_setBackgroundDrawable`) is separate.
+    pub background_color: Option<i32>,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -213,6 +218,7 @@ pub fn allocate(class_name: &str) -> Result<ViewHandle, ViewRegistryError> {
         layout: LayoutParams::default(),
         clickable: false,
         jobject: None,
+        background_color: None,
     };
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -283,6 +289,13 @@ pub fn set_clickable(handle: ViewHandle) -> Result<(), ViewRegistryError> {
     with_view(handle, |v| v.clickable = true)
 }
 
+/// Record a solid ARGB background color on the view a `handle` refers to (`View.setBackgroundColor`).
+/// 2026-06-05: the renderer fills the view's rect with this color for real fidelity. Validates the
+/// handle exactly like [`with_view`], so a stale/fabricated handle is a typed `Err`, never UB.
+pub fn set_background_color(handle: ViewHandle, argb: i32) -> Result<(), ViewRegistryError> {
+    with_view(handle, |v| v.background_color = Some(argb))
+}
+
 /// Record the JNI **global** reference to a view's Java `View` object onto its registry slot, so a
 /// click resolved to this view (by handle) can later call `View.performClick()` on the real object.
 ///
@@ -351,6 +364,9 @@ pub struct RenderNode {
     /// 2026-06-05: mirrors [`ViewState::clickable`] — `true` if a click listener was recorded. The
     /// hit-test only targets clickable views.
     pub clickable: bool,
+    /// 2026-06-05: mirrors [`ViewState::background_color`] — the solid ARGB background color
+    /// (`View.setBackgroundColor`), or `None` to use the renderer's synthetic depth color.
+    pub background_color: Option<i32>,
     /// Indices (into the flat snapshot `Vec`) of this node's children, in their recorded order.
     pub children: Vec<usize>,
 }
@@ -407,6 +423,7 @@ pub fn snapshot_tree() -> Vec<RenderNode> {
             depth,
             layout: state.layout,
             clickable: state.clickable,
+            background_color: state.background_color,
             children: Vec::new(),
         });
         if let Some(parent) = out.get_mut(parent_idx) {
