@@ -43,16 +43,27 @@
 //! weak, weak-undef → 0, strong-undef → unresolved). With it, [`map`] applies the
 //! symbol-dependent relocations (`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`) it previously deferred.
 //!
+//! [`tls`] — the **static-TLS layout + `R_X86_64_TPOFF64` offsets**: a [`tls::TlsLayout`] stacks
+//! one or more modules' `PT_TLS` blocks below the thread pointer per the x86-64 variant-II model
+//! (`offset_i = offset_{i-1} + roundup(size_i, align_i)`; a symbol's tp-relative value is
+//! `-offset_i + st_value`), assembles the init block (`.tdata` copied, `.tbss` zeroed, aligned),
+//! and a [`tls::TlsResolver`] resolves a `TPOFF64` symbol to that tp-relative value (delegating
+//! non-TLS relocations to the inner [`resolve`] resolver). With it, [`map`] applies the last
+//! non-ifunc relocation class. **It computes the layout/offsets + applies `TPOFF64`; it does NOT
+//! bind the block to a live thread pointer (`%fs`/TCB) — that is a separate integration step (see
+//! `tls.rs` and AGENTS.md §5).**
+//!
 //! `elf.rs` decodes the file format; `reloc.rs` applies relocations; `map.rs` lays the segments
 //! out and drives both base and (via `resolve.rs`) symbol relocations — a clean boundary (the
 //! decoded `reloc::Rela` is the applier's input type, with no glue).
 //!
 //! ## What this module deliberately does NOT do (the broader loader, built on this core)
-//! This is the **decode + map + relocate core**, not a full working loader. It does **not**
-//! allocate the static-TLS block, set up the thread pointer (`%fs`/TCB), so `R_X86_64_TPOFF64`
-//! stays deferred; nor does it execute the library's `IRELATIVE` ifunc resolvers, run init
-//! functions, model the bionic two-namespace scope, or replace/augment the apkenv linker. Those
-//! are the next steps that build on this core
+//! This is the **decode + map + relocate core**, not a full working loader. It assembles the
+//! static-TLS block and computes its tp-relative offsets ([`tls`]) but does **not** bind that block
+//! to a live thread pointer (`%fs`/TCB), so `R_X86_64_TPOFF64`'s computed offsets are correct but
+//! not yet *reachable at runtime*; nor does it execute the library's `IRELATIVE` ifunc resolvers,
+//! run init functions, model the bionic two-namespace scope, or replace/augment the apkenv linker.
+//! Those are the next steps that build on this core
 //! (see the submodule docs and AGENTS.md §5 next-actions). Wiring it into the engine-load path
 //! requires that broader loader and is **main-loop / dev-host only** (the cyber-safeguard
 //! false-positives on linker work).
@@ -61,3 +72,4 @@ pub mod elf;
 pub mod map;
 pub mod reloc;
 pub mod resolve;
+pub mod tls;
