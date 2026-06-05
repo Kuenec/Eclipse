@@ -738,6 +738,23 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   milestone tag) + a dated MSRV note (1.95 is the conservative dev pin, not the true floor). Gate
   green (38 tests). The earlier ART-boot/JNI workflows were content-filter-blocked for subagents;
   this review workflow (framed as Rust code review, not runtime analysis) completed cleanly.
+- **2026-06-04** — **Engine-load frontier characterized precisely (next-phase spec).** Static
+  analysis (`readelf`) + load probes: `libroblox.so` NEEDs `libmediandk/libOpenMAXAL/libOpenSLES/
+  libGLESv2/libEGL/libandroid/liblog/libm/libdl/libc` (585 undefined syms); ATL's `libandroid.so`
+  already provides **100%** of the NDK families it imports (AMedia 19, AMediaCodec 11,
+  ANativeWindow 4, AAsset 6, AConfiguration 4, ALooper 7), and its `libOpenMAXAL` imports are
+  actually OpenSL ES syms (→ libOpenSLES). So the only missing pieces are the **sonames**
+  `libmediandk.so`/`libOpenMAXAL.so` (absent as files; symbols exist elsewhere). **Core challenge
+  = the host/bionic loader-namespace boundary:** the apkenv bionic linker resolves libroblox's
+  transitive NEEDED only from its own `dl_parse_library_path` paths (not glibc `LD_LIBRARY_PATH`);
+  a host `.so` in that path gets bionic-linked (glibc deps fail), out of it is "not found" — so the
+  host NDK shims must be loaded into the *bionic* namespace so the engine's relocations resolve.
+  Next: read `bionic_translation/linker.c` (host-lib load + symbol registration) and build shims
+  it accepts / preload libandroid into that namespace. **Correction:** ATL's own M0 boot did NOT
+  reach the engine load — it died on low_4gb during framework *asset init*, before the Activity's
+  `loadLibrary`. So Eclipse's no-GTK path already reaches **further** than ATL on this APK (to the
+  engine load itself); this is new territory, not copyable from a working ATL run. Full spec:
+  `~/eclipse-m0/framework-worklist.txt`.
 
 ---
 
