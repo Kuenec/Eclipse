@@ -551,21 +551,26 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   deferred to the framework-lifecycle work). Cargo.lock committed. NO `axmldecoder`/`jni`/`ureq`/
   `rustls`/`clap`/`rustix`. `winit`/`ash` deferred to the windowed boot.
 - **Open items:** license `TBD`; M1 reach Roblox `onCreate` (+ later: APK fetch backend).
-- **Next actions (pick up here — the demo's `onCreate` now COMPLETES; advance the lifecycle / engine):**
-  🟢 **NEXT GRAPHICS BUILD = the CANVAS DRAW CASCADE + RGBA COMPOSITE (2026-06-05).** The tiny-skia Canvas
-  raster is DONE + pixel-tested (`canvas_registry`, §5/§6 Canvas entry); multitouch.test reaches RESUMED but
-  its custom-View `onDraw(Canvas)` never runs (Eclipse drives `onResume` but not `ViewRootImpl.performTraversals`,
-  so 0 Canvas natives surface). Two concrete steps, smallest-sound first: **(1) draw-cascade driver** —
-  after RESUMED, walk the laid-out tree (`view_registry::snapshot_tree` + the renderer's layout) for CUSTOM
-  (non-`android.*`) views, allocate a `canvas_registry` Pixmap sized to each view's rect, construct a Java
-  `Canvas` whose native handle is that slab index (bind `Canvas`'s init native + `nDrawColor`/`nDrawRect`/
-  `nDrawCircle`/`nDrawPath`/`nDrawText` → the `canvas_registry` methods + `paint_registry`/`path_registry`),
-  and invoke `View.draw(canvas)`/`onDraw` via JNI (guarded, `catch_unwind`); each native fills the Pixmap.
-  **(2) RGBA composite** — sibling of `graphics::TextRenderer` (R8) for an RGBA8 sampled texture: upload the
-  Pixmap + draw a textured quad over the view's rect (reuse the text pipeline's vertex-input + combined-image-
-  sampler descriptor; sound reverse-order teardown). Validate on multitouch.test (touch circles composite) +
-  keep demo_app/accelerometerdemo rendering. The Canvas op→Pixmap pixels are already GPU-free unit-tested;
-  add a composite-quad geometry test when the RGBA pipeline lands.
+- **Next actions (pick up here — draw cascade + composite BUILT; the ATL-Canvas backing is the blocker):**
+  🟠 **NEXT GRAPHICS BUILD = the `Canvas(Bitmap)` / GskCanvas-readback subsystem (2026-06-05, §6 draw-cascade
+  entry).** The draw-cascade driver (`framework::drive_view_draw`), the `nDraw*` Canvas-native binding
+  (`register_canvas_natives`), AND the RGBA composite pipeline (`graphics::CanvasCompositor`) are ALL BUILT +
+  gate-green + the cascade RUNS end-to-end (it finds multitouch's custom `MultiTouch` view + attempts
+  `View.draw(Canvas)`). **THE DEV-HOST DISCOVERY (run log `/tmp/eclipse-draw.log`): this ATL build's
+  `android.graphics.Canvas` is NOT the modern-AOSP `nDraw*`-native shape** — its vtable dump shows the draw ops
+  are PUBLIC JAVA methods (`drawColor`/`drawCircle`/`drawRect`/`drawPath`) backed by an `android.atl.GskCanvas
+  gsk_canvas` field (GTK GSK render node) + a `Bitmap bitmap` field, with only `Canvas()`/`Canvas(Bitmap)` ctors
+  (NO `nDraw*` natives, NO `Canvas(long)` ctor). So `register_canvas_natives` is best-effort (it logs + DISABLES
+  the cascade when the natives are absent — `CANVAS_DRAW_SUPPORTED` false), and the cascade composites nothing on
+  this build (view quads + text still render; multitouch + demo + accel all still reach RESUMED, 0 VK_ERROR). The
+  durable faithful path on THIS build: construct `new Canvas(eclipseBitmap)` where Eclipse owns the Bitmap (bind
+  `Bitmap`'s create/native natives → an Eclipse RGBA buffer), so the public-Java draw methods raster into
+  Eclipse-readable pixels via the Bitmap/GskCanvas natives (NOT GTK — a non-GTK Bitmap backing), then the composite
+  uploads that buffer. The `canvas_registry` Pixmap raster + the RGBA `CanvasCompositor` + `drive_view_draw` are
+  REUSED unchanged once that consumer exists (only the Canvas-construction + per-op-native wiring change). On an
+  AOSP-shaped Canvas build (`nDraw*` present, e.g. Roblox-class apps) the cascade self-enables + composites with
+  zero further work. Smallest next step = bind `android.graphics.Bitmap`'s create/config natives against an
+  Eclipse-owned RGBA buffer registry (mirror `canvas_registry`) so `Canvas(Bitmap)` constructs.
   ✅ **DONE 2026-06-05: the demo `MainActivity.onCreate` completes** — `findViewById(0x7f030000).setText(…)`
   succeeds, `onContentChanged - yay!` runs, "recipe steps 1–5 driven". Root cause was the styled-attribute
   path, NOT the resource table: the TypedArray window layout was wrong (now the standard AOSP stride-7
@@ -813,6 +818,46 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   combined-image-sampler shape; sound teardown in reverse order). Files: `src/framework/canvas_registry.rs`
   (new), `src/framework.rs` (module decl), `src/framework/paint_registry.rs` (`PaintStyle` + `stroke_width`).
   Faithful log: `/tmp/eclipse-canvas10.log` (multitouch RESUMED, 0 onDraw).
+  ✅ **DONE 2026-06-05: the DRAW CASCADE DRIVER + Canvas-native binding + the RGBA COMPOSITE pipeline are all
+  BUILT (real, sound, gate-green) — and the dev-host run NAILED DOWN the exact Canvas backing this ATL build
+  uses (the integrative render-capstone increment).** Three pieces, all wired + run-validated:
+  • **Draw-cascade driver** (`framework::drive_view_draw(vm, &[DrawTarget]) -> Vec<DrawnCanvas>` + `draw_targets`,
+    `src/framework.rs`): after RESUMED, for each CUSTOM (non-`android.*`/`androidx.*`/`com.android.*`/`java.*`)
+    view in the laid-out tree it allocates a `canvas_registry` Pixmap sized to the view's rect, constructs a Java
+    `Canvas`, and invokes `View.draw(Canvas)` on the view's recorded global ref (held VM, attached main thread,
+    `catch_unwind`-guarded, every JNI call via `checked` — a per-target failure is skipped + its Pixmap freed, the
+    whole cascade never aborts). Driven from the winit loop (`graphics::GameWindow::drive_custom_view_draw`, which
+    holds the VM) each frame before `draw_frame`. **RUN-VALIDATED: the cascade RUNS** — it finds multitouch's
+    custom `com.leocardz.multitouch.test.MultiTouch` view + attempts `View.draw(Canvas)`.
+  • **Canvas natives** (`register_canvas_natives` → `Canvas.nDrawColor`/`nDrawRect`/`nDrawCircle`/`nDrawPath` →
+    `canvas_registry` real tiny-skia draws + `paint_config_from_handle` reading `paint_registry`, `src/framework.rs`).
+  • **RGBA composite** (`graphics::CanvasCompositor`, sibling of `TextRenderer`: per custom view an RGBA8
+    `R8G8B8A8_UNORM` sampled texture uploaded from the Pixmap's straight RGBA + a textured quad over the view's
+    rect, alpha-blended over the quads + text; `shaders/composite.{vert,frag}.spv` embedded; per-frame textures
+    freed next frame after the `in_flight` fence — same single-frame-in-flight safety as the vertex buffers; all
+    handles freed in `Drop` after `device_wait_idle`; `upload_rgba_pixels`/`composite_quad_vertices`/
+    `upload_composite_vertices`/`build_composite_pipeline`).
+  **THE DEV-HOST FINDING (root-cause, `/tmp/eclipse-draw.log`): this ATL/ART build's `android.graphics.Canvas`
+  is GTK-coupled, NOT `nDraw*`-native.** ART's vtable dump shows the draw ops are PUBLIC JAVA methods
+  (`drawColor(int)`, `drawCircle(float,float,float,Paint)`, `drawRect`, `drawPath(Path,Paint)`, …) backed by an
+  `android.atl.GskCanvas gsk_canvas` field + a `Bitmap bitmap` field; there is **no `nDraw*` native and no
+  `Canvas(long)` constructor** (only `Canvas()`/`Canvas(Bitmap)`). So `register_canvas_natives`'s RegisterNatives
+  throws `NoSuchMethodError` → it is **best-effort** (clears the exception, logs the discovery, sets
+  `CANVAS_DRAW_SUPPORTED=false`), and `drive_view_draw` short-circuits when unsupported (so the missing
+  `Canvas(long)` ctor is NOT re-attempted/re-logged every frame — fixed a 5k-ERROR/run spam mid-increment).
+  **FAITHFUL status — the custom View's `onDraw(Canvas)` does NOT yet raster on THIS build** (the Canvas is
+  GskCanvas/Bitmap-backed, so an Eclipse-readable Canvas needs `Canvas(Bitmap)` + a non-GTK Bitmap backing — the
+  deferred next build, §5 next-actions). The cascade + Canvas raster + RGBA composite are all REAL + REUSED
+  unchanged once that consumer exists; on an AOSP-shaped Canvas build (`nDraw*` present) the cascade self-enables.
+  **NO REGRESSION:** multitouch.test (`/tmp/eclipse-draw.log`, EXIT=124) + demo_app (`/tmp/eclipse-demo-reg.log`)
+  + accelerometerdemo (`/tmp/eclipse-accel-reg.log`) all reach **ActivityResumed + Vulkan swapchain, 0 VK_ERROR/
+  panic**; the 13-view multitouch tree (incl. the custom MultiTouch view) lays out + draws (`/tmp/eclipse-draw-dbg.log`,
+  `RUST_LOG=eclipse::graphics=debug`). Gate clean: **211 unit + 2 doctests** (fmt/clippy `-D warnings`/release all
+  0-warning). GPU-free tests added: Canvas-native names/sigs, `paint_config_from_handle`, `DrawTarget`/`DrawnCanvas`,
+  `is_custom_view_class` (framework-namespace exclusion), `composite_quad_vertices` (6 verts/full-UV/pixel→NDC + a
+  sub-rect map), the 4-bytes/pixel RGBA upload size, the straight-RGBA byte order tying `canvas_registry` → the
+  RGBA8 texture, and composite SPIR-V well-formedness. Files: `src/framework.rs` (cascade + Canvas natives +
+  `CANVAS_DRAW_SUPPORTED`), `src/graphics.rs` (`CanvasCompositor` + helpers + frame wiring), `shaders/composite.*`.
   🟢 **ROBLOX RUN 2026-06-05 (the actual target, merged APK): Roblox's OWN `Application.onCreate` is now
   REACHED + runs its own startup tasks** — far past the demo. Bound the one benign framework native that
   surfaced inside `RobloxApplication.<init>`: **`android.os.SystemClock.elapsedRealtime()J`** (class A;
@@ -2372,6 +2417,32 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   Gate clean: fmt / build --all-targets / clippy `-D warnings` / **test 188 unit + 2 doctests** (+3 over v0's 185) /
   release — all 0-warning. Files: `src/framework.rs` (MotionEvent obtain/dispatch/recycle + `MotionAction` + tests),
   `src/graphics.rs` (press/release pointer handling threads the hit view + action into dispatch). No new deps.
+- **2026-06-05** — **DRAW CASCADE + Canvas natives + RGBA composite BUILT; dev-host run pinned the ATL Canvas
+  backing (GskCanvas/Bitmap, not `nDraw*`-native).** Built the integrative render capstone: (1) `framework::
+  drive_view_draw` drives `View.draw(Canvas)` for each CUSTOM (non-framework-namespace) laid-out view via JNI on
+  the held VM (`catch_unwind`-guarded, per-target-skip, every call via `checked`), constructing a
+  `canvas_registry`-Pixmap-backed Java `Canvas`; (2) `register_canvas_natives` binds `Canvas.nDraw{Color,Rect,
+  Circle,Path}` → the `canvas_registry` real tiny-skia draws; (3) `graphics::CanvasCompositor` (sibling of
+  `TextRenderer`) uploads each drawn Pixmap as an `R8G8B8A8_UNORM` texture + draws a textured quad over the view's
+  rect (per-frame textures freed next frame after the in-flight fence; reverse-order `Drop` teardown;
+  `shaders/composite.*` embedded SPIR-V). The cascade is wired into the winit frame loop
+  (`GameWindow::drive_custom_view_draw`). **ROOT-CAUSE DISCOVERY (run log `/tmp/eclipse-draw.log`): this ATL/ART
+  build's `android.graphics.Canvas` is GTK-coupled** — ART's vtable dump shows the draw ops are PUBLIC JAVA methods
+  backed by an `android.atl.GskCanvas gsk_canvas` + a `Bitmap bitmap` field, with NO `nDraw*` natives and NO
+  `Canvas(long)` ctor (only `Canvas()`/`Canvas(Bitmap)`). So the `nDraw*` RegisterNatives throws `NoSuchMethodError`
+  → made **best-effort** (clears the exception, sets `CANVAS_DRAW_SUPPORTED=false`, logs the discovery), and
+  `drive_view_draw` short-circuits when unsupported (avoiding a per-frame `Canvas(long)` re-attempt that spammed
+  ~5k errors/run mid-build). **DECISION:** the durable faithful path on this build is `new Canvas(eclipseBitmap)`
+  with a non-GTK Eclipse Bitmap backing (the public-Java draw methods then raster into Eclipse-readable pixels) —
+  the deferred next graphics build (§5 next-actions); the `canvas_registry` raster + `CanvasCompositor` +
+  `drive_view_draw` are reused unchanged, and self-enable on an AOSP-shaped `nDraw*` Canvas build. **FAITHFUL:**
+  the cascade RUNS (finds multitouch's custom `MultiTouch` view) but `onDraw` does not yet raster on this Canvas
+  build; **NO REGRESSION** — multitouch/demo_app/accelerometerdemo all reach ActivityResumed + Vulkan swapchain,
+  0 VK_ERROR/panic, the 13-view multitouch tree lays out + draws. Gate: **211 unit + 2 doctests**, fmt/clippy
+  `-D warnings`/release all 0-warning (+18 tests: Canvas names/sigs, `paint_config_from_handle`, `DrawTarget`/
+  `DrawnCanvas`, `is_custom_view_class`, composite-quad geometry, RGBA upload size + straight-RGBA byte order,
+  composite SPIR-V). No new deps (reuses tiny-skia + ash). Files: `src/framework.rs`, `src/graphics.rs`,
+  `shaders/composite.{vert,frag}{,.spv}`, `shaders/README.md`.
 
 ---
 

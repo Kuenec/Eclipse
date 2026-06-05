@@ -95,6 +95,17 @@ pub mod view_registry;
 pub mod window_registry;
 pub mod xml_registry;
 
+/// Whether this ART build's `android.graphics.Canvas` supports Eclipse's draw cascade — i.e. its draw
+/// ops bind as the modern-AOSP `nDraw*` natives AND a `Canvas(long)` ctor exists. Set by
+/// [`register_canvas_natives`]: `true` if the `nDraw*` RegisterNatives succeeds, `false` if it throws
+/// (the Canvas is GskCanvas/Bitmap-backed on this build — section note at `register_canvas_natives`).
+/// [`drive_view_draw`] reads it to skip the cascade entirely when unsupported, so a missing
+/// `Canvas(long)` ctor isn't re-attempted (and re-logged) every frame. Starts `false`; the lifecycle
+/// driver always calls `register_canvas_natives` once before any frame, so it is set before the first
+/// cascade. Atomic (lock-free, no dep) — read once per frame on the main thread.
+static CANVAS_DRAW_SUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // === Eclipse's own (non-GTK) backing for android.content.Context's static-init natives =========
 //
 // 2026-06-05: `android.content.Context`'s static initializer (ATL `api-impl/android/content/
@@ -4765,6 +4776,310 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.graphics.Canvas draw natives =================
+//
+// 2026-06-05: a CUSTOM View's `onDraw(Canvas)` issues Canvas draw calls (e.g. multitouch.test's
+// `MultiTouch.onDraw` draws touch circles). The draw-cascade driver ([`drive_view_draw`]) constructs
+// a Java `Canvas` whose native backing is an Eclipse-owned [`canvas_registry`] slab handle (a tiny-skia
+// `Pixmap`, NOT a GTK/Cairo/Skia-C context), then invokes `View.draw(Canvas)`; if Canvas's draw ops
+// resolve to natives Eclipse can bind, they issue REAL tiny-skia fills/strokes into that Pixmap. The
+// renderer then uploads the Pixmap as an RGBA GPU texture over the view's rect (`CanvasCompositor`).
+//
+// ⚠️ DEV-HOST DISCOVERY (run log 2026-06-05, multitouch.test, `/tmp/eclipse-draw.log`): THIS ART/ATL
+// build's `android.graphics.Canvas` is NOT the modern-AOSP `nDraw*`-native shape. Its vtable dump shows
+// the draw ops are **public Java methods** (`drawColor(int)`, `drawCircle(float,float,float,Paint)`,
+// `drawRect(...)`, `drawPath(Path,Paint)`, …) backed by an `android.atl.GskCanvas gsk_canvas` field
+// (GTK GSK render node) + a `Bitmap bitmap` field — there is NO `nDrawColor`/`nDrawRect`/… native and
+// NO `Canvas(long)` constructor (only `Canvas()` and `Canvas(Bitmap)`). So binding `nDraw*` natives
+// here throws `NoSuchMethodError`. RegisterNatives is therefore BEST-EFFORT (see
+// [`register_canvas_natives`]): when the methods aren't natives on this build, registration is logged
+// + skipped and the lifecycle still reaches RESUMED (the draw cascade then composites nothing — the
+// view quads + text still draw). The durable faithful path on this build is a `Canvas(Bitmap)` whose
+// Bitmap Eclipse owns (so the Java draw methods raster into Eclipse-readable pixels via the Bitmap/
+// GskCanvas natives) — a separate Bitmap/GskCanvas subsystem build (deferred; AGENTS.md §5). The
+// `canvas_registry` Pixmap raster + the RGBA composite are real + unit-tested and are reused unchanged
+// once that consumer exists. The `nDraw*` names below are kept as the attempted binding (they are the
+// modern-AOSP set); they are the right names on an AOSP-shaped Canvas build and harmlessly skipped on
+// this GTK-backed one.
+
+/// `android.graphics.Canvas` (internal/slashed name for `find_class`) — the class the draw-cascade
+/// driver constructs + (best-effort) binds draw natives on. NOTE (2026-06-05): on this ATL build Canvas
+/// is GskCanvas-backed with public-Java draw methods + only `Canvas()`/`Canvas(Bitmap)` ctors (no
+/// `Canvas(long)`), so the binding + `Canvas(long)` construction are best-effort (see the section note).
+pub const CANVAS_CLASS: &JNIStr = jni_str!("android/graphics/Canvas");
+
+// JNI names + descriptors for the modern-AOSP `BaseCanvas` draw natives (bound static with the canvas
+// handle as the first arg). Best-effort: skipped if absent on a GTK-backed Canvas build (see the
+// section note). Each is paired with its `extern "system"` fn below; pinned by `canvas_native_names_and_sigs`.
+const CANVAS_N_DRAW_COLOR_NAME: &JNIStr = jni_str!("nDrawColor");
+const CANVAS_N_DRAW_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
+const CANVAS_N_DRAW_RECT_NAME: &JNIStr = jni_str!("nDrawRect");
+const CANVAS_N_DRAW_RECT_SIG: &JNIStr = jni_str!("(JFFFFJ)V");
+const CANVAS_N_DRAW_CIRCLE_NAME: &JNIStr = jni_str!("nDrawCircle");
+const CANVAS_N_DRAW_CIRCLE_SIG: &JNIStr = jni_str!("(JFFFJ)V");
+const CANVAS_N_DRAW_PATH_NAME: &JNIStr = jni_str!("nDrawPath");
+const CANVAS_N_DRAW_PATH_SIG: &JNIStr = jni_str!("(JJJ)V");
+
+/// Snapshot a [`paint_registry`] handle into a [`canvas_registry::PaintConfig`] for a Canvas draw.
+///
+/// 2026-06-05: reads the `Paint`'s recorded color/style/stroke-width under the paint lock and returns a
+/// plain value, so the canvas lock and the paint lock are never held at once (no lock-order hazard).
+/// A bad/stale/`0` paint handle (e.g. a draw with a default Paint Eclipse never saw construct) yields
+/// [`canvas_registry::PaintConfig::default`] (opaque black, fill) — AOSP's default Paint, so the draw
+/// is still real, never UB.
+fn paint_config_from_handle(paint: jlong) -> canvas_registry::PaintConfig {
+    paint_registry::with_paint(paint, |p| canvas_registry::PaintConfig {
+        argb: p.color,
+        style: p.style,
+        stroke_width: p.stroke_width,
+        // AOSP `Path.getFillType` defaults to WINDING; even-odd is per-path, not per-paint, so the
+        // path's own geometry/fill carries it. Canvas circle/rect ignore it; drawPath reads the
+        // geometry's recorded rule via the path handle below.
+        even_odd: false,
+    })
+    .unwrap_or_default()
+}
+
+/// `Canvas.nDrawColor(long canvas, int color)` → fill the whole Pixmap with a solid ARGB color.
+///
+/// JNI ABI: a `static` native returning void (`(JI)V`), so the parameters are
+/// `(EnvUnowned, JClass, jlong canvas, jint color)`. Issues a real [`canvas_registry`] `draw_color`
+/// (tiny-skia `Pixmap::fill`). A bad/stale canvas handle is logged + ignored (never UB). This is the
+/// op a custom View's `onDraw` typically issues first to clear its canvas.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8); `resolve`
+/// returns the `()` default on error/panic.
+extern "system" fn canvas_n_draw_color<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    canvas: jlong,
+    color: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match canvas_registry::with_canvas(canvas, |c| c.draw_color(color)) {
+            Ok(()) => tracing::trace!(
+                target: "android.graphics.Canvas",
+                canvas, color,
+                "Canvas.nDrawColor: filled the Pixmap (real tiny-skia)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.graphics.Canvas",
+                canvas, error = %e,
+                "Canvas.nDrawColor: invalid canvas handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Canvas.nDrawRect(long canvas, float left, float top, float right, float bottom, long paint)` →
+/// fill/stroke an axis-aligned rectangle into the Pixmap.
+///
+/// JNI ABI: a `static` native returning void (`(JFFFFJ)V`). Reads the Paint config from the `paint`
+/// handle ([`paint_config_from_handle`]) and issues a real [`canvas_registry`] `draw_rect`. Bad canvas
+/// handle → logged + ignored.
+extern "system" fn canvas_n_draw_rect<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    canvas: jlong,
+    left: jfloat,
+    top: jfloat,
+    right: jfloat,
+    bottom: jfloat,
+    paint: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let cfg = paint_config_from_handle(paint);
+        match canvas_registry::with_canvas(canvas, |c| c.draw_rect(left, top, right, bottom, &cfg))
+        {
+            Ok(()) => tracing::trace!(
+                target: "android.graphics.Canvas",
+                canvas, left, top, right, bottom,
+                "Canvas.nDrawRect: rasterized a rect (real tiny-skia)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.graphics.Canvas",
+                canvas, error = %e,
+                "Canvas.nDrawRect: invalid canvas handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Canvas.nDrawCircle(long canvas, float cx, float cy, float radius, long paint)` → fill/stroke a
+/// circle into the Pixmap (the op multitouch.test's `onDraw` issues per touch point).
+///
+/// JNI ABI: a `static` native returning void (`(JFFFJ)V`). Reads the Paint config from `paint` and
+/// issues a real [`canvas_registry`] `draw_circle`. Bad canvas handle → logged + ignored.
+extern "system" fn canvas_n_draw_circle<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    canvas: jlong,
+    cx: jfloat,
+    cy: jfloat,
+    radius: jfloat,
+    paint: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let cfg = paint_config_from_handle(paint);
+        match canvas_registry::with_canvas(canvas, |c| c.draw_circle(cx, cy, radius, &cfg)) {
+            Ok(()) => tracing::trace!(
+                target: "android.graphics.Canvas",
+                canvas, cx, cy, radius,
+                "Canvas.nDrawCircle: rasterized a circle (real tiny-skia)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.graphics.Canvas",
+                canvas, error = %e,
+                "Canvas.nDrawCircle: invalid canvas handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Canvas.nDrawPath(long canvas, long path, long paint)` → fill/stroke an arbitrary contour into the
+/// Pixmap from a [`path_registry`] geometry.
+///
+/// JNI ABI: a `static` native returning void (`(JJJ)V`). Snapshots the [`path_registry`] geometry +
+/// its fill rule and the [`paint_registry`] config, then issues a real [`canvas_registry`] `draw_path`.
+/// A bad canvas/path handle is logged + ignored (never UB). The geometry is COPIED out under the path
+/// lock so the canvas lock and path lock are never held at once.
+extern "system" fn canvas_n_draw_path<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    canvas: jlong,
+    path: jlong,
+    paint: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        // Copy the path geometry + fill rule out under the path lock (clone into an owned value).
+        let geometry = path_registry::with_path(path, |g| g.clone());
+        let Ok(geometry) = geometry else {
+            tracing::debug!(
+                target: "android.graphics.Canvas",
+                canvas, path,
+                "Canvas.nDrawPath: invalid path handle (ignored)"
+            );
+            return Ok(());
+        };
+        // 2026-06-05: `PathGeometry` records verbs+points only (no fill rule); AOSP `Path`'s default
+        // fill type is WINDING, which `PaintConfig::default`/`paint_config_from_handle` already use.
+        let cfg = paint_config_from_handle(paint);
+        match canvas_registry::with_canvas(canvas, |c| c.draw_path(&geometry, &cfg)) {
+            Ok(()) => tracing::trace!(
+                target: "android.graphics.Canvas",
+                canvas, path,
+                "Canvas.nDrawPath: rasterized a path (real tiny-skia)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.graphics.Canvas",
+                canvas, error = %e,
+                "Canvas.nDrawPath: invalid canvas handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Canvas`'s draw natives.
+///
+/// Registered before step 4 (alongside the other graphics natives) so the natives are resolvable the
+/// moment a custom View's `onDraw(Canvas)` issues them during the draw cascade. Each is implemented
+/// against [`canvas_registry`] (real tiny-skia raster) + [`paint_registry`]/[`path_registry`]. New
+/// Canvas natives a dev-host run surfaces (`nDrawText`/`nDrawBitmap`/…) are added here.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do, by construction — each native is written to the modern-AOSP `BaseCanvas` descriptor (provenance
+/// note above; the discovery loop confirms/corrects names on the dev host). Every native body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(CANVAS_CLASS)?;
+    let methods = [
+        // SAFETY: `canvas_n_draw_color` matches the paired `(JI)V` signature as a static native;
+        // casting the `extern "system"` fn to a `*mut c_void` is how `from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CANVAS_N_DRAW_COLOR_NAME,
+                CANVAS_N_DRAW_COLOR_SIG,
+                canvas_n_draw_color as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `canvas_n_draw_rect` matches the paired `(JFFFFJ)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CANVAS_N_DRAW_RECT_NAME,
+                CANVAS_N_DRAW_RECT_SIG,
+                canvas_n_draw_rect as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `canvas_n_draw_circle` matches the paired `(JFFFJ)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CANVAS_N_DRAW_CIRCLE_NAME,
+                CANVAS_N_DRAW_CIRCLE_SIG,
+                canvas_n_draw_circle as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `canvas_n_draw_path` matches the paired `(JJJ)V` signature as a static native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CANVAS_N_DRAW_PATH_NAME,
+                CANVAS_N_DRAW_PATH_SIG,
+                canvas_n_draw_path as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // BEST-EFFORT (2026-06-05): on this ATL build Canvas has no `nDraw*` natives (it is GskCanvas-
+    // backed with public-Java draw methods — section note), so RegisterNatives throws
+    // `NoSuchMethodError`. That must NOT abort the lifecycle (the app still reaches RESUMED + the view
+    // quads/text render; the draw cascade just composites nothing). So we attempt the bind and, on
+    // failure, clear the pending exception + log it as the discovery signal, returning Ok. On an
+    // AOSP-shaped Canvas build (where these natives exist) the bind succeeds and the cascade composites.
+    // SAFETY: `class` is the loaded android/graphics/Canvas; the fn pointers' signatures match the
+    // modern-AOSP BaseCanvas draw-native descriptors.
+    match unsafe { env.register_native_methods(&class, &methods) } {
+        Ok(()) => {
+            // The nDraw* natives bound → this build's Canvas is the AOSP-shaped one the cascade can
+            // drive. Enable it (drive_view_draw will construct Canvas(long) + run View.draw).
+            CANVAS_DRAW_SUPPORTED.store(true, std::sync::atomic::Ordering::Release);
+            tracing::info!(
+                class = "android/graphics/Canvas",
+                "registered Eclipse's non-GTK backing for Canvas.nDrawColor + nDrawRect + nDrawCircle + nDrawPath (real tiny-skia raster); draw cascade enabled"
+            );
+        }
+        Err(e) => {
+            // Clear the NoSuchMethodError RegisterNatives left pending so it can't poison the next JNI
+            // call; log it as the discovery signal (this build backs Canvas via GskCanvas/Bitmap), and
+            // DISABLE the cascade so drive_view_draw doesn't re-attempt (+ re-log) the missing
+            // Canvas(long) ctor every frame.
+            if env.exception_check() {
+                env.exception_clear();
+            }
+            CANVAS_DRAW_SUPPORTED.store(false, std::sync::atomic::Ordering::Release);
+            tracing::warn!(
+                class = "android/graphics/Canvas",
+                error = %e,
+                "Canvas draw natives not bindable on this ART build (Canvas is GskCanvas/Bitmap-backed, not nDraw*-native); draw cascade DISABLED — view quads + text still render"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `true` if this ART build's `android.graphics.Canvas` supports the draw cascade (set by
+/// [`register_canvas_natives`] after probing the `nDraw*` natives). [`drive_view_draw`] short-circuits
+/// when this is `false` so the missing `Canvas(long)` ctor is not re-attempted every frame.
+pub fn canvas_draw_supported() -> bool {
+    CANVAS_DRAW_SUPPORTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 // === Eclipse's own (non-GTK) backing for android.widget.TextView native peer construction =======
 //
 // 2026-06-05: the launcher layout contains a `<TextView>`, so step 5 (`setContentView` →
@@ -6043,6 +6358,161 @@ fn touch_view(
     }
 }
 
+/// A view that should have its `onDraw(Canvas)` driven: its [`view_registry`] handle and the pixel
+/// size of its laid-out rect (the [`canvas_registry`] Pixmap is allocated at this size).
+///
+/// 2026-06-05: computed by the renderer's GPU-free layout pass (`graphics::layout_views`) and handed
+/// to [`drive_view_draw`]; kept a plain `Copy` value so the geometry stays GPU-free and the framework
+/// crate need not depend on the renderer's layout types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawTarget {
+    /// The view's [`view_registry`] handle (the same `jlong` the native peer holds).
+    pub handle: view_registry::ViewHandle,
+    /// The laid-out width in pixels (`>= 1`; the renderer clamps a degenerate rect out).
+    pub width: u32,
+    /// The laid-out height in pixels (`>= 1`).
+    pub height: u32,
+}
+
+/// One drawn custom view: its [`view_registry`] handle paired with the [`canvas_registry`] handle of
+/// the Pixmap its `onDraw(Canvas)` rasterized into. The renderer uploads the Pixmap over the view's
+/// rect, then [`canvas_registry::free`]s the handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawnCanvas {
+    /// The custom view whose `onDraw` ran.
+    pub view: view_registry::ViewHandle,
+    /// The Pixmap-backed Canvas its `onDraw` rasterized into.
+    pub canvas: canvas_registry::CanvasHandle,
+}
+
+/// Drive `View.draw(Canvas)` for each custom view in `targets`, rasterizing each into an Eclipse-owned
+/// [`canvas_registry`] Pixmap, and return the `(view, canvas)` pairs that drew successfully.
+///
+/// 2026-06-05: the DRAW CASCADE. Android's `ViewRootImpl.performTraversals` is what normally calls
+/// `View.draw(Canvas)`; Eclipse's minimal lifecycle never runs it, so a custom View's `onDraw` (e.g.
+/// multitouch.test's touch circles) never fires. This drives it directly: for each target it allocates
+/// a Pixmap-backed Canvas sized to the view's laid-out rect, constructs a Java
+/// `android.graphics.Canvas(long nativeCanvas)` over that handle, and invokes `View.draw(Canvas)` on
+/// the view's recorded global object (which dispatches into the View's `onDraw` + the bound
+/// [Canvas draw natives](register_canvas_natives), filling the Pixmap with REAL tiny-skia raster). The
+/// renderer then uploads each returned Pixmap as an RGBA texture over the owning view's rect (the
+/// composite) and frees it.
+///
+/// MUST be called on the VM/winit main thread (the `&Vm` borrow keeps the VM alive + pins us there).
+/// The JNI work is wrapped in `catch_unwind` so a Rust panic can never unwind into ART's C++
+/// (`panic = "abort"`, §2.8); every JNI call routes through [`checked`] (a thrown Java exception is
+/// described + cleared into a typed error, never left pending). A target whose Canvas can't be built,
+/// whose view has no recorded Java object, or whose `draw` throws is skipped (its Pixmap is freed) —
+/// the others still draw. Returns the successfully-drawn canvases; an empty `Vec` on no VM-reachable
+/// drawable target (never a panic across the boundary).
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] only on an attach
+/// failure (per-target Java errors are skipped, not surfaced).
+pub fn drive_view_draw(
+    vm: &Vm,
+    targets: &[DrawTarget],
+) -> Result<Vec<DrawnCanvas>, FrameworkError> {
+    // Skip the cascade entirely on a Canvas build that can't back it (no nDraw* natives / no
+    // Canvas(long) ctor — set by register_canvas_natives). Avoids re-attempting + re-logging the
+    // missing constructor every frame; the view quads + text still render.
+    if targets.is_empty() || !canvas_draw_supported() {
+        return Ok(Vec::new());
+    }
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
+    // this call (verified non-null above); `from_raw`'s contract is exactly that.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| draw_targets(env, targets))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Run the draw cascade body: build a `Canvas` + invoke `View.draw` for each target, collecting the
+/// drawn `(view, canvas)` pairs. Split out so the panic guard in [`drive_view_draw`] wraps one call.
+/// A per-target failure frees that target's Canvas (if allocated) and continues — never aborts the
+/// whole cascade. Always returns `Ok` (per-target errors are logged, not propagated).
+fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas>, FrameworkError> {
+    // Resolve the Canvas class + its `(long)` constructor once for the whole cascade.
+    let canvas_class = env.find_class(CANVAS_CLASS)?;
+    let mut drawn = Vec::with_capacity(targets.len());
+    for t in targets {
+        // Allocate the Pixmap-backed Canvas at the view's laid-out size (rejects 0/oversize).
+        let canvas_handle = match canvas_registry::allocate(t.width, t.height) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(view = t.handle, w = t.width, h = t.height, error = %e,
+                    "draw cascade: canvas allocate failed (skipped)");
+                continue;
+            }
+        };
+        // Construct `new android.graphics.Canvas(canvas_handle)` — the standard AOSP public ctor whose
+        // `long` is the native canvas handle (here the Eclipse slab index). The draw natives this
+        // Canvas's ops resolve to are bound by `register_canvas_natives`.
+        let canvas_obj = match checked(env, "Canvas.<init>(long)", |env| {
+            env.new_object(
+                &canvas_class,
+                jni_sig!("(J)V"),
+                &[JValue::Long(canvas_handle)],
+            )
+        }) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!(view = t.handle, canvas = canvas_handle, error = %e,
+                    "draw cascade: Canvas.<init> failed (skipped)");
+                let _ = canvas_registry::free(canvas_handle);
+                continue;
+            }
+        };
+        // Invoke `View.draw(Canvas)` on the view's recorded global object — this dispatches the View's
+        // own draw pass (background + onDraw + children), so the custom view's `onDraw` runs and its
+        // Canvas ops raster into the Pixmap. `with_jobject` holds the registry lock only to read the
+        // global ref; the single JNI call inside does not re-enter the registry (lock contract honored).
+        let result = view_registry::with_jobject(t.handle, |global| {
+            checked(env, "View.draw(Canvas)", |env| {
+                env.call_method(
+                    global.as_obj(),
+                    jni_str!("draw"),
+                    jni_sig!("(Landroid/graphics/Canvas;)V"),
+                    &[JValue::Object(&canvas_obj)],
+                )?
+                .v()
+            })
+        });
+        match result {
+            Ok(Some(Ok(()))) => {
+                tracing::debug!(
+                    view = t.handle,
+                    canvas = canvas_handle,
+                    w = t.width,
+                    h = t.height,
+                    "draw cascade: View.draw(Canvas) ran — onDraw rasterized into the Pixmap"
+                );
+                drawn.push(DrawnCanvas {
+                    view: t.handle,
+                    canvas: canvas_handle,
+                });
+            }
+            // A Java exception, a non-dispatchable view, or a stale handle: free the Canvas + skip.
+            other => {
+                if let Ok(Some(Err(e))) = &other {
+                    tracing::debug!(view = t.handle, error = %e, "draw cascade: View.draw threw (skipped)");
+                } else {
+                    tracing::trace!(view = t.handle, "draw cascade: view not drawable (skipped)");
+                }
+                let _ = canvas_registry::free(canvas_handle);
+            }
+        }
+    }
+    Ok(drawn)
+}
+
 /// Prove the bridge, then drive recipe steps 1–5 to the launcher Activity's `onCreate`. Split out so
 /// the panic guard in [`drive_application_lifecycle`] wraps a single named call.
 ///
@@ -6132,6 +6602,10 @@ fn drive_lifecycle(
     // AdaptiveIconDrawable → PathParser → Path.moveTo), so this must be bound before step 4. Bound
     // non-GTK against path_registry, recording the REAL parsed contour geometry (no GTK, no Skia-C).
     register_path_natives(env)?;
+    // Bind android.graphics.Canvas's draw natives on its own class — a CUSTOM View's onDraw(Canvas)
+    // issues these during the draw cascade ([`drive_view_draw`], after RESUMED), so they must be bound
+    // before the cascade runs. Bound non-GTK against canvas_registry (real tiny-skia raster).
+    register_canvas_natives(env)?;
 
     // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
     // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
@@ -7358,6 +7832,67 @@ mod tests {
         assert_eq!(PATH_NATIVE_CREATE_PATH_SIG.to_str(), "(J)J");
         assert_eq!(PATH_NATIVE_REF_PATH_NAME.to_str(), "native_ref_path");
         assert_eq!(PATH_NATIVE_REF_PATH_SIG.to_str(), "(J)J");
+    }
+
+    #[test]
+    fn canvas_native_names_and_sigs() {
+        // Pin android.graphics.Canvas's class + the draw natives' names/descriptors. These are the
+        // modern-AOSP `BaseCanvas` draw-native set bound static-with-handle (see the provenance note at
+        // register_canvas_natives); the dev-host discovery loop confirms/corrects them on a real run.
+        // A transcription regression here would silently bind the wrong descriptor — this catches it.
+        assert_eq!(CANVAS_CLASS.to_str(), "android/graphics/Canvas");
+        assert_eq!(CANVAS_N_DRAW_COLOR_NAME.to_str(), "nDrawColor");
+        assert_eq!(CANVAS_N_DRAW_COLOR_SIG.to_str(), "(JI)V");
+        assert_eq!(CANVAS_N_DRAW_RECT_NAME.to_str(), "nDrawRect");
+        assert_eq!(CANVAS_N_DRAW_RECT_SIG.to_str(), "(JFFFFJ)V");
+        assert_eq!(CANVAS_N_DRAW_CIRCLE_NAME.to_str(), "nDrawCircle");
+        assert_eq!(CANVAS_N_DRAW_CIRCLE_SIG.to_str(), "(JFFFJ)V");
+        assert_eq!(CANVAS_N_DRAW_PATH_NAME.to_str(), "nDrawPath");
+        assert_eq!(CANVAS_N_DRAW_PATH_SIG.to_str(), "(JJJ)V");
+    }
+
+    #[test]
+    fn paint_config_from_handle_reads_paint_then_defaults_when_invalid() {
+        // The draw cascade snapshots a paint_registry handle into a canvas_registry PaintConfig. A real
+        // handle reflects the recorded color/style/stroke-width; a bad/0 handle yields AOSP's default
+        // Paint (opaque black, fill) so a draw with an unseen default Paint is still real, never UB.
+        let p = paint_registry::allocate().expect("allocate paint");
+        paint_registry::with_paint(p, |s| {
+            s.color = 0x80AB_CDEFu32 as i32;
+            s.style = paint_registry::PaintStyle::Stroke;
+            s.stroke_width = 3.5;
+        })
+        .expect("configure paint");
+        let cfg = paint_config_from_handle(p);
+        assert_eq!(cfg.argb, 0x80AB_CDEFu32 as i32);
+        assert_eq!(cfg.style, paint_registry::PaintStyle::Stroke);
+        assert_eq!(cfg.stroke_width, 3.5);
+        paint_registry::free(p).expect("free paint");
+        // A fabricated/0 handle falls back to the default Paint (opaque black, fill).
+        let def = paint_config_from_handle(0);
+        assert_eq!(def.argb, canvas_registry::PaintConfig::default().argb);
+        assert_eq!(def.style, paint_registry::PaintStyle::Fill);
+    }
+
+    #[test]
+    fn draw_target_and_drawn_canvas_are_plain_copy_values() {
+        // DrawTarget/DrawnCanvas carry only opaque handles + pixel dims across the draw-cascade boundary
+        // (GPU-free, Copy). This pins their field meaning so the renderer + framework agree.
+        let t = DrawTarget {
+            handle: 42,
+            width: 100,
+            height: 50,
+        };
+        let t2 = t; // Copy, not move.
+        assert_eq!(t, t2);
+        assert_eq!(t.width, 100);
+        assert_eq!(t.height, 50);
+        let d = DrawnCanvas {
+            view: 42,
+            canvas: 7,
+        };
+        assert_eq!(d.view, t.handle);
+        assert_eq!(d.canvas, 7);
     }
 
     #[test]
