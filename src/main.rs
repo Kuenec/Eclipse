@@ -13,14 +13,15 @@ USAGE:
     eclipse <COMMAND>
 
 COMMANDS:
-    run        Launch Roblox            (not yet implemented)
+    run <APK>  Show the ART boot plan for an APK (dry run; VM boot not yet implemented)
     config     Show effective configuration and its path
     help       Show this help
     --version  Show version
 
 STATUS:
-    Research/scoping is complete and the plan is locked. The next step is the manual
-    foundation validation in docs/m0-runbook.md (M0). See docs/ for the full design.
+    `run` is a dry run: it opens the APK, parses the manifest, and prints the ART boot
+    plan (heap, host ISA, graphics backend, launcher) that the runtime will pass — the
+    VM boot itself (ART FFI) is pending. See docs/ for the full design.
 ";
 
 fn main() -> ExitCode {
@@ -37,13 +38,13 @@ fn main() -> ExitCode {
             println!("eclipse {}", eclipse::VERSION);
             ExitCode::SUCCESS
         }
-        Some("run") => {
-            eprintln!(
-                "`eclipse run` is not implemented yet.\n\
-                 Foundation validation comes first — see docs/m0-runbook.md."
-            );
-            ExitCode::FAILURE
-        }
+        Some("run") => match run_dry(args.get(1).map(String::as_str)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("eclipse run: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("config") => match show_config() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -68,5 +69,47 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
     let config = eclipse::config::Config::load()?;
     println!("# {}", path.display());
     println!("{}", config.to_json_pretty()?);
+    Ok(())
+}
+
+/// Dry run for `eclipse run <APK>`: open the APK, parse its manifest, build the ART
+/// [`BootPlan`](eclipse::runtime::BootPlan) from the manifest + effective config, and print
+/// the plan plus the ART options it would pass. The VM boot itself is not implemented yet
+/// (ART FFI pending) — this is the honest, demonstrable step before that lands.
+///
+/// Returns `Box<dyn Error>` because this `main`/setup-layer code composes several typed
+/// library errors (APK, config); the library crates themselves stay strictly typed (§2.8).
+fn run_dry(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(apk_path) = apk_path else {
+        return Err("missing APK path (usage: eclipse run <APK>)".into());
+    };
+
+    let mut apk = eclipse::apk::Apk::open(std::path::Path::new(apk_path))?;
+    let manifest = apk.manifest()?;
+    let config = eclipse::config::Config::load()?;
+    let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
+
+    println!("# ART boot plan (dry run) for {apk_path}");
+    println!("package:            {}", manifest.package);
+    println!("launcher_activity:  {}", plan.launcher_activity);
+    println!("sdk_int:            {}", plan.sdk_int);
+    println!(
+        "heap:               {} MiB (DisableHSpaceCompactForOOM={})",
+        plan.heap_mib, plan.disable_hspace_compact
+    );
+    println!("graphics_backend:   {}", plan.graphics_backend.as_str());
+    println!("instruction_set:    {}", plan.instruction_set_features);
+    println!("\n# ART/dex2oat options this plan would pass:");
+    for opt in plan.art_options() {
+        println!("    {opt}");
+    }
+
+    // Do not fake a boot: report that the VM boot is pending, the same honest posture as the
+    // rest of the launcher. boot() returns NotImplemented by design (see runtime::boot).
+    println!();
+    match eclipse::runtime::boot(&plan) {
+        Ok(()) => println!("VM booted."),
+        Err(e) => println!("VM boot not started: {e}"),
+    }
     Ok(())
 }

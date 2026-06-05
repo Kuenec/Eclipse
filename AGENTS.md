@@ -132,7 +132,10 @@ before any history-rewriting/force operation.
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
   PROGRESS** — `diagnostics` (tracing) + `config` (serde/JSON) + **`apk`** (zip + own total
-  AXML reader + SHA-256) all done & gated (2026-06-04). Next M1 crate: **`runtime`**.
+  AXML reader + SHA-256) + **`runtime`** (host-ISA detection + `BootPlan` + `eclipse run`
+  dry-run) all done & gated (2026-06-04). Remaining M1: the `runtime` **VM boot FFI**
+  (`dlopen` libart + `JNI_CreateJavaVM` + winit + ash) — the charter's high-risk/last step,
+  needs the vendored ART linked.
 
 ### 🟡 M0 STATUS — Steps 1+2 PASSED, Step 3 in progress (low_4gb blocker)
 
@@ -431,23 +434,33 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   **own total pure-Rust binary AXML reader** `src/apk/axml.rs` — replaced panic-prone
   `axmldecoder`; package/launcher/sdk/largeHeap; native-ABI + x86_64-engine detection;
   streaming SHA-256 `verify_integrity`; 24 tests incl. UTF-8/UTF-16 + truncation/mutation
-  totality fuzz). The other 7 modules are still dependency-free stubs.
+  totality fuzz), **`runtime`** (`src/runtime.rs`: `instruction_set_features()` runtime CPUID
+  ISA detection for dex2oat — the Step 4 fix; `BootPlan` derived from manifest+config+host
+  with `art_options()`; `boot()` honestly returns `NotImplemented`; `eclipse run <apk>`
+  dry-run prints the plan; 13 tests). **37 tests total, all green.** The other 6 modules are
+  dependency-free stubs.
 - **Deps wired (M1):** `tracing 0.1`, `tracing-subscriber 0.3`, `serde 1`, `serde_json 1`,
   `directories 6`, **`zip 2` (`deflate`, default-features off)**, **`sha2 0.10`**. Cargo.lock
-  committed. NO `axmldecoder` (own reader); `ureq`/`rustls` (APK fetch) deferred — no stable
-  programmatic source yet (see "why user-supplied"); `clap`/`rustix` deferred.
-- **Open items:** license `TBD`; M1 `runtime` crate (+ later: APK fetch backend).
-- **Next actions (pick up here — M1 `runtime`):**
-  1. `runtime` crate: ART boot → `onCreate`. Launcher uses **`winit`** (not GTK4) — the
-     architectural fix for Step 3.5 (frees the low_4gb window). Prefer **Vulkan via `ash`**
-     for the surface, GL/EGL fallback (perf — see §6). Detect host ISA and pass real
-     `--instruction-set-features` to dex2oat (Step 4 finding). Boot the activity the `apk`
-     reader resolves (`ActivitySplash`), or `-l ActivityNativeMain` to skip the splash.
-     Keep release `panic = "abort"`: wrap **every** JNI/`extern "C"` boundary in `catch_unwind`
-     so a Rust panic can never unwind into ART's C++ (§2.8) — see §6 panic decision.
-  2. With a winit-based boot, re-attempt the Roblox boot to finally harvest
+  committed. `runtime` host detection is **std-only** (no new dep). NO `axmldecoder` (own
+  reader); `ureq`/`rustls` (APK fetch) deferred — no stable programmatic source yet (see "why
+  user-supplied"); `clap`/`rustix`/`jni`/`winit`/`ash` deferred to the VM-boot FFI.
+- **Open items:** license `TBD`; M1 `runtime` **VM boot FFI** (+ later: APK fetch backend).
+- **Next actions (pick up here — M1 `runtime` VM boot FFI):**
+  1. Implement `runtime::boot()`: `dlopen` libart + `JNI_CreateJavaVM` (boot image +
+     bootclasspath + classpath = api-impl.jar : APK), a **`winit`** window (not GTK4 — the
+     Step 3.5 fix that frees the low_4gb window), and an **`ash` Vulkan** surface (GL/EGL
+     fallback). This introduces the crate's first `unsafe` → lift `#![forbid(unsafe_code)]`
+     in `runtime.rs` and **wrap every JNI/`extern "C"` boundary in `catch_unwind`** so a Rust
+     panic can never unwind into ART's C++ under `panic = "abort"` (§2.8, see §6 decision).
+     Consume the existing `BootPlan`/`art_options()` (heap, ISA, sdk-int, activity, backend).
+  2. **Deferred from the BootPlan review (do at boot time):** (a) split `art_options()` VM
+     options (`-X*` → `JavaVMOption`) from the dex2oat flag (`--instruction-set-features` → a
+     separate dex2oat invocation) at the type level so neither is sent to the wrong target;
+     (b) canonicalize the launcher-activity name (manifest dotted vs `-l` slashed form) to
+     whatever ART's `-l` actually expects.
+  3. With the winit-based boot, re-attempt the Roblox boot to finally harvest
      `framework-worklist.txt` (the deferred Step 4 data).
-  3. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
+  4. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
 
 ---
 
@@ -607,6 +620,18 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   agents **schemaless** (prose) and re-verify gate results myself. Also: a content-filter
   false-positive ("cyber safeguards") can kill an agent that's asked to decode a binary parser —
   re-run or verify that dimension manually.
+- **2026-06-04** — **M1 `runtime` first layer: host-ISA detection + `BootPlan` (no FFI yet).**
+  `instruction_set_features()` does runtime CPUID (`std::arch::is_x86_feature_detected!`, std-only)
+  and emits dex2oat's `--instruction-set-features` in ART's canonical token order/spelling
+  (verified vs AOSP `instruction_set_features_x86.cc`) — the Step 4 fix for ATL's hardcoded
+  baseline ISA (§9 detect-don't-assume; §6 perf). `BootPlan::new(&Manifest,&Config)` derives the
+  documented boot's args (activity, sdk-int [target_sdk else 33], M0 heap 768 MiB +
+  DisableHSpaceCompactForOOM, ISA, Vulkan-default/OpenGL-on-`use_opengl`); `art_options()` renders
+  them. `boot()` returns typed `NotImplemented` (no fake); `eclipse run <apk>` is a dry-run that
+  printed the correct plan for the real APK end-to-end (apk→runtime). `#![forbid(unsafe_code)]`
+  kept (lift at the FFI). Non-x86_64 host → `compile_error!`. 13 tests; 37 total green; no new dep.
+  Two review MINORs **deferred to `boot()`** (logged in §5 next-actions): split VM-vs-dex2oat
+  options at the type level; canonicalize the activity dotted/slashed form for ART's `-l`.
 
 ---
 
