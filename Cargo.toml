@@ -44,7 +44,11 @@ directories = "6"                                                   # portable X
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"                                     # streaming artifact-integrity hash (lowercase hex via std::fmt, no `hex` crate)
 # --- Runtime: boot the vendored ART VM (M1) -------------------------------------
-libloading = "0.9"                                # dlopen the vendored /usr/lib/art/libart.so (no link-time ART dep)
+# 2026-06-05: 0.8 (was 0.9) unifies the tree on the single libloading already pulled by ash/
+# wayland-sys/khronos-egl — removing the duplicate 0.9 (§2.5 no-bloat) and letting egl_engine.rs
+# construct the `khronos-egl` `DynamicInstance` from the SAME libloading::Library type it expects
+# (a 0.9 Library is a distinct type → mismatch). The `os::unix` API runtime.rs uses is identical.
+libloading = "0.8"                                # dlopen the vendored /usr/lib/art/libart.so (no link-time ART dep)
 jni-sys = "0.4"                                   # raw JNI invocation types used by boot()'s JNI_CreateJavaVM
 jni = "0.22"                                      # safe JNI wrapper for the onCreate framework driver (wraps the held *mut JavaVM)
 # --- Graphics/window: the host game window (M2) ----------------------------------
@@ -66,6 +70,13 @@ libc = "0.2"
 ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
 ash-window = "0.13"                               # ash ↔ raw-window-handle interop: required surface extensions + VkSurfaceKHR from the window
 raw-window-handle = "0.6"                         # the window/display handle abstraction (deduped with winit 0.30's own dep)
+# 2026-06-05: the ENGINE's GLES2/EGL render surface on Eclipse's window (src/egl_engine.rs). The
+# Roblox x86-64 engine renders the whole frame into an ANativeWindow via EGL (91 EGL/GLESv2 imports →
+# host Mesa, NOT Vulkan — docs/libroblox-characterization.md). `dynamic` makes khronos-egl dlopen the
+# host libEGL.so.1 at runtime (detect-don't-assume §9, no link-time EGL dep) via `libloading` 0.8 —
+# ALREADY in Cargo.lock (transitively) → ZERO new transitive crates beyond khronos-egl itself; the
+# smallest sound option vs glutin (which bundles window-management Eclipse already does with winit).
+khronos-egl = { version = "6", features = ["dynamic"] }
 # 2026-06-05: pure-Rust glyph rasterizer for the View-tree TEXT pass — rasterizes each TextView's
 # text into an R8 glyph atlas the text pipeline samples. Pure Rust (ttf-parser/owned_ttf_parser),
 # no C/system font lib (§2.1); the system font FILE is found portably at runtime via fontconfig

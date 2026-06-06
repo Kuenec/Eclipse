@@ -676,6 +676,36 @@ before any history-rewriting/force operation.
   gap as §10, now manifesting one layer deeper inside the apkenv linker. **The durable Rust-loader native-load
   integration that fixes it is INSIDE the cyber-safeguard boundary — main-loop only, FORBIDDEN for subagents.** Gate now
   **382 unit + 2 doctests**. See §6 (2026-06-05 APKENV-LOADABLE libm) + [`docs/libroblox-init-run.md`](docs/libroblox-init-run.md) §11.
+- **2026-06-05 UPDATE — the ENGINE's GLES2/EGL render surface ON Eclipse's window is BUILT, WIRED, and VALIDATED with a
+  REAL triangle render (0 GL/EGL errors, swaps succeed) — the render path for when the boot clears the native-load wall.**
+  New module `src/egl_engine.rs` (`pub mod egl_engine;`) builds an **EGL display + GLES2 context + on-screen window
+  surface on Eclipse's existing `winit` window** using **host EGL/GLESv2** (the engine's 91 EGL/GLES imports already route
+  to host Mesa — docs/libroblox-characterization.md; **0 Vulkan**). EGL via **`khronos-egl` (`dynamic` → dlopens
+  `libEGL.so.1`** at runtime, detect-don't-assume §9); GLESv2 via a hand-rolled ~19-fn typed binding dlsym'd from
+  `libGLESv2.so.2` (no `glow` — §2.5 no-bloat); the native window from `raw-window-handle` chosen at runtime per display
+  server (**Wayland** `wl_egl_window` via `libwayland-egl.so.1`; **X11** XID directly). This is a **SEPARATE render mode**
+  from the Vulkan framework path (`src/graphics.rs`) — engine-only, gated behind the `__gl-test` subcommand / future engine
+  bring-up; the Java-view-app Vulkan render is **untouched** (demo_app + accelerometerdemo unaffected — graphics.rs has
+  ZERO changes). **ANativeWindow natives now SURFACE-BACKED** (`src/loader/native_provider.rs`): `ANativeWindow_fromSurface`
+  mints a handle reporting the **REAL live geometry of Eclipse's window** (new `ndk_registry::set_engine_window_geometry`
+  published from the live winit window, read by `default_native_window()`), so `getWidth`/`getHeight` answer with Eclipse's
+  actual window size, not the fixed 1080×1920 phone default; handles stay sound in the existing `ndk_registry` generational
+  slab (no UB). Verified vs the engine: libroblox imports EXACTLY 5 `ANativeWindow_*` (`acquire`/`fromSurface`/`getWidth`/
+  `getHeight`/`release`) — NOT `getFormat`/`setBuffersGeometry`/`lock`/`unlockAndPost` — so those are intentionally NOT
+  registered (§ simplicity — no dead natives). **REAL vs DEFERRED:** REAL = the EGL/GLES2 surface + triangle render +
+  present on Eclipse's window (validated headless: 0 GL errors + successful swaps); DEFERRED (documented) = the WSI
+  translation routing the engine's OWN `eglCreateWindowSurface(ANativeWindow*)` onto this surface — lands when the boot
+  clears the native-load wall and the engine reaches a frame. **VALIDATED (dev host, Wayland+Mesa):**
+  `cargo build --release && timeout 30 ./target/release/eclipse __gl-test` → `EGL+GLES2 OK: surface 800x600, 5 frames
+  rendered + presented, 0 GL errors, all swaps succeeded` (EXIT=0, deterministic over 3 runs; log `/tmp/eclipse-gl-test.log`).
+  The visible triangle is the dev-host visual check; the machine bar (0 EGL/GL errors + successful swaps) is met. **Dep:**
+  ONE new crate `khronos-egl 6.0` — zero new transitive (its `libloading 0.8` was already pulled by ash/wayland-sys; the
+  project's direct `libloading` dep moved `0.9 → 0.8` to UNIFY the tree, **removing** the duplicate 0.9 → net crate count
+  unchanged, §2.5). `unsafe` confined to the EGL/`wl_egl_window`/GLESv2 FFI bodies (dated `// SAFETY:`); reloc/elf/resolve/
+  ndk_registry stay `#![forbid(unsafe_code)]`. Cyber-safeguard NOT tripped (graphics/NDK-window work only — NO native-load
+  linker / apkenv / bionic_dlopen / ART nativeLoad touched). 4 new GPU-free unit tests (GLES2 config/context attribs,
+  geometry clamp, ANativeWindow reports published live geometry) + the `__gl-test` harness. Gate now **386 unit + 2
+  doctests** (fmt/build/clippy `-D warnings`/test/release all clean). See §6 (2026-06-05 engine GLES2/EGL surface).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3792,6 +3822,37 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (**382 unit + 2 doctests**) / release — all 0-warning/0-error (both crates). **NEXT (safeguard-gated, main-loop
   only):** the durable Rust-loader native-load integration so `System.loadLibrary` short-circuits to Eclipse's
   loaded-lib registry instead of re-entering the apkenv `apkenv_find_library` walk that now NULL-derefs.**
+- **2026-06-05 — engine GLES2/EGL render surface on Eclipse's window (the engine render path).** *Decision:* build the
+  engine's whole-window GL surface as a **separate render mode** from the Java-view Vulkan path, validated in isolation
+  now so it's ready when the boot clears the (safeguard-gated) native-load wall. *Why this shape:* libroblox is a
+  NativeActivity-style engine that renders every frame into an `ANativeWindow` via **EGL+GLES2** (91 EGL/GLES imports →
+  host Mesa, **0 Vulkan** — docs/libroblox-characterization.md); Eclipse only has to give it a real GL-capable surface on
+  the window it already opens with winit. *What:* `src/egl_engine.rs` — EGL display/context/window-surface on the winit
+  window's `raw-window-handle` (Wayland `wl_egl_window` / X11 XID, chosen at runtime — detect-don't-assume §9), a
+  hand-rolled typed GLESv2 binding dlsym'd from `libGLESv2.so.2`, and a `render_test_frames` (clear + compiled trivial
+  vert/frag shaders + one triangle + `eglSwapBuffers`) driven by the hidden `eclipse __gl-test` subcommand. ANativeWindow
+  natives are now **surface-backed**: `ANativeWindow_fromSurface`/`getWidth`/`getHeight` report Eclipse's **real live
+  window geometry** (`ndk_registry::set_engine_window_geometry`, published from the live window), handles stay in the sound
+  generational slab. *Dep decision (§2.5):* `khronos-egl 6` (`dynamic`) is the smallest sound EGL option (vs glutin, which
+  re-does window management Eclipse already owns); it dlopens host libEGL (matches the engine's own resolution model). Its
+  `libloading 0.8` was already in-tree (ash/wayland-sys), so the project's direct `libloading` moved `0.9 → 0.8` to unify —
+  **net zero** new crates beyond khronos-egl, and the duplicate 0.9 is gone. GLESv2 hand-rolled (not `glow`) to keep the
+  surface tight. *REAL vs DEFERRED:* REAL = the EGL/GLES2 surface + triangle render + present on Eclipse's window;
+  DEFERRED = routing the engine's OWN `eglCreateWindowSurface(ANativeWindow*)` onto it (WSI translation, lands at engine
+  frame-time). *Verification:* `cargo build --release && timeout 30 ./target/release/eclipse __gl-test` →
+  `EGL+GLES2 OK: surface 800x600, 5 frames rendered + presented, 0 GL errors, all swaps succeeded` (EXIT=0, deterministic
+  ×3; `/tmp/eclipse-gl-test.log`). *Same-pattern audit:* `getFormat`/`setBuffersGeometry`/`lock`/`unlockAndPost` are NOT
+  in libroblox's 5-symbol ANativeWindow import set (verified vs the engine) → not registered (no dead natives). *Regression
+  guard:* +4 GPU-free unit tests (GLES2 config/context attribs are EGL_NONE-terminated + request a GLES2 window RGBA8888
+  config / client-version-2; `WindowGeometry::from_physical` clamps to ≥1×1; `ANativeWindow_fromSurface` reports the
+  published live geometry). `demo_app` + `accelerometerdemo` Vulkan path UNCHANGED (graphics.rs untouched) — no regression.
+  *Cyber-safeguard: NOT tripped* — graphics + NDK-window natives + windowing only; NO native-load linker / apkenv /
+  `bionic_dlopen` / ART `nativeLoad` / `framework.rs` native-load sections touched. Context7: khronos-egl 6 API +
+  `eglChooseConfig`/`eglCreateWindowSurface` sequence (EGL Registry). Files: `src/egl_engine.rs` (new), `src/lib.rs`,
+  `src/main.rs`, `src/loader/ndk_registry.rs`, `src/loader/native_provider.rs`, `Cargo.toml`, `Cargo.lock`. *Gate:*
+  fmt --all --check / build --all-targets / clippy (-D warnings) / test (**386 unit + 2 doctests**) / release — all
+  0-warning/0-error. **NEXT:** the WSI bind (engine `ANativeWindow*` → this EGL surface) at engine frame-time, after the
+  safeguard-gated native-load integration lets the boot reach a frame.
 
 ---
 

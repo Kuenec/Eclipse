@@ -1035,11 +1035,19 @@ fn default_configuration() -> ConfigurationState {
     }
 }
 
-/// Eclipse's default [`NativeWindowState`]: the default portrait display geometry, RGBA8888.
+/// The [`NativeWindowState`] an `ANativeWindow_*` handle reports: the **real live geometry** of
+/// Eclipse's engine window when the run/test path has published it ([`ndk_registry::
+/// engine_window_geometry`] — the same window the engine's EGL surface presents to, see
+/// [`crate::egl_engine`]), else the documented portrait default (the window does not exist yet at
+/// engine-init time). 2026-06-05: this is the bind from the engine's `ANativeWindow` to Eclipse's
+/// real window — the geometry getters now answer with Eclipse's actual window size, not a fixed
+/// phone default, so the engine sizes its framebuffer correctly.
 fn default_native_window() -> NativeWindowState {
+    let (width, height) = ndk_registry::engine_window_geometry()
+        .unwrap_or((DEFAULT_DISPLAY_WIDTH_PX, DEFAULT_DISPLAY_HEIGHT_PX));
     NativeWindowState {
-        width: DEFAULT_DISPLAY_WIDTH_PX,
-        height: DEFAULT_DISPLAY_HEIGHT_PX,
+        width,
+        height,
         format: WINDOW_FORMAT_RGBA_8888,
     }
 }
@@ -1446,20 +1454,27 @@ unsafe extern "C" fn eclipse_alooper_removefd(looper: *mut c_void, fd: c_int) ->
     }
 }
 
-// ---- ANativeWindow (5) — SOUND-STUB: real geometry getters; refcount ops no-op ------------------
+// ---- ANativeWindow (5) — surface-backed: REAL live-window geometry; refcount ops no-op ----------
 //
-// 2026-06-05: `ANativeWindow_fromSurface` mints an Eclipse window handle holding the default display
-// geometry; the getters return that real geometry. The surface/buffer-presentation natives
-// (`setBuffersGeometry`/`lock`/`unlockAndPost`) are NOT in libroblox's 27-symbol set — when the
-// render integration lands they will route to the GLES2/EGL surface. `acquire`/`release` are correct
-// no-ops (Eclipse windows live for the process lifetime in the registry). DEFERRED-TO-RENDER for the
-// surface/buffer behavior; the geometry returned here is real.
+// 2026-06-05: `ANativeWindow_fromSurface` mints an Eclipse window handle holding the **real live
+// geometry of Eclipse's engine window** ([`ndk_registry::engine_window_geometry`], the same window
+// the engine's EGL surface presents to — see [`crate::egl_engine`]); the getters return that real
+// geometry (the documented portrait default only until the run/test path opens the window). REAL
+// (validated by `eclipse __gl-test`): the EGL/GLES2 render surface on that window. DEFERRED
+// (documented): the WSI translation that routes the engine's OWN `eglCreateWindowSurface(this
+// ANativeWindow*)` onto Eclipse's EGL surface — that lands when the boot clears the native-load wall
+// and the engine reaches a frame. `setBuffersGeometry`/`lock`/`unlockAndPost` are NOT in libroblox's
+// 5-symbol ANativeWindow import set (verified vs the engine), so they are intentionally not
+// registered (§ simplicity — dead natives that never bind). `acquire`/`release` are correct no-ops
+// (Eclipse windows live for the process lifetime in the registry).
 
 /// `ANativeWindow* ANativeWindow_fromSurface(JNIEnv* env, jobject surface)` — get a native window for
-/// a Java `Surface`. **sound-stub:** Eclipse mints an `ANativeWindow*` handle holding
-/// [`default_native_window`] (the real default display geometry); the actual GLES2/EGL surface
-/// binding is deferred to the render integration. Returns a valid Eclipse handle (so the getters
-/// return real geometry), or NULL on registry exhaustion — never a fake non-window pointer.
+/// a Java `Surface`. **surface-backed:** Eclipse mints an `ANativeWindow*` handle holding
+/// [`default_native_window`] (the **real live geometry** of Eclipse's window when published, else the
+/// portrait default); the getters then answer with Eclipse's actual window size. The engine's own
+/// `eglCreateWindowSurface` against this handle (the WSI bind) is the deferred render-integration
+/// step. Returns a valid Eclipse handle, or NULL on registry exhaustion — never a fake non-window
+/// pointer.
 ///
 /// # Safety
 /// `env`/`surface` are the JNI args; this native does not dereference them (the surface binding is
@@ -2600,6 +2615,27 @@ mod tests {
         // SAFETY: `stale` is fabricated; rejected.
         assert_eq!(unsafe { eclipse_anativewindow_getheight(stale) }, -1);
         // Free the live window's slot to keep the registry tidy.
+        ndk_registry::native_windows()
+            .remove(ptr_to_handle(win))
+            .ok();
+    }
+
+    #[test]
+    fn anativewindow_fromsurface_reports_published_live_window_geometry() {
+        // 2026-06-05: the engine's ANativeWindow geometry must reflect Eclipse's REAL live window
+        // (the EGL surface presents to it), not the fixed phone default. Publishing a geometry then
+        // minting a window must surface that geometry through the getters.
+        ndk_registry::set_engine_window_geometry(1600, 900);
+        // SAFETY: JNI args unused by the stub; any value accepted.
+        let win = unsafe {
+            eclipse_anativewindow_fromsurface(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert!(!win.is_null());
+        // SAFETY: `win` is a live Eclipse ANativeWindow*.
+        unsafe {
+            assert_eq!(eclipse_anativewindow_getwidth(win), 1600, "live width");
+            assert_eq!(eclipse_anativewindow_getheight(win), 900, "live height");
+        }
         ndk_registry::native_windows()
             .remove(ptr_to_handle(win))
             .ok();

@@ -68,6 +68,21 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Hidden dev-host diagnostic (NOT in HELP): build the ENGINE's GLES2/EGL render surface on an
+        // Eclipse window via host EGL/GLESv2, render + present a real triangle for a few frames, and
+        // assert 0 GL/EGL errors + successful swaps. Proves the engine GL render path on Eclipse's
+        // window independent of Roblox (the render path for when the boot clears the native-load
+        // wall). Needs a display server + GL (dev host); see src/egl_engine.rs.
+        Some("__gl-test") => match eclipse::egl_engine::run_gl_test() {
+            Ok(report) => {
+                println!("__gl-test: {report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("__gl-test: {e}");
+                ExitCode::FAILURE
+            }
+        },
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{HELP}");
             ExitCode::SUCCESS
