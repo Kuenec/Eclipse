@@ -56,7 +56,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // =================================================================================================
 // Public bionic ABI constants (documented values; the only contract this shim must match exactly).
@@ -1235,11 +1235,19 @@ static THREAD_REGISTRY: Mutex<Vec<(i32, ThreadEntry)>> = Mutex::new(Vec::new());
 
 /// The hand-off block the parent boxes and the trampoline consumes: the libroblox start routine + its
 /// arg, plus a futex slot the child publishes its TID into so `pthread_create` can return that TID.
+///
+/// 2026-06-05: `child_tid` is an `Arc<AtomicU32>`, NOT a field the trampoline frees with the rest of
+/// `SpawnArgs`. The parent keeps its own clone, so the slot lives until BOTH parent and child drop it
+/// — regardless of how soon `start()` returns. Co-owning the word is what removes the use-after-free:
+/// previously the parent read this word through a raw pointer into a `Box<SpawnArgs>` the child freed
+/// the instant its (possibly trivial) `start()` returned, so under load the parent read a freed/reused
+/// block (a concurrent creator's TID or heap garbage) instead of this child's real TID.
 struct SpawnArgs {
     start: extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
-    /// 0 until the child has published its TID here (then the parent reads it). A futex word.
-    child_tid: AtomicU32,
+    /// 0 until the child has published its TID here (then the parent reads it). A futex word,
+    /// co-owned with the parent so it outlives both the child's store and the parent's read.
+    child_tid: Arc<AtomicU32>,
 }
 
 /// The Eclipse trampoline the host OS thread actually starts on: publish this thread's TID (so the
@@ -1253,7 +1261,9 @@ extern "C" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
     // the host `pthread_create`; we own it here and reclaim it once.
     let boxed = unsafe { Box::from_raw(raw as *mut SpawnArgs) };
     let tid = gettid();
-    // Publish our TID + wake the parent (it parks on `child_tid == 0`).
+    // Publish our TID + wake the parent (it parks on `child_tid == 0`). The slot is the shared
+    // `Arc<AtomicU32>`; the parent holds its own clone, so the word stays alive for the parent's read
+    // even after this trampoline returns and frees `boxed`. 2026-06-05.
     boxed.child_tid.store(tid as u32, Ordering::Release);
     futex_wake_u32(&boxed.child_tid, 1);
     if trace_threads() {
@@ -1356,12 +1366,17 @@ unsafe extern "C" fn eclipse_pthread_create(
         unsafe { libc::pthread_attr_setstacksize(&mut host_attr, stacksize) };
     }
 
+    // The TID hand-off slot is co-owned: the parent keeps `child_tid` and passes a clone to the child
+    // in `SpawnArgs`. This is what makes the slot outlive both the child's store and the parent's read
+    // — the trampoline may free `SpawnArgs` the instant its `start()` returns, but the parent's clone
+    // keeps the word alive (2026-06-05 use-after-free fix).
+    let child_tid = Arc::new(AtomicU32::new(0));
     let spawn = Box::new(SpawnArgs {
         start,
         arg,
-        child_tid: AtomicU32::new(0),
+        child_tid: Arc::clone(&child_tid),
     });
-    // A raw pointer the parent keeps to read the published TID; ownership passes to the trampoline.
+    // Ownership of the box passes to the trampoline (it reclaims it via `Box::from_raw`).
     let spawn_ptr = Box::into_raw(spawn);
     let mut host_handle: libc::pthread_t = 0;
     // SAFETY: 2026-06-05 — `thread_trampoline` is a valid `extern "C"` entry of exactly the type
@@ -1385,19 +1400,15 @@ unsafe extern "C" fn eclipse_pthread_create(
         return rc;
     }
 
-    // Wait for the child to publish its TID (the bionic `pthread_t` we must return). The child stores
-    // its TID and futex-wakes us; loop to tolerate spurious wakes. The `SpawnArgs` is owned by the
-    // child now, but `child_tid` lives until the child reads `start`/`arg` — we only touch it via the
-    // raw pointer until we have the TID, and the child's `Box::from_raw` keeps the storage alive for
-    // the whole trampoline, so this read is valid until at least after the store+wake.
-    // SAFETY: 2026-06-05 — `spawn_ptr` points at the live `SpawnArgs` (the child has not freed it; it
-    // is dropped only when the trampoline's `Box` goes out of scope at thread end, long after the
-    // store+wake). Reading its `child_tid` atomically is sound.
-    let child_tid_ref: &AtomicU32 = unsafe { &(*spawn_ptr).child_tid };
-    let mut tid = child_tid_ref.load(Ordering::Acquire);
+    // Wait for the child to publish its TID (the bionic `pthread_t` we must return) on the slot WE
+    // co-own. The child stores its TID and futex-wakes us; loop to tolerate spurious wakes. Because
+    // `child_tid` is the parent's own `Arc<AtomicU32>` clone, the word stays alive and is exclusively
+    // this creation's slot — no raw pointer into the child-owned `SpawnArgs` (which may already be
+    // freed), and no cross-contamination with a concurrent `pthread_create`. 2026-06-05.
+    let mut tid = child_tid.load(Ordering::Acquire);
     while tid == 0 {
-        futex_wait_u32(child_tid_ref, 0);
-        tid = child_tid_ref.load(Ordering::Acquire);
+        futex_wait_u32(&child_tid, 0);
+        tid = child_tid.load(Ordering::Acquire);
     }
     let tid = tid as i32;
 
@@ -2371,6 +2382,62 @@ mod tests {
         // SAFETY: `tid` is no longer tracked (join consumed it).
         let again = unsafe { eclipse_pthread_join(tid, std::ptr::null_mut()) };
         assert_eq!(again, 3, "re-join of a consumed thread → ESRCH");
+    }
+
+    // 2026-06-05: regression guard for the child-TID hand-off use-after-free. Each created thread
+    // returns ITS OWN gettid() as the start-routine result; the invariant is that the pthread_t the
+    // parent received == the thread's own gettid (the bionic TID identity). `start` returns
+    // immediately so the trampoline frees its hand-off block at the earliest possible instant — the
+    // exact window in which a dangling read used to observe a freed/reused block (a concurrent
+    // creator's TID or heap garbage). Many threads × many rounds make a freed block get reused by a
+    // concurrent creator almost immediately; if the hand-off slot did not outlive the parent's read,
+    // some pthread_t would not equal its own gettid here.
+    #[test]
+    fn create_returns_each_childs_own_tid_under_heavy_parallel_load() {
+        extern "C" fn start(_arg: *mut c_void) -> *mut c_void {
+            // Return this thread's real kernel TID so join can compare it to the pthread_t the
+            // parent obtained for this exact thread.
+            gettid() as usize as *mut c_void
+        }
+
+        const N: usize = 64; // concurrent creators per round
+        const ROUNDS: usize = 16; // repeat to widen the race window
+        for _ in 0..ROUNDS {
+            // Each creator thread spawns one Eclipse thread, then joins it, and checks that the
+            // pthread_t it got back equals that child's own reported gettid().
+            let mut creators = Vec::with_capacity(N);
+            for _ in 0..N {
+                creators.push(std::thread::spawn(|| {
+                    let mut tid: usize = 0;
+                    let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+                    // SAFETY: `tp` is a valid `pthread_t*` out-param; `start` is a valid entry.
+                    let rc = unsafe {
+                        eclipse_pthread_create(
+                            tp,
+                            std::ptr::null(),
+                            Some(start),
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    assert_eq!(rc, 0, "create succeeds under load");
+                    assert!(tid != 0, "create wrote a non-zero pthread_t");
+
+                    let mut retval: *mut c_void = std::ptr::null_mut();
+                    // SAFETY: `tid` is the just-created joinable thread; `&mut retval` is writable.
+                    let jrc = unsafe { eclipse_pthread_join(tid, &mut retval) };
+                    assert_eq!(jrc, 0, "join succeeds under load");
+                    // THE INVARIANT: the pthread_t the parent received IS this child's own TID.
+                    assert_eq!(
+                        retval as usize, tid,
+                        "pthread_t returned by create must equal the child's own gettid() \
+                         (no dangling/cross-contaminated TID hand-off under parallel load)"
+                    );
+                }));
+            }
+            for c in creators {
+                c.join().expect("creator thread asserted TID identity");
+            }
+        }
     }
 
     #[test]
