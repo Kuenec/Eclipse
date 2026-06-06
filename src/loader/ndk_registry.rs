@@ -260,15 +260,15 @@ pub struct ConfigurationState {
     pub country: [u8; 2],
 }
 
-/// State behind an `ALooper*` handle: a minimal Eclipse per-thread looper. Holds only the registered
-/// fd identifiers (so `addFd`/`removeFd` are bookkeeping-correct); the real epoll/event wiring is
-/// deferred (the looper has no event source until the render/input integration). See the looper
-/// natives' docs for the documented poll sentinels.
-#[derive(Debug, Default)]
+/// State behind an `ALooper*` handle: a real, wakeable Eclipse per-thread looper. Owns a wake
+/// `eventfd` + the registered `(fd, ident, events)` poll set; `ALooper_pollOnce` does a genuine
+/// `poll(2)` over them. See [`super::looper::Looper`] for the event model. (2026-06-05: upgraded from
+/// the prior bookkeeping-only fd list — the looper now actually blocks/wakes on its fds.)
+#[derive(Debug)]
 pub struct LooperState {
-    /// Registered `(fd, ident)` pairs from `ALooper_addFd`, removed by `ALooper_removeFd`. Tracked so
-    /// add/remove return contract-correct values; not yet polled (no event source).
-    pub fds: Vec<(i32, i32)>,
+    /// The real fd-backed looper this handle drives. `ALooper_addFd`/`removeFd`/`pollOnce` operate on
+    /// it; `ALooper_prepare` constructs it (an `eventfd` is allocated then).
+    pub looper: super::looper::Looper,
 }
 
 /// State behind an `ANativeWindow*` handle: the window geometry the getters return. Sound for the
@@ -419,6 +419,40 @@ pub fn loopers() -> &'static Slab<LooperState> {
     &S
 }
 
+/// Process-global list of every prepared looper's wake handle, so the winit input feed can wake a
+/// parked `ALooper_pollOnce` **without** taking the [`loopers`] slab mutex (which a parked poll could
+/// be holding-snapshot-of — see [`super::looper`] lock discipline).
+///
+/// 2026-06-05: Roblox's engine threads each `ALooper_prepare` a looper and park in `pollOnce` on their
+/// own input source. A host input event is a liveness signal that the engine's loopers should re-check
+/// their sources, so the engine-path winit feed [`wake_all_loopers`] every registered waker. The
+/// `Waker` is a cheap `Arc<eventfd>` clone; waking is lock-free and best-effort.
+static LOOPER_WAKERS: Mutex<Vec<super::looper::Waker>> = Mutex::new(Vec::new());
+
+/// Register a prepared looper's [`super::looper::Waker`] so [`wake_all_loopers`] can wake it. Called by
+/// `ALooper_prepare` after it builds the real looper. Idempotent per looper is not required (each
+/// `prepare` of a new looper adds one); the list is process-lifetime (loopers are not freed).
+pub fn register_looper_waker(waker: super::looper::Waker) {
+    if let Ok(mut wakers) = LOOPER_WAKERS.lock() {
+        wakers.push(waker);
+    }
+}
+
+/// Wake every registered looper (the engine-path winit input feed calls this on a host input event so
+/// a parked `ALooper_pollOnce` returns `ALOOPER_POLL_WAKE` and the engine thread re-checks its input).
+/// Lock-free per waker (each is an `Arc<eventfd>` write); returns the number of loopers woken.
+pub fn wake_all_loopers() -> usize {
+    match LOOPER_WAKERS.lock() {
+        Ok(wakers) => {
+            for w in wakers.iter() {
+                w.wake();
+            }
+            wakers.len()
+        }
+        Err(_) => 0,
+    }
+}
+
 /// The process-global `ANativeWindow*` slab.
 pub fn native_windows() -> &'static Slab<NativeWindowState> {
     static S: Slab<NativeWindowState> = Slab::new();
@@ -470,20 +504,24 @@ mod tests {
     #[test]
     fn freed_handle_is_stale_and_does_not_alias_reused_slot() {
         let s = loopers();
-        let old = s.insert(LooperState::default()).expect("insert old");
-        s.with(old, |l| l.fds.push((7, 1))).expect("use old");
+        let make = || LooperState {
+            looper: super::super::looper::Looper::new().expect("eventfd"),
+        };
+        let old = s.insert(make()).expect("insert old");
+        s.with(old, |l| l.looper.add_fd(7, 1, 1)).expect("use old");
         s.remove(old).expect("remove old");
         // Reuse pops the freed slot with a bumped generation.
-        let new = s.insert(LooperState::default()).expect("insert new");
+        let new = s.insert(make()).expect("insert new");
         // The OLD handle must now be Stale — never reading/writing the NEW occupant.
         assert_eq!(
-            s.with(old, |l| l.fds.len()),
+            s.with(old, |l| l.looper.remove_fd(7)),
             Err(NdkRegistryError::StaleHandle),
             "a freed handle must be StaleHandle, never alias the reused slot"
         );
+        // The live handle addresses the reused (freshly-constructed) slot — its looper has no fds.
         assert_eq!(
-            s.with(new, |l| l.fds.len()),
-            Ok(0),
+            s.with(new, |l| l.looper.remove_fd(7)),
+            Ok(false),
             "the live handle addresses the reused (cleared) slot"
         );
         s.remove(new).expect("remove new");

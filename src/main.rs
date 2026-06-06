@@ -100,6 +100,22 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Hidden dev-host diagnostic (NOT in HELP): drive the REAL ALooper input path end-to-end
+        // without the boot reaching the engine's input loop — prepare a looper, register a synthetic
+        // engine input fd, inject a synthetic input (fd signal) + a host-input wake, and assert
+        // ALooper_pollOnce delivers the registered ident then ALOOPER_POLL_WAKE. Proves the
+        // winit-input → looper feed unblocks a parked engine poll. GPU/VM-free. See
+        // src/loader/native_provider.rs::run_input_test.
+        Some("__input-test") => match eclipse::loader::native_provider::run_input_test() {
+            Ok(report) => {
+                println!("__input-test: {report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("__input-test: {e}");
+                ExitCode::FAILURE
+            }
+        },
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{HELP}");
             ExitCode::SUCCESS
