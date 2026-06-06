@@ -331,6 +331,70 @@ pub fn engine_window_geometry() -> Option<(i32, i32)> {
     ENGINE_WINDOW_GEOMETRY.lock().ok().and_then(|g| *g)
 }
 
+/// The engine render WSI bind: a map from the **real WSI native-window pointer** (a Wayland
+/// `wl_egl_window*` / an X11 XID, as a `usize`) to that window's geometry.
+///
+/// 2026-06-05 — why this exists: Roblox's native engine creates its OWN EGL surface by calling host
+/// `eglCreateWindowSurface(display, config, (EGLNativeWindowType)<the `ANativeWindow*` it got from
+/// `ANativeWindow_fromSurface`>, …)`. For that surface to land on Eclipse's window, the
+/// `ANativeWindow*` Eclipse hands the engine must BE the real WSI handle host EGL accepts. So
+/// `ANativeWindow_fromSurface` returns that real WSI pointer (owned by [`crate::egl_engine::
+/// EngineNativeWindow`], which lives on the main thread alongside the `winit` window), and this map
+/// lets the geometry natives (`ANativeWindow_getWidth`/`getHeight`), which take that pointer back,
+/// answer with the real size — a bounds-safe table lookup (unknown pointer → `None` → the NDK `-1`
+/// sentinel), never a dereference of an engine-supplied pointer. Only the pointer **value** + the
+/// geometry (both `Copy`) cross into this process-global table; the `EngineNativeWindow` itself never
+/// leaves its owning thread.
+static WSI_WINDOWS: Mutex<Vec<(usize, (i32, i32))>> = Mutex::new(Vec::new());
+
+/// Register a real WSI native-window pointer + its geometry as the backing for the engine's
+/// `ANativeWindow*`. Idempotent on the pointer (re-registering updates the geometry). A poisoned
+/// lock is ignored (best-effort; never panics — AGENTS.md §2.8).
+pub fn register_wsi_window(native_window: usize, width: i32, height: i32) {
+    if native_window == 0 {
+        return; // a NULL pointer is never a valid WSI window (reserved as the ANativeWindow NULL).
+    }
+    if let Ok(mut v) = WSI_WINDOWS.lock() {
+        let geo = (width.max(1), height.max(1));
+        if let Some(entry) = v.iter_mut().find(|(p, _)| *p == native_window) {
+            entry.1 = geo;
+        } else {
+            v.push((native_window, geo));
+        }
+    }
+}
+
+/// Remove a WSI native-window pointer registered by [`register_wsi_window`] (called when its owning
+/// [`crate::egl_engine::EngineNativeWindow`] is torn down). A poisoned lock / unknown pointer is a
+/// no-op; never panics.
+pub fn unregister_wsi_window(native_window: usize) {
+    if let Ok(mut v) = WSI_WINDOWS.lock() {
+        v.retain(|(p, _)| *p != native_window);
+    }
+}
+
+/// The geometry registered for a WSI native-window pointer, or `None` if it is not a known WSI
+/// window (a fabricated/stale `ANativeWindow*` → `None` → the geometry native returns the NDK `-1`
+/// sentinel, never a dereference). Poisoned lock → `None`.
+pub fn wsi_window_geometry(native_window: usize) -> Option<(i32, i32)> {
+    WSI_WINDOWS
+        .lock()
+        .ok()
+        .and_then(|v| v.iter().find(|(p, _)| *p == native_window).map(|(_, g)| *g))
+}
+
+/// The real WSI native-window pointer Eclipse currently exposes (the most recently registered — there
+/// is one Eclipse window), or `None` if the render path has not built an
+/// [`crate::egl_engine::EngineNativeWindow`] yet. `ANativeWindow_fromSurface` returns this so the
+/// `ANativeWindow*` the engine gets IS the real WSI handle host EGL accepts; when `None` the native
+/// falls back to a sound geometry-only handle (the window does not exist yet at that point).
+pub fn current_wsi_window() -> Option<usize> {
+    WSI_WINDOWS
+        .lock()
+        .ok()
+        .and_then(|v| v.last().map(|(p, _)| *p))
+}
+
 /// The process-global `AAssetManager*` slab.
 pub fn asset_managers() -> &'static Slab<AssetManagerState> {
     static S: Slab<AssetManagerState> = Slab::new();
@@ -461,6 +525,66 @@ mod tests {
             Err(NdkRegistryError::StaleHandle),
             "a second free of the same handle is StaleHandle, not corruption"
         );
+    }
+
+    // Serializes the WSI-window-registry tests (the registry is process-global). 2026-06-05.
+    static WSI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn wsi_window_register_lookup_unregister_round_trips() {
+        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p: usize = 0x5000_1000;
+        register_wsi_window(p, 1280, 720);
+        assert_eq!(
+            wsi_window_geometry(p),
+            Some((1280, 720)),
+            "a registered WSI pointer resolves to its geometry"
+        );
+        assert_eq!(
+            current_wsi_window(),
+            Some(p),
+            "the registered WSI pointer is the current one"
+        );
+        // Re-registering the same pointer updates the geometry (a resize), not a duplicate.
+        register_wsi_window(p, 800, 600);
+        assert_eq!(
+            wsi_window_geometry(p),
+            Some((800, 600)),
+            "re-register updates geometry"
+        );
+        unregister_wsi_window(p);
+        assert_eq!(
+            wsi_window_geometry(p),
+            None,
+            "an unregistered WSI pointer is unknown → the getter returns the NDK -1 sentinel"
+        );
+    }
+
+    #[test]
+    fn wsi_window_rejects_null_and_unknown_pointers() {
+        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A NULL pointer is reserved as the ANativeWindow NULL → never registered.
+        register_wsi_window(0, 100, 100);
+        assert_eq!(
+            wsi_window_geometry(0),
+            None,
+            "NULL is never a valid WSI window"
+        );
+        // An unknown (fabricated) pointer resolves to None, never a wild read.
+        assert_eq!(
+            wsi_window_geometry(0xDEAD_BEEF),
+            None,
+            "an unknown pointer is None"
+        );
+        // Geometry is clamped to ≥ 1×1 (a zero dimension is not a valid surface size).
+        let p: usize = 0x5000_2000;
+        register_wsi_window(p, 0, 0);
+        assert_eq!(
+            wsi_window_geometry(p),
+            Some((1, 1)),
+            "zero geometry clamps to 1×1"
+        );
+        unregister_wsi_window(p);
     }
 
     #[test]

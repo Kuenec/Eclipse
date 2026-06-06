@@ -83,6 +83,23 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Hidden dev-host diagnostic (NOT in HELP): the engine render WSI bind. Go through the
+        // engine's exact path — obtain an ANativeWindow* via the bound ANativeWindow_fromSurface
+        // native, then drive HOST eglCreateWindowSurface(display, config, the ANativeWindow as
+        // EGLNativeWindowType, null) + make-current + a real triangle + eglSwapBuffers, asserting the
+        // ANativeWindow* is the real WSI handle, surface creation succeeds, 0 GL errors, swaps OK.
+        // Proves the engine's own eglCreateWindowSurface(ANativeWindow) presents to Eclipse's window.
+        // Needs a display server + GL (dev host); see src/egl_engine.rs::run_gl_test_anw.
+        Some("__gl-test-anw") => match eclipse::egl_engine::run_gl_test_anw() {
+            Ok(report) => {
+                println!("__gl-test-anw: {report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("__gl-test-anw: {e}");
+                ExitCode::FAILURE
+            }
+        },
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{HELP}");
             ExitCode::SUCCESS

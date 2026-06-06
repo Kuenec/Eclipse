@@ -174,14 +174,14 @@ pub struct EngineGlSurface {
     /// The dlopened host `libGLESv2.so.2` + its resolved entry points (kept alive for the surface's
     /// lifetime; the library must outlive every call through it).
     gl: Gles2,
-    /// The Wayland `wl_egl_window` (with its owning `libwayland-egl` library), if this is a Wayland
-    /// surface. `None` on X11 (the XID is used directly). Held purely for RAII: the EGL surface
-    /// references the `wl_egl_window`, so this must outlive it and is destroyed *after* the EGL
-    /// surface (field drop order is declaration order; this is declared after `surface`). It is never
-    /// read after construction — 2026-06-05: `#[allow(dead_code)]` is the correct annotation for a
-    /// drop-guard field, justified here per AGENTS.md §2.2.
+    /// The platform WSI native window the EGL surface was created over (Wayland `wl_egl_window` +
+    /// its owning `libwayland-egl`; or the X11 XID). Held purely for RAII: the EGL surface references
+    /// this native window, so it must outlive it and is destroyed *after* the EGL surface (field drop
+    /// order is declaration order; this is declared after `surface`). It is never read after
+    /// construction — 2026-06-05: `#[allow(dead_code)]` is the correct annotation for a drop-guard
+    /// field, justified here per AGENTS.md §2.2.
     #[allow(dead_code)]
-    wl_window: Option<WaylandEglWindow>,
+    native: EngineNativeWindow,
     geometry: WindowGeometry,
 }
 
@@ -195,6 +195,46 @@ impl EngineGlSurface {
     pub fn new(
         display_handle: RawDisplayHandle,
         window_handle: RawWindowHandle,
+        geometry: WindowGeometry,
+    ) -> Result<Self, EglError> {
+        // Build the REAL WSI native window — the EGLNativeWindowType host EGL accepts (Wayland
+        // `wl_egl_window*` from the `wl_surface`; X11 XID). This is the SAME native-window object the
+        // engine path exposes as the `ANativeWindow*` (see [`EngineNativeWindow`]); this surface owns
+        // its own here for the `__gl-test` path.
+        let native = EngineNativeWindow::new(window_handle, geometry)?;
+        Self::build(display_handle, native, geometry)
+    }
+
+    /// Build the EGL/GLES2 surface over an **engine-supplied** `ANativeWindow*` (an
+    /// `EGLNativeWindowType`) — the exact thing the engine does: it got the `ANativeWindow*` from
+    /// `ANativeWindow_fromSurface` (the real WSI handle Eclipse owns) and calls host
+    /// `eglCreateWindowSurface(display, config, that pointer, …)`. Eclipse renders over the
+    /// engine-owned window without owning/freeing it. Used by the `eclipse __gl-test-anw` validation.
+    ///
+    /// # Safety
+    /// `native_window` must be a valid `EGLNativeWindowType` (a `wl_egl_window*` / XID) for
+    /// `display_handle`'s display, alive for the returned surface's lifetime.
+    pub fn from_ndk_window(
+        display_handle: RawDisplayHandle,
+        native_window: egl::NativeWindowType,
+        geometry: WindowGeometry,
+    ) -> Result<Self, EglError> {
+        Self::build(
+            display_handle,
+            EngineNativeWindow::borrowed(native_window, geometry),
+            geometry,
+        )
+    }
+
+    /// Shared EGL/GLES2 bring-up over a constructed [`EngineNativeWindow`] (owned or borrowed).
+    ///
+    /// Steps (Khronos EGL Registry reference sequence, Context7 2026-06-05): load host EGL →
+    /// `eglGetDisplay`(native display) → `eglInitialize` → `eglChooseConfig`(GLES2) → `eglBindAPI`
+    /// (ES) → `eglCreateContext`(v2) → `eglCreateWindowSurface`(native window) → `eglMakeCurrent` →
+    /// load GLES2. Any failure is a typed [`EglError`].
+    fn build(
+        display_handle: RawDisplayHandle,
+        native: EngineNativeWindow,
         geometry: WindowGeometry,
     ) -> Result<Self, EglError> {
         // Load host libEGL.so.1 (detect-don't-assume §9). The `.1` soname is the stable ABI name.
@@ -237,22 +277,12 @@ impl EngineGlSurface {
             .create_context(display, config, None, &gles2_context_attribs())
             .map_err(EglError::Context)?;
 
-        // Build the platform native window: Wayland needs a wl_egl_window wrapping the wl_surface;
-        // X11 uses the XID directly as the EGLNativeWindowType.
-        let (native_window, wl_window): (egl::NativeWindowType, Option<WaylandEglWindow>) =
-            match window_handle {
-                RawWindowHandle::Wayland(w) => {
-                    let wl = WaylandEglWindow::new(w.surface.as_ptr(), geometry)?;
-                    (wl.as_native_window(), Some(wl))
-                }
-                RawWindowHandle::Xlib(w) => (w.window as egl::NativeWindowType, None),
-                _ => return Err(EglError::UnsupportedDisplay),
-            };
-
-        // SAFETY: `native_window` is a valid wl_egl_window*/XID for this display, kept alive in
-        // `wl_window` (Wayland) or owned by the winit window (X11), both outliving this surface.
+        // SAFETY: `native.as_native_window()` is a valid wl_egl_window*/XID for this display, kept
+        // alive in `native` (Wayland) / owned by the winit window (X11) / engine-owned (Borrowed),
+        // all outliving this surface. A bad native window surfaces as `EglError::Surface`
+        // (EGL_BAD_NATIVE_WINDOW), never UB.
         let surface = unsafe {
-            egl.create_window_surface(display, config, native_window, None)
+            egl.create_window_surface(display, config, native.as_native_window(), None)
                 .map_err(EglError::Surface)?
         };
 
@@ -268,7 +298,7 @@ impl EngineGlSurface {
             context,
             surface,
             gl,
-            wl_window,
+            native,
             geometry,
         })
     }
@@ -320,13 +350,133 @@ impl Drop for EngineGlSurface {
         let _ = self.egl.make_current(self.display, None, None, None);
         let _ = self.egl.destroy_surface(self.display, self.surface);
         let _ = self.egl.destroy_context(self.display, self.context);
-        // `wl_window` drops after this, destroying the wl_egl_window the EGL surface referenced.
+        // `native` drops after this, destroying the WSI window (e.g. the wl_egl_window) the EGL
+        // surface referenced.
     }
 }
 
 // =================================================================================================
-// Wayland: wl_egl_window from libwayland-egl.so.1 (dlopened on demand).
+// EngineNativeWindow — the REAL WSI native window Eclipse owns and exposes as the ANativeWindow*.
 // =================================================================================================
+
+/// The real platform WSI native window for Eclipse's `winit` window — the exact handle host EGL's
+/// `eglCreateWindowSurface` accepts as its `EGLNativeWindowType` (Khronos EGL Registry, Context7
+/// 2026-06-05): on **Wayland** a `wl_egl_window*` created from the window's `wl_surface` at the
+/// window size; on **X11** the window's XID.
+///
+/// 2026-06-05 — the engine render WSI bind: Roblox's native engine creates its OWN EGL context +
+/// surface by calling host `eglCreateWindowSurface(display, config, (EGLNativeWindowType)<the
+/// ANativeWindow* it got from `ANativeWindow_fromSurface`>, …)`. For that to land on Eclipse's
+/// window, the `ANativeWindow*` it receives must BE this real WSI handle. So **Eclipse owns this
+/// native window object and hands its pointer out as the `ANativeWindow*`**; it does NOT pre-create
+/// a competing EGL context on the engine path (the engine owns its context — two contexts must not
+/// fight over one surface). The `__gl-test`/`__gl-test-anw` paths and [`EngineGlSurface`] reuse the
+/// SAME construction so the validation exercises exactly what the engine does.
+///
+/// The pointer [`as_native_window`](Self::as_native_window) returns is stable for this object's
+/// lifetime; the underlying `wl_egl_window`/XID is destroyed (Wayland) or simply forgotten (X11, the
+/// `winit` window owns the X resource) on [`Drop`].
+pub struct EngineNativeWindow {
+    /// The platform-specific backing: a dlopened `wl_egl_window` (Wayland) or a bare XID (X11). Held
+    /// purely as a drop guard (the Wayland variant frees its `wl_egl_window` on [`Drop`]); never read
+    /// after construction. 2026-06-05.
+    #[allow(dead_code)]
+    backing: NativeWindowBacking,
+    /// The `EGLNativeWindowType` pointer host EGL (and the engine's own EGL) accept: the
+    /// `wl_egl_window*` (Wayland) or the XID re-interpreted as a pointer (X11). Stable for the
+    /// object's lifetime; this is also the value handed out as the `ANativeWindow*`.
+    native_window: *mut c_void,
+    geometry: WindowGeometry,
+}
+
+/// The platform-specific resource an [`EngineNativeWindow`] owns (or, on X11/Borrowed, borrows).
+enum NativeWindowBacking {
+    /// A Wayland `wl_egl_window` (with its owning `libwayland-egl` library). Held purely as a drop
+    /// guard — its [`Drop`] frees the `wl_egl_window`; the field is never read. 2026-06-05.
+    Wayland(#[allow(dead_code)] WaylandEglWindow),
+    /// An X11 window: the XID is owned by the `winit` window, so there is nothing to free here. The
+    /// XID itself is stored in [`EngineNativeWindow::native_window`].
+    X11,
+    /// A native window owned by someone else (the engine supplies the `ANativeWindow*`; Eclipse only
+    /// renders an EGL surface over it). Nothing is freed and the WSI map is NOT touched — the owner
+    /// (the real [`EngineNativeWindow`]) handles registration/teardown.
+    Borrowed,
+}
+
+impl EngineNativeWindow {
+    /// Build the real WSI native window for `window_handle` at `geometry`. Chosen at runtime from the
+    /// `RawWindowHandle` variant (detect-don't-assume §9): Wayland → a `wl_egl_window` from the
+    /// `wl_surface`; X11 → the XID. An unsupported display server is a typed [`EglError`].
+    pub fn new(window_handle: RawWindowHandle, geometry: WindowGeometry) -> Result<Self, EglError> {
+        let window = match window_handle {
+            RawWindowHandle::Wayland(w) => {
+                let wl = WaylandEglWindow::new(w.surface.as_ptr(), geometry)?;
+                let native_window = wl.window;
+                Self {
+                    backing: NativeWindowBacking::Wayland(wl),
+                    native_window,
+                    geometry,
+                }
+            }
+            RawWindowHandle::Xlib(w) => Self {
+                backing: NativeWindowBacking::X11,
+                // The X `Window` (XID) is the EGLNativeWindowType directly. Stored as a pointer-sized
+                // value (the C `EGLNativeWindowType` on X11 is an unsigned long = the XID).
+                native_window: w.window as *mut c_void,
+                geometry,
+            },
+            _ => return Err(EglError::UnsupportedDisplay),
+        };
+        // Publish this real WSI pointer + geometry so the `ANativeWindow_*` geometry natives, which
+        // take the pointer back, resolve it to the real size (the engine render WSI bind). Unregistered
+        // on Drop.
+        crate::loader::ndk_registry::register_wsi_window(
+            window.native_window as usize,
+            geometry.width,
+            geometry.height,
+        );
+        Ok(window)
+    }
+
+    /// Wrap an externally-owned native window pointer (the engine path: the engine supplies the
+    /// `ANativeWindow*` it got from `ANativeWindow_fromSurface`; Eclipse renders an EGL surface over
+    /// it without owning/freeing it or touching the WSI map). The pointer must be a valid
+    /// `EGLNativeWindowType` for the current display, alive for the surface's lifetime.
+    #[must_use]
+    pub fn borrowed(native_window: egl::NativeWindowType, geometry: WindowGeometry) -> Self {
+        Self {
+            backing: NativeWindowBacking::Borrowed,
+            native_window,
+            geometry,
+        }
+    }
+
+    /// The `EGLNativeWindowType` pointer — what host EGL's `eglCreateWindowSurface` accepts, and the
+    /// value Eclipse hands the engine as the `ANativeWindow*`. Stable for this object's lifetime.
+    #[must_use]
+    pub fn as_native_window(&self) -> egl::NativeWindowType {
+        self.native_window
+    }
+
+    /// The window geometry this WSI window was created at (`ANativeWindow_getWidth`/`getHeight`).
+    #[must_use]
+    pub fn geometry(&self) -> WindowGeometry {
+        self.geometry
+    }
+}
+
+impl Drop for EngineNativeWindow {
+    fn drop(&mut self) {
+        // A Borrowed wrapper never registered the pointer (its owner did) — leave the WSI map alone.
+        if matches!(self.backing, NativeWindowBacking::Borrowed) {
+            return;
+        }
+        // Unregister the WSI pointer→geometry mapping BEFORE `backing` drops and frees the underlying
+        // window (the pointer value is still the table key here). After this, a getter for the now-gone
+        // pointer returns the NDK `-1` sentinel rather than stale geometry.
+        crate::loader::ndk_registry::unregister_wsi_window(self.native_window as usize);
+    }
+}
 
 /// A Wayland `wl_egl_window` wrapping a `wl_surface`, plus the `libwayland-egl` library it came from.
 /// The EGL window surface is created over this; it must outlive that surface (dropped after it).
@@ -370,11 +520,6 @@ impl WaylandEglWindow {
                 destroy,
             })
         }
-    }
-
-    /// The `wl_egl_window*` as an `EGLNativeWindowType`.
-    fn as_native_window(&self) -> egl::NativeWindowType {
-        self.window
     }
 }
 
@@ -777,6 +922,166 @@ pub fn run_gl_test() -> Result<GlTestReport, EglError> {
     let event_loop =
         EventLoop::new().map_err(|e| EglError::Display(format!("winit event loop: {e}")))?;
     let mut app = GlTestApp {
+        outcome: None,
+        window: None,
+        create_error: None,
+    };
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| EglError::Display(format!("winit run_app: {e}")))?;
+    if let Some(e) = app.create_error {
+        return Err(EglError::Display(format!("failed to create window: {e}")));
+    }
+    app.outcome.unwrap_or(Err(EglError::Display(
+        "harness produced no render outcome".into(),
+    )))
+}
+
+// =================================================================================================
+// `eclipse __gl-test-anw` harness — the ENGINE-STYLE WSI bind validation.
+//
+// 2026-06-05: this proves the engine render WSI bind WITHOUT needing the boot to reach a frame. It
+// goes through the engine's exact path: obtain an `ANativeWindow*` via the BOUND
+// `ANativeWindow_fromSurface` native (resolved through the Eclipse native provider, as the engine's
+// relocation would), then call HOST EGL itself — `eglGetDisplay`/`eglInitialize`/`eglChooseConfig`/
+// `eglCreateContext` + `eglCreateWindowSurface(display, config, the ANativeWindow as
+// EGLNativeWindowType, null)` + `eglMakeCurrent` + render a triangle + `eglSwapBuffers` — exactly
+// what the engine does. Eclipse OWNS the WSI window (the `EngineNativeWindow`) and does NOT pre-create
+// a competing context on this path; the surface is created over the engine-supplied `ANativeWindow*`.
+// Success bar: surface creation succeeds (no EGL_BAD_NATIVE_WINDOW), the `ANativeWindow*` IS the real
+// WSI handle, 0 GL errors, every swap succeeds.
+// =================================================================================================
+
+/// Result of the `__gl-test-anw` engine-style render: the geometry, frames, and whether the
+/// `ANativeWindow*` the bound native returned was the real WSI handle (vs the geometry-only fallback).
+#[derive(Debug)]
+pub struct GlAnwTestReport {
+    /// The window geometry the surface was built at (Eclipse's real window size).
+    pub geometry: WindowGeometry,
+    /// Frames rendered + presented through the engine-supplied `ANativeWindow*`.
+    pub frames: u32,
+    /// True if `ANativeWindow_fromSurface` returned the real WSI native-window pointer (the host-EGL
+    /// `EGLNativeWindowType`), i.e. the engine's own `eglCreateWindowSurface` lands on Eclipse's
+    /// window — the load-bearing assertion of this harness.
+    pub anw_is_real_wsi_handle: bool,
+}
+
+impl fmt::Display for GlAnwTestReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "engine-style eglCreateWindowSurface(ANativeWindow) OK: surface {}x{}, {} frames presented, \
+             ANativeWindow* is the real WSI handle = {}, 0 GL errors, all swaps succeeded",
+            self.geometry.width, self.geometry.height, self.frames, self.anw_is_real_wsi_handle
+        )
+    }
+}
+
+/// The `__gl-test-anw` winit application: creates one window, builds the WSI window Eclipse owns,
+/// obtains the `ANativeWindow*` via the bound native, then renders engine-style over it.
+struct GlAnwTestApp {
+    outcome: Option<Result<GlAnwTestReport, EglError>>,
+    window: Option<Window>,
+    create_error: Option<winit::error::OsError>,
+}
+
+impl GlAnwTestApp {
+    /// The engine-style WSI bind on `window`: build the WSI window Eclipse owns + register it, obtain
+    /// the `ANativeWindow*` via the bound native, assert it is the real WSI handle, then drive host
+    /// EGL over that `ANativeWindow*` (the engine's own path) and render.
+    fn render_engine_style(window: &Window) -> Result<GlAnwTestReport, EglError> {
+        let display_handle = window
+            .display_handle()
+            .map_err(|e| EglError::Display(format!("no raw display handle: {e}")))?
+            .as_raw();
+        let window_handle = window
+            .window_handle()
+            .map_err(|e| EglError::WaylandEgl(format!("no raw window handle: {e}")))?
+            .as_raw();
+        let size = window.inner_size();
+        let geometry = WindowGeometry::from_physical(size.width, size.height);
+
+        // 1) Eclipse OWNS the real WSI native window (and registers it so the ANativeWindow_* natives
+        //    resolve to it). Kept alive for the whole engine-style render below.
+        let owned = EngineNativeWindow::new(window_handle, geometry)?;
+        let real_wsi = owned.as_native_window() as usize;
+
+        // 2) Obtain the ANativeWindow* the engine would get — through the BOUND native (resolved via
+        //    the Eclipse native provider, as the engine's relocation does). It must be the real WSI
+        //    handle so the engine's own eglCreateWindowSurface lands on Eclipse's window.
+        let anw = crate::loader::native_provider::anativewindow_from_surface_via_provider()
+            .ok_or_else(|| EglError::Display("ANativeWindow_fromSurface not bound".into()))?;
+        let anw_is_real_wsi_handle = anw as usize == real_wsi && !anw.is_null();
+        if !anw_is_real_wsi_handle {
+            return Err(EglError::Surface(egl::Error::BadNativeWindow));
+        }
+
+        // 3) Engine-style: host EGL creates its surface over the engine-supplied ANativeWindow* (as
+        //    the EGLNativeWindowType). EngineGlSurface::from_ndk_window does NOT create its own native
+        //    window — it renders over `anw`, exactly as the engine's eglCreateWindowSurface does.
+        let surface = EngineGlSurface::from_ndk_window(
+            display_handle,
+            anw as egl::NativeWindowType,
+            geometry,
+        )?;
+        render_test_frames(&surface, GL_TEST_FRAMES)?;
+        // `surface` drops here (EGL torn down), then `owned` drops (WSI window freed + unregistered).
+        drop(surface);
+        drop(owned);
+        Ok(GlAnwTestReport {
+            geometry,
+            frames: GL_TEST_FRAMES,
+            anw_is_real_wsi_handle,
+        })
+    }
+}
+
+impl ApplicationHandler for GlAnwTestApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let attrs = Window::default_attributes()
+            .with_title("Eclipse __gl-test-anw (engine WSI bind: ANativeWindow → host EGL)");
+        match event_loop.create_window(attrs) {
+            Ok(window) => {
+                let size = window.inner_size();
+                let geo = WindowGeometry::from_physical(size.width, size.height);
+                crate::loader::ndk_registry::set_engine_window_geometry(geo.width, geo.height);
+                window.request_redraw();
+                self.window = Some(window);
+            }
+            Err(e) => {
+                self.create_error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested if self.outcome.is_none() => {
+                let result = self.window.as_ref().map_or_else(
+                    || Err(EglError::UnsupportedDisplay),
+                    Self::render_engine_style,
+                );
+                self.outcome = Some(result);
+                event_loop.exit();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Run the `eclipse __gl-test-anw` harness: prove the engine render WSI bind by going through the
+/// engine's exact path — obtain an `ANativeWindow*` via the bound `ANativeWindow_fromSurface` native,
+/// then drive host `eglCreateWindowSurface(display, config, the ANativeWindow as EGLNativeWindowType,
+/// null)` + make-current + a real triangle render + `eglSwapBuffers`, asserting the `ANativeWindow*`
+/// is the real WSI handle, surface creation succeeds (no EGL_BAD_NATIVE_WINDOW), 0 GL errors, and
+/// every swap succeeds. This is the real proof the engine's own `eglCreateWindowSurface(ANativeWindow)`
+/// will present to Eclipse's window. Dev-host / main-loop only (opens a real window + drives a GPU).
+pub fn run_gl_test_anw() -> Result<GlAnwTestReport, EglError> {
+    let event_loop =
+        EventLoop::new().map_err(|e| EglError::Display(format!("winit event loop: {e}")))?;
+    let mut app = GlAnwTestApp {
         outcome: None,
         window: None,
         create_error: None,

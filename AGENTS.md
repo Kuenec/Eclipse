@@ -706,6 +706,39 @@ before any history-rewriting/force operation.
   linker / apkenv / bionic_dlopen / ART nativeLoad touched). 4 new GPU-free unit tests (GLES2 config/context attribs,
   geometry clamp, ANativeWindow reports published live geometry) + the `__gl-test` harness. Gate now **386 unit + 2
   doctests** (fmt/build/clippy `-D warnings`/test/release all clean). See §6 (2026-06-05 engine GLES2/EGL surface).
+- **2026-06-05 UPDATE — the ENGINE RENDER WSI BIND IS DONE: `ANativeWindow*` IS the real host-EGL WSI handle, and an
+  engine-style `eglCreateWindowSurface(ANativeWindow)` PRESENTS to Eclipse's window (validated in isolation).** The DEFERRED
+  item in the entry above is now landed. **What was bound:** `ANativeWindow_fromSurface` now returns the **real WSI native
+  window** host EGL accepts as the `EGLNativeWindowType` — on **Wayland** the `wl_egl_window*` created from Eclipse's
+  `wl_surface` at the window size; on **X11** the XID — so the engine's OWN `eglCreateWindowSurface(display, config,
+  (EGLNativeWindowType)ANativeWindow, …)` lands on Eclipse's window. New `egl_engine::EngineNativeWindow` is the standalone,
+  owned WSI window (extracted from the EGL-surface path so the WSI handle exists WITHOUT an EGL context); it registers its
+  pointer→geometry in `ndk_registry` (`register_wsi_window`/`wsi_window_geometry`/`current_wsi_window`, `#![forbid(unsafe_code)]`)
+  so the geometry getters resolve the engine-supplied pointer by **table lookup** (unknown pointer → NDK `-1`, never a
+  dereference). **OWNERSHIP DECISION (documented):** on the engine path **Eclipse OWNS + exposes the native window handle and
+  does NOT pre-create a competing EGL context** — the engine creates its OWN context/surface over the `ANativeWindow*` (two
+  contexts must never fight over one surface). `EngineGlSurface::from_ndk_window` renders over an engine-supplied
+  `ANativeWindow*` without owning it (a `Borrowed` backing). **VALIDATED engine-style (dev host, Wayland+Mesa) — the real
+  proof:** `cargo build --release && timeout 30 ./target/release/eclipse __gl-test-anw` goes through the engine's exact path
+  (obtain `ANativeWindow*` via the BOUND `ANativeWindow_fromSurface` native, then HOST `eglGetDisplay`/`eglInitialize`/
+  `eglChooseConfig`/`eglCreateContext` + **`eglCreateWindowSurface(display, config, the ANativeWindow as EGLNativeWindowType,
+  null)`** + `eglMakeCurrent` + triangle render + `eglSwapBuffers`) → `engine-style eglCreateWindowSurface(ANativeWindow) OK:
+  surface 800x600, 5 frames presented, ANativeWindow* is the real WSI handle = true, 0 GL errors, all swaps succeeded`
+  (EXIT=0, deterministic ×3; `/tmp/eclipse-gl-anw.log`) — surface creation succeeds (**no EGL_BAD_NATIVE_WINDOW**), the
+  `ANativeWindow*` IS the real WSI handle, swaps present. The existing `__gl-test` + `graphics.rs` (Vulkan, Java-app render)
+  are UNCHANGED (no regression). **Cyber-safeguard NOT tripped** (graphics/NDK-window/EGL only — NO native-load linker /
+  apkenv / `bionic_dlopen` / ART `nativeLoad` / `framework.rs` native-load touched). **ZERO new deps.** +3 GPU-free unit
+  tests (WSI register/lookup/unregister round-trip + null/zero-clamp; `ANativeWindow_fromSurface` returns the real WSI
+  handle + getters resolve it via the map) + the `__gl-test-anw` harness; gate now **389 unit + 2 doctests** (fmt/build/
+  clippy `-D warnings`/test/release all clean). **Render path is DRIVE-READY:** the engine's `eglCreateWindowSurface(
+  ANativeWindow)` will present to Eclipse's window the moment the boot reaches a frame. **What remains is NOT the render
+  path** — it is the boot reaching a frame past the **native-load wall** (the bionic-shim relocation integration, main-loop /
+  dev-host only, cyber-safeguard). See §6 (2026-06-05 engine render WSI bind). **PRE-EXISTING FLAKE NOTED (not mine, not
+  touched):** `bionic_pthread::tests::create_runs_entry_on_real_thread_and_join_returns_its_result` fails ~1/20 under full
+  parallel load — captured: `TID identity` assert `left: 842580` (real child `gettid()`) vs `right: 30002856` (the
+  `pthread_t` `pthread_create` wrote), i.e. the parent's child-TID futex hand-off returned a wrong `pthread_t` under load. A
+  real concurrency-identity issue in `eclipse_pthread_create` (NOT the geometry/WSI logic, NOT a quick test tweak); left for
+  a dedicated root-cause pass in the pthread lifecycle code (§6).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3853,6 +3886,47 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   fmt --all --check / build --all-targets / clippy (-D warnings) / test (**386 unit + 2 doctests**) / release — all
   0-warning/0-error. **NEXT:** the WSI bind (engine `ANativeWindow*` → this EGL surface) at engine frame-time, after the
   safeguard-gated native-load integration lets the boot reach a frame.
+- **2026-06-05 — engine render WSI bind: `ANativeWindow*` made the real host-EGL native window; engine-style
+  `eglCreateWindowSurface(ANativeWindow)` presents to Eclipse's window.** *Decision:* land the WSI translation the prior
+  entry deferred — make the `ANativeWindow*` the engine receives BE the real `EGLNativeWindowType` host EGL accepts, so the
+  engine's OWN `eglCreateWindowSurface` lands on Eclipse's window, and prove it in isolation (no boot-to-frame needed).
+  *Why this shape:* the engine is a NativeActivity-style renderer that creates its OWN EGL context/surface; it gets an
+  `ANativeWindow*` from `ANativeWindow_fromSurface` and calls host `eglCreateWindowSurface(display, config,
+  (EGLNativeWindowType)ANativeWindow, …)` (Khronos EGL Registry — on Wayland `win` is a `wl_egl_window*`, on X11 the XID;
+  Context7 2026-06-05). So the `ANativeWindow*` MUST be that real handle. **Ownership:** Eclipse OWNS + exposes the native
+  window and does NOT pre-create a competing context on the engine path (the engine owns its context — two contexts must not
+  fight over one surface). *What:* (1) `egl_engine::EngineNativeWindow` — the standalone, owned WSI window (Wayland
+  `wl_egl_window` from the `wl_surface` / X11 XID), built WITHOUT an EGL context (extracted from `EngineGlSurface`, which now
+  delegates to a shared `build`); it registers its pointer→geometry in `ndk_registry`. (2) `ndk_registry::register_wsi_window`/
+  `wsi_window_geometry`/`current_wsi_window`/`unregister_wsi_window` (`#![forbid(unsafe_code)]`) — a sound pointer→geometry
+  table so `ANativeWindow_fromSurface` returns the real WSI pointer and the geometry getters resolve it by lookup (unknown →
+  NDK `-1`, never a deref). (3) `EngineGlSurface::from_ndk_window` renders over an engine-supplied `ANativeWindow*` via a
+  `Borrowed` backing (no ownership/free). (4) `native_provider::anativewindow_from_surface_via_provider` resolves + calls the
+  BOUND native (the engine's resolution→call path). *Verification (the real proof):* `cargo build --release && timeout 30
+  ./target/release/eclipse __gl-test-anw` (new harness) goes through the engine's exact path and drives HOST
+  `eglCreateWindowSurface(the ANativeWindow as EGLNativeWindowType)` + make-current + a triangle + swaps →
+  `engine-style eglCreateWindowSurface(ANativeWindow) OK: surface 800x600, 5 frames presented, ANativeWindow* is the real WSI
+  handle = true, 0 GL errors, all swaps succeeded` (EXIT=0, deterministic ×3; `/tmp/eclipse-gl-anw.log`) — **no
+  EGL_BAD_NATIVE_WINDOW**. *Same-pattern audit:* the same WSI-handle truth now flows through all 5 ANativeWindow natives
+  (`fromSurface` returns it; `getWidth`/`getHeight` resolve it; `acquire`/`release` no-op on it); the existing `__gl-test`
+  shares the `EngineNativeWindow` construction (no divergent WSI path). *Regression guard:* +3 GPU-free unit tests (WSI
+  register/lookup/unregister round-trip + null/zero-clamp; `ANativeWindow_fromSurface` returns the real WSI handle + getters
+  resolve it via the map), serialized with a module-local `Mutex` so the process-global WSI registry can't cross-contaminate
+  the no-WSI fallback tests under parallel runs (no dep, no weakened assertion). `demo_app`/`accelerometerdemo` Vulkan path
+  UNCHANGED (`graphics.rs` untouched) — no regression; `__gl-test` still green. *Cyber-safeguard: NOT tripped* — graphics +
+  NDK-window + EGL + windowing only; NO native-load linker / apkenv / `bionic_dlopen` / ART `nativeLoad` / `framework.rs`
+  native-load touched. *Deps:* ZERO new. Context7: khronos-egl 6 `create_window_surface`/`get_proc_address` (already in-tree)
+  + EGL Registry `eglCreateWindowSurface`/`EGLNativeWindowType` (Wayland `wl_egl_window*` / X11 XID; EGL_BAD_NATIVE_WINDOW).
+  Files: `src/egl_engine.rs`, `src/loader/ndk_registry.rs`, `src/loader/native_provider.rs`, `src/main.rs`. *Gate:* fmt
+  --all --check / build --all-targets / clippy (-D warnings) / test (**389 unit + 2 doctests**) / release — all
+  0-warning/0-error. **NEXT:** the render path is DRIVE-READY — what remains is the boot reaching a frame past the
+  safeguard-gated native-load wall (then the engine's `eglCreateWindowSurface(ANativeWindow)` presents live). *Pre-existing
+  flake (noted, NOT touched):* `bionic_pthread::tests::create_runs_entry_on_real_thread_and_join_returns_its_result` is
+  intermittent (~1/20, full-parallel load) — captured `TID identity` assert `left: 842580` (child `gettid()`) vs `right:
+  30002856` (the `pthread_t` `pthread_create` returned): the parent's child-TID futex hand-off yields a wrong `pthread_t`
+  under load. A real concurrency-identity issue in `eclipse_pthread_create` (NOT the WSI/geometry logic, NOT a quick
+  test-robustness tweak, and adjacent to the safeguard-gated pthread lifecycle) — deferred to a dedicated root-cause pass; my
+  changes touch ZERO pthread code (`git diff --stat`).
 
 ---
 
