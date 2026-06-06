@@ -1774,6 +1774,35 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   4. Once Roblox's Java shell runs, harvest `framework-worklist.txt` (missing `android.*` the
      framework must implement) — the deferred Step 4 data, and the spec for the winit framework.
   5. Later: APK fetch (`ureq`+`rustls`) once a stable source/backend exists.
+- **2026-06-05 (loader adversarial-robustness pass)** — 🛡️ **The from-scratch Rust loader
+  (`src/loader/{elf,reloc,map,resolve,tls,link}.rs`) is now HARDENED against hostile/malformed `.so`
+  input with 37 new negative tests + ONE real root-cause defect fixed.** Every module gained
+  HAND-CRAFTED malformed-byte tests asserting a typed `Err` (never a panic/overflow/OOB/UB/unbounded
+  alloc): **elf +13** (truncation mid-phdr / dynamic-vaddr-past-EOF strtab+symtab / `e_phnum*entsize`
+  overflow / bad phentsize / absurd `DT_STRSZ` no-over-read / unterminated string / `DT_NEEDED`
+  past-strtab / `.rela`-without-`DT_SYMTAB` / SLEB128-past-64-bits → `BadSleb128` / APS2
+  `reloc_count=i64::MAX`-no-prealloc + negative-count / overlapping-unordered `PT_LOAD` `vaddr_to_off`
+  by-containment); **reloc +6** (exact-end-boundary write, offset-near-`usize::MAX` bounds-checked,
+  RELATIVE/ABS64 addend overflow wraps-not-panics, RELR bitmap address overflow, empty-image rejects);
+  **map +6**; **resolve +4** (`u32::MAX`/empty-symtab index → None, base+value overflow wraps,
+  embedded-NUL name); **tls +4** (`mem_size*align` round-up overflow + offset-accumulation overflow →
+  `Overflow`, out-of-range/`sym0`-without-PT_TLS → None); **link +4** (self-cycle terminates,
+  64-deep chain terminates no-stack-overflow, malformed-dep → `LinkError::Parse`, bad-segment dep →
+  `LinkError::Map`). **REAL DEFECT FOUND + ROOT-CAUSE FIXED (map.rs):** `populate_segment` copies a
+  `p_filesz`-sized slice but only mprotects the `p_memsz`-sized page range writable; a hostile
+  `PT_LOAD` with `p_filesz > p_memsz` overruns into the **next, not-yet-writable (`PROT_NONE`)
+  segment's pages** → **SIGSEGV** (proven: with the guard disabled the regression test crashes with
+  signal 11). The SAFETY comment *assumed* `filesz <= memsz` as an "ELF invariant" but never enforced
+  it. Fix = validate `s.file_size <= s.mem_size` in `map_and_relocate`'s span loop (new typed
+  `MapError::FileSizeExceedsMemSize`), before any mmap/copy — smallest correct change, no weakening;
+  the SAFETY comment now states the invariant is enforced. Audit: the only file-byte copy is
+  `populate_segment` (now guarded); `tls.rs::add_module` already validates `FileLargerThanMem`. **No
+  test weakened; NO new `unsafe`** (the forbid-unsafe modules elf/reloc/tls/link stay
+  `#![forbid(unsafe_code)]`; resolve.rs keeps only its pre-existing confined `dlsym`). Gate now
+  **457 unit + 4 integration + 2 doctests** (fmt/build/clippy `-D warnings`/test/release all clean;
+  deterministic ×3). Cyber-safeguard NOT tripped (crafted in-memory malformed byte buffers + Eclipse's
+  own `src/loader`; no real-binary symbol-mining, no native-load-interception region touched). See §6
+  (2026-06-05 loader adversarial-robustness pass).
 
 ---
 
@@ -4180,6 +4209,28 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   engine calls `slCreateEngine`); a host resampler is deferred until an engine rate the device can't match is observed
   (none yet, simplicity-first). Files: `src/loader/opensl.rs` (new), `src/loader/opensl/tests.rs` (new), `src/loader.rs`,
   `src/loader/native_provider.rs`, `src/main.rs`, `Cargo.toml`, `Cargo.lock`.
+- **2026-06-05 (loader adversarial-robustness pass)** — 🛡️ Hardened the from-scratch Rust loader against
+  hostile/malformed `.so` input. **37 negative tests added** over HAND-CRAFTED malformed byte buffers
+  (no real binary touched): elf +13, reloc +6, map +6, resolve +4, tls +4, link +4 — each asserts a typed
+  `Err`/safe outcome with NO panic / overflow / OOB / UB / unbounded alloc. **One REAL defect found +
+  root-cause-fixed:** `map.rs::populate_segment` copied a `p_filesz`-sized slice while only the
+  `p_memsz`-sized page range was made writable → a hostile `PT_LOAD` with `p_filesz > p_memsz` overran
+  into the next, still-`PROT_NONE` segment's pages, **faulting (SIGSEGV)**. *Evidence:* with the new guard
+  disabled, `filesz_greater_than_memsz_is_typed_err_no_fault` crashes with signal 11; with it enabled the
+  test gets a typed `MapError::FileSizeExceedsMemSize`. *Root cause:* the `unsafe` copy's SAFETY note
+  *assumed* the ELF invariant `filesz <= memsz` but nothing enforced it. *Fix (smallest correct, no
+  weakening):* validate `s.file_size <= s.mem_size` in `map_and_relocate`'s span loop before any mmap/copy
+  (new typed `MapError::FileSizeExceedsMemSize`); SAFETY comment updated to state the invariant is now
+  enforced. *Same-pattern audit:* `populate_segment` is the only file-byte copy in map.rs (now guarded);
+  `tls.rs::add_module` already validated `FileLargerThanMem`; reloc/resolve/tls/link were already robust
+  (their negative tests are pure regression guards). *Regression guards:* the new per-module `#[test]`s in
+  each loader module (run by `cargo test`). **No test weakened; NO new `unsafe`** — elf/reloc/tls/link stay
+  `#![forbid(unsafe_code)]`, resolve.rs keeps only its pre-existing confined `dlsym`. *Gate:* fmt --all
+  --check / build --all-targets / clippy (-D warnings) / test (**457 unit + 4 integration + 2 doctests**) /
+  release — all 0-warning/0-error, deterministic ×3; the 4 `engine_milestones` guards still pass. Cyber-
+  safeguard NOT tripped (crafted in-memory malformed buffers + Eclipse's own `src/loader`; no libroblox
+  symbol-mining, no native-load-interception region read/edited). Files: `src/loader/map.rs` (fix + tests),
+  `src/loader/{elf,reloc,resolve,tls,link}.rs` (tests only).
 
 ---
 

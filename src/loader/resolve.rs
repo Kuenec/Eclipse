@@ -523,4 +523,59 @@ mod tests {
         // A name with an interior NUL is not a valid C symbol → None (no panic).
         assert_eq!(p.resolve("bad\0name"), None);
     }
+
+    // ---- Adversarial / out-of-range hardening (2026-06-05) --------------------------------------
+    //
+    // HAND-CRAFTED hostile symbol indices + names: a `sym_index` of `u32::MAX` against a tiny
+    // symtab, and a defined symbol whose value + base wraps. Each must be `None` / a wrapped value,
+    // never a panic or OOB. `resolve.rs`'s only `unsafe` is the `dlsym` FFI (already covered above).
+
+    #[test]
+    fn resolver_u32_max_index_is_unresolved_no_panic() {
+        // `sym_index` at its u32 max against a 1-entry table: `.get(idx as usize)` is None → None,
+        // never an OOB / panic (the `as usize` widen cannot wrap on 64-bit, but the bound still holds).
+        let dynsyms = vec![def("only", 0x10)];
+        let scope = Scope::new();
+        let r = ScopedResolver::new(&scope, &dynsyms);
+        assert_eq!(r.resolve_symbol(u32::MAX), None);
+        assert_eq!(r.resolve_tls_offset(u32::MAX), None);
+    }
+
+    #[test]
+    fn resolver_empty_dynsyms_resolves_nothing() {
+        // An empty symtab: any index is out of range → None, never a panic on the empty slice.
+        let dynsyms: Vec<DynSym> = Vec::new();
+        let scope = Scope::new();
+        let r = ScopedResolver::new(&scope, &dynsyms);
+        assert_eq!(r.resolve_symbol(0), None);
+        assert_eq!(r.resolve_symbol(7), None);
+    }
+
+    #[test]
+    fn provider_base_plus_value_overflow_wraps_no_panic() {
+        // A defined symbol whose st_value + a near-top base wraps the address space: the provider uses
+        // wrapping_add (addresses are modular), so it returns a wrapped address, never an overflow
+        // panic. Pins the documented wrapping contract for the symbol-address computation.
+        let dynsyms = vec![def("s", u64::MAX)]; // st_value = u64::MAX
+        let p = LoadedObjectProvider::new(0x1000, &dynsyms);
+        assert_eq!(
+            p.resolve("s"),
+            Some(ResolvedSym {
+                addr: 0x1000u64.wrapping_add(u64::MAX), // wraps to 0xfff
+                weak: false,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_handles_name_with_embedded_nul_safely() {
+        // A defined symbol whose NAME contains an embedded NUL (a hostile/garbage dynstr). The
+        // provider indexes it by the Rust String key as-is (no C-string conversion here), so a lookup
+        // by the exact same key resolves, and an ordinary name does not — no panic, no truncation.
+        let mut sym = def("a\0b", 0x10);
+        sym.name = "a\0b".to_string();
+        let p = LoadedObjectProvider::new(0x1000, &[sym]);
+        assert!(p.resolve("a\0b").is_some()); // exact key resolves
+        assert_eq!(p.resolve("a"), None); // not truncated at the NUL
+    }
 }

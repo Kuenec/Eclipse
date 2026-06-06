@@ -734,4 +734,126 @@ mod tests {
             RelocError::UnsupportedType(9)
         );
     }
+
+    // ---- Adversarial / overflow-boundary hardening (2026-06-05) ---------------------------------
+    //
+    // HAND-CRAFTED hostile relocations probing the offset/address arithmetic boundaries: an offset
+    // whose target word straddles or exceeds the image, an offset+base that overflows the address
+    // space (the deliberate wrapping path — still bounds-checked on the write), and the exact
+    // end-of-image boundary. Each must be a typed `RelocError` (or a correct wrapped write), never a
+    // panic, overflow-abort, or OOB write. The module is `#![forbid(unsafe_code)]`.
+
+    #[test]
+    fn write_at_exact_end_boundary_succeeds() {
+        // The last valid 8-byte word ends exactly at the image length → must succeed (off-by-one in
+        // the upper bound would wrongly reject it). 2 words; offset 8 targets [8,16) == the end.
+        let mut buf = image_bytes(2);
+        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let rela = Rela {
+            offset: 8,
+            sym_index: 0,
+            r_type: R_X86_64_RELATIVE,
+            addend: 0x7,
+        };
+        apply_one(&mut img, &FixedResolver, &rela).unwrap();
+        assert_eq!(word(&buf, 1), BASE + 0x7);
+    }
+
+    #[test]
+    fn offset_near_usize_max_is_out_of_bounds_no_overflow() {
+        // base + offset wraps the address space (documented wrapping), but the resulting in-image
+        // offset is astronomically large → image_offset_of/write bounds-check rejects it as a typed
+        // error, never a panicking add or an OOB write. Use an offset that makes base+offset huge.
+        let mut buf = image_bytes(1);
+        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let rela = Rela {
+            offset: u64::MAX - BASE, // base + offset wraps to ~u64::MAX
+            sym_index: 0,
+            r_type: R_X86_64_RELATIVE,
+            addend: 0,
+        };
+        let err = apply_one(&mut img, &FixedResolver, &rela).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RelocError::OutOfBounds(_) | RelocError::RelrAddressInvalid(_)
+            ),
+            "expected a bounds error, got {err:?}"
+        );
+        assert_eq!(word(&buf, 0), 0); // nothing written
+    }
+
+    #[test]
+    fn relative_addend_overflow_wraps_then_bounds_checks_write() {
+        // RELATIVE writes base.wrapping_add(addend). A maximal addend wraps modularly (documented):
+        // the WRITE is still in-bounds (offset 0 valid), so it succeeds with the wrapped value — no
+        // overflow panic. This pins the deliberate wrapping-arithmetic contract.
+        let mut buf = image_bytes(1);
+        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let rela = Rela {
+            offset: 0,
+            sym_index: 0,
+            r_type: R_X86_64_RELATIVE,
+            addend: -1, // 0xffff... → base + (-1) wraps to base-1, no panic
+        };
+        apply_one(&mut img, &FixedResolver, &rela).unwrap();
+        assert_eq!(word(&buf, 0), BASE.wrapping_sub(1));
+    }
+
+    #[test]
+    fn abs64_symbol_plus_addend_overflow_wraps_no_panic() {
+        // R_X86_64_64 writes sym.wrapping_add(addend). sym=0x7fff_aaaa_0000 (index 1) + i64::MAX must
+        // wrap, not panic; the write at offset 0 is in-bounds so it lands.
+        let mut buf = image_bytes(1);
+        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        let rela = Rela {
+            offset: 0,
+            sym_index: 1,
+            r_type: R_X86_64_64,
+            addend: i64::MAX,
+        };
+        apply_one(&mut img, &FixedResolver, &rela).unwrap();
+        let expected = 0x7fff_aaaa_0000u64.wrapping_add(i64::MAX as u64);
+        assert_eq!(word(&buf, 0), expected);
+    }
+
+    #[test]
+    fn relr_bitmap_address_overflow_is_typed_err_not_panic() {
+        // A bitmap whose cursor + bit-index wraps past the address space (a huge prior address word
+        // followed by a fully-set bitmap) must surface a typed bounds error for the wrapped targets,
+        // never panic or write OOB. Seed the cursor near u64::MAX via an address word, then a bitmap.
+        let mut buf = image_bytes(2);
+        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        // Address word just below the top of the space (even) → cursor = that + 8 (wraps near 0),
+        // then a bitmap with bit 0 set targets the wrapped cursor, which is not an in-image address.
+        let addr_word = u64::MAX - 1; // even (LSB 0 = address word), enormous
+        let bitmap = (1u64 << 1) | 1; // data bit 0 set
+        let entries = [addr_word, bitmap];
+        let err = apply_relr(&mut img, &entries).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RelocError::RelrAddressInvalid(_) | RelocError::OutOfBounds(_)
+            ),
+            "expected a bounds error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_image_rejects_any_write() {
+        // A zero-length image: every relocation target is out of bounds → typed error, never a panic.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut img = SliceImage::new(BASE, TLS_BASE_OFF, &mut buf);
+        assert!(img.is_empty());
+        let rela = Rela {
+            offset: 0,
+            sym_index: 0,
+            r_type: R_X86_64_RELATIVE,
+            addend: 0,
+        };
+        assert!(matches!(
+            apply_one(&mut img, &FixedResolver, &rela).unwrap_err(),
+            RelocError::OutOfBounds(0)
+        ));
+    }
 }

@@ -62,6 +62,12 @@ pub enum MapError {
     /// A segment's `p_filesz` bytes are not present in the file slice `[file_offset, +file_size)`.
     /// Carries the segment's `file_offset`.
     SegmentOutOfFile(u64),
+    /// A `PT_LOAD` segment's `p_filesz` exceeds its `p_memsz`. This violates the ELF invariant
+    /// that the in-memory image of a segment is at least as large as its file image; a hostile
+    /// object can use it to make `populate_segment`'s `filesz`-sized copy overrun the `memsz`-sized
+    /// writable page range into an adjacent not-yet-writable (`PROT_NONE`) segment, faulting.
+    /// Carries `(file_size, mem_size)`. 2026-06-05.
+    FileSizeExceedsMemSize(u64, u64),
     /// The underlying `mmap`/`mprotect`/`munmap` syscall failed. Carries the OS error.
     Os(rustix::io::Errno),
     /// A relocation failed (out of bounds / unsupported). Carries the [`RelocError`].
@@ -78,6 +84,9 @@ impl std::fmt::Display for MapError {
                     f,
                     "PT_LOAD at file offset {off:#x} extends past the file bytes"
                 )
+            }
+            Self::FileSizeExceedsMemSize(fz, mz) => {
+                write!(f, "PT_LOAD p_filesz {fz:#x} exceeds p_memsz {mz:#x}")
             }
             Self::Os(e) => write!(f, "memory-mapping syscall failed: {e}"),
             Self::Reloc(e) => write!(f, "base relocation failed: {e}"),
@@ -255,6 +264,14 @@ impl MappedObject {
         let min_vaddr = img.loads.iter().map(|s| s.vaddr).min().expect("non-empty");
         let mut max_end: u64 = 0;
         for s in &img.loads {
+            // 2026-06-05: reject p_filesz > p_memsz BEFORE mapping. The copy in `populate_segment`
+            // is `filesz`-sized but only the `memsz`-sized page range is made writable; a hostile
+            // segment whose `filesz` overruns its `memsz` into a later (not-yet-writable) segment's
+            // pages would fault the copy. Enforcing the ELF invariant here turns that into a typed
+            // error before any byte is mapped or written.
+            if s.file_size > s.mem_size {
+                return Err(MapError::FileSizeExceedsMemSize(s.file_size, s.mem_size));
+            }
             let end = s
                 .vaddr
                 .checked_add(s.mem_size)
@@ -742,10 +759,12 @@ impl MappedObject {
             .ok_or(MapError::SegmentOutOfFile(seg.file_offset))?;
 
         // SAFETY: 2026-06-05 — `seg_off + filesz <= span`: `seg_off` is `vaddr - region_start` and
-        // `vaddr + memsz <= region_end`, with `filesz <= memsz` (ELF invariant; an over-large
-        // `filesz` only shrinks the bss and is still within memsz's page-ceiled span). `dst` is the
-        // mapping's writable bytes at `seg_off`; `src` is exactly `filesz` bytes from the file slice;
-        // the two never alias (different allocations). The segment's pages were made writable above.
+        // `vaddr + memsz <= region_end`, with `filesz <= memsz` ENFORCED by `map_and_relocate`'s
+        // `FileSizeExceedsMemSize` check (so the `filesz`-sized copy stays within this segment's
+        // `memsz`-sized writable page range — it cannot overrun into an adjacent not-yet-writable
+        // segment). `dst` is the mapping's writable bytes at `seg_off`; `src` is exactly `filesz`
+        // bytes from the file slice; the two never alias (different allocations). The `end > span`
+        // guard below is a redundant defense. The segment's pages were made writable above.
         let dst = unsafe {
             let end = seg_off
                 .checked_add(filesz)
@@ -1681,5 +1700,126 @@ mod tests {
              written={written:#x} addend={} — libm FULLY relocated modulo ifunc (IRELATIVE deferred=0)",
             errno_sym.value, tpoff.addend,
         );
+    }
+
+    // ---- Adversarial / malformed-input hardening (2026-06-05) -----------------------------------
+    //
+    // These tests feed HAND-CRAFTED hostile PT_LOAD layouts to `map_and_relocate` and assert it
+    // returns a typed `MapError` (never panics, overflows, OOBs, faults, or attempts an absurd
+    // mmap). The `filesz > memsz` overrun case is the REGRESSION GUARD for the confirmed defect
+    // fixed this session (the `filesz`-sized copy could overrun the `memsz`-sized writable range
+    // into an adjacent not-yet-writable segment, faulting); the rest are guards over already-robust
+    // span/overflow paths.
+
+    /// Build a two-PT_LOAD fixture exactly like [`build_two_segment_fixture`], but override LOAD0's
+    /// `p_filesz` to `bad_filesz` so the caller can craft a `filesz > memsz` overrun. LOAD0 keeps
+    /// `memsz = PAGE`; with `bad_filesz` spilling into LOAD1's page, the unfixed copy would write
+    /// into LOAD1's still-`PROT_NONE` pages (LOAD1 is populated AFTER LOAD0).
+    fn build_load0_filesz_overrun_fixture(bad_filesz: u64) -> Vec<u8> {
+        let mut buf = build_two_segment_fixture();
+        // The file must actually contain `bad_filesz` bytes for LOAD0 (else SegmentOutOfFile would
+        // mask the overrun). Grow the buffer so the copy source exists.
+        let needed = bad_filesz as usize;
+        if buf.len() < needed {
+            buf.resize(needed, 0);
+        }
+        // LOAD0 is phdr index 0: rewrite its p_filesz (offset +32 within the phdr).
+        let ph0 = PH_OFF;
+        put_u64(&mut buf, ph0 + 32, bad_filesz); // p_filesz
+                                                 // p_memsz (offset +40) stays PAGE → filesz > memsz.
+        buf
+    }
+
+    #[test]
+    fn filesz_greater_than_memsz_is_typed_err_no_fault() {
+        // The confirmed defect: LOAD0 filesz=0x1800 (> memsz=PAGE=0x1000) overruns into LOAD1's
+        // page [0x1000, 0x2000), which is PROT_NONE when LOAD0 is copied. Pre-fix this faulted
+        // (SIGSEGV). Post-fix it is rejected up front with a typed error and nothing is mapped.
+        let buf = build_load0_filesz_overrun_fixture(0x1800);
+        let img = ElfImage::parse(&buf).expect("fixture still parses (header/phdr valid)");
+        assert!(img.loads[0].file_size > img.loads[0].mem_size);
+        match MappedObject::map_and_relocate(&img, &buf, PAGE) {
+            Err(MapError::FileSizeExceedsMemSize(fz, mz)) => {
+                assert_eq!(fz, 0x1800);
+                assert_eq!(mz, PAGE);
+            }
+            Err(other) => panic!("expected FileSizeExceedsMemSize, got {other}"),
+            Ok(_) => panic!("expected FileSizeExceedsMemSize, mapping unexpectedly succeeded"),
+        }
+    }
+
+    #[test]
+    fn filesz_one_byte_over_memsz_is_rejected() {
+        // Boundary: filesz exactly one byte past memsz is still a violation (the SAFETY argument
+        // requires filesz <= memsz; off-by-one must not slip through).
+        let buf = build_load0_filesz_overrun_fixture(PAGE + 1);
+        let img = ElfImage::parse(&buf).unwrap();
+        assert!(matches!(
+            MappedObject::map_and_relocate(&img, &buf, PAGE),
+            Err(MapError::FileSizeExceedsMemSize(_, _))
+        ));
+    }
+
+    #[test]
+    fn filesz_equal_to_memsz_still_maps() {
+        // The guard must not over-reject: filesz == memsz is legal (a fully-initialized segment with
+        // no bss). LOAD0 filesz=PAGE=memsz must still map cleanly.
+        let buf = build_load0_filesz_overrun_fixture(PAGE); // filesz == memsz == PAGE
+        let img = ElfImage::parse(&buf).unwrap();
+        let (obj, stats) =
+            MappedObject::map_and_relocate(&img, &buf, PAGE).expect("filesz==memsz is legal");
+        assert_eq!(stats.segments_mapped, 2);
+        assert_eq!(obj.span(), 0x2000);
+    }
+
+    #[test]
+    fn vaddr_plus_memsz_overflow_is_typed_err() {
+        // A segment whose p_vaddr + p_memsz overflows u64 must be a typed SpanOverflow, not a panic.
+        let mut buf = build_two_segment_fixture();
+        let ph1 = PH_OFF + PHDR_SIZE; // LOAD1
+        put_u64(&mut buf, ph1 + 16, u64::MAX - 0x10); // p_vaddr near the top
+        put_u64(&mut buf, ph1 + 32, 0); // p_filesz 0 (avoid SegmentOutOfFile / filesz>memsz first)
+        put_u64(&mut buf, ph1 + 40, 0x1000); // p_memsz → vaddr + memsz overflows
+        let img = ElfImage::parse(&buf).unwrap();
+        assert!(matches!(
+            MappedObject::map_and_relocate(&img, &buf, PAGE),
+            Err(MapError::SpanOverflow(_))
+        ));
+    }
+
+    #[test]
+    fn absurdly_huge_span_refuses_rather_than_mmaps() {
+        // A PT_LOAD claiming a ~2^62-byte memsz must NOT attempt that mmap: either the span/page
+        // math overflows (SpanOverflow) or the kernel refuses the reservation (Os). Either way it is
+        // a typed error — never a successful absurd allocation, never a panic. filesz=0 so the
+        // filesz>memsz guard does not fire first.
+        let mut buf = build_two_segment_fixture();
+        let ph1 = PH_OFF + PHDR_SIZE; // LOAD1
+        put_u64(&mut buf, ph1 + 16, 0x1000); // p_vaddr (valid, just above LOAD0)
+        put_u64(&mut buf, ph1 + 32, 0); // p_filesz 0
+        put_u64(&mut buf, ph1 + 40, 1u64 << 62); // p_memsz ≈ 4 EiB
+        let img = ElfImage::parse(&buf).unwrap();
+        match MappedObject::map_and_relocate(&img, &buf, PAGE) {
+            Err(MapError::SpanOverflow(_)) | Err(MapError::Os(_)) => {}
+            Err(other) => panic!("absurd span must refuse with a span/os error, got {other}"),
+            Ok(_) => panic!("absurd span must refuse, mapping unexpectedly succeeded"),
+        }
+    }
+
+    #[test]
+    fn segment_filesz_past_file_bytes_is_typed_err() {
+        // LOAD1's p_offset+p_filesz points past the end of the (truncated) file slice → a typed
+        // SegmentOutOfFile, never an OOB read of the source slice. Keep filesz <= memsz so that
+        // guard does not fire first; enlarge memsz to match.
+        let mut buf = build_two_segment_fixture();
+        let ph1 = PH_OFF + PHDR_SIZE; // LOAD1
+        put_u64(&mut buf, ph1 + 8, 0x1000); // p_offset
+        put_u64(&mut buf, ph1 + 32, 0x4000); // p_filesz far past the 0x1040-byte file
+        put_u64(&mut buf, ph1 + 40, 0x4000); // p_memsz == filesz (legal ratio)
+        let img = ElfImage::parse(&buf).unwrap();
+        assert!(matches!(
+            MappedObject::map_and_relocate(&img, &buf, PAGE),
+            Err(MapError::SegmentOutOfFile(_))
+        ));
     }
 }
