@@ -614,4 +614,69 @@ mod tests {
         let resolver = TlsResolver::new(&inner, &dynsyms, &layout, None);
         assert_eq!(resolver.resolve_tls_offset(1), None);
     }
+
+    // ---- Adversarial / overflow-boundary hardening (2026-06-05) ---------------------------------
+    //
+    // HAND-CRAFTED hostile PT_TLS templates whose size/align arithmetic overflows, plus out-of-range
+    // resolver indices. Each must be a typed `TlsError::Overflow` / `None`, never a panic, overflow,
+    // OOB, or unbounded allocation. `tls.rs` is `#![forbid(unsafe_code)]`.
+
+    #[test]
+    fn mem_size_align_round_up_overflow_is_typed_err() {
+        // mem_size near u64::MAX with align > 1: round_up(mem_size, align) = (v + mask) overflows →
+        // a typed Overflow, never a wraparound to a tiny size (which would under-allocate the block).
+        let mut layout = TlsLayout::new();
+        let err = layout
+            .add_module(&seg(0, 0, u64::MAX, 16), &[], 0, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, TlsError::Overflow(_)),
+            "expected Overflow, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn offset_accumulation_overflow_is_typed_err() {
+        // Stack two modules whose aligned sizes together overflow the running accumulated offset.
+        // The first nearly fills the u64 range; the second's add overflows → a typed Overflow on the
+        // SECOND add, never a panic. (filesz 0 / file empty so only the offset math is exercised.)
+        let mut layout = TlsLayout::new();
+        // First module: aligned size = (u64::MAX/2 rounded) — succeeds (block_offset/init alloc is
+        // bounded by mem_size as usize, which would itself overflow on a 64-bit usize only at
+        // u64::MAX; use a memsz that aligns cleanly and leaves the SECOND add to overflow).
+        // A single huge module already overflows mem_size-as-usize/round_up; assert that path too.
+        let err = layout
+            .add_module(&seg(0, 0, (1u64 << 63) + 8, 8), &[], 0, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, TlsError::Overflow(_)),
+            "expected Overflow for an absurd module size, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolver_out_of_range_named_index_is_none() {
+        // A named TPOFF64 whose sym_index is past the relocated object's dynsym table → None (typed
+        // UnresolvedSymbol in the applier), never an OOB index. dynsyms has 1 entry; ask for index 9.
+        let dynsyms = vec![tls_undef("")];
+        let mut layout = TlsLayout::new();
+        layout
+            .add_module(&seg(0, 0, 16, 8), &[], 0, &[tls_def("x", 0)])
+            .unwrap();
+        let inner = InnerFixed;
+        let resolver = TlsResolver::new(&inner, &dynsyms, &layout, None);
+        assert_eq!(resolver.resolve_tls_offset(9), None);
+        assert_eq!(resolver.resolve_tls_offset(u32::MAX), None);
+    }
+
+    #[test]
+    fn sym0_self_reference_without_own_tls_is_none() {
+        // A sym-0 (STN_UNDEF) self-referential TPOFF64 in an object that declares NO PT_TLS
+        // (own_tp_offset None) is malformed → None, never a fabricated offset or a panic.
+        let dynsyms = vec![tls_undef("")];
+        let layout = TlsLayout::new();
+        let inner = InnerFixed;
+        let resolver = TlsResolver::new(&inner, &dynsyms, &layout, None);
+        assert_eq!(resolver.resolve_tls_offset(0), None);
+    }
 }

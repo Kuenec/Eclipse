@@ -2035,4 +2035,104 @@ mod tests {
         drop(set);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ---- Adversarial / dep-graph hardening (2026-06-05) -----------------------------------------
+    //
+    // HAND-CRAFTED hostile on-disk dependency graphs: a SELF-cycle, a deep chain, a malformed dep
+    // object, and a dep whose mapping must fail. Each must TERMINATE with a typed result — never an
+    // infinite loop, stack overflow, panic, or fault. `link.rs` orchestration is
+    // `#![forbid(unsafe_code)]`.
+
+    #[test]
+    fn self_cycle_terminates_loading_once() {
+        // A.so declares itself as a DT_NEEDED (A -> A). The soname dedup must load it exactly once
+        // and terminate (a naive recursive loader would spin). 2026-06-05.
+        let dir = temp_dir("selfcycle");
+        let a = build_so("A.so", &["A.so"], None, None);
+        let a_path = write_so(&dir, "A.so", &a);
+        let linker = Linker::new([dir.clone()]);
+        let set = linker.load(&a_path).expect("self-cycle terminates");
+        let sonames: Vec<&str> = set.objects.iter().map(|o| o.soname.as_str()).collect();
+        assert_eq!(sonames, vec!["A.so"], "A loaded exactly once");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deep_dependency_chain_terminates_without_stack_overflow() {
+        // A linear chain L0 -> L1 -> ... -> L63 (64 deep). The iterative BFS must load all 64 and
+        // terminate with no stack growth (a recursive walker risks overflow on a long enough chain).
+        let dir = temp_dir("deepchain");
+        const DEPTH: usize = 64;
+        let mut root_path = None;
+        for i in 0..DEPTH {
+            let name = format!("L{i}.so");
+            let next = format!("L{}.so", i + 1);
+            let needed: Vec<&str> = if i + 1 < DEPTH {
+                vec![next.as_str()]
+            } else {
+                vec![]
+            };
+            let so = build_so(&name, &needed, None, None);
+            let p = write_so(&dir, &name, &so);
+            if i == 0 {
+                root_path = Some(p);
+            }
+        }
+        let linker = Linker::new([dir.clone()]);
+        let set = linker
+            .load(root_path.as_ref().unwrap())
+            .expect("deep chain links");
+        assert_eq!(
+            set.objects.len(),
+            DEPTH,
+            "every link in the chain loaded once"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn malformed_dependency_object_is_typed_parse_error() {
+        // The root NEEDs dep.so, but dep.so is garbage bytes (bad ELF magic). The linker must surface
+        // a typed LinkError (Parse/DynStrings/Map), never a panic, when loading the dep.
+        let dir = temp_dir("malformeddep");
+        let root = build_so("root.so", &["dep.so"], None, None);
+        let root_path = write_so(&dir, "root.so", &root);
+        // dep.so: 512 bytes of non-ELF garbage.
+        write_so(&dir, "dep.so", &vec![0xABu8; 512]);
+        let linker = Linker::new([dir.clone()]);
+        match linker.load(&root_path) {
+            Err(LinkError::Parse { object, .. }) => assert_eq!(object, "dep.so"),
+            Err(other) => panic!("expected Parse error for the malformed dep, got {other:?}"),
+            Ok(_) => panic!("a garbage dep must not link successfully"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dependency_with_bad_segment_layout_is_typed_map_error() {
+        // dep.so parses as ELF but its PT_LOAD has p_filesz > p_memsz (the hostile overrun shape
+        // hardened in map.rs). The linker must surface LinkError::Map, never fault during mapping.
+        let dir = temp_dir("badseg");
+        let root = build_so("root.so", &["dep.so"], None, None);
+        let root_path = write_so(&dir, "root.so", &root);
+        // Build a valid dep, then corrupt LOAD0's p_filesz to exceed p_memsz.
+        let mut dep = build_so("dep.so", &[], None, None);
+        // LOAD0 is phdr 0; p_filesz is at PH_OFF+32, p_memsz at PH_OFF+40. Set filesz > memsz.
+        let memsz = u64::from_le_bytes(dep[PH_OFF + 40..PH_OFF + 48].try_into().unwrap());
+        put_u64(&mut dep, PH_OFF + 32, memsz + PAGE); // filesz = memsz + a page → violation
+        write_so(&dir, "dep.so", &dep);
+        let linker = Linker::new([dir.clone()]);
+        match linker.load(&root_path) {
+            Err(LinkError::Map { object, error }) => {
+                assert_eq!(object, "dep.so");
+                assert!(
+                    matches!(error, MapError::FileSizeExceedsMemSize(_, _)),
+                    "expected FileSizeExceedsMemSize, got {error}"
+                );
+            }
+            Err(other) => panic!("expected Map error for the bad-layout dep, got {other:?}"),
+            Ok(_) => panic!("a filesz>memsz dep must not map successfully"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

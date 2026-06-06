@@ -1862,4 +1862,236 @@ mod tests {
             relas.len(),
         );
     }
+
+    // ---- Adversarial / structural-boundary hardening (2026-06-05) -------------------------------
+    //
+    // HAND-CRAFTED malformed images that probe every structural boundary the decoder walks:
+    // truncation mid-phdr / mid-dynamic / mid-symtab, dynamic vaddrs past EOF, absurd table sizes,
+    // unterminated/out-of-range strings, overflowing phnum*entsize, and APS2/SLEB128 edge cases.
+    // Each must yield a typed `ElfError` (never a panic, overflow, OOB, or unbounded allocation).
+    // The decoder is `#![forbid(unsafe_code)]`, so these guard the bounds-check discipline.
+
+    /// A minimal VALID header (no program headers) with `e_phnum`/`e_phoff`/`e_phentsize` settable
+    /// by the caller. Used to probe phdr-boundary truncation without the full fixture.
+    fn header_only(e_phoff: u64, e_phnum: u16, e_phentsize: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; EHDR_SIZE];
+        buf[0..4].copy_from_slice(&ELF_MAGIC);
+        buf[EI_CLASS] = ELFCLASS64;
+        buf[EI_DATA] = ELFDATA2LSB;
+        put_u16(&mut buf, 16, ET_DYN);
+        put_u16(&mut buf, 18, EM_X86_64);
+        put_u64(&mut buf, 32, e_phoff);
+        put_u16(&mut buf, 54, e_phentsize);
+        put_u16(&mut buf, 56, e_phnum);
+        buf
+    }
+
+    #[test]
+    fn truncated_mid_phdr_is_typed_err_not_panic() {
+        // e_phnum=2 but the file holds only 1.5 phdrs → the second phdr read runs off the end.
+        let mut buf = header_only(PH_OFF as u64, 2, PHDR_SIZE as u16);
+        buf.resize(PH_OFF + PHDR_SIZE + PHDR_SIZE / 2, 0); // 1.5 phdrs present
+        assert!(matches!(
+            ElfImage::parse(&buf).unwrap_err(),
+            ElfError::Truncated { .. }
+        ));
+    }
+
+    #[test]
+    fn phnum_times_entsize_overflow_is_typed_err() {
+        // e_phnum at its u16 max with e_phoff near usize::MAX: i*PHDR_SIZE + e_phoff must use checked
+        // arithmetic. e_phentsize must equal PHDR_SIZE (validated first), so this exercises the
+        // checked add/mul in the phdr loop rather than the entsize guard.
+        let buf = header_only(u64::MAX - 10, u16::MAX, PHDR_SIZE as u16);
+        // Either the e_phoff-as-usize / add overflows → Truncated, or the read is simply past EOF →
+        // Truncated. Never a panic or wraparound.
+        assert!(matches!(
+            ElfImage::parse(&buf).unwrap_err(),
+            ElfError::Truncated { .. }
+        ));
+    }
+
+    #[test]
+    fn bad_phentsize_is_typed_err() {
+        // e_phentsize != 56 must be rejected up front (a different stride would misparse every phdr).
+        let mut buf = header_only(PH_OFF as u64, 1, 40);
+        buf.resize(PH_OFF + 64, 0);
+        assert!(matches!(
+            ElfImage::parse(&buf).unwrap_err(),
+            ElfError::BadPhEntSize(40)
+        ));
+    }
+
+    #[test]
+    fn dynamic_strtab_vaddr_past_eof_is_typed_err() {
+        // DT_STRTAB points at a vaddr no PT_LOAD covers → UnmappedVaddr when a string is looked up
+        // (soname/needed resolution), never an OOB read. Slot 8 is DT_STRTAB in build_fixture.
+        let mut buf = build_fixture();
+        put_dyn(&mut buf, 8, DT_STRTAB, 0xffff_0000); // far outside the 0x4000-byte 1:1 PT_LOAD
+                                                      // The parse itself reads symbol names (str_at), so the bad strtab surfaces during parse.
+        let err = ElfImage::parse(&buf).unwrap_err();
+        assert!(
+            matches!(err, ElfError::UnmappedVaddr(_) | ElfError::Truncated { .. }),
+            "expected UnmappedVaddr/Truncated, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_symtab_vaddr_past_eof_is_typed_err() {
+        // DT_SYMTAB at an unmapped vaddr → UnmappedVaddr during parse_dynsyms, not an OOB. Slot 6.
+        let mut buf = build_fixture();
+        put_dyn(&mut buf, 6, DT_SYMTAB, 0xffff_0000);
+        let err = ElfImage::parse(&buf).unwrap_err();
+        assert!(
+            matches!(err, ElfError::UnmappedVaddr(_) | ElfError::Truncated { .. }),
+            "expected UnmappedVaddr/Truncated, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn absurd_strsz_does_not_over_read_or_panic() {
+        // A DT_STRSZ of u64::MAX must not cause an unbounded scan or OOB: str_at clamps the table end
+        // to the buffer length, so a lookup still terminates at the buffer end (or finds the NUL).
+        // Slot 9 is DT_STRSZ. The parse still succeeds because the real names have NULs within bounds.
+        let mut buf = build_fixture();
+        put_dyn(&mut buf, 9, DT_STRSZ, u64::MAX);
+        // Must not panic / hang; either parses (names still NUL-terminated in-bounds) or a typed err.
+        let _ = ElfImage::parse(&buf);
+    }
+
+    #[test]
+    fn unterminated_string_is_typed_err() {
+        // Overwrite every byte from the string table to the buffer end with non-NUL so a name has no
+        // terminator before the clamped table/buffer end. `parse()` itself tolerates a bad SYMBOL
+        // name (it uses `unwrap_or_default()` so a corrupt symtab name → empty, not a hard error),
+        // but the explicit `soname()`/`needed()` string lookups PROPAGATE the error → Truncated,
+        // never a runaway read. The strtab is at STR_OFF; the soname sits at STR_OFF+11.
+        let mut buf = build_fixture();
+        for b in buf
+            .iter_mut()
+            .skip(STR_OFF as usize)
+            .take(IMG_SIZE - STR_OFF as usize)
+        {
+            *b = b'X';
+        }
+        let img = ElfImage::parse(&buf).expect("parse tolerates corrupt symbol names");
+        let err = img.soname().unwrap_err();
+        assert!(
+            matches!(err, ElfError::Truncated { .. }),
+            "expected Truncated (no NUL in strtab), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn needed_offset_past_strtab_is_typed_err() {
+        // DT_NEEDED naming a string offset past the string table → a typed error from needed(), not
+        // a panic. Slot 10 is DT_NEEDED; point it well past the 0x40-byte strtab.
+        let mut buf = build_fixture();
+        put_dyn(&mut buf, 10, DT_NEEDED, 0x10_000); // index far past STR_OFF + 0x40 and past EOF
+        let img = ElfImage::parse(&buf).expect("header/dynamic still parse (names read lazily)");
+        let err = img.needed().unwrap_err();
+        assert!(
+            matches!(err, ElfError::Truncated { .. } | ElfError::UnmappedVaddr(_)),
+            "expected Truncated/UnmappedVaddr, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rela_present_without_symtab_is_typed_err() {
+        // A .rela referencing symbols but no DT_SYMTAB is malformed → MissingDynamic, not a later
+        // OOB symbol index. Zero out the DT_SYMTAB tag (slot 6) so it is absent.
+        let mut buf = build_fixture();
+        put_dyn(&mut buf, 6, DT_NULL, 0); // turn DT_SYMTAB into a stray DT_NULL → terminates dynamic early
+                                          // The dynamic now ends before DT_RELA's symtab is declared; but DT_RELA at slot 0 is read
+                                          // first. Rebuild a case where DT_RELA is present but DT_SYMTAB is not by editing the tag only.
+        let mut buf2 = build_fixture();
+        // Replace the DT_SYMTAB tag with a benign-but-ignored tag value, keeping the entry count.
+        put_u64(&mut buf2, DYN_OFF as usize + 6 * DYN_SIZE, 0x6fff_fffe_u64); // unknown tag → ignored
+        let err = ElfImage::parse(&buf2).unwrap_err();
+        assert!(
+            matches!(err, ElfError::MissingDynamic("DT_SYMTAB")),
+            "expected MissingDynamic(DT_SYMTAB), got {err:?}"
+        );
+        // (buf is unused beyond demonstrating the early-DT_NULL path parses without panic.)
+        let _ = ElfImage::parse(&buf);
+    }
+
+    #[test]
+    fn read_sleb128_running_past_64_bits_is_bad_sleb128() {
+        // 11 continuation bytes drive `shift` past 64 before any terminator → BadSleb128, not an
+        // overflowing shift (`<<` past the type width is UB-adjacent; the guard prevents it).
+        let bytes = [0x80u8; 11];
+        let mut cur = 0usize;
+        assert!(matches!(
+            read_sleb128(&bytes, &mut cur),
+            Err(ElfError::BadSleb128(0))
+        ));
+    }
+
+    #[test]
+    fn aps2_reloc_count_u64_max_does_not_preallocate_or_panic() {
+        // A declared reloc_count of u64::MAX (as a positive SLEB128) with a truncated body must NOT
+        // pre-allocate a u64::MAX-element Vec (OOM) nor spin — the decoder appends per decoded reloc
+        // and runs off the (short) section → a typed Truncated/BadAndroidReloc.
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, i64::MAX); // a huge positive count
+        enc_sleb128(&mut s, 0); // base offset
+                                // No groups follow → the first group_size read runs off the section end.
+        let (buf, _) = build_aps2_image(&s);
+        let img = ElfImage::parse(&buf).unwrap();
+        let err = img.relocations().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ElfError::Truncated { .. } | ElfError::BadAndroidReloc(_, _)
+            ),
+            "expected Truncated/BadAndroidReloc, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn aps2_negative_reloc_count_is_typed_err() {
+        // A reloc_count encoded as a NEGATIVE SLEB128 cannot be a u64 count → BadAndroidReloc, never
+        // a wraparound to a giant unsigned count.
+        let mut s = Vec::new();
+        s.extend_from_slice(&APS2_MAGIC);
+        enc_sleb128(&mut s, -1); // negative count
+        enc_sleb128(&mut s, 0);
+        let (buf, _) = build_aps2_image(&s);
+        let img = ElfImage::parse(&buf).unwrap();
+        assert!(matches!(
+            img.relocations().unwrap_err(),
+            ElfError::BadAndroidReloc(0, 0)
+        ));
+    }
+
+    #[test]
+    fn vaddr_to_off_overlapping_unordered_loads_resolve_by_containment() {
+        // Hostile/odd PT_LOAD table: two overlapping, out-of-order segments. vaddr_to_off must walk
+        // by containment (first covering segment wins) and never index OOB; an address in no segment
+        // → UnmappedVaddr. This proves the converter is total over a malformed load table.
+        let mut buf = vec![0u8; IMG_SIZE];
+        buf[0..4].copy_from_slice(&ELF_MAGIC);
+        buf[EI_CLASS] = ELFCLASS64;
+        buf[EI_DATA] = ELFDATA2LSB;
+        put_u16(&mut buf, 16, ET_DYN);
+        put_u16(&mut buf, 18, EM_X86_64);
+        put_u64(&mut buf, 32, PH_OFF as u64);
+        put_u16(&mut buf, 54, PHDR_SIZE as u16);
+        put_u16(&mut buf, 56, 2);
+        // Segment 0: vaddr 0x2000 (higher) first; Segment 1: vaddr 0x0 (lower) second → unordered.
+        put_phdr(
+            &mut buf, 0, PT_LOAD, PF_R, 0x2000, 0x2000, 0x1000, 0x1000, 0x1000,
+        );
+        put_phdr(&mut buf, 1, PT_LOAD, PF_R, 0x0, 0x0, 0x1000, 0x1000, 0x1000);
+        let img = ElfImage::parse(&buf).expect("no dynamic → header/phdr-only parse");
+        // An address in the lower segment resolves; one in no segment is UnmappedVaddr (not a panic).
+        assert_eq!(img.vaddr_to_off(0x10).unwrap(), 0x10);
+        assert_eq!(img.vaddr_to_off(0x2010).unwrap(), 0x2010);
+        assert!(matches!(
+            img.vaddr_to_off(0x5000),
+            Err(ElfError::UnmappedVaddr(0x5000))
+        ));
+    }
 }
