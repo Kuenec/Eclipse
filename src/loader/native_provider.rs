@@ -295,7 +295,8 @@ impl EclipseNativeProvider {
             "ALooper_removeFd",
             eclipse_alooper_removefd as *const () as u64,
         );
-        // ANativeWindow (5) — SOUND-STUB; getters return real geometry, refcount ops are no-ops.
+        // ANativeWindow (5) — WSI-bound: fromSurface returns the REAL host-EGL native window Eclipse
+        // owns, getters return real geometry, refcount ops are no-ops (the engine render WSI bind).
         p.register(
             "ANativeWindow_fromSurface",
             eclipse_anativewindow_fromsurface as *const () as u64,
@@ -485,6 +486,29 @@ impl SymbolProvider for EclipseNativeProvider {
             .get(name)
             .map(|&addr| ResolvedSym { addr, weak: false })
     }
+}
+
+/// Resolve `ANativeWindow_fromSurface` through the Eclipse native provider (exactly as the engine's
+/// relocation would) and call it with `(env=null, surface=null)`, returning the `ANativeWindow*` the
+/// engine would receive. This is the **engine-style** entry the `eclipse __gl-test-anw` validation
+/// uses to obtain its `ANativeWindow*` — going through the bound native, not a direct internal call —
+/// before driving host `eglCreateWindowSurface` over it. Returns `None` if the name is not bound.
+///
+/// # Safety
+/// The returned pointer is an `ANativeWindow*` Eclipse owns (the real WSI handle when a window exists,
+/// else a sound geometry-only slab handle); the caller passes it to host EGL / the geometry getters.
+#[must_use]
+pub fn anativewindow_from_surface_via_provider() -> Option<*mut c_void> {
+    let provider = EclipseNativeProvider::with_bionic_natives();
+    let addr = provider.resolve("ANativeWindow_fromSurface")?.addr;
+    // SAFETY: `addr` is the address `with_bionic_natives` registered for
+    // `eclipse_anativewindow_fromsurface` (an `unsafe extern "C" fn(*mut c_void, *mut c_void) ->
+    // *mut c_void`), transmuted to that exact signature. The native ignores both args, so null is a
+    // valid call. This mirrors the engine resolving + calling the bound native. 2026-06-05.
+    let func: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute::<u64, _>(addr) };
+    // SAFETY: see above — the native accepts any (env, surface) and does not dereference them.
+    Some(unsafe { func(std::ptr::null_mut(), std::ptr::null_mut()) })
 }
 
 // =================================================================================================
@@ -1454,35 +1478,44 @@ unsafe extern "C" fn eclipse_alooper_removefd(looper: *mut c_void, fd: c_int) ->
     }
 }
 
-// ---- ANativeWindow (5) — surface-backed: REAL live-window geometry; refcount ops no-op ----------
+// ---- ANativeWindow (5) — WSI-bound: returns the REAL host-EGL native window; getters real geometry
 //
-// 2026-06-05: `ANativeWindow_fromSurface` mints an Eclipse window handle holding the **real live
-// geometry of Eclipse's engine window** ([`ndk_registry::engine_window_geometry`], the same window
-// the engine's EGL surface presents to — see [`crate::egl_engine`]); the getters return that real
-// geometry (the documented portrait default only until the run/test path opens the window). REAL
-// (validated by `eclipse __gl-test`): the EGL/GLES2 render surface on that window. DEFERRED
-// (documented): the WSI translation that routes the engine's OWN `eglCreateWindowSurface(this
-// ANativeWindow*)` onto Eclipse's EGL surface — that lands when the boot clears the native-load wall
-// and the engine reaches a frame. `setBuffersGeometry`/`lock`/`unlockAndPost` are NOT in libroblox's
-// 5-symbol ANativeWindow import set (verified vs the engine), so they are intentionally not
-// registered (§ simplicity — dead natives that never bind). `acquire`/`release` are correct no-ops
-// (Eclipse windows live for the process lifetime in the registry).
+// 2026-06-05 — the engine render WSI bind: Roblox's native engine creates its OWN EGL surface by
+// calling host `eglCreateWindowSurface(display, config, (EGLNativeWindowType)<the `ANativeWindow*` it
+// got from `ANativeWindow_fromSurface`>, …)`. For that surface to present to Eclipse's window, the
+// `ANativeWindow*` Eclipse hands the engine must BE the real WSI handle host EGL accepts (Wayland
+// `wl_egl_window*` / X11 XID). So when the render path has built an [`crate::egl_engine::
+// EngineNativeWindow`] on Eclipse's window, `ANativeWindow_fromSurface` returns THAT real WSI pointer
+// ([`ndk_registry::current_wsi_window`]); the geometry getters resolve it via
+// [`ndk_registry::wsi_window_geometry`]. OWNERSHIP: Eclipse owns + exposes the native window; it does
+// NOT pre-create a competing EGL context on the engine path (the engine owns its context — two
+// contexts must not fight over one surface). Validated engine-style by `eclipse __gl-test-anw`.
+// Until the window exists (the engine may probe `fromSurface` earlier), it falls back to a sound
+// geometry-only slab handle ([`default_native_window`]). `setBuffersGeometry`/`lock`/`unlockAndPost`
+// are NOT in libroblox's 5-symbol ANativeWindow import set (verified vs the engine), so they are
+// intentionally not registered (§ simplicity). `acquire`/`release` are correct no-ops (Eclipse owns
+// the window for the process lifetime).
 
 /// `ANativeWindow* ANativeWindow_fromSurface(JNIEnv* env, jobject surface)` — get a native window for
-/// a Java `Surface`. **surface-backed:** Eclipse mints an `ANativeWindow*` handle holding
-/// [`default_native_window`] (the **real live geometry** of Eclipse's window when published, else the
-/// portrait default); the getters then answer with Eclipse's actual window size. The engine's own
-/// `eglCreateWindowSurface` against this handle (the WSI bind) is the deferred render-integration
-/// step. Returns a valid Eclipse handle, or NULL on registry exhaustion — never a fake non-window
-/// pointer.
+/// a Java `Surface`. **WSI-bound:** when the render path has built the real WSI window on Eclipse's
+/// window, returns that real `EGLNativeWindowType` pointer (a `wl_egl_window*` / XID), so the engine's
+/// own `eglCreateWindowSurface(this ANativeWindow*)` presents to Eclipse's window. Until then, falls
+/// back to a sound geometry-only slab handle (the window may not exist yet). Returns NULL only on
+/// registry exhaustion — never a fake non-window pointer.
 ///
 /// # Safety
-/// `env`/`surface` are the JNI args; this native does not dereference them (the surface binding is
-/// deferred), so any value is accepted safely.
+/// `env`/`surface` are the JNI args; this native does not dereference them (Eclipse owns the window
+/// it returns), so any value is accepted safely.
 unsafe extern "C" fn eclipse_anativewindow_fromsurface(
     _env: *mut c_void,
     _surface: *mut c_void,
 ) -> *mut c_void {
+    // Preferred: the real WSI handle host EGL accepts — what the engine will pass to its own
+    // eglCreateWindowSurface to present to Eclipse's window.
+    if let Some(p) = ndk_registry::current_wsi_window() {
+        return p as *mut c_void;
+    }
+    // Fallback (window not built yet): a sound geometry-only handle from the slab.
     match ndk_registry::native_windows().insert(default_native_window()) {
         Ok(h) => handle_to_ptr(h),
         Err(_) => std::ptr::null_mut(),
@@ -1490,23 +1523,29 @@ unsafe extern "C" fn eclipse_anativewindow_fromsurface(
 }
 
 /// `int32_t ANativeWindow_getWidth(ANativeWindow* window)` — the window width in pixels. **sound:**
-/// returns the real stored geometry; a stale/fabricated handle → `-1` (the NDK negative-error
-/// contract), never a fake positive size.
+/// a real WSI window resolves via the WSI map; a fallback slab handle via the slab; a stale/fabricated
+/// pointer → `-1` (the NDK negative-error contract), never a fake size or a dereference.
 ///
 /// # Safety
 /// `window` must be an `ANativeWindow*` from an Eclipse window native (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_anativewindow_getwidth(window: *mut c_void) -> i32 {
+    if let Some((w, _)) = ndk_registry::wsi_window_geometry(window as usize) {
+        return w;
+    }
     ndk_registry::native_windows()
         .with(ptr_to_handle(window), |w| w.width)
         .unwrap_or(-1)
 }
 
 /// `int32_t ANativeWindow_getHeight(ANativeWindow* window)` — the window height in pixels. **sound:**
-/// real stored geometry; stale/fabricated handle → `-1`.
+/// real WSI geometry via the WSI map, else the slab handle; stale/fabricated pointer → `-1`.
 ///
 /// # Safety
 /// `window` must be an `ANativeWindow*` from an Eclipse window native (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_anativewindow_getheight(window: *mut c_void) -> i32 {
+    if let Some((_, h)) = ndk_registry::wsi_window_geometry(window as usize) {
+        return h;
+    }
     ndk_registry::native_windows()
         .with(ptr_to_handle(window), |w| w.height)
         .unwrap_or(-1)
@@ -1975,6 +2014,14 @@ mod tests {
     use super::*;
     use crate::loader::reloc::{apply_one, Rela, SliceImage, SymbolResolver, R_X86_64_GLOB_DAT};
     use std::cell::RefCell;
+    use std::sync::Mutex;
+
+    // Serializes the ANativeWindow tests that share the process-global `ANativeWindow_fromSurface`
+    // path + the WSI-window registry: one test registers a real WSI window (so fromSurface returns
+    // it), the others assert the no-WSI fallback (a slab handle). Running them concurrently would let
+    // a transient registration cross-contaminate. A plain `std::sync::Mutex` (no dep) serializes them
+    // without weakening any assertion. 2026-06-05.
+    static ANW_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     // ---- liblog emit capture (test-only) -------------------------------------------------------
     //
@@ -2594,6 +2641,7 @@ mod tests {
 
     #[test]
     fn anativewindow_getters_return_real_geometry_and_stale_is_negative() {
+        let _guard = ANW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: JNI args are unused by the stub; any value is accepted.
         let win = unsafe {
             eclipse_anativewindow_fromsurface(std::ptr::null_mut(), std::ptr::null_mut())
@@ -2622,6 +2670,7 @@ mod tests {
 
     #[test]
     fn anativewindow_fromsurface_reports_published_live_window_geometry() {
+        let _guard = ANW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 2026-06-05: the engine's ANativeWindow geometry must reflect Eclipse's REAL live window
         // (the EGL surface presents to it), not the fixed phone default. Publishing a geometry then
         // minting a window must surface that geometry through the getters.
@@ -2639,6 +2688,51 @@ mod tests {
         ndk_registry::native_windows()
             .remove(ptr_to_handle(win))
             .ok();
+    }
+
+    #[test]
+    fn anativewindow_fromsurface_returns_the_real_wsi_handle_when_registered() {
+        let _guard = ANW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 2026-06-05 — the engine render WSI bind: when the render path has registered a REAL WSI
+        // native-window pointer (the EGLNativeWindowType host EGL accepts — a wl_egl_window*/XID),
+        // ANativeWindow_fromSurface must return THAT pointer (so the engine's own
+        // eglCreateWindowSurface lands on Eclipse's window), and the geometry getters must resolve it
+        // via the WSI map. A fake-but-pointer-shaped value stands in for the real WSI pointer here (no
+        // window/GPU in a unit test); the binding logic is identical.
+        let fake_wsi: usize = 0x7F00_1234_5670; // 16-byte aligned, never a slab handle (gen high bits)
+        ndk_registry::register_wsi_window(fake_wsi, 1280, 720);
+
+        // SAFETY: JNI args unused; any value accepted.
+        let win = unsafe {
+            eclipse_anativewindow_fromsurface(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(
+            win as usize, fake_wsi,
+            "fromSurface must return the real WSI handle the engine passes to host eglCreateWindowSurface"
+        );
+        // SAFETY: `win` is the registered WSI pointer; the getters resolve it via the WSI map (no deref).
+        unsafe {
+            assert_eq!(
+                eclipse_anativewindow_getwidth(win),
+                1280,
+                "WSI width via the map"
+            );
+            assert_eq!(
+                eclipse_anativewindow_getheight(win),
+                720,
+                "WSI height via the map"
+            );
+            // acquire/release are sound no-ops on the WSI handle.
+            eclipse_anativewindow_acquire(win);
+            eclipse_anativewindow_release(win);
+        }
+        // After unregister, the now-unknown pointer falls through to the slab → -1 (no stale geometry).
+        ndk_registry::unregister_wsi_window(fake_wsi);
+        assert_eq!(
+            ndk_registry::wsi_window_geometry(fake_wsi),
+            None,
+            "an unregistered WSI pointer is unknown (the getters then return the NDK -1 sentinel)"
+        );
     }
 
     // ---- media-ndk: sound-stub sentinels --------------------------------------------------------
