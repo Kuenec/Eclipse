@@ -744,6 +744,46 @@ before any history-rewriting/force operation.
   (`create_returns_each_childs_own_tid_under_heavy_parallel_load`, N=64 × 16 rounds, asserts each returned `pthread_t` ==
   the child's own `gettid()`); reproduced the bug on run 1 pre-fix, **50/50 release-stress + 50/50 release-module + 40/40
   debug-module + 10/10 debug-suite + 5/5 release-suite runs pass post-fix**. Gate now **390 unit + 2 doctests**.
+- **2026-06-05 UPDATE — ENGINE NDK INPUT PATH IS REAL: `ALooper` now actually blocks/wakes on its fds, fed by a
+  winit→looper wake; engine I/O is now render+input ready; validated in isolation. PLUS an evidence-based PREMISE
+  CORRECTION.** **Binary evidence (the authoritative finding, `llvm-readelf --dyn-symbols lib/x86_64/libroblox.so`):**
+  libroblox imports the **7 `ALooper_*`** natives but imports **ZERO `AInputQueue_*` / `AInputEvent_*` / `AMotionEvent_*`
+  / `AKeyEvent_*`** — it is **NOT a NativeActivity**. It receives input the **GLSurfaceView / JNI-push** way: the Java view
+  layer calls the engine's OWN exported JNI methods (`com.roblox.engine.jni.NativeInputInterface.nativePassInput` /
+  `nativePassMouseMove`/`nativePassMouseButton`/`nativePassMouseWheel`/`nativePassPanGesture*`/`nativePassPinch*`/gamepad,
+  + `NativeGLInterface.nativePassKeyEvent`/`nativePassText` — all DEFINED+exported in libroblox). So building an
+  `AInputQueue`/`AInputEvent` native surface + accessors would be **dead code the engine never calls** (forbidden by §2.5
+  / "no dead natives", the same rule that kept ANativeWindow's unused getFormat/setBuffersGeometry out). The durable,
+  evidence-aligned piece the engine DOES use was built instead: **a real fd-backed, wakeable `ALooper`.** New
+  `src/loader/looper.rs` (`Looper` = an owned wake `eventfd` + the registered `(fd, ident, events)` poll set; `Waker` =
+  a lock-free `Arc<eventfd>` clone; `PollSnapshot::poll_once` = a genuine `poll(2)` over the wake fd + every registered
+  fd with the caller's timeout → returns the NDK outcome: a ready fd's `ident`, `ALOOPER_POLL_WAKE`, `ALOOPER_POLL_TIMEOUT`,
+  or `ALOOPER_POLL_ERROR`). `LooperState` in `ndk_registry.rs` now holds the real `Looper` (was a bookkeeping-only fd
+  list). The 7 `ALooper_*` natives in `native_provider.rs` are now REAL: `pollOnce` takes a cheap snapshot UNDER the slab
+  lock then **releases the lock** and blocks lock-free (so a concurrent wake/addFd can't deadlock); `addFd` adds to the
+  real poll set (rejects the unsupported callback form + negative ident with -1, honestly); `removeFd` removes from it;
+  `prepare` registers the looper's `Waker` in a process-global wakers list. **winit→looper feed (ENGINE PATH ONLY):**
+  `feed_winit_input_to_loopers(&WindowEvent)` classifies input-bearing winit events (`classify_winit_event` →
+  `HostInputKind` Pointer/MouseButton/Scroll/Touch/Key) and `wake_all_loopers()` so a host input event unblocks a parked
+  engine `pollOnce` — the NDK-level role of input for this JNI-push engine is a **liveness wake**. The Java-view input
+  path (`src/graphics.rs` MotionEvent→`View.dispatchTouchEvent`) is **UNCHANGED — graphics.rs has ZERO diff** (demo_app /
+  accelerometerdemo / multitouch.test unaffected; 45 graphics + 110 framework tests still green). **VALIDATED in isolation
+  (dev host, `eclipse __input-test`, EXIT=0, deterministic 5/5):** prepare a looper → addFd a synthetic engine input fd →
+  park in pollOnce → inject the fd signal → **pollOnce returns the registered ident 11 (fd 3, POLLIN)**; then park on an
+  infinite pollOnce → inject the host-input wake → **pollOnce returns `ALOOPER_POLL_WAKE`; 1 looper woken** — the asserted
+  fields come from the injected events through the REAL queue, no fake. **REAL vs STUB now:** `ALooper_*` (7) **REAL**
+  (fd-backed, blocks+wakes); `AInputQueue_*`/`AInputEvent_*` **N/A** (engine doesn't import them — input is JNI-push);
+  AAsset/AAssetManager REAL, AConfiguration minimal-correct, ANativeWindow WSI-bound, media-ndk/audio sound-stub
+  (unchanged). `unsafe` confined to the looper's `eventfd`/`poll`/`read`/`write` FFI (dated `// SAFETY:`); reloc/elf/
+  resolve/ndk_registry stay `#![forbid(unsafe_code)]`; ZERO new crates (`libc` already in tree). Cyber-safeguard NOT
+  tripped (NDK input/looper event-primitive only — NO native-load linker / apkenv / bionic_dlopen / ART nativeLoad /
+  framework.rs native-load touched). 16 new tests (7 looper: timeout/wake/cross-thread-wake/ident/wake-priority/remove/
+  re-add; 9 native: prepare-idempotent/ident-return/winit-feed-wakes-parked/callback+ident-reject/no-prepare-error/stale→
+  -1/policy×2/the harness-as-unit-test). Gate now **406 unit + 2 doctests** (fmt/build/clippy `-D warnings`/test/release
+  all clean). **Engine-load frontier UNCHANGED:** engine I/O is now render (egl_engine, §ANativeWindow WSI bind) + input
+  (real ALooper + winit feed) ready; what remains is the boot reaching the engine's input loop **past the native-load
+  wall** (the bionic-shim native-load integration — main-loop/dev-host only, cyber-safeguard). See §6 (2026-06-05 real
+  ALooper input path).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3960,6 +4000,43 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   *Gate:* fmt --all --check / build --all-targets / clippy (-D warnings) / test (**390 unit + 2 doctests**) / release — all
   0-warning/0-error. The engine's heavy threading now has correct, deterministic `pthread_t` identity. File:
   `src/loader/bionic_pthread.rs`.
+- **2026-06-05 — real ALooper input path + winit→looper feed; + an evidence-based premise correction (libroblox is NOT a
+  NativeActivity — no `AInputQueue`).** *Premise correction (the load-bearing finding):* the task framing assumed libroblox
+  reads input NativeActivity-style via the NDK `AInputQueue`/`AInputEvent`. **The real binary disproves it.** `llvm-readelf
+  --dyn-symbols lib/x86_64/libroblox.so` shows it imports the **7 `ALooper_*`** natives and **ZERO** `AInputQueue_*` /
+  `AInputEvent_*` / `AMotionEvent_*` / `AKeyEvent_*`. Instead it **EXPORTS** its input entry points as JNI methods
+  (`com.roblox.engine.jni.NativeInputInterface.nativePassInput`/`nativePassMouse*`/`nativePassPanGesture*`/`nativePass*Gesture`/
+  gamepad, `NativeGLInterface.nativePassKeyEvent`/`nativePassText`) — the **GLSurfaceView / JNI-push** model, not the pull-based
+  NDK input queue. So building an `AInputQueue`/`AInputEvent` native surface would be **dead code the engine never calls**
+  (§2.5 / "no dead natives", the rule that already excluded ANativeWindow's unused getFormat/setBuffersGeometry). *Decision
+  (durable, evidence-aligned, surgical):* build the part the engine actually uses — a **real fd-backed, wakeable `ALooper`** —
+  and a winit→looper **wake** feed (the NDK-level role of host input for a JNI-push engine is a liveness wake). *What was
+  built:* (1) new `src/loader/looper.rs` — `Looper` (owned wake `eventfd` + registered `(fd,ident,events)` poll set), `Waker`
+  (lock-free `Arc<eventfd>`), `PollSnapshot::poll_once` (genuine `poll(2)` → `ident` / `ALOOPER_POLL_WAKE` / `_TIMEOUT` /
+  `_ERROR`); lock discipline: `pollOnce` snapshots UNDER the slab lock then blocks lock-free (no deadlock vs a concurrent
+  wake/addFd). (2) `ndk_registry.rs` — `LooperState` now holds the real `Looper` (was a bookkeeping fd list); a process-global
+  `LOOPER_WAKERS` + `register_looper_waker`/`wake_all_loopers`. (3) `native_provider.rs` — the 7 `ALooper_*` natives are now
+  REAL (`prepare` builds+registers the waker; `addFd` adds to the poll set, rejecting the unsupported callback form / negative
+  ident with -1; `removeFd` removes; `pollOnce` snapshots+blocks); `classify_winit_event`→`HostInputKind` +
+  `feed_winit_input_to_loopers` (engine-path wake). (4) `main.rs` — hidden `__input-test` harness. *Same-pattern audit:* the
+  ALooper handle stays in the existing generational slab (stale/fabricated → typed `Err` → -1, no UB), consistent with the
+  other NDK natives; the winit→looper feed is gated to the engine path — `src/graphics.rs` (the Java-view MotionEvent→
+  `View.dispatchTouchEvent` path) has **ZERO diff** → no regression (45 graphics + 110 framework tests still green).
+  *Regression guard:* 16 new GPU/VM-free tests (7 looper lifecycle: timeout/wake/cross-thread-wake/registered-fd-ident/
+  wake-priority/remove/re-add; 9 native: prepare-idempotent+finite-timeout, ident-return, winit-feed-wakes-parked-pollOnce,
+  callback+negative-ident reject, no-prepare→ERROR-not-panic, stale-handle→-1, input-kind→wake policy×2, the `run_input_test`
+  harness run as a unit test) + the dev-host `eclipse __input-test` (EXIT=0, deterministic 5/5: registered fd → pollOnce
+  returns ident 11/fd 3/POLLIN; host-input wake → parked pollOnce returns `ALOOPER_POLL_WAKE`). The old
+  `alooper_…returns_documented_sentinels` test was updated (its stale "infinite pollOnce no-source → ERROR" assertion is
+  superseded — the real looper now legitimately blocks; the parked-then-woken case is covered by the new wake test).
+  *Cyber-safeguard: NOT tripped* — NDK input/looper event-primitive only; NO native-load linker / apkenv / `bionic_dlopen` /
+  ART `nativeLoad` / `framework.rs` native-load / vendor code touched. *Deps:* ZERO new (`libc` eventfd/poll/read/write
+  already in tree; `winit` already in tree). Context7: NDK `ALooper_pollOnce`/`ALooper_addFd` return contract (ident form,
+  `ALOOPER_POLL_*`) confirmed via developer_android_ndk_reference. *Gate:* fmt --all --check / build --all-targets / clippy
+  (-D warnings) / test (**406 unit + 2 doctests**) / release — all 0-warning/0-error. **NEXT:** engine I/O is now render
+  (egl_engine WSI bind) + input (real ALooper + winit feed) ready; what remains is the boot reaching the engine's input loop
+  past the native-load wall (main-loop/dev-host only, cyber-safeguard). Files: `src/loader/looper.rs` (new),
+  `src/loader.rs`, `src/loader/ndk_registry.rs`, `src/loader/native_provider.rs`, `src/main.rs`.
 
 ---
 

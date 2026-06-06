@@ -97,6 +97,7 @@ pub mod elf;
 pub mod engine;
 pub mod init_run;
 pub mod link;
+pub mod looper;
 pub mod map;
 pub mod native_provider;
 pub mod ndk_registry;

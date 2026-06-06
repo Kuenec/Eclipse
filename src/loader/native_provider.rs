@@ -1333,21 +1333,21 @@ unsafe extern "C" fn eclipse_aconfiguration_getscreenwidthdp(config: *mut c_void
         .unwrap_or(0)
 }
 
-// ---- ALooper (7) — MINIMAL-CORRECT Eclipse per-thread looper ------------------------------------
+// ---- ALooper (7) — REAL fd-backed, wakeable Eclipse per-thread looper ----------------------------
 //
-// 2026-06-05: a thread-local Eclipse looper handle + an fd-registry. `pollOnce` returns the
-// documented `ALOOPER_POLL_*` sentinel (TIMEOUT when given a finite timeout, ERROR when blocking
-// forever with no event source) — a sentinel the NDK contract requires callers to handle, NOT a
-// fake "an event happened" success. Real epoll wiring is deferred until there is an event source
-// (the render/input integration).
-
-// (`ALOOPER_POLL_WAKE` = -1 and `ALOOPER_POLL_CALLBACK` = -2 are part of the public looper contract
-// but Eclipse's natives never return them — `ALooper_wake` is not in libroblox's 27-symbol set and
-// `pollOnce` never fakes a CALLBACK — so they are intentionally not defined here. 2026-06-05.)
-/// `ALOOPER_POLL_TIMEOUT` = -3: no data before the timeout expired. From `<android/looper.h>`.
-const ALOOPER_POLL_TIMEOUT: c_int = -3;
-/// `ALOOPER_POLL_ERROR` = -4: no associated looper / unrecoverable error. From `<android/looper.h>`.
-const ALOOPER_POLL_ERROR: c_int = -4;
+// 2026-06-05: a thread-local Eclipse looper handle backed by a real [`crate::loader::looper::Looper`]
+// (an owned wake `eventfd` + the registered `(fd, ident, events)` poll set). `pollOnce` does a genuine
+// `poll(2)` over the wake fd + every registered fd, returning the standard NDK outcome: a ready fd's
+// `ident`, `ALOOPER_POLL_WAKE` on a wake, `ALOOPER_POLL_TIMEOUT` on the timeout, `ALOOPER_POLL_ERROR`
+// on a poll failure. This replaced the prior bookkeeping-only sentinel looper — the looper now
+// actually blocks and wakes on its fds, which is what the engine's input/job-system threads need.
+//
+// (`ALOOPER_POLL_CALLBACK` = -2 is part of the public looper contract for fds added WITH a callback;
+// Eclipse's `addFd` rejects a non-null callback — the engine uses the ident form — so `pollOnce` never
+// returns CALLBACK. See [`crate::loader::looper`] for the sentinels.)
+use crate::loader::looper::{
+    PollResult, ALOOPER_EVENT_INPUT, ALOOPER_POLL_ERROR, ALOOPER_POLL_TIMEOUT, ALOOPER_POLL_WAKE,
+};
 
 thread_local! {
     /// The calling thread's Eclipse looper handle, set by `ALooper_prepare`, read by
@@ -1367,7 +1367,15 @@ extern "C" fn eclipse_alooper_prepare(_opts: c_int) -> *mut c_void {
         if let Some(h) = tl.get() {
             return handle_to_ptr(h); // existing looper for this thread (NDK: prepare is idempotent)
         }
-        match ndk_registry::loopers().insert(LooperState::default()) {
+        // Build a real fd-backed looper (allocates its wake `eventfd`). NULL on fd exhaustion (the NDK
+        // "no looper" answer) — never a fabricated handle.
+        let Some(looper) = crate::loader::looper::Looper::new() else {
+            return std::ptr::null_mut();
+        };
+        // Register this looper's wake handle so the engine-path winit input feed can wake a parked
+        // `pollOnce` lock-free (see `ndk_registry::wake_all_loopers`).
+        ndk_registry::register_looper_waker(looper.waker());
+        match ndk_registry::loopers().insert(LooperState { looper }) {
             Ok(h) => {
                 tl.set(Some(h));
                 handle_to_ptr(h)
@@ -1403,79 +1411,328 @@ unsafe extern "C" fn eclipse_alooper_acquire(_looper: *mut c_void) {}
 /// `looper` must be an `ALooper*` from an Eclipse looper native (unused here; any value is accepted).
 unsafe extern "C" fn eclipse_alooper_release(_looper: *mut c_void) {}
 
-/// `int ALooper_pollOnce(int timeoutMillis, int* outFd, int* outEvents, void** outData)` — wait for
-/// an event. **minimal-correct (documented sentinel, NOT a fake success):** Eclipse's looper has no
-/// event source yet (deferred to the render/input integration), so it cannot deliver a real event.
-/// Per the NDK contract it clears the out-params and returns the *correct* sentinel for the situation:
-/// `ALOOPER_POLL_TIMEOUT` for a finite (≥ 0) timeout (no data arrived), and `ALOOPER_POLL_ERROR` for
-/// an infinite (< 0) wait — blocking forever with no source would hang, so reporting the
-/// no-source error is the sound, non-hanging answer a caller must handle. Never returns
-/// `ALOOPER_POLL_CALLBACK` or a fd id (no fake "an event happened").
+/// `int ALooper_pollOnce(int timeoutMillis, int* outFd, int* outEvents, void** outData)` — wait for an
+/// event. **REAL:** drives the calling thread's [`crate::loader::looper::Looper`] (set by
+/// `ALooper_prepare`) to do a genuine `poll(2)` over its wake fd + registered fds with `timeout_millis`
+/// (negative = block forever, `0` = return immediately). Returns the NDK outcome:
+/// - a registered fd became ready → its `ident` (≥ 0), with `*out_fd`/`*out_events` set to the fd and
+///   its events (and `*out_data` cleared — Eclipse's `addFd` form has no user data);
+/// - a wake (`ALooper_wake` is not in libroblox's set, but a winit input event / internal wake uses
+///   the same mechanism) → `ALOOPER_POLL_WAKE`;
+/// - the timeout expired → `ALOOPER_POLL_TIMEOUT`;
+/// - the underlying `poll(2)` failed → `ALOOPER_POLL_ERROR`;
+/// - the calling thread has no prepared looper → `ALOOPER_POLL_ERROR` (the NDK "no associated looper").
 ///
 /// # Safety
 /// `out_fd`/`out_events`/`out_data` must each be null or valid writable pointers (the NDK contract);
-/// this native writes the documented "no event" values to the non-null ones.
+/// this native writes the outcome's values to the non-null ones.
 unsafe extern "C" fn eclipse_alooper_pollonce(
     timeout_millis: c_int,
     out_fd: *mut c_int,
     out_events: *mut c_int,
     out_data: *mut *mut c_void,
 ) -> c_int {
-    // Clear the out-params to the "no fd / no events / no data" values (NDK: set when no fd fires).
+    // The calling thread's looper handle (from `ALooper_prepare`). No looper → the NDK no-looper error.
+    let Some(handle) = THREAD_LOOPER.with(std::cell::Cell::get) else {
+        return ALOOPER_POLL_ERROR;
+    };
+    // Take a cheap poll snapshot UNDER the slab lock, then the lock is released (the `with` closure
+    // returns) BEFORE the blocking poll — never block while holding the registry mutex, or a
+    // concurrent wake/addFd would deadlock (see `looper.rs` lock discipline). A stale handle → the
+    // no-looper error sentinel.
+    let snapshot = match ndk_registry::loopers().with(handle, |l| l.looper.snapshot()) {
+        Ok(s) => s,
+        Err(_) => return ALOOPER_POLL_ERROR,
+    };
+    let result = snapshot.poll_once(timeout_millis);
+
+    let (ret, fd, events) = match result {
+        PollResult::Fd { ident, fd, events } => (ident, fd, events),
+        PollResult::Wake => (ALOOPER_POLL_WAKE, 0, 0),
+        PollResult::Timeout => (ALOOPER_POLL_TIMEOUT, 0, 0),
+        PollResult::Error => (ALOOPER_POLL_ERROR, 0, 0),
+    };
     if !out_fd.is_null() {
-        // SAFETY: 2026-06-05 — caller-provided writable `int*` per the contract; write the no-fd value.
-        unsafe { out_fd.write(0) };
+        // SAFETY: 2026-06-05 — caller-provided writable `int*` per the contract; write the firing fd
+        // (0 when no fd fired).
+        unsafe { out_fd.write(fd) };
     }
     if !out_events.is_null() {
-        // SAFETY: 2026-06-05 — caller-provided writable `int*`; write the no-events value.
-        unsafe { out_events.write(0) };
+        // SAFETY: 2026-06-05 — caller-provided writable `int*`; write the fd's events (0 when none).
+        unsafe { out_events.write(events) };
     }
     if !out_data.is_null() {
-        // SAFETY: 2026-06-05 — caller-provided writable `void**`; write the no-data null.
+        // SAFETY: 2026-06-05 — caller-provided writable `void**`; Eclipse's `addFd` ident-form has no
+        // user data, so the NDK out-data is always null here.
         unsafe { out_data.write(std::ptr::null_mut()) };
     }
-    if timeout_millis >= 0 {
-        ALOOPER_POLL_TIMEOUT // finite wait, nothing arrived — the honest sentinel
-    } else {
-        ALOOPER_POLL_ERROR // infinite wait with no event source: report error, never hang
-    }
+    ret
 }
 
 /// `int ALooper_addFd(ALooper* looper, int fd, int ident, int events, ALooper_callbackFunc callback,
-/// void* data)` — register a file descriptor with the looper. **minimal-correct:** records `(fd,
-/// ident)` in the Eclipse looper's fd set (bookkeeping-correct for `removeFd`); returns `1` on
-/// success and `-1` on failure (the NDK contract). Eclipse does not yet poll the fd (no epoll until
-/// the event integration), so `pollOnce` will not deliver its events — documented, not a fake.
+/// void* data)` — register a file descriptor with the looper. **REAL:** adds `(fd, ident, events)` to
+/// the looper's `poll(2)` set so `ALooper_pollOnce` actually waits on `fd` and returns `ident` when it
+/// fires. Returns `1` on success, `-1` on failure (the NDK contract). Per the NDK, with **no callback**
+/// the `ident` MUST be `>= 0` (negative idents are reserved for the poll sentinels), so a non-positive
+/// ident is rejected. Eclipse's looper uses the ident form (no callbacks), so a **non-null** `callback`
+/// is rejected with `-1` — surfaced honestly rather than silently dropping the engine's callback
+/// (libroblox does not use the callback form; if a future caller did, this is the correct signal, not a
+/// fake success).
 ///
 /// # Safety
-/// `looper` must be an `ALooper*` from an Eclipse looper native; `callback`/`data` are stored by value
-/// (callback unused here) and are not dereferenced.
+/// `looper` must be an `ALooper*` from an Eclipse looper native (or garbage, which the registry
+/// rejects); `fd` must be a valid file descriptor the caller keeps open while registered.
 unsafe extern "C" fn eclipse_alooper_addfd(
     looper: *mut c_void,
     fd: c_int,
     ident: c_int,
-    _events: c_int,
-    _callback: *mut c_void,
+    events: c_int,
+    callback: *mut c_void,
     _data: *mut c_void,
 ) -> c_int {
-    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| l.fds.push((fd, ident))) {
+    // NDK contract: with no callback, ident must be >= 0. Eclipse does not run callbacks, so a non-null
+    // callback is an unsupported (honest -1), not a silent drop.
+    if !callback.is_null() || ident < 0 {
+        return -1;
+    }
+    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| {
+        l.looper.add_fd(fd, ident, events)
+    }) {
         Ok(()) => 1,  // NDK: 1 on success
         Err(_) => -1, // NDK: -1 on failure (stale/fabricated looper handle)
     }
 }
 
-/// `int ALooper_removeFd(ALooper* looper, int fd)` — unregister a file descriptor. **minimal-correct:**
-/// removes all entries for `fd` from the Eclipse looper's fd set; returns `1` if the looper handle is
-/// valid (the fd may or may not have been present — the NDK returns 1 for "removed or not present"),
-/// `-1` for a stale/fabricated handle.
+/// `int ALooper_removeFd(ALooper* looper, int fd)` — unregister a file descriptor. **REAL:** removes
+/// `fd` from the looper's `poll(2)` set so `pollOnce` no longer waits on it; returns `1` if the looper
+/// handle is valid (the fd may or may not have been present — the NDK returns 1 for "removed or not
+/// present"), `-1` for a stale/fabricated handle.
 ///
 /// # Safety
 /// `looper` must be an `ALooper*` from an Eclipse looper native (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_alooper_removefd(looper: *mut c_void, fd: c_int) -> c_int {
-    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| l.fds.retain(|&(f, _)| f != fd)) {
+    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| {
+        let _ = l.looper.remove_fd(fd);
+    }) {
         Ok(()) => 1,
         Err(_) => -1,
     }
+}
+
+// ---- winit → ALooper input feed (ENGINE path only) ----------------------------------------------
+//
+// 2026-06-05: how Roblox's native engine actually consumes input — and why this is a looper WAKE, not
+// an NDK AInputQueue. Verified against the real `lib/x86_64/libroblox.so` (llvm-readelf --dyn-symbols):
+// the engine imports the 7 `ALooper_*` natives but imports ZERO `AInputQueue_*` / `AInputEvent_*` /
+// `AMotionEvent_*` / `AKeyEvent_*` — it is NOT a NativeActivity. It receives input the GLSurfaceView
+// way: the Java view layer pushes events INTO the engine via the engine's OWN exported JNI methods
+// (`com.roblox.engine.jni.NativeInputInterface.nativePassInput` / `nativePassMouseMove` /
+// `NativeGLInterface.nativePassKeyEvent` / `nativePassText` / gamepad / gestures — all DEFINED &&
+// exported in libroblox). So the NDK-level role of a host input event for this engine is a LIVENESS
+// WAKE: the engine's worker threads `ALooper_prepare` + park in `pollOnce`; a host input event signals
+// them to wake and re-check their sources. That is exactly [`ndk_registry::wake_all_loopers`].
+//
+// This feed is ENGINE-PATH ONLY. The Java-view apps (demo_app, accelerometerdemo, multitouch.test)
+// keep the existing `MotionEvent` → `View.dispatchTouchEvent` JNI path in `src/graphics.rs` UNCHANGED
+// — this function is never called on that path (no regression).
+
+/// The kind of host user input a winit [`WindowEvent`] carries, for the engine looper feed. A winit
+/// `WindowEvent` is mapped to `Some(kind)` for input-bearing variants and `None` for non-input
+/// (`RedrawRequested`/`Resized`/`CloseRequested`/…). Kept as a small constructible enum so the
+/// kind→wake decision is unit-testable without fabricating winit events (winit's `DeviceId` is not
+/// publicly constructible, so a `WindowEvent` cannot be built in a test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostInputKind {
+    /// Pointer moved (`CursorMoved`) or entered/left the window.
+    Pointer,
+    /// Mouse button (`MouseInput`).
+    MouseButton,
+    /// Mouse wheel / scroll (`MouseWheel`).
+    Scroll,
+    /// Touchscreen contact (`Touch` — down/move/up/cancel).
+    Touch,
+    /// Keyboard key (`KeyboardInput`).
+    Key,
+}
+
+/// Classify a winit [`WindowEvent`] into the [`HostInputKind`] it carries, or `None` if it is not
+/// user input. The single thin, obvious winit→kind mapping; the kind→wake policy lives in
+/// [`host_input_should_wake`] (unit-tested independently).
+pub fn classify_winit_event(event: &winit::event::WindowEvent) -> Option<HostInputKind> {
+    use winit::event::WindowEvent as W;
+    match event {
+        W::CursorMoved { .. } | W::CursorEntered { .. } | W::CursorLeft { .. } => {
+            Some(HostInputKind::Pointer)
+        }
+        W::MouseInput { .. } => Some(HostInputKind::MouseButton),
+        W::MouseWheel { .. } => Some(HostInputKind::Scroll),
+        W::Touch(_) => Some(HostInputKind::Touch),
+        W::KeyboardInput { .. } => Some(HostInputKind::Key),
+        _ => None,
+    }
+}
+
+/// Whether a classified host input event should wake the engine's input loopers. Every input kind
+/// wakes (a Roblox player drives pointer/touch/mouse/scroll/key, all of which the engine consumes via
+/// its JNI input bridge), so this is `true` for any `Some(kind)`. Split out so the policy is a single
+/// unit-testable function over the constructible [`HostInputKind`].
+pub fn host_input_should_wake(kind: Option<HostInputKind>) -> bool {
+    kind.is_some()
+}
+
+/// Engine-path winit input feed: if `event` carries user input, wake every prepared engine looper so a
+/// parked `ALooper_pollOnce` returns `ALOOPER_POLL_WAKE` and the engine's input thread re-checks its
+/// source. Returns the number of loopers woken (`0` if the event is not input, or no looper is
+/// prepared yet). Call ONLY from the engine/GL window mode — never from the Java-view event loop.
+pub fn feed_winit_input_to_loopers(event: &winit::event::WindowEvent) -> usize {
+    if host_input_should_wake(classify_winit_event(event)) {
+        ndk_registry::wake_all_loopers()
+    } else {
+        0
+    }
+}
+
+/// Dev-host isolation harness (`eclipse __input-test`): drive the REAL ALooper input path end-to-end
+/// WITHOUT needing the boot to reach the engine's input loop. Returns a human report on success or a
+/// typed message on the first failed assertion.
+///
+/// It runs the exact native surface a libroblox worker uses:
+/// 1. `ALooper_prepare` → a real fd-backed looper on a worker thread;
+/// 2. `ALooper_addFd` registers a pipe (the stand-in for the engine's own input source) under an
+///    ident; the worker parks in `ALooper_pollOnce`;
+/// 3. the main thread writes the pipe (a synthetic engine input "event") → `pollOnce` wakes and
+///    returns the registered IDENT with the firing fd — proving the fd genuinely wakes the looper;
+/// 4. a synthetic host input WAKE ([`feed_winit_input_to_loopers`]'s primitive, `wake_all_loopers`) is
+///    injected while the worker is parked → `pollOnce` returns `ALOOPER_POLL_WAKE` — proving the
+///    winit-input → looper-wake feed unblocks a parked engine poll.
+///
+/// No GPU / no window / no VM — pure event-primitive validation. Mirrors the unit tests but as a live
+/// dev-host run a human can invoke (`docs/dev-host-runbook.md`).
+pub fn run_input_test() -> Result<String, String> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // A pipe: the write end signals the read end POLLIN-ready — the engine's input-source stand-in.
+    let mut fds = [0i32; 2];
+    // SAFETY: 2026-06-05 — pipe2 writes two fresh fds into the 2-element array; both are taken into
+    // RAII owners immediately below (closed on scope exit), or the call failed.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err("pipe2 failed (fd exhaustion?)".into());
+    }
+    // SAFETY: 2026-06-05 — fds[0]/fds[1] are fresh exclusively-owned fds from pipe2.
+    let read: OwnedFd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: 2026-06-05 — fds[1] is a fresh exclusively-owned fd from pipe2.
+    let mut write: std::fs::File = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    let read_fd = read.as_raw_fd();
+
+    const ENGINE_INPUT_IDENT: c_int = 11;
+    let (registered_tx, registered_rx) = mpsc::channel::<bool>();
+    let (fd_result_tx, fd_result_rx) = mpsc::channel::<(c_int, c_int, c_int)>();
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let (wake_result_tx, wake_result_rx) = mpsc::channel::<c_int>();
+
+    let worker = std::thread::spawn(move || {
+        // (1) prepare + (2) addFd, then park awaiting the fd signal.
+        let looper = eclipse_alooper_prepare(0);
+        if looper.is_null() {
+            let _ = registered_tx.send(false);
+            return;
+        }
+        // SAFETY: 2026-06-05 — `looper` is a valid Eclipse handle; `read_fd` stays open for the run;
+        // null callback + ident >= 0 is the supported ident form.
+        let added = unsafe {
+            eclipse_alooper_addfd(
+                looper,
+                read_fd,
+                ENGINE_INPUT_IDENT,
+                ALOOPER_EVENT_INPUT,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let _ = registered_tx.send(added == 1);
+        let mut out_fd: c_int = -1;
+        let mut out_events: c_int = -1;
+        // (3) park up to 5 s; the main thread writes the pipe.
+        // SAFETY: 2026-06-05 — valid writable out-params; blocking poll until the fd fires.
+        let rc = unsafe {
+            eclipse_alooper_pollonce(5000, &mut out_fd, &mut out_events, std::ptr::null_mut())
+        };
+        let _ = fd_result_tx.send((rc, out_fd, out_events));
+
+        // (4) remove the fd, then park again on a pure WAKE (no source) — the wake feed must unblock it.
+        // SAFETY: 2026-06-05 — valid looper handle.
+        let _ = unsafe { eclipse_alooper_removefd(looper, read_fd) };
+        let _ = parked_tx.send(());
+        // SAFETY: 2026-06-05 — block forever; only the injected wake returns it.
+        let wrc = unsafe {
+            eclipse_alooper_pollonce(
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let _ = wake_result_tx.send(wrc);
+    });
+
+    // Stage 2/3: confirm registration, then signal the synthetic engine input.
+    match registered_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(true) => {}
+        Ok(false) => return Err("ALooper_prepare/addFd failed in the worker".into()),
+        Err(_) => return Err("worker did not register its fd (timeout)".into()),
+    }
+    // A synthetic touch DOWN/MOVE/UP + key are all "the engine's input source has data" at the NDK
+    // layer; one write makes the registered fd readable, which is what wakes the parked pollOnce.
+    write
+        .write_all(b"DOWN")
+        .map_err(|e| format!("write to engine input source: {e}"))?;
+    let (rc, out_fd, out_events) = fd_result_rx
+        .recv_timeout(Duration::from_secs(6))
+        .map_err(|_| "pollOnce did not wake on the fd (timeout)".to_string())?;
+    if rc != ENGINE_INPUT_IDENT {
+        return Err(format!(
+            "pollOnce returned {rc}, expected the registered ident {ENGINE_INPUT_IDENT}"
+        ));
+    }
+    if out_fd != read_fd {
+        return Err(format!(
+            "pollOnce out_fd {out_fd} != the firing fd {read_fd}"
+        ));
+    }
+    if out_events & ALOOPER_EVENT_INPUT == 0 {
+        return Err(format!("pollOnce out_events {out_events} missing POLLIN"));
+    }
+
+    // Stage 4: the worker is now parked on a pure WAKE; inject the host-input wake feed.
+    parked_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| "worker did not re-park for the wake stage (timeout)".to_string())?;
+    // Small settle so the worker is actually inside poll(2) before we wake (best-effort; the eventfd
+    // wake is edge-safe either way — a wake before the park still leaves the counter non-zero).
+    std::thread::sleep(Duration::from_millis(50));
+    let woken = ndk_registry::wake_all_loopers();
+    if woken == 0 {
+        return Err("wake_all_loopers woke 0 loopers (no looper registered its waker?)".into());
+    }
+    let wrc = wake_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "parked pollOnce did not return after the wake (timeout)".to_string())?;
+    if wrc != ALOOPER_POLL_WAKE {
+        return Err(format!(
+            "post-wake pollOnce returned {wrc}, expected ALOOPER_POLL_WAKE ({ALOOPER_POLL_WAKE})"
+        ));
+    }
+
+    worker
+        .join()
+        .map_err(|_| "worker thread panicked".to_string())?;
+    Ok(format!(
+        "input path OK: registered fd → pollOnce returned ident {ENGINE_INPUT_IDENT} (fd {read_fd}, POLLIN); \
+         host-input wake → parked pollOnce returned ALOOPER_POLL_WAKE; {woken} looper(s) woken"
+    ))
 }
 
 // ---- ANativeWindow (5) — WSI-bound: returns the REAL host-EGL native window; getters real geometry
@@ -2567,7 +2824,7 @@ mod tests {
         assert_eq!(unsafe { eclipse_aconfiguration_getscreenwidthdp(cfg) }, 0);
     }
 
-    // ---- ndk-android: ALooper minimal-correct sentinels ----------------------------------------
+    // ---- ndk-android: ALooper lifecycle (prepare/addFd/removeFd/stale) -------------------------
 
     #[test]
     fn alooper_prepare_is_idempotent_per_thread_and_pollonce_returns_documented_sentinels() {
@@ -2592,7 +2849,10 @@ mod tests {
         let removed = unsafe { eclipse_alooper_removefd(l1, 7) };
         assert_eq!(removed, 1, "removeFd on a valid looper returns 1");
 
-        // pollOnce: finite timeout → TIMEOUT; infinite → ERROR (never a fake CALLBACK / fd id).
+        // pollOnce: a finite timeout with no ready source → TIMEOUT (the real poll(2) timed out, never
+        // a fake CALLBACK / fd id). (2026-06-05: an INFINITE pollOnce with no source now legitimately
+        // BLOCKS — the looper is real — so it is NOT asserted here; the parked-then-woken infinite poll
+        // is covered by `winit_feed_wakes_a_parked_native_pollonce`.)
         // SAFETY: out-params are null (allowed by the contract).
         let finite = unsafe {
             eclipse_alooper_pollonce(
@@ -2604,20 +2864,7 @@ mod tests {
         };
         assert_eq!(
             finite, ALOOPER_POLL_TIMEOUT,
-            "finite-timeout pollOnce → TIMEOUT"
-        );
-        // SAFETY: out-params are null.
-        let infinite = unsafe {
-            eclipse_alooper_pollonce(
-                -1,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(
-            infinite, ALOOPER_POLL_ERROR,
-            "infinite pollOnce (no source) → ERROR"
+            "finite-timeout pollOnce with no ready source → TIMEOUT"
         );
 
         // addFd / removeFd on a stale looper → -1 (rejected, never UB).
@@ -2906,5 +3153,252 @@ mod tests {
                 .addr,
             "SL_IID_ENGINE address is stable across providers"
         );
+    }
+
+    // ---- ALooper natives end-to-end (the engine's real input-loop surface) ---------------------
+    //
+    // 2026-06-05: drive the actual `extern "C"` ALooper natives (prepare → addFd → pollOnce →
+    // removeFd) on the calling thread, proving the C-ABI surface a libroblox worker uses works
+    // through the real fd-backed looper + the generational registry. These run on their own threads
+    // so each gets a fresh thread-local looper (`ALooper_prepare` is per-thread).
+
+    /// A self-contained pipe whose write end signals the read end POLLIN-ready — a stand-in for an
+    /// engine input source registered via `ALooper_addFd`. RAII-closes both ends.
+    struct NativeTestPipe {
+        read: std::os::fd::OwnedFd,
+        write: std::fs::File,
+    }
+    impl NativeTestPipe {
+        fn new() -> Self {
+            use std::os::fd::FromRawFd;
+            let mut fds = [0i32; 2];
+            // SAFETY: test-only — pipe2 writes two fresh fds; both taken into RAII owners below.
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            assert_eq!(rc, 0, "pipe2");
+            // SAFETY: test-only — fresh exclusively-owned fds from pipe2.
+            let read = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: test-only — fresh exclusively-owned fd from pipe2.
+            let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+            Self { read, write }
+        }
+        fn read_fd(&self) -> i32 {
+            use std::os::fd::AsRawFd;
+            self.read.as_raw_fd()
+        }
+        fn signal(&mut self) {
+            use std::io::Write;
+            self.write.write_all(b"x").expect("signal pipe");
+        }
+    }
+
+    #[test]
+    fn alooper_prepare_then_pollonce_no_source_times_out() {
+        std::thread::spawn(|| {
+            let looper = eclipse_alooper_prepare(0);
+            assert!(!looper.is_null(), "prepare returns a real looper handle");
+            // forThread returns the same handle (prepare is idempotent / thread-local).
+            assert_eq!(eclipse_alooper_forthread(), looper, "forThread == prepared");
+            // No fds, finite timeout → POLL_TIMEOUT (real poll honored the timeout, no fake event).
+            // SAFETY: test-only — null out-params are allowed by the contract.
+            let rc = unsafe {
+                eclipse_alooper_pollonce(
+                    10,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, ALOOPER_POLL_TIMEOUT);
+        })
+        .join()
+        .expect("looper thread");
+    }
+
+    #[test]
+    fn alooper_pollonce_returns_ident_when_registered_fd_fires() {
+        let mut pipe = NativeTestPipe::new();
+        let fd = pipe.read_fd();
+        // The pipe outlives the thread (signaled after the thread parks via a channel handshake).
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<i32>();
+        let h = std::thread::spawn(move || {
+            let looper = eclipse_alooper_prepare(0);
+            assert!(!looper.is_null());
+            const IDENT: c_int = 42;
+            // SAFETY: test-only — `looper` is a valid Eclipse handle; `fd` stays open (owned by the
+            // outer pipe); callback null + ident >= 0 is the supported ident form.
+            let added = unsafe {
+                eclipse_alooper_addfd(
+                    looper,
+                    fd,
+                    IDENT,
+                    1,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(added, 1, "addFd succeeds");
+            ready_tx.send(()).expect("signal ready");
+            let mut out_fd: c_int = -1;
+            let mut out_events: c_int = -1;
+            // SAFETY: test-only — valid writable out-params; blocking poll until the fd fires.
+            let rc = unsafe {
+                eclipse_alooper_pollonce(1000, &mut out_fd, &mut out_events, std::ptr::null_mut())
+            };
+            assert_eq!(rc, IDENT, "pollOnce returns the registered ident");
+            assert_eq!(out_fd, fd, "out_fd is the fd that fired");
+            assert!(out_events & 1 != 0, "out_events reports POLLIN");
+            done_tx.send(rc).expect("signal done");
+        });
+        ready_rx.recv().expect("thread registered the fd");
+        // Now signal the source; the parked pollOnce must wake and return the ident.
+        pipe.signal();
+        let rc = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pollOnce woke");
+        assert_eq!(rc, 42);
+        h.join().expect("looper thread");
+    }
+
+    #[test]
+    fn winit_feed_wakes_a_parked_native_pollonce() {
+        // Proves the engine-path winit feed (`wake_all_loopers`) wakes a parked `ALooper_pollOnce`.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<i32>();
+        let h = std::thread::spawn(move || {
+            let looper = eclipse_alooper_prepare(0);
+            assert!(!looper.is_null());
+            ready_tx.send(()).expect("ready");
+            // Indefinite block; only a wake can return it (no fds, negative timeout).
+            // SAFETY: test-only — null out-params allowed.
+            let rc = unsafe {
+                eclipse_alooper_pollonce(
+                    -1,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            done_tx.send(rc).expect("done");
+        });
+        ready_rx.recv().expect("thread prepared its looper");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let woken = ndk_registry::wake_all_loopers();
+        assert!(
+            woken >= 1,
+            "at least the parked looper was registered + woken"
+        );
+        let rc = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pollOnce woke");
+        assert_eq!(
+            rc, ALOOPER_POLL_WAKE,
+            "the winit feed woke the parked pollOnce"
+        );
+        h.join().expect("looper thread");
+    }
+
+    #[test]
+    fn alooper_addfd_rejects_callback_and_negative_ident() {
+        std::thread::spawn(|| {
+            let looper = eclipse_alooper_prepare(0);
+            // A non-null callback is unsupported (Eclipse uses the ident form) → -1, not a silent drop.
+            // Use a pointer to a real local so it is genuinely non-null (and never dereferenced).
+            let mut sentinel: u8 = 0;
+            let cb = std::ptr::addr_of_mut!(sentinel).cast::<c_void>();
+            // SAFETY: test-only — `cb` is never dereferenced (rejected before use).
+            let r1 = unsafe { eclipse_alooper_addfd(looper, 3, 1, 1, cb, std::ptr::null_mut()) };
+            assert_eq!(r1, -1, "callback form rejected");
+            // A negative ident with no callback is invalid per the NDK → -1.
+            // SAFETY: test-only.
+            let r2 = unsafe {
+                eclipse_alooper_addfd(looper, 3, -1, 1, std::ptr::null_mut(), std::ptr::null_mut())
+            };
+            assert_eq!(r2, -1, "negative ident rejected");
+        })
+        .join()
+        .expect("looper thread");
+    }
+
+    #[test]
+    fn alooper_pollonce_without_prepare_is_error_not_panic() {
+        std::thread::spawn(|| {
+            // This thread never prepared a looper → POLL_ERROR (NDK "no associated looper"), no panic.
+            // SAFETY: test-only — null out-params allowed.
+            let rc = unsafe {
+                eclipse_alooper_pollonce(
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, ALOOPER_POLL_ERROR);
+        })
+        .join()
+        .expect("thread");
+    }
+
+    #[test]
+    fn alooper_addfd_removefd_on_stale_handle_return_minus_one() {
+        // A fabricated/stale ALooper* must be rejected by the registry → -1, never a wild deref.
+        let fabricated = handle_to_ptr::<c_void>(0xDEAD_0000_0001);
+        // SAFETY: test-only — the registry validates the handle and rejects it before any fd use.
+        let add = unsafe {
+            eclipse_alooper_addfd(
+                fabricated,
+                5,
+                1,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(add, -1, "addFd on a fabricated handle is -1");
+        // SAFETY: test-only.
+        let rem = unsafe { eclipse_alooper_removefd(fabricated, 5) };
+        assert_eq!(rem, -1, "removeFd on a fabricated handle is -1");
+    }
+
+    // ---- winit → looper input feed policy ------------------------------------------------------
+    //
+    // 2026-06-05: winit's `WindowEvent` cannot be constructed in a test (its `DeviceId` is
+    // `pub(crate)`), so the winit→kind mapping (`classify_winit_event`) is a thin obvious match and
+    // the testable policy is the kind→wake decision over the constructible `HostInputKind`.
+
+    #[test]
+    fn every_host_input_kind_wakes_the_loopers() {
+        for kind in [
+            HostInputKind::Pointer,
+            HostInputKind::MouseButton,
+            HostInputKind::Scroll,
+            HostInputKind::Touch,
+            HostInputKind::Key,
+        ] {
+            assert!(
+                host_input_should_wake(Some(kind)),
+                "{kind:?} (a Roblox player input) must wake the engine input loop"
+            );
+        }
+    }
+
+    #[test]
+    fn non_input_events_do_not_wake() {
+        // None = a non-input winit event (RedrawRequested/Resized/CloseRequested/…) → must NOT wake.
+        assert!(
+            !host_input_should_wake(None),
+            "non-input events must not wake the engine input loop"
+        );
+    }
+
+    #[test]
+    fn full_input_path_run_input_test_succeeds() {
+        // The dev-host harness is also a unit test: it is GPU/VM-free and self-contained (a pipe + a
+        // worker thread), so it runs in the suite and proves the synthetic touch DOWN→fd→pollOnce(ident)
+        // and the host-input-wake→pollOnce(WAKE) path end-to-end through the real natives.
+        match run_input_test() {
+            Ok(report) => assert!(report.contains("ALOOPER_POLL_WAKE"), "report: {report}"),
+            Err(e) => panic!("run_input_test failed: {e}"),
+        }
     }
 }
