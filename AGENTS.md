@@ -846,6 +846,21 @@ before any history-rewriting/force operation.
   `-D warnings`/test/release all clean). **Engine-load frontier UNCHANGED (audio is a parallel subsystem): bind the
   relocated+resolved image to execution past the 3,427 DT_INIT_ARRAY ctors. The engine's audio output now has a real OpenSL
   ES → host path the moment it calls `slCreateEngine`.** See §6 (2026-06-05 real OpenSL ES audio).
+- **2026-06-05 CAPSTONE (engine-load track) — verified at HEAD `1d4228e`:** the from-scratch Rust bionic loader takes the
+  REAL `lib/x86_64/libroblox.so` all the way to **map + relocate (527,843 incl. APS2) + resolve (all 584 imports,
+  `unresolved_strong=0`) + run all 3,427 `DT_INIT_ARRAY` constructors deterministically + `JNI_OnLoad` (JNI 1.6) against the
+  real ART VM + Roblox `Application.onCreate`**; the engine I/O surfaces are built + validated in isolation — render
+  (EGL/GLES2 + ANativeWindow WSI bind, `__gl-test`/`__gl-test-anw`), input (real fd-backed `ALooper`, `__input-test`), audio
+  (OpenSL ES → cpal, `__audio-test`); the pthread UAF is fixed; **4 gated regression guards** (`tests/engine_milestones.rs`)
+  protect the milestones (all 4 RAN+PASS on this dev host — APK + Wayland present). **Gate clean at HEAD `1d4228e`: 420 unit +
+  4 integration + 2 doctests, 0 failed; fmt/build/clippy `-D warnings`/release all clean.** **THE ONE WALL (render-critical,
+  unchanged):** the native-load routing step — ART's `Runtime.nativeLoad` does NOT consult Eclipse's pre-loaded-lib registry
+  (`src/loader/engine.rs`), so `androidx.startup`'s `System.loadLibrary("zstd-jni")` re-enters the apkenv linker; the consult
+  (re-`RegisterNatives` `Runtime.nativeLoad` → engine.rs registry → success for a hit) trips the cyber-safeguard → needs the
+  **Cyber Verification Program or a human one-time edit** (main-loop/dev-host only). **HONEST STATUS: Roblox does NOT render
+  yet** — the load+init+I/O foundation is complete; the engine running+rendering is the remaining work, gated on this wall.
+  Likely next frontier once past it = the host-baseline bionic libc ABI-mismatch class (like the fixed sysconf/pthread),
+  fixed evidence-first. Full capstone + runbook: [`docs/engine-load-capstone-2026-06-05.md`](docs/engine-load-capstone-2026-06-05.md).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
