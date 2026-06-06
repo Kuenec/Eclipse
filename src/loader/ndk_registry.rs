@@ -305,6 +305,32 @@ pub fn apk_path() -> Option<&'static PathBuf> {
     APK_PATH.get()
 }
 
+/// The real, live geometry of Eclipse's engine render window, in physical pixels.
+///
+/// 2026-06-05: `ANativeWindow_fromSurface` mints a window handle whose geometry the engine reads via
+/// `ANativeWindow_getWidth/Height/Format` to size its EGL framebuffer. The window is opened by `winit`
+/// only after the event loop is `resumed`, *after* the engine-init path; so the run/test path
+/// **publishes the live window's geometry here** (the same window the engine's EGL surface presents
+/// to — see [`crate::egl_engine`]). When unset, the natives fall back to a documented portrait
+/// default (a sound geometry, never a crash). Updated on resize so the engine can re-query.
+static ENGINE_WINDOW_GEOMETRY: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// Publish Eclipse's live window geometry (physical pixels) for the `ANativeWindow_*` geometry
+/// natives. Called by the run/test path when the window is created and on each resize. Clamped to
+/// ≥ 1×1 (a zero dimension is not a valid surface size). A poisoned lock is ignored (best-effort
+/// publish; the natives then read the last good / default value) so this never panics.
+pub fn set_engine_window_geometry(width: i32, height: i32) {
+    if let Ok(mut g) = ENGINE_WINDOW_GEOMETRY.lock() {
+        *g = Some((width.max(1), height.max(1)));
+    }
+}
+
+/// The published engine-window geometry `(width, height)` in physical pixels, or `None` if the run/
+/// test path has not opened a window yet (then the geometry natives use their documented default).
+pub fn engine_window_geometry() -> Option<(i32, i32)> {
+    ENGINE_WINDOW_GEOMETRY.lock().ok().and_then(|g| *g)
+}
+
 /// The process-global `AAssetManager*` slab.
 pub fn asset_managers() -> &'static Slab<AssetManagerState> {
     static S: Slab<AssetManagerState> = Slab::new();
