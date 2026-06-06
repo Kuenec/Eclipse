@@ -82,6 +82,14 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 # no C/system font lib (§2.1); the system font FILE is found portably at runtime via fontconfig
 # `fc-match` / known font dirs (detect-don't-assume §9), never linking fontconfig.
 ab_glyph = "0.2"
+# 2026-06-05: host audio output for the REAL OpenSL ES path (src/loader/opensl.rs). libroblox's
+# x86-64 build imports OpenSL ES (slCreateEngine + SL_IID_*); Eclipse returns a working SLObjectItf
+# whose buffer-queue Enqueue feeds a host output stream. `cpal` is the smallest portable Linux sound
+# option: it auto-selects ALSA (which modern distros route through PipeWire/Pulse's ALSA-compat layer)
+# — detect-don't-assume (§9), no hardcoded backend. It is pure-Rust except the ALSA-C link (the
+# documented "purity ceiling" in docs/dependency-plan.md — no pure-Rust Linux audio exists). Adds 4
+# new crates (cpal, alsa, alsa-sys, dasp_sample); libc/bitflags/cfg-if/pkg-config already in tree.
+cpal = "0.17"
 # 2026-06-05: pure-Rust software 2D rasterizer (a Skia subset, no C/Skia link) for the vector-drawable
 # pass — fills each android.graphics.Path's REAL recorded geometry (path_registry) into an RGBA Pixmap
 # the renderer uploads as a GPU texture (mirroring the glyph atlas). `std` + `simd` (default) kept;

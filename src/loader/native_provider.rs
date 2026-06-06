@@ -65,27 +65,30 @@
 //!   documented sound sentinels (valid-but-empty handle / negative error per the NDK contract) so
 //!   resolution + early init proceed WITHOUT pretending a frame was presented. Deferred-to-render.
 //!
-//! ## media-ndk (libmediandk, 33) + audio (OpenSL ES, 8) — sound-stubs (added 2026-06-05)
-//! The final two work-list categories. Both are **gameplay-time** subsystems (video playback, sound)
-//! — NOT needed to start/render — so the soundest minimal step is a contract-correct "unavailable"
-//! stub: each native returns its public-ABI failure/unavailable sentinel so a caller cleanly detects
-//! "no media / no audio" and never acts on a fabricated success. NO global state, NO UB.
-//! - **media-ndk (33) — sound-stub: media playback deferred (gameplay-time):** `AMediaCodec_*` /
+//! ## media-ndk (libmediandk, 33) — sound-stubs (added 2026-06-05) + audio (OpenSL ES, 8) — REAL
+//! - **media-ndk (33) — sound-stub: media playback deferred (gameplay-time):** video playback is NOT
+//!   needed to start/render, so each native returns its public-ABI failure/unavailable sentinel so a
+//!   caller cleanly detects "no media" and never acts on a fabricated success. `AMediaCodec_*` /
 //!   `AMediaFormat_*` pointer-returning fns → `NULL`; [`media_status_t`](MEDIA_STATUS)-returning fns
 //!   → `AMEDIA_ERROR_UNSUPPORTED`; the `ssize_t` dequeue fns → that error (negative); `bool` getters
 //!   → `false`; `delete`/setters → safe no-ops; `AMediaFormat_toString` → a stable empty C string.
 //!   The 10 `AMEDIAFORMAT_KEY_*` are real `const char*` data objects holding the documented public
 //!   key strings (minimal-correct data, not a stub).
-//! - **audio (8) — sound-stub: audio deferred (gameplay-time):** `slCreateEngine` →
-//!   `SL_RESULT_FEATURE_UNSUPPORTED` (the public OpenSL ES result a caller checks for "no audio");
-//!   the 7 `SL_IID_*` are real, stable, distinct `SLInterfaceID` data objects (valid non-null
-//!   addresses; never queried because `slCreateEngine` fails first).
+//! - **audio (8) — REAL OpenSL ES → host audio (2026-06-05):** `slCreateEngine` is implemented by
+//!   [`super::opensl`] — it returns a **working** `SLObjectItf` whose vtables drive
+//!   `Realize`/`GetInterface`/`CreateOutputMix`/`CreateAudioPlayer`/`SetPlayState` and whose
+//!   `SLAndroidSimpleBufferQueueItf::Enqueue` feeds a **cpal** host output stream (real PCM → real
+//!   sound). The 7 `SL_IID_*` stay real, stable, distinct `SLInterfaceID` data objects — now
+//!   **consumed** by `GetInterface` (matched via [`sl_iid_index`]). On a host with no audio device the
+//!   engine still constructs and accepts Enqueues (no sound) — a clean "no device" posture, never a
+//!   fake. Only `slCreateEngine` + the 7 IIDs are imported by libroblox (everything else flows through
+//!   the vtables), so no other audio symbol is registered (no dead natives, §2.5).
 //!
 //! ## What this is NOT (honest scope, dated 2026-06-05)
 //! Registering a correct address makes the relocation land *and* (for the forward/minimal/real
 //! natives) makes a **call** to that symbol behave per its public contract. It does **not** by itself
-//! make `libroblox.so` runnable — that needs the rest of the work-list (media-ndk / audio + the 2
-//! variadic liblog), binding the image to execution, and running the `DT_INIT_ARRAY` constructors
+//! make `libroblox.so` runnable — that needs binding the image to execution and running the
+//! `DT_INIT_ARRAY` constructors
 //! (the runtime tail, main-loop / dev-host only). The ANativeWindow surface/buffer natives are
 //! explicitly **deferred to the render integration** (documented sound sentinels until then).
 
@@ -151,8 +154,9 @@ impl EclipseNativeProvider {
     /// **variadic** ones — `__android_log_print`/`__android_log_assert` — now DEFINED by the
     /// clean-room C shim, 2026-06-05); bionic-libc's 15; ndk-android's 27 (AAsset* real via
     /// `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub); media-ndk's 33
-    /// and audio's 8 sound-stubs. **88** symbols total — registering them shrinks the engine's
-    /// work-list from 88 to **0** (FULL resolution of all 584 libroblox imports to Eclipse/host).
+    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **88** symbols
+    /// total — registering them shrinks the engine's work-list from 88 to **0** (FULL resolution of
+    /// all 584 libroblox imports to Eclipse/host).
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -432,16 +436,21 @@ impl EclipseNativeProvider {
         p.register("AMEDIAFORMAT_KEY_STRIDE", amediaformat_key_addr(8));
         p.register("AMEDIAFORMAT_KEY_WIDTH", amediaformat_key_addr(9));
 
-        // ---- audio (OpenSL ES) — the 8 audio natives (sound-stub: gameplay-time) ----------------
-        // slCreateEngine → SL_RESULT_FEATURE_UNSUPPORTED so the caller cleanly detects "no audio".
+        // ---- audio (OpenSL ES) — the 8 audio natives (REAL OpenSL ES → host audio) ---------------
+        // 2026-06-05: slCreateEngine now returns a WORKING Eclipse-owned `SLObjectItf` engine
+        // (`super::opensl`): Realize/GetInterface yields a real SLEngineItf; CreateOutputMix +
+        // CreateAudioPlayer (AndroidSimpleBufferQueue source + PCM format → output-mix sink) build a
+        // player whose SLAndroidSimpleBufferQueueItf::Enqueue feeds a cpal host output stream. On a
+        // host with no audio device the engine still constructs (Enqueues accepted, no sound) — a
+        // clean "no device" posture, never a fake. See `src/loader/opensl.rs`.
         p.register(
             "slCreateEngine",
-            eclipse_sl_create_engine as *const () as u64,
+            super::opensl::eclipse_sl_create_engine as *const () as u64,
         );
         // SL_IID_* (7) — DATA objects of type `SLInterfaceID` (a pointer to a 128-bit interface UUID
-        // struct). Each resolves to a stable, valid, distinct Eclipse-owned `SLInterfaceID_` object so
-        // the relocation has a real non-null address; audio being unavailable, no engine ever queries
-        // them (slCreateEngine fails first).
+        // struct). Each resolves to a stable, valid, distinct Eclipse-owned `SLInterfaceID_` object;
+        // `GetInterface` matches the engine's requested interface by these pointers (see
+        // `sl_iid_index`).
         p.register("SL_IID_ANDROIDCONFIGURATION", sl_iid_addr(0));
         p.register("SL_IID_ANDROIDSIMPLEBUFFERQUEUE", sl_iid_addr(1));
         p.register("SL_IID_BUFFERQUEUE", sl_iid_addr(2));
@@ -2170,40 +2179,17 @@ fn amediaformat_key_addr(idx: usize) -> u64 {
 }
 
 // =================================================================================================
-// audio (OpenSL ES) — the 8 audio natives. SOUND-STUB: audio deferred (gameplay-time). 2026-06-05.
+// audio (OpenSL ES) — the 8 audio natives. REAL OpenSL ES → host audio (cpal). 2026-06-05.
 //
-// Sound is a gameplay-time subsystem libroblox does not need to start/render. Per the PUBLIC OpenSL
-// ES 1.0.1 C-ABI (`SLES/OpenSLES.h`): `slCreateEngine` returns `SL_RESULT_FEATURE_UNSUPPORTED`
-// (0x0000000C = 12) — the documented result a caller checks to detect "no audio" cleanly. The 7
-// `SL_IID_*` are DATA objects of type `SLInterfaceID` (a pointer to a 128-bit interface-UUID struct);
-// each resolves to a stable, valid, distinct Eclipse-owned `SLInterfaceID_` so the relocation has a
-// real non-null address. Audio being unavailable, no engine is ever created to query them.
+// `slCreateEngine` is implemented by [`super::opensl`] (a working `SLObjectItf` engine whose vtables
+// drive CreateOutputMix/CreateAudioPlayer/Enqueue → a cpal host output stream). The 7 `SL_IID_*` are
+// DATA objects of type `SLInterfaceID` (a pointer to a 128-bit interface-UUID struct); each resolves
+// to a stable, valid, distinct Eclipse-owned `SLInterfaceID_` so the relocation has a real non-null
+// address AND `opensl::obj_get_interface` can match the engine's requested interface by these
+// pointers (via [`sl_iid_index`]). Only `slCreateEngine` + these 7 IIDs are imported by libroblox;
+// everything else flows through the vtables, so no additional audio symbol is registered (no dead
+// natives — AGENTS.md §2.5).
 // =================================================================================================
-
-/// `SLresult` is `SLuint32` → C `u32`. `SL_RESULT_FEATURE_UNSUPPORTED = 0x0000000C` from the public
-/// OpenSL ES 1.0.1 header — "the requested feature is not supported", the clean "no audio" sentinel.
-const SL_RESULT_FEATURE_UNSUPPORTED: u32 = 0x0000_000C;
-
-/// `SLresult slCreateEngine(SLObjectItf* pEngine, SLuint32 numOptions,
-/// const SLEngineOption* pEngineOptions, SLuint32 numInterfaces, const SLInterfaceID* pInterfaceIDs,
-/// const SLboolean* pInterfaceRequired)`. **sound-stub:** audio is deferred, so the engine cannot be
-/// created → `SL_RESULT_FEATURE_UNSUPPORTED`. Per the OpenSL ES contract a non-success result means no
-/// object was produced, so `*pEngine` is left untouched and the caller must not use it. NOT a fake
-/// engine the caller would `Realize`/`GetInterface` and then crash on.
-///
-/// # Safety
-/// the pointer args are the OpenSL ES C-ABI params; none is dereferenced (the call fails before
-/// producing an object), so any value (incl. null) is accepted safely.
-unsafe extern "C" fn eclipse_sl_create_engine(
-    _p_engine: *mut c_void,
-    _num_options: u32,
-    _p_engine_options: *const c_void,
-    _num_interfaces: u32,
-    _p_interface_ids: *const c_void,
-    _p_interface_required: *const c_void,
-) -> u32 {
-    SL_RESULT_FEATURE_UNSUPPORTED
-}
 
 /// The public `SLInterfaceID_` struct layout (a 128-bit interface UUID), from `SLES/OpenSLES.h`:
 /// `{ SLuint32 time_low; SLuint16 time_mid; SLuint16 time_hi_and_version; SLuint16 clock_seq;
@@ -2264,6 +2250,26 @@ fn sl_iid_addr(idx: usize) -> u64 {
     let ptrs = SL_IID_PTRS
         .get_or_init(|| SlIidPtrs(std::array::from_fn(|i| std::ptr::addr_of!(structs.0[i]))));
     std::ptr::addr_of!(ptrs.0[idx]) as u64
+}
+
+/// The address of the `SL_IID_*` data symbol at registration index `idx` (0..=6). Exposed to
+/// [`super::opensl`]'s `__audio-test` harness so it can pass the same `SLInterfaceID` value the engine
+/// would. Idempotent (lazy-inits the storage). 2026-06-05.
+pub(crate) fn sl_iid_addr_for_test(idx: usize) -> u64 {
+    sl_iid_addr(idx)
+}
+
+/// Map an `SLInterfaceID` **value** (the pointer the engine passes to `GetInterface`, which is the
+/// value stored at an `SL_IID_*` data symbol — i.e. the address of the backing `SLInterfaceID_`
+/// struct) back to its registration index 0..=6:
+/// 0=ANDROIDCONFIGURATION, 1=ANDROIDSIMPLEBUFFERQUEUE, 2=BUFFERQUEUE, 3=ENGINE, 4=PLAY, 5=RECORD,
+/// 6=VOLUME. Returns `None` for any other pointer. Used by [`super::opensl`]'s `GetInterface` to
+/// resolve which interface the engine requested without re-deriving the UUID layout.
+pub(crate) fn sl_iid_index(iid_value: usize) -> Option<usize> {
+    // Ensure the storage is initialized (idempotent; the natives also call `sl_iid_addr`).
+    let _ = sl_iid_addr(0);
+    let structs = SL_IID_STRUCTS.get()?;
+    (0..7).find(|&i| std::ptr::addr_of!(structs.0[i]) as usize == iid_value)
 }
 
 #[cfg(test)]
@@ -3086,16 +3092,33 @@ mod tests {
         }
     }
 
-    // ---- audio: sound-stub sentinels ------------------------------------------------------------
+    // ---- audio: real OpenSL ES engine wiring ----------------------------------------------------
 
     #[test]
-    fn sl_create_engine_reports_feature_unsupported() {
-        // slCreateEngine → SL_RESULT_FEATURE_UNSUPPORTED (0x0C); the caller cleanly detects "no audio"
-        // and must NOT use *pEngine (left untouched). NOT a fake engine.
-        let mut engine: *mut c_void = 0xDEAD as *mut c_void; // poison; must stay untouched
-                                                             // SAFETY: the OpenSL ES params are not dereferenced (the call fails before producing an object).
+    fn sl_create_engine_via_provider_produces_a_real_engine() {
+        // 2026-06-05: slCreateEngine now returns a WORKING SLObjectItf (super::opensl). Confirm the
+        // provider's registered address creates a non-null engine the caller can Destroy. The full
+        // create→mix→player→Enqueue path is exercised in `super::opensl::tests` + the __audio-test
+        // harness; here we only confirm the provider wiring reaches the real engine.
+        let p = EclipseNativeProvider::with_bionic_natives();
+        let addr = p.resolve("slCreateEngine").expect("registered").addr;
+        assert!(
+            addr != 0,
+            "slCreateEngine must resolve to an Eclipse address"
+        );
+        // SAFETY: `addr` is super::opensl::eclipse_sl_create_engine; call it with a valid out-param.
+        let create: unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            *const c_void,
+            u32,
+            *const c_void,
+            *const c_void,
+        ) -> u32 = unsafe { std::mem::transmute::<u64, _>(addr) };
+        let mut engine: *mut c_void = std::ptr::null_mut();
+        // SAFETY: out-param is a valid writable SLObjectItf*; other args are unused by the impl.
         let r = unsafe {
-            eclipse_sl_create_engine(
+            create(
                 std::ptr::addr_of_mut!(engine).cast(),
                 0,
                 std::ptr::null(),
@@ -3104,15 +3127,10 @@ mod tests {
                 std::ptr::null(),
             )
         };
-        assert_eq!(r, SL_RESULT_FEATURE_UNSUPPORTED);
-        assert_eq!(
-            r, 0x0000_000C,
-            "OpenSL ES public value of FEATURE_UNSUPPORTED"
-        );
-        assert_eq!(
-            engine, 0xDEAD as *mut c_void,
-            "a failed slCreateEngine must not write *pEngine"
-        );
+        assert_eq!(r, super::super::opensl::SL_RESULT_SUCCESS);
+        assert!(!engine.is_null(), "a real engine object must be produced");
+        // Destroy it via the object vtable to free the registry slot (no leak).
+        super::super::opensl::destroy_object_for_test(engine);
     }
 
     #[test]

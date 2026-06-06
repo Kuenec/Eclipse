@@ -462,7 +462,8 @@ before any history-rewriting/force operation.
   Sentinels from the PUBLIC NDK media + Khronos OpenSL ES C-ABI: media pointer fns → NULL, `media_status_t` →
   `AMEDIA_ERROR_UNSUPPORTED` (-10009), `ssize_t` dequeue → negative, `bool` getters → false, setters/delete → no-op,
   `toString` → stable empty C string; the 10 `AMEDIAFORMAT_KEY_*` are real `const char*` key strings; `slCreateEngine`
-  → `SL_RESULT_FEATURE_UNSUPPORTED` (0x0C, `*pEngine` untouched); the 7 `SL_IID_*` are real stable distinct
+  → `SL_RESULT_FEATURE_UNSUPPORTED` (0x0C, `*pEngine` untouched) **[SUPERSEDED 2026-06-05: audio is now REAL OpenSL ES →
+  host audio (cpal) — see the OpenSL-ES-real entry at the end of §5]**; the 7 `SL_IID_*` are real stable distinct
   `SLInterfaceID` data objects. NO global state beyond two read-only OnceLock tables, NO UB (no media/audio handle ever
   minted). REAL gated test (APK present → RAN): work-list **88 → 2**, **86** newly-resolved to Eclipse (all 41 media+audio,
   each verified == Eclipse addr + absent from host dlsym), `applied_nonnull` **580 → 621**, 86 GOT slots hold the Eclipse
@@ -807,6 +808,44 @@ before any history-rewriting/force operation.
   subcommands + assert their stdout/stderr markers — NO loader/bionic/native-load internals or libroblox binary touched).
   ZERO new deps (std `process::Command` only). Gate now **406 unit + 4 integration + 2 doctests** (fmt/build/clippy
   `-D warnings`/test/release all clean). See §6 (2026-06-05 engine-milestone regression guards).
+- **2026-06-05 UPDATE — AUDIO IS NOW REAL: the 8 OpenSL ES audio symbols are a WORKING OpenSL ES 1.0.1 engine →
+  host audio (cpal), replacing the sound-stub; `eclipse __audio-test` plays a real PCM tone end-to-end.** New module
+  `src/loader/opensl.rs` implements the documented audio surface for real: `slCreateEngine` returns a WORKING
+  `SLObjectItf` whose Eclipse-owned `#[repr(C)]` vtables (stable process-lifetime `OnceLock` addresses, the two-phase
+  pattern used for `SL_IID_*`) drive the whole path — `Realize`/`GetInterface` → a real `SLEngineItf`;
+  `SLEngineItf::CreateOutputMix` + `CreateAudioPlayer` (an `SLDataSource` = `SLDataLocator_AndroidSimpleBufferQueue` +
+  `SLDataFormat_PCM` → an `SLDataSink` to the output mix) → a player exposing `SLPlayItf` + `SLAndroidSimpleBufferQueueItf`;
+  the bq `Enqueue` decodes the caller's 8/16-bit-LE PCM to `f32` and feeds a **cpal** host output stream whose callback
+  drains the ring and fires the registered bq-callback per finished buffer. **Only the documented symbols are touched** —
+  libroblox imports exactly `slCreateEngine` + the 7 `SL_IID_*` (everything else flows through the vtables, no extra
+  imported symbol), so NO dead natives are added (§2.5); the 7 `SL_IID_*` stay the same real data objects but are now
+  CONSUMED by `GetInterface` (matched via the new `native_provider::sl_iid_index`). **Soundness:** every OpenSL object is a
+  generational [`opensl::ObjectRegistry`] slab entry (the same pattern as `ndk_registry`/`window_registry`); the engine's
+  `self` is the stable boxed-`ObjectState` heap address whose offset-0 vtable pointer the engine dereferences, and every
+  method re-validates the handle's registry id (bounds+generation) before touching state → a stale/fabricated `SLObjectItf`
+  is a typed `Err` → `SL_RESULT_PARAMETER_INVALID`, never UB. On a host with NO audio device the engine + mix + player still
+  construct and accept Enqueues (no `cpal::Stream`) — a clean "no device" posture, never a fake success. `#![forbid(unsafe_
+  code)]` stays on reloc/elf/resolve/ndk_registry; the new `unsafe` is confined to the C-ABI vtable bodies + the ring/cpal
+  bridge, each with a dated `// SAFETY:`. **Dep:** `cpal = "0.17"` — the smallest portable Linux sound option (auto-selects
+  ALSA, which modern distros route through PipeWire/Pulse's ALSA-compat; detect-don't-assume §9; pure-Rust except the ALSA-C
+  link, the documented "purity ceiling" in `docs/dependency-plan.md`), adding 4 new building crates (cpal/alsa/alsa-sys/
+  dasp_sample; libc/bitflags/cfg-if/pkg-config already in tree). **VALIDATED:** `eclipse __audio-test` (new hidden
+  subcommand) drives the REAL path through the public vtables — create engine → Realize → `GetInterface(SL_IID_ENGINE)` →
+  CreateOutputMix → CreateAudioPlayer (16-bit mono 44.1 kHz buffer-queue source → output-mix sink) →
+  `GetInterface(PLAY/BUFFERQUEUE)` → RegisterCallback → `SetPlayState(PLAYING)` → Enqueue a generated 440 Hz sine PCM buffer
+  — and on this dev host (cpal device present) **PASSED: the cpal stream drained 1 buffer + the bq-callback fired 1× with 0
+  SL errors** (`/tmp/eclipse-audio-test.log`, EXIT=0); on a headless host with no device it SKIPs cleanly (full path built +
+  PCM enqueued, 0 SL errors, no device to play it), never a spurious fail. 14 GPU/VM-free unit tests (PCM format validate/
+  reject, 8/16-bit→f32 conversion, sine generation, ring fill_output drain+callback+underrun+multi-buffer, itf-offset
+  round-trip, stale-handle-after-Destroy rejection, null-handle → PARAMETER_INVALID, the full engine→mix→player→Enqueue path
+  with NO device, non-PCM source rejection) + 1 provider-wiring test (slCreateEngine via the registered address → a real
+  engine). The full-resolution regression guard is UNCHANGED (still 88→0; audio is still 8 symbols, only `slCreateEngine`'s
+  address now points at the real impl). Cyber-safeguard NOT tripped (clean-room from the public OpenSL ES 1.0.1 C-ABI +
+  public cpal API + Eclipse's own src/; no apkenv/bionic/NDK/Khronos/linker source read; libroblox parsed as data only — the
+  native-load/linker region was not touched). Gate now **420 unit + 4 integration + 2 doctests** (fmt/build/clippy
+  `-D warnings`/test/release all clean). **Engine-load frontier UNCHANGED (audio is a parallel subsystem): bind the
+  relocated+resolved image to execution past the 3,427 DT_INIT_ARRAY ctors. The engine's audio output now has a real OpenSL
+  ES → host path the moment it calls `slCreateEngine`.** See §6 (2026-06-05 real OpenSL ES audio).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -4090,6 +4129,42 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   doctests**) / release — all 0-warning/0-error. **NEXT:** unchanged engine-load frontier — the boot reaching a frame /
   the engine's input loop past the native-load wall (main-loop/dev-host only, cyber-safeguard). Files:
   `tests/engine_milestones.rs` (new).
+
+- **2026-06-05 (real OpenSL ES audio)** — 🔊 **The 8 documented OpenSL ES audio symbols are now a REAL working OpenSL ES
+  1.0.1 engine → host audio (cpal), replacing the sound-stub; a generated PCM tone plays end-to-end.** *Root cause / why:*
+  the audio natives were sound-stubs (`slCreateEngine` → `SL_RESULT_FEATURE_UNSUPPORTED`); the task is a durable real audio
+  path for the documented surface. *What was built:* new `src/loader/opensl.rs` — `slCreateEngine` returns a WORKING
+  `SLObjectItf` whose Eclipse-owned `#[repr(C)]` vtables (`SLObjectItf_`/`SLEngineItf_`/`SLPlayItf_`/
+  `SLAndroidSimpleBufferQueueItf_`/`SLOutputMixItf_` slot order from the public Khronos OpenSL ES 1.0.1 C-ABI, stable
+  process-lifetime `OnceLock` addresses) drive `Realize`/`GetInterface` → `SLEngineItf`; `CreateOutputMix` +
+  `CreateAudioPlayer` (`SLDataLocator_AndroidSimpleBufferQueue` + `SLDataFormat_PCM` source → output-mix sink) → a player
+  with `SLPlayItf` + `SLAndroidSimpleBufferQueueItf`; `Enqueue` decodes 8/16-bit-LE PCM → `f32` into a ring a **cpal**
+  output-stream callback drains (firing the registered bq-callback per finished buffer). *Real vs kept-stub:* `slCreateEngine`
+  + the 7 `SL_IID_*` are REAL (the IIDs now consumed by `GetInterface` via the new `native_provider::sl_iid_index`); no other
+  audio symbol exists to register (libroblox imports ONLY those 8 — everything else flows through the vtables), so **no dead
+  natives** (§2.5). The unsupported `SLEngineItf` device-creation slots (LED/vibra/recorder/metadata/extension) return the
+  documented `SL_RESULT_FEATURE_UNSUPPORTED` (present at correct offset, safe if called — not a stub of a documented import).
+  *Soundness:* every OpenSL object is a generational `opensl::ObjectRegistry` slab entry (the `ndk_registry`/`window_registry`
+  pattern); the engine's `self` is the stable boxed-`ObjectState` heap address (offset-0 vtable pointer), every method
+  re-validates the handle's registry id (bounds+generation) → a stale/fabricated `SLObjectItf` is `SL_RESULT_PARAMETER_INVALID`,
+  never UB. No host device → engine/mix/player still construct + accept Enqueues (no sound), a clean "no device" posture.
+  *unsafe:* `#![forbid(unsafe_code)]` stays on reloc/elf/resolve/ndk_registry; the new `unsafe` is confined to the C-ABI vtable
+  bodies + the ring/cpal bridge, each dated `// SAFETY:`. *Validation:* new hidden `eclipse __audio-test` drives the real path
+  through the public vtables and (dev host, device present) **PASSED — cpal drained 1 buffer + bq-callback fired 1× with 0 SL
+  errors** (EXIT=0, `/tmp/eclipse-audio-test.log`); SKIPs cleanly with no device. *Regression guard:* 14 GPU/VM-free unit
+  tests (`opensl::tests` — format validate/reject, 8/16-bit→f32 convert, sine gen, ring drain+callback+underrun+multi-buffer,
+  itf-offset round-trip, stale-handle-after-Destroy rejection, null-handle → PARAMETER_INVALID, full engine→mix→player→Enqueue
+  with NO device, non-PCM-source rejection) + 1 provider-wiring test; the existing full-resolution guard is unchanged (88→0;
+  audio still 8 symbols). *Cyber-safeguard: NOT tripped* — clean-room from the public OpenSL ES 1.0.1 C-ABI + public cpal API
+  + Eclipse's own src/; NO apkenv/bionic/NDK/Khronos/linker source read; libroblox parsed as data only; the native-load/linker
+  region was not touched. *Deps:* `cpal = "0.17"` — smallest portable Linux sound (auto-ALSA→PipeWire/Pulse compat,
+  detect-don't-assume §9; the documented "purity ceiling"), +4 building crates (cpal/alsa/alsa-sys/dasp_sample). Context7:
+  cpal `build_output_stream`/`default_host`/`default_output_config`/`play` API confirmed via `/rustaudio/cpal`. *Gate:* fmt
+  --all --check / build --all-targets / clippy (-D warnings) / test (**420 unit + 4 integration + 2 doctests**) / release —
+  all 0-warning/0-error. **NEXT:** the engine-load frontier is unchanged (audio is a parallel subsystem ready the moment the
+  engine calls `slCreateEngine`); a host resampler is deferred until an engine rate the device can't match is observed
+  (none yet, simplicity-first). Files: `src/loader/opensl.rs` (new), `src/loader/opensl/tests.rs` (new), `src/loader.rs`,
+  `src/loader/native_provider.rs`, `src/main.rs`, `Cargo.toml`, `Cargo.lock`.
 
 ---
 

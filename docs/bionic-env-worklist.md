@@ -209,17 +209,23 @@ init-critical, it gets a real host-codec bridge then.
 ✅ AMEDIAFORMAT_KEY_WIDTH
 ```
 
-### 5. audio — OpenSL ES (8) — ✅ DONE (2026-06-05): sound-stubs (gameplay-time, deferred)
-`src/loader/native_provider.rs` implements all 8 as Eclipse-owned `extern "C"` sound-stubs. Sound is
-a gameplay-time subsystem. Per the public OpenSL ES 1.0.1 C-ABI (`SLES/OpenSLES.h`), `slCreateEngine`
-returns `SL_RESULT_FEATURE_UNSUPPORTED` (0x0C) — the documented result a caller checks to detect "no
-audio" cleanly (it leaves `*pEngine` untouched, never a fake engine). The 7 `SL_IID_*` are real,
-stable, distinct `SLInterfaceID` data objects (valid non-null pointers; never queried because
-slCreateEngine fails first). NO global state, NO UB.
+### 5. audio — OpenSL ES (8) — ✅ DONE (2026-06-05): REAL OpenSL ES → host audio (cpal)
+**2026-06-05 UPDATE — audio is now REAL (was a sound-stub).** `src/loader/opensl.rs` implements
+`slCreateEngine` as a WORKING `SLObjectItf` engine whose Eclipse-owned `#[repr(C)]` vtables (the
+public OpenSL ES 1.0.1 slot order) drive `Realize`/`GetInterface` → `SLEngineItf`;
+`CreateOutputMix` + `CreateAudioPlayer` (an `SLDataLocator_AndroidSimpleBufferQueue` +
+`SLDataFormat_PCM` source → an output-mix sink) → a player exposing `SLPlayItf` +
+`SLAndroidSimpleBufferQueueItf` whose `Enqueue` decodes 8/16-bit-LE PCM → `f32` and feeds a **cpal**
+host output stream (real sound; the bq-callback fires per finished buffer). On a host with no audio
+device the engine still constructs and accepts Enqueues (no sound) — a clean "no device" posture,
+never a fake. The 7 `SL_IID_*` stay real, stable, distinct `SLInterfaceID` data objects, now
+**consumed** by `GetInterface` (matched via `native_provider::sl_iid_index`). Only these 8 symbols are
+imported (everything else flows through the vtables) → no dead natives. Validate with
+`eclipse __audio-test` (drives the real path; SKIPs cleanly with no device).
 ```
-✅ slCreateEngine  # → SL_RESULT_FEATURE_UNSUPPORTED (no engine produced; *pEngine untouched)
+✅ slCreateEngine  # REAL: returns a working SLObjectItf engine (src/loader/opensl.rs → cpal)
 ✅ SL_IID_ANDROIDCONFIGURATION  ✅ SL_IID_ANDROIDSIMPLEBUFFERQUEUE  ✅ SL_IID_BUFFERQUEUE
-✅ SL_IID_ENGINE  ✅ SL_IID_PLAY  ✅ SL_IID_RECORD  ✅ SL_IID_VOLUME
+✅ SL_IID_ENGINE  ✅ SL_IID_PLAY  ✅ SL_IID_RECORD  ✅ SL_IID_VOLUME  # consumed by GetInterface
 ```
 (`OpenMAXAL` — `XA_*` — contributes **0** here: none of its symbols is referenced by a relocation
 in this build, so it is not on the work-list despite being a `DT_NEEDED`.)
