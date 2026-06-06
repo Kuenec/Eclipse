@@ -784,6 +784,29 @@ before any history-rewriting/force operation.
   (real ALooper + winit feed) ready; what remains is the boot reaching the engine's input loop **past the native-load
   wall** (the bionic-shim native-load integration — main-loop/dev-host only, cyber-safeguard). See §6 (2026-06-05 real
   ALooper input path).
+- **2026-06-05 UPDATE — the four engine-load milestones now have GATED REGRESSION GUARDS (`tests/engine_milestones.rs`),
+  so a silent regression in the loader / render / input path FAILS a test instead of going unnoticed.** New integration
+  test file runs the built `eclipse` binary via `env!("CARGO_BIN_EXE_eclipse")` for each hidden harness subcommand and
+  asserts its REAL success marker + a success exit status: **(1)** `run_libroblox_init_runs_all_3427_constructors` guards
+  `__run-libroblox-init` — asserts EXIT=0 **and** the stderr marker `ALL 3427/3427 constructors completed without a crash`
+  (the harness `libc::_exit(0)`s from inside `run_libroblox_init` on full success, so the main.rs stdout line is
+  intentionally unreachable and NOT asserted; a constructor crash `_exit`s NON-ZERO without that marker → fail);
+  **(2)** `gl_test_renders_engine_surface_with_zero_gl_errors` guards `__gl-test` — asserts `EGL+GLES2 OK:` + `0 GL errors,
+  all swaps succeeded`; **(3)** `gl_test_anw_binds_real_wsi_handle` guards `__gl-test-anw` — asserts `ANativeWindow* is the
+  real WSI handle = true` + `0 GL errors, all swaps succeeded` (the `= true` is load-bearing — `= false` is the
+  geometry-only fallback, a WSI-bind regression); **(4)** `input_test_delivers_ident_then_looper_wake` guards
+  `__input-test` — asserts `input path OK:` + `pollOnce returned ident 11` + `parked pollOnce returned ALOOPER_POLL_WAKE`.
+  **Each SKIPS CLEANLY** (prints `SKIP: <reason>`, returns ok) when its precondition is absent — the init test if the
+  Roblox APK is missing (`ECLIPSE_ROBLOX_APK` env or the default `$HOME/eclipse-m0/apk/.../roblox-2.724.735-merged.apk`),
+  the GL tests if no display (`WAYLAND_DISPLAY`/`DISPLAY` both unset) or the host can't bring up EGL/the event loop (env
+  limitation, not a regression) — so the suite **never fails spuriously headless/CI**; the input test is GPU/VM-free and
+  always runs. **NO assertion is trivially-passing** (verified: the init test FAILED a candidate that asserted the
+  unreachable stdout marker, proving the marker checks bite). **VALIDATED on this dev host (APK + Wayland present):
+  `cargo test --release --test engine_milestones -- --nocapture` → all 4 RAN + PASSED; with APK+display removed → 3 SKIP
+  cleanly + the input test passes (suite stays green).** Cyber-safeguard NOT tripped (tests only WRAP the existing
+  subcommands + assert their stdout/stderr markers — NO loader/bionic/native-load internals or libroblox binary touched).
+  ZERO new deps (std `process::Command` only). Gate now **406 unit + 4 integration + 2 doctests** (fmt/build/clippy
+  `-D warnings`/test/release all clean). See §6 (2026-06-05 engine-milestone regression guards).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -4037,6 +4060,36 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   (egl_engine WSI bind) + input (real ALooper + winit feed) ready; what remains is the boot reaching the engine's input loop
   past the native-load wall (main-loop/dev-host only, cyber-safeguard). Files: `src/loader/looper.rs` (new),
   `src/loader.rs`, `src/loader/ndk_registry.rs`, `src/loader/native_provider.rs`, `src/main.rs`.
+
+- **2026-06-05 (engine-milestone regression guards)** — 🟢 **The four dev-host-validated engine-load milestones are now
+  protected from SILENT regression by a gated integration test file `tests/engine_milestones.rs` (the first `tests/`
+  integration target).** Each test runs the built `eclipse` binary via `env!("CARGO_BIN_EXE_eclipse")` (cargo builds +
+  locates it — portable, no path assumptions) for one hidden harness subcommand and asserts that harness's EXACT success
+  marker + a success exit status, so a regression in the loader / EGL render / WSI bind / ALooper input path makes a test
+  FAIL: **(1)** `__run-libroblox-init` → EXIT=0 **and** stderr `ALL 3427/3427 constructors completed without a crash`
+  (root-caused subtlety: the harness `libc::_exit(0)`s from *inside* `run_libroblox_init` on full success — to avoid
+  faulting its still-live worker threads / exit-time finalizers on teardown, init_run.rs:333 — so the main.rs
+  `…constructor(s) completed` STDOUT line is intentionally unreachable on success and is NOT asserted; a constructor crash
+  `_exit`s NON-ZERO without the `ALL …` marker → fail); **(2)** `__gl-test` → `EGL+GLES2 OK:` + `0 GL errors, all swaps
+  succeeded`; **(3)** `__gl-test-anw` → `ANativeWindow* is the real WSI handle = true` + `0 GL errors, all swaps
+  succeeded` (the `= true` is required — `= false` is the geometry-only fallback, a WSI-bind regression); **(4)**
+  `__input-test` → `input path OK:` + `pollOnce returned ident 11` + `parked pollOnce returned ALOOPER_POLL_WAKE`. **Clean
+  skips (never spurious in CI/headless):** the init test SKIPs (`SKIP: …`) if the Roblox APK is absent (mirrors
+  `init_run::find_roblox_apk` — `ECLIPSE_ROBLOX_APK` env or the default `$HOME/eclipse-m0/apk/v2.724.735/
+  roblox-2.724.735-merged.apk`); the two GL tests SKIP if no display (`WAYLAND_DISPLAY`/`DISPLAY` both unset) OR if a
+  display is advertised but the host cannot bring up the event loop / EGL (an env limitation — detected from the harness's
+  `EglError::Display(…)` output, NOT a code regression); the input test is GPU/VM-free with no precondition (always runs).
+  **No assertion is trivially-passing** — proven during development: a candidate init assertion that checked the
+  unreachable STDOUT marker FAILED, which is what surfaced the `_exit(0)`-before-`main`-print root cause and led to
+  asserting the authoritative stderr marker instead. **VALIDATED on this dev host (APK + Wayland present):
+  `cargo test --release --test engine_milestones -- --nocapture` → all 4 RAN + PASSED; re-run with APK+display env
+  removed → 3 SKIP cleanly + input passes (suite stays green).** *Cyber-safeguard: NOT tripped* — the tests only WRAP the
+  existing subcommands and assert their stdout/stderr; NO loader/bionic/native-load/apkenv/ART-`nativeLoad`/`framework.rs`
+  native-load internals and NO libroblox binary were read or reverse-engineered. *Deps:* ZERO new (std `process::Command`
+  only). *Gate:* fmt --all --check / build --all-targets / clippy (-D warnings) / test (**406 unit + 4 integration + 2
+  doctests**) / release — all 0-warning/0-error. **NEXT:** unchanged engine-load frontier — the boot reaching a frame /
+  the engine's input loop past the native-load wall (main-loop/dev-host only, cyber-safeguard). Files:
+  `tests/engine_milestones.rs` (new).
 
 ---
 
