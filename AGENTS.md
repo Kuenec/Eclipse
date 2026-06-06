@@ -733,12 +733,17 @@ before any history-rewriting/force operation.
   clippy `-D warnings`/test/release all clean). **Render path is DRIVE-READY:** the engine's `eglCreateWindowSurface(
   ANativeWindow)` will present to Eclipse's window the moment the boot reaches a frame. **What remains is NOT the render
   path** — it is the boot reaching a frame past the **native-load wall** (the bionic-shim relocation integration, main-loop /
-  dev-host only, cyber-safeguard). See §6 (2026-06-05 engine render WSI bind). **PRE-EXISTING FLAKE NOTED (not mine, not
-  touched):** `bionic_pthread::tests::create_runs_entry_on_real_thread_and_join_returns_its_result` fails ~1/20 under full
-  parallel load — captured: `TID identity` assert `left: 842580` (real child `gettid()`) vs `right: 30002856` (the
-  `pthread_t` `pthread_create` wrote), i.e. the parent's child-TID futex hand-off returned a wrong `pthread_t` under load. A
-  real concurrency-identity issue in `eclipse_pthread_create` (NOT the geometry/WSI logic, NOT a quick test tweak); left for
-  a dedicated root-cause pass in the pthread lifecycle code (§6).
+  dev-host only, cyber-safeguard). See §6 (2026-06-05 engine render WSI bind). **2026-06-05 — THE pthread_create child-TID
+  FLAKE IS ROOT-CAUSED + FIXED (§6 pthread child-TID hand-off entry):** it was a **use-after-free**, not a futex/ordering
+  bug. The parent read the child's published TID through a raw pointer into the `Box<SpawnArgs>` the trampoline frees the
+  instant its `start()` returns; under load a trivial `start()` returns before the parent reads, so the parent observed a
+  freed/reused block (a concurrent creator's TID or heap garbage — the `right: 30002856` / `right: 32` non-TID values). FIX:
+  the TID hand-off word is now an `Arc<AtomicU32>` co-owned by parent + child, so the slot outlives both the child's store
+  and the parent's read regardless of how soon `start()` returns; each creation has its own `Arc` → no cross-contamination.
+  The engine's heavy threading now has **correct, deterministic `pthread_t` identity**. New stress regression test
+  (`create_returns_each_childs_own_tid_under_heavy_parallel_load`, N=64 × 16 rounds, asserts each returned `pthread_t` ==
+  the child's own `gettid()`); reproduced the bug on run 1 pre-fix, **50/50 release-stress + 50/50 release-module + 40/40
+  debug-module + 10/10 debug-suite + 5/5 release-suite runs pass post-fix**. Gate now **390 unit + 2 doctests**.
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -3927,6 +3932,34 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   under load. A real concurrency-identity issue in `eclipse_pthread_create` (NOT the WSI/geometry logic, NOT a quick
   test-robustness tweak, and adjacent to the safeguard-gated pthread lifecycle) — deferred to a dedicated root-cause pass; my
   changes touch ZERO pthread code (`git diff --stat`).
+- **2026-06-05 — pthread child-TID hand-off: the `pthread_create` identity flake is ROOT-CAUSED + FIXED (it was a
+  use-after-free, NOT a futex/memory-ordering bug).** *Root cause:* `eclipse_pthread_create` boxed `SpawnArgs { start, arg,
+  child_tid }`, leaked it via `Box::into_raw`, and the parent waited on the child's published TID by reading
+  `(*spawn_ptr).child_tid` **through that raw pointer**. But the trampoline reclaims the box (`Box::from_raw`) and **drops it
+  the instant `start()` returns**. A trivial/fast `start()` (or a worker that finishes quickly under load) frees the
+  `SpawnArgs` block before the parent reads it; the allocator immediately hands that block to a CONCURRENT `pthread_create`
+  (or leaves stale bytes), so the parent reads a freed/reused word — a different thread's TID or heap garbage (the captured
+  non-TID values `30002856` / `32`) — and returns it as the bionic `pthread_t`. The futex/`Acquire`/`Release` were fine; the
+  *storage lifetime* was the defect. *Fix (smallest correct, `src/loader/bionic_pthread.rs`):* the TID hand-off word is now
+  an **`Arc<AtomicU32>` co-owned by parent and child** — `SpawnArgs.child_tid: Arc<AtomicU32>`, the parent keeps its own
+  `Arc::clone`, the child stores+futex-wakes on its clone, the parent waits+reads on ITS clone. The slot lives until BOTH
+  drop it, so it outlives the parent's read no matter how soon `start()` returns; each creation has a distinct `Arc` →
+  zero cross-contamination between concurrent creates. No raw-pointer cross-thread read remains (`spawn_ptr` is used only to
+  pass ownership to the trampoline + reclaim on spawn failure). bionic-ABI unchanged (`pthread_t` is still the kernel TID).
+  *Same-pattern audit:* grepped the tree for `Box::into_raw` + cross-thread read-back — the framework/loader registries
+  (`view/paint/window/theme/matrix/path/xml/ndk_registry`) deliberately use generational-slab indices, NOT
+  `Box::into_raw`, exactly to avoid this UAF class; `runtime.rs`'s `Library::into_raw()` is an intentional VM-library leak,
+  never read back; the only spawn-and-read-back-via-raw-pointer instance was this one, now fixed. *Regression guard:* new
+  stress test `create_returns_each_childs_own_tid_under_heavy_parallel_load` (N=64 creators × 16 rounds; each child returns
+  its own `gettid()`, asserts the returned `pthread_t` == that child's `gettid()` — the exact violated invariant, with a
+  trivial `start()` to maximize the free-then-reuse window). It reproduced the bug on run 1 pre-fix (`left` = real TID,
+  `right` = `32` garbage); post-fix: **50/50 release-stress + 50/50 release-module + 40/40 debug-module + 10/10 full
+  debug-suite + 5/5 full release-suite** runs all pass (no weakened assertion). *Cyber-safeguard: NOT tripped* — work
+  confined to Eclipse's own clean-room pthread shim + its tests; NO native-library-LOAD / apkenv linker / `bionic_dlopen` /
+  ART `nativeLoad` / `framework.rs` native-load / vendor code read or touched. *Deps:* ZERO new (`std::sync::Arc`).
+  *Gate:* fmt --all --check / build --all-targets / clippy (-D warnings) / test (**390 unit + 2 doctests**) / release — all
+  0-warning/0-error. The engine's heavy threading now has correct, deterministic `pthread_t` identity. File:
+  `src/loader/bionic_pthread.rs`.
 
 ---
 
