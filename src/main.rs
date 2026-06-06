@@ -116,6 +116,22 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Hidden dev-host diagnostic (NOT in HELP): drive the REAL OpenSL ES audio path end-to-end —
+        // slCreateEngine → Realize → CreateOutputMix → CreateAudioPlayer (buffer-queue PCM source) →
+        // SetPlayState(PLAYING) → Enqueue a generated 440 Hz sine PCM buffer, then confirm the cpal
+        // host stream drained it + the buffer-queue callback fired with 0 SL errors. On a headless
+        // host with no audio device it SKIPs cleanly (the full path is still built + PCM enqueued).
+        // See src/loader/opensl.rs::run_audio_test.
+        Some("__audio-test") => match eclipse::loader::opensl::run_audio_test() {
+            Ok(report) => {
+                println!("__audio-test: {report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("__audio-test: {e}");
+                ExitCode::FAILURE
+            }
+        },
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{HELP}");
             ExitCode::SUCCESS
