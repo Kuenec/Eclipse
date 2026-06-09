@@ -1232,6 +1232,321 @@ mod tests {
         assert_eq!(err, ArscError::NoValuePool);
     }
 
+    // === Adversarial robustness pass (2026-06-05) ==========================================
+    // Hand-crafted hostile `resources.arsc` byte buffers: each must yield a typed `ArscError`
+    // (or a clean `None` from a resolver), NEVER a panic / integer overflow / OOB slice /
+    // unbounded alloc. Direct negative tests driving the chunk header, table/package header,
+    // type/typeSpec, entry-offset array, entry, bag, and Res_value readers into failure
+    // branches. `#![forbid(unsafe_code)]` + debug `overflow-checks` mean any wrapping `+`/`*`
+    // would panic here, so the tests completing is proof the checked/bounds discipline holds.
+
+    /// `parse_arsc`'s error (`ResTable` has no `Debug`/`PartialEq`, so `assert_eq!` on the whole
+    /// `Result` won't compile; extract the `Err` and compare that).
+    fn parse_err(bytes: &[u8]) -> ArscError {
+        parse_arsc(bytes).err().expect("expected a typed ArscError")
+    }
+
+    /// Build a minimal valid empty global value string pool chunk (28 bytes).
+    fn empty_value_pool() -> Vec<u8> {
+        let mut pool = Vec::new();
+        push_u16(&mut pool, RES_STRING_POOL_TYPE);
+        push_u16(&mut pool, 28);
+        push_u32(&mut pool, 28);
+        push_u32(&mut pool, 0); // stringCount
+        push_u32(&mut pool, 0); // styleCount
+        push_u32(&mut pool, 0); // flags
+        push_u32(&mut pool, 28); // stringsStart
+        push_u32(&mut pool, 0); // stylesStart
+        pool
+    }
+
+    /// Wrap a value pool + arbitrary package bytes into a RES_TABLE_TYPE root with packageCount=1.
+    fn build_table(pkg: &[u8]) -> Vec<u8> {
+        let pool = empty_value_pool();
+        let mut table = Vec::new();
+        push_u16(&mut table, RES_TABLE_TYPE);
+        push_u16(&mut table, TABLE_HEADER_SIZE as u16);
+        push_u32(
+            &mut table,
+            (TABLE_HEADER_SIZE + pool.len() + pkg.len()) as u32,
+        );
+        push_u32(&mut table, 1); // packageCount
+        table.extend_from_slice(&pool);
+        table.extend_from_slice(pkg);
+        table
+    }
+
+    #[test]
+    fn bad_root_chunk_header_is_typed_error() {
+        // headerSize < 8 → BadChunk.
+        let mut b = Vec::new();
+        push_u16(&mut b, RES_TABLE_TYPE);
+        push_u16(&mut b, 4);
+        push_u32(&mut b, 12);
+        assert_eq!(parse_err(&b), ArscError::BadChunk);
+
+        // size < headerSize → BadChunk.
+        let mut b = Vec::new();
+        push_u16(&mut b, RES_TABLE_TYPE);
+        push_u16(&mut b, 12);
+        push_u32(&mut b, 8);
+        assert_eq!(parse_err(&b), ArscError::BadChunk);
+
+        // size past EOF → Truncated.
+        let mut b = Vec::new();
+        push_u16(&mut b, RES_TABLE_TYPE);
+        push_u16(&mut b, 12);
+        push_u32(&mut b, 0xFFFF_FFF0);
+        assert_eq!(parse_err(&b), ArscError::Truncated);
+
+        // Valid chunk but RES_TABLE headerSize < 12 (no room for packageCount) → BadChunk.
+        let mut b = Vec::new();
+        push_u16(&mut b, RES_TABLE_TYPE);
+        push_u16(&mut b, 8); // < TABLE_HEADER_SIZE
+        push_u32(&mut b, 8);
+        assert_eq!(parse_err(&b), ArscError::BadChunk);
+    }
+
+    #[test]
+    fn package_header_too_small_is_bad_package() {
+        // A package chunk whose headerSize is below PACKAGE_HEADER_MIN (284) → BadPackage.
+        let mut pkg = Vec::new();
+        push_u16(&mut pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut pkg, 16); // far below 284
+        push_u32(&mut pkg, 16);
+        pkg.resize(16, 0);
+        let table = build_table(&pkg);
+        assert_eq!(parse_err(&table), ArscError::BadPackage);
+    }
+
+    #[test]
+    fn package_type_or_key_strings_offset_past_chunk_is_bad_package() {
+        // typeStrings offset pointing past the package chunk end → BadPackage (pool_range_in_chunk).
+        let mut pkg = Vec::new();
+        push_u16(&mut pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut pkg, PACKAGE_HEADER_MIN as u16);
+        push_u32(&mut pkg, PACKAGE_HEADER_MIN as u32); // size = header only
+        push_u32(&mut pkg, 0x7f); // id
+        pkg.resize(pkg.len() + 256, 0); // name
+        push_u32(&mut pkg, 0xFFFF_FFF0); // typeStrings offset way past the chunk
+        push_u32(&mut pkg, 0); // lastPublicType
+        push_u32(&mut pkg, 0); // keyStrings
+        push_u32(&mut pkg, 0); // lastPublicKey
+        let table = build_table(&pkg);
+        let err = parse_err(&table);
+        assert!(
+            matches!(err, ArscError::BadPackage | ArscError::Overflow),
+            "got {err:?}"
+        );
+    }
+
+    /// Build a package whose body is the given type-chunk bytes, with no string pools (offsets 0).
+    fn build_package_with_type(type_chunk: &[u8]) -> Vec<u8> {
+        let mut pkg = Vec::new();
+        push_u16(&mut pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut pkg, PACKAGE_HEADER_MIN as u16);
+        push_u32(&mut pkg, (PACKAGE_HEADER_MIN + type_chunk.len()) as u32);
+        push_u32(&mut pkg, 0x7f);
+        pkg.resize(pkg.len() + 256, 0);
+        push_u32(&mut pkg, 0); // typeStrings
+        push_u32(&mut pkg, 0); // lastPublicType
+        push_u32(&mut pkg, 0); // keyStrings
+        push_u32(&mut pkg, 0); // lastPublicKey
+        pkg.extend_from_slice(type_chunk);
+        pkg
+    }
+
+    #[test]
+    fn type_chunk_huge_entry_count_does_not_overrun_or_alloc() {
+        // A type chunk declaring a colossal entryCount but a tiny body: resolve() must return None
+        // for an in-range-looking entry whose offset slot is past the chunk (read_u32 → Err → None),
+        // and must never pre-allocate entryCount-sized memory or read OOB. resolve does NOT allocate
+        // per entry, so the danger is purely arithmetic/OOB — assert it stays None.
+        let mut type_chunk = Vec::new();
+        push_u16(&mut type_chunk, RES_TABLE_TYPE_TYPE);
+        push_u16(&mut type_chunk, TYPE_HEADER_MIN as u16); // headerSize 20
+        push_u32(&mut type_chunk, TYPE_HEADER_MIN as u32); // size = header only (no offset array!)
+        type_chunk.push(1); // type id 1
+        type_chunk.push(0); // res0
+        push_u16(&mut type_chunk, 0); // res1
+        push_u32(&mut type_chunk, 0xFFFF_FFFF); // entryCount = 4 billion
+        push_u32(&mut type_chunk, TYPE_HEADER_MIN as u32); // entriesStart
+        let pkg = build_package_with_type(&type_chunk);
+        let table = build_table(&pkg);
+        // The type chunk's declared size (20) is only the header, but build_table's outer size
+        // covers the real bytes; parse must succeed and resolve must be a clean None.
+        let parsed = parse_arsc(&table);
+        if let Ok(t) = parsed {
+            // entry 0's offset slot is at headerSize(20) but the chunk body ends there → read_u32
+            // fails → None. No panic, no OOB, no alloc.
+            assert!(t.resolve(0x7f, 1, 0).is_none());
+            assert!(t.resolve(0x7f, 1, 0xFFFF).is_none());
+            assert!(t.resolve_style(0x7f01_0000).is_none());
+        }
+        // If parse itself rejected it, that is equally acceptable (typed error, no panic).
+    }
+
+    #[test]
+    fn type_entry_offset_past_type_data_is_none() {
+        // A type chunk with one entry whose offset points far past the entries region → resolve
+        // returns None (read past chunk fails), never OOB.
+        let mut type_chunk = Vec::new();
+        let header_size = TYPE_HEADER_MIN as u16;
+        let entries_start = (TYPE_HEADER_MIN + 4) as u32; // header + 1 offset
+        push_u16(&mut type_chunk, RES_TABLE_TYPE_TYPE);
+        push_u16(&mut type_chunk, header_size);
+        // size = header(20) + offset array(4); no actual entry bytes follow.
+        push_u32(&mut type_chunk, (TYPE_HEADER_MIN + 4) as u32);
+        type_chunk.push(1);
+        type_chunk.push(0);
+        push_u16(&mut type_chunk, 0);
+        push_u32(&mut type_chunk, 1); // entryCount 1
+        push_u32(&mut type_chunk, entries_start);
+        push_u32(&mut type_chunk, 0xFFFF_FF00); // entry 0 offset: way past entries_start
+        let pkg = build_package_with_type(&type_chunk);
+        let table = build_table(&pkg);
+        if let Ok(t) = parse_arsc(&table) {
+            assert!(t.resolve(0x7f, 1, 0).is_none(), "offset past data ⇒ None");
+        }
+    }
+
+    #[test]
+    fn entry_size_below_minimum_is_none() {
+        // An entry whose declared size is below ENTRY_MIN_SIZE (8) → resolve returns None, never a
+        // bad Res_value read. Build a type chunk with one entry of size 4.
+        let mut type_chunk = Vec::new();
+        let header_size = TYPE_HEADER_MIN as u16;
+        let entries_start = (TYPE_HEADER_MIN + 4) as u32;
+        push_u16(&mut type_chunk, RES_TABLE_TYPE_TYPE);
+        push_u16(&mut type_chunk, header_size);
+        let size_pos = type_chunk.len();
+        push_u32(&mut type_chunk, 0); // size patched below
+        type_chunk.push(1);
+        type_chunk.push(0);
+        push_u16(&mut type_chunk, 0);
+        push_u32(&mut type_chunk, 1); // entryCount
+        push_u32(&mut type_chunk, entries_start);
+        push_u32(&mut type_chunk, 0); // entry 0 at offset 0
+                                      // ResTable_entry with size 4 (below the 8-byte minimum) + 4 padding bytes.
+        push_u16(&mut type_chunk, 4); // entry size (too small)
+        push_u16(&mut type_chunk, 0); // flags
+        push_u32(&mut type_chunk, 0); // padding to keep the chunk well-formed
+        let total = type_chunk.len() as u32;
+        type_chunk[size_pos..size_pos + 4].copy_from_slice(&total.to_le_bytes());
+        let pkg = build_package_with_type(&type_chunk);
+        let table = build_table(&pkg);
+        if let Ok(t) = parse_arsc(&table) {
+            assert!(t.resolve(0x7f, 1, 0).is_none(), "entry size < 8 ⇒ None");
+        }
+    }
+
+    #[test]
+    fn bag_count_overflow_is_bounded_not_unbounded() {
+        // A complex (bag) entry declaring a colossal map count must be bounded by MAX_MAP_ENTRIES
+        // and stop at the first map that would read past the chunk — never an unbounded loop, OOB,
+        // or gigabyte alloc. Build a style entry with count = 0xFFFFFFFF but only 1 real map.
+        let mut type_chunk = Vec::new();
+        let header_size = TYPE_HEADER_MIN as u16;
+        let entries_start = (TYPE_HEADER_MIN + 4) as u32;
+        push_u16(&mut type_chunk, RES_TABLE_TYPE_TYPE);
+        push_u16(&mut type_chunk, header_size);
+        let size_pos = type_chunk.len();
+        push_u32(&mut type_chunk, 0); // size patched below
+        type_chunk.push(8); // type id 8 (style)
+        type_chunk.push(0);
+        push_u16(&mut type_chunk, 0);
+        push_u32(&mut type_chunk, 1); // entryCount
+        push_u32(&mut type_chunk, entries_start);
+        push_u32(&mut type_chunk, 0); // entry 0 at offset 0
+                                      // ResTable_map_entry: size 16, flags COMPLEX, key 0, parent 0, count 0xFFFFFFFF.
+        push_u16(&mut type_chunk, 16);
+        push_u16(&mut type_chunk, ENTRY_FLAG_COMPLEX);
+        push_u32(&mut type_chunk, 0); // key
+        push_u32(&mut type_chunk, 0); // parent
+        push_u32(&mut type_chunk, 0xFFFF_FFFF); // hostile count
+                                                // exactly one real ResTable_map (12 bytes); the loop must stop after it.
+        push_u32(&mut type_chunk, 0x7f01_0058); // name
+        push_u16(&mut type_chunk, 8); // value size
+        type_chunk.push(0); // res0
+        type_chunk.push(0x10); // dataType
+        push_u32(&mut type_chunk, 1); // data
+        let total = type_chunk.len() as u32;
+        type_chunk[size_pos..size_pos + 4].copy_from_slice(&total.to_le_bytes());
+        let pkg = build_package_with_type(&type_chunk);
+        let table = build_table(&pkg);
+        let t = parse_arsc(&table).expect("parse hostile-bag table");
+        let style = t
+            .resolve_style(0x7f08_0000)
+            .expect("style entry resolves (bounded)");
+        // Only the one in-bounds map is read; the loop stopped at the chunk boundary.
+        assert_eq!(
+            style.entries.len(),
+            1,
+            "hostile count must be bounded by the chunk, not 4 billion"
+        );
+    }
+
+    #[test]
+    fn too_many_packages_is_typed_error() {
+        // packageCount in the header is advisory; parse iterates actual child chunks. Feed more
+        // than MAX_PACKAGES real package chunks and require TooManyChunks, not unbounded growth.
+        let pool = empty_value_pool();
+        // A minimal valid package (header only, no body).
+        let mut one_pkg = Vec::new();
+        push_u16(&mut one_pkg, RES_TABLE_PACKAGE_TYPE);
+        push_u16(&mut one_pkg, PACKAGE_HEADER_MIN as u16);
+        push_u32(&mut one_pkg, PACKAGE_HEADER_MIN as u32);
+        push_u32(&mut one_pkg, 0x7f);
+        one_pkg.resize(one_pkg.len() + 256, 0);
+        push_u32(&mut one_pkg, 0);
+        push_u32(&mut one_pkg, 0);
+        push_u32(&mut one_pkg, 0);
+        push_u32(&mut one_pkg, 0);
+
+        let mut body = pool.clone();
+        for _ in 0..(MAX_PACKAGES + 1) {
+            body.extend_from_slice(&one_pkg);
+        }
+        let mut table = Vec::new();
+        push_u16(&mut table, RES_TABLE_TYPE);
+        push_u16(&mut table, TABLE_HEADER_SIZE as u16);
+        push_u32(&mut table, (TABLE_HEADER_SIZE + body.len()) as u32);
+        push_u32(&mut table, 1);
+        table.extend_from_slice(&body);
+        assert_eq!(parse_err(&table), ArscError::TooManyChunks);
+    }
+
+    #[test]
+    fn unknown_package_type_entry_ids_resolve_to_none() {
+        // Out-of-range package/type/entry ids on a valid table are clean None, never a panic.
+        let bytes = build_fixture();
+        let t = parse_arsc(&bytes).expect("parse fixture");
+        assert!(t.resolve(0x01, 1, 0).is_none(), "unknown package id");
+        assert!(t.resolve(0x7f, 0xff, 0).is_none(), "unknown type id");
+        assert!(t.resolve(0x7f, 1, 0xffff).is_none(), "unknown entry id");
+        assert!(t.resolve_style(0x0108_0000).is_none(), "unknown style pkg");
+        // type_name/key_name/value_string for absent ids are Ok(None), not Err/panic.
+        assert!(t.type_name(0x01, 1).unwrap().is_none());
+        assert!(t.key_name(0x01, 0).unwrap().is_none());
+        assert!(t.type_name(0x7f, 0).unwrap().is_none(), "type id 0 ⇒ None");
+    }
+
+    #[test]
+    fn string_pool_with_bad_type_is_bad_string_pool() {
+        // pool_at / StringPool::parse on bytes whose first u16 isn't RES_STRING_POOL_TYPE →
+        // BadStringPool (reached when a package's type-strings offset names a non-pool chunk; here
+        // we assert the resolver path stays a typed error, not a panic).
+        let mut not_a_pool = Vec::new();
+        push_u16(&mut not_a_pool, 0x9999); // wrong type
+        push_u16(&mut not_a_pool, 28);
+        push_u32(&mut not_a_pool, 28);
+        not_a_pool.resize(28, 0);
+        assert!(matches!(
+            StringPool::parse(&not_a_pool),
+            Err(ArscError::BadStringPool)
+        ));
+    }
+
     #[test]
     fn reader_is_total_under_truncation_and_mutation() {
         // TOTALITY guard (the confirmed root cause a non-total parser would reintroduce: a panic

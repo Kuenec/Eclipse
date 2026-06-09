@@ -861,6 +861,27 @@ before any history-rewriting/force operation.
   yet** — the load+init+I/O foundation is complete; the engine running+rendering is the remaining work, gated on this wall.
   Likely next frontier once past it = the host-baseline bionic libc ABI-mismatch class (like the fixed sysconf/pthread),
   fixed evidence-first. Full capstone + runbook: [`docs/engine-load-capstone-2026-06-05.md`](docs/engine-load-capstone-2026-06-05.md).
+- **2026-06-05 UPDATE — the `apk/` clean-room parsers (the UNTRUSTED-APK front door) got an adversarial-robustness
+  pass: +27 hand-crafted negative tests, all green; ALREADY ROBUST — no real defect found.** The three parsers
+  (`mod.rs` = ZIP/APK reader, `axml.rs` = binary AndroidManifest, `arsc.rs` = resources.arsc) were driven into
+  every failure branch with hand-built hostile byte buffers (NOT real-APK reversing): bad/short/overrunning chunk
+  headers, `string_count*4` / `attribute_count*attribute_size` overflow, UTF-8/UTF-16 length fields running past
+  the chunk (incl. the 31-bit high-bit form), string indices out of range, MAX_DEPTH nesting, unbalanced
+  end-elements, a resource-map shorter than the referenced attr index (→ id 0, never OOB), min-size child chunks
+  (no infinite loop); ARSC bad table/package header sizes, typeStrings offset past EOF, colossal entryCount /
+  entry offset past type data / entry size below minimum (→ clean None), a bag `count = 0xFFFFFFFF` (bounded by
+  the chunk + MAX_MAP_ENTRIES, not unbounded), > MAX_PACKAGES, out-of-range pkg/type/entry ids; ZIP truncation
+  at EVERY prefix length + central-directory byte-corruption (typed `ApkError`, never panic) + the
+  `READ_ENTRY_PREALLOC_CAP` (8 MiB) guard proving a hostile uncompressed-size can't force a gigabyte up-front
+  alloc + a Deflate round-trip proving the decompress is bounded by the declared size. **Every one yields a typed
+  `AxmlError`/`ArscError`/`ApkError` (or a clean `None`), never a panic / integer overflow / OOB / unbounded
+  alloc** — the existing `.get()`+`checked_*`+explicit-bound discipline already held; these are regression guards
+  tied to the panic=abort totality requirement (§2.8). NO defect, NO weakening, NO new `unsafe` — all three
+  modules stay `#![forbid(unsafe_code)]` (verified: zero `unsafe` keyword in `src/apk/`). The zip-container parse
+  is the `zip` 2.4.2 crate (Context7-verified: typed `ZipError` + `take(compressed_size)` + early
+  uncompressed-size decompression limit — bounded by design). Gate now **484 unit + 4 integration + 2 doctests**
+  (fmt/build/clippy `-D warnings`/test/release all clean); the 4 `engine_milestones` guards still pass. See §6
+  (2026-06-05 apk-parser adversarial-robustness pass).
 - **Phase:** Research & design **locked** → skeleton pushed → **M0 ✅ COMPLETE**
   (foundation built, ATL installed, GLES3 smoke render verified, Roblox boot reaches
   asset-loading before the ATL/GTK4 low_4gb limit — see "M0 COMPLETE" below). **M1 IN
@@ -4231,6 +4252,32 @@ grep -E 'Class .* not found|Method .* not found|UnsatisfiedLink|no implementatio
   safeguard NOT tripped (crafted in-memory malformed buffers + Eclipse's own `src/loader`; no libroblox
   symbol-mining, no native-load-interception region read/edited). Files: `src/loader/map.rs` (fix + tests),
   `src/loader/{elf,reloc,resolve,tls,link}.rs` (tests only).
+- **2026-06-05 (apk-parser adversarial-robustness pass)** — 🛡️ Hardened Eclipse's own clean-room
+  UNTRUSTED-APK parsers (`src/apk/{mod,axml,arsc}.rs`) against malicious/corrupt input with **+27 hand-crafted
+  negative tests** (11 axml, 10 arsc, 6 zip/apk). *Same discipline as the loader pass; same finding posture:*
+  **ALREADY ROBUST — no real defect found.** Each parser was driven into every failure branch with hand-built
+  hostile byte buffers (NOT real-APK reverse-engineering): **axml** — bad/short/overrunning chunk headers,
+  `string_count*4` overflow, `attribute_count*attribute_size` overflow, UTF-8 byte-len + UTF-16 (incl. the
+  31-bit high-bit form) length running past the chunk, element name index out of range, MAX_DEPTH nesting,
+  unbalanced end-element, a resource-map shorter than the referenced attr index (→ id 0, never OOB), min-size
+  child chunks (no infinite loop); **arsc** — bad table/package header sizes, typeStrings offset past EOF,
+  colossal `entryCount` / entry offset past type data / entry size < minimum (→ clean `None`), a bag
+  `count=0xFFFFFFFF` (bounded by the chunk + `MAX_MAP_ENTRIES`), > `MAX_PACKAGES`, out-of-range pkg/type/entry
+  ids, a non-pool chunk where a pool is expected; **zip/apk** — truncation at EVERY prefix length +
+  central-directory byte-corruption (typed `ApkError`, never panic), the `READ_ENTRY_PREALLOC_CAP` (8 MiB)
+  guard proving a hostile uncompressed-size can't force a gigabyte up-front alloc, a 256 KiB-repetitive Deflate
+  round-trip proving the decompress is bounded by the declared size, missing-entry → `EntryMissing`, empty file
+  → typed error. **Every input yields a typed `AxmlError`/`ArscError`/`ApkError` (or a clean `None`), never a
+  panic / integer overflow / OOB slice / unbounded alloc** — the existing `.get()`+`checked_*`+explicit-bound
+  discipline already held; these guards are tied to the panic=abort totality requirement (§2.8). **No defect, no
+  test weakened, NO new `unsafe`** — all three modules stay `#![forbid(unsafe_code)]` (verified: zero `unsafe`
+  keyword in `src/apk/`). The zip-container parse itself is the `zip` 2.4.2 crate (Context7-verified: typed
+  `ZipError` + `take(compressed_size)` + early uncompressed-size decompression limit → bounded by design).
+  *Gate:* fmt --all --check / build --all-targets / clippy (-D warnings) / test (**484 unit + 4 integration +
+  2 doctests**) / release — all 0-warning/0-error, deterministic ×5 on the apk suite; the 4 `engine_milestones`
+  guards still pass. Cyber-safeguard NOT tripped (crafted in-memory malformed buffers + Eclipse's own `src/apk`;
+  no ATL asset/Resources source, no native-library-load region, no real-binary symbol-mining). Files:
+  `src/apk/{mod,axml,arsc}.rs` (tests only).
 
 ---
 

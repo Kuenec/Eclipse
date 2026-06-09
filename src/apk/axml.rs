@@ -1187,4 +1187,248 @@ mod tests {
             .expect("activity element");
         assert_eq!(activity.attributes[0].name_resource, 0, "absent map ⇒ id 0");
     }
+
+    // === Adversarial robustness pass (2026-06-05) ==========================================
+    // Hand-crafted hostile AXML byte buffers: every one must yield a typed `AxmlError`
+    // (Ok or specific Err), NEVER a panic / integer overflow / OOB slice / unbounded alloc.
+    // These are direct negative tests (not byte-flip fuzz) that drive the chunk header, string
+    // pool, element/attribute, and resource-map readers into their failure branches on purpose.
+    // `#![forbid(unsafe_code)]` + debug `overflow-checks` mean any wrapping `+`/`*` would panic
+    // here, so the tests completing is proof the checked-math/bounds discipline holds.
+
+    /// Build a fully hand-controlled `RES_STRING_POOL_TYPE` chunk header with arbitrary field
+    /// values (no trailing data), so a test can inject hostile `string_count`/`flags`/
+    /// `strings_start`/declared-`size` values the valid builder never would.
+    fn build_pool_header(
+        size: u32,
+        string_count: u32,
+        flags: u32,
+        strings_start: u32,
+        trailing: &[u8],
+    ) -> Vec<u8> {
+        let mut c = Vec::new();
+        u16b(&mut c, RES_STRING_POOL_TYPE);
+        u16b(&mut c, STRING_POOL_HEADER_SIZE as u16); // headerSize 28
+        u32b(&mut c, size);
+        u32b(&mut c, string_count);
+        u32b(&mut c, 0); // styleCount
+        u32b(&mut c, flags);
+        u32b(&mut c, strings_start);
+        u32b(&mut c, 0); // stylesStart
+        c.extend_from_slice(trailing);
+        c
+    }
+
+    #[test]
+    fn chunk_header_short_or_overrunning_is_typed_error() {
+        // headerSize < 8 (cannot even cover ResChunk_header) → BadChunk.
+        let mut b = Vec::new();
+        u16b(&mut b, RES_XML_TYPE);
+        u16b(&mut b, 4); // headerSize too small
+        u32b(&mut b, 8);
+        assert_eq!(read_manifest(&b), Err(AxmlError::BadChunk));
+
+        // size < headerSize → BadChunk.
+        let mut b = Vec::new();
+        u16b(&mut b, RES_XML_TYPE);
+        u16b(&mut b, 8);
+        u32b(&mut b, 4); // size < headerSize
+        assert_eq!(read_manifest(&b), Err(AxmlError::BadChunk));
+
+        // size declares more bytes than the buffer holds → Truncated.
+        let mut b = Vec::new();
+        u16b(&mut b, RES_XML_TYPE);
+        u16b(&mut b, 8);
+        u32b(&mut b, 0xFFFF_FFF0); // size far past EOF
+        assert_eq!(read_manifest(&b), Err(AxmlError::Truncated));
+
+        // A non-RES_XML root chunk → NoXmlRoot (not a panic).
+        let mut b = Vec::new();
+        u16b(&mut b, RES_STRING_POOL_TYPE);
+        u16b(&mut b, 8);
+        u32b(&mut b, 8);
+        assert_eq!(read_manifest(&b), Err(AxmlError::NoXmlRoot));
+    }
+
+    #[test]
+    fn string_pool_count_times_four_overflow_is_typed_error() {
+        // string_count whose *4 offset array overflows usize must be Overflow, never a wrap/OOB.
+        let pool = build_pool_header(28, 0xFFFF_FFFF, UTF8_FLAG, 28, &[]);
+        let axml = build_axml(&[&pool]);
+        // find_string_pool → StringPool::parse: count*4 overflows on 32-bit, or offsets_end past
+        // buf on 64-bit → BadString. Either way a typed error, never a panic.
+        let err = read_manifest(&axml).expect_err("hostile string_count must fail");
+        assert!(
+            matches!(err, AxmlError::Overflow | AxmlError::BadString),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn string_pool_offsets_or_strings_start_past_chunk_is_bad_string() {
+        // offset array claims more entries (100*4 bytes) than fit in the 28-byte chunk → BadString
+        // raised inside StringPool::parse before any string is read.
+        let pool = build_pool_header(28, 100, UTF8_FLAG, 28, &[]);
+        let axml = build_axml(&[&pool]);
+        assert_eq!(read_manifest(&axml), Err(AxmlError::BadString));
+
+        // strings_start past the chunk end → BadString.
+        let pool = build_pool_header(28, 0, UTF8_FLAG, 0xFFFF, &[]);
+        let axml = build_axml(&[&pool]);
+        assert_eq!(read_manifest(&axml), Err(AxmlError::BadString));
+    }
+
+    #[test]
+    fn utf8_string_byte_len_runs_past_chunk_is_bad_string() {
+        // A UTF-8 pool with one string whose byte-length field claims far more bytes than exist.
+        // data: char-len=1, byte-len=200 (single-byte forms), then only 1 actual byte.
+        let data: &[u8] = &[1, 200, b'A'];
+        let strings_start = STRING_POOL_HEADER_SIZE + 4; // header + one u32 offset
+        let size = (strings_start + data.len()) as u32;
+        let mut pool = build_pool_header(size, 1, UTF8_FLAG, strings_start as u32, &[]);
+        u32b(&mut pool, 0); // the single offset (relative to strings_start)
+        pool.extend_from_slice(data);
+        // Drive get() via parse_document's materialize so the decode path runs over the pool.
+        let axml = build_axml(&[&pool]);
+        let err = parse_document(&axml).expect_err("overrunning utf8 string must fail");
+        assert!(
+            matches!(err, AxmlError::BadString | AxmlError::Overflow),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn utf16_string_high_bit_length_overflow_is_typed_error() {
+        // A UTF-16 pool whose first length word sets the 0x8000 high bit and the extension word
+        // encodes a huge 31-bit char count; char_len*2 must be a checked Overflow or the slice
+        // bound BadString — never a wrapping multiply.
+        let mut data = Vec::new();
+        u16b(&mut data, 0xFFFF); // high bit set → 31-bit length follows
+        u16b(&mut data, 0xFFFF); // extension word → length ≈ 0x7FFF_FFFF
+        let strings_start = STRING_POOL_HEADER_SIZE + 4;
+        let size = (strings_start + data.len()) as u32;
+        let mut pool = build_pool_header(size, 1, 0 /* UTF-16 */, strings_start as u32, &[]);
+        u32b(&mut pool, 0);
+        pool.extend_from_slice(&data);
+        let axml = build_axml(&[&pool]);
+        let err = parse_document(&axml).expect_err("overrunning utf16 string must fail");
+        assert!(
+            matches!(err, AxmlError::Overflow | AxmlError::BadString),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn element_name_index_out_of_range_is_typed_error() {
+        // A start element whose name string index is past the pool → StringIndexOutOfRange.
+        let pool = build_utf8_string_pool(&["only"]);
+        let elem = build_start_element(99, 0, TYPE_INT_DEC, 0); // name_ref 99 (pool has 1 string)
+        let axml = build_axml(&[&pool, &elem]);
+        assert_eq!(parse_document(&axml), Err(AxmlError::StringIndexOutOfRange));
+    }
+
+    #[test]
+    fn element_attribute_count_times_size_overflow_is_typed_error() {
+        // A start element declaring attribute_count * attribute_size that overflows usize must be
+        // a checked Overflow (or Truncated when the array is bounded but past EOF), never an OOB
+        // read or a giant allocation. Build the node header by hand with hostile attr fields.
+        let pool = build_utf8_string_pool(&["el"]);
+        let mut elem = Vec::new();
+        u16b(&mut elem, RES_XML_START_ELEMENT_TYPE);
+        u16b(&mut elem, XML_NODE_HEADER_SIZE as u16); // headerSize 16
+        let size_pos = elem.len();
+        u32b(&mut elem, 0); // size patched below
+        u32b(&mut elem, 1); // lineNumber
+        u32b(&mut elem, NO_STRING); // comment
+                                    // attrExt: ns, name, attributeStart, attributeSize, attributeCount, ...
+        u32b(&mut elem, NO_STRING); // ns
+        u32b(&mut elem, 0); // name idx 0 ("el")
+        u16b(&mut elem, 20); // attributeStart
+        u16b(&mut elem, 0xFFFF); // attributeSize (huge)
+        u16b(&mut elem, 0xFFFF); // attributeCount (huge) → count*size = 0xFFFF*0xFFFF
+        u16b(&mut elem, 0); // idIndex
+        u16b(&mut elem, 0); // classIndex
+        u16b(&mut elem, 0); // styleIndex
+        let total = elem.len() as u32;
+        elem[size_pos..size_pos + 4].copy_from_slice(&total.to_le_bytes());
+        let axml = build_axml(&[&pool, &elem]);
+        // 0xFFFF*0xFFFF fits in usize on 64-bit, so the array bound (attrs_end > buf.len) trips
+        // Truncated; on a 32-bit target the multiply would be a checked Overflow. Accept either.
+        let err = parse_document(&axml).expect_err("hostile attr count/size must fail");
+        assert!(
+            matches!(err, AxmlError::Truncated | AxmlError::Overflow),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unbalanced_end_element_is_typed_error() {
+        // An end-element with no matching start (stack underflow) must be UnbalancedElement.
+        let pool = build_utf8_string_pool(&["el"]);
+        let mut end = Vec::new();
+        u16b(&mut end, RES_XML_END_ELEMENT_TYPE);
+        u16b(&mut end, XML_NODE_HEADER_SIZE as u16);
+        u32b(&mut end, XML_NODE_HEADER_SIZE as u32 + 8); // size: header + endExt(ns+name)
+        u32b(&mut end, 1); // lineNumber
+        u32b(&mut end, NO_STRING); // comment
+        u32b(&mut end, NO_STRING); // ns
+        u32b(&mut end, 0); // name
+        let axml = build_axml(&[&pool, &end]);
+        // read_manifest's walk pops an empty stack → UnbalancedElement.
+        assert_eq!(read_manifest(&axml), Err(AxmlError::UnbalancedElement));
+        // parse_document's checked_sub on depth 0 → UnbalancedElement (same root cause).
+        assert_eq!(parse_document(&axml), Err(AxmlError::UnbalancedElement));
+    }
+
+    #[test]
+    fn nesting_beyond_max_depth_is_typed_error() {
+        // MAX_DEPTH+1 nested start-elements must yield TooDeep, never unbounded stack/vec growth.
+        let pool = build_utf8_string_pool(&["el"]);
+        let mut children: Vec<Vec<u8>> = Vec::new();
+        children.push(pool);
+        // build_start_element makes a self-contained start with one attr; reuse it as a generic
+        // start tag (its attr is harmless). MAX_DEPTH+1 of them are all "open" (no end tags).
+        for _ in 0..=MAX_DEPTH {
+            children.push(build_start_element(0, 0, TYPE_INT_DEC, 0));
+        }
+        let refs: Vec<&[u8]> = children.iter().map(|c| c.as_slice()).collect();
+        let axml = build_axml(&refs);
+        assert_eq!(read_manifest(&axml), Err(AxmlError::TooDeep));
+        assert_eq!(parse_document(&axml), Err(AxmlError::TooDeep));
+    }
+
+    #[test]
+    fn resource_map_shorter_than_attr_index_yields_zero_not_panic() {
+        // A resource-map shorter than the attribute name index → name_resource 0 (never fabricated,
+        // never OOB). String idx 1 ("name") used as the attr name, but the map has only 1 id.
+        let pool = build_utf8_string_pool(&["activity", "name", "MyActivity"]);
+        let resmap = build_resource_map(&[0x0000_0000]); // only index 0; index 1 is past it
+        let elem = build_start_element(0, 1, TYPE_STRING, 2);
+        let axml = build_axml(&[&pool, &resmap, &elem]);
+        let doc = parse_document(&axml).expect("short resource map must not panic");
+        let activity = doc
+            .elements
+            .iter()
+            .find(|e| e.name.as_deref() == Some("activity"))
+            .expect("activity element");
+        assert_eq!(
+            activity.attributes[0].name_resource, 0,
+            "attr index past a short resource map ⇒ 0, never OOB"
+        );
+    }
+
+    #[test]
+    fn child_chunk_with_min_size_does_not_loop_forever() {
+        // A child chunk declaring the minimum legal size (8) must advance the iterator (no infinite
+        // loop). A root whose body is several back-to-back 8-byte string-pool-typed stubs: the walk
+        // terminates (the test returning at all is the proof) with a typed error.
+        let mut stub = Vec::new();
+        u16b(&mut stub, RES_STRING_POOL_TYPE);
+        u16b(&mut stub, 8);
+        u32b(&mut stub, 8);
+        let axml = build_axml(&[&stub, &stub, &stub]);
+        // No usable string pool (these are malformed 8-byte stubs) → an error, but crucially it
+        // returns rather than hanging.
+        let _ = read_manifest(&axml);
+    }
 }

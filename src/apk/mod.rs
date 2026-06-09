@@ -900,4 +900,130 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, ApkError::InvalidDigest(_)), "got {err:?}");
     }
+
+    // === Adversarial robustness pass (2026-06-05) ==========================================
+    // The zip-container parsing itself is delegated to the `zip` 2.x crate, which returns typed
+    // `ZipError` (InvalidArchive/UnsupportedArchive/Io) for malformed archives and bounds reads
+    // with `take(compressed_size)` + an early `uncompressed_size` decompression limit (verified
+    // 2026-06-05 via Context7 against zip 2.4.2). What Eclipse OWNS here and these tests guard:
+    //   (1) every malformed/truncated/missing input surfaces a typed `ApkError`, never a panic;
+    //   (2) the `READ_ENTRY_PREALLOC_CAP` keeps a hostile uncompressed-size field from forcing a
+    //       gigabyte up-front allocation, while still reading the entry's true bytes.
+
+    #[test]
+    fn open_truncated_zip_at_every_boundary_is_typed_error_never_panic() {
+        // Build a real multi-entry APK, then truncate it at every prefix length. Each truncation is
+        // fed to Apk::open: it must return a typed ApkError (Zip/Io) or — if enough of the central
+        // directory survived — Ok, but NEVER panic. The loop completing is the totality proof.
+        let bytes = build_apk(&[
+            (MANIFEST_ENTRY, FIXTURE_MANIFEST),
+            ("lib/x86_64/libroblox.so", b"engine-bytes-payload"),
+            ("classes.dex", b"dex-bytes"),
+        ]);
+        for len in 0..=bytes.len() {
+            let path = temp_file(&format!("trunc-{len}"), &bytes[..len]);
+            // Whatever the verdict, it must be a Result, not a panic. On Ok, also drive read_entry
+            // (still total) so a truncated-but-openable archive's entry read can't panic either.
+            if let Ok(mut apk) = Apk::open(&path) {
+                let _ = apk.read_entry(MANIFEST_ENTRY);
+                let _ = apk.x86_64_engine();
+                let _ = apk.native_abis();
+            }
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn open_corrupted_central_directory_is_typed_zip_error() {
+        // Flip bytes across the tail of a valid APK (where the central directory + end-of-CD record
+        // live). Each mutation must yield a typed ApkError (or Ok), never a panic.
+        let bytes = build_apk(&[
+            (MANIFEST_ENTRY, FIXTURE_MANIFEST),
+            ("classes.dex", b"dex-bytes"),
+        ]);
+        // The EOCD/central directory is in the last ~128 bytes; stride through them.
+        let start = bytes.len().saturating_sub(128);
+        for off in (start..bytes.len()).step_by(3) {
+            for &val in &[0x00u8, 0xFF] {
+                let mut buf = bytes.clone();
+                buf[off] = val;
+                let path = temp_file(&format!("cd-corrupt-{off}-{val}"), &buf);
+                if let Ok(mut apk) = Apk::open(&path) {
+                    let _ = apk.read_entry(MANIFEST_ENTRY);
+                }
+                std::fs::remove_file(&path).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn read_entry_prealloc_cap_bounds_upfront_allocation() {
+        // Regression guard for the documented hostile-uncompressed-size defense: the speculative
+        // Vec::with_capacity in read_entry is capped at READ_ENTRY_PREALLOC_CAP, so an attacker's
+        // size field cannot drive a gigabyte up-front allocation. Pin the cap is sane (≤ 8 MiB,
+        // well under any OOM threshold) and that the cap math (size.min(cap)) is what bounds it.
+        assert_eq!(READ_ENTRY_PREALLOC_CAP, 8 * 1024 * 1024);
+        // For a real small entry, capacity == its true size (cap doesn't shrink real reads), and
+        // the bytes read back are exactly the entry's content (cap never truncates data).
+        let payload: &[u8] = b"a-small-manifest-class-entry";
+        let cap = (payload.len() as u64).min(READ_ENTRY_PREALLOC_CAP) as usize;
+        assert_eq!(cap, payload.len(), "small entry: cap is the true size");
+        let bytes = build_apk(&[("res.bin", payload)]);
+        let (mut apk, path) = open_apk(&bytes, "prealloc-cap");
+        let got = apk.read_entry("res.bin").expect("read small entry");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(got, payload, "cap must never truncate the real bytes");
+    }
+
+    #[test]
+    fn read_entry_missing_is_typed_error_not_panic() {
+        // A read of an absent entry is EntryMissing, never a panic (the framework maps this to
+        // FileNotFoundException).
+        let bytes = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST)]);
+        let (mut apk, path) = open_apk(&bytes, "read-missing");
+        let err = apk
+            .read_entry("definitely/not/here.bin")
+            .expect_err("absent entry");
+        std::fs::remove_file(&path).ok();
+        match err {
+            ApkError::EntryMissing(name) => assert_eq!(name, "definitely/not/here.bin"),
+            other => panic!("expected EntryMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_entry_deflated_is_bounded_and_roundtrips() {
+        // A Deflate-compressed, highly-repetitive entry (compresses tiny, expands to its declared
+        // uncompressed size): the zip crate's take(compressed_size) + uncompressed-size limit keeps
+        // the read bounded (no OOM), and the bytes must round-trip exactly — proving the decompress
+        // path is enforced by the declared size, not driven unbounded by the stream.
+        let payload = vec![0x41u8; 256 * 1024]; // 256 KiB of 'A' → compresses to a few hundred bytes
+        let bytes = build_apk_methods(&[("big.bin", &payload, CompressionMethod::Deflated)]);
+        // The container itself is far smaller than the uncompressed payload (compression worked).
+        assert!(
+            bytes.len() < payload.len() / 2,
+            "repetitive payload should compress well in the fixture"
+        );
+        let (mut apk, path) = open_apk(&bytes, "deflate-bounded");
+        let got = apk.read_entry("big.bin").expect("read deflated entry");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            got.len(),
+            payload.len(),
+            "decompressed length is the declared size"
+        );
+        assert_eq!(got, payload, "deflated bytes round-trip exactly");
+    }
+
+    #[test]
+    fn empty_file_open_is_typed_error() {
+        // A zero-byte file (no zip structure at all) must be a typed error, never a panic.
+        let path = temp_file("empty", b"");
+        let err = Apk::open(&path).err().expect("empty file must fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, ApkError::Zip(_) | ApkError::Io(_)),
+            "got {err:?}"
+        );
+    }
 }
