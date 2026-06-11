@@ -128,6 +128,31 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-11 — SQLite OPEN path works (libsqlite3-backed natives); the lifecycle is at step 5 `ActivitySplash.onCreate`,
+  next blocker = `nativeExecuteForCursorWindow` (the first row-returning SELECT). ⇐ START HERE NEXT SESSION.**
+  ATL's `SQLiteConnection.java` declares the full AOSP `private static native` surface but backs it in its unloaded GTK
+  lib, so Roblox's DB open was an `UnsatisfiedLinkError`. **Implemented (gate-green):** new dep `libsqlite3-sys` (feature
+  `bundled` — compiles the vendored SQLite amalgamation via `cc`, no system lib; justified in `Cargo.toml` + below) and
+  `src/framework/sqlite.rs` — a generational-slab registry of the raw `sqlite3*`/`sqlite3_stmt*` (jlong = slab index, not a
+  raw pointer → a stale handle throws, never UB) + **26 `SQLiteConnection` natives bound via `RegisterNatives`** (open /
+  close / prepare / finalize / bind{Null,Long,Double,String,Blob} / reset / execute / executeFor{Long,String,ChangedRowCount,
+  LastInsertedRowId} / getColumn{Count,Name} / getParameterCount / isReadOnly / hasCodec(false) / cancel·resetCancel·
+  getDbLookaside·registerCustomFunction no-ops). On any SQLite error a native throws `SQLiteException`; the
+  `"LOCALIZED"`/`"UNICODE"` collations are registered (a byte comparator) so `SQLiteDatabase.setLocale`'s `REINDEX LOCALIZED`
+  resolves. **VALIDATED on the real v2.721.1108 boot:** `nativeOpen` succeeds — `androidx.work.workdb` + `db_default_job_manager`
+  open, PRAGMAs/statements/executes run, `setLocale` succeeds (0 REINDEX errors). **NEXT (Phase B): `nativeExecuteForCursorWindow`.**
+  ⚠️ **KEY INSIGHT for whoever does Phase B:** ATL declares it `nativeExecuteForCursorWindow(long conn, long stmt,
+  **android.database.CursorWindow window**, int startPos, int requiredPos, boolean countAllRows) → long` — the window is a
+  **Java object, NOT a `long` windowPtr** (ATL's `CursorWindow` is pure-Java, no native buffer). So the native must FILL the
+  Java `CursorWindow` via JNI callbacks (`window.clear()` / `setNumColumns(n)` / `allocRow()` / `putLong`/`putString`/`putDouble`/
+  `putNull`/`putBlob(value,row,col)`) while looping `sqlite3_step`, then return the packed `(jlong(startPos) << 32) | totalRows`.
+  No `#[repr(C,packed)]` FieldSlot buffer needed — it's JNI calls into the Java window (verify the exact `CursorWindow` Java
+  method names/sigs in ATL's `api-impl/android/database/CursorWindow.java` first). Other remaining (worker/deeper, non-blocking
+  the main thread): `java.time.DateTimeFormatter` `BootstrapMethodError`, the Firebase measurement `StreamCorruptedException`
+  (Binder/Parcel). Gate: **504 unit + 4 integration + 2 doctests**, fmt/clippy `-D warnings`/release all 0-warning. **Durability
+  still open:** the Build + NetworkRequest framework patches need `ECLIPSE_ANDROID_FRAMEWORK_DIR=~/.cache/eclipse/framework-patched`
+  (built by `~/.cache/eclipse/patch-framework.sh`); the SQLite + ConnectivityManager + discovery-gap fixes are in-binary
+  (durable). Not committed (owner's session instruction). Detail: §6 (2026-06-11 SQLite).
 - **2026-06-11 — Post-discovery-gap cascade: lifecycle reached step 5 `ActivitySplash.onCreate`; the REAL main-thread
   blocker is now SQLite.** After the `Java_*` discovery gap closed (below), the dev-host run revealed + cleared two more
   `ActivitySplash.onCreate` (step 5) gaps: (a) **`NetworkRequest$Builder.addCapability`/`addTransportType`** (missing
@@ -4545,6 +4570,43 @@ an Eclipse-side auto-provision of the overlay (like the libm shim) is an open im
 (`resolve_export` + `java_native_exports` + wiring), `src/loader.rs` (2 mods). Gate clean: **504 unit + 4 integration + 2
 doctests**, fmt/clippy `-D warnings`/release all 0-warning. Done MAIN-LOOP (dev-host); **not committed** (owner's session
 instruction).
+
+### 2026-06-11 — SQLite subsystem Phase A: `SQLiteConnection` natives (libsqlite3-backed) — DB open + statement lifecycle + executes WORK
+
+**New dependency (policy-logged):** `libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }` (+ `vcpkg`, a
+Windows-only build helper — 2 new crates total). `bundled` compiles the vendored SQLite amalgamation via the `cc` crate
+(already a build-dep) and links it statically: NO system `libsqlite3`, deterministic version, distro-portable
+(detect-don't-assume §9). No pure-Rust SQLite is production-grade (stability §3.1), so a thin binding to the gold-standard C
+engine is the accepted shape — the one new C black box, same rationale as cpal→ALSA / the `cc` shims. Eclipse binds the
+natives against the RAW `libsqlite3-sys` FFI (the JNI contract IS a thin C-API surface; `sqlite3*`/`sqlite3_stmt*` round-trip
+as the jlong handles), not the higher-level `rusqlite` (leaner: no rusqlite/smallvec/fallible-iterator). Recorded in
+`Cargo.toml` (per-dep comment) + `docs/dependency-plan.md`.
+
+**Module `src/framework/sqlite.rs`:** a generational-slab registry of the raw `sqlite3*`/`sqlite3_stmt*` (jlong = packed
+slab index+generation, NOT a raw pointer — a stale/fabricated handle is a checked throw, never UB; raw ptrs wrapped in a
+`SendPtr` whose `unsafe impl Send` is justified by SQLITE_THREADSAFE=1 + the registry Mutex) + **26 `SQLiteConnection`
+natives** bound via `RegisterNatives` in `framework::sqlite::register_natives` (wired into `drive_application_lifecycle` after
+`register_connectivity_natives`). UTF-8 SQLite entry points (`open_v2`/`prepare_v2`/`bind_text`/`column_text`) — functionally
+identical to AOSP's UTF-16 ones, simpler. Each native is `with_env`-guarded (no panic across JNI) and throws
+`android.database.sqlite.SQLiteException` (via `throw_new`) on any SQLite error. `nativeOpen` maps Android's `openFlags`
+(`CREATE_IF_NECESSARY`/`OPEN_READONLY`) to SQLite flags exactly as AOSP does, sets a 2.5 s busy timeout, and registers the
+`"LOCALIZED"`/`"UNICODE"` collations (a byte-lexicographic comparator via `sqlite3_create_collation_v2`) so
+`SQLiteDatabase.setLocale`'s `REINDEX LOCALIZED` resolves (it threw "unable to identify the object to be reindexed" until the
+collations existed). `nativeRegisterLocalizedCollators` re-registers them on the connection. The rarely-hit
+`nativeExecuteForBlobFileDescriptor` returns -1 (no ashmem fd path); `nativeRegisterCustomFunction`/`nativeCancel`/
+`nativeResetCancel`/`nativeGetDbLookaside` are sound no-ops/neutral values.
+
+**VALIDATED (real v2.721.1108, `ECLIPSE_ANDROID_FRAMEWORK_DIR=…/framework-patched`):** `nativeOpen` succeeds —
+`androidx.work.workdb` and `db_default_job_manager` open, PRAGMAs / prepared statements / non-cursor executes run, and
+`setLocale` succeeds (0 `REINDEX LOCALIZED` errors). The lifecycle stays at step 5 (`ActivitySplash.onCreate`) on the **next
+blocker = `nativeExecuteForCursorWindow`** (the first row-returning SELECT). **Phase B note (do this next):** ATL declares it
+`nativeExecuteForCursorWindow(long conn, long stmt, android.database.CursorWindow window, int startPos, int requiredPos,
+boolean countAllRows) → long` — the window is a **Java object, NOT a `long` windowPtr** (ATL's `CursorWindow` is pure-Java,
+no native buffer). Implement it by looping `sqlite3_step` and FILLING the Java window via JNI callbacks
+(`window.clear()`/`setNumColumns(n)`/`allocRow()`/`putLong`/`putString`/`putDouble`/`putNull`/`putBlob(value,row,col)` — verify
+the exact method names/sigs in ATL's `api-impl/android/database/CursorWindow.java`), then return
+`(jlong(startPos) << 32) | totalRows`. No `#[repr(C,packed)]` FieldSlot buffer is needed. Gate: **504 unit + 4 integration +
+2 doctests**, all 0-warning. Done MAIN-LOOP (dev-host); **not committed** (owner's session instruction).
 
 ---
 

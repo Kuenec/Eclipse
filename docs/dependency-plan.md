@@ -66,6 +66,15 @@ zbus = "4"                                             # 🟢 D-Bus: Feral GameM
 ashpd = "0.9"                                          # 🟢 XDG portals (notifications, etc.)
 discord-rich-presence = "0.2"                          # 🟢 Discord RPC
 
+# --- Framework: SQLite (src/framework/sqlite.rs) — WIRED 2026-06-11 ----------
+# 🟡 The engine behind android.database.sqlite.SQLiteConnection's natives (ATL declares the full AOSP
+# native surface but backs it in its GTK lib Eclipse doesn't load → Roblox's onCreate DB open is an
+# UnsatisfiedLinkError; Eclipse binds them itself against the RAW FFI). `bundled` compiles the vendored
+# SQLite amalgamation via `cc` (no system libsqlite3, deterministic, distro-portable). No pure-Rust
+# SQLite is production-grade (stability > purity), so a thin C binding is the accepted shape — the one new
+# C black box, same rationale as cpal→ALSA. Raw -sys (not rusqlite) — the JNI contract IS the C API.
+libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }  # 🟡 (+vcpkg, Windows-only build helper)
+
 # --- Allocator ---------------------------------------------------------------
 # Use the SYSTEM allocator by default (zero dep, leanest). Add only on profiling evidence:
 # mimalloc = { version = "0.1", optional = true }      # 🟡
