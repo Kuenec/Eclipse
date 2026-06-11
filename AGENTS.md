@@ -128,6 +128,19 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-11 — Post-discovery-gap cascade: lifecycle reached step 5 `ActivitySplash.onCreate`; the REAL main-thread
+  blocker is now SQLite.** After the `Java_*` discovery gap closed (below), the dev-host run revealed + cleared two more
+  `ActivitySplash.onCreate` (step 5) gaps: (a) **`NetworkRequest$Builder.addCapability`/`addTransportType`** (missing
+  framework METHODS, Build-field category) — added a real-AOSP-shape fluent `Builder` to the patched-`api-impl.jar` overlay
+  (`~/.cache/eclipse/patch-framework.sh` now patches `android.os.Build` + `android.net.NetworkRequest`); (b)
+  **`ConnectivityManager.registerNetworkCallback`/`isActiveNetworkMetered`/`nativeGetNetworkAvailable`** (ATL GTK-backed
+  NATIVES Eclipse doesn't load) — bound via Eclipse Rust `RegisterNatives` in `framework.rs::register_connectivity_natives`
+  (no-op / unmetered / available; **durable — compiled into the binary, no overlay needed**). **Now the REAL main-thread
+  blocker is `android.database.sqlite.SQLiteConnection.nativeOpen` at `ActivitySplash.onCreate(76)`** — the big SQLite
+  subsystem (the original "frontier"; research ready: `rusqlite` `bundled` + raw `ffi` for the `SQLiteConnection`/`CursorWindow`
+  native surface). **Durability caveat persists:** the Build + NetworkRequest overlay needs `ECLIPSE_ANDROID_FRAMEWORK_DIR=
+  ~/.cache/eclipse/framework-patched` (bare `./eclipse run` reverts to stock `api-impl.jar`); auto-provisioning the overlay
+  is an open improvement. Gate: **504 unit + 4 integration + 2 doctests**, all 0-warning. Not committed. Detail: §6 (2026-06-11).
 - **2026-06-11 — 🚀 THE `Java_*` DISCOVERY GAP IS CLOSED (general reflection-based RegisterNatives); the Roblox lifecycle
   advanced 2 steps into the launcher `ActivitySplash.onCreate`.** Eclipse mmap-pre-loads JNI libs (not via ART `dlopen`),
   so ART's lazy `dlsym(handle,"Java_…")` could never find their natives → `UnsatisfiedLinkError`. **Fix (pure-Rust,
