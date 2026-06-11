@@ -1,3 +1,118 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+> The **Engineering Instructions** below (starting at that heading) are the authoritative,
+> mandatory project policy — `AGENTS.md` §0 names this file as "ALWAYS follow it." This top
+> section is codebase orientation layered on top of that policy, not a replacement for it.
+
+## Read first, every session
+
+- **`AGENTS.md`** is the durable charter + **living working state**. Read it at session start —
+  especially **§5 Living State** (what is implemented vs stubbed right now) and **§6 Decisions
+  Log** (append-only, dated). **Update §5 and append to §6 after any meaningful change.** It
+  survives context compaction; the code's status comments lag behind it.
+- **`docs/component-map.md`** is the authoritative component matrix — the `src/` module layout
+  mirrors it. The other `docs/` files (see the index in `AGENTS.md` §7) hold the locked design.
+
+## What Eclipse is
+
+An open-source, **pure-Rust, distro-agnostic** runtime that runs the **Android x86-64 build of
+Roblox** natively on Linux (an open alternative to the closed-source Sober). It uses the
+Android-Translation-Layer approach: run Roblox's own native engine `.so` directly on the Linux
+kernel, give it the Android environment it expects, **forward** its Vulkan/GLES/audio to the host
+(near-zero overhead), and run its Java/Kotlin shell on a **vendored AOSP ART** VM that sits off
+the gameplay hot path. **Target is Linux** (all distros, Wayland **and** X11, Mesa **and** NVIDIA,
+Vulkan **and** GL, Pulse **and** PipeWire) — the "Compatibility Requirements" in the policy below
+are written for Windows; apply their *intent* (detect, don't assume) to Linux instead.
+
+## Common commands
+
+**Quality gate** — run all of these clean (0 warnings/errors) before declaring work done or committing:
+
+```bash
+cargo fmt --all
+cargo build --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build --release        # also verify the shipped artifact
+```
+
+- **Build requires a host C/C++ compiler.** `build.rs` compiles three clean-room shims that Rust
+  stable cannot define (C-variadic functions): `src/loader/liblog_shim.c`,
+  `src/loader/bionic_syscall_shim.c`, `src/loader/native_load_shim.cpp`. It also builds the
+  `crates/libm-shim` sub-crate (a `no_std` cdylib) and a missing compiler fails the build with an
+  actionable error.
+- **Run a single test:** `cargo test <substring>` (e.g. `cargo test manifest_parses_utf16`), or a
+  whole file with `cargo test --test engine_milestones`.
+- **The integration tests in `tests/engine_milestones.rs` self-skip** (print `SKIP: …`, pass) when
+  their preconditions are absent — no Roblox APK (`ECLIPSE_ROBLOX_APK=<path>` or the default
+  `$HOME/eclipse-m0/apk/.../*-merged.apk`) or no display server (`WAYLAND_DISPLAY`/`DISPLAY`). They
+  never weaken assertions; with the precondition present they require the exact success marker.
+- **Run the app:** `cargo run -- run <APK>` (boots ART + drives lifecycle + opens the window),
+  `cargo run -- config`, `cargo run -- help`. The live ART/loader boot **must run on the process
+  main thread via `cargo run` — NOT under `cargo test`** (ART aborts on worker threads). The
+  unit/discovery logic is what `cargo test` covers; the live boot is validated per
+  `docs/dev-host-runbook.md`.
+- **Hidden dev-host diagnostic subcommands** (not in `help`; each prints a deterministic SUCCESS
+  marker that `tests/engine_milestones.rs` guards): `__run-libroblox-init` (map+relocate+resolve
+  libroblox.so and run all DT_INIT_ARRAY constructors), `__gl-test` / `__gl-test-anw` (engine
+  GLES2/EGL render path on Eclipse's window), `__input-test` (ALooper input path), `__audio-test`
+  (OpenSL ES → cpal host audio).
+
+## Architecture (the big picture)
+
+One Cargo crate (`eclipse`) plus one sub-crate (`crates/libm-shim`). `src/lib.rs` declares the
+subsystem modules; each maps to a row in `docs/component-map.md`. The end-to-end boot flow lives in
+**`src/main.rs::run_apk`** and is the best map of how the pieces connect:
+
+1. **`apk`** (`src/apk/`) opens the APK zip and reads the binary `AndroidManifest.xml` with
+   Eclipse's **own pure-Rust, total** AXML/ARSC readers (`axml.rs`, `arsc.rs` — they return typed
+   `ApkError`, never panic, which matters under the release `panic = "abort"`).
+2. **`runtime`** (`src/runtime.rs`) builds a `BootPlan` from the manifest+config and **boots the
+   vendored ART VM** by `dlopen`-ing `libart.so` and calling `JNI_CreateJavaVM` (no link-time ART
+   dep), with Roblox's Java on the classpath.
+3. **`loader`** (`src/loader/`) is Eclipse's **own from-scratch pure-Rust bionic dynamic loader** —
+   the highest-risk, most-tested core. It exists because the legacy apkenv/`bionic_translation`
+   shim linker aborts on modern relocations (`R_X86_64_TPOFF64`, `DT_RELR`, `BIND_NOW`) that
+   `libroblox.so` uses. Pipeline: `elf.rs` (decode ET_DYN) → `reloc.rs` (apply relocations) →
+   `map.rs` (mmap PT_LOAD segments, the one `unsafe` module) → `resolve.rs` (symbol scope /
+   providers) → `tls.rs` (static-TLS layout + TPOFF64) → `link.rs` (DT_NEEDED graph orchestrator).
+   On top: `engine.rs` (`load_app_native_lib` — the app-JNI-lib preload entry), `init_run.rs`
+   (run constructors), `native_provider.rs`/`ndk_registry.rs`/`bionic_*` (Eclipse-owned bionic+NDK
+   natives), `looper.rs` (real fd-backed ALooper), `opensl.rs` (OpenSL ES → host `cpal`).
+4. **`framework`** (`src/framework.rs` + `framework/*_registry.rs`) is the **native (JNI) side** of
+   the `android.*` framework, written in Rust via the `jni` crate. `drive_application_lifecycle`
+   drives the confirmed JNI recipe (steps 1–7: `createApplication` → `onCreate` → `Activity.*` →
+   `onResume`) against Eclipse-owned, generational-slab registry handles — **no GTK** (GTK would
+   re-crowd the `low_4gb` region ART needs). The `*_registry.rs` files record the view/canvas/paint
+   tree shape that the graphics pass renders.
+5. **`graphics`** (`ash`/Vulkan + `egl_engine.rs` host EGL/GLES2) / **`input`** / **`audio`** are
+   the host-forwarding bridges; `graphics::run_windowed` owns the `winit` window + event loop.
+
+`crates/libm-shim` is a separate `#![no_std]`, `panic="abort"` cdylib re-exporting the pure-Rust
+`libm` crate as a clean-relocation `libm.so` the apkenv linker *can* load (the host glibc
+`libm.so.6` carries the modern relocs that abort it). `build.rs` builds it and the build *verifies*
+via `readelf` that it has no `R_X86_64_TPOFF64`/RELR.
+
+## Repo-specific conventions
+
+- **Pure-Rust for every line Eclipse owns** (AGENTS.md §2.1). The only vendored non-Rust black box
+  is ART; thin host bindings are allowed only where the host owns the component (GPU/audio loader).
+  Every new dependency is justified against stability > pure-Rust > no-bloat and recorded in
+  `docs/dependency-plan.md` + `AGENTS.md` §6 — read `Cargo.toml`'s per-dep comments before adding one.
+- **`unsafe` is confined** (FFI/JNI, the loader's `map.rs`, raw Vulkan); every block carries a
+  `// SAFETY:` comment, and `unsafe_op_in_unsafe_fn` is denied. Modules that need none declare
+  `#![forbid(unsafe_code)]`.
+- **Date non-obvious comments** `// YYYY-MM-DD: …` (behavior, ABI/offset, platform, reasoning) — and
+  treat an old comment as stale if it conflicts with the code.
+- **Dev-host vs harness boundary:** live ART/bionic-loader boots run only on the dev host's main
+  thread (`cargo run`), never in `cargo test` (ART aborts off the main thread) and never in workflow
+  subagents (the cyber-safeguard false-positives on bionic-linker / ART-VM analysis). See
+  `docs/dev-host-runbook.md`.
+
+---
+
 # Engineering Instructions
 
 ## Mandatory Scope

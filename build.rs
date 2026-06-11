@@ -27,9 +27,10 @@
 //! compiler is the documented build requirement for this shim.
 
 fn main() {
-    // Rebuild if either C shim changes. 2026-06-05.
+    // Rebuild if any shim changes. 2026-06-05 / 2026-06-11.
     println!("cargo:rerun-if-changed=src/loader/liblog_shim.c");
     println!("cargo:rerun-if-changed=src/loader/bionic_syscall_shim.c");
+    println!("cargo:rerun-if-changed=src/loader/native_load_shim.cpp");
 
     // `compile` emits `cargo:rustc-link-lib=static=eclipse_liblog_shim` + the link-search path, so
     // the archive is linked into the lib, the bin, AND the test harness. The shim's two symbols are
@@ -50,6 +51,18 @@ fn main() {
     cc::Build::new()
         .file("src/loader/bionic_syscall_shim.c")
         .compile("eclipse_bionic_syscall_shim");
+
+    // The clean-room C++ DELEGATION shim for ART's `JavaVMExt::LoadNativeLibrary`: DEFINES
+    // `eclipse_art_load_native_library(...)`, which builds the `std::string` args with the host
+    // libstdc++ (correct ABI) and calls a runtime-`dlsym`'d function pointer (libart is RTLD_GLOBAL).
+    // The framework's `Runtime.nativeLoad` interception (src/framework.rs) uses it to delegate
+    // non-pre-loaded library loads to ART's real path so they keep their handle / `JNI_OnLoad` /
+    // `Java_*` discovery. `.cpp(true)` compiles it as C++ and links the C++ standard library (which
+    // ART already pulls in). See `src/loader/native_load_shim.cpp` for the full rationale + ABI note.
+    cc::Build::new()
+        .cpp(true)
+        .file("src/loader/native_load_shim.cpp")
+        .compile("eclipse_native_load_shim");
 
     build_libm_shim();
 }
