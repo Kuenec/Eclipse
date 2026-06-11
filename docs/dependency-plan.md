@@ -20,8 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # 🟢
 rustix = "0.38"                                        # 🟢 flock (single-instance), fs/syscalls
 
 # --- APK fetch / parse / verify (src/apk.rs) ---------------------------------
-ureq = "2"                                             # 🟢 blocking HTTP, no async runtime
-rustls = "0.23"                                        # 🟢 pure-Rust TLS (no system OpenSSL)
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }  # 🟢 WIRED 2026-06-11: blocking HTTP, no async, opt-in APK auto-fetch (src/apk/fetch.rs). Eclipse never hosts/hard-codes a Roblox source — user-configured URL only.
+# rustls 0.23 comes transitively via `ureq`'s `rustls` feature (pure-Rust TLS, no system OpenSSL) — not a direct dep.
 zip = { version = "2", default-features = false, features = ["deflate"] }  # 🟢 APK container (WIRED M1)
 # binary AndroidManifest.xml: Eclipse OWNS the reader (src/apk/axml.rs) — NO dep. 2026-06-04:
 # dropped `axmldecoder 0.3` — it *panics* on hostile AXML (aborts under panic=abort); our reader

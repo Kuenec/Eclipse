@@ -34,7 +34,7 @@ serde_json = "1"                                                    # config.jso
 directories = "6"                                                   # portable XDG dirs (no hardcoded paths)
 # --- APK parse / verify (M1) ----------------------------------------------------
 # Local-only: open the APK zip, read binary AndroidManifest.xml, verify SHA-256.
-# Network fetch (ureq/rustls) stays deferred — see docs/dependency-plan.md.
+# Network fetch (ureq/rustls) WIRED 2026-06-11 for the opt-in APK auto-fetch (see below + src/apk/fetch.rs).
 # APK container. `deflate` decompresses the Deflate-compressed AndroidManifest.xml (libroblox.so
 # is Stored). 2026-06-04: `deflate` is the ONLY pure-Rust deflate option in zip 2.4.2 — it pulls
 # flate2/rust_backend (miniz_oxide) and, unavoidably, the zopfli compressor we never use; the
@@ -109,6 +109,12 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std", "si
 # is the accepted shape — the one new C black box here, same rationale as cpal→ALSA / the cc shims; adds
 # only libsqlite3-sys (+ vcpkg, a Windows-only build helper). Logged in docs/dependency-plan.md + §6.
 libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }
+# 2026-06-11: the OPT-IN APK auto-fetch (src/apk/fetch.rs) — a blocking, streaming HTTPS GET to download
+# a Roblox APK from a USER-CONFIGURED source (Eclipse never hosts/hard-codes one — see fetch.rs policy).
+# `ureq` is the smallest blocking HTTP client (no async runtime — §2.5); `default-features = false` +
+# `rustls` gives PURE-RUST TLS (no system OpenSSL — §2.1 pure-Rust, §9 distro-portable), pulling rustls
+# 0.23 + webpki-roots (the planned ureq+rustls pair, docs/dependency-plan.md). SHA-256 reuses `sha2`.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 # 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
 # The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.

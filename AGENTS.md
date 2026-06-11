@@ -128,8 +128,32 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-11 — 🎉 `Application.onCreate` COMPLETES (SQLite fully wired); Roblox now self-exits on its own
+  process-identity check. + Opt-in APK auto-fetch added. ⇐ START HERE NEXT SESSION (frontier = `getProcessName`).**
+  **SQLite Phase A+B DONE:** `src/framework/sqlite.rs` now also implements `nativeExecuteForCursorWindow` — KEY: ATL's
+  `android.database.CursorWindow` is a **pure-Java `ArrayList<Object[]>`** (no native buffer), so the native FILLS it via
+  the window's Java methods over JNI (`clear`/`setNumColumns`/`setStartPosition`/`allocRow`/`put{Long,Double,String,Blob,Null}`,
+  ABSOLUTE row index, per-row `with_local_frame`), returning `(startPos<<32)|totalRows`. **VALIDATED:** the whole
+  `getWritableDatabase` path runs (open → PRAGMAs → `setLocale`'s `REINDEX LOCALIZED` via the registered `LOCALIZED`/`UNICODE`
+  collations → CREATE/SELECT), **`Application.onCreate` reaches "recipe steps 1–3 driven" with NO crash**. The boot then ends
+  with **Roblox calling `System.exit(10)` after logging "Background process detected"** (`RobloxApplication.onCreate:411`,
+  tag `rbx.application`) — this is **Roblox's OWN process-identity self-check**, not an Eclipse failure: Roblox thinks it is a
+  background/isolated process (not the main `com.roblox.client` process). **NEXT FRONTIER:** make ATL report the main process
+  name — `android.app.Application.getProcessName()` / `ActivityThread.currentProcessName()` (ATL `api-impl/android/app/`)
+  must return `com.roblox.client` so Roblox's "is main process" check passes. Then drive step 4 `Activity.createMainActivity`
+  → the engine render loop. Worker-thread gaps still present (non-blocking the main thread): `PowerManager.isDeviceIdleMode()`
+  (jobqueue — add to the overlay or RegisterNatives), `java.time.DateTimeFormatter` `BootstrapMethodError`, Firebase
+  `StreamCorruptedException`. **APK auto-fetch (opt-in, the owner's request):** new `src/apk/fetch.rs` (deps `ureq` + rustls,
+  pure-Rust TLS) — `eclipse fetch` reports the latest upstream version via the OFFICIAL `clientsettings` oracle (verified live:
+  `0.725.0.7251138` ≈ Android 2.725.x; Android has NO official APK endpoint) and downloads from a **user-configured** source
+  (`config.apk_url` / `ECLIPSE_APK_URL`, optional `apk_sha256` pin, `auto_fetch_missing` for `run`) into the XDG cache
+  (streaming, SHA-256, crash-safe `.partial`→rename). **Eclipse NEVER hosts/hard-codes a Roblox source** (Sober precedent;
+  README/policy updated). Follow-ups: mirror auto-resolve (APKPure/APKMirror — fragile/Cloudflare, deliberately NOT
+  hard-coded), XAPK-split→merged-APK, APK signing-cert pinning. Gate: **506 unit + 4 integration + 2 doctests** (+2 fetch),
+  fmt/clippy `-D warnings`/release 0-warning. Durability caveat unchanged (Build+NetworkRequest overlay needs
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR`; SQLite/ConnectivityManager/discovery-gap are in-binary). Not committed. Detail: §6 (2026-06-11 SQLite-cursor + APK-fetch).
 - **2026-06-11 — SQLite OPEN path works (libsqlite3-backed natives); the lifecycle is at step 5 `ActivitySplash.onCreate`,
-  next blocker = `nativeExecuteForCursorWindow` (the first row-returning SELECT). ⇐ START HERE NEXT SESSION.**
+  next blocker = `nativeExecuteForCursorWindow` (the first row-returning SELECT).** *(superseded by the entry above — cursor window now done)*
   ATL's `SQLiteConnection.java` declares the full AOSP `private static native` surface but backs it in its unloaded GTK
   lib, so Roblox's DB open was an `UnsatisfiedLinkError`. **Implemented (gate-green):** new dep `libsqlite3-sys` (feature
   `bundled` — compiles the vendored SQLite amalgamation via `cc`, no system lib; justified in `Cargo.toml` + below) and
@@ -4607,6 +4631,34 @@ no native buffer). Implement it by looping `sqlite3_step` and FILLING the Java w
 the exact method names/sigs in ATL's `api-impl/android/database/CursorWindow.java`), then return
 `(jlong(startPos) << 32) | totalRows`. No `#[repr(C,packed)]` FieldSlot buffer is needed. Gate: **504 unit + 4 integration +
 2 doctests**, all 0-warning. Done MAIN-LOOP (dev-host); **not committed** (owner's session instruction).
+
+### 2026-06-11 — SQLite Phase B (`nativeExecuteForCursorWindow`) done → `Application.onCreate` COMPLETES; + opt-in APK auto-fetch
+
+**Phase B implemented** exactly as the prior entry predicted: `native_execute_for_cursor_window` in `src/framework/sqlite.rs`
+loops `sqlite3_step` and fills ATL's **pure-Java** `CursorWindow` (`ArrayList<Object[]>`) via JNI callbacks — `clear` /
+`setNumColumns(colCount)` / `setStartPosition(startPos)` / per row `allocRow()` + `put{Long,Double,String,Blob,Null}(value,
+ABSROW, col)` (ATL's `putX` does `row - startPos` internally; row is ABSOLUTE), per-row `with_local_frame` to free transient
+`JString`/`JByteArray` refs — returns `(startPos<<32)|totalRows`. Registered (24 natives now). **REAL boot result
+(`/tmp/eclipse-cursor.log`):** the full `SQLiteOpenHelper.getWritableDatabase` path runs — `nativeOpen` opens
+`androidx.work.workdb` + `db_default_job_manager`, PRAGMAs/binds/executes/cursor-queries succeed, `setLocale`'s
+`REINDEX LOCALIZED` resolves (collations registered) — and **`Application.onCreate` completes with NO crash** ("recipe steps
+1–3 driven"). The process then ends via **`System.exit(10)` after `RobloxApplication.onCreate:411` logs "Background process
+detected"** — Roblox's OWN main-vs-background process self-check failing (Eclipse's process isn't seen as the main
+`com.roblox.client` process). NEXT: make ATL's `Application.getProcessName()` (→ `ActivityThread.currentProcessName()`) report
+`com.roblox.client`, then drive step 4 onward. (`PowerManager.isDeviceIdleMode()` etc. are worker-thread gaps.)
+
+**Opt-in APK auto-fetch (owner-requested):** `src/apk/fetch.rs` + config (`apk_url`/`apk_sha256`/`auto_fetch_missing`) + CLI
+(`eclipse fetch`; `run` auto-fetches when no APK + configured). Deps: `ureq` 3.3 (`default-features=false` + `rustls`) → pure-Rust
+TLS (no OpenSSL), blocking (no async); SHA-256 via `sha2`. `latest_roblox_version()` hits the OFFICIAL `clientsettings`
+WindowsPlayer oracle (Android has NO official APK endpoint — Google-Play-only; verified live `0.725.0.7251138` ≈ Android
+2.725.x). `fetch_apk(url, sha)` streams to the XDG cache (`ECLIPSE_APK_CACHE_DIR` override), SHA-256-verifies, crash-safe
+`.partial`→rename, idempotent. **POLICY (deliberate, Sober precedent): Eclipse NEVER hosts or hard-codes a Roblox source** —
+auto-fetch is opt-in, from a URL the USER configures; the bright line is no redistribution (README + this file updated).
+Research recorded mirror options (APKPure `d.apkpure.com/b/XAPK/com.roblox.client?versionCode=…`, APKMirror UA
+`APKUpdater-v3.0.3`) but they are Cloudflare-fragile/ToS-gray, so deliberately NOT hard-coded; the user points `apk_url` at
+their chosen source. Follow-ups: optional mirror auto-resolve, XAPK-split→merged-APK assembly, APK signing-cert pinning
+(the load-bearing trust control). Gate: **506 unit + 4 integration + 2 doctests** (+2 `fetch`), all 0-warning. Done MAIN-LOOP
+(dev-host); **not committed** (owner's session instruction).
 
 ---
 

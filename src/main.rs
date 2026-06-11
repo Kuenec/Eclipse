@@ -14,10 +14,17 @@ USAGE:
     eclipse <COMMAND>
 
 COMMANDS:
-    run <APK>  Parse the APK, boot the ART VM (Roblox on the classpath), open the window
+    run [APK]  Parse the APK, boot the ART VM (Roblox on the classpath), open the window.
+               With no APK and `auto_fetch_missing`+`apk_url` set (or ECLIPSE_APK_URL),
+               auto-downloads from your configured source first.
+    fetch      Report the latest upstream Roblox version + download the APK from your
+               configured source (config `apk_url` / ECLIPSE_APK_URL) into the cache.
     config     Show effective configuration and its path
     help       Show this help
     --version  Show version
+
+NOTE: Eclipse never hosts or hard-codes a Roblox APK source. You supply your own APK (path
+    or a download URL you configure); auto-fetch is opt-in. Eclipse does not redistribute Roblox.
 
 STATUS:
     `run` parses the manifest, prints the ART boot plan, boots the vendored ART VM with
@@ -51,6 +58,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("eclipse config: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("fetch") => match fetch_apk_command() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("eclipse fetch: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -152,6 +166,37 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
     Ok(())
 }
 
+/// The configured APK download URL: `ECLIPSE_APK_URL` (env) wins over `config.apk_url`. `None` = none set.
+fn configured_apk_url(config: &eclipse::config::Config) -> Option<String> {
+    std::env::var("ECLIPSE_APK_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config.apk_url.clone())
+}
+
+/// `eclipse fetch`: report the latest upstream Roblox version (official oracle) and download the APK from
+/// the user-configured source into the cache (verifying `apk_sha256` if set). Eclipse never hard-codes a
+/// source — a URL must be configured (`config.apk_url` / `ECLIPSE_APK_URL`).
+fn fetch_apk_command() -> Result<(), Box<dyn std::error::Error>> {
+    match eclipse::apk::fetch::latest_roblox_version() {
+        Ok(v) => {
+            let android_major = v.split('.').nth(1).unwrap_or("?");
+            println!(
+                "# Latest upstream Roblox version (oracle): {v}  (≈ Android 2.{android_major}.x)"
+            );
+        }
+        Err(e) => eprintln!("# version oracle unavailable (non-fatal): {e}"),
+    }
+    let config = eclipse::config::Config::load()?;
+    let url = configured_apk_url(&config).ok_or(
+        "no APK source configured — set config `apk_url` or ECLIPSE_APK_URL (Eclipse never hard-codes one)",
+    )?;
+    println!("# Fetching APK from your configured source: {url}");
+    let path = eclipse::apk::fetch::fetch_apk(&url, config.apk_sha256.as_deref())?;
+    println!("fetched APK: {} ✓", path.display());
+    Ok(())
+}
+
 /// `eclipse run <APK>`: open the APK, parse its manifest, build the ART
 /// [`BootPlan`](eclipse::runtime::BootPlan) from the manifest + effective config, print the
 /// plan and the options it implies, then boot the ART VM from this (main) thread. Today this
@@ -160,9 +205,30 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
 /// Returns `Box<dyn Error>` because this `main`/setup-layer code composes several typed
 /// library errors (APK, config, runtime); the library crates themselves stay strictly typed (§2.8).
 fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(apk_path) = apk_path else {
-        return Err("missing APK path (usage: eclipse run <APK>)".into());
+    // Resolve the APK: an explicit path wins; otherwise opt-in auto-fetch from the user-configured
+    // source (only when `auto_fetch_missing` is on, or `ECLIPSE_APK_URL` is explicitly set). Eclipse
+    // never hard-codes a source and never auto-fetches silently without that opt-in.
+    let resolved: String = match apk_path {
+        Some(p) => p.to_string(),
+        None => {
+            let config = eclipse::config::Config::load()?;
+            let env_url = std::env::var_os("ECLIPSE_APK_URL").is_some();
+            match configured_apk_url(&config) {
+                Some(url) if config.auto_fetch_missing || env_url => {
+                    println!("# No APK supplied — auto-fetching from your configured source: {url}");
+                    let path = eclipse::apk::fetch::fetch_apk(&url, config.apk_sha256.as_deref())?;
+                    println!("fetched APK: {} ✓", path.display());
+                    path.to_string_lossy().into_owned()
+                }
+                _ => {
+                    return Err("missing APK path (usage: eclipse run <APK>); or set config `apk_url` + \
+                                `auto_fetch_missing` (or ECLIPSE_APK_URL) to auto-download — `eclipse fetch`"
+                        .into())
+                }
+            }
+        }
     };
+    let apk_path = resolved.as_str();
 
     let mut apk = eclipse::apk::Apk::open(std::path::Path::new(apk_path))?;
     // 2026-06-05: configure the asset source for Eclipse's ndk-android natives (libandroid). The
