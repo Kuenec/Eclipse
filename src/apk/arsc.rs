@@ -335,6 +335,66 @@ impl<'a> ResTable<'a> {
             .and_then(|p| p.name.as_deref())
     }
 
+    /// The REVERSE of [`resource_value`]: find the packed `0xPPTTEEEE` id of the entry named
+    /// `entry_name` of type `type_name` (e.g. `string`/`drawable`) in package `package_name`
+    /// (`None`/empty = any package). This backs `AssetManager.getResourceIdentifier`
+    /// (`Resources.getIdentifier`).
+    ///
+    /// Scans each matching package's `RES_TABLE_TYPE_TYPE` chunks for the type whose name matches,
+    /// then its entries for the one whose key name matches, returning the first hit's id. `None`
+    /// when no such resource exists (the caller returns `0`, AOSP's "not found"). Total: malformed
+    /// chunks are skipped, the entry loop is bounded by the 16-bit entry-id space, never panics.
+    pub fn find_resource_id(
+        &self,
+        package_name: Option<&str>,
+        type_name: &str,
+        entry_name: &str,
+    ) -> Option<u32> {
+        let want_pkg = package_name.filter(|p| !p.is_empty());
+        for package in &self.packages {
+            if let Some(want) = want_pkg {
+                if package.name.as_deref() != Some(want) {
+                    continue;
+                }
+            }
+            for &(start, end) in &package.type_chunks {
+                let Some(chunk) = self.buf.get(start..end) else {
+                    continue;
+                };
+                let Ok(type_id) = read_u8(chunk, CHUNK_HEADER_SIZE) else {
+                    continue;
+                };
+                // Match this chunk's type name (e.g. "string") to the requested type.
+                if !matches!(self.type_name(package.id, type_id), Ok(Some(tn)) if tn == type_name) {
+                    continue;
+                }
+                let Ok(entry_count) = read_u32(chunk, 12) else {
+                    continue;
+                };
+                // entry_id is 16-bit, so the entry space is bounded by 0x1_0000 regardless of a
+                // (possibly hostile) entry_count field; resolve_in_type_chunk bounds each access.
+                let bound = entry_count.min(0x1_0000);
+                for entry_id in 0..bound {
+                    let Ok(eid) = u16::try_from(entry_id) else {
+                        break;
+                    };
+                    let Some(resolved) = resolve_in_type_chunk(chunk, eid) else {
+                        continue;
+                    };
+                    if matches!(self.key_name(package.id, resolved.key_index), Ok(Some(kn)) if kn == entry_name)
+                    {
+                        return Some(
+                            (u32::from(package.id) << 24)
+                                | (u32::from(type_id) << 16)
+                                | u32::from(eid),
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn value_pool(&self) -> Result<StringPool<'a>, ArscError> {
         self.pool_at(self.value_pool.0, self.value_pool.1)
     }
@@ -1149,6 +1209,60 @@ mod tests {
         );
         // An unknown id is None, not a panic.
         assert!(simple.resolve_style(0x7f08_0000).is_none(), "unknown style");
+    }
+
+    #[test]
+    fn find_resource_id_round_trips_with_resource_name_on_real_demo() {
+        // The reverse lookup (getResourceIdentifier's backing) must return the SAME id that
+        // resource_value/key_name resolved forward. APK-agnostic: discover a concrete (type, entry,
+        // id) from the real demo arsc, then round-trip. Skips cleanly if the demo asset is absent (the
+        // parse/fallback logic is covered host-independently in the framework test + the boot).
+        let Some(bytes) = demo_arsc() else {
+            eprintln!("demo arsc unavailable; reverse-lookup parse/fallback covered elsewhere");
+            return;
+        };
+        let table = parse_arsc(&bytes).expect("parse demo arsc");
+        let pkg_id = *table.package_ids().first().expect("at least one package");
+        let pkg_name = table.package_name(pkg_id).map(str::to_owned);
+
+        // Discover SOME concrete (type_name, entry_name, id) by scanning a few type ids + entries.
+        let mut found: Option<(String, String, u32)> = None;
+        'outer: for tid in 1u8..=32 {
+            let Ok(Some(type_name)) = table.type_name(pkg_id, tid) else {
+                continue;
+            };
+            for eid in 0u16..256 {
+                let resid = (u32::from(pkg_id) << 24) | (u32::from(tid) << 16) | u32::from(eid);
+                let Some(rv) = table.resource_value(resid) else {
+                    continue;
+                };
+                if let Ok(Some(entry_name)) = table.key_name(pkg_id, rv.key_index) {
+                    found = Some((type_name.clone(), entry_name, resid));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((type_name, entry_name, resid)) = found else {
+            eprintln!("no concrete entry discovered in demo arsc; skipping round-trip");
+            return;
+        };
+
+        // The reverse lookup returns the SAME id (with the package name and without it).
+        assert_eq!(
+            table.find_resource_id(pkg_name.as_deref(), &type_name, &entry_name),
+            Some(resid),
+            "find_resource_id must round-trip the forward-resolved id"
+        );
+        assert_eq!(
+            table.find_resource_id(None, &type_name, &entry_name),
+            Some(resid),
+            "a None package matches any package"
+        );
+        // A non-existent entry name → None (the caller's 0 = AOSP "not found").
+        assert_eq!(
+            table.find_resource_id(pkg_name.as_deref(), &type_name, "__eclipse_no_such_entry__"),
+            None
+        );
     }
 
     #[test]
