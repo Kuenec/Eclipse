@@ -70,13 +70,14 @@
 //! [`EnvUnowned::with_env`] (which `catch_unwind`-wraps it), so a Rust panic can never unwind into
 //! ART's C++ under the release `panic = "abort"` profile (AGENTS.md §2.8; CLAUDE.md).
 
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use jni::errors::LogErrorAndDefault;
-use jni::objects::{JClass, JIntArray, JObject, JString};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::refs::Reference;
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
@@ -86,10 +87,12 @@ use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use crate::runtime::Vm;
 
+pub mod asset_registry;
 pub mod canvas_registry;
 pub mod matrix_registry;
 pub mod paint_registry;
 pub mod path_registry;
+pub mod sqlite;
 pub mod theme_registry;
 pub mod view_registry;
 pub mod window_registry;
@@ -404,6 +407,110 @@ fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.net.ConnectivityManager =========================
+//
+// 2026-06-11: ATL's `ConnectivityManager` (api-impl/android/net/ConnectivityManager.java) declares THREE
+// `native` methods backed by ATL's GTK lib (`libtranslation_layer_main.so`), which Eclipse does NOT load:
+// `registerNetworkCallback(NetworkRequest, NetworkCallback)`, `isActiveNetworkMetered()`, and
+// `nativeGetNetworkAvailable()`. Roblox's `com.birbit.android.jobqueue` connectivity monitor calls
+// `registerNetworkCallback` in `ActivitySplash.onCreate` (step 5), surfacing `UnsatisfiedLinkError`. Like
+// the Context/Log/View natives, Eclipse binds its OWN GTK-free backing via `RegisterNatives` — durable
+// (compiled into the binary, so it works without the framework-jar overlay). The host desktop network is
+// treated as available + unmetered, and Eclipse delivers no connectivity callbacks (a sound no-op: Roblox
+// degrades gracefully without connectivity-change events).
+
+/// `android.net.ConnectivityManager` (internal/slashed name for `find_class`).
+pub const CONNECTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/net/ConnectivityManager");
+
+// JNI names + descriptors, exactly as declared in ATL's ConnectivityManager.java (2026-06-11).
+const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("registerNetworkCallback");
+const CM_REGISTER_NETWORK_CALLBACK_SIG: &JNIStr =
+    jni_str!("(Landroid/net/NetworkRequest;Landroid/net/ConnectivityManager$NetworkCallback;)V");
+const CM_IS_ACTIVE_NETWORK_METERED_NAME: &JNIStr = jni_str!("isActiveNetworkMetered");
+const CM_IS_ACTIVE_NETWORK_METERED_SIG: &JNIStr = jni_str!("()Z");
+const CM_NATIVE_GET_NETWORK_AVAILABLE_NAME: &JNIStr = jni_str!("nativeGetNetworkAvailable");
+const CM_NATIVE_GET_NETWORK_AVAILABLE_SIG: &JNIStr = jni_str!("()Z");
+
+/// `ConnectivityManager.registerNetworkCallback(NetworkRequest, NetworkCallback)` — no-op. Eclipse does
+/// not deliver connectivity-change callbacks; Roblox's network monitor degrades gracefully without them.
+/// Instance native (second arg is the `this` `JObject`). `with_env` `catch_unwind`-guards the body.
+extern "system" fn cm_register_network_callback<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _request: JObject<'local>,
+    _callback: JObject<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> { Ok(()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `ConnectivityManager.isActiveNetworkMetered()` → `false` (the host desktop network is unmetered).
+extern "system" fn cm_is_active_network_metered<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jboolean {
+    // jni 0.22 maps `jboolean` to Rust `bool`. The desktop host network is treated as unmetered.
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(false) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `ConnectivityManager.nativeGetNetworkAvailable()` → `true` (the host desktop network is available).
+extern "system" fn cm_native_get_network_available<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jboolean {
+    // jni 0.22 maps `jboolean` to Rust `bool`. The desktop host network is treated as available.
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(true) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.net.ConnectivityManager`'s three `native` methods.
+///
+/// Locates `android/net/ConnectivityManager` and registers the natives via `RegisterNatives` (which wins
+/// over ATL's GTK-lib symbol binding — JNI 1.1 spec). Like [`register_log_natives`], it runs before the
+/// lifecycle drive so the natives are bound before `ActivitySplash.onCreate`'s connectivity-monitor call.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature. They do,
+/// by construction (the descriptors are taken verbatim from ATL's `ConnectivityManager.java`). Each body
+/// is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary.
+fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(CONNECTIVITY_MANAGER_CLASS)?;
+    let methods = [
+        // SAFETY: each fn matches its paired signature (verbatim from ConnectivityManager.java); casting
+        // the `extern "system"` fn to `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CM_REGISTER_NETWORK_CALLBACK_NAME,
+                CM_REGISTER_NETWORK_CALLBACK_SIG,
+                cm_register_network_callback as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CM_IS_ACTIVE_NETWORK_METERED_NAME,
+                CM_IS_ACTIVE_NETWORK_METERED_SIG,
+                cm_is_active_network_metered as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CM_NATIVE_GET_NETWORK_AVAILABLE_NAME,
+                CM_NATIVE_GET_NETWORK_AVAILABLE_SIG,
+                cm_native_get_network_available as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/net/ConnectivityManager; `methods` hold valid fn pointers
+    // whose signatures match the class's `native` declarations (verified against ConnectivityManager.java).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/net/ConnectivityManager",
+        "registered Eclipse's non-GTK backing for registerNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.content.res.AssetManager.init ==================
 //
 // 2026-06-05: `android.content.res.AssetManager`'s constructors (ATL `api-impl/android/content/res/
@@ -552,6 +659,53 @@ const ASSET_MANAGER_APPLY_STYLE_SIG: &JNIStr = jni_str!("(JJII[IIJJ)V");
 // (the framework then throws `NotFoundException` — the correct, non-faked outcome).
 const ASSET_MANAGER_GET_RESOURCE_NAME_NAME: &JNIStr = jni_str!("getResourceName");
 const ASSET_MANAGER_GET_RESOURCE_NAME_SIG: &JNIStr = jni_str!("(I)Ljava/lang/String;");
+
+// 2026-06-11: `getResourcePackageName(int resid)` is the native AOSP's `Resources.getResourcePackageName`
+// calls to turn a packed resource id into JUST its package name (the `package` of `package:type/entry`).
+// Surfaced by the real Roblox run during `FirebaseInitProvider.onCreate` (→ `Resources.
+// getResourcePackageName`). Bound from the exact JNI signature ART reported missing (`No implementation
+// found for java.lang.String android.content.res.AssetManager.getResourcePackageName(int)`, mangled
+// `...__I`, run log 2026-06-11) — an INSTANCE native, descriptor `(I)Ljava/lang/String;`. Backed by the
+// same `apk::arsc` reader as `getResourceName`: returns the id's package name (`arsc::package_name` of
+// the id's high-byte package), or null for an unresolvable id (→ `NotFoundException`, the non-faked outcome).
+const ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_NAME: &JNIStr = jni_str!("getResourcePackageName");
+const ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_SIG: &JNIStr = jni_str!("(I)Ljava/lang/String;");
+
+// 2026-06-11: `getResourceIdentifier(String name, String defType, String defPackage)` is the REVERSE
+// of `getResourceName` — AOSP's `Resources.getIdentifier` calls it to turn a resource NAME into its
+// packed id (0 if absent). Surfaced by the real Roblox run during `FirebaseInitProvider.onCreate`.
+// Bound from the exact JNI signature ART reported missing (`No implementation found for int
+// android.content.res.AssetManager.getResourceIdentifier(java.lang.String, java.lang.String,
+// java.lang.String)`, run log 2026-06-11), descriptor `(Ljava/lang/String;Ljava/lang/String;
+// Ljava/lang/String;)I`, an INSTANCE native. Backed by the `apk::arsc` reverse lookup
+// ([`arsc::ResTable::find_resource_id`]); returns 0 for an unknown name (AOSP's "not found").
+const ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_NAME: &JNIStr = jni_str!("getResourceIdentifier");
+const ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_SIG: &JNIStr =
+    jni_str!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I");
+
+// 2026-06-11: the asset-STREAM natives behind `AssetManager.open(fileName)` → an `AssetInputStream`.
+// `openAsset(String,int)` (confirmed from the ART `No implementation found … openAsset(java.lang.
+// String, int)` line, run log 2026-06-11, returns `long`) opens an asset and returns a handle; the
+// read cycle (`readAsset`/`seekAsset`/`getAssetLength`/`getAssetRemainingLength`/`destroyAsset`)
+// operates on it. Bound non-GTK against Eclipse's own [`asset_registry`] (jlong = slab index, never a
+// raw pointer) + the `src/apk` reader (reads `assets/<fileName>`). The classic AOSP signatures
+// (`readAsset(J[BII)I`, `seekAsset(JJI)J`, `getAssetLength(J)J`, `getAssetRemainingLength(J)J`,
+// `destroyAsset(J)V`) are registered best-effort ([`register_asset_stream_natives`]) so a sig drift on
+// the read cycle is logged + discovered, never breaking the main AssetManager natives.
+const ASSET_MANAGER_OPEN_ASSET_NAME: &JNIStr = jni_str!("openAsset");
+const ASSET_MANAGER_OPEN_ASSET_SIG: &JNIStr = jni_str!("(Ljava/lang/String;I)J");
+const ASSET_MANAGER_READ_ASSET_NAME: &JNIStr = jni_str!("readAsset");
+// ATL's readAsset takes the off/len as `long` (run log 2026-06-11: vtable shows
+// `readAsset(long, byte[], long, long)`, mangled `__J_3BJJ`), NOT the classic AOSP `(J[BII)I`.
+const ASSET_MANAGER_READ_ASSET_SIG: &JNIStr = jni_str!("(J[BJJ)I");
+const ASSET_MANAGER_SEEK_ASSET_NAME: &JNIStr = jni_str!("seekAsset");
+const ASSET_MANAGER_SEEK_ASSET_SIG: &JNIStr = jni_str!("(JJI)J");
+const ASSET_MANAGER_GET_ASSET_LENGTH_NAME: &JNIStr = jni_str!("getAssetLength");
+const ASSET_MANAGER_GET_ASSET_LENGTH_SIG: &JNIStr = jni_str!("(J)J");
+const ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_NAME: &JNIStr = jni_str!("getAssetRemainingLength");
+const ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_SIG: &JNIStr = jni_str!("(J)J");
+const ASSET_MANAGER_DESTROY_ASSET_NAME: &JNIStr = jni_str!("destroyAsset");
+const ASSET_MANAGER_DESTROY_ASSET_SIG: &JNIStr = jni_str!("(J)V");
 
 // 2026-06-05: `loadResourceValue(int resid, short density, TypedValue outValue, boolean resolveRefs)`
 // is the native AOSP's `AssetManager.getResourceValue`/`Resources.getValue` calls to resolve a
@@ -1586,6 +1740,390 @@ extern "system" fn asset_manager_get_resource_name<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `AssetManager.getResourcePackageName(int resid)` → the resource id's package name, or null.
+///
+/// JNI ABI: an INSTANCE native (`(EnvUnowned, JObject this, jint)`). Mirrors
+/// [`asset_manager_get_resource_name`] but returns only the package component via
+/// [`resolve_resource_package_name`]. `resolve::<LogErrorAndDefault>` returns the default (null) on an
+/// internal error/panic; an unresolvable id returns null explicitly (→ `NotFoundException`).
+extern "system" fn asset_manager_get_resource_package_name<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    resid: jint,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let resid_u32 = u32::from_ne_bytes(resid.to_ne_bytes());
+        match resolve_resource_package_name(resid_u32) {
+            Some(pkg) => {
+                tracing::debug!(
+                    target: "android.content.res.AssetManager",
+                    resid = format_args!("0x{resid_u32:08x}"),
+                    package = %pkg,
+                    "AssetManager.getResourcePackageName: resolved via resources.arsc"
+                );
+                env.new_string(pkg)
+            }
+            None => {
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    resid = format_args!("0x{resid_u32:08x}"),
+                    "AssetManager.getResourcePackageName: id not in resources.arsc → null (NotFoundException)"
+                );
+                Ok(JString::default())
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Resolve a packed resource id to JUST its package name via the matching `resources.arsc` (framework
+/// table for package `0x01`, app table otherwise; see [`arsc_bytes_for`]). The package id is the id's
+/// high byte. Returns `None` for any failure (no path, missing/corrupt ARSC, or a package the table
+/// does not name) — never panics. Parses fresh per call (mirrors [`resolve_resource_name`]).
+fn resolve_resource_package_name(resid: u32) -> Option<String> {
+    let bytes = arsc_bytes_for(resid)?;
+    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+    let package_id = (resid >> 24) as u8;
+    table.package_name(package_id).map(str::to_owned)
+}
+
+/// `AssetManager.getResourceIdentifier(String name, String defType, String defPackage)` → the packed
+/// resource id, or 0 if not found (AOSP's `Resources.getIdentifier`).
+///
+/// JNI ABI: an INSTANCE native (`(EnvUnowned, JObject this, jstring, jstring, jstring)`). Resolves via
+/// [`resolve_resource_identifier`]; `resolve::<LogErrorAndDefault>` returns the `jint` default (`0`) on
+/// an internal error/panic, and a not-found name returns `0` explicitly — both the correct "no such id".
+extern "system" fn asset_manager_get_resource_identifier<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    name: JString<'local>,
+    def_type: JString<'local>,
+    def_package: JString<'local>,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        if name.is_null() {
+            return Ok(0);
+        }
+        let name = name.try_to_string(env)?;
+        let read_opt = |s: &JString<'local>| -> jni::errors::Result<String> {
+            if s.is_null() {
+                Ok(String::new())
+            } else {
+                s.try_to_string(env)
+            }
+        };
+        let def_type = read_opt(&def_type)?;
+        let def_package = read_opt(&def_package)?;
+        let resid = resolve_resource_identifier(&name, &def_type, &def_package);
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            name = %name,
+            def_type = %def_type,
+            def_package = %def_package,
+            resid = format_args!("0x{resid:08x}"),
+            "AssetManager.getResourceIdentifier"
+        );
+        // jint is i32; reinterpret the u32 id's bits (a valid id fits, 0 = not found).
+        Ok(i32::from_ne_bytes(resid.to_ne_bytes()))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Resolve `Resources.getIdentifier(name, defType, defPackage)` to a packed resource id (or `0`).
+///
+/// Parses the AOSP `[package:][type/]entry` form of `name` (falling back to `defType`/`defPackage` for
+/// the type/package), selects the framework table for package `android` else the app table (via
+/// [`arsc_bytes_for`]'s id-dispatch with a probe id), and reverse-looks-up the id with
+/// [`arsc::ResTable::find_resource_id`](crate::apk::arsc::ResTable::find_resource_id). Returns `0`
+/// (AOSP's "not found") for an empty entry, an unknown name, or any ARSC failure — never panics.
+fn resolve_resource_identifier(name: &str, def_type: &str, def_package: &str) -> u32 {
+    // Parse the optional "package:" prefix, then the optional "type/" prefix, then the entry.
+    let (pkg_in_name, rest) = match name.split_once(':') {
+        Some((p, r)) => (Some(p), r),
+        None => (None, name),
+    };
+    let (type_in_name, entry) = match rest.split_once('/') {
+        Some((t, e)) => (Some(t), e),
+        None => (None, rest),
+    };
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return 0;
+    }
+    let pick = |from_name: Option<&str>, default: &str| -> Option<String> {
+        from_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                let d = default.trim();
+                (!d.is_empty()).then(|| d.to_owned())
+            })
+    };
+    let pkg = pick(pkg_in_name, def_package);
+    let Some(typ) = pick(type_in_name, def_type) else {
+        return 0; // no type → cannot identify a resource
+    };
+    // Pick the table by package: the framework ("android") table (package 0x01) vs the app table.
+    let probe_id: u32 = if pkg.as_deref() == Some("android") {
+        0x0100_0000
+    } else {
+        0x7f00_0000
+    };
+    let Some(bytes) = arsc_bytes_for(probe_id) else {
+        return 0;
+    };
+    let Ok(table) = crate::apk::arsc::parse_arsc(&bytes) else {
+        return 0;
+    };
+    table
+        .find_resource_id(pkg.as_deref(), &typ, entry)
+        .unwrap_or(0)
+}
+
+/// Read an asset from the booted APK via Eclipse's own `src/apk` reader. `None` if the APK path is
+/// unset or the entry is absent/unreadable (the caller returns `0` → `FileNotFoundException`).
+///
+/// 2026-06-11: ATL's `AssetManager.open` passes `openAsset` the FULL APK-relative path (already
+/// `assets/…`), unlike stock AOSP (a path relative to `assets/`). Accept BOTH: use the name as-is when
+/// it already has the `assets/` prefix, else prepend it (so a double `assets/assets/…` can't happen).
+fn read_asset_bytes(name: &str) -> Option<Vec<u8>> {
+    let apk_path = APK_PATH.get()?;
+    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
+    let entry = if name.starts_with("assets/") {
+        name.to_owned()
+    } else {
+        format!("assets/{name}")
+    };
+    apk.read_entry(&entry).ok()
+}
+
+/// `AssetManager.openAsset(String fileName, int accessMode)` → an [`asset_registry`] handle, or `0`.
+///
+/// JNI ABI: an INSTANCE native. Reads `assets/<fileName>` via [`read_asset_bytes`] and stores it as an
+/// open stream; the `accessMode` (random/streaming/buffer) is advisory and ignored (Eclipse buffers
+/// the whole asset). Returns `0` on a missing asset (→ `FileNotFoundException`, the non-faked outcome).
+extern "system" fn asset_manager_open_asset<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    file_name: JString<'local>,
+    _access_mode: jint,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        if file_name.is_null() {
+            return Ok(0);
+        }
+        let name = file_name.try_to_string(env)?;
+        let Some(bytes) = read_asset_bytes(&name) else {
+            tracing::warn!(
+                target: "android.content.res.AssetManager",
+                asset = %name,
+                "AssetManager.openAsset: assets/<name> not found → 0 (FileNotFoundException)"
+            );
+            return Ok(0);
+        };
+        match asset_registry::store(bytes) {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.content.res.AssetManager",
+                    asset = %name,
+                    "AssetManager.openAsset: opened via src/apk"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    asset = %name, error = %e,
+                    "AssetManager.openAsset: registry store failed → 0"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.readAsset(long asset, byte[] b, int off, int len)` → bytes read, or `-1` at EOF.
+///
+/// JNI ABI: an INSTANCE native. Reads up to `len` bytes from the stream's cursor into `b[off..]`.
+/// Returns `-1` at EOF (AOSP contract) or on a stale handle; `resolve::<LogErrorAndDefault>` returns
+/// `0` only on an internal JNI error (e.g. the array write throwing `ArrayIndexOutOfBounds`).
+extern "system" fn asset_manager_read_asset<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    asset: jlong,
+    b: JByteArray<'local>,
+    off: jlong,
+    len: jlong,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        if len <= 0 {
+            return Ok(0);
+        }
+        // Bound the read to what actually fits in b[off..] so set_region can never throw
+        // ArrayIndexOutOfBounds (a pending JNI exception ATL would surface as IOException).
+        let array_len = i64::try_from(b.len(env).unwrap_or(0)).unwrap_or(i64::MAX);
+        let off = off.clamp(0, array_len);
+        let fits = (array_len - off).max(0);
+        let want = usize::try_from(len.min(fits)).unwrap_or(0);
+        if want == 0 {
+            return Ok(0);
+        }
+        let read = match asset_registry::with_stream(asset, |s| {
+            let mut tmp = vec![0u8; want];
+            let n = s.read(&mut tmp);
+            tmp.truncate(n);
+            tmp
+        }) {
+            Ok(buf) => buf,
+            Err(_) => return Ok(-1), // stale/fabricated handle → report EOF, never UB
+        };
+        if read.is_empty() {
+            return Ok(-1); // AOSP readAsset returns -1 at EOF
+        }
+        // Java bytes are jbyte = i8; reinterpret each byte's bits (no lossy cast).
+        let signed: Vec<i8> = read.iter().map(|&x| i8::from_ne_bytes([x])).collect();
+        let start = jni::sys::jsize::try_from(off).unwrap_or(jni::sys::jsize::MAX);
+        b.set_region(env, start, &signed)?;
+        let n = read.len();
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            asset, off, len, returned = n,
+            "AssetManager.readAsset"
+        );
+        Ok(i32::try_from(n).unwrap_or(jint::MAX))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.seekAsset(long asset, long offset, int whence)` → the new cursor position, or `-1`.
+extern "system" fn asset_manager_seek_asset<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    asset: jlong,
+    offset: jlong,
+    whence: jint,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        Ok(asset_registry::with_stream(asset, |s| s.seek(offset, whence)).unwrap_or(-1))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.getAssetLength(long asset)` → the asset's total length, or `-1` on a bad handle.
+extern "system" fn asset_manager_get_asset_length<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    asset: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        Ok(
+            asset_registry::with_stream(asset, |s| i64::try_from(s.len()).unwrap_or(i64::MAX))
+                .unwrap_or(-1),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.getAssetRemainingLength(long asset)` → bytes from the cursor to EOF, or `-1`.
+extern "system" fn asset_manager_get_asset_remaining_length<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    asset: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        Ok(
+            asset_registry::with_stream(asset, |s| {
+                i64::try_from(s.remaining()).unwrap_or(i64::MAX)
+            })
+            .unwrap_or(-1),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `AssetManager.destroyAsset(long asset)` → free the stream (idempotent on a stale handle).
+extern "system" fn asset_manager_destroy_asset<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    asset: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let _ = asset_registry::free(asset); // a double/stale free is a harmless no-op
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind the asset-STREAM read cycle (`readAsset`/`seekAsset`/`getAssetLength`/
+/// `getAssetRemainingLength`/`destroyAsset`) on `android/content/res/AssetManager`, BEST-EFFORT.
+///
+/// `openAsset` is bound in the main [`register_asset_manager_natives`] array (its signature is
+/// confirmed). These follow-on natives use the classic AOSP signatures; if this ATL build declares any
+/// differently, RegisterNatives throws and we clear+log it (the dev-host run then names the real
+/// signature) instead of aborting — so a read-cycle sig drift never breaks the already-registered
+/// `openAsset`/resource natives. On the standard signatures the full asset stream works in one bind.
+fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // Register each native INDEPENDENTLY (best-effort) so the ones this ATL build DOES declare bind
+    // even if a sibling does not: ATL has `getAssetLength(J)J`/`destroyAsset(J)V` but reads assets
+    // without the classic `readAsset(J[BII)I` (a grouped bind would fail as a whole on that one). Each
+    // entry's fn matches its paired signature; a `NoSuchMethodError` is cleared + logged, not fatal.
+    let natives: [(&JNIStr, &JNIStr, *mut c_void); 5] = [
+        (
+            ASSET_MANAGER_READ_ASSET_NAME,
+            ASSET_MANAGER_READ_ASSET_SIG,
+            asset_manager_read_asset as *mut c_void,
+        ),
+        (
+            ASSET_MANAGER_SEEK_ASSET_NAME,
+            ASSET_MANAGER_SEEK_ASSET_SIG,
+            asset_manager_seek_asset as *mut c_void,
+        ),
+        (
+            ASSET_MANAGER_GET_ASSET_LENGTH_NAME,
+            ASSET_MANAGER_GET_ASSET_LENGTH_SIG,
+            asset_manager_get_asset_length as *mut c_void,
+        ),
+        (
+            ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_NAME,
+            ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_SIG,
+            asset_manager_get_asset_remaining_length as *mut c_void,
+        ),
+        (
+            ASSET_MANAGER_DESTROY_ASSET_NAME,
+            ASSET_MANAGER_DESTROY_ASSET_SIG,
+            asset_manager_destroy_asset as *mut c_void,
+        ),
+    ];
+    let mut bound = 0u32;
+    for (name, sig, ptr) in natives {
+        let class = env.find_class(ASSET_MANAGER_CLASS)?;
+        // SAFETY: `class` is the loaded AssetManager; `ptr` is an `extern "system"` fn whose signature
+        // is `sig` by construction. A method this build doesn't declare throws (cleared best-effort).
+        let method = unsafe { NativeMethod::from_raw_parts(name, sig, ptr) };
+        match unsafe { env.register_native_methods(&class, std::slice::from_ref(&method)) } {
+            Ok(()) => bound += 1,
+            Err(_) => {
+                if env.exception_check() {
+                    env.exception_clear();
+                }
+                tracing::debug!(
+                    class = "android/content/res/AssetManager",
+                    method = %name.to_str(),
+                    "asset-stream native not declared on this ATL build (skipped)"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        class = "android/content/res/AssetManager",
+        bound,
+        "registered Eclipse's non-GTK asset-stream natives (per-native best-effort: readAsset/seekAsset/getAssetLength/getAssetRemainingLength/destroyAsset)"
+    );
+    Ok(())
+}
+
 /// The framework `resources.arsc` bytes (from `framework-res.apk`), cached once.
 ///
 /// 2026-06-05: `android.R.*` ids live in package `0x01` (the AOSP framework resource table), which
@@ -2030,6 +2568,38 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_get_resource_name as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `asset_manager_get_resource_package_name` matches the paired `(I)Ljava/lang/String;`
+        // signature as an instance native (see the native's docs); casting the `extern "system"` fn to
+        // a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_NAME,
+                ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_SIG,
+                asset_manager_get_resource_package_name as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_get_resource_identifier` matches the paired
+        // `(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I` signature as an instance native
+        // (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
+        // `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_NAME,
+                ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_SIG,
+                asset_manager_get_resource_identifier as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_open_asset` matches the paired `(Ljava/lang/String;I)J` signature as
+        // an instance native (confirmed from the ART-reported line); casting the `extern "system"` fn
+        // to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it. The read-cycle natives are
+        // bound separately (best-effort) by `register_asset_stream_natives`.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_OPEN_ASSET_NAME,
+                ASSET_MANAGER_OPEN_ASSET_SIG,
+                asset_manager_open_asset as *mut std::ffi::c_void,
+            )
+        },
         // SAFETY: `asset_manager_load_resource_value` matches the paired
         // `(ISLandroid/util/TypedValue;Z)I` signature as an instance native (see the native's docs);
         // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
@@ -2058,7 +2628,7 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/AssetManager",
-        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes + newTheme + applyThemeStyle + copyTheme + applyStyle + getResourceName + loadResourceValue + loadThemeAttributeValue"
+        "registered Eclipse's non-GTK backing for AssetManager.init + native_setApkAssets + setConfiguration + openXmlAssetNative + retrieveAttributes + newTheme + applyThemeStyle + copyTheme + applyStyle + getResourceName + getResourcePackageName + getResourceIdentifier + openAsset + loadResourceValue + loadThemeAttributeValue"
     );
     Ok(())
 }
@@ -6067,6 +6637,236 @@ pub enum LifecycleProgress {
     ActivityResumed,
 }
 
+// === Eclipse's interception of ART's java.lang.Runtime.nativeLoad ================================
+//
+// 2026-06-11: ART's `System.loadLibrary(name)` → `Runtime.nativeLoad(path, loader, caller)` →
+// `art::JavaVMExt::LoadNativeLibrary(path)` → `bionic_dlopen(path)` (the apkenv shim linker). For the
+// app's engine JNI libs (e.g. `libzstd-jni`, loaded by `androidx.startup` during `onCreate`) the
+// apkenv linker ABORTS — it cannot apply their modern relocations / its dependency-graph walk
+// NULL-derefs (docs/libroblox-init-run.md §9–§11) → SIGSEGV. Eclipse already PRE-LOADS those libs
+// through its own Rust loader (src/loader/engine.rs): mapped + relocated + fully-resolved (+
+// `JNI_OnLoad` called for the engine) BEFORE the lifecycle. The MISSING half was the CONSULT — making
+// `Runtime.nativeLoad` report a pre-loaded soname as already-loaded so it never re-enters apkenv.
+//
+// This binds Eclipse's own `Runtime.nativeLoad` via RegisterNatives (wins over the libcore native).
+// Per call:
+//   * derive the soname from the resolved path; if Eclipse pre-loaded it → return `null` = SUCCESS
+//     (ART's `nativeLoad` contract: `null` on success, an error `String` on failure), skipping
+//     apkenv entirely — this is the documented §10/§11 "registry consult";
+//   * else → DELEGATE to ART's REAL `JavaVMExt::LoadNativeLibrary` so every OTHER library (e.g.
+//     `libwolfssljni`, a discovery-based lib loaded during cert verification) loads through ART's
+//     normal path — its handle goes into `libraries_`, its `JNI_OnLoad` runs, its `Java_*` symbols
+//     stay discoverable — EXACTLY as before this interception existed (zero regression).
+//
+// With NO pre-loaded lib in the registry (e.g. a pure-Java demo APK) the interception is a pure
+// passthrough (delegates everything), so it is a no-op there. It may run on a background thread
+// (Roblox loads zstd-jni on its `AppStartupTaskM` thread); all of it is thread-safe (the registry is
+// Mutex-guarded; delegation re-enters ART with the calling thread's `JNIEnv`, which ART locks).
+
+unsafe extern "C" {
+    /// Delegate one `nativeLoad` to ART's real `art::JavaVMExt::LoadNativeLibrary` via the C++ shim
+    /// (`src/loader/native_load_shim.cpp`), which builds the `std::string` args with the host
+    /// libstdc++ (correct ABI) and calls `load_fn` (the runtime-`dlsym`'d member-function address,
+    /// invoked with an explicit `this` per the Itanium C++ ABI for a non-virtual member). Returns 1
+    /// on success (lib loaded), 0 on failure (error copied NUL-terminated into `err_buf`).
+    fn eclipse_art_load_native_library(
+        load_fn: *mut c_void,
+        vm: *mut c_void,
+        env: *mut c_void,
+        path: *const c_char,
+        class_loader: *mut c_void,
+        caller_class: *mut c_void,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> c_int;
+}
+
+/// The mangled symbol of `art::JavaVMExt::LoadNativeLibrary(JNIEnv*, const std::string&, jobject,
+/// jclass, std::string*)`, exported (`T`) by `libart.so` (verified `nm -D`). `dlsym`'d from the global
+/// scope (libart is opened RTLD_GLOBAL by `runtime::boot`) to delegate non-pre-loaded `nativeLoad`
+/// calls to ART's real loader. 2026-06-11.
+const ART_LOAD_NATIVE_LIBRARY_SYMBOL: &[u8] =
+    b"_ZN3art9JavaVMExt17LoadNativeLibraryEP7_JNIEnvRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEP8_jobjectP7_jclassPS8_\0";
+
+/// The runtime address of ART's `JavaVMExt::LoadNativeLibrary` (resolved once, cached). `None` if the
+/// symbol is absent (libart not RTLD_GLOBAL, or a build without it) — then the interception cannot
+/// delegate and reports a load *failure* for a non-pre-loaded lib rather than silently faking success.
+fn art_load_native_library_fn() -> Option<*mut c_void> {
+    static FN: OnceLock<usize> = OnceLock::new();
+    let addr = *FN.get_or_init(|| {
+        // SAFETY: 2026-06-11 — `dlsym(RTLD_DEFAULT, name)` with a NUL-terminated C symbol name.
+        // `libart.so` is opened RTLD_GLOBAL by `runtime::boot` (so its symbols are in the global
+        // scope) before any lifecycle/native runs. `dlsym` returns null if the symbol is absent.
+        let p = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                ART_LOAD_NATIVE_LIBRARY_SYMBOL.as_ptr() as *const c_char,
+            )
+        };
+        p as usize
+    });
+    (addr != 0).then_some(addr as *mut c_void)
+}
+
+/// The library soname = the final path component of the resolved load path ART hands `nativeLoad`
+/// (e.g. `/…/native-libs/libzstd-jni-1.5.7-6.so` → `libzstd-jni-1.5.7-6.so`). Pure; unit-tested.
+fn soname_from_load_path(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// `java.lang.Runtime` (internal/slashed name) — hosts the `nativeLoad` Eclipse intercepts.
+const RUNTIME_CLASS: &JNIStr = jni_str!("java/lang/Runtime");
+// JNI name + descriptor for `Runtime.nativeLoad`, the API-26+ libcore form
+// `private static native String nativeLoad(String filename, ClassLoader loader, Class<?> caller);`
+// (the `caller` arg matches `LoadNativeLibrary`'s `jclass caller_class`). A signature mismatch makes
+// RegisterNatives throw (best-effort handled in [`register_runtime_native_load_natives`]).
+const NATIVE_LOAD_NAME: &JNIStr = jni_str!("nativeLoad");
+const NATIVE_LOAD_SIG: &JNIStr =
+    jni_str!("(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;");
+
+/// `Runtime.nativeLoad(String filename, ClassLoader loader, Class caller)` → `null` on success, an
+/// error `String` on failure (ART's contract).
+///
+/// Eclipse's interception: a pre-loaded soname (Eclipse's Rust loader already mapped + relocated +
+/// resolved it) → `null` (success, apkenv skipped); otherwise DELEGATE to ART's real
+/// `LoadNativeLibrary` so the lib loads through ART's normal path unchanged.
+///
+/// JNI ABI: a `static` native, so the second argument is the `JClass`. The body runs inside
+/// [`EnvUnowned::with_env`] (`catch_unwind`-wrapped so a Rust panic can never unwind into ART's C++,
+/// AGENTS.md §2.8). `resolve::<LogErrorAndDefault>` returns the default (a null `JString`) only on an
+/// internal JNI error/panic; the normal success/failure outcomes are returned explicitly.
+extern "system" fn runtime_native_load<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    filename: JString<'local>,
+    loader: JObject<'local>,
+    caller: JClass<'local>,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        // A null filename has no soname to consult — fall through to delegation (ART treats a null
+        // path as "the running executable", which its loader handles).
+        let path = if filename.is_null() {
+            String::new()
+        } else {
+            filename.try_to_string(env)?
+        };
+
+        // 1) CONSULT Eclipse's pre-load registry by soname. A pre-loaded lib is already mapped +
+        //    relocated + resolved (+ JNI_OnLoad called for the engine) — report success, skip apkenv.
+        if !path.is_empty() && crate::loader::engine::is_preloaded(soname_from_load_path(&path)) {
+            tracing::info!(
+                soname = soname_from_load_path(&path),
+                "Runtime.nativeLoad: already pre-loaded by Eclipse's Rust loader — reporting success (apkenv skipped)"
+            );
+            return Ok(JString::default()); // null == success per ART's nativeLoad contract
+        }
+
+        // 2) NOT pre-loaded: delegate to ART's real LoadNativeLibrary so this lib loads through ART's
+        //    normal path (handle in libraries_, JNI_OnLoad, Java_* discovery) exactly as before.
+        let Some(load_fn) = art_load_native_library_fn() else {
+            // Cannot delegate: report a real failure (an error String) rather than fake success —
+            // returning null would wrongly mark the lib loaded and its natives would never bind.
+            return env.new_string(format!(
+                "Eclipse: cannot load \"{path}\": ART JavaVMExt::LoadNativeLibrary not found (is libart RTLD_GLOBAL?)"
+            ));
+        };
+        let java_vm = env.get_java_vm()?.get_raw() as *mut c_void; // JavaVMExt* == the JavaVM*
+        let raw_env = env.get_raw() as *mut c_void;
+        let loader_raw = loader.as_raw() as *mut c_void;
+        let caller_raw = caller.as_raw() as *mut c_void;
+        // A path with an interior NUL cannot be a real file path → a load failure.
+        let c_path = match CString::new(path.as_str()) {
+            Ok(s) => s,
+            Err(_) => return env.new_string(format!("Eclipse: invalid library path \"{path}\"")),
+        };
+        let mut err_buf = [0u8; 1024];
+        // SAFETY: 2026-06-11 — `load_fn` is the dlsym'd `JavaVMExt::LoadNativeLibrary` (a non-virtual
+        // member, callable as a free fn with explicit `this` per the Itanium C++ ABI); `java_vm` is
+        // the live `JavaVMExt*` (ART upcasts `JavaVM*`→`JavaVMExt*`, same address); `raw_env` is the
+        // calling thread's `JNIEnv*`; `loader_raw`/`caller_raw` are the JNI args; `c_path` is a valid
+        // NUL-terminated path held alive across the call; `err_buf` is a 1 KiB out buffer. The C++
+        // shim builds the `std::string` args with the host libstdc++ ART also links. This re-enters
+        // ART's loader exactly as the libcore `Runtime_nativeLoad` native does (same JNI context).
+        let ok = unsafe {
+            eclipse_art_load_native_library(
+                load_fn,
+                java_vm,
+                raw_env,
+                c_path.as_ptr(),
+                loader_raw,
+                caller_raw,
+                err_buf.as_mut_ptr() as *mut c_char,
+                err_buf.len(),
+            )
+        };
+        if ok == 1 {
+            Ok(JString::default()) // success
+        } else {
+            // Build the error String from the shim's NUL-terminated buffer and return it (failure).
+            let end = err_buf.iter().position(|&b| b == 0).unwrap_or(err_buf.len());
+            let msg = String::from_utf8_lossy(&err_buf[..end]).into_owned();
+            let msg = if msg.is_empty() {
+                format!("Eclipse: failed to load \"{path}\"")
+            } else {
+                msg
+            };
+            env.new_string(msg)
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's `Runtime.nativeLoad` interception on `java/lang/Runtime`.
+///
+/// BEST-EFFORT: if this libcore's `nativeLoad` has a different arity/signature, RegisterNatives
+/// throws — we describe+clear+log it and leave ART's original `nativeLoad` in place (so non-engine
+/// libs are unaffected) rather than aborting the boot. The dev-host log then shows `Runtime`'s method
+/// table (as for Canvas), naming the real signature. A pre-loaded lib is still pre-loaded; only the
+/// apkenv-skip is missing if registration fails.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
+/// does, by construction — [`runtime_native_load`] is written to the exact `(Ljava/lang/String;
+/// Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;` descriptor. The body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary.
+fn register_runtime_native_load_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(RUNTIME_CLASS)?;
+    let methods = [
+        // SAFETY: `runtime_native_load` matches the paired signature (see its docs); casting the
+        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                NATIVE_LOAD_NAME,
+                NATIVE_LOAD_SIG,
+                runtime_native_load as *mut c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded java/lang/Runtime; the fn pointer's signature matches the
+    // declared native. On a signature mismatch ART throws (handled best-effort below).
+    match unsafe { env.register_native_methods(&class, &methods) } {
+        Ok(()) => {
+            tracing::info!(
+                class = "java/lang/Runtime",
+                "registered Eclipse's Runtime.nativeLoad interception (pre-loaded libs skip apkenv; others delegate to ART's LoadNativeLibrary)"
+            );
+        }
+        Err(e) => {
+            // Clear any pending exception so it can't poison the next JNI call; log it as the
+            // discovery signal (the dev-host run then dumps Runtime's method table = the real sig).
+            if env.exception_check() {
+                env.exception_clear();
+            }
+            tracing::warn!(
+                class = "java/lang/Runtime",
+                error = %e,
+                "could not register Runtime.nativeLoad interception (signature mismatch?); apkenv path unchanged — engine libs still pre-loaded"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Drive the booted ART VM to Roblox's `Application.onCreate` (recipe steps 1–3).
 ///
 /// Wraps the held [`Vm`]'s raw `*mut JavaVM` with [`jni::vm::JavaVM::from_raw`], attaches the
@@ -6539,6 +7339,10 @@ fn drive_lifecycle(
     // Bind android.content.res.AssetManager.init on its own class — the framework builds an
     // AssetManager early in init (Resources/asset access), so this must be bound before step 1.
     register_asset_manager_natives(env)?;
+    // Bind the asset-STREAM read cycle (readAsset/seekAsset/getAssetLength/.../destroyAsset) on the
+    // same class, best-effort (a sig drift logs + is discovered, never breaks the natives above). A
+    // real app's Application.onCreate opens assets (Roblox's startup tasks do), so bind before step 1.
+    register_asset_stream_natives(env)?;
     // Bind android.content.res.XmlBlock's parser natives on its own class — once openXmlAssetNative
     // returns a real block handle, the framework walks it via XmlBlock (reading AndroidManifest.xml
     // during Context.<clinit>), so these must be bound before step 1.
@@ -6559,6 +7363,14 @@ fn drive_lifecycle(
     // register a sensor listener during Activity.onCreate (accelerometerdemo does, in initViews). Honest
     // no-sensor backing: registers no source, delivers no events (this Linux desktop has no accelerometer).
     register_sensor_manager_natives(env)?;
+    // Bind android.net.ConnectivityManager's three GTK-backed natives (registerNetworkCallback /
+    // isActiveNetworkMetered / nativeGetNetworkAvailable) — Roblox's jobqueue connectivity monitor calls
+    // registerNetworkCallback in ActivitySplash.onCreate (step 5). Non-GTK no-op/available backing.
+    register_connectivity_natives(env)?;
+    // Bind android.database.sqlite.SQLiteConnection's natives (libsqlite3-backed) — Roblox's
+    // ActivitySplash.onCreate (step 5) opens a SQLite DB (SQLiteOpenHelper.getWritableDatabase).
+    // Phase A: open + statement lifecycle + non-cursor executes (nativeExecuteForCursorWindow is Phase B).
+    sqlite::register_natives(env)?;
     // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
@@ -6606,6 +7418,13 @@ fn drive_lifecycle(
     // issues these during the draw cascade ([`drive_view_draw`], after RESUMED), so they must be bound
     // before the cascade runs. Bound non-GTK against canvas_registry (real tiny-skia raster).
     register_canvas_natives(env)?;
+    // Intercept java.lang.Runtime.nativeLoad BEFORE step 1: Context.<clinit>'s APK signature
+    // verification does System.loadLibrary("wolfssljni") (delegated to ART's real loader, unchanged),
+    // and Application.onCreate's androidx.startup does System.loadLibrary("zstd-jni") — which Eclipse
+    // PRE-LOADED through its Rust loader, so the interception reports it already-loaded and skips the
+    // apkenv shim linker (which SIGSEGVs on it). Best-effort: a libcore nativeLoad-signature mismatch
+    // logs + leaves ART's original in place (docs/libroblox-init-run.md §10/§11).
+    register_runtime_native_load_natives(env)?;
 
     // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
     // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
@@ -7606,6 +8425,112 @@ mod tests {
         // uptimeMillis() → `()J`, surfaced 2026-06-05 by Handler.postDelayed; same monotonic source.
         assert_eq!(UPTIME_MILLIS_NAME.to_str(), "uptimeMillis");
         assert_eq!(UPTIME_MILLIS_SIG.to_str(), "()J");
+    }
+
+    #[test]
+    fn runtime_native_load_name_sig_and_class_match_art() {
+        // Pin java.lang.Runtime.nativeLoad's class, method, and JNI descriptor (the API-26+ libcore
+        // form `nativeLoad(String, ClassLoader, Class) -> String`, whose `Class caller` matches
+        // JavaVMExt::LoadNativeLibrary's `jclass caller_class`). A drift would make RegisterNatives
+        // throw (best-effort: the boot log then dumps Runtime's method table). Host-independent.
+        assert_eq!(RUNTIME_CLASS.to_str(), "java/lang/Runtime");
+        assert_eq!(NATIVE_LOAD_NAME.to_str(), "nativeLoad");
+        assert_eq!(
+            NATIVE_LOAD_SIG.to_str(),
+            "(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;"
+        );
+        // The delegation target: the exact mangled `art::JavaVMExt::LoadNativeLibrary` exported by
+        // libart.so (verified `nm -D`), NUL-terminated for `dlsym`. A typo silently disables
+        // delegation (non-pre-loaded libs would then report a load failure, not crash).
+        assert!(ART_LOAD_NATIVE_LIBRARY_SYMBOL.starts_with(b"_ZN3art9JavaVMExt17LoadNativeLibrary"));
+        assert_eq!(*ART_LOAD_NATIVE_LIBRARY_SYMBOL.last().unwrap(), 0u8);
+    }
+
+    #[test]
+    fn soname_from_load_path_returns_the_basename() {
+        // The consult derives the soname from the path ART resolved, to match the engine pre-load
+        // registry. Full path → basename; a bare soname → itself; no slash → itself. Stays total
+        // (no panic) on degenerate inputs.
+        assert_eq!(
+            soname_from_load_path("/home/u/.cache/eclipse/native-libs/libzstd-jni-1.5.7-6.so"),
+            "libzstd-jni-1.5.7-6.so"
+        );
+        assert_eq!(soname_from_load_path("libroblox.so"), "libroblox.so");
+        assert_eq!(
+            soname_from_load_path("/usr/lib/libwolfssljni.so"),
+            "libwolfssljni.so"
+        );
+        assert_eq!(soname_from_load_path(""), "");
+        assert_eq!(soname_from_load_path("/a/b/"), "");
+    }
+
+    #[test]
+    fn asset_manager_get_resource_package_name_name_sig_match_art_reported() {
+        // Pin AssetManager.getResourcePackageName's name + JNI descriptor against the exact signature
+        // ART reported missing (`No implementation found for java.lang.String
+        // android.content.res.AssetManager.getResourcePackageName(int)`, mangled `...__I`, run log
+        // 2026-06-11 from FirebaseInitProvider.onCreate). A drift re-throws the UnsatisfiedLinkError.
+        assert_eq!(
+            ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_NAME.to_str(),
+            "getResourcePackageName"
+        );
+        assert_eq!(
+            ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_SIG.to_str(),
+            "(I)Ljava/lang/String;"
+        );
+    }
+
+    #[test]
+    fn asset_manager_get_resource_identifier_name_sig_match_art_reported() {
+        // Pin AssetManager.getResourceIdentifier's name + JNI descriptor against the exact signature
+        // ART reported missing (`No implementation found for int
+        // android.content.res.AssetManager.getResourceIdentifier(java.lang.String, java.lang.String,
+        // java.lang.String)`, run log 2026-06-11 from FirebaseInitProvider.onCreate).
+        assert_eq!(
+            ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_NAME.to_str(),
+            "getResourceIdentifier"
+        );
+        assert_eq!(
+            ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_SIG.to_str(),
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I"
+        );
+    }
+
+    #[test]
+    fn asset_manager_stream_native_names_and_sigs_are_the_classic_aosp_set() {
+        // openAsset's signature is confirmed from the ART-reported line; the read cycle uses the
+        // classic AOSP signatures (bound best-effort). Pin them so a transcription drift is caught.
+        assert_eq!(ASSET_MANAGER_OPEN_ASSET_NAME.to_str(), "openAsset");
+        assert_eq!(
+            ASSET_MANAGER_OPEN_ASSET_SIG.to_str(),
+            "(Ljava/lang/String;I)J"
+        );
+        assert_eq!(ASSET_MANAGER_READ_ASSET_NAME.to_str(), "readAsset");
+        // ATL's readAsset uses long off/len (run log 2026-06-11), not the classic AOSP int/int.
+        assert_eq!(ASSET_MANAGER_READ_ASSET_SIG.to_str(), "(J[BJJ)I");
+        assert_eq!(ASSET_MANAGER_SEEK_ASSET_NAME.to_str(), "seekAsset");
+        assert_eq!(ASSET_MANAGER_SEEK_ASSET_SIG.to_str(), "(JJI)J");
+        assert_eq!(
+            ASSET_MANAGER_GET_ASSET_LENGTH_NAME.to_str(),
+            "getAssetLength"
+        );
+        assert_eq!(ASSET_MANAGER_GET_ASSET_LENGTH_SIG.to_str(), "(J)J");
+        assert_eq!(
+            ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_NAME.to_str(),
+            "getAssetRemainingLength"
+        );
+        assert_eq!(ASSET_MANAGER_DESTROY_ASSET_NAME.to_str(), "destroyAsset");
+        assert_eq!(ASSET_MANAGER_DESTROY_ASSET_SIG.to_str(), "(J)V");
+    }
+
+    #[test]
+    fn resolve_resource_identifier_parses_name_forms_and_returns_zero_when_unresolvable() {
+        // Pure parse/fallback logic (no ARSC needed for the not-found paths): an empty entry → 0; a
+        // name with no type and no defType → 0. The real reverse lookup is covered by an arsc test;
+        // here we pin that the AOSP `[package:][type/]entry` parsing + 0-fallback never panics.
+        assert_eq!(resolve_resource_identifier("", "string", "com.x"), 0);
+        assert_eq!(resolve_resource_identifier("foo", "", ""), 0); // no type → not identifiable
+        assert_eq!(resolve_resource_identifier("type/", "", ""), 0); // empty entry → 0
     }
 
     #[test]

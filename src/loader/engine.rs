@@ -78,6 +78,20 @@ fn soname_is_loaded(soname: &str) -> bool {
     guard.as_ref().is_some_and(|s| s.contains(soname))
 }
 
+/// Whether a native library `name` — its `DT_SONAME` **or** its `lib/<abi>/` file name — has already
+/// been loaded through Eclipse's Rust loader.
+///
+/// 2026-06-11: public so the framework's `Runtime.nativeLoad` interception can CONSULT this registry
+/// (`docs/libroblox-init-run.md` §10/§11). When ART's `System.loadLibrary` resolves a name to a path
+/// whose basename is a pre-loaded soname, the interception reports success **without** re-entering the
+/// apkenv shim linker (which aborts on the engine libs' modern relocs). The registry is keyed by BOTH
+/// the resolved soname and the input file name (see [`load_app_native_lib`]), so a consult by the
+/// path basename matches regardless of whether `DT_SONAME` equals the file name.
+#[must_use]
+pub fn is_preloaded(name: &str) -> bool {
+    soname_is_loaded(name)
+}
+
 /// The exported symbol ART invokes after loading a JNI library to register its native methods and
 /// learn its required JNI version. Looked up in the engine's dynamic symbol table (see
 /// [`LoadedEngine::jni_onload_addr`]).
@@ -130,6 +144,44 @@ impl LoadedEngine {
         provider
             .resolve(JNI_ONLOAD_SYMBOL)
             .map(|resolved| resolved.addr)
+    }
+
+    /// The absolute runtime address of an exported symbol `name` (a defined `GLOBAL`/`WEAK` export),
+    /// or `None`. Resolves via the SAME [`LoadedObjectProvider`] the relocation scope uses
+    /// (`base + st_value`), matching by the symbol's BASE name (a GNU symbol version such as
+    /// `@@LIBROBLOX` lives in the version table, not in `st_name`, so the base name still matches).
+    ///
+    /// 2026-06-11: the pre-loaded-lib `Java_*` discovery-gap fix uses this to bind ART's declared
+    /// native to the implementation's address in Eclipse's mapped image — ART cannot `dlsym` the lib
+    /// itself (Eclipse mmap-pre-loaded it, so it is not in ART's `libraries_`).
+    #[must_use]
+    pub fn resolve_export(&self, name: &str) -> Option<u64> {
+        LoadedObjectProvider::new(self.base, &self.dynsyms)
+            .resolve(name)
+            .map(|resolved| resolved.addr)
+    }
+
+    /// Every `Java_*` native this image DEFINES and exports, as `(symbol_name, absolute_addr)`. The
+    /// general discovery-gap fix ([`super::jni_register::register_all_preloaded_natives`]) demangles
+    /// each and RegisterNatives it with ART (which cannot `dlsym` an Eclipse-mmap-pre-loaded lib).
+    ///
+    /// 2026-06-11: a defined export is `st_shndx != SHN_UNDEF` (0) with `GLOBAL`/`WEAK` binding; the
+    /// address is `base + st_value` (a GNU symbol version such as `@@LIBROBLOX` is not part of the
+    /// `st_name`, so the base name is what `RegisterNatives` needs). libroblox exports ~499 of these.
+    #[must_use]
+    pub fn java_native_exports(&self) -> Vec<(String, u64)> {
+        const SHN_UNDEF: u16 = 0;
+        const STB_GLOBAL: u8 = 1;
+        const STB_WEAK: u8 = 2;
+        self.dynsyms
+            .iter()
+            .filter(|s| {
+                s.shndx != SHN_UNDEF
+                    && (s.bind == STB_GLOBAL || s.bind == STB_WEAK)
+                    && s.name.starts_with("Java_")
+            })
+            .map(|s| (s.name.clone(), self.base.wrapping_add(s.value)))
+            .collect()
     }
 }
 
@@ -535,6 +587,13 @@ pub fn load_app_native_lib(
         return Ok(None);
     }
 
+    // 2026-06-11: also index by the input file name so the `Runtime.nativeLoad` consult
+    // ([`is_preloaded`]) — which derives the soname from the PATH ART resolved — matches even when
+    // `DT_SONAME` differs from the file name. (Idempotent; the soname above is the dedup decider.)
+    if soname != filename {
+        let _ = register_soname(filename);
+    }
+
     // Run constructors only if this lib has a DT_INIT_ARRAY (lazy-native libs ship none).
     let constructors_run = if engine.init_array.is_some() {
         engine.run_init_array(log)?
@@ -552,6 +611,28 @@ pub fn load_app_native_lib(
         );
         None
     };
+
+    // 2026-06-11: discovery-gap fix — ART cannot `dlsym` this Eclipse-mmap-pre-loaded lib (it is not in
+    // ART's `libraries_`), so its `Java_*` natives would surface as `UnsatisfiedLinkError`. RegisterNatives
+    // the natives this lib provides directly with ART, binding each to its export address. Best-effort
+    // (strictly additive — never regresses the boot). `java_vm` is the live process `JavaVM*` the caller
+    // passed (`runtime::Vm::as_raw`, non-null) and we are on the JNI-attached main thread (the pre-load
+    // context) — the documented pointer contract of these functions. The GENERAL pass reflects + binds
+    // every exported `Java_*` native; if it binds nothing (systemic reflection failure) we fall back to
+    // the hand-curated criticals so a regression cannot drop below the proven baseline.
+    let bound = super::jni_register::register_all_preloaded_natives(
+        java_vm,
+        &engine.java_native_exports(),
+        &soname,
+        log,
+    );
+    if bound == 0 {
+        super::jni_register::register_preloaded_natives(
+            java_vm,
+            |name| engine.resolve_export(name),
+            log,
+        );
+    }
 
     Ok(Some(PreloadedLib {
         soname,
@@ -640,6 +721,20 @@ mod tests {
         assert!(!register_soname(b));
         // The first soname is still recorded (inserting b did not evict a).
         assert!(soname_is_loaded(a));
+    }
+
+    #[test]
+    fn is_preloaded_reflects_registration() {
+        // The public consult the framework's Runtime.nativeLoad interception uses: false before, true
+        // after registering. Uses a unique soname so the process-global registry isn't polluted by /
+        // doesn't collide with other tests.
+        let s = "libengine-test-is-preloaded.so";
+        assert!(!is_preloaded(s), "fresh soname must read not-preloaded");
+        assert!(register_soname(s));
+        assert!(
+            is_preloaded(s),
+            "after registration the public consult reports preloaded"
+        );
     }
 
     #[test]

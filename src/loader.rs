@@ -96,6 +96,8 @@ pub mod bionic_sysconf;
 pub mod elf;
 pub mod engine;
 pub mod init_run;
+pub mod jni_mangle;
+pub mod jni_register;
 pub mod link;
 pub mod looper;
 pub mod map;
