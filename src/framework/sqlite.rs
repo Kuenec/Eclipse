@@ -9,10 +9,13 @@
 //! the Java side stores. For soundness (AGENTS.md §2.8) the `jlong`s are NOT raw pointers but
 //! generational-slab indices (a stale/fabricated handle is a checked `Err`, never a wild deref).
 //!
-//! ## Phase A (this module): the OPEN + statement-lifecycle + non-cursor execute path
-//! Enough to clear `nativeOpen` and the PRAGMA / `android_metadata` / `CREATE TABLE` / version-check
-//! sequence `SQLiteOpenHelper.getWritableDatabase` issues. `nativeExecuteForCursorWindow` (the first
-//! `SELECT` returning rows) + the `CursorWindow` buffer are Phase B (TODO).
+//! ## Scope: the full `SQLiteConnection` native surface (open + statements + executes + cursor window)
+//! Covers `nativeOpen` and the PRAGMA / `android_metadata` / `CREATE TABLE` / version-check sequence
+//! `SQLiteOpenHelper.getWritableDatabase` issues, AND `nativeExecuteForCursorWindow` — the row-returning
+//! SELECT path. NOTE ATL's `android.database.CursorWindow` is a **pure-Java** `ArrayList<Object[]>` (no
+//! native buffer), so `nativeExecuteForCursorWindow` fills it via the window's Java methods
+//! (`clear`/`setNumColumns`/`allocRow`/`put{Long,Double,String,Blob,Null}`) over JNI — there is no
+//! `#[repr(C,packed)]` FieldSlot buffer here.
 //!
 //! UTF-8 SQLite entry points are used (`sqlite3_open_v2`/`prepare_v2`/`bind_text`/`column_text`) rather
 //! than AOSP's UTF-16 ones — functionally identical (SQLite stores text as UTF-8), and a Java `String`
@@ -24,10 +27,10 @@
 use std::ffi::{c_int, CStr, CString};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use jni::objects::{JByteArray, JClass, JString};
+use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::strings::JNIStr;
 use jni::sys::{jboolean, jdouble, jint, jlong};
-use jni::{jni_str, Env, EnvUnowned, NativeMethod};
+use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use jni::errors::LogErrorAndDefault;
 use jni::refs::Reference;
@@ -53,6 +56,11 @@ const SQLITE_OPEN_READONLY: c_int = 0x0000_0001;
 const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
 const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
 const SQLITE_UTF8: c_int = 1; // text encoding for a collation/function registration
+                              // sqlite3_column_type result codes.
+const SQLITE_INTEGER: c_int = 1;
+const SQLITE_FLOAT: c_int = 2;
+const SQLITE_TEXT: c_int = 3;
+const SQLITE_BLOB: c_int = 4;
 
 // `android.database.sqlite.SQLiteDatabase` open-flag bits `nativeOpen`'s `openFlags` carries, mapped to
 // SQLite flags exactly as AOSP's `android_database_SQLiteConnection.cpp` does.
@@ -711,6 +719,155 @@ extern "system" fn native_execute_for_blob_file_descriptor<'l>(
         .resolve::<LogErrorAndDefault>()
 }
 
+/// The current row's column `col` as a Rust `String` (UTF-8). Empty for NULL/empty.
+fn column_text(stmt: *mut ffi::sqlite3_stmt, col: c_int) -> String {
+    // SAFETY: `stmt` is a live statement stepped to a row; column_text/column_bytes return the UTF-8
+    // text + its byte length, valid until the next step/reset.
+    unsafe {
+        let ptr = ffi::sqlite3_column_text(stmt, col);
+        if ptr.is_null() {
+            return String::new();
+        }
+        let len = ffi::sqlite3_column_bytes(stmt, col).max(0) as usize;
+        String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned()
+    }
+}
+
+/// The current row's column `col` as raw blob bytes.
+fn column_blob(stmt: *mut ffi::sqlite3_stmt, col: c_int) -> Vec<u8> {
+    // SAFETY: as `column_text` — blob ptr + byte length valid until the next step/reset.
+    unsafe {
+        let ptr = ffi::sqlite3_column_blob(stmt, col);
+        let len = ffi::sqlite3_column_bytes(stmt, col).max(0) as usize;
+        if ptr.is_null() || len == 0 {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+    }
+}
+
+/// `nativeExecuteForCursorWindow(connPtr, stmtPtr, CursorWindow window, startPos, requiredPos,
+/// countAllRows)` → `(actualStartPos << 32) | totalRows`. Steps the statement and FILLS the **Java**
+/// `CursorWindow` (ATL's is a pure-Java `ArrayList<Object[]>`, NOT a native buffer) via its Java methods
+/// (`clear`/`setNumColumns`/`setStartPosition`/`allocRow`/`put{Long,Double,String,Blob,Null}`). ATL's
+/// window is unbounded, so all rows from `startPos` are filled in one pass; `put*` takes the ABSOLUTE
+/// row index (the window subtracts its `startPos` internally). Per-row local frames free the transient
+/// `JString`/`JByteArray` refs so a large result set never overflows the local-reference table.
+extern "system" fn native_execute_for_cursor_window<'l>(
+    mut env: EnvUnowned<'l>,
+    _cls: JClass<'l>,
+    conn: jlong,
+    stmt: jlong,
+    window: JObject<'l>,
+    start_pos: jint,
+    _required_pos: jint,
+    _count_all_rows: jboolean,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        let (db, s) = match require_conn_stmt(env, conn, stmt, 0i64) {
+            Ok(v) => v,
+            Err(d) => return d,
+        };
+        // SAFETY: `s` is a live statement; column_count is valid before/after stepping.
+        let col_count = unsafe { ffi::sqlite3_column_count(s) };
+        env.call_method(&window, jni_str!("clear"), jni_sig!("()V"), &[])?;
+        env.call_method(
+            &window,
+            jni_str!("setNumColumns"),
+            jni_sig!("(I)Z"),
+            &[JValue::Int(col_count)],
+        )?;
+        env.call_method(
+            &window,
+            jni_str!("setStartPosition"),
+            jni_sig!("(I)V"),
+            &[JValue::Int(start_pos)],
+        )?;
+
+        let mut total_rows: i32 = 0;
+        loop {
+            // SAFETY: `s` is a live statement; step advances to the next row / DONE / an error code.
+            let rc = unsafe { ffi::sqlite3_step(s) };
+            if rc == SQLITE_DONE {
+                break;
+            }
+            if rc != SQLITE_ROW {
+                let r = throw_sqlite(env, db, 0);
+                // SAFETY: reset so the statement is reusable/finalizable after the error.
+                unsafe { ffi::sqlite3_reset(s) };
+                return r;
+            }
+            if total_rows >= start_pos {
+                let row = total_rows;
+                // One local frame per row frees the transient JString/JByteArray column refs.
+                env.with_local_frame(8, |env| -> jni::errors::Result<()> {
+                    env.call_method(&window, jni_str!("allocRow"), jni_sig!("()Z"), &[])?;
+                    for col in 0..col_count {
+                        // SAFETY: `s` is stepped to a row; column_type is the dynamic type at (row,col).
+                        let ctype = unsafe { ffi::sqlite3_column_type(s, col) };
+                        match ctype {
+                            SQLITE_INTEGER => {
+                                // SAFETY: column is INTEGER → column_int64 is valid.
+                                let v = unsafe { ffi::sqlite3_column_int64(s, col) };
+                                env.call_method(
+                                    &window,
+                                    jni_str!("putLong"),
+                                    jni_sig!("(JII)Z"),
+                                    &[JValue::Long(v), JValue::Int(row), JValue::Int(col)],
+                                )?;
+                            }
+                            SQLITE_FLOAT => {
+                                // SAFETY: column is FLOAT → column_double is valid.
+                                let v = unsafe { ffi::sqlite3_column_double(s, col) };
+                                env.call_method(
+                                    &window,
+                                    jni_str!("putDouble"),
+                                    jni_sig!("(DII)Z"),
+                                    &[JValue::Double(v), JValue::Int(row), JValue::Int(col)],
+                                )?;
+                            }
+                            SQLITE_TEXT => {
+                                let jstr = env.new_string(column_text(s, col))?;
+                                env.call_method(
+                                    &window,
+                                    jni_str!("putString"),
+                                    jni_sig!("(Ljava/lang/String;II)Z"),
+                                    &[JValue::Object(&jstr), JValue::Int(row), JValue::Int(col)],
+                                )?;
+                            }
+                            SQLITE_BLOB => {
+                                let jarr = env.byte_array_from_slice(&column_blob(s, col))?;
+                                env.call_method(
+                                    &window,
+                                    jni_str!("putBlob"),
+                                    jni_sig!("([BII)Z"),
+                                    &[JValue::Object(&jarr), JValue::Int(row), JValue::Int(col)],
+                                )?;
+                            }
+                            _ => {
+                                // SQLITE_NULL (or any unexpected): store a NULL field.
+                                env.call_method(
+                                    &window,
+                                    jni_str!("putNull"),
+                                    jni_sig!("(II)Z"),
+                                    &[JValue::Int(row), JValue::Int(col)],
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            total_rows = total_rows.saturating_add(1);
+        }
+        // SAFETY: rewind the statement for reuse (AOSP resets after filling the window).
+        unsafe { ffi::sqlite3_reset(s) };
+        // Pack (actualStartPos << 32) | totalRows. We filled from `start_pos`, so actualStartPos = start_pos.
+        Ok((i64::from(start_pos) << 32) | i64::from(total_rows) & 0xFFFF_FFFF)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// A byte-lexicographic comparator registered as the "LOCALIZED"/"UNICODE" collations so a
 /// `REINDEX LOCALIZED` (SQLiteDatabase.setLocale) and any `COLLATE LOCALIZED` resolve. NOT
 /// locale-accurate (AOSP uses ICU); it is a valid TOTAL order, which is all SQLite requires, and
@@ -816,9 +973,9 @@ extern "system" fn native_reset_cancel<'l>(
 /// `android.database.sqlite.SQLiteConnection` (slashed name for `find_class`).
 const SQLITE_CONNECTION_CLASS: &JNIStr = jni_str!("android/database/sqlite/SQLiteConnection");
 
-/// Bind Eclipse's libsqlite3-backed natives for the Phase-A `SQLiteConnection` surface (everything
-/// except `nativeExecuteForCursorWindow`, which needs the `CursorWindow` buffer — Phase B). Best-effort
-/// per AOSP: registered before the lifecycle so they are bound before `ActivitySplash.onCreate`'s DB open.
+/// Bind Eclipse's libsqlite3-backed natives for the `SQLiteConnection` surface (open + statement
+/// lifecycle + executes + `nativeExecuteForCursorWindow`). Registered before the lifecycle so they are
+/// bound before `ActivitySplash.onCreate`'s DB open.
 ///
 /// # Safety / soundness
 /// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature. They do,
@@ -828,7 +985,7 @@ const SQLITE_CONNECTION_CLASS: &JNIStr = jni_str!("android/database/sqlite/SQLit
 pub fn register_natives(env: &mut Env) -> Result<(), super::FrameworkError> {
     let class = env.find_class(SQLITE_CONNECTION_CLASS)?;
     // (name, signature, fn pointer). Signatures verbatim from ATL's SQLiteConnection.java.
-    let m: [(&JNIStr, &JNIStr, *mut std::ffi::c_void); 23] = [
+    let m: [(&JNIStr, &JNIStr, *mut std::ffi::c_void); 24] = [
         (
             jni_str!("nativeOpen"),
             jni_str!("(Ljava/lang/String;ILjava/lang/String;ZZ)J"),
@@ -935,6 +1092,11 @@ pub fn register_natives(env: &mut Env) -> Result<(), super::FrameworkError> {
             native_execute_for_last_inserted_row_id as *mut _,
         ),
         (
+            jni_str!("nativeExecuteForCursorWindow"),
+            jni_str!("(JJLandroid/database/CursorWindow;IIZ)J"),
+            native_execute_for_cursor_window as *mut _,
+        ),
+        (
             jni_str!("nativeGetDbLookaside"),
             jni_str!("(J)I"),
             native_get_db_lookaside as *mut _,
@@ -985,7 +1147,7 @@ pub fn register_natives(env: &mut Env) -> Result<(), super::FrameworkError> {
 
     tracing::info!(
         class = "android/database/sqlite/SQLiteConnection",
-        "registered Eclipse's libsqlite3-backed natives (Phase A: open + statement lifecycle + non-cursor executes)"
+        "registered Eclipse's libsqlite3-backed natives (open + statement lifecycle + executes + cursor window)"
     );
     Ok(())
 }
