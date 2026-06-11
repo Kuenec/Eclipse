@@ -27,6 +27,7 @@
 
 pub mod arsc;
 pub mod axml;
+pub mod fetch;
 
 use std::collections::BTreeMap;
 use std::fmt;

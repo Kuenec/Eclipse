@@ -71,6 +71,15 @@ pub struct Config {
     /// number, or string, so they are kept as raw JSON. `BTreeMap` keeps `save` output
     /// stable (sorted keys).
     pub fflags: BTreeMap<String, serde_json::Value>,
+    // --- APK auto-fetch (opt-in; Eclipse never hosts/hard-codes a Roblox source — see apk::fetch) ---
+    /// User-configured APK download URL (a single merged/universal APK the user chooses to fetch from).
+    /// Empty/`None` = no source (the default; supply the APK path instead). Also `ECLIPSE_APK_URL`.
+    pub apk_url: Option<String>,
+    /// Optional SHA-256 (lowercase hex) the fetched APK must match before it is used (defense-in-depth).
+    pub apk_sha256: Option<String>,
+    /// When `true` and no APK path is supplied, `eclipse run` auto-fetches from [`Self::apk_url`].
+    /// Off by default (the safest posture: the runtime never acquires the APK unless asked).
+    pub auto_fetch_missing: bool,
 }
 
 impl Default for Config {
@@ -91,6 +100,9 @@ impl Default for Config {
             use_console_experience: false,
             use_libsecret: false,
             fflags: BTreeMap::new(),
+            apk_url: None,
+            apk_sha256: None,
+            auto_fetch_missing: false,
         }
     }
 }

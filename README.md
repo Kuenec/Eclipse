@@ -88,6 +88,21 @@ docs/               research, design, and the M0 runbook
 To be decided (`TBD`). AOSP ART is Apache-2.0; the reusable ATL/`bionic_translation` code is
 GPLv3+, which will influence the choice if/when that code is reused. Tracked as an open item.
 
+## Supplying the Roblox APK
+
+The default is **user-supplied**: `eclipse run <apk>` (or `ECLIPSE_ROBLOX_APK=<path>`). There is also an
+**opt-in auto-fetch** that downloads from a source **you configure** — Eclipse **never hosts or hard-codes
+a Roblox download source** (Roblox publishes no official Android APK endpoint; Android is Google-Play-only):
+
+- `eclipse fetch` — report the latest upstream version (the official `clientsettings` oracle) and download
+  the APK from your configured source into the cache.
+- Set `apk_url` (a single merged/universal APK URL you choose) in `config.json`, or `ECLIPSE_APK_URL`.
+  Optionally pin `apk_sha256`. Enable `auto_fetch_missing` to have `eclipse run` (no APK arg) fetch it.
+
+The download is streamed over TLS (pure-Rust `rustls`), SHA-256-verified (if pinned), and cached. You are
+responsible for your own download and your account (running a third-party client can risk moderation).
+
 ---
-*Eclipse is unofficial and not affiliated with Roblox Corporation. You must supply your own
-Roblox APK; Eclipse does not redistribute Roblox.*
+*Eclipse is unofficial and not affiliated with Roblox Corporation. The default is user-supplied APK; the
+opt-in fetch downloads only from a source **you** configure. **Eclipse does not host or redistribute
+Roblox** — it never serves Roblox bytes and will cease any contested behavior on request.*
