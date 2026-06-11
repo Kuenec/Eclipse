@@ -96,6 +96,19 @@ cpal = "0.17"
 # `png-format` dropped (no PNG encode/decode — Eclipse uploads raw RGBA straight to the GPU; no bloat
 # §2.5). Pure Rust (tiny-skia-path/png/fdeflate), no GTK/Cairo/Skia-C (§2.1).
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
+# 2026-06-11: the SQLite engine behind android.database.sqlite.SQLiteConnection's natives. ATL declares
+# the full AOSP SQLiteConnection native surface (nativeOpen/prepare/bind/step/column/…) but backs it in
+# its GTK lib (libtranslation_layer_main.so) Eclipse does not load, so Roblox's ActivitySplash.onCreate
+# DB open is an UnsatisfiedLinkError. Eclipse binds these natives itself (RegisterNatives, like Context/
+# ConnectivityManager) against the RAW libsqlite3-sys FFI (sqlite3*/sqlite3_stmt* round-trip as the jlong
+# handles the Java side stores — the JNI contract IS a thin C-API surface, so the raw -sys crate fits
+# better than rusqlite's safe wrapper, and is leaner: no rusqlite/smallvec/fallible-iterator). `bundled`
+# compiles the vendored SQLite amalgamation via the `cc` crate (already a build-dep) and links it
+# statically — NO system libsqlite3, deterministic version, distro-portable (detect-don't-assume §9). No
+# pure-Rust SQLite is production-grade (stability §3.1), so a thin binding to the gold-standard C engine
+# is the accepted shape — the one new C black box here, same rationale as cpal→ALSA / the cc shims; adds
+# only libsqlite3-sys (+ vcpkg, a Windows-only build helper). Logged in docs/dependency-plan.md + §6.
+libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }
 # 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
 # The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
 # Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.

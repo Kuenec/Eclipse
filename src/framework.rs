@@ -92,6 +92,7 @@ pub mod canvas_registry;
 pub mod matrix_registry;
 pub mod paint_registry;
 pub mod path_registry;
+pub mod sqlite;
 pub mod theme_registry;
 pub mod view_registry;
 pub mod window_registry;
@@ -7366,6 +7367,10 @@ fn drive_lifecycle(
     // isActiveNetworkMetered / nativeGetNetworkAvailable) — Roblox's jobqueue connectivity monitor calls
     // registerNetworkCallback in ActivitySplash.onCreate (step 5). Non-GTK no-op/available backing.
     register_connectivity_natives(env)?;
+    // Bind android.database.sqlite.SQLiteConnection's natives (libsqlite3-backed) — Roblox's
+    // ActivitySplash.onCreate (step 5) opens a SQLite DB (SQLiteOpenHelper.getWritableDatabase).
+    // Phase A: open + statement lifecycle + non-cursor executes (nativeExecuteForCursorWindow is Phase B).
+    sqlite::register_natives(env)?;
     // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
