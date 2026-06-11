@@ -406,6 +406,110 @@ fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.net.ConnectivityManager =========================
+//
+// 2026-06-11: ATL's `ConnectivityManager` (api-impl/android/net/ConnectivityManager.java) declares THREE
+// `native` methods backed by ATL's GTK lib (`libtranslation_layer_main.so`), which Eclipse does NOT load:
+// `registerNetworkCallback(NetworkRequest, NetworkCallback)`, `isActiveNetworkMetered()`, and
+// `nativeGetNetworkAvailable()`. Roblox's `com.birbit.android.jobqueue` connectivity monitor calls
+// `registerNetworkCallback` in `ActivitySplash.onCreate` (step 5), surfacing `UnsatisfiedLinkError`. Like
+// the Context/Log/View natives, Eclipse binds its OWN GTK-free backing via `RegisterNatives` — durable
+// (compiled into the binary, so it works without the framework-jar overlay). The host desktop network is
+// treated as available + unmetered, and Eclipse delivers no connectivity callbacks (a sound no-op: Roblox
+// degrades gracefully without connectivity-change events).
+
+/// `android.net.ConnectivityManager` (internal/slashed name for `find_class`).
+pub const CONNECTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/net/ConnectivityManager");
+
+// JNI names + descriptors, exactly as declared in ATL's ConnectivityManager.java (2026-06-11).
+const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("registerNetworkCallback");
+const CM_REGISTER_NETWORK_CALLBACK_SIG: &JNIStr =
+    jni_str!("(Landroid/net/NetworkRequest;Landroid/net/ConnectivityManager$NetworkCallback;)V");
+const CM_IS_ACTIVE_NETWORK_METERED_NAME: &JNIStr = jni_str!("isActiveNetworkMetered");
+const CM_IS_ACTIVE_NETWORK_METERED_SIG: &JNIStr = jni_str!("()Z");
+const CM_NATIVE_GET_NETWORK_AVAILABLE_NAME: &JNIStr = jni_str!("nativeGetNetworkAvailable");
+const CM_NATIVE_GET_NETWORK_AVAILABLE_SIG: &JNIStr = jni_str!("()Z");
+
+/// `ConnectivityManager.registerNetworkCallback(NetworkRequest, NetworkCallback)` — no-op. Eclipse does
+/// not deliver connectivity-change callbacks; Roblox's network monitor degrades gracefully without them.
+/// Instance native (second arg is the `this` `JObject`). `with_env` `catch_unwind`-guards the body.
+extern "system" fn cm_register_network_callback<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _request: JObject<'local>,
+    _callback: JObject<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> { Ok(()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `ConnectivityManager.isActiveNetworkMetered()` → `false` (the host desktop network is unmetered).
+extern "system" fn cm_is_active_network_metered<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jboolean {
+    // jni 0.22 maps `jboolean` to Rust `bool`. The desktop host network is treated as unmetered.
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(false) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `ConnectivityManager.nativeGetNetworkAvailable()` → `true` (the host desktop network is available).
+extern "system" fn cm_native_get_network_available<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jboolean {
+    // jni 0.22 maps `jboolean` to Rust `bool`. The desktop host network is treated as available.
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(true) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.net.ConnectivityManager`'s three `native` methods.
+///
+/// Locates `android/net/ConnectivityManager` and registers the natives via `RegisterNatives` (which wins
+/// over ATL's GTK-lib symbol binding — JNI 1.1 spec). Like [`register_log_natives`], it runs before the
+/// lifecycle drive so the natives are bound before `ActivitySplash.onCreate`'s connectivity-monitor call.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature. They do,
+/// by construction (the descriptors are taken verbatim from ATL's `ConnectivityManager.java`). Each body
+/// is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary.
+fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(CONNECTIVITY_MANAGER_CLASS)?;
+    let methods = [
+        // SAFETY: each fn matches its paired signature (verbatim from ConnectivityManager.java); casting
+        // the `extern "system"` fn to `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CM_REGISTER_NETWORK_CALLBACK_NAME,
+                CM_REGISTER_NETWORK_CALLBACK_SIG,
+                cm_register_network_callback as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CM_IS_ACTIVE_NETWORK_METERED_NAME,
+                CM_IS_ACTIVE_NETWORK_METERED_SIG,
+                cm_is_active_network_metered as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                CM_NATIVE_GET_NETWORK_AVAILABLE_NAME,
+                CM_NATIVE_GET_NETWORK_AVAILABLE_SIG,
+                cm_native_get_network_available as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/net/ConnectivityManager; `methods` hold valid fn pointers
+    // whose signatures match the class's `native` declarations (verified against ConnectivityManager.java).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/net/ConnectivityManager",
+        "registered Eclipse's non-GTK backing for registerNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.content.res.AssetManager.init ==================
 //
 // 2026-06-05: `android.content.res.AssetManager`'s constructors (ATL `api-impl/android/content/res/
@@ -7258,6 +7362,10 @@ fn drive_lifecycle(
     // register a sensor listener during Activity.onCreate (accelerometerdemo does, in initViews). Honest
     // no-sensor backing: registers no source, delivers no events (this Linux desktop has no accelerometer).
     register_sensor_manager_natives(env)?;
+    // Bind android.net.ConnectivityManager's three GTK-backed natives (registerNetworkCallback /
+    // isActiveNetworkMetered / nativeGetNetworkAvailable) — Roblox's jobqueue connectivity monitor calls
+    // registerNetworkCallback in ActivitySplash.onCreate (step 5). Non-GTK no-op/available backing.
+    register_connectivity_natives(env)?;
     // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
