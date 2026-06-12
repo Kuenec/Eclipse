@@ -128,6 +128,33 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-12 (live-validated) — ✅ THE ENGINE SIGSEGV IS RESOLVED; the real Roblox v2.721.1108 boot is now STABLE to
+  the host window + Vulkan present loop (6/6 clean runs — 5 warm + 1 COLD, caches wiped). ⇐ START HERE NEXT SESSION
+  (frontier = wire Roblox's engine GL output (`AndroidGLView`/EGL) to Eclipse's winit window so it draws the real UI).**
+  Owner live-validation on the dev-host MAIN LOOP (`./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the signal-ABI work (now COMMITTED + merged —
+  origin/main `1b56e99`) made the engine's crashpad-era SIGSEGV stop reproducing entirely. Across 6 consecutive runs
+  (`/tmp/tap{1..5}.log` warm + `/tmp/cold1.log` cold) the boot drives lifecycle 1–7 → `ActivitySplash` RESUMED → winit
+  window `Eclipse — com.roblox.client` → **Vulkan swapchain present loop** (B8G8R8A8_SRGB, 800×600, 3 images) every time:
+  `EXIT=124` (clean 30–40 s timeout), zero `Fatal signal 11`, zero `corrupted double-linked list`, **the early-fault tap
+  never fires** (no engine SIGSEGV left to trace — the team's prior "validate the tap captures the engine fault"
+  START-HERE is now MOOT; the tap stays as a dated diagnostic floor). The earlier transient instability (1/3 SIGABRT
+  heap-corruption right after the merge) did not recur once the release binary was rebuilt from the merged tree + the
+  asset caches warmed; cold-start is also clean, so it was a first-run asset-unpack race, not a standing bug. **What the
+  engine reaches:** FLog crashpad init + `Roblox files folder`/`cache folder` + `AndroidGLView nativeInitClientSettings`
+  + `FlagCache Deferring … post TTI`, then it idles — because once `graphics::run_windowed` takes the main thread for
+  Eclipse's OWN clear-and-present loop (the recorded `view_registry` quads — white bg + blue UI rects, owner
+  screenshot-confirmed), the engine's `AndroidGLView` has **no host surface wired to it**, so Roblox's real GL UI never
+  reaches the screen. **NEXT FRONTIER (the big render-integration build):** hand Eclipse's window's `ANativeWindow` to
+  the engine's `AndroidGLView`/EGL path (the `__gl-test-anw` diagnostic already proves engine-GLES2-on-Eclipse's-window
+  works — integration test `gl_test_anw_binds_real_wsi_handle` is green; the boot just doesn't WIRE it yet). **Secondary
+  observations (not blocking the window):** ART logs `STRAWTOGRASP: GetFieldID(SocketImpl.delegate) returning NULL` (an
+  ART/libcore networking-internal miss, NOT an Eclipse gap — wolfSSL-backed okhttp sockets do connect/read); the benign
+  `framework-res.apk` dex2oat "no dex files" + `ClassLoaderContext`/duplicate-class warnings; Canvas `nDrawColor` draw
+  cascade still disabled (GskCanvas-backed, view quads + text still render). Gate: **516 unit + 4 integration + 2
+  doctests**, fmt/clippy `-D warnings`/release all 0-warning. Durability: overlay output is a cache artifact (rebuild via
+  `tools/framework-overlay/patch-framework.sh`; `eclipse run` needs `ECLIPSE_ANDROID_FRAMEWORK_DIR`). Detail: §6
+  (2026-06-12 engine-SIGSEGV-resolved).
 - **2026-06-12 — EARLY-FAULT TAP IMPLEMENTED (gate-green: 516 unit + 4 integration (self-skip path, displays unset)
   + 2 doctests = 522 passed, 0 failed; STILL UNCOMMITTED with the rest of the held signal-ABI work — owner hold on
   all post-2026-06-11-morning work). ⇐ START HERE NEXT SESSION (frontier = OWNER live validation on the dev-host
@@ -755,6 +782,24 @@ the pattern (its handler reads always-valid atomics and `_exit`s — no install-
 handler installer in `src/`. **Gate (re-run in full):** fmt --all / build --all-targets / clippy `-D warnings` /
 test (**516 unit + 4 integration (self-skip, displays/APK unset) + 2 doctests = 522 passed, 0 failed**) / release —
 all 0-warning/0-error. NOT committed (the Push-phase agent owns commit/push).
+- **2026-06-12 (engine-SIGSEGV-resolved — live owner validation on the dev-host main loop)** — ✅ The signal-ABI work
+  (committed: origin/main `1b56e99`) **resolved the engine's crashpad-era SIGSEGV**: it no longer reproduces. Validation:
+  6 consecutive `./target/release/eclipse run <APK>` boots (`ECLIPSE_ANDROID_FRAMEWORK_DIR=~/.cache/eclipse/
+  framework-patched`) — 5 warm (`/tmp/tap{1..5}.log`) + 1 COLD (`/tmp/cold1.log`, `~/.local/share/eclipse/app-data` +
+  `/tmp/atl_cache/com.roblox.client` wiped) — all `EXIT=124` (clean timeout), all drive lifecycle 1–7 → `ActivitySplash`
+  RESUMED → winit window → **Vulkan swapchain present loop**, with **zero** `Fatal signal 11`, **zero** `corrupted
+  double-linked list`, and the early-fault tap **never firing** (no engine SIGSEGV remains to trace → the team's prior
+  "capture the engine fault via the tap" START-HERE is retired; the tap stays as a dated diagnostic floor). A transient
+  1/3 SIGABRT heap-corruption seen immediately after the merge did NOT recur after rebuilding the release binary from
+  the merged tree + a warmed asset cache, and cold-start is clean too → it was a first-run asset-unpack race, not a
+  standing bug. The engine reaches `AndroidGLView nativeInitClientSettings` + `FlagCache … post TTI` then idles: once
+  `graphics::run_windowed` claims the main thread for Eclipse's own clear-and-present loop (recorded `view_registry`
+  quads), the engine's `AndroidGLView` has **no host surface wired to it**, so Roblox's real GL UI never reaches the
+  screen. **This reframes the §5 START-HERE to the render-integration build**: hand Eclipse's window `ANativeWindow` to
+  the engine's `AndroidGLView`/EGL (the `__gl-test-anw` diagnostic + green `gl_test_anw_binds_real_wsi_handle` already
+  prove engine-GLES2-on-Eclipse's-window works; the boot just doesn't WIRE it). Doc-only change (Living State §5 + this
+  entry); no code touched, gate unchanged (**516 unit + 4 integration + 2 doctests**, fmt/clippy `-D warnings`/release
+  all 0-warning). Committed + pushed (owner authorized git this session; identity Yoshi; no co-author).
 
 ---
 
