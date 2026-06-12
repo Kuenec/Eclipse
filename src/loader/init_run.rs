@@ -184,11 +184,16 @@ pub fn run_libroblox_init() -> Result<usize, InitRunError> {
         sym_stats.applied_nonnull, sym_stats.applied_weak_zero, sym_stats.unresolved_strong
     );
     if sym_stats.unresolved_strong != 0 {
+        // 2026-06-12: import count = the NAME count; `unresolved_strong` is the RELOC count (one
+        // symbol may back several relocs) — printed separately, same disambiguation as
+        // `EngineLoadError::UnresolvedImports`.
         let _ = writeln!(
             log,
-            "WARNING: {} unresolved-strong imports remain (work-list non-empty: {:?}); \
+            "WARNING: {} unresolved-strong import(s) remain ({} reloc(s); work-list: {:?}); \
              constructors may jump through null GOT slots",
-            sym_stats.unresolved_strong, sym_stats.unresolved
+            sym_stats.unresolved.len(),
+            sym_stats.unresolved_strong,
+            sym_stats.unresolved
         );
     }
 

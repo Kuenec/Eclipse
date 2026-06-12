@@ -341,6 +341,12 @@ libroblox's `start(arg)`; honors the bionic attr's detach-state + stack-size), `
 (`tgkill(getpid(),tid,sig)`), `pthread_getattr_np`, `pthread_get/setschedparam` (TID-based `sched_*`),
 and `pthread_attr_init/destroy/setdetachstate/setstacksize/setschedparam/getstack`. `pthread_sigmask`
 (sigset-only, no `pthread_t`) + `__cxa_thread_atexit_impl` stay on the host baseline (ABI-identical).
+*[2026-06-12: both halves of that last sentence were later DISPROVEN — `pthread_sigmask` moved to the
+bionic signal-ABI natives 2026-06-11 (8- vs 128-byte `sigset_t`), and `__cxa_thread_atexit_impl` is now
+an Eclipse pthread native (core 947663: the signature is identical but glibc runs the cxa finalizers
+only in `__call_tls_dtors`, AFTER Eclipse's key-destructor sweep — the inversion of bionic
+`pthread_exit.cpp`'s `__cxa_thread_finalize()` → `pthread_key_clean_all()` order, fatal at
+engine-thread exit; `PTHREAD_NATIVE_COUNT` is 53 with it + `pthread_atfork`).]*
 
 ### Two follow-on harness-teardown faults (also gdb-proven, fixed in `src/loader/init_run.rs`)
 With the worker no longer crashing, the init-array ran to **3427/3427**, exposing two **process-exit**

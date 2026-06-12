@@ -1852,6 +1852,10 @@ mod tests {
             );
         }
         // All 27 ndk-android names must be among the newly-resolved set (resolve to Eclipse).
+        // 2026-06-12: `ANativeWindow_getFormat` (the provider's 28th ndk native) is deliberately
+        // ABSENT here — it is NOT a libroblox import (libroblox's ANativeWindow set is exactly the
+        // 5 below); it exists for libsurface_util_jni.so, pinned by
+        // `real_boot_path_loadlibrary_libs_fully_resolve` + the provider presence/count test.
         for ndk in [
             "AAssetManager_fromJava",
             "AAssetManager_open",
@@ -2055,11 +2059,14 @@ mod tests {
         //
         // Boot-path loadLibrary libs (evidence: AGENTS.md §6): libbacktrace-native.so
         // (rbx.backtrace, every boot since the main-Looper pump) and libzstd-jni-*.so
-        // (androidx.startup during Application.onCreate; version-suffixed file name). The two
-        // known same-pattern pre-load failures (libimage_processing_util_jni.so: 5 NDK
-        // window/bitmap imports; librenderscript-toolkit.so: 3 bitmap imports) are deliberately
-        // NOT asserted — no System.loadLibrary of either is on the current boot path, and their
-        // natives (ANativeWindow CPU-buffer + jnigraphics surface) are recorded design work, not
+        // (androidx.startup during Application.onCreate; version-suffixed file name).
+        // 2026-06-12: libsurface_util_jni.so added — its boot pre-load failed on exactly 1 import
+        // (`ANativeWindow_getFormat`, owner live validation log line 98), now an Eclipse ndk
+        // native; this pins the lib fully resolving (1/1 closed). The two remaining same-pattern
+        // pre-load failures (libimage_processing_util_jni.so: 5 NDK window/bitmap imports;
+        // librenderscript-toolkit.so: 3 bitmap imports) are deliberately NOT asserted — no
+        // System.loadLibrary of either is on the current boot path, and their natives
+        // (ANativeWindow CPU-buffer + jnigraphics surface) are recorded design work, not
         // implemented yet. Extend this list when they land.
         use crate::loader::bionic_env::BionicEnv;
 
@@ -2072,7 +2079,11 @@ mod tests {
         let filenames = apk.native_lib_filenames("x86_64");
         let boot_path_libs: Vec<&String> = filenames
             .iter()
-            .filter(|f| *f == "libbacktrace-native.so" || f.starts_with("libzstd-jni"))
+            .filter(|f| {
+                *f == "libbacktrace-native.so"
+                    || *f == "libsurface_util_jni.so"
+                    || f.starts_with("libzstd-jni")
+            })
             .collect();
         assert!(
             boot_path_libs
@@ -2122,15 +2133,25 @@ mod tests {
             );
             // Names the BOOT process resolves through its RTLD_GLOBAL surface but cargo test
             // cannot: libart.so is dlopen'd RTLD_GLOBAL at boot (runtime.rs), putting its NEEDED
-            // libz in the default scope (the 8 zlib names), and an ART-side lib exports
-            // `pthread_atfork` (host glibc's is a compat-versioned `@GLIBC_2.2.5` symbol dlsym
-            // cannot see). Deliberately NOT reconstructed here — dlopen'ing libz RTLD_GLOBAL in a
-            // test would leak zlib names into RTLD_DEFAULT for the sibling work-list-count tests.
-            // The pin therefore asserts the unresolved set is CONFINED to this documented
-            // boot-resolvable set: any other name (the __android_log_vprint/__umask_chk class)
-            // is one the boot also cannot resolve → its System.loadLibrary re-opens the apkenv
-            // delegation. Fails closed: a new boot-global-resolvable name added by a future APK
-            // shows up here and must be triaged deliberately.
+            // libz in the default scope (the 8 zlib names). Deliberately NOT reconstructed here —
+            // dlopen'ing libz RTLD_GLOBAL in a test would leak zlib names into RTLD_DEFAULT for
+            // the sibling work-list-count tests. The pin therefore asserts the unresolved set is
+            // CONFINED to this documented boot-resolvable set: any other name (the
+            // __android_log_vprint/__umask_chk class) is one the boot also cannot resolve → its
+            // System.loadLibrary re-opens the apkenv delegation. Fails closed: a new
+            // boot-global-resolvable name added by a future APK shows up here and must be triaged
+            // deliberately.
+            // 2026-06-12: `pthread_atfork` REMOVED from this set — the prior claim "an ART-side
+            // lib exports pthread_atfork" was DISPROVEN by the owner's live validation
+            // (/tmp/eclipse-866509-validate.log line 60: the libbacktrace-native pre-load still
+            // failed, unresolved went 2→1 naming exactly `pthread_atfork`) and by an nm scan of
+            // every boot-mapped lib (none defines it; host glibc exports it only as a
+            // compat-versioned WEAK `@GLIBC_2.2.5` symbol dlsym cannot see — new links get it from
+            // `libc_nonshared.a`, never any dlsym surface). The old cross-boot reloc arithmetic
+            // had attributed liblog.so's RTLD_GLOBAL `__android_log_vprint` resolution to this
+            // name. It is now an Eclipse pthread native (`eclipse_pthread_atfork` → the link-time
+            // `libc::pthread_atfork`), so keeping it here would green-light the exact fall-through
+            // class this test exists to pin.
             let boot_global_resolvable = [
                 "deflate",
                 "deflateEnd",
@@ -2140,7 +2161,6 @@ mod tests {
                 "inflateEnd",
                 "inflateInit_",
                 "zError",
-                "pthread_atfork",
             ];
             let leaked: Vec<&String> = stats
                 .unresolved

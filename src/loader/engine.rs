@@ -197,8 +197,10 @@ pub enum EngineLoadError {
     /// The map / relocate / resolve pipeline failed (a real loader error).
     Link(String),
     /// One or more strong (non-weak) imports stayed unresolved — running constructors would jump
-    /// through a null GOT slot. Carries the unresolved-reloc count AND the sorted, de-duped symbol
-    /// names (the work-list must be 0 for a sound run).
+    /// through a null GOT slot. Carries the unresolved-RELOC count AND the sorted, de-duped symbol
+    /// names (the work-list must be 0 for a sound run). The Display prints BOTH counts
+    /// disambiguated — `{names} strong import(s) unresolved ({relocs} reloc(s))` — since one
+    /// symbol may back several relocs (2026-06-12).
     ///
     /// 2026-06-12: the names are load-bearing diagnostics — the pre-load warning printed only a
     /// COUNT, so the 2 imports that failed `libbacktrace-native.so`'s pre-load (sending its
@@ -225,9 +227,15 @@ impl std::fmt::Display for EngineLoadError {
             Self::Stage(e) => write!(f, "stage libroblox.so: {e}"),
             Self::Link(e) => write!(f, "map/relocate/resolve libroblox.so: {e}"),
             Self::UnresolvedImports(n, names) => {
+                // 2026-06-12: the import COUNT is `names.len()`; `n` is the unresolved RELOC count
+                // (one symbol may back several relocs). The old wording printed the reloc count as
+                // "import(s)", re-creating the exact count/name triage ambiguity the named output
+                // exists to remove (live log line 60: "1 strong import(s)" for 1 name was only
+                // coincidentally aligned).
                 write!(
                     f,
-                    "{n} strong import(s) unresolved (work-list non-empty): {}",
+                    "{} strong import(s) unresolved ({n} reloc(s)): {}",
+                    names.len(),
                     names.join(", ")
                 )
             }
@@ -748,9 +756,12 @@ mod tests {
         // work-list (__android_log_vprint + __umask_chk, the failed libbacktrace-native.so
         // pre-load that re-opened the apkenv delegation) had to be reconstructed by offline
         // readelf set-arithmetic. The Display output must NAME every unresolved import so the next
-        // fall-through is identified from the boot log itself.
+        // fall-through is identified from the boot log itself — AND it must disambiguate the
+        // import count (names) from the reloc count (one symbol may back several relocs): the old
+        // wording printed the reloc count as "import(s)", re-creating the triage ambiguity. The
+        // fixture deliberately uses 3 relocs over 2 names so a conflation cannot pass.
         let e = EngineLoadError::UnresolvedImports(
-            2,
+            3,
             vec![
                 "__android_log_vprint".to_string(),
                 "__umask_chk".to_string(),
@@ -758,8 +769,8 @@ mod tests {
         );
         let msg = e.to_string();
         assert!(
-            msg.contains("2 strong import(s) unresolved"),
-            "keeps the count: {msg}"
+            msg.contains("2 strong import(s) unresolved (3 reloc(s))"),
+            "import count = the NAME count, reloc count separate + labelled: {msg}"
         );
         assert!(
             msg.contains("__android_log_vprint") && msg.contains("__umask_chk"),

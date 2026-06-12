@@ -128,16 +128,55 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-12 — ✅ CORE 947663 ROOT-CAUSED + FIXED (the engine-thread-exit MIMALLOC fault — Yoshi's open question
+  ANSWERED): Eclipse INVERTED bionic's thread-exit destructor order.** `thread_trampoline`/`eclipse_pthread_exit`
+  ran the pthread-KEY destructors while `__cxa_thread_atexit_impl` stayed on host glibc (cxa finalizers only later,
+  in `__call_tls_dtors`) — public AOSP bionic `pthread_exit.cpp` runs `__cxa_thread_finalize()` FIRST, then
+  `pthread_key_clean_all()`. Under Eclipse the engine's key dtors mi_free'd + abandoned the dying thread's 128-slot
+  TLS-registry block (key1 = `_mi_thread_done`, disasm-matched to public mimalloc), a newborn sibling RECLAIMED and
+  re-stamped it, THEN the late cxa finalizer walked the stale obj → `movq $0x0,0x58(%r12)` through NULL+0x58 (the
+  deterministic `libroblox+0x2779cc4` MAPERR addr=0x58). The per-thread body was NEVER half-initialized — it was
+  freed-then-reclaimed before its finalizer ran (hypothesis (b) ordering WON; (a) lazy-init and (c) TSD corruption
+  disproven by core 947663). FIX: Eclipse-owned `__cxa_thread_atexit_impl` (per-thread LIFO, re-entrancy-safe
+  drain) run BEFORE the key sweep on BOTH exit paths; the forced-unwind path typed `extern "C-unwind"` (glibc
+  `pthread_exit` unwinds — nounwind Rust frames aborted; pinned against the installed rustc 1.96.0 std
+  personality). ALSO FIXED: `pthread_atfork` — the 2ceca8a "pre-load resolves clean / apkenv never entered" claim
+  was FALSIFIED by this validation (log line 60: unresolved 2→1, naming exactly `pthread_atfork`; nothing
+  boot-mapped defines it) — now a native forwarding to link-time `libc::pthread_atfork`, AND the masking link.rs
+  allowlist entry REMOVED so the boot-path pin fails closed; and `ANativeWindow_getFormat` (libsurface_util_jni
+  pre-loads 1/1). Counts: pthread 51→53, ndk 27→28, provider 122 base / 180 total. **⇐ START HERE NEXT SESSION
+  (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: the libbacktrace-native pre-load
+  WARNING GONE (`unresolved_strong=0`) + `Runtime.nativeLoad: already pre-loaded` for backtrace-native (the apkenv
+  delegation closed for the last boot-path lib); libsurface_util_jni pre-loading clean; NO early-fault tap capture
+  at `libroblox+0x2779cc4` / MAPERR addr=0x58 — if the mimalloc fix holds, the engine's burst-created pool threads
+  exit cleanly and the boot survives past the Vulkan swapchain to the next wall — then the render-integration
+  build: wire the window's `ANativeWindow` into the engine's `AndroidGLView`/EGL path. KEEP core 947663 + the
+  scratch copy at `~/.cache/eclipse-forensics/core947663` until that boot: same rip + a foreign live-sibling TID
+  stamp in the faulted obj again = a second reuse path; an all-zero obj with NO foreign TID = the purge/decommit
+  variant — capture the new core before touching code.)** Remaining pre-load surfaces after that (dormant today):
+  libimage_processing_util_jni (5) + librenderscript-toolkit (3) → one shared pin-or-copy AndroidBitmap/
+  ANativeWindow-CPU-buffer design (8 imports, recorded design work); libtrampoline is NOT JNI-loadable (dynsym
+  all-UND — triage-only). Open items recorded, not coded: D2 (key dtors never run on non-Eclipse-created threads),
+  D4 (engine-side forced-unwind exposure — the ordering half IS fixed), the cross-allocator vasprintf/realpath +
+  mallinfo-shape hazard notes (`bionic_env.rs`). Gate: **527 unit + 4 integration + 2 doctests = 533 passed, 0
+  failed**, fmt/clippy `-D warnings`/release all 0-warning. Detail: §6 (2026-06-12 core-947663 entry).
 - **2026-06-12 — ✅ CORE 866509 ROOT-CAUSED + FIXED (the first-ever-swapchain boot's death, owner live validation of
   the `__sF` fix): (1) `libbacktrace-native.so`'s Eclipse pre-load failed on exactly 2 missing natives
   (`__android_log_vprint` + `__umask_chk`), so its `System.loadLibrary` DELEGATED into the apkenv shim linker, which
   died writing through its never-initialized `_r_debug_ptr` (SIGSEGV, fault addr 0x18, rip in `libdl_bio.so.0.0.1` —
   NOT libroblox/ART) — both natives now provided (liblog C-shim + Rust FORTIFY umask; provider 121 base / 177 total),
-  the pre-load resolves clean and the apkenv delegation is never entered; (2) the fatal-signal handler chain
+  the pre-load resolves clean and the apkenv delegation is never entered [CORRECTED 2026-06-12 — live validation
+  FALSIFIED this clause: unresolved went 2→1, `pthread_atfork` remained (nothing boot-mapped defines it; glibc's is a
+  compat-versioned WEAK `@GLIBC_2.2.5` dlsym cannot see) — now an Eclipse pthread native and the masking link.rs
+  allowlist entry removed; see the core-947663 entry above]; (2) the fatal-signal handler chain
   (~79.2 KiB measured) overflowed ART's heap-backed, guard-less 32 KiB main-thread altstack, zero-filling live heap
   (the `malloc(): unaligned tcache chunk detected` SIGABRT that destroyed the crash report mid-backtrace) — the main
   thread now gets an Eclipse-owned guard-paged 256 KiB mmap'd altstack right after `JNI_CreateJavaVM`
-  (`install_guarded_altstack`, wired in `runtime::boot`). ⇐ START HERE NEXT SESSION (= OWNER live validation of
+  (`install_guarded_altstack`, wired in `runtime::boot`). [START-HERE marker moved 2026-06-12 to the core-947663
+  entry above — this owner live validation HAPPENED: `/tmp/eclipse-866509-validate.log`, EXIT=139 → core 947663;
+  the altstack + named-warning fixes run-proven, but the libbacktrace-native WARNING did NOT clear (2→1:
+  `pthread_atfork`)] (the plan was = OWNER live validation of
   these fixes on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
   `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: the
   `pre-load of libbacktrace-native.so failed` WARNING GONE; the new boot line `main-thread alternate signal stack:
@@ -1189,6 +1228,185 @@ dependent — `No symbolication ID provided` printed immediately before today's 
 `eclipse_umask_chk`'s abort-on-invalid-mode branch is pinned by presence, not exercised (process-fatal by
 contract); (f) the one-time displaced 32 KiB ART main-thread altstack buffer leak is by design and documented at
 the wiring site.
+
+---
+
+### 2026-06-12 — Core 947663 root-caused: Eclipse inverted bionic's thread-exit destructor order — the engine's mimalloc key-dtors freed+abandoned the per-thread registry block and a sibling RECLAIMED it before the late cxa finalizer walked it (FIXED: Eclipse-owned `__cxa_thread_atexit_impl`, cxa-before-keys on both exit paths); + `pthread_atfork` provided and the masking allowlist entry removed (corrects this log's prior "resolves clean" claim); + `ANativeWindow_getFormat`
+
+**Context (owner live validation of `2ceca8a`, `/tmp/eclipse-866509-validate.log`, EXIT=139 → fresh core 947663,
+118.6 M):** the 866509 fixes are LIVE-PROVEN — the guard-paged altstack banner printed (log line 34: `main-thread
+alternate signal stack: Eclipse guard-paged 256 KiB @ 0x7f6e4e7c0000`), there was NO malloc-corruption abort (the
+complete deep libunwind/ART dump chain finished intact — the fix held under a real fatal fault), and the
+named-imports WARNING run-proved itself (line 60). The boot reached the Vulkan swapchain (line 550), then ~0.17 s
+later the early-fault tap made its FIRST REAL CAPTURE (line 613): `*** ECLIPSE EARLY-FAULT TAP: signal 11 code 1
+(MAPERR) addr=0x58 ***` — thread 947876 "Main" (ART-named), rip=`0x7f6e000b5cc4` = libroblox+`0x2779cc4` (base
+`0x7f6dfd93c000`), rax=0 r12=0 — byte-identical to core 947663's frame-17 sigframe and to Yoshi's earlier capture
+at a different base. Forensics on Eclipse's own core via the established-safe `coredumpctl`/`gdb -batch` method,
+matched against PUBLIC mimalloc sources (minimal call-site disassembly only).
+
+**Mechanism 1 — CONFIRMED Eclipse-side (hypothesis (b) destructor ORDERING; boot-blocking; FIXED). Yoshi's open
+question — "why is the per-thread body zero at exit?" — is ANSWERED: it was never half-initialized; it was
+freed-then-reclaimed before its finalizer ran.** Chain: Eclipse's `thread_trampoline` and `eclipse_pthread_exit`
+ran `run_thread_key_destructors()` BEFORE glibc `start_thread`'s `__call_tls_dtors`, while
+`__cxa_thread_atexit_impl` was deliberately left on host glibc (the "stays on the host baseline (ABI-identical)"
+comment — true of the SIGNATURE, false of the ORDERING semantics) — public AOSP bionic `pthread_exit.cpp` runs
+`__cxa_thread_finalize()` FIRST, then `pthread_key_clean_all()`; Eclipse ran the two destructor classes in the
+inverted order, and stock mimalloc's thread-exit hook IS a pthread-key dtor (public `src/init.c`). Under Eclipse:
+key0's dtor (libroblox+`0x2c18fb0`, a deferred-free cache) mi_frees the dying thread's Roblox 128-slot
+TLS-registry block and key1's dtor (libroblox+`0x232813f` = `_mi_thread_done`, disasm-matched field-for-field to
+public microsoft/mimalloc `init.c`, v3 with reclaim ON) abandons the thread's pages; mimalloc page reclaim hands
+the freed block to newborn sibling LWP 947882, which zeroes it, stamps its TID at obj+0x14, and parks
+mid-registration on the registry per-CPU futex (`0x7f6e42dc660c`, the recycled page base on its stack ×3); THEN
+glibc `__call_tls_dtors` runs the engine's cxa finalizer (libroblox+`0x2779bb0`, registered exactly once, list
+intact) on the stale obj: `[obj+0x408]`=NULL → `movq $0x0,0x58(%r12)` = write through NULL+0x58 → SIGSEGV. Key
+core evidence: faulted obj `0x7f6dc1df00a0` is all-zero EXCEPT live sibling 947882's TID at +0x14; healthy parked
+sibling 947875 shows the initialized shape (node+0x58 → obj back-pointer) AND its key0 deferred-free item[4] IS
+its own registry obj — wiring the free to the key sweep; the crashed thread's TLS_VALUES slots are all-zero (both
+key dtors ran before `__call_tls_dtors`). Alternatives disproven: (a) failed-lazy-init — the healthy sibling shape
++ the foreign TID stamp prove reuse, not non-init; (c) TSD corruption — TLS generations coherent, no key reuse,
+the `__cxa` registration exists exactly once in the intact `tls_dtor_list` (mangled pointer demangles to
+`0x7f6e000b5bb0`; 28 sibling registrations process-wide; zero direct call sites to the finalizer in the whole text
+image); `gettid`/`sched_getcpu` natives verified correct; libroblox still has no PT_TLS (static-TLS stays ruled
+out). Roblox's exit design is VALID under bionic's contract — Eclipse broke the contract. **Fix:** Eclipse-owned
+`eclipse_cxa_thread_atexit_impl` in `bionic_pthread.rs` — per-thread LIFO `CXA_THREAD_DTORS` (RefCell<Vec>),
+loop-drain re-entrancy-safe (pop releases the borrow before each call; a dtor may legally register more),
+`dso_handle` accepted+ignored (engine libs are never unloaded, dated), `try_with` teardown-safe registration with
+a documented fallback (forward to host glibc's `__cxa_thread_atexit_impl` via dlsym; bounded leak if even that is
+absent) — and `run_cxa_thread_dtors()` drains it BEFORE `run_thread_key_destructors()` in BOTH
+`thread_trampoline` (return-from-start) and `eclipse_pthread_exit`, restoring bionic's order on both exit modes.
+Non-Eclipse-created threads drain via `CxaThreadDtorList::Drop` in glibc's `__call_tls_dtors` phase — today's
+glibc semantics preserved where Eclipse does not own the thread (dated comment). The disproven "ABI-identical"
+claims rewritten with the dated core-947663 finding (PTHREAD_NATIVE_COUNT doc; `docs/libroblox-init-run.md` §8
+dated bracket). **Necessary intersect discovered by the new pthread_exit-path pin aborting (then verified against
+the installed rustc 1.96.0 std personality source — an IP missing from the LSDA call-site table yields
+`EHAction::Terminate` even under `_UA_FORCE_UNWIND`):** glibc `pthread_exit` force-unwinds, and Eclipse's frames
+were nounwind `extern "C"` — the three Eclipse crossing points (`eclipse_pthread_exit` + its host transmute,
+`SpawnArgs::start` + the widening transmute, `thread_trampoline` + the narrowing transmute) are now
+`extern "C-unwind"` (machine-ABI identical to "C"), and the trampoline early-drops its `Box<SpawnArgs>` before
+`start()` so the frame is a plain-old-frame (RFC 2945). This is the load-bearing ORDERING half of D4; the
+engine-side unwind exposure remains a recorded open item.
+
+**Mechanism 2 — CONFIRMED + the post-hoc BLOCKING finding (FIXED both): the `pthread_atfork` provider gap kept
+libbacktrace-native's pre-load failing — and the 2ceca8a regression guard ALLOWLISTED the failure.** Run-proven:
+log line 59–60 verbatim — `applied_nonnull=11302 weak_zero=0 unresolved_strong=1` + `WARNING: pre-load of
+libbacktrace-native.so failed (continuing): 1 strong import(s) unresolved (work-list non-empty): pthread_atfork` —
+unresolved went 2→1, NOT 2→0. **This CORRECTS the core-866509 entries above (append-only): the claim "the pre-load
+resolves clean and the apkenv delegation is never entered" is FALSIFIED, and the reloc cross-check arithmetic
+(boot 11301+2 vs test 11294+9, total 11303 in both) actually proves the old boot's real unresolved set was
+`{__umask_chk, pthread_atfork}` — `__android_log_vprint` was resolved by `/usr/lib/art/liblog.so`'s RTLD_GLOBAL
+export, which the offline set-arithmetic did not model.** Root cause of the residual: glibc exports
+`pthread_atfork` only as a compat-versioned WEAK symbol `@GLIBC_2.2.5` (no default version — `dlsym(RTLD_DEFAULT)`
+fails, empirically proven), NO boot-mapped lib defines it (nm scan over all 79 old-core libs — the link.rs comment
+"an ART-side lib exports pthread_atfork" is DISPROVEN), and new links get it from `libc_nonshared.a` (a
+binary-LOCAL `W pthread_atfork` wrapper → `U __register_atfork@@GLIBC_2.3.2` — never in any dlsym surface). Worse,
+the guard built to pin this class allow-listed the exact name (`boot_global_resolvable` in
+`real_boot_path_loadlibrary_libs_fully_resolve`), green-lighting the failure. This boot the delegation provably
+never ran — three independent proofs: zero `is not a prelinked library` warnings (the old log had them right after
+the SAME `b.<init>` line), no `Runtime.nativeLoad` for backtrace-native, and core 947663's NT_FILE has zero
+file-backed native-libs mappings (vs core 866509's apkenv fingerprint) — most consistent reading:
+`System.loadLibrary` lost the ~ms race to mechanism 1. But `libdl_bio.so.0.0.1` is resident every boot (5 segments
+in core 947663) and rbx.backtrace's loadLibrary IS on the boot path, so with mechanism 1 fixed this was the next
+fatal (the core-866509 NULL-`_r_debug_ptr` precedent). **Fix:** `eclipse_pthread_atfork` in `bionic_pthread.rs`
+forwarding to the link-time `libc::pthread_atfork` (probe-verified on this host: a libc-0.2.186 program compiles,
+links, and runs — the PRELOAD-forensics premise "libc 0.2.186 lacks it" is disproven; portable to musl hosts
+unlike a glibc-internal `__register_atfork` extern). Bionic-contract signature (3 × `Option<unsafe extern "C"
+fn()>`, NULL handlers allowed); NO Eclipse-side handler list — the in-process fork IS glibc's, so glibc's own
+atfork list runs the handlers at exactly the right points. AND `pthread_atfork` REMOVED from the allowlist (now
+exactly the 8 zlib names, re-verified sound: resolved at boot via libart's RTLD_GLOBAL NEEDED libz) + the
+disproven comment rewritten — the boot-path test is now the fail-closed pin.
+
+**Mechanism 3 — the residual pre-load inventory (run-proven, all four DORMANT this boot — no later loadLibrary/
+class references in the log) + the post-hoc 2ceca8a review outcome.** [1] `libimage_processing_util_jni.so` — 5
+unresolved (`ANativeWindow_lock`/`setBuffersGeometry`/`unlockAndPost` + `AndroidBitmap_lockPixels`/
+`unlockPixels`, line 88); [2] `librenderscript-toolkit.so` — 3 unresolved (`AndroidBitmap_getInfo`/`lockPixels`/
+`unlockPixels`, line 93): one shared pin-or-copy AndroidBitmap/ANativeWindow-CPU-buffer design covers 8 of the 10
+outstanding imports (`lockPixels` must yield a stable pixel pointer until `unlockPixels`; no bitmap registry
+exists in `src/framework/`) — recorded-only design work per the no-fall-through-stubs policy, blocked on the
+render-integration build. [3] `libsurface_util_jni.so` — 1 unresolved (`ANativeWindow_getFormat`, line 98): FIXED
+NOW — `eclipse_anativewindow_getformat` in `native_provider.rs`, the exact sibling of getWidth/getHeight (WSI map
+first → `WINDOW_FORMAT_RGBA_8888`, then the `ndk_registry::native_windows()` slab `.format`, −1 for stale/
+fabricated handles per the NDK negative-error contract), registered (ndk 27→28) and `libsurface_util_jni.so`
+added to the boot-path pin's staged lib list (run-proven in-test: `applied_nonnull=9, unresolved_strong=0` — 1/1
+closed). Deliberate deviation from the verdict's letter, recorded: getFormat is NOT added to the libroblox
+27-name ndk pin loop — it is NOT a libroblox import (the assertion would be false); the genuine pins are the
+boot-path lib test + the provider presence/count test (the standing "extend the link.rs pin's lib list when they
+land" intent). [4] `libtrampoline.so` — 1 unresolved (`__libc_init`, line 103): NOT a JNI lib (dynsym = 8 entries
+ALL UND — zero exports, no `JNI_OnLoad`/`Java_*`) — an exec-style stub a Java `loadLibrary` can never serve; a
+`__libc_init` native would be a fall-through stub for an exec-only code path — triage-only. **Post-hoc 2ceca8a
+review (the lost lenses now covered): verdict FAIL — 1 blocking + 2 minor, ALL repaired in this pass.** Blocking =
+the allowlist masking (mechanism 2 above). Minor (a): `EngineLoadError::UnresolvedImports` Display printed the
+RELOC count as "import(s)" (a 1-symbol/2-reloc gap would print `2 strong import(s) unresolved: __foo` — the exact
+triage ambiguity 2ceca8a existed to remove) → now `{names.len()} strong import(s) unresolved ({n} reloc(s)):
+{names}`, wording pinned by `unresolved_imports_error_names_the_symbols` with a deliberately mismatched
+3-relocs/2-names fixture; the same-pattern sweep found ONE more instance — `init_run.rs`'s diagnostic-harness
+warning — fixed identically. Minor (b): `umask_chk_forwards_a_valid_mode_and_round_trips` gained the dated
+invariant comment (sole umask(2) toucher in the test binary; grep before adding another — a second toucher
+introduces a flake). Review notes verified-CLEAN (no action needed): "ART never re-attaches main" TRUE on every
+current path (zero `DetachCurrentThread`/`DestroyJavaVM` sites; `Vm` has no Drop); provider-count math;
+UnresolvedImports plumbing (sole construction → Display → boot log); BTreeSet sortedness; the
+`__android_log_vprint` va_list C/Rust boundary; all policy items (dated comments/SAFETY/surgical diff). Optional
+extras deliberately SKIPPED (surgical-changes policy): the `__umask_chk` abort-branch FATAL liblog line; the
+`jni_register.rs` scoped-attach cross-reference comments.
+
+**Same-pattern audits:** (thread-local `.with`-aborts-under-`panic=abort` class — the fixed tracing-subscriber BUF
+precedent) `TLS_VALUES` had 3 sites, all converted to `try_with` with defined dated fallbacks (getspecific → NULL,
+setspecific → EINVAL, key-sweep → return); the new `CXA_THREAD_DTORS` uses `try_with` by construction;
+`framework.rs`'s main-thread guard already did; no other engine-reachable `thread_local!` `.with` in the loader.
+(destructor-order class) the only two thread-exit paths Eclipse owns both drain cxa-before-keys now; non-Eclipse
+threads documented (D2/Drop comments). (disproven-premise-allowlist class) the remaining 8 zlib names re-verified
+sound; no other name remains. (single-import pre-load class) the four dormant libs triaged above.
+(reloc-count-labelled-as-imports class) grep over unresolved-printing sites found exactly ONE more instance
+(`init_run.rs:189`) — fixed; `link.rs`'s test eprintln prints explicitly-labelled stats fields (not the pattern);
+`main.rs` prints the fixed Display. (stale-comment sweep for the disproven claims) PTHREAD_NATIVE_COUNT doc +
+link.rs `:2123` comment rewritten, `docs/libroblox-init-run.md` §8 dated bracket added; `bionic_env.rs`'s
+CxaRuntime classification already said "baseline only" — left untouched.
+
+**Regression pins (existing style — no new files, no scripts):** `bionic_pthread::tests` —
+`cxa_dtors_run_before_key_dtors_and_lifo_on_return_from_start` + `cxa_dtors_run_before_key_dtors_on_pthread_exit_path`
+(NEW — a real thread through `eclipse_pthread_create`, one key dtor + cxa dtors registered through the Eclipse
+natives; pin cxa-before-key on BOTH exit paths, LIFO within the cxa list, loop-drain of a mid-drain
+re-registration, null-func rejection, and the join retval round-trip; BOTH verified to FAIL under the pre-fix
+inverted drain order — `got last-cxa=4 KEY=1` / `got CXA=2 KEY=1` — and the exit-path test exercises the real
+glibc forced unwind through the now C-unwind-typed frames), `pthread_atfork_registers_handlers_including_null`
+(NEW — pins the link-time `libc::pthread_atfork` binding without forking), the word-count test auto-tracking
+PTHREAD_NATIVE_COUNT 51→53; `link::tests` — `real_boot_path_loadlibrary_libs_fully_resolve` (UPDATED — THE
+mechanism-2 pin: `pthread_atfork` removed from the allowlist = fails closed on any future fall-through;
+`libsurface_util_jni.so` staged; ran LIVE against the real APK this session: libbacktrace-native unresolved =
+exactly the 8 zlib names, libsurface_util_jni 0, libzstd-jni 0); `native_provider::tests` — presence/count
+updated (180 total = 122 base + 53 pthread + 5 sysconf; the three new names present), the two ANativeWindow tests
+extended (slab-default format / stale → −1 / registered-WSI → RGBA_8888); `engine::tests` —
+`unresolved_imports_error_names_the_symbols` (UPDATED — the wording pin).
+
+**Gate (run on this exact tree; genuine rebuilds forced via `cargo clean -p eclipse` / `--release` per gate
+precedent; logs `/tmp/eclipse-gate-{build,clippy,test,release}.log`):** fmt --all (+ `--check`) / build
+--all-targets / clippy `-D warnings` / test / release — **527 unit + 4 integration + 2 doctests = 533 passed, 0
+failed**, 0 SKIP (all 4 milestone tests ran their live milestone subprocesses against the default APK + displays —
+this host's documented norm; none boots ART), all 0-warning. No live ART/bionic boot was run in the workflow
+(dev-host boundary respected); the live validation expectations are the §5 START-HERE.
+
+**Carried non-blocking notes (recorded, not acted on):** (a) the link.rs boot-path-test comment says "the two
+remaining same-pattern pre-load failures" — UNDERCOUNT: the validation log named a third, `libtrampoline`
+(`__libc_init`); its disposition is recorded HERE (not-JNI-loadable, triage-only) — name it in that sentence when
+next touching the file. (b) Narrow bionic divergence: a cxa dtor registered DURING the key sweep on an
+Eclipse-created thread runs LATE via the Drop drain (bionic LEAKS such a registration) — triage any future fault
+in that window against this; matching bionic exactly needs a post-finalize flag, only with evidence. (c) Failure
+ergonomics of the two ordering pins: a failing assert inside the spawned start fns presents as a SIGABRT of the
+test process (panic through the C-unwind trampoline into glibc — "failed to initiate panic"), not a clean failed
+assertion; the static ticket atomics in the core identify which assertion tripped. (d) `docs/bionic-env-worklist.md`
+staleness: the cxa-runtime row ("baseline; glibc atexit semantics") and the dated scope note ("grown 2 natives …
+121 base / 177 total") now lag — correct to the Eclipse-tier `__cxa_thread_atexit_impl` + 122 base / 180 total /
+5 beyond-work-list natives on next touch (dated-bracket style). (e) Pre-existing: the `register_natives` section
+header says "rwlock (6)" but registers 5 (the 53 arithmetic is right) — fix the header on next touch. (f)
+Non-Eclipse-thread interleaving: batching engine cxa dtors into one Drop entry changes the global LIFO
+interleaving vs other same-thread registrants (engine-internal LIFO preserved) — a candidate for any future
+ART-attached-thread teardown fault, alongside D2. (g) The dtor call sites in both sweeps are plain `extern "C"`
+(nounwind) — a dtor-initiated `pthread_exit` would terminate there (pathological under bionic too); decide at D4
+design time. (h) The foreign-thread Drop-drain path has no pin (the two new tests cover the Eclipse exit paths);
+a cheap deterministic pin exists if it ever matters (`std::thread::spawn` + register via the native + join +
+assert-ran). (i) Recorded-only hazard notes now live in code: `bionic_env.rs` — the cross-allocator class
+(vasprintf/realpath(..,NULL)/strdup-family return glibc-heap blocks; consistent today, must move TOGETHER with any
+future Eclipse malloc/free displacement) and the bionic-mallinfo 80 B vs glibc 40 B shape note; D2 + D4 dated
+open-item comments sit at the sweep/exit sites in `bionic_pthread.rs`.
 
 ---
 
