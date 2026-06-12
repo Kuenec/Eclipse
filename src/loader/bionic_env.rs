@@ -467,6 +467,16 @@ pub fn categorize_imports(relas: &[Rela], dynsyms: &[DynSym], scope: &Scope) -> 
 /// The host tiers prove the relocation pipeline and are **not** bionic-ABI-correct; the prepended
 /// Eclipse tier (1) is where bionic-correct natives displace the glibc baseline. Build with
 /// [`BionicEnv::with_host_baseline`] and read [`BionicEnv::into_scope`].
+///
+/// 2026-06-12 — recorded-only host-baseline hazards (no code; flagged during the core-947663
+/// destructor-order forensics; each needs its own evidence before a fix): (a) the cross-allocator
+/// class — host-baseline natives that RETURN malloc'd memory the caller must free (`vasprintf`,
+/// `realpath(.., NULL)`, `strdup`-family) hand out glibc-heap blocks; the engine's `free` also
+/// resolves to host glibc today so the pair is consistent, but any future Eclipse-owned
+/// `malloc`/`free` displacement must move these in the SAME change or frees cross allocators;
+/// (b) the struct-shape class — bionic `mallinfo` returns the `size_t`-field struct (80 B on LP64)
+/// vs glibc's `int`-field one (40 B): a host fall-through under-fills the caller's 80-byte buffer
+/// (the `__sF`/`__fread_chk` shape-mismatch class; no engine import proven to call it yet).
 pub struct BionicEnv {
     scope: Scope,
     /// Host GL sonames that could NOT be `dlopen`ed (recorded so EGL/GLES are reported unresolved).

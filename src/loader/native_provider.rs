@@ -47,9 +47,11 @@
 //! that cross the C ABI (raw-pointer args, forwarding to glibc), each with a dated `// SAFETY:` note.
 //! [`super::reloc`]/[`super::elf`]/[`super::resolve`] stay `#![forbid(unsafe_code)]`.
 //!
-//! ## ndk-android (libandroid) tier — the 27 NDK natives (added 2026-06-05)
+//! ## ndk-android (libandroid) tier — the 28 NDK natives (added 2026-06-05)
 //! The second Eclipse-native category: the 27 `libandroid` C-ABI imports from
-//! `docs/bionic-env-worklist.md`. Each is labelled at its definition:
+//! `docs/bionic-env-worklist.md` (libroblox's own set), plus `ANativeWindow_getFormat`
+//! (2026-06-12 — `libsurface_util_jni.so`'s sole unresolved pre-load import). Each is labelled at
+//! its definition:
 //! - **AAsset / AAssetManager (6) — real:** route to Eclipse's own [`crate::apk`] reader.
 //!   `AAssetManager_open` reads the named `assets/<name>` zip entry's real bytes; `AAsset_getBuffer`
 //!   /`AAsset_getLength` hand them back; `AAsset_close` frees the owned-handle slot. Handles are
@@ -60,7 +62,7 @@
 //! - **ALooper (7) — minimal-correct:** a small Eclipse per-thread looper (an fd registry); `pollOnce`
 //!   returns the documented `ALOOPER_POLL_*` sentinel a caller must handle (NOT a fake-success
 //!   landmine).
-//! - **ANativeWindow (5) — sound-stub:** the getters return the real window geometry; the
+//! - **ANativeWindow (6) — sound-stub:** the getters return the real window geometry/format; the
 //!   surface/buffer bits whose real behavior is the upcoming GLES2/EGL render integration return
 //!   documented sound sentinels (valid-but-empty handle / negative error per the NDK contract) so
 //!   resolution + early init proceed WITHOUT pretending a frame was presented. Deferred-to-render.
@@ -150,7 +152,7 @@ impl EclipseNativeProvider {
 
     /// Build the provider with the **fixed-arity liblog (3)** + **bionic-specific libc (16)** +
     /// **bionic stdio FILE\* translation (25)** + **bionic signal-ABI (6)** + **ndk-android
-    /// libandroid (27)** natives this module implements registered. Taking each native's address is
+    /// libandroid (28)** natives this module implements registered. Taking each native's address is
     /// safe Rust (a function/data item coerced to a pointer then to `u64`).
     ///
     /// The names are the real work-list from `loader::link::tests::real_libroblox_bionic_env_*`
@@ -161,11 +163,11 @@ impl EclipseNativeProvider {
     /// 2026-06-12, the other libbacktrace-native unresolved import); the stdio FILE\* translation 25
     /// (2026-06-12 — bionic `&__sF[i]` stream sentinels remapped to host glibc streams; see the
     /// `__sF` section); the signal-ABI 6 (2026-06-11 — these resolved to host glibc before, whose
-    /// sigset_t/sigaction LAYOUT is incompatible; see the signal-ABI section); ndk-android's 27
-    /// (AAsset* real via
-    /// `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub); media-ndk's 33
-    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **121**
-    /// symbols total.
+    /// sigset_t/sigaction LAYOUT is incompatible; see the signal-ABI section); ndk-android's 28
+    /// (AAsset* real via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow
+    /// sound-stub — `ANativeWindow_getFormat` added 2026-06-12 for `libsurface_util_jni.so`'s
+    /// pre-load); media-ndk's 33 sound-stubs and audio's 8 (REAL OpenSL ES → host audio via
+    /// [`super::opensl`]). **122** symbols total.
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -283,7 +285,7 @@ impl EclipseNativeProvider {
             eclipse_pthread_sigmask as *const () as u64,
         );
 
-        // ---- ndk-android (libandroid) — the 27 NDK natives -------------------------------------
+        // ---- ndk-android (libandroid) — the 28 NDK natives -------------------------------------
         // AAsset / AAssetManager (6) — REAL, routed to Eclipse's own `src/apk` reader.
         p.register(
             "AAssetManager_fromJava",
@@ -369,8 +371,10 @@ impl EclipseNativeProvider {
             "ALooper_removeFd",
             eclipse_alooper_removefd as *const () as u64,
         );
-        // ANativeWindow (5) — WSI-bound: fromSurface returns the REAL host-EGL native window Eclipse
-        // owns, getters return real geometry, refcount ops are no-ops (the engine render WSI bind).
+        // ANativeWindow (6) — WSI-bound: fromSurface returns the REAL host-EGL native window Eclipse
+        // owns, getters return real geometry/format, refcount ops are no-ops (the engine render WSI
+        // bind). getFormat added 2026-06-12 — libsurface_util_jni.so's sole unresolved pre-load
+        // import (the apkenv-delegation class, core 866509).
         p.register(
             "ANativeWindow_fromSurface",
             eclipse_anativewindow_fromsurface as *const () as u64,
@@ -382,6 +386,10 @@ impl EclipseNativeProvider {
         p.register(
             "ANativeWindow_getHeight",
             eclipse_anativewindow_getheight as *const () as u64,
+        );
+        p.register(
+            "ANativeWindow_getFormat",
+            eclipse_anativewindow_getformat as *const () as u64,
         );
         p.register(
             "ANativeWindow_acquire",
@@ -2470,7 +2478,7 @@ extern "C" {
 }
 
 // =================================================================================================
-// ndk-android (libandroid) — the 27 NDK natives. Opaque NDK pointers are Eclipse-owned generational
+// ndk-android (libandroid) — the 28 NDK natives. Opaque NDK pointers are Eclipse-owned generational
 // registry handles ([`super::ndk_registry`]) cast to `*mut T`, so a stale/fabricated handle is a
 // typed `Err` → NDK sentinel (NULL / negative), never a wild dereference / UB.
 // =================================================================================================
@@ -3204,7 +3212,7 @@ pub fn run_input_test() -> Result<String, String> {
     ))
 }
 
-// ---- ANativeWindow (5) — WSI-bound: returns the REAL host-EGL native window; getters real geometry
+// ---- ANativeWindow (6) — WSI-bound: returns the REAL host-EGL native window; getters real geometry
 //
 // 2026-06-05 — the engine render WSI bind: Roblox's native engine creates its OWN EGL surface by
 // calling host `eglCreateWindowSurface(display, config, (EGLNativeWindowType)<the `ANativeWindow*` it
@@ -3219,8 +3227,10 @@ pub fn run_input_test() -> Result<String, String> {
 // Until the window exists (the engine may probe `fromSurface` earlier), it falls back to a sound
 // geometry-only slab handle ([`default_native_window`]). `setBuffersGeometry`/`lock`/`unlockAndPost`
 // are NOT in libroblox's 5-symbol ANativeWindow import set (verified vs the engine), so they are
-// intentionally not registered (§ simplicity). `acquire`/`release` are correct no-ops (Eclipse owns
-// the window for the process lifetime).
+// intentionally not registered (§ simplicity); 2026-06-12: `getFormat` IS registered — not for
+// libroblox (its set stays the 5) but for `libsurface_util_jni.so`, whose pre-load failed on
+// exactly that 1 import. `acquire`/`release` are correct no-ops (Eclipse owns the window for the
+// process lifetime).
 
 /// `ANativeWindow* ANativeWindow_fromSurface(JNIEnv* env, jobject surface)` — get a native window for
 /// a Java `Surface`. **WSI-bound:** when the render path has built the real WSI window on Eclipse's
@@ -3274,6 +3284,28 @@ unsafe extern "C" fn eclipse_anativewindow_getheight(window: *mut c_void) -> i32
     }
     ndk_registry::native_windows()
         .with(ptr_to_handle(window), |w| w.height)
+        .unwrap_or(-1)
+}
+
+/// `int32_t ANativeWindow_getFormat(ANativeWindow* window)` — the window pixel format. **sound:**
+/// the exact sibling of [`eclipse_anativewindow_getwidth`] — a real WSI window reports Eclipse's
+/// surface format (`WINDOW_FORMAT_RGBA_8888`, the RGBA8888 config the engine render path builds on
+/// Eclipse's window); a fallback slab handle reports its recorded [`NativeWindowState::format`]; a
+/// stale/fabricated pointer → `-1` (the NDK negative-error contract), never a fake format or a
+/// dereference. 2026-06-12: provided because `libsurface_util_jni.so`'s pre-load failed on exactly
+/// this 1 import (owner live validation `/tmp/eclipse-866509-validate.log` line 98) — a failed
+/// pre-load leaves that lib's `System.loadLibrary` armed to delegate into the apkenv shim linker
+/// (the fatal NULL `_r_debug_ptr` class, core 866509). NOT a libroblox import (its ANativeWindow
+/// set stays the 5 below).
+///
+/// # Safety
+/// `window` must be an `ANativeWindow*` from an Eclipse window native (or garbage, which is rejected).
+unsafe extern "C" fn eclipse_anativewindow_getformat(window: *mut c_void) -> i32 {
+    if ndk_registry::wsi_window_geometry(window as usize).is_some() {
+        return WINDOW_FORMAT_RGBA_8888;
+    }
+    ndk_registry::native_windows()
+        .with(ptr_to_handle(window), |w| w.format)
         .unwrap_or(-1)
 }
 
@@ -3822,17 +3854,20 @@ mod tests {
         // __android_log_vprint, a libbacktrace-native pre-load import) + 16 bionic-libc
         // (2026-06-12 — __umask_chk, the other libbacktrace-native pre-load import) + 25
         // bionic-stdio FILE*-translation (22 Rust + 3 C-shim; 2026-06-12 — the &__sF[i] sentinel
-        // remap) + 6 bionic-signal (2026-06-11) + 27 ndk-android + 33 media-ndk + 8 audio + 51
-        // bionic-pthread/TLS/sem/syscall (37 + the 14 thread-lifecycle natives added 2026-06-05:
-        // create/join/detach/setname_np/kill/getattr_np/get+setschedparam/attr_*) + 5
-        // bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo — the
-        // allocator-bootstrap fix, 2026-06-05) = 177.
+        // remap) + 6 bionic-signal (2026-06-11) + 28 ndk-android (2026-06-12 —
+        // ANativeWindow_getFormat, libsurface_util_jni's sole unresolved pre-load import) + 33
+        // media-ndk + 8 audio + 53 bionic-pthread/TLS/sem/syscall (37 + the 14 thread-lifecycle
+        // natives added 2026-06-05: create/join/detach/setname_np/kill/getattr_np/
+        // get+setschedparam/attr_*; + __cxa_thread_atexit_impl & pthread_atfork 2026-06-12 —
+        // the core-947663 destructor-order fix and the last libbacktrace-native pre-load import)
+        // + 5 bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo —
+        // the allocator-bootstrap fix, 2026-06-05) = 180.
         assert_eq!(
             p.len(),
-            121 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            122 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
-            "6 liblog + 16 bionic-libc + 25 bionic-stdio + 6 bionic-signal + 27 ndk-android + 33 \
-             media-ndk + 8 audio + 51 pthread + 5 sysconf system-query natives registered"
+            "6 liblog + 16 bionic-libc + 25 bionic-stdio + 6 bionic-signal + 28 ndk-android + 33 \
+             media-ndk + 8 audio + 53 pthread + 5 sysconf system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim + 1 va_list C-shim)
@@ -3892,7 +3927,7 @@ mod tests {
             "sigfillset",
             "sigprocmask",
             "pthread_sigmask",
-            // ndk-android (27)
+            // ndk-android (28)
             "AAssetManager_fromJava",
             "AAssetManager_open",
             "AAsset_close",
@@ -3918,6 +3953,7 @@ mod tests {
             "ANativeWindow_fromSurface",
             "ANativeWindow_getWidth",
             "ANativeWindow_getHeight",
+            "ANativeWindow_getFormat",
             "ANativeWindow_acquire",
             "ANativeWindow_release",
             // media-ndk (33)
@@ -3963,7 +3999,8 @@ mod tests {
             "SL_IID_PLAY",
             "SL_IID_RECORD",
             "SL_IID_VOLUME",
-            // bionic pthread / TLS / sem / syscall (45) — the threading runtime (2026-06-05)
+            // bionic pthread / TLS / sem / syscall (53) — the threading runtime (2026-06-05;
+            // __cxa_thread_atexit_impl + pthread_atfork added 2026-06-12)
             "pthread_mutex_lock",
             "pthread_mutex_unlock",
             "pthread_once",
@@ -3976,6 +4013,8 @@ mod tests {
             "sem_wait",
             "gettid",
             "syscall",
+            "__cxa_thread_atexit_impl",
+            "pthread_atfork",
             // bionic system-query (5) — the allocator-bootstrap fix (2026-06-05)
             "sysconf",
             "getauxval",
@@ -4107,6 +4146,9 @@ mod tests {
         // absence (with __android_log_vprint) re-opened the apkenv delegation (core 866509). The
         // invalid-mode branch aborts the process (the FORTIFY contract) and is pinned by the bound
         // check's presence, not exercised here. umask is process-global: save + restore around.
+        // 2026-06-12 (invariant): this test is the SOLE umask(2) toucher in the test binary —
+        // umask is process-global with no read-only query, so a second concurrent toucher makes
+        // the save/round-trip/restore below a flake. grep for `umask` before adding one.
         // SAFETY: umask(2) takes any mode and cannot fail; all modes used are valid masks.
         unsafe {
             let saved = libc::umask(0o022); // returns the pre-test mask; 0o022 is now current
@@ -5244,6 +5286,9 @@ mod tests {
         unsafe {
             assert_eq!(eclipse_anativewindow_getwidth(win), def.width);
             assert_eq!(eclipse_anativewindow_getheight(win), def.height);
+            // 2026-06-12: getFormat (libsurface_util_jni's sole pre-load import) reports the slab
+            // handle's recorded format — the documented RGBA_8888 default.
+            assert_eq!(eclipse_anativewindow_getformat(win), def.format);
             // acquire/release are sound no-ops.
             eclipse_anativewindow_acquire(win);
             eclipse_anativewindow_release(win);
@@ -5254,6 +5299,8 @@ mod tests {
         assert_eq!(unsafe { eclipse_anativewindow_getwidth(stale) }, -1);
         // SAFETY: `stale` is fabricated; rejected.
         assert_eq!(unsafe { eclipse_anativewindow_getheight(stale) }, -1);
+        // SAFETY: `stale` is fabricated; rejected (the same negative-error contract for getFormat).
+        assert_eq!(unsafe { eclipse_anativewindow_getformat(stale) }, -1);
         // Free the live window's slot to keep the registry tidy.
         ndk_registry::native_windows()
             .remove(ptr_to_handle(win))
@@ -5313,6 +5360,12 @@ mod tests {
                 eclipse_anativewindow_getheight(win),
                 720,
                 "WSI height via the map"
+            );
+            // 2026-06-12: a registered WSI window reports Eclipse's surface format (RGBA_8888).
+            assert_eq!(
+                eclipse_anativewindow_getformat(win),
+                WINDOW_FORMAT_RGBA_8888,
+                "WSI format is Eclipse's RGBA_8888 surface format"
             );
             // acquire/release are sound no-ops on the WSI handle.
             eclipse_anativewindow_acquire(win);

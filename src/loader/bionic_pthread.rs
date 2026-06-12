@@ -1047,15 +1047,23 @@ unsafe extern "C" fn eclipse_pthread_getspecific(key: c_int) -> *mut c_void {
     let Some(cur_gen) = cur_gen else {
         return std::ptr::null_mut();
     };
-    TLS_VALUES.with(|v| {
-        let v = v.borrow();
-        let entry = v[k];
-        if entry.generation == cur_gen {
-            entry.ptr as *mut c_void
-        } else {
-            std::ptr::null_mut() // stale (key deleted/reused since this thread last set it)
-        }
-    })
+    // 2026-06-12: `try_with`, not `with` — an engine `__cxa_thread_atexit_impl` destructor may
+    // legally call `pthread_getspecific` up to its last instruction under bionic, and on a
+    // non-Eclipse-created thread that destructor runs in glibc's `__call_tls_dtors` phase, where
+    // this Rust thread-local may already be destroyed; `with` would panic → process abort under
+    // the release `panic="abort"` (the same class as the fixed tracing-subscriber BUF abort).
+    // Teardown fallback: NULL — the per-thread store is gone, the defined "no value" answer.
+    TLS_VALUES
+        .try_with(|v| {
+            let v = v.borrow();
+            let entry = v[k];
+            if entry.generation == cur_gen {
+                entry.ptr as *mut c_void
+            } else {
+                std::ptr::null_mut() // stale (key deleted/reused since this thread last set it)
+            }
+        })
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `int pthread_setspecific(pthread_key_t key, const void* value)` — set this thread's value for
@@ -1075,32 +1083,47 @@ unsafe extern "C" fn eclipse_pthread_setspecific(key: c_int, value: *const c_voi
     let Some(cur_gen) = cur_gen else {
         return EINVAL;
     };
-    TLS_VALUES.with(|v| {
+    // 2026-06-12: `try_with` for the same teardown reason as `pthread_getspecific` above.
+    // Teardown fallback: EINVAL — the per-thread store is destroyed, so the value CANNOT be
+    // recorded; a defined error return, never an abort (an Eclipse-model limit at the teardown
+    // edge — bionic's own store lives until the thread truly exits).
+    match TLS_VALUES.try_with(|v| {
         let mut v = v.borrow_mut();
         v[k] = TlsValue {
             ptr: value as usize,
             generation: cur_gen,
         };
-    });
-    0
+    }) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
 }
 
 /// Run this thread's TLS destructors (for keys with a non-null value + a registered destructor),
 /// the way bionic does on thread exit. POSIX runs them in up to `PTHREAD_DESTRUCTOR_ITERATIONS` (4)
 /// passes because a destructor may set another key. Used by `pthread_exit`.
 ///
-/// 2026-06-05 (documented deferral): this is invoked from the Eclipse `pthread_exit` native. For a
-/// thread that exits by **returning from a native (glibc) thread start** without calling
-/// `pthread_exit`, Eclipse does not yet hook glibc's thread teardown, so its key destructors are not
-/// run — a benign leak of per-thread values (no UB), deferred until Eclipse owns thread creation.
+/// Runs on BOTH Eclipse exit paths — [`eclipse_pthread_exit`] and the [`thread_trampoline`]
+/// return-from-start path — each AFTER [`run_cxa_thread_dtors`]: bionic's `pthread_exit.cpp` runs
+/// `__cxa_thread_finalize()` FIRST and `pthread_key_clean_all()` LAST, and core 947663 proved the
+/// inverted order fatal (the engine's mimalloc key dtors freed the per-thread block its cxa
+/// finalizer then walked). 2026-06-12.
+///
+/// 2026-06-12 (open item D2): for a thread Eclipse did NOT create (ART-attached / host-spawned)
+/// that stored bionic key values, nothing invokes this — its key destructors never run (a bounded
+/// per-thread-value leak; the opposite half-teardown of the core-947663 ordering bug). No evidence
+/// yet that engine bionic keys are ever SET on such threads; needs design evidence before code.
 fn run_thread_key_destructors() {
     const DESTRUCTOR_ITERATIONS: usize = 4;
     for _ in 0..DESTRUCTOR_ITERATIONS {
         let mut ran_any = false;
         // Snapshot (key, value, dtor) for keys with a live value + destructor, clearing the value
         // first (POSIX: the value is set to NULL before the destructor runs).
+        // 2026-06-12: `try_with` (defensive) — if this is ever reached after the thread's Rust TLS
+        // teardown (where `with` would panic → abort under panic="abort"), there are no live
+        // per-thread values left to destroy; return instead of aborting.
         let mut to_run: Vec<(usize, *mut c_void, KeyDtor)> = Vec::new();
-        TLS_VALUES.with(|v| {
+        let alive = TLS_VALUES.try_with(|v| {
             let mut v = v.borrow_mut();
             key_table_with(|t| {
                 for k in 0..PTHREAD_KEYS_MAX {
@@ -1117,6 +1140,9 @@ fn run_thread_key_destructors() {
                 }
             });
         });
+        if alive.is_err() {
+            return;
+        }
         for (_k, ptr, dtor) in to_run {
             ran_any = true;
             // SAFETY: 2026-06-05 — `dtor` is a C destructor the engine registered with
@@ -1128,6 +1154,169 @@ fn run_thread_key_destructors() {
             break;
         }
     }
+}
+
+// =================================================================================================
+// __cxa_thread_atexit_impl — Eclipse-owned C++ thread_local finalizers (the bionic destructor
+// ORDER) — and pthread_atfork (fork-handler registration the boot has no dynamic surface for).
+// =================================================================================================
+//
+// 2026-06-12 — ROOT CAUSE (core 947663: SIGSEGV MAPERR addr=0x58, rip=libroblox+0x2779cc4, the
+// deterministic engine-thread-exit fault): `__cxa_thread_atexit_impl` was deliberately left on the
+// host glibc baseline as "ABI-identical" — true of the SIGNATURE, false of the ORDERING semantics.
+// Public AOSP bionic `pthread_exit.cpp` runs `__cxa_thread_finalize()` (the C++ `thread_local`
+// destructors) FIRST and `pthread_key_clean_all()` (the pthread-key destructors) LAST, on both the
+// explicit-`pthread_exit` and return-from-start paths. Eclipse ran the two classes INVERTED: the
+// trampoline/`pthread_exit` ran the key destructors, and only later — after the thread returned
+// into glibc `start_thread` — did glibc's `__call_tls_dtors` run the engine's cxa-registered
+// finalizer. Under that inversion the engine's key destructors (libroblox's mimalloc deferred-free
+// cache + `_mi_thread_done`, disasm-matched to the public mimalloc `src/init.c`) freed + abandoned
+// the dying thread's TLS-registry block; mimalloc page reclaim handed the freed block to a newborn
+// sibling thread (its TID stamped at obj+0x14 in the core), and the late cxa finalizer then walked
+// the stale block: `[obj+0x408]` = NULL → `movq $0x0,0x58(%r12)` = the NULL+0x58 write. Eclipse
+// now OWNS the registration (this native displaces the glibc resolution in the engine scope — it
+// previously reached glibc only via the last-tier HostDlsymProvider) and drains the list BEFORE
+// the key destructors on BOTH Eclipse exit paths.
+
+/// A C++-ABI thread_local destructor `void (*)(void*)` registered via `__cxa_thread_atexit_impl`.
+type CxaThreadDtor = unsafe extern "C" fn(*mut c_void);
+
+/// One registered (destructor, object) pair, run at thread exit in LIFO order.
+struct CxaThreadDtorEntry {
+    func: CxaThreadDtor,
+    obj: *mut c_void,
+}
+
+/// This thread's LIFO `__cxa_thread_atexit_impl` list. The `Drop` impl is the drain for threads
+/// Eclipse did NOT create (see its comment).
+struct CxaThreadDtorList {
+    entries: RefCell<Vec<CxaThreadDtorEntry>>,
+}
+
+impl Drop for CxaThreadDtorList {
+    fn drop(&mut self) {
+        // 2026-06-12: for a thread Eclipse did NOT create (ART-attached / host-spawned), no
+        // trampoline runs the bionic-order drain — this `Drop` runs it in glibc's
+        // `__call_tls_dtors` phase instead (Rust registers thread-local destructors with glibc),
+        // i.e. exactly when the host baseline ran these dtors pre-fix: semantics are PRESERVED
+        // where Eclipse does not own the thread. On Eclipse-created threads the explicit drain
+        // already emptied the list, so this is a no-op. Pop-then-call per iteration (the borrow is
+        // released before the dtor runs) because a dtor may re-enter the registration native.
+        loop {
+            let entry = self.entries.borrow_mut().pop();
+            match entry {
+                // SAFETY: 2026-06-12 — `func`/`obj` are exactly what the registrant passed to
+                // `__cxa_thread_atexit_impl`; calling `func(obj)` once at thread exit is the
+                // Itanium C++ ABI contract.
+                Some(e) => unsafe { (e.func)(e.obj) },
+                None => break,
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The calling thread's cxa-finalizer list (LIFO). Drained by [`run_cxa_thread_dtors`] on the
+    /// two Eclipse exit paths, else by [`CxaThreadDtorList`]'s `Drop`.
+    static CXA_THREAD_DTORS: CxaThreadDtorList = const {
+        CxaThreadDtorList {
+            entries: RefCell::new(Vec::new()),
+        }
+    };
+}
+
+/// Drain this thread's `__cxa_thread_atexit_impl` list in LIFO order. Loop-drain: a destructor may
+/// legally register more (the C++ ABI), and those run too (each pop releases the borrow before the
+/// call). Invoked BEFORE [`run_thread_key_destructors`] on both Eclipse exit paths — the bionic
+/// `__cxa_thread_finalize()` → `pthread_key_clean_all()` order (core 947663). 2026-06-12.
+fn run_cxa_thread_dtors() {
+    loop {
+        let entry = CXA_THREAD_DTORS.try_with(|l| l.entries.borrow_mut().pop());
+        match entry {
+            // SAFETY: 2026-06-12 — same contract as the `Drop` drain above.
+            Ok(Some(e)) => unsafe { (e.func)(e.obj) },
+            Ok(None) | Err(_) => break,
+        }
+    }
+}
+
+/// `int __cxa_thread_atexit_impl(void (*func)(void*), void* obj, void* dso_handle)` — register a
+/// destructor for a C++ `thread_local` object on the calling thread (the public Itanium C++ ABI /
+/// bionic contract; returns 0 on success, non-zero on failure). Eclipse-owned so the dtors run in
+/// bionic's thread-exit ORDER — before the pthread-key destructors (core 947663; section comment).
+///
+/// # Safety
+/// `func` is null or a valid destructor; `obj` is the registrant's opaque object pointer (stored,
+/// not dereferenced); `dso_handle` is accepted and ignored.
+unsafe extern "C" fn eclipse_cxa_thread_atexit_impl(
+    func: Option<CxaThreadDtor>,
+    obj: *mut c_void,
+    dso_handle: *mut c_void,
+) -> c_int {
+    // 2026-06-12: `dso_handle` is accepted and IGNORED — it exists so a dlclose'd DSO's pending
+    // thread dtors can be handled early; Eclipse never unloads engine libs (the loader has no
+    // dlclose), so the handle carries no information here.
+    let Some(func) = func else {
+        return 1; // non-zero = registration failure (the Itanium C++ ABI return contract)
+    };
+    let registered = CXA_THREAD_DTORS.try_with(|l| {
+        l.entries
+            .borrow_mut()
+            .push(CxaThreadDtorEntry { func, obj });
+    });
+    if registered.is_ok() {
+        return 0;
+    }
+    // Teardown fallback (2026-06-12): this thread's Rust TLS is already destroyed — a destructor
+    // registered MORE dtors while the `Drop` drain above was running (possible only on
+    // non-Eclipse-created threads, where the drain IS the Drop). Forward the registration to host
+    // glibc's `__cxa_thread_atexit_impl`: its per-thread `tls_dtor_list` is drained by the SAME
+    // `__call_tls_dtors` pass currently executing, so the dtor still runs before the thread exits.
+    // SAFETY: 2026-06-12 — `dlsym(RTLD_DEFAULT, ...)` over a NUL-terminated literal; the transmute
+    // target is the documented glibc signature (identical to this native's); the forwarded args
+    // are the caller's own.
+    unsafe {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, c"__cxa_thread_atexit_impl".as_ptr());
+        if !sym.is_null() {
+            let host: unsafe extern "C" fn(CxaThreadDtor, *mut c_void, *mut c_void) -> c_int =
+                std::mem::transmute(sym);
+            return host(func, obj, dso_handle);
+        }
+    }
+    // No host registration surface either (a non-glibc host at the teardown edge): the entry is
+    // dropped — a bounded leak (the object is never destroyed, so never double-destroyed; bionic
+    // itself leaks a dtor registered after `__cxa_thread_finalize`). Report success so the C++
+    // runtime does not abort the construction. 2026-06-12.
+    0
+}
+
+/// `int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void))` —
+/// register fork handlers (the public bionic contract; NULL handlers allowed, POSIX ordering:
+/// prepare LIFO, parent/child FIFO — bionic and glibc agree). Forwards to the link-time
+/// `libc::pthread_atfork` (on glibc hosts that binds the `libc_nonshared.a` static wrapper →
+/// `__register_atfork@@GLIBC_2.3.2`; musl exports `pthread_atfork` dynamically, so the libc-crate
+/// forward is portable to both). The in-process `fork(2)` IS glibc's (the engine libs' fork/vfork
+/// imports resolve to host glibc), so glibc's own atfork list runs these handlers at exactly the
+/// right points — no Eclipse-side handler list is needed.
+///
+/// 2026-06-12: provided because the boot has NO dynamic-symbol surface for this name — host glibc
+/// exports `pthread_atfork` only as a compat-versioned WEAK `@GLIBC_2.2.5` symbol `dlsym` cannot
+/// see, and no boot-mapped lib defines it (nm scan over every lib in core 866509) — so it was the
+/// LAST unresolved import keeping `libbacktrace-native.so`'s pre-load failing (owner live
+/// validation `/tmp/eclipse-866509-validate.log` line 60), which left its `System.loadLibrary`
+/// armed to delegate into the apkenv shim linker (the fatal NULL `_r_debug_ptr` class, core
+/// 866509).
+///
+/// # Safety
+/// Each handler is null or a valid `extern "C" fn()`; nothing is dereferenced here.
+unsafe extern "C" fn eclipse_pthread_atfork(
+    prepare: Option<unsafe extern "C" fn()>,
+    parent: Option<unsafe extern "C" fn()>,
+    child: Option<unsafe extern "C" fn()>,
+) -> c_int {
+    // SAFETY: 2026-06-12 — forwards the bionic-signature triple (ABI-identical on x86-64: three
+    // nullable fn pointers, int return) to the link-time-bound host registration.
+    unsafe { libc::pthread_atfork(prepare, parent, child) }
 }
 
 // =================================================================================================
@@ -1159,21 +1348,40 @@ unsafe extern "C" fn eclipse_gettid() -> c_int {
     gettid()
 }
 
-/// `void pthread_exit(void* retval)` — run this thread's TLS destructors (bionic does), then end the
-/// thread via the host runtime. noreturn.
+/// `void pthread_exit(void* retval)` — run this thread's destructors in the bionic ORDER — the
+/// `__cxa_thread_atexit_impl` finalizers FIRST, then the pthread-key destructors (public AOSP
+/// `pthread_exit.cpp`: `__cxa_thread_finalize()` then `pthread_key_clean_all()`; core 947663
+/// proved the inverted order fatal — see the cxa section comment) — then end the thread via the
+/// host runtime. noreturn.
+///
+/// 2026-06-12 (open item D4): the forward to glibc `pthread_exit` FORCE-UNWINDS the calling
+/// frames. Eclipse's own frames on this path are plain-old-frames (legal to cross, RFC 2945), but
+/// the ENGINE's bionic-compiled frames between the thread start and this call are outside
+/// Eclipse's control — that unwind exposure needs its own design (a non-unwinding end here would
+/// skip glibc TSD/Rust TLS/ART-detach teardown, which is worse). The destructor ORDERING half is
+/// fixed here; the unwind half is the recorded open item.
 ///
 /// # Safety
 /// Called on a thread that intends to terminate; `retval` is opaque (ignored by Eclipse's join model).
-unsafe extern "C" fn eclipse_pthread_exit(_retval: *mut c_void) -> ! {
+///
+/// ABI note (2026-06-12): declared `extern "C-unwind"` — glibc `pthread_exit` ends the thread by
+/// FORCE-UNWINDING the stack, and Rust's personality terminates a forced unwind that crosses a
+/// call site missing from the LSDA call-site table (a `nounwind` call — verified in the pinned
+/// std `sys/personality/dwarf/eh.rs`). "C-unwind" gives this fn's call sites (and callers' sites
+/// into it) table entries the forced unwind may legally cross; the machine calling convention is
+/// identical to "C".
+unsafe extern "C-unwind" fn eclipse_pthread_exit(_retval: *mut c_void) -> ! {
+    run_cxa_thread_dtors();
     run_thread_key_destructors();
     // SAFETY: 2026-06-05 — `pthread_exit(3)`/`__pthread_exit` is the host libc primitive that ends
     // the calling thread after running cleanup. Forwarding to it terminates the thread cleanly
     // (matching the bionic noreturn contract). If the host symbol is somehow absent, fall back to
-    // exiting the thread via the raw `exit` syscall (SYS_exit = 60 on x86-64).
+    // exiting the thread via the raw `exit` syscall (SYS_exit = 60 on x86-64). The transmute target
+    // is "C-unwind" because glibc pthread_exit unwinds (see the ABI note above).
     unsafe {
         let sym = libc::dlsym(libc::RTLD_DEFAULT, c"pthread_exit".as_ptr());
         if !sym.is_null() {
-            let host: extern "C" fn(*mut c_void) -> ! = std::mem::transmute(sym);
+            let host: unsafe extern "C-unwind" fn(*mut c_void) -> ! = std::mem::transmute(sym);
             host(_retval);
         }
         libc::syscall(60, 0); // SYS_exit (thread exit) — last resort
@@ -1243,7 +1451,11 @@ static THREAD_REGISTRY: Mutex<Vec<(i32, ThreadEntry)>> = Mutex::new(Vec::new());
 /// the instant its (possibly trivial) `start()` returned, so under load the parent read a freed/reused
 /// block (a concurrent creator's TID or heap garbage) instead of this child's real TID.
 struct SpawnArgs {
-    start: extern "C" fn(*mut c_void) -> *mut c_void,
+    /// 2026-06-12: typed "C-unwind" (machine-ABI identical to "C") so the trampoline's `start(arg)`
+    /// call site gets an LSDA entry glibc `pthread_exit`'s forced unwind may legally cross — a
+    /// `nounwind` call site terminates a forced unwind under Rust's personality (see
+    /// [`eclipse_pthread_exit`]'s ABI note). The widening "C" → "C-unwind" is the sound direction.
+    start: extern "C-unwind" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
     /// 0 until the child has published its TID here (then the parent reads it). A futex word,
     /// co-owned with the parent so it outlives both the child's store and the parent's read.
@@ -1254,9 +1466,15 @@ struct SpawnArgs {
 /// parent's `pthread_create` can return it as the bionic `pthread_t`), wake the parent, then run
 /// libroblox's `start(arg)` and return its result to the host join machinery.
 ///
+/// ABI note (2026-06-12): declared `extern "C-unwind"` (machine-ABI identical to "C") so glibc
+/// `pthread_exit`'s forced unwind — the legal way the engine's `start` may end this thread — can
+/// exit this frame instead of hitting the abort guard rustc inserts in non-unwind fns ("panic in a
+/// function that cannot unwind"). glibc's `start_thread` caller is built to be unwound into
+/// (thread cancellation/exit are forced unwinds by design).
+///
 /// # Safety
 /// `raw` is the `Box<SpawnArgs>` leaked by [`eclipse_pthread_create`]; this reclaims it.
-extern "C" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
+extern "C-unwind" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
     // SAFETY: 2026-06-05 — `raw` is exactly the `Box<SpawnArgs>` `eclipse_pthread_create` leaked into
     // the host `pthread_create`; we own it here and reclaim it once.
     let boxed = unsafe { Box::from_raw(raw as *mut SpawnArgs) };
@@ -1271,11 +1489,21 @@ extern "C" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
     }
     let start = boxed.start;
     let arg = boxed.arg;
+    // 2026-06-12: reclaim `boxed` BEFORE running the engine's start routine so this frame holds no
+    // pending destructor while foreign code runs: the engine may end the thread via `pthread_exit`,
+    // whose glibc implementation force-unwinds back to `start_thread`, and a forced unwind may only
+    // cross Rust plain-old-frames (RFC 2945) — a live `Box` here would turn that legal exit into an
+    // abort. (The parent's own `Arc` clone keeps the TID slot alive; dropping ours is free.)
+    drop(boxed);
     // Run libroblox's start routine. Returning from it ends the host thread normally; the host join
-    // machinery captures the returned pointer for `pthread_join`'s `retval`. We also run this thread's
-    // TLS destructors here (bionic runs key destructors on a normal thread return, not only on an
-    // explicit `pthread_exit`) so a worker that stored TLS values gets them cleaned up.
+    // machinery captures the returned pointer for `pthread_join`'s `retval`. On this return-from-
+    // start path we run the thread's destructors the way bionic's `pthread_exit` does (bionic
+    // routes a normal return through `pthread_exit`): the `__cxa_thread_atexit_impl` finalizers
+    // FIRST, the pthread-key destructors LAST — core 947663 proved the inverted order fatal (the
+    // engine's mimalloc key dtors freed the TLS-registry block its cxa finalizer then walked).
+    // 2026-06-12.
     let ret = start(arg);
+    run_cxa_thread_dtors();
     run_thread_key_destructors();
     ret
 }
@@ -1371,6 +1599,11 @@ unsafe extern "C" fn eclipse_pthread_create(
     // — the trampoline may free `SpawnArgs` the instant its `start()` returns, but the parent's clone
     // keeps the word alive (2026-06-05 use-after-free fix).
     let child_tid = Arc::new(AtomicU32::new(0));
+    // SAFETY: 2026-06-12 — "C" → "C-unwind" only widens the unwind permission (same machine ABI);
+    // the engine's start routine MAY end the thread via `pthread_exit`, whose glibc forced unwind
+    // must be allowed to cross the trampoline's call site (see `SpawnArgs::start`).
+    let start: extern "C-unwind" fn(*mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(start) };
     let spawn = Box::new(SpawnArgs {
         start,
         arg,
@@ -1379,14 +1612,21 @@ unsafe extern "C" fn eclipse_pthread_create(
     // Ownership of the box passes to the trampoline (it reclaims it via `Box::from_raw`).
     let spawn_ptr = Box::into_raw(spawn);
     let mut host_handle: libc::pthread_t = 0;
-    // SAFETY: 2026-06-05 — `thread_trampoline` is a valid `extern "C"` entry of exactly the type
+    // SAFETY: 2026-06-05 — `thread_trampoline` is a valid entry of exactly the machine type
     // `pthread_create` expects; `spawn_ptr` is the leaked `Box<SpawnArgs>` it reclaims.
-    // `host_handle`/`host_attr` are valid out/in params.
+    // `host_handle`/`host_attr` are valid out/in params. 2026-06-12: the trampoline is declared
+    // "C-unwind" (so pthread_exit's forced unwind may exit it) while the libc crate conservatively
+    // types the start routine "C"; the transmute only narrows the unwind annotation for the
+    // declaration glibc sees — glibc's `start_thread` is built to be unwound into (cancellation/
+    // pthread_exit are forced unwinds by design), so no nounwind assumption is violated.
     let rc = unsafe {
         libc::pthread_create(
             &mut host_handle,
             &host_attr,
-            thread_trampoline,
+            std::mem::transmute::<
+                extern "C-unwind" fn(*mut c_void) -> *mut c_void,
+                extern "C" fn(*mut c_void) -> *mut c_void,
+            >(thread_trampoline),
             spawn_ptr as *mut c_void,
         )
     };
@@ -1768,15 +2008,25 @@ extern "C" {
 /// primitives the init path needs. Breakdown: mutex 5, mutexattr 3, cond 6, condattr 3, rwlock 5,
 /// once 1, TLS keys 4, identity/lifecycle 5, sem 4, syscall 1 = 37, **plus** the thread LIFECYCLE
 /// (2026-06-05): create/join/detach 3, setname_np 1, kill 1, getattr_np 1, get/setschedparam 2,
-/// attr_* 6 = 14 → **51**. The lifecycle is now Eclipse-owned (TID-based `pthread_t`) because the init
-/// path DOES spawn threads, and the mixed Eclipse-`pthread_self`/host-glibc-`pthread_setname_np` ABI
-/// crashed the worker (gdb-proven, `docs/libroblox-init-run.md` §8). `__cxa_thread_atexit_impl`
-/// stays on the host baseline (ABI-identical). 2026-06-11: `pthread_sigmask` is NOT ABI-identical
-/// after all — bionic `sigset_t` is 8 bytes vs glibc's 128 (a non-null `oldset` made glibc WRITE
-/// 128 bytes through it) — it is now provided by `native_provider`'s bionic signal-ABI section
-/// (with `sigaction`/`sigprocmask`/`sigemptyset`/`sigaddset`/`sigfillset`), counted there, so this
-/// count is unchanged.
-pub const PTHREAD_NATIVE_COUNT: usize = 51;
+/// attr_* 6 = 14, **plus** `__cxa_thread_atexit_impl` + `pthread_atfork` (2026-06-12) = **53**.
+/// The lifecycle is Eclipse-owned (TID-based `pthread_t`) because the init path DOES spawn
+/// threads, and the mixed Eclipse-`pthread_self`/host-glibc-`pthread_setname_np` ABI crashed the
+/// worker (gdb-proven, `docs/libroblox-init-run.md` §8).
+/// 2026-06-12: `__cxa_thread_atexit_impl` previously stayed on the host baseline under an
+/// "ABI-identical" claim — DISPROVEN by core 947663: the SIGNATURE is identical but the thread-exit
+/// ORDERING is not (glibc runs cxa finalizers only in `__call_tls_dtors`, AFTER the trampoline's
+/// key sweep — the exact inversion of bionic `pthread_exit.cpp`'s `__cxa_thread_finalize()` →
+/// `pthread_key_clean_all()`), which let mimalloc's key dtors free the engine's per-thread
+/// TLS-registry block before its cxa finalizer walked it (freed-then-reclaimed by a sibling thread
+/// → the NULL+0x58 write at libroblox+0x2779cc4). `pthread_atfork` (2026-06-12): the boot has no
+/// dynamic surface for the name (glibc's is compat-versioned `@GLIBC_2.2.5`, dlsym-invisible), so
+/// it was the last unresolved import failing `libbacktrace-native.so`'s pre-load (the
+/// apkenv-delegation class, core 866509).
+/// 2026-06-11: `pthread_sigmask` is NOT ABI-identical after all — bionic `sigset_t` is 8 bytes vs
+/// glibc's 128 (a non-null `oldset` made glibc WRITE 128 bytes through it) — it is provided by
+/// `native_provider`'s bionic signal-ABI section (with `sigaction`/`sigprocmask`/`sigemptyset`/
+/// `sigaddset`/`sigfillset`) and counted there.
+pub const PTHREAD_NATIVE_COUNT: usize = 53;
 
 /// Append every Eclipse-owned bionic pthread/TLS/sem/syscall native to `register` as
 /// `(name, address)` pairs. Called by [`super::native_provider::EclipseNativeProvider`] so the
@@ -1870,6 +2120,13 @@ pub fn register_natives(mut register: impl FnMut(&'static str, u64)) {
         eclipse_pthread_attr_setschedparam
     );
     reg!("pthread_attr_getstack", eclipse_pthread_attr_getstack);
+
+    // ---- C++ thread_local finalizers + fork handlers (2) — 2026-06-12 ----
+    // __cxa_thread_atexit_impl: Eclipse-owned so the cxa finalizers run BEFORE the key destructors
+    // (bionic order; core 947663). pthread_atfork: no boot dynamic surface exports the name
+    // (glibc's is compat-versioned @GLIBC_2.2.5); forwards to the link-time libc::pthread_atfork.
+    reg!("__cxa_thread_atexit_impl", eclipse_cxa_thread_atexit_impl);
+    reg!("pthread_atfork", eclipse_pthread_atfork);
 
     // ---- sem (4) ----
     reg!("sem_init", eclipse_sem_init);
@@ -2279,6 +2536,224 @@ mod tests {
         unsafe {
             eclipse_pthread_key_delete(key);
         }
+    }
+
+    // ---- thread-exit destructor ORDER: cxa finalizers BEFORE key destructors (core 947663) ------
+    //
+    // 2026-06-12: bionic runs the `__cxa_thread_atexit_impl` finalizers BEFORE the pthread-key
+    // destructors on BOTH exit paths (public AOSP pthread_exit.cpp: `__cxa_thread_finalize()` then
+    // `pthread_key_clean_all()`). Eclipse ran them INVERTED, which let the engine's mimalloc key
+    // dtors free the per-thread TLS-registry block its cxa finalizer then walked (the deterministic
+    // SIGSEGV MAPERR addr=0x58 at rip=libroblox+0x2779cc4). These two tests are the pins: under the
+    // pre-fix order the key dtor ran in the trampoline and the cxa dtor only later in glibc's
+    // __call_tls_dtors, so the cxa-before-key assertions FAIL there. Each dtor takes a ticket from
+    // a per-test sequence counter so the order is recorded race-free.
+
+    #[test]
+    fn cxa_dtors_run_before_key_dtors_and_lifo_on_return_from_start() {
+        use std::sync::atomic::{AtomicUsize as AU, Ordering as O};
+        static SEQ: AU = AU::new(0);
+        static KEY_T: AU = AU::new(0);
+        static CXA_A_T: AU = AU::new(0);
+        static CXA_B_T: AU = AU::new(0);
+        static CXA_C_T: AU = AU::new(0);
+
+        extern "C" fn key_dtor(_v: *mut c_void) {
+            KEY_T.store(SEQ.fetch_add(1, O::SeqCst) + 1, O::SeqCst);
+        }
+        unsafe extern "C" fn cxa_c(_o: *mut c_void) {
+            CXA_C_T.store(SEQ.fetch_add(1, O::SeqCst) + 1, O::SeqCst);
+        }
+        unsafe extern "C" fn cxa_a(_o: *mut c_void) {
+            CXA_A_T.store(SEQ.fetch_add(1, O::SeqCst) + 1, O::SeqCst);
+            // A dtor may legally register MORE dtors mid-drain (the C++ ABI); the loop-drain must
+            // run C too, after the already-registered entries.
+            // SAFETY: a valid dtor + opaque null object registered on the draining thread.
+            unsafe {
+                assert_eq!(
+                    eclipse_cxa_thread_atexit_impl(
+                        Some(cxa_c),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut()
+                    ),
+                    0,
+                    "mid-drain re-registration succeeds"
+                );
+            }
+        }
+        unsafe extern "C" fn cxa_b(_o: *mut c_void) {
+            CXA_B_T.store(SEQ.fetch_add(1, O::SeqCst) + 1, O::SeqCst);
+        }
+        extern "C" fn start(arg: *mut c_void) -> *mut c_void {
+            let key = arg as usize as c_int;
+            // SAFETY: `key` is the allocated key passed via `arg`; the cxa registrations record
+            // valid dtors with opaque null objects.
+            unsafe {
+                assert_eq!(eclipse_pthread_setspecific(key, 0x51 as *const c_void), 0);
+                assert_eq!(
+                    eclipse_cxa_thread_atexit_impl(
+                        Some(cxa_a),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut()
+                    ),
+                    0
+                );
+                assert_eq!(
+                    eclipse_cxa_thread_atexit_impl(
+                        Some(cxa_b),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut()
+                    ),
+                    0
+                );
+                // A null func is a rejected registration (Itanium ABI non-zero failure), never UB.
+                assert_eq!(
+                    eclipse_cxa_thread_atexit_impl(
+                        None,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut()
+                    ),
+                    1
+                );
+            }
+            std::ptr::null_mut()
+        }
+
+        let mut key: c_int = -1;
+        let kp = std::ptr::addr_of_mut!(key) as *mut c_void;
+        // SAFETY: valid key out-param + dtor.
+        unsafe { assert_eq!(eclipse_pthread_key_create(kp, Some(key_dtor)), 0) };
+        let mut tid: usize = 0;
+        let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+        // SAFETY: valid out-param + entry; `arg` carries the key index.
+        let rc = unsafe {
+            eclipse_pthread_create(
+                tp,
+                std::ptr::null(),
+                Some(start),
+                key as usize as *mut c_void,
+            )
+        };
+        assert_eq!(rc, 0, "create succeeds");
+        // SAFETY: `tid` is the just-created joinable thread.
+        unsafe { assert_eq!(eclipse_pthread_join(tid, std::ptr::null_mut()), 0) };
+
+        let (k, a, b, c) = (
+            KEY_T.load(O::SeqCst),
+            CXA_A_T.load(O::SeqCst),
+            CXA_B_T.load(O::SeqCst),
+            CXA_C_T.load(O::SeqCst),
+        );
+        assert!(
+            k != 0 && a != 0 && b != 0 && c != 0,
+            "all four destructors ran on the return-from-start path (KEY={k} A={a} B={b} C={c})"
+        );
+        // LIFO within the cxa list + loop-drain: B (registered last) first, then A, then A's
+        // mid-drain C.
+        assert!(
+            b < a && a < c,
+            "cxa LIFO + loop-drain order is B, A, C (got B={b} A={a} C={c})"
+        );
+        // THE core-947663 pin: every cxa finalizer runs BEFORE the pthread-key destructor.
+        assert!(
+            c < k,
+            "cxa finalizers run BEFORE key destructors on return-from-start \
+             (bionic __cxa_thread_finalize → pthread_key_clean_all; got last-cxa={c} KEY={k})"
+        );
+        // SAFETY: clean up the key.
+        unsafe { eclipse_pthread_key_delete(key) };
+    }
+
+    #[test]
+    fn cxa_dtors_run_before_key_dtors_on_pthread_exit_path() {
+        use std::sync::atomic::{AtomicUsize as AU, Ordering as O};
+        static SEQ: AU = AU::new(0);
+        static KEY_T: AU = AU::new(0);
+        static CXA_T: AU = AU::new(0);
+
+        extern "C" fn key_dtor(_v: *mut c_void) {
+            KEY_T.store(SEQ.fetch_add(1, O::SeqCst) + 1, O::SeqCst);
+        }
+        unsafe extern "C" fn cxa_d(_o: *mut c_void) {
+            CXA_T.store(SEQ.fetch_add(1, O::SeqCst) + 1, O::SeqCst);
+        }
+        // "C-unwind": glibc pthread_exit FORCE-UNWINDS this frame on its way out; a plain
+        // `extern "C"` (nounwind) start would hit rustc's abort guard ("panic in a function that
+        // cannot unwind") — the same reason `thread_trampoline` is "C-unwind". 2026-06-12.
+        extern "C-unwind" fn start(arg: *mut c_void) -> *mut c_void {
+            let key = arg as usize as c_int;
+            // SAFETY: `key` is the allocated key passed via `arg`; the cxa registration records a
+            // valid dtor; `eclipse_pthread_exit` ends this thread (noreturn) — both dtor classes
+            // must run from the explicit-exit path, cxa first. The frames crossed by glibc
+            // pthread_exit's forced unwind here are all "C-unwind" and destructor-free.
+            unsafe {
+                assert_eq!(eclipse_pthread_setspecific(key, 0x52 as *const c_void), 0);
+                assert_eq!(
+                    eclipse_cxa_thread_atexit_impl(
+                        Some(cxa_d),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut()
+                    ),
+                    0
+                );
+                eclipse_pthread_exit(0x77 as *mut c_void)
+            }
+        }
+
+        let mut key: c_int = -1;
+        let kp = std::ptr::addr_of_mut!(key) as *mut c_void;
+        // SAFETY: valid key out-param + dtor.
+        unsafe { assert_eq!(eclipse_pthread_key_create(kp, Some(key_dtor)), 0) };
+        let mut tid: usize = 0;
+        let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+        // SAFETY: valid out-param + entry; `arg` carries the key index. The "C-unwind" → "C"
+        // transmute matches the native's declared parameter; `eclipse_pthread_create` widens it
+        // back to "C-unwind" before the trampoline calls it.
+        let rc = unsafe {
+            eclipse_pthread_create(
+                tp,
+                std::ptr::null(),
+                Some(std::mem::transmute::<
+                    extern "C-unwind" fn(*mut c_void) -> *mut c_void,
+                    extern "C" fn(*mut c_void) -> *mut c_void,
+                >(start)),
+                key as usize as *mut c_void,
+            )
+        };
+        assert_eq!(rc, 0, "create succeeds");
+        let mut retval: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `tid` is the just-created joinable thread; `&mut retval` is writable.
+        unsafe { assert_eq!(eclipse_pthread_join(tid, &mut retval), 0) };
+        assert_eq!(
+            retval as usize, 0x77,
+            "pthread_exit's retval round-trips through join"
+        );
+
+        let (k, d) = (KEY_T.load(O::SeqCst), CXA_T.load(O::SeqCst));
+        assert!(
+            k != 0 && d != 0,
+            "both destructor classes ran on the explicit pthread_exit path (KEY={k} CXA={d})"
+        );
+        assert!(
+            d < k,
+            "cxa finalizers run BEFORE key destructors on pthread_exit \
+             (bionic __cxa_thread_finalize → pthread_key_clean_all; got CXA={d} KEY={k})"
+        );
+        // SAFETY: clean up the key.
+        unsafe { eclipse_pthread_key_delete(key) };
+    }
+
+    #[test]
+    fn pthread_atfork_registers_handlers_including_null() {
+        // 2026-06-12: the native forwards to the link-time libc::pthread_atfork (glibc's
+        // libc_nonshared.a wrapper → __register_atfork). NULL handlers are allowed by the public
+        // contract (both bionic and glibc treat a NULL handler as "none") — registering all-NULL
+        // must succeed and is side-effect-free (no handler ever runs), so the test does not need
+        // to fork. This pins that the symbol is genuinely link-bound and callable — the
+        // libbacktrace-native pre-load import that had NO boot dynamic surface (core 866509 class).
+        // SAFETY: all-NULL handlers; pthread_atfork only records them.
+        let rc = unsafe { eclipse_pthread_atfork(None, None, None) };
+        assert_eq!(rc, 0, "pthread_atfork(NULL, NULL, NULL) registers cleanly");
     }
 
     // ---- sem: post/wait counting ----------------------------------------------------------------
