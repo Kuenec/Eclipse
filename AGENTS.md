@@ -186,12 +186,17 @@ before any history-rewriting/force operation.
   static-TLS gap** — `readelf` confirms libroblox has **no `PT_TLS`, 0 TLS symbols, 0 `R_X86_64_TPOFF64`** (the team's
   "libroblox has no PT_TLS" holds). So the bug is a libroblox per-thread CLEANUP structure left with a null node at the
   point an engine thread exits — a thread-lifecycle / per-thread-state issue, exposed (not caused) by the pump advancing
-  Roblox far enough to spawn+exit these native threads. **NEXT (open):** determine why that per-thread node is null at
-  exit — candidates: (a) the thread never completed libroblox's per-thread registration (Eclipse-`pthread_create`
-  trampoline vs ART-attached thread mismatch — `bionic_pthread.rs` thread lifecycle); (b) a teardown-ORDERING race
-  (another `__cxa_thread_atexit` dtor freed the node first); (c) confirm whether the exiting thread ran a Java
-  `Looper.loop()` (my non-blocking `nativePollOnce` makes worker loopers exit-immediately — a known wart) vs is a pure
-  native engine thread (likely, given the siblings). **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
+  Roblox far enough to spawn+exit these native threads. **Candidate (c) RULED OUT (verified):** a temporary TID trace in
+  `nativePollOnce` (since reverted) showed **0 worker threads ever run `Looper.loop()`** across pump-active runs — the
+  non-blocking `nativePollOnce` only ever runs on the main/winit thread, so the engine fault is **independent of the pump's
+  yield**; the pump merely advances Roblox so its NATIVE engine threads spawn+exit. **NEXT (open):** determine why the
+  per-thread node is null at exit — remaining candidates: (a) the exiting thread never completed libroblox's per-thread
+  REGISTRATION (it was created/attached outside Eclipse's `pthread_create` trampoline — `bionic_pthread.rs` thread
+  lifecycle — so the per-thread structure the dtor walks was never linked in for it); (b) a teardown-ORDERING race (an
+  earlier `__cxa_thread_atexit` dtor freed/zeroed the node first). Approach: re-run the gdb engine-fault catchpoint and
+  also break at the matching `__cxa_thread_atexit_impl`/registration to compare the registered `obj` vs the faulting
+  `rbx`, and check whether the thread went through Eclipse's `pthread_create` trampoline (gettid vs the trampoline's
+  TID set). **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
   `android.util.Log`/`liblog` firehose + its own native diagnostics through `tracing`, emitted from ART/bionic WORKER
   threads; `tracing-subscriber`'s default `fmt` layer formats via a `thread_local! BUF` (`fmt_layer.rs:1022 BUF.with`),
   and a worker logging during its TLS teardown hit `LocalKey::with` on a destroyed TLS → AccessError → **process abort**.
