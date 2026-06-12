@@ -3578,16 +3578,18 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
 // `if (mPtr == 0) throw new IllegalStateException("Unable to allocate native queue");`, so the only
 // Java-side contract is that the returned handle is **non-zero**.
 //
-// Eclipse drives the lifecycle on a single attached main thread and **never runs `Looper.loop()`**,
-// so the queue's polling/wake/destroy natives (`nativePollOnce`/`nativeWake`/`nativeIsPolling`/
-// `nativeDestroy`) are never invoked — none are bound, and if one ever were called it would raise a
-// clean `UnsatisfiedLinkError` (not UB). Because the returned handle therefore has NO dereferencing
-// consumer, a full generational-slab registry (as for window/view/paint handles, which ARE
-// dereferenced by later natives) would be dead weight (Simplicity First, AGENTS.md §Surgical). The
-// minimal-sound backing returns a stable non-zero sentinel that is plainly NOT a pointer, satisfying
-// the `mPtr != 0` contract without faking any message-loop behavior. If a queue-consuming native is
-// ever bound (i.e. the lifecycle starts running `Looper.loop()`), this must become a real registry
-// handle (mirroring `paint_registry`) so the consumer can validate it — flagged here for that step.
+// 2026-06-12: the lifecycle still drives on a single attached main thread, but that thread is now
+// handed to winit's `run_windowed`, which PUMPS the main `Looper` once per frame via
+// [`pump_main_looper`] (`Looper.loop()` driven with the non-blocking [`message_queue_native_poll_once`]
+// below). So `nativePollOnce`/`nativeWake` ARE now bound; `nativeIsPolling`/`nativeDestroy` are NOT
+// (the main queue never idles-with-handler-tracking nor disposes — they'd raise a clean
+// `UnsatisfiedLinkError`, not UB, if reached). The handle (`mPtr`) is STILL not dereferenced: the poll
+// native applies its yield decision purely from the `timeoutMillis` arg and ignores `ptr`, so a full
+// generational-slab registry would still be dead weight (Simplicity First, AGENTS.md §Surgical). The
+// `nativeInit` sentinel therefore stays a stable non-zero, plainly-not-a-pointer marker. (A WORKER
+// thread that ran its own `Looper.loop()` would see the same yield-when-empty `nativePollOnce` and
+// exit immediately rather than block — none occur today; backing worker queues with a real blocking
+// wait is the documented follow-up if one appears.)
 
 /// `android.os.MessageQueue` (internal/slashed name for `find_class`) — hosts the `nativeInit`
 /// queue-allocation native.
@@ -3599,6 +3601,35 @@ pub const MESSAGE_QUEUE_CLASS: &JNIStr = jni_str!("android/os/MessageQueue");
 // line + the `MessageQueue.<init> → nativeInit` stack confirm the name/arity/return.)
 const MESSAGE_QUEUE_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
 const MESSAGE_QUEUE_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
+
+// 2026-06-12: bound so the MAIN-thread Looper can be PUMPED from the winit loop (`pump_main_looper`).
+// ATL declares these `private native static` (MessageQueue.java:53-54): `nativePollOnce(long,int)Z`
+// and `nativeWake(long)V`. ATL's patched `next()` (MessageQueue.java:137) is
+// `if (nativePollOnce(mPtr, timeout)) return null;` — so the yield/block decision lives ENTIRELY here.
+// Eclipse's main thread runs winit, not `Looper.loop()`, so the pump drives `Looper.loop()` once per
+// frame with a NON-BLOCKING `nativePollOnce`: it returns `false` for `timeout==0` (let `next()` pull a
+// ready message) and `true` otherwise (empty `-1` or future-delayed `>0` → yield → `next()` returns
+// null → `loop()` drains the ready batch and returns). A delayed message simply fires on the next
+// per-frame pump at/after its deadline (no WaitUntil re-arm — the renderer self-drives redraws).
+const MESSAGE_QUEUE_NATIVE_POLL_ONCE_NAME: &JNIStr = jni_str!("nativePollOnce");
+const MESSAGE_QUEUE_NATIVE_POLL_ONCE_SIG: &JNIStr = jni_str!("(JI)Z");
+const MESSAGE_QUEUE_NATIVE_WAKE_NAME: &JNIStr = jni_str!("nativeWake");
+const MESSAGE_QUEUE_NATIVE_WAKE_SIG: &JNIStr = jni_str!("(J)V");
+
+thread_local! {
+    /// Main-thread re-entrancy guard for [`run_main_looper_once`]: set on pump entry, cleared on exit;
+    /// a (theoretical) nested drive of the single main queue no-ops. **Accessed via `try_with`** so a
+    /// thread-local-teardown edge can never panic — and under `panic = "abort"` a panic would ABORT the
+    /// process (the regression that a worker-thread-accessed counter here caused on 2026-06-12).
+    static MAIN_LOOPER_PUMP_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One-time confirmation that the winit loop is actually pumping the Android main `Looper` (set on the
+/// first successful drive). A process-global atomic, NOT a thread-local — `nativePollOnce` runs on
+/// worker threads too and a thread-local accessed during a worker's teardown panic-aborts under
+/// `panic = "abort"`. Logged once so the dev-host boot shows the pump came alive without 60 Hz spam.
+static MAIN_LOOPER_PUMP_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The non-zero, non-pointer sentinel `MessageQueue.nativeInit()` returns as `mPtr`.
 ///
@@ -3631,6 +3662,61 @@ extern "system" fn message_queue_native_init<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `MessageQueue.nativePollOnce(long ptr, int timeoutMillis)` → the NON-BLOCKING yield decision that
+/// lets [`pump_main_looper`] drive `Looper.loop()` once and return (2026-06-12).
+///
+/// JNI ABI: a `static` native returning `jboolean` (jni-sys `jboolean` = Rust `bool`), parameters
+/// `(EnvUnowned, JClass, jlong ptr, jint timeout)`. `ptr` is the queue's `mPtr` (the sentinel) — NOT
+/// dereferenced. ATL's `next()` does `if (nativePollOnce(mPtr, timeout)) return null;`, so:
+/// - `timeout == 0` → return **`false`**: `next()` proceeds to pull the one ready message (counted).
+/// - `timeout != 0` (`-1` empty, or `> 0` a future-delayed head) → return **`true`**: `next()` returns
+///   null → `Looper.loop()` exits. The delayed message stays queued and fires on the next per-frame
+///   pump at/after its deadline. NEVER blocks (Eclipse's main thread is the winit thread, not a
+///   `Looper.loop()` thread). Counts `false` returns in [`MAIN_LOOPER_POLL_FALSE_COUNT`] for the drain log.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `jboolean` default (`false`) on error/panic — harmless (a spurious `false` just makes `next()` do one
+/// extra empty queue check, then yield on the following `-1` poll).
+extern "system" fn message_queue_native_poll_once<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    _ptr: jlong,
+    timeout_millis: jint,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> {
+        // No thread-local / no global state: this native runs on ANY thread (main pump AND any worker
+        // that runs its own Looper.loop()), so it must be allocation- and TLS-free to stay panic-free
+        // during a worker's teardown (panic = "abort"). The decision is purely a function of `timeout`.
+        Ok(main_looper_poll_should_yield(timeout_millis))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// The non-blocking `nativePollOnce` yield decision (pure, for the regression test). `false` only for
+/// `timeout == 0` (a ready message exists → let `MessageQueue.next()` pull it); `true` otherwise
+/// (`-1` empty, or `> 0` a future-delayed head → yield so the driven `Looper.loop()` returns instead of
+/// blocking the winit/main thread; the delayed message fires on the next per-frame pump).
+fn main_looper_poll_should_yield(timeout_millis: jint) -> bool {
+    timeout_millis != 0
+}
+
+/// `MessageQueue.nativeWake(long ptr)` → no-op (2026-06-12).
+///
+/// JNI ABI: a `static` native returning void, parameters `(EnvUnowned, JClass, jlong ptr)`. On real
+/// Android this writes the queue's wake fd to break a blocking `nativePollOnce`. Eclipse never blocks
+/// in `nativePollOnce` (the winit loop re-pumps the main Looper every frame via the renderer's
+/// self-driven `request_redraw`), so a wake is implicit: any newly-enqueued message is dispatched on
+/// the next per-frame pump. Validated handle-free no-op; a cross-thread `EventLoopProxy` wake is a
+/// documented follow-up for the renderer-absent case.
+extern "system" fn message_queue_native_wake<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    _ptr: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> { Ok(()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.os.MessageQueue`'s `nativeInit`.
 ///
 /// Locates `android/os/MessageQueue` and registers the native via `RegisterNatives` (which wins over
@@ -3656,14 +3742,32 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 message_queue_native_init as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `message_queue_native_poll_once` matches the paired `(JI)Z` signature as a static
+        // native (MessageQueue.java:53); the cast is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                MESSAGE_QUEUE_NATIVE_POLL_ONCE_NAME,
+                MESSAGE_QUEUE_NATIVE_POLL_ONCE_SIG,
+                message_queue_native_poll_once as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `message_queue_native_wake` matches the paired `(J)V` signature as a static native
+        // (MessageQueue.java:54); the cast is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                MESSAGE_QUEUE_NATIVE_WAKE_NAME,
+                MESSAGE_QUEUE_NATIVE_WAKE_SIG,
+                message_queue_native_wake as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/os/MessageQueue; `methods` holds a valid fn pointer whose
-    // signature matches the class's `native` declaration (AOSP `MessageQueue.java`,
-    // `private native long nativeInit()`, 2026-06-05).
+    // SAFETY: `class` is the loaded android/os/MessageQueue; `methods` hold valid fn pointers whose
+    // signatures match the class's `native` declarations (AOSP/ATL `MessageQueue.java`: `nativeInit()J`,
+    // `nativePollOnce(JI)Z`, `nativeWake(J)V`, 2026-06-05/2026-06-12).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/MessageQueue",
-        "registered Eclipse's non-GTK backing for nativeInit"
+        "registered Eclipse's non-GTK backing for nativeInit + nativePollOnce + nativeWake (main-Looper pump)"
     );
     Ok(())
 }
@@ -7126,6 +7230,74 @@ pub fn drive_application_lifecycle(
 /// # Errors
 /// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
 /// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+///
+/// ---
+///
+/// Pump the Android **main** `Looper` once: dispatch every currently-ready main-thread message
+/// (`Handler.post` continuations, `SurfaceHolder` callbacks, etc.) and return (2026-06-12).
+///
+/// Eclipse drives the lifecycle on the main thread then hands it to winit's `run_windowed`, so the
+/// main thread never runs `Looper.loop()` — main-thread messages queue but never dispatch, stalling
+/// Roblox after `onResume`. This drives `Looper.loop()` ONCE from the winit `about_to_wait` hook; with
+/// the non-blocking [`message_queue_native_poll_once`], `loop()` drains the ready batch and returns
+/// instead of blocking. Returns the approximate number of messages dispatched this tick (for the
+/// drain log / the "is the queue even non-empty" check).
+///
+/// Runs on the winit/main thread — the SAME thread that called `Looper.prepareMainLooper` (step 0), so
+/// `Looper.myLooper()` resolves to the main Looper. The `&Vm` borrow pins it to that thread (`Vm` is
+/// `!Send`/`!Sync`). `catch_unwind`-guarded (a dispatched message runs real app code that may panic);
+/// [`checked`] describes+clears any thrown Java exception so one bad handler can't poison the batch.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error
+/// from `Looper.loop`; [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn pump_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: identical to `dispatch_click_to_view` — `raw` is the live `*mut JavaVM` from `boot()`,
+    // kept alive by the `&Vm` borrow (non-null verified); `from_raw` returns the process VM singleton.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| run_main_looper_once(env))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Drive `android.os.Looper.loop()V` exactly once on the current (main) thread. Re-entrancy-guarded
+/// ([`MAIN_LOOPER_PUMP_IN_PROGRESS`], accessed via `try_with` so it can never panic-abort) so a message
+/// that synchronously re-enters the winit path can't recursively drive the single main queue.
+fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
+    // `try_with` (not `with`): on the main thread the TLS is always live, but a teardown edge must
+    // degrade to "not in progress" + proceed, never panic (panic = "abort"). Default true = skip.
+    let already = MAIN_LOOPER_PUMP_IN_PROGRESS
+        .try_with(|f| f.replace(true))
+        .unwrap_or(true);
+    if already {
+        return Ok(()); // already pumping (or TLS unavailable) — a nested drive would corrupt the queue
+    }
+    let looper_class = env.find_class(LOOPER_CLASS);
+    let result = match looper_class {
+        Ok(class) => checked(env, "pump Looper.loop", |env| {
+            env.call_static_method(&class, jni_str!("loop"), jni_sig!("()V"), &[])?
+                .v()
+        }),
+        Err(e) => Err(FrameworkError::Jni(e)),
+    };
+    let _ = MAIN_LOOPER_PUMP_IN_PROGRESS.try_with(|f| f.set(false));
+    result?;
+    // One-time confirmation the pump is live (process-global atomic, no TLS — see its docs).
+    if !MAIN_LOOPER_PUMP_ACTIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            "main Looper pump active: dispatching main-thread messages from the winit loop"
+        );
+    }
+    Ok(())
+}
+
 pub fn dispatch_click_to_view(
     vm: &Vm,
     handle: view_registry::ViewHandle,
@@ -8719,11 +8891,47 @@ mod tests {
         assert_eq!(MESSAGE_QUEUE_CLASS.to_str(), "android/os/MessageQueue");
         assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_NAME.to_str(), "nativeInit");
         assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_SIG.to_str(), "()J");
+        // 2026-06-12: nativePollOnce/nativeWake — the main-Looper pump natives (MessageQueue.java:53-54).
+        // A descriptor regression would make RegisterNatives throw NoSuchMethodError, or leave next()'s
+        // nativePollOnce unbound → UnsatisfiedLinkError the moment pump_main_looper drives Looper.loop().
+        assert_eq!(
+            MESSAGE_QUEUE_NATIVE_POLL_ONCE_NAME.to_str(),
+            "nativePollOnce"
+        );
+        assert_eq!(MESSAGE_QUEUE_NATIVE_POLL_ONCE_SIG.to_str(), "(JI)Z");
+        assert_eq!(MESSAGE_QUEUE_NATIVE_WAKE_NAME.to_str(), "nativeWake");
+        assert_eq!(MESSAGE_QUEUE_NATIVE_WAKE_SIG.to_str(), "(J)V");
         // The Looper class whose static prepareMainLooper() (step 0) builds the MessageQueue.
         assert_eq!(LOOPER_CLASS.to_str(), "android/os/Looper");
         // Java's MessageQueue.<init> requires mPtr != 0; the sentinel must be non-zero (and is a
         // plainly-non-pointer marker, never dereferenced — see register_message_queue_natives docs).
         assert_ne!(MESSAGE_QUEUE_HANDLE_SENTINEL, 0);
+    }
+
+    #[test]
+    fn main_looper_poll_yield_table_matches_atl_next_contract() {
+        // The non-blocking nativePollOnce decision IS the whole pump correctness: ATL's MessageQueue
+        // .next() does `if (nativePollOnce(mPtr, timeout)) return null;`. timeout==0 MUST NOT yield (a
+        // ready message exists → next() pulls it); every other timeout (-1 empty, >0 future-delayed)
+        // MUST yield so the driven Looper.loop() returns instead of blocking the winit/main thread. A
+        // regression here would either hang the window (false when it should yield → busy/forever loop)
+        // or never dispatch (true when it should pull). Host-independent pure logic.
+        assert!(
+            !main_looper_poll_should_yield(0),
+            "timeout==0 must pull, not yield"
+        );
+        assert!(
+            main_looper_poll_should_yield(-1),
+            "timeout==-1 (empty) must yield"
+        );
+        assert!(
+            main_looper_poll_should_yield(1),
+            "timeout>0 (delayed) must yield"
+        );
+        assert!(
+            main_looper_poll_should_yield(i32::MAX),
+            "large delay must yield"
+        );
     }
 
     #[test]

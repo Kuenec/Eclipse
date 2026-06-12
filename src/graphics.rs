@@ -199,6 +199,21 @@ impl ApplicationHandler for GameWindow<'_> {
             _ => {}
         }
     }
+
+    /// 2026-06-12: pump the Android **main** `Looper` once per loop iteration, on the winit/main
+    /// thread. Eclipse drives the lifecycle then hands the main thread to winit, so it never runs
+    /// `Looper.loop()` — main-thread `Handler.post` continuations and `SurfaceHolder` callbacks would
+    /// queue but never dispatch, stalling Roblox after `onResume`. `about_to_wait` fires once per
+    /// iteration; the renderer self-drives `request_redraw` each frame (RedrawRequested above), so this
+    /// re-pumps at the present cadence — delayed messages fire on the next tick past their deadline.
+    /// `pump_main_looper` is non-blocking (drains the ready batch and returns), so the window never
+    /// freezes. It logs a one-time "pump active" line itself; here we only surface a pump error.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(vm) = self.vm else { return };
+        if let Err(e) = crate::framework::pump_main_looper(vm) {
+            tracing::error!(error = %e, "main Looper pump failed");
+        }
+    }
 }
 
 impl GameWindow<'_> {
