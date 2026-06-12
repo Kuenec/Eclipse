@@ -128,6 +128,37 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-12 — 🎉🎉 FULL ANDROID LIFECYCLE → RESUMED on the REAL Roblox v2.721.1108 APK → live winit window +
+  Vulkan present loop RENDERING the splash view tree (screenshot-confirmed). ⇐ START HERE NEXT SESSION
+  (frontier = Roblox ENGINE-init SIGSEGV right after Crashpad's first-chance handler).** The boot now drives the
+  WHOLE recipe on the real APK: step 3 `Application.onCreate` ✅ → step 4 `Activity.createMainActivity` ✅ → step 5
+  `ActivitySplash.onCreate` ✅ → steps 6–7 `onStart`/`onResume` ✅ (Roblox's own `- onResume - yay!`) → `graphics::
+  run_windowed` opens the **winit window `Eclipse — com.roblox.client`** and the **Vulkan swapchain present loop**
+  (B8G8R8A8_SRGB, 800×600, 3 images) renders the recorded `view_registry` tree (white bg + blue UI quads + R8 text
+  atlas) — **no crash, ran a clean 90 s** (`/tmp/eclipse-boot.log`). **ROOT CAUSE of the prior `System.exit(10)`
+  (was mis-framed as a "Background process" check):** ATL's libcore installs a `hacky_uncaught_exception_handler` that
+  escalates **ANY uncaught exception on ANY thread** to `System.exit(10)` (mirrors Android's real `KillApplication
+  Handler`). The uncaught exception was `NoSuchMethodError PowerManager.isDeviceIdleMode()Z` thrown on Roblox's
+  `job-manager` thread (jobqueue network-status). **Proven by a JVM shutdown-hook thread-dumper** (temporarily injected
+  into the overlay `ActivityManager` static-init — the culprit thread showed `…hacky_uncaught_exception_handler.
+  uncaughtException → System.exit` on its stack; gdb's ART `DumpFromGdb` was too fragile mid-shutdown). **Durable fix =
+  add the missing method, NOT suppress the handler.** **Fixes this session:** (overlay, `patch-framework.sh`, now patches
+  Build + **PowerManager** + NetworkRequest + ActivityManager) — `PowerManager.isDeviceIdleMode()→false` (the killer);
+  `ActivityManager.getRunningAppProcesses()` reports `importance=FOREGROUND` + `RunningAppProcessInfo.pkgList=[pkg]`
+  (Roblox's main-process check reads both — were `NoSuchFieldError`); the compile-only `Context` stub's `this_application`
+  retyped `android.app.Application` (real ATL type — a `Context`-typed stub emits the wrong field descriptor →
+  `NoSuchFieldError`). (Eclipse Rust, in-binary, durable) — `View.nativeSetFullscreen(long,boolean)→(JZ)V` no-op (host
+  window fullscreen is winit's, not per-View); `Path.native_reset(long,long)→(JJ)V` frees both registry handles;
+  `TextView.native_setTextColor(int)→(I)V` records ARGB on the `view_registry` peer (new `ViewState.text_color` +
+  `set_text_color`). **NEW FRONTIER (next session): the Roblox engine native init SIGSEGVs ~5 s in, right after FLog logs
+  `initialized crashpad, plug in the first chance exception handler`** — a RACE (when the main thread opens the window
+  first, it renders fine for 90 s; when the engine threads win, they fault). Crashpad's own first-chance handler swallows
+  the SIGSEGV so ART prints no Fatal-signal block. **Lead:** `rbx.xapkmanager` logs `unpackAssets: Asset path not yet set`
+  immediately before — the engine's APK asset path is likely unwired. **To diagnose: run under gdb and catch the SIGSEGV
+  BEFORE Crashpad installs its handler** (or disable crashpad), to get the faulting lib/fn. Gate: **506 unit + 4
+  integration + 2 doctests**, fmt/clippy `-D warnings`/release all 0-warning. Durability: the overlay needs
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=~/.cache/eclipse/framework-patched`; the View/Path/TextView natives are in-binary. Not
+  committed (owner's session instruction: no git commit/push unless told). Detail: §6 (2026-06-12 full-lifecycle-RESUMED).
 - **2026-06-11 — 🎉 `Application.onCreate` COMPLETES (SQLite fully wired); Roblox now self-exits on its own
   process-identity check. + Opt-in APK auto-fetch added. ⇐ START HERE NEXT SESSION (frontier = `getProcessName`).**
   **SQLite Phase A+B DONE:** `src/framework/sqlite.rs` now also implements `nativeExecuteForCursorWindow` — KEY: ATL's
@@ -4659,6 +4690,34 @@ Research recorded mirror options (APKPure `d.apkpure.com/b/XAPK/com.roblox.clien
 their chosen source. Follow-ups: optional mirror auto-resolve, XAPK-split→merged-APK assembly, APK signing-cert pinning
 (the load-bearing trust control). Gate: **506 unit + 4 integration + 2 doctests** (+2 `fetch`), all 0-warning. Done MAIN-LOOP
 (dev-host); **not committed** (owner's session instruction).
+- **2026-06-12 (full-lifecycle-RESUMED → window → render on the real APK)** — 🎉🎉 **Eclipse boots Roblox
+  v2.721.1108 through the COMPLETE Android lifecycle to RESUMED and renders the splash Activity in a live winit window +
+  Vulkan present loop** (owner screenshot-confirmed: `Eclipse — com.roblox.client`, white bg + blue `view_registry`
+  quads). **Root cause of the long-standing `System.exit(10)` (previously mis-attributed to a "Background process"
+  check):** ATL libcore's `Thread$hacky_uncaught_exception_handler` turns **any** uncaught exception on **any** thread
+  into `System.exit(10)` (it mirrors Android's `KillApplicationHandler`). **Diagnosis method (durable technique):** a JVM
+  shutdown-hook injected (temporarily) into the overlay `ActivityManager`'s static initializer dumped every thread's stack
+  at exit — the `job-manager` thread showed `…hacky_uncaught_exception_handler.uncaughtException → java.lang.System.exit`
+  on its stack, with the thrown exception = `NoSuchMethodError PowerManager.isDeviceIdleMode()Z` (jobqueue network-status).
+  (gdb's `art::Thread::DumpFromGdb` crashed gdb mid-shutdown — the shutdown-hook proved race-free and reliable; the
+  diagnostic was removed after the root cause was confirmed, with a re-arm note left in `patch-framework.sh`.) **Durable
+  fix = supply the missing surface, never neuter the handler.** Changes: **(overlay)** `PowerManager.isDeviceIdleMode()→
+  false` (a desktop is never in Doze — the actual killer); `ActivityManager.getRunningAppProcesses()` now sets
+  `importance=IMPORTANCE_FOREGROUND` and `RunningAppProcessInfo.pkgList=[packageName]` (Roblox's main-process check reads
+  both → were `NoSuchFieldError`); the compile-only `Context` stub's `this_application` retyped to its real ATL type
+  `android.app.Application` (a `Context`-typed stub emits field descriptor `Landroid/content/Context;` ≠ the real
+  `Landroid/app/Application;` → `NoSuchFieldError`). **(Eclipse Rust `src/framework.rs` + `view_registry.rs`, in-binary,
+  durable, gate-green)** bound `View.nativeSetFullscreen(long,boolean) (JZ)V` (no-op — `setSystemUiVisibility`; host
+  window fullscreen is winit's), `Path.native_reset(long,long) (JJ)V` (frees both `path_registry` handles per
+  `Path.reset()`), `TextView.native_setTextColor(int) (I)V` (records ARGB on the peer via new `ViewState.text_color` +
+  `view_registry::set_text_color`). Each native pinned by a name/sig `assert_eq!` test. **NEW FRONTIER (START HERE):** the
+  Roblox ENGINE native init SIGSEGVs ~5 s after onResume, immediately after FLog `initialized crashpad, plug in the first
+  chance exception handler` — a race (main-thread-opens-window-first → renders 90 s clean; engine-threads-win → fault).
+  Crashpad's first-chance handler swallows the signal (no ART Fatal-signal block). Lead: `rbx.xapkmanager` logs
+  `unpackAssets: Asset path not yet set` right before. Diagnose by catching the SIGSEGV under gdb BEFORE crashpad installs
+  its handler (or disabling crashpad), to name the faulting lib/fn. Gate: **506 unit + 4 integration + 2 doctests**,
+  fmt/clippy `-D warnings`/release all 0-warning. Overlay (Build+PowerManager+NetworkRequest+ActivityManager) still needs
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR`; View/Path/TextView natives are in-binary. **Not committed** (owner's session instruction).
 
 ---
 
