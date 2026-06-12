@@ -563,6 +563,23 @@ pub fn load_app_native_lib(
     search_dir: &Path,
     log: &mut impl Write,
 ) -> Result<Option<PreloadedLib>, EngineLoadError> {
+    // 2026-06-12: early-fault tap (diagnostic — AGENTS.md §5 frontier: dump the engine's ORIGINAL
+    // SIGSEGV before crashpad's broken logging path destroys the evidence). Installed here because
+    // this is AFTER ART booted (this fn's contract requires the live `JavaVM*`, so everything
+    // ART/sigchain installs is final and the captured pre-tap action is ART's true post-boot one)
+    // and BEFORE any engine instruction can run (engine code executes only via the constructors /
+    // `JNI_OnLoad` below and what they spawn/register). A failed install only loses the
+    // diagnostic — never abort the boot for it.
+    static EARLY_FAULT_TAP: std::sync::Once = std::sync::Once::new();
+    EARLY_FAULT_TAP.call_once(|| {
+        if let Err(e) = super::native_provider::install_early_fault_tap(libc::SIGSEGV) {
+            let _ = writeln!(
+                log,
+                "engine-load: early-fault tap install failed ({e}) — continuing without the diagnostic"
+            );
+        }
+    });
+
     // Dedup by the implied soname (the filename — an app lib's DT_SONAME equals its file name here).
     // The authoritative dedup is by resolved soname after the map (below); this cheap pre-check skips
     // a redundant 100+ MiB read+map when a lib was already pulled in as a sibling DT_NEEDED.
@@ -576,6 +593,16 @@ pub fn load_app_native_lib(
 
     let mut engine = map_resolve_app_lib(apk_path, filename, Some(search_dir), log)?;
     let soname = engine.set.objects[0].soname.clone();
+
+    // 2026-06-12: publish the engine's mapped range to the early-fault tap BEFORE run_init_array
+    // below (the first engine instruction), so the tap's engine-PC filter covers engine faults
+    // from the very first constructor onward.
+    if filename == LIBROBLOX_FILENAME {
+        super::native_provider::publish_engine_text_range(
+            engine.base,
+            engine.set.objects[0].mapped.span() as u64,
+        );
+    }
 
     // The resolved soname is the authoritative dedup key (it may differ from the file name). If a
     // sibling DT_NEEDED already loaded this exact object, register_soname returns false → skip.

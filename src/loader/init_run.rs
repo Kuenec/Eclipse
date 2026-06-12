@@ -426,7 +426,10 @@ extern "C" fn crash_handler(signo: c_int, info: *mut libc::siginfo_t, _ctx: *mut
 }
 
 /// Append `src` to `buf` at cursor `n` (async-signal-safe; bounded by `buf.len()`).
-fn write_bytes(buf: &mut [u8], n: &mut usize, src: &[u8]) {
+///
+/// 2026-06-12: `pub(super)` so the loader's other async-signal-safe handler (the early-fault tap
+/// in [`super::native_provider`]) reuses these proven formatters instead of duplicating them.
+pub(super) fn write_bytes(buf: &mut [u8], n: &mut usize, src: &[u8]) {
     for &b in src {
         if *n < buf.len() {
             buf[*n] = b;
@@ -436,7 +439,7 @@ fn write_bytes(buf: &mut [u8], n: &mut usize, src: &[u8]) {
 }
 
 /// Append `val` as decimal to `buf` (async-signal-safe; no allocation).
-fn write_dec(buf: &mut [u8], n: &mut usize, val: u64) {
+pub(super) fn write_dec(buf: &mut [u8], n: &mut usize, val: u64) {
     let mut tmp = [0u8; 20];
     let mut i = tmp.len();
     let mut v = val;
@@ -453,7 +456,7 @@ fn write_dec(buf: &mut [u8], n: &mut usize, val: u64) {
 }
 
 /// Append `val` as lowercase hex to `buf` (async-signal-safe; no allocation).
-fn write_hex(buf: &mut [u8], n: &mut usize, val: u64) {
+pub(super) fn write_hex(buf: &mut [u8], n: &mut usize, val: u64) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut tmp = [0u8; 16];
     let mut i = tmp.len();
