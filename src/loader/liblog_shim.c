@@ -3,10 +3,16 @@
  *
  * Rust stable cannot DEFINE a C-variadic `extern "C"` function (the `c_variadic` feature is
  * nightly-only), and Eclipse builds on stable (clean-checkout portability, AGENTS.md §2.11). The
- * two remaining `libroblox.so` bionic imports are exactly such variadic functions:
+ * `libroblox.so` bionic imports below are exactly such variadic functions (plus one `va_list`
+ * variant, which has no stable Rust spelling either):
  *
  *     int  __android_log_print (int prio, const char* tag, const char* fmt, ...);
  *     void __android_log_assert(const char* cond, const char* tag, const char* fmt, ...);
+ *     int  __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap);
+ *
+ * (2026-06-12: `__android_log_vprint` added — `libbacktrace-native.so` imports it as one of the 2
+ * unresolved strong imports that failed its Eclipse pre-load, sending its `System.loadLibrary`
+ * into the apkenv shim linker's fatal NULL `_r_debug_ptr` write — core 866509.)
  *
  * This tiny shim DEFINES them per the PUBLIC liblog C-ABI (the documented signatures in
  * <android/log.h>): it formats the variadic argument list with vsnprintf into a bounded stack
@@ -61,6 +67,37 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
      * (excluding the NUL), or a negative value on an output/encoding error. */
     int written = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+
+    if (written < 0) {
+        /* Encoding/output error — emit nothing meaningful; report the error per contract. */
+        return written;
+    }
+
+    eclipse_liblog_emit(prio, (tag != NULL) ? tag : "", buf);
+
+    /* On truncation vsnprintf returns the untruncated length; the bytes actually emitted are at
+     * most sizeof(buf)-1. Report the emitted byte count (> 0 on success per the liblog contract). */
+    int emitted = (written < (int)sizeof(buf)) ? written : (int)(sizeof(buf) - 1);
+    return (emitted > 0) ? emitted : 1;
+}
+
+/*
+ * int __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap)
+ *
+ * Public liblog contract (<android/log.h>): identical to __android_log_print, but the caller has
+ * already materialized the va_list. 2026-06-12: same bounded vsnprintf → eclipse_liblog_emit path
+ * and the same return contract as __android_log_print above.
+ */
+int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+    char buf[ECLIPSE_LIBLOG_BUF];
+
+    if (fmt == NULL) {
+        fmt = "";
+    }
+
+    /* vsnprintf NUL-terminates within `buf` and returns the would-be length (excluding the NUL),
+     * or a negative value on an output/encoding error. */
+    int written = vsnprintf(buf, sizeof(buf), fmt, ap);
 
     if (written < 0) {
         /* Encoding/output error — emit nothing meaningful; report the error per contract. */

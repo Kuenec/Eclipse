@@ -889,6 +889,30 @@ pub fn boot(
     // libart is already kept mapped for the VM's lifetime (leaked via `into_raw()` above; its
     // daemon threads reference its code, so unmapping it would be UB).
 
+    // 2026-06-12 (core 866509): ART's `Thread::Init` just registered a 32 KiB glibc-HEAP buffer
+    // (vendored `thread_linux.cc` `SetUpAlternateSignalStack`, `new uint8_t[]`, no guard page) as
+    // this main thread's alternate signal stack; the fatal-signal handler chain (Eclipse tap →
+    // libsigchain → ART's unexpected-signal dump) measured ~79.2 KiB and overflowed it, silently
+    // zero-filling live heap below `ss_sp` ("malloc(): unaligned tcache chunk detected" SIGABRT
+    // mid-crash-report). Replace it NOW — after `JNI_CreateJavaVM`, so ART cannot overwrite it
+    // again, and safe from ART's `TearDownAlternateSignalStack` `delete[]` of the current `ss_sp`
+    // because Eclipse never destroys the VM or detaches this thread (`Vm` has no `Drop`). The
+    // displaced 32 KiB ART buffer leaks once by design (freeing a foreign `operator new[]`
+    // allocation would be unsound). Non-fatal on failure: the boot proceeds on ART's stack — the
+    // pre-fix state, losing only the overflow protection.
+    match crate::loader::native_provider::install_guarded_altstack() {
+        Ok(st) => {
+            println!(
+                "main-thread alternate signal stack: Eclipse guard-paged {} KiB @ {:#x} (replaces ART's heap-backed 32 KiB) ✓",
+                st.ss_size / 1024,
+                st.ss_sp
+            );
+        }
+        Err(e) => {
+            eprintln!("# WARNING: guard-paged altstack install failed (continuing on ART's heap-backed stack): {e}");
+        }
+    }
+
     // JNI_OK with a live JavaVM + JNIEnv is definitive: ART loaded the boot image and libcore's
     // native backends and attached this thread before returning. Return the owned `Vm` handle so
     // the caller keeps the VM reachable on this (main) thread for the next increment's JNI calls;

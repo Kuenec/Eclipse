@@ -148,21 +148,23 @@ impl EclipseNativeProvider {
         self.natives.is_empty()
     }
 
-    /// Build the provider with the **fixed-arity liblog (3)** + **bionic-specific libc (15)** +
+    /// Build the provider with the **fixed-arity liblog (3)** + **bionic-specific libc (16)** +
     /// **bionic stdio FILE\* translation (25)** + **bionic signal-ABI (6)** + **ndk-android
     /// libandroid (27)** natives this module implements registered. Taking each native's address is
     /// safe Rust (a function/data item coerced to a pointer then to `u64`).
     ///
     /// The names are the real work-list from `loader::link::tests::real_libroblox_bionic_env_*`
-    /// (`docs/bionic-env-worklist.md`): liblog's full 5 (the 3 fixed-arity Rust natives plus the 2
-    /// **variadic** ones — `__android_log_print`/`__android_log_assert` — now DEFINED by the
-    /// clean-room C shim, 2026-06-05); bionic-libc's 15; the stdio FILE\* translation 25
+    /// (`docs/bionic-env-worklist.md`): liblog's full 6 (the 3 fixed-arity Rust natives plus the 2
+    /// **variadic** ones — `__android_log_print`/`__android_log_assert` — DEFINED by the
+    /// clean-room C shim, 2026-06-05, plus the `va_list` `__android_log_vprint`, 2026-06-12 —
+    /// `libbacktrace-native.so`'s pre-load needs it); bionic-libc's 16 (`__umask_chk` added
+    /// 2026-06-12, the other libbacktrace-native unresolved import); the stdio FILE\* translation 25
     /// (2026-06-12 — bionic `&__sF[i]` stream sentinels remapped to host glibc streams; see the
     /// `__sF` section); the signal-ABI 6 (2026-06-11 — these resolved to host glibc before, whose
     /// sigset_t/sigaction LAYOUT is incompatible; see the signal-ABI section); ndk-android's 27
     /// (AAsset* real via
     /// `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub); media-ndk's 33
-    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **119**
+    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **121**
     /// symbols total.
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
@@ -192,8 +194,16 @@ impl EclipseNativeProvider {
             "__android_log_assert",
             __android_log_assert as *const () as u64,
         );
+        // The va_list liblog native — also DEFINED by the C shim (no stable Rust spelling for
+        // va_list). 2026-06-12: libbacktrace-native.so imports it; without it the pre-load failed
+        // and System.loadLibrary("backtrace-native") fell through to the apkenv shim linker
+        // (fatal NULL _r_debug_ptr write — core 866509).
+        p.register(
+            "__android_log_vprint",
+            __android_log_vprint as *const () as u64,
+        );
 
-        // ---- bionic-specific libc (15) — glibc lacks these exact names --------------------------
+        // ---- bionic-specific libc (16) — glibc lacks these exact names --------------------------
         // FORTIFY `_chk` family — forward to the plain glibc routine (ABI-identical), honoring the
         // bound per the public `_FORTIFY_SOURCE` contract (abort if the access would overflow).
         p.register("__strlen_chk", eclipse_strlen_chk as *const () as u64);
@@ -205,6 +215,7 @@ impl EclipseNativeProvider {
         p.register("__FD_SET_chk", eclipse_fd_set_chk as *const () as u64);
         p.register("__FD_CLR_chk", eclipse_fd_clr_chk as *const () as u64);
         p.register("__FD_ISSET_chk", eclipse_fd_isset_chk as *const () as u64);
+        p.register("__umask_chk", eclipse_umask_chk as *const () as u64);
         // bionic internal / assert / strerror / property entry points.
         p.register("__errno", eclipse_errno as *const () as u64);
         p.register("__assert2", eclipse_assert2 as *const () as u64);
@@ -685,14 +696,17 @@ unsafe extern "C" fn eclipse_android_set_abort_message(msg: *const c_char) {
 }
 
 // =================================================================================================
-// liblog — the 2 VARIADIC natives: clean-room C shim → Eclipse sink (added 2026-06-05).
+// liblog — the 2 VARIADIC + 1 va_list natives: clean-room C shim → Eclipse sink (2026-06-05;
+// `__android_log_vprint` added 2026-06-12).
 // =================================================================================================
 //
 // `__android_log_print` / `__android_log_assert` are C-variadic; Rust stable cannot DEFINE a
 // variadic `extern "C"` fn (`c_variadic` is nightly-only) but it CAN declare one and take its
-// address. The definitions live in the clean-room C shim `src/loader/liblog_shim.c` (compiled by
-// build.rs via the `cc` crate); each formats its varargs with `vsnprintf` into a bounded stack
-// buffer and forwards the finished line to the Eclipse-owned non-variadic sink below.
+// address. `__android_log_vprint` takes a `va_list` (no stable Rust spelling — the
+// `eclipse_vfprintf` precedent). The definitions live in the clean-room C shim
+// `src/loader/liblog_shim.c` (compiled by build.rs via the `cc` crate); each formats its
+// varargs/va_list with `vsnprintf` into a bounded stack buffer and forwards the finished line to
+// the Eclipse-owned non-variadic sink below.
 
 extern "C" {
     /// `int __android_log_print(int prio, const char* tag, const char* fmt, ...)` — DEFINED in the
@@ -703,6 +717,19 @@ extern "C" {
     /// `void __android_log_assert(const char* cond, const char* tag, const char* fmt, ...)` —
     /// DEFINED in the C shim (noreturn: emits FATAL then `abort()`). Address-only use here.
     fn __android_log_assert(cond: *const c_char, tag: *const c_char, fmt: *const c_char, ...);
+
+    /// `int __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap)` —
+    /// DEFINED in the C shim. 2026-06-12: one of `libbacktrace-native.so`'s 2 unresolved strong
+    /// imports (the failed pre-load that sent its `System.loadLibrary` into the apkenv shim
+    /// linker's fatal NULL `_r_debug_ptr` write — core 866509). In the x86-64 SysV ABI a `va_list`
+    /// parameter is a pointer (`__va_list_tag*`), so the declaration is ABI-accurate — and it is
+    /// ADDRESS-ONLY here (never called from Rust).
+    fn __android_log_vprint(
+        prio: c_int,
+        tag: *const c_char,
+        fmt: *const c_char,
+        ap: *mut c_void,
+    ) -> c_int;
 }
 
 /// Eclipse-owned **non-variadic** liblog sink, called by the C variadic shim
@@ -725,7 +752,7 @@ pub unsafe extern "C" fn eclipse_liblog_emit(prio: c_int, tag: *const c_char, ms
 }
 
 // =================================================================================================
-// bionic-specific libc (15) — names glibc does not export under these exact identifiers.
+// bionic-specific libc (16) — names glibc does not export under these exact identifiers.
 // =================================================================================================
 
 // ---- FORTIFY `_chk` family — forward to the ABI-identical glibc routine, honoring the bound ------
@@ -857,6 +884,25 @@ unsafe extern "C" fn eclipse_sendto_chk(
     // the caller's socket-address args (null-or-valid per sendto). glibc `sendto` is ABI-identical
     // to bionic's underlying send.
     unsafe { libc::sendto(fd, buf, len, flags, dst, dst_len) }
+}
+
+/// `mode_t __umask_chk(mode_t mode)` — bionic FORTIFY umask. Aborts if `mode` carries bits outside
+/// the permission mask `0777` (the public bionic FORTIFY contract — `bits/fortify/stat.h` routes
+/// `umask(mode)` here and documents "called with invalid mode" as the fortify failure), else
+/// forwards to glibc `umask` (ABI-identical: `mode_t` is `u32` on LP64). **forward.**
+///
+/// 2026-06-12: one of `libbacktrace-native.so`'s 2 unresolved strong imports — absent from glibc
+/// (glibc has no `__umask_chk`) and from every Eclipse provider, the pre-load failure that sent
+/// its `System.loadLibrary` into the apkenv shim linker (fatal NULL `_r_debug_ptr` write,
+/// core 866509).
+unsafe extern "C" fn eclipse_umask_chk(mode: libc::mode_t) -> libc::mode_t {
+    if mode & !0o777 != 0 {
+        // bionic `__umask_chk` calls `__fortify_fatal` (abort) on an invalid mode — match it.
+        std::process::abort();
+    }
+    // SAFETY: 2026-06-12 — `umask(2)` takes any mode_t and cannot fail; after the bound check the
+    // mode is a valid permission mask. glibc `umask` is ABI-identical to bionic's underlying umask.
+    unsafe { libc::umask(mode) }
 }
 
 // FD_SET / FD_CLR / FD_ISSET FORTIFY helpers. bionic's `__FD_*_chk(int fd, fd_set*, size_t set_size)`
@@ -1802,11 +1848,16 @@ unsafe extern "C" fn early_fault_tap_handler(
 /// deliberately stops kernel forwarding for the tapped signal, so installing "through" the
 /// tapped path would be self-defeating); the glibc-shaped queried/old actions also feed the
 /// shared [`bionic_action_from_glibc`] to seed the chain slot. Flags: `SA_SIGINFO | SA_ONSTACK`,
-/// empty mask (no SA_NODEFER — the tapped signal stays blocked during the handler). Deliberately
-/// NO Eclipse `sigaltstack`: ART manages per-thread alt stacks for its attached threads and an
-/// Eclipse-installed one on the main thread would clobber ART's; SA_ONSTACK uses whatever alt
-/// stack the faulting thread already has (ignored without one), and the known fault is not a
-/// stack overflow (crashpad's handler ran on it — AGENTS.md §5).
+/// empty mask (no SA_NODEFER — the tapped signal stays blocked during the handler).
+///
+/// 2026-06-12 (core 866509): the earlier "deliberately NO Eclipse `sigaltstack`" stance here is
+/// DISPROVEN — its premise ("the known fault is not a stack overflow") missed that the
+/// tap→sigchain→ART-dump chain itself overflows ART's 32 KiB heap-backed main-thread altstack
+/// (~79.2 KiB measured), silently zeroing live heap below `ss_sp` (the `malloc(): unaligned
+/// tcache chunk detected` SIGABRT that destroyed the crash report). Its clobber reasoning was
+/// also backwards: ART overwrites whatever altstack exists at attach, not the reverse. Eclipse
+/// now REPLACES the main thread's altstack with a guard-paged mmap'd one right after
+/// `JNI_CreateJavaVM` — see [`install_guarded_altstack`] and the `runtime::boot` wiring.
 pub(super) fn install_early_fault_tap(signum: c_int) -> Result<(), String> {
     if TAPPED_SIGNAL.load(Ordering::Acquire) != 0 {
         return Ok(());
@@ -1870,6 +1921,126 @@ pub(super) fn install_early_fault_tap(signum: c_int) -> Result<(), String> {
 pub(super) fn publish_engine_text_range(base: u64, span: u64) {
     ENGINE_RANGE_BASE.store(base, Ordering::Relaxed);
     ENGINE_RANGE_SPAN.store(span, Ordering::Relaxed);
+}
+
+// =================================================================================================
+// Eclipse-owned guard-paged alternate signal stack (2026-06-12 — core 866509).
+// =================================================================================================
+
+/// The measured stack cost of the deepest observed fatal-signal handler chain (core 866509,
+/// 2026-06-12): Eclipse tap → libsigchain → ART `HandleUnexpectedSignalCommon` → `DumpNativeStack`
+/// → `BacktraceMap::Create` → vendored libunwind, whose maps-parser frame alone was 76,816 bytes —
+/// ~79.2 KiB total, 51.9 KiB PAST the 32 KiB stack it ran on. [`ALTSTACK_SIZE`] must dominate it.
+pub const ALTSTACK_CHAIN_BUDGET: usize = 80 * 1024;
+
+/// The usable size of Eclipse's alternate signal stack: 3× the measured worst chain
+/// ([`ALTSTACK_CHAIN_BUDGET`]) — the 128–256 KiB headroom band the core-866509 analysis called
+/// for. An overflow past it now lands on the PROT_NONE guard page (a clean fault), never on heap.
+pub const ALTSTACK_SIZE: usize = 256 * 1024;
+
+/// A successfully installed Eclipse-owned alternate signal stack (see
+/// [`install_guarded_altstack`]). The mapping is `[guard_base, guard_base + mapping_len)`:
+/// one PROT_NONE guard page at the bottom, then the `ss_size` usable stack.
+#[derive(Debug, Clone, Copy)]
+pub struct GuardedAltstack {
+    /// `ss_sp` as registered with the kernel: `guard_base + page` (just above the guard page).
+    pub ss_sp: u64,
+    /// `ss_size` as registered: [`ALTSTACK_SIZE`].
+    pub ss_size: usize,
+    /// The full mapping's base = the PROT_NONE guard page, one host page below [`Self::ss_sp`].
+    pub guard_base: u64,
+    /// The full mapping length (guard page + stack) — what a `munmap` of the region would take.
+    pub mapping_len: usize,
+}
+
+/// Install an Eclipse-owned, mmap'd, guard-paged alternate signal stack on the CALLING thread,
+/// replacing whatever stack is currently registered (never freeing it — see below).
+///
+/// 2026-06-12 — root cause this exists for (core 866509): vendored ART's
+/// `Thread::SetUpAlternateSignalStack` (`art/runtime/thread_linux.cc`, run by `Thread::Init` for
+/// every attaching thread — including the process main thread inside `JNI_CreateJavaVM`)
+/// registers a 32 KiB **glibc-heap** buffer (`new uint8_t[]`) with no guard page and live malloc
+/// arena directly below. The fatal-SIGSEGV handler chain measured ~79.2 KiB
+/// ([`ALTSTACK_CHAIN_BUDGET`]), so it plunged 51.9 KiB below `ss_sp`, zero-filling live heap —
+/// surfacing as glibc's `malloc(): unaligned tcache chunk detected` SIGABRT that destroyed the
+/// crash report mid-backtrace. This mmap'd replacement turns any future overflow into a clean
+/// guard-page fault instead of silent heap corruption.
+///
+/// Install-point contract (verified against the vendored ART source, 2026-06-12):
+/// - ART's `SetUpAlternateSignalStack` unconditionally overwrites the thread's current altstack
+///   at attach, so this must be called AFTER `JNI_CreateJavaVM` on the main thread (the
+///   `runtime::boot` wiring) for Eclipse's stack to be the one in effect on signal delivery.
+/// - ART's `TearDownAlternateSignalStack` queries the CURRENT `ss_sp` and `delete[]`s it — it
+///   does NOT tolerate a foreign pointer. It only runs when a thread detaches from the runtime;
+///   Eclipse never destroys the VM or detaches the main thread (`runtime::Vm` has no `Drop`;
+///   `DestroyJavaVM` is never called), so ART can never free this mapping. The 32 KiB ART buffer
+///   this displaces is never freed either (a one-time, main-thread-only leak by design — freeing
+///   a foreign `operator new[]` allocation from Rust would be unsound).
+/// - ART-attached ENGINE threads still get ART's heap-backed stack at attach (ART overwrites any
+///   pre-installed one, and Eclipse cannot hook the attach point) — a recorded limitation, not
+///   fixable on the Eclipse side without modifying vendored ART. Threads with NO altstack are
+///   already safe (delivery falls back to the glibc-guard-paged thread stack).
+pub fn install_guarded_altstack() -> Result<GuardedAltstack, String> {
+    let page = super::map::host_page_size() as usize;
+    let mapping_len = page + ALTSTACK_SIZE;
+    // Map the whole region PROT_NONE first, then open up the stack part — so the guard page is
+    // never writable at any point. MAP_STACK marks the mapping's purpose (advisory on Linux).
+    // SAFETY: 2026-06-12 — anonymous private mapping of a kernel-chosen address; no existing
+    // memory is touched. A MAP_FAILED return is checked before use.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mapping_len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(format!(
+            "mmap({mapping_len}) for the alternate signal stack failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let guard_base = base as u64;
+    let ss_sp = guard_base + page as u64;
+    // SAFETY: 2026-06-12 — `[ss_sp, ss_sp + ALTSTACK_SIZE)` lies inside the mapping just created
+    // (its tail; the first page stays PROT_NONE as the guard). Page-aligned by construction.
+    if unsafe {
+        libc::mprotect(
+            ss_sp as *mut c_void,
+            ALTSTACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )
+    } != 0
+    {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: 2026-06-12 — unmap exactly the mapping created above (nothing else references it).
+        unsafe { libc::munmap(base, mapping_len) };
+        return Err(format!(
+            "mprotect(RW) of the alternate signal stack failed: {e}"
+        ));
+    }
+    let ss = libc::stack_t {
+        ss_sp: ss_sp as *mut c_void,
+        ss_flags: 0,
+        ss_size: ALTSTACK_SIZE,
+    };
+    // SAFETY: 2026-06-12 — `ss` describes the writable region just mapped; a null `old_ss` is the
+    // documented "don't report the previous stack" form. Registers for the calling thread only.
+    if unsafe { libc::sigaltstack(&ss, std::ptr::null_mut()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: 2026-06-12 — as above; the kernel rejected the registration so nothing uses it.
+        unsafe { libc::munmap(base, mapping_len) };
+        return Err(format!("sigaltstack(install) failed: {e}"));
+    }
+    Ok(GuardedAltstack {
+        ss_sp,
+        ss_size: ALTSTACK_SIZE,
+        guard_base,
+        mapping_len,
+    })
 }
 
 // =================================================================================================
@@ -3633,6 +3804,12 @@ mod tests {
         assert!(p
             .resolve("__android_log_assert")
             .is_some_and(|r| r.addr != 0));
+        // The va_list liblog native + the FORTIFY umask wrapper (2026-06-12 — the two
+        // libbacktrace-native.so pre-load imports; their absence re-opened the apkenv delegation).
+        assert!(p
+            .resolve("__android_log_vprint")
+            .is_some_and(|r| r.addr != 0));
+        assert!(p.resolve("__umask_chk").is_some_and(|r| r.addr != 0));
         // An unregistered name → None (falls through to the host tier).
         assert_eq!(p.resolve("memcpy"), None);
         assert_eq!(p.resolve("__eclipse_no_such_native__"), None);
@@ -3641,28 +3818,31 @@ mod tests {
     #[test]
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
-        // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 25 bionic-stdio
-        // FILE*-translation (22 Rust + 3 C-shim; 2026-06-12 — the &__sF[i] sentinel remap) + 6
-        // bionic-signal (2026-06-11) + 27 ndk-android + 33 media-ndk + 8 audio + 51
+        // 6 liblog (3 fixed-arity Rust + 2 variadic C-shim + 1 va_list C-shim; 2026-06-12 —
+        // __android_log_vprint, a libbacktrace-native pre-load import) + 16 bionic-libc
+        // (2026-06-12 — __umask_chk, the other libbacktrace-native pre-load import) + 25
+        // bionic-stdio FILE*-translation (22 Rust + 3 C-shim; 2026-06-12 — the &__sF[i] sentinel
+        // remap) + 6 bionic-signal (2026-06-11) + 27 ndk-android + 33 media-ndk + 8 audio + 51
         // bionic-pthread/TLS/sem/syscall (37 + the 14 thread-lifecycle natives added 2026-06-05:
         // create/join/detach/setname_np/kill/getattr_np/get+setschedparam/attr_*) + 5
         // bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo — the
-        // allocator-bootstrap fix, 2026-06-05) = 175.
+        // allocator-bootstrap fix, 2026-06-05) = 177.
         assert_eq!(
             p.len(),
-            119 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            121 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
-            "5 liblog + 15 bionic-libc + 25 bionic-stdio + 6 bionic-signal + 27 ndk-android + 33 \
+            "6 liblog + 16 bionic-libc + 25 bionic-stdio + 6 bionic-signal + 27 ndk-android + 33 \
              media-ndk + 8 audio + 51 pthread + 5 sysconf system-query natives registered"
         );
         for name in [
-            // liblog (3 fixed-arity Rust + 2 variadic C-shim)
+            // liblog (3 fixed-arity Rust + 2 variadic C-shim + 1 va_list C-shim)
             "__android_log_write",
             "__android_log_buf_write",
             "android_set_abort_message",
             "__android_log_print",
             "__android_log_assert",
-            // bionic-libc (15)
+            "__android_log_vprint",
+            // bionic-libc (16)
             "__strlen_chk",
             "__strchr_chk",
             "__strncpy_chk2",
@@ -3672,6 +3852,7 @@ mod tests {
             "__FD_SET_chk",
             "__FD_CLR_chk",
             "__FD_ISSET_chk",
+            "__umask_chk",
             "__errno",
             "__assert2",
             "__gnu_strerror_r",
@@ -3917,6 +4098,24 @@ mod tests {
         assert!(!p.is_null());
         // SAFETY: `p` points into `s` at the 'c'.
         assert_eq!(unsafe { *p } as u8, b'c');
+    }
+
+    #[test]
+    fn umask_chk_forwards_a_valid_mode_and_round_trips() {
+        // 2026-06-12: __umask_chk (bionic FORTIFY umask) must forward a valid 0..=0o777 mode to the
+        // kernel and return the PREVIOUS mask — the libbacktrace-native.so pre-load import whose
+        // absence (with __android_log_vprint) re-opened the apkenv delegation (core 866509). The
+        // invalid-mode branch aborts the process (the FORTIFY contract) and is pinned by the bound
+        // check's presence, not exercised here. umask is process-global: save + restore around.
+        // SAFETY: umask(2) takes any mode and cannot fail; all modes used are valid masks.
+        unsafe {
+            let saved = libc::umask(0o022); // returns the pre-test mask; 0o022 is now current
+            let prev = eclipse_umask_chk(0o077);
+            assert_eq!(prev, 0o022, "__umask_chk returns the previous mask");
+            let now = eclipse_umask_chk(0o022);
+            assert_eq!(now, 0o077, "__umask_chk installed the requested mask");
+            libc::umask(saved); // restore the pre-test mask
+        }
     }
 
     #[test]
@@ -4510,6 +4709,80 @@ mod tests {
         assert_eq!(b.handler, 0x1234, "the handler carries over");
         assert_eq!(b.sa_mask, 1 << (libc::SIGURG - 1), "the mask narrows");
         assert_eq!(b.sa_restorer, 0, "the restorer pointer is never carried");
+    }
+
+    #[test]
+    fn guarded_altstack_installs_eclipse_region_with_a_prot_none_guard_page() {
+        // 2026-06-12 (core 866509): the pin that fails if the heap-backed 32 KiB ART altstack (or
+        // any guard-less/undersized stack) ever becomes the active one again on a thread Eclipse
+        // owns. Asserts the three load-bearing properties: (1) sigaltstack(NULL, &ss) reports
+        // Eclipse's mmap'd region as the ACTIVE stack, (2) ss_size dominates the measured
+        // ~79.2 KiB fatal-chain budget, (3) the page below ss_sp is PROT_NONE — an overflow is a
+        // clean guard-page fault, never silent heap zeroing. sigaltstack is per-thread, so the
+        // install + probes + restore are self-contained on this test thread.
+        // SAFETY: query-only sigaltstack with a valid out-param.
+        let mut saved: libc::stack_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: `saved` is a valid out-param; a null ss makes this a pure query.
+            unsafe { libc::sigaltstack(std::ptr::null(), &mut saved) },
+            0,
+            "query the pre-test altstack state"
+        );
+
+        let st = install_guarded_altstack().expect("install the Eclipse guard-paged altstack");
+
+        // (1) The kernel reports Eclipse's region as this thread's ACTIVE alternate stack.
+        // SAFETY: `q` is a valid out-param; null ss = pure query.
+        let mut q: libc::stack_t = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::sigaltstack(std::ptr::null(), &mut q) }, 0);
+        assert_eq!(
+            q.ss_sp as u64, st.ss_sp,
+            "the active altstack must be Eclipse's mmap'd region"
+        );
+        assert_eq!(q.ss_size, st.ss_size, "the active size is Eclipse's");
+        assert_eq!(q.ss_flags & libc::SS_DISABLE, 0, "the stack is enabled");
+
+        // (2) Sized for the documented chain budget with headroom (the 32 KiB ART stack fails this).
+        assert!(
+            st.ss_size >= 2 * ALTSTACK_CHAIN_BUDGET,
+            "ss_size {} must dominate the measured ~79.2 KiB fatal-chain budget",
+            st.ss_size
+        );
+
+        // (3) Guard-page geometry + protection: ss_sp sits exactly one page above the mapping
+        // base, the stack region is readable, and the guard page (incl. the 8 bytes just below
+        // ss_sp) is PROT_NONE — probed via the tap's process_vm_readv self-probe (EFAULT class).
+        let page = crate::loader::map::host_page_size();
+        assert_eq!(st.guard_base + page, st.ss_sp, "one guard page below ss_sp");
+        assert!(
+            tap_read_u64(st.ss_sp).is_some(),
+            "the stack region is mapped + readable"
+        );
+        assert!(
+            tap_read_u64(st.ss_sp + st.ss_size as u64 - 8).is_some(),
+            "the top of the stack region is mapped"
+        );
+        assert!(
+            tap_read_u64(st.guard_base).is_none(),
+            "the guard page is PROT_NONE (unreadable)"
+        );
+        assert!(
+            tap_read_u64(st.ss_sp - 8).is_none(),
+            "the bytes immediately below ss_sp fall in the guard page"
+        );
+
+        // Restore the pre-test per-thread state and unmap the test region (the real boot keeps
+        // its region for the process lifetime; this cleanup is test hygiene only).
+        // SAFETY: `saved` is the kernel's own pre-test report (a disabled state round-trips as
+        // SS_DISABLE); restoring it cannot install an invalid stack.
+        assert_eq!(
+            unsafe { libc::sigaltstack(&saved, std::ptr::null_mut()) },
+            0
+        );
+        // SAFETY: unmap exactly the region install_guarded_altstack mapped for THIS test; the
+        // kernel no longer references it (the restore above deregistered it).
+        unsafe { libc::munmap(st.guard_base as *mut c_void, st.mapping_len) };
     }
 
     #[test]

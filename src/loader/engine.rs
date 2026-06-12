@@ -197,8 +197,15 @@ pub enum EngineLoadError {
     /// The map / relocate / resolve pipeline failed (a real loader error).
     Link(String),
     /// One or more strong (non-weak) imports stayed unresolved — running constructors would jump
-    /// through a null GOT slot. Carries the count (the work-list must be 0 for a sound run).
-    UnresolvedImports(usize),
+    /// through a null GOT slot. Carries the unresolved-reloc count AND the sorted, de-duped symbol
+    /// names (the work-list must be 0 for a sound run).
+    ///
+    /// 2026-06-12: the names are load-bearing diagnostics — the pre-load warning printed only a
+    /// COUNT, so the 2 imports that failed `libbacktrace-native.so`'s pre-load (sending its
+    /// `System.loadLibrary` into the apkenv shim linker's fatal NULL `_r_debug_ptr` write, core
+    /// 866509) had to be reconstructed by offline readelf set-arithmetic instead of being read
+    /// off the log.
+    UnresolvedImports(usize, Vec<String>),
     /// The text segment is not executable after mapping (would fault the first constructor).
     TextNotExecutable(String),
     /// The mapped image lacks a `DT_INIT_ARRAY` (unexpected — the engine has 3,427 constructors).
@@ -217,8 +224,12 @@ impl std::fmt::Display for EngineLoadError {
             Self::Apk(entry, e) => write!(f, "read {entry} from APK: {e}"),
             Self::Stage(e) => write!(f, "stage libroblox.so: {e}"),
             Self::Link(e) => write!(f, "map/relocate/resolve libroblox.so: {e}"),
-            Self::UnresolvedImports(n) => {
-                write!(f, "{n} strong import(s) unresolved (work-list non-empty)")
+            Self::UnresolvedImports(n, names) => {
+                write!(
+                    f,
+                    "{n} strong import(s) unresolved (work-list non-empty): {}",
+                    names.join(", ")
+                )
             }
             Self::TextNotExecutable(d) => write!(f, "engine text segment not executable: {d}"),
             Self::NoInitArray => write!(f, "mapped libroblox.so has no DT_INIT_ARRAY"),
@@ -346,9 +357,12 @@ fn map_resolve_app_lib(
         sym_stats.applied_nonnull, sym_stats.applied_weak_zero, sym_stats.unresolved_strong
     );
     if sym_stats.unresolved_strong != 0 {
-        // A non-zero work-list means a constructor could jump through a null GOT slot — refuse to run.
+        // A non-zero work-list means a constructor could jump through a null GOT slot — refuse to
+        // run. Carry the NAMES (stats.unresolved is sorted + de-duped) so the caller's warning
+        // identifies the missing natives on the log itself (2026-06-12 — see UnresolvedImports).
         return Err(EngineLoadError::UnresolvedImports(
             sym_stats.unresolved_strong,
+            sym_stats.unresolved,
         ));
     }
 
@@ -726,6 +740,31 @@ mod tests {
         // Eclipse boots ART at JNI 1.6 (runtime.rs); the engine is expected to request ≥ 1.6. Pin the
         // constant so a jni-sys bump that changed it would fail here, not silently at runtime.
         assert_eq!(JNI_VERSION_1_6, 0x0001_0006);
+    }
+
+    #[test]
+    fn unresolved_imports_error_names_the_symbols() {
+        // 2026-06-12: the pre-load failure warning printed only a COUNT, so core 866509's 2-symbol
+        // work-list (__android_log_vprint + __umask_chk, the failed libbacktrace-native.so
+        // pre-load that re-opened the apkenv delegation) had to be reconstructed by offline
+        // readelf set-arithmetic. The Display output must NAME every unresolved import so the next
+        // fall-through is identified from the boot log itself.
+        let e = EngineLoadError::UnresolvedImports(
+            2,
+            vec![
+                "__android_log_vprint".to_string(),
+                "__umask_chk".to_string(),
+            ],
+        );
+        let msg = e.to_string();
+        assert!(
+            msg.contains("2 strong import(s) unresolved"),
+            "keeps the count: {msg}"
+        );
+        assert!(
+            msg.contains("__android_log_vprint") && msg.contains("__umask_chk"),
+            "names every unresolved import: {msg}"
+        );
     }
 
     #[test]
