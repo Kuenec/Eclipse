@@ -94,7 +94,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_long, c_void};
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -114,9 +114,9 @@ use super::resolve::{ResolvedSym, SymbolProvider};
 /// definitions), or `None` for an unregistered name (so the scope falls through to the host tier).
 ///
 /// Built with [`EclipseNativeProvider::with_bionic_natives`], which registers the liblog (3
-/// fixed-arity), bionic-specific libc (15), and bionic signal-ABI (6, 2026-06-11) natives
-/// implemented in this module. Prepended before the host baseline in
-/// [`super::bionic_env::BionicEnv`] so Eclipse's bionic-correct impls win.
+/// fixed-arity), bionic-specific libc (15), bionic stdio FILE\*-translation (25, 2026-06-12), and
+/// bionic signal-ABI (6, 2026-06-11) natives implemented in this module. Prepended before the host
+/// baseline in [`super::bionic_env::BionicEnv`] so Eclipse's bionic-correct impls win.
 pub struct EclipseNativeProvider {
     /// name → run-time address of the Eclipse-owned `extern "C"` symbol.
     natives: HashMap<&'static str, u64>,
@@ -149,19 +149,21 @@ impl EclipseNativeProvider {
     }
 
     /// Build the provider with the **fixed-arity liblog (3)** + **bionic-specific libc (15)** +
-    /// **bionic signal-ABI (6)** + **ndk-android libandroid (27)** natives this module implements
-    /// registered. Taking each native's address is safe Rust (a function/data item coerced to a
-    /// pointer then to `u64`).
+    /// **bionic stdio FILE\* translation (25)** + **bionic signal-ABI (6)** + **ndk-android
+    /// libandroid (27)** natives this module implements registered. Taking each native's address is
+    /// safe Rust (a function/data item coerced to a pointer then to `u64`).
     ///
     /// The names are the real work-list from `loader::link::tests::real_libroblox_bionic_env_*`
     /// (`docs/bionic-env-worklist.md`): liblog's full 5 (the 3 fixed-arity Rust natives plus the 2
     /// **variadic** ones — `__android_log_print`/`__android_log_assert` — now DEFINED by the
-    /// clean-room C shim, 2026-06-05); bionic-libc's 15; the signal-ABI 6 (2026-06-11 — these
-    /// resolved to host glibc before, whose sigset_t/sigaction LAYOUT is incompatible; see the
-    /// signal-ABI section); ndk-android's 27 (AAsset* real via
+    /// clean-room C shim, 2026-06-05); bionic-libc's 15; the stdio FILE\* translation 25
+    /// (2026-06-12 — bionic `&__sF[i]` stream sentinels remapped to host glibc streams; see the
+    /// `__sF` section); the signal-ABI 6 (2026-06-11 — these resolved to host glibc before, whose
+    /// sigset_t/sigaction LAYOUT is incompatible; see the signal-ABI section); ndk-android's 27
+    /// (AAsset* real via
     /// `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub); media-ndk's 33
-    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **94** symbols
-    /// total.
+    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **119**
+    /// symbols total.
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -217,6 +219,42 @@ impl EclipseNativeProvider {
         // bionic data OBJECTs (not functions): the SSP guard word and the stdio FILE table.
         p.register("__stack_chk_guard", eclipse_stack_chk_guard_addr());
         p.register("__sF", eclipse_sf_addr());
+
+        // ---- bionic stdio FILE* translation (25) — &__sF[i] sentinels → host glibc streams ------
+        // 2026-06-12: bionic's public ABI computes stdin/stdout/stderr as `&__sF[i]` (an
+        // array-of-STRUCTS interior address, stride 152 on LP64) — those sentinel addresses are
+        // NOT glibc FILE*s, so every FILE*-consuming stdio import of the five __sF-importing
+        // engine libs (readelf enumeration — see the `__sF` section) is intercepted to remap the
+        // three sentinels and forward to glibc. Root cause: core 782252 — crashpad's
+        // `fputs(msg, &__sF[2])` handed glibc a pointer 280 bytes past Eclipse's old 24-byte
+        // pointer table and the crash handler's own logging SIGSEGV'd.
+        p.register("clearerr", eclipse_clearerr as *const () as u64);
+        p.register("fclose", eclipse_fclose as *const () as u64);
+        p.register("feof", eclipse_feof as *const () as u64);
+        p.register("ferror", eclipse_ferror as *const () as u64);
+        p.register("fflush", eclipse_fflush as *const () as u64);
+        p.register("fgets", eclipse_fgets as *const () as u64);
+        p.register("fileno", eclipse_fileno as *const () as u64);
+        p.register("fputc", eclipse_fputc as *const () as u64);
+        p.register("fputs", eclipse_fputs as *const () as u64);
+        p.register("fputwc", eclipse_fputwc as *const () as u64);
+        p.register("fread", eclipse_fread as *const () as u64);
+        p.register("__fread_chk", eclipse_fread_chk as *const () as u64);
+        p.register("fseek", eclipse_fseek as *const () as u64);
+        p.register("fseeko", eclipse_fseeko as *const () as u64);
+        p.register("ftell", eclipse_ftell as *const () as u64);
+        p.register("ftello", eclipse_ftello as *const () as u64);
+        p.register("fwrite", eclipse_fwrite as *const () as u64);
+        p.register("getc", eclipse_getc as *const () as u64);
+        p.register("getwc", eclipse_getwc as *const () as u64);
+        p.register("setvbuf", eclipse_setvbuf as *const () as u64);
+        p.register("ungetc", eclipse_ungetc as *const () as u64);
+        p.register("ungetwc", eclipse_ungetwc as *const () as u64);
+        // The 2 VARIADIC + 1 va_list stdio natives — DEFINED by the clean-room C shim
+        // (src/loader/stdio_shim.c), the liblog_shim.c pattern. 2026-06-12.
+        p.register("fprintf", eclipse_fprintf as *const () as u64);
+        p.register("fscanf", eclipse_fscanf as *const () as u64);
+        p.register("vfprintf", eclipse_vfprintf as *const () as u64);
 
         // ---- bionic signal ABI (6) — glibc HAS these names but an incompatible layout -----------
         // 2026-06-11: bionic sigset_t = 8 bytes vs glibc's 128; bionic sigaction = flags@0/
@@ -773,10 +811,11 @@ unsafe extern "C" fn eclipse_write_chk(
 }
 
 /// `size_t __fwrite_chk(const void* buf, size_t size, size_t count, FILE* stream, size_t buf_size)`
-/// — bionic FORTIFY fwrite. Aborts if `size * count > buf_size`. **forward.**
+/// — bionic FORTIFY fwrite. Aborts if `size * count > buf_size`. **forward (stream-translated).**
 ///
 /// # Safety
-/// `buf` must point to at least `buf_size` readable bytes; `stream` must be a valid `FILE*`.
+/// `buf` must point to at least `buf_size` readable bytes; `stream` must be a bionic `&__sF[i]`
+/// sentinel or a valid glibc `FILE*`.
 unsafe extern "C" fn eclipse_fwrite_chk(
     buf: *const c_void,
     size: usize,
@@ -789,9 +828,10 @@ unsafe extern "C" fn eclipse_fwrite_chk(
         Some(t) if t <= buf_size => {}
         _ => std::process::abort(),
     }
-    // SAFETY: 2026-06-05 — after the check, `buf` has ≥ `size*count` readable bytes and `stream` is
-    // a valid `FILE*`; glibc `fwrite` reads that many bytes and writes them, ABI-identical.
-    unsafe { libc::fwrite(buf, size, count, stream) }
+    // SAFETY: 2026-06-05 — after the check, `buf` has ≥ `size*count` readable bytes; glibc `fwrite`
+    // reads that many bytes and writes them, ABI-identical. 2026-06-12: the stream may be a bionic
+    // `&__sF[i]` sentinel — remapped to the host glibc stream first (see the `__sF` section).
+    unsafe { libc::fwrite(buf, size, count, eclipse_sf_translate_stream(stream)) }
 }
 
 /// `ssize_t __sendto_chk(int fd, const void* buf, size_t len, size_t buf_size, int flags,
@@ -1857,24 +1897,54 @@ fn eclipse_stack_chk_guard_addr() -> u64 {
     std::ptr::addr_of!(ECLIPSE_STACK_CHK_GUARD) as u64
 }
 
-/// bionic's `__sF` — the stdio `FILE` table whose first three entries back `stdin`/`stdout`/`stderr`
-/// (bionic's `stdin`/`stdout`/`stderr` macros expand to `&__sF[0..2]`). glibc has **no** `__sF` (its
-/// `stdin`/… are individual `FILE*` objects). **forward (host stdio handles):** Eclipse points `__sF`
-/// at a small Eclipse-owned table of three glibc `FILE*` (stdin/stdout/stderr), so a relocated
-/// reference to `__sF[i]` yields a usable host stdio stream.
+/// bionic's `__sF` — the stdio `FILE` table backing `stdin`/`stdout`/`stderr`. bionic's PUBLIC
+/// pre-API-23 stdio ABI (AOSP NDK `<stdio.h>` + `<bits/struct_file.h>`) declares
+/// `extern FILE __sF[]` — an array of **STRUCTS** (`struct __sFILE { char __private[152]; }` on
+/// LP64, 8-aligned) — with `stdin == &__sF[0]`, `stdout == &__sF[1]`, `stderr == &__sF[2]`. A
+/// bionic-compiled consumer therefore computes `__sF_base + i*152` (an interior address) and never
+/// LOADS a pointer from the object.
 ///
-/// 2026-06-05 — HONEST scope: the bionic `FILE` struct layout differs from glibc's, so this is sound
-/// for code that takes `&__sF[i]` and passes the resulting `FILE*` straight to a libc stdio call that
-/// ALSO forwards to glibc (the pointer round-trips); it is NOT layout-correct for code that pokes
-/// bionic `FILE` fields directly. The three host streams are the closest real, usable backing
-/// (documented; not a silent fake — the pointers are genuine glibc streams).
-struct SfTable([*mut libc::FILE; 3]);
-// SAFETY: 2026-06-05 — the table holds the process-global glibc stdio handles (`stdin`/`stdout`/
-// `stderr`), valid for the whole process lifetime and shared across threads by glibc (it locks
-// internally). Storing/sharing these raw pointers is sound (read-only, never closed).
-unsafe impl Sync for SfTable {}
-// SAFETY: see the `Sync` note — process-lifetime, never-closed glibc stdio handles.
-unsafe impl Send for SfTable {}
+/// 2026-06-12 — ROOT CAUSE (core dump 782252, gdb-verified end to end): Eclipse previously provided
+/// `__sF` as a 24-byte array of three glibc `FILE*` POINTER VALUES. crashpad's bionic-compiled
+/// logger computed `stderr = GOT(__sF) + 0x130` (= 2×152), which landed 280 bytes past that table
+/// inside unrelated Rust statics; glibc `fputs` then read the garbage "stream"'s `_lock` field
+/// (0xff) and faulted at `fputs+53` (si_addr 0x107 = 0xff+8) — killing the process INSIDE the crash
+/// handler's own logging path. The premise the 2026-06-05 provision relied on ("a relocated
+/// reference to `__sF[i]` yields a usable host stdio stream") was false: bionic code takes the
+/// slot's ADDRESS, not its value.
+///
+/// **The fix (bionic-ABI-shaped):** `__sF` is now a zero-initialized 3×152-byte (456-byte)
+/// Eclipse-owned backing, so `&__sF[0]`/`&__sF[1]`/`&__sF[2]` are deterministic SENTINEL addresses
+/// at `base+0x000`/`+0x098`/`+0x130` that can never alias unrelated statics. Because glibc stdio
+/// can only consume genuine glibc `FILE` objects, every FILE*-consuming stdio import of the `__sF`
+/// importers is provided as an Eclipse translating native (see the "bionic stdio FILE* translation"
+/// section below): [`eclipse_sf_translate_stream`] maps the three sentinels to the host glibc
+/// streams and passes every other `FILE*` (a real `fopen`/`fdopen` return) through unchanged.
+///
+/// 2026-06-12: LP64 `sizeof(struct __sFILE)` per the public AOSP NDK `<bits/struct_file.h>`
+/// (`char __private[152]`, `aligned(sizeof(void*))`). Pinned by
+/// `sf_backing_is_bionic_shaped_three_structs`.
+const SF_FILE_STRIDE: usize = 152;
+/// `__sF[0..3)` — the three standard streams the bionic ABI publishes through `__sF`.
+const SF_ENTRY_COUNT: usize = 3;
+/// Total size of the bionic-shaped `__sF` backing: 3 × 152 = 456 bytes.
+const SF_BACKING_LEN: usize = SF_FILE_STRIDE * SF_ENTRY_COUNT;
+
+/// The bionic-shaped `__sF` backing object. The bytes are opaque (`struct __sFILE`'s fields are
+/// private in the public ABI; no known importer pokes them directly — readelf audit 2026-06-12),
+/// zero-initialized, and WRITABLE (bionic's real `__sF` lives in `.data`; `UnsafeCell` keeps this
+/// static out of read-only `.rodata` so a hypothetical direct field write lands in Eclipse-owned
+/// memory instead of faulting). Eclipse itself never reads or writes the bytes — only the ADDRESS
+/// is meaningful (the sentinel match in [`eclipse_sf_translate_stream`]).
+#[repr(C, align(8))]
+struct SfBacking(UnsafeCell<[u8; SF_BACKING_LEN]>);
+// SAFETY: 2026-06-12 — Eclipse never creates a Rust reference into the cell; the address is handed
+// to foreign bionic code as an opaque data symbol. Any concurrent foreign access is to plain bytes
+// Eclipse does not touch, so sharing the static across threads is sound.
+unsafe impl Sync for SfBacking {}
+
+/// The process-global `__sF` backing (see [`SfBacking`]).
+static ECLIPSE_SF: SfBacking = SfBacking(UnsafeCell::new([0u8; SF_BACKING_LEN]));
 
 extern "C" {
     // glibc's stdio handle data symbols (`extern FILE *stdin, *stdout, *stderr;`). The `libc` crate
@@ -1885,17 +1955,347 @@ extern "C" {
     static stderr: *mut libc::FILE;
 }
 
-static ECLIPSE_SF: OnceLock<SfTable> = OnceLock::new();
-
-/// Initialize (once) Eclipse's `__sF` table from the host stdio handles and return its address.
+/// The address of the bionic-shaped `__sF` backing — the `__sF` data symbol's resolution.
 fn eclipse_sf_addr() -> u64 {
-    let t = ECLIPSE_SF.get_or_init(|| {
-        // SAFETY: 2026-06-05 — `stdin`/`stdout`/`stderr` are the process-global glibc stdio `FILE*`
-        // data symbols (valid for the process lifetime). We snapshot the three pointers into an
-        // Eclipse-owned table; reading these externs is a plain pointer read of stable globals.
-        unsafe { SfTable([stdin, stdout, stderr]) }
-    });
-    std::ptr::addr_of!(t.0) as u64
+    ECLIPSE_SF.0.get() as u64
+}
+
+/// Map a bionic `&__sF[i]` stream sentinel to the corresponding host glibc stream; pass every other
+/// pointer (a real glibc `FILE*` from `fopen`/`fdopen`/the fall-through `stdin`/`stdout`/`stderr`
+/// OBJECT imports — or null, e.g. `fflush(NULL)`) through unchanged. Exact-entry match only: bionic
+/// code computes exactly `base + i*152`; an interior pointer is not a stream and passes through.
+///
+/// `#[no_mangle] extern "C"` because the C stdio shim (`src/loader/stdio_shim.c`) calls it too.
+/// Safe to call with ANY pointer value — it only compares addresses, never dereferences.
+#[no_mangle]
+pub extern "C" fn eclipse_sf_translate_stream(stream: *mut libc::FILE) -> *mut libc::FILE {
+    let base = ECLIPSE_SF.0.get() as usize;
+    let p = stream as usize;
+    if p == base {
+        // SAFETY: 2026-06-12 — `stdin` is the process-global glibc stdio `FILE*` data symbol,
+        // valid for the process lifetime; reading it is a plain pointer read of a stable global.
+        unsafe { stdin }
+    } else if p == base + SF_FILE_STRIDE {
+        // SAFETY: 2026-06-12 — same contract as `stdin` above.
+        unsafe { stdout }
+    } else if p == base + 2 * SF_FILE_STRIDE {
+        // SAFETY: 2026-06-12 — same contract as `stdin` above.
+        unsafe { stderr }
+    } else {
+        stream
+    }
+}
+
+// =================================================================================================
+// bionic stdio FILE* translation (22 Rust + 3 C-shim) — every FILE*-consuming stdio import of the
+// `__sF` importers, remapped through `eclipse_sf_translate_stream` then forwarded to glibc.
+// =================================================================================================
+//
+// 2026-06-12: enumerated via `readelf --dyn-syms` over the five `__sF`-importing engine libs
+// (libroblox.so, libbacktrace-native.so, libeigen_blas.so, librenderscript-toolkit.so,
+// libzstd-jni-1.5.7-6.so, v2.721.1108): clearerr fclose feof ferror fflush fgets fileno fputc
+// fputs fputwc fread __fread_chk fseek fseeko ftell ftello fwrite getc getwc setvbuf ungetc
+// ungetwc (fixed-arity, Rust — this section) plus fprintf/fscanf (C-variadic) and vfprintf
+// (va_list), DEFINED by the clean-room C shim `src/loader/stdio_shim.c` (Rust stable cannot define
+// either shape — the liblog_shim.c pattern). `fopen`/`fdopen` only RETURN a `FILE*` (a real glibc
+// stream the translator passes through) and need no native. `__fwrite_chk` (already Eclipse-owned)
+// gained the same remap. Each native is **forward (stream-translated)**: glibc's routine is
+// ABI-identical for real streams; the translation makes the bionic `&__sF[i]` sentinel a real
+// stream first.
+
+/// `void clearerr(FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_clearerr(stream: *mut libc::FILE) {
+    // SAFETY: 2026-06-12 — the translated stream is a genuine glibc FILE* (sentinel → host stream;
+    // anything else is a valid glibc stream per the caller contract).
+    unsafe { libc::clearerr(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int fclose(FILE* stream)` — **forward (stream-translated).** Closing a standard-stream sentinel
+/// closes the corresponding host stream — exactly what the bionic caller asked for.
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid, open glibc `FILE*`.
+unsafe extern "C" fn eclipse_fclose(stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`; the stream is open per the caller contract.
+    unsafe { libc::fclose(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int feof(FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_feof(stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::feof(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int ferror(FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_ferror(stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::ferror(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int fflush(FILE* stream)` — **forward (stream-translated).** A null stream passes through (the
+/// documented "flush all open streams" contract).
+///
+/// # Safety
+/// `stream` must be null, a bionic `&__sF[i]` sentinel, or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fflush(stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`; null passes through untouched (glibc fflush(NULL)
+    // flushes all streams per the public contract).
+    unsafe { libc::fflush(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `char* fgets(char* buf, int n, FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `buf` must point to at least `n` writable bytes; `stream` must be a bionic `&__sF[i]` sentinel
+/// or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fgets(
+    buf: *mut c_char,
+    n: c_int,
+    stream: *mut libc::FILE,
+) -> *mut c_char {
+    // SAFETY: 2026-06-12 — `buf`/`n` per the caller contract; see `eclipse_clearerr` for the stream.
+    unsafe { libc::fgets(buf, n, eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int fileno(FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fileno(stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::fileno(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int fputc(int c, FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fputc(c: c_int, stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::fputc(c, eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int fputs(const char* s, FILE* stream)` — **forward (stream-translated).** THE call shape that
+/// killed boot 782252: crashpad's `fputs(msg, &__sF[2])`.
+///
+/// # Safety
+/// `s` must be a valid NUL-terminated C string; `stream` must be a bionic `&__sF[i]` sentinel or a
+/// valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fputs(s: *const c_char, stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — `s` valid NUL-terminated per the caller contract; see `eclipse_clearerr`
+    // for the stream.
+    unsafe { libc::fputs(s, eclipse_sf_translate_stream(stream)) }
+}
+
+/// `size_t fread(void* buf, size_t size, size_t count, FILE* stream)` — **forward
+/// (stream-translated).**
+///
+/// # Safety
+/// `buf` must point to at least `size*count` writable bytes; `stream` must be a bionic `&__sF[i]`
+/// sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fread(
+    buf: *mut c_void,
+    size: usize,
+    count: usize,
+    stream: *mut libc::FILE,
+) -> usize {
+    // SAFETY: 2026-06-12 — `buf` sized per the caller contract; see `eclipse_clearerr`.
+    unsafe { libc::fread(buf, size, count, eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int fseek(FILE* stream, long offset, int whence)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fseek(
+    stream: *mut libc::FILE,
+    offset: c_long,
+    whence: c_int,
+) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::fseek(eclipse_sf_translate_stream(stream), offset, whence) }
+}
+
+/// `int fseeko(FILE* stream, off_t offset, int whence)` — **forward (stream-translated).** bionic
+/// LP64 `off_t` is 64-bit, same as glibc x86-64.
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fseeko(
+    stream: *mut libc::FILE,
+    offset: libc::off_t,
+    whence: c_int,
+) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::fseeko(eclipse_sf_translate_stream(stream), offset, whence) }
+}
+
+/// `long ftell(FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_ftell(stream: *mut libc::FILE) -> c_long {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::ftell(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `off_t ftello(FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_ftello(stream: *mut libc::FILE) -> libc::off_t {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::ftello(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `size_t fwrite(const void* buf, size_t size, size_t count, FILE* stream)` — **forward
+/// (stream-translated).**
+///
+/// # Safety
+/// `buf` must point to at least `size*count` readable bytes; `stream` must be a bionic `&__sF[i]`
+/// sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fwrite(
+    buf: *const c_void,
+    size: usize,
+    count: usize,
+    stream: *mut libc::FILE,
+) -> usize {
+    // SAFETY: 2026-06-12 — `buf` sized per the caller contract; see `eclipse_clearerr`.
+    unsafe { libc::fwrite(buf, size, count, eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int getc(FILE* stream)` — **forward (stream-translated).** Forwards to glibc `fgetc`, which
+/// ISO C defines as equivalent to `getc` (libc 0.2.186 binds only `fgetc` for linux-gnu).
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_getc(stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::fgetc(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `int setvbuf(FILE* stream, char* buffer, int mode, size_t size)` — **forward
+/// (stream-translated).**
+///
+/// # Safety
+/// `buffer` must be null or point to at least `size` bytes valid for the stream's lifetime;
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_setvbuf(
+    stream: *mut libc::FILE,
+    buffer: *mut c_char,
+    mode: c_int,
+    size: usize,
+) -> c_int {
+    // SAFETY: 2026-06-12 — `buffer`/`mode`/`size` per the public setvbuf contract; see
+    // `eclipse_clearerr` for the stream.
+    unsafe { libc::setvbuf(eclipse_sf_translate_stream(stream), buffer, mode, size) }
+}
+
+/// `int ungetc(int c, FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_ungetc(c: c_int, stream: *mut libc::FILE) -> c_int {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { libc::ungetc(c, eclipse_sf_translate_stream(stream)) }
+}
+
+/// glibc/bionic `wint_t` — `unsigned int` on x86-64 in both ABIs. 2026-06-12: pinned locally
+/// because libc 0.2.186 defines `wint_t` for teeos/hurd but NOT linux-gnu.
+#[allow(non_camel_case_types)] // 2026-06-12: deliberately matches the public C type name it pins.
+type wint_t = std::ffi::c_uint;
+
+extern "C" {
+    // glibc's wide-char stdio routines — libc 0.2.186 does not bind them, so declare them directly
+    // (the public C signatures; bionic LP64 wchar_t/wint_t are 4 bytes, same as glibc x86-64).
+    // 2026-06-12.
+    fn fputwc(wc: libc::wchar_t, stream: *mut libc::FILE) -> wint_t;
+    fn getwc(stream: *mut libc::FILE) -> wint_t;
+    fn ungetwc(wc: wint_t, stream: *mut libc::FILE) -> wint_t;
+}
+
+/// `wint_t fputwc(wchar_t wc, FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fputwc(wc: libc::wchar_t, stream: *mut libc::FILE) -> wint_t {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`; glibc fputwc is the public wide-char write.
+    unsafe { fputwc(wc, eclipse_sf_translate_stream(stream)) }
+}
+
+/// `wint_t getwc(FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_getwc(stream: *mut libc::FILE) -> wint_t {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { getwc(eclipse_sf_translate_stream(stream)) }
+}
+
+/// `wint_t ungetwc(wint_t wc, FILE* stream)` — **forward (stream-translated).**
+///
+/// # Safety
+/// `stream` must be a bionic `&__sF[i]` sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_ungetwc(wc: wint_t, stream: *mut libc::FILE) -> wint_t {
+    // SAFETY: 2026-06-12 — see `eclipse_clearerr`.
+    unsafe { ungetwc(wc, eclipse_sf_translate_stream(stream)) }
+}
+
+/// `size_t __fread_chk(void* buf, size_t size, size_t count, FILE* stream, size_t buf_size)` —
+/// bionic FORTIFY fread. Aborts if `size * count > buf_size`, else forwards to glibc `fread` with
+/// the translated stream. **forward (stream-translated).**
+///
+/// 2026-06-12: glibc ALSO exports a `__fread_chk`, but with a DIFFERENT argument order
+/// (`(ptr, ptrlen, size, n, stream)` per glibc `bits/stdio2.h` — the object bound is the SECOND
+/// argument and the stream is LAST), so the previous host fall-through was shape-mismatched on
+/// every argument after the first — the same flawed-pattern class as the `__sF` data object
+/// (a bionic name resolved to a glibc symbol of a different shape).
+///
+/// # Safety
+/// `buf` must point to at least `buf_size` writable bytes; `stream` must be a bionic `&__sF[i]`
+/// sentinel or a valid glibc `FILE*`.
+unsafe extern "C" fn eclipse_fread_chk(
+    buf: *mut c_void,
+    size: usize,
+    count: usize,
+    stream: *mut libc::FILE,
+    buf_size: usize,
+) -> usize {
+    // bionic aborts if the total bytes (`size * count`) would overflow the destination object.
+    match size.checked_mul(count) {
+        Some(t) if t <= buf_size => {}
+        _ => std::process::abort(),
+    }
+    // SAFETY: 2026-06-12 — after the check, `buf` has ≥ `size*count` writable bytes; the translated
+    // stream is a genuine glibc FILE* (see `eclipse_clearerr`).
+    unsafe { libc::fread(buf, size, count, eclipse_sf_translate_stream(stream)) }
+}
+
+extern "C" {
+    /// `int fprintf(FILE* stream, const char* fmt, ...)` — DEFINED in the C stdio shim
+    /// (`src/loader/stdio_shim.c`): remaps the stream via [`eclipse_sf_translate_stream`], then
+    /// glibc `vfprintf`. Variadic externs are stable to declare; the address is taken in
+    /// [`EclipseNativeProvider::with_bionic_natives`]. 2026-06-12.
+    fn eclipse_fprintf(stream: *mut libc::FILE, fmt: *const c_char, ...) -> c_int;
+
+    /// `int fscanf(FILE* stream, const char* fmt, ...)` — DEFINED in the C stdio shim (remap +
+    /// glibc `vfscanf`). Address-only use here. 2026-06-12.
+    fn eclipse_fscanf(stream: *mut libc::FILE, fmt: *const c_char, ...) -> c_int;
+
+    /// `int vfprintf(FILE* stream, const char* fmt, va_list ap)` — DEFINED in the C stdio shim
+    /// (remap + glibc `vfprintf`). 2026-06-12: `va_list` has no stable Rust spelling; in the
+    /// x86-64 SysV ABI a `va_list` parameter is a pointer (`__va_list_tag*`), so the declaration
+    /// is ABI-accurate — and it is ADDRESS-ONLY here (never called from Rust).
+    fn eclipse_vfprintf(stream: *mut libc::FILE, fmt: *const c_char, ap: *mut c_void) -> c_int;
 }
 
 // =================================================================================================
@@ -3241,18 +3641,19 @@ mod tests {
     #[test]
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
-        // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 6 bionic-signal
-        // (2026-06-11) + 27 ndk-android + 33 media-ndk + 8 audio + 51 bionic-pthread/TLS/sem/syscall
-        // (37 + the 14 thread-lifecycle natives added 2026-06-05: create/join/detach/setname_np/
-        // kill/getattr_np/get+setschedparam/attr_*) + 5 bionic-sysconf system-query
-        // (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo — the allocator-bootstrap fix,
-        // 2026-06-05) = 150.
+        // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 25 bionic-stdio
+        // FILE*-translation (22 Rust + 3 C-shim; 2026-06-12 — the &__sF[i] sentinel remap) + 6
+        // bionic-signal (2026-06-11) + 27 ndk-android + 33 media-ndk + 8 audio + 51
+        // bionic-pthread/TLS/sem/syscall (37 + the 14 thread-lifecycle natives added 2026-06-05:
+        // create/join/detach/setname_np/kill/getattr_np/get+setschedparam/attr_*) + 5
+        // bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo — the
+        // allocator-bootstrap fix, 2026-06-05) = 175.
         assert_eq!(
             p.len(),
-            94 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            119 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
-            "5 liblog + 15 bionic-libc + 6 bionic-signal + 27 ndk-android + 33 media-ndk + 8 audio \
-             + 51 pthread + 5 sysconf system-query natives registered"
+            "5 liblog + 15 bionic-libc + 25 bionic-stdio + 6 bionic-signal + 27 ndk-android + 33 \
+             media-ndk + 8 audio + 51 pthread + 5 sysconf system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim)
@@ -3277,6 +3678,32 @@ mod tests {
             "__system_property_get",
             "__stack_chk_guard",
             "__sF",
+            // bionic stdio FILE* translation (25; 22 Rust + 3 C-shim) — 2026-06-12
+            "clearerr",
+            "fclose",
+            "feof",
+            "ferror",
+            "fflush",
+            "fgets",
+            "fileno",
+            "fputc",
+            "fputs",
+            "fputwc",
+            "fread",
+            "__fread_chk",
+            "fseek",
+            "fseeko",
+            "ftell",
+            "ftello",
+            "fwrite",
+            "getc",
+            "getwc",
+            "setvbuf",
+            "ungetc",
+            "ungetwc",
+            "fprintf",
+            "fscanf",
+            "vfprintf",
             // bionic signal ABI (6) — 2026-06-11
             "sigaction",
             "sigemptyset",
@@ -4096,12 +4523,188 @@ mod tests {
     }
 
     #[test]
-    fn sf_table_points_at_three_host_streams() {
-        let addr = eclipse_sf_addr();
-        assert!(addr != 0, "__sF address must be non-null");
-        let t = ECLIPSE_SF.get().expect("table initialized");
-        for fp in t.0 {
-            assert!(!fp.is_null(), "each __sF entry is a host FILE*");
+    fn sf_backing_is_bionic_shaped_three_structs() {
+        // 2026-06-12: pins the public AOSP NDK LP64 stdio ABI — `extern FILE __sF[]` is an array
+        // of `struct __sFILE { char __private[152]; }` STRUCTS (8-aligned), with
+        // stdin/stdout/stderr = &__sF[0]/&__sF[1]/&__sF[2] = base+0x000/+0x098/+0x130. The
+        // pre-fix 24-byte FILE*-pointer table FAILED these: +0x98/+0x130 fell 128/280 bytes past
+        // its end inside unrelated Rust statics (core 782252 — crashpad's fputs(&__sF[2]) read a
+        // garbage `_lock` there and SIGSEGV'd inside its own crash-logging path).
+        assert_eq!(SF_FILE_STRIDE, 152, "LP64 sizeof(struct __sFILE)");
+        assert_eq!(SF_FILE_STRIDE, 0x98, "bionic &__sF[1] offset");
+        assert_eq!(2 * SF_FILE_STRIDE, 0x130, "bionic &__sF[2] offset");
+        assert_eq!(SF_BACKING_LEN, 456, "3 x 152-byte entries");
+        assert_eq!(std::mem::size_of::<SfBacking>(), SF_BACKING_LEN);
+        assert_eq!(
+            std::mem::align_of::<SfBacking>(),
+            8,
+            "aligned(sizeof(void*))"
+        );
+
+        // The registered `__sF` data symbol IS the backing's address, 8-aligned, and every bionic
+        // standard-stream address falls strictly INSIDE the Eclipse-owned object.
+        let p = EclipseNativeProvider::with_bionic_natives();
+        let registered = p.resolve("__sF").expect("__sF registered").addr;
+        assert_eq!(registered, eclipse_sf_addr());
+        assert_eq!(registered % 8, 0, "the backing honors the ABI alignment");
+        for i in 0..SF_ENTRY_COUNT as u64 {
+            let entry = registered + i * SF_FILE_STRIDE as u64;
+            assert!(
+                entry + SF_FILE_STRIDE as u64 <= registered + SF_BACKING_LEN as u64,
+                "&__sF[{i}] + sizeof(struct __sFILE) stays inside the Eclipse-owned backing"
+            );
+        }
+    }
+
+    #[test]
+    fn sf_sentinels_translate_to_host_streams() {
+        // 2026-06-12: the translation contract — the three bionic `&__sF[i]` sentinel addresses
+        // map to the GENUINE glibc stream objects; everything else (interior pointers, null, real
+        // streams) passes through unchanged.
+        let base = eclipse_sf_addr() as usize;
+        let s0 = eclipse_sf_translate_stream(base as *mut libc::FILE);
+        let s1 = eclipse_sf_translate_stream((base + SF_FILE_STRIDE) as *mut libc::FILE);
+        let s2 = eclipse_sf_translate_stream((base + 2 * SF_FILE_STRIDE) as *mut libc::FILE);
+        // SAFETY: 2026-06-12 — reading the process-global glibc stdin/stdout/stderr data symbols
+        // (stable, process-lifetime pointer reads).
+        let (g0, g1, g2) = unsafe { (stdin, stdout, stderr) };
+        assert_eq!(s0, g0, "&__sF[0] -> glibc stdin");
+        assert_eq!(s1, g1, "&__sF[1] -> glibc stdout");
+        assert_eq!(s2, g2, "&__sF[2] -> glibc stderr");
+
+        // Host-fd linkage through the actual NATIVE the bionic import binds to (no output): the
+        // sentinel goes in, the standard host fd comes out.
+        // SAFETY: 2026-06-12 — `eclipse_fileno` translates the sentinel to the host stream before
+        // glibc dereferences anything.
+        unsafe {
+            assert_eq!(eclipse_fileno(base as *mut libc::FILE), 0);
+            assert_eq!(
+                eclipse_fileno((base + SF_FILE_STRIDE) as *mut libc::FILE),
+                1
+            );
+            assert_eq!(
+                eclipse_fileno((base + 2 * SF_FILE_STRIDE) as *mut libc::FILE),
+                2
+            );
+        }
+
+        // Non-sentinel pointers pass through untouched (exact-entry match only).
+        let interior = (base + 8) as *mut libc::FILE;
+        assert_eq!(eclipse_sf_translate_stream(interior), interior);
+        let null: *mut libc::FILE = std::ptr::null_mut();
+        assert_eq!(eclipse_sf_translate_stream(null), null);
+
+        // THE call shape that killed boot 782252 — crashpad's `fputs(msg, &__sF[2])` — now writes
+        // to the real host stderr and returns success (one short line of test-stderr noise, the
+        // precedented tap-test posture).
+        let msg = std::ffi::CString::new(
+            "eclipse __sF regression pin: fputs(&__sF[2]) reaches host stderr\n",
+        )
+        .unwrap();
+        // SAFETY: 2026-06-12 — `msg` is a valid NUL-terminated C string kept alive across the
+        // call; the stderr sentinel is translated to the genuine glibc stream.
+        let ret =
+            unsafe { eclipse_fputs(msg.as_ptr(), (base + 2 * SF_FILE_STRIDE) as *mut libc::FILE) };
+        assert!(ret >= 0, "fputs through the stderr sentinel succeeds");
+    }
+
+    #[test]
+    fn sf_stdio_natives_round_trip_a_real_stream() {
+        use std::ffi::CString;
+
+        // 2026-06-12: the pass-through branch — a REAL glibc stream (tmpfile) flows through the
+        // translating natives unchanged, proving the forwards are glibc-ABI-correct end to end
+        // (write via fputs/fprintf(C shim)/fwrite/fputc, then read back via fscanf(C shim)/fgets/
+        // fread, with seek/tell/eof/ungetc cross-checks).
+        // SAFETY: tmpfile() returns an owned, open glibc stream (deleted on close) or null.
+        let f = unsafe { libc::tmpfile() };
+        assert!(!f.is_null(), "tmpfile available");
+
+        let line = CString::new("num 42\n").unwrap();
+        let fmt_out = CString::new("%s %d\n").unwrap();
+        let word = CString::new("val").unwrap();
+        let fmt_in = CString::new("num %d").unwrap();
+
+        // SAFETY: 2026-06-12 — `f` is a live glibc stream for the whole block (closed at the end
+        // exactly once); all strings are NUL-terminated CStrings kept alive across the calls; the
+        // varargs passed to the C-shim fprintf/fscanf match their `%s %d`/`%d` conversions; all
+        // buffers are sized per the lengths passed.
+        unsafe {
+            assert!(eclipse_fputs(line.as_ptr(), f) >= 0);
+            assert_eq!(
+                eclipse_fprintf(f, fmt_out.as_ptr(), word.as_ptr(), 7_i32),
+                6,
+                "C-shim fprintf formats and writes through the pass-through stream"
+            );
+            assert_eq!(eclipse_fwrite(b"bytes".as_ptr().cast(), 1, 5, f), 5);
+            assert_eq!(eclipse_fputc(c_int::from(b'\n'), f), c_int::from(b'\n'));
+            assert_eq!(eclipse_fflush(f), 0);
+
+            // "num 42\n" (7) + "val 7\n" (6) + "bytes" (5) + '\n' (1) = 19 bytes.
+            assert_eq!(eclipse_ftell(f), 19);
+            assert_eq!(eclipse_ftello(f), 19);
+            assert_eq!(eclipse_fseek(f, 0, libc::SEEK_SET), 0);
+
+            let mut n: c_int = 0;
+            assert_eq!(
+                eclipse_fscanf(f, fmt_in.as_ptr(), &raw mut n),
+                1,
+                "C-shim fscanf converts through the pass-through stream"
+            );
+            assert_eq!(n, 42);
+            // fscanf("num %d") leaves the line's newline in the stream — consume it via the native.
+            assert_eq!(eclipse_getc(f), c_int::from(b'\n'));
+
+            let mut buf = [0u8; 32];
+            assert!(!eclipse_fgets(buf.as_mut_ptr().cast(), buf.len() as c_int, f).is_null());
+            let got = std::ffi::CStr::from_ptr(buf.as_ptr().cast());
+            assert_eq!(got.to_bytes(), b"val 7\n");
+
+            let mut tail = [0u8; 6];
+            assert_eq!(eclipse_fread(tail.as_mut_ptr().cast(), 1, 6, f), 6);
+            assert_eq!(&tail, b"bytes\n");
+
+            // EOF/error state machinery through the natives.
+            assert_eq!(eclipse_getc(f), libc::EOF);
+            assert_ne!(
+                eclipse_feof(f),
+                0,
+                "EOF flag set after the read past the end"
+            );
+            eclipse_clearerr(f);
+            assert_eq!(eclipse_feof(f), 0, "clearerr resets the EOF flag");
+            assert_eq!(eclipse_ferror(f), 0);
+            assert_eq!(eclipse_ungetc(c_int::from(b'Z'), f), c_int::from(b'Z'));
+            assert_eq!(eclipse_getc(f), c_int::from(b'Z'));
+
+            assert!(eclipse_fileno(f) > 2, "a real stream keeps its own fd");
+            assert_eq!(eclipse_fseeko(f, 0, libc::SEEK_SET), 0);
+            assert_eq!(eclipse_fclose(f), 0);
+        }
+    }
+
+    #[test]
+    fn fread_chk_uses_the_bionic_argument_order_and_honors_the_bound() {
+        // 2026-06-12: bionic `__fread_chk(buf, size, count, stream, buf_size)` vs glibc's
+        // `__fread_chk(ptr, ptrlen, size, n, stream)` — the host fall-through was shape-mismatched
+        // on every argument after the first (the stream arrived in the bound slot and vice versa).
+        // This pins the Eclipse native consuming the BIONIC order: a read with `size*count <=
+        // buf_size` succeeds and fills the buffer.
+        // SAFETY: tmpfile() returns an owned, open glibc stream or null.
+        let f = unsafe { libc::tmpfile() };
+        assert!(!f.is_null(), "tmpfile available");
+        // SAFETY: 2026-06-12 — `f` is a live glibc stream; the buffers are sized per the args.
+        unsafe {
+            assert_eq!(eclipse_fwrite(b"abcdef".as_ptr().cast(), 1, 6, f), 6);
+            assert_eq!(eclipse_fseek(f, 0, libc::SEEK_SET), 0);
+            let mut buf = [0u8; 8];
+            // bionic order: (buf, size=1, count=6, stream, buf_size=8).
+            assert_eq!(
+                eclipse_fread_chk(buf.as_mut_ptr().cast(), 1, 6, f, buf.len()),
+                6
+            );
+            assert_eq!(&buf[..6], b"abcdef");
+            assert_eq!(eclipse_fclose(f), 0);
         }
     }
 

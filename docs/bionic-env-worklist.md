@@ -142,7 +142,12 @@ variadic externs + takes their addresses on stable; no ABI landmine.
 All 15 implemented in `src/loader/native_provider.rs` (each labelled forward / minimal-correct):
 ```
 ✅ __system_property_get   # minimal-correct: empty store → writes ""/returns 0 (bionic "unset")
-✅ __sF                    # forward: table of the 3 host glibc FILE* (stdin/stdout/stderr)
+✅ __sF                    # 2026-06-12: bionic-SHAPED 3x152-byte backing (array of struct __sFILE,
+                           # public NDK LP64 ABI) — &__sF[i] are Eclipse-owned sentinels remapped to
+                           # the host streams by 25 translating stdio natives (fputs/fflush/fwrite/
+                           # fprintf/…). The original 24-byte host-FILE*-pointer table was the root
+                           # cause of core 782252 (crashpad's fputs(&__sF[2]) → SIGSEGV in its own
+                           # crash logging): bionic consumers take the slot's ADDRESS, not its value.
 ✅ __errno                 # forward: → glibc __errno_location (identical C contract)
 ✅ __assert2               # minimal-correct: emit FATAL + abort (noreturn, fixed 4-arg)
 ✅ __gnu_strerror_r        # forward: → glibc GNU (char*-returning) strerror_r
@@ -152,7 +157,13 @@ All 15 implemented in `src/loader/native_provider.rs` (each labelled forward / m
 ✅ __fwrite_chk  ✅ __sendto_chk  ✅ __strchr_chk  ✅ __strlen_chk  ✅ __strncpy_chk2  ✅ __write_chk
 ```
 (303 other libc names resolve from glibc as a baseline; only these 15 were missing entirely. The
-older "21" figure in this doc was prose; the real test reports exactly **15** bionic-libc names.)
+older "21" figure in this doc was prose; the real test reports exactly **15** bionic-libc names.
+2026-06-12: 25 of the baseline names — every FILE*-consuming stdio import of the five `__sF`
+importers: clearerr fclose feof ferror fflush fgets fileno fputc fputs fputwc fread __fread_chk
+fseek fseeko ftell ftello fwrite getc getwc setvbuf ungetc ungetwc + fprintf/fscanf/vfprintf
+(C shim) — are now Eclipse-owned translating natives, because a bionic `&__sF[i]` stream sentinel
+must be remapped to the host glibc stream before glibc stdio may dereference it; `__fread_chk`
+additionally had a bionic-vs-glibc argument-order mismatch.)
 
 ### 3. ndk-android — libandroid (27) — ✅ DONE (2026-06-05): all 27 Eclipse-owned natives
 `src/loader/native_provider.rs` implements all 27, each labelled real / minimal-correct / sound-stub;

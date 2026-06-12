@@ -350,8 +350,11 @@ artifacts (NOT init failures — the harness's job was already done):
    now-unmapped `[base,base+size)`).
 2. **Exit-time finalizer + `__sF` layout:** returning through `main` let glibc `exit()` run libroblox's
    C++ static destructors / `atexit` finalizers, one of which `fflush`es an engine `FILE*` taken as
-   `&__sF[i]`; Eclipse's `__sF` is a host-stdio **pointer** table, so the slot address derefs as a
-   bad glibc `FILE*` → fault on the **main thread** at exit.
+   `&__sF[i]`; Eclipse's `__sF` was (at the time) a host-stdio **pointer** table, so the slot address
+   derefed as a bad glibc `FILE*` → fault on the **main thread** at exit. *(2026-06-12: this exact
+   mechanism later killed crashpad's in-handler logging — core 782252 — and was root-cause-fixed:
+   `__sF` is now a bionic-shaped 3×152-byte backing with translating stdio natives; see
+   `native_provider.rs`. The `_exit(0)` below stays for reason 1.)*
    Fix: once **all** constructors complete, the diagnostic's defined job is done, so it `_exit(0)`s
    **immediately** (async-signal-safe; no unmap, no destructors/finalizers, no teardown of live
    workers; the OS reclaims everything). Init — not shutdown — is this harness's scope.

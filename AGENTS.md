@@ -128,8 +128,36 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-12 — ✅ `__sF` SHAPE MISMATCH CONFIRMED (core 782252) AND ROOT-CAUSE-FIXED: Eclipse provided the bionic
+  data symbol `__sF` as a 24-byte table of 3 glibc `FILE*` POINTERS, but bionic's public ABI makes `__sF` an array of
+  3 × 152-byte STRUCTS whose ADDRESSES are the streams — now a bionic-shaped 456-byte sentinel backing + 25
+  translating stdio natives. ⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP:
+  `./target/release/eclipse run <APK>` with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` —
+  expect THIS machine to now survive to the window + Vulkan present loop like the collaborator's machine; then the
+  frontier is the render-integration build — wire the window's `ANativeWindow` into the engine's
+  `AndroidGLView`/EGL path).** Context: the "ENGINE SIGSEGV RESOLVED, 6/6 stable" entry below was MACHINE-SPECIFIC —
+  today an owner boot on this machine (cachyos x86-64) died again, EXIT=139 at ~8 s (`/tmp/eclipse-render-check.log`,
+  systemd core 782252). Core forensics confirmed the long-suspected (UNVERIFIED until now) `__sF` hypothesis end to
+  end: crashpad's bionic-compiled logger computes `stderr = &__sF[2]` = base+0x130 (LP64 `sizeof(struct __sFILE)` =
+  152 per public AOSP NDK headers), which landed 280 bytes PAST Eclipse's 24-byte pointer table inside unrelated Rust
+  statics → glibc `fputs` read `fp->_lock` = `0xff` and faulted at `si_addr=0x107` (the historic "rdi=0xff invalid
+  string pointer" was a misattributed reloaded register — the string was VALID). The FIRST fault (the one crashpad was
+  logging) turned out to be NOT an engine bug: a routine ART implicit-null-check SIGSEGV in AOT boot-classpath code
+  (`boot-wolfssljni-hostdex.oat`, si_addr=0x0, in the machine/network-dependent wolfssljni/okhttp `getAllAppSettings`
+  path — which reconciles the collaborator's 6/6 with today's repro) that ART's fault manager is designed to recover
+  into a Java NPE; it killed the boot only because crashpad sat AHEAD of ART's fault manager in the chain and then
+  crashpad's own logging died on `__sF`. COMPANION WORK ITEM (flagged, deliberately NOT in this diff): ART-first
+  fault-manager ordering in the `eclipse_sigaction`/tap chain so routine managed-NPE fixups are recovered before
+  crashpad classifies them as real crashes — without it, a boot that hits that NPE path still dies (now cleanly
+  logged through the fixed stdio). Fix shipped: `SF_FILE_STRIDE=152`-pinned 3×152 backing,
+  `eclipse_sf_translate_stream` sentinel remap, 22 Rust + 3 C-shim (`src/loader/stdio_shim.c`:
+  fprintf/fscanf/vfprintf) translating natives covering every FILE*-consuming stdio import of the five `__sF`
+  importers, plus the `__fread_chk` bionic-vs-glibc ARGUMENT-ORDER fix (same-pattern catch). Gate: **519 unit + 4
+  integration (live milestone subprocesses, exact SUCCESS markers) + 2 doctests = 525 passed, 0 failed**, fmt/clippy
+  `-D warnings`/release all 0-warning. Detail: §6 (2026-06-12 `__sF` root-cause entry).
 - **2026-06-12 (live-validated) — ✅ THE ENGINE SIGSEGV IS RESOLVED; the real Roblox v2.721.1108 boot is now STABLE to
-  the host window + Vulkan present loop (6/6 clean runs — 5 warm + 1 COLD, caches wiped). ⇐ START HERE NEXT SESSION
+  the host window + Vulkan present loop (6/6 clean runs — 5 warm + 1 COLD, caches wiped). [2026-06-12 correction:
+  MACHINE-SPECIFIC — it reproduced the same day on the owner's machine (core 782252); see the `__sF` entry above]
   (frontier = wire Roblox's engine GL output (`AndroidGLView`/EGL) to Eclipse's winit window so it draws the real UI).**
   Owner live-validation on the dev-host MAIN LOOP (`./target/release/eclipse run <APK>` with
   `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the signal-ABI work (now COMMITTED + merged —
@@ -156,9 +184,9 @@ before any history-rewriting/force operation.
   `tools/framework-overlay/patch-framework.sh`; `eclipse run` needs `ECLIPSE_ANDROID_FRAMEWORK_DIR`). Detail: §6
   (2026-06-12 engine-SIGSEGV-resolved).
 - **2026-06-12 — EARLY-FAULT TAP IMPLEMENTED (gate-green: 516 unit + 4 integration (self-skip path, displays unset)
-  + 2 doctests = 522 passed, 0 failed; STILL UNCOMMITTED with the rest of the held signal-ABI work — owner hold on
-  all post-2026-06-11-morning work). ⇐ START HERE NEXT SESSION (frontier = OWNER live validation on the dev-host
-  MAIN LOOP):** run `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched cargo run -- run <APK>`
+  + 2 doctests = 522 passed, 0 failed; since committed with the signal-ABI work — origin/main `1b56e99`). [START-HERE
+  marker retired 2026-06-12 — the owner live validation happened; see the entries above.] (frontier WAS = OWNER live
+  validation on the dev-host MAIN LOOP):** run `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched cargo run -- run <APK>`
   (rebuild the overlay FIRST via `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped — the
   overlay is a cache artifact) and capture the tap's dump of the ORIGINAL engine SIGSEGV at ~`libroblox+0x1f28xxx`:
   expect the `*** ECLIPSE EARLY-FAULT TAP: signal 11 … (libroblox+0x…)` block on stderr BEFORE crashpad's
@@ -170,7 +198,7 @@ before any history-rewriting/force operation.
   `si_signo`/`si_code`/`si_addr` + RIP/RSP/RBP/ERR + a bounded RBP stack walk (engine-PC-filtered once
   `publish_engine_text_range` arms it after the libroblox map) via ONE async-signal-safe `write(2)`, then CHAINS to
   whatever crashpad registered through the `eclipse_sigaction` seam (alloc-free claim-once pool slots; tid-scoped
-  re-entry latch — the two 2026-06-12 review-fix entries in §6). Detail + carried review notes: §6
+  re-entry latch; chain seed before kernel install — the three 2026-06-12 review-fix entries in §6). Detail + carried review notes: §6
   (2026-06-12 early-fault tap base entry).
 - **2026-06-11 (late) — 🎉 BIONIC SIGNAL ABI DONE: crashpad's first-chance SIGSEGV handler now actually RUNS on the real
   Roblox v2.721.1108 boot — the engine raises SIGSEGV inside `libroblox.so` and Roblox's own logger emits
@@ -800,6 +828,115 @@ all 0-warning/0-error. NOT committed (the Push-phase agent owns commit/push).
   prove engine-GLES2-on-Eclipse's-window works; the boot just doesn't WIRE it). Doc-only change (Living State §5 + this
   entry); no code touched, gate unchanged (**516 unit + 4 integration + 2 doctests**, fmt/clippy `-D warnings`/release
   all 0-warning). Committed + pushed (owner authorized git this session; no co-author).
+
+### 2026-06-12 — `__sF` shape mismatch CONFIRMED (core 782252) and root-cause-FIXED: bionic array-of-structs vs Eclipse's 3-pointer table; 25 translating stdio natives; the "engine SIGSEGV resolved" claim was machine-specific
+
+**Correction first (append-only — the 2026-06-12 engine-SIGSEGV-resolved entry above stands as written for ITS
+machine):** that 6/6-stable validation was performed on the collaborator's machine. TODAY on the owner's machine
+(cachyos x86-64) a live boot of v2.721.1108 died again — EXIT=139 at ~8 s (`/tmp/eclipse-render-check.log`),
+crashpad's `Run book keeping for signal 11` present, the early-fault tap silent, systemd core 782252 captured
+(116 MB, present). The crash is machine/network-state dependent (see "the first fault" below), which reconciles the
+6/6 there with the reproduction here. The §5 "resolved" framing is corrected to machine-specific.
+
+**Confirmed mechanism (gdb over core 782252, crashing thread LWP 782400 — the SECOND fault, the one that killed the
+process):** Eclipse provided the bionic data symbol `__sF` as `SfTable([*mut libc::FILE; 3])` — 24 bytes of glibc
+`FILE*` POINTER VALUES (registered FIRST-priority in `EclipseNativeProvider`; `reloc.rs` writes the table's address
+verbatim into each importer's `R_X86_64_GLOB_DAT` slot). Bionic's PUBLIC ABI (AOSP NDK `stdio.h` +
+`bits/struct_file.h`) declares `extern FILE __sF[]` — an array of STRUCTS, LP64 `sizeof(struct __sFILE)` = 152,
+`stderr = &__sF[2]` — consumers compute an ADDRESS (`base + i*152`) and never LOAD the slots. Deref chain verified
+end to end in the core: libroblox's bionic-compiled crashpad logger at `libroblox+0x278fe2d` runs
+`mov $0x130,%r14d; add GOT(__sF),%r14; mov %r14,%rsi; call fputs` — GOT slot `libroblox+0x701c738` held
+`0x557292051138`, whose memory IS Eclipse's table (`[_IO_2_1_stdin_, _IO_2_1_stdout_, _IO_2_1_stderr_]`,
+gdb-resolved) — so the computed `FILE*` = `0x557292051268` = table+0x130, **280 bytes past the 24-byte table inside
+unrelated Rust statics** in eclipse's `.data`. glibc `fputs` (the STRING arg was VALID — the 93-byte
+`crashpad_client_linux.cc:337 … Handle a real crash` line, strlen `0x5d` in rax/rdx) read `fp->_lock` at fp+0x88 =
+`0x5572920512f0` → `0xff`, then faulted at `fputs+53` `mov 0x8(%rdi),%rax`: `si_signo=11`, `si_code=1` SEGV_MAPERR,
+`si_addr=0x107` = 0xff+8 — exact. SIGSEGV was blocked in-handler → kernel force-kill → EXIT=139. The historic
+"rdi=0xff invalid string pointer" reading (2026-06-11 late entry) was a MISATTRIBUTED reloaded register (`fputs`
+moves s→rbp / fp→rbx at +6/+9 and reloads rdi from `fp->_lock` at +30). Prior art: the SAME mechanism was gdb-proven
+2026-06-05 at exit-time `fflush(&__sF[i])` (`init_run.rs`, then sidestepped with `_exit(0)`); the provision comment's
+premise ("a relocated reference to `__sF[i]` yields a usable host stdio stream") was false — bionic consumers take
+the address, they never read the pointer value Eclipse stored there.
+
+**What the FIRST fault turned out to be (recovered rt_sigframe on the sigaltstack — the fault crashpad was logging):**
+NOT an engine bug and NOT in libroblox: `si_addr=0x0`, RIP `0x62de3e1e` inside the executable mapping of
+`~/.cache/art/x86_64/…boot-wolfssljni-hostdex.oat` — ART AOT boot-classpath code, the canonical ART implicit
+null-check (`mov (%rsi),%edi` + vtable dispatch, no compiler-emitted null test, rsi=0) in the wolfssljni/okhttp
+managed networking path of the just-started `getAllAppSettings` HTTPS fetch (machine/network-dependent). On Android,
+libsigchain keeps ART's fault manager FIRST and converts this into a recoverable Java `NullPointerException`; here
+the tap's chain slot held crashpad (registered through the `eclipse_sigaction` seam ~1.5 ms earlier), so crashpad ran
+AHEAD of ART's fault manager, classified a routine fixup as "a real crash", and then its own logging died on `__sF`.
+The faulting PC being OUTSIDE the published libroblox image is exactly why the early-fault tap's engine-PC filter
+correctly stayed silent. One inferential step remains (that ART's fault manager would have claimed this exact PC —
+strongly supported by the implicit-check codegen, not run-proven in this core); the Java-level origin of the null
+(the long-noted `GetFieldID(SocketImpl.delegate)` NULL is a plausible upstream) is unproven, a separate follow-up.
+**COMPANION WORK ITEM (distinct mechanism, deliberately NOT in this diff):** restore Android-equivalent ordering in
+the `eclipse_sigaction`/tap chain so ART's fault manager sees synchronous faults BEFORE crashpad's first-chance
+handler — without it, even with `__sF` fixed, a boot that hits a routine managed-NPE fixup racing crashpad's
+registration still dies (now cleanly logged through the fixed stdio).
+
+**The fix (root-cause, one place — `src/loader/native_provider.rs` + a small C shim):** (1) `__sF` is now a
+bionic-ABI-shaped backing: `SF_FILE_STRIDE=152` (named const pinning the public LP64 `sizeof(struct __sFILE)`) ×
+`SF_ENTRY_COUNT=3` = `SF_BACKING_LEN=456` bytes, `#[repr(C, align(8))]` over a zero-initialized writable
+`UnsafeCell<[u8; 456]>` — so `&__sF[0]`/`&__sF[1]`/`&__sF[2]` = base+0x000/+0x098/+0x130 are deterministic
+Eclipse-owned SENTINELS that can never alias unrelated statics. (2) `eclipse_sf_translate_stream` exact-matches the
+three sentinel addresses → host glibc stdin/stdout/stderr; every other `FILE*` (incl. null) passes through unchanged
+(fopen-returned streams are real glibc streams). (3) 25 stdio names now Eclipse-owned translating natives (provider
+94 → 119 base, 175 total): 22 in Rust — clearerr fclose feof ferror fflush fgets fileno fputc fputs fputwc fread
+`__fread_chk` fseek fseeko ftell ftello fwrite getc getwc setvbuf ungetc ungetwc (getwc/fputwc/ungetwc via direct
+glibc extern decls; libc 0.2.186 lacks them for linux-gnu) — + fprintf/fscanf/vfprintf via the NEW clean-room
+`src/loader/stdio_shim.c` (C-variadic + va_list, the established `liblog_shim.c`/`build.rs` pattern: remap the
+stream, forward to glibc vfprintf/vfscanf). (4) The existing `eclipse_fwrite_chk` gained the sentinel remap. (5)
+Disproven comments rewritten with dated 2026-06-12 notes: the `native_provider.rs` `__sF` doc (now records the
+core-782252 proof), `init_run.rs`'s `_exit(0)` reason #2 (historical note; the `_exit(0)` STAYS — reason #1, live
+engine worker threads, still holds), plus `docs/bionic-env-worklist.md` and `docs/libroblox-init-run.md` brackets.
+
+**Same-pattern audit (static, data-only readelf over the v2.721.1108 x86-64 libs):** exactly FIVE libs import `__sF`
+— libroblox.so (GOT `0x701c738`, APS2-packed relocs, slot proven by the core), libbacktrace-native.so (`0x55d688`),
+libeigen_blas.so (`0x401c0`), librenderscript-toolkit.so (`0x61cb8`), libzstd-jni-1.5.7-6.so (`0xb3fd0`) — all
+`R_X86_64_GLOB_DAT` addend 0 against the same base; ONE provider-side fix covers all five by construction. Every
+OTHER Eclipse-provided data object re-audited shape-correct (`__stack_chk_guard`, 10× `AMEDIAFORMAT_KEY_*`, 7×
+`SL_IID_*`) — `__sF` was the ONLY address-consumed array-of-structs. Fall-through UND OBJECT imports across all 11
+libs (stdin/stdout/stderr — bionic API-23+ `FILE*` pointer objects, glibc shape-identical — environ, optarg, optind,
+daylight, timezone, tzname, in6addr_*) verified shape-identical and deliberately NOT intercepted. The exhaustive
+FILE*-consuming FUNC sweep of the five importers found ONE additional same-class instance, FIXED: `__fread_chk` fell
+through to glibc whose argument order DIFFERS (glibc `(ptr, ptrlen, size, n, stream)` vs bionic
+`(buf, size, count, stream, buf_size)`) — now an Eclipse native with the bionic order + bound + remap; the other
+`_chk` imports verified shape-identical. Review re-verified the 25-name set is enumeration-complete for v2.721.1108
+AND v2.724.735.
+
+**Regression pins (existing `native_provider::tests` module — no new files, no scripts):**
+`sf_backing_is_bionic_shaped_three_structs` (THE pin that would have caught the bug: stride 152, backing 456 B,
+registered `__sF` addr == backing addr, every `&__sF[i]`+152 falls INSIDE the Eclipse-owned object — the old 24-byte
+table fails it), `sf_sentinels_translate_to_host_streams` (sentinels → glibc stdin/stdout/stderr;
+`eclipse_fileno`(sentinels) == 0/1/2; interior+null pass-through; THE killing call shape `fputs(msg, &__sF[2])` →
+host stderr succeeds), `sf_stdio_natives_round_trip_a_real_stream` (pass-through branch over a real `tmpfile()`
+through the natives incl. the C-shim fprintf/fscanf), `fread_chk_uses_the_bionic_argument_order_and_honors_the_bound`;
+the disproven-shape `sf_table_points_at_three_host_streams` REMOVED; the provider presence/count test updated
+(94 → 119 base, the 25 names listed).
+
+**Gate (run end-to-end twice after the last edit; genuine rebuilds forced via `cargo clean -p eclipse`):** fmt --all /
+build --all-targets / clippy `-D warnings` / test / release — **519 unit + 4 integration + 2 doctests = 525 passed,
+0 failed**, all 0-warning. The 4 `tests/engine_milestones.rs` tests ran their LIVE milestone subprocesses (APK +
+display present on this machine) and matched their exact SUCCESS markers — loader constructor run, GL render, ANW
+WSI bind, looper input.
+
+**Carried review notes (non-blocking, recorded not acted on):** (a) the 25 stdio natives are pinned by PRESENCE only
+— add address pins (`p.resolve("fputs").addr == eclipse_fputs as …`, mirroring the existing `__sF` address pin) so a
+re-introduced glibc fall-through cannot pass the suite; (b) the 25-name set is enumeration-complete for
+v2.721.1108/v2.724.735 ONLY — a future APK importing another FILE*-consumer (putc, freopen, getline, `__fgets_chk` —
+itself argument-order-mismatched, the `__fread_chk` class) would silently fall through and crash on a sentinel; guard
+shape: extend the self-skipping real-APK link tests (`src/loader/link.rs`) to assert every FILE*-consuming stdio
+import of a `__sF`-importing lib resolves to the Eclipse provider tier, and re-run the readelf enumeration on every
+APK version bump; (c) `eclipse_fread_chk` aborts on size×count mul-overflow where bionic delegates to fread
+(EOVERFLOW) — copies the 2026-06-05 `eclipse_fwrite_chk` posture, practically unreachable; (d) the `SfBacking` doc's
+"no importer pokes fields (readelf audit)" overclaims what readelf proves — the real basis is the opaque
+`__private[]` public NDK ABI + no `__srget`/`__swbuf`/`__isthreaded` imports + the writable zeroed backing as the
+floor; reword when next touching the file; (e) crashpad's in-handler logging now reaches glibc `fputs`, which takes
+the per-FILE lock (not async-signal-safe) — faithful to bionic-on-Android semantics, but a fault interrupting a
+holder of the host stderr lock could deadlock the handler; the tap's `write(2)`-only dump remains the
+async-signal-safe floor; (f) test nit: `eclipse_fileno(f) > 2` assumes fds 0–2 occupied (deterministic under
+cargo test).
 
 ---
 
