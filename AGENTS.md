@@ -160,9 +160,10 @@ before any history-rewriting/force operation.
   `-D warnings`/release all 0-warning. Detail: §6 (2026-06-12 `__sF` root-cause entry).
 - **2026-06-12 (main-Looper pump) — 🚀 Roblox now boots PAST the splash into DEEP engine init (Mimalloc · RbxStorage/
   SQLite WAL · AndroidGLView · HTTP/network · telemetry) and the engine SIGSEGV is now REPRODUCIBLE + ROOT-CAUSED.
-  [START-HERE marker consolidated into the `__sF` entry above at the 2026-06-12 merge] (frontier = a libroblox
-  `__cxa_thread_atexit`-registered DESTRUCTOR faults at native-engine-thread
-  EXIT on a per-thread/per-CPU heap structure with a NULL node; NOT static TLS — see the corrected gdb root-cause below).** Implemented the **Android main-`Looper`
+  [START-HERE marker consolidated into the `__sF` entry above at the 2026-06-12 merge] (frontier = **MIMALLOC's
+  per-thread-heap cleanup** (`_mi_thread_done` via `__cxa_thread_atexit_impl`) faults at engine-thread EXIT on a
+  PARTIALLY-initialized mimalloc heap in `[anon:mimalloc]` — header valid, per-CPU body all-zero; NOT static TLS, and the
+  thread IS Eclipse-`pthread_create`'d — see the gdb root-cause below).** Implemented the **Android main-`Looper`
   pump**: Eclipse drives the lifecycle then hands the main thread to winit, so it never ran `Looper.loop()` — main-thread
   `Handler.post` continuations + `SurfaceHolder` callbacks queued but never dispatched, stalling Roblox at `ActivitySplash`
   RESUMED. Fix (`src/framework.rs` + `src/graphics.rs`): bind `MessageQueue.nativePollOnce(JI)Z`/`nativeWake(J)V`
@@ -189,14 +190,22 @@ before any history-rewriting/force operation.
   Roblox far enough to spawn+exit these native threads. **Candidate (c) RULED OUT (verified):** a temporary TID trace in
   `nativePollOnce` (since reverted) showed **0 worker threads ever run `Looper.loop()`** across pump-active runs — the
   non-blocking `nativePollOnce` only ever runs on the main/winit thread, so the engine fault is **independent of the pump's
-  yield**; the pump merely advances Roblox so its NATIVE engine threads spawn+exit. **NEXT (open):** determine why the
-  per-thread node is null at exit — remaining candidates: (a) the exiting thread never completed libroblox's per-thread
-  REGISTRATION (it was created/attached outside Eclipse's `pthread_create` trampoline — `bionic_pthread.rs` thread
-  lifecycle — so the per-thread structure the dtor walks was never linked in for it); (b) a teardown-ORDERING race (an
-  earlier `__cxa_thread_atexit` dtor freed/zeroed the node first). Approach: re-run the gdb engine-fault catchpoint and
-  also break at the matching `__cxa_thread_atexit_impl`/registration to compare the registered `obj` vs the faulting
-  `rbx`, and check whether the thread went through Eclipse's `pthread_create` trampoline (gettid vs the trampoline's
-  TID set). **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
+  yield**; the pump merely advances Roblox so its NATIVE engine threads spawn+exit. **IDENTIFIED (gdb, `[anon:mimalloc]`):
+  it is MIMALLOC's per-thread-heap cleanup.** The faulting `obj` (`rbx`) lives in an `[anon:mimalloc]` 1 GB arena mapping;
+  it is a mimalloc per-thread heap / `mi_tld_t` whose **header is valid** (a `0x500`-sized descriptor at `rbx-0x80..rbx-0x10`
+  with intra-arena self-pointers + arena pointers) but whose **per-CPU/segment body (`rbx`+) is ALL-ZERO** — i.e. a
+  PARTIALLY-initialized heap. The destructor (`_mi_thread_done`-style, registered via `__cxa_thread_atexit_impl`, run by
+  glibc `__call_tls_dtors`) walks the per-CPU body (`sched_getcpu()&0xf` → 16 slots, stride `0x4a140`, `lock cmpxchg`) and
+  dereferences a zero block pointer → write to `NULL+0x58`. **Candidate (a) RULED OUT:** the faulting thread (e.g. tid
+  325442) IS Eclipse-created — it appears in the `ECLIPSE_TRACE_THREADS=1` `pthread_create child running tid=` log (one of
+  ~24 thread-pool threads spawned in a burst). So it is NOT a registration-skip; it's a mimalloc per-thread heap left
+  half-initialized when the thread exits. **NEXT (open):** why is the mimalloc per-thread body zero at exit on these
+  burst-created pool threads? — likely a mimalloc lazy-thread-init vs thread-done ORDERING/coordination issue under
+  Eclipse's threading (the thread registered `_mi_thread_done` but exited before/without the per-CPU body init completing),
+  OR a destructor-ordering interaction between Eclipse's pthread-key destructors (`bionic_pthread.rs::run_tls_destructors`)
+  and glibc's `__call_tls_dtors`. Approach: read mimalloc's `_mi_heap_init`/`_mi_thread_done` (open source) to see what
+  zeroes/gates the per-CPU body, and check whether Eclipse's thread trampoline runs the thread-start hook mimalloc's lazy
+  init expects. **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
   `android.util.Log`/`liblog` firehose + its own native diagnostics through `tracing`, emitted from ART/bionic WORKER
   threads; `tracing-subscriber`'s default `fmt` layer formats via a `thread_local! BUF` (`fmt_layer.rs:1022 BUF.with`),
   and a worker logging during its TLS teardown hit `LocalKey::with` on a destroyed TLS → AccessError → **process abort**.
