@@ -3885,13 +3885,16 @@ const VIEW_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 const VIEW_SET_BACKGROUND_COLOR_NAME: &JNIStr = jni_str!("native_setBackgroundColor");
 const VIEW_SET_BACKGROUND_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
 
-// 2026-06-11: `View.setSystemUiVisibility` (called from `ActivitySplash.onCreate` → `com.roblox.client.a.F0`)
-// calls `nativeSetFullscreen(long widget, boolean fullscreen)` (View.java:1300, a `private native`). ATL's C
-// backing toggles GTK window fullscreen; Eclipse must NOT pull GTK (AGENTS.md §5) and the host window's
-// fullscreen state is owned by `winit`/`graphics::run_windowed`, not per-View — so this validates the view
-// handle and no-ops. Instance native, descriptor `(JZ)V`. Surfaced as the step-5 (Activity.onCreate) wall.
-const VIEW_SET_FULLSCREEN_NAME: &JNIStr = jni_str!("nativeSetFullscreen");
-const VIEW_SET_FULLSCREEN_SIG: &JNIStr = jni_str!("(JZ)V");
+// 2026-06-11: `View.setSystemUiVisibility` calls `nativeSetFullscreen(widget, fullscreen)` to
+// hide/show the system UI (status/navigation bars) for the SYSTEM_UI_FLAG_FULLSCREEN flags.
+// Surfaced by Roblox's `ActivitySplash.onCreate` → `com.roblox.client.a.F0` (run log 2026-06-11:
+// `No implementation found for void android.view.View.nativeSetFullscreen(long, boolean)`).
+// `View.java` line 1214 declares `private native void nativeSetFullscreen(long widget, boolean
+// fullscreen);` → an instance native, descriptor `(JZ)V`. Eclipse's desktop window has no system
+// bars to hide, so the honest backing validates the view handle and no-ops (host window
+// fullscreen, if ever wanted, is `graphics::run_windowed`'s concern, not the Android View's).
+const VIEW_NATIVE_SET_FULLSCREEN_NAME: &JNIStr = jni_str!("nativeSetFullscreen");
+const VIEW_NATIVE_SET_FULLSCREEN_SIG: &JNIStr = jni_str!("(JZ)V");
 
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
@@ -4183,39 +4186,6 @@ extern "system" fn view_native_set_visibility<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeSetFullscreen(long widget, boolean fullscreen)` → validate the view handle; no-op
-/// (2026-06-11).
-///
-/// JNI ABI: an INSTANCE native returning void; `jboolean` is jni 0.22's Rust `bool`. `widget` is the
-/// view's [`view_registry`] handle. ATL toggles the GtkWindow's fullscreen here; Eclipse owns the host
-/// window's fullscreen state in `winit`/`graphics::run_windowed` (not per-View) and never pulls GTK
-/// (AGENTS.md §5), so this validates the handle (a bad one is logged + ignored, never UB) and no-ops.
-/// Surfaced when `ActivitySplash.onCreate → com.roblox.client.a.F0 → View.setSystemUiVisibility` ran
-/// (step-5 Activity.onCreate, run log 2026-06-11).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
-extern "system" fn view_native_set_fullscreen<'local>(
-    mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
-    widget: jlong,
-    fullscreen: jboolean,
-) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
-        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
-            tracing::debug!(
-                target: "android.view.View",
-                widget,
-                fullscreen,
-                error = %e,
-                "View.nativeSetFullscreen: invalid view handle (ignored)"
-            );
-        }
-        Ok(())
-    })
-    .resolve::<LogErrorAndDefault>()
-}
-
 /// `View.native_setBackgroundColor(long widget, int color)` → record the solid ARGB background color
 /// on the view's [`view_registry`] peer (2026-06-05).
 ///
@@ -4247,6 +4217,45 @@ extern "system" fn view_native_set_background_color<'local>(
                 error = %e,
                 "View.native_setBackgroundColor: invalid view handle (ignored)"
             ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.nativeSetFullscreen(long widget, boolean fullscreen)` → validate the view handle; no-op
+/// (no system bars exist on Eclipse's desktop window, 2026-06-11).
+///
+/// JNI ABI: an INSTANCE native returning void (`(JZ)V`; jni 0.22 maps `jboolean` to Rust `bool`).
+/// `widget` is the view's [`view_registry`] handle. Validates it through the bounds+generation-
+/// checked [`view_registry`] (a bad handle is logged + ignored, never UB) and no-ops: the Android
+/// semantic is "hide the status/navigation bars", and Eclipse's host window has none. Surfaced by
+/// Roblox's `ActivitySplash.onCreate` (`setSystemUiVisibility`, run log 2026-06-11).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn view_native_set_fullscreen<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    fullscreen: jboolean,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                fullscreen,
+                error = %e,
+                "View.nativeSetFullscreen: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget,
+                fullscreen,
+                "View.nativeSetFullscreen: validated handle, no-op (no system bars on the host window)"
+            );
         }
         Ok(())
     })
@@ -4349,12 +4358,12 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
         // SAFETY: `view_native_set_fullscreen` matches the paired `(JZ)V` signature as an instance
-        // native (View.java:1300 `nativeSetFullscreen(long, boolean)`); casting the `extern "system"`
-        // fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+        // native (surfaced by Roblox's ActivitySplash.onCreate setSystemUiVisibility, run log
+        // 2026-06-11).
         unsafe {
             NativeMethod::from_raw_parts(
-                VIEW_SET_FULLSCREEN_NAME,
-                VIEW_SET_FULLSCREEN_SIG,
+                VIEW_NATIVE_SET_FULLSCREEN_NAME,
+                VIEW_NATIVE_SET_FULLSCREEN_SIG,
                 view_native_set_fullscreen as *mut std::ffi::c_void,
             )
         },
@@ -5013,14 +5022,6 @@ const PATH_NATIVE_CUBIC_TO_SIG: &JNIStr = jni_str!("(JFFFFFF)V");
 const PATH_NATIVE_CLOSE_NAME: &JNIStr = jni_str!("native_close");
 const PATH_NATIVE_CLOSE_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-06-11: `Path.reset()` calls `native_reset(long path, long builder)` then zeroes both Java fields
-// (Path.java:58-62), so the native op must RELEASE both handles; Java re-creates a fresh builder lazily
-// on the next op. Both are Eclipse [`path_registry`] geometry slots → free both (the reserved `0` handle
-// and stale handles are rejected by `free` and ignored, never UB). Static native, descriptor `(JJ)V`.
-// Surfaced by `ActivitySplash.onCreate`'s vector-drawable path setup (run log 2026-06-11).
-const PATH_NATIVE_RESET_NAME: &JNIStr = jni_str!("native_reset");
-const PATH_NATIVE_RESET_SIG: &JNIStr = jni_str!("(JJ)V");
-
 // JNI name + descriptor for Path.native_create_path, from the ART-reported signature `long
 // android.graphics.Path.native_create_path(long)` (run log 2026-06-05): a static native, descriptor
 // `(J)J`. AOSP's `Path.getGskPath()`/`Path.<init>` calls it to FOLD the builder back into a finalized
@@ -5038,6 +5039,15 @@ const PATH_NATIVE_CREATE_PATH_SIG: &JNIStr = jni_str!("(J)J");
 // ownership matching `Path(Path src)` semantics, never a shared-mutation alias across the slab.
 const PATH_NATIVE_REF_PATH_NAME: &JNIStr = jni_str!("native_ref_path");
 const PATH_NATIVE_REF_PATH_SIG: &JNIStr = jni_str!("(J)J");
+
+// 2026-06-11: `Path.reset()`/`rewind()` call `native_reset(long path, long builder)` — a static
+// native, descriptor `(JJ)V` (Path.java line 252; ART-reported `void android.graphics.Path.
+// native_reset(long, long)`, run log 2026-06-11 — Roblox's splash spinner animates a vector
+// drawable, calling reset() per frame). ATL's GSK backing unrefs both native objects and Java
+// zeroes its fields; Eclipse frees both [`path_registry`] slots (either handle may be `0` =
+// absent — the normal case, since a Path holds only ONE of path/builder at a time).
+const PATH_NATIVE_RESET_NAME: &JNIStr = jni_str!("native_reset");
+const PATH_NATIVE_RESET_SIG: &JNIStr = jni_str!("(JJ)V");
 
 /// `Path.native_create_builder(long nativePath, long reserve)` → a real Eclipse-owned
 /// [`path_registry`] geometry handle (2026-06-05).
@@ -5226,39 +5236,6 @@ extern "system" fn path_native_close<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Path.native_reset(long path, long builder)` → release both registry handles (`Path.reset()` then
-/// zeroes its Java `path`/`builder` fields and re-creates a builder lazily, Path.java:58-62).
-///
-/// JNI ABI: a `static` native returning void (`(JJ)V`), parameters `(EnvUnowned, JClass, jlong path,
-/// jlong builder)`. Frees both [`path_registry`] slots so their geometry is dropped and the slabs are
-/// reusable; the reserved `0` handle (an as-yet-unbuilt `path`/`builder`) and any stale handle are
-/// rejected by [`path_registry::free`] and logged at trace, never UB. `catch_unwind`-guarded via
-/// `with_env`; `resolve` returns `()`.
-extern "system" fn path_native_reset<'local>(
-    mut env: EnvUnowned<'local>,
-    _class: JClass<'local>,
-    path: jlong,
-    builder: jlong,
-) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
-        for (handle, which) in [(path, "path"), (builder, "builder")] {
-            if handle != 0 {
-                if let Err(e) = path_registry::free(handle) {
-                    tracing::trace!(
-                        target: "android.graphics.Path",
-                        handle,
-                        which,
-                        error = %e,
-                        "Path.native_reset: handle already free/stale (ignored)"
-                    );
-                }
-            }
-        }
-        Ok(())
-    })
-    .resolve::<LogErrorAndDefault>()
-}
-
 /// Allocate a new [`path_registry`] slot holding a COPY of `source`'s geometry, returning its slab
 /// handle. Shared by `native_create_path` (fold builder → finalized path) and `native_ref_path` (take
 /// independent ownership into a `Path`): both produce a new, independently-owned native path object
@@ -5346,6 +5323,44 @@ extern "system" fn path_native_ref_path<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `Path.native_reset(long path, long builder)` → free both [`path_registry`] slots (2026-06-11).
+///
+/// JNI ABI: a `static` native (`(JJ)V`), so the parameters are
+/// `(EnvUnowned, JClass, jlong path, jlong builder)`. `Path.reset()` passes its CURRENT `path` and
+/// `builder` handles (a Path holds only one at a time, so one is normally `0`) and zeroes both Java
+/// fields afterwards — the native must release the old geometry. `0` = absent (skipped silently,
+/// AOSP's null native object); a non-zero stale/fabricated handle is logged + ignored (the
+/// generational slab rejects it — never UB, never a double free). Surfaced by Roblox's splash
+/// spinner resetting its vector-drawable path every animation frame (run log 2026-06-11).
+///
+/// `catch_unwind`-guarded via `with_env`; `resolve::<LogErrorAndDefault>` returns the `()` default
+/// on error/panic.
+extern "system" fn path_native_reset<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    path: jlong,
+    builder: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        for (handle, role) in [(path, "path"), (builder, "builder")] {
+            if handle == 0 {
+                continue;
+            }
+            if let Err(e) = path_registry::free(handle) {
+                tracing::debug!(
+                    target: "android.graphics.Path",
+                    handle,
+                    role,
+                    error = %e,
+                    "Path.native_reset: invalid handle (ignored)"
+                );
+            }
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.graphics.Path`'s natives.
 ///
 /// Registered before step 4, alongside the View/Paint/Matrix natives, since a launcher's onCreate may
@@ -5410,14 +5425,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_close as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_reset` matches the paired `(JJ)V` signature as a static native.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PATH_NATIVE_RESET_NAME,
-                PATH_NATIVE_RESET_SIG,
-                path_native_reset as *mut std::ffi::c_void,
-            )
-        },
         // SAFETY: `path_native_create_path` matches the paired `(J)J` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
@@ -5434,14 +5441,23 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_ref_path as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `path_native_reset` matches the paired `(JJ)V` signature as a static native
+        // (Path.java line 252; surfaced by Roblox's splash spinner, run log 2026-06-11).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PATH_NATIVE_RESET_NAME,
+                PATH_NATIVE_RESET_SIG,
+                path_native_reset as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/graphics/Path; the fn pointers' signatures match its
     // `native_create_builder`/`native_move_to`/… declarations (from the ART-reported signatures,
-    // 2026-06-05).
+    // 2026-06-05 + native_reset 2026-06-11).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/graphics/Path",
-        "registered Eclipse's non-GTK backing for Path.native_create_builder + move/line/quad/cubic/close + native_reset"
+        "registered Eclipse's non-GTK backing for Path.native_create_builder + move/line/quad/cubic/close + create_path/ref_path/reset"
     );
     Ok(())
 }
@@ -5774,11 +5790,13 @@ pub const TEXT_VIEW_CLASS: &JNIStr = jni_str!("android/widget/TextView");
 const TEXT_VIEW_NATIVE_SET_TEXT_NAME: &JNIStr = jni_str!("native_setText");
 const TEXT_VIEW_NATIVE_SET_TEXT_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V");
 
-// JNI name + descriptor for TextView.native_setTextColor (TextView.java:138):
-// `public native final void native_setTextColor(int color);` → an INSTANCE native (reads `this.widget`,
-// no handle param), descriptor `(I)V`. `color` is `Color.argb`/`0xAARRGGBB`. Surfaced at step 5 when
-// `ActivitySplash.onCreate` styled a TextView (run log 2026-06-11). ATL backs it on the GtkLabel;
-// Eclipse records the color on the receiver's [`view_registry`] peer (no GTK, text pass honors later).
+// 2026-06-11: `TextView.setTextColor` (called from `TextView.<init>` line 153) is backed by
+// `native_setTextColor(int color)` — TextView.java line 120 declares it with NO widget param
+// (ATL's C reads `this.widget`), descriptor `(I)V`. Surfaced by Roblox's `ActivitySplash`
+// `setContentView` inflating its splash layout (`com.roblox.client.components.LoadingBar` →
+// `AppCompatTextView`, run log 2026-06-11). The snapshot renderer draws glyphs with the fixed
+// `graphics::TEXT_COLOR` and does not consume a per-view text color yet (documented follow-up
+// like visibility/alpha), so the backing validates the receiver's widget handle and no-ops.
 const TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME: &JNIStr = jni_str!("native_setTextColor");
 const TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG: &JNIStr = jni_str!("(I)V");
 
@@ -5831,17 +5849,17 @@ extern "system" fn text_view_native_set_text<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `TextView.native_setTextColor(int color)` → record the ARGB text color on the receiver's
-/// [`view_registry`] peer (2026-06-11).
+/// `TextView.native_setTextColor(int color)` → validate the receiver's widget handle; no-op (the
+/// snapshot renderer draws text with the fixed `graphics::TEXT_COLOR`, 2026-06-11).
 ///
-/// JNI ABI: an INSTANCE native returning void, parameters `(EnvUnowned, JObject this, jint color)`.
-/// Reads the receiver's `widget` handle off `this` (like [`text_view_native_set_text`]) and records
-/// `color` (`Color.argb`/`0xAARRGGBB`) through the bounds+generation-checked [`view_registry`] (a
-/// stale/fabricated handle is logged + ignored, never UB). No GTK; the text pass honoring the color is
-/// a documented follow-up (the color is recorded now so it is available).
+/// JNI ABI: an INSTANCE native returning void with descriptor `(I)V` — no widget param; the
+/// receiver's [`view_registry`] handle is read off `this.widget` (like [`text_view_native_set_text`]).
+/// Validates it through the bounds+generation-checked registry (a bad handle is logged + ignored,
+/// never UB) and no-ops: per-view text color is not yet consumed by the renderer (a documented
+/// follow-up, like visibility/alpha). Surfaced by Roblox's `ActivitySplash` splash-layout inflation.
 ///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
 extern "system" fn text_view_native_set_text_color<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -5849,19 +5867,21 @@ extern "system" fn text_view_native_set_text_color<'local>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let widget = view_widget_handle(env, &this);
-        match view_registry::set_text_color(widget, color) {
-            Ok(()) => tracing::debug!(
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
                 target: "android.widget.TextView",
                 widget,
-                color,
-                "TextView.native_setTextColor: recorded text color on non-GTK view peer"
-            ),
-            Err(e) => tracing::debug!(
-                target: "android.widget.TextView",
-                widget,
+                color = format_args!("0x{:08x}", u32::from_ne_bytes(color.to_ne_bytes())),
                 error = %e,
                 "TextView.native_setTextColor: invalid view handle (ignored)"
-            ),
+            );
+        } else {
+            tracing::trace!(
+                target: "android.widget.TextView",
+                widget,
+                color = format_args!("0x{:08x}", u32::from_ne_bytes(color.to_ne_bytes())),
+                "TextView.native_setTextColor: validated handle, no-op (renderer uses fixed text color)"
+            );
         }
         Ok(())
     })
@@ -5918,8 +5938,9 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 text_view_native_set_text as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `text_view_native_set_text_color` matches the paired `(I)V` signature as an instance
-        // native (TextView.java:138); the cast is how `NativeMethod::from_raw_parts` takes the pointer.
+        // SAFETY: `text_view_native_set_text_color` matches the paired `(I)V` signature as an
+        // instance native (TextView.java line 120; surfaced by Roblox's splash-layout inflation,
+        // run log 2026-06-11).
         unsafe {
             NativeMethod::from_raw_parts(
                 TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME,
@@ -5930,7 +5951,7 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     ];
     // SAFETY: `class` is the loaded android/widget/TextView; the fn pointers' signatures match its
     // `native_constructor`/`native_setText`/`native_setTextColor` declarations (verified against
-    // TextView.java lines 89/111/138, 2026-06-05/2026-06-11).
+    // TextView.java lines 89/111/120, 2026-06-05 + 2026-06-11).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/widget/TextView",
@@ -8797,10 +8818,13 @@ mod tests {
             "native_setBackgroundColor"
         );
         assert_eq!(VIEW_SET_BACKGROUND_COLOR_SIG.to_str(), "(JI)V");
-        // nativeSetFullscreen(long, boolean) → `(JZ)V` (View.java:1300), surfaced 2026-06-11 by
-        // ActivitySplash.onCreate → setSystemUiVisibility. No-op (host window fullscreen is winit's).
-        assert_eq!(VIEW_SET_FULLSCREEN_NAME.to_str(), "nativeSetFullscreen");
-        assert_eq!(VIEW_SET_FULLSCREEN_SIG.to_str(), "(JZ)V");
+        // nativeSetFullscreen(long, boolean) → `(JZ)V`, View.java line 1214; surfaced 2026-06-11 by
+        // Roblox's ActivitySplash.onCreate setSystemUiVisibility (the ART No-implementation-found line).
+        assert_eq!(
+            VIEW_NATIVE_SET_FULLSCREEN_NAME.to_str(),
+            "nativeSetFullscreen"
+        );
+        assert_eq!(VIEW_NATIVE_SET_FULLSCREEN_SIG.to_str(), "(JZ)V");
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
@@ -8812,8 +8836,9 @@ mod tests {
             TEXT_VIEW_NATIVE_SET_TEXT_SIG.to_str(),
             "(Ljava/lang/String;)V"
         );
-        // TextView.native_setTextColor: TextView.java:138 → instance `(I)V` (ARGB int). Surfaced
-        // 2026-06-11 by ActivitySplash.onCreate; records the color on the view_registry peer.
+        // TextView.native_setTextColor: TextView.java line 120 → instance `(I)V` (NO widget param —
+        // ATL reads `this.widget`); pinned to the ART No-implementation-found line (2026-06-11,
+        // Roblox splash-layout inflation).
         assert_eq!(
             TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME.to_str(),
             "native_setTextColor"
@@ -8918,14 +8943,14 @@ mod tests {
         assert_eq!(PATH_NATIVE_CUBIC_TO_SIG.to_str(), "(JFFFFFF)V");
         assert_eq!(PATH_NATIVE_CLOSE_NAME.to_str(), "native_close");
         assert_eq!(PATH_NATIVE_CLOSE_SIG.to_str(), "(J)V");
-        // native_reset(long path, long builder) → `(JJ)V` (Path.java:251), surfaced 2026-06-11 by
-        // ActivitySplash's vector-drawable path setup. Frees both registry handles (Path.reset()).
-        assert_eq!(PATH_NATIVE_RESET_NAME.to_str(), "native_reset");
-        assert_eq!(PATH_NATIVE_RESET_SIG.to_str(), "(JJ)V");
         assert_eq!(PATH_NATIVE_CREATE_PATH_NAME.to_str(), "native_create_path");
         assert_eq!(PATH_NATIVE_CREATE_PATH_SIG.to_str(), "(J)J");
         assert_eq!(PATH_NATIVE_REF_PATH_NAME.to_str(), "native_ref_path");
         assert_eq!(PATH_NATIVE_REF_PATH_SIG.to_str(), "(J)J");
+        // native_reset(long path, long builder) → static `(JJ)V` (Path.java line 252); pinned to the
+        // ART-reported line (2026-06-11, Roblox splash spinner reset() per animation frame).
+        assert_eq!(PATH_NATIVE_RESET_NAME.to_str(), "native_reset");
+        assert_eq!(PATH_NATIVE_RESET_SIG.to_str(), "(JJ)V");
     }
 
     #[test]

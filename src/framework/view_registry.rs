@@ -169,10 +169,6 @@ pub struct ViewState {
     /// renderer fills the view's rect with this color (real fidelity) and otherwise uses a synthetic
     /// depth-distinguished color. A drawable background (`native_setBackgroundDrawable`) is separate.
     pub background_color: Option<i32>,
-    /// 2026-06-11: the text/foreground color (`TextView.setTextColor`, ARGB as `Color.argb`/
-    /// `0xAARRGGBB`), recorded by `TextView.native_setTextColor`. `None` until set; the text pass should
-    /// honor it (a documented follow-up, like visibility/alpha — recorded now so it is available).
-    pub text_color: Option<i32>,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -223,7 +219,6 @@ pub fn allocate(class_name: &str) -> Result<ViewHandle, ViewRegistryError> {
         clickable: false,
         jobject: None,
         background_color: None,
-        text_color: None,
     };
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -299,13 +294,6 @@ pub fn set_clickable(handle: ViewHandle) -> Result<(), ViewRegistryError> {
 /// handle exactly like [`with_view`], so a stale/fabricated handle is a typed `Err`, never UB.
 pub fn set_background_color(handle: ViewHandle, argb: i32) -> Result<(), ViewRegistryError> {
     with_view(handle, |v| v.background_color = Some(argb))
-}
-
-/// Record the ARGB text/foreground color on the view a `handle` refers to (`TextView.setTextColor`).
-/// 2026-06-11: stored for the text pass to honor (follow-up). Validates the handle exactly like
-/// [`with_view`], so a stale/fabricated handle is a typed `Err`, never UB.
-pub fn set_text_color(handle: ViewHandle, argb: i32) -> Result<(), ViewRegistryError> {
-    with_view(handle, |v| v.text_color = Some(argb))
 }
 
 /// Record the JNI **global** reference to a view's Java `View` object onto its registry slot, so a
