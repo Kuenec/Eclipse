@@ -799,7 +799,7 @@ all 0-warning/0-error. NOT committed (the Push-phase agent owns commit/push).
   the engine's `AndroidGLView`/EGL (the `__gl-test-anw` diagnostic + green `gl_test_anw_binds_real_wsi_handle` already
   prove engine-GLES2-on-Eclipse's-window works; the boot just doesn't WIRE it). Doc-only change (Living State §5 + this
   entry); no code touched, gate unchanged (**516 unit + 4 integration + 2 doctests**, fmt/clippy `-D warnings`/release
-  all 0-warning). Committed + pushed (owner authorized git this session; identity Yoshi; no co-author).
+  all 0-warning). Committed + pushed (owner authorized git this session; no co-author).
 
 ---
 
