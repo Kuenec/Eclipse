@@ -131,13 +131,16 @@ before any history-rewriting/force operation.
 - **2026-06-12 — ✅ `__sF` SHAPE MISMATCH CONFIRMED (core 782252) AND ROOT-CAUSE-FIXED: Eclipse provided the bionic
   data symbol `__sF` as a 24-byte table of 3 glibc `FILE*` POINTERS, but bionic's public ABI makes `__sF` an array of
   3 × 152-byte STRUCTS whose ADDRESSES are the streams — now a bionic-shaped 456-byte sentinel backing + 25
-  translating stdio natives. ⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP:
-  `./target/release/eclipse run <APK>` with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` —
-  expect THIS machine to now survive to the window + Vulkan present loop like the collaborator's machine; then the
-  frontier is the render-integration build — wire the window's `ANativeWindow` into the engine's
-  `AndroidGLView`/EGL path).** Context: the "ENGINE SIGSEGV RESOLVED, 6/6 stable" entry below was MACHINE-SPECIFIC —
-  today an owner boot on this machine (cachyos x86-64) died again, EXIT=139 at ~8 s (`/tmp/eclipse-render-check.log`,
-  systemd core 782252). Core forensics confirmed the long-suspected (UNVERIFIED until now) `__sF` hypothesis end to
+  translating stdio natives. ⇐ START HERE NEXT SESSION (= OWNER live validation of the MERGED tree on the dev-host
+  MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect crashpad's in-handler logging to
+  SURVIVE now (no more silent EXIT=139 through the `__sF` fputs fault); with the main-Looper pump merged (entry
+  below) the boot reaches DEEP engine init and deterministically hits the root-caused thread-exit-dtor SIGSEGV — so
+  the next CODE frontier is that per-thread cleanup fault (entry below), then the render-integration build — wire
+  the window's `ANativeWindow` into the engine's `AndroidGLView`/EGL path).** Context: the "ENGINE SIGSEGV RESOLVED,
+  6/6 stable" entry below was MACHINE-SPECIFIC (and independently superseded by the pump entry below) — today an
+  owner boot on this machine (cachyos x86-64) died, EXIT=139 at ~8 s (`/tmp/eclipse-render-check.log`, systemd core
+  782252). Core forensics confirmed the long-suspected (UNVERIFIED until now) `__sF` hypothesis end to
   end: crashpad's bionic-compiled logger computes `stderr = &__sF[2]` = base+0x130 (LP64 `sizeof(struct __sFILE)` =
   152 per public AOSP NDK headers), which landed 280 bytes PAST Eclipse's 24-byte pointer table inside unrelated Rust
   statics → glibc `fputs` read `fp->_lock` = `0xff` and faulted at `si_addr=0x107` (the historic "rdi=0xff invalid
@@ -155,10 +158,51 @@ before any history-rewriting/force operation.
   importers, plus the `__fread_chk` bionic-vs-glibc ARGUMENT-ORDER fix (same-pattern catch). Gate: **519 unit + 4
   integration (live milestone subprocesses, exact SUCCESS markers) + 2 doctests = 525 passed, 0 failed**, fmt/clippy
   `-D warnings`/release all 0-warning. Detail: §6 (2026-06-12 `__sF` root-cause entry).
-- **2026-06-12 (live-validated) — ✅ THE ENGINE SIGSEGV IS RESOLVED; the real Roblox v2.721.1108 boot is now STABLE to
-  the host window + Vulkan present loop (6/6 clean runs — 5 warm + 1 COLD, caches wiped). [2026-06-12 correction:
-  MACHINE-SPECIFIC — it reproduced the same day on the owner's machine (core 782252); see the `__sF` entry above]
-  (frontier = wire Roblox's engine GL output (`AndroidGLView`/EGL) to Eclipse's winit window so it draws the real UI).**
+- **2026-06-12 (main-Looper pump) — 🚀 Roblox now boots PAST the splash into DEEP engine init (Mimalloc · RbxStorage/
+  SQLite WAL · AndroidGLView · HTTP/network · telemetry) and the engine SIGSEGV is now REPRODUCIBLE + ROOT-CAUSED.
+  [START-HERE marker consolidated into the `__sF` entry above at the 2026-06-12 merge] (frontier = a libroblox
+  `__cxa_thread_atexit`-registered DESTRUCTOR faults at native-engine-thread
+  EXIT on a per-thread/per-CPU heap structure with a NULL node; NOT static TLS — see the corrected gdb root-cause below).** Implemented the **Android main-`Looper`
+  pump**: Eclipse drives the lifecycle then hands the main thread to winit, so it never ran `Looper.loop()` — main-thread
+  `Handler.post` continuations + `SurfaceHolder` callbacks queued but never dispatched, stalling Roblox at `ActivitySplash`
+  RESUMED. Fix (`src/framework.rs` + `src/graphics.rs`): bind `MessageQueue.nativePollOnce(JI)Z`/`nativeWake(J)V`
+  (ATL's `next()` yields via `nativePollOnce`; ours is NON-BLOCKING — `false` for `timeout==0` to pull a ready message,
+  `true` otherwise to yield), add `framework::pump_main_looper` (drives `Looper.loop()` once), and call it from a new
+  winit `GameWindow::about_to_wait` hook (fires each frame via the renderer's self-driven `request_redraw`). **Result
+  (live, `/tmp/r*.log`):** the pump dispatches main-thread work (`main Looper pump active`) and Roblox advances FAR — it
+  initializes mimalloc, opens its `rbx-storage.db` (SQLite, "recovered 59 frames from WAL"), inits `AndroidGLView`,
+  runs telemetry, and makes real HTTP requests (`ecsv2.roblox.com` — host internet works; networking is NOT the blocker).
+  **This corrects the prior entry's claim that the engine SIGSEGV was "resolved": it was never resolved — the splash
+  stall just prevented REACHING the faulting code.** With the pump, Roblox reaches it every run; the team's early-fault
+  tap now captures it deterministically (`signal 11 MAPERR addr=0x58 rip=libroblox+0x2779cc4`). **ROOT-CAUSED via gdb
+  (catchpoint conditioned on the faulting instruction bytes `movq $0,0x58(%r12)` to skip ART's implicit-null-check
+  SIGSEGVs):** the faulting frame is a libroblox destructor (fn @ `+0x2779bb0`) run by **`__call_tls_dtors`** (libc) — i.e.
+  a thread is EXITING and glibc is running a destructor libroblox registered via **`__cxa_thread_atexit_impl`** (a WEAK
+  libroblox import left on the host glibc baseline, `bionic_pthread.rs:1773`). The destructor walks a per-thread/per-CPU
+  heap structure (`rbx` = a linked list of nodes; it reads `[rbx+0x408]` → a node whose sub-pointer is NULL, then writes
+  `[NULL+0x58]`; the surrounding code masks `sched_getcpu()&0xf` to index a 16-slot per-CPU array, stride `0x4a140`, with
+  `lock cmpxchg`). The exiting thread is one of several ART-attached engine threads named "Main" (siblings: `RBX Worker
+  A–P`, `[vkcf]/[vkrt]/[vkps]`, `HttpClient`, …). **CORRECTION (verified, do not repeat the wrong guess):** this is **NOT a
+  static-TLS gap** — `readelf` confirms libroblox has **no `PT_TLS`, 0 TLS symbols, 0 `R_X86_64_TPOFF64`** (the team's
+  "libroblox has no PT_TLS" holds). So the bug is a libroblox per-thread CLEANUP structure left with a null node at the
+  point an engine thread exits — a thread-lifecycle / per-thread-state issue, exposed (not caused) by the pump advancing
+  Roblox far enough to spawn+exit these native threads. **NEXT (open):** determine why that per-thread node is null at
+  exit — candidates: (a) the thread never completed libroblox's per-thread registration (Eclipse-`pthread_create`
+  trampoline vs ART-attached thread mismatch — `bionic_pthread.rs` thread lifecycle); (b) a teardown-ORDERING race
+  (another `__cxa_thread_atexit` dtor freed the node first); (c) confirm whether the exiting thread ran a Java
+  `Looper.loop()` (my non-blocking `nativePollOnce` makes worker loopers exit-immediately — a known wart) vs is a pure
+  native engine thread (likely, given the siblings). **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
+  `android.util.Log`/`liblog` firehose + its own native diagnostics through `tracing`, emitted from ART/bionic WORKER
+  threads; `tracing-subscriber`'s default `fmt` layer formats via a `thread_local! BUF` (`fmt_layer.rs:1022 BUF.with`),
+  and a worker logging during its TLS teardown hit `LocalKey::with` on a destroyed TLS → AccessError → **process abort**.
+  Replaced it with a teardown-safe `diagnostics::PanicSafeStderr` layer that formats into a function-LOCAL buffer (zero
+  thread-locals; same RFC3339+level+target+fields format, no ANSI). Gate: **517 unit + 4 integration + 2 doctests**
+  (+1 `nativePollOnce` yield-table test), fmt/clippy `-D warnings`/release all 0-warning. Durability: overlay still needs
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR`; pump + logging fix are in-binary. Detail: §6 (2026-06-12 main-Looper pump).
+  *(Superseded entry below — its "engine SIGSEGV resolved / 6-6 clean" held only while the splash stall hid the fault.)*
+- **2026-06-12 (live-validated) — ⚠️ SUPERSEDED: "engine SIGSEGV resolved; boot STABLE to window (6/6 clean)" — the
+  fault was merely UNREACHED behind the splash stall; the main-Looper pump above reaches it every run. [Also
+  MACHINE-SPECIFIC: the same day it DID die pre-pump on the owner's machine — core 782252, the `__sF` entry above.]**
   Owner live-validation on the dev-host MAIN LOOP (`./target/release/eclipse run <APK>` with
   `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the signal-ABI work (now COMMITTED + merged —
   origin/main `1b56e99`) made the engine's crashpad-era SIGSEGV stop reproducing entirely. Across 6 consecutive runs
@@ -828,6 +872,30 @@ all 0-warning/0-error. NOT committed (the Push-phase agent owns commit/push).
   prove engine-GLES2-on-Eclipse's-window works; the boot just doesn't WIRE it). Doc-only change (Living State §5 + this
   entry); no code touched, gate unchanged (**516 unit + 4 integration + 2 doctests**, fmt/clippy `-D warnings`/release
   all 0-warning). Committed + pushed (owner authorized git this session; no co-author).
+- **2026-06-12 (main-Looper pump → deep engine init; engine NULL-deref captured)** — 🚀 **Bound the Android main
+  `Looper` to the winit loop so Roblox boots PAST the splash.** Root cause of the post-RESUMED stall (proven by a SIGQUIT
+  thread dump: main thread parked in winit with NO managed frames, i.e. not in `Looper.loop()`; Roblox made 0 network
+  calls though the host CDN returns HTTP 200): Eclipse drives lifecycle 1–7 then enters `graphics::run_windowed`, so the
+  main thread never pumps the Android main `Looper` — `Handler.post` continuations and (on Android) `SurfaceHolder`
+  callbacks dispatch on the main thread via `Looper.loop()`, which never runs. Fix: bind `MessageQueue.nativePollOnce`/
+  `nativeWake` (ATL's patched `next()` is `if (nativePollOnce(mPtr,t)) return null;`; ours is NON-BLOCKING per
+  `main_looper_poll_should_yield` — pull on `timeout==0`, yield otherwise so the driven `Looper.loop()` returns instead of
+  blocking the winit thread); add `framework::pump_main_looper` (drive `Looper.loop()` once, re-entrancy-guarded) called
+  from a new winit `GameWindow::about_to_wait` (ticks every frame via the renderer's `request_redraw`). **LIVE RESULT:**
+  Roblox advances from the splash plateau into mimalloc init, `rbx-storage.db` SQLite (WAL recovery), `AndroidGLView`,
+  telemetry, and real `ecsv2.roblox.com` HTTP — then reliably hits the engine's pre-existing SIGSEGV (the team's
+  early-fault tap now captures it every run: `signal 11 MAPERR addr=0x58 rip=libroblox+0x2779cc4 err=0x6` = a USER WRITE
+  through NULL+0x58 in the engine; some Eclipse-provided pointer is 0). **Same-pattern note:** the pump surfaced that the
+  `tracing-subscriber` default `fmt` layer ABORTS under `panic="abort"` when a teardown-state worker thread logs
+  (`fmt_layer.rs:1022 BUF.with()` on a destroyed thread-local → AccessError); replaced it with the zero-thread-local
+  `diagnostics::PanicSafeStderr` layer (same RFC3339+level+target+fields format). A first attempt that kept a worker-
+  reachable `thread_local!` poll counter reproduced the abort — removed; `nativePollOnce` is now TLS-free, the main-thread
+  guard uses `try_with`. **Regression guards:** `main_looper_poll_yield_table_matches_atl_next_contract` pins the
+  non-blocking yield decision (the whole pump correctness) + name/sig asserts for the two new natives. Gate (full):
+  **517 unit + 4 integration + 2 doctests**, fmt --all / clippy `-D warnings` / release all 0-warning. **Known follow-ups
+  the pump exposed (now the frontier):** the engine NULL+0x58 write (disassemble `libroblox+0x2779cc4`, trace the null
+  source); worker `HandlerThread` loopers currently exit-immediately on the yield (none load-bearing yet; back with a
+  real blocking wait if one appears). Committed + pushed (owner authorized git this session; no co-author).
 
 ### 2026-06-12 — `__sF` shape mismatch CONFIRMED (core 782252) and root-cause-FIXED: bionic array-of-structs vs Eclipse's 3-pointer table; 25 translating stdio natives; the "engine SIGSEGV resolved" claim was machine-specific
 
