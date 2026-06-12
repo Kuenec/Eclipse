@@ -130,8 +130,8 @@ before any history-rewriting/force operation.
 
 - **2026-06-12 (main-Looper pump) — 🚀 Roblox now boots PAST the splash into DEEP engine init (Mimalloc · RbxStorage/
   SQLite WAL · AndroidGLView · HTTP/network · telemetry) and the engine SIGSEGV is now REPRODUCIBLE + ROOT-CAUSED. ⇐ START
-  HERE NEXT SESSION (frontier = libroblox static-TLS for engine-spawned threads — a `thread_local` DTOR runs at thread
-  exit on a never-constructed/zero object; see the gdb root-cause + `src/loader/tls.rs` below).** Implemented the **Android main-`Looper`
+  HERE NEXT SESSION (frontier = a libroblox `__cxa_thread_atexit`-registered DESTRUCTOR faults at native-engine-thread
+  EXIT on a per-thread/per-CPU heap structure with a NULL node; NOT static TLS — see the corrected gdb root-cause below).** Implemented the **Android main-`Looper`
   pump**: Eclipse drives the lifecycle then hands the main thread to winit, so it never ran `Looper.loop()` — main-thread
   `Handler.post` continuations + `SurfaceHolder` callbacks queued but never dispatched, stalling Roblox at `ActivitySplash`
   RESUMED. Fix (`src/framework.rs` + `src/graphics.rs`): bind `MessageQueue.nativePollOnce(JI)Z`/`nativeWake(J)V`
@@ -145,18 +145,22 @@ before any history-rewriting/force operation.
   stall just prevented REACHING the faulting code.** With the pump, Roblox reaches it every run; the team's early-fault
   tap now captures it deterministically (`signal 11 MAPERR addr=0x58 rip=libroblox+0x2779cc4`). **ROOT-CAUSED via gdb
   (catchpoint conditioned on the faulting instruction bytes `movq $0,0x58(%r12)` to skip ART's implicit-null-check
-  SIGSEGVs):** the faulting frame is a libroblox **C++ `thread_local` DESTRUCTOR** (fn @ `+0x2779bb0`) running from
-  **`__call_tls_dtors`** (libc) — i.e. a thread is EXITING — on an **all-zero object** (`rbx=valid` but `rbx+0x3e0..+0x420`
-  all 0, so `[rbx+0x408]=NULL` → write to `NULL+0x58`). The exiting thread is one of several ART-attached engine threads
-  named "Main" (siblings: `RBX Worker A–P`, `[vkcf]/[vkrt]/[vkps]`, `HttpClient`, …). **The deep cause:** Eclipse loads
-  `libroblox.so` via its OWN loader (not glibc `dlopen`), so **glibc never initializes libroblox's static-TLS block for
-  newly-spawned engine threads** — their `thread_local`s stay zero, yet glibc's `__call_tls_dtors` still runs the
-  registered destructor at thread exit → null deref. (`__cxa_thread_atexit_impl` is a WEAK libroblox import left on the
-  host glibc baseline — `bionic_pthread.rs:1773` "ABI-identical"; the gap is the static-TLS *template init for new
-  threads*, the loader's `tls.rs` domain — NOT a JNI/bionic-return null as first guessed.) The pump only EXPOSED it by
-  advancing Roblox far enough to spawn+exit those threads. **NEXT: make libroblox's static-TLS block be allocated +
-  template-initialized (and/or its `thread_local` ctors run, or destructors safely skipped) for engine-spawned threads**
-  — `src/loader/tls.rs` + the thread-create path. **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
+  SIGSEGVs):** the faulting frame is a libroblox destructor (fn @ `+0x2779bb0`) run by **`__call_tls_dtors`** (libc) — i.e.
+  a thread is EXITING and glibc is running a destructor libroblox registered via **`__cxa_thread_atexit_impl`** (a WEAK
+  libroblox import left on the host glibc baseline, `bionic_pthread.rs:1773`). The destructor walks a per-thread/per-CPU
+  heap structure (`rbx` = a linked list of nodes; it reads `[rbx+0x408]` → a node whose sub-pointer is NULL, then writes
+  `[NULL+0x58]`; the surrounding code masks `sched_getcpu()&0xf` to index a 16-slot per-CPU array, stride `0x4a140`, with
+  `lock cmpxchg`). The exiting thread is one of several ART-attached engine threads named "Main" (siblings: `RBX Worker
+  A–P`, `[vkcf]/[vkrt]/[vkps]`, `HttpClient`, …). **CORRECTION (verified, do not repeat the wrong guess):** this is **NOT a
+  static-TLS gap** — `readelf` confirms libroblox has **no `PT_TLS`, 0 TLS symbols, 0 `R_X86_64_TPOFF64`** (the team's
+  "libroblox has no PT_TLS" holds). So the bug is a libroblox per-thread CLEANUP structure left with a null node at the
+  point an engine thread exits — a thread-lifecycle / per-thread-state issue, exposed (not caused) by the pump advancing
+  Roblox far enough to spawn+exit these native threads. **NEXT (open):** determine why that per-thread node is null at
+  exit — candidates: (a) the thread never completed libroblox's per-thread registration (Eclipse-`pthread_create`
+  trampoline vs ART-attached thread mismatch — `bionic_pthread.rs` thread lifecycle); (b) a teardown-ORDERING race
+  (another `__cxa_thread_atexit` dtor freed the node first); (c) confirm whether the exiting thread ran a Java
+  `Looper.loop()` (my non-blocking `nativePollOnce` makes worker loopers exit-immediately — a known wart) vs is a pure
+  native engine thread (likely, given the siblings). **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
   `android.util.Log`/`liblog` firehose + its own native diagnostics through `tracing`, emitted from ART/bionic WORKER
   threads; `tracing-subscriber`'s default `fmt` layer formats via a `thread_local! BUF` (`fmt_layer.rs:1022 BUF.with`),
   and a worker logging during its TLS teardown hit `LocalKey::with` on a destroyed TLS → AccessError → **process abort**.
