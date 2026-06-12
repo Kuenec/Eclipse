@@ -318,11 +318,13 @@ pub fn run_libroblox_init() -> Result<usize, InitRunError> {
     //      shows one `pthread_create` → a thread named "RBX Worker A") that keep executing libroblox
     //      text. Unmapping it out from under a live worker faults it (gdb-proven).
     //   2. glibc `exit()` running libroblox's C++ static destructors / `atexit` finalizers — a SHUTDOWN
-    //      lifecycle phase (distinct from init) that flushes engine-owned `FILE*`s through the bionic
-    //      `__sF` table. `__sF` is the documented host-stdio *pointer* table (native_provider.rs); a
-    //      finalizer that takes `&__sF[i]` as a bionic `FILE` struct address then `fflush`es it
-    //      derefs the table-slot address as a glibc `FILE*` → fault (gdb-proven, exit-time, main
-    //      thread). Orderly engine shutdown is out of this init harness's scope.
+    //      lifecycle phase (distinct from init) this bare init harness does not support. (Historical
+    //      note: until 2026-06-12 a finalizer's `fflush(&__sF[i])` ALSO faulted here, because `__sF`
+    //      was provided as a 24-byte host-stdio POINTER table while bionic's public ABI makes
+    //      `&__sF[i]` an array-of-structs interior address (gdb-proven 2026-06-05 at exit time —
+    //      the same mechanism later killed crashpad's logging, core 782252). `__sF` is now a
+    //      bionic-shaped 3x152-byte backing with translating stdio natives (native_provider.rs),
+    //      so that specific fault is fixed — but reason 1 alone still makes returning unsafe.)
     // So once init has fully succeeded, exit the process IMMEDIATELY and cleanly with `_exit(0)`: it
     // bypasses destructors/finalizers and the still-running workers, and the OS reclaims the mapping,
     // the staged temp file's mapping, and the worker threads. This is correct for a diagnostic that

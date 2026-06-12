@@ -1,13 +1,15 @@
 //! Eclipse build script — 2026-06-05.
 //!
 //! Compiles the clean-room C VARIADIC shims (`src/loader/liblog_shim.c`,
-//! `src/loader/bionic_syscall_shim.c`) into static libraries linked into the crate. They DEFINE the
-//! C-variadic bionic functions Rust stable cannot define (the `c_variadic` feature is nightly-only):
-//! the liblog `__android_log_print` / `__android_log_assert` (forward to the Rust sink
-//! `eclipse_liblog_emit`), and `eclipse_bionic_syscall(long, ...)` (forwards varargs to the host
-//! `syscall(3)` for the bionic `syscall` import — called directly for `SYS_gettid` in the init path).
-//! See `src/loader/liblog_shim.c` / `src/loader/bionic_syscall_shim.c` / `src/loader/native_provider.rs`
-//! / `src/loader/bionic_pthread.rs` for the full rationale.
+//! `src/loader/bionic_syscall_shim.c`, `src/loader/stdio_shim.c`) into static libraries linked into
+//! the crate. They DEFINE the C-variadic bionic functions Rust stable cannot define (the
+//! `c_variadic` feature is nightly-only): the liblog `__android_log_print` / `__android_log_assert`
+//! (forward to the Rust sink `eclipse_liblog_emit`), `eclipse_bionic_syscall(long, ...)` (forwards
+//! varargs to the host `syscall(3)` for the bionic `syscall` import — called directly for
+//! `SYS_gettid` in the init path), and the bionic stdio `fprintf`/`fscanf`/`vfprintf` translation
+//! (2026-06-12 — remap the bionic `&__sF[i]` stream sentinels to host glibc streams). See
+//! `src/loader/liblog_shim.c` / `src/loader/bionic_syscall_shim.c` / `src/loader/stdio_shim.c` /
+//! `src/loader/native_provider.rs` / `src/loader/bionic_pthread.rs` for the full rationale.
 //!
 //! Also builds the apkenv-loadable `libm` shim cdylib (`crates/libm-shim`, see `build_libm_shim`) and
 //! exposes its `.so` path via `cargo:rustc-env=ECLIPSE_LIBM_SHIM_SO`, so `runtime` can provision it as
@@ -27,10 +29,11 @@
 //! compiler is the documented build requirement for this shim.
 
 fn main() {
-    // Rebuild if any shim changes. 2026-06-05 / 2026-06-11.
+    // Rebuild if any shim changes. 2026-06-05 / 2026-06-11 / 2026-06-12.
     println!("cargo:rerun-if-changed=src/loader/liblog_shim.c");
     println!("cargo:rerun-if-changed=src/loader/bionic_syscall_shim.c");
     println!("cargo:rerun-if-changed=src/loader/native_load_shim.cpp");
+    println!("cargo:rerun-if-changed=src/loader/stdio_shim.c");
 
     // `compile` emits `cargo:rustc-link-lib=static=eclipse_liblog_shim` + the link-search path, so
     // the archive is linked into the lib, the bin, AND the test harness. The shim's two symbols are
@@ -51,6 +54,16 @@ fn main() {
     cc::Build::new()
         .file("src/loader/bionic_syscall_shim.c")
         .compile("eclipse_bionic_syscall_shim");
+
+    // The clean-room bionic stdio VARIADIC shim (2026-06-12): DEFINES `eclipse_fprintf`/
+    // `eclipse_fscanf` (C-variadic) and `eclipse_vfprintf` (va_list — no stable Rust spelling),
+    // registered by native_provider.rs under the bionic import names. Each remaps a bionic
+    // `&__sF[i]` stream sentinel to the host glibc stream via the Rust-exported
+    // `eclipse_sf_translate_stream`, then forwards to glibc vfprintf/vfscanf. See
+    // `src/loader/stdio_shim.c` for the full rationale (core dump 782252).
+    cc::Build::new()
+        .file("src/loader/stdio_shim.c")
+        .compile("eclipse_stdio_shim");
 
     // The clean-room C++ DELEGATION shim for ART's `JavaVMExt::LoadNativeLibrary`: DEFINES
     // `eclipse_art_load_native_library(...)`, which builds the `std::string` args with the host
