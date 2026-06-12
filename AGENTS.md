@@ -128,10 +128,43 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-12 — ✅ CORE 866509 ROOT-CAUSED + FIXED (the first-ever-swapchain boot's death, owner live validation of
+  the `__sF` fix): (1) `libbacktrace-native.so`'s Eclipse pre-load failed on exactly 2 missing natives
+  (`__android_log_vprint` + `__umask_chk`), so its `System.loadLibrary` DELEGATED into the apkenv shim linker, which
+  died writing through its never-initialized `_r_debug_ptr` (SIGSEGV, fault addr 0x18, rip in `libdl_bio.so.0.0.1` —
+  NOT libroblox/ART) — both natives now provided (liblog C-shim + Rust FORTIFY umask; provider 121 base / 177 total),
+  the pre-load resolves clean and the apkenv delegation is never entered; (2) the fatal-signal handler chain
+  (~79.2 KiB measured) overflowed ART's heap-backed, guard-less 32 KiB main-thread altstack, zero-filling live heap
+  (the `malloc(): unaligned tcache chunk detected` SIGABRT that destroyed the crash report mid-backtrace) — the main
+  thread now gets an Eclipse-owned guard-paged 256 KiB mmap'd altstack right after `JNI_CreateJavaVM`
+  (`install_guarded_altstack`, wired in `runtime::boot`). ⇐ START HERE NEXT SESSION (= OWNER live validation of
+  these fixes on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: the
+  `pre-load of libbacktrace-native.so failed` WARNING GONE; the new boot line `main-thread alternate signal stack:
+  Eclipse guard-paged 256 KiB …`; the two remaining pre-load WARNINGs (libimage_processing_util_jni 5 /
+  librenderscript-toolkit 3) now print symbol NAMES (run-proving the static enumeration — the warning previously
+  printed only a count); the boot should reach the Vulkan swapchain again and advance to the NEXT wall — most
+  probably the engine-thread-exit MIMALLOC fault (pump entry below: `_mi_thread_done` on a partially-init per-thread
+  heap; collaborator's diagnostics ongoing, no fix proposed yet per the evidence standard) — then the
+  render-integration build: wire the window's `ANativeWindow` into the engine's `AndroidGLView`/EGL path).**
+  Validation context: the `__sF` fix IS run-proven (crashpad's in-handler logging reached stderr intact; the 8.46 s
+  first-chance ART signal-11 was book-kept and the boot SURVIVED it, crashpad-first) and the boot reached the
+  FIRST-EVER `Vulkan surface + swapchain initialized; clear-and-present loop active` on this machine (B8G8R8A8_SRGB
+  800×600) before the fatal fired ~0.14 s later. Recorded-only (no code, deliberate): the 8 NDK natives behind the
+  two remaining same-pattern pre-load failures (need a real ANativeWindow CPU-buffer + jnigraphics surface — design
+  work, not fall-through stubs); ART-attached ENGINE threads still receive ART's guard-less 32 KiB heap altstack at
+  attach (vendored `thread_linux.cc` overwrites any pre-installed stack — open work item; a vendor-build-side
+  mitigation of `kHostAltSigStackSize`/guard page is the candidate that closes the class); the ART-first
+  fault-manager-ordering item stays monitored-only (today's boot SURVIVED the first-chance signal-11 with
+  crashpad-first, and the fatal PC was native — ordering-orthogonal; zero ordering-attributable failures on this
+  tree). Gate: **524 unit + 4 integration + 2 doctests = 530 passed, 0 failed**, fmt/clippy `-D warnings`/release
+  all 0-warning. Detail: §6 (2026-06-12 core-866509 entry).
 - **2026-06-12 — ✅ `__sF` SHAPE MISMATCH CONFIRMED (core 782252) AND ROOT-CAUSE-FIXED: Eclipse provided the bionic
   data symbol `__sF` as a 24-byte table of 3 glibc `FILE*` POINTERS, but bionic's public ABI makes `__sF` an array of
   3 × 152-byte STRUCTS whose ADDRESSES are the streams — now a bionic-shaped 456-byte sentinel backing + 25
-  translating stdio natives. ⇐ START HERE NEXT SESSION (= OWNER live validation of the MERGED tree on the dev-host
+  translating stdio natives. [START-HERE marker moved 2026-06-12 to the core-866509 entry above — this owner live
+  validation HAPPENED: `/tmp/eclipse-sf-validate.log`, EXIT=134 → core 866509, the `__sF` fix run-proven] (the plan
+  was = OWNER live validation of the MERGED tree on the dev-host
   MAIN LOOP: `./target/release/eclipse run <APK>` with
   `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect crashpad's in-handler logging to
   SURVIVE now (no more silent EXIT=139 through the `__sF` fputs fault); with the main-Looper pump merged (entry
@@ -1019,6 +1052,143 @@ the per-FILE lock (not async-signal-safe) — faithful to bionic-on-Android sema
 holder of the host stderr lock could deadlock the handler; the tap's `write(2)`-only dump remains the
 async-signal-safe floor; (f) test nit: `eclipse_fileno(f) > 2` assumes fds 0–2 occupied (deterministic under
 cargo test).
+
+### 2026-06-12 — Core 866509 root-caused (the first-ever-swapchain boot's death): the apkenv delegation re-opened by a 2-import pre-load gap (FIXED) + the fatal-handler chain overflowing ART's 32 KiB heap altstack (FIXED, main thread); 8 NDK natives + engine-thread altstack recorded-only
+
+**Context (owner live validation of the merged tree at `2ac0c9d`, `/tmp/eclipse-sf-validate.log`, EXIT=134):** the
+`__sF` fix is RUN-PROVEN — crashpad's in-handler logging reached stderr intact, the routine first-chance ART
+signal-11 at engine-clock 8.46 s (tid 866658, the 782252-class wolfssljni/okhttp implicit-null-check path) was
+book-kept by crashpad running AHEAD of ART's fault manager and **the boot SURVIVED it**, then reached the
+FIRST-EVER `Vulkan surface + swapchain initialized; clear-and-present loop active` on this machine (B8G8R8A8_SRGB
+800×600) — and died ~0.14 s later. systemd core 866509 (SIGABRT, 119.7 M) held the whole story; forensics via the
+established-safe `coredumpctl`/`gdb -batch` method (minimal call-site disassembly only).
+
+**Mechanism 1 — CONFIRMED, boot-blocking, the fatal SIGSEGV (Eclipse-side root cause = the loader provision gap;
+FIXED):** rip `0x7f54dbdcbc80` = `/usr/lib/libdl_bio.so.0.0.1+0x9c80` = `apkenv_find_library+3856` (the host
+apkenv/bionic_translation shim linker, pkg r107.026ea254-1 — NOT libroblox/ART/host-graphics), disasm
+`movl $0x1,0x18(%rax)` (`r_debug->r_state = RT_ADD`, the post-load debugger rendezvous) through the shim's
+never-initialized BSS global `_r_debug_ptr` = NULL (`nm -D`: `11650 B _r_debug_ptr`; gdb by name: `0x0`). Raw
+rt_sigframe mcontext `TRAPNO=0xe ERR=0x6 CR2=0x18` — a user-mode WRITE to NULL+0x18 (corrects the initial "read"
+framing); registers byte-identical to the in-handler report at log ~line 708. It fired while apkenv recursed into
+DT_NEEDED `"libm.so"` (rbx soinfo name + r12 string both `libm.so`, r12 inside libbacktrace-native's image); the
+full trigger chain is attested in the stack: eclipse `nativeLoad` delegation frames ← `art::JavaVMExt::
+LoadNativeLibrary` (libart+0x41b805) ← `bionic_dlopen` ← `apkenv_find_library` ×2. WHY the delegation was reached:
+Eclipse's pre-load of `libbacktrace-native.so` failed at boot with exactly 2 unresolved strong imports (log lines
+58–59: `unresolved_strong=2` + a count-only WARNING), so when rbx.backtrace's
+`System.loadLibrary("backtrace-native")` was dispatched on the Main thread by the main-Looper pump,
+`runtime_native_load` could not report it pre-loaded and delegated — the established "#1 wall" registry-consult
+design intent says that delegation must never carry an Eclipse-preloadable lib. The 2 symbols were statically
+identified (data-only readelf/nm set-arithmetic: UND set minus host libc/libm/libz exports minus every provider
+registration = exactly `{__android_log_vprint, __umask_chk}`; the same method reproduces the boot log's 2/5/3
+unresolved counts for all three failing libs; UND sets byte-identical across v2.721.1108 and v2.724.735). The
+early-fault tap behaved correctly by design: frame #16 (eclipse+0x295b6b) proves it ran and CHAINED, and its 0 dump
+banners are the engine-PC filter correctly excluding a libdl_bio rip (libroblox itself pre-loaded fine: 3388 ctors,
+`JNI_OnLoad 0x10006`). The apkenv `_r_debug_ptr` defect itself is host-package-internal — not durably fixable by
+Eclipse, and the architecture already treats apkenv as the dead-end the Rust loader exists to replace. **Fix:**
+(a) `__android_log_vprint` DEFINED in `src/loader/liblog_shim.c` (`va_list` — the established clean-room C-shim
+pattern; bounded vsnprintf → `eclipse_liblog_emit`, same return contract as `__android_log_print`);
+(b) `__umask_chk` as a Rust translating native in `native_provider.rs` (bionic FORTIFY: abort on `mode & ~0o777`,
+else glibc `umask` — public contract); provider liblog 5→6, bionic-libc 15→16 = **121 base / 177 total**;
+(c) surgical observability fix tied to this root cause: `EngineLoadError::UnresolvedImports` now carries the
+sorted/deduped NAMES and the pre-load WARNING prints them (the 2-symbol identification had to be reconstructed
+offline; the named warning run-proves it on the owner's next boot).
+
+**Mechanism 2 — CONFIRMED, the amplifier not the killer (Eclipse-integration-owned; FIXED on the main thread):**
+the `malloc(): unaligned tcache chunk detected` SIGABRT was NOT pre-existing corruption and NOT the 25 new stdio
+natives (the prime suspects — exonerated by line-by-line audit AND by the proven alternative planter): vendored
+ART's `Thread::SetUpAlternateSignalStack` (`thread_linux.cc`) registers each attaching thread's altstack as a
+32 KiB glibc-HEAP buffer (`operator new[]`, libart+0x174b04 `call _Znam`), no guard page, live malloc arena below —
+and Eclipse deliberately installed no sigaltstack (the old `native_provider.rs:1806` stance, justified by "the
+known fault is not a stack overflow" — DISPROVEN by this core). The fatal chain (tap → libsigchain → ART
+`HandleUnexpectedSignalCommon` → `DumpNativeStack` → `BacktraceMap::Create` → vendored libunwind, whose maps-parser
+frame alone is 76,816 B) consumed ~79.2 KiB: thread rsp bottomed 51,888 B BELOW `ss_sp` (frame-22 ucontext
+`uc_stack: ss_sp=0x5603b6c5a050 ss_size=0x8000`), zero-filling live heap. The heapslice's maximal zero runs match
+frame #12's bounds exactly, interrupted only by libunwind's strdup'd 62-char `framework-res.apk` path (tcache
+bin 3); the zeroed free chunk's next field gave `REVEAL_PTR(0)` = addr>>12 = `0x5603b6c51` — the one unaligned
+`entries[3]` — and the next bin-3 strdup hit glibc 2.43 `malloc.c:5341 misaligned_mem` → abort. Yoshi's earlier
+transient `corrupted double-linked list` is the same class (consistent, not run-proven — no core retained; with
+the fix, any recurrence presents as a clean guard-page SIGSEGV at a PROT_NONE address — itself the diagnostic).
+**Fix:** `install_guarded_altstack()` — mmap PROT_NONE then mprotect-RW, 256 KiB usable (3× the measured ~80 KiB
+`ALTSTACK_CHAIN_BUDGET`) over one PROT_NONE guard page — wired into `runtime::boot` immediately AFTER
+`JNI_CreateJavaVM` (verified against the vendored ART source: `Thread::Init` overwrites any pre-installed stack
+unconditionally → install after; `TearDownAlternateSignalStack` `delete[]`s the CURRENT `ss_sp` but never runs on
+the main thread — `Vm` has no `Drop`, `DestroyJavaVM` is never called; the displaced 32 KiB ART buffer leaks once
+by design — freeing a foreign `operator new[]` allocation would be unsound). Install failure is a non-fatal
+WARNING (boot proceeds on ART's stack = the pre-fix state). The disproven no-sigaltstack comment is rewritten with
+the dated core-866509 note.
+
+**Recorded-only (deliberate, per the no-workarounds policy — no code):** (a) the 8 NDK natives behind the two
+same-pattern pre-load failures — `libimage_processing_util_jni.so` needs `{ANativeWindow_lock,
+ANativeWindow_setBuffersGeometry, ANativeWindow_unlockAndPost, AndroidBitmap_lockPixels,
+AndroidBitmap_unlockPixels}` (5) and `librenderscript-toolkit.so` needs `{AndroidBitmap_getInfo,
+AndroidBitmap_lockPixels, AndroidBitmap_unlockPixels}` (3) — counts match the boot log's 5/3 exactly; no
+`System.loadLibrary` of either is on the current boot path, and real implementations need the ANativeWindow
+CPU-buffer + jnigraphics surface (design work, not fall-through stubs); extend the link.rs pin's lib list when
+they land. (b) ART-attached ENGINE threads still receive ART's guard-less 32 KiB heap altstack at attach
+(`SetUpAlternateSignalStack` overwrites any pre-installed stack; a trampoline install would be clobbered AND
+risks `TearDown`'s foreign-`delete[]`) — the exact core-866509 corruption stays reachable on an engine-thread
+fatal fault; not fixable Eclipse-side without modifying vendored ART, but Eclipse BUILDS vendored ART locally, so
+a vendor-build-side mitigation (`kHostAltSigStackSize` bump / guard-paged variant in `thread_linux.cc`) is the
+candidate follow-up that closes the class — explicit open work item. (c) The ART-first fault-manager-ordering
+companion item stays monitored-only: today's evidence cuts against urgency (the boot SURVIVED the first-chance
+signal-11 with crashpad-first post-`__sF`-fix, and the fatal PC was native — apkenv — which ART's fault manager
+cannot claim under ANY ordering; SignalChain correctly fell through to ART's unexpected-signal dump). Graduation
+condition: a boot dying where crashpad classifies a MANAGED-PC fault (.oat/JIT mapping) that ART would have
+converted to a Java NPE — capture that core first.
+
+**Same-pattern audits:** (provider-gap class) the readelf/nm set-arithmetic above over BOTH APK versions —
+libbacktrace-native = exactly the 2 (fixed); the 5/3 recorded-only; libzstd-jni's only residuals are 4 WEAK
+`ZSTD_trace_*` (legal weak-undef→0, not strong). (altstack-overflow class) grep of `SA_ONSTACK`/`sigaltstack`
+across `src/`: the tap (`SA_ONSTACK` — now guard-paged on the main thread); `init_run.rs::crash_handler` has no
+`SA_ONSTACK` and `_exit`s (shallow, not the pattern); the engine's bionic `sigaltstack` import deliberately stays
+host-baseline (`stack_t` layout-identical on x86-64; engine-registered stacks are the engine's own).
+
+**Regression pins (existing style — no new files, no scripts):** `native_provider::tests` —
+`umask_chk_forwards_a_valid_mode_and_round_trips` (new),
+`guarded_altstack_installs_eclipse_region_with_a_prot_none_guard_page` (new — active-stack identity via
+`sigaltstack(NULL,&ss)`, `ss_size >= 2×` the documented chain budget, PROT_NONE guard probed via the tap's
+`process_vm_readv` self-probe; NOTE: it pins the INSTALLER's geometry/protection/registration — the live boot
+WIRING is evidenced by the new `main-thread alternate signal stack: Eclipse guard-paged …` boot line, per
+dev-host-runbook practice), the presence/count test updated (121 base; both new names),
+`provider_resolves_registered_and_rejects_unregistered` extended; `engine::tests` —
+`unresolved_imports_error_names_the_symbols` (new — the Display must NAME every unresolved import);
+`link::tests` — `real_boot_path_loadlibrary_libs_fully_resolve` (new, self-skipping real-APK: every boot-path
+`System.loadLibrary` lib must pre-load with its unresolved set CONFINED to the documented boot-only RTLD_GLOBAL
+surface — 8 zlib names via libart's NEEDED libz + `pthread_atfork`, host-dlsym-invisible because glibc's is
+compat-versioned `@GLIBC_2.2.5`; ANY other name = re-opened apkenv delegation; it ran LIVE against v2.724.735 and
+it CAUGHT the pre-fix state during development). One discovery recorded: the boot resolves 9 extra
+libbacktrace-native imports only via libart's RTLD_GLOBAL NEEDED surface (reloc arithmetic cross-checks exactly:
+boot 11301+2 vs test 11294+9 = the same 11303 with the 2 new natives) — hence the confined-allowlist form instead
+of a raw `==0` (dlopen'ing libz RTLD_GLOBAL in-test would leak zlib names into RTLD_DEFAULT and perturb the
+sibling 88-work-list count tests). Doc reconciliation: `docs/bionic-env-worklist.md` gains a dated scope note
+(its 5/15 counts are libroblox's own work-list, still correct; the provider's 6/16 additions are
+libbacktrace-native's).
+
+**Gate (run on this exact tree; genuine rebuilds forced via `cargo clean -p eclipse` per gate precedent):**
+fmt --all (+ `--check`) / build --all-targets / clippy `-D warnings` / test (displays + `ECLIPSE_ROBLOX_APK`
+unset; the 2 display-gated milestone tests took the documented SKIP path, the 2 APK-gated ones ran their live
+milestone subprocesses against the default `$HOME/eclipse-m0` APK — this host's documented norm) / release —
+**524 unit + 4 integration + 2 doctests = 530 passed, 0 failed**, all 0-warning. No live ART/bionic boot was run
+in the workflow (dev-host boundary respected); the live validation of the named-imports warning + altstack boot
+line is the owner's next-session START-HERE.
+
+**Carried non-blocking notes (recorded, not acted on):** (a) the engine-thread altstack exposure above — recorded
+as an explicit open work item, not only a code comment; (b) the guarded-altstack test comment slightly overclaims
+("ever becomes the active one again on a thread Eclipse owns") — it cannot detect the `runtime::boot` wiring being
+dropped, ART re-overwriting on a re-attach, or the engine displacing the stack via its host-baseline `sigaltstack`
+import; reword toward the installer-properties claim when next touching the file (live wiring = the boot log
+line); (c) mechanism-3 state moved under the collaborator's same-day entries while this work was in flight: it is
+now identified as MIMALLOC's `_mi_thread_done` on a partially-initialized per-thread heap, candidate (a)
+registration-skip RULED OUT (the thread IS Eclipse-`pthread_create`'d) — the verdict's (a)-vs-(b) gdb plan is
+superseded by his narrower open question (why the per-CPU body is zero at exit; mimalloc lazy-init vs
+`__call_tls_dtors`/pthread-key destructor ordering under Eclipse's trampoline); with mechanism 1 fixed, that fault
+is the most probable next wall, and the guard-paged altstack now protects its diagnosability (the same deep ART
+dump chain would have re-corrupted the heap mid-backtrace exactly as core 866509 did); (d) why the collaborator's
+`/tmp/r*.log` boots survived the rbx.backtrace `System.loadLibrary` path is unestablished (likely config/flag
+dependent — `No symbolication ID provided` printed immediately before today's fatal block); (e)
+`eclipse_umask_chk`'s abort-on-invalid-mode branch is pinned by presence, not exercised (process-fatal by
+contract); (f) the one-time displaced 32 KiB ART main-thread altstack buffer leak is by design and documented at
+the wiring site.
 
 ---
 

@@ -2036,6 +2036,129 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ---- REAL test: every boot-path System.loadLibrary lib pre-loads with unresolved_strong=0 ----
+    // (skips cleanly if the APK is absent — never fails / fabricates.)
+
+    #[test]
+    fn real_boot_path_loadlibrary_libs_fully_resolve() {
+        // 2026-06-12 (core 866509): libbacktrace-native.so's Eclipse pre-load failed with exactly 2
+        // unresolved strong imports (__android_log_vprint + __umask_chk), so when Roblox's
+        // rbx.backtrace called System.loadLibrary("backtrace-native") on the main thread, the
+        // nativeLoad interception could not report it pre-loaded and DELEGATED into the apkenv
+        // shim linker — which died writing through its never-initialized `_r_debug_ptr` (NULL+0x18)
+        // while recursing into DT_NEEDED "libm.so". This is the smallest check that fails if a new
+        // import falls through and re-opens that apkenv delegation: every lib whose
+        // System.loadLibrary is on the boot path must pre-load with unresolved_strong == 0 in the
+        // boot process, asserted here under EXACTLY the engine.rs pre-load scope
+        // ([LoadedObjectProvider(root)] + the full BionicEnv with the Eclipse-native tier) modulo
+        // the documented boot-only RTLD_GLOBAL surface (see `boot_global_resolvable` below).
+        //
+        // Boot-path loadLibrary libs (evidence: AGENTS.md §6): libbacktrace-native.so
+        // (rbx.backtrace, every boot since the main-Looper pump) and libzstd-jni-*.so
+        // (androidx.startup during Application.onCreate; version-suffixed file name). The two
+        // known same-pattern pre-load failures (libimage_processing_util_jni.so: 5 NDK
+        // window/bitmap imports; librenderscript-toolkit.so: 3 bitmap imports) are deliberately
+        // NOT asserted — no System.loadLibrary of either is on the current boot path, and their
+        // natives (ANativeWindow CPU-buffer + jnigraphics surface) are recorded design work, not
+        // implemented yet. Extend this list when they land.
+        use crate::loader::bionic_env::BionicEnv;
+
+        let Some(apk_path) = find_roblox_apk() else {
+            eprintln!("real_boot_path_loadlibrary_libs_fully_resolve: no Roblox APK; skipping");
+            return;
+        };
+
+        let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
+        let filenames = apk.native_lib_filenames("x86_64");
+        let boot_path_libs: Vec<&String> = filenames
+            .iter()
+            .filter(|f| *f == "libbacktrace-native.so" || f.starts_with("libzstd-jni"))
+            .collect();
+        assert!(
+            boot_path_libs
+                .iter()
+                .any(|f| *f == "libbacktrace-native.so"),
+            "the APK must carry libbacktrace-native.so (the lib whose loadLibrary proved fatal)"
+        );
+
+        let dir = temp_dir("boot-path-loadlibrary");
+        for filename in boot_path_libs {
+            let entry = format!("lib/x86_64/{filename}");
+            let so_bytes = apk
+                .read_entry(&entry)
+                .unwrap_or_else(|e| panic!("read {entry} from APK: {e}"));
+            let so_path = dir.join(filename);
+            std::fs::write(&so_path, &so_bytes).expect("stage boot-path lib");
+
+            // The engine.rs pre-load pipeline: root-only map + base-relocate (bionic DT_NEEDED
+            // env-provided, host fallback off), then the FULL Eclipse scope partial-apply.
+            let linker = Linker::new(Vec::<PathBuf>::new())
+                .with_host_fallback(false)
+                .with_tolerate_missing_deps(true);
+            let mut set = linker
+                .load(&so_path)
+                .unwrap_or_else(|e| panic!("root-only map+base-relocate of {filename}: {e}"));
+            let page = host_page_size();
+            let base = set.objects[0].load_base();
+            let soname = set.objects[0].soname.clone();
+            let dynsyms = {
+                let img = set.objects[0].image().expect("re-parse boot-path lib");
+                img.dynsyms.clone()
+            };
+            let mut scope = Scope::new();
+            scope.push(Box::new(LoadedObjectProvider::new(base, &dynsyms)));
+            for p in BionicEnv::with_host_baseline(true, true).into_providers() {
+                scope.push(p);
+            }
+            let stats = set
+                .relocate_object_symbols_partial(&soname, &scope, page)
+                .unwrap_or_else(|e| panic!("partial symbol relocation of {filename}: {e}"));
+            eprintln!(
+                "{filename}: applied_nonnull={} weak_zero={} unresolved_strong={} ({:?})",
+                stats.applied_nonnull,
+                stats.applied_weak_zero,
+                stats.unresolved_strong,
+                stats.unresolved
+            );
+            // Names the BOOT process resolves through its RTLD_GLOBAL surface but cargo test
+            // cannot: libart.so is dlopen'd RTLD_GLOBAL at boot (runtime.rs), putting its NEEDED
+            // libz in the default scope (the 8 zlib names), and an ART-side lib exports
+            // `pthread_atfork` (host glibc's is a compat-versioned `@GLIBC_2.2.5` symbol dlsym
+            // cannot see). Deliberately NOT reconstructed here — dlopen'ing libz RTLD_GLOBAL in a
+            // test would leak zlib names into RTLD_DEFAULT for the sibling work-list-count tests.
+            // The pin therefore asserts the unresolved set is CONFINED to this documented
+            // boot-resolvable set: any other name (the __android_log_vprint/__umask_chk class)
+            // is one the boot also cannot resolve → its System.loadLibrary re-opens the apkenv
+            // delegation. Fails closed: a new boot-global-resolvable name added by a future APK
+            // shows up here and must be triaged deliberately.
+            let boot_global_resolvable = [
+                "deflate",
+                "deflateEnd",
+                "deflateInit2_",
+                "deflateInit_",
+                "inflate",
+                "inflateEnd",
+                "inflateInit_",
+                "zError",
+                "pthread_atfork",
+            ];
+            let leaked: Vec<&String> = stats
+                .unresolved
+                .iter()
+                .filter(|n| !boot_global_resolvable.contains(&n.as_str()))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "{filename} has unresolved strong import(s) the BOOT cannot resolve either: \
+                 {leaked:?} — its System.loadLibrary would fall through to the apkenv shim \
+                 linker (fatal NULL _r_debug_ptr write, core 866509). Provide the missing \
+                 native(s) in the Eclipse provider tier."
+            );
+            drop(set);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ---- Adversarial / dep-graph hardening (2026-06-05) -----------------------------------------
     //
     // HAND-CRAFTED hostile on-disk dependency graphs: a SELF-cycle, a deep chain, a malformed dep

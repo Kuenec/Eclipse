@@ -13,6 +13,15 @@
 > step): bind the relocated + fully-resolved image to execution and run the 3,427 `DT_INIT_ARRAY`
 > constructors in an isolated harness (honoring RELRO + BIND_NOW; no `%fs`/TCB — no PT_TLS),
 > main-loop / dev-host only.**
+>
+> **2026-06-12 scope note:** this doc's per-category counts (liblog 5, bionic-libc 15, …) are
+> **libroblox.so's own** 88-name work-list and stay correct. The provider has since grown 2 natives
+> **beyond** this list for `libbacktrace-native.so`'s pre-load (its `System.loadLibrary` otherwise
+> fell through to the apkenv shim linker — fatal NULL `_r_debug_ptr` write, core 866509): liblog
+> `__android_log_vprint` (C shim, `va_list`) and bionic-libc `__umask_chk` (FORTIFY → glibc
+> `umask`) — so `EclipseNativeProvider` registers **liblog 6 / bionic-libc 16** (121 base, 177
+> total). Per-lib pre-load resolution is pinned by
+> `loader::link::tests::real_boot_path_loadlibrary_libs_fully_resolve`.
 
 The **first bionic-env resolution cut**: resolve every one of `libroblox.so`'s 584 undefined (UND)
 imports against a host-baseline [`BionicEnv`](../src/loader/bionic_env.rs) scope, categorize them,
