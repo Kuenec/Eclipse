@@ -129,8 +129,9 @@ before any history-rewriting/force operation.
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
 - **2026-06-12 (main-Looper pump) — 🚀 Roblox now boots PAST the splash into DEEP engine init (Mimalloc · RbxStorage/
-  SQLite WAL · AndroidGLView · HTTP/network · telemetry) and the engine SIGSEGV is now REPRODUCIBLE + CAPTURED. ⇐ START
-  HERE NEXT SESSION (frontier = the engine's NULL-pointer write captured below).** Implemented the **Android main-`Looper`
+  SQLite WAL · AndroidGLView · HTTP/network · telemetry) and the engine SIGSEGV is now REPRODUCIBLE + ROOT-CAUSED. ⇐ START
+  HERE NEXT SESSION (frontier = libroblox static-TLS for engine-spawned threads — a `thread_local` DTOR runs at thread
+  exit on a never-constructed/zero object; see the gdb root-cause + `src/loader/tls.rs` below).** Implemented the **Android main-`Looper`
   pump**: Eclipse drives the lifecycle then hands the main thread to winit, so it never ran `Looper.loop()` — main-thread
   `Handler.post` continuations + `SurfaceHolder` callbacks queued but never dispatched, stalling Roblox at `ActivitySplash`
   RESUMED. Fix (`src/framework.rs` + `src/graphics.rs`): bind `MessageQueue.nativePollOnce(JI)Z`/`nativeWake(J)V`
@@ -142,11 +143,20 @@ before any history-rewriting/force operation.
   runs telemetry, and makes real HTTP requests (`ecsv2.roblox.com` — host internet works; networking is NOT the blocker).
   **This corrects the prior entry's claim that the engine SIGSEGV was "resolved": it was never resolved — the splash
   stall just prevented REACHING the faulting code.** With the pump, Roblox reaches it every run; the team's early-fault
-  tap now captures it deterministically: **`signal 11 code 1 (MAPERR) addr=0x58 … rip=libroblox+0x2779cc4 err=0x6`** — a
-  **USER WRITE to a not-present page at 0x58**, i.e. a NULL-pointer-plus-0x58 store (`null->field@0x58 = …`) in the engine:
-  some Eclipse-provided pointer (a JNI/bionic return, or an object the engine expected non-null) is 0. NEXT: disassemble
-  `libroblox.so` at `+0x2779cc4` to see the dereferenced struct/field, and trace which Eclipse call returned null just
-  before. **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
+  tap now captures it deterministically (`signal 11 MAPERR addr=0x58 rip=libroblox+0x2779cc4`). **ROOT-CAUSED via gdb
+  (catchpoint conditioned on the faulting instruction bytes `movq $0,0x58(%r12)` to skip ART's implicit-null-check
+  SIGSEGVs):** the faulting frame is a libroblox **C++ `thread_local` DESTRUCTOR** (fn @ `+0x2779bb0`) running from
+  **`__call_tls_dtors`** (libc) — i.e. a thread is EXITING — on an **all-zero object** (`rbx=valid` but `rbx+0x3e0..+0x420`
+  all 0, so `[rbx+0x408]=NULL` → write to `NULL+0x58`). The exiting thread is one of several ART-attached engine threads
+  named "Main" (siblings: `RBX Worker A–P`, `[vkcf]/[vkrt]/[vkps]`, `HttpClient`, …). **The deep cause:** Eclipse loads
+  `libroblox.so` via its OWN loader (not glibc `dlopen`), so **glibc never initializes libroblox's static-TLS block for
+  newly-spawned engine threads** — their `thread_local`s stay zero, yet glibc's `__call_tls_dtors` still runs the
+  registered destructor at thread exit → null deref. (`__cxa_thread_atexit_impl` is a WEAK libroblox import left on the
+  host glibc baseline — `bionic_pthread.rs:1773` "ABI-identical"; the gap is the static-TLS *template init for new
+  threads*, the loader's `tls.rs` domain — NOT a JNI/bionic-return null as first guessed.) The pump only EXPOSED it by
+  advancing Roblox far enough to spawn+exit those threads. **NEXT: make libroblox's static-TLS block be allocated +
+  template-initialized (and/or its `thread_local` ctors run, or destructors safely skipped) for engine-spawned threads**
+  — `src/loader/tls.rs` + the thread-create path. **Also fixed a `panic = "abort"` regression the pump exposed:** Eclipse routes the engine's
   `android.util.Log`/`liblog` firehose + its own native diagnostics through `tracing`, emitted from ART/bionic WORKER
   threads; `tracing-subscriber`'s default `fmt` layer formats via a `thread_local! BUF` (`fmt_layer.rs:1022 BUF.with`),
   and a worker logging during its TLS teardown hit `LocalKey::with` on a destroyed TLS → AccessError → **process abort**.
