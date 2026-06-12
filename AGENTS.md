@@ -128,34 +128,60 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **2026-06-11 (evening) — 🎉🎉 FULL LIFECYCLE MILESTONE: recipe steps 1–7 (CREATED → RESUMED) drive on the REAL
-  Roblox v2.721.1108 — `ActivitySplash` runs its startup, the host window + Vulkan swapchain open, and the ENGINE's
-  own native startup executes (`JNIRobloxSettings` → crashpad init). ⇐ START HERE NEXT SESSION (frontier = the
-  bionic SIGNAL ABI: a SIGSEGV inside libroblox dies in a GARBAGE signal handler).**
-  This session corrected TWO wrong framings from the prior entry with dex/core evidence (detail: §6 evening entry):
-  (1) the "Background process detected" check is **`ActivityManager.getRunningAppProcesses()`** (dex `yj.s.b`: an entry
-  with `importance==100` whose `pkgList` contains the package) — NOT `getProcessName`; (2) the `System.exit(10)` came
-  from **ATL's vendored-libcore `Thread.java` default uncaught-exception handler** (exits 10 on ANY thread's uncaught
-  exception) — so **"worker-thread gaps are non-blocking" is FALSE**; each uncaught worker exception is process-fatal.
-  **Fixed this session:** (a) `~/.cache/eclipse` was WIPED (overlay + its script lost) → the patch tooling is now
-  **IN-REPO `tools/framework-overlay/`** (script + patched ATL sources + compile-only stubs; README documents the
-  multidex first-dex-wins mechanism); overlay now patches **Build + NetworkRequest + ActivityManager (foreground
-  RunningAppProcessInfo) + PowerManager (`isDeviceIdleMode` — the actual exit-10 killer)**; (b) in-binary natives
-  bound: `View.nativeSetFullscreen (JZ)V`, `TextView.native_setTextColor (I)V` (instance, NO widget param),
-  `Path.native_reset (JJ)V` (frees both registry slots; the splash spinner calls it per frame) + name-sig pin tests.
-  **NEW FRONTIER (core-dump evidence, `coredumpctl` 455287):** during `InitHelper.getAllAppSettings` → engine JNI, a
-  SIGSEGV is raised inside `libroblox.so` (≈ base+0x1f28eff) and the kernel-invoked handler address is GARBAGE/unmapped
-  (gdb: `#1 <signal handler called>`, `rdi=0xb`) → double-fault SIGSEGV death. Crashpad had JUST registered its
-  first-chance handler; Eclipse's native provider does NOT intercept `sigaction` (only Eclipse's own `init_run.rs`
-  crash hook uses host sigaction), so bionic `sigaction` from engine code falls through to HOST GLIBC whose
-  `struct sigaction` layout differs from bionic LP64 (handler@0/mask@8(128B)/flags@136 vs flags@0/handler@8/mask@16(8B))
-  → scrambled registration. NEXT: bionic-correct signal surface in `native_provider` (sigaction/sigaction64,
-  sigprocmask, sigaltstack; mind ART's sigchain), then find what raises the FIRST fault. Worker gaps still open:
-  `Log.println_native` (benign, caught), WorkManager "non-main process" framing, `java.time` BootstrapMethodError,
-  Firebase StreamCorruptedException. Gate: **506 unit + 4 integration + 2 doctests**, fmt/clippy `-D warnings`/release
-  all 0-warning. Prior state (SQLite A+B, APK auto-fetch) is committed at `f886fcf`/`13de7ec`; durability caveat now
-  reduced to: the overlay output still lives in the cache and `run` still needs `ECLIPSE_ANDROID_FRAMEWORK_DIR`
-  (auto-provision from inside Eclipse remains open).
+- **2026-06-12 — EARLY-FAULT TAP IMPLEMENTED (gate-green: 516 unit + 4 integration (self-skip path, displays unset)
+  + 2 doctests = 522 passed, 0 failed; STILL UNCOMMITTED with the rest of the held signal-ABI work — owner hold on
+  all post-2026-06-11-morning work). ⇐ START HERE NEXT SESSION (frontier = OWNER live validation on the dev-host
+  MAIN LOOP):** run `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched cargo run -- run <APK>`
+  (rebuild the overlay FIRST via `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped — the
+  overlay is a cache artifact) and capture the tap's dump of the ORIGINAL engine SIGSEGV at ~`libroblox+0x1f28xxx`:
+  expect the `*** ECLIPSE EARLY-FAULT TAP: signal 11 … (libroblox+0x…)` block on stderr BEFORE crashpad's
+  `Run book keeping for signal 11`, then the boot dying exactly as today (the tap masks nothing — it is a
+  diagnostic, not a fix). Copy that evidence into §6 SAME-SESSION, and only THEN evaluate the (UNVERIFIED) `__sF`
+  hypothesis for crashpad's `fputs` second fault. **What landed (NEXT item (1) of the entry below):** a
+  kernel-first `SA_SIGINFO|SA_ONSTACK` SIGSEGV tap installed under a `std::sync::Once` as the FIRST statement of
+  `engine::load_app_native_lib` (after ART, before any engine instruction); it dumps
+  `si_signo`/`si_code`/`si_addr` + RIP/RSP/RBP/ERR + a bounded RBP stack walk (engine-PC-filtered once
+  `publish_engine_text_range` arms it after the libroblox map) via ONE async-signal-safe `write(2)`, then CHAINS to
+  whatever crashpad registered through the `eclipse_sigaction` seam (alloc-free claim-once pool slots; tid-scoped
+  re-entry latch — the two 2026-06-12 review-fix entries in §6). Detail + carried review notes: §6
+  (2026-06-12 early-fault tap base entry).
+- **2026-06-11 (late) — 🎉 BIONIC SIGNAL ABI DONE: crashpad's first-chance SIGSEGV handler now actually RUNS on the real
+  Roblox v2.721.1108 boot — the engine raises SIGSEGV inside `libroblox.so` and Roblox's own logger emits
+  `"Run book keeping for signal 11"` (it did not before — delivery double-faulted into a garbage address). The
+  underlying engine SIGSEGV is STILL there; crashpad now hits a SECOND fault INSIDE its own logging path.
+  (Frontier = the engine's original `libroblox+0x1f28xxx` fault, plus the crashpad-internal fputs crash that hides
+  it — the START-HERE marker moved to the 2026-06-12 entry above: the early-fault tap from NEXT item (1) is now
+  implemented; live validation is the owner's.)** **Done this session (gate-green, NOT committed — owner's session instruction):**
+  `src/loader/native_provider.rs` now provides the **bionic signal ABI as 6 translating natives** —
+  `sigaction`/`sigemptyset`/`sigaddset`/`sigfillset`/`sigprocmask`/`pthread_sigmask`. Mechanism: a
+  `#[repr(C)] BionicSigaction { sa_flags@0, handler@8, sa_mask@16, sa_restorer@24 }` (32B) and `BionicSigsetT = u64`
+  match the AOSP LP64 layout (`bits/signal_types.h`); each native translates bionic ↔ glibc fields and FORWARDS to
+  glibc with the glibc-shaped struct. `SA_RESTORER` is stripped both directions (glibc supplies its own `__restore_rt`;
+  leaking it back would corrupt re-registration). Provider total **88 → 94 base** (`150` with pthread+sysconf); the
+  registration list and count assertion in `with_bionic_natives_registers_the_three_implemented_categories` are
+  updated; the stale "ABI-identical" claim for `pthread_sigmask` in `bionic_pthread.rs` `PTHREAD_NATIVE_COUNT` is
+  corrected (sigset width was 8 vs 128 — non-null `oldset` would have written 128 bytes through an 8-byte set).
+  **5 new tests (the regression guards):** `bionic_sigaction_layout_matches_lp64` (pins offsets/sizes so a drift can't
+  re-introduce the scramble), `bionic_sigset_ops_match_the_bionic_contract` (sigempty/fill/add bound checks),
+  `bionic_sigset_translation_round_trips` (widen/narrow lossless, kernel `sigismember` cross-check),
+  `bionic_sigaction_registers_a_live_handler_and_round_trips_oldact` (REGISTERS a SIGURG handler through the bionic
+  path, `raise(SIGURG)`, asserts the kernel DELIVERED it — this is the smallest reliable check that would have
+  failed on the prior fall-through), `bionic_sigprocmask_translates_both_directions` (cross-checks the host mask
+  via glibc after a bionic SIG_BLOCK). **LIVE-BOOT EVIDENCE (`/tmp/eclipse-sig{1,2}.log`, `coredumpctl` 482294):**
+  lifecycle 1–7 still drives (`Activity resumed: recipe steps 1–7 driven`); the engine native startup runs (FLog
+  crashpad init + `Roblox files folder`/`cache folder` + `initialized crashpad, plug in the sfirst chance exception
+  handler`); the engine then SIGSEGVs at the same site as before — but now the line **`FLog::CrashReportLog Run
+  book keeping for signal 11`** is emitted (it was IMPOSSIBLE before — delivery faulted at a garbage handler address,
+  proving the bionic-ABI fix is load-bearing). Crashpad's signal handler then crashes inside `fputs` (glibc + 0x93fc5,
+  rdi=`0xff`=invalid string ptr) — a SECOND ABI gap inside crashpad's own logging path (likely a bionic/glibc stdio
+  `__sF`/FILE layout disagreement or a pre-existing engine bug that the previously-broken signal delivery had hidden).
+  **NEXT (root-cause, in order):** (1) trace the *original* engine SIGSEGV with a tiny logging early-fault handler
+  (a verbatim signal-context dump before forwarding to crashpad) — the engine fault is the actual bug; (2) determine
+  whether crashpad's `fputs` call goes through our `__sF` provision and fix that path if so. Other gaps unchanged
+  (the §8-class teardown SIGSEGV, `Log.println_native` benign worker error, WorkManager non-main framing,
+  `java.time` BootstrapMethodError, Firebase StreamCorruptedException). Gate: **511 unit + 4 integration + 2 doctests**
+  (+5 signal-ABI), fmt/clippy `-D warnings`/release all 0-warning. Durability caveat unchanged (overlay output is
+  cache, `eclipse run` still needs `ECLIPSE_ANDROID_FRAMEWORK_DIR`). Detail: §6 (2026-06-11 late signal-ABI).
 
 ---
 
@@ -438,6 +464,94 @@ their chosen source. Follow-ups: optional mirror auto-resolve, XAPK-split→merg
 (the load-bearing trust control). Gate: **506 unit + 4 integration + 2 doctests** (+2 `fetch`), all 0-warning. Done MAIN-LOOP
 (dev-host); **not committed** (owner's session instruction). *(Committed next session: `13de7ec` + `f886fcf`.)*
 
+### 2026-06-11 (late) — Bionic signal ABI in `native_provider` (6 translating natives); crashpad's first-chance handler now actually RUNS on the real Roblox boot
+
+**Root cause confirmed before fixing (CLAUDE.md "Root-Cause Diagnosis"):** the prior session's framing — engine
+`sigaction` falls through to host glibc with an incompatible struct layout — was **PROVEN** with two pieces of
+evidence before any code change. (1) **Static side, `readelf --dyn-syms -W`:** `libroblox.so` imports
+`sigaction`/`sigemptyset`/`sigaddset`/`sigfillset`/`pthread_sigmask` UND from `LIBC` (and `libbacktrace-native.so` adds
+`sigprocmask`/`sigaltstack`) — none of these were registered in the Eclipse provider, so all six resolved to host
+glibc. (2) **Dynamic side, `coredumpctl info 455287` + gdb:** the kernel-invoked handler from the prior crash dump
+was `0x00007fbc_08000804`. The low 32 bits `0x08000804` decompose exactly as `SA_ONSTACK (0x08000000) |
+SA_EXPOSE_TAGBITS (0x800) | SA_SIGINFO (0x4)` — crashpad's first-chance flags. That means glibc read its `sa_handler`
+from offset 0 of the caller's bionic struct, which is where bionic keeps `sa_flags`. ABI confirmed (AOSP
+`bits/signal_types.h` LP64): bionic `struct sigaction = { int sa_flags; union handler; sigset_t sa_mask;
+void(*sa_restorer)(); }` (32 bytes: flags@0, handler@8, mask@16, restorer@24); glibc x86-64 is
+`{ union handler; 128-byte sa_mask; int sa_flags; sa_restorer }` (152 bytes: handler@0, mask@8, flags@136). The
+mask size disagreement is also a real corruption source — glibc's `sigfillset` and a `*_sigmask(oldset)` would
+WRITE 128 bytes through an 8-byte bionic set. Decisive evidence in hand, the fix moved to implementation.
+
+**Mechanism (the fix, pure-Rust, AGENTS.md §2.1 + CLAUDE.md "Compatibility Requirements"):** new section in
+`src/loader/native_provider.rs` between `eclipse_system_property_get` and the `__stack_chk_guard`/`__sF` data
+objects. A `#[repr(C)] BionicSigaction` + `type BionicSigsetT = u64` pin the bionic LP64 layout (pin-tested below);
+`glibc_sigset_from_bionic`/`bionic_sigset_from_glibc` widen/narrow the kernel's first sigset word (the kernel's
+`rt_sigaction`/`rt_sigprocmask` actually consume 8 bytes — signals 1–64 — and bionic represents exactly that, so the
+remaining 120 bytes of glibc's set are always 0 in practice). The six translating natives:
+`eclipse_sigaction` builds a glibc-shaped `sigaction` from the bionic input, forwards to glibc, translates `oldact`
+back; `eclipse_sigemptyset`/`eclipse_sigfillset` write EXACTLY one 8-byte word (an EINVAL on null); `eclipse_sigaddset`
+bounds `signum` to 1..=64 with EINVAL outside; `eclipse_sigprocmask`/`eclipse_pthread_sigmask` widen `set`, forward,
+narrow `oldset`. `SA_RESTORER` is stripped from both directions on the wire (glibc supplies its own restorer; leaking
+that pointer to a bionic-ABI caller that later re-registers it would be unsound). `sigaltstack` stays on the host
+baseline — bionic and glibc `stack_t` are layout-identical on x86-64 (verified: `{ void* ss_sp; int ss_flags;
+size_t ss_size }` in both). Registered in `with_bionic_natives` (provider count 88 → 94 base, 144 → 150 total);
+the presence-list test gains the 6 new names; the count assertion + its breakdown comment are updated; the stale
+"`pthread_sigmask` is ABI-identical, stays on host" comment in `bionic_pthread.rs` `PTHREAD_NATIVE_COUNT` is
+corrected with a back-reference to this section (the count is unchanged because the natives live in
+`native_provider`, not `bionic_pthread`).
+
+**Regression guards (CLAUDE.md "Regression Protection" — the smallest reliable checks):** **5 new tests** in the
+existing `native_provider::tests` module, in the established style (no new file, no script). (1)
+`bionic_sigaction_layout_matches_lp64` pins the struct offsets/size + the sigset width disagreement — a future
+refactor that broke the layout would re-introduce the scramble; this test catches it before the live boot does.
+(2) `bionic_sigset_ops_match_the_bionic_contract` verifies sigempty/fill/add exactly clear/fill the one word and
+that out-of-range signums + null sets return EINVAL. (3) `bionic_sigset_translation_round_trips` widens a multi-bit
+bionic set, cross-checks with glibc's `sigismember` (proves the widened set actually represents the right bits to
+the kernel), then narrows back losslessly. (4) `bionic_sigaction_registers_a_live_handler_and_round_trips_oldact`
+is the smallest end-to-end check that would have failed on the prior fall-through: register a `SA_SIGINFO` handler
+through the bionic path, `raise(SIGURG)` (its default disposition is IGNORE so a broken registration cannot kill
+the test process), and assert the kernel actually delivered the signal to our handler — then restore the saved
+`oldact` and re-query it, proving the chain-to-previous pattern (which crashpad uses for first-chance handlers)
+round-trips. (5) `bionic_sigprocmask_translates_both_directions` blocks a signal through the bionic path and
+queries the resulting host thread mask through glibc directly to cross-check the translation against the kernel's
+view. All 5 pass; existing tests unchanged.
+
+**Live-boot evidence the fix works (`/tmp/eclipse-sig{1,2}.log`):** lifecycle still drives all the way through
+`Activity resumed: recipe steps 1–7 driven (launcher Activity = com.roblox.client.startup.ActivitySplash)` on the
+real v2.721.1108 APK; engine native startup runs and emits the same `FLog::CrashReportLog` lines as before
+(`Roblox files folder` / `cache folder` / `initialized crashpad, plug in the sfirst chance exception handler`).
+Then the engine SIGSEGVs at the same site as the prior dump — and the **NEW** log line appears:
+`FLog::CrashReportLog Run book keeping for signal 11`. That line is the first thing Roblox's `CrashReporter::HandleSignal`
+emits on entry from its signal handler. Before this fix, it was IMPOSSIBLE to reach (the kernel jumped to a
+bionic-`sa_flags`-value-read-as-pointer, double-faulted, and killed the process with no log). That this line now
+appears is direct positive proof the bionic-ABI fix delivered the signal correctly to crashpad's registered handler.
+
+**NEW frontier (HONEST: the original engine fault is still there; a SECOND ABI gap now hides behind crashpad's
+own logging path; coredump 482294 + gdb):** the process dies inside crashpad's signal handler at
+`fputs` (glibc + 0x93fc5) ← `libroblox + 0x278fe42` ← `libroblox + 0x278fc8e` ← `libroblox + 0x2792fe5` ←
+`libroblox + 0x2792930` ← signal trampoline. Register state at the fault: `rdi = 0xff` (the `fputs` `s` argument
+— invalid pointer; `gdb: Cannot access memory at address 0xff`). This is a different failure mode than the prior
+double-fault delivery: crashpad's handler IS running, but its first formatted message tries to `fputs` a string
+whose pointer is `0xff`. Hypothesis (UNVERIFIED — to be confirmed BEFORE fixing, per CLAUDE.md): either (a) crashpad
+uses `stdin`/`stdout`/`stderr` via the bionic `__sF` macro and our `__sF` table layout disagrees with crashpad's
+expected indexing (bionic FILE struct is small, so `&__sF[1]` is `__sF_base + sizeof(struct __sFILE)` — our table
+is an array of 3 `*const FILE` pointers, so the same expression yields the wrong byte offset); or (b) the original
+engine bug corrupts a TLS/global that crashpad's logger reads, and the `0xff` is downstream of that. Diagnostic
+plan: install an **early-fault tap** (a minimal `SA_SIGINFO` handler registered through `eclipse_sigaction` BEFORE
+the engine's first call — it logs `siginfo_t.si_signo`/`si_code`/`si_addr` and a bounded stack walk, then either
+chains to the previously-saved handler or `abort()`s with the dump). That isolates the engine fault from the
+crashpad logging path so we can root-cause them independently.
+
+**Cyber-safeguard NOT tripped:** the bionic signal ABI is public AOSP NDK header material (`sys/signal.h`,
+`bits/signal_types.h`) + a public-ABI translation to glibc; no AOSP/ATL/linker source modification. Done MAIN-LOOP
+on the dev host. **Gate:** fmt --all --check / build --all-targets / clippy `-D warnings` /
+test (**511 unit + 4 integration + 2 doctests**, +5: the signal-ABI tests above) / release — all 0-warning/0-error.
+**`unsafe`:** confined to the C-ABI native bodies and the kernel-side `sigaction`/`sigprocmask`/`pthread_sigmask`
+forwards (each `// SAFETY:`-dated); the translation helpers operate over `&` and `&mut`; `reloc.rs`/`elf.rs`/
+`resolve.rs` stay `#![forbid(unsafe_code)]`. Files: `src/loader/native_provider.rs` (the new section + the 5 tests
++ the count/list edits), `src/loader/bionic_pthread.rs` (the stale-comment correction). **NOT committed** — owner
+explicitly held all post-2026-06-11-morning work uncommitted; bionic-signal sits on top of the in-repo
+framework-overlay work that was just committed in `29d8dcd`/`8beef79`/`f9c7ef4` and pushed.
+
 ### 2026-06-11 (evening) — Two prior framings corrected by evidence; lifecycle 1–7 MILESTONE on real Roblox; new frontier = the bionic signal ABI
 
 **Context:** `~/.cache/eclipse` had been WIPED between sessions — the patched-framework overlay AND its out-of-tree build
@@ -494,6 +608,153 @@ real engine-init failure the broken handler hid). Remaining non-fatal: `Log.prin
 **Gate:** fmt/build/clippy `-D warnings`/test (**506 unit + 4 integration + 2 doctests**)/release — all 0-warning.
 **Cyber-safeguard:** natives from benign ART error lines + ATL Java sources only; the signal-ABI analysis is core-dump
 forensics of Eclipse's OWN process (no linker/ART source modification); done MAIN-LOOP on the dev host.
+
+### 2026-06-12 — Review fix: the early-fault tap's chain slot is now alloc-free (static claim-once pool — no heap in handler context)
+
+Blocking review finding on the (uncommitted) early-fault-tap work: `tap_chain_register` published chain-slot values via
+`Box::leak(Box::new(..))` — but that seam is reachable INSIDE the fault-handler chain (crashpad's documented not-handled
+flow, `Signals::RestoreHandlerAndReraiseSignalOnReturn`, re-registers the saved previous action via `sigaction` from
+WITHIN its handler → engine PLT → `eclipse_sigaction` → the tapped-signal seam), so the publish could `malloc` while the
+interrupted context is arbitrary engine code — possibly mid-`malloc`; glibc's arena lock is not reentrant → deadlock or
+allocator corruption instead of dump+death, in exactly the restore-and-reraise flow the tap exists to diagnose. **Fix
+(`src/loader/native_provider.rs`):** `TAP_CHAIN` is now backed by `TAP_CHAIN_POOL` — 8 static claim-once
+`UnsafeCell<BionicSigaction>` cells claimed by a grow-only `AtomicUsize` cursor, each fully written BEFORE being
+published through the existing `AtomicPtr` (Release) — preserving the never-free/no-tearing property with zero
+allocation; on exhaustion (unreachable in the real 3-claim flow: install seed + crashpad register + crashpad restore)
+the slot keeps its last occupant with one async-signal-safe `write(2)` note. `install_early_fault_tap`'s seed uses the
+same pool — NO `Box::leak` remains anywhere in the signal path (audited; the file's remaining `Box::new` are test
+fixtures; `bionic_pthread.rs`'s lazy mutex/once `Box::leak` init is a separate, pre-existing, unbounded-count pattern —
+noted, not changed here). **Regression guards:** new
+`tap_chain_pool_publishes_in_place_and_keeps_last_occupant_on_exhaustion` (a LOCAL pool/cursor/slot triple via the
+`tap_chain_publish` parametrization, so exhaustion testing cannot poison the process-global pool) + an in-pool pointer
+assertion on the REAL statics inside `early_fault_tap_intercepts_registration_and_chains` (a reintroduced heap publish
+fails it). Gate: **515 unit + 4 integration + 2 doctests**, fmt/clippy `-D warnings`/release all 0-warning. NOT
+committed (owner hold on post-2026-06-11-morning work).
+
+### 2026-06-12 — Review fix: the early-fault tap's re-entry latch is now tid-scoped (a cross-thread fault is concurrency, not recursion)
+
+Second blocking review finding on the (uncommitted) early-fault-tap work: `TAP_IN_HANDLER` was a process-global
+`AtomicBool`, held from handler entry until AFTER the chained handler returned. The tap is kernel-first for EVERY
+delivery of the tapped signal (the engine-PC filter gates only the dump), and SIGSEGV is blocked only on the handling
+thread — so a second thread faulting in that window (routine on x86-64: ART delivers managed NPE/StackOverflow fixups
+via SIGSEGV) saw `swap()==true`, was misclassified as re-entry, and took the bail path: `tap_restore_default` installed
+SIG_DFL PROCESS-WIDE and the re-executed fault killed the process — two overlapping recoverable faults became spurious
+whole-process death with the tap+crashpad chain stripped from the kernel slot. **Fix (`src/loader/native_provider.rs`):**
+`TAP_HANDLER_TID` (`AtomicI64`, owner tid via raw `SYS_gettid` — async-signal-safe, glibc-version-independent) +
+`tap_entry_claim(latch, tid)` (one CAS, pure over the latch): CAS 0→tid = `Latched` (release on exit); failure with
+owner==tid = `SameThreadReentry` (the existing SIG_DFL bail — recursive tap fault / sigchain re-front cycle, preserved);
+failure with owner!=tid = `Unlatched` → PROCEED without the latch (all per-fault handler state is stack-local,
+`TAP_CHAIN` reads are Acquire loads of immutable cells, the dump is one `write(2)` — at worst two dumps interleave on
+fd 2; never release the owner's claim). **Regression guards:** `tap_entry_claim_is_tid_scoped_not_process_global`
+(local-latch pure-fn pins: different-tid proceeds, same-tid bails, Unlatched never disturbs the owner) + a new
+cross-thread phase (f) in `early_fault_tap_intercepts_registration_and_chains` (a second thread parks INSIDE the
+chained handler holding the latch; a delivery on the test thread must still chain and the kernel slot must stay the
+tap — verified to FAIL under the old global-bool semantics: entries 1≠2). Same-pattern audit: `init_run.rs::crash_handler`
+has no latch (it `_exit`s, never returns — not the pattern); no other signal-handler latch in `src/`. Gate: **516 unit
+(+1) + 2 integration (GL SKIP path, displays unset) + 2 doctests** clean, fmt/clippy `-D warnings`/release 0-warning
+(the 2 live-boot integration tests excluded per the subagent live-boot rule — dev-host main-loop validation covers
+them). NOT committed (owner hold on post-2026-06-11-morning work).
+
+### 2026-06-12 — Early-fault tap IMPLEMENTED (the base entry the two review-fix entries above build on; appended at close-out, §6 is append-only)
+
+**What it is:** the diagnostic the 2026-06-11 (late) entry planned as NEXT item (1): a minimal, Eclipse-owned,
+**kernel-first** `SA_SIGINFO|SA_ONSTACK` SIGSEGV handler that dumps the ORIGINAL engine fault's verbatim signal
+context BEFORE crashpad's handler runs, then chains to whatever crashpad registered — isolating the engine's
+`libroblox+0x1f28xxx` fault from crashpad's own crashing `fputs` logging path so the two can be root-caused
+independently. Lives entirely in the bionic signal-ABI section of `src/loader/native_provider.rs`: statics
+`TAPPED_SIGNAL` (AtomicI32, doubles as the seam gate), `TAP_CHAIN` (AtomicPtr<BionicSigaction> over the claim-once
+pool), `TAP_IN_HANDLER`/`TAP_HANDLER_TID` (re-entry latch), `ENGINE_RANGE_BASE/SPAN`; handler stack:
+`tap_restore_default` (raw SIG_DFL reinstall), `tap_read_u64` (`SYS_process_vm_readv` self-probe, `Some` only on
+ret==8), `tap_stack_walk` (RIP then RBP frame chain — accepts iff fp≠0, 8-aligned, fp>rsp, next>fp, step<1 MiB;
+32-entry cap; standalone-testable), `tap_write_addr` (hex + `(libroblox+0x…)` annotation), and
+`early_fault_tap_handler` (errno save/restore, null-checked siginfo/ucontext reads, engine-PC filter —
+dump-everything until the range is published, the detect-don't-assume choice — fixed 2048-byte buffer formatted
+with the `init_run` `write_bytes`/`write_dec`/`write_hex` helpers promoted to `pub(super)`, ONE raw `write(2)`,
+zero panic/alloc/stdio/lock paths, dated `// SAFETY:` on every unsafe block). Local `SEGV_MAPERR=1`/`SEGV_ACCERR=2`
+consts pin kernel UAPI (absent from libc 0.2.186 for linux-gnu — verified in the pinned registry source).
+
+**Where it registers and why that is provably early enough:** `install_early_fault_tap(SIGSEGV)` runs under a
+`std::sync::Once` as the **FIRST statement of `engine::load_app_native_lib`** (install failure logs a warning and
+never aborts the boot) — i.e. AFTER ART is up (ART's sigchain installed first; the tap fronts it) and BEFORE
+`map_resolve_app_lib`/`run_init_array`, so NO engine instruction — constructor or later — can execute before the
+tap holds the kernel slot. Immediately after the libroblox map resolves (before constructors),
+`publish_engine_text_range(base, span)` arms the engine-PC filter.
+
+**Chaining design (the tap stays kernel-first by construction):** a seam at the top of `eclipse_sigaction`
+Acquire-loads `TAPPED_SIGNAL`; the tapped signal routes to `tap_chain_register` — oldact ← the current slot
+occupant (or zeroed SIG_DFL), act → a restorer-stripped copy into a claim-once pool cell, Release-published;
+returns 0, so crashpad's registration "succeeds" while the kernel slot never changes. Every other signal is
+byte-identical forward-to-glibc. The factored `bionic_action_from_glibc` helper is the ONLY glibc→bionic action
+translation (oldact path + install seed share it — they cannot drift). Handler chain dispatch: null→SIG_DFL;
+SIG_DFL→reinstall+return (the re-executed fault preserves the original siginfo); SIG_IGN→return; else 3-arg
+`sa_sigaction` iff the slot carries SA_SIGINFO, else 1-arg `sa_handler`. Deliberately NOT flag/mask-exact (the
+slot's `sa_mask` is not applied around the chained call; SA_RESETHAND/SA_NODEFER not emulated) — immaterial for
+crashpad's proven flags, documented in the handler. Live test evidence: a kernel-delivered SIGWINCH produced the
+real dump then chained to the test handler — kernel→tap→chain proven end-to-end.
+
+**Regression guards (3 new tests, in the existing `native_provider::tests` module; the 2 review-fix tests above
+add 2 more):** `early_fault_tap_intercepts_registration_and_chains` (live SIGWINCH end-to-end: kernel slot IS the
+tap, the seam round-trips oldact with `sa_restorer==0`, `raise` → kernel→tap→chained handler with the dump on test
+stderr, crashpad-style restore reverts the slot, full cleanup restores the raw pre-test state),
+`tap_stack_walk_bounds_and_validates` (synthetic frame chains: termination, alignment/ordering/1-MiB-step
+rejection, the 32-cap; live `SYS_process_vm_readv` mapped/unmapped probe), `tap_si_code_consts_match_kernel_uapi`
+(pins SEGV_MAPERR/ACCERR + the `bionic_action_from_glibc` anti-drift contract: SA_RESTORER stripped, handler/mask
+carried, restorer forced to 0). Companion edits: `src/loader/engine.rs` (the Once install + the
+`publish_engine_text_range` call) and `src/loader/init_run.rs` (the three write helpers promoted `pub(super)`,
+visibility-only). No new provider symbol — the 150-count registration test is unchanged.
+
+**Gate (close-out re-verified 2026-06-12, displays/APK env unset so `tests/engine_milestones.rs` took its
+documented self-skip path):** fmt --all / build --all-targets / clippy `-D warnings` / test / release — **516 unit
++ 4 integration (self-skip) + 2 doctests = 522 passed, 0 failed**, all 0-warning. (The base tap work landed at 514
+unit; the two review fixes above added 2.) **NOT committed — owner hold on all post-2026-06-11-morning work; the
+tree stays dirty on purpose.** Live validation is the OWNER's next step (dev-host main loop — see §5).
+
+**Carried review notes (non-blocking, recorded not acted on):** (a) MINOR seed-window:
+`install_early_fault_tap` installs the tap kernel-first BEFORE seeding `TAP_CHAIN`; in that sub-microsecond
+once-per-boot window a concurrent tapped-signal delivery on another thread would see a null chain → SIG_DFL →
+spurious death of a recoverable fault. Fix shape if ever needed: query current action → seed → install (→ optional
+re-seed from the returned oldact). (b) Dump-everything noise window: the tap installs before the multi-second
+libroblox map, so routine ART SIGSEGV fixups in that window dump in full; if the noise pollutes the evidence log,
+move the Once to just before `publish_engine_text_range` (still before `run_init_array`). (c)
+`publish_engine_text_range` publishes the FULL mapped image span (map.rs `span()`), not just PF_X text — name
+overstates precision, harmless over-inclusion for an RIP filter. (d) The 2048-byte buffer can truncate the deepest
+frames in the 16-hex-digit worst case (~2.1 KB); bounded loss only (header/registers never lost) — bump to 4096 if
+guaranteed-complete 32-frame dumps are wanted. (e) Test phase (f) asserts `entries_while_parked == 2`; a real
+tty-resize SIGWINCH during an interactive run could flake it — relax to `>= 2` if ever observed. (f) Pool
+exhaustion in `tap_chain_register` returns 0 with the slot keeping its last occupant (one `write(2)` note;
+unreachable in the real ~3-claim flow). (g) A SIG_IGN chain occupant for a synchronous fault would loop
+dump+re-execute (mirrors kernel semantics; unreachable with crashpad — treat SIG_IGN like SIG_DFL for fault-class
+signals if ever hit). (h) bionic also exports `sigaction64`/`sigprocmask64`; libroblox/libbacktrace import only
+the six provided names today — route any future imports to the same translating natives (identical LP64 layout on
+x86-64) and extend the presence-list test. (i) The handler comment justifying the skipped `sa_mask` emulation
+cites crashpad's flags word, which does not encode the mask — reword to own the tradeoff directly when next
+touching the file. (j) `eclipse_sigaction`'s doc header still describes the pure forward-to-glibc contract; the
+tapped-signal seam exception is documented only in the dated body comment — optionally add one doc line.
+
+### 2026-06-12 — Review fix: carried note (a) CLOSED — the early-fault tap seeds the chain slot BEFORE the kernel install (seed-window race eliminated)
+
+Third review fix on the (uncommitted) early-fault-tap work: `install_early_fault_tap` registered the tap kernel-first
+BEFORE seeding `TAP_CHAIN` — in that once-per-boot sub-microsecond window a tapped-signal delivery on another thread
+(routine: ART's implicit-NPE SIGSEGV fixups) entered the handler with a null chain → `tap_restore_default` installed
+SIG_DFL process-wide → a recoverable fault killed the process. **New order (`src/loader/native_provider.rs`):**
+(1) query the current kernel action (`sigaction(signum, NULL, &queried)` — an invalid signum fails before anything is
+seeded or installed); (2) seed the chain slot from it (`tap_chain_store(bionic_action_from_glibc(&queried))`);
+(3) install the tap; (4) re-seed from the install's returned oldact ONLY if it differs from the queried action (a
+re-registration raced the query→install window; `BionicSigaction` now derives `PartialEq`/`Eq` for the comparison).
+The handler can therefore never observe a null chain from a real boot (that branch stays as a dated defensive floor).
+Ordering invariants preserved by construction: seed (Release) → install → `TAPPED_SIGNAL` gate (Release) LAST. Pool
+budget: the real flow still claims 3 cells (query seed + crashpad register + crashpad restore), 4 only in the raced
+re-seed case — the `TAP_CHAIN_POOL_LEN`/`tap_chain_register` comments are updated and the section-header + install
+doc comments rewritten so no stale comment describes install-then-seed. **Regression guard (deterministic, no
+concurrency test):** `early_fault_tap_intercepts_registration_and_chains` gains phase (a2) —
+`install_early_fault_tap(SIGKILL)` (queryable but never replaceable, kernel EINVAL; nothing is ever raised) must fail
+with the pool cursor advanced by exactly 1 and `TAP_CHAIN` published while the gate stays closed — verified to FAIL
+under the old order (assertion "the chain seed is claimed BEFORE the kernel install") — plus an exactly-one-cell pin
+on the quiescent real install (no spurious re-seed). Same-pattern audit: `init_run.rs::install_crash_handler` is not
+the pattern (its handler reads always-valid atomics and `_exit`s — no install-before-seed dependency); no other
+handler installer in `src/`. **Gate (re-run in full):** fmt --all / build --all-targets / clippy `-D warnings` /
+test (**516 unit + 4 integration (self-skip, displays/APK unset) + 2 doctests = 522 passed, 0 failed**) / release —
+all 0-warning/0-error. NOT committed (the Push-phase agent owns commit/push).
 
 ---
 

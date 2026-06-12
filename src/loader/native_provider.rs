@@ -92,11 +92,13 @@
 //! (the runtime tail, main-loop / dev-host only). The ANativeWindow surface/buffer natives are
 //! explicitly **deferred to the render integration** (documented sound sentinels until then).
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+use super::init_run::{write_bytes, write_dec, write_hex};
 use super::ndk_registry::{
     self, AssetManagerState, AssetState, ConfigurationState, LooperState, NativeWindowState,
 };
@@ -112,8 +114,9 @@ use super::resolve::{ResolvedSym, SymbolProvider};
 /// definitions), or `None` for an unregistered name (so the scope falls through to the host tier).
 ///
 /// Built with [`EclipseNativeProvider::with_bionic_natives`], which registers the liblog (3
-/// fixed-arity) and bionic-specific libc (15) natives implemented in this module. Prepended before
-/// the host baseline in [`super::bionic_env::BionicEnv`] so Eclipse's bionic-correct impls win.
+/// fixed-arity), bionic-specific libc (15), and bionic signal-ABI (6, 2026-06-11) natives
+/// implemented in this module. Prepended before the host baseline in
+/// [`super::bionic_env::BionicEnv`] so Eclipse's bionic-correct impls win.
 pub struct EclipseNativeProvider {
     /// name → run-time address of the Eclipse-owned `extern "C"` symbol.
     natives: HashMap<&'static str, u64>,
@@ -146,17 +149,19 @@ impl EclipseNativeProvider {
     }
 
     /// Build the provider with the **fixed-arity liblog (3)** + **bionic-specific libc (15)** +
-    /// **ndk-android libandroid (27)** natives this module implements registered. Taking each
-    /// native's address is safe Rust (a function/data item coerced to a pointer then to `u64`).
+    /// **bionic signal-ABI (6)** + **ndk-android libandroid (27)** natives this module implements
+    /// registered. Taking each native's address is safe Rust (a function/data item coerced to a
+    /// pointer then to `u64`).
     ///
     /// The names are the real work-list from `loader::link::tests::real_libroblox_bionic_env_*`
     /// (`docs/bionic-env-worklist.md`): liblog's full 5 (the 3 fixed-arity Rust natives plus the 2
     /// **variadic** ones — `__android_log_print`/`__android_log_assert` — now DEFINED by the
-    /// clean-room C shim, 2026-06-05); bionic-libc's 15; ndk-android's 27 (AAsset* real via
+    /// clean-room C shim, 2026-06-05); bionic-libc's 15; the signal-ABI 6 (2026-06-11 — these
+    /// resolved to host glibc before, whose sigset_t/sigaction LAYOUT is incompatible; see the
+    /// signal-ABI section); ndk-android's 27 (AAsset* real via
     /// `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow sound-stub); media-ndk's 33
-    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **88** symbols
-    /// total — registering them shrinks the engine's work-list from 88 to **0** (FULL resolution of
-    /// all 584 libroblox imports to Eclipse/host).
+    /// sound-stubs and audio's 8 (REAL OpenSL ES → host audio via [`super::opensl`]). **94** symbols
+    /// total.
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -212,6 +217,22 @@ impl EclipseNativeProvider {
         // bionic data OBJECTs (not functions): the SSP guard word and the stdio FILE table.
         p.register("__stack_chk_guard", eclipse_stack_chk_guard_addr());
         p.register("__sF", eclipse_sf_addr());
+
+        // ---- bionic signal ABI (6) — glibc HAS these names but an incompatible layout -----------
+        // 2026-06-11: bionic sigset_t = 8 bytes vs glibc's 128; bionic sigaction = flags@0/
+        // handler@8/mask@16 vs glibc handler@0/mask@8(128B)/flags@136. Falling through to glibc
+        // scrambled crashpad's SIGSEGV handler registration (core dump 455287 — the kernel-invoked
+        // handler was a bionic sa_flags value read as a pointer) and glibc's sigfillset/
+        // *_sigmask(oldset) write 128 bytes through 8-byte bionic sets. See the signal-ABI section.
+        p.register("sigaction", eclipse_sigaction as *const () as u64);
+        p.register("sigemptyset", eclipse_sigemptyset as *const () as u64);
+        p.register("sigaddset", eclipse_sigaddset as *const () as u64);
+        p.register("sigfillset", eclipse_sigfillset as *const () as u64);
+        p.register("sigprocmask", eclipse_sigprocmask as *const () as u64);
+        p.register(
+            "pthread_sigmask",
+            eclipse_pthread_sigmask as *const () as u64,
+        );
 
         // ---- ndk-android (libandroid) — the 27 NDK natives -------------------------------------
         // AAsset / AAssetManager (6) — REAL, routed to Eclipse's own `src/apk` reader.
@@ -941,6 +962,874 @@ unsafe extern "C" fn eclipse_system_property_get(
         unsafe { value.write(0) };
     }
     0 // length of the (empty) value — bionic returns 0 for an unset property.
+}
+
+// =================================================================================================
+// bionic SIGNAL ABI — glibc HAS these names but with an INCOMPATIBLE layout. **translate.**
+// =================================================================================================
+//
+// 2026-06-11: bionic LP64 `sigset_t` is ONE 64-bit word (the kernel's 8-byte rt_sigset); glibc's
+// `sigset_t` is 128 bytes (1024 bits). bionic LP64 `struct sigaction` is
+// `{ int sa_flags; union handler; sigset_t sa_mask; void (*sa_restorer)(); }` (32 bytes:
+// flags@0, handler@8, mask@16, restorer@24); glibc x86-64's is
+// `{ union handler; 128-byte sa_mask; int sa_flags; sa_restorer }` (152 bytes: handler@0,
+// mask@8, flags@136). Letting the engine's signal imports fall through to host glibc therefore
+// SCRAMBLES registration and CORRUPTS memory:
+//   - glibc `sigaction` reads its handler from offset 0 of the bionic struct — where bionic keeps
+//     `sa_flags`. PROVEN on the dev host (core dump 455287, gdb): crashpad registered its
+//     first-chance SIGSEGV handler and the kernel-invoked handler address was
+//     0x00007fbc_08000804 = [4 bytes stack-garbage padding | SA_ONSTACK|SA_EXPOSE_TAGBITS|
+//     SA_SIGINFO] — exactly a bionic `sa_flags` value read as a pointer → the handler delivery
+//     itself faulted (double-SIGSEGV death with no crash report).
+//   - glibc `sigfillset`, and `sigprocmask`/`pthread_sigmask` with a non-null `oldset`, WRITE 128
+//     bytes through the caller's 8-byte bionic set — silent stack corruption.
+// The engine work-list (readelf, libroblox.so + libbacktrace-native.so, 2026-06-11): `sigaction`,
+// `sigemptyset`, `sigaddset`, `sigfillset`, `sigprocmask`, `pthread_sigmask` — exactly these six
+// are provided here. `sigaltstack` is also imported but bionic/glibc `stack_t` are layout-identical
+// on x86-64 (`{void* ss_sp; int ss_flags; size_t ss_size}`), so it stays on the host baseline.
+
+/// Bionic LP64 `sigset_t` — one 64-bit word (signals 1–64, bit `signum-1`).
+type BionicSigsetT = u64;
+
+/// Bionic LP64 x86-64 `struct sigaction` (AOSP `bits/signal_types.h`), 32 bytes. The
+/// `#[repr(C)]` field order yields flags@0 (+4 padding), handler@8, mask@16, restorer@24 —
+/// pinned by `bionic_sigaction_layout_matches_lp64` below.
+// 2026-06-12: PartialEq/Eq derived (field-wise, padding ignored) for the install's
+// re-seed-only-if-changed comparison in `install_early_fault_tap`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BionicSigaction {
+    /// `int sa_flags` — kernel flag bits (bionic passes them through unchanged).
+    sa_flags: c_int,
+    /// The `sa_handler`/`sa_sigaction` union member (one pointer; which one is live is
+    /// `SA_SIGINFO`-determined, kernel-side — opaque here).
+    handler: usize,
+    /// `sigset_t sa_mask` — the 64-bit bionic set.
+    sa_mask: BionicSigsetT,
+    /// `void (*sa_restorer)(void)` — bionic/glibc each install their own; never forwarded.
+    sa_restorer: usize,
+}
+
+/// `SA_RESTORER` (0x04000000) — stripped both ways: glibc supplies its own `__restore_rt` when
+/// registering, and reporting glibc's restorer back to bionic-ABI callers would leak a pointer
+/// they re-register with the wrong libc's semantics.
+const SA_RESTORER_FLAG: c_int = 0x0400_0000;
+
+/// Widen a bionic 64-bit set into a glibc `sigset_t` (zeroed = empty; the kernel consumes only
+/// the first word — signals 1–64 — which is the entire bionic set).
+fn glibc_sigset_from_bionic(set: BionicSigsetT) -> libc::sigset_t {
+    // SAFETY: 2026-06-11 — an all-zero glibc sigset_t is exactly `sigemptyset`'s result (glibc
+    // memsets 0); copying the one 64-bit word into the first word makes the same set the kernel
+    // would decode from the bionic value (both are the raw kernel bitmask for signals 1–64).
+    unsafe {
+        let mut g: libc::sigset_t = std::mem::zeroed();
+        std::ptr::copy_nonoverlapping(
+            (&raw const set).cast::<u8>(),
+            (&raw mut g).cast::<u8>(),
+            std::mem::size_of::<BionicSigsetT>(),
+        );
+        g
+    }
+}
+
+/// Narrow a glibc `sigset_t` to the bionic 64-bit set (the first word — signals 1–64 — is all
+/// bionic can represent, and all the kernel uses with an 8-byte rt_sigset).
+fn bionic_sigset_from_glibc(set: &libc::sigset_t) -> BionicSigsetT {
+    let mut b: BionicSigsetT = 0;
+    // SAFETY: 2026-06-11 — reads the first 8 bytes of the (≥ 8-byte) glibc set into the bionic
+    // word; both are the raw kernel bitmask for signals 1–64.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (set as *const libc::sigset_t).cast::<u8>(),
+            (&raw mut b).cast::<u8>(),
+            std::mem::size_of::<BionicSigsetT>(),
+        );
+    }
+    b
+}
+
+/// Translate a glibc-shaped `sigaction` to the bionic LP64 shape: strip `SA_RESTORER` from
+/// `sa_flags`, carry the handler, narrow the mask, and force `sa_restorer = 0` (glibc's restorer
+/// must never leak to a bionic-ABI consumer).
+///
+/// 2026-06-12: factored out of [`eclipse_sigaction`]'s `oldact` back-translation so the
+/// early-fault tap's chain-slot seeding ([`install_early_fault_tap`]) and the live translation
+/// path cannot drift apart (pinned by `tap_si_code_consts_match_kernel_uapi` and the live SIGURG
+/// round-trip test).
+fn bionic_action_from_glibc(g: &libc::sigaction) -> BionicSigaction {
+    BionicSigaction {
+        sa_flags: g.sa_flags & !SA_RESTORER_FLAG,
+        handler: g.sa_sigaction,
+        sa_mask: bionic_sigset_from_glibc(&g.sa_mask),
+        sa_restorer: 0,
+    }
+}
+
+/// Set the calling thread's `errno` to `EINVAL` and return `-1` (the bionic sigset-op error path).
+fn einval() -> c_int {
+    // SAFETY: 2026-06-11 — `__errno_location()` returns a valid pointer to the calling thread's
+    // errno (same location `eclipse_errno` exposes to the engine, so the engine reads it back).
+    unsafe { *libc::__errno_location() = libc::EINVAL };
+    -1
+}
+
+/// `int sigaction(int signum, const struct sigaction* act, struct sigaction* oldact)` — bionic
+/// signal-handler registration. **translate:** bionic struct → glibc struct, forward to glibc
+/// `sigaction` (which supplies its own `sa_restorer`), translate the old action back. The
+/// handler/flags/mask round-trip losslessly, so a caller that saves `oldact` and later
+/// re-registers it (crashpad's chain-to-previous on a non-handled fault) restores the exact
+/// kernel state.
+///
+/// # Safety
+/// `act`/`oldact` must each be null or valid pointers to a bionic LP64 `struct sigaction`.
+unsafe extern "C" fn eclipse_sigaction(
+    signum: c_int,
+    act: *const BionicSigaction,
+    oldact: *mut BionicSigaction,
+) -> c_int {
+    // 2026-06-12: early-fault-tap seam — when `signum` is the tapped signal, the diagnostic tap
+    // owns the KERNEL slot, and the engine's registration goes to the Eclipse-owned chain slot
+    // instead (the tap stays kernel-first by construction; the tap chains to the slot occupant
+    // after dumping). Every other signal's translation below stays byte-identical.
+    let tapped = TAPPED_SIGNAL.load(Ordering::Acquire);
+    if tapped != 0 && signum == tapped {
+        // SAFETY: 2026-06-12 — `act`/`oldact` are null or valid bionic sigactions (this fn's
+        // caller contract), exactly the contract `tap_chain_register` requires.
+        return unsafe { tap_chain_register(act, oldact) };
+    }
+    let g_act = if act.is_null() {
+        None
+    } else {
+        // SAFETY: 2026-06-11 — `act` is a valid bionic sigaction (caller contract); plain read.
+        let b = unsafe { *act };
+        // SAFETY: 2026-06-11 — all-zero is a valid glibc sigaction baseline (empty mask, no
+        // flags, null restorer); the three bionic fields are then translated in.
+        let mut g: libc::sigaction = unsafe { std::mem::zeroed() };
+        g.sa_sigaction = b.handler;
+        g.sa_mask = glibc_sigset_from_bionic(b.sa_mask);
+        g.sa_flags = b.sa_flags & !SA_RESTORER_FLAG;
+        Some(g)
+    };
+    // SAFETY: 2026-06-11 — all-zero is a valid out-param baseline glibc `sigaction` overwrites.
+    let mut g_old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: 2026-06-11 — `g_act`/`g_old` are valid (or null) glibc-layout structs built above;
+    // glibc `sigaction` performs the kernel registration with its own restorer.
+    let ret = unsafe {
+        libc::sigaction(
+            signum,
+            g_act
+                .as_ref()
+                .map_or(std::ptr::null(), |g| g as *const libc::sigaction),
+            if oldact.is_null() {
+                std::ptr::null_mut()
+            } else {
+                &mut g_old
+            },
+        )
+    };
+    if ret == 0 && !oldact.is_null() {
+        // SAFETY: 2026-06-11 — `oldact` is a valid bionic sigaction out-param (caller contract);
+        // glibc filled `g_old` on success.
+        unsafe {
+            *oldact = bionic_action_from_glibc(&g_old);
+        }
+    }
+    ret
+}
+
+/// `int sigemptyset(sigset_t* set)` — clear the bionic 64-bit set. **minimal-correct** (bionic
+/// returns `EINVAL` for a null set; glibc's would zero 128 bytes).
+///
+/// # Safety
+/// `set` must be null or a valid pointer to a bionic `sigset_t` (one 64-bit word).
+unsafe extern "C" fn eclipse_sigemptyset(set: *mut BionicSigsetT) -> c_int {
+    if set.is_null() {
+        return einval();
+    }
+    // SAFETY: 2026-06-11 — non-null per the check; writes exactly the bionic 8-byte set.
+    unsafe { *set = 0 };
+    0
+}
+
+/// `int sigfillset(sigset_t* set)` — fill the bionic 64-bit set. **minimal-correct** (glibc's
+/// would write 128 bytes — the corruption case).
+///
+/// # Safety
+/// `set` must be null or a valid pointer to a bionic `sigset_t` (one 64-bit word).
+unsafe extern "C" fn eclipse_sigfillset(set: *mut BionicSigsetT) -> c_int {
+    if set.is_null() {
+        return einval();
+    }
+    // SAFETY: 2026-06-11 — non-null per the check; writes exactly the bionic 8-byte set.
+    unsafe { *set = !0 };
+    0
+}
+
+/// `int sigaddset(sigset_t* set, int signum)` — set bit `signum-1` in the bionic 64-bit set.
+/// **minimal-correct** (bionic bounds the bit to the set width → `EINVAL` outside 1–64).
+///
+/// # Safety
+/// `set` must be null or a valid pointer to a bionic `sigset_t` (one 64-bit word).
+unsafe extern "C" fn eclipse_sigaddset(set: *mut BionicSigsetT, signum: c_int) -> c_int {
+    let bit = signum.wrapping_sub(1);
+    if set.is_null() || !(0..64).contains(&bit) {
+        return einval();
+    }
+    // SAFETY: 2026-06-11 — non-null per the check; `bit` ∈ 0..64 so the shift is in range.
+    unsafe { *set |= 1u64 << bit };
+    0
+}
+
+/// `int sigprocmask(int how, const sigset_t* set, sigset_t* oldset)` — bionic 64-bit sets.
+/// **translate:** widen `set`, forward to glibc (the `how` values are the shared kernel ABI:
+/// SIG_BLOCK=0/SIG_UNBLOCK=1/SIG_SETMASK=2), narrow `oldset` back (glibc writing its own
+/// 128-byte out-param, not the caller's 8-byte one).
+///
+/// # Safety
+/// `set`/`oldset` must each be null or valid pointers to a bionic `sigset_t` (one 64-bit word).
+unsafe extern "C" fn eclipse_sigprocmask(
+    how: c_int,
+    set: *const BionicSigsetT,
+    oldset: *mut BionicSigsetT,
+) -> c_int {
+    let g_set = if set.is_null() {
+        None
+    } else {
+        // SAFETY: 2026-06-11 — `set` is a valid bionic set (caller contract); plain read.
+        Some(glibc_sigset_from_bionic(unsafe { *set }))
+    };
+    // SAFETY: 2026-06-11 — all-zero is a valid out-param baseline glibc overwrites.
+    let mut g_old: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: 2026-06-11 — translated glibc-layout sets (or null), per the sigprocmask contract.
+    let ret = unsafe {
+        libc::sigprocmask(
+            how,
+            g_set
+                .as_ref()
+                .map_or(std::ptr::null(), |g| g as *const libc::sigset_t),
+            if oldset.is_null() {
+                std::ptr::null_mut()
+            } else {
+                &mut g_old
+            },
+        )
+    };
+    if ret == 0 && !oldset.is_null() {
+        // SAFETY: 2026-06-11 — `oldset` is a valid bionic set out-param (caller contract).
+        unsafe { *oldset = bionic_sigset_from_glibc(&g_old) };
+    }
+    ret
+}
+
+/// `int pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset)` — the calling thread's
+/// mask, bionic 64-bit sets. **translate** (same widening/narrowing as [`eclipse_sigprocmask`];
+/// returns an errno VALUE — 0 on success — instead of setting `errno`, per the pthread contract).
+///
+/// # Safety
+/// `set`/`oldset` must each be null or valid pointers to a bionic `sigset_t` (one 64-bit word).
+unsafe extern "C" fn eclipse_pthread_sigmask(
+    how: c_int,
+    set: *const BionicSigsetT,
+    oldset: *mut BionicSigsetT,
+) -> c_int {
+    let g_set = if set.is_null() {
+        None
+    } else {
+        // SAFETY: 2026-06-11 — `set` is a valid bionic set (caller contract); plain read.
+        Some(glibc_sigset_from_bionic(unsafe { *set }))
+    };
+    // SAFETY: 2026-06-11 — all-zero is a valid out-param baseline glibc overwrites.
+    let mut g_old: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: 2026-06-11 — translated glibc-layout sets (or null), per the pthread_sigmask
+    // contract (thread-local mask; returns the error value directly).
+    let ret = unsafe {
+        libc::pthread_sigmask(
+            how,
+            g_set
+                .as_ref()
+                .map_or(std::ptr::null(), |g| g as *const libc::sigset_t),
+            if oldset.is_null() {
+                std::ptr::null_mut()
+            } else {
+                &mut g_old
+            },
+        )
+    };
+    if ret == 0 && !oldset.is_null() {
+        // SAFETY: 2026-06-11 — `oldset` is a valid bionic set out-param (caller contract).
+        unsafe { *oldset = bionic_sigset_from_glibc(&g_old) };
+    }
+    ret
+}
+
+// ---- EARLY-FAULT TAP (diagnostic, 2026-06-12) ---------------------------------------------------
+//
+// A kernel-first SA_SIGINFO handler that dumps the ORIGINAL engine fault's verbatim context
+// (si_signo/si_code/si_addr, RIP/RSP/RBP/REG_ERR, a bounded frame-pointer walk) BEFORE handing the
+// signal to exactly the handler that would have run without the tap. It exists because crashpad's
+// first-chance SIGSEGV handler now runs (the bionic signal ABI above is load-bearing) but dies
+// inside its own fputs path before logging the fault it was handling (AGENTS.md §5) — the tap makes
+// the original fault visible; it never suppresses, repairs, or reroutes it.
+//
+// Two-layer chaining keeps the tap kernel-first by construction (the same interposition model
+// libsigchain uses, at the layer Eclipse already owns): `install_early_fault_tap` seeds the
+// Eclipse-owned chain slot with the kernel's true current action (ART/sigchain's, post-boot —
+// QUERIED and seeded BEFORE the tap is raw-glibc-registered, so the handler can never run against
+// an empty slot; 2026-06-12), then registers the tap; afterwards, the seam in `eclipse_sigaction`
+// routes the engine's (crashpad's) registration for the tapped signal into that same slot instead
+// of the kernel. If
+// crashpad's registration reached the kernel it would be kernel-first, and its currently-faulting
+// logging path would kill the process before ever chaining to the tap — logging NOTHING.
+
+/// The tapped signal number (0 = no tap installed). Doubles as the [`eclipse_sigaction`] seam
+/// gate — signals are >= 1, so no separate installed flag is needed. Stored LAST by
+/// [`install_early_fault_tap`] (Release), after the chain slot is seeded, so the Acquire-loading
+/// seam never sees gate-open with an empty slot.
+static TAPPED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// The Eclipse-owned chain slot: the action the tap dispatches to after dumping. Values are
+/// claim-once cells of the static [`TAP_CHAIN_POOL`] — a single `AtomicPtr` store publishes
+/// handler/flags/mask atomically (no tearing readable from signal context).
+///
+/// 2026-06-12: superseded cells are intentionally never freed or reused — a concurrently
+/// running tap handler may still hold the pointer. Do NOT "fix" this into reuse — that is a
+/// torn read in signal context.
+static TAP_CHAIN: AtomicPtr<BionicSigaction> = AtomicPtr::new(std::ptr::null_mut());
+
+/// [`TAP_CHAIN_POOL`] cell count. 2026-06-12: the real signal flow claims 3 (the install's
+/// query seed + crashpad's register + crashpad's chain-to-previous restore) — 4 only if a
+/// re-registration races the install's query→install window (the one-shot re-seed in
+/// [`install_early_fault_tap`]); 8 leaves headroom for re-registrations.
+const TAP_CHAIN_POOL_LEN: usize = 8;
+
+/// Backing store for [`TAP_CHAIN`]: a fixed pool of claim-once cells, **no heap**. It exists
+/// because [`tap_chain_register`] is reachable INSIDE the fault-handler chain — crashpad's
+/// documented not-handled flow (`Signals::RestoreHandlerAndReraiseSignalOnReturn`) re-registers
+/// the saved previous action via `sigaction` FROM WITHIN its handler, which resolves through
+/// the engine PLT → [`eclipse_sigaction`] → the tapped-signal seam. The interrupted context is
+/// arbitrary engine code (the original fault may itself be mid-`malloc`), and glibc's arena
+/// lock is not reentrant — an allocation here deadlocks or corrupts the allocator instead of
+/// dump+death, in exactly the flow the tap exists to diagnose. 2026-06-12.
+///
+/// Each cell is claimed at most once ([`TAP_CHAIN_POOL_NEXT`] only grows), fully written, then
+/// published through [`TAP_CHAIN`] (Release) — immutable from then on. On exhaustion the slot
+/// keeps its last occupant (see [`tap_chain_publish`]).
+struct TapChainPool([UnsafeCell<BionicSigaction>; TAP_CHAIN_POOL_LEN]);
+
+impl TapChainPool {
+    /// All-unclaimed pool (cells zeroed; a cell's value is meaningless until published).
+    const fn new() -> Self {
+        Self(
+            [const {
+                UnsafeCell::new(BionicSigaction {
+                    sa_flags: 0,
+                    handler: 0,
+                    sa_mask: 0,
+                    sa_restorer: 0,
+                })
+            }; TAP_CHAIN_POOL_LEN],
+        )
+    }
+}
+
+// SAFETY: 2026-06-12 — each cell is written at most once, by the unique claimant of its index
+// (the paired fetch_add cursor), strictly BEFORE its pointer is published through an `AtomicPtr`
+// Release store; every cross-thread read goes through an Acquire load of that pointer, so each
+// read happens-after the one write (no data race, no tearing).
+unsafe impl Sync for TapChainPool {}
+
+/// See [`TapChainPool`].
+static TAP_CHAIN_POOL: TapChainPool = TapChainPool::new();
+
+/// One-past-the-last claimed [`TAP_CHAIN_POOL`] cell. Grows only (cells are never reclaimed).
+static TAP_CHAIN_POOL_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Claim the next unclaimed cell of `pool`, write `b` into it, and publish it to `slot`
+/// (Release). **Async-signal-safe by construction:** one `fetch_add`, one plain write to a cell
+/// nothing else can reference yet, one Release store — no allocation, no locks (the whole point
+/// — see [`TAP_CHAIN_POOL`]). On exhaustion `slot` keeps its current occupant (still a real,
+/// previously published action — benign) and `false` is returned, with one `write(2)` note per
+/// attempt (fd 2, async-signal-safe).
+///
+/// `pool` and `next` must be used as an exclusive pair (no other cursor claims this pool's
+/// cells) — the process statics above, or a test-local pair (the parametrization exists so the
+/// exhaustion test below cannot poison the process-global pool). `next` overrunning the pool is
+/// harmless (`get` bounds it; wrapping would take 2^64 claims).
+fn tap_chain_publish(
+    pool: &TapChainPool,
+    next: &AtomicUsize,
+    slot: &AtomicPtr<BionicSigaction>,
+    b: BionicSigaction,
+) -> bool {
+    let idx = next.fetch_add(1, Ordering::Relaxed);
+    let Some(cell) = pool.0.get(idx) else {
+        const MSG: &[u8] =
+            b"eclipse early-fault tap: chain pool exhausted; keeping previous chain occupant\n";
+        // SAFETY: 2026-06-12 — write(2) is async-signal-safe; MSG is a static byte string.
+        unsafe { libc::write(2, MSG.as_ptr().cast::<c_void>(), MSG.len()) };
+        return false;
+    };
+    // SAFETY: 2026-06-12 — `idx` is unique to this call (fetch_add on the pool's exclusive
+    // cursor), so this cell is written exactly once, before its pointer is published below; no
+    // other reference to it can exist yet, and it is never written again afterwards (see the
+    // TapChainPool Sync justification).
+    unsafe { cell.get().write(b) };
+    slot.store(cell.get(), Ordering::Release);
+    true
+}
+
+/// Publish `b` as the new [`TAP_CHAIN`] occupant via the static pool ([`tap_chain_publish`]).
+fn tap_chain_store(b: BionicSigaction) -> bool {
+    tap_chain_publish(&TAP_CHAIN_POOL, &TAP_CHAIN_POOL_NEXT, &TAP_CHAIN, b)
+}
+
+/// Re-entry latch: the tid of the thread currently inside the tap handler (0 = none). Only a
+/// second SYNCHRONOUS entry on the SAME thread (a recursive tap fault, or an ART-sigchain
+/// re-front cycle: sigchain → tap → chained `SignalChain::Handler` → sigchain walks → tap) bails
+/// to `SIG_DFL` and returns, so the kernel kills with the ORIGINAL siginfo (dump already written).
+///
+/// 2026-06-12: tid-scoped, NOT a process-global bool. The tap is kernel-first for EVERY delivery
+/// of the tapped signal (the engine-PC filter gates only the dump), and a fault on ANOTHER
+/// thread while one thread is mid-handler is routine concurrency — on x86-64 ART delivers
+/// managed NPE/StackOverflow fixups via SIGSEGV, and SIGSEGV is blocked only on the handling
+/// thread. A global bool misread such a concurrent entry as recursion and bailed it to SIG_DFL,
+/// turning two overlapping recoverable faults into whole-process death and stripping the
+/// tap+chain from the kernel slot. A different-tid entry proceeds concurrently instead (see
+/// [`tap_entry_claim`]): all per-fault handler state is stack-local, [`TAP_CHAIN`] reads are
+/// Acquire loads of immutable cells, and the dump is one `write(2)` — at worst two dumps
+/// interleave on fd 2.
+static TAP_HANDLER_TID: AtomicI64 = AtomicI64::new(0);
+
+/// One tap-handler entry's [`TAP_HANDLER_TID`] outcome (see [`tap_entry_claim`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapEntryClaim {
+    /// This thread claimed the latch — release it (store 0) on handler exit.
+    Latched,
+    /// Another thread is mid-handler: proceed concurrently WITHOUT the latch (never release).
+    /// Same-thread recursion detection is degraded for this one entry — accepted: degrading a
+    /// diagnostic beats escalating a concurrent recoverable fault to a process kill.
+    Unlatched,
+    /// This thread is already inside the handler — synchronous re-entry; bail to `SIG_DFL`.
+    SameThreadReentry,
+}
+
+/// Classify one tap entry against `latch` (claim-or-classify): async-signal-safe by
+/// construction — one CAS, no allocation, no locks. Parametrized over the latch so the
+/// cross-thread contract — a different tid while the latch is held PROCEEDS, never bails — is
+/// unit-testable without touching the process-global [`TAP_HANDLER_TID`] (the
+/// [`tap_chain_publish`] parametrization pattern). Kernel tids are >= 1, so 0 is a safe
+/// "unheld" sentinel.
+fn tap_entry_claim(latch: &AtomicI64, tid: i64) -> TapEntryClaim {
+    match latch.compare_exchange(0, tid, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => TapEntryClaim::Latched,
+        Err(owner) if owner == tid => TapEntryClaim::SameThreadReentry,
+        Err(_) => TapEntryClaim::Unlatched,
+    }
+}
+
+/// libroblox's mapped `[base, base+span)` range, published by `engine.rs` after map/relocate/
+/// resolve and BEFORE any engine instruction runs. 0 = unknown → the tap dumps every tapped
+/// signal (detect, don't assume); published → dumps only engine-PC faults (silences ART's
+/// routine managed-fault fixups).
+static ENGINE_RANGE_BASE: AtomicU64 = AtomicU64::new(0);
+/// See [`ENGINE_RANGE_BASE`].
+static ENGINE_RANGE_SPAN: AtomicU64 = AtomicU64::new(0);
+
+// 2026-06-12: kernel UAPI `asm-generic/siginfo.h` SIGSEGV si_codes: SEGV_MAPERR=1 (address not
+// mapped), SEGV_ACCERR=2 (invalid permissions). Pinned locally because the pinned libc 0.2.186
+// does NOT define them for linux-gnu (only hurd/aix); guarded by
+// `tap_si_code_consts_match_kernel_uapi`.
+const SEGV_MAPERR: c_int = 1;
+const SEGV_ACCERR: c_int = 2;
+
+/// Register/query the tapped signal's handler against the Eclipse-owned chain slot instead of
+/// the kernel — the kernel slot stays the tap's, so the tap is always-first by construction.
+/// Mirrors the observable `sigaction` contract: `oldact` receives the previous slot occupant
+/// (already bionic-shaped, restorer already 0); `act`, when non-null, becomes the new occupant
+/// (restorer stripped exactly as the real registration path does). Never calls the kernel;
+/// returns 0, so a caller's save/restore round-trip is indistinguishable from real registration.
+///
+/// # Safety
+/// `act`/`oldact` must each be null or valid pointers to a bionic LP64 `struct sigaction`.
+unsafe fn tap_chain_register(act: *const BionicSigaction, oldact: *mut BionicSigaction) -> c_int {
+    if !oldact.is_null() {
+        let prev = TAP_CHAIN.load(Ordering::Acquire);
+        let out = if prev.is_null() {
+            // Not reachable after install (the slot is seeded before the gate opens) — report the
+            // disposition a fresh signal would have: SIG_DFL (handler 0), empty mask, no flags.
+            BionicSigaction {
+                sa_flags: 0,
+                handler: 0,
+                sa_mask: 0,
+                sa_restorer: 0,
+            }
+        } else {
+            // SAFETY: 2026-06-12 — `prev` is a published TAP_CHAIN_POOL cell: immutable after
+            // publication, never freed or reused (see TAP_CHAIN); plain copy read.
+            unsafe { *prev }
+        };
+        // SAFETY: 2026-06-12 — `oldact` is a valid bionic sigaction out-param (caller contract).
+        unsafe { *oldact = out };
+    }
+    if !act.is_null() {
+        // SAFETY: 2026-06-12 — `act` is a valid bionic sigaction (caller contract); plain read.
+        let mut b = unsafe { *act };
+        // The restorer never crosses the seam (mirrors eclipse_sigaction's on-the-wire strip).
+        b.sa_flags &= !SA_RESTORER_FLAG;
+        b.sa_restorer = 0;
+        // 2026-06-12: alloc-free publish — this seam runs in HANDLER context via crashpad's
+        // restore-and-reraise flow (see TAP_CHAIN_POOL). On exhaustion the slot keeps its last
+        // occupant and 0 is still returned (the chain still dispatches a real action; the real
+        // flow claims 3 of the 8 cells — 4 with the install's raced re-seed — so this cannot
+        // fire in practice).
+        let _ = tap_chain_store(b);
+    }
+    0
+}
+
+/// Re-install the kernel default action for `signo` via raw glibc `sigaction` (async-signal-
+/// safe). Returning afterwards re-executes the faulting instruction, so the kernel kills with
+/// the ORIGINAL si_code/si_addr — strictly better than `raise()`, which would deliver SI_TKILL.
+fn tap_restore_default(signo: c_int) {
+    // SAFETY: 2026-06-12 — an all-zero glibc sigaction (handler SIG_DFL=0, empty mask, no flags)
+    // is the kernel default action; sigaction(2) is async-signal-safe (signal-safety(7)).
+    unsafe {
+        let dfl: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signo, &dfl, std::ptr::null_mut());
+    }
+}
+
+/// Non-faulting read of one `u64` at `addr` in this process's own address space.
+///
+/// 2026-06-12: one `process_vm_readv(2)` syscall on self — the pinned libc 0.2.186 declares no
+/// `process_vm_readv` FUNCTION for linux-gnu (only android/l4re; linux-gnu has only
+/// `SYS_process_vm_readv`), so this goes through `libc::syscall`. Not on the POSIX
+/// async-signal-safe list, but it is a single non-allocating Linux syscall with no userspace
+/// state, and the probe+copy is atomic (no TOCTOU against running engine threads) — an unmapped
+/// `addr` yields EFAULT/partial instead of faulting this thread. Linux-only is Eclipse's target.
+fn tap_read_u64(addr: u64) -> Option<u64> {
+    let mut val: u64 = 0;
+    let local = libc::iovec {
+        iov_base: (&raw mut val).cast::<c_void>(),
+        iov_len: 8,
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut c_void,
+        iov_len: 8,
+    };
+    // SAFETY: 2026-06-12 — the local iovec covers the 8 writable bytes of `val` on this stack;
+    // the remote iovec is only an address the KERNEL reads from our own address space (pid =
+    // self), per process_vm_readv(2) `(pid, local_iov, 1, remote_iov, 1, flags=0)`. The kernel
+    // returns the byte count or -1; it never dereferences in this thread's context.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_process_vm_readv,
+            libc::getpid() as libc::c_long,
+            &raw const local,
+            1usize,
+            &raw const remote,
+            1usize,
+            0usize,
+        )
+    };
+    (ret == 8).then_some(val)
+}
+
+/// Bounded SysV AMD64 frame-pointer walk into `out`; returns the entry count. `out[0]` is `rip`
+/// itself; subsequent entries are return addresses from the RBP chain (`[fp+8]` = return
+/// address, `[fp]` = caller's frame pointer). A step is accepted iff `fp != 0`, `fp % 8 == 0`,
+/// `fp > rsp`, `next > fp` (strictly increasing — guarantees termination) and
+/// `next - fp < 1 MiB` (a plausible frame size); every load is a non-faulting [`tap_read_u64`].
+/// Code built without frame pointers dies at frame 0 — accepted (the register + si_* lines are
+/// the primary diagnostic; a raw-stack-scan fallback is an explicit follow-up, not v1).
+fn tap_stack_walk(rip: u64, rsp: u64, rbp: u64, out: &mut [u64; 32]) -> usize {
+    const MAX_FRAME_STEP: u64 = 1 << 20; // 1 MiB
+    out[0] = rip;
+    let mut count = 1usize;
+    let mut fp = rbp;
+    while count < out.len() {
+        if fp == 0 || !fp.is_multiple_of(8) || fp <= rsp {
+            break;
+        }
+        let Some(ret) = tap_read_u64(fp.wrapping_add(8)) else {
+            break;
+        };
+        let Some(next) = tap_read_u64(fp) else {
+            break;
+        };
+        if next <= fp || next.wrapping_sub(fp) >= MAX_FRAME_STEP {
+            break;
+        }
+        out[count] = ret;
+        count += 1;
+        fp = next;
+    }
+    count
+}
+
+/// Append `0x<val>` plus, when `val` lies in the published engine range, ` (libroblox+0x<off>)`.
+/// Async-signal-safe (the bounded init_run formatters only).
+fn tap_write_addr(buf: &mut [u8], n: &mut usize, val: u64, base: u64, span: u64) {
+    write_bytes(buf, n, b"0x");
+    write_hex(buf, n, val);
+    if base != 0 && (base..base.wrapping_add(span)).contains(&val) {
+        write_bytes(buf, n, b" (libroblox+0x");
+        write_hex(buf, n, val - base);
+        write_bytes(buf, n, b")");
+    }
+}
+
+/// The early-fault tap handler — kernel-first for the tapped signal. Dumps the verbatim fault
+/// context with async-signal-safe primitives only (no stdio — the exact crashpad failure mode
+/// being diagnosed — no alloc, no locks, no panic path), then chains to the [`TAP_CHAIN`] slot:
+/// exactly the handler that would have run without the tap. Purely a diagnostic — it never
+/// masks, repairs, or reroutes the fault.
+///
+/// # Safety
+/// Installed via `sigaction` with `SA_SIGINFO`; the kernel invokes it with a valid (or null —
+/// read defensively) `siginfo_t*`/`ucontext_t*` for the interrupted context.
+unsafe extern "C" fn early_fault_tap_handler(
+    signo: c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut c_void,
+) {
+    // signal-safety(7): preserve the interrupted context's errno across the handler.
+    // SAFETY: 2026-06-12 — __errno_location() returns the calling thread's errno slot.
+    let saved_errno = unsafe { *libc::__errno_location() };
+
+    // SAFETY: 2026-06-12 — gettid(2) via raw syscall: one async-signal-safe syscall, no
+    // userspace state (the glibc gettid() wrapper needs glibc >= 2.30 — the raw syscall stays
+    // distro-portable, like tap_read_u64's SYS_process_vm_readv).
+    let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+    // Re-entry latch (tid-scoped — see TAP_HANDLER_TID): only a second synchronous entry on
+    // THIS thread (a recursive tap fault or a sigchain re-front cycle) bails to SIG_DFL and
+    // returns, so the original faulting instruction re-executes and the kernel kills with the
+    // ORIGINAL siginfo (first dump already written). A different thread mid-handler is routine
+    // concurrency and proceeds.
+    let claim = tap_entry_claim(&TAP_HANDLER_TID, my_tid);
+    if claim == TapEntryClaim::SameThreadReentry {
+        tap_restore_default(signo);
+        // SAFETY: 2026-06-12 — restore errno (same thread-local slot as above).
+        unsafe { *libc::__errno_location() = saved_errno };
+        return;
+    }
+
+    let (si_signo, si_code, si_addr) = if info.is_null() {
+        (signo, 0, 0u64)
+    } else {
+        // SAFETY: 2026-06-12 — the kernel passes a valid `siginfo_t*` with SA_SIGINFO (null
+        // checked above); si_signo/si_code are public c_int fields and `si_addr()` reads the
+        // sigfault union member (meaningful for faults, merely informative otherwise).
+        unsafe { ((*info).si_signo, (*info).si_code, (*info).si_addr() as u64) }
+    };
+    let (rip, rsp, rbp, err) = if ctx.is_null() {
+        (0u64, 0u64, 0u64, 0u64)
+    } else {
+        // SAFETY: 2026-06-12 — with SA_SIGINFO the third argument is the `ucontext_t*` of the
+        // interrupted context; the greg indices REG_RIP=16/REG_RSP=15/REG_RBP=10/REG_ERR=19 are
+        // the pinned glibc x86-64 layout (verified in libc 0.2.186's x86_64 module).
+        let uc = unsafe { &*ctx.cast::<libc::ucontext_t>() };
+        (
+            uc.uc_mcontext.gregs[libc::REG_RIP as usize] as u64,
+            uc.uc_mcontext.gregs[libc::REG_RSP as usize] as u64,
+            uc.uc_mcontext.gregs[libc::REG_RBP as usize] as u64,
+            uc.uc_mcontext.gregs[libc::REG_ERR as usize] as u64,
+        )
+    };
+
+    // Engine-PC filter: with the libroblox range published, dump only engine-PC faults (ART's
+    // routine managed-fault fixups stay silent); unpublished (base 0) → dump everything.
+    let base = ENGINE_RANGE_BASE.load(Ordering::Relaxed);
+    let span = ENGINE_RANGE_SPAN.load(Ordering::Relaxed);
+    if base == 0 || (base..base.wrapping_add(span)).contains(&rip) {
+        let mut frames = [0u64; 32];
+        let nframes = tap_stack_walk(rip, rsp, rbp, &mut frames);
+
+        let mut buf = [0u8; 2048];
+        let mut n = 0usize;
+        write_bytes(&mut buf, &mut n, b"\n*** ECLIPSE EARLY-FAULT TAP: signal ");
+        write_dec(&mut buf, &mut n, si_signo as u64);
+        write_bytes(&mut buf, &mut n, b" code ");
+        if si_code < 0 {
+            // e.g. SI_TKILL (-6) from raise()/tgkill — keep the sign readable.
+            write_bytes(&mut buf, &mut n, b"-");
+            write_dec(&mut buf, &mut n, u64::from(si_code.unsigned_abs()));
+        } else {
+            write_dec(&mut buf, &mut n, si_code as u64);
+        }
+        write_bytes(&mut buf, &mut n, b" (");
+        let label: &[u8] = if si_code == SEGV_MAPERR {
+            b"MAPERR"
+        } else if si_code == SEGV_ACCERR {
+            b"ACCERR"
+        } else if si_code == libc::SI_KERNEL {
+            b"SI_KERNEL"
+        } else {
+            b"?"
+        };
+        write_bytes(&mut buf, &mut n, label);
+        write_bytes(&mut buf, &mut n, b") addr=0x");
+        write_hex(&mut buf, &mut n, si_addr);
+        write_bytes(&mut buf, &mut n, b" ***\nrip=");
+        tap_write_addr(&mut buf, &mut n, rip, base, span);
+        write_bytes(&mut buf, &mut n, b" rsp=0x");
+        write_hex(&mut buf, &mut n, rsp);
+        write_bytes(&mut buf, &mut n, b" rbp=0x");
+        write_hex(&mut buf, &mut n, rbp);
+        // REG_ERR = the x86 page-fault error code: bit0 present, bit1 write, bit4 ifetch.
+        write_bytes(&mut buf, &mut n, b" err=0x");
+        write_hex(&mut buf, &mut n, err);
+        write_bytes(&mut buf, &mut n, b"\n");
+        for (k, &frame) in frames.iter().take(nframes).enumerate() {
+            write_bytes(&mut buf, &mut n, b"frame[");
+            write_dec(&mut buf, &mut n, k as u64);
+            write_bytes(&mut buf, &mut n, b"]=");
+            tap_write_addr(&mut buf, &mut n, frame, base, span);
+            write_bytes(&mut buf, &mut n, b"\n");
+        }
+        // SAFETY: 2026-06-12 — write(2) is async-signal-safe; `buf[..n]` is an initialized
+        // stack byte range. ONE raw write keeps the dump contiguous on fd 2 (the run's log).
+        unsafe { libc::write(2, buf.as_ptr().cast::<c_void>(), n) };
+    }
+
+    // SAFETY: 2026-06-12 — restore the saved errno (signal-safety(7)).
+    unsafe { *libc::__errno_location() = saved_errno };
+
+    // Chain to exactly the handler that would have run without the tap. Deliberate, documented
+    // simplifications (irrelevant to crashpad's proven flags 0x08000804): the slot's sa_mask is
+    // not applied around the chained call (the tapped signal itself is already blocked), and
+    // SA_RESETHAND is not emulated.
+    let p = TAP_CHAIN.load(Ordering::Acquire);
+    if p.is_null() {
+        // 2026-06-12: not reachable from a real boot — `install_early_fault_tap` seeds the slot
+        // BEFORE the tap owns the kernel slot (the closed seed-window race). Kept as the
+        // defensive floor (the tap test's cleanup nulls the slot).
+        tap_restore_default(signo);
+    } else {
+        // SAFETY: 2026-06-12 — `p` is a published TAP_CHAIN_POOL cell: immutable after
+        // publication, never freed or reused.
+        let chain = unsafe { *p };
+        if chain.handler == libc::SIG_DFL {
+            // Re-install the default and RETURN: a fault re-executes and the kernel kills with
+            // the ORIGINAL si_code/si_addr; a non-fault signal simply continues.
+            tap_restore_default(signo);
+        } else if chain.handler == libc::SIG_IGN {
+            // Ignore — nothing to call.
+        } else if chain.sa_flags & libc::SA_SIGINFO != 0 {
+            // SAFETY: 2026-06-12 — the slot holds the handler address the engine registered
+            // through the seam with SA_SIGINFO; calling it as the three-argument form with the
+            // kernel's (signo, info, ctx) is exactly the delivery the kernel would have
+            // performed had the registration reached it. Returning afterwards resumes via the
+            // tap's normal sigreturn, so any ucontext fixup the chained handler made (ART's
+            // modify-and-return pattern) takes effect.
+            let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
+                unsafe { std::mem::transmute::<usize, _>(chain.handler) };
+            f(signo, info, ctx);
+        } else {
+            // SAFETY: 2026-06-12 — as above, for the classic one-argument sa_handler form.
+            let f: extern "C" fn(c_int) = unsafe { std::mem::transmute::<usize, _>(chain.handler) };
+            f(signo);
+        }
+    }
+    // Release only what this entry claimed — an Unlatched (concurrent) entry must never clear
+    // the owner's latch out from under it.
+    if claim == TapEntryClaim::Latched {
+        TAP_HANDLER_TID.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Install the early-fault tap for `signum`: (1) query the kernel's CURRENT action (ART/
+/// sigchain's post-boot handler when ART claimed the signal), (2) seed the chain slot from it,
+/// (3) register [`early_fault_tap_handler`] kernel-first via RAW glibc `sigaction`, (4) re-seed
+/// from the install's returned oldact only if it differs from the queried action, then open the
+/// [`eclipse_sigaction`] seam gate. Idempotent: a second call (any signal) is a no-op `Ok`.
+///
+/// 2026-06-12: seed-BEFORE-install (closes the reviewed seed-window race, AGENTS.md §6 carried
+/// note (a)): the tap is kernel-first for EVERY delivery the moment the install syscall
+/// returns, including deliveries on OTHER threads (routine on x86-64 — ART delivers managed
+/// NPE/StackOverflow fixups via SIGSEGV). With the prior install-then-seed order, such a
+/// delivery in the sub-microsecond seed window entered the handler with a null [`TAP_CHAIN`] →
+/// `tap_restore_default` installed SIG_DFL process-wide → a recoverable fault killed the
+/// process. Seeding first closes the window by construction: the seed's Release publish is
+/// program-ordered before the install syscall, and a handler entry can only follow the install,
+/// so it always Acquire-loads an occupied slot. Step (4) covers a re-registration landing
+/// between query and install (then the install's oldact, not the queried action, is the true
+/// pre-tap action); the comparison keeps the quiescent flow at ONE claimed pool cell — two only
+/// in that raced case (see [`TAP_CHAIN_POOL_LEN`]).
+///
+/// 2026-06-12: RAW glibc (not the bionic translating native) because Eclipse is the caller — no
+/// bionic ABI boundary to cross — and the kernel registration must really happen (the seam
+/// deliberately stops kernel forwarding for the tapped signal, so installing "through" the
+/// tapped path would be self-defeating); the glibc-shaped queried/old actions also feed the
+/// shared [`bionic_action_from_glibc`] to seed the chain slot. Flags: `SA_SIGINFO | SA_ONSTACK`,
+/// empty mask (no SA_NODEFER — the tapped signal stays blocked during the handler). Deliberately
+/// NO Eclipse `sigaltstack`: ART manages per-thread alt stacks for its attached threads and an
+/// Eclipse-installed one on the main thread would clobber ART's; SA_ONSTACK uses whatever alt
+/// stack the faulting thread already has (ignored without one), and the known fault is not a
+/// stack overflow (crashpad's handler ran on it — AGENTS.md §5).
+pub(super) fn install_early_fault_tap(signum: c_int) -> Result<(), String> {
+    if TAPPED_SIGNAL.load(Ordering::Acquire) != 0 {
+        return Ok(());
+    }
+    // (1) Query the current kernel action (act null = pure query, sigaction(2)); an invalid
+    // `signum` fails HERE, before any cell is claimed or anything is installed.
+    // SAFETY: 2026-06-12 — all-zero is a valid out-param baseline glibc `sigaction` overwrites;
+    // a null act makes this a query that changes nothing.
+    let mut queried: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: 2026-06-12 — `queried` is a valid out-param; act is null (query-only).
+    if unsafe { libc::sigaction(signum, std::ptr::null(), &mut queried) } != 0 {
+        return Err(format!(
+            "raw sigaction({signum}) query failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // (2) Seed the chain slot BEFORE the tap can own the kernel slot (the doc comment's
+    // seed-window race). Exhaustion is unreachable (the real boot reaches here once, under
+    // engine.rs's Once, claiming at most 2 of the 8 cells while the seam is still closed) but
+    // stays an explicit Err so the tap can never install over an unseeded slot. If the install
+    // below fails, this seed stays published with the gate closed — benign: nothing reads the
+    // slot until the gate opens.
+    let seed = bionic_action_from_glibc(&queried);
+    if !tap_chain_store(seed) {
+        return Err("early-fault tap: chain pool exhausted before seeding".to_string());
+    }
+    // (3) Install the tap kernel-first.
+    // SAFETY: 2026-06-12 — all-zero is a valid glibc sigaction baseline (empty mask, no flags);
+    // the handler pointer + flags are set before registering. `old` is a valid out-param glibc
+    // fills with the previous kernel action on success.
+    let (ret, old) = unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = early_fault_tap_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        let mut old: libc::sigaction = std::mem::zeroed();
+        (libc::sigaction(signum, &sa, &mut old), old)
+    };
+    if ret != 0 {
+        return Err(format!(
+            "raw sigaction({signum}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // (4) Re-seed ONLY if a re-registration raced between (1) and (3) — the install's oldact is
+    // then the authoritative pre-tap action. Identical in every non-raced run, so no second
+    // cell is claimed (pinned by the install phase of
+    // `early_fault_tap_intercepts_registration_and_chains`).
+    let displaced = bionic_action_from_glibc(&old);
+    if displaced != seed && !tap_chain_store(displaced) {
+        return Err("early-fault tap: chain pool exhausted on re-seed".to_string());
+    }
+    // Gate LAST (Release): the seam's Acquire load can never observe gate-open with an
+    // empty/unseeded slot.
+    TAPPED_SIGNAL.store(signum, Ordering::Release);
+    Ok(())
+}
+
+/// Publish libroblox's mapped `[base, base+span)` so the tap's engine-PC filter can scope dumps
+/// to engine faults. Called by `engine.rs` immediately after map/relocate/resolve — provably
+/// before any engine instruction runs (constructors/`JNI_OnLoad` come after).
+pub(super) fn publish_engine_text_range(base: u64, span: u64) {
+    ENGINE_RANGE_BASE.store(base, Ordering::Relaxed);
+    ENGINE_RANGE_SPAN.store(span, Ordering::Relaxed);
 }
 
 // =================================================================================================
@@ -2277,6 +3166,7 @@ mod tests {
     use super::*;
     use crate::loader::reloc::{apply_one, Rela, SliceImage, SymbolResolver, R_X86_64_GLOB_DAT};
     use std::cell::RefCell;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
 
     // Serializes the ANativeWindow tests that share the process-global `ANativeWindow_fromSurface`
@@ -2351,18 +3241,18 @@ mod tests {
     #[test]
     fn with_bionic_natives_registers_the_three_implemented_categories() {
         let p = EclipseNativeProvider::with_bionic_natives();
-        // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 27 ndk-android + 33
-        // media-ndk + 8 audio + 51 bionic-pthread/TLS/sem/syscall (37 + the 14 thread-lifecycle
-        // natives added 2026-06-05: create/join/detach/setname_np/kill/getattr_np/get+setschedparam/
-        // attr_*) + 5 bionic-sysconf system-query
+        // 5 liblog (3 fixed-arity Rust + 2 variadic C-shim) + 15 bionic-libc + 6 bionic-signal
+        // (2026-06-11) + 27 ndk-android + 33 media-ndk + 8 audio + 51 bionic-pthread/TLS/sem/syscall
+        // (37 + the 14 thread-lifecycle natives added 2026-06-05: create/join/detach/setname_np/
+        // kill/getattr_np/get+setschedparam/attr_*) + 5 bionic-sysconf system-query
         // (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo — the allocator-bootstrap fix,
-        // 2026-06-05) = 144.
+        // 2026-06-05) = 150.
         assert_eq!(
             p.len(),
-            88 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            94 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
-            "5 liblog + 15 bionic-libc + 27 ndk-android + 33 media-ndk + 8 audio + 51 pthread + 5 \
-             sysconf system-query natives registered"
+            "5 liblog + 15 bionic-libc + 6 bionic-signal + 27 ndk-android + 33 media-ndk + 8 audio \
+             + 51 pthread + 5 sysconf system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim)
@@ -2387,6 +3277,13 @@ mod tests {
             "__system_property_get",
             "__stack_chk_guard",
             "__sF",
+            // bionic signal ABI (6) — 2026-06-11
+            "sigaction",
+            "sigemptyset",
+            "sigaddset",
+            "sigfillset",
+            "sigprocmask",
+            "pthread_sigmask",
             // ndk-android (27)
             "AAssetManager_fromJava",
             "AAssetManager_open",
@@ -2620,6 +3517,572 @@ mod tests {
             buf[0], 0,
             "the value buffer must be an empty NUL-terminated string"
         );
+    }
+
+    // ---- bionic signal ABI (2026-06-11) ---------------------------------------------------------
+
+    #[test]
+    fn bionic_sigaction_layout_matches_lp64() {
+        // Pin the bionic LP64 x86-64 struct sigaction layout (AOSP bits/signal_types.h):
+        // flags@0 (+4 pad), handler@8, mask@16, restorer@24, 32 bytes total. A drift here would
+        // re-introduce the scrambled-handler registration the core-dump evidence proved
+        // (2026-06-11): glibc reading its handler from offset 0, where bionic keeps sa_flags.
+        assert_eq!(std::mem::offset_of!(BionicSigaction, sa_flags), 0);
+        assert_eq!(std::mem::offset_of!(BionicSigaction, handler), 8);
+        assert_eq!(std::mem::offset_of!(BionicSigaction, sa_mask), 16);
+        assert_eq!(std::mem::offset_of!(BionicSigaction, sa_restorer), 24);
+        assert_eq!(std::mem::size_of::<BionicSigaction>(), 32);
+        // And the incompatibility being translated away: glibc's sigset_t is 16x wider.
+        assert_eq!(std::mem::size_of::<BionicSigsetT>(), 8);
+        assert_eq!(std::mem::size_of::<libc::sigset_t>(), 128);
+    }
+
+    #[test]
+    fn bionic_sigset_ops_match_the_bionic_contract() {
+        let mut set: BionicSigsetT = 0xdead_beef;
+        // SAFETY: `set` is a valid bionic sigset word for all three ops.
+        unsafe {
+            assert_eq!(eclipse_sigemptyset(&mut set), 0);
+            assert_eq!(set, 0, "sigemptyset clears exactly the 64-bit word");
+            assert_eq!(eclipse_sigaddset(&mut set, libc::SIGURG), 0);
+            assert_eq!(
+                set,
+                1u64 << (libc::SIGURG - 1),
+                "sigaddset sets bit signum-1"
+            );
+            assert_eq!(eclipse_sigfillset(&mut set), 0);
+            assert_eq!(set, !0u64, "sigfillset fills exactly the 64-bit word");
+            // Out-of-range signum → EINVAL (bit 64 would be signal 65 — beyond the bionic set).
+            assert_eq!(eclipse_sigaddset(&mut set, 0), -1);
+            assert_eq!(eclipse_sigaddset(&mut set, 65), -1);
+            assert_eq!(*libc::__errno_location(), libc::EINVAL);
+            // Null set → EINVAL, never a write.
+            assert_eq!(eclipse_sigemptyset(std::ptr::null_mut()), -1);
+            assert_eq!(eclipse_sigfillset(std::ptr::null_mut()), -1);
+        }
+    }
+
+    #[test]
+    fn bionic_sigset_translation_round_trips() {
+        let bionic: BionicSigsetT = (1 << (libc::SIGURG - 1)) | (1 << (libc::SIGUSR2 - 1));
+        let glibc = glibc_sigset_from_bionic(bionic);
+        // The widened set must answer sigismember exactly like the bionic bits…
+        // SAFETY: `glibc` is a valid initialized glibc sigset_t.
+        unsafe {
+            assert_eq!(libc::sigismember(&glibc, libc::SIGURG), 1);
+            assert_eq!(libc::sigismember(&glibc, libc::SIGUSR2), 1);
+            assert_eq!(libc::sigismember(&glibc, libc::SIGUSR1), 0);
+        }
+        // …and narrow back losslessly.
+        assert_eq!(bionic_sigset_from_glibc(&glibc), bionic);
+    }
+
+    /// The live handler the round-trip test registers: records the signal number it received.
+    static SIGNAL_TEST_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn signal_test_handler(
+        signum: c_int,
+        _info: *mut libc::siginfo_t,
+        _ctx: *mut c_void,
+    ) {
+        SIGNAL_TEST_RECEIVED.store(signum as usize, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn bionic_sigaction_registers_a_live_handler_and_round_trips_oldact() {
+        // The regression guard for the confirmed bug: register a SA_SIGINFO handler through the
+        // BIONIC-shaped sigaction and prove the KERNEL actually calls it (with the scrambled
+        // glibc fall-through, the handler address was garbage and delivery double-faulted).
+        // SIGURG: default disposition is IGNORE, so even a broken registration cannot kill the
+        // test process; raise() delivers to the calling thread.
+        let act = BionicSigaction {
+            sa_flags: libc::SA_SIGINFO,
+            handler: signal_test_handler as *const () as usize,
+            sa_mask: 0,
+            sa_restorer: 0,
+        };
+        let mut old = BionicSigaction {
+            sa_flags: 0,
+            handler: usize::MAX,
+            sa_mask: !0,
+            sa_restorer: usize::MAX,
+        };
+        // SAFETY: `act`/`old` are valid bionic sigaction structs; SIGURG is a valid signal.
+        unsafe {
+            assert_eq!(eclipse_sigaction(libc::SIGURG, &act, &mut old), 0);
+            assert_eq!(
+                old.handler,
+                libc::SIG_DFL,
+                "oldact reports the prior (default) disposition"
+            );
+            assert_eq!(old.sa_restorer, 0, "glibc's restorer is never leaked back");
+            libc::raise(libc::SIGURG);
+        }
+        assert_eq!(
+            SIGNAL_TEST_RECEIVED.load(Ordering::SeqCst),
+            libc::SIGURG as usize,
+            "the kernel delivered SIGURG to the bionic-registered handler"
+        );
+        // Restore the saved old action THROUGH the bionic path (the crashpad chain-to-previous
+        // pattern) and verify a query round-trips it.
+        let mut requeried = old;
+        // SAFETY: `old`/`requeried` are valid bionic sigaction structs.
+        unsafe {
+            assert_eq!(
+                eclipse_sigaction(libc::SIGURG, &old, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                eclipse_sigaction(libc::SIGURG, std::ptr::null(), &mut requeried),
+                0
+            );
+        }
+        assert_eq!(requeried.handler, old.handler, "restore round-trips");
+    }
+
+    #[test]
+    fn bionic_sigprocmask_translates_both_directions() {
+        let mut block: BionicSigsetT = 0;
+        let mut prev: BionicSigsetT = !0;
+        // SAFETY: valid bionic set words; SIG_BLOCK/SIG_SETMASK are the shared kernel constants.
+        unsafe {
+            assert_eq!(eclipse_sigaddset(&mut block, libc::SIGURG), 0);
+            assert_eq!(eclipse_sigprocmask(libc::SIG_BLOCK, &block, &mut prev), 0);
+            // The kernel must now report SIGURG blocked — query through glibc to cross-check the
+            // translation against the real thread mask.
+            let mut host_mask: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sigprocmask(libc::SIG_BLOCK, std::ptr::null(), &mut host_mask),
+                0
+            );
+            assert_eq!(libc::sigismember(&host_mask, libc::SIGURG), 1);
+            // Restore the previous mask through the bionic path.
+            assert_eq!(
+                eclipse_sigprocmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    // ---- early-fault tap (2026-06-12) -----------------------------------------------------------
+
+    /// The "engine handler" the tap test chains to. Its OWN atomic + handler — never shared with
+    /// the SIGURG live test above, so the two parallel-running live tests cannot cross-talk.
+    static TAP_TEST_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn tap_test_chain_handler(
+        signum: c_int,
+        _info: *mut libc::siginfo_t,
+        _ctx: *mut c_void,
+    ) {
+        TAP_TEST_RECEIVED.store(signum as usize, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn early_fault_tap_intercepts_registration_and_chains() {
+        // SIGWINCH: default disposition is IGNORE (like SIGURG), so a broken registration cannot
+        // kill the test process — and a DIFFERENT signal from the SIGURG live test, so the two
+        // never race on one process-global disposition under the parallel test runner.
+        let sig = libc::SIGWINCH;
+
+        // (a) Snapshot the kernel's current SIGWINCH action for cleanup.
+        // SAFETY: query-only raw sigaction (act null) with a valid zeroed out-param.
+        let mut snapshot: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut snapshot), 0);
+        }
+
+        // (a2) Seed-BEFORE-install ordering pin (2026-06-12, the reviewed seed-window race): on
+        // a signal whose action can be QUERIED but never REPLACED (SIGKILL — sigaction(2)
+        // EINVAL; nothing is ever raised here), the install must fail AFTER the chain seed.
+        // Under the fixed order (query → seed → install) the failed install leaves exactly one
+        // newly claimed pool cell and a published slot with the gate still closed; under the
+        // buggy install-then-seed order the install failed first and neither happened — this
+        // block fails deterministically, no concurrency needed.
+        let cursor_before = TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst);
+        assert!(
+            install_early_fault_tap(libc::SIGKILL).is_err(),
+            "the kernel must reject installing over SIGKILL"
+        );
+        assert_eq!(
+            TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst),
+            cursor_before + 1,
+            "the chain seed is claimed BEFORE the kernel install"
+        );
+        assert!(
+            !TAP_CHAIN.load(Ordering::Acquire).is_null(),
+            "the chain slot is published before the (failed) install"
+        );
+        assert_eq!(
+            TAPPED_SIGNAL.load(Ordering::SeqCst),
+            0,
+            "a failed install never opens the seam gate"
+        );
+
+        // (b) Install the tap; the KERNEL slot must now be the tap with SA_SIGINFO.
+        let cursor_pre_install = TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst);
+        install_early_fault_tap(sig).expect("tap install");
+        // 2026-06-12: a quiescent install claims exactly ONE pool cell (the query seed) — the
+        // oldact re-seed must not fire when nothing re-registered between query and install
+        // (pins the TAP_CHAIN_POOL_LEN budget accounting).
+        assert_eq!(
+            TAP_CHAIN_POOL_NEXT.load(Ordering::SeqCst),
+            cursor_pre_install + 1,
+            "a quiescent install claims exactly one pool cell (no spurious re-seed)"
+        );
+        // SAFETY: query-only raw sigaction with a valid zeroed out-param.
+        let mut kernel: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut kernel), 0);
+        }
+        assert_eq!(
+            kernel.sa_sigaction, early_fault_tap_handler as *const () as usize,
+            "the tap is kernel-registered"
+        );
+        assert_ne!(kernel.sa_flags & libc::SA_SIGINFO, 0, "SA_SIGINFO is set");
+
+        // (c) Query through the seam: the seeded chain slot reports the pre-tap disposition,
+        // restorer never leaked.
+        let mut old = BionicSigaction {
+            sa_flags: 0,
+            handler: usize::MAX,
+            sa_mask: !0,
+            sa_restorer: usize::MAX,
+        };
+        // SAFETY: `old` is a valid bionic sigaction out-param; query-only (act null).
+        unsafe {
+            assert_eq!(eclipse_sigaction(sig, std::ptr::null(), &mut old), 0);
+        }
+        assert_eq!(
+            old.handler, snapshot.sa_sigaction,
+            "the chain slot holds the pre-tap disposition"
+        );
+        assert_eq!(
+            old.sa_restorer, 0,
+            "glibc's restorer never crosses the seam"
+        );
+
+        // (d) Register the "engine handler" through the bionic path: the previous occupant
+        // round-trips via oldact, and the KERNEL slot is STILL the tap (the seam never forwarded
+        // — the always-first property, the load-bearing assertion).
+        let act = BionicSigaction {
+            sa_flags: libc::SA_SIGINFO,
+            handler: tap_test_chain_handler as *const () as usize,
+            sa_mask: 0,
+            sa_restorer: 0,
+        };
+        let mut old2 = old;
+        // SAFETY: `act`/`old2` are valid bionic sigaction structs.
+        unsafe {
+            assert_eq!(eclipse_sigaction(sig, &act, &mut old2), 0);
+        }
+        assert_eq!(old2.handler, old.handler, "previous occupant round-trips");
+        // SAFETY: query-only raw sigaction with a valid zeroed out-param.
+        let mut kernel2: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut kernel2), 0);
+        }
+        assert_eq!(
+            kernel2.sa_sigaction, early_fault_tap_handler as *const () as usize,
+            "the kernel slot is STILL the tap — the engine registration never reached the kernel"
+        );
+        // 2026-06-12: the published chain pointer is a static TAP_CHAIN_POOL cell — the
+        // no-heap-in-handler-context guard on the REAL statics (tap_chain_register is reachable
+        // inside the fault-handler chain via crashpad's restore-and-reraise flow, so a
+        // reintroduced Box/malloc publish must fail here).
+        let chain_ptr = TAP_CHAIN.load(Ordering::Acquire) as usize;
+        let pool_start = TAP_CHAIN_POOL.0.as_ptr() as usize;
+        let pool_end = pool_start + std::mem::size_of_val(&TAP_CHAIN_POOL.0);
+        assert!(
+            (pool_start..pool_end).contains(&chain_ptr),
+            "the chain slot points into the static pool, never the heap"
+        );
+
+        // (e) Deliver: kernel → tap (the dump runs — engine range unpublished here, so the
+        // dump-everything mode also live-exercises the walker on this thread's real context) →
+        // chained engine handler. The latch must be clear afterwards.
+        // SAFETY: raise() delivers the signal to the calling thread.
+        unsafe {
+            libc::raise(sig);
+        }
+        assert_eq!(
+            TAP_TEST_RECEIVED.load(Ordering::SeqCst),
+            sig as usize,
+            "kernel → tap → chained engine handler delivered end-to-end"
+        );
+        assert_eq!(
+            TAP_HANDLER_TID.load(Ordering::SeqCst),
+            0,
+            "the re-entry latch is cleared after a normal pass"
+        );
+
+        // (f) Cross-thread concurrency (the tid-scoped latch contract, 2026-06-12): while a
+        // second thread is PARKED inside the chained handler (its tid holds the latch for the
+        // whole chained run — on a real engine fault that window spans crashpad's entire dump),
+        // a delivery on THIS thread must still chain — a different-tid entry is concurrency,
+        // not recursion. The process-global-bool latch this guards against bailed the
+        // concurrent entry to SIG_DFL, stripping the tap+chain from the kernel slot and killing
+        // the process on two overlapping recoverable faults.
+        static TAP_TEST_PARK_RELEASED: AtomicBool = AtomicBool::new(false);
+        static TAP_TEST_CHAIN_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn tap_test_parking_chain_handler(
+            _signum: c_int,
+            _info: *mut libc::siginfo_t,
+            _ctx: *mut c_void,
+        ) {
+            // The FIRST entry parks until released; later entries return immediately.
+            if TAP_TEST_CHAIN_ENTRIES.fetch_add(1, Ordering::SeqCst) == 0 {
+                while !TAP_TEST_PARK_RELEASED.load(Ordering::SeqCst) {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        let park_act = BionicSigaction {
+            sa_flags: libc::SA_SIGINFO,
+            handler: tap_test_parking_chain_handler as *const () as usize,
+            sa_mask: 0,
+            sa_restorer: 0,
+        };
+        // SAFETY: `park_act` is a valid bionic sigaction; registration goes through the seam.
+        unsafe {
+            assert_eq!(eclipse_sigaction(sig, &park_act, std::ptr::null_mut()), 0);
+        }
+        let parker = std::thread::spawn(move || {
+            // SAFETY: raise() delivers the signal to the calling (parker) thread.
+            unsafe { libc::raise(sig) };
+        });
+        // Wait until the parker thread is parked inside the chained handler (latch held).
+        while TAP_TEST_CHAIN_ENTRIES.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let owner_while_parked = TAP_HANDLER_TID.load(Ordering::SeqCst);
+        // Deliver on THIS thread while the parker's tid holds the latch.
+        // SAFETY: raise() delivers the signal to the calling thread; returns post-handler.
+        unsafe {
+            libc::raise(sig);
+        }
+        // Observe BEFORE asserting, then release + join, so a failed assertion can never leave
+        // the parker spinning for the rest of the test run.
+        let entries_while_parked = TAP_TEST_CHAIN_ENTRIES.load(Ordering::SeqCst);
+        // SAFETY: query-only raw sigaction with a valid zeroed out-param.
+        let mut kernel3: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut kernel3), 0);
+        }
+        TAP_TEST_PARK_RELEASED.store(true, Ordering::SeqCst);
+        parker.join().expect("parker thread");
+        assert_ne!(
+            owner_while_parked, 0,
+            "the parked thread's tid holds the latch"
+        );
+        assert_eq!(
+            entries_while_parked, 2,
+            "a concurrent different-tid delivery chains instead of dying to SIG_DFL"
+        );
+        assert_eq!(
+            kernel3.sa_sigaction, early_fault_tap_handler as *const () as usize,
+            "the kernel slot survives a concurrent delivery (never restored to SIG_DFL)"
+        );
+        assert_eq!(
+            TAP_HANDLER_TID.load(Ordering::SeqCst),
+            0,
+            "the owner released the latch after the parked run"
+        );
+
+        // (g) Crashpad-style restore: re-register the saved oldact, then re-query — the slot
+        // reverts (the proven oldact round-trip pattern).
+        // SAFETY: `old` is a valid bionic sigaction.
+        unsafe {
+            assert_eq!(eclipse_sigaction(sig, &old, std::ptr::null_mut()), 0);
+        }
+        let mut requeried = act;
+        // SAFETY: `requeried` is a valid bionic sigaction out-param; query-only (act null).
+        unsafe {
+            assert_eq!(eclipse_sigaction(sig, std::ptr::null(), &mut requeried), 0);
+        }
+        assert_eq!(requeried.handler, old.handler, "the chain slot reverts");
+
+        // (h) Cleanup: close the seam gate, clear the slot (the claimed pool cells stay —
+        // claim-once, deliberate), and restore the (a) snapshot raw so no disposition leaks to
+        // other tests.
+        TAPPED_SIGNAL.store(0, Ordering::SeqCst);
+        TAP_CHAIN.store(std::ptr::null_mut(), Ordering::SeqCst);
+        // SAFETY: `snapshot` is the valid glibc action captured in (a).
+        unsafe {
+            assert_eq!(libc::sigaction(sig, &snapshot, std::ptr::null_mut()), 0);
+        }
+    }
+
+    #[test]
+    fn tap_chain_pool_publishes_in_place_and_keeps_last_occupant_on_exhaustion() {
+        // 2026-06-12: the regression guard for the handler-context alloc ban — the chain slot
+        // must be backed by claim-once static-pool cells, never the heap (tap_chain_register is
+        // reachable INSIDE the fault-handler chain; see TAP_CHAIN_POOL). A LOCAL pool/cursor/
+        // slot triple (the tap_chain_publish parametrization exists for exactly this) so
+        // exhausting it cannot poison the process-global pool the live test shares.
+        let pool = TapChainPool::new();
+        let next = AtomicUsize::new(0);
+        let slot: AtomicPtr<BionicSigaction> = AtomicPtr::new(std::ptr::null_mut());
+        let pool_start = pool.0.as_ptr() as usize;
+        let pool_end = pool_start + std::mem::size_of_val(&pool.0);
+        let mk = |handler: usize| BionicSigaction {
+            sa_flags: libc::SA_SIGINFO,
+            handler,
+            sa_mask: 0,
+            sa_restorer: 0,
+        };
+
+        // Every successful publish lands IN the pool (the no-heap property), reads back intact,
+        // and claims a fresh cell (superseded cells are never reused — the no-tearing property).
+        let mut published = Vec::new();
+        for k in 0..TAP_CHAIN_POOL_LEN {
+            assert!(tap_chain_publish(&pool, &next, &slot, mk(0x1000 + k)));
+            let p = slot.load(Ordering::Acquire);
+            assert!(
+                (pool_start..pool_end).contains(&(p as usize)),
+                "published pointer must be a pool cell, never a heap allocation"
+            );
+            assert!(!published.contains(&(p as usize)), "cells are claim-once");
+            published.push(p as usize);
+            // SAFETY: `p` is the just-published pool cell (immutable after publication).
+            assert_eq!(unsafe { (*p).handler }, 0x1000 + k);
+        }
+
+        // Exhaustion: the publish reports failure and the slot KEEPS the last occupant.
+        let last = slot.load(Ordering::Acquire);
+        assert!(!tap_chain_publish(&pool, &next, &slot, mk(0xdead)));
+        assert_eq!(
+            slot.load(Ordering::Acquire),
+            last,
+            "exhaustion keeps the last occupant"
+        );
+        // SAFETY: `last` is a published pool cell (immutable after publication).
+        assert_eq!(
+            unsafe { (*last).handler },
+            0x1000 + (TAP_CHAIN_POOL_LEN - 1)
+        );
+    }
+
+    #[test]
+    fn tap_entry_claim_is_tid_scoped_not_process_global() {
+        // 2026-06-12: the regression guard for the cross-thread-kill bug — a different-tid
+        // entry while the latch is held is CONCURRENCY and must PROCEED (Unlatched); only the
+        // SAME tid re-entering is recursion (SameThreadReentry → the SIG_DFL bail). A LOCAL
+        // latch (the tap_chain_publish parametrization pattern) so this never touches the
+        // process-global TAP_HANDLER_TID the live test exercises.
+        let latch = AtomicI64::new(0);
+        // The first entry claims the latch with its tid.
+        assert_eq!(tap_entry_claim(&latch, 101), TapEntryClaim::Latched);
+        assert_eq!(latch.load(Ordering::SeqCst), 101);
+        // The SAME tid re-entering is synchronous recursion → bail.
+        assert_eq!(
+            tap_entry_claim(&latch, 101),
+            TapEntryClaim::SameThreadReentry
+        );
+        // A DIFFERENT tid while held proceeds — the global-bool bug bailed (killed) here.
+        assert_eq!(tap_entry_claim(&latch, 202), TapEntryClaim::Unlatched);
+        assert_eq!(
+            latch.load(Ordering::SeqCst),
+            101,
+            "an Unlatched entry never disturbs the owner's claim"
+        );
+        // The owner releases; the next entry (any tid) claims fresh.
+        latch.store(0, Ordering::SeqCst);
+        assert_eq!(tap_entry_claim(&latch, 202), TapEntryClaim::Latched);
+        assert_eq!(latch.load(Ordering::SeqCst), 202);
+    }
+
+    #[test]
+    fn tap_stack_walk_bounds_and_validates() {
+        // A synthetic SysV frame chain in heap memory: [fp] = next fp (strictly ascending),
+        // [fp+8] = a fake return address. Frame k sits at base + k*64; the last frame's next-fp
+        // is 0 (the SysV outermost-frame convention), which fails `next > fp` and ends the walk.
+        let mut mem = Box::new([0u64; 64]);
+        let base = mem.as_ptr() as u64;
+        for k in 0..5usize {
+            mem[k * 8] = if k < 4 {
+                base + ((k + 1) * 64) as u64
+            } else {
+                0
+            };
+            mem[k * 8 + 1] = 0x1000_0000 + k as u64;
+        }
+        let rip = 0xdead_0000u64;
+        let rsp = base.wrapping_sub(64); // below the chain so `fp > rsp` holds
+        let mut out = [0u64; 32];
+
+        // The happy path: rip + the 4 chained return addresses (the 5th frame's next is 0).
+        let n = tap_stack_walk(rip, rsp, base, &mut out);
+        assert_eq!(n, 5);
+        assert_eq!(out[0], rip, "frame 0 is RIP itself");
+        for k in 0..4u64 {
+            assert_eq!(out[(k + 1) as usize], 0x1000_0000 + k);
+        }
+
+        // A non-8-aligned fp dies at frame 0.
+        assert_eq!(tap_stack_walk(rip, rsp, base + 1, &mut out), 1);
+        // fp <= rsp dies at frame 0 (the chain must sit above the interrupted stack pointer).
+        assert_eq!(tap_stack_walk(rip, base, base, &mut out), 1);
+        // next <= fp is rejected (the strictly-increasing-fp termination guarantee).
+        mem[0] = base; // self-loop: next == fp
+        assert_eq!(tap_stack_walk(rip, rsp, base, &mut out), 1);
+        // A >= 1 MiB frame step is rejected.
+        mem[0] = base + (1 << 20);
+        assert_eq!(tap_stack_walk(rip, rsp, base, &mut out), 1);
+
+        // A longer chain stops at the 32-entry cap (rip + 31 frames).
+        let mut long = Box::new([0u64; 128]);
+        let lbase = long.as_ptr() as u64;
+        for k in 0..63usize {
+            long[k * 2] = lbase + ((k + 1) * 16) as u64;
+            long[k * 2 + 1] = 0x2000_0000 + k as u64;
+        }
+        assert_eq!(
+            tap_stack_walk(rip, lbase.wrapping_sub(64), lbase, &mut out),
+            32,
+            "the walk caps at the 32-entry buffer"
+        );
+
+        // The non-faulting probe: Some for a valid local, None for an unmapped null-page address.
+        let local = 0xfeed_face_cafe_beefu64;
+        assert_eq!(
+            tap_read_u64(&raw const local as u64),
+            Some(local),
+            "process_vm_readv reads a mapped local"
+        );
+        assert_eq!(
+            tap_read_u64(0x10),
+            None,
+            "an unmapped address yields None, never a fault"
+        );
+    }
+
+    /// A do-nothing restorer stand-in for the strip test below (never called).
+    extern "C" fn tap_test_dummy_restorer() {}
+
+    #[test]
+    fn tap_si_code_consts_match_kernel_uapi() {
+        // 2026-06-12: pinned locally because libc 0.2.186 defines SEGV_MAPERR/SEGV_ACCERR for
+        // hurd/aix but NOT linux-gnu; the kernel UAPI (asm-generic/siginfo.h) values are 1 and 2.
+        assert_eq!(SEGV_MAPERR, 1);
+        assert_eq!(SEGV_ACCERR, 2);
+
+        // The anti-drift guard for the shared back-translation helper (eclipse_sigaction's oldact
+        // path + the tap's chain-slot seeding): SA_RESTORER is stripped from sa_flags and the
+        // restorer is forced to 0 even when the glibc action carries both.
+        // SAFETY: all-zero is a valid glibc sigaction baseline; fields are then set directly.
+        let mut g: libc::sigaction = unsafe { std::mem::zeroed() };
+        g.sa_sigaction = 0x1234;
+        g.sa_flags = libc::SA_SIGINFO | SA_RESTORER_FLAG;
+        g.sa_mask = glibc_sigset_from_bionic(1 << (libc::SIGURG - 1));
+        g.sa_restorer = Some(tap_test_dummy_restorer);
+        let b = bionic_action_from_glibc(&g);
+        assert_eq!(b.sa_flags, libc::SA_SIGINFO, "SA_RESTORER stripped");
+        assert_eq!(b.handler, 0x1234, "the handler carries over");
+        assert_eq!(b.sa_mask, 1 << (libc::SIGURG - 1), "the mask narrows");
+        assert_eq!(b.sa_restorer, 0, "the restorer pointer is never carried");
     }
 
     #[test]

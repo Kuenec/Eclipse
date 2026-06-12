@@ -1770,8 +1770,12 @@ extern "C" {
 /// (2026-06-05): create/join/detach 3, setname_np 1, kill 1, getattr_np 1, get/setschedparam 2,
 /// attr_* 6 = 14 → **51**. The lifecycle is now Eclipse-owned (TID-based `pthread_t`) because the init
 /// path DOES spawn threads, and the mixed Eclipse-`pthread_self`/host-glibc-`pthread_setname_np` ABI
-/// crashed the worker (gdb-proven, `docs/libroblox-init-run.md` §8). `pthread_sigmask` (sigset-only,
-/// no `pthread_t`) and `__cxa_thread_atexit_impl` stay on the host baseline (ABI-identical).
+/// crashed the worker (gdb-proven, `docs/libroblox-init-run.md` §8). `__cxa_thread_atexit_impl`
+/// stays on the host baseline (ABI-identical). 2026-06-11: `pthread_sigmask` is NOT ABI-identical
+/// after all — bionic `sigset_t` is 8 bytes vs glibc's 128 (a non-null `oldset` made glibc WRITE
+/// 128 bytes through it) — it is now provided by `native_provider`'s bionic signal-ABI section
+/// (with `sigaction`/`sigprocmask`/`sigemptyset`/`sigaddset`/`sigfillset`), counted there, so this
+/// count is unchanged.
 pub const PTHREAD_NATIVE_COUNT: usize = 51;
 
 /// Append every Eclipse-owned bionic pthread/TLS/sem/syscall native to `register` as
