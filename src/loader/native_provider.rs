@@ -407,6 +407,13 @@ impl EclipseNativeProvider {
             "ALooper_removeFd",
             eclipse_alooper_removefd as *const () as u64,
         );
+        // EGL display interception (1) — 2026-06-13: tier-0 `eglGetDisplay` that connection-matches the
+        // engine's EGLDisplay to Eclipse's winit `wl_display` (remaps EGL_DEFAULT_DISPLAY on Wayland,
+        // pass-through otherwise/X11), fixing the engine's `eglCreateWindowSurface` EGL_BAD_ALLOC 3003
+        // cross-connection. Wins over host libEGL by `resolve`'s first-strong-match (tier 0 before
+        // tier 1). See `eclipse_egl_get_display`.
+        p.register("eglGetDisplay", eclipse_egl_get_display as *const () as u64);
+
         // ANativeWindow (6) — WSI-bound: fromSurface returns the REAL host-EGL native window Eclipse
         // owns, getters return real geometry/format, refcount ops are no-ops (the engine render WSI
         // bind). getFormat added 2026-06-12 — libsurface_util_jni.so's sole unresolved pre-load
@@ -3839,6 +3846,99 @@ pub fn run_input_test() -> Result<String, String> {
     ))
 }
 
+// ---- EGL display interception (1) — connection-match the engine's EGLDisplay to Eclipse's window --
+//
+// 2026-06-13 — the engine resolves `egl*` through host `libEGL.so` (bionic_env tier 1) and calls
+// `eglGetDisplay(EGL_DEFAULT_DISPLAY)`. Per the Khronos `EGL_KHR_platform_wayland` /
+// `EGL_EXT_platform_wayland` registry text (verified 2026-06-13), on Wayland `EGL_DEFAULT_DISPLAY`
+// makes EGL open Mesa's OWN `wl_display` via `wl_display_connect(NULL)` — a DIFFERENT connection than
+// the one `winit` opened for Eclipse's window. The `ANativeWindow*` Eclipse hands the engine
+// (`eclipse_anativewindow_fromsurface` → `current_wsi_window`) wraps a `wl_egl_window*` on `winit`'s
+// `wl_surface`, and `eglCreateWindowSurface` requires the EGLDisplay's `wl_display` and the
+// `wl_egl_window`'s `wl_surface` to be on the SAME connection — crossing them is `EGL_BAD_ALLOC`
+// (3003). Eclipse registers its OWN `eglGetDisplay` at loader tier 0 (`EclipseNativeProvider`), which
+// wins over host `libEGL` by `resolve`'s first-strong-match, and remaps `EGL_DEFAULT_DISPLAY` to the
+// registered winit `wl_display` ([`ndk_registry::wsi_display`]) before delegating to the HOST
+// `eglGetDisplay`, so the engine's EGLDisplay shares the `wl_egl_window`'s connection — identical to
+// what `egl_engine` does for `__gl-test-anw`. A non-default `display_id`, or no registered Wayland
+// display (X11/other, where the XID is server-scoped so cross-connection is not an issue), is passed
+// through unchanged. This is a connection-MATCHING fix, not a workaround.
+
+/// Decide which `EGLNativeDisplayType` value the host `eglGetDisplay` should receive for the engine's
+/// request: when the engine asks for `EGL_DEFAULT_DISPLAY` (`0`) AND a winit Wayland `wl_display` is
+/// registered, return that pointer (so the engine's EGLDisplay lands on winit's connection); otherwise
+/// pass the original `display_id` through unchanged (a caller-chosen non-default display is never
+/// rewritten; `EGL_DEFAULT_DISPLAY` on X11/other passes through, preserving X11/NVIDIA).
+///
+/// 2026-06-13: `EGL_DEFAULT_DISPLAY == 0 == NULL` (khronos-egl 6.0.0 `DEFAULT_DISPLAY`,
+/// `NativeDisplayType = *mut c_void`). Pure + JVM-free so the mapping is a deterministic unit test.
+fn resolve_egl_display_target(display_id: usize, wsi: Option<usize>) -> usize {
+    if display_id == 0 {
+        // EGL_DEFAULT_DISPLAY: remap to the winit wl_display on Wayland, else keep 0 (X11/other).
+        wsi.unwrap_or(0)
+    } else {
+        display_id
+    }
+}
+
+/// The host `libEGL.so` `eglGetDisplay`, dlsym'd once via Eclipse's OWN `dlopen` handle (NOT through
+/// the engine's relocated symbol scope), so the tier-0 shim NEVER re-enters the engine's `eglGetDisplay`
+/// — no recursion. The handle is `RTLD_NOW | RTLD_LOCAL`, process-lifetime (never `dlclose`d), mirroring
+/// [`super::bionic_env::DlopenLibProvider`]. `None` if the host lacks `libEGL.so` or the symbol — the
+/// native then returns `EGL_NO_DISPLAY` (a clean EGL failure, never UB). The cached value is the
+/// function-pointer address as a `usize` (`Send`/`Sync`-safe to store in a `OnceLock`).
+fn host_egl_get_display() -> Option<usize> {
+    static HOST_EGL_GET_DISPLAY: OnceLock<Option<usize>> = OnceLock::new();
+    *HOST_EGL_GET_DISPLAY.get_or_init(|| {
+        // SAFETY: 2026-06-13 — `dlopen(ptr, flags)` reads the NUL-terminated C string at `ptr` (a
+        // `'static` `c"…"` literal that outlives the call) and returns an opaque handle or NULL;
+        // `dlsym(handle, ptr)` reads the NUL-terminated symbol name and returns the symbol's address or
+        // NULL. We pass the standard `RTLD_NOW | RTLD_LOCAL`, never dereference the handle in Rust, and
+        // never `dlclose` it (process-lifetime — its address is cached and called for the run). NULL
+        // handle/sym is handled below as `None` (no UB). This is the established `DlopenLibProvider`
+        // pattern; using our own handle keeps the lookup out of the engine's symbol scope (no recursion).
+        let handle =
+            unsafe { libc::dlopen(c"libEGL.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if handle.is_null() {
+            return None;
+        }
+        let sym = unsafe { libc::dlsym(handle, c"eglGetDisplay".as_ptr()) };
+        if sym.is_null() {
+            None
+        } else {
+            Some(sym as usize)
+        }
+    })
+}
+
+/// `EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id)` — Eclipse-owned tier-0 override of the
+/// engine's display acquisition. Remaps `EGL_DEFAULT_DISPLAY` to the registered winit `wl_display` on
+/// Wayland (see [`resolve_egl_display_target`]) and delegates to the HOST `eglGetDisplay` so the
+/// engine's EGLDisplay shares the `wl_egl_window`'s connection (the `EGL_BAD_ALLOC` 3003 connection
+/// fix). Returns `EGL_NO_DISPLAY` (NULL) if the host `eglGetDisplay` is unavailable — a clean EGL
+/// failure, never UB. Does NOT dereference `display_id` (it is an opaque native-display token).
+///
+/// # Safety
+/// `display_id` is the opaque `EGLNativeDisplayType` the engine passes; this native treats it only as
+/// a pointer-sized token (compares against `0`, forwards it), never dereferencing it.
+unsafe extern "C" fn eclipse_egl_get_display(display_id: *mut c_void) -> *mut c_void {
+    let Some(host) = host_egl_get_display() else {
+        return std::ptr::null_mut(); // EGL_NO_DISPLAY — host libEGL.so / eglGetDisplay unavailable.
+    };
+    let target = resolve_egl_display_target(display_id as usize, ndk_registry::wsi_display());
+    // SAFETY: 2026-06-13 — `host` is the address `dlsym` returned for the host `libEGL.so`
+    // `eglGetDisplay` (non-null, checked above), whose C signature is
+    // `EGLDisplay eglGetDisplay(EGLNativeDisplayType)` with both parameter and return being
+    // `*mut c_void` (khronos-egl 6.0.0). Transmuting the `usize` address to that fn pointer and
+    // calling it with a pointer-sized `EGLNativeDisplayType` value matches the ABI exactly. `target`
+    // is either the winit `wl_display*` (a live pointer for the window's lifetime) or the original
+    // `display_id` / `EGL_DEFAULT_DISPLAY` — all valid `eglGetDisplay` inputs; the host only stores
+    // the value (it does not require Eclipse to keep any buffer alive past the call).
+    let host_fn: unsafe extern "C" fn(*mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(host) };
+    unsafe { host_fn(target as *mut c_void) }
+}
+
 // ---- ANativeWindow (6) — WSI-bound: returns the REAL host-EGL native window; getters real geometry
 //
 // 2026-06-05 — the engine render WSI bind: Roblox's native engine creates its OWN EGL surface by
@@ -4499,14 +4599,15 @@ mod tests {
         // getattr_np/get+setschedparam/attr_*; + __cxa_thread_atexit_impl & pthread_atfork
         // 2026-06-12 — the core-947663 destructor-order fix and the last libbacktrace-native
         // pre-load import) + 5 bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/
-        // getpagesize/sysinfo — the allocator-bootstrap fix, 2026-06-05) = 187.
+        // getpagesize/sysinfo — the allocator-bootstrap fix, 2026-06-05) + 1 EGL display interception
+        // (2026-06-13 — eglGetDisplay, the EGL_BAD_ALLOC 3003 connection-match fix) = 188.
         assert_eq!(
             p.len(),
-            129 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            130 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
             "6 liblog + 16 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
-             introspection + 4 netdb resolver-ABI + 28 ndk-android + 33 media-ndk + 8 audio + \
-             53 pthread + 5 sysconf system-query natives registered"
+             introspection + 4 netdb resolver-ABI + 1 EGL display interception + 28 ndk-android + \
+             33 media-ndk + 8 audio + 53 pthread + 5 sysconf system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim + 1 va_list C-shim)
@@ -4575,6 +4676,8 @@ mod tests {
             "freeaddrinfo",
             "gai_strerror",
             "getnameinfo",
+            // EGL display interception (1) — 2026-06-13 (EGL_BAD_ALLOC 3003 connection-match)
+            "eglGetDisplay",
             // ndk-android (28)
             "AAssetManager_fromJava",
             "AAssetManager_open",
@@ -6333,6 +6436,41 @@ mod tests {
             ndk_registry::wsi_window_geometry(fake_wsi),
             None,
             "an unregistered WSI pointer is unknown (the getters then return the NDK -1 sentinel)"
+        );
+    }
+
+    #[test]
+    fn resolve_egl_display_target_maps_default_display_to_winit_wayland_only() {
+        // 2026-06-13 — the confirmed-root-cause regression guard for the EGL_BAD_ALLOC 3003
+        // connection mismatch. The engine's eglGetDisplay(EGL_DEFAULT_DISPLAY=0) on Wayland MUST be
+        // remapped to the registered winit wl_display; everything else passes through unchanged. Pure +
+        // deterministic (no JVM, no registry), so this is the smallest check that fails if the mapping
+        // logic regresses.
+        let winit_wl_display: usize = 0x5000_1000;
+        // (a) EGL_DEFAULT_DISPLAY on Wayland remaps to the registered winit wl_display — the exact bug.
+        assert_eq!(
+            resolve_egl_display_target(0, Some(winit_wl_display)),
+            winit_wl_display,
+            "EGL_DEFAULT_DISPLAY on Wayland remaps to the registered winit wl_display"
+        );
+        // (b) EGL_DEFAULT_DISPLAY with no Wayland display (X11/other) passes through unchanged —
+        //     preserves X11/NVIDIA, where the XID is server-scoped so cross-connection is fine.
+        assert_eq!(
+            resolve_egl_display_target(0, None),
+            0,
+            "EGL_DEFAULT_DISPLAY on X11/other passes through unchanged"
+        );
+        // (c) a caller-chosen non-default display is NEVER rewritten, even on Wayland.
+        assert_eq!(
+            resolve_egl_display_target(0xABCD, Some(winit_wl_display)),
+            0xABCD,
+            "a non-default display_id is never rewritten (Wayland)"
+        );
+        // (d) a non-default display with no Wayland display also passes through.
+        assert_eq!(
+            resolve_egl_display_target(0xABCD, None),
+            0xABCD,
+            "a non-default display_id is never rewritten (X11/other)"
         );
     }
 
