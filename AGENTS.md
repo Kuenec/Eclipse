@@ -128,6 +128,38 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🩹 LayoutInflater `<requestFocus/>` OVERLAY PATCH — LIVE-PROVEN: inflation advanced PAST `<requestFocus/>`.**
+  ATL's vendored `LayoutInflater.rInflate` stubbed the standard AOSP `<requestFocus/>` layout tag with `throw new
+  Exception("<requestFocus /> not supported atm")`, which aborted `ActivityNativeMain.onCreate`'s content-view inflation.
+  Fix is a **framework-overlay** Java patch (NOT Rust — no `RegisterNatives` can add a Java method body): a committed
+  patched copy `tools/framework-overlay/src/android/view/LayoutInflater.java`, byte-identical to the vendored original
+  EXCEPT the `<requestFocus/>` branch now calls a new private `parseRequestFocus(parser, parent)` → `consumeChildElements(parser)`
+  (the canonical AOSP frameworks/base parse-and-consume idiom — a genuine depth-guarded consume of the tag so inflation
+  continues, NOT error suppression). It deliberately OMITS `View.requestFocus()`: Eclipse is headless and binds no
+  `nativeRequestFocus` (it would `UnsatisfiedLinkError`); the engine owns input focus, so consuming the tag is the
+  load-bearing behavior. Shadows the stock class via the overlay's `classes.dex` (multidex first-dex-wins). New
+  compile-only stubs under `tools/framework-overlay/stubs/` (`android/view/{View,ViewGroup,ContextThemeWrapper}`,
+  `android/content/res/{TypedArray,XmlResourceParser,Resources}`, `android/util/{AttributeSet,Slog,Xml}`,
+  `com/android/internal/R`, `org/xmlpull/v1/{XmlPullParser,XmlPullParserException,XmlPullParserFactory}`) + an extended
+  `android/content/Context.java` stub (concrete `getResources`/`obtainStyledAttributes`/`getSystemService`) let `javac`
+  compile the patched source WITHOUT ATL's full source tree; the staging glob (`android/view/LayoutInflater*.class`)
+  dexes ONLY the 3 LayoutInflater classes, so NO stub ever reaches the dex (verified: `classes.dex` defines exactly 17
+  classes, 0 stub classes). `patch-framework.sh` wires LayoutInflater into the javac list + staging glob and adds a
+  build-time regression guard (lines 63-70) that fails the build if the `<requestFocus/>` fix is ever reverted (mirrors
+  the Build.java anchor guard). Overlay build clean (exit 0; `classes.dex` 10508 → **18656** bytes; `classes2.dex`
+  2498192 bytes). **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP, already DONE for this
+  patch — commit `521ba34` tree + this overlay: the live boot no longer throws `<requestFocus /> not supported atm`;
+  `ActivityNativeMain.onCreate` inflation advanced PAST `<requestFocus/>`). NEXT GAP = the NEW frontier the live boot
+  revealed: `NoClassDefFoundError android.view.View$OnCapturedPointerListener` at `ActivityNativeMain.d1` — a newer
+  Android nested interface ATL's vendored `View` lacks. Fix path: add the nested type `View$OnCapturedPointerListener`
+  to the overlay's `classes.dex` WITHOUT shadowing the large `View` class (i.e. ship the nested interface alone, do NOT
+  re-dex a whole patched `View`). REMINDER: the overlay is a CACHE artifact — if `~/.cache/eclipse` was wiped and the
+  boot errors `Android framework not found`, rebuild it with `tools/framework-overlay/patch-framework.sh` FIRST
+  (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`).** This `<requestFocus/>` patch is
+  LIVE-PROVEN (inflation advanced past the tag). Gate (no Rust changed — Java-overlay + build-script only): overlay
+  build clean; `cargo fmt --all -- --check`/`build --all-targets`/`clippy -D warnings`/`build --release` (8,907,880-byte
+  artifact) all 0-warning; `cargo test` **555 unit + 0 main-bin + 4 integration (0 SKIP) + 2 doctests = 561 passed, 0
+  failed**. Detail: §6 (2026-06-13 LayoutInflater `<requestFocus/>` overlay entry).
 - **2026-06-13 — ⌨️ `EditText` LISTENER NATIVES BOUND (record-the-listener) + the 58a50f6 atomic-RegisterNatives
   ABORT CLASS root-cause-fixed across the View/widget per-class registrations.** Owner live boot of `16db9eb` (clean,
   pure log observation) PROVED the 58a50f6 regression fix landed: `register_view_natives` registers cleanly, the boot
@@ -164,11 +196,9 @@ before any history-rewriting/force operation.
   (JVM-free, since ART can't run in-harness) with a 3-entry set whose middle entry fails — asserts all 3 are visited in
   order (no short-circuit) and `bound == 2`, the smallest check that would have caught the 58a50f6 atomic abort; the
   existing `widget_property_setter_names_sigs_and_classes_match_overlay` pin extended with the three EditText listener
-  name/sig pins so a transcription drift re-introducing the boot-block fails CI. **⇐ START HERE NEXT SESSION (= OWNER
-  live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
-  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`. NOTE: the framework overlay is a CACHE artifact
-  that is wiped periodically — if the boot errors `Android framework not found`, rebuild it with
-  `tools/framework-overlay/patch-framework.sh` FIRST.): with the three EditText listener natives bound, expect
+  name/sig pins so a transcription drift re-introducing the boot-block fails CI. **(SUPERSEDED as the START-HERE marker
+  by the 2026-06-13 LayoutInflater `<requestFocus/>` entry above — the owner live boot validated past EditText to the
+  `<requestFocus/>` gap, then past that too; left here for the lineage.)** With the three EditText listener natives bound, expect
   `RbxKeyboard`/`AppCompatEditText` construction to no longer trip `UnsatisfiedLinkError` on `native_addTextChangedListener`
   and `ActivityNativeMain`'s content-view inflation to proceed PAST EditText/RbxKeyboard; confirm the View/widget
   registrations log the normal `(best-effort)` info lines and NO per-method WARN (a WARN names a genuinely-non-native
@@ -2801,6 +2831,26 @@ listeners the shipped dex declares plain Java); (3) capture the NEXT unbound nat
 return-driving getter such as `EditText.native_getText`/`SeekBar.native_getProgress`, an `isChecked()`/`setChecked()`
 pair, another listener registration, or the next class on the inflate→attach→surface path — pure log observation, no
 binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs`, `AGENTS.md`. *No subagent live boot.*
+
+---
+
+### 2026-06-13 — LayoutInflater `<requestFocus/>` framework-overlay patch (ATL stubbed the standard tag; AOSP parse-and-consume, headless so `requestFocus()` is skipped) — LIVE-PROVEN: inflation advanced past the tag
+
+*Confirmed root cause / live evidence (owner dev-host boot, commit `521ba34` tree + this overlay — clean log observation, NOT a subagent):* `ActivityNativeMain.onCreate`'s content-view `LayoutInflater.inflate` aborted with `<requestFocus /> not supported atm`. The vendored ATL `LayoutInflater.rInflate` (`vendor/atl/src/api-impl/android/view/LayoutInflater.java`) stubs the standard AOSP `<requestFocus/>` layout tag with `throw new Exception("<requestFocus /> not supported atm")` (the AOSP `parseRequestFocus` call is commented out right below it). Roblox's content layout contains a `<requestFocus/>` element, so inflation hits the throw and dies.
+
+*Why an overlay patch (not a Rust `RegisterNatives` fix):* this is a pure-Java method-BODY gap — no native method is involved, so Eclipse's `RegisterNatives` mechanism (which binds native methods) cannot fix it. The patch goes through the framework overlay (`tools/framework-overlay/`, multidex first-dex-wins: patched classes in `classes.dex` shadow the stock ATL `classes2.dex`), exactly the lane established for `Build`/`NetworkRequest`/`ActivityManager`/`PowerManager`.
+
+*Fix:* NEW committed patched copy `tools/framework-overlay/src/android/view/LayoutInflater.java` (Apache-2.0), byte-identical to the vendored original EXCEPT: (1) header comment, (2) the `<requestFocus/>` branch in `rInflate` now calls a new `private parseRequestFocus(parser, parent)` instead of throwing, (3) two new private methods `parseRequestFocus(XmlPullParser, View)` → `consumeChildElements(XmlPullParser)`. `consumeChildElements` is the canonical AOSP frameworks/base idiom (and identical to `rInflate`'s own depth-guard loop): it advances the parser to the current element's matching `END_TAG` and stops there, so `rInflate`'s next `parser.next()` resumes at the next SIBLING (no skipped siblings), always advances via `parser.next()`, and terminates on `END_DOCUMENT` (no infinite loop) — a GENUINE consume of the (empty) tag, not error suppression. `parseRequestFocus` DELIBERATELY OMITS `View.requestFocus()`: Eclipse is headless (no GTK) and binds NO `nativeRequestFocus` native (`View.requestFocus()` bottoms out in `private native void nativeRequestFocus(long, int)`, whose only impl is ATL's GTK `gtk_widget_grab_focus`, which Eclipse never loads); calling it would trade one inflation abort for an `UnsatisfiedLinkError`. The engine owns input focus headlessly — consuming the tag so inflation continues is the load-bearing, correct behavior. `ECLIPSE PATCH 2026-06-13` markers carry the root-cause + headless-focus reasoning in-code.
+
+*Compile-only stub set (NEVER dexed):* the patched `LayoutInflater` references View/ViewGroup/Context/Resources/TypedArray/XmlPullParser etc., but ATL ships dex (not classfiles) so it cannot be a `javac` classpath. NEW compile-only stubs under `tools/framework-overlay/stubs/`: `android/view/{View,ViewGroup,ContextThemeWrapper}`, `android/content/res/{TypedArray,XmlResourceParser,Resources}`, `android/util/{AttributeSet,Slog,Xml}`, `com/android/internal/R`, `org/xmlpull/v1/{XmlPullParser,XmlPullParserException,XmlPullParserFactory}`; plus an EXTENDED `tools/framework-overlay/stubs/android/content/Context.java` (added concrete `getResources`/`obtainStyledAttributes`/`getSystemService` — `getSystemService` concrete, NOT abstract, because `android/app/Application` extends `Context` as a non-abstract class and an abstract method would break the pre-existing Application stub compile). The `XmlPullParser` stub constants (`START_TAG=2`/`END_TAG=3`/`END_DOCUMENT=1`) are the canonical `org.xmlpull.v1` values, compile-inlined into the patched bytecode; the stub is never dexed, and the original ATL `rInflate`/`parseInclude` already reference these same constants at runtime today, so the values are runtime-proven by the existing inflate path. The staging glob in `patch-framework.sh` selects ONLY `android/view/LayoutInflater*.class`, so NONE of the co-compiled stubs reach the dex.
+
+*`patch-framework.sh` wiring + regression guard:* added `LayoutInflater.java` to the javac list and the staging glob (so the 3 LayoutInflater classes — `LayoutInflater`, `$Factory`, `$Factory2` — go into `classes.dex`); updated the header comment's patched-class list. NEW build-time regression guard (lines 63-70, mirroring the existing Build.java anchor guard): the build FAILS loudly if `parseRequestFocus(parser, parent);` is absent OR if the old `<requestFocus /> not supported atm` throw is still present — directly tied to the confirmed fix, so a silent revert cannot ship. Verified effective: a simulated revert to the old throw trips the guard and exits 1; both checks pass on the real file.
+
+*Same-pattern audit:* searched the vendored ATL `LayoutInflater` for other `not supported atm`-style inflation throws — the `<include/>` branch throws only on a genuine malformed root, `<merge/>` is handled, and no other standard layout tag is stubbed with a "not supported" throw on the live content-view path. The `<requestFocus/>` throw was the single instance of this class on the inflation path; this patch covers it. The next inflation gap is a DIFFERENT class (missing nested type, below), not another stubbed-tag throw.
+
+*Verification (overlay build + full cargo gate; no Rust source changed — Java-overlay + build-script only):* `tools/framework-overlay/patch-framework.sh` ran clean (exit 0, prints `OK: patched framework overlay installed`) — `classes.dex` 10508 → **18656** bytes, `classes2.dex` 2498192 bytes (matches the owner's live-validated growth); only the benign javac unchecked-operations NOTE (NetworkRequest generics). Parsed `classes.dex`'s `class_defs` table directly (no `dexdump` available): it DEFINES exactly 17 classes — the 3 LayoutInflater classes plus the pre-existing patched `Build*`/`NetworkRequest*`/`ActivityManager*`/`PowerManager*` — and ZERO stub classes (View/ViewGroup/Context/TypedArray/XmlPullParser/… appear only as referenced type descriptors, never as `class_defs`, so they resolve from `classes2.dex`/real AOSP via first-dex-wins). Cargo gate: `cargo fmt --all -- --check` CLEAN; `cargo build --all-targets` 0 warnings (exit 0); `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings (exit 0); `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 561 passed, 0 failed**; `cargo build --release` clean (artifact `/home/kue/Projects/Eclipse/target/release/eclipse`, 8,907,880 bytes — matches §5). *No live ART boot in this workflow; the dev-host live boot was the OWNER's.*
+
+*OWNER LIVE-VALIDATION (already done — commit `521ba34` tree + this overlay):* the live boot no longer throws `<requestFocus /> not supported atm`; `ActivityNativeMain.onCreate` inflation advanced PAST `<requestFocus/>` to a NEW, DIFFERENT gap — `NoClassDefFoundError android.view.View$OnCapturedPointerListener` at `ActivityNativeMain.d1` (a newer Android nested interface ATL's vendored `View` lacks). That is the NEXT frontier (a separate future item, NOT part of this patch): add the nested type `View$OnCapturedPointerListener` to the overlay's `classes.dex` WITHOUT shadowing the large `View` class (ship the nested interface alone; do not re-dex a whole patched `View`). REMINDER: the overlay is a CACHE artifact under `~/.cache/eclipse` — if it was wiped and the boot errors `Android framework not found`, run `tools/framework-overlay/patch-framework.sh` FIRST. *Files:* `tools/framework-overlay/src/android/view/LayoutInflater.java` (NEW), `tools/framework-overlay/stubs/**` (NEW stub set + extended `Context.java`), `tools/framework-overlay/patch-framework.sh`, `AGENTS.md`.
 
 ---
 
