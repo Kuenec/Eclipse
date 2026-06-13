@@ -6,7 +6,7 @@
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
 #   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*)
-#   classes2.dex = smali-patched View (+ View$OnCapturedPointerListener) + Display = installed classes + AOSP gaps
+#   classes2.dex = smali-patched View (+ View$OnCapturedPointerListener) + Display + Activity + Fragment = installed classes + AOSP gaps
 #   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
@@ -137,11 +137,56 @@ n="$(grep -cF '.method public getRefreshRate()F' "$dsm")" || true
 perl -0pi -e 's{(\.method public getRefreshRate\(\)F.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP Display.getSupportedRefreshRates() (Roblox queries it in Activity.onStart for framerate setup; ATL omits it). Returns {60.0f} to match getRefreshRate above.\n.method public getSupportedRefreshRates()[F\n    .locals 3\n\n    const/4 v0, 0x1\n\n    new-array v0, v0, [F\n\n    const/4 v1, 0x0\n\n    const/high16 v2, 0x42700000    # 60.0f\n\n    aput v2, v0, v1\n\n    return-object v0\n.end method\n}s' "$dsm"
 grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali getSupportedRefreshRates insert failed (drift?)"
 
-# assemble the patched View + nested interface + patched Display -> classes2.dex (other classes stay stock)
-mkdir -p "$work/smali-view/android/view"
+# 2026-06-13: androidx create-phase ON_CREATE dispatch. Roblox's ActivityNativeMain extends androidx
+# ComponentActivity, whose LifecycleRegistry must receive Lifecycle.Event.ON_CREATE during the
+# activity's create phase (AOSP: performCreate -> dispatchActivityCreated -> Fragment.onActivityCreated,
+# all BEFORE onStart). ATL dispatches NO create-phase fragment hook: Activity.onCreate only loops
+# fragment.onCreate(), Activity.onPostCreate is a no-op, and base Fragment has no onActivityCreated.
+# So the androidx ReportFragment (injected via getFragmentManager().add() during the onCreate super-
+# chain — ATL's FragmentTransaction.add DOES populate activity.fragments) never gets onActivityCreated;
+# the FIRST event the registry sees is ReportFragment.onStart -> handleLifecycleEvent(ON_START), which
+# advances to STARTED and back-fills ON_CREATE to lagging observers while currentState is already
+# STARTED. An observer's registerForActivityResult (ActivityResultRegistry requires state < STARTED at
+# register time) then throws IllegalStateException "must call register before STARTED".
+# Fix (drift-proof baksmali, like View/Display): (Fragment) add the AOSP base no-op
+# onActivityCreated(Bundle) so the dispatch call resolves and androidx's ReportFragment @Override is
+# invoked; (Activity) make onPostCreate(Bundle) iterate activity.fragments calling
+# onActivityCreated(savedInstanceState). onPostCreate (driven by Eclipse BETWEEN onCreate and onStart,
+# matching AOSP) runs AFTER the full onCreate super-chain has injected the ReportFragment, and BEFORE
+# onStart — so ON_CREATE is dispatched while the registry is at CREATED. NOT error suppression: the
+# registry legitimately reaches CREATED first, so registerForActivityResult passes its guard.
+fsm="$work/smali/android/app/Fragment.smali"
+[ -f "$fsm" ] || fail "Fragment.smali not found after baksmali"
+n="$(grep -cF '.method public onCreate(Landroid/os/Bundle;)V' "$fsm")" || true
+[ "$n" = "1" ] || fail "Fragment.smali onCreate anchor not unique (found $n, expected 1) — installed Fragment drifted; update patch-framework.sh"
+! grep -qF 'onActivityCreated(Landroid/os/Bundle;)V' "$fsm" || fail "Fragment.smali already declares onActivityCreated — installed Fragment drifted; update patch-framework.sh"
+# AOSP base android.app.Fragment.onActivityCreated(Bundle) is an empty hook; add it (registers 2 = this + Bundle).
+perl -0pi -e 's{(\.method public onCreate\(Landroid/os/Bundle;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP base Fragment.onActivityCreated(Bundle) hook (empty); androidx ReportFragment \@Overrides it to dispatch Lifecycle.Event.ON_CREATE. ATL omitted it.\n.method public onActivityCreated(Landroid/os/Bundle;)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$fsm"
+grep -qF 'onActivityCreated(Landroid/os/Bundle;)V' "$fsm" || fail "Fragment.smali onActivityCreated insert failed (drift?)"
+
+asm="$work/smali/android/app/Activity.smali"
+[ -f "$asm" ] || fail "Activity.smali not found after baksmali"
+# Guard on the EXACT current no-op onPostCreate body (full multi-line match; fail loud on installed drift).
+# `grep -F` splits a multi-line pattern into an OR of lines, so it cannot verify a whole body — use a
+# perl whole-file substring check instead (the perl substitution below is itself a no-op on drift, but
+# this turns that into a loud failure rather than the later back-check's quieter one).
+ANCHOR_PC=$'.method protected onPostCreate(Landroid/os/Bundle;)V\n    .registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static {v0, v1}, Landroid/util/Slog;->i(Ljava/lang/String;Ljava/lang/String;)I\n\n    return-void\n.end method'
+n="$(grep -cF '.method protected onPostCreate(Landroid/os/Bundle;)V' "$asm")" || true
+[ "$n" = "1" ] || fail "Activity.smali onPostCreate anchor not unique (found $n, expected 1) — installed Activity drifted; update patch-framework.sh"
+ANCHOR_PC="$ANCHOR_PC" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_PC}) >= 0) ? 0 : 1)' "$asm" || fail "Activity.smali onPostCreate body changed from the expected no-op — installed Activity drifted; update patch-framework.sh"
+! grep -qF 'onActivityCreated(Landroid/os/Bundle;)V' "$asm" || fail "Activity.smali already dispatches onActivityCreated — installed Activity drifted; update patch-framework.sh"
+# Replace the no-op onPostCreate with one that dispatches Fragment.onActivityCreated(savedInstanceState).
+# Mirrors the installed onCreate fragment loop (registers v0/v1, p1=Bundle), substituting onActivityCreated.
+perl -0pi -e 's{\.method protected onPostCreate\(Landroid/os/Bundle;\)V\n    \.registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i\(Ljava/lang/String;Ljava/lang/String;\)I\n\n    return-void\n\.end method}{.method protected onPostCreate(Landroid/os/Bundle;)V\n    .registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i(Ljava/lang/String;Ljava/lang/String;)I\n\n    # ECLIPSE PATCH 2026-06-13: dispatch Fragment.onActivityCreated(savedInstanceState) (AOSP create-\n    # phase hook ATL omits) so androidx ReportFragment fires Lifecycle.Event.ON_CREATE while the\n    # LifecycleRegistry is at CREATED, BEFORE onStart dispatches ON_START. Eclipse drives onPostCreate\n    # between onCreate and onStart, after the onCreate super-chain has injected the ReportFragment.\n    iget-object v0, p0, Landroid/app/Activity;->fragments:Ljava/util/List;\n\n    invoke-interface \{v0\}, Ljava/util/List;->iterator()Ljava/util/Iterator;\n\n    move-result-object v1\n\n    :goto_pc\n    invoke-interface \{v1\}, Ljava/util/Iterator;->hasNext()Z\n\n    move-result v0\n\n    if-eqz v0, :cond_pc\n\n    invoke-interface \{v1\}, Ljava/util/Iterator;->next()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, Landroid/app/Fragment;\n\n    invoke-virtual \{v0, p1\}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V\n\n    goto :goto_pc\n\n    :cond_pc\n    return-void\n.end method}s' "$asm"
+grep -qF 'invoke-virtual {v0, p1}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V' "$asm" || fail "Activity.smali onPostCreate dispatch insert failed (drift?)"
+
+# assemble the patched View + nested interface + patched Display + Activity + Fragment -> classes2.dex
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
+cp "$asm" "$work/smali-view/android/app/Activity.smali"
+cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
 # --- 4c. stock api-impl as classes3.dex; compose the 3-dex overlay jar --------------------
@@ -157,5 +202,5 @@ ln -sfn "$ORIG_FW/framework-res.apk" "$OUT/framework-res.apk"
 ln -sfn "$ORIG_FW/natives" "$OUT/natives"
 
 echo "OK: patched framework overlay installed at $OUT"
-echo "    classes.dex (javac-patched): $(ls -l "$work/jar/classes.dex" | awk '{print $5}') bytes; classes2.dex (smali View): $(ls -l "$work/jar/classes2.dex" | awk '{print $5}') bytes; classes3.dex (stock): $(ls -l "$work/jar/classes3.dex" | awk '{print $5}') bytes"
+echo "    classes.dex (javac-patched): $(ls -l "$work/jar/classes.dex" | awk '{print $5}') bytes; classes2.dex (smali View+Display+Activity+Fragment): $(ls -l "$work/jar/classes2.dex" | awk '{print $5}') bytes; classes3.dex (stock): $(ls -l "$work/jar/classes3.dex" | awk '{print $5}') bytes"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""

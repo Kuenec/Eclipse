@@ -8531,7 +8531,16 @@ extern "system" fn activity_native_start_activity<'local>(
         track_activity(env, &activity, false);
         // Each helper routes through `checked` (describe+clear on a Java throw). A failure is
         // already logged there; stop the up-cascade and return cleanly (no pending exception).
+        // 2026-06-13: onPostCreate is driven BETWEEN onCreate and onStart (the same AOSP ordering as
+        // `drive_lifecycle`) so the activity's androidx LifecycleRegistry reaches CREATED before
+        // onStart — see `call_activity_on_post_create`.
         if call_activity_on_create(env, &activity, "nativeStartActivity Activity.onCreate").is_err()
+            || call_activity_on_post_create(
+                env,
+                &activity,
+                "nativeStartActivity Activity.onPostCreate",
+            )
+            .is_err()
             || call_activity_on_start(env, &activity, "nativeStartActivity Activity.onStart")
                 .is_err()
             || call_activity_on_resume(env, &activity, "nativeStartActivity Activity.onResume")
@@ -8870,6 +8879,23 @@ pub const STEP4_CREATE_MAIN_ACTIVITY: RecipeStep = RecipeStep {
 pub const STEP5_ACTIVITY_ON_CREATE: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "onCreate",
+    descriptor: "(Landroid/os/Bundle;)V",
+};
+/// Step 5b: instance `Activity.onPostCreate(Bundle) -> void` (on the step-4 object), invoked with a
+/// `null` `Bundle`, BETWEEN [`STEP5_ACTIVITY_ON_CREATE`] and [`STEP6_ACTIVITY_ON_START`].
+///
+/// 2026-06-13: restores AOSP's `performCreate` → `onPostCreate` → `dispatchActivityCreated`
+/// ordering that ATL omits (ATL/Eclipse has no `performCreate`, so without an explicit drive
+/// `onPostCreate` never runs). The overlay's patched base `Activity.onPostCreate` dispatches
+/// `Fragment.onActivityCreated(savedInstanceState)` to each fragment — which fires androidx's
+/// `ReportFragment.onActivityCreated` → `LifecycleRegistry.handleLifecycleEvent(ON_CREATE)` while
+/// the registry is at CREATED, BEFORE `onStart` dispatches ON_START. Without this, `onStart`'s
+/// ON_START is the first event the registry sees, so it back-fills ON_CREATE to observers while
+/// already STARTED — and an observer's `registerForActivityResult` (its `ActivityResultRegistry`
+/// guard requires the state be below STARTED at register time) throws `IllegalStateException`.
+pub const STEP_ACTIVITY_ON_POST_CREATE: RecipeStep = RecipeStep {
+    class: "android/app/Activity",
+    method: "onPostCreate",
     descriptor: "(Landroid/os/Bundle;)V",
 };
 /// Step 6: instance `Activity.onStart() -> void` (on the step-4 object). The first half of ATL's
@@ -9996,6 +10022,13 @@ fn drive_lifecycle(
         "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
     );
 
+    // Step 5b: instance `Activity.onPostCreate(null Bundle)` — driven BETWEEN onCreate and onStart
+    // (AOSP's performCreate → onPostCreate ordering ATL omits). The overlay's base
+    // `Activity.onPostCreate` dispatches `Fragment.onActivityCreated` (androidx ReportFragment →
+    // ON_CREATE) here, so the activity's androidx LifecycleRegistry reaches CREATED before onStart
+    // moves it to STARTED — fixing the "register while STARTED" IllegalStateException (2026-06-13).
+    call_activity_on_post_create(env, &activity, "step 5b Activity.onPostCreate")?;
+
     // Step 6: instance `Activity.onStart() -> void` on the step-4 object — the first half of ATL's
     // `activity_start` (`main.c`): the launcher Activity moves to the STARTED state, running the
     // app's own `onStart` override.
@@ -10064,6 +10097,31 @@ fn call_activity_on_create<'local>(
         env.call_method(
             activity,
             jni_str!("onCreate"),
+            jni_sig!("(Landroid/os/Bundle;)V"),
+            &[JValue::Object(&JObject::null())],
+        )?
+        .v()
+    })
+}
+
+/// Instance `Activity.onPostCreate(Bundle)` with a null `Bundle` — recipe step 5b's call shape
+/// ([`STEP_ACTIVITY_ON_POST_CREATE`]), driven BETWEEN `onCreate` and `onStart`.
+///
+/// 2026-06-13: ATL/Eclipse has no AOSP `performCreate` to invoke `onPostCreate` after `onCreate`
+/// returns, so the lifecycle driver must call it explicitly. The overlay's patched base
+/// `Activity.onPostCreate` dispatches `Fragment.onActivityCreated` (androidx `ReportFragment` →
+/// `ON_CREATE`) at this point — after the full `onCreate` super-chain injected the ReportFragment,
+/// and before `onStart` dispatches ON_START — so the activity's androidx `LifecycleRegistry`
+/// reaches CREATED before STARTED.
+fn call_activity_on_post_create<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+    what: &str,
+) -> Result<(), FrameworkError> {
+    checked(env, what, |env| {
+        env.call_method(
+            activity,
+            jni_str!("onPostCreate"),
             jni_sig!("(Landroid/os/Bundle;)V"),
             &[JValue::Object(&JObject::null())],
         )?
@@ -10201,6 +10259,15 @@ mod tests {
             STEP5_ACTIVITY_ON_CREATE.descriptor,
             "(Landroid/os/Bundle;)V"
         );
+        // Step 5b: Activity.onPostCreate(Bundle) — driven between onCreate and onStart so the
+        // androidx LifecycleRegistry reaches CREATED before STARTED (2026-06-13). Same (Bundle)V
+        // shape as onCreate; a transcription drift would call the wrong method/sig at boot.
+        assert_eq!(STEP_ACTIVITY_ON_POST_CREATE.class, "android/app/Activity");
+        assert_eq!(STEP_ACTIVITY_ON_POST_CREATE.method, "onPostCreate");
+        assert_eq!(
+            STEP_ACTIVITY_ON_POST_CREATE.descriptor,
+            "(Landroid/os/Bundle;)V"
+        );
         // Steps 6–7: Activity.onStart/onResume are no-arg void instance methods (2026-06-05).
         assert_eq!(STEP6_ACTIVITY_ON_START.class, "android/app/Activity");
         assert_eq!(STEP6_ACTIVITY_ON_START.method, "onStart");
@@ -10315,6 +10382,16 @@ mod tests {
             jni_sig!("(Landroid/os/Bundle;)V").sig().to_str(),
             STEP5_ACTIVITY_ON_CREATE.descriptor
         );
+        // Step 5b onPostCreate call-site literals (2026-06-13): `call_activity_on_post_create` uses
+        // these exact literals — pin them equal to the constant so the two cannot drift.
+        assert_eq!(
+            jni_str!("onPostCreate").to_str(),
+            STEP_ACTIVITY_ON_POST_CREATE.method
+        );
+        assert_eq!(
+            jni_sig!("(Landroid/os/Bundle;)V").sig().to_str(),
+            STEP_ACTIVITY_ON_POST_CREATE.descriptor
+        );
         // Step 6 onStart + step 7 onResume call-site literals (2026-06-05).
         assert_eq!(jni_str!("onStart").to_str(), STEP6_ACTIVITY_ON_START.method);
         assert_eq!(
@@ -10333,8 +10410,63 @@ mod tests {
         assert_eq!(ACTIVITY_CLASS.to_str(), "android/app/Activity");
         assert_eq!(STEP4_CREATE_MAIN_ACTIVITY.class, "android/app/Activity");
         assert_eq!(STEP5_ACTIVITY_ON_CREATE.class, "android/app/Activity");
+        assert_eq!(STEP_ACTIVITY_ON_POST_CREATE.class, "android/app/Activity");
         assert_eq!(STEP6_ACTIVITY_ON_START.class, "android/app/Activity");
         assert_eq!(STEP7_ACTIVITY_ON_RESUME.class, "android/app/Activity");
+    }
+
+    // 2026-06-13: pin the ACTUAL driving order onCreate → onPostCreate → onStart → onResume in BOTH
+    // lifecycle drivers (`drive_lifecycle` and `activity_native_start_activity`). The fix for the
+    // androidx "register while STARTED" IllegalStateException depends on `onPostCreate` (which
+    // dispatches Fragment.onActivityCreated → ReportFragment ON_CREATE) running BETWEEN onCreate and
+    // onStart — a reverted or mis-ordered insert reintroduces the boot break. ART cannot run under
+    // cargo test, so this reads this source file and asserts the call-helper order textually (the
+    // smallest JVM-free check tied to the confirmed root cause). `include_str!("framework.rs")`
+    // reads THIS file (the path is relative to the file containing the macro) — no machine-specific
+    // path, runs from any clean checkout.
+    #[test]
+    fn lifecycle_drivers_call_on_post_create_between_on_create_and_on_start() {
+        let src = include_str!("framework.rs");
+
+        // Extract a named fn's body span [signature .. next "\nfn " at column 0] and assert the four
+        // up-lifecycle helper calls appear in onCreate → onPostCreate → onStart → onResume order.
+        fn assert_order(src: &str, marker: &str) {
+            let start = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing {marker}"));
+            // End the span at the next top-level `fn ` after the marker (drivers are distinct fns).
+            let rest = &src[start + marker.len()..];
+            let end = rest
+                .find("\nfn ")
+                .map_or(src.len(), |o| start + marker.len() + o);
+            let body = &src[start..end];
+            let create = body
+                .find("call_activity_on_create(")
+                .unwrap_or_else(|| panic!("{marker}: no call_activity_on_create"));
+            let post = body
+                .find("call_activity_on_post_create(")
+                .unwrap_or_else(|| panic!("{marker}: no call_activity_on_post_create"));
+            let start_call = body
+                .find("call_activity_on_start(")
+                .unwrap_or_else(|| panic!("{marker}: no call_activity_on_start"));
+            let resume = body
+                .find("call_activity_on_resume(")
+                .unwrap_or_else(|| panic!("{marker}: no call_activity_on_resume"));
+            assert!(
+                create < post && post < start_call && start_call < resume,
+                "{marker}: drive order must be onCreate < onPostCreate < onStart < onResume \
+                 (got create={create} post={post} start={start_call} resume={resume})"
+            );
+        }
+
+        // Both lifecycle drivers must keep the create-phase ordering: the static
+        // `activity_native_start_activity` (matched by its fn signature) and `drive_lifecycle`'s
+        // steps 5–7 (matched by its step-5 onCreate call literal, which begins that driver's span).
+        assert_order(src, "fn activity_native_start_activity<'local>");
+        assert_order(
+            src,
+            "call_activity_on_create(env, &activity, \"step 5 Activity.onCreate\")",
+        );
     }
 
     #[test]
