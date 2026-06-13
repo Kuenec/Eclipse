@@ -5,7 +5,7 @@
 # AOSP-shape NetworkRequest$Builder, foreground RunningAppProcessInfo).
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
-#   classes.dex  = ONLY the patched classes (Build*, NetworkRequest*, ActivityManager*)
+#   classes.dex  = ONLY the patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*)
 #   classes2.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
@@ -60,6 +60,15 @@ awk -v anchor="$anchor" '
     }
 ' "$ATL_SRC/android/os/Build.java" > "$work/gen/android/os/Build.java"
 
+# --- 1b. guard the patched LayoutInflater (<requestFocus/> fix) against silent regression --
+# 2026-06-13: the patch replaces ATL's `throw "<requestFocus /> not supported atm"` in rInflate
+# with parseRequestFocus(parser, parent) (consume-and-skip; the engine owns input focus headlessly).
+# Fail loudly if that fix is ever reverted, mirroring the Build.java anchor guard above.
+li_src="$here/src/android/view/LayoutInflater.java"
+[ -f "$li_src" ] || fail "patched LayoutInflater.java missing at $li_src"
+grep -qF 'parseRequestFocus(parser, parent);' "$li_src" || fail "patched LayoutInflater.java no longer calls parseRequestFocus — the <requestFocus/> fix regressed"
+! grep -qF '<requestFocus /> not supported atm' "$li_src" || fail "patched LayoutInflater.java still throws the old <requestFocus/> 'not supported atm' — the fix regressed"
+
 # --- 2. compile patched sources against the compile-only stubs ---------------------------
 # --release 8: dx 1.x accepts class files <= v52. -Xlint:-options silences the
 # "release 8 is obsolete" note; real warnings still show.
@@ -68,10 +77,11 @@ awk -v anchor="$anchor" '
     "$work/gen/android/os/Build.java" \
     "$here/src/android/net/NetworkRequest.java" \
     "$here/src/android/app/ActivityManager.java" \
-    "$here/src/android/os/PowerManager.java"
+    "$here/src/android/os/PowerManager.java" \
+    "$here/src/android/view/LayoutInflater.java"
 
 # --- 3. stage ONLY the patched classes (stubs must never reach the dex) ------------------
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     cp "$work/classes/"$pattern "$work/stage/$dir/"
