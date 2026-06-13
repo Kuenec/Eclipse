@@ -128,6 +128,43 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🩹 58a50f6 REGRESSION FIXED: the two speculative base-`android.view.View` setters that 58a50f6 added
+  to `register_view_natives` are REMOVED — `View.setBackgroundColor(I)V` and `View.native_keep_screen_on(JZ)V`.** Root
+  cause (PROVEN by the owner's live boot of 58a50f6): `RegisterNatives` is ATOMIC over its whole `NativeMethod` array
+  and rejected the very first new entry — ART logged `jni_internal.cc: Failed to register non-native method
+  android.view.View.setBackgroundColor(I)V as native` → `No such method: no native method "Landroid/view/View;.
+  setBackgroundColor(I)V"`. In the SHIPPED framework `setBackgroundColor(int)` is a PLAIN Java method (the vendored
+  `View.java:1284` `public native void setBackgroundColor(int)` is demonstrably out of sync with the installed dex), so
+  the atomic registration FAILED ENTIRELY and took the lifecycle-critical View natives
+  (`native_constructor`/`native_destructor`/`native_get_window`) down with it — the lifecycle aborted and the process
+  faulted during teardown. `native_keep_screen_on` was never reached (RegisterNatives stopped at the first bad entry),
+  so its shipped native-ness is unverified and the out-of-sync vendored source cannot prove it either; both are left
+  OUT until a live boot proves the shipped framework declares them native. Neither was needed for progress — the boot
+  reached `ActivityNativeMain.onCreate` WITHOUT them before 58a50f6. FIX (surgical, src/framework.rs only, 25 ins / 126
+  del): dropped both consts (name+sig), both fn bodies (`view_set_background_color_no_handle`, `view_keep_screen_on`),
+  both `NativeMethod` array entries, the `info!` log mentions, and the two pin-test assertions; added a dated guard
+  comment in the consts cluster, in `register_view_natives`, and in the pin test so neither is reintroduced without a
+  live-boot proof. The kept pre-existing `native_setBackgroundColor(JI)V` `(JI)V` binding and ALL 58a50f6 widget-class
+  setters/constructors are intact and untouched. Regression guard: the existing
+  `widget_property_setter_names_sigs_and_classes_match_overlay` pin test now carries the dated NOTE that these two are
+  intentionally unbound; the dropped assertions + the in-code dated comments are the smallest guard tied to the proven
+  root cause (a future reintroduction must again pass an atomic RegisterNatives the shipped dex rejects). **⇐ START
+  HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): with the two bad entries gone, expect
+  `register_view_natives` to register CLEANLY again — NO `NoSuchMethod`/`Failed to register non-native method` on
+  `android.view.View`, the View natives (`native_constructor`/`native_destructor`/`native_get_window`) bound — and the
+  boot to reach `ActivityNativeMain.onCreate` with the widget property setters working (`ProgressBar.native_setIndeterminate`
+  bound, no `UnsatisfiedLinkError`). Then capture the NEXT unbound native one at a time (pure log observation, no binary
+  inspection; expected from the leftUnbound set: a return-driving getter like `SeekBar.native_getProgress`/
+  `EditText.native_getText`, an `isChecked()`/`setChecked()` pair, a listener registration, or the next class on the
+  inflate→attach→surface path). The standing next FRONTIER is the SCOPED surface-to-engine render wiring from
+  `2194f02`'s §6 plan: wire `EngineNativeWindow::new` + `register_wsi_window`/`set_engine_window_geometry` into
+  `graphics.rs::run_windowed` + present-loop ownership handoff + JNI-dispatch `SurfaceView.surfaceCreated()`/
+  `surfaceChanged()` once the WSI surface is live — designed AFTER the live boot reveals the post-layout call chain
+  (libroblox-internal RUNTIME behavior, NOT first-party-determinable, NOT to be obtained by reverse-engineering
+  libroblox.so).** Gate: **552 unit + 4 integration (live milestone subprocesses, 0 SKIP) + 2 doctests = 558 passed,
+  0 failed**, fmt/clippy `-D warnings`/release (8,897,128-byte artifact) all 0-warning. Detail: §6 (2026-06-13
+  58a50f6-regression entry).
 - **2026-06-13 — 🎚️ INFLATABLE `android.widget.*` PROPERTY SETTERS BOUND (one pass) — the per-widget setter
   `UnsatisfiedLinkError` churn after construction is closed; `ProgressBar.native_setIndeterminate` (the trigger) and
   the rest of the widget-set property setters resolve.** Following the View-subclass `native_constructor` batch
@@ -157,8 +194,12 @@ before any history-rewriting/force operation.
   Regression guard: NEW `widget_property_setter_names_sigs_and_classes_match_overlay` (mirrors
   `view_subclass_constructor_classes_are_slashed_internal_names`) pins the exact slashed class internal names +
   method name/JNI descriptors for every newly bound setter (incl. the two base-View setters), so a dropped class or a
-  transcribed-wrong name/sig — which re-introduces the one-per-boot `UnsatisfiedLinkError` — fails CI. **⇐ START HERE
-  NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  transcribed-wrong name/sig — which re-introduces the one-per-boot `UnsatisfiedLinkError` — fails CI. **[START-HERE
+  marker moved 2026-06-13 to the regression-fix entry at the TOP of §5 — note (a) below was PROVEN by the owner's live
+  boot of 58a50f6: the two NEW base-View setters DID break `register_view_natives` (atomic RegisterNatives rejected the
+  shipped `setBackgroundColor(I)V` as non-native), so both were removed; note (b)'s pre-existing `(JI)V` binding
+  remains untouched and is still the standing separate-cleanup flag.]** (the plan was = OWNER live validation on the
+  dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
   `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): confirm `ProgressBar.native_setIndeterminate`
   no longer trips `UnsatisfiedLinkError` and `ActivityNativeMain`'s `LayoutInflater` builds the FULL content view /
   `onCreate` proceeds further toward RESUMED, then capture the NEXT unbound native one at a time (expected from the
@@ -174,10 +215,12 @@ before any history-rewriting/force operation.
   RegisterNatives array — confirm it still registers cleanly (no `NoSuchMethodError` on `android.view.View`) under the
   installed stock dex; (b) the pre-existing `native_setBackgroundColor(JI)V` binding targets a method the current
   vendored `View.java` no longer declares (only the `(I)V` form at line 1284 exists) — pre-existing, NOT regressed
-  here, flagged for a separate cleanup if a boot log shows a `NoSuchMethodError`/`No implementation` on it.)**
+  here, flagged for a separate cleanup if a boot log shows a `NoSuchMethodError`/`No implementation` on it.)
   Gate: **552 unit + 4 integration (live milestone subprocesses, 0 SKIP) + 2 doctests = 558 passed, 0 failed**
   (+1 unit: the pin test), fmt/clippy `-D warnings`/release all 0-warning. Detail: §6 (2026-06-13 widget
-  property-setter entry).
+  property-setter entry). [SUPERSEDED in part 2026-06-13 by the regression-fix entry above: the two base-View setters
+  this entry added were removed; the gate count is unchanged because the fix dropped assertions inside the existing pin
+  test, not a whole test.]
 - **2026-06-13 — 🧩 INFLATABLE `android.widget.*` VIEW-SUBCLASS `native_constructor` BATCH BOUND (8 classes, one pass)
   — the one-class-per-boot `UnsatisfiedLinkError` churn at `LayoutInflater.inflate` is closed for the widget set.**
   Owner live validation of the SurfaceView bind (`/tmp/eclipse-surfaceview-validate.log`, EXIT=124 clean) proved
@@ -2547,6 +2590,49 @@ binding in `register_view_natives` targets a method the current vendored `View.j
 widget classes), but if a live log ever shows a `NoSuchMethodError`/`No implementation` on `native_setBackgroundColor`,
 reconcile that dead binding to the shipped overlay in a separate cleanup pass. *Files:* `src/framework.rs`. *No
 subagent live boot.*
+
+---
+
+- **2026-06-13 — 🩹 58a50f6 REGRESSION FIXED — the two speculative base-`android.view.View` setters added by 58a50f6
+  are removed from `register_view_natives`.** This resolves the prior (2026-06-13 widget property-setter) entry's
+  *OWNER-RUN DATA NEEDED (3)* — "confirm `register_view_natives` still registers cleanly now that `setBackgroundColor(I)V`
+  + `native_keep_screen_on(JZ)V` joined that all-or-nothing array under the installed stock dex." **It did NOT.** ROOT
+  CAUSE (PROVEN by the owner's live boot of 58a50f6, NOT a subagent — pure log observation): JNI `RegisterNatives` is
+  ATOMIC over its entire `NativeMethod` array; ART validates each entry against the class's declared methods FIRST and
+  aborts the whole array on the first mismatch. The very first new entry, `View.setBackgroundColor(I)V`, is a PLAIN
+  Java method in the SHIPPED framework (not native), so ART logged `jni_internal.cc: Failed to register non-native
+  method android.view.View.setBackgroundColor(I)V as native` → `No such method: no native method "Landroid/view/View;.
+  setBackgroundColor(I)V"` and rejected the ENTIRE `register_view_natives` array. That took the lifecycle-critical
+  base-View natives down with it — `native_constructor`/`native_destructor`/`native_get_window` never registered — so
+  the lifecycle drive aborted and the process faulted during teardown. (The vendored `View.java:1284` `public native
+  void setBackgroundColor(int)` is demonstrably out of sync with the installed dex; the source cannot be trusted to
+  decide the shipped native/non-native split. `native_keep_screen_on(JZ)V` was never reached — RegisterNatives stopped
+  at the first bad entry — so its shipped native-ness is likewise unverified.) FIX (surgical, `src/framework.rs` only,
+  25 insertions / 126 deletions): removed the two consts (`VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_NAME`/`_SIG`,
+  `VIEW_KEEP_SCREEN_ON_NAME`/`_SIG`), the two fn bodies (`view_set_background_color_no_handle`, `view_keep_screen_on`),
+  the two `NativeMethod::from_raw_parts` array entries in `register_view_natives`, their mentions in the `info!`
+  registration log, and the two assertions in the `widget_property_setter_names_sigs_and_classes_match_overlay` pin
+  test. Added a dated `2026-06-13` guard comment in three places (the consts cluster, the `register_view_natives`
+  array, and the pin test) recording the live-log evidence so neither setter is reintroduced without a live boot
+  proving the shipped framework declares it native. NOT TOUCHED (intact): the pre-existing `native_setBackgroundColor(JI)V`
+  `(JI)V` binding (still the separate-cleanup flag from the prior entry) and ALL 58a50f6 widget-class
+  constructors/property setters. WHY THIS IS THE ROOT-CAUSE FIX, not a workaround: the boot reached
+  `ActivityNativeMain.onCreate` WITHOUT either setter before 58a50f6, so neither is required for progress; the durable
+  correct state is to bind ONLY methods the shipped framework actually declares native, and the atomic-RegisterNatives
+  contract makes a single non-native entry fatal to the whole class — so the speculative entries were the defect, and
+  removing them restores correct registration. REGRESSION GUARD: the existing pin test
+  `widget_property_setter_names_sigs_and_classes_match_overlay` now carries the dated NOTE that these two are
+  intentionally unbound; reintroducing either would have to re-add an array entry that the shipped dex's atomic
+  RegisterNatives rejects (caught at the next live boot) — and the in-code dated comments document the live evidence
+  for any future reader. GATE (re-run on the merged working tree): `cargo fmt --all -- --check` clean; `cargo build
+  --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings;
+  `cargo test` **552 unit + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP, exact success markers) +
+  2 doctests = 558 passed, 0 failed** (unit count unchanged at 552 — the fix dropped assertions inside the existing pin
+  test, not a whole test; `widget_property_setter_names_sigs_and_classes_match_overlay` 1 passed); `cargo build
+  --release` clean (artifact `/home/kue/Projects/Eclipse/target/release/eclipse`, 8,897,128 bytes). *Did NOT live-boot
+  ART (no `cargo run`/`__*` subcommands) and did NOT inspect any binary — the regression mechanism is the owner's
+  already-captured live log of 58a50f6; the fix is first-party source + the green gate.* *Files:* `src/framework.rs`,
+  `AGENTS.md`. *No subagent live boot.*
 
 ---
 

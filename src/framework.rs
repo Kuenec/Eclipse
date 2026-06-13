@@ -4424,25 +4424,21 @@ const VIEW_NATIVE_GET_WINDOW_SIG: &JNIStr = jni_str!("(J)Landroid/view/Window;")
 const VIEW_NATIVE_DESTRUCTOR_NAME: &JNIStr = jni_str!("native_destructor");
 const VIEW_NATIVE_DESTRUCTOR_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-06-13: `View.setBackgroundColor(int)` is itself a native (View.java line 1284,
-// `public native void setBackgroundColor(int color);`) — an INSTANCE native that takes only the ARGB
-// color and reads the receiver's [`view_registry`] handle off `this.widget`, descriptor `(I)V`.
-// (Distinct from the pre-existing `native_setBackgroundColor(long, int)` `(JI)V` binding above, a
-// separate legacy entry; the current vendored View.java declares only this `(I)V` form, called from
-// View.java line 975 when a ColorDrawable background is applied.) Records the solid background
-// color on the peer (renderer-consumed, real fidelity) — the same state `view_registry::set_background_color`
-// already backs.
-const VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_NAME: &JNIStr = jni_str!("setBackgroundColor");
-const VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_SIG: &JNIStr = jni_str!("(I)V");
-
-// 2026-06-13: `View.setKeepScreenOn(boolean)` calls `native_keep_screen_on(widget, screenOn)` to keep
-// the device screen awake while attached (View.java lines 1982-1986). `View.java` line 1982 declares
-// `private static native void native_keep_screen_on(long widget, boolean keepScreenOn);` → a STATIC
-// native, descriptor `(JZ)V`. Eclipse's host has no Android screen-wake concept (the desktop window's
-// power state is the compositor's concern, not the Android View's) and no native getter reads it back,
-// so the honest backing validates the view handle and no-ops (mirrors `nativeSetFullscreen`).
-const VIEW_KEEP_SCREEN_ON_NAME: &JNIStr = jni_str!("native_keep_screen_on");
-const VIEW_KEEP_SCREEN_ON_SIG: &JNIStr = jni_str!("(JZ)V");
+// 2026-06-13: `View.setBackgroundColor(int)` and `View.native_keep_screen_on(long, boolean)` are NOT
+// RegisterNatives-bound here. Commit 58a50f6 added bindings for both citing the *vendored* View.java
+// (line 1284 `public native void setBackgroundColor(int color);`, line 1982 `private static native
+// void native_keep_screen_on(long, boolean)`), but the live boot at 58a50f6 proved the *shipped*
+// framework disagrees with the vendored source: ART rejected the very first entry with
+// `jni_internal.cc: Failed to register non-native method android.view.View.setBackgroundColor(I)V as
+// native` → `No such method: no native method "Landroid/view/View;.setBackgroundColor(I)V"`. In the
+// installed framework `setBackgroundColor(int)` is a PLAIN Java method, so RegisterNatives — which is
+// atomic over the whole array — failed entirely and took the lifecycle-critical View natives
+// (native_constructor/native_destructor/native_get_window) down with it, aborting the boot.
+// `native_keep_screen_on` was never reached (RegisterNatives stopped at the first bad entry), so its
+// shipped native-ness is unverified; because the vendored source is demonstrably out of sync with the
+// shipped native/non-native split here, it cannot be trusted as proof either. The boot reached
+// `ActivityNativeMain.onCreate` WITHOUT either binding before 58a50f6, so neither is required for
+// progress — both are left out until a live boot proves the shipped framework declares them native.
 
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
@@ -4926,83 +4922,6 @@ extern "system" fn view_native_destructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.setBackgroundColor(int color)` → record the solid ARGB background color on the receiver's
-/// [`view_registry`] peer (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void with descriptor `(I)V` — no widget param; the receiver's
-/// [`view_registry`] handle is read off `this.widget` (like [`text_view_native_set_text`]). `color` is
-/// `Color.argb`/`0xAARRGGBB`. Records it through the bounds+generation-checked
-/// [`view_registry::set_background_color`] (a bad handle is logged + ignored, never UB); the renderer's
-/// layout pass fills the view's rect with this color (real fidelity, the same consumer as the
-/// `(JI)V` form). Surfaced for the inflatable widget set — `View.java` line 1284 declares it native.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
-extern "system" fn view_set_background_color_no_handle<'local>(
-    mut env: EnvUnowned<'local>,
-    this: JObject<'local>,
-    color: jint,
-) {
-    env.with_env(|env| -> jni::errors::Result<()> {
-        let widget = view_widget_handle(env, &this);
-        match view_registry::set_background_color(widget, color) {
-            Ok(()) => tracing::trace!(
-                target: "android.view.View",
-                widget,
-                color = format_args!("0x{:08x}", u32::from_ne_bytes(color.to_ne_bytes())),
-                "View.setBackgroundColor: recorded background color on view peer"
-            ),
-            Err(e) => tracing::debug!(
-                target: "android.view.View",
-                widget,
-                error = %e,
-                "View.setBackgroundColor: invalid view handle (ignored)"
-            ),
-        }
-        Ok(())
-    })
-    .resolve::<LogErrorAndDefault>()
-}
-
-/// `View.native_keep_screen_on(long widget, boolean keepScreenOn)` → validate the handle; no-op
-/// (no Android screen-wake concept on the host window, 2026-06-13).
-///
-/// JNI ABI: a STATIC native returning void (`(JZ)V`; jni 0.22 maps `jboolean` to Rust `bool`). `widget`
-/// is the view's [`view_registry`] handle. Validates it through the bounds+generation-checked
-/// [`view_registry`] (a bad handle is logged + ignored, never UB) and no-ops: keeping the device screen
-/// awake is the compositor's/host's concern, not the Android View's, and no native getter reads it back.
-/// Surfaced for the inflatable widget set — `View.java` line 1982 declares it native static.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic. Static native: receiver is the `JClass`, taken but unused.
-extern "system" fn view_keep_screen_on<'local>(
-    mut env: EnvUnowned<'local>,
-    _class: JClass<'local>,
-    widget: jlong,
-    keep_screen_on: jboolean,
-) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
-        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
-            tracing::debug!(
-                target: "android.view.View",
-                widget,
-                keep_screen_on,
-                error = %e,
-                "View.native_keep_screen_on: invalid view handle (ignored)"
-            );
-        } else {
-            tracing::trace!(
-                target: "android.view.View",
-                widget,
-                keep_screen_on,
-                "View.native_keep_screen_on: validated handle, no-op (no host screen-wake concept)"
-            );
-        }
-        Ok(())
-    })
-    .resolve::<LogErrorAndDefault>()
-}
-
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -5129,26 +5048,10 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_destructor as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `view_set_background_color_no_handle` matches the paired `(I)V` signature as an
-        // instance native (View.java line 1284, `public native void setBackgroundColor(int)`); the
-        // cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_NAME,
-                VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_SIG,
-                view_set_background_color_no_handle as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_keep_screen_on` matches the paired `(JZ)V` signature as a STATIC native
-        // (View.java line 1982, `private static native void native_keep_screen_on(long, boolean)`); the
-        // cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_KEEP_SCREEN_ON_NAME,
-                VIEW_KEEP_SCREEN_ON_SIG,
-                view_keep_screen_on as *mut std::ffi::c_void,
-            )
-        },
+        // 2026-06-13: NO `setBackgroundColor(I)V` / `native_keep_screen_on(JZ)V` entries here — the
+        // shipped framework's `setBackgroundColor(int)` is plain Java, not native, so RegisterNatives
+        // (atomic over this array) rejected it and aborted the whole class binding at 58a50f6. See the
+        // consts comment near `VIEW_SET_ON_CLICK_LISTENER_NAME` for the live-log evidence.
     ];
     // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
@@ -5158,7 +5061,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + setBackgroundColor + native_keep_screen_on"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor"
     );
     Ok(())
 }
@@ -11625,15 +11528,11 @@ mod tests {
             "native_removeView"
         );
         assert_eq!(VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG.to_str(), "(JJ)V");
-
-        // The two base-View property setters this pass added (View.java:1284 / :1982).
-        assert_eq!(
-            VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_NAME.to_str(),
-            "setBackgroundColor"
-        );
-        assert_eq!(VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_SIG.to_str(), "(I)V");
-        assert_eq!(VIEW_KEEP_SCREEN_ON_NAME.to_str(), "native_keep_screen_on");
-        assert_eq!(VIEW_KEEP_SCREEN_ON_SIG.to_str(), "(JZ)V");
+        // 2026-06-13: NOTE — base-View `setBackgroundColor(I)V` / `native_keep_screen_on(JZ)V` are
+        // intentionally NOT pinned/bound here. The shipped framework's `setBackgroundColor(int)` is
+        // plain Java (live boot at 58a50f6: `Failed to register non-native method
+        // android.view.View.setBackgroundColor(I)V as native`), which aborted the atomic
+        // RegisterNatives for the whole View class; see `register_view_natives` for the removal.
     }
 
     #[test]
