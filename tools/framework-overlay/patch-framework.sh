@@ -6,7 +6,7 @@
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
 #   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*)
-#   classes2.dex = smali-patched View (+ View$OnCapturedPointerListener) + Display + Activity + Fragment = installed classes + AOSP gaps
+#   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + Vibrator = installed classes + AOSP gaps
 #   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
@@ -136,6 +136,14 @@ n="$(grep -cF '.method public getRefreshRate()F' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali getRefreshRate anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public getRefreshRate\(\)F.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP Display.getSupportedRefreshRates() (Roblox queries it in Activity.onStart for framerate setup; ATL omits it). Returns {60.0f} to match getRefreshRate above.\n.method public getSupportedRefreshRates()[F\n    .locals 3\n\n    const/4 v0, 0x1\n\n    new-array v0, v0, [F\n\n    const/4 v1, 0x0\n\n    const/high16 v2, 0x42700000    # 60.0f\n\n    aput v2, v0, v1\n\n    return-object v0\n.end method\n}s' "$dsm"
 grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali getSupportedRefreshRates insert failed (drift?)"
+# Display.getMode() -> Display$Mode — Roblox queries it in ActivityNativeMain.onResume startup; ATL omits
+# both getMode and the Mode nested class. Build a Display$Mode (committed smali, assembled below) from the
+# installed Display's window_width/window_height statics + 60.0f. Anchor on the unique getWidth()I method.
+n="$(grep -cF '.method public getWidth()I' "$dsm")" || true
+[ "$n" = "1" ] || fail "Display.smali getWidth anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
+! grep -qF 'getMode()Landroid/view/Display$Mode;' "$dsm" || fail "Display.smali already declares getMode — installed Display drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public getWidth\(\)I.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP Display.getMode() (Roblox onResume startup; ATL omits it + Display\$Mode). Build a Mode from window_width/window_height + 60.0f (consistent with getWidth/getHeight/getRefreshRate).\n.method public getMode()Landroid/view/Display\$Mode;\n    .locals 5\n\n    new-instance v0, Landroid/view/Display\$Mode;\n\n    const/4 v1, 0x0\n\n    sget v2, Landroid/view/Display;->window_width:I\n\n    sget v3, Landroid/view/Display;->window_height:I\n\n    const/high16 v4, 0x42700000    # 60.0f\n\n    invoke-direct {v0, v1, v2, v3, v4}, Landroid/view/Display\$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n}s' "$dsm"
+grep -qF 'getMode()Landroid/view/Display$Mode;' "$dsm" || fail "Display.smali getMode insert failed (drift?)"
 
 # 2026-06-13: androidx create-phase ON_CREATE dispatch. Roblox's ActivityNativeMain extends androidx
 # ComponentActivity, whose LifecycleRegistry must receive Lifecycle.Event.ON_CREATE during the
@@ -180,13 +188,26 @@ ANCHOR_PC="$ANCHOR_PC" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_PC}) >= 0) ? 
 perl -0pi -e 's{\.method protected onPostCreate\(Landroid/os/Bundle;\)V\n    \.registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i\(Ljava/lang/String;Ljava/lang/String;\)I\n\n    return-void\n\.end method}{.method protected onPostCreate(Landroid/os/Bundle;)V\n    .registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i(Ljava/lang/String;Ljava/lang/String;)I\n\n    # ECLIPSE PATCH 2026-06-13: dispatch Fragment.onActivityCreated(savedInstanceState) (AOSP create-\n    # phase hook ATL omits) so androidx ReportFragment fires Lifecycle.Event.ON_CREATE while the\n    # LifecycleRegistry is at CREATED, BEFORE onStart dispatches ON_START. Eclipse drives onPostCreate\n    # between onCreate and onStart, after the onCreate super-chain has injected the ReportFragment.\n    iget-object v0, p0, Landroid/app/Activity;->fragments:Ljava/util/List;\n\n    invoke-interface \{v0\}, Ljava/util/List;->iterator()Ljava/util/Iterator;\n\n    move-result-object v1\n\n    :goto_pc\n    invoke-interface \{v1\}, Ljava/util/Iterator;->hasNext()Z\n\n    move-result v0\n\n    if-eqz v0, :cond_pc\n\n    invoke-interface \{v1\}, Ljava/util/Iterator;->next()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, Landroid/app/Fragment;\n\n    invoke-virtual \{v0, p1\}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V\n\n    goto :goto_pc\n\n    :cond_pc\n    return-void\n.end method}s' "$asm"
 grep -qF 'invoke-virtual {v0, p1}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V' "$asm" || fail "Activity.smali onPostCreate dispatch insert failed (drift?)"
 
-# assemble the patched View + nested interface + patched Display + Activity + Fragment -> classes2.dex
-mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app"
+# Vibrator.cancel() no-op — Roblox calls it on a Timer thread (caught by its own handler, non-fatal noise);
+# ATL's Vibrator (hasVibrator/vibrate only) omits it. Eclipse has no vibration device, so cancel is a no-op,
+# matching the no-vibration-device backing. Anchor on the unique vibrate(J)V.
+vibsm="$work/smali/android/os/Vibrator.smali"
+[ -f "$vibsm" ] || fail "Vibrator.smali not found after baksmali"
+n="$(grep -cF '.method public vibrate(J)V' "$vibsm")" || true
+[ "$n" = "1" ] || fail "Vibrator.smali vibrate(J)V anchor not unique (found $n, expected 1) — installed Vibrator drifted; update patch-framework.sh"
+! grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali already declares cancel — installed Vibrator drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public vibrate\(J\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP Vibrator.cancel() no-op (Roblox calls it on a Timer thread; ATL omits it). No vibration device -> nothing to cancel.\n.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$vibsm"
+grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali cancel insert failed (drift?)"
+
+# assemble View(+nested) + Display(+Mode) + Activity + Fragment + Vibrator -> classes2.dex
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/os"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
+cp "$here/smali/android/view/Display\$Mode.smali" "$work/smali-view/android/view/"
 cp "$asm" "$work/smali-view/android/app/Activity.smali"
 cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
+cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
 # --- 4c. stock api-impl as classes3.dex; compose the 3-dex overlay jar --------------------
