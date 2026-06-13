@@ -79,6 +79,10 @@ pub enum ImportCategory {
     Pthread,
     /// `dlfcn` (`dlopen`/`dlsym`/`dlerror`/`dladdr`) — must route to Eclipse's **own** loader, not
     /// host `dlopen` (host `dlopen` would load host ELF, not bionic objects). Host = baseline only.
+    /// 2026-06-12 (core 1223806): `dladdr` + `dl_iterate_phdr` ARE now Eclipse natives
+    /// (`module_registry` — the host walk/lookup is blind to Eclipse-mapped modules, which made
+    /// every engine C++ throw a fatal std::terminate loop); `dlopen`/`dlsym`/`dlclose`/`dlerror`
+    /// remain the recorded host-baseline loading gap this classification documents.
     Dl,
     /// C++ runtime hooks (`__cxa_atexit`/`__cxa_finalize`/`__cxa_thread_atexit_impl`) — bionic-owned
     /// atexit/finalize semantics; host has them but with glibc semantics (baseline only).

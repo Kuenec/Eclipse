@@ -128,6 +128,51 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-12 — ✅ CORE 1223806 ROOT-CAUSED + FIXED (owner live validation of `ddabcd7`,
+  `/tmp/eclipse-947663-validate.log`, EXIT=139 → core 1223806 124.7 M — the 947663 thread-exit fix is RUN-PROVEN
+  (recurrence discriminator CLEAN); this death was a NEW, SILENT mechanism):** libroblox's statically-linked libc++abi
+  unwinder resolves FDEs via its `dl_iterate_phdr@LIBC` import, which Eclipse never provided — host glibc's walk is
+  BLIND to Eclipse's anonymously-mmapped images, so EVERY C++ throw in libroblox was uncatchable: phase-1 unwind → no
+  FDE → `std::terminate` → Roblox's terminate handler re-raises to classify → a 3-frame cycle repeated **61,497×**
+  consuming 12.2 MB of stack, entered on the engine HTTP worker's DNS-failure error path. The actual KILL was a kernel
+  `force_sigsegv()` (NT_SIGINFO `si_code=128` SI_KERNEL, `si_addr=0x0`): signal-frame setup targeted a
+  registered-but-UNWRITABLE `SA_ONSTACK` altstack (owner UNPROVEN — kernel-only state; lead suspect = an
+  engine-registered altstack later decommitted, e.g. a mimalloc PROT_NONE purge), handler reset to SIG_DFL, ZERO
+  handler bytes ran — the complete explanation of why BOTH reporters (tap + crashpad) were silent. THIRD mechanism:
+  `android.os.Vibrator.native_constructor()` `UnsatisfiedLinkError` escaped `Looper.loop` 17 ms before death — the
+  main Looper pump was permanently dead (splash init unreachable that boot regardless). FIXES: (1) Eclipse-owned
+  bionic `dl_iterate_phdr` + same-class `dladdr` (NEW `src/loader/module_registry.rs`; every loader-mapped image
+  registered in `engine.rs` BEFORE any engine instruction, Drop-symmetric unregistration; one fix covers all 4
+  importing engine libs); (2) `android.os.Vibrator` FULL declared native set bound in `src/framework.rs`
+  (`native_constructor()I` → −1 documented no-vibration-device constant, `native_vibrate(IJ)V` logged no-op —
+  intentional capability handling; NO catch-and-continue in the pump); (3) sigaltstack OBSERVABILITY: Eclipse-owned
+  translating native (layout-identical forward; `src/loader/sigaltstack_shim.c` captures the caller) logs
+  tid/ss_sp/ss_size/ss_flags + caller-module attribution into a 64-entry ring — coverage = bionic-import-routed calls
+  ONLY (an EMPTY ring for a dying tid implicates a host-side registrant, most likely ART's attach-time altstack — the
+  866509 open item — not an attribution bug). Counts: provider **125 base / 183 total** (+3). ALSO: the engine curl
+  `ecsv2.roblox.com` NXDOMAIN is NOT environmental (the host resolves it; the SAME process's Java/okhttp path
+  succeeded 7 s earlier) — RECLASSIFIED as a suspected Eclipse resolver-ABI gap (libroblox imports
+  getaddrinfo/freeaddrinfo/gai_strerror/getnameinfo, Eclipse provides none; bionic vs glibc `addrinfo` field order /
+  `AI_*` / `EAI_*` diverge) — diagnostics-first, a future blocker once gameplay traffic runs on the engine path.
+  STRAWTOGRASP/`SocketImpl.delegate` CLOSED as benign-by-design (wolfssljni dual-shape probe; never a death marker).
+  **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>`
+  with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: the DNS-failure throw becomes
+  a CAUGHT, logged HttpError with a retry (`numberOfTimesRetried` increments; NO 3-frame terminate loop); the main
+  Looper pump SURVIVES past `InitHelper` (the Vibrator no-vibration-device registration line prints; no `main Looper
+  pump failed`); `eclipse.sigaltstack` attribution lines name every engine altstack registrant; tap/crashpad still
+  book-keep first-chance ART signal-11s. If an engine throw STILL terminates → suspect the unwinder's secondary
+  lookups (dladdr-based / `__gnu_Unwind`) — capture the core, do not iterate blind. On any recurrence of a silent
+  SI_KERNEL/addr=0 kill: capture the fresh core FIRST — the ring + core together name the stack owner (empty ring for
+  the dying tid = host-side/ART registrant). KEEP core 1223806 + `~/.cache/eclipse-forensics/core1223806` +
+  `/tmp/core1223806-*` + `/tmp/t1stack.bin` until this validation passes; core 947663 + its scratch are RELEASED
+  (discriminator clean). After validation: the render-integration build — wire the window's `ANativeWindow` into the
+  engine's `AndroidGLView`/EGL path; the dormant pre-load surfaces (libimage_processing_util_jni 5 /
+  librenderscript-toolkit 3) remain the recorded design item.)** Untriaged non-blocking boot observations recorded,
+  evidence-first (§6): the ~7.4 s `ActivitySplash.onCreate` stall + 4× `Resource is not a Drawable` WARNs; the
+  `AssetManager.destroy()` STUB → dictionary `readAsset` IOException regression vs 06-11; the `Couldn't find any
+  tzdata file!` ART env gap; `CrashLibFileHelper` nativeLibraryDir miss. Gate: **535 unit + 4 integration (live
+  milestone subprocesses, 0 SKIP) + 2 doctests = 541 passed, 0 failed**, fmt/clippy `-D warnings`/release all
+  0-warning. Detail: §6 (2026-06-12 core-1223806 entry).
 - **2026-06-12 — ✅ CORE 947663 ROOT-CAUSED + FIXED (the engine-thread-exit MIMALLOC fault — Yoshi's open question
   ANSWERED): Eclipse INVERTED bionic's thread-exit destructor order.** `thread_trampoline`/`eclipse_pthread_exit`
   ran the pthread-KEY destructors while `__cxa_thread_atexit_impl` stayed on host glibc (cxa finalizers only later,
@@ -144,8 +189,14 @@ before any history-rewriting/force operation.
   was FALSIFIED by this validation (log line 60: unresolved 2→1, naming exactly `pthread_atfork`; nothing
   boot-mapped defines it) — now a native forwarding to link-time `libc::pthread_atfork`, AND the masking link.rs
   allowlist entry REMOVED so the boot-path pin fails closed; and `ANativeWindow_getFormat` (libsurface_util_jni
-  pre-loads 1/1). Counts: pthread 51→53, ndk 27→28, provider 122 base / 180 total. **⇐ START HERE NEXT SESSION
-  (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  pre-loads 1/1). Counts: pthread 51→53, ndk 27→28, provider 122 base / 180 total. [START-HERE marker moved
+  2026-06-12 to the core-1223806 entry above — this owner live validation HAPPENED:
+  `/tmp/eclipse-947663-validate.log`, EXIT=139 → fresh core 1223806, a NEW mechanism; the recurrence discriminator
+  came back CLEAN on every axis (zero `libroblox+0x2779cc4` frames at this base, zero MAPERR addr=0x58, zero
+  `__call_tls_dtors`/`pthread_exit`/cxa frames across all 76 threads), the old death milestone was crossed at
+  t=8.769 with ~0.32 s of deep multi-thread work beyond it — the cxa-before-keys fix HELD; retention condition
+  satisfied: core 947663 + `~/.cache/eclipse-forensics/core947663` RELEASED] (the plan was = OWNER live validation
+  on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
   `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: the libbacktrace-native pre-load
   WARNING GONE (`unresolved_strong=0`) + `Runtime.nativeLoad: already pre-loaded` for backtrace-native (the apkenv
   delegation closed for the last boot-path lib); libsurface_util_jni pre-loading clean; NO early-fault tap capture
@@ -307,7 +358,10 @@ before any history-rewriting/force operation.
   the engine's `AndroidGLView`/EGL path (the `__gl-test-anw` diagnostic already proves engine-GLES2-on-Eclipse's-window
   works — integration test `gl_test_anw_binds_real_wsi_handle` is green; the boot just doesn't WIRE it yet). **Secondary
   observations (not blocking the window):** ART logs `STRAWTOGRASP: GetFieldID(SocketImpl.delegate) returning NULL` (an
-  ART/libcore networking-internal miss, NOT an Eclipse gap — wolfSSL-backed okhttp sockets do connect/read); the benign
+  ART/libcore networking-internal miss, NOT an Eclipse gap — wolfSSL-backed okhttp sockets do connect/read) [CLOSED
+  2026-06-12: benign-by-design, not a "miss" at all — the sole caller is wolfssljni's dual-shape `setFd` probe for
+  OpenJDK-13+ `DelegatingSocketImpl`, which NULL-checks the fid and ExceptionClears the EXPECTED `NoSuchFieldError`;
+  never a death marker — see §6 core-1223806 entry]; the benign
   `framework-res.apk` dex2oat "no dex files" + `ClassLoaderContext`/duplicate-class warnings; Canvas `nDrawColor` draw
   cascade still disabled (GskCanvas-backed, view quads + text still render). Gate: **516 unit + 4 integration + 2
   doctests**, fmt/clippy `-D warnings`/release all 0-warning. Durability: overlay output is a cache artifact (rebuild via
@@ -1407,6 +1461,230 @@ assert-ran). (i) Recorded-only hazard notes now live in code: `bionic_env.rs` �
 (vasprintf/realpath(..,NULL)/strdup-family return glibc-heap blocks; consistent today, must move TOGETHER with any
 future Eclipse malloc/free displacement) and the bionic-mallinfo 80 B vs glibc 40 B shape note; D2 + D4 dated
 open-item comments sit at the sweep/exit sites in `bionic_pthread.rs`.
+
+---
+
+### 2026-06-12 — Core 1223806 root-caused (the SILENT death past the 947663 wall): missing bionic `dl_iterate_phdr` made every libroblox C++ throw uncatchable (std::terminate re-raise loop ×61,497) and the kill was a kernel `force_sigsegv()` onto an unwritable altstack — zero handler bytes ran (why BOTH reporters were silent); + Vibrator `UnsatisfiedLinkError` killed the main Looper pump; the 947663 fix RUN-PROVEN clean
+
+**Context (owner live validation of `ddabcd7`, `/tmp/eclipse-947663-validate.log`, EXIT=139 → fresh core 1223806,
+124.7 M, PID 1223806):** the boot got FURTHER than ever — guard-paged altstack banner (line 34), libbacktrace-native
+pre-load fully CLEAN (`unresolved_strong=0`, 2 ctors, `JNI_OnLoad 0x10004`) with line 689's `Runtime.nativeLoad:
+already pre-loaded by Eclipse's Rust loader — reporting success (apkenv skipped)` (ddabcd7 mechanisms 2+3
+run-proven), the early ART first-chance signal-11 at 8.469 s book-kept and SURVIVED, Vulkan swapchain active
+(line 626), then ~0.3 s of REAL deep work (WorkManager workers SUCCESS, JobScheduler, real curl HTTP, analytics
+EventUploadJob) — and then a SILENT SIGSEGV: no tap banner, no crashpad `Fatal signal`, the log just ends.
+Forensics on Eclipse's own core via the established-safe `coredumpctl`/`gdb -batch`/`eu-readelf` method (minimal
+disassembly; scratch artifacts `/tmp/core1223806-*` + the 12.8 MB dying-thread stack image `/tmp/t1stack.bin`).
+
+**947663 recurrence check — CLEAN (the cxa-before-keys fix HELD).** The §5 discriminator applied to core 1223806:
+zero frames at `libroblox+0x2779cc4`, zero MAPERR addr=0x58, zero `__call_tls_dtors`/`pthread_exit`/cxa frames
+across all 76 threads (grep = 0 hits over `/tmp/core1223806-{allbt,eustack}.txt`); the old death milestone (the
+`b.<init>`/RbxStorage-DONE pair where core 866509's boot died at engine t=8.670) passed at t=8.769 with ~0.32 s of
+dense multi-thread work beyond it and the tap never firing. The whole 06-12 fix chain (`__sF` → apkenv+altstack →
+thread-exit ordering+pthread_atfork) is now fully live-validated; this boot's death is a NEW mechanism. Retention:
+the 947663 keep-condition is satisfied — its core + `~/.cache/eclipse-forensics/core947663` are RELEASED; core
+1223806 + `~/.cache/eclipse-forensics/core1223806` + `/tmp/core1223806-*` + `/tmp/t1stack.bin` take the
+keep-until-validated slot.
+
+**Mechanism 1 — CONFIRMED Eclipse-side, boot-blocking, FIXED: no bionic `dl_iterate_phdr` ⇒ FDE blindness ⇒ every
+C++ exception thrown in libroblox is process-fatal.** libroblox's statically-linked libc++abi unwinder resolves
+FDEs via its `dl_iterate_phdr@LIBC` import (`nm -D`: `U dl_iterate_phdr@LIBC`, plus `U dladdr@LIBC`,
+`U sigaltstack@LIBC` — re-verified); Eclipse provided no such native (grep over `src/`: zero hits), so the import
+fell through to HOST GLIBC, whose walk covers only glibc's own link map — Eclipse's anonymously-mmapped libroblox
+is invisible (the in-stack callback cursor shows ~0x4f host modules visited, libroblox absent; frame #0 of the
+dying thread is glibc `dl_iterate_phdr`). On the engine HTTP worker's DNS-failure error path (LWP 1226978 =
+0x12b8e2 = the tid of the final engine log line `HttpResponse error:2 HttpError:DnsResolve
+https://ecsv2.roblox.com/timespent/pbe`, log:728) the boot's first C++ throw entered phase-1 unwind → no FDE for
+any libroblox PC → `std::terminate` → Roblox's terminate handler re-raises to classify → unwind fails again: a
+3-frame cycle (`libroblox+0x2bfc7a8`/`+0x2bfc7c6`/`+0x6a9c881`, disassembly-matched field-for-field to libc++abi
+`std::terminate`/`__terminate`, r12 = `kOurExceptionClass` `CLNGC++\0`) repeated **61,497 times** spanning
+12.20 MB of the 24.4 MB stack at 208 B/iter — deterministically fatal by stack exhaustion even absent mechanism 2.
+The consequence is GENERAL, not DNS-specific: under Eclipse, ANY engine throw (which Roblox uses routinely for
+recoverable errors) was process-fatal; on real Android Roblox's own error handling catches the DNS-failure
+exception. **Fix:** NEW `src/loader/module_registry.rs` — `BionicDlPhdrInfo` pins the 8-field bionic LP64
+`dl_phdr_info` (verified against PUBLIC bionic `libc/include/link.h` via aosp-mirror BEFORE coding: identical to
+glibc field-for-field, tail 4 fields API-30+, the size arg versions the struct); `ModuleRecord::for_image` derives
+`dlpi_phdr` the bionic way (PT_PHDR p_vaddr first, else PT_LOAD file-range-containment translation; an uncovered
+table is a typed Err, never a fabricated pointer) plus a sorted defined-dynsym table; `eclipse_dl_iterate_phdr`
+walks Eclipse-mapped modules FIRST (full 64-byte size arg, adds/subs counters, tls_modid 0 — engine libs have no
+PT_TLS) then delegates to host glibc with the caller's callback unchanged (typed extern decl, no transmute),
+honoring the first-nonzero-rc stop; `eclipse_dladdr` (same-class, fixed together) resolves Eclipse-module
+addresses (bionic containment rule: defined, `st_value <= a < st_value+st_size`, zero-size never matches) with
+host `libc::dladdr` fallback for host PCs; `describe_address` is the attribution helper mechanism 2's ring
+consumes. Wiring (`src/loader/engine.rs`): `map_resolve_app_lib` step 5 registers EVERY object of the kept-alive
+`LoadedImageSet` BEFORE returning — i.e. before any engine instruction — and a NEW `impl Drop for LoadedEngine`
+unregisters by load base (body drops before the field drops munmap the set), so the dedup-skip and error paths can
+never leave records pointing at unmapped memory. Registered in `native_provider.rs` (new "bionic link-map
+introspection (2)" section, dated core-1223806 rationale).
+
+**Mechanism 2 — CONFIRMED (the silent kill; NOT a proven Eclipse logic defect — the Eclipse-side gap was
+OBSERVABILITY, which is FIXED; the altstack OWNER stays a bounded unknown):** a signal arrived for the
+terminate-looping thread mid-iteration at `dl_iterate_phdr+18`; the kernel's signal-frame setup targeted the
+thread's registered `SA_ONSTACK` altstack, the WRITE FAULTED (stack unwritable), and the kernel `force_sigsegv()`'d:
+NT_SIGINFO `si_signo=11, si_code=128 (SI_KERNEL), si_addr=0x0`, handler reset to SIG_DFL, instant whole-process
+kill BEFORE any handler byte executed. That fully explains the total silence — tap, crashpad, and ART's chain never
+received control (and the tap's engine-PC filter would have suppressed its banner anyway: RIP was in libc.so.6 —
+answering the carried tap-filter question: extending dump-everything would NOT have changed this outcome; no
+in-process observability can make a force_sigsegv self-report — the coredump IS the report for this class; a
+bounded one-line record for non-engine-PC faults stays optional, not a fix). Proven by elimination: the interrupted
+instruction (`mov %rdi,0x10(%rsp)`) wrote to a stack VMA the core proves RW (memsz==filesz, 24.4 MB) with 12.2 MB
+headroom and pristine zeros below rsp (the kernel never targeted the writable current stack); all 76 threads show
+uniform `sighold <3,10,13>` with empty sigpend — nobody mid-handler; a real memory fault would carry SEGV_MAPERR +
+an address. BOUNDED UNKNOWNS (kernel-only state, not in the core): the inbound signal's identity (consumed at the
+failed delivery; timeout-SIGTERM ruled out by timing/EXIT=139; no thread in raise/abort/tgkill) and WHO registered
+the unwritable altstack — libroblox imports `sigaltstack@LIBC`, which Eclipse deliberately left host-baseline, so
+Eclipse had ZERO attribution; lead suspect = an engine-registered altstack whose backing was later decommitted
+(e.g. mimalloc `mprotect(PROT_NONE)` purge); ART's 32 KiB heap altstack would have been writable. **Fix
+(observability only, per the evidence standard — no logic fix without a proven owner):** the host-baseline
+`sigaltstack` is replaced by an Eclipse-owned translating native: NEW clean-room `src/loader/sigaltstack_shim.c`
+(the established `liblog_shim.c` pattern — stable Rust has no spelling for `__builtin_return_address(0)`) captures
+the caller and tail-calls `eclipse_sigaltstack_record` (`native_provider.rs`): a pure layout-identical forward to
+glibc (bionic/glibc `stack_t` identical on x86-64), then a tracing log + 64-entry `AltstackRegistration` ring
+(tid/ss_sp/ss_size/ss_flags/caller + caller module via the Eclipse module table then host-dladdr fallback; pure
+queries record nothing; kernel rejections logged); accessors `recent_altstack_registrations`/
+`altstack_registration_total`; provider signal natives 6→7. The stale "sigaltstack … stays on the host baseline"
+comments are REWRITTEN with the dated core-1223806 finding (repo-wide grep: zero stale instances remain).
+COVERAGE BOUNDARY (important for the next forensics): the ring sees only bionic-IMPORT-routed registrations —
+Eclipse's own `install_guarded_altstack` calls `libc::sigaltstack` directly, and vendored ART's attach-time
+altstack (the 866509 open item; this core's dying thread was ART-named "Main") goes straight to glibc — so an
+EMPTY ring for a dying tid is itself the discriminator implicating a host-side/ART registrant, NOT evidence that
+no registration happened, and NOT an attribution bug.
+
+**Mechanism 3 — CONFIRMED Eclipse-side, boot-blocking, FIXED: `android.os.Vibrator.native_constructor()`
+`UnsatisfiedLinkError` escaped `Looper.loop` — the main Looper pump was permanently dead 17 ms before the crash.**
+InitHelper's `AsyncTask.onPostExecute` → `ContextImpl.getSystemService` constructed `Vibrator`; its unbound native
+threw out of `Looper.loop` (log:691 `java_vm_ext.cc:1130 No implementation found for int
+android.os.Vibrator.native_constructor()`; log:709–710 `framework lifecycle step failed step="pump Looper.loop"` +
+`main Looper pump failed` at 22:31:28.993) — from that point no main-thread Handler continuation was ever
+dispatched again, so splash init was unreachable that boot regardless of the crash. The loud pump failure is
+CORRECT behavior (it surfaced the gap); the defect was the missing framework native — the established
+discovery-loop class. **Fix (`src/framework.rs`):** the vendored ATL `Vibrator.java` read FIRST — its FULL declared
+native list is exactly two: `native_constructor()I` + `native_vibrate(IJ)V` (both instance; independently verified
+against the ACTUAL boot artifact `framework-patched/api-impl.jar` classes2.dex). `vibrator_native_constructor`
+returns −1 = the documented no-vibration-device constant (ATL's own C backing returns −1 when `/dev/input` has no
+motor; the Java class gates on `fd != -1` itself) — intentional capability handling on a desktop host, dated, NOT a
+fall-through stub; `vibrator_native_vibrate` is a logged no-op (bound so NO path through the class can ever
+re-surface an `UnsatisfiedLinkError` out of `Looper.loop`). `register_vibrator_natives` is wired into
+`drive_lifecycle` after `register_connectivity_natives`, before step 1. Deliberately NO catch-and-continue in
+`pump_main_looper` — the loud failure stays the regression signal for this class.
+
+**STRAWTOGRASP / `SocketImpl.delegate` NULL-jfieldID hypothesis — CONTRADICTED, CLOSED (no fix at any layer;
+supersedes the §5 "ART/libcore networking-internal miss" note, now bracketed):** ruled out by source + artifact +
+log + core. The print is Eclipse's prior instrumentation in vendored ART `GetFieldID`
+(`art/runtime/jni/jni_internal.cc:1649`); the SOLE `delegate` caller in the entire vendored tree is wolfssljni's
+`Java_com_wolfssl_WolfSSLSession_setFd` (`com_wolfssl_WolfSSLSession.c:286–311`) — an upstream dual-shape
+portability probe for OpenJDK-13+ `DelegatingSocketImpl` that NULL-checks the fid, ExceptionClears the EXPECTED
+`NoSuchFieldError` ("we expect it to happen"), and falls back to `Socket.impl`; the NULL fid is never dereferenced
+and the fallback fd lookups exist in the vendored libcore. Class shape: `java.net.SocketImpl` has exactly one
+definer (boot-classpath `core-oj-hostdex.jar`, androguard-proven, no `delegate` anywhere in the hierarchy); the
+framework overlay + APK multidex define ZERO `java.net` classes — no shadowing, no dex-order contest. The line
+occurred 4× this log (3 followed by hundreds of healthy lines) and in the prior 6/6-clean boots; the dying thread
+has zero JNI/wolfssl frames — occurrence #4 merely timestamps the EventUploadJob's TLS setup in flight on a
+parallel thread at kill time. Never re-chase this line as a death marker.
+
+**Engine curl DNS NXDOMAIN — RECLASSIFIED: NOT environmental; suspected Eclipse resolver-ABI gap (UNPROVEN,
+diagnostics-first, deliberately NO code per the `__sF` discipline):** the brief's "host has no network/DNS for it"
+framing is CONTRADICTED — the host resolves `ecsv2.roblox.com` (live `getent` → 128.116.95.3 via
+systemd-resolved) and the SAME PROCESS completed a real Roblox HTTPS round-trip on the Java/okhttp/wolfSSL path
+7 s before the engine curl failed (`Network won the race`/`Network payload stored` log:566/568 vs the engine
+`Could not resolve host` at log:727; telemetry-only this boot — settings loaded via the Java path, boot progress
+was not network-blocked). Suspected mechanism: libroblox imports `getaddrinfo`/`freeaddrinfo`/`gai_strerror`/
+`getnameinfo@LIBC` (nm-verified) and Eclipse provides none, so the bionic-compiled resolver caller runs against
+glibc — and bionic vs glibc publicly diverge on `struct addrinfo` field order (`ai_canonname`/`ai_addr` swapped),
+`AI_*` flag values (bionic `AI_ADDRCONFIG` 0x400 == glibc `AI_NUMERICSERV`), and `EAI_*` signs (bionic positive,
+glibc negative) — the proven `__sF`/`__fread_chk`/sigaction shape-mismatch class on a confirmed import surface.
+UNPROVEN links: whether libroblox's curl actually calls `getaddrinfo` for this request (vs a bundled resolver such
+as c-ares) and which divergence yields the symptom. Next-session diagnostics: re-verify the bionic `netdb.h`
+divergences from public AOSP; minimal nm/strings scan for a bundled resolver (`ares_*`); if the getaddrinfo path
+is confirmed, bionic-shaped translating `getaddrinfo`/`freeaddrinfo` (+ `EAI`/`AI` translation; `getnameinfo` is
+struct-free) is the root-cause fix AND doubles as the attribution diagnostic. This WILL matter once gameplay
+traffic runs on the engine path.
+
+**Untriaged non-blocking boot observations (recorded, evidence-first — measure before binding anything):** the
+~7.4 s `ActivitySplash.onCreate` stall bracketed by 4× `Resource is not a Drawable (color or path)` WARNs
+(string/file-path drawable gap — profile where the time goes first); the `AssetManager.destroy()` STUB →
+compression-dictionary `readAsset` IOException REGRESSION vs 06-11 (it worked fully then — diff the
+`asset_registry` lifecycle around `destroy()`); the `Couldn't find any tzdata file!` ART env gap (sibling of the
+known `java.time` BootstrapMethodError — likely ANDROID_TZDATA/ART env wiring); `CrashLibFileHelper`'s
+nativeLibraryDir miss (Java-side symbolication config — matters once crash reporting is exercised).
+
+**Same-pattern audits:** (module-introspection-blindness class) `nm -D` over ALL 12 cached engine libs:
+`dl_iterate_phdr` is imported by libroblox, libbacktrace-native, libeigen_blas AND librenderscript-toolkit — ONE
+provider-side fix covers all four by construction (the `__sF` precedent shape); `dladdr` libroblox-only; zero
+`dlvsym`/`android_dlopen_ext`/`dl_unwind_find_exidx` imports anywhere. The remaining dl-family imports
+(dlopen/dlsym/dlclose/dlerror) are the LOADING class, not PC/module introspection — the pre-existing recorded
+host-baseline dlfcn gap (`bionic_env.rs`'s `Dl` classification now carries a dated note separating the fixed
+introspection pair from the open loading gap). One adjacent path recorded, not changed: `init_run.rs`'s
+`__run-libroblox-init` diagnostic harness maps libroblox via its own Linker pipeline WITHOUT registry records — a
+throw there still hits the blind walk (diagnostic-only, `_exit(0)`s, and the 3,427 ctors are run-proven
+non-throwing); register-or-document when next touched (carried note (a)). (stale-comment class) repo-wide grep:
+zero remaining "stays on the host baseline" sigaltstack claims; `install_guarded_altstack`'s core-866509 comments
+verified still accurate (they describe the INSTALL, not the import routing). (getSystemService ctor-natives class)
+all 27 service classes ATL's `ContextImpl.getSystemService` constructs were audited: Vibrator is the ONLY one
+whose CONSTRUCTOR invokes a native; six others (WindowManagerImpl, ClipboardManager, SensorManager,
+ConnectivityManager, NotificationManager, LocationManager) declare method-level natives only, which surface as
+their own discovery-loop lines if ever reached — bind on run evidence, no speculative pre-binding.
+
+**Regression pins (existing style — no scripts; the new module's tests live in it):** `module_registry::tests` —
+`dl_phdr_info_layout_matches_glibc` (THE ABI pin: `BionicDlPhdrInfo` size 64 + all 8 field offsets vs
+`libc::dl_phdr_info` — a drift scrambles the engine unwinder's view),
+`for_image_derives_phdr_addr_via_pt_phdr_then_pt_load` (PT_PHDR-wins / PT_LOAD-containment / uncovered-is-Err),
+`dladdr_lookup_finds_containing_module_and_symbol` (bionic containment incl. zero-size-never-matches),
+`eclipse_dladdr_falls_back_to_host_for_host_pcs`, `describe_address_names_module_plus_offset`; `link::tests` —
+`module_registry_enumerates_loader_mapped_and_host_modules` (NEW, the required collecting-callback pin: a REAL
+Linker-mapped fixture module enumerated with correct base/name/phnum + a DEREFERENCED mapped phdr entry + the full
+API-30+ size arg AND ≥1 host module via the glibc delegation; rc-stop contract) and
+`real_libroblox_eclipse_natives_fully_resolve_all_imports` EXTENDED with the fail-closed host-shadowed pin —
+`dl_iterate_phdr`/`dladdr`/`sigaltstack` must resolve through the full Eclipse scope to the EXACT Eclipse-provider
+addresses, with `host_only.resolve(name).is_some()` proving each pin load-bearing (these names were never on the
+88 work-list — the 947663 no-allowlisting lesson; ran LIVE against real libroblox: 88-baseline / 0-work-list /
+623-applied unchanged); `native_provider::tests` — `sigaltstack_native_forwards_and_records_caller_attribution`
+(registers through the C shim, kernel round-trip via `sigaltstack(NULL,&ss)`, attribution names this tid + a
+shim-captured caller resolved to a module, pure query records nothing, full save/restore hygiene) + the
+presence/count test UPDATED (125 base + 53 pthread + 5 sysconf = 183; the 3 new names listed); `framework::tests`
+— `vibrator_native_names_sigs_and_class_match_vibrator_java` (class/name/sig pins for BOTH declared natives = the
+full-list count pin, matched against the exact ART-reported line at log:691).
+
+**Gate (run on this exact tree; genuine rebuilds forced via `cargo clean -p eclipse` / `--release` per gate
+precedent; logs `/tmp/gate-{build,clippy,test,release}.log`):** fmt --all (+ `--check`) / build --all-targets /
+clippy `-D warnings` / test / release — **535 unit + 4 integration + 2 doctests = 541 passed, 0 failed**, 0 SKIP
+(the 4 milestone tests ran their LIVE milestone subprocesses against the default APK + displays — this host's
+documented norm; none boots ART; the constructor milestone matched `ALL 3427/3427 constructors completed without a
+crash`), all 0-warning. No live ART/bionic boot was run in the workflow (dev-host boundary respected); the live
+validation expectations are the §5 START-HERE.
+
+**Docs ledger:** `docs/bionic-env-worklist.md` brought current in this commit (closes the 947663 entry's carried
+note (d)): the scope note now records the beyond-list growth through `pthread_atfork`/`ANativeWindow_getFormat`
+(122/180) to the 3 new natives (**125 base / 183 total**), and the stale cxa-runtime / dl table rows carry dated
+brackets (`__cxa_thread_atexit_impl` Eclipse-tier since core 947663; `dl_iterate_phdr`/`dladdr` Eclipse-owned
+since core 1223806; dlopen-family = the open loading gap).
+
+**Carried non-blocking review notes (recorded, not acted on):** (a) the `init_run.rs` harness registry gap above —
+register `ModuleRecord`s there (the image lives until `_exit`) or add a dated deliberate-skip comment when next
+touched. (b) `module_registry.rs`'s MODULES doc overclaims std `RwLock` recursive-read safety (std disclaims it: a
+queued writer can deadlock a re-entrant read); exposure is theoretical (no realistic unwinder callback re-enters;
+write windows are boot-time pushes) — correct the comment (or walk a snapshot) when next touched; the same lock is
+reachable from crashpad-style in-handler unwinds (bionic/glibc loader-lock-equivalent semantics, not worse — check
+this lock first in any future hung-crash-dump triage). (c) `dladdr_lookup`'s `s.value + s.size` is an unchecked
+u64 add over APK-supplied dynsym fields — a crafted symbol panics in DEBUG builds across the FFI boundary (release
+wraps fail-safe); switch to `checked_add` when next touched. (d) `for_image` trusts PT_PHDR's `p_vaddr` without
+span-containment validation (bionic-identical trust; the real artifact is well-formed — PT_PHDR at 0x40 inside the
+first R E PT_LOAD); a one-line guard or docstring softening when next touched. (e) Eclipse-modules-first walk
+order: callbacks no longer see the main executable as entry 0 (glibc/bionic report it first) — order-independent
+for unwinders; document or flip to host-first only on evidence of a consumer that cares. (f) Two
+`dlpi_adds`/`dlpi_subs` counter domains (Eclipse vs glibc) ⇒ LLVM libunwind's FrameHeaderCache flushes on every
+Eclipse→host boundary crossing — perf-only, the code comment already owns "at worst flushes a cache". (g)
+`eclipse_sigaltstack_record`'s FAILURE path logs via tracing before returning, which can clobber errno for a
+caller checking it after −1 — save/restore errno around the log when next touched. (h) the record fn is NOT
+async-signal-safe (Mutex/tracing) — documented assumption: sigaltstack is thread-setup-only on every observed
+engine path (crashpad re-registers ACTIONS in-handler, never stacks); if a future core shows a thread parked in
+this lock during signal handling, move to an atomics ring (the tap pool pattern). (i) Vibrator: both natives
+register in ONE grouped `?`-propagated bind; `native_vibrate (IJ)V` is dex-verified this session but not yet
+run-proven — if the owner's live validation ever surfaces a NoSuchMethodError on the grouped bind, split
+per-native (ctor mandatory, vibrate best-effort — the 06-11 `readAsset` precedent). (j) the fail-closed three-name
+pin lives in the APK-gated `real_*` test, so APK-less checkouts are guarded only by the presence/count test —
+convention-consistent; hoist an ungated scope-priority test only if it ever matters. (k) the
+`#[allow(clippy::type_complexity)]` justification comment lacks the §2.2 dated format — date it on next touch.
 
 ---
 

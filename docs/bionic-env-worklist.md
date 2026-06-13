@@ -22,6 +22,14 @@
 > `umask`) — so `EclipseNativeProvider` registers **liblog 6 / bionic-libc 16** (121 base, 177
 > total). Per-lib pre-load resolution is pinned by
 > `loader::link::tests::real_boot_path_loadlibrary_libs_fully_resolve`.
+>
+> **2026-06-12 (later) count update:** the beyond-list growth continued — + `pthread_atfork` (pthread
+> 51→53 incl. the Eclipse-tier `__cxa_thread_atexit_impl`, core 947663) + `ANativeWindow_getFormat`
+> (ndk 27→28) = 122 base / 180 total (`ddabcd7`); then + bionic link-map introspection
+> `dl_iterate_phdr` + `dladdr` (core 1223806 — host glibc's walk is blind to Eclipse-mapped images,
+> which made every libroblox C++ throw process-fatal; see `src/loader/module_registry.rs`) + the
+> translating/attributing `sigaltstack` (signal natives 6→7) = **125 base / 183 total**. The
+> AGENTS.md §6 dated entries are authoritative for these counts.
 
 The **first bionic-env resolution cut**: resolve every one of `libroblox.so`'s 584 undefined (UND)
 imports against a host-baseline [`BionicEnv`](../src/loader/bionic_env.rs) scope, categorize them,
@@ -113,8 +121,8 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 | pthread     | 45 | 0  | yes (baseline only; bionic `pthread_t` differs) |
 | libm        | 43 | 0  | yes (pure math is sound) |
 | bionic-libc | 303 | 21 | partly — 21 are bionic-specific (glibc lacks them) |
-| cxa-runtime | 3  | 0  | yes (baseline; glibc atexit semantics) |
-| dl          | 5  | 0  | baseline only — must route to Eclipse's OWN loader |
+| cxa-runtime | 3  | 0  | yes (baseline; glibc atexit semantics) [2026-06-12: stale for `__cxa_thread_atexit_impl` — Eclipse-tier native since core 947663: bionic runs cxa finalizers BEFORE pthread-key dtors] |
+| dl          | 5  | 0  | baseline only — must route to Eclipse's OWN loader [2026-06-12: `dl_iterate_phdr`/`dladdr` now Eclipse-owned (core 1223806 — glibc's walk is blind to Eclipse-mapped images); dlopen/dlsym/dlclose/dlerror remain the recorded host-baseline loading gap] |
 | ndk-android | 0  | ✅ 0 (was 27) | **no host equiv → all 27 Eclipse-owned (2026-06-05)** |
 | media-ndk   | 0  | ✅ 0 (was 33) | **no host equiv → all 33 Eclipse sound-stub (2026-06-05)** |
 | audio       | 0  | ✅ 0 (was 8)  | **no host equiv → all 8 Eclipse sound-stub (2026-06-05)** |

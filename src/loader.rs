@@ -101,6 +101,7 @@ pub mod jni_register;
 pub mod link;
 pub mod looper;
 pub mod map;
+pub mod module_registry;
 pub mod native_provider;
 pub mod ndk_registry;
 pub mod opensl;

@@ -409,6 +409,43 @@ fn map_resolve_app_lib(
     }
     let _ = log.flush();
 
+    // ---- 5) Publish every object of this kept-alive set to the module registry -------------------
+    // 2026-06-12 (core 1223806): the engine's statically-linked libc++abi unwinder finds FDEs via
+    // its `dl_iterate_phdr@LIBC` import — which binds to Eclipse's `module_registry` native. The
+    // records must exist BEFORE any engine instruction runs (constructors/`JNI_OnLoad` come after
+    // this fn returns), or the first C++ throw std::terminate-loops to death (61,497 iterations in
+    // that core). Registration here is symmetric with `LoadedEngine::drop` (the dedup/error paths
+    // drop the engine, unregistering the records before the images unmap — no dangling walk).
+    for obj in &set.objects {
+        let obj_dynsyms = if obj.load_base() == base {
+            dynsyms.clone()
+        } else {
+            obj.image()
+                .map(|img| img.dynsyms.clone())
+                .unwrap_or_default()
+        };
+        match super::module_registry::ModuleRecord::for_image(
+            &obj.path,
+            &obj.bytes,
+            &obj_dynsyms,
+            obj.load_base(),
+            obj.mapped.span() as u64,
+        ) {
+            Ok(rec) => super::module_registry::register_module(rec),
+            // A well-formed mapped lib always derives (its phdrs sit in the first PT_LOAD); a
+            // failure here loses dl_iterate_phdr/dladdr visibility for THIS object only — warn
+            // loudly, never fabricate a record.
+            Err(e) => {
+                let _ = writeln!(
+                    log,
+                    "engine-load: WARNING: module-registry record for {} failed ({e}) — \
+                     its PCs stay invisible to dl_iterate_phdr/dladdr",
+                    obj.soname
+                );
+            }
+        }
+    }
+
     Ok(LoadedEngine {
         set,
         base,
@@ -416,6 +453,19 @@ fn map_resolve_app_lib(
         init_array,
         constructors_run: 0,
     })
+}
+
+impl Drop for LoadedEngine {
+    fn drop(&mut self) {
+        // 2026-06-12 (core 1223806): symmetric module-registry removal — a dropped engine (the
+        // dedup-skip and error paths in `load_app_native_lib`) must not leave
+        // dl_iterate_phdr/dladdr records pointing at munmapped memory. Runs before the field
+        // drops `munmap` the set (Rust drops the body first, then the fields). A never-registered
+        // base is a no-op.
+        for obj in &self.set.objects {
+            let _ = super::module_registry::unregister_module(obj.load_base());
+        }
+    }
 }
 
 impl LoadedEngine {
