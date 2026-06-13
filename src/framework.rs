@@ -77,8 +77,8 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use jni::errors::LogErrorAndDefault;
-use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
-use jni::refs::Reference;
+use jni::objects::{JByteArray, JClass, JIntArray, JLongArray, JObject, JString};
+use jni::refs::{Global, Reference};
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
 use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
@@ -706,6 +706,16 @@ const ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_NAME: &JNIStr = jni_str!("getAsse
 const ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_SIG: &JNIStr = jni_str!("(J)J");
 const ASSET_MANAGER_DESTROY_ASSET_NAME: &JNIStr = jni_str!("destroyAsset");
 const ASSET_MANAGER_DESTROY_ASSET_SIG: &JNIStr = jni_str!("(J)V");
+// 2026-06-12: `openAssetFd(String, int, long[], long[])` → an OWNED raw fd on the APK file (the
+// out-arrays receive [0] = data offset / [0] = length), or a NEGATIVE value → the Java side throws
+// the designed FileNotFoundException (`openFd_internal`). Declared `(Ljava/lang/String;I[J[J)I`
+// (artifact classes2.dex, flags 0x112) and tripped by androidx.profileinstaller reading
+// `dexopt/baseline.prof` on a worker thread — unbound, the UnsatisfiedLinkError (an Error, not the
+// caught IOException) hit the vendored-libcore default uncaught handler → `System.exit(10)`, the
+// EXIT=10 boot's actual death. `openNonAssetFd` shares Java's `openFd_internal`, so this one
+// binding covers both.
+const ASSET_MANAGER_OPEN_ASSET_FD_NAME: &JNIStr = jni_str!("openAssetFd");
+const ASSET_MANAGER_OPEN_ASSET_FD_SIG: &JNIStr = jni_str!("(Ljava/lang/String;I[J[J)I");
 
 // 2026-06-05: `loadResourceValue(int resid, short density, TypedValue outValue, boolean resolveRefs)`
 // is the native AOSP's `AssetManager.getResourceValue`/`Resources.getValue` calls to resolve a
@@ -1944,6 +1954,172 @@ extern "system" fn asset_manager_open_asset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// Errors from [`asset_fd_for`]. Every variant maps to the NEGATIVE `openAssetFd` return that
+/// makes ATL's `openFd_internal` throw the designed, caught-by-callers `FileNotFoundException`
+/// (androidx.profileinstaller's no-profile path catches exactly that `IOException`). 2026-06-12.
+#[derive(Debug)]
+enum AssetFdError {
+    /// The APK could not be opened or the entry is absent (the typed `src/apk` error).
+    Apk(crate::apk::ApkError),
+    /// The entry exists but is NOT Stored — AOSP's own `openAssetFd` refuses compressed assets
+    /// (an fd+offset+length can only serve raw Stored bytes), so the FileNotFoundException is
+    /// the correct caught outcome, matching real-Android behavior for this APK.
+    Compressed,
+    /// Re-opening the APK file for the fresh fd failed.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for AssetFdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Apk(e) => write!(f, "apk: {e}"),
+            Self::Compressed => f.write_str("entry is compressed (fd path serves Stored only)"),
+            Self::Io(e) => write!(f, "open APK for fd: {e}"),
+        }
+    }
+}
+
+/// Resolve an asset name to the fd-servable triple `(fresh APK fd, data offset, uncompressed
+/// length)` behind `AssetManager.openAssetFd`. Accepts the name with or without the `assets/`
+/// prefix, like [`read_asset_bytes`] (ATL's `openFd` passes the already-prefixed full path).
+///
+/// 2026-06-12: a FRESH fd is opened per call because ownership transfers to Java
+/// (`FileDescriptor.setInt$` → `ParcelFileDescriptor` → `AssetFileDescriptor`, which closes it) —
+/// never a shared/dup'd cached fd. The triple is only produced for a Stored entry
+/// ([`crate::apk::Apk::entry_span`]); anything else is the typed `Err` → the caller's `-1` →
+/// Java's designed `FileNotFoundException`.
+fn asset_fd_for(apk_path: &str, name: &str) -> Result<(c_int, u64, u64), AssetFdError> {
+    let entry = if name.starts_with("assets/") {
+        name.to_owned()
+    } else {
+        format!("assets/{name}")
+    };
+    let mut apk =
+        crate::apk::Apk::open(std::path::Path::new(apk_path)).map_err(AssetFdError::Apk)?;
+    let span = apk.entry_span(&entry).map_err(AssetFdError::Apk)?;
+    if !span.stored {
+        return Err(AssetFdError::Compressed);
+    }
+    let file = std::fs::File::open(std::path::Path::new(apk_path)).map_err(AssetFdError::Io)?;
+    Ok((
+        std::os::fd::IntoRawFd::into_raw_fd(file),
+        span.data_start,
+        span.uncompressed_size,
+    ))
+}
+
+/// Write `value` into `arr[0]` (an `openAssetFd` out-param `long[]`), returning `false` on
+/// failure with the JNI exception described+cleared (the caller then closes the fd and reports
+/// `-1` — never a half-written success). A null array is skipped (`true`), mirroring AOSP's
+/// null-tolerant out-params.
+fn write_long_out_param(env: &mut Env, arr: &JLongArray, value: jlong, which: &str) -> bool {
+    if arr.is_null() {
+        return true;
+    }
+    match arr.set_region(env, 0, &[value]) {
+        Ok(()) => true,
+        Err(e) => {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            tracing::warn!(
+                target: "android.content.res.AssetManager",
+                which,
+                error = %e,
+                "AssetManager.openAssetFd: out-param write failed"
+            );
+            false
+        }
+    }
+}
+
+/// `AssetManager.openAssetFd(String fileName, int mode, long[] outOffsets, long[] outLengths)` →
+/// an OWNED raw fd on the APK file with `outOffsets[0]`/`outLengths[0]` set, or `-1`.
+///
+/// 2026-06-12: the REAL fd implementation (the EXIT=10 fix — see the constants' section note).
+/// A Stored `assets/<fileName>` entry is served as `(fresh APK fd, data_start, uncompressed
+/// length)` via [`asset_fd_for`]; fd ownership transfers to Java (`ParcelFileDescriptor` closes
+/// it). Absent or compressed entries return `-1` → ATL's `openFd_internal` throws the designed
+/// `FileNotFoundException` (the caught no-profile path). The body NEVER propagates a JNI error
+/// (which would resolve to the default `0` — a VALID fd number); every failure is an explicit
+/// `-1` with any pending exception described+cleared, and an fd whose out-params could not be
+/// written is closed here (Java never owned it).
+extern "system" fn asset_manager_open_asset_fd<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    file_name: JString<'local>,
+    _mode: jint,
+    out_offsets: JLongArray<'local>,
+    out_lengths: JLongArray<'local>,
+) -> jint {
+    env.with_env(|env| -> jni::errors::Result<jint> {
+        if file_name.is_null() {
+            return Ok(-1);
+        }
+        let name = match file_name.try_to_string(env) {
+            Ok(n) => n,
+            Err(e) => {
+                if env.exception_check() {
+                    env.exception_describe();
+                    env.exception_clear();
+                }
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    error = %e,
+                    "AssetManager.openAssetFd: could not read fileName → -1"
+                );
+                return Ok(-1);
+            }
+        };
+        let Some(apk_path) = APK_PATH.get() else {
+            tracing::warn!(
+                target: "android.content.res.AssetManager",
+                asset = %name,
+                "AssetManager.openAssetFd: APK path unset → -1 (FileNotFoundException)"
+            );
+            return Ok(-1);
+        };
+        let (fd, offset, length) = match asset_fd_for(apk_path, &name) {
+            Ok(triple) => triple,
+            Err(e) => {
+                tracing::info!(
+                    target: "android.content.res.AssetManager",
+                    asset = %name,
+                    reason = %e,
+                    "AssetManager.openAssetFd: not fd-servable → -1 (FileNotFoundException)"
+                );
+                return Ok(-1);
+            }
+        };
+        // u64 → jlong, total: a real APK is far below i64::MAX, but a conversion failure must
+        // close the fresh fd and report -1, never wrap into a bogus offset/length.
+        let (Ok(offset), Ok(length)) = (jlong::try_from(offset), jlong::try_from(length)) else {
+            // SAFETY: `fd` was freshly opened by asset_fd_for and not yet handed to Java; Eclipse
+            // still owns it, so closing it here is sound and leak-free.
+            unsafe { libc::close(fd) };
+            return Ok(-1);
+        };
+        if !write_long_out_param(env, &out_offsets, offset, "outOffsets")
+            || !write_long_out_param(env, &out_lengths, length, "outLengths")
+        {
+            // SAFETY: as above — the fd was never returned, Eclipse still owns it.
+            unsafe { libc::close(fd) };
+            return Ok(-1);
+        }
+        tracing::debug!(
+            target: "android.content.res.AssetManager",
+            asset = %name,
+            fd,
+            offset,
+            length,
+            "AssetManager.openAssetFd: served Stored entry by fd (ownership → Java)"
+        );
+        Ok(fd)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// `AssetManager.readAsset(long asset, byte[] b, int off, int len)` → bytes read, or `-1` at EOF.
 ///
 /// JNI ABI: an INSTANCE native. Reads up to `len` bytes from the stream's cursor into `b[off..]`.
@@ -2057,7 +2233,8 @@ extern "system" fn asset_manager_destroy_asset<'local>(
 }
 
 /// Bind the asset-STREAM read cycle (`readAsset`/`seekAsset`/`getAssetLength`/
-/// `getAssetRemainingLength`/`destroyAsset`) on `android/content/res/AssetManager`, BEST-EFFORT.
+/// `getAssetRemainingLength`/`destroyAsset`) plus the fd-serving `openAssetFd` (2026-06-12) on
+/// `android/content/res/AssetManager`, BEST-EFFORT.
 ///
 /// `openAsset` is bound in the main [`register_asset_manager_natives`] array (its signature is
 /// confirmed). These follow-on natives use the classic AOSP signatures; if this ATL build declares any
@@ -2069,11 +2246,17 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // even if a sibling does not: ATL has `getAssetLength(J)J`/`destroyAsset(J)V` but reads assets
     // without the classic `readAsset(J[BII)I` (a grouped bind would fail as a whole on that one). Each
     // entry's fn matches its paired signature; a `NoSuchMethodError` is cleared + logged, not fatal.
-    let natives: [(&JNIStr, &JNIStr, *mut c_void); 5] = [
+    let natives: [(&JNIStr, &JNIStr, *mut c_void); 6] = [
         (
             ASSET_MANAGER_READ_ASSET_NAME,
             ASSET_MANAGER_READ_ASSET_SIG,
             asset_manager_read_asset as *mut c_void,
+        ),
+        // 2026-06-12: the fd-serving open (covers openNonAssetFd via Java's shared openFd_internal).
+        (
+            ASSET_MANAGER_OPEN_ASSET_FD_NAME,
+            ASSET_MANAGER_OPEN_ASSET_FD_SIG,
+            asset_manager_open_asset_fd as *mut c_void,
         ),
         (
             ASSET_MANAGER_SEEK_ASSET_NAME,
@@ -2119,7 +2302,7 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/content/res/AssetManager",
         bound,
-        "registered Eclipse's non-GTK asset-stream natives (per-native best-effort: readAsset/seekAsset/getAssetLength/getAssetRemainingLength/destroyAsset)"
+        "registered Eclipse's non-GTK asset-stream natives (per-native best-effort: readAsset/openAssetFd/seekAsset/getAssetLength/getAssetRemainingLength/destroyAsset)"
     );
     Ok(())
 }
@@ -3997,6 +4180,95 @@ fn register_vibrator_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/os/Vibrator",
         "registered Eclipse's no-vibration-device backing for native_constructor + native_vibrate"
+    );
+    Ok(())
+}
+
+// === Eclipse's own backing for android.os.Process.getElapsedCpuTime =============================
+//
+// 2026-06-12 (EXIT=10 boot, /tmp/eclipse-1223806-validate.log:634-637): Roblox's telemetry
+// (LoggingProtocol's process-timestamp path — the engine logged `process timestamps will be
+// inaccurate`) called the unbound `static native long getElapsedCpuTime()` 4× on a worker thread;
+// the caller caught the UnsatisfiedLinkError itself this boot, but (a) under the vendored libcore
+// EVERY uncaught worker exception is process-fatal (`hacky_uncaught_exception_handler` →
+// System.exit(10)), and (b) process timestamps were absent from telemetry for the whole boot.
+// AOSP contract (frameworks/base android_util_Process.cpp, public behavior): elapsed CPU time of
+// this process — `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` in MILLISECONDS, 0 on clock failure.
+// The class's other declared natives (getFreeMemory/getPss/…, classes2.dex) stay on the discovery
+// loop — bind on run evidence, no speculative pre-binding (Simplicity First).
+
+/// `android.os.Process` (internal/slashed name for `find_class`).
+pub const PROCESS_CLASS: &JNIStr = jni_str!("android/os/Process");
+
+// JNI name + descriptor, exactly as declared in the boot artifact's classes2.dex (2026-06-12):
+// `public static final native long getElapsedCpuTime();` (flags 0x119) → `()J`.
+const PROCESS_GET_ELAPSED_CPU_TIME_NAME: &JNIStr = jni_str!("getElapsedCpuTime");
+const PROCESS_GET_ELAPSED_CPU_TIME_SIG: &JNIStr = jni_str!("()J");
+
+/// `Process.getElapsedCpuTime()` → this process's consumed CPU time in milliseconds.
+///
+/// 2026-06-12: real implementation per the AOSP contract — `CLOCK_PROCESS_CPUTIME_ID` converted
+/// to ms; `0` on a (practically impossible on Linux ≥ 2.6.12) clock failure, matching AOSP's
+/// 0-on-error posture rather than throwing.
+extern "system" fn process_get_elapsed_cpu_time<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid out-pointer for the duration of the call;
+        // CLOCK_PROCESS_CPUTIME_ID is a standard POSIX clock id.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        if rc != 0 {
+            return Ok(0);
+        }
+        // Saturating sec→ms + nsec→ms fold: total for any representable timespec (tv_sec/tv_nsec
+        // are i64 on this LP64 target).
+        let ms = ts
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec / 1_000_000);
+        Ok(ms)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's backing for `android.os.Process.getElapsedCpuTime`.
+///
+/// Registered BOTH by [`register_engine_preload_natives`] (the engine's `JNI_OnLoad`-time
+/// LoggingProtocol init calls it before the lifecycle drive — the registration-ordering gap,
+/// 2026-06-12) and by `drive_lifecycle`'s block (re-registering identical fn pointers is
+/// spec-legal and idempotent, so neither path can regress the other).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature.
+/// It does, by construction — `()J` as a STATIC native (pinned by
+/// `process_native_name_sig_and_class_match_api_impl_dex`). The body is `catch_unwind`-guarded
+/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_process_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(PROCESS_CLASS)?;
+    let methods = [
+        // SAFETY: `process_get_elapsed_cpu_time` matches the paired `()J` signature as a static
+        // native; the cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                PROCESS_GET_ELAPSED_CPU_TIME_NAME,
+                PROCESS_GET_ELAPSED_CPU_TIME_SIG,
+                process_get_elapsed_cpu_time as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/os/Process; the method holds a valid fn pointer whose
+    // signature matches the class's `native` declaration (artifact classes2.dex, 2026-06-12; the
+    // exact ART-reported line `No implementation found for long
+    // android.os.Process.getElapsedCpuTime()`).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/os/Process",
+        "registered Eclipse's backing for getElapsedCpuTime (CLOCK_PROCESS_CPUTIME_ID → ms)"
     );
     Ok(())
 }
@@ -6903,6 +7175,433 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own backing for android.app.Activity's transition/lifecycle natives ==============
+//
+// 2026-06-12 (EXIT=10 boot, /tmp/eclipse-1223806-validate.log): `android.app.Activity` declares
+// EXACTLY 7 natives — re-enumerated this session from the actual boot artifact
+// (`framework-patched/api-impl.jar` classes2.dex, androguard; the full-declared-list discipline
+// from the Vibrator fix):
+//   static  void    nativeStartActivity(Activity)     `(Landroid/app/Activity;)V`               0x109 — BOUND
+//   private void    nativeFinish(long)                `(J)V`                                    0x102 — BOUND (instance)
+//   static  boolean nativeResumeActivity(Class,Intent)`(Ljava/lang/Class;Landroid/content/Intent;)Z` 0x109 — BOUND
+//   public  boolean isInMultiWindowMode()             `()Z`                                     0x101 — BOUND (instance)
+//   public  boolean isTaskRoot()                      `()Z`                                     0x101 — BOUND (instance)
+//   static  void    nativeOpenURI(String)             `(Ljava/lang/String;)V`                   0x109 — RECORDED, not bound
+//   public  void    nativeFileChooser(int,String,String,int) `(ILjava/lang/String;Ljava/lang/String;I)V` 0x101 — RECORDED, not bound
+//
+// Why this matters (the splash→main handoff): ActivitySplash's NORMAL NEW_STARTUP transition is
+// `startActivity(ActivityNativeMain intent)` then `finish()` (twice — dex-proven). ATL's
+// `Context.startActivity` posts `Context$6` to the main Looper, whose `run()` constructs the new
+// Activity Java-side (`internalCreateActivity` — its Window wraps the SAME process-shared
+// [`window_registry`] handle as `Application.native_window`) and then calls the STATIC
+// `nativeStartActivity` to drive it up; `finish()` posts `Activity$2`, which calls the INSTANCE
+// `nativeFinish(window.native_window)` to drive the finishing activity down. The native owns BOTH
+// lifecycle halves — no api-impl Java drives a started activity's up-lifecycle or a finishing
+// one's down-lifecycle (dex xref-swept). Unbound, both threw `UnsatisfiedLinkError` out of
+// `Looper.loop`; the pump described+cleared each, but `Looper.loop` had already DEQUEUED the
+// message, so the transition was irrecoverably consumed: ActivityNativeMain (the activity hosting
+// the game engine surface) never reached `onCreate`, dead-ending the boot on a stranded splash.
+//
+// `nativeOpenURI`/`nativeFileChooser` are deliberately NOT bound (signatures recorded above from
+// the artifact): neither tripped this boot, and both need a real host action (a detected URI
+// opener / a file dialog) — a no-op would be a workaround; unbound they surface loudly through
+// the pump signal, the established discovery loop.
+
+// JNI names + descriptors, exactly as declared in the boot artifact's classes2.dex (2026-06-12).
+const ACTIVITY_NATIVE_START_ACTIVITY_NAME: &JNIStr = jni_str!("nativeStartActivity");
+const ACTIVITY_NATIVE_START_ACTIVITY_SIG: &JNIStr = jni_str!("(Landroid/app/Activity;)V");
+const ACTIVITY_NATIVE_FINISH_NAME: &JNIStr = jni_str!("nativeFinish");
+const ACTIVITY_NATIVE_FINISH_SIG: &JNIStr = jni_str!("(J)V");
+const ACTIVITY_NATIVE_RESUME_ACTIVITY_NAME: &JNIStr = jni_str!("nativeResumeActivity");
+const ACTIVITY_NATIVE_RESUME_ACTIVITY_SIG: &JNIStr =
+    jni_str!("(Ljava/lang/Class;Landroid/content/Intent;)Z");
+const ACTIVITY_IS_IN_MULTI_WINDOW_MODE_NAME: &JNIStr = jni_str!("isInMultiWindowMode");
+const ACTIVITY_IS_IN_MULTI_WINDOW_MODE_SIG: &JNIStr = jni_str!("()Z");
+const ACTIVITY_IS_TASK_ROOT_NAME: &JNIStr = jni_str!("isTaskRoot");
+const ACTIVITY_IS_TASK_ROOT_SIG: &JNIStr = jni_str!("()Z");
+
+/// One Eclipse-driven Activity instance: a JNI global ref (the identity anchor for
+/// `IsSameObject`) plus whether [`activity_native_finish`] already drove its down-lifecycle.
+struct TrackedActivity {
+    /// Global ref to the Java `Activity` object (owned; released when the entry is dropped).
+    jobject: Global<JObject<'static>>,
+    /// `true` once the down-lifecycle (onPause→onStop→onDestroy) ran — the idempotence gate for
+    /// the dex-proven double `finish()` post (two queued `Activity$2`s for the splash).
+    finished: bool,
+}
+
+/// Eclipse-driven activities in creation order (oldest first). The lifecycle driver tracks the
+/// step-4 launcher activity; [`activity_native_start_activity`] tracks each started activity.
+/// Consulted by `nativeFinish` (finished-once gate), `nativeResumeActivity` (live-instance
+/// lookup), and `isTaskRoot` (oldest-live identity). Guarded by a `Mutex`; holders make only
+/// leaf JNI calls (IsSameObject/IsInstanceOf/NewLocalRef — never app code) under the lock, so
+/// an app callback re-entering these natives cannot deadlock.
+static TRACKED_ACTIVITIES: std::sync::Mutex<Vec<TrackedActivity>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record `activity` in [`TRACKED_ACTIVITIES`] (creation order). Best-effort: a global-ref or
+/// lock failure logs and leaves it untracked — the finish-idempotence and `isTaskRoot` answers
+/// then degrade for that one instance (logged, never fatal/UB).
+fn track_activity(env: &Env, activity: &JObject, finished: bool) {
+    match env.new_global_ref(activity) {
+        Ok(global) => match TRACKED_ACTIVITIES.lock() {
+            Ok(mut tracker) => tracker.push(TrackedActivity {
+                jobject: global,
+                finished,
+            }),
+            Err(e) => tracing::warn!(
+                target: "android.app.Activity",
+                error = %e,
+                "activity tracker poisoned: activity untracked"
+            ),
+        },
+        Err(e) => tracing::warn!(
+            target: "android.app.Activity",
+            error = %e,
+            "new_global_ref failed: activity untracked"
+        ),
+    }
+}
+
+/// Mark `activity` finished, returning `true` iff this is its FIRST finish (the caller then
+/// drives the down-lifecycle exactly once). An untracked instance (global-ref failure at
+/// creation) is tracked now as finished, so the second queued `Activity$2` still dedupes.
+fn mark_activity_finished_once(env: &mut Env, activity: &JObject) -> bool {
+    let mut tracker = match TRACKED_ACTIVITIES.lock() {
+        Ok(t) => t,
+        Err(e) => {
+            // Poisoned: no dedupe possible — drive the down-lifecycle (loud, logged) rather than
+            // silently dropping the Android destruction contract.
+            tracing::warn!(
+                target: "android.app.Activity",
+                error = %e,
+                "activity tracker poisoned: finish dedupe unavailable"
+            );
+            return true;
+        }
+    };
+    for entry in tracker.iter_mut() {
+        // IsSameObject is a leaf JNI identity check (no app code) — safe under the lock.
+        match env.is_same_object(entry.jobject.as_obj(), activity) {
+            Ok(true) => {
+                if entry.finished {
+                    return false;
+                }
+                entry.finished = true;
+                return true;
+            }
+            Ok(false) => {}
+            Err(e) => tracing::debug!(
+                target: "android.app.Activity",
+                error = %e,
+                "IsSameObject failed during finish lookup (entry skipped)"
+            ),
+        }
+    }
+    drop(tracker);
+    track_activity(env, activity, true);
+    true
+}
+
+/// `static Activity.nativeStartActivity(Activity activity)` — drive the ALREADY-CONSTRUCTED
+/// started activity up through exactly recipe steps 5–7 (`onCreate(null)` → `onStart` →
+/// `onResume`), the same implementation `drive_lifecycle` uses (factored helpers below).
+///
+/// 2026-06-12: ATL's `Context$6.run` (the posted `startActivity` continuation) has already built
+/// the Activity + Window Java-side (`internalCreateActivity`; the Window wraps the SAME shared
+/// [`window_registry`] handle, so `setContentView` flows through the existing view path — no
+/// registry work here). Any Java exception a step throws is described+cleared by [`checked`]
+/// (never left pending across the native return); a failed step stops the cascade, loudly.
+extern "system" fn activity_native_start_activity<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    activity: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if activity.is_null() {
+            tracing::warn!(
+                target: "android.app.Activity",
+                "Activity.nativeStartActivity: null activity (ignored)"
+            );
+            return Ok(());
+        }
+        let class_name = view_class_name(env, &activity).unwrap_or_default();
+        tracing::info!(
+            target: "android.app.Activity",
+            class = %class_name,
+            "Activity.nativeStartActivity: driving the started activity to RESUMED (steps 5–7)"
+        );
+        track_activity(env, &activity, false);
+        // Each helper routes through `checked` (describe+clear on a Java throw). A failure is
+        // already logged there; stop the up-cascade and return cleanly (no pending exception).
+        if call_activity_on_create(env, &activity, "nativeStartActivity Activity.onCreate").is_err()
+            || call_activity_on_start(env, &activity, "nativeStartActivity Activity.onStart")
+                .is_err()
+            || call_activity_on_resume(env, &activity, "nativeStartActivity Activity.onResume")
+                .is_err()
+        {
+            return Ok(());
+        }
+        tracing::info!(
+            target: "android.app.Activity",
+            class = %class_name,
+            "Activity.nativeStartActivity: started activity resumed (steps 5–7 driven)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Activity.nativeFinish(long native_window)` (instance) — drive the finishing activity DOWN:
+/// `onPause` → `onStop` → `onDestroy` (the Android destruction contract; the native owns it).
+///
+/// 2026-06-12 contract details, all dex-proven:
+/// * the `jlong` is `Window.native_window` = the PROCESS-SHARED [`window_registry`] handle
+///   (every activity's Window wraps the same slot as `Application.native_window`), so this MUST
+///   NOT `window_registry::free` it and MUST NOT close the host winit window — Java zeroes only
+///   the finishing activity's field, and ActivityNativeMain's Window still wraps the slot;
+/// * the splash calls `finish()` twice (once in `Z0`, once in `s()`), and `Activity$2` zeroes
+///   `native_window` only AFTER a successful native return — so a same-boot double call is
+///   reachable and the down-lifecycle is gated to run once per instance
+///   ([`mark_activity_finished_once`]).
+extern "system" fn activity_native_finish<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    native_window: jlong,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        // Validate the shared handle (bounds+generation-checked — a stale/fabricated jlong logs
+        // and returns, never UB). The state itself is not touched.
+        if let Err(e) = window_registry::with_window(native_window, |_| ()) {
+            tracing::warn!(
+                target: "android.app.Activity",
+                handle = native_window,
+                error = %e,
+                "Activity.nativeFinish: stale/invalid window handle (down-lifecycle skipped)"
+            );
+            return Ok(());
+        }
+        if this.is_null() {
+            tracing::warn!(
+                target: "android.app.Activity",
+                "Activity.nativeFinish: null receiver (ignored)"
+            );
+            return Ok(());
+        }
+        if !mark_activity_finished_once(env, &this) {
+            tracing::debug!(
+                target: "android.app.Activity",
+                handle = native_window,
+                "Activity.nativeFinish: down-lifecycle already driven (second queued finish — no-op)"
+            );
+            return Ok(());
+        }
+        let class_name = view_class_name(env, &this).unwrap_or_default();
+        tracing::info!(
+            target: "android.app.Activity",
+            class = %class_name,
+            handle = native_window,
+            "Activity.nativeFinish: driving the finishing activity down (onPause → onStop → onDestroy)"
+        );
+        // A thrown Java exception is described+cleared by `checked` (already logged); the
+        // cascade stops there and the native returns cleanly. The handle stays allocated and
+        // the host window stays up (see the contract note above).
+        let _ = drive_activity_down_lifecycle(env, &this);
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `static Activity.nativeResumeActivity(Class cls, Intent intent)` — the CLEAR_TOP branch of
+/// the same `Context$6` dispatch: report whether a LIVE Eclipse-tracked instance of `cls`
+/// exists, resuming it if so.
+///
+/// 2026-06-12, the dex-proven minimal contract: no live instance → `false` (Java falls through
+/// to `internalCreateActivity` + `nativeStartActivity` — correct by construction); a live
+/// instance → drive it to RESUMED and return `true`. `onNewIntent` delivery is NOT yet
+/// evidence-pinned (recorded next-diagnostic), so the `intent` is not delivered here.
+extern "system" fn activity_native_resume_activity<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    cls: JObject<'local>,
+    _intent: JObject<'local>,
+) -> jboolean {
+    env.with_env(|env| -> jni::errors::Result<jboolean> {
+        if cls.is_null() {
+            return Ok(false);
+        }
+        // Runtime-checked JObject→JClass cast (the arg is a java.lang.Class instance).
+        let cls = env.cast_local::<JClass>(cls)?;
+        // Find the FIRST live (not finished) tracked instance of `cls`. Only leaf JNI calls
+        // (IsInstanceOf/NewLocalRef) run under the lock; onResume — real app code — runs AFTER
+        // the lock is dropped so a callback re-entering these natives cannot deadlock.
+        let target: Option<JObject<'_>> = {
+            let tracker = match TRACKED_ACTIVITIES.lock() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "android.app.Activity",
+                        error = %e,
+                        "activity tracker poisoned: nativeResumeActivity reports no live instance"
+                    );
+                    return Ok(false);
+                }
+            };
+            let mut found = None;
+            for entry in tracker.iter() {
+                if entry.finished {
+                    continue;
+                }
+                match env.is_instance_of(entry.jobject.as_obj(), &cls) {
+                    Ok(true) => {
+                        found = Some(env.new_local_ref(entry.jobject.as_obj())?);
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::debug!(
+                        target: "android.app.Activity",
+                        error = %e,
+                        "IsInstanceOf failed during resume lookup (entry skipped)"
+                    ),
+                }
+            }
+            found
+        };
+        match target {
+            Some(activity) => {
+                let class_name = view_class_name(env, &activity).unwrap_or_default();
+                tracing::info!(
+                    target: "android.app.Activity",
+                    class = %class_name,
+                    "Activity.nativeResumeActivity: live instance found — driving to RESUMED"
+                );
+                // The live instance EXISTS, so report `true` even if onResume threw (described+
+                // cleared by `checked`) — `false` would make Java construct a DUPLICATE activity.
+                let _ = call_activity_on_resume(
+                    env,
+                    &activity,
+                    "nativeResumeActivity Activity.onResume",
+                );
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Activity.isInMultiWindowMode()` (instance) → `false`.
+///
+/// 2026-06-12: Eclipse hosts exactly one activity stack in one host winit window — there is no
+/// split-screen/multi-window mode on this desktop host (intentional capability answer, not a stub).
+extern "system" fn activity_is_in_multi_window_mode<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(false) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `Activity.isTaskRoot()` (instance) → `true` iff the receiver is the OLDEST live
+/// Eclipse-tracked activity (the task's bottom — the launcher activity until it finishes).
+extern "system" fn activity_is_task_root<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+) -> jboolean {
+    env.with_env(|env| -> jni::errors::Result<jboolean> {
+        let tracker = match TRACKED_ACTIVITIES.lock() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.app.Activity",
+                    error = %e,
+                    "activity tracker poisoned: isTaskRoot reports false"
+                );
+                return Ok(false);
+            }
+        };
+        for entry in tracker.iter() {
+            if !entry.finished {
+                // IsSameObject is a leaf identity check — safe under the lock.
+                return Ok(env
+                    .is_same_object(entry.jobject.as_obj(), &this)
+                    .unwrap_or(false));
+            }
+        }
+        Ok(false)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's backing for the 5 load-bearing `android.app.Activity` natives (of the
+/// artifact-verified 7 declared — `nativeOpenURI`/`nativeFileChooser` stay recorded, unbound).
+///
+/// Registered before step 4: the splash→main transition (`Context$6`/`Activity$2`, both
+/// main-Looper messages) calls `nativeStartActivity`/`nativeFinish`, and unbound natives there
+/// consumed the transition messages (2026-06-12, EXIT=10 boot).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature.
+/// They do, by construction — the descriptors are transcribed from the boot artifact's
+/// classes2.dex (pinned by `activity_native_names_sigs_and_class_match_api_impl_dex`). Every
+/// body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(ACTIVITY_CLASS)?;
+    let methods = [
+        // SAFETY: `activity_native_start_activity` matches `(Landroid/app/Activity;)V` as a
+        // STATIC native (second arg JClass); the cast is how NativeMethod takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ACTIVITY_NATIVE_START_ACTIVITY_NAME,
+                ACTIVITY_NATIVE_START_ACTIVITY_SIG,
+                activity_native_start_activity as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `activity_native_finish` matches `(J)V` as an INSTANCE native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ACTIVITY_NATIVE_FINISH_NAME,
+                ACTIVITY_NATIVE_FINISH_SIG,
+                activity_native_finish as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `activity_native_resume_activity` matches
+        // `(Ljava/lang/Class;Landroid/content/Intent;)Z` as a STATIC native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ACTIVITY_NATIVE_RESUME_ACTIVITY_NAME,
+                ACTIVITY_NATIVE_RESUME_ACTIVITY_SIG,
+                activity_native_resume_activity as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `activity_is_in_multi_window_mode` matches `()Z` as an INSTANCE native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ACTIVITY_IS_IN_MULTI_WINDOW_MODE_NAME,
+                ACTIVITY_IS_IN_MULTI_WINDOW_MODE_SIG,
+                activity_is_in_multi_window_mode as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `activity_is_task_root` matches `()Z` as an INSTANCE native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ACTIVITY_IS_TASK_ROOT_NAME,
+                ACTIVITY_IS_TASK_ROOT_SIG,
+                activity_is_task_root as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/app/Activity; `methods` hold valid fn pointers whose
+    // signatures match the class's `native` declarations (artifact classes2.dex, 2026-06-12; the
+    // two exact ART-reported gaps nativeStartActivity/nativeFinish from the EXIT=10 boot log).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/app/Activity",
+        "registered Eclipse's backing for nativeStartActivity + nativeFinish + nativeResumeActivity + isInMultiWindowMode + isTaskRoot"
+    );
+    Ok(())
+}
+
 // === The confirmed onCreate recipe, encoded as typed constants ===================
 //
 // 2026-06-04: class internal names (slashed, for `find_class`) and JNI method descriptors,
@@ -7330,6 +8029,45 @@ pub fn drive_application_lifecycle(
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
             drive_lifecycle(env, apk_path, launcher_activity)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Register the framework natives an engine `JNI_OnLoad` can reach, BEFORE the engine pre-load.
+///
+/// 2026-06-12 (registration-ordering gap): `run_apk` runs `preload_app_native_libs` (where
+/// libroblox's `JNI_OnLoad` executes) BEFORE `drive_application_lifecycle`, but every framework
+/// native was registered only inside `drive_lifecycle` — so the engine's one `JNI_OnLoad`-time
+/// Java `Log` call (LoggingProtocol init, tag=JNIMain) missed `println_native` and the engine
+/// warned `process timestamps will be inaccurate` for the whole boot. This entry point is called
+/// by `run_apk` BEFORE the pre-load and registers exactly the evidence-backed set: `Log` (the
+/// observed miss) + `Process` (the same LoggingProtocol init path calls `getElapsedCpuTime`).
+/// `drive_lifecycle` keeps registering both too — RegisterNatives with identical fn pointers is
+/// spec-legal and idempotent, so neither call site can regress the other. Sweep result, dated:
+/// no OTHER registration in `drive_lifecycle`'s block has evidence of an engine-`JNI_OnLoad`-time
+/// caller today; grow this set on run evidence only.
+///
+/// Same threading/panic contract as [`drive_application_lifecycle`] (main thread, `&Vm` pins it,
+/// `catch_unwind` at the JNI boundary).
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI error;
+/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn register_engine_preload_natives(vm: &Vm) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
+    // by the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton).
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            register_log_natives(env)?;
+            register_process_natives(env)
         })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
@@ -7807,7 +8545,12 @@ fn drive_lifecycle(
     // Bind android.util.Log.println_native on its own class. ART resolves natives lazily during the
     // lifecycle, so all discovered natives are registered (per class) BEFORE step 1; the framework
     // logs heavily during init, so this must be bound before createApplication touches Log.
+    // 2026-06-12: ALSO registered earlier by register_engine_preload_natives (the engine's
+    // JNI_OnLoad logs before the lifecycle); kept here too — idempotent — so neither path regresses.
     register_log_natives(env)?;
+    // Bind android.os.Process.getElapsedCpuTime — Roblox telemetry calls it from workers AND from
+    // the engine's JNI_OnLoad-time LoggingProtocol init (also in register_engine_preload_natives).
+    register_process_natives(env)?;
     // Bind android.content.res.AssetManager.init on its own class — the framework builds an
     // AssetManager early in init (Resources/asset access), so this must be bound before step 1.
     register_asset_manager_natives(env)?;
@@ -7849,6 +8592,12 @@ fn drive_lifecycle(
     // ActivitySplash.onCreate (step 5) opens a SQLite DB (SQLiteOpenHelper.getWritableDatabase).
     // Phase A: open + statement lifecycle + non-cursor executes (nativeExecuteForCursorWindow is Phase B).
     sqlite::register_natives(env)?;
+    // Bind android.app.Activity's transition/lifecycle natives on its own class — the splash→main
+    // handoff (`Context.startActivity` → `Context$6` → STATIC nativeStartActivity; `finish()` →
+    // `Activity$2` → INSTANCE nativeFinish) dispatches from main-Looper messages, and an unbound
+    // native there consumes the transition irrecoverably (2026-06-12, EXIT=10 boot: the splash's
+    // normal NEW_STARTUP transition to ActivityNativeMain was lost twice over). Before step 4.
+    register_activity_natives(env)?;
     // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
@@ -8007,18 +8756,16 @@ fn drive_lifecycle(
         .l()
     })?;
 
+    // 2026-06-12: track the step-4 launcher activity (oldest live = the task root) so
+    // nativeFinish's finished-once gate, nativeResumeActivity's live-instance lookup, and
+    // isTaskRoot answer correctly for it (the splash is the first activity to call finish()).
+    track_activity(env, &activity, false);
+
     // Step 5: instance `Activity.onCreate(Bundle) -> void` on the object from step 4, with a null
     // Bundle (a fresh launch has no saved instance state). Reaching this — which runs the Activity's
-    // setContentView → View-hierarchy inflation — is the increment's milestone. `.v()` asserts void.
-    checked(env, "step 5 Activity.onCreate", |env| {
-        env.call_method(
-            &activity,
-            jni_str!("onCreate"),
-            jni_sig!("(Landroid/os/Bundle;)V"),
-            &[JValue::Object(&JObject::null())],
-        )?
-        .v()
-    })?;
+    // setContentView → View-hierarchy inflation — is the increment's milestone. 2026-06-12: steps
+    // 5–7 are driven through the shared helpers `Activity.nativeStartActivity` also uses.
+    call_activity_on_create(env, &activity, "step 5 Activity.onCreate")?;
     tracing::info!(
         activity = launcher_activity,
         "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
@@ -8026,19 +8773,13 @@ fn drive_lifecycle(
 
     // Step 6: instance `Activity.onStart() -> void` on the step-4 object — the first half of ATL's
     // `activity_start` (`main.c`): the launcher Activity moves to the STARTED state, running the
-    // app's own `onStart` override. No args. `.v()` asserts the void return.
-    checked(env, "step 6 Activity.onStart", |env| {
-        env.call_method(&activity, jni_str!("onStart"), jni_sig!("()V"), &[])?
-            .v()
-    })?;
+    // app's own `onStart` override.
+    call_activity_on_start(env, &activity, "step 6 Activity.onStart")?;
 
     // Step 7: instance `Activity.onResume() -> void` on the step-4 object — the second half of
     // `activity_start`: the Activity reaches the RESUMED (running/interactive) state, running the
-    // app's own `onResume` override. No args. `.v()` asserts the void return.
-    checked(env, "step 7 Activity.onResume", |env| {
-        env.call_method(&activity, jni_str!("onResume"), jni_sig!("()V"), &[])?
-            .v()
-    })?;
+    // app's own `onResume` override.
+    call_activity_on_resume(env, &activity, "step 7 Activity.onResume")?;
 
     tracing::info!(
         activity = launcher_activity,
@@ -8078,6 +8819,78 @@ fn checked<'local, T>(
             Err(FrameworkError::Jni(e))
         }
     }
+}
+
+// === The shared Activity up/down lifecycle calls (2026-06-12) ====================================
+//
+// Factored out of `drive_lifecycle`'s inline steps 5–7 so the launcher path and
+// `Activity.nativeStartActivity` (the splash→main handoff) share ONE implementation per call —
+// the EXIT=10 boot's fix directive. Each routes through [`checked`], so a thrown Java exception
+// is described+cleared (named for the discovery loop), never left pending.
+
+/// Instance `Activity.onCreate(Bundle)` with a null `Bundle` (a fresh launch has no saved
+/// instance state) — recipe step 5's call shape ([`STEP5_ACTIVITY_ON_CREATE`]).
+fn call_activity_on_create<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+    what: &str,
+) -> Result<(), FrameworkError> {
+    checked(env, what, |env| {
+        env.call_method(
+            activity,
+            jni_str!("onCreate"),
+            jni_sig!("(Landroid/os/Bundle;)V"),
+            &[JValue::Object(&JObject::null())],
+        )?
+        .v()
+    })
+}
+
+/// Instance `Activity.onStart()` — recipe step 6's call shape ([`STEP6_ACTIVITY_ON_START`]).
+fn call_activity_on_start<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+    what: &str,
+) -> Result<(), FrameworkError> {
+    checked(env, what, |env| {
+        env.call_method(activity, jni_str!("onStart"), jni_sig!("()V"), &[])?
+            .v()
+    })
+}
+
+/// Instance `Activity.onResume()` — recipe step 7's call shape ([`STEP7_ACTIVITY_ON_RESUME`]).
+fn call_activity_on_resume<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+    what: &str,
+) -> Result<(), FrameworkError> {
+    checked(env, what, |env| {
+        env.call_method(activity, jni_str!("onResume"), jni_sig!("()V"), &[])?
+            .v()
+    })
+}
+
+/// The Android destruction contract for a finishing activity: instance `onPause()` → `onStop()`
+/// → `onDestroy()` (no-arg `()V` instance methods, like steps 6–7). 2026-06-12: the native owns
+/// this — no api-impl Java drives a finishing activity's down-lifecycle (dex xref-swept). A
+/// thrown step stops the cascade (already described+cleared by [`checked`]).
+fn drive_activity_down_lifecycle<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+) -> Result<(), FrameworkError> {
+    checked(env, "nativeFinish Activity.onPause", |env| {
+        env.call_method(activity, jni_str!("onPause"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+    checked(env, "nativeFinish Activity.onStop", |env| {
+        env.call_method(activity, jni_str!("onStop"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+    checked(env, "nativeFinish Activity.onDestroy", |env| {
+        env.call_method(activity, jni_str!("onDestroy"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+    Ok(())
 }
 
 /// Errors from the framework lifecycle driver.
@@ -8999,6 +9812,82 @@ mod tests {
         );
         assert_eq!(ASSET_MANAGER_DESTROY_ASSET_NAME.to_str(), "destroyAsset");
         assert_eq!(ASSET_MANAGER_DESTROY_ASSET_SIG.to_str(), "(J)V");
+        // 2026-06-12: openAssetFd, pinned against the artifact (classes2.dex `openAssetFd
+        // (Ljava/lang/String;I[J[J)I`, flags 0x112) and the exact ART-reported gap (`No
+        // implementation found for int android.content.res.AssetManager.openAssetFd(java.lang.
+        // String, int, long[], long[])`, the EXIT=10 boot's trigger). A transcription regression
+        // leaves it unbound → an uncaught worker UnsatisfiedLinkError → the vendored-libcore
+        // default handler's System.exit(10).
+        assert_eq!(ASSET_MANAGER_OPEN_ASSET_FD_NAME.to_str(), "openAssetFd");
+        assert_eq!(
+            ASSET_MANAGER_OPEN_ASSET_FD_SIG.to_str(),
+            "(Ljava/lang/String;I[J[J)I"
+        );
+    }
+
+    #[test]
+    fn asset_fd_for_serves_stored_entries_and_refuses_absent_and_compressed() {
+        // 2026-06-12: the openAssetFd contract over a zip fixture — a Stored asset yields a FRESH
+        // owned fd on the APK file whose (offset, length) window contains exactly the asset bytes
+        // (read back through the fd to prove the triple is usable as ParcelFileDescriptor would);
+        // an absent entry and a compressed entry are typed Errs (→ the native's -1 → Java's
+        // designed FileNotFoundException). Uses only std + a temp file — host-independent.
+        use std::io::{Read, Seek, SeekFrom, Write};
+        const PAYLOAD: &[u8] = b"baseline-profile-bytes";
+
+        // Build the fixture zip (Stored asset + Deflated sibling) in a temp file.
+        let mut zip_bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer
+                .start_file("assets/dexopt/baseline.prof", stored)
+                .expect("start stored");
+            writer.write_all(PAYLOAD).expect("write stored");
+            let deflated = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("assets/compressed.bin", deflated)
+                .expect("start deflated");
+            writer.write_all(PAYLOAD).expect("write deflated");
+            writer.finish().expect("finish zip");
+        }
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eclipse-openassetfd-test-{:?}.apk",
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &zip_bytes).expect("write fixture apk");
+        let apk_path = path.to_str().expect("utf-8 temp path");
+
+        // Stored: the triple must be readable through the returned fd. Both name forms (with and
+        // without the assets/ prefix ATL's openFd prepends) resolve to the same entry.
+        for name in ["assets/dexopt/baseline.prof", "dexopt/baseline.prof"] {
+            let (fd, offset, length) = asset_fd_for(apk_path, name).expect("stored asset fd");
+            assert!(fd >= 0, "a real owned fd");
+            assert_eq!(length, PAYLOAD.len() as u64);
+            // SAFETY: `fd` was freshly opened by asset_fd_for and is owned by this test (the
+            // JNI transfer never happened); From<OwnedFd>-style adoption via from_raw_fd closes
+            // it when `file` drops — exactly once.
+            let mut file: std::fs::File = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
+            file.seek(SeekFrom::Start(offset)).expect("seek to offset");
+            let mut got = vec![0u8; PAYLOAD.len()];
+            file.read_exact(&mut got).expect("read asset bytes");
+            assert_eq!(got, PAYLOAD, "the (fd, offset, length) window IS the asset");
+        }
+
+        // Absent → typed Err (the FileNotFoundException path).
+        assert!(matches!(
+            asset_fd_for(apk_path, "assets/absent.bin"),
+            Err(AssetFdError::Apk(crate::apk::ApkError::EntryMissing(_)))
+        ));
+        // Compressed → typed Err (AOSP's openAssetFd refuses compressed assets).
+        assert!(matches!(
+            asset_fd_for(apk_path, "assets/compressed.bin"),
+            Err(AssetFdError::Compressed)
+        ));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9108,6 +9997,79 @@ mod tests {
         assert_eq!(VIBRATOR_NATIVE_CONSTRUCTOR_SIG.to_str(), "()I");
         assert_eq!(VIBRATOR_NATIVE_VIBRATE_NAME.to_str(), "native_vibrate");
         assert_eq!(VIBRATOR_NATIVE_VIBRATE_SIG.to_str(), "(IJ)V");
+    }
+
+    #[test]
+    fn activity_native_names_sigs_and_class_match_api_impl_dex() {
+        // 2026-06-12 (EXIT=10 boot): pin android.app.Activity's bound natives against the
+        // artifact-verified declared list (api-impl.jar classes2.dex, androguard re-enumeration:
+        // EXACTLY 7 declared natives — 5 bound here, nativeOpenURI `(Ljava/lang/String;)V` +
+        // nativeFileChooser `(ILjava/lang/String;Ljava/lang/String;I)V` recorded-not-bound) and
+        // the two exact ART-reported gaps (`No implementation found for void
+        // android.app.Activity.nativeStartActivity(android.app.Activity)` /
+        // `...nativeFinish(long)`, /tmp/eclipse-1223806-validate.log). A transcription regression
+        // would make RegisterNatives throw NoSuchMethodError — or leave a native unbound, whose
+        // UnsatisfiedLinkError consumes the splash→main transition message out of Looper.loop
+        // (the stranded-splash death this binding fixes). Host-independent constants.
+        assert_eq!(ACTIVITY_CLASS.to_str(), "android/app/Activity");
+        assert_eq!(
+            ACTIVITY_NATIVE_START_ACTIVITY_NAME.to_str(),
+            "nativeStartActivity"
+        );
+        assert_eq!(
+            ACTIVITY_NATIVE_START_ACTIVITY_SIG.to_str(),
+            "(Landroid/app/Activity;)V"
+        );
+        assert_eq!(ACTIVITY_NATIVE_FINISH_NAME.to_str(), "nativeFinish");
+        assert_eq!(ACTIVITY_NATIVE_FINISH_SIG.to_str(), "(J)V");
+        assert_eq!(
+            ACTIVITY_NATIVE_RESUME_ACTIVITY_NAME.to_str(),
+            "nativeResumeActivity"
+        );
+        assert_eq!(
+            ACTIVITY_NATIVE_RESUME_ACTIVITY_SIG.to_str(),
+            "(Ljava/lang/Class;Landroid/content/Intent;)Z"
+        );
+        assert_eq!(
+            ACTIVITY_IS_IN_MULTI_WINDOW_MODE_NAME.to_str(),
+            "isInMultiWindowMode"
+        );
+        assert_eq!(ACTIVITY_IS_IN_MULTI_WINDOW_MODE_SIG.to_str(), "()Z");
+        assert_eq!(ACTIVITY_IS_TASK_ROOT_NAME.to_str(), "isTaskRoot");
+        assert_eq!(ACTIVITY_IS_TASK_ROOT_SIG.to_str(), "()Z");
+    }
+
+    #[test]
+    fn process_native_name_sig_and_class_match_api_impl_dex() {
+        // 2026-06-12: pin android.os.Process.getElapsedCpuTime against the artifact declaration
+        // (classes2.dex `getElapsedCpuTime ()J`, flags 0x119) and the exact ART-reported line
+        // (4× `No implementation found for long android.os.Process.getElapsedCpuTime()`,
+        // /tmp/eclipse-1223806-validate.log:634-637). A transcription regression leaves it
+        // unbound: caught by Roblox telemetry today, but any future UNCAUGHT worker call site is
+        // process-fatal under the vendored libcore (System.exit(10)). Host-independent constants.
+        assert_eq!(PROCESS_CLASS.to_str(), "android/os/Process");
+        assert_eq!(
+            PROCESS_GET_ELAPSED_CPU_TIME_NAME.to_str(),
+            "getElapsedCpuTime"
+        );
+        assert_eq!(PROCESS_GET_ELAPSED_CPU_TIME_SIG.to_str(), "()J");
+    }
+
+    #[test]
+    fn engine_preload_natives_entry_point_exists_and_covers_log_and_process() {
+        // 2026-06-12 (registration-ordering gap): the pre-preload entry point must keep existing
+        // with this exact shape — `run_apk` calls it BEFORE preload_app_native_libs so the
+        // engine's JNI_OnLoad-time Log/Process calls resolve. A refactor that drops or renames it
+        // breaks this compile-time binding; the registered names/sigs are pinned by their own
+        // tests (`log_native_name_sig_and_class_match_log_java` /
+        // `process_native_name_sig_and_class_match_api_impl_dex`). The live signal is the
+        // `process timestamps will be inaccurate` WARN disappearing from the next owner boot.
+        let entry: fn(&Vm) -> Result<(), FrameworkError> = register_engine_preload_natives;
+        // A fn item is never null; the assert keeps `entry` load-bearing (not optimized away).
+        assert!((entry as usize) != 0);
+        // The two registrations it performs target these pinned classes.
+        assert_eq!(LOG_CLASS.to_str(), "android/util/Log");
+        assert_eq!(PROCESS_CLASS.to_str(), "android/os/Process");
     }
 
     #[test]

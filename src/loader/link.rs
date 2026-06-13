@@ -1974,8 +1974,19 @@ mod tests {
         // images → every engine C++ throw std::terminate-loops; the 947663 allowlist lesson — no
         // host-fall-through allowlisting). Each must resolve through the full scope to the EXACT
         // Eclipse-provider address, and the host must ALSO export the name (proving the pin is
-        // load-bearing, not vacuous).
-        for shadowed in ["dl_iterate_phdr", "dladdr", "sigaltstack"] {
+        // load-bearing, not vacuous). 2026-06-12 (same session, the engine DnsResolve root
+        // cause): the 4 netdb resolver-ABI names joined the same class — host glibc exports them
+        // with a SWAPPED addrinfo tail + renumbered AI_/EAI_/NI_ values, so a dropped Eclipse
+        // registration silently resurrects the zero-usable-addresses resolver.
+        for shadowed in [
+            "dl_iterate_phdr",
+            "dladdr",
+            "sigaltstack",
+            "getaddrinfo",
+            "freeaddrinfo",
+            "gai_strerror",
+            "getnameinfo",
+        ] {
             let e = eclipse_only
                 .resolve(shadowed)
                 .unwrap_or_else(|| panic!("Eclipse provider must own {shadowed}"));

@@ -282,6 +282,45 @@ impl Apk {
         entry.read_to_end(&mut buf)?;
         Ok(buf)
     }
+
+    /// Locate a named zip entry's raw byte span inside the APK **file itself**: the offset of its
+    /// data (past the local file header), its uncompressed size, and whether it is Stored.
+    ///
+    /// 2026-06-12: the general accessor behind `AssetManager.openAssetFd` — an asset served by
+    /// file descriptor is `(fd-of-the-APK, data_start, length)`, which is only meaningful for a
+    /// **Stored** entry (the bytes at `data_start` ARE the asset; a Deflated entry's raw bytes are
+    /// compressed, and AOSP's own `openAssetFd` refuses compressed assets). Generalizes the
+    /// engine-lib-only `stored` flag of [`Self::x86_64_engine`]. `data_start` comes from the local
+    /// header (the zip crate parses it when the entry is opened), so it is exact for this file.
+    /// Returns [`ApkError::EntryMissing`] when the entry is absent (the framework maps that to the
+    /// Java `FileNotFoundException` its asset API expects).
+    pub fn entry_span(&mut self, name: &str) -> Result<EntrySpan, ApkError> {
+        let entry = match self.archive.by_name(name) {
+            Ok(e) => e,
+            Err(zip::result::ZipError::FileNotFound) => {
+                return Err(ApkError::EntryMissing(name.to_owned()));
+            }
+            Err(e) => return Err(ApkError::Zip(e)),
+        };
+        Ok(EntrySpan {
+            data_start: entry.data_start(),
+            uncompressed_size: entry.size(),
+            stored: entry.compression() == CompressionMethod::Stored,
+        })
+    }
+}
+
+/// A named zip entry's raw byte span inside the APK file (see [`Apk::entry_span`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntrySpan {
+    /// Byte offset of the entry's data in the APK file (just past its local file header).
+    pub data_start: u64,
+    /// Uncompressed length in bytes. For a Stored entry this is also the raw byte count at
+    /// `data_start`.
+    pub uncompressed_size: u64,
+    /// `true` when stored uncompressed — the precondition for serving the entry by `(fd, offset,
+    /// length)` straight from the APK file.
+    pub stored: bool,
 }
 
 /// Verify a file's integrity against an expected SHA-256 digest (lowercase hex).
@@ -788,6 +827,51 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(engine.size, payload.len() as u64);
         assert!(!engine.stored);
+    }
+
+    #[test]
+    fn entry_span_reports_stored_offset_size_and_rejects_absent() {
+        // 2026-06-12: the fd-serving contract behind AssetManager.openAssetFd — for a Stored
+        // entry the bytes at data_start..data_start+uncompressed_size in the APK FILE are exactly
+        // the asset bytes (assert by slicing the zip image); a Deflated entry reports
+        // stored == false (the fd path must refuse it, like AOSP's openAssetFd); an absent entry
+        // is the typed EntryMissing (→ the Java FileNotFoundException profileinstaller catches).
+        const PAYLOAD: &[u8] = b"profile-bytes-0123456789";
+        let bytes = build_apk_methods(&[
+            (
+                "assets/dexopt/baseline.prof",
+                PAYLOAD,
+                CompressionMethod::Stored,
+            ),
+            (
+                "assets/compressed.bin",
+                PAYLOAD,
+                CompressionMethod::Deflated,
+            ),
+        ]);
+        let (mut apk, path) = open_apk(&bytes, "entry-span");
+
+        let span = apk
+            .entry_span("assets/dexopt/baseline.prof")
+            .expect("stored span");
+        assert!(span.stored);
+        assert_eq!(span.uncompressed_size, PAYLOAD.len() as u64);
+        let start = usize::try_from(span.data_start).expect("offset fits usize");
+        assert_eq!(
+            &bytes[start..start + PAYLOAD.len()],
+            PAYLOAD,
+            "the bytes at data_start must BE the Stored asset"
+        );
+
+        let span = apk
+            .entry_span("assets/compressed.bin")
+            .expect("deflated span");
+        assert!(!span.stored, "a Deflated entry must report stored == false");
+        assert_eq!(span.uncompressed_size, PAYLOAD.len() as u64);
+
+        let err = apk.entry_span("assets/absent.bin").unwrap_err();
+        assert!(matches!(err, ApkError::EntryMissing(_)), "got {err:?}");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
