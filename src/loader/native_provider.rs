@@ -284,6 +284,29 @@ impl EclipseNativeProvider {
             "pthread_sigmask",
             eclipse_pthread_sigmask as *const () as u64,
         );
+        // sigaltstack (the 7th signal native) — bionic/glibc `stack_t` ARE layout-identical on
+        // x86-64, so this is a PURE forward; it exists for OBSERVABILITY (2026-06-12,
+        // core 1223806): the kernel force_sigsegv()'d writing a signal frame to a
+        // registered-but-unwritable SA_ONSTACK altstack, and Eclipse had ZERO attribution for
+        // engine altstack registrations. The C shim captures the caller's return address; the
+        // Rust callee forwards, then logs+records tid/ss_sp/ss_size/ss_flags + caller module.
+        p.register("sigaltstack", eclipse_sigaltstack as *const () as u64);
+
+        // ---- bionic link-map introspection (2) — dl_iterate_phdr + dladdr ----------------------
+        // 2026-06-12 (core 1223806): libroblox's statically-linked libc++abi unwinder resolves
+        // FDEs via `dl_iterate_phdr@LIBC`; falling through to HOST glibc walked only glibc's own
+        // link map (the Eclipse-mapped engine images are invisible to it), so the boot's first
+        // C++ throw found no FDE → std::terminate re-raise loop, 61,497 iterations / 12.2 MB of
+        // stack. `dladdr` is the same-class companion (engine backtrace symbolization). Both walk
+        // Eclipse's `module_registry` first, then delegate to host glibc for host modules.
+        p.register(
+            "dl_iterate_phdr",
+            super::module_registry::eclipse_dl_iterate_phdr as *const () as u64,
+        );
+        p.register(
+            "dladdr",
+            super::module_registry::eclipse_dladdr as *const () as u64,
+        );
 
         // ---- ndk-android (libandroid) — the 28 NDK natives -------------------------------------
         // AAsset / AAssetManager (6) — REAL, routed to Eclipse's own `src/apk` reader.
@@ -1078,9 +1101,14 @@ unsafe extern "C" fn eclipse_system_property_get(
 //   - glibc `sigfillset`, and `sigprocmask`/`pthread_sigmask` with a non-null `oldset`, WRITE 128
 //     bytes through the caller's 8-byte bionic set — silent stack corruption.
 // The engine work-list (readelf, libroblox.so + libbacktrace-native.so, 2026-06-11): `sigaction`,
-// `sigemptyset`, `sigaddset`, `sigfillset`, `sigprocmask`, `pthread_sigmask` — exactly these six
-// are provided here. `sigaltstack` is also imported but bionic/glibc `stack_t` are layout-identical
-// on x86-64 (`{void* ss_sp; int ss_flags; size_t ss_size}`), so it stays on the host baseline.
+// `sigemptyset`, `sigaddset`, `sigfillset`, `sigprocmask`, `pthread_sigmask` — these six are
+// translating natives. `sigaltstack` is the seventh: bionic/glibc `stack_t` ARE layout-identical
+// on x86-64 (`{void* ss_sp; int ss_flags; size_t ss_size}`), so it forwarded on the host baseline
+// until 2026-06-12 (core 1223806) — a silent SI_KERNEL/addr=0 force_sigsegv kill proved the
+// kernel's signal-frame write targeted a registered-but-UNWRITABLE SA_ONSTACK altstack, and the
+// host-baseline pass-through left Eclipse with zero attribution for WHO registered it. It is now
+// an Eclipse-owned pure forward that logs+records every registration with caller attribution
+// (see the sigaltstack section below).
 
 /// Bionic LP64 `sigset_t` — one 64-bit word (signals 1–64, bit `signum-1`).
 type BionicSigsetT = u64;
@@ -1929,6 +1957,162 @@ pub(super) fn install_early_fault_tap(signum: c_int) -> Result<(), String> {
 pub(super) fn publish_engine_text_range(base: u64, span: u64) {
     ENGINE_RANGE_BASE.store(base, Ordering::Relaxed);
     ENGINE_RANGE_SPAN.store(span, Ordering::Relaxed);
+}
+
+// =================================================================================================
+// Eclipse-owned `sigaltstack` — pure forward + registration attribution (2026-06-12, core 1223806).
+// =================================================================================================
+//
+// Bionic and glibc `stack_t` are layout-identical on x86-64 (`{void* ss_sp; int ss_flags;
+// size_t ss_size}`), so the forward passes the caller's pointers through UNTRANSLATED. The native
+// exists for observability: core 1223806 died to a kernel `force_sigsegv()` (NT_SIGINFO
+// `si_code=128 SI_KERNEL, si_addr=0`) — the signal-frame write to the dying thread's
+// registered-but-unwritable SA_ONSTACK altstack faulted, the disposition reset to SIG_DFL, and
+// ZERO handler instructions ran (both crash reporters silent by construction). The altstack's
+// OWNER was unprovable because engine `sigaltstack` calls passed through to host glibc invisibly.
+// Every registration is now logged + ring-buffered with tid / ss_sp / ss_size / ss_flags and the
+// CALLER's return address resolved against the loader module table — any recurrence names the
+// registrant and the stack region. No logic change: a pure forward (no workaround, no behavior
+// edit — the evidence standard found no Eclipse logic defect to fix).
+
+extern "C" {
+    /// The C wrapper (`src/loader/sigaltstack_shim.c`) — captures `__builtin_return_address(0)`
+    /// (no stable-Rust spelling exists for the caller's return address; the established
+    /// `liblog_shim.c` pattern) and tail-calls [`eclipse_sigaltstack_record`]. THIS is the
+    /// address registered under the bionic import name `sigaltstack`.
+    pub fn eclipse_sigaltstack(ss: *const libc::stack_t, old_ss: *mut libc::stack_t) -> c_int;
+}
+
+/// One observed `sigaltstack` registration (the core-1223806 attribution record).
+#[derive(Clone, Debug)]
+pub struct AltstackRegistration {
+    /// The registering thread (raw `SYS_gettid`).
+    pub tid: i64,
+    /// The registered `ss_sp` (0 for an `SS_DISABLE` registration with a null sp).
+    pub ss_sp: u64,
+    /// The registered `ss_size`.
+    pub ss_size: usize,
+    /// The registered `ss_flags` (e.g. `SS_DISABLE`).
+    pub ss_flags: c_int,
+    /// The caller's return address (who called `sigaltstack`).
+    pub caller: u64,
+    /// The caller resolved as `"<module>+0x<off>"` (Eclipse module table first, host `dladdr`
+    /// fallback); `None` if no module contains the address.
+    pub caller_module: Option<String>,
+}
+
+/// Bounded history of the most recent registrations (engine threads re-register on every
+/// create/exit cycle over a long session; the forensic consumer correlates the DYING tid's most
+/// recent registration, so a recent-window ring is sufficient and never grows).
+const ALTSTACK_LOG_CAP: usize = 64;
+
+/// The ring (oldest dropped first) + a monotonic total so a wrap is visible.
+static ALTSTACK_LOG: std::sync::Mutex<Vec<AltstackRegistration>> =
+    std::sync::Mutex::new(Vec::new());
+static ALTSTACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the recent registrations (newest last) — the test pin + any future core triage hook.
+#[must_use]
+pub fn recent_altstack_registrations() -> Vec<AltstackRegistration> {
+    ALTSTACK_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Total registrations observed since boot (monotonic; exceeds the ring length once it wraps).
+#[must_use]
+pub fn altstack_registration_total() -> u64 {
+    ALTSTACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Resolve a code address to `"<module>+0x<off>"`: the Eclipse loader module table first (engine
+/// callers — the attribution core 1223806 lacked), host `dladdr` for host PCs.
+fn describe_code_address(addr: u64) -> Option<String> {
+    if let Some(s) = super::module_registry::describe_address(addr) {
+        return Some(s);
+    }
+    // SAFETY: 2026-06-12 — zeroed Dl_info is a valid out-param; `dladdr` only writes it.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: 2026-06-12 — host dladdr over an arbitrary address is a query (no deref of `addr`).
+    if unsafe { libc::dladdr(addr as *const c_void, &mut info) } != 0 && !info.dli_fname.is_null() {
+        // SAFETY: 2026-06-12 — a nonzero dladdr return makes dli_fname a valid NUL-terminated
+        // string owned by the host loader (never freed for a loaded module).
+        let name = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        let short = name.rsplit('/').next().unwrap_or(&name);
+        return Some(format!(
+            "{short}+{:#x}",
+            addr.wrapping_sub(info.dli_fbase as u64)
+        ));
+    }
+    None
+}
+
+/// The Rust callee behind [`eclipse_sigaltstack`]: **forward** (layout-identical `stack_t`),
+/// then log + record the registration with caller attribution. Queries (`ss == NULL`) forward
+/// silently — only kernel-state CHANGES are recorded. Failures log a warning (the kernel
+/// rejected the registration; nothing changed). NOT async-signal-safe (allocates/locks) —
+/// `sigaltstack` is thread-setup code, not handler code, on every observed engine path
+/// (2026-06-12; crashpad's in-handler flow re-registers ACTIONS via `sigaction`, never stacks).
+///
+/// # Safety
+/// `ss`/`old_ss` follow the public `sigaltstack(2)` contract (each null or valid); `caller` is
+/// the shim-captured return address, used only as an integer.
+#[no_mangle]
+pub unsafe extern "C" fn eclipse_sigaltstack_record(
+    ss: *const libc::stack_t,
+    old_ss: *mut libc::stack_t,
+    caller: *const c_void,
+) -> c_int {
+    // SAFETY: 2026-06-12 — pure forward of the caller's own pointers; bionic/glibc stack_t are
+    // layout-identical on x86-64 (the section header note), so no translation is required.
+    let ret = unsafe { libc::sigaltstack(ss, old_ss) };
+    if ss.is_null() {
+        return ret; // pure query — no kernel-state change to record.
+    }
+    if ret != 0 {
+        let e = std::io::Error::last_os_error();
+        tracing::warn!(
+            target: "eclipse.sigaltstack",
+            caller = format_args!("{:#x}", caller as u64),
+            error = %e,
+            "sigaltstack registration REJECTED by the kernel"
+        );
+        return ret;
+    }
+    // SAFETY: 2026-06-12 — `ss` is non-null and was just accepted by the kernel, so it points at
+    // a readable stack_t for the duration of the call.
+    let stack = unsafe { *ss };
+    // SAFETY: 2026-06-12 — raw SYS_gettid takes no arguments and cannot fail.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+    let caller = caller as u64;
+    let caller_module = describe_code_address(caller);
+    tracing::info!(
+        target: "eclipse.sigaltstack",
+        tid,
+        ss_sp = format_args!("{:#x}", stack.ss_sp as u64),
+        ss_size = stack.ss_size,
+        ss_flags = stack.ss_flags,
+        disable = stack.ss_flags & libc::SS_DISABLE != 0,
+        caller = format_args!("{caller:#x}"),
+        caller_module = caller_module.as_deref().unwrap_or("?"),
+        "altstack registered (core-1223806 attribution)"
+    );
+    let rec = AltstackRegistration {
+        tid,
+        ss_sp: stack.ss_sp as u64,
+        ss_size: stack.ss_size,
+        ss_flags: stack.ss_flags,
+        caller,
+        caller_module,
+    };
+    let mut log = ALTSTACK_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.len() == ALTSTACK_LOG_CAP {
+        log.remove(0);
+    }
+    log.push(rec);
+    ALTSTACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+    ret
 }
 
 // =================================================================================================
@@ -3854,20 +4038,24 @@ mod tests {
         // __android_log_vprint, a libbacktrace-native pre-load import) + 16 bionic-libc
         // (2026-06-12 — __umask_chk, the other libbacktrace-native pre-load import) + 25
         // bionic-stdio FILE*-translation (22 Rust + 3 C-shim; 2026-06-12 — the &__sF[i] sentinel
-        // remap) + 6 bionic-signal (2026-06-11) + 28 ndk-android (2026-06-12 —
-        // ANativeWindow_getFormat, libsurface_util_jni's sole unresolved pre-load import) + 33
-        // media-ndk + 8 audio + 53 bionic-pthread/TLS/sem/syscall (37 + the 14 thread-lifecycle
-        // natives added 2026-06-05: create/join/detach/setname_np/kill/getattr_np/
-        // get+setschedparam/attr_*; + __cxa_thread_atexit_impl & pthread_atfork 2026-06-12 —
-        // the core-947663 destructor-order fix and the last libbacktrace-native pre-load import)
-        // + 5 bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/getpagesize/sysinfo —
-        // the allocator-bootstrap fix, 2026-06-05) = 180.
+        // remap) + 7 bionic-signal (6 translating 2026-06-11; + sigaltstack 2026-06-12 — the
+        // core-1223806 caller-attribution forward) + 2 bionic link-map introspection
+        // (dl_iterate_phdr + dladdr, 2026-06-12 — core 1223806's terminate-loop root cause: the
+        // host-glibc walk could never contain the Eclipse-mapped engine images) + 28 ndk-android
+        // (2026-06-12 — ANativeWindow_getFormat, libsurface_util_jni's sole unresolved pre-load
+        // import) + 33 media-ndk + 8 audio + 53 bionic-pthread/TLS/sem/syscall (37 + the 14
+        // thread-lifecycle natives added 2026-06-05: create/join/detach/setname_np/kill/
+        // getattr_np/get+setschedparam/attr_*; + __cxa_thread_atexit_impl & pthread_atfork
+        // 2026-06-12 — the core-947663 destructor-order fix and the last libbacktrace-native
+        // pre-load import) + 5 bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/
+        // getpagesize/sysinfo — the allocator-bootstrap fix, 2026-06-05) = 183.
         assert_eq!(
             p.len(),
-            122 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            125 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
-            "6 liblog + 16 bionic-libc + 25 bionic-stdio + 6 bionic-signal + 28 ndk-android + 33 \
-             media-ndk + 8 audio + 53 pthread + 5 sysconf system-query natives registered"
+            "6 liblog + 16 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
+             introspection + 28 ndk-android + 33 media-ndk + 8 audio + 53 pthread + 5 sysconf \
+             system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim + 1 va_list C-shim)
@@ -3920,13 +4108,17 @@ mod tests {
             "fprintf",
             "fscanf",
             "vfprintf",
-            // bionic signal ABI (6) — 2026-06-11
+            // bionic signal ABI (7) — 2026-06-11; sigaltstack 2026-06-12 (core 1223806)
             "sigaction",
             "sigemptyset",
             "sigaddset",
             "sigfillset",
             "sigprocmask",
             "pthread_sigmask",
+            "sigaltstack",
+            // bionic link-map introspection (2) — 2026-06-12 (core 1223806)
+            "dl_iterate_phdr",
+            "dladdr",
             // ndk-android (28)
             "AAssetManager_fromJava",
             "AAssetManager_open",
@@ -4825,6 +5017,88 @@ mod tests {
         // SAFETY: unmap exactly the region install_guarded_altstack mapped for THIS test; the
         // kernel no longer references it (the restore above deregistered it).
         unsafe { libc::munmap(st.guard_base as *mut c_void, st.mapping_len) };
+    }
+
+    #[test]
+    fn sigaltstack_native_forwards_and_records_caller_attribution() {
+        // 2026-06-12 (core 1223806): the pin for the Eclipse-owned sigaltstack forward. A
+        // registration through the C-shim native must (1) really reach the kernel (the host
+        // round-trip reports OUR stack as the active one — a broken forward fails here), and
+        // (2) leave an attribution record naming the registering tid and the caller — the
+        // observability core 1223806 lacked (an unwritable registered altstack force_sigsegv'd
+        // the process with zero in-process evidence of WHO registered it). sigaltstack is
+        // per-thread; the ring is matched by OUR unique ss_sp so parallel tests can't flake it.
+        // SAFETY: query-only sigaltstack with a valid out-param (save the pre-test state).
+        let mut saved: libc::stack_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: `saved` is a valid out-param; a null ss makes this a pure query.
+            unsafe { libc::sigaltstack(std::ptr::null(), &mut saved) },
+            0
+        );
+
+        // A pure QUERY through the native must not record anything (no kernel-state change).
+        let before_total = altstack_registration_total();
+        let mut q: libc::stack_t = unsafe { std::mem::zeroed() };
+        // SAFETY: null ss = pure query through the shim; `q` is a valid out-param.
+        assert_eq!(unsafe { eclipse_sigaltstack(std::ptr::null(), &mut q) }, 0);
+        assert_eq!(
+            altstack_registration_total(),
+            before_total,
+            "a pure query records nothing"
+        );
+
+        // Register a real stack THROUGH the native (the engine's path).
+        let mut stack = vec![0u8; libc::SIGSTKSZ];
+        let ss = libc::stack_t {
+            ss_sp: stack.as_mut_ptr() as *mut c_void,
+            ss_flags: 0,
+            ss_size: stack.len(),
+        };
+        // SAFETY: `ss` describes the live, writable Vec buffer; null old_ss is the documented
+        // "don't report the previous stack" form. Per-thread effect only.
+        assert_eq!(
+            unsafe { eclipse_sigaltstack(&ss, std::ptr::null_mut()) },
+            0,
+            "the forward must reach the kernel and succeed"
+        );
+
+        // (1) The host round-trip: the kernel's view is OUR stack (the pure-forward proof).
+        let mut active: libc::stack_t = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out-param; null ss = pure query.
+        assert_eq!(
+            unsafe { libc::sigaltstack(std::ptr::null(), &mut active) },
+            0
+        );
+        assert_eq!(active.ss_sp as u64, ss.ss_sp as u64);
+        assert_eq!(active.ss_size, ss.ss_size);
+
+        // (2) The attribution record: our registration is in the ring, naming THIS tid and a
+        // non-null caller (the C shim's __builtin_return_address(0), resolved to a module —
+        // here the test binary itself via the host-dladdr fallback).
+        // SAFETY: raw SYS_gettid takes no arguments and cannot fail.
+        let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+        let recs = recent_altstack_registrations();
+        let rec = recs
+            .iter()
+            .rev()
+            .find(|r| r.ss_sp == ss.ss_sp as u64)
+            .expect("the registration must be recorded");
+        assert_eq!(rec.tid, my_tid, "the record names the registering thread");
+        assert_eq!(rec.ss_size, ss.ss_size);
+        assert_eq!(rec.ss_flags, 0);
+        assert_ne!(rec.caller, 0, "the shim captured a return address");
+        assert!(
+            rec.caller_module.is_some(),
+            "the caller resolves to a module (host-dladdr fallback names the test binary)"
+        );
+
+        // Restore the pre-test per-thread state before the Vec buffer drops.
+        // SAFETY: `saved` is the kernel's own pre-test report (a disabled state round-trips as
+        // SS_DISABLE); restoring it deregisters the Vec-backed test stack.
+        assert_eq!(
+            unsafe { libc::sigaltstack(&saved, std::ptr::null_mut()) },
+            0
+        );
     }
 
     #[test]

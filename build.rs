@@ -1,14 +1,18 @@
 //! Eclipse build script — 2026-06-05.
 //!
-//! Compiles the clean-room C VARIADIC shims (`src/loader/liblog_shim.c`,
-//! `src/loader/bionic_syscall_shim.c`, `src/loader/stdio_shim.c`) into static libraries linked into
-//! the crate. They DEFINE the C-variadic bionic functions Rust stable cannot define (the
-//! `c_variadic` feature is nightly-only): the liblog `__android_log_print` / `__android_log_assert`
+//! Compiles the clean-room C shims (`src/loader/liblog_shim.c`,
+//! `src/loader/bionic_syscall_shim.c`, `src/loader/stdio_shim.c`,
+//! `src/loader/sigaltstack_shim.c`) into static libraries linked into
+//! the crate. They DEFINE what Rust stable cannot: the C-variadic bionic functions (the
+//! `c_variadic` feature is nightly-only) — the liblog `__android_log_print` / `__android_log_assert`
 //! (forward to the Rust sink `eclipse_liblog_emit`), `eclipse_bionic_syscall(long, ...)` (forwards
 //! varargs to the host `syscall(3)` for the bionic `syscall` import — called directly for
-//! `SYS_gettid` in the init path), and the bionic stdio `fprintf`/`fscanf`/`vfprintf` translation
-//! (2026-06-12 — remap the bionic `&__sF[i]` stream sentinels to host glibc streams). See
+//! `SYS_gettid` in the init path), the bionic stdio `fprintf`/`fscanf`/`vfprintf` translation
+//! (2026-06-12 — remap the bionic `&__sF[i]` stream sentinels to host glibc streams) — and the
+//! `sigaltstack` caller-attribution wrapper (2026-06-12, core 1223806 — `__builtin_return_address`
+//! has no stable Rust spelling). See
 //! `src/loader/liblog_shim.c` / `src/loader/bionic_syscall_shim.c` / `src/loader/stdio_shim.c` /
+//! `src/loader/sigaltstack_shim.c` /
 //! `src/loader/native_provider.rs` / `src/loader/bionic_pthread.rs` for the full rationale.
 //!
 //! Also builds the apkenv-loadable `libm` shim cdylib (`crates/libm-shim`, see `build_libm_shim`) and
@@ -34,6 +38,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/loader/bionic_syscall_shim.c");
     println!("cargo:rerun-if-changed=src/loader/native_load_shim.cpp");
     println!("cargo:rerun-if-changed=src/loader/stdio_shim.c");
+    println!("cargo:rerun-if-changed=src/loader/sigaltstack_shim.c");
 
     // `compile` emits `cargo:rustc-link-lib=static=eclipse_liblog_shim` + the link-search path, so
     // the archive is linked into the lib, the bin, AND the test harness. The shim's two symbols are
@@ -64,6 +69,15 @@ fn main() {
     cc::Build::new()
         .file("src/loader/stdio_shim.c")
         .compile("eclipse_stdio_shim");
+
+    // The clean-room `sigaltstack(2)` CALLER-ATTRIBUTION shim (2026-06-12, core 1223806): DEFINES
+    // `eclipse_sigaltstack(ss, old_ss)`, capturing `__builtin_return_address(0)` (no stable Rust
+    // spelling for the caller's return address) and tail-calling the Rust-exported
+    // `eclipse_sigaltstack_record`, which forwards to host glibc and logs WHO registered each
+    // alternate signal stack. See `src/loader/sigaltstack_shim.c` for the full rationale.
+    cc::Build::new()
+        .file("src/loader/sigaltstack_shim.c")
+        .compile("eclipse_sigaltstack_shim");
 
     // The clean-room C++ DELEGATION shim for ART's `JavaVMExt::LoadNativeLibrary`: DEFINES
     // `eclipse_art_load_native_library(...)`, which builds the `std::string` args with the host

@@ -3876,6 +3876,131 @@ fn register_sensor_manager_natives(env: &mut Env) -> Result<(), FrameworkError> 
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.os.Vibrator ====================================
+//
+// 2026-06-12 (core 1223806 boot, /tmp/eclipse-947663-validate.log line 691): Roblox's InitHelper
+// AsyncTask `onPostExecute` → `ContextWrapper.getSystemService("vibrator")` constructed
+// `android.os.Vibrator`, whose CONSTRUCTOR calls `native_constructor()` — unbound, so the
+// `UnsatisfiedLinkError` propagated out of `Looper.loop`, `pump_main_looper` returned the error,
+// and the main Looper pump was permanently dead 17 ms before the crash (no main-thread Handler
+// continuation ever dispatched again — the splash init state machine killed). The loud pump
+// failure is CORRECT behavior (it surfaced this gap; no catch-and-continue is added there) — the
+// fix is binding the class's FULL declared native list, read from the vendored ATL
+// `src/api-impl/android/os/Vibrator.java` (2026-06-12): exactly two —
+//   `private native int native_constructor();`            → `()I`  (instance)
+//   `private native void native_vibrate(int fd, long millis);` → `(IJ)V` (instance)
+// Binding BOTH (not just the constructor ART reported) so a later vibrate can never re-kill the
+// pump the same way. Same-pattern audit (2026-06-12): of ATL ContextImpl.getSystemService's 27
+// service classes, Vibrator is the ONLY one whose constructor invokes a native — the others'
+// natives are method-level and stay on the discovery loop (bind on run evidence).
+
+/// `android.os.Vibrator` (internal/slashed name for `find_class`) — hosts the vibrator natives.
+pub const VIBRATOR_CLASS: &JNIStr = jni_str!("android/os/Vibrator");
+
+// `Vibrator.java` line 38 (vendored ATL): `private native int native_constructor();` — an
+// instance native returning the vibrator device fd, `-1` = no device (the Java `vibrate(long)`
+// checks `fd != -1` and logs instead of vibrating).
+const VIBRATOR_NATIVE_CONSTRUCTOR_NAME: &JNIStr = jni_str!("native_constructor");
+const VIBRATOR_NATIVE_CONSTRUCTOR_SIG: &JNIStr = jni_str!("()I");
+
+// `Vibrator.java` line 37 (vendored ATL): `private native void native_vibrate(int fd, long
+// millis);` — an instance native; only reachable when the constructor returned a real fd.
+const VIBRATOR_NATIVE_VIBRATE_NAME: &JNIStr = jni_str!("native_vibrate");
+const VIBRATOR_NATIVE_VIBRATE_SIG: &JNIStr = jni_str!("(IJ)V");
+
+/// `Vibrator.native_constructor()` → `-1` = "no vibration device".
+///
+/// 2026-06-12: the documented constant-handle host semantic — a Linux desktop has no vibration
+/// motor (ATL's own C backing opens `/dev/input/eventX` and returns `-1` when absent; Eclipse
+/// detects-not-assumes by reporting the honest no-device value). The Java class handles `-1`
+/// itself (`vibrate` logs instead of calling `native_vibrate`), so this is intentional capability
+/// handling, not a stub: every Vibrator API stays callable and well-defined.
+extern "system" fn vibrator_native_constructor<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jint {
+    // The closure is infallible (returns `Ok(-1)`); `LogErrorAndDefault`'s `0` on the unreachable
+    // error path is still sound — `native_vibrate(0, …)` is bound below and no-ops.
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        tracing::debug!(
+            target: "android.os.Vibrator",
+            "Vibrator.native_constructor: no vibration device on the host (fd = -1)"
+        );
+        Ok(-1)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Vibrator.native_vibrate(int fd, long millis)` → recorded no-op.
+///
+/// 2026-06-12: unreachable through Eclipse's own constructor (it returns `-1` and the Java side
+/// gates on it), but bound anyway — the FULL declared native list — so no code path through this
+/// class can ever surface another `UnsatisfiedLinkError` out of `Looper.loop` (the core-1223806
+/// pump kill). Logged so a real call is visible evidence, never silent.
+extern "system" fn vibrator_native_vibrate<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    fd: jint,
+    millis: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::debug!(
+            target: "android.os.Vibrator",
+            fd,
+            millis,
+            "Vibrator.native_vibrate: no-op (no vibration motor on the host)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's backing for `android.os.Vibrator`'s FULL declared native list.
+///
+/// Registered before the lifecycle drive: `getSystemService("vibrator")` constructs the class
+/// from a main-Looper message (InitHelper's `AsyncTask.onPostExecute`), and an unbound native
+/// there kills the main Looper pump (2026-06-12, core-1223806 boot).
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
+/// They do, by construction — both natives are written to the exact descriptors declared in the
+/// vendored ATL `Vibrator.java` (pinned by `vibrator_native_names_sigs_and_class_match_vibrator_java`).
+/// Both bodies are `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_vibrator_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(VIBRATOR_CLASS)?;
+    let methods = [
+        // SAFETY: `vibrator_native_constructor` matches the paired `()I` signature as an instance
+        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is
+        // how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIBRATOR_NATIVE_CONSTRUCTOR_NAME,
+                VIBRATOR_NATIVE_CONSTRUCTOR_SIG,
+                vibrator_native_constructor as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `vibrator_native_vibrate` matches the paired `(IJ)V` signature as an instance
+        // native (see the native's docs); same casting contract as above.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIBRATOR_NATIVE_VIBRATE_NAME,
+                VIBRATOR_NATIVE_VIBRATE_SIG,
+                vibrator_native_vibrate as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/os/Vibrator; `methods` hold valid fn pointers whose
+    // signatures match the class's two `native` declarations (verified against the vendored ATL
+    // `Vibrator.java`, 2026-06-12; constructor signature also from the ART
+    // `No implementation found for int android.os.Vibrator.native_constructor()` line).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/os/Vibrator",
+        "registered Eclipse's no-vibration-device backing for native_constructor + native_vibrate"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.view.View native peer construction =============
 //
 // 2026-06-05: step 4 (`Activity.createMainActivity`) constructs the launcher Activity, whose
@@ -7714,6 +7839,12 @@ fn drive_lifecycle(
     // isActiveNetworkMetered / nativeGetNetworkAvailable) — Roblox's jobqueue connectivity monitor calls
     // registerNetworkCallback in ActivitySplash.onCreate (step 5). Non-GTK no-op/available backing.
     register_connectivity_natives(env)?;
+    // Bind android.os.Vibrator's FULL declared native list — getSystemService("vibrator")
+    // constructs the class from a main-Looper message (Roblox InitHelper's AsyncTask
+    // onPostExecute), and its CONSTRUCTOR calls native_constructor(); unbound, the
+    // UnsatisfiedLinkError escaped Looper.loop and permanently killed the main Looper pump
+    // (2026-06-12, core-1223806 boot). No-vibration-device host backing (fd = -1).
+    register_vibrator_natives(env)?;
     // Bind android.database.sqlite.SQLiteConnection's natives (libsqlite3-backed) — Roblox's
     // ActivitySplash.onCreate (step 5) opens a SQLite DB (SQLiteOpenHelper.getWritableDatabase).
     // Phase A: open + statement lifecycle + non-cursor executes (nativeExecuteForCursorWindow is Phase B).
@@ -8955,6 +9086,28 @@ mod tests {
             SENSOR_MANAGER_REGISTER_SIG.to_str(),
             "(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V"
         );
+    }
+
+    #[test]
+    fn vibrator_native_names_sigs_and_class_match_vibrator_java() {
+        // 2026-06-12 (core-1223806 boot): pin android.os.Vibrator's class, method names, and JNI
+        // descriptors against the vendored ATL `Vibrator.java`'s FULL declared native list
+        // (`private native int native_constructor();` → `()I`; `private native void
+        // native_vibrate(int fd, long millis);` → `(IJ)V`) and the exact ART-reported gap
+        // (`No implementation found for int android.os.Vibrator.native_constructor()`,
+        // /tmp/eclipse-947663-validate.log:691). A transcription regression would make
+        // RegisterNatives throw NoSuchMethodError — or leave a native unbound, whose
+        // UnsatisfiedLinkError escapes Looper.loop and permanently kills the main Looper pump
+        // (the splash-init death this binding fixes). Both natives asserted = the full-list
+        // count pin. Host-independent constants.
+        assert_eq!(VIBRATOR_CLASS.to_str(), "android/os/Vibrator");
+        assert_eq!(
+            VIBRATOR_NATIVE_CONSTRUCTOR_NAME.to_str(),
+            "native_constructor"
+        );
+        assert_eq!(VIBRATOR_NATIVE_CONSTRUCTOR_SIG.to_str(), "()I");
+        assert_eq!(VIBRATOR_NATIVE_VIBRATE_NAME.to_str(), "native_vibrate");
+        assert_eq!(VIBRATOR_NATIVE_VIBRATE_SIG.to_str(), "(IJ)V");
     }
 
     #[test]

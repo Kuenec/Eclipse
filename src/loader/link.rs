@@ -1967,6 +1967,31 @@ mod tests {
                 "{name} is a bionic-only name the host glibc does not export"
             );
         }
+        // 2026-06-12 (core 1223806) — the FAIL-CLOSED pin for the host-shadowed Eclipse natives:
+        // these names exist in HOST glibc too, so they were never on the work-list — a dropped
+        // Eclipse registration would silently re-open the host fall-through (the exact mechanism
+        // of the core: glibc's dl_iterate_phdr walk can never contain the Eclipse-mapped engine
+        // images → every engine C++ throw std::terminate-loops; the 947663 allowlist lesson — no
+        // host-fall-through allowlisting). Each must resolve through the full scope to the EXACT
+        // Eclipse-provider address, and the host must ALSO export the name (proving the pin is
+        // load-bearing, not vacuous).
+        for shadowed in ["dl_iterate_phdr", "dladdr", "sigaltstack"] {
+            let e = eclipse_only
+                .resolve(shadowed)
+                .unwrap_or_else(|| panic!("Eclipse provider must own {shadowed}"));
+            let scoped = eclipse_scope
+                .resolve(shadowed)
+                .unwrap_or_else(|| panic!("full Eclipse scope resolves {shadowed}"));
+            assert_eq!(
+                scoped.addr, e.addr,
+                "{shadowed} must resolve to the ECLIPSE address, never fall through to host \
+                 glibc (core 1223806: the host walk is blind to Eclipse-mapped modules)"
+            );
+            assert!(
+                host_only.resolve(shadowed).is_some(),
+                "{shadowed} is host-shadowed (glibc exports it) — the pin above is load-bearing"
+            );
+        }
         // 3) Apply the Eclipse-tier-resolvable subset on the mapped engine and verify the new slots.
         let stats = set
             .relocate_object_symbols_partial("libroblox.so", &eclipse_scope, page)
@@ -2176,6 +2201,78 @@ mod tests {
             );
             drop(set);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- module_registry: the dl_iterate_phdr walk over a REAL loader-mapped module -------------
+    //
+    // 2026-06-12 (core 1223806): the regression pin for the Eclipse `dl_iterate_phdr` native's
+    // contract. The engine's statically-linked libc++abi unwinder finds FDEs through this walk;
+    // host glibc's walk can never contain the Eclipse-mapped images, so a regression here means
+    // every engine C++ throw is a std::terminate re-raise loop again. The raw-callback FFI lives
+    // in `module_registry::walk_support` (this module is `forbid(unsafe_code)`).
+
+    #[test]
+    fn module_registry_enumerates_loader_mapped_and_host_modules() {
+        use crate::loader::module_registry::{walk_support, ModuleRecord};
+
+        // Map a fixture .so through the REAL loader pipeline, build its registry record, and walk.
+        let dir = temp_dir("phdrwalk");
+        let so = build_so("phdrwalk.so", &[], Some("walk_export"), None);
+        let so_path = write_so(&dir, "phdrwalk.so", &so);
+        let linker = Linker::new(Vec::<PathBuf>::new());
+        let set = linker.load(&so_path).expect("map the fixture");
+        let obj = &set.objects[0];
+        let img = obj.image().expect("re-parse the fixture");
+        let rec = ModuleRecord::for_image(
+            &obj.path,
+            &obj.bytes,
+            &img.dynsyms,
+            obj.load_base(),
+            obj.mapped.span() as u64,
+        )
+        .expect("derive the registry record");
+        // The fixture has no PT_PHDR; the derivation goes through the PT_LOAD containment path:
+        // table at file offset 0x40 inside the identity-mapped PT_LOAD → base + 0x40, 2 phdrs.
+        assert_eq!(rec.phdr_addr(), obj.load_base() + 0x40);
+        assert_eq!(rec.phnum(), 2);
+
+        // The walk must enumerate the Eclipse module (correct base/name/phnum, a dereferenceable
+        // phdr table, the full API-30+ struct size) AND at least one host module (the glibc
+        // delegation) — the exact dual visibility core 1223806's unwinder lacked.
+        let records = [rec];
+        let (rc, seen) = walk_support::collect(&records);
+        assert_eq!(rc, 0, "a never-stopping walk returns 0");
+        let ours = seen
+            .iter()
+            .find(|s| s.addr == obj.load_base())
+            .expect("the loader-mapped module must be enumerated");
+        assert_eq!(ours.phnum, 2, "dlpi_phnum is the image's phdr count");
+        assert!(
+            ours.name.ends_with("phdrwalk.so"),
+            "dlpi_name is the loaded path (got {})",
+            ours.name
+        );
+        assert_eq!(
+            ours.size,
+            std::mem::size_of::<crate::loader::module_registry::BionicDlPhdrInfo>(),
+            "the size argument versions the full bionic API-30+ struct"
+        );
+        assert_eq!(
+            ours.first_p_type, 1,
+            "dlpi_phdr points at the MAPPED phdr table (entry 0 is the fixture's PT_LOAD)"
+        );
+        assert!(
+            seen.iter().any(|s| s.addr != obj.load_base()),
+            "the host delegation must enumerate at least one host module"
+        );
+
+        // The rc-stop contract: the first nonzero callback return ends the walk and is returned.
+        let (rc, calls) = walk_support::stop_after_first(&records);
+        assert_eq!(rc, 7, "the callback's nonzero rc is the walk's return");
+        assert_eq!(calls, 1, "the walk stops at the first nonzero rc");
+
+        drop(set);
         std::fs::remove_dir_all(&dir).ok();
     }
 
