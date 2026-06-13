@@ -128,7 +128,35 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). ⇐ START HERE NEXT SESSION.**
+- **2026-06-13 — 🖼️ RENDER PHASE 6 SHIPPED: VULKAN WSI TRANSLATION (Android→Wayland) via a tier-0 `dlsym` interposer.
+  ⇐ START HERE NEXT SESSION.** After Phase 5 un-gated Vulkan (API 28), Mode 6 failed `Unable to create Vulkan instance`
+  because the engine requests the Android-only `VK_KHR_android_surface` instance extension, absent from the host Linux
+  Vulkan ICD. KEY MECHANISM (proven, settles the Phase-5 plan's open question): the engine **`dlopen`s `libvulkan.so` at
+  RUNTIME and `dlsym`s the loader commands by name** — `vk*` are NOT `DT_NEEDED`/UND imports, so the tier-0 `vk*` natives
+  are NEVER consulted for it (diagnostic: zero shim hits until `dlsym` was intercepted). But `dlsym` IS a UND import the
+  engine resolves through Eclipse's scope. FIX (`src/loader/vulkan_wsi.rs` + a tier-0 `dlsym` registration in
+  `native_provider`): `eclipse_dlsym` returns Eclipse's WSI-translating shims for the three Vulkan-loader entry points the
+  engine looks up by name (`vkGetInstanceProcAddr` is load-bearing — the engine reaches the rest THROUGH it), forwarding
+  every other symbol unchanged to the host `dlsym`. The shims: `eclipse_vk_create_instance` swaps
+  `VK_KHR_android_surface`→`VK_KHR_wayland_surface` in the enabled-extension list (order/pNext/appinfo/layers preserved)
+  and forwards to the host `vkCreateInstance`; `eclipse_vk_create_android_surface_khr` builds a
+  `VkWaylandSurfaceCreateInfoKHR` from Eclipse's own winit `wl_display` (`ndk_registry::wsi_display`) + `wl_surface`
+  (`ndk_registry::wsi_wl_surface`, newly published by `graphics.rs::resumed`) and forwards to the host
+  `vkCreateWaylandSurfaceKHR` (the engine's `ANativeWindow` is ignored — Eclipse owns the real WSI). LIVE BOOT
+  (`/tmp/eclipse-vkdlsym.log`, EXIT=124): **✅ Vulkan instance + surface + device now CREATE** — the engine resolves
+  hundreds of `vk*` through Eclipse's `vkGetInstanceProcAddr` and progresses to `RenderView created[1]`; `Mode 6` no
+  longer fails on instance creation. Gate clean (566 unit incl. `vulkan_wsi` swap + `wsi_wl_surface` round-trip tests +
+  4 integ + 2 doctest; 134-base count test updated). **NEW SINGLE COMMON RENDER BLOCKER (both paths now hit it):**
+  `Mode 6 failed: Error opening shader pack vulkan_mobile` AND `Mode 4 failed: Error opening shader pack glsles3` →
+  `RenderView is NULL`. So the shader-pack open is the COMMON final blocker for BOTH Vulkan and GLES3 (NOT path-specific
+  as Phase-5 §5 framed it). EVIDENCE (Phase-5 forensics, still valid): the engine reads the pack DIRECTLY from the APK
+  (its own zip reader — `lseek` to the CRC-valid STORED entry; it ignores the Phase-4 extracted FS tree; corrupting the
+  FS copy was byte-identical) and rejects the valid `RBXS` bytes POST-READ. Since it is now common to BOTH packs/APIs,
+  the failure is in the engine's COMMON pack open/read/parse, not an API/GL/Vulkan-surface step. NEXT: granular syscall
+  trace (read/pread/lseek, attach-late) of the `vulkan_mobile` pack read to see exactly how far the read gets + what the
+  engine does at the rejection; weigh provisioning (merged-APK engine/shader version skew — though same-version + intact
+  CRC argues against it) vs a common decompress/parse step. Detail: §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
+- **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
   dev-host) established the chain and **corrected the Phase 4 hypothesis below** (Phase 4 was the WRONG layer — see its
@@ -3641,6 +3669,24 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Two next gates revealed (either unblocks render — pick next session):* **(a) Vulkan (reference path; Sober uses it):** `Mode 6 failed: Unable to create Vulkan instance` because the engine requests the Android-only `VK_KHR_android_surface` instance extension, absent from the host Linux Vulkan ICD. Eclipse needs a Vulkan-surface translation seam (parallel to the EGL connection-match): intercept `vkCreateInstance` to swap `VK_KHR_android_surface`→`VK_KHR_wayland_surface` (+ `vkEnumerateInstanceExtensionProperties` filtering), and `vkCreateAndroidSurfaceKHR`→`vkCreateWaylandSurfaceKHR` on winit's `wl_display`+`wl_surface`. **(b) GLES3 (EGL already wired by Phase 3):** `Error opening shader pack glsles3` is a POST-READ rejection of valid bytes; forensics' medium-confidence hypothesis is the empty `ro.product.*`/`ro.build.*` store collapsing the engine into a bogus "HTC unknown" low-end profile (`Excluded 'HTC unknown:…RTX 5070' - disabling SuperHQ shaders`, `GLES MT shader loading is disabled`, 64 MiB VRAM floor) that gates the pack. NEXT PROBE: populate sane `ro.product.*`/`ro.build.*` in `native_provider.rs::eclipse_system_property_get` (currently empty for every key) and re-boot (confirm-by-fix).
 
   *Files:* `src/runtime.rs` (`vm_options()` SDK_INT push + `vm_options_propagate_clamped_sdk_int` test), `AGENTS.md`. Forensics: workflow `eclipse-shader-render-forensics`.
+
+---
+
+### 2026-06-13 — 🖼️ Render Phase 6: VULKAN WSI TRANSLATION (Android→Wayland) — a tier-0 `dlsym` interposer routes the engine's runtime-dlopen'd libvulkan lookups to Eclipse's `vkCreateInstance` (ext-swap) + `vkCreateAndroidSurfaceKHR`→wayland shims; Mode-6 "Unable to create Vulkan instance" FIXED
+
+  *Confirmed root cause (orchestrator live boots + syscall/`dlsym` diagnostics):* with API 28 (Phase 5) the engine attempts Vulkan Mode 6 and requests instance extensions `VK_KHR_surface` + `VK_KHR_get_physical_device_properties2` + `VK_KHR_android_surface`; `vkCreateInstance` returns `VK_ERROR_EXTENSION_NOT_PRESENT` (`Mode 6 failed: Unable to create Vulkan instance`) because the host Linux Vulkan ICD has `VK_KHR_wayland_surface`, not the Android-only `VK_KHR_android_surface`. CRITICAL MECHANISM (this settles the Phase-5 open question of how the engine resolves `vk*`): the engine **`dlopen`s `/usr/lib/libvulkan.so.1` at RUNTIME and `dlsym`s the loader commands by name** — `vk*` are NOT `DT_NEEDED`/UND imports, so Eclipse's tier-0 `vk*` natives are NEVER consulted for the engine (PROVEN: a first registration of tier-0 `vkCreateInstance`/`vkGetInstanceProcAddr`/`vkCreateAndroidSurfaceKHR` got ZERO shim hits — the engine bypassed them entirely, unlike `eglGetDisplay` which IS a UND import). `dlsym` and `dlopen`, however, ARE UND imports the engine resolves through Eclipse's scope.
+
+  *Fix (the interception point is `dlsym`, not the `vk*` symbols):* a new `src/loader/vulkan_wsi.rs` + a tier-0 `dlsym` registration. `eclipse_dlsym` (registered at tier 0 in `native_provider`, winning over the host `dlsym` by `resolve`'s first-strong-match) returns Eclipse's shims for exactly the three Vulkan-loader entry points the engine looks up by name — `vkGetInstanceProcAddr` (load-bearing: the engine reaches `vkCreateInstance` + everything else THROUGH it), `vkCreateInstance`, `vkCreateAndroidSurfaceKHR` — and forwards every other symbol UNCHANGED to the host `dlsym` (a faithful pass-through). The shims (all `extern "system"`, ash 0.38 `vk::` types): **`eclipse_vk_get_instance_proc_addr`** returns the two create-shims by name, else forwards to the host `vkGetInstanceProcAddr` (`ash::Entry::load().static_fn()`); **`eclipse_vk_create_instance`** copies the requested extension list swapping `VK_KHR_android_surface`→`VK_KHR_wayland_surface` (order + pNext + app_info + layers + flags preserved), then forwards to the host `vkCreateInstance` (`entry.fp_v1_0().create_instance`); **`eclipse_vk_create_android_surface_khr`** builds a `VkWaylandSurfaceCreateInfoKHR` from Eclipse's winit `wl_display` (`ndk_registry::wsi_display`) + `wl_surface` (`ndk_registry::wsi_wl_surface`, newly published in `graphics.rs::resumed` from `RawWindowHandle::Wayland`) and forwards to the host `vkCreateWaylandSurfaceKHR` (resolved via the host `vkGetInstanceProcAddr` on the instance) — the engine's `ANativeWindow`-bound create-info is ignored since Eclipse owns the real WSI handles; returns `VK_ERROR_INITIALIZATION_FAILED` when the host loader or WSI handles are absent (clean failure, never UB). The three vk* tier-0 native registrations from the first cut are KEPT (harmless — they would serve any future lib that DID UND-import vk*).
+
+  *Same-pattern audit:* the only Android-WSI extension the engine requests that the host lacks is `VK_KHR_android_surface` (→ `vkCreateAndroidSurfaceKHR`); the EGL path's analogous Android→Wayland mismatch was already handled by the Phase-3 `eglGetDisplay` connection-match. No other Android-only WSI symbol is in the engine's Vulkan path (it resolves the rest — swapchain/device/queue — through the host unchanged via the forwarding `vkGetInstanceProcAddr`). `dlsym` interposition is scoped to the three names; all else is verbatim host `dlsym`.
+
+  *Regression protection:* `loader::vulkan_wsi::tests::swap_android_for_wayland_surface_replaces_only_android_and_preserves_order` + `..._is_identity_without_android` (pure extension-rewrite core — the one part testable without a live ICD); `ndk_registry` `wsi_wl_surface` round-trip; the `native_provider` registration-count test updated to 134 base (+1 `dlsym`). The live forwarding path (host `vkCreateInstance`/`vkCreateWaylandSurfaceKHR`) is inherently a dev-host live-boot concern (needs a real ICD; cannot run under `cargo test`) and is owner-validated below.
+
+  *Verification (this tree):* `cargo fmt`/`build --all-targets` 0-warn/`clippy -D warnings` 0-warn/`cargo test` **566 unit + 4 integ (0 SKIP) + 2 doctest, 0 failed** (+3 vs Phase 5)/`cargo build --release` clean. OWNER LIVE BOOT (`/tmp/eclipse-vkdlsym.log`, EXIT=124): the engine's `dlsym("vkGetInstanceProcAddr")` is intercepted, `eclipse_vk_create_instance` runs with the host loader present, the engine then resolves hundreds of `vk*` through Eclipse's `vkGetInstanceProcAddr` and **progresses past Vulkan instance + surface + device creation to `RenderView created[1]`** — `Mode 6` no longer fails on instance creation.
+
+  *New single common render blocker (next session):* Mode 6 now fails `Error opening shader pack vulkan_mobile` and Mode 4 fails `Error opening shader pack glsles3` → `RenderView is NULL`. The shader-pack open is the COMMON final blocker for BOTH render paths. The engine reads the pack DIRECTLY from the APK (CRC-valid STORED `RBXS` bytes; ignores the Phase-4 FS tree — corrupting the FS copy is byte-identical) and rejects it POST-READ. Being common to both packs/APIs, it is in the engine's COMMON pack open/read/parse (not an API/GL/Vulkan step). NEXT: granular attach-late `strace` (read/pread/lseek) of the `vulkan_mobile` pack read to see how far the read gets + the rejection point; weigh provisioning (merged-APK engine/shader version skew — same-version + intact CRC argues against) vs a common decompress/parse step.
+
+  *Files:* `src/loader/vulkan_wsi.rs` (NEW — shims + `eclipse_dlsym` interposer + tests), `src/loader.rs` (`pub mod vulkan_wsi`), `src/loader/ndk_registry.rs` (`set_wsi_wl_surface`/`wsi_wl_surface` + test), `src/loader/native_provider.rs` (tier-0 `dlsym` + 3 `vk*` registrations, count test), `src/graphics.rs` (publish `wl_surface` in `resumed`), `AGENTS.md`. Implement+review: workflow `eclipse-vulkan-wsi-translation`.
 
 ---
 

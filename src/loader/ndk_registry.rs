@@ -429,6 +429,35 @@ pub fn wsi_display() -> Option<usize> {
     WSI_DISPLAY.lock().ok().and_then(|d| *d)
 }
 
+/// 2026-06-13 — render Phase 6 (Vulkan WSI): the RAW winit `wl_surface*` (as a `usize`) the engine's
+/// Vulkan `vkCreateWaylandSurfaceKHR` needs. This is DISTINCT from the `wl_egl_window*` that
+/// [`register_wsi_window`] stores for the EGL path: `wl_egl_window` is a Mesa EGL wrapper built on top
+/// of the `wl_surface`, whereas `VkWaylandSurfaceCreateInfoKHR.surface` is the BARE `wl_surface*`. The
+/// engine requests the Android-only `VK_KHR_android_surface` instance extension + `vkCreateAndroidSurfaceKHR`,
+/// which the host Linux Vulkan ICD lacks; Eclipse's tier-0 Vulkan shims swap that to
+/// `VK_KHR_wayland_surface` and build a `VkWaylandSurfaceCreateInfoKHR` from THIS pointer plus
+/// [`wsi_display`]'s `wl_display`. `None` on X11/other (the engine's X11 path is a separate seam). Stores
+/// only the pointer VALUE as `usize` (this module is `#![forbid(unsafe_code)]`), exactly like
+/// [`WSI_DISPLAY`].
+static WSI_WL_SURFACE: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Record the RAW winit Wayland `wl_surface*` (as a `usize`), or `None` on X11/other (see
+/// [`WSI_WL_SURFACE`]). Called by `graphics::run_windowed`'s `resumed` once it has the winit window's
+/// raw window handle. A poisoned lock is ignored (best-effort; never panics — AGENTS.md §2.8).
+pub fn set_wsi_wl_surface(surface: Option<usize>) {
+    if let Ok(mut s) = WSI_WL_SURFACE.lock() {
+        *s = surface;
+    }
+}
+
+/// The registered RAW winit Wayland `wl_surface*` (as a `usize`), or `None` on X11/other or before
+/// `resumed` registered it (see [`WSI_WL_SURFACE`]). The tier-0 `vkCreateAndroidSurfaceKHR` native reads
+/// this (with [`wsi_display`]) to build the host `vkCreateWaylandSurfaceKHR` request. Poisoned lock →
+/// `None`.
+pub fn wsi_wl_surface() -> Option<usize> {
+    WSI_WL_SURFACE.lock().ok().and_then(|s| *s)
+}
+
 /// 2026-06-13 — render Phase 2.1 present-loop handoff CONFIRMATION signal: set `true` the first time the
 /// engine actually PULLS the real WSI surface, i.e. `ANativeWindow_fromSurface`
 /// ([`super::native_provider::eclipse_anativewindow_fromsurface`]) returns the real WSI pointer (its
@@ -727,6 +756,29 @@ mod tests {
             wsi_display(),
             None,
             "clearing to None (X11/other) is observed by wsi_display"
+        );
+    }
+
+    #[test]
+    fn wsi_wl_surface_round_trips_set_and_get() {
+        // 2026-06-13: the raw winit wl_surface the engine's vkCreateWaylandSurfaceKHR needs (distinct
+        // from the wl_egl_window register_wsi_window stores for EGL). set_wsi_wl_surface round-trips
+        // through wsi_wl_surface; Some(ptr) on Wayland, None on X11/other. Serialized under
+        // WSI_TEST_LOCK and RESTORED to None at the end so it does not leak into other tests in this
+        // binary (same discipline as wsi_display_round_trips_set_and_get).
+        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p: usize = 0x6000_2000;
+        set_wsi_wl_surface(Some(p));
+        assert_eq!(
+            wsi_wl_surface(),
+            Some(p),
+            "a registered Wayland wl_surface round-trips through wsi_wl_surface"
+        );
+        set_wsi_wl_surface(None);
+        assert_eq!(
+            wsi_wl_surface(),
+            None,
+            "clearing to None (X11/other) is observed by wsi_wl_surface"
         );
     }
 

@@ -166,11 +166,16 @@ impl EclipseNativeProvider {
     /// before, whose sigset_t/sigaction LAYOUT is incompatible; + the sigaltstack attribution
     /// forward, 2026-06-12); link-map introspection's 2 (dl_iterate_phdr/dladdr, 2026-06-12); the
     /// netdb resolver-ABI 4 (getaddrinfo/freeaddrinfo/gai_strerror/getnameinfo, 2026-06-12 — the
-    /// engine DnsResolve root cause; see the netdb section); ndk-android's 28
+    /// engine DnsResolve root cause; see the netdb section); EGL display interception's 1
+    /// (eglGetDisplay, 2026-06-13 — the EGL_BAD_ALLOC 3003 connection-match); Vulkan WSI
+    /// interception's 3 (vkGetInstanceProcAddr/vkCreateInstance/vkCreateAndroidSurfaceKHR, 2026-06-13 —
+    /// the Android→Wayland Vulkan WSI translation; see [`super::vulkan_wsi`]); ndk-android's 28
     /// (AAsset* real via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow
     /// sound-stub — `ANativeWindow_getFormat` added 2026-06-12 for `libsurface_util_jni.so`'s
     /// pre-load); media-ndk's 33 sound-stubs and audio's 8 (REAL OpenSL ES → host audio via
-    /// [`super::opensl`]). **129** base symbols (the pthread + sysconf groups register on top).
+    /// [`super::opensl`]). **134** base symbols (the pthread + sysconf groups register on top) —
+    /// includes the tier-0 `dlsym` interposer that hands the engine the Vulkan WSI shims it `dlsym`s
+    /// from its runtime-`dlopen`ed libvulkan (see [`super::vulkan_wsi::eclipse_dlsym`]).
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -413,6 +418,37 @@ impl EclipseNativeProvider {
         // cross-connection. Wins over host libEGL by `resolve`'s first-strong-match (tier 0 before
         // tier 1). See `eclipse_egl_get_display`.
         p.register("eglGetDisplay", eclipse_egl_get_display as *const () as u64);
+
+        // Vulkan WSI interception (3) — 2026-06-13: tier-0 `vk*` shims that translate the engine's
+        // Android Vulkan WSI to the host Linux Wayland WSI. The engine (API 28 ⇒ Mode 6) requests the
+        // Android-only `VK_KHR_android_surface` instance extension + `vkCreateAndroidSurfaceKHR`, absent
+        // from the host ICD → `Mode 6 failed: Unable to create Vulkan instance`. `vkCreateInstance` swaps
+        // `VK_KHR_android_surface`→`VK_KHR_wayland_surface`; `vkCreateAndroidSurfaceKHR` builds the surface
+        // on Eclipse's winit `wl_display`+`wl_surface` via the host `vkCreateWaylandSurfaceKHR`;
+        // `vkGetInstanceProcAddr` routes the two shims by name (proc-addr path) and forwards the rest. Win
+        // over host libvulkan by `resolve`'s first-strong-match (tier 0 before tier 1), exactly like
+        // `eglGetDisplay`. See `super::vulkan_wsi`.
+        p.register(
+            "vkGetInstanceProcAddr",
+            super::vulkan_wsi::eclipse_vk_get_instance_proc_addr as *const () as u64,
+        );
+        p.register(
+            "vkCreateInstance",
+            super::vulkan_wsi::eclipse_vk_create_instance as *const () as u64,
+        );
+        p.register(
+            "vkCreateAndroidSurfaceKHR",
+            super::vulkan_wsi::eclipse_vk_create_android_surface_khr as *const () as u64,
+        );
+        // 2026-06-13: the engine `dlopen`s libvulkan at runtime and `dlsym`s the Vulkan loader commands by
+        // name (they are NOT UND imports, so the three `vk*` registrations above are never consulted for
+        // it). `dlsym` IS a UND import the engine resolves through Eclipse's scope, so a tier-0 `dlsym`
+        // interposer hands back the WSI-translating shims for the loader entry points and forwards every
+        // other symbol unchanged to the host `dlsym`. See `super::vulkan_wsi::eclipse_dlsym`.
+        p.register(
+            "dlsym",
+            super::vulkan_wsi::eclipse_dlsym as *const () as u64,
+        );
 
         // ANativeWindow (6) — WSI-bound: fromSurface returns the REAL host-EGL native window Eclipse
         // owns, getters return real geometry/format, refcount ops are no-ops (the engine render WSI
@@ -4600,14 +4636,18 @@ mod tests {
         // 2026-06-12 — the core-947663 destructor-order fix and the last libbacktrace-native
         // pre-load import) + 5 bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/
         // getpagesize/sysinfo — the allocator-bootstrap fix, 2026-06-05) + 1 EGL display interception
-        // (2026-06-13 — eglGetDisplay, the EGL_BAD_ALLOC 3003 connection-match fix) = 188.
+        // (2026-06-13 — eglGetDisplay, the EGL_BAD_ALLOC 3003 connection-match fix) + 4 Vulkan WSI
+        // interception (2026-06-13 — vkGetInstanceProcAddr/vkCreateInstance/vkCreateAndroidSurfaceKHR
+        // plus the `dlsym` interposer that routes the engine's runtime-dlopen'd libvulkan lookups to
+        // them, the Android→Wayland Vulkan WSI translation; Mode-6 "Unable to create Vulkan instance" fix) = 192.
         assert_eq!(
             p.len(),
-            130 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            134 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
             "6 liblog + 16 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
-             introspection + 4 netdb resolver-ABI + 1 EGL display interception + 28 ndk-android + \
-             33 media-ndk + 8 audio + 53 pthread + 5 sysconf system-query natives registered"
+             introspection + 4 netdb resolver-ABI + 1 EGL display interception + 4 Vulkan WSI \
+             interception + 28 ndk-android + 33 media-ndk + 8 audio + 53 pthread + 5 sysconf \
+             system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim + 1 va_list C-shim)
@@ -4678,6 +4718,10 @@ mod tests {
             "getnameinfo",
             // EGL display interception (1) — 2026-06-13 (EGL_BAD_ALLOC 3003 connection-match)
             "eglGetDisplay",
+            // Vulkan WSI interception (3) — 2026-06-13 (Android→Wayland Vulkan WSI translation)
+            "vkGetInstanceProcAddr",
+            "vkCreateInstance",
+            "vkCreateAndroidSurfaceKHR",
             // ndk-android (28)
             "AAssetManager_fromJava",
             "AAssetManager_open",
