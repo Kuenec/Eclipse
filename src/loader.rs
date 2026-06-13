@@ -108,3 +108,4 @@ pub mod opensl;
 pub mod reloc;
 pub mod resolve;
 pub mod tls;
+pub mod vulkan_wsi;

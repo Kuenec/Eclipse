@@ -31,7 +31,7 @@ use std::ffi::CStr;
 use std::fmt;
 
 use ash::{khr, vk};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::error::{EventLoopError, OsError};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -228,6 +228,26 @@ impl ApplicationHandler for GameWindow<'_> {
                 _ => crate::loader::ndk_registry::set_wsi_display(None),
             },
             Err(_) => crate::loader::ndk_registry::set_wsi_display(None),
+        }
+
+        // 2026-06-13 — render Phase 6 (Vulkan WSI): publish the RAW winit `wl_surface*` so Eclipse's
+        // tier-0 `vkCreateAndroidSurfaceKHR` (`vulkan_wsi::eclipse_vk_create_android_surface_khr`) can
+        // build a `VkWaylandSurfaceCreateInfoKHR` from it + the `wl_display` above. The engine requests
+        // the Android-only `VK_KHR_android_surface` extension, absent from the host Linux ICD; the shims
+        // swap it to `VK_KHR_wayland_surface` and create the surface on THIS `wl_surface`. This is the
+        // BARE `wl_surface` (`RawWindowHandle::Wayland`), distinct from the `wl_egl_window` the Phase 1
+        // WSI publish above registered for the EGL path. `None` on X11/other (a separate seam).
+        // Non-fatal, matching the Phase 1 / display-publish pattern.
+        match window.window_handle() {
+            Ok(wh) => match wh.as_raw() {
+                RawWindowHandle::Wayland(s) => {
+                    crate::loader::ndk_registry::set_wsi_wl_surface(Some(
+                        s.surface.as_ptr() as usize
+                    ));
+                }
+                _ => crate::loader::ndk_registry::set_wsi_wl_surface(None),
+            },
+            Err(_) => crate::loader::ndk_registry::set_wsi_wl_surface(None),
         }
 
         self.window = Some(window);
