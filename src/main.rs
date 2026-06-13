@@ -312,6 +312,14 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     eclipse::runtime::whitelist_bionic_library_path(&fw, Some(&app_lib_dir))?;
     println!("bionic linker search path whitelisted (dl_parse_library_path) ✓");
 
+    // 2026-06-12: register the framework natives an engine JNI_OnLoad reaches (Log + Process)
+    // BEFORE the pre-load below runs that JNI_OnLoad — previously they were registered only inside
+    // drive_application_lifecycle, so the engine's JNI_OnLoad-time Log call missed and its
+    // LoggingProtocol warned `process timestamps will be inaccurate` for the whole boot.
+    println!("# Registering engine-JNI_OnLoad-reachable framework natives (Log + Process)…");
+    eclipse::framework::register_engine_preload_natives(&vm)?;
+    println!("engine-preload framework natives registered ✓");
+
     // Route the app's x86_64 JNI libs through Eclipse's OWN Rust loader (NOT the apkenv shim linker,
     // which aborts on their modern relocs — R_X86_64_TPOFF64). Each is mapped + relocated + fully
     // resolved + init-run + (if it exports JNI_OnLoad) handed the REAL ART JavaVM. The returned images

@@ -128,6 +128,62 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🏁 NATIVE-CRASH LADDER CLIMBED + EXIT=10 ROOT-CAUSED + FIXED (owner live validation of `54153e1`,
+  `/tmp/eclipse-1223806-validate.log`, EXIT=10, NO coredump): ZERO SIGSEGV/SIGABRT this boot — the whole 4-core fix
+  chain (782252 `__sF` → 866509 apkenv+altstack → 947663 thread-exit ordering → 1223806 dl_iterate_phdr/dladdr +
+  Vibrator) is fully RUN-PROVEN.** The engine now catches its own C++ exceptions (DNS HttpError lines logged and
+  SURVIVED — previously the first throw was a 61k-iteration std::terminate death); ~6 s of deep work (Vulkan
+  swapchain active, ENGINE-logged mimalloc options, WorkManager/JobScheduler). The death was JAVA-LEVEL and clean
+  (`System.exit called, status: 10`), root-caused to four framework-native gaps + the §6-reserved resolver-ABI gap,
+  ALL FIXED THIS COMMIT: (1) **`android.app.Activity` natives** — the splash's `finish()` was the NORMAL
+  splash→main transition (dex-proven: `startActivity(ActivityNativeMain)` BEFORE `finish()`); the unbound STATIC
+  `nativeStartActivity` threw `UnsatisfiedLinkError` out of `Looper.loop` AFTER the message was dequeued, so the
+  transition was irrecoverably consumed — **ActivityNativeMain (the engine-hosting activity) never reached
+  onCreate**; the unbound INSTANCE `nativeFinish` (thrown 2×, dex-proven double-post) lost the splash
+  down-lifecycle. Bound 5 of the artifact-verified 7 declared natives (`register_activity_natives`):
+  `nativeStartActivity` drives the already-constructed Activity through exactly recipe steps 5–7 (factored shared
+  helpers, same `checked()` discipline); `nativeFinish` validates the shared `window_registry` handle and drives
+  onPause→onStop→onDestroy ONCE (NEVER frees the process-shared handle, NEVER closes the host window);
+  `nativeResumeActivity` minimal dex-proven contract (no live tracked instance → false = the create fall-through);
+  `isInMultiWindowMode` false; `isTaskRoot` tracked. `nativeOpenURI` + `nativeFileChooser` RECORDED-not-bound
+  (host-action design pending; unbound stays the loud discovery signal). (2) **`AssetManager.openAssetFd`** — the
+  ACTUAL exit(10): androidx.profileinstaller's worker hit the unbound native, and under the vendored libcore EVERY
+  uncaught worker exception is process-fatal (`hacky_uncaught_exception_handler` → `System.exit(10)`); now a REAL
+  fd implementation (fresh fd + `data_start` offset + uncompressed length for Stored entries via the new
+  `Apk::entry_span`; negative return → Java's designed, CAUGHT FileNotFoundException for absent/compressed
+  entries) — covers `openNonAssetFd` by construction. (3) **`Process.getElapsedCpuTime`** —
+  CLOCK_PROCESS_CPUTIME_ID → ms (4 caught misses this boot; boot-long telemetry loss; latent process-fatal class).
+  (4) **registration ORDERING** — new `register_engine_preload_natives` (Log + Process) called in `run_apk` BEFORE
+  `preload_app_native_libs`, closing the JNI_OnLoad-time `println_native` miss behind the boot-long `process
+  timestamps will be inaccurate` WARN (drive_lifecycle's block stays, idempotent re-registration). (5) the
+  **engine-DNS NXDOMAIN** — the §6-reserved resolver-ABI suspicion CONFIRMED Eclipse-side and FIXED: bionic-shaped
+  `getaddrinfo`/`freeaddrinfo`/`gai_strerror`/`getnameinfo` translating natives in `native_provider.rs` (bionic
+  `addrinfo` tail is BSD order `ai_canonname`@24/`ai_addr`@32 — SWAPPED vs glibc — plus AI_/EAI_/NI_ divergences;
+  deep-copied bionic-shaped chains, bionic-positive EAI codes; the `eclipse.netdb` trace = the reserved attribution
+  diagnostic). Counts: provider **129 base / 187 total** (+4). The main-Looper pump's exception contract was ruled
+  CORRECT — deliberately NO change (the loud error pair stays the regression signal that surfaced all of this).
+  **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run
+  <APK>` with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: (a)
+  `launchMainActivity` followed by NO UnsatisfiedLinkError — the factored steps 5–7 drive **ActivityNativeMain**,
+  whose onCreate is the next discovery surface (expect NEW unbound-native trips on the engine surface/View path);
+  (b) splash down-lifecycle driven ONCE (the second `finish()` a guarded no-op), host window staying up; (c) NO
+  `main Looper pump failed` pairs; (d) at +5 s NO `hacky_uncaught_exception_handler`/`System.exit(10)` — on the
+  merged APK profileinstaller reads the real Stored `baseline.prof` fd, on 2.721 it logs its caught
+  FileNotFoundException path; (e) the `process timestamps will be inaccurate` WARN GONE; (f) the engine
+  HttpResponse for `ecsv2.roblox.com` RESOLVING (no DnsResolve; the `eclipse.netdb` trace records the engine's
+  ACTUAL ai_flags/family — closing the last unobserved resolver detail; watch Roblox's EAI_AGAIN retry
+  classification now that EAI codes are bionic-shaped). Once the Java lifecycle holds, the standing next frontier
+  is the RENDER-INTEGRATION build — wire the window's `ANativeWindow` into the engine's `AndroidGLView`/EGL path.
+  If a CLEAR_TOP relaunch trips nativeResumeActivity's live-instance branch, capture the intent flags before
+  deepening its semantics (onNewIntent delivery is NOT evidence-pinned). On ANY new silent SI_KERNEL/addr=0 kill:
+  capture the fresh core FIRST. KEEP core 1223806 + `~/.cache/eclipse-forensics/core1223806` + `/tmp/core1223806-*`
+  + `/tmp/t1stack.bin` until this validation passes.)** Unproven/recorded items deliberately NOT coded:
+  nativeOpenURI/nativeFileChooser host-action design; the `AssetManager.destroy()` stub → dictionary `readAsset`
+  IOException regression vs 06-11; the tzdata/java.time ART env gap; the ~7.4 s `ActivitySplash.onCreate` stall +
+  `Resource is not a Drawable` WARNs (profile first); the benign ClientAppSettings.json FileNotFound reads; ART
+  attach-time 32 KiB guard-less altstacks on engine threads (866509 open item). Gate: **544 unit + 4 integration
+  (live milestone subprocesses, 0 SKIP) + 2 doctests = 550 passed, 0 failed**, fmt/clippy `-D warnings`/release all
+  0-warning. Detail: §6 (2026-06-13 exit-10 entry).
 - **2026-06-12 — ✅ CORE 1223806 ROOT-CAUSED + FIXED (owner live validation of `ddabcd7`,
   `/tmp/eclipse-947663-validate.log`, EXIT=139 → core 1223806 124.7 M — the 947663 thread-exit fix is RUN-PROVEN
   (recurrence discriminator CLEAN); this death was a NEW, SILENT mechanism):** libroblox's statically-linked libc++abi
@@ -155,7 +211,12 @@ before any history-rewriting/force operation.
   getaddrinfo/freeaddrinfo/gai_strerror/getnameinfo, Eclipse provides none; bionic vs glibc `addrinfo` field order /
   `AI_*` / `EAI_*` diverge) — diagnostics-first, a future blocker once gameplay traffic runs on the engine path.
   STRAWTOGRASP/`SocketImpl.delegate` CLOSED as benign-by-design (wolfssljni dual-shape probe; never a death marker).
-  **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>`
+  [START-HERE marker moved 2026-06-13 to the exit-10 entry above — this owner live validation HAPPENED:
+  `/tmp/eclipse-1223806-validate.log`, EXIT=10, NO coredump, ZERO SIGSEGV/SIGABRT — the dl_iterate_phdr fix
+  run-proven (the engine's DNS HttpError throws were CAUGHT and the boot SURVIVED them; no terminate loop), the
+  Vibrator fix held (the pump stayed alive past `InitHelper`), ~6 s of deep work (swapchain active, engine-logged
+  mimalloc options, WorkManager/JobScheduler); the death was JAVA-level `System.exit(10)` — see the 2026-06-13
+  entry above] (the plan was = OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>`
   with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: the DNS-failure throw becomes
   a CAUGHT, logged HttpError with a retry (`numberOfTimesRetried` increments; NO 3-frame terminate loop); the main
   Looper pump SURVIVES past `InitHelper` (the Vibrator no-vibration-device registration line prints; no `main Looper
@@ -1685,6 +1746,216 @@ per-native (ctor mandatory, vibrate best-effort — the 06-11 `readAsset` preced
 pin lives in the APK-gated `real_*` test, so APK-less checkouts are guarded only by the presence/count test —
 convention-consistent; hoist an ungated scope-priority test only if it ever matters. (k) the
 `#[allow(clippy::type_complexity)]` justification comment lacks the §2.2 dated format — date it on next touch.
+
+### 2026-06-13 — EXIT=10 root-caused (the first ZERO-native-fault boot — the native-crash ladder is climbed): unbound `Activity.nativeStartActivity`/`nativeFinish` consumed the splash→main Looper messages, and unbound `AssetManager.openAssetFd` turned profileinstaller's benign no-profile path into a process-fatal worker `UnsatisfiedLinkError` → `System.exit(10)`; + `Process.getElapsedCpuTime`, Log/Process registration ordering, and the reserved netdb resolver-ABI gap CONFIRMED + FIXED
+
+**Context (owner live validation of `54153e1`, `/tmp/eclipse-1223806-validate.log`, EXIT=10, NO coredump,
+~19:13 CDT 2026-06-12):** ZERO SIGSEGV/SIGABRT — the 06-12 4-core fix chain (782252 `__sF` → 866509
+apkenv+altstack → 947663 cxa-before-keys → 1223806 dl_iterate_phdr/dladdr + Vibrator) is fully RUN-PROVEN this
+boot: the engine CAUGHT its own C++ exceptions (DNS HttpError throws logged and survived — previously the first
+throw was the 61,497-iteration std::terminate death), ~6 s of deep work (swapchain active log:561, ENGINE-logged
+mimalloc options log:590, WorkManager/JobScheduler running), and the death was Java-level and clean
+(`OpenjdkJvm.cc:314] System.exit called, status: 10`, log:757). Forensics were LOG + DEX + SOURCE based (no
+coredump existed): androguard over the ACTUAL boot artifact `~/.cache/eclipse/framework-patched/api-impl.jar`
+(classes.dex + classes2.dex), `nm`/`readelf` import enumeration, vendored-ART/libcore source, host headers. No
+live ART/bionic boot was run in the workflow (dev-host boundary respected).
+
+**Mechanism 1 — CONFIRMED Eclipse-side, boot-blocking, FIXED: `android.app.Activity.nativeStartActivity` unbound
+⇒ the splash→ActivityNativeMain handoff irrecoverably consumed.** The splash's `finish()` was the NORMAL
+NEW_STARTUP transition, not an error bail — dex-proven order in `com.roblox.client.startup.ActivitySplash`:
+`s()` → `Z0(false)` → `Context.startActivity(ActivityNativeMain intent)` FIRST, then `overridePendingTransition`,
+then `finish()` (twice — Z0's and s()'s; log:708–711 corroborates). ATL's `Context.startActivity` posts
+`Context$6` to the main Looper; Eclipse's pump dispatched it; `Context$6.run` successfully constructed
+ActivityNativeMain via `internalCreateActivity` (its Window wraps the SAME process-shared `window_registry`
+handle as `Application.native_window`) and then hit the unbound STATIC `nativeStartActivity(Activity)` →
+`UnsatisfiedLinkError` (an Error — escapes Context$6's Exception-typed catch) escaped `Looper.loop`
+(log:713–721); the pump's `checked()` described+cleared it, but `Looper.loop` had already DEQUEUED the message,
+so the transition was consumed: the engine-hosting activity never reached onCreate — the boot dead-ended on a
+stranded splash even absent the exit(10). Eclipse bound ZERO of Activity's declared natives (grep-proven; the
+ACTIVITY_CLASS was used only by recipe steps 4–7). Artifact re-enumeration this session (androguard over
+api-impl.jar classes2.dex): EXACTLY 7 declared natives — `nativeFinish (J)V` 0x102, `nativeOpenURI` 0x109,
+`nativeResumeActivity (Ljava/lang/Class;Landroid/content/Intent;)Z` 0x109, `nativeStartActivity` 0x109,
+`isInMultiWindowMode ()Z` 0x101, `isTaskRoot ()Z` 0x101, `nativeFileChooser (ILjava/lang/String;Ljava/lang/
+String;I)V` 0x101; the prior survey's 8th entry `moveTaskToBack` is FALSIFIED (not native). No api-impl Java
+drives a started activity's up-lifecycle — the native owns it (xref-swept); Eclipse's exact equivalent is its
+existing recipe steps 5–7. **Fix (`src/framework.rs`):** new `register_activity_natives` (one RegisterNatives on
+ACTIVITY_CLASS, wired into drive_lifecycle's registration block before `register_view_natives`); drive_lifecycle's
+inline steps 5–7 factored into shared helpers (`call_activity_on_create`/`on_start`/`on_resume` +
+`drive_activity_down_lifecycle`), labels/log placement unchanged; `nativeStartActivity` drives the passed,
+already-constructed Activity through exactly steps 5–7 via the helpers, exceptions described+cleared per
+`checked()`, never left pending across the native return; a new `TRACKED_ACTIVITIES` tracker (creation-order
+Global refs + finished flag; drive_lifecycle tracks the step-4 launcher activity) backs
+`nativeResumeActivity`/`isTaskRoot`/the finish dedupe.
+
+**Mechanism 2 — CONFIRMED Eclipse-side, boot-blocking, FIXED: `Activity.nativeFinish` unbound ⇒ splash
+down-lifecycle lost (thrown 2× by design of the Java side).** ATL's `Activity.finish()` posts `Activity$2`;
+its `run` guards on `window.native_window != 0`, calls the unbound INSTANCE `nativeFinish(window.native_window)`
+and zeroes the field only AFTER the native returns — so the first `UnsatisfiedLinkError` skipped the zeroing and
+the second queued `Activity$2` threw identically (log:722–741, two identical stacks + pump error pairs; the pump
+then ticked clean ~5.9 s — no spin, no permanent death). The jlong IS the Eclipse `window_registry` handle shared
+process-wide. **Fix:** `nativeFinish (J)V` bound: validates the jlong via `window_registry::with_window`
+(generation-checked; stale handle logs and returns), drives the finishing instance onPause→onStop→onDestroy via
+the same `checked()` discipline, gated by `mark_activity_finished_once` (the dex-proven double-post means a
+same-boot double call is reachable), and MUST NOT free the handle or close the host window — the handle is shared
+with ActivityNativeMain's Window (Java zeroes only the finishing activity's field).
+
+**Mechanism 3 — CONFIRMED Eclipse-side, boot-blocking, FIXED: `AssetManager.openAssetFd` unbound — the ACTUAL
+EXIT=10 trigger.** ~5.1 s after the Looper failures, pool-20-thread-1 ran androidx.profileinstaller →
+`AssetManager.openFd("dexopt/baseline.prof")` → `openFd_internal` → the unbound `openAssetFd
+(Ljava/lang/String;I[J[J)I` → `UnsatisfiedLinkError` (log:742–757). profileinstaller's designed no-profile path
+catches only the IOException a real openAssetFd raises; the unbound native converted that benign path into an
+uncaught `java.lang.Error` on a worker → the vendored-libcore default UncaughtExceptionHandler
+(`Thread.java:1832–1839` `hacky_uncaught_exception_handler`, verified verbatim — banner + printStackTrace +
+`System.exit(10)`) fired on the same tid. Exit 10 is ATL/vendored-libcore semantics (no Roblox dex exits 10 —
+xref-swept). INDEPENDENT of mechanisms 1–2: fixing only the Activity natives still exits 10 at +5 s; fixing only
+this still strands the boot on a dead splash. Re-confirms the recorded rule: under the vendored libcore EVERY
+uncaught worker exception is process-fatal. **Fix (REAL implementation, per policy and the AOSP contract):**
+`openAssetFd` registered alongside the existing AssetManager bindings (5→6, per-native best-effort); per call
+`asset_fd_for` resolves the APK entry; exists AND Stored → a FRESH fd on the APK file (`File::open` →
+`into_raw_fd`, ownership transfers to Java per the ParcelFileDescriptor wrap — never a shared/duped cached fd),
+`outOffsets[0]`=`data_start()`, `outLengths[0]`=uncompressed size written BEFORE returning the fd; absent →
+negative (Java throws the designed, CAUGHT FileNotFoundException); compressed → negative (AOSP's own openAssetFd
+refuses compressed assets). Every failure path is an explicit −1 with exceptions described+cleared and the
+un-transferred fd closed (jint's default 0 is a VALID fd — stdin — so the body never error-propagates to
+`LogErrorAndDefault`). Covers `openNonAssetFd` (shared `openFd_internal`). New small general accessor
+`Apk::entry_span(name) → {data_start, uncompressed_size, stored}` in `src/apk/mod.rs` (zip 2.x `data_start()`,
+verified non-panicking-after-`by_name` in the vendored crate source; absent → typed `ApkError::EntryMissing`),
+generalizing the X8664Engine-only stored flag. APK content evidence: 2.721.1108 has NO `dexopt/baseline.prof`
+(absent → caught FNF, like real Android); the 2.724.735-merged APK has both `.prof`/`.profm` Stored — the real fd
+path is servable.
+
+**Mechanism 4 — CONFIRMED Eclipse-side, not boot-blocking, FIXED: `Process.getElapsedCpuTime` unbound.** 4
+consecutive caught misses on a worker (log:634–637, no stack/no UEH banner — Roblox telemetry caught it); the
+engine warned `process timestamps will be inaccurate` (log:50) — boot-long telemetry data loss, and per the
+worker-fatal rule any future uncaught call site is exit-10. **Fix:** new `register_process_natives` on
+`android/os/Process` binding `getElapsedCpuTime ()J` STATIC — `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` →
+saturating ms, 0 on clock failure (the AOSP `android_util_Process.cpp` contract). The other 23 declared Process
+natives stay discovery-loop items (Simplicity First — no run evidence).
+
+**Mechanism 5 — CONFIRMED Eclipse-side, not boot-blocking, FIXED: `Log.println_native` registered too LATE
+(ordering, not a missing native).** `run_apk` calls `preload_app_native_libs` (where libroblox's JNI_OnLoad runs)
+BEFORE `drive_application_lifecycle`, and `register_log_natives`'s only call site was inside drive_lifecycle — so
+the engine's one JNI_OnLoad-time Log call (LoggingProtocol init) missed (log:49–51), compounding mechanism 4 on
+the same machinery. **Fix:** new `pub fn register_engine_preload_natives(&Vm)` (attaches + registers Log +
+Process, catch_unwind-guarded) called in `run_apk` BEFORE `preload_app_native_libs`; drive_lifecycle keeps both
+registrations (RegisterNatives re-registration of identical fnPtrs is spec-legal and idempotent) so neither path
+can regress the other. Audit: only Log (observed) and Process (same code path) have engine-JNI_OnLoad-time-caller
+evidence; the entry point grows on run evidence only.
+
+**Mechanism 6 — main-Looper pump exception contract RULED CORRECT — deliberately NO change.** Log-proven this
+boot: each tick drives `Looper.loop()` once via `checked()` (describe+clear+Err); graphics logs and keeps
+ticking; exactly 3 error pairs bracketing the 3 throws ~1.4 ms apart, then clean ticks for ~5.9 s — the pump
+neither spins nor dies. The cost (a throwing message is irrecoverably lost — already dequeued) is inherent; on
+real Android the same escape kills the whole app. NO catch-and-continue/retry/replay — that would mask exactly
+the missing-native class this boot surfaced (three natives found BECAUSE the failures were loud). The loud error
+pair remains the regression signal; binding the natives is the root-cause fix.
+
+**Mechanism 7 — the engine resolver-ABI gap CONFIRMED Eclipse-side + FIXED (closes the 06-12 entry's reserved
+diagnostics):** host DNS healthy (getent resolves `ecsv2.roblox.com`) and the SAME process's Java/okhttp/wolfSSL
+path completed real Roblox HTTPS round-trips in all 4 validation logs, while the engine curl path failed 2/2
+times ever reached (zero successes in any log). libroblox imports plain POSIX
+`getaddrinfo`/`freeaddrinfo`/`gai_strerror`/`getnameinfo`/`gethostbyname@LIBC` (nm re-verified; NO
+`android_getaddrinfofornet`/`android_res_*` — netd ruled out); its curl uses the threaded getaddrinfo resolver
+(exact failf string present; zero `ares_*` — the c-ares UNPROVEN link closed). Eclipse provided none → the
+HostDlsymProvider glibc fall-through (the proven `__sF`/dl_iterate_phdr class). Deterministic public-ABI break,
+headers pinned both sides: bionic `addrinfo` tail = BSD order `ai_canonname`@24/`ai_addr`@32 (public AOSP
+netdb.h) vs glibc `ai_addr`@24/`ai_canonname`@32 (host `/usr/include/netdb.h:565–575`) — SWAPPED, so the
+bionic-compiled walker reads glibc's canonname slot (NULL) as `ai_addr` → zero usable addresses →
+CURLE_COULDNT_RESOLVE_HOST, exactly the logged non-crashing failure. Over-determined by AI_* value aliasing
+(bionic ADDRCONFIG 0x400 == glibc NUMERICSERV; bionic 0x200/0x800 invalid to glibc → EAI_BADFLAGS), the EAI_*
+sign flip (bionic positive vs glibc negative — also breaks Roblox's own EAI_AGAIN retry classification), and the
+NI_* scramble — deterministic failure under EVERY flag combination, matching 0-successes-ever. Residual unknown:
+the exact ai_flags at the curl call site (which divergence fires first) — the fix's own `eclipse.netdb` trace
+closes that observation. **Fix (`src/loader/native_provider.rs`, the sigaction/`__sF` translating-native
+pattern, new "bionic netdb resolver ABI (4)" section):** `eclipse_getaddrinfo` (AI_* translated BY NAME — struct
+head 0–16 identical; host call; deep-copy into single-malloc-block bionic-shaped nodes; glibc-negative EAI →
+bionic-positive; EAI_MEMORY unwind on alloc failure; errno save/restore around the failure trace; tracing target
+`eclipse.netdb` records node/service/ai_flags/family + outcome — the reserved attribution diagnostic);
+`eclipse_freeaddrinfo` (frees Eclipse's own chain ONLY, never forwarded to glibc); `eclipse_gai_strerror` (static
+table keyed by bionic-positive codes); `eclipse_getnameinfo` (sockaddr passthrough — layouts identical on Linux
+x86-64 — with NI_*/EAI translation). `gethostbyname` stays host-baseline (hostent field order identical — dated
+record-only comment). Importer audit: exactly 2 of 12 cached engine libs import the family (libroblox,
+libbacktrace-native) — one provider-side fix covers both. Counts: provider **125→129 base / 183→187 total**;
+`docs/bionic-env-worklist.md` scope-note chain extended and the bionic-libc category row carries the dated
+netdb bracket. Not boot-blocking this boot (caught, telemetry-only) but it gates ALL engine-path content —
+gameplay traffic, RUPP/TURN transport.
+
+**Fixed vs recorded-only:** FIXED = mechanisms 1–5 + 7 above. RECORDED, deliberately NOT bound:
+`nativeOpenURI (Ljava/lang/String;)V` 0x109 + `nativeFileChooser (ILjava/lang/String;Ljava/lang/String;I)V`
+0x101 (not tripped this boot; both need real host-action design — a detected URI opener / file dialog — and a
+no-op would be a workaround; unbound they surface loudly through the pump signal — the next discovery items);
+the other 23 `android/os/Process` declared natives (no run evidence); the prior entry's untriaged items carry
+unchanged (AssetManager.destroy() → readAsset IOException regression, tzdata gap, splash onCreate stall +
+Drawable WARNs, benign ClientAppSettings.json FNF reads, ART attach-time engine-thread altstacks).
+
+**Same-pattern audits:** (full-declared-list discipline) Activity re-enumerated from the ACTUAL boot artifact —
+exactly 7, `moveTaskToBack` falsified; no path through the transition dispatch (Context$6/Activity$2) remains
+unbound. (worker-fatal UnsatisfiedLinkError class) Process (24 declared) + AssetManager enumerated; openAssetFd
+was the only unbound fd-path native (openNonAssetFd shares openFd_internal); the existing
+openAsset/readAsset/seekAsset/getAssetLength/destroyAsset bindings re-confirmed against the artifact.
+(registration-ordering class) drive_lifecycle's full registration block swept — only Log + Process have
+engine-JNI_OnLoad-time evidence. (host-shadowed fall-through class) the 4 netdb names joined the fail-closed
+link.rs pin exactly like dl_iterate_phdr/dladdr/sigaltstack; gethostbyname/inet_ntop/inet_pton audited
+shape-identical (record-only). (stale-comment class) provider doc-comment "122 symbols total"/"signal-ABI 6"
+corrected; register_asset_stream_natives doc updated; repo grep for stale "provides none"/"resolver-ABI gap"
+claims in src/ → zero. (pump) NO changes — mechanism 6 ruling.
+
+**Regression pins (existing style — no scripts):** `framework::tests` —
+`activity_native_names_sigs_and_class_match_api_impl_dex` (class + all 5 bound name/sig pins vs the artifact
+7-list + the two exact ART-reported gaps; records the 2 unbound),
+`process_native_name_sig_and_class_match_api_impl_dex`,
+`engine_preload_natives_entry_point_exists_and_covers_log_and_process` (compile-shape pin; the live signal = the
+WARN disappearing), `asset_manager_stream_native_names_and_sigs_are_the_classic_aosp_set` EXTENDED (openAssetFd),
+`asset_fd_for_serves_stored_entries_and_refuses_absent_and_compressed` (zip fixture: the (fd,offset,length)
+triple read back THROUGH the returned fd; absent→EntryMissing; compressed→Compressed); `apk::tests` —
+`entry_span_reports_stored_offset_size_and_rejects_absent` (data_start bytes ARE the Stored asset);
+`native_provider::tests` — `bionic_addrinfo_layout_is_bsd_order_and_differs_from_glibc` (THE ABI pin: all 8
+bionic offsets + size 48 AND the glibc swap proven via `libc::addrinfo` offsets),
+`bionic_ai_ni_eai_translation_tables_match_both_headers` (incl. the 0x400 aliasing hazard),
+`bionic_getaddrinfo_returns_bionic_shaped_nodes_and_positive_eai` (offline live lookup: 127.0.0.1 numeric-host →
+non-NULL `ai_addr`@32 + deep-copied canonname@24; invalid name → bionic-positive EAI_NONAME=8; free round-trip),
+`bionic_getnameinfo_translates_flags_and_returns_numeric_host` (raw bits would mean NAMEREQD — proves the
+translation load-bearing), count test → 129/187 with the 4 names; `link::tests` —
+`real_libroblox_eclipse_natives_fully_resolve_all_imports` EXTENDED to 7 fail-closed host-shadowed pins (ran
+LIVE against real libroblox this session: 88-baseline/0-work-list/623-applied unchanged, all 7 pins green).
+
+**Gate (this exact tree):** fmt --all (+ `--check`) / build --all-targets / clippy `-D warnings` / test /
+release — **544 unit + 4 integration + 2 doctests = 550 passed, 0 failed, 0 SKIP** (the 4 milestone tests ran
+their live milestone subprocesses — this host's documented norm, none boots ART;
+`run_libroblox_init_runs_all_3427_constructors` green WITH the new netdb provider entries in the resolution
+scope), all 0-warning. No live ART/bionic boot in the workflow; the live validation expectations are the §5
+START-HERE.
+
+**Carried non-blocking review notes (recorded, not acted on):** (a) `activity_native_finish` skips the
+down-lifecycle + finished-marking when handle validation fails — but dex proves handle 0 is a LEGITIMATE shape
+(`Activity$3`/`recreate()` calls `nativeFinish(0)` before `nativeStartActivity(new)`): under Eclipse a recreate()
+would skip the old instance's down-lifecycle and leave it "live" in the tracker; when next touched, run the
+dedupe+down-lifecycle regardless of handle validity (warn only for a NONZERO invalid handle) and update the
+contract comment to name both Activity$2 and Activity$3 caller shapes. (b) `asset_fd_for` unconditionally
+prepends `assets/`, but `openNonAssetFd` passes RAW zip paths (e.g. `res/raw/…`) through the same native — those
+would mis-root to `assets/res/…` and always miss; no observed caller today (profileinstaller goes through
+openFd); try the literal name first when next touched. (c) `asset_manager_open_asset_fd` resolves via
+`LogErrorAndDefault`, whose caught-PANIC path returns jint::default()=0 — a VALID fd (stdin); the body's Err
+half is closed (explicit −1 everywhere) and release is panic=abort, so exposure is dev-build panics only; if a
+panic-capable call is ever added, restructure so the resolved default is −1 (local ErrorPolicy/newtype). (d)
+`TRACKED_ACTIVITIES` is append-only — finished entries keep their Global refs for the process lifetime (pins the
+destroyed Activity graph against GC); bounded today (2 activities; the dedupe gate needs the tombstone); the doc
+clause "released when the entry is dropped" is slightly misleading (entries never drop) — prune-with-tombstone
+if activity churn ever becomes real. (e) `eclipse_getaddrinfo` forwards NULL hints straight to glibc, whose
+documented GNU default is `AI_V4MAPPED|AI_ADDRCONFIG` vs bionic's zero-flags NULL-hints behavior — pass an
+explicit zeroed hints struct on NULL when next touched (curl always passes non-null today; host-config-dependent
+silent divergence). (f) `engine_preload_natives_entry_point_exists_and_covers_log_and_process` is a
+compile-shape pin only — it cannot catch run_apk dropping the pre-preload CALL; the live WARN line is the real
+ordering signal. (g) evidence-pinned-minimal lifecycle contracts, revisit on run evidence: `nativeResumeActivity`
+drives only onResume (a stopped-but-unfinished instance would skip onRestart/onStart), drops the Intent (no
+onNewIntent — deliberately unimplemented, not evidence-pinned), and returns true even if onResume threw (false
+would make Java construct a DUPLICATE activity); `nativeStartActivity` resumes the new activity BEFORE the
+finishing splash's onPause (Android pauses old-first) — unobservable for the current single-stack boot. (h)
+comment-wording: the openAssetFd constants comment says "vendored-libcore default uncaught handler" where the
+Process section names `hacky_uncaught_exception_handler` — the SAME handler (vendored libcore
+`Thread.java:1832–1839`); align the wording on next touch so nobody hunts for two handlers. (i) the netdb live
+fix is necessarily unvalidated until the next owner boot — on any remaining DnsResolve, the `eclipse.netdb`
+trace line (the engine's actual resolver arguments) is the first thing to read.
 
 ---
 

@@ -162,12 +162,15 @@ impl EclipseNativeProvider {
     /// `libbacktrace-native.so`'s pre-load needs it); bionic-libc's 16 (`__umask_chk` added
     /// 2026-06-12, the other libbacktrace-native unresolved import); the stdio FILE\* translation 25
     /// (2026-06-12 — bionic `&__sF[i]` stream sentinels remapped to host glibc streams; see the
-    /// `__sF` section); the signal-ABI 6 (2026-06-11 — these resolved to host glibc before, whose
-    /// sigset_t/sigaction LAYOUT is incompatible; see the signal-ABI section); ndk-android's 28
+    /// `__sF` section); the signal-ABI 7 (6 translating, 2026-06-11 — these resolved to host glibc
+    /// before, whose sigset_t/sigaction LAYOUT is incompatible; + the sigaltstack attribution
+    /// forward, 2026-06-12); link-map introspection's 2 (dl_iterate_phdr/dladdr, 2026-06-12); the
+    /// netdb resolver-ABI 4 (getaddrinfo/freeaddrinfo/gai_strerror/getnameinfo, 2026-06-12 — the
+    /// engine DnsResolve root cause; see the netdb section); ndk-android's 28
     /// (AAsset* real via `src/apk`, AConfiguration/ALooper minimal-correct, ANativeWindow
     /// sound-stub — `ANativeWindow_getFormat` added 2026-06-12 for `libsurface_util_jni.so`'s
     /// pre-load); media-ndk's 33 sound-stubs and audio's 8 (REAL OpenSL ES → host audio via
-    /// [`super::opensl`]). **122** symbols total.
+    /// [`super::opensl`]). **129** base symbols (the pthread + sysconf groups register on top).
     pub fn with_bionic_natives() -> Self {
         let mut p = Self::empty();
 
@@ -307,6 +310,16 @@ impl EclipseNativeProvider {
             "dladdr",
             super::module_registry::eclipse_dladdr as *const () as u64,
         );
+
+        // ---- bionic netdb resolver ABI (4) — addrinfo tail order + AI_/EAI_/NI_ values diverge --
+        // 2026-06-12 (the engine HttpError:DnsResolve root cause — see the netdb section): the
+        // host-glibc fall-through handed bionic walkers glibc-shaped addrinfo nodes (canonname/
+        // addr tail SWAPPED) → zero usable addresses on every engine curl lookup. gethostbyname
+        // stays host-baseline (hostent field order identical — record-only).
+        p.register("getaddrinfo", eclipse_getaddrinfo as *const () as u64);
+        p.register("freeaddrinfo", eclipse_freeaddrinfo as *const () as u64);
+        p.register("gai_strerror", eclipse_gai_strerror as *const () as u64);
+        p.register("getnameinfo", eclipse_getnameinfo as *const () as u64);
 
         // ---- ndk-android (libandroid) — the 28 NDK natives -------------------------------------
         // AAsset / AAssetManager (6) — REAL, routed to Eclipse's own `src/apk` reader.
@@ -2662,6 +2675,436 @@ extern "C" {
 }
 
 // =================================================================================================
+// bionic netdb resolver ABI (4) — glibc HAS these names but `struct addrinfo`'s tail field ORDER
+// and the AI_/EAI_/NI_ constant VALUES diverge. **translate.**
+// =================================================================================================
+//
+// 2026-06-12 (the engine `HttpError:DnsResolve` root cause; closes the AGENTS.md §6 core-1223806
+// resolver-ABI reservation): libroblox.so + libbacktrace-native.so import plain POSIX
+// `getaddrinfo`/`freeaddrinfo`/`gai_strerror`/`getnameinfo` (+ `gethostbyname`) `@LIBC`
+// (nm-re-verified; NO `android_getaddrinfofornet`/`android_res_*` — netd ruled out; curl's
+// threaded-resolver failf string present, zero `ares_*` — a bundled c-ares ruled out). Eclipse
+// provided none, so the bionic-compiled callers ran against host glibc:
+//   * `struct addrinfo`: offsets 0–16 (flags/family/socktype/protocol/addrlen) are identical,
+//     but the tail is SWAPPED — bionic (BSD order; public AOSP `libc/include/netdb.h`,
+//     re-fetched 2026-06-12) has `ai_canonname`@24 / `ai_addr`@32, glibc (host
+//     /usr/include/netdb.h) has `ai_addr`@24 / `ai_canonname`@32 (`ai_next`@40 in both). A
+//     bionic-compiled walker over glibc nodes reads the canonname slot (NULL on effectively
+//     every node) as `ai_addr` → zero usable addresses → curl `CURLE_COULDNT_RESOLVE_HOST` —
+//     the logged `Could not resolve host`, deterministic under every flag combination (0
+//     engine-resolver successes across all validation logs while the SAME process's
+//     Java/okhttp/wolfSSL path did real Roblox HTTPS round-trips).
+//   * `AI_*` values alias ACROSS libcs: bionic `AI_ADDRCONFIG` (0x400) == glibc
+//     `AI_NUMERICSERV`; bionic 0x100/0x200/0x800 (`AI_ALL`/`AI_V4MAPPED_CFG`/`AI_V4MAPPED`)
+//     mean other things (or nothing) to glibc → translated BY NAME, never passed raw.
+//   * `EAI_*` codes sign-flip AND renumber (bionic positive 1..15, glibc negative) — also what
+//     Roblox's own `EAI_AGAIN` retry classification reads (RbxTransport strings).
+//   * `NI_*` low bits scramble (bionic NOFQDN=1/NUMERICHOST=2/NAMEREQD=4/NUMERICSERV=8 vs glibc
+//     NUMERICHOST=1/NUMERICSERV=2/NOFQDN=4/NAMEREQD=8; DGRAM=16 in both).
+// `gethostbyname` stays on the host baseline — bionic and glibc `struct hostent` field order is
+// IDENTICAL (h_name/h_aliases/h_addrtype/h_length/h_addr_list; both headers read 2026-06-12), as
+// are `inet_ntop`/`inet_pton` (record-only; no native needed).
+
+/// Bionic LP64 `struct addrinfo` (public AOSP `netdb.h`, BSD field order). The head (offsets
+/// 0–16) matches glibc; the TAIL is the swap: `ai_canonname`@24, `ai_addr`@32 (glibc has them
+/// reversed). Pinned by `bionic_addrinfo_layout_is_bsd_order_and_differs_from_glibc`.
+#[repr(C)]
+struct BionicAddrinfo {
+    /// `int ai_flags` — BIONIC `AI_*` values (translated, never forwarded raw).
+    ai_flags: c_int,
+    /// `int ai_family` — `AF_*` (shared kernel ABI; identical values).
+    ai_family: c_int,
+    /// `int ai_socktype` — `SOCK_*` (shared kernel ABI).
+    ai_socktype: c_int,
+    /// `int ai_protocol` — `IPPROTO_*` (shared kernel ABI).
+    ai_protocol: c_int,
+    /// `socklen_t ai_addrlen` (+4 bytes padding to the first pointer).
+    ai_addrlen: libc::socklen_t,
+    /// `char* ai_canonname` — @24 (glibc keeps `ai_addr` here).
+    ai_canonname: *mut c_char,
+    /// `struct sockaddr* ai_addr` — @32 (glibc keeps `ai_canonname` here).
+    ai_addr: *mut libc::sockaddr,
+    /// `struct addrinfo* ai_next` — @40 in both ABIs.
+    ai_next: *mut BionicAddrinfo,
+}
+
+// Bionic `EAI_*` (POSITIVE; public AOSP `netdb.h`, re-fetched 2026-06-12).
+const BIONIC_EAI_ADDRFAMILY: c_int = 1;
+const BIONIC_EAI_AGAIN: c_int = 2;
+const BIONIC_EAI_BADFLAGS: c_int = 3;
+const BIONIC_EAI_FAIL: c_int = 4;
+const BIONIC_EAI_FAMILY: c_int = 5;
+const BIONIC_EAI_MEMORY: c_int = 6;
+const BIONIC_EAI_NODATA: c_int = 7;
+const BIONIC_EAI_NONAME: c_int = 8;
+const BIONIC_EAI_SERVICE: c_int = 9;
+const BIONIC_EAI_SOCKTYPE: c_int = 10;
+const BIONIC_EAI_SYSTEM: c_int = 11;
+const BIONIC_EAI_OVERFLOW: c_int = 14;
+
+/// glibc's GNU-extension `EAI_ADDRFAMILY` (host /usr/include/netdb.h: `-9`) — the `libc` crate
+/// does not export it for linux-gnu, so it is pinned locally (2026-06-12).
+const GLIBC_EAI_ADDRFAMILY: c_int = -9;
+
+/// `(bionic value, glibc value)` `AI_*` pairs, translated BY NAME. Bionic values from the public
+/// AOSP `netdb.h`; glibc values via the `libc` crate (matching the host header). Bionic
+/// `AI_V4MAPPED_CFG` (0x200, "accept IPv4-mapped if kernel supports") maps to glibc `AI_V4MAPPED`
+/// — the closest documented semantic (Linux always supports v4-mapped addresses).
+const AI_FLAG_PAIRS: &[(c_int, c_int)] = &[
+    (0x0001, libc::AI_PASSIVE),
+    (0x0002, libc::AI_CANONNAME),
+    (0x0004, libc::AI_NUMERICHOST),
+    (0x0008, libc::AI_NUMERICSERV),
+    (0x0100, libc::AI_ALL),
+    (0x0200, libc::AI_V4MAPPED), // bionic AI_V4MAPPED_CFG
+    (0x0400, libc::AI_ADDRCONFIG),
+    (0x0800, libc::AI_V4MAPPED),
+];
+
+/// `(bionic value, glibc value)` `NI_*` pairs, translated BY NAME (values per the two headers).
+const NI_FLAG_PAIRS: &[(c_int, c_int)] = &[
+    (0x0001, libc::NI_NOFQDN),
+    (0x0002, libc::NI_NUMERICHOST),
+    (0x0004, libc::NI_NAMEREQD),
+    (0x0008, libc::NI_NUMERICSERV),
+    (0x0010, libc::NI_DGRAM),
+];
+
+/// Translate a bionic flag word to glibc through a by-name pair table. A bit outside the table is
+/// `Err(`[`BIONIC_EAI_BADFLAGS`]`)` — both libcs reject undefined flag bits rather than guessing.
+fn translate_flags_by_name(bionic: c_int, pairs: &[(c_int, c_int)]) -> Result<c_int, c_int> {
+    let mut rest = bionic;
+    let mut glibc = 0;
+    for &(b, g) in pairs {
+        if rest & b == b {
+            glibc |= g;
+            rest &= !b;
+        }
+    }
+    if rest != 0 {
+        return Err(BIONIC_EAI_BADFLAGS);
+    }
+    Ok(glibc)
+}
+
+/// Translate a glibc `EAI_*` return (negative) to the bionic code of the SAME NAME (positive).
+/// `0` stays success; an unmapped/newer glibc code becomes the generic non-recoverable
+/// [`BIONIC_EAI_FAIL`] (never silently positive-but-meaningless).
+fn bionic_eai_from_glibc(rc: c_int) -> c_int {
+    match rc {
+        0 => 0,
+        libc::EAI_BADFLAGS => BIONIC_EAI_BADFLAGS,
+        libc::EAI_NONAME => BIONIC_EAI_NONAME,
+        libc::EAI_AGAIN => BIONIC_EAI_AGAIN,
+        libc::EAI_FAIL => BIONIC_EAI_FAIL,
+        libc::EAI_NODATA => BIONIC_EAI_NODATA,
+        libc::EAI_FAMILY => BIONIC_EAI_FAMILY,
+        libc::EAI_SOCKTYPE => BIONIC_EAI_SOCKTYPE,
+        libc::EAI_SERVICE => BIONIC_EAI_SERVICE,
+        GLIBC_EAI_ADDRFAMILY => BIONIC_EAI_ADDRFAMILY,
+        libc::EAI_MEMORY => BIONIC_EAI_MEMORY,
+        libc::EAI_SYSTEM => BIONIC_EAI_SYSTEM,
+        libc::EAI_OVERFLOW => BIONIC_EAI_OVERFLOW,
+        _ => BIONIC_EAI_FAIL,
+    }
+}
+
+/// Deep-copy ONE glibc `addrinfo` node into a single Eclipse-owned `malloc` block laid out as
+/// `[BionicAddrinfo][sockaddr bytes][canonname bytes]` — so [`eclipse_freeaddrinfo`] frees each
+/// node with exactly one `free`. `bionic_flags` (the caller's original hints word) is what the
+/// result nodes report back (POSIX leaves result `ai_flags` unspecified; round-tripping the
+/// caller's own bionic value can never hand it a glibc-valued word). Returns null on `malloc`
+/// failure (the caller unwinds the partial chain).
+///
+/// # Safety
+/// `g` must be a node of a live chain returned by host glibc `getaddrinfo` (its `ai_addr` has
+/// `ai_addrlen` readable bytes; `ai_canonname` is null or a NUL-terminated C string).
+unsafe fn bionic_node_from_glibc(g: &libc::addrinfo, bionic_flags: c_int) -> *mut BionicAddrinfo {
+    let addr_len = if g.ai_addr.is_null() {
+        0
+    } else {
+        g.ai_addrlen as usize
+    };
+    let canon_len = if g.ai_canonname.is_null() {
+        0
+    } else {
+        // SAFETY: per the glibc getaddrinfo contract, a non-null ai_canonname is a NUL-terminated
+        // C string owned by the live chain.
+        unsafe { std::ffi::CStr::from_ptr(g.ai_canonname) }
+            .to_bytes_with_nul()
+            .len()
+    };
+    let header = std::mem::size_of::<BionicAddrinfo>();
+    let total = header + addr_len + canon_len;
+    // SAFETY: `total` ≥ 48; malloc returns a suitably-aligned block or null (handled below). The
+    // sockaddr lands at offset 48 (16-aligned block ⇒ 8-aligned slot — over-aligned for sockaddr).
+    let block = unsafe { libc::malloc(total) }.cast::<u8>();
+    if block.is_null() {
+        return std::ptr::null_mut();
+    }
+    let addr_ptr = if addr_len > 0 {
+        // SAFETY: the block has `total` writable bytes; the source has `addr_len` readable bytes
+        // (caller contract); the ranges cannot overlap (fresh allocation).
+        unsafe {
+            std::ptr::copy_nonoverlapping(g.ai_addr.cast::<u8>(), block.add(header), addr_len);
+            block.add(header).cast::<libc::sockaddr>()
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+    let canon_ptr = if canon_len > 0 {
+        // SAFETY: as above — `canon_len` includes the NUL; destination range is inside the block.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                g.ai_canonname.cast::<u8>(),
+                block.add(header + addr_len),
+                canon_len,
+            );
+            block.add(header + addr_len).cast::<c_char>()
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+    let node = block.cast::<BionicAddrinfo>();
+    // SAFETY: `node` is the start of the fresh block, valid + aligned for one BionicAddrinfo.
+    unsafe {
+        node.write(BionicAddrinfo {
+            ai_flags: bionic_flags,
+            ai_family: g.ai_family,
+            ai_socktype: g.ai_socktype,
+            ai_protocol: g.ai_protocol,
+            ai_addrlen: if addr_ptr.is_null() { 0 } else { g.ai_addrlen },
+            ai_canonname: canon_ptr,
+            ai_addr: addr_ptr,
+            ai_next: std::ptr::null_mut(),
+        });
+    }
+    node
+}
+
+/// `int getaddrinfo(const char* node, const char* service, const struct addrinfo* hints,
+/// struct addrinfo** res)` — bionic-shaped resolver. **translate:** hints `AI_*` by name (head
+/// fields are layout-identical, so they are read field-wise and rebuilt — the swapped tail is
+/// never touched in the hints), forward to host glibc, deep-copy the result chain into
+/// Eclipse-owned BIONIC-shaped nodes ([`bionic_node_from_glibc`]), translate the `EAI_*` return
+/// to bionic-positive. The tracing line records node/service/flags/family + outcome — the
+/// attribution diagnostic AGENTS.md reserved (it names the engine's ACTUAL resolver arguments).
+///
+/// # Safety
+/// `node`/`service` must each be null or valid C strings; `hints` null or a valid bionic
+/// `addrinfo`; `res` a valid out-pointer (POSIX caller contract).
+unsafe extern "C" fn eclipse_getaddrinfo(
+    node: *const c_char,
+    service: *const c_char,
+    hints: *const BionicAddrinfo,
+    res: *mut *mut BionicAddrinfo,
+) -> c_int {
+    // For the trace only — lossy, never dereferenced beyond the C-string contract.
+    let describe = |p: *const c_char| -> String {
+        if p.is_null() {
+            "<null>".to_owned()
+        } else {
+            // SAFETY: non-null ⇒ a valid NUL-terminated C string per this fn's caller contract.
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    if res.is_null() {
+        // A null out-pointer violates POSIX; answer with the bionic system-error code instead of
+        // faulting. errno carries the detail per the EAI_SYSTEM contract.
+        // SAFETY: __errno_location() is the calling thread's errno slot (always valid).
+        unsafe { *libc::__errno_location() = libc::EINVAL };
+        return BIONIC_EAI_SYSTEM;
+    }
+    let (bionic_flags, g_hints) = if hints.is_null() {
+        (0, None)
+    } else {
+        // SAFETY: `hints` is a valid bionic addrinfo (caller contract); only the head fields
+        // (layout-identical offsets 0–16) are read — the swapped tail pointers are not consulted
+        // (POSIX requires them null in hints anyway).
+        let b = unsafe { &*hints };
+        let g_flags = match translate_flags_by_name(b.ai_flags, AI_FLAG_PAIRS) {
+            Ok(g) => g,
+            Err(eai) => {
+                tracing::warn!(
+                    target: "eclipse.netdb",
+                    node = %describe(node),
+                    service = %describe(service),
+                    ai_flags = format_args!("0x{:x}", b.ai_flags),
+                    "getaddrinfo: undefined bionic AI_* bits -> EAI_BADFLAGS"
+                );
+                return eai;
+            }
+        };
+        // SAFETY: an all-zero glibc addrinfo is the documented empty-hints baseline.
+        let mut g: libc::addrinfo = unsafe { std::mem::zeroed() };
+        g.ai_flags = g_flags;
+        g.ai_family = b.ai_family;
+        g.ai_socktype = b.ai_socktype;
+        g.ai_protocol = b.ai_protocol;
+        (b.ai_flags, Some(g))
+    };
+
+    let mut g_res: *mut libc::addrinfo = std::ptr::null_mut();
+    // SAFETY: node/service are null-or-valid C strings (caller contract); the hints are a valid
+    // glibc-shaped struct built above (or null); `g_res` is a valid out-pointer.
+    let rc = unsafe {
+        libc::getaddrinfo(
+            node,
+            service,
+            g_hints
+                .as_ref()
+                .map_or(std::ptr::null(), |g| g as *const libc::addrinfo),
+            &mut g_res,
+        )
+    };
+    if rc != 0 {
+        let eai = bionic_eai_from_glibc(rc);
+        // Save/restore errno around the trace: EAI_SYSTEM callers read errno after return.
+        // SAFETY: __errno_location() is the calling thread's errno slot (always valid).
+        let saved_errno = unsafe { *libc::__errno_location() };
+        tracing::info!(
+            target: "eclipse.netdb",
+            node = %describe(node),
+            service = %describe(service),
+            bionic_ai_flags = format_args!("0x{bionic_flags:x}"),
+            glibc_rc = rc,
+            bionic_eai = eai,
+            "getaddrinfo: host resolution failed (translated to bionic-positive EAI)"
+        );
+        // SAFETY: as above.
+        unsafe { *libc::__errno_location() = saved_errno };
+        return eai;
+    }
+
+    // Deep-copy the glibc chain into bionic-shaped Eclipse-owned nodes.
+    let mut head: *mut BionicAddrinfo = std::ptr::null_mut();
+    let mut tail: *mut BionicAddrinfo = std::ptr::null_mut();
+    let mut count = 0u32;
+    let mut cursor = g_res;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` walks the live glibc chain returned above.
+        let g = unsafe { &*cursor };
+        // SAFETY: `g` is a live glibc node — exactly bionic_node_from_glibc's contract.
+        let bionic_node = unsafe { bionic_node_from_glibc(g, bionic_flags) };
+        if bionic_node.is_null() {
+            // malloc failure: unwind BOTH chains, report the bionic memory code.
+            // SAFETY: `head` is the (possibly empty) chain of nodes THIS call allocated.
+            unsafe { eclipse_freeaddrinfo(head) };
+            // SAFETY: `g_res` is the live glibc chain; glibc's freeaddrinfo owns it.
+            unsafe { libc::freeaddrinfo(g_res) };
+            return BIONIC_EAI_MEMORY;
+        }
+        if head.is_null() {
+            head = bionic_node;
+        } else {
+            // SAFETY: `tail` is the previous Eclipse-owned node (non-null once head is set).
+            unsafe { (*tail).ai_next = bionic_node };
+        }
+        tail = bionic_node;
+        count += 1;
+        cursor = g.ai_next;
+    }
+    // SAFETY: the glibc chain is fully copied; return it to glibc's allocator.
+    unsafe { libc::freeaddrinfo(g_res) };
+    // SAFETY: `res` is a valid out-pointer (checked non-null above).
+    unsafe { *res = head };
+    tracing::debug!(
+        target: "eclipse.netdb",
+        node = %describe(node),
+        service = %describe(service),
+        bionic_ai_flags = format_args!("0x{bionic_flags:x}"),
+        nodes = count,
+        "getaddrinfo: resolved via host glibc into bionic-shaped nodes"
+    );
+    0
+}
+
+/// `void freeaddrinfo(struct addrinfo* ai)` — free an Eclipse-owned bionic chain.
+///
+/// Frees ECLIPSE's own malloc'd nodes ONLY (every chain a bionic caller holds came from
+/// [`eclipse_getaddrinfo`]); NEVER forwards to glibc — these are not glibc nodes, and glibc's
+/// `freeaddrinfo` walking them (field offsets swapped, foreign allocation layout) would corrupt
+/// the heap. Null is the documented no-op.
+///
+/// # Safety
+/// `head` must be null or a chain returned by [`eclipse_getaddrinfo`] (each node one `malloc`
+/// block), not yet freed.
+unsafe extern "C" fn eclipse_freeaddrinfo(head: *mut BionicAddrinfo) {
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` is a live Eclipse-owned node (caller contract); ai_next is read before
+        // the node's single backing block is freed.
+        let next = unsafe { (*cursor).ai_next };
+        // SAFETY: each node is exactly one malloc block (bionic_node_from_glibc), freed once.
+        unsafe { libc::free(cursor.cast()) };
+        cursor = next;
+    }
+}
+
+/// `const char* gai_strerror(int ecode)` — static message table keyed by BIONIC-positive codes
+/// (the values [`eclipse_getaddrinfo`]/[`eclipse_getnameinfo`] return). **minimal-correct:**
+/// stable process-lifetime strings; glibc's table (keyed by ITS negative codes) would answer
+/// "Unknown error" — or worse, a wrong message — for every bionic code.
+unsafe extern "C" fn eclipse_gai_strerror(ecode: c_int) -> *const c_char {
+    let msg: &'static [u8] = match ecode {
+        0 => b"no error\0",
+        BIONIC_EAI_ADDRFAMILY => b"address family for hostname not supported\0",
+        BIONIC_EAI_AGAIN => b"temporary failure in name resolution\0",
+        BIONIC_EAI_BADFLAGS => b"invalid value for ai_flags\0",
+        BIONIC_EAI_FAIL => b"non-recoverable failure in name resolution\0",
+        BIONIC_EAI_FAMILY => b"ai_family not supported\0",
+        BIONIC_EAI_MEMORY => b"memory allocation failure\0",
+        BIONIC_EAI_NODATA => b"no address associated with hostname\0",
+        BIONIC_EAI_NONAME => b"hostname nor servname provided, or not known\0",
+        BIONIC_EAI_SERVICE => b"servname not supported for ai_socktype\0",
+        BIONIC_EAI_SOCKTYPE => b"ai_socktype not supported\0",
+        BIONIC_EAI_SYSTEM => b"system error returned in errno\0",
+        12 => b"invalid value for hints\0", // bionic EAI_BADHINTS
+        13 => b"resolved protocol is unknown\0", // bionic EAI_PROTOCOL
+        BIONIC_EAI_OVERFLOW => b"argument buffer overflow\0",
+        _ => b"unknown error\0",
+    };
+    msg.as_ptr().cast()
+}
+
+/// `int getnameinfo(const struct sockaddr*, socklen_t, char* host, socklen_t, char* serv,
+/// socklen_t, int flags)` — reverse lookup. **translate (flags + return only):** `sockaddr`/
+/// `socklen_t` are layout-identical on Linux x86-64 (shared kernel ABI), so the call passes
+/// through; the bionic `NI_*` word is translated by name and the glibc `EAI_*` return mapped to
+/// bionic-positive. Undefined bionic bits → [`BIONIC_EAI_BADFLAGS`] without touching the host.
+///
+/// # Safety
+/// Standard `getnameinfo` caller contract: `sa` valid for `salen` bytes; `host`/`serv` null or
+/// writable for their stated lengths.
+unsafe extern "C" fn eclipse_getnameinfo(
+    sa: *const libc::sockaddr,
+    salen: libc::socklen_t,
+    host: *mut c_char,
+    hostlen: libc::socklen_t,
+    serv: *mut c_char,
+    servlen: libc::socklen_t,
+    flags: c_int,
+) -> c_int {
+    let g_flags = match translate_flags_by_name(flags, NI_FLAG_PAIRS) {
+        Ok(g) => g,
+        Err(eai) => {
+            tracing::warn!(
+                target: "eclipse.netdb",
+                ni_flags = format_args!("0x{flags:x}"),
+                "getnameinfo: undefined bionic NI_* bits -> EAI_BADFLAGS"
+            );
+            return eai;
+        }
+    };
+    // SAFETY: pure pass-through of the caller's pointers under the identical Linux sockaddr ABI;
+    // only the flag word was rewritten.
+    let rc = unsafe { libc::getnameinfo(sa, salen, host, hostlen, serv, servlen, g_flags) };
+    bionic_eai_from_glibc(rc)
+}
+
+// =================================================================================================
 // ndk-android (libandroid) — the 28 NDK natives. Opaque NDK pointers are Eclipse-owned generational
 // registry handles ([`super::ndk_registry`]) cast to `*mut T`, so a stale/fabricated handle is a
 // typed `Err` → NDK sentinel (NULL / negative), never a wild dereference / UB.
@@ -4041,21 +4484,24 @@ mod tests {
         // remap) + 7 bionic-signal (6 translating 2026-06-11; + sigaltstack 2026-06-12 — the
         // core-1223806 caller-attribution forward) + 2 bionic link-map introspection
         // (dl_iterate_phdr + dladdr, 2026-06-12 — core 1223806's terminate-loop root cause: the
-        // host-glibc walk could never contain the Eclipse-mapped engine images) + 28 ndk-android
+        // host-glibc walk could never contain the Eclipse-mapped engine images) + 4 bionic-netdb
+        // resolver-ABI (getaddrinfo/freeaddrinfo/gai_strerror/getnameinfo, 2026-06-12 — the
+        // engine HttpError:DnsResolve root cause: glibc-shaped addrinfo tails read through the
+        // bionic field order) + 28 ndk-android
         // (2026-06-12 — ANativeWindow_getFormat, libsurface_util_jni's sole unresolved pre-load
         // import) + 33 media-ndk + 8 audio + 53 bionic-pthread/TLS/sem/syscall (37 + the 14
         // thread-lifecycle natives added 2026-06-05: create/join/detach/setname_np/kill/
         // getattr_np/get+setschedparam/attr_*; + __cxa_thread_atexit_impl & pthread_atfork
         // 2026-06-12 — the core-947663 destructor-order fix and the last libbacktrace-native
         // pre-load import) + 5 bionic-sysconf system-query (sysconf/getauxval/sched_getcpu/
-        // getpagesize/sysinfo — the allocator-bootstrap fix, 2026-06-05) = 183.
+        // getpagesize/sysinfo — the allocator-bootstrap fix, 2026-06-05) = 187.
         assert_eq!(
             p.len(),
-            125 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            129 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
             "6 liblog + 16 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
-             introspection + 28 ndk-android + 33 media-ndk + 8 audio + 53 pthread + 5 sysconf \
-             system-query natives registered"
+             introspection + 4 netdb resolver-ABI + 28 ndk-android + 33 media-ndk + 8 audio + \
+             53 pthread + 5 sysconf system-query natives registered"
         );
         for name in [
             // liblog (3 fixed-arity Rust + 2 variadic C-shim + 1 va_list C-shim)
@@ -4119,6 +4565,11 @@ mod tests {
             // bionic link-map introspection (2) — 2026-06-12 (core 1223806)
             "dl_iterate_phdr",
             "dladdr",
+            // bionic netdb resolver ABI (4) — 2026-06-12 (engine DnsResolve root cause)
+            "getaddrinfo",
+            "freeaddrinfo",
+            "gai_strerror",
+            "getnameinfo",
             // ndk-android (28)
             "AAssetManager_fromJava",
             "AAssetManager_open",
@@ -4521,6 +4972,232 @@ mod tests {
                 0
             );
         }
+    }
+
+    // ---- bionic netdb resolver ABI (2026-06-12) -------------------------------------------------
+
+    #[test]
+    fn bionic_addrinfo_layout_is_bsd_order_and_differs_from_glibc() {
+        // THE ABI pin (2026-06-12, the engine DnsResolve root cause): bionic addrinfo tail =
+        // canonname@24 / addr@32 (BSD order, public AOSP netdb.h); glibc = addr@24 /
+        // canonname@32. A drift here re-opens the exact failure (a bionic walker reading the
+        // glibc canonname slot — NULL on effectively every node — as ai_addr → zero usable
+        // addresses → CURLE_COULDNT_RESOLVE_HOST).
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_flags), 0);
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_family), 4);
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_socktype), 8);
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_protocol), 12);
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_addrlen), 16);
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_canonname), 24);
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_addr), 32);
+        assert_eq!(std::mem::offset_of!(BionicAddrinfo, ai_next), 40);
+        assert_eq!(std::mem::size_of::<BionicAddrinfo>(), 48);
+        // Prove the divergence is REAL on this target (the pin is load-bearing, not vacuous):
+        // glibc's tail order through the libc crate is the swap of the bionic one.
+        assert_eq!(std::mem::offset_of!(libc::addrinfo, ai_addr), 24);
+        assert_eq!(std::mem::offset_of!(libc::addrinfo, ai_canonname), 32);
+        assert_eq!(std::mem::offset_of!(libc::addrinfo, ai_next), 40);
+        assert_eq!(std::mem::size_of::<libc::addrinfo>(), 48);
+    }
+
+    #[test]
+    fn bionic_ai_ni_eai_translation_tables_match_both_headers() {
+        // AI_*: every bionic bit maps to the glibc bit of the SAME NAME (bionic values from the
+        // public AOSP netdb.h re-fetched 2026-06-12; glibc values via the libc crate = the host
+        // header). Undefined bits are EAI_BADFLAGS (bionic-positive 3), never guessed.
+        assert_eq!(translate_flags_by_name(0, AI_FLAG_PAIRS), Ok(0));
+        assert_eq!(
+            translate_flags_by_name(0x0001, AI_FLAG_PAIRS),
+            Ok(libc::AI_PASSIVE)
+        );
+        assert_eq!(
+            translate_flags_by_name(0x0002, AI_FLAG_PAIRS),
+            Ok(libc::AI_CANONNAME)
+        );
+        assert_eq!(
+            translate_flags_by_name(0x0004, AI_FLAG_PAIRS),
+            Ok(libc::AI_NUMERICHOST)
+        );
+        assert_eq!(
+            translate_flags_by_name(0x0008, AI_FLAG_PAIRS),
+            Ok(libc::AI_NUMERICSERV)
+        );
+        assert_eq!(
+            translate_flags_by_name(0x0100, AI_FLAG_PAIRS),
+            Ok(libc::AI_ALL)
+        );
+        assert_eq!(
+            translate_flags_by_name(0x0400, AI_FLAG_PAIRS),
+            Ok(libc::AI_ADDRCONFIG)
+        );
+        assert_eq!(
+            translate_flags_by_name(0x0800, AI_FLAG_PAIRS),
+            Ok(libc::AI_V4MAPPED)
+        );
+        // The proven aliasing hazard: bionic AI_ADDRCONFIG (0x400) numerically equals glibc
+        // AI_NUMERICSERV — a raw pass-through silently flips the flag's meaning.
+        assert_eq!(libc::AI_NUMERICSERV, 0x0400);
+        assert_ne!(libc::AI_ADDRCONFIG, 0x0400);
+        assert_eq!(
+            translate_flags_by_name(0x4000, AI_FLAG_PAIRS),
+            Err(BIONIC_EAI_BADFLAGS)
+        );
+        // NI_*: the scrambled low bits translate by name; DGRAM (16) is identical in both.
+        assert_eq!(
+            translate_flags_by_name(0x1, NI_FLAG_PAIRS),
+            Ok(libc::NI_NOFQDN) // glibc 4
+        );
+        assert_eq!(
+            translate_flags_by_name(0x2, NI_FLAG_PAIRS),
+            Ok(libc::NI_NUMERICHOST) // glibc 1
+        );
+        assert_eq!(
+            translate_flags_by_name(0x4, NI_FLAG_PAIRS),
+            Ok(libc::NI_NAMEREQD) // glibc 8
+        );
+        assert_eq!(
+            translate_flags_by_name(0x8, NI_FLAG_PAIRS),
+            Ok(libc::NI_NUMERICSERV) // glibc 2
+        );
+        assert_eq!(
+            translate_flags_by_name(0x10, NI_FLAG_PAIRS),
+            Ok(libc::NI_DGRAM)
+        );
+        assert_eq!(
+            translate_flags_by_name(0x100, NI_FLAG_PAIRS),
+            Err(BIONIC_EAI_BADFLAGS)
+        );
+        // EAI_*: glibc-negative → bionic-positive of the SAME NAME (sign-flip AND renumber —
+        // e.g. FAMILY is glibc -6 but bionic 5, NONAME glibc -2 but bionic 8).
+        assert_eq!(bionic_eai_from_glibc(0), 0);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_BADFLAGS), 3);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_NONAME), 8);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_AGAIN), 2);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_FAIL), 4);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_NODATA), 7);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_FAMILY), 5);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_SOCKTYPE), 10);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_SERVICE), 9);
+        assert_eq!(bionic_eai_from_glibc(GLIBC_EAI_ADDRFAMILY), 1);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_MEMORY), 6);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_SYSTEM), 11);
+        assert_eq!(bionic_eai_from_glibc(libc::EAI_OVERFLOW), 14);
+        // An unmapped/newer glibc code degrades to the generic non-recoverable failure.
+        assert_eq!(bionic_eai_from_glibc(-100), BIONIC_EAI_FAIL);
+    }
+
+    #[test]
+    fn bionic_getaddrinfo_returns_bionic_shaped_nodes_and_positive_eai() {
+        // Live round-trip through the bionic shape, fully OFFLINE (AI_NUMERICHOST → no DNS):
+        // "127.0.0.1" must yield a node whose ai_addr — read at the BIONIC offset (32, via the
+        // typed field) — is a non-NULL AF_INET sockaddr holding 127.0.0.1, and (AI_CANONNAME)
+        // whose ai_canonname@24 is the deep-copied numeric string; a NAME under AI_NUMERICHOST
+        // is the deterministic bionic-POSITIVE EAI_NONAME; gai_strerror answers the bionic code.
+        let node = std::ffi::CString::new("127.0.0.1").expect("cstring");
+        // SAFETY: all-zero is a valid bionic addrinfo hints baseline (fields set below).
+        let mut hints: BionicAddrinfo = unsafe { std::mem::zeroed() };
+        hints.ai_flags = 0x0004 | 0x0002; // bionic AI_NUMERICHOST | AI_CANONNAME
+        hints.ai_family = libc::AF_INET;
+        hints.ai_socktype = libc::SOCK_STREAM;
+        let mut res: *mut BionicAddrinfo = std::ptr::null_mut();
+        // SAFETY: valid C string + valid hints + valid out-pointer — the fn's caller contract.
+        let rc = unsafe { eclipse_getaddrinfo(node.as_ptr(), std::ptr::null(), &hints, &mut res) };
+        assert_eq!(rc, 0, "numeric-host lookup must succeed offline");
+        assert!(!res.is_null(), "success must produce a chain");
+        // SAFETY: rc==0 ⇒ res points at the Eclipse-owned chain head.
+        let first = unsafe { &*res };
+        assert_eq!(first.ai_family, libc::AF_INET);
+        assert!(
+            !first.ai_addr.is_null(),
+            "ai_addr (the BIONIC @32 slot) must be populated"
+        );
+        assert_eq!(
+            first.ai_addrlen as usize,
+            std::mem::size_of::<libc::sockaddr_in>()
+        );
+        // SAFETY: ai_addrlen says this is a sockaddr_in; the node owns the bytes.
+        let sin = unsafe { &*(first.ai_addr.cast::<libc::sockaddr_in>()) };
+        assert_eq!(sin.sin_family, libc::AF_INET as libc::sa_family_t);
+        assert_eq!(u32::from_be(sin.sin_addr.s_addr), 0x7f00_0001);
+        // AI_CANONNAME with a numeric host: glibc reports the numeric string; the deep copy must
+        // land it in the BIONIC canonname slot (@24).
+        assert!(!first.ai_canonname.is_null(), "AI_CANONNAME requested");
+        // SAFETY: canonname is the NUL-terminated copy bionic_node_from_glibc made.
+        let canon = unsafe { std::ffi::CStr::from_ptr(first.ai_canonname) };
+        assert_eq!(canon.to_str().expect("utf-8"), "127.0.0.1");
+        // SAFETY: `res` is the chain eclipse_getaddrinfo returned, freed exactly once.
+        unsafe { eclipse_freeaddrinfo(res) };
+
+        // Guaranteed-invalid OFFLINE failure: a non-numeric NAME under AI_NUMERICHOST cannot
+        // parse → glibc EAI_NONAME → bionic-positive 8 (the sign every bionic caller — including
+        // Roblox's EAI retry classification — branches on).
+        let bad = std::ffi::CString::new("not-an-ip.invalid").expect("cstring");
+        let mut res2: *mut BionicAddrinfo = std::ptr::null_mut();
+        // SAFETY: as above.
+        let rc = unsafe { eclipse_getaddrinfo(bad.as_ptr(), std::ptr::null(), &hints, &mut res2) };
+        assert_eq!(rc, BIONIC_EAI_NONAME);
+        assert!(rc > 0, "bionic EAI codes are POSITIVE");
+        assert!(res2.is_null(), "failure must not hand out a chain");
+        // SAFETY: gai_strerror takes any code and returns a static string.
+        let msg = unsafe { eclipse_gai_strerror(rc) };
+        assert!(!msg.is_null());
+        // SAFETY: the table entries are static NUL-terminated strings.
+        let s = unsafe { std::ffi::CStr::from_ptr(msg) }
+            .to_str()
+            .expect("ascii");
+        assert!(s.contains("not known"), "the NONAME message, got: {s}");
+    }
+
+    #[test]
+    fn bionic_getnameinfo_translates_flags_and_returns_numeric_host() {
+        // Fully offline: BIONIC NI_NUMERICHOST|NI_NUMERICSERV (0x2|0x8) — which as RAW glibc
+        // bits would mean NUMERICSERV|NAMEREQD and reverse-resolve 127.0.0.1 to "localhost" (or
+        // fail) — must yield exactly "127.0.0.1"/"80", proving the by-name translation is
+        // load-bearing. An undefined bionic bit is EAI_BADFLAGS without touching the host.
+        // SAFETY: all-zero then field-filled is a valid sockaddr_in.
+        let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        sin.sin_family = libc::AF_INET as libc::sa_family_t;
+        sin.sin_port = 80u16.to_be();
+        sin.sin_addr.s_addr = 0x7f00_0001u32.to_be();
+        let mut host = [0 as c_char; 64];
+        let mut serv = [0 as c_char; 16];
+        // SAFETY: valid sockaddr_in + correctly-sized writable buffers — the caller contract.
+        let rc = unsafe {
+            eclipse_getnameinfo(
+                (&raw const sin).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                host.as_mut_ptr(),
+                host.len() as libc::socklen_t,
+                serv.as_mut_ptr(),
+                serv.len() as libc::socklen_t,
+                0x2 | 0x8, // bionic NI_NUMERICHOST | NI_NUMERICSERV
+            )
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: rc==0 ⇒ both buffers hold NUL-terminated strings.
+        let h = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) }
+            .to_str()
+            .expect("ascii");
+        // SAFETY: as above.
+        let s = unsafe { std::ffi::CStr::from_ptr(serv.as_ptr()) }
+            .to_str()
+            .expect("ascii");
+        assert_eq!(h, "127.0.0.1");
+        assert_eq!(s, "80");
+        // Undefined bionic NI bit → bionic-positive EAI_BADFLAGS, host untouched.
+        // SAFETY: same valid pointers; the flag word alone is invalid.
+        let rc = unsafe {
+            eclipse_getnameinfo(
+                (&raw const sin).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                host.as_mut_ptr(),
+                host.len() as libc::socklen_t,
+                serv.as_mut_ptr(),
+                serv.len() as libc::socklen_t,
+                0x100,
+            )
+        };
+        assert_eq!(rc, BIONIC_EAI_BADFLAGS);
     }
 
     // ---- early-fault tap (2026-06-12) -----------------------------------------------------------

@@ -28,8 +28,13 @@
 > (ndk 27→28) = 122 base / 180 total (`ddabcd7`); then + bionic link-map introspection
 > `dl_iterate_phdr` + `dladdr` (core 1223806 — host glibc's walk is blind to Eclipse-mapped images,
 > which made every libroblox C++ throw process-fatal; see `src/loader/module_registry.rs`) + the
-> translating/attributing `sigaltstack` (signal natives 6→7) = **125 base / 183 total**. The
-> AGENTS.md §6 dated entries are authoritative for these counts.
+> translating/attributing `sigaltstack` (signal natives 6→7) = 125 base / 183 total; then + the
+> **bionic netdb resolver-ABI 4** — translating `getaddrinfo`/`freeaddrinfo`/`gai_strerror`/
+> `getnameinfo` (the engine `HttpError:DnsResolve` root cause: bionic vs glibc `struct addrinfo`
+> tail order SWAPPED — `ai_canonname`@24/`ai_addr`@32 vs `ai_addr`@24/`ai_canonname`@32 — plus
+> renumbered `AI_*`/sign-flipped `EAI_*`/scrambled `NI_*`; `gethostbyname` stays host-baseline,
+> `hostent` field order identical; see the netdb section in `native_provider.rs`) =
+> **129 base / 187 total**. The AGENTS.md §6 dated entries are authoritative for these counts.
 
 The **first bionic-env resolution cut**: resolve every one of `libroblox.so`'s 584 undefined (UND)
 imports against a host-baseline [`BionicEnv`](../src/loader/bionic_env.rs) scope, categorize them,
@@ -120,7 +125,7 @@ means an Eclipse-owned native is the ONLY path even for a baseline.
 | egl-gles    | 91 | 0  | yes — host `libEGL.so`/`libGLESv2.so` present |
 | pthread     | 45 | 0  | yes (baseline only; bionic `pthread_t` differs) |
 | libm        | 43 | 0  | yes (pure math is sound) |
-| bionic-libc | 303 | 21 | partly — 21 are bionic-specific (glibc lacks them) |
+| bionic-libc | 303 | 21 | partly — 21 are bionic-specific (glibc lacks them) [2026-06-12: stale for the netdb resolver 4 — `getaddrinfo`/`freeaddrinfo`/`gai_strerror`/`getnameinfo` are Eclipse-tier translating natives since the engine-DnsResolve root cause (bionic/glibc `addrinfo` tail SWAPPED + `AI_`/`EAI_`/`NI_` value divergence); `gethostbyname` stays baseline (`hostent` identical)] |
 | cxa-runtime | 3  | 0  | yes (baseline; glibc atexit semantics) [2026-06-12: stale for `__cxa_thread_atexit_impl` — Eclipse-tier native since core 947663: bionic runs cxa finalizers BEFORE pthread-key dtors] |
 | dl          | 5  | 0  | baseline only — must route to Eclipse's OWN loader [2026-06-12: `dl_iterate_phdr`/`dladdr` now Eclipse-owned (core 1223806 — glibc's walk is blind to Eclipse-mapped images); dlopen/dlsym/dlclose/dlerror remain the recorded host-baseline loading gap] |
 | ndk-android | 0  | ✅ 0 (was 27) | **no host equiv → all 27 Eclipse-owned (2026-06-05)** |
