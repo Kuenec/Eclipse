@@ -5,8 +5,9 @@
 # AOSP-shape NetworkRequest$Builder, foreground RunningAppProcessInfo).
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
-#   classes.dex  = ONLY the patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*)
-#   classes2.dex = ATL's original whole api-impl dex
+#   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*)
+#   classes2.dex = smali-patched View (+ View$OnCapturedPointerListener) = installed View + AOSP pointer-capture API
+#   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
 
@@ -36,6 +37,15 @@ fail() { echo "ERROR: $*" >&2; exit 1; }
 [ -n "$DX" ] && [ -x "$DX" ] || fail "dx not found (set DX or install the Android dx tool; d8 is NOT compatible with this script)"
 [ -f "$ATL_SRC/android/os/Build.java" ] || fail "ATL api-impl sources not found at $ATL_SRC (set ATL_SRC)"
 [ -f "$ORIG_FW/api-impl.jar" ] || fail "stock framework not found at $ORIG_FW (set ORIG_FW; install android-translation-layer)"
+
+# 2026-06-13: smali/baksmali (run via the vendored JDK's java) for the View pointer-capture patch (step 4b).
+# Vendored at vendor/toolchain/smali/ so a clean checkout builds with no system install; env-overridable.
+JAVA="${JAVA:-$(find_jdk_tool java)}"
+BAKSMALI_JAR="${BAKSMALI_JAR:-$repo/vendor/toolchain/smali/baksmali-2.5.2.jar}"
+SMALI_JAR="${SMALI_JAR:-$repo/vendor/toolchain/smali/smali-2.5.2.jar}"
+[ -n "$JAVA" ] && [ -x "$JAVA" ] || fail "java not found (set JAVA, or vendor a JDK at vendor/toolchain/jdk-*/)"
+[ -f "$BAKSMALI_JAR" ] || fail "baksmali not found at $BAKSMALI_JAR (vendored at vendor/toolchain/smali/; set BAKSMALI_JAR, or 'pacman -S smali')"
+[ -f "$SMALI_JAR" ] || fail "smali not found at $SMALI_JAR (vendored at vendor/toolchain/smali/; set SMALI_JAR, or 'pacman -S smali')"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -87,10 +97,46 @@ for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'andro
     cp "$work/classes/"$pattern "$work/stage/$dir/"
 done
 
-# --- 4. dex the patched classes, compose the multidex overlay jar ------------------------
+# --- 4. dex the javac-patched classes -> classes.dex -------------------------------------
 "$DX" --dex --output="$work/jar/classes.dex" "$work/stage"
-unzip -p "$ORIG_FW/api-impl.jar" classes.dex > "$work/jar/classes2.dex"
-(cd "$work/jar" && "$JAR" cf api-impl.jar classes.dex classes2.dex)
+
+# --- 4b. smali-patch the INSTALLED View -> classes2.dex ----------------------------------
+# 2026-06-13: ATL's installed View omits AOSP's pointer-capture API (View.OnCapturedPointerListener +
+# setOnCapturedPointerListener) that Roblox calls in ActivityNativeMain.d1. Adding a *method* needs the
+# whole View class, and the repo's vendored View source has DRIFTED from the installed jar (e.g.
+# setBackgroundColor is native in vendored, plain-Java installed) — so recompiling vendored re-breaks it.
+# Instead, disassemble the AUTHORITATIVE installed View, add ONLY the field + setter + nested interface,
+# reassemble. Anchored inserts with exact-count guards (fail loud on drift) mirror the Build.java approach.
+unzip -p "$ORIG_FW/api-impl.jar" classes.dex > "$work/stock-classes.dex"
+"$JAVA" -jar "$BAKSMALI_JAR" disassemble "$work/stock-classes.dex" -o "$work/smali" >/dev/null
+vsm="$work/smali/android/view/View.smali"
+[ -f "$vsm" ] || fail "View.smali not found after baksmali of the installed framework"
+for a in \
+    '.field private on_touch_listener:Landroid/view/View$OnTouchListener;' \
+    '.method public setOnClickListener(Landroid/view/View$OnClickListener;)V' \
+    '        Landroid/view/View$DeclaredOnClickListener;,'; do
+    n="$(grep -cF "$a" "$vsm")" || true
+    [ "$n" = "1" ] || fail "View.smali anchor not unique (found $n, expected 1): $a — installed View drifted; update patch-framework.sh"
+done
+# (i) backing field after on_touch_listener
+perl -0pi -e 's{(\.field private on_touch_listener:Landroid/view/View\$OnTouchListener;\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP View.OnCapturedPointerListener backing field (pointer-capture API ATL omits)\n.field private mCapturedPointerListener:Landroid/view/View\$OnCapturedPointerListener;\n}' "$vsm"
+# (ii) setter right after setOnClickListener's .end method
+perl -0pi -e 's{(\.method public setOnClickListener\(Landroid/view/View\$OnClickListener;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP View.setOnCapturedPointerListener (API 26); headless (engine owns pointer input), pure-Java record\n.method public setOnCapturedPointerListener(Landroid/view/View\$OnCapturedPointerListener;)V\n    .registers 2\n\n    iput-object p1, p0, Landroid/view/View;->mCapturedPointerListener:Landroid/view/View\$OnCapturedPointerListener;\n\n    return-void\n.end method\n}s' "$vsm"
+# (iii) register the nested class in MemberClasses (reflection completeness)
+perl -0pi -e 's{(value = \{\n)(        Landroid/view/View\$DeclaredOnClickListener;,\n)}{$1        Landroid/view/View\$OnCapturedPointerListener;,\n$2}' "$vsm"
+grep -qF 'setOnCapturedPointerListener(Landroid/view/View$OnCapturedPointerListener;)V' "$vsm" || fail "View.smali setter insert failed (drift?)"
+grep -qF 'mCapturedPointerListener:Landroid/view/View$OnCapturedPointerListener;' "$vsm" || fail "View.smali field insert failed (drift?)"
+# assemble ONLY the patched View + the committed nested interface -> classes2.dex (other View$* stay stock)
+mkdir -p "$work/smali-view/android/view"
+cp "$vsm" "$work/smali-view/android/view/View.smali"
+cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
+"$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
+
+# --- 4c. stock api-impl as classes3.dex; compose the 3-dex overlay jar --------------------
+# DexPathList resolves first-dex-wins across classes.dex < classes2.dex < classes3.dex: View resolves from
+# the patched classes2.dex, the javac-patched classes from classes.dex, everything else from stock classes3.dex.
+cp "$work/stock-classes.dex" "$work/jar/classes3.dex"
+(cd "$work/jar" && "$JAR" cf api-impl.jar classes.dex classes2.dex classes3.dex)
 
 # --- 5. install: overlay jar + symlinks to the stock res/natives -------------------------
 mkdir -p "$OUT"
@@ -99,5 +145,5 @@ ln -sfn "$ORIG_FW/framework-res.apk" "$OUT/framework-res.apk"
 ln -sfn "$ORIG_FW/natives" "$OUT/natives"
 
 echo "OK: patched framework overlay installed at $OUT"
-echo "    classes.dex (patched): $(ls -l "$work/jar/classes.dex" | awk '{print $5}') bytes; classes2.dex (stock): $(ls -l "$work/jar/classes2.dex" | awk '{print $5}') bytes"
+echo "    classes.dex (javac-patched): $(ls -l "$work/jar/classes.dex" | awk '{print $5}') bytes; classes2.dex (smali View): $(ls -l "$work/jar/classes2.dex" | awk '{print $5}') bytes; classes3.dex (stock): $(ls -l "$work/jar/classes3.dex" | awk '{print $5}') bytes"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""
