@@ -152,10 +152,20 @@ before any history-rewriting/force operation.
   as Phase-5 §5 framed it). EVIDENCE (Phase-5 forensics, still valid): the engine reads the pack DIRECTLY from the APK
   (its own zip reader — `lseek` to the CRC-valid STORED entry; it ignores the Phase-4 extracted FS tree; corrupting the
   FS copy was byte-identical) and rejects the valid `RBXS` bytes POST-READ. Since it is now common to BOTH packs/APIs,
-  the failure is in the engine's COMMON pack open/read/parse, not an API/GL/Vulkan-surface step. NEXT: granular syscall
-  trace (read/pread/lseek, attach-late) of the `vulkan_mobile` pack read to see exactly how far the read gets + what the
-  engine does at the rejection; weigh provisioning (merged-APK engine/shader version skew — though same-version + intact
-  CRC argues against it) vs a common decompress/parse step. Detail: §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
+  the failure is in the engine's COMMON pack open/read/parse, not an API/GL/Vulkan-surface step. GRANULAR SYSCALL TRACE
+  DONE (attach-late read/pread/lseek, 6.3M lines): the engine reads each pack DIRECTLY from the APK —
+  `lseek(apkfd,<data_off>); read(apkfd,"RBXS\v\0\1\0…default\0…",8192)=8192` (FULL read, NO short/failed reads → Eclipse
+  file IO is sound) — i.e. it reads the `RBXS` header + variant table (`default` = first shader variant) and **rejects
+  during EARLY PARSE: it never reads past the first 8 KB** (exactly ONE data-offset seek + ONE RBXS read per pack across
+  ~70 retry frames). Both packs are RBXS format version `0x0b`. (It also re-scans the whole zip central directory every
+  retry — ~1.3M reads — a perf artifact of the per-frame retry, NOT the reject cause; it does find+read the entry.)
+  CONCLUSION: the reject is INSIDE the engine's proprietary RBXS parse / variant-selection on a valid+complete+CRC-correct
+  +same-build pack — NOT first-party-resolvable. NEXT STEP needs EITHER (a) a genuine, internally-consistent
+  `roblox-2.721.1108` APK (the current one may be a merged/universal APK whose shader packs version-skew the
+  `libroblox.so` build — try a known-good single APK and re-boot), OR (b) the RBXS format/variant-selection internals
+  (reverse-engineering `libroblox.so` — OFF-POLICY per the cyber-safeguard; do NOT). RECOMMEND (a). If shaders still
+  reject on a known-good APK, the cause is Eclipse-environmental (re-open: the device-profile / feature-level the engine
+  presents to variant-selection). Detail: §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
 - **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
