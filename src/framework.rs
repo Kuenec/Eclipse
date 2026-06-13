@@ -4922,6 +4922,88 @@ extern "system" fn view_native_destructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// A `(JNI name, JNI descriptor, fn pointer)` triple for one native to bind on a class — the unit the
+/// best-effort registrar ([`register_class_natives_best_effort`]) registers independently.
+type NativeBinding = (&'static JNIStr, &'static JNIStr, *mut c_void);
+
+/// Drive the per-method best-effort loop: `step` is called for EVERY entry in `bindings`, in order,
+/// returning `true` when that entry was bound and `false` when it was skipped (already logged by
+/// `step`). Returns the number of bound entries. The loop NEVER short-circuits — a `false` (skipped)
+/// entry does not stop the rest.
+///
+/// 2026-06-13: this is the pure control-flow core of [`register_class_natives_best_effort`], split out
+/// so it is unit-testable without a JVM (the real JNI calls need a live ART VM, which can't run
+/// in-harness). It encodes the one invariant the 58a50f6 atomic-RegisterNatives abort violated: a
+/// single failing entry must NOT prevent the remaining entries from being attempted. A regression that
+/// re-introduces `?`/early-return on a per-entry failure fails
+/// `register_class_natives_best_effort_skips_unbindable_method_and_continues`.
+fn fold_best_effort(
+    bindings: &[NativeBinding],
+    mut step: impl FnMut(&NativeBinding) -> bool,
+) -> u32 {
+    let mut bound = 0u32;
+    for binding in bindings {
+        if step(binding) {
+            bound += 1;
+        }
+    }
+    bound
+}
+
+/// Register each native in `bindings` on `class_name` INDEPENDENTLY (best-effort), so a single entry the
+/// SHIPPED framework does not declare native cannot abort the whole class's registration.
+///
+/// 2026-06-13: `RegisterNatives` is ATOMIC over its `NativeMethod` array — ART validates every entry
+/// against the class's declared methods first and rejects the WHOLE array on the first mismatch. The
+/// 58a50f6 boot break was exactly this: a speculative `View.setBackgroundColor(I)V` that the shipped
+/// dex declares as PLAIN Java took the lifecycle-critical `native_constructor`/`native_destructor`/
+/// `native_get_window` bindings down with it (`jni_internal.cc: Failed to register non-native method …
+/// as native`). Registering one entry at a time degrades that fatal whole-class abort into a deferred
+/// call-time `UnsatisfiedLinkError` on ONLY the bad method — the same loud per-method discovery signal
+/// the project already relies on. This mirrors the existing per-native best-effort precedent in
+/// [`register_asset_stream_natives`], but logs each unbindable method at WARN (not debug): it must stay
+/// LOUD so it never silently masks a genuinely-needed native — it only prevents one bad entry from
+/// destroying its siblings. Returns the count bound.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each `ptr` must be an `extern "system"` fn matching its paired
+/// `sig`. Callers guarantee this by construction (the same guarantee the atomic path required). A method
+/// the class does not declare native makes `register_native_methods` throw; the exception is cleared and
+/// the entry skipped (WARN), never propagated.
+fn register_class_natives_best_effort(
+    env: &mut Env,
+    class_name: &JNIStr,
+    bindings: &[NativeBinding],
+) -> Result<u32, FrameworkError> {
+    // `find_class` is the one operation that may legitimately fail the whole registration (the class
+    // must load); resolve it once up front so a load failure propagates, not a per-method skip.
+    let class = env.find_class(class_name)?;
+    let bound = fold_best_effort(bindings, |&(name, sig, ptr)| {
+        // SAFETY: `ptr` is an `extern "system"` fn whose signature is `sig` by the caller's
+        // construction. A method this build does not declare native throws (cleared best-effort below),
+        // never UB.
+        let method = unsafe { NativeMethod::from_raw_parts(name, sig, ptr) };
+        match unsafe { env.register_native_methods(&class, std::slice::from_ref(&method)) } {
+            Ok(()) => true,
+            Err(_) => {
+                // Clear the pending NoSuchMethodError ART raised so the next entry registers cleanly.
+                if env.exception_check() {
+                    env.exception_clear();
+                }
+                tracing::warn!(
+                    class = %class_name.to_str(),
+                    method = %name.to_str(),
+                    sig = %sig.to_str(),
+                    "native not declared on this shipped framework class (skipped, best-effort) — \
+                     will surface as a call-time UnsatisfiedLinkError if actually invoked"
+                );
+                false
+            }
+        }
+    });
+    Ok(bound)
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -4929,139 +5011,91 @@ extern "system" fn view_native_destructor<'local>(
 /// dev-host run surfaces (`No implementation found …`) is added here, implemented against
 /// [`view_registry`].
 ///
+/// 2026-06-13: bound PER METHOD (best-effort, via [`register_class_natives_best_effort`]) rather than as
+/// one atomic array — so a single entry the shipped dex disagrees with (the 58a50f6 mechanism) cannot
+/// abort the lifecycle-critical `native_constructor`/`native_destructor`/`native_get_window` bindings.
+///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
-/// They do, by construction — each native is written to the exact descriptor declared in `View.java`.
-/// Every native body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic crosses
-/// the JNI boundary (AGENTS.md §2.8).
+/// Each fn pointer matches the declared JNI signature by construction — each native is written to the
+/// exact descriptor declared in `View.java`. Every native body is `catch_unwind`-guarded via
+/// [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
 fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(VIEW_CLASS)?;
-    let methods = [
-        // SAFETY: `view_native_constructor` matches the paired
-        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
-        // (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_CONSTRUCTOR_NAME,
-                VIEW_NATIVE_CONSTRUCTOR_SIG,
-                view_native_constructor as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_set_padding` matches the paired `(JIIII)V` signature as an instance
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_SET_PADDING_NAME,
-                VIEW_NATIVE_SET_PADDING_SIG,
-                view_native_set_padding as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_set_layout_params` matches the paired `(JIIIFIIII)V` signature as an
-        // instance native (see the native's docs); casting the `extern "system"` fn to a
-        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_SET_LAYOUT_PARAMS_NAME,
-                VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG,
-                view_native_set_layout_params as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_request_layout` matches the paired `(J)V` signature as an instance
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_REQUEST_LAYOUT_NAME,
-                VIEW_NATIVE_REQUEST_LAYOUT_SIG,
-                view_native_request_layout as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_set_background_drawable` matches the paired `(JJ)V` signature as an
-        // instance native (see the native's docs); casting the `extern "system"` fn to a
-        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME,
-                VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG,
-                view_native_set_background_drawable as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_set_visibility` matches the paired `(JIF)V` signature as an instance
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_SET_VISIBILITY_NAME,
-                VIEW_NATIVE_SET_VISIBILITY_SIG,
-                view_native_set_visibility as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `image_button_set_on_click_listener` is the class-agnostic `(J)V` instance native
-        // that marks the peer clickable in `view_registry`; bound here for `View.nativeSetOnClickListener`
-        // (surfaced by multitouch.test's custom View, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_SET_ON_CLICK_LISTENER_NAME,
-                VIEW_SET_ON_CLICK_LISTENER_SIG,
-                image_button_set_on_click_listener as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_set_background_color` matches the paired `(JI)V` signature as an instance
-        // native (surfaced by multitouch.test, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_SET_BACKGROUND_COLOR_NAME,
-                VIEW_SET_BACKGROUND_COLOR_SIG,
-                view_native_set_background_color as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_set_fullscreen` matches the paired `(JZ)V` signature as an instance
-        // native (surfaced by Roblox's ActivitySplash.onCreate setSystemUiVisibility, run log
-        // 2026-06-11).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_SET_FULLSCREEN_NAME,
-                VIEW_NATIVE_SET_FULLSCREEN_SIG,
-                view_native_set_fullscreen as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_get_window` matches the paired `(J)Landroid/view/Window;` signature as
-        // an instance native (surfaced by Roblox's ActivityNativeMain.onCreate getViewTreeObserver,
-        // live-boot stack 2026-06-13). A RegisterNatives binding shadows the lazy mangled-name lookup
-        // that the boot reported missing.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_GET_WINDOW_NAME,
-                VIEW_NATIVE_GET_WINDOW_SIG,
-                view_native_get_window as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_native_destructor` matches the paired `(J)V` signature as an instance native
-        // (View.java line 1168, called from View.finalize line 1679). Declared on View and not
-        // overridden, so binding it here covers every View subclass (incl. SurfaceView) by inheritance.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_DESTRUCTOR_NAME,
-                VIEW_NATIVE_DESTRUCTOR_SIG,
-                view_native_destructor as *mut std::ffi::c_void,
-            )
-        },
-        // 2026-06-13: NO `setBackgroundColor(I)V` / `native_keep_screen_on(JZ)V` entries here — the
-        // shipped framework's `setBackgroundColor(int)` is plain Java, not native, so RegisterNatives
-        // (atomic over this array) rejected it and aborted the whole class binding at 58a50f6. See the
-        // consts comment near `VIEW_SET_ON_CLICK_LISTENER_NAME` for the live-log evidence.
+    // 2026-06-13: bound PER METHOD (best-effort) so a single entry the shipped dex disagrees with cannot
+    // abort the whole class — the 58a50f6 regression mechanism (a non-native `setBackgroundColor(I)V`
+    // took the lifecycle-critical natives down with it under atomic RegisterNatives). The casts to
+    // `*mut c_void` pair each fn with its declared JNI descriptor (verified against View.java lines
+    // 1166/1310, 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility`/`nativeSetOnClickListener`
+    // from the ART No-implementation-found lines, 2026-06-05; `native_destructor` View.java line 1168,
+    // 2026-06-13). NO `setBackgroundColor(I)V` / `native_keep_screen_on(JZ)V` here — the shipped
+    // framework's `setBackgroundColor(int)` is plain Java, not native (see the consts comment near
+    // `VIEW_SET_ON_CLICK_LISTENER_NAME` for the 58a50f6 live-log evidence); the best-effort registrar
+    // additionally makes any future such drift non-fatal (deferred per-method UnsatisfiedLinkError).
+    let bindings: [NativeBinding; 11] = [
+        (
+            VIEW_NATIVE_CONSTRUCTOR_NAME,
+            VIEW_NATIVE_CONSTRUCTOR_SIG,
+            view_native_constructor as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_SET_PADDING_NAME,
+            VIEW_NATIVE_SET_PADDING_SIG,
+            view_native_set_padding as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_SET_LAYOUT_PARAMS_NAME,
+            VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG,
+            view_native_set_layout_params as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_REQUEST_LAYOUT_NAME,
+            VIEW_NATIVE_REQUEST_LAYOUT_SIG,
+            view_native_request_layout as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME,
+            VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG,
+            view_native_set_background_drawable as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_SET_VISIBILITY_NAME,
+            VIEW_NATIVE_SET_VISIBILITY_SIG,
+            view_native_set_visibility as *mut c_void,
+        ),
+        // `image_button_set_on_click_listener` is the class-agnostic `(J)V` instance native that marks
+        // the peer clickable; bound here for `View.nativeSetOnClickListener` (multitouch.test, 2026-06-05).
+        (
+            VIEW_SET_ON_CLICK_LISTENER_NAME,
+            VIEW_SET_ON_CLICK_LISTENER_SIG,
+            image_button_set_on_click_listener as *mut c_void,
+        ),
+        (
+            VIEW_SET_BACKGROUND_COLOR_NAME,
+            VIEW_SET_BACKGROUND_COLOR_SIG,
+            view_native_set_background_color as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_SET_FULLSCREEN_NAME,
+            VIEW_NATIVE_SET_FULLSCREEN_SIG,
+            view_native_set_fullscreen as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_GET_WINDOW_NAME,
+            VIEW_NATIVE_GET_WINDOW_SIG,
+            view_native_get_window as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_DESTRUCTOR_NAME,
+            VIEW_NATIVE_DESTRUCTOR_SIG,
+            view_native_destructor as *mut c_void,
+        ),
     ];
-    // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
-    // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
-    // 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility`/`nativeSetOnClickListener` from
-    // the ART No-implementation-found lines, 2026-06-05; `native_destructor` View.java line 1168,
-    // 2026-06-13).
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    // SAFETY: each `ptr` is an `extern "system"` fn matching its paired descriptor by construction (see
+    // the per-entry references above); the registrar binds them per method on `android/view/View`.
+    let bound = register_class_natives_best_effort(env, VIEW_CLASS, &bindings)?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor"
+        bound,
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor (per-method best-effort)"
     );
     Ok(())
 }
@@ -5276,39 +5310,35 @@ extern "system" fn view_group_native_remove_view<'local>(
 /// [`view_registry`]; new ViewGroup natives the run surfaces are added here.
 ///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
-/// does — [`view_group_native_add_view`] is written to ViewGroup.java line 186's exact descriptor.
-/// The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do — [`view_group_native_add_view`] is written to ViewGroup.java line 186's exact descriptor and
+/// [`view_group_native_remove_view`] to line 187's. The bodies are `catch_unwind`-guarded via
+/// [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_view_group_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(VIEW_GROUP_CLASS)?;
-    let methods = [
-        // SAFETY: `view_group_native_add_view` matches the paired
-        // `(JJILandroid/view/ViewGroup$LayoutParams;)V` signature as an instance native; casting the
-        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
-                VIEW_GROUP_NATIVE_ADD_VIEW_SIG,
-                view_group_native_add_view as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `view_group_native_remove_view` matches the paired `(JJ)V` signature as an instance
-        // native (surfaced by multitouch.test re-parenting its content, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME,
-                VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG,
-                view_group_native_remove_view as *mut std::ffi::c_void,
-            )
-        },
+    // 2026-06-13: per-method best-effort (via `register_class_natives_best_effort`) so a single entry
+    // the shipped dex disagrees with is a deferred call-time UnsatisfiedLinkError on that method, not a
+    // fatal whole-class abort taking its siblings down (the 58a50f6 class of bug).
+    // SAFETY: `view_group_native_add_view` matches the paired
+    // `(JJILandroid/view/ViewGroup$LayoutParams;)V` instance native (ViewGroup.java line 186);
+    // `view_group_native_remove_view` matches the paired `(JJ)V` instance native (ViewGroup.java line
+    // 187, surfaced by multitouch.test re-parenting its content, run log 2026-06-05).
+    let bindings: [NativeBinding; 2] = [
+        (
+            VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
+            VIEW_GROUP_NATIVE_ADD_VIEW_SIG,
+            view_group_native_add_view as *mut c_void,
+        ),
+        (
+            VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME,
+            VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG,
+            view_group_native_remove_view as *mut c_void,
+        ),
     ];
-    // SAFETY: `class` is the loaded android/view/ViewGroup; the fn pointers' signatures match its
-    // `native_addView` (ViewGroup.java line 186) and `native_removeView` (ART-reported line 2026-06-05)
-    // declarations.
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    let bound = register_class_natives_best_effort(env, VIEW_GROUP_CLASS, &bindings)?;
     tracing::info!(
         class = "android/view/ViewGroup",
-        "registered Eclipse's non-GTK backing for ViewGroup.native_addView + native_removeView"
+        bound,
+        "registered Eclipse's non-GTK backing for ViewGroup.native_addView + native_removeView (per-method best-effort)"
     );
     Ok(())
 }
@@ -6680,47 +6710,40 @@ fn view_widget_handle(env: &mut Env, this: &JObject) -> jlong {
 /// do — each native is written to the exact descriptor declared in `TextView.java`. The bodies are
 /// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(TEXT_VIEW_CLASS)?;
-    let methods = [
-        // SAFETY: `view_native_constructor` matches the paired
-        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
-        // (shared with View.native_constructor); casting the `extern "system"` fn to a `*mut c_void`
-        // is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_CONSTRUCTOR_NAME,
-                VIEW_NATIVE_CONSTRUCTOR_SIG,
-                view_native_constructor as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `text_view_native_set_text` matches the paired `(Ljava/lang/String;)V` signature as
-        // an instance native (TextView.java line 111); the cast is how `NativeMethod::from_raw_parts`
-        // takes the fn pointer.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                TEXT_VIEW_NATIVE_SET_TEXT_NAME,
-                TEXT_VIEW_NATIVE_SET_TEXT_SIG,
-                text_view_native_set_text as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `text_view_native_set_text_color` matches the paired `(I)V` signature as an
-        // instance native (TextView.java line 120; surfaced by Roblox's splash-layout inflation,
-        // run log 2026-06-11).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME,
-                TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG,
-                text_view_native_set_text_color as *mut std::ffi::c_void,
-            )
-        },
+    // 2026-06-13: per-method best-effort (via `register_class_natives_best_effort`) so a single entry
+    // the shipped dex disagrees with is a deferred call-time UnsatisfiedLinkError on that method, not a
+    // fatal whole-class abort (the 58a50f6 class of bug). TextView is the SUPERTYPE of
+    // EditText/Button/CheckBox/RadioButton, so an atomic abort here would break LayoutInflater for
+    // every text widget — keeping `native_constructor` bindable independently of `native_setText`/
+    // `native_setTextColor` is exactly the lifecycle-critical protection 58a50f6 lacked.
+    // SAFETY: `view_native_constructor` matches the paired
+    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` instance native (shared with
+    // View.native_constructor, TextView.java line 89); `text_view_native_set_text` matches the paired
+    // `(Ljava/lang/String;)V` instance native (TextView.java line 111); `text_view_native_set_text_color`
+    // matches the paired `(I)V` instance native (TextView.java line 120, surfaced by Roblox's
+    // splash-layout inflation, run log 2026-06-11).
+    let bindings: [NativeBinding; 3] = [
+        (
+            VIEW_NATIVE_CONSTRUCTOR_NAME,
+            VIEW_NATIVE_CONSTRUCTOR_SIG,
+            view_native_constructor as *mut c_void,
+        ),
+        (
+            TEXT_VIEW_NATIVE_SET_TEXT_NAME,
+            TEXT_VIEW_NATIVE_SET_TEXT_SIG,
+            text_view_native_set_text as *mut c_void,
+        ),
+        (
+            TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME,
+            TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG,
+            text_view_native_set_text_color as *mut c_void,
+        ),
     ];
-    // SAFETY: `class` is the loaded android/widget/TextView; the fn pointers' signatures match its
-    // `native_constructor`/`native_setText`/`native_setTextColor` declarations (verified against
-    // TextView.java lines 89/111/120, 2026-06-05 + 2026-06-11).
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    let bound = register_class_natives_best_effort(env, TEXT_VIEW_CLASS, &bindings)?;
     tracing::info!(
         class = "android/widget/TextView",
-        "registered Eclipse's non-GTK backing for TextView.native_constructor + native_setText + native_setTextColor"
+        bound,
+        "registered Eclipse's non-GTK backing for TextView.native_constructor + native_setText + native_setTextColor (per-method best-effort)"
     );
     Ok(())
 }
@@ -6847,45 +6870,38 @@ extern "system" fn image_view_set_drawable<'local>(
 /// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
 /// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_image_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(IMAGE_VIEW_CLASS)?;
-    let methods = [
-        // SAFETY: `view_native_constructor` matches the paired
-        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
-        // (shared with View/TextView native_constructor); casting the `extern "system"` fn to a
-        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_CONSTRUCTOR_NAME,
-                VIEW_NATIVE_CONSTRUCTOR_SIG,
-                view_native_constructor as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `image_view_set_scale_type` matches the paired `(JI)V` signature as an instance
-        // native (surfaced by multitouch.test's ImageView, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                IMAGE_VIEW_SET_SCALE_TYPE_NAME,
-                IMAGE_VIEW_SET_SCALE_TYPE_SIG,
-                image_view_set_scale_type as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `image_view_set_drawable` matches the paired `(JJ)V` signature as an instance native
-        // (surfaced by multitouch.test's ImageView, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                IMAGE_VIEW_SET_DRAWABLE_NAME,
-                IMAGE_VIEW_SET_DRAWABLE_SIG,
-                image_view_set_drawable as *mut std::ffi::c_void,
-            )
-        },
+    // 2026-06-13: per-method best-effort (via `register_class_natives_best_effort`) so a single entry
+    // the shipped dex disagrees with is a deferred call-time UnsatisfiedLinkError on that method, not a
+    // fatal whole-class abort taking the lifecycle-critical `native_constructor` down (the 58a50f6
+    // class of bug).
+    // SAFETY: `view_native_constructor` matches the paired
+    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` instance native (shared with
+    // View/TextView native_constructor, ImageView.java line 208); `image_view_set_scale_type` matches
+    // the paired `(JI)V` instance native (ImageView.java line 210); `image_view_set_drawable` matches
+    // the paired `(JJ)V` instance native (ImageView.java line 209; both surfaced by multitouch.test's
+    // ImageView, run log 2026-06-05).
+    let bindings: [NativeBinding; 3] = [
+        (
+            VIEW_NATIVE_CONSTRUCTOR_NAME,
+            VIEW_NATIVE_CONSTRUCTOR_SIG,
+            view_native_constructor as *mut c_void,
+        ),
+        (
+            IMAGE_VIEW_SET_SCALE_TYPE_NAME,
+            IMAGE_VIEW_SET_SCALE_TYPE_SIG,
+            image_view_set_scale_type as *mut c_void,
+        ),
+        (
+            IMAGE_VIEW_SET_DRAWABLE_NAME,
+            IMAGE_VIEW_SET_DRAWABLE_SIG,
+            image_view_set_drawable as *mut c_void,
+        ),
     ];
-    // SAFETY: `class` is the loaded android/widget/ImageView; the fn pointers' signatures match its
-    // re-declared `native_constructor` (same as View/TextView), `native_setScaleType`, and
-    // `native_setDrawable` (surfaced by the run lines 2026-06-05).
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    let bound = register_class_natives_best_effort(env, IMAGE_VIEW_CLASS, &bindings)?;
     tracing::info!(
         class = "android/widget/ImageView",
-        "registered Eclipse's non-GTK backing for ImageView.native_constructor + native_setScaleType + native_setDrawable"
+        bound,
+        "registered Eclipse's non-GTK backing for ImageView.native_constructor + native_setScaleType + native_setDrawable (per-method best-effort)"
     );
     Ok(())
 }
@@ -6957,34 +6973,29 @@ extern "system" fn image_button_set_on_click_listener<'local>(
 /// `image_button_set_on_click_listener` the `(J)V` instance native. Each body is `catch_unwind`-guarded
 /// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(IMAGE_BUTTON_CLASS)?;
-    let methods = [
-        // SAFETY: `view_native_constructor` matches the paired
-        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
-        // (shared with View/ImageView native_constructor).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_CONSTRUCTOR_NAME,
-                VIEW_NATIVE_CONSTRUCTOR_SIG,
-                view_native_constructor as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `image_button_set_on_click_listener` matches the paired `(J)V` signature as an
-        // instance native.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME,
-                IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG,
-                image_button_set_on_click_listener as *mut std::ffi::c_void,
-            )
-        },
+    // 2026-06-13: per-method best-effort so a shipped-dex drift on either entry is a deferred call-time
+    // UnsatisfiedLinkError on that method, not a fatal whole-class abort (the 58a50f6 class of bug).
+    // SAFETY: `view_native_constructor` matches the paired
+    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` instance native (shared with
+    // View/ImageView native_constructor); `image_button_set_on_click_listener` matches the paired
+    // `(J)V` instance native (both surfaced by the run lines 2026-06-05).
+    let bindings: [NativeBinding; 2] = [
+        (
+            VIEW_NATIVE_CONSTRUCTOR_NAME,
+            VIEW_NATIVE_CONSTRUCTOR_SIG,
+            view_native_constructor as *mut c_void,
+        ),
+        (
+            IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME,
+            IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG,
+            image_button_set_on_click_listener as *mut c_void,
+        ),
     ];
-    // SAFETY: `class` is the loaded android/widget/ImageButton; the fn pointers' signatures match its
-    // re-resolved `native_constructor`/`nativeSetOnClickListener` (surfaced by the run lines 2026-06-05).
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    let bound = register_class_natives_best_effort(env, IMAGE_BUTTON_CLASS, &bindings)?;
     tracing::info!(
         class = "android/widget/ImageButton",
-        "registered Eclipse's non-GTK backing for ImageButton.native_constructor + nativeSetOnClickListener"
+        bound,
+        "registered Eclipse's non-GTK backing for ImageButton.native_constructor + nativeSetOnClickListener (per-method best-effort)"
     );
     Ok(())
 }
@@ -7022,28 +7033,22 @@ pub const SURFACE_VIEW_CLASS: &JNIStr = jni_str!("android/view/SurfaceView");
 /// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
 /// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_surface_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(SURFACE_VIEW_CLASS)?;
-    let methods = [
-        // SAFETY: `view_native_constructor` matches the paired
-        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
-        // (shared with View/TextView/ImageView native_constructor; SurfaceView.java line 40 @Override);
-        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
-        // takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_NATIVE_CONSTRUCTOR_NAME,
-                VIEW_NATIVE_CONSTRUCTOR_SIG,
-                view_native_constructor as *mut std::ffi::c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded android/view/SurfaceView; the fn pointer's signature matches its
-    // re-declared `native_constructor` (same as View/TextView/ImageView; SurfaceView.java line 40,
+    // 2026-06-13: per-method best-effort (one entry) so a shipped-dex drift on this class is a deferred
+    // call-time UnsatisfiedLinkError, not a fatal whole-class abort (the 58a50f6 class of bug).
+    // SAFETY: `view_native_constructor` matches the paired
+    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
+    // (shared with View/TextView/ImageView native_constructor; SurfaceView.java line 40 @Override,
     // surfaced by the live boot 2026-06-13).
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    let bindings: [NativeBinding; 1] = [(
+        VIEW_NATIVE_CONSTRUCTOR_NAME,
+        VIEW_NATIVE_CONSTRUCTOR_SIG,
+        view_native_constructor as *mut c_void,
+    )];
+    let bound = register_class_natives_best_effort(env, SURFACE_VIEW_CLASS, &bindings)?;
     tracing::info!(
         class = "android/view/SurfaceView",
-        "registered Eclipse's non-GTK backing for SurfaceView.native_constructor"
+        bound,
+        "registered Eclipse's non-GTK backing for SurfaceView.native_constructor (per-method best-effort)"
     );
     Ok(())
 }
@@ -7131,28 +7136,24 @@ const VIEW_SUBCLASS_CONSTRUCTOR_CLASSES: &[&JNIStr] = &[
 /// instance native, and every class in the set declares that exact signature (verified against the
 /// vendored ATL overlay). The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (§2.8).
 fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // 2026-06-13: per-method best-effort (single entry per class) so a class that — like the 58a50f6
+    // `setBackgroundColor(I)V` — turns out NOT to declare the native in the shipped dex cannot abort the
+    // others (it degrades to a deferred call-time UnsatisfiedLinkError on that one class only).
     for &class_name in VIEW_SUBCLASS_CONSTRUCTOR_CLASSES {
-        let class = env.find_class(class_name)?;
-        let methods = [
-            // SAFETY: `view_native_constructor` matches the paired
-            // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance
-            // native (shared with View/TextView/ImageView/SurfaceView native_constructor); casting the
-            // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    VIEW_NATIVE_CONSTRUCTOR_NAME,
-                    VIEW_NATIVE_CONSTRUCTOR_SIG,
-                    view_native_constructor as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is the loaded android/widget/* subclass; the fn pointer's signature matches
-        // its re-declared `native_constructor` (each declares the exact 2-arg signature — verified
-        // against the vendored ATL overlay, see the section comment).
-        unsafe { env.register_native_methods(&class, &methods) }?;
+        // SAFETY: `view_native_constructor` matches the paired
+        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
+        // (shared with View/TextView/ImageView/SurfaceView native_constructor); each class re-declares
+        // that exact 2-arg signature (verified against the vendored ATL overlay, see the section comment).
+        let bindings: [NativeBinding; 1] = [(
+            VIEW_NATIVE_CONSTRUCTOR_NAME,
+            VIEW_NATIVE_CONSTRUCTOR_SIG,
+            view_native_constructor as *mut c_void,
+        )];
+        let bound = register_class_natives_best_effort(env, class_name, &bindings)?;
         tracing::info!(
             class = %class_name.to_str(),
-            "registered Eclipse's non-GTK backing for native_constructor on inflatable View subclass"
+            bound,
+            "registered Eclipse's non-GTK backing for native_constructor on inflatable View subclass (per-method best-effort)"
         );
     }
     Ok(())
@@ -7191,10 +7192,16 @@ fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), Frame
 //     stateful boolean pair with NO consumed view-registry field; no-op'ing `setChecked` while
 //     `isChecked` reads it back would be a silent wrong answer, so BOTH stay unbound (the loud
 //     `isChecked` trip is the honest signal) rather than faking the setter.
-//   * Listener registrations (`*OnClickListener`/`*OnCheckedChangeListener`/`setOnSeekBarChangeListener`/
-//     `setOnItemSelectedListener`/`native_addTextChangedListener`/`native_removeTextChangedListener`/
-//     `native_setOnEditorActionListener`/`setOnItemSelectedListener`) — not property setters; whether
-//     they fire is RBX-bytecode/owner-run-data-gated, so each stays the deliberate discovery signal.
+//   * The remaining listener registrations (`*OnClickListener`/`*OnCheckedChangeListener`/
+//     `setOnSeekBarChangeListener`/`setOnItemSelectedListener`) — whether they fire is
+//     RBX-bytecode/owner-run-data-gated, so each stays the deliberate discovery signal.
+//
+// 2026-06-13: EditText's `native_addTextChangedListener`/`native_removeTextChangedListener`/
+// `native_setOnEditorActionListener` ARE bound below (the RbxKeyboard/AppCompatEditText construction
+// path reaches them — live boot 2026-06-13) with honest RECORD-the-listener semantics: each RETAINS a
+// global ref to the listener on the `view_registry` peer (Eclipse's `EditText` keeps no Java field, so
+// the native must hold it). No input occurs during boot, so recording is complete + correct now;
+// DISPATCHING the TextWatcher/editor-action callbacks on real input is a future input-integration step.
 
 // JNI names + descriptors, exactly as declared in the vendored ATL overlay. The `native_setText`
 // text-recording setters all share `(JLjava/lang/String;)V` (an explicit `long widget` + String) but
@@ -7224,6 +7231,28 @@ const BUTTON_SET_COMPOUND_DRAWABLES_SIG: &JNIStr = jni_str!("(JJ)V");
 // `Spinner.native_setAdapter(long, SpinnerAdapter)` (Spinner.java:27), `(JLandroid/widget/SpinnerAdapter;)V`.
 const SPINNER_SET_ADAPTER_NAME: &JNIStr = jni_str!("native_setAdapter");
 const SPINNER_SET_ADAPTER_SIG: &JNIStr = jni_str!("(JLandroid/widget/SpinnerAdapter;)V");
+
+// 2026-06-13: EditText's listener-registration natives, all declared native in the vendored overlay
+// (`EditText.java:26/27/28`) and reached on the RbxKeyboard/AppCompatEditText construction path
+// (live boot 2026-06-13: `No implementation found for void
+// android.widget.EditText.native_addTextChangedListener(long, android.text.TextWatcher)` at
+// `addTextChangedListener` → `AppCompatEditText.<init>` → `RbxKeyboard.<init>` → `LayoutInflater` →
+// `ActivityNativeMain.onCreate`). Honest RECORD-the-listener semantics: `EditText.addTextChangedListener`
+// / `setOnEditorActionListener` (EditText.java:52/57) pass the listener STRAIGHT to the native with no
+// Java field, so the native must RETAIN it (a `view_registry` global ref on the peer) or it is collected
+// the moment the call returns. No input occurs during boot, so recording is the complete correct
+// behavior now; actually DISPATCHING `TextWatcher.onTextChanged`/`onEditorAction` on real input is a
+// future input-integration step. `addTextChangedListener`/`removeTextChangedListener` share
+// `(JLandroid/text/TextWatcher;)V`; the editor-action listener is the nested `TextView$OnEditorActionListener`
+// (TextView.java:287, an unqualified nested type resolved through EditText's TextView supertype).
+const EDIT_TEXT_ADD_TEXT_CHANGED_LISTENER_NAME: &JNIStr = jni_str!("native_addTextChangedListener");
+const EDIT_TEXT_REMOVE_TEXT_CHANGED_LISTENER_NAME: &JNIStr =
+    jni_str!("native_removeTextChangedListener");
+const EDIT_TEXT_TEXT_CHANGED_LISTENER_SIG: &JNIStr = jni_str!("(JLandroid/text/TextWatcher;)V");
+const EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_NAME: &JNIStr =
+    jni_str!("native_setOnEditorActionListener");
+const EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG: &JNIStr =
+    jni_str!("(JLandroid/widget/TextView$OnEditorActionListener;)V");
 
 /// `<Widget>.native_setText(long widget, String text)` → record the text on the receiver's
 /// [`view_registry`] peer (2026-06-13).
@@ -7503,6 +7532,150 @@ extern "system" fn spinner_set_adapter<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `EditText.native_addTextChangedListener(long widget, TextWatcher watcher)` → RETAIN the watcher on
+/// the receiver's [`view_registry`] peer (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void, descriptor `(JLandroid/text/TextWatcher;)V`
+/// (EditText.java:26). Eclipse's `EditText.addTextChangedListener` (EditText.java:52) passes the watcher
+/// straight here with NO Java field, so the native must hold a global ref or the watcher is collected
+/// the moment this returns. Records a JNI global ref to the watcher on the peer through the
+/// bounds+generation-checked [`view_registry`] (a stale/fabricated handle is logged + ignored, never UB;
+/// a null watcher is ignored). No input occurs during boot, so retaining the listener is the complete
+/// correct behavior now — a future input-dispatch path invokes `onTextChanged(...)` on the held object.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn edit_text_add_text_changed_listener<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    watcher: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if watcher.is_null() {
+            tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                "EditText.native_addTextChangedListener: null watcher (ignored)"
+            );
+            return Ok(());
+        }
+        // Retain the watcher (a Send `Global`) on the peer so it outlives this call. A failure to
+        // create the global ref leaves the listener unrecorded but is non-fatal (logged, never UB).
+        let global = env.new_global_ref(&watcher)?;
+        match view_registry::add_text_watcher(widget, global) {
+            Ok(()) => tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                "EditText.native_addTextChangedListener: retained TextWatcher on non-GTK view peer (dispatch on real input is a future step)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                error = %e,
+                "EditText.native_addTextChangedListener: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `EditText.native_removeTextChangedListener(long widget, TextWatcher watcher)` → drop the matching
+/// retained watcher from the receiver's [`view_registry`] peer (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void, descriptor `(JLandroid/text/TextWatcher;)V`
+/// (EditText.java:27). Drops the retained `Global` whose object is the SAME Java object as `watcher`
+/// (`IsSameObject`, a leaf identity check run under the registry lock — the same JNI-under-lock contract
+/// as [`view_registry::with_jobject`]), releasing that global ref. A stale/fabricated handle or a null
+/// watcher is logged + ignored, never UB; an unmatched watcher drops nothing (a no-op, not an error).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn edit_text_remove_text_changed_listener<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    watcher: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if watcher.is_null() {
+            tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                "EditText.native_removeTextChangedListener: null watcher (ignored)"
+            );
+            return Ok(());
+        }
+        // `keep` returns false for the watcher that IS the same Java object as `watcher` (dropping it,
+        // releasing its global ref). An `IsSameObject` failure conservatively keeps the watcher (false
+        // negative is safe — it stays retained, never wrongly dropped).
+        let result = view_registry::retain_text_watchers(widget, |held| {
+            !env.is_same_object(held.as_obj(), &watcher).unwrap_or(false)
+        });
+        match result {
+            Ok(dropped) => tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                dropped,
+                "EditText.native_removeTextChangedListener: dropped matching retained TextWatcher(s)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                error = %e,
+                "EditText.native_removeTextChangedListener: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `EditText.native_setOnEditorActionListener(long widget, TextView$OnEditorActionListener l)` → RETAIN
+/// (replacing any prior) the editor-action listener on the receiver's [`view_registry`] peer (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void, descriptor
+/// `(JLandroid/widget/TextView$OnEditorActionListener;)V` (EditText.java:28). `EditText.setOnEditorActionListener`
+/// (EditText.java:57) passes the listener straight here with NO Java field, so the native must hold a
+/// global ref or it is collected on return. Records a JNI global ref on the peer (replacing any prior,
+/// whose `Drop` releases its ref) through the bounds+generation-checked [`view_registry`] (a
+/// stale/fabricated handle is logged + ignored; a null listener clears the recorded one). No input
+/// occurs during boot — a future IME-dispatch path invokes `onEditorAction(...)` on the held object.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn edit_text_set_on_editor_action_listener<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    listener: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let global = if listener.is_null() {
+            None
+        } else {
+            Some(env.new_global_ref(&listener)?)
+        };
+        match view_registry::set_editor_action_listener(widget, global) {
+            Ok(()) => tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                cleared = listener.is_null(),
+                "EditText.native_setOnEditorActionListener: retained editor-action listener on non-GTK view peer (dispatch on real input is a future step)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.EditText",
+                widget,
+                error = %e,
+                "EditText.native_setOnEditorActionListener: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for the property-setter natives of the inflatable
 /// `android.widget.*` View subclasses, each on its OWN declaring class (ART resolves natives per
 /// declaring class). Wired before step 4 so the `LayoutInflater` pass finds them.
@@ -7513,173 +7686,153 @@ extern "system" fn spinner_set_adapter<'local>(
 /// section comment for the per-class line references). Every body is `catch_unwind`-guarded via
 /// [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
 fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // 2026-06-13: every class binds PER METHOD (best-effort, via `register_class_natives_best_effort`)
+    // so a single entry the shipped dex disagrees with (the 58a50f6 mechanism) cannot abort the rest of
+    // a class's setters — it degrades to a deferred call-time UnsatisfiedLinkError on only that method.
+    // Each `*mut c_void` cast pairs the fn with its declared JNI descriptor (per-class line references
+    // in the section comment + below).
+
     // Button: native_setText(long, String) records text; native_setCompoundDrawables(long, long) no-op.
-    {
-        let class = env.find_class(BUTTON_CLASS)?;
-        let methods = [
-            // SAFETY: `widget_native_set_text` matches Button.java:40's `(JLjava/lang/String;)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    WIDGET_NATIVE_SET_TEXT_NAME,
-                    WIDGET_NATIVE_SET_TEXT_SIG,
-                    widget_native_set_text as *mut std::ffi::c_void,
-                )
-            },
-            // SAFETY: `button_set_compound_drawables` matches Button.java:43's `(JJ)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    BUTTON_SET_COMPOUND_DRAWABLES_NAME,
-                    BUTTON_SET_COMPOUND_DRAWABLES_SIG,
-                    button_set_compound_drawables as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/Button; fn pointers match its native declarations.
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
-    // EditText: native_setText(long, String) records text.
-    {
-        let class = env.find_class(EDIT_TEXT_CLASS)?;
-        let methods = [
-            // SAFETY: `widget_native_set_text` matches EditText.java:29's `(JLjava/lang/String;)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    WIDGET_NATIVE_SET_TEXT_NAME,
-                    WIDGET_NATIVE_SET_TEXT_SIG,
-                    widget_native_set_text as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/EditText; fn pointer matches its native declaration.
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
+    let button: [NativeBinding; 2] = [
+        // SAFETY: `widget_native_set_text` matches Button.java:40's `(JLjava/lang/String;)V`.
+        (
+            WIDGET_NATIVE_SET_TEXT_NAME,
+            WIDGET_NATIVE_SET_TEXT_SIG,
+            widget_native_set_text as *mut c_void,
+        ),
+        // SAFETY: `button_set_compound_drawables` matches Button.java:43's `(JJ)V`.
+        (
+            BUTTON_SET_COMPOUND_DRAWABLES_NAME,
+            BUTTON_SET_COMPOUND_DRAWABLES_SIG,
+            button_set_compound_drawables as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, BUTTON_CLASS, &button)?;
+
+    // EditText: native_setText records text; the three listener natives RETAIN the listener on the peer
+    // (EditText.java:52/57 pass them straight to the native with no Java field — 2026-06-13 boot trip).
+    let edit_text: [NativeBinding; 4] = [
+        // SAFETY: `widget_native_set_text` matches EditText.java:29's `(JLjava/lang/String;)V`.
+        (
+            WIDGET_NATIVE_SET_TEXT_NAME,
+            WIDGET_NATIVE_SET_TEXT_SIG,
+            widget_native_set_text as *mut c_void,
+        ),
+        // SAFETY: `edit_text_add_text_changed_listener` matches EditText.java:26's
+        // `(JLandroid/text/TextWatcher;)V`.
+        (
+            EDIT_TEXT_ADD_TEXT_CHANGED_LISTENER_NAME,
+            EDIT_TEXT_TEXT_CHANGED_LISTENER_SIG,
+            edit_text_add_text_changed_listener as *mut c_void,
+        ),
+        // SAFETY: `edit_text_remove_text_changed_listener` matches EditText.java:27's
+        // `(JLandroid/text/TextWatcher;)V`.
+        (
+            EDIT_TEXT_REMOVE_TEXT_CHANGED_LISTENER_NAME,
+            EDIT_TEXT_TEXT_CHANGED_LISTENER_SIG,
+            edit_text_remove_text_changed_listener as *mut c_void,
+        ),
+        // SAFETY: `edit_text_set_on_editor_action_listener` matches EditText.java:28's
+        // `(JLandroid/widget/TextView$OnEditorActionListener;)V`.
+        (
+            EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_NAME,
+            EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG,
+            edit_text_set_on_editor_action_listener as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, EDIT_TEXT_CLASS, &edit_text)?;
+
     // CheckBox: native_setText(long, String) records text.
-    {
-        let class = env.find_class(CHECK_BOX_CLASS)?;
-        let methods = [
-            // SAFETY: `widget_native_set_text` matches CheckBox.java:44's `(JLjava/lang/String;)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    WIDGET_NATIVE_SET_TEXT_NAME,
-                    WIDGET_NATIVE_SET_TEXT_SIG,
-                    widget_native_set_text as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/CheckBox; fn pointer matches its native declaration.
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
+    let check_box: [NativeBinding; 1] = [
+        // SAFETY: `widget_native_set_text` matches CheckBox.java:44's `(JLjava/lang/String;)V`.
+        (
+            WIDGET_NATIVE_SET_TEXT_NAME,
+            WIDGET_NATIVE_SET_TEXT_SIG,
+            widget_native_set_text as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, CHECK_BOX_CLASS, &check_box)?;
+
     // RadioButton: setText(CharSequence) records text.
-    {
-        let class = env.find_class(RADIO_BUTTON_CLASS)?;
-        let methods = [
-            // SAFETY: `radio_button_set_text` matches RadioButton.java:29's `(Ljava/lang/CharSequence;)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    RADIO_BUTTON_SET_TEXT_NAME,
-                    RADIO_BUTTON_SET_TEXT_SIG,
-                    radio_button_set_text as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/RadioButton; fn pointer matches its native declaration.
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
+    let radio_button: [NativeBinding; 1] = [
+        // SAFETY: `radio_button_set_text` matches RadioButton.java:29's `(Ljava/lang/CharSequence;)V`.
+        (
+            RADIO_BUTTON_SET_TEXT_NAME,
+            RADIO_BUTTON_SET_TEXT_SIG,
+            radio_button_set_text as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, RADIO_BUTTON_CLASS, &radio_button)?;
+
     // ProgressBar: native_setIndeterminate(boolean) + native_setProgress(long, float), both no-op.
-    {
-        let class = env.find_class(PROGRESS_BAR_CLASS)?;
-        let methods = [
-            // SAFETY: `progress_bar_set_indeterminate` matches ProgressBar.java:106's `(Z)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    PROGRESS_BAR_SET_INDETERMINATE_NAME,
-                    PROGRESS_BAR_SET_INDETERMINATE_SIG,
-                    progress_bar_set_indeterminate as *mut std::ffi::c_void,
-                )
-            },
-            // SAFETY: `progress_native_set_progress` matches ProgressBar.java:50's `(JF)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    PROGRESS_NATIVE_SET_PROGRESS_NAME,
-                    PROGRESS_NATIVE_SET_PROGRESS_SIG,
-                    progress_native_set_progress as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/ProgressBar; fn pointers match its native declarations.
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
+    let progress_bar: [NativeBinding; 2] = [
+        // SAFETY: `progress_bar_set_indeterminate` matches ProgressBar.java:106's `(Z)V`.
+        (
+            PROGRESS_BAR_SET_INDETERMINATE_NAME,
+            PROGRESS_BAR_SET_INDETERMINATE_SIG,
+            progress_bar_set_indeterminate as *mut c_void,
+        ),
+        // SAFETY: `progress_native_set_progress` matches ProgressBar.java:50's `(JF)V`.
+        (
+            PROGRESS_NATIVE_SET_PROGRESS_NAME,
+            PROGRESS_NATIVE_SET_PROGRESS_SIG,
+            progress_native_set_progress as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, PROGRESS_BAR_CLASS, &progress_bar)?;
+
     // SeekBar: native_setProgress(long, float) + native_setMax(long, int), both no-op.
-    {
-        let class = env.find_class(SEEK_BAR_CLASS)?;
-        let methods = [
-            // SAFETY: `progress_native_set_progress` matches SeekBar.java:19's `(JF)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    PROGRESS_NATIVE_SET_PROGRESS_NAME,
-                    PROGRESS_NATIVE_SET_PROGRESS_SIG,
-                    progress_native_set_progress as *mut std::ffi::c_void,
-                )
-            },
-            // SAFETY: `seek_bar_set_max` matches SeekBar.java:21's `(JI)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    SEEK_BAR_SET_MAX_NAME,
-                    SEEK_BAR_SET_MAX_SIG,
-                    seek_bar_set_max as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/SeekBar; fn pointers match its native declarations.
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
+    let seek_bar: [NativeBinding; 2] = [
+        // SAFETY: `progress_native_set_progress` matches SeekBar.java:19's `(JF)V`.
+        (
+            PROGRESS_NATIVE_SET_PROGRESS_NAME,
+            PROGRESS_NATIVE_SET_PROGRESS_SIG,
+            progress_native_set_progress as *mut c_void,
+        ),
+        // SAFETY: `seek_bar_set_max` matches SeekBar.java:21's `(JI)V`.
+        (
+            SEEK_BAR_SET_MAX_NAME,
+            SEEK_BAR_SET_MAX_SIG,
+            seek_bar_set_max as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, SEEK_BAR_CLASS, &seek_bar)?;
+
     // Spinner: native_setAdapter(long, SpinnerAdapter) no-op.
-    {
-        let class = env.find_class(SPINNER_CLASS)?;
-        let methods = [
-            // SAFETY: `spinner_set_adapter` matches Spinner.java:27's `(JLandroid/widget/SpinnerAdapter;)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    SPINNER_SET_ADAPTER_NAME,
-                    SPINNER_SET_ADAPTER_SIG,
-                    spinner_set_adapter as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/Spinner; fn pointer matches its native declaration.
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
+    let spinner: [NativeBinding; 1] = [
+        // SAFETY: `spinner_set_adapter` matches Spinner.java:27's `(JLandroid/widget/SpinnerAdapter;)V`.
+        (
+            SPINNER_SET_ADAPTER_NAME,
+            SPINNER_SET_ADAPTER_SIG,
+            spinner_set_adapter as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, SPINNER_CLASS, &spinner)?;
+
     // ScrollView: native_addView/native_removeView re-declared per class — reuse the class-agnostic
     // ViewGroup tree-wiring bodies (record the real parent→child edges the renderer walks).
-    {
-        let class = env.find_class(SCROLL_VIEW_CLASS)?;
-        let methods = [
-            // SAFETY: `view_group_native_add_view` matches ScrollView.java:20's
-            // `(JJILandroid/view/ViewGroup$LayoutParams;)V` (same as ViewGroup.native_addView).
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
-                    VIEW_GROUP_NATIVE_ADD_VIEW_SIG,
-                    view_group_native_add_view as *mut std::ffi::c_void,
-                )
-            },
-            // SAFETY: `view_group_native_remove_view` matches ScrollView.java:22's `(JJ)V`.
-            unsafe {
-                NativeMethod::from_raw_parts(
-                    VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME,
-                    VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG,
-                    view_group_native_remove_view as *mut std::ffi::c_void,
-                )
-            },
-        ];
-        // SAFETY: `class` is android/widget/ScrollView; fn pointers match its re-declared native_addView/
-        // native_removeView (same signatures as ViewGroup's).
-        unsafe { env.register_native_methods(&class, &methods) }?;
-    }
+    let scroll_view: [NativeBinding; 2] = [
+        // SAFETY: `view_group_native_add_view` matches ScrollView.java:20's
+        // `(JJILandroid/view/ViewGroup$LayoutParams;)V` (same as ViewGroup.native_addView).
+        (
+            VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
+            VIEW_GROUP_NATIVE_ADD_VIEW_SIG,
+            view_group_native_add_view as *mut c_void,
+        ),
+        // SAFETY: `view_group_native_remove_view` matches ScrollView.java:22's `(JJ)V`.
+        (
+            VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME,
+            VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG,
+            view_group_native_remove_view as *mut c_void,
+        ),
+    ];
+    register_class_natives_best_effort(env, SCROLL_VIEW_CLASS, &scroll_view)?;
+
     tracing::info!(
         "registered Eclipse's non-GTK backing for the inflatable android.widget.* property setters \
-         (Button/EditText/CheckBox/RadioButton text; ProgressBar/SeekBar progress/indeterminate/max; \
-         Button compound-drawables; Spinner adapter; ScrollView add/removeView)"
+         (Button/EditText/CheckBox/RadioButton text; EditText text/editor-action listeners RETAINED; \
+         ProgressBar/SeekBar progress/indeterminate/max; Button compound-drawables; Spinner adapter; \
+         ScrollView add/removeView; per-method best-effort)"
     );
     Ok(())
 }
@@ -11528,11 +11681,93 @@ mod tests {
             "native_removeView"
         );
         assert_eq!(VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG.to_str(), "(JJ)V");
+        // 2026-06-13: EditText's listener natives, bound with record-the-listener semantics (the
+        // RbxKeyboard/AppCompatEditText construction path reaches `native_addTextChangedListener` —
+        // live boot 2026-06-13). All declared native in the vendored overlay (EditText.java:26/27/28).
+        // add/remove share `(JLandroid/text/TextWatcher;)V`; the editor-action listener is the nested
+        // `TextView$OnEditorActionListener`. A transcription drift here re-introduces the boot-blocking
+        // UnsatisfiedLinkError, so pin the exact names/descriptors.
+        assert_eq!(
+            EDIT_TEXT_ADD_TEXT_CHANGED_LISTENER_NAME.to_str(),
+            "native_addTextChangedListener"
+        );
+        assert_eq!(
+            EDIT_TEXT_REMOVE_TEXT_CHANGED_LISTENER_NAME.to_str(),
+            "native_removeTextChangedListener"
+        );
+        assert_eq!(
+            EDIT_TEXT_TEXT_CHANGED_LISTENER_SIG.to_str(),
+            "(JLandroid/text/TextWatcher;)V"
+        );
+        assert_eq!(
+            EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_NAME.to_str(),
+            "native_setOnEditorActionListener"
+        );
+        assert_eq!(
+            EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG.to_str(),
+            "(JLandroid/widget/TextView$OnEditorActionListener;)V"
+        );
         // 2026-06-13: NOTE — base-View `setBackgroundColor(I)V` / `native_keep_screen_on(JZ)V` are
         // intentionally NOT pinned/bound here. The shipped framework's `setBackgroundColor(int)` is
         // plain Java (live boot at 58a50f6: `Failed to register non-native method
         // android.view.View.setBackgroundColor(I)V as native`), which aborted the atomic
         // RegisterNatives for the whole View class; see `register_view_natives` for the removal.
+        // The View/widget per-class registrations now bind PER METHOD (best-effort), so such a drift is
+        // a deferred call-time UnsatisfiedLinkError rather than a fatal whole-class abort — guarded by
+        // `register_class_natives_best_effort_skips_unbindable_method_and_continues`.
+    }
+
+    #[test]
+    fn register_class_natives_best_effort_skips_unbindable_method_and_continues() {
+        // 2026-06-13: the smallest check that would have caught the 58a50f6 atomic-abort regression.
+        // `register_class_natives_best_effort` drives `fold_best_effort` (its pure control-flow core,
+        // testable without a JVM); the invariant is that ONE unbindable entry is skipped while every
+        // OTHER entry is still attempted — the exact behavior the old atomic RegisterNatives violated
+        // (a single non-native `setBackgroundColor(I)V` took the whole View class down). The `ptr` is
+        // inert data here (never dereferenced by the loop), so a null is fine for the control-flow test.
+        let bindings: [NativeBinding; 3] = [
+            (
+                VIEW_NATIVE_CONSTRUCTOR_NAME,
+                VIEW_NATIVE_CONSTRUCTOR_SIG,
+                std::ptr::null_mut(),
+            ),
+            // The "bad" entry — stands in for a method the shipped dex declares as plain Java.
+            (
+                VIEW_SET_BACKGROUND_COLOR_NAME,
+                VIEW_SET_BACKGROUND_COLOR_SIG,
+                std::ptr::null_mut(),
+            ),
+            (
+                VIEW_NATIVE_DESTRUCTOR_NAME,
+                VIEW_NATIVE_DESTRUCTOR_SIG,
+                std::ptr::null_mut(),
+            ),
+        ];
+
+        // `step` fails ONLY the middle entry (simulating ART rejecting one non-native method) and
+        // records the order every entry was visited in.
+        let mut visited: Vec<String> = Vec::new();
+        let bound = fold_best_effort(&bindings, |&(name, _sig, _ptr)| {
+            visited.push(name.to_str().into_owned());
+            // Fail the second entry; the first and third must still be attempted AND counted.
+            name.to_str() != VIEW_SET_BACKGROUND_COLOR_NAME.to_str()
+        });
+
+        // Every entry was attempted in order — the failing one did NOT abort the rest (the 58a50f6 fix).
+        assert_eq!(
+            visited,
+            vec![
+                VIEW_NATIVE_CONSTRUCTOR_NAME.to_str().into_owned(),
+                VIEW_SET_BACKGROUND_COLOR_NAME.to_str().into_owned(),
+                VIEW_NATIVE_DESTRUCTOR_NAME.to_str().into_owned(),
+            ],
+            "a single unbindable entry must not short-circuit the remaining methods"
+        );
+        // The two lifecycle-critical natives bound; only the bad entry was skipped.
+        assert_eq!(
+            bound, 2,
+            "skipped entry is not counted; the rest still bind"
+        );
     }
 
     #[test]

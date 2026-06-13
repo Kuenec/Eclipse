@@ -128,6 +128,63 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — ⌨️ `EditText` LISTENER NATIVES BOUND (record-the-listener) + the 58a50f6 atomic-RegisterNatives
+  ABORT CLASS root-cause-fixed across the View/widget per-class registrations.** Owner live boot of `16db9eb` (clean,
+  pure log observation) PROVED the 58a50f6 regression fix landed: `register_view_natives` registers cleanly, the boot
+  reaches `ActivityNativeMain.onCreate` past `ProgressBar.native_setIndeterminate`, and the NEXT unbound native — while
+  `LayoutInflater` inflates the content view via `RbxKeyboard` → `AppCompatEditText.<init>` → `EditText.addTextChangedListener`
+  — is `No implementation found for void android.widget.EditText.native_addTextChangedListener(long, android.text.TextWatcher)`.
+  **(A)** Bound the three `EditText` listener natives ON `android/widget/EditText` (all first-party-verified `protected
+  native`: `native_addTextChangedListener` `EditText.java:26`, `native_removeTextChangedListener` `:27`,
+  `native_setOnEditorActionListener` `:28`) with HONEST record-the-listener semantics — Eclipse's vendored
+  `addTextChangedListener`/`setOnEditorActionListener` (`EditText.java:52`/`:57`) pass the listener straight to the
+  native with NO Java field, so the native MUST retain it or it is collected on return: `add` retains a `new_global_ref`
+  TextWatcher on the `view_registry` peer (`ViewState.text_watchers: Vec<Global>`), `remove` drops the `IsSameObject`-
+  matching retained watcher, `setOnEditorActionListener` retains/replaces (null clears) the editor-action listener
+  (`ViewState.editor_action_listener: Option<Global>`); each `Global` releases its ref on `Drop` (slot `free`d /
+  replaced). Null listener ignored; stale/fabricated handle is a typed `Err` (logged, never UB). The editor-action sig
+  is the nested `(JLandroid/widget/TextView$OnEditorActionListener;)V` (`OnEditorActionListener` is `public static
+  interface` in `TextView.java:287`, reached via EditText's TextView supertype). **Actually DISPATCHING
+  `TextWatcher.onTextChanged`/`onEditorAction` on real input is a FUTURE input-integration step — no input occurs during
+  boot, so retaining the listener is the complete correct behavior now.** **(B)** ROOT-CAUSE-CLASS FIX: the 58a50f6 boot
+  break was JNI `RegisterNatives` aborting an ENTIRE per-class `NativeMethod` array atomically when one entry
+  (`setBackgroundColor(I)V`) is plain Java in the shipped dex — taking `native_constructor`/`native_destructor`/
+  `native_get_window` down with it. NEW `register_class_natives_best_effort(env, class, &[NativeBinding])` (modeled on
+  the existing `register_asset_stream_natives` per-native precedent, but at LOUD `tracing::warn!` not debug) binds each
+  method via a single-element `RegisterNatives` slice; a method the shipped dex does not declare native is skipped
+  (exception cleared) with a per-method WARN naming class+method+sig, degrading the fatal whole-class abort into a
+  deferred call-time `UnsatisfiedLinkError` on ONLY that method — the discovery signal the project already relies on.
+  `find_class` failure still propagates via `?` (a genuine class-load failure is not masked). Converted EXACTLY the
+  View/widget per-class registrars affected by this class of bug: `register_view_natives`, `register_view_group_natives`,
+  `register_text_view_natives`, `register_image_view_natives`, `register_image_button_natives`,
+  `register_surface_view_natives`, `register_view_subclass_constructor_natives`, `register_widget_property_setter_natives`
+  (all 8 widget classes); unrelated registrars (Paint/Canvas/Window/Activity/asset-stream/ViewTreeObserver) left atomic
+  per "do not rewrite unrelated registration code." Regression guard: NEW
+  `register_class_natives_best_effort_skips_unbindable_method_and_continues` drives the pure `fold_best_effort` core
+  (JVM-free, since ART can't run in-harness) with a 3-entry set whose middle entry fails — asserts all 3 are visited in
+  order (no short-circuit) and `bound == 2`, the smallest check that would have caught the 58a50f6 atomic abort; the
+  existing `widget_property_setter_names_sigs_and_classes_match_overlay` pin extended with the three EditText listener
+  name/sig pins so a transcription drift re-introducing the boot-block fails CI. **⇐ START HERE NEXT SESSION (= OWNER
+  live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`. NOTE: the framework overlay is a CACHE artifact
+  that is wiped periodically — if the boot errors `Android framework not found`, rebuild it with
+  `tools/framework-overlay/patch-framework.sh` FIRST.): with the three EditText listener natives bound, expect
+  `RbxKeyboard`/`AppCompatEditText` construction to no longer trip `UnsatisfiedLinkError` on `native_addTextChangedListener`
+  and `ActivityNativeMain`'s content-view inflation to proceed PAST EditText/RbxKeyboard; confirm the View/widget
+  registrations log the normal `(best-effort)` info lines and NO per-method WARN (a WARN names a genuinely-non-native
+  shipped method to investigate next). Capture the NEXT unbound native one at a time (pure log observation, no binary
+  inspection; expected: whether `native_removeTextChangedListener`/`native_setOnEditorActionListener` are also reached
+  on this ctor path, then a return-driving getter like `EditText.native_getText`/`SeekBar.native_getProgress`, an
+  `isChecked()`/`setChecked()` pair, another listener registration, or the next class on the inflate→attach→surface
+  path). The standing next FRONTIER remains the SCOPED surface-to-engine render wiring from `2194f02`'s §6 plan: wire
+  `EngineNativeWindow::new` + `register_wsi_window`/`set_engine_window_geometry` into `graphics.rs::run_windowed` +
+  present-loop ownership handoff + JNI-dispatch `SurfaceView.surfaceCreated()`/`surfaceChanged()` once the WSI surface
+  is live — designed AFTER the live boot reveals the post-layout call chain (libroblox-internal RUNTIME behavior, NOT
+  first-party-determinable, NOT to be obtained by reverse-engineering libroblox.so).** Gate: **555 unit + 0 main-bin + 4
+  integration (live milestone subprocesses, 0 SKIP, exact success markers) + 2 doctests = 561 passed, 0 failed** (+3
+  unit: two `view_registry` listener-retention tests + one `fold_best_effort` skip-and-continue test), fmt/clippy
+  `-D warnings`/release (8,907,880-byte artifact) all 0-warning. Detail: §6 (2026-06-13 EditText-listener /
+  best-effort-registration entry).
 - **2026-06-13 — 🩹 58a50f6 REGRESSION FIXED: the two speculative base-`android.view.View` setters that 58a50f6 added
   to `register_view_natives` are REMOVED — `View.setBackgroundColor(I)V` and `View.native_keep_screen_on(JZ)V`.** Root
   cause (PROVEN by the owner's live boot of 58a50f6): `RegisterNatives` is ATOMIC over its whole `NativeMethod` array
@@ -148,8 +205,13 @@ before any history-rewriting/force operation.
   setters/constructors are intact and untouched. Regression guard: the existing
   `widget_property_setter_names_sigs_and_classes_match_overlay` pin test now carries the dated NOTE that these two are
   intentionally unbound; the dropped assertions + the in-code dated comments are the smallest guard tied to the proven
-  root cause (a future reintroduction must again pass an atomic RegisterNatives the shipped dex rejects). **⇐ START
-  HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  root cause (a future reintroduction must again pass an atomic RegisterNatives the shipped dex rejects). **[START-HERE
+  marker moved 2026-06-13 to the EditText-listener / best-effort-registration entry at the TOP of §5 — the owner's live
+  boot of `16db9eb` CONFIRMED this fix landed (`register_view_natives` registers cleanly, the boot reaches
+  `ActivityNativeMain.onCreate` past `ProgressBar.native_setIndeterminate`), and the next unbound native it surfaced —
+  `EditText.native_addTextChangedListener` — is now bound; and the atomic-RegisterNatives mechanism this entry root-caused
+  is now hardened class-wide via per-method best-effort registration.]** (the plan was = OWNER live validation on the
+  dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
   `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): with the two bad entries gone, expect
   `register_view_natives` to register CLEANLY again — NO `NoSuchMethod`/`Failed to register non-native method` on
   `android.view.View`, the View natives (`native_constructor`/`native_destructor`/`native_get_window`) bound — and the
@@ -2633,6 +2695,112 @@ subagent live boot.*
   ART (no `cargo run`/`__*` subcommands) and did NOT inspect any binary — the regression mechanism is the owner's
   already-captured live log of 58a50f6; the fix is first-party source + the green gate.* *Files:* `src/framework.rs`,
   `AGENTS.md`. *No subagent live boot.*
+
+---
+
+### 2026-06-13 — `EditText` listener natives bound (record-the-listener; dispatch-on-real-input is future work) + the 58a50f6 atomic-`RegisterNatives` abort class hardened to per-method best-effort across the View/widget per-class registrations
+
+*Confirmed root cause / live evidence (owner dev-host boot of `16db9eb`, clean run, pure log observation — NOT a
+subagent):* the 58a50f6 regression fix landed — `register_view_natives` registers cleanly and the boot reaches
+`ActivityNativeMain.onCreate` PAST `ProgressBar.native_setIndeterminate`. The NEXT unbound native, while `LayoutInflater`
+inflates the content view via `com.roblox.client.RbxKeyboard.<init>` → `androidx.appcompat.widget.AppCompatEditText.<init>`
+→ `EditText.addTextChangedListener`: `No implementation found for void
+android.widget.EditText.native_addTextChangedListener(long, android.text.TextWatcher)` (at `Activity.nativeStartActivity`
+→ `ActivityNativeMain.onCreate` → `LayoutInflater`). The `UnsatisfiedLinkError` confirms the native IS declared native
+in the shipped framework but unbound.
+
+*Fix (A) — `src/framework.rs` + `src/framework/view_registry.rs`, EditText listener natives, record-the-listener:* bound
+the three listener natives ON their declaring class `android/widget/EditText`, each first-party-verified `protected
+native` in the vendored overlay: `native_addTextChangedListener` (`EditText.java:26`, `(JLandroid/text/TextWatcher;)V`),
+`native_removeTextChangedListener` (`:27`, same sig), `native_setOnEditorActionListener` (`:28`,
+`(JLandroid/widget/TextView$OnEditorActionListener;)V` — `OnEditorActionListener` is a `public static interface` in
+`TextView.java:287`, reached through EditText's TextView supertype). HONEST record-the-listener semantics: Eclipse's
+vendored `EditText.addTextChangedListener`/`setOnEditorActionListener` (`EditText.java:52`/`:57`) pass the listener
+straight to the native with NO Java field, so a plain local arg would be GC'd the moment the native returns — the native
+therefore RETAINS it. `edit_text_add_text_changed_listener` stores a `env.new_global_ref(watcher)` on the
+`view_registry` peer (NEW `ViewState.text_watchers: Vec<Global<JObject<'static>>>`);
+`edit_text_remove_text_changed_listener` drops the `IsSameObject`-matching retained watcher (releasing its global ref;
+an `IsSameObject` JNI failure conservatively KEEPS the watcher — a safe false-negative);
+`edit_text_set_on_editor_action_listener` retains/replaces (the old `Global`'s `Drop` releases its ref) the editor-action
+listener (NEW `ViewState.editor_action_listener: Option<Global<JObject<'static>>>`), `null` clears it. Each `Global`
+releases its ref on `Drop` (slot `free`d or listener replaced/cleared). Null listener ignored; a stale/fabricated handle
+is a typed `Err` (logged + ignored, never UB) via the bounds+generation-checked `view_registry::{add_text_watcher,
+retain_text_watchers, set_editor_action_listener}` helpers (each validates the handle exactly like `with_view`). Every
+body runs inside `EnvUnowned::with_env` (catch_unwind, §2.8) and resolves via `LogErrorAndDefault`. **Actually
+DISPATCHING `TextWatcher.onTextChanged`/`onEditorAction` on real input is a FUTURE input-integration step — no input
+occurs during boot, so retaining the listener (so a future input-dispatch path can invoke the held object) is the
+complete correct behavior NOW.** This is documented in-code (`view_registry.rs:172-186`, each native's docstring).
+
+*Fix (B) — `src/framework.rs`, the 58a50f6 root-cause CLASS fix + regression guard:* the 58a50f6 boot break was JNI
+`RegisterNatives` aborting an ENTIRE per-class `NativeMethod` array ATOMICALLY when one entry (`setBackgroundColor(I)V`)
+is plain Java in the shipped dex — ART validates every entry against the class's declared methods first and rejects the
+whole array on the first mismatch, taking the lifecycle-critical `native_constructor`/`native_destructor`/
+`native_get_window` down with it. NEW `register_class_natives_best_effort(env, class_name, &[NativeBinding])` (where
+`type NativeBinding = (&'static JNIStr, &'static JNIStr, *mut c_void)`) resolves `find_class` ONCE (a genuine class-load
+failure still propagates via `?`, never masked), then binds each method INDEPENDENTLY via a single-element
+`RegisterNatives` slice (`std::slice::from_ref(&method)`); a method the shipped dex does not declare native makes the
+single-method `register_native_methods` throw — the pending exception is cleared and the entry skipped with a LOUD
+per-method `tracing::warn!` naming class+method+sig. This faithfully mirrors the EXISTING per-native best-effort
+precedent in `register_asset_stream_natives` (the readAsset/openAssetFd/… loop), but at WARN not the precedent's debug:
+it must NEVER silently mask a genuinely-needed native — it only degrades the fatal whole-class abort into a deferred
+call-time `UnsatisfiedLinkError` on ONLY the bad method, the same loud discovery signal the project already relies on.
+The skip-and-continue control flow is split into a pure `fold_best_effort(bindings, step) -> u32` core (no JVM) so it is
+unit-testable in-harness. CONVERTED exactly the View/widget per-class registrars affected by this class of bug from
+atomic-array `RegisterNatives` to per-method best-effort: `register_view_natives` (the function 58a50f6 actually broke),
+`register_view_group_natives`, `register_text_view_natives`, `register_image_view_natives`, `register_image_button_natives`,
+`register_surface_view_natives`, `register_view_subclass_constructor_natives`, and `register_widget_property_setter_natives`
+(all 8 inflatable widget classes). Did NOT touch unrelated registrars (Paint/Matrix/Path/Canvas/Drawable/Window/Activity/
+asset-stream stay atomic per "do not rewrite unrelated registration code"; `register_view_tree_observer_natives` sits at
+the edge of the chosen scope and was left atomic — flagged below).
+
+*Same-pattern audit:* the audit boundary is the LayoutInflater-critical View/widget per-class `RegisterNatives` family —
+exactly the registrations that can be reached during step-4 inflation and so are exposed to the 58a50f6 atomic-abort
+mechanism (an entry the shipped dex disagrees with taking lifecycle-critical siblings down with it). All eight are
+converted. `register_view_tree_observer_natives` (reached on the same `getViewTreeObserver` path, commit `95f964c`)
+still uses atomic `register_native_methods`; it is at the edge of scope and left atomic per "do not rewrite unrelated
+registration code" — if a future single-bad-entry there ever aborts its class, convert it the same way. The non-View
+registrars (Paint/Canvas/Window/Activity/asset-stream) were correctly left atomic.
+
+*Regression guard (tied to the confirmed root cause):* NEW `register_class_natives_best_effort_skips_unbindable_method_and_continues`
+(`src/framework.rs`) drives the pure `fold_best_effort` core (JVM-free — ART can't run in `cargo test`, it aborts off
+the main thread) with a 3-entry binding set whose MIDDLE entry fails: it asserts all 3 entries are visited IN ORDER (no
+short-circuit) and `bound == 2` — the smallest check that would have caught the 58a50f6 atomic abort, and a future
+reintroduction of an early `return Err`/`?` on a per-entry failure fails it. (Coverage boundary, stated for transparency:
+this pins the no-short-circuit LOOP invariant — the exact thing 58a50f6 violated — but tests the extracted `step`
+closure, not the real `register_class_natives_best_effort` match-arm body; the match-arm mirrors the proven asset-stream
+precedent. This is the best achievable without a JVM.) The existing `widget_property_setter_names_sigs_and_classes_match_overlay`
+pin is EXTENDED with name/sig pins for the three EditText listener natives (add/remove share `(JLandroid/text/TextWatcher;)V`;
+editor-action `(JLandroid/widget/TextView$OnEditorActionListener;)V`) so a transcription drift re-introducing the
+boot-blocking `UnsatisfiedLinkError` fails CI. NEW `view_registry` tests
+`listener_retention_counts_start_empty_and_clear_is_a_noop_on_empty` and
+`listener_retention_helpers_reject_stale_and_fabricated_handles` pin the handle-validation + count/clear bookkeeping of
+the listener-retention helpers (a real `Global` needs a live VM — that path is validated on the owner dev-host run).
+Run: `cargo test register_class_natives_best_effort_skips_unbindable_method_and_continues` (1 passed),
+`cargo test listener_retention` (2 passed), `cargo test widget_property_setter_names_sigs_and_classes_match_overlay`
+(1 passed). As with every View native, the binding-PRESENCE / per-class WIRING guard only surfaces under a live ART
+boot (which can't run in-harness) — the documented owner dev-host live boot.
+
+*Verification (full gate, clean working tree, no machine-specific assumptions):* `cargo fmt --all -- --check` CLEAN;
+`cargo build --all-targets` 0 warnings (exit 0); `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings
+(exit 0); `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP — APK+display
+present, exact success markers required) + 2 doctests = 561 passed, 0 failed** (unit 552→555, +3: two `view_registry`
+listener-retention tests + one `fold_best_effort` skip-and-continue test); `cargo build --release` clean (artifact
+`/home/kue/Projects/Eclipse/target/release/eclipse`, 8,907,880 bytes). *Did NOT live-boot ART (no `cargo run`/`__*`
+subcommands) and did NOT inspect any third-party binary — first-party only against the vendored
+`vendor/atl/src/api-impl/android/widget/EditText.java` + `TextView.java` + the public Android API.*
+
+*OWNER-RUN DATA NEEDED (dev-host live boot, prohibited here — `./target/release/eclipse run <APK>` with
+`ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`; NOTE: the framework overlay is a CACHE artifact
+wiped periodically — if the boot errors `Android framework not found`, rebuild it with
+`tools/framework-overlay/patch-framework.sh` FIRST):* (1) confirm `EditText.native_addTextChangedListener` no longer
+trips `UnsatisfiedLinkError` on the `RbxKeyboard`/`AppCompatEditText` construction path and `LayoutInflater` proceeds
+past it; (2) confirm the View/widget registrations log the normal `(best-effort)` info lines and NO per-method WARN (a
+WARN names a genuinely-non-native shipped method to investigate next, e.g. confirming which — if any — of these EditText
+listeners the shipped dex declares plain Java); (3) capture the NEXT unbound native one at a time (whether
+`native_removeTextChangedListener`/`native_setOnEditorActionListener` are also reached on this ctor path, then likely a
+return-driving getter such as `EditText.native_getText`/`SeekBar.native_getProgress`, an `isChecked()`/`setChecked()`
+pair, another listener registration, or the next class on the inflate→attach→surface path — pure log observation, no
+binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs`, `AGENTS.md`. *No subagent live boot.*
 
 ---
 

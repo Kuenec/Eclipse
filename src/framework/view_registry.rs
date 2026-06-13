@@ -169,6 +169,21 @@ pub struct ViewState {
     /// renderer fills the view's rect with this color (real fidelity) and otherwise uses a synthetic
     /// depth-distinguished color. A drawable background (`native_setBackgroundDrawable`) is separate.
     pub background_color: Option<i32>,
+    /// 2026-06-13: JNI **global** references to the `android.text.TextWatcher`s registered on this view
+    /// by `EditText.native_addTextChangedListener` (removed by `native_removeTextChangedListener`).
+    /// Eclipse's vendored `EditText.addTextChangedListener` (EditText.java:52) passes the watcher
+    /// straight to the native WITHOUT keeping a Java field, so the native side must RETAIN it (a plain
+    /// local arg would be collected the moment the call returns) — held here so a future input-dispatch
+    /// path can invoke `TextWatcher.onTextChanged(...)` on the real object. No input occurs during boot,
+    /// so recording is the complete correct behavior now. Each `Global` is `Send` and releases its ref
+    /// on `Drop` (slot [`free`]d or this `Vec` cleared). Empty until a watcher is added.
+    pub text_watchers: Vec<Global<JObject<'static>>>,
+    /// 2026-06-13: a JNI **global** reference to the `TextView$OnEditorActionListener` registered on
+    /// this view by `EditText.native_setOnEditorActionListener` (EditText.java:57 passes it straight to
+    /// the native with no Java field, so the native must retain it). A view has at most one editor-action
+    /// listener; a new registration replaces the prior (its `Drop` releases the old ref). Held so a
+    /// future IME/input-dispatch path can invoke `onEditorAction(...)`. `None` until set.
+    pub editor_action_listener: Option<Global<JObject<'static>>>,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -219,6 +234,8 @@ pub fn allocate(class_name: &str) -> Result<ViewHandle, ViewRegistryError> {
         clickable: false,
         jobject: None,
         background_color: None,
+        text_watchers: Vec::new(),
+        editor_action_listener: None,
     };
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -322,6 +339,57 @@ pub fn with_jobject<R>(
     f: impl FnOnce(&Global<JObject<'static>>) -> R,
 ) -> Result<Option<R>, ViewRegistryError> {
     with_view(handle, |v| v.jobject.as_ref().map(f))
+}
+
+/// 2026-06-13: RETAIN a `TextWatcher` global ref on the view a `handle` refers to
+/// (`EditText.native_addTextChangedListener`). Eclipse's `EditText.addTextChangedListener` keeps no
+/// Java field, so the native must hold the watcher or it is collected immediately — held here so a
+/// future input-dispatch path can invoke it. Validates the handle exactly like [`with_view`], so a
+/// stale/fabricated handle is a typed `Err`, never UB.
+pub fn add_text_watcher(
+    handle: ViewHandle,
+    watcher: Global<JObject<'static>>,
+) -> Result<(), ViewRegistryError> {
+    with_view(handle, move |v| v.text_watchers.push(watcher))
+}
+
+/// 2026-06-13: keep only the `TextWatcher`s for which `keep` returns `true`, dropping (and thereby
+/// releasing the JNI global ref of) the rest — the backing for `EditText.native_removeTextChangedListener`.
+/// The caller's `keep` runs under the registry lock and compares each retained watcher against the one
+/// being removed (a JNI identity check, which does not re-enter the registry — same contract as
+/// [`with_jobject`]). Returns the number of watchers dropped. Validates the handle like [`with_view`].
+pub fn retain_text_watchers(
+    handle: ViewHandle,
+    mut keep: impl FnMut(&Global<JObject<'static>>) -> bool,
+) -> Result<usize, ViewRegistryError> {
+    with_view(handle, move |v| {
+        let before = v.text_watchers.len();
+        v.text_watchers.retain(|w| keep(w));
+        before - v.text_watchers.len()
+    })
+}
+
+/// 2026-06-13: RETAIN (replacing any prior) the editor-action listener global ref on the view a
+/// `handle` refers to (`EditText.native_setOnEditorActionListener`); passing `None` clears it. Replacing
+/// drops the old `Global` (releasing its ref). Validates the handle exactly like [`with_view`].
+pub fn set_editor_action_listener(
+    handle: ViewHandle,
+    listener: Option<Global<JObject<'static>>>,
+) -> Result<(), ViewRegistryError> {
+    with_view(handle, move |v| v.editor_action_listener = listener)
+}
+
+/// 2026-06-13: the number of `TextWatcher`s currently retained on the view a `handle` refers to (the
+/// observable side effect of [`add_text_watcher`]/[`retain_text_watchers`]). Validates the handle like
+/// [`with_view`].
+pub fn text_watcher_count(handle: ViewHandle) -> Result<usize, ViewRegistryError> {
+    with_view(handle, |v| v.text_watchers.len())
+}
+
+/// 2026-06-13: whether an editor-action listener is currently retained on the view a `handle` refers to
+/// (the observable side effect of [`set_editor_action_listener`]). Validates the handle like [`with_view`].
+pub fn editor_action_listener_is_set(handle: ViewHandle) -> Result<bool, ViewRegistryError> {
+    with_view(handle, |v| v.editor_action_listener.is_some())
 }
 
 /// Publish `handle` as the window's content-root view (called by `Window.set_widget_as_root`), so
@@ -701,6 +769,50 @@ mod tests {
         assert_eq!(
             with_jobject(h, |_| 1i32),
             Err(ViewRegistryError::StaleHandle)
+        );
+    }
+
+    // 2026-06-13: the EditText listener-retention helpers. Constructing a real `Global` needs a VM
+    // (validated on the dev-host run), so these pin the handle validation + count/clear bookkeeping that
+    // the listener natives depend on: a fresh view holds no watchers and no editor-action listener;
+    // `retain`/`set(None)` on an empty view are well-defined no-ops; and every helper rejects a
+    // stale/fabricated handle with a typed Err (never UB).
+    #[test]
+    fn listener_retention_counts_start_empty_and_clear_is_a_noop_on_empty() {
+        let h = allocate("android.widget.EditText").expect("alloc");
+        assert_eq!(text_watcher_count(h), Ok(0));
+        assert_eq!(editor_action_listener_is_set(h), Ok(false));
+        // retain over an empty watcher list drops nothing and keeps the count at 0.
+        assert_eq!(retain_text_watchers(h, |_| true), Ok(0));
+        assert_eq!(text_watcher_count(h), Ok(0));
+        // Clearing an unset editor-action listener is a well-defined no-op.
+        set_editor_action_listener(h, None).expect("clear editor-action listener");
+        assert_eq!(editor_action_listener_is_set(h), Ok(false));
+        free(h).expect("free");
+    }
+
+    #[test]
+    fn listener_retention_helpers_reject_stale_and_fabricated_handles() {
+        let h = allocate("android.widget.EditText").expect("alloc");
+        free(h).expect("free");
+        // Stale handle (freed) → Err on every helper, never UB.
+        assert_eq!(text_watcher_count(h), Err(ViewRegistryError::StaleHandle));
+        assert_eq!(
+            editor_action_listener_is_set(h),
+            Err(ViewRegistryError::StaleHandle)
+        );
+        assert_eq!(
+            retain_text_watchers(h, |_| true),
+            Err(ViewRegistryError::StaleHandle)
+        );
+        assert_eq!(
+            set_editor_action_listener(h, None),
+            Err(ViewRegistryError::StaleHandle)
+        );
+        // Fabricated out-of-range index → OutOfRange.
+        assert_eq!(
+            text_watcher_count(pack(u32::MAX, 1)),
+            Err(ViewRegistryError::OutOfRange)
         );
     }
 }
