@@ -128,6 +128,66 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🔁 androidx LIFECYCLE-ORDERING FIX — `ON_CREATE` now dispatched during the activity's CREATE phase,
+  BEFORE `onStart`.** Owner's live boot of `b480bd0` (EXIT=124 clean) advanced `ActivityNativeMain` PAST `onCreate`
+  (`createGlAppsFrame` succeeds) into `onStart`, which then threw `IllegalStateException: LifecycleOwner
+  ActivityNativeMain is attempting to register while current state is STARTED — must call register before STARTED`:
+  `MediaPickerProtocolV2.onCreate` (a `DefaultLifecycleObserver`) calls `registerForActivityResult` whose
+  `ActivityResultRegistry.register` guard throws because the activity's androidx `LifecycleRegistry` had already
+  reached STARTED before `ON_CREATE` was dispatched to observers. **Root cause (confirmed first-party):**
+  `ActivityNativeMain` extends androidx `ComponentActivity`; its `LifecycleRegistry` must receive `ON_CREATE` during
+  the create phase. At ATL's `Build.VERSION.SDK_INT == 23` (ATL `Build.java` defaults to 23 when the property is
+  unset; `runtime.rs` `vm_options()` pushes no `-DBuild.VERSION.SDK_INT`), androidx's `ReportFragment` dispatches
+  `ON_CREATE` from its `android.app.Fragment.onActivityCreated(Bundle)` override. ATL dispatched NO create-phase
+  fragment hook (installed `Activity.onCreate` only loops `fragment.onCreate()`; `Activity.onPostCreate` was a
+  Slog-only no-op; the base `Fragment` had no `onActivityCreated`), and Eclipse's `drive_lifecycle` called `onCreate`
+  → `onStart` back-to-back with nothing between — so the FIRST event the registry saw was `ReportFragment.onStart` →
+  `handleLifecycleEvent(ON_START)`, which advanced `mState` to STARTED and back-filled `ON_CREATE` to lagging
+  observers while already STARTED → the throw. **Fix (durable, NOT suppression — `fixLocation=both`, matching AOSP's
+  `performCreate` → `onPostCreate` ordering):** (A) framework overlay (`tools/framework-overlay/patch-framework.sh`,
+  step-4b smali pipeline now also shadows the INSTALLED `android.app.Activity` + `android.app.Fragment` into
+  `classes2.dex`): base `Fragment` gets the AOSP no-op `onActivityCreated(Bundle)` hook (so androidx `ReportFragment`'s
+  `@Override` resolves + is invoked), and the installed `Activity.onPostCreate` (was a Slog-only no-op) now iterates
+  `fragments` calling `Fragment.onActivityCreated(savedInstanceState)` — the create-phase dispatch AOSP runs and ATL
+  omitted. (B) Eclipse Rust (`src/framework.rs`): a new `STEP_ACTIVITY_ON_POST_CREATE` recipe step + a
+  `call_activity_on_post_create` helper (null `Bundle`, `(Landroid/os/Bundle;)V`, routed through `checked`), driven
+  BETWEEN `onCreate` and `onStart` in BOTH up-lifecycle drivers — `drive_lifecycle` (step 5 → 5b → 6 → 7) AND the
+  static `activity_native_start_activity` (the splash→main `nativeStartActivity` handoff). ATL/Eclipse has no
+  `performCreate` to invoke `onPostCreate`, so the driver must; `onPostCreate` (not `onCreate`) is the dispatch site
+  because the androidx `ReportFragment` is injected during `ComponentActivity.onCreate`'s super-chain — it is present
+  in `fragments` only after the whole `onCreate` chain returns, and still before `onStart`. Net: `ON_CREATE` reaches
+  observers while the registry is at CREATED → `registerForActivityResult` legitimately sees CREATED and passes its
+  guard; NO catch/ignore of the `IllegalStateException` anywhere. Same-pattern audit: both up-lifecycle drivers fixed;
+  `nativeResumeActivity` (drives only `onResume` on an already-created/started instance) correctly left unpatched;
+  `recreate()` routes through `nativeStartActivity` so it is covered. Regression guards: a new JVM-free source-order
+  pin `lifecycle_drivers_call_on_post_create_between_on_create_and_on_start` (`include_str!` asserts `onCreate` <
+  `onPostCreate` < `onStart` < `onResume` in both drivers — ART cannot run under `cargo test`), `STEP_ACTIVITY_ON_POST_CREATE`
+  class/method/descriptor + call-site literal asserts in the existing recipe-pin cluster, and build-time overlay
+  guards in `patch-framework.sh` (exact-count==1 anchors + a `perl -0777` pristine-body guard + post-insert `grep -qF`
+  back-checks that fail the build loudly if the `Fragment.onActivityCreated` hook or the `Activity.onPostCreate`
+  dispatch is reverted / the installed-class shape drifts). **⇐ START HERE NEXT SESSION (= OWNER live validation on
+  the dev-host MAIN LOOP): rebuild the overlay FIRST with `tools/framework-overlay/patch-framework.sh` if
+  `~/.cache/eclipse` was wiped or the overlay was touched (boot errors `Android framework not found`; `export
+  ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must hold the smali
+  2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. EXPECTED: `ActivityNativeMain.onStart` no
+  longer throws the `IllegalStateException` (`register while STARTED`); `MediaPickerProtocolV2.onCreate`'s
+  `registerForActivityResult` succeeds with the `LifecycleRegistry` at CREATED; boot advances PAST `onStart` into
+  `onResume` (watch for the `Activity.onPostCreate` driver log between `onCreate` and `onStart`, and the patched
+  Activity's `- onPostCreate - yay!`). CAPTURE the next gap one at a time (pure log observation, no binary
+  inspection): further `onStart`/`onResume` work, or the engine surface / `AndroidGLView` path. STANDING FRONTIER once
+  RESUMED is the surface-to-engine render wiring. RESIDUAL RISK to watch (note, not a blocker): the create-phase
+  dispatch reaches androidx's `ReportFragment.onActivityCreated` only if that fragment is actually in
+  `activity.fragments` via the framework `android.app.FragmentManager` at `onPostCreate` time; if the bundled androidx
+  routes its `ReportFragment` through a support FragmentManager instead, the named fallback is ATL's no-op
+  `Activity.registerActivityLifecycleCallbacks` (overlay) feeding the API-29+ `LifecycleCallbacks.onActivityPostCreated`
+  path — diagnose via log observation only.** Gate (only `src/framework.rs` + `tools/framework-overlay/patch-framework.sh`
+  changed): `cargo fmt --all -- --check` / `build --all-targets` (0 warn) / `clippy --all-targets --all-features -D
+  warnings` (0 warn) / `build --release` (8,911,112-byte artifact) all 0-warning; `cargo test` **556 unit + 0 main-bin
+  + 4 integration (0 SKIP) + 2 doctests = 562 passed, 0 failed** (+1 unit: the new source-order pin). Overlay build
+  clean (exit 0; `classes.dex` 18656B, `classes2.dex` 59704B [grew from 43580B by the added Activity+Fragment
+  lifecycle smali], `classes3.dex` 2498192B; `classes2.dex` verified via baksmali `list classes` to define EXACTLY
+  `Activity` + `Fragment` + `Display` + `View` + `View$OnCapturedPointerListener`). Detail: §6 (2026-06-13 androidx
+  lifecycle-ordering / `onPostCreate` create-phase dispatch entry).
 - **2026-06-13 — 📺 `android.view.Display.getSupportedRefreshRates()[F` OVERLAY PATCH — OWNER LIVE-VALIDATED
   (EXIT=124 clean): the method resolves, `ActivityNativeMain` now COMPLETES `onCreate` (`createGlAppsFrame`
   succeeds) and ENTERS `onStart`.** Roblox calls `Display.getSupportedRefreshRates()[F` in `Activity.onStart`
@@ -143,19 +203,13 @@ before any history-rewriting/force operation.
   `Display`, defines EXACTLY those 3 classes) + `classes3.dex` (stock); first-dex-wins. Working-tree change is
   confined to `tools/framework-overlay/patch-framework.sh` (+15/-3: the Display anchor guard + perl insert +
   post-insert grep guard + the `cp` into `smali-view`, plus two header-comment updates); no new committed files;
-  the vendored smali jars stay in git-ignored `vendor/toolchain/smali/`. **⇐ START HERE NEXT SESSION (= OWNER live
-  validation on the dev-host MAIN LOOP): rebuild the overlay FIRST with `tools/framework-overlay/patch-framework.sh`
-  if `~/.cache/eclipse` was wiped (boot errors `Android framework not found`; `export
-  ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must hold the
-  smali 2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. MILESTONE ALREADY PROVEN this patch:
-  `getSupportedRefreshRates` resolves, `ActivityNativeMain` COMPLETES `onCreate` (`createGlAppsFrame` succeeds) and
-  ADVANCES to `onStart`. The NEW FRONTIER is an androidx lifecycle-ORDERING bug (NOT a missing method):
-  `IllegalStateException: LifecycleOwner ActivityNativeMain is attempting to register while current state is STARTED
-  — must call register before STARTED`, thrown when `MediaPickerProtocolV2.onCreate` (a lifecycle observer) calls
-  `registerForActivityResult` during the `onStart` dispatch — i.e. the activity's androidx `LifecycleRegistry`
-  reached STARTED before `ON_CREATE` was dispatched to observers. INVESTIGATE how Eclipse's `drive_lifecycle` drives
-  `ActivityNativeMain`'s steps vs how ATL's `Activity` dispatches androidx lifecycle events (capture/diagnose one gap
-  at a time — pure log observation, no binary inspection).** Gate (no Rust changed — smali-overlay + build-script
+  the vendored smali jars stay in git-ignored `vendor/toolchain/smali/`. **[START-HERE marker moved 2026-06-13 to the
+  androidx lifecycle-ordering entry at the TOP of §5 — `getSupportedRefreshRates` resolves and `ActivityNativeMain`
+  COMPLETES `onCreate` (`createGlAppsFrame` succeeds) and ADVANCES to `onStart`; the androidx lifecycle-ORDERING bug
+  this entry flagged as the NEXT FRONTIER (`IllegalStateException: LifecycleOwner ActivityNativeMain is attempting to
+  register while current state is STARTED` — `MediaPickerProtocolV2.onCreate` calls `registerForActivityResult` while
+  the `LifecycleRegistry` is already STARTED because `ON_CREATE` was never dispatched during the create phase) is now
+  FIXED by that entry's `onPostCreate` → `Fragment.onActivityCreated` create-phase dispatch.]** Gate (no Rust changed — smali-overlay + build-script
   only): overlay build clean (exit 0; `classes.dex` 18656B, `classes2.dex` 43580B [grew from 42288B pointer-capture-
   only by the added Display method], `classes3.dex` 2498192B; `classes2.dex` verified to define EXACTLY `View` +
   `View$OnCapturedPointerListener` + `Display`); `cargo fmt --all -- --check`/`build --all-targets`/`clippy
@@ -3006,6 +3060,34 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 *Context7:* not used — no external library/API surface changed; this extends the project's own established baksmali/smali step-4b overlay pipeline (`smali`/`baksmali` 2.5.2, already vendored) against the AUTHORITATIVE installed `Display` dex.
 
 *OWNER LIVE-VALIDATION (already done, current tree):* `patch-framework.sh` reproduces the 3-dex overlay (`classes2.dex` defines EXACTLY `View` + `View$OnCapturedPointerListener` + `Display`); the live boot is EXIT=124 clean — `getSupportedRefreshRates` resolves, `ActivityNativeMain` COMPLETES `onCreate` (`createGlAppsFrame` succeeds) and ADVANCES to `onStart`. **MILESTONE:** this is the first boot to complete `onCreate` and enter `onStart`. **NEW FRONTIER (the next investigation, NOT part of this patch):** an androidx lifecycle-ORDERING bug — `IllegalStateException: LifecycleOwner ActivityNativeMain is attempting to register while current state is STARTED — must call register before STARTED`, thrown when `MediaPickerProtocolV2.onCreate` (a lifecycle observer) calls `registerForActivityResult` during the `onStart` dispatch. I.e. the activity's androidx `LifecycleRegistry` reached STARTED before `ON_CREATE` was dispatched to observers; investigate how Eclipse's `drive_lifecycle` drives `ActivityNativeMain`'s steps vs how ATL's `Activity` dispatches androidx lifecycle events. *Files:* `tools/framework-overlay/patch-framework.sh`, `AGENTS.md`; vendored (git-ignored, NOT committed): `vendor/toolchain/smali/{baksmali,smali}-2.5.2.jar` + `SOURCE.txt`.
+
+---
+
+### 2026-06-13 — 🔁 androidx lifecycle-ordering fix: dispatch `ON_CREATE` during the activity's CREATE phase (`onPostCreate` → `Fragment.onActivityCreated`), before `onStart`
+
+*Symptom (owner live boot of `b480bd0`, EXIT=124 clean):* `ActivityNativeMain` completes `onCreate` (`createGlAppsFrame` succeeds), then Eclipse drives `onStart`, which throws `java.lang.IllegalStateException: LifecycleOwner com.roblox.client.ActivityNativeMain@… is attempting to register while current state is STARTED. LifecycleOwners must call register before they are STARTED.` The stack is `ActivityResultRegistry.register` ← `MediaPickerProtocolV2.onCreate` (a `DefaultLifecycleObserver`'s `ON_CREATE` callback) ← `LifecycleRegistry` sync/dispatch ← a `ReportFragment`-style `ON_START` driver (`k0.onStart`, a `Fragment` method) ← `ComponentActivity.onStart` super ← `ActivityNativeMain.onStart` ← Eclipse's `nativeStartActivity`.
+
+*Root cause (confirmed first-party — Eclipse-side ordering + missing ATL create-phase dispatch):* `ActivityNativeMain` extends androidx `ComponentActivity`, whose `LifecycleRegistry` must receive `Lifecycle.Event.ON_CREATE` during the create phase (AOSP: `performCreate` → `onCreate` → `dispatchActivityPostCreated` / `ReportFragment`, all BEFORE `onStart`). At ATL's `Build.VERSION.SDK_INT == 23` (ATL `Build.java` reads `System.getProperty("Build.VERSION.SDK_INT")` and DEFAULTS TO 23 when unset; `runtime.rs` `vm_options()` pushes only `-Xmx`/`-XX` heap opts and never `-DBuild.VERSION.SDK_INT`, so `BootPlan.sdk_int=35` does NOT reach ATL's Java `Build.VERSION.SDK_INT`), androidx's `ReportFragment.injectIfNeededIn` takes the pre-API-29 framework-`Fragment` path: it dispatches `ON_CREATE` from its `android.app.Fragment.onActivityCreated(Bundle)` override (matching the live trace's `k0.onStart` being a `Fragment` method). But (1) ATL dispatched NO create-phase fragment hook — installed `Activity.onCreate` only loops `fragment.onCreate()`, installed `Activity.onPostCreate` was a Slog-only no-op, and the base `android.app.Fragment` had no `onActivityCreated` at all; and (2) Eclipse's `drive_lifecycle` (and the static `activity_native_start_activity`) called `onCreate` → `onStart` back-to-back with nothing between. So the FIRST event the registry ever saw was `ReportFragment.onStart` → `handleLifecycleEvent(ON_START)`, which advanced `mState` to STARTED and then back-filled the skipped `ON_CREATE` to lagging observers while `currentState` was already STARTED → `MediaPickerProtocolV2`'s `ON_CREATE` callback called `registerForActivityResult`, whose `ActivityResultRegistry.register` guard (`lifecycle.currentState.isAtLeast(STARTED)` → throw) fired. (`ActivitySplash` survives the same late ordering only because it registers no `ON_CREATE` observer that calls `registerForActivityResult` — APK-confirmable, not first-party.)
+
+*Fix (durable, NOT suppression — `fixLocation=both`, restoring AOSP's `onCreate` → `onPostCreate` → `onStart` ordering; the registry legitimately reaches CREATED first, so `register` passes its guard — no `catch`/ignore of the `IllegalStateException` anywhere):*
+- **(A) Framework overlay** (`tools/framework-overlay/patch-framework.sh`, extending the established step-4b baksmali pipeline to ALSO shadow the INSTALLED `android.app.Activity` + `android.app.Fragment` into `classes2.dex`): insert the AOSP base no-op `Fragment.onActivityCreated(Landroid/os/Bundle;)V` hook (so androidx `ReportFragment`'s `@Override` resolves + is invoked), and replace the no-op `Activity.onPostCreate(Bundle)` body with a `fragments`-loop dispatching `Fragment.onActivityCreated(savedInstanceState)` — the create-phase hook ATL omitted. (`FragmentTransaction.add` already populates `activity.fragments`, verified in the installed smali, so the injected `ReportFragment` is in the loop.)
+- **(B) Eclipse Rust** (`src/framework.rs`): a new `STEP_ACTIVITY_ON_POST_CREATE` recipe-step const (`android/app/Activity` · `onPostCreate` · `(Landroid/os/Bundle;)V`) + a `call_activity_on_post_create` helper (null `Bundle`, routed through `checked`), wired BETWEEN `call_activity_on_create` and `call_activity_on_start` in BOTH up-lifecycle drivers — `drive_lifecycle` (step 5 → 5b → 6 → 7) AND the static `activity_native_start_activity` (the splash→main `nativeStartActivity` handoff). ATL/Eclipse has no `performCreate` to invoke `onPostCreate`, so the driver must. `onPostCreate` (not `onCreate`) is the dispatch site: the androidx `ReportFragment` is injected during `ComponentActivity.onCreate`'s super-chain, so it is present in `fragments` only after the whole `onCreate` chain returns — and still before `onStart`.
+
+*Why this is the correct mechanism, not a workaround:* the registry reaches CREATED during the create phase exactly as on real Android; `registerForActivityResult` then sees `state == CREATED` and passes its own guard. Nothing catches or ignores the exception; the exception simply never arises because the precondition it guards is now satisfied in the right order.
+
+*Same-pattern audit:* grepped every Activity up-lifecycle call site in `src/framework.rs`. Exactly two drivers run the create→start cascade — `drive_lifecycle` (steps 5/5b/6/7) and the static `activity_native_start_activity` (splash→main `nativeStartActivity`) — and BOTH now drive `onPostCreate` between `onCreate` and `onStart`; `android.app.Activity.recreate()` routes through `nativeStartActivity`, so it is covered. `nativeResumeActivity` intentionally drives ONLY `onResume` (it resumes an already-created/started instance; re-dispatching the create phase there would re-fire `ON_CREATE` to an already-CREATED registry) — correctly left unpatched. `Application.onCreate` (step 3, `()V`) and the down-lifecycle `onPause`/`onStop`/`onDestroy` helpers are unrelated. On the ATL side the create-phase dispatch was missing in TWO places (base `Fragment` had no `onActivityCreated`; `Activity.onCreate`/`onPostCreate` never called it) — both fixed in the overlay.
+
+*Regression protection (tied to the confirmed root cause; no new script):* (1) a NEW JVM-free source-order pin `framework::tests::lifecycle_drivers_call_on_post_create_between_on_create_and_on_start` — `include_str!("framework.rs")` then asserts the helper order `onCreate` < `onPostCreate` < `onStart` < `onResume` in BOTH drivers (catches a reverted/mis-ordered `onPostCreate` insert; ART cannot run under `cargo test`); (2) `STEP_ACTIVITY_ON_POST_CREATE` class/method/descriptor asserts added to `recipe_descriptors_match_confirmed_spec` and `onPostCreate` call-site-literal asserts to `call_site_literals_match_recipe_constants`; (3) build-time overlay guards in `patch-framework.sh` (the established mechanism, like the Build.java/Display/View anchors) — exact-count `== 1` anchors on the installed `Fragment.onCreate` / `Activity.onPostCreate` signatures, a `perl -0777` pristine-no-op-body guard (`grep -F` cannot multi-line match), and post-insert `grep -qF` back-checks asserting the `Fragment.onActivityCreated` hook + the `Activity.onPostCreate` dispatch landed — the build fails loudly if either is reverted or the installed-class shape drifts.
+
+*SDK_INT resolved from first-party sources (no live boot needed for the diagnostic):* the verdict's open SDK_INT probe is answered by code — ATL `Build.java` defaults `Build.VERSION.SDK_INT` to 23 when the property is unset, and `runtime.rs` `vm_options()` pushes no `-DBuild.VERSION.SDK_INT` (no native `System.setProperty` for it either), so ATL's `Build.VERSION.SDK_INT == 23` (< 29) at boot. That is why the load-bearing dispatch is `Fragment.onActivityCreated` (the pre-API-29 `ReportFragment` path), NOT the API-29+ `registerActivityLifecycleCallbacks` → `onActivityPostCreated` path (which ATL's `ActivityLifecycleCallbacks` interface lacks anyway), and why the Rust `onPostCreate` step (B) is REQUIRED, not optional: the dispatch must run after the full `onCreate` super-chain injects the `ReportFragment` and before `onStart`.
+
+*Verification (this tree):* `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **556 unit + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 562 passed, 0 failed**; `cargo build --release` clean (artifact 8,911,112 bytes). Overlay: `tools/framework-overlay/patch-framework.sh` exits 0 (`OK: patched framework overlay installed`) — `classes.dex` 18656 B, `classes2.dex` 59704 B (grew from 43580 B by the added Activity+Fragment lifecycle smali), `classes3.dex` 2498192 B; baksmali `list classes` on the shipped `classes2.dex` confirms it defines EXACTLY `Landroid/app/Activity;` + `Landroid/app/Fragment;` + `Landroid/view/Display;` + `Landroid/view/View$OnCapturedPointerListener;` + `Landroid/view/View;`, and a re-disassemble confirms `Activity.onPostCreate` invokes `Fragment->onActivityCreated(Landroid/os/Bundle;)V` and `Fragment.onActivityCreated(Bundle)` round-tripped through smali assembly. *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); the dev-host live boot is the OWNER's (§5 START-HERE).*
+
+*Context7:* `/androidx/androidx` consulted — confirmed `ReportFragment` extends `android.app.Fragment`, declares `onActivityCreated(Bundle)`, and that `injectIfNeededIn` uses the framework-`Fragment` path pre-API-29 (the `LifecycleCallbacks`/`onActivityPostCreated` path was added on API 29+).
+
+*Files:* `src/framework.rs` (recipe step + helper + driver wiring + pins), `tools/framework-overlay/patch-framework.sh` (Activity/Fragment shadow + guards), `AGENTS.md`; overlay output is a `~/.cache` artifact regenerated by the in-repo script (not committed); vendored smali toolchain stays git-ignored under `vendor/toolchain/smali/`.
+
+*Residual risk (note for next session, not a blocker):* the create-phase dispatch reaches androidx's `ReportFragment.onActivityCreated` only if that fragment is actually in `activity.fragments` via the framework `android.app.FragmentManager` at `onPostCreate` time. If the bundled androidx routes its `ReportFragment` through a support FragmentManager instead (which would not feed `activity.fragments`), the named fallback is making ATL's no-op `Activity.registerActivityLifecycleCallbacks` (overlay) store the callback and feeding the API-29+ `LifecycleCallbacks.onActivityPostCreated` path — to be diagnosed via the owner's live boot log only (no binary inspection).
 
 ---
 
