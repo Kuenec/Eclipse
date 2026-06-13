@@ -128,6 +128,40 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 📺 `android.view.Display.getSupportedRefreshRates()[F` OVERLAY PATCH — OWNER LIVE-VALIDATED
+  (EXIT=124 clean): the method resolves, `ActivityNativeMain` now COMPLETES `onCreate` (`createGlAppsFrame`
+  succeeds) and ENTERS `onStart`.** Roblox calls `Display.getSupportedRefreshRates()[F` in `Activity.onStart`
+  (framerate setup) but ATL's INSTALLED `Display` omits it → `NoSuchMethodError`. This is a **framework-overlay**
+  patch (NOT Rust — `RegisterNatives` cannot add a Java *method*), extending the existing step-4b smali pipeline.
+  Same drift-proof approach as the `View` pointer-capture patch: **baksmali the AUTHORITATIVE installed `Display`**,
+  insert (anchor-guarded after the UNIQUE `getRefreshRate()F` method, exact-count==1 guard like `Build.java`) a
+  `getSupportedRefreshRates()[F` returning `float[]{60.0f}` — the `const/high16 0x42700000` IEEE-754 bit pattern of
+  60.0f, matching ATL's `getRefreshRate()` which HARDCODES 60.0f, so the reported set is faithful to the installed
+  `Display` — then reassemble `View` + `View$OnCapturedPointerListener` + `Display` TOGETHER into `classes2.dex`
+  (post-insert `grep -qF` back-check; `cp` of `Display.smali` into the `smali-view` dir). Overlay layout stays
+  3-dex: `classes.dex` (javac-patched) + `classes2.dex` (smali `View` + `View$OnCapturedPointerListener` +
+  `Display`, defines EXACTLY those 3 classes) + `classes3.dex` (stock); first-dex-wins. Working-tree change is
+  confined to `tools/framework-overlay/patch-framework.sh` (+15/-3: the Display anchor guard + perl insert +
+  post-insert grep guard + the `cp` into `smali-view`, plus two header-comment updates); no new committed files;
+  the vendored smali jars stay in git-ignored `vendor/toolchain/smali/`. **⇐ START HERE NEXT SESSION (= OWNER live
+  validation on the dev-host MAIN LOOP): rebuild the overlay FIRST with `tools/framework-overlay/patch-framework.sh`
+  if `~/.cache/eclipse` was wiped (boot errors `Android framework not found`; `export
+  ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must hold the
+  smali 2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. MILESTONE ALREADY PROVEN this patch:
+  `getSupportedRefreshRates` resolves, `ActivityNativeMain` COMPLETES `onCreate` (`createGlAppsFrame` succeeds) and
+  ADVANCES to `onStart`. The NEW FRONTIER is an androidx lifecycle-ORDERING bug (NOT a missing method):
+  `IllegalStateException: LifecycleOwner ActivityNativeMain is attempting to register while current state is STARTED
+  — must call register before STARTED`, thrown when `MediaPickerProtocolV2.onCreate` (a lifecycle observer) calls
+  `registerForActivityResult` during the `onStart` dispatch — i.e. the activity's androidx `LifecycleRegistry`
+  reached STARTED before `ON_CREATE` was dispatched to observers. INVESTIGATE how Eclipse's `drive_lifecycle` drives
+  `ActivityNativeMain`'s steps vs how ATL's `Activity` dispatches androidx lifecycle events (capture/diagnose one gap
+  at a time — pure log observation, no binary inspection).** Gate (no Rust changed — smali-overlay + build-script
+  only): overlay build clean (exit 0; `classes.dex` 18656B, `classes2.dex` 43580B [grew from 42288B pointer-capture-
+  only by the added Display method], `classes3.dex` 2498192B; `classes2.dex` verified to define EXACTLY `View` +
+  `View$OnCapturedPointerListener` + `Display`); `cargo fmt --all -- --check`/`build --all-targets`/`clippy
+  --all-targets --all-features -D warnings`/`build --release` (8,910,152-byte artifact) all 0-warning; `cargo test`
+  **555 unit + 0 main-bin + 4 integration (0 SKIP) + 2 doctests = 561 passed, 0 failed**. Detail: §6 (2026-06-13
+  Display.getSupportedRefreshRates overlay entry).
 - **2026-06-13 — 👆 `android.view.View` TOUCH/LONG-CLICK LISTENER NATIVES BOUND (record-the-listener, non-GTK).**
   Owner's live boot of the pointer-capture overlay (commit `8cf570c`, EXIT=124 clean) advanced
   `ActivityNativeMain.onCreate` → `d1` PAST pointer-capture into d1's input setup and hit
@@ -144,15 +178,11 @@ before any history-rewriting/force operation.
   distinct and engine-dispatched). Both natives are `void`, so nothing branches on a return — the validated no-op
   is honest. `nativeRequestFocus` left unbound per the owner-validated `<requestFocus/>` headless-consume decision.
   Regression pin: the existing `view_native_names_sigs_and_class_match_view_java` extended with name+`(J)V`
-  descriptor asserts for both new natives (tied to View.java 1155/1448 + the live UnsatisfiedLinkError). **⇐ START
-  HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP): rebuild the overlay FIRST with
-  `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped (boot errors `Android framework not
-  found`; `export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/`
-  must hold the smali 2.5.2 jars), then `cargo run -- run <APK>` on the process main thread — EXPECT d1's input
-  setup to get PAST `View.nativeSetOnTouchListener` (no per-method WARN for the two new natives unless the shipped
-  dex disagrees on the sig), CAPTURE the next unbound native/gap one at a time (pure log observation, no binary
-  inspection). The standing next FRONTIER remains the SCOPED surface-to-engine render wiring (2194f02 §6 plan)
-  once `onCreate` reaches RESUMED.** Gate (only `src/framework.rs` changed, +87/-2): `cargo fmt --all -- --check`
+  descriptor asserts for both new natives (tied to View.java 1155/1448 + the live UnsatisfiedLinkError). **[START-HERE
+  marker moved 2026-06-13 to the `Display.getSupportedRefreshRates` overlay entry at the TOP of §5 — the owner's live
+  boot validated PAST `View.nativeSetOnTouchListener` (these natives bound) all the way through `onCreate`
+  (`createGlAppsFrame` succeeds) into `onStart`, where the NEW frontier is the androidx lifecycle-ORDERING bug, not a
+  missing native.]** Gate (only `src/framework.rs` changed, +87/-2): `cargo fmt --all -- --check`
   / `build --all-targets` (0 warn) / `clippy --all-targets --all-features -D warnings` (0 warn) / `build --release`
   (8,910,152-byte artifact) all clean; `cargo test` **555 unit + 0 main-bin + 4 integration (0 SKIP) + 2 doctests
   = 561 passed, 0 failed**. Detail: §6 (2026-06-13 View touch/long-click listener natives entry).
@@ -2956,6 +2986,26 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 *Verification (only `src/framework.rs` changed, +87/-2):* `cargo fmt --all -- --check` CLEAN; `cargo build --all-targets` (forced rebuild of the changed crate) 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 561 passed, 0 failed** (includes the extended pin test); `cargo build --release` clean (artifact 8,910,152 bytes). No live ART boot in this workflow (off-main-thread + cyber-safeguard); the dev-host live boot is the OWNER's next step.
 
 *Context7:* not used — no external library/API surface changed; this is internal JNI `RegisterNatives` against vendored `View.java` and the project's own `jni`-crate usage already established by the adjacent `nativeSetOnClickListener` binding. *Gate (owner next step):* rebuild the overlay with `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped, then `cargo run -- run <APK>` on the process main thread — expect d1's input setup to get PAST `View.nativeSetOnTouchListener`; capture the next gap one at a time (pure log observation). Standing next frontier: the scoped surface-to-engine render wiring (2194f02 §6 plan) once `onCreate` reaches RESUMED.
+
+---
+
+### 2026-06-13 — `android.view.Display.getSupportedRefreshRates()[F` framework-overlay patch (baksmali the installed Display; returns `{60.0f}` matching `getRefreshRate`; 3-dex with View) — OWNER LIVE-VALIDATED (EXIT=124 clean): `ActivityNativeMain` completes `onCreate` and enters `onStart`
+
+*Root cause (evidence):* with the pointer-capture + touch-listener gaps closed (entries above), the owner's dev-host live boot advanced `ActivityNativeMain` through `onCreate` (`createGlAppsFrame` succeeds) and into `Activity.onStart`, where Roblox's framerate setup calls `Display.getSupportedRefreshRates()[F`. ATL's INSTALLED `Display` omits that AOSP method → `NoSuchMethodError`. Adding a *method* cannot be done by `RegisterNatives` (JNI binds natives, not Java method bodies/signatures), so this is a **framework-overlay** patch, extending the existing step-4b smali pipeline.
+
+*Source-of-truth check:* the installed `Display` (baksmali-disassembled from the AUTHORITATIVE `$ORIG_FW` jar by step 4b) defines `getRefreshRate()F` exactly once, and that method HARDCODES `const/high16 v0, 0x42700000` (= IEEE-754 60.0f). It does NOT define `getSupportedRefreshRates()[F`. The repo's vendored `View.java`/`Display` sources have drifted from the installed jar (the documented reason the View patch baksmali's the installed class rather than recompiling vendored), so the same drift-proof approach is required for `Display`.
+
+*Fix (framework-overlay, NOT Rust):* in `patch-framework.sh` step 4b, after the existing baksmali of the installed framework, anchor-guard on the UNIQUE `getRefreshRate()F` method (exact-count `== 1` guard, mirroring the `Build.java` / View anchors — aborts loudly if the installed `Display` drifted), then `perl -0pi` insert (after that method's `.end method`, `/s` non-greedy so it cannot over-match a `getRefreshRateXyz` lookalike) a `public getSupportedRefreshRates()[F` that builds a 1-element `float[]` and stores `const/high16 0x42700000` (60.0f) — the SAME constant `getRefreshRate()` returns, so the advertised refresh-rate set is FAITHFUL to the installed `Display`, not a fabricated value. A post-insert `grep -qF 'getSupportedRefreshRates()[F' || fail` back-checks the insert (drift guard). The patched `Display.smali` is then `cp`'d into the existing `smali-view` staging dir so the smali assembler emits `View` + `View$OnCapturedPointerListener` + `Display` TOGETHER into `classes2.dex`; first-dex-wins resolves all three from `classes2.dex` (stock `classes3.dex` still defines `Display`/`View` but is shadowed). Layout stays 3-dex; only `classes2.dex` grew (42288 → 43580 B) by the one added method. Smali source 4.0+ uses `.locals 3` (= `.registers 4`: 3 locals + `p0`/this); the inserted bytecode round-trips smali→dex→baksmali as valid (`new-array [F` size 1; `const/high16 0x42700000`; `aput`; `return-object`).
+
+*Same-pattern audit:* `getSupportedRefreshRates` is the ONLY refresh-rate method Roblox's `onStart` framerate setup is known to call that the installed `Display` omits; `getRefreshRate()F` already exists (the anchor). No other installed `android.*` class needs a sibling refresh-rate method for this boot. The patch is confined to `Display` in the same smali assembly already used for `View`; no other overlay class or Rust native is touched.
+
+*Regression protection:* the build-time anchor + back-check guards in `patch-framework.sh` step 4b ARE the regression guard tied to the confirmed root cause — the `getRefreshRate()F` exact-count `== 1` guard fails the build loudly if a future ATL `Display` drifts the anchor (renamed/duplicated/absent), and the post-insert `grep -qF 'getSupportedRefreshRates()[F' || fail` fails the build if the insert silently no-ops. Consistent with the `Build.java`, LayoutInflater, and View guards; no new script. (A reviewer-noted optional hardening — a pre-insert `grep -qF … && fail` asserting the installed `Display` does NOT already ship the method — was left out as low-value: smali `assemble` rejects a duplicate method loudly regardless, and the current installed `Display` omits it; recorded as future cleanup to keep the change surgical.)
+
+*Verification (overlay build; no Rust source changed — smali-overlay + build-script only; working-tree change confined to `tools/framework-overlay/patch-framework.sh`, +15/-3):* `tools/framework-overlay/patch-framework.sh` reproduced clean (exit 0, `OK: patched framework overlay installed`) — `classes.dex` **18656** B, `classes2.dex` **43580** B (grew from 42288 B pointer-capture-only by the added Display method), `classes3.dex` **2498192** B; only the benign pre-existing LayoutInflater javac unchecked-operations NOTE. The overlay gate confirmed (baksmali `list classes`) that `classes2.dex` defines EXACTLY `Landroid/view/Display;` + `Landroid/view/View$OnCapturedPointerListener;` + `Landroid/view/View;` — no stray classes — and a re-baksmali confirmed `Display.getSupportedRefreshRates()[F` (with `const/high16 0x42700000` = 60.0f) and `View.setOnCapturedPointerListener` both landed. Cargo gate (re-run on this tree; no Rust changed): `cargo fmt --all -- --check` CLEAN; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 561 passed, 0 failed**; `cargo build --release` clean (artifact 8,910,152 bytes). *No live ART boot in this workflow (off-main-thread + cyber-safeguard); the dev-host live boot was the OWNER's.*
+
+*Context7:* not used — no external library/API surface changed; this extends the project's own established baksmali/smali step-4b overlay pipeline (`smali`/`baksmali` 2.5.2, already vendored) against the AUTHORITATIVE installed `Display` dex.
+
+*OWNER LIVE-VALIDATION (already done, current tree):* `patch-framework.sh` reproduces the 3-dex overlay (`classes2.dex` defines EXACTLY `View` + `View$OnCapturedPointerListener` + `Display`); the live boot is EXIT=124 clean — `getSupportedRefreshRates` resolves, `ActivityNativeMain` COMPLETES `onCreate` (`createGlAppsFrame` succeeds) and ADVANCES to `onStart`. **MILESTONE:** this is the first boot to complete `onCreate` and enter `onStart`. **NEW FRONTIER (the next investigation, NOT part of this patch):** an androidx lifecycle-ORDERING bug — `IllegalStateException: LifecycleOwner ActivityNativeMain is attempting to register while current state is STARTED — must call register before STARTED`, thrown when `MediaPickerProtocolV2.onCreate` (a lifecycle observer) calls `registerForActivityResult` during the `onStart` dispatch. I.e. the activity's androidx `LifecycleRegistry` reached STARTED before `ON_CREATE` was dispatched to observers; investigate how Eclipse's `drive_lifecycle` drives `ActivityNativeMain`'s steps vs how ATL's `Activity` dispatches androidx lifecycle events. *Files:* `tools/framework-overlay/patch-framework.sh`, `AGENTS.md`; vendored (git-ignored, NOT committed): `vendor/toolchain/smali/{baksmali,smali}-2.5.2.jar` + `SOURCE.txt`.
 
 ---
 

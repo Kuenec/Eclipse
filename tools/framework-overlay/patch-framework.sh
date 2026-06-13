@@ -6,7 +6,7 @@
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
 #   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*)
-#   classes2.dex = smali-patched View (+ View$OnCapturedPointerListener) = installed View + AOSP pointer-capture API
+#   classes2.dex = smali-patched View (+ View$OnCapturedPointerListener) + Display = installed classes + AOSP gaps
 #   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
@@ -100,7 +100,7 @@ done
 # --- 4. dex the javac-patched classes -> classes.dex -------------------------------------
 "$DX" --dex --output="$work/jar/classes.dex" "$work/stage"
 
-# --- 4b. smali-patch the INSTALLED View -> classes2.dex ----------------------------------
+# --- 4b. smali-patch the INSTALLED View + Display -> classes2.dex -------------------------
 # 2026-06-13: ATL's installed View omits AOSP's pointer-capture API (View.OnCapturedPointerListener +
 # setOnCapturedPointerListener) that Roblox calls in ActivityNativeMain.d1. Adding a *method* needs the
 # whole View class, and the repo's vendored View source has DRIFTED from the installed jar (e.g.
@@ -126,9 +126,21 @@ perl -0pi -e 's{(\.method public setOnClickListener\(Landroid/view/View\$OnClick
 perl -0pi -e 's{(value = \{\n)(        Landroid/view/View\$DeclaredOnClickListener;,\n)}{$1        Landroid/view/View\$OnCapturedPointerListener;,\n$2}' "$vsm"
 grep -qF 'setOnCapturedPointerListener(Landroid/view/View$OnCapturedPointerListener;)V' "$vsm" || fail "View.smali setter insert failed (drift?)"
 grep -qF 'mCapturedPointerListener:Landroid/view/View$OnCapturedPointerListener;' "$vsm" || fail "View.smali field insert failed (drift?)"
-# assemble ONLY the patched View + the committed nested interface -> classes2.dex (other View$* stay stock)
+
+# Display.getSupportedRefreshRates — Roblox calls it in Activity.onStart (framerate setup); ATL's Display
+# omits it. Same drift-proof smali approach: add the method to the AUTHORITATIVE installed Display, returning
+# {60.0f} to match Display.getRefreshRate() (which ATL hardcodes to 60.0f). Anchor-guarded like the rest.
+dsm="$work/smali/android/view/Display.smali"
+[ -f "$dsm" ] || fail "Display.smali not found after baksmali"
+n="$(grep -cF '.method public getRefreshRate()F' "$dsm")" || true
+[ "$n" = "1" ] || fail "Display.smali getRefreshRate anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public getRefreshRate\(\)F.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP Display.getSupportedRefreshRates() (Roblox queries it in Activity.onStart for framerate setup; ATL omits it). Returns {60.0f} to match getRefreshRate above.\n.method public getSupportedRefreshRates()[F\n    .locals 3\n\n    const/4 v0, 0x1\n\n    new-array v0, v0, [F\n\n    const/4 v1, 0x0\n\n    const/high16 v2, 0x42700000    # 60.0f\n\n    aput v2, v0, v1\n\n    return-object v0\n.end method\n}s' "$dsm"
+grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali getSupportedRefreshRates insert failed (drift?)"
+
+# assemble the patched View + nested interface + patched Display -> classes2.dex (other classes stay stock)
 mkdir -p "$work/smali-view/android/view"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
+cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
