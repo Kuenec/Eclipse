@@ -128,8 +128,72 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **2026-06-13 — 🖼️ RENDER PHASE 2.1 SHIPPED: DROP-BEFORE-DISPATCH handoff ordering fix. ⇐ START HERE NEXT SESSION (=
-  OWNER live validation on the dev-host MAIN LOOP).** Phase 2 (commit `ae20ef5`) dispatched `surfaceCreated` FIRST and
+- **2026-06-13 — 🖼️ RENDER PHASE 3 SHIPPED: EGL DISPLAY CONNECTION-MATCH (tier-0 `eglGetDisplay` shim). ⇐ START HERE
+  NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Phase 2.1 (commit `6a75944`) freed the `wl_surface`
+  before dispatch (dropped Eclipse's `VulkanRenderer` strictly first), so the engine now creates its EGL CONTEXT
+  successfully — but its `eglCreateWindowSurface` STILL failed `[FLog::SurfaceController] Mode 4 failed: Error creating
+  context: eglCreateWindowSurface 3003` (`EGL_BAD_ALLOC`). ROOT CAUSE (independent of Phase 2.1's two-owners fix): the
+  engine resolves its `egl*` symbols through `bionic_env` tier 1 (host `libEGL.so`) — Eclipse's tier-0
+  `EclipseNativeProvider` previously registered ZERO `egl*`/`gl*` names. So the engine's
+  `eglGetDisplay(EGL_DEFAULT_DISPLAY=0=NULL)` ran in HOST Mesa, which per the Khronos
+  `EGL_KHR_platform_wayland`/`EGL_EXT_platform_wayland` registry text (Context7, verified 2026-06-13: "When
+  `EGL_DEFAULT_DISPLAY` is used, EGL connects to the default Wayland socket, similar to `wl_display_connect(3)`") opens
+  Mesa's OWN `wl_display` via `wl_display_connect(NULL)` — a DIFFERENT connection object than the one `winit` opened for
+  Eclipse's window. But the `ANativeWindow*` Eclipse hands the engine (`current_wsi_window` via
+  `eclipse_anativewindow_fromsurface`) wraps a `wl_egl_window*` on `winit`'s `wl_surface`; `eglCreateWindowSurface`
+  requires the EGLDisplay's `wl_display` and the `wl_egl_window`'s `wl_surface` on the SAME connection → crossing them =
+  `EGL_BAD_ALLOC` 3003 (matches the live log exactly: `eglCreateContext` SUCCEEDS — display/config fine — but
+  `eglCreateWindowSurface` 3003). Eclipse's own `__gl-test-anw` AVOIDS this because `egl_engine` builds its EGLDisplay
+  from the `winit` `RawDisplayHandle::Wayland` `wl_display` (the SAME connection as its `wl_egl_window`). FIX (3 surgical
+  edits mirroring the existing WSI-window plumbing): **(A)** `ndk_registry`: a `WSI_DISPLAY: Mutex<Option<usize>>` +
+  `set_wsi_display(Option<usize>)`/`wsi_display() -> Option<usize>` pair next to `register_wsi_window`/
+  `current_wsi_window` — stores the winit `wl_display*` as a `usize` VALUE (the module is `#![forbid(unsafe_code)]`),
+  best-effort/poison-safe (§2.8). **(B)** `native_provider`: a pure JVM-free helper
+  `resolve_egl_display_target(display_id, wsi)` (`EGL_DEFAULT_DISPLAY=0` + Wayland → winit `wl_display`; else
+  pass-through), a cached `host_egl_get_display()` (`OnceLock<Option<usize>>` doing its OWN
+  `dlopen("libEGL.so", RTLD_NOW|RTLD_LOCAL)` + `dlsym("eglGetDisplay")` so the shim NEVER re-enters the engine's
+  relocated symbol — no recursion; `None` → `EGL_NO_DISPLAY`, clean failure), and the tier-0 native
+  `eclipse_egl_get_display` delegating to the host fn with the remapped target; registered `"eglGetDisplay"` in
+  `with_bionic_natives` before the ANativeWindow block (wins over host `libEGL` by `resolve`'s first-strong-match).
+  **(C)** `graphics::resumed`: right after the Phase 1 WSI-publish block, match `window.display_handle().as_raw()` →
+  `RawDisplayHandle::Wayland(d)` → `set_wsi_display(Some(d.display.as_ptr() as usize))`, else/`Err` → `set_wsi_display(None)`
+  (the SAME `wl_display` pointer `egl_engine` uses for `__gl-test-anw`). **OWNER LIVE-VALIDATION — START HERE NEXT
+  SESSION (dev-host MAIN LOOP, EXIT=124 clean):** if `~/.cache/eclipse` was wiped or the overlay touched, rebuild the
+  overlay FIRST with `tools/framework-overlay/patch-framework.sh` (`export
+  ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`; `vendor/toolchain/smali/` must hold the smali
+  2.5.2 jars), then `cargo run -- run <APK>` on the process MAIN thread (NOT `cargo test` — ART aborts off-main-thread).
+  Look for, in order: (1) NO more `[FLog::SurfaceController] Mode 4 failed: ... eglCreateWindowSurface 3003`
+  (`EGL_BAD_ALLOC`) — the engine's `eglCreateWindowSurface` must now SUCCEED on Eclipse's window (the engine's EGLDisplay
+  now shares the `wl_egl_window`'s winit `wl_display` connection); (2) the engine's GLES2 context goes current; (3) THE
+  FIRST ENGINE FRAME renders in Eclipse's window (engine content, NOT Eclipse's clear loop; Phase 1 logged
+  width=800 height=600). DISCRIMINATE `eglGetDisplay` vs `eglGetPlatformDisplay` (the one unproven leg): confirm via the
+  SurfaceController/EGL log whether the tier-0 `eclipse_egl_get_display` fired AND took the Wayland branch (proving the
+  engine calls `eglGetDisplay` AND the tier-0 override beat host `libEGL`). IF `eglCreateWindowSurface` STILL returns
+  3003 with `eglGetDisplay` intercepted: if `eclipse_egl_get_display` never fired, the engine took the platform-display
+  path → add `eglGetPlatformDisplay`/`eglGetPlatformDisplayEXT` interceptions (same `EGL_DEFAULT_DISPLAY` → winit
+  `wl_display` mapping, `platform == EGL_PLATFORM_WAYLAND_KHR/EXT 0x31D8`) — NOT shipped now because the engine's actual
+  display-acquisition symbol cannot be pinned without RE of `libroblox` (out of scope; Eclipse's first-party docs
+  enumerate only `eglGetError` among the 91 EGL/GLES imports). If still 3003 or a different EGL error, capture the exact
+  SurfaceController/EGL lines + whether the engine used `eglGetDisplay` vs `eglGetPlatformDisplay` for the next iteration
+  (runtime-only, log-observation, do NOT RE the APK/libroblox). Record the owner laptop log path
+  (e.g. `/tmp/eclipse-egldisplay-validate.log`). REGRESSION: confirm `__gl-test` / `__gl-test-anw` still pass — they
+  build their EGLDisplay via `egl_engine` (the winit `wl_display` directly), NOT via the engine's resolved symbol, so
+  they must be UNAFFECTED by the new tier-0 native. RUNTIME CORRECTNESS (does the engine render) is confirmed ONLY by
+  this live boot. Gate (only the 3 work files changed — `src/graphics.rs`, `src/loader/native_provider.rs`,
+  `src/loader/ndk_registry.rs`): `cargo fmt --all -- --check` clean, `cargo build --all-targets` 0 warn, `cargo clippy
+  --all-targets --all-features -- -D warnings` 0 warn (forced recheck via `touch` of the 3 files), `cargo test` **567
+  passed, 0 failed (561 unit + 0 main + 4 integration, 0 SKIP + 2 doctests)** (+2 vs Phase 2.1's 565: the two new unit
+  tests), `cargo build --release` clean (artifact 8,939,368 bytes, grew from Phase 2.1's 8,937,896 by the EGL
+  interception). Regression guards: `resolve_egl_display_target_maps_default_display_to_winit_wayland_only` pins the
+  confirmed-root-cause mapping (EGL_DEFAULT_DISPLAY+Wayland → winit `wl_display`; non-default & X11 pass through);
+  `wsi_display_round_trips_set_and_get` pins the registry round-trip; the
+  `with_bionic_natives_registers_the_three_implemented_categories` count assertion (129→130) + name list now cover
+  `eglGetDisplay`. The host-EGL dlopen/dlsym delegation has no JVM-free seam (FFI to host Mesa libEGL) so its live
+  tier-0 win is owner-dev-host-boot validated. Detail: §6 (2026-06-13 render Phase 3 — EGL display connection-match entry).
+- **2026-06-13 — 🖼️ RENDER PHASE 2.1 SHIPPED: DROP-BEFORE-DISPATCH handoff ordering fix.** [Superseded as the
+  START-HERE marker by the RENDER PHASE 3 entry above — Phase 2.1's drop-before-dispatch HOLDS (it freed the
+  `wl_surface` so the engine's EGL CONTEXT now creates successfully), but revealed the remaining/independent
+  `eglCreateWindowSurface` 3003 cross-connection cause that Phase 3 fixes.] Phase 2 (commit `ae20ef5`) dispatched `surfaceCreated` FIRST and
   dropped Eclipse's `VulkanRenderer` only on the NEXT `about_to_wait` tick (gated on `engine_claimed_surface`, set inside
   `fromSurface`). The owner live boot (EXIT=124 clean) proved the dispatch + handoff fire end-to-end and the engine
   subscribes (engine `surfaceCreated` ran — `MainScreenController`/`AppShellFragment` `surfaceCreated`, "Start the lua
@@ -3422,6 +3486,26 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Context7:* not used — this change touches no external API surface or version-sensitive behavior; it reorders two existing internal calls and extracts one function. The `winit` `ApplicationHandler`/`ControlFlow::Poll` usage and the `jni`-0.22.4 `FieldSignature::from_raw_parts`/`call_method`/`get_field` patterns are unchanged from the already-green Phase 2 code (the project's own source is the authority for the project-specific `Env`/`Global` API).
 
   *Files:* `src/framework.rs` (`surface_callbacks_size` shared helper + `engine_surface_callback_ready`/`surface_callback_ready` + rewired `surface_lifecycle` self-gate), `src/graphics.rs` (removed `surface_dispatched`; single `handed_off` drop-before-dispatch gate + confirmation-only `engine_claimed_surface` log), `src/loader/ndk_registry.rs` (Phase 2.1 doc-comment hygiene on the claim signal), `AGENTS.md`.
+
+---
+
+### 2026-06-13 — 🖼️ Render Phase 3: EGL DISPLAY CONNECTION-MATCH — tier-0 `eglGetDisplay` remaps `EGL_DEFAULT_DISPLAY` to Eclipse's winit `wl_display`, fixing the engine's `eglCreateWindowSurface` `EGL_BAD_ALLOC` (3003)
+
+  *Confirmed root cause (evidence, not speculation):* Phase 2.1 (commit `6a75944`) freed the `wl_surface` before dispatch (dropped Eclipse's `VulkanRenderer` strictly first), so the engine's EGL CONTEXT now creates successfully — `eglCreateContext` SUCCEEDS — but `eglCreateWindowSurface` STILL failed `[FLog::SurfaceController] Mode 4 failed: Error creating context: eglCreateWindowSurface 3003` (`EGL_BAD_ALLOC`). This is an INDEPENDENT cause from Phase 2.1's two-owners-of-one-`wl_surface`: the engine resolves its `egl*` symbols through `bionic_env` tier 1 (host `libEGL.so`, opened at `bionic_env.rs:516-524`) because Eclipse's tier-0 `EclipseNativeProvider` previously registered ZERO `egl*`/`gl*` names (verified by grep of `p.register("egl`/`gl` in `native_provider.rs` — empty; only the 6 ANativeWindow + bionic/libc natives existed). So the engine's `eglGetDisplay(EGL_DEFAULT_DISPLAY=0=NULL)` ran in HOST Mesa, which per the Khronos `EGL_KHR_platform_wayland` / `EGL_EXT_platform_wayland` registry text (Context7, verified 2026-06-13: "When `EGL_DEFAULT_DISPLAY` is used, EGL connects to the default Wayland socket, similar to `wl_display_connect(3)`" / "If `EGL_DEFAULT_DISPLAY` is used, EGL creates a new `wl_display` structure by connecting to the default Wayland socket") opens Mesa's OWN `wl_display` via `wl_display_connect(NULL)` — a DIFFERENT connection object than the one `winit` opened for Eclipse's window. The `ANativeWindow*` Eclipse hands the engine (`ndk_registry::current_wsi_window` via `eclipse_anativewindow_fromsurface`) wraps a `wl_egl_window*` on `winit`'s `wl_surface`; `eglCreateWindowSurface` requires the EGLDisplay's `wl_display` and the `wl_egl_window`'s `wl_surface` to be on the SAME connection — crossing connections is `EGL_BAD_ALLOC` 3003 (matches the live log EXACTLY: `eglCreateContext` succeeds — display/config valid — but `eglCreateWindowSurface` 3003). Eclipse's own `__gl-test-anw` AVOIDS this because `egl_engine.rs:251-263` builds its EGLDisplay from the `winit` `RawDisplayHandle::Wayland` `wl_display` (`d.display.as_ptr()`) — the SAME connection as its `wl_egl_window`. The constant `EGL_DEFAULT_DISPLAY == 0 == NULL` is verified in vendored `khronos-egl-6.0.0/src/lib.rs` (`DEFAULT_DISPLAY` line 1486; `NativeDisplayType`/`EGLDisplay = *mut c_void`, lines 236/232).
+
+  *Fix (connection-MATCHING, not a workaround — 3 surgical edits mirroring the existing WSI-window plumbing):* register an Eclipse-OWNED `eglGetDisplay` at loader tier 0, which wins over host `libEGL` by `resolve.rs`'s first-strong-match (`resolve.rs:240-241`), and map `EGL_DEFAULT_DISPLAY` to the registered winit `wl_display` before delegating to the HOST `eglGetDisplay` so the engine's EGLDisplay shares the `wl_egl_window`'s connection. **(A)** `src/loader/ndk_registry.rs` (`#![forbid(unsafe_code)]` — store the pointer VALUE as `usize`, exactly like `WSI_WINDOWS`): `static WSI_DISPLAY: Mutex<Option<usize>>` + `set_wsi_display(Option<usize>)` (best-effort, poison→ignore, never panics per §2.8) + `wsi_display() -> Option<usize>` (poisoned→`None`), next to `register_wsi_window`/`current_wsi_window`; dated doc comment: it is the winit `wl_display` connection the engine's EGLDisplay must match (`None` on X11/other, where the XID is server-scoped so cross-connection is fine). **(B)** `src/loader/native_provider.rs`: a pure JVM-free helper `resolve_egl_display_target(display_id, wsi) -> usize` (`display_id==0` + Wayland → winit `wl_display`; else pass-through — written `wsi.unwrap_or(0)` to satisfy `clippy::manual_unwrap_or_default`); a cached `host_egl_get_display()` (`OnceLock<Option<usize>>` doing its OWN `dlopen("libEGL.so", RTLD_NOW|RTLD_LOCAL)` + `dlsym("eglGetDisplay")`, `RTLD_LOCAL` + process-lifetime, never `dlclose`, mirroring `DlopenLibProvider` — `None` on null handle/sym → `EGL_NO_DISPLAY`, a clean failure, never UB; using Eclipse's own handle keeps the lookup out of the engine's symbol scope so the shim NEVER re-enters the engine's relocated `eglGetDisplay` — no recursion); and the tier-0 native `unsafe extern "C" fn eclipse_egl_get_display(display_id: *mut c_void) -> *mut c_void` delegating to the host fn with the remapped target (does NOT dereference `display_id`); registered `p.register("eglGetDisplay", …)` in `with_bionic_natives` before the ANativeWindow block. Dated 2026-06-13 SAFETY comments on both `unsafe` blocks (the `dlopen`/`dlsym` FFI; the host-fn transmute+call). Used `c"…"` C-string literals (stable since Rust 1.77) to avoid a `CString` import. **(C)** `src/graphics.rs` (`HasDisplayHandle` already imported; added `RawDisplayHandle` to the `raw_window_handle` import): in `GameWindow::resumed`, right after the Phase 1 WSI-publish block (before `self.window = Some(window)`), match `window.display_handle().as_raw()` → `RawDisplayHandle::Wayland(d)` → `set_wsi_display(Some(d.display.as_ptr() as usize))`, else/`Err` → `set_wsi_display(None)`. The `wl_display` pointer is the SAME one `egl_engine.rs:252` uses, so the engine's remapped EGLDisplay lands on winit's connection — identical to `__gl-test-anw`. Non-fatal, dated 2026-06-13 comment matching the adjacent Phase 1 pattern.
+
+  *Same-pattern audit:* grep of `eglGetDisplay`/`eglGetPlatformDisplay`/`register("egl`/`register("gl` across `src/` confirms: (1) BEFORE this change tier-0 `EclipseNativeProvider` registered ZERO `egl*`/`gl*` names (the engine's `egl*` resolved only through `bionic_env` tier 1 host `libEGL.so`) — so this is the single, correct interception point; (2) `egl_engine.rs` calls host `eglGetDisplay` DIRECTLY via the `khronos-egl` `EglInstance` built from the winit `RawDisplayHandle::Wayland` `wl_display` (`egl_engine.rs:251-263`), NOT through the engine's resolved symbol scope — so `__gl-test`/`__gl-test-anw` (which build their EGLDisplay from that same `wl_display`, already matching their `wl_egl_window`) are UNAFFECTED by the new tier-0 native (their integration tests stay green); (3) NO `eglGetPlatformDisplay`/`eglGetPlatformDisplayEXT` is registered anywhere — consistent with the CONDITIONAL classification below (live-probe-gated). The connection-mismatch is the same CLASS of bug as Phase 2.1's two-owners-of-one-`wl_surface` (both `EGL_BAD_ALLOC` 3003) — Phase 2.1 fixed the `VkSurfaceKHR` co-ownership, this fixes the independent `wl_display` cross-connection; no other instance of cross-connection EGL display acquisition exists in Eclipse-owned code.
+
+  *Platform-display follow-up (deferred, live-probe-gated — Simplicity First):* `eglGetPlatformDisplay` / `eglGetPlatformDisplayEXT` (EGL 1.5 / `EGL_EXT_platform_base`) are NOT intercepted. The engine's actual display-acquisition symbol cannot be pinned without RE of `libroblox` (out of scope; Eclipse's first-party docs enumerate only `eglGetError` among the 91 EGL/GLES imports — the display-acquisition symbol name is not in Eclipse's own sources). The live-log evidence (`eglCreateContext` succeeds, only `eglCreateWindowSurface` fails 3003) is consistent with the engine using plain `eglGetDisplay`. Add the platform-display interceptions ONLY if the OWNER live-probe shows the engine took the platform-display path (`eclipse_egl_get_display` never fired, OR 3003 persists with `eglGetDisplay` intercepted): same `EGL_DEFAULT_DISPLAY`→winit `wl_display` mapping on the `(platform, native_display, attribs)` signature, remap `native_display==NULL(0)` when `platform == EGL_PLATFORM_WAYLAND_KHR/EXT (0x31D8)` and `wsi_display()` is `Some`, else delegate unchanged.
+
+  *Regression protection (tied to the root, no new script):* `native_provider::tests::resolve_egl_display_target_maps_default_display_to_winit_wayland_only` is the confirmed-root-cause guard — the pure JVM-free decision: (a) `display_id=0 + wsi=Some(0x5000_1000)` → `0x5000_1000` (the EXACT bug: `EGL_DEFAULT_DISPLAY` on Wayland remaps to the registered winit `wl_display`); (b) `display_id=0 + wsi=None` → `0` (X11/no-Wayland pass-through, preserves X11/NVIDIA); (c) `display_id=0xABCD + wsi=Some(…)` → `0xABCD` (a non-default display is never rewritten); (d) `display_id=0xABCD + wsi=None` → `0xABCD`. `ndk_registry::tests::wsi_display_round_trips_set_and_get` pins the registry round-trip (serialized under the existing `WSI_TEST_LOCK`, RESTORED to `None` at the end so it does not leak into other tests, mirroring `engine_claimed_surface_round_trips_set_and_get`). `native_provider::tests::with_bionic_natives_registers_the_three_implemented_categories` was updated (count 129→130 + descriptive comment) and `"eglGetDisplay"` added to its name-presence list, so a dropped registration or transcription drift fails CI. The host-EGL `dlopen`/`dlsym` delegation + the live tier-0 win over host `libEGL` have NO JVM-free seam (FFI to host Mesa libEGL), so they are OWNER-dev-host-boot validated (same posture as the other render natives); the unit tests pin the decision logic + the registry round-trip.
+
+  *Verification (this tree; the 3 work files — `src/graphics.rs`, `src/loader/native_provider.rs`, `src/loader/ndk_registry.rs`):* `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings (forced recheck via `touch` of the 3 files); `cargo test` **567 passed, 0 failed (561 unit + 0 main + 4 integration `tests/engine_milestones.rs` 0 SKIP + 2 doctests)** — +2 vs Phase 2.1's 565 (the two new unit tests); `cargo build --release` clean (artifact 8,939,368 bytes, grew from Phase 2.1's 8,937,896 by the EGL interception). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); RUNTIME CORRECTNESS — the engine's `eglCreateWindowSurface` SUCCEEDING (no more 3003) and THE FIRST ENGINE FRAME — is confirmed ONLY by the OWNER's dev-host MAIN-LOOP boot (§5 START-HERE; record the laptop log path e.g. `/tmp/eclipse-egldisplay-validate.log`). If `eglCreateWindowSurface` still errors, capture the exact SurfaceController/EGL log lines + whether the engine used `eglGetDisplay` vs `eglGetPlatformDisplay` (log-observation only; do NOT RE the APK/libroblox).*
+
+  *Context7:* Khronos EGL Registry consulted (verified 2026-06-13) — `EGL_KHR_platform_wayland` / `EGL_EXT_platform_wayland` confirm the `EGL_DEFAULT_DISPLAY` → `wl_display_connect(NULL)` (own default-socket connection) semantics that ARE the cross-connection root cause; `khronos-egl-6.0.0` vendored source confirms `DEFAULT_DISPLAY=0` and `EGLDisplay`/`NativeDisplayType = *mut c_void` for the ABI of the tier-0 native and the host-fn transmute.
+
+  *Files:* `src/loader/ndk_registry.rs` (`WSI_DISPLAY` + `set_wsi_display`/`wsi_display` + round-trip test), `src/loader/native_provider.rs` (`resolve_egl_display_target` + `host_egl_get_display` + `eclipse_egl_get_display` + registration + count/name test updates + mapping test), `src/graphics.rs` (`RawDisplayHandle` import + `set_wsi_display` from `resumed`), `AGENTS.md`.
 
 ---
 

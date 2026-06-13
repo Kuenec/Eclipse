@@ -31,7 +31,7 @@ use std::ffi::CStr;
 use std::fmt;
 
 use ash::{khr, vk};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use winit::application::ApplicationHandler;
 use winit::error::{EventLoopError, OsError};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -209,6 +209,25 @@ impl ApplicationHandler for GameWindow<'_> {
                     "no raw window handle; engine WSI publish skipped (geometry-only ANativeWindow)"
                 );
             }
+        }
+
+        // 2026-06-13 — register the winit Wayland `wl_display*` so Eclipse's tier-0 `eglGetDisplay`
+        // (`native_provider::eclipse_egl_get_display`) can remap the engine's `EGL_DEFAULT_DISPLAY` to
+        // THIS connection. The engine resolves `egl*` through host `libEGL.so` and calls
+        // `eglGetDisplay(EGL_DEFAULT_DISPLAY)`, which on Wayland opens Mesa's OWN `wl_display` — a
+        // DIFFERENT connection than the one the `wl_egl_window` Eclipse hands it (above) is on; that
+        // cross-connection is the engine's `eglCreateWindowSurface` `EGL_BAD_ALLOC` 3003. This is the
+        // SAME `wl_display` pointer `egl_engine` uses for `__gl-test-anw` (`d.display.as_ptr()`), so the
+        // engine's remapped EGLDisplay lands on winit's connection. `None` on X11/other (XID is
+        // server-scoped → pass `EGL_DEFAULT_DISPLAY` through). Non-fatal, matching the Phase 1 pattern.
+        match window.display_handle() {
+            Ok(dh) => match dh.as_raw() {
+                RawDisplayHandle::Wayland(d) => {
+                    crate::loader::ndk_registry::set_wsi_display(Some(d.display.as_ptr() as usize));
+                }
+                _ => crate::loader::ndk_registry::set_wsi_display(None),
+            },
+            Err(_) => crate::loader::ndk_registry::set_wsi_display(None),
         }
 
         self.window = Some(window);

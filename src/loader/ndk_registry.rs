@@ -395,6 +395,40 @@ pub fn current_wsi_window() -> Option<usize> {
         .and_then(|v| v.last().map(|(p, _)| *p))
 }
 
+/// 2026-06-13 — the winit Wayland `wl_display*` connection (as a `usize`) the engine's EGLDisplay must
+/// MATCH, or `None` on X11/other.
+///
+/// Why this exists: Roblox's engine resolves `egl*` through the host `libEGL.so` (bionic_env tier 1)
+/// and calls `eglGetDisplay(EGL_DEFAULT_DISPLAY)`. Per the Khronos `EGL_KHR_platform_wayland` /
+/// `EGL_EXT_platform_wayland` registry text, on Wayland `EGL_DEFAULT_DISPLAY` makes EGL open Mesa's
+/// OWN `wl_display` by `wl_display_connect(NULL)` — a DIFFERENT connection than the one `winit` opened
+/// for Eclipse's window. The `ANativeWindow*` Eclipse hands the engine ([`current_wsi_window`]) wraps a
+/// `wl_egl_window*` on `winit`'s `wl_surface`; `eglCreateWindowSurface` requires the EGLDisplay's
+/// `wl_display` and the `wl_egl_window`'s `wl_surface` to be on the SAME connection — crossing them is
+/// `EGL_BAD_ALLOC` (3003). Eclipse intercepts `eglGetDisplay` (tier-0 native) and remaps
+/// `EGL_DEFAULT_DISPLAY` to THIS pointer so the engine's EGLDisplay lands on `winit`'s connection —
+/// identical to what `egl_engine` does for `__gl-test-anw`. `None` on X11/other: an X11 window XID is
+/// server-scoped (not connection-scoped the same way), so passing `EGL_DEFAULT_DISPLAY` through is
+/// correct there. Stores only the pointer VALUE as `usize` (this module is `#![forbid(unsafe_code)]`),
+/// exactly like [`WSI_WINDOWS`] stores the native-window pointer.
+static WSI_DISPLAY: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Record the winit Wayland `wl_display*` (as a `usize`), or `None` on X11/other (see [`WSI_DISPLAY`]).
+/// Called by `graphics::run_windowed`'s `resumed` once it has the winit window's display handle. A
+/// poisoned lock is ignored (best-effort; never panics — AGENTS.md §2.8).
+pub fn set_wsi_display(display: Option<usize>) {
+    if let Ok(mut d) = WSI_DISPLAY.lock() {
+        *d = display;
+    }
+}
+
+/// The registered winit Wayland `wl_display*` (as a `usize`), or `None` on X11/other or before
+/// `resumed` registered it (see [`WSI_DISPLAY`]). The tier-0 `eglGetDisplay` native reads this to
+/// remap `EGL_DEFAULT_DISPLAY` to winit's connection. Poisoned lock → `None`.
+pub fn wsi_display() -> Option<usize> {
+    WSI_DISPLAY.lock().ok().and_then(|d| *d)
+}
+
 /// 2026-06-13 — render Phase 2.1 present-loop handoff CONFIRMATION signal: set `true` the first time the
 /// engine actually PULLS the real WSI surface, i.e. `ANativeWindow_fromSurface`
 /// ([`super::native_provider::eclipse_anativewindow_fromsurface`]) returns the real WSI pointer (its
@@ -672,6 +706,28 @@ mod tests {
         // Restore the boot-initial state so the live boot's first-tick read still sees `false`.
         set_engine_claimed_surface(false);
         assert!(!engine_claimed_surface(), "the flag clears back to false");
+    }
+
+    #[test]
+    fn wsi_display_round_trips_set_and_get() {
+        // 2026-06-13: the winit wl_display connection the engine's EGLDisplay must match. set_wsi_display
+        // round-trips through wsi_display; Some(ptr) on Wayland, None on X11/other. Serialized under
+        // WSI_TEST_LOCK and RESTORED to None at the end so it does not leak the registered display into
+        // other tests in this binary (same discipline as engine_claimed_surface_round_trips_set_and_get).
+        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p: usize = 0x5000_1000;
+        set_wsi_display(Some(p));
+        assert_eq!(
+            wsi_display(),
+            Some(p),
+            "a registered Wayland wl_display round-trips through wsi_display"
+        );
+        set_wsi_display(None);
+        assert_eq!(
+            wsi_display(),
+            None,
+            "clearing to None (X11/other) is observed by wsi_display"
+        );
     }
 
     #[test]
