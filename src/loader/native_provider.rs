@@ -3876,6 +3876,11 @@ unsafe extern "C" fn eclipse_anativewindow_fromsurface(
     // Preferred: the real WSI handle host EGL accepts — what the engine will pass to its own
     // eglCreateWindowSurface to present to Eclipse's window.
     if let Some(p) = ndk_registry::current_wsi_window() {
+        // 2026-06-13 — render Phase 2 present-loop handoff: the engine has now PULLED the real WSI
+        // surface (it called fromSurface and got the real WSI pointer, not the geometry-only
+        // fallback). Signal the winit loop to release Eclipse's VulkanRenderer so the engine's own
+        // EGL window surface owns the surface alone (two producers must not share one wl_surface).
+        ndk_registry::set_engine_claimed_surface(true);
         return p as *mut c_void;
     }
     // Fallback (window not built yet): a sound geometry-only handle from the slab.

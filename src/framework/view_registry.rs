@@ -406,6 +406,26 @@ pub fn active_root() -> ViewHandle {
     ACTIVE_ROOT.load(Ordering::Acquire)
 }
 
+/// 2026-06-13: find the live view whose recorded [`ViewState::class_name`] equals `name`, returning
+/// its [`ViewHandle`], or `None` if no live slot matches (or the registry mutex is poisoned).
+///
+/// The render Phase 2 surface-lifecycle dispatch uses this to locate the engine's `SurfaceView` peer
+/// by its concrete class `com.roblox.client.RBXSurfaceView` (captured into the slab by
+/// `view_native_constructor` via [`set_jobject`] + [`ViewState::class_name`]) so it can JNI-dispatch
+/// `surfaceCreated`/`surfaceChanged` to it. Scans the slab under the registry lock and returns the
+/// first live (occupied) match in slot order; on the live boot there is exactly one such peer.
+pub fn find_by_class(name: &str) -> Option<ViewHandle> {
+    let reg = lock().ok()?;
+    for (index, slot) in reg.slots.iter().enumerate() {
+        if let Some(state) = slot.state.as_ref() {
+            if state.class_name == name {
+                return Some(pack(index as u32, slot.generation));
+            }
+        }
+    }
+    None
+}
+
 /// A flattened, owned snapshot of one view in the recorded tree — what the renderer reads per frame.
 ///
 /// 2026-06-05: a depth-first, owned copy (no registry handles / locks held by the renderer) so the
@@ -625,6 +645,46 @@ mod tests {
             let handle = pack(index, generation);
             assert_eq!(unpack(handle), (index, generation));
         }
+    }
+
+    #[test]
+    fn find_by_class_locates_the_right_handle_and_is_none_for_absent_class() {
+        // 2026-06-13: the render Phase 2 lookup the surface-lifecycle dispatch uses to locate the
+        // RBXSurfaceView peer by class. Two distinct live entries: find_by_class must return the
+        // handle whose recorded class_name matches, and None for a class no live slot carries.
+        //
+        // The class strings here are UNIQUE to this test (the `eclipse.test.FindByClass*` namespace
+        // is allocated by no other test or production code) so that `find_by_class` — which returns
+        // the FIRST live match in slot order — cannot be aliased to a sibling test's live entry under
+        // parallel execution. (Using real production class names like RBXSurfaceView/FrameLayout
+        // collided with concurrent tests sharing the process-global slab.) The guard's intent is
+        // unchanged: prove class discrimination, liveness filtering, and None-for-absent.
+        let surface =
+            allocate("eclipse.test.FindByClassSurface").expect("allocate first test peer");
+        let other = allocate("eclipse.test.FindByClassOther").expect("allocate second test peer");
+        assert_eq!(
+            find_by_class("eclipse.test.FindByClassSurface"),
+            Some(surface),
+            "find_by_class returns the handle of the matching live entry"
+        );
+        assert_eq!(
+            find_by_class("eclipse.test.FindByClassOther"),
+            Some(other),
+            "find_by_class distinguishes the second class"
+        );
+        assert_eq!(
+            find_by_class("eclipse.test.FindByClassNone"),
+            None,
+            "an absent class yields None, never a wrong/aliased handle"
+        );
+        // After freeing the match, the class is no longer found (only live slots are scanned).
+        free(surface).expect("free first test peer");
+        assert_eq!(
+            find_by_class("eclipse.test.FindByClassSurface"),
+            None,
+            "a freed entry is not returned by find_by_class"
+        );
+        free(other).expect("free second test peer");
     }
 
     // 2026-06-05: the snapshot walk the renderer reads each frame. These tests exercise it against

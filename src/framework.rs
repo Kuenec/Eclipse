@@ -6631,6 +6631,12 @@ const TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG: &JNIStr = jni_str!("(I)V");
 const VIEW_WIDGET_FIELD_NAME: &JNIStr = jni_str!("widget");
 const VIEW_WIDGET_FIELD_SIG: &JNIStr = jni_str!("J");
 
+/// 2026-06-13: descriptor of `SurfaceView.mCallbacks` — the `final ArrayList<SurfaceHolder.Callback>`
+/// field (`vendor/atl/.../android/view/SurfaceView.java:13`) the render Phase 2 surface-lifecycle
+/// gate reads via `get_field` to check the engine has subscribed its `SurfaceHolder.Callback` before
+/// dispatching `surfaceCreated`/`surfaceChanged`.
+const ARRAY_LIST_SIG: &JNIStr = jni_str!("Ljava/util/ArrayList;");
+
 /// `TextView.native_setText(String text)` → record the text on the receiver's [`view_registry`] peer
 /// (2026-06-05).
 ///
@@ -9591,6 +9597,146 @@ fn touch_view(
     }
 }
 
+/// The concrete class of Roblox's engine `SurfaceView` peer, captured into [`view_registry`] by
+/// [`view_native_constructor`] (via [`view_registry::find_by_class`]). The engine's `AndroidGLView`
+/// subscribes to this view's `SurfaceHolder` (`getHolder().addCallback(...)`), so its `mCallbacks`
+/// list becomes non-empty once it has registered — the gate for dispatching the surface lifecycle.
+const RBX_SURFACE_VIEW_CLASS: &str = "com.roblox.client.RBXSurfaceView";
+
+/// The window pixel format Eclipse passes as `SurfaceView.surfaceChanged(format, w, h)`'s `format`.
+/// 2026-06-13: `WINDOW_FORMAT_RGBA_8888 = 1` — the public Android `PixelFormat.RGBA_8888` value, the
+/// RGBA8888 config Eclipse's window/engine render path is built on (the same constant
+/// `native_provider::eclipse_anativewindow_getformat` reports for the real WSI window).
+const WINDOW_FORMAT_RGBA_8888: jint = 1;
+
+/// Render Phase 2 — JNI-dispatch the `SurfaceView` surface lifecycle to the engine's
+/// `SurfaceHolder.Callback`s: `surfaceCreated()` then `surfaceChanged(format, width, height)`, so the
+/// engine's `AndroidGLView` pulls Eclipse's published `ANativeWindow` and begins rendering into it.
+///
+/// 2026-06-13: the production driver for the engine's render path. Eclipse's vendored `SurfaceView`
+/// (`vendor/atl/.../android/view/SurfaceView.java`) has `private surfaceCreated()`/`surfaceChanged(int,
+/// int,int)` that fan a `SurfaceHolder` lifecycle out to each subscribed callback, but NOTHING in ATL
+/// calls them — the native must. A JNI `call_method` bypasses Java private-access checks.
+///
+/// SELF-GATED (the prior abort's lesson — never blank the window prematurely): the engine subscribes
+/// its `AndroidGLView` callback via `getHolder().addCallback(...)` only after it is ready, so this
+/// reads the `SurfaceView` `mCallbacks` `ArrayList` (`get_field` of `Ljava/util/ArrayList;`, then
+/// `size()I`) and dispatches ONLY when it is non-empty — returning `Ok(false)` (retry next tick) while
+/// it is still empty. Returns `Ok(true)` once the lifecycle was dispatched.
+///
+/// Mirrors [`dispatch_touch_to_view`]'s soundness: the held VM's `*mut JavaVM` is null-guarded before
+/// [`JavaVM::from_raw`], the main thread is attached (the `&Vm` borrow keeps it alive + pins us), the
+/// JNI work is `catch_unwind`-guarded so a Rust panic can never unwind into ART's C++ (`panic =
+/// "abort"`, §2.8), and every JNI call routes through [`checked`] (a thrown Java exception is
+/// described + cleared into a typed [`FrameworkError::Jni`], never left pending).
+///
+/// Returns `Ok(true)` if the lifecycle was dispatched this call; `Ok(false)` if no `RBXSurfaceView`
+/// peer is recorded yet OR its callback list is still empty (retry next tick); a typed `Err` on a
+/// VM/JNI/Java error.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
+/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn dispatch_surface_lifecycle(
+    vm: &Vm,
+    width: i32,
+    height: i32,
+) -> Result<bool, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
+    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
+    // process VM singleton (idempotent across calls), same as `dispatch_touch_to_view`.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| surface_lifecycle(env, width, height))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Locate the `RBXSurfaceView` peer, gate on its non-empty `mCallbacks`, and (when gated open)
+/// dispatch `surfaceCreated()` then `surfaceChanged(format, width, height)` on the real Java object.
+/// See [`dispatch_surface_lifecycle`] for the contract. Returns `Ok(false)` (retry) when no peer is
+/// recorded yet or the callback list is still empty; `Ok(true)` once dispatched.
+fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, FrameworkError> {
+    // (a) Locate the engine's SurfaceView peer by its concrete class. None → not constructed yet.
+    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+        return Ok(false);
+    };
+
+    // Hold the registry lock only across the JNI dispatch on the recorded global ref (the closure
+    // makes JNI calls but never re-enters the registry), honoring `with_jobject`'s contract.
+    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
+        let surface_view = global.as_obj();
+
+        // (b) SELF-GATE: read the SurfaceView `mCallbacks` ArrayList and check it is non-empty. The
+        // engine registers its AndroidGLView SurfaceHolder.Callback via getHolder().addCallback(...);
+        // until then the list is empty and dispatching would fan out to nobody — retry next tick.
+        // SAFETY: "Ljava/util/ArrayList;" paired with JavaType::Object is consistent
+        // (FieldSignature::from_raw_parts' invariant); `mCallbacks` is a `final ArrayList` field of
+        // android.view.SurfaceView (SurfaceView.java:13), the receiver's runtime supertype, so the
+        // read is type-correct. JNI reads private/package fields (no Java access check).
+        let callbacks_sig =
+            unsafe { FieldSignature::from_raw_parts(ARRAY_LIST_SIG, JavaType::Object) };
+        let callbacks = checked(env, "SurfaceView.mCallbacks get_field", |env| {
+            env.get_field(surface_view, jni_str!("mCallbacks"), &callbacks_sig)?
+                .l()
+        })?;
+        let size = checked(env, "SurfaceView.mCallbacks.size", |env| {
+            env.call_method(&callbacks, jni_str!("size"), jni_sig!("()I"), &[])?
+                .i()
+        })?;
+        if size <= 0 {
+            // Engine has not subscribed its SurfaceHolder.Callback yet — do NOT dispatch into an
+            // empty callback list; retry next tick.
+            return Ok(false);
+        }
+
+        // (c) DISPATCH the lifecycle on the real Java object: surfaceCreated() BEFORE
+        // surfaceChanged(format, w, h), per the AOSP SurfaceHolder.Callback contract. Both are
+        // `private` on SurfaceView; the JNI call bypasses Java access checks.
+        checked(env, "SurfaceView.surfaceCreated", |env| {
+            env.call_method(
+                surface_view,
+                jni_str!("surfaceCreated"),
+                jni_sig!("()V"),
+                &[],
+            )?
+            .v()
+        })?;
+        checked(env, "SurfaceView.surfaceChanged", |env| {
+            env.call_method(
+                surface_view,
+                jni_str!("surfaceChanged"),
+                jni_sig!("(III)V"),
+                &[
+                    JValue::Int(WINDOW_FORMAT_RGBA_8888),
+                    JValue::Int(width),
+                    JValue::Int(height),
+                ],
+            )?
+            .v()
+        })?;
+        Ok(true)
+    });
+
+    match result {
+        Ok(Some(inner)) => inner,
+        // Valid handle but no recorded jobject: the peer is non-dispatchable — retry (the live boot
+        // captures the global ref in view_native_constructor, so this is transient at worst).
+        Ok(None) => Ok(false),
+        // Stale/fabricated handle or poisoned lock: nothing to dispatch this tick (logged, not fatal).
+        Err(e) => {
+            tracing::debug!(handle, error = %e, "dispatch_surface_lifecycle: peer not dispatchable (retry)");
+            Ok(false)
+        }
+    }
+}
+
 /// A view that should have its `onDraw(Canvas)` driven: its [`view_registry`] handle and the pixel
 /// size of its laid-out rect (the [`canvas_registry`] Pixmap is allocated at this size).
 ///
@@ -11541,6 +11687,16 @@ mod tests {
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
+        // 2026-06-13 — render Phase 2 surface-lifecycle dispatch (dispatch_surface_lifecycle). These
+        // pin the EXACT strings the JNI dispatch transcribes from the vendored SurfaceView.java so a
+        // typo would fail in the harness, not silently no-op (empty mCallbacks read) or NoSuchMethod
+        // on the live boot. mCallbacks: `final ArrayList<...>` (SurfaceView.java:13);
+        // surfaceCreated()V (line 33), surfaceChanged(int,int,int)V (line 27) — both private, reached
+        // via JNI call_method (bypasses Java access). RBXSurfaceView is the concrete peer class
+        // view_native_constructor records; the format is PixelFormat.RGBA_8888 (1).
+        assert_eq!(ARRAY_LIST_SIG.to_str(), "Ljava/util/ArrayList;");
+        assert_eq!(RBX_SURFACE_VIEW_CLASS, "com.roblox.client.RBXSurfaceView");
+        assert_eq!(WINDOW_FORMAT_RGBA_8888, 1);
         // TextView re-declares native_constructor (same signature); pin its class internal name.
         assert_eq!(TEXT_VIEW_CLASS.to_str(), "android/widget/TextView");
         // TextView.native_setText: TextView.java line 111 → instance `(Ljava/lang/String;)V`.
