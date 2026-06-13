@@ -395,6 +395,29 @@ pub fn current_wsi_window() -> Option<usize> {
         .and_then(|v| v.last().map(|(p, _)| *p))
 }
 
+/// 2026-06-13 — render Phase 2 present-loop handoff signal: set `true` the first time the engine
+/// actually PULLS the real WSI surface, i.e. `ANativeWindow_fromSurface`
+/// ([`super::native_provider::eclipse_anativewindow_fromsurface`]) returns the real WSI pointer (its
+/// `current_wsi_window().is_some()` branch — NOT the geometry-only fallback). The winit loop reads
+/// [`engine_claimed_surface`] each tick: once `true`, Eclipse DROPS its `VulkanRenderer` (whose `Drop`
+/// releases the `wl_surface`/`VkSurfaceKHR`) so the engine's own EGL window surface owns the surface
+/// alone — two producers must never share one `wl_surface`. Lock-free (a single atomic), so the render
+/// native and the winit loop never contend a mutex on this hot signal.
+static ENGINE_CLAIMED_SURFACE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the engine has pulled the real WSI surface (see [`ENGINE_CLAIMED_SURFACE`]). Called by
+/// `eclipse_anativewindow_fromsurface` when it returns the real WSI pointer.
+pub fn set_engine_claimed_surface(claimed: bool) {
+    ENGINE_CLAIMED_SURFACE.store(claimed, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether the engine has pulled the real WSI surface yet (see [`ENGINE_CLAIMED_SURFACE`]). The winit
+/// loop reads this to trigger the present-loop handoff (drop Eclipse's renderer) exactly once.
+pub fn engine_claimed_surface() -> bool {
+    ENGINE_CLAIMED_SURFACE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The process-global `AAssetManager*` slab.
 pub fn asset_managers() -> &'static Slab<AssetManagerState> {
     static S: Slab<AssetManagerState> = Slab::new();
@@ -623,6 +646,27 @@ mod tests {
             "zero geometry clamps to 1×1"
         );
         unregister_wsi_window(p);
+    }
+
+    #[test]
+    fn engine_claimed_surface_round_trips_set_and_get() {
+        // 2026-06-13: the render Phase 2 present-loop handoff signal. set_engine_claimed_surface
+        // toggles the flag engine_claimed_surface reads. Serialized under WSI_TEST_LOCK and restored
+        // to the boot-initial `false` at the end so it does not leak into other tests in this binary.
+        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_engine_claimed_surface(false);
+        assert!(
+            !engine_claimed_surface(),
+            "the flag starts (and is restorable to) false"
+        );
+        set_engine_claimed_surface(true);
+        assert!(
+            engine_claimed_surface(),
+            "set_engine_claimed_surface(true) is observed by engine_claimed_surface()"
+        );
+        // Restore the boot-initial state so the live boot's first-tick read still sees `false`.
+        set_engine_claimed_surface(false);
+        assert!(!engine_claimed_surface(), "the flag clears back to false");
     }
 
     #[test]

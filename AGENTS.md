@@ -128,10 +128,64 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🖼️ RENDER PHASE 2 SHIPPED: self-gated `surfaceCreated`/`surfaceChanged` dispatch to the engine's
+  `RBXSurfaceView` + renderer-DROP present-loop handoff triggered when the engine pulls the surface. ⇐ START HERE NEXT
+  SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Phase 1 published Eclipse's real WSI window as the engine
+  `ANativeWindow*`, but the engine does NOT call `fromSurface`/`surfaceCreated` on its own (Phase 1 live-confirmed ZERO
+  such log lines). Phase 2 drives the engine to pull that surface and renders into it, and corrects the prior attempt's
+  abort (going merely QUIESCENT left TWO owners of one `wl_surface`) by RELEASING the renderer instead. What it does, in 4
+  steps: **(1)** `view_registry::find_by_class(name) -> Option<ViewHandle>` scans the slab for the live entry whose
+  recorded `class_name` matches and returns its handle (used to locate the `RBXSurfaceView` peer). **(2)**
+  `framework::dispatch_surface_lifecycle(vm, w, h) -> Result<bool>` (modeled on `dispatch_touch_to_view`: null-guarded
+  `JavaVM::from_raw`, `attach_current_thread`, `catch_unwind`, inner `surface_lifecycle`): locates the peer via
+  `find_by_class("com.roblox.client.RBXSurfaceView")` (None → `Ok(false)`); SELF-GATES by reading the `SurfaceView`
+  `mCallbacks` `ArrayList` field (`Ljava/util/ArrayList;`) via JNI `get_field` then `size()I` — returns `Ok(false)` while
+  empty (the engine has not subscribed its `AndroidGLView` `SurfaceHolder.Callback` yet, retry next tick, never blank the
+  window prematurely); when non-empty, JNI-dispatches private `surfaceCreated()V` THEN `surfaceChanged(III)V`
+  (`WINDOW_FORMAT_RGBA_8888=1`, w, h) per the AOSP contract and returns `Ok(true)`. Every JNI call routes through
+  `checked` (a thrown exception is described + cleared + returned typed, never left pending). **(3)**
+  `native_provider::eclipse_anativewindow_fromsurface` sets `ndk_registry::set_engine_claimed_surface(true)` in the
+  REAL-WSI-pointer branch ONLY (NOT the geometry-only fallback) — the engine actually pulling the surface is the handoff
+  trigger. **(4)** `graphics.rs`: `GameWindow` gains `surface_dispatched`/`handed_off` (both false). In `about_to_wait`,
+  after `pump_main_looper`: if `!surface_dispatched && engine_window.is_some()`, call `dispatch_surface_lifecycle` with
+  geometry from `engine_window_geometry().unwrap_or((1,1))` (`Ok(true)` sets the flag + logs; `Ok(false)` retries; `Err`
+  warns + retries); separately, if `!handed_off && engine_claimed_surface()`, set `self.renderer = None` to DROP the
+  `VulkanRenderer` (its `Drop` runs `device_wait_idle` → `destroy_swapchain` → `destroy_surface`, truly RELEASING the
+  `wl_surface`/`VkSurfaceKHR`), set `handed_off`, switch to `ControlFlow::Poll`, and log the handoff. The
+  `RedrawRequested` `Some(renderer)` guard then stops Eclipse drawing/re-arming `request_redraw`; the main `Looper` keeps
+  pumping so the engine runs on. **OWNER LIVE-VALIDATION — START HERE NEXT SESSION (dev-host MAIN LOOP, EXIT=124 clean):**
+  if `~/.cache/eclipse` was wiped or the overlay touched, rebuild the overlay FIRST with
+  `tools/framework-overlay/patch-framework.sh` (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`;
+  `vendor/toolchain/smali/` must hold the smali 2.5.2 jars), then `cargo run -- run <APK>` on the process MAIN thread (NOT
+  `cargo test` — ART aborts off-main-thread). Look for, in order: (1) the dispatch log `engine SurfaceView lifecycle
+  dispatched (surfaceCreated + surfaceChanged); engine should now pull Eclipse's ANativeWindow width=<w> height=<h>` —
+  fires exactly once, only once the engine's `AndroidGLView` callback registered (`mCallbacks` non-empty); before that
+  `about_to_wait` silently retries each tick (the window is never blanked early); (2) the engine then calling
+  `ANativeWindow_fromSurface` (sets `engine_claimed_surface`) and `eglCreateWindowSurface`; (3) the handoff log `engine
+  claimed the surface; Eclipse released its Vulkan renderer (present-loop handoff)` — fires exactly once; (4) THE FIRST
+  ENGINE FRAME in the window (engine frames, NOT Eclipse's clear-and-present). Watch for: NO `engine SurfaceView lifecycle
+  dispatch failed` warn (a described+cleared JNI/Java exception) and NO double-dispatch (both flags are one-shot). If the
+  dispatch logs but the engine does NOT then call `fromSurface` (no handoff log), the gate read of `mCallbacks` fired but
+  the engine's callback path differs — capture that exact log as the next forensics signal (log-observation only; do NOT
+  RE the APK/libroblox). If dispatch never fires, the `RBXSurfaceView` peer may not be captured under
+  `com.roblox.client.RBXSurfaceView` — confirm via the `View.native_constructor` debug log for that class. If the engine
+  renders but the handoff has a runtime issue (timing/race/blank), capture the exact log and describe for the next
+  iteration. RUNTIME CORRECTNESS (does the engine render) is confirmed ONLY by this live boot. Gate (only the 5 work files
+  changed — `src/framework.rs`, `src/framework/view_registry.rs`, `src/graphics.rs`, `src/loader/native_provider.rs`,
+  `src/loader/ndk_registry.rs`): `cargo fmt --all -- --check` clean, `cargo build --all-targets` 0 warn, `cargo clippy
+  --all-targets --all-features -- -D warnings` 0 warn (forced recheck via `touch` of all 5 files), `cargo test` **559 unit
+  (+2: `find_by_class_locates_the_right_handle_and_is_none_for_absent_class` + `engine_claimed_surface_round_trips_set_and_get`)
+  + 0 main-bin + 4 integration (0 SKIP) + 2 doctests = 565 passed, 0 failed**, `cargo build --release` clean (artifact
+  8,926,184 bytes, grew from 8,913,704 by the Phase 2 dispatch + handoff wiring). Regression guards: the two new pins +
+  the `view_native_names_sigs_and_class_match_view_java` pin extended with `ARRAY_LIST_SIG`/`RBX_SURFACE_VIEW_CLASS`/
+  `WINDOW_FORMAT_RGBA_8888` (a transcription drift in any load-bearing string/value fails CI instead of silently no-op-ing
+  or `NoSuchMethod`-ing the live boot). Detail: §6 (2026-06-13 render Phase 2 entry).
 - **2026-06-13 — 🖼️ RENDER PHASE 1 DONE: Eclipse's REAL winit-window WSI handle is published as the engine's
   `ANativeWindow*` — `ANativeWindow_fromSurface` now returns Eclipse's actual window (live-confirmed, EXIT=124 clean) —
-  but the engine does NOT yet render because it does not call `fromSurface`/`surfaceCreated` on its own. ⇐ START HERE
-  NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Phase 1 (the safe first increment of the
+  but the engine does NOT yet render because it does not call `fromSurface`/`surfaceCreated` on its own. [START-HERE
+  marker moved 2026-06-13 to the RENDER PHASE 2 entry at the TOP of §5 — Phase 1's WSI publish HOLDS (live-confirmed); the
+  Phase 2 dispatch + handoff this entry flagged as NEXT TASK is now SHIPPED by that top entry and awaits OWNER live
+  validation.]** Phase 1 (the safe first increment of the
   render-integration plan; production-side mirror of the proven `__gl-test-anw` harness) wires Eclipse's real WSI
   window into the engine ANativeWindow path: `GameWindow` gains an `engine_window: Option<egl_engine::EngineNativeWindow>`
   drop-guard; `resumed`, right after creating the winit window, reads its window/display handle + `inner_size`, calls
@@ -3267,6 +3321,28 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Context7:* not used — no external library/API surface changed; this is the production-side wiring of Eclipse's own already-proven `egl_engine` / `ndk_registry` WSI APIs (the same ones the `__gl-test-anw` harness exercises), against the project's own `winit` `window_handle()`/`raw-window-handle` integration already imported in `graphics.rs`.
 
   *Files:* `src/graphics.rs` (the `engine_window` field, the `resumed` WSI publish, the `Resized` re-publish + `publish_engine_window_geometry` helper, and the new pin test), `AGENTS.md`.
+
+---
+
+### 2026-06-13 — 🖼️ Render Phase 2: self-gated `surfaceCreated`/`surfaceChanged` dispatch into the engine's `RBXSurfaceView` + a renderer-DROP present-loop handoff triggered when the engine pulls the surface (RELEASE, not quiesce — the prior abort's lesson)
+
+  *Context / goal:* Phase 1 (entry above) published Eclipse's real winit-window WSI handle as the engine `ANativeWindow*` and LIVE-CONFIRMED the crucial observation: with the window published but no `surfaceCreated` dispatch, the engine does NOT call `ANativeWindow_fromSurface`/`surfaceCreated` on its own (ZERO such log lines). So the engine will not pull the surface until told to. Phase 2 is the next increment of the render-integration plan: drive the engine to pull Eclipse's published surface and render into it, then hand the surface off cleanly. Confined to the 5 owned files; no overlay, no external API surface.
+
+  *Recorded forensics this builds on (first-party — Eclipse's own source + log observation, NOT RE):* the vendored `vendor/atl/src/api-impl/android/view/SurfaceView.java` has `final ArrayList<SurfaceHolder.Callback> mCallbacks` (line 13; descriptor `Ljava/util/ArrayList;`), and `private void surfaceCreated()` (line 33, `()V`) / `private void surfaceChanged(int format, int width, int height)` (line 27, `(III)V`) — both PRIVATE, each fanning the lifecycle out to every subscribed callback, with NO Java caller anywhere in ATL. The engine's `AndroidGLView` subscribes via `getHolder().addCallback(...)`, which appends to `mCallbacks` (line 61-66), so `mCallbacks` becomes non-empty once it has registered. `view_native_constructor` captures the `RBXSurfaceView` peer as a `Global<JObject>` (`set_jobject`) and records its concrete class via `getClass().getName()` (`view_class_name`), i.e. the dot-form FQN `com.roblox.client.RBXSurfaceView`. A JNI `call_method` bypasses Java private-access checks.
+
+  *What it does (the 4 spec steps):* **(1)** `view_registry::find_by_class(name) -> Option<ViewHandle>` (next to `active_root`): scans `reg.slots` under the registry lock, returns `pack(index, generation)` of the first LIVE (occupied) slot whose `state.class_name == name`, else `None`. **(2)** `framework::dispatch_surface_lifecycle(vm, w, h) -> Result<bool, FrameworkError>`, modeled exactly on `dispatch_touch_to_view`: null-guarded `JavaVM::from_raw` (SAFETY mirrors the touch path), `attach_current_thread`, `catch_unwind(AssertUnwindSafe(...))` over an inner `surface_lifecycle`. `surface_lifecycle`: (a) `find_by_class("com.roblox.client.RBXSurfaceView")` → `None` returns `Ok(false)`; (b) SELF-GATE via `with_jobject` — `get_field(surface_view, "mCallbacks", FieldSignature::from_raw_parts("Ljava/util/ArrayList;", JavaType::Object)).l()` then `call_method(callbacks, "size", "()I").i()`; `size <= 0` returns `Ok(false)` (engine has not subscribed yet — do NOT dispatch into an empty list, retry next tick so the window is never blanked prematurely); (c) when non-empty, `call_method surfaceCreated ()V` THEN `call_method surfaceChanged (III)V` with `[WINDOW_FORMAT_RGBA_8888, width, height]` (surfaceCreated BEFORE surfaceChanged per the AOSP `SurfaceHolder.Callback` contract), returns `Ok(true)`. Every JNI call routes through `checked` (a thrown Java exception is `exception_describe` + `exception_clear`ed and returned as typed `FrameworkError::Jni`, never left pending). The `with_jobject` result is flattened exactly like `touch_view`: `Ok(Some(inner)) => inner` (propagating a JNI `Err` as `Err`), `Ok(None) => Ok(false)`, `Err(registry) => Ok(false)` (logged debug). **(3)** `native_provider::eclipse_anativewindow_fromsurface` calls `ndk_registry::set_engine_claimed_surface(true)` inside the `current_wsi_window().is_some()` REAL-WSI-pointer branch ONLY (NOT the geometry-only fallback) — the engine actually pulling the real surface is the handoff trigger; backed by a new lock-free `static ENGINE_CLAIMED_SURFACE: AtomicBool` + `set_engine_claimed_surface`/`engine_claimed_surface` (Release/Acquire) in `ndk_registry`. **(4)** `graphics.rs`: `GameWindow` gains `surface_dispatched`/`handed_off` (both `false`). In `about_to_wait`, after the unconditional `pump_main_looper`: if `!surface_dispatched && engine_window.is_some()`, call `dispatch_surface_lifecycle(vm, w, h)` with `(w,h)` from `engine_window_geometry().unwrap_or((1,1))` — `Ok(true)` sets the flag + logs, `Ok(false)` retries, `Err` warns + retries; separately, if `!handed_off && engine_claimed_surface()`, set `self.renderer = None` to DROP the `VulkanRenderer`, set `handed_off`, `set_control_flow(ControlFlow::Poll)`, log the handoff.
+
+  *Why DROP, not quiesce (the prior abort's lesson — and why this is a root-cause design, not a workaround):* the engine renders into the SAME `wl_surface`/`VkSurfaceKHR` once it claims Eclipse's published `ANativeWindow`. Two producers (Eclipse's Vulkan present loop + the engine's EGL window surface) must NOT share one `wl_surface` — that is the resource conflict. The prior attempt went merely QUIESCENT (stopped drawing but kept the `VulkanRenderer` alive), leaving TWO live owners of the one surface, which blocked. The correct fix is to RELEASE: `self.renderer = None` runs `VulkanRenderer::Drop` (`device_wait_idle` → `destroy_swapchain` → `destroy_surface(self.surface)` — verified at `graphics.rs` Drop), so the engine's own EGL window surface owns the `wl_surface` alone. `self.window` (the `wl_surface` owner) and `self.engine_window` (the `wl_egl_window` built on it in `resumed`) are NOT dropped — only the renderer is nulled — so after handoff the engine's surface still has its backing window. The `RedrawRequested` `Some(renderer)` guard then stops Eclipse drawing/re-arming `request_redraw`; `ControlFlow::Poll` keeps `about_to_wait` ticking so the main `Looper` keeps pumping and the engine runs on.
+
+  *Same-pattern audit:* `surfaceCreated`/`surfaceChanged` are dispatched ONLY from the new `surface_lifecycle` (confirmed: SurfaceView.java has them private with no Java caller, so this native dispatch is the sole driver — no competing/duplicate path). `set_engine_claimed_surface(true)` is in exactly one production place (the real-WSI branch of `fromSurface`); the geometry-only fallback never sets it. `self.renderer = None` appears once, only in the handoff arm; there is no other renderer-drop and no quiescent early-return that keeps the renderer alive (the prior abort's bug is not present). `find_by_class` is the only new slab-scan-by-class helper. Phase 1's WSI-publish callers are unchanged and already audited.
+
+  *Regression protection (tied to the root, no new script):* (1) `view_registry::tests::find_by_class_locates_the_right_handle_and_is_none_for_absent_class` — two live slab entries in a unique `eclipse.test.FindByClass*` namespace (so a parallel test sharing the process-global slab cannot alias the result), asserts the right handle per class, `None` for an absent class, and `None` after the match is freed (proves class discrimination + liveness filtering). (2) `ndk_registry::tests::engine_claimed_surface_round_trips_set_and_get` — set/get the flag, serialized under `WSI_TEST_LOCK`, restored to the boot-initial `false` so the live boot's first-tick read is unaffected. (3) `framework::tests::view_native_names_sigs_and_class_match_view_java` extended with `ARRAY_LIST_SIG == "Ljava/util/ArrayList;"`, `RBX_SURFACE_VIEW_CLASS == "com.roblox.client.RBXSurfaceView"`, `WINDOW_FORMAT_RGBA_8888 == 1` — a transcription drift in any load-bearing string/value (the `mCallbacks` descriptor, the peer class, or the format) fails CI instead of silently no-op-ing (empty `mCallbacks` read) or `NoSuchMethod`-ing the live boot. The surface dispatch and the render itself are owner-live-boot-validated (ART cannot run under `cargo test`).
+
+  *Verification (this tree; the 5 work files):* `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings (forced recheck via `touch` of all 5 changed files); `cargo test` **559 unit (+2: the two new pins) + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 565 passed, 0 failed**; `cargo build --release` clean (artifact 8,926,184 bytes, grew from 8,913,704 by the Phase 2 dispatch + handoff wiring). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); RUNTIME CORRECTNESS — the engine actually rendering into Eclipse's window — is confirmed ONLY by the OWNER's dev-host MAIN-LOOP boot (§5 START-HERE): the surfaceCreated/Changed dispatch log → the engine calling `fromSurface`/`eglCreateWindowSurface` → the renderer-released handoff log → THE FIRST ENGINE FRAME. If the dispatch logs but no handoff follows, capture that as the next forensics signal (log-observation only; do NOT RE the APK/libroblox).*
+
+  *Context7:* not used — the `jni` crate here is 0.22.4 with a project-specific `Env`/`Global` API (NOT upstream `JNIEnv`/`GlobalRef`); the authoritative source is the project's own code (the `dispatch_touch_to_view` model, the `get_field` + `FieldSignature::from_raw_parts(_, JavaType::Object)` precedent at `framework.rs`, `checked`'s exception discipline, `with_jobject`'s `Result<Option<R>>` contract) plus the vendored `SurfaceView.java`. `winit` 0.30's `ActiveEventLoop::set_control_flow(ControlFlow::Poll)` and the `jni`-0.22.4 `JValueOwned` accessors (`.l()`/`.i()`/`.v()`) were confirmed by reading the vendored crate sources, not from memory.
+
+  *Files:* `src/framework/view_registry.rs` (`find_by_class` + its test), `src/loader/ndk_registry.rs` (`ENGINE_CLAIMED_SURFACE` + set/get + test), `src/loader/native_provider.rs` (set the flag in the real-WSI branch of `fromSurface`), `src/framework.rs` (`dispatch_surface_lifecycle`/`surface_lifecycle` + the `ARRAY_LIST_SIG`/`RBX_SURFACE_VIEW_CLASS`/`WINDOW_FORMAT_RGBA_8888` consts + the extended name/sig pin), `src/graphics.rs` (the `surface_dispatched`/`handed_off` fields + the `about_to_wait` dispatch + renderer-drop handoff), `AGENTS.md`.
 
 ---
 
