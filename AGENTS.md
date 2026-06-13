@@ -184,14 +184,25 @@ before any history-rewriting/force operation.
   (discrete-GPU) branch is Roblox-on-Android-untested territory that pins videoMemory to a 64 MiB fallback. This value is
   COMMON to both modes and set BEFORE both shader-open failures (a Roblox shader/pipeline pool likely sized off
   videoMemory → too small at 64 MiB → "Error opening shader pack"). This is the clearest "Eclipse presents what no
-  Android device would" environmental cause. NEXT PROBE (carries RISK): intercept `vkGetPhysicalDeviceMemoryProperties`
-  (+ `...2`) in `src/loader/vulkan_wsi.rs` (via the Phase-6 `vkGetInstanceProcAddr` shim) to present an INTEGRATED/UNIFIED
-  heap layout (a large `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` heap) so the engine sees `unifiedMemory=true` + a large
-  videoMemory like a real Android iGPU — BUT this also changes the memory types the engine ALLOCATES from, so it can
-  break allocation on the discrete NVIDIA (host-visible ≠ all of VRAM); test carefully and watch for allocation
-  failures. If that's untenable or doesn't fix it, the remaining cause is the RBXS format-revision/parse internals
-  (RE of `libroblox` — OFF-POLICY; do NOT). Also unproven-but-cheap: force `use_opengl`-equivalent + try FFlags. Detail:
-  §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
+  Android device would" environmental cause. videoMemory PROBE DONE + REVERTED (2026-06-13): intercepted
+  `vkGetPhysicalDeviceMemoryProperties` (+`…2`) via the Phase-6 gipa shim and flagged every `DEVICE_LOCAL` memory TYPE
+  also `HOST_VISIBLE|HOST_COHERENT` to present unified memory. The shim WAS reached (`pdmp called types=5 heaps=2`,
+  diagnostic) but the engine STILL logged `unifiedMemory = false … caps.videoMemory = 67108864` UNCHANGED ⇒ the engine
+  derives `unifiedMemory` from the HEAP STRUCTURE (2 separate heaps: device-local 12.8 GB + host-visible 23.2 GB), NOT
+  the memory-type flags; and the 64 MiB is a FIXED discrete-GPU fallback (not size-derived). Making `unifiedMemory=true`
+  would require MERGING the heaps into one (blind guessing at the engine's exact check + high allocation-break risk on
+  the discrete NVIDIA) — NOT done (CLAUDE.md: don't guess, don't risk-break). Reverted the probe; `vulkan_wsi.rs` is back
+  to the clean shipped Phase-6 state. **STATUS: BOTH synthesis leads (device identity + videoMemory) are now EXHAUSTED
+  via safe first-party experiments; neither fixes the shader-pack reject.** The reject is in the engine's proprietary
+  RBXS shader-pack parse/feature-level/format-revision logic, gated on something Eclipse presents (degraded "OpenGL 3.2
+  UBO" feature level? the discrete-GPU profile? a renderer-derived format revision?) that is NOT reachable by the safe
+  levers tried. REMAINING OPTIONS, none clean first-party: (a) blindly merge Vulkan memory heaps to force
+  `unifiedMemory=true` (risky/guessing); (b) spoof the GL/Vulkan feature-level / renderer the engine derives the
+  expected shader format from (guessing + needs intercepting more GL/Vulkan queries); (c) RBXS-format/variant-selection
+  internals = REVERSE-ENGINEERING `libroblox` — OFF-POLICY per the cyber-safeguard, do NOT. NET: the shipped Phase-5/6
+  fixes (API 28 + Vulkan WSI) HOLD and got the engine to build its full Vulkan instance+surface+device pipeline; the
+  shader-pack open is a hard, well-characterized boundary needing either a non-first-party signal (how Sober tunes the
+  profile/FFlags — its runtime is closed) or info Eclipse cannot derive without RE. Detail: §6 (2026-06-13 render Phase 6).
 - **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
