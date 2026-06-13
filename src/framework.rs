@@ -4410,6 +4410,20 @@ const VIEW_NATIVE_SET_FULLSCREEN_SIG: &JNIStr = jni_str!("(JZ)V");
 const VIEW_NATIVE_GET_WINDOW_NAME: &JNIStr = jni_str!("native_get_window");
 const VIEW_NATIVE_GET_WINDOW_SIG: &JNIStr = jni_str!("(J)Landroid/view/Window;");
 
+// 2026-06-13: `View.finalize()` calls `native_destructor(widget)` to free the view's native peer when
+// the Java View is garbage-collected (View.java line 1679, `native_destructor(widget)`). `View.java`
+// line 1168 declares `protected native void native_destructor(long widget);` → an INSTANCE native
+// taking the peer handle and returning void, descriptor `(J)V`. Declared on View and NOT overridden by
+// any subclass, so binding it on `android/view/View` covers every View subclass (incl. SurfaceView) by
+// inheritance. Surfaced by Roblox's live boot (commit 95f964c): the ART FinalizerDaemon cleaning up a
+// half-built `com.roblox.client.RBXSurfaceView` (whose `native_constructor` had thrown) hit
+// `No implementation found for void android.view.View.native_destructor(long)`. Frees the
+// [`view_registry`] peer for the handle; it MUST tolerate `widget == 0` and any stale/fabricated
+// handle (the failed-construct path leaves `View.widget` at its default `0`), which
+// [`view_registry::free`] does via its bounds+generation check (logged + ignored, never throws/UB).
+const VIEW_NATIVE_DESTRUCTOR_NAME: &JNIStr = jni_str!("native_destructor");
+const VIEW_NATIVE_DESTRUCTOR_SIG: &JNIStr = jni_str!("(J)V");
+
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
 /// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
@@ -4850,6 +4864,48 @@ extern "system" fn view_native_get_window<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.native_destructor(long widget)` → free the view's [`view_registry`] peer (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void (`View.java` line 1168, `(J)V`), so the parameters are
+/// `(EnvUnowned, JObject this, jlong widget)`. Called from `View.finalize()` (View.java line 1679) on
+/// the ART FinalizerDaemon thread when a Java View is garbage-collected, to release the native peer.
+///
+/// Frees the slab handle through the bounds+generation-checked [`view_registry::free`], which bumps the
+/// slot's generation so any other copy of the handle becomes [`view_registry::ViewRegistryError::StaleHandle`]
+/// (never UB). It MUST tolerate `widget == 0` and any stale/fabricated handle gracefully: when
+/// `native_constructor` threw, `View.widget` (View.java line 965) was never assigned and stays the
+/// `long` default `0`, then the finalizer calls `native_destructor(0)`. `free(0)` (index 0 / generation
+/// 0; live generations are ≥ 1) returns `Err` — logged and ignored, NEVER thrown (a throw on the
+/// finalizer thread would re-produce the live boot's second `UnsatisfiedLinkError`-shaped failure).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+extern "system" fn view_native_destructor<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::free(widget) {
+            Ok(()) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                "View.native_destructor: freed view-registry peer"
+            ),
+            // widget==0 (failed construct) or a stale/double-finalized handle: log + ignore. NEVER
+            // throw — this runs on the FinalizerDaemon thread (see the native's docs).
+            Err(e) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_destructor: no live peer for handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -4966,15 +5022,26 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_get_window as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `view_native_destructor` matches the paired `(J)V` signature as an instance native
+        // (View.java line 1168, called from View.finalize line 1679). Declared on View and not
+        // overridden, so binding it here covers every View subclass (incl. SurfaceView) by inheritance.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_DESTRUCTOR_NAME,
+                VIEW_NATIVE_DESTRUCTOR_SIG,
+                view_native_destructor as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
     // 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility`/`nativeSetOnClickListener` from
-    // the ART No-implementation-found lines, 2026-06-05).
+    // the ART No-implementation-found lines, 2026-06-05; `native_destructor` View.java line 1168,
+    // 2026-06-13).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor"
     );
     Ok(())
 }
@@ -6902,6 +6969,65 @@ fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.view.SurfaceView native peer construction =========
+//
+// 2026-06-13: Roblox's `ActivityNativeMain.onCreate` → `d1()` → `LayoutInflater.inflate` constructs
+// `com.roblox.client.RBXSurfaceView` (extends `android.view.SurfaceView`), surfacing the live boot's
+// `No implementation found for long android.view.SurfaceView.native_constructor(Context, AttributeSet)`
+// (commit 95f964c). `SurfaceView.java` line 40 `@Override protected native long native_constructor(
+// Context, AttributeSet);` — SurfaceView RE-declares View's constructor, and ART resolves natives per
+// declaring class, so it MUST get its own RegisterNatives binding on `android/view/SurfaceView` (it is
+// NOT inherited from the View-class binding). Same `(Context, AttributeSet)J` signature as
+// View/TextView/ImageView, so it reuses the class-agnostic [`view_native_constructor`], which records
+// the receiver's ACTUAL class (`com.roblox.client.RBXSurfaceView`) in [`view_registry`] and returns a
+// real slab handle ≥ 1 (never the reserved 0). That makes `View.widget` (View.java line 965) non-zero,
+// which SurfaceView copies into `mSurface.widget` (SurfaceView.java lines 18/24) so `Surface.isValid()`
+// holds. Records view-tree metadata only — no GTK, no layout/draw, no surface (the SurfaceHolder
+// surface → host `ANativeWindow` render-integration is the deferred next-workflow step).
+
+/// `android.view.SurfaceView` (internal/slashed name) — re-declares `native_constructor` per class.
+pub const SURFACE_VIEW_CLASS: &JNIStr = jni_str!("android/view/SurfaceView");
+
+/// Bind Eclipse's own (non-GTK) backing for `android.view.SurfaceView`'s peer natives.
+///
+/// `native_constructor` (SurfaceView.java line 40, same `(Landroid/content/Context;Landroid/util/
+/// AttributeSet;)J` signature as View's, `@Override`) reuses the class-agnostic
+/// [`view_native_constructor`], which records the receiver's actual class
+/// (`com.roblox.client.RBXSurfaceView`) in [`view_registry`]. Registered before step 4, alongside the
+/// other per-class View-subclass natives, because ART resolves natives per declaring class and
+/// SurfaceView re-declares the constructor — so it needs its own binding before `LayoutInflater` runs.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It does
+/// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
+/// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_surface_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(SURFACE_VIEW_CLASS)?;
+    let methods = [
+        // SAFETY: `view_native_constructor` matches the paired
+        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
+        // (shared with View/TextView/ImageView native_constructor; SurfaceView.java line 40 @Override);
+        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
+        // takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_CONSTRUCTOR_NAME,
+                VIEW_NATIVE_CONSTRUCTOR_SIG,
+                view_native_constructor as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/view/SurfaceView; the fn pointer's signature matches its
+    // re-declared `native_constructor` (same as View/TextView/ImageView; SurfaceView.java line 40,
+    // surfaced by the live boot 2026-06-13).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/view/SurfaceView",
+        "registered Eclipse's non-GTK backing for SurfaceView.native_constructor"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.graphics.drawable.Drawable.native_constructor ===
 //
 // 2026-06-05: a launcher that loads a drawable in onCreate (e.g. AdaptiveIconDemo's
@@ -8819,6 +8945,13 @@ fn drive_lifecycle(
     // resolves natives per declaring class, so this must be bound before step 4. Reuses the
     // class-agnostic View constructor backing (records android.widget.ImageButton in the tree).
     register_image_button_natives(env)?;
+    // Bind android.view.SurfaceView's native_constructor on its own class — Roblox's
+    // ActivityNativeMain.onCreate inflates com.roblox.client.RBXSurfaceView (extends SurfaceView)
+    // during step 4's LayoutInflater pass, and ART resolves natives per declaring class (SurfaceView
+    // @Override-re-declares native_constructor), so this must be bound before step 4 or LayoutInflater
+    // hits UnsatisfiedLinkError (live boot 2026-06-13). Reuses the class-agnostic View constructor
+    // backing (records com.roblox.client.RBXSurfaceView in the tree).
+    register_surface_view_natives(env)?;
     // Bind android.graphics.drawable.Drawable's native_constructor on its own class — a launcher's
     // onCreate may load a drawable during step 5 (e.g. AdaptiveIconDemo's getDrawable), so this must be
     // bound before step 4. GTK-free; returns a non-zero non-pointer sentinel (no draw pass runs).
@@ -10357,6 +10490,13 @@ mod tests {
             VIEW_NATIVE_GET_WINDOW_SIG.to_str(),
             "(J)Landroid/view/Window;"
         );
+        // native_destructor(long) → `(J)V`, View.java line 1168 (called from View.finalize line 1679);
+        // surfaced 2026-06-13 by Roblox's FinalizerDaemon cleaning up a half-built RBXSurfaceView (the
+        // live-boot stack: `No implementation found for void android.view.View.native_destructor(long)`).
+        // A drift here would re-produce that exact runtime UnsatisfiedLinkError on the finalizer thread
+        // instead of failing in the harness, so this pins the name+descriptor ART named.
+        assert_eq!(VIEW_NATIVE_DESTRUCTOR_NAME.to_str(), "native_destructor");
+        assert_eq!(VIEW_NATIVE_DESTRUCTOR_SIG.to_str(), "(J)V");
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
@@ -10599,6 +10739,17 @@ mod tests {
             "nativeSetOnClickListener"
         );
         assert_eq!(IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG.to_str(), "(J)V");
+    }
+
+    #[test]
+    fn surface_view_class_is_slashed_internal_name() {
+        // Pin android.view.SurfaceView's internal name: Roblox inflates com.roblox.client.RBXSurfaceView
+        // (extends SurfaceView), which @Override-re-declares native_constructor (SurfaceView.java line
+        // 40, same signature as View), and ART resolves natives per declaring class — so
+        // register_surface_view_natives must find the class by this EXACT internal name or
+        // RegisterNatives throws NoClassDefFoundError at boot. The shared constructor name/sig are
+        // pinned by view_native_names_sigs_and_class_match_view_java. Host-independent constant.
+        assert_eq!(SURFACE_VIEW_CLASS.to_str(), "android/view/SurfaceView");
     }
 
     #[test]

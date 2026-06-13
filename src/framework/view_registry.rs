@@ -530,6 +530,28 @@ mod tests {
     }
 
     #[test]
+    fn surface_view_peer_round_trips_and_destructor_tolerates_null() {
+        // 2026-06-13: the two exact properties View.native_destructor relies on (framework.rs
+        // view_native_destructor). (1) A real RBXSurfaceView peer (what SurfaceView.native_constructor
+        // allocates via the class-agnostic view_native_constructor) frees cleanly. (2) The
+        // failed-construct finalizer path — where native_constructor threw so View.widget stayed the
+        // `long` default 0 and View.finalize calls native_destructor(0) — must return Err (the reserved
+        // null 0 is index 0/generation 0; live generations are ≥ 1), NEVER panic, because the
+        // destructor runs on the ART FinalizerDaemon thread and must not throw.
+        let peer =
+            allocate("com.roblox.client.RBXSurfaceView").expect("allocate RBXSurfaceView peer");
+        assert_ne!(peer, 0, "a real view peer is never the reserved null 0");
+        free(peer).expect("a live RBXSurfaceView peer frees cleanly");
+        assert!(
+            matches!(
+                free(0),
+                Err(ViewRegistryError::StaleHandle) | Err(ViewRegistryError::OutOfRange)
+            ),
+            "native_destructor(0) (failed-construct finalizer path) must be Err, never panic"
+        );
+    }
+
+    #[test]
     fn pack_unpack_round_trips() {
         for &(index, generation) in &[(0u32, 1u32), (1, 1), (5, 42), (u32::MAX, u32::MAX), (3, 7)] {
             let handle = pack(index, generation);
