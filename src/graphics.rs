@@ -105,6 +105,14 @@ struct GameWindow<'vm> {
     /// the center of the first clickable view to prove the hit-test→performClick chain end-to-end on a
     /// real run, since a headless run cannot physically click. Never fires in normal operation.
     synthetic_tap_done: bool,
+    /// 2026-06-13 — the engine-render WSI publish: Eclipse's REAL window exposed as the engine's
+    /// `ANativeWindow*`. Built in [`Self::resumed`] right after the window (the same mechanics as the
+    /// proven `__gl-test-anw` harness). Held for the window's lifetime as a drop guard: its construction
+    /// runs `register_wsi_window` (so `ndk_registry::current_wsi_window()`, what
+    /// `eclipse_anativewindow_fromsurface` returns, is Eclipse's actual window instead of the geometry-
+    /// only fallback), and its `Drop` unregisters. `None` if the display server is unsupported (the
+    /// window still opens; the geometry-only ANativeWindow fallback stands), or before `resumed`.
+    engine_window: Option<crate::egl_engine::EngineNativeWindow>,
 }
 
 impl ApplicationHandler for GameWindow<'_> {
@@ -148,6 +156,52 @@ impl ApplicationHandler for GameWindow<'_> {
             }
         }
 
+        // 2026-06-13 — engine-render WSI publish (Phase 1): register Eclipse's REAL window as the
+        // engine's `ANativeWindow*`. Mirrors the proven `__gl-test-anw` harness
+        // (`egl_engine::GlAnwTestApp::render_engine_style` + `resumed`): publish the window geometry,
+        // then build `EngineNativeWindow` (which internally `register_wsi_window`s the real WSI
+        // pointer). After this, `ndk_registry::current_wsi_window()` is Some(real WSI handle), so the
+        // engine's `ANativeWindow_fromSurface` (`native_provider::eclipse_anativewindow_fromsurface`)
+        // returns Eclipse's actual window instead of the geometry-only fallback — exactly what the
+        // green `gl_test_anw_binds_real_wsi_handle` asserts. Non-fatal on an unsupported display
+        // server (the window still opens; the geometry-only fallback stands), matching the Vulkan
+        // non-fatal pattern above.
+        match window.window_handle() {
+            Ok(handle) => {
+                let size = window.inner_size();
+                let geometry =
+                    crate::egl_engine::WindowGeometry::from_physical(size.width, size.height);
+                crate::loader::ndk_registry::set_engine_window_geometry(
+                    geometry.width,
+                    geometry.height,
+                );
+                match crate::egl_engine::EngineNativeWindow::new(handle.as_raw(), geometry) {
+                    Ok(engine_window) => {
+                        tracing::info!(
+                            width = geometry.width,
+                            height = geometry.height,
+                            "engine ANativeWindow published (real WSI handle); ANativeWindow_fromSurface \
+                             now returns Eclipse's window"
+                        );
+                        self.engine_window = Some(engine_window);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "engine WSI publish failed (unsupported display); ANativeWindow falls back \
+                             to geometry-only"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "no raw window handle; engine WSI publish skipped (geometry-only ANativeWindow)"
+                );
+            }
+        }
+
         self.window = Some(window);
     }
 
@@ -161,6 +215,18 @@ impl ApplicationHandler for GameWindow<'_> {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.mark_resized(size.width, size.height);
                 }
+                // 2026-06-13 — re-publish the engine-window geometry on resize so
+                // `ANativeWindow_getWidth`/`getHeight` (which read this) report the real new size.
+                // `register_wsi_window` is idempotent on the pointer (it updates the geometry of the
+                // existing entry, not a duplicate). NOTE: the Wayland `wl_egl_window` also needs
+                // `wl_egl_window_resize` for a true surface resize — that is follow-up; this geometry
+                // re-publish is the in-scope correctness fix for the getters.
+                let geo = crate::egl_engine::WindowGeometry::from_physical(size.width, size.height);
+                let wsi_ptr = self
+                    .engine_window
+                    .as_ref()
+                    .map(|w| w.as_native_window() as usize);
+                publish_engine_window_geometry(wsi_ptr, geo.width, geo.height);
             }
             WindowEvent::RedrawRequested => {
                 // Draw cascade: before the frame, drive each custom View's onDraw(Canvas) into an
@@ -439,6 +505,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         cursor: None,
         primary_press: None,
         synthetic_tap_done: false,
+        engine_window: None,
     };
     event_loop
         .run_app(&mut app)
@@ -448,6 +515,25 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         return Err(GraphicsError::CreateWindow(e));
     }
     Ok(())
+}
+
+/// Publish the engine-window geometry (and, when a real WSI window is published, re-register its
+/// pointer→geometry mapping) into the [`ndk_registry`](crate::loader::ndk_registry) so the engine's
+/// `ANativeWindow_getWidth`/`getHeight`/`getFormat` report the live window size.
+///
+/// 2026-06-13: pulled out of [`GameWindow::window_event`]'s `Resized` arm as a free function so the
+/// production WSI-geometry publish is unit-testable without a display server (the WSI publish in
+/// `resumed` needs a real `RawWindowHandle`, but this geometry re-publish is pure registry writes).
+/// `register_wsi_window` is idempotent on the pointer (it updates the geometry of the existing entry,
+/// not a duplicate). `wsi_ptr` is `None` before the real WSI window is built (the geometry-only
+/// fallback then stands) or `Some(ptr)` once `EngineNativeWindow` is published. NOTE: a true Wayland
+/// surface resize also needs `wl_egl_window_resize` — that is follow-up; this is the in-scope getter
+/// correctness fix.
+fn publish_engine_window_geometry(wsi_ptr: Option<usize>, width: i32, height: i32) {
+    crate::loader::ndk_registry::set_engine_window_geometry(width, height);
+    if let Some(ptr) = wsi_ptr {
+        crate::loader::ndk_registry::register_wsi_window(ptr, width, height);
+    }
 }
 
 /// Pick the swapchain surface format: prefer 8-bit BGRA in the sRGB-nonlinear color space (the
@@ -4904,6 +4990,48 @@ mod tests {
     #[test]
     fn surface_format_none_when_driver_advertises_none() {
         assert!(choose_surface_format(&[]).is_none());
+    }
+
+    // 2026-06-13: pins the production engine-window geometry publish (the resize re-publish, factored
+    // from `window_event::Resized`). Deleting/mis-wiring it would leave `ANativeWindow_getWidth/Height`
+    // reporting stale geometry; the egl_engine `gl_test_anw_binds_real_wsi_handle` harness does NOT
+    // exercise this graphics.rs path, so without this guard the production wiring is unpinned. Uses a
+    // fabricated, unique pointer and asserts only THAT pointer's mapping (not the order-dependent
+    // `current_wsi_window`), so it is order-independent vs the ndk_registry WSI tests in the same binary.
+    #[test]
+    fn publish_engine_window_geometry_registers_real_wsi_mapping() {
+        use crate::loader::ndk_registry;
+        // A unique fabricated WSI pointer for this test (never a real window — only the value is
+        // stored). Asserting only THIS pointer's WSI mapping keeps the test order-independent vs the
+        // process-global ndk_registry cells other tests in the same binary write (we do NOT assert on
+        // the shared `engine_window_geometry` / `current_wsi_window`, which are not pointer-scoped).
+        let ptr = 0xECC1_0613_usize;
+        ndk_registry::unregister_wsi_window(ptr); // defensive: clear any prior run's entry
+                                                  // With a Some(ptr): the pointer→geometry mapping is registered (the engine's
+                                                  // ANativeWindow_getWidth/Height read this). This is the production wiring BLOCKING #2 asked to
+                                                  // pin — deleting `register_wsi_window` from `publish_engine_window_geometry` fails this.
+        publish_engine_window_geometry(Some(ptr), 1280, 720);
+        assert_eq!(
+            ndk_registry::wsi_window_geometry(ptr),
+            Some((1280, 720)),
+            "the real WSI pointer must resolve to the published geometry (ANativeWindow_getWidth/Height)"
+        );
+        // Idempotent re-publish (a resize) updates the geometry of the SAME entry, not a duplicate.
+        publish_engine_window_geometry(Some(ptr), 800, 600);
+        assert_eq!(
+            ndk_registry::wsi_window_geometry(ptr),
+            Some((800, 600)),
+            "a resize re-publish updates the same WSI entry's geometry"
+        );
+        // A None ptr (before the real WSI window is built) publishes geometry only — it must NOT
+        // register this pointer. Clear first, then confirm it stays unregistered.
+        ndk_registry::unregister_wsi_window(ptr);
+        publish_engine_window_geometry(None, 640, 480);
+        assert_eq!(
+            ndk_registry::wsi_window_geometry(ptr),
+            None,
+            "None ptr publishes geometry only — no WSI pointer registration"
+        );
     }
 
     #[test]

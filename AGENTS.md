@@ -128,6 +128,43 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🖼️ RENDER PHASE 1 DONE: Eclipse's REAL winit-window WSI handle is published as the engine's
+  `ANativeWindow*` — `ANativeWindow_fromSurface` now returns Eclipse's actual window (live-confirmed, EXIT=124 clean) —
+  but the engine does NOT yet render because it does not call `fromSurface`/`surfaceCreated` on its own. ⇐ START HERE
+  NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Phase 1 (the safe first increment of the
+  render-integration plan; production-side mirror of the proven `__gl-test-anw` harness) wires Eclipse's real WSI
+  window into the engine ANativeWindow path: `GameWindow` gains an `engine_window: Option<egl_engine::EngineNativeWindow>`
+  drop-guard; `resumed`, right after creating the winit window, reads its window/display handle + `inner_size`, calls
+  `ndk_registry::set_engine_window_geometry`, and builds `EngineNativeWindow::new(window_handle, geometry)` (whose ctor
+  runs `register_wsi_window`, so `ndk_registry::current_wsi_window()` becomes Eclipse's real window and
+  `native_provider::eclipse_anativewindow_fromsurface` returns the real WSI handle instead of the geometry-only
+  fallback; its `Drop` unregisters). `WindowEvent::Resized` re-publishes via a `publish_engine_window_geometry` helper
+  (`set_engine_window_geometry` + idempotent `register_wsi_window`) so `ANativeWindow_getWidth`/`getHeight` track
+  resizes. Both the no-handle and unsupported-display arms are non-fatal (warn; the window still opens and the
+  geometry-only fallback stands). **OWNER LIVE-VALIDATION (current tree, dev-host main loop, EXIT=124 clean):** the boot
+  logs `engine ANativeWindow published (real WSI handle); ANativeWindow_fromSurface now returns Eclipse's window
+  width=800 height=600` and stays clean to APP_READY / DataModel-load. **CRUCIAL OBSERVATION (carried into the Phase 2
+  plan):** with the window published but NO `surfaceCreated` dispatch, the engine does NOT call `ANativeWindow_fromSurface`
+  / `surfaceCreated` on its own (ZERO such log lines) — confirming Phase 2's `surfaceCreated`/`surfaceChanged` dispatch
+  to the engine's `AndroidGLView` `SurfaceHolder.Callback` is REQUIRED for the engine to pull the surface and render.
+  **NEXT TASK = RENDER PHASE 2 (do NOT bundle into this commit; evidence-backed below):** (a) JNI-dispatch the
+  `RBXSurfaceView` `SurfaceHolder.Callback.surfaceCreated()` then `surfaceChanged(format, w, h)` to the engine's
+  `AndroidGLView` callback — SELF-GATED: only dispatch once the engine has actually registered its callback (the
+  `SurfaceView` `mCallbacks` list is non-empty, read via JNI), retrying each main-loop tick until then so the window is
+  never blanked prematurely; `format = WINDOW_FORMAT_RGBA_8888`, `w`/`h` = published geometry; capture the `RBXSurfaceView`
+  peer as a Global ref in `view_native_constructor` (find it by the concrete class name `com.roblox.client.RBXSurfaceView`).
+  (b) PRESENT-LOOP HANDOFF (the CORRECT design — the prior attempt's blocking bug): when the engine has CLAIMED the
+  surface, Eclipse must `self.renderer.take()` to DROP the `VulkanRenderer` (its `Drop` does `device_wait_idle` +
+  `destroy_swapchain` + `destroy_surface`, truly RELEASING the `wl_surface`/`VkSurfaceKHR`) — going merely quiescent
+  leaves TWO owners of one surface; trigger the `take()` off the engine actually claiming the surface (set a flag inside
+  `eclipse_anativewindow_fromsurface` when it returns the real WSI pointer) so Eclipse holds the surface until the engine
+  genuinely takes it, then releases. Keep pumping the main `Looper`. Detail + the prior abort's lesson: §6 (2026-06-13
+  render Phase 1 entry). Gate (ONLY `src/graphics.rs` changed): `cargo fmt --all -- --check` clean, `cargo build
+  --all-targets` 0 warn, `cargo clippy --all-targets --all-features -- -D warnings` 0 warn (forced recheck via
+  `touch src/graphics.rs`), `cargo test` **557 unit + 0 main-bin + 4 integration (0 SKIP) + 2 doctests = 563 passed, 0
+  failed** (+1 unit: the new pin `graphics::tests::publish_engine_window_geometry_registers_real_wsi_mapping`), `cargo
+  build --release` clean (artifact 8,913,704 bytes, grew from 8,911,112 by the Phase 1 WSI-publish wiring). Regression
+  guard: the new order-independent pin fails if `register_wsi_window` is dropped from `publish_engine_window_geometry`.
 - **2026-06-13 — 🟢 ROBLOX BOOTS TO APP_READY (Startup/Landing) — `ActivityManager$MemoryInfo` is now `Parcelable`
   (`writeToParcel`/`describeContents`) — OWNER LIVE-VALIDATED (EXIT=124 clean): `writeToParcel` resolves,
   `ActivityNativeMain` gets PAST `onResume` ENTIRELY, the app reaches RESUMED + a running main `Looper` pump, the engine
@@ -142,7 +179,9 @@ before any history-rewriting/force operation.
   resolve at runtime. The compile-only stub `tools/framework-overlay/stubs/android/os/Parcel.java` was extended with
   `writeLong(long)`/`writeInt(int)` so the patched `MemoryInfo` compiles (the stub is NEVER dexed; the real `Parcel` is
   used at runtime). `MemoryInfo` is staged into `classes.dex` by the existing `android/app/ActivityManager*.class` javac
-  glob — no script change. **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP): rebuild the
+  glob — no script change. **[START-HERE marker moved 2026-06-13 to the RENDER PHASE 1 (WSI publish) entry at the TOP of
+  §5 — APP_READY holds; the render frontier flagged below (NEW FRONTIER (b)) is now advanced by RENDER PHASE 1.]** Boot
+  recipe unchanged (= OWNER live validation on the dev-host MAIN LOOP): rebuild the
   overlay FIRST with `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped or the overlay was
   touched (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must
   hold the smali 2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. MILESTONE REACHED (owner-validated,
@@ -3204,6 +3243,30 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Verification (this tree):* `tools/framework-overlay/patch-framework.sh` exits 0 (`OK: patched framework overlay installed`); 3-dex `api-impl.jar` — `classes.dex` 18832 B (grew from 18656 B, consistent with the larger `Parcelable` `MemoryInfo`), `classes2.dex` 60968 B UNCHANGED, `classes3.dex` 2498192 B UNCHANGED; baksmali of the produced `classes.dex` confirms `android/app/ActivityManager$MemoryInfo` `.implements Landroid/os/Parcelable;` with `describeContents()I` returning 0 and `writeToParcel(Landroid/os/Parcel;I)V` invoking `Parcel->writeLong(J)V` ×3 (`availMem`/`totalMem`/`threshold`) + `Parcel->writeInt(I)V` ×1 (`lowMemory` 1/0) — the exact stock-Parcel write-API surface and the exact signature of the `NoSuchMethodError` target; `classes2.dex` baksmali `list classes` still defines EXACTLY the 7 smali classes (`Activity`/`Fragment`/`Vibrator`/`Display`/`Display$Mode`/`View`/`View$OnCapturedPointerListener`) — smali path untouched. `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **556 unit + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 562 passed, 0 failed** (no Rust changed → no test delta); `cargo build --release` clean (artifact 8,911,112 bytes). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); the dev-host live boot is the OWNER's (§5 START-HERE) and is the source of the EXIT=124-clean APP_READY milestone above.*
 
   *Files:* `tools/framework-overlay/src/android/app/ActivityManager.java` (`MemoryInfo implements Parcelable` + `describeContents`/`writeToParcel`), `tools/framework-overlay/stubs/android/os/Parcel.java` (compile-only `writeLong(long)`/`writeInt(int)` shells — never dexed), `AGENTS.md`; overlay output is a `~/.cache` artifact regenerated by the in-repo script (not committed).
+
+---
+
+### 2026-06-13 — 🖼️ Render Phase 1: publish Eclipse's REAL winit-window WSI handle as the engine `ANativeWindow*` (production-side mirror of the proven `__gl-test-anw` harness); the evidence-backed Phase 2 plan + the prior abort's lesson
+
+  *Context / goal:* APP_READY holds (entry above), and the standing frontier is the surface-to-engine render wiring — Eclipse runs its own Vulkan clear/present loop while the engine renders to its own surface, so no engine frames appear in Eclipse's window. The render-integration plan is split into safe increments. This is **Render Phase 1 (WSI publish)** — the first increment — done in `src/graphics.rs` only. Phase 2 (`surfaceCreated`/`surfaceChanged` dispatch + present-loop handoff) is DELIBERATELY NOT in this change; it is the next task (plan below).
+
+  *What Phase 1 does (faithful to the proven `__gl-test-anw` harness — `egl_engine::GlAnwTestApp::resumed`/`render_engine_style`):* `GameWindow` gains an `engine_window: Option<crate::egl_engine::EngineNativeWindow>` field — a drop-guard. In `GameWindow::resumed`, right after the winit window is created, Eclipse reads the window/display handle (`window.window_handle()` → `as_raw()`) + `inner_size()`, computes `WindowGeometry::from_physical`, calls `ndk_registry::set_engine_window_geometry`, then builds `EngineNativeWindow::new(window_handle, geometry)` and stores it. `EngineNativeWindow::new` internally `register_wsi_window`s the REAL WSI pointer (`egl_engine.rs:433`); its `Drop` `unregister_wsi_window`s (`egl_engine.rs:468`). So `ndk_registry::current_wsi_window()` becomes Eclipse's real window, and `native_provider::eclipse_anativewindow_fromsurface` (`native_provider.rs:3878`) returns the real WSI handle instead of the geometry-only fallback — exactly what the green `egl_engine` `gl_test_anw_binds_real_wsi_handle` harness asserts, now wired in production. `WindowEvent::Resized` re-publishes via a new free helper `publish_engine_window_geometry(wsi_ptr, w, h)` (`set_engine_window_geometry` + idempotent `register_wsi_window` on the same pointer) so `ANativeWindow_getWidth`/`getHeight` track resizes. Both the no-raw-handle arm and the unsupported-display arm are NON-FATAL (warn + leave `engine_window = None`; the window still opens and the geometry-only fallback stands), matching the adjacent Vulkan non-fatal pattern.
+
+  *Why this is the correct first increment, not a workaround:* it publishes the real surface handle the engine needs to render into Eclipse's window — the root the render frontier requires — without yet forcing the handoff. The pointer registered by `EngineNativeWindow::new` (`self.native_window`) is the exact pointer `as_native_window()` returns, so the production `Resized` re-publish hits the same WSI entry; `register_wsi_window` is idempotent on the pointer (`ndk_registry.rs:353-365`), so the resize updates the existing geometry, not a duplicate. The X11 XID / Wayland `wl_egl_window` pointer round-trips identically (`as usize`) between `new()` registration and the resize-arm `as_native_window()`, so the registry key is stable.
+
+  *Same-pattern audit:* the only non-test callers of `register_wsi_window` / `EngineNativeWindow::new` / `set_engine_window_geometry` outside `egl_engine.rs` / `ndk_registry.rs` are this new `graphics.rs` code (the `native_provider.rs` matches at lines 6267/6293/6326 are inside the `#[cfg(test)]` module at 4394) — confirming this is the FIRST production WSI publish; no other production render path needed the same wiring.
+
+  *Regression protection (tied to the root, no new script):* a new unit test `graphics::tests::publish_engine_window_geometry_registers_real_wsi_mapping` pins that the helper registers the real WSI mapping. It uses a unique fabricated pointer (`0xECC1_0613`) and asserts only THAT pointer's `wsi_window_geometry(ptr)` (NOT the order-dependent process-global `current_wsi_window`), so it is order-independent vs the `ndk_registry` WSI tests sharing the binary; it defensively `unregister_wsi_window`s before/between phases, and would FAIL if `register_wsi_window` were dropped from `publish_engine_window_geometry`. (The WSI publish in `resumed` needs a real `RawWindowHandle`, so the resize re-publish was factored into the testable free helper; the live WSI publish itself is covered by the owner's dev-host boot.)
+
+  *OWNER LIVE-VALIDATION (already done, current tree, dev-host main loop):* the live boot logs `engine ANativeWindow published (real WSI handle); ANativeWindow_fromSurface now returns Eclipse's window width=800 height=600` and stays EXIT=124 clean to APP_READY / DataModel-load. **CRUCIAL OBSERVATION:** with the window published but no `surfaceCreated` dispatch, the engine does NOT call `ANativeWindow_fromSurface` / `surfaceCreated` on its own (ZERO such log lines) — direct evidence that the engine will not pull the surface until told to. This is why Phase 2's `surfaceCreated`/`surfaceChanged` dispatch is REQUIRED.
+
+  *NEXT TASK = Render Phase 2 (evidence-backed plan; NOT in this commit):* (a) **JNI-dispatch the surface lifecycle** — call the `RBXSurfaceView` `SurfaceHolder.Callback.surfaceCreated()` then `surfaceChanged(format, w, h)` into the engine's `AndroidGLView` callback. SELF-GATED: dispatch only once the engine has actually registered its callback (read the `SurfaceView` `mCallbacks` list via JNI and check it is non-empty), retrying each main-loop tick until then, so the window is never blanked prematurely. `format = WINDOW_FORMAT_RGBA_8888`; `w`/`h` = the published geometry. Capture the `RBXSurfaceView` peer as a Global ref in `view_native_constructor`, found by the concrete class name `com.roblox.client.RBXSurfaceView`. (b) **PRESENT-LOOP HANDOFF — the CORRECT design (and the prior attempt's blocking bug):** when the engine has CLAIMED the surface, Eclipse must `self.renderer.take()` to DROP the `VulkanRenderer` — its `Drop` does `device_wait_idle` + `destroy_swapchain` + `destroy_surface`, truly RELEASING the `wl_surface`/`VkSurfaceKHR`. Going merely QUIESCENT (the prior abort's mistake) leaves TWO owners of one surface, which deadlocks/blocks. Trigger the `take()` off the engine actually claiming the surface — set a flag inside `eclipse_anativewindow_fromsurface` when it returns the real WSI pointer — so Eclipse holds the surface until the engine genuinely takes it, then releases. Keep pumping the main `Looper` throughout.
+
+  *Verification (this tree; ONLY `src/graphics.rs` changed):* `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings (forced recheck via `touch src/graphics.rs` to defeat incremental caching; re-checked the eclipse crate clean); `cargo test` **557 unit + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 563 passed, 0 failed** (+1 unit: the new pin); `cargo build --release` clean (artifact 8,913,704 bytes, grew from 8,911,112 by the Phase 1 WSI-publish wiring). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); the EXIT=124-clean WSI-publish validation is the OWNER's dev-host boot (§5 START-HERE).*
+
+  *Context7:* not used — no external library/API surface changed; this is the production-side wiring of Eclipse's own already-proven `egl_engine` / `ndk_registry` WSI APIs (the same ones the `__gl-test-anw` harness exercises), against the project's own `winit` `window_handle()`/`raw-window-handle` integration already imported in `graphics.rs`.
+
+  *Files:* `src/graphics.rs` (the `engine_window` field, the `resumed` WSI publish, the `Resized` re-publish + `publish_engine_window_geometry` helper, and the new pin test), `AGENTS.md`.
 
 ---
 
