@@ -160,12 +160,22 @@ before any history-rewriting/force operation.
   ~70 retry frames). Both packs are RBXS format version `0x0b`. (It also re-scans the whole zip central directory every
   retry — ~1.3M reads — a perf artifact of the per-frame retry, NOT the reject cause; it does find+read the entry.)
   CONCLUSION: the reject is INSIDE the engine's proprietary RBXS parse / variant-selection on a valid+complete+CRC-correct
-  +same-build pack — NOT first-party-resolvable. NEXT STEP needs EITHER (a) a genuine, internally-consistent
-  `roblox-2.721.1108` APK (the current one may be a merged/universal APK whose shader packs version-skew the
-  `libroblox.so` build — try a known-good single APK and re-boot), OR (b) the RBXS format/variant-selection internals
-  (reverse-engineering `libroblox.so` — OFF-POLICY per the cyber-safeguard; do NOT). RECOMMEND (a). If shaders still
-  reject on a known-good APK, the cause is Eclipse-environmental (re-open: the device-profile / feature-level the engine
-  presents to variant-selection). Detail: §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
+  +same-build pack. **PROVISIONING/VERSION-SKEW RULED OUT (2026-06-13):** all prior boots used the SUSPECT
+  `roblox-2.721.1108.apk` (a ~254 MB all-arches *universal* merge). Re-booted the KNOWN-CONSISTENT
+  `$HOME/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk` (Eclipse's OWN default path — base.apk + ONLY the
+  `config.x86_64` split of the SAME build code 2460, so `lib/x86_64/libroblox.so` + `assets/shaders/*.pack` cannot
+  version-skew) → the engine rejects BOTH packs IDENTICALLY (`Error opening shader pack vulkan_mobile` + `glsles3` →
+  `RenderView is NULL`). So the engine rejects its OWN internally-consistent matching packs ⇒ the cause is
+  **ECLIPSE-ENVIRONMENTAL, NOT the APK** (a real Eclipse bug, first-party-fixable). USE THE 2.724.735 DEFAULT APK GOING
+  FORWARD (latest released is 2.725.1142 / 2026-06-11, but 2.724.735/code-2460 is the consistent base+x86_64 set already
+  on disk + the repo default). NEW PRIME SUSPECT (re-opened): the device/GPU/feature profile Eclipse presents to the
+  engine's variant-selection — `Excluded 'HTC unknown:NVIDIA GeForce RTX 5070' - disabling SuperHQ shaders`,
+  `GL feature level: OpenGL 3.2 UBO`, `Video memory size: 67108864` (64 MiB), ATL `Build.MANUFACTURER="HTC"` (hardcoded
+  literal) + `MODEL` empty. The engine reads the RBXS header + variant table (`default` = first variant) then rejects in
+  early parse — likely a variant/feature/profile match that Eclipse's presented (desktop-NVIDIA-as-"HTC unknown")
+  environment fails. NEXT: compare what Sober (the closed reference, which DOES render this build on Linux GPUs) presents
+  vs Eclipse (device identity, GL/Vulkan caps, feature level) — public Sober/vinegarhq docs + Eclipse's own provision;
+  do NOT RE `libroblox`. Detail: §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
 - **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
