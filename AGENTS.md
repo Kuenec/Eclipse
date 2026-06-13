@@ -168,14 +168,30 @@ before any history-rewriting/force operation.
   `RenderView is NULL`). So the engine rejects its OWN internally-consistent matching packs ⇒ the cause is
   **ECLIPSE-ENVIRONMENTAL, NOT the APK** (a real Eclipse bug, first-party-fixable). USE THE 2.724.735 DEFAULT APK GOING
   FORWARD (latest released is 2.725.1142 / 2026-06-11, but 2.724.735/code-2460 is the consistent base+x86_64 set already
-  on disk + the repo default). NEW PRIME SUSPECT (re-opened): the device/GPU/feature profile Eclipse presents to the
-  engine's variant-selection — `Excluded 'HTC unknown:NVIDIA GeForce RTX 5070' - disabling SuperHQ shaders`,
-  `GL feature level: OpenGL 3.2 UBO`, `Video memory size: 67108864` (64 MiB), ATL `Build.MANUFACTURER="HTC"` (hardcoded
-  literal) + `MODEL` empty. The engine reads the RBXS header + variant table (`default` = first variant) then rejects in
-  early parse — likely a variant/feature/profile match that Eclipse's presented (desktop-NVIDIA-as-"HTC unknown")
-  environment fails. NEXT: compare what Sober (the closed reference, which DOES render this build on Linux GPUs) presents
-  vs Eclipse (device identity, GL/Vulkan caps, feature level) — public Sober/vinegarhq docs + Eclipse's own provision;
-  do NOT RE `libroblox`. Detail: §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
+  on disk + the repo default). DEVICE-IDENTITY HYPOTHESIS TESTED + DISPROVEN (2026-06-13): a multi-agent
+  env-investigation workflow ranked the Java `Build.*` device identity (the SDK_INT-style JNI channel) as the top
+  suspect (the prior "ruled out" probe used the wrong NATIVE property store). Tested it on the REAL channel: edited
+  vendored ATL `Build.java` `MANUFACTURER "HTC"→"Google"` + `MODEL getString(...)→"Pixel 7 Pro"`, rebuilt the overlay,
+  re-booted. The engine DID pick it up (`Vulkan Android Device: Google Pixel 7 Pro`, `Excluded 'Google Pixel 7
+  Pro:NVIDIA GeForce RTX 5070' - disabling SuperHQ`) — but the shader pack STILL rejects IDENTICALLY (`Error opening
+  shader pack` both modes → `RenderView is NULL`). So device identity is NOT the cause (matches the synthesis's own
+  counter-argument: a real low-end phone gets a degraded profile yet opens these packs). [The Build.java Pixel edit is a
+  gitignored local overlay experiment, harmless, can be reverted to "HTC".] **STRONGEST REMAINING CONCRETE LEAD —
+  `caps.videoMemory = 67108864` (64 MiB):** the engine logs (on the Vulkan path, set BEFORE both shader failures)
+  `VULKAN unifiedMemory = false, device memory = 12820938752, host memory = 24901687296, setting caps.videoMemory =
+  67108864` — it enumerates 11.9 GB device memory but caps videoMemory to 64 MiB BECAUSE `unifiedMemory = false`. NO real
+  Android device is discrete — they are all INTEGRATED/UNIFIED-memory GPUs — so the engine's `unifiedMemory=false`
+  (discrete-GPU) branch is Roblox-on-Android-untested territory that pins videoMemory to a 64 MiB fallback. This value is
+  COMMON to both modes and set BEFORE both shader-open failures (a Roblox shader/pipeline pool likely sized off
+  videoMemory → too small at 64 MiB → "Error opening shader pack"). This is the clearest "Eclipse presents what no
+  Android device would" environmental cause. NEXT PROBE (carries RISK): intercept `vkGetPhysicalDeviceMemoryProperties`
+  (+ `...2`) in `src/loader/vulkan_wsi.rs` (via the Phase-6 `vkGetInstanceProcAddr` shim) to present an INTEGRATED/UNIFIED
+  heap layout (a large `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` heap) so the engine sees `unifiedMemory=true` + a large
+  videoMemory like a real Android iGPU — BUT this also changes the memory types the engine ALLOCATES from, so it can
+  break allocation on the discrete NVIDIA (host-visible ≠ all of VRAM); test carefully and watch for allocation
+  failures. If that's untenable or doesn't fix it, the remaining cause is the RBXS format-revision/parse internals
+  (RE of `libroblox` — OFF-POLICY; do NOT). Also unproven-but-cheap: force `use_opengl`-equivalent + try FFlags. Detail:
+  §6 (2026-06-13 render Phase 6 — Vulkan WSI translation).
 - **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
