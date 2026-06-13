@@ -128,6 +128,50 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🎬 `ActivityNativeMain` IS NOW FULLY RESUMED — `Display.getMode()`/`Display$Mode` + `Vibrator.cancel()`
+  OVERLAY PATCHES — OWNER LIVE-VALIDATED (EXIT=124 clean): `getMode` resolves, `onCreate`→`onPostCreate`→`onStart`→`onResume`
+  ALL fire, `createGlAppsFrame` succeeds.** Roblox hits two more INSTALLED-framework gaps in `ActivityNativeMain.onResume`
+  startup that ATL omits: (1) `android.view.Display.getMode()Landroid/view/Display$Mode;` — `NoSuchMethodError`; ATL's
+  installed `Display` omits BOTH the method AND the `Mode` nested class. (2) `android.os.Vibrator.cancel()V` — Roblox
+  calls it on a `Timer` thread (caught by Roblox's own handler = non-fatal noise) but ATL's `Vibrator`
+  (`hasVibrator`/`vibrate` only) omits it. Both are **framework-overlay** patches (NOT Rust — `RegisterNatives` cannot
+  add a Java *method* or a nested *type*), extending the existing step-4b smali pipeline. Same drift-proof approach as
+  the `View`/`Display`/`Activity`/`Fragment` patches: **baksmali the AUTHORITATIVE installed classes**, anchor-guarded
+  inserts (exact-count==1), an "already declares" drift guard, and post-insert `grep -qF` back-checks that fail the
+  build loudly. **`Display.getMode()`** is anchored after the UNIQUE `getWidth()I`; it constructs a new
+  `android.view.Display$Mode` from the installed `Display`'s `window_width:I`/`window_height:I` statics (the same
+  `public static` fields the pre-existing `getWidth`/`getHeight` read) + `60.0f` (`const/high16 0x42700000`, consistent
+  with `getWidth`/`getHeight`/`getRefreshRate`). The nested class is a NEW committed source
+  `tools/framework-overlay/smali/android/view/Display$Mode.smali` (public static final, accessFlags 0x19; fields
+  `mModeId`/`mWidth`/`mHeight`/`mRefreshRate`; ctor `(IIIF)V`; getters `getModeId`/`getPhysicalWidth`/
+  `getPhysicalHeight`/`getRefreshRate`), assembled alongside `View`+`Display`+`Activity`+`Fragment`+`Vibrator`.
+  **`Vibrator.cancel()`** is anchored after the UNIQUE `vibrate(J)V`; a `return-void` no-op faithful to Eclipse's
+  no-vibration-device backing. Overlay layout grows to 7 smali classes in `classes2.dex`: `View` +
+  `View$OnCapturedPointerListener` + `Display` + `Display$Mode` + `Activity` + `Fragment` + `Vibrator`; first-dex-wins.
+  Working-tree changes: `tools/framework-overlay/patch-framework.sh` (the `Display.getMode` + `Vibrator.cancel` blocks
+  + the assemble `cp` lines + the header comment) and the NEW committed `Display$Mode.smali`; the vendored smali jars
+  stay in git-ignored `vendor/toolchain/smali/`. **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host
+  MAIN LOOP): rebuild the overlay FIRST with `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was
+  wiped or the overlay was touched (boot errors `Android framework not found`; `export
+  ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must hold the smali
+  2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. MILESTONE REACHED (owner-validated, current
+  tree): `ActivityNativeMain` is now FULLY RESUMED — `onCreate`→`onPostCreate`→`onStart`→`onResume` all fire,
+  `createGlAppsFrame` succeeds, the lifecycle-ordering fix + `getMode` hold; the boot is EXIT=124 clean and advances
+  PAST `getMode` to a SEPARATE next gap. NEW FRONTIER (next task — a series of framework-completeness gaps in
+  `onResume` startup): the IMMEDIATE one is `android.app.ActivityManager$MemoryInfo.writeToParcel(Landroid/os/Parcel;I)V`
+  — `NoSuchMethodError`; the patched-`javac` `MemoryInfo` must implement `Parcelable` + `writeToParcel`, a
+  **javac-overlay edit to `tools/framework-overlay/src/android/app/ActivityManager.java`, NOT smali** (depends on ATL's
+  stock `Parcel` write-API surface). CAPTURE the next gap one at a time (pure log observation, no binary inspection).
+  STANDING FRONTIER once the resume gaps clear is the surface-to-engine render wiring.** Gate (no Rust changed —
+  smali-overlay + build-script only): overlay build clean (exit 0; `classes.dex` 18656B, `classes2.dex` 60968B [grew
+  from 59704B Activity+Fragment by the added `Display.getMode` + `Display$Mode` + `Vibrator.cancel`], `classes3.dex`
+  2498192B; `classes2.dex` verified via baksmali `list classes` to define EXACTLY `Activity` + `Fragment` + `Vibrator`
+  + `Display` + `Display$Mode` + `View` + `View$OnCapturedPointerListener` — 7 classes, no strays); `cargo fmt --all --
+  check` / `build --all-targets` (0 warn) / `clippy --all-targets --all-features -D warnings` (0 warn) / `build
+  --release` (8,911,112-byte artifact) all 0-warning; `cargo test` **556 unit + 0 main-bin + 4 integration (0 SKIP) + 2
+  doctests = 562 passed, 0 failed** (overlay regression protection is the build-time anchor/already-declares/grep
+  guards inside `patch-framework.sh`). Detail: §6 (2026-06-13 `Display.getMode`/`Display$Mode` + `Vibrator.cancel`
+  overlay entry).
 - **2026-06-13 — 🔁 androidx LIFECYCLE-ORDERING FIX — `ON_CREATE` now dispatched during the activity's CREATE phase,
   BEFORE `onStart`.** Owner's live boot of `b480bd0` (EXIT=124 clean) advanced `ActivityNativeMain` PAST `onCreate`
   (`createGlAppsFrame` succeeds) into `onStart`, which then threw `IllegalStateException: LifecycleOwner
@@ -165,17 +209,12 @@ before any history-rewriting/force operation.
   class/method/descriptor + call-site literal asserts in the existing recipe-pin cluster, and build-time overlay
   guards in `patch-framework.sh` (exact-count==1 anchors + a `perl -0777` pristine-body guard + post-insert `grep -qF`
   back-checks that fail the build loudly if the `Fragment.onActivityCreated` hook or the `Activity.onPostCreate`
-  dispatch is reverted / the installed-class shape drifts). **⇐ START HERE NEXT SESSION (= OWNER live validation on
-  the dev-host MAIN LOOP): rebuild the overlay FIRST with `tools/framework-overlay/patch-framework.sh` if
-  `~/.cache/eclipse` was wiped or the overlay was touched (boot errors `Android framework not found`; `export
-  ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must hold the smali
-  2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. EXPECTED: `ActivityNativeMain.onStart` no
-  longer throws the `IllegalStateException` (`register while STARTED`); `MediaPickerProtocolV2.onCreate`'s
-  `registerForActivityResult` succeeds with the `LifecycleRegistry` at CREATED; boot advances PAST `onStart` into
-  `onResume` (watch for the `Activity.onPostCreate` driver log between `onCreate` and `onStart`, and the patched
-  Activity's `- onPostCreate - yay!`). CAPTURE the next gap one at a time (pure log observation, no binary
-  inspection): further `onStart`/`onResume` work, or the engine surface / `AndroidGLView` path. STANDING FRONTIER once
-  RESUMED is the surface-to-engine render wiring. RESIDUAL RISK to watch (note, not a blocker): the create-phase
+  dispatch is reverted / the installed-class shape drifts). **[START-HERE marker moved 2026-06-13 to the
+  `Display.getMode`/`Display$Mode` + `Vibrator.cancel` overlay entry at the TOP of §5 — OWNER LIVE-VALIDATED that this
+  `onPostCreate` create-phase dispatch holds: `ActivityNativeMain.onStart` no longer throws the `IllegalStateException`
+  (`register while STARTED`), `registerForActivityResult` sees CREATED, and the boot advances PAST `onStart` into
+  `onResume`. The NEXT FRONTIER this entry flagged (further `onStart`/`onResume` work) is now the
+  `Display.getMode`/`Vibrator.cancel` gaps fixed by that top entry, which carries the live frontier forward.]** RESIDUAL RISK to watch (note, not a blocker): the create-phase
   dispatch reaches androidx's `ReportFragment.onActivityCreated` only if that fragment is actually in
   `activity.fragments` via the framework `android.app.FragmentManager` at `onPostCreate` time; if the bundled androidx
   routes its `ReportFragment` through a support FragmentManager instead, the named fallback is ATL's no-op
@@ -3088,6 +3127,28 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 *Files:* `src/framework.rs` (recipe step + helper + driver wiring + pins), `tools/framework-overlay/patch-framework.sh` (Activity/Fragment shadow + guards), `AGENTS.md`; overlay output is a `~/.cache` artifact regenerated by the in-repo script (not committed); vendored smali toolchain stays git-ignored under `vendor/toolchain/smali/`.
 
 *Residual risk (note for next session, not a blocker):* the create-phase dispatch reaches androidx's `ReportFragment.onActivityCreated` only if that fragment is actually in `activity.fragments` via the framework `android.app.FragmentManager` at `onPostCreate` time. If the bundled androidx routes its `ReportFragment` through a support FragmentManager instead (which would not feed `activity.fragments`), the named fallback is making ATL's no-op `Activity.registerActivityLifecycleCallbacks` (overlay) store the callback and feeding the API-29+ `LifecycleCallbacks.onActivityPostCreated` path — to be diagnosed via the owner's live boot log only (no binary inspection).
+
+---
+
+- **2026-06-13 — 🎬 `Display.getMode()`/`Display$Mode` + `Vibrator.cancel()` OVERLAY PATCHES — `ActivityNativeMain` IS NOW FULLY RESUMED (OWNER LIVE-VALIDATED, EXIT=124 clean).**
+
+  *Symptom / evidence:* with the androidx lifecycle-ordering fix in place, the owner's live boot advanced `ActivityNativeMain` PAST `onStart` into `onResume`, where Roblox hits two more gaps in ATL's INSTALLED `android.*` framework during the resume startup: (1) `android.view.Display.getMode()Landroid/view/Display$Mode;` → `NoSuchMethodError` — ATL's installed `Display` omits BOTH the `getMode()` method AND the `Mode` nested class; (2) `android.os.Vibrator.cancel()V` → called on a `Timer` thread (caught by Roblox's own handler, so non-fatal noise) but ATL's `Vibrator` (`hasVibrator`/`vibrate` only) omits it.
+
+  *Root cause:* purely missing Java-level surface on the installed framework classes — `RegisterNatives` cannot add a Java *method* or a nested *type*, so this is a **framework-overlay** fix, not a Rust one. It extends the existing step-4b smali pipeline that already shadows the installed `View`/`Display`/`Activity`/`Fragment`.
+
+  *Fix (faithful to the installed classes, drift-proof — mirrors the `View`/`Display`/`Activity`/`Fragment` anchor pattern):* in `tools/framework-overlay/patch-framework.sh`, (A) `Display.getMode()` is inserted into the baksmali-disassembled AUTHORITATIVE installed `Display`, anchored after the UNIQUE `getWidth()I` method (exact-count==1 guard + an "already declares `getMode`" drift guard + post-insert `grep -qF` back-check). It constructs a new `android.view.Display$Mode` from the installed `Display`'s `window_width:I`/`window_height:I` `public static` statics (the SAME fields the pre-existing `getWidth`/`getHeight` read) + `60.0f` (`const/high16 0x42700000`, the same constant ATL's `getRefreshRate()` hardcodes — so the reported mode is faithful to the installed `Display`, not fabricated). The synthetic mode uses `modeId == 0` (Eclipse advertises a single mode; owner-validated that the native `getMode` caller accepts it). (B) The nested class is a NEW committed source `tools/framework-overlay/smali/android/view/Display$Mode.smali` — public static final (`accessFlags 0x19`), `EnclosingClass`/`InnerClass` annotations naming `android/view/Display`, fields `mModeId:I`/`mWidth:I`/`mHeight:I`/`mRefreshRate:F`, constructor `<init>(IIIF)V` (`.registers 5`, matching `getMode`'s `invoke-direct {v0,v1,v2,v3,v4}`), and AOSP getters `getModeId()I`/`getPhysicalWidth()I`/`getPhysicalHeight()I`/`getRefreshRate()F`. (C) `Vibrator.cancel()` is inserted into the disassembled installed `Vibrator`, anchored after the UNIQUE `vibrate(J)V` (same exact-count + already-declares + grep-back-check guards); a `return-void` no-op faithful to Eclipse's no-vibration-device backing. (D) `Display$Mode.smali` and the patched `Vibrator.smali` are `cp`'d into the smali assembly dir (with a new `android/os` subdir) and assembled together with `View`+`View$OnCapturedPointerListener`+`Display`+`Activity`+`Fragment` into `classes2.dex`. The header comment was updated; the line-226 closing echo's class list is a cosmetic log string left untouched (out of scope for this surgical patch).
+
+  *Same-pattern audit:* every other ATL framework gap fixed by this pipeline (`View`, `Display.getSupportedRefreshRates`, `Activity.onPostCreate`, `Fragment.onActivityCreated`) already uses the identical anchor-guarded baksmali/smali insert; the two new inserts add nothing novel structurally. No equivalent unguarded inserts elsewhere.
+
+  *Regression protection:* the build-time guards inside `patch-framework.sh` — for each insert, an exact-count==1 anchor check, an "already declares" drift guard, and a post-insert `grep -qF` back-check — fail the build loudly if the installed-class shape drifts or the insert is reverted. `smali assemble` succeeding is itself a structural validity check (it rejects bad registers/types/descriptors). This is the same regression mechanism as the prior overlay entries; no new test script was warranted (ART cannot run under `cargo test`).
+
+  *Milestone (owner live-validated, current tree):* `ActivityNativeMain` is now FULLY RESUMED — `onCreate`→`onPostCreate`→`onStart`→`onResume` ALL fire, `createGlAppsFrame` succeeds, the lifecycle-ordering fix + `getMode` hold; EXIT=124 clean. The boot advances PAST `getMode` to a SEPARATE next gap.
+
+  *New frontier (next task):* a series of framework-completeness gaps in `onResume` startup; the IMMEDIATE one is `android.app.ActivityManager$MemoryInfo.writeToParcel(Landroid/os/Parcel;I)V` (`NoSuchMethodError`) — the patched-`javac` `MemoryInfo` must implement `Parcelable` + `writeToParcel`, a **javac-overlay edit to `tools/framework-overlay/src/android/app/ActivityManager.java`, NOT smali** (depends on ATL's stock `Parcel` write-API surface). Capture the next gap one at a time by log observation only. STANDING FRONTIER once the resume gaps clear is the surface-to-engine render wiring.
+
+  *Verification (this tree):* `tools/framework-overlay/patch-framework.sh` exits 0 (`OK: patched framework overlay installed`); 3-dex `api-impl.jar` — `classes.dex` 18656 B, `classes2.dex` 60968 B (grew from 59704 B Activity+Fragment by the added `Display.getMode` + `Display$Mode` + `Vibrator.cancel`), `classes3.dex` 2498192 B; baksmali `list classes` on the shipped `classes2.dex` confirms it defines EXACTLY the 7 classes `Landroid/app/Activity;` + `Landroid/app/Fragment;` + `Landroid/os/Vibrator;` + `Landroid/view/Display;` + `Landroid/view/Display$Mode;` + `Landroid/view/View;` + `Landroid/view/View$OnCapturedPointerListener;` — no strays. `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **556 unit + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 562 passed, 0 failed**; `cargo build --release` clean (artifact 8,911,112 bytes). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); the dev-host live boot is the OWNER's (§5 START-HERE) and is the source of the EXIT=124-clean resume milestone above.*
+
+  *Files:* `tools/framework-overlay/patch-framework.sh` (the `Display.getMode` + `Vibrator.cancel` insert blocks + the assemble `cp`/`mkdir` lines + the header comment), NEW `tools/framework-overlay/smali/android/view/Display$Mode.smali`, `AGENTS.md`; overlay output is a `~/.cache` artifact regenerated by the in-repo script (not committed); vendored smali toolchain stays git-ignored under `vendor/toolchain/smali/`.
 
 ---
 
