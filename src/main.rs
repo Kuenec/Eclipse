@@ -271,6 +271,32 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let extracted = apk.extract_native_libs("x86_64", &app_lib_dir)?;
     println!("extracted {} native lib(s) ✓", extracted.len());
 
+    // 2026-06-13: extract the APK's bundled `assets/` tree to the engine's content root so the
+    // engine can open its shader packs (and fonts/content) from the FILESYSTEM. The engine reads
+    // `<app_data_dir>/files/assets/shaders/shaders_*.pack` directly (not via the JNI AssetManager);
+    // without this, `app_data_dir/files/assets/` lacks `shaders/` and the engine's SurfaceController
+    // fails `Mode 4 ... Error opening shader pack` → `RenderView is NULL` → no frames. The dest is
+    // derived from the SAME `framework::app_data_dir()` that `native_get_app_data_dir` returns (one
+    // source of truth — the path can't drift from what the engine reads). The extractor streams and
+    // is idempotent (skips already-extracted files), so repeat boots don't rewrite ~105 MB. A shader
+    // pack that fails to extract means no rendering, so this is fatal (the `?` propagates).
+    let assets_dir = eclipse::framework::app_data_dir()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot resolve the app data directory (no $HOME/XDG base and ECLIPSE_APP_DATA_DIR \
+                 unset); set ECLIPSE_APP_DATA_DIR to the engine content root",
+            )
+        })?
+        .join("files")
+        .join("assets");
+    println!(
+        "\n# Extracting Roblox bundled assets (assets/ → files/assets/) to {}…",
+        assets_dir.display()
+    );
+    let asset_count = apk.extract_assets(&assets_dir)?;
+    println!("extracted {asset_count} asset file(s) ✓");
+
     // Boot the ART VM from this (main) thread — the production entry point — with the APK on the
     // classpath, so ART loads Roblox's Java (+ the android.* framework) alongside libcore, and the
     // extracted app-lib dir on java.library.path so System.loadLibrary finds libroblox.so.

@@ -3548,7 +3548,12 @@ const GET_APP_DATA_DIR_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
 /// hardcoded `/data`/`/sdcard`/`/home`/`/tmp` path (§9, CLAUDE.md portability). Returns `None` only
 /// when no home/data base can be determined (e.g. `$HOME` unset) — the native then surfaces a JNI
 /// error rather than fabricating a path.
-fn app_data_dir() -> Option<std::path::PathBuf> {
+///
+/// 2026-06-13: `pub` so the boot flow (`main.rs::run_apk`) can extract the APK's bundled `assets/`
+/// tree to this SAME directory's `files/assets/` content root that the engine reads — single source
+/// of truth for the path, so the extraction destination can never drift from what
+/// `native_get_app_data_dir` returns.
+pub fn app_data_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("ECLIPSE_APP_DATA_DIR") {
         return Some(std::path::PathBuf::from(dir));
     }

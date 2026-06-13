@@ -257,6 +257,79 @@ impl Apk {
         Ok(extracted)
     }
 
+    /// Extract the bundled `assets/` tree to `dest_dir`, preserving sub-paths, returning the
+    /// number of files written this call.
+    ///
+    /// 2026-06-13: the Roblox engine reads its shader packs (and fonts/content) from the
+    /// FILESYSTEM under its content root (`app_data_dir/files/assets/shaders/shaders_*.pack`),
+    /// not through the JNI `AssetManager` path — so the APK's `assets/` tree (~105 MB) must be
+    /// materialised on disk before the engine's `SurfaceController` opens the shader pack
+    /// (`Mode 4 failed: Error opening shader pack` → `RenderView is NULL` otherwise). Mirrors
+    /// [`Self::extract_native_libs`]: collect matching entry names under the `assets/` prefix
+    /// (immutable borrow), then stream each to disk (mutable borrow) — constant memory. Each
+    /// entry's destination is `dest_dir.join(<path-without-the-assets/-prefix>)`, so
+    /// `assets/shaders/x.pack` lands at `dest_dir/shaders/x.pack`. Directory entries (names
+    /// ending in `/`) are skipped — parent dirs are created from the file entries. Path safety:
+    /// every entry is validated via the `zip` crate's [`enclosed_name`](zip::read::ZipFile::enclosed_name)
+    /// (rejects NUL bytes, `..` traversal, and absolute paths — the recommended safe-extraction
+    /// check; verified 2026-06-13 via Context7 against zip 2.x); an entry that fails it is skipped,
+    /// never extracted outside `dest_dir`. **Idempotent**: an entry whose destination already exists
+    /// with the same uncompressed size is skipped (so repeat boots don't rewrite ~105 MB).
+    pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError> {
+        const PREFIX: &str = "assets/";
+        // Collect matching entry names first (immutable borrow), then extract (mutable borrow) —
+        // the same two-phase borrow as `extract_native_libs`. Directory entries (trailing `/`) are
+        // excluded here; parent dirs are created per-file below.
+        let names: Vec<String> = self
+            .archive
+            .file_names()
+            .filter(|n| n.starts_with(PREFIX) && !n.ends_with('/'))
+            .map(str::to_owned)
+            .collect();
+        std::fs::create_dir_all(dest_dir)?;
+        let mut written = 0usize;
+        for name in names {
+            let mut entry = self.archive.by_name(&name)?;
+            // Safe path: `enclosed_name` rejects NUL bytes, `..` traversal, and absolute names, so
+            // the result stays inside the archive's namespace; strip the leading `assets/`
+            // component to map `assets/shaders/x.pack` → `shaders/x.pack` under `dest_dir`. An
+            // unsafe/empty entry is skipped (never written outside `dest_dir`).
+            let Some(safe) = entry.enclosed_name() else {
+                continue;
+            };
+            let Ok(rel) = safe.strip_prefix(PREFIX) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let dest = dest_dir.join(rel);
+            // Idempotent: skip if already extracted with the right (uncompressed) size. Safe
+            // because we publish only fully-written files (atomic temp+rename below), so a size
+            // match means the bytes are complete — never a truncated mid-copy file.
+            if std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(entry.size()) {
+                continue;
+            }
+            // Create parent dirs (the assets/ tree is nested, unlike the flat lib/<abi>/ layout).
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Write to a temp sibling, fsync, then rename into place (same atomicity as
+            // `extract_native_libs`): a kill mid-copy leaves only a `.partial` file, never a
+            // same-size-but-corrupt dest the idempotency skip above would later accept. The temp
+            // sibling lives in the same parent dir (created above), so the rename is intra-dir.
+            let file_name = dest.file_name().unwrap_or(rel.as_os_str());
+            let tmp = dest.with_file_name(format!("{}.partial", file_name.to_string_lossy()));
+            let mut out = File::create(&tmp)?;
+            io::copy(&mut entry, &mut out)?;
+            out.sync_all()?;
+            drop(out);
+            std::fs::rename(&tmp, &dest)?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
     /// Read a named zip entry fully into memory.
     ///
     /// 2026-06-05: `pub` so Eclipse's own (non-GTK) AssetManager XML backing can read a binary-XML
@@ -912,6 +985,52 @@ mod tests {
         // Idempotent: a second call returns the same set (skipping already-extracted files).
         let again = apk.extract_native_libs("x86_64", &dir).expect("re-extract");
         assert_eq!(again.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn extract_assets_strips_prefix_preserves_subpaths_skips_non_assets_and_is_idempotent() {
+        // 2026-06-13: regression guard for the shader-pack render blocker. The engine reads its
+        // shader packs from the filesystem under `files/assets/shaders/…`; this proves the APK's
+        // `assets/` tree extracts to that content root with the `assets/` prefix stripped and
+        // sub-paths preserved, that NON-asset entries (e.g. lib/<abi>/*.so) are skipped, and that a
+        // second extract is idempotent (0 files written, no error) — so repeat boots don't rewrite
+        // ~105 MB.
+        let bytes = build_apk(&[
+            ("assets/shaders/shaders_glsles3.pack", b"GLSLES3-PACK"),
+            ("assets/baz.txt", b"BAZ"),
+            ("lib/x86_64/libroblox.so", b"ENGINE"), // non-asset: must NOT be extracted
+            ("classes.dex", b"dex"),                // non-asset: must NOT be extracted
+        ]);
+        let (mut apk, apk_path) = open_apk(&bytes, "extract-assets");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-assets-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let count = apk.extract_assets(&dir).expect("extract assets");
+        assert_eq!(count, 2, "two asset files written");
+        assert_eq!(
+            std::fs::read(dir.join("shaders/shaders_glsles3.pack")).unwrap(),
+            b"GLSLES3-PACK",
+            "nested asset lands at <dest>/shaders/… (prefix stripped, sub-path preserved)"
+        );
+        assert_eq!(std::fs::read(dir.join("baz.txt")).unwrap(), b"BAZ");
+        assert!(
+            !dir.join("libroblox.so").exists() && !dir.join("x86_64").exists(),
+            "non-asset entry must not be extracted"
+        );
+        assert!(
+            !dir.join("classes.dex").exists(),
+            "non-asset entry must not be extracted"
+        );
+
+        // Idempotent: a second extract rewrites nothing (every dest already exists same-size).
+        let again = apk.extract_assets(&dir).expect("re-extract assets");
+        assert_eq!(again, 0, "idempotent re-extract writes 0 files");
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();

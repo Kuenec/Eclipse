@@ -128,8 +128,61 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **2026-06-13 — 🖼️ RENDER PHASE 3 SHIPPED: EGL DISPLAY CONNECTION-MATCH (tier-0 `eglGetDisplay` shim). ⇐ START HERE
-  NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Phase 2.1 (commit `6a75944`) freed the `wl_surface`
+- **2026-06-13 — 🖼️ RENDER PHASE 4 SHIPPED: BUNDLED-ASSET PROVISIONING (extract APK `assets/` → app-data
+  `files/assets/`). ⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Render Phase 3
+  (commit `c5681bc`) fixed the EGL connection-match: the engine now creates its EGL CONTEXT + 800×600 window surface
+  successfully (live boot logged `[FLog::Graphics]` "Initialized EGL context … with renderbuffer 800x600",
+  `eglSwapInterval(1)`, GL extensions + framebuffer caps enumerated — NO more `eglCreateWindowSurface` 3003). But the
+  NEXT render blocker appeared: `[FLog::SurfaceController] Mode 4 failed: Error opening shader pack glsles3
+  (<app_data_dir>/files/assets/content/../shaders/shaders_glsles3.pack)` then `RenderView is NULL` → no frames. CONFIRMED
+  ROOT CAUSE (owner live boot, commit `c5681bc`, EXIT=124): the engine reads its shader packs (and fonts/content) from
+  the FILESYSTEM under its content root `app_data_dir/files/assets/shaders/shaders_glsles3.pack` (the logged
+  `content/../shaders/` normalises to `files/assets/shaders/`), but Eclipse extracted ONLY `lib/x86_64/*.so` from the APK
+  and NEVER the `assets/` tree, so `files/assets/` held only empty `android/content/ExtraContent` dirs and no `shaders/`
+  → shader-pack open fails → `RenderView` NULL. The APK bundles `assets/shaders/shaders_glsles3.pack` (~9.6 MB) +
+  `shaders_vulkan_mobile.pack` (~20 MB); the full `assets/` tree is ~105 MB (shaders/ ExtraContent/ content/ android/
+  fonts/ ssl/ shared_compression_dictionaries/ com/ + PublicSuffixDatabase.list, dexopt/). FIX (3 surgical edits
+  mirroring `extract_native_libs`): **(A)** `src/apk/mod.rs`: `pub fn extract_assets(&mut self, dest_dir: &Path) ->
+  Result<usize, ApkError>` — collect entry names under the `assets/` prefix excluding directory entries (immutable
+  borrow), then stream each via `by_name` (mutable borrow), strip the `assets/` prefix (so `assets/shaders/x.pack` →
+  `dest_dir/shaders/x.pack`), create parent dirs, idempotent size-skip, atomic temp(`.partial`)+fsync+rename; `zip` 2.x
+  `enclosed_name()` path-traversal safety (rejects NUL/`..`/absolute — added because the assets/ tree is nested, unlike
+  the flat lib/<abi>/ extractor). Returns the count written this call; typed `ApkError`, never panics. **(B)**
+  `src/framework.rs`: raised `fn app_data_dir()` → `pub fn app_data_dir()` (dated note) so the boot flow derives the
+  extraction dest from the SAME source of truth `native_get_app_data_dir` returns — the path can never drift. **(C)**
+  `src/main.rs::run_apk`: after the `extract_native_libs` block, `assets_dir = framework::app_data_dir()/files/assets`
+  (an actionable `io::Error` when no XDG/home base resolves), prints the progress line, `apk.extract_assets(&assets_dir)?`
+  — FATAL via `?` (a missing shader pack means no rendering). **OWNER LIVE-VALIDATION — START HERE NEXT SESSION (dev-host
+  MAIN LOOP, EXIT=124 clean):** if `~/.cache/eclipse` was wiped or the overlay touched, rebuild the overlay FIRST with
+  `tools/framework-overlay/patch-framework.sh` (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`;
+  `vendor/toolchain/smali/` must hold the smali 2.5.2 jars), then `cargo run -- run <APK>` on the process MAIN thread (NOT
+  `cargo test` — ART aborts off-main-thread). NOTE: the FIRST boot now extracts ~105 MB of APK assets to
+  `app-data/files/assets` (a few seconds; idempotent after — the second boot rewrites 0 files). Look for, in order:
+  (1) the new progress lines `# Extracting Roblox bundled assets (assets/ → files/assets/) to <…>/files/assets…` then
+  `extracted <n> asset file(s)` with `n` large on first boot, `n==0` on a second boot; (2) on the filesystem,
+  `<app_data_dir>/files/assets/shaders/shaders_glsles3.pack` present (~9.6 MB) at the exact path the engine logged it
+  could not open; (3) in the engine FLog, the prior `[FLog::SurfaceController] Mode 4 failed: Error opening shader pack
+  glsles3 (…)` must be GONE — the Mode 4 shader-pack open must now SUCCEED; (4) `RenderView is NULL` must be GONE
+  (`RenderView` non-NULL); (5) THE FIRST ENGINE FRAME renders in Eclipse's window (engine content — the landing UI — the
+  Phase 3 EGL connection-match already created the 800×600 context + window surface). IF `RenderView` is still NULL or a
+  DIFFERENT asset/shader error appears: capture the EXACT `[FLog::SurfaceController]`/`[FLog::Graphics]` line for the next
+  iteration, and confirm the extracted file exists at `<app_data_dir>/files/assets/shaders/` with non-zero size; if
+  `ECLIPSE_APP_DATA_DIR` is set, confirm both the extraction dest and the engine's `native_get_app_data_dir` resolve to
+  that same root (they share `framework::app_data_dir()`). NOTE: the CDN 401/403 asset errors are login-gated (separate,
+  expected without auth) and do NOT block the bundled shader/UI render. Record the owner laptop log path (e.g.
+  `/tmp/eclipse-assets-extract-validate.log`; runtime log-observation only — do NOT RE the APK/libroblox). REGRESSION:
+  `apk::tests::extract_assets_strips_prefix_preserves_subpaths_skips_non_assets_and_is_idempotent` pins prefix-strip +
+  nested sub-path preservation + non-asset skip + idempotent re-extract (count 0). Gate (only the 3 work files changed —
+  `src/apk/mod.rs`, `src/framework.rs`, `src/main.rs`): `cargo fmt --all -- --check` clean, `cargo build --all-targets`
+  0 warn, `cargo clippy --all-targets --all-features -- -D warnings` 0 warn (forced recheck via `touch` of the 3 files),
+  `cargo test` **568 passed, 0 failed (562 unit + 0 main + 4 integration, 0 SKIP + 2 doctests)** (+1 vs Phase 3's 567:
+  the new `extract_assets` regression test), `cargo build --release` clean (artifact 8,945,096 bytes, grew from Phase 3's
+  8,939,368 by the asset-extraction wiring). RUNTIME CORRECTNESS (does the engine render its first frame) is confirmed
+  ONLY by this live boot. Detail: §6 (2026-06-13 render Phase 4 — bundled-asset provisioning entry).
+- **2026-06-13 — 🖼️ RENDER PHASE 3 SHIPPED: EGL DISPLAY CONNECTION-MATCH (tier-0 `eglGetDisplay` shim).** [Superseded as
+  the START-HERE marker by the RENDER PHASE 4 entry above — Phase 3's EGL connection-match HOLDS (the engine's EGL
+  context + window surface now create successfully, no more 3003), but revealed the NEXT blocker: the missing on-disk
+  shader pack that Phase 4 fixes.] Phase 2.1 (commit `6a75944`) freed the `wl_surface`
   before dispatch (dropped Eclipse's `VulkanRenderer` strictly first), so the engine now creates its EGL CONTEXT
   successfully — but its `eglCreateWindowSurface` STILL failed `[FLog::SurfaceController] Mode 4 failed: Error creating
   context: eglCreateWindowSurface 3003` (`EGL_BAD_ALLOC`). ROOT CAUSE (independent of Phase 2.1's two-owners fix): the
@@ -3506,6 +3559,24 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Context7:* Khronos EGL Registry consulted (verified 2026-06-13) — `EGL_KHR_platform_wayland` / `EGL_EXT_platform_wayland` confirm the `EGL_DEFAULT_DISPLAY` → `wl_display_connect(NULL)` (own default-socket connection) semantics that ARE the cross-connection root cause; `khronos-egl-6.0.0` vendored source confirms `DEFAULT_DISPLAY=0` and `EGLDisplay`/`NativeDisplayType = *mut c_void` for the ABI of the tier-0 native and the host-fn transmute.
 
   *Files:* `src/loader/ndk_registry.rs` (`WSI_DISPLAY` + `set_wsi_display`/`wsi_display` + round-trip test), `src/loader/native_provider.rs` (`resolve_egl_display_target` + `host_egl_get_display` + `eclipse_egl_get_display` + registration + count/name test updates + mapping test), `src/graphics.rs` (`RawDisplayHandle` import + `set_wsi_display` from `resumed`), `AGENTS.md`.
+
+---
+
+### 2026-06-13 — 🖼️ Render Phase 4: BUNDLED-ASSET PROVISIONING — extract the APK's `assets/` tree to the engine content root (`app-data/files/assets`) so the engine can open its shader packs from the filesystem (the missing pack was `RenderView is NULL`)
+
+  *Confirmed root cause (evidence, not speculation — owner live boot, commit `c5681bc`, EXIT=124):* Render Phase 3 fixed the EGL connection-match — the engine now creates its EGL CONTEXT + 800×600 window surface successfully (`[FLog::Graphics]` "Initialized EGL context … with renderbuffer 800x600", `eglSwapInterval(1)`, GL extensions + framebuffer caps enumerated; NO more `eglCreateWindowSurface` 3003). The NEXT render blocker then surfaced: `[FLog::SurfaceController] Mode 4 failed: Error opening shader pack glsles3 (<app_data_dir>/files/assets/content/../shaders/shaders_glsles3.pack)` followed by `RenderView is NULL` → no frames. The engine reads its shader packs (and fonts/content) from the FILESYSTEM under its content root `<app_data_dir>/files/assets/shaders/shaders_glsles3.pack` (the logged `content/../shaders/` normalises to `files/assets/shaders/`) — NOT through the JNI `AssetManager`. But Eclipse extracted ONLY `lib/x86_64/*.so` from the APK (`extract_native_libs`) and never the `assets/` tree, so `files/assets/` held only empty `android/content/ExtraContent` dirs and no `shaders/` → the shader-pack open fails → `RenderView` NULL. The APK bundles `assets/shaders/shaders_glsles3.pack` (~9.6 MB) + `shaders_vulkan_mobile.pack` (~20 MB); the full `assets/` tree is ~105 MB (shaders/ ExtraContent/ content/ android/ fonts/ ssl/ shared_compression_dictionaries/ com/ + PublicSuffixDatabase.list, dexopt/).
+
+  *Fix (provision the bundled assets on disk — root-cause, not a workaround; 3 surgical edits mirroring `extract_native_libs`):* materialise the APK's `assets/` tree at the engine content root before boot. **(A)** `src/apk/mod.rs`: `pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError>` — the SAME two-phase borrow as `extract_native_libs` (collect entry names under the `assets/` prefix excluding directory entries via the immutable `file_names()`, then stream each through `by_name` with the mutable borrow — constant memory), strips the leading `assets/` component so `assets/shaders/x.pack` → `dest_dir/shaders/x.pack`, creates parent dirs (the assets/ tree is nested, unlike the flat `lib/<abi>/` layout), idempotent size-skip (a dest already at the entry's uncompressed size is left untouched — repeat boots don't rewrite ~105 MB), and atomic temp(`.partial`)+fsync+rename writes (a kill mid-copy leaves only a `.partial`, never a same-size-but-corrupt dest the skip would accept). Adds `zip` 2.x `enclosed_name()` path-traversal safety (rejects NUL bytes / `..` traversal / absolute names — the recommended safe-extraction check; the nested tree needs it where the flat lib extractor flattened to basename and did not). Returns the count written this call; typed `ApkError`, never panics (matters under release `panic = "abort"`). **(B)** `src/framework.rs`: raised `fn app_data_dir()` → `pub fn app_data_dir()` with a dated 2026-06-13 doc note, so `main.rs` derives the extraction dest from the SAME source of truth `native_get_app_data_dir` returns — the extraction path can never drift from what the engine reads (`ECLIPSE_APP_DATA_DIR` override else `directories` `ProjectDirs` `eclipse` data_dir + `app-data`). Visibility-only change; `native_get_app_data_dir` still calls it unchanged. **(C)** `src/main.rs::run_apk`: after the `extract_native_libs` block, `assets_dir = framework::app_data_dir()/files/assets` (an actionable `io::Error` when no XDG/home base resolves and `ECLIPSE_APP_DATA_DIR` is unset — never a silent skip), prints `# Extracting Roblox bundled assets (assets/ → files/assets/) to <…>…` then `apk.extract_assets(&assets_dir)?` (FATAL via `?` — a missing shader pack means no rendering) and `extracted <n> asset file(s)`.
+
+  *Same-pattern audit:* grepped `src/` for `extract_native_libs` / `extract_assets` / `files/assets` / `"assets"` usages. The only on-disk asset/lib extraction path is the APK→filesystem flow in `main.rs::run_apk`; `extract_native_libs` (`lib/<abi>/*.so`, flat) was the model and `extract_assets` is the new sibling for the nested `assets/` tree — no other code materialises APK assets to disk. The JNI `AssetManager` path (`framework.rs` `read_asset_bytes`) serves assets straight from the APK zip and is a DIFFERENT, unaffected mechanism (the engine's shader pack is read by the engine's OWN C++ file IO from the filesystem — exactly why on-disk extraction is required). `extract_assets` mirrors `extract_native_libs`'s idempotency + atomic temp+rename so the same truncated-mid-copy class of bug cannot recur, and adds `enclosed_name()` path-traversal safety the nested tree needs. No equivalent flawed instance elsewhere.
+
+  *Regression protection (tied to the root, no new script):* `apk::tests::extract_assets_strips_prefix_preserves_subpaths_skips_non_assets_and_is_idempotent` (mirrors the model `extract_native_libs_extracts_matching_abi_only_and_is_idempotent`): builds an in-memory APK with `assets/shaders/shaders_glsles3.pack` + `assets/baz.txt` + a non-asset `lib/x86_64/libroblox.so` + `classes.dex`, extracts to a per-thread tempdir (portable, no hardcoded paths), asserts count==2; the nested asset lands at `dest/shaders/shaders_glsles3.pack` with correct bytes (prefix stripped, sub-path preserved); `baz.txt` at the dest root; the non-asset entries are NOT extracted; and a second extract returns 0 (idempotent — proves repeat boots don't rewrite the ~105 MB tree). A drift that broke prefix-stripping, leaked a non-asset, or lost idempotency fails CI. The shader-pack open + `RenderView` non-NULL + the first engine frame are OWNER-live-boot-validated (ART cannot run under `cargo test`).
+
+  *Verification (this tree; the 3 work files — `src/apk/mod.rs`, `src/framework.rs`, `src/main.rs`):* `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings (forced recheck via `touch` of the 3 files); `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **568 passed, 0 failed (562 unit (+1: the new `extract_assets` test) + 0 main + 4 integration `tests/engine_milestones.rs` 0 SKIP + 2 doctests)** — +1 vs Phase 3's 567; `cargo build --release` clean (artifact 8,945,096 bytes, grew from Phase 3's 8,939,368 by the asset-extraction wiring). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); RUNTIME CORRECTNESS — the engine's shader-pack open SUCCEEDING (no more `[FLog::SurfaceController] Mode 4 failed: Error opening shader pack`), `RenderView` non-NULL, and THE FIRST ENGINE FRAME — is confirmed ONLY by the OWNER's dev-host MAIN-LOOP boot (§5 START-HERE; record the laptop log path e.g. `/tmp/eclipse-assets-extract-validate.log`). The first boot extracts ~105 MB (a few seconds; idempotent after). If `RenderView` is still NULL or a different asset/shader error appears, capture the exact SurfaceController/Graphics line + confirm the extracted file's path & size (log-observation only; do NOT RE the APK/libroblox). The CDN 401/403 asset errors are login-gated, separate, and do NOT block the bundled shader/UI render.*
+
+  *Context7:* `zip` 2.x (`/zip-rs/zip2`) consulted (verified 2026-06-13) — confirmed `enclosed_name()` is the recommended path-exploit-resistant safe-extraction API (rejects NUL bytes / `..` traversal / absolute paths) and is NOT deprecated (the deprecated method is `sanitized_name`); trailing-`/` detects directory entries. The project's own `extract_native_libs` (+ its idempotent/atomic test) is the authoritative model for the two-phase borrow, size-skip idempotency, and temp+fsync+rename atomicity.
+
+  *Files:* `src/apk/mod.rs` (`extract_assets` + its regression test), `src/framework.rs` (`app_data_dir` raised to `pub` with a dated note — single source of truth for the content root), `src/main.rs` (`run_apk` asset-extraction step after `extract_native_libs`), `AGENTS.md`.
 
 ---
 
