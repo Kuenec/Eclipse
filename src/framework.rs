@@ -4397,6 +4397,19 @@ const VIEW_SET_BACKGROUND_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
 const VIEW_NATIVE_SET_FULLSCREEN_NAME: &JNIStr = jni_str!("nativeSetFullscreen");
 const VIEW_NATIVE_SET_FULLSCREEN_SIG: &JNIStr = jni_str!("(JZ)V");
 
+// 2026-06-13: `View.getViewTreeObserver()` calls `native_get_window(widget)` to obtain the Window
+// that owns this view's tree, so it can hand it to `new ViewTreeObserver(window)` (View.java lines
+// 1244-1255). Surfaced by Roblox's `ActivityNativeMain.onCreate` → `d1()` → `getViewTreeObserver()`
+// (live-boot stack, commit 4e7cd42: `No implementation found for android.view.Window
+// android.view.View.native_get_window(long)`). `View.java` line 1244 declares
+// `public native Window native_get_window(long widget);` → an INSTANCE native returning a Window,
+// descriptor `(J)Landroid/view/Window;`. Eclipse returns the process-shared Java `Window` object
+// (the one `internalCreateActivity` built and `set_native_window` populated — Activity.java line 82,
+// Window.java lines 58-60), captured at `Window.set_jobject`. A null return is contract-valid: ATL
+// builds a floating observer (View.java line 1252), so the native is sound even before capture.
+const VIEW_NATIVE_GET_WINDOW_NAME: &JNIStr = jni_str!("native_get_window");
+const VIEW_NATIVE_GET_WINDOW_SIG: &JNIStr = jni_str!("(J)Landroid/view/Window;");
+
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
 /// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
@@ -4763,6 +4776,80 @@ extern "system" fn view_native_set_fullscreen<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.native_get_window(long widget) -> android.view.Window` → the process-shared Java `Window`
+/// object that owns this view's tree (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning a Window object (`View.java` line 1244,
+/// `(J)Landroid/view/Window;`), so the parameters are `(EnvUnowned, JObject this, jlong widget)`.
+/// `widget` is the view's [`view_registry`] handle; it is validated (a bad handle is logged and the
+/// native returns null) but it does NOT locate the Window — Eclipse's model is one process-shared
+/// window per launch (the [`window_registry`] handle allocated once in `drive_application_lifecycle`
+/// and threaded through every `internalCreateActivity` via `set_native_window`). The Window's Java
+/// object was captured at `Window.set_jobject` ([`window_set_jobject`]); this returns a frame-local
+/// reference to it. ATL then reads `window.native_window` (already populated before `set_jobject`
+/// ran — Window.java lines 58-60) to build a real `ViewTreeObserver` (ViewTreeObserver.java line 307).
+///
+/// Returning null is contract-valid: when no Window object has been captured yet, ATL's
+/// `getViewTreeObserver` builds a floating observer (View.java line 1252). The body runs inside
+/// [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8); `resolve::<LogErrorAndDefault>`
+/// returns the `JObject` default (a JNI null) on any error/panic — itself the floating-observer path.
+extern "system" fn view_native_get_window<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) -> JObject<'local> {
+    env.with_env(|env| -> jni::errors::Result<JObject> {
+        // Validate-and-log the view handle (it identifies the calling view, but not the window —
+        // see the native's docs). A bad handle is not fatal: the window is still the shared one.
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_get_window: invalid view handle (returning the shared window anyway)"
+            );
+        }
+        // Map any view to the single live process-shared window and return a frame-local reference to
+        // its captured Java Window object. `with_jobject` borrows the stored Global under the registry
+        // lock and we make only the leaf `NewLocalRef` call inside (it does not re-enter the registry),
+        // mirroring how the click-dispatch path borrows view_registry globals. Returning a fresh local
+        // ref (never the Global raw) keeps the returned object valid in the caller's frame.
+        let active = window_registry::active_window();
+        let local = match window_registry::with_jobject(active, |global| {
+            env.new_local_ref(global.as_obj())
+        }) {
+            // A window with a captured Window object: return a frame-local ref to it.
+            Ok(Some(Ok(obj))) => obj,
+            // NewLocalRef itself failed: propagate as an error → LogErrorAndDefault returns null.
+            Ok(Some(Err(e))) => return Err(e),
+            // Valid window but no Window object captured yet (set_jobject has not run): null →
+            // ATL builds a floating observer (View.java line 1252).
+            Ok(None) => {
+                tracing::debug!(
+                    target: "android.view.Window",
+                    active,
+                    widget,
+                    "View.native_get_window: no Window object captured yet → null (floating observer)"
+                );
+                JObject::null()
+            }
+            // No live window / stale active handle: null → floating observer (never UB).
+            Err(e) => {
+                tracing::debug!(
+                    target: "android.view.Window",
+                    active,
+                    widget,
+                    error = %e,
+                    "View.native_get_window: no live process-shared window → null (floating observer)"
+                );
+                JObject::null()
+            }
+        };
+        Ok(local)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -4868,6 +4955,17 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_set_fullscreen as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `view_native_get_window` matches the paired `(J)Landroid/view/Window;` signature as
+        // an instance native (surfaced by Roblox's ActivityNativeMain.onCreate getViewTreeObserver,
+        // live-boot stack 2026-06-13). A RegisterNatives binding shadows the lazy mangled-name lookup
+        // that the boot reported missing.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_NATIVE_GET_WINDOW_NAME,
+                VIEW_NATIVE_GET_WINDOW_SIG,
+                view_native_get_window as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
@@ -4876,7 +4974,86 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window"
+    );
+    Ok(())
+}
+
+// === Eclipse's own backing for android.view.ViewTreeObserver ====================================
+//
+// 2026-06-13: once `View.native_get_window` returns a real Window, `View.getViewTreeObserver()`
+// builds a `ViewTreeObserver`, and `ActivityNativeMain.d1()` immediately registers a global-layout
+// listener on it. ATL's `addOnGlobalLayoutListener`/`removeOnGlobalLayoutListener`/`merge`/`kill`
+// call `native_set_have_global_layout_listeners(boolean)` whenever the listener count crosses 0↔1
+// (ViewTreeObserver.java lines 344/506/545/763) so the native side knows whether to fire
+// `onGlobalLayout`. It is the very next native on the view-tree-setup path after `native_get_window`
+// succeeds; unbound, the `addOnGlobalLayoutListener` right after `getViewTreeObserver` throws the
+// next `UnsatisfiedLinkError` and dead-ends the same `onCreate`, so it is bound now.
+//
+// `ViewTreeObserver.java` line 1049 declares
+//   `private native void native_set_have_global_layout_listeners(boolean have_listeners);`
+// — an INSTANCE native, descriptor `(Z)V`. The ViewTreeObserver carries its own `private long window`
+// field (line 57) — no view_registry/window_registry handle is passed — so there is no handle to
+// validate. Eclipse has no GTK/host layout signal to drive `onGlobalLayout`, so the honest backing
+// records the flag and no-ops (mirrors `nativeSetFullscreen`/`native_setVisibility`); a real
+// layout-callback driver is the deferred render-integration build, not a fall-through here.
+
+/// `android.view.ViewTreeObserver` (internal/slashed name for `find_class`).
+pub const VIEW_TREE_OBSERVER_CLASS: &JNIStr = jni_str!("android/view/ViewTreeObserver");
+
+// JNI name + descriptor, exactly as declared in `ViewTreeObserver.java` line 1049.
+const VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_NAME: &JNIStr =
+    jni_str!("native_set_have_global_layout_listeners");
+const VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG: &JNIStr = jni_str!("(Z)V");
+
+/// `ViewTreeObserver.native_set_have_global_layout_listeners(boolean have_listeners)` → no-op
+/// (Eclipse has no host layout signal to gate; 2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void (`(Z)V`; jni maps `jboolean` to Rust `bool`). No
+/// handle is passed (the observer holds its own `window` field), so there is nothing to validate —
+/// the native logs the crossed flag and no-ops. The body runs inside [`EnvUnowned::with_env`]
+/// (`catch_unwind`-wrapped, AGENTS.md §2.8); `resolve` returns the `()` default on error/panic.
+extern "system" fn view_tree_observer_set_have_global_layout_listeners<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    have_listeners: jboolean,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.view.ViewTreeObserver",
+            have_listeners,
+            "ViewTreeObserver.native_set_have_global_layout_listeners: recorded flag, no-op (no host layout signal)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind `android.view.ViewTreeObserver.native_set_have_global_layout_listeners` on its own class.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
+/// does, by construction (`(Z)V`, ViewTreeObserver.java line 1049). The body is `catch_unwind`-guarded
+/// via [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
+fn register_view_tree_observer_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(VIEW_TREE_OBSERVER_CLASS)?;
+    let methods = [
+        // SAFETY: `view_tree_observer_set_have_global_layout_listeners` matches the paired `(Z)V`
+        // signature as an instance native (see the native's docs).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_NAME,
+                VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG,
+                view_tree_observer_set_have_global_layout_listeners as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/view/ViewTreeObserver; `methods` hold a valid fn pointer
+    // whose signature matches the class's `native` declaration (ViewTreeObserver.java line 1049).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/view/ViewTreeObserver",
+        "registered Eclipse's backing for ViewTreeObserver.native_set_have_global_layout_listeners"
     );
     Ok(())
 }
@@ -6903,15 +7080,20 @@ const WINDOW_SET_WIDGET_AS_ROOT_SIG: &JNIStr = jni_str!("(JJ)V");
 const WINDOW_REMOVE_GTK_BACKGROUND_NAME: &JNIStr = jni_str!("remove_gtk_background");
 const WINDOW_REMOVE_GTK_BACKGROUND_SIG: &JNIStr = jni_str!("(J)V");
 
-/// `Window.set_jobject(long ptr, Window obj)` → record that the Java Window back-reference is set on
-/// the [`window_registry`] window.
+/// `Window.set_jobject(long ptr, Window obj)` → capture a JNI **global** reference to the Java
+/// `android.view.Window` object on the [`window_registry`] window.
 ///
 /// JNI ABI: a STATIC native returning void (`Window.java` line 188), so the parameters are
 /// `(EnvUnowned, JClass, jlong ptr, JObject window)`. `ptr` is the Eclipse-owned window-registry
-/// handle; `window` is the Java `android.view.Window` (not dereferenced — Eclipse records only that
-/// it was set; the design's `WindowState.jobject` is the documented slot for the real `GlobalRef` a
-/// later input/lifecycle increment will store). Validates the handle through the
-/// bounds+generation-checked [`window_registry`] (a bad handle is logged + ignored, never UB).
+/// handle; `window` is the Java `android.view.Window`. 2026-06-13: this is the one place the Window
+/// object flows into Eclipse, called from `set_native_window` AFTER `this.native_window` is populated
+/// (Window.java lines 58-60), so the captured object always has a valid `native_window` field — which
+/// `View.native_get_window` hands back so ATL can build a real `ViewTreeObserver`. A global ref is
+/// created over `window` and stored on the slot (re-capture on a later `set_jobject` drops the prior
+/// ref via the `Option`'s `Drop`). Validates the handle through the bounds+generation-checked
+/// [`window_registry`] (a bad handle is logged + ignored, never UB); a failure to create or store the
+/// global ref leaves the window without a captured object (so `native_get_window` returns null and ATL
+/// builds a floating observer) — logged, never fatal.
 ///
 /// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
 /// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
@@ -6919,22 +7101,33 @@ extern "system" fn window_set_jobject<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     ptr: jlong,
-    _window: JObject<'local>,
+    window: JObject<'local>,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
-        // Record "jobject set" on the window slot. The unit placeholder is the design's documented
-        // stand-in for the real GlobalRef (window_registry.rs ViewState.jobject docs).
-        match window_registry::with_window(ptr, |w| w.jobject = Some(())) {
-            Ok(()) => tracing::debug!(
-                target: "android.view.Window",
-                ptr,
-                "Window.set_jobject: recorded Java Window back-reference on non-GTK window"
-            ),
+    env.with_env(|env| -> jni::errors::Result<()> {
+        // Capture a global ref to the Java Window so View.native_get_window can return the SAME object
+        // (its native_window field is already populated — set_native_window sets it before this runs).
+        // `new_global_ref` over a non-null `window` is sound here; a failure leaves the window without
+        // a captured object (logged, non-fatal — native_get_window then yields the floating-observer
+        // path) rather than unwinding across JNI.
+        match env.new_global_ref(&window) {
+            Ok(global) => match window_registry::set_jobject(ptr, global) {
+                Ok(()) => tracing::debug!(
+                    target: "android.view.Window",
+                    ptr,
+                    "Window.set_jobject: captured Java Window object on non-GTK window"
+                ),
+                Err(e) => tracing::debug!(
+                    target: "android.view.Window",
+                    ptr,
+                    error = %e,
+                    "Window.set_jobject: invalid window handle (Window object not captured)"
+                ),
+            },
             Err(e) => tracing::debug!(
                 target: "android.view.Window",
                 ptr,
                 error = %e,
-                "Window.set_jobject: invalid window handle (ignored)"
+                "Window.set_jobject: new_global_ref failed (Window object not captured)"
             ),
         }
         Ok(())
@@ -8602,6 +8795,12 @@ fn drive_lifecycle(
     // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
     // against view_registry; each new View native the run surfaces is added to register_view_natives.
     register_view_natives(env)?;
+    // Bind android.view.ViewTreeObserver.native_set_have_global_layout_listeners on its own class —
+    // ActivityNativeMain.onCreate (step 4+) calls View.getViewTreeObserver() (which uses
+    // native_get_window above) and then registers a global-layout listener, which crosses the
+    // listener count 0→1 and calls this native (ViewTreeObserver.java line 344). Unbound, it threw
+    // the next UnsatisfiedLinkError on the same view-tree-setup path (2026-06-13).
+    register_view_tree_observer_natives(env)?;
     // Bind android.view.Window's window-setup natives on its own class — step 4 wires the launcher's
     // Window onto the native window handle (set_jobject/set_title/set_layout/set_widget_as_root), so
     // these must be bound before step 4. Bound non-GTK against window_registry/view_registry.
@@ -10148,6 +10347,16 @@ mod tests {
             "nativeSetFullscreen"
         );
         assert_eq!(VIEW_NATIVE_SET_FULLSCREEN_SIG.to_str(), "(JZ)V");
+        // native_get_window(long) → `(J)Landroid/view/Window;`, View.java line 1244; surfaced
+        // 2026-06-13 by Roblox's ActivityNativeMain.onCreate getViewTreeObserver (the live-boot stack:
+        // `No implementation found for android.view.Window android.view.View.native_get_window(long)`).
+        // A drift here would re-produce that exact runtime UnsatisfiedLinkError instead of failing in
+        // the harness, so this pins the name+descriptor ART named.
+        assert_eq!(VIEW_NATIVE_GET_WINDOW_NAME.to_str(), "native_get_window");
+        assert_eq!(
+            VIEW_NATIVE_GET_WINDOW_SIG.to_str(),
+            "(J)Landroid/view/Window;"
+        );
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
@@ -10167,6 +10376,24 @@ mod tests {
             "native_setTextColor"
         );
         assert_eq!(TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG.to_str(), "(I)V");
+    }
+
+    #[test]
+    fn view_tree_observer_native_name_sig_and_class_match_view_tree_observer_java() {
+        // Pin android.view.ViewTreeObserver's class, method name, and JNI descriptor against
+        // `ViewTreeObserver.java` line 1049 (`private native void
+        // native_set_have_global_layout_listeners(boolean have_listeners);` → instance `(Z)V`). This
+        // is the next native on the view-tree-setup path after native_get_window; a transcription
+        // drift would make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
+        assert_eq!(
+            VIEW_TREE_OBSERVER_CLASS.to_str(),
+            "android/view/ViewTreeObserver"
+        );
+        assert_eq!(
+            VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_NAME.to_str(),
+            "native_set_have_global_layout_listeners"
+        );
+        assert_eq!(VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG.to_str(), "(Z)V");
     }
 
     #[test]
