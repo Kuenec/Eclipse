@@ -128,6 +128,64 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🎬 `SurfaceView.native_constructor` + `View.native_destructor` BOUND — Roblox's GL render
+  surface (`com.roblox.client.RBXSurfaceView`) now CONSTRUCTS; LayoutInflater can complete ActivityNativeMain's
+  content view.** Owner live validation of `native_get_window` (`/tmp/eclipse-getwindow-validate.log`, EXIT=124
+  clean) proved the boot got PAST `native_get_window` and into `ActivityNativeMain.onCreate` → `d1()` →
+  `LayoutInflater.inflate`, which constructs `RBXSurfaceView` (extends `android.view.SurfaceView` — THE engine's GL
+  render surface) and died on two coupled unbound natives, BOTH FIXED THIS COMMIT: (1) `No implementation found for
+  long android.view.SurfaceView.native_constructor(Context, AttributeSet)`; then (2) on the FinalizerDaemon cleaning
+  up the half-built View, `No implementation found for void android.view.View.native_destructor(long)` (after which
+  Roblox's watchdog logged `RBXCRASH-HangDetected` — the main-thread onCreate failure tripped its hang detector).
+  ROOT CAUSE (first-party-confirmed): SurfaceView `@Override`-re-declares `native_constructor` (vendored
+  `SurfaceView.java:40`, `(Context, AttributeSet)J`) and ART resolves natives PER DECLARING CLASS, so the existing
+  View-class binding did NOT satisfy it; and `View.native_destructor(long)` (`View.java:1168`, called from
+  `View.finalize` `View.java:1679`) was genuinely never bound on `android/view/View` (zero src references). FIX
+  (both root causes, both land together — binding only one leaves the other's `UnsatisfiedLinkError`): a NEW
+  `register_surface_view_natives` binds the EXISTING class-agnostic `view_native_constructor` on a NEW
+  `SURFACE_VIEW_CLASS = "android/view/SurfaceView"` (records the receiver's actual class
+  `com.roblox.client.RBXSurfaceView` in `view_registry`, allocates a real generational slab handle ≥ 1 so
+  `View.widget` is non-zero and SurfaceView's `mSurface.widget`/`Surface.isValid()` hold), wired into
+  `drive_lifecycle` right after `register_image_button_natives` (before step 4, so it is bound before
+  `LayoutInflater` runs); and a NEW `view_native_destructor` (consts `VIEW_NATIVE_DESTRUCTOR_NAME`/`_SIG`) added to
+  the EXISTING `register_view_natives` method table on `android/view/View` (declared on View, NOT overridden, so one
+  binding covers every View subclass incl. SurfaceView by inheritance) — frees the peer via the bounds+generation-
+  checked `view_registry::free`, and MUST tolerate `widget == 0`/stale/fabricated gracefully (the failed-construct
+  path leaves `View.widget` at the `long` default 0, then the finalizer calls `native_destructor(0)`): it logs +
+  ignores any `Err`, NEVER throwing on the FinalizerDaemon thread. Deliberately NOT bound (discovery signal stays
+  loud, per policy): `SurfaceView.native_createSnapshot`/`native_postSnapshot` (off the EGL render path — the
+  `lockCanvas` software-blit path Roblox doesn't use), `View.native_measure`/`native_layout`/`native_queueAllocate`
+  (whether they fire is RBXSurfaceView-bytecode/owner-run-data-gated). SURFACE WIRING DEFERRED (not a punt — the
+  NDK/EGL HALF is already proven): the SurfaceHolder surface → host `ANativeWindow` render-integration is scoped to
+  the NEXT workflow; `eclipse_anativewindow_fromsurface` already IGNORES its jobject arg and returns the real
+  process-global WSI window (`ndk_registry::current_wsi_window`), and `gl_test_anw_binds_real_wsi_handle` is green —
+  the remaining work is `graphics.rs::run_windowed` WSI publish (`EngineNativeWindow::new` +
+  `register_wsi_window`/`set_engine_window_geometry`, today ZERO in graphics.rs/main.rs so production
+  `ANativeWindow_fromSurface` always hits the geometry-only fallback) + present-loop ownership handoff + JNI-
+  dispatching SurfaceView's private `surfaceCreated()`/`surfaceChanged()` once the WSI surface is live (no Java
+  caller in vendored ATL; Eclipse must drive them — precedent: `View.layoutInternal` JNI-called from native). **⇐
+  START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>`
+  with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the empirical bind→boot→next-gap
+  loop — expect `RBXSurfaceView` to now CONSTRUCT (NO `UnsatisfiedLinkError` on `SurfaceView.native_constructor`; a
+  `view_registry` peer naming `com.roblox.client.RBXSurfaceView` is allocated and LayoutInflater completes the
+  content view), and NO finalizer-thread `UnsatisfiedLinkError` on `View.native_destructor` (the failed-construct
+  finalizer path is gone because the constructor now succeeds; confirm from the log that `native_destructor` is no
+  longer reached with `widget == 0`, and that real RBXSurfaceView destructor calls pass a valid handle `free()`
+  accepts — pure log observation, no binary inspection). Then EITHER the next unbound framework native surfaces on
+  the inflate→attach→surface-available path in the same one-per-boot discovery way (capture its exact ART stack — in
+  particular whether/when libroblox, via its reflection-registered `AndroidGLView` SurfaceHolder.Callback, calls
+  `SurfaceView.getHolder().addCallback(...)`, what triggers the private `surfaceCreated()`/`surfaceChanged()` and on
+  which thread, and whether the engine's GL/EGL targets THIS RBXSurfaceView via `getHolder().getSurface()` →
+  `ANativeWindow_fromSurface` vs a separate AndroidGLView surface — all libroblox-internal RUNTIME behavior, NOT
+  first-party-determinable, NOT to be obtained by reverse-engineering libroblox.so), OR the view tree completes and
+  the engine's SurfaceHolder.Callback / AndroidGLView surface path begins — at which point the RENDER-INTEGRATION
+  frontier is ACTIVE and success looks like: the engine's surfaceCreated path fires, EGL context creation succeeds,
+  and the FIRST engine frames appear in the winit window (the prize). The NDK/EGL path is de-risked
+  (`gl_test_anw_binds_real_wsi_handle` green); the next workflow is the graphics.rs WSI publish + present-loop
+  handoff + the surfaceCreated/surfaceChanged JNI-dispatch described above, designed AFTER the owner boot reveals
+  the post-construction call chain.)** Gate: **550 unit + 4 integration (live milestone subprocesses, 0 SKIP) + 2
+  doctests = 556 passed, 0 failed**, fmt/clippy `-D warnings`/release all 0-warning. Detail: §6 (2026-06-13
+  SurfaceView/native_destructor entry).
 - **2026-06-13 — 🪟 `View.native_get_window` BOUND — the last evidence-pinned blocker on the
   ActivityNativeMain.onCreate view-tree path is closed (the EXIT=124 boot's only remaining gap).** Owner live
   validation of the exit-10 fix chain (`/tmp/eclipse-exit10-validate.log`, EXIT=124 clean, NO coredump, ZERO
@@ -154,24 +212,15 @@ before any history-rewriting/force operation.
   no host layout signal; ViewTreeObserver.java:1049, called from `addOnGlobalLayoutListener` right after
   `getViewTreeObserver`) via the new `register_view_tree_observer_natives` wired into `drive_lifecycle` after
   `register_view_natives`. Deliberately NOT bound (discovery signal stays loud, per policy):
-  `View.native_getMatrix`, `View.native_getGlobalVisibleRect` — not on the captured path. **⇐ START HERE NEXT
-  SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
-  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the empirical bind→boot→next-gap loop —
-  expect ActivityNativeMain.onCreate to now get PAST `native_get_window` (NO `UnsatisfiedLinkError` on it). Confirm
-  in the boot log that `Window.set_jobject: captured Java Window object` fires BEFORE the `native_get_window` call
-  in onCreate (the one timing assumption the non-null path depends on — inferred sound from `internalCreateActivity`
-  ordering, observe it; if it does NOT, `getViewTreeObserver` returns a floating observer that never fires layout
-  callbacks). Then EITHER the next unbound framework native surfaces in the same one-per-boot discovery way (capture
-  its exact ART stack — predicted `ViewTreeObserver.native_set_have_global_layout_listeners` is now bound, so it
-  should PASS and the genuine next trip surfaces), OR the view tree completes and the engine's
-  `AndroidGLView`/ANativeWindow surface path begins — the standing RENDER-INTEGRATION frontier (wire the window's
-  `ANativeWindow` → the engine's `AndroidGLView`/EGL path; the `__gl-test-anw` diagnostic already proves
-  engine-GLES2-on-Eclipse's-window works — `gl_test_anw_binds_real_wsi_handle` is green; the boot just doesn't WIRE
-  it yet). Watch for a `getInsetsController` NPE on an early/uncaptured path — `View.java:2323` derefs
-  `native_get_window(widget)` without a null guard (pre-existing, not this diff); the fix if it trips is the
-  set_jobject capture timing, not the native.)** Gate: **548 unit + 4 integration (live milestone subprocesses,
-  0 SKIP) + 2 doctests = 554 passed, 0 failed**, fmt/clippy `-D warnings`/release all 0-warning. Detail: §6
-  (2026-06-13 native_get_window entry).
+  `View.native_getMatrix`, `View.native_getGlobalVisibleRect` — not on the captured path. [START-HERE marker moved
+  2026-06-13 to the SurfaceView entry above — this owner live validation HAPPENED: `native_get_window` is BOUND and
+  working (`/tmp/eclipse-getwindow-validate.log`, EXIT=124 clean), `ActivityNativeMain.onCreate` got PAST it and
+  proceeded into `d1()` → `LayoutInflater.inflate` constructing `com.roblox.client.RBXSurfaceView` (extends
+  android.view.SurfaceView) — the next discovery trip the prediction here named ("the view tree completes and the
+  engine's `AndroidGLView`/ANativeWindow surface path begins"); the new gap was the unbound SurfaceView
+  `native_constructor` + View `native_destructor`, now bound — see the entry above]. Gate: **548 unit + 4
+  integration (live milestone subprocesses, 0 SKIP) + 2 doctests = 554 passed, 0 failed**, fmt/clippy `-D warnings`/
+  release all 0-warning. Detail: §6 (2026-06-13 native_get_window entry).
 - **2026-06-13 — 🏁 NATIVE-CRASH LADDER CLIMBED + EXIT=10 ROOT-CAUSED + FIXED (owner live validation of `54153e1`,
   `/tmp/eclipse-1223806-validate.log`, EXIT=10, NO coredump): ZERO SIGSEGV/SIGABRT this boot — the whole 4-core fix
   chain (782252 `__sF` → 866509 apkenv+altstack → 947663 thread-exit ordering → 1223806 dl_iterate_phdr/dladdr +
@@ -2073,6 +2122,128 @@ trace line (the engine's actual resolver arguments) is the first thing to read.
   `ViewTreeObserver.native_set_have_global_layout_listeners`, now bound → should PASS, then the genuine next trip),
   or the view tree completing and the engine's `AndroidGLView` surface path beginning (the render-integration
   frontier). *Files:* `src/framework.rs`, `src/framework/window_registry.rs`. *No subagent live boot.*
+
+### 2026-06-13 — `SurfaceView.native_constructor` + `View.native_destructor` bound — Roblox's `RBXSurfaceView` GL render surface now constructs (LayoutInflater can complete ActivityNativeMain's content view); the engine SurfaceHolder/ANativeWindow render-integration is the scoped next-workflow step
+
+*Confirmed root cause (first-party + live-evidence — owner boot of `95f964c`, `/tmp/eclipse-getwindow-validate.log`,
+EXIT=124 clean):* with `native_get_window` bound (entry above), `ActivityNativeMain.onCreate` proceeded into
+`com.roblox.client.ActivityNativeMain.d1()` → `android.view.LayoutInflater.inflate`, which constructs
+`com.roblox.client.RBXSurfaceView` (extends `android.view.SurfaceView` — THE engine's GL render surface) and died on
+two coupled unbound natives:
+1. `No implementation found for long android.view.SurfaceView.native_constructor(android.content.Context,
+   android.util.AttributeSet)` (`SurfaceView.native_constructor` → `View.<init>` → `LayoutInflater.createView` →
+   `ActivityNativeMain.d1` → `onCreate` → `Activity.nativeStartActivity`).
+2. Then, on the ART FinalizerDaemon cleaning up the half-built View, `No implementation found for void
+   android.view.View.native_destructor(long)` (`View.native_destructor` → `View.finalize` → `FinalizerDaemon`).
+
+After the exception Roblox's watchdog logged `Simulate crash with reason: RBXCRASH-HangDetected` — the main-thread
+onCreate failure tripped its hang detector. *Mechanism (first-party-verified):* (a) SurfaceView
+`@Override`-re-declares `native_constructor(Context, AttributeSet) -> long` (vendored `SurfaceView.java:40`,
+returns a native peer handle that `View.java:965` stores in the `long widget` field) and ART resolves natives PER
+DECLARING CLASS — so the existing View-class binding did NOT satisfy SurfaceView; it needs its OWN `RegisterNatives`
+on `android/view/SurfaceView` (same per-class pattern already handled for TextView/ImageView/ImageButton). (b)
+`View.native_destructor(long widget)` (`View.java:1168`, called from `View.finalize` `View.java:1679` to free that
+peer) was declared on View, NOT overridden by any subclass, and genuinely never bound (zero `view_native_destructor`
+/ `VIEW_NATIVE_DESTRUCTOR` references in src; the `register_view_natives` table had no destructor entry).
+
+*Fix (both root causes — both land together; binding only one leaves the other's `UnsatisfiedLinkError`,
+`src/framework.rs`):*
+- NEW `pub const SURFACE_VIEW_CLASS = jni_str!("android/view/SurfaceView")` + NEW `register_surface_view_natives(env)`
+  (an exact mirror of `register_image_view_natives`/`register_image_button_natives`): `find_class(SURFACE_VIEW_CLASS)`
+  + one `NativeMethod::from_raw_parts(VIEW_NATIVE_CONSTRUCTOR_NAME, VIEW_NATIVE_CONSTRUCTOR_SIG,
+  view_native_constructor)`. No new constructor body — it reuses the EXISTING class-agnostic
+  `view_native_constructor`, which reads the receiver's concrete class via `getClass().getName()` (so it records
+  `com.roblox.client.RBXSurfaceView` in `view_registry`) and allocates a real generational slab handle ≥ 1 (never the
+  reserved 0), making `View.widget` non-zero so SurfaceView copies it into `mSurface.widget`
+  (`SurfaceView.java:18,24`) and `Surface.isValid()` holds. Wired into `drive_lifecycle` right after
+  `register_image_button_natives` (before step 4), so it is bound before `LayoutInflater` runs — the SAME ordering
+  proven for the other per-class View-subclass registrations.
+- NEW consts `VIEW_NATIVE_DESTRUCTOR_NAME = jni_str!("native_destructor")` / `VIEW_NATIVE_DESTRUCTOR_SIG =
+  jni_str!("(J)V")` (dated, citing `View.java:1168`/finalize:1679) + NEW `extern "system" fn view_native_destructor`
+  added to the EXISTING `register_view_natives` method table on `android/view/View` (declared on View and not
+  overridden → one binding covers SurfaceView and every View subclass by inheritance; no new register fn for the
+  destructor). It calls the bounds+generation-checked `view_registry::free(widget)` inside
+  `env.with_env(...).resolve::<LogErrorAndDefault>()` and on `Err` logs + ignores — NEVER throwing. CRITICAL coupling:
+  it MUST tolerate `widget == 0` and any stale/fabricated handle, because in the live crash `native_constructor`
+  THREW so `widget = native_constructor(...)` (`View.java:965`) never assigned and `widget` stayed the `long` default
+  0, then the finalizer ran `native_destructor(0)`. `view_registry::free(0)` safely returns `Err` (0 → index0/gen0;
+  live generations are ≥ 1 → `StaleHandle`/`OutOfRange`), and `with_env` is `catch_unwind`-guarded — so a fault on the
+  FinalizerDaemon thread cannot re-produce the live boot's second `UnsatisfiedLinkError`-shaped failure. This is also
+  the FIRST runtime caller of `view_registry::free` (before this, View slots leaked for the process lifetime).
+
+*Surface wiring — DELIBERATELY DEFERRED to the next workflow (not a punt; first-party-grounded):* the engine's
+NDK/EGL HALF is already complete and proven — `eclipse_anativewindow_fromsurface` (`native_provider.rs`) IGNORES its
+jobject arg and returns `ndk_registry::current_wsi_window()` (the process-global real WSI `EGLNativeWindowType`),
+`EngineNativeWindow::new` mints+registers it and `EngineGlSurface::from_ndk_window` renders over it (`egl_engine.rs`),
+and the integration test `gl_test_anw_binds_real_wsi_handle` is green. So the Java Surface peer is NOT how the engine
+reaches the window — binding `native_constructor` does NOT block on any Surface→ANW plumbing. The wiring is genuinely
+large (three production-path facts none yet coded — `register_wsi_window`/`EngineNativeWindow`/
+`set_engine_window_geometry` exist ONLY in `egl_engine.rs`, ZERO in `graphics.rs`/`main.rs`, so production
+`ANativeWindow_fromSurface` always hits the geometry-only fallback; present-loop ownership handoff between
+run_windowed's Vulkan loop and the engine; and the Java trigger — SurfaceView's `surfaceCreated()`/`surfaceChanged()`
+are PRIVATE with no Java caller in vendored ATL, so Eclipse must JNI-dispatch them once its winit WSI surface is live,
+precedent `View.layoutInternal`). The exact post-construction call chain is libroblox-internal RUNTIME behavior,
+observable ONLY on the live boot and NOT to be obtained by reverse-engineering libroblox.so — binding
+constructor+destructor IS the one-native-per-boot step that surfaces it.
+
+*Recorded-only (deliberately NOT bound — per the discovery-signal policy, unbound stays the loud signal):*
+`SurfaceView.native_createSnapshot()J` / `native_postSnapshot(long, long)V` (`SurfaceView.java:42-43`) — off the
+Roblox EGL render path (reached only via `lockCanvas`/`unlockCanvasAndPost`, the GskCanvas software-blit path Roblox
+doesn't use); `SurfaceView.surfaceCreated()` / `surfaceChanged(int,int,int)` (PRIVATE, `SurfaceView.java:27-37`) —
+the surface-lifecycle DELIVERY methods Eclipse must JNI-dispatch in the next workflow, not a native to bind;
+`View.native_measure(JII)V` / `native_layout(JIIII)V` / `native_queueAllocate(J)V` — on the inflate→layout path but
+whether they fire is RBXSurfaceView-bytecode (third-party) / owner-run-data-gated, bind reactively if a next boot
+surfaces them; production WSI wiring into `graphics.rs::run_windowed` `resumed` + present-loop handoff (the
+next-workflow render build, scoped above).
+
+*Same-pattern audit:* `native_destructor` is declared ONLY on View (grep of vendored `View.java` — once at :1168, no
+subclass override), so the single `android/view/View` binding covers RBXSurfaceView/SurfaceView/TextView/ImageView/
+ImageButton by inheritance — no equivalent-instance gap. `native_constructor` is `@Override`-re-declared by SurfaceView
+(`SurfaceView.java:40`) and ART resolves per declaring class — the same per-class pattern already handled for
+View/TextView/ImageView/ImageButton, so SurfaceView was the one missing per-class binding; the recordedOnly natives
+have zero src references (verified left unbound as loud discovery signals). No surface→ANativeWindow wiring was added;
+the proven `egl_engine`/`__gl-test-anw`/`ndk_registry` path is untouched. The diff's asymmetry (per-class bind for the
+constructor, View-only bind for the destructor) is exactly the correct consequence of these two facts.
+
+*Regression guards (tied to the confirmed root cause):* NEW `surface_view_class_is_slashed_internal_name`
+(`src/framework.rs`) pins `SURFACE_VIEW_CLASS == "android/view/SurfaceView"` so `register_surface_view_natives`'
+`find_class` cannot drift into a boot-time `NoClassDefFoundError`; EXTENDED
+`view_native_names_sigs_and_class_match_view_java` to pin `VIEW_NATIVE_DESTRUCTOR_NAME == "native_destructor"` /
+`VIEW_NATIVE_DESTRUCTOR_SIG == "(J)V"` (a descriptor drift would re-produce the exact runtime `UnsatisfiedLinkError`
+on the finalizer thread instead of failing in-harness); NEW `view_registry::tests::
+surface_view_peer_round_trips_and_destructor_tolerates_null` (`src/framework/view_registry.rs`) proves a real
+`allocate("com.roblox.client.RBXSurfaceView")` peer frees cleanly AND `free(0)` (the failed-construct finalizer path)
+returns `Err`, never panics — the two exact properties `view_native_destructor` relies on (the existing
+`out_of_range_and_fabricated_handles_return_err_not_panic` / `double_free_is_rejected` already cover the broader
+stale/double-free soundness). As with every prior View native, the binding-PRESENCE guard (a missing
+`RegisterNatives` only surfaces under a live ART boot, which can't run in-harness) is the documented owner dev-host
+live boot.
+
+*Verification (full gate, clean working tree, no machine-specific assumptions):* `cargo fmt --all --check` CLEAN;
+`cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings;
+`cargo test` **550 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP — APK+display present, exact
+success markers required, including `gl_test_anw_binds_real_wsi_handle` and the 3427-constructor init) + 2 doctests =
+556 passed, 0 failed**; `cargo build --release` clean (stripped PIE x86-64). Unit count 548→550 (+1
+`surface_view_class_is_slashed_internal_name`, +1 `surface_view_peer_round_trips_and_destructor_tolerates_null`). *Did
+NOT live-boot ART (no `cargo run` / `__*` subcommands) and did NOT inspect any third-party binary — first-party only.*
+
+*OWNER-RUN DATA NEEDED (dev-host live boot, prohibited here — `./target/release/eclipse run <APK>` with
+`ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`):* (1) confirm `RBXSurfaceView` `<init>` gets
+PAST `native_constructor` (NO `UnsatisfiedLinkError`) and a `view_registry` peer naming
+`com.roblox.client.RBXSurfaceView` is logged, and LayoutInflater completes the content view; (2) confirm NO
+finalizer-thread `UnsatisfiedLinkError` on `View.native_destructor`, and (pure log observation) that
+`native_destructor` is no longer reached with `widget == 0` (because the constructor now succeeds) and that real
+RBXSurfaceView destructor calls pass a valid handle `free()` accepts; (3) capture the NEXT unbound-native ART stack on
+the inflate→attach→surface-available path — specifically whether/when libroblox (via its reflection-registered
+`AndroidGLView` SurfaceHolder.Callback) calls `SurfaceView.getHolder().addCallback(...)`, what triggers the private
+`surfaceCreated()`/`surfaceChanged()` and on which thread, and whether the engine's GL/EGL targets THIS RBXSurfaceView
+(`getHolder().getSurface()` → `ANativeWindow_fromSurface`) vs a separate AndroidGLView surface — all libroblox-internal
+RUNTIME behavior, NOT first-party-determinable and NOT to be obtained by reverse-engineering libroblox.so. Once that
+post-construction call chain is observed, the render-integration frontier is ACTIVE and the next-workflow build is the
+`graphics.rs::run_windowed` WSI publish + present-loop ownership handoff + JNI-dispatch of
+`surfaceCreated()`/`surfaceChanged()` on top of the already-green ANW path; success looks like EGL context creation
+succeeding and the FIRST engine frames in the winit window. *Files:* `src/framework.rs`,
+`src/framework/view_registry.rs`. *No subagent live boot.*
 
 ---
 
