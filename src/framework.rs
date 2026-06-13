@@ -4424,6 +4424,26 @@ const VIEW_NATIVE_GET_WINDOW_SIG: &JNIStr = jni_str!("(J)Landroid/view/Window;")
 const VIEW_NATIVE_DESTRUCTOR_NAME: &JNIStr = jni_str!("native_destructor");
 const VIEW_NATIVE_DESTRUCTOR_SIG: &JNIStr = jni_str!("(J)V");
 
+// 2026-06-13: `View.setBackgroundColor(int)` is itself a native (View.java line 1284,
+// `public native void setBackgroundColor(int color);`) — an INSTANCE native that takes only the ARGB
+// color and reads the receiver's [`view_registry`] handle off `this.widget`, descriptor `(I)V`.
+// (Distinct from the pre-existing `native_setBackgroundColor(long, int)` `(JI)V` binding above, a
+// separate legacy entry; the current vendored View.java declares only this `(I)V` form, called from
+// View.java line 975 when a ColorDrawable background is applied.) Records the solid background
+// color on the peer (renderer-consumed, real fidelity) — the same state `view_registry::set_background_color`
+// already backs.
+const VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_NAME: &JNIStr = jni_str!("setBackgroundColor");
+const VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_SIG: &JNIStr = jni_str!("(I)V");
+
+// 2026-06-13: `View.setKeepScreenOn(boolean)` calls `native_keep_screen_on(widget, screenOn)` to keep
+// the device screen awake while attached (View.java lines 1982-1986). `View.java` line 1982 declares
+// `private static native void native_keep_screen_on(long widget, boolean keepScreenOn);` → a STATIC
+// native, descriptor `(JZ)V`. Eclipse's host has no Android screen-wake concept (the desktop window's
+// power state is the compositor's concern, not the Android View's) and no native getter reads it back,
+// so the honest backing validates the view handle and no-ops (mirrors `nativeSetFullscreen`).
+const VIEW_KEEP_SCREEN_ON_NAME: &JNIStr = jni_str!("native_keep_screen_on");
+const VIEW_KEEP_SCREEN_ON_SIG: &JNIStr = jni_str!("(JZ)V");
+
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
 /// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
@@ -4906,6 +4926,83 @@ extern "system" fn view_native_destructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.setBackgroundColor(int color)` → record the solid ARGB background color on the receiver's
+/// [`view_registry`] peer (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void with descriptor `(I)V` — no widget param; the receiver's
+/// [`view_registry`] handle is read off `this.widget` (like [`text_view_native_set_text`]). `color` is
+/// `Color.argb`/`0xAARRGGBB`. Records it through the bounds+generation-checked
+/// [`view_registry::set_background_color`] (a bad handle is logged + ignored, never UB); the renderer's
+/// layout pass fills the view's rect with this color (real fidelity, the same consumer as the
+/// `(JI)V` form). Surfaced for the inflatable widget set — `View.java` line 1284 declares it native.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn view_set_background_color_no_handle<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    color: jint,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let widget = view_widget_handle(env, &this);
+        match view_registry::set_background_color(widget, color) {
+            Ok(()) => tracing::trace!(
+                target: "android.view.View",
+                widget,
+                color = format_args!("0x{:08x}", u32::from_ne_bytes(color.to_ne_bytes())),
+                "View.setBackgroundColor: recorded background color on view peer"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.setBackgroundColor: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_keep_screen_on(long widget, boolean keepScreenOn)` → validate the handle; no-op
+/// (no Android screen-wake concept on the host window, 2026-06-13).
+///
+/// JNI ABI: a STATIC native returning void (`(JZ)V`; jni 0.22 maps `jboolean` to Rust `bool`). `widget`
+/// is the view's [`view_registry`] handle. Validates it through the bounds+generation-checked
+/// [`view_registry`] (a bad handle is logged + ignored, never UB) and no-ops: keeping the device screen
+/// awake is the compositor's/host's concern, not the Android View's, and no native getter reads it back.
+/// Surfaced for the inflatable widget set — `View.java` line 1982 declares it native static.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic. Static native: receiver is the `JClass`, taken but unused.
+extern "system" fn view_keep_screen_on<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    widget: jlong,
+    keep_screen_on: jboolean,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                keep_screen_on,
+                error = %e,
+                "View.native_keep_screen_on: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget,
+                keep_screen_on,
+                "View.native_keep_screen_on: validated handle, no-op (no host screen-wake concept)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
 ///
 /// Registered before the lifecycle drive, alongside the other framework natives, since step 4
@@ -5032,6 +5129,26 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 view_native_destructor as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `view_set_background_color_no_handle` matches the paired `(I)V` signature as an
+        // instance native (View.java line 1284, `public native void setBackgroundColor(int)`); the
+        // cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_NAME,
+                VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_SIG,
+                view_set_background_color_no_handle as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `view_keep_screen_on` matches the paired `(JZ)V` signature as a STATIC native
+        // (View.java line 1982, `private static native void native_keep_screen_on(long, boolean)`); the
+        // cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                VIEW_KEEP_SCREEN_ON_NAME,
+                VIEW_KEEP_SCREEN_ON_SIG,
+                view_keep_screen_on as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/view/View; `methods` hold valid fn pointers whose
     // signatures match the class's `native` declarations (verified against View.java lines 1166/1310,
@@ -5041,7 +5158,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/View",
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + setBackgroundColor + native_keep_screen_on"
     );
     Ok(())
 }
@@ -7075,15 +7192,25 @@ fn register_surface_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
 /// be pure boilerplate. Each name is verified to declare the 2-arg `native_constructor` directly (see
 /// the section comment); `register_view_subclass_constructor_natives` binds exactly this set, and
 /// `view_subclass_constructor_classes_are_slashed_internal_names` pins it so a dropped class fails CI.
+// Internal/slashed class names (single source of truth, reused by `register_widget_property_setter_natives`).
+pub const BUTTON_CLASS: &JNIStr = jni_str!("android/widget/Button");
+pub const EDIT_TEXT_CLASS: &JNIStr = jni_str!("android/widget/EditText");
+pub const PROGRESS_BAR_CLASS: &JNIStr = jni_str!("android/widget/ProgressBar");
+pub const CHECK_BOX_CLASS: &JNIStr = jni_str!("android/widget/CheckBox");
+pub const RADIO_BUTTON_CLASS: &JNIStr = jni_str!("android/widget/RadioButton");
+pub const SEEK_BAR_CLASS: &JNIStr = jni_str!("android/widget/SeekBar");
+pub const SPINNER_CLASS: &JNIStr = jni_str!("android/widget/Spinner");
+pub const SCROLL_VIEW_CLASS: &JNIStr = jni_str!("android/widget/ScrollView");
+
 const VIEW_SUBCLASS_CONSTRUCTOR_CLASSES: &[&JNIStr] = &[
-    jni_str!("android/widget/Button"),
-    jni_str!("android/widget/EditText"),
-    jni_str!("android/widget/ProgressBar"),
-    jni_str!("android/widget/CheckBox"),
-    jni_str!("android/widget/RadioButton"),
-    jni_str!("android/widget/SeekBar"),
-    jni_str!("android/widget/Spinner"),
-    jni_str!("android/widget/ScrollView"),
+    BUTTON_CLASS,
+    EDIT_TEXT_CLASS,
+    PROGRESS_BAR_CLASS,
+    CHECK_BOX_CLASS,
+    RADIO_BUTTON_CLASS,
+    SEEK_BAR_CLASS,
+    SPINNER_CLASS,
+    SCROLL_VIEW_CLASS,
 ];
 
 /// Bind Eclipse's own (non-GTK) backing for the `native_constructor` of every concrete inflatable
@@ -7125,6 +7252,532 @@ fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), Frame
             "registered Eclipse's non-GTK backing for native_constructor on inflatable View subclass"
         );
     }
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for the inflatable android.widget.* property setters =========
+//
+// 2026-06-13: with each inflatable widget's `native_constructor` bound (above), `LayoutInflater` builds
+// the content view and the widgets' own property-setter natives surface one at a time (the trigger was
+// `No implementation found for void android.widget.ProgressBar.native_setIndeterminate(boolean)`). ART
+// resolves natives PER DECLARING CLASS, so each property setter is bound on the class that declares it
+// (verified against the vendored ATL overlay `vendor/atl/src/api-impl/android/widget/`). Honest
+// semantics, per widget:
+//   * Text setters (`Button`/`EditText`/`CheckBox` `native_setText(long, String)`, `RadioButton`
+//     `setText(CharSequence)`) RECORD the text on the view-registry peer — the renderer draws
+//     `RenderNode.text`, so it is load-bearing consumed state (reuses the [`text_view_native_set_text`]
+//     pattern).
+//   * `ScrollView.native_addView`/`native_removeView` re-declare ViewGroup's tree-wiring natives on
+//     their own class (ScrollView.java:20/22); they reuse the class-agnostic
+//     [`view_group_native_add_view`]/[`view_group_native_remove_view`] bodies, recording the real
+//     parent→child tree edges the renderer walks.
+//   * Progress/indeterminate/max/adapter/compound-drawable setters are VALIDATED-HANDLE NO-OPS: the
+//     headless renderer draws none of these widget chromes (real game frames come from the engine GL
+//     surface, not these android.widget views), there is no view-registry field they feed, and — the
+//     decisive check — NO bound native getter reads them back, so the Java caller does not depend on a
+//     native side effect (ProgressBar/Spinner's getters return Java fields; SeekBar's `native_getProgress`
+//     is left UNBOUND — see below). They mirror the existing `ImageView.native_setScaleType`/
+//     `View.nativeSetFullscreen` validated-no-op setters.
+//
+// DELIBERATELY LEFT UNBOUND (return value drives Java control flow — must not be no-op'd, per policy;
+// each surfaces loudly as the next discovery signal if a real layout calls it):
+//   * `SeekBar.native_getProgress(long) -> int` (SeekBar.java:20, the return of `SeekBar.getProgress()`).
+//   * `EditText.native_getText(long) -> String` (EditText.java:25, feeds `getText()`/`getEditableText()`).
+//   * `Button.getText() -> CharSequence` (Button.java:51).
+//   * `CheckBox`/`RadioButton` `isChecked() -> boolean` + their coupled `setChecked(boolean)` — a
+//     stateful boolean pair with NO consumed view-registry field; no-op'ing `setChecked` while
+//     `isChecked` reads it back would be a silent wrong answer, so BOTH stay unbound (the loud
+//     `isChecked` trip is the honest signal) rather than faking the setter.
+//   * Listener registrations (`*OnClickListener`/`*OnCheckedChangeListener`/`setOnSeekBarChangeListener`/
+//     `setOnItemSelectedListener`/`native_addTextChangedListener`/`native_removeTextChangedListener`/
+//     `native_setOnEditorActionListener`/`setOnItemSelectedListener`) — not property setters; whether
+//     they fire is RBX-bytecode/owner-run-data-gated, so each stays the deliberate discovery signal.
+
+// JNI names + descriptors, exactly as declared in the vendored ATL overlay. The `native_setText`
+// text-recording setters all share `(JLjava/lang/String;)V` (an explicit `long widget` + String) but
+// are declared on three different classes, so each is bound on its own class with the shared body.
+const WIDGET_NATIVE_SET_TEXT_NAME: &JNIStr = jni_str!("native_setText");
+const WIDGET_NATIVE_SET_TEXT_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
+
+// `RadioButton.setText(CharSequence)` (RadioButton.java:29) is a native taking a CharSequence and no
+// explicit widget (reads `this.widget`), descriptor `(Ljava/lang/CharSequence;)V`.
+const RADIO_BUTTON_SET_TEXT_NAME: &JNIStr = jni_str!("setText");
+const RADIO_BUTTON_SET_TEXT_SIG: &JNIStr = jni_str!("(Ljava/lang/CharSequence;)V");
+
+// `ProgressBar.native_setIndeterminate(boolean)` (ProgressBar.java:106) reads `this.widget`, `(Z)V`.
+const PROGRESS_BAR_SET_INDETERMINATE_NAME: &JNIStr = jni_str!("native_setIndeterminate");
+const PROGRESS_BAR_SET_INDETERMINATE_SIG: &JNIStr = jni_str!("(Z)V");
+// `ProgressBar.native_setProgress(long, float)` (ProgressBar.java:50), `(JF)V`. SeekBar re-declares the
+// same `native_setProgress` (SeekBar.java:19) on its own class — same name/sig, bound there too.
+const PROGRESS_NATIVE_SET_PROGRESS_NAME: &JNIStr = jni_str!("native_setProgress");
+const PROGRESS_NATIVE_SET_PROGRESS_SIG: &JNIStr = jni_str!("(JF)V");
+// `SeekBar.native_setMax(long, int)` (SeekBar.java:21), `(JI)V`.
+const SEEK_BAR_SET_MAX_NAME: &JNIStr = jni_str!("native_setMax");
+const SEEK_BAR_SET_MAX_SIG: &JNIStr = jni_str!("(JI)V");
+// `Button.native_setCompoundDrawables(long, long)` (Button.java:43), `(JJ)V` — the `long paintable` is
+// a Drawable peer handle, not a view-registry handle.
+const BUTTON_SET_COMPOUND_DRAWABLES_NAME: &JNIStr = jni_str!("native_setCompoundDrawables");
+const BUTTON_SET_COMPOUND_DRAWABLES_SIG: &JNIStr = jni_str!("(JJ)V");
+// `Spinner.native_setAdapter(long, SpinnerAdapter)` (Spinner.java:27), `(JLandroid/widget/SpinnerAdapter;)V`.
+const SPINNER_SET_ADAPTER_NAME: &JNIStr = jni_str!("native_setAdapter");
+const SPINNER_SET_ADAPTER_SIG: &JNIStr = jni_str!("(JLandroid/widget/SpinnerAdapter;)V");
+
+/// `<Widget>.native_setText(long widget, String text)` → record the text on the receiver's
+/// [`view_registry`] peer (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void with an explicit `long widget` first arg (Button.java:40,
+/// EditText.java:29, CheckBox.java:44; all `(JLjava/lang/String;)V`). Records `text` (null → cleared)
+/// on the peer through the bounds+generation-checked [`view_registry`] (a stale/fabricated handle is
+/// logged + ignored, never UB). The renderer draws `RenderNode.text`, so this is consumed state.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn widget_native_set_text<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    text: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let value = if text.is_null() {
+            None
+        } else {
+            Some(text.try_to_string(env)?)
+        };
+        match view_registry::with_view(widget, |v| v.text = value.clone()) {
+            Ok(()) => tracing::debug!(
+                target: "android.widget",
+                widget,
+                text = value.as_deref().unwrap_or(""),
+                "Widget.native_setText: recorded text on non-GTK view peer"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget",
+                widget,
+                error = %e,
+                "Widget.native_setText: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `RadioButton.setText(CharSequence text)` → record the text on the receiver's [`view_registry`] peer
+/// (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void with descriptor `(Ljava/lang/CharSequence;)V` — no widget
+/// param; the handle is read off `this.widget`. `text` is a `CharSequence`; its `toString()` is the
+/// recorded label (null → cleared). Records it through the bounds+generation-checked [`view_registry`]
+/// (a bad handle is logged + ignored, never UB); the renderer draws `RenderNode.text`.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn radio_button_set_text<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    text: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let widget = view_widget_handle(env, &this);
+        // A CharSequence is not a String — call toString() to get the displayable text. A null
+        // CharSequence clears the text (records None).
+        let value = if text.is_null() {
+            None
+        } else {
+            let s = env
+                .call_method(
+                    &text,
+                    jni_str!("toString"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )?
+                .l()?;
+            Some(JString::cast_local(env, s)?.try_to_string(env)?)
+        };
+        match view_registry::with_view(widget, |v| v.text = value.clone()) {
+            Ok(()) => tracing::debug!(
+                target: "android.widget.RadioButton",
+                widget,
+                text = value.as_deref().unwrap_or(""),
+                "RadioButton.setText: recorded text on non-GTK view peer"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.RadioButton",
+                widget,
+                error = %e,
+                "RadioButton.setText: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `ProgressBar.native_setIndeterminate(boolean indeterminate)` → validate the handle; no-op
+/// (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void with descriptor `(Z)V` — no widget param; the handle is
+/// read off `this.widget`. The headless renderer draws no progress-bar chrome and no bound native
+/// getter reads the flag back (`ProgressBar.isIndeterminate()` returns a Java field, ProgressBar.java:52),
+/// so this validates the handle through the bounds+generation-checked [`view_registry`] (a bad handle
+/// is logged + ignored, never UB) and no-ops — the honest backing of the surfaced trigger.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn progress_bar_set_indeterminate<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    indeterminate: jboolean,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let widget = view_widget_handle(env, &this);
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.widget.ProgressBar",
+                widget,
+                indeterminate,
+                error = %e,
+                "ProgressBar.native_setIndeterminate: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.widget.ProgressBar",
+                widget,
+                indeterminate,
+                "ProgressBar.native_setIndeterminate: validated handle, no-op (no progress chrome drawn)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `<ProgressBar|SeekBar>.native_setProgress(long widget, float fraction)` → validate the handle; no-op
+/// (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void with an explicit `long widget` first arg (ProgressBar.java:50,
+/// SeekBar.java:19; both `(JF)V`). The headless renderer draws no progress chrome and no bound native
+/// getter reads the value back (ProgressBar's `getProgress()` is a Java field; SeekBar's
+/// `native_getProgress` is left UNBOUND), so this validates the handle through the bounds+generation-
+/// checked [`view_registry`] (a bad handle is logged + ignored, never UB) and no-ops.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn progress_native_set_progress<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    fraction: jfloat,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => tracing::trace!(
+                target: "android.widget",
+                widget,
+                fraction,
+                "Widget.native_setProgress: validated handle, no-op (no progress chrome drawn)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget",
+                widget,
+                error = %e,
+                "Widget.native_setProgress: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `SeekBar.native_setMax(long widget, int max)` → validate the handle; no-op (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void, descriptor `(JI)V` (SeekBar.java:21). The headless
+/// renderer draws no seek-bar chrome and no bound native getter reads `max` back (`native_getProgress`
+/// is left UNBOUND), so this validates the handle through the bounds+generation-checked [`view_registry`]
+/// (a bad handle is logged + ignored, never UB) and no-ops.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn seek_bar_set_max<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    max: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => tracing::trace!(
+                target: "android.widget.SeekBar",
+                widget,
+                max,
+                "SeekBar.native_setMax: validated handle, no-op (no seek-bar chrome drawn)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.SeekBar",
+                widget,
+                error = %e,
+                "SeekBar.native_setMax: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Button.native_setCompoundDrawables(long widget, long paintable)` → validate the view handle; no-op
+/// (compound-drawable draw deferred, 2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void, descriptor `(JJ)V` (Button.java:43). `widget` is the
+/// view's [`view_registry`] handle; `paintable` is a `Drawable` peer handle (the non-pointer sentinel
+/// from `Drawable.native_constructor`) — taken but NOT dereferenced (not a registry handle). Validates
+/// the `widget` handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
+/// ignored, never UB) and no-ops: compound-drawable rasterization is the deferred drawable/Skia path,
+/// mirroring [`view_native_set_background_drawable`].
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn button_set_compound_drawables<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    paintable: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => tracing::trace!(
+                target: "android.widget.Button",
+                widget,
+                paintable,
+                "Button.native_setCompoundDrawables: validated handle, no-op (drawable draw deferred)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.Button",
+                widget,
+                error = %e,
+                "Button.native_setCompoundDrawables: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Spinner.native_setAdapter(long widget, SpinnerAdapter adapter)` → validate the view handle; no-op
+/// (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void, descriptor `(JLandroid/widget/SpinnerAdapter;)V`
+/// (Spinner.java:27). `widget` is the view's [`view_registry`] handle; `adapter` is the Java adapter,
+/// taken but NOT dereferenced. The headless renderer draws no spinner dropdown and `Spinner.getAdapter()`
+/// returns the Java-side adapter (not a native read), so no caller depends on a native side effect; this
+/// validates the handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
+/// ignored, never UB) and no-ops.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn spinner_set_adapter<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    _adapter: JObject<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => tracing::trace!(
+                target: "android.widget.Spinner",
+                widget,
+                "Spinner.native_setAdapter: validated handle, no-op (no spinner dropdown drawn)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.widget.Spinner",
+                widget,
+                error = %e,
+                "Spinner.native_setAdapter: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for the property-setter natives of the inflatable
+/// `android.widget.*` View subclasses, each on its OWN declaring class (ART resolves natives per
+/// declaring class). Wired before step 4 so the `LayoutInflater` pass finds them.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
+/// do — every native is written to the exact descriptor the vendored ATL overlay declares (see the
+/// section comment for the per-class line references). Every body is `catch_unwind`-guarded via
+/// [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
+fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // Button: native_setText(long, String) records text; native_setCompoundDrawables(long, long) no-op.
+    {
+        let class = env.find_class(BUTTON_CLASS)?;
+        let methods = [
+            // SAFETY: `widget_native_set_text` matches Button.java:40's `(JLjava/lang/String;)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    WIDGET_NATIVE_SET_TEXT_NAME,
+                    WIDGET_NATIVE_SET_TEXT_SIG,
+                    widget_native_set_text as *mut std::ffi::c_void,
+                )
+            },
+            // SAFETY: `button_set_compound_drawables` matches Button.java:43's `(JJ)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    BUTTON_SET_COMPOUND_DRAWABLES_NAME,
+                    BUTTON_SET_COMPOUND_DRAWABLES_SIG,
+                    button_set_compound_drawables as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/Button; fn pointers match its native declarations.
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    // EditText: native_setText(long, String) records text.
+    {
+        let class = env.find_class(EDIT_TEXT_CLASS)?;
+        let methods = [
+            // SAFETY: `widget_native_set_text` matches EditText.java:29's `(JLjava/lang/String;)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    WIDGET_NATIVE_SET_TEXT_NAME,
+                    WIDGET_NATIVE_SET_TEXT_SIG,
+                    widget_native_set_text as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/EditText; fn pointer matches its native declaration.
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    // CheckBox: native_setText(long, String) records text.
+    {
+        let class = env.find_class(CHECK_BOX_CLASS)?;
+        let methods = [
+            // SAFETY: `widget_native_set_text` matches CheckBox.java:44's `(JLjava/lang/String;)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    WIDGET_NATIVE_SET_TEXT_NAME,
+                    WIDGET_NATIVE_SET_TEXT_SIG,
+                    widget_native_set_text as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/CheckBox; fn pointer matches its native declaration.
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    // RadioButton: setText(CharSequence) records text.
+    {
+        let class = env.find_class(RADIO_BUTTON_CLASS)?;
+        let methods = [
+            // SAFETY: `radio_button_set_text` matches RadioButton.java:29's `(Ljava/lang/CharSequence;)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    RADIO_BUTTON_SET_TEXT_NAME,
+                    RADIO_BUTTON_SET_TEXT_SIG,
+                    radio_button_set_text as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/RadioButton; fn pointer matches its native declaration.
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    // ProgressBar: native_setIndeterminate(boolean) + native_setProgress(long, float), both no-op.
+    {
+        let class = env.find_class(PROGRESS_BAR_CLASS)?;
+        let methods = [
+            // SAFETY: `progress_bar_set_indeterminate` matches ProgressBar.java:106's `(Z)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    PROGRESS_BAR_SET_INDETERMINATE_NAME,
+                    PROGRESS_BAR_SET_INDETERMINATE_SIG,
+                    progress_bar_set_indeterminate as *mut std::ffi::c_void,
+                )
+            },
+            // SAFETY: `progress_native_set_progress` matches ProgressBar.java:50's `(JF)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    PROGRESS_NATIVE_SET_PROGRESS_NAME,
+                    PROGRESS_NATIVE_SET_PROGRESS_SIG,
+                    progress_native_set_progress as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/ProgressBar; fn pointers match its native declarations.
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    // SeekBar: native_setProgress(long, float) + native_setMax(long, int), both no-op.
+    {
+        let class = env.find_class(SEEK_BAR_CLASS)?;
+        let methods = [
+            // SAFETY: `progress_native_set_progress` matches SeekBar.java:19's `(JF)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    PROGRESS_NATIVE_SET_PROGRESS_NAME,
+                    PROGRESS_NATIVE_SET_PROGRESS_SIG,
+                    progress_native_set_progress as *mut std::ffi::c_void,
+                )
+            },
+            // SAFETY: `seek_bar_set_max` matches SeekBar.java:21's `(JI)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    SEEK_BAR_SET_MAX_NAME,
+                    SEEK_BAR_SET_MAX_SIG,
+                    seek_bar_set_max as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/SeekBar; fn pointers match its native declarations.
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    // Spinner: native_setAdapter(long, SpinnerAdapter) no-op.
+    {
+        let class = env.find_class(SPINNER_CLASS)?;
+        let methods = [
+            // SAFETY: `spinner_set_adapter` matches Spinner.java:27's `(JLandroid/widget/SpinnerAdapter;)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    SPINNER_SET_ADAPTER_NAME,
+                    SPINNER_SET_ADAPTER_SIG,
+                    spinner_set_adapter as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/Spinner; fn pointer matches its native declaration.
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    // ScrollView: native_addView/native_removeView re-declared per class — reuse the class-agnostic
+    // ViewGroup tree-wiring bodies (record the real parent→child edges the renderer walks).
+    {
+        let class = env.find_class(SCROLL_VIEW_CLASS)?;
+        let methods = [
+            // SAFETY: `view_group_native_add_view` matches ScrollView.java:20's
+            // `(JJILandroid/view/ViewGroup$LayoutParams;)V` (same as ViewGroup.native_addView).
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
+                    VIEW_GROUP_NATIVE_ADD_VIEW_SIG,
+                    view_group_native_add_view as *mut std::ffi::c_void,
+                )
+            },
+            // SAFETY: `view_group_native_remove_view` matches ScrollView.java:22's `(JJ)V`.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME,
+                    VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG,
+                    view_group_native_remove_view as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is android/widget/ScrollView; fn pointers match its re-declared native_addView/
+        // native_removeView (same signatures as ViewGroup's).
+        unsafe { env.register_native_methods(&class, &methods) }?;
+    }
+    tracing::info!(
+        "registered Eclipse's non-GTK backing for the inflatable android.widget.* property setters \
+         (Button/EditText/CheckBox/RadioButton text; ProgressBar/SeekBar progress/indeterminate/max; \
+         Button compound-drawables; Spinner adapter; ScrollView add/removeView)"
+    );
     Ok(())
 }
 
@@ -9059,6 +9712,14 @@ fn drive_lifecycle(
     // ActivityNativeMain content layout hit ProgressBar this way, live boot 2026-06-13). Each reuses
     // the class-agnostic View constructor backing (records the concrete subclass in the tree).
     register_view_subclass_constructor_natives(env)?;
+    // Bind the inflatable android.widget.* property-setter natives on their OWN declaring classes —
+    // once each widget's native_constructor (above) lets LayoutInflater build the content view, the
+    // widgets' own setters surface one at a time (the trigger was ProgressBar.native_setIndeterminate,
+    // live boot 2026-06-13). ART resolves natives per declaring class, so each setter is bound on its
+    // class before step 4's LayoutInflater pass. Text setters record (renderer-consumed); ScrollView's
+    // add/removeView record tree edges; progress/indeterminate/max/adapter/compound-drawable are
+    // validated-handle no-ops (no chrome drawn, no bound getter reads them back).
+    register_widget_property_setter_natives(env)?;
     // Bind android.graphics.drawable.Drawable's native_constructor on its own class — a launcher's
     // onCreate may load a drawable during step 5 (e.g. AdaptiveIconDemo's getDrawable), so this must be
     // bound before step 4. GTK-free; returns a non-zero non-pointer sentinel (no draw pass runs).
@@ -10892,6 +11553,87 @@ mod tests {
         // stay OUT of this (Context, AttributeSet)J-signature set.
         assert!(!names.iter().any(|n| n == "android/widget/CompoundButton"));
         assert!(!names.iter().any(|n| n == "android/widget/PopupWindow"));
+    }
+
+    #[test]
+    fn widget_property_setter_names_sigs_and_classes_match_overlay() {
+        // Pin the EXACT class internal names + method name/JNI descriptors that
+        // register_widget_property_setter_natives binds, against the vendored ATL overlay
+        // (`vendor/atl/src/api-impl/android/widget/`). ART resolves natives per declaring class and each
+        // setter is bound on its own class, so a transcribed-wrong name/sig (or a dropped class) would
+        // make RegisterNatives throw NoSuchMethodError/NoClassDefFoundError at boot — re-introducing the
+        // one-per-boot UnsatisfiedLinkError this pass fixes. Host-independent constants.
+        //
+        // Classes (reuse the constructor-set consts; pinned slashed by the test above).
+        assert_eq!(BUTTON_CLASS.to_str(), "android/widget/Button");
+        assert_eq!(EDIT_TEXT_CLASS.to_str(), "android/widget/EditText");
+        assert_eq!(CHECK_BOX_CLASS.to_str(), "android/widget/CheckBox");
+        assert_eq!(RADIO_BUTTON_CLASS.to_str(), "android/widget/RadioButton");
+        assert_eq!(PROGRESS_BAR_CLASS.to_str(), "android/widget/ProgressBar");
+        assert_eq!(SEEK_BAR_CLASS.to_str(), "android/widget/SeekBar");
+        assert_eq!(SPINNER_CLASS.to_str(), "android/widget/Spinner");
+        assert_eq!(SCROLL_VIEW_CLASS.to_str(), "android/widget/ScrollView");
+
+        // Text setters: Button.java:40 / EditText.java:29 / CheckBox.java:44 all `(JLjava/lang/String;)V`.
+        assert_eq!(WIDGET_NATIVE_SET_TEXT_NAME.to_str(), "native_setText");
+        assert_eq!(
+            WIDGET_NATIVE_SET_TEXT_SIG.to_str(),
+            "(JLjava/lang/String;)V"
+        );
+        // RadioButton.java:29 `setText(CharSequence)` → `(Ljava/lang/CharSequence;)V` (this.widget).
+        assert_eq!(RADIO_BUTTON_SET_TEXT_NAME.to_str(), "setText");
+        assert_eq!(
+            RADIO_BUTTON_SET_TEXT_SIG.to_str(),
+            "(Ljava/lang/CharSequence;)V"
+        );
+        // ProgressBar.java:106 `native_setIndeterminate(boolean)` → `(Z)V` (this.widget) — the trigger.
+        assert_eq!(
+            PROGRESS_BAR_SET_INDETERMINATE_NAME.to_str(),
+            "native_setIndeterminate"
+        );
+        assert_eq!(PROGRESS_BAR_SET_INDETERMINATE_SIG.to_str(), "(Z)V");
+        // ProgressBar.java:50 / SeekBar.java:19 `native_setProgress(long, float)` → `(JF)V`.
+        assert_eq!(
+            PROGRESS_NATIVE_SET_PROGRESS_NAME.to_str(),
+            "native_setProgress"
+        );
+        assert_eq!(PROGRESS_NATIVE_SET_PROGRESS_SIG.to_str(), "(JF)V");
+        // SeekBar.java:21 `native_setMax(long, int)` → `(JI)V`.
+        assert_eq!(SEEK_BAR_SET_MAX_NAME.to_str(), "native_setMax");
+        assert_eq!(SEEK_BAR_SET_MAX_SIG.to_str(), "(JI)V");
+        // Button.java:43 `native_setCompoundDrawables(long, long)` → `(JJ)V`.
+        assert_eq!(
+            BUTTON_SET_COMPOUND_DRAWABLES_NAME.to_str(),
+            "native_setCompoundDrawables"
+        );
+        assert_eq!(BUTTON_SET_COMPOUND_DRAWABLES_SIG.to_str(), "(JJ)V");
+        // Spinner.java:27 `native_setAdapter(long, SpinnerAdapter)` → `(JLandroid/widget/SpinnerAdapter;)V`.
+        assert_eq!(SPINNER_SET_ADAPTER_NAME.to_str(), "native_setAdapter");
+        assert_eq!(
+            SPINNER_SET_ADAPTER_SIG.to_str(),
+            "(JLandroid/widget/SpinnerAdapter;)V"
+        );
+        // ScrollView.java:20/22 reuse ViewGroup's add/removeView name/sig (pinned by the ViewGroup test
+        // below); assert the exact descriptors here so a ScrollView-side transcription error fails too.
+        assert_eq!(VIEW_GROUP_NATIVE_ADD_VIEW_NAME.to_str(), "native_addView");
+        assert_eq!(
+            VIEW_GROUP_NATIVE_ADD_VIEW_SIG.to_str(),
+            "(JJILandroid/view/ViewGroup$LayoutParams;)V"
+        );
+        assert_eq!(
+            VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME.to_str(),
+            "native_removeView"
+        );
+        assert_eq!(VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG.to_str(), "(JJ)V");
+
+        // The two base-View property setters this pass added (View.java:1284 / :1982).
+        assert_eq!(
+            VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_NAME.to_str(),
+            "setBackgroundColor"
+        );
+        assert_eq!(VIEW_SET_BACKGROUND_COLOR_NO_HANDLE_SIG.to_str(), "(I)V");
+        assert_eq!(VIEW_KEEP_SCREEN_ON_NAME.to_str(), "native_keep_screen_on");
+        assert_eq!(VIEW_KEEP_SCREEN_ON_SIG.to_str(), "(JZ)V");
     }
 
     #[test]

@@ -128,6 +128,56 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🎚️ INFLATABLE `android.widget.*` PROPERTY SETTERS BOUND (one pass) — the per-widget setter
+  `UnsatisfiedLinkError` churn after construction is closed; `ProgressBar.native_setIndeterminate` (the trigger) and
+  the rest of the widget-set property setters resolve.** Following the View-subclass `native_constructor` batch
+  (entry below), the layout now constructs the widgets and the NEXT trip is each widget's PROPERTY SETTERS. Bound in
+  one pass on each setter's OWN declaring class (ART resolves natives per declaring class), with honest no-GTK
+  record-or-no-op semantics: TEXT setters RECORD (renderer-consumed) — `Button.native_setText`/`EditText.native_setText`/
+  `CheckBox.native_setText` (`(JLjava/lang/String;)V`) and `RadioButton.setText(Ljava/lang/CharSequence;)V` (records
+  `this.widget` text via `CharSequence.toString()`); ScrollView REUSES the class-agnostic
+  `view_group_native_add_view`/`view_group_native_remove_view` (records real tree edges); validated-handle NO-OPs
+  where NO bound native getter reads the value back and the renderer draws no such chrome (so the Java caller depends
+  on no native effect — mirrors the existing `ImageView.native_setScaleType`/`View.nativeSetFullscreen`/
+  `native_setBackgroundDrawable` no-ops): `ProgressBar.native_setIndeterminate(Z)V`, `ProgressBar.native_setProgress(JF)V`,
+  `SeekBar.native_setProgress(JF)V`, `SeekBar.native_setMax(JI)V`, `Spinner.native_setAdapter(JLandroid/widget/SpinnerAdapter;)V`,
+  `Button.native_setCompoundDrawables(JJ)V`. Also added two base-`android.view.View` setters into
+  `register_view_natives`: `setBackgroundColor(I)V` (RECORDS ARGB via `view_registry::set_background_color`,
+  renderer-consumed; verified `View.java:1284`) and the STATIC `native_keep_screen_on(JZ)V` (validated no-op — no host
+  screen-wake, no native getter; `View.java:1982`). PROMOTED the 8 widget class-name literals to `pub const`
+  (`BUTTON_CLASS`..`SCROLL_VIEW_CLASS`) as one source of truth reused by both `VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` and
+  the new `register_widget_property_setter_natives`, wired into `drive_lifecycle` right after
+  `register_view_subclass_constructor_natives` (before step 4 / LayoutInflater). DELIBERATELY LEFT UNBOUND + flagged
+  (return value drives Java control flow → never no-op'd per policy; surfaces loudly at boot as the next discovery
+  signal): the return-driving GETTERS `SeekBar.native_getProgress(J)I`, `EditText.native_getText(J)Ljava/lang/String;`,
+  `Button.getText()Ljava/lang/CharSequence;`; the COUPLED stateful `CheckBox.isChecked()Z`/`setChecked(Z)V` and
+  `RadioButton.isChecked()Z`/`setChecked(Z)V` pairs left FULLY unbound (no consumed `view_registry` field backs
+  `checked`; no-op'ing `setChecked` while `isChecked` reads it would be a silent wrong answer — bind both together with
+  a real `checked` field when evidence requires); and all listener registrations (RBX-bytecode/owner-run-data-gated).
+  Regression guard: NEW `widget_property_setter_names_sigs_and_classes_match_overlay` (mirrors
+  `view_subclass_constructor_classes_are_slashed_internal_names`) pins the exact slashed class internal names +
+  method name/JNI descriptors for every newly bound setter (incl. the two base-View setters), so a dropped class or a
+  transcribed-wrong name/sig — which re-introduces the one-per-boot `UnsatisfiedLinkError` — fails CI. **⇐ START HERE
+  NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): confirm `ProgressBar.native_setIndeterminate`
+  no longer trips `UnsatisfiedLinkError` and `ActivityNativeMain`'s `LayoutInflater` builds the FULL content view /
+  `onCreate` proceeds further toward RESUMED, then capture the NEXT unbound native one at a time (expected from the
+  leftUnbound set: a return-driving getter like `SeekBar.native_getProgress`/`EditText.native_getText`, an
+  `isChecked()`/`setChecked()` pair, a listener registration, or the next class on the inflate→attach→surface path —
+  pure log observation, no binary inspection). The standing next FRONTIER is the SCOPED surface-to-engine render
+  wiring from `2194f02`'s §6 plan: wire `EngineNativeWindow::new` + `register_wsi_window`/`set_engine_window_geometry`
+  into `graphics.rs::run_windowed` + present-loop ownership handoff + JNI-dispatch `SurfaceView.surfaceCreated()`/
+  `surfaceChanged()` once the WSI surface is live — designed AFTER the live boot reveals the post-layout call chain
+  (libroblox-internal RUNTIME behavior, NOT first-party-determinable, NOT to be obtained by reverse-engineering
+  libroblox.so). The NDK/EGL half is de-risked (`gl_test_anw_binds_real_wsi_handle` green). Two OWNER-confirm notes
+  from the read: (a) the two NEW base-View setters join the EXISTING all-or-nothing `register_view_natives`
+  RegisterNatives array — confirm it still registers cleanly (no `NoSuchMethodError` on `android.view.View`) under the
+  installed stock dex; (b) the pre-existing `native_setBackgroundColor(JI)V` binding targets a method the current
+  vendored `View.java` no longer declares (only the `(I)V` form at line 1284 exists) — pre-existing, NOT regressed
+  here, flagged for a separate cleanup if a boot log shows a `NoSuchMethodError`/`No implementation` on it.)**
+  Gate: **552 unit + 4 integration (live milestone subprocesses, 0 SKIP) + 2 doctests = 558 passed, 0 failed**
+  (+1 unit: the pin test), fmt/clippy `-D warnings`/release all 0-warning. Detail: §6 (2026-06-13 widget
+  property-setter entry).
 - **2026-06-13 — 🧩 INFLATABLE `android.widget.*` VIEW-SUBCLASS `native_constructor` BATCH BOUND (8 classes, one pass)
   — the one-class-per-boot `UnsatisfiedLinkError` churn at `LayoutInflater.inflate` is closed for the widget set.**
   Owner live validation of the SurfaceView bind (`/tmp/eclipse-surfaceview-validate.log`, EXIT=124 clean) proved
@@ -169,14 +219,16 @@ before any history-rewriting/force operation.
   recorded-unbound (WebView); PopupWindow's zero-arg form is correctly outside this set. Regression guard:
   `view_subclass_constructor_classes_are_slashed_internal_names` (mirrors `surface_view_class_is_slashed_internal_name`)
   pins the EXACT ordered 8-name set so a dropped/reordered class — which re-introduces the one-per-boot
-  `UnsatisfiedLinkError` — fails CI, and asserts CompoundButton/PopupWindow stay OUT. **⇐ START HERE NEXT SESSION (=
-  OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
-  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the empirical bind→boot→next-gap loop —
-  expect `ActivityNativeMain`'s `LayoutInflater` to now build its FULL content view WITHOUT tripping per-widget
-  `native_constructor` (ProgressBar + the rest of the batch construct; a `view_registry` peer is allocated per
-  inflated widget recording its concrete class), then surface the NEXT unbound native one at a time — either a
-  per-widget extra native (e.g. `ProgressBar.native_setProgress`), the recorded `WebView.native_constructor` if a
-  WebView is in the layout, or the next class on the inflate→attach→surface path. Capture that exact next-native ART
+  `UnsatisfiedLinkError` — fails CI, and asserts CompoundButton/PopupWindow stay OUT. **[START-HERE marker moved
+  2026-06-13 to the widget property-setter entry above — the per-widget extra natives this entry predicted as the next
+  trip surfaced: `ProgressBar.native_setIndeterminate` opened the discovery, and the whole inflatable widget set's
+  property setters are now bound in one pass]** (the plan was = OWNER live validation on the dev-host MAIN LOOP:
+  `./target/release/eclipse run <APK>` with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`: the
+  empirical bind→boot→next-gap loop — expect `ActivityNativeMain`'s `LayoutInflater` to now build its FULL content view
+  WITHOUT tripping per-widget `native_constructor` (ProgressBar + the rest of the batch construct; a `view_registry`
+  peer is allocated per inflated widget recording its concrete class), then surface the NEXT unbound native one at a
+  time — either a per-widget extra native (e.g. `ProgressBar.native_setProgress`), the recorded `WebView.native_constructor`
+  if a WebView is in the layout, or the next class on the inflate→attach→surface path. Capture that exact next-native ART
   stack (pure log observation, no binary inspection). The next FRONTIER once the layout completes is the SCOPED
   surface-to-engine wiring from `2194f02`'s §6 plan: wire `EngineNativeWindow::new` + `register_wsi_window`/
   `set_engine_window_geometry` into `graphics.rs::run_windowed` (today ZERO there, so production
@@ -2408,6 +2460,93 @@ reflection-registered `AndroidGLView` SurfaceHolder.Callback fires and on which 
 behavior, NOT first-party-determinable, NOT to be obtained by reverse-engineering libroblox.so — capture that
 next-native/AndroidGLView trace from the boot log). The NDK/EGL half is de-risked (`gl_test_anw_binds_real_wsi_handle`
 green). *Files:* `src/framework.rs`. *No subagent live boot.*
+
+---
+
+### 2026-06-13 — Inflatable `android.widget.*` property setters bound in one pass (Button/EditText/ProgressBar/CheckBox/RadioButton/SeekBar/Spinner/ScrollView + two base `android.view.View` setters) — closes the per-widget setter `UnsatisfiedLinkError` churn after the construction batch; control-flow getters and the coupled isChecked/setChecked pairs deliberately left unbound
+
+*Confirmed root cause (first-party + the prior live-evidence chain):* with the inflatable View-subclass
+`native_constructor` batch bound (entry above), `ActivityNativeMain`'s `LayoutInflater` constructs the widgets, and
+the NEXT one-per-boot `UnsatisfiedLinkError` trip is each widget's PROPERTY SETTER native — `ProgressBar.native_setIndeterminate(boolean)`
+was named as THE trigger. *Mechanism (identical to the constructor batch):* ART resolves natives PER DECLARING class,
+so each widget's setter must be registered on its OWN class. Binding them one-per-boot is slow; this binds the
+inflatable-widget-set's property setters in one pass.
+
+*Fix (`src/framework.rs`):* NEW `register_widget_property_setter_natives(env)` registers each setter on its declaring
+class, wired into `drive_lifecycle` right after `register_view_subclass_constructor_natives(env)?` (before step 4 /
+LayoutInflater). Honest no-GTK record-or-no-op semantics (the project model: the framework RECORDS the view tree into
+`view_registry` and the graphics pass draws view quads from it; real game frames come from the engine GL surface, not
+these `android.widget` views): (1) TEXT setters RECORD on the peer (renderer-consumed) — `Button.native_setText`,
+`EditText.native_setText`, `CheckBox.native_setText` (each `(JLjava/lang/String;)V`) and
+`RadioButton.setText(Ljava/lang/CharSequence;)V` (records `this.widget` via `CharSequence.toString()`, resolved with
+`?` so a thrown Java exception is described+cleared at the boundary). (2) ScrollView REUSES the already-class-agnostic
+`view_group_native_add_view`/`view_group_native_remove_view` — records real tree edges. (3) Validated-handle NO-OPs
+where the decisive check holds — NO bound native getter reads the value back AND the renderer draws no such chrome, so
+the Java caller depends on no native effect (mirrors the existing `ImageView.native_setScaleType`/`View.nativeSetFullscreen`/
+`native_setBackgroundDrawable` no-ops): `ProgressBar.native_setIndeterminate(Z)V` (the trigger; `isIndeterminate()`
+reads a Java field), `ProgressBar.native_setProgress(JF)V`, `SeekBar.native_setProgress(JF)V`, `SeekBar.native_setMax(JI)V`,
+`Spinner.native_setAdapter(JLandroid/widget/SpinnerAdapter;)V` (`getAdapter()` returns the Java adapter),
+`Button.native_setCompoundDrawables(JJ)V` (drawable draw deferred). (4) Two base `android.view.View` setters added to
+the EXISTING `register_view_natives` array: `setBackgroundColor(I)V` RECORDS ARGB via `view_registry::set_background_color`
+(renderer-consumed; verified `View.java:1284`), and the STATIC `native_keep_screen_on(JZ)V` is a validated no-op (no
+host screen-wake, no native getter; verified `View.java:1982`). One small refactor traceable to the change: the 8
+widget class-name literals promoted to `pub const` (`BUTTON_CLASS`..`SCROLL_VIEW_CLASS`) as a single source of truth
+reused by both `VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` and the new registrar (mirrors the `SURFACE_VIEW_CLASS` precedent).
+Every body runs inside `EnvUnowned::with_env` (catch_unwind, AGENTS.md §2.8) and resolves via `LogErrorAndDefault`.
+
+*Deliberately LEFT UNBOUND + flagged (per policy — a native whose RETURN value drives Java control flow is NEVER
+no-op'd; it stays the loud discovery signal):* the return-driving GETTERS `SeekBar.native_getProgress(J)I`
+(`SeekBar.getProgress()`), `EditText.native_getText(J)Ljava/lang/String;` (`getText()`/`getEditableText()`),
+`Button.getText()Ljava/lang/CharSequence;`. The COUPLED stateful `CheckBox.isChecked()Z`/`setChecked(Z)V` and
+`RadioButton.isChecked()Z`/`setChecked(Z)V` pairs are left FULLY unbound (not silent no-op setters): no consumed
+`view_registry` field backs a `checked` boolean, so no-op'ing `setChecked` while `isChecked` reads it would be a
+silent wrong answer — binding them later means adding a `checked` field + the `isChecked` reader together. All listener
+registrations (Button/CheckBox/RadioButton/View `*OnClickListener`, `setOnCheckedChangeListener`,
+`setOnSeekBarChangeListener`, Spinner `setOnItemSelectedListener`, EditText text/editor-action listeners, View
+touch/long-click/focus) are NOT property setters and whether they fire is RBX-bytecode/owner-run-data-gated — kept as
+the deliberate per-class discovery signal. View getters/queries with return-driven flow (`getWidth`/`getHeight`,
+`nativeIsFocused`, `nativeIsAttachedToWindow`, `native_getMatrix`, `native_getGlobalVisibleRect`) and the deferred
+layout/draw/CSS natives (`native_measure`/`native_layout`/`native_drawBackground`/etc.) stay out of the
+property-setter scope, consistent with §5's deferred-layout note.
+
+*Same-pattern audit:* the audit confirmed the honest-semantics decision per setter against the project's
+record-or-no-op model — `view_registry::ViewState` carries only `class_name`/`text`/`children`/`layout`/`clickable`/
+`jobject`/`background_color`, and the renderer draws `RenderNode` from those, so text + background-color + tree-edge
+setters RECORD (real fidelity) and progress/indeterminate/max/adapter/compound-drawable no-op (no backing field, no
+chrome). This mirrors the existing View setter bindings (`nativeSetFullscreen`, `native_setVisibility`,
+`native_setTextColor`, `native_setBackgroundColor`).
+
+*Regression guard (tied to the confirmed root cause):* NEW `widget_property_setter_names_sigs_and_classes_match_overlay`
+(`src/framework.rs`, mirrors `view_subclass_constructor_classes_are_slashed_internal_names`) pins the exact slashed
+class internal names + method name/JNI descriptors for every newly bound setter (incl. the two base-View setters), so a
+dropped class or a transcribed-wrong name/sig — the failure modes that re-introduce the one-per-boot
+`UnsatisfiedLinkError` — fails CI. As with every prior View native, the binding-PRESENCE / per-class WIRING guard (a
+missing or misrouted `RegisterNatives` only surfaces under a live ART boot, which can't run in-harness — ART aborts
+off the main thread) is the documented owner dev-host live boot. Run:
+`cargo test widget_property_setter_names_sigs_and_classes_match_overlay` (1 passed).
+
+*Verification (full gate, clean working tree, no machine-specific assumptions):* `cargo fmt --all` CLEAN;
+`cargo build --all-targets` 0 warnings (exit 0); `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings
+(exit 0); `cargo test` **552 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP — APK+display
+present, exact success markers required) + 2 doctests = 558 passed, 0 failed**; `cargo build --release` clean
+(artifact `/home/kue/Projects/Eclipse/target/release/eclipse`, 8,901,224 bytes). Unit count 551→552 (+1, the pin
+test). *Did NOT live-boot ART (no `cargo run` / `__*` subcommands) and did NOT inspect any third-party binary —
+first-party only against the vendored `vendor/atl/src/api-impl/android/` source + the public Android widget API.*
+
+*OWNER-RUN DATA NEEDED (dev-host live boot, prohibited here — `./target/release/eclipse run <APK>` with
+`ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`):* (1) confirm `ProgressBar.native_setIndeterminate`
+no longer trips `UnsatisfiedLinkError` and `ActivityNativeMain`'s `LayoutInflater` builds the FULL content view /
+`onCreate` proceeds further toward RESUMED; (2) capture the NEXT unbound-native ART stack one at a time (a return-driving
+getter like `SeekBar.native_getProgress`/`EditText.native_getText`, an `isChecked()`/`setChecked()` pair, a listener
+registration, or the next class on the inflate→attach→surface path — pure log observation, no binary inspection); (3)
+confirm `register_view_natives` still registers cleanly (no `NoSuchMethodError` on `android.view.View`) now that
+`setBackgroundColor(I)V` + `native_keep_screen_on(JZ)V` joined that all-or-nothing array under the installed stock
+dex. *Pre-existing wart flagged, NOT regressed here, out of scope:* the pre-existing `native_setBackgroundColor(JI)V`
+binding in `register_view_natives` targets a method the current vendored `View.java` no longer declares (only the
+`(I)V` form at `View.java:1284` exists); the boot demonstrably already passes `register_view_natives` (it reaches the
+widget classes), but if a live log ever shows a `NoSuchMethodError`/`No implementation` on `native_setBackgroundColor`,
+reconcile that dead binding to the shipped overlay in a separate cleanup pass. *Files:* `src/framework.rs`. *No
+subagent live boot.*
 
 ---
 
