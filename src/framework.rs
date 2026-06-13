@@ -7028,6 +7028,106 @@ fn register_surface_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for the inflatable android.widget.* View subclasses ==========
+//
+// 2026-06-13: ART resolves natives PER DECLARING CLASS, and `android.view.View`'s
+// `native_constructor(Context, AttributeSet)` (View.java line 1166) is RE-declared verbatim by every
+// concrete `android.widget.*` View subclass the vendored ATL ships (each carries its own
+// `protected native long native_constructor(Context context, AttributeSet attrs);`). So the
+// `register_view_natives` binding on `android/view/View` does NOT satisfy them — each subclass that
+// `LayoutInflater` instantiates needs the shared `view_native_constructor` registered on its OWN class
+// before step 4 runs, or `LayoutInflater.inflate` throws `UnsatisfiedLinkError`. Roblox's
+// `ActivityNativeMain` content layout walked into this one class at a time (SurfaceView, then
+// `ProgressBar`, …); binding the whole set the overlay declares `native_constructor` on, in one pass,
+// stops the one-per-boot discovery churn for these widgets. Surfaced concretely by the live boot of
+// commit 2194f02 (`No implementation found for long android.widget.ProgressBar.native_constructor(
+// android.content.Context, android.util.AttributeSet)` at `LayoutInflater.inflate`).
+//
+// ONLY `native_constructor` is bound here. Each class also declares its own extra natives (e.g.
+// `ProgressBar.native_setProgress`, SeekBar's, …) — those stay UNBOUND on purpose so the next real
+// layout/draw trip surfaces them one at a time (the deliberate loud discovery signal, exactly as
+// `register_surface_view_natives` omits `native_createSnapshot`/`native_postSnapshot`).
+// `View.native_destructor(long)` is declared on View and NOT re-declared by any of these (View.java
+// line 1168), so the single `register_view_natives` binding covers destruction for all of them by
+// inheritance — no per-class destructor binding is needed.
+//
+// Caveats verified against the vendored ATL overlay (`vendor/atl/src/api-impl/android/widget/`):
+//   * Each class below declares `native_constructor(Context, AttributeSet)J` DIRECTLY on itself
+//     (Button.java:39, EditText.java:24, ProgressBar.java:49, CheckBox.java:19, RadioButton.java:17,
+//     SeekBar.java:17, Spinner.java:26, ScrollView.java:18) — so `RegisterNatives` finds the method
+//     (a class that only inherited it would NoSuchMethodError). All eight share the exact
+//     `VIEW_NATIVE_CONSTRUCTOR_SIG`, so the class-agnostic `view_native_constructor` is the backing.
+//   * `CompoundButton` is ABSTRACT (CompoundButton.java:9), so LayoutInflater cannot instantiate it —
+//     excluded; its concrete subclasses CheckBox/RadioButton re-declare the native and ARE bound.
+//   * The abstract layout parents `AbsSeekBar`/`AbsSpinner`/`AdapterView` do NOT declare
+//     `native_constructor`; the concrete leaves SeekBar/Spinner re-declare it and are the inflatable
+//     entry points — bound here.
+//   * `PopupWindow` is excluded: its `native_constructor` is ZERO-ARG `()J` (PopupWindow.java:177) and
+//     it is NOT a View — pointing it at the shared `(Context, AttributeSet)J` body would be both wrong
+//     arity and wrong type. It gets its own distinct body if/when it traps.
+
+/// Internal/slashed class names of the concrete, LayoutInflater-instantiable `android.widget.*` View
+/// subclasses that RE-declare `native_constructor(Context, AttributeSet)J` and therefore each need the
+/// shared `view_native_constructor` bound on their own class (ART resolves natives per declaring class).
+///
+/// Kept as one list (not one fn per class) because every entry binds the identical class-agnostic
+/// backing — the shared body already records the receiver's ACTUAL class, so per-class functions would
+/// be pure boilerplate. Each name is verified to declare the 2-arg `native_constructor` directly (see
+/// the section comment); `register_view_subclass_constructor_natives` binds exactly this set, and
+/// `view_subclass_constructor_classes_are_slashed_internal_names` pins it so a dropped class fails CI.
+const VIEW_SUBCLASS_CONSTRUCTOR_CLASSES: &[&JNIStr] = &[
+    jni_str!("android/widget/Button"),
+    jni_str!("android/widget/EditText"),
+    jni_str!("android/widget/ProgressBar"),
+    jni_str!("android/widget/CheckBox"),
+    jni_str!("android/widget/RadioButton"),
+    jni_str!("android/widget/SeekBar"),
+    jni_str!("android/widget/Spinner"),
+    jni_str!("android/widget/ScrollView"),
+];
+
+/// Bind Eclipse's own (non-GTK) backing for the `native_constructor` of every concrete inflatable
+/// `android.widget.*` View subclass in [`VIEW_SUBCLASS_CONSTRUCTOR_CLASSES`].
+///
+/// Each class re-declares View's `native_constructor(Context, AttributeSet)J`, so the class-agnostic
+/// [`view_native_constructor`] (which records the receiver's actual class in [`view_registry`] and
+/// returns a real slab handle ≥ 1) is registered on each. Registered before step 4, alongside the
+/// other per-class View-subclass natives, because ART resolves natives per declaring class and these
+/// re-declare the constructor — so each needs its own binding before `LayoutInflater` runs.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It does
+/// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
+/// instance native, and every class in the set declares that exact signature (verified against the
+/// vendored ATL overlay). The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (§2.8).
+fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    for &class_name in VIEW_SUBCLASS_CONSTRUCTOR_CLASSES {
+        let class = env.find_class(class_name)?;
+        let methods = [
+            // SAFETY: `view_native_constructor` matches the paired
+            // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance
+            // native (shared with View/TextView/ImageView/SurfaceView native_constructor); casting the
+            // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    VIEW_NATIVE_CONSTRUCTOR_NAME,
+                    VIEW_NATIVE_CONSTRUCTOR_SIG,
+                    view_native_constructor as *mut std::ffi::c_void,
+                )
+            },
+        ];
+        // SAFETY: `class` is the loaded android/widget/* subclass; the fn pointer's signature matches
+        // its re-declared `native_constructor` (each declares the exact 2-arg signature — verified
+        // against the vendored ATL overlay, see the section comment).
+        unsafe { env.register_native_methods(&class, &methods) }?;
+        tracing::info!(
+            class = %class_name.to_str(),
+            "registered Eclipse's non-GTK backing for native_constructor on inflatable View subclass"
+        );
+    }
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.graphics.drawable.Drawable.native_constructor ===
 //
 // 2026-06-05: a launcher that loads a drawable in onCreate (e.g. AdaptiveIconDemo's
@@ -8952,6 +9052,13 @@ fn drive_lifecycle(
     // hits UnsatisfiedLinkError (live boot 2026-06-13). Reuses the class-agnostic View constructor
     // backing (records com.roblox.client.RBXSurfaceView in the tree).
     register_surface_view_natives(env)?;
+    // Bind native_constructor on the concrete inflatable android.widget.* View subclasses (Button,
+    // EditText, ProgressBar, CheckBox, RadioButton, SeekBar, Spinner, ScrollView) on their OWN classes
+    // — ART resolves natives per declaring class and each re-declares View's constructor, so they must
+    // be bound before step 4's LayoutInflater pass or it throws UnsatisfiedLinkError (Roblox's
+    // ActivityNativeMain content layout hit ProgressBar this way, live boot 2026-06-13). Each reuses
+    // the class-agnostic View constructor backing (records the concrete subclass in the tree).
+    register_view_subclass_constructor_natives(env)?;
     // Bind android.graphics.drawable.Drawable's native_constructor on its own class — a launcher's
     // onCreate may load a drawable during step 5 (e.g. AdaptiveIconDemo's getDrawable), so this must be
     // bound before step 4. GTK-free; returns a non-zero non-pointer sentinel (no draw pass runs).
@@ -10750,6 +10857,41 @@ mod tests {
         // RegisterNatives throws NoClassDefFoundError at boot. The shared constructor name/sig are
         // pinned by view_native_names_sigs_and_class_match_view_java. Host-independent constant.
         assert_eq!(SURFACE_VIEW_CLASS.to_str(), "android/view/SurfaceView");
+    }
+
+    #[test]
+    fn view_subclass_constructor_classes_are_slashed_internal_names() {
+        // Pin the FULL set of concrete inflatable android.widget.* View subclasses whose
+        // native_constructor is bound by register_view_subclass_constructor_natives. ART resolves
+        // natives per declaring class and each of these RE-declares View's
+        // native_constructor(Context, AttributeSet) (verified against the vendored ATL overlay), so
+        // register_view_subclass_constructor_natives must find each by its EXACT slashed internal name
+        // or RegisterNatives throws NoClassDefFoundError at boot. The shared constructor name/sig are
+        // pinned by view_native_names_sigs_and_class_match_view_java. Asserting the exact set (and its
+        // length) makes a DROPPED class — re-introducing the one-per-boot UnsatisfiedLinkError this
+        // pass fixes — fail the test. Host-independent constants.
+        let names: Vec<String> = VIEW_SUBCLASS_CONSTRUCTOR_CLASSES
+            .iter()
+            .map(|c| c.to_str().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "android/widget/Button",
+                "android/widget/EditText",
+                "android/widget/ProgressBar",
+                "android/widget/CheckBox",
+                "android/widget/RadioButton",
+                "android/widget/SeekBar",
+                "android/widget/Spinner",
+                "android/widget/ScrollView",
+            ],
+        );
+        // No abstract / non-View class slipped into the set: CompoundButton is abstract (not
+        // instantiable) and PopupWindow's native_constructor is zero-arg ()J and not a View — both must
+        // stay OUT of this (Context, AttributeSet)J-signature set.
+        assert!(!names.iter().any(|n| n == "android/widget/CompoundButton"));
+        assert!(!names.iter().any(|n| n == "android/widget/PopupWindow"));
     }
 
     #[test]
