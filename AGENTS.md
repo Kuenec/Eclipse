@@ -128,8 +128,49 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
-- **2026-06-13 — 🖼️ RENDER PHASE 4 SHIPPED: BUNDLED-ASSET PROVISIONING (extract APK `assets/` → app-data
-  `files/assets/`). ⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Render Phase 3
+- **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). ⇐ START HERE NEXT SESSION.**
+  Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
+  frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
+  dev-host) established the chain and **corrected the Phase 4 hypothesis below** (Phase 4 was the WRONG layer — see its
+  ⚠️). CONFIRMED ROOT CAUSE: ATL's `android.os.Build$VERSION` static initializer
+  (`vendor/atl/src/api-impl/android/os/Build.java:111`) defaults `SDK_INT` to **23** when the JVM property
+  `Build.VERSION.SDK_INT` is unset, and `runtime.rs::BootPlan::vm_options()` was heap-only — it never passed that `-D`,
+  so `BootPlan.sdk_int` (correctly 35 from manifest `targetSdk`) never reached ATL. The engine reads
+  `Build.VERSION.SDK_INT` over JNI as its device API level (`[FLog::Graphics] Android API 23`); at 23 (< 24) it
+  hard-rejects **Mode 6 (Vulkan)** "Android version is too old to activate Vulkan" and drops onto the **Mode 4 (GLES3)**
+  path. (Serving `ro.build.version.sdk` via `__system_property_get` was the WRONG channel — proven: it changed nothing.)
+  FIX (1 line, `src/runtime.rs::vm_options()`): `opts.push(format!("-DBuild.VERSION.SDK_INT={}", self.sdk_int.min(28)))`.
+  **The `.min(28)` clamp is load-bearing and must stay < 29:** ATL's `Activity.registerActivityLifecycleCallbacks`
+  (`vendor/atl/src/api-impl/android/app/Activity.java:614`) is an empty no-op `{}`, so at `SDK_INT >= 29` androidx
+  `ReportFragment` switches to the `registerActivityLifecycleCallbacks`/`onActivityPostCreated` path and the create-phase
+  `ON_CREATE` dispatch (the `onPostCreate`→`Fragment.onActivityCreated` overlay path) is dropped → the
+  `IllegalStateException` boot blocker (§6 2026-06-13) returns BEFORE render init. `RESOURCES_SDK_INT` auto-follows
+  `SDK_INT` in ATL when its own prop is unset (no mismatch). Regression guard:
+  `runtime.rs::tests::vm_options_propagate_clamped_sdk_int` (asserts `=28` for `targetSdk=35`, rejects 23/35, propagates
+  a sub-28 target verbatim). Gate clean (563 unit + 4 integ + 2 doctest, fmt/clippy 0-warn, release built). OWNER LIVE
+  BOOT (`/tmp/eclipse-sdk28.log`, EXIT=124): **(A) ✅ `Android API 28`** (was 23) — engine now ATTEMPTS Vulkan, loading
+  `VK_KHR_surface` + `VK_KHR_android_surface`; **(B) ✅ NO `IllegalStateException`**, `ActivityNativeMain` reaches
+  `onResume`/RESUMED (clamp-28 preserved the lifecycle); **(C) ⏳ still no frames** — the engine reads its shader pack
+  **directly from the APK** (strace: `lseek` to the CRC-valid STORED `assets/shaders/shaders_glsles3.pack` local-header
+  67686916 + data 67686984; it NEVER opens the extracted FS tree, and corrupting the FS copy's magic was byte-identical).
+  **TWO NEXT GATES — either unblocks render (pick next session):** **(a) Vulkan (reference path — Sober uses it):**
+  `Mode 6 failed: Unable to create Vulkan instance` because the engine requests the Android-only **`VK_KHR_android_surface`**
+  instance extension, which the host Linux Vulkan ICD lacks. Eclipse must add a Vulkan-surface translation seam (parallel
+  to the EGL one): intercept the engine's `vkCreateInstance` to swap `VK_KHR_android_surface`→`VK_KHR_wayland_surface`
+  (+ `vkEnumerateInstanceExtensionProperties`), and `vkCreateAndroidSurfaceKHR`→`vkCreateWaylandSurfaceKHR` on winit's
+  `wl_display`+`wl_surface`. **(b) GLES3 (EGL already wired by Phase 3):** `Mode 4 failed: Error opening shader pack
+  glsles3` is a POST-READ rejection of valid bytes (not file/CRC/format — all verified OK). Forensics' medium-confidence
+  hypothesis: the empty `ro.product.*`/`ro.build.*` property store collapses the engine into a bogus "HTC unknown"
+  low-end profile (`Excluded 'HTC unknown:…RTX 5070' - disabling SuperHQ shaders`, `GLES MT shader loading is disabled`,
+  `Video memory size: 67108864`=64 MiB floor) that gates the GLES3 pack. NEXT PROBE: populate sane `ro.product.*`/
+  `ro.build.*` in `native_provider.rs::eclipse_system_property_get` (currently empty for all keys) and re-boot
+  (confirm-by-fix). Detail: §6 (2026-06-13 render Phase 5 — guest API level).
+- **2026-06-13 — ⚠️ RENDER PHASE 4 (BUNDLED-ASSET PROVISIONING) — CORRECTED BY PHASE 5: it was the WRONG layer.** The
+  `Apk::extract_assets` wiring (extract APK `assets/` → app-data `files/assets/`) is harmless and still ships, BUT the
+  Phase 5 strace probe PROVED the engine reads its shader packs/content **directly from the APK** (its own zip reader,
+  `openat` of the .apk + `lseek` to the stored entry), NOT from the extracted FS tree — so this extraction does NOT fix
+  the shader-pack open and the "FS content root" theory in this entry is SUPERSEDED. Original Phase 4 detail (kept for
+  history): Render Phase 3
   (commit `c5681bc`) fixed the EGL connection-match: the engine now creates its EGL CONTEXT + 800×600 window surface
   successfully (live boot logged `[FLog::Graphics]` "Initialized EGL context … with renderbuffer 800x600",
   `eglSwapInterval(1)`, GL extensions + framebuffer caps enumerated — NO more `eglCreateWindowSurface` 3003). But the
@@ -3577,6 +3618,22 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Context7:* `zip` 2.x (`/zip-rs/zip2`) consulted (verified 2026-06-13) — confirmed `enclosed_name()` is the recommended path-exploit-resistant safe-extraction API (rejects NUL bytes / `..` traversal / absolute paths) and is NOT deprecated (the deprecated method is `sanitized_name`); trailing-`/` detects directory entries. The project's own `extract_native_libs` (+ its idempotent/atomic test) is the authoritative model for the two-phase borrow, size-skip idempotency, and temp+fsync+rename atomicity.
 
   *Files:* `src/apk/mod.rs` (`extract_assets` + its regression test), `src/framework.rs` (`app_data_dir` raised to `pub` with a dated note — single source of truth for the content root), `src/main.rs` (`run_apk` asset-extraction step after `extract_native_libs`), `AGENTS.md`.
+
+### 2026-06-13 — 🖼️ Render Phase 5: GUEST DEVICE API LEVEL — propagate `-DBuild.VERSION.SDK_INT` to ART so the engine stops misreading API 23 (un-gates Vulkan); corrects Phase 4 (the engine reads shaders from the APK, not the FS)
+
+  *Confirmed root cause (multi-agent first-party forensics + orchestrator `strace`/`LD_PRELOAD`/magic-flip probes; owner live boots):* after Phase 3/4 the engine reached render init but `RenderView is NULL` — no graphics mode came up. The engine tries modes in order: **Mode 6 (Vulkan)** then **Mode 4 (GLES3)**. Mode 6 failed `Android version is too old to activate Vulkan` and Mode 4 failed `Error opening shader pack glsles3`. The probe campaign established: (1) the engine logs `[FLog::Graphics] Android API 23`, but the manifest `targetSdk=35` and Eclipse's `BootPlan.sdk_int=35`; (2) `strace` proved the engine reads `shaders_glsles3.pack` **directly from the APK** (`openat` of the .apk + `lseek` to the STORED entry's local-header 67686916 / data 67686984) — the entry is CRC-valid (`unzip -t` OK, central==local==computed `0x4f49dbf7`), the bytes are valid `RBXS`; (3) the engine NEVER `openat`s the Phase-4 extracted FS tree, and corrupting the extracted FS copy's magic was byte-identical → **Phase 4 (FS extraction) was the wrong layer; it does not feed the shader read** (this corrects the Phase 4 §6 entry above + §5). The load-bearing API channel is JNI `android.os.Build$VERSION.SDK_INT`: ATL's `vendor/atl/src/api-impl/android/os/Build.java:111` does `SDK_INT = (System.getProperty("Build.VERSION.SDK_INT") != null) ? parseInt : 23` — it falls back to **23** when the property is unset, and `runtime.rs::BootPlan::vm_options()` was heap-only (it never passed that `-D`), so `sdk_int=35` never reached ATL. API 23 < 24 ⇒ the engine hard-rejects Vulkan and drops to the GLES3 path. (Serving `ro.build.version.sdk` via bionic `__system_property_get` was the WRONG channel — proven inert by an inline probe.)
+
+  *Fix (1 line — root-cause, smallest change):* `src/runtime.rs::vm_options()` now pushes `format!("-DBuild.VERSION.SDK_INT={}", self.sdk_int.min(28))` (capacity bumped 3→4). **The `.min(28)` clamp is load-bearing and MUST stay < 29:** ATL's `Activity.registerActivityLifecycleCallbacks` (`vendor/atl/src/api-impl/android/app/Activity.java:614`) is an empty no-op `{}`, so at `SDK_INT >= 29` androidx `ReportFragment.injectIfNeededIn` switches from the pre-API-29 `android.app.Fragment.onActivityCreated` path (which the 2026-06-13 lifecycle-ordering overlay services) to `registerActivityLifecycleCallbacks`/`onActivityPostCreated` → the callback is dropped → `ON_CREATE` never dispatches → the `IllegalStateException` boot blocker (§6 androidx lifecycle-ordering entry) returns BEFORE render init. 28 (Android 9) clears the Vulkan API-24 gate while staying below the androidx-29 switch. ATL sets `RESOURCES_SDK_INT` to the same value when its own property is unset (no mismatch crash), so one option suffices.
+
+  *Same-pattern audit:* `vm_options()` is the single Java-system-property choke point (grep of `src/`+`tools/` for `setProperty`/`-DBuild`/`SDK_INT` found only this site and ATL's reader). The NDK device-API path is not load-bearing (`AConfiguration_getSdkVersion`/`android_get_device_api_level` are not imported strong — the engine loaded — and the JNI value is what it printed). VRAM `67108864` (64 MiB) and `renderbuffer 800x600` are engine-side values (the engine queries the desktop `GL_NVX_gpu_memory_info` extension the host GLES context lacks and falls back to its own floor; 800×600 is Eclipse's window size) — NOT Eclipse-settable and NOT touched.
+
+  *Regression protection (tied to the root, no new script):* `runtime.rs::tests::vm_options_propagate_clamped_sdk_int` — asserts a `targetSdk=35` plan yields `-DBuild.VERSION.SDK_INT=28`, never `=23` (the bug) or `=35` (the API-29 regression), and that a sub-28 target (`Some(21)`) is propagated verbatim (we cap, not floor). A drift that drops the property, un-clamps to ≥29, or hardcodes 23 fails CI.
+
+  *Verification (this tree):* `cargo fmt --all` clean; `cargo build --all-targets` 0 warn; `cargo clippy --all-targets --all-features -- -D warnings` 0 warn; `cargo test` **563 unit + 4 integration (0 SKIP) + 2 doctests, 0 failed**; `cargo build --release` clean. OWNER LIVE BOOT (`/tmp/eclipse-sdk28.log`, EXIT=124): **(A) ✅** `Android API 28` (was 23) — the engine now ATTEMPTS Vulkan (loads `VK_KHR_surface` + `VK_KHR_android_surface`); **(B) ✅** NO `IllegalStateException`, `ActivityNativeMain` reaches `onResume`/RESUMED (clamp-28 preserved the lifecycle); **(C) ⏳** still no frames.
+
+  *Two next gates revealed (either unblocks render — pick next session):* **(a) Vulkan (reference path; Sober uses it):** `Mode 6 failed: Unable to create Vulkan instance` because the engine requests the Android-only `VK_KHR_android_surface` instance extension, absent from the host Linux Vulkan ICD. Eclipse needs a Vulkan-surface translation seam (parallel to the EGL connection-match): intercept `vkCreateInstance` to swap `VK_KHR_android_surface`→`VK_KHR_wayland_surface` (+ `vkEnumerateInstanceExtensionProperties` filtering), and `vkCreateAndroidSurfaceKHR`→`vkCreateWaylandSurfaceKHR` on winit's `wl_display`+`wl_surface`. **(b) GLES3 (EGL already wired by Phase 3):** `Error opening shader pack glsles3` is a POST-READ rejection of valid bytes; forensics' medium-confidence hypothesis is the empty `ro.product.*`/`ro.build.*` store collapsing the engine into a bogus "HTC unknown" low-end profile (`Excluded 'HTC unknown:…RTX 5070' - disabling SuperHQ shaders`, `GLES MT shader loading is disabled`, 64 MiB VRAM floor) that gates the pack. NEXT PROBE: populate sane `ro.product.*`/`ro.build.*` in `native_provider.rs::eclipse_system_property_get` (currently empty for every key) and re-boot (confirm-by-fix).
+
+  *Files:* `src/runtime.rs` (`vm_options()` SDK_INT push + `vm_options_propagate_clamped_sdk_int` test), `AGENTS.md`. Forensics: workflow `eclipse-shader-render-forensics`.
 
 ---
 
