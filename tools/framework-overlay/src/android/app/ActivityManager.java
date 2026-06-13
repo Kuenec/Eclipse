@@ -64,7 +64,7 @@ public class ActivityManager {
 
 	public boolean isLowRamDevice() {return false;}
 
-	public static class MemoryInfo {
+	public static class MemoryInfo implements android.os.Parcelable {
 		/* For now, just always report there's 10GB free RAM */
 		public long availMem = 10000;
 
@@ -73,6 +73,20 @@ public class ActivityManager {
 		public long threshold = 200;
 
 		public boolean lowMemory = false;
+
+		// 2026-06-13: ECLIPSE PATCH — AOSP MemoryInfo is Parcelable; Roblox calls writeToParcel in
+		// ActivityNativeMain.onResume startup (dex tg.b2.b). Write the fields via the stock Parcel
+		// write-API (verified present on ATL's installed Parcel: writeLong/writeInt). No FDs -> 0.
+		public int describeContents() {
+			return 0;
+		}
+
+		public void writeToParcel(android.os.Parcel dest, int flags) {
+			dest.writeLong(availMem);
+			dest.writeLong(totalMem);
+			dest.writeLong(threshold);
+			dest.writeInt(lowMemory ? 1 : 0);
+		}
 	}
 
 	public void getMemoryInfo(MemoryInfo outInfo)

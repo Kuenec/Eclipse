@@ -128,6 +128,44 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🟢 ROBLOX BOOTS TO APP_READY (Startup/Landing) — `ActivityManager$MemoryInfo` is now `Parcelable`
+  (`writeToParcel`/`describeContents`) — OWNER LIVE-VALIDATED (EXIT=124 clean): `writeToParcel` resolves,
+  `ActivityNativeMain` gets PAST `onResume` ENTIRELY, the app reaches RESUMED + a running main `Looper` pump, the engine
+  loads its DataModel (`rbxasset://places/Mobile.rbxl`) and reaches APP_READY.** Root cause: Roblox calls
+  `android.app.ActivityManager$MemoryInfo.writeToParcel(Landroid/os/Parcel;I)V` in `ActivityNativeMain.onResume` startup,
+  but the patched (`javac`) `MemoryInfo` (a verbatim ATL copy + the `RunningAppProcessInfo` patch) did NOT declare it →
+  `NoSuchMethodError`. AOSP's `MemoryInfo` IS `Parcelable`. **Fix (javac path, NOT smali — depends on ATL's stock
+  `Parcel` write-API surface):** `tools/framework-overlay/src/android/app/ActivityManager.java` — `MemoryInfo` now
+  `implements android.os.Parcelable`, with `describeContents()` returning `0` and `writeToParcel(Parcel,int)` writing its
+  4 fields via the stock Parcel write-API (`dest.writeLong` on `availMem`/`totalMem`/`threshold`; `dest.writeInt` on
+  `lowMemory` as `1`/`0`); ATL's installed `Parcel` was verified to provide `writeLong(J)V`/`writeInt(I)V` so the calls
+  resolve at runtime. The compile-only stub `tools/framework-overlay/stubs/android/os/Parcel.java` was extended with
+  `writeLong(long)`/`writeInt(int)` so the patched `MemoryInfo` compiles (the stub is NEVER dexed; the real `Parcel` is
+  used at runtime). `MemoryInfo` is staged into `classes.dex` by the existing `android/app/ActivityManager*.class` javac
+  glob — no script change. **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP): rebuild the
+  overlay FIRST with `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped or the overlay was
+  touched (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must
+  hold the smali 2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. MILESTONE REACHED (owner-validated,
+  current tree): with `MemoryInfo.writeToParcel`, `ActivityNativeMain` gets PAST `onResume`; the app reaches RESUMED +
+  running main `Looper` pump, the engine loads its DataModel (`rbxasset://places/Mobile.rbxl`) and reaches APP_READY
+  (Startup/Landing) — Roblox boots to the landing/app-ready stage; the boot is EXIT=124 clean. NEW FRONTIER (next tasks):
+  (a) the now-TOLERATED running-loop framework gaps the pump survives (non-fatal in the pump today): bind
+  `View.nativeIsAttachedToWindow` → `boolean` (return-driven; the activity view IS attached, so return `true`),
+  `View.getWindowVisibleDisplayFrame(Rect)` (fill the `Rect` with the window frame), and `android.app.Dialog.nativeInit`
+  → `long` (Dialog peer) — so UI/dialog messages stop throwing in the pump; (b) the STANDING render frontier — wire the
+  engine `AndroidGLView` surface to Eclipse's window (Eclipse currently runs its own Vulkan clear-and-present loop while
+  the engine renders to its own surface) so rendered frames appear; (c) login/auth (`apis.roblox.com` 403s —
+  environmental, needs real credentials). Capture the running-loop gaps one at a time by log observation only.** Gate
+  (overlay javac-path + compile-only stub only; NO Rust changed): overlay build clean (exit 0; `classes.dex` 18832B
+  [grew from 18656B for the larger `Parcelable` `MemoryInfo`], `classes2.dex` 60968B UNCHANGED, `classes3.dex` 2498192B
+  UNCHANGED); baksmali of `classes.dex` confirms `MemoryInfo` `.implements Landroid/os/Parcelable;` with
+  `describeContents()I` returning 0 and `writeToParcel(Landroid/os/Parcel;I)V` invoking `Parcel->writeLong(J)V` ×3 +
+  `Parcel->writeInt(I)V` ×1; `classes2.dex` still EXACTLY the 7 smali classes (smali path untouched). `cargo fmt --all --
+  check` / `build --all-targets` (0 warn) / `clippy --all-targets --all-features -D warnings` (0 warn) / `build
+  --release` (8,911,112-byte artifact) all 0-warning; `cargo test` **556 unit + 0 main-bin + 4 integration (0 SKIP) + 2
+  doctests = 562 passed, 0 failed** (no Rust changed → no test delta; overlay regression protection is the build-time
+  anchor/glob/stub-exclusion guards inside `patch-framework.sh`). Detail: §6 (2026-06-13 `MemoryInfo` `Parcelable`/
+  `writeToParcel` + APP_READY entry).
 - **2026-06-13 — 🎬 `ActivityNativeMain` IS NOW FULLY RESUMED — `Display.getMode()`/`Display$Mode` + `Vibrator.cancel()`
   OVERLAY PATCHES — OWNER LIVE-VALIDATED (EXIT=124 clean): `getMode` resolves, `onCreate`→`onPostCreate`→`onStart`→`onResume`
   ALL fire, `createGlAppsFrame` succeeds.** Roblox hits two more INSTALLED-framework gaps in `ActivityNativeMain.onResume`
@@ -150,19 +188,14 @@ before any history-rewriting/force operation.
   `View$OnCapturedPointerListener` + `Display` + `Display$Mode` + `Activity` + `Fragment` + `Vibrator`; first-dex-wins.
   Working-tree changes: `tools/framework-overlay/patch-framework.sh` (the `Display.getMode` + `Vibrator.cancel` blocks
   + the assemble `cp` lines + the header comment) and the NEW committed `Display$Mode.smali`; the vendored smali jars
-  stay in git-ignored `vendor/toolchain/smali/`. **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host
-  MAIN LOOP): rebuild the overlay FIRST with `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was
-  wiped or the overlay was touched (boot errors `Android framework not found`; `export
-  ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/` must hold the smali
-  2.5.2 jars), then `cargo run -- run <APK>` on the process main thread. MILESTONE REACHED (owner-validated, current
-  tree): `ActivityNativeMain` is now FULLY RESUMED — `onCreate`→`onPostCreate`→`onStart`→`onResume` all fire,
+  stay in git-ignored `vendor/toolchain/smali/`. **[START-HERE marker moved 2026-06-13 to the `MemoryInfo`
+  `Parcelable`/`writeToParcel` + APP_READY entry at the TOP of §5 — OWNER LIVE-VALIDATED that this `getMode`/
+  `Vibrator.cancel` resume work holds: `ActivityNativeMain` is FULLY RESUMED. The NEW FRONTIER this entry flagged
+  (`MemoryInfo.writeToParcel`) is now FIXED by that top entry, which carries the live frontier forward to APP_READY +
+  the tolerated running-loop gaps.]** MILESTONE REACHED (owner-validated):
+  `ActivityNativeMain` is FULLY RESUMED — `onCreate`→`onPostCreate`→`onStart`→`onResume` all fire,
   `createGlAppsFrame` succeeds, the lifecycle-ordering fix + `getMode` hold; the boot is EXIT=124 clean and advances
-  PAST `getMode` to a SEPARATE next gap. NEW FRONTIER (next task — a series of framework-completeness gaps in
-  `onResume` startup): the IMMEDIATE one is `android.app.ActivityManager$MemoryInfo.writeToParcel(Landroid/os/Parcel;I)V`
-  — `NoSuchMethodError`; the patched-`javac` `MemoryInfo` must implement `Parcelable` + `writeToParcel`, a
-  **javac-overlay edit to `tools/framework-overlay/src/android/app/ActivityManager.java`, NOT smali** (depends on ATL's
-  stock `Parcel` write-API surface). CAPTURE the next gap one at a time (pure log observation, no binary inspection).
-  STANDING FRONTIER once the resume gaps clear is the surface-to-engine render wiring.** Gate (no Rust changed —
+  PAST `getMode`. Gate (no Rust changed —
   smali-overlay + build-script only): overlay build clean (exit 0; `classes.dex` 18656B, `classes2.dex` 60968B [grew
   from 59704B Activity+Fragment by the added `Display.getMode` + `Display$Mode` + `Vibrator.cancel`], `classes3.dex`
   2498192B; `classes2.dex` verified via baksmali `list classes` to define EXACTLY `Activity` + `Fragment` + `Vibrator`
@@ -3149,6 +3182,28 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Verification (this tree):* `tools/framework-overlay/patch-framework.sh` exits 0 (`OK: patched framework overlay installed`); 3-dex `api-impl.jar` — `classes.dex` 18656 B, `classes2.dex` 60968 B (grew from 59704 B Activity+Fragment by the added `Display.getMode` + `Display$Mode` + `Vibrator.cancel`), `classes3.dex` 2498192 B; baksmali `list classes` on the shipped `classes2.dex` confirms it defines EXACTLY the 7 classes `Landroid/app/Activity;` + `Landroid/app/Fragment;` + `Landroid/os/Vibrator;` + `Landroid/view/Display;` + `Landroid/view/Display$Mode;` + `Landroid/view/View;` + `Landroid/view/View$OnCapturedPointerListener;` — no strays. `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **556 unit + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 562 passed, 0 failed**; `cargo build --release` clean (artifact 8,911,112 bytes). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); the dev-host live boot is the OWNER's (§5 START-HERE) and is the source of the EXIT=124-clean resume milestone above.*
 
   *Files:* `tools/framework-overlay/patch-framework.sh` (the `Display.getMode` + `Vibrator.cancel` insert blocks + the assemble `cp`/`mkdir` lines + the header comment), NEW `tools/framework-overlay/smali/android/view/Display$Mode.smali`, `AGENTS.md`; overlay output is a `~/.cache` artifact regenerated by the in-repo script (not committed); vendored smali toolchain stays git-ignored under `vendor/toolchain/smali/`.
+
+---
+
+### 2026-06-13 — 🟢 `ActivityManager$MemoryInfo` made `Parcelable` (`writeToParcel`/`describeContents`) — Roblox BOOTS TO APP_READY (Startup/Landing), `ActivityNativeMain` gets PAST `onResume` (OWNER LIVE-VALIDATED, EXIT=124 clean)
+
+  *Symptom / evidence:* with the `Display.getMode`/`Vibrator.cancel` resume gaps fixed and `ActivityNativeMain` FULLY RESUMED, the owner's live boot threw `NoSuchMethodError` on `android.app.ActivityManager$MemoryInfo.writeToParcel(Landroid/os/Parcel;I)V` in `ActivityNativeMain.onResume` startup. The overlay's patched (`javac`) `MemoryInfo` is a verbatim ATL copy (+ the `RunningAppProcessInfo` importance/pkgList patch) and declared only the 4 plain fields (`availMem`/`totalMem`/`threshold`/`lowMemory`) — it did NOT implement `Parcelable`, so the call had no target.
+
+  *Root cause:* purely missing Java-level surface on the overlay's patched `MemoryInfo`. AOSP's `ActivityManager.MemoryInfo` IS `Parcelable` (declares `describeContents()` + `writeToParcel(Parcel,int)` + a `CREATOR`); ATL's copy dropped the Parcelable surface, and Roblox's resume path parcels a `MemoryInfo`. `RegisterNatives` cannot add a Java *method* or an `implements` clause, so this is a **framework-overlay** fix — and specifically the **javac path**, because `MemoryInfo` is the javac-patched `android/app/ActivityManager` class (NOT one of the smali-shadowed installed classes).
+
+  *Fix (javac path, faithful to AOSP, minimal):* `tools/framework-overlay/src/android/app/ActivityManager.java` — `public static class MemoryInfo` now `implements android.os.Parcelable`, with `describeContents()` returning `0` (no FDs) and `writeToParcel(android.os.Parcel dest, int flags)` writing its 4 declared fields via the stock Parcel write-API: `dest.writeLong(availMem)`, `dest.writeLong(totalMem)`, `dest.writeLong(threshold)`, `dest.writeInt(lowMemory ? 1 : 0)`. ATL's installed `Parcel` was verified to provide `writeLong(J)V` + `writeInt(I)V`, so the invoke-virtuals resolve at runtime. So the patched source compiles against the compile-only stub tree (`api-impl.jar` ships dex, not classfiles, so it can't be a javac classpath), `tools/framework-overlay/stubs/android/os/Parcel.java` was extended with `writeLong(long)` + `writeInt(int)` no-op shells. The pre-existing `stubs/android/os/Parcelable.java` interface already declares the `describeContents()`/`writeToParcel(Parcel,int)` pair, so no stub change there. Both stubs are **compile-only and NEVER dexed** — the stage glob (`patch-framework.sh`) copies only `Build*`/`PowerManager*`/`NetworkRequest*`/`ActivityManager*`/`LayoutInflater*` classes into `classes.dex`; `android/os/Parcel.class`/`Parcelable.class` are excluded, so the REAL ATL `Parcel`/`Parcelable` are used at runtime. `MemoryInfo` is staged into `classes.dex` by the existing `android/app/ActivityManager*.class` glob — **no `patch-framework.sh` change needed**.
+
+  *Same-pattern audit:* the only other `Parcelable` nested class in the overlay's `ActivityManager.java` is `RunningServiceInfo`, which already declares the `describeContents()`/`writeToParcel` pair — so this patch brings `MemoryInfo` in line with the in-file precedent. No other `MemoryInfo` definition exists anywhere in the overlay (the smali path is untouched by this javac-only patch; `classes2.dex` stays exactly the 7 installed-class shadows). Like the sibling `RunningServiceInfo`, `MemoryInfo` omits the read-side `CREATOR` — intentional and correct for the confirmed failure (Roblox only calls `writeToParcel` in the validated boot); adding `CREATOR` would be speculative scope (Simplicity First). Flagged for a future reader: if a later boot shows Roblox reading a `MemoryInfo` back (`CREATOR.createFromParcel`), add `CREATOR` + a matching read path then, mirroring the write field order (`availMem`/`totalMem`/`threshold` long, then `lowMemory` int). (Pre-existing, untouched: `getMemoryInfo(MemoryInfo outInfo)` does a no-op local reassignment `outInfo = new MemoryInfo();` that never populates the caller's object — inherited verbatim ATL behavior, out of this patch's scope.)
+
+  *Regression protection:* the build-time guards inside `patch-framework.sh` (the dex-entry/byte-size and class-set checks) plus the `javac` compile itself — `writeToParcel` referencing `Parcel.writeLong`/`writeInt` will not compile if the stub regresses, and the build fails loudly. No new test script was warranted (ART cannot run under `cargo test`, and the failure is a Java-level method-resolution gap the Rust unit/integration suite cannot exercise); the verifiable invariant is the rebuilt `classes.dex` containing `MemoryInfo .implements Landroid/os/Parcelable;` with the exact `writeToParcel(Landroid/os/Parcel;I)V` signature, checked via baksmali in verification below.
+
+  *Milestone (owner live-validated, current tree):* with `MemoryInfo.writeToParcel`, `writeToParcel` resolves and `ActivityNativeMain` gets PAST `onResume` ENTIRELY. The app reaches RESUMED, the main `Looper` pump runs, the engine loads its DataModel (`rbxasset://places/Mobile.rbxl`) and reaches **APP_READY (Startup/Landing)** — Roblox boots to the landing/app-ready stage; the boot is EXIT=124 clean.
+
+  *New frontier (next tasks):* (a) the now-TOLERATED running-loop framework gaps the pump survives (non-fatal in the running pump today, but they throw): `View.nativeIsAttachedToWindow` → `boolean` (return-driven; the activity view IS attached, so return `true`), `View.getWindowVisibleDisplayFrame(Rect)` (fill the `Rect` with the window frame), and `android.app.Dialog.nativeInit` → `long` (Dialog peer) — bind these so UI/dialog messages stop throwing in the pump; (b) the STANDING render frontier — wire the engine `AndroidGLView` surface to Eclipse's window (Eclipse currently runs its own Vulkan clear-and-present loop while the engine renders to its own surface) so rendered frames appear; (c) login/auth (`apis.roblox.com` 403s — environmental, needs real credentials). Capture the running-loop gaps one at a time by log observation only.
+
+  *Verification (this tree):* `tools/framework-overlay/patch-framework.sh` exits 0 (`OK: patched framework overlay installed`); 3-dex `api-impl.jar` — `classes.dex` 18832 B (grew from 18656 B, consistent with the larger `Parcelable` `MemoryInfo`), `classes2.dex` 60968 B UNCHANGED, `classes3.dex` 2498192 B UNCHANGED; baksmali of the produced `classes.dex` confirms `android/app/ActivityManager$MemoryInfo` `.implements Landroid/os/Parcelable;` with `describeContents()I` returning 0 and `writeToParcel(Landroid/os/Parcel;I)V` invoking `Parcel->writeLong(J)V` ×3 (`availMem`/`totalMem`/`threshold`) + `Parcel->writeInt(I)V` ×1 (`lowMemory` 1/0) — the exact stock-Parcel write-API surface and the exact signature of the `NoSuchMethodError` target; `classes2.dex` baksmali `list classes` still defines EXACTLY the 7 smali classes (`Activity`/`Fragment`/`Vibrator`/`Display`/`Display$Mode`/`View`/`View$OnCapturedPointerListener`) — smali path untouched. `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **556 unit + 0 main-bin + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 562 passed, 0 failed** (no Rust changed → no test delta); `cargo build --release` clean (artifact 8,911,112 bytes). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); the dev-host live boot is the OWNER's (§5 START-HERE) and is the source of the EXIT=124-clean APP_READY milestone above.*
+
+  *Files:* `tools/framework-overlay/src/android/app/ActivityManager.java` (`MemoryInfo implements Parcelable` + `describeContents`/`writeToParcel`), `tools/framework-overlay/stubs/android/os/Parcel.java` (compile-only `writeLong(long)`/`writeInt(int)` shells — never dexed), `AGENTS.md`; overlay output is a `~/.cache` artifact regenerated by the in-repo script (not committed).
 
 ---
 
