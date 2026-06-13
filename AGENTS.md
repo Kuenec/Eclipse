@@ -153,18 +153,25 @@ before any history-rewriting/force operation.
   `onResume`/RESUMED (clamp-28 preserved the lifecycle); **(C) ⏳ still no frames** — the engine reads its shader pack
   **directly from the APK** (strace: `lseek` to the CRC-valid STORED `assets/shaders/shaders_glsles3.pack` local-header
   67686916 + data 67686984; it NEVER opens the extracted FS tree, and corrupting the FS copy's magic was byte-identical).
-  **TWO NEXT GATES — either unblocks render (pick next session):** **(a) Vulkan (reference path — Sober uses it):**
-  `Mode 6 failed: Unable to create Vulkan instance` because the engine requests the Android-only **`VK_KHR_android_surface`**
-  instance extension, which the host Linux Vulkan ICD lacks. Eclipse must add a Vulkan-surface translation seam (parallel
-  to the EGL one): intercept the engine's `vkCreateInstance` to swap `VK_KHR_android_surface`→`VK_KHR_wayland_surface`
-  (+ `vkEnumerateInstanceExtensionProperties`), and `vkCreateAndroidSurfaceKHR`→`vkCreateWaylandSurfaceKHR` on winit's
-  `wl_display`+`wl_surface`. **(b) GLES3 (EGL already wired by Phase 3):** `Mode 4 failed: Error opening shader pack
-  glsles3` is a POST-READ rejection of valid bytes (not file/CRC/format — all verified OK). Forensics' medium-confidence
-  hypothesis: the empty `ro.product.*`/`ro.build.*` property store collapses the engine into a bogus "HTC unknown"
-  low-end profile (`Excluded 'HTC unknown:…RTX 5070' - disabling SuperHQ shaders`, `GLES MT shader loading is disabled`,
-  `Video memory size: 67108864`=64 MiB floor) that gates the GLES3 pack. NEXT PROBE: populate sane `ro.product.*`/
-  `ro.build.*` in `native_provider.rs::eclipse_system_property_get` (currently empty for all keys) and re-boot
-  (confirm-by-fix). Detail: §6 (2026-06-13 render Phase 5 — guest API level).
+  **NEXT GATE = (a) VULKAN — gate (b) GLES3 device-profile was RULED OUT by probe (this session):** **(a) Vulkan
+  (reference path — Sober uses it; the engine PREFERS it, Mode 6 is tried first):** `Mode 6 failed: Unable to create
+  Vulkan instance` because the engine requests the Android-only **`VK_KHR_android_surface`** instance extension, which the
+  host Linux Vulkan ICD lacks (it has `VK_KHR_wayland_surface`/`VK_KHR_xcb_surface`). Eclipse must add a Vulkan-surface
+  translation seam (tier-0, parallel to the Phase-3 `eglGetDisplay` connection-match): intercept the engine's
+  `vkCreateInstance` to swap `VK_KHR_android_surface`→`VK_KHR_wayland_surface` in `ppEnabledExtensionNames` (and have
+  `vkEnumerateInstanceExtensionProperties` advertise `android_surface` so the engine requests it), then intercept
+  `vkCreateAndroidSurfaceKHR(instance,{ANativeWindow})`→`vkCreateWaylandSurfaceKHR(instance,{wl_display,wl_surface})`
+  using winit's `wl_display`+`wl_surface` from `ndk_registry` WSI (the same handles Phase 1/3 publish). The engine routes
+  `vk*` to host `libvulkan` via `bionic_env` tier 1 (like `egl*`/`gl*`); Eclipse intercepts only the 2-3 surface calls at
+  tier 0. This is the high-confidence path and warrants a focused forensics+design workflow. **(b) GLES3 device-profile —
+  RULED OUT as the render blocker (probe evidence):** serving the 3 native device keys the engine actually reads
+  (captured live via `__system_property_get`: `ro.product.model`/`ro.hardware`/`ro.soc.manufacturer`) with sane values
+  (`Pixel 7 Pro`/`cheetah`/`Qualcomm`) changed NEITHER the `HTC unknown` profile NOR the shader-pack open — because the
+  "HTC unknown" identity is sourced from Java `Build.MANUFACTURER`/`Build.MODEL` over JNI (the SAME channel as SDK_INT),
+  not the native property store, AND the `Error opening shader pack glsles3` is independent of the device profile (it is
+  the Vulkan-fallback path the engine does not robustly use on this config). So the empty native property store is NOT
+  the render blocker; populating it (and/or the Java `Build.*` device identity) is at most a separate User-Agent/quality
+  correctness nicety, NOT on the render critical path. Detail: §6 (2026-06-13 render Phase 5 — guest API level).
 - **2026-06-13 — ⚠️ RENDER PHASE 4 (BUNDLED-ASSET PROVISIONING) — CORRECTED BY PHASE 5: it was the WRONG layer.** The
   `Apk::extract_assets` wiring (extract APK `assets/` → app-data `files/assets/`) is harmless and still ships, BUT the
   Phase 5 strace probe PROVED the engine reads its shader packs/content **directly from the APK** (its own zip reader,
