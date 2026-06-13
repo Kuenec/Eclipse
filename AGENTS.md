@@ -128,6 +128,67 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🧩 INFLATABLE `android.widget.*` VIEW-SUBCLASS `native_constructor` BATCH BOUND (8 classes, one pass)
+  — the one-class-per-boot `UnsatisfiedLinkError` churn at `LayoutInflater.inflate` is closed for the widget set.**
+  Owner live validation of the SurfaceView bind (`/tmp/eclipse-surfaceview-validate.log`, EXIT=124 clean) proved
+  `RBXSurfaceView` constructs and `ActivityNativeMain`'s `LayoutInflater` proceeds further into the content view,
+  then tripped the NEXT View subclass in the same layout: `No implementation found for long
+  android.widget.ProgressBar.native_constructor(android.content.Context, android.util.AttributeSet)` at
+  `LayoutInflater.inflate` → `ActivityNativeMain.onCreate`. ROOT CAUSE (first-party, same mechanism as SurfaceView):
+  ART resolves natives PER DECLARING CLASS, and `android.view.View`'s `native_constructor(Context, AttributeSet)J`
+  (`View.java:1166`) is RE-declared VERBATIM by every concrete inflatable `android.widget.*` subclass the vendored
+  ATL ships, so the `register_view_natives` base binding does NOT satisfy them — each must bind the shared
+  class-agnostic `view_native_constructor` on its OWN class before step 4. FIX (this commit): instead of one fn per
+  class, a NEW `const VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` (the 8 slashed names) + a single
+  `register_view_subclass_constructor_natives(env)` helper loops `find_class → NativeMethod::from_raw_parts(
+  VIEW_NATIVE_CONSTRUCTOR_NAME/_SIG, view_native_constructor) → register_native_methods` (the exact
+  `register_surface_view_natives` recipe — minimal because all 8 bind the IDENTICAL shared body, which records the
+  receiver's concrete class via `view_class_name` + `view_registry::allocate`, handle ≥ 1), wired into
+  `drive_lifecycle` right after `register_surface_view_natives` (before step 4 / LayoutInflater). THE 8 BOUND
+  (each verified first-party to declare the 2-arg `native_constructor` DIRECTLY against
+  `vendor/atl/src/api-impl/android/widget/`): `Button` (`Button.java:39`), `EditText` (`:24`), `ProgressBar` (`:49`),
+  `CheckBox` (`:19`), `RadioButton` (`:17`), `SeekBar` (`:17`), `Spinner` (`:26`), `ScrollView` (`:18`). EXCLUDED
+  (first-party-verified): `CompoundButton` is `public abstract class` (`CompoundButton.java:9`) — not
+  LayoutInflater-instantiable; its concrete leaves CheckBox/RadioButton re-declare the native and ARE bound.
+  `PopupWindow` (`PopupWindow.java:177`) declares ZERO-ARG `native_constructor()J` and is NOT a View — wrong arity +
+  wrong type for the shared body. The abstract parents `AbsSeekBar`/`AbsSpinner`/`AdapterView`/`ViewGroup` do NOT
+  declare `native_constructor` (the layout containers inherit View's, already bound) — no binding needed. ONLY
+  `native_constructor` is bound per class; each class's extra natives (e.g. `ProgressBar.native_setProgress`, SeekBar/
+  Spinner extras) stay UNBOUND on purpose so the next real layout/draw trip surfaces them one at a time (the
+  deliberate loud discovery signal, exactly as `register_surface_view_natives` omits `native_createSnapshot`/
+  `native_postSnapshot`). `View.native_destructor(long)` (`View.java:1168`) is declared on View and NOT re-declared by
+  any widget, so the existing `register_view_natives` binding covers destruction for all 8 by inheritance. RECORDED,
+  deliberately NOT bound (out of the `android.widget.*` scope, not yet surfaced by evidence): `android.webkit.WebView`
+  (`vendor/atl/src/api-impl/android/webkit/WebView.java`) is the ONE remaining concrete class that re-declares the
+  exact `(Context, AttributeSet)J` `native_constructor` and is currently unbound anywhere in `framework.rs` — if a
+  future layout inflates a WebView it will trip `No implementation found for long
+  android.webkit.WebView.native_constructor(...)`; it shares the exact signature so it can join
+  `VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` (+ the pin test) when/if it surfaces. AUDIT (full overlay grep,
+  `native long native_constructor(Context` across `widget`/`view`/`webkit`): exactly 15 declarers = 5 already bound
+  (View, SurfaceView, TextView, ImageView, ImageButton) + 8 newly bound + 1 abstract-excluded (CompoundButton) + 1
+  recorded-unbound (WebView); PopupWindow's zero-arg form is correctly outside this set. Regression guard:
+  `view_subclass_constructor_classes_are_slashed_internal_names` (mirrors `surface_view_class_is_slashed_internal_name`)
+  pins the EXACT ordered 8-name set so a dropped/reordered class — which re-introduces the one-per-boot
+  `UnsatisfiedLinkError` — fails CI, and asserts CompoundButton/PopupWindow stay OUT. **⇐ START HERE NEXT SESSION (=
+  OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the empirical bind→boot→next-gap loop —
+  expect `ActivityNativeMain`'s `LayoutInflater` to now build its FULL content view WITHOUT tripping per-widget
+  `native_constructor` (ProgressBar + the rest of the batch construct; a `view_registry` peer is allocated per
+  inflated widget recording its concrete class), then surface the NEXT unbound native one at a time — either a
+  per-widget extra native (e.g. `ProgressBar.native_setProgress`), the recorded `WebView.native_constructor` if a
+  WebView is in the layout, or the next class on the inflate→attach→surface path. Capture that exact next-native ART
+  stack (pure log observation, no binary inspection). The next FRONTIER once the layout completes is the SCOPED
+  surface-to-engine wiring from `2194f02`'s §6 plan: wire `EngineNativeWindow::new` + `register_wsi_window`/
+  `set_engine_window_geometry` into `graphics.rs::run_windowed` (today ZERO there, so production
+  `ANativeWindow_fromSurface` always hits the geometry-only fallback), resolve present-loop ownership handoff, and
+  JNI-dispatch `SurfaceView.surfaceCreated()`/`surfaceChanged()` once the WSI surface is live — designed AFTER the
+  live boot reveals the post-layout call chain (in particular whether/when libroblox's reflection-registered
+  `AndroidGLView` SurfaceHolder.Callback fires and on which thread; all libroblox-internal RUNTIME behavior, NOT
+  first-party-determinable, NOT to be obtained by reverse-engineering libroblox.so — capture that next-native/
+  AndroidGLView trace from the boot log). The NDK/EGL half is de-risked (`gl_test_anw_binds_real_wsi_handle` green).)**
+  Gate: **551 unit + 4 integration (live milestone subprocesses, 0 SKIP) + 2 doctests = 557 passed, 0 failed**
+  (+1 unit: the pin test), fmt/clippy `-D warnings`/release all 0-warning. Detail: §6 (2026-06-13 View-subclass
+  constructor-batch entry).
 - **2026-06-13 — 🎬 `SurfaceView.native_constructor` + `View.native_destructor` BOUND — Roblox's GL render
   surface (`com.roblox.client.RBXSurfaceView`) now CONSTRUCTS; LayoutInflater can complete ActivityNativeMain's
   content view.** Owner live validation of `native_get_window` (`/tmp/eclipse-getwindow-validate.log`, EXIT=124
@@ -163,8 +224,10 @@ before any history-rewriting/force operation.
   `register_wsi_window`/`set_engine_window_geometry`, today ZERO in graphics.rs/main.rs so production
   `ANativeWindow_fromSurface` always hits the geometry-only fallback) + present-loop ownership handoff + JNI-
   dispatching SurfaceView's private `surfaceCreated()`/`surfaceChanged()` once the WSI surface is live (no Java
-  caller in vendored ATL; Eclipse must drive them — precedent: `View.layoutInternal` JNI-called from native). **⇐
-  START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>`
+  caller in vendored ATL; Eclipse must drive them — precedent: `View.layoutInternal` JNI-called from native). **[START-HERE
+  marker moved 2026-06-13 to the View-subclass `native_constructor` batch entry above — the per-class
+  one-at-a-time SurfaceView bind exposed `ProgressBar` next, and the whole `android.widget.*` inflatable
+  set is now bound in one pass.]** (the plan was = OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>`
   with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the empirical bind→boot→next-gap
   loop — expect `RBXSurfaceView` to now CONSTRUCT (NO `UnsatisfiedLinkError` on `SurfaceView.native_constructor`; a
   `view_registry` peer naming `com.roblox.client.RBXSurfaceView` is allocated and LayoutInflater completes the
@@ -2244,6 +2307,107 @@ post-construction call chain is observed, the render-integration frontier is ACT
 `surfaceCreated()`/`surfaceChanged()` on top of the already-green ANW path; success looks like EGL context creation
 succeeding and the FIRST engine frames in the winit window. *Files:* `src/framework.rs`,
 `src/framework/view_registry.rs`. *No subagent live boot.*
+
+### 2026-06-13 — Inflatable `android.widget.*` View-subclass `native_constructor` batch bound in one pass (Button/EditText/ProgressBar/CheckBox/RadioButton/SeekBar/Spinner/ScrollView) — closes the one-class-per-boot `LayoutInflater.inflate` `UnsatisfiedLinkError` churn for the widget set
+
+*Confirmed root cause (first-party + live-evidence — owner boot of `2194f02`, `/tmp/eclipse-surfaceview-validate.log`,
+EXIT=124 clean):* with `SurfaceView.native_constructor` + `View.native_destructor` bound (entry above),
+`RBXSurfaceView` constructed and `ActivityNativeMain`'s `LayoutInflater` proceeded further into the content view, then
+tripped the NEXT View subclass in the same layout: `No implementation found for long
+android.widget.ProgressBar.native_constructor(android.content.Context, android.util.AttributeSet)` at
+`android.widget.ProgressBar.native_constructor(Native Method)` → `android.view.LayoutInflater.inflate` →
+`com.roblox.client.ActivityNativeMain.onCreate` → `android.app.Activity.nativeStartActivity`. *Mechanism
+(first-party-verified, IDENTICAL to the SurfaceView root cause):* ART resolves natives PER DECLARING/receiver class,
+and `android.view.View`'s `native_constructor(Context, AttributeSet) -> long` (vendored `View.java:1166`, the peer
+handle `View.java:965` stores into the `long widget` field) is RE-declared VERBATIM by every concrete inflatable
+`android.widget.*` subclass — so the `register_view_natives` base binding does NOT satisfy them; each subclass the
+layout inflates needs the shared class-agnostic `view_native_constructor` registered on its OWN class before step 4 /
+`LayoutInflater`, or `inflate` throws. Eclipse had been binding these one at a time (View, then SurfaceView, …); the
+layout clearly contained more (ProgressBar surfaced, others to follow), so binding them one-per-boot is slow — this
+binds the whole `android.widget.*` set the overlay declares `native_constructor` on, in one pass.
+
+*Fix (one shared helper, not eight near-duplicate functions, `src/framework.rs`):* NEW
+`const VIEW_SUBCLASS_CONSTRUCTOR_CLASSES: &[&JNIStr]` (the 8 slashed internal names below) + NEW
+`register_view_subclass_constructor_natives(env)` that loops the slice: `find_class(class_name)` →
+`[NativeMethod::from_raw_parts(VIEW_NATIVE_CONSTRUCTOR_NAME, VIEW_NATIVE_CONSTRUCTOR_SIG, view_native_constructor)]` →
+`unsafe env.register_native_methods` — the EXACT `register_surface_view_natives` recipe (`src/framework.rs`), with the
+same `// SAFETY:` discipline. One shared helper (not per-class fns) is the minimal/non-boilerplate match to the
+codebase's own design, because all 8 bind the IDENTICAL shared body: `view_native_constructor` (`src/framework.rs`) is
+fully class-agnostic — it reads the receiver's concrete class via `getClass().getName()` (`view_class_name`) and
+allocates a real `view_registry` generational-slab peer (handle ≥ 1), so each subclass records its OWN concrete class
+(e.g. `android.widget.ProgressBar`). Wired into `drive_lifecycle` right after `register_surface_view_natives(env)?`
+(before step 4 / LayoutInflater) — the SAME ordering proven for every other per-class View-subclass registration.
+
+*The 8 bound* (each verified first-party to declare the 2-arg `native_constructor(Context, AttributeSet)J` DIRECTLY on
+itself against `vendor/atl/src/api-impl/android/widget/`, so `RegisterNatives` finds the method — a class that merely
+inherited it would `NoSuchMethodError`): `android/widget/Button` (`Button.java:39`), `android/widget/EditText`
+(`EditText.java:24`), `android/widget/ProgressBar` (`ProgressBar.java:49`), `android/widget/CheckBox`
+(`CheckBox.java:19`), `android/widget/RadioButton` (`RadioButton.java:17`), `android/widget/SeekBar`
+(`SeekBar.java:17`), `android/widget/Spinner` (`Spinner.java:26`), `android/widget/ScrollView` (`ScrollView.java:18`).
+All 8 share the exact `VIEW_NATIVE_CONSTRUCTOR_SIG = (Landroid/content/Context;Landroid/util/AttributeSet;)J`
+(`src/framework.rs:4322-4324`).
+
+*Excluded (first-party-verified, intentional):* `android/widget/CompoundButton` is `public abstract class`
+(`CompoundButton.java:9`) — LayoutInflater cannot instantiate it; its concrete leaves CheckBox/RadioButton re-declare
+the native and ARE in the set. `android/widget/PopupWindow` declares ZERO-ARG `native_constructor()J`
+(`PopupWindow.java:177`) and is NOT a View — pointing it at the shared `(Context, AttributeSet)J` body would be wrong
+arity AND wrong type; it gets its own distinct body if/when it traps. The abstract layout parents
+`AbsSeekBar`/`AbsSpinner`/`AdapterView`/`ViewGroup` do NOT declare `native_constructor` (the containers inherit View's,
+already bound by `register_view_natives`) — no binding needed. ONLY `native_constructor` is bound per class; each
+class's extra natives (e.g. `ProgressBar.native_setProgress`, SeekBar/Spinner extras) stay UNBOUND on purpose so the
+next real layout/draw trip surfaces them one at a time — the deliberate loud discovery signal, exactly as
+`register_surface_view_natives` omits `native_createSnapshot`/`native_postSnapshot`. `View.native_destructor(long)`
+(`View.java:1168`) is declared on View and re-declared by NONE of these, so the existing `register_view_natives`
+binding covers destruction for all 8 by inheritance — no per-class destructor binding.
+
+*Same-pattern audit (full overlay grep, `native long native_constructor(Context` across `widget`/`view`/`webkit`):*
+exactly 15 declarers of the `(Context, AttributeSet)J` form: 5 already bound (View, view/SurfaceView, widget/TextView,
+widget/ImageView, widget/ImageButton) + 8 newly bound (above) + 1 abstract-excluded (widget/CompoundButton) + 1
+recorded-unbound (webkit/WebView). PopupWindow's zero-arg form is correctly outside this set. RECORDED, deliberately
+NOT bound (out of the `android.widget.*` scope of this pass, not yet surfaced by evidence): `android.webkit.WebView`
+(`vendor/atl/src/api-impl/android/webkit/WebView.java`) is the ONE remaining concrete class that re-declares the exact
+`(Context, AttributeSet)J` `native_constructor` and is currently unbound anywhere in `framework.rs` — if a future
+layout inflates a WebView it will trip `No implementation found for long android.webkit.WebView.native_constructor(...)`;
+it shares the exact signature so it can join `VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` (+ the pin test) when/if it surfaces.
+Leaving it unbound keeps it a loud discovery signal, consistent with the per-class extra-natives policy above. The
+`ViewGroup` layout containers (LinearLayout/FrameLayout/RelativeLayout/ViewGroup) do NOT re-declare `native_constructor`
+— they inherit View's, already bound — so they are correctly absent.
+
+*Regression guard (tied to the confirmed root cause):* NEW `view_subclass_constructor_classes_are_slashed_internal_names`
+(`src/framework.rs`, mirrors `surface_view_class_is_slashed_internal_name`) pins the EXACT ordered 8-name set
+(`assert_eq!` on the full Vec, so a DROPPED or reordered class — which re-introduces the one-per-boot
+`UnsatisfiedLinkError` this pass fixes — fails the test) and asserts CompoundButton/PopupWindow stay OUT of the set
+(abstract / wrong-arity-non-View). Host-independent pure-const test. As with every prior View native, the
+binding-PRESENCE guard (a missing `RegisterNatives` only surfaces under a live ART boot, which can't run in-harness) is
+the documented owner dev-host live boot. Run: `cargo test view_subclass_constructor_classes_are_slashed_internal_names`
+(1 passed).
+
+*Verification (full gate, clean working tree, no machine-specific assumptions):* `cargo fmt --all` CLEAN;
+`cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings (confirmed
+real, not stale cache — forced a fresh recompile of the eclipse crate, 2.45s); `cargo test` **551 unit + 0 (main) + 4
+integration (`tests/engine_milestones.rs`, 0 SKIP — APK+display present, exact success markers required) + 2 doctests =
+557 passed, 0 failed**; `cargo build --release` clean (stripped PIE x86-64, artifact 8,870,408 bytes). Unit count
+550→551 (+1, the pin test). *Did NOT live-boot ART (no `cargo run` / `__*` subcommands) and did NOT inspect any
+third-party binary — first-party only.*
+
+*OWNER-RUN DATA NEEDED (dev-host live boot, prohibited here — `./target/release/eclipse run <APK>` with
+`ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`):* (1) confirm `ActivityNativeMain`'s
+`LayoutInflater` builds its FULL content view WITHOUT tripping per-widget `native_constructor` (ProgressBar + the rest
+of the batch construct; a `view_registry` peer is allocated per inflated widget recording its concrete class); (2)
+capture the NEXT unbound-native ART stack — either a per-widget extra native (e.g. `ProgressBar.native_setProgress`),
+the recorded `WebView.native_constructor` if the layout inflates a WebView, or the next class on the
+inflate→attach→surface path; (3) watch for any `UnsatisfiedLinkError` naming a `com.roblox.*` class on
+`native_constructor` (an RBX* custom view that `@Override`-re-declares it in the dex would need its own binding on the
+app class name — an app-bytecode fact, NOT first-party-determinable; report the exact class, do not dexdump the APK).
+Once the layout completes, the render-integration frontier is the SCOPED surface-to-engine wiring from `2194f02`'s §6
+plan: `EngineNativeWindow::new` + `register_wsi_window`/`set_engine_window_geometry` into `graphics.rs::run_windowed`
+(today ZERO there, so production `ANativeWindow_fromSurface` always hits the geometry-only fallback), present-loop
+ownership handoff, and JNI-dispatch of `SurfaceView.surfaceCreated()`/`surfaceChanged()` once the WSI surface is live —
+designed AFTER the live boot reveals the post-layout call chain (in particular whether/when libroblox's
+reflection-registered `AndroidGLView` SurfaceHolder.Callback fires and on which thread; all libroblox-internal RUNTIME
+behavior, NOT first-party-determinable, NOT to be obtained by reverse-engineering libroblox.so — capture that
+next-native/AndroidGLView trace from the boot log). The NDK/EGL half is de-risked (`gl_test_anw_binds_real_wsi_handle`
+green). *Files:* `src/framework.rs`. *No subagent live boot.*
 
 ---
 
