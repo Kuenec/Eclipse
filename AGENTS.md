@@ -128,6 +128,50 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🪟 `View.native_get_window` BOUND — the last evidence-pinned blocker on the
+  ActivityNativeMain.onCreate view-tree path is closed (the EXIT=124 boot's only remaining gap).** Owner live
+  validation of the exit-10 fix chain (`/tmp/eclipse-exit10-validate.log`, EXIT=124 clean, NO coredump, ZERO
+  native faults) proved the boot indefinitely stable through the splash→ActivityNativeMain transition and real
+  Roblox HTTPS flag-fetch, with ONE remaining blocker: `ActivityNativeMain.onCreate` → `d1()` →
+  `View.getViewTreeObserver()` threw `UnsatisfiedLinkError: No implementation found for android.view.Window
+  android.view.View.native_get_window(long)` (ATL's `getViewTreeObserver` calls the instance native
+  `native_get_window(widget)` to obtain the Window that owns the view tree's `ViewTreeObserver`). ROOT CAUSE
+  (first-party): two coupled gaps — (1) `View.native_get_window` (declared `(J)Landroid/view/Window;` instance,
+  vendored ATL `View.java:1244`) was unbound; (2) Eclipse held NO real Window object to return —
+  `window_registry::WindowState.jobject` was a presence-only `Option<()>` and `Window.set_jobject` only recorded
+  `Some(())`. FIX (this commit, both root causes): `window_registry` now CAPTURES the real Java Window — `jobject`
+  is `Option<Global<JObject<'static>>>` (mirrors the proven `view_registry` `Global`+`Send`+Drop-releases-the-ref
+  triple), with `set_jobject`/`with_jobject` accessors and a lock-free `ACTIVE_WINDOW` `AtomicI64` +
+  `active_window()` (mirrors `view_registry::ACTIVE_ROOT`) published by `allocate`/cleared by `free`. `framework.rs`
+  binds `View.native_get_window` in `register_view_natives` (validates the view `widget` handle, maps any view to
+  the single process-shared window via `active_window()`, returns a fresh frame-local `new_local_ref` of the
+  captured Window Global — never the Global raw — or JNI null on no-capture/stale → ATL's contract-valid
+  floating-observer fallback, `View.java:1252`); `Window.set_jobject` now does `env.new_global_ref(&window)` +
+  `window_registry::set_jobject` (the one place the Window object flows into Eclipse — Window.java:188, called from
+  `set_native_window` AFTER `this.native_window` is set, so the captured object always has a valid `native_window`
+  field). Also bound the immediate next native on the same view-tree path (code-path-proven, not speculative):
+  `ViewTreeObserver.native_set_have_global_layout_listeners(Z)V` (instance no-op recording the flag — Eclipse has
+  no host layout signal; ViewTreeObserver.java:1049, called from `addOnGlobalLayoutListener` right after
+  `getViewTreeObserver`) via the new `register_view_tree_observer_natives` wired into `drive_lifecycle` after
+  `register_view_natives`. Deliberately NOT bound (discovery signal stays loud, per policy):
+  `View.native_getMatrix`, `View.native_getGlobalVisibleRect` — not on the captured path. **⇐ START HERE NEXT
+  SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`): the empirical bind→boot→next-gap loop —
+  expect ActivityNativeMain.onCreate to now get PAST `native_get_window` (NO `UnsatisfiedLinkError` on it). Confirm
+  in the boot log that `Window.set_jobject: captured Java Window object` fires BEFORE the `native_get_window` call
+  in onCreate (the one timing assumption the non-null path depends on — inferred sound from `internalCreateActivity`
+  ordering, observe it; if it does NOT, `getViewTreeObserver` returns a floating observer that never fires layout
+  callbacks). Then EITHER the next unbound framework native surfaces in the same one-per-boot discovery way (capture
+  its exact ART stack — predicted `ViewTreeObserver.native_set_have_global_layout_listeners` is now bound, so it
+  should PASS and the genuine next trip surfaces), OR the view tree completes and the engine's
+  `AndroidGLView`/ANativeWindow surface path begins — the standing RENDER-INTEGRATION frontier (wire the window's
+  `ANativeWindow` → the engine's `AndroidGLView`/EGL path; the `__gl-test-anw` diagnostic already proves
+  engine-GLES2-on-Eclipse's-window works — `gl_test_anw_binds_real_wsi_handle` is green; the boot just doesn't WIRE
+  it yet). Watch for a `getInsetsController` NPE on an early/uncaptured path — `View.java:2323` derefs
+  `native_get_window(widget)` without a null guard (pre-existing, not this diff); the fix if it trips is the
+  set_jobject capture timing, not the native.)** Gate: **548 unit + 4 integration (live milestone subprocesses,
+  0 SKIP) + 2 doctests = 554 passed, 0 failed**, fmt/clippy `-D warnings`/release all 0-warning. Detail: §6
+  (2026-06-13 native_get_window entry).
 - **2026-06-13 — 🏁 NATIVE-CRASH LADDER CLIMBED + EXIT=10 ROOT-CAUSED + FIXED (owner live validation of `54153e1`,
   `/tmp/eclipse-1223806-validate.log`, EXIT=10, NO coredump): ZERO SIGSEGV/SIGABRT this boot — the whole 4-core fix
   chain (782252 `__sF` → 866509 apkenv+altstack → 947663 thread-exit ordering → 1223806 dl_iterate_phdr/dladdr +
@@ -162,11 +206,17 @@ before any history-rewriting/force operation.
   deep-copied bionic-shaped chains, bionic-positive EAI codes; the `eclipse.netdb` trace = the reserved attribution
   diagnostic). Counts: provider **129 base / 187 total** (+4). The main-Looper pump's exception contract was ruled
   CORRECT — deliberately NO change (the loud error pair stays the regression signal that surfaced all of this).
-  **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run
-  <APK>` with `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expect: (a)
-  `launchMainActivity` followed by NO UnsatisfiedLinkError — the factored steps 5–7 drive **ActivityNativeMain**,
-  whose onCreate is the next discovery surface (expect NEW unbound-native trips on the engine surface/View path);
-  (b) splash down-lifecycle driven ONCE (the second `finish()` a guarded no-op), host window staying up; (c) NO
+  [START-HERE marker moved 2026-06-13 to the `native_get_window` entry above — this owner live validation
+  HAPPENED: `/tmp/eclipse-exit10-validate.log`, EXIT=124 (clean timeout), NO coredump, ZERO native faults: the
+  whole exit-10 fix chain is RUN-PROVEN — splash→ActivityNativeMain transition works, the boot is indefinitely
+  stable, real Roblox HTTPS flag-fetch works; the SINGLE remaining blocker was ActivityNativeMain.onCreate
+  throwing `UnsatisfiedLinkError` on the unbound `android.view.View.native_get_window(long)` (the next discovery
+  trip the exit-10 entry predicted on the engine-surface/View path), now bound — see the entry above] (the plan
+  was = OWNER live validation on the dev-host MAIN LOOP: `./target/release/eclipse run <APK>` with
+  `ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched` — expected: (a) `launchMainActivity`
+  followed by NO UnsatisfiedLinkError — the factored steps 5–7 drive **ActivityNativeMain**, whose onCreate is
+  the next discovery surface (expect NEW unbound-native trips on the engine surface/View path); (b) splash
+  down-lifecycle driven ONCE (the second `finish()` a guarded no-op), host window staying up; (c) NO
   `main Looper pump failed` pairs; (d) at +5 s NO `hacky_uncaught_exception_handler`/`System.exit(10)` — on the
   merged APK profileinstaller reads the real Stored `baseline.prof` fd, on 2.721 it logs its caught
   FileNotFoundException path; (e) the `process timestamps will be inaccurate` WARN GONE; (f) the engine
@@ -177,7 +227,7 @@ before any history-rewriting/force operation.
   If a CLEAR_TOP relaunch trips nativeResumeActivity's live-instance branch, capture the intent flags before
   deepening its semantics (onNewIntent delivery is NOT evidence-pinned). On ANY new silent SI_KERNEL/addr=0 kill:
   capture the fresh core FIRST. KEEP core 1223806 + `~/.cache/eclipse-forensics/core1223806` + `/tmp/core1223806-*`
-  + `/tmp/t1stack.bin` until this validation passes.)** Unproven/recorded items deliberately NOT coded:
+  + `/tmp/t1stack.bin` until this validation passes.) Unproven/recorded items deliberately NOT coded:
   nativeOpenURI/nativeFileChooser host-action design; the `AssetManager.destroy()` stub → dictionary `readAsset`
   IOException regression vs 06-11; the tzdata/java.time ART env gap; the ~7.4 s `ActivitySplash.onCreate` stall +
   `Resource is not a Drawable` WARNs (profile first); the benign ClientAppSettings.json FileNotFound reads; ART
@@ -1956,6 +2006,73 @@ Process section names `hacky_uncaught_exception_handler` — the SAME handler (v
 `Thread.java:1832–1839`); align the wording on next touch so nobody hunts for two handlers. (i) the netdb live
 fix is necessarily unvalidated until the next owner boot — on any remaining DnsResolve, the `eclipse.netdb`
 trace line (the engine's actual resolver arguments) is the first thing to read.
+
+- **2026-06-13 (View.native_get_window → view-tree path) — 🪟 Bound `android.view.View.native_get_window` (+ the
+  next-on-path `ViewTreeObserver.native_set_have_global_layout_listeners`) and CAPTURED the real Java `Window`
+  object in `window_registry`, closing the last evidence-pinned blocker on `ActivityNativeMain.onCreate`.**
+  *Confirmed root cause (first-party evidence — the owner exit-10 boot stack, `/tmp/eclipse-exit10-validate.log`,
+  EXIT=124 clean):* the EXIT=124 boot was indefinitely stable (splash→ActivityNativeMain transition, real Roblox
+  HTTPS flag-fetch, zero native faults) with ONE remaining gap — `ActivityNativeMain.onCreate` →
+  `com.roblox.client.ActivityNativeMain.d1()` → `android.view.View.getViewTreeObserver()` threw
+  `UnsatisfiedLinkError: No implementation found for android.view.Window android.view.View.native_get_window(long)
+  (tried Java_android_view_View_native_1get_1window and ...__J)`. ATL's `getViewTreeObserver()` calls the instance
+  native `native_get_window(widget)` to obtain the Window that owns the view tree's `ViewTreeObserver`. Two coupled
+  gaps made this fail: (1) the native was undeclared/unbound; (2) Eclipse held NO real Window object to return —
+  `window_registry::WindowState.jobject` was a presence-only `Option<()>` and `Window.set_jobject` only recorded
+  `Some(())` (the documented placeholder slot). *Fix (both root causes, smallest necessary change):*
+  **`src/framework/window_registry.rs`** — `jobject` is now `Option<Global<JObject<'static>>>` (a captured JNI
+  global ref; `Global` is `Send`, lives soundly in the process-global slab, and its `Drop` releases the ref on
+  `free`/replacement — mirrors the proven `view_registry::ViewState.jobject` triple), with `set_jobject(handle,
+  Global)` / `with_jobject(handle, f)` accessors (handle bounds+generation validated, so a stale handle is a typed
+  `Err`, never UB) and a lock-free `ACTIVE_WINDOW: AtomicI64` + `active_window()` (mirrors
+  `view_registry::ACTIVE_ROOT`) published by `allocate()` / cleared by `free()` via `compare_exchange` (only when it
+  still names the freed handle — preserves the one-window-per-launch invariant under a superseding allocate).
+  **`src/framework.rs`** — bound `View.native_get_window` (`(J)Landroid/view/Window;`, instance) in
+  `register_view_natives`: it validates-and-logs the view `widget` handle (a bad handle is non-fatal — the window is
+  the shared one), maps any view to the single live window via `active_window()`, and returns a fresh frame-local
+  `env.new_local_ref` of the captured Window Global via `with_jobject` (NEVER the Global raw — the established
+  in-tree pattern); on no-capture/stale/error it returns JNI null, which is contract-valid (ATL builds a floating
+  observer, `View.java:1252`). Rewrote `Window.set_jobject` (the one place the Window object flows into Eclipse —
+  `Window.java:188`, called from `set_native_window` AFTER `this.native_window` is populated, `Window.java:58-60`)
+  to `env.new_global_ref(&window)` + `window_registry::set_jobject` — so the captured object always has a valid
+  `native_window` field, which `ViewTreeObserver(window)` reads (`ViewTreeObserver.java:305-308`). Also bound the
+  immediate next native on the SAME view-tree path (code-path-proven, not speculative — `getViewTreeObserver` →
+  `addOnGlobalLayoutListener` crosses the listener count 0→1, `ViewTreeObserver.java:344`):
+  `ViewTreeObserver.native_set_have_global_layout_listeners(Z)V`, an instance no-op that records the flag (Eclipse
+  has no host layout signal to gate `onGlobalLayout` — mirrors `nativeSetFullscreen`/`native_setVisibility`), via
+  the new `register_view_tree_observer_natives` wired into `drive_lifecycle` right after `register_view_natives`.
+  *Recorded-only (deliberately NOT bound — per the discovery-signal policy, unbound stays the loud signal):*
+  `View.native_getMatrix` (`View.java:1756`) and `View.native_getGlobalVisibleRect` (`View.java:2066`) — not on the
+  captured `getViewTreeObserver` path; `Window.getInsetsController` is pure Java (`Window.java:180`), needs no
+  native. *Same-pattern audit:* grepped the crate for the presence-only `Option<()>` / `jobject = Some(())` pattern
+  — the only `window_registry::WindowState.jobject` writer was `Window.set_jobject` (fixed); the separate
+  `NativeWindowState` (loader `ndk_registry`/`native_provider`) is the engine `ANativeWindow` registry, unrelated
+  and untouched; the field-type change compiles clean across every `window_registry::` consumer. *Regression
+  guards (tied to the confirmed root cause):* extended the View pin-test with `VIEW_NATIVE_GET_WINDOW_NAME` ==
+  `native_get_window` / `_SIG` == `(J)Landroid/view/Window;` (a transcription drift fails in-harness instead of
+  re-producing the exact runtime `UnsatisfiedLinkError` ART named); a new ViewTreeObserver pin-test for the class +
+  `native_set_have_global_layout_listeners` / `(Z)V`; and three `window_registry` unit tests (no-capture →
+  `Ok(None)` = the null/floating-observer path, stale handle → `Err`, `active_window()` allocate/free tracking, and
+  freeing a superseded window does NOT clear the newer active) — these would have caught the `Option<()>` bug
+  (`set_jobject` silently dropping the ref). Also fixed the now-stale `WindowState` struct-level doc comment that
+  still described the old `()`-typed placeholder (CLAUDE.md "Comments and Documentation"). *Verification (full gate,
+  clean working tree, no machine-specific assumptions):* `cargo fmt --all --check` CLEAN; `cargo build
+  --all-targets` 0; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **548 unit +
+  0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP — APK+display present, exact success markers
+  required, so the binding did NOT regress the engine-milestone paths) + 2 doctests = 554 passed, 0 failed**;
+  `cargo build --release` clean (stripped PIE x86-64, 8868552 bytes). Unit count 544→548 (+3 window_registry, +1
+  ViewTreeObserver pin-test). *Context7:* had no `jni`-rs index (only `napi`-rs, unrelated); the authoritative jni
+  0.21.1 behavior (`new_local_ref(global.as_obj()) -> JObject<'local>`, `with_jobject` borrow) was verified against
+  the in-tree usage being mirrored (`view_registry`, `framework.rs:7457` `nativeResumeActivity`), which
+  compile/test-pass. NOTE: `Cargo.toml` comments say jni 0.22 but `Cargo.lock` pins 0.21.1 (pre-existing, out of
+  scope). *Did NOT live-boot ART (no `cargo run` / `__*` subcommands) and did NOT inspect any third-party binary —
+  first-party only.* **OWNER-RUN DATA NEEDED (dev-host live boot, prohibited here):** (1) confirm the log shows
+  `Window.set_jobject: captured Java Window object` BEFORE the `native_get_window` call in ActivityNativeMain's
+  onCreate (the timing the non-null/non-floating path depends on — inferred sound from `Activity.java:81-82`
+  ordering, but observe it); (2) capture the NEXT native on the view-tree path after this binding (predicted:
+  `ViewTreeObserver.native_set_have_global_layout_listeners`, now bound → should PASS, then the genuine next trip),
+  or the view tree completing and the engine's `AndroidGLView` surface path beginning (the render-integration
+  frontier). *Files:* `src/framework.rs`, `src/framework/window_registry.rs`. *No subagent live boot.*
 
 ---
 
