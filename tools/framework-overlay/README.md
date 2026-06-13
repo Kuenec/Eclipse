@@ -52,10 +52,26 @@ Everything is env-overridable, nothing user-specific is hardcoded:
 | `ATL_SRC` | `<repo>/vendor/atl/src/api-impl` | ATL api-impl Java sources (for `Build.java`) |
 | `ORIG_FW` | `/usr/lib/java/dex/android_translation_layer` | installed stock framework dir |
 | `OUT` | `${XDG_CACHE_HOME:-$HOME/.cache}/eclipse/framework-patched` | output overlay dir |
-| `JAVAC`/`JAR` | repo `vendor/toolchain/jdk-*/bin/*`, else `PATH` | Java compiler / jar tool |
+| `JAVAC`/`JAR`/`JAVA` | repo `vendor/toolchain/jdk-*/bin/*`, else `PATH` | Java compiler / jar / runtime |
 | `DX` | `dx` on `PATH` | dexer (class file ≤ v52, hence `--release 8`) |
+| `BAKSMALI_JAR`/`SMALI_JAR` | `<repo>/vendor/toolchain/smali/{baksmali,smali}-2.5.2.jar` | dex disassembler/assembler for the View patch (2026-06-13) |
 
-Missing tools/dirs fail with an actionable error (no silent fallback).
+Missing tools/dirs fail with an actionable error (no silent fallback). `vendor/` is git-ignored
+(local toolchain, like the JDK): place the smali 2.5.2 jars at `vendor/toolchain/smali/` (upstream
+JesusFreke/google `smali`, or the distro `smali` package — see `vendor/toolchain/smali/SOURCE.txt`),
+or point `BAKSMALI_JAR`/`SMALI_JAR` elsewhere.
+
+## `android.view.View` pointer-capture (2026-06-13)
+
+ATL's installed `View` omits AOSP's pointer-capture API — `View.OnCapturedPointerListener` +
+`View.setOnCapturedPointerListener` — which Roblox calls in `ActivityNativeMain.d1`. Adding a *method*
+needs the whole `View` class, and the repo's vendored `View.java` has **drifted** from the installed jar
+(e.g. `setBackgroundColor(int)` is `native` in vendored but plain-Java installed), so recompiling vendored
+re-breaks it. Instead the script (step 4b) **baksmali-disassembles the authoritative installed `View`**,
+adds only the field + setter + the nested interface (anchored inserts with exact-count guards, like the
+`Build.java` anchor), and reassembles. Output layout becomes 3-dex: `classes.dex` (javac-patched) +
+`classes2.dex` (smali `View` + `View$OnCapturedPointerListener`) + `classes3.dex` (stock), resolved
+first-dex-wins. The nested interface lives at `smali/android/view/View$OnCapturedPointerListener.smali`.
 
 > Durability status (2026-06-11): the overlay output is still a cache artifact and
 > `eclipse run` still needs `ECLIPSE_ANDROID_FRAMEWORK_DIR` pointed at it; auto-provisioning

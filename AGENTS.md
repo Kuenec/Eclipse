@@ -128,6 +128,39 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🖱️ `android.view.View` POINTER-CAPTURE OVERLAY PATCH — OWNER LIVE-VALIDATED (EXIT=124 clean):
+  `setOnCapturedPointerListener` resolves, boot advanced PAST pointer-capture.** Roblox's `ActivityNativeMain.d1`
+  references `android.view.View$OnCapturedPointerListener` and calls `View.setOnCapturedPointerListener(listener)` —
+  AOSP's API-26 pointer-capture API that ATL's INSTALLED `View` omits (without it the boot aborts with
+  `NoClassDefFoundError`/`NoSuchMethodError`). This is a **framework-overlay** patch (NOT Rust — `RegisterNatives`
+  cannot add a Java *method* or a nested *type*). Adding the setter needs the whole `View` class, and the repo's
+  vendored `View.java` has **DRIFTED** from the installed jar (e.g. `setBackgroundColor(int)` is `native` in vendored
+  but plain-Java installed), so recompiling vendored re-breaks it. Fix (`patch-framework.sh` step 4b): **baksmali the
+  AUTHORITATIVE installed `View`**, insert ONLY the backing field (`mCapturedPointerListener`) + the setter
+  (`setOnCapturedPointerListener` — a pure-Java field record, headless: Eclipse's engine owns pointer input) + the
+  nested interface's MemberClasses entry, each behind an exact-count anchor guard (mirrors the `Build.java` anchor
+  guard; field+setter inserts are back-checked by `grep -qF || fail`), then reassemble (smali) ONLY `View` + the
+  committed `View$OnCapturedPointerListener.smali` nested interface. Overlay layout is now **3-dex**: `classes.dex`
+  (javac-patched) + `classes2.dex` (smali `View` + `View$OnCapturedPointerListener`, defines EXACTLY those 2 classes) +
+  `classes3.dex` (stock); first-dex-wins resolves `View` and the nested interface from `classes2.dex`. The smali
+  toolchain (baksmali/smali 2.5.2) is vendored at `vendor/toolchain/smali/` (git-ignored local toolchain, exactly like
+  the JDK; env-overridable `BAKSMALI_JAR`/`SMALI_JAR`). **⇐ START HERE NEXT SESSION (= OWNER live validation on the
+  dev-host MAIN LOOP, already DONE for this patch — `tools/framework-overlay/patch-framework.sh` reproduces the 3-dex
+  overlay (`classes2.dex` defines EXACTLY `View` + `View$OnCapturedPointerListener`) and the live boot is EXIT=124
+  clean: `setOnCapturedPointerListener` resolves, `setBackgroundColor` is intact, and `ActivityNativeMain.onCreate`
+  advanced PAST pointer-capture). NEXT GAP = the NEW frontier the live boot revealed: `View.nativeSetOnTouchListener` —
+  a `View` native sibling of `nativeSetOnClickListener` (which Eclipse already binds in `register_view_natives`); bind
+  the touch sibling there as a quick Rust `RegisterNatives` binding (record-the-listener, like the other listener
+  natives — NOT an overlay change). REMINDER: the overlay is a CACHE artifact — if `~/.cache/eclipse` was wiped and the
+  boot errors `Android framework not found`, rebuild it FIRST with `tools/framework-overlay/patch-framework.sh`
+  (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`), and `vendor/toolchain/smali/` must
+  hold the smali 2.5.2 jars (git-ignored, like the JDK — see `vendor/toolchain/smali/SOURCE.txt`).** This pointer-capture
+  patch is LIVE-PROVEN (boot advanced past pointer-capture to the `nativeSetOnTouchListener` gap). Gate (no Rust changed
+  — Java/smali-overlay + build-script only): overlay build clean (exit 0; `classes.dex` 18656B, `classes2.dex` 42288B,
+  `classes3.dex` 2498192B; `classes2.dex` verified to define EXACTLY `View` + `View$OnCapturedPointerListener`);
+  `cargo fmt --all -- --check`/`build --all-targets`/`clippy -D warnings`/`build --release` (8,907,880-byte artifact)
+  all 0-warning; `cargo test` **555 unit + 0 main-bin + 4 integration (0 SKIP) + 2 doctests = 561 passed, 0 failed**.
+  Detail: §6 (2026-06-13 View pointer-capture overlay entry).
 - **2026-06-13 — 🩹 LayoutInflater `<requestFocus/>` OVERLAY PATCH — LIVE-PROVEN: inflation advanced PAST `<requestFocus/>`.**
   ATL's vendored `LayoutInflater.rInflate` stubbed the standard AOSP `<requestFocus/>` layout tag with `throw new
   Exception("<requestFocus /> not supported atm")`, which aborted `ActivityNativeMain.onCreate`'s content-view inflation.
@@ -147,15 +180,17 @@ before any history-rewriting/force operation.
   classes, 0 stub classes). `patch-framework.sh` wires LayoutInflater into the javac list + staging glob and adds a
   build-time regression guard (lines 63-70) that fails the build if the `<requestFocus/>` fix is ever reverted (mirrors
   the Build.java anchor guard). Overlay build clean (exit 0; `classes.dex` 10508 → **18656** bytes; `classes2.dex`
-  2498192 bytes). **⇐ START HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP, already DONE for this
-  patch — commit `521ba34` tree + this overlay: the live boot no longer throws `<requestFocus /> not supported atm`;
-  `ActivityNativeMain.onCreate` inflation advanced PAST `<requestFocus/>`). NEXT GAP = the NEW frontier the live boot
-  revealed: `NoClassDefFoundError android.view.View$OnCapturedPointerListener` at `ActivityNativeMain.d1` — a newer
-  Android nested interface ATL's vendored `View` lacks. Fix path: add the nested type `View$OnCapturedPointerListener`
-  to the overlay's `classes.dex` WITHOUT shadowing the large `View` class (i.e. ship the nested interface alone, do NOT
-  re-dex a whole patched `View`). REMINDER: the overlay is a CACHE artifact — if `~/.cache/eclipse` was wiped and the
-  boot errors `Android framework not found`, rebuild it with `tools/framework-overlay/patch-framework.sh` FIRST
-  (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`).** This `<requestFocus/>` patch is
+  2498192 bytes). **[START-HERE marker moved 2026-06-13 to the View pointer-capture entry at the TOP of §5 — the owner's
+  live boot validated PAST `<requestFocus/>` to the `NoClassDefFoundError android.view.View$OnCapturedPointerListener`
+  gap, which is now resolved by that entry's overlay patch.]** (this entry's now-superseded NEXT-GAP plan said to "add
+  the nested type `View$OnCapturedPointerListener` to the overlay's `classes.dex` WITHOUT shadowing the large `View`
+  class (ship the nested interface alone, do NOT re-dex a whole patched `View`)" — the shipped fix deliberately did the
+  OPPOSITE and re-dexed a whole baksmali-patched installed `View`, because Roblox ALSO CALLS `setOnCapturedPointerListener`,
+  a *method* the nested interface alone cannot provide; see the §5 top entry + the 2026-06-13 §6 View pointer-capture
+  entry for why the whole-View smali approach was required. REMINDER: the overlay is a CACHE artifact — if
+  `~/.cache/eclipse` was wiped and the boot errors `Android framework not found`, rebuild it with
+  `tools/framework-overlay/patch-framework.sh` FIRST
+  (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`).) This `<requestFocus/>` patch is
   LIVE-PROVEN (inflation advanced past the tag). Gate (no Rust changed — Java-overlay + build-script only): overlay
   build clean; `cargo fmt --all -- --check`/`build --all-targets`/`clippy -D warnings`/`build --release` (8,907,880-byte
   artifact) all 0-warning; `cargo test` **555 unit + 0 main-bin + 4 integration (0 SKIP) + 2 doctests = 561 passed, 0
@@ -2851,6 +2886,28 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 *Verification (overlay build + full cargo gate; no Rust source changed — Java-overlay + build-script only):* `tools/framework-overlay/patch-framework.sh` ran clean (exit 0, prints `OK: patched framework overlay installed`) — `classes.dex` 10508 → **18656** bytes, `classes2.dex` 2498192 bytes (matches the owner's live-validated growth); only the benign javac unchecked-operations NOTE (NetworkRequest generics). Parsed `classes.dex`'s `class_defs` table directly (no `dexdump` available): it DEFINES exactly 17 classes — the 3 LayoutInflater classes plus the pre-existing patched `Build*`/`NetworkRequest*`/`ActivityManager*`/`PowerManager*` — and ZERO stub classes (View/ViewGroup/Context/TypedArray/XmlPullParser/… appear only as referenced type descriptors, never as `class_defs`, so they resolve from `classes2.dex`/real AOSP via first-dex-wins). Cargo gate: `cargo fmt --all -- --check` CLEAN; `cargo build --all-targets` 0 warnings (exit 0); `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings (exit 0); `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 561 passed, 0 failed**; `cargo build --release` clean (artifact `/home/kue/Projects/Eclipse/target/release/eclipse`, 8,907,880 bytes — matches §5). *No live ART boot in this workflow; the dev-host live boot was the OWNER's.*
 
 *OWNER LIVE-VALIDATION (already done — commit `521ba34` tree + this overlay):* the live boot no longer throws `<requestFocus /> not supported atm`; `ActivityNativeMain.onCreate` inflation advanced PAST `<requestFocus/>` to a NEW, DIFFERENT gap — `NoClassDefFoundError android.view.View$OnCapturedPointerListener` at `ActivityNativeMain.d1` (a newer Android nested interface ATL's vendored `View` lacks). That is the NEXT frontier (a separate future item, NOT part of this patch): add the nested type `View$OnCapturedPointerListener` to the overlay's `classes.dex` WITHOUT shadowing the large `View` class (ship the nested interface alone; do not re-dex a whole patched `View`). REMINDER: the overlay is a CACHE artifact under `~/.cache/eclipse` — if it was wiped and the boot errors `Android framework not found`, run `tools/framework-overlay/patch-framework.sh` FIRST. *Files:* `tools/framework-overlay/src/android/view/LayoutInflater.java` (NEW), `tools/framework-overlay/stubs/**` (NEW stub set + extended `Context.java`), `tools/framework-overlay/patch-framework.sh`, `AGENTS.md`.
+
+---
+
+### 2026-06-13 — `android.view.View` pointer-capture overlay patch (baksmali the installed View; 3-dex; headless setter) — OWNER LIVE-VALIDATED (EXIT=124 clean)
+
+*Root cause:* Roblox's `ActivityNativeMain.d1` references the nested interface `android.view.View$OnCapturedPointerListener` and calls `View.setOnCapturedPointerListener(listener)` — AOSP's API-26 pointer-capture API. ATL's INSTALLED `View` omits both, so the boot aborts with `NoClassDefFoundError`/`NoSuchMethodError` (the NEXT-frontier gap the 2026-06-13 LayoutInflater entry's live boot revealed). `RegisterNatives` cannot add a Java *method* or a nested *type*, so this is a framework-overlay patch.
+
+*Why NOT recompile the vendored View:* adding the *method* needs the whole `View` class. The repo's vendored `View.java` has DRIFTED from the installed jar — e.g. `setBackgroundColor(int)` is `native` in vendored but plain-Java installed — so recompiling vendored re-introduces a wrong `View` (the same drift that the 16db9eb regression already proved breaks `register_view_natives`). This SUPERSEDES the LayoutInflater entry's planned "ship the nested interface alone, do NOT re-dex a whole patched View" fix path: the nested interface alone resolves the `NoClassDefFoundError` but NOT the `setOnCapturedPointerListener(listener)` *method* call, so the whole-`View` approach is required — but it must be the AUTHORITATIVE installed `View`, not the drifted vendored one.
+
+*Fix (`patch-framework.sh` step 4b):* baksmali-disassemble the INSTALLED framework's `View`, then insert exactly three things behind exact-count anchor guards (mirroring the `Build.java` anchor: anchor count != 1 fails loud — installed-View drift never silently guessed): (i) backing field `mCapturedPointerListener:Landroid/view/View$OnCapturedPointerListener;` after the `on_touch_listener` field; (ii) the setter `setOnCapturedPointerListener(...)V` after `setOnClickListener`'s `.end method` — a pure-Java field record (`iput-object`, `return-void`): HEADLESS, because Eclipse's engine owns pointer input, so recording the listener is the complete correct behavior; (iii) the nested class's MemberClasses annotation entry (reflection completeness). Inserts (i) and (ii) are back-checked by `grep -qF … || fail`. Then reassemble (smali) ONLY the patched `View` + the committed nested interface `smali/android/view/View$OnCapturedPointerListener.smali` (modeled byte-for-byte on the installed `View$OnClickListener`: `public static interface abstract`, `accessFlags 0x609`, EnclosingClass/InnerClass annotations, one abstract `onCapturedPointer(View, MotionEvent)Z`) into `classes2.dex`.
+
+*3-dex overlay layout (first-dex-wins):* `classes.dex` (javac-patched Build*/NetworkRequest*/ActivityManager*/PowerManager*/LayoutInflater*) + `classes2.dex` (smali `View` + `View$OnCapturedPointerListener`, defining EXACTLY those 2 classes) + `classes3.dex` (stock whole api-impl). ART's `DexPathList` resolves `View` and the nested interface from `classes2.dex` ahead of `classes3.dex`'s stock `View` (which still lacks the nested interface), and everything else from `classes3.dex`.
+
+*Vendored smali toolchain:* baksmali/smali 2.5.2 run via the vendored JDK's `java`, vendored at `vendor/toolchain/smali/{baksmali,smali}-2.5.2.jar` (+ `SOURCE.txt`). `vendor/` is git-ignored (local toolchain, exactly like the vendored JDK) — confirmed via `git check-ignore`; the jars are NOT committed. Env-overridable `BAKSMALI_JAR`/`SMALI_JAR`/`JAVA`; missing tools fail with an actionable error (no silent fallback), satisfying CLAUDE.md "Build and Environment Portability" (the generator survives a cache wipe; the overlay output stays a cache artifact under `~/.cache/eclipse`).
+
+*Same-pattern audit:* the `setOnCapturedPointerListener` setter is the only pointer-capture method Roblox's `d1` needs; the nested `OnCapturedPointerListener` is the only nested type required for it. The anchor-guard + back-check discipline matches the existing `Build.java` anchor and the new step-4b guards; the headless record-the-listener semantics match the existing `EditText`/`View` listener-record precedents (the engine owns input). The `setBackgroundColor` drift this patch sidesteps is the same drift class the 16db9eb §6 entry root-caused for `register_view_natives` — here it is avoided structurally by patching the installed (not vendored) `View`, and the live boot confirms `setBackgroundColor` stays intact.
+
+*Regression protection:* the build-time anchor guards in `patch-framework.sh` step 4b are the regression guard tied to the confirmed root cause — if a future ATL build drifts the `on_touch_listener`/`setOnClickListener`/`DeclaredOnClickListener` anchors so an insert no longer applies, the field/setter back-checks (`grep -qF … || fail`) fail the build loudly (consistent with the `Build.java` and LayoutInflater guards). *Known low-impact asymmetry (reviewer note, NOT blocking):* the (iii) MemberClasses insert has no post-insert back-check — it is reflection-completeness only (non-load-bearing: ART resolves the type from its own `class_def` and the committed nested interface carries its own EnclosingClass/InnerClass annotations; the setter does not depend on it), so a future-drift silent no-op would not break the validated boot. Optional symmetric hardening (a `grep -qF … View$OnCapturedPointerListener … || fail` after the (iii) substitution) is recorded as a future cleanup, not done here to keep the change surgical and because the entry is non-load-bearing.
+
+*Verification (overlay build; no Rust source changed — smali/Java-overlay + build-script only):* `tools/framework-overlay/patch-framework.sh` reproduced clean (exit 0, `OK: patched framework overlay installed`) — `classes.dex` **18656** B, `classes2.dex` **42288** B, `classes3.dex` **2498192** B; only the benign pre-existing LayoutInflater javac unchecked-operations NOTE. The overlay gate confirmed `classes2.dex` defines EXACTLY `View` + `View$OnCapturedPointerListener` (custom DEX `class_defs` reader), `classes.dex` 17 defs (no `View`, no stub classes), `classes3.dex` stock 1548 defs (defines `View` but NOT the nested interface, so first-dex-wins resolves both from `classes2.dex`), and a re-baksmali of the assembled `classes2.dex` confirmed all three inserts landed (field, `iput-object` setter, MemberClasses registration). Cargo gate (re-run on this tree by the gate agent; no Rust changed): `cargo fmt --all -- --check` CLEAN; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 561 passed, 0 failed**; `cargo build --release` clean (artifact 8,907,880 bytes). *No live ART boot in this workflow; the dev-host live boot was the OWNER's.*
+
+*OWNER LIVE-VALIDATION (already done, current tree):* `patch-framework.sh` reproduces the 3-dex overlay; the live boot is EXIT=124 clean (no crash) — `setOnCapturedPointerListener` resolves, `setBackgroundColor` is intact, and `ActivityNativeMain.onCreate` advanced PAST pointer-capture to a NEW gap: `View.nativeSetOnTouchListener` (a `View` native sibling of `nativeSetOnClickListener`, which Eclipse already binds in `register_view_natives`). That is the NEXT frontier — a quick Rust `RegisterNatives` binding in `register_view_natives` (record-the-listener), NOT an overlay change, and NOT part of this patch. *Files:* `tools/framework-overlay/patch-framework.sh`, `tools/framework-overlay/smali/android/view/View$OnCapturedPointerListener.smali` (NEW), `tools/framework-overlay/README.md`, `AGENTS.md`; vendored (git-ignored, NOT committed): `vendor/toolchain/smali/{baksmali,smali}-2.5.2.jar` + `SOURCE.txt`.
 
 ---
 
