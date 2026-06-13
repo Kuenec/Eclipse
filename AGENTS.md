@@ -128,9 +128,64 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 🖼️ RENDER PHASE 2.1 SHIPPED: DROP-BEFORE-DISPATCH handoff ordering fix. ⇐ START HERE NEXT SESSION (=
+  OWNER live validation on the dev-host MAIN LOOP).** Phase 2 (commit `ae20ef5`) dispatched `surfaceCreated` FIRST and
+  dropped Eclipse's `VulkanRenderer` only on the NEXT `about_to_wait` tick (gated on `engine_claimed_surface`, set inside
+  `fromSurface`). The owner live boot (EXIT=124 clean) proved the dispatch + handoff fire end-to-end and the engine
+  subscribes (engine `surfaceCreated` ran — `MainScreenController`/`AppShellFragment` `surfaceCreated`, "Start the lua
+  app"), BUT the engine's EGL surface then FAILED: `[FLog::SurfaceController] Mode 4 failed: Error creating context:
+  eglCreateWindowSurface 3003` (`EGL_BAD_ALLOC`) at t=.908349, and ONLY AFTER that did Eclipse log its renderer release at
+  t=.927677 — ~19 ms too late. ROOT CAUSE: the engine ran `eglCreateWindowSurface` over its `wl_egl_window` on the same
+  `wl_surface` while Eclipse's `VkSurfaceKHR`/`VkSwapchainKHR` STILL owned it → two owners of one `wl_surface` →
+  `EGL_BAD_ALLOC`. FIX (minimal surgical REORDER, not a redesign): drop the renderer STRICTLY BEFORE dispatching
+  `surfaceCreated`, gated on a readiness probe. What changed: **(A)** `framework::engine_surface_callback_ready(vm) ->
+  Result<bool>` — factored out of the dispatch self-gate; locates the `RBXSurfaceView` peer via
+  `find_by_class(com.roblox.client.RBXSurfaceView)` and returns `Ok(true)` iff the peer exists AND its `SurfaceView`
+  `mCallbacks` `ArrayList` is non-empty (engine's `AndroidGLView` `SurfaceHolder.Callback` registered); it dispatches
+  NOTHING. The load-bearing `mCallbacks` read (`get_field` `Ljava/util/ArrayList;` → `size()I`) now lives in ONE shared
+  inner helper `surface_callbacks_size`, consumed by BOTH the probe and `surface_lifecycle`'s self-gate (one source of
+  truth). Same JNI discipline (null-guarded `JavaVM::from_raw` / `attach_current_thread` / `catch_unwind` / `checked`).
+  **(B)** `graphics::about_to_wait`: replaced the dispatch-then-(next-tick)-drop logic with a single `handed_off` gate —
+  `if !handed_off && engine_window.is_some()`, evaluate `engine_surface_callback_ready(vm)`; on `Ok(true)`: FIRST
+  `self.renderer = None` (its `Drop` runs `device_wait_idle` → `destroy_swapchain` → `destroy_surface`, RELEASING the
+  `wl_surface`), THEN `dispatch_surface_lifecycle(vm, w, h)` (`(w,h)` from `engine_window_geometry().unwrap_or((1,1))`)
+  so the engine creates its EGL surface on the now-FREE `wl_surface`, THEN `handed_off = true` + `ControlFlow::Poll` + one
+  drop-before-dispatch handoff info log. `Ok(false)` retries next tick (never blanked early); `Err` warns + retries.
+  **(C)** removed the `surface_dispatched` field and folded the old `engine_claimed_surface()`-gated separate drop block
+  into the single `handed_off` gate. KEPT `set_engine_claimed_surface`/`engine_claimed_surface` and its set inside
+  `eclipse_anativewindow_fromsurface` — now a confirmation-only one-shot log (`else if handed_off && engine_claimed_surface()`),
+  NOT the drop trigger. **OWNER LIVE-VALIDATION — START HERE NEXT SESSION (dev-host MAIN LOOP, EXIT=124 clean):** if
+  `~/.cache/eclipse` was wiped or the overlay touched, rebuild the overlay FIRST with `tools/framework-overlay/patch-framework.sh`
+  (`export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`; `vendor/toolchain/smali/` must hold the
+  smali 2.5.2 jars), then `cargo run -- run <APK>` on the process MAIN thread (NOT `cargo test` — ART aborts off-main-thread).
+  Look for, in order: (1) the SINGLE handoff log `Eclipse released its Vulkan renderer then dispatched the SurfaceView
+  lifecycle (surfaceCreated + surfaceChanged); present-loop handoff (drop-before-dispatch)` — it MUST appear BEFORE the
+  engine's `eglCreateWindowSurface`, not ~19 ms after; (2) the engine's `eglCreateWindowSurface` SUCCEEDING — the
+  `[FLog::SurfaceController] Mode 4 failed: ... eglCreateWindowSurface 3003` (`EGL_BAD_ALLOC`) from `ae20ef5` must be GONE
+  (the `wl_surface` is now free before the engine takes it); (3) THE FIRST ENGINE FRAME visible in the window (engine
+  content, NOT Eclipse's clear-and-present); (4) a separate one-shot confirmation log `engine claimed the surface
+  (ANativeWindow_fromSurface returned Eclipse's WSI window)` — correlation-only, fires at most once. If
+  `eglCreateWindowSurface` STILL errors (3003 or other) or the window stays blank, capture the exact SurfaceController/EGL
+  log lines and the timing for the next iteration (runtime-only, log-observation, do NOT RE the APK/libroblox). If
+  `engine_surface_callback_ready` never returns true (no handoff log), the `RBXSurfaceView` `mCallbacks` list never became
+  non-empty — confirm the engine's `AndroidGLView` `getHolder().addCallback` ran via the `View.native_constructor` debug
+  log for `com.roblox.client.RBXSurfaceView`. RUNTIME CORRECTNESS (does the engine render) is confirmed ONLY by this live
+  boot. Gate (only the 3 work files changed — `src/framework.rs`, `src/graphics.rs`, `src/loader/ndk_registry.rs`):
+  `cargo fmt --all -- --check` clean, `cargo build --all-targets` 0 warn, `cargo clippy --all-targets --all-features -- -D
+  warnings` 0 warn (forced recheck via `touch` of the 3 files), `cargo test` **565 passed, 0 failed (559 unit + 0 main + 4
+  integration, 0 SKIP + 2 doctests)** — same count as Phase 2 (a field was removed, no test was), `cargo build --release`
+  clean (artifact 8,937,896 bytes, grew from Phase 2's 8,926,184 by the extracted fn + reorder + confirmation log).
+  Regression guards: the `view_native_names_sigs_and_class_match_view_java` pin (`ARRAY_LIST_SIG`/`RBX_SURFACE_VIEW_CLASS`/
+  `WINDOW_FORMAT_RGBA_8888`) now covers BOTH the probe and the dispatch (both go through `surface_callbacks_size`); the
+  Phase 2 `find_by_class` + `engine_claimed_surface` pins stay green; `engine_surface_callback_ready` has no JVM-free seam
+  (JNI field read) so its runtime behavior is owner-live-boot-validated. Detail: §6 (2026-06-13 render Phase 2.1 entry).
 - **2026-06-13 — 🖼️ RENDER PHASE 2 SHIPPED: self-gated `surfaceCreated`/`surfaceChanged` dispatch to the engine's
-  `RBXSurfaceView` + renderer-DROP present-loop handoff triggered when the engine pulls the surface. ⇐ START HERE NEXT
-  SESSION (= OWNER live validation on the dev-host MAIN LOOP).** Phase 1 published Eclipse's real WSI window as the engine
+  `RBXSurfaceView` + renderer-DROP present-loop handoff triggered when the engine pulls the surface. [Superseded by the
+  RENDER PHASE 2.1 entry above — the dispatch + handoff this entry SHIPPED proved correct end-to-end in the owner live boot
+  (engine subscribed + `surfaceCreated` ran), but revealed a handoff ORDERING bug (renderer dropped ~19 ms too late →
+  `EGL_BAD_ALLOC` 3003); Phase 2.1 reorders the drop strictly before the dispatch. The Phase 2 4-step mechanism below still
+  describes the dispatch/probe/flag plumbing, but the `surface_dispatched` field and the `engine_claimed_surface`-gated
+  drop it describes are replaced by Phase 2.1's single `handed_off` gate.]** Phase 1 published Eclipse's real WSI window as the engine
   `ANativeWindow*`, but the engine does NOT call `fromSurface`/`surfaceCreated` on its own (Phase 1 live-confirmed ZERO
   such log lines). Phase 2 drives the engine to pull that surface and renders into it, and corrects the prior attempt's
   abort (going merely QUIESCENT left TWO owners of one `wl_surface`) by RELEASING the renderer instead. What it does, in 4
@@ -3343,6 +3398,30 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
   *Context7:* not used — the `jni` crate here is 0.22.4 with a project-specific `Env`/`Global` API (NOT upstream `JNIEnv`/`GlobalRef`); the authoritative source is the project's own code (the `dispatch_touch_to_view` model, the `get_field` + `FieldSignature::from_raw_parts(_, JavaType::Object)` precedent at `framework.rs`, `checked`'s exception discipline, `with_jobject`'s `Result<Option<R>>` contract) plus the vendored `SurfaceView.java`. `winit` 0.30's `ActiveEventLoop::set_control_flow(ControlFlow::Poll)` and the `jni`-0.22.4 `JValueOwned` accessors (`.l()`/`.i()`/`.v()`) were confirmed by reading the vendored crate sources, not from memory.
 
   *Files:* `src/framework/view_registry.rs` (`find_by_class` + its test), `src/loader/ndk_registry.rs` (`ENGINE_CLAIMED_SURFACE` + set/get + test), `src/loader/native_provider.rs` (set the flag in the real-WSI branch of `fromSurface`), `src/framework.rs` (`dispatch_surface_lifecycle`/`surface_lifecycle` + the `ARRAY_LIST_SIG`/`RBX_SURFACE_VIEW_CLASS`/`WINDOW_FORMAT_RGBA_8888` consts + the extended name/sig pin), `src/graphics.rs` (the `surface_dispatched`/`handed_off` fields + the `about_to_wait` dispatch + renderer-drop handoff), `AGENTS.md`.
+
+---
+
+### 2026-06-13 — 🖼️ Render Phase 2.1: DROP-BEFORE-DISPATCH — release the `wl_surface` (drop `VulkanRenderer`) STRICTLY BEFORE dispatching `surfaceCreated`, fixing the `EGL_BAD_ALLOC` (3003) the owner Phase 2 live boot revealed
+
+  *Evidence (owner live boot, commit `ae20ef5`, EXIT=124 clean — the success marker):* the Phase 2 dispatch + handoff fired end to end and the engine subscribed — the log shows the engine `surfaceCreated` callback ran (`MainScreenController`/`AppShellFragment` `surfaceCreated`, "Start the lua app"), then the engine attempted its EGL surface and FAILED: `[FLog::SurfaceController] Mode 4 failed: Error creating context: eglCreateWindowSurface 3003` (`EGL_BAD_ALLOC`) at t=.908349, and ONLY AFTER that did Eclipse log `engine claimed the surface; Eclipse released its Vulkan renderer (present-loop handoff)` at t=.927677 — ~19 ms too late.
+
+  *Confirmed root cause (timing + ownership, from the live boot above — first-party log observation, NOT RE):* Phase 2 dispatched `surfaceCreated` FIRST; the engine then created its EGL window surface (`eglCreateWindowSurface` over its `wl_egl_window` on the SAME `wl_surface`) while Eclipse's `VkSurfaceKHR`/`VkSwapchainKHR` STILL owned that `wl_surface` — two owners of one `wl_surface` → `EGL_BAD_ALLOC`. Eclipse dropped its renderer only on the NEXT `about_to_wait` tick (gated on `engine_claimed_surface`, which `eclipse_anativewindow_fromsurface` sets), i.e. AFTER the engine had already tried. The surface must be FREE before the engine creates its EGL surface, i.e. BEFORE Eclipse dispatches `surfaceCreated`.
+
+  *The fix (minimal surgical REORDER — not a redesign; root-cause, not a workaround):* drop the renderer STRICTLY BEFORE dispatching `surfaceCreated`. **(A)** Factored the load-bearing `mCallbacks` read into ONE shared inner helper `surface_callbacks_size(env, surface_view) -> Result<jint>` (the `FieldSignature::from_raw_parts(ARRAY_LIST_SIG, JavaType::Object)` `get_field` then `size()I`, with the existing SAFETY comment + `checked` exception discipline) so there is a single source of truth for the field read; `surface_lifecycle`'s self-gate now calls it (`if surface_callbacks_size(env, sv)? <= 0 { return Ok(false) }`). Added `pub fn engine_surface_callback_ready(vm) -> Result<bool>` (null-guarded `JavaVM::from_raw` + `attach_current_thread` + `catch_unwind`, same discipline as `dispatch_surface_lifecycle`) delegating to a private `surface_callback_ready(env)` that does `find_by_class(RBX_SURFACE_VIEW_CLASS)` → `with_jobject` → `surface_callbacks_size > 0`; it dispatches NOTHING. `Ok(false)` when no peer / empty list / no recorded jobject; `Err` on VM/JNI error. **(B)** Reordered `graphics::about_to_wait` to a single `handed_off` gate: `if !handed_off && engine_window.is_some()`, evaluate `engine_surface_callback_ready(vm)`; on `Ok(true)`: (1) `self.renderer = None` — `VulkanRenderer::Drop` runs `device_wait_idle` → `destroy_swapchain` → `destroy_surface`, RELEASING the `wl_surface`/`VkSurfaceKHR`; (2) `dispatch_surface_lifecycle(vm, w, h)` (`(w,h)` from `engine_window_geometry().unwrap_or((1,1))`) so the engine creates its EGL window surface over the now-FREE `wl_surface`; (3) `handed_off = true` + `set_control_flow(ControlFlow::Poll)` + one drop-before-dispatch handoff info log. `Ok(false)` retries next tick (never blanked early); `Err` warns + retries. The main `Looper` keeps pumping. **(C)** Removed the now-redundant `surface_dispatched` field (the single `handed_off` gate covers both the dispatch and the drop). KEPT `set_engine_claimed_surface`/`engine_claimed_surface` and its set inside `eclipse_anativewindow_fromsurface` (the real-WSI branch) — repurposed to a one-shot confirmation log (`else if handed_off && engine_claimed_surface()`), NOT the drop trigger.
+
+  *Why this is the correct order (not the inverse):* the engine renders into the SAME `wl_surface` once it claims Eclipse's published `ANativeWindow`. Two producers must never share one `wl_surface`. `engine_surface_callback_ready` (non-empty `mCallbacks`) confirms the engine has subscribed its `SurfaceHolder.Callback`, i.e. it is ABOUT to be told `surfaceCreated` and WILL `eglCreateWindowSurface`. Releasing Eclipse's renderer in the same tick, before the dispatch, guarantees the engine's EGL surface is the sole owner of the `wl_surface` when it is created. `ControlFlow::Poll` is set in the same tick as the drop, so there is no gap where the renderer is gone but the loop waits without a pending redraw.
+
+  *Same-pattern audit:* after the edit, `surface_dispatched` has ZERO references across `src/`, `tests/`, `docs/` (the field, initializer, and its comments were the only users — removed cleanly). The `mCallbacks` ArrayList field read now exists in exactly ONE place (`surface_callbacks_size`), consumed by both `surface_lifecycle` and `surface_callback_ready` (verified: `get_field(.., "mCallbacks", ..)` / `FieldSignature::from_raw_parts(ARRAY_LIST_SIG, ..)` appears only inside that helper). `self.renderer = None` appears once (the handoff arm) — no other renderer-drop, no quiescent early-return that keeps the renderer alive (the prior abort's two-owners bug AND the Phase 2 dispatch-then-late-drop bug are both gone). `dispatch_surface_lifecycle` is called from exactly one production site (the reordered handoff arm). `set_engine_claimed_surface(true)` remains in exactly one production place (the real-WSI branch of `fromSurface`), now a correlation signal only. The handoff is still gated on `engine_window.is_some()` so the no-WSI / geometry-only fallback never blanks the window.
+
+  *Regression protection (tied to the root, no new script):* `engine_surface_callback_ready` and `surface_callbacks_size` are entirely JNI/JVM-bound (`find_by_class` + `attach_current_thread` + a live JNI field/method read) with NO JVM-free seam to unit-test under `cargo` (ART aborts off the main thread), so their runtime behavior is OWNER-live-boot-validated — exactly as `dispatch_surface_lifecycle` is. Their non-JNI inputs (the const strings/values) are pinned by the existing `framework::tests::view_native_names_sigs_and_class_match_view_java` (`ARRAY_LIST_SIG == "Ljava/util/ArrayList;"`, `RBX_SURFACE_VIEW_CLASS == "com.roblox.client.RBXSurfaceView"`, `WINDOW_FORMAT_RGBA_8888 == 1`), which now covers BOTH the probe and the dispatch self-gate because both route through `surface_callbacks_size` — a transcription drift in the field descriptor / peer class / format fails CI instead of silently no-op-ing the live boot. The Phase 2 pins `view_registry::tests::find_by_class_locates_the_right_handle_and_is_none_for_absent_class` and `ndk_registry::tests::engine_claimed_surface_round_trips_set_and_get` stay green (both helpers are still used). No test was added (no new JVM-free seam) and none was removed.
+
+  *Verification (this tree; the 3 work files — `src/framework.rs`, `src/graphics.rs`, `src/loader/ndk_registry.rs`):* `cargo fmt --all -- --check` clean; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings (forced recheck via `touch` of the 3 files); `cargo test` **565 passed, 0 failed (559 unit + 0 main + 4 integration `tests/engine_milestones.rs` 0 SKIP + 2 doctests)** — same count as Phase 2; `cargo build --release` clean (artifact 8,937,896 bytes, grew from Phase 2's 8,926,184 by the extracted fn + reorder + confirmation log). *No live ART boot in this workflow (off-main-thread + cyber-safeguard preclude it); RUNTIME CORRECTNESS — the engine's `eglCreateWindowSurface` SUCCEEDING (no more 3003) and THE FIRST ENGINE FRAME — is confirmed ONLY by the OWNER's dev-host MAIN-LOOP boot (§5 START-HERE). If `eglCreateWindowSurface` still errors or the window stays blank, capture the exact SurfaceController/EGL log lines + timing (log-observation only; do NOT RE the APK/libroblox).*
+
+  *Comment hygiene:* `ndk_registry.rs`'s `ENGINE_CLAIMED_SURFACE` / `engine_claimed_surface()` doc comments (which described it as the renderer-drop trigger) were updated to the Phase 2.1 confirmation-only role per the comment-dating + stale-comment policy (dated 2026-06-13).
+
+  *Context7:* not used — this change touches no external API surface or version-sensitive behavior; it reorders two existing internal calls and extracts one function. The `winit` `ApplicationHandler`/`ControlFlow::Poll` usage and the `jni`-0.22.4 `FieldSignature::from_raw_parts`/`call_method`/`get_field` patterns are unchanged from the already-green Phase 2 code (the project's own source is the authority for the project-specific `Env`/`Global` API).
+
+  *Files:* `src/framework.rs` (`surface_callbacks_size` shared helper + `engine_surface_callback_ready`/`surface_callback_ready` + rewired `surface_lifecycle` self-gate), `src/graphics.rs` (removed `surface_dispatched`; single `handed_off` drop-before-dispatch gate + confirmation-only `engine_claimed_surface` log), `src/loader/ndk_registry.rs` (Phase 2.1 doc-comment hygiene on the claim signal), `AGENTS.md`.
 
 ---
 

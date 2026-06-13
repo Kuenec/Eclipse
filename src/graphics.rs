@@ -113,16 +113,14 @@ struct GameWindow<'vm> {
     /// only fallback), and its `Drop` unregisters. `None` if the display server is unsupported (the
     /// window still opens; the geometry-only ANativeWindow fallback stands), or before `resumed`.
     engine_window: Option<crate::egl_engine::EngineNativeWindow>,
-    /// 2026-06-13 — render Phase 2: `true` once the engine's `SurfaceView` surface lifecycle
-    /// (`surfaceCreated`/`surfaceChanged`) has been JNI-dispatched. Until then, `about_to_wait`
-    /// retries the (self-gated) dispatch each tick — it only fires once the engine has subscribed its
-    /// `SurfaceHolder.Callback`, so the window is never blanked prematurely. Starts `false`.
-    surface_dispatched: bool,
-    /// 2026-06-13 — render Phase 2 present-loop handoff: `true` once Eclipse has DROPPED its
-    /// [`VulkanRenderer`] because the engine claimed the surface (`ndk_registry::engine_claimed_surface()`).
-    /// Dropping the renderer runs its `Drop` (`device_wait_idle` → `destroy_swapchain` →
-    /// `destroy_surface`), truly RELEASING the `wl_surface`/`VkSurfaceKHR` so the engine's own EGL
-    /// window surface owns it alone (two producers must not share one surface). Done exactly once.
+    /// 2026-06-13 — render Phase 2.1 present-loop handoff: `true` once Eclipse has, in one tick, DROPPED
+    /// its [`VulkanRenderer`] (releasing the `wl_surface`) and THEN dispatched the engine's `SurfaceView`
+    /// surface lifecycle (`surfaceCreated`/`surfaceChanged`). The drop runs the renderer's `Drop`
+    /// (`device_wait_idle` → `destroy_swapchain` → `destroy_surface`), truly RELEASING the
+    /// `wl_surface`/`VkSurfaceKHR` BEFORE the engine creates its own EGL window surface over that same
+    /// `wl_surface` — two owners of one `wl_surface` made `eglCreateWindowSurface` fail `EGL_BAD_ALLOC`
+    /// (3003). Gated on [`crate::framework::engine_surface_callback_ready`] (engine subscribed its
+    /// `SurfaceHolder.Callback`), so the window is never blanked prematurely. Done exactly once.
     handed_off: bool,
 }
 
@@ -291,46 +289,58 @@ impl ApplicationHandler for GameWindow<'_> {
             tracing::error!(error = %e, "main Looper pump failed");
         }
 
-        // 2026-06-13 — render Phase 2 surface-lifecycle dispatch: once Eclipse's REAL WSI window is
-        // published (`engine_window` Some), drive the engine's `SurfaceView` SurfaceHolder lifecycle
-        // (`surfaceCreated`/`surfaceChanged`) so its `AndroidGLView` pulls Eclipse's `ANativeWindow`
-        // and renders into it. SELF-GATED inside `dispatch_surface_lifecycle` (only fires once the
-        // engine subscribed its callback), so it is safe to retry every tick: `Ok(false)` = retry.
-        if !self.surface_dispatched && self.engine_window.is_some() {
-            let (w, h) = crate::loader::ndk_registry::engine_window_geometry().unwrap_or((1, 1));
-            match crate::framework::dispatch_surface_lifecycle(vm, w, h) {
+        // 2026-06-13 — render Phase 2.1 present-loop handoff (DROP-BEFORE-DISPATCH). Once Eclipse's
+        // REAL WSI window is published (`engine_window` Some) AND the engine has subscribed its
+        // `SurfaceView` `SurfaceHolder.Callback` (`engine_surface_callback_ready` — non-empty
+        // `mCallbacks`), do the handoff atomically in ORDER:
+        //   1. DROP the VulkanRenderer FIRST — its `Drop` runs `device_wait_idle` → `destroy_swapchain`
+        //      → `destroy_surface`, RELEASING the `wl_surface`/`VkSurfaceKHR` so it is free.
+        //   2. THEN dispatch `surfaceCreated()`/`surfaceChanged(III)` so the engine's `AndroidGLView`
+        //      creates its EGL window surface over the now-FREE `wl_surface`.
+        // Phase 2 dispatched FIRST and dropped the renderer only on the NEXT tick (gated on
+        // `engine_claimed_surface`, set inside `fromSurface`) — ~19 ms too late: the engine's
+        // `eglCreateWindowSurface` ran while Eclipse's `VkSurfaceKHR`/`VkSwapchainKHR` still owned the
+        // `wl_surface`, so two owners of one `wl_surface` → `EGL_BAD_ALLOC` (3003). Dropping BEFORE
+        // dispatch makes the surface free before the engine takes it. The dispatch is itself self-gated
+        // (no-op into an empty callback list), so this is safe to retry: `Ok(false)`/`Err` = retry.
+        // RedrawRequested's `Some(renderer)` guard means Eclipse stops drawing once the renderer is
+        // gone; we keep pumping the main Looper above and switch to Poll so the loop keeps ticking.
+        if !self.handed_off && self.engine_window.is_some() {
+            match crate::framework::engine_surface_callback_ready(vm) {
                 Ok(true) => {
-                    self.surface_dispatched = true;
+                    let (w, h) =
+                        crate::loader::ndk_registry::engine_window_geometry().unwrap_or((1, 1));
+                    // (1) Release the surface BEFORE the engine creates its EGL window surface on it.
+                    self.renderer = None;
+                    // (2) Hand the (now-free) surface to the engine.
+                    if let Err(e) = crate::framework::dispatch_surface_lifecycle(vm, w, h) {
+                        tracing::warn!(error = %e, "engine SurfaceView lifecycle dispatch failed after renderer release");
+                    }
+                    self.handed_off = true;
+                    event_loop.set_control_flow(ControlFlow::Poll);
                     tracing::info!(
                         width = w,
                         height = h,
-                        "engine SurfaceView lifecycle dispatched (surfaceCreated + surfaceChanged); \
-                         engine should now pull Eclipse's ANativeWindow"
+                        "Eclipse released its Vulkan renderer then dispatched the SurfaceView lifecycle \
+                         (surfaceCreated + surfaceChanged); present-loop handoff (drop-before-dispatch)"
                     );
                 }
                 Ok(false) => {} // engine has not subscribed its SurfaceHolder.Callback yet — retry.
                 Err(e) => {
-                    tracing::warn!(error = %e, "engine SurfaceView lifecycle dispatch failed (retry)");
+                    tracing::warn!(error = %e, "engine surface-callback readiness probe failed (retry)");
                 }
             }
-        }
-
-        // 2026-06-13 — render Phase 2 present-loop handoff (the CORRECTED design: RELEASE, do not
-        // quiesce): once the engine has CLAIMED the surface (it called `ANativeWindow_fromSurface`
-        // and got the real WSI pointer — `native_provider` sets this flag), DROP Eclipse's
-        // VulkanRenderer so its `Drop` releases the `wl_surface`/`VkSurfaceKHR`. The engine's own EGL
-        // window surface then owns the surface alone (two producers must not share one wl_surface).
-        // RedrawRequested's `Some(renderer)` guard means Eclipse then stops drawing and stops
-        // re-arming `request_redraw` naturally; we keep pumping the main Looper above so the engine
-        // keeps running, and switch to Poll so the loop keeps ticking (and pumping) without
-        // Eclipse's redraw cadence driving it.
-        if !self.handed_off && crate::loader::ndk_registry::engine_claimed_surface() {
-            self.renderer = None;
-            self.handed_off = true;
-            event_loop.set_control_flow(ControlFlow::Poll);
-            tracing::info!(
-                "engine claimed the surface; Eclipse released its Vulkan renderer (present-loop handoff)"
-            );
+        } else if self.handed_off && crate::loader::ndk_registry::engine_claimed_surface() {
+            // 2026-06-13 — confirmation only (no longer the drop trigger): the engine genuinely pulled
+            // the surface via `ANativeWindow_fromSurface` (the real-WSI branch sets this flag). Log it
+            // once so the handoff can be correlated with the engine actually claiming the surface.
+            static CLAIM_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !CLAIM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "engine claimed the surface (ANativeWindow_fromSurface returned Eclipse's WSI window)"
+                );
+            }
         }
     }
 }
@@ -559,7 +569,6 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         primary_press: None,
         synthetic_tap_done: false,
         engine_window: None,
-        surface_dispatched: false,
         handed_off: false,
     };
     event_loop

@@ -395,14 +395,17 @@ pub fn current_wsi_window() -> Option<usize> {
         .and_then(|v| v.last().map(|(p, _)| *p))
 }
 
-/// 2026-06-13 — render Phase 2 present-loop handoff signal: set `true` the first time the engine
-/// actually PULLS the real WSI surface, i.e. `ANativeWindow_fromSurface`
+/// 2026-06-13 — render Phase 2.1 present-loop handoff CONFIRMATION signal: set `true` the first time the
+/// engine actually PULLS the real WSI surface, i.e. `ANativeWindow_fromSurface`
 /// ([`super::native_provider::eclipse_anativewindow_fromsurface`]) returns the real WSI pointer (its
-/// `current_wsi_window().is_some()` branch — NOT the geometry-only fallback). The winit loop reads
-/// [`engine_claimed_surface`] each tick: once `true`, Eclipse DROPS its `VulkanRenderer` (whose `Drop`
-/// releases the `wl_surface`/`VkSurfaceKHR`) so the engine's own EGL window surface owns the surface
-/// alone — two producers must never share one `wl_surface`. Lock-free (a single atomic), so the render
-/// native and the winit loop never contend a mutex on this hot signal.
+/// `current_wsi_window().is_some()` branch — NOT the geometry-only fallback). This is NO LONGER the
+/// renderer-drop trigger (Phase 2 used it as one and released the `wl_surface` ~19 ms too late — after
+/// the engine's `eglCreateWindowSurface`, causing two owners of one `wl_surface` → `EGL_BAD_ALLOC`
+/// 3003). The drop now happens in `graphics::about_to_wait` gated on
+/// [`crate::framework::engine_surface_callback_ready`] (non-empty `mCallbacks`), STRICTLY BEFORE
+/// `dispatch_surface_lifecycle`. The winit loop reads [`engine_claimed_surface`] only for a one-shot
+/// confirmation log correlating the handoff with the engine genuinely claiming the surface. Lock-free
+/// (a single atomic), so the render native and the winit loop never contend a mutex on this hot signal.
 static ENGINE_CLAIMED_SURFACE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -412,8 +415,10 @@ pub fn set_engine_claimed_surface(claimed: bool) {
     ENGINE_CLAIMED_SURFACE.store(claimed, std::sync::atomic::Ordering::Release);
 }
 
-/// Whether the engine has pulled the real WSI surface yet (see [`ENGINE_CLAIMED_SURFACE`]). The winit
-/// loop reads this to trigger the present-loop handoff (drop Eclipse's renderer) exactly once.
+/// Whether the engine has pulled the real WSI surface yet (see [`ENGINE_CLAIMED_SURFACE`]). 2026-06-13
+/// — confirmation signal only: the winit loop reads this AFTER the handoff to log, once, that the engine
+/// genuinely claimed the surface. It is NOT the renderer-drop trigger (that is
+/// [`crate::framework::engine_surface_callback_ready`], evaluated before `dispatch_surface_lifecycle`).
 pub fn engine_claimed_surface() -> bool {
     ENGINE_CLAIMED_SURFACE.load(std::sync::atomic::Ordering::Acquire)
 }

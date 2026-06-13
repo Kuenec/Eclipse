@@ -9609,6 +9609,88 @@ const RBX_SURFACE_VIEW_CLASS: &str = "com.roblox.client.RBXSurfaceView";
 /// `native_provider::eclipse_anativewindow_getformat` reports for the real WSI window).
 const WINDOW_FORMAT_RGBA_8888: jint = 1;
 
+/// 2026-06-13: the single source of truth for reading `SurfaceView.mCallbacks.size()` — shared by the
+/// dispatch self-gate ([`surface_lifecycle`]) and the readiness probe ([`engine_surface_callback_ready`])
+/// so the load-bearing field read lives in one place. `surface_view` is the `RBXSurfaceView` peer
+/// (runtime supertype `android.view.SurfaceView`). Returns the current callback count; a thrown Java
+/// exception is described + cleared into a typed [`FrameworkError::Jni`] by [`checked`], never left
+/// pending.
+fn surface_callbacks_size(env: &mut Env, surface_view: &JObject) -> Result<jint, FrameworkError> {
+    // SAFETY: "Ljava/util/ArrayList;" paired with JavaType::Object is consistent
+    // (FieldSignature::from_raw_parts' invariant); `mCallbacks` is a `final ArrayList` field of
+    // android.view.SurfaceView (SurfaceView.java:13), the receiver's runtime supertype, so the
+    // read is type-correct. JNI reads private/package fields (no Java access check).
+    let callbacks_sig = unsafe { FieldSignature::from_raw_parts(ARRAY_LIST_SIG, JavaType::Object) };
+    let callbacks = checked(env, "SurfaceView.mCallbacks get_field", |env| {
+        env.get_field(surface_view, jni_str!("mCallbacks"), &callbacks_sig)?
+            .l()
+    })?;
+    checked(env, "SurfaceView.mCallbacks.size", |env| {
+        env.call_method(&callbacks, jni_str!("size"), jni_sig!("()I"), &[])?
+            .i()
+    })
+}
+
+/// Render Phase 2.1 — readiness probe: has the engine's `AndroidGLView` registered its
+/// `SurfaceHolder.Callback` on the `RBXSurfaceView` (its `mCallbacks` list non-empty)? Returns
+/// `Ok(true)` iff the peer exists AND `mCallbacks` is non-empty — i.e. dispatching `surfaceCreated`
+/// now would actually reach the engine. It dispatches NOTHING; it shares the exact `mCallbacks` read
+/// ([`surface_callbacks_size`]) with [`surface_lifecycle`].
+///
+/// 2026-06-13: factored out of the dispatch self-gate so `graphics.rs` can DROP its `VulkanRenderer`
+/// (releasing the `wl_surface`) STRICTLY BEFORE dispatching `surfaceCreated` — otherwise two owners
+/// hold one `wl_surface` and the engine's `eglCreateWindowSurface` fails with `EGL_BAD_ALLOC` (3003).
+///
+/// Mirrors [`dispatch_surface_lifecycle`]'s soundness: null-guarded [`JavaVM::from_raw`], attaches the
+/// held VM's main thread, `catch_unwind`-guards the JNI work, and routes every JNI call through
+/// [`checked`].
+///
+/// Returns `Ok(false)` if no `RBXSurfaceView` peer is recorded yet OR its callback list is still empty
+/// (retry next tick); a typed `Err` on a VM/JNI/Java error.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
+/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn engine_surface_callback_ready(vm: &Vm) -> Result<bool, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
+    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
+    // process VM singleton (idempotent across calls), same as `dispatch_surface_lifecycle`.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| surface_callback_ready(env))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Locate the `RBXSurfaceView` peer and report whether its `mCallbacks` list is non-empty. See
+/// [`engine_surface_callback_ready`] for the contract. Dispatches nothing.
+fn surface_callback_ready(env: &mut Env) -> Result<bool, FrameworkError> {
+    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+        return Ok(false);
+    };
+    // Hold the registry lock only across the JNI read on the recorded global ref (the closure makes
+    // JNI calls but never re-enters the registry), honoring `with_jobject`'s contract.
+    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
+        Ok(surface_callbacks_size(env, global.as_obj())? > 0)
+    });
+    match result {
+        Ok(Some(inner)) => inner,
+        // Valid handle but no recorded jobject yet — not ready, retry (transient at worst).
+        Ok(None) => Ok(false),
+        // Stale/fabricated handle or poisoned lock: not ready this tick (logged, not fatal).
+        Err(e) => {
+            tracing::debug!(handle, error = %e, "engine_surface_callback_ready: peer not readable (retry)");
+            Ok(false)
+        }
+    }
+}
+
 /// Render Phase 2 — JNI-dispatch the `SurfaceView` surface lifecycle to the engine's
 /// `SurfaceHolder.Callback`s: `surfaceCreated()` then `surfaceChanged(format, width, height)`, so the
 /// engine's `AndroidGLView` pulls Eclipse's published `ANativeWindow` and begins rendering into it.
@@ -9676,21 +9758,7 @@ fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, Fra
         // (b) SELF-GATE: read the SurfaceView `mCallbacks` ArrayList and check it is non-empty. The
         // engine registers its AndroidGLView SurfaceHolder.Callback via getHolder().addCallback(...);
         // until then the list is empty and dispatching would fan out to nobody — retry next tick.
-        // SAFETY: "Ljava/util/ArrayList;" paired with JavaType::Object is consistent
-        // (FieldSignature::from_raw_parts' invariant); `mCallbacks` is a `final ArrayList` field of
-        // android.view.SurfaceView (SurfaceView.java:13), the receiver's runtime supertype, so the
-        // read is type-correct. JNI reads private/package fields (no Java access check).
-        let callbacks_sig =
-            unsafe { FieldSignature::from_raw_parts(ARRAY_LIST_SIG, JavaType::Object) };
-        let callbacks = checked(env, "SurfaceView.mCallbacks get_field", |env| {
-            env.get_field(surface_view, jni_str!("mCallbacks"), &callbacks_sig)?
-                .l()
-        })?;
-        let size = checked(env, "SurfaceView.mCallbacks.size", |env| {
-            env.call_method(&callbacks, jni_str!("size"), jni_sig!("()I"), &[])?
-                .i()
-        })?;
-        if size <= 0 {
+        if surface_callbacks_size(env, surface_view)? <= 0 {
             // Engine has not subscribed its SurfaceHolder.Callback yet — do NOT dispatch into an
             // empty callback list; retry next tick.
             return Ok(false);
