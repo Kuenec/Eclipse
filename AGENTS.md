@@ -128,6 +128,34 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-13 — 👆 `android.view.View` TOUCH/LONG-CLICK LISTENER NATIVES BOUND (record-the-listener, non-GTK).**
+  Owner's live boot of the pointer-capture overlay (commit `8cf570c`, EXIT=124 clean) advanced
+  `ActivityNativeMain.onCreate` → `d1` PAST pointer-capture into d1's input setup and hit
+  `No implementation found for void android.view.View.nativeSetOnTouchListener(long)` (at `ActivityNativeMain.d1`,
+  `View.setOnTouchListener`). `register_view_natives` bound `nativeSetOnClickListener` but not its touch sibling.
+  `View.java` confirms `setOnTouchListener` (line 1151) and `setOnLongClickListener` (line 1444) each call a
+  `(long widget)` native (`nativeSetOnTouchListener` line 1155 / `nativeSetOnLongClickListener` line 1448, both
+  `protected native void` → `(J)V`) then store the listener in a View Java field (`on_touch_listener` 1153 /
+  `on_long_click_listener` 1446) — the EXACT `nativeSetOnClickListener` shape. Fix (pure-Rust `RegisterNatives`,
+  NOT an overlay change): bound BOTH on `android/view/View` via the existing per-method best-effort registrar,
+  both pointing at one shared headless handler `view_set_input_listener` (validates the `view_registry` handle via
+  `with_view(widget, |_| ())`, then no-ops — listener lives Java-side, the engine/input path dispatches). It
+  deliberately does NOT flip the `clickable` flag (that gates only the click hit-test; touch/long-click are
+  distinct and engine-dispatched). Both natives are `void`, so nothing branches on a return — the validated no-op
+  is honest. `nativeRequestFocus` left unbound per the owner-validated `<requestFocus/>` headless-consume decision.
+  Regression pin: the existing `view_native_names_sigs_and_class_match_view_java` extended with name+`(J)V`
+  descriptor asserts for both new natives (tied to View.java 1155/1448 + the live UnsatisfiedLinkError). **⇐ START
+  HERE NEXT SESSION (= OWNER live validation on the dev-host MAIN LOOP): rebuild the overlay FIRST with
+  `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped (boot errors `Android framework not
+  found`; `export ECLIPSE_ANDROID_FRAMEWORK_DIR=$HOME/.cache/eclipse/framework-patched`, `vendor/toolchain/smali/`
+  must hold the smali 2.5.2 jars), then `cargo run -- run <APK>` on the process main thread — EXPECT d1's input
+  setup to get PAST `View.nativeSetOnTouchListener` (no per-method WARN for the two new natives unless the shipped
+  dex disagrees on the sig), CAPTURE the next unbound native/gap one at a time (pure log observation, no binary
+  inspection). The standing next FRONTIER remains the SCOPED surface-to-engine render wiring (2194f02 §6 plan)
+  once `onCreate` reaches RESUMED.** Gate (only `src/framework.rs` changed, +87/-2): `cargo fmt --all -- --check`
+  / `build --all-targets` (0 warn) / `clippy --all-targets --all-features -D warnings` (0 warn) / `build --release`
+  (8,910,152-byte artifact) all clean; `cargo test` **555 unit + 0 main-bin + 4 integration (0 SKIP) + 2 doctests
+  = 561 passed, 0 failed**. Detail: §6 (2026-06-13 View touch/long-click listener natives entry).
 - **2026-06-13 — 🖱️ `android.view.View` POINTER-CAPTURE OVERLAY PATCH — OWNER LIVE-VALIDATED (EXIT=124 clean):
   `setOnCapturedPointerListener` resolves, boot advanced PAST pointer-capture.** Roblox's `ActivityNativeMain.d1`
   references `android.view.View$OnCapturedPointerListener` and calls `View.setOnCapturedPointerListener(listener)` —
@@ -144,8 +172,10 @@ before any history-rewriting/force operation.
   (javac-patched) + `classes2.dex` (smali `View` + `View$OnCapturedPointerListener`, defines EXACTLY those 2 classes) +
   `classes3.dex` (stock); first-dex-wins resolves `View` and the nested interface from `classes2.dex`. The smali
   toolchain (baksmali/smali 2.5.2) is vendored at `vendor/toolchain/smali/` (git-ignored local toolchain, exactly like
-  the JDK; env-overridable `BAKSMALI_JAR`/`SMALI_JAR`). **⇐ START HERE NEXT SESSION (= OWNER live validation on the
-  dev-host MAIN LOOP, already DONE for this patch — `tools/framework-overlay/patch-framework.sh` reproduces the 3-dex
+  the JDK; env-overridable `BAKSMALI_JAR`/`SMALI_JAR`). **[START-HERE marker moved 2026-06-13 to the View touch/long-click
+  listener entry at the TOP of §5 — the owner's live boot validated PAST pointer-capture to the
+  `View.nativeSetOnTouchListener` gap, which is now closed by that entry's `RegisterNatives` binding.]** (OWNER live
+  validation on the dev-host MAIN LOOP, DONE for this patch — `tools/framework-overlay/patch-framework.sh` reproduces the 3-dex
   overlay (`classes2.dex` defines EXACTLY `View` + `View$OnCapturedPointerListener`) and the live boot is EXIT=124
   clean: `setOnCapturedPointerListener` resolves, `setBackgroundColor` is intact, and `ActivityNativeMain.onCreate`
   advanced PAST pointer-capture). NEXT GAP = the NEW frontier the live boot revealed: `View.nativeSetOnTouchListener` —
@@ -2908,6 +2938,24 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 *Verification (overlay build; no Rust source changed — smali/Java-overlay + build-script only):* `tools/framework-overlay/patch-framework.sh` reproduced clean (exit 0, `OK: patched framework overlay installed`) — `classes.dex` **18656** B, `classes2.dex` **42288** B, `classes3.dex` **2498192** B; only the benign pre-existing LayoutInflater javac unchecked-operations NOTE. The overlay gate confirmed `classes2.dex` defines EXACTLY `View` + `View$OnCapturedPointerListener` (custom DEX `class_defs` reader), `classes.dex` 17 defs (no `View`, no stub classes), `classes3.dex` stock 1548 defs (defines `View` but NOT the nested interface, so first-dex-wins resolves both from `classes2.dex`), and a re-baksmali of the assembled `classes2.dex` confirmed all three inserts landed (field, `iput-object` setter, MemberClasses registration). Cargo gate (re-run on this tree by the gate agent; no Rust changed): `cargo fmt --all -- --check` CLEAN; `cargo build --all-targets` 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 561 passed, 0 failed**; `cargo build --release` clean (artifact 8,907,880 bytes). *No live ART boot in this workflow; the dev-host live boot was the OWNER's.*
 
 *OWNER LIVE-VALIDATION (already done, current tree):* `patch-framework.sh` reproduces the 3-dex overlay; the live boot is EXIT=124 clean (no crash) — `setOnCapturedPointerListener` resolves, `setBackgroundColor` is intact, and `ActivityNativeMain.onCreate` advanced PAST pointer-capture to a NEW gap: `View.nativeSetOnTouchListener` (a `View` native sibling of `nativeSetOnClickListener`, which Eclipse already binds in `register_view_natives`). That is the NEXT frontier — a quick Rust `RegisterNatives` binding in `register_view_natives` (record-the-listener), NOT an overlay change, and NOT part of this patch. *Files:* `tools/framework-overlay/patch-framework.sh`, `tools/framework-overlay/smali/android/view/View$OnCapturedPointerListener.smali` (NEW), `tools/framework-overlay/README.md`, `AGENTS.md`; vendored (git-ignored, NOT committed): `vendor/toolchain/smali/{baksmali,smali}-2.5.2.jar` + `SOURCE.txt`.
+
+---
+
+### 2026-06-13 — `android.view.View` touch/long-click listener natives bound (record-the-listener, headless) — closes the `nativeSetOnTouchListener` gap the pointer-capture live boot revealed
+
+*Root cause (evidence):* the owner's dev-host live boot of the pointer-capture overlay (commit `8cf570c`, EXIT=124 clean — see the entry above) advanced `ActivityNativeMain.onCreate` → `d1` PAST pointer-capture into d1's input setup, where it hit `No implementation found for void android.view.View.nativeSetOnTouchListener(long)` (`at android.view.View.nativeSetOnTouchListener(Native Method) … at android.view.View.setOnTouchListener(…) … at com.roblox.client.ActivityNativeMain.d1`). `register_view_natives` bound `nativeSetOnClickListener` but NOT its `nativeSetOnTouchListener` sibling (confirmed in the boot log's registration line — no touch sibling).
+
+*Source-of-truth check:* `vendor/atl/src/api-impl/android/view/View.java` — `setOnTouchListener` (line 1151) calls `nativeSetOnTouchListener(widget)` then stores `on_touch_listener` (1153); `setOnLongClickListener` (1444) calls `nativeSetOnLongClickListener(widget)` then stores `on_long_click_listener` (1446). Both natives are `protected native void …(long widget)` → instance descriptor `(J)V` (lines 1155/1448) — the EXACT `setOnClickListener`/`nativeSetOnClickListener` shape (line 1158/1161). Both return `void`, so nothing branches on a return value. Same-pattern audit of all 11 `setOn*Listener` methods in `View.java`: only THREE call a native (`click` already bound, `touch` + `long-click` now bound); the other 8 (`Key`/`Hover`/`FocusChange`/`GenericMotion`/`CreateContextMenu`/`ApplyWindowInsets`/`Drag`/`SystemUiVisibilityChange`) have empty `{}` Java bodies that call no native, so they cannot trip `UnsatisfiedLinkError`. Neither native is re-declared on any other ATL Java class (grep confirms only `View.java`), so the single `View` registration is full coverage.
+
+*Fix (pure-Rust `RegisterNatives`, NOT an overlay change):* bound both `nativeSetOnTouchListener` and `nativeSetOnLongClickListener` on `android/view/View`, both pointing at one shared headless handler `view_set_input_listener(EnvUnowned, JObject, jlong)`. It validates the `view_registry` handle via `view_registry::with_view(widget, |_| ())` (bounds+generation-checked; stale/fabricated handle → typed `Err`, logged + ignored, never UB) and headless no-ops — the listener object lives Java-side and the engine/input path dispatches to it (Eclipse is headless; no GTK signal wiring). Mirrors the existing `image_button_set_on_click_listener` exception discipline exactly (`EnvUnowned::with_env` + `resolve::<LogErrorAndDefault>`). It DELIBERATELY does NOT flip `view_registry`'s `clickable` flag — that flag gates only the click hit-test; touch/long-click are distinct in Android and dispatched by the engine input path, the documented follow-up. One shared handler since neither native carries the listener object in its signature (only the handle), so their backing is identical. Bound through the existing per-method best-effort registrar (`register_class_natives_best_effort`), so a shipped-dex sig drift degrades to a deferred per-method `UnsatisfiedLinkError` (loud discovery), never the 58a50f6 atomic whole-class abort. `nativeSetOnLongClickListener` is INFERRED (the live boot surfaced only `nativeSetOnTouchListener`), bound proactively as the same-pattern sibling reached on the same view-setup path — low-risk because the best-effort registrar skips+WARNs if the shipped class disagrees.
+
+*Left unbound (deliberate):* `nativeRequestFocus(long,int)` (`View.java:1212`, `(JI)V`) — the 2026-06-13 LayoutInflater `<requestFocus/>` overlay entry documents the owner-validated decision to consume `<requestFocus/>` headlessly and NOT bind `nativeRequestFocus` (the engine owns input focus headlessly; `requestFocus()` is skipped, so the native is not reached). Binding it would contradict that established decision. Return-driving `View` getters (`isFocused`/`getWidth`/`getMatrix`/…) remain unbound as discovery signals per the standing policy — out of scope for a listener-setter no-op.
+
+*Regression protection:* extended the existing pin test `framework::tests::view_native_names_sigs_and_class_match_view_java` with name + `(J)V` descriptor assertions for both new natives (`nativeSetOnTouchListener`, `nativeSetOnLongClickListener`), tied to `View.java` lines 1155/1448 and the live-boot `UnsatisfiedLinkError`. This is the deterministic regression pin (JVM-free — ART cannot run under `cargo test`): a transcription drift in either const re-produces the exact boot-time `UnsatisfiedLinkError` instead, but the pin fails it in-harness first. Fits the project's existing framework pin-test style; no new script.
+
+*Verification (only `src/framework.rs` changed, +87/-2):* `cargo fmt --all -- --check` CLEAN; `cargo build --all-targets` (forced rebuild of the changed crate) 0 warnings; `cargo clippy --all-targets --all-features -- -D warnings` 0 warnings; `cargo test` **555 unit + 0 (main) + 4 integration (`tests/engine_milestones.rs`, 0 SKIP) + 2 doctests = 561 passed, 0 failed** (includes the extended pin test); `cargo build --release` clean (artifact 8,910,152 bytes). No live ART boot in this workflow (off-main-thread + cyber-safeguard); the dev-host live boot is the OWNER's next step.
+
+*Context7:* not used — no external library/API surface changed; this is internal JNI `RegisterNatives` against vendored `View.java` and the project's own `jni`-crate usage already established by the adjacent `nativeSetOnClickListener` binding. *Gate (owner next step):* rebuild the overlay with `tools/framework-overlay/patch-framework.sh` if `~/.cache/eclipse` was wiped, then `cargo run -- run <APK>` on the process main thread — expect d1's input setup to get PAST `View.nativeSetOnTouchListener`; capture the next gap one at a time (pure log observation). Standing next frontier: the scoped surface-to-engine render wiring (2194f02 §6 plan) once `onCreate` reaches RESUMED.
 
 ---
 

@@ -4378,6 +4378,23 @@ const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIF)V");
 const VIEW_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
 const VIEW_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 
+// 2026-06-13: `View.setOnTouchListener`/`setOnLongClickListener` each call a `(long widget)` native
+// then store the listener in a View Java field (`on_touch_listener`/`on_long_click_listener`,
+// View.java lines 1153/1446) — the SAME shape as `setOnClickListener`/`nativeSetOnClickListener`. The
+// owner's live boot of the pointer-capture overlay (EXIT=124 clean) advanced `ActivityNativeMain.d1`
+// to `No implementation found for void android.view.View.nativeSetOnTouchListener(long)`; the
+// `nativeSetOnLongClickListener` sibling is the same record-the-listener pattern reached on the same
+// view-setup path. Both are `protected native void …(long)` → instance descriptor `(J)V` (View.java
+// lines 1155/1448). Eclipse is headless (no GTK signal wiring): the listener object lives Java-side
+// and the engine/input path dispatches, so the native only has to exist, validate the handle, and not
+// throw — UNLIKE `nativeSetOnClickListener`, these do NOT flip `view_registry`'s `clickable` flag
+// (that flag gates only the click hit-test; touch/long-click are distinct in Android and dispatched
+// by the engine input path, not the click hit-test). See [`view_set_input_listener`].
+const VIEW_SET_ON_TOUCH_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnTouchListener");
+const VIEW_SET_ON_TOUCH_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
+const VIEW_SET_ON_LONG_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnLongClickListener");
+const VIEW_SET_ON_LONG_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
+
 // 2026-06-05: `View.setBackgroundColor` calls `native_setBackgroundColor(long widget, int color)` to
 // set a solid background fill on the native peer; surfaced by multitouch.test (run log `No
 // implementation found for void android.view.View.native_setBackgroundColor(long, int)`). `color` is
@@ -5030,7 +5047,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // framework's `setBackgroundColor(int)` is plain Java, not native (see the consts comment near
     // `VIEW_SET_ON_CLICK_LISTENER_NAME` for the 58a50f6 live-log evidence); the best-effort registrar
     // additionally makes any future such drift non-fatal (deferred per-method UnsatisfiedLinkError).
-    let bindings: [NativeBinding; 11] = [
+    let bindings: [NativeBinding; 13] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -5068,6 +5085,19 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_SET_ON_CLICK_LISTENER_SIG,
             image_button_set_on_click_listener as *mut c_void,
         ),
+        // 2026-06-13: `nativeSetOnTouchListener`/`nativeSetOnLongClickListener` are the record-the-
+        // listener siblings of `nativeSetOnClickListener` (View.java lines 1155/1448, both `(J)V`). The
+        // listener object is stored Java-side; `view_set_input_listener` validates the handle + no-ops.
+        (
+            VIEW_SET_ON_TOUCH_LISTENER_NAME,
+            VIEW_SET_ON_TOUCH_LISTENER_SIG,
+            view_set_input_listener as *mut c_void,
+        ),
+        (
+            VIEW_SET_ON_LONG_CLICK_LISTENER_NAME,
+            VIEW_SET_ON_LONG_CLICK_LISTENER_SIG,
+            view_set_input_listener as *mut c_void,
+        ),
         (
             VIEW_SET_BACKGROUND_COLOR_NAME,
             VIEW_SET_BACKGROUND_COLOR_SIG,
@@ -5095,7 +5125,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/view/View",
         bound,
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor (per-method best-effort)"
     );
     Ok(())
 }
@@ -6953,6 +6983,45 @@ extern "system" fn image_button_set_on_click_listener<'local>(
                 widget,
                 error = %e,
                 "ImageButton.nativeSetOnClickListener: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.nativeSetOnTouchListener(long)` / `View.nativeSetOnLongClickListener(long)` → validate the
+/// [`view_registry`] handle + headless no-op (2026-06-13).
+///
+/// JNI ABI: an INSTANCE native returning void; `widget` is the view's [`view_registry`] handle.
+/// `View.setOnTouchListener`/`setOnLongClickListener` (View.java lines 1151/1444) call this then store
+/// the listener object in a View Java field — Eclipse is headless (no GTK signal wiring), so the
+/// listener lives Java-side and the engine/input path dispatches to it; the native only has to exist,
+/// confirm the peer handle is live, and not throw. It deliberately does NOT mark the peer `clickable`
+/// (that flag gates only the click hit-test; touch/long-click dispatch is owned by the engine input
+/// path, the documented follow-up). A stale/fabricated handle is logged + ignored, never UB, via the
+/// bounds+generation-checked [`view_registry::with_view`]. Shared by both natives since neither carries
+/// the listener object in its signature (only the handle), so their backing is identical.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic.
+extern "system" fn view_set_input_listener<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                "View.nativeSetOnTouch/LongClickListener: listener kept Java-side (engine input path dispatches)"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.nativeSetOnTouch/LongClickListener: invalid view handle (ignored)"
             ),
         }
         Ok(())
@@ -11290,6 +11359,22 @@ mod tests {
             "nativeSetOnClickListener"
         );
         assert_eq!(VIEW_SET_ON_CLICK_LISTENER_SIG.to_str(), "(J)V");
+        // nativeSetOnTouchListener(long) → `(J)V`, View.java line 1155; surfaced 2026-06-13 by the
+        // owner's pointer-capture-overlay live boot (`No implementation found for void
+        // android.view.View.nativeSetOnTouchListener(long)` at ActivityNativeMain.d1). A drift here
+        // would re-produce that exact runtime UnsatisfiedLinkError instead of failing in the harness.
+        assert_eq!(
+            VIEW_SET_ON_TOUCH_LISTENER_NAME.to_str(),
+            "nativeSetOnTouchListener"
+        );
+        assert_eq!(VIEW_SET_ON_TOUCH_LISTENER_SIG.to_str(), "(J)V");
+        // nativeSetOnLongClickListener(long) → `(J)V`, View.java line 1448; the record-the-listener
+        // sibling reached on the same view-setup path. Pin name+descriptor to View.java.
+        assert_eq!(
+            VIEW_SET_ON_LONG_CLICK_LISTENER_NAME.to_str(),
+            "nativeSetOnLongClickListener"
+        );
+        assert_eq!(VIEW_SET_ON_LONG_CLICK_LISTENER_SIG.to_str(), "(J)V");
         // native_setBackgroundColor(long, int) → `(JI)V`, surfaced 2026-06-05 by multitouch.test
         // (records the ARGB background on the view_registry peer). Pinned to the ART-reported sig.
         assert_eq!(
