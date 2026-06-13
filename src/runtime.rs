@@ -217,12 +217,27 @@ impl BootPlan {
     /// the two destinations would feed dex2oat flags to the VM.
     #[must_use]
     pub fn vm_options(&self) -> Vec<String> {
-        let mut opts = Vec::with_capacity(3);
+        let mut opts = Vec::with_capacity(4);
         opts.push(format!("-Xmx{}m", self.heap_mib));
         opts.push(format!("-XX:HeapGrowthLimit={}m", self.heap_mib));
         if self.disable_hspace_compact {
             opts.push("-XX:DisableHSpaceCompactForOOM".to_owned());
         }
+        // 2026-06-13: propagate the resolved API level to the VM so ATL's
+        // `android.os.Build$VERSION` static initializer reads a non-null `Build.VERSION.SDK_INT`
+        // property instead of falling back to its hardcoded 23 (Android 6.0). The guest engine
+        // reads `Build.VERSION.SDK_INT` over JNI as its device API level; at 23 it rejects Vulkan
+        // ("Android version is too old to activate Vulkan" — Vulkan is API 24+) and drops onto the
+        // GLES3 render path that then fails to come up. Clamp to 28: ATL's
+        // `Activity.registerActivityLifecycleCallbacks` is an empty no-op, so at SDK_INT >= 29
+        // androidx `ReportFragment` switches to the `registerActivityLifecycleCallbacks` /
+        // `onActivityPostCreated` path and the create-phase `ON_CREATE` dispatch (the
+        // `onPostCreate` -> `Fragment.onActivityCreated` overlay path) is silently dropped,
+        // reintroducing the `IllegalStateException` boot blocker (see AGENTS.md §6, 2026-06-13).
+        // 28 (Android 9) clears the Vulkan gate and stays below the androidx API-29 switch.
+        // `RESOURCES_SDK_INT` auto-follows `SDK_INT` in ATL when its own property is unset, so this
+        // single option keeps them matched (a SDK_INT/RESOURCES_SDK_INT mismatch can crash).
+        opts.push(format!("-DBuild.VERSION.SDK_INT={}", self.sdk_int.min(28)));
         opts
     }
 
@@ -1132,6 +1147,32 @@ mod tests {
         assert!(
             !vm.iter().any(|o| o.contains("instruction-set-features")),
             "VM options must not contain the dex2oat ISA flag: {vm:?}"
+        );
+    }
+
+    #[test]
+    fn vm_options_propagate_clamped_sdk_int() {
+        // 2026-06-13 regression guard: the VM must receive `-DBuild.VERSION.SDK_INT` so ATL's
+        // `Build$VERSION` does not fall back to 23 (which makes the engine report "Android API 23"
+        // and reject Vulkan). The value is clamped to 28 — at >= 29 androidx takes ATL's no-op
+        // `registerActivityLifecycleCallbacks` path and the `ON_CREATE` dispatch boot fix breaks.
+        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let vm = plan.vm_options();
+        assert!(
+            vm.contains(&"-DBuild.VERSION.SDK_INT=28".to_owned()),
+            "manifest targetSdk=35 must be clamped to 28: {vm:?}"
+        );
+        assert!(
+            !vm.iter()
+                .any(|o| o.contains("SDK_INT=23") || o.contains("SDK_INT=35")),
+            "must neither fall back to 23 nor exceed the androidx API-29 switch: {vm:?}"
+        );
+        // A genuinely low target is reported as-is (no floor forced — Vulkan stays off if < 24).
+        let low = BootPlan::new(&manifest_with(Some(21)), &Config::default());
+        assert!(
+            low.vm_options()
+                .contains(&"-DBuild.VERSION.SDK_INT=21".to_owned()),
+            "a sub-28 target is propagated verbatim"
         );
     }
 
