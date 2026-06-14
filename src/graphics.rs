@@ -131,8 +131,10 @@ struct GameWindow<'vm> {
     /// env-gated synthetic engine tap (`ECLIPSE_SYNTHETIC_ENGINE_TAP="x,y"`) can fire a few seconds
     /// later, once the engine's Lua UI is interactive. `None` until handoff; never set in normal use.
     handoff_at: Option<std::time::Instant>,
-    /// 2026-06-14 — set once the env-gated synthetic engine tap has fired, so it fires at most once.
+    /// 2026-06-14 — set once the env-gated synthetic engine tap (stage 0) has fired, so it fires once.
     engine_synthetic_tap_done: bool,
+    /// 2026-06-14 — set once the env-gated synthetic type-test (stage 1) has fired, so it fires once.
+    engine_synthetic_type_done: bool,
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
     /// keys are pressed/released, and passed as the `metaState` of each engine `KeyEvent`.
     key_meta_state: i32,
@@ -771,70 +773,75 @@ impl GameWindow<'_> {
         self.dispatch_touch(handle, crate::framework::MotionAction::Up, cx, cy);
     }
 
-    /// 2026-06-14 — dev-host diagnostic (env `ECLIPSE_SYNTHETIC_ENGINE_TAP="x,y"`): fire ONE real
-    /// DOWN+UP through the engine pointer path at window pixel `(x, y)` ~6 s after the handoff (so the
-    /// engine's Lua UI is interactive), proving the host → `RBXSurfaceView.onTouchEvent` wiring on a
-    /// real run without a physical click. Defaults to the window center if `x,y` does not parse. Never
-    /// fires in normal operation (the env var is unset). Mirrors [`Self::maybe_synthetic_tap`].
+    /// 2026-06-14 — dev-host diagnostic, env-gated, two staged actions after the handoff (off in normal
+    /// runs). Stage 0 (~6 s, `ECLIPSE_SYNTHETIC_ENGINE_TAP="x,y"`): one DOWN+UP at `(x,y)` through the
+    /// engine pointer path (e.g. tap the Sign In button → navigate to the login screen). Stage 1 (~12 s,
+    /// `ECLIPSE_SYNTHETIC_TYPE="x,y:text"`): tap `(x,y)` to focus a field, then type `text` through the
+    /// engine key path — a self-contained end-to-end proof of focus→type without a physical keyboard.
+    /// All via JNI, so it bypasses any compositor/ydotool focus quirk. Mirrors [`Self::maybe_synthetic_tap`].
     fn maybe_synthetic_engine_tap(&mut self) {
-        if self.engine_synthetic_tap_done || !self.handed_off {
+        if !self.handed_off {
             return;
         }
-        let Some(spec) = std::env::var_os("ECLIPSE_SYNTHETIC_ENGINE_TAP") else {
-            return;
-        };
-        // Wait until the engine UI has had time to become interactive after the handoff.
-        match self.handoff_at {
-            Some(at) if at.elapsed() >= std::time::Duration::from_secs(6) => {}
-            _ => return,
-        }
-        self.engine_synthetic_tap_done = true;
-        let (x, y) = spec
-            .to_str()
-            .and_then(|s| {
-                let (xs, ys) = s.split_once(',')?;
-                Some((
-                    xs.trim().parse::<f32>().ok()?,
-                    ys.trim().parse::<f32>().ok()?,
-                ))
-            })
-            .unwrap_or_else(|| {
-                let (w, h) =
-                    crate::loader::ndk_registry::engine_window_geometry().unwrap_or((800, 600));
-                (w as f32 / 2.0, h as f32 / 2.0)
-            });
-        tracing::info!(
-            x,
-            y,
-            "synthetic ENGINE tap: driving DOWN+UP to RBXSurfaceView.onTouchEvent"
-        );
-        self.cursor = Some((x, y));
-        self.engine_primary_press();
-        self.engine_primary_release();
+        let Some(at) = self.handoff_at else { return };
+        let elapsed = at.elapsed();
 
-        // Optional synthetic KEY (env `ECLIPSE_SYNTHETIC_KEY`): drive a hardcoded 'a' DOWN+UP through
-        // the engine key path to confirm onKeyDown/onKeyUp is REACHABLE + consumed on a live boot
-        // (resolves whether RBXSurfaceView overrides onKeyDown vs needs dispatchKeyEvent). The key is a
-        // fixed test char, never a credential, so logging it is safe. Real typing is the owner's test.
-        if let Some(vm) = self
-            .vm
-            .filter(|_| std::env::var_os("ECLIPSE_SYNTHETIC_KEY").is_some())
-        {
-            for action in [
-                crate::framework::KeyAction::Down,
-                crate::framework::KeyAction::Up,
-            ] {
-                match crate::framework::dispatch_key_to_engine_surface(
-                    vm, action, 29, 'a' as i32, 0,
-                ) {
-                    Ok(consumed) => {
-                        tracing::info!(
-                            ?action,
-                            consumed,
-                            "synthetic KEY 'a' → RBXSurfaceView.dispatchKeyEvent"
-                        )
+        // Stage 0: tap (e.g. the Sign In button) once the engine UI is interactive.
+        if !self.engine_synthetic_tap_done && elapsed >= std::time::Duration::from_secs(6) {
+            self.engine_synthetic_tap_done = true;
+            if let Some((x, y)) =
+                std::env::var_os("ECLIPSE_SYNTHETIC_ENGINE_TAP").and_then(|s| parse_xy(&s))
+            {
+                tracing::info!(
+                    x,
+                    y,
+                    "synthetic ENGINE tap (stage 0): DOWN+UP → onTouchEventInternal"
+                );
+                self.cursor = Some((x, y));
+                self.engine_primary_press();
+                self.engine_primary_release();
+            }
+        }
+
+        // Stage 1: focus a field with a tap, then type a test string through the key path. The test
+        // string is owner-supplied via env (use a throwaway value, never a real credential).
+        if !self.engine_synthetic_type_done && elapsed >= std::time::Duration::from_secs(12) {
+            self.engine_synthetic_type_done = true;
+            if let Some((x, y, text)) =
+                std::env::var_os("ECLIPSE_SYNTHETIC_TYPE").and_then(|s| parse_xy_text(&s))
+            {
+                tracing::info!(
+                    x,
+                    y,
+                    chars = text.chars().count(),
+                    "synthetic TYPE (stage 1): tap-to-focus then type a test string"
+                );
+                self.cursor = Some((x, y));
+                self.engine_primary_press();
+                self.engine_primary_release();
+                if let Some(vm) = self.vm {
+                    for ch in text.chars() {
+                        for action in [
+                            crate::framework::KeyAction::Down,
+                            crate::framework::KeyAction::Up,
+                        ] {
+                            // keycode UNKNOWN (0); the char rides on the KeyEvent unicodeValue.
+                            match crate::framework::dispatch_key_to_engine_surface(
+                                vm, action, 0, ch as i32, 0,
+                            ) {
+                                Ok(consumed) => {
+                                    tracing::info!(
+                                        ?action,
+                                        consumed,
+                                        "synthetic TYPE key → dispatchKeyEvent"
+                                    )
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "synthetic TYPE key dispatch failed")
+                                }
+                            }
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "synthetic KEY dispatch failed"),
                 }
             }
         }
@@ -866,6 +873,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_tap_downtime: None,
         handoff_at: None,
         engine_synthetic_tap_done: false,
+        engine_synthetic_type_done: false,
         key_meta_state: 0,
     };
     event_loop
@@ -1505,6 +1513,25 @@ fn should_complete_tap(
         (Some(p), Some(r)) if p == r => Some(p),
         _ => None,
     }
+}
+
+/// Parse `"x,y"` (window pixels) for the stage-0 synthetic-tap diagnostic. `None` on malformed input.
+fn parse_xy(spec: &std::ffi::OsStr) -> Option<(f32, f32)> {
+    let s = spec.to_str()?;
+    let (xs, ys) = s.split_once(',')?;
+    Some((xs.trim().parse().ok()?, ys.trim().parse().ok()?))
+}
+
+/// Parse `"x,y:text"` for the stage-1 synthetic type-test diagnostic. `None` on malformed input.
+fn parse_xy_text(spec: &std::ffi::OsStr) -> Option<(f32, f32, String)> {
+    let s = spec.to_str()?;
+    let (xy, text) = s.split_once(':')?;
+    let (xs, ys) = xy.split_once(',')?;
+    Some((
+        xs.trim().parse().ok()?,
+        ys.trim().parse().ok()?,
+        text.to_string(),
+    ))
 }
 
 /// 2026-06-14 — map a winit logical key to the Android `KEYCODE_*` for the keys needed to type
