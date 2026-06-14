@@ -226,7 +226,7 @@ before any history-rewriting/force operation.
   passed without RE (off-policy) or a non-first-party signal (how Sober delivers its FFlags past the allowlist for this
   build). (Separately noted: ATL's memory stubs are absurdly low — `totalMem=10000` BYTES, class 20/60 MB — a latent
   correctness bug worth fixing for OTHER reasons, but NOT the render blocker; reverted to keep the baseline clean.)
-  Detail: §6 (2026-06-13 render Phase 6).
+  NEW LEAD (2026-06-13, unfiltered log scan, for the NEXT attempt): the host GLES context the engine sees exposes a DESKTOP-NVIDIA extension set no real Android GPU has (`GL_NV_draw_vulkan_image`/`path_rendering`/`bindless_texture`/`mesh_shader`/…) + `Shader program binary support is: enabled`. The engine's variant-selection (synthesis hypothesis #1, `shader pack does not have variant %s`) likely fingerprints the GPU/feature-set; Eclipse's desktop-NVIDIA-as-GLES fingerprint may match NO variant in the mobile-targeted pack. Testing it = spoofing `glGetString(GL_RENDERER/EXTENSIONS)` + caps to look like a real mobile GPU (Adreno/Mali) — INVASIVE (intercept many GL queries) + still guessing the variant-key without confirming the mechanism (RE), so deferred. Detail: §6 (2026-06-13 render Phase 6).
 - **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
