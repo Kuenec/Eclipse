@@ -146,6 +146,27 @@ fn draw_text_onto_rgba(buf: &mut [u8], w: u32, h: u32, text: &str) {
         }
         pen_x += advance;
     }
+    // Blinking caret at the cursor (end of the text): a 2px white bar spanning the text height, toggled
+    // ~every 0.5 s (per-draw counter; the overlay draws ~60×/s while a field is focused).
+    static BLINK: AtomicU64 = AtomicU64::new(0);
+    if (BLINK.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
+        let cx = pen_x as i32 + 1;
+        let y0 = (baseline_y - scale * 0.72).max(0.0) as u32;
+        let y1 = ((baseline_y + scale * 0.08) as u32).min(h);
+        for cy in y0..y1 {
+            for dx in 0..2 {
+                let px = cx + dx;
+                if px >= 0 && (px as u32) < w {
+                    let idx = ((cy * w + px as u32) * 4) as usize;
+                    if idx + 2 < buf.len() {
+                        buf[idx] = 255;
+                        buf[idx + 1] = 255;
+                        buf[idx + 2] = 255;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Whether the present-path text overlay is enabled — ON by default (it makes host-typed text visible in
