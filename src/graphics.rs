@@ -133,10 +133,11 @@ struct GameWindow<'vm> {
     handoff_at: Option<std::time::Instant>,
     /// 2026-06-14 — set once the env-gated synthetic engine tap (stage 0) has fired, so it fires once.
     engine_synthetic_tap_done: bool,
-    /// 2026-06-14 — set once the env-gated synthetic type-test STAGE 1 (focus tap) has fired.
-    engine_synthetic_type_done: bool,
     /// 2026-06-14 — set once the env-gated synthetic type-test STAGE 2 (the actual typing) has fired.
     engine_synthetic_typed_done: bool,
+    /// 2026-06-14 — the instant of the last synthetic focus-tap, so the focus stage RE-TAPS the field
+    /// (focus-on-tap is async + occasionally missed) until `framework::active_text_field()` is set.
+    engine_last_focus_tap: Option<std::time::Instant>,
     /// 2026-06-14 — set once the env-gated engine-input-bridge reflection diagnostic has fired.
     engine_reflect_done: bool,
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
@@ -833,41 +834,46 @@ impl GameWindow<'_> {
             }
         }
 
-        // Stage 1: tap to FOCUS a field (ECLIPSE_SYNTHETIC_TYPE="x,y:text" → tap x,y). The engine then
-        // (asynchronously) focuses the EditText + polls its getText(), which sets the active text field.
-        if !self.engine_synthetic_type_done && elapsed >= std::time::Duration::from_secs(12) {
-            self.engine_synthetic_type_done = true;
-            if let Some((x, y, _text)) =
+        // Stages 1+2 (ECLIPSE_SYNTHETIC_TYPE="x,y:text"): from ~10 s post-handoff, FOCUS the field then
+        // type. The engine's focus-on-tap is asynchronous + occasionally missed, so we RE-TAP `(x,y)`
+        // every ~1.5 s until `framework::active_text_field()` reports a focused field, then type once —
+        // a robust, self-verifying loop (vs the old fixed-time tap that silently failed when the tap
+        // missed). 2026-06-14.
+        if !self.engine_synthetic_typed_done && elapsed >= std::time::Duration::from_secs(10) {
+            if let Some((x, y, text)) =
                 std::env::var_os("ECLIPSE_SYNTHETIC_TYPE").and_then(|s| parse_xy_text(&s))
             {
-                tracing::info!(x, y, "synthetic TYPE (stage 1): tap-to-focus the field");
-                self.cursor = Some((x, y));
-                self.engine_primary_press();
-                self.engine_primary_release();
-            }
-        }
-
-        // Stage 2: a few seconds after focusing (so the engine has set the active field via getText),
-        // type the test string through the TEXT-FIELD path (type_into_active_text_field), then wake the
-        // engine loopers so it re-polls getText() and re-renders the field with the new text.
-        if !self.engine_synthetic_typed_done && elapsed >= std::time::Duration::from_secs(16) {
-            self.engine_synthetic_typed_done = true;
-            if let Some((_x, _y, text)) =
-                std::env::var_os("ECLIPSE_SYNTHETIC_TYPE").and_then(|s| parse_xy_text(&s))
-            {
-                tracing::info!(
-                    chars = text.chars().count(),
-                    "synthetic TYPE (stage 2): typing into the active text field"
-                );
-                if let Some(vm) = self.vm {
-                    for ch in text.chars() {
-                        let handled =
-                            crate::framework::type_into_active_text_field(vm, ch as i32, false);
-                        tracing::info!(handled, "synthetic TYPE char → active text field");
+                if crate::framework::active_text_field() != 0 {
+                    // Focused → type the test string now.
+                    self.engine_synthetic_typed_done = true;
+                    tracing::info!(
+                        chars = text.chars().count(),
+                        "synthetic TYPE (stage 2): field focused — typing into the active text field"
+                    );
+                    if let Some(vm) = self.vm {
+                        for ch in text.chars() {
+                            let handled =
+                                crate::framework::type_into_active_text_field(vm, ch as i32, false);
+                            tracing::info!(handled, "synthetic TYPE char → active text field");
+                        }
                     }
+                    // Wake the engine's parked loopers so it re-polls getText() + re-renders the field.
+                    crate::loader::ndk_registry::wake_all_loopers();
+                } else if self
+                    .engine_last_focus_tap
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1500))
+                {
+                    // Not focused yet → (re)tap the field to focus it (retries until it takes).
+                    self.engine_last_focus_tap = Some(std::time::Instant::now());
+                    tracing::info!(
+                        x,
+                        y,
+                        "synthetic TYPE (stage 1): focus-tap (retry until focused)"
+                    );
+                    self.cursor = Some((x, y));
+                    self.engine_primary_press();
+                    self.engine_primary_release();
                 }
-                // Wake the engine's parked loopers so it re-polls getText() + re-renders the field.
-                crate::loader::ndk_registry::wake_all_loopers();
             }
         }
     }
@@ -898,8 +904,8 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_tap_downtime: None,
         handoff_at: None,
         engine_synthetic_tap_done: false,
-        engine_synthetic_type_done: false,
         engine_synthetic_typed_done: false,
+        engine_last_focus_tap: None,
         engine_reflect_done: false,
         key_meta_state: 0,
     };
@@ -2556,7 +2562,7 @@ const ATLAS_CHARS: std::ops::RangeInclusive<u8> = 32..=126;
 /// desktop) for `sans-serif`; (2) a scan of the well-known system font dirs for any `.ttf`/`.otf`.
 /// Returns `None` (text disabled, quads still draw) if nothing is found — never panics, never
 /// hardcodes a single file path. An env override (`ECLIPSE_FONT`) wins for testing/packaging.
-fn discover_font_path() -> Option<std::path::PathBuf> {
+pub(crate) fn discover_font_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("ECLIPSE_FONT") {
         let path = std::path::PathBuf::from(p);
         if path.is_file() {
