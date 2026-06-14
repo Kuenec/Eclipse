@@ -229,8 +229,31 @@ n="$(grep -cF '.method public unregisterCallback(Landroid/view/autofill/Autofill
 perl -0pi -e 's{(\.method public unregisterCallback\(Landroid/view/autofill/AutofillManager\$AutofillCallback;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP AutofillManager.cancel() no-op (Roblox RbxKeyboard.i() calls it when showing text input for a focused login field; ATL omits it). No autofill service -> nothing to cancel.\n.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$afm"
 grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali cancel insert failed (drift?)"
 
-# assemble View(+nested) + Display(+Mode) + Activity + Fragment + Vibrator + AutofillManager -> classes2.dex
-mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/os" "$work/smali-view/android/view/autofill"
+# CookieManager.setCookie(url, value, ValueCallback<Boolean>) — AOSP API 21; Roblox's CookieProtocol sets
+# login cookies through it; ATL ships only the 2-arg setCookie. Delegate to the 2-arg, then report success
+# to the callback (ValueCallback is now an interface — see the javac ValueCallback patch). Anchor on the
+# unique 2-arg setCookie.
+csm="$work/smali/android/webkit/CookieManager.smali"
+[ -f "$csm" ] || fail "CookieManager.smali not found after baksmali"
+n="$(grep -cF '.method public setCookie(Ljava/lang/String;Ljava/lang/String;)V' "$csm")" || true
+[ "$n" = "1" ] || fail "CookieManager.smali setCookie(String,String) anchor not unique (found $n, expected 1) — installed CookieManager drifted; update patch-framework.sh"
+! grep -qF 'setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V' "$csm" || fail "CookieManager.smali already declares the 3-arg setCookie — drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public setCookie\(Ljava/lang/String;Ljava/lang/String;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP CookieManager.setCookie(url, value, ValueCallback<Boolean>) (API 21); ATL omits it. Delegate to the 2-arg setCookie, then report success to the callback.\n.method public setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V\n    .locals 1\n\n    invoke-virtual {p0, p1, p2}, Landroid/webkit/CookieManager;->setCookie(Ljava/lang/String;Ljava/lang/String;)V\n\n    if-eqz p3, :cond_eclipse_setcookie_done\n\n    sget-object v0, Ljava/lang/Boolean;->TRUE:Ljava/lang/Boolean;\n\n    invoke-interface {p3, v0}, Landroid/webkit/ValueCallback;->onReceiveValue(Ljava/lang/Object;)V\n\n    :cond_eclipse_setcookie_done\n    return-void\n.end method\n}s' "$csm"
+grep -qF 'setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V' "$csm" || fail "CookieManager.smali setCookie(3-arg) insert failed (drift?)"
+
+# JobParameters.getNetwork() -> Network — AOSP API 28; Roblox queries it on a scheduled network job; ATL
+# omits it. Returns null (no Network bound — AOSP-valid; the caller handles null). Anchor on getExtras.
+jpm="$work/smali/android/app/job/JobParameters.smali"
+[ -f "$jpm" ] || fail "JobParameters.smali not found after baksmali"
+n="$(grep -cF '.method public getExtras()Landroid/os/PersistableBundle;' "$jpm")" || true
+[ "$n" = "1" ] || fail "JobParameters.smali getExtras anchor not unique (found $n, expected 1) — installed JobParameters drifted; update patch-framework.sh"
+! grep -qF 'getNetwork()Landroid/net/Network;' "$jpm" || fail "JobParameters.smali already declares getNetwork — drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public getExtras\(\)Landroid/os/PersistableBundle;.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP JobParameters.getNetwork() (API 28); ATL omits it. Returns null (no Network bound — AOSP-valid; the caller handles null).\n.method public getNetwork()Landroid/net/Network;\n    .locals 1\n\n    const/4 v0, 0x0\n\n    return-object v0\n.end method\n}s' "$jpm"
+grep -qF 'getNetwork()Landroid/net/Network;' "$jpm" || fail "JobParameters.smali getNetwork insert failed (drift?)"
+
+# assemble View(+nested) + Display(+Mode) + Activity + Fragment + Vibrator + AutofillManager + CookieManager
+# + JobParameters -> classes2.dex
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/os" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
@@ -239,6 +262,8 @@ cp "$asm" "$work/smali-view/android/app/Activity.smali"
 cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
+cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
+cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
 # --- 4c. stock api-impl as classes3.dex; compose the 3-dex overlay jar --------------------
