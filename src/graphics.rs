@@ -137,6 +137,8 @@ struct GameWindow<'vm> {
     engine_synthetic_type_done: bool,
     /// 2026-06-14 — set once the env-gated synthetic type-test STAGE 2 (the actual typing) has fired.
     engine_synthetic_typed_done: bool,
+    /// 2026-06-14 — set once the env-gated engine-input-bridge reflection diagnostic has fired.
+    engine_reflect_done: bool,
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
     /// keys are pressed/released, and passed as the `metaState` of each engine `KeyEvent`.
     key_meta_state: i32,
@@ -802,6 +804,18 @@ impl GameWindow<'_> {
         let Some(at) = self.handoff_at else { return };
         let elapsed = at.elapsed();
 
+        // Diagnostic (env ECLIPSE_REFLECT_INPUT): once ~8s post-handoff, reflect the engine's input-
+        // bridge classes' method signatures (for the VISIBLE-typing path — find nativePassText's sig).
+        if !self.engine_reflect_done && elapsed >= std::time::Duration::from_secs(8) {
+            self.engine_reflect_done = true;
+            if let Some(vm) = self
+                .vm
+                .filter(|_| std::env::var_os("ECLIPSE_REFLECT_INPUT").is_some())
+            {
+                crate::framework::reflect_engine_input_methods(vm);
+            }
+        }
+
         // Stage 0: tap (e.g. the Sign In button) once the engine UI is interactive.
         if !self.engine_synthetic_tap_done && elapsed >= std::time::Duration::from_secs(6) {
             self.engine_synthetic_tap_done = true;
@@ -886,6 +900,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_synthetic_tap_done: false,
         engine_synthetic_type_done: false,
         engine_synthetic_typed_done: false,
+        engine_reflect_done: false,
         key_meta_state: 0,
     };
     event_loop

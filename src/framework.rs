@@ -77,7 +77,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use jni::errors::LogErrorAndDefault;
-use jni::objects::{JByteArray, JClass, JIntArray, JLongArray, JObject, JString};
+use jni::objects::{JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray, JString};
 use jni::refs::{Global, Reference};
 use jni::signature::{FieldSignature, JavaType, Primitive};
 use jni::strings::JNIStr;
@@ -7440,6 +7440,74 @@ fn apply_text_edit(old: &str, unicode: i32, backspace: bool) -> (String, jint, j
     (s, 0, 0, 0) // non-printable / unmappable — no text change
 }
 
+/// Pure: map a typed `unicode` codepoint (or `backspace`) to the `(KEYCODE_*, metaState)` pair the engine
+/// expects from `nativePassKeyEvent`, or `None` if the codepoint is not one of the credential-typing keys
+/// Eclipse forwards. Android constants: `KEYCODE_A`=29, `KEYCODE_0`=7, `KEYCODE_SPACE`=62, `KEYCODE_DEL`=67,
+/// `META_SHIFT_ON`=1 (set for uppercase letters). VM-free → unit-testable. 2026-06-14.
+fn android_keycode_for(unicode: i32, backspace: bool) -> Option<(jint, jint)> {
+    if backspace {
+        return Some((67, 0));
+    }
+    let c = char::from_u32(unicode as u32)?;
+    match c {
+        'a'..='z' => Some((29 + (c as jint - 'a' as jint), 0)),
+        'A'..='Z' => Some((29 + (c as jint - 'A' as jint), 1)),
+        '0'..='9' => Some((7 + (c as jint - '0' as jint), 0)),
+        ' ' => Some((62, 0)),
+        _ => None,
+    }
+}
+
+/// Forward one keystroke to the engine's OWN key bridge, `NativeGLInterface.nativePassKeyEvent(boolean
+/// isDown, int keyCode, int metaState, boolean isRepeat)`, as a DOWN+UP pair. This is the engine's
+/// hardware-keyboard path — the one Roblox uses to draw typed characters in a focused TextBox on
+/// desktop/console — and is distinct from the IME-text bridges ([`sync_engine_textbox`]). The engine
+/// derives the character from `keyCode`+`metaState` (the `getUnicodeChar` model), so we map the codepoint
+/// to an Android `KEYCODE_*` (+ `META_SHIFT_ON` for uppercase). Only credential-typing keys are mapped; an
+/// unmappable codepoint is skipped. All args are value types (no handle) → crash-safe; a missing
+/// class/method or JNI throw is described+cleared, never fatal. 2026-06-14.
+fn pass_key_event_to_engine(vm: &Vm, unicode: i32, backspace: bool) {
+    let Some((key_code, meta)) = android_keycode_for(unicode, backspace) else {
+        return;
+    };
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let cls = match env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface")) {
+                Ok(c) => c,
+                Err(_) => {
+                    env.exception_clear();
+                    return;
+                }
+            };
+            for is_down in [true, false] {
+                if let Err(e) = checked(env, "NativeGLInterface.nativePassKeyEvent", |env| {
+                    env.call_static_method(
+                        &cls,
+                        jni_str!("nativePassKeyEvent"),
+                        jni_sig!("(ZIIZ)V"),
+                        &[
+                            JValue::Bool(is_down),
+                            JValue::Int(key_code),
+                            JValue::Int(meta),
+                            JValue::Bool(false),
+                        ],
+                    )?
+                    .v()
+                }) {
+                    tracing::debug!(error = %e, "nativePassKeyEvent threw (cleared)");
+                }
+            }
+        }));
+        Ok(())
+    });
+}
+
 /// Route a host keystroke into the active text-input `EditText` — the field whose `native_getText` the
 /// engine last polled ([`ACTIVE_TEXT_FIELD`]). A printable `unicode` codepoint is appended; `backspace`
 /// removes the last char. Mutates the field's [`view_registry`] `text` and fires the retained
@@ -7462,9 +7530,16 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
     });
     match edited {
         Ok((old_text, new_text, start, before, count)) => {
-            // The engine observes the field via a TextWatcher (it does NOT poll getText to render), so
-            // fire the full before→on→after contract with the exact edit delta so it re-renders.
+            // (1) Fire the EditText TextWatcher contract (validation — enables e.g. the "Next" button).
             fire_text_watchers(vm, widget, &old_text, &new_text, start, before, count);
+            // (2) Push the full text + cursor to the engine's Lua TextBox so it RENDERS the typed text —
+            // the engine's display reads its own textbox, not the Android EditText (reflection-confirmed).
+            let cursor = jint::try_from(new_text.chars().count()).unwrap_or(jint::MAX);
+            sync_engine_textbox(vm, &new_text, cursor);
+            // (3) Also forward the keystroke through the engine's OWN hardware-key bridge
+            // (nativePassKeyEvent) — the desktop/console text-render path Roblox uses to draw typed chars
+            // in a TextBox, distinct from the IME-text bridges in (2). 2026-06-14.
+            pass_key_event_to_engine(vm, unicode, backspace);
             true
         }
         Err(_) => {
@@ -7473,6 +7548,97 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
             false
         }
     }
+}
+
+/// Push the active text field's full `text` + `cursor` to the engine's Lua TextBox via the engine's own
+/// `com.roblox.engine.jni.NativeGLInterface.syncTextboxTextAndCursorPosition2(String, int)` bridge
+/// (a static native the engine exports + Java calls to sync its on-screen text input — discovered via
+/// reflection, [`reflect_engine_input_methods`]). The engine RENDERS its Lua TextBox from this, not from
+/// the Android `EditText`, so this is what makes host-typed text VISIBLE in the field. Best-effort: a
+/// missing class/method or a JNI throw is described+cleared, never fatal. 2026-06-14.
+fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let cls = match env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface")) {
+                Ok(c) => c,
+                Err(_) => {
+                    env.exception_clear();
+                    return;
+                }
+            };
+            let Ok(s) = env.new_string(text) else {
+                return;
+            };
+            // updateKeyboardSize(boolean shown, int x, int y, int w, int h) tells the engine the soft
+            // keyboard is visible. On Android the engine only activates its on-screen text-input rendering
+            // once the IME reports shown; Eclipse has no real soft keyboard (ATL stubs showSoftInput), so
+            // without this the engine accepts text for validation (Next enables) but never RENDERS it in the
+            // focused TextBox. We assert shown + a plausible bottom-strip rect before pushing text. The exact
+            // rect is non-gating (the engine pans layout off it); the `shown` flag is what unlocks the render
+            // path. 2026-06-14.
+            if let Err(e) = checked(env, "NativeGLInterface.updateKeyboardSize", |env| {
+                env.call_static_method(
+                    &cls,
+                    jni_str!("updateKeyboardSize"),
+                    jni_sig!("(ZIIII)V"),
+                    &[
+                        JValue::Bool(true),
+                        JValue::Int(0),
+                        JValue::Int(360),
+                        JValue::Int(800),
+                        JValue::Int(240),
+                    ],
+                )?
+                .v()
+            }) {
+                tracing::debug!(error = %e, "updateKeyboardSize threw (cleared)");
+            }
+            // nativePassText(long eventTime, String text, boolean isComposing, int cursor) is the engine's
+            // IME-commit bridge — Java pushes the committed text into the focused Lua TextBox, which the
+            // engine then RENDERS. The `long` is an eventTime, not a textbox handle: NativeTextBoxInfo (the
+            // only textbox object the engine hands Java) exposes geometry/style but NO handle and NO text,
+            // and the engine tracks the active textbox internally (same model as nativePassInput) — so 0 is
+            // safe. isComposing=false marks a finalized (not preedit) commit. 2026-06-14.
+            if let Err(e) = checked(env, "NativeGLInterface.nativePassText", |env| {
+                env.call_static_method(
+                    &cls,
+                    jni_str!("nativePassText"),
+                    jni_sig!("(JLjava/lang/String;ZI)V"),
+                    &[
+                        JValue::Long(0),
+                        JValue::Object(&s),
+                        JValue::Bool(false),
+                        JValue::Int(cursor),
+                    ],
+                )?
+                .v()
+            }) {
+                tracing::debug!(error = %e, "nativePassText threw (cleared)");
+            }
+            if let Err(e) = checked(
+                env,
+                "NativeGLInterface.syncTextboxTextAndCursorPosition2",
+                |env| {
+                    env.call_static_method(
+                        &cls,
+                        jni_str!("syncTextboxTextAndCursorPosition2"),
+                        jni_sig!("(Ljava/lang/String;I)V"),
+                        &[JValue::Object(&s), JValue::Int(cursor)],
+                    )?
+                    .v()
+                },
+            ) {
+                tracing::debug!(error = %e, "syncTextboxTextAndCursorPosition2 threw (cleared)");
+            }
+        }));
+        Ok(())
+    });
 }
 
 /// Fire `TextWatcher.onTextChanged` on each watcher retained for the EditText `widget`, so an engine
@@ -7593,6 +7759,85 @@ fn fire_text_watchers(
             Ok(r) => r,
             Err(_) => Err(FrameworkError::Panicked),
         }
+    });
+}
+
+/// Dev-host diagnostic (env `ECLIPSE_REFLECT_INPUT`): log the engine's input-bridge classes' declared
+/// methods via JNI reflection (a runtime API on loaded classes — NOT binary RE; Eclipse already reflects
+/// Roblox classes' native methods by design, jni_register.rs), so the orchestrator can read the exact
+/// signature of the engine's text-input native (`NativeGLInterface.nativePassText` /
+/// `NativeInputInterface.nativePassInput`, per `native_provider`'s note) — the candidate path for VISIBLE
+/// login typing (the engine's display reads its own input buffer, not the EditText TextWatcher). 2026-06-14.
+pub fn reflect_engine_input_methods(vm: &Vm) {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            for class_name in [
+                jni_str!("com/roblox/engine/jni/NativeGLInterface"),
+                jni_str!("com/roblox/engine/jni/NativeInputInterface"),
+            ] {
+                let cls = match env.find_class(class_name) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        env.exception_clear();
+                        tracing::info!(class = %class_name.to_str(), "reflect-input: class not loaded");
+                        continue;
+                    }
+                };
+                let methods_obj = match checked(env, "Class.getDeclaredMethods", |env| {
+                    env.call_method(
+                        &cls,
+                        jni_str!("getDeclaredMethods"),
+                        jni_sig!("()[Ljava/lang/reflect/Method;"),
+                        &[],
+                    )?
+                    .l()
+                }) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let methods: JObjectArray = match env.cast_local::<JObjectArray>(methods_obj) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let len = methods.len(env).unwrap_or(0);
+                tracing::info!(class = %class_name.to_str(), methods = len, "reflect-input: declared methods");
+                for i in 0..len {
+                    let Ok(m) = methods.get_element(env, i) else {
+                        continue;
+                    };
+                    let Ok(s_obj) = checked(env, "Method.toString", |env| {
+                        env.call_method(
+                            &m,
+                            jni_str!("toString"),
+                            jni_sig!("()Ljava/lang/String;"),
+                            &[],
+                        )?
+                        .l()
+                    }) else {
+                        continue;
+                    };
+                    // SAFETY: toString returns a String; wrap the ref (env binds the lifetime).
+                    let s = unsafe { JString::from_raw(env, s_obj.into_raw()) };
+                    if let Ok(desc) = s.try_to_string(env) {
+                        if desc.contains("Pass")
+                            || desc.contains("Input")
+                            || desc.contains("Text")
+                            || desc.contains("Key")
+                            || desc.contains("Char")
+                        {
+                            tracing::info!(method = %desc, "reflect-input: bridge method");
+                        }
+                    }
+                }
+            }
+        }));
+        Ok(())
     });
 }
 
@@ -11264,6 +11509,26 @@ mod tests {
             apply_text_edit("é", 'x' as i32, false),
             ("éx".to_string(), 1, 0, 1)
         );
+    }
+
+    #[test]
+    fn android_keycode_for_maps_credential_keys() {
+        // Letters: KEYCODE_A=29 .. KEYCODE_Z=54, no meta when lowercase.
+        assert_eq!(android_keycode_for('a' as i32, false), Some((29, 0)));
+        assert_eq!(android_keycode_for('z' as i32, false), Some((54, 0)));
+        assert_eq!(android_keycode_for('r' as i32, false), Some((46, 0))); // 'r' in "robloxtest"
+                                                                           // Uppercase letters: same keyCode + META_SHIFT_ON=1.
+        assert_eq!(android_keycode_for('A' as i32, false), Some((29, 1)));
+        assert_eq!(android_keycode_for('Z' as i32, false), Some((54, 1)));
+        // Digits: KEYCODE_0=7 .. KEYCODE_9=16.
+        assert_eq!(android_keycode_for('0' as i32, false), Some((7, 0)));
+        assert_eq!(android_keycode_for('9' as i32, false), Some((16, 0)));
+        // Space + backspace (DEL=67; backspace ignores the codepoint).
+        assert_eq!(android_keycode_for(' ' as i32, false), Some((62, 0)));
+        assert_eq!(android_keycode_for(0, true), Some((67, 0)));
+        // Unmapped printable (e.g. '@') and control/unmappable codepoints → None.
+        assert_eq!(android_keycode_for('@' as i32, false), None);
+        assert_eq!(android_keycode_for(0x1b, false), None); // ESC
     }
 
     #[test]
