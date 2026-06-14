@@ -128,6 +128,28 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-14 — 🖼️ RENDER PHASE 7 SHIPPED: WAYLAND UNDEFINED SURFACE-EXTENT FIX. ⇐ START HERE NEXT SESSION.**
+  Found in the engine's OWN player log (`<app_data>/files/appData/logs/*_last.log` — these carry detail the liblog
+  console truncates; grep them, not just stdout): on the Vulkan path the engine logged `Vulkan: skipping framebuffer
+  creation, invalid currentExtent -1x-1`. ROOT CAUSE: the host driver reports the SPEC-VALID Wayland "undefined" surface
+  extent `currentExtent = 0xFFFFFFFF×0xFFFFFFFF` (the app must size the swapchain itself), but Roblox's engine —
+  Android-only, where a surface ALWAYS has a concrete size — treats it as invalid and skips framebuffer creation. FIX
+  (`src/loader/vulkan_wsi.rs`, via the Phase-6 `vkGetInstanceProcAddr` shim — no new tier-0 registration, so the
+  native-count test is unchanged): intercept `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` (+ `…2KHR`), forward to the
+  host, then if `currentExtent` is undefined, replace it with the real winit window size (`ndk_registry::
+  engine_window_geometry`, default 800×600) clamped to `[minImageExtent, maxImageExtent]`. Regression guard:
+  `vulkan_wsi::tests::fix_undefined_extent_replaces_wayland_undefined_and_keeps_concrete`. Gate clean (567 unit + 4
+  integ + 2 doctest). LIVE BOOT (`/tmp/eclipse-extent.log`): the `skipping framebuffer` line is GONE and the engine now
+  **creates its Vulkan swapchain — `Vulkan: swapchain images 3 … size 800x600`** (real progress; the swapchain is a
+  prerequisite for Vulkan rendering). **BUT the shader-pack open STILL fails** (`Mode 6 failed: Error opening shader
+  pack vulkan_mobile` → `RenderView is NULL`), so the extent was a SEPARATE framebuffer blocker and the shader-pack
+  reject is independent of it (as it was of device/memory/FFlags/GL-renderer — all disproven earlier in §5). The
+  shader-pack reject remains the final blocker: an in-engine RBXS container check whose reason is gated behind an
+  `FLog::SurfaceController`/`Graphics` level that the local-override FFlag path can't raise (Roblox's 2026 allowlist,
+  `DFStringAllowedPublicFlags` absent → deny-all, blocks it across both settings paths — strace-confirmed). NEXT: keep
+  mining the player log + any post-swapchain detail for the SAME class of Android-vs-Wayland/host mismatch the extent
+  bug was (the productive pattern this session); the shader-pack reason itself needs the allowlist bypass (non-first-
+  party) or RBXS RE (off-policy). Detail: §6 (render Phase 6 entry covers the WSI seam this extends).
 - **2026-06-13 — 🖼️ RENDER PHASE 6 SHIPPED: VULKAN WSI TRANSLATION (Android→Wayland) via a tier-0 `dlsym` interposer.
   ⇐ START HERE NEXT SESSION.** After Phase 5 un-gated Vulkan (API 28), Mode 6 failed `Unable to create Vulkan instance`
   because the engine requests the Android-only `VK_KHR_android_surface` instance extension, absent from the host Linux
