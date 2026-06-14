@@ -220,7 +220,7 @@ before any history-rewriting/force operation.
   found in settings` — Roblox's 2026 local-override ALLOWLIST is absent ⇒ default-deny ⇒ every non-allowlisted local
   flag is SILENTLY dropped, and the allowlist key itself is not locally-settable. So even OBSERVABILITY of the reject
   reason is blocked without modifying Roblox's own allowlist/settings code (RE/tampering — OFF-POLICY). Cleaned up the
-  external config files. NET: the shipped Phase-5/6 fixes (API 28 + Vulkan WSI translation) HOLD and got the engine to
+  external config files. STRACE-CONFIRMED (2026-06-13) the engine opens EXACTLY these settings paths: `/data/local/tmp/ClientAppSettings.json` (debug override) AND `<app_data>/files/exe/ClientSettings/ClientAppSettings.json` (the Sober/Bloxstrap app-settings path) AND `<app_data>/files/appData/ClientSettings/IxpSettings.json` — so the boot-4 write WAS to the correct Sober path; both override paths are allowlist-gated, ruling out a wrong-path explanation. The only non-RE unblock is learning how Sober populates `DFStringAllowedPublicFlags` for this build. NET: the shipped Phase-5/6 fixes (API 28 + Vulkan WSI translation) HOLD and got the engine to
   build its full Vulkan instance+surface+device pipeline + a GLES3 context; the shader-pack open is a HARD,
   exhaustively-characterized boundary — across device-profile, memory, provisioning, AND FFlag avenues — that cannot be
   passed without RE (off-policy) or a non-first-party signal (how Sober delivers its FFlags past the allowlist for this
