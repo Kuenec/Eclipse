@@ -10421,6 +10421,43 @@ pub fn engine_surface_view_handle() -> Option<view_registry::ViewHandle> {
     view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS)
 }
 
+/// Forward a host mouse-wheel scroll to the engine's `com.roblox.engine.jni.NativeInputInterface.
+/// nativePassMouseWheel(float x, float y, float delta)` (a static native discovered via
+/// [`reflect_engine_input_methods`] — the engine's desktop wheel handler). Best-effort: a missing
+/// class/method or a JNI throw is described+cleared, never fatal. (Roblox's Android UI also scrolls via
+/// touch-drag, which Eclipse already forwards as `ACTION_MOVE`; this adds the desktop wheel.) 2026-06-14.
+pub fn dispatch_scroll(vm: &Vm, x: f32, y: f32, delta: f32) {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let cls = match env.find_class(jni_str!("com/roblox/engine/jni/NativeInputInterface")) {
+                Ok(c) => c,
+                Err(_) => {
+                    env.exception_clear();
+                    return;
+                }
+            };
+            if let Err(e) = checked(env, "NativeInputInterface.nativePassMouseWheel", |env| {
+                env.call_static_method(
+                    &cls,
+                    jni_str!("nativePassMouseWheel"),
+                    jni_sig!("(FFF)V"),
+                    &[JValue::Float(x), JValue::Float(y), JValue::Float(delta)],
+                )?
+                .v()
+            }) {
+                tracing::debug!(error = %e, "nativePassMouseWheel threw (cleared)");
+            }
+        }));
+        Ok(())
+    });
+}
+
 /// Dispatch a single-pointer `MotionEvent` of `action` at window pixel `(x, y)` to the engine's
 /// `RBXSurfaceView` via ATL's touch driver `onTouchEventInternal`, which invokes the view's
 /// `OnTouchListener` — the GLSurfaceView input entry point Roblox's engine wires (via
