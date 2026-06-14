@@ -122,6 +122,17 @@ struct GameWindow<'vm> {
     /// (3003). Gated on [`crate::framework::engine_surface_callback_ready`] (engine subscribed its
     /// `SurfaceHolder.Callback`), so the window is never blanked prematurely. Done exactly once.
     handed_off: bool,
+    /// 2026-06-14 — engine-mode pointer path: the `downTime` (ms) of an in-flight primary press on the
+    /// engine's `RBXSurfaceView`, captured on `ACTION_DOWN` and reused for the matching `ACTION_UP` so
+    /// both events carry the IDENTICAL downTime (one gesture stream). `None` when no engine press is in
+    /// flight. Separate from [`Self::primary_press`] (the pre-handoff Eclipse-view path).
+    engine_tap_downtime: Option<i64>,
+    /// 2026-06-14 — dev-host diagnostic only: the instant the present-loop handoff completed, so an
+    /// env-gated synthetic engine tap (`ECLIPSE_SYNTHETIC_ENGINE_TAP="x,y"`) can fire a few seconds
+    /// later, once the engine's Lua UI is interactive. `None` until handoff; never set in normal use.
+    handoff_at: Option<std::time::Instant>,
+    /// 2026-06-14 — set once the env-gated synthetic engine tap has fired, so it fires at most once.
+    engine_synthetic_tap_done: bool,
 }
 
 impl ApplicationHandler for GameWindow<'_> {
@@ -254,6 +265,13 @@ impl ApplicationHandler for GameWindow<'_> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // 2026-06-14 — engine-mode liveness wake: the engine's input worker threads park in
+        // `ALooper_pollOnce`; any host input event must wake them so they re-check their sources (the
+        // engine consumes input via its JNI bridge, not an NDK `AInputQueue` — see `native_provider`'s
+        // "winit → ALooper input feed" note). No-op pre-handoff and for non-input events.
+        if self.handed_off {
+            crate::loader::native_provider::feed_winit_input_to_loopers(&event);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("window close requested; exiting event loop");
@@ -306,10 +324,21 @@ impl ApplicationHandler for GameWindow<'_> {
                 state,
                 button: MouseButton::Left,
                 ..
-            } => match state {
-                ElementState::Pressed => self.handle_primary_press(),
-                ElementState::Released => self.handle_primary_release(),
-            },
+            } => {
+                if self.handed_off {
+                    // Engine owns rendering + its own Lua UI: forward the raw pointer to the engine's
+                    // RBXSurfaceView (no renderer, no Eclipse-view hit-test).
+                    match state {
+                        ElementState::Pressed => self.engine_primary_press(),
+                        ElementState::Released => self.engine_primary_release(),
+                    }
+                } else {
+                    match state {
+                        ElementState::Pressed => self.handle_primary_press(),
+                        ElementState::Released => self.handle_primary_release(),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -356,6 +385,7 @@ impl ApplicationHandler for GameWindow<'_> {
                         tracing::warn!(error = %e, "engine SurfaceView lifecycle dispatch failed after renderer release");
                     }
                     self.handed_off = true;
+                    self.handoff_at = Some(std::time::Instant::now());
                     event_loop.set_control_flow(ControlFlow::Poll);
                     tracing::info!(
                         width = w,
@@ -381,6 +411,7 @@ impl ApplicationHandler for GameWindow<'_> {
                 );
             }
         }
+        self.maybe_synthetic_engine_tap();
     }
 }
 
@@ -474,6 +505,65 @@ impl GameWindow<'_> {
             Err(e) => {
                 tracing::warn!(handle, ?action, error = %e, "touch dispatch to view failed (ignored)");
                 false
+            }
+        }
+    }
+
+    /// 2026-06-14 — ENGINE-MODE primary press: forward the pointer to Roblox's engine, which owns
+    /// rendering and its own Lua UI post-handoff (Eclipse's `VulkanRenderer` + view tree are gone, so
+    /// the renderer-gated [`Self::handle_primary_press`] path is pre-handoff only). Dispatches an
+    /// `ACTION_DOWN` `MotionEvent` at the raw cursor position to the engine's `RBXSurfaceView.onTouchEvent`
+    /// and records the gesture's downTime for the matching release. No VM / no cursor yet → no-op.
+    fn engine_primary_press(&mut self) {
+        self.engine_tap_downtime = None;
+        let Some(vm) = self.vm else { return };
+        let Some((px, py)) = self.cursor else { return };
+        match crate::framework::dispatch_touch_to_engine_surface(
+            vm,
+            crate::framework::MotionAction::Down,
+            px,
+            py,
+            None,
+        ) {
+            Ok(outcome) => {
+                self.engine_tap_downtime = Some(outcome.down_time_ms);
+                tracing::info!(
+                    x = px,
+                    y = py,
+                    consumed = outcome.consumed,
+                    "engine pointer ACTION_DOWN → RBXSurfaceView.onTouchEventInternal"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "engine pointer ACTION_DOWN dispatch failed (ignored)");
+            }
+        }
+    }
+
+    /// 2026-06-14 — ENGINE-MODE primary release: dispatch the matching `ACTION_UP` to the engine's
+    /// `RBXSurfaceView.onTouchEvent` at the raw cursor position, reusing the press's downTime so the
+    /// engine groups DOWN+UP as one tap. Clears the in-flight gesture regardless.
+    fn engine_primary_release(&mut self) {
+        let down_time = self.engine_tap_downtime.take();
+        let Some(vm) = self.vm else { return };
+        let Some((px, py)) = self.cursor else { return };
+        match crate::framework::dispatch_touch_to_engine_surface(
+            vm,
+            crate::framework::MotionAction::Up,
+            px,
+            py,
+            down_time,
+        ) {
+            Ok(outcome) => {
+                tracing::info!(
+                    x = px,
+                    y = py,
+                    consumed = outcome.consumed,
+                    "engine pointer ACTION_UP → RBXSurfaceView.onTouchEventInternal"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "engine pointer ACTION_UP dispatch failed (ignored)");
             }
         }
     }
@@ -585,6 +675,48 @@ impl GameWindow<'_> {
         self.dispatch_touch(handle, crate::framework::MotionAction::Down, cx, cy);
         self.dispatch_touch(handle, crate::framework::MotionAction::Up, cx, cy);
     }
+
+    /// 2026-06-14 — dev-host diagnostic (env `ECLIPSE_SYNTHETIC_ENGINE_TAP="x,y"`): fire ONE real
+    /// DOWN+UP through the engine pointer path at window pixel `(x, y)` ~6 s after the handoff (so the
+    /// engine's Lua UI is interactive), proving the host → `RBXSurfaceView.onTouchEvent` wiring on a
+    /// real run without a physical click. Defaults to the window center if `x,y` does not parse. Never
+    /// fires in normal operation (the env var is unset). Mirrors [`Self::maybe_synthetic_tap`].
+    fn maybe_synthetic_engine_tap(&mut self) {
+        if self.engine_synthetic_tap_done || !self.handed_off {
+            return;
+        }
+        let Some(spec) = std::env::var_os("ECLIPSE_SYNTHETIC_ENGINE_TAP") else {
+            return;
+        };
+        // Wait until the engine UI has had time to become interactive after the handoff.
+        match self.handoff_at {
+            Some(at) if at.elapsed() >= std::time::Duration::from_secs(6) => {}
+            _ => return,
+        }
+        self.engine_synthetic_tap_done = true;
+        let (x, y) = spec
+            .to_str()
+            .and_then(|s| {
+                let (xs, ys) = s.split_once(',')?;
+                Some((
+                    xs.trim().parse::<f32>().ok()?,
+                    ys.trim().parse::<f32>().ok()?,
+                ))
+            })
+            .unwrap_or_else(|| {
+                let (w, h) =
+                    crate::loader::ndk_registry::engine_window_geometry().unwrap_or((800, 600));
+                (w as f32 / 2.0, h as f32 / 2.0)
+            });
+        tracing::info!(
+            x,
+            y,
+            "synthetic ENGINE tap: driving DOWN+UP to RBXSurfaceView.onTouchEvent"
+        );
+        self.cursor = Some((x, y));
+        self.engine_primary_press();
+        self.engine_primary_release();
+    }
 }
 
 /// Open the host game window and run the winit event loop until the window is closed.
@@ -609,6 +741,9 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         synthetic_tap_done: false,
         engine_window: None,
         handed_off: false,
+        engine_tap_downtime: None,
+        handoff_at: None,
+        engine_synthetic_tap_done: false,
     };
     event_loop
         .run_app(&mut app)

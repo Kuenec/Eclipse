@@ -9376,14 +9376,15 @@ fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
     if already {
         return Ok(()); // already pumping (or TLS unavailable) — a nested drive would corrupt the queue
     }
-    let looper_class = env.find_class(LOOPER_CLASS);
-    let result = match looper_class {
-        Ok(class) => checked(env, "pump Looper.loop", |env| {
-            env.call_static_method(&class, jni_str!("loop"), jni_sig!("()V"), &[])?
-                .v()
-        }),
-        Err(e) => Err(FrameworkError::Jni(e)),
-    };
+    // 2026-06-14: drive a BOUNDED batch of ready messages instead of `Looper.loop()`. `Looper.loop()`
+    // returns only when the queue drains to empty — but a live app (e.g. the landing screen's auth/
+    // fragment error-retry paths) RE-POSTS main-thread messages continuously, so the queue is never
+    // empty and `loop()` never returns, FREEZING the winit event loop (about_to_wait never returns →
+    // no host input is delivered). `drive_main_messages` mirrors `loop()`'s body (myQueue → next →
+    // getTarget → dispatchMessage → recycle, exactly ATL's Looper.loop) but caps the work per tick, so
+    // about_to_wait always returns and stays responsive. When idle it drains fully in << budget
+    // (identical to loop()); only a storm hits the cap.
+    let result = drive_main_messages(env);
     let _ = MAIN_LOOPER_PUMP_IN_PROGRESS.try_with(|f| f.set(false));
     result?;
     // One-time confirmation the pump is live (process-global atomic, no TLS — see its docs).
@@ -9391,6 +9392,89 @@ fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
         tracing::info!(
             "main Looper pump active: dispatching main-thread messages from the winit loop"
         );
+    }
+    Ok(())
+}
+
+/// The max main-thread messages [`drive_main_messages`] dispatches per pump tick before returning to
+/// the winit loop, even if more are ready. Bounds a message storm (a live app re-posting continuously)
+/// so the winit event loop stays responsive; an idle queue drains in far fewer (identical to
+/// `Looper.loop`). 512 comfortably covers the lifecycle's per-tick bursts while capping a runaway storm.
+const MAIN_LOOPER_MESSAGE_BUDGET: usize = 512;
+
+/// Drive up to [`MAIN_LOOPER_MESSAGE_BUDGET`] ready main-thread messages, mirroring
+/// `android.os.Looper.loop()`'s body (`myQueue` → `next` → `getTarget` → `dispatchMessage` → `recycle`,
+/// exactly ATL's `Looper.loop`) but RETURNING after the cap instead of looping until the queue is empty.
+/// `MessageQueue.next()` is non-blocking under Eclipse (ATL's `nativePollOnce` returns rather than
+/// blocking when no message is ready, so `next()` yields `null`), so the loop ends early once the queue
+/// drains. Each message is dispatched inside its own local frame (bounded JNI local refs over the loop)
+/// and a thrown handler is described+cleared so one bad handler can't stop the batch — stricter than
+/// `Looper.loop`, which aborts the whole loop on a throw.
+fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
+    let looper_class = env.find_class(LOOPER_CLASS)?;
+    // Looper.myQueue() (public static) → the current (main) thread's MessageQueue.
+    let queue = checked(env, "Looper.myQueue", |env| {
+        env.call_static_method(
+            &looper_class,
+            jni_str!("myQueue"),
+            jni_sig!("()Landroid/os/MessageQueue;"),
+            &[],
+        )?
+        .l()
+    })?;
+    for _ in 0..MAIN_LOOPER_MESSAGE_BUDGET {
+        let processed = env.with_local_frame(16, |env| -> Result<bool, FrameworkError> {
+            // MessageQueue.next() — package-private, non-blocking here (yields null when no ready
+            // message). JNI ignores Java access modifiers, so the methodID resolves.
+            let msg = checked(env, "MessageQueue.next", |env| {
+                env.call_method(
+                    &queue,
+                    jni_str!("next"),
+                    jni_sig!("()Landroid/os/Message;"),
+                    &[],
+                )?
+                .l()
+            })?;
+            if msg.is_null() {
+                return Ok(false); // queue drained this tick — stop
+            }
+            // Message.getTarget() (public) → Handler; dispatch, catching a handler throw so one bad
+            // handler can't poison the batch (ATL's Looper.loop aborts the whole loop on a throw).
+            let target = checked(env, "Message.getTarget", |env| {
+                env.call_method(
+                    &msg,
+                    jni_str!("getTarget"),
+                    jni_sig!("()Landroid/os/Handler;"),
+                    &[],
+                )?
+                .l()
+            })?;
+            if !target.is_null() {
+                if let Err(e) = checked(env, "Handler.dispatchMessage", |env| {
+                    env.call_method(
+                        &target,
+                        jni_str!("dispatchMessage"),
+                        jni_sig!("(Landroid/os/Message;)V"),
+                        &[JValue::Object(&msg)],
+                    )?
+                    .v()
+                }) {
+                    tracing::debug!(error = %e, "main-looper message handler threw (cleared, continuing)");
+                }
+            }
+            // Return the message to ATL's pool (mirrors Looper.loop's msg.recycle(); ATL's recycle has
+            // no in-use check, so it is safe post-dispatch). A recycle failure is logged, never fatal.
+            if let Err(e) = checked(env, "Message.recycle", |env| {
+                env.call_method(&msg, jni_str!("recycle"), jni_sig!("()V"), &[])?
+                    .v()
+            }) {
+                tracing::debug!(error = %e, "Message.recycle failed (ignored)");
+            }
+            Ok(true)
+        })?;
+        if !processed {
+            break;
+        }
     }
     Ok(())
 }
@@ -9600,6 +9684,199 @@ fn touch_view(
             Ok(false)
         }
     }
+}
+
+/// The outcome of dispatching one pointer event to the engine's `RBXSurfaceView` via
+/// [`dispatch_touch_to_engine_surface`].
+pub struct EngineTouchOutcome {
+    /// `true` iff `RBXSurfaceView.onTouchEvent` returned `true` (the engine consumed the event).
+    pub consumed: bool,
+    /// The `downTime` (ms, `SystemClock.uptimeMillis`) used for this gesture. The caller threads the
+    /// SAME value from the press's `ACTION_DOWN` into the matching `ACTION_UP` so the engine groups
+    /// them as one gesture stream (downTime is constant across a gesture, per the Android contract).
+    pub down_time_ms: i64,
+}
+
+/// Resolve the engine's content `RBXSurfaceView` handle (the `SurfaceView` Roblox's engine draws into
+/// and reads input from), or `None` if it is not yet registered in [`view_registry`]. Thin wrapper over
+/// [`view_registry::find_by_class`] so the pointer path (`graphics.rs`) targets the engine surface
+/// without duplicating the class constant.
+pub fn engine_surface_view_handle() -> Option<view_registry::ViewHandle> {
+    view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS)
+}
+
+/// Dispatch a single-pointer `MotionEvent` of `action` at window pixel `(x, y)` to the engine's
+/// `RBXSurfaceView` via ATL's touch driver `onTouchEventInternal`, which invokes the view's
+/// `OnTouchListener` — the GLSurfaceView input entry point Roblox's engine wires (via
+/// `setOnTouchListener`) to push the event into native through its
+/// `com.roblox.engine.jni.NativeInputInterface` bridge. The engine is NOT a NativeActivity (it imports
+/// zero `AInputQueue_*`; only `ALooper_*`), so the Java view layer pushes input in — see
+/// `native_provider`'s "winit → ALooper input feed" note.
+///
+/// 2026-06-14: the ENGINE-MODE pointer path, used post-handoff when the engine owns rendering and
+/// Eclipse's `VulkanRenderer` + own view tree are gone. Distinct from [`dispatch_touch_to_view`],
+/// which calls `View.dispatchTouchEvent` (a no-op on ATL's base `View`) against an Eclipse-hit-tested
+/// view — that path cannot reach the engine-drawn Lua UI. This targets the engine's real content
+/// surface (the same peer Eclipse drives the surface lifecycle on, see [`dispatch_surface_lifecycle`]).
+///
+/// `down_time_ms`: `None` for the gesture's `ACTION_DOWN` — samples `SystemClock.uptimeMillis()` as the
+/// downTime and returns it (in [`EngineTouchOutcome::down_time_ms`]); the caller stores it and passes
+/// `Some(it)` for the matching `ACTION_UP`, so both events carry the IDENTICAL downTime. `eventTime` is
+/// always the current uptime (`== downTime` for the DOWN, `>= downTime` for the UP).
+///
+/// Soundness mirrors [`dispatch_touch_to_view`]: null-VM guard, `attach_current_thread`, `catch_unwind`
+/// so a Rust panic cannot cross into ART, every JNI call through [`checked`], and the obtained
+/// `MotionEvent` is `recycle()`d on every path. Returns a no-op outcome (`consumed = false`) if the
+/// `RBXSurfaceView` is not registered yet.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
+/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn dispatch_touch_to_engine_surface(
+    vm: &Vm,
+    action: MotionAction,
+    x: f32,
+    y: f32,
+    down_time_ms: Option<i64>,
+) -> Result<EngineTouchOutcome, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()`, kept alive by the `&Vm` borrow and
+    // verified non-null — exactly `JavaVM::from_raw`'s contract (same as `dispatch_touch_to_view`).
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            touch_engine_surface(env, action, x, y, down_time_ms)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Build a `MotionEvent` for `action` at `(x, y)` and dispatch it to the engine's `RBXSurfaceView` via
+/// `onTouchEvent`, then `recycle()` it. Resolves the surface from [`view_registry`] each call (it is the
+/// engine's stable content view). Returns a no-op outcome when the surface is not registered or not
+/// dispatchable. On the gesture's `ACTION_DOWN` (`down_time_ms == None`) logs the resolved surface's
+/// width/height (attached+laid-out proof + a coordinate-space check, detect-don't-assume).
+fn touch_engine_surface(
+    env: &mut Env,
+    action: MotionAction,
+    x: f32,
+    y: f32,
+    down_time_ms: Option<i64>,
+) -> Result<EngineTouchOutcome, FrameworkError> {
+    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+        tracing::debug!(
+            ?action,
+            "engine touch: RBXSurfaceView not registered yet (no-op)"
+        );
+        return Ok(EngineTouchOutcome {
+            consumed: false,
+            down_time_ms: down_time_ms.unwrap_or(0),
+        });
+    };
+    let mut used_down_time = down_time_ms.unwrap_or(0);
+    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
+        let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
+        let now = checked(env, "SystemClock.uptimeMillis", |env| {
+            env.call_static_method(
+                &system_clock,
+                jni_str!("uptimeMillis"),
+                jni_sig!("()J"),
+                &[],
+            )?
+            .j()
+        })?;
+        let down_time = down_time_ms.unwrap_or(now);
+        used_down_time = down_time;
+
+        // On the DOWN, prove the surface is attached + laid out and confirm the coordinate space (a
+        // full-window content view's local space == window pixels; verify rather than assume).
+        if down_time_ms.is_none() {
+            let w = checked(env, "View.getWidth", |env| {
+                env.call_method(global.as_obj(), jni_str!("getWidth"), jni_sig!("()I"), &[])?
+                    .i()
+            })
+            .unwrap_or(-1);
+            let h = checked(env, "View.getHeight", |env| {
+                env.call_method(global.as_obj(), jni_str!("getHeight"), jni_sig!("()I"), &[])?
+                    .i()
+            })
+            .unwrap_or(-1);
+            tracing::info!(
+                handle,
+                width = w,
+                height = h,
+                x,
+                y,
+                "engine touch DOWN: RBXSurfaceView resolved (geometry = coordinate-space check)"
+            );
+        }
+
+        // MotionEvent.obtain(downTime, eventTime, action, x, y, metaState) — the public Java factory.
+        let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
+        let event = checked(env, "MotionEvent.obtain", |env| {
+            env.call_static_method(
+                &motion_event_class,
+                jni_str!("obtain"),
+                jni_sig!("(JJIFFI)Landroid/view/MotionEvent;"),
+                &[
+                    JValue::Long(down_time),
+                    JValue::Long(now),
+                    JValue::Int(action.code()),
+                    JValue::Float(x),
+                    JValue::Float(y),
+                    JValue::Int(0), // metaState: no modifier keys this increment
+                ],
+            )?
+            .l()
+        })?;
+
+        // RBXSurfaceView.onTouchEventInternal(event, false) — ATL's REAL touch driver (View.java:1133):
+        // it invokes the view's OnTouchListener (which a GLSurfaceView-style engine sets via
+        // setOnTouchListener to forward into native), then onTouchEvent. We must NOT call
+        // dispatchTouchEvent (ATL base is a `return false` no-op, View.java:2062) nor the base
+        // onTouchEvent (also a `return false` stub, View.java:1147) — both silently drop the tap. The
+        // boolean return is informational: the engine's listener may return false yet still have
+        // forwarded the event to native. `handle_gestures = false` (no performClick fallback; the
+        // engine's listener owns the gesture).
+        let consumed = checked(env, "RBXSurfaceView.onTouchEventInternal", |env| {
+            env.call_method(
+                global.as_obj(),
+                jni_str!("onTouchEventInternal"),
+                jni_sig!("(Landroid/view/MotionEvent;Z)Z"),
+                &[JValue::Object(&event), JValue::Bool(false)],
+            )?
+            .z()
+        });
+
+        // Recycle on EVERY path (pooled object; mirrors `touch_view`). A recycle failure is logged but
+        // never masks the dispatch result.
+        if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
+            env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
+                .v()
+        }) {
+            tracing::debug!(error = %e, "MotionEvent.recycle failed (ignored)");
+        }
+        consumed
+    });
+    let consumed = match result {
+        Ok(Some(Ok(c))) => c,
+        Ok(Some(Err(e))) => return Err(e),
+        // Valid handle but no recorded jobject, or stale/poisoned: nothing to touch (no-op).
+        Ok(None) => false,
+        Err(e) => {
+            tracing::debug!(error = %e, "engine touch: surface not dispatchable (ignored)");
+            false
+        }
+    };
+    Ok(EngineTouchOutcome {
+        consumed,
+        down_time_ms: used_down_time,
+    })
 }
 
 /// The concrete class of Roblox's engine `SurfaceView` peer, captured into [`view_registry`] by
