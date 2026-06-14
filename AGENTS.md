@@ -191,18 +191,28 @@ before any history-rewriting/force operation.
   derives `unifiedMemory` from the HEAP STRUCTURE (2 separate heaps: device-local 12.8 GB + host-visible 23.2 GB), NOT
   the memory-type flags; and the 64 MiB is a FIXED discrete-GPU fallback (not size-derived). Making `unifiedMemory=true`
   would require MERGING the heaps into one (blind guessing at the engine's exact check + high allocation-break risk on
-  the discrete NVIDIA) — NOT done (CLAUDE.md: don't guess, don't risk-break). Reverted the probe; `vulkan_wsi.rs` is back
-  to the clean shipped Phase-6 state. **STATUS: BOTH synthesis leads (device identity + videoMemory) are now EXHAUSTED
-  via safe first-party experiments; neither fixes the shader-pack reject.** The reject is in the engine's proprietary
-  RBXS shader-pack parse/feature-level/format-revision logic, gated on something Eclipse presents (degraded "OpenGL 3.2
-  UBO" feature level? the discrete-GPU profile? a renderer-derived format revision?) that is NOT reachable by the safe
-  levers tried. REMAINING OPTIONS, none clean first-party: (a) blindly merge Vulkan memory heaps to force
-  `unifiedMemory=true` (risky/guessing); (b) spoof the GL/Vulkan feature-level / renderer the engine derives the
-  expected shader format from (guessing + needs intercepting more GL/Vulkan queries); (c) RBXS-format/variant-selection
-  internals = REVERSE-ENGINEERING `libroblox` — OFF-POLICY per the cyber-safeguard, do NOT. NET: the shipped Phase-5/6
-  fixes (API 28 + Vulkan WSI) HOLD and got the engine to build its full Vulkan instance+surface+device pipeline; the
-  shader-pack open is a hard, well-characterized boundary needing either a non-first-party signal (how Sober tunes the
-  profile/FFlags — its runtime is closed) or info Eclipse cannot derive without RE. Detail: §6 (2026-06-13 render Phase 6).
+  the discrete NVIDIA) — initially deferred, then DONE properly (see next). **`videoMemory=64MiB` IS A HARDCODED ENGINE
+  CONSTANT — proven by exhaustively varying every input it could derive from (all reverted, tree clean):** (1)
+  intercepted `vkGetPhysicalDeviceMemoryProperties` to merge to ONE heap (allocation-safe: type INDEX/flags preserved,
+  driver allocates by index) → engine logged `unifiedMemory = TRUE` (the change took!) but `caps.videoMemory = 67108864`
+  UNCHANGED; (2) bumped ATL `ActivityManager.getMemoryClass 20→256`, `getLargeMemoryClass 60→512`, `MemoryInfo.totalMem
+  10000→8 GiB` (rebuilt overlay) → `caps.videoMemory` STILL 67108864. So `67108864` (= 2^26 = 64 MiB) is NOT derived from
+  the Vulkan memory heaps, `unifiedMemory`, `getMemoryClass`/`getLargeMemoryClass`, or `totalMem` — it is an in-engine
+  hardcoded constant. **DEFINITIVE STATUS: the ENTIRE device-profile/memory hypothesis space is now EXHAUSTIVELY
+  DISPROVEN by safe first-party experiments — provisioning, device identity (Build.* → Pixel 7 Pro), `unifiedMemory`
+  (→true), Vulkan memory heaps, Android memory-class + totalMem — NONE change the shader-pack reject.** The reject is in
+  the engine's PROPRIETARY RBXS shader-pack parse / feature-level / format-revision logic (the first 8 KB it reads:
+  `RBXS` v0x0b + an API tag = 17 GLES / 18 Vulkan + a program directory starting `default`), gated on something Eclipse
+  presents that is NOT any settable Android environment value. REMAINING OPTIONS, none clean first-party: (a) spoof the
+  GL/Vulkan feature-level / `GL_RENDERER` / GL extension string the engine derives the expected shader format from
+  (intercepting more GL/Vulkan queries = guessing, CLAUDE.md-forbidden without a confirmed mechanism); (b)
+  RBXS-format/variant-selection internals = REVERSE-ENGINEERING `libroblox` — OFF-POLICY per the cyber-safeguard, do NOT;
+  (c) a NON-first-party signal (how Sober — closed runtime, shared ATL — tunes the profile/FFlags for this exact build).
+  NET: the shipped Phase-5/6 fixes (API 28 + Vulkan WSI translation) HOLD and got the engine to build its full Vulkan
+  instance+surface+device pipeline + a GLES3 context; the shader-pack open is a HARD, exhaustively-characterized boundary
+  that cannot be passed without RE (off-policy) or a non-first-party signal. (Separately noted: ATL's memory stubs are
+  absurdly low — `totalMem=10000` BYTES, class 20/60 MB — a latent correctness bug worth fixing for OTHER reasons, but
+  NOT the render blocker; reverted here to keep the baseline clean.) Detail: §6 (2026-06-13 render Phase 6).
 - **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
