@@ -4320,6 +4320,9 @@ pub const VIEW_CLASS: &JNIStr = jni_str!("android/view/View");
 ///
 /// All three are stable, general public Android API.
 pub const MOTION_EVENT_CLASS: &JNIStr = jni_str!("android/view/MotionEvent");
+/// `android.view.KeyEvent` (slashed internal name) — keyboard input events dispatched to the engine's
+/// `RBXSurfaceView.dispatchKeyEvent` (see [`dispatch_key_to_engine_surface`]).
+pub const KEY_EVENT_CLASS: &JNIStr = jni_str!("android/view/KeyEvent");
 
 // JNI name + descriptor for View's native peer constructor, exactly as declared in `View.java`
 // (2026-06-05, line 1166): `protected native long native_constructor(Context context, AttributeSet
@@ -9533,7 +9536,7 @@ fn perform_click(env: &mut Env, handle: view_registry::ViewHandle) -> Result<boo
 
 /// A single-pointer touch action — the subset Eclipse dispatches this increment (DOWN/UP). 2026-06-05:
 /// `MOVE` and multi-touch/key are documented follow-ups. The discriminant maps to the public Android
-/// `MotionEvent` action code via [`Self::code`] (`ACTION_DOWN = 0`, `ACTION_UP = 1`).
+/// `MotionEvent` action code via [`Self::code`] (`ACTION_DOWN = 0`, `ACTION_UP = 1`, `ACTION_MOVE = 2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionAction {
     /// `MotionEvent.ACTION_DOWN` — the pointer first contacts the view (press).
@@ -9541,16 +9544,42 @@ pub enum MotionAction {
     /// `MotionEvent.ACTION_UP` — the pointer leaves the view (release); the View's own click
     /// detection fires its `OnClickListener` on an UP that completes a tap.
     Up,
+    /// `MotionEvent.ACTION_MOVE` — the pointer moved while down (a drag); carries the same downTime as
+    /// the gesture's `ACTION_DOWN`. Lets the engine track drags (scroll lists, sliders).
+    Move,
 }
 
 impl MotionAction {
     /// The public Android `MotionEvent` action code (`android.view.MotionEvent.ACTION_*`): a stable
-    /// part of the Android API. `ACTION_DOWN = 0`, `ACTION_UP = 1`. Pure (GPU/VM-free) so it is
-    /// unit-testable; passed verbatim as the `action` arg to `MotionEvent.obtain`.
+    /// part of the Android API. `ACTION_DOWN = 0`, `ACTION_UP = 1`, `ACTION_MOVE = 2`. Pure
+    /// (GPU/VM-free) so it is unit-testable; passed verbatim as the `action` arg to `MotionEvent.obtain`.
     pub fn code(self) -> jint {
         match self {
             Self::Down => 0, // MotionEvent.ACTION_DOWN
             Self::Up => 1,   // MotionEvent.ACTION_UP
+            Self::Move => 2, // MotionEvent.ACTION_MOVE
+        }
+    }
+}
+
+/// Which half of a key press a [`dispatch_key_to_engine_surface`] call carries, mapped to the public
+/// `android.view.KeyEvent` action code via [`Self::code`] (`ACTION_DOWN = 0`, `ACTION_UP = 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    /// `KeyEvent.ACTION_DOWN` — a key was pressed. Carries the typed character (`unicodeValue`).
+    Down,
+    /// `KeyEvent.ACTION_UP` — a key was released.
+    Up,
+}
+
+impl KeyAction {
+    /// The public Android `KeyEvent` action code (`android.view.KeyEvent.ACTION_*`): `ACTION_DOWN = 0`,
+    /// `ACTION_UP = 1`. Pure (GPU/VM-free), so it is unit-testable; passed verbatim as the `action` arg
+    /// to the `KeyEvent` constructor.
+    pub fn code(self) -> jint {
+        match self {
+            Self::Down => 0, // KeyEvent.ACTION_DOWN
+            Self::Up => 1,   // KeyEvent.ACTION_UP
         }
     }
 }
@@ -9877,6 +9906,139 @@ fn touch_engine_surface(
         consumed,
         down_time_ms: used_down_time,
     })
+}
+
+/// Dispatch one hardware-keyboard key event of `action` to the engine's `RBXSurfaceView` by building an
+/// `android.view.KeyEvent` and calling `dispatchKeyEvent` — the GLSurfaceView key entry the
+/// engine overrides to forward into native (`NativeGLInterface.nativePassKeyEvent`). NOT
+/// `setOnKeyListener` (an ATL no-op that discards the listener, View.java:1197) nor `onKeyUp` (a live
+/// boot showed it is absent on the view, and base `onKeyDown` is a `return false` stub).
+/// `key_code` is the Android `KEYCODE_*`, `unicode` the typed codepoint (0 for non-printing keys),
+/// `meta_state` the `META_*` modifier bitmask.
+///
+/// 2026-06-14 LOAD-BEARING: ATL's `KeyEvent.getUnicodeChar()` returns the package-private `unicodeValue`
+/// field verbatim (its keymap path is disabled), and the public constructors leave it 0 — so this sets
+/// `unicodeValue = unicode` via JNI `SetIntField`, or no character is typed even though the keyCode
+/// arrives (exactly what ATL's own GTK key driver does before dispatch).
+///
+/// Soundness mirrors [`dispatch_touch_to_engine_surface`]: null-VM guard, `attach_current_thread`,
+/// `catch_unwind`, every JNI call through [`checked`]. Returns whether `dispatchKeyEvent` consumed
+/// the event (informational), or a no-op `false` if the surface is not registered.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`]/[`FrameworkError::Jni`]/[`FrameworkError::Panicked`] as for the touch path.
+pub fn dispatch_key_to_engine_surface(
+    vm: &Vm,
+    action: KeyAction,
+    key_code: jint,
+    unicode: jint,
+    meta_state: jint,
+) -> Result<bool, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: as `dispatch_touch_to_engine_surface` — the live process VM kept alive by `&Vm`, non-null.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            key_engine_surface(env, action, key_code, unicode, meta_state)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Build a `KeyEvent` for `action`/`key_code` (with `unicodeValue = unicode` and `metaState`) and call
+/// `dispatchKeyEvent` on the engine's `RBXSurfaceView`. No-op `false` if the surface is unregistered.
+fn key_engine_surface(
+    env: &mut Env,
+    action: KeyAction,
+    key_code: jint,
+    unicode: jint,
+    meta_state: jint,
+) -> Result<bool, FrameworkError> {
+    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+        tracing::debug!(
+            ?action,
+            "engine key: RBXSurfaceView not registered yet (no-op)"
+        );
+        return Ok(false);
+    };
+    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
+        let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
+        let now = checked(env, "SystemClock.uptimeMillis", |env| {
+            env.call_static_method(
+                &system_clock,
+                jni_str!("uptimeMillis"),
+                jni_sig!("()J"),
+                &[],
+            )?
+            .j()
+        })?;
+        // new KeyEvent(downTime, eventTime, action, code, repeat=0, metaState).
+        let key_event_class = env.find_class(KEY_EVENT_CLASS)?;
+        let event = checked(env, "KeyEvent.<init>", |env| {
+            env.new_object(
+                &key_event_class,
+                jni_sig!("(JJIIII)V"),
+                &[
+                    JValue::Long(now),
+                    JValue::Long(now),
+                    JValue::Int(action.code()),
+                    JValue::Int(key_code),
+                    JValue::Int(0), // repeat
+                    JValue::Int(meta_state),
+                ],
+            )
+        })?;
+        // CRITICAL (2026-06-14): populate the package-private `unicodeValue` field so getUnicodeChar()
+        // returns the typed character (public ctors leave it 0; ATL's keymap path is disabled). JNI
+        // SetIntField bypasses Java access control. A failure is logged, not fatal.
+        if let Err(e) = checked(env, "KeyEvent.unicodeValue=", |env| {
+            // SAFETY: `unicodeValue` is an `int` field of android.view.KeyEvent (ATL KeyEvent.java),
+            // so the "I" signature paired with JavaType::Int is consistent — exactly
+            // FieldSignature::from_raw_parts' invariant; set_field re-checks the value type at runtime.
+            let int_sig = unsafe {
+                FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int))
+            };
+            env.set_field(
+                &event,
+                jni_str!("unicodeValue"),
+                &int_sig,
+                JValue::Int(unicode),
+            )
+        }) {
+            tracing::debug!(error = %e, "KeyEvent.unicodeValue set failed (char may not type)");
+        }
+        // Call dispatchKeyEvent(event) — the event carries its own action (DOWN/UP). 2026-06-14: a live
+        // boot proved RBXSurfaceView does NOT expose onKeyUp and its onKeyDown is ATL's base
+        // `return false` stub (engine not reached, consumed=false) — so the engine overrides
+        // dispatchKeyEvent (the path ATL's own GTK key driver uses, WrapperWidget.c). dispatchKeyEvent
+        // reaches that override; for a view that instead overrode onKeyDown, ATL's base dispatchKeyEvent
+        // still routes DOWN→onKeyDown (UP would then be dropped — acceptable, the DOWN carries the
+        // typed char). The action is read from the event, but `key_code` stays meaningful for callers.
+        let _ = key_code;
+        checked(env, "RBXSurfaceView.dispatchKeyEvent", |env| {
+            env.call_method(
+                global.as_obj(),
+                jni_str!("dispatchKeyEvent"),
+                jni_sig!("(Landroid/view/KeyEvent;)Z"),
+                &[JValue::Object(&event)],
+            )?
+            .z()
+        })
+    });
+    match result {
+        Ok(Some(Ok(c))) => Ok(c),
+        Ok(Some(Err(e))) => Err(e),
+        Ok(None) => Ok(false),
+        Err(e) => {
+            tracing::debug!(error = %e, "engine key: surface not dispatchable (ignored)");
+            Ok(false)
+        }
+    }
 }
 
 /// The concrete class of Roblox's engine `SurfaceView` peer, captured into [`view_registry`] by
@@ -10817,6 +10979,36 @@ mod tests {
             UPTIME_MILLIS_NAME.to_str()
         );
         assert_eq!(jni_sig!("()J").sig().to_str(), "()J");
+    }
+
+    // 2026-06-14: pin the KeyEvent action codes against the public Android API — a regression would
+    // dispatch the wrong key half (e.g. a DOWN reported as UP). Pure data, no VM.
+    #[test]
+    fn key_action_codes_match_public_android_constants() {
+        // android.view.KeyEvent.ACTION_DOWN = 0, ACTION_UP = 1 (public Android API).
+        assert_eq!(KeyAction::Down.code(), 0, "KeyEvent.ACTION_DOWN must be 0");
+        assert_eq!(KeyAction::Up.code(), 1, "KeyEvent.ACTION_UP must be 1");
+    }
+
+    // 2026-06-14: pin the key-dispatch class + the `key_engine_surface` call-site literals against the
+    // public Android API, including the package-private `unicodeValue` field name/descriptor that
+    // getUnicodeChar() reads (a transcription drift there silently breaks all typing). Mirrors
+    // motion_event_dispatch_descriptors_are_the_public_android_api.
+    #[test]
+    fn key_event_dispatch_descriptors_are_the_public_android_api() {
+        assert_eq!(KEY_EVENT_CLASS.to_str(), "android/view/KeyEvent");
+        // new KeyEvent(downTime, eventTime, action, code, repeat, metaState).
+        assert_eq!(jni_sig!("(JJIIII)V").sig().to_str(), "(JJIIII)V");
+        // View.dispatchKeyEvent(KeyEvent) → boolean (the engine's overridden key entry; a live boot
+        // showed onKeyUp is absent and onKeyDown is the base stub, so dispatchKeyEvent is the route).
+        assert_eq!(jni_str!("dispatchKeyEvent").to_str(), "dispatchKeyEvent");
+        assert_eq!(
+            jni_sig!("(Landroid/view/KeyEvent;)Z").sig().to_str(),
+            "(Landroid/view/KeyEvent;)Z"
+        );
+        // KeyEvent.unicodeValue : int — the field getUnicodeChar() returns verbatim (ATL keymap off).
+        assert_eq!(jni_str!("unicodeValue").to_str(), "unicodeValue");
+        assert_eq!(INT_SIG.to_str(), "I");
     }
 
     #[test]
