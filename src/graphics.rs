@@ -133,8 +133,10 @@ struct GameWindow<'vm> {
     handoff_at: Option<std::time::Instant>,
     /// 2026-06-14 — set once the env-gated synthetic engine tap (stage 0) has fired, so it fires once.
     engine_synthetic_tap_done: bool,
-    /// 2026-06-14 — set once the env-gated synthetic type-test (stage 1) has fired, so it fires once.
+    /// 2026-06-14 — set once the env-gated synthetic type-test STAGE 1 (focus tap) has fired.
     engine_synthetic_type_done: bool,
+    /// 2026-06-14 — set once the env-gated synthetic type-test STAGE 2 (the actual typing) has fired.
+    engine_synthetic_typed_done: bool,
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
     /// keys are pressed/released, and passed as the `metaState` of each engine `KeyEvent`.
     key_meta_state: i32,
@@ -640,6 +642,20 @@ impl GameWindow<'_> {
             .map(|c| c as i32)
             .unwrap_or(0);
         let Some(vm) = self.vm else { return };
+        // Text-input path: route a printable char or backspace DOWN into the engine's focused EditText
+        // (e.g. the login username/password fields). If a field consumed it, do NOT also forward the
+        // key to the game surface. UP/non-printing keys with no active field fall through to the surface.
+        if pressed {
+            let backspace = key_code == 67; // KEYCODE_DEL
+            let printable =
+                unicode != 0 && char::from_u32(unicode as u32).is_some_and(|c| !c.is_control());
+            if (printable || backspace)
+                && crate::framework::type_into_active_text_field(vm, unicode, backspace)
+            {
+                tracing::info!(pressed, "engine key → active text field (typed)");
+                return;
+            }
+        }
         let action = if pressed {
             crate::framework::KeyAction::Down
         } else {
@@ -803,46 +819,41 @@ impl GameWindow<'_> {
             }
         }
 
-        // Stage 1: focus a field with a tap, then type a test string through the key path. The test
-        // string is owner-supplied via env (use a throwaway value, never a real credential).
+        // Stage 1: tap to FOCUS a field (ECLIPSE_SYNTHETIC_TYPE="x,y:text" → tap x,y). The engine then
+        // (asynchronously) focuses the EditText + polls its getText(), which sets the active text field.
         if !self.engine_synthetic_type_done && elapsed >= std::time::Duration::from_secs(12) {
             self.engine_synthetic_type_done = true;
-            if let Some((x, y, text)) =
+            if let Some((x, y, _text)) =
                 std::env::var_os("ECLIPSE_SYNTHETIC_TYPE").and_then(|s| parse_xy_text(&s))
             {
-                tracing::info!(
-                    x,
-                    y,
-                    chars = text.chars().count(),
-                    "synthetic TYPE (stage 1): tap-to-focus then type a test string"
-                );
+                tracing::info!(x, y, "synthetic TYPE (stage 1): tap-to-focus the field");
                 self.cursor = Some((x, y));
                 self.engine_primary_press();
                 self.engine_primary_release();
+            }
+        }
+
+        // Stage 2: a few seconds after focusing (so the engine has set the active field via getText),
+        // type the test string through the TEXT-FIELD path (type_into_active_text_field), then wake the
+        // engine loopers so it re-polls getText() and re-renders the field with the new text.
+        if !self.engine_synthetic_typed_done && elapsed >= std::time::Duration::from_secs(16) {
+            self.engine_synthetic_typed_done = true;
+            if let Some((_x, _y, text)) =
+                std::env::var_os("ECLIPSE_SYNTHETIC_TYPE").and_then(|s| parse_xy_text(&s))
+            {
+                tracing::info!(
+                    chars = text.chars().count(),
+                    "synthetic TYPE (stage 2): typing into the active text field"
+                );
                 if let Some(vm) = self.vm {
                     for ch in text.chars() {
-                        for action in [
-                            crate::framework::KeyAction::Down,
-                            crate::framework::KeyAction::Up,
-                        ] {
-                            // keycode UNKNOWN (0); the char rides on the KeyEvent unicodeValue.
-                            match crate::framework::dispatch_key_to_engine_surface(
-                                vm, action, 0, ch as i32, 0,
-                            ) {
-                                Ok(consumed) => {
-                                    tracing::info!(
-                                        ?action,
-                                        consumed,
-                                        "synthetic TYPE key → dispatchKeyEvent"
-                                    )
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "synthetic TYPE key dispatch failed")
-                                }
-                            }
-                        }
+                        let handled =
+                            crate::framework::type_into_active_text_field(vm, ch as i32, false);
+                        tracing::info!(handled, "synthetic TYPE char → active text field");
                     }
                 }
+                // Wake the engine's parked loopers so it re-polls getText() + re-renders the field.
+                crate::loader::ndk_registry::wake_all_loopers();
             }
         }
     }
@@ -874,6 +885,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         handoff_at: None,
         engine_synthetic_tap_done: false,
         engine_synthetic_type_done: false,
+        engine_synthetic_typed_done: false,
         key_meta_state: 0,
     };
     event_loop
