@@ -247,6 +247,16 @@ pub unsafe extern "system" fn eclipse_vk_get_instance_proc_addr(
         });
     }
     let host_gipa = host_get_instance_proc_addr()?;
+    // 2026-06-14: the text-overlay present-path interception (`vkCreateDevice` / `vkGetDeviceProcAddr`,
+    // which in turn yields `vkQueuePresentKHR` etc.). Kept in `vk_overlay` so this module stays the WSI
+    // surface/instance layer; returns `Some` only for the names it wraps.
+    // SAFETY: `name`/`host_gipa`/`instance` are valid per this fn's contract; `vk_overlay` only reads the
+    // name and forwards `(instance, name)` to `host_gipa` to capture the host command.
+    if let Some(shim) =
+        unsafe { super::vk_overlay::intercept_instance_proc(instance, name, host_gipa) }
+    {
+        return shim;
+    }
     // 2026-06-14: intercept the surface-capabilities queries — cache the host version and return our shim
     // that replaces Wayland's UNDEFINED currentExtent (0xFFFFFFFF) with the concrete window extent, so the
     // engine (Android-only, expects a fixed surface size) stops skipping framebuffer creation.
