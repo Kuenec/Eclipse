@@ -7455,16 +7455,16 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
     // pure [`apply_text_edit`]; capture the result to notify watchers OUTSIDE the lock (an engine
     // TextWatcher re-enters the registry via getText → with_view, which would deadlock).
     let edited = view_registry::with_view(widget, |v| {
-        let (new, start, before, count) =
-            apply_text_edit(v.text.as_deref().unwrap_or_default(), unicode, backspace);
+        let old = v.text.clone().unwrap_or_default();
+        let (new, start, before, count) = apply_text_edit(&old, unicode, backspace);
         v.text = Some(new.clone());
-        (new, start, before, count)
+        (old, new, start, before, count)
     });
     match edited {
-        Ok((new_text, start, before, count)) => {
+        Ok((old_text, new_text, start, before, count)) => {
             // The engine observes the field via a TextWatcher (it does NOT poll getText to render), so
-            // fire onTextChanged with the exact edit delta so it applies the change + re-renders.
-            fire_text_watchers(vm, widget, &new_text, start, before, count);
+            // fire the full before→on→after contract with the exact edit delta so it re-renders.
+            fire_text_watchers(vm, widget, &old_text, &new_text, start, before, count);
             true
         }
         Err(_) => {
@@ -7484,6 +7484,7 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
 fn fire_text_watchers(
     vm: &Vm,
     widget: jlong,
+    old_text: &str,
     new_text: &str,
     start: jint,
     before: jint,
@@ -7515,6 +7516,7 @@ fn fire_text_watchers(
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
             let s = env.new_string(new_text)?;
+            let old_s = env.new_string(old_text)?;
             // Build an Editable (SpannableStringBuilder) holding the new text for afterTextChanged — many
             // TextWatchers (incl. the engine's) update the model/display in afterTextChanged, not just
             // onTextChanged. Built once; reused per watcher. None on a class/ctor error (afterTextChanged
@@ -7533,6 +7535,26 @@ fn fire_text_watchers(
                 // SAFETY: see the snapshot note above — `*ptr` is a live global ref; a non-owning view
                 // (`from_raw`'s `&Env` only binds the lifetime, it does not retain a borrow of `env`).
                 let watcher = unsafe { JObject::from_raw(env, *ptr) };
+                // TextWatcher.beforeTextChanged(CharSequence s=OLD text, int start, int count, int after):
+                // `count` old chars at `start` are about to be replaced by `after` new chars. The full
+                // contract (before→on→after) is what a real EditText fires; the engine's display logic may
+                // need the before-state. Maps our delta: count = `before` (replaced), after = `count` (inserted).
+                if let Err(e) = checked(env, "TextWatcher.beforeTextChanged", |env| {
+                    env.call_method(
+                        &watcher,
+                        jni_str!("beforeTextChanged"),
+                        jni_sig!("(Ljava/lang/CharSequence;III)V"),
+                        &[
+                            JValue::Object(&old_s),
+                            JValue::Int(start),
+                            JValue::Int(before),
+                            JValue::Int(count),
+                        ],
+                    )?
+                    .v()
+                }) {
+                    tracing::debug!(error = %e, "TextWatcher.beforeTextChanged threw (cleared, continuing)");
+                }
                 // TextWatcher.onTextChanged(CharSequence s, int start, int before, int count): `count`
                 // chars at `start` just replaced `before` chars (the exact single-keystroke delta).
                 if let Err(e) = checked(env, "TextWatcher.onTextChanged", |env| {
