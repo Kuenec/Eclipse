@@ -125,6 +125,32 @@ fn draw_text_onto_rgba(buf: &mut [u8], w: u32, h: u32, text: &str) {
     let baseline_y = (h as f32 - scale) * 0.5 + ascent;
     let mut pen_x = 10.0f32; // left inset
     for ch in text.chars() {
+        // Masked-password dot: draw a vertically-centered filled circle (the `•` GLYPH renders too high
+        // in the EM box). Keeps the password masked while looking like a real password field.
+        if ch == '\u{2022}' {
+            let r = (scale * 0.13).max(2.0);
+            let cxi = (pen_x + r) as i32;
+            let cyi = (h as f32 * 0.5) as i32;
+            let ri = r as i32;
+            for dy in -ri..=ri {
+                for dx in -ri..=ri {
+                    if (dx * dx + dy * dy) as f32 <= r * r {
+                        let px = cxi + dx;
+                        let py = cyi + dy;
+                        if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                            let idx = ((py as u32 * w + px as u32) * 4) as usize;
+                            if idx + 2 < buf.len() {
+                                buf[idx] = 255;
+                                buf[idx + 1] = 255;
+                                buf[idx + 2] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+            pen_x += r * 3.0; // dot spacing
+            continue;
+        }
         let gid = scaled.glyph_id(ch);
         let advance = scaled.h_advance(gid);
         let glyph = gid.with_scale_and_position(scale, ab_glyph::point(pen_x, baseline_y));
