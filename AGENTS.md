@@ -3959,7 +3959,7 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 
   **Full login form now works + is safe:** username renders the typed text → detected → advances to password (resolved the real RobloxTest account); password renders masked dots → text delivered to the engine. No defocus, no tripling, 60fps. The synthetic harness gained a stage-4 (`ECLIPSE_SYNTHETIC_TYPE2`) that types into the field focused after Next.
 
-  **Verification:** gate green (fmt / clippy `-D warnings` / 578 tests / release). Autonomous PNG proofs: username "robloxtest" visible; Next → password screen (RobloxTest); password "secret123" → `••••••••`. **Remaining (non-blocking):** dots sit slightly high in the field (cosmetic baseline); caret/blink; actual login completion (real password + the LAN-IP/network path); audio; scroll.
+  **Verification:** gate green (fmt / clippy `-D warnings` / 578 tests / release). Autonomous PNG proofs: username "robloxtest" visible; Next → password screen (RobloxTest); password "secret123" → `••••••••`. **Remaining (non-blocking):** dots sit slightly high in the field (cosmetic baseline); actual login completion (real password + the LAN-IP/network path); audio; scroll. (A blinking caret was added — `robloxtest|`.)
 
   *Files:* `src/framework.rs` (`textbox_input_type` + read `textInputType` in `query_textbox_geometry`), `src/loader/vk_overlay.rs` (mask `type==5` → `•`; `ECLIPSE_VK_FPS` present-rate log), `src/graphics.rs` (stage-4 password-type synthetic), `AGENTS.md`.
 
