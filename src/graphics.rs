@@ -133,6 +133,9 @@ struct GameWindow<'vm> {
     handoff_at: Option<std::time::Instant>,
     /// 2026-06-14 — set once the env-gated synthetic engine tap has fired, so it fires at most once.
     engine_synthetic_tap_done: bool,
+    /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
+    /// keys are pressed/released, and passed as the `metaState` of each engine `KeyEvent`.
+    key_meta_state: i32,
 }
 
 impl ApplicationHandler for GameWindow<'_> {
@@ -319,6 +322,11 @@ impl ApplicationHandler for GameWindow<'_> {
             // Multi-touch / ACTION_MOVE / key / NDK-AInputQueue dispatch is the documented follow-up.
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some((position.x as f32, position.y as f32));
+                // Engine mode: while the primary button is down, a move is a DRAG — forward
+                // ACTION_MOVE so the engine tracks it (scroll lists, sliders). No-op otherwise.
+                if self.handed_off {
+                    self.engine_pointer_move();
+                }
             }
             WindowEvent::MouseInput {
                 state,
@@ -338,6 +346,11 @@ impl ApplicationHandler for GameWindow<'_> {
                         ElementState::Released => self.handle_primary_release(),
                     }
                 }
+            }
+            // 2026-06-14: keyboard — forward keys to the engine's RBXSurfaceView.dispatchKeyEvent
+            // (engine mode only; the pre-handoff Java-view apps have no key path here).
+            WindowEvent::KeyboardInput { event, .. } if self.handed_off => {
+                self.engine_key(&event);
             }
             _ => {}
         }
@@ -568,6 +581,88 @@ impl GameWindow<'_> {
         }
     }
 
+    /// 2026-06-14 — ENGINE-MODE pointer drag: while a primary press is in flight, dispatch an
+    /// `ACTION_MOVE` to the engine's `RBXSurfaceView` at the new cursor position, reusing the press's
+    /// downTime so the engine groups it into the same gesture (drag-scroll, sliders). No-op when no
+    /// press is in flight (a bare hover — a touchscreen-modeled engine does not expect hover events).
+    /// Quiet on success (drags fire at pointer rate); only a dispatch error is logged.
+    fn engine_pointer_move(&mut self) {
+        let Some(down_time) = self.engine_tap_downtime else {
+            return;
+        };
+        let Some(vm) = self.vm else { return };
+        let Some((px, py)) = self.cursor else { return };
+        if let Err(e) = crate::framework::dispatch_touch_to_engine_surface(
+            vm,
+            crate::framework::MotionAction::Move,
+            px,
+            py,
+            Some(down_time),
+        ) {
+            tracing::warn!(error = %e, "engine pointer ACTION_MOVE dispatch failed (ignored)");
+        }
+    }
+
+    /// 2026-06-14 — ENGINE-MODE keyboard: forward a winit key event to the engine's `RBXSurfaceView`
+    /// via `dispatchKeyEvent`. Modifier keys (shift/ctrl/alt) update the running meta-state and are
+    /// not dispatched as standalone keys. The typed character (winit's already layout/shift-resolved
+    /// `text`) rides on the `KeyEvent.unicodeValue` so the engine's `getUnicodeChar()` yields it. Logs
+    /// only `consumed` + the press/release half — NEVER the key or character (do not log keystrokes/
+    /// credentials).
+    fn engine_key(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        let pressed = event.state == ElementState::Pressed;
+        // Modifiers fire as their own events: maintain the meta bitmask; do not dispatch them as keys.
+        let meta_bit = match &event.logical_key {
+            Key::Named(NamedKey::Shift) => Some(0x1), // META_SHIFT_ON
+            Key::Named(NamedKey::Control) => Some(0x1000), // META_CTRL_ON
+            Key::Named(NamedKey::Alt) => Some(0x02),  // META_ALT_ON
+            _ => None,
+        };
+        if let Some(bit) = meta_bit {
+            if pressed {
+                self.key_meta_state |= bit;
+            } else {
+                self.key_meta_state &= !bit;
+            }
+            return;
+        }
+        let Some(key_code) = winit_keycode(&event.logical_key) else {
+            return; // no clean Android mapping (e.g. dead/unidentified key) — dropped
+        };
+        // winit's resolved printable text → Unicode codepoint (0 for non-printing keys).
+        let unicode = event
+            .text
+            .as_ref()
+            .and_then(|s| s.chars().next())
+            .map(|c| c as i32)
+            .unwrap_or(0);
+        let Some(vm) = self.vm else { return };
+        let action = if pressed {
+            crate::framework::KeyAction::Down
+        } else {
+            crate::framework::KeyAction::Up
+        };
+        match crate::framework::dispatch_key_to_engine_surface(
+            vm,
+            action,
+            key_code,
+            unicode,
+            self.key_meta_state,
+        ) {
+            Ok(consumed) => {
+                tracing::info!(
+                    pressed,
+                    consumed,
+                    "engine key → RBXSurfaceView.dispatchKeyEvent (key/char not logged)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "engine key dispatch failed (ignored)");
+            }
+        }
+    }
+
     /// Drive each custom View's `onDraw(Canvas)` into an Eclipse Pixmap and hand the drawn canvases to
     /// the renderer to composite this frame (the DRAW CASCADE, 2026-06-05).
     ///
@@ -716,6 +811,33 @@ impl GameWindow<'_> {
         self.cursor = Some((x, y));
         self.engine_primary_press();
         self.engine_primary_release();
+
+        // Optional synthetic KEY (env `ECLIPSE_SYNTHETIC_KEY`): drive a hardcoded 'a' DOWN+UP through
+        // the engine key path to confirm onKeyDown/onKeyUp is REACHABLE + consumed on a live boot
+        // (resolves whether RBXSurfaceView overrides onKeyDown vs needs dispatchKeyEvent). The key is a
+        // fixed test char, never a credential, so logging it is safe. Real typing is the owner's test.
+        if let Some(vm) = self
+            .vm
+            .filter(|_| std::env::var_os("ECLIPSE_SYNTHETIC_KEY").is_some())
+        {
+            for action in [
+                crate::framework::KeyAction::Down,
+                crate::framework::KeyAction::Up,
+            ] {
+                match crate::framework::dispatch_key_to_engine_surface(
+                    vm, action, 29, 'a' as i32, 0,
+                ) {
+                    Ok(consumed) => {
+                        tracing::info!(
+                            ?action,
+                            consumed,
+                            "synthetic KEY 'a' → RBXSurfaceView.dispatchKeyEvent"
+                        )
+                    }
+                    Err(e) => tracing::warn!(error = %e, "synthetic KEY dispatch failed"),
+                }
+            }
+        }
     }
 }
 
@@ -744,6 +866,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_tap_downtime: None,
         handoff_at: None,
         engine_synthetic_tap_done: false,
+        key_meta_state: 0,
     };
     event_loop
         .run_app(&mut app)
@@ -1382,6 +1505,46 @@ fn should_complete_tap(
         (Some(p), Some(r)) if p == r => Some(p),
         _ => None,
     }
+}
+
+/// 2026-06-14 — map a winit logical key to the Android `KEYCODE_*` for the keys needed to type
+/// credentials and edit text, or `None` for keys with no clean mapping (dropped). The typed character
+/// itself rides on the `KeyEvent.unicodeValue` (winit's resolved `text`), so a `KEYCODE_UNKNOWN` (0)
+/// printable still types. Values are the public `android.view.KeyEvent.KEYCODE_*` constants. Pure
+/// (VM/GPU-free) so it is unit-testable without fabricating a winit event.
+fn winit_keycode(key: &winit::keyboard::Key) -> Option<i32> {
+    use winit::keyboard::{Key, NamedKey};
+    Some(match key {
+        Key::Character(s) => {
+            let c = s.chars().next()?;
+            match c {
+                'a'..='z' => 29 + (c as i32 - 'a' as i32), // KEYCODE_A=29 .. KEYCODE_Z=54
+                'A'..='Z' => 29 + (c as i32 - 'A' as i32),
+                '0'..='9' => 7 + (c as i32 - '0' as i32), // KEYCODE_0=7 .. KEYCODE_9=16
+                ' ' => 62,                                // SPACE
+                '.' => 56,                                // PERIOD
+                ',' => 55,                                // COMMA
+                '@' => 77,                                // AT
+                '-' | '_' => 69,                          // MINUS (char comes via unicodeValue)
+                '+' | '=' => 70,                          // EQUALS
+                '/' => 76,                                // SLASH
+                _ => 0, // KEYCODE_UNKNOWN — still types via unicode
+            }
+        }
+        Key::Named(NamedKey::Space) => 62,      // SPACE
+        Key::Named(NamedKey::Backspace) => 67,  // DEL
+        Key::Named(NamedKey::Enter) => 66,      // ENTER
+        Key::Named(NamedKey::Tab) => 61,        // TAB
+        Key::Named(NamedKey::Escape) => 111,    // ESCAPE
+        Key::Named(NamedKey::Delete) => 112,    // FORWARD_DEL
+        Key::Named(NamedKey::ArrowLeft) => 21,  // DPAD_LEFT
+        Key::Named(NamedKey::ArrowRight) => 22, // DPAD_RIGHT
+        Key::Named(NamedKey::ArrowUp) => 19,    // DPAD_UP
+        Key::Named(NamedKey::ArrowDown) => 20,  // DPAD_DOWN
+        Key::Named(NamedKey::Home) => 122,      // MOVE_HOME
+        Key::Named(NamedKey::End) => 123,       // MOVE_END
+        _ => return None,
+    })
 }
 
 /// Convert a top-left-origin pixel rect into 6 [`QuadVertex`]es (two triangles) in Vulkan NDC.
@@ -5223,6 +5386,32 @@ mod tests {
         }];
         let chosen = choose_surface_format(&formats).expect("a format exists");
         assert_eq!(chosen.format, vk::Format::R8G8B8A8_UNORM);
+    }
+
+    // 2026-06-14: pin the winit→Android keycode mapping for the keys needed to type credentials. A
+    // regression would send the wrong KEYCODE_* (the engine may key behavior off the code for editing
+    // keys). Pure data (no VM/window), so unit-testable in-harness. Values are public KeyEvent.KEYCODE_*.
+    #[test]
+    fn winit_keycode_maps_credential_keys_to_android_keycodes() {
+        use winit::keyboard::{Key, NamedKey};
+        // Letters → KEYCODE_A(29)..KEYCODE_Z(54), case-insensitive (the char rides on unicodeValue).
+        assert_eq!(winit_keycode(&Key::Character("a".into())), Some(29));
+        assert_eq!(winit_keycode(&Key::Character("z".into())), Some(54));
+        assert_eq!(winit_keycode(&Key::Character("A".into())), Some(29));
+        // Digits → KEYCODE_0(7)..KEYCODE_9(16).
+        assert_eq!(winit_keycode(&Key::Character("0".into())), Some(7));
+        assert_eq!(winit_keycode(&Key::Character("9".into())), Some(16));
+        // Login punctuation: '@' → KEYCODE_AT(77), '.' → KEYCODE_PERIOD(56).
+        assert_eq!(winit_keycode(&Key::Character("@".into())), Some(77));
+        assert_eq!(winit_keycode(&Key::Character(".".into())), Some(56));
+        // Named editing keys: Backspace → KEYCODE_DEL(67), Enter → ENTER(66), Space → SPACE(62).
+        assert_eq!(winit_keycode(&Key::Named(NamedKey::Backspace)), Some(67));
+        assert_eq!(winit_keycode(&Key::Named(NamedKey::Enter)), Some(66));
+        assert_eq!(winit_keycode(&Key::Named(NamedKey::Space)), Some(62));
+        // An unmapped printable still types via unicodeValue (KEYCODE_UNKNOWN = 0, not dropped).
+        assert_eq!(winit_keycode(&Key::Character("#".into())), Some(0));
+        // A key with no mapping at all → None (dropped, not sent as keycode 0).
+        assert_eq!(winit_keycode(&Key::Named(NamedKey::F1)), None);
     }
 
     #[test]
