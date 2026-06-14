@@ -3338,22 +3338,62 @@ unsafe extern "C" fn eclipse_aasset_getlength(asset: *mut c_void) -> libc::off_t
     }
 }
 
-/// `int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength)` — get a file
-/// descriptor for direct asset access. **sound-stub:** Eclipse serves assets from in-memory bytes
-/// (read from the APK zip), so there is no backing file descriptor for the asset region. The NDK
-/// contract is to return `< 0` "if direct fd access is not possible (for example, if the asset is
-/// compressed)" — Eclipse returns `-1`, the documented sound failure, so callers fall back to
-/// `AAsset_getBuffer`/`AAsset_read` (which Eclipse serves with real bytes). NOT a fake fd.
+/// `int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength)` — get a real file
+/// descriptor for direct asset access. 2026-06-14: real Android returns the APK fd + the uncompressed
+/// asset's offset here so a caller can `mmap` it directly; Roblox's engine uses THIS path for the large
+/// (STORED, 8–18 MB) shader packs and treats a `< 0` return as `Error opening shader pack <path>`
+/// rather than falling back to `AAsset_getBuffer`. Eclipse holds the asset's decompressed bytes in
+/// memory, so back them with an anonymous in-memory file (`memfd`) and return its fd + `[0, len)`. The
+/// caller owns and closes the returned fd. Falls back to the documented `-1` (→ buffer path) only if
+/// the handle is stale or a syscall fails.
 ///
 /// # Safety
 /// `asset` must be an `AAsset*` from an Eclipse asset native; `out_start`/`out_length` are null or
-/// valid `off_t*`. This native writes neither (it returns the failure sentinel), so they are unused.
+/// valid `off_t*` (written only on success). The returned fd is owned by the caller.
 unsafe extern "C" fn eclipse_aasset_openfiledescriptor(
-    _asset: *mut c_void,
-    _out_start: *mut libc::off_t,
-    _out_length: *mut libc::off_t,
+    asset: *mut c_void,
+    out_start: *mut libc::off_t,
+    out_length: *mut libc::off_t,
 ) -> c_int {
-    -1 // direct fd access not possible (in-memory asset) — bionic's documented "< 0" → buffer fallback
+    let bytes = match ndk_registry::assets().with(ptr_to_handle(asset), |a| a.bytes.clone()) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+    let len = bytes.len();
+    // SAFETY: 2026-06-14 — `memfd_create` with a valid NUL-terminated name + 0 flags returns a fresh
+    // owned fd or -1; on success we size it (`ftruncate`), write exactly `len` bytes from the owned
+    // slice, rewind to 0, and hand the fd to the caller (its contract). Every libc call is checked;
+    // any failure closes the fd (if opened) and returns the documented -1 (caller uses the buffer
+    // path). `out_start`/`out_length` are written only via the null-checked pointers.
+    unsafe {
+        let fd = libc::memfd_create(c"eclipse-asset".as_ptr(), 0);
+        if fd < 0 {
+            return -1;
+        }
+        if len > 0 {
+            if libc::ftruncate(fd, len as libc::off_t) < 0 {
+                libc::close(fd);
+                return -1;
+            }
+            let mut off = 0usize;
+            while off < len {
+                let n = libc::write(fd, bytes.as_ptr().add(off) as *const c_void, len - off);
+                if n <= 0 {
+                    libc::close(fd);
+                    return -1;
+                }
+                off += n as usize;
+            }
+            libc::lseek(fd, 0, libc::SEEK_SET);
+        }
+        if !out_start.is_null() {
+            *out_start = 0;
+        }
+        if !out_length.is_null() {
+            *out_length = len as libc::off_t;
+        }
+        fd
+    }
 }
 
 // ---- AConfiguration (9) — MINIMAL-CORRECT: real getters over Eclipse device values --------------
@@ -6251,23 +6291,45 @@ mod tests {
     }
 
     #[test]
-    fn aasset_openfiledescriptor_reports_no_direct_fd() {
-        // Eclipse serves in-memory assets → no backing fd → the documented "< 0" (buffer fallback).
+    fn aasset_openfiledescriptor_serves_a_real_fd_with_exact_bytes() {
+        // 2026-06-14: AAsset_openFileDescriptor must return a REAL, readable fd backing the asset
+        // bytes (Roblox's engine mmaps this path for the large STORED shader packs and treats a
+        // `< 0` return as "Error opening shader pack"). Regression guard: fd >= 0, out_start == 0,
+        // out_length == len, and the fd's contents are byte-exact. A regression to the old `-1`
+        // stub — or any wrong-bytes/offset bug — fails this test.
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
         let s = ndk_registry::assets()
             .insert(AssetState {
-                bytes: Box::from(&b"x"[..]),
+                bytes: payload.clone().into_boxed_slice(),
                 cursor: 0,
             })
             .expect("insert asset");
         let asset = handle_to_ptr::<c_void>(s);
-        // SAFETY: `asset` is live; out-params are null (the native returns the failure sentinel).
-        let fd = unsafe {
-            eclipse_aasset_openfiledescriptor(asset, std::ptr::null_mut(), std::ptr::null_mut())
-        };
-        assert!(
-            fd < 0,
-            "no direct fd access for an in-memory asset (bionic < 0)"
-        );
+        let mut start: libc::off_t = -1;
+        let mut length: libc::off_t = -1;
+        // SAFETY: `asset` is live; both out-params are valid `off_t*` written only on success.
+        let fd = unsafe { eclipse_aasset_openfiledescriptor(asset, &mut start, &mut length) };
+        assert!(fd >= 0, "a real fd must back the in-memory asset");
+        assert_eq!(start, 0, "asset begins at offset 0 in the backing memfd");
+        assert_eq!(length, payload.len() as libc::off_t, "length is the asset len");
+        // Read the fd's full contents back and require byte-exactness with the source asset.
+        let mut got = vec![0u8; payload.len()];
+        let mut off = 0usize;
+        while off < got.len() {
+            // SAFETY: `fd` is live and owned here; `got[off..]` is a valid writable slice.
+            let n = unsafe {
+                libc::read(
+                    fd,
+                    got.as_mut_ptr().add(off) as *mut c_void,
+                    got.len() - off,
+                )
+            };
+            assert!(n > 0, "fd must read back the full asset");
+            off += n as usize;
+        }
+        assert_eq!(got, payload, "fd contents must be byte-exact with the asset");
+        // SAFETY: `fd` is the live owned descriptor we received; close it once.
+        unsafe { libc::close(fd) };
         ndk_registry::assets().remove(s).ok();
     }
 
