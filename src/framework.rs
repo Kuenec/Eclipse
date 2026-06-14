@@ -7377,9 +7377,20 @@ pub fn active_text_field_text() -> Option<String> {
 /// text where the field actually is (the login layout drifts, so a fixed rect goes stale). 2026-06-14.
 static TEXTBOX_GEOM: std::sync::Mutex<Option<(i32, i32, u32, u32)>> = std::sync::Mutex::new(None);
 
+/// The focused textbox's `NativeTextBoxInfo.textInputType` (an engine enum), cached alongside the
+/// geometry. Lets the overlay MASK secure fields (a password renders as `•`, never plaintext). `i32::MIN`
+/// = unknown/no field. 2026-06-14.
+static TEXTBOX_INPUT_TYPE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MIN);
+
 /// The cached focused-textbox geometry `(x, y, w, h)`, or `None`.
 pub fn textbox_geometry() -> Option<(i32, i32, u32, u32)> {
     TEXTBOX_GEOM.lock().ok().and_then(|g| *g)
+}
+
+/// The cached focused-textbox `textInputType` (engine enum), or `i32::MIN` if no field is focused.
+pub fn textbox_input_type() -> i32 {
+    TEXTBOX_INPUT_TYPE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Query the engine for the focused textbox's geometry (`NativeGLInterface.nativeGetTextBoxInfo` →
@@ -7472,9 +7483,51 @@ pub fn query_textbox_geometry(vm: &Vm) {
             ) else {
                 return;
             };
+            // Read the `int` textInputType (for password masking): getDeclaredField → setAccessible → getInt.
+            let input_type = (|| -> Option<i32> {
+                let jname = env.new_string("textInputType").ok()?;
+                let field = checked(env, "Class.getDeclaredField", |env| {
+                    env.call_method(
+                        &info_cls,
+                        jni_str!("getDeclaredField"),
+                        jni_sig!("(Ljava/lang/String;)Ljava/lang/reflect/Field;"),
+                        &[JValue::Object(&jname)],
+                    )?
+                    .l()
+                })
+                .ok()?;
+                let _ = checked(env, "Field.setAccessible", |env| {
+                    env.call_method(
+                        &field,
+                        jni_str!("setAccessible"),
+                        jni_sig!("(Z)V"),
+                        &[JValue::Bool(true)],
+                    )?
+                    .v()
+                });
+                checked(env, "Field.getInt", |env| {
+                    env.call_method(
+                        &field,
+                        jni_str!("getInt"),
+                        jni_sig!("(Ljava/lang/Object;)I"),
+                        &[JValue::Object(&info)],
+                    )?
+                    .i()
+                })
+                .ok()
+            })();
             if w > 0.0 && h > 0.0 {
                 if let Ok(mut g) = TEXTBOX_GEOM.lock() {
                     *g = Some((x as i32, y as i32, w as u32, h as u32));
+                }
+                if let Some(it) = input_type {
+                    TEXTBOX_INPUT_TYPE.store(it, std::sync::atomic::Ordering::Relaxed);
+                    // Log once per distinct value (so the username vs password input-type values surface).
+                    static LAST: std::sync::atomic::AtomicI32 =
+                        std::sync::atomic::AtomicI32::new(i32::MIN);
+                    if LAST.swap(it, std::sync::atomic::Ordering::Relaxed) != it {
+                        tracing::info!(text_input_type = it, "focused textbox input type");
+                    }
                 }
             }
         }));
