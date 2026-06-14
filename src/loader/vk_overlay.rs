@@ -41,6 +41,73 @@ fn overlay_font() -> Option<&'static FontVec> {
     .as_ref()
 }
 
+/// Encode `rgba` (`w`×`h`, row-major `R8G8B8A8`) as a minimal **uncompressed** PNG — a self-contained,
+/// dependency-free image encoder (signature + IHDR + one IDAT of a zlib stream using stored/uncompressed
+/// DEFLATE blocks + IEND, with CRC32 + Adler32). Used by the field probe to write a compositor-independent
+/// screenshot the dev host can view (the buried Eclipse window can't be captured with `grim`). Not for
+/// shipping pixels — bytes are bigger than a compressed PNG, but it adds zero deps. 2026-06-14.
+fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    fn crc32(buf: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in buf {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn adler32(buf: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &x in buf {
+            a = (a + u32::from(x)) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+    fn chunk(out: &mut Vec<u8>, typ: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(typ);
+        out.extend_from_slice(data);
+        let mut crc_in = typ.to_vec();
+        crc_in.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
+    }
+    let mut out = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]; // PNG signature
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, color type 6 (RGBA), deflate, no filter, no interlace
+    chunk(&mut out, b"IHDR", &ihdr);
+    // Raw scanlines, each prefixed with filter byte 0 (none).
+    let mut raw = Vec::with_capacity((w * h * 4 + h) as usize);
+    for y in 0..h as usize {
+        raw.push(0);
+        let row = &rgba[y * w as usize * 4..(y + 1) * w as usize * 4];
+        raw.extend_from_slice(row);
+    }
+    // zlib stream: header + stored DEFLATE blocks (<=65535 each) + Adler32 of the raw data.
+    let mut zlib = vec![0x78u8, 0x01];
+    let mut i = 0;
+    while i < raw.len() {
+        let block = (raw.len() - i).min(65535);
+        let bfinal = u8::from(i + block >= raw.len());
+        zlib.push(bfinal); // BFINAL bit, BTYPE=00 (stored)
+        zlib.extend_from_slice(&(block as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(block as u16)).to_le_bytes());
+        zlib.extend_from_slice(&raw[i..i + block]);
+        i += block;
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+    chunk(&mut out, b"IDAT", &zlib);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
 /// Alpha-blend `text` (white) onto the RGBA `buf` (`w`×`h`, row-major `R8G8B8A8`) — left-aligned,
 /// vertically centered, at a scale that fits the field height. This is how the overlay draws host-typed
 /// text onto the engine's actual field pixels (preserving its background/border). No-op if no font / no
@@ -81,12 +148,13 @@ fn draw_text_onto_rgba(buf: &mut [u8], w: u32, h: u32, text: &str) {
     }
 }
 
-/// Whether the present-path text overlay is enabled (env `ECLIPSE_VK_OVERLAY`, cached). OFF by default:
-/// the capture shims still run (cheap), but `present_with_overlay` skips the draw and forwards unmodified
-/// — so a normal boot shows ONLY the engine's frame (no injected pixels), and the overlay is opt-in.
+/// Whether the present-path text overlay is enabled — ON by default (it makes host-typed text visible in
+/// focused fields, e.g. login), with an opt-out (`ECLIPSE_NO_VK_OVERLAY`) for debugging. When on, the
+/// overlay only does GPU work while a text field is focused (`present_with_overlay`'s fast path), so it
+/// is zero-cost during gameplay.
 fn overlay_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("ECLIPSE_VK_OVERLAY").is_some())
+    *EN.get_or_init(|| std::env::var_os("ECLIPSE_NO_VK_OVERLAY").is_none())
 }
 
 // Host device-level command pointers, captured (as their address in a `usize`-in-`u64`) the first time
@@ -398,6 +466,40 @@ fn login_field_rect(extent: vk::Extent2D) -> vk::Rect2D {
             width: w,
             height: h,
         },
+    }
+}
+
+/// The focused field's on-screen rect: the engine's LIVE `NativeTextBoxInfo` geometry (cached by the main
+/// thread via `framework::textbox_geometry`, clamped to the surface) so the overlay text lands where the
+/// field actually is (the login layout drifts). Falls back to the hardcoded login rect (test/diagnostic).
+fn field_rect(extent: vk::Extent2D) -> vk::Rect2D {
+    // Diagnostic: ECLIPSE_VK_SCREENSHOT → capture the WHOLE frame (the probe then writes a full-screen
+    // PNG so the dev host can see the current UI + find drifted button/field positions).
+    static SHOT: OnceLock<bool> = OnceLock::new();
+    if *SHOT.get_or_init(|| std::env::var_os("ECLIPSE_VK_SCREENSHOT").is_some()) {
+        return vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+    }
+    match crate::framework::textbox_geometry() {
+        Some((gx, gy, gw, gh)) if gw > 0 && gh > 0 => {
+            let x = (gx.max(0) as u32).min(extent.width.saturating_sub(1));
+            let y = (gy.max(0) as u32).min(extent.height.saturating_sub(1));
+            let w = gw.min(extent.width - x).max(1);
+            let h = gh.min(extent.height - y).max(1);
+            vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: x as i32,
+                    y: y as i32,
+                },
+                extent: vk::Extent2D {
+                    width: w,
+                    height: h,
+                },
+            }
+        }
+        _ => login_field_rect(extent),
     }
 }
 
@@ -794,18 +896,26 @@ impl Probe {
                     }
                 }
             }
-            // Analyze the readback into an ASCII ink-profile: text is light glyphs on the field's dark
-            // background, so "ink" = bright pixels. We scan the vertical MIDDLE band (skipping the top/
-            // bottom border rows) and bucket ink per column → a sparkline that shows where the glyphs are,
-            // how many, and how much ink (triplication ≈ 3× ink). Compositor-independent visual check.
+            let w = self.rect.extent.width as usize;
+            let h = self.rect.extent.height as usize;
+            let size = w * h * 4;
+            // Compositor-independent screenshot: write a PNG of the captured rect EVERY capture (so it
+            // reflects the CURRENT frame — `grim` can't reach the buried window). Force alpha opaque.
+            {
+                let data = std::slice::from_raw_parts(self.mapped, size);
+                let mut png_rgba = data.to_vec();
+                for px in png_rgba.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
+                let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
+                let _ = std::fs::write("/tmp/eclipse_field_probe.png", png);
+            }
+            // Analyze the readback into an ASCII ink-profile sparkline (light glyphs on the dark field).
             // Rate-limited (~once/sec) so per-frame overlay drawing doesn't spam the log.
             static LOG_TICK: AtomicU64 = AtomicU64::new(0);
             if !LOG_TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
                 return true;
             }
-            let w = self.rect.extent.width as usize;
-            let h = self.rect.extent.height as usize;
-            let size = w * h * 4;
             let data = std::slice::from_raw_parts(self.mapped, size);
             const BUCKETS: usize = 64;
             let mut col_ink = [0u32; BUCKETS];
@@ -849,11 +959,17 @@ impl Drop for Probe {
     }
 }
 
-/// Build the probe once from the captured engine state (best-effort).
+/// Build the probe (best-effort), or rebuild it if the field `rect` changed (the login layout drifts, so
+/// the focused field moves/resizes — the probe's buffer + copy region are sized to the rect).
 fn ensure_probe(rect: vk::Rect2D) {
     let Ok(mut guard) = PROBE.lock() else { return };
-    if guard.is_some() {
-        return;
+    if guard.as_ref().is_some_and(|p| {
+        p.rect.offset.x == rect.offset.x
+            && p.rect.offset.y == rect.offset.y
+            && p.rect.extent.width == rect.extent.width
+            && p.rect.extent.height == rect.extent.height
+    }) {
+        return; // already current
     }
     let device = STATE.lock().map(|s| s.device).unwrap_or(0);
     if device == 0 {
@@ -862,6 +978,8 @@ fn ensure_probe(rect: vk::Rect2D) {
     let Some(entry) = super::vulkan_wsi::host_entry() else {
         return;
     };
+    // Drop any stale probe (its Drop idles + frees) BEFORE building the new one for the changed rect.
+    *guard = None;
     if let Some(p) = Probe::build(
         entry,
         INSTANCE.load(Ordering::Relaxed),
@@ -870,7 +988,13 @@ fn ensure_probe(rect: vk::Rect2D) {
         QUEUE_FAMILY.load(Ordering::Relaxed),
         rect,
     ) {
-        tracing::info!("vk-overlay: field probe built (writes /tmp/eclipse_field_probe.png)");
+        tracing::info!(
+            x = rect.offset.x,
+            y = rect.offset.y,
+            w = rect.extent.width,
+            h = rect.extent.height,
+            "vk-overlay: field overlay/probe built for field rect"
+        );
         *guard = Some(p);
     }
 }
@@ -888,8 +1012,15 @@ unsafe fn present_with_overlay(
     p_present_info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
     if p_present_info.is_null() || (!overlay_enabled() && !probe_enabled()) {
-        // Overlay + probe both off (default) or null info → forward the engine's present unchanged.
+        // Overlay opted out + probe off, or null info → forward the engine's present unchanged.
         // SAFETY: forwarding `(queue, p_present_info)` is the plain host present path.
+        return unsafe { host(queue, p_present_info) };
+    }
+    // Fast path: the overlay is on by default, but it only has work when a text field is focused. With no
+    // focused field and no probe, skip ALL the per-present work (locks, readback) — zero gameplay cost.
+    // (A cheap atomic check before any lock.)
+    if !probe_enabled() && crate::framework::active_text_field() == 0 {
+        // SAFETY: plain host present — nothing to composite this frame.
         return unsafe { host(queue, p_present_info) };
     }
     // SAFETY: non-null per the check; a valid `VkPresentInfoKHR` per the contract.
@@ -907,8 +1038,6 @@ unsafe fn present_with_overlay(
     // write the PNG, then present with the engine wait semaphores cleared (the probe submit consumed +
     // fence-waited them). Rate-limited — the readback fence-wait stalls the queue, so do it ~twice/sec.
     if probe_enabled() || overlay_enabled() {
-        static TICK: AtomicU64 = AtomicU64::new(0);
-        let tick = TICK.fetch_add(1, Ordering::Relaxed);
         let (extent, image_raw) = match STATE.lock() {
             Ok(st) => (
                 vk::Extent2D {
@@ -929,16 +1058,19 @@ unsafe fn present_with_overlay(
         } else {
             None
         };
-        // Draw EVERY frame when there is text (else it flickers — the engine repaints the field each
-        // frame, overwriting our text). The probe-only diagnostic (no text) is rate-limited to ~twice/sec
-        // since its readback fence-wait stalls the queue. No text + not a probe tick → plain present (zero
-        // cost during gameplay, when no field is focused).
-        let run =
-            image_raw != 0 && (draw_text.is_some() || (probe_enabled() && tick.is_multiple_of(30)));
+        // Run on EVERY present when overlay-drawing (else the text flickers — the engine repaints the
+        // field each frame) or when probing (so the PNG/sparkline reflect the CURRENT frame, not a stale
+        // one). The readback fence-wait stalls the queue, but this only runs under the env-gated overlay/
+        // probe (never in a normal/gameplay boot). No active field + not probing → plain present.
+        let run = image_raw != 0 && (draw_text.is_some() || probe_enabled());
         if !run {
             return unsafe { host(queue, p_present_info) };
         }
-        ensure_probe(login_field_rect(extent));
+        // Use the focused field's LIVE geometry (cached from the engine by the main thread) so the text
+        // lands where the field actually is — the login layout drifts. Fall back to the hardcoded login
+        // rect (test/diagnostic). Clamp to the surface.
+        let rect = field_rect(extent);
+        ensure_probe(rect);
         let engine_waits: &[vk::Semaphore] = if pi.wait_semaphore_count > 0
             && !pi.p_wait_semaphores.is_null()
         {

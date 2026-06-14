@@ -138,6 +138,12 @@ struct GameWindow<'vm> {
     /// 2026-06-14 — the instant of the last synthetic focus-tap, so the focus stage RE-TAPS the field
     /// (focus-on-tap is async + occasionally missed) until `framework::active_text_field()` is set.
     engine_last_focus_tap: Option<std::time::Instant>,
+    /// 2026-06-14 — the instant the synthetic type completed (stage 2), so stage 3 can tap "Next" a few
+    /// seconds later to confirm the engine detected the text (validation).
+    engine_typed_at: Option<std::time::Instant>,
+    /// 2026-06-14 — set once the env-gated synthetic "Next" tap (stage 3, `ECLIPSE_SYNTHETIC_NEXT="x,y"`)
+    /// has fired.
+    engine_synthetic_next_done: bool,
     /// 2026-06-14 — set once the env-gated engine-input-bridge reflection diagnostic has fired.
     engine_reflect_done: bool,
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
@@ -432,6 +438,13 @@ impl ApplicationHandler for GameWindow<'_> {
             }
         }
         self.maybe_synthetic_engine_tap();
+        // Cache the focused textbox's live geometry for the Vulkan text overlay (which runs on the engine
+        // render thread + must not call into the engine). Main-thread JNI; only when a field is focused.
+        if self.handed_off && crate::framework::active_text_field() != 0 {
+            if let Some(vm) = self.vm {
+                crate::framework::query_textbox_geometry(vm);
+            }
+        }
     }
 }
 
@@ -859,6 +872,7 @@ impl GameWindow<'_> {
                     }
                     // Wake the engine's parked loopers so it re-polls getText() + re-renders the field.
                     crate::loader::ndk_registry::wake_all_loopers();
+                    self.engine_typed_at = Some(std::time::Instant::now());
                 } else if self
                     .engine_last_focus_tap
                     .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(1500))
@@ -874,6 +888,30 @@ impl GameWindow<'_> {
                     self.engine_primary_press();
                     self.engine_primary_release();
                 }
+            }
+        }
+
+        // Stage 3 (ECLIPSE_SYNTHETIC_NEXT="x,y"): a few seconds after typing, tap "Next" once — confirms
+        // the engine DETECTED the text (it should advance past the username step, vs an empty-field error).
+        if self.engine_synthetic_typed_done
+            && !self.engine_synthetic_next_done
+            && self
+                .engine_typed_at
+                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3))
+        {
+            if let Some((x, y)) =
+                std::env::var_os("ECLIPSE_SYNTHETIC_NEXT").and_then(|s| parse_xy(&s))
+            {
+                self.engine_synthetic_next_done = true;
+                tracing::info!(
+                    x,
+                    y,
+                    "synthetic NEXT (stage 3): tapping Next to confirm detection"
+                );
+                self.cursor = Some((x, y));
+                self.engine_primary_press();
+                self.engine_primary_release();
+                crate::loader::ndk_registry::wake_all_loopers();
             }
         }
     }
@@ -906,6 +944,8 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_synthetic_tap_done: false,
         engine_synthetic_typed_done: false,
         engine_last_focus_tap: None,
+        engine_typed_at: None,
+        engine_synthetic_next_done: false,
         engine_reflect_done: false,
         key_meta_state: 0,
     };
