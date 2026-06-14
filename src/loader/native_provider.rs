@@ -6311,7 +6311,11 @@ mod tests {
         let fd = unsafe { eclipse_aasset_openfiledescriptor(asset, &mut start, &mut length) };
         assert!(fd >= 0, "a real fd must back the in-memory asset");
         assert_eq!(start, 0, "asset begins at offset 0 in the backing memfd");
-        assert_eq!(length, payload.len() as libc::off_t, "length is the asset len");
+        assert_eq!(
+            length,
+            payload.len() as libc::off_t,
+            "length is the asset len"
+        );
         // Read the fd's full contents back and require byte-exactness with the source asset.
         let mut got = vec![0u8; payload.len()];
         let mut off = 0usize;
@@ -6327,7 +6331,10 @@ mod tests {
             assert!(n > 0, "fd must read back the full asset");
             off += n as usize;
         }
-        assert_eq!(got, payload, "fd contents must be byte-exact with the asset");
+        assert_eq!(
+            got, payload,
+            "fd contents must be byte-exact with the asset"
+        );
         // SAFETY: `fd` is the live owned descriptor we received; close it once.
         unsafe { libc::close(fd) };
         ndk_registry::assets().remove(s).ok();

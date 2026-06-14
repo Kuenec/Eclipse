@@ -79,6 +79,15 @@ li_src="$here/src/android/view/LayoutInflater.java"
 grep -qF 'parseRequestFocus(parser, parent);' "$li_src" || fail "patched LayoutInflater.java no longer calls parseRequestFocus — the <requestFocus/> fix regressed"
 ! grep -qF '<requestFocus /> not supported atm' "$li_src" || fail "patched LayoutInflater.java still throws the old <requestFocus/> 'not supported atm' — the fix regressed"
 
+# --- 1c. guard the patched ValueCallback (must be an interface, not a class) ---------------
+# 2026-06-14: android.webkit.ValueCallback is an INTERFACE in AOSP, but ATL ships it as an empty
+# `public class`. Roblox's ql.b `implements ValueCallback`, so a class form makes ART throw
+# IncompatibleClassChangeError at CookieProtocol.<init> (auth/cookie path) and wedge the main-looper
+# pump (freezing the winit event loop -> no host input). Fail loudly if the patch regresses.
+vc_src="$here/src/android/webkit/ValueCallback.java"
+[ -f "$vc_src" ] || fail "patched ValueCallback.java missing at $vc_src"
+grep -qE 'public[[:space:]]+interface[[:space:]]+ValueCallback' "$vc_src" || fail "patched ValueCallback.java is not an interface — the IncompatibleClassChangeError fix regressed"
+
 # --- 2. compile patched sources against the compile-only stubs ---------------------------
 # --release 8: dx 1.x accepts class files <= v52. -Xlint:-options silences the
 # "release 8 is obsolete" note; real warnings still show.
@@ -88,10 +97,11 @@ grep -qF 'parseRequestFocus(parser, parent);' "$li_src" || fail "patched LayoutI
     "$here/src/android/net/NetworkRequest.java" \
     "$here/src/android/app/ActivityManager.java" \
     "$here/src/android/os/PowerManager.java" \
-    "$here/src/android/view/LayoutInflater.java"
+    "$here/src/android/view/LayoutInflater.java" \
+    "$here/src/android/webkit/ValueCallback.java"
 
 # --- 3. stage ONLY the patched classes (stubs must never reach the dex) ------------------
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     cp "$work/classes/"$pattern "$work/stage/$dir/"
