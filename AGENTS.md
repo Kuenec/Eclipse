@@ -208,11 +208,25 @@ before any history-rewriting/force operation.
   (intercepting more GL/Vulkan queries = guessing, CLAUDE.md-forbidden without a confirmed mechanism); (b)
   RBXS-format/variant-selection internals = REVERSE-ENGINEERING `libroblox` — OFF-POLICY per the cyber-safeguard, do NOT;
   (c) a NON-first-party signal (how Sober — closed runtime, shared ATL — tunes the profile/FFlags for this exact build).
-  NET: the shipped Phase-5/6 fixes (API 28 + Vulkan WSI translation) HOLD and got the engine to build its full Vulkan
-  instance+surface+device pipeline + a GLES3 context; the shader-pack open is a HARD, exhaustively-characterized boundary
-  that cannot be passed without RE (off-policy) or a non-first-party signal. (Separately noted: ATL's memory stubs are
-  absurdly low — `totalMem=10000` BYTES, class 20/60 MB — a latent correctness bug worth fixing for OTHER reasons, but
-  NOT the render blocker; reverted here to keep the baseline clean.) Detail: §6 (2026-06-13 render Phase 6).
+  **FFlag OBSERVABILITY PATH PURSUED + BLOCKED (2026-06-13):** the legitimate way to surface the engine's OWN reject
+  reason is its FastFlags — the binary contains `Error: shader pack %s does not have variant %s` / `is outdated (expected
+  version %d, got %d)` / `is corrupted` (research-confirmed), gated behind `FLog::Graphics`/`SurfaceController` verbosity.
+  Provided `ClientAppSettings.json` (verbose FLog + `FFlagDebugGraphicsPreferOpenGL`/`DisableVulkan` +
+  `DFIntDebugFRMQualityLevelOverride`) at BOTH the `/data/local/tmp/` debug-override path (created via sudo — the engine
+  DID read it: the prior FileNotFound is GONE) AND the Sober/Bloxstrap app-settings path `<app_data>/files/exe/
+  ClientSettings/ClientAppSettings.json`, plus a self-allowlist attempt (`DFStringAllowedPublicFlags`). Across 4 boots:
+  NONE took effect — Mode 6 (Vulkan) still ran (PreferOpenGL ignored), `FLog::Graphics` line count unchanged (82),
+  reject reason still the generic line. The boot logs `getFlagValueFromSettings: 'DFStringAllowedPublicFlags' key not
+  found in settings` — Roblox's 2026 local-override ALLOWLIST is absent ⇒ default-deny ⇒ every non-allowlisted local
+  flag is SILENTLY dropped, and the allowlist key itself is not locally-settable. So even OBSERVABILITY of the reject
+  reason is blocked without modifying Roblox's own allowlist/settings code (RE/tampering — OFF-POLICY). Cleaned up the
+  external config files. NET: the shipped Phase-5/6 fixes (API 28 + Vulkan WSI translation) HOLD and got the engine to
+  build its full Vulkan instance+surface+device pipeline + a GLES3 context; the shader-pack open is a HARD,
+  exhaustively-characterized boundary — across device-profile, memory, provisioning, AND FFlag avenues — that cannot be
+  passed without RE (off-policy) or a non-first-party signal (how Sober delivers its FFlags past the allowlist for this
+  build). (Separately noted: ATL's memory stubs are absurdly low — `totalMem=10000` BYTES, class 20/60 MB — a latent
+  correctness bug worth fixing for OTHER reasons, but NOT the render blocker; reverted to keep the baseline clean.)
+  Detail: §6 (2026-06-13 render Phase 6).
 - **2026-06-13 — 🖼️ RENDER PHASE 5 SHIPPED: GUEST API LEVEL (`-DBuild.VERSION.SDK_INT`). [Superseded as START-HERE by Phase 6.]**
   Owner live boot proved the engine reaches render init but **no graphics mode succeeds → `RenderView is NULL` → no
   frames**. A multi-agent first-party forensics + an `strace`/`LD_PRELOAD`/magic-flip probe campaign (orchestrator,
