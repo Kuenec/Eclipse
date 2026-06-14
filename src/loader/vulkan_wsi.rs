@@ -157,7 +157,7 @@ pub unsafe extern "C" fn eclipse_dlsym(handle: *mut c_void, symbol: *const c_cha
 /// The host Vulkan loader, loaded once via the SAME `ash::Entry::load()` the renderer uses. `None` if the
 /// host has no usable `libvulkan` (the shims then return `VK_ERROR_INITIALIZATION_FAILED` — a clean
 /// Vulkan failure, never UB). Process-lifetime; `ash::Entry` owns its `libloading` handle.
-fn host_entry() -> Option<&'static ash::Entry> {
+pub(crate) fn host_entry() -> Option<&'static ash::Entry> {
     static HOST_ENTRY: OnceLock<Option<ash::Entry>> = OnceLock::new();
     // SAFETY: 2026-06-13 — `ash::Entry::load()` dlopen's the platform Vulkan loader (`libvulkan.so.1`)
     // and reads the entry-level command pointers from it; it is `unsafe` only because it loads native
@@ -339,7 +339,14 @@ pub unsafe extern "system" fn eclipse_vk_create_instance(
     // valid `VkInstanceCreateInfo` borrowing `rewritten` (alive for this call) for the names and the
     // original `ci`'s `p_next`/`p_application_info`/layers (alive in the caller); `p_allocator`/
     // `p_instance` are the engine's own, forwarded unchanged. The host copies the names it reads.
-    unsafe { create_instance(&patched, p_allocator, p_instance) }
+    let r = unsafe { create_instance(&patched, p_allocator, p_instance) };
+    // 2026-06-14: capture the created `VkInstance` for the text overlay (`vk_overlay` builds an
+    // `ash::Instance` from it to load the engine's device commands). On success only.
+    if r == vk::Result::SUCCESS && !p_instance.is_null() {
+        // SAFETY: on success the host wrote a valid `VkInstance` to `p_instance`.
+        super::vk_overlay::set_instance(unsafe { *p_instance });
+    }
+    r
 }
 
 /// `PFN_vkCreateAndroidSurfaceKHR` — Eclipse-owned tier-0 override. The host Linux ICD has no

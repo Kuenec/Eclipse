@@ -7350,6 +7350,27 @@ const EDIT_TEXT_GET_TEXT_SIG: &JNIStr = jni_str!("(J)Ljava/lang/String;");
 /// lock on use, so a stale value is a sound no-op, never UB).
 static ACTIVE_TEXT_FIELD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// The currently-focused text field's [`view_registry`] handle, or `0` if none. Lets the graphics
+/// synthetic-input harness re-tap until a field is actually focused before typing (focus-on-tap is
+/// asynchronous + occasionally missed). 2026-06-14.
+pub fn active_text_field() -> i64 {
+    ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The current text of the focused text field (the `EditText` the engine last polled), or `None` if no
+/// field is active. The Vulkan present-path overlay draws THIS onto the field so host-typed text is
+/// visible — Eclipse compositing the Android input view, the platform's job. Re-read under the registry
+/// lock each call (a stale handle → `None`). 2026-06-14.
+pub fn active_text_field_text() -> Option<String> {
+    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Relaxed);
+    if widget == 0 {
+        return None;
+    }
+    view_registry::with_view(widget, |v| v.text.clone())
+        .ok()
+        .flatten()
+}
+
 /// `<Widget>.native_setText(long widget, String text)` → record the text on the receiver's
 /// [`view_registry`] peer (2026-06-13).
 ///
@@ -7508,6 +7529,17 @@ fn pass_key_event_to_engine(vm: &Vm, unicode: i32, backspace: bool) {
     });
 }
 
+/// Which per-keystroke host-input delivery paths fire (env `ECLIPSE_TEXT_PATHS`, cached). Letters:
+/// `w` EditText TextWatcher (RbxKeyboard validation → "Next"), `p` `nativePassText`, `s`
+/// `syncTextboxTextAndCursorPosition2`, `k` `nativePassKeyEvent`, `e` `updateKeyboardSize`. Default
+/// `"wpske"` (all — prior behavior). Firing multiple text-delivery paths duplicates each typed char, so
+/// this isolates the single clean path. 2026-06-14.
+fn text_paths() -> &'static str {
+    static PATHS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATHS
+        .get_or_init(|| std::env::var("ECLIPSE_TEXT_PATHS").unwrap_or_else(|_| "wpske".to_string()))
+}
+
 /// Route a host keystroke into the active text-input `EditText` — the field whose `native_getText` the
 /// engine last polled ([`ACTIVE_TEXT_FIELD`]). A printable `unicode` codepoint is appended; `backspace`
 /// removes the last char. Mutates the field's [`view_registry`] `text` and fires the retained
@@ -7530,16 +7562,24 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
     });
     match edited {
         Ok((old_text, new_text, start, before, count)) => {
-            // (1) Fire the EditText TextWatcher contract (validation — enables e.g. the "Next" button).
-            fire_text_watchers(vm, widget, &old_text, &new_text, start, before, count);
-            // (2) Push the full text + cursor to the engine's Lua TextBox so it RENDERS the typed text —
-            // the engine's display reads its own textbox, not the Android EditText (reflection-confirmed).
+            // 2026-06-14: each keystroke can reach the engine via several delivery paths; firing more than
+            // one duplicates the character (one keypress rendered N times). `text_paths()` selects which
+            // fire so the single clean path can be isolated. Letters: `w` TextWatcher (validation/Next),
+            // `p` nativePassText, `s` syncTextbox, `k` nativePassKeyEvent, `e` updateKeyboardSize.
+            let paths = text_paths();
+            // (w) Fire the EditText TextWatcher contract (validation — enables e.g. the "Next" button).
+            if paths.contains('w') {
+                fire_text_watchers(vm, widget, &old_text, &new_text, start, before, count);
+            }
+            // (p/s/e) Push the full text + cursor to the engine's Lua TextBox (the engine renders its own
+            // textbox, not the Android EditText). `sync_engine_textbox` internally honors `paths`.
             let cursor = jint::try_from(new_text.chars().count()).unwrap_or(jint::MAX);
             sync_engine_textbox(vm, &new_text, cursor);
-            // (3) Also forward the keystroke through the engine's OWN hardware-key bridge
-            // (nativePassKeyEvent) — the desktop/console text-render path Roblox uses to draw typed chars
-            // in a TextBox, distinct from the IME-text bridges in (2). 2026-06-14.
-            pass_key_event_to_engine(vm, unicode, backspace);
+            // (k) Forward the keystroke via the engine's hardware-key bridge — an APPEND path (it adds a
+            // char on top of nativePassText), so it is the prime duplication suspect; off unless selected.
+            if paths.contains('k') {
+                pass_key_event_to_engine(vm, unicode, backspace);
+            }
             true
         }
         Err(_) => {
@@ -7561,6 +7601,11 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
     if raw.is_null() {
         return;
     }
+    // 2026-06-14 experiment (ECLIPSE_TEXT_COMPOSING): deliver each keystroke to `nativePassText` as IME
+    // COMPOSING/preedit text (`isComposing=true`) instead of committed (`false`) — the one delivery
+    // variant untested for whether the engine draws the field text LIVE (preedit is what some engines
+    // render live). Default off (committed). A/B without rebuilding.
+    let composing = std::env::var_os("ECLIPSE_TEXT_COMPOSING").is_some();
     // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
@@ -7575,6 +7620,7 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
             let Ok(s) = env.new_string(text) else {
                 return;
             };
+            let paths = text_paths();
             // updateKeyboardSize(boolean shown, int x, int y, int w, int h) tells the engine the soft
             // keyboard is visible. On Android the engine only activates its on-screen text-input rendering
             // once the IME reports shown; Eclipse has no real soft keyboard (ATL stubs showSoftInput), so
@@ -7582,6 +7628,7 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
             // focused TextBox. We assert shown + a plausible bottom-strip rect before pushing text. The exact
             // rect is non-gating (the engine pans layout off it); the `shown` flag is what unlocks the render
             // path. 2026-06-14.
+            if paths.contains('e') {
             if let Err(e) = checked(env, "NativeGLInterface.updateKeyboardSize", |env| {
                 env.call_static_method(
                     &cls,
@@ -7599,12 +7646,12 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
             }) {
                 tracing::debug!(error = %e, "updateKeyboardSize threw (cleared)");
             }
-            // nativePassText(long eventTime, String text, boolean isComposing, int cursor) is the engine's
-            // IME-commit bridge — Java pushes the committed text into the focused Lua TextBox, which the
-            // engine then RENDERS. The `long` is an eventTime, not a textbox handle: NativeTextBoxInfo (the
-            // only textbox object the engine hands Java) exposes geometry/style but NO handle and NO text,
-            // and the engine tracks the active textbox internally (same model as nativePassInput) — so 0 is
-            // safe. isComposing=false marks a finalized (not preedit) commit. 2026-06-14.
+            }
+            // nativePassText(long eventTime, String text, boolean isComposing, int cursor) — the engine
+            // RENDERS the focused TextBox text LIVE from this when `isComposing=true` (IME preedit;
+            // env `ECLIPSE_TEXT_COMPOSING`), the confirmed live-display path. The `long` is an eventTime,
+            // not a textbox handle (NativeTextBoxInfo exposes no handle), so 0 is safe. 2026-06-14.
+            if paths.contains('p') {
             if let Err(e) = checked(env, "NativeGLInterface.nativePassText", |env| {
                 env.call_static_method(
                     &cls,
@@ -7613,7 +7660,7 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
                     &[
                         JValue::Long(0),
                         JValue::Object(&s),
-                        JValue::Bool(false),
+                        JValue::Bool(composing),
                         JValue::Int(cursor),
                     ],
                 )?
@@ -7621,6 +7668,8 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
             }) {
                 tracing::debug!(error = %e, "nativePassText threw (cleared)");
             }
+            }
+            if paths.contains('s') {
             if let Err(e) = checked(
                 env,
                 "NativeGLInterface.syncTextboxTextAndCursorPosition2",
@@ -7635,6 +7684,7 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
                 },
             ) {
                 tracing::debug!(error = %e, "syncTextboxTextAndCursorPosition2 threw (cleared)");
+            }
             }
         }));
         Ok(())
