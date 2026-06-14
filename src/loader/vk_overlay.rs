@@ -1058,6 +1058,16 @@ unsafe fn present_with_overlay(
         } else {
             None
         };
+        // SECURITY: a password field (engine `textInputType == 5`, confirmed live: the login password
+        // step) must NEVER render plaintext — mask it to one `•` per character. (Username is type 7.)
+        const SECURE_INPUT_TYPE: i32 = 5;
+        let draw_text = draw_text.map(|s| {
+            if crate::framework::textbox_input_type() == SECURE_INPUT_TYPE {
+                "\u{2022}".repeat(s.chars().count())
+            } else {
+                s
+            }
+        });
         // Run on EVERY present when overlay-drawing (else the text flickers — the engine repaints the
         // field each frame) or when probing (so the PNG/sparkline reflect the CURRENT frame, not a stale
         // one). The readback fence-wait stalls the queue, but this only runs under the env-gated overlay/
@@ -1130,6 +1140,25 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
                 images = st.images.len(),
                 "vk-overlay: present seam armed (engine present interposed)"
             );
+        }
+    }
+    // Present-rate (fps) every ~120 frames — measures any overlay overhead (it composites only while a
+    // field is focused). Env-gated diagnostic to avoid steady-state logging.
+    if std::env::var_os("ECLIPSE_VK_FPS").is_some() && n.is_multiple_of(120) {
+        static LAST: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+        if let Ok(mut g) = LAST.lock() {
+            let now = std::time::Instant::now();
+            if let Some((t0, n0)) = *g {
+                let dt = now.duration_since(t0).as_secs_f64();
+                if dt > 0.0 {
+                    tracing::info!(
+                        fps = ((n - n0) as f64 / dt) as u32,
+                        field_focused = crate::framework::active_text_field() != 0,
+                        "vk-overlay present rate"
+                    );
+                }
+            }
+            *g = Some((now, n));
         }
     }
     let Some(addr) = cached(&HOST_QUEUE_PRESENT) else {

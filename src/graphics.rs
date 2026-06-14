@@ -144,6 +144,12 @@ struct GameWindow<'vm> {
     /// 2026-06-14 — set once the env-gated synthetic "Next" tap (stage 3, `ECLIPSE_SYNTHETIC_NEXT="x,y"`)
     /// has fired.
     engine_synthetic_next_done: bool,
+    /// 2026-06-14 — the instant of the stage-3 Next tap, so stage 4 can type into the next field (e.g.
+    /// the password field, which auto-focuses) a few seconds later.
+    engine_next_at: Option<std::time::Instant>,
+    /// 2026-06-14 — set once stage 4 (`ECLIPSE_SYNTHETIC_TYPE2="text"`, typed into the field focused after
+    /// Next — verifies the password field + its masking) has fired.
+    engine_synthetic_typed2_done: bool,
     /// 2026-06-14 — set once the env-gated engine-input-bridge reflection diagnostic has fired.
     engine_reflect_done: bool,
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
@@ -903,6 +909,7 @@ impl GameWindow<'_> {
                 std::env::var_os("ECLIPSE_SYNTHETIC_NEXT").and_then(|s| parse_xy(&s))
             {
                 self.engine_synthetic_next_done = true;
+                self.engine_next_at = Some(std::time::Instant::now());
                 tracing::info!(
                     x,
                     y,
@@ -911,6 +918,35 @@ impl GameWindow<'_> {
                 self.cursor = Some((x, y));
                 self.engine_primary_press();
                 self.engine_primary_release();
+                crate::loader::ndk_registry::wake_all_loopers();
+            }
+        }
+
+        // Stage 4 (ECLIPSE_SYNTHETIC_TYPE2="text"): a few seconds after Next, type into the field that
+        // auto-focused (the password field) — verifies the password step + that the overlay MASKS it.
+        if self.engine_synthetic_next_done
+            && !self.engine_synthetic_typed2_done
+            && self
+                .engine_next_at
+                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3))
+            && crate::framework::active_text_field() != 0
+        {
+            if let Some(text) = std::env::var("ECLIPSE_SYNTHETIC_TYPE2")
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                self.engine_synthetic_typed2_done = true;
+                tracing::info!(
+                    chars = text.chars().count(),
+                    "synthetic TYPE2 (stage 4): typing into the field focused after Next (password)"
+                );
+                if let Some(vm) = self.vm {
+                    for ch in text.chars() {
+                        let handled =
+                            crate::framework::type_into_active_text_field(vm, ch as i32, false);
+                        tracing::info!(handled, "synthetic TYPE2 char → active text field");
+                    }
+                }
                 crate::loader::ndk_registry::wake_all_loopers();
             }
         }
@@ -946,6 +982,8 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_last_focus_tap: None,
         engine_typed_at: None,
         engine_synthetic_next_done: false,
+        engine_next_at: None,
+        engine_synthetic_typed2_done: false,
         engine_reflect_done: false,
         key_meta_state: 0,
     };

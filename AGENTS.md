@@ -3951,6 +3951,20 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 
 ---
 
+### 2026-06-14 — 🔒 Login FORM complete: password fields MASKED (•, never plaintext) + framerate verified 60fps — full username→password flow works
+
+  **Password masking (SECURITY — the default-on overlay would otherwise render passwords in plaintext).** `query_textbox_geometry` now also reads `NativeTextBoxInfo.textInputType` (cached via `framework::textbox_input_type`). Live-confirmed values: username field = **7**, password field = **5** (and the password field auto-focuses after the username "Next"). The overlay masks `type == 5` → renders one `•` (U+2022) per character. Verified autonomously: a stage-4 synthetic typed "secret123" into the password field (9 chars `handled=true`) and the field PNG showed `••••••••` — NOT the plaintext. The text still reaches the engine (detection intact).
+
+  **Framerate (resolves the earlier "regression" concern — it is NOT real).** New `ECLIPSE_VK_FPS` present-rate log measured **60 fps with the overlay actively compositing** (`field_focused=true`) — identical to idle. The overlay's per-present copies are the small field rect (~80 KB), so they cost nothing at 60 Hz. (Low `fps` readings appear only when the engine itself IDLES — a static screen presents rarely — not from the overlay.)
+
+  **Full login form now works + is safe:** username renders the typed text → detected → advances to password (resolved the real RobloxTest account); password renders masked dots → text delivered to the engine. No defocus, no tripling, 60fps. The synthetic harness gained a stage-4 (`ECLIPSE_SYNTHETIC_TYPE2`) that types into the field focused after Next.
+
+  **Verification:** gate green (fmt / clippy `-D warnings` / 578 tests / release). Autonomous PNG proofs: username "robloxtest" visible; Next → password screen (RobloxTest); password "secret123" → `••••••••`. **Remaining (non-blocking):** dots sit slightly high in the field (cosmetic baseline); caret/blink; actual login completion (real password + the LAN-IP/network path); audio; scroll.
+
+  *Files:* `src/framework.rs` (`textbox_input_type` + read `textInputType` in `query_textbox_geometry`), `src/loader/vk_overlay.rs` (mask `type==5` → `•`; `ECLIPSE_VK_FPS` present-rate log), `src/graphics.rs` (stage-4 password-type synthetic), `AGENTS.md`.
+
+---
+
 ## 7. Doc index
 
 | File | Purpose |
