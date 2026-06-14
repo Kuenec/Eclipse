@@ -7336,6 +7336,19 @@ const EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_NAME: &JNIStr =
     jni_str!("native_setOnEditorActionListener");
 const EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG: &JNIStr =
     jni_str!("(JLandroid/widget/TextView$OnEditorActionListener;)V");
+// 2026-06-14: EditText.native_getText(long widget) → String (EditText.java:25). `EditText.getText()`
+// wraps it in a SpannableStringBuilder. Roblox's RbxKeyboard polls the FOCUSED field's getText(), so
+// this is also Eclipse's signal for "which EditText is the active text input" (see ACTIVE_TEXT_FIELD).
+const EDIT_TEXT_GET_TEXT_NAME: &JNIStr = jni_str!("native_getText");
+const EDIT_TEXT_GET_TEXT_SIG: &JNIStr = jni_str!("(J)Ljava/lang/String;");
+
+/// 2026-06-14: the [`view_registry`] handle of the `EditText` the engine is currently using as its text
+/// input — the field whose `native_getText` it most recently called (`RbxKeyboard` polls the focused
+/// field's `getText()`). `0` = none. Host-typed characters route here (see
+/// [`type_into_active_text_field`]); set by [`edit_text_native_get_text`]. A process-global atomic
+/// (single ART process; the value is just a `view_registry` handle, re-validated under the registry
+/// lock on use, so a stale value is a sound no-op, never UB).
+static ACTIVE_TEXT_FIELD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// `<Widget>.native_setText(long widget, String text)` → record the text on the receiver's
 /// [`view_registry`] peer (2026-06-13).
@@ -7376,6 +7389,189 @@ extern "system" fn widget_native_set_text<'local>(
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+/// `EditText.native_getText(long widget) -> String` → return the text recorded on the receiver's
+/// [`view_registry`] peer (empty if none) AND mark `widget` as the active text-input field
+/// ([`ACTIVE_TEXT_FIELD`]) so host-typed characters route to it. Roblox's `RbxKeyboard` polls the
+/// FOCUSED field's `getText()`, so this call IS the "which field is focused" signal (2026-06-14).
+///
+/// JNI ABI: an INSTANCE native returning `java.lang.String`, descriptor `(J)Ljava/lang/String;`
+/// (EditText.java:25). The framework's first VALUE-returning native: `with_env(...).resolve::<P>()`
+/// needs the return type `Default` for the error fallback — `JString<'local>` is `Default` (a null
+/// string ref), the AOSP-sound result for getText on a broken peer.
+extern "system" fn edit_text_native_get_text<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        // The engine reads the focused field's text via getText(); record it as the active input field.
+        ACTIVE_TEXT_FIELD.store(widget, std::sync::atomic::Ordering::Relaxed);
+        let text = view_registry::with_view(widget, |v| v.text.clone())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        env.new_string(&text)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Pure: apply one keystroke to `old` and return `(new_text, start, before, count)` — the Android
+/// `onTextChanged(s, start, before, count)` delta for that single edit (`count` chars at `start`
+/// replaced `before` chars). Appends a printable `unicode` codepoint; `backspace` removes the last
+/// char; a non-printable codepoint or backspace-on-empty is a no-op (`before == count == 0`). Operates
+/// on Unicode chars (not bytes), so indices are char offsets. VM/registry-free → unit-testable.
+/// 2026-06-14.
+fn apply_text_edit(old: &str, unicode: i32, backspace: bool) -> (String, jint, jint, jint) {
+    let old_len = jint::try_from(old.chars().count()).unwrap_or(jint::MAX);
+    let mut s = old.to_string();
+    if backspace {
+        return if s.pop().is_some() {
+            (s, old_len - 1, 1, 0) // removed 1 char at the new end
+        } else {
+            (s, 0, 0, 0) // nothing to delete (empty)
+        };
+    }
+    if let Some(c) = char::from_u32(unicode as u32).filter(|c| !c.is_control()) {
+        s.push(c);
+        return (s, old_len, 0, 1); // appended 1 char at the old end
+    }
+    (s, 0, 0, 0) // non-printable / unmappable — no text change
+}
+
+/// Route a host keystroke into the active text-input `EditText` — the field whose `native_getText` the
+/// engine last polled ([`ACTIVE_TEXT_FIELD`]). A printable `unicode` codepoint is appended; `backspace`
+/// removes the last char. Mutates the field's [`view_registry`] `text` and fires the retained
+/// `TextWatcher`s (via [`fire_text_watchers`]) so the engine reads the updated `getText()` and re-renders
+/// the field. Returns `true` iff a valid active field was edited (the caller then does NOT also forward
+/// the key to the game surface); `false` → no active field (a stale handle self-clears). 2026-06-14.
+pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bool {
+    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Relaxed);
+    if widget == 0 {
+        return false;
+    }
+    // Edit the stored text under the registry lock, computing the precise `onTextChanged` delta via the
+    // pure [`apply_text_edit`]; capture the result to notify watchers OUTSIDE the lock (an engine
+    // TextWatcher re-enters the registry via getText → with_view, which would deadlock).
+    let edited = view_registry::with_view(widget, |v| {
+        let (new, start, before, count) =
+            apply_text_edit(v.text.as_deref().unwrap_or_default(), unicode, backspace);
+        v.text = Some(new.clone());
+        (new, start, before, count)
+    });
+    match edited {
+        Ok((new_text, start, before, count)) => {
+            // The engine observes the field via a TextWatcher (it does NOT poll getText to render), so
+            // fire onTextChanged with the exact edit delta so it applies the change + re-renders.
+            fire_text_watchers(vm, widget, &new_text, start, before, count);
+            true
+        }
+        Err(_) => {
+            // Stale handle (the field's peer was destroyed, e.g. on navigation) — clear + not active.
+            ACTIVE_TEXT_FIELD.store(0, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+/// Fire `TextWatcher.onTextChanged` on each watcher retained for the EditText `widget`, so an engine
+/// that observes the field via `addTextChangedListener` (Roblox's `RbxKeyboard`) reads the new
+/// `getText()` and re-renders. The watcher `Global`s live in [`view_registry`] (not `Clone`); their raw
+/// refs are snapshotted UNDER the registry lock (just copying pointers — no JNI), then the JNI calls run
+/// OUTSIDE the lock (a watcher re-enters the registry via getText). Best-effort: a null VM, no watchers,
+/// or a JNI/Java error is logged + skipped, never fatal. 2026-06-14.
+fn fire_text_watchers(
+    vm: &Vm,
+    widget: jlong,
+    new_text: &str,
+    start: jint,
+    before: jint,
+    count: jint,
+) {
+    // SAFETY of the raw-ref snapshot: each `jobject` is the live global ref of a `Global` stored in the
+    // registry for `widget`; those `Global`s are not dropped during this call (they stay in the slot),
+    // so each pointer is valid for the JNI calls below. We wrap them as non-owning `JObject`s (drop is a
+    // no-op — they are NOT owned locals), so no global ref is wrongly deleted.
+    let ptrs: Vec<jni::sys::jobject> = match view_registry::with_view(widget, |v| {
+        v.text_watchers
+            .iter()
+            .map(|g| g.as_obj().as_raw())
+            .collect::<Vec<_>>()
+    }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if ptrs.is_empty() {
+        return;
+    }
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: `raw` is the live process `*mut JavaVM` (kept alive by `&Vm`, non-null) — exactly
+    // `JavaVM::from_raw`'s contract, same as the other dispatch paths.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let s = env.new_string(new_text)?;
+            // Build an Editable (SpannableStringBuilder) holding the new text for afterTextChanged — many
+            // TextWatchers (incl. the engine's) update the model/display in afterTextChanged, not just
+            // onTextChanged. Built once; reused per watcher. None on a class/ctor error (afterTextChanged
+            // is then skipped — onTextChanged still fires).
+            let editable = match env.find_class(jni_str!("android/text/SpannableStringBuilder")) {
+                Ok(cls) => env
+                    .new_object(
+                        &cls,
+                        jni_sig!("(Ljava/lang/CharSequence;)V"),
+                        &[JValue::Object(&s)],
+                    )
+                    .ok(),
+                Err(_) => None,
+            };
+            for ptr in &ptrs {
+                // SAFETY: see the snapshot note above — `*ptr` is a live global ref; a non-owning view
+                // (`from_raw`'s `&Env` only binds the lifetime, it does not retain a borrow of `env`).
+                let watcher = unsafe { JObject::from_raw(env, *ptr) };
+                // TextWatcher.onTextChanged(CharSequence s, int start, int before, int count): `count`
+                // chars at `start` just replaced `before` chars (the exact single-keystroke delta).
+                if let Err(e) = checked(env, "TextWatcher.onTextChanged", |env| {
+                    env.call_method(
+                        &watcher,
+                        jni_str!("onTextChanged"),
+                        jni_sig!("(Ljava/lang/CharSequence;III)V"),
+                        &[
+                            JValue::Object(&s),
+                            JValue::Int(start),
+                            JValue::Int(before),
+                            JValue::Int(count),
+                        ],
+                    )?
+                    .v()
+                }) {
+                    tracing::debug!(error = %e, "TextWatcher.onTextChanged threw (cleared, continuing)");
+                }
+                // TextWatcher.afterTextChanged(Editable s): the final edit hook (display/model sync).
+                if let Some(ed) = &editable {
+                    if let Err(e) = checked(env, "TextWatcher.afterTextChanged", |env| {
+                        env.call_method(
+                            &watcher,
+                            jni_str!("afterTextChanged"),
+                            jni_sig!("(Landroid/text/Editable;)V"),
+                            &[JValue::Object(ed)],
+                        )?
+                        .v()
+                    }) {
+                        tracing::debug!(error = %e, "TextWatcher.afterTextChanged threw (cleared, continuing)");
+                    }
+                }
+            }
+            Ok::<(), FrameworkError>(())
+        })) {
+            Ok(r) => r,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    });
 }
 
 /// `RadioButton.setText(CharSequence text)` → record the text on the receiver's [`view_registry`] peer
@@ -7794,12 +7990,18 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
 
     // EditText: native_setText records text; the three listener natives RETAIN the listener on the peer
     // (EditText.java:52/57 pass them straight to the native with no Java field — 2026-06-13 boot trip).
-    let edit_text: [NativeBinding; 4] = [
+    let edit_text: [NativeBinding; 5] = [
         // SAFETY: `widget_native_set_text` matches EditText.java:29's `(JLjava/lang/String;)V`.
         (
             WIDGET_NATIVE_SET_TEXT_NAME,
             WIDGET_NATIVE_SET_TEXT_SIG,
             widget_native_set_text as *mut c_void,
+        ),
+        // SAFETY: `edit_text_native_get_text` matches EditText.java:25's `(J)Ljava/lang/String;`.
+        (
+            EDIT_TEXT_GET_TEXT_NAME,
+            EDIT_TEXT_GET_TEXT_SIG,
+            edit_text_native_get_text as *mut c_void,
         ),
         // SAFETY: `edit_text_add_text_changed_listener` matches EditText.java:26's
         // `(JLandroid/text/TextWatcher;)V`.
@@ -11009,6 +11211,37 @@ mod tests {
         // KeyEvent.unicodeValue : int — the field getUnicodeChar() returns verbatim (ATL keymap off).
         assert_eq!(jni_str!("unicodeValue").to_str(), "unicodeValue");
         assert_eq!(INT_SIG.to_str(), "I");
+    }
+
+    // 2026-06-14: pin the per-keystroke text-edit delta the EditText TextWatcher path reports via
+    // onTextChanged(s, start, before, count). A wrong delta mis-renders typed text (the first cut used
+    // start=0/count=fullLen and the field stayed wrong). Pure (no VM/registry), so unit-tested.
+    #[test]
+    fn apply_text_edit_computes_android_ontextchanged_delta() {
+        // Append to empty: 1 char inserted at index 0 (before=0, count=1).
+        assert_eq!(
+            apply_text_edit("", 'a' as i32, false),
+            ("a".to_string(), 0, 0, 1)
+        );
+        // Append to "ro": 1 char inserted at index 2.
+        assert_eq!(
+            apply_text_edit("ro", 'b' as i32, false),
+            ("rob".to_string(), 2, 0, 1)
+        );
+        // Backspace "rob": 1 char removed at the new end (start=2, before=1, count=0).
+        assert_eq!(apply_text_edit("rob", 0, true), ("ro".to_string(), 2, 1, 0));
+        // Backspace on empty: no-op.
+        assert_eq!(apply_text_edit("", 0, true), (String::new(), 0, 0, 0));
+        // Control char (ESC = 0x1b): no text change.
+        assert_eq!(
+            apply_text_edit("ro", 0x1b, false),
+            ("ro".to_string(), 0, 0, 0)
+        );
+        // Char COUNT (not byte) indices: 'é' is 2 bytes but 1 char — append lands at char index 1.
+        assert_eq!(
+            apply_text_edit("é", 'x' as i32, false),
+            ("éx".to_string(), 1, 0, 1)
+        );
     }
 
     #[test]
