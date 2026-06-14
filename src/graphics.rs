@@ -371,6 +371,16 @@ impl ApplicationHandler for GameWindow<'_> {
             WindowEvent::KeyboardInput { event, .. } if self.handed_off => {
                 self.engine_key(&event);
             }
+            // 2026-06-14: mouse wheel — forward to the engine's nativePassMouseWheel (desktop scroll).
+            WindowEvent::MouseWheel { delta, .. } if self.handed_off => {
+                let d = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                };
+                if d != 0.0 {
+                    self.engine_scroll(d);
+                }
+            }
             _ => {}
         }
     }
@@ -553,6 +563,15 @@ impl GameWindow<'_> {
     /// the renderer-gated [`Self::handle_primary_press`] path is pre-handoff only). Dispatches an
     /// `ACTION_DOWN` `MotionEvent` at the raw cursor position to the engine's `RBXSurfaceView.onTouchEvent`
     /// and records the gesture's downTime for the matching release. No VM / no cursor yet → no-op.
+    /// 2026-06-14 — ENGINE-MODE mouse-wheel scroll: forward the wheel `delta` (+ the cursor position) to
+    /// the engine's `nativePassMouseWheel`. (Roblox's Android UI also scrolls via touch-drag, already
+    /// forwarded as `ACTION_MOVE`; this is the desktop wheel convenience.)
+    fn engine_scroll(&mut self, delta: f32) {
+        let Some(vm) = self.vm else { return };
+        let (px, py) = self.cursor.unwrap_or((0.0, 0.0));
+        crate::framework::dispatch_scroll(vm, px, py, delta);
+    }
+
     fn engine_primary_press(&mut self) {
         self.engine_tap_downtime = None;
         let Some(vm) = self.vm else { return };
