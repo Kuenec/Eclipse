@@ -303,8 +303,12 @@ fn env_path(var: &str) -> Option<PathBuf> {
     }
 }
 
-/// Default install dir of the vendored Android framework (ATL's `api-impl.jar`,
-/// `framework-res.apk`, `natives/`). Overridable via `ECLIPSE_ANDROID_FRAMEWORK_DIR`.
+/// Stock ATL framework install dir — the **last-resort** framework source. `find_framework`
+/// prefers `ECLIPSE_ANDROID_FRAMEWORK_DIR`, then the auto-detected patched overlay
+/// ([`patched_overlay_dir`]); this stock dir is used only when neither is present. 2026-06-14:
+/// it lacks the `android.os.Build.SUPPORTED_*_BIT_ABIS` fields + AOSP-shaped
+/// `NetworkRequest`/`ActivityManager` classes Roblox requires, so booting against it dies in
+/// `RobloxApplication.onCreate` with `NoSuchFieldError` — hence the overlay preference + warning.
 const FRAMEWORK_DIR_DEFAULT: &str = "/usr/lib/java/dex/android_translation_layer";
 
 /// Paths to the vendored Android framework Eclipse boots the app against.
@@ -318,7 +322,65 @@ pub struct FrameworkPaths {
     pub natives_dir: PathBuf,
 }
 
-/// Locate the vendored Android framework (`ECLIPSE_ANDROID_FRAMEWORK_DIR` override, else default).
+/// The patched-framework overlay dir built by `tools/framework-overlay/patch-framework.sh`
+/// (`$XDG_CACHE_HOME/eclipse/framework-patched`, mirroring that script's `OUT` default). `None`
+/// only when no cache base can be determined (`$HOME` unset) — then auto-detection is skipped and
+/// resolution falls through to the stock default. Mirrors [`native_lib_cache_dir`]'s portable
+/// `ProjectDirs` pattern; never a hardcoded user path (§9, CLAUDE.md "Build & Environment
+/// Portability").
+fn patched_overlay_dir() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "eclipse").map(|d| d.cache_dir().join("framework-patched"))
+}
+
+/// Framework-dir precedence (pure — no env/FS reads, so it is unit-testable on any machine):
+/// explicit `ECLIPSE_ANDROID_FRAMEWORK_DIR` override > auto-detected patched overlay (when its
+/// `api-impl.jar` is present) > stock ATL default ([`FRAMEWORK_DIR_DEFAULT`]).
+fn resolve_framework_dir(
+    env_override: Option<PathBuf>,
+    overlay_dir: Option<PathBuf>,
+    overlay_present: bool,
+) -> PathBuf {
+    if let Some(dir) = env_override {
+        return dir;
+    }
+    if overlay_present {
+        if let Some(dir) = overlay_dir {
+            return dir;
+        }
+    }
+    PathBuf::from(FRAMEWORK_DIR_DEFAULT)
+}
+
+/// Resolve the framework dir from the live environment + filesystem via [`resolve_framework_dir`].
+///
+/// 2026-06-14: auto-detects the patched overlay so `eclipse run` works without the operator having
+/// to export `ECLIPSE_ANDROID_FRAMEWORK_DIR` (the README's tracked "auto-provisioning" gap). When
+/// neither the override nor a built overlay is present it falls back to the stock ATL framework
+/// and warns — that framework lacks the `android.os.Build.SUPPORTED_*_BIT_ABIS` / AOSP-shaped
+/// classes Roblox needs, so the warning points at the generator instead of letting the boot die in
+/// `RobloxApplication.onCreate` (`NoSuchFieldError` → SIGSEGV) with no hint why.
+fn framework_dir() -> PathBuf {
+    let env_override = env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR");
+    let overlay = patched_overlay_dir();
+    let overlay_present = overlay
+        .as_ref()
+        .is_some_and(|d| d.join("api-impl.jar").exists());
+    let dir = resolve_framework_dir(env_override.clone(), overlay, overlay_present);
+    if env_override.is_none() && !overlay_present {
+        tracing::warn!(
+            framework_dir = %dir.display(),
+            "no patched framework overlay found; using the stock ATL framework, which lacks \
+             Roblox-required android.* classes/fields (boot will fail in \
+             RobloxApplication.onCreate). Run tools/framework-overlay/patch-framework.sh or set \
+             ECLIPSE_ANDROID_FRAMEWORK_DIR."
+        );
+    }
+    dir
+}
+
+/// Locate the vendored Android framework: `ECLIPSE_ANDROID_FRAMEWORK_DIR` override >
+/// auto-detected patched overlay ([`patched_overlay_dir`]) > stock ATL default — see
+/// [`framework_dir`].
 ///
 /// Returns [`RuntimeError::FrameworkNotFound`] if `api-impl.jar` is absent (detect-don't-assume,
 /// §9).
@@ -330,8 +392,7 @@ pub struct FrameworkPaths {
 /// driving the Activity to `onCreate` *through it* pulls in GTK. Eclipse's own winit/Vulkan
 /// framework is the production replacement (component-map F) — see `docs/art-and-runtime.md`.
 pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
-    let dir = env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR")
-        .unwrap_or_else(|| PathBuf::from(FRAMEWORK_DIR_DEFAULT));
+    let dir = framework_dir();
     let api_impl_jar = dir.join("api-impl.jar");
     if !api_impl_jar.exists() {
         return Err(RuntimeError::FrameworkNotFound(api_impl_jar));
@@ -1236,6 +1297,36 @@ mod tests {
             matches!(r, Err(RuntimeError::FrameworkNotFound(_))),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn framework_dir_precedence_prefers_overlay_over_stock() {
+        // 2026-06-14 regression guard for the silent stock-framework fallback: `eclipse run`
+        // without ECLIPSE_ANDROID_FRAMEWORK_DIR must prefer the auto-detected patched overlay over
+        // the stock ATL framework. The stock framework lacks android.os.Build.SUPPORTED_64_BIT_ABIS,
+        // so booting against it dies in RobloxApplication.onCreate (NoSuchFieldError → SIGSEGV).
+        // Pure precedence (no env/FS reads) → identical on every machine.
+        let overlay = PathBuf::from("/cache/eclipse/framework-patched");
+        let stock = PathBuf::from(FRAMEWORK_DIR_DEFAULT);
+
+        // 1. Explicit override wins even when the overlay is present.
+        assert_eq!(
+            resolve_framework_dir(
+                Some(PathBuf::from("/custom/fw")),
+                Some(overlay.clone()),
+                true
+            ),
+            PathBuf::from("/custom/fw")
+        );
+        // 2. No override + overlay present → the patched overlay, NOT stock (the bug being guarded).
+        assert_eq!(
+            resolve_framework_dir(None, Some(overlay.clone()), true),
+            overlay
+        );
+        // 3. No override + overlay absent → stock default (documented last resort).
+        assert_eq!(resolve_framework_dir(None, Some(overlay), false), stock);
+        // 4. No override + no resolvable cache base → stock default.
+        assert_eq!(resolve_framework_dir(None, None, false), stock.clone());
     }
 
     #[test]

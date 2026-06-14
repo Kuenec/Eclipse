@@ -41,9 +41,12 @@ other class resolves unchanged from `classes2.dex`.
 
 ```sh
 tools/framework-overlay/patch-framework.sh
-export ECLIPSE_ANDROID_FRAMEWORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eclipse/framework-patched"
-cargo run -- run <APK>
+cargo run -- run <APK>      # auto-detects the overlay at $XDG_CACHE_HOME/eclipse/framework-patched
 ```
+
+`eclipse run` auto-detects the overlay at its default `OUT` location (2026-06-14), so the export
+is no longer required after running the script. Set `ECLIPSE_ANDROID_FRAMEWORK_DIR` only to point
+at an overlay built elsewhere (it still takes precedence over auto-detection).
 
 Everything is env-overridable, nothing user-specific is hardcoded:
 
@@ -73,6 +76,9 @@ adds only the field + setter + the nested interface (anchored inserts with exact
 `classes2.dex` (smali `View` + `View$OnCapturedPointerListener`) + `classes3.dex` (stock), resolved
 first-dex-wins. The nested interface lives at `smali/android/view/View$OnCapturedPointerListener.smali`.
 
-> Durability status (2026-06-11): the overlay output is still a cache artifact and
-> `eclipse run` still needs `ECLIPSE_ANDROID_FRAMEWORK_DIR` pointed at it; auto-provisioning
-> from inside Eclipse remains an open improvement tracked in `AGENTS.md` §5.
+> Durability status (2026-06-14): the overlay output is still a cache artifact, but `eclipse run`
+> now **auto-detects** it at the default `OUT` location — no `ECLIPSE_ANDROID_FRAMEWORK_DIR`
+> export needed (`runtime::framework_dir`). When no overlay is found it warns and points back at
+> this script instead of silently booting the stock framework into a `NoSuchFieldError`/SIGSEGV.
+> Remaining gap: the script itself is still run by hand (the overlay is not yet built on demand
+> from inside Eclipse).
