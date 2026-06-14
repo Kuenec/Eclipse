@@ -30,11 +30,92 @@
 //! shim and every transmuted host fn pointer uses `extern "system"`.
 
 use std::ffi::{c_char, c_void, CStr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use ash::vk;
 
 use super::ndk_registry;
+
+/// 2026-06-14: cached host `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` / `…2KHR`, captured at
+/// `vkGetInstanceProcAddr` time. `0` = unresolved.
+static HOST_PDSC: AtomicU64 = AtomicU64::new(0);
+static HOST_PDSC2: AtomicU64 = AtomicU64::new(0);
+
+/// Replace an UNDEFINED Wayland surface extent with the concrete window size. On Wayland, the host driver
+/// reports `currentExtent = 0xFFFFFFFF×0xFFFFFFFF` (per the Vulkan WSI spec: the surface size is determined
+/// by the swapchain's `imageExtent`, not the surface). Roblox's engine — written for Android, where a
+/// surface ALWAYS has a concrete size — treats that as invalid and logs `Vulkan: skipping framebuffer
+/// creation, invalid currentExtent -1x-1`, leaving no render target → `Mode 6 failed: Error opening shader
+/// pack` → `RenderView is NULL`. So Eclipse presents the real window extent like an Android surface would.
+fn fix_undefined_extent(caps: &mut vk::SurfaceCapabilitiesKHR) {
+    const UNDEF: u32 = u32::MAX;
+    if caps.current_extent.width == UNDEF || caps.current_extent.height == UNDEF {
+        let win = ndk_registry::engine_window_geometry().unwrap_or((800, 600));
+        caps.current_extent =
+            clamp_window_extent(win, caps.min_image_extent, caps.max_image_extent);
+    }
+}
+
+/// The pure core of [`fix_undefined_extent`]: the window size (≥ 1) clamped into the surface's supported
+/// `[minImageExtent, maxImageExtent]` range (the `max(min)` guards a driver reporting `max < min`).
+fn clamp_window_extent(win: (i32, i32), min: vk::Extent2D, max: vk::Extent2D) -> vk::Extent2D {
+    vk::Extent2D {
+        width: (win.0.max(1) as u32).clamp(min.width, max.width.max(min.width)),
+        height: (win.1.max(1) as u32).clamp(min.height, max.height.max(min.height)),
+    }
+}
+
+/// `PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR` — forward to the host, then fix the undefined Wayland
+/// extent via [`fix_undefined_extent`].
+///
+/// # Safety
+/// `surface`/`physical_device` forwarded unchanged; `p_caps` must be a valid out-pointer (Vulkan contract).
+pub unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilities_khr(
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    p_caps: *mut vk::SurfaceCapabilitiesKHR,
+) -> vk::Result {
+    let host = HOST_PDSC.load(Ordering::Relaxed);
+    if host == 0 || p_caps.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: 2026-06-14 — `host` is the host fn captured at gipa time; forward then rewrite the filled struct.
+    unsafe {
+        let host_fn: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
+            std::mem::transmute(host as usize as *const ());
+        let r = host_fn(physical_device, surface, p_caps);
+        if r == vk::Result::SUCCESS {
+            fix_undefined_extent(&mut *p_caps);
+        }
+        r
+    }
+}
+
+/// `PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR` — as above, unwrapping the `…2KHR` outer struct.
+///
+/// # Safety
+/// As [`eclipse_vk_get_physical_device_surface_capabilities_khr`]; `p_surface_info`/`p_caps` are the `…2` args.
+pub unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilities2_khr(
+    physical_device: vk::PhysicalDevice,
+    p_surface_info: *const vk::PhysicalDeviceSurfaceInfo2KHR<'_>,
+    p_caps: *mut vk::SurfaceCapabilities2KHR<'_>,
+) -> vk::Result {
+    let host = HOST_PDSC2.load(Ordering::Relaxed);
+    if host == 0 || p_caps.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: 2026-06-14 — `host` is the host `…2KHR` fn captured at gipa time; rewrite the inner caps.
+    unsafe {
+        let host_fn: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR =
+            std::mem::transmute(host as usize as *const ());
+        let r = host_fn(physical_device, p_surface_info, p_caps);
+        if r == vk::Result::SUCCESS {
+            fix_undefined_extent(&mut (*p_caps).surface_capabilities);
+        }
+        r
+    }
+}
 
 /// `void* dlsym(void* handle, const char* symbol)` — Eclipse-owned tier-0 `dlsym` interposer.
 ///
@@ -166,6 +247,31 @@ pub unsafe extern "system" fn eclipse_vk_get_instance_proc_addr(
         });
     }
     let host_gipa = host_get_instance_proc_addr()?;
+    // 2026-06-14: intercept the surface-capabilities queries — cache the host version and return our shim
+    // that replaces Wayland's UNDEFINED currentExtent (0xFFFFFFFF) with the concrete window extent, so the
+    // engine (Android-only, expects a fixed surface size) stops skipping framebuffer creation.
+    if name == c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" {
+        // SAFETY: 2026-06-14 — forwarding `(instance, p_name)` to the host gipa is the resolution path.
+        let host = unsafe { host_gipa(instance, p_name) };
+        HOST_PDSC.store(host.map_or(0, |f| f as usize as u64), Ordering::Relaxed);
+        return Some(unsafe {
+            std::mem::transmute::<
+                vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+                unsafe extern "system" fn(),
+            >(eclipse_vk_get_physical_device_surface_capabilities_khr)
+        });
+    }
+    if name == c"vkGetPhysicalDeviceSurfaceCapabilities2KHR" {
+        // SAFETY: 2026-06-14 — as above; the `…2KHR` entry point shares the inner-caps rewrite.
+        let host = unsafe { host_gipa(instance, p_name) };
+        HOST_PDSC2.store(host.map_or(0, |f| f as usize as u64), Ordering::Relaxed);
+        return Some(unsafe {
+            std::mem::transmute::<
+                vk::PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR,
+                unsafe extern "system" fn(),
+            >(eclipse_vk_get_physical_device_surface_capabilities2_khr)
+        });
+    }
     // SAFETY: 2026-06-13 — `host_gipa` is the host loader's `vkGetInstanceProcAddr`; forwarding the
     // engine's `(instance, p_name)` to it is exactly what an ICD/loader expects for any name we do not
     // intercept.
@@ -277,6 +383,82 @@ pub unsafe extern "system" fn eclipse_vk_create_android_surface_khr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix_undefined_extent_replaces_wayland_undefined_and_keeps_concrete() {
+        // 2026-06-14 regression guard: the engine logs `Vulkan: skipping framebuffer creation, invalid
+        // currentExtent -1x-1` and fails (Mode 6 → RenderView NULL) when the Wayland surface reports the
+        // SPEC-VALID "undefined" extent (0xFFFFFFFF). `fix_undefined_extent` must replace it with the
+        // window size, and MUST leave an already-concrete extent untouched.
+        let min = vk::Extent2D {
+            width: 1,
+            height: 1,
+        };
+        let max = vk::Extent2D {
+            width: 16384,
+            height: 16384,
+        };
+        let undef = vk::Extent2D {
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        // The pure clamp: window size, bounded to [min,max].
+        assert_eq!(
+            clamp_window_extent((800, 600), min, max),
+            vk::Extent2D {
+                width: 800,
+                height: 600
+            }
+        );
+        // Clamps below min / above max, and treats a zero/negative window as ≥ 1.
+        assert_eq!(
+            clamp_window_extent(
+                (0, -5),
+                vk::Extent2D {
+                    width: 4,
+                    height: 4
+                },
+                max
+            ),
+            vk::Extent2D {
+                width: 4,
+                height: 4
+            }
+        );
+        // A surface with an UNDEFINED extent is rewritten (engine_window_geometry default 800x600 here).
+        let mut caps = vk::SurfaceCapabilitiesKHR {
+            current_extent: undef,
+            min_image_extent: min,
+            max_image_extent: max,
+            ..Default::default()
+        };
+        fix_undefined_extent(&mut caps);
+        assert_ne!(
+            caps.current_extent.width,
+            u32::MAX,
+            "undefined extent must be replaced"
+        );
+        assert!(caps.current_extent.width >= 1 && caps.current_extent.height >= 1);
+        // A surface with a CONCRETE extent is left exactly as-is.
+        let mut concrete = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            min_image_extent: min,
+            max_image_extent: max,
+            ..Default::default()
+        };
+        fix_undefined_extent(&mut concrete);
+        assert_eq!(
+            concrete.current_extent,
+            vk::Extent2D {
+                width: 1280,
+                height: 720
+            },
+            "a concrete extent must not be touched"
+        );
+    }
 
     #[test]
     fn swap_android_for_wayland_surface_replaces_only_android_and_preserves_order() {
