@@ -7371,6 +7371,117 @@ pub fn active_text_field_text() -> Option<String> {
         .flatten()
 }
 
+/// The focused textbox's on-screen rect `(x, y, w, h)` from the engine, or `None` if no field is active.
+/// Cached by [`query_textbox_geometry`] (run on the JNI-attached main thread) so the Vulkan present-path
+/// overlay — which runs on the engine render thread and must NOT call into the engine — can position the
+/// text where the field actually is (the login layout drifts, so a fixed rect goes stale). 2026-06-14.
+static TEXTBOX_GEOM: std::sync::Mutex<Option<(i32, i32, u32, u32)>> = std::sync::Mutex::new(None);
+
+/// The cached focused-textbox geometry `(x, y, w, h)`, or `None`.
+pub fn textbox_geometry() -> Option<(i32, i32, u32, u32)> {
+    TEXTBOX_GEOM.lock().ok().and_then(|g| *g)
+}
+
+/// Query the engine for the focused textbox's geometry (`NativeGLInterface.nativeGetTextBoxInfo` →
+/// `x/y/width/height` floats) and cache it for the overlay. MUST be called on the JNI-attached main thread
+/// (the engine's `getTextBoxInfo` is a normal Java-thread query — no reentrancy into Eclipse). Best-effort:
+/// a missing class/method/field or a JNI throw is cleared and leaves the cache unchanged; a null info (no
+/// active textbox) clears it. 2026-06-14.
+pub fn query_textbox_geometry(vm: &Vm) {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let cls = match env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface")) {
+                Ok(c) => c,
+                Err(_) => {
+                    env.exception_clear();
+                    return;
+                }
+            };
+            let Ok(info) = checked(env, "NativeGLInterface.nativeGetTextBoxInfo", |env| {
+                env.call_static_method(
+                    &cls,
+                    jni_str!("nativeGetTextBoxInfo"),
+                    jni_sig!("()Lcom/roblox/engine/jni/model/NativeTextBoxInfo;"),
+                    &[],
+                )?
+                .l()
+            }) else {
+                return;
+            };
+            if info.is_null() {
+                if let Ok(mut g) = TEXTBOX_GEOM.lock() {
+                    *g = None;
+                }
+                return;
+            }
+            let Ok(info_cls) = checked(env, "Object.getClass", |env| {
+                env.call_method(
+                    &info,
+                    jni_str!("getClass"),
+                    jni_sig!("()Ljava/lang/Class;"),
+                    &[],
+                )?
+                .l()
+            }) else {
+                return;
+            };
+            // Read one `float` field of `info` by name (getDeclaredField → setAccessible → getFloat).
+            let read = |env: &mut Env, name: &str| -> Option<f32> {
+                let jname = env.new_string(name).ok()?;
+                let field = checked(env, "Class.getDeclaredField", |env| {
+                    env.call_method(
+                        &info_cls,
+                        jni_str!("getDeclaredField"),
+                        jni_sig!("(Ljava/lang/String;)Ljava/lang/reflect/Field;"),
+                        &[JValue::Object(&jname)],
+                    )?
+                    .l()
+                })
+                .ok()?;
+                let _ = checked(env, "Field.setAccessible", |env| {
+                    env.call_method(
+                        &field,
+                        jni_str!("setAccessible"),
+                        jni_sig!("(Z)V"),
+                        &[JValue::Bool(true)],
+                    )?
+                    .v()
+                });
+                checked(env, "Field.getFloat", |env| {
+                    env.call_method(
+                        &field,
+                        jni_str!("getFloat"),
+                        jni_sig!("(Ljava/lang/Object;)F"),
+                        &[JValue::Object(&info)],
+                    )?
+                    .f()
+                })
+                .ok()
+            };
+            let (Some(x), Some(y), Some(w), Some(h)) = (
+                read(env, "x"),
+                read(env, "y"),
+                read(env, "width"),
+                read(env, "height"),
+            ) else {
+                return;
+            };
+            if w > 0.0 && h > 0.0 {
+                if let Ok(mut g) = TEXTBOX_GEOM.lock() {
+                    *g = Some((x as i32, y as i32, w as u32, h as u32));
+                }
+            }
+        }));
+        Ok(())
+    });
+}
+
 /// `<Widget>.native_setText(long widget, String text)` → record the text on the receiver's
 /// [`view_registry`] peer (2026-06-13).
 ///
@@ -7531,13 +7642,17 @@ fn pass_key_event_to_engine(vm: &Vm, unicode: i32, backspace: bool) {
 
 /// Which per-keystroke host-input delivery paths fire (env `ECLIPSE_TEXT_PATHS`, cached). Letters:
 /// `w` EditText TextWatcher (RbxKeyboard validation → "Next"), `p` `nativePassText`, `s`
-/// `syncTextboxTextAndCursorPosition2`, `k` `nativePassKeyEvent`, `e` `updateKeyboardSize`. Default
-/// `"wpske"` (all — prior behavior). Firing multiple text-delivery paths duplicates each typed char, so
-/// this isolates the single clean path. 2026-06-14.
+/// `syncTextboxTextAndCursorPosition2`, `k` `nativePassKeyEvent`, `e` `updateKeyboardSize`. Default `w`
+/// (TextWatcher only — detection without the kick-out/tripling the engine-render bridges cause; the
+/// overlay handles display). Firing multiple text-delivery paths duplicates each typed char. 2026-06-14.
 fn text_paths() -> &'static str {
     static PATHS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PATHS
-        .get_or_init(|| std::env::var("ECLIPSE_TEXT_PATHS").unwrap_or_else(|_| "wpske".to_string()))
+    // Default `w` (the EditText TextWatcher only): it delivers typed text to the engine for DETECTION/
+    // validation (RbxKeyboard's standard path — confirmed live: the username resolved + advanced to the
+    // password step) WITHOUT the per-keystroke kick-out/tripling the other engine bridges (`p`/`s`/`k`,
+    // esp. composing) cause. The VISIBLE text is drawn by the Vulkan overlay, not the engine, so no
+    // engine-render bridge is needed. 2026-06-14.
+    PATHS.get_or_init(|| std::env::var("ECLIPSE_TEXT_PATHS").unwrap_or_else(|_| "w".to_string()))
 }
 
 /// Route a host keystroke into the active text-input `EditText` — the field whose `native_getText` the
