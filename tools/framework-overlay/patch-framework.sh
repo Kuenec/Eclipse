@@ -136,6 +136,13 @@ perl -0pi -e 's{(\.method public setOnClickListener\(Landroid/view/View\$OnClick
 perl -0pi -e 's{(value = \{\n)(        Landroid/view/View\$DeclaredOnClickListener;,\n)}{$1        Landroid/view/View\$OnCapturedPointerListener;,\n$2}' "$vsm"
 grep -qF 'setOnCapturedPointerListener(Landroid/view/View$OnCapturedPointerListener;)V' "$vsm" || fail "View.smali setter insert failed (drift?)"
 grep -qF 'mCapturedPointerListener:Landroid/view/View$OnCapturedPointerListener;' "$vsm" || fail "View.smali field insert failed (drift?)"
+# (ii.b) AOSP autofill no-ops after the captured-pointer setter — Roblox's com.roblox.client.RbxKeyboard
+# configures the focused login EditText for autofill (View.setAutofillHints(String[]) +
+# setImportantForAutofill(int)); ATL's View omits both, so RbxKeyboard's text-input setup throws
+# NoSuchMethodError and typing into the field never works. Eclipse has no autofill service -> no-ops.
+perl -0pi -e 's{(\.method public setOnCapturedPointerListener\(Landroid/view/View\$OnCapturedPointerListener;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP autofill no-ops (RbxKeyboard configures the login EditText for autofill; ATL omits these). No autofill service.\n.method public setAutofillHints([Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method\n\n.method public setImportantForAutofill(I)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$vsm"
+grep -qF 'setAutofillHints([Ljava/lang/String;)V' "$vsm" || fail "View.smali setAutofillHints insert failed (drift?)"
+grep -qF 'setImportantForAutofill(I)V' "$vsm" || fail "View.smali setImportantForAutofill insert failed (drift?)"
 
 # Display.getSupportedRefreshRates — Roblox calls it in Activity.onStart (framerate setup); ATL's Display
 # omits it. Same drift-proof smali approach: add the method to the AUTHORITATIVE installed Display, returning
@@ -209,8 +216,21 @@ n="$(grep -cF '.method public vibrate(J)V' "$vibsm")" || true
 perl -0pi -e 's{(\.method public vibrate\(J\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-13: AOSP Vibrator.cancel() no-op (Roblox calls it on a Timer thread; ATL omits it). No vibration device -> nothing to cancel.\n.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$vibsm"
 grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali cancel insert failed (drift?)"
 
-# assemble View(+nested) + Display(+Mode) + Activity + Fragment + Vibrator -> classes2.dex
-mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/os"
+# AutofillManager.cancel() no-op — Roblox's com.roblox.client.RbxKeyboard.i() calls it when showing the
+# soft keyboard / text input for a focused field (e.g. the LoginV2 username/password fields); ATL's
+# AutofillManager (only <init>/registerCallback/unregisterCallback) omits cancel(), so the keyboard-show
+# path throws NoSuchMethodError and text entry never sets up (the field focuses but typing does nothing).
+# Eclipse has no autofill service, so cancel is a no-op. Anchor on the unique unregisterCallback.
+afm="$work/smali/android/view/autofill/AutofillManager.smali"
+[ -f "$afm" ] || fail "AutofillManager.smali not found after baksmali"
+n="$(grep -cF '.method public unregisterCallback(Landroid/view/autofill/AutofillManager$AutofillCallback;)V' "$afm")" || true
+[ "$n" = "1" ] || fail "AutofillManager.smali unregisterCallback anchor not unique (found $n, expected 1) — installed AutofillManager drifted; update patch-framework.sh"
+! grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali already declares cancel — installed AutofillManager drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public unregisterCallback\(Landroid/view/autofill/AutofillManager\$AutofillCallback;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP AutofillManager.cancel() no-op (Roblox RbxKeyboard.i() calls it when showing text input for a focused login field; ATL omits it). No autofill service -> nothing to cancel.\n.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$afm"
+grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali cancel insert failed (drift?)"
+
+# assemble View(+nested) + Display(+Mode) + Activity + Fragment + Vibrator + AutofillManager -> classes2.dex
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/os" "$work/smali-view/android/view/autofill"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
@@ -218,6 +238,7 @@ cp "$here/smali/android/view/Display\$Mode.smali" "$work/smali-view/android/view
 cp "$asm" "$work/smali-view/android/app/Activity.smali"
 cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
+cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
 # --- 4c. stock api-impl as classes3.dex; compose the 3-dex overlay jar --------------------
