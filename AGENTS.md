@@ -128,6 +128,24 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-06-15 — ✅ FULL BOOT RE-CONFIRMED at HEAD (renders → `LoginV2`); + DEV-HOST GOTCHA: the auto-detected cache
+  overlay can be STALE, not just wiped.** A bare `./target/release/eclipse run roblox-2.721.1108.apk` first died with
+  `System.exit(10)`: `runtime::find_framework` auto-detected `~/.cache/eclipse/framework-patched`, but that cache was
+  built **2026-06-11** (a previous session) — it predates the 2026-06-14 overlay commits, so it lacked
+  `JobParameters.getNetwork()` → `NoSuchMethodError` (worker/job path) → `hacky_uncaught_exception_handler` →
+  `System.exit(10)`. **Lesson: rebuild the overlay after ANY commit that touches `tools/framework-overlay/` — the
+  auto-detect uses the cache dir's CONTENT as-is and cannot tell it is out of date (the existing note framed the rebuild
+  trigger as "if `~/.cache/eclipse` was wiped"; "stale/outdated" is the sharper, more common trigger).** Exact dev-host
+  recipe used (this host had NO smali toolchain): `sudo pacman -S smali` (installs `/usr/share/java/smali/{baksmali,smali}.jar`
+  + a java-11 runtime); re-extract ATL sources `tar xzf ~/.cache/paru/clone/android_translation_layer/android_translation_layer-<rev>.tar.gz -C /tmp/atlsrc`;
+  then `ATL_SRC=/tmp/atlsrc/<dir>/src/api-impl JAVAC=/usr/lib/jvm/java-26-openjdk/bin/javac JAR=…/jar JAVA=/usr/lib/jvm/java-11-openjdk/bin/java
+  BAKSMALI_JAR=/usr/share/java/smali/baksmali.jar SMALI_JAR=/usr/share/java/smali/smali.jar bash tools/framework-overlay/patch-framework.sh`
+  (JDK 26 compiles `--release`; the smali jars run on java-11; `dx` already in PATH; `ORIG_FW` defaults to the installed
+  ATL). **After the rebuild the boot ran a clean 90 s** (`EXIT=124`, `/tmp/eclipse-launch2.log`): `Compiled 1070 shaders`
+  → `setStage: LuaApp` → `onAppReady` **Startup → Landing → LoginV2** → `AssetsManifestManager` OTA writes/reads →
+  `SceneManager: resizing main targets to 800x600` → `vk-overlay field-probe` (login-text overlay live); a
+  `ChallengeNativeWrapper`/`ChallengeHybridWebView` (Roblox login captcha/verification) also appeared — i.e. the login
+  screen renders and is interactive. Gate green (fmt/clippy/573 unit + 4 integ + 2 doctest/release at `50ad78c`).
 - **2026-06-14 — ✅✅✅ HOST INPUT IS FORWARDED — CLICKS REACH ROBLOX AND DRIVE THE UI. Tapping "Sign In" navigated the app Landing → LoginV2. ⇐ START HERE NEXT SESSION.**
   Three coupled fixes made it work (one commit):
   1. **Event-loop FREEZE fixed — bounded main-Looper pump (`src/framework.rs` `drive_main_messages`, replacing the single `Looper.loop()` call in `run_main_looper_once`).** ROOT CAUSE: `pump_main_looper` drove `android.os.Looper.loop()` once per `about_to_wait`, relying on it draining to empty and returning. But the landing screen's auth/fragment error-retry paths RE-POST main-thread messages continuously, so the queue is never empty, `loop()` never returns, and the **winit event loop froze** (`about_to_wait` never returns → no host input, real or synthetic, is delivered; the main thread spins `RNl`). Fix: drive a BOUNDED batch (`MAIN_LOOPER_MESSAGE_BUDGET = 512`) per tick, mirroring ATL's `Looper.loop` body exactly (`Looper.myQueue` → `MessageQueue.next` [non-blocking under Eclipse, yields null when idle] → `Message.getTarget` → `Handler.dispatchMessage` → `Message.recycle`), each message in its own local frame, a thrown handler described+cleared (stricter than `loop()`, which aborts the whole loop on a throw). Idle drains in << budget (identical to `loop()`); only a storm hits the cap → the loop stays responsive. **This was THE input blocker** (the renderer-None gate below was necessary but not sufficient).
