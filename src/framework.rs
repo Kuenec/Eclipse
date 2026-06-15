@@ -4449,6 +4449,20 @@ const VIEW_NATIVE_GET_WINDOW_SIG: &JNIStr = jni_str!("(J)Landroid/view/Window;")
 const VIEW_NATIVE_DESTRUCTOR_NAME: &JNIStr = jni_str!("native_destructor");
 const VIEW_NATIVE_DESTRUCTOR_SIG: &JNIStr = jni_str!("(J)V");
 
+// 2026-06-15: post-login Home-screen natives. `View.getWindowVisibleDisplayFrame(Rect)` (View.java:2216,
+// `public native void getWindowVisibleDisplayFrame(Rect rect)` — INSTANCE, no widget handle) and
+// `View.nativeIsAttachedToWindow(long widget)` (View.java:2012, `private native boolean`, `(J)Z`). Both
+// were UNBOUND and threw on the LuaApp Home setup (`Handler.dispatchMessage` failed every cycle →
+// Home re-navigated Startup→…→Home in a tight loop, hammering APIs into HTTP 429). ATL backs the visible
+// frame against its GtkWindow; Eclipse has no system bars/insets, so the visible frame IS the full host
+// window — filled from the published `ndk_registry::engine_window_geometry()`. `isAttachedToWindow` → true
+// (the view tree is on the live window). Live boot 2026-06-15: this loop is what blocked the post-login Home.
+const VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_NAME: &JNIStr =
+    jni_str!("getWindowVisibleDisplayFrame");
+const VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_SIG: &JNIStr = jni_str!("(Landroid/graphics/Rect;)V");
+const VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_NAME: &JNIStr = jni_str!("nativeIsAttachedToWindow");
+const VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG: &JNIStr = jni_str!("(J)Z");
+
 // 2026-06-13: `View.setBackgroundColor(int)` and `View.native_keep_screen_on(long, boolean)` are NOT
 // RegisterNatives-bound here. Commit 58a50f6 added bindings for both citing the *vendored* View.java
 // (line 1284 `public native void setBackgroundColor(int color);`, line 1982 `private static native
@@ -4848,6 +4862,53 @@ extern "system" fn view_native_set_fullscreen<'local>(
 /// `getViewTreeObserver` builds a floating observer (View.java line 1252). The body runs inside
 /// [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8); `resolve::<LogErrorAndDefault>`
 /// returns the `JObject` default (a JNI null) on any error/panic — itself the floating-observer path.
+/// `View.getWindowVisibleDisplayFrame(Rect rect)` → fill `rect` with the host window's visible frame
+/// (2026-06-15). INSTANCE native (no widget handle), descriptor `(Landroid/graphics/Rect;)V`. Eclipse's
+/// window has no system bars/insets, so the visible frame is the full window `(0, 0, w, h)` taken from
+/// the published [`ndk_registry::engine_window_geometry`] (default 800×600 before the window opens). A
+/// null `rect` is a no-op. UNBOUND, this threw on every Home/LuaApp setup tick (`Handler.dispatchMessage`)
+/// and drove the post-login Home into a Startup→Home re-navigation loop (HTTP 429 storms).
+extern "system" fn view_get_window_visible_display_frame<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    rect: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if rect.is_null() {
+            return Ok(());
+        }
+        let (w, h) = crate::loader::ndk_registry::engine_window_geometry().unwrap_or((800, 600));
+        // SAFETY: "I" paired with JavaType::Int is FieldSignature::from_raw_parts' invariant; Rect's
+        // left/top/right/bottom are `public int` (Rect.java:28-31), so each set is type-correct.
+        let int_sig =
+            unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
+        env.set_field(&rect, jni_str!("left"), &int_sig, 0i32.into())?;
+        env.set_field(&rect, jni_str!("top"), &int_sig, 0i32.into())?;
+        env.set_field(&rect, jni_str!("right"), &int_sig, w.into())?;
+        env.set_field(&rect, jni_str!("bottom"), &int_sig, h.into())?;
+        tracing::trace!(
+            target: "android.view.View",
+            w,
+            h,
+            "View.getWindowVisibleDisplayFrame: filled with the host window frame"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.nativeIsAttachedToWindow(long widget)` → `true` (2026-06-15). INSTANCE native, `(J)Z`. jni 0.22
+/// maps `jboolean` to Rust `bool`. The view tree is wired onto the single live host window, so report
+/// attached; UNBOUND, this threw on the Home setup path (a sibling gap of `getWindowVisibleDisplayFrame`).
+extern "system" fn view_native_is_attached_to_window<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _widget: jlong,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(true) })
+        .resolve::<LogErrorAndDefault>()
+}
+
 extern "system" fn view_native_get_window<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5055,7 +5116,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // framework's `setBackgroundColor(int)` is plain Java, not native (see the consts comment near
     // `VIEW_SET_ON_CLICK_LISTENER_NAME` for the 58a50f6 live-log evidence); the best-effort registrar
     // additionally makes any future such drift non-fatal (deferred per-method UnsatisfiedLinkError).
-    let bindings: [NativeBinding; 13] = [
+    let bindings: [NativeBinding; 15] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -5126,6 +5187,18 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_DESTRUCTOR_SIG,
             view_native_destructor as *mut c_void,
         ),
+        // 2026-06-15: post-login Home-screen gaps (View.java:2216/2012). UNBOUND, these threw on every
+        // LuaApp Home setup tick and drove the Startup→Home re-navigation loop (HTTP 429 storm).
+        (
+            VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_NAME,
+            VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_SIG,
+            view_get_window_visible_display_frame as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_NAME,
+            VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG,
+            view_native_is_attached_to_window as *mut c_void,
+        ),
     ];
     // SAFETY: each `ptr` is an `extern "system"` fn matching its paired descriptor by construction (see
     // the per-entry references above); the registrar binds them per method on `android/view/View`.
@@ -5133,7 +5206,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/view/View",
         bound,
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + getWindowVisibleDisplayFrame + nativeIsAttachedToWindow (per-method best-effort)"
     );
     Ok(())
 }
@@ -12977,6 +13050,21 @@ mod tests {
             "native_setBackgroundColor"
         );
         assert_eq!(VIEW_SET_BACKGROUND_COLOR_SIG.to_str(), "(JI)V");
+        // 2026-06-15 post-login Home natives, pinned to View.java (2216/2012). A descriptor regression
+        // re-introduces the UnsatisfiedLinkError that drove the Startup→Home loop (HTTP 429 storm).
+        assert_eq!(
+            VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_NAME.to_str(),
+            "getWindowVisibleDisplayFrame"
+        );
+        assert_eq!(
+            VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_SIG.to_str(),
+            "(Landroid/graphics/Rect;)V"
+        );
+        assert_eq!(
+            VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_NAME.to_str(),
+            "nativeIsAttachedToWindow"
+        );
+        assert_eq!(VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG.to_str(), "(J)Z");
         // nativeSetFullscreen(long, boolean) → `(JZ)V`, View.java line 1214; surfaced 2026-06-11 by
         // Roblox's ActivitySplash.onCreate setSystemUiVisibility (the ART No-implementation-found line).
         assert_eq!(
