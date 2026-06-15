@@ -4278,6 +4278,118 @@ fn register_process_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own (non-GTK) backing for android.view.inputmethod.InputMethodManager =============
+//
+// 2026-06-15: ATL's InputMethodManager (api-impl/android/view/inputmethod/InputMethodManager.java) declares a
+// STATIC native `nativeInit()` that returns a `long` — a GtkIMContext pointer in ATL, but Eclipse has no
+// soft keyboard (no GTK), so this returns a dummy non-null handle (0 is valid as "no context"). UNBOUND,
+// this threw during the post-logout LuaApp re-init (2×). The `im_context` class field stores the handle;
+// Eclipse's 0 sentinel means "no IM context" (hideSoftInput/showSoftInput no-ops).
+
+/// `android.view.inputmethod.InputMethodManager` (internal/slashed name for `find_class`).
+pub const INPUT_METHOD_MANAGER_CLASS: &JNIStr = jni_str!("android/view/inputmethod/InputMethodManager");
+
+// JNI name + descriptor for InputMethodManager.nativeInit, exactly as declared in
+// InputMethodManager.java (line 56): `private static native long nativeInit();` → STATIC, descriptor `()J`.
+const IMM_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
+const IMM_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
+
+/// `InputMethodManager.nativeInit()` → 0 (2026-06-15). STATIC native, descriptor `()J`. Eclipse has no
+/// soft keyboard (no GTK/GtkIMContext), so this returns 0 as a "no IM context" sentinel. UNBOUND, this
+/// threw during the post-logout LuaApp re-init (2×).
+extern "system" fn imm_native_init<'local>(mut env: EnvUnowned<'local>) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> { Ok(0) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `InputMethodManager.nativeInit()`.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature.
+/// It does, by construction — `()J` as a STATIC native (pinned by
+/// `imm_native_name_sig_and_class_match_api_impl_dex`). The body is `catch_unwind`-guarded
+/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(INPUT_METHOD_MANAGER_CLASS)?;
+    let methods = [
+        // SAFETY: `imm_native_init` matches the paired `()J` signature as a static native; the cast
+        // is how `NativeMethod::from_raw_parts` takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                IMM_NATIVE_INIT_NAME,
+                IMM_NATIVE_INIT_SIG,
+                imm_native_init as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/view/inputmethod/InputMethodManager; the method holds
+    // a valid fn pointer whose signature matches the class's `native` declaration (InputMethodManager.java
+    // line 56, ATL api-impl).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/view/inputmethod/InputMethodManager",
+        "registered Eclipse's non-GTK backing for nativeInit (no soft keyboard → 0 sentinel)"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.app.Dialog =====================================
+//
+// 2026-06-15: ATL's Dialog (api-impl/android/app/Dialog.java) declares an INSTANCE native `nativeInit()`
+// that returns a `long` — a GtkWindow dialog pointer in ATL, but Eclipse has no dialog system (no GTK),
+// so this returns a dummy non-null handle (1 as a "dialog placeholder"). UNBOUND, this threw during the
+// post-logout LuaApp re-init (2×). The `nativePtr` instance field stores the handle; Eclipse's sentinel
+// means "no real dialog" (setTitle/setContentView/show/close no-ops).
+
+/// `android.app.Dialog` (internal/slashed name for `find_class`).
+pub const DIALOG_CLASS: &JNIStr = jni_str!("android/app/Dialog");
+
+// JNI name + descriptor for Dialog.nativeInit, exactly as declared in Dialog.java (line 23):
+// `protected native long nativeInit();` → INSTANCE, descriptor `()J`.
+const DIALOG_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
+const DIALOG_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
+
+/// `Dialog.nativeInit()` → 1 (2026-06-15). INSTANCE native, descriptor `()J`. Eclipse has no dialog
+/// system (no GTK/GtkWindow), so this returns 1 as a "dialog placeholder" sentinel. UNBOUND, this
+/// threw during the post-logout LuaApp re-init (2×).
+extern "system" fn dialog_native_init<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> { Ok(1) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `Dialog.nativeInit()`.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature.
+/// It does, by construction — `()J` as an INSTANCE native (pinned by
+/// `dialog_native_name_sig_and_class_match_api_impl_dex`). The body is `catch_unwind`-guarded
+/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_dialog_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(DIALOG_CLASS)?;
+    let methods = [
+        // SAFETY: `dialog_native_init` matches the paired `()J` signature as an instance native;
+        // the cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                DIALOG_NATIVE_INIT_NAME,
+                DIALOG_NATIVE_INIT_SIG,
+                dialog_native_init as *mut std::ffi::c_void,
+            )
+        },
+    ];
+    // SAFETY: `class` is the loaded android/app/Dialog; the method holds a valid fn pointer whose
+    // signature matches the class's `native` declaration (Dialog.java line 23, ATL api-impl).
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/app/Dialog",
+        "registered Eclipse's non-GTK backing for nativeInit (no dialog system → 1 placeholder)"
+    );
+    Ok(())
+}
+
 // === Eclipse's own (non-GTK) backing for android.view.View native peer construction =============
 //
 // 2026-06-05: step 4 (`Activity.createMainActivity`) constructs the launcher Activity, whose
@@ -4462,6 +4574,17 @@ const VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_NAME: &JNIStr =
 const VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_SIG: &JNIStr = jni_str!("(Landroid/graphics/Rect;)V");
 const VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_NAME: &JNIStr = jni_str!("nativeIsAttachedToWindow");
 const VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG: &JNIStr = jni_str!("(J)Z");
+
+// 2026-06-15: Home-screen view-focus/geometry natives. `View.native_getGlobalVisibleRect(long, Rect)` (View.java:2179,
+// `protected native boolean native_getGlobalVisibleRect(long widget, Rect visibleRect)`, returns `(JLandroid/graphics/Rect;)Z`)
+// and `View.nativeRequestFocus(long, int)` (View.java:1298, `private native void nativeRequestFocus(long widget, int direction)`,
+// descriptor `(JI)V`). UNBOUND, these threw on the post-logout LuaApp re-init (4× getGlobalVisibleRect, 2× requestFocus).
+// Eclipse has no window hierarchy, so the global visible rect is the full window frame (0,0,w,h) taken from
+// `ndk_registry::engine_window_geometry()`, and focus is a no-op (no focus manager).
+const VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_NAME: &JNIStr = jni_str!("native_getGlobalVisibleRect");
+const VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_SIG: &JNIStr = jni_str!("(JLandroid/graphics/Rect;)Z");
+const VIEW_NATIVE_REQUEST_FOCUS_NAME: &JNIStr = jni_str!("nativeRequestFocus");
+const VIEW_NATIVE_REQUEST_FOCUS_SIG: &JNIStr = jni_str!("(JI)V");
 
 // 2026-06-13: `View.setBackgroundColor(int)` and `View.native_keep_screen_on(long, boolean)` are NOT
 // RegisterNatives-bound here. Commit 58a50f6 added bindings for both citing the *vendored* View.java
@@ -4909,6 +5032,54 @@ extern "system" fn view_native_is_attached_to_window<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.native_getGlobalVisibleRect(long widget, Rect visibleRect)` → fill `rect` with the window frame
+/// (2026-06-15). INSTANCE native, descriptor `(JLandroid/graphics/Rect;)Z` (View.java:2179). Eclipse's
+/// window has no insets, so the global visible rect is the full window `(0, 0, w, h)` taken from
+/// `ndk_registry::engine_window_geometry()`. Returns `true` (success). UNBOUND, this threw on the
+/// post-logout LuaApp re-init (4×).
+extern "system" fn view_native_get_global_visible_rect<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _widget: jlong,
+    rect: JObject<'local>,
+) -> jboolean {
+    env.with_env(|env| -> jni::errors::Result<jboolean> {
+        if rect.is_null() {
+            return Ok(false);
+        }
+        let (w, h) = crate::loader::ndk_registry::engine_window_geometry().unwrap_or((800, 600));
+        // SAFETY: "I" paired with JavaType::Int is FieldSignature::from_raw_parts' invariant; Rect's
+        // left/top/right/bottom are `public int` (Rect.java:28-31), so each set is type-correct.
+        let int_sig =
+            unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
+        env.set_field(&rect, jni_str!("left"), &int_sig, 0i32.into())?;
+        env.set_field(&rect, jni_str!("top"), &int_sig, 0i32.into())?;
+        env.set_field(&rect, jni_str!("right"), &int_sig, w.into())?;
+        env.set_field(&rect, jni_str!("bottom"), &int_sig, h.into())?;
+        tracing::trace!(
+            target: "android.view.View",
+            w,
+            h,
+            "View.native_getGlobalVisibleRect: filled with the host window frame"
+        );
+        Ok(true)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.nativeRequestFocus(long widget, int direction)` → no-op (2026-06-15). INSTANCE native,
+/// descriptor `(JI)V` (View.java:1298). Eclipse has no focus manager, so this is a no-op. UNBOUND,
+/// this threw on the post-logout LuaApp re-init (2×).
+extern "system" fn view_native_request_focus<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _widget: jlong,
+    _direction: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> { Ok(()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
 extern "system" fn view_native_get_window<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5116,7 +5287,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // framework's `setBackgroundColor(int)` is plain Java, not native (see the consts comment near
     // `VIEW_SET_ON_CLICK_LISTENER_NAME` for the 58a50f6 live-log evidence); the best-effort registrar
     // additionally makes any future such drift non-fatal (deferred per-method UnsatisfiedLinkError).
-    let bindings: [NativeBinding; 15] = [
+    let bindings: [NativeBinding; 17] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -5199,6 +5370,19 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG,
             view_native_is_attached_to_window as *mut c_void,
         ),
+        // 2026-06-15: post-logout LuaApp re-init gaps (View.java:2179/1298). UNBOUND, these threw during
+        // the LuaApp reload (4× getGlobalVisibleRect, 2× requestFocus). Eclipse has no window hierarchy,
+        // so the global visible rect is the full window frame and focus is a no-op.
+        (
+            VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_NAME,
+            VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_SIG,
+            view_native_get_global_visible_rect as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_REQUEST_FOCUS_NAME,
+            VIEW_NATIVE_REQUEST_FOCUS_SIG,
+            view_native_request_focus as *mut c_void,
+        ),
     ];
     // SAFETY: each `ptr` is an `extern "system"` fn matching its paired descriptor by construction (see
     // the per-entry references above); the registrar binds them per method on `android/view/View`.
@@ -5206,7 +5390,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/view/View",
         bound,
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + getWindowVisibleDisplayFrame + nativeIsAttachedToWindow (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + getWindowVisibleDisplayFrame + nativeIsAttachedToWindow + native_getGlobalVisibleRect + nativeRequestFocus (per-method best-effort)"
     );
     Ok(())
 }
@@ -11286,6 +11470,14 @@ fn drive_lifecycle(
     // listener count 0→1 and calls this native (ViewTreeObserver.java line 344). Unbound, it threw
     // the next UnsatisfiedLinkError on the same view-tree-setup path (2026-06-13).
     register_view_tree_observer_natives(env)?;
+    // Bind android.view.inputmethod.InputMethodManager.nativeInit — the class holds a static `im_context`
+    // field initialized by nativeInit() during class static init (InputMethodManager.java line 10). UNBOUND,
+    // this threw during the post-logout LuaApp re-init (2026-06-15). Eclipse returns 0 (no soft keyboard).
+    register_input_method_manager_natives(env)?;
+    // Bind android.app.Dialog.nativeInit — Dialog constructor calls nativeInit() to allocate its native
+    // peer (Dialog.java line 38). UNBOUND, this threw during the post-logout LuaApp re-init (2026-06-15).
+    // Eclipse returns 1 (no dialog system placeholder).
+    register_dialog_natives(env)?;
     // Bind android.view.Window's window-setup natives on its own class — step 4 wires the launcher's
     // Window onto the native window handle (set_jobject/set_title/set_layout/set_widget_as_root), so
     // these must be bound before step 4. Bound non-GTK against window_registry/view_registry.
