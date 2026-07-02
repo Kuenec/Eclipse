@@ -128,10 +128,105 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-02 — 📐 `android.view.View` LAYOUT/GEOMETRY native remainder audited + bound as a CLASS (closes the
+  challenge8 `native_layout` frontier) — ✅ VALIDATED by the 2026-07-02 challenge9 boot + COMMITTED 2026-07-02
+  ⇐ START-HERE-NEXT: bind/back the installed framework's `android.webkit.WebView` native surface (plan at the end
+  of this bullet).** Implements the 🖌️ bullet's
+  START-HERE-NEXT (see §6 2026-07-02 📐 for the full audit table). DECLARED-VS-BOUND audit (View has had several
+  partial passes, so this pass diffed, not re-enumerated): baksmali of the installed
+  `~/.cache/eclipse/framework-patched/api-impl.jar` (vendored smali toolchain + JDK-21 java, 2026-07-02) shows
+  `android/view/View` declares EXACTLY 30 natives — in BOTH dexes that define View: the classes2.dex
+  overlay-shadowed View (the ACTIVE first-dex-wins copy, from the 2026-06-13 pointer-capture patch) and the stock
+  classes3.dex View declare IDENTICAL 30-native surfaces (classes.dex defines NO View — of its 19 classes
+  [Build×3, ActivityManager×6, KeyguardManager, NetworkRequest×2, PowerManager×2, ValueCallback + the 3
+  LayoutInflater classes] the only `android/view` ones are the LayoutInflater trio; wording corrected by the
+  2026-07-02 review pass — the original "defines only LayoutInflater" undercounted the javac-patched classes). 17 were
+  already bound (`register_view_natives`); the 13-native REMAINDER is now worked: **9 newly bound** (same
+  registrar, 17 → 26 entries, per-method best-effort): `native_layout(JIIII)V` (**the challenge8 discovery
+  signal**) = registry-backed RECORD of the laid-out frame — VERIFIED HONEST: the installed `layout(l,t,r,b)`
+  stores the frame in Java fields (`left`/`top`/`right`/`bottom`) BEFORE invoking the native and ALL Java
+  read-back (`getLeft`/`getTop`/`getRight`/`getBottom`/`getWidth`/`getHeight`/`offsetTopAndBottom`/
+  `offsetLeftAndRight`) is Java-field-backed (smali-proven; the vendored View.java has DRIFTED — it declares
+  `native getWidth()/getHeight()`, the installed dex has plain-Java field reads), so the record is Eclipse-side
+  bookkeeping on the EXISTING `view_registry` (new `ViewState.frame: Option<[i32;4]>` + `set_frame`, beside the
+  requested LayoutParams — no duplicate state); `nativeIsFocused(J)Z` = value-returning, served HONESTLY from a
+  new lock-free `view_registry` focus record (`FOCUSED_VIEW` AtomicI64, the ACTIVE_ROOT shape) that its COUPLED
+  WRITER `nativeRequestFocus(JI)V` — already bound 2026-07-01 as a pure no-op, now upgraded to record the
+  requesting view — stores (the 2026-06-13 CheckBox `isChecked`/`setChecked` rule: never no-op the setter while
+  the getter reads back; installed `isFocused()` returns the native verbatim); validated no-ops (write-only,
+  ATL-reference-C + smali verified, no reader): `nativeInvalidate(J)V` (STATIC, GTK queue_draw),
+  `native_keep_screen_on(JZ)V` (STATIC, GtkApplication suspend-inhibit — the 58a50f6 embargo on it is LIFTED by
+  the dex declaration proof; `setBackgroundColor(I)V` stays OUT, still plain Java), `native_addClass
+  (JLjava/lang/String;)V` + `native_removeClasses(J[Ljava/lang/String;)V` (GTK CSS classes — invokers, per the
+  2026-07-02 review-pass full scan: `View.setTextAlignment` "ATL-text-align-*", `TextView.setAllCaps`
+  "ATL-text-uppercase", `TextView.setTypeface` "ATL-font-bold"/"ATL-font-italic", `Button.<init>` "ATL-no-border"
+  [addClass only] — all resolve to View's declaration, write-only, no reader on ANY path),
+  `native_drawBackground(JJ)V` + `native_drawContent(JJ)V` (GskCanvas-instanceof-guarded snapshot renders — the
+  🎨 `Drawable.native_draw` precedent), `native_queueAllocate(J)V` (setTranslationX/Y's PARENT re-layout request).
+  **4 left unbound (documented):** `native_measure(JII)V` — a REAL content-measure pass whose
+  `setMeasuredDimension` upcall IS read back via `getMeasuredWidth()/Height()` (installed `onMeasure` calls ONLY
+  the native for `haveCustomMeasure == false` views — TextView/ProgressBar/ImageView/Spinner flip the flag to
+  route there for Pango/GTK content metrics; unservable honestly headless — the `Paint.native_get_text_bounds`
+  class, clean call-time ULE stays the discovery signal); `native_addClasses(J[Ljava/lang/String;)V` /
+  `native_removeClass(JLjava/lang/String;)V` / `native_getMatrix(JJ)Z` — declaration-only DEAD CODE (no invoker
+  in any of the 3 installed dexes). No widget subclass re-declares any of the 9 (grep-verified) — the View-class
+  bindings cover all callers by inheritance. Regression guards (plain `cargo test`):
+  `view_native_names_sigs_and_class_match_view_java` extended with all 9 name/sig pins against the installed-dex
+  truth + the 4 documented unbound decisions; new round-trips `frame_records_layout_and_rejects_stale_handles` +
+  `focus_record_serves_the_last_requester_and_never_the_null_or_reused_handle`. Gate green (fmt / build
+  --all-targets / clippy -D warnings / **591 unit + 4 integ + 2 doctest** / release). **BOOT-WATCH VERDICTS (`/tmp/eclipse-challenge9.log`, 1384 lines, boot
+  window 21:53–21:55 UTC, EXIT=124 clean 180 s timeout kill; recipe = the identical challenge8 re-drive,
+  hands-off): (a) CONFIRMED** — the `View.native_layout` ULE is GONE (its only log hit is the registration line
+  152); ZERO View-related `UnsatisfiedLinkError`; exactly ONE `UnsatisfiedLinkError` in the whole log = the new
+  frontier in (c). **(b) CONFIRMED** — log line 152: the View registration line logs `bound=26` with the full
+  26-native list plus the documented-unbound note (`native_measure` deliberately unbound; `native_addClasses`/
+  `native_removeClass`/`native_getMatrix` declaration-only dead code). **(c) ANSWERED — NEW FRONTIER:**
+  `CustomSwipeRefreshLayout.<init>` COMPLETED (0 hits anywhere in the log); the challenge fragment advanced INTO
+  its WebView child and died at `java.lang.UnsatisfiedLinkError: No implementation found for long
+  android.webkit.WebView.native_constructor(android.content.Context, android.util.AttributeSet)` — log lines
+  1232–1256, the `Handler.dispatchMessage` lifecycle step failed at 21:54:09.819. Stack:
+  `WebView.native_constructor(Native Method)` ← `android.view.View.<init>(Unknown Source:87)` ← `View.<init>:1` ←
+  `ViewGroup.<init>:0/:1` ← `android.webkit.WebView.<init>:0/:1/:1` ← `nk.d.<init>(SourceFile:4)` ←
+  `com.roblox.client.hybrid.RBHybridWebView.<init>(SourceFile:2)` ← `gi.a.<init>(SourceFile:6)` ←
+  `com.roblox.client.c.Z(Unknown Source:35)` ← `com.roblox.client.c.onCreateView(Unknown Source:30)` ←
+  `yh.d.onCreateView(Unknown Source:237)` ← `yh.k.onCreateView` ← fragment machinery ← `Handler.dispatchMessage`.
+  This is the LONG-PREDICTED, twice-deferred ATL stub-WebView gap (wrong at challenge7: Paint tripped first;
+  wrong at challenge8: `View.native_layout` tripped first), now actually reached. KEY MECHANISM: `View.<init>`
+  line 87 invokes the INSTANCE native `native_constructor`, which virtual-dispatches to WebView's OWN declared
+  override (long return, `(Context, AttributeSet)` args) — so the existing `android/view/View` class registration
+  CANNOT cover it; WebView needs its own pass. **(d) CONFIRMED** — 0 `NullPointerException`; NO new inflation
+  exception; baseline UNCHANGED vs challenge8: the known applyStyle `inflate(0x0)` upgrade-dialog defect fired at
+  21:53:45.7 (log lines ~1080–1095: `Resources$NotFoundException` "Unable to find resource ID #0x0" ←
+  `LayoutInflater.inflate:159` ← AlertController ← `Dialog.show` ← `com.roblox.client.a.J0`); the gms-measurement
+  `StreamCorruptedException` 2 hits (same as challenge8); the registration-time jni_internal.cc Canvas class dump
+  78 lines (same); the single survivable challenge-adjacent signal-11 bookkeeping line (1215). After the ULE the
+  fragment recovers to LoginV2 at 21:54:59 (the ~challenge timeout) and the engine stays alive to the 180 s kill
+  (engine pointer events still consumed at 21:55:52). **(e) CONFIRMED** — the one-shot `View.nativeIsFocused:
+  serving false for the ACTIVE_TEXT_FIELD` WARN NEVER FIRED (its only log hit is the registration line), so the
+  two-focus-records divergence (`view_registry::FOCUSED_VIEW` ← `nativeRequestFocus` only, vs `ACTIVE_TEXT_FIELD`
+  ← the engine's getText() poll; `isFocused()` serves only the former) stayed silent — per the recorded decision
+  the records stay deliberately un-unified (unify only if the WARN ever fires NEXT TO a focus-gated misbehavior;
+  ACTIVE_TEXT_FIELD is a last-getText()-caller heuristic whose export to `isFocused()` would create a
+  false-POSITIVE class). **⇐ START-HERE-NEXT: bind/back the installed framework's `android.webkit.WebView`
+  native surface per the proven class-pattern** — discovery signal = the (c) `WebView.native_constructor` ULE.
+  WebView is expected to be a REAL SUBSYSTEM (a challenge WebView must eventually load real web content), NOT
+  another record-and-no-op widget — so the pass starts with the declared-vs-bound audit + scoping (the installed
+  WebView + its ATL backing), binds honestly what is servable, leaves LEFT-UNBOUND + documented whatever honesty
+  would require a real web engine for, and lets the next boot reveal the boundary; an audit/plan workflow is
+  already in flight this session (2026-07-02). **REVIEW FIXES folded into this same pass
+  (2026-07-02, adversarial review of the diff, committed with it; see §6 📐 for the dispositions):** the `register_view_natives`
+  head comment + pin-test note no longer claim `native_keep_screen_on(JZ)V` is excluded (it IS in the 26-entry
+  array; only `setBackgroundColor(I)V` stays out), the `native_addClass`/`native_removeClasses` caller inventory
+  is corrected (see above — the review found TextView.setAllCaps/setTypeface; the fix-pass rescan additionally
+  found Button.<init>), the classes.dex composition wording is corrected (19 classes, not "only LayoutInflater"),
+  and the focus-divergence diagnostic above was added. Gate re-run green after the review fixes (591 unit + 4
+  integ + 2 doctests).
 - **2026-07-02 — 🖌️ `android.graphics.Paint` native surface audited + bound as a CLASS (closes the challenge7
   `native_set_stroke_cap` frontier) — ✅ VALIDATED by the 2026-07-02 challenge8 boot + COMMITTED 2026-07-02
   ⇐ START-HERE-NEXT: bind the installed framework's `android.view.View` LAYOUT/GEOMETRY native surface (plan at
-  the end of this bullet).** Validation (`/tmp/eclipse-challenge8.log`, 1309 lines, boot window 20:44–20:47 UTC,
+  the end of this bullet) — IMPLEMENTED 2026-07-02 + ✅ VALIDATED by the 2026-07-02 challenge9 boot + COMMITTED
+  2026-07-02 (see the 📐 bullet above; the live frontier moved on to `WebView.native_constructor`).** Validation
+  (`/tmp/eclipse-challenge8.log`, 1309 lines, boot window 20:44–20:47 UTC,
   EXIT=124 clean timeout kill): the identical 180 s fully-autonomous challenge7 re-drive (same 5-stage chain, APK
   roblox-2.724.735-merged, overlay FRESH — rebuilt by the review-fix pass with the new step-4b Paint self-set
   guard). **BOOT-WATCH VERDICTS: (a) CONFIRMED** — `native_set_stroke_cap` GONE (0 hits); ZERO Paint-related
@@ -154,7 +249,8 @@ before any history-rewriting/force operation.
   lines both boots). Baseline green: Landing 20:45:14 → LoginV2 20:45:17.538 → `v2/login` 403 "Challenge is
   required" 20:45:28.5 → `ChallengeNativeWrapper` → `ChallengeHybridWebView` 20:45:28.639 → the rbx.web fragment
   inflates NPE-free → after the fragment ULE the app recovers to LoginV2 at 20:46:28.652 (the ~60 s challenge
-  timeout) → engine alive to the 180 s kill. **⇐ START-HERE-NEXT: bind the installed framework's
+  timeout) → engine alive to the 180 s kill. **⇐ START-HERE-NEXT (IMPLEMENTED 2026-07-02 + ✅ VALIDATED by the
+  2026-07-02 challenge9 boot; COMMITTED 2026-07-02 — see the 📐 bullet above): bind the installed framework's
   `android.view.View` LAYOUT/GEOMETRY native surface** — discovery signal `View.native_layout(JIIII)V` from
   `SwipeRefreshLayout.setTargetOffsetTopAndBottom` (spinner positioning). Per the proven class-pattern: audit the
   INSTALLED View's declared natives still unbound — View has had several PARTIAL passes (the 2026-06-13 setters
@@ -4918,7 +5014,182 @@ surface — discovery signal `View.native_layout(JIIII)V` from `SwipeRefreshLayo
 the audit must diff declared-vs-currently-bound), classify per the established taxonomy (geometry IS READ BACK by
 Java — `getTop`/`getLeft`/`getWidth`/`getHeight`/`offset*` — so layout state must be registry-backed and honest,
 consistent with the existing `view_registry` geometry the vk-overlay already queries), bind per-method
-best-effort in `src/framework.rs`, then re-drive the same 180 s boot.
+best-effort in `src/framework.rs`, then re-drive the same 180 s boot. *(2026-07-02: IMPLEMENTED — see the 📐
+entry below; validation boot pending.)*
+
+---
+
+### 2026-07-02 — 📐 The installed framework's `android.view.View` LAYOUT/GEOMETRY native remainder audited + bound (the challenge8 `native_layout` frontier): 30 declared natives enumerated across BOTH View-defining dexes (identical surfaces), 17 already bound, 9 of the 13-native remainder newly bound (frame record + honest focus pair + validated no-ops), `native_measure` + a 3-native dead trio deliberately left unbound; UNCOMMITTED pending validation boot
+
+*Discovery evidence (the §5 START-HERE-NEXT above):* the challenge8 boot (`/tmp/eclipse-challenge8.log` lines
+1153–1188) died inside the rbx.web fragment's `LayoutInflater.inflate` on `UnsatisfiedLinkError: No
+implementation found for void android.view.View.native_layout(long, int, int, int, int)` at `View.layout` ←
+`View.offsetTopAndBottom` ← `androidx.core.view.q0.X` ← `SwipeRefreshLayout.setTargetOffsetTopAndBottom` ←
+`SwipeRefreshLayout.q()` ← `SwipeRefreshLayout.<init>(Unknown Source:144)` ←
+`com.roblox.client.components.CustomSwipeRefreshLayout.<init>` (the spinner-positioning step right after the
+🖌️ Paint pass unblocked the spinner's Paint work).
+
+*Audit method (the 🎨/🖌️ precedent, all first-party, DECLARED-VS-BOUND because View has had several partial
+passes — 2026-06-13 constructor/setters/listeners batches, `native_get_window`, `native_destructor`,
+pointer-capture, 2026-06-15 `getWindowVisibleDisplayFrame`/`nativeIsAttachedToWindow`/`getGlobalVisibleRect`/
+`nativeRequestFocus`):* baksmali of the installed `~/.cache/eclipse/framework-patched/api-impl.jar`
+(`vendor/toolchain/smali/baksmali-2.5.2.jar` under the vendored JDK-21 java, 2026-07-02) — View is defined in
+TWO dexes: classes2.dex (the overlay-shadowed View from the 2026-06-13 pointer-capture patch — the ACTIVE
+first-dex-wins copy) and classes3.dex (stock); **both declare the IDENTICAL 30 `native` methods** (the
+pointer-capture patch added only a field + a plain-Java setter), so there is no cross-dex divergence to route
+around; classes.dex defines NO View — of its 19 classes (Build + $VERSION + $VERSION_CODES, ActivityManager + 5
+nested, KeyguardManager, NetworkRequest + $Builder, PowerManager + $WakeLock, webkit ValueCallback, + the 3
+LayoutInflater classes) the only `android/view` ones are the LayoutInflater trio (wording corrected by the
+2026-07-02 review pass — "defines only LayoutInflater" undercounted the javac-patched overlay classes). Diffed
+against `register_view_natives`
+(`src/framework.rs`): 17 already bound → a 13-native remainder. Call-site classification from the installed
+`View.smali` bodies + the vendored reference C (`vendor/atl/src/api-impl-jni/views/android_view_View.c`).
+**Drift finding:** the vendored `View.java` declares `public native final int getWidth()/getHeight()` (:1163-4)
+and `public native void setBackgroundColor(int)` (:1284), but the INSTALLED dex has all three as plain-Java
+(`getWidth()` = `right - left` field math; the 58a50f6 lesson re-confirmed) — the installed dex stayed the
+authority throughout.
+
+*KEY GEOMETRY FACT (verified, not assumed):* the frame IS read back by Java everywhere — but from JAVA FIELDS,
+never through a native: the installed `layout(l,t,r,b)` does `iput` of `left`/`top`/`right`/`bottom` on `this`
+BEFORE `invoke-virtual native_layout`; `getLeft`/`getTop`/`getRight`/`getBottom`/`getWidth`/`getHeight` are
+plain field reads; `offsetTopAndBottom`/`offsetLeftAndRight` recompute from the fields and re-enter `layout()`.
+So `native_layout` is a write-only sink (reference C: `gtk_widget_size_allocate`) and the honest disposition is
+a registry RECORD (real laid-out geometry for Eclipse's renderer/overlay), not a Java read-back server.
+
+*Audit table (the 13-native remainder → disposition; all bindings in `src/framework.rs::register_view_natives`,
+17 → 26 entries, per-method best-effort):*
+| # | native (sig) | disposition |
+|---|---|---|
+| 1 | `native_layout` `(JIIII)V` | NEW registry-backed RECORD — **the challenge8 discovery signal**. Records `[l,t,r,b]` on the EXISTING `view_registry` peer (new `ViewState.frame: Option<[i32;4]>` + `set_frame`, beside the requested `LayoutParams` — integrates, never duplicates); invalid handle logged + ignored |
+| 2 | `nativeIsFocused` `(J)Z` | NEW value-returning (STATIC): `isFocused()` returns the native verbatim (smali), so it serves handle equality against a new lock-free `view_registry::FOCUSED_VIEW` record (`AtomicI64`, the ACTIVE_ROOT shape; `is_focused(0)` always false; a freed slot's reused occupant has a NEW generation so a stale record never claims it) |
+| 3 | `nativeRequestFocus` `(JI)V` | already bound 2026-07-01 as a pure no-op — UPGRADED to record the requesting view into `FOCUSED_VIEW` (the coupled writer of #2; the 2026-06-13 CheckBox `isChecked`/`setChecked` rule: never no-op the setter while the getter reads back). Invalid/stale handle logged, record unchanged |
+| 4 | `nativeInvalidate` `(J)V` | NEW validated no-op (STATIC): every `invalidate*()` overload; reference C = `wrapper_widget_queue_draw`, no reader — the engine renders the real screen |
+| 5 | `native_keep_screen_on` `(JZ)V` | NEW validated no-op (STATIC): `setKeepScreenOn` + `onAttachedToWindow`/`onDetachedFromWindow`; reference C = GtkApplication suspend/idle inhibit, no reader. The 58a50f6 embargo ("left out until proven native") is LIFTED by the dex-declaration proof in BOTH dexes; `setBackgroundColor(I)V` stays OUT (still plain Java, re-verified) |
+| 6 | `native_addClass` `(JLjava/lang/String;)V` | NEW validated no-op: GTK CSS classes; reference C = `gtk_widget_add_css_class`, no reader. Invokers (full per-method scan of all 3 dexes, corrected by the 2026-07-02 review pass — the original row credited only `setTextAlignment`): `View.setTextAlignment` ("ATL-text-align-left/center/right"), `TextView.setAllCaps` ("ATL-text-uppercase"), `TextView.setTypeface` ("ATL-font-bold"/"ATL-font-italic"), `Button.<init>` ("ATL-no-border") — TextView/Button invoke via their OWN class refs that resolve UP to View's declaration (neither re-declares), so the View-class binding covers all; write-only on EVERY path, and the natives must NOT be downgraded to dead code while any of these callers exists |
+| 7 | `native_removeClasses` `(J[Ljava/lang/String;)V` | NEW validated no-op: the array-remove sibling — invokers `View.setTextAlignment` + `TextView.setAllCaps` + `TextView.setTypeface` (Button's ctor calls addClass only; same inventory correction as row 6) |
+| 8 | `native_drawBackground` `(JJ)V` | NEW validated no-op: reached from `draw(Canvas)` ONLY under `instanceof android.atl.GskCanvas` (smali-guarded; the second J is the GSK snapshot pointer, never dereferenced) — the 🎨 `Drawable.native_draw` precedent, write-only render bookkeeping |
+| 9 | `native_drawContent` `(JJ)V` | NEW validated no-op: the `onDraw(Canvas)` sibling behind the same GskCanvas guard |
+| 10 | `native_queueAllocate` `(J)V` | NEW validated no-op: `setTranslationX/Y` store the translation in the view's OWN Java field then call this on the PARENT's widget (smali); reference C = `gtk_widget_queue_allocate`, no reader |
+| 11 | `native_measure` `(JII)V` | deliberately LEFT UNBOUND: a REAL content-measure pass whose result IS read back — the installed `onMeasure` (for `haveCustomMeasure == false`; base View ctor sets it TRUE, exactly TextView/ProgressBar/ImageView/Spinner flip it false to route here) calls ONLY the native, which must upcall `setMeasuredDimension` (reference C: `gtk_widget_measure` → `CallVoidMethod`) or `getMeasuredWidth()/Height()` serve stale zeros to every ViewGroup layout pass. Headless Eclipse cannot measure text/image content honestly (the `Paint.native_get_text_bounds` Pango-metrics class) — the clean call-time ULE stays the discovery signal |
+| 12 | `native_addClasses` `(J[Ljava/lang/String;)V` | deliberately LEFT UNBOUND: declaration-only DEAD CODE — no invoker in any of the 3 installed dexes (grep 2026-07-02; the 🎨 dead-BitmapFactory rule) |
+| 13 | `native_removeClass` `(JLjava/lang/String;)V` + `native_getMatrix` `(JJ)Z` | deliberately LEFT UNBOUND: same declaration-only dead code (no invoker anywhere) |
+
+*Same-pattern audit:* no widget subclass in any installed dex re-declares ANY of the 9 newly bound natives
+(grep over all three baksmali'd dexes) — ART's per-declaring-class resolution is satisfied by the View-class
+bindings alone (unlike the 2026-06-13 `native_constructor` case, where subclasses re-declared it verbatim).
+The 17 pre-existing bindings were re-verified present in the installed 30 and kept unchanged (only
+`nativeRequestFocus`'s body was upgraded, see #3).
+
+*Regression guards (plain `cargo test`, no APK/display/boot):*
+`view_native_names_sigs_and_class_match_view_java` extended with all 9 new name/sig pins against the
+installed-dex truth + comments pinning the 4 documented unbound decisions (`native_measure` + the dead trio) and
+the re-verified `setBackgroundColor(I)V` exclusion; new `view_registry` round-trips
+`frame_records_layout_and_rejects_stale_handles` (fresh None → record → verbatim read-back → re-layout
+overwrite → freed handle rejected) and
+`focus_record_serves_the_last_requester_and_never_the_null_or_reused_handle` (last-requester-wins, null never
+focused, focus moves, a freed slot's reused occupant never inherits focus).
+
+*Gate:* green — `cargo fmt --all` / `cargo build --all-targets` / `cargo clippy --all-targets --all-features
+-- -D warnings` / `cargo test` (**591 unit + 4 integ + 2 doctest**, 0 failed) / `cargo build --release`.
+
+*Status:* UNCOMMITTED, validation boot PENDING (boot-watch list in the §5 📐 bullet; recipe = the identical
+180 s challenge8 re-drive). No overlay change this pass — the installed framework jar is untouched.
+
+*Review fixes (2026-07-02, applied into this same uncommitted pass — adversarial review of the diff, 4 findings,
+every claim re-verified against a FRESH baksmali of the installed jar before acting):*
+**(1) Focus-record duplication (framework.rs `nativeIsFocused`) — mechanism CONFIRMED, code unification
+DECLINED, discovery diagnostic ADDED.** Confirmed by code-path analysis: `view_registry::FOCUSED_VIEW` is
+written ONLY by `nativeRequestFocus` (installed smali: `requestFocus(ILandroid/graphics/Rect;)Z` is its only
+Java caller; `clearFocus()` is `return-void`; `isFocused()` returns the native verbatim — all re-verified),
+while `ACTIVE_TEXT_FIELD` (framework.rs, the engine-tap focus signal set by the `EditText.getText()` poll) is a
+disjoint second record the vk-overlay/typing path consume — so `isFocused()` can serve `false` for the field
+Eclipse types into, silently where the pre-pass behavior was a loud ULE. NOT unified (the reviewer's own
+evidence: no isFocused-gated caller has ever misbehaved — the only framework caller is AbsListView, app dex not
+inspectable in-policy — AND `ACTIVE_TEXT_FIELD` is a last-`getText()`-CALLER heuristic: any Java reader of any
+field sets it, so exporting it into the precise `isFocused()` API would trade the hypothetical false-negative
+for a real false-POSITIVE class; the evidence standard says no behavior change without a confirmed failing
+flow). Instead the lost discovery signal is RESTORED: a one-shot WARN in `view_native_is_focused` fires the
+first time `false` is served for the current `ACTIVE_TEXT_FIELD` (the 🧵 `getPooledString`-WARN precedent),
+dated cross-reference docs sit on both records, and §5 boot-watch item (e) carries the unify-on-evidence plan.
+**(2) Stale head comment (framework.rs `register_view_natives`) — CONFIRMED + fixed, plus one same-pattern
+instance the review missed:** the head comment claimed "NO … `native_keep_screen_on(JZ)V` here" while this
+pass's 26-entry array binds it; rewritten (only `setBackgroundColor(I)V` remains excluded — still plain Java,
+re-verified). Same-pattern sweep found the pin-test NOTE (framework.rs ~16663) still claiming BOTH are
+"intentionally NOT pinned/bound" — also corrected (keep_screen_on is pinned 40 lines above it in the same test).
+**(3) §5/§6 classes.dex composition — CONFIRMED + reworded** (19 classes, verified by `baksmali list classes`
+this pass; the load-bearing "no View in classes.dex" half was always true). **(4) Incomplete
+`native_addClass`/`native_removeClasses` caller inventory — CONFIRMED and found to be even broader:** the
+review's rescan found `TextView.setAllCaps`/`setTypeface`; this fix-pass's full per-method scan of all 3 dexes
+additionally found `Button.<init>` ("ATL-no-border", addClass only). Table rows 6–7 above, the §5 bullet, and
+the framework.rs consts + pin-test comments now carry the full inventory (validated-no-op disposition holds for
+every caller — write-only GTK CSS, no reader; the correction's point is that a future audit must not downgrade
+these to dead code when the `setTextAlignment` path alone disappears). Same-pattern sweep of the OTHER 7 newly
+bound natives' claimed inventories (`nativeInvalidate`/`native_keep_screen_on`/`native_queueAllocate`/
+`native_drawBackground`/`native_drawContent`/`native_layout`/`nativeIsFocused`): all EXACT — only the CSS-class
+pair was incomplete. No Rust behavior changed except the additive one-shot WARN diagnostic; no new tests (the
+diagnostic is observability, per CLAUDE.md's diagnostics-first rule — its live signal is the WARN line itself,
+watched by §5 item (e)). Gate re-run green after the review fixes (fmt --check / build --all-targets / clippy
+-D warnings / 591 unit + 4 integ + 2 doctests / release).
+
+---
+
+### 2026-07-02 — 📐 Validation-boot verdict on the View layout/geometry pass: ALL FIVE boot-watch items CONFIRMED — the `native_layout` ULE is GONE (`bound=26`), `CustomSwipeRefreshLayout.<init>` completes, and the NEW frontier is the unbound `android.webkit.WebView.native_constructor` — the twice-deferred ATL stub-WebView prediction is now CONFIRMED in the detail; View pass committed with this entry
+
+*Recipe (`/tmp/eclipse-challenge9.log`, 1384 lines / 199402 bytes, boot window 21:53–21:55 UTC per the tracing
+timestamps, EXIT=124 clean 180 s timeout kill):* the identical challenge8 180 s fully-autonomous challenge
+re-drive (stage 0 `ECLIPSE_SYNTHETIC_ENGINE_TAP="419,531"` / stages 1+2 `ECLIPSE_SYNTHETIC_TYPE="278,179:robloxtest"`
+/ stage 3 `ECLIPSE_SYNTHETIC_NEXT="400,236"` / stage 4 `ECLIPSE_SYNTHETIC_TYPE2="241,327:<pw>"` / stage 5
+`ECLIPSE_SYNTHETIC_SUBMIT="349,377"`, hands-off host input), APK `roblox-2.724.735-merged`. Every claim below was
+grep-verified against the log before being recorded.
+
+*Boot-watch verdicts (all five):* **(a) CONFIRMED** — the `View.native_layout` ULE is GONE: its ONLY log hit is
+the registration line 152 (challenge8 died on it at 20:45:39.741); ZERO View-related `UnsatisfiedLinkError`;
+exactly ONE `UnsatisfiedLinkError` in the whole log = the new frontier in (c) (the 2 `No implementation found`
+strings are the ART java_vm_ext line + the exception line of that SAME single event). **(b) CONFIRMED** — log
+line 152 is the View registration line: the full 26-native list plus the documented-unbound note
+(`native_measure` deliberately unbound — real content-measure pass; `native_addClasses`/`native_removeClass`/
+`native_getMatrix` declaration-only dead code) `(per-method best-effort) class="android/view/View" bound=26`.
+**(c) ANSWERED — NEW FRONTIER (the LONG-PREDICTED, twice-deferred ATL stub-WebView gap, now actually reached):**
+`CustomSwipeRefreshLayout.<init>` COMPLETED (0 hits anywhere in the log — challenge8's ULE stack died inside it);
+the challenge fragment advanced INTO its WebView child and died at `java.lang.UnsatisfiedLinkError: No
+implementation found for long android.webkit.WebView.native_constructor(android.content.Context,
+android.util.AttributeSet)` — log lines 1232–1256, the `Handler.dispatchMessage` lifecycle step failed at
+21:54:09.819. Full stack: `WebView.native_constructor(Native Method)` ← `android.view.View.<init>(Unknown
+Source:87)` ← `View.<init>(Unknown Source:1)` ← `ViewGroup.<init>(Unknown Source:0/:1)` ←
+`android.webkit.WebView.<init>(Unknown Source:0/:1/:1)` ← `nk.d.<init>(SourceFile:4)` ←
+`com.roblox.client.hybrid.RBHybridWebView.<init>(SourceFile:2)` ← `gi.a.<init>(SourceFile:6)` ←
+`com.roblox.client.c.Z(Unknown Source:35)` ← `com.roblox.client.c.onCreateView(Unknown Source:30)` ←
+`yh.d.onCreateView(Unknown Source:237)` ← `yh.k.onCreateView` ← androidx fragment machinery
+(`Fragment.performCreateView` ← `FragmentManager`) ← `Handler.dispatchMessage`. The stub-WebView prediction was
+wrong at challenge7 (Paint tripped first) and again at challenge8 (`View.native_layout` tripped first) — it is
+now CONFIRMED in the detail. KEY MECHANISM for the next pass: `View.<init>` line 87 invokes the INSTANCE native
+`native_constructor`, which virtual-dispatches to WebView's OWN declared override (long return,
+`(Context, AttributeSet)` args) — so the existing `android/view/View` class registration CANNOT cover it (ART
+resolves natives per DECLARING class — the 2026-06-13 `native_constructor` batch precedent, where WebView was the
+one recorded-unbound declarer); WebView needs its own pass. **(d) CONFIRMED** — 0 `NullPointerException`; NO new
+inflation exception; baseline UNCHANGED vs challenge8, all named items present: the known applyStyle
+`inflate(0x0)` upgrade-dialog defect fired at 21:53:45.7 (log lines ~1080–1095: `Resources$NotFoundException:
+Unable to find resource ID #0x0` ← `LayoutInflater.inflate:159` ← `AlertController` ← `Dialog.show` ←
+`com.roblox.client.a.J0`; challenge8 had it at 20:45:17.509); the gms-measurement `StreamCorruptedException`
+2 hits (challenge8: 2); the registration-time jni_internal.cc Canvas class dump 78 lines (challenge8: 78); the
+SINGLE survivable challenge-adjacent `Run book keeping for signal 11` bookkeeping line (log line 1215, engine
+clock 40.45 s — NON-FATAL, fragment work continues after it). After the ULE the fragment recovers to
+`onAppReady: LoginV2` at 21:54:59 (log line 1330, the ~60 s challenge timeout) and the engine stays alive to the
+180 s kill (engine pointer events still `consumed=true` at 21:55:52). **(e) CONFIRMED** — the one-shot
+`View.nativeIsFocused: serving false for the ACTIVE_TEXT_FIELD` WARN NEVER FIRED (its only log hit is the
+registration line 152), so the two-focus-records divergence stayed silent all boot; per the §5 recorded decision
+the records stay deliberately un-unified (unify only if the WARN ever fires NEXT TO a focus-gated misbehavior).
+
+*Baseline green:* challenge chain intact — `v2/login` POST → 403 "Challenge is required" 21:53:58 (log line
+1197) → `ChallengeNativeWrapper` 21:53:58.555 → `ChallengeHybridWebView` 21:53:58.671 → the rbx.web fragment
+inflates NPE-free to the WebView-child construction.
+
+*Next (the §5 START-HERE-NEXT):* bind/back the installed framework's `android.webkit.WebView` native surface per
+the proven class-pattern — discovery signal = the (c) ULE. WebView is expected to be a REAL SUBSYSTEM (a
+challenge WebView must eventually load real web content), NOT another record-and-no-op widget — so the pass
+starts with the declared-vs-bound audit + scoping (the installed WebView + its ATL backing), binds honestly what
+is servable, leaves LEFT-UNBOUND + documented whatever honesty would require a real web engine for, and lets the
+next boot reveal the boundary. An audit/plan workflow is already in flight this session (2026-07-02).
 
 ---
 

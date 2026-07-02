@@ -4941,21 +4941,115 @@ const VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_SIG: &JNIStr = jni_str!("(JLandroid/gr
 const VIEW_NATIVE_REQUEST_FOCUS_NAME: &JNIStr = jni_str!("nativeRequestFocus");
 const VIEW_NATIVE_REQUEST_FOCUS_SIG: &JNIStr = jni_str!("(JI)V");
 
-// 2026-06-13: `View.setBackgroundColor(int)` and `View.native_keep_screen_on(long, boolean)` are NOT
-// RegisterNatives-bound here. Commit 58a50f6 added bindings for both citing the *vendored* View.java
-// (line 1284 `public native void setBackgroundColor(int color);`, line 1982 `private static native
-// void native_keep_screen_on(long, boolean)`), but the live boot at 58a50f6 proved the *shipped*
-// framework disagrees with the vendored source: ART rejected the very first entry with
-// `jni_internal.cc: Failed to register non-native method android.view.View.setBackgroundColor(I)V as
-// native` → `No such method: no native method "Landroid/view/View;.setBackgroundColor(I)V"`. In the
-// installed framework `setBackgroundColor(int)` is a PLAIN Java method, so RegisterNatives — which is
-// atomic over the whole array — failed entirely and took the lifecycle-critical View natives
+// 2026-06-13: `View.setBackgroundColor(int)` is NOT RegisterNatives-bound here. Commit 58a50f6 added
+// a binding for it citing the *vendored* View.java (line 1284 `public native void
+// setBackgroundColor(int color);`), but the live boot at 58a50f6 proved the *shipped* framework
+// disagrees with the vendored source: ART rejected the entry with `jni_internal.cc: Failed to
+// register non-native method android.view.View.setBackgroundColor(I)V as native` → `No such method:
+// no native method "Landroid/view/View;.setBackgroundColor(I)V"`. In the installed framework
+// `setBackgroundColor(int)` is a PLAIN Java method, so RegisterNatives — which is atomic over the
+// whole array — failed entirely and took the lifecycle-critical View natives
 // (native_constructor/native_destructor/native_get_window) down with it, aborting the boot.
-// `native_keep_screen_on` was never reached (RegisterNatives stopped at the first bad entry), so its
-// shipped native-ness is unverified; because the vendored source is demonstrably out of sync with the
-// shipped native/non-native split here, it cannot be trusted as proof either. The boot reached
-// `ActivityNativeMain.onCreate` WITHOUT either binding before 58a50f6, so neither is required for
-// progress — both are left out until a live boot proves the shipped framework declares them native.
+// 2026-07-02: the declared-vs-bound audit of the installed dex (baksmali of BOTH the classes2.dex
+// shadowed View and the stock classes3.dex View — identical 30-native surfaces) re-confirms
+// `setBackgroundColor(I)V` is absent from the native set, so it stays out. `native_keep_screen_on
+// (JZ)V` — which 58a50f6 also embargoed pending proof of its shipped native-ness — IS declared
+// `private static native` in both dexes (the exact declaration RegisterNatives validates against),
+// so it is now bound below as a validated no-op; the per-method best-effort registrar additionally
+// makes any residual mismatch non-fatal (a WARN + call-time UnsatisfiedLinkError, never a class abort).
+
+// 2026-07-02: the View LAYOUT/GEOMETRY remainder pass (the challenge8 `View.native_layout` ULE, log
+// lines 1153–1188: `SwipeRefreshLayout.<init>` → `setTargetOffsetTopAndBottom` →
+// `View.offsetTopAndBottom` → `View.layout` inside the rbx.web fragment inflation). Declared-vs-bound
+// audit of the INSTALLED framework (baksmali of `~/.cache/eclipse/framework-patched/api-impl.jar`;
+// the classes2.dex overlay-shadowed View is the active first-dex-wins copy and declares the IDENTICAL
+// 30 natives as the stock classes3.dex View): 17 were already bound; the 13-native remainder is
+// classified below. The frame IS read back by Java everywhere (`getLeft`/`getTop`/`getRight`/
+// `getBottom`/`getWidth`/`getHeight`/`offsetTopAndBottom`/`offsetLeftAndRight`) — but from Java
+// FIELDS: the installed `View.layout(l,t,r,b)` stores `left`/`top`/`right`/`bottom` on `this` BEFORE
+// invoking `native_layout` (smali-verified; the vendored View.java's `native getWidth()/getHeight()`
+// declarations have DRIFTED — the installed getters are plain-Java field reads). So `native_layout`
+// is a write-only sink (ATL's reference C forwards it to gtk_widget_size_allocate) and Eclipse
+// RECORDS the frame on the `view_registry` peer (real laid-out geometry beside the requested
+// LayoutParams — the honest registry-backed disposition, never a Java read-back source).
+const VIEW_NATIVE_LAYOUT_NAME: &JNIStr = jni_str!("native_layout");
+const VIEW_NATIVE_LAYOUT_SIG: &JNIStr = jni_str!("(JIIII)V");
+
+// 2026-07-02: `View.invalidate()`/`invalidate(int,int,int,int)`/`invalidate(Rect)`/
+// `invalidateDrawable(Drawable)` all call the STATIC `nativeInvalidate(widget)` (ATL reference C:
+// `wrapper_widget_queue_draw` — a GTK redraw request with no reader). Validated no-op: nothing reads
+// back, the engine renders the real screen. Static native → the second JNI parameter is the JClass.
+const VIEW_NATIVE_INVALIDATE_NAME: &JNIStr = jni_str!("nativeInvalidate");
+const VIEW_NATIVE_INVALIDATE_SIG: &JNIStr = jni_str!("(J)V");
+
+// 2026-07-02: `View.isFocused()` returns the STATIC `nativeIsFocused(widget)` answer VERBATIM
+// (installed smali: `invoke-static … move-result v0 … return v0`; ATL reference C:
+// `gtk_widget_has_focus`), and `View.requestFocus()` → `nativeRequestFocus(widget, direction)` is
+// the only focus writer on the class — a coupled read-back pair (the CheckBox `isChecked`/
+// `setChecked` rule, 2026-06-13: never no-op the setter while the getter reads it back). Eclipse has
+// no GTK focus, so `nativeRequestFocus` (already bound) now RECORDS the requesting view as
+// `view_registry`'s focused view and `nativeIsFocused` serves handle equality against that record —
+// the last view that requested focus is focused (the honest headless model; Android focus likewise
+// moves to the latest successful requester).
+const VIEW_NATIVE_IS_FOCUSED_NAME: &JNIStr = jni_str!("nativeIsFocused");
+const VIEW_NATIVE_IS_FOCUSED_SIG: &JNIStr = jni_str!("(J)Z");
+
+// 2026-07-02: `View.setKeepScreenOn(boolean)` + `onAttachedToWindow()`/`onDetachedFromWindow()` call
+// the STATIC `native_keep_screen_on(widget, keepScreenOn)` (ATL reference C: GtkApplication
+// inhibit/uninhibit of host suspend/idle — a host power-management side effect with no reader).
+// Validated no-op: Eclipse sets no host screen-wake policy (the desktop compositor owns idle), and
+// nothing reads back. Bound now that the installed dex proves the declaration (see the 58a50f6
+// embargo note above).
+const VIEW_NATIVE_KEEP_SCREEN_ON_NAME: &JNIStr = jni_str!("native_keep_screen_on");
+const VIEW_NATIVE_KEEP_SCREEN_ON_SIG: &JNIStr = jni_str!("(JZ)V");
+
+// 2026-07-02: GTK CSS style-class natives `native_addClass(widget, String)` /
+// `native_removeClasses(widget, String[])` (ATL reference C: `gtk_widget_add_css_class`/
+// `gtk_widget_remove_css_class` — styling hints with no reader). Installed-dex invokers (full
+// per-method scan of all three dexes, 2026-07-02; every call resolves to View's declaration by
+// inheritance — no subclass re-declares either native): `View.setTextAlignment(int)`
+// ("ATL-text-align-left/center/right"), `TextView.setAllCaps(boolean)` ("ATL-text-uppercase"),
+// `TextView.setTypeface(Typeface,int)` ("ATL-font-bold"/"ATL-font-italic"), and `Button.<init>`
+// ("ATL-no-border", addClass only). Validated no-ops: Eclipse has no GTK style context, nothing
+// reads back — the disposition holds for EVERY caller, so neither native may be downgraded to dead
+// code while any of those paths exist. The sibling `native_addClasses(J[Ljava/lang/String;)V` /
+// `native_removeClass(JLjava/lang/String;)V` are DECLARATION-ONLY dead code in the installed dex (no
+// invoker in any of the three dexes) and stay unbound like the 🎨 pass's dead BitmapFactory natives.
+const VIEW_NATIVE_ADD_CLASS_NAME: &JNIStr = jni_str!("native_addClass");
+const VIEW_NATIVE_ADD_CLASS_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
+const VIEW_NATIVE_REMOVE_CLASSES_NAME: &JNIStr = jni_str!("native_removeClasses");
+const VIEW_NATIVE_REMOVE_CLASSES_SIG: &JNIStr = jni_str!("(J[Ljava/lang/String;)V");
+
+// 2026-07-02: `View.draw(Canvas)`/`onDraw(Canvas)` call `native_drawBackground(widget, snapshot)` /
+// `native_drawContent(widget, snapshot)` ONLY under an `instanceof android.atl.GskCanvas` guard
+// (installed smali; the `snapshot` is the GskCanvas's GSK snapshot pointer — ATL reference C:
+// `gtk_widget_snapshot_child`). Validated no-ops, the `Drawable.native_draw(JJII)V` precedent
+// (2026-07-02 🎨): write-only render bookkeeping with no reader — the engine renders the real
+// screen, and Eclipse never constructs a GskCanvas, so the guard normally keeps these unreached.
+const VIEW_NATIVE_DRAW_BACKGROUND_NAME: &JNIStr = jni_str!("native_drawBackground");
+const VIEW_NATIVE_DRAW_BACKGROUND_SIG: &JNIStr = jni_str!("(JJ)V");
+const VIEW_NATIVE_DRAW_CONTENT_NAME: &JNIStr = jni_str!("native_drawContent");
+const VIEW_NATIVE_DRAW_CONTENT_SIG: &JNIStr = jni_str!("(JJ)V");
+
+// 2026-07-02: `View.setTranslationX(float)`/`setTranslationY(float)` store the translation in the
+// view's OWN Java field, then call `native_queueAllocate` on the PARENT's widget handle (installed
+// smali; ATL reference C: `gtk_widget_queue_allocate` — a GTK re-layout request with no reader).
+// Validated no-op; note the handle passed is the parent's, so the handler validates whatever live
+// handle arrives.
+const VIEW_NATIVE_QUEUE_ALLOCATE_NAME: &JNIStr = jni_str!("native_queueAllocate");
+const VIEW_NATIVE_QUEUE_ALLOCATE_SIG: &JNIStr = jni_str!("(J)V");
+
+// 2026-07-02: deliberately LEFT UNBOUND from the 30-native audit (the honest call-time
+// UnsatisfiedLinkError stays the discovery signal — the 🎨/🖌️ rule):
+//   * `native_measure(JII)V` — a REAL content-measure pass whose result IS read back: the installed
+//     `onMeasure` (for `haveCustomMeasure == false` views — TextView/ProgressBar/ImageView/Spinner
+//     flip the flag to route here) calls ONLY the native, which must upcall `setMeasuredDimension`
+//     (ATL reference C: gtk_widget_measure → CallVoidMethod) or `getMeasuredWidth()/Height()` serve
+//     stale zeros to every ViewGroup layout pass. Headless Eclipse cannot measure text/image content
+//     honestly (the Paint.native_get_text_bounds Pango-metrics class).
+//   * `native_addClasses(J[Ljava/lang/String;)V`, `native_removeClass(JLjava/lang/String;)V`,
+//     `native_getMatrix(JJ)Z` — declaration-only DEAD CODE: no invoker anywhere in the installed
+//     dexes (classes.dex/classes2.dex/classes3.dex all grepped 2026-07-02).
 
 /// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
 ///
@@ -5422,17 +5516,309 @@ extern "system" fn view_native_get_global_visible_rect<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeRequestFocus(long widget, int direction)` → no-op (2026-06-15). INSTANCE native,
-/// descriptor `(JI)V` (View.java:1298). Eclipse has no focus manager, so this is a no-op. UNBOUND,
-/// this threw on the post-logout LuaApp re-init (2×).
+/// `View.nativeRequestFocus(long widget, int direction)` → record the requesting view as the
+/// focused view (2026-06-15, upgraded 2026-07-02). INSTANCE native, descriptor `(JI)V`
+/// (View.java:1298). UNBOUND, this threw on the post-logout LuaApp re-init (2×).
+///
+/// 2026-07-02: was a pure no-op; now that `nativeIsFocused` is bound (its coupled read-back — see
+/// the consts note), a valid `widget` is RECORDED via [`view_registry::set_focused_view`] so
+/// `isFocused()` serves an honest answer (the last view that requested focus is focused). An
+/// invalid/stale handle is logged and NOT recorded (never throws — same tolerance as the other
+/// handle-validating no-ops).
 extern "system" fn view_native_request_focus<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
-    _widget: jlong,
-    _direction: jint,
+    widget: jlong,
+    direction: jint,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> { Ok(()) })
-        .resolve::<LogErrorAndDefault>()
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::with_view(widget, |_v| ()) {
+            Ok(()) => {
+                view_registry::set_focused_view(widget);
+                tracing::trace!(
+                    target: "android.view.View",
+                    widget,
+                    direction,
+                    "View.nativeRequestFocus: recorded focused view"
+                );
+            }
+            Err(e) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                direction,
+                error = %e,
+                "View.nativeRequestFocus: invalid view handle (focus record unchanged)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.nativeIsFocused(long widget) -> boolean` → whether `widget` is the recorded focused view
+/// (2026-07-02). STATIC native (the second JNI parameter is the `JClass`), descriptor `(J)Z`. The
+/// installed `isFocused()` returns this answer VERBATIM (smali: `invoke-static … return v0`), so it
+/// must be honest: served from the [`view_registry::is_focused`] record `nativeRequestFocus` writes
+/// (the coupled pair — see the consts note). Before any view requests focus, every view honestly
+/// reads unfocused (`false`), matching a freshly attached tree.
+///
+/// 2026-07-02 (review finding, recorded — behavior deliberately unchanged): Eclipse holds a SECOND
+/// de-facto focus record, [`ACTIVE_TEXT_FIELD`] — the `EditText` whose `getText()` was last polled
+/// (the engine-tap focus signal the vk-overlay + host typing consume). The engine-tap path calls no
+/// Java `requestFocus()` Eclipse can see, so the two records can diverge and this getter would then
+/// serve `false` for the very field Eclipse types into. No isFocused-gated caller has misbehaved on
+/// any live boot (framework-side only `AbsListView` calls `isFocused()`; app dex is not inspectable
+/// in-policy), and `ACTIVE_TEXT_FIELD` is a last-`getText()`-caller HEURISTIC (any Java reader of
+/// any field sets it — serving it here would trade the hypothetical false-negative for a real
+/// false-POSITIVE class), so per the evidence standard the answer stays the `requestFocus` record.
+/// The divergence is kept OBSERVABLE instead: a one-shot WARN below (the `getPooledString`-WARN
+/// discovery-diagnostic precedent, 2026-07-01 🧵) fires the first time `false` is served for the
+/// current active text field. If a boot pairs that WARN with a focus-gated misbehavior, unify the
+/// records then, with that evidence in hand.
+extern "system" fn view_native_is_focused<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    widget: jlong,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> {
+        let focused = view_registry::is_focused(widget);
+        if !focused && widget != 0 && widget == active_text_field() {
+            // 2026-07-02: one-shot divergence diagnostic — Java asked about the field Eclipse's
+            // engine-focus signal names, but no requestFocus() ever recorded it (see the fn doc).
+            static FOCUS_DIVERGENCE_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FOCUS_DIVERGENCE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "android.view.View",
+                    widget,
+                    "View.nativeIsFocused: serving false for the ACTIVE_TEXT_FIELD (the engine-tap \
+                     focus signal) — requestFocus never recorded it; if a focus-gated flow \
+                     misbehaves this boot, unify the two focus records (see view_native_is_focused)"
+                );
+            }
+        }
+        Ok(focused)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_layout(long widget, int l, int t, int r, int b)` → RECORD the laid-out frame on the
+/// view's [`view_registry`] peer (2026-07-02 — the challenge8 discovery signal:
+/// `SwipeRefreshLayout.setTargetOffsetTopAndBottom` → `View.offsetTopAndBottom` → `View.layout`).
+///
+/// JNI ABI: an INSTANCE native returning void, descriptor `(JIIII)V`. The installed
+/// `View.layout(l,t,r,b)` stores the frame in its OWN Java `left`/`top`/`right`/`bottom` fields
+/// BEFORE invoking this native, and every Java read-back (`getLeft`/`getWidth`/`offset*`) reads
+/// those fields (smali-verified) — so this record is Eclipse-side bookkeeping (real laid-out
+/// geometry for the renderer/overlay), never a Java read-back source. ATL's reference C forwards to
+/// `gtk_widget_size_allocate`; Eclipse records through the bounds+generation-checked
+/// [`view_registry::set_frame`] (a bad handle is logged + ignored, never UB).
+extern "system" fn view_native_layout<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    l: jint,
+    t: jint,
+    r: jint,
+    b: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        match view_registry::set_frame(widget, [l, t, r, b]) {
+            Ok(()) => tracing::trace!(
+                target: "android.view.View",
+                widget,
+                l,
+                t,
+                r,
+                b,
+                "View.native_layout: recorded laid-out frame on view peer"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.view.View",
+                widget,
+                l,
+                t,
+                r,
+                b,
+                error = %e,
+                "View.native_layout: invalid view handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.nativeInvalidate(long widget)` → validate the handle; no-op (2026-07-02). STATIC native
+/// (the second JNI parameter is the `JClass`), descriptor `(J)V`, called by every `invalidate*()`
+/// overload. ATL's reference C queues a GTK redraw; nothing reads back and the engine renders the
+/// real screen, so the honest backing validates the handle (bounds+generation-checked, a bad handle
+/// is logged + ignored, never UB) and no-ops.
+extern "system" fn view_native_invalidate<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.nativeInvalidate: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_keep_screen_on(long widget, boolean keepScreenOn)` → validate the handle; no-op
+/// (2026-07-02). STATIC native, descriptor `(JZ)V`, called by `setKeepScreenOn` +
+/// `onAttachedToWindow`/`onDetachedFromWindow`. ATL's reference C inhibits host suspend/idle via
+/// GtkApplication; Eclipse sets no host power policy (the desktop compositor owns idle) and nothing
+/// reads back, so the honest backing validates the handle and no-ops. Bound now that the installed
+/// dex proves the declaration the 58a50f6 embargo demanded (see the consts note).
+extern "system" fn view_native_keep_screen_on<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    widget: jlong,
+    keep_screen_on: jboolean,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                keep_screen_on,
+                error = %e,
+                "View.native_keep_screen_on: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_addClass(long widget, String className)` → validate the handle; no-op (2026-07-02).
+/// INSTANCE native, descriptor `(JLjava/lang/String;)V` (`setTextAlignment` passes the literal
+/// "ATL-text-align-*" GTK CSS classes). Eclipse has no GTK style context and nothing reads back, so
+/// the honest backing validates the handle and no-ops; the class-name string is not dereferenced.
+extern "system" fn view_native_add_class<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    _class_name: JString<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_addClass: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_removeClasses(long widget, String[] classNames)` → validate the handle; no-op
+/// (2026-07-02). INSTANCE native, descriptor `(J[Ljava/lang/String;)V` — the array-remove sibling of
+/// [`view_native_add_class`] on the same `setTextAlignment` path (GTK CSS classes, no reader).
+extern "system" fn view_native_remove_classes<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    _class_names: JObjectArray<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_removeClasses: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_drawBackground(long widget, long snapshot)` → validate the handle; no-op
+/// (2026-07-02). INSTANCE native, descriptor `(JJ)V`, reached from `View.draw(Canvas)` ONLY under an
+/// `instanceof android.atl.GskCanvas` guard (the `snapshot` is the GskCanvas's GSK snapshot pointer
+/// — NOT a registry handle, taken but never dereferenced). Validated no-op per the
+/// `Drawable.native_draw` precedent (2026-07-02 🎨): write-only render bookkeeping with no reader —
+/// the engine renders the real screen.
+extern "system" fn view_native_draw_background<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    snapshot: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                snapshot,
+                error = %e,
+                "View.native_drawBackground: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_drawContent(long widget, long snapshot)` → validate the handle; no-op (2026-07-02).
+/// INSTANCE native, descriptor `(JJ)V` — the `onDraw(Canvas)` sibling of
+/// [`view_native_draw_background`], behind the same GskCanvas guard (write-only, no reader).
+extern "system" fn view_native_draw_content<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    snapshot: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                snapshot,
+                error = %e,
+                "View.native_drawContent: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `View.native_queueAllocate(long widget)` → validate the handle; no-op (2026-07-02). INSTANCE
+/// native, descriptor `(J)V`. `setTranslationX`/`setTranslationY` store the translation in the
+/// view's OWN Java field, then call this on the PARENT's widget (a GTK re-layout request in ATL's
+/// reference C; no reader). The honest backing validates whatever live handle arrives and no-ops.
+extern "system" fn view_native_queue_allocate<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_queueAllocate: invalid view handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 extern "system" fn view_native_get_window<'local>(
@@ -5638,11 +6024,14 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // `*mut c_void` pair each fn with its declared JNI descriptor (verified against View.java lines
     // 1166/1310, 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility`/`nativeSetOnClickListener`
     // from the ART No-implementation-found lines, 2026-06-05; `native_destructor` View.java line 1168,
-    // 2026-06-13). NO `setBackgroundColor(I)V` / `native_keep_screen_on(JZ)V` here — the shipped
-    // framework's `setBackgroundColor(int)` is plain Java, not native (see the consts comment near
-    // `VIEW_SET_ON_CLICK_LISTENER_NAME` for the 58a50f6 live-log evidence); the best-effort registrar
-    // additionally makes any future such drift non-fatal (deferred per-method UnsatisfiedLinkError).
-    let bindings: [NativeBinding; 17] = [
+    // 2026-06-13). NO `setBackgroundColor(I)V` here — the shipped framework's `setBackgroundColor(int)`
+    // is plain Java, not native (see the consts comment near `VIEW_SET_ON_CLICK_LISTENER_NAME` for the
+    // 58a50f6 live-log evidence; re-verified against the installed dex 2026-07-02). 2026-07-02:
+    // `native_keep_screen_on(JZ)V` — which 58a50f6 embargoed alongside it — IS declared
+    // `private static native` in both installed dexes and is now IN this array (see the consts note);
+    // the best-effort registrar additionally makes any future such drift non-fatal (deferred
+    // per-method UnsatisfiedLinkError).
+    let bindings: [NativeBinding; 26] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -5738,6 +6127,56 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_REQUEST_FOCUS_SIG,
             view_native_request_focus as *mut c_void,
         ),
+        // 2026-07-02: the View LAYOUT/GEOMETRY remainder pass (declared-vs-bound audit of the
+        // installed dex — see the consts cluster for the per-native classification evidence).
+        // `native_layout` records the laid-out frame (the challenge8 discovery signal);
+        // `nativeIsFocused` serves the focus record `nativeRequestFocus` writes; the rest are
+        // validated no-ops. `native_measure` + the declaration-only dead trio stay unbound.
+        (
+            VIEW_NATIVE_LAYOUT_NAME,
+            VIEW_NATIVE_LAYOUT_SIG,
+            view_native_layout as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_IS_FOCUSED_NAME,
+            VIEW_NATIVE_IS_FOCUSED_SIG,
+            view_native_is_focused as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_INVALIDATE_NAME,
+            VIEW_NATIVE_INVALIDATE_SIG,
+            view_native_invalidate as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_KEEP_SCREEN_ON_NAME,
+            VIEW_NATIVE_KEEP_SCREEN_ON_SIG,
+            view_native_keep_screen_on as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_ADD_CLASS_NAME,
+            VIEW_NATIVE_ADD_CLASS_SIG,
+            view_native_add_class as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_REMOVE_CLASSES_NAME,
+            VIEW_NATIVE_REMOVE_CLASSES_SIG,
+            view_native_remove_classes as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_DRAW_BACKGROUND_NAME,
+            VIEW_NATIVE_DRAW_BACKGROUND_SIG,
+            view_native_draw_background as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_DRAW_CONTENT_NAME,
+            VIEW_NATIVE_DRAW_CONTENT_SIG,
+            view_native_draw_content as *mut c_void,
+        ),
+        (
+            VIEW_NATIVE_QUEUE_ALLOCATE_NAME,
+            VIEW_NATIVE_QUEUE_ALLOCATE_SIG,
+            view_native_queue_allocate as *mut c_void,
+        ),
     ];
     // SAFETY: each `ptr` is an `extern "system"` fn matching its paired descriptor by construction (see
     // the per-entry references above); the registrar binds them per method on `android/view/View`.
@@ -5745,7 +6184,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/view/View",
         bound,
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + getWindowVisibleDisplayFrame + nativeIsAttachedToWindow + native_getGlobalVisibleRect + nativeRequestFocus (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + getWindowVisibleDisplayFrame + nativeIsAttachedToWindow + native_getGlobalVisibleRect + nativeRequestFocus + native_layout + nativeIsFocused + nativeInvalidate + native_keep_screen_on + native_addClass + native_removeClasses + native_drawBackground + native_drawContent + native_queueAllocate (native_measure deliberately unbound — real content-measure pass; native_addClasses/native_removeClass/native_getMatrix declaration-only dead code) (per-method best-effort)"
     );
     Ok(())
 }
@@ -8637,6 +9076,10 @@ const EDIT_TEXT_GET_TEXT_SIG: &JNIStr = jni_str!("(J)Ljava/lang/String;");
 /// [`type_into_active_text_field`]); set by [`edit_text_native_get_text`]. A process-global atomic
 /// (single ART process; the value is just a `view_registry` handle, re-validated under the registry
 /// lock on use, so a stale value is a sound no-op, never UB).
+///
+/// 2026-07-02: this is a de-facto SECOND focus record beside `view_registry`'s `FOCUSED_VIEW`
+/// (written only by `View.nativeRequestFocus`); `View.nativeIsFocused` serves ONLY the latter and
+/// carries a one-shot divergence WARN — see [`view_native_is_focused`]'s doc before unifying them.
 static ACTIVE_TEXT_FIELD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// The currently-focused text field's [`view_registry`] handle, or `0` if none. Lets the graphics
@@ -15693,6 +16136,65 @@ mod tests {
         // instead of failing in the harness, so this pins the name+descriptor ART named.
         assert_eq!(VIEW_NATIVE_DESTRUCTOR_NAME.to_str(), "native_destructor");
         assert_eq!(VIEW_NATIVE_DESTRUCTOR_SIG.to_str(), "(J)V");
+        // 2026-07-02 — the View LAYOUT/GEOMETRY remainder pass, pinned against the INSTALLED dex
+        // (baksmali of api-impl.jar: the classes2.dex overlay-shadowed View and the stock
+        // classes3.dex View declare the IDENTICAL 30-native surface). native_layout(JIIII)V is the
+        // challenge8 ART-reported ULE (`No implementation found for void
+        // android.view.View.native_layout(long, int, int, int, int)`); a drift here re-produces that
+        // exact boot failure instead of failing in the harness.
+        assert_eq!(VIEW_NATIVE_LAYOUT_NAME.to_str(), "native_layout");
+        assert_eq!(VIEW_NATIVE_LAYOUT_SIG.to_str(), "(JIIII)V");
+        // nativeIsFocused(J)Z is STATIC + value-returning: isFocused() returns it verbatim, served
+        // from the focus record its coupled writer nativeRequestFocus(JI)V (pinned above) stores.
+        assert_eq!(VIEW_NATIVE_IS_FOCUSED_NAME.to_str(), "nativeIsFocused");
+        assert_eq!(VIEW_NATIVE_IS_FOCUSED_SIG.to_str(), "(J)Z");
+        // nativeInvalidate(J)V — STATIC, every invalidate*() overload; validated no-op (GTK redraw
+        // request, no reader).
+        assert_eq!(VIEW_NATIVE_INVALIDATE_NAME.to_str(), "nativeInvalidate");
+        assert_eq!(VIEW_NATIVE_INVALIDATE_SIG.to_str(), "(J)V");
+        // native_keep_screen_on(JZ)V — STATIC; bound now that the installed dex proves the
+        // declaration the 58a50f6 embargo demanded (setBackgroundColor(I)V stays OUT — still plain
+        // Java in the installed dex, re-verified 2026-07-02).
+        assert_eq!(
+            VIEW_NATIVE_KEEP_SCREEN_ON_NAME.to_str(),
+            "native_keep_screen_on"
+        );
+        assert_eq!(VIEW_NATIVE_KEEP_SCREEN_ON_SIG.to_str(), "(JZ)V");
+        // native_addClass / native_removeClasses — GTK-CSS-class styling no-ops; invoked (via
+        // View's declaration — no subclass re-declares) from View.setTextAlignment,
+        // TextView.setAllCaps/setTypeface, and Button.<init> (addClass only). No reader anywhere.
+        assert_eq!(VIEW_NATIVE_ADD_CLASS_NAME.to_str(), "native_addClass");
+        assert_eq!(VIEW_NATIVE_ADD_CLASS_SIG.to_str(), "(JLjava/lang/String;)V");
+        assert_eq!(
+            VIEW_NATIVE_REMOVE_CLASSES_NAME.to_str(),
+            "native_removeClasses"
+        );
+        assert_eq!(
+            VIEW_NATIVE_REMOVE_CLASSES_SIG.to_str(),
+            "(J[Ljava/lang/String;)V"
+        );
+        // native_drawBackground / native_drawContent — the GskCanvas-guarded draw pair (validated
+        // no-ops, the Drawable.native_draw precedent).
+        assert_eq!(
+            VIEW_NATIVE_DRAW_BACKGROUND_NAME.to_str(),
+            "native_drawBackground"
+        );
+        assert_eq!(VIEW_NATIVE_DRAW_BACKGROUND_SIG.to_str(), "(JJ)V");
+        assert_eq!(VIEW_NATIVE_DRAW_CONTENT_NAME.to_str(), "native_drawContent");
+        assert_eq!(VIEW_NATIVE_DRAW_CONTENT_SIG.to_str(), "(JJ)V");
+        // native_queueAllocate(J)V — setTranslationX/Y's parent re-layout request (validated no-op).
+        assert_eq!(
+            VIEW_NATIVE_QUEUE_ALLOCATE_NAME.to_str(),
+            "native_queueAllocate"
+        );
+        assert_eq!(VIEW_NATIVE_QUEUE_ALLOCATE_SIG.to_str(), "(J)V");
+        // 2026-07-02 — deliberately UNBOUND from the 30-native installed-dex audit (documented
+        // decisions; the clean call-time UnsatisfiedLinkError stays the discovery signal):
+        //   * native_measure(JII)V — a real content-measure pass whose setMeasuredDimension upcall
+        //     IS read back via getMeasuredWidth()/Height() (unservable honestly headless — the
+        //     Paint.native_get_text_bounds class).
+        //   * native_addClasses(J[Ljava/lang/String;)V, native_removeClass(JLjava/lang/String;)V,
+        //     native_getMatrix(JJ)Z — declaration-only dead code (no invoker in any installed dex).
         // The View.widget field (the view_registry handle on `this`) instance natives read.
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
@@ -16203,13 +16705,16 @@ mod tests {
             EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG.to_str(),
             "(JLandroid/widget/TextView$OnEditorActionListener;)V"
         );
-        // 2026-06-13: NOTE — base-View `setBackgroundColor(I)V` / `native_keep_screen_on(JZ)V` are
-        // intentionally NOT pinned/bound here. The shipped framework's `setBackgroundColor(int)` is
-        // plain Java (live boot at 58a50f6: `Failed to register non-native method
+        // 2026-06-13: NOTE — base-View `setBackgroundColor(I)V` is intentionally NOT pinned/bound
+        // here. The shipped framework's `setBackgroundColor(int)` is plain Java (live boot at
+        // 58a50f6: `Failed to register non-native method
         // android.view.View.setBackgroundColor(I)V as native`), which aborted the atomic
         // RegisterNatives for the whole View class; see `register_view_natives` for the removal.
-        // The View/widget per-class registrations now bind PER METHOD (best-effort), so such a drift is
-        // a deferred call-time UnsatisfiedLinkError rather than a fatal whole-class abort — guarded by
+        // 2026-07-02: `native_keep_screen_on(JZ)V` — which 58a50f6 embargoed alongside it — IS
+        // declared `private static native` in both installed dexes, so it is now bound + pinned
+        // above (the 📐 View layout/geometry pass). The View/widget per-class registrations bind
+        // PER METHOD (best-effort), so such a drift is a deferred call-time UnsatisfiedLinkError
+        // rather than a fatal whole-class abort — guarded by
         // `register_class_natives_best_effort_skips_unbindable_method_and_continues`.
     }
 
