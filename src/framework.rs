@@ -14019,6 +14019,76 @@ mod tests {
     }
 
     #[test]
+    fn resolve_xml_attributes_serves_include_android_id_and_never_matches_attr_zero() {
+        // 2026-07-02 regression guard for the challenge-fragment RobloxToolbar NPE: ATL's
+        // LayoutInflater.parseInclude reads the <include android:id> override via
+        // obtainStyledAttributes(attrs, {com.android.internal.R.attr.id}) → applyStyle →
+        // resolve_xml_attributes. The Eclipse-native half of that contract: (a) android:id
+        // (0x010100d0) on the include element must resolve with the referenced id preserved in
+        // resource_id and a non-NULL value type (both are what TypedArray.getResourceId reads);
+        // (b) a requested attr id of 0 — what the overlay's mis-stubbed internal R constant
+        // compiled to, dropping the override — must NEVER match anything.
+        use crate::apk::axml::{XmlAttribute, XmlDocument, XmlElement, XmlEventKind};
+        let include = XmlElement {
+            namespace: None,
+            name: Some("include".to_string()),
+            attributes: vec![
+                // android:id="@id/toolbar1" — the real shape from res/layout/toolbar_frame.xml.
+                XmlAttribute {
+                    namespace: Some("http://schemas.android.com/apk/res/android".to_string()),
+                    name: Some("id".to_string()),
+                    name_resource: 0x0101_00d0,
+                    value_type: TYPE_REFERENCE,
+                    value_data: 0x7f09_027b,
+                    value_string: None,
+                },
+                // layout="@layout/toolbar_include" — no name resource (not an android: attr).
+                XmlAttribute {
+                    namespace: None,
+                    name: Some("layout".to_string()),
+                    name_resource: 0,
+                    value_type: TYPE_REFERENCE,
+                    value_data: 0x7f0c_00a3,
+                    value_string: None,
+                },
+            ],
+            line: 0,
+        };
+        let doc = XmlDocument {
+            events: vec![XmlEventKind::StartTag(0), XmlEventKind::EndTag(0)],
+            elements: vec![include],
+            texts: vec![],
+            namespaces: vec![],
+            strings: vec![],
+        };
+        let handle = xml_registry::store(doc).expect("store include block");
+        // Position the cursor on the <include> START_TAG (what rInflate's parser.next() did).
+        xml_registry::with_block(handle, |b| {
+            b.next_event();
+        })
+        .expect("advance to include");
+
+        let out = resolve_xml_attributes(handle, &[u32_to_i32(0x0101_00d0), 0]);
+        assert_eq!(out.len(), 2);
+        let id_entry = out[0].expect("android:id resolves on the include tag");
+        assert_eq!(
+            id_entry.resource_id,
+            u32_to_i32(0x7f09_027b),
+            "getResourceId must see the include-tag override id"
+        );
+        assert_ne!(
+            id_entry.value_type, 0,
+            "TYPE_NULL would make TypedArray.getResourceId return the 0 default → override dropped"
+        );
+        assert!(
+            out[1].is_none(),
+            "requested attr id 0 must never match (the zero-stub failure signature)"
+        );
+
+        xml_registry::free(handle).expect("free include block");
+    }
+
+    #[test]
     fn context_native_names_and_sigs_match_context_java() {
         // Pin the two Context static-init native method names + JNI descriptors against
         // `Context.java` (2026-06-05): a transcription regression (wrong name or sig) would make

@@ -97,6 +97,23 @@ kg_src="$here/src/android/app/KeyguardManager.java"
 [ -f "$kg_src" ] || fail "patched KeyguardManager.java missing at $kg_src"
 grep -qF 'public boolean isDeviceSecure()' "$kg_src" || fail "patched KeyguardManager.java no longer declares isDeviceSecure() — the NoSuchMethodError fix regressed"
 
+# --- 1e. compile against the VENDORED com.android.internal.R (javac constant-inlining guard) --
+# 2026-07-02: javac inlines `static final int` constants from compile inputs into the emitted
+# bytecode. A hand-written stub R.java with placeholder values (attr.id = 0, attr.theme = 0)
+# compiled LayoutInflater.parseInclude's <include android:id> override into
+# obtainStyledAttributes(attrs, new int[]{0}) — attribute id 0 never resolves, the include-tag id
+# was never applied to the included root, and the challenge fragment's findViewById(R.id.toolbar1/2)
+# returned null (RobloxToolbar.setVisibility NPE at yh.d.onCreateView). The stub is GONE; the
+# authoritative vendored R.java (what the stock classes3.dex was compiled with) is a compile input
+# instead, so any internal-R constant an overlay source uses inlines with its real value. Its
+# R*.class files are compile-only (the step-3 stage whitelist keeps them out of the dex). Guard the
+# two load-bearing constants against vendored drift, mirroring the Build.java anchor guard.
+r_src="$ATL_SRC/com/android/internal/R.java"
+[ -f "$r_src" ] || fail "vendored com/android/internal/R.java not found at $r_src (set ATL_SRC)"
+grep -qF 'public static final int id=0x010100d0;' "$r_src" || fail "vendored internal R.attr.id != 0x010100d0 — ATL source drifted; re-verify the overlay's inlined constants"
+grep -qF 'public static final int theme=0x01010000;' "$r_src" || fail "vendored internal R.attr.theme != 0x01010000 — ATL source drifted; re-verify the overlay's inlined constants"
+[ ! -e "$here/stubs/com/android/internal/R.java" ] || fail "stub com/android/internal/R.java re-appeared — javac would inline its placeholder constants into the overlay dex (the 2026-07-02 include-id NPE class); delete it (the vendored R.java is the compile input)"
+
 # --- 2. compile patched sources against the compile-only stubs ---------------------------
 # --release 8: dx 1.x accepts class files <= v52. -Xlint:-options silences the
 # "release 8 is obsolete" note; real warnings still show.
@@ -108,7 +125,8 @@ grep -qF 'public boolean isDeviceSecure()' "$kg_src" || fail "patched KeyguardMa
     "$here/src/android/os/PowerManager.java" \
     "$here/src/android/view/LayoutInflater.java" \
     "$here/src/android/webkit/ValueCallback.java" \
-    "$here/src/android/app/KeyguardManager.java"
+    "$here/src/android/app/KeyguardManager.java" \
+    "$r_src"
 
 # --- 3. stage ONLY the patched classes (stubs must never reach the dex) ------------------
 for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class' 'android/app/KeyguardManager*.class'; do
@@ -119,6 +137,17 @@ done
 
 # --- 4. dex the javac-patched classes -> classes.dex -------------------------------------
 "$DX" --dex --output="$work/jar/classes.dex" "$work/stage"
+
+# --- 4a. verify the DEXED LayoutInflater carries the REAL inlined internal-R constants ----
+# 2026-07-02: the dex-level check that catches the constant-inlining bug class directly (a source
+# grep cannot see what javac folded). parseInclude must request android:id (0x010100d0) and
+# createView android:theme (0x01010000); baksmali renders the inlined literals without the leading
+# zero. With the old zero-constant stub these greps fail (the array cell is `aput v5(=0)`).
+"$JAVA" -jar "$BAKSMALI_JAR" disassemble "$work/jar/classes.dex" -o "$work/smali-check" >/dev/null
+lism="$work/smali-check/android/view/LayoutInflater.smali"
+[ -f "$lism" ] || fail "LayoutInflater.smali not found in the built classes.dex"
+grep -qF '0x10100d0' "$lism" || fail "dexed LayoutInflater lost the inlined android:id constant (0x010100d0) — the <include android:id> override would silently drop (2026-07-02 RobloxToolbar NPE class)"
+grep -qF '0x1010000' "$lism" || fail "dexed LayoutInflater lost the inlined android:theme constant (0x01010000) — createView's android:theme handling would silently drop"
 
 # --- 4b. smali-patch the INSTALLED View + Display -> classes2.dex -------------------------
 # 2026-06-13: ATL's installed View omits AOSP's pointer-capture API (View.OnCapturedPointerListener +
