@@ -5,7 +5,7 @@
 # AOSP-shape NetworkRequest$Builder, foreground RunningAppProcessInfo).
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
-#   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*)
+#   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*, KeyguardManager*)
 #   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + Vibrator = installed classes + AOSP gaps
 #   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
@@ -88,6 +88,15 @@ vc_src="$here/src/android/webkit/ValueCallback.java"
 [ -f "$vc_src" ] || fail "patched ValueCallback.java missing at $vc_src"
 grep -qE 'public[[:space:]]+interface[[:space:]]+ValueCallback' "$vc_src" || fail "patched ValueCallback.java is not an interface — the IncompatibleClassChangeError fix regressed"
 
+# --- 1d. guard the patched KeyguardManager (isDeviceSecure) against silent regression ------
+# 2026-07-01: Roblox's security/device-check path calls KeyguardManager.isDeviceSecure() (AOSP API 23+);
+# ATL omits it, and the resulting NoSuchMethodError propagates as a pending exception that trips ART's
+# `runtime.cc:650 No pending exception expected` FATAL abort (EXIT=134) at the login screen. Fail loudly
+# if the added method is ever removed.
+kg_src="$here/src/android/app/KeyguardManager.java"
+[ -f "$kg_src" ] || fail "patched KeyguardManager.java missing at $kg_src"
+grep -qF 'public boolean isDeviceSecure()' "$kg_src" || fail "patched KeyguardManager.java no longer declares isDeviceSecure() — the NoSuchMethodError fix regressed"
+
 # --- 2. compile patched sources against the compile-only stubs ---------------------------
 # --release 8: dx 1.x accepts class files <= v52. -Xlint:-options silences the
 # "release 8 is obsolete" note; real warnings still show.
@@ -98,10 +107,11 @@ grep -qE 'public[[:space:]]+interface[[:space:]]+ValueCallback' "$vc_src" || fai
     "$here/src/android/app/ActivityManager.java" \
     "$here/src/android/os/PowerManager.java" \
     "$here/src/android/view/LayoutInflater.java" \
-    "$here/src/android/webkit/ValueCallback.java"
+    "$here/src/android/webkit/ValueCallback.java" \
+    "$here/src/android/app/KeyguardManager.java"
 
 # --- 3. stage ONLY the patched classes (stubs must never reach the dex) ------------------
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class' 'android/app/KeyguardManager*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     cp "$work/classes/"$pattern "$work/stage/$dir/"
@@ -228,6 +238,13 @@ n="$(grep -cF '.method public unregisterCallback(Landroid/view/autofill/Autofill
 ! grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali already declares cancel — installed AutofillManager drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public unregisterCallback\(Landroid/view/autofill/AutofillManager\$AutofillCallback;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP AutofillManager.cancel() no-op (Roblox RbxKeyboard.i() calls it when showing text input for a focused login field; ATL omits it). No autofill service -> nothing to cancel.\n.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$afm"
 grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali cancel insert failed (drift?)"
+# AutofillManager.requestAutofill(View) no-op — Roblox's RbxKeyboard.i() ALSO calls it (AOSP API 26)
+# when configuring the focused login field for autofill; ATL/overlay AutofillManager omits it, so the
+# post-login keyboard-setup path throws NoSuchMethodError. No autofill service -> no-op. Anchor on the
+# cancel() method inserted just above (unique after that insert).
+! grep -qF 'requestAutofill(Landroid/view/View;)V' "$afm" || fail "AutofillManager.smali already declares requestAutofill — drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public cancel\(\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-07-01: AOSP AutofillManager.requestAutofill(View) no-op (Roblox RbxKeyboard.i() requests autofill for a focused login field; ATL omits it). No autofill service -> no-op.\n.method public requestAutofill(Landroid/view/View;)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$afm"
+grep -qF 'requestAutofill(Landroid/view/View;)V' "$afm" || fail "AutofillManager.smali requestAutofill insert failed (drift?)"
 
 # CookieManager.setCookie(url, value, ValueCallback<Boolean>) — AOSP API 21; Roblox's CookieProtocol sets
 # login cookies through it; ATL ships only the 2-arg setCookie. Delegate to the 2-arg, then report success
