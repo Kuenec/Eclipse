@@ -4287,12 +4287,25 @@ fn register_process_natives(env: &mut Env) -> Result<(), FrameworkError> {
 // Eclipse's 0 sentinel means "no IM context" (hideSoftInput/showSoftInput no-ops).
 
 /// `android.view.inputmethod.InputMethodManager` (internal/slashed name for `find_class`).
-pub const INPUT_METHOD_MANAGER_CLASS: &JNIStr = jni_str!("android/view/inputmethod/InputMethodManager");
+pub const INPUT_METHOD_MANAGER_CLASS: &JNIStr =
+    jni_str!("android/view/inputmethod/InputMethodManager");
 
-// JNI name + descriptor for InputMethodManager.nativeInit, exactly as declared in
-// InputMethodManager.java (line 56): `private static native long nativeInit();` → STATIC, descriptor `()J`.
+// JNI names + descriptors for InputMethodManager's natives, exactly as declared in the installed
+// InputMethodManager dex (baksmali-confirmed 2026-07-01):
+//   `private static native long nativeInit();`                                             → STATIC ()J
+//   `private native void nativeHideSoftInput(long);`                                        → INSTANCE (J)V
+//   `private native boolean nativeShowSoftInput(long, long, InputConnection, int);`         → INSTANCE (JJLandroid/view/inputmethod/InputConnection;I)Z
+// nativeInit backs the class <clinit>'s `im_context` field; hide/show are the soft-keyboard show/hide
+// path (`hideSoftInputFromWindow`/`showSoftInput`). Eclipse has no soft keyboard (no GTK/GtkIMContext),
+// and Roblox's visible login typing is delivered via the engine text bridge + Eclipse's Vulkan overlay
+// (AGENTS.md §5), NOT the Android IME — so hide is a no-op and show honestly reports "not shown".
 const IMM_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
 const IMM_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
+const IMM_NATIVE_HIDE_SOFT_INPUT_NAME: &JNIStr = jni_str!("nativeHideSoftInput");
+const IMM_NATIVE_HIDE_SOFT_INPUT_SIG: &JNIStr = jni_str!("(J)V");
+const IMM_NATIVE_SHOW_SOFT_INPUT_NAME: &JNIStr = jni_str!("nativeShowSoftInput");
+const IMM_NATIVE_SHOW_SOFT_INPUT_SIG: &JNIStr =
+    jni_str!("(JJLandroid/view/inputmethod/InputConnection;I)Z");
 
 /// `InputMethodManager.nativeInit()` → 0 (2026-06-15). STATIC native, descriptor `()J`. Eclipse has no
 /// soft keyboard (no GTK/GtkIMContext), so this returns 0 as a "no IM context" sentinel. UNBOUND, this
@@ -4302,13 +4315,51 @@ extern "system" fn imm_native_init<'local>(mut env: EnvUnowned<'local>) -> jlong
         .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `InputMethodManager.nativeInit()`.
+/// `InputMethodManager.nativeHideSoftInput(long im_context)` → no-op (2026-07-01). INSTANCE native,
+/// descriptor `(J)V`. Called from `hideSoftInputFromWindow` on the `RbxKeyboard` keyboard path
+/// (post-login field defocus). Eclipse has no soft keyboard to hide, so this is a sound no-op; the
+/// `im_context` arg is the [`imm_native_init`] 0 sentinel and is not dereferenced.
+extern "system" fn imm_native_hide_soft_input<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _im_context: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> { Ok(()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `InputMethodManager.nativeShowSoftInput(long im_context, long view, InputConnection ic, int flags)`
+/// → `false` (2026-07-01). INSTANCE native, descriptor `(JJLandroid/view/inputmethod/InputConnection;I)Z`.
+/// Called from `showSoftInput` on the `RbxKeyboard` keyboard path (post-login field focus). Eclipse has
+/// no soft keyboard, so the honest answer is "no soft input was shown" (`false`) — this is a capability
+/// report, not a workaround: Roblox's visible login typing is delivered via the engine text bridge +
+/// Eclipse's Vulkan overlay (AGENTS.md §5), not the Android IME. Args are not dereferenced.
+extern "system" fn imm_native_show_soft_input<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _im_context: jlong,
+    _view: jlong,
+    _ic: JObject<'local>,
+    _flags: jint,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(false) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `InputMethodManager`'s `nativeInit` +
+/// `nativeHideSoftInput` + `nativeShowSoftInput`.
+///
+/// All three are declared `native` in the shipped dex (baksmali-confirmed 2026-07-01), so the atomic
+/// `register_native_methods` array binds cleanly. Binding the full declared-native set in one pass
+/// (per the batch-binding discipline in AGENTS.md §6) closes the whole soft-keyboard path at once
+/// rather than one gap per boot.
 ///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature.
-/// It does, by construction — `()J` as a STATIC native (pinned by
-/// `imm_native_name_sig_and_class_match_api_impl_dex`). The body is `catch_unwind`-guarded
-/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+/// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature. They
+/// do, by construction — `nativeInit ()J` (STATIC), `nativeHideSoftInput (J)V` (INSTANCE),
+/// `nativeShowSoftInput (JJLandroid/view/inputmethod/InputConnection;I)Z` (INSTANCE) — pinned by
+/// `imm_native_name_sig_and_class_match_api_impl_dex`. Every body is `catch_unwind`-guarded via
+/// [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(INPUT_METHOD_MANAGER_CLASS)?;
     let methods = [
@@ -4321,14 +4372,31 @@ fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkE
                 imm_native_init as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `imm_native_hide_soft_input` matches the paired `(J)V` signature as an instance native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                IMM_NATIVE_HIDE_SOFT_INPUT_NAME,
+                IMM_NATIVE_HIDE_SOFT_INPUT_SIG,
+                imm_native_hide_soft_input as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `imm_native_show_soft_input` matches the paired
+        // `(JJLandroid/view/inputmethod/InputConnection;I)Z` signature as an instance native.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                IMM_NATIVE_SHOW_SOFT_INPUT_NAME,
+                IMM_NATIVE_SHOW_SOFT_INPUT_SIG,
+                imm_native_show_soft_input as *mut std::ffi::c_void,
+            )
+        },
     ];
-    // SAFETY: `class` is the loaded android/view/inputmethod/InputMethodManager; the method holds
-    // a valid fn pointer whose signature matches the class's `native` declaration (InputMethodManager.java
-    // line 56, ATL api-impl).
+    // SAFETY: `class` is the loaded android/view/inputmethod/InputMethodManager; each method holds a
+    // valid fn pointer whose signature matches the class's `native` declaration (installed IMM dex,
+    // baksmali-confirmed 2026-07-01).
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/inputmethod/InputMethodManager",
-        "registered Eclipse's non-GTK backing for nativeInit (no soft keyboard → 0 sentinel)"
+        "registered Eclipse's non-GTK backing for nativeInit + nativeHideSoftInput + nativeShowSoftInput (no soft keyboard)"
     );
     Ok(())
 }
@@ -6890,6 +6958,35 @@ const TEXT_VIEW_NATIVE_SET_TEXT_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V")
 const TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME: &JNIStr = jni_str!("native_setTextColor");
 const TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG: &JNIStr = jni_str!("(I)V");
 
+// 2026-07-01: `TextView.setTextSize(float size)` — the INSTALLED TextView declares it `public
+// native setTextSize(F)V` (baksmali of the shipped api-impl dex, line 1609) and calls it from
+// `TextView.<init>` (Unknown Source:171), so EVERY TextView construction hits it. Surfaced FATALLY
+// by the Roblox login anti-bot challenge (`onAppReady: ChallengeNativeWrapper` → challenge layout
+// inflation → UnsatisfiedLinkError out of Handler.dispatchMessage → the "stuck loading" sign-in,
+// /tmp/eclipse-continue3.log). No widget param — reads `this.widget` like `native_setTextColor`.
+// The renderer draws no per-view text size (the engine renders the real UI; the vk_overlay gets its
+// font size from NativeTextBoxInfo), so validate-and-no-op is the honest backing.
+const TEXT_VIEW_SET_TEXT_SIZE_NAME: &JNIStr = jni_str!("setTextSize");
+const TEXT_VIEW_SET_TEXT_SIZE_SIG: &JNIStr = jni_str!("(F)V");
+
+// 2026-07-01: `TextView.native_set_markup(int enable)` — installed TextView declares it
+// `private final native native_set_markup(I)V` (baksmali line 472); called from
+// `setText(CharSequence, BufferType)` when the text is a `Spanned` (styled challenge/legal text).
+// Same shape as `native_setTextColor`: no widget param, reads `this.widget`; the recorded peer
+// carries plain text only (markup is a GTK-label rendering concern ATL's C backing owns) →
+// validate-and-no-op.
+const TEXT_VIEW_NATIVE_SET_MARKUP_NAME: &JNIStr = jni_str!("native_set_markup");
+const TEXT_VIEW_NATIVE_SET_MARKUP_SIG: &JNIStr = jni_str!("(I)V");
+
+// 2026-07-01: `TextView.native_setCompoundDrawables(long widget, long left, long top, long right,
+// long bottom)` — installed TextView declares it `protected native (JJJJJ)V` (baksmali line 990);
+// `setCompoundDrawables(Drawable×4)` passes `this.widget` + each drawable's `paintable` handle
+// (0 for null). Drawable draw is deferred (the Button sibling `native_setCompoundDrawables(JJ)V`
+// is the same validated no-op) → validate the widget handle and no-op.
+const TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_NAME: &JNIStr =
+    jni_str!("native_setCompoundDrawables");
+const TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_SIG: &JNIStr = jni_str!("(JJJJJ)V");
+
 // JNI name + descriptor for View.widget — the `public long widget` field (`View.java` line 888) that
 // holds the view's [`view_registry`] handle. An instance native like `native_setText` (which receives
 // only the text, not the handle) reads it off `this` to find the peer to update.
@@ -6984,6 +7081,114 @@ extern "system" fn text_view_native_set_text_color<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `TextView.setTextSize(float size)` — Eclipse's non-GTK backing. Instance native with NO widget
+/// param (reads `this.widget`, the `native_setTextColor` shape). Called from `TextView.<init>`
+/// (installed dex, Unknown Source:171), so EVERY TextView construction reaches it — surfaced
+/// FATALLY 2026-07-01 by the login anti-bot challenge layout (`ChallengeNativeWrapper`), where the
+/// UnsatisfiedLinkError escaped `Handler.dispatchMessage` and left sign-in "stuck loading".
+/// Validated no-op: the engine renders the real UI; no bound native getter reads a text size back.
+extern "system" fn text_view_set_text_size<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    size: jfloat,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let widget = view_widget_handle(env, &this);
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.widget.TextView",
+                widget,
+                size,
+                error = %e,
+                "TextView.setTextSize: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.widget.TextView",
+                widget,
+                size,
+                "TextView.setTextSize: validated handle, no-op (renderer uses fixed glyph metrics)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `TextView.native_set_markup(int enable)` — Eclipse's non-GTK backing. Instance native with NO
+/// widget param (reads `this.widget`); called from `setText(CharSequence, BufferType)` when the
+/// text is a `Spanned` (styled challenge/legal text). Markup rendering is a GTK-label concern of
+/// ATL's C backing; Eclipse's recorded peer carries plain text → validated no-op.
+extern "system" fn text_view_native_set_markup<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    enable: jint,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let widget = view_widget_handle(env, &this);
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.widget.TextView",
+                widget,
+                enable,
+                error = %e,
+                "TextView.native_set_markup: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.widget.TextView",
+                widget,
+                enable,
+                "TextView.native_set_markup: validated handle, no-op (plain-text peer)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `TextView.native_setCompoundDrawables(long widget, long left, long top, long right, long
+/// bottom)` — Eclipse's non-GTK backing. STATIC-shaped instance call in ATL style: the widget
+/// handle is the FIRST param (the drawable `paintable` handles follow, 0 for null). Drawable draw
+/// is deferred project-wide (the Button `native_setCompoundDrawables(JJ)V` sibling is the same
+/// validated no-op) → validate the widget handle and no-op.
+extern "system" fn text_view_native_set_compound_drawables<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    left: jlong,
+    top: jlong,
+    right: jlong,
+    bottom: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.widget.TextView",
+                widget,
+                left,
+                top,
+                right,
+                bottom,
+                error = %e,
+                "TextView.native_setCompoundDrawables: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.widget.TextView",
+                widget,
+                left,
+                top,
+                right,
+                bottom,
+                "TextView.native_setCompoundDrawables: validated handle, no-op (drawable draw deferred)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Read a View's `widget` (`long`) field off `this` — its [`view_registry`] handle. Returns `0` (the
 /// reserved null handle, which the registry rejects) on any JNI error, so the caller still no-ops
 /// soundly. Off the gameplay hot path (per text/attribute set during inflation).
@@ -7022,8 +7227,12 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // View.native_constructor, TextView.java line 89); `text_view_native_set_text` matches the paired
     // `(Ljava/lang/String;)V` instance native (TextView.java line 111); `text_view_native_set_text_color`
     // matches the paired `(I)V` instance native (TextView.java line 120, surfaced by Roblox's
-    // splash-layout inflation, run log 2026-06-11).
-    let bindings: [NativeBinding; 3] = [
+    // splash-layout inflation, run log 2026-06-11); `text_view_set_text_size` matches the paired
+    // `(F)V` instance native (installed-dex baksmali line 1609, surfaced FATALLY by the login
+    // challenge, /tmp/eclipse-continue3.log 2026-07-01); `text_view_native_set_markup` matches the
+    // paired `(I)V` instance native (baksmali line 472); `text_view_native_set_compound_drawables`
+    // matches the paired `(JJJJJ)V` instance native (baksmali line 990).
+    let bindings: [NativeBinding; 6] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -7039,12 +7248,27 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG,
             text_view_native_set_text_color as *mut c_void,
         ),
+        (
+            TEXT_VIEW_SET_TEXT_SIZE_NAME,
+            TEXT_VIEW_SET_TEXT_SIZE_SIG,
+            text_view_set_text_size as *mut c_void,
+        ),
+        (
+            TEXT_VIEW_NATIVE_SET_MARKUP_NAME,
+            TEXT_VIEW_NATIVE_SET_MARKUP_SIG,
+            text_view_native_set_markup as *mut c_void,
+        ),
+        (
+            TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_NAME,
+            TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_SIG,
+            text_view_native_set_compound_drawables as *mut c_void,
+        ),
     ];
     let bound = register_class_natives_best_effort(env, TEXT_VIEW_CLASS, &bindings)?;
     tracing::info!(
         class = "android/widget/TextView",
         bound,
-        "registered Eclipse's non-GTK backing for TextView.native_constructor + native_setText + native_setTextColor (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for TextView.native_constructor + native_setText + native_setTextColor + setTextSize + native_set_markup + native_setCompoundDrawables (per-method best-effort)"
     );
     Ok(())
 }
@@ -8904,6 +9128,18 @@ const DRAWABLE_NATIVE_CONSTRUCTOR_SIG: &JNIStr = jni_str!("()J");
 const DRAWABLE_NATIVE_UNREF_NAME: &JNIStr = jni_str!("native_unref");
 const DRAWABLE_NATIVE_UNREF_SIG: &JNIStr = jni_str!("(J)V");
 
+// JNI name + descriptor for Drawable.native_invalidate, from the ART-reported signature `void
+// android.graphics.drawable.Drawable.native_invalidate(long)` (run log 2026-07-01, live boot):
+// `protected native void native_invalidate(long paintable)` in ATL's `Drawable.java:386` — an
+// INSTANCE native (called `invoke-virtual {this, paintable}` from `Drawable.invalidateSelf()`,
+// `Drawable.java:139`), descriptor `(J)V`. Surfaced when `GradientDrawable.setShape → invalidateSelf`
+// runs during an AppCompat ActionBar drawable inflate (post-login LuaApp init). ATL's C backing asks
+// GTK to repaint the paintable; Eclipse's lifecycle is draw-free and the `paintable` here is the
+// non-pointer [`DRAWABLE_HANDLE_SENTINEL`] (never dereferenced — see the section comment), so
+// invalidation is a sound no-op (no surface to redraw). Bound alongside native_constructor/native_unref.
+const DRAWABLE_NATIVE_INVALIDATE_NAME: &JNIStr = jni_str!("native_invalidate");
+const DRAWABLE_NATIVE_INVALIDATE_SIG: &JNIStr = jni_str!("(J)V");
+
 /// The non-zero, non-pointer sentinel `Drawable.native_constructor()` returns as `mNativePtr`.
 ///
 /// 2026-06-05: Java only needs `mNativePtr != 0` (for the native-allocation registration); this value
@@ -8961,16 +9197,45 @@ extern "system" fn drawable_native_unref<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.graphics.drawable.Drawable`'s `native_constructor`.
+/// `Drawable.native_invalidate(long paintable)` → no-op repaint request (2026-07-01).
 ///
-/// Locates `android/graphics/drawable/Drawable` and registers the native via `RegisterNatives` (which
+/// JNI ABI: an INSTANCE native returning void (`Drawable.invalidateSelf()` calls
+/// `invoke-virtual {this, paintable}`, `Drawable.java:139`), so the parameters are
+/// `(EnvUnowned, JObject this, jlong paintable)`. `paintable` is the non-pointer
+/// [`DRAWABLE_HANDLE_SENTINEL`] (no registry slot backs it — see the section comment), so it is taken
+/// but NOT dereferenced. ATL's C backing repaints the GTK paintable; Eclipse's lifecycle is draw-free
+/// (no surface to redraw), so the sound behavior is a no-op.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
+/// `()` default on error/panic — the correct neutral value for this `void` native.
+extern "system" fn drawable_native_invalidate<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    paintable: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.drawable.Drawable",
+            paintable,
+            "Drawable.native_invalidate: no-op (sentinel handle, draw-free lifecycle)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.graphics.drawable.Drawable`'s
+/// `native_constructor` + `native_unref` + `native_invalidate`.
+///
+/// Locates `android/graphics/drawable/Drawable` and registers the natives via `RegisterNatives` (which
 /// wins over name-based lazy binding — JNI 1.1 spec). MUST run before step 4, since a launcher's
-/// onCreate may load a drawable. Registered alongside the View/widget natives.
+/// onCreate may load a drawable. Registered alongside the View/widget natives. All three are declared
+/// `native` in the shipped dex, so the atomic `register_native_methods` array binds cleanly.
 ///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI signature.
-/// It does — [`drawable_native_constructor`] is written to the exact `()J` descriptor as an instance
-/// native (`EnvUnowned, JObject this`). The native body is `catch_unwind`-guarded via
+/// `register_native_methods` is `unsafe`: the function pointers must match the declared JNI signatures.
+/// They do — `native_constructor` `()J`, `native_unref` `(J)V` (static), `native_invalidate` `(J)V`
+/// (instance) — see each native's docs. Every native body is `catch_unwind`-guarded via
 /// [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
 fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(DRAWABLE_CLASS)?;
@@ -8993,6 +9258,15 @@ fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 drawable_native_unref as *mut std::ffi::c_void,
             )
         },
+        // SAFETY: `drawable_native_invalidate` matches the paired `(J)V` signature as an instance
+        // native (see the native's docs).
+        unsafe {
+            NativeMethod::from_raw_parts(
+                DRAWABLE_NATIVE_INVALIDATE_NAME,
+                DRAWABLE_NATIVE_INVALIDATE_SIG,
+                drawable_native_invalidate as *mut std::ffi::c_void,
+            )
+        },
     ];
     // SAFETY: `class` is the loaded android/graphics/drawable/Drawable; the fn pointers' signatures
     // match its `native_constructor`/`native_unref` (AOSP `Drawable.java` + the ART-reported signatures,
@@ -9000,7 +9274,7 @@ fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/graphics/drawable/Drawable",
-        "registered Eclipse's non-GTK backing for Drawable.native_constructor + native_unref"
+        "registered Eclipse's non-GTK backing for Drawable.native_constructor + native_unref + native_invalidate"
     );
     Ok(())
 }
@@ -13310,6 +13584,29 @@ mod tests {
             "native_setTextColor"
         );
         assert_eq!(TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG.to_str(), "(I)V");
+        // 2026-07-01: TextView.setTextSize — installed dex declares `public native setTextSize(F)V`
+        // (baksmali line 1609), called from TextView.<init>; pinned to the exact ART
+        // No-implementation-found line the login challenge surfaced (/tmp/eclipse-continue3.log —
+        // the "stuck loading" sign-in). A drift re-produces that fatal UnsatisfiedLinkError.
+        assert_eq!(TEXT_VIEW_SET_TEXT_SIZE_NAME.to_str(), "setTextSize");
+        assert_eq!(TEXT_VIEW_SET_TEXT_SIZE_SIG.to_str(), "(F)V");
+        // 2026-07-01: TextView.native_set_markup — installed dex `private final native (I)V`
+        // (baksmali line 472), called from setText(CharSequence, BufferType) for Spanned text.
+        assert_eq!(
+            TEXT_VIEW_NATIVE_SET_MARKUP_NAME.to_str(),
+            "native_set_markup"
+        );
+        assert_eq!(TEXT_VIEW_NATIVE_SET_MARKUP_SIG.to_str(), "(I)V");
+        // 2026-07-01: TextView.native_setCompoundDrawables — installed dex `protected native
+        // (JJJJJ)V` (baksmali line 990): widget handle first, then 4 drawable paintable handles.
+        assert_eq!(
+            TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_NAME.to_str(),
+            "native_setCompoundDrawables"
+        );
+        assert_eq!(
+            TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_SIG.to_str(),
+            "(JJJJJ)V"
+        );
     }
 
     #[test]
@@ -13760,9 +14057,44 @@ mod tests {
         // native_unref(long) → `(J)V`, surfaced 2026-06-05; the drawable peer free callback (no-op).
         assert_eq!(DRAWABLE_NATIVE_UNREF_NAME.to_str(), "native_unref");
         assert_eq!(DRAWABLE_NATIVE_UNREF_SIG.to_str(), "(J)V");
+        // native_invalidate(long) → `(J)V`, surfaced 2026-07-01 (GradientDrawable.setShape →
+        // invalidateSelf during a post-login ActionBar drawable inflate); instance, no-op repaint.
+        assert_eq!(
+            DRAWABLE_NATIVE_INVALIDATE_NAME.to_str(),
+            "native_invalidate"
+        );
+        assert_eq!(DRAWABLE_NATIVE_INVALIDATE_SIG.to_str(), "(J)V");
         // Java's Drawable.<init> registers mNativePtr for native-allocation cleanup; it must be non-zero
         // (and is a plainly-non-pointer marker, never dereferenced — see register_drawable_natives docs).
         assert_ne!(DRAWABLE_HANDLE_SENTINEL, 0);
+    }
+
+    #[test]
+    fn imm_native_name_sig_and_class_match_api_impl_dex() {
+        // Pin android.view.inputmethod.InputMethodManager's class + the three native names/descriptors
+        // against the installed dex (baksmali-confirmed 2026-07-01): a transcription regression would make
+        // the atomic RegisterNatives array throw NoSuchMethodError (aborting ALL three, incl. the
+        // <clinit>-critical nativeInit), or leave nativeHideSoftInput/nativeShowSoftInput unbound so the
+        // RbxKeyboard soft-keyboard path throws UnsatisfiedLinkError. Host-independent constants.
+        assert_eq!(
+            INPUT_METHOD_MANAGER_CLASS.to_str(),
+            "android/view/inputmethod/InputMethodManager"
+        );
+        assert_eq!(IMM_NATIVE_INIT_NAME.to_str(), "nativeInit");
+        assert_eq!(IMM_NATIVE_INIT_SIG.to_str(), "()J");
+        assert_eq!(
+            IMM_NATIVE_HIDE_SOFT_INPUT_NAME.to_str(),
+            "nativeHideSoftInput"
+        );
+        assert_eq!(IMM_NATIVE_HIDE_SOFT_INPUT_SIG.to_str(), "(J)V");
+        assert_eq!(
+            IMM_NATIVE_SHOW_SOFT_INPUT_NAME.to_str(),
+            "nativeShowSoftInput"
+        );
+        assert_eq!(
+            IMM_NATIVE_SHOW_SOFT_INPUT_SIG.to_str(),
+            "(JJLandroid/view/inputmethod/InputConnection;I)Z"
+        );
     }
 
     #[test]

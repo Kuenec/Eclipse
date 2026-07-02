@@ -128,6 +128,65 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-01 — 🔑 LOGIN "STUCK LOADING AFTER SIGN-IN" ROOT-CAUSED + FIXED — ✅ FIX CONFIRMED by the validation boot
+  (`/tmp/eclipse-tvfix.log` analyzed 2026-07-01: crash GONE; the challenge now renders past `ChallengeNativeWrapper`
+  into the `rbx.web` web fragment). NEW NEXT GAP = the signal-11 + web-fragment path (evidence truncated by the 75 s
+  kill) ⇐ START HERE NEXT SESSION: autonomous 180 s re-driven boot (coordinate map + stage chain below).** The owner
+  reported: username+password
+  entered, click Continue/Next → stuck loading forever. ROOT CAUSE CHAIN (from `/tmp/eclipse-continue3.log`): the login
+  POST to `auth.roblox.com/v2/login` returns HTTP **403 "Challenge is required to authorize the request"** (Roblox
+  anti-bot — EXPECTED, not a bug) → the app renders the challenge natively (`Rendering native challenge.` →
+  `onAppReady: ChallengeNativeWrapper`) → the challenge layout inflation hits **FATAL `UnsatisfiedLinkError: No
+  implementation found for void android.widget.TextView.setTextSize(float)`** escaping `Handler.dispatchMessage` on the
+  main thread → the challenge UI never renders → the user sees an eternal spinner. The installed TextView declares
+  `public native setTextSize(F)V` (baksmali line 1609, called from `TextView.<init>` Unknown Source:171 — EVERY TextView
+  construction hits it; it survived this long only because earlier layouts happened not to reach a fatal path).
+  **FIX (in `src/framework.rs`, committed this session):** bound 3 TextView natives as validated no-ops in
+  `register_text_view_natives` (bindings 3→6): `setTextSize(F)V`, `native_set_markup(I)V` (private, called from
+  `setText` when the text is `Spanned` — styled challenge/legal text), `native_setCompoundDrawables(JJJJJ)V`
+  (protected, widget + 4 drawable handles — same validated-no-op shape as the Button `(JJ)V` sibling). Pin test
+  `view_native_names_sigs_and_class_match_view_java` extended with all 3 names/sigs. Gate GREEN (fmt/build/clippy
+  `-D warnings`/574 unit + 4 integ + 2 doctest/release).
+  **✅ VALIDATION VERDICT (`/tmp/eclipse-tvfix.log`, 75 s boot of this exact tree, 2026-07-01 ~22:10 local, EXIT=137 =
+  clean KILL-timeout; the owner manually drove login with real mouse taps):** (a) line 157: TextView registration logs
+  `bound=6` — the 3 new bindings registered; (b) **ZERO `UnsatisfiedLinkError` / `No implementation found` lines
+  anywhere — the stuck-login crash is GONE**; (c) `setTextSize` IS exercised: 3× `setTextSize called with non-SP unit
+  (0), we don't currently handle that` (non-fatal, the vendored TextView Java fallback path); (d) no new
+  `NoSuchMethodError`; every other exception is the long-known benign set (Firebase/GMS missing, DateTimeFormatter
+  bootstrap, ClientAppSettings.json). OWNER TAP TRAIL (log `engine pointer ACTION_UP … x=… y=…` lines — **THE
+  COORDINATE MAP, durable working state**): **(418.9,530.9)** landing screen → LoginV2; **(278.3,178.6)** focus
+  username field; **(281.2,233.7)** focus password field; (240.6,326.5) purpose unknown; **(349.4,377.3)** Log In
+  button → POST `https://auth.roblox.com/v2/login` → HTTP 403 "Challenge is required to authorize the request"
+  (expected anti-bot) → `Rendering native challenge.` → `onAppReady: ChallengeNativeWrapper` → `onAppReady: LoginV2` →
+  a web fragment starts (several `bundle.getBoolean(USE_APP_HYBRID/…)` lines, then `[d.onCreate()-104]: onCreate
+  enableWebViewService = false tag=rbx.web`). ⇒ **the challenge now renders past ChallengeNativeWrapper into the
+  rbx.web web fragment.** NEW NEXT GAP: at 73.8 s `[FLog::CrashReportLog] Run book keeping for signal 11` + crashpad
+  `Handle a real crash` — BUT the process logged again 0.37 s later (an AppCompatViewInflater deprecation line) and the
+  log truncates at the 75 s KILL timeout. So it is NOT yet known whether that signal 11 is fatal or what the web
+  fragment does next.
+  **NEXT STEP (START HERE): an autonomous 180 s re-driven boot** using the synthetic stage chain with the coordinate
+  map above — stage 0 `ECLIPSE_SYNTHETIC_ENGINE_TAP="419,531"` (landing → LoginV2) → stages 1+2
+  `ECLIPSE_SYNTHETIC_TYPE="278,179:<username>"` (focus + type username) → stage 3 `ECLIPSE_SYNTHETIC_NEXT="281,234"`
+  (the tap doubles as the password-field focus) → stage 4 `ECLIPSE_SYNTHETIC_TYPE2="<password>"` (types into the
+  focused field) → **NEW stage 5 `ECLIPSE_SYNTHETIC_SUBMIT="349,377"`** (taps Log In — added this session in
+  `src/graphics.rs::maybe_synthetic_engine_tap`, mirrors stage 3: env-gated, fires once ≥3 s after stage 4, no behavior
+  when the env var is absent). Goal: reproduce login → 403 → challenge → web fragment WITHOUT manual taps and see what
+  the signal 11 + the web fragment do past the old 75 s horizon. Credentials are typed, never logged.
+  **EARLIER THIS SESSION (same uncommitted tree + 2 commits):** (1) commits `bb93c96` (bind
+  `View.getWindowVisibleDisplayFrame` + `nativeIsAttachedToWindow` — fixed the post-login Home re-navigation loop) and
+  `f9d471b` (bind `View.native_getGlobalVisibleRect` + `View.nativeRequestFocus` + `InputMethodManager.nativeInit` +
+  `Dialog.nativeInit`) landed and are pushed; (2) uncommitted since: `KeyguardManager.isDeviceSecure()` →
+  `NoSuchMethodError` fixed via NEW javac overlay class `tools/framework-overlay/src/android/app/KeyguardManager.java`
+  (returns false — no lock screen on the host; wired into `patch-framework.sh` + grep regression guard);
+  `AutofillManager.requestAutofill(Landroid/view/View;)V` added via smali overlay patch (no-op, same anchor-guard
+  pattern); `Drawable.native_invalidate(J)V` + `InputMethodManager.nativeHideSoftInput`/`nativeShowSoftInput` bound as
+  validated no-ops in `src/framework.rs`. The overlay cache was wiped again → rebuilt via the §5 2026-06-15 recipe
+  (smali jars at `/usr/share/java/smali/`, java-11 for smali, JDK-26 javac). REMEMBER: after ANY
+  `tools/framework-overlay/` change, rebuild the overlay BEFORE booting — the auto-detect uses stale cache content
+  as-is. All of the above (`src/framework.rs`, `tools/framework-overlay/patch-framework.sh`, NEW `KeyguardManager.java`)
+  committed + pushed this session after the validation boot confirmed the fix; the overlay cache at
+  `~/.cache/eclipse/framework-patched` is current (built from this exact overlay content — no rebuild needed before the
+  next boot).
 - **2026-06-15 — ✅ FULL BOOT RE-CONFIRMED at HEAD (renders → `LoginV2`); + DEV-HOST GOTCHA: the auto-detected cache
   overlay can be STALE, not just wiped.** A bare `./target/release/eclipse run roblox-2.721.1108.apk` first died with
   `System.exit(10)`: `runtime::find_framework` auto-detected `~/.cache/eclipse/framework-patched`, but that cache was
@@ -3984,6 +4043,65 @@ binary inspection). *Files:* `src/framework.rs`, `src/framework/view_registry.rs
 ---
 
 - **2026-06-14 — PATCHED-FRAMEWORK AUTO-DETECTION (durable fix supersedes the "always export the env var" runbook workaround).** §5's earlier resolution of the "Firebase/GMS onCreate crash on every boot" correctly diagnosed the root cause — booting against the STOCK ATL framework (missing `android.os.Build.SUPPORTED_*_BIT_ABIS` + AOSP-shaped classes) instead of the patched overlay — but landed it as a **manual invariant** ("always boot with `ECLIPSE_ANDROID_FRAMEWORK_DIR` set"). That is operator-discipline mitigation, not a root-cause fix (CLAUDE.md forbids workarounds): `eclipse run <APK>` with the env var unset still SILENTLY fell back to the stock framework and died deep in `RobloxApplication.onCreate` (`NoSuchFieldError` → SIGSEGV) with no hint why. **Fix:** `runtime::find_framework` now resolves the framework dir by precedence — explicit `ECLIPSE_ANDROID_FRAMEWORK_DIR` override > **auto-detected patched overlay** at `patched_overlay_dir()` (`$XDG_CACHE_HOME/eclipse/framework-patched`, the patch script's `OUT`, via the same portable `ProjectDirs` pattern as `native_lib_cache_dir`) > stock `FRAMEWORK_DIR_DEFAULT`. When neither override nor overlay is present it `tracing::warn!`s and points at `tools/framework-overlay/patch-framework.sh` instead of silently booting the broken stock framework. The README's tracked "auto-provisioning from inside Eclipse" gap is now closed (the overlay is auto-detected; only the manual `patch-framework.sh` run remains). **Verified:** the exact bare command that crashed earlier this session — `eclipse run <APK>` with NO env var — now auto-loads `~/.cache/eclipse/framework-patched/api-impl.jar` (classpath confirms `classes2/classes3.dex`), no `NoSuchFieldError`/SIGSEGV, reaches `setStage: LuaApp` (login). Gate green (fmt / clippy `-D warnings` / **573 tests** + the new precedence guard / release). Regression guard: `runtime::tests::framework_dir_precedence_prefers_overlay_over_stock` (pure precedence — override > overlay > stock, hermetic, no env/FS). *Files:* `src/runtime.rs` (`patched_overlay_dir` + `resolve_framework_dir` + `framework_dir`, rewired `find_framework`, + test), `tools/framework-overlay/README.md` (usage no longer requires the export; durability note updated). Separately confirmed this session: `__audio-test` PASSES — the OpenSL ES → cpal bridge (`src/loader/opensl.rs`, real, 1857 lines) is verified working end-to-end (enqueue 440 Hz sine → cpal drains it → bq-callback fires, 0 SL errors); audio is NOT a stub — engine-driven game audio just can't be exercised until past login.
+
+---
+
+### 2026-07-01 — 🔑 Login "stuck loading after sign-in" root-caused: the Roblox anti-bot CHALLENGE render dies on unbound `TextView.setTextSize(float)` — 3 TextView natives bound; plus the session's discovery-loop chain (KeyguardManager / AutofillManager / Drawable / InputMethodManager)
+
+*Owner report:* username + password entered, click Continue/Next → stuck loading forever.
+
+*Confirmed root cause (live log `/tmp/eclipse-continue3.log`, pure log observation):* the login POST to
+`auth.roblox.com/v2/login` returns HTTP **403 "Challenge is required to authorize the request"** — Roblox's anti-bot
+challenge, the EXPECTED response for a fresh login, not a bug. The app then renders the challenge natively
+(`Rendering native challenge.` → `onAppReady: ChallengeNativeWrapper`), and the challenge layout inflation throws
+**`UnsatisfiedLinkError: No implementation found for void android.widget.TextView.setTextSize(float)`** out of
+`Handler.dispatchMessage` on the main thread → the challenge UI never appears → the eternal spinner. The installed
+TextView (baksmali of the shipped api-impl dex) declares `public native setTextSize(F)V` (line 1609) and calls it from
+`TextView.<init>` (Unknown Source:171), so EVERY TextView construction hits it — earlier layouts merely never let it
+escape fatally.
+
+*Fix (`src/framework.rs`, register_text_view_natives 3→6 bindings, per-method best-effort):* bound as validated
+no-ops — the honest backing since the engine renders the real UI and the renderer draws no per-view text size/markup/
+drawable chrome (mirrors `native_setTextColor` and the Button `native_setCompoundDrawables(JJ)V` precedents):
+(1) `setTextSize(F)V` — no widget param, reads `this.widget`; (2) `native_set_markup(I)V` — private, called from
+`setText(CharSequence, BufferType)` when the text is `Spanned` (styled challenge/legal text); (3)
+`native_setCompoundDrawables(JJJJJ)V` — protected, `this.widget` + 4 drawable `paintable` handles (0 for null). All
+signatures taken from the baksmali'd INSTALLED TextView (lines 1609/472/990), not the drifted vendored source.
+
+*Same-session discovery-loop chain (each from its own live-boot ART error line, in order):*
+`KeyguardManager.isDeviceSecure()` `NoSuchMethodError` → NEW javac overlay class
+`tools/framework-overlay/src/android/app/KeyguardManager.java` (shadows the stock class; `isDeviceSecure()` returns
+false — the desktop host has no lock screen; wired into `patch-framework.sh` javac list + staging glob + a grep
+regression guard). `AutofillManager.requestAutofill(Landroid/view/View;)V` `NoSuchMethodError` → smali overlay insert
+(anchor-guarded, no-op — same pattern as the earlier `cancel()`/`setAutofillHints` autofill patches).
+`Drawable.native_invalidate(J)V` + `InputMethodManager.nativeInit`/`nativeHideSoftInput`/`nativeShowSoftInput` →
+validated no-op Rust natives (no host IME window; the vk_overlay owns visible text). The overlay cache had been wiped
+again — rebuilt with the §5 2026-06-15 recipe.
+
+*Regression protection:* the existing pin test `view_native_names_sigs_and_class_match_view_java` extended with the 3
+TextView names/sigs (a transcription drift fails CI instead of reproducing the stuck-login `UnsatisfiedLinkError`);
+the KeyguardManager grep guard in `patch-framework.sh` fails the overlay build loudly if the patch is reverted.
+
+*Verification:* gate GREEN — `cargo fmt --all` / `cargo build --all-targets` 0 warn / `cargo clippy --all-targets
+--all-features -- -D warnings` 0 warn / `cargo test` **574 unit + 4 integration (0 SKIP) + 2 doctests, 0 failed** /
+`cargo build --release` clean. **✅ FIX CONFIRMED by the 75 s validation boot** (`/tmp/eclipse-tvfix.log`, EXIT=137 =
+clean KILL-timeout; the owner manually drove login with real mouse taps): TextView registration logs `bound=6` (line
+157); **ZERO `UnsatisfiedLinkError` / `No implementation found` lines** — the stuck-login crash is GONE; `setTextSize`
+IS exercised (3× the non-fatal vendored-Java-fallback line `setTextSize called with non-SP unit (0)`); no new
+`NoSuchMethodError` (remaining exceptions = the long-known benign set). The driven login reached the 403 → `Rendering
+native challenge.` → `onAppReady: ChallengeNativeWrapper` → `onAppReady: LoginV2` → a `rbx.web` web fragment starts
+(`onCreate enableWebViewService = false`) — i.e. **past the old crash point**. NEW gap: at 73.8 s `[FLog::
+CrashReportLog] Run book keeping for signal 11` + crashpad `Handle a real crash`, yet the process logged again 0.37 s
+later before the 75 s KILL truncated the evidence — fatality UNKNOWN. Next: the autonomous 180 s re-drive per §5 (owner
+tap coordinate map + the new stage-5 `ECLIPSE_SYNTHETIC_SUBMIT` tap in `src/graphics.rs`, which mirrors stage 3 and
+finally lets the drive press Log In without a physical mouse).
+
+*State:* commits `bb93c96` + `f9d471b` (View/IMM/Dialog natives, post-login Home re-navigation fix) were already
+pushed; everything above (`src/framework.rs`, `tools/framework-overlay/patch-framework.sh`, NEW `KeyguardManager.java`,
+this AGENTS.md update) is committed + pushed this session, with the stage-5 SUBMIT tap as a follow-up graphics commit.
+The owner tap coordinate map is recorded in §5 (durable). *Files:* `src/framework.rs`, `src/graphics.rs`,
+`tools/framework-overlay/patch-framework.sh`, `tools/framework-overlay/src/android/app/KeyguardManager.java` (NEW),
+`AGENTS.md`.
 
 ---
 
