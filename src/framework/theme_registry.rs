@@ -77,6 +77,14 @@ pub struct ThemeAttr {
     pub type_: u8,
     /// `Res_value.data` (raw 32-bit payload).
     pub data: u32,
+    /// The package id of the `resources.arsc` table the style bag defining this value lives in
+    /// (`0x01` = the framework table, anything else = the app table).
+    ///
+    /// 2026-07-01: for a `TYPE_STRING` value, `data` is an index into THAT table's GLOBAL value
+    /// string pool — NOT the XmlBlock pool — so `framework`'s `TypedEntry` must carry the matching
+    /// positive ARSC asset cookie (the challenge-boot "Resource is not a Drawable … \"<null>\""
+    /// root cause was routing these to the XmlBlock pool via cookie `-1`).
+    pub source_package: u8,
 }
 
 /// Per-theme state held in a registry slot: the non-GTK theme attribute set.
@@ -277,6 +285,7 @@ mod tests {
                 ThemeAttr {
                     type_: 0x12,
                     data: 0xffff_ffff,
+                    source_package: 0x7f,
                 },
             );
         })
@@ -290,7 +299,8 @@ mod tests {
             got,
             ThemeAttr {
                 type_: 0x12,
-                data: 0xffff_ffff
+                data: 0xffff_ffff,
+                source_package: 0x7f,
             }
         );
 
@@ -304,6 +314,7 @@ mod tests {
                 ThemeAttr {
                     type_: 0x10,
                     data: 0,
+                    source_package: 0x7f,
                 },
             );
         })
@@ -315,7 +326,8 @@ mod tests {
             dest_val,
             ThemeAttr {
                 type_: 0x12,
-                data: 0xffff_ffff
+                data: 0xffff_ffff,
+                source_package: 0x7f,
             },
             "the copied map is independent of later src mutation"
         );

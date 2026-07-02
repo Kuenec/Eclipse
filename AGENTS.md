@@ -128,6 +128,113 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-02 — 🧩 VALIDATION VERDICT on the FULL three-pass stack (🧵 string-pool cookies + 📼 asset-stream
+  contracts + 🎨 drawable/bitmap paintable surface) — `/tmp/eclipse-challenge6.log`, 180 s fully-autonomous login
+  re-drive at this exact tree: ALL CLEAN, all three passes VALIDATED (committed together this session).** Signals:
+  `UnsatisfiedLinkError` 0, `No implementation found` 0, `readAsset_internal` IOException 0, `Resource is not a
+  Drawable` 0, getPooledString misroute WARNs 0; the ONLY `Resources$NotFoundException` is the KNOWN separate
+  applyStyle `inflate(0x0)` upgrade-dialog defect (05:23:29.761 — recorded 2026-07-01 🧵, untouched by this stack).
+  Registration lines confirm `drawable_bound=6 container_bound=2 nine_patch_bound=3`, `factory_bound=1
+  bitmap_bound=6`, stream `bound=7`. The splash INFLATES (recipe steps 1–7 complete — `ActivitySplash` RESUMED at
+  05:23:10.905), the full 5-stage synthetic drive runs (stages 0–5 all `handled=true`/`consumed=true`), and the
+  boot reaches `v2/login` POST → 403 "Challenge is required" (05:23:40.809) → `ChallengeNativeWrapper` →
+  `ChallengeHybridWebView` → the rbx.web fragment (`d.onCreate … tag=rbx.web` 05:23:40.936). **IMPORTANT NEGATIVE
+  RESULT: the RobloxToolbar NPE (`RobloxToolbar.setVisibility(int)` on null at `yh.d.onCreateView(Unknown
+  Source:187)`) STILL fires (05:23:49.923) even with EVERY resource string and drawable resolving — the
+  drawable-failure-linkage hypothesis is REFUTED by experiment.** New facts: (a) NO signal-11/crashpad fires
+  anywhere near the challenge this boot — the only one is the unrelated splash-era `Run book keeping for signal 11`
+  at app-time 8.5 s (05:23:10.893, predates this work); (b) the fragment inflation emits exactly two
+  `AppCompatViewInflater` app:theme deprecation lines (the two toolbar includes, 05:23:41.294 + 05:23:45.120), then
+  the NPE lands ~4.8 s after the second; (c) the app falls back to `onAppReady: LoginV2` after the ~60 s challenge
+  timeout (05:24:41.921) — engine alive to the 180 s kill. **⇐ START-HERE-NEXT: the toolbar-null is an
+  inflation-SEMANTICS bug, not resource resolution. Prime suspect: ATL `LayoutInflater.parseInclude` id-override
+  handling — Android semantics require `<include android:id=…>` to OVERRIDE the included root view's id; a
+  divergence makes the app's `findViewById` miss the RobloxToolbar root. Diagnose FIRST-PARTY ONLY: the layout XMLs
+  (`toolbar_frame.xml` / `toolbar_include.xml` ids) via Eclipse's own `apk::axml` reader + the vendored/installed
+  ATL LayoutInflater source/smali.**
+- **2026-07-02 — 🎨 VALIDATION VERDICT on the 📼 asset-stream fixes (`/tmp/eclipse-challenge5.log`): ALL CONFIRMED
+  (`readAsset_internal` IOException 4 → 0; `Resources$NotFoundException` 0; `Resource is not a Drawable` 0; stream
+  natives `bound=7`; the splash PNG decode SUCCEEDS) — the boot then died ONE step later in the same splash
+  inflation: `UnsatisfiedLinkError: No implementation found for void android.graphics.drawable.Drawable.
+  native_ref(long)` (`BitmapDrawable.<init>` → `setPaintable` → `ImageView.<init>` … `ActivitySplash.onCreate:336`)
+  → step-5 abort → the known collateral teardown SEGV. This was the predicted "next unbound Bitmap/Drawable native".
+  ROOT CAUSE: the INSTALLED framework's drawable classes (baksmali of `~/.cache/eclipse/framework-patched/
+  api-impl.jar` classes3.dex — the VENDORED `Drawable.java` has DRIFTED: no `setPaintable`/`native_ref` there at
+  all) declare a full paintable/texture lifecycle Eclipse had only partially bound. FIXED (✅ VALIDATED by the
+  challenge6 boot — see the 🧩 bullet above; committed 2026-07-02 with the 🧵+📼 work) — the WHOLE reachable class
+  bound in one pass, per-method best-effort (12 natives; see §6 2026-07-02
+  🎨): `Drawable.native_ref(J)V` + `native_draw(JJII)V` (validated no-ops — refcount/draw bookkeeping with no
+  reader; the engine renders, Eclipse records), `native_paintable_from_path(Ljava/lang/String;)J` (registry-backed
+  via the new shared `record_bitmap_from_file`); `DrawableContainer.native_constructor()J` (its OWN declared native
+  — ART resolves per declaring class; new non-pointer 'DC' sentinel; the `<selector>`/`<animation-list>` base) +
+  `native_selectChild(JJ)V` (no-op — selection state lives in Java `curIndex`); `NinePatchDrawable.nativeCreate
+  (Ljava/lang/String;)J` (registry-backed) + `nativeCreate([BJ)J` (live-texture pass-through — the 9-patch chunk is
+  stretch metadata the headless model doesn't rasterize) + `nativeSetTint(JI)V` (no-op); `Bitmap.native_recycle
+  (JJ)V` (registry FREE bookkeeping — `finalize()` reaches it on EVERY GC'd bitmap, incl. the splash logo),
+  `native_create_texture(JIIII)J` (getTexture()'s GTK-GdkTexture constructor — the GTK fallback now
+  identity-moves a live snapshot record / records a blank createBitmap surface), `native_create_snapshot(J)J`
+  (identity-move mirror; `Canvas(Bitmap)` construction), `native_ref_texture(J)J` (record CLONE —
+  `createBitmap(Bitmap)`/`copy()` read the result back through `native_get_width/height`, so a live handle is
+  required). Pixel-CONTENT natives (`native_erase_color`/`native_get_pixels`/`native_set_pixels`/
+  `native_copy_to_buffer`/`native_save_to_png`) deliberately LEFT UNBOUND — their callers read pixel data back,
+  which the headless model can't honestly serve (clean call-time ULE = the discovery signal; deferred raster
+  build). `register_drawable_natives` converted atomic → per-method best-effort (58a50f6 pattern). Regression
+  guards: `drawable_native_name_sig_and_class_match_art_reported` + `bitmap_native_names_sigs_and_classes_match_
+  bitmap_java` extended with every new name/sig/class + both sentinels distinct-nonzero; new
+  `record_bitmap_from_file_records_dimensions_and_is_total_on_bad_paths`. Gate green (583 unit + 4 integ + 2
+  doctest). BOOT WATCH — ✅ ALL FOUR CONFIRMED by the 2026-07-02 challenge6 boot (see the 🧩 bullet above): (a) ZERO
+  `UnsatisfiedLinkError`/`No implementation found` (esp. `native_ref`, `native_create_texture`, `native_recycle`);
+  (b) registration lines log `drawable_bound=6 container_bound=2 nine_patch_bound=3` and `bitmap_bound=6`;
+  (c) `ActivitySplash.onCreate` COMPLETES → steps 1–7 → the full login drive; (d) no step-abort and the teardown
+  `SEGV_MAPERR` (libroblox+0x23e74d0) did NOT fire.**
+- **2026-07-02 — 📼 VALIDATION VERDICT on the 🧵 string-pool fix (`/tmp/eclipse-challenge4.log`): CONFIRMED GOOD
+  (`Resource is not a Drawable` 10 → 0; `factory_bound=1 bitmap_bound=2`; zero getPooledString/unknown-cookie/
+  UnsatisfiedLinkError signals) — but it exposed a PRE-EXISTING readAsset contract bug that then ABORTED the boot at
+  the splash (`Resources$NotFoundException: res/drawable-hdpi-v4/roblox_logo.png` ← `IOException` at
+  `readAsset_internal`) — ROOT-CAUSED + FIXED (committed 2026-07-02 with the 🧵+🎨 work; validation boot DONE
+  2026-07-02 — ALL CONFIRMED, see the 🎨 + 🧩 bullets above).** Eclipse's `AssetManager.readAsset` native returned the AOSP convention (−1 at EOF), but ATL's
+  `readAsset_internal` (vendored `AssetManager.java:592`) throws `IOException` for ANY negative and itself maps 0 →
+  the InputStream −1 (reference native `Asset_read` returns 0 at EOF) — so EVERY `AssetInputStream` read-to-EOF threw.
+  Pre-existing (challenge3 had the same 3 CAUGHT dictionary/cacert `IOException`s); the drawable fix made it fatal by
+  routing the splash PNG through `BitmapFactory.nativeDecodeStream` → the Java stream. FIX + family audit (all
+  `src/framework.rs`; see §6 2026-07-02 📼): readAsset returns 0 at EOF / negative only on genuine error
+  (`atl_read_asset_return`); seekAsset translates the AOSP-Java whence (−1 SET / 0 CUR / +1 END — raw pass-through
+  made `mark()` REWIND); `readAssetChar` bound (was an UnsatisfiedLinkError); `asset_fd_for` now resolves entries via
+  the same shared `asset_entry_candidates` rule as `read_asset_bytes` (the fd path couldn't serve APK-root-relative
+  `res/…`). **SEPARATE KNOWN DEFECT (recorded, NOT fixed — future work):** when the lifecycle aborts with the live
+  engine loaded, teardown ends in a REAL fatal `SEGV_MAPERR` (jump to unmapped, `libroblox+0x23e74d0`) + core dump —
+  Eclipse needs a graceful lifecycle-abort path that doesn't tear down under the engine. **BOOT WATCH:** (a) zero
+  `IOException at android.content.res.AssetManager.readAsset_internal`; (b) no `Resources$NotFoundException … from
+  drawable resource ID`; (c) splash `ActivitySplash.onCreate` completes → step 5+; (d) `Error reading dictionary` /
+  `Failed to update cacert.pem` gone.
+- **2026-07-01 — 🧵 CHALLENGE-SCREEN NPE ROOT-CAUSED + string-pool class FIXED (validation boot DONE 2026-07-02 —
+  string-pool fix CONFIRMED, see the 📼 bullet above; committed 2026-07-02 with the 📼+🎨 work. CAVEAT: the NPE
+  itself SURVIVED the fixed resources — watch item (e) answered 2026-07-02, zero getPooledString warns, so strings
+  do NOT misroute; the mechanism is inflation semantics — see the 🧩 bullet above).** The `/tmp/eclipse-challenge3.log` re-drive reached
+  login → 403 → `ChallengeHybridWebView` → the rbx.web fragment, then died on `NullPointerException:
+  RobloxToolbar.setVisibility(int) on a null object reference` (yh.d.onCreateView:187). CONFIRMED ROOT CAUSE (matched
+  byte-for-byte with Eclipse's own `apk::arsc` reader): styled-attribute TYPE_STRING values resolved through
+  `resources.arsc` (file-path drawables/colors/fonts, e.g. `@drawable/topbar_ic_close` →
+  "res/drawable-mdpi-v4/topbar_ic_close.png") were written with the XmlBlock cookie (−1), so
+  `TypedArray.loadStringValueAt` resolved the ARSC pool index against the WRONG pool → null → the boot-long
+  `Resource is not a Drawable … "<null>" a=-1` warnings (the logged `d=` values ARE the ARSC pool indices: 0x456 =
+  topbar_ic_close, 0x25a = progress_dot, 0x4b3 = roblox_logo, 0x280 = rbx_spinner_splash). The challenge fragment
+  inflates `toolbar_frame.xml` (two `<include @layout/toolbar_include>` = the two RobloxToolbar app:theme deprecation
+  lines + the topbar_ic_close ImageView warned right before the NPE). FIX (src/framework.rs + theme_registry +
+  NEW bitmap_registry — see §6 2026-07-01 🧵 for full detail): ARSC pool cookies (app=1/framework=2) tracked through
+  the reference chase; `AssetManager.getPooledString` bound (warns on unresolvable = the live diagnostic);
+  `loadThemeAttributeValue` now fills `TypedValue.string` (same-bug sibling); `read_asset_bytes` serves APK-root
+  paths (`openNonAsset` contract); `open_xml_block` cookie-aware; recorded-bitmap backing
+  (`BitmapFactory.nativeDecodeStream` + `Bitmap.native_get_width/height`, PNG-IHDR dimensions, headless) closes the
+  UnsatisfiedLinkError cliff the newly-reachable `.png` drawable path would hit. Gate green (579 unit + 4 integ + 2
+  doctest). **VALIDATION BOOT WATCH:** (a) `Resource is not a Drawable` count should drop to ~0; (b) NO
+  `AssetManager.getPooledString: unknown cookie` warns; (c) NO `UnsatisfiedLinkError`/`No implementation found` for
+  BitmapFactory/Bitmap; (d) the rbx.web fragment's `RobloxToolbar.setVisibility` NPE gone → what the challenge
+  WebView does next (ATL WebView is a stub — likely the next gap); (e) if the NPE PERSISTS, the toolbar-null is the
+  d.onCreate caught null-deref (03:50:07.302 signal-11) — grep what precedes it, the getPooledString warns will say
+  whether strings still misroute. SEPARATE CONFIRMED DEFECT (not fixed, next pass): `applyStyle` ignores
+  `defStyleAttr`/`defStyleRes` → AlertDialog `android:layout` = 0 → `inflate(0x0)` NotFoundException killed the
+  upgrade dialog at 03:49:56.319.**
 - **2026-07-01 — 🎯 CHALLENGE RE-DRIVE ATTEMPT #1 (first fully-autonomous 180 s drive at `ba5d3d5`; log
   `/tmp/eclipse-challenge2.log`, full-frame screenshot `/tmp/eclipse_field_probe.png`): ALL FIVE synthetic stages fired
   mechanically correctly, but the drive used a STALE UI coordinate map AND was derailed by REAL host input — NO
@@ -4167,6 +4274,222 @@ precedent).
 *Verification:* full gate green (fmt / build --all-targets / clippy `-D warnings` / test / release). Next boot: the §5
 START-HERE-NEXT hands-off re-drive with the corrected coordinate map, expecting `v2/login` → 403 challenge →
 `rbx.web` fragment → the earlier signal-11 under observation. *Files:* `src/graphics.rs`, `AGENTS.md`.
+
+### 2026-07-01 — 🧵 Challenge NPE diagnosis: styled TYPE_STRING values resolved through resources.arsc were routed to the WRONG string pool (cookie −1 → XmlBlock) — fixed end-to-end (ARSC cookies + `getPooledString` + recorded-bitmap backing); string-pool fix VALIDATED + committed 2026-07-02 (the NPE itself survived — see the 2026-07-02 🧩 entry)
+
+*Evidence (the confirmed root cause of Q1 — the boot-long `Resource is not a Drawable (color or path):
+TypedValue{t=0x3/d=… "<null>" a=-1 r=0x7f08…}` warnings, `/tmp/eclipse-challenge3.log`):* the four warned ids resolve —
+via Eclipse's OWN `apk::arsc` reader against `roblox-2.724.735-merged.apk` — to file-path drawables whose ARSC
+global-string-pool indices match the logged `d=` EXACTLY: `0x7f080173` = `drawable/topbar_ic_close` →
+`res/drawable-mdpi-v4/topbar_ic_close.png` (pool index 1110 = 0x456), `0x7f08012f` = `progress_dot` →
+`res/drawable/progress_dot.xml` (602 = 0x25a), `0x7f08015a` = `roblox_logo` (1203 = 0x4b3), `0x7f080155` =
+`rbx_spinner_splash` (640 = 0x280). `a=-1` pins the styled-attribute path (`loadResourceValue` writes cookie 1):
+`resolve_inline_attr_value`/`resolve_theme_attr` chased `@drawable/...` into the ARSC, landed on TYPE_STRING (an ARSC
+pool index), but kept `asset_cookie = XML_BLOCK_COOKIE (-1)` → ATL's `TypedArray.loadStringValueAt` (cookie < 0 →
+`mXml.getPooledString(data)`, installed smali verified identical) resolved the ARSC index against the LAYOUT XmlBlock's
+pool → null → `Resources.loadDrawable` warned + returned null. EVERY TypedArray/theme TYPE_STRING consumer (drawable
+paths, color-XML paths, font/string values; also `getString()`'s `loadStringValueAt(index).toString()` — an NPE vector)
+got null all boot.
+
+*Q2 (the RobloxToolbar NPE mechanism — pinned as far as first-party evidence allows):* the rbx.web challenge fragment
+inflates `layout/toolbar_frame.xml` — the ONLY layout containing both two `<include layout=@layout/toolbar_include>`
+(root = `com.roblox.client.components.RobloxToolbar` with `app:theme`, matching the two AppCompatViewInflater
+deprecation lines at 03:50:07.665/03:50:11.262) and the `<ImageView android:src=@drawable/topbar_ic_close>` whose
+failed load is the 03:50:14.869 warning immediately before the NPE (layouts parsed with Eclipse's own `apk::axml`).
+Inflation COMPLETED (the ImageView is the last element; ATL's LayoutInflater — vendored + installed smali — never
+swallows a view-construction failure, and `parseInclude` sets the include's `android:id` via
+`getResourceId`/`STYLE_RESOURCE_ID`, which Eclipse writes). A second, CAUGHT main-thread null-deref fired at
+`d.onCreate` (03:50:07.302, `signal 11` + crashpad, deterministic across boots). The app-side line `yh.d.onCreateView:187`
+cannot be decompiled in-policy; the framework-side null sources feeding it are exactly the TYPE_STRING class fixed
+here. `AssetManager.getPooledString` now WARNs on any unresolvable pool lookup — the targeted diagnostic if the NPE
+survives the validation boot.
+
+*Also confirmed (recorded for a NEXT pass, NOT fixed here):* `applyStyle` ignores `defStyleAttr`/`defStyleRes` — the
+03:49:56.319 `NotFoundException: Unable to find resource ID #0x0` (AlertController reads `android:layout` via
+`R.attr.alertDialogStyle` → 0 → `inflate(0)`) killed the upgrade dialog. A separate mechanism (def-style layering),
+out of this change's smallest-necessary scope.
+
+*Fix (all `src/framework.rs` + `src/framework/theme_registry.rs` + NEW `src/framework/bitmap_registry.rs`;
+UNCOMMITTED):* (1) positive ARSC string-pool cookies `ARSC_APP_COOKIE=1`/`ARSC_FRAMEWORK_COOKIE=2`;
+`resolve_inline_attr_value` + `resolve_theme_attr` track the owning pool through the reference chase (inline XmlBlock
+strings keep −1; ARSC-resolved strings carry their table's cookie; `ThemeAttr` gains `source_package` set by
+`merge_theme_style`). (2) Bound `AssetManager.getPooledString(II)Ljava/lang/CharSequence;` (installed smali line 1352
+verified) serving the right table's global pool via `arsc_pool_string`. (3) Same-pattern audit fixes:
+`loadThemeAttributeValue` now fills `TypedValue.string` for TYPE_STRING (was left null — the theme-drawable form of the
+same bug); `loadResourceValue`'s cookie is table-accurate. (4) The now-reachable `Resources.loadDrawable` pipeline made
+total: `read_asset_bytes` serves APK-root-relative entries (ATL `openNonAsset` contract — `res/....png` was
+`assets/`-prefixed into a miss), `open_xml_block` is cookie-aware (framework cookie → `framework-res.apk`), and the
+`.png` branch's unbound-GTK cliff is closed with the recorded-bitmap backing (`bitmap_registry` generational slab;
+`BitmapFactory.nativeDecodeStream` reads the stream + parses PNG IHDR dimensions; `Bitmap.native_get_width/height`) —
+without it, `new Bitmap(0)` → `getTexture()` → unbound `native_create_texture` `UnsatisfiedLinkError` would ABORT
+inflation where today's behavior is a silent null (ImageView `native_setDrawable` was already bound as a validated
+no-op). Headless-recording model throughout; pixel raster stays the deferred render build.
+
+*Regression guards:* `styled_type_string_cookie_routes_to_the_owning_pool` (the confirmed-root-cause guard),
+`png_dimensions_parses_ihdr_and_rejects_non_png`, `bitmap_native_names_sigs_and_classes_match_bitmap_java`
+(+ installed-smali verification), `getPooledString` + ARSC-cookie pins added to
+`asset_manager_init_name_sig_and_class_match_asset_manager_java`, `bitmap_registry` slab-soundness tests, and the
+`getPooledString` WARN as the live wrong-pool diagnostic. Gate green: fmt / build --all-targets / clippy `-D warnings`
+/ 579 unit + 4 integ + 2 doctest / release.
+
+### 2026-07-02 — 📼 Validation boot verdict on the 🧵 string-pool fix (CONFIRMED GOOD) + the splash-PNG abort it exposed root-caused: `readAsset` used the AOSP return convention (−1 at EOF) where ATL's Java throws `IOException` on ANY negative — asset-stream family aligned to the ATL contracts; VALIDATED (challenge5/challenge6) + committed 2026-07-02 with the 🧵+🎨 work
+
+*Validation verdict (`/tmp/eclipse-challenge4.log`):* the string-pool routing fix is **CONFIRMED** — `Resource is not
+a Drawable` dropped 10 → 0, the bitmap natives registered (`factory_bound=1 bitmap_bound=2`), zero
+getPooledString/unknown-cookie/UnsatisfiedLinkError/unrecognized-encoding signals. But the newly-reachable PNG decode
+then ABORTED the boot at the splash: `RuntimeException: Resources$NotFoundException: File
+res/drawable-hdpi-v4/roblox_logo.png from drawable resource ID #0x7f08015a … Caused by: java.io.IOException at
+android.content.res.AssetManager.readAsset_internal` → `step 5 Activity.onCreate` failed → `eclipse run: JNI error`.
+
+*Confirmed root cause (REFUTES the open-vs-read root-relative hypothesis):* the log has FOUR `IOException at
+readAsset_internal` instances and three of them are plain `assets/`-relative reads (dictionary ×2, cacert.pem) that
+ALSO failed — and the same three exist in `/tmp/eclipse-challenge3.log` (pre-existing, caught by app code). The
+registry buffers the whole entry at open, so reads are name-independent. The real mechanism: Eclipse's
+`asset_manager_read_asset` (src/framework.rs) returned **−1 at EOF** (the AOSP framework convention), but ATL's
+`readAsset_internal` (vendored `AssetManager.java:592`, reference native `Asset_read` → `android::Asset::read`)
+treats ANY negative as an error → `throw new IOException()` and maps **0 → the InputStream −1 EOF** itself. Every
+`AssetInputStream` read-to-EOF therefore threw; the 🧵 fix made it fatal because
+`BitmapFactory.nativeDecodeStream` (Eclipse's) drains the Java stream to EOF for the splash PNG.
+
+*Fix + same-pattern family audit (all `src/framework.rs`):* (1) `readAsset` follows the ATL contract — 0 at EOF,
+negative ONLY for a genuine error (stale/fabricated handle), via the pure, tested seam `atl_read_asset_return`.
+(2) `seekAsset`: ATL's Java passes the AOSP whence convention (`mark()` = `seekAsset(0,0)` position QUERY, `reset()` =
+`seekAsset(mMarkPos,-1)` SET, `skip(n)` = CUR) — Eclipse passed it raw into the lseek-style `AssetStream::seek`
+(0 = SET), so `mark()` REWOUND the stream and `reset()` failed; translated via `atl_seek_whence_to_lseek`
+(< 0 SET / 0 CUR / > 0 END, AOSP `android_util_AssetManager.cpp`'s exact mapping; ATL's own C passes whence raw — an
+upstream divergence from its Java; Eclipse serves the Java). (3) `readAssetChar` (single-byte
+`AssetInputStream.read()`, `AssetManager.java:685`) was UNBOUND (call-time `UnsatisfiedLinkError`) — bound (byte or
+−1 at EOF, the reference C's contract; stream family now 7 natives). (4) The fd path had the actual open-vs-read
+split-brain the hypothesis predicted: `asset_fd_for` prepended `assets/` unconditionally, so APK-root-relative
+`res/…` entries could never be fd-served — both it and `read_asset_bytes` now resolve through the ONE shared
+`asset_entry_candidates` rule (exact entry first, `assets/` fallback for unprefixed names). Audited the rest of the
+family (`getAssetLength`/`getAssetRemainingLength`/`destroyAsset`/`openAsset` — contracts already match) and the
+loader NDK side (`AAsset_read`/`AAsset_seek` are not yet implemented there; no divergence to fix).
+
+*Regression guards (plain `cargo test`, zip fixture — no APK):* `atl_read_asset_return_maps_eof_to_zero_and_errors_negative`
+(the confirmed-root-cause guard), `atl_seek_whence_translation_matches_asset_input_stream_callers`,
+`root_relative_res_entry_serves_open_read_seek_and_length_via_the_shared_rule` (a Stored `res/…` PNG opened, read to
+a clean 0-EOF, seek-queried without rewinding, length-checked, and fd-served through the exact helpers the Java
+natives call), plus `readAssetChar` name/sig pins in `asset_manager_stream_native_names_and_sigs_are_the_classic_aosp_set`.
+Gate green: fmt / build --all-targets / clippy `-D warnings` / 582 unit + 4 integ + 2 doctest / release.
+
+*Separate known defect (recorded as FUTURE WORK, deliberately not fixed here):* when a lifecycle step fails with the
+live engine already loaded, Eclipse's abrupt teardown ends in a REAL fatal `SEGV_MAPERR` — a jump to unmapped memory
+at `libroblox+0x23e74d0` on the main thread — and dumps core (challenge4, 04:42:57). Eclipse needs a graceful
+lifecycle-abort path (quiesce/skip teardown under a live engine) so a Java-side failure exits cleanly instead of
+crashing through the engine.
+
+---
+
+### 2026-07-02 — 🎨 Validation boot verdict on the 📼 asset-stream fixes (ALL CONFIRMED) + the next splash gap it exposed closed as a CLASS: the installed framework's drawable paintable/texture lifecycle (`Drawable.native_ref` was the crash) — 12 natives bound per-method best-effort; VALIDATED (challenge6) + committed 2026-07-02 with the 🧵+📼 work
+
+*Validation verdict (`/tmp/eclipse-challenge5.log`):* the 📼 asset-stream contract fixes are **CONFIRMED** —
+`IOException at AssetManager.readAsset_internal` 4 → 0, `Resources$NotFoundException` 0, `Resource is not a
+Drawable` 0, the stream family registers `bound=7`, and the splash `roblox_logo.png` decode now SUCCEEDS
+(`BitmapFactory.nativeDecodeStream` → `new Bitmap(handle)`). The boot then died one step later in the same splash
+inflation: `UnsatisfiedLinkError: No implementation found for void android.graphics.drawable.Drawable.
+native_ref(long)` at `Drawable.setPaintable` ← `BitmapDrawable.<init>` ← `Drawable.createFromResourceStream` ←
+`Resources.loadDrawable` ← `TypedArray.getDrawable` ← `ImageView.<init>` ← … ← `ActivitySplash.onCreate:336` →
+`step 5 Activity.onCreate` failed → the recorded collateral teardown SEGV (log line 538 / 561 / 564).
+
+*Confirmed root cause:* the **installed** framework jar's drawable classes declare a full paintable/texture
+lifecycle that Eclipse had only partially bound — and the **vendored ATL source has drifted** (its `Drawable.java`
+has no `setPaintable`/`native_ref` at all), so the installed dex is the authority (baksmali of
+`~/.cache/eclipse/framework-patched/api-impl.jar` classes3.dex, `vendor/toolchain/smali/baksmali-2.5.2.jar` under
+java-26, 2026-07-02). Enumerated from the smali: `Drawable` declares `native_constructor()J` /
+`native_unref(J)V` / `native_invalidate(J)V` (already bound) **+ `native_ref(J)V`** (called from `setPaintable`
+AND unconditionally — even for 0 — from the `Drawable(long)` ctor), `native_draw(JJII)V` (only under an
+`instanceof android.atl.GskCanvas` guard), `native_paintable_from_path(Ljava/lang/String;)J` (static,
+`createFromPath`); `DrawableContainer` (the `<selector>`/`<animation-list>` base on the same loadDrawable
+pipeline) declares its **own** `native_constructor()J` + `native_selectChild(JJ)V` (ART resolves natives per
+DECLARING class — Drawable's bindings don't cover it); `NinePatchDrawable` declares `nativeCreate
+(Ljava/lang/String;)J` / `nativeCreate([BJ)J` / `nativeSetTint(JI)V` (`.9.png` routes there from
+`createFromResourceStream`/`createFromPath`); `Bitmap` declares the texture/snapshot lifecycle statics —
+`native_recycle(JJ)V` (**`finalize()` → `recycle()` reaches it on EVERY GC'd bitmap**, so the splash bitmap's
+first GC would ULE on the finalizer thread), `native_create_texture(JIIII)J` (`getTexture()` when `texture == 0`
+— ATL's GTK `GdkTexture` constructor, i.e. the GTK fallback that must not stay reachable-unbound),
+`native_create_snapshot(J)J` (`getSnapshot()` — `Canvas(Bitmap)` ctor + every Canvas op), `native_ref_texture(J)J`
+(`createBitmap(Bitmap)`/`copy()` — the result is READ BACK via `Bitmap(long)` → `native_get_width/height`).
+Data-flow note pinning the backing choice: `nativeDecodeStream`'s return IS the `Bitmap.texture` field, so
+`getTexture()` hands Eclipse's `bitmap_registry` handle to `BitmapDrawable.paintable` — the paintable natives
+receive live registry handles (or the non-pointer sentinels), never GTK pointers.
+
+*Fix (all `src/framework.rs`, per-method best-effort — the 58a50f6 pattern):* (1) `Drawable.native_ref` +
+`native_draw` = validated no-ops (refcount/draw bookkeeping with no reader; the registry retains records until
+`Bitmap.native_recycle`, the engine renders the screen); `native_paintable_from_path` = registry-backed via the
+new shared `record_bitmap_from_file` (real IHDR dimensions, bytes retained, `BITMAP_DECODE_MAX_BYTES` cap; 0 =
+tolerated "no paintable"). (2) `DrawableContainer.native_constructor` returns the new non-pointer
+`DRAWABLE_CONTAINER_HANDLE_SENTINEL` (0x4443 'DC', distinct from Drawable's 0x4452 'DR');
+`native_selectChild` = no-op (selection state lives in the Java `curIndex` field). (3)
+`NinePatchDrawable.nativeCreate(String)` = registry-backed (same helper); `nativeCreate([BJ)` = live-texture
+pass-through (the 9-patch chunk is stretch metadata the headless model doesn't rasterize; dead handle → 0);
+`nativeSetTint` = no-op. (4) `Bitmap.native_recycle` = the registry FREE bookkeeping (both peers,
+bounds+generation-checked; stale/0 tolerated — a BitmapDrawable's shared paintable keeps the Bitmap strongly
+referenced, so Java's reachability ordering makes the free safe); `native_create_texture`/`native_create_snapshot`
+= identity moves (Java zeroes the source field — same record, new owner; `snapshot == 0` records a blank
+createBitmap surface); `native_ref_texture` = record CLONE (each Bitmap owns an independently-recyclable handle).
+(5) `register_drawable_natives` converted from atomic `RegisterNatives` to `register_class_natives_best_effort`
+and now covers all three drawable classes; `register_bitmap_natives` extended 2 → 6 Bitmap bindings. Deliberately
+LEFT UNBOUND (honest ULE discovery signals — callers read pixel content back, which recording can't serve):
+`Bitmap.native_erase_color`/`native_get_pixels`/`native_set_pixels`/`native_copy_to_buffer`/`native_save_to_png`;
+the `GskCanvas` draw natives (deferred Canvas subsystem); `BitmapFactory.nativeDecodeAsset`/`nativeDecodeByteArray`
+/`nativeDecodeFileDescriptor`/`nativeIsSeekable` are dead code in the installed Java (every decode entry point
+routes through `decodeStream` → the bound `nativeDecodeStream` — smali-verified).
+
+*Regression guards (plain `cargo test`):* `drawable_native_name_sig_and_class_match_art_reported` extended with
+every new Drawable/DrawableContainer/NinePatchDrawable name/sig/class + both sentinels distinct-nonzero;
+`bitmap_native_names_sigs_and_classes_match_bitmap_java` extended with the 4 lifecycle natives; new
+`record_bitmap_from_file_records_dimensions_and_is_total_on_bad_paths` (temp-file PNG → real dimensions recorded;
+missing path → tolerated 0). Gate green: fmt / build --all-targets / clippy `-D warnings` / 583 unit + 4 integ +
+2 doctest / release.
+
+*Boot watch (next validation boot):* (a) zero `UnsatisfiedLinkError`/`No implementation found` (esp. `native_ref`/
+`native_create_texture`/`native_recycle`); (b) `drawable_bound=6 container_bound=2 nine_patch_bound=3` +
+`bitmap_bound=6` registration lines; (c) `ActivitySplash.onCreate` completes → step 5+; (d) with no step abort,
+the collateral teardown `SEGV_MAPERR` (`libroblox+0x23e74d0`) should not fire either (it remains the recorded
+separate defect if a DIFFERENT abort path is hit). *(2026-07-02: all four CONFIRMED — see the 🧩 entry below.)*
+
+---
+
+### 2026-07-02 — 🧩 Validation boot verdict on the FULL three-pass stack (🧵+📼+🎨): ALL CLEAN — all three passes VALIDATED and committed as one commit; the RobloxToolbar NPE SURVIVES with every resource resolving (drawable-failure-linkage hypothesis REFUTED) — next lead: inflation semantics (ATL `parseInclude` id-override)
+
+*Validation verdict (`/tmp/eclipse-challenge6.log` — 180 s fully-autonomous login re-drive at this exact tree,
+2026-07-02 05:23–05:26 UTC):* **ALL CLEAN.** `UnsatisfiedLinkError` 0, `No implementation found` 0, `IOException at
+readAsset_internal` 0, `Resource is not a Drawable` 0, getPooledString misroute WARNs 0; the single
+`Resources$NotFoundException` in the log is the KNOWN separate applyStyle `inflate(0x0)` upgrade-dialog defect
+(`Unable to find resource ID #0x0`, AlertController, 05:23:29.761 — recorded 2026-07-01 🧵, untouched here).
+Registration lines: `drawable_bound=6 container_bound=2 nine_patch_bound=3` + `factory_bound=1 bitmap_bound=6` +
+asset-stream `bound=7`. The splash INFLATES (recipe steps 1–7 complete: `Activity resumed: recipe steps 1–7 driven`
+for `ActivitySplash` at 05:23:10.905), the full 5-stage synthetic drive fires (stages 0–5, every char
+`handled=true`, every tap `consumed=true`), and the boot reaches `v2/login` POST → HTTP 403 "Challenge is required
+to authorize the request" (05:23:40.809) → `Rendering native challenge.` → `onAppReady: ChallengeNativeWrapper` →
+`onAppReady: ChallengeHybridWebView` → the rbx.web fragment (`[d.onCreate()-104] … tag=rbx.web`, 05:23:40.936).
+All three passes are hereby **VALIDATED**; committed together (one commit) with this entry.
+
+*Important NEGATIVE result (hypothesis refuted by experiment):* the RobloxToolbar NPE —
+`NullPointerException: void com.roblox.client.components.RobloxToolbar.setVisibility(int) on a null object
+reference` at `yh.d.onCreateView(Unknown Source:187)` — **STILL fires (05:23:49.923)** even with every resource
+string and drawable resolving cleanly. The 2026-07-01 🧵 working hypothesis (the toolbar-null flows from the
+TYPE_STRING/drawable resolution failures) is **REFUTED**: the framework-side null sources were all fixed and
+verified silent this boot, and the NPE is byte-identical.
+
+*New facts (challenge6):* (a) **NO signal-11 / crashpad activity anywhere near the challenge** — the only
+signal-11 this boot is an unrelated splash-era `Run book keeping for signal 11` + crashpad `Handle a real crash`
+at app-time 8.5 s (05:23:10.893, during crashpad init, predates this work; the earlier 03:50:07-era
+challenge-adjacent signal-11 did NOT reproduce). (b) The fragment inflation emits exactly TWO
+`AppCompatViewInflater` app:theme deprecation lines (the two `toolbar_include` RobloxToolbar constructions,
+05:23:41.294 + 05:23:45.120), then the NPE lands ~4.8 s after the second — inflation itself proceeds; the null is
+discovered by the app's own view lookup afterwards. (c) After the NPE the fragment dies but the app recovers: the
+~60 s challenge timeout fires and it falls back to `onAppReady: LoginV2` (05:24:41.921); the engine stays alive to
+the 180 s kill — no teardown SEGV this boot (no lifecycle step aborted the boot).
+
+*Next lead (the §5 START-HERE-NEXT):* with resources exonerated, the mechanism must be inflation SEMANTICS.
+Prime suspect: ATL `LayoutInflater.parseInclude` id-override handling — Android semantics require an
+`<include android:id=…>` to OVERRIDE the included root view's id; if ATL diverges (keeps the included root's own
+id, or applies neither), the app's `findViewById(R.id.<toolbar-frame id>)` misses the RobloxToolbar root → null →
+`setVisibility` NPE at exactly this shape. Diagnosis is FIRST-PARTY ONLY: dump `toolbar_frame.xml` /
+`toolbar_include.xml` id attributes with Eclipse's own `apk::axml` reader and read the vendored/installed ATL
+`LayoutInflater` source/smali side-by-side; no app-code decompilation.
 
 ---
 

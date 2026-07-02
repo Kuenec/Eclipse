@@ -88,6 +88,7 @@ use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 use crate::runtime::Vm;
 
 pub mod asset_registry;
+pub mod bitmap_registry;
 pub mod canvas_registry;
 pub mod matrix_registry;
 pub mod paint_registry;
@@ -686,18 +687,24 @@ const ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_SIG: &JNIStr =
 // 2026-06-11: the asset-STREAM natives behind `AssetManager.open(fileName)` → an `AssetInputStream`.
 // `openAsset(String,int)` (confirmed from the ART `No implementation found … openAsset(java.lang.
 // String, int)` line, run log 2026-06-11, returns `long`) opens an asset and returns a handle; the
-// read cycle (`readAsset`/`seekAsset`/`getAssetLength`/`getAssetRemainingLength`/`destroyAsset`)
-// operates on it. Bound non-GTK against Eclipse's own [`asset_registry`] (jlong = slab index, never a
-// raw pointer) + the `src/apk` reader (reads `assets/<fileName>`). The classic AOSP signatures
-// (`readAsset(J[BII)I`, `seekAsset(JJI)J`, `getAssetLength(J)J`, `getAssetRemainingLength(J)J`,
-// `destroyAsset(J)V`) are registered best-effort ([`register_asset_stream_natives`]) so a sig drift on
-// the read cycle is logged + discovered, never breaking the main AssetManager natives.
+// read cycle (`readAsset`/`readAssetChar`/`seekAsset`/`getAssetLength`/`getAssetRemainingLength`/
+// `destroyAsset`) operates on it. Bound non-GTK against Eclipse's own [`asset_registry`] (jlong =
+// slab index, never a raw pointer) + the `src/apk` reader (reads `assets/<fileName>`). The
+// signatures are registered best-effort ([`register_asset_stream_natives`]) so a sig drift on the
+// read cycle is logged + discovered, never breaking the main AssetManager natives.
+// 2026-07-02: the RETURN CONTRACTS are ATL's, not AOSP's — readAsset returns 0 at EOF (negative
+// throws Java IOException; see [`atl_read_asset_return`]) and seekAsset's whence is the AOSP Java
+// convention (<0 SET / 0 CUR / >0 END; see [`atl_seek_whence_to_lseek`]).
 const ASSET_MANAGER_OPEN_ASSET_NAME: &JNIStr = jni_str!("openAsset");
 const ASSET_MANAGER_OPEN_ASSET_SIG: &JNIStr = jni_str!("(Ljava/lang/String;I)J");
 const ASSET_MANAGER_READ_ASSET_NAME: &JNIStr = jni_str!("readAsset");
 // ATL's readAsset takes the off/len as `long` (run log 2026-06-11: vtable shows
 // `readAsset(long, byte[], long, long)`, mangled `__J_3BJJ`), NOT the classic AOSP `(J[BII)I`.
 const ASSET_MANAGER_READ_ASSET_SIG: &JNIStr = jni_str!("(J[BJJ)I");
+// 2026-07-02: readAssetChar(J)I — the single-byte AssetInputStream.read() native (vendored
+// AssetManager.java line 685); unbound it was a call-time UnsatisfiedLinkError.
+const ASSET_MANAGER_READ_ASSET_CHAR_NAME: &JNIStr = jni_str!("readAssetChar");
+const ASSET_MANAGER_READ_ASSET_CHAR_SIG: &JNIStr = jni_str!("(J)I");
 const ASSET_MANAGER_SEEK_ASSET_NAME: &JNIStr = jni_str!("seekAsset");
 const ASSET_MANAGER_SEEK_ASSET_SIG: &JNIStr = jni_str!("(JJI)J");
 const ASSET_MANAGER_GET_ASSET_LENGTH_NAME: &JNIStr = jni_str!("getAssetLength");
@@ -750,6 +757,14 @@ const ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG: &JNIStr = jni_str!("(ISLandroid/uti
 const ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME: &JNIStr = jni_str!("loadThemeAttributeValue");
 const ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG: &JNIStr =
     jni_str!("(JILandroid/util/TypedValue;Z)I");
+
+// 2026-07-01: `getPooledString(int block, int id)` (AssetManager.java line 286, `/*package*/ native
+// final CharSequence getPooledString(int block, int id);`) — `TypedArray.loadStringValueAt` calls it
+// for any TYPE_STRING whose asset cookie is `>= 0`, i.e. exactly the ARSC-pool strings the
+// styled-attribute natives now mark with [`ARSC_APP_COOKIE`]/[`ARSC_FRAMEWORK_COOKIE`]. Unbound it
+// would be a call-time UnsatisfiedLinkError the moment the cookie fix routes a string here.
+const ASSET_MANAGER_GET_POOLED_STRING_NAME: &JNIStr = jni_str!("getPooledString");
+const ASSET_MANAGER_GET_POOLED_STRING_SIG: &JNIStr = jni_str!("(II)Ljava/lang/CharSequence;");
 
 /// `Res_value.dataType` for a string-pool reference (`TYPE_STRING`); its `data` is a value-pool index.
 const RES_VALUE_TYPE_STRING: u8 = 0x03;
@@ -819,6 +834,54 @@ const TYPE_ATTRIBUTE: u8 = 0x02;
 /// `TypedValue.TYPE_STRING` — an interned string; its `data` is the source string-pool index, resolved
 /// by `getString` via the XmlBlock pool (cookie [`XML_BLOCK_COOKIE`]).
 const TYPE_STRING: u8 = 0x03;
+
+// 2026-07-01: positive asset cookies marking a TYPE_STRING whose `data` indexes a `resources.arsc`
+// GLOBAL value string pool (vs the XmlBlock pool, cookie -1). `TypedArray.loadStringValueAt` routes
+// `cookie >= 0` to `AssetManager.getPooledString(cookie, data)` (AssetManager.java line 286), which
+// [`asset_manager_get_pooled_string`] backs. ROOT CAUSE this closes (challenge boot,
+// /tmp/eclipse-challenge3.log): a styled attribute whose reference chase landed on an ARSC
+// TYPE_STRING (a file-path drawable such as `@drawable/topbar_ic_close` →
+// "res/drawable-mdpi-v4/topbar_ic_close.png") kept cookie -1, so Java resolved the ARSC pool index
+// against the LAYOUT XmlBlock's pool → null → `Resource is not a Drawable (color or path):
+// TypedValue{t=0x3/d=0x456 "<null>" a=-1 r=0x7f080173}` (d=0x456 == the ARSC pool index of that
+// exact path — verified with Eclipse's own `apk::arsc` reader).
+
+/// Asset cookie for a string in the APP `resources.arsc` global value pool (== [`ECLIPSE_ASSET_COOKIE`]).
+const ARSC_APP_COOKIE: i32 = 1;
+/// Asset cookie for a string in the FRAMEWORK table's (`framework-res.apk`) global value pool.
+const ARSC_FRAMEWORK_COOKIE: i32 = 2;
+
+/// The ARSC string-pool cookie for the table that defines resource id `resid` — mirrors
+/// [`arsc_bytes_for`]'s package dispatch (package `0x01` → the framework table, else the app table).
+fn arsc_cookie_for(resid: u32) -> i32 {
+    arsc_cookie_for_package((resid >> 24) as u8)
+}
+
+/// The ARSC string-pool cookie for a package id (`0x01` → framework table, else app table).
+fn arsc_cookie_for_package(package_id: u8) -> i32 {
+    if package_id == 0x01 {
+        ARSC_FRAMEWORK_COOKIE
+    } else {
+        ARSC_APP_COOKIE
+    }
+}
+
+/// Resolve a global ARSC value-pool string by its positive asset `cookie` + pool `index` — the
+/// native backing for `AssetManager.getPooledString` and the `TypedValue.string` fill of
+/// [`asset_manager_load_theme_attribute_value`]. Returns `None` for an unknown cookie, a missing
+/// table, or an out-of-range index (never panics; the caller logs + returns null, the observable
+/// diagnostic for a wrong-pool regression).
+fn arsc_pool_string(cookie: i32, index: u32) -> Option<String> {
+    // Any resid with the right package byte selects the table in arsc_bytes_for.
+    let probe_resid: u32 = match cookie {
+        ARSC_FRAMEWORK_COOKIE => 0x0100_0000,
+        ARSC_APP_COOKIE => 0x7f00_0000,
+        _ => return None,
+    };
+    let bytes = arsc_bytes_for(probe_resid)?;
+    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+    table.value_string(index).ok().flatten()
+}
 
 /// `AssetManager.init(int sdk_version)` → GTK-free no-op (minimal stub, 2026-06-05).
 ///
@@ -944,8 +1007,9 @@ extern "system" fn asset_manager_set_configuration<'local>(
 /// [`crate::apk::axml::parse_document`], stores the parsed [`crate::apk::axml::XmlDocument`] in
 /// [`xml_registry`], and returns the slab handle (≥ 1, never `0`). A missing entry or parse failure
 /// returns `0` — the "no asset" sentinel the framework turns into `FileNotFoundException` (correct
-/// behavior, not a fake success). `cookie` is the APK-set index; Eclipse keys assets by the single
-/// stashed APK path, so it is logged but not used to select an archive.
+/// behavior, not a fake success). 2026-07-01: `cookie` selects the archive —
+/// [`ARSC_FRAMEWORK_COOKIE`] routes to `framework-res.apk`, anything else to the app APK (see
+/// [`open_xml_block`]).
 ///
 /// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
 /// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
@@ -963,7 +1027,7 @@ extern "system" fn asset_manager_open_xml_asset<'local>(
             return Ok(0);
         }
         let name = file_name.try_to_string(env)?;
-        match open_xml_block(&name) {
+        match open_xml_block(cookie, &name) {
             Ok(handle) => {
                 tracing::debug!(
                     target: "android.content.res.AssetManager",
@@ -1107,8 +1171,11 @@ struct TypedEntry {
     /// `TYPE_ATTRIBUTE` (e.g. `android:id="@id/foo"`) this is the referenced id (== `data`), which is
     /// what `TypedArray.getResourceId` returns; for every other value type it is `0` (no resource id).
     resource_id: i32,
-    /// The asset cookie for the `STYLE_ASSET_COOKIE` slot. [`XML_BLOCK_COOKIE`] (`-1`) for a
-    /// `TYPE_STRING` (so `getString` resolves via the XmlBlock's own Java pool); `0` otherwise.
+    /// The asset cookie for the `STYLE_ASSET_COOKIE` slot. For a `TYPE_STRING` this routes string
+    /// resolution to the pool `data` actually indexes: [`XML_BLOCK_COOKIE`] (`-1`) for an inline
+    /// XmlBlock string (`mXml.getPooledString`), or the positive [`ARSC_APP_COOKIE`] /
+    /// [`ARSC_FRAMEWORK_COOKIE`] for a value resolved through `resources.arsc`
+    /// (`AssetManager.getPooledString`, 2026-07-01). `0` for every other value type.
     asset_cookie: i32,
 }
 
@@ -1167,12 +1234,21 @@ fn resolve_inline_attr_value(value_type: u8, value_data: u32) -> TypedEntry {
     // Follow resource references (`@…`) to a concrete value. `TYPE_ATTRIBUTE` (`?attr/…`) has no
     // theme context here (this is an inline AttributeSet value, not a theme bag), so it is left as-is
     // for the framework to resolve against the active theme.
+    //
+    // 2026-07-01: track which string pool a TYPE_STRING's `data` indexes. The INLINE value's string
+    // lives in the XmlBlock's own pool (cookie -1 → mXml.getPooledString). But once the chase
+    // resolves through resources.arsc, the value's `data` indexes THAT TABLE's global pool — the
+    // matching positive ARSC cookie routes Java to AssetManager.getPooledString (the challenge-boot
+    // "Resource is not a Drawable … \"<null>\" a=-1" root cause was leaving these at -1).
+    let mut string_pool_cookie = XML_BLOCK_COOKIE;
     for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
         if cur_type != TYPE_REFERENCE || cur_data == 0 {
             break; // concrete value, a non-reference, or the explicit @null reference: done.
         }
         match resolve_res_value(cur_data) {
             Some(v) => {
+                // The resolved value came from the table that defines `cur_data`.
+                string_pool_cookie = arsc_cookie_for(cur_data);
                 cur_type = u8::try_from(v.type_).unwrap_or(0);
                 cur_data = u32::from_ne_bytes(v.data.to_ne_bytes());
             }
@@ -1180,10 +1256,10 @@ fn resolve_inline_attr_value(value_type: u8, value_data: u32) -> TypedEntry {
             None => break,
         }
     }
-    // A string value lives in the XmlBlock's own pool; the XML_BLOCK_COOKIE routes getString to
-    // mXml.getPooledString(data) in Java (no native). Other types: cookie 0.
+    // A string's cookie routes getString to the pool its data indexes (XmlBlock or ARSC, above).
+    // Other types: cookie 0.
     let asset_cookie = if cur_type == TYPE_STRING {
-        XML_BLOCK_COOKIE
+        string_pool_cookie
     } else {
         0
     };
@@ -1257,6 +1333,9 @@ fn merge_theme_style(
                 theme_registry::ThemeAttr {
                     type_: entry.type_,
                     data: entry.data,
+                    // 2026-07-01: a TYPE_STRING bag value's `data` indexes the GLOBAL pool of the
+                    // table THIS style node lives in — record it for the string-pool cookie.
+                    source_package: (current >> 24) as u8,
                 }
             });
         }
@@ -1291,12 +1370,17 @@ fn resolve_theme_attr(
     } else {
         0
     };
+    // 2026-07-01: a theme value is ALWAYS resources.arsc-sourced (a style bag), so a TYPE_STRING's
+    // `data` indexes the GLOBAL pool of the table the bag (or the chased target) lives in — never
+    // the XmlBlock pool. Track it for the string-pool cookie.
+    let mut string_pool_cookie = arsc_cookie_for_package(cur.source_package);
     for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
         match cur.type_ {
             // A theme-attribute reference (`?attr/foo`): re-resolve against the theme map.
             TYPE_ATTRIBUTE => {
                 let next_id = u32_to_i32(cur.data);
                 cur = *attrs.get(&next_id)?;
+                string_pool_cookie = arsc_cookie_for_package(cur.source_package);
                 if cur.type_ == TYPE_REFERENCE {
                     resource_id = u32_to_i32(cur.data);
                 }
@@ -1310,9 +1394,12 @@ fn resolve_theme_attr(
                 }
                 match resolve_res_value(cur.data) {
                     Some(v) => {
+                        // The resolved value came from the table that defines the referenced id.
+                        string_pool_cookie = arsc_cookie_for(cur.data);
                         cur = theme_registry::ThemeAttr {
                             type_: u8::try_from(v.type_).unwrap_or(0),
                             data: u32::from_ne_bytes(v.data.to_ne_bytes()),
+                            source_package: (cur.data >> 24) as u8,
                         };
                         // If it points to ANOTHER reference, keep chasing and update resource_id.
                         if cur.type_ == TYPE_REFERENCE {
@@ -1329,7 +1416,7 @@ fn resolve_theme_attr(
         }
     }
     let asset_cookie = if cur.type_ == TYPE_STRING {
-        XML_BLOCK_COOKIE
+        string_pool_cookie
     } else {
         0
     };
@@ -1897,15 +1984,34 @@ fn resolve_resource_identifier(name: &str, def_type: &str, def_package: &str) ->
 /// 2026-06-11: ATL's `AssetManager.open` passes `openAsset` the FULL APK-relative path (already
 /// `assets/…`), unlike stock AOSP (a path relative to `assets/`). Accept BOTH: use the name as-is when
 /// it already has the `assets/` prefix, else prepend it (so a double `assets/assets/…` can't happen).
+///
+/// 2026-07-01: ATL's `AssetManager.openNonAsset` (AssetManager.java line 393) funnels through the
+/// SAME `openAsset` native with an APK-ROOT-relative path (the AOSP openNonAsset contract — e.g.
+/// `Resources.loadDrawable` opening `res/drawable-mdpi-v4/topbar_ic_close.png`). Serve the exact
+/// entry when it exists, and only fall back to the `assets/` prefix for the assets-relative form —
+/// detection, not an assumed prefix.
 fn read_asset_bytes(name: &str) -> Option<Vec<u8>> {
-    let apk_path = APK_PATH.get()?;
+    read_asset_bytes_from(APK_PATH.get()?, name)
+}
+
+/// [`read_asset_bytes`] against an explicit APK path (the testable seam — the global
+/// [`APK_PATH`] is process-wide and set once by the boot).
+fn read_asset_bytes_from(apk_path: &str, name: &str) -> Option<Vec<u8>> {
     let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
-    let entry = if name.starts_with("assets/") {
-        name.to_owned()
-    } else {
-        format!("assets/{name}")
-    };
-    apk.read_entry(&entry).ok()
+    asset_entry_candidates(name).find_map(|entry| apk.read_entry(&entry).ok())
+}
+
+/// The zip-entry candidates for an asset `name`, in resolution order — the ONE shared rule for
+/// every asset consumer (2026-07-02: the byte path [`read_asset_bytes`] and the fd path
+/// [`asset_fd_for`] had diverged; only the byte path served APK-root-relative names).
+///
+/// Order: the exact entry first (ATL's `openNonAsset`/`openNonAssetFd` pass APK-root-relative
+/// paths such as `res/…`), then the `assets/`-prefixed form for an assets-relative name. An
+/// already-`assets/`-prefixed name gets no fallback (a double `assets/assets/…` can't happen);
+/// its exact miss is a genuine miss.
+fn asset_entry_candidates(name: &str) -> impl Iterator<Item = String> {
+    let fallback = (!name.starts_with("assets/")).then(|| format!("assets/{name}"));
+    std::iter::once(name.to_owned()).chain(fallback)
 }
 
 /// `AssetManager.openAsset(String fileName, int accessMode)` → an [`asset_registry`] handle, or `0`.
@@ -1980,8 +2086,11 @@ impl fmt::Display for AssetFdError {
 }
 
 /// Resolve an asset name to the fd-servable triple `(fresh APK fd, data offset, uncompressed
-/// length)` behind `AssetManager.openAssetFd`. Accepts the name with or without the `assets/`
-/// prefix, like [`read_asset_bytes`] (ATL's `openFd` passes the already-prefixed full path).
+/// length)` behind `AssetManager.openAssetFd`. Resolves the entry through the same
+/// [`asset_entry_candidates`] rule as [`read_asset_bytes`] (2026-07-02: exact/APK-root-relative
+/// first — ATL's `openNonAssetFd` shares `openFd_internal` — then the `assets/` prefix; the fd
+/// path previously prepended `assets/` unconditionally, so root-relative entries could never be
+/// fd-served).
 ///
 /// 2026-06-12: a FRESH fd is opened per call because ownership transfers to Java
 /// (`FileDescriptor.setInt$` → `ParcelFileDescriptor` → `AssetFileDescriptor`, which closes it) —
@@ -1989,14 +2098,21 @@ impl fmt::Display for AssetFdError {
 /// ([`crate::apk::Apk::entry_span`]); anything else is the typed `Err` → the caller's `-1` →
 /// Java's designed `FileNotFoundException`.
 fn asset_fd_for(apk_path: &str, name: &str) -> Result<(c_int, u64, u64), AssetFdError> {
-    let entry = if name.starts_with("assets/") {
-        name.to_owned()
-    } else {
-        format!("assets/{name}")
-    };
     let mut apk =
         crate::apk::Apk::open(std::path::Path::new(apk_path)).map_err(AssetFdError::Apk)?;
-    let span = apk.entry_span(&entry).map_err(AssetFdError::Apk)?;
+    let mut resolved = Err(AssetFdError::Apk(crate::apk::ApkError::EntryMissing(
+        name.to_owned(),
+    )));
+    for entry in asset_entry_candidates(name) {
+        match apk.entry_span(&entry) {
+            Ok(span) => {
+                resolved = Ok(span);
+                break;
+            }
+            Err(e) => resolved = Err(AssetFdError::Apk(e)),
+        }
+    }
+    let span = resolved?;
     if !span.stored {
         return Err(AssetFdError::Compressed);
     }
@@ -2120,11 +2236,31 @@ extern "system" fn asset_manager_open_asset_fd<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.readAsset(long asset, byte[] b, int off, int len)` → bytes read, or `-1` at EOF.
+/// Map a registry read outcome to ATL's `readAsset` native return contract (2026-07-02): `n > 0`
+/// bytes read → `n`; `0` at EOF; NEGATIVE only for a genuine error (stale/fabricated handle).
+///
+/// ATL's `readAsset_internal` (vendored `AssetManager.java` line 592) throws `IOException` for ANY
+/// negative native return and itself maps `0` → the `InputStream` `-1` EOF — the reference native
+/// (`Asset_read` → `android::Asset::read`) returns `0` at EOF. Eclipse previously used the AOSP
+/// framework convention (`-1` at EOF) here, so EVERY `AssetInputStream` read to EOF threw
+/// `IOException` (caught by the dictionary/cacert readers all along; FATAL once the 2026-07-01
+/// drawable fix routed the splash PNG through `BitmapFactory.nativeDecodeStream` → the Java
+/// stream — the challenge4 `Resources$NotFoundException` boot abort).
+fn atl_read_asset_return(outcome: &Result<Vec<u8>, asset_registry::AssetRegistryError>) -> jint {
+    match outcome {
+        Ok(read) => i32::try_from(read.len()).unwrap_or(jint::MAX),
+        Err(_) => -1,
+    }
+}
+
+/// `AssetManager.readAsset(long asset, byte[] b, long off, long len)` → bytes read, `0` at EOF, or
+/// `-1` on a bad handle.
 ///
 /// JNI ABI: an INSTANCE native. Reads up to `len` bytes from the stream's cursor into `b[off..]`.
-/// Returns `-1` at EOF (AOSP contract) or on a stale handle; `resolve::<LogErrorAndDefault>` returns
-/// `0` only on an internal JNI error (e.g. the array write throwing `ArrayIndexOutOfBounds`).
+/// The return value follows the ATL contract ([`atl_read_asset_return`]): `0` at EOF (ATL's Java
+/// maps it to the `InputStream` `-1`), negative ONLY for a genuine error (→ Java `IOException`).
+/// `resolve::<LogErrorAndDefault>` returns `0` only on an internal JNI error (e.g. the array write
+/// throwing `ArrayIndexOutOfBounds`).
 extern "system" fn asset_manager_read_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2146,34 +2282,80 @@ extern "system" fn asset_manager_read_asset<'local>(
         if want == 0 {
             return Ok(0);
         }
-        let read = match asset_registry::with_stream(asset, |s| {
+        let outcome = asset_registry::with_stream(asset, |s| {
             let mut tmp = vec![0u8; want];
             let n = s.read(&mut tmp);
             tmp.truncate(n);
             tmp
-        }) {
-            Ok(buf) => buf,
-            Err(_) => return Ok(-1), // stale/fabricated handle → report EOF, never UB
+        });
+        // 2026-07-02: the ATL return contract lives in atl_read_asset_return — a stale/fabricated
+        // handle is the ONLY negative (→ Java IOException); EOF is 0, never -1.
+        let ret = atl_read_asset_return(&outcome);
+        let Ok(read) = outcome else {
+            return Ok(ret);
         };
-        if read.is_empty() {
-            return Ok(-1); // AOSP readAsset returns -1 at EOF
+        if !read.is_empty() {
+            // Java bytes are jbyte = i8; reinterpret each byte's bits (no lossy cast).
+            let signed: Vec<i8> = read.iter().map(|&x| i8::from_ne_bytes([x])).collect();
+            let start = jni::sys::jsize::try_from(off).unwrap_or(jni::sys::jsize::MAX);
+            b.set_region(env, start, &signed)?;
         }
-        // Java bytes are jbyte = i8; reinterpret each byte's bits (no lossy cast).
-        let signed: Vec<i8> = read.iter().map(|&x| i8::from_ne_bytes([x])).collect();
-        let start = jni::sys::jsize::try_from(off).unwrap_or(jni::sys::jsize::MAX);
-        b.set_region(env, start, &signed)?;
-        let n = read.len();
         tracing::debug!(
             target: "android.content.res.AssetManager",
-            asset, off, len, returned = n,
+            asset, off, len, returned = ret,
             "AssetManager.readAsset"
         );
-        Ok(i32::try_from(n).unwrap_or(jint::MAX))
+        Ok(ret)
     })
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `AssetManager.readAssetChar(long asset)` → the next byte (`0..=255`), or `-1` at EOF / on a bad
+/// handle.
+///
+/// 2026-07-02: the single-byte `AssetInputStream.read()` native (vendored `AssetManager.java` line
+/// 685) — previously unbound, so any one-byte read was a call-time `UnsatisfiedLinkError`. The
+/// reference native (`readAssetChar` in ATL's `android_content_res_AssetManager.c`) returns the
+/// byte when exactly 1 was read, else `-1` (the `InputStream.read()` EOF contract — no `IOException`
+/// mapping on this path, so `-1` is correct here, unlike [`atl_read_asset_return`]).
+extern "system" fn asset_manager_read_asset_char<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    asset: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        let byte = asset_registry::with_stream(asset, |s| {
+            let mut one = [0u8; 1];
+            (s.read(&mut one) == 1).then_some(one[0])
+        });
+        Ok(match byte {
+            Ok(Some(b)) => jint::from(b),
+            Ok(None) | Err(_) => -1, // EOF, or a stale/fabricated handle
+        })
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Translate the `whence` ATL's `AssetInputStream` passes `seekAsset` into the lseek-style whence
+/// [`asset_registry::AssetStream::seek`] takes (2026-07-02).
+///
+/// The Java side (vendored `AssetManager.java`, copied from AOSP) uses the AOSP-native convention:
+/// `mark()` queries the position with `seekAsset(0, 0)` (CUR), `reset()` restores with
+/// `seekAsset(mMarkPos, -1)` (SET), `skip(n)` advances with `seekAsset(n, 0)` (CUR) — i.e. `< 0` =
+/// SET, `0` = CUR, `> 0` = END (AOSP `android_util_AssetManager.cpp`'s exact mapping). Passing the
+/// value through raw (lseek: `0` = SET) made `mark()` REWIND the stream and `reset()` fail — the
+/// same Java-contract-vs-native-convention split as [`atl_read_asset_return`]. (ATL's own C passes
+/// whence raw into `Asset::seek` — an upstream divergence from its Java; Eclipse serves the Java.)
+fn atl_seek_whence_to_lseek(whence: jint) -> i32 {
+    match whence {
+        w if w < 0 => 0, // SET
+        0 => 1,          // CUR
+        _ => 2,          // END
+    }
+}
+
 /// `AssetManager.seekAsset(long asset, long offset, int whence)` → the new cursor position, or `-1`.
+/// `whence` uses the AOSP Java convention, translated by [`atl_seek_whence_to_lseek`].
 extern "system" fn asset_manager_seek_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2182,7 +2364,12 @@ extern "system" fn asset_manager_seek_asset<'local>(
     whence: jint,
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
-        Ok(asset_registry::with_stream(asset, |s| s.seek(offset, whence)).unwrap_or(-1))
+        Ok(
+            asset_registry::with_stream(asset, |s| {
+                s.seek(offset, atl_seek_whence_to_lseek(whence))
+            })
+            .unwrap_or(-1),
+        )
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -2232,7 +2419,7 @@ extern "system" fn asset_manager_destroy_asset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind the asset-STREAM read cycle (`readAsset`/`seekAsset`/`getAssetLength`/
+/// Bind the asset-STREAM read cycle (`readAsset`/`readAssetChar`/`seekAsset`/`getAssetLength`/
 /// `getAssetRemainingLength`/`destroyAsset`) plus the fd-serving `openAssetFd` (2026-06-12) on
 /// `android/content/res/AssetManager`, BEST-EFFORT.
 ///
@@ -2246,11 +2433,17 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // even if a sibling does not: ATL has `getAssetLength(J)J`/`destroyAsset(J)V` but reads assets
     // without the classic `readAsset(J[BII)I` (a grouped bind would fail as a whole on that one). Each
     // entry's fn matches its paired signature; a `NoSuchMethodError` is cleared + logged, not fatal.
-    let natives: [(&JNIStr, &JNIStr, *mut c_void); 6] = [
+    let natives: [(&JNIStr, &JNIStr, *mut c_void); 7] = [
         (
             ASSET_MANAGER_READ_ASSET_NAME,
             ASSET_MANAGER_READ_ASSET_SIG,
             asset_manager_read_asset as *mut c_void,
+        ),
+        // 2026-07-02: the single-byte read() native (previously unbound → UnsatisfiedLinkError).
+        (
+            ASSET_MANAGER_READ_ASSET_CHAR_NAME,
+            ASSET_MANAGER_READ_ASSET_CHAR_SIG,
+            asset_manager_read_asset_char as *mut c_void,
         ),
         // 2026-06-12: the fd-serving open (covers openNonAssetFd via Java's shared openFd_internal).
         (
@@ -2302,7 +2495,7 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/content/res/AssetManager",
         bound,
-        "registered Eclipse's non-GTK asset-stream natives (per-native best-effort: readAsset/openAssetFd/seekAsset/getAssetLength/getAssetRemainingLength/destroyAsset)"
+        "registered Eclipse's non-GTK asset-stream natives (per-native best-effort: readAsset/readAssetChar/openAssetFd/seekAsset/getAssetLength/getAssetRemainingLength/destroyAsset)"
     );
     Ok(())
 }
@@ -2450,11 +2643,13 @@ extern "system" fn asset_manager_load_resource_value<'local>(
             resolved.type_.into(),
         )?;
         env.set_field(&out_value, jni_str!("data"), &int_sig, resolved.data.into())?;
+        // 2026-07-01: the cookie names the TABLE the value (and, for TYPE_STRING, its pool index)
+        // came from — app (1) vs framework (2) — matching AssetManager.getPooledString's routing.
         env.set_field(
             &out_value,
             jni_str!("assetCookie"),
             &int_sig,
-            ECLIPSE_ASSET_COOKIE.into(),
+            arsc_cookie_for(resid_u32).into(),
         )?;
         env.set_field(&out_value, jni_str!("resourceId"), &int_sig, resid.into())?;
         env.set_field(
@@ -2555,7 +2750,7 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             &out_value,
             jni_str!("assetCookie"),
             &int_sig,
-            ECLIPSE_ASSET_COOKIE.into(),
+            entry.asset_cookie.into(),
         )?;
         env.set_field(
             &out_value,
@@ -2563,6 +2758,38 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             &int_sig,
             entry.resource_id.into(),
         )?;
+        // 2026-07-01: same-pattern audit fix alongside the styled-attribute string-pool routing —
+        // this native previously left `TypedValue.string` NULL for a TYPE_STRING theme value, so
+        // `Theme.resolveAttribute` consumers (e.g. `Resources.loadDrawable` on a theme drawable)
+        // hit the identical "Resource is not a Drawable … \"<null>\"" failure. Resolve the pooled
+        // string from the table the entry's cookie names, exactly like `loadResourceValue`.
+        if entry.value_type == i32::from(TYPE_STRING) {
+            if let Some(s) =
+                arsc_pool_string(entry.asset_cookie, u32::from_ne_bytes(entry.data.to_ne_bytes()))
+            {
+                let jstr = env.new_string(&s)?;
+                // SAFETY: `string` is a `public CharSequence` field of android.util.TypedValue, so
+                // the `Ljava/lang/CharSequence;` descriptor paired with `JavaType::Object` is
+                // consistent — exactly FieldSignature::from_raw_parts' invariant. set_field
+                // re-checks the value (a java.lang.String IS a CharSequence) at runtime.
+                let cs_sig =
+                    unsafe { FieldSignature::from_raw_parts(CHAR_SEQUENCE_SIG, JavaType::Object) };
+                env.set_field(
+                    &out_value,
+                    jni_str!("string"),
+                    &cs_sig,
+                    JValue::Object(&jstr),
+                )?;
+            } else {
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    theme,
+                    cookie = entry.asset_cookie,
+                    index = entry.data,
+                    "AssetManager.loadThemeAttributeValue: TYPE_STRING pool index unresolvable (string left null)"
+                );
+            }
+        }
         tracing::debug!(
             target: "android.content.res.AssetManager",
             theme,
@@ -2577,16 +2804,66 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `AssetManager.getPooledString(int block, int id)` → the ARSC global value-pool string the
+/// `(block, id)` pair names, or null (2026-07-01).
+///
+/// JNI ABI: an INSTANCE native returning `CharSequence`, so the parameters are
+/// `(EnvUnowned, JObject this, jint block, jint id)`. `block` is the positive asset cookie the
+/// styled-attribute natives wrote ([`ARSC_APP_COOKIE`] = the app `resources.arsc`,
+/// [`ARSC_FRAMEWORK_COOKIE`] = `framework-res.apk`'s); `id` is the index into that table's global
+/// value string pool. This is what `TypedArray.loadStringValueAt` calls for a `cookie >= 0` string
+/// (`getString`/`getText`/`loadDrawable` path). An unknown cookie or out-of-range index returns
+/// null with a WARN — the loud, observable signal of a wrong-pool regression (the silent form of
+/// which was the challenge boot's `Resource is not a Drawable … "<null>"`).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
+/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns a null `JString` on error/panic
+/// (a `java.lang.String` IS a `CharSequence`, so the declared return type is satisfied).
+extern "system" fn asset_manager_get_pooled_string<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    block: jint,
+    id: jint,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let index = u32::from_ne_bytes(id.to_ne_bytes());
+        match arsc_pool_string(block, index) {
+            Some(s) => env.new_string(&s),
+            None => {
+                tracing::warn!(
+                    target: "android.content.res.AssetManager",
+                    block,
+                    index,
+                    "AssetManager.getPooledString: unknown cookie or out-of-range pool index → null"
+                );
+                Ok(JString::default())
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Read `name` from the APK zip, parse it as binary XML, and store it as an [`xml_registry`] block.
 ///
 /// Returns the non-zero block handle, or a typed [`AssetError`] on any failure (no stashed APK path,
 /// missing entry, parse error, or registry error) — the caller maps that to the `0` "no asset"
 /// sentinel. Opens the APK fresh per call (the launcher opens few XML assets; this avoids holding a
 /// `ZipArchive` across the JNI boundary and keeps the asset state a single `OnceLock<String>` path).
-fn open_xml_block(name: &str) -> Result<jlong, AssetError> {
-    let apk_path = APK_PATH.get().ok_or(AssetError::NoApkPath)?;
-    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path))?;
-    let bytes = apk.read_entry(name)?;
+///
+/// 2026-07-01: `cookie` selects the archive, matching the tables' cookies —
+/// [`ARSC_FRAMEWORK_COOKIE`] opens `framework-res.apk` (a framework XML file path resolved from the
+/// framework table, e.g. a theme drawable), anything else the app APK (the existing behavior; ATL's
+/// `Resources.loadXmlResourceParser` passes `TypedValue.assetCookie` through `openXmlResourceParser`).
+fn open_xml_block(cookie: jint, name: &str) -> Result<jlong, AssetError> {
+    let bytes = if cookie == ARSC_FRAMEWORK_COOKIE {
+        let fw = crate::runtime::find_framework().map_err(|_| AssetError::NoApkPath)?;
+        let mut apk = crate::apk::Apk::open(&fw.framework_res_apk)?;
+        apk.read_entry(name)?
+    } else {
+        let apk_path = APK_PATH.get().ok_or(AssetError::NoApkPath)?;
+        let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path))?;
+        apk.read_entry(name)?
+    };
     let doc = crate::apk::axml::parse_document(&bytes)?;
     let handle = xml_registry::store(doc)?;
     Ok(handle)
@@ -2801,6 +3078,16 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME,
                 ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG,
                 asset_manager_load_theme_attribute_value as *mut std::ffi::c_void,
+            )
+        },
+        // SAFETY: `asset_manager_get_pooled_string` matches the paired
+        // `(II)Ljava/lang/CharSequence;` signature as an instance native (AssetManager.java line
+        // 286; see the native's docs) — it returns a JString, which IS a CharSequence.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                ASSET_MANAGER_GET_POOLED_STRING_NAME,
+                ASSET_MANAGER_GET_POOLED_STRING_SIG,
+                asset_manager_get_pooled_string as *mut std::ffi::c_void,
             )
         },
     ];
@@ -9140,12 +9427,71 @@ const DRAWABLE_NATIVE_UNREF_SIG: &JNIStr = jni_str!("(J)V");
 const DRAWABLE_NATIVE_INVALIDATE_NAME: &JNIStr = jni_str!("native_invalidate");
 const DRAWABLE_NATIVE_INVALIDATE_SIG: &JNIStr = jni_str!("(J)V");
 
+// 2026-07-02: the INSTALLED framework dex is the authority for this class — the vendored ATL
+// `Drawable.java` has DRIFTED (it lacks `setPaintable`/`native_ref` entirely). Baksmali of the
+// installed `api-impl.jar` (classes3.dex, `Drawable.smali`) declares the full paintable lifecycle:
+//   `protected native void native_ref(long)`   — instance, called from `setPaintable(J)` (ref the
+//     incoming paintable) and UNCONDITIONALLY from the `Drawable(long)` ctor (even for 0);
+//   `protected native void native_draw(long paintable, long snapshot, int width, int height)` —
+//     instance, called from `draw(Canvas)` ONLY when the canvas `instanceof android.atl.GskCanvas`;
+//   `protected static native long native_paintable_from_path(String path)` — static, called from
+//     `createFromPath` for non-`.9.png` paths; the result feeds `Drawable(long)` → `native_ref`.
+// The validation boot `/tmp/eclipse-challenge5.log` (line 538) hit exactly this drift: the splash
+// PNG decode now succeeds, `BitmapDrawable.<init>` → `setPaintable` → `native_ref(long)` →
+// call-time `UnsatisfiedLinkError` → step-5 abort. The `paintable` here is either a live
+// [`bitmap_registry`] handle (`Bitmap.getTexture()` hands back `nativeDecodeStream`'s record), a
+// non-pointer sentinel ([`DRAWABLE_HANDLE_SENTINEL`] / [`DRAWABLE_CONTAINER_HANDLE_SENTINEL`]), or
+// 0 — never dereferenced. Refcount bookkeeping has no reader in the recorded model (the registry
+// retains records; `Bitmap.native_recycle` is the free bookkeeping), so ref/draw are validated
+// no-ops and `native_paintable_from_path` is registry-backed (its return IS read back through
+// `native_ref`/`native_get_width` on the shared-handle model).
+const DRAWABLE_NATIVE_REF_NAME: &JNIStr = jni_str!("native_ref");
+const DRAWABLE_NATIVE_REF_SIG: &JNIStr = jni_str!("(J)V");
+const DRAWABLE_NATIVE_DRAW_NAME: &JNIStr = jni_str!("native_draw");
+const DRAWABLE_NATIVE_DRAW_SIG: &JNIStr = jni_str!("(JJII)V");
+const DRAWABLE_PAINTABLE_FROM_PATH_NAME: &JNIStr = jni_str!("native_paintable_from_path");
+const DRAWABLE_PAINTABLE_FROM_PATH_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)J");
+
+// 2026-07-02: `android.graphics.drawable.DrawableContainer` (the StateListDrawable /
+// AnimationDrawable base — every `<selector>`/`<animation-list>` drawable XML the now-working
+// `Resources.loadDrawable` pipeline inflates) declares ITS OWN natives (installed classes3.dex,
+// `DrawableContainer.smali`): `protected native long native_constructor()` (instance, called from
+// `<init>` and fed to `setPaintable` → `native_ref`) and
+// `protected native void native_selectChild(long container, long child)` (instance, called from
+// `selectDrawable(int)` on state change with the container + child paintables). ART resolves
+// natives per DECLARING class, so Drawable's bindings do not cover these.
+const DRAWABLE_CONTAINER_CLASS: &JNIStr = jni_str!("android/graphics/drawable/DrawableContainer");
+const DRAWABLE_CONTAINER_SELECT_CHILD_NAME: &JNIStr = jni_str!("native_selectChild");
+const DRAWABLE_CONTAINER_SELECT_CHILD_SIG: &JNIStr = jni_str!("(JJ)V");
+
+// 2026-07-02: `android.graphics.drawable.NinePatchDrawable` (installed classes3.dex,
+// `NinePatchDrawable.smali`) declares three private instance natives, all reachable from the same
+// loadDrawable pipeline (`Drawable.createFromResourceStream` routes `.9.png` files to
+// `new NinePatchDrawable(String)`; `createFromPath` does the same):
+//   `private native long nativeCreate(String path)`            — `<init>(String)` → `setPaintable`;
+//   `private native long nativeCreate(byte[] chunk, long texture)` — `<init>(Resources, Bitmap,
+//     byte[], Rect, String)` passes `bitmap.getTexture()` (a [`bitmap_registry`] handle);
+//   `private native void nativeSetTint(long paintable, int tint)` — `setTint(int)` override.
+const NINE_PATCH_DRAWABLE_CLASS: &JNIStr = jni_str!("android/graphics/drawable/NinePatchDrawable");
+const NINE_PATCH_CREATE_NAME: &JNIStr = jni_str!("nativeCreate");
+const NINE_PATCH_CREATE_FROM_PATH_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)J");
+const NINE_PATCH_CREATE_FROM_CHUNK_SIG: &JNIStr = jni_str!("([BJ)J");
+const NINE_PATCH_SET_TINT_NAME: &JNIStr = jni_str!("nativeSetTint");
+const NINE_PATCH_SET_TINT_SIG: &JNIStr = jni_str!("(JI)V");
+
 /// The non-zero, non-pointer sentinel `Drawable.native_constructor()` returns as `mNativePtr`.
 ///
 /// 2026-06-05: Java only needs `mNativePtr != 0` (for the native-allocation registration); this value
 /// is never dereferenced (no drawable draw/bounds native is bound — see the section comment). A small,
 /// recognizable, plainly-not-a-pointer constant.
 const DRAWABLE_HANDLE_SENTINEL: jlong = 0x4452; // 'DR' — a non-zero, non-pointer marker.
+
+/// The non-zero, non-pointer sentinel `DrawableContainer.native_constructor()` returns (2026-07-02).
+///
+/// Same contract as [`DRAWABLE_HANDLE_SENTINEL`] (Java only feeds it to `setPaintable` →
+/// `native_ref`/`native_selectChild`, all Eclipse no-ops that never dereference); a distinct value
+/// so a log line tells the container apart from a plain drawable peer.
+const DRAWABLE_CONTAINER_HANDLE_SENTINEL: jlong = 0x4443; // 'DC' — a non-zero, non-pointer marker.
 
 /// `Drawable.native_constructor()` → a stable non-zero peer handle (`mNativePtr`).
 ///
@@ -9224,57 +9570,921 @@ extern "system" fn drawable_native_invalidate<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.graphics.drawable.Drawable`'s
-/// `native_constructor` + `native_unref` + `native_invalidate`.
+/// `Drawable.native_ref(long paintable)` → no-op refcount bookkeeping (2026-07-02).
 ///
-/// Locates `android/graphics/drawable/Drawable` and registers the natives via `RegisterNatives` (which
-/// wins over name-based lazy binding — JNI 1.1 spec). MUST run before step 4, since a launcher's
-/// onCreate may load a drawable. Registered alongside the View/widget natives. All three are declared
-/// `native` in the shipped dex, so the atomic `register_native_methods` array binds cleanly.
+/// JNI ABI: an INSTANCE native returning void (`setPaintable(J)` and the `Drawable(long)` ctor call
+/// `invoke-virtual {this, paintable}` — installed classes3.dex `Drawable.smali`), so the parameters
+/// are `(EnvUnowned, JObject this, jlong paintable)`. The `Drawable(long)` ctor refs UNCONDITIONALLY
+/// (even `0`), so this must tolerate `0`, a sentinel, a live [`bitmap_registry`] handle, or a stale
+/// one — it is taken but NEVER dereferenced. ATL's C backing bumps the GTK paintable's refcount;
+/// Eclipse's registry retains records until `Bitmap.native_recycle` (the free bookkeeping), so ref
+/// is a sound no-op with no reader. This was the `/tmp/eclipse-challenge5.log` splash abort
+/// (`UnsatisfiedLinkError` from `BitmapDrawable.<init>` → `setPaintable`, line 538).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic — the correct neutral value for this `void` native.
+extern "system" fn drawable_native_ref<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    paintable: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.drawable.Drawable",
+            paintable,
+            "Drawable.native_ref: no-op (recorded paintable; registry retains until Bitmap.recycle)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Drawable.native_draw(long paintable, long snapshot, int width, int height)` → no-op
+/// (2026-07-02).
+///
+/// JNI ABI: an INSTANCE native returning void (installed classes3.dex `Drawable.smali`:
+/// `draw(Canvas)` calls `invoke-virtual/range {this, paintable, snapshot, w, h}` ONLY when the
+/// canvas is `instanceof android.atl.GskCanvas`), so the parameters are
+/// `(EnvUnowned, JObject this, jlong paintable, jlong snapshot, jint width, jint height)`. ATL's C
+/// backing appends the paintable to the GSK render snapshot; Eclipse's framework is headless (the
+/// engine renders the screen; the view/drawable tree is only recorded), so drawing is a sound no-op
+/// — nothing reads a value back. Neither handle is dereferenced.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn drawable_native_draw<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    paintable: jlong,
+    snapshot: jlong,
+    width: jint,
+    height: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.drawable.Drawable",
+            paintable,
+            snapshot,
+            width,
+            height,
+            "Drawable.native_draw: no-op (headless recording; the engine renders the screen)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Drawable.native_paintable_from_path(String path)` → a recorded [`bitmap_registry`] handle for
+/// the image file, or `0` when unreadable (2026-07-02).
+///
+/// JNI ABI: a `static` native returning `jlong` (installed classes3.dex `Drawable.smali`), so the
+/// parameters are `(EnvUnowned, JClass, JString path)`. Called from `Drawable.createFromPath` for
+/// non-`.9.png` paths; the result feeds `new Drawable(long)` → `native_ref` (unconditional, so `0`
+/// is tolerated) and travels as the drawable `paintable`. Registry-backed via
+/// [`record_bitmap_from_file`] — the same headless recording `nativeDecodeStream` performs (real
+/// dimensions from the encoded header, bytes retained; no raster).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// `0` on an internal JNI error (the "no paintable" value every caller guards for).
+extern "system" fn drawable_native_paintable_from_path<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        if path.is_null() {
+            return Ok(0);
+        }
+        let path = path.try_to_string(env)?;
+        Ok(record_bitmap_from_file(
+            &path,
+            "Drawable.native_paintable_from_path",
+        ))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `DrawableContainer.native_constructor()` → a stable non-zero container peer handle (2026-07-02).
+///
+/// JNI ABI: an INSTANCE native returning `jlong` (installed classes3.dex `DrawableContainer.smali`,
+/// called from `<init>` on `this` with no Java args). The result only feeds `setPaintable` →
+/// [`drawable_native_ref`]/[`drawable_container_native_select_child`] — Eclipse no-ops that never
+/// dereference — so the minimal-sound backing is the non-pointer
+/// [`DRAWABLE_CONTAINER_HANDLE_SENTINEL`] (same shape as [`drawable_native_constructor`]).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); the body is
+/// infallible, so the sentinel is always returned.
+extern "system" fn drawable_container_native_constructor<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        tracing::debug!(
+            target: "android.graphics.drawable.DrawableContainer",
+            handle = DRAWABLE_CONTAINER_HANDLE_SENTINEL,
+            "DrawableContainer.native_constructor: returning non-GTK non-zero container sentinel"
+        );
+        Ok(DRAWABLE_CONTAINER_HANDLE_SENTINEL)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `DrawableContainer.native_selectChild(long container, long child)` → no-op selection
+/// bookkeeping (2026-07-02).
+///
+/// JNI ABI: an INSTANCE native returning void (installed classes3.dex `DrawableContainer.smali`,
+/// called from `selectDrawable(int)` with the container paintable + the selected child's
+/// paintable). The selection state Java reads back lives in the Java `curIndex` field; ATL's C
+/// backing re-parents the GTK paintable, which the headless recording model has no counterpart
+/// for. Neither handle is dereferenced.
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// the `()` default on error/panic.
+extern "system" fn drawable_container_native_select_child<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    container: jlong,
+    child: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.drawable.DrawableContainer",
+            container,
+            child,
+            "DrawableContainer.native_selectChild: no-op (selection state lives in Java curIndex)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NinePatchDrawable.nativeCreate(String path)` → a recorded [`bitmap_registry`] handle for the
+/// `.9.png` file, or `0` when unreadable (2026-07-02).
+///
+/// JNI ABI: a private INSTANCE native returning `jlong` (installed classes3.dex
+/// `NinePatchDrawable.smali`, called from `<init>(String)`), so the parameters are
+/// `(EnvUnowned, JObject this, JString path)`. The result feeds `setPaintable` (which skips
+/// `native_ref` for `0`). Registry-backed via [`record_bitmap_from_file`]; the nine-patch stretch
+/// metadata is inside the recorded PNG bytes for the deferred raster pass.
+extern "system" fn nine_patch_native_create_from_path<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    path: JString<'local>,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        if path.is_null() {
+            return Ok(0);
+        }
+        let path = path.try_to_string(env)?;
+        Ok(record_bitmap_from_file(
+            &path,
+            "NinePatchDrawable.nativeCreate",
+        ))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NinePatchDrawable.nativeCreate(byte[] chunk, long texture)` → the underlying recorded texture
+/// handle, or `0` for a dead one (2026-07-02).
+///
+/// JNI ABI: a private INSTANCE native returning `jlong` (installed classes3.dex
+/// `NinePatchDrawable.smali`, called from `<init>(Resources, Bitmap, byte[], Rect, String)` with
+/// the bitmap's `getTexture()` handle), so the parameters are
+/// `(EnvUnowned, JObject this, JByteArray chunk, jlong texture)`. In the recorded model the
+/// nine-patch paintable IS the underlying bitmap record (the chunk is stretch metadata the
+/// headless framework does not rasterize), so a live [`bitmap_registry`] `texture` passes through
+/// as the paintable; a stale/fabricated one yields `0` (logged), which `setPaintable` tolerates.
+extern "system" fn nine_patch_native_create_from_chunk<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    _chunk: JByteArray<'local>,
+    texture: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        match bitmap_registry::with_bitmap(texture, |_| ()) {
+            Ok(()) => Ok(texture),
+            Err(e) => {
+                tracing::debug!(
+                    target: "android.graphics.drawable.NinePatchDrawable",
+                    texture,
+                    error = %e,
+                    "NinePatchDrawable.nativeCreate: dead texture handle → 0 (no paintable)"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NinePatchDrawable.nativeSetTint(long paintable, int tint)` → no-op tint bookkeeping
+/// (2026-07-02).
+///
+/// JNI ABI: a private INSTANCE native returning void (installed classes3.dex
+/// `NinePatchDrawable.smali`, called from the `setTint(int)` override). ATL's C backing tints the
+/// GTK paintable; nothing reads the tint back and the headless model draws nothing, so a validated
+/// no-op is sound. The handle is not dereferenced.
+extern "system" fn nine_patch_native_set_tint<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    paintable: jlong,
+    tint: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.drawable.NinePatchDrawable",
+            paintable,
+            tint,
+            "NinePatchDrawable.nativeSetTint: no-op (headless recording)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for the drawable paintable-lifecycle natives:
+/// `android.graphics.drawable.Drawable` (`native_constructor`/`native_unref`/`native_invalidate`/
+/// `native_ref`/`native_draw`/`native_paintable_from_path`), `DrawableContainer`
+/// (`native_constructor`/`native_selectChild`), and `NinePatchDrawable` (`nativeCreate` ×2 /
+/// `nativeSetTint`).
+///
+/// MUST run before step 4, since a launcher's onCreate may load a drawable (the splash inflation
+/// does — `/tmp/eclipse-challenge5.log`). 2026-07-02: registered per-method best-effort (the
+/// 58a50f6 pattern, [`register_class_natives_best_effort`]) instead of one atomic array, so a
+/// framework-build drift on any single method cannot take the lifecycle-critical
+/// `native_constructor`/`native_ref` bindings down with it. ART resolves natives per DECLARING
+/// class, so the container/nine-patch classes get their own registrations.
 ///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointers must match the declared JNI signatures.
-/// They do — `native_constructor` `()J`, `native_unref` `(J)V` (static), `native_invalidate` `(J)V`
-/// (instance) — see each native's docs. Every native body is `catch_unwind`-guarded via
-/// [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
+/// Each fn pointer matches its declared JNI signature by construction (see each native's docs and
+/// the pin test `drawable_native_name_sig_and_class_match_art_reported`). Every native body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI
+/// boundary (AGENTS.md §2.8).
 fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(DRAWABLE_CLASS)?;
-    let methods = [
-        // SAFETY: `drawable_native_constructor` matches the paired `()J` signature as an instance
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                DRAWABLE_NATIVE_CONSTRUCTOR_NAME,
-                DRAWABLE_NATIVE_CONSTRUCTOR_SIG,
-                drawable_native_constructor as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `drawable_native_unref` matches the paired `(J)V` signature as a static native.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                DRAWABLE_NATIVE_UNREF_NAME,
-                DRAWABLE_NATIVE_UNREF_SIG,
-                drawable_native_unref as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `drawable_native_invalidate` matches the paired `(J)V` signature as an instance
-        // native (see the native's docs).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                DRAWABLE_NATIVE_INVALIDATE_NAME,
-                DRAWABLE_NATIVE_INVALIDATE_SIG,
-                drawable_native_invalidate as *mut std::ffi::c_void,
-            )
-        },
+    // SAFETY (per entry): each fn matches its paired descriptor — `native_constructor` `()J`
+    // (instance), `native_unref`/`native_invalidate`/`native_ref` `(J)V`, `native_draw` `(JJII)V`
+    // (instance), `native_paintable_from_path` `(Ljava/lang/String;)J` (static) — installed
+    // classes3.dex `Drawable.smali`, baksmali-confirmed 2026-07-02.
+    let drawable_bindings: [NativeBinding; 6] = [
+        (
+            DRAWABLE_NATIVE_CONSTRUCTOR_NAME,
+            DRAWABLE_NATIVE_CONSTRUCTOR_SIG,
+            drawable_native_constructor as *mut c_void,
+        ),
+        (
+            DRAWABLE_NATIVE_UNREF_NAME,
+            DRAWABLE_NATIVE_UNREF_SIG,
+            drawable_native_unref as *mut c_void,
+        ),
+        (
+            DRAWABLE_NATIVE_INVALIDATE_NAME,
+            DRAWABLE_NATIVE_INVALIDATE_SIG,
+            drawable_native_invalidate as *mut c_void,
+        ),
+        (
+            DRAWABLE_NATIVE_REF_NAME,
+            DRAWABLE_NATIVE_REF_SIG,
+            drawable_native_ref as *mut c_void,
+        ),
+        (
+            DRAWABLE_NATIVE_DRAW_NAME,
+            DRAWABLE_NATIVE_DRAW_SIG,
+            drawable_native_draw as *mut c_void,
+        ),
+        (
+            DRAWABLE_PAINTABLE_FROM_PATH_NAME,
+            DRAWABLE_PAINTABLE_FROM_PATH_SIG,
+            drawable_native_paintable_from_path as *mut c_void,
+        ),
     ];
-    // SAFETY: `class` is the loaded android/graphics/drawable/Drawable; the fn pointers' signatures
-    // match its `native_constructor`/`native_unref` (AOSP `Drawable.java` + the ART-reported signatures,
-    // surfaced by the run lines 2026-06-05).
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    let drawable_bound =
+        register_class_natives_best_effort(env, DRAWABLE_CLASS, &drawable_bindings)?;
+    // SAFETY (per entry): `native_constructor` `()J` + `native_selectChild` `(JJ)V`, both instance —
+    // installed classes3.dex `DrawableContainer.smali`, baksmali-confirmed 2026-07-02.
+    let container_bindings: [NativeBinding; 2] = [
+        (
+            DRAWABLE_NATIVE_CONSTRUCTOR_NAME,
+            DRAWABLE_NATIVE_CONSTRUCTOR_SIG,
+            drawable_container_native_constructor as *mut c_void,
+        ),
+        (
+            DRAWABLE_CONTAINER_SELECT_CHILD_NAME,
+            DRAWABLE_CONTAINER_SELECT_CHILD_SIG,
+            drawable_container_native_select_child as *mut c_void,
+        ),
+    ];
+    let container_bound =
+        register_class_natives_best_effort(env, DRAWABLE_CONTAINER_CLASS, &container_bindings)?;
+    // SAFETY (per entry): `nativeCreate` `(Ljava/lang/String;)J` / `([BJ)J` + `nativeSetTint`
+    // `(JI)V`, all private instance — installed classes3.dex `NinePatchDrawable.smali`,
+    // baksmali-confirmed 2026-07-02.
+    let nine_patch_bindings: [NativeBinding; 3] = [
+        (
+            NINE_PATCH_CREATE_NAME,
+            NINE_PATCH_CREATE_FROM_PATH_SIG,
+            nine_patch_native_create_from_path as *mut c_void,
+        ),
+        (
+            NINE_PATCH_CREATE_NAME,
+            NINE_PATCH_CREATE_FROM_CHUNK_SIG,
+            nine_patch_native_create_from_chunk as *mut c_void,
+        ),
+        (
+            NINE_PATCH_SET_TINT_NAME,
+            NINE_PATCH_SET_TINT_SIG,
+            nine_patch_native_set_tint as *mut c_void,
+        ),
+    ];
+    let nine_patch_bound =
+        register_class_natives_best_effort(env, NINE_PATCH_DRAWABLE_CLASS, &nine_patch_bindings)?;
     tracing::info!(
-        class = "android/graphics/drawable/Drawable",
-        "registered Eclipse's non-GTK backing for Drawable.native_constructor + native_unref + native_invalidate"
+        drawable_bound,
+        container_bound,
+        nine_patch_bound,
+        "registered Eclipse's non-GTK drawable paintable-lifecycle backing (Drawable.native_constructor + native_unref + native_invalidate + native_ref + native_draw + native_paintable_from_path; DrawableContainer.native_constructor + native_selectChild; NinePatchDrawable.nativeCreate ×2 + nativeSetTint) (per-method best-effort)"
+    );
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.graphics.BitmapFactory / Bitmap ================
+//
+// 2026-07-01: the styled-attribute string-pool fix (see [`ARSC_APP_COOKIE`]) lets
+// `Resources.loadDrawable` resolve file-path drawables for the first time, so its `.png` branch now
+// actually runs: `openNonAsset` → `BitmapFactory.decodeStream` → `nativeDecodeStream` →
+// `new Bitmap(texture)` → `native_get_width`/`native_get_height` (Bitmap.java line 51) →
+// `BitmapDrawable.paintable = bitmap.getTexture()`. ATL backs these with GTK (`GdkTexture`);
+// Eclipse's framework is HEADLESS (the view tree is recorded; the engine renders the screen), so
+// the faithful non-GTK backing is the same recording model every widget native uses: read the
+// encoded stream, parse the image header for the REAL dimensions, retain the bytes in
+// [`bitmap_registry`], and hand Java a generational-slab handle. Without these bindings the newly
+// reachable path would abort inflation with a call-time `UnsatisfiedLinkError` (an `Error`, so not
+// even `Resources.loadDrawable`'s `catch (Exception)` contains it) — the exact regression cliff the
+// challenge-fix validation boot must not hit. Pixel decode/raster stays the deferred render build.
+
+/// `android.graphics.BitmapFactory` (internal/slashed name for `find_class`).
+const BITMAP_FACTORY_CLASS: &JNIStr = jni_str!("android/graphics/BitmapFactory");
+/// `android.graphics.Bitmap` (internal/slashed name for `find_class`).
+const BITMAP_CLASS: &JNIStr = jni_str!("android/graphics/Bitmap");
+
+// `private static native long nativeDecodeStream(InputStream is, byte[] storage, Rect outPadding,
+// Options opts);` — BitmapFactory.java line 666.
+const BITMAP_FACTORY_DECODE_STREAM_NAME: &JNIStr = jni_str!("nativeDecodeStream");
+const BITMAP_FACTORY_DECODE_STREAM_SIG: &JNIStr = jni_str!(
+    "(Ljava/io/InputStream;[BLandroid/graphics/Rect;Landroid/graphics/BitmapFactory$Options;)J"
+);
+// `private static native int native_get_width(long texture);` / `..._get_height` — Bitmap.java
+// lines 236–237 (called by the `Bitmap(long texture)` constructor, line 51).
+const BITMAP_GET_WIDTH_NAME: &JNIStr = jni_str!("native_get_width");
+const BITMAP_GET_WIDTH_SIG: &JNIStr = jni_str!("(J)I");
+const BITMAP_GET_HEIGHT_NAME: &JNIStr = jni_str!("native_get_height");
+const BITMAP_GET_HEIGHT_SIG: &JNIStr = jni_str!("(J)I");
+// 2026-07-02: the Bitmap texture/snapshot LIFECYCLE natives (installed classes3.dex,
+// `Bitmap.smali`, all static) — reachable from the now-working BitmapDrawable pipeline:
+//   `native_recycle(JJ)V`        — `recycle()` (and `finalize()` → `recycle()`, so EVERY recorded
+//     bitmap hits it on GC) frees both peers; Eclipse's free bookkeeping on [`bitmap_registry`].
+//   `native_create_texture(JIIII)J` — `getTexture()` when `texture == 0` (a `createBitmap`-made or
+//     snapshot-converted Bitmap entering `BitmapDrawable`/`setImageBitmap`/`NinePatchDrawable`).
+//     ATL's GTK `GdkTexture` constructor — the exact GTK fallback Eclipse must not leave reachable.
+//   `native_create_snapshot(J)J` — `getSnapshot()` when `snapshot == 0` (`Canvas(Bitmap)` ctor and
+//     every Canvas op re-sync). Java MOVES the value between its `texture`/`snapshot` fields
+//     (zeroing the source), so in the recorded model both conversions are identity moves of the
+//     same registry record.
+//   `native_ref_texture(J)J`     — `createBitmap(Bitmap)` / `copy()` duplicate a texture; the
+//     recorded backing clones the record so each Bitmap owns an independently-recyclable handle.
+// The pixel-CONTENT natives (`native_erase_color`, `native_get_pixels`/`native_set_pixels`,
+// `native_copy_to_buffer`, `native_save_to_png`) stay unbound: their callers read pixel data back,
+// which the headless recording model cannot honestly serve — a clean call-time
+// `UnsatisfiedLinkError` is the correct discovery signal (deferred raster build, AGENTS.md §5).
+const BITMAP_RECYCLE_NAME: &JNIStr = jni_str!("native_recycle");
+const BITMAP_RECYCLE_SIG: &JNIStr = jni_str!("(JJ)V");
+const BITMAP_CREATE_TEXTURE_NAME: &JNIStr = jni_str!("native_create_texture");
+const BITMAP_CREATE_TEXTURE_SIG: &JNIStr = jni_str!("(JIIII)J");
+const BITMAP_CREATE_SNAPSHOT_NAME: &JNIStr = jni_str!("native_create_snapshot");
+const BITMAP_CREATE_SNAPSHOT_SIG: &JNIStr = jni_str!("(J)J");
+const BITMAP_REF_TEXTURE_NAME: &JNIStr = jni_str!("native_ref_texture");
+const BITMAP_REF_TEXTURE_SIG: &JNIStr = jni_str!("(J)J");
+
+/// Cap on how many encoded-image bytes [`bitmap_factory_native_decode_stream`] will buffer from one
+/// stream (2026-07-01). Resource images are ≤ a few MiB; the cap keeps a hostile/endless stream from
+/// exhausting memory while staying far above any legitimate drawable.
+const BITMAP_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Parse an encoded image header for its pixel dimensions (2026-07-01). Currently PNG (the format
+/// of this APK's file-backed drawables): 8-byte signature + the mandatory first IHDR chunk carrying
+/// big-endian width/height at byte offsets 16/20. Returns `None` for any other/truncated encoding —
+/// never panics (all access via `get`).
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    if bytes.get(..8)? != PNG_SIGNATURE {
+        return None;
+    }
+    // Chunk 1 must be IHDR per the PNG spec: length(4) + "IHDR"(4) + width(4 BE) + height(4 BE).
+    if bytes.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    Some((width, height))
+}
+
+/// Read an image FILE into a recorded [`bitmap_registry`] handle, or `0` when unreadable
+/// (2026-07-02). The file-path twin of [`bitmap_factory_native_decode_stream`]'s recording: real
+/// dimensions from the encoded header ([`png_dimensions`]; an unrecognized encoding records `0×0`
+/// with a WARN discovery signal), bytes retained verbatim, size capped by
+/// [`BITMAP_DECODE_MAX_BYTES`]. Shared by `Drawable.native_paintable_from_path` and
+/// `NinePatchDrawable.nativeCreate(String)`. `caller` labels the log lines.
+fn record_bitmap_from_file(path: &str, caller: &str) -> jlong {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::debug!(
+                target: "android.graphics.drawable.Drawable",
+                path,
+                caller,
+                error = %e,
+                "recorded-bitmap file read failed → 0 (no paintable)"
+            );
+            return 0;
+        }
+    };
+    if bytes.len() > BITMAP_DECODE_MAX_BYTES {
+        tracing::warn!(
+            target: "android.graphics.drawable.Drawable",
+            path,
+            caller,
+            len = bytes.len(),
+            cap = BITMAP_DECODE_MAX_BYTES,
+            "recorded-bitmap file exceeds the decode cap → 0 (no paintable)"
+        );
+        return 0;
+    }
+    let (width, height) = match png_dimensions(&bytes) {
+        Some((w, h)) => (
+            i32::try_from(w).unwrap_or(i32::MAX),
+            i32::try_from(h).unwrap_or(i32::MAX),
+        ),
+        None => {
+            tracing::warn!(
+                target: "android.graphics.drawable.Drawable",
+                path,
+                caller,
+                len = bytes.len(),
+                "recorded-bitmap file has an unrecognized image encoding (recorded 0×0)"
+            );
+            (0, 0)
+        }
+    };
+    match bitmap_registry::store(bitmap_registry::BitmapState {
+        width,
+        height,
+        bytes,
+    }) {
+        Ok(handle) => {
+            tracing::debug!(
+                target: "android.graphics.drawable.Drawable",
+                path,
+                caller,
+                handle,
+                width,
+                height,
+                "recorded bitmap from file (headless; no raster)"
+            );
+            handle
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "android.graphics.drawable.Drawable",
+                path,
+                caller,
+                error = %e,
+                "recorded-bitmap registry store failed → 0"
+            );
+            0
+        }
+    }
+}
+
+/// `BitmapFactory.nativeDecodeStream(InputStream is, byte[] storage, Rect outPadding, Options opts)`
+/// → a live [`bitmap_registry`] handle recording the image (2026-07-01).
+///
+/// JNI ABI: a `static` native returning `jlong`, so the parameters are
+/// `(EnvUnowned, JClass, JObject is, JByteArray storage, JObject outPadding, JObject opts)`.
+/// Reads the stream to EOF via `InputStream.read(byte[])` (using the caller's `storage` buffer when
+/// provided, else an own 8 KiB array), parses the encoded header for the REAL dimensions
+/// ([`png_dimensions`]), and stores `{width, height, bytes}` in [`bitmap_registry`]. An
+/// unrecognized encoding still returns a live handle (dimensions `0×0`, bytes retained) with a WARN
+/// — the total, headless-recording outcome; returning `0` would send `Bitmap.getTexture()` into the
+/// unbound GTK `native_create_texture` (`UnsatisfiedLinkError` aborting inflation).
+///
+/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
+/// `0` only on an internal JNI error (e.g. the stream `read` itself threw — `decodeStream`'s caller
+/// then fails as it would for a broken stream).
+extern "system" fn bitmap_factory_native_decode_stream<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    is: JObject<'local>,
+    storage: JByteArray<'local>,
+    _out_padding: JObject<'local>,
+    _opts: JObject<'local>,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        if is.is_null() {
+            return Ok(0); // no stream, no bitmap (decodeStream null-checks before calling).
+        }
+        // Use the caller-provided temp buffer when it exists (its AOSP purpose), else our own.
+        let buf = if !storage.is_null() && storage.len(env)? > 0 {
+            storage
+        } else {
+            env.new_byte_array(8192)?
+        };
+        let buf_len = buf.len(env)?;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let n = env
+                .call_method(&is, jni_str!("read"), jni_sig!("([B)I"), &[JValue::Object(&buf)])?
+                .i()?;
+            if n <= 0 {
+                break; // -1 = EOF (0 is defensive: never spin on a pathological stream).
+            }
+            let n = usize::try_from(n).unwrap_or(0).min(buf_len);
+            let mut chunk = vec![0i8; n];
+            buf.get_region(env, 0, &mut chunk)?;
+            bytes.extend(chunk.iter().map(|&b| u8::from_ne_bytes(b.to_ne_bytes())));
+            if bytes.len() > BITMAP_DECODE_MAX_BYTES {
+                tracing::warn!(
+                    target: "android.graphics.BitmapFactory",
+                    cap = BITMAP_DECODE_MAX_BYTES,
+                    "BitmapFactory.nativeDecodeStream: stream exceeds the decode cap → 0 (no bitmap)"
+                );
+                return Ok(0);
+            }
+        }
+        let (width, height) = match png_dimensions(&bytes) {
+            Some((w, h)) => (
+                i32::try_from(w).unwrap_or(i32::MAX),
+                i32::try_from(h).unwrap_or(i32::MAX),
+            ),
+            None => {
+                // Unrecognized encoding: record it 0×0 (headless — nothing samples the pixels) and
+                // leave a discovery signal for the format (e.g. JPEG/WebP header parsing).
+                tracing::warn!(
+                    target: "android.graphics.BitmapFactory",
+                    len = bytes.len(),
+                    "BitmapFactory.nativeDecodeStream: unrecognized image encoding (recorded 0×0)"
+                );
+                (0, 0)
+            }
+        };
+        match bitmap_registry::store(bitmap_registry::BitmapState {
+            width,
+            height,
+            bytes,
+        }) {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.graphics.BitmapFactory",
+                    handle,
+                    width,
+                    height,
+                    "BitmapFactory.nativeDecodeStream: recorded bitmap (headless; no raster)"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.BitmapFactory",
+                    error = %e,
+                    "BitmapFactory.nativeDecodeStream: registry store failed → 0"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Bitmap.native_get_width(long texture)` → the recorded width, or `0` for a bad handle
+/// (2026-07-01). Static native; validated through the bounds+generation-checked [`bitmap_registry`].
+extern "system" fn bitmap_native_get_width<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    texture: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(
+            bitmap_registry::with_bitmap(texture, |s| s.width).unwrap_or_else(|e| {
+                tracing::debug!(
+                    target: "android.graphics.Bitmap",
+                    texture,
+                    error = %e,
+                    "Bitmap.native_get_width: invalid bitmap handle → 0"
+                );
+                0
+            }),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Bitmap.native_get_height(long texture)` → the recorded height, or `0` for a bad handle
+/// (2026-07-01). Static native; validated through the bounds+generation-checked [`bitmap_registry`].
+extern "system" fn bitmap_native_get_height<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    texture: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(
+            bitmap_registry::with_bitmap(texture, |s| s.height).unwrap_or_else(|e| {
+                tracing::debug!(
+                    target: "android.graphics.Bitmap",
+                    texture,
+                    error = %e,
+                    "Bitmap.native_get_height: invalid bitmap handle → 0"
+                );
+                0
+            }),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Bitmap.native_recycle(long texture, long snapshot)` → free the recorded registry slots
+/// (2026-07-02). Static native (`Bitmap.recycle()`, also reached via `Bitmap.finalize()` on EVERY
+/// GC'd bitmap — the first splash-bitmap GC would otherwise throw a finalizer-thread
+/// `UnsatisfiedLinkError`). This is the ONE free bookkeeping in the recorded-bitmap model (ref/
+/// unref are no-ops), so retained encoded bytes are released when Java releases the Bitmap. `0` is
+/// the "no peer" value (skipped); a stale/fabricated handle is a bounds+generation-checked debug
+/// log, never UB. A `BitmapDrawable` paintable sharing the handle keeps the Bitmap strongly
+/// referenced (its `bitmap` field), so Java's own reachability ordering makes the free safe; any
+/// later call on the freed handle degrades to a validated stale-handle log.
+extern "system" fn bitmap_native_recycle<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    texture: jlong,
+    snapshot: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        for (label, handle) in [("texture", texture), ("snapshot", snapshot)] {
+            if handle == 0 {
+                continue;
+            }
+            match bitmap_registry::free(handle) {
+                Ok(()) => tracing::trace!(
+                    target: "android.graphics.Bitmap",
+                    peer = label,
+                    handle,
+                    "Bitmap.native_recycle: freed recorded bitmap"
+                ),
+                Err(e) => tracing::debug!(
+                    target: "android.graphics.Bitmap",
+                    peer = label,
+                    handle,
+                    error = %e,
+                    "Bitmap.native_recycle: dead handle (ignored)"
+                ),
+            }
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Bitmap.native_create_texture(long snapshot, int width, int height, int stride, int format)` →
+/// the texture-form handle for the record (2026-07-02). Static native (`Bitmap.getTexture()` when
+/// `texture == 0`) — ATL's GTK `GdkTexture` constructor, the exact GTK fallback that must not stay
+/// reachable-unbound now that `BitmapDrawable.<init>`/`setImageBitmap`/`NinePatchDrawable` call
+/// `getTexture()` on arbitrary Bitmaps. Java MOVES the value `snapshot` → `texture` (zeroing
+/// `snapshot`), so a live [`bitmap_registry`] `snapshot` passes through unchanged (identity move —
+/// same record, new owner field). `snapshot == 0` is a `createBitmap`-made surface with no content
+/// yet: record a fresh `{width, height, no bytes}` slot so `Bitmap(long)`-style readers and
+/// `native_recycle` stay exact. A stale nonzero handle yields `0` (logged; callers pass `0` around
+/// as "no texture"). `stride`/`format` are GDK memory-layout params with no recorded counterpart.
+extern "system" fn bitmap_native_create_texture<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    snapshot: jlong,
+    width: jint,
+    height: jint,
+    stride: jint,
+    format: jint,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        if snapshot != 0 {
+            return match bitmap_registry::with_bitmap(snapshot, |_| ()) {
+                Ok(()) => {
+                    tracing::trace!(
+                        target: "android.graphics.Bitmap",
+                        snapshot,
+                        "Bitmap.native_create_texture: identity move (snapshot record becomes the texture)"
+                    );
+                    Ok(snapshot)
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "android.graphics.Bitmap",
+                        snapshot,
+                        error = %e,
+                        "Bitmap.native_create_texture: dead snapshot handle → 0 (no texture)"
+                    );
+                    Ok(0)
+                }
+            };
+        }
+        match bitmap_registry::store(bitmap_registry::BitmapState {
+            width,
+            height,
+            bytes: Vec::new(),
+        }) {
+            Ok(handle) => {
+                tracing::debug!(
+                    target: "android.graphics.Bitmap",
+                    handle,
+                    width,
+                    height,
+                    stride,
+                    format,
+                    "Bitmap.native_create_texture: recorded blank createBitmap surface (headless)"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.Bitmap",
+                    error = %e,
+                    "Bitmap.native_create_texture: registry store failed → 0"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Bitmap.native_create_snapshot(long texture)` → the snapshot-form handle for the record
+/// (2026-07-02). Static native (`Bitmap.getSnapshot()` when `snapshot == 0` — the `Canvas(Bitmap)`
+/// ctor and every Canvas op re-sync). The exact mirror of [`bitmap_native_create_texture`]'s
+/// identity move: Java zeroes `texture` after this returns, so the record simply changes owner
+/// field. `0`/stale → `0` (logged for stale), never UB.
+extern "system" fn bitmap_native_create_snapshot<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    texture: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        if texture == 0 {
+            return Ok(0);
+        }
+        match bitmap_registry::with_bitmap(texture, |_| ()) {
+            Ok(()) => {
+                tracing::trace!(
+                    target: "android.graphics.Bitmap",
+                    texture,
+                    "Bitmap.native_create_snapshot: identity move (texture record becomes the snapshot)"
+                );
+                Ok(texture)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "android.graphics.Bitmap",
+                    texture,
+                    error = %e,
+                    "Bitmap.native_create_snapshot: dead texture handle → 0 (no snapshot)"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Bitmap.native_ref_texture(long texture)` → an independent duplicate of the record
+/// (2026-07-02). Static native (`Bitmap.createBitmap(Bitmap)` / `Bitmap.copy()` wrap the result in
+/// `new Bitmap(long)`, which reads it back through `native_get_width`/`native_get_height` — so a
+/// live handle is REQUIRED, not a sentinel). ATL refs the GTK texture; [`bitmap_registry`] has no
+/// refcount, so the honest recorded backing CLONES the record — each Bitmap then owns an
+/// independently-recyclable handle and `native_recycle` bookkeeping stays exact. A dead source
+/// handle yields `0` (the "decode failed" value `createBitmap`'s `Bitmap(long)` path tolerates as
+/// a `0×0` bitmap).
+extern "system" fn bitmap_native_ref_texture<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    texture: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        let cloned = bitmap_registry::with_bitmap(texture, |s| bitmap_registry::BitmapState {
+            width: s.width,
+            height: s.height,
+            bytes: s.bytes.clone(),
+        });
+        match cloned {
+            Ok(state) => match bitmap_registry::store(state) {
+                Ok(handle) => {
+                    tracing::debug!(
+                        target: "android.graphics.Bitmap",
+                        texture,
+                        handle,
+                        "Bitmap.native_ref_texture: duplicated recorded bitmap"
+                    );
+                    Ok(handle)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "android.graphics.Bitmap",
+                        texture,
+                        error = %e,
+                        "Bitmap.native_ref_texture: registry store failed → 0"
+                    );
+                    Ok(0)
+                }
+            },
+            Err(e) => {
+                tracing::debug!(
+                    target: "android.graphics.Bitmap",
+                    texture,
+                    error = %e,
+                    "Bitmap.native_ref_texture: dead texture handle → 0"
+                );
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `BitmapFactory.nativeDecodeStream` and
+/// `Bitmap.native_get_width`/`native_get_height` — the exact natives on
+/// `Resources.loadDrawable`'s newly-reachable `.png` path (see the section comment).
+///
+/// 2026-07-02: also binds the texture/snapshot LIFECYCLE natives (`native_recycle`,
+/// `native_create_texture`, `native_create_snapshot`, `native_ref_texture` — see the consts
+/// comment): `finalize()` reaches `native_recycle` on every GC'd bitmap, and `getTexture()`'s
+/// `native_create_texture` is ATL's GTK-texture constructor (the GTK fallback must not stay
+/// reachable-unbound). Registered per-method best-effort (the 58a50f6 pattern): a native this ATL
+/// build does not declare is skipped with a warn line instead of aborting the whole class
+/// registration. The pixel-CONTENT natives (`native_erase_color`, `native_get_pixels`/
+/// `native_set_pixels`, `native_copy_to_buffer`, `native_save_to_png`) stay unbound as call-time
+/// discovery signals — their callers read pixel data back, which the headless recording model
+/// cannot honestly serve.
+///
+/// # Safety / soundness
+/// `register_native_methods` is `unsafe`: the fn pointers must match the declared JNI signatures.
+/// They do — see each native's docs and the descriptor pin test
+/// `bitmap_native_names_sigs_and_classes_match_bitmap_java`. Every body is `catch_unwind`-guarded
+/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_bitmap_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // SAFETY: `bitmap_factory_native_decode_stream` matches the paired
+    // `(Ljava/io/InputStream;[BLandroid/graphics/Rect;Landroid/graphics/BitmapFactory$Options;)J`
+    // static native (BitmapFactory.java line 666).
+    let factory_bindings: [NativeBinding; 1] = [(
+        BITMAP_FACTORY_DECODE_STREAM_NAME,
+        BITMAP_FACTORY_DECODE_STREAM_SIG,
+        bitmap_factory_native_decode_stream as *mut c_void,
+    )];
+    let factory_bound =
+        register_class_natives_best_effort(env, BITMAP_FACTORY_CLASS, &factory_bindings)?;
+    // SAFETY: `bitmap_native_get_width`/`bitmap_native_get_height` match the paired `(J)I` static
+    // natives (Bitmap.java lines 236–237); `bitmap_native_recycle` `(JJ)V`,
+    // `bitmap_native_create_texture` `(JIIII)J`, `bitmap_native_create_snapshot` `(J)J`, and
+    // `bitmap_native_ref_texture` `(J)J` match the static natives in the installed classes3.dex
+    // `Bitmap.smali` (baksmali-confirmed 2026-07-02).
+    let bitmap_bindings: [NativeBinding; 6] = [
+        (
+            BITMAP_GET_WIDTH_NAME,
+            BITMAP_GET_WIDTH_SIG,
+            bitmap_native_get_width as *mut c_void,
+        ),
+        (
+            BITMAP_GET_HEIGHT_NAME,
+            BITMAP_GET_HEIGHT_SIG,
+            bitmap_native_get_height as *mut c_void,
+        ),
+        (
+            BITMAP_RECYCLE_NAME,
+            BITMAP_RECYCLE_SIG,
+            bitmap_native_recycle as *mut c_void,
+        ),
+        (
+            BITMAP_CREATE_TEXTURE_NAME,
+            BITMAP_CREATE_TEXTURE_SIG,
+            bitmap_native_create_texture as *mut c_void,
+        ),
+        (
+            BITMAP_CREATE_SNAPSHOT_NAME,
+            BITMAP_CREATE_SNAPSHOT_SIG,
+            bitmap_native_create_snapshot as *mut c_void,
+        ),
+        (
+            BITMAP_REF_TEXTURE_NAME,
+            BITMAP_REF_TEXTURE_SIG,
+            bitmap_native_ref_texture as *mut c_void,
+        ),
+    ];
+    let bitmap_bound = register_class_natives_best_effort(env, BITMAP_CLASS, &bitmap_bindings)?;
+    tracing::info!(
+        factory_bound,
+        bitmap_bound,
+        "registered Eclipse's non-GTK recorded-bitmap backing (BitmapFactory.nativeDecodeStream + Bitmap.native_get_width/height + native_recycle + native_create_texture + native_create_snapshot + native_ref_texture)"
     );
     Ok(())
 }
@@ -11792,10 +13002,15 @@ fn drive_lifecycle(
     // add/removeView record tree edges; progress/indeterminate/max/adapter/compound-drawable are
     // validated-handle no-ops (no chrome drawn, no bound getter reads them back).
     register_widget_property_setter_natives(env)?;
-    // Bind android.graphics.drawable.Drawable's native_constructor on its own class — a launcher's
-    // onCreate may load a drawable during step 5 (e.g. AdaptiveIconDemo's getDrawable), so this must be
-    // bound before step 4. GTK-free; returns a non-zero non-pointer sentinel (no draw pass runs).
+    // Bind the drawable paintable-lifecycle natives (Drawable + DrawableContainer +
+    // NinePatchDrawable, each on its own declaring class) — a launcher's onCreate loads drawables
+    // during step 5 (the splash inflation's BitmapDrawable hit the unbound native_ref,
+    // /tmp/eclipse-challenge5.log 2026-07-02), so this must be bound before step 4. GTK-free:
+    // sentinels/registry handles + validated no-ops (the engine renders; the tree is recorded).
     register_drawable_natives(env)?;
+    // 2026-07-01: the recorded-bitmap backing on Resources.loadDrawable's `.png` path (reachable
+    // now that styled-attribute TYPE_STRING values resolve — see the BitmapFactory section note).
+    register_bitmap_natives(env)?;
     // Bind android.view.ViewGroup's tree-wiring natives on its own class — setContentView's
     // LayoutInflater wires children via ViewGroup.addView during step 5, so this must be bound before
     // step 4. Bound non-GTK against view_registry (records the tree edges).
@@ -12486,6 +13701,7 @@ mod tests {
             ThemeAttr {
                 type_: 0x12,
                 data: 0xffff_ffff,
+                source_package: 0x7f,
             },
         );
         let e = resolve_theme_attr(&attrs, win_action_bar).expect("present attr resolves");
@@ -12518,6 +13734,7 @@ mod tests {
             ThemeAttr {
                 type_: TYPE_ATTRIBUTE,
                 data: u32::from_ne_bytes(target.to_ne_bytes()),
+                source_package: 0x7f,
             },
         );
         attrs.insert(
@@ -12525,6 +13742,7 @@ mod tests {
             ThemeAttr {
                 type_: 0x10,
                 data: 7,
+                source_package: 0x7f,
             },
         );
         let e = resolve_theme_attr(&attrs, alias).expect("indirection resolves");
@@ -12539,11 +13757,160 @@ mod tests {
             ThemeAttr {
                 type_: TYPE_ATTRIBUTE,
                 data: u32::from_ne_bytes(a.to_ne_bytes()),
+                source_package: 0x7f,
             },
         );
         // Must return (not hang); the value stays the unresolved attribute reference.
         let e = resolve_theme_attr(&cyc, a).expect("cycle terminates with a value");
         assert_eq!(e.value_type, i32::from(TYPE_ATTRIBUTE));
+    }
+
+    #[test]
+    fn styled_type_string_cookie_routes_to_the_owning_pool() {
+        // 2026-07-01 regression guard tied to the confirmed challenge-boot root cause
+        // (/tmp/eclipse-challenge3.log): a styled TYPE_STRING resolved through resources.arsc was
+        // written with the XmlBlock cookie (-1), so TypedArray.loadStringValueAt resolved the ARSC
+        // pool index against the LAYOUT XmlBlock's pool → null → `Resource is not a Drawable
+        // (color or path): TypedValue{t=0x3/d=0x456 "<null>" a=-1 r=0x7f080173}` for EVERY
+        // file-path drawable/color/font reached via TypedArray or a theme, all boot long.
+        use crate::framework::theme_registry::ThemeAttr;
+
+        // A theme bag's TYPE_STRING is ALWAYS ARSC-sourced: the cookie must name its table.
+        let mut attrs = std::collections::HashMap::new();
+        let app_attr = u32_to_i32(0x7f01_0010);
+        attrs.insert(
+            app_attr,
+            ThemeAttr {
+                type_: TYPE_STRING,
+                data: 0x456, // an ARSC global-pool index, NOT an XmlBlock index
+                source_package: 0x7f,
+            },
+        );
+        let fw_attr = u32_to_i32(0x0101_0010);
+        attrs.insert(
+            fw_attr,
+            ThemeAttr {
+                type_: TYPE_STRING,
+                data: 7,
+                source_package: 0x01,
+            },
+        );
+        let e = resolve_theme_attr(&attrs, app_attr).expect("app-table string resolves");
+        assert_eq!(
+            e.asset_cookie, ARSC_APP_COOKIE,
+            "an app-table theme string must carry the app ARSC cookie (was -1 → the null-string bug)"
+        );
+        let e = resolve_theme_attr(&attrs, fw_attr).expect("framework-table string resolves");
+        assert_eq!(
+            e.asset_cookie, ARSC_FRAMEWORK_COOKIE,
+            "a framework-table theme string must carry the framework ARSC cookie"
+        );
+
+        // An INLINE XML string (no reference chase) genuinely lives in the XmlBlock pool: -1 stays.
+        let inline = resolve_inline_attr_value(TYPE_STRING, 42);
+        assert_eq!(
+            inline.asset_cookie, XML_BLOCK_COOKIE,
+            "an inline XmlBlock string keeps the XmlBlock cookie"
+        );
+        // Non-string values keep the neutral 0 cookie.
+        let non_string = resolve_inline_attr_value(0x10, 5);
+        assert_eq!(non_string.asset_cookie, 0);
+    }
+
+    #[test]
+    fn png_dimensions_parses_ihdr_and_rejects_non_png() {
+        // 2026-07-01: the recorded-bitmap decode parses the PNG IHDR for the REAL dimensions
+        // Bitmap(long) reads back via native_get_width/height. Minimal valid prefix: signature +
+        // IHDR length/tag + width/height (the rest of the chunk is irrelevant to the parse).
+        let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&48u32.to_be_bytes());
+        png.extend_from_slice(&24u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), Some((48, 24)));
+
+        assert_eq!(png_dimensions(b"not a png at all"), None, "wrong signature");
+        assert_eq!(png_dimensions(&png[..12]), None, "truncated before IHDR");
+        let mut wrong_chunk = png.clone();
+        wrong_chunk[12..16].copy_from_slice(b"IDAT");
+        assert_eq!(png_dimensions(&wrong_chunk), None, "first chunk not IHDR");
+    }
+
+    #[test]
+    fn bitmap_native_names_sigs_and_classes_match_bitmap_java() {
+        // Pin the recorded-bitmap natives against the vendored ATL sources (2026-07-01):
+        // BitmapFactory.java line 666 `private static native long nativeDecodeStream(InputStream is,
+        // byte[] storage, Rect outPadding, Options opts);` and Bitmap.java lines 236–237
+        // `private static native int native_get_width(long texture);` / `..._get_height`. A
+        // transcription regression would surface as a boot-time NoSuchMethodError (best-effort skip)
+        // and re-open the UnsatisfiedLinkError inflation abort on the `.png` drawable path.
+        assert_eq!(
+            BITMAP_FACTORY_CLASS.to_str(),
+            "android/graphics/BitmapFactory"
+        );
+        assert_eq!(BITMAP_CLASS.to_str(), "android/graphics/Bitmap");
+        assert_eq!(
+            BITMAP_FACTORY_DECODE_STREAM_NAME.to_str(),
+            "nativeDecodeStream"
+        );
+        assert_eq!(
+            BITMAP_FACTORY_DECODE_STREAM_SIG.to_str(),
+            "(Ljava/io/InputStream;[BLandroid/graphics/Rect;Landroid/graphics/BitmapFactory$Options;)J"
+        );
+        assert_eq!(BITMAP_GET_WIDTH_NAME.to_str(), "native_get_width");
+        assert_eq!(BITMAP_GET_WIDTH_SIG.to_str(), "(J)I");
+        assert_eq!(BITMAP_GET_HEIGHT_NAME.to_str(), "native_get_height");
+        assert_eq!(BITMAP_GET_HEIGHT_SIG.to_str(), "(J)I");
+        // 2026-07-02: the texture/snapshot lifecycle natives from the installed classes3.dex
+        // Bitmap.smali (all static). native_recycle is reached by finalize() on EVERY GC'd bitmap;
+        // native_create_texture is getTexture()'s GTK-texture constructor (the GTK fallback that
+        // must never be reachable-unbound). A transcription regression surfaces as a boot-time
+        // best-effort skip → a call-time UnsatisfiedLinkError on the drawable/bitmap path.
+        assert_eq!(BITMAP_RECYCLE_NAME.to_str(), "native_recycle");
+        assert_eq!(BITMAP_RECYCLE_SIG.to_str(), "(JJ)V");
+        assert_eq!(BITMAP_CREATE_TEXTURE_NAME.to_str(), "native_create_texture");
+        assert_eq!(BITMAP_CREATE_TEXTURE_SIG.to_str(), "(JIIII)J");
+        assert_eq!(
+            BITMAP_CREATE_SNAPSHOT_NAME.to_str(),
+            "native_create_snapshot"
+        );
+        assert_eq!(BITMAP_CREATE_SNAPSHOT_SIG.to_str(), "(J)J");
+        assert_eq!(BITMAP_REF_TEXTURE_NAME.to_str(), "native_ref_texture");
+        assert_eq!(BITMAP_REF_TEXTURE_SIG.to_str(), "(J)J");
+    }
+
+    #[test]
+    fn record_bitmap_from_file_records_dimensions_and_is_total_on_bad_paths() {
+        // 2026-07-02: the file-path twin of the nativeDecodeStream recording, shared by
+        // Drawable.native_paintable_from_path + NinePatchDrawable.nativeCreate(String). A valid
+        // PNG file records its REAL IHDR dimensions; a missing file is the tolerated 0 ("no
+        // paintable" — Drawable(long) refs it unconditionally through Eclipse's no-op native_ref).
+        let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&32u32.to_be_bytes());
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-record-bitmap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("probe.png");
+        std::fs::write(&path, &png).expect("write probe png");
+
+        let handle = record_bitmap_from_file(&path.to_string_lossy(), "test");
+        assert_ne!(handle, 0, "a readable PNG must yield a live handle");
+        let (w, h) = bitmap_registry::with_bitmap(handle, |s| (s.width, s.height))
+            .expect("recorded state readable");
+        assert_eq!((w, h), (64, 32), "IHDR dimensions recorded");
+        bitmap_registry::free(handle).expect("free recorded bitmap");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        let missing = dir.join("does-not-exist.png");
+        assert_eq!(
+            record_bitmap_from_file(&missing.to_string_lossy(), "test"),
+            0,
+            "an unreadable path is the tolerated 0 (no paintable), never a panic"
+        );
     }
 
     #[test]
@@ -12560,6 +13927,7 @@ mod tests {
                 theme_registry::ThemeAttr {
                     type_: 0x12,
                     data: 1,
+                    source_package: 0x7f,
                 },
             );
         })
@@ -12595,6 +13963,7 @@ mod tests {
                 theme_registry::ThemeAttr {
                     type_: 0x10, // TYPE_INT_DEC
                     data: 42,
+                    source_package: 0x7f,
                 },
             );
         })
@@ -12793,9 +14162,29 @@ mod tests {
             ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG.to_str(),
             "(JILandroid/util/TypedValue;Z)I"
         );
+        // getPooledString: AssetManager.java line 286 (`/*package*/ native final CharSequence
+        // getPooledString(int block, int id);`) — TypedArray.loadStringValueAt's cookie >= 0 route
+        // (2026-07-01). A transcription regression is a call-time UnsatisfiedLinkError the first
+        // time a styled TYPE_STRING resolves through resources.arsc.
+        assert_eq!(
+            ASSET_MANAGER_GET_POOLED_STRING_NAME.to_str(),
+            "getPooledString"
+        );
+        assert_eq!(
+            ASSET_MANAGER_GET_POOLED_STRING_SIG.to_str(),
+            "(II)Ljava/lang/CharSequence;"
+        );
         assert_eq!(CHAR_SEQUENCE_SIG.to_str(), "Ljava/lang/CharSequence;");
         assert_eq!(RES_VALUE_TYPE_STRING, 0x03);
         assert_eq!(ECLIPSE_ASSET_COOKIE, 1);
+        // 2026-07-01: the ARSC string-pool cookies must stay non-negative (TypedArray routes
+        // `cookie < 0` to the XmlBlock pool) and must agree with getPooledString's dispatch.
+        assert_eq!(ARSC_APP_COOKIE, 1);
+        assert_eq!(ARSC_FRAMEWORK_COOKIE, 2);
+        assert_eq!(arsc_cookie_for(0x7f08_0173), ARSC_APP_COOKIE);
+        assert_eq!(arsc_cookie_for(0x0108_0000), ARSC_FRAMEWORK_COOKIE);
+        assert_eq!(arsc_cookie_for_package(0x7f), ARSC_APP_COOKIE);
+        assert_eq!(arsc_cookie_for_package(0x01), ARSC_FRAMEWORK_COOKIE);
         // Pin the run-confirmed AOSP TypedArray window layout the styled-attribute natives write
         // (corrected 2026-06-05: stride 7, TYPE@0, DATA@1, ASSET_COOKIE@2, RESOURCE_ID@3 — the
         // standard AOSP API 29+ layout, corroborated by the runtime `R.styleable.View_id`=9 read).
@@ -13158,6 +14547,11 @@ mod tests {
         assert_eq!(ASSET_MANAGER_READ_ASSET_NAME.to_str(), "readAsset");
         // ATL's readAsset uses long off/len (run log 2026-06-11), not the classic AOSP int/int.
         assert_eq!(ASSET_MANAGER_READ_ASSET_SIG.to_str(), "(J[BJJ)I");
+        // 2026-07-02: readAssetChar — the single-byte AssetInputStream.read() native
+        // (AssetManager.java line 685); a transcription drift leaves one-byte reads an
+        // UnsatisfiedLinkError.
+        assert_eq!(ASSET_MANAGER_READ_ASSET_CHAR_NAME.to_str(), "readAssetChar");
+        assert_eq!(ASSET_MANAGER_READ_ASSET_CHAR_SIG.to_str(), "(J)I");
         assert_eq!(ASSET_MANAGER_SEEK_ASSET_NAME.to_str(), "seekAsset");
         assert_eq!(ASSET_MANAGER_SEEK_ASSET_SIG.to_str(), "(JJI)J");
         assert_eq!(
@@ -13246,6 +14640,159 @@ mod tests {
             asset_fd_for(apk_path, "assets/compressed.bin"),
             Err(AssetFdError::Compressed)
         ));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn atl_read_asset_return_maps_eof_to_zero_and_errors_negative() {
+        // 2026-07-02: the confirmed root cause of the challenge4 splash-PNG boot abort — ATL's
+        // `readAsset_internal` (vendored AssetManager.java line 592) throws IOException for ANY
+        // negative native return and itself maps 0 → the InputStream -1 EOF. Returning the AOSP
+        // convention (-1 at EOF) turned EVERY AssetInputStream read-to-EOF into IOException
+        // (fatal once the drawable fix made BitmapFactory.nativeDecodeStream consume the splash
+        // PNG's stream to EOF).
+        assert_eq!(atl_read_asset_return(&Ok(vec![7u8; 3])), 3);
+        assert_eq!(
+            atl_read_asset_return(&Ok(Vec::new())),
+            0,
+            "EOF must be 0 (Java maps it to -1); any negative throws IOException"
+        );
+        assert_eq!(
+            atl_read_asset_return(&Err(asset_registry::AssetRegistryError::StaleHandle)),
+            -1,
+            "only a genuine error is negative (→ the designed IOException)"
+        );
+    }
+
+    #[test]
+    fn atl_seek_whence_translation_matches_asset_input_stream_callers() {
+        // 2026-07-02: ATL's AssetInputStream uses the AOSP Java whence convention — mark() is
+        // `seekAsset(0, 0)` (query CURrent), reset() is `seekAsset(mMarkPos, -1)` (SET), skip(n)
+        // is `seekAsset(n, 0)` (CUR) — exactly AOSP android_util_AssetManager.cpp's mapping.
+        // Passing whence through raw (lseek: 0 = SET) made mark() REWIND the stream.
+        assert_eq!(atl_seek_whence_to_lseek(-1), 0, "whence < 0 is SET");
+        assert_eq!(atl_seek_whence_to_lseek(0), 1, "whence 0 is CUR");
+        assert_eq!(atl_seek_whence_to_lseek(1), 2, "whence > 0 is END");
+    }
+
+    #[test]
+    fn root_relative_res_entry_serves_open_read_seek_and_length_via_the_shared_rule() {
+        // 2026-07-02: the challenge4 regression class end-to-end over a zip fixture (no APK
+        // dependency): an APK-root-relative `res/…` entry — the ATL openNonAsset contract
+        // Resources.loadDrawable uses for file-path drawables — must be servable through the SAME
+        // code paths the Java natives call: the byte/open path (openAsset → read_asset_bytes),
+        // the opened stream's read/seek/length cycle under the ATL return contracts, and the fd
+        // path (openAssetFd → asset_fd_for, which used to prepend `assets/` unconditionally).
+        use std::io::{Read, Seek, SeekFrom, Write};
+        // A minimal PNG (signature + IHDR w=2 h=3) — the splash asset's shape.
+        const PNG: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, // signature
+            0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R', // IHDR length + tag
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, // width=2, height=3
+            0x08, 0x06, 0x00, 0x00, 0x00, // bit depth / color / etc.
+        ];
+        const CFG: &[u8] = b"cfg-bytes";
+        let mut zip_bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer
+                .start_file("res/drawable-hdpi-v4/roblox_logo.png", stored)
+                .expect("start res entry");
+            writer.write_all(PNG).expect("write res entry");
+            writer
+                .start_file("assets/config.txt", stored)
+                .expect("start assets entry");
+            writer.write_all(CFG).expect("write assets entry");
+            writer.finish().expect("finish zip");
+        }
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eclipse-root-relative-asset-test-{:?}.apk",
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &zip_bytes).expect("write fixture apk");
+        let apk_path = path.to_str().expect("utf-8 temp path");
+
+        // (a) The open/byte path: the exact root-relative entry, the assets-relative form, and
+        // the already-prefixed form all resolve via the ONE candidate rule; a prefixed miss is a
+        // genuine miss (no assets/assets/ double prefix, no res/ mangling).
+        let bytes = read_asset_bytes_from(apk_path, "res/drawable-hdpi-v4/roblox_logo.png")
+            .expect("root-relative res entry must open");
+        assert_eq!(bytes, PNG);
+        assert_eq!(
+            read_asset_bytes_from(apk_path, "config.txt").as_deref(),
+            Some(CFG)
+        );
+        assert_eq!(
+            read_asset_bytes_from(apk_path, "assets/config.txt").as_deref(),
+            Some(CFG)
+        );
+        assert!(read_asset_bytes_from(apk_path, "assets/roblox_logo.png").is_none());
+
+        // (b) The opened stream's read/seek/length cycle (what readAsset/seekAsset/getAssetLength/
+        // getAssetRemainingLength drive) under the ATL contracts.
+        let handle = asset_registry::store(bytes).expect("store opened asset");
+        assert_eq!(
+            asset_registry::with_stream(handle, |s| s.len()),
+            Ok(PNG.len())
+        );
+        let read_chunk = |want: usize| {
+            asset_registry::with_stream(handle, |s| {
+                let mut buf = vec![0u8; want];
+                let n = s.read(&mut buf);
+                buf.truncate(n);
+                buf
+            })
+        };
+        let full = read_chunk(PNG.len() + 8);
+        assert_eq!(
+            atl_read_asset_return(&full),
+            i32::try_from(PNG.len()).expect("fits"),
+            "a data read returns the byte count"
+        );
+        assert_eq!(full.as_deref(), Ok(PNG));
+        assert_eq!(
+            atl_read_asset_return(&read_chunk(16)),
+            0,
+            "the terminal EOF read must map to 0 — -1 makes ATL's readAsset_internal throw \
+             IOException (the challenge4 splash fatal)"
+        );
+        // reset() (`seekAsset(pos, -1)` = SET) rewinds; mark() (`seekAsset(0, 0)` = CUR) is a
+        // position QUERY and must NOT move the cursor.
+        assert_eq!(
+            asset_registry::with_stream(handle, |s| s.seek(0, atl_seek_whence_to_lseek(-1))),
+            Ok(0)
+        );
+        assert_eq!(
+            asset_registry::with_stream(handle, |s| s.remaining()),
+            Ok(PNG.len())
+        );
+        drop(read_chunk(4)); // advance the cursor to 4
+        assert_eq!(
+            asset_registry::with_stream(handle, |s| s.seek(0, atl_seek_whence_to_lseek(0))),
+            Ok(4),
+            "mark()'s whence-0 seek reports the current position"
+        );
+        assert_eq!(
+            asset_registry::with_stream(handle, |s| s.remaining()),
+            Ok(PNG.len() - 4),
+            "the whence-0 position query must not rewind the stream"
+        );
+        asset_registry::free(handle).expect("free");
+
+        // (c) The fd path serves the root-relative Stored entry through the same rule.
+        let (fd, offset, length) = asset_fd_for(apk_path, "res/drawable-hdpi-v4/roblox_logo.png")
+            .expect("root-relative res entry must be fd-servable");
+        assert_eq!(length, PNG.len() as u64);
+        // SAFETY: `fd` was freshly opened by asset_fd_for and is owned by this test (never handed
+        // to Java); from_raw_fd adoption closes it exactly once when `file` drops.
+        let mut file: std::fs::File = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
+        file.seek(SeekFrom::Start(offset)).expect("seek to offset");
+        let mut got = vec![0u8; PNG.len()];
+        file.read_exact(&mut got).expect("read entry bytes");
+        assert_eq!(got, PNG);
         std::fs::remove_file(&path).ok();
     }
 
@@ -14064,9 +15611,55 @@ mod tests {
             "native_invalidate"
         );
         assert_eq!(DRAWABLE_NATIVE_INVALIDATE_SIG.to_str(), "(J)V");
+        // 2026-07-02: the paintable-lifecycle set from the INSTALLED dex (baksmali classes3.dex —
+        // the vendored Drawable.java has drifted and lacks setPaintable/native_ref entirely).
+        // native_ref was the /tmp/eclipse-challenge5.log splash abort (`No implementation found for
+        // void android.graphics.drawable.Drawable.native_ref(long)` from BitmapDrawable.<init> →
+        // setPaintable); a transcription regression re-opens that UnsatisfiedLinkError cliff.
+        assert_eq!(DRAWABLE_NATIVE_REF_NAME.to_str(), "native_ref");
+        assert_eq!(DRAWABLE_NATIVE_REF_SIG.to_str(), "(J)V");
+        assert_eq!(DRAWABLE_NATIVE_DRAW_NAME.to_str(), "native_draw");
+        assert_eq!(DRAWABLE_NATIVE_DRAW_SIG.to_str(), "(JJII)V");
+        assert_eq!(
+            DRAWABLE_PAINTABLE_FROM_PATH_NAME.to_str(),
+            "native_paintable_from_path"
+        );
+        assert_eq!(
+            DRAWABLE_PAINTABLE_FROM_PATH_SIG.to_str(),
+            "(Ljava/lang/String;)J"
+        );
+        // DrawableContainer declares its OWN native_constructor (ART resolves per declaring class)
+        // plus native_selectChild — the StateListDrawable/AnimationDrawable (<selector>/
+        // <animation-list>) base on the same loadDrawable pipeline.
+        assert_eq!(
+            DRAWABLE_CONTAINER_CLASS.to_str(),
+            "android/graphics/drawable/DrawableContainer"
+        );
+        assert_eq!(
+            DRAWABLE_CONTAINER_SELECT_CHILD_NAME.to_str(),
+            "native_selectChild"
+        );
+        assert_eq!(DRAWABLE_CONTAINER_SELECT_CHILD_SIG.to_str(), "(JJ)V");
+        // NinePatchDrawable's private natives — reached by `.9.png` file-path drawables
+        // (createFromResourceStream/createFromPath route them to the NinePatchDrawable ctors).
+        assert_eq!(
+            NINE_PATCH_DRAWABLE_CLASS.to_str(),
+            "android/graphics/drawable/NinePatchDrawable"
+        );
+        assert_eq!(NINE_PATCH_CREATE_NAME.to_str(), "nativeCreate");
+        assert_eq!(
+            NINE_PATCH_CREATE_FROM_PATH_SIG.to_str(),
+            "(Ljava/lang/String;)J"
+        );
+        assert_eq!(NINE_PATCH_CREATE_FROM_CHUNK_SIG.to_str(), "([BJ)J");
+        assert_eq!(NINE_PATCH_SET_TINT_NAME.to_str(), "nativeSetTint");
+        assert_eq!(NINE_PATCH_SET_TINT_SIG.to_str(), "(JI)V");
         // Java's Drawable.<init> registers mNativePtr for native-allocation cleanup; it must be non-zero
         // (and is a plainly-non-pointer marker, never dereferenced — see register_drawable_natives docs).
         assert_ne!(DRAWABLE_HANDLE_SENTINEL, 0);
+        // Same non-zero contract for the container sentinel; distinct so log lines tell them apart.
+        assert_ne!(DRAWABLE_CONTAINER_HANDLE_SENTINEL, 0);
+        assert_ne!(DRAWABLE_CONTAINER_HANDLE_SENTINEL, DRAWABLE_HANDLE_SENTINEL);
     }
 
     #[test]
