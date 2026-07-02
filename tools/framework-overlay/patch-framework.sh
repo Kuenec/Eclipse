@@ -6,7 +6,7 @@
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
 #   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*, KeyguardManager*)
-#   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + Vibrator = installed classes + AOSP gaps
+#   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + Vibrator + AutofillManager + CookieManager + JobParameters + Paint = installed classes + AOSP gaps
 #   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
@@ -297,9 +297,27 @@ n="$(grep -cF '.method public getExtras()Landroid/os/PersistableBundle;' "$jpm")
 perl -0pi -e 's{(\.method public getExtras\(\)Landroid/os/PersistableBundle;.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP JobParameters.getNetwork() (API 28); ATL omits it. Returns null (no Network bound — AOSP-valid; the caller handles null).\n.method public getNetwork()Landroid/net/Network;\n    .locals 1\n\n    const/4 v0, 0x0\n\n    return-object v0\n.end method\n}s' "$jpm"
 grep -qF 'getNetwork()Landroid/net/Network;' "$jpm" || fail "JobParameters.smali getNetwork insert failed (drift?)"
 
+# Paint.set(Paint) self-set guard — AOSP Paint.set(Paint src) no-ops a self-set (its `if (this != src)`
+# guard), but ATL's set(Paint) has NO guard and calls native_recycle(this.paint) BEFORE
+# native_clone(paint.paint), so `p.set(p)` hands native_clone a just-freed handle: a use-after-free under
+# ATL's own reference C native, and under Eclipse's paint registry a StaleHandle that degrades the paint
+# to a FRESH DEFAULT (warn-logged) — losing the recorded color/alpha/style/cap/join/width/text-size that
+# AOSP's set(Paint) contract preserves (2026-07-02 review finding on the Paint-native pass). Insert the
+# AOSP self-set guard at method entry. Anchor on the unique set(Paint) + a whole-body pristine check
+# (the onPostCreate ANCHOR_PC pattern) so installed drift fails loud, never a silent mis-insert.
+psm="$work/smali/android/graphics/Paint.smali"
+[ -f "$psm" ] || fail "Paint.smali not found after baksmali"
+n="$(grep -cF '.method public set(Landroid/graphics/Paint;)V' "$psm")" || true
+[ "$n" = "1" ] || fail "Paint.smali set(Paint) anchor not unique (found $n, expected 1) — installed Paint drifted; update patch-framework.sh"
+ANCHOR_PSET=$'.method public set(Landroid/graphics/Paint;)V\n    .registers 4\n\n    iget-wide v0, p0, Landroid/graphics/Paint;->paint:J\n\n    invoke-static {v0, v1}, Landroid/graphics/Paint;->native_recycle(J)V\n\n    iget-wide v0, p1, Landroid/graphics/Paint;->paint:J\n\n    invoke-static {v0, v1}, Landroid/graphics/Paint;->native_clone(J)J\n\n    move-result-wide v0\n\n    iput-wide v0, p0, Landroid/graphics/Paint;->paint:J\n\n    return-void\n.end method'
+ANCHOR_PSET="$ANCHOR_PSET" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_PSET}) >= 0) ? 0 : 1)' "$psm" || fail "Paint.smali set(Paint) body changed from the expected recycle-before-clone shape — installed Paint drifted; update patch-framework.sh"
+! grep -qF ':eclipse_not_self_set' "$psm" || fail "Paint.smali already carries the self-set guard — installed Paint drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public set\(Landroid/graphics/Paint;\)V\n    \.registers 4\n)}{$1\n    # ECLIPSE PATCH 2026-07-02: AOSP self-set guard — AOSP Paint.set(Paint src) no-ops when src == this.\n    # ATL recycles this.paint BEFORE cloning paint.paint, so an unguarded self-set clones a freed\n    # handle (use-after-free in the ATL reference C native; a warn-logged reset to a DEFAULT paint\n    # under the Eclipse paint registry, where AOSP preserves the state). Guard restores the contract.\n    if-ne p0, p1, :eclipse_not_self_set\n\n    return-void\n\n    :eclipse_not_self_set\n}s' "$psm"
+grep -qF 'if-ne p0, p1, :eclipse_not_self_set' "$psm" || fail "Paint.smali self-set guard insert failed (drift?)"
+
 # assemble View(+nested) + Display(+Mode) + Activity + Fragment + Vibrator + AutofillManager + CookieManager
-# + JobParameters -> classes2.dex
-mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/os" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job"
+# + JobParameters + Paint -> classes2.dex
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/os" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
@@ -310,6 +328,7 @@ cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
 cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
+cp "$psm" "$work/smali-view/android/graphics/Paint.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
 # --- 4c. stock api-impl as classes3.dex; compose the 3-dex overlay jar --------------------

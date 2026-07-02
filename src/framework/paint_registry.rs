@@ -88,6 +88,90 @@ impl PaintStyle {
             _ => Self::Fill,
         }
     }
+
+    /// The AOSP `Paint.Style` ordinal for this style — the exact inverse of [`Self::from_ordinal`].
+    /// 2026-07-02: `Paint.getStyle()` indexes `Style.values[native_get_style(paint)]`, so the value
+    /// served back to Java MUST be a valid ordinal (0..=2) or ART throws
+    /// `ArrayIndexOutOfBoundsException`; this is total and in-range by construction.
+    pub fn ordinal(self) -> i32 {
+        match self {
+            Self::Fill => 0,
+            Self::Stroke => 1,
+            Self::FillAndStroke => 2,
+        }
+    }
+}
+
+/// `android.graphics.Paint.Cap` — how stroke ends are drawn. 2026-07-02: ordinals match AOSP
+/// `Paint.Cap` (BUTT=0, ROUND=1, SQUARE=2), which is what `Paint.setStrokeCap` passes to
+/// `native_set_stroke_cap` and what `Paint.getStrokeCap` indexes `Cap.values[...]` with (the ATL
+/// reference native passes the same ordinals straight to GSK — `GSK_LINE_CAP_*` match 1:1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StrokeCap {
+    /// The stroke ends with the path, no projection (AOSP default).
+    #[default]
+    Butt,
+    /// The stroke projects out as a semicircle.
+    Round,
+    /// The stroke projects out as a square.
+    Square,
+}
+
+impl StrokeCap {
+    /// Map an AOSP `Paint.Cap` ordinal (BUTT=0, ROUND=1, SQUARE=2) to a [`StrokeCap`]. An unknown
+    /// ordinal falls back to `Butt` (the AOSP default) — never panics.
+    pub fn from_ordinal(ordinal: i32) -> Self {
+        match ordinal {
+            1 => Self::Round,
+            2 => Self::Square,
+            _ => Self::Butt,
+        }
+    }
+
+    /// The AOSP `Paint.Cap` ordinal — exact inverse of [`Self::from_ordinal`], always in 0..=2
+    /// (`Paint.getStrokeCap` indexes `Cap.values[...]` with it — see [`PaintStyle::ordinal`]).
+    pub fn ordinal(self) -> i32 {
+        match self {
+            Self::Butt => 0,
+            Self::Round => 1,
+            Self::Square => 2,
+        }
+    }
+}
+
+/// `android.graphics.Paint.Join` — how stroke segments join. 2026-07-02: ordinals match AOSP
+/// `Paint.Join` (MITER=0, ROUND=1, BEVEL=2); same set/get ordinal contract as [`StrokeCap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StrokeJoin {
+    /// Outer edges meet at a sharp angle (AOSP default).
+    #[default]
+    Miter,
+    /// Outer edges meet in a circular arc.
+    Round,
+    /// Outer edges meet with a straight line.
+    Bevel,
+}
+
+impl StrokeJoin {
+    /// Map an AOSP `Paint.Join` ordinal (MITER=0, ROUND=1, BEVEL=2) to a [`StrokeJoin`]. An unknown
+    /// ordinal falls back to `Miter` (the AOSP default) — never panics.
+    pub fn from_ordinal(ordinal: i32) -> Self {
+        match ordinal {
+            1 => Self::Round,
+            2 => Self::Bevel,
+            _ => Self::Miter,
+        }
+    }
+
+    /// The AOSP `Paint.Join` ordinal — exact inverse of [`Self::from_ordinal`], always in 0..=2
+    /// (`Paint.getStrokeJoin` indexes `Join.values[...]` with it).
+    pub fn ordinal(self) -> i32 {
+        match self {
+            Self::Miter => 0,
+            Self::Round => 1,
+            Self::Bevel => 2,
+        }
+    }
 }
 
 /// Per-paint state held in a registry slot: the non-GTK drawing configuration.
@@ -96,10 +180,12 @@ impl PaintStyle {
 /// `text_size` (`Paint.native_setTextSize`), `stroke_width` (`Paint.native_set_stroke_width`), and
 /// `style` (`Paint.native_setStyle`). Holds no GTK/Cairo context and performs no drawing itself; the
 /// Canvas natives read it to drive tiny-skia. More fields (typeface, flags) are added when their
-/// setters are bound.
-#[derive(Debug, Default)]
+/// setters are bound. 2026-07-02: `Clone` because `Paint.native_clone` ([`clone_of`]) copies a whole
+/// slot's state (`Paint(Paint)` / `Paint.set(Paint)`).
+#[derive(Debug, Clone)]
 pub struct PaintState {
-    /// ARGB color (`Paint.setColor`); 0 (transparent black) until set.
+    /// ARGB color (`Paint.setColor`); opaque black (0xFF000000, the AOSP default) until set — see
+    /// the `Default` impl below.
     pub color: i32,
     /// Text size in pixels (`Paint.setTextSize`); 0.0 until set.
     pub text_size: f32,
@@ -107,6 +193,30 @@ pub struct PaintState {
     pub stroke_width: f32,
     /// Fill vs stroke style (`Paint.setStyle`); [`PaintStyle::Fill`] (AOSP default) until set.
     pub style: PaintStyle,
+    /// Stroke end cap (`Paint.setStrokeCap`); [`StrokeCap::Butt`] (AOSP default) until set.
+    pub stroke_cap: StrokeCap,
+    /// Stroke segment join (`Paint.setStrokeJoin`); [`StrokeJoin::Miter`] (AOSP default) until set.
+    pub stroke_join: StrokeJoin,
+}
+
+impl Default for PaintState {
+    fn default() -> Self {
+        // 2026-07-02: a fresh paint's color is OPAQUE BLACK (0xFF000000) — the AOSP default Paint
+        // color and exactly what the ATL reference native creates (`native_create` sets
+        // `color.alpha = 1.f` over zeroed RGB, so its `native_get_color` reads 0xFF000000). This
+        // became load-bearing when `native_get_color`/`native_get_alpha` were bound: Java reads the
+        // values back, and a fresh AOSP Paint must report alpha 255, not 0 (a 0 default would make
+        // e.g. alpha-scaling drawables compute fully-transparent). Matches
+        // `canvas_registry::PaintConfig::default` (already opaque black).
+        Self {
+            color: 0xFF00_0000u32 as i32,
+            text_size: 0.0,
+            stroke_width: 0.0,
+            style: PaintStyle::Fill,
+            stroke_cap: StrokeCap::Butt,
+            stroke_join: StrokeJoin::Miter,
+        }
+    }
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -142,14 +252,15 @@ fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, PaintRegistryError
         .map_err(|_: PoisonError<_>| PaintRegistryError::Poisoned)
 }
 
-/// Allocate a fresh paint slot and return its packed [`PaintHandle`] (`jlong`, generation ≥ 1, never
-/// the reserved `0`). Reuses a freed slot when available, else grows the slab. Returns
-/// [`PaintRegistryError::Poisoned`] only on a poisoned mutex — never panics.
-pub fn allocate() -> Result<PaintHandle, PaintRegistryError> {
-    let mut reg = lock()?;
+/// Place `state` into a free (or fresh) slot of the already-locked registry and return its packed
+/// handle. 2026-07-02: shared allocation core of [`allocate`] and [`clone_of`].
+fn allocate_state(
+    reg: &mut Registry,
+    state: PaintState,
+) -> Result<PaintHandle, PaintRegistryError> {
     if let Some(index) = reg.free.pop() {
         let slot = &mut reg.slots[index as usize];
-        slot.state = Some(PaintState::default());
+        slot.state = Some(state);
         return Ok(pack(index, slot.generation));
     }
     let index: u32 = reg
@@ -159,9 +270,40 @@ pub fn allocate() -> Result<PaintHandle, PaintRegistryError> {
         .map_err(|_| PaintRegistryError::OutOfRange)?;
     reg.slots.push(Slot {
         generation: 1,
-        state: Some(PaintState::default()),
+        state: Some(state),
     });
     Ok(pack(index, 1))
+}
+
+/// Allocate a fresh paint slot and return its packed [`PaintHandle`] (`jlong`, generation ≥ 1, never
+/// the reserved `0`). Reuses a freed slot when available, else grows the slab. Returns
+/// [`PaintRegistryError::Poisoned`] only on a poisoned mutex — never panics.
+pub fn allocate() -> Result<PaintHandle, PaintRegistryError> {
+    let mut reg = lock()?;
+    allocate_state(&mut reg, PaintState::default())
+}
+
+/// Allocate a new slot whose state is a copy of `source`'s and return its handle — the backing for
+/// `Paint.native_clone` (`Paint(Paint)` copy constructor + `Paint.set(Paint)`). 2026-07-02: done
+/// under ONE registry lock so the copy is atomic (the source cannot be freed between read and
+/// write). Validates `source` exactly like [`with_paint`]: a stale/out-of-range/`0` source is a
+/// typed `Err`, never UB — the caller decides the fallback.
+pub fn clone_of(source: PaintHandle) -> Result<PaintHandle, PaintRegistryError> {
+    let (index, generation) = unpack(source);
+    let mut reg = lock()?;
+    let slot = reg
+        .slots
+        .get(index as usize)
+        .ok_or(PaintRegistryError::OutOfRange)?;
+    if slot.generation != generation {
+        return Err(PaintRegistryError::StaleHandle);
+    }
+    let state = slot
+        .state
+        .as_ref()
+        .ok_or(PaintRegistryError::StaleHandle)?
+        .clone();
+    allocate_state(&mut reg, state)
 }
 
 /// Look up the [`PaintState`] for a `handle` and run `f` against it (mutable) under the registry
@@ -250,8 +392,8 @@ mod tests {
         );
         assert_eq!(
             with_paint(new, |s| s.color),
-            Ok(0),
-            "the live handle's reused slot is fresh (default color 0)"
+            Ok(0xFF00_0000u32 as i32),
+            "the live handle's reused slot is fresh (default opaque black, 2026-07-02)"
         );
         free(new).expect("free new");
     }
@@ -291,6 +433,101 @@ mod tests {
         assert_eq!(PaintStyle::from_ordinal(99), PaintStyle::Fill);
         assert_eq!(PaintStyle::from_ordinal(-1), PaintStyle::Fill);
         assert_eq!(PaintStyle::default(), PaintStyle::Fill);
+    }
+
+    #[test]
+    fn style_cap_join_ordinals_round_trip_and_stay_in_java_values_range() {
+        // 2026-07-02: Paint.getStyle/getStrokeCap/getStrokeJoin index `Enum.values[ordinal]` with the
+        // native's return, so ordinal() must be the exact inverse of from_ordinal for 0..=2 AND stay
+        // in-range for ANY recorded value (out-of-range would be a Java ArrayIndexOutOfBoundsException).
+        for ordinal in 0..=2 {
+            assert_eq!(PaintStyle::from_ordinal(ordinal).ordinal(), ordinal);
+            assert_eq!(StrokeCap::from_ordinal(ordinal).ordinal(), ordinal);
+            assert_eq!(StrokeJoin::from_ordinal(ordinal).ordinal(), ordinal);
+        }
+        // AOSP enum constants pinned by name: Cap BUTT/ROUND/SQUARE, Join MITER/ROUND/BEVEL.
+        assert_eq!(StrokeCap::from_ordinal(0), StrokeCap::Butt);
+        assert_eq!(StrokeCap::from_ordinal(1), StrokeCap::Round);
+        assert_eq!(StrokeCap::from_ordinal(2), StrokeCap::Square);
+        assert_eq!(StrokeJoin::from_ordinal(0), StrokeJoin::Miter);
+        assert_eq!(StrokeJoin::from_ordinal(1), StrokeJoin::Round);
+        assert_eq!(StrokeJoin::from_ordinal(2), StrokeJoin::Bevel);
+        // Unknown ordinals fall back to the AOSP defaults (BUTT/MITER) — in-range, never a panic.
+        assert_eq!(StrokeCap::from_ordinal(99).ordinal(), 0);
+        assert_eq!(StrokeCap::from_ordinal(-1).ordinal(), 0);
+        assert_eq!(StrokeJoin::from_ordinal(99).ordinal(), 0);
+        assert_eq!(StrokeJoin::from_ordinal(-1).ordinal(), 0);
+    }
+
+    #[test]
+    fn fresh_paint_defaults_are_aosp_reference_values() {
+        // 2026-07-02: the value-returning Paint getters serve these back to Java, so a fresh slot
+        // must read as AOSP's default Paint: opaque black (alpha 255), FILL, BUTT, MITER, hairline
+        // stroke. (The ATL reference native creates alpha=1.0 over zeroed RGB — the same 0xFF000000.)
+        let h = allocate().expect("allocate");
+        let s = with_paint(h, |s| s.clone()).expect("read");
+        assert_eq!(
+            s.color, 0xFF00_0000u32 as i32,
+            "default color = opaque black"
+        );
+        assert_eq!((s.color >> 24) & 0xFF, 0xFF, "default alpha byte = 255");
+        assert_eq!(s.style, PaintStyle::Fill);
+        assert_eq!(s.stroke_cap, StrokeCap::Butt);
+        assert_eq!(s.stroke_join, StrokeJoin::Miter);
+        assert_eq!(s.stroke_width, 0.0);
+        assert_eq!(s.text_size, 0.0);
+        free(h).expect("free");
+    }
+
+    #[test]
+    fn clone_of_copies_state_into_an_independent_slot() {
+        // 2026-07-02: Paint.native_clone (Paint(Paint) / set(Paint)) — the clone carries the source's
+        // full recorded state but is an independent slot: later writes to either side do not alias.
+        let src = allocate().expect("allocate src");
+        with_paint(src, |s| {
+            s.color = 0x80AB_CDEFu32 as i32;
+            s.stroke_width = 2.5;
+            s.stroke_cap = StrokeCap::Square;
+            s.stroke_join = StrokeJoin::Bevel;
+            s.style = PaintStyle::Stroke;
+            s.text_size = 11.0;
+        })
+        .expect("configure src");
+        let dup = clone_of(src).expect("clone_of");
+        assert_ne!(dup, src, "the clone is its own handle");
+        let copied = with_paint(dup, |s| s.clone()).expect("read dup");
+        assert_eq!(copied.color, 0x80AB_CDEFu32 as i32);
+        assert_eq!(copied.stroke_width, 2.5);
+        assert_eq!(copied.stroke_cap, StrokeCap::Square);
+        assert_eq!(copied.stroke_join, StrokeJoin::Bevel);
+        assert_eq!(copied.style, PaintStyle::Stroke);
+        assert_eq!(copied.text_size, 11.0);
+        // Independence: mutate the source; the clone must not follow.
+        with_paint(src, |s| s.color = 0).expect("mutate src");
+        assert_eq!(
+            with_paint(dup, |s| s.color).expect("re-read dup"),
+            0x80AB_CDEFu32 as i32,
+            "the clone is a copy, not an alias"
+        );
+        free(src).expect("free src");
+        free(dup).expect("free dup");
+    }
+
+    #[test]
+    fn clone_of_rejects_stale_null_and_fabricated_sources() {
+        // Same validation contract as with_paint: a dead source is a typed Err (the JNI binding
+        // falls back to a fresh default paint), never UB.
+        let h = allocate().expect("allocate");
+        free(h).expect("free");
+        assert_eq!(clone_of(h), Err(PaintRegistryError::StaleHandle));
+        assert!(matches!(
+            clone_of(0),
+            Err(PaintRegistryError::StaleHandle) | Err(PaintRegistryError::OutOfRange)
+        ));
+        assert_eq!(
+            clone_of(pack(u32::MAX, 1)),
+            Err(PaintRegistryError::OutOfRange)
+        );
     }
 
     #[test]

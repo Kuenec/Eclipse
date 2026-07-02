@@ -128,6 +128,87 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-02 — 🖌️ `android.graphics.Paint` native surface audited + bound as a CLASS (closes the challenge7
+  `native_set_stroke_cap` frontier) — ✅ VALIDATED by the 2026-07-02 challenge8 boot + COMMITTED 2026-07-02
+  ⇐ START-HERE-NEXT: bind the installed framework's `android.view.View` LAYOUT/GEOMETRY native surface (plan at
+  the end of this bullet).** Validation (`/tmp/eclipse-challenge8.log`, 1309 lines, boot window 20:44–20:47 UTC,
+  EXIT=124 clean timeout kill): the identical 180 s fully-autonomous challenge7 re-drive (same 5-stage chain, APK
+  roblox-2.724.735-merged, overlay FRESH — rebuilt by the review-fix pass with the new step-4b Paint self-set
+  guard). **BOOT-WATCH VERDICTS: (a) CONFIRMED** — `native_set_stroke_cap` GONE (0 hits); ZERO Paint-related
+  `UnsatisfiedLinkError`; zero `Paint.native_clone` dead-source warns (the self-set guard path stayed silent —
+  nothing self-set this boot, and no paint-state anomalies). **(b) CONFIRMED** — log line 177 is the Paint
+  registration line, `… (per-method best-effort) bound=19`. **(c) ANSWERED — NEW FRONTIER:** the challenge
+  fragment's `CustomSwipeRefreshLayout` construction ADVANCED — `SwipeRefreshLayout.<init>` from Unknown
+  Source:100 (challenge7: the spinner CircularProgressDrawable Paint work via `SwipeRefreshLayout.e()`) to
+  Unknown Source:144 (`SwipeRefreshLayout.q()` → `setTargetOffsetTopAndBottom` → `androidx.core.view.q0.X` →
+  `View.offsetTopAndBottom` → `View.layout`) — and now dies on the NEXT unbound native: `UnsatisfiedLinkError:
+  No implementation found for void android.view.View.native_layout(long, int, int, int, int)`, log lines
+  1153–1188 (same fragment stack shape: `com.roblox.client.c.onCreateView` → `yh.d.onCreateView:237` →
+  `LayoutInflater.inflate:165`; RuntimeException ← InvocationTargetException ← the ULE escaping
+  `Handler.dispatchMessage` at 20:45:39.741). That is the ONLY `UnsatisfiedLinkError` in the log (the 2
+  `No implementation found` strings are the ART java_vm_ext line + the exception line of the SAME single event).
+  **(d) CONFIRMED** — 0 `NullPointerException`; no NEW inflation exception; the pre-existing baseline UNCHANGED
+  vs challenge7 (the known applyStyle `inflate(0x0)` upgrade-dialog failure fired at 20:45:17.509 — `Dialog.show`
+  ← `com.roblox.client.a.J0`, challenge7 had it at 19:44:40; the gms-measurement worker
+  `StreamCorruptedException`, 2 hits both boots; the registration-time jni_internal.cc Canvas class dump, 78
+  lines both boots). Baseline green: Landing 20:45:14 → LoginV2 20:45:17.538 → `v2/login` 403 "Challenge is
+  required" 20:45:28.5 → `ChallengeNativeWrapper` → `ChallengeHybridWebView` 20:45:28.639 → the rbx.web fragment
+  inflates NPE-free → after the fragment ULE the app recovers to LoginV2 at 20:46:28.652 (the ~60 s challenge
+  timeout) → engine alive to the 180 s kill. **⇐ START-HERE-NEXT: bind the installed framework's
+  `android.view.View` LAYOUT/GEOMETRY native surface** — discovery signal `View.native_layout(JIIII)V` from
+  `SwipeRefreshLayout.setTargetOffsetTopAndBottom` (spinner positioning). Per the proven class-pattern: audit the
+  INSTALLED View's declared natives still unbound — View has had several PARTIAL passes (the 2026-06-13 setters
+  batch, the listeners, `getGlobalVisibleRect`), so the audit MUST diff declared-vs-currently-bound — classify
+  per the established taxonomy (geometry IS READ BACK by Java: `getTop`/`getLeft`/`getWidth`/`getHeight`/
+  `offset*` — so layout state must be registry-backed and HONEST, consistent with the existing `view_registry`
+  geometry the vk-overlay already queries), bind per-method best-effort in `src/framework.rs`, then re-drive the
+  same 180 s boot. Implementation record: per the proven 🎨 class-pattern (§6 2026-07-02 🖌️ for
+  the full audit table): baksmali of the INSTALLED framework (`~/.cache/eclipse/framework-patched/api-impl.jar`
+  classes3.dex, vendored toolchain) enumerates EXACTLY 20 declared `Paint` natives — **NO vendored-source drift
+  this time** (vendored `Paint.java` declares the identical 20; the Paint inner classes declare none) — of which
+  Eclipse bound 5 (create + 4 setters, atomic). Now ALL 19 bindable are bound in ONE per-method best-effort pass
+  (`src/framework.rs::register_paint_natives`, the 58a50f6 pattern): every `native_get_*` IS read back by its
+  Java caller (`getStrokeCap`/`getStrokeJoin`/`getStyle` index `Enum.values[...]` with the return — it MUST be an
+  in-range ordinal), so the getters serve honest recorded values from `paint_registry` (new `StrokeCap`/
+  `StrokeJoin` enums + `stroke_cap`/`stroke_join` fields; `PaintStyle::ordinal()` — all from_ordinal/ordinal
+  round-trips in-range by construction); `native_set_stroke_cap`/`_join` record (the cap setter is the challenge7
+  discovery signal, from the androidx CircularProgressDrawable ring ← SwipeRefreshLayout ←
+  CustomSwipeRefreshLayout); `native_set_alpha` merges ONLY the alpha byte into the recorded color (the
+  ATL-reference semantics — pure helper `paint_color_with_alpha`); `native_clone` = new registry `clone_of`
+  (one-lock state copy — `Paint(Paint)`/`set(Paint)` store the return as the live handle; a dead source degrades
+  to a fresh default paint, warn-logged); `native_recycle` = registry free (`set(Paint)` frees the old handle; 0
+  skipped, stale tolerated); `native_set_color_filter` + `native_set_text_align` = validated no-ops (write-only:
+  the Java side retains the `ColorFilter`/`Align` in its OWN fields and serves the getters from them —
+  smali-confirmed no native readers). `native_get_text_bounds(JLjava/lang/String;Landroid/graphics/Rect;)V`
+  deliberately LEFT UNBOUND (the 20th): real text measurement (the ATL reference native runs a Pango layout)
+  whose Rect out-param IS read back (`getTextBounds`/`getTextWidths`) — unservable honestly headless, so the
+  clean call-time ULE stays the discovery signal (🎨 rule). SEMANTIC CORRECTION the getters forced:
+  `PaintState::default().color` is now OPAQUE BLACK 0xFF000000 (AOSP's default Paint; ATL's `native_create` sets
+  alpha=1.0 — a fresh Paint must read back alpha 255, not 0), matching `canvas_registry::PaintConfig::default`.
+  Regression guards (plain `cargo test`): `paint_native_name_sig_and_class_match_art_reported` extended with all
+  14 new name/sig pins + the documented unbound-`native_get_text_bounds` decision; new
+  `paint_color_with_alpha_replaces_only_the_alpha_channel`,
+  `style_cap_join_ordinals_round_trip_and_stay_in_java_values_range`,
+  `fresh_paint_defaults_are_aosp_reference_values`, `clone_of_copies_state_into_an_independent_slot`,
+  `clone_of_rejects_stale_null_and_fabricated_sources`. Gate green (fmt / build --all-targets / clippy -D
+  warnings / 589 unit + 4 integ + 2 doctest / release). **BOOT WATCH — ✅ ALL FOUR RESOLVED by the 2026-07-02
+  challenge8 boot (verdicts at the top of this bullet; the (c) prediction "likely ATL's stub WebView next" was
+  WRONG in the detail — `View.native_layout` trips first, BEFORE any WebView child).**
+  **REVIEW FIX folded into this same pass (2026-07-02; committed with it):** the adversarial review's one surviving
+  finding — ATL's `Paint.set(Paint)` calls `native_recycle(this.paint)` BEFORE `native_clone(paint.paint)`
+  with NO AOSP self-set guard, so a self-set `p.set(p)` hands `native_clone` a freed handle and Eclipse's
+  warn-logged fallback resets the paint to a FRESH DEFAULT where AOSP preserves the state (upstream ATL's
+  reference C would use-after-free on the same path) — is fixed at the ROOT in the overlay:
+  `patch-framework.sh` now shadows the installed `Paint` into classes2.dex (11 classes) with the AOSP
+  self-set guard (`if-ne p0, p1` → `return-void` on equality) inserted at `set(Paint)` entry, behind the
+  established exact-count anchor + whole-body pristine check + post-insert back-check. The overlay is
+  REBUILT + INSTALLED with the guard (baksmali-verified in the installed classes2.dex; the shadowed Paint
+  still declares the identical 20 natives, so `register_paint_natives` binds unchanged). Same-pattern audit:
+  Paint.set is the ONLY recycle-before-clone/self-alias shape in the installed dex (Bitmap's `native_recycle`
+  callers are `recycle()`/`finalize()` on its own fields, `native_ref_texture` clones only live sources).
+  `paint_native_clone`'s dead-source→default fallback stays (correct for genuinely dead sources; its warn
+  now means a real dead source, not a self-set — fn doc dated). Gate re-run green (fmt / build --all-targets
+  / clippy -D warnings / 589 unit + 4 integ + 2 doctest / release).
 - **2026-07-02 — 🪛 RobloxToolbar include-id NPE ROOT-CAUSED + FIXED (overlay stub-R javac constant-inlining) —
   ✅ VALIDATED by the 2026-07-02 challenge7 boot + COMMITTED 2026-07-02.** Validation
   (`/tmp/eclipse-challenge7.log`, 1638 lines, boot window 19:44–19:47 UTC, EXIT=124 clean timeout kill): 180 s
@@ -138,8 +219,10 @@ before any history-rewriting/force operation.
   green during that build. **BOOT-WATCH VERDICTS: (a) CONFIRMED — the `RobloxToolbar.setVisibility` NPE is GONE**
   (0 hits; 0 `NullPointerException` anywhere in the log; challenge6 had it at 05:23:49.923). **(b) CONFIRMED** —
   exactly two `AppCompatViewInflater` app:theme deprecation lines (19:46:11.427 + 19:46:15.213, log lines
-  1518/1523): both `toolbar_include` RobloxToolbar constructions fire. **(c) ANSWERED — NEW FRONTIER ⇐
-  START-HERE-NEXT: bind the installed framework's `android.graphics.Paint` native surface.** The rbx.web fragment
+  1518/1523): both `toolbar_include` RobloxToolbar constructions fire. **(c) ANSWERED — NEW FRONTIER (IMPLEMENTED
+  2026-07-02 + ✅ VALIDATED by the 2026-07-02 challenge8 boot — see the 🖌️ bullet above; committed 2026-07-02;
+  the live frontier moved on to `View.native_layout`): bind the installed framework's
+  `android.graphics.Paint` native surface.** The rbx.web fragment
   inflation proceeds PAST the old failure point (the new stack goes through `yh.d.onCreateView Unknown Source:237`
   — 50 lines further than challenge6's `:187` — via `com.roblox.client.c.onCreateView` →
   `LayoutInflater.inflate:165`) and dies at 19:46:22.06 on the NEXT unbound native: `UnsatisfiedLinkError: No
@@ -4666,6 +4749,176 @@ proven 🎨 class-pattern (2026-07-02), baksmali-audit the WHOLE reachable Paint
 framework (the vendored `Paint.java` may have drifted exactly like `Drawable.java` did) and bind it in one
 per-method best-effort pass in `src/framework.rs` (`Paint.native_set_stroke_cap(JI)V` is the discovery signal),
 then re-drive the same 180 s validation boot.
+
+---
+
+### 2026-07-02 — 🖌️ The installed framework's `android.graphics.Paint` native surface audited + bound as a CLASS (the challenge7 `native_set_stroke_cap` frontier): 20 declared natives enumerated from the installed dex (NO vendored drift), 19 bound per-method best-effort with honest registry-served getters, `native_get_text_bounds` deliberately left unbound; UNCOMMITTED pending validation boot
+
+*Discovery evidence (the §5 START-HERE-NEXT above):* the challenge7 boot (`/tmp/eclipse-challenge7.log` lines
+1543–1576) died inside the rbx.web fragment's `LayoutInflater.inflate` on `UnsatisfiedLinkError: No
+implementation found for void android.graphics.Paint.native_set_stroke_cap(long, int)` at `Paint.setStrokeCap` ←
+`f5.b$c.<init>` (the androidx CircularProgressDrawable ring) ← `f5.b.<init>` ←
+`androidx.swiperefreshlayout.widget.SwipeRefreshLayout.<init>` ←
+`com.roblox.client.components.CustomSwipeRefreshLayout.<init>`.
+
+*Audit method (the 🎨 precedent, all first-party):* baksmali of the installed
+`~/.cache/eclipse/framework-patched/api-impl.jar` classes3.dex (`vendor/toolchain/smali/baksmali-2.5.2.jar` under
+the vendored JDK-21 java, 2026-07-02) → `Paint.smali` declares EXACTLY 20 `private static native` methods; the
+inner classes (`Paint$Cap`/`$Join`/`$Style`/`$Align`/`$FontMetrics`/`$FontMetricsInt`) declare NONE; the only
+smali file in the whole dex invoking `Paint;->native_*` is `Paint.smali` itself (all call sites read for the
+classification below). **Drift finding: NONE** — the vendored `vendor/atl/src/api-impl/android/graphics/Paint.java`
+declares the identical 20 (unlike `Drawable.java`, which had drifted); the vendored ATL reference native
+`vendor/atl/src/api-impl-jni/graphics/android_graphics_Paint.c` supplied the reference semantics (fresh paint
+alpha = 1.0 over zeroed RGB ⇒ get_color 0xFF000000; `set_alpha` writes ONLY the alpha channel; cap/join ordinals
+pass 1:1 to GSK enums, which match AOSP `Cap`/`Join` ordinals exactly; `get_text_bounds` runs a real Pango
+layout).
+
+*Audit table (every declared Paint native → disposition, all in `src/framework.rs`):*
+| # | native (sig) | disposition |
+|---|---|---|
+| 1 | `native_create` `()J` | already bound (registry allocate) — kept |
+| 2 | `native_clone` `(J)J` | NEW value-returning: registry `clone_of` (one-lock state copy; `Paint(Paint)`/`set(Paint)` store the return as the live handle); dead source → fresh default paint (warn) |
+| 3 | `native_recycle` `(J)V` | NEW free bookkeeping (`set(Paint)` frees the old handle first); 0 skipped, stale → debug (mirrors `Bitmap.native_recycle`) |
+| 4 | `native_set_color` `(JI)V` | already bound (registry record) — kept |
+| 5 | `native_get_color` `(J)I` | NEW value-returning: recorded color (`getColor` returns it verbatim); dead → opaque-black default |
+| 6 | `native_set_alpha` `(JI)V` | NEW registry: alpha-byte-only merge into the recorded color (`paint_color_with_alpha`, ATL-reference semantics — RGB preserved) |
+| 7 | `native_get_alpha` `(J)I` | NEW value-returning: `(color >> 24) & 0xFF`; dead → 255 (a fresh AOSP/ATL paint is opaque) |
+| 8 | `native_set_style` `(JI)V` | already bound (registry record) — kept |
+| 9 | `native_get_style` `(J)I` | NEW value-returning: `PaintStyle::ordinal()` — in-range 0..=2 by construction (`getStyle` indexes `Style.values[...]`) |
+| 10 | `native_set_stroke_width` `(JF)V` | already bound (registry record) — kept |
+| 11 | `native_get_stroke_width` `(J)F` | NEW value-returning: recorded width (0 = AOSP hairline; Eclipse does NOT copy ATL's GSK-forced 0→1 coercion) |
+| 12 | `native_set_stroke_cap` `(JI)V` | NEW registry record (`StrokeCap::from_ordinal`, unknown → BUTT) — **the challenge7 discovery signal** |
+| 13 | `native_get_stroke_cap` `(J)I` | NEW value-returning: `StrokeCap::ordinal()` — in-range (`getStrokeCap` indexes `Cap.values[...]`) |
+| 14 | `native_set_stroke_join` `(JI)V` | NEW registry record (`StrokeJoin::from_ordinal`, unknown → MITER) |
+| 15 | `native_get_stroke_join` `(J)I` | NEW value-returning: `StrokeJoin::ordinal()` — in-range (`getStrokeJoin` indexes `Join.values[...]`) |
+| 16 | `native_set_text_size` `(JF)V` | already bound (registry record) — kept |
+| 17 | `native_get_text_size` `(J)F` | NEW value-returning: recorded size (`getTextSize` feeds the vendored Java's own `ascent()`/`measureText` math) |
+| 18 | `native_set_color_filter` `(JII)V` | NEW validated no-op: write-only — Java retains the `ColorFilter` object and serves `getColorFilter()` from its own field (smali-confirmed: no native reader declared) |
+| 19 | `native_set_text_align` `(JI)V` | NEW validated no-op: write-only — Java stores the `Align` in its own `align` field and serves `getTextAlign()` from it (no native reader) |
+| 20 | `native_get_text_bounds` `(JLjava/lang/String;Landroid/graphics/Rect;)V` | deliberately LEFT UNBOUND: real text measurement (ATL reference = Pango layout) whose Rect out-param IS read back (`getTextBounds`/`getTextWidths` returns `bounds.width()`) — the headless recording model cannot serve honest metrics; the clean call-time ULE stays the discovery signal (🎨 rule, same class as the Bitmap pixel-content natives) |
+
+*Fix mechanics:* `register_paint_natives` converted from one atomic `RegisterNatives` array (5 entries) to
+[`register_class_natives_best_effort`] with all 19 bindings (the 58a50f6 pattern — a per-method mismatch WARNs
+and continues, never aborts the class); registration line now logs the `bound` count.
+`src/framework/paint_registry.rs`: new `StrokeCap`/`StrokeJoin` enums (AOSP ordinals, total
+`from_ordinal`/`ordinal` inverses), `PaintStyle::ordinal()`, `stroke_cap`/`stroke_join` fields on `PaintState`,
+`PaintState` now `Clone`, `clone_of(source)` (single-lock copy via the shared `allocate_state` core), and a
+manual `Default` making a fresh paint's color OPAQUE BLACK 0xFF000000 — the AOSP default and the ATL reference's
+fresh-paint read-back, load-bearing now that `native_get_color`/`native_get_alpha` serve values to Java (a 0
+default would read alpha 0 and make alpha-scaling callers compute fully-transparent); this also aligns
+`paint_config_from_handle`'s live-fresh-paint snapshot with `canvas_registry::PaintConfig::default` (already
+opaque black). Same-pattern audit (installed-dex greps, 2026-07-02): the classes on the `Paint` API surface —
+`Typeface`/`Shader`/`Xfermode`/`MaskFilter`/`PathEffect`/`BlendMode`/`ColorFilter` — declare ZERO natives in the
+installed dex (plain-Java there); `PorterDuffColorFilter` declares ONE (`native_CreatePorterDuffFilter(II)J`)
+which is verified DEAD CODE (declaration-only — its ctor calls the plain-Java `update()`, a bare `return-void`;
+no invoker anywhere in the dex), so it stays unbound like the 🎨 pass's dead BitmapFactory natives. `Paint.smali`
+is the ONLY class in the installed dex that invokes any `Paint;->native_*`. `Matrix` (41 declared) and `Path`
+(20 declared) keep the established surface-as-surfaced contract from their own earlier passes — any
+still-unbound declared native there remains a loud call-time ULE discovery signal (the standing mechanism), and
+converting their registrars was out of this pass's surgical scope.
+
+*Regression guards (plain `cargo test`, no APK/display/boot):*
+`paint_native_name_sig_and_class_match_art_reported` extended with all 14 new name/sig pins against the
+installed-dex truth + a comment pinning the deliberate non-binding of `native_get_text_bounds`; new
+`paint_color_with_alpha_replaces_only_the_alpha_channel` (RGB-preserving merge + low-byte masking + getter
+round-trip), `style_cap_join_ordinals_round_trip_and_stay_in_java_values_range` (ordinal() is from_ordinal's
+exact inverse AND always in the `Enum.values[...]` range — an out-of-range return would be a Java
+ArrayIndexOutOfBoundsException), `fresh_paint_defaults_are_aosp_reference_values` (opaque black / alpha 255 /
+FILL / BUTT / MITER / hairline), `clone_of_copies_state_into_an_independent_slot` (full-state copy, no aliasing),
+`clone_of_rejects_stale_null_and_fabricated_sources` (typed Err, never UB); the pre-existing
+`freed_handle_is_stale_and_does_not_alias_reused_slot` updated for the new default color.
+
+*Gate:* green — `cargo fmt --all` / `cargo build --all-targets` / `cargo clippy --all-targets --all-features
+-- -D warnings` / `cargo test` (589 unit + 4 integ + 2 doctest, 0 failed) / `cargo build --release`.
+
+*Status:* UNCOMMITTED, validation boot PENDING (the boot-watch list lives in the §5 🖌️ bullet; recipe = the
+identical 180 s challenge7 re-drive).
+
+*Review fix (2026-07-02, applied into this same uncommitted pass):* the adversarial review of this pass
+confirmed everything above clean except ONE finding (reported twice at different severities — the same
+defect): **`Paint.set(Paint)` self-set loses state.** Confirmed against first-party truth (installed
+classes3.dex `Paint.smali` `set(Landroid/graphics/Paint;)V`, re-baksmali'd this session; vendored
+`Paint.java:345-348` identical): ATL's Java calls `native_recycle(this.paint)` strictly BEFORE
+`native_clone(paint.paint)` and has NO self-set guard — AOSP's `Paint.set(Paint src)` no-ops when
+`src == this` — so `p.set(p)` frees the source slot (generation bumped), `clone_of` returns `StaleHandle`,
+and `paint_native_clone`'s warn-logged fallback substitutes a FRESH DEFAULT paint: every subsequent getter
+(`getColor`→0xFF000000, `getAlpha`→255, `getStrokeCap`→BUTT, `getStrokeWidth`→0.0, `getTextSize`→0.0)
+serves defaults instead of the configured values, where AOSP preserves them. (Upstream ATL's reference C
+native has the identical recycle-before-clone order and would use-after-free — Eclipse's degradation was
+strictly safer, but the contract divergence was real; never observed in a boot log, confirmed by code-path
+analysis.) **Fix (root cause — the broken mechanism is the ATL Java, so the overlay):**
+`tools/framework-overlay/patch-framework.sh` now shadows the installed `Paint` into classes2.dex (11
+classes) and inserts the AOSP self-set guard at `set(Paint)` entry (`if-ne p0, p1, :eclipse_not_self_set`
+→ `return-void` on equality; the recycle-before-clone body is untouched and safe for distinct objects —
+the source is a different live handle). Guards, per the established step-4b discipline: exact-count==1
+anchor on the unique `set(Landroid/graphics/Paint;)V`, a whole-body pristine check (`ANCHOR_PSET`, the
+onPostCreate `ANCHOR_PC` pattern — fails loud if the installed recycle-before-clone shape ever drifts), an
+already-carries-the-guard negative check, and a post-insert `grep -qF` back-check. NOT touched: the
+`paint_native_clone` dead-source→fresh-default fallback (still the correct degradation for a genuinely
+dead/foreign source; its fn doc now carries a dated note that the warn can no longer mean a self-set).
+Same-pattern audit (installed dex + vendored src): `Paint.set` is the ONLY recycle-before-clone /
+missing-self-guard instance — Bitmap's `native_recycle` callers (`recycle()`/`finalize()`) free the
+object's OWN fields with no subsequent clone, and `native_ref_texture`'s callers clone live sources.
+Overlay REBUILT + INSTALLED (`bash tools/framework-overlay/patch-framework.sh`, repo defaults; installed
+classes2.dex baksmali-verified: 11 classes incl. `Landroid/graphics/Paint;`, the guard present, the
+shadowed Paint still declaring the identical 20 natives so `register_paint_natives` binds unchanged; the
+§1e/§4a guards passed during the build). No new Rust test (no Rust behavior changed; the build-time
+overlay guards are the regression protection, per the View/Display/Activity precedent). Gate re-run green
+(fmt / build --all-targets / clippy -D warnings / 589 unit + 4 integ + 2 doctest / release).
+
+---
+
+### 2026-07-02 — 🖌️ Validation-boot verdict on the Paint pass: ALL boot-watch items CONFIRMED — the `native_set_stroke_cap` ULE is GONE (`bound=19`), the swipe-refresh constructor advances :100 → :144, and the NEW frontier is the unbound `View.native_layout` (spinner positioning); Paint pass + overlay self-set guard committed with this entry
+
+*Recipe (`/tmp/eclipse-challenge8.log`, 1309 lines, boot window 20:44–20:47 UTC, EXIT=124 clean timeout kill):*
+the identical challenge7 180 s fully-autonomous challenge re-drive (stage 0 `ECLIPSE_SYNTHETIC_ENGINE_TAP="419,531"`
+/ stages 1+2 `ECLIPSE_SYNTHETIC_TYPE="278,179:robloxtest"` / stage 3 `ECLIPSE_SYNTHETIC_NEXT="400,236"` / stage 4
+`ECLIPSE_SYNTHETIC_TYPE2="241,327:<pw>"` / stage 5 `ECLIPSE_SYNTHETIC_SUBMIT="349,377"`, hands-off host input),
+APK `roblox-2.724.735-merged`, overlay FRESH (rebuilt 15:40 local by the review-fix pass with the new step-4b
+Paint self-set guard; the §1e/§4a guards passed during that build).
+
+*Boot-watch verdicts (all four):* **(a) CONFIRMED** — `Paint.native_set_stroke_cap` GONE (0 hits; challenge7 died
+on it at 19:46:22.06); ZERO Paint-related `UnsatisfiedLinkError`; zero `Paint.native_clone: dead source handle`
+warns — the overlay self-set guard path stayed silent (nothing self-set this boot) and no paint-state anomalies
+appeared. **(b) CONFIRMED** — log line 177: `registered Eclipse's non-GTK backing for the android.graphics.Paint
+native surface (create/clone/recycle + color/alpha/style/stroke-width/stroke-cap/stroke-join/text-size get+set +
+color-filter/text-align no-ops; native_get_text_bounds deliberately unbound — real text metrics) (per-method
+best-effort) bound=19`. **(c) ANSWERED — NEW FRONTIER:** the challenge fragment's `CustomSwipeRefreshLayout`
+construction ADVANCED — `SwipeRefreshLayout.<init>` from `Unknown Source:100` (challenge7: the spinner
+CircularProgressDrawable Paint work via `SwipeRefreshLayout.e()`) to `Unknown Source:144`
+(`SwipeRefreshLayout.q()` → `setTargetOffsetTopAndBottom` → `androidx.core.view.q0.X` → `View.offsetTopAndBottom`
+→ `View.layout`) — and now dies on the NEXT unbound native: `UnsatisfiedLinkError: No implementation found for
+void android.view.View.native_layout(long, int, int, int, int)`, log lines 1153–1188, same fragment stack shape
+as challenge7 (`com.roblox.client.c.onCreateView` → `yh.d.onCreateView(Unknown Source:237)` →
+`LayoutInflater.inflate:165`; `RuntimeException` ← `InvocationTargetException` ← the ULE escaping
+`Handler.dispatchMessage`; Eclipse logs `framework lifecycle step failed step="Handler.dispatchMessage"` at
+20:45:39.741 and the boot does NOT abort). That ULE is the ONLY `UnsatisfiedLinkError` in the log — the 2
+`No implementation found` strings are the ART java_vm_ext line + the exception line of the SAME single event.
+**(d) CONFIRMED** — 0 `NullPointerException`; no NEW inflation exception; the pre-existing baseline is UNCHANGED
+vs challenge7, all three named items present in both boots: the known applyStyle `inflate(0x0)` upgrade-dialog
+failure fired at 20:45:17.509 (`Resources$NotFoundException: Unable to find resource ID #0x0` ← `Dialog.show` ←
+`com.roblox.client.a.J0`, log lines 1011–1034; challenge7 had it at 19:44:40), the gms-measurement worker
+`StreamCorruptedException: invalid stream header: 00000000` appeared (2 hits = one event's exception + Caused-by;
+challenge7: 2), and the registration-time `jni_internal.cc` Canvas class dump is likewise pre-existing (78 lines;
+challenge7: 78). The single challenge-adjacent survivable signal-11 + crashpad `Handle a real crash` pair
+(20:45:28.667, right after ChallengeHybridWebView) reproduces challenge7's — NON-FATAL, fragment work continues
+after it.
+
+*Baseline green:* splash recipe steps 1–7 complete (`ActivitySplash` resumed 20:44:57.991), the full 5-stage
+synthetic chain fired (24 `handled=true` typed chars), Landing 20:45:14 → LoginV2 20:45:17.538 → `v2/login` POST
+403 "Challenge is required" 20:45:28.5 (log line 1115) → `ChallengeNativeWrapper` 20:45:28.539 →
+`ChallengeHybridWebView` 20:45:28.639 → the rbx.web fragment inflates NPE-free; after the fragment ULE the app
+recovers to `onAppReady: LoginV2` at 20:46:28.652 (the ~60 s challenge timeout) and the engine stays alive to the
+180 s kill (last log 20:47:27) — no teardown SEGV.
+
+*Next (the §5 START-HERE-NEXT):* bind the installed framework's `android.view.View` LAYOUT/GEOMETRY native
+surface — discovery signal `View.native_layout(JIIII)V` from `SwipeRefreshLayout.setTargetOffsetTopAndBottom`
+(spinner positioning). Per the proven class-pattern: audit the INSTALLED View's declared natives still unbound
+(View has had several PARTIAL passes — the 2026-06-13 setters batch, the listeners, `getGlobalVisibleRect` — so
+the audit must diff declared-vs-currently-bound), classify per the established taxonomy (geometry IS READ BACK by
+Java — `getTop`/`getLeft`/`getWidth`/`getHeight`/`offset*` — so layout state must be registry-backed and honest,
+consistent with the existing `view_registry` geometry the vk-overlay already queries), bind per-method
+best-effort in `src/framework.rs`, then re-drive the same 180 s boot.
 
 ---
 
