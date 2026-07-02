@@ -147,9 +147,14 @@ struct GameWindow<'vm> {
     /// 2026-06-14 — the instant of the stage-3 Next tap, so stage 4 can type into the next field (e.g.
     /// the password field, which auto-focuses) a few seconds later.
     engine_next_at: Option<std::time::Instant>,
-    /// 2026-06-14 — set once stage 4 (`ECLIPSE_SYNTHETIC_TYPE2="text"`, typed into the field focused after
-    /// Next — verifies the password field + its masking) has fired.
+    /// 2026-06-14 — set once stage 4 (`ECLIPSE_SYNTHETIC_TYPE2="x,y:text"` or bare `"text"`, typed into
+    /// the password-step field — verifies the password field + its masking) has fired.
     engine_synthetic_typed2_done: bool,
+    /// 2026-07-01 — the instant of the last stage-4 focus-tap (only the `"x,y:text"` form of
+    /// `ECLIPSE_SYNTHETIC_TYPE2` taps): the password step is a SECOND screen whose field does NOT
+    /// auto-focus, so stage 4 (re)taps its target until `framework::active_text_field()` reports
+    /// focus. Mirrors [`Self::engine_last_focus_tap`] (stage 1). `None` for the bare-`"text"` form.
+    engine_last_focus_tap2: Option<std::time::Instant>,
     /// 2026-07-01 — the instant the stage-4 typing completed, so stage 5 can tap the submit button a
     /// few seconds later (the same shape as [`Self::engine_typed_at`] → stage 3).
     engine_typed2_at: Option<std::time::Instant>,
@@ -947,33 +952,62 @@ impl GameWindow<'_> {
             }
         }
 
-        // Stage 4 (ECLIPSE_SYNTHETIC_TYPE2="text"): a few seconds after Next, type into the field that
-        // auto-focused (the password field) — verifies the password step + that the overlay MASKS it.
+        // Stage 4 (ECLIPSE_SYNTHETIC_TYPE2="x,y:text" or bare "text"): a few seconds after Next, type
+        // into the password-step field. 2026-07-01: the value now accepts an "x,y:" target (tried via
+        // parse_xy_text first; a value that does not parse as coords keeps the old bare-"text"
+        // behavior). The 2026-07-01 re-drive proved the password step is a SECOND screen whose field
+        // does NOT auto-focus (stage 4 typed the password into the still-focused USERNAME field), so
+        // with a target stage 4 taps (x,y) FIRST — unconditionally, since the previous screen's field
+        // handle can still read as focused (stale) — then re-taps every ~1.5 s until
+        // `framework::active_text_field()` reports focus (stage 1's retry shape), then types once.
         if self.engine_synthetic_next_done
             && !self.engine_synthetic_typed2_done
             && self
                 .engine_next_at
                 .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3))
-            && crate::framework::active_text_field() != 0
         {
-            if let Some(text) = std::env::var("ECLIPSE_SYNTHETIC_TYPE2")
-                .ok()
-                .filter(|s| !s.is_empty())
-            {
-                self.engine_synthetic_typed2_done = true;
-                self.engine_typed2_at = Some(std::time::Instant::now());
-                tracing::info!(
-                    chars = text.chars().count(),
-                    "synthetic TYPE2 (stage 4): typing into the field focused after Next (password)"
-                );
-                if let Some(vm) = self.vm {
-                    for ch in text.chars() {
-                        let handled =
-                            crate::framework::type_into_active_text_field(vm, ch as i32, false);
-                        tracing::info!(handled, "synthetic TYPE2 char → active text field");
+            let parsed =
+                std::env::var_os("ECLIPSE_SYNTHETIC_TYPE2").and_then(|s| match parse_xy_text(&s) {
+                    Some((x, y, text)) => Some((Some((x, y)), text)),
+                    None => s.to_str().map(|t| (None, t.to_owned())),
+                });
+            if let Some((target, text)) = parsed.filter(|(_, text)| !text.is_empty()) {
+                let focused = crate::framework::active_text_field() != 0;
+                if let Some((x, y)) = target.filter(|_| {
+                    self.engine_last_focus_tap2.is_none()
+                        || (!focused
+                            && self.engine_last_focus_tap2.is_some_and(|t| {
+                                t.elapsed() >= std::time::Duration::from_millis(1500)
+                            }))
+                }) {
+                    // (a) The FIRST tap fires even while a field reads as focused (it can be the
+                    // username screen's stale handle); (b) then re-tap until focus actually takes.
+                    self.engine_last_focus_tap2 = Some(std::time::Instant::now());
+                    tracing::info!(
+                        x,
+                        y,
+                        "synthetic TYPE2 (stage 4): focus-tap (retry until focused)"
+                    );
+                    self.cursor = Some((x, y));
+                    self.engine_primary_press();
+                    self.engine_primary_release();
+                } else if focused {
+                    // (c) A field is focused (with a target: after its tap fired) → type once.
+                    self.engine_synthetic_typed2_done = true;
+                    self.engine_typed2_at = Some(std::time::Instant::now());
+                    tracing::info!(
+                        chars = text.chars().count(),
+                        "synthetic TYPE2 (stage 4): typing into the field focused after Next (password)"
+                    );
+                    if let Some(vm) = self.vm {
+                        for ch in text.chars() {
+                            let handled =
+                                crate::framework::type_into_active_text_field(vm, ch as i32, false);
+                            tracing::info!(handled, "synthetic TYPE2 char → active text field");
+                        }
                     }
+                    crate::loader::ndk_registry::wake_all_loopers();
                 }
-                crate::loader::ndk_registry::wake_all_loopers();
             }
         }
 
@@ -1035,6 +1069,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_synthetic_next_done: false,
         engine_next_at: None,
         engine_synthetic_typed2_done: false,
+        engine_last_focus_tap2: None,
         engine_typed2_at: None,
         engine_synthetic_submit_done: false,
         engine_reflect_done: false,
@@ -1686,7 +1721,8 @@ fn parse_xy(spec: &std::ffi::OsStr) -> Option<(f32, f32)> {
     Some((xs.trim().parse().ok()?, ys.trim().parse().ok()?))
 }
 
-/// Parse `"x,y:text"` for the stage-1 synthetic type-test diagnostic. `None` on malformed input.
+/// Parse `"x,y:text"` for the stage-1 + stage-4 synthetic type-test diagnostics. `None` on
+/// malformed input (stage 4 then treats the whole value as bare text — the pre-2026-07-01 form).
 fn parse_xy_text(spec: &std::ffi::OsStr) -> Option<(f32, f32, String)> {
     let s = spec.to_str()?;
     let (xy, text) = s.split_once(':')?;
