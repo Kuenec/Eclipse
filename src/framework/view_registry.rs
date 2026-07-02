@@ -50,6 +50,20 @@ static VIEWS: OnceLock<Mutex<Registry>> = OnceLock::new();
 /// not a pointer), validated against the slab on use, so a stale value is a checked `Err`, not UB.
 static ACTIVE_ROOT: AtomicI64 = AtomicI64::new(0);
 
+/// 2026-07-02: the handle of the view that most recently requested input focus, recorded by
+/// `View.nativeRequestFocus` and served back by `View.nativeIsFocused` (the coupled read-back pair —
+/// the installed dex's `isFocused()` returns the native's answer verbatim, so a half-bound no-op
+/// would lie to Java; same rule as the CheckBox `isChecked`/`setChecked` coupling, 2026-06-13).
+/// `0` = no view has requested focus yet. Same lock-free `AtomicI64` shape as [`ACTIVE_ROOT`]: it
+/// stores only the packed `jlong` handle (an opaque index, not a pointer), and [`is_focused`]
+/// compares handles by value — a freed-then-reused slot gets a NEW generation, so a stale recorded
+/// handle can never claim focus for the slot's new occupant.
+///
+/// 2026-07-02: `framework.rs` holds a de-facto SECOND focus record, `ACTIVE_TEXT_FIELD` (the
+/// engine-tap focus signal, written by the `EditText.getText()` poll) — deliberately NOT merged
+/// into this record; see `view_native_is_focused` in `framework.rs` for the divergence diagnostic.
+static FOCUSED_VIEW: AtomicI64 = AtomicI64::new(0);
+
 /// A view-registry handle as it travels across JNI: a `jlong` (`i64`) packing the slot index (low 32
 /// bits) and the slot's generation (high 32 bits). `0` is the reserved "no view" / null sentinel.
 pub type ViewHandle = jlong;
@@ -184,6 +198,14 @@ pub struct ViewState {
     /// listener; a new registration replaces the prior (its `Drop` releases the old ref). Held so a
     /// future IME/input-dispatch path can invoke `onEditorAction(...)`. `None` until set.
     pub editor_action_listener: Option<Global<JObject<'static>>>,
+    /// 2026-07-02: the view's laid-out frame `[left, top, right, bottom]` (parent coordinates),
+    /// recorded verbatim by `View.native_layout`. The installed dex's `View.layout(l,t,r,b)` stores
+    /// the frame in its OWN Java `left`/`top`/`right`/`bottom` fields BEFORE invoking the native, and
+    /// every Java read-back (`getLeft`/`getTop`/`getWidth`/`getHeight`/`offset*`) reads those fields
+    /// (smali-verified) — so this record never serves Java; it is Eclipse-side bookkeeping (real
+    /// laid-out geometry for the renderer/overlay, alongside the *requested* [`LayoutParams`]).
+    /// `None` until the first `layout()` reaches the native.
+    pub frame: Option<[i32; 4]>,
 }
 
 /// A generational slot: the current generation plus the optional occupant.
@@ -236,6 +258,7 @@ pub fn allocate(class_name: &str) -> Result<ViewHandle, ViewRegistryError> {
         background_color: None,
         text_watchers: Vec::new(),
         editor_action_listener: None,
+        frame: None,
     };
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -311,6 +334,14 @@ pub fn set_clickable(handle: ViewHandle) -> Result<(), ViewRegistryError> {
 /// handle exactly like [`with_view`], so a stale/fabricated handle is a typed `Err`, never UB.
 pub fn set_background_color(handle: ViewHandle, argb: i32) -> Result<(), ViewRegistryError> {
     with_view(handle, |v| v.background_color = Some(argb))
+}
+
+/// 2026-07-02: record the laid-out frame `[left, top, right, bottom]` that `View.layout(l,t,r,b)`
+/// pushed through `View.native_layout` (see [`ViewState::frame`] for why this is bookkeeping, not a
+/// Java read-back source). Validates the handle exactly like [`with_view`], so a stale/fabricated
+/// handle is a typed `Err`, never UB.
+pub fn set_frame(handle: ViewHandle, frame: [i32; 4]) -> Result<(), ViewRegistryError> {
+    with_view(handle, move |v| v.frame = Some(frame))
 }
 
 /// Record the JNI **global** reference to a view's Java `View` object onto its registry slot, so a
@@ -404,6 +435,26 @@ pub fn set_active_root(handle: ViewHandle) {
 /// The currently published content-root view handle, or `0` if none has been set yet.
 pub fn active_root() -> ViewHandle {
     ACTIVE_ROOT.load(Ordering::Acquire)
+}
+
+/// 2026-07-02: publish `handle` as the view that most recently requested input focus (called by
+/// `View.nativeRequestFocus`). Lock-free (a single atomic store, the [`set_active_root`] shape);
+/// the caller validates the handle before recording, and [`is_focused`] compares by value, so a
+/// stale record can never claim focus for a reused slot's new occupant.
+pub fn set_focused_view(handle: ViewHandle) {
+    FOCUSED_VIEW.store(handle, Ordering::Release);
+}
+
+/// 2026-07-02: the handle of the view that most recently requested focus, or `0` if none has.
+pub fn focused_view() -> ViewHandle {
+    FOCUSED_VIEW.load(Ordering::Acquire)
+}
+
+/// 2026-07-02: whether `handle` is the currently focused view — the pure core `View.nativeIsFocused`
+/// serves to Java (`isFocused()` returns the native's answer verbatim, installed-dex-verified). The
+/// reserved `0` handle is never focused, even before any view requests focus.
+pub fn is_focused(handle: ViewHandle) -> bool {
+    handle != 0 && handle == focused_view()
 }
 
 /// 2026-06-13: find the live view whose recorded [`ViewState::class_name`] equals `name`, returning
@@ -615,6 +666,70 @@ mod tests {
         // The same handle is now stale (generation bumped); a second free returns StaleHandle, not a
         // panic or free-list corruption.
         assert_eq!(free(h), Err(ViewRegistryError::StaleHandle));
+    }
+
+    // 2026-07-02: the View LAYOUT/GEOMETRY remainder pass — round-trip the new registry-backed
+    // state. `frame` is what `View.native_layout` records (Eclipse-side bookkeeping; the Java
+    // read-back is field-backed — see ViewState::frame); a regression here silently drops the
+    // recorded laid-out geometry.
+    #[test]
+    fn frame_records_layout_and_rejects_stale_handles() {
+        let v = allocate("android.view.View").expect("allocate");
+        assert_eq!(
+            with_view(v, |s| s.frame).expect("read fresh"),
+            None,
+            "a never-laid-out view has no recorded frame"
+        );
+        set_frame(v, [10, 20, 110, 220]).expect("set_frame");
+        assert_eq!(
+            with_view(v, |s| s.frame).expect("read back"),
+            Some([10, 20, 110, 220]),
+            "native_layout's record must read back verbatim [l, t, r, b]"
+        );
+        // Re-layout overwrites (offsetTopAndBottom re-enters layout() with a shifted frame).
+        set_frame(v, [10, 25, 110, 225]).expect("re-set_frame");
+        assert_eq!(
+            with_view(v, |s| s.frame).expect("read shifted"),
+            Some([10, 25, 110, 225])
+        );
+        free(v).expect("free");
+        assert_eq!(
+            set_frame(v, [0, 0, 1, 1]),
+            Err(ViewRegistryError::StaleHandle),
+            "a freed handle must be rejected, never resurrect the slot"
+        );
+    }
+
+    // 2026-07-02: the nativeRequestFocus → nativeIsFocused coupled pair. The installed dex's
+    // isFocused() returns the native's answer verbatim, so the record must be honest: the LAST view
+    // that requested focus is focused, `0` never is, and a freed slot's reused occupant is never
+    // claimed by the stale record (generation-distinct handles). Single test (sequential) because
+    // FOCUSED_VIEW is process-global.
+    #[test]
+    fn focus_record_serves_the_last_requester_and_never_the_null_or_reused_handle() {
+        let a = allocate("android.widget.EditText").expect("allocate a");
+        let b = allocate("android.widget.Button").expect("allocate b");
+        assert!(!is_focused(0), "the reserved null handle is never focused");
+        set_focused_view(a);
+        assert_eq!(focused_view(), a);
+        assert!(is_focused(a), "the last requester reads focused");
+        assert!(!is_focused(b), "a non-requester reads unfocused");
+        // Focus moves: the newest requester wins, the old one reads unfocused.
+        set_focused_view(b);
+        assert!(is_focused(b));
+        assert!(!is_focused(a));
+        // A freed-then-reused slot gets a NEW generation, so the stale record can never claim focus
+        // for the new occupant.
+        set_focused_view(a);
+        free(a).expect("free a");
+        let reused = allocate("android.view.View").expect("reuse slot");
+        assert!(
+            !is_focused(reused),
+            "a reused slot's new handle must not inherit the freed view's focus"
+        );
+        set_focused_view(0); // leave the process-global record cleared for other tests
+        free(b).expect("free b");
+        free(reused).expect("free reused");
     }
 
     #[test]
