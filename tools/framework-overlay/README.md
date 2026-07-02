@@ -34,8 +34,13 @@ other class resolves unchanged from `classes2.dex`.
   committed **patched copies** of ATL's (Apache-2.0) sources, with `ECLIPSE PATCH` markers.
 - `stubs/` are **compile-only** shells so `javac` can compile the patched sources without
   ATL's full source tree (`api-impl.jar` ships dex, not classfiles, so it cannot be a
-  javac classpath). Stubs are **excluded from the dex** — only `Build*`, `NetworkRequest*`
-  and `ActivityManager*` classes are dexed.
+  javac classpath). Stubs are **excluded from the dex** — only the whitelisted patched
+  classes are dexed. ⚠️ **Never stub a `static final` constant with a placeholder value:**
+  javac inlines it into the dexed bytecode (2026-07-02: a stub `internal.R.attr.id = 0`
+  silently dropped LayoutInflater's `<include android:id>` override → the challenge
+  fragment's RobloxToolbar NPE). `com.android.internal.R` is therefore compiled from the
+  **vendored ATL source** (`$ATL_SRC/com/android/internal/R.java`, guarded in the script),
+  not a stub; the built `classes.dex` is baksmali-verified to carry the real inlined ids.
 
 ## Usage
 

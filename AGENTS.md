@@ -128,6 +128,74 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-02 — 🪛 RobloxToolbar include-id NPE ROOT-CAUSED + FIXED (overlay stub-R javac constant-inlining) —
+  ✅ VALIDATED by the 2026-07-02 challenge7 boot + COMMITTED 2026-07-02.** Validation
+  (`/tmp/eclipse-challenge7.log`, 1638 lines, boot window 19:44–19:47 UTC, EXIT=124 clean timeout kill): 180 s
+  fully-autonomous login re-drive, identical challenge6 stage chain (stage 0 ENGINE_TAP 419,531 / stages 1+2 TYPE
+  278,179:robloxtest / stage 3 NEXT 400,236 / stage 4 TYPE2 241,327:<pw> / stage 5 SUBMIT 349,377), APK
+  roblox-2.724.735-merged; the overlay was REBUILT FRESH this run (`~/.cache/eclipse` had been wiped again — the
+  known recurring cache-wipe event) via `bash tools/framework-overlay/patch-framework.sh`, its §1e + §4a guards
+  green during that build. **BOOT-WATCH VERDICTS: (a) CONFIRMED — the `RobloxToolbar.setVisibility` NPE is GONE**
+  (0 hits; 0 `NullPointerException` anywhere in the log; challenge6 had it at 05:23:49.923). **(b) CONFIRMED** —
+  exactly two `AppCompatViewInflater` app:theme deprecation lines (19:46:11.427 + 19:46:15.213, log lines
+  1518/1523): both `toolbar_include` RobloxToolbar constructions fire. **(c) ANSWERED — NEW FRONTIER ⇐
+  START-HERE-NEXT: bind the installed framework's `android.graphics.Paint` native surface.** The rbx.web fragment
+  inflation proceeds PAST the old failure point (the new stack goes through `yh.d.onCreateView Unknown Source:237`
+  — 50 lines further than challenge6's `:187` — via `com.roblox.client.c.onCreateView` →
+  `LayoutInflater.inflate:165`) and dies at 19:46:22.06 on the NEXT unbound native: `UnsatisfiedLinkError: No
+  implementation found for void android.graphics.Paint.native_set_stroke_cap(long, int)` at `Paint.setStrokeCap`
+  ← `f5.b$c.<init>` (the androidx CircularProgressDrawable ring) ←
+  `androidx.swiperefreshlayout.widget.SwipeRefreshLayout.<init>` ←
+  `com.roblox.client.components.CustomSwipeRefreshLayout.<init>` — the swipe-refresh wrapper of the web fragment's
+  layout, hit BEFORE any WebView child (log lines 1543–1576: RuntimeException ← InvocationTargetException ← the
+  ULE, escaping `Handler.dispatchMessage`). Per the proven 🎨 class-pattern (2026-07-02): baksmali-audit the WHOLE
+  reachable Paint native surface of the INSTALLED framework (the vendored `Paint.java` may have drifted exactly
+  like `Drawable.java` did), bind it in ONE per-method best-effort pass in `src/framework.rs`
+  (`Paint.native_set_stroke_cap(JI)V` is the discovery signal), then re-drive the same 180 s validation boot.
+  **(d) CONFIRMED** — that ULE is the ONLY `UnsatisfiedLinkError` in the log (the 2 `No implementation found` hits
+  are the ART java_vm_ext line + the exception line of the SAME event) and the only NEW inflation exception (the
+  known applyStyle `inflate(0x0)` upgrade-dialog defect still fires at 19:44:40 — unchanged); Eclipse logs
+  `framework lifecycle step failed step="Handler.dispatchMessage"` (19:46:22.079) and the boot does NOT abort: the
+  engine stays alive to the 180 s kill (last log 19:47:08), NO teardown SEGV. **(e)** no theme-related regressions
+  observed anywhere. NEW FACT: a SINGLE challenge-adjacent `Run book keeping for signal 11` + crashpad `Handle a
+  real crash` pair at 19:46:11.058 (engine clock 119.03 s), ~54 µs after the rbx.web `d.onCreate` line (log lines
+  1512–1515) — NON-FATAL: both toolbar constructions and 11 more seconds of fragment work happen after it, engine
+  alive to the kill. This reproduces the 2026-07-01 tvfix-era challenge-adjacent signal-11 that challenge6 did NOT
+  reproduce, and proves it first-chance-handled/survivable; NO splash-era signal-11 this boot (challenge6 had one
+  at app-time 8.5 s — timing variance). Baseline all green: splash steps 1–7 complete (`ActivitySplash` resumed
+  19:44:20.868, log line 579), full stage chain fired (24 `handled=true` typed chars, 120 `consumed=true`),
+  Landing 19:44:37 → LoginV2 19:46:01 → `v2/login` POST 403 "Challenge is required" 19:46:10.939 (line 1493) →
+  `ChallengeNativeWrapper` → `ChallengeHybridWebView` → rbx.web `d.onCreate` 19:46:11.058. This
+  resolves the 🧩 START-HERE-NEXT below. CONFIRMED ROOT CAUSE (dex-level evidence): the overlay's compile-only stub
+  `tools/framework-overlay/stubs/com/android/internal/R.java` declared `attr.id = 0` / `attr.theme = 0`, and javac
+  INLINES `static final int` constants — so the ACTIVE (first-dex-wins) overlay `LayoutInflater.parseInclude`'s
+  `<include android:id>` override compiled to `obtainStyledAttributes(attrs, new int[]{0})` (baksmali of the
+  installed classes.dex, `.line 364`: `new-array v1; aput v5(=0)`), and `createView`'s `android:theme` read compiled
+  to `new int[]{0}` too (`.line 92`). Attribute id 0 never resolves (`src/framework.rs` `resolve_xml_attributes`
+  correctly refuses `name_resource == 0`) → `TypedArray.getResourceId(0,0)` returns 0 → `view.setId` skipped. The
+  challenge fragment's layout `res/layout/toolbar_frame.xml` (Eclipse's own axml reader) has TWO
+  `<include layout=@layout/toolbar_include>` whose override ids `@id/toolbar1`/`@id/toolbar2` (0x7f09027b/7c) are the
+  ONLY ids the two `RobloxToolbar` roots can get — `toolbar_include.xml`'s root carries NO android:id — so the app's
+  `findViewById(R.id.toolbar1/2)` returned null → `RobloxToolbar.setVisibility(int)` NPE at `yh.d.onCreateView`
+  (the FRAGMENT lifecycle method, per the full challenge6 stack: `Fragment.performCreateView` → `FragmentManager`,
+  no inflater frames — the null is the app's own post-inflate lookup). Eclipse-native side EXONERATED
+  (`resolve_xml_attributes` serves android:id=0x010100d0 TYPE_REFERENCE with `resource_id` preserved; arsc id
+  entries are TYPE_BOOLEAN(0x12) so ATL `getResourceId`'s `!= TYPE_NULL` guard passes). FIX (root cause, not
+  symptom): the stub R is DELETED; the overlay now compiles against the VENDORED
+  `$ATL_SRC/com/android/internal/R.java` (the authoritative source classes3.dex was built with; real values
+  `id=0x010100d0`, `theme=0x01010000`) plus a new compile-only `stubs/android/annotation/SystemApi.java` it needs.
+  Same-pattern audit: those two were the ONLY internal-R usages in overlay src, and no other stub declares a
+  non-zero-risk `static final` constant. REGRESSION GUARDS (patch-framework.sh): §1e source guards (vendored R
+  declares the two constants exactly; the stub must NEVER re-appear) + §4a DEX-LEVEL guard (baksmali the built
+  classes.dex; LayoutInflater.smali must carry the inlined `0x10100d0` + `0x1010000` — catches constant-inlining
+  directly, which source greps cannot); Rust-side pin
+  `resolve_xml_attributes_serves_include_android_id_and_never_matches_attr_zero` (plain `cargo test`; pins the
+  native half of the include-id contract + that attr id 0 never matches). Overlay rebuilt via
+  `bash tools/framework-overlay/patch-framework.sh` (repo defaults; installed to
+  `~/.cache/eclipse/framework-patched`, dex re-verified `const v2, 0x10100d0`). Gate green (fmt/build/clippy -D
+  warnings/584 unit + 4 integ + 2 doctest/release). The five boot-watch items this bullet carried are ALL resolved
+  by the challenge7 verdicts above (the (c) prediction "ATL's stub WebView is likely the next gap" was WRONG in
+  the detail — the swipe-refresh wrapper's Paint natives trip first, BEFORE any WebView child).
 - **2026-07-02 — 🧩 VALIDATION VERDICT on the FULL three-pass stack (🧵 string-pool cookies + 📼 asset-stream
   contracts + 🎨 drawable/bitmap paintable surface) — `/tmp/eclipse-challenge6.log`, 180 s fully-autonomous login
   re-drive at this exact tree: ALL CLEAN, all three passes VALIDATED (committed together this session).** Signals:
@@ -146,7 +214,9 @@ before any history-rewriting/force operation.
   at app-time 8.5 s (05:23:10.893, predates this work); (b) the fragment inflation emits exactly two
   `AppCompatViewInflater` app:theme deprecation lines (the two toolbar includes, 05:23:41.294 + 05:23:45.120), then
   the NPE lands ~4.8 s after the second; (c) the app falls back to `onAppReady: LoginV2` after the ~60 s challenge
-  timeout (05:24:41.921) — engine alive to the 180 s kill. **⇐ START-HERE-NEXT: the toolbar-null is an
+  timeout (05:24:41.921) — engine alive to the 180 s kill. **⇐ START-HERE-NEXT (RESOLVED 2026-07-02 — see the 🪛
+  bullet above; right in effect, but the divergence was NOT ATL's Java, which DOES override the id — it was the
+  OVERLAY's stub `com.android.internal.R.attr.id = 0` javac-inlined into parseInclude): the toolbar-null is an
   inflation-SEMANTICS bug, not resource resolution. Prime suspect: ATL `LayoutInflater.parseInclude` id-override
   handling — Android semantics require `<include android:id=…>` to OVERRIDE the included root view's id; a
   divergence makes the app's `findViewById` miss the RobloxToolbar root. Diagnose FIRST-PARTY ONLY: the layout XMLs
@@ -4490,6 +4560,112 @@ id, or applies neither), the app's `findViewById(R.id.<toolbar-frame id>)` misse
 `setVisibility` NPE at exactly this shape. Diagnosis is FIRST-PARTY ONLY: dump `toolbar_frame.xml` /
 `toolbar_include.xml` id attributes with Eclipse's own `apk::axml` reader and read the vendored/installed ATL
 `LayoutInflater` source/smali side-by-side; no app-code decompilation.
+
+---
+
+### 2026-07-02 — 🪛 RobloxToolbar include-id NPE root-caused: the OVERLAY's stub `com.android.internal.R` (attr.id = 0) was javac-CONSTANT-INLINED into `parseInclude`, silently dropping every `<include android:id>` override — fixed by compiling the overlay against the VENDORED internal R.java (+ source/dex-level guards); UNCOMMITTED pending validation boot
+
+*Diagnosis trail (all first-party, per the 🧩 plan):*
+1. **Layouts (Eclipse's own `apk::axml` reader, temp probe test, deleted after):** the challenge fragment layout
+   `res/layout/toolbar_frame.xml` = `LinearLayout[ include(android:id=@0x7f09027b, layout=@0x7f0c00a3),
+   include(android:id=@0x7f09027c, layout=@0x7f0c00a3), FrameLayout(id=@0x7f0900a9)[ ImageView(topbar_ic_close) ] ]`;
+   `res/layout/toolbar_include.xml`'s root `com.roblox.client.components.RobloxToolbar` has **NO android:id of its
+   own** (children: toolbar_close_button/back_button/title/subtitle). ARSC (own `apk::arsc` reader):
+   0x7f09027b/7c = `id/toolbar1`/`id/toolbar2` (TYPE_BOOLEAN entries, normal aapt shape); 0x7f0c00a3 =
+   `layout/toolbar_include`. ⇒ the include-tag override ids are the ONLY handle the app has on the two toolbars.
+2. **Active inflater identified:** the challenge3-era stack line numbers (createViewFromTag:136, rInflate:284,
+   inflate:230/163/154) match `tools/framework-overlay/src/android/view/LayoutInflater.java` EXACTLY (not the
+   vendored file) — the overlay's LayoutInflater (classes.dex, first-dex-wins, shipped 2026-06-13 for the
+   `<requestFocus/>` fix) is what runs. Its Java DOES implement the AOSP include-id override
+   (`obtainStyledAttributes(attrs, {com.android.internal.R.attr.id})` → `getResourceId` → `setId`).
+3. **The challenge6 NPE stack has NO inflater frames** (`yh.d.onCreateView` ← `yh.k.onCreateView` ←
+   `Fragment.performCreateView` ← `FragmentManager`): the NPE is the app's own **post-inflate findViewById miss**,
+   not a factory callback — consistent with a dropped id override.
+4. **Eclipse-native side exonerated:** `resolve_xml_attributes`/`applyStyle` (src/framework.rs) serve
+   `android:id` (name_resource 0x010100d0) from the include element with `resource_id` preserved through the
+   reference chase; ATL `TypedArray.getResourceId` reads STYLE_RESOURCE_ID@3 with a `!= TYPE_NULL` guard, and the
+   arsc id entries are TYPE_BOOLEAN → the guard passes. ATL `View.setId`/`ViewGroup.findViewById` are plain-Java
+   and sound.
+5. **SMOKING GUN (baksmali of the INSTALLED overlay classes.dex, `LayoutInflater.smali` `.line 364`):**
+   `new-array v1, v6(=1), [I; aput v5(=0), v1, v5` — the compiled request array is `{0}`, not `{0x010100d0}`.
+   `tools/framework-overlay/stubs/com/android/internal/R.java` declared `attr.id = 0` / `attr.theme = 0`
+   ("compile-only" placeholders), but **javac inlines `static final int` constants into bytecode** — the stub's
+   values SHIPPED inside the dexed LayoutInflater. Attr id 0 never matches (resolve_xml_attributes refuses
+   `name_resource == 0`) → `getResourceId` → 0 → `if (id != 0) setId` skipped → both RobloxToolbars end with NO_ID
+   → `findViewById(id/toolbar1|toolbar2)` → null → the NPE. Same inlining also killed `createView`'s
+   `android:theme` (0x01010000) handling on every tag (silent — themes just didn't apply).
+
+*Fix (root cause; tools/framework-overlay/):* deleted the stub R.java entirely — the overlay now compiles against
+the **vendored** `$ATL_SRC/com/android/internal/R.java` (the authoritative aapt-generated source the stock
+classes3.dex was built with; real `id=0x010100d0`, `theme=0x01010000`), passed to javac explicitly (its R*.class
+stay compile-only — the step-3 stage whitelist keeps them out of the dex). New compile-only stub
+`stubs/android/annotation/SystemApi.java` (the one annotation the vendored R references; compile-verified 0.6 s).
+*Same-pattern audit:* `grep com.android.internal` over overlay src → exactly the two LayoutInflater usages; no
+other stub declares an inlinable placeholder constant.
+*Regression guards:* patch-framework.sh **§1e** (vendored R exists + declares both constants byte-exactly; FAIL if
+a stub `com/android/internal/R.java` ever re-appears) and **§4a — dex-level**: baksmali the freshly built
+classes.dex and require `0x10100d0` + `0x1010000` inside LayoutInflater.smali (source greps cannot see what javac
+folded; this catches the whole constant-inlining class in the shipped artifact). Rust-side pin (plain `cargo
+test`): `framework::tests::resolve_xml_attributes_serves_include_android_id_and_never_matches_attr_zero` — an
+include-shaped XmlElement must resolve android:id with `resource_id` preserved + non-NULL type, and a requested
+attr id 0 (the zero-stub failure signature) must never match. README stubs section updated with the
+never-stub-a-constant warning.
+*Status:* overlay REBUILT + INSTALLED (`bash tools/framework-overlay/patch-framework.sh`, repo defaults; installed
+dex re-verified: `.line 364` now `const v2, 0x10100d0`). Gate green (fmt / build --all-targets / clippy -D
+warnings / 584 unit + 4 integ + 2 doctest / release). UNCOMMITTED, pending the validation boot (watch items in the
+§5 🪛 bullet; expected: the NPE gone, the challenge fragment proceeds into ATL's stub WebView — likely the next
+gap).
+
+---
+
+### 2026-07-02 — 🪛 Validation-boot verdict on the include-id fix: ALL boot-watch items CONFIRMED — the RobloxToolbar NPE is GONE, the challenge fragment inflates 50 lines further, and the NEW frontier is the unbound `Paint.native_set_stroke_cap` (the swipe-refresh spinner); fix committed with this entry
+
+*Recipe (`/tmp/eclipse-challenge7.log`, 1638 lines, boot window 19:44–19:47 UTC, EXIT=124 clean timeout kill):*
+180 s fully-autonomous login re-drive at this exact tree, identical challenge6 stage chain (stage 0
+`ECLIPSE_SYNTHETIC_ENGINE_TAP="419,531"` / stages 1+2 `ECLIPSE_SYNTHETIC_TYPE="278,179:robloxtest"` / stage 3
+`ECLIPSE_SYNTHETIC_NEXT="400,236"` / stage 4 `ECLIPSE_SYNTHETIC_TYPE2="241,327:<pw>"` / stage 5
+`ECLIPSE_SYNTHETIC_SUBMIT="349,377"`), APK `roblox-2.724.735-merged`. The overlay was REBUILT FRESH for this run —
+`~/.cache/eclipse` had been wiped again (the known recurring cache-wipe event) — via
+`bash tools/framework-overlay/patch-framework.sh`; its §1e source guards + §4a dex-level baksmali guard both
+passed during that build.
+
+*Boot-watch verdicts (all five):* **(a) CONFIRMED — the `RobloxToolbar.setVisibility(int)` NPE is GONE**: 0 hits,
+and 0 `NullPointerException` of any kind anywhere in the log (challenge6 had it at 05:23:49.923 at
+`yh.d.onCreateView(Unknown Source:187)`). **(b) CONFIRMED** — exactly two `AppCompatViewInflater` app:theme
+deprecation lines (19:46:11.427 + 19:46:15.213, log lines 1518/1523): both `toolbar_include` RobloxToolbar
+constructions fire. **(c) ANSWERED — NEW FRONTIER:** the rbx.web fragment inflation proceeds PAST the old failure
+point — the new stack goes through `yh.d.onCreateView(Unknown Source:237)`, 50 lines further than challenge6's
+`:187`, via `com.roblox.client.c.onCreateView` → `LayoutInflater.inflate:165` — and dies at 19:46:22.06 on the
+NEXT unbound native: `UnsatisfiedLinkError: No implementation found for void
+android.graphics.Paint.native_set_stroke_cap(long, int)` at `Paint.setStrokeCap` ← `f5.b$c.<init>` (the androidx
+CircularProgressDrawable ring) ← `f5.b.<init>` ← `androidx.swiperefreshlayout.widget.SwipeRefreshLayout.<init>` ←
+`com.roblox.client.components.CustomSwipeRefreshLayout.<init>` ← `LayoutInflater.createView` — the swipe-refresh
+wrapper of the web fragment's layout, hit BEFORE any WebView child (log lines 1543–1576: `RuntimeException` ←
+`InvocationTargetException` ← the ULE, escaping `Handler.dispatchMessage`). **(d) CONFIRMED** — that ULE is the
+ONLY `UnsatisfiedLinkError` in the log (the two `No implementation found` hits are the ART java_vm_ext line + the
+exception line of the SAME event) and the only NEW inflation exception (the known applyStyle `inflate(0x0)`
+upgrade-dialog defect, recorded 2026-07-01 🧵, still fires at 19:44:40 — unchanged, untouched). Eclipse logs
+`framework lifecycle step failed step="Handler.dispatchMessage"` (19:46:22.079) and the boot does NOT abort: the
+engine stays alive to the 180 s kill (last log 19:47:08), NO teardown SEGV. **(e)** no theme-related regressions
+observed anywhere.
+
+*New fact:* a SINGLE challenge-adjacent `Run book keeping for signal 11` + crashpad `Handle a real crash` pair at
+19:46:11.058 (engine clock 119.03 s), ~54 µs after the rbx.web `d.onCreate` line (log lines 1512–1515) —
+NON-FATAL: both toolbar constructions and 11 more seconds of fragment work happen after it, engine alive to the
+kill. This reproduces the 2026-07-01 tvfix-era challenge-adjacent signal-11 that challenge6 did NOT reproduce, and
+proves it first-chance-handled/survivable. NO splash-era signal-11 this boot (challenge6 had one at app-time
+8.5 s — timing variance).
+
+*Baseline all green:* splash recipe steps 1–7 complete (`ActivitySplash` resumed 19:44:20.868, log line 579), the
+full 5-stage synthetic chain fired (24 `handled=true` typed chars, 120 `consumed=true`), Landing 19:44:37 →
+LoginV2 19:46:01 → `v2/login` POST 403 "Challenge is required" 19:46:10.939 (line 1493) → `ChallengeNativeWrapper`
+→ `ChallengeHybridWebView` → rbx.web `d.onCreate` 19:46:11.058.
+
+*Next (the §5 START-HERE-NEXT):* bind the installed framework's `android.graphics.Paint` native surface — per the
+proven 🎨 class-pattern (2026-07-02), baksmali-audit the WHOLE reachable Paint native surface of the INSTALLED
+framework (the vendored `Paint.java` may have drifted exactly like `Drawable.java` did) and bind it in one
+per-method best-effort pass in `src/framework.rs` (`Paint.native_set_stroke_cap(JI)V` is the discovery signal),
+then re-drive the same 180 s validation boot.
 
 ---
 
