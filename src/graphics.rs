@@ -150,6 +150,12 @@ struct GameWindow<'vm> {
     /// 2026-06-14 — set once stage 4 (`ECLIPSE_SYNTHETIC_TYPE2="text"`, typed into the field focused after
     /// Next — verifies the password field + its masking) has fired.
     engine_synthetic_typed2_done: bool,
+    /// 2026-07-01 — the instant the stage-4 typing completed, so stage 5 can tap the submit button a
+    /// few seconds later (the same shape as [`Self::engine_typed_at`] → stage 3).
+    engine_typed2_at: Option<std::time::Instant>,
+    /// 2026-07-01 — set once stage 5 (`ECLIPSE_SYNTHETIC_SUBMIT="x,y"`, taps the submit/Log In button
+    /// after the stage-4 typing — completes an autonomous login drive) has fired.
+    engine_synthetic_submit_done: bool,
     /// 2026-06-14 — set once the env-gated engine-input-bridge reflection diagnostic has fired.
     engine_reflect_done: bool,
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
@@ -955,6 +961,7 @@ impl GameWindow<'_> {
                 .filter(|s| !s.is_empty())
             {
                 self.engine_synthetic_typed2_done = true;
+                self.engine_typed2_at = Some(std::time::Instant::now());
                 tracing::info!(
                     chars = text.chars().count(),
                     "synthetic TYPE2 (stage 4): typing into the field focused after Next (password)"
@@ -966,6 +973,31 @@ impl GameWindow<'_> {
                         tracing::info!(handled, "synthetic TYPE2 char → active text field");
                     }
                 }
+                crate::loader::ndk_registry::wake_all_loopers();
+            }
+        }
+
+        // Stage 5 (ECLIPSE_SYNTHETIC_SUBMIT="x,y"): a few seconds after the stage-4 typing, tap the
+        // submit/Log In button once — completes the autonomous login drive (login POST → the anti-bot
+        // challenge path) without a physical mouse. 2026-07-01.
+        if self.engine_synthetic_typed2_done
+            && !self.engine_synthetic_submit_done
+            && self
+                .engine_typed2_at
+                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3))
+        {
+            if let Some((x, y)) =
+                std::env::var_os("ECLIPSE_SYNTHETIC_SUBMIT").and_then(|s| parse_xy(&s))
+            {
+                self.engine_synthetic_submit_done = true;
+                tracing::info!(
+                    x,
+                    y,
+                    "synthetic SUBMIT (stage 5): tapping the submit button"
+                );
+                self.cursor = Some((x, y));
+                self.engine_primary_press();
+                self.engine_primary_release();
                 crate::loader::ndk_registry::wake_all_loopers();
             }
         }
@@ -1003,6 +1035,8 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_synthetic_next_done: false,
         engine_next_at: None,
         engine_synthetic_typed2_done: false,
+        engine_typed2_at: None,
+        engine_synthetic_submit_done: false,
         engine_reflect_done: false,
         key_meta_state: 0,
     };
