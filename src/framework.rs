@@ -6001,8 +6001,23 @@ fn register_view_group_natives(env: &mut Env) -> Result<(), FrameworkError> {
 // drawing at onCreate (the ash/Vulkan render is the deferred big build), so a Paint is backed by the
 // Eclipse-owned [`paint_registry`] — a generational-slab index (NOT a raw pointer), holding only the
 // drawing config (color, text size). A fresh Paint with defaults is a valid Paint; recording its
-// config soundly lets the TextView construct without GTK. Each Paint native the run surfaces is added
-// here. (Paint's native signatures are taken from the ART `No implementation found` lines.)
+// config soundly lets the TextView construct without GTK.
+//
+// 2026-07-02: the WHOLE reachable Paint native surface of the INSTALLED framework audited + bound in
+// one per-method best-effort pass (the 🎨 drawable-pass class pattern), after the challenge7 boot
+// died on `Paint.native_set_stroke_cap` (androidx CircularProgressDrawable ring ← SwipeRefreshLayout
+// ← the rbx.web fragment's CustomSwipeRefreshLayout). The installed classes3.dex `Paint.smali`
+// declares exactly 20 natives (baksmali-confirmed 2026-07-02; NO drift from the vendored
+// `Paint.java`, unlike Drawable): create/clone/recycle lifecycle, get/set for
+// color/alpha/style/stroke-width/stroke-cap/stroke-join/text-size, the write-only
+// color-filter/text-align setters, and `native_get_text_bounds`. Every get* is READ BACK by its Java
+// caller (getStrokeCap/getStrokeJoin/getStyle index `Enum.values[...]` with the return — the value
+// MUST be an in-range ordinal), so the getters serve honest values from the registry (the
+// native_getText precedent: record on set, serve on get). `native_get_text_bounds` is deliberately
+// LEFT UNBOUND: it is real text measurement (the ATL reference native runs a Pango layout), its Rect
+// out-param is read back (`getTextBounds`/`getTextWidths`), and the headless recording model cannot
+// serve honest metrics — the clean call-time UnsatisfiedLinkError stays the discovery signal
+// (🎨 rule, same as the Bitmap pixel-content natives).
 
 /// `android.graphics.Paint` (internal/slashed name for `find_class`) — hosts the Paint natives.
 pub const PAINT_CLASS: &JNIStr = jni_str!("android/graphics/Paint");
@@ -6038,6 +6053,41 @@ const PAINT_NATIVE_SET_STYLE_SIG: &JNIStr = jni_str!("(JI)V");
 // custom View `MultiTouch.<init>` → Paint.setTextSize): a static native, descriptor `(JF)V`.
 const PAINT_NATIVE_SET_TEXT_SIZE_NAME: &JNIStr = jni_str!("native_set_text_size");
 const PAINT_NATIVE_SET_TEXT_SIZE_SIG: &JNIStr = jni_str!("(JF)V");
+
+// 2026-07-02: the rest of the installed Paint native surface (all `private static native`,
+// installed classes3.dex `Paint.smali`, baksmali-confirmed 2026-07-02; identical declarations in the
+// vendored `Paint.java`). `native_set_stroke_cap(JI)V` is the challenge7 discovery signal
+// (`No implementation found for void android.graphics.Paint.native_set_stroke_cap(long, int)` at
+// `Paint.setStrokeCap` ← the androidx CircularProgressDrawable ring, /tmp/eclipse-challenge7.log
+// lines 1543–1576).
+const PAINT_NATIVE_CLONE_NAME: &JNIStr = jni_str!("native_clone");
+const PAINT_NATIVE_CLONE_SIG: &JNIStr = jni_str!("(J)J");
+const PAINT_NATIVE_RECYCLE_NAME: &JNIStr = jni_str!("native_recycle");
+const PAINT_NATIVE_RECYCLE_SIG: &JNIStr = jni_str!("(J)V");
+const PAINT_NATIVE_GET_COLOR_NAME: &JNIStr = jni_str!("native_get_color");
+const PAINT_NATIVE_GET_COLOR_SIG: &JNIStr = jni_str!("(J)I");
+const PAINT_NATIVE_SET_ALPHA_NAME: &JNIStr = jni_str!("native_set_alpha");
+const PAINT_NATIVE_SET_ALPHA_SIG: &JNIStr = jni_str!("(JI)V");
+const PAINT_NATIVE_GET_ALPHA_NAME: &JNIStr = jni_str!("native_get_alpha");
+const PAINT_NATIVE_GET_ALPHA_SIG: &JNIStr = jni_str!("(J)I");
+const PAINT_NATIVE_GET_STYLE_NAME: &JNIStr = jni_str!("native_get_style");
+const PAINT_NATIVE_GET_STYLE_SIG: &JNIStr = jni_str!("(J)I");
+const PAINT_NATIVE_GET_STROKE_WIDTH_NAME: &JNIStr = jni_str!("native_get_stroke_width");
+const PAINT_NATIVE_GET_STROKE_WIDTH_SIG: &JNIStr = jni_str!("(J)F");
+const PAINT_NATIVE_SET_STROKE_CAP_NAME: &JNIStr = jni_str!("native_set_stroke_cap");
+const PAINT_NATIVE_SET_STROKE_CAP_SIG: &JNIStr = jni_str!("(JI)V");
+const PAINT_NATIVE_GET_STROKE_CAP_NAME: &JNIStr = jni_str!("native_get_stroke_cap");
+const PAINT_NATIVE_GET_STROKE_CAP_SIG: &JNIStr = jni_str!("(J)I");
+const PAINT_NATIVE_SET_STROKE_JOIN_NAME: &JNIStr = jni_str!("native_set_stroke_join");
+const PAINT_NATIVE_SET_STROKE_JOIN_SIG: &JNIStr = jni_str!("(JI)V");
+const PAINT_NATIVE_GET_STROKE_JOIN_NAME: &JNIStr = jni_str!("native_get_stroke_join");
+const PAINT_NATIVE_GET_STROKE_JOIN_SIG: &JNIStr = jni_str!("(J)I");
+const PAINT_NATIVE_GET_TEXT_SIZE_NAME: &JNIStr = jni_str!("native_get_text_size");
+const PAINT_NATIVE_GET_TEXT_SIZE_SIG: &JNIStr = jni_str!("(J)F");
+const PAINT_NATIVE_SET_COLOR_FILTER_NAME: &JNIStr = jni_str!("native_set_color_filter");
+const PAINT_NATIVE_SET_COLOR_FILTER_SIG: &JNIStr = jni_str!("(JII)V");
+const PAINT_NATIVE_SET_TEXT_ALIGN_NAME: &JNIStr = jni_str!("native_set_text_align");
+const PAINT_NATIVE_SET_TEXT_ALIGN_SIG: &JNIStr = jni_str!("(JI)V");
 
 /// `Paint.native_create()` → a real Eclipse-owned [`paint_registry`] handle (2026-06-05).
 ///
@@ -6199,71 +6249,542 @@ extern "system" fn paint_native_set_text_size<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// AOSP `Paint.setAlpha` color merge: replace ONLY the alpha channel of an ARGB color, preserving
+/// RGB (2026-07-02). The ATL reference native does exactly this (`color.alpha = (alpha & 0xFF)/255`
+/// with red/green/blue untouched). `alpha` is masked to its low byte first, so an out-of-range Java
+/// int cannot corrupt the RGB bits. Pure — unit-tested without a VM
+/// (`paint_color_with_alpha_replaces_only_the_alpha_channel`).
+fn paint_color_with_alpha(color: jint, alpha: jint) -> jint {
+    (color & 0x00FF_FFFF) | ((alpha & 0xFF) << 24)
+}
+
+/// `Paint.native_clone(long src)` → a NEW registry handle whose state copies `src`'s (2026-07-02).
+///
+/// Static native `(J)J` — the backing for the `Paint(Paint)` copy constructor and `Paint.set(Paint)`
+/// (installed `Paint.smali`: both store the return into `this.paint`, which every later get/set
+/// resolves — so the clone must be a live, independent handle, exactly [`paint_registry::clone_of`]).
+/// A stale/`0` source (e.g. a Paint whose handle Eclipse never saw) degrades to a FRESH default
+/// paint (warn-logged): AOSP's `Paint(Paint)` always yields a working Paint, so a broken source must
+/// not produce a dead clone that poisons every later call on the new Paint. Returns `0` only if the
+/// registry itself fails.
+///
+/// 2026-07-02 (review fix): the one ATL caller shape that fed this fallback a freed handle — a
+/// self-set `p.set(p)`, whose installed Java recycles `this.paint` BEFORE cloning `paint.paint` (a
+/// use-after-free in ATL's own reference native; a state-losing default-paint reset here, where AOSP
+/// preserves the state) — is closed at the ROOT by the overlay's AOSP self-set guard in
+/// `Paint.set(Paint)` (`tools/framework-overlay/patch-framework.sh`, anchor-guarded). So this warn
+/// firing in a boot log now means a genuinely dead/foreign source, not a self-set.
+extern "system" fn paint_native_clone<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    src: jlong,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> {
+        match paint_registry::clone_of(src) {
+            Ok(handle) => {
+                tracing::trace!(
+                    target: "android.graphics.Paint",
+                    src,
+                    handle,
+                    "Paint.native_clone: cloned paint-registry state"
+                );
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "android.graphics.Paint",
+                    src,
+                    error = %e,
+                    "Paint.native_clone: dead source handle → fresh default paint"
+                );
+                Ok(paint_registry::allocate().unwrap_or(0))
+            }
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_recycle(long paint)` → free the recorded registry slot (2026-07-02).
+///
+/// Static native `(J)V`, called from `Paint.set(Paint)` (frees the old handle before storing the
+/// clone — installed `Paint.smali`). The ONE free bookkeeping in the recorded-paint model. `0` is
+/// skipped ("no paint"); a stale/fabricated handle is a bounds+generation-checked debug log, never
+/// UB (mirrors `Bitmap.native_recycle`).
+extern "system" fn paint_native_recycle<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if native_paint == 0 {
+            return Ok(());
+        }
+        match paint_registry::free(native_paint) {
+            Ok(()) => tracing::trace!(
+                target: "android.graphics.Paint",
+                native_paint,
+                "Paint.native_recycle: freed recorded paint"
+            ),
+            Err(e) => tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                error = %e,
+                "Paint.native_recycle: dead handle (ignored)"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_get_color(long paint)` → the recorded ARGB color (2026-07-02).
+///
+/// Static native `(J)I`; `Paint.getColor()` returns it verbatim, so it serves the honest recorded
+/// value. A dead handle reads as the default-paint color (opaque black — what a fresh AOSP/ATL
+/// paint reports), debug-logged.
+extern "system" fn paint_native_get_color<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(
+            paint_registry::with_paint(native_paint, |p| p.color).unwrap_or_else(|e| {
+                tracing::debug!(
+                    target: "android.graphics.Paint",
+                    native_paint,
+                    error = %e,
+                    "Paint.native_get_color: invalid paint handle → default (opaque black)"
+                );
+                paint_registry::PaintState::default().color
+            }),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_set_alpha(long paint, int alpha)` → replace the recorded color's alpha channel
+/// (2026-07-02).
+///
+/// Static native `(JI)V`. AOSP/ATL semantics: ONLY the alpha byte changes, RGB is preserved
+/// ([`paint_color_with_alpha`]) — `Paint.getAlpha()` then reads it back through
+/// `native_get_alpha`. A bad/stale handle is logged and ignored.
+extern "system" fn paint_native_set_alpha<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    alpha: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = paint_registry::with_paint(native_paint, |p| {
+            p.color = paint_color_with_alpha(p.color, alpha);
+        }) {
+            tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                error = %e,
+                "Paint.native_set_alpha: invalid paint handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_get_alpha(long paint)` → the recorded color's alpha byte (2026-07-02).
+///
+/// Static native `(J)I`; `Paint.getAlpha()` returns it verbatim. A dead handle reads as 255 (a
+/// fresh AOSP/ATL paint is fully opaque — 0 would make alpha-scaling callers compute
+/// fully-transparent), debug-logged.
+extern "system" fn paint_native_get_alpha<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(
+            paint_registry::with_paint(native_paint, |p| (p.color >> 24) & 0xFF).unwrap_or_else(
+                |e| {
+                    tracing::debug!(
+                        target: "android.graphics.Paint",
+                        native_paint,
+                        error = %e,
+                        "Paint.native_get_alpha: invalid paint handle → 255 (opaque default)"
+                    );
+                    0xFF
+                },
+            ),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_get_style(long paint)` → the recorded style's AOSP ordinal (2026-07-02).
+///
+/// Static native `(J)I`; `Paint.getStyle()` indexes `Style.values[...]` with the return, so the
+/// value MUST be in 0..=2 — [`paint_registry::PaintStyle::ordinal`] is in-range by construction.
+/// A dead handle reads as 0 (FILL, the AOSP default), debug-logged.
+extern "system" fn paint_native_get_style<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(
+            paint_registry::with_paint(native_paint, |p| p.style.ordinal()).unwrap_or_else(|e| {
+                tracing::debug!(
+                    target: "android.graphics.Paint",
+                    native_paint,
+                    error = %e,
+                    "Paint.native_get_style: invalid paint handle → 0 (FILL)"
+                );
+                0
+            }),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_get_stroke_width(long paint)` → the recorded stroke width (2026-07-02).
+///
+/// Static native `(J)F`; `Paint.getStrokeWidth()` returns it verbatim. Eclipse records the width
+/// as set — including AOSP's 0 = hairline (the ATL reference coerces 0 → 1 only because GSK cannot
+/// represent a hairline; the recording model has no such limitation). A dead handle reads as 0.0.
+extern "system" fn paint_native_get_stroke_width<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) -> jfloat {
+    env.with_env(|_env| -> jni::errors::Result<jfloat> {
+        Ok(
+            paint_registry::with_paint(native_paint, |p| p.stroke_width).unwrap_or_else(|e| {
+                tracing::debug!(
+                    target: "android.graphics.Paint",
+                    native_paint,
+                    error = %e,
+                    "Paint.native_get_stroke_width: invalid paint handle → 0.0"
+                );
+                0.0
+            }),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_set_stroke_cap(long paint, int cap)` → record the stroke end-cap (2026-07-02).
+///
+/// Static native `(JI)V` — THE challenge7 discovery signal (`Paint.setStrokeCap` ← `f5.b$c.<init>`,
+/// the androidx CircularProgressDrawable ring ← SwipeRefreshLayout ← the rbx.web fragment's
+/// CustomSwipeRefreshLayout, /tmp/eclipse-challenge7.log). `cap` is the AOSP `Paint.Cap` ordinal
+/// (BUTT=0, ROUND=1, SQUARE=2), mapped via [`paint_registry::StrokeCap::from_ordinal`] (unknown →
+/// BUTT); `Paint.getStrokeCap()` reads it back through `native_get_stroke_cap`. A bad/stale handle
+/// is logged and ignored.
+extern "system" fn paint_native_set_stroke_cap<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    cap: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let resolved = paint_registry::StrokeCap::from_ordinal(cap);
+        if let Err(e) = paint_registry::with_paint(native_paint, |p| p.stroke_cap = resolved) {
+            tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                cap,
+                error = %e,
+                "Paint.native_set_stroke_cap: invalid paint handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_get_stroke_cap(long paint)` → the recorded cap's AOSP ordinal (2026-07-02).
+///
+/// Static native `(J)I`; `Paint.getStrokeCap()` indexes `Cap.values[...]` with the return — in
+/// 0..=2 by construction ([`paint_registry::StrokeCap::ordinal`]). A dead handle reads as 0 (BUTT).
+extern "system" fn paint_native_get_stroke_cap<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(
+            paint_registry::with_paint(native_paint, |p| p.stroke_cap.ordinal()).unwrap_or_else(
+                |e| {
+                    tracing::debug!(
+                        target: "android.graphics.Paint",
+                        native_paint,
+                        error = %e,
+                        "Paint.native_get_stroke_cap: invalid paint handle → 0 (BUTT)"
+                    );
+                    0
+                },
+            ),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_set_stroke_join(long paint, int join)` → record the stroke join (2026-07-02).
+///
+/// Static native `(JI)V`. `join` is the AOSP `Paint.Join` ordinal (MITER=0, ROUND=1, BEVEL=2),
+/// mapped via [`paint_registry::StrokeJoin::from_ordinal`] (unknown → MITER);
+/// `Paint.getStrokeJoin()` reads it back. A bad/stale handle is logged and ignored.
+extern "system" fn paint_native_set_stroke_join<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    join: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let resolved = paint_registry::StrokeJoin::from_ordinal(join);
+        if let Err(e) = paint_registry::with_paint(native_paint, |p| p.stroke_join = resolved) {
+            tracing::debug!(
+                target: "android.graphics.Paint",
+                native_paint,
+                join,
+                error = %e,
+                "Paint.native_set_stroke_join: invalid paint handle (ignored)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_get_stroke_join(long paint)` → the recorded join's AOSP ordinal (2026-07-02).
+///
+/// Static native `(J)I`; `Paint.getStrokeJoin()` indexes `Join.values[...]` with the return — in
+/// 0..=2 by construction ([`paint_registry::StrokeJoin::ordinal`]). A dead handle reads as 0 (MITER).
+extern "system" fn paint_native_get_stroke_join<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(
+            paint_registry::with_paint(native_paint, |p| p.stroke_join.ordinal()).unwrap_or_else(
+                |e| {
+                    tracing::debug!(
+                        target: "android.graphics.Paint",
+                        native_paint,
+                        error = %e,
+                        "Paint.native_get_stroke_join: invalid paint handle → 0 (MITER)"
+                    );
+                    0
+                },
+            ),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_get_text_size(long paint)` → the recorded text size (2026-07-02).
+///
+/// Static native `(J)F`; read back by `Paint.getTextSize()` AND consumed by the vendored Java's own
+/// text math (`ascent()` returns `-getTextSize()`; `measureText` approximates from it), so the
+/// honest recorded value keeps that math consistent with what setters stored. A dead handle reads
+/// as 0.0 (the ATL reference also reports 0 on a fresh pango font description).
+extern "system" fn paint_native_get_text_size<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+) -> jfloat {
+    env.with_env(|_env| -> jni::errors::Result<jfloat> {
+        Ok(
+            paint_registry::with_paint(native_paint, |p| p.text_size).unwrap_or_else(|e| {
+                tracing::debug!(
+                    target: "android.graphics.Paint",
+                    native_paint,
+                    error = %e,
+                    "Paint.native_get_text_size: invalid paint handle → 0.0"
+                );
+                0.0
+            }),
+        )
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_set_color_filter(long paint, int mode, int color)` → validated no-op (2026-07-02).
+///
+/// Static native `(JII)V`, called from `Paint.setColorFilter` (a PorterDuff mode ordinal + color,
+/// or `(-1, 0)` to clear). Write-only in the recording model: the Java side retains the
+/// `ColorFilter` object itself and serves `getColorFilter()` from it (installed `Paint.smali` — no
+/// native reader exists), and the headless model composites nothing (the engine renders the
+/// screen). Recording nothing is honest; the trace log keeps the call observable.
+extern "system" fn paint_native_set_color_filter<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    mode: jint,
+    color: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.Paint",
+            native_paint,
+            mode,
+            color,
+            "Paint.native_set_color_filter: no-op (headless recording; Java retains the ColorFilter)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `Paint.native_set_text_align(long paint, int align)` → validated no-op (2026-07-02).
+///
+/// Static native `(JI)V`, called from `Paint.setTextAlign` with the AOSP `Paint.Align` ordinal.
+/// Write-only in the recording model: the Java side stores the `Align` in its own `align` field
+/// FIRST and serves `getTextAlign()` from that field (installed `Paint.smali` — no native reader
+/// exists; the ATL reference native just stashes the int for its Pango draw, which Eclipse does not
+/// run). The trace log keeps the call observable.
+extern "system" fn paint_native_set_text_align<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    native_paint: jlong,
+    align: jint,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.graphics.Paint",
+            native_paint,
+            align,
+            "Paint.native_set_text_align: no-op (headless recording; Java retains the Align)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Bind Eclipse's own (non-GTK) backing for `android.graphics.Paint`'s natives.
 ///
 /// Registered before step 4, alongside the View/Window natives, since the View hierarchy's
 /// `TextPaint`/`Paint` construct during step 5. Each native is implemented against [`paint_registry`].
 ///
+/// 2026-07-02: covers the WHOLE installed Paint native surface (20 declared, 19 bound — see the
+/// section note above; `native_get_text_bounds` deliberately left unbound as the honest
+/// text-measurement discovery signal) and registered per-method best-effort (the 58a50f6 pattern,
+/// [`register_class_natives_best_effort`]) so a framework-build drift on any single method cannot
+/// take the lifecycle-critical `native_create` binding down with it.
+///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — each native is written to the exact descriptor the run reported. Every native body is
+/// Each fn pointer matches its declared JNI signature by construction (see each native's docs and
+/// the pin test `paint_native_name_sig_and_class_match_art_reported`). Every native body is
 /// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_paint_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let class = env.find_class(PAINT_CLASS)?;
-    let methods = [
-        // SAFETY: `paint_native_create` matches the paired `()J` signature as a static native;
-        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
-        // takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PAINT_NATIVE_CREATE_NAME,
-                PAINT_NATIVE_CREATE_SIG,
-                paint_native_create as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `paint_native_set_color` matches the paired `(JI)V` signature as a static native.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PAINT_NATIVE_SET_COLOR_NAME,
-                PAINT_NATIVE_SET_COLOR_SIG,
-                paint_native_set_color as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `paint_native_set_stroke_width` matches the paired `(JF)V` signature as a static
-        // native (surfaced by multitouch.test's custom-View Paint setup, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PAINT_NATIVE_SET_STROKE_WIDTH_NAME,
-                PAINT_NATIVE_SET_STROKE_WIDTH_SIG,
-                paint_native_set_stroke_width as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `paint_native_set_style` matches the paired `(JI)V` signature as a static native
-        // (surfaced by multitouch.test's custom-View Paint setup, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PAINT_NATIVE_SET_STYLE_NAME,
-                PAINT_NATIVE_SET_STYLE_SIG,
-                paint_native_set_style as *mut std::ffi::c_void,
-            )
-        },
-        // SAFETY: `paint_native_set_text_size` matches the paired `(JF)V` signature as a static native
-        // (surfaced by multitouch.test's custom-View Paint setup, run log 2026-06-05).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PAINT_NATIVE_SET_TEXT_SIZE_NAME,
-                PAINT_NATIVE_SET_TEXT_SIZE_SIG,
-                paint_native_set_text_size as *mut std::ffi::c_void,
-            )
-        },
+    // SAFETY (per entry): each fn matches its paired descriptor — all 19 are `private static native`
+    // on the installed classes3.dex `Paint.smali` (baksmali-confirmed 2026-07-02, identical to the
+    // vendored Paint.java declarations): `native_create` `()J`, `native_clone` `(J)J`,
+    // `native_recycle` `(J)V`, get/set color `(J)I`/`(JI)V`, alpha `(J)I`/`(JI)V`, style
+    // `(J)I`/`(JI)V`, stroke-width `(J)F`/`(JF)V`, stroke-cap `(J)I`/`(JI)V`, stroke-join
+    // `(J)I`/`(JI)V`, text-size `(J)F`/`(JF)V`, `native_set_color_filter` `(JII)V`,
+    // `native_set_text_align` `(JI)V`.
+    let bindings: [NativeBinding; 19] = [
+        (
+            PAINT_NATIVE_CREATE_NAME,
+            PAINT_NATIVE_CREATE_SIG,
+            paint_native_create as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_CLONE_NAME,
+            PAINT_NATIVE_CLONE_SIG,
+            paint_native_clone as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_RECYCLE_NAME,
+            PAINT_NATIVE_RECYCLE_SIG,
+            paint_native_recycle as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_COLOR_NAME,
+            PAINT_NATIVE_SET_COLOR_SIG,
+            paint_native_set_color as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_GET_COLOR_NAME,
+            PAINT_NATIVE_GET_COLOR_SIG,
+            paint_native_get_color as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_ALPHA_NAME,
+            PAINT_NATIVE_SET_ALPHA_SIG,
+            paint_native_set_alpha as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_GET_ALPHA_NAME,
+            PAINT_NATIVE_GET_ALPHA_SIG,
+            paint_native_get_alpha as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_STYLE_NAME,
+            PAINT_NATIVE_SET_STYLE_SIG,
+            paint_native_set_style as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_GET_STYLE_NAME,
+            PAINT_NATIVE_GET_STYLE_SIG,
+            paint_native_get_style as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_STROKE_WIDTH_NAME,
+            PAINT_NATIVE_SET_STROKE_WIDTH_SIG,
+            paint_native_set_stroke_width as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_GET_STROKE_WIDTH_NAME,
+            PAINT_NATIVE_GET_STROKE_WIDTH_SIG,
+            paint_native_get_stroke_width as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_STROKE_CAP_NAME,
+            PAINT_NATIVE_SET_STROKE_CAP_SIG,
+            paint_native_set_stroke_cap as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_GET_STROKE_CAP_NAME,
+            PAINT_NATIVE_GET_STROKE_CAP_SIG,
+            paint_native_get_stroke_cap as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_STROKE_JOIN_NAME,
+            PAINT_NATIVE_SET_STROKE_JOIN_SIG,
+            paint_native_set_stroke_join as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_GET_STROKE_JOIN_NAME,
+            PAINT_NATIVE_GET_STROKE_JOIN_SIG,
+            paint_native_get_stroke_join as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_TEXT_SIZE_NAME,
+            PAINT_NATIVE_SET_TEXT_SIZE_SIG,
+            paint_native_set_text_size as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_GET_TEXT_SIZE_NAME,
+            PAINT_NATIVE_GET_TEXT_SIZE_SIG,
+            paint_native_get_text_size as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_COLOR_FILTER_NAME,
+            PAINT_NATIVE_SET_COLOR_FILTER_SIG,
+            paint_native_set_color_filter as *mut c_void,
+        ),
+        (
+            PAINT_NATIVE_SET_TEXT_ALIGN_NAME,
+            PAINT_NATIVE_SET_TEXT_ALIGN_SIG,
+            paint_native_set_text_align as *mut c_void,
+        ),
     ];
-    // SAFETY: `class` is the loaded android/graphics/Paint; the fn pointers' signatures match its
-    // `native_create`/`native_set_color`/`native_set_stroke_width`/`native_set_style`/
-    // `native_set_text_size` declarations (from the ART-reported signatures, 2026-06-05).
-    unsafe { env.register_native_methods(&class, &methods) }?;
+    let bound = register_class_natives_best_effort(env, PAINT_CLASS, &bindings)?;
     tracing::info!(
-        class = "android/graphics/Paint",
-        "registered Eclipse's non-GTK backing for Paint.native_create + native_set_color + native_set_stroke_width + native_set_style + native_set_text_size"
+        bound,
+        "registered Eclipse's non-GTK backing for the android.graphics.Paint native surface (create/clone/recycle + color/alpha/style/stroke-width/stroke-cap/stroke-join/text-size get+set + color-filter/text-align no-ops; native_get_text_bounds deliberately unbound — real text metrics) (per-method best-effort)"
     );
     Ok(())
 }
@@ -15298,6 +15819,97 @@ mod tests {
             "native_set_text_size"
         );
         assert_eq!(PAINT_NATIVE_SET_TEXT_SIZE_SIG.to_str(), "(JF)V");
+        // 2026-07-02: the rest of the installed Paint native surface (baksmali of the installed
+        // classes3.dex Paint.smali — 20 declared natives, identical to the vendored Paint.java; NO
+        // drift, unlike Drawable). native_set_stroke_cap was the challenge7 crash (`No implementation
+        // found for void android.graphics.Paint.native_set_stroke_cap(long, int)` at Paint.setStrokeCap
+        // ← the androidx CircularProgressDrawable ring ← SwipeRefreshLayout ← the rbx.web fragment's
+        // CustomSwipeRefreshLayout); a transcription regression re-opens that UnsatisfiedLinkError.
+        assert_eq!(PAINT_NATIVE_CLONE_NAME.to_str(), "native_clone");
+        assert_eq!(PAINT_NATIVE_CLONE_SIG.to_str(), "(J)J");
+        assert_eq!(PAINT_NATIVE_RECYCLE_NAME.to_str(), "native_recycle");
+        assert_eq!(PAINT_NATIVE_RECYCLE_SIG.to_str(), "(J)V");
+        assert_eq!(PAINT_NATIVE_GET_COLOR_NAME.to_str(), "native_get_color");
+        assert_eq!(PAINT_NATIVE_GET_COLOR_SIG.to_str(), "(J)I");
+        assert_eq!(PAINT_NATIVE_SET_ALPHA_NAME.to_str(), "native_set_alpha");
+        assert_eq!(PAINT_NATIVE_SET_ALPHA_SIG.to_str(), "(JI)V");
+        assert_eq!(PAINT_NATIVE_GET_ALPHA_NAME.to_str(), "native_get_alpha");
+        assert_eq!(PAINT_NATIVE_GET_ALPHA_SIG.to_str(), "(J)I");
+        assert_eq!(PAINT_NATIVE_GET_STYLE_NAME.to_str(), "native_get_style");
+        assert_eq!(PAINT_NATIVE_GET_STYLE_SIG.to_str(), "(J)I");
+        assert_eq!(
+            PAINT_NATIVE_GET_STROKE_WIDTH_NAME.to_str(),
+            "native_get_stroke_width"
+        );
+        assert_eq!(PAINT_NATIVE_GET_STROKE_WIDTH_SIG.to_str(), "(J)F");
+        assert_eq!(
+            PAINT_NATIVE_SET_STROKE_CAP_NAME.to_str(),
+            "native_set_stroke_cap"
+        );
+        assert_eq!(PAINT_NATIVE_SET_STROKE_CAP_SIG.to_str(), "(JI)V");
+        assert_eq!(
+            PAINT_NATIVE_GET_STROKE_CAP_NAME.to_str(),
+            "native_get_stroke_cap"
+        );
+        assert_eq!(PAINT_NATIVE_GET_STROKE_CAP_SIG.to_str(), "(J)I");
+        assert_eq!(
+            PAINT_NATIVE_SET_STROKE_JOIN_NAME.to_str(),
+            "native_set_stroke_join"
+        );
+        assert_eq!(PAINT_NATIVE_SET_STROKE_JOIN_SIG.to_str(), "(JI)V");
+        assert_eq!(
+            PAINT_NATIVE_GET_STROKE_JOIN_NAME.to_str(),
+            "native_get_stroke_join"
+        );
+        assert_eq!(PAINT_NATIVE_GET_STROKE_JOIN_SIG.to_str(), "(J)I");
+        assert_eq!(
+            PAINT_NATIVE_GET_TEXT_SIZE_NAME.to_str(),
+            "native_get_text_size"
+        );
+        assert_eq!(PAINT_NATIVE_GET_TEXT_SIZE_SIG.to_str(), "(J)F");
+        assert_eq!(
+            PAINT_NATIVE_SET_COLOR_FILTER_NAME.to_str(),
+            "native_set_color_filter"
+        );
+        assert_eq!(PAINT_NATIVE_SET_COLOR_FILTER_SIG.to_str(), "(JII)V");
+        assert_eq!(
+            PAINT_NATIVE_SET_TEXT_ALIGN_NAME.to_str(),
+            "native_set_text_align"
+        );
+        assert_eq!(PAINT_NATIVE_SET_TEXT_ALIGN_SIG.to_str(), "(JI)V");
+        // The 20th declared native, native_get_text_bounds(JLjava/lang/String;Landroid/graphics/Rect;)V,
+        // is DELIBERATELY unbound (real text measurement — the ATL reference runs a Pango layout; its
+        // Rect out-param is read back by getTextBounds/getTextWidths, which the headless recording
+        // model cannot serve honestly). The clean call-time UnsatisfiedLinkError is the discovery
+        // signal (🎨 rule, 2026-07-02); no constant exists on purpose.
+    }
+
+    #[test]
+    fn paint_color_with_alpha_replaces_only_the_alpha_channel() {
+        // 2026-07-02: AOSP/ATL Paint.setAlpha semantics — ONLY the alpha byte changes, RGB preserved;
+        // out-of-range alphas are masked to their low byte so they can never corrupt the RGB bits.
+        // Paint.getAlpha/getColor read the merged value back, so a merge regression would corrupt
+        // every alpha-animated drawable (e.g. the androidx swipe-refresh ring's setAlpha).
+        assert_eq!(
+            paint_color_with_alpha(0x1234_5678, 0xFF),
+            0xFF34_5678u32 as i32
+        );
+        assert_eq!(
+            paint_color_with_alpha(0xFF34_5678u32 as i32, 0),
+            0x0034_5678
+        );
+        assert_eq!(
+            paint_color_with_alpha(0x8000_0001u32 as i32, 0x80),
+            0x8000_0001u32 as i32
+        );
+        // Alpha is masked to its low byte (0x1FF → 0xFF), matching the ATL reference (`alpha & 0xFF`).
+        assert_eq!(
+            paint_color_with_alpha(0x0034_5678, 0x1FF),
+            0xFF34_5678u32 as i32
+        );
+        // Round-trip with the getter's extraction: (color >> 24) & 0xFF.
+        let merged = paint_color_with_alpha(0x0012_3456, 0xAB);
+        assert_eq!((merged >> 24) & 0xFF, 0xAB);
     }
 
     #[test]
