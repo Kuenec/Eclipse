@@ -128,6 +128,43 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-01 — 🎯 CHALLENGE RE-DRIVE ATTEMPT #1 (first fully-autonomous 180 s drive at `ba5d3d5`; log
+  `/tmp/eclipse-challenge2.log`, full-frame screenshot `/tmp/eclipse_field_probe.png`): ALL FIVE synthetic stages fired
+  mechanically correctly, but the drive used a STALE UI coordinate map AND was derailed by REAL host input — NO
+  `v2/login` POST reached. Stage 4 is now TARGET-AWARE (`ECLIPSE_SYNTHETIC_TYPE2="x,y:text"`, shipped this session).
+  ⇐ START HERE NEXT SESSION: hands-off 180 s re-drive with the corrected map below.** Forensics (log-confirmed):
+  (1) **Stage mechanics ALL GREEN** — stage 0 (419,531) at 03:33:35.766 → `onAppReady: LoginV2` at .795; stages 1+2
+  (278,179) typed 10 chars all `handled=true`; stage 3 (281,234); stage 4 typed 14 chars all `handled=true`; stage 5
+  (349,377) DOWN+UP `consumed=true`. Engine alive the whole run (last log 03:35:35), **NO signal 11, no crash, zero
+  `Challenge` lines, zero `v2/login`**.
+  (2) **The current LoginV2 (v2.724.735) is a ONE-FIELD flow** — the old map assumed username+password on one screen.
+  **CONFIRMED CURRENT LOGIN-UI COORDINATE MAP (screenshot + the `/tmp/eclipse-tvfix.log` owner tap trail):
+  USERNAME SCREEN — single "Username, email, or phone number" field ~y=172 (x spans 170–630); "Next" ~(400,236);
+  "Forgot username?" ~(400,284); "OR" ~(400,323); "Use passkey" ~(400,378); "Quick sign-in" ~(400,438).
+  PASSWORD SCREEN (a SECOND screen, after Next) — password field ~(241,327); "Log In" ~(349,377).**
+  (3) **REAL-INPUT INTERFERENCE derailed the run:** three fractional-coordinate real mouse taps ((753.9,316.4) at
+  03:33:36.8, (427.6,169.9) at 03:33:38.7, (398.6,164.1) at 03:33:42.1) plus two stray real keystrokes ("ku") landed
+  in the window mid-drive. End state (screenshot): the USERNAME field reads "robloxtestkuEclipseDrive1x" — stage 4's
+  password went into the still-focused USERNAME field (the password screen was never reached; stage 3's (281,234) hits
+  nothing on this layout). **LESSON: drive boots need a hands-off keyboard/mouse — the orchestrator warns the owner
+  before each drive.**
+  (4) Stage 5's (349,377) tap, on the USERNAME screen, landed on "Use passkey" → `Error getting credentials: y2.p:
+  getCredentialAsync no provider dependencies found` (the host has no Android credential provider — GRACEFUL: logged
+  error, no navigation, no crash; not a bug to fix).
+  (5) **Known COSMETIC (NOT on the critical path — do not fix now):** the vk_overlay drew the typed text at a
+  degenerate geometry (the touch log shows the resolved `RBXSurfaceView` with `width=0 height=0`) as giant glyphs
+  across the frame, while the ENGINE itself renders field text natively in this APK (v2.724.735) — the overlay is
+  redundant/mis-geometried here. Recorded as cosmetic only.
+  **SHIPPED THIS SESSION (`src/graphics.rs`): stage 4 target-aware** — `ECLIPSE_SYNTHETIC_TYPE2` now accepts
+  `"x,y:text"` (tried via `parse_xy_text` first; a value that does not parse keeps the bare-`"text"`
+  type-into-focused behavior): once armed (≥3 s after stage 3) it taps `(x,y)` FIRST — unconditionally, since a stale
+  field handle can still read as focused — then re-taps every ~1.5 s until `framework::active_text_field()` reports
+  focus (stage 1's retry shape; new field `engine_last_focus_tap2`), then types once. Env-gated dev-host diagnostic
+  like stages 0–5: no behavior when the env var is absent.
+  **START-HERE-NEXT: re-drive 180 s, HANDS-OFF, with `ECLIPSE_SYNTHETIC_ENGINE_TAP="419,531"`
+  `ECLIPSE_SYNTHETIC_TYPE="278,179:robloxtest"` `ECLIPSE_SYNTHETIC_NEXT="400,236"`
+  `ECLIPSE_SYNTHETIC_TYPE2="241,327:<pw>"` `ECLIPSE_SYNTHETIC_SUBMIT="349,377"` — expected: `v2/login` POST → 403
+  challenge → `rbx.web` fragment → observe the earlier signal-11 past the old 75 s horizon.**
 - **2026-07-01 — 🔑 LOGIN "STUCK LOADING AFTER SIGN-IN" ROOT-CAUSED + FIXED — ✅ FIX CONFIRMED by the validation boot
   (`/tmp/eclipse-tvfix.log` analyzed 2026-07-01: crash GONE; the challenge now renders past `ChallengeNativeWrapper`
   into the `rbx.web` web fragment). NEW NEXT GAP = the signal-11 + web-fragment path (evidence truncated by the 75 s
@@ -4102,6 +4139,34 @@ this AGENTS.md update) is committed + pushed this session, with the stage-5 SUBM
 The owner tap coordinate map is recorded in §5 (durable). *Files:* `src/framework.rs`, `src/graphics.rs`,
 `tools/framework-overlay/patch-framework.sh`, `tools/framework-overlay/src/android/app/KeyguardManager.java` (NEW),
 `AGENTS.md`.
+
+### 2026-07-01 — 🎯 Challenge re-drive attempt #1 forensics: stages all fired, but a stale UI map + real-input interference derailed it — `ECLIPSE_SYNTHETIC_TYPE2` upgraded to a target-aware `"x,y:text"`
+
+*Evidence:* the first fully-autonomous 180 s login re-drive at `ba5d3d5` (`/tmp/eclipse-challenge2.log`, screenshot
+`/tmp/eclipse_field_probe.png`). All five synthetic stages fired mechanically correctly (stage 0 → `onAppReady:
+LoginV2`; stages 1+2 typed 10 chars `handled=true`; stage 3; stage 4 typed 14 chars `handled=true`; stage 5 DOWN+UP
+`consumed=true`), the engine stayed alive the whole run with no signal 11 — but **no `v2/login` POST** happened.
+Two independent causes: (1) the coordinate map was stale — the current LoginV2 is a ONE-FIELD username screen with the
+password on a SECOND screen (confirmed map now in §5), so stage 3's tap hit nothing, the username field stayed focused,
+and stage 4's password text landed in it; stage 5's (349,377) hit "Use passkey" → the GRACEFUL
+`getCredentialAsync no provider dependencies found` error (host has no credential provider; no navigation).
+(2) Real host input (three fractional-coordinate mouse taps + two stray keystrokes "ku") landed in the window
+mid-drive — drive boots must be hands-off (the orchestrator warns the owner). Known cosmetic recorded: the vk_overlay
+drew the typed text at a degenerate `width=0 height=0` geometry as giant glyphs while the engine renders field text
+natively in this APK — not on the critical path.
+
+*Change (`src/graphics.rs`):* stage 4 (`ECLIPSE_SYNTHETIC_TYPE2`) now accepts `"x,y:text"` — parsed with the existing
+`parse_xy_text` first; a value that does not parse keeps the old bare-`"text"` behavior (type into whatever field is
+focused). With a target, once armed (≥3 s after stage 3) it taps `(x,y)` FIRST — unconditionally, because the previous
+screen's field handle can still read as focused (stale) — then re-taps every ~1.5 s until
+`framework::active_text_field()` reports focus (mirrors stage 1's `engine_last_focus_tap` retry shape via the new
+`engine_last_focus_tap2` field), then types once. Still env-gated dev-host diagnostic machinery: no behavior when the
+env var is absent. `parse_xy_text` itself is unchanged (no new parser behavior → no new parser tests, per the stages
+precedent).
+
+*Verification:* full gate green (fmt / build --all-targets / clippy `-D warnings` / test / release). Next boot: the §5
+START-HERE-NEXT hands-off re-drive with the corrected coordinate map, expecting `v2/login` → 403 challenge →
+`rbx.web` fragment → the earlier signal-11 under observation. *Files:* `src/graphics.rs`, `AGENTS.md`.
 
 ---
 
