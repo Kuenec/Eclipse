@@ -128,6 +128,64 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-03 — 🧭 OWNER DECISION (a) MADE: integrate a real NON-GTK web engine for the challenge WebView —
+  DECIDED by the owner 2026-07-03, direction locked + RECORDED + COMMITTED (the phased plan is
+  `docs/web-engine-plan.md`; the dependency direction is in `docs/dependency-plan.md`; full record in §6
+  2026-07-03 🧭; this pass is DOCS-ONLY — no dependency added, no code touched) ⇐ START-HERE-NEXT: MILESTONE M1
+  of `docs/web-engine-plan.md` — the STANDALONE CEF spike on the dev host (no app wiring, no ART, no APK, no
+  challenge URL — a public page only; the go/no-go proof that gates every later milestone).** Resolves the 🔘
+  bullet's owner-level decision (options (a)/(b); (b) — a non-web login/challenge path — REJECTED by the owner).
+  CHOSEN DIRECTION: CEF/Chromium (the tauri-apps `cef` crate, 149.x as of 2026-07-03) embedded in an
+  Eclipse-owned OUT-OF-PROCESS `eclipse-webview` Rust helper binary — windowless OSR, BGRA frames over memfd
+  into the existing vk-overlay present seam, input/load-events/cookies/JS bridge over a small std-only owned
+  Unix-socket protocol (NO tokio) — ZERO engine bytes ever mapped into the ART main process: the recorded
+  Step-3.5 low_4gb mechanism behind the GTK ban bans ANY in-process engine (1.375 GB unstripped libcef, V8's
+  address-space reservation, crashpad handlers beside ART's fault handler, DT_NEEDED glib/atk/cairo/pango), so
+  the helper split is MANDATORY, not optional — the ART process gains only a Unix socket + a memfd mapping.
+  Rubric resolution (§3 stability > pure-Rust > no-bloat; #2/#3 never override #1): the stability and
+  integration lenses of the three-lens review both rank CEF first — it IS current Chromium, the engine family
+  the anti-bot vendor builds against (Arkose documents Android-WebView/Chrome support), and every recorded
+  Eclipse seam maps 1:1 onto decade-mature CEF APIs (`internalLoadChanged(0/3)` ← OnLoadStart/OnLoadEnd;
+  CookieManager incl. the overlay 3-arg setCookie/.ROBLOSECURITY handoff ← CefCookieManager;
+  addJavascriptInterface incl. synchronous returns ← renderer-side V8 + CefMessageRouter; OSR OnPaint ← the
+  proven memfd + vk-overlay precedents); the purity-bloat lens's servo-first ordering is exactly the ordering §3
+  subordinates. Pure-Rust survives where the charter measures it (§2.1 "every line we own"): helper, IPC,
+  compositing, and JNI plumbing all Rust; the `cef` bindings are machine-generated from CEF's STABLE C API and
+  loaded via libloading (regenerable if upstream stalls); libcef becomes the SECOND vendored non-Rust black box
+  under the recorded libsqlite3-sys precedent. No-bloat (§2.5) honored by CONFINEMENT: lazy spawn on the first
+  challenge load-drive, killed after completion/timeout — zero main-binary, test-gate, or gameplay-hot-path
+  (§2.4) cost when absent. RUNNER-UP (recorded fallback): `servo` (half-yearly LTS pin) in the identical helper
+  shape, itself gated on a days-scale servoshell spike against the real challenge URL — triggered only if the
+  vendor's scoring refuses CEF-shaped clients at M6 or the owner rejects the CEF footprint/release treadmill.
+  REJECTED (honest summaries in the plan doc): WPE (zero Rust bindings → a new owned unsafe GObject FFI surface;
+  embedder API mid-sunset; Ubuntu 24.04+/Fedora host coverage fails; no X11 in WPEPlatform), pure-Rust
+  Blitz/Stylo + Boa (no JS↔DOM web platform — ~5–15 engineer-years before the widget's first script runs),
+  external browser (the widget's completion token is delivered to in-page JS and dies in the foreign tab —
+  every working reformulation IS option (b); plus a token-in-argv privacy regression), and in-process embedding
+  of ANY engine (the low_4gb class). Constraints carried into every milestone: the ABSOLUTE URL-redaction rule
+  extends across the new process boundary from day one (`url_scheme_and_host_for_log`, scheme+host only;
+  payloads never bound to any log macro — helper included); "integrates, never duplicates" (per-view identity =
+  the existing `view_registry` widget handle, NO new webview_registry); detect-don't-assume (§2.9: sandbox mode
+  SUID/userns/loud degradation, DT_NEEDED host-lib probe, Wayland AND X11, GPU vs bundled SwiftShader); Eclipse
+  renders the page faithfully for a REAL HUMAN to complete and hands the callback back through the app's own
+  WebView contract — it never automates or engineers around vendor scoring. Milestones (per-milestone verify
+  checks in the plan doc): M1 standalone dev-host spike (both display servers, OSR PNG ink proof,
+  sandbox/host-lib/footprint numbers captured) → M2 the full dependency-justification cycle + the
+  `eclipse-webview` helper + owned IPC protocol (protocol + redaction units in plain `cargo test`) → M3
+  main-process wiring at the recorded seams (the two validated no-op load natives at framework.rs
+  `web_view_native_load_url`/`web_view_native_load_data_with_base_url` become spawn-and-forward; the dead
+  `internalLoadChanged(0/3)` seam fires as JNI upcalls; vk-overlay composite; hidden `__webview-test`
+  subcommand + engine_milestones self-skip guard) → M4 JS bridge/cookies/honest UA via the overlay (incl.
+  patching the recorded javascript:-println leak channel BEFORE javascript: URLs become secret-bearing) → M5
+  distro-agnostic hardening + packaging (strip/prune, Chromium license aggregate, Flatpak sketch) → M6 the live
+  challenge boot per the orchestrator recipe (NEVER a subagent; stage-0 tap 400,413 + the field-probe
+  re-calibration technique; 180 s EXIT=124) followed by the owner-interactive completion boot (success = login
+  proceeds past the 403, no ~60 s timeout-to-LoginV2 recovery). Ten open questions recorded in the plan doc §7
+  (vendor reception of CEF-shaped clients, sandbox degradation policy [owner ruling], RBHybridWebView's real
+  bridge shape, release-cadence policy, footprint sign-off, Wayland-without-XWayland, Flatpak sandbox,
+  audio-challenge path, helper lifecycle vs the ~60 s challenge timeout, cef-rs binding durability). Gate green
+  on this docs-only tree (fmt / build --all-targets / clippy -D warnings / **594 unit + 4 integ + 2 doctest** /
+  release — no code change, counts unchanged).
 - **2026-07-03 — 🔘 `android.widget.ImageButton.native_setDrawable(JJ)V` BOUND (closes the challenge14 frontier —
   the challenge14 log's ONLY ULE: the SAME challenge fragment yh.d in `onActivityCreated:77` wiring its
   RobloxToolbar navigation icon) — IMPLEMENTED 2026-07-02/03 per the adversarially-reviewed plan + ✅ VALIDATED
@@ -135,9 +193,10 @@ before any history-rewriting/force operation.
   block at the end of this bullet + §6 2026-07-03 ✅🔘: ULE GONE, `bound=3`, the challenge fragment's lifecycle
   COMPLETES with ZERO remaining native failures and ZERO new ULEs, so the recorded native-binding CEILING on the
   challenge fragment is REACHED) ⇐ START-HERE-NEXT: the OWNER-LEVEL web-engine decision at the end of this
-  bullet — options (a) a non-GTK web engine vs (b) a non-web login/challenge path; there is NO new native
-  frontier and NOTHING implementable until the owner decides — a session reaching this bullet should SURFACE THE
-  DECISION to the owner.** Implements the 📏 bullet's START-HERE-NEXT
+  bullet — options (a) a non-GTK web engine vs (b) a non-web login/challenge path — DECIDED BY THE OWNER
+  2026-07-03: option (a), CEF in an Eclipse-owned out-of-process helper (see the 🧭 bullet above +
+  `docs/web-engine-plan.md`; the live pointer moved to that plan's MILESTONE M1).** Implements the 📏 bullet's
+  START-HERE-NEXT
   (full record in §6 2026-07-03 🔘). Mechanism (challenge14-proven — `/tmp/eclipse-challenge14.log` E-line 1165,
   ULE 1166, stack 1167–1184): ART resolves natives per DECLARING class and ImageButton RE-DECLARES ImageView's
   `native_setDrawable(JJ)V` (installed classes3.dex ImageButton.smali:42), so ImageView's own bound copy
@@ -221,8 +280,8 @@ before any history-rewriting/force operation.
   challenge fragment has REACHED ITS CEILING: there is nothing left to bind on this path. The gating choice is the
   owner's: (a) integrate a real web engine for the challenge WebView (an owned minimal renderer vs a non-GTK
   embedding — WebKitGTK is banned by the no-GTK/low_4gb constraint; an embedded browser needs a
-  pure-Rust/no-bloat justification cycle), or (b) find a non-web login/challenge path. Recorded; NOT decided —
-  surface it to the owner at next contact.
+  pure-Rust/no-bloat justification cycle), or (b) find a non-web login/challenge path. Recorded; DECIDED BY THE
+  OWNER 2026-07-03 — option (a), CEF out-of-process helper (see the 🧭 bullet above + `docs/web-engine-plan.md`).
 - **2026-07-02 — 📏 `android.view.View.native_measure(JII)V` BOUND (closes the challenge13 frontier — the 📐
   audit-table row-11 documented-unbound REAL content-measure native; the challenge fragment's Toolbar →
   ActionMenuView measure) — IMPLEMENTED per the adversarially-reviewed plan + ✅ VALIDATED by the 2026-07-03
@@ -6136,6 +6195,113 @@ shared-const name/sig pins inside `image_button_class_is_slashed_internal_name` 
 path+lines); the live-boot ImageButton `bound=3` line is the registration-presence guard (house convention —
 RegisterNatives only surfaces under live ART).
 
+### 2026-07-03 — 🧭 OWNER DECISION (a): integrate a real NON-GTK web engine for the challenge WebView — direction locked: CEF/Chromium (tauri-apps `cef` crate) in an Eclipse-owned OUT-OF-PROCESS `eclipse-webview` helper (windowless OSR → memfd → vk-overlay; std-only Unix-socket IPC; ZERO engine bytes in the ART process); Servo recorded as the spike-gated runner-up; `docs/web-engine-plan.md` is the locked phased plan — DECIDED + RECORDED + COMMITTED 2026-07-03 (docs-only pass; NO dependency added)
+
+*Decision provenance:* the ✅🔘 entry above recorded the native-binding CEILING REACHED (challenge15,
+`/tmp/eclipse-challenge15.log`: zero ULEs, the challenge fragment's lifecycle completes, the web challenge
+still renders nothing and times out to LoginV2) and put the owner-level choice — (a) a real non-GTK web engine
+vs (b) a non-web login/challenge path — on the critical path. The owner decided **2026-07-03: option (a)**,
+option (b) rejected. The direction below is the engineering synthesis of a three-lens adversarial review
+(stability / purity-bloat / integration judges), resolved by the §3 rubric (stability > pure-Rust > no-bloat;
+#2/#3 never override #1) — the stability and integration lenses both ranked CEF first; the purity-bloat lens's
+servo-first ordering is precisely the ordering §3 subordinates. This is the §2.1 enforcement case verbatim:
+a new non-Rust dependency/FFI surface justified against §3 and logged here BEFORE any dependency lands.
+
+*Chosen direction (the architecture the non-negotiables force):* CEF/Chromium via the machine-generated
+tauri-apps `cef` bindings (149.x as of 2026-07-03; loaded via libloading, regenerable against CEF's STABLE C
+API if upstream stalls), embedded in an Eclipse-owned OUT-OF-PROCESS `eclipse-webview` Rust helper binary:
+windowless OSR, software OnPaint BGRA frames over memfd composited at the `view_registry` frame rect through
+the existing vk-overlay present seam; loads/input/load-events/cookies/JS-bridge over a small OWNED std-only
+Unix-socket protocol (NO tokio/async runtime); helper spawned LAZILY on the first real challenge load-drive
+and killed after completion/timeout. In-process embedding of ANY engine is rejected by the recorded Step-3.5
+low_4gb mechanism behind the GTK ban (`docs/art-and-runtime.md` — a graphics-stack-free boot has a clean
+low_4gb window; 1.375 GB unstripped libcef + V8's address-space reservation + crashpad handlers beside ART's
+fault handler + DT_NEEDED glib/atk/cairo/pango are exactly the banned class), so the ART main process gains
+ONLY a Unix socket + a memfd frame mapping (kernel places both high); renderer/GPU processes fork from the
+helper, never from Eclipse; an engine crash is isolated from ART and the game. libcef becomes the SECOND
+vendored non-Rust black box under the recorded libsqlite3-sys precedent ("no pure-Rust X is production-grade —
+stability > purity"); pinned SHA1-verified artifact download, stripped + locale-pruned, Chromium third-party
+license aggregate shipped, audited with cargo tree/cargo bloat at the M2 justification cycle.
+
+*Why CEF wins the stability axis (the axis Eclipse can never patch itself):* the dominant uncertainty is
+whether a commercial anti-bot widget renders AND completes — and keeps doing so for years as the vendor
+updates it. CEF IS current Chromium, the engine family the widget vendor builds and tests against (Arkose
+documents Android-WebView and Chrome support), shipped as prebuilt bundled binaries identical on every distro
+with the best GPU degradation story (Mesa, NVIDIA, bundled SwiftShader software fallback); every recorded
+Eclipse seam maps 1:1 onto decade-mature APIs — `internalLoadChanged(0/3)` (the dead upcall seam, vendored
+WebView.java:38) ← OnLoadStart/OnLoadEnd; CookieManager incl. the overlay 3-arg setCookie/.ROBLOSECURITY
+handoff ← CefCookieManager; addJavascriptInterface incl. synchronous returns ← renderer-side V8 handler +
+CefMessageRouter; OSR OnPaint ← the proven memfd (`AAsset_openFileDescriptor`) + vk-overlay precedents. Servo
+carries a measured ~19.8%-of-Baseline compat gap that structurally widens, zero public evidence of
+Arkose-class widgets running on it, and monthly breaking embedder churn — so CEF is chosen OUTRIGHT and Servo
+is the named fallback (half-yearly LTS pin, identical helper shape), gated on its own days-scale servoshell
+spike against the real challenge URL, triggered only if the vendor's scoring refuses CEF-shaped clients at M6
+or the owner rejects the CEF footprint/release treadmill.
+
+*Rejected (full honest summaries in `docs/web-engine-plan.md` §5):* WPE WebKit (viable engine; zero Rust
+bindings → Eclipse would own a new hand-rolled unsafe GObject FFI surface, embedder API mid-sunset until
+~Sept 2026, Ubuntu 24.04+/Fedora host coverage fails, no X11 in WPEPlatform, practical fallback is
+out-of-process WebKitGTK needing an owner ruling against the GTK ban's letter); pure-Rust Blitz/Stylo + Boa
+(non-viable: no JS↔DOM web platform — ~5–15 engineer-years before the widget's first script runs); external
+browser via xdg-open/portal (non-viable: the widget's completion token is delivered to in-page JS with no
+redirect-URI step and dies in the foreign tab — every working reformulation IS option (b), which the owner
+rejected; plus a token-in-argv//proc/cmdline privacy regression); in-process embedding of anything (the
+low_4gb class above).
+
+*Constraints carried into every milestone:* the ABSOLUTE URL-redaction rule extends across the new process
+boundary from day one (`url_scheme_and_host_for_log` scheme+host-only contract; load payloads never bound to
+any log macro at any level — helper logs included); "integrates, never duplicates" (per-view identity = the
+existing `view_registry` widget handle from the already-bound shared constructor; NO new webview_registry);
+§2.4 off-the-hot-path (zero per-frame/per-event cost when no WebView is live); §2.9 detect-don't-assume
+(DT_NEEDED host-lib probe with actionable errors, sandbox-mode selection SUID chrome-sandbox / unprivileged
+userns / loud documented degradation, Wayland AND X11, GPU vs bundled SwiftShader); JNI upcalls keep the
+EnvUnowned/catch_unwind house shape; Eclipse renders the page faithfully for a REAL HUMAN to complete and
+hands the callback back through the app's own WebView contract — it never automates or engineers around
+vendor scoring. The recorded javascript:-println full-URL leak channel gets its overlay patch at M4, BEFORE
+javascript: URLs become live and secret-bearing.
+
+*Plan (six milestones, each gating the next; per-milestone verify checks in `docs/web-engine-plan.md` §6):*
+M1 standalone CEF spike on the dev host (no app wiring/ART/APK/challenge URL — a public page only; both
+Wayland and X11 sessions; OSR PNG nonzero-ink proof; sandbox/host-lib/GPU-path/footprint numbers captured;
+failure stops the plan before any integration cost) → M2 the full dependency-justification cycle (this file +
+`docs/dependency-plan.md`) + the `eclipse-webview` helper crate + the owned IPC protocol (plain-`cargo test`
+units for protocol framing + helper-side redaction) → M3 main-process wiring at the recorded seams (the two
+validated no-op load natives `web_view_native_load_url`/`web_view_native_load_data_with_base_url` become
+spawn-and-forward; a socket-reader thread fires `internalLoadChanged(0/3)` as JNI upcalls so
+`WebViewClient.onPageStarted/onPageFinished` run for the first time; vk-overlay composite; winit input
+routing; absent/failed helper degrades to the current honest one-shot WARN no-op — never a crash, never a
+fabricated callback; hidden `__webview-test` subcommand with a deterministic SUCCESS marker + an
+`engine_milestones.rs` self-skip guard) → M4 the completion-handoff surface via the overlay
+(addJavascriptInterface for real, evaluateJavascript → ExecuteJavaScript → the overlay ValueCallback,
+CookieManager via CefCookieManager with a private session-scoped store, replace the recorded "GDPR VIOLATION"
+UA with an honest deliberate UA; never stub a static-final constant — the 2026-07-02 include-id lesson) → M5
+distro-agnostic hardening + packaging (strip 1.375 GB → ~256 MB + locale prune, pinned SHA1-verified
+download, license aggregate, clean-checkout different-path gate, Flatpak org.freedesktop.Platform sketch) →
+M6 the LIVE CHALLENGE BOOT per the orchestrator recipe (NEVER a subagent: stage-0 tap 400,413 with the
+field-probe re-calibration technique if Landing drifted, 180 s EXIT=124, do NOT wipe /tmp/atl_cache) — grep
+verdicts for onPageStarted/onPageFinished, WebView-rect ink, zero ULEs, `bound=3` intact, privacy greps clean
+— then the owner-interactive completion boot (success = login proceeds past the 403; no ~60 s
+timeout-to-LoginV2 recovery). Ten open questions recorded in the plan doc §7 (vendor reception, sandbox
+degradation policy [owner ruling needed], RBHybridWebView's real bridge shape, release-cadence policy,
+footprint sign-off, Wayland-without-XWayland, Flatpak sandbox, audio-challenge path, helper lifecycle vs the
+~60 s challenge timeout, cef-rs binding durability).
+
+*Regression guards:* none new this pass — docs-only, no runtime surface (the existing WebView pins
+`web_view_native_names_sigs_and_class_match_the_installed_dex` +
+`url_scheme_and_host_for_log_serves_scheme_and_host_only_and_never_query_payload_or_credentials` +
+`view_subclass_constructor_classes_are_slashed_internal_names` stand unchanged and are the seams M3 extends).
+Process guard: the dependency may NOT land in Cargo.toml before the M2 justification cycle in
+`docs/dependency-plan.md` + this log (its entry is written as "added at M1/M2", commented, deliberately
+unwired — the §2.1 enforcement order).
+
+*Gate:* green on this docs-only tree — `cargo fmt --all` / `cargo build --all-targets` / `cargo clippy
+--all-targets --all-features -- -D warnings` / `cargo test` (**594 unit + 4 integ + 2 doctest**, 0 failed) /
+`cargo build --release` (no code change; counts unchanged from the ✅🔘 entry).
+
+*Status:* DECIDED by the owner + RECORDED + COMMITTED 2026-07-03. Files: `docs/web-engine-plan.md` (new,
+indexed in §7), `docs/dependency-plan.md` (new WebView-engine subsystem section + libcef row in the vendored
+table), this file (§5 🧭 bullet ⇐ START-HERE-NEXT = plan M1; §6 this entry). Next session: MILESTONE M1.
+
 ---
 
 ## 7. Doc index
@@ -6149,6 +6315,7 @@ RegisterNatives only surfaces under live ART).
 | `docs/tech-selection.md` | Library selection rationale. |
 | `docs/art-and-runtime.md` | Vendored ART/runtime: build, performance, stability. |
 | `docs/dependency-plan.md` | What each subsystem will depend on. |
+| `docs/web-engine-plan.md` | Owner decision (a) 2026-07-03: challenge-WebView engine direction (CEF out-of-process helper) + phased milestone plan. |
 | `docs/m0-runbook.md` | The next step: validate the foundation. |
 | `docs/bionic-loader-plan.md` | Build-ready bionic NDK-soname-shim spec (DEFERRED, main-loop). |
 | `docs/bionic-loader-strategy.md` | Bionic-loader v1 strategy: the modern-relocation wall + chosen path. |

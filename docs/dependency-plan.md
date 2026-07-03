@@ -5,7 +5,7 @@
 > Add a dep to `Cargo.toml` only when building that subsystem, after verifying the version
 > with `cargo add`. Priorities: **stability > pure-Rust > no bloat.**
 > 🟢 pure Rust · 🟡 thin binding to unavoidable host C · 🔴 vendored non-Rust (FFI).
-> Last updated **2026-06-04**.
+> Last updated **2026-07-03**.
 
 ## Planned `[dependencies]` (by subsystem)
 
@@ -75,6 +75,23 @@ discord-rich-presence = "0.2"                          # 🟢 Discord RPC
 # C black box, same rationale as cpal→ALSA. Raw -sys (not rusqlite) — the JNI contract IS the C API.
 libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }  # 🟡 (+vcpkg, Windows-only build helper)
 
+# --- WebView engine: challenge-only CEF helper (eclipse-webview) — OWNER DECISION (a) 2026-07-03
+# (docs/web-engine-plan.md; deps added at MILESTONE 1/2 of that plan — deliberately NOT wired yet) --
+# 🟡/🔴 The engine behind android.webkit.WebView for the LOGIN CHALLENGE only. It runs in an
+# Eclipse-owned OUT-OF-PROCESS `eclipse-webview` Rust helper binary — zero engine bytes are ever
+# mapped into the ART main process (the recorded low_4gb/no-GTK mechanism bans ANY in-process
+# engine) — lazily spawned on the first challenge load-drive, killed after completion/timeout, so
+# the main binary, its test gate, and the gameplay hot path carry zero cost. `cef` is
+# machine-generated bindings over CEF's STABLE C API, loaded via libloading (regenerable in-house
+# if upstream stalls); libcef itself is the SECOND vendored non-Rust black box, accepted under the
+# libsqlite3-sys precedent (no pure-Rust web engine is production-grade — the anti-bot widget
+# vendor targets Chromium/Android-WebView; stability > purity). IPC = owned std-only Unix socket +
+# memfd BGRA frames (NO tokio/async runtime). Runner-up recorded: `servo` (half-yearly LTS pin) in
+# the identical helper shape, gated on its own servoshell real-challenge-URL spike — triggered only
+# if the vendor's scoring refuses CEF-shaped clients at plan-M6 or the owner rejects the footprint.
+# cef = "149"          # 🟡 added at M1 spike / M2 helper crate — pin the exact 149.x at cargo add
+# download-cef = "*"   # 🟢 build/packaging-time fetch of the pinned, SHA1-verified CEF artifact
+
 # --- Allocator ---------------------------------------------------------------
 # Use the SYSTEM allocator by default (zero dep, leanest). Add only on profiling evidence:
 # mimalloc = { version = "0.1", optional = true }      # 🟡
@@ -89,3 +106,4 @@ libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }  # 🟡 (+vcpkg,
 | **wolfSSL** 5.8.2 | source build w/ JNI flags | GPLv2+/commercial | libcore TLS provider. |
 | **libunwind**, **libandroidfw**, **libOpenSLES** | via the ATL super-build | various | Reuse v1; migrate peripheral ones to Rust later. |
 | Easiest unified build | `github.com/killerdevildog/android_translation_layer` | — | Builds the whole chain in order. |
+| **CEF `libcef`** (Chromium 149 prebuilt `linux64_minimal`) | `download-cef`, pinned + SHA1-verified | BSD-3 + Chromium third-party aggregate (must ship) | 2026-07-03 owner decision (a): the challenge-WebView engine. Helper-process ONLY — never mapped into the ART process. Stripped + locale-pruned at package time. The second 🔴 after ART (`docs/web-engine-plan.md`). |
