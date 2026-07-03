@@ -1,0 +1,7 @@
+# 2026-07-03: M1 spike guard — NOTHING larger than source files may ever become committable.
+# /target/ also holds the CEF runtime files that cef-dll-sys's build script copies next to the
+# produced binary; /cef-dist/ is export-cef-dir's output dir (the SHA1-verified CEF binary
+# distribution, its downloaded *.tar.bz2 archive, and its old_*/cef_binary_* extraction leftovers).
+/target/
+/cef-dist/
+*.log

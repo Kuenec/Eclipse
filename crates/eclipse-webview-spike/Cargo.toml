@@ -1,0 +1,34 @@
+# Eclipse M1 web-engine spike — 2026-07-03 (docs/web-engine-plan.md §6 M1; owner decision (a)).
+#
+# A STANDALONE crate, deliberately detached from the root `eclipse` build — the crates/libm-shim
+# pattern (the root Cargo.toml is not a workspace, so a crate under crates/ builds on its own).
+# The empty [workspace] table at the bottom makes that detachment explicit and permanent: even if
+# the root ever becomes a workspace, this spike must never join it — the CEF engine payload must
+# never touch the main binary, its test gate, or the gameplay hot path (web-engine-plan.md §4).
+#
+# Dependency notes (spike-only; M2 runs the full stability>pure-Rust>no-bloat justification cycle
+# in docs/dependency-plan.md before any of this lands in a shipped crate):
+#   * cef — tauri-apps' machine-generated bindings over CEF's STABLE C API, loaded against the
+#     pinned CEF 149 binary distribution. Pinned EXACT to the owner-decided 149.x line
+#     (149.3.0+149.0.6 = CEF 149.0.6 / Chromium 149, latest as of 2026-07-03). Build recipe per
+#     the official README: `export-cef-dir --force <dir>` downloads the linux64_minimal archive
+#     from cef-builds.spotifycdn.com, SHA1-verifies it against the CDN index, and flattens it;
+#     CEF_PATH=<dir> at build time; sys/build.rs links dylib=cef and copies the CEF runtime files
+#     next to the produced binary (LD_LIBRARY_PATH must include the libcef.so dir at run time).
+#     Default features kept (sandbox + build-util) — the tested configuration of the upstream
+#     examples; `sandbox` keeps Settings.no_sandbox=0 so the real Linux sandbox mode is measured.
+#   * png — pure-Rust PNG encoder, for the OSR nonzero-ink frame proof only.
+
+[package]
+name = "eclipse-webview-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "M1 standalone CEF spike: go/no-go proof that CEF initializes and renders a live page on the dev host (windowed + windowless software OSR)"
+
+[dependencies]
+cef = "=149.3.0"
+png = "0.18"
+
+# 2026-07-03: standalone-detach guard (see header comment).
+[workspace]
