@@ -1,0 +1,48 @@
+# Eclipse `eclipse-webview` — the REAL out-of-process challenge-WebView helper (web-engine plan
+# M2, 2026-07-03; promoted from the M1 spike crates/eclipse-webview-spike).
+#
+# A STANDALONE crate, deliberately detached from the root `eclipse` build — the crates/libm-shim /
+# spike pattern. The empty [workspace] table at the bottom makes the detachment explicit and
+# permanent: the root eclipse build must NEVER gain the cef dependency (the recorded low_4gb/no-GTK
+# mechanism bans ANY in-process engine; zero engine bytes may ever map into the ART main process —
+# docs/web-engine-plan.md §4). Even if the root ever becomes a workspace, this crate must not join.
+#
+# Dependency justification: docs/dependency-plan.md ("WebView engine" subsystem section, dated
+# 2026-07-03) + AGENTS.md §6 — authored BEFORE this dependency merged (§2.1 enforcement order).
+#
+# CEF_PATH build contract (cef-dll-sys): the CEF binary distribution directory. It fails
+# ACTIONABLY when unset/invalid — no silent fallback. The dev-host instance is the M1
+# SHA1-verified dist, REUSED (never re-downloaded):
+#   export CEF_PATH="$(git rev-parse --show-toplevel)/crates/eclipse-webview-spike/cef-dist/linux-x86_64"
+# Any `export-cef-dir --force <dir>` output dir (pinned download, SHA1-verified) is equally valid.
+# At run time LD_LIBRARY_PATH must include the libcef.so dir (cef-dll-sys also copies the CEF
+# runtime files next to the produced binaries under target/).
+#
+#   * cef — pinned EXACT to the M1-proven line: =149.3.0 → CEF 149.0.6 / Chromium
+#     149.0.7827.201 linux64_minimal (archive SHA1 d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72).
+#     Machine-generated bindings over CEF's STABLE C API (MOZJS-free; regenerable in-house).
+#   * libc — memfd_create/sendmsg/recvmsg FFI used by the SHARED src/webview/* modules this
+#     crate #[path]-includes from the root crate (src/shared.rs — one canonical source).
+
+[package]
+name = "eclipse-webview"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Out-of-process CEF helper for the Eclipse challenge WebView: windowless OSR over an owned Unix-socket protocol + memfd BGRA frames"
+
+[dependencies]
+cef = "=149.3.0"
+libc = "0.2"
+
+[[bin]]
+name = "eclipse-webview"
+path = "src/main.rs"
+
+[[bin]]
+name = "eclipse-webview-drive"
+path = "src/bin/drive.rs"
+
+# 2026-07-03: standalone-detach guard (see header comment) — the root eclipse build must NEVER
+# gain the cef dependency.
+[workspace]

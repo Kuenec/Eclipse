@@ -1,0 +1,6 @@
+# 2026-07-03: M2 helper guard — nothing larger than source may ever become committable.
+# /target/ also holds the CEF runtime files cef-dll-sys's build script copies next to the
+# produced binaries; the CEF dist itself stays under the spike crate's gitignored cef-dist/
+# (the reused M1 download — see Cargo.toml's CEF_PATH contract).
+/target/
+*.log

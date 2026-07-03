@@ -79,17 +79,14 @@ fn now_ms(start: Instant) -> u128 {
     start.elapsed().as_millis()
 }
 
-/// Absolute URL-redaction rule (AGENTS.md 2026-07-02 record): scheme+host only, never the rest.
-fn scheme_and_host_for_log(url: &str) -> String {
-    match url.find("://") {
-        Some(pos) => {
-            let after = &url[pos + 3..];
-            let host_end = after.find('/').unwrap_or(after.len());
-            format!("{}://{}", &url[..pos], &after[..host_end])
-        }
-        None => "<non-url>".to_string(),
-    }
-}
+// 2026-07-03 (M2 same-pattern audit fix): the spike's local redactor leaked query text on
+// path-less URLs (https://host?token=SECRET), kept userinfo, and did not validate the scheme —
+// replaced by the ONE canonical shared implementation (src/webview/redact.rs, `#[path]`-included
+// like the real helper crate does; `NON_URL` + the moved unit test ride along, unused here).
+#[allow(dead_code)]
+#[path = "../../../src/webview/redact.rs"]
+mod redact;
+use redact::url_scheme_and_host_for_log as scheme_and_host_for_log;
 
 wrap_app! {
     struct SpikeApp;
