@@ -25,6 +25,8 @@
 //! - `docs/art-and-runtime.md` — the vendored ART/runtime
 //! - `docs/dependency-plan.md` — what each module will depend on
 //! - `docs/m0-runbook.md` — the foundation-validation step that comes next
+//! - `docs/web-engine-plan.md` — the [`webview`] out-of-process challenge-WebView engine
+//!   (shared IPC protocol/redaction/transport; component-map §N)
 //!
 //! ## Subsystem modules
 //! Each module maps to a subsystem in `docs/component-map.md`; some are implemented (above),
@@ -43,6 +45,7 @@ pub mod input;
 pub mod loader;
 pub mod runtime;
 pub mod services;
+pub mod webview;
 
 /// Eclipse version (from Cargo).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

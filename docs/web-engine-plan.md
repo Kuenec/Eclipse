@@ -3,7 +3,8 @@
 > **Status:** Locked direction / decision record + phased plan. Owner decision **(a)** made
 > **2026-07-03**. Companion to [`dependency-plan.md`](./dependency-plan.md) (the dependency
 > justification) and `AGENTS.md` §6 (2026-07-03 🧭, the decision-log entry). Every milestone
-> gates the next. **M1 is DONE — GO (2026-07-03, verified);** implementation continues at **M2**.
+> gates the next. **M1 is DONE — GO; M2 is DONE (2026-07-03, drive-verified);** implementation
+> continues at **M3**.
 
 ## 1. Why a web engine at all (the recorded ceiling)
 
@@ -196,6 +197,50 @@ cargo test / release) with new plain-`cargo test` units for protocol framing and
 redaction (no CEF or display needed); a dev-host standalone helper run loads a public page
 headless and emits load-started/finished events plus a nonzero-ink frame over the socket;
 `dependency-plan.md` + AGENTS.md §5/§6 entries exist before the dependency merges.
+
+**Status — DONE (2026-07-03; gate + dev-host drive run verified).**
+
+- **Protocol v1 FROZEN.** `src/webview/proto.rs` is the normative message-set/framing spec
+  (this doc keeps only the summary): one `SOCK_STREAM` UnixStream (socketpair end at fd 3
+  per the spawn contract in `src/webview/mod.rs`), frames `[len u32 LE][type u8][body]`,
+  16 consumer→helper types (0x01–0x10) + 8 helper→consumer (0x81–0x88), global 8 MiB cap
+  before allocation + per-type caps, `Hello`/`HelloAck` exact-version handshake (10 s
+  watchdog), symmetric typed malformed-input contract (close loudly + payload-free; helper
+  exit 2). Frame transport: one sealed memfd per (view × size) generation, 2 BGRA slots,
+  `SCM_RIGHTS` on a `0xF5` sentinel byte right after `FrameBufferNew`; torn frames impossible
+  by the `SlotTracker` publish/ack invariant (never write a published-unacked slot;
+  latest-wins coalescing into the spare).
+- **Crate layout.** Root gains `src/webview/` (mod/proto/redact/fdpass/shm/slots — std+libc
+  only, zero cef); the REAL helper `crates/eclipse-webview` (workspace-DETACHED, `cef
+  =149.3.0` + `libc`, committed `Cargo.lock`) `#[path]`-includes those files verbatim via
+  `src/shared.rs` (sibling-module-shape invariant), so the shared units run under BOTH
+  `cargo test` gates. Binaries: `eclipse-webview` (helper) + `eclipse-webview-drive` (the M2
+  verify driver / reference consumer).
+- **Measured drive run (dev-host, Wayland session, ozone selected explicitly `wayland`):**
+  handshake → CreateView 1024x768 → LoadUrl <https://www.roblox.com> → `LoadState` 0 at
+  ~354 ms and 3 at ~867 ms `http_status=200` over the socket → `FrameBufferNew` + memfd
+  received/verified/mapped → `FrameReady` census **122,925 distinct pixels** (the M1 range
+  122,859–123,156 — the rendered live page) → mouse move/click smoke → `CookieGet`→
+  `CookieList` round-trip (12 cookies, names/domains only) → `CloseView`→`ViewClosed` →
+  `Shutdown` → helper exit 0, child reaped, /proc orphan scan clean →
+  `ECLIPSE_WEBVIEW_M2_DRIVE_SUCCESS`. LoadState fidelity finding fixed during M2: the
+  `CreateView` about:blank bootstrap navigation's 0/3 events are suppressed (the Android
+  `internalLoadChanged` contract fires only for DRIVEN loads) — pinned by
+  `load_state_suppresses_the_about_blank_bootstrap_but_never_driven_loads`.
+- **Redaction (the absolute rule, across the boundary by construction):** engine logging OFF
+  at the source (`build_settings` pins `log_severity=DISABLE`, no log file, sandbox ON;
+  `--enable-logging`/`--no-sandbox` stripped from any pass-through command line) +
+  `on_console_message` returns 1 (suppressing the M1-measured console-to-stderr URL leak) +
+  the `Console` wire message is STRUCTURALLY text-free (`Console::from_raw` redacts the
+  source and keeps only the text length). One canonical `url_scheme_and_host_for_log`
+  (moved verbatim `framework.rs` → `src/webview/redact.rs`, call sites/test unchanged);
+  same-pattern audit fixed the spike's weaker local copy (leaked query text on path-less
+  URLs) by switching it to the shared module. Drive-log privacy grep: scheme+host only.
+- **Dependency cycle complete:** `dependency-plan.md` (real dated `cef = "=149.3.0"` +
+  `download-cef`-as-tooling entries, vendored-table M2 note) and the AGENTS.md §5/§6 records
+  were authored BEFORE/WITH the dependency (the §2.1 enforcement order); the root
+  `Cargo.toml`/`Cargo.lock` verified free of cef\*.
+- Implementation continues at **M3**.
 
 ### M3 — Main-process wiring at the recorded seams, validated against a public page via a hidden dev-host subcommand
 

@@ -135,6 +135,16 @@ and exactly one big vendored black box (ART)."**
 |---|---|---|---|
 | Allocator | **system allocator** (v1); `mimalloc` only if profiled | 🟢 / 🟡 | Drop the default `mimalloc` dep → leanest, zero extra dep (no-bloat #3). Roblox's engine brings its own allocator anyway. Add `mimalloc` later *only* if our Rust-side allocation shows up in profiles. |
 
+### N. Challenge WebView engine (login challenge only — 2026-07-03 owner decision (a))
+
+> Added 2026-07-03 (plan M2 of `docs/web-engine-plan.md`); the 2026-06-04 matrix above is unchanged.
+
+| Need | Pick | Tier | Notes |
+|---|---|---|---|
+| Render the web challenge | CEF/Chromium 149 via the `cef` crate in the OUT-OF-PROCESS `crates/eclipse-webview` helper | 🔴 (libcef, the second vendored black box) / 🟢 (every helper line is Rust) | Zero engine bytes in the ART process; lazily spawned, killed after completion. |
+| IPC protocol + frame transport | own std-only Unix-socket protocol + memfd BGRA, `src/webview/` (shared into the helper by `#[path]`) | 🟢 | No tokio; SCM_RIGHTS/memfd confined `unsafe`. |
+| URL redaction contract | `src/webview/redact.rs` (moved from `framework.rs`) | 🟢 | Scheme+host only, both processes. |
+
 ---
 
 ## Purity scorecard

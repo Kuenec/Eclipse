@@ -89,8 +89,25 @@ libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }  # 🟡 (+vcpkg,
 # memfd BGRA frames (NO tokio/async runtime). Runner-up recorded: `servo` (half-yearly LTS pin) in
 # the identical helper shape, gated on its own servoshell real-challenge-URL spike — triggered only
 # if the vendor's scoring refuses CEF-shaped clients at plan-M6 or the owner rejects the footprint.
-# cef = "149"          # 🟡 added at M1 spike / M2 helper crate — pin the exact 149.x at cargo add
-# download-cef = "*"   # 🟢 build/packaging-time fetch of the pinned, SHA1-verified CEF artifact
+# 2026-07-03 (plan M2): WIRED in `crates/eclipse-webview` ONLY — the workspace-DETACHED helper
+# crate (empty [workspace] table, the libm-shim/spike pattern); the root `eclipse` Cargo.toml
+# NEVER gains it (root Cargo.lock verified clean of cef*). Exact pin `=149.3.0` → CEF 149.0.6 /
+# Chromium 149.0.7827.201 `linux64_minimal`, archive SHA1 d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72
+# (download-cef-verified, M1 record). Transitive sys layer: `cef-dll-sys` with the CEF_PATH build
+# contract — it fails ACTIONABLY when CEF_PATH is unset (no silent fallback); the dev-host
+# instance is the M1 dist at crates/eclipse-webview-spike/cef-dist/linux-x86_64 (REUSED, never
+# re-downloaded; any `export-cef-dir` output dir is equally valid). Supply chain is MOZJS-free:
+# machine-generated bindings over CEF's STABLE C API, regenerable in-house if tauri-apps stalls.
+# Strip/prune plan executed at package time (plan M5): libcef.so 1,375,259,784 → 256,322,688 B,
+# locales → en-US; 336 MB measured (M1). Chromium third-party license-attribution obligation:
+# ship CREDITS.html / the aggregate with the payload. Accepted under the libsqlite3-sys/ART
+# precedent: no pure-Rust web engine is production-grade — stability > purity (AGENTS.md §3).
+cef = "=149.3.0"       # 🟡/🔴 crates/eclipse-webview ONLY — never a root-crate dep
+# 2026-07-03: `download-cef`/`export-cef-dir` is a DEV/PACKAGING-TIME tool only (`cargo install
+# export-cef-dir`; pinned + SHA1-verified fetch) — never a [dependencies] entry of any shipped
+# crate. Helper co-dependency: `libc = "0.2"` (memfd/SCM_RIGHTS FFI). The helper's protocol/
+# redaction/fd-pass/shm/slot code is the ROOT crate's src/webview/* shared by #[path] includes
+# (crates/eclipse-webview/src/shared.rs) — one canonical source, no duplicate implementation.
 
 # --- Allocator ---------------------------------------------------------------
 # Use the SYSTEM allocator by default (zero dep, leanest). Add only on profiling evidence:
@@ -106,4 +123,4 @@ libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }  # 🟡 (+vcpkg,
 | **wolfSSL** 5.8.2 | source build w/ JNI flags | GPLv2+/commercial | libcore TLS provider. |
 | **libunwind**, **libandroidfw**, **libOpenSLES** | via the ATL super-build | various | Reuse v1; migrate peripheral ones to Rust later. |
 | Easiest unified build | `github.com/killerdevildog/android_translation_layer` | — | Builds the whole chain in order. |
-| **CEF `libcef`** (Chromium 149 prebuilt `linux64_minimal`) | `download-cef`, pinned + SHA1-verified | BSD-3 + Chromium third-party aggregate (must ship) | 2026-07-03 owner decision (a): the challenge-WebView engine. Helper-process ONLY — never mapped into the ART process. Stripped + locale-pruned at package time. The second 🔴 after ART (`docs/web-engine-plan.md`). |
+| **CEF `libcef`** (Chromium 149 prebuilt `linux64_minimal`) | `download-cef`, pinned + SHA1-verified | BSD-3 + Chromium third-party aggregate (must ship) | 2026-07-03 owner decision (a): the challenge-WebView engine. Helper-process ONLY — never mapped into the ART process. Stripped + locale-pruned at package time. The second 🔴 after ART (`docs/web-engine-plan.md`). M2 (2026-07-03): `cef` dep wired in the detached `crates/eclipse-webview` helper; root crate untouched (verified: root Cargo.lock diff empty of cef*). |

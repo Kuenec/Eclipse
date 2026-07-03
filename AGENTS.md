@@ -128,6 +128,53 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-03 — 🔌 WEB-ENGINE MILESTONE M2 DONE: the real `eclipse-webview` helper crate + the owned
+  std-only IPC protocol v1 (FROZEN) + the completed dependency-justification cycle — IMPLEMENTED + gate
+  green + dev-host drive-run VERIFIED 2026-07-03 (full record in §6 2026-07-03 🔌 and the M2 Status block
+  in `docs/web-engine-plan.md`) ⇐ START-HERE-NEXT: MILESTONE M3 of `docs/web-engine-plan.md` — main-process
+  wiring at the recorded seams (framework.rs:~9325/:~9389 `web_view_native_load_url`/
+  `web_view_native_load_data_with_base_url` become spawn-and-forward keyed by the existing view_registry
+  handle; a socket-reader thread fires the dead `WebView.internalLoadChanged(0/3)` seam as JNI upcalls;
+  vk-overlay composite at the view frame rect; winit input routing; hidden `__webview-test` subcommand +
+  `engine_milestones.rs` self-skip guard).** What shipped: (1) NEW root module `src/webview/` — the
+  SHARED, cef-free protocol surface (`proto.rs` = the NORMATIVE v1 wire spec: `[len u32 LE][type u8][body]`
+  frames, 16 in-types 0x01–0x10 / 8 out-types 0x81–0x88, 8 MiB global cap enforced before allocation +
+  per-type caps, Hello/HelloAck exact-version handshake, total decoder with typed payload-free ProtoError;
+  `redact.rs` = `url_scheme_and_host_for_log`+`NON_URL` MOVED VERBATIM from framework.rs with their §6-cited
+  test — ONE canonical implementation, framework.rs now imports it; `fdpass.rs` = SCM_RIGHTS memfd passing
+  on a 0xF5 sentinel byte; `shm.rs` = sealed-memfd create (SHRINK|GROW|SEAL) + detect-don't-assume consumer
+  mapping guard (size + F_SEAL_SHRINK verified before mmap); `slots.rs` = the 2-slot publish/ack
+  SlotTracker whose invariant makes torn frames impossible by construction; module docs of
+  `src/webview/mod.rs` are the normative helper SPAWN CONTRACT: fd-3 socketpair + `--ipc-fd=3`, optional
+  `--ozone-platform=` override, NO URL ever in argv, PDEATHSIG note). (2) The REAL helper crate
+  `crates/eclipse-webview` — workspace-DETACHED like the spike (`cef = "=149.3.0"` + `libc`, committed
+  Cargo.lock; the root Cargo.toml/Cargo.lock verified cef-free), `#[path]`-includes the shared modules via
+  `src/shared.rs` (sibling-module-shape invariant), binaries `eclipse-webview` (execute_process early-exit
+  → strict --ipc-fd → handshake FIRST under a 10 s watchdog → EXPLICIT ozone selection, never auto →
+  CefInitialize windowless/external-pump/sandbox-ON/logging-DISABLED → 10 ms pump loop + reader/writer std
+  threads, bounded outbox = stalled-consumer quit path) and `eclipse-webview-drive` (the M2 verify driver /
+  reference consumer). (3) Redaction across the boundary by construction: engine logging OFF at the source
+  (`build_settings` unit-pinned), `on_console_message` returns 1 (the M1-measured stderr-URL leak channel
+  closed), the Console wire message STRUCTURALLY text-free (`Console::from_raw` keeps only severity /
+  redacted source / line / byte-length), helper stderr logger accepts only `RedactedTarget`-typed
+  pre-redacted strings, and the spike's weaker local redactor (leaked query text on path-less URLs) fixed
+  to the shared module — the same-pattern audit. MEASURED drive run (Wayland session; ozone explicitly
+  `wayland`): LoadState 0 at ~354 ms → 3 at ~867 ms http_status=200 for https://www.roblox.com over the
+  socket; memfd received/verified/mapped; FrameReady census **122,925 distinct pixels** (inside the M1
+  range 122,859–123,156); mouse move/click smoke; CookieGet→CookieList round-trip (12 cookies,
+  names/domains only); CloseView→ViewClosed; Shutdown → helper exit 0, child reaped, /proc orphan scan
+  clean; marker `ECLIPSE_WEBVIEW_M2_DRIVE_SUCCESS`; privacy grep of the run log: scheme+host only. M2
+  in-flight finding FIXED: the CreateView about:blank bootstrap navigation initially emitted LoadState 0/3
+  a consumer would credit to its own load — suppressed per the Android internalLoadChanged
+  driven-loads-only contract (pinned by
+  `load_state_suppresses_the_about_blank_bootstrap_but_never_driven_loads`). Gate: root fmt/build/clippy
+  -D warnings/test/release ALL clean — **604 unit + 4 integ + 2 doctest** (was 594; +11 new webview units,
+  −1 moved redaction test) with the M3-seam pins
+  (`web_view_native_names_sigs_and_class_match_the_installed_dex`,
+  `view_subclass_constructor_classes_are_slashed_internal_names`, the redaction test under its unchanged
+  name) green; helper crate fmt --check/build/clippy -D warnings/test (**17 + 11** incl. the shared units a
+  second time)/release clean with `CEF_PATH=crates/eclipse-webview-spike/cef-dist/linux-x86_64` (the reused
+  M1 dist — no re-download); spike crate re-gated clean after the redaction fix.
 - **2026-07-03 — 🧪 WEB-ENGINE MILESTONE M1 DONE: the standalone CEF spike is a GO — RUN + independently
   RE-RUN/VERIFIED + COMMITTED 2026-07-03 (spike crate `crates/eclipse-webview-spike`, standalone/
   workspace-detached, source-only committed; full measured record in §6 2026-07-03 🧪 and in
@@ -136,7 +183,7 @@ before any history-rewriting/force operation.
   merges into any shipped crate) + the real `eclipse-webview` helper crate (one windowless browser per view
   handle, software OnPaint BGRA → memfd, lazy spawn/kill) + the owned std-only Unix-socket IPC protocol,
   with plain-`cargo test` units for protocol framing and helper-side redaction — the M1 evidence to build on
-  exists.** Verdict basis: CEF 149.0.6 / Chromium 149.0.7827.201 (`cef` crate pinned `=149.3.0`,
+  exists — DONE 2026-07-03 (see the 🔌 bullet above; the live pointer moved to MILESTONE M3).** Verdict basis: CEF 149.0.6 / Chromium 149.0.7827.201 (`cef` crate pinned `=149.3.0`,
   linux64_minimal SHA1-verified) initialized, loaded and rendered live https://www.roblox.com on the dev
   host in BOTH modes (windowed native window; windowless software OSR → 1024x768 PNG, distinct-pixel census
   122,859–123,156, visually the rendered signup page) on FOUR display paths — session-default (ozone AUTO
@@ -6411,6 +6458,148 @@ clippy --all-targets -- -D warnings` clean (exact counts in the commit).
 (`Cargo.toml`, `Cargo.lock`, `src/main.rs`, `.gitignore` — source only), `docs/web-engine-plan.md` (header +
 M1 Status block), this file (§5 🧪 bullet ⇐ START-HERE-NEXT = plan M2; §6 this entry). Next session:
 MILESTONE M2.
+
+### 2026-07-03 — 🔌 WEB-ENGINE MILESTONE M2 DONE: the real `eclipse-webview` helper crate (CEF 149, workspace-detached) + the owned std-only Unix-socket IPC protocol v1 (FROZEN) + memfd frame transport + the completed `cef` dependency-justification cycle — gate green in three crates and the dev-host drive run loaded live https://www.roblox.com headless over the socket (LoadState 0→3 http 200, 122,925-distinct-pixel frame, cookie round-trip, clean reap, zero orphans); the live pointer advances to MILESTONE M3
+
+*Provenance:* implements MILESTONE M2 of `docs/web-engine-plan.md` (after the 🧪 M1 GO above). Scope held
+to the plan: NO app wiring, NO ART, NO APK, NO challenge URL; the drive loads a public page only. The M1
+findings honored throughout: the CEF dist REUSED from `crates/eclipse-webview-spike/cef-dist/linux-x86_64`
+(SHA1-verified at M1; the `CEF_PATH` env contract — cef-dll-sys fails actionably when unset, no silent
+fallback); ozone selected EXPLICITLY (never auto); `--no-sandbox` never passed (`no_sandbox=0`, and the
+flag is stripped defensively from any pass-through command line); engine stderr logging OFF at the source.
+
+*Dependency justification (§2.1 enforcement order — docs authored FIRST, same tree):*
+`docs/dependency-plan.md` now carries the real dated entries: `cef = "=149.3.0"` (→ CEF 149.0.6 / Chromium
+149.0.7827.201 `linux64_minimal`, archive SHA1 `d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72`) wired in
+`crates/eclipse-webview` ONLY — the workspace-DETACHED helper crate (empty `[workspace]` table, the
+libm-shim/spike pattern); the root eclipse build NEVER gains it (verified: root `Cargo.toml`/`Cargo.lock`
+diff empty of cef\*). `cef-dll-sys` recorded as the transitive sys layer with the CEF_PATH contract;
+`download-cef`/`export-cef-dir` recorded as DEV/PACKAGING-TIME tooling only (never a [dependencies] entry);
+helper co-dependency `libc = "0.2"` (memfd/SCM_RIGHTS FFI); the MOZJS-free supply-chain note
+(machine-generated bindings over CEF's STABLE C API, regenerable in-house), the strip/prune plan
+(1,375,259,784 → 256,322,688 B; locales → en-US; 336 MB measured, executed at plan-M5 package time), the
+Chromium third-party license-attribution obligation (ship CREDITS.html/the aggregate), and the explicit
+libsqlite3-sys/ART precedent sentence (no pure-Rust web engine is production-grade — stability > purity,
+§3). The vendored-table libcef row gained the dated M2 wiring note. `docs/component-map.md` gained section
+N (Challenge WebView engine) mirroring the new `src/webview/` module per the house rule.
+
+*Design shipped (protocol/transport/redaction, full spec in `src/webview/proto.rs` — the normative home):*
+ONE `SOCK_STREAM` UnixStream (socketpair end dup2'd to fd 3; spawn contract normative in
+`src/webview/mod.rs`: binary resolution ECLIPSE_WEBVIEW_HELPER/sibling, argv `--ipc-fd=3` +
+optional `--ozone-platform=`, NO URL ever in argv, PDEATHSIG-fires-on-thread-exit note). Framing
+`[len u32 LE][type u8][body]` (len counts type+body); strings u32-len UTF-8-validated; bools strictly 0/1;
+global 8 MiB cap enforced BEFORE allocation + per-type caps (default 64 KiB, LoadUrl 32 KiB,
+LoadDataWithBaseUrl/EvaluateJs 8 MiB); v1 = 16 consumer→helper types (Hello, CreateView/CloseView/
+ResizeView/Shutdown, LoadUrl/LoadDataWithBaseUrl, MouseMove/MouseClick/MouseWheel/Key, EvaluateJs
+fire-and-forget, CookieSet/CookieGet/CookiesClear, FrameAck) + 8 helper→consumer (HelloAck, LoadState
+0|3 = exactly the internalLoadChanged codes, FrameBufferNew, FrameReady, Console, Crash, CookieList,
+ViewClosed). Handshake: Hello magic `ECWV` + exact version match (bad magic = malformed close; unsupported
+version → HelloAck carrying the helper's version, then close; 10 s no-Hello watchdog). MALFORMED-INPUT
+contract (symmetric, total decoder in the axml.rs house shape, typed payload-free `ProtoError`): unknown
+type/over-cap/truncated/bad-UTF-8/bad-bool/handshake-order → ONE loud payload-free log line, close; helper
+quits the CEF loop, closes browsers, CefShutdown, exit 2; unexpected EOF identical minus severity; v1 never
+skips unknown frames. FRAME TRANSPORT: per (view × size) generation one memfd
+(`memfd_create MFD_CLOEXEC|MFD_ALLOW_SEALING` → ftruncate 2×slot_bytes → seals SHRINK|GROW|SEAL — size
+immutable, write access retained), fd crosses via SCM_RIGHTS on a 0xF5 sentinel byte immediately after the
+FrameBufferNew frame (exact-length reads make the sentinel the next unread byte; /proc/pid/fd REJECTED —
+Yama ptrace_scope portability); consumer maps only after fstat-size + F_SEAL_SHRINK verification
+(SIGBUS-via-truncation closed); torn frames impossible by the SlotTracker invariant (a published-unacked
+slot is NEVER written; latest-wins coalescing into the spare; ack releases + swaps; ≤1 FrameReady in
+flight → bounded traffic); resize = new generation, stale paints/acks dropped/ignored by definition.
+ORPHAN PREVENTION layered: reader-EOF → clean CefShutdown (primary), PR_SET_PDEATHSIG(SIGTERM) in pre_exec
+(secondary), consumer kill()+wait() + the drive's /proc argv[0] orphan scan (backstop). Stalled-consumer
+policy: bounded 1024-deep outbox; a full queue = dead consumer = quit path. REDACTION crosses the boundary
+by construction, four layers: (1) ONE canonical `url_scheme_and_host_for_log`+`NON_URL` moved VERBATIM
+`src/framework.rs` → `src/webview/redact.rs` (framework.rs imports; call sites + §6-cited test name
+unchanged; dated moved-note at the old site); (2) helper stderr logger accepts only `RedactedTarget`-typed
+pre-redacted strings, loadData's payload has no formatter parameter at all; (3) engine logging OFF at the
+source (`build_settings`: LOGSEVERITY_DISABLE, no log_file, never --enable-logging — the M1-measured
+full-URL stderr channel) + `on_console_message` returns 1 (suppresses Chromium's console-to-stderr
+forwarding); (4) the Console wire message is STRUCTURALLY text-free — its only constructor
+`Console::from_raw` redacts the source and stores the message byte-length alone (defense-in-depth:
+the consumer decode re-redacts). Cross-crate sharing: `crates/eclipse-webview/src/shared.rs`
+`#[path]`-includes the root's `src/webview/*` files (sibling-module-shape invariant documented; the shared
+`#[cfg(test)]` units run under BOTH crates' `cargo test` — deliberate double-execution parity insurance).
+
+*In-flight root-cause fix (drive run 1 → run 2):* the first drive run exposed that CreateView's internal
+about:blank bootstrap navigation emitted LoadState 0/3 (target `<non-url>`, http 0) that the consumer
+credited to its OWN driven load, while the real roblox load-start went unattributed. Mechanism fixed at the
+source per the Android `internalLoadChanged` contract (fires only for DRIVEN loads): `ViewState.driven_url`
+gates LoadState emission — suppressed until the first driven load and for late about:blank bootstrap events
+after a real target was driven (driving about:blank itself, loadData's hardcoded base, stays live). Honest
+`*-bootstrap-suppressed` log lines record the suppression.
+
+*Same-pattern audit:* the redaction contract had exactly two implementations —
+`framework.rs::url_scheme_and_host_for_log` (canonical) and the spike's LOCAL weaker
+`scheme_and_host_for_log` (crates/eclipse-webview-spike/src/main.rs:83 — leaked query text on path-less
+URLs like `https://host?token=SECRET`, kept userinfo, no scheme validation). The canonical fn moved to the
+shared module; the spike's copy REPLACED by the same `#[path]` include (smallest diff; markers/behavior
+unchanged; spike re-gated). Repo-wide grep confirms no third copy.
+
+*Regression guards (all under plain `cargo test`, no CEF/display; run twice via the helper gate):*
+`proto_roundtrip_encodes_and_decodes_every_v1_message` (v1 freeze),
+`proto_decoder_is_total_on_truncated_frames`, `proto_rejects_oversized_declared_length_before_allocating`,
+`proto_rejects_unknown_type_trailing_bytes_and_bad_bools`, `proto_rejects_invalid_utf8_in_string_fields`,
+`hello_handshake_requires_exact_magic_and_version`,
+`console_event_never_carries_message_text_or_raw_url` (the M1 stderr-leak class closed at the wire),
+`fdpass_sends_and_receives_memfd_across_socketpair` (buffered-reader/sentinel hazard),
+`map_frame_buffer_rejects_unsealed_or_missized_memfd`,
+`frame_slots_never_write_a_published_unacked_slot` (50k-step randomized property),
+`url_scheme_and_host_for_log_serves_scheme_and_host_only_and_never_query_payload_or_credentials` (moved
+intact). Helper-crate units: `ozone_selection_is_explicit_and_never_auto` (the M1 designed-failure table),
+`engine_settings_keep_engine_logging_disabled`, `helper_log_lines_redact_urls_to_scheme_and_host`,
+`ipc_fd_argument_is_required_and_validated`, `urls_equivalent_tolerates_exactly_the_trailing_slash`,
+`load_state_suppresses_the_about_blank_bootstrap_but_never_driven_loads`. Existing pins unchanged + green:
+`web_view_native_names_sigs_and_class_match_the_installed_dex`,
+`view_subclass_constructor_classes_are_slashed_internal_names`, the two validated no-op load natives
+untouched (M3's seams).
+
+*Gate (all clean, 0 warnings/errors):* [root] `cargo fmt --all` / `cargo build --all-targets` /
+`cargo clippy --all-targets --all-features -- -D warnings` / `cargo test` (**604 unit + 4 integ +
+2 doctest**, 0 failed; was 594 — +11 new webview units, −1 moved) / `cargo build --release`.
+[helper crate, `CEF_PATH=…/eclipse-webview-spike/cef-dist/linux-x86_64`] `cargo fmt --check` /
+`cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `cargo test` (**17 + 11**, the
+shared units a second time) / `cargo build --release`. [spike re-gate] `cargo fmt --check` / `cargo build
+--all-targets` / `cargo clippy --all-targets -- -D warnings`. [root isolation] root Cargo.toml/Cargo.lock
+diff empty of cef\*. [dev-host drive] `target/release/eclipse-webview-drive` (Wayland session, ozone
+explicitly `wayland`): LoadState 0 @ ~354 ms → 3 @ ~867 ms http_status=200 for https://www.roblox.com,
+FrameBufferNew+memfd received/verified/mapped, FrameReady census 122,925 distinct pixels (M1 range
+122,859–123,156), mouse smoke, CookieGet→CookieList (12 cookies, names/domains only), CloseView→ViewClosed,
+Shutdown → helper exit 0, reaped, /proc orphan scan clean → `ECLIPSE_WEBVIEW_M2_DRIVE_SUCCESS`; privacy
+grep of the run log: scheme+host only, zero payload text.
+
+*Independent validation (2026-07-03, same tree, pre-ship):* the full gate REPRODUCED green ([root]
+604 unit + 4 integ + 2 doctest; [helper] 17 + 11; [spike] fmt/build/clippy; root Cargo.lock cef-free) and
+the drive run REPRODUCED FRESH (prior logs deleted first): LoadState 0 @ 354 ms → 3 @ 702 ms http 200,
+the about:blank bootstrap correctly logged `*-bootstrap-suppressed` and NOT emitted, cookie round-trip
+(12), clean reap, zero orphans, marker printed. The fresh census was **988** distinct pixels vs run 2's
+122,925 — the drive breaks at the FIRST inked frame, so the census is sampling-time dependent; both
+honestly satisfy the nonzero-ink criterion (a future gate wanting the M1-range census must sample
+post-settle). An 8-case hostile-input harness against the LIVE helper confirmed the malformed-input
+contract end-to-end (bad magic / u32::MAX declared len rejected BEFORE allocation / truncated-EOF /
+version mismatch → HelloAck-then-close / handshake-order violation / unknown type carrying a secret body —
+ZERO payload bytes reached stderr / bad bool / silent consumer → 10 s watchdog): every case ONE loud
+typed payload-free line + clean CefShutdown exit 2, no hangs/panics/orphans. Redaction audit CLEAN across
+all 87 log/print call sites and the fresh run log (scheme+host tokens only; engine stderr empty in every
+run, attack cases included). Non-blocking notes carried forward: (a) `suppress_load_state` suppresses ALL
+pre-driven LoadState events, not only about:blank — matches the driven-loads-only contract and is
+unit-pinned, but a page that self-navigates before any driven load would be silent (irrelevant at M2;
+re-examine at M3/M6); (b) `crates/eclipse-webview/src/logging.rs` has no unsafe but lacks
+`#![forbid(unsafe_code)]` (§2.3 one-liner; mod.rs/shared.rs are legitimately excused — forbid would
+propagate into their unsafe-bearing child modules); (c) shm.rs/fdpass.rs each have one shared `// SAFETY:`
+comment covering two adjacent blocks (cosmetic split); (d) helper gate steps 6–10 require `CEF_PATH`
+(the accepted, documented env contract — cef-dll-sys fails actionably when unset).
+
+*Status:* M2 DONE + drive-VERIFIED 2026-07-03. Files: `src/webview/` (new: mod/proto/redact/fdpass/shm/
+slots), `src/lib.rs` (+`pub mod webview` + doc line), `src/framework.rs` (redaction fn/test moved out;
+import + dated notes), `crates/eclipse-webview/` (new: Cargo.toml, Cargo.lock, .gitignore, src/{main,
+engine,logging,shared}.rs, src/bin/drive.rs), `crates/eclipse-webview-spike/src/main.rs` (same-pattern
+redaction fix), `docs/dependency-plan.md` (real cef entries + vendored-row note),
+`docs/component-map.md` (§N), `docs/web-engine-plan.md` (header + M2 Status block), this file (§5 🔌 bullet
+⇐ START-HERE-NEXT = plan M3; §6 this entry). Next session: MILESTONE M3 — main-process wiring at the
+recorded seams (framework.rs `web_view_native_load_url`/`web_view_native_load_data_with_base_url`
+spawn-and-forward, `internalLoadChanged(0/3)` JNI upcalls, vk-overlay composite, `__webview-test` +
+engine_milestones self-skip guard).
 
 ---
 
