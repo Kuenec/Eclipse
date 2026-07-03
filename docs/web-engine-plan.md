@@ -2,8 +2,8 @@
 
 > **Status:** Locked direction / decision record + phased plan. Owner decision **(a)** made
 > **2026-07-03**. Companion to [`dependency-plan.md`](./dependency-plan.md) (the dependency
-> justification) and `AGENTS.md` §6 (2026-07-03 🧭, the decision-log entry). Nothing here is
-> implemented yet — implementation starts at **M1** and every milestone gates the next.
+> justification) and `AGENTS.md` §6 (2026-07-03 🧭, the decision-log entry). Every milestone
+> gates the next. **M1 is DONE — GO (2026-07-03, verified);** implementation continues at **M2**.
 
 ## 1. Why a web engine at all (the recorded ceiling)
 
@@ -122,7 +122,7 @@ subordinates.
 
 ## 6. Phased milestones (each gates the next; per-milestone verify checks)
 
-### M1 — Standalone CEF spike on the dev host (no app wiring; the go/no-go proof)
+### M1 — Standalone CEF spike on the dev host (no app wiring; the go/no-go proof) — **DONE: GO (2026-07-03)**
 
 New scratch crate outside the `eclipse` binary (e.g. `crates/eclipse-webview-spike` or the
 session scratchpad): `cef` crate + `download-cef` fetches the pinned CEF 149 `linux64_minimal`
@@ -139,6 +139,44 @@ locale-prune. NOT `cargo run -- run`; no ART, no APK, no challenge URL — a pub
 ink; sandbox mode, host-lib set, render path, and footprint numbers are captured in the spike
 notes for the §6 record. Failure here (engine cannot initialize/render on this host) stops
 the plan before any integration cost.
+
+**Status — DONE, GO (2026-07-03; independently re-run and verified).** Spike crate
+`crates/eclipse-webview-spike` (standalone, workspace-detached — the libm-shim pattern; `cef`
+pinned `=149.3.0` → CEF 149.0.6 / Chromium 149.0.7827.201 `linux64_minimal`, SHA1-verified
+`d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72`). Measured on the dev host:
+
+- **Display paths** (windowed AND OSR each SUCCESS): (a) session default — ozone AUTO-selected
+  **native Wayland**, not XWayland; (b) explicit `--ozone-platform=wayland` — **answers
+  open-question #6 positively on this host** (windowed included, libX11 merely present);
+  (c) X11 via `XDG_SESSION_TYPE=x11` + `DISPLAY`; (d) explicit `--ozone-platform=x11`. The one
+  designed failure: `WAYLAND_DISPLAY` unset while `XDG_SESSION_TYPE=wayland` — ozone auto
+  still picks Wayland and cannot connect, so the M2 helper must select/probe the ozone
+  platform explicitly, never trust auto.
+- **Sandbox mode:** unprivileged user-namespace sandbox engaged **by default** — `--no-sandbox`
+  never passed (`Settings.no_sandbox=0` every run). Kernel-level probe of the live process
+  tree: zygote+renderer forks in a new user/PID/net namespace, `NoNewPrivs=1`,
+  renderer/utility `Seccomp=2` (filter mode). Shipped `chrome-sandbox` is mode 0755 (not
+  SUID), so the SUID mode is impossible as-shipped; host userns availability was verified,
+  not assumed (`kernel.unprivileged_userns_clone=1`).
+- **Host-lib probe:** `ldd` on `libcef.so` — **0 "not found"** (32 direct `DT_NEEDED`
+  incl. nss/nspr, atk/atspi, cups, gbm, xkbcommon, cairo/pango, asound, libX11; full closure
+  ~70 libs, all resolved on this host).
+- **Render path:** hardware GPU (NVIDIA 610.43.02 via CEF's bundled ANGLE EGL/GL — Chromium
+  disables Vulkan under ozone-wayland); `libvk_swiftshader.so` never mapped in any run.
+- **OSR ink proof:** 1024x768 (exactly the served view_rect) BGRA→RGBA PNG of the live
+  rendered roblox.com signup page; distinct-pixel census 122,859–123,156 across runs;
+  load-start ~0.36–0.71 s, load-finished http 200 ~0.7–1.4 s; clean
+  `close_browser`→`on_before_close`→`shutdown`, exit 0, no orphan Chromium processes.
+- **Footprint:** as-downloaded extracted 1452 MB (archive 297 MB); `strip` of `libcef.so`
+  1,375,259,784 → 256,322,688 bytes (dir total 385 MB); + locale prune to en-US (220 files,
+  50 MB → 0.56 MB) = **336 MB** — inside the plan's ~320–400 MB envelope (~8 MB of that is
+  SDK sources that would not ship).
+- **M2-carried findings:** Chromium's `--enable-logging=stderr` console forwarding prints
+  FULL page URLs — the helper must keep engine stderr logging off/filtered (the absolute
+  redaction rule); the roblox.com captcha bootstrap ran on CEF 149 (early positive signal for
+  open-question #1).
+
+Full record: `AGENTS.md` §6 2026-07-03 🧪 (M1 verdict entry).
 
 ### M2 — Dependency-justification cycle + real `eclipse-webview` helper + owned IPC protocol
 

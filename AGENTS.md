@@ -128,12 +128,40 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-03 — 🧪 WEB-ENGINE MILESTONE M1 DONE: the standalone CEF spike is a GO — RUN + independently
+  RE-RUN/VERIFIED + COMMITTED 2026-07-03 (spike crate `crates/eclipse-webview-spike`, standalone/
+  workspace-detached, source-only committed; full measured record in §6 2026-07-03 🧪 and in
+  `docs/web-engine-plan.md` M1 Status) ⇐ START-HERE-NEXT: MILESTONE M2 of `docs/web-engine-plan.md` — the
+  full dependency-justification cycle (`docs/dependency-plan.md` + a §6 entry BEFORE the `cef` dependency
+  merges into any shipped crate) + the real `eclipse-webview` helper crate (one windowless browser per view
+  handle, software OnPaint BGRA → memfd, lazy spawn/kill) + the owned std-only Unix-socket IPC protocol,
+  with plain-`cargo test` units for protocol framing and helper-side redaction — the M1 evidence to build on
+  exists.** Verdict basis: CEF 149.0.6 / Chromium 149.0.7827.201 (`cef` crate pinned `=149.3.0`,
+  linux64_minimal SHA1-verified) initialized, loaded and rendered live https://www.roblox.com on the dev
+  host in BOTH modes (windowed native window; windowless software OSR → 1024x768 PNG, distinct-pixel census
+  122,859–123,156, visually the rendered signup page) on FOUR display paths — session-default (ozone AUTO
+  picked NATIVE Wayland, not XWayland), explicit `--ozone-platform=wayland` (plan open-question #6 answered
+  positively on this host), X11 via `XDG_SESSION_TYPE=x11`, explicit `--ozone-platform=x11` — with the ONE
+  designed failure (WAYLAND_DISPLAY unset while XDG_SESSION_TYPE=wayland → ozone auto still picks Wayland
+  and cannot connect) proving the M2 helper MUST select/probe the ozone platform explicitly, never trust
+  auto. Sandbox: the unprivileged-USERNS namespace sandbox engaged BY DEFAULT — `--no-sandbox` never passed;
+  kernel-level probe: zygote+renderer in NEW user/pid/net namespaces, NoNewPrivs=1, renderer/utility
+  Seccomp=2 (filter mode); shipped chrome-sandbox is 0755 (not SUID). Host-lib probe: ldd on libcef.so 0
+  "not found" (32 direct DT_NEEDED, ~70-lib closure, all resolved). Render path: hardware GPU (NVIDIA
+  610.43.02 via bundled ANGLE EGL/GL; Vulkan disabled under ozone-wayland); SwiftShader never mapped.
+  Footprint: 1452 MB extracted → libcef.so strip 1,375,259,784 → 256,322,688 B → + en-US locale prune =
+  336 MB (inside the plan's ~320–400 MB envelope). M2-carried findings: engine stderr console forwarding
+  prints FULL page URLs — keep it OFF/filtered in the helper (absolute redaction rule); the roblox.com
+  captcha bootstrap ran on CEF 149 (early positive for open-question #1). STILL OPEN FOR THE OWNER (plan §7):
+  footprint/payload-size acceptance (#5), the `--no-sandbox` degradation policy (#2), release-tracking
+  cadence (#4). Clean runs: exit 0, honest close/shutdown, zero orphan Chromium processes.
 - **2026-07-03 — 🧭 OWNER DECISION (a) MADE: integrate a real NON-GTK web engine for the challenge WebView —
   DECIDED by the owner 2026-07-03, direction locked + RECORDED + COMMITTED (the phased plan is
   `docs/web-engine-plan.md`; the dependency direction is in `docs/dependency-plan.md`; full record in §6
   2026-07-03 🧭; this pass is DOCS-ONLY — no dependency added, no code touched) ⇐ START-HERE-NEXT: MILESTONE M1
   of `docs/web-engine-plan.md` — the STANDALONE CEF spike on the dev host (no app wiring, no ART, no APK, no
-  challenge URL — a public page only; the go/no-go proof that gates every later milestone).** Resolves the 🔘
+  challenge URL — a public page only; the go/no-go proof that gates every later milestone) — DONE 2026-07-03:
+  GO (see the 🧪 bullet above; the live pointer moved to MILESTONE M2).** Resolves the 🔘
   bullet's owner-level decision (options (a)/(b); (b) — a non-web login/challenge path — REJECTED by the owner).
   CHOSEN DIRECTION: CEF/Chromium (the tauri-apps `cef` crate, 149.x as of 2026-07-03) embedded in an
   Eclipse-owned OUT-OF-PROCESS `eclipse-webview` Rust helper binary — windowless OSR, BGRA frames over memfd
@@ -6301,6 +6329,88 @@ unwired — the §2.1 enforcement order).
 *Status:* DECIDED by the owner + RECORDED + COMMITTED 2026-07-03. Files: `docs/web-engine-plan.md` (new,
 indexed in §7), `docs/dependency-plan.md` (new WebView-engine subsystem section + libcef row in the vendored
 table), this file (§5 🧭 bullet ⇐ START-HERE-NEXT = plan M1; §6 this entry). Next session: MILESTONE M1.
+
+### 2026-07-03 — 🧪 WEB-ENGINE MILESTONE M1 VERDICT: **GO** — the standalone CEF spike (`crates/eclipse-webview-spike`) initialized, sandboxed, and rendered live https://www.roblox.com on the dev host in BOTH modes (windowed + windowless software OSR with a nonzero-ink PNG) across four display paths, with every plan-M1 measurement captured and independently re-verified; the live pointer advances to MILESTONE M2
+
+*Provenance:* implements MILESTONE M1 of `docs/web-engine-plan.md` (the 🧭 entry above; owner decision (a),
+2026-07-03). Scope held exactly to the plan: NO app wiring, NO ART, NO APK, NO challenge URL — a public page
+only; NOT `cargo run -- run`. The spike is a STANDALONE crate (`crates/eclipse-webview-spike`, the
+crates/libm-shim detachment pattern + an explicit empty `[workspace]` table) — the root `Cargo.toml`,
+`build.rs`, and root `Cargo.lock` are untouched, and the §2.1/§6 process guard stands: the `cef` dependency
+still does NOT land in any shipped crate before the M2 justification cycle in `docs/dependency-plan.md`.
+Research per CLAUDE.md before the spike: official tauri-apps/cef-rs README + cefsimple/osr examples at tag
+`export-cef-dir-v149.3.0+149.0.6`, docs.rs 149.3.0 `ImplLoadHandler` signatures, crates.io (`cef` max
+149.3.0+149.0.6 pub 2026-06-28), `download-cef` source (SHA1 verify + spotifycdn index), `cef-dll-sys`
+build.rs (CEF_PATH contract; Linux needs no cmake). Pin: `cef = "=149.3.0"` → CEF 149.0.6 / Chromium
+149.0.7827.201 `linux64_minimal`, archive SHA1 `d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72` verified by
+`download-cef`.
+
+*Measured results (spike run + independent verification re-run, both 2026-07-03):*
+- **Windowed:** CEF's own native window loaded https://www.roblox.com — main-frame load-start ~360–710 ms,
+  load-finished http_status=200 at ~0.7–1.4 s, 20 s visible linger, then clean
+  `close_browser`→`on_before_close`→`shutdown`, exit 0; deterministic marker
+  `ECLIPSE_WEBVIEW_SPIKE_WINDOWED_SUCCESS`. No retries; no orphan Chromium processes after any run.
+- **Windowless OSR (the M3-relevant path):** software OSR (`windowless_rendering_enabled=1`, 30 fps, NO
+  shared-texture path) delivered BGRA `on_paint` frames at exactly the served view_rect (1024x768); the
+  settled frame written as RGBA PNG shows the fully rendered live signup page (verifier: logo, form widgets,
+  legal text, hero-art collage — real content, not blank/garbage); nonzero-ink census 122,859–123,156
+  distinct pixels across runs (uniform buffer would be 1); marker `ECLIPSE_WEBVIEW_SPIKE_OSR_SUCCESS`. The
+  settled render is deterministic (verifier's regenerated PNG byte-identical after deleting the original).
+- **Display paths (each SUCCESS in BOTH modes):** (a) session default — Chromium ozone AUTO selected NATIVE
+  Wayland (not XWayland; `ui/ozone/platform/wayland/*` in the logs); (b) explicit
+  `--ozone-platform=wayland` — plan open-question #6 answered POSITIVELY on this host (windowed included;
+  libX11 a hard DT_NEEDED but X libs merely present, not connected); (c) X11 via `XDG_SESSION_TYPE=x11` +
+  `DISPLAY` (zero wayland-platform lines); (d) explicit `--ozone-platform=x11`. The ONE designed failure —
+  `WAYLAND_DISPLAY` unset while `XDG_SESSION_TYPE=wayland` — fails honestly
+  (`cef-initialize-returned-0`; ozone auto still picks Wayland and cannot connect): **the M2 helper must
+  select/probe the ozone platform explicitly, never trust auto** (§2.9 detect-don't-assume).
+- **Sandbox mode (plan-M1 required capture):** the unprivileged USER-NAMESPACE sandbox engages BY DEFAULT —
+  `--no-sandbox` NEVER passed (`Settings.no_sandbox=0`); shipped `chrome-sandbox` is 0755 (not SUID → the
+  SUID mode is impossible as-shipped); host userns VERIFIED not assumed
+  (`kernel.unprivileged_userns_clone=1`, `user.max_user_namespaces=126156`); kernel-level probe of the live
+  spike tree: sandboxed zygote + renderer forks in a NEW user namespace (plus new pid + net namespaces),
+  `NoNewPrivs=1`, renderer/utility `Seccomp=2` (filter mode) — namespace layer-1 + seccomp-bpf layer-2 both
+  active. Reproduced identically by the independent verifier.
+- **Host-lib probe:** `ldd` on `libcef.so`: **0 "not found"** — 32 direct DT_NEEDED (glib/gio, nspr/nss,
+  atk/atspi, dbus, cups, X11+xcb, xkbcommon, cairo, pango, gbm, expat, udev, asound, libc/libm/...), full
+  ~70-lib closure all resolved on this host (CachyOS).
+- **Render path:** hardware GPU — NVIDIA proprietary 610.43.02 via CEF's bundled ANGLE (EGL/GL); Chromium
+  disables Vulkan under ozone-wayland; `libvk_swiftshader.so` never mapped in ANY run; GPU process holds
+  /dev/nvidia0 + /dev/dri/renderD128.
+- **Footprint:** as-downloaded extracted 1452 MB (archive 297 MB); `strip` of `libcef.so` 1,375,259,784 →
+  256,322,688 bytes (dir 385 MB); + locale prune to en-US (220 files, 50 MB → en-US.pak 0.56 MB) =
+  **336 MB** — inside the plan's ~320–400 MB envelope (~8 MB of it is SDK sources that would not ship).
+  Verifier reproduced every number byte-exact, including an independent strip.
+
+*Open questions (plan §7) M1 touched:* **answered/measured** — #6 Wayland-without-XWayland
+(`--ozone-platform=wayland` initializes and renders in both modes on this host; still to be validated on a
+host with NO XWayland at M5), the sandbox-mode half of #2 (userns default works here — the DEGRADATION
+POLICY ruling below remains), the footprint numbers for #5, and an early positive signal on #1 (the
+roblox.com captcha bootstrap console line ran on CEF 149). **Still OPEN for the owner:** #5
+footprint/payload acceptance (336 MB pruned / ~120 MB order compressed, a 10×+ distribution growth —
+sign-off needed), #2 `--no-sandbox` as a loud documented degradation on hosts with neither SUID helper nor
+userns, #4 release-tracking cadence (LTC/LTS pin vs ~2-week stable treadmill; CVE exposure when lagged).
+
+*Privacy note carried to M2 (absolute redaction rule):* Chromium's own `--enable-logging=stderr` console
+forwarding prints FULL page URLs (page-controlled content) — the helper must keep engine stderr logging OFF
+or filter it; helper logs route through the `url_scheme_and_host_for_log` contract like everything else.
+
+*Regression guards:* none new — the M1 record IS the deliverable (docs + a standalone spike crate with no
+runtime surface in the shipped binary; the existing WebView/redaction pins stand unchanged). Process guards
+held: the spike crate's own `.gitignore` (`/target/`, `/cef-dist/`, `*.log`) makes nothing larger than
+source committable (verified: the stageable set is exactly 4 files, largest ~39 KB `Cargo.lock`); the `cef`
+dependency remains out of every shipped crate until the M2 `dependency-plan.md` cycle. The M2 helper's
+plain-`cargo test` protocol/redaction units are where automated guards for this subsystem begin.
+
+*Gate:* root quality gate green on this tree (docs + new detached crate; root build unaffected) — `cargo
+fmt --all` / `cargo build --all-targets` / `cargo clippy --all-targets --all-features -- -D warnings` /
+`cargo test` / `cargo build --release`; PLUS the detached spike crate's own `cargo fmt --check` + `cargo
+clippy --all-targets -- -D warnings` clean (exact counts in the commit).
+
+*Status:* M1 DONE — GO, VERIFIED + COMMITTED 2026-07-03. Files: `crates/eclipse-webview-spike/`
+(`Cargo.toml`, `Cargo.lock`, `src/main.rs`, `.gitignore` — source only), `docs/web-engine-plan.md` (header +
+M1 Status block), this file (§5 🧪 bullet ⇐ START-HERE-NEXT = plan M2; §6 this entry). Next session:
+MILESTONE M2.
 
 ---
 
