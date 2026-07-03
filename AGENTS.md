@@ -128,10 +128,114 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-02 — 📏 `android.view.View.native_measure(JII)V` BOUND (closes the challenge13 frontier — the 📐
+  audit-table row-11 documented-unbound REAL content-measure native; the challenge fragment's Toolbar →
+  ActionMenuView measure) — IMPLEMENTED per the adversarially-reviewed plan + ✅ VALIDATED by the 2026-07-03
+  challenge14 boot + COMMITTED 2026-07-03 ⇐ START-HERE-NEXT: bind
+  `android.widget.ImageButton.native_setDrawable(JJ)V` (the challenge14 discovery signal — the log's ONLY ULE;
+  full stack in §6 2026-07-03 📏: the SAME challenge fragment yh.d ONE LIFECYCLE STAGE LATER, in
+  `onActivityCreated:77` via `Fragment.performActivityCreated`, wiring its RobloxToolbar navigation icon. The 🎨
+  drawable-pass and the widget-subclass precedents likely apply: ImageView's OWN native_setDrawable IS bound
+  (`bound=3`) but ImageButton (`bound=2`) RE-DECLARES it — the 2026-06-13 WebView.native_constructor
+  subclass-redeclaration pattern recurring; natural shape = register ImageButton.native_setDrawable, plausibly
+  delegating to the existing ImageView handler, after the usual baksmali audit of the installed ImageButton dex
+  surface) — and NOTE the standing OWNER-LEVEL web-engine decision preserved at the end of this bullet: this pass
+  advanced the toolbar but STILL CANNOT make the web challenge COMPLETE.** Implements the 🌐 bullet's
+  START-HERE-NEXT (full record in §6 2026-07-02 📏; plan = the 2026-07-02 audit/plan workflow, adversarially
+  reviewed — 2 deduplicated must-fixes +
+  6 folded advisories applied BEFORE implementation; the post-implementation diff review returned ZERO
+  must-fixes). Shape (all in `src/framework.rs::view_native_measure` — an INSTANCE native; unlike its 2026-07-02
+  geometry siblings it uses BOTH the live `env` and `this`): mirrors the ATL reference-C SHAPE — compute a size →
+  **MANDATORY `setMeasuredDimension(II)V` upcall on `this`, fired on EVERY call** incl. invalid-handle calls (the
+  installed `measure(II)V` iputs the spec cache BEFORE `invoke-virtual onMeasure` and the ctor zero-init makes
+  setMeasuredDimension the SOLE post-init writer of `measuredWidth/Height`, so a skipped upcall is SILENT sticky
+  0×0 until requestLayout or a spec change; the widget handle is diagnostics-only, the answer spec-derived — a
+  documented divergence from the validated-no-op siblings' early-return-on-bad-handle shape) — but sources the
+  dimensions from the INSTALLED `getDefaultSize` semantics, since headless Eclipse has no content metrics (the
+  `Paint.native_get_text_bounds` Pango class): EXACTLY/AT_MOST axis → spec size (AT_MOST = the FULL parent
+  budget, the deliberate documented divergence from the reference C's clamped-CONTENT answer — serving 0 would
+  lie that content is empty and collapse the toolbar); any OTHER mode (UNSPECIFIED 0x0 AND the degenerate 0b11 —
+  the installed sswitch DEFAULT branch) → the suggested minimum via a LIVE
+  `this.getSuggestedMinimumWidth()/getSuggestedMinimumHeight()` `()I` upcall (virtual dispatch tracks the
+  installed dex incl. future overlay drift; gated to non-EXACTLY/AT_MOST axes only — zero extra JNI on the common
+  paths; Err → describe+clear + debug + 0, the ctor default). One-shot TWO-DIRECTION honesty WARN (the
+  LOAD_URL_WARNED pattern; per-call `trace!` thereafter — measure is layout-hot): AT_MOST children may be
+  OVERSIZED and non-EXACTLY/AT_MOST children UNDERSIZED (suggested minimum; ctor default 0) relative to real
+  content — the discovery record that replaces the ULE. Exception-safety invariant: the getSuggestedMinimum
+  upcalls run BEFORE setMeasuredDimension, every Err path describe+clears before the next JNI call, and
+  setMeasuredDimension is the LAST JNI call in the body. Registration: `[NativeBinding; 27]` (26 → 27, appended
+  after `native_queueAllocate`); the info! line now lists `+ native_measure` with the parenthetical reduced to
+  the dead trio (`native_addClasses`/`native_removeClass`/`native_getMatrix` declaration-only dead code) — live
+  expectation **`bound=27`** (the registration-presence guard). `view_registry.rs` byte-identical — NO
+  measured-dims mirror (setMeasuredDimension writes the Java fields, the SOLE post-init read-back source; a
+  mirror would be speculative state and a second source of truth). **RECORD CORRECTION (review A-3, supersedes
+  the 📐 row-11 flip-class wording):** of the four haveCustomMeasure-flipping classes, Spinner NEVER reaches
+  native_measure (it extends AbsSpinner, whose own `onMeasure(II)V` calls its own setMeasuredDimension with zero
+  invoke-super); TextView/ImageView/ProgressBar extend View directly with no onMeasure override and DO reach it.
+  **KNOWN FOLLOW-UP (recorded, deliberately untouched — Surgical Changes):** the pre-existing `view_class_name`
+  `.ok()?` pending-exception leak (its caller `view_native_constructor` then issues `new_global_ref`) is the
+  FIRST SUSPECT if challenge14 shows a JNI abort or poisoned JNI call near view construction. Regression guards
+  (plain `cargo test`, no APK/display): `view_native_names_sigs_and_class_match_view_java` extended with the
+  native_measure name/sig pins (dated to the challenge13 ULE) + the five upcall-target pins (names `.to_str()`,
+  `MethodSignature` sigs `.sig().to_str()` — pinning the SAME consts the call sites pass); new
+  `measure_default_size_serves_installed_get_default_size_semantics` (EXACTLY/AT_MOST → spec size incl.
+  full-width 0x3FFF_FFFF masking + the negative-jint sign-bit guards — runtime `assert!(s < 0)` on the AT_MOST
+  spec local, compile-time `const { assert!(MEASURE_SPEC_MODE_MASK < 0) }`; UNSPECIFIED → verbatim minimum with
+  the size bits IGNORED; degenerate 0b11 → minimum). Gate green (fmt / build --all-targets / clippy -D warnings /
+  **594 unit + 4 integ + 2 doctest** / release), independently re-verified by the diff review and re-run by the
+  fix-and-docs pass.
+  **CHALLENGE14 BOOT-WATCH VERDICTS (`/tmp/eclipse-challenge14.log`, 1302 lines, boot window 2026-07-03
+  02:18–02:21 UTC, EXIT=124 clean 180 s timeout kill; recipe = the challenge13 re-drive with stage-0 tap
+  `ECLIPSE_SYNTHETIC_ENGINE_TAP="400,413"` HOLDING — worked first try, no re-calibration; full record in §6
+  2026-07-03 📏): (a) CONFIRMED** — `View.native_measure` ULE GONE: zero `No implementation
+  found`/`UnsatisfiedLinkError` naming it; its only 2 log occurrences are the registration bound-list (line 154)
+  and the one-shot honesty WARN (line 1162); the whole log's only `No implementation found` lines (1165+1166) are
+  BOTH the same single NEW `ImageButton.native_setDrawable` event — challenge13's 2-line native_measure ULE
+  baseline fully replaced. **(b) CONFIRMED** — line 154 shows `native_measure` in the bound list with the
+  parenthetical reduced to the dead trio and `bound=27` (was 26); the WebView registration line unchanged at
+  `bound=3` (line 171). **(c) CONFIRMED** — (i) the one-shot two-direction honesty WARN fired EXACTLY ONCE (line
+  1162, 02:20:12.869; `widget=4294967372 width_measure_spec=0 height_measure_spec=0 width=0 height=0` —
+  UNSPECIFIED on BOTH axes → both took the suggested-minimum LIVE-upcall path and honest-served 0×0 via a FIRED
+  setMeasuredDimension upcall, NOT the silent-sticky-0×0 hazard) with ZERO `setMeasuredDimension upcall failed`
+  WARNs (the should-never-fire per-call WARN held at its expected count of ZERO); (ii) the fragment advanced PAST
+  `yh.d.onCreateView:246` — zero `yh.d.onCreateView` and zero `androidx.appcompat.widget.a.i` /
+  `androidx.appcompat.view.menu.e.c` anywhere in the log (the challenge13 Toolbar.getMenu → ActionMenuView
+  measure stack is GONE, served silently), `Fragment.performCreateView` COMPLETED, and the failure moved a WHOLE
+  LIFECYCLE STAGE to `yh.d.onActivityCreated(Unknown Source:77)` via `Fragment.performActivityCreated` —
+  exceeding the challenge9→13 :237→:246 precedent. **(d) NEXT FRONTIER CAPTURED —
+  `ImageButton.native_setDrawable(long, long)` ULE** (the log's ONLY ULE; E-line 1165, ULE 1166, stack 1167–1184,
+  lifecycle ERROR 1185): the SAME fragment yh.d wiring its RobloxToolbar navigation icon — `hh.i.b` →
+  `RobloxToolbar.setNavigationOnClickListener` → `RobloxToolbar.g0:46` → `Toolbar.setNavigationIcon` →
+  `AppCompatImageButton.setImageDrawable` → `ImageView.setImageDrawable:38` → the ImageButton subclass
+  re-declaration (full stack in §6 2026-07-03 📏); the ceiling shape held exactly as predicted — challenge
+  timeout → recovery `onAppReady: LoginV2` line 1251 (60.03 s, inside the recorded 47–60 s envelope), engine
+  alive to the kill. **(e) CONFIRMED — BASELINE UNCHANGED + chain intact**: Landing line 967 (02:19:45, tap
+  worked — no stall) → LoginV2 line 1047 → 403 "Challenge is required" line 1122 → ChallengeNativeWrapper line
+  1126 → ChallengeHybridWebView line 1130 → WebView constructs + native_loadUrl one-shot WARN line 1157
+  (widget=4294967370) → recovery LoginV2 line 1251; PRIVACY ABSOLUTE HELD (the only `target=` line in the entire
+  log is 1157, exactly `target=https://www.roblox.com` — scheme+host only, no path/query/token/payload on any
+  android.webkit.WebView-target line); 0 `NullPointerException`; gms `StreamCorruptedException` 2 hits;
+  jni_internal Canvas class dump 78 lines; single survivable `Run book keeping for signal 11` line; the known
+  applyStyle `inflate(0x0)` upgrade-dialog `Resources$NotFoundException` "Unable to find resource ID #0x0" 1 hit;
+  the `View.nativeIsFocused: serving false for the ACTIVE_TEXT_FIELD` one-shot WARN still never fired
+  (registration line only); `framework lifecycle step failed` count 2 (lines 1038+1185 — IDENTICAL structure to
+  challenge13); engine alive to the 180 s kill (EXIT=124). Recipe note (durable): stage-0 tap `400,413` held this
+  boot; the Landing re-drift check + `/tmp/eclipse_field_probe.png` re-calibration technique stays recorded in
+  the 🌐 bullet below (do NOT wipe /tmp/atl_cache — proven red herring 2026-07-03).
+  **OWNER-LEVEL DECISION STILL ON THE CRITICAL PATH (preserved from the 🌐 bullet — NOT to be decided by an
+  implementation pass):** Eclipse has NO web engine (the recorded hard ceiling), so an Arkose/FunCaptcha-style
+  WEB challenge can never RENDER or COMPLETE via native-binding alone — this pass unblocked the toolbar and
+  revealed the next native (challenge14-proven), but native-binding progress on the challenge fragment is
+  APPROACHING ITS CEILING. The
+  gating choice is the owner's: (a) integrate a real web engine for the challenge WebView (an owned minimal
+  renderer vs a non-GTK embedding — WebKitGTK is banned by the no-GTK/low_4gb constraint; an embedded browser
+  needs a pure-Rust/no-bloat justification cycle), or (b) find a non-web login/challenge path. Recorded; NOT
+  decided.
 - **2026-07-02 — 🌐 `android.webkit.WebView` native surface audited + bound as a CLASS (closes the challenge9
   `native_constructor` frontier) — ✅ VALIDATED by the 2026-07-03 challenge13 boot + COMMITTED 2026-07-03
   ⇐ START-HERE-NEXT: bind `android.view.View.native_measure(JII)V` (the 📐-documented-unbound real content-measure
-  native, now the ACTIVE frontier — the challenge fragment's Toolbar → ActionMenuView measure) — but FIRST read the
+  native, now the ACTIVE frontier — the challenge fragment's Toolbar → ActionMenuView measure) — IMPLEMENTED
+  2026-07-02 + ✅ VALIDATED by the 2026-07-03 challenge14 boot + COMMITTED 2026-07-03 — but FIRST read the
   OWNER-LEVEL inflection in the VERDICTS below: binding the View surface CANNOT make the web challenge COMPLETE.**
   Implements the 📐 bullet's START-HERE-NEXT (full audit table + review dispositions in §6 2026-07-02 🌐; plan =
   the 2026-07-02 audit/plan workflow, adversarially reviewed fix-then-ship with both must-fixes folded in). AUDIT
@@ -5485,6 +5589,226 @@ NOT persisted account state (the cache-wipe was a RED HERRING). The rest of the 
 *Status:* COMMITTED 2026-07-03. Regression guards unchanged from the implement pass (the 3 plain-`cargo test`
 pins); the live-boot `bound=3` line is the registration-presence guard (house convention — RegisterNatives only
 surfaces under live ART).
+
+---
+
+### 2026-07-02 — 📏 `android.view.View.native_measure(JII)V` bound (closes the 📐 audit-table row 11 — the challenge13 frontier): installed-getDefaultSize semantics served via the MANDATORY `setMeasuredDimension(II)V` upcall, suggested-minimum LIVE upcalls on non-EXACTLY/AT_MOST axes, one-shot two-direction honesty WARN, `bound=27`, view_registry untouched; UNCOMMITTED pending the challenge14 validation boot
+
+*Discovery evidence (the §5 🌐 START-HERE-NEXT):* the challenge13 boot (`/tmp/eclipse-challenge13.log` lines
+1154–1176) died on `UnsatisfiedLinkError: No implementation found for void
+android.view.View.native_measure(long, int, int)` — the ONE deliberately-unbound View native on the challenge
+path (📐 audit-table row 11). Stack: `View.native_measure(Native Method)` ← `View.onMeasure:26` ←
+`View.measure:19` ← `androidx.appcompat.widget.a.i` ← `androidx.appcompat.view.menu.e.c` ←
+`ActionMenuView.getMenu` ← `Toolbar.getMenu` ← `yh.d.onCreateView:246` ← fragment machinery ←
+`Handler.dispatchMessage` — the challenge fragment's Toolbar measuring its ActionMenuView.
+
+*Decided disposition (the row-11 closure):* INSTANCE native `view_native_measure` (uses BOTH the live `env` and
+`this`, unlike every prior view native) mirroring the ATL reference-C SHAPE (`android_view_View.c:554–591`:
+compute a size → one `CallVoidMethod(this, setMeasuredDimension, w, h)`) with the dimensions sourced from the
+INSTALLED `getDefaultSize` semantics, since headless Eclipse has no content metrics (the
+`Paint.native_get_text_bounds` Pango class — the one part of the reference C that cannot be honored): (1)
+EXACTLY/AT_MOST axis → spec size — AT_MOST serving the FULL parent budget is a deliberate documented divergence
+from the reference C's clamped-CONTENT answer (content unknowable headless; 0 would lie that content is empty
+and collapse the toolbar) and is exactly what the installed static `View.getDefaultSize` serves; (2) any OTHER
+mode (UNSPECIFIED 0x0 AND the degenerate 0b11 — the installed sswitch DEFAULT branch) → the suggested minimum
+via a LIVE `this.getSuggestedMinimumWidth()/getSuggestedMinimumHeight()` `()I` upcall (virtual dispatch tracks
+the installed dex incl. future overlay drift; gated to non-EXACTLY/AT_MOST axes — zero extra JNI on the common
+paths; Err → describe+clear + debug + 0 fallback, the ctor default); (3) the `setMeasuredDimension(II)V` upcall
+fires on EVERY call incl. invalid-handle calls — the widget handle is diagnostics-only, the answer spec-derived,
+a documented divergence from the validated-no-op siblings' early-return shape (skipping the upcall would convert
+the loud ULE into silent sticky 0×0: the installed `measure(II)V` iputs `oldWidth/HeightMeasureSpec` BEFORE
+`invoke-virtual onMeasure`, and the ctor zero-init makes setMeasuredDimension the SOLE post-init writer of
+`measuredWidth/Height`); (4) one-shot TWO-DIRECTION honesty WARN (the LOAD_URL_WARNED AtomicBool pattern;
+per-call `trace!` thereafter — measure is layout-hot): AT_MOST children may be OVERSIZED, non-EXACTLY/AT_MOST
+children UNDERSIZED (suggested minimum; ctor default 0) — the discovery record that replaces the ULE.
+Exception-safety invariant: the getSuggestedMinimum upcalls run BEFORE setMeasuredDimension, every Err path
+describe+clears before the next JNI call (the openAssetFd/WebView house pattern — `checked()` deliberately NOT
+reused, it emits the boot-watch-sensitive "framework lifecycle step failed" ERROR line), and
+setMeasuredDimension is the LAST JNI call in the body. **Rejected alternatives (recorded):** (a) leave unbound —
+the ULE is the ACTIVE frontier; (b) bind without the upcall — the silent-sticky-zeros hazard, smali-proven;
+(c) registry-derived or content-derived sizes — no content metrics exist headless; (d) record measured dims in
+`view_registry` — the Java `measuredWidth/Height` fields are the SOLE post-init read-back source (only the three
+getters read them; Eclipse's renderer consumes the post-layout `frame` record), so a mirror would be speculative
+state and a second source of truth; `view_registry.rs` stays byte-identical.
+
+*Audit evidence chain (all first-party; re-verified against the workflow's baksmali dumps of the installed
+`~/.cache/eclipse/framework-patched/api-impl.jar`, plus the vendored ATL reference C and the vendored jni-0.22.4
+sources):* `native_measure` declared ONLY on classes2/classes3 `android/view/View` (identical surfaces), ZERO
+subclass re-declarations in any of the 3 dexes, only invokers = the two `View.onMeasure` bodies
+(`haveCustomMeasure == false` branch) — one View-class registration covers every caller (the 2026-06-13
+WebView.native_constructor counter-case does not recur); installed `getDefaultSize` sparse-switch: AT_MOST
+`-0x80000000` / EXACTLY `0x40000000` → spec size, UNSPECIFIED 0x0 AND the switch DEFAULT → the supplied minimum;
+`View$MeasureSpec` constants: MODE_MASK `-0x40000000` (AT_MOST and the mask are NEGATIVE jints — sign-bit mode
+encoding, so the decode must be bit-pattern-exact and sign-agnostic); `measure(II)V` iputs the spec cache BEFORE
+invoking onMeasure (stickiness proof); ctor zero-inits `measuredWidth/Height` (:654/:656) and
+`minWidth/minHeight` (:696/:698), `setMeasuredDimension` iput×2 (:4506/:4508) the sole post-init writer;
+**flip-class precision (the A-3 record correction, supersedes the 📐 row-11 wording):** Spinner NEVER reaches
+native_measure — it extends AbsSpinner (Spinner.smali:2), whose own `onMeasure(II)V` (:275) calls its own
+setMeasuredDimension (:489) with zero invoke-super; TextView/ImageView/ProgressBar extend View directly with no
+onMeasure override and DO reach it via the base branch. Crate-source facts (verified in the vendored jni 0.22.4,
+compile-checked in a scratchpad crate): `call_method`'s `S: AsRef<MethodSignature>` has exactly ONE impl
+(MethodSignature itself) and `jni_sig!` expands to a const-evaluable `MethodSignature` — hence the
+`MethodSignature<'static, 'static>` sig consts and the `.sig().to_str()` pin form.
+
+*Plan-review dispositions (adversarial review of the plan, fix-then-ship — ALL folded BEFORE implementation;
+full text in the workflow scratchpad dispositions file):* **MF-1+MF-3** (deduplicated) — the original plan's
+`&JNIStr` sig consts fail `call_method`'s type bound → folded as the `MethodSignature` consts + `.sig()` pins
+(shared consts chosen deliberately so the pin test cannot decouple from the load-bearing call-site string).
+**MF-2+MF-4** (deduplicated) — the reviewers' "`2i32 << 30` overflows (debug panic)" claim is FALSE (verified by
+compile+run with debug-assertions: Rust shl overflow-checks only the shift AMOUNT) → folded as a REWORD to the
+true hazard (negative-jint sign-bit encoding; masking must be bitwise/sign-agnostic), with the plan forbidding
+the false debug-panic claim in any comment. Advisories: **A-1** degenerate-0b11 gate/decoder mismatch → the
+helper `suggested_minimum_if_needed` gates on mode ∉ {EXACTLY, AT_MOST} mirroring the decoder arms exactly
+(gating on `mode != 0` would serve a hardcoded 0 where the installed DEFAULT branch serves the live minimum) + a
+0b11 unit-test case; **A-2** the WARN names BOTH divergence directions; **A-3** the Spinner record correction
+(above); **A-4** failed-upcall WARN wording "stale until requestLayout or a spec change"; **A-5** the "4
+documented unbound decisions" phrase never existed in framework.rs — exactly two pin-test comment edits (delete
+the native_measure bullet, keep the dead-trio bullet); **A-6** the pre-existing `view_class_name` `.ok()?`
+pending-exception leak (caller `view_native_constructor`'s `new_global_ref`) — recorded follow-up, deliberately
+NOT touched (Surgical Changes; this pass's root cause is a missing binding), FIRST SUSPECT if challenge14 shows
+a JNI abort or poisoned JNI call near view construction; **A-7** flip-class comments cite the INSTALLED dex, not
+the drifted vendored View.java; **A-8** concurring review, anchors spot-re-verified.
+
+*Diff-review dispositions (adversarial review of the uncommitted implementation diff → the fix-and-docs pass):*
+**ZERO must-fixes.** Advisories dispositioned: (i) the gate/decoder mode-condition duplication
+(`suggested_minimum_if_needed` vs `measure_default_size`) stays comment-enforced — NOT folded (Surgical Changes;
+the plan's reviewed shape is what shipped, and both halves verifiably agree: 0b11 and UNSPECIFIED both route to
+the live upcall); a future simplify pass may extract one shared pure predicate to make the A-1 mismatch class
+structurally impossible; (ii) **PLAN DELTA recorded:** the §4 negativity guard additionally shipped as the
+compile-time `const { assert!(MEASURE_SPEC_MODE_MASK < 0) }` (the graphics.rs MAX_COMPOSITE_VIEWS const-block
+house form; the clippy::assertions_on_constants-forced conversion of an implementer-added extra assert; no
+`#[allow]`; inside a `#[test]` fn so it fires on every `--all-targets` gate build) beside the plan's verbatim
+runtime `assert!(s < 0)` on the AT_MOST spec local — the diff's only shape not literally in the final plan,
+verified within intent; (iii) boot-watch string fidelity confirmed (registration line, one-shot-WARN prefix
+`View.native_measure: serving installed getDefaultSize semantics`, and the greppable `setMeasuredDimension
+upcall failed` — deliberately PER-CALL, not one-shot, expected count ZERO, consistent with watch item (c));
+(iv) the A-6 carry-forward restated (above); (v) the review independently re-ran the full gate green and
+confirmed the working tree contains ONLY `M src/framework.rs` at HEAD 3a4f2c9; (vi) the §5/§6 Living-State
+update (plan §7 step 4) had been deferred by the orchestrator — now DONE by the fix-and-docs pass (this entry +
+the §5 📏 bullet; the challenge14 boot-watch incl. the `bound=27` expectation no longer lives only in the
+workflow scratchpad).
+
+*Regression guards (plain `cargo test`, no APK/display/boot, all in the existing framework.rs test module):*
+`view_native_names_sigs_and_class_match_view_java` extended with the native_measure name/sig pins (dated to the
+exact challenge13 ART ULE) + the five upcall-target pins (names via `.to_str()`, `MethodSignature` sigs via
+`.sig().to_str()` — pinning the SAME consts the call sites pass, so a typo cannot become a silent wrong answer
+under describe-and-clear); new `measure_default_size_serves_installed_get_default_size_semantics`
+(EXACTLY|240 → 240; AT_MOST|800 → 800 with the runtime negative-jint assert on the spec local + the compile-time
+const negativity assert on the mode mask; UNSPECIFIED verbatim pass-through incl. size-bit ignoring
+(55,17 → 17); degenerate 0b11|320 → 17; full-width 0x3FFF_FFFF masking under both AT_MOST and EXACTLY).
+Registration-PRESENCE guard = the challenge14 live boot's `bound=27` line (house convention — RegisterNatives
+only surfaces under live ART).
+
+*Gate:* green — `cargo fmt --all` / `cargo build --all-targets` / `cargo clippy --all-targets --all-features
+-- -D warnings` / `cargo test` (**594 unit + 4 integ + 2 doctest**, 0 failed) / `cargo build --release`; run by
+the implement pass, independently re-verified by the diff review, and re-run green by the fix-and-docs pass
+(which made ZERO code changes — no must-fixes existed).
+
+*Status:* UNCOMMITTED, validation boot PENDING (the challenge14 boot-watch (a)–(e) list lives in the §5 📏
+bullet; recipe = the challenge13 re-drive, stage-0 tap `400,413` with the Landing re-drift check; no overlay
+change this pass — the installed framework jar is untouched). Diff: `src/framework.rs` only (+287/−14);
+`view_registry.rs` byte-identical.
+
+---
+
+### 2026-07-03 — 📏 Validation-boot verdict on the native_measure pass: ALL boot-watch items CONFIRMED — the `View.native_measure` ULE is GONE (`bound=27`, the one-shot honesty WARN fired exactly once, zero failed upcalls), challenge13's Toolbar-measure stack has ZERO log occurrences so `Fragment.performCreateView` COMPLETED and the frontier advanced a WHOLE lifecycle stage to `yh.d.onActivityCreated:77`, and the NEW frontier is `android.widget.ImageButton.native_setDrawable(JJ)V` (the WebView subclass-redeclaration pattern recurring); native_measure pass committed with this entry. The OWNER-LEVEL web-engine decision remains on the critical path (no web engine — the web challenge still cannot render or complete).
+
+*Boot:* `/tmp/eclipse-challenge14.log`, 1302 lines, window 2026-07-03 02:18–02:21 UTC (log-line span
+02:19:18–02:21:40), EXIT=124 owner-reported clean 180 s timeout kill (the exit code is not in the log body — the
+log ends mid-Lua-traceback at line 1302, consistent with the SIGKILL). Recipe = the challenge13 re-drive with
+stage-0 tap `ECLIPSE_SYNTHETIC_ENGINE_TAP="400,413"` HOLDING (worked first try — Landing 02:19:45 → LoginV2
+02:19:48, no stall, no re-calibration this boot); `src/framework.rs` unchanged from the implement pass (§6
+2026-07-02 📏), so the gate is the identical **594 unit + 4 integ + 2 doctest**.
+
+*Verdicts (each grep-verified against the log):* **(a) CONFIRMED** — `View.native_measure` ULE GONE: zero `No
+implementation found for void android.view.View.native_measure(long, int, int)` and zero `UnsatisfiedLinkError`
+naming native_measure; `grep -n native_measure` returns exactly 2 lines — the View registration bound-list (line
+154) and the one-shot honesty WARN (line 1162). The whole log's only `No implementation found` lines are
+1165+1166, BOTH the same single NEW `ImageButton.native_setDrawable` event (see (d)); challenge13's 2-line
+native_measure ULE baseline (its lines 1154–1155) is fully replaced. **(b) CONFIRMED** — line 154: `registered
+Eclipse's non-GTK backing for View.native_constructor + … + native_queueAllocate + native_measure
+(native_addClasses/native_removeClass/native_getMatrix declaration-only dead code) (per-method best-effort)
+class="android/view/View" bound=27` — `native_measure` present in the bound list (appended after
+`native_queueAllocate` exactly as shipped), parenthetical reduced to the dead trio only, `bound=27` (was 26);
+the WebView registration line unchanged at line 171, `bound=3`. **(c) CONFIRMED** — (i) the one-shot
+two-direction honesty WARN fired EXACTLY ONCE, line 1162 (02:20:12.869): `WARN android.view.View:
+View.native_measure: serving installed getDefaultSize semantics — EXACTLY/AT_MOST → spec size (full parent
+budget), other modes → suggested minimum; text/image content is NOT measured headless, so AT_MOST children may
+be OVERSIZED and UNSPECIFIED-measured children may be UNDERSIZED (suggested minimum; ctor default 0) relative to
+real content widget=4294967372 width_measure_spec=0 height_measure_spec=0 width=0 height=0` — the native is
+reached and serving; zero `setMeasuredDimension upcall failed` WARNs and zero `upcall failed` of any kind
+(`grep -c` = 0 — the should-never-fire per-call WARN held at its expected count of ZERO). (ii) The fragment
+advanced PAST `yh.d.onCreateView:246`: `grep -c yh.d.onCreateView` = 0 and zero `androidx.appcompat.widget.a.i`
+/ `androidx.appcompat.view.menu.e.c` anywhere in the log — the challenge13 Toolbar.getMenu → ActionMenuView
+measure stack is GONE (native_measure now serves it silently), `Fragment.performCreateView` COMPLETED, and the
+new failure sits in the NEXT lifecycle stage — `yh.d.onActivityCreated(Unknown Source:77)` via
+`Fragment.performActivityCreated`, a WHOLE-STAGE advance exceeding the challenge9→13 :237→:246 precedent. **(d)
+NEXT FRONTIER CAPTURED — `ImageButton.native_setDrawable(long, long)` ULE** — `java.lang.UnsatisfiedLinkError:
+No implementation found for void android.widget.ImageButton.native_setDrawable(long, long) (tried
+Java_android_widget_ImageButton_native_1setDrawable and Java_android_widget_ImageButton_native_1setDrawable__JJ)`,
+the log's ONLY ULE event (java_vm_ext.cc:1130 E-line 1165, ULE line 1166, stack frames 1167–1184, `framework
+lifecycle step failed step="Handler.dispatchMessage"` ERROR line 1185 at 02:20:14.217). Full stack:
+`ImageButton.native_setDrawable(Native Method)` ← `android.widget.ImageView.setImageDrawable(Unknown Source:38)`
+← `androidx.appcompat.widget.AppCompatImageButton.setImageDrawable(Unknown Source:13)` ←
+`androidx.appcompat.widget.Toolbar.setNavigationIcon(SourceFile:9)` ← `Toolbar.setNavigationIcon(SourceFile:1)`
+← `com.roblox.client.components.RobloxToolbar.g0(Unknown Source:46)` ←
+`RobloxToolbar.setNavigationOnClickListener(Unknown Source:43)` ← `hh.i.b(Unknown Source:0)` ←
+`yh.d.onActivityCreated(Unknown Source:77)` ← `androidx.fragment.app.Fragment.performActivityCreated(Unknown
+Source:11)` ← `androidx.fragment.app.l0.a:47` / `l0.m:119` ← `FragmentManager.i0:344` / `m1:81` / `f0:116` ←
+`FragmentManager$f.run:3` ← `Handler.handleCallback:2` ← `Handler.dispatchMessage:4` — NOT inflation and NOT
+onCreateView: the SAME challenge fragment yh.d one lifecycle stage LATER, wiring its RobloxToolbar navigation
+icon, with the installed `ImageView.setImageDrawable` invoking `native_setDrawable` virtually dispatched onto
+the ImageButton subclass which RE-DECLARES its own `native_setDrawable(JJ)V`. BINDING NOTE for the next pass:
+ImageView's OWN native_setDrawable IS bound (line 160, ImageView `bound=3`) but ImageButton's registration (line
+161, `bound=2`: native_constructor + nativeSetOnClickListener) does not cover the subclass re-declaration — the
+2026-06-13 WebView.native_constructor subclass-redeclaration pattern recurs on ImageButton; natural shape =
+register ImageButton.native_setDrawable (plausibly delegating to the existing ImageView handler) after the usual
+baksmali audit of the installed ImageButton dex surface. Ceiling shape held exactly as predicted: challenge
+timeout → recovery `onAppReady: LoginV2` line 1251 (02:20:59.693 — 60.03 s after ChallengeHybridWebView at
+02:19:59.662, inside the recorded 47–60 s envelope), engine alive to the kill. **(e) CONFIRMED — BASELINE
+UNCHANGED + chain intact** — onAppReady Landing line 967 (02:19:45.429, stage-0 tap 400,413 worked — no Landing
+stall) → onAppReady LoginV2 line 1047 (02:19:48.561) → HTTP 403 error body `"Challenge is required to authorize
+the request"` line 1122 (02:19:59.546) → onAppReady ChallengeNativeWrapper line 1126 (02:19:59.562) →
+ChallengeHybridWebView line 1130 (02:19:59.662) → WebView constructs + native_loadUrl one-shot WARN line 1157
+(02:20:11.746, widget=4294967370) → native_measure WARN line 1162 → ImageButton ULE line 1166 → recovery LoginV2
+line 1251. PRIVACY ABSOLUTE HELD: the only `target=` line in the entire log is line 1157, exactly
+`target=https://www.roblox.com` — scheme+host only, no path/query/token/payload on any
+android.webkit.WebView-target line.
+
+*Baseline comparison (all challenge13 items verified UNCHANGED):* 0 `NullPointerException`;
+`StreamCorruptedException` exactly 2 hits (lines 420+430, the known gms pair); jni_internal Canvas class dump
+exactly 78 lines (contiguous 179–256, ending at the known `nDrawColor(JI)V` register-failure line); single
+survivable `Run book keeping for signal 11` line (1139, 02:19:59.694, right after the challenge 403 as usual);
+the known applyStyle `inflate(0x0)` upgrade-dialog `Resources$NotFoundException` "Unable to find resource ID
+#0x0" exactly 1 hit (line 1015, the known stack, preceded by the AssetManager.getResourceName resid=0x00000000
+WARN); the `nativeIsFocused` ACTIVE_TEXT_FIELD one-shot WARN never fired (registration line only); `framework
+lifecycle step failed` count 2 (lines 1038+1185) — IDENTICAL structure to challenge13 (its 1033+1176): first =
+the known upgrade-dialog NotFoundException, second = the active frontier ULE. Engine alive to the kill: last
+timestamped activity 02:21:40 (lines 1294–1295, LuaAppStarterScript HTTP 403 "Unauthorized." + unhandled Promise
+rejection). Exception census: only known species (FileNotFoundException 8, ClassNotFoundException 4,
+ClassCastException 3, BootstrapMethodError 3, the StreamCorruptedException pair, the single ULE, the single
+Resources$NotFoundException). The A-6 first-suspect (the pre-existing `view_class_name` `.ok()?`
+pending-exception leak) did NOT manifest — no JNI abort / poisoned-JNI-call signature anywhere in the log.
+
+*Measure-WARN spec analysis (the served answer, read from line 1162):* `width_measure_spec=0
+height_measure_spec=0` — UNSPECIFIED (mode 0x0) on BOTH axes, so both axes took the suggested-minimum
+LIVE-upcall path (not the EXACTLY/AT_MOST spec-size path) and the served size was 0×0: the live
+getSuggestedMinimumWidth/Height upcalls returned 0 (the ctor zero-init default of minWidth/minHeight — no
+background-drawable minimum on this view). HONEST per the installed getDefaultSize DEFAULT/UNSPECIFIED branch —
+and crucially honest-SERVED 0×0 via a FIRED setMeasuredDimension upcall (zero `upcall failed` WARNs), not the
+silent-sticky-0×0 hazard the mandatory-upcall design guards against. widget=4294967372 (2 handles above the
+WebView's 4294967370; the 02:20:12.869 timestamp sits between native_loadUrl 02:20:11.746 and the toolbar ULE
+02:20:14.217 — a challenge-fragment-tree view). One-shot semantics are assertable (exactly 1 WARN line); total
+measure-call volume is not (per-call `trace!` is below the boot's log level, as designed).
+
+*OWNER-LEVEL DECISION still on the critical path (recorded, NOT decided):* this boot advanced the toolbar
+(performCreateView completed) and revealed the next native, but Eclipse still has NO web engine — the web
+challenge cannot RENDER or COMPLETE via native-binding alone; the gating choice remains the owner's exactly as
+recorded in the §5 📏/🌐 bullets ((a) a non-GTK web engine vs (b) a non-web login/challenge path).
+
+*Status:* COMMITTED 2026-07-03 with this entry. Regression guards unchanged from the implement pass (the
+plain-`cargo test` name/sig + upcall-target pins and the getDefaultSize-semantics test); the live-boot `bound=27`
+line is the registration-presence guard (house convention — RegisterNatives only surfaces under live ART).
 
 ---
 

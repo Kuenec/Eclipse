@@ -79,7 +79,7 @@ use std::time::Instant;
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray, JString};
 use jni::refs::{Global, Reference};
-use jni::signature::{FieldSignature, JavaType, Primitive};
+use jni::signature::{FieldSignature, JavaType, MethodSignature, Primitive};
 use jni::strings::JNIStr;
 use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
 use jni::vm::JavaVM;
@@ -5039,14 +5039,46 @@ const VIEW_NATIVE_DRAW_CONTENT_SIG: &JNIStr = jni_str!("(JJ)V");
 const VIEW_NATIVE_QUEUE_ALLOCATE_NAME: &JNIStr = jni_str!("native_queueAllocate");
 const VIEW_NATIVE_QUEUE_ALLOCATE_SIG: &JNIStr = jni_str!("(J)V");
 
+// 2026-07-02: `native_measure(JII)V` — bound (the challenge13 frontier: ART ULE at
+// Toolbar.getMenu → ActionMenuView, /tmp/eclipse-challenge13.log lines 1154–1176). A real
+// content-measure pass; headless Eclipse serves the installed getDefaultSize semantics via the
+// MANDATORY setMeasuredDimension(II)V upcall (see view_native_measure).
+const VIEW_NATIVE_MEASURE_NAME: &JNIStr = jni_str!("native_measure");
+const VIEW_NATIVE_MEASURE_SIG: &JNIStr = jni_str!("(JII)V");
+// Upcall targets (installed-dex smali-verified — cite the INSTALLED dex, not the drifted vendored
+// View.java: setMeasuredDimension is plain-Java `protected final` iput×2; getSuggestedMinimum* are
+// plain minWidth/minHeight field reads; JNI call_method bypasses Java access — the surfaceCreated()V
+// house precedent). Names are `&JNIStr` (call_method's `N: AsRef<JNIStr>`); signatures are
+// `MethodSignature` consts (call_method's `S: AsRef<MethodSignature>` — its ONLY AsRef impl is
+// MethodSignature itself, so a jni_str! sig const would be rejected; jni_sig! is const-evaluable).
+const VIEW_SET_MEASURED_DIMENSION_NAME: &JNIStr = jni_str!("setMeasuredDimension");
+const VIEW_SET_MEASURED_DIMENSION_SIG: MethodSignature<'static, 'static> = jni_sig!("(II)V");
+const VIEW_GET_SUGGESTED_MIN_WIDTH_NAME: &JNIStr = jni_str!("getSuggestedMinimumWidth");
+const VIEW_GET_SUGGESTED_MIN_HEIGHT_NAME: &JNIStr = jni_str!("getSuggestedMinimumHeight");
+const VIEW_GET_SUGGESTED_MIN_SIG: MethodSignature<'static, 'static> = jni_sig!("()I");
+// MeasureSpec encoding (installed View$MeasureSpec smali: MODE_MASK = -0x40000000, EXACTLY =
+// 0x40000000, AT_MOST = -0x80000000; size = low 30 bits). The mode lives in the TOP 2 bits, so
+// AT_MOST and the mask are NEGATIVE jints — mode/size math must be bit-pattern-exact and
+// sign-agnostic (bitwise ops only; never arithmetic/sign-dependent handling of a spec). Written as
+// u32 casts for clarity about the bit patterns.
+const MEASURE_SPEC_MODE_MASK: jint = (0x3u32 << 30) as jint;
+const MEASURE_SPEC_EXACTLY: jint = (1u32 << 30) as jint;
+const MEASURE_SPEC_AT_MOST: jint = (2u32 << 30) as jint;
+
+/// Installed `View.getDefaultSize(int size, int measureSpec)` semantics (smali sparse-switch:
+/// AT_MOST/EXACTLY → spec size; UNSPECIFIED (0x0) AND the switch DEFAULT (the degenerate 0b11
+/// mode) → the supplied size, i.e. the suggested minimum). Pure, unit-tested.
+fn measure_default_size(measure_spec: jint, suggested_minimum: jint) -> jint {
+    match measure_spec & MEASURE_SPEC_MODE_MASK {
+        m if m == MEASURE_SPEC_EXACTLY || m == MEASURE_SPEC_AT_MOST => {
+            measure_spec & !MEASURE_SPEC_MODE_MASK
+        }
+        _ => suggested_minimum,
+    }
+}
+
 // 2026-07-02: deliberately LEFT UNBOUND from the 30-native audit (the honest call-time
 // UnsatisfiedLinkError stays the discovery signal — the 🎨/🖌️ rule):
-//   * `native_measure(JII)V` — a REAL content-measure pass whose result IS read back: the installed
-//     `onMeasure` (for `haveCustomMeasure == false` views — TextView/ProgressBar/ImageView/Spinner
-//     flip the flag to route here) calls ONLY the native, which must upcall `setMeasuredDimension`
-//     (ATL reference C: gtk_widget_measure → CallVoidMethod) or `getMeasuredWidth()/Height()` serve
-//     stale zeros to every ViewGroup layout pass. Headless Eclipse cannot measure text/image content
-//     honestly (the Paint.native_get_text_bounds Pango-metrics class).
 //   * `native_addClasses(J[Ljava/lang/String;)V`, `native_removeClass(JLjava/lang/String;)V`,
 //     `native_getMatrix(JJ)Z` — declaration-only DEAD CODE: no invoker anywhere in the installed
 //     dexes (classes.dex/classes2.dex/classes3.dex all grepped 2026-07-02).
@@ -5821,6 +5853,178 @@ extern "system" fn view_native_queue_allocate<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `View.native_measure(long widget, int widthMeasureSpec, int heightMeasureSpec)` (2026-07-02 —
+/// the challenge13 discovery signal: ART ULE `No implementation found for void
+/// android.view.View.native_measure(long, int, int)` at Toolbar.getMenu → ActionMenuView,
+/// /tmp/eclipse-challenge13.log lines 1154–1176). INSTANCE native (installed smali:
+/// invoke-virtual, receiver `this`; the jlong IS the `View.widget` field = the live
+/// [`view_registry`] handle) — unlike its 2026-07-02 geometry siblings it uses BOTH the live
+/// `env` and `this`.
+///
+/// A REAL content-measure pass whose result IS read back: the installed `onMeasure`
+/// (`haveCustomMeasure == false` branch) calls ONLY this native, and the installed `measure(II)V`
+/// caches the specs (`oldWidth/HeightMeasureSpec` iput) BEFORE invoking `onMeasure` — so a
+/// skipped `setMeasuredDimension` upcall is SILENT sticky 0×0 (the ctor zero-init; the sole
+/// post-init writer is setMeasuredDimension) until requestLayout or a spec change, with no
+/// exception. Eclipse mirrors the ATL reference-C SHAPE (compute a size → MANDATORY
+/// `setMeasuredDimension(II)V` upcall on `this`; `protected final` is no obstacle — JNI
+/// call_method bypasses Java access, the surfaceCreated()V house precedent) but sources the
+/// dimensions from the installed `getDefaultSize` semantics, since headless Eclipse has no
+/// content metrics (the Paint.native_get_text_bounds Pango-metrics class):
+///
+/// - EXACTLY/AT_MOST axis → spec size. AT_MOST serving the FULL parent budget is a deliberate,
+///   documented divergence from the reference C's clamped-CONTENT answer (content is unknowable
+///   headless; serving 0 would lie that content is empty and collapse the toolbar) — it is
+///   exactly what the installed static `View.getDefaultSize` serves on those modes.
+/// - Any OTHER mode (UNSPECIFIED 0x0 AND the degenerate 0b11) → the suggested minimum via a live
+///   `this.getSuggestedMinimumWidth()/getSuggestedMinimumHeight()` upcall (virtual dispatch —
+///   tracks whatever the installed dex actually does, including future overlay drift; the
+///   installed getDefaultSize's sswitch DEFAULT branch also returns the supplied minimum).
+///
+/// The upcall fires on EVERY call, including invalid-handle calls (skipping it would convert the
+/// loud pre-binding ULE into silent sticky 0×0). The answer is spec-derived, never
+/// registry-derived, so an invalid/stale `widget` handle is diagnostics-only (debug log, answer
+/// still served) — a deliberate, documented divergence from the validated-no-op siblings'
+/// early-return-on-bad-handle shape. A one-shot WARN (the LOAD_URL_WARNED pattern) records the
+/// content-measure honesty limit in BOTH directions (AT_MOST children may be OVERSIZED;
+/// non-EXACTLY/AT_MOST children may be UNDERSIZED to the suggested minimum — ctor default 0).
+///
+/// Exception-safety invariant: the getSuggestedMinimum upcalls run BEFORE setMeasuredDimension
+/// and every Err path describe+clears before the next JNI call; setMeasuredDimension is the LAST
+/// JNI call in the body.
+extern "system" fn view_native_measure<'local>(
+    mut env: EnvUnowned<'local>,
+    this: JObject<'local>,
+    widget: jlong,
+    width_measure_spec: jint,
+    height_measure_spec: jint,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        // 1) Handle validation — diagnostics ONLY (the answer is spec-derived; the upcall always
+        //    fires, see the doc invariant).
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::debug!(
+                target: "android.view.View",
+                widget,
+                error = %e,
+                "View.native_measure: invalid view handle (measured answer still served)"
+            );
+        }
+        // 2) Suggested minimum, per axis, ONLY when the mode is neither EXACTLY nor AT_MOST
+        //    (matches the installed getDefaultSize switch INCLUDING its default branch; zero
+        //    extra JNI calls on the common EXACTLY/AT_MOST paths).
+        let w_min = suggested_minimum_if_needed(
+            env,
+            &this,
+            width_measure_spec,
+            VIEW_GET_SUGGESTED_MIN_WIDTH_NAME,
+        );
+        let h_min = suggested_minimum_if_needed(
+            env,
+            &this,
+            height_measure_spec,
+            VIEW_GET_SUGGESTED_MIN_HEIGHT_NAME,
+        );
+        // 3) Pure decode (installed getDefaultSize semantics; unit-tested).
+        let width = measure_default_size(width_measure_spec, w_min);
+        let height = measure_default_size(height_measure_spec, h_min);
+        // 4) One-shot honesty WARN (the LOAD_URL_WARNED AtomicBool pattern) naming BOTH
+        //    divergence directions — the discovery record that replaces the ULE. Measure is
+        //    layout-hot, so subsequent calls are trace-level (the view_native_layout discipline).
+        static MEASURE_HONESTY_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !MEASURE_HONESTY_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "android.view.View",
+                widget,
+                width_measure_spec,
+                height_measure_spec,
+                width,
+                height,
+                "View.native_measure: serving installed getDefaultSize semantics — EXACTLY/AT_MOST \
+                 → spec size (full parent budget), other modes → suggested minimum; text/image \
+                 content is NOT measured headless, so AT_MOST children may be OVERSIZED and \
+                 UNSPECIFIED-measured children may be UNDERSIZED (suggested minimum; ctor default \
+                 0) relative to real content"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget,
+                width_measure_spec,
+                height_measure_spec,
+                width,
+                height,
+                "View.native_measure: served installed getDefaultSize semantics"
+            );
+        }
+        // 5) MANDATORY upcall — every call, even on an invalid handle (see the doc invariant).
+        if let Err(e) = env
+            .call_method(
+                &this,
+                VIEW_SET_MEASURED_DIMENSION_NAME,
+                VIEW_SET_MEASURED_DIMENSION_SIG,
+                &[JValue::Int(width), JValue::Int(height)],
+            )
+            .and_then(|v| v.v())
+        {
+            // Describe-and-clear (the openAssetFd/WebView house pattern): never leave a pending
+            // exception to poison later JNI calls, never throw back into Java. Should-never-fire
+            // (plain final field-setter) — WARN loudly.
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            tracing::warn!(
+                target: "android.view.View",
+                widget,
+                width,
+                height,
+                error = %e,
+                "View.native_measure: setMeasuredDimension upcall failed (described+cleared; \
+                 measured fields stale until requestLayout or a spec change)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Per-axis suggested minimum for [`view_native_measure`]: a live JNI upcall
+/// `this.getSuggestedMinimumWidth()/getSuggestedMinimumHeight()` `()I`, run ONLY when the spec
+/// mode is neither EXACTLY nor AT_MOST. 2026-07-02: the gate MUST mirror
+/// [`measure_default_size`]'s match arms exactly — gating on `mode != 0` would serve a hardcoded
+/// 0 for the degenerate 0b11 mode, where the installed getDefaultSize DEFAULT branch serves the
+/// live minimum. On upcall failure: describe+clear (never leave a pending exception before the
+/// caller's next JNI call) + debug log + 0 (the View ctor's zero-init default).
+fn suggested_minimum_if_needed(env: &mut Env, this: &JObject, spec: jint, name: &JNIStr) -> jint {
+    let mode = spec & MEASURE_SPEC_MODE_MASK;
+    if mode == MEASURE_SPEC_EXACTLY || mode == MEASURE_SPEC_AT_MOST {
+        // The decoder serves the spec size on these axes; the minimum is unused.
+        return 0;
+    }
+    match env
+        .call_method(this, name, VIEW_GET_SUGGESTED_MIN_SIG, &[])
+        .and_then(|v| v.i())
+    {
+        Ok(min) => min,
+        Err(e) => {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            tracing::debug!(
+                target: "android.view.View",
+                name = %name.to_str(),
+                error = %e,
+                "View.native_measure: getSuggestedMinimum upcall failed (described+cleared; \
+                 falling back to 0, the ctor default)"
+            );
+            0
+        }
+    }
+}
+
 extern "system" fn view_native_get_window<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -6031,7 +6235,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // `private static native` in both installed dexes and is now IN this array (see the consts note);
     // the best-effort registrar additionally makes any future such drift non-fatal (deferred
     // per-method UnsatisfiedLinkError).
-    let bindings: [NativeBinding; 26] = [
+    let bindings: [NativeBinding; 27] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -6131,7 +6335,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
         // installed dex — see the consts cluster for the per-native classification evidence).
         // `native_layout` records the laid-out frame (the challenge8 discovery signal);
         // `nativeIsFocused` serves the focus record `nativeRequestFocus` writes; the rest are
-        // validated no-ops. `native_measure` + the declaration-only dead trio stay unbound.
+        // validated no-ops. Only the declaration-only dead trio stays unbound.
         (
             VIEW_NATIVE_LAYOUT_NAME,
             VIEW_NATIVE_LAYOUT_SIG,
@@ -6177,6 +6381,12 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_QUEUE_ALLOCATE_SIG,
             view_native_queue_allocate as *mut c_void,
         ),
+        // 2026-07-02: the challenge13 measure frontier — see view_native_measure.
+        (
+            VIEW_NATIVE_MEASURE_NAME,
+            VIEW_NATIVE_MEASURE_SIG,
+            view_native_measure as *mut c_void,
+        ),
     ];
     // SAFETY: each `ptr` is an `extern "system"` fn matching its paired descriptor by construction (see
     // the per-entry references above); the registrar binds them per method on `android/view/View`.
@@ -6184,7 +6394,7 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/view/View",
         bound,
-        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + getWindowVisibleDisplayFrame + nativeIsAttachedToWindow + native_getGlobalVisibleRect + nativeRequestFocus + native_layout + nativeIsFocused + nativeInvalidate + native_keep_screen_on + native_addClass + native_removeClasses + native_drawBackground + native_drawContent + native_queueAllocate (native_measure deliberately unbound — real content-measure pass; native_addClasses/native_removeClass/native_getMatrix declaration-only dead code) (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for View.native_constructor + native_setPadding + native_setLayoutParams + native_requestLayout + native_setBackgroundDrawable + native_setVisibility + nativeSetOnClickListener + nativeSetOnTouchListener + nativeSetOnLongClickListener + native_setBackgroundColor + nativeSetFullscreen + native_get_window + native_destructor + getWindowVisibleDisplayFrame + nativeIsAttachedToWindow + native_getGlobalVisibleRect + nativeRequestFocus + native_layout + nativeIsFocused + nativeInvalidate + native_keep_screen_on + native_addClass + native_removeClasses + native_drawBackground + native_drawContent + native_queueAllocate + native_measure (native_addClasses/native_removeClass/native_getMatrix declaration-only dead code) (per-method best-effort)"
     );
     Ok(())
 }
@@ -16494,11 +16704,34 @@ mod tests {
             "native_queueAllocate"
         );
         assert_eq!(VIEW_NATIVE_QUEUE_ALLOCATE_SIG.to_str(), "(J)V");
+        // 2026-07-02 — native_measure(JII)V, bound: the challenge13 ART-reported ULE (`No
+        // implementation found for void android.view.View.native_measure(long, int, int)`,
+        // /tmp/eclipse-challenge13.log lines 1154–1176). A drift here re-produces that exact boot
+        // failure instead of failing in the harness.
+        assert_eq!(VIEW_NATIVE_MEASURE_NAME.to_str(), "native_measure");
+        assert_eq!(VIEW_NATIVE_MEASURE_SIG.to_str(), "(JII)V");
+        // The measure upcall targets, pinned to the INSTALLED dex (setMeasuredDimension is
+        // plain-Java `protected final` iput×2; getSuggestedMinimum* are plain field reads — JNI
+        // call_method bypasses Java access, the surfaceCreated()V precedent below). A typo here
+        // would be a SILENT wrong answer under describe-and-clear, not a crash — and these pin
+        // the SAME consts the call sites pass, so the guard cannot decouple from the load-bearing
+        // string. The sig consts are `MethodSignature`; `.sig()` is the `&JNIStr` descriptor.
+        assert_eq!(
+            VIEW_SET_MEASURED_DIMENSION_NAME.to_str(),
+            "setMeasuredDimension"
+        );
+        assert_eq!(VIEW_SET_MEASURED_DIMENSION_SIG.sig().to_str(), "(II)V");
+        assert_eq!(
+            VIEW_GET_SUGGESTED_MIN_WIDTH_NAME.to_str(),
+            "getSuggestedMinimumWidth"
+        );
+        assert_eq!(
+            VIEW_GET_SUGGESTED_MIN_HEIGHT_NAME.to_str(),
+            "getSuggestedMinimumHeight"
+        );
+        assert_eq!(VIEW_GET_SUGGESTED_MIN_SIG.sig().to_str(), "()I");
         // 2026-07-02 — deliberately UNBOUND from the 30-native installed-dex audit (documented
-        // decisions; the clean call-time UnsatisfiedLinkError stays the discovery signal):
-        //   * native_measure(JII)V — a real content-measure pass whose setMeasuredDimension upcall
-        //     IS read back via getMeasuredWidth()/Height() (unservable honestly headless — the
-        //     Paint.native_get_text_bounds class).
+        // decision; the clean call-time UnsatisfiedLinkError stays the discovery signal):
         //   * native_addClasses(J[Ljava/lang/String;)V, native_removeClass(JLjava/lang/String;)V,
         //     native_getMatrix(JJ)Z — declaration-only dead code (no invoker in any installed dex).
         // The View.widget field (the view_registry handle on `this`) instance natives read.
@@ -16552,6 +16785,46 @@ mod tests {
         assert_eq!(
             TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_SIG.to_str(),
             "(JJJJJ)V"
+        );
+    }
+
+    // 2026-07-02: pin the pure measure decoder against the INSTALLED `View.getDefaultSize` smali
+    // (sparse-switch: AT_MOST -0x80000000 / EXACTLY 0x40000000 → spec size; UNSPECIFIED 0x0 AND
+    // the switch DEFAULT — the degenerate 0b11 mode — → the supplied suggested minimum). An
+    // AT_MOST spec and the mode mask are NEGATIVE jints (sign-bit mode encoding), so the decode
+    // must be bit-pattern-exact and sign-agnostic — the negativity asserts fail if a refactor
+    // ever makes the constants positive-only or the masking arithmetic/sign-dependent.
+    #[test]
+    fn measure_default_size_serves_installed_get_default_size_semantics() {
+        // EXACTLY → spec size (the suggested minimum is ignored).
+        assert_eq!(measure_default_size(MEASURE_SPEC_EXACTLY | 240, 17), 240);
+        // AT_MOST → spec size (the full parent budget). The spec int is NEGATIVE (installed
+        // smali: AT_MOST = -0x80000000, MODE_MASK = -0x40000000).
+        let s = MEASURE_SPEC_AT_MOST | 800;
+        assert!(
+            s < 0,
+            "an AT_MOST spec must be a negative jint (sign-bit mode encoding)"
+        );
+        // Compile-time (const-block, the graphics.rs MAX_COMPOSITE_VIEWS house form): the mode
+        // mask itself is a negative jint — a positive-only refactor fails the build.
+        const { assert!(MEASURE_SPEC_MODE_MASK < 0) };
+        assert_eq!(measure_default_size(s, 17), 800);
+        // UNSPECIFIED (mode 0) → suggested minimum, verbatim — including the ctor default 0 and
+        // a non-zero minimum with a non-zero size payload (mode 0 must IGNORE the size bits).
+        assert_eq!(measure_default_size(0, 0), 0);
+        assert_eq!(measure_default_size(55, 17), 17);
+        // The degenerate 0b11 mode → suggested minimum (the installed sparse-switch DEFAULT
+        // branch — which the suggested_minimum_if_needed gate must also route to the
+        // live-minimum path, never a hardcoded 0).
+        assert_eq!(measure_default_size(MEASURE_SPEC_MODE_MASK | 320, 17), 17);
+        // Full-width 30-bit size masking under AT_MOST/EXACTLY.
+        assert_eq!(
+            measure_default_size(MEASURE_SPEC_AT_MOST | 0x3FFF_FFFF, 17),
+            0x3FFF_FFFF
+        );
+        assert_eq!(
+            measure_default_size(MEASURE_SPEC_EXACTLY | 0x3FFF_FFFF, 17),
+            0x3FFF_FFFF
         );
     }
 
