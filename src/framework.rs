@@ -8900,8 +8900,9 @@ pub const IMAGE_BUTTON_CLASS: &JNIStr = jni_str!("android/widget/ImageButton");
 // 2026-06-05: `View.setOnClickListener` calls `nativeSetOnClickListener(widget)` to mark the view
 // clickable on its native peer; ART resolved it against the ImageButton class (`No implementation
 // found for void android.widget.ImageButton.nativeSetOnClickListener(long)`, run log 2026-06-05, the
-// Toolbar nav button). Instance native, descriptor `(J)V`. The draw-free lifecycle dispatches no
-// input, so this validates the handle + no-ops (click dispatch is the deferred input/render build).
+// Toolbar nav button). Instance native, descriptor `(J)V`. The handler marks the peer clickable in
+// [`view_registry`] — the renderer's hit-test targets clickable views and dispatches
+// `View.performClick()` (the minimal click path; see [`image_button_set_on_click_listener`]).
 const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
 const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 
@@ -8984,23 +8985,47 @@ extern "system" fn view_set_input_listener<'local>(
 /// Bind Eclipse's own (non-GTK) backing for `android.widget.ImageButton`'s peer natives.
 ///
 /// `native_constructor` reuses the class-agnostic [`view_native_constructor`] (records the receiver's
-/// actual class in [`view_registry`]); `nativeSetOnClickListener` validates the handle + no-ops.
-/// Registered before step 4, alongside the View/ImageView natives, because ART resolves natives per
-/// declaring class.
+/// actual class in [`view_registry`]); `nativeSetOnClickListener` marks the peer clickable in
+/// [`view_registry`] (the renderer's hit-test target); `native_setDrawable` reuses the class-agnostic
+/// [`image_view_set_drawable`] (validated no-op — ImageButton RE-declares ImageView's native; see the
+/// dated 2026-07-02 comment in the body). Registered before step 4, alongside the View/ImageView
+/// natives, because ART resolves natives per declaring class. This covers ImageButton's WHOLE declared
+/// native surface (3/3 — installed classes3.dex ImageButton.smali :36/:39/:42, baksmali audit
+/// 2026-07-02); the installed dex's `ImageButton.native_setScaleType(JI)V` is a PLAIN Java
+/// `return-void` override (smali :45, NOT a native — absent from the vendored ImageButton.java), so it
+/// can never ULE on ImageButton and must NOT be registered (a non-native entry fails per-method
+/// best-effort with a per-boot WARN).
 ///
 /// # Safety / soundness
 /// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — `view_native_constructor` is the exact `(Context, AttributeSet)J` instance native and
-/// `image_button_set_on_click_listener` the `(J)V` instance native. Each body is `catch_unwind`-guarded
-/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+/// do — `view_native_constructor` is the exact `(Context, AttributeSet)J` instance native,
+/// `image_button_set_on_click_listener` the `(J)V` instance native, and `image_view_set_drawable` the
+/// `(JJ)V` instance native. Each body is `catch_unwind`-guarded via [`EnvUnowned::with_env`]
+/// (AGENTS.md §2.8).
 fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: per-method best-effort so a shipped-dex drift on either entry is a deferred call-time
+    // 2026-06-13: per-method best-effort so a shipped-dex drift on any entry is a deferred call-time
     // UnsatisfiedLinkError on that method, not a fatal whole-class abort (the 58a50f6 class of bug).
+    // 2026-07-02: native_setDrawable(JJ)V added — ImageButton RE-declares ImageView's native (installed
+    // classes3.dex ImageButton.smali:42) and ART resolves natives per DECLARING class, so ImageView's
+    // own bound copy does not cover it: the 2026-07-03 challenge14 boot's ONLY ULE (`No implementation
+    // found for void android.widget.ImageButton.native_setDrawable(long, long)`,
+    // /tmp/eclipse-challenge14.log lines 1165–1184; Toolbar.setNavigationIcon →
+    // AppCompatImageButton.setImageDrawable → ImageView.setImageDrawable:38, virtually dispatched onto
+    // the ImageButton subclass — the 2026-06-13 WebView.native_constructor subclass-redeclaration
+    // pattern). The binding reuses the class-agnostic [`image_view_set_drawable`] verbatim under the
+    // shared IMAGE_VIEW_SET_DRAWABLE_NAME/SIG consts (the view_native_constructor const-sharing shape):
+    // the native is a display-side peer notification with NO Java read-back (the `drawable` field is
+    // iput BEFORE the call and is the sole getDrawable() source), so the validated no-op is honest.
+    // ImageButton calls trace under the "android.widget.ImageView" target (class-agnostic message —
+    // the tolerated label mismatch of the View.nativeSetOnClickListener reuse precedent; the registry
+    // peer + this registration line carry the ImageButton identity).
     // SAFETY: `view_native_constructor` matches the paired
     // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` instance native (shared with
-    // View/ImageView native_constructor); `image_button_set_on_click_listener` matches the paired
-    // `(J)V` instance native (both surfaced by the run lines 2026-06-05).
-    let bindings: [NativeBinding; 2] = [
+    // View/ImageView native_constructor; ImageButton.smali:39); `image_button_set_on_click_listener`
+    // matches the paired `(J)V` instance native (ImageButton.smali:36; constructor + click listener
+    // both surfaced by the run lines 2026-06-05); `image_view_set_drawable` matches the paired `(JJ)V`
+    // instance native (ImageButton.smali:42, the 2026-07-03 challenge14 ULE).
+    let bindings: [NativeBinding; 3] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -9011,12 +9036,19 @@ fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
             IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG,
             image_button_set_on_click_listener as *mut c_void,
         ),
+        // `image_view_set_drawable` is the class-agnostic `(JJ)V` instance native (validated no-op);
+        // bound here for ImageButton's re-declaration — see the dated 2026-07-02 comment above.
+        (
+            IMAGE_VIEW_SET_DRAWABLE_NAME,
+            IMAGE_VIEW_SET_DRAWABLE_SIG,
+            image_view_set_drawable as *mut c_void,
+        ),
     ];
     let bound = register_class_natives_best_effort(env, IMAGE_BUTTON_CLASS, &bindings)?;
     tracing::info!(
         class = "android/widget/ImageButton",
         bound,
-        "registered Eclipse's non-GTK backing for ImageButton.native_constructor + nativeSetOnClickListener (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for ImageButton.native_constructor + nativeSetOnClickListener + native_setDrawable (per-method best-effort)"
     );
     Ok(())
 }
@@ -14448,10 +14480,12 @@ fn drive_lifecycle(
     // declaring class (ImageView re-declares native_constructor), so this must be bound before step 4.
     // Reuses the class-agnostic View constructor backing (records android.widget.ImageView in the tree).
     register_image_view_natives(env)?;
-    // Bind android.widget.ImageButton's native_constructor on its own class — AppCompat's Toolbar
-    // builds an AppCompatImageButton (extends ImageButton) during step 5's setContentView, and ART
-    // resolves natives per declaring class, so this must be bound before step 4. Reuses the
-    // class-agnostic View constructor backing (records android.widget.ImageButton in the tree).
+    // Bind android.widget.ImageButton's peer natives on its own class — AppCompat's Toolbar builds an
+    // AppCompatImageButton (extends ImageButton) during step 5's setContentView, and ART resolves
+    // natives per declaring class (ImageButton re-declares native_constructor AND ImageView's
+    // native_setDrawable — the 2026-07-03 challenge14 ULE), so this must be bound before step 4.
+    // Reuses the class-agnostic View constructor + ImageView setDrawable backings (records
+    // android.widget.ImageButton in the tree).
     register_image_button_natives(env)?;
     // Bind android.view.SurfaceView's native_constructor on its own class — Roblox's
     // ActivityNativeMain.onCreate inflates com.roblox.client.RBXSurfaceView (extends SurfaceView)
@@ -17134,12 +17168,26 @@ mod tests {
         // by this exact name or RegisterNatives throws NoClassDefFoundError. The shared constructor
         // name/sig are pinned by view_native_names_sigs_and_class_match_view_java. Host-independent.
         assert_eq!(IMAGE_BUTTON_CLASS.to_str(), "android/widget/ImageButton");
-        // nativeSetOnClickListener(long) → `(J)V`, surfaced 2026-06-05 by Toolbar nav button (no-op).
+        // nativeSetOnClickListener(long) → `(J)V`, surfaced 2026-06-05 by Toolbar nav button (marks
+        // the peer clickable in view_registry — the renderer's click hit-test target).
         assert_eq!(
             IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME.to_str(),
             "nativeSetOnClickListener"
         );
         assert_eq!(IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG.to_str(), "(J)V");
+        // 2026-07-02: native_setDrawable(long, long) → `(JJ)V` — the 2026-07-03 challenge14 boot's
+        // ONLY ULE (`No implementation found for void
+        // android.widget.ImageButton.native_setDrawable(long, long)`, /tmp/eclipse-challenge14.log
+        // lines 1165–1184): ImageButton RE-declares ImageView's native (installed classes3.dex
+        // ImageButton.smali:42) and ART resolves natives per declaring class, so ImageView's own
+        // bound copy did not cover Toolbar.setNavigationIcon → AppCompatImageButton.setImageDrawable.
+        // The binding DELIBERATELY reuses the SHARED IMAGE_VIEW_SET_DRAWABLE_NAME/SIG consts (the
+        // same pair register_image_view_natives passes — the view_native_constructor const-sharing
+        // shape), so re-assert them here: these pins cover the exact consts the ImageButton call site
+        // passes. A transcription regression would make RegisterNatives skip the entry (per-method
+        // best-effort WARN) and re-open the challenge14 UnsatisfiedLinkError at boot.
+        assert_eq!(IMAGE_VIEW_SET_DRAWABLE_NAME.to_str(), "native_setDrawable");
+        assert_eq!(IMAGE_VIEW_SET_DRAWABLE_SIG.to_str(), "(JJ)V");
     }
 
     #[test]

@@ -128,6 +128,101 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-03 — 🔘 `android.widget.ImageButton.native_setDrawable(JJ)V` BOUND (closes the challenge14 frontier —
+  the challenge14 log's ONLY ULE: the SAME challenge fragment yh.d in `onActivityCreated:77` wiring its
+  RobloxToolbar navigation icon) — IMPLEMENTED 2026-07-02/03 per the adversarially-reviewed plan + ✅ VALIDATED
+  by the 2026-07-03 challenge15 boot + COMMITTED 2026-07-03 (ALL boot-watch verdicts CONFIRMED — the VERDICTS
+  block at the end of this bullet + §6 2026-07-03 ✅🔘: ULE GONE, `bound=3`, the challenge fragment's lifecycle
+  COMPLETES with ZERO remaining native failures and ZERO new ULEs, so the recorded native-binding CEILING on the
+  challenge fragment is REACHED) ⇐ START-HERE-NEXT: the OWNER-LEVEL web-engine decision at the end of this
+  bullet — options (a) a non-GTK web engine vs (b) a non-web login/challenge path; there is NO new native
+  frontier and NOTHING implementable until the owner decides — a session reaching this bullet should SURFACE THE
+  DECISION to the owner.** Implements the 📏 bullet's START-HERE-NEXT
+  (full record in §6 2026-07-03 🔘). Mechanism (challenge14-proven — `/tmp/eclipse-challenge14.log` E-line 1165,
+  ULE 1166, stack 1167–1184): ART resolves natives per DECLARING class and ImageButton RE-DECLARES ImageView's
+  `native_setDrawable(JJ)V` (installed classes3.dex ImageButton.smali:42), so ImageView's own bound copy
+  (`bound=3`, challenge14 line 160) could not cover `Toolbar.setNavigationIcon` →
+  `AppCompatImageButton.setImageDrawable` → `ImageView.setImageDrawable:38` virtually dispatched onto the
+  subclass — the 2026-06-13 `WebView.native_constructor` subclass-redeclaration pattern recurring, confirmed by
+  the ULE's tried symbols `Java_android_widget_ImageButton_native_1setDrawable[__JJ]`. Dex audit (first-party
+  baksmali of the installed `~/.cache/eclipse/framework-patched/api-impl.jar`, all 3 dexes): ImageButton is
+  defined ONLY in classes3.dex — classes.dex/classes2.dex carry ZERO android/widget classes, so there is NO
+  overlay shadow and first-dex-wins is moot — and declares EXACTLY 3 natives: `nativeSetOnClickListener(J)V`
+  (:36, bound 2026-06-05), `native_constructor(…)J` (:39, bound via the shared `view_native_constructor`), and
+  `native_setDrawable(JJ)V` (:42, the challenge14 ULE — bound by THIS pass), completing the class's WHOLE
+  declared native surface (3/3, the 🌐 WebView class-audit pattern). The adjacent `native_setScaleType(JI)V`
+  (smali :45) is a PLAIN Java `return-void` override in the INSTALLED dex — NOT a native (the one vendored-source
+  drift: the vendored ImageButton.java lacks it; protective direction — setScaleType on an ImageButton receiver
+  dispatches to the Java no-op) — so it can NEVER ULE on ImageButton and must NOT be registered (a non-native
+  entry fails per-method best-effort with a loud per-boot WARN that would perturb the boot-watch greps). Shape
+  (all in `src/framework.rs::register_image_button_natives`): DIRECT class-agnostic reuse of the live-validated
+  `image_view_set_drawable` handler under the SHARED `IMAGE_VIEW_SET_DRAWABLE_NAME/SIG` consts (the
+  `view_native_constructor` const-sharing shape; ImageButton calls trace under the `android.widget.ImageView`
+  target — the tolerated label mismatch of the View.nativeSetOnClickListener reuse precedent, disclosed by the
+  dated in-body comment); `[NativeBinding; 2]` → `[NativeBinding; 3]`; the registration info! line now reads
+  `ImageButton.native_constructor + nativeSetOnClickListener + native_setDrawable (per-method best-effort)` —
+  live expectation **`bound=3`**, replacing challenge14's line-161 `bound=2`. Honesty: the native is `(JJ)V` void
+  with NO read-back on ANY path — on the challenge14 path (`setImageDrawable`) the Java `drawable` field is iput
+  BEFORE the native fires and `getDrawable()` reads ONLY that field (diff-review precision note, recorded:
+  `setImageBitmap`/`setImageResource` pass `Bitmap.getTexture()` WITHOUT writing the field — zero read-back is
+  structurally impossible on a void native either way, honesty unaffected); upstream reference C is
+  `gtk_picture_set_paintable`, display-side only — the validated no-op is semantically exact. Recorded risk: the
+  drawable jlong is a HETEROGENEOUS handle namespace (`Drawable.paintable` on the setImageDrawable/XML-src paths
+  vs `Bitmap.getTexture()` on setImageBitmap/setImageResource; 0 for null) — ignored today, and a future
+  image-raster consumer MUST disambiguate paintable vs texture handles before recording the drawable on the view
+  peer (never pass it to view_registry). Review provenance: plan adversarially reviewed — 2 must-fixes (the
+  challenge14 boot misdated 2026-07-02: every boot/ULE attribution now says 2026-07-03 or cites the log
+  path+lines; the stale "nativeSetOnClickListener validates the handle + no-ops" claim corrected to "marks the
+  peer clickable") + 7 advisories, ALL folded BEFORE implementation; the diff review returned ZERO must-fixes +
+  4 advisories (dispositions in §6 2026-07-03 🔘). Same-pattern comment fix (this fix-and-docs pass, CLAUDE.md
+  equivalent-instances): the TWO remaining instances of the stale nativeSetOnClickListener-no-op claim fixed —
+  the pin-test comment (was framework.rs:17170, "(no-op)") and the const-comment final sentence (was :8903–8904,
+  "validates the handle + no-ops") — repo-grep confirms the class is now fully corrected (the View const comment
+  4847–4852 and View pin comment 16620–16621, final-tree coordinates, were already accurate). Regression guards
+  (plain `cargo test`, no APK/display): shared-const name/sig pins added INSIDE the existing
+  `image_button_class_is_slashed_internal_name`
+  test fn citing the challenge14 log by path+lines (house convention — the unit count DELIBERATELY STAYS 594, no
+  new test fn); registration-PRESENCE guard = the live boot's ImageButton `bound=3` line. Gate green (fmt /
+  build --all-targets / clippy -D warnings / **594 unit + 4 integ + 2 doctest** / release) — run by the implement
+  pass, independently re-verified by the diff review, re-run green by this fix-and-docs pass after the comment
+  fixes; diff `src/framework.rs` only (+66/−18).
+  **CHALLENGE15 BOOT-WATCH VERDICTS (`/tmp/eclipse-challenge15.log`, 1291 lines, boot window 2026-07-03
+  05:21–05:24 UTC (log-line span 05:21:56–05:24:17), EXIT=124 orchestrator-observed clean 180 s timeout kill;
+  recipe = the challenge14 re-drive with stage-0 tap `ECLIPSE_SYNTHETIC_ENGINE_TAP="400,413"` HOLDING — first
+  try, no re-calibration; full record in §6 2026-07-03 ✅🔘): (a) CONFIRMED** — the
+  `ImageButton.native_setDrawable` ULE GONE with NOTHING in its place: `grep -c "No implementation found"` = 0
+  AND `grep -c UnsatisfiedLinkError` = 0 over the WHOLE log (challenge14 baseline: exactly 1 ULE, its lines
+  1165+1166); the log's only `ImageButton` line is the registration line. **(b) CONFIRMED** — line 161:
+  `ImageButton.native_constructor + nativeSetOnClickListener + native_setDrawable (per-method best-effort)
+  class="android/widget/ImageButton" bound=3` (challenge14 line 161 was `bound=2`); siblings unchanged — View
+  line 154 `bound=27`, ImageView line 160 `bound=3`, WebView line 171 `bound=3`. **(c) CONFIRMED** — the toolbar
+  navigation-icon wiring stack and the `yh.d.onActivityCreated:77` frame have ZERO log occurrences (`hh.i.b` /
+  `RobloxToolbar` / `Toolbar.setNavigationIcon` / `AppCompatImageButton` / `yh.d` / `performActivityCreated` /
+  `FragmentManager` all grep 0) — `Fragment.performActivityCreated` COMPLETED and the failure did NOT move: it
+  VANISHED (no successor stack anywhere; the challenge fragment's lifecycle completes with no remaining native
+  failure). **(d) CONFIRMED — BASELINE UNCHANGED + chain intact**: Landing line 977 (05:22:22.647) → stage-0 tap
+  line 1051 → LoginV2 line 1057 (05:22:25.712) → 403 "Challenge is required" line 1132 → ChallengeNativeWrapper
+  line 1136 (05:22:36.779) → ChallengeHybridWebView line 1140 (05:22:36.879) → WebView constructs +
+  native_loadUrl one-shot WARN line 1167 (05:22:48.910, widget=4294967370) → native_measure one-shot WARN line
+  1172 (fired exactly once) → recovery LoginV2 line 1240 (05:23:36.894 — 60.01 s, inside the 47–60 s envelope);
+  PRIVACY ABSOLUTE HELD (the only `target=` line in the entire log is 1167, exactly
+  `target=https://www.roblox.com` — scheme+host only); 0 `NullPointerException`; known exception census only,
+  species+counts IDENTICAL to challenge14 minus the ULE (gms `StreamCorruptedException` pair 426+436, Canvas
+  class dump 78 lines contiguous 179–256, single signal-11 book-keeping line 1149, applyStyle `inflate(0x0)`
+  `Resources$NotFoundException` 1 hit); `framework lifecycle step failed` count **1** (line 1048, the known
+  upgrade-dialog NotFoundException) — the EXPECTED improvement from challenge14's 2 (its second WAS the frontier
+  ULE); EXIT=124, engine alive to the kill (last timestamped line 1284, 05:24:17.654). **(e) NEW-ULE CENSUS:
+  ZERO `No implementation found` lines → NO next native frontier** — the recorded native-binding CEILING on the
+  challenge fragment is REACHED; the owner-level decision below is now THE critical path.
+  **OWNER-LEVEL DECISION NOW THE CRITICAL PATH (preserved from the 📏/🌐 bullets — NOT decided by this
+  validation pass):** Eclipse has NO web engine (the recorded hard ceiling), so an Arkose/FunCaptcha-style WEB
+  challenge can never RENDER or COMPLETE via native-binding alone — the challenge15 boot proved the challenge
+  fragment's lifecycle now completes with ZERO remaining native failures, so native-binding progress on the
+  challenge fragment has REACHED ITS CEILING: there is nothing left to bind on this path. The gating choice is the
+  owner's: (a) integrate a real web engine for the challenge WebView (an owned minimal renderer vs a non-GTK
+  embedding — WebKitGTK is banned by the no-GTK/low_4gb constraint; an embedded browser needs a
+  pure-Rust/no-bloat justification cycle), or (b) find a non-web login/challenge path. Recorded; NOT decided —
+  surface it to the owner at next contact.
 - **2026-07-02 — 📏 `android.view.View.native_measure(JII)V` BOUND (closes the challenge13 frontier — the 📐
   audit-table row-11 documented-unbound REAL content-measure native; the challenge fragment's Toolbar →
   ActionMenuView measure) — IMPLEMENTED per the adversarially-reviewed plan + ✅ VALIDATED by the 2026-07-03
@@ -139,7 +234,10 @@ before any history-rewriting/force operation.
   (`bound=3`) but ImageButton (`bound=2`) RE-DECLARES it — the 2026-06-13 WebView.native_constructor
   subclass-redeclaration pattern recurring; natural shape = register ImageButton.native_setDrawable, plausibly
   delegating to the existing ImageView handler, after the usual baksmali audit of the installed ImageButton dex
-  surface) — and NOTE the standing OWNER-LEVEL web-engine decision preserved at the end of this bullet: this pass
+  surface) — IMPLEMENTED 2026-07-02/03 + ✅ VALIDATED by the 2026-07-03 challenge15 boot + COMMITTED 2026-07-03
+  (full record in §6 2026-07-03 🔘 + ✅🔘; the challenge15 verdicts live in the 🔘 bullet above) — and NOTE the
+  standing OWNER-LEVEL
+  web-engine decision preserved at the end of this bullet: this pass
   advanced the toolbar but STILL CANNOT make the web challenge COMPLETE.** Implements the 🌐 bullet's
   START-HERE-NEXT (full record in §6 2026-07-02 📏; plan = the 2026-07-02 audit/plan workflow, adversarially
   reviewed — 2 deduplicated must-fixes +
@@ -5809,6 +5907,234 @@ recorded in the §5 📏/🌐 bullets ((a) a non-GTK web engine vs (b) a non-web
 *Status:* COMMITTED 2026-07-03 with this entry. Regression guards unchanged from the implement pass (the
 plain-`cargo test` name/sig + upcall-target pins and the getDefaultSize-semantics test); the live-boot `bound=27`
 line is the registration-presence guard (house convention — RegisterNatives only surfaces under live ART).
+
+---
+
+### 2026-07-03 — 🔘 `android.widget.ImageButton.native_setDrawable(JJ)V` bound (closes the challenge14 frontier — the WebView subclass-redeclaration pattern recurring on ImageButton): direct class-agnostic reuse of the live-validated `image_view_set_drawable` under the shared consts, whole-class 3/3 declared-native coverage (`native_setScaleType` proven NON-native in the installed dex, deliberately NOT registered), live expectation `bound=3`; UNCOMMITTED pending the challenge15 validation boot
+
+*Discovery evidence (the §5 📏 START-HERE-NEXT):* the challenge14 boot (`/tmp/eclipse-challenge14.log` —
+java_vm_ext E-line 1165, ULE line 1166, stack frames 1167–1184, `framework lifecycle step failed
+step="Handler.dispatchMessage"` ERROR line 1185; full verdicts in §6 2026-07-03 📏) died wiring the challenge
+fragment's RobloxToolbar navigation icon: `UnsatisfiedLinkError: No implementation found for void
+android.widget.ImageButton.native_setDrawable(long, long)` (tried
+`Java_android_widget_ImageButton_native_1setDrawable[__JJ]`) — the log's ONLY ULE. Stack:
+`ImageButton.native_setDrawable(Native Method)` ← `ImageView.setImageDrawable:38` ←
+`AppCompatImageButton.setImageDrawable` ← `Toolbar.setNavigationIcon` ← `RobloxToolbar.g0:46` ←
+`RobloxToolbar.setNavigationOnClickListener:43` ← `hh.i.b` ← `yh.d.onActivityCreated:77` ←
+`Fragment.performActivityCreated` ← fragment machinery ← `Handler.dispatchMessage`. ART resolves natives per
+DECLARING class: ImageView's OWN `native_setDrawable` IS bound (challenge14 line 160, `bound=3`) but ImageButton
+RE-DECLARES it and its registration (line 161, `bound=2`) did not cover the re-declaration — the 2026-06-13
+`WebView.native_constructor` subclass-redeclaration pattern recurring, exactly as the 📏 verdict predicted.
+
+*Audit method + table (the 🎨/🖌️/📐/🌐 precedent, all first-party — baksmali of the installed
+`~/.cache/eclipse/framework-patched/api-impl.jar`, all 3 dexes, artifacts in the 2026-07-02 session scratchpad
+`imagebutton-audit/`):* `android/widget/ImageButton` (`.super Landroid/widget/ImageView;`) and
+`android/widget/ImageView` are each defined ONLY in classes3.dex — classes.dex/classes2.dex contain ZERO
+`android/widget` classes, so there is NO overlay shadow and first-dex-wins is moot; grep over all smali of all 3
+dexes finds exactly 2 declarers of a native named `native_setDrawable` (ImageView.smali:269 +
+ImageButton.smali:42), no framework class extends ImageButton, and androidx/AppCompatImageButton is app-dex-side
+and does NOT re-declare it (per the ULE resolving to `android.widget.ImageButton`) — the single
+ImageButton-class registration covers the AppCompat receiver. All 4 `native_setDrawable` invoke sites live in
+ImageView.smali (ctor :199 — the XML `android:src` path, so inflating an ImageButton with a src attr would ALSO
+have hit this ULE; setImageBitmap :323; setImageDrawable :376 — the challenge14 path; setImageResource :452),
+all invoke-virtual on `Landroid/widget/ImageView;->native_setDrawable(JJ)V`, resolving through the receiver's
+declaring class.
+
+| # | ImageButton declared native (installed classes3 `ImageButton.smali` line) | discovery evidence | state |
+|---|---|---|---|
+| 1 | `nativeSetOnClickListener` `(J)V` (:36) | 2026-06-05 run-log ULE (Toolbar nav button) | bound (pre-existing) — `view_registry::set_clickable` marks the peer clickable (the renderer's click hit-test target) |
+| 2 | `native_constructor` `(Landroid/content/Context;Landroid/util/AttributeSet;)J` (:39) | 2026-06-05 run-log ULE | bound (pre-existing) — the shared class-agnostic `view_native_constructor` (records `android.widget.ImageButton` on the peer) |
+| 3 | `native_setDrawable` `(JJ)V` (:42) | the 2026-07-03 challenge14 ULE (`/tmp/eclipse-challenge14.log` lines 1165–1184) | **NEWLY BOUND this pass** — direct reuse of the shared class-agnostic `image_view_set_drawable` (validated no-op) |
+
+Non-entry (deliberate): the installed dex's `ImageButton.native_setScaleType(JI)V` (smali :45) is a PLAIN Java
+`return-void` override — NOT a native. This is the audit's ONE vendored-source drift (the vendored
+`vendor/atl/src/api-impl/android/widget/ImageButton.java` lacks it; protective direction — under the installed
+dex, `setScaleType` on an ImageButton receiver dispatches to the Java no-op and can never ULE; under the
+vendored shape it would resolve up to ImageView's bound native, a no-op either way). It must NOT be registered:
+a non-native entry fails per-method best-effort with a loud per-boot WARN that would perturb the boot-watch
+baseline greps. After row 3 the class's WHOLE declared native surface is covered (3/3; `bound=2` →
+**`bound=3`**). The vendored ImageButton.java's 3 native declarations otherwise match the installed dex exactly
+(no other drift); the vendored reference C (`android_widget_ImageButton.c:42–50`) implements
+`native_setDrawable` as `gtk_picture_set_paintable` + a CSS class — a pure GTK display-side effect with no Java
+read-back, mirroring ImageView's reference native.
+
+*Decided shape (six edits, all `src/framework.rs`):* (1) registrar doc comment rewritten — 3/3 coverage, the
+non-native `native_setScaleType` exclusion, and the MF-2 correction (`nativeSetOnClickListener` "marks the peer
+clickable in view_registry", replacing the stale "validates the handle + no-ops"); (2) dated 2026-07-02 in-body
+mechanism/evidence comment (boot attributed 2026-07-03 with the log path+lines, per MF-1) + the SAFETY per-entry
+list extended to the WebView house form (per-entry smali line citations); (3) `[NativeBinding; 2]` →
+`[NativeBinding; 3]`, appending `IMAGE_VIEW_SET_DRAWABLE_NAME/SIG` + `image_view_set_drawable as *mut c_void`
+LAST (info! names are '+'-joined in array order) with an inline reuse note (A-7); (4) registration info! →
+`…native_constructor + nativeSetOnClickListener + native_setDrawable (per-method best-effort)`, `class=` field
+kept (NOT copying WebView's missing-field inconsistency), live expectation `bound=3`, no parenthetical (no
+declaration-only dead natives remain on this class); (5) the stale call-site comment at the
+`register_image_button_natives` call replaced (re-declaration mechanism + the 2026-07-03 challenge14
+attribution); (6) the pin test extended (regression guards below). Direct-reuse decisions: the handler is
+genuinely class-agnostic (`view_registry::with_view` validation + trace/debug logging only; the drawable jlong
+is NEVER passed to view_registry — it is a HETEROGENEOUS handle namespace, `Drawable.paintable` on the
+setImageDrawable/XML-src paths vs `Bitmap.getTexture()` on setImageBitmap/setImageResource vs 0 for null, which
+a future image-raster consumer must disambiguate; the existing handler doc already defers this); NO wrapper
+(zero precedent in framework.rs — it would duplicate a validated body for a trace-level label) and NO retarget
+of the live-validated ImageView log strings — ImageButton calls trace under `android.widget.ImageView` (the
+tolerated label mismatch of the View.nativeSetOnClickListener reuse precedent; the registry peer records
+`android.widget.ImageButton` at construction and the registration line carries the class identity); SHARED
+consts, not a duplicated per-class pair (the constructor-style precedent — and the pin test asserts the SAME
+consts the call site passes, the native_measure MF-1 lesson); ImageButton stays OUT of
+`VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` (it keeps its own registrar because it carries natives beyond the
+constructor — the recorded WebView reason; double-registration hazard). Honesty basis: the native is `(JJ)V`
+void with NO Java-side read-back on ANY path — `getDrawable()` reads only the Java `drawable` field, no
+getter/iput/branch anywhere in the dex consumes native-side drawable state, and the upstream reference effect is
+display-only; the validated no-op is semantically exact (diff-review precision note in advisory (i) below).
+
+*Plan-review dispositions (adversarial review, fix-then-ship — ALL folded BEFORE implementation):* **MF-1** —
+Edits 2/5/6 misdated the challenge14 boot/ULE as 2026-07-02; a DIFFERENT 2026-07-02 📏 §6 entry exists (the
+native_measure implementation entry, which does NOT contain the ImageButton ULE), so the wrong date actively
+routes readers to the wrong entry → every boot/ULE attribution now says "the 2026-07-03 challenge14 boot" or
+cites `/tmp/eclipse-challenge14.log lines 1165–1184` (the challenge13 in-code citation form); leading write-on
+dates stay 2026-07-02 (the CLAUDE.md write-date convention). Recorded as plan decision D7. **MF-2** — Edit 1
+re-shipped the known-wrong "`nativeSetOnClickListener` validates the handle + no-ops" (the handler calls
+`view_registry::set_clickable`, framework.rs:8927, consumed by the renderer's hit-test which dispatches
+`View.performClick()`) → corrected to "marks the peer clickable"; the same-pattern outliers OUTSIDE the diff
+were left per Surgical Changes and delegated to the fix-and-docs pass (now DONE, below). Recorded as plan
+decision D8. Advisories (all seven folded, none declined): **A-1** duplicate of MF-2 (same remedy, applied in
+Edit 1); **A-2+A-4** the plan's "post-validation docs pass" label was wrong → re-sequenced as THIS
+pre-validation fix-and-docs pass (the §5 🔘 bullet + this entry recorded BEFORE the challenge15 boot, so the
+boot never runs against a stale §5 frontier — every precedent §6 implement entry was appended
+UNCOMMITTED-pending-validation); **A-3** prose precision (the ULE span is 1165–1184 with the ERROR line 1185
+named separately and excluded from shipped comments; the SAFETY "both" disambiguated to "constructor + click
+listener both surfaced by the run lines 2026-06-05"; the stays-594 unit-count criterion confirmed at HEAD);
+**A-5** subsumed by MF-1 (the call-site parenthetical now reads "the 2026-07-03 challenge14 ULE"); **A-6** the
+pin comment now cites the challenge14 log path+lines — with one deliberate narrowing: the suggested §6-emoji
+cross-reference was replaced by the plain log-path citation, the exact form of the adjacent challenge13 pin
+precedent; **A-7** inline reuse note added on the new array entry (mirroring the one existing non-constructor
+cross-class-reuse entry, View's binding of image_button_set_on_click_listener), and the advisory's endorsement
+of NOT rewording `image_view_set_drawable`'s Ok-arm message preserved (the dated in-body comment is the sole
+disclosure of the label mismatch and landed as specified).
+
+*Diff-review dispositions (adversarial review of the uncommitted implementation diff → this fix-and-docs
+pass):* **ZERO must-fixes.** Four advisories, dispositioned: **(i)** the in-body comment's "the `drawable` field
+is iput BEFORE the call" is smali-exact for the challenge14 `setImageDrawable` path and the XML-src ctor path,
+but `setImageBitmap` (:323) and `setImageResource` (:452) pass `Bitmap.getTexture()` WITHOUT writing the field —
+the honesty conclusion is unaffected (a `(JJ)V` void native makes read-back structurally impossible on EVERY
+path); recorded here as the precision note, no code change (Surgical Changes). **(ii)** the pre-validation
+fix-and-docs pass owed before the challenge15 boot — DONE: this entry + the §5 🔘 bullet (the `bound=3`
+registration-line expectation now lives in the Living State, not only the workflow record). **(iii)** the unit
+count deliberately stays 594 — the pins extend the EXISTING `image_button_class_is_slashed_internal_name` fn
+(house convention, no new test fn); not a missing test; verified green via the filtered run and the full suite.
+**(iv)** a SECOND instance of the exact stale-phrasing class MF-2 corrected — the pin-test comment at
+framework.rs:17170 "(no-op)" — recorded for the fix-and-docs pass alongside the plan-§4 outlier at :8900–8904;
+this pass went one step further than the advisory's record-only ask and FIXED the class (next paragraph), per
+the CLAUDE.md equivalent-instances policy.
+
+*Same-pattern comment fix (this fix-and-docs pass, comment-only — the CLAUDE.md equivalent-instances policy):*
+repo-wide grep enumerated every claim that `nativeSetOnClickListener` no-ops; TWO live instances remained and
+both are now fixed — (1) the pin-test provenance comment (was framework.rs:17170) "surfaced 2026-06-05 by
+Toolbar nav button (no-op)" → now "(marks the peer clickable in view_registry — the renderer's click hit-test
+target)" (surfaced-by/date provenance kept); (2) the `IMAGE_BUTTON_SET_ON_CLICK_LISTENER_*` const comment's
+final sentence (was :8903–8904) "The draw-free lifecycle dispatches no input, so this validates the handle +
+no-ops (click dispatch is the deferred input/render build)" — stale on BOTH claims (the handler marks the peer
+clickable, and the minimal click path EXISTS: the renderer's hit-test dispatches `View.performClick()`) →
+replaced with the true set_clickable/hit-test behavior, cross-referencing the handler. The two other mention
+sites (the View const comment at 4847–4852 and the View pin comment at 16620–16621, final-tree coordinates)
+were verified already
+accurate ("marks the peer clickable"), and no AGENTS.md/docs line carries the stale claim (§6 history is
+append-only and untouched) — the class is fully corrected.
+
+*Regression guards (plain `cargo test`, no APK/display/boot, all in the existing framework.rs test module):* the
+shared-const name/sig pins (`IMAGE_VIEW_SET_DRAWABLE_NAME` → `native_setDrawable`, `…_SIG` → `(JJ)V`)
+re-asserted INSIDE `image_button_class_is_slashed_internal_name`, dated 2026-07-02 and citing
+`/tmp/eclipse-challenge14.log` lines 1165–1184 — they pin the exact consts the ImageButton call site passes (a
+transcription regression would make RegisterNatives skip the entry per-method best-effort and re-open the
+challenge14 ULE at boot); the `android/widget/ImageButton` class-name pin (the boot-fatal `find_class` path)
+pre-existing; `register_class_natives_best_effort_skips_unbindable_method_and_continues` unchanged (the
+per-entry-failure isolation this pass relies on). Registration-PRESENCE guard = the challenge15 live boot's
+ImageButton `bound=3` line (house convention — RegisterNatives only surfaces under live ART). No new scripts, no
+new test files.
+
+*Gate:* green — `cargo fmt --all` / `cargo build --all-targets` / `cargo clippy --all-targets --all-features
+-- -D warnings` / `cargo test` (**594 unit + 4 integ + 2 doctest**, 0 failed — the unit count DELIBERATELY stays
+594) / `cargo build --release`; run by the implement pass, independently re-verified by the diff review, and
+re-run green by this fix-and-docs pass after the same-pattern comment fixes.
+
+*Status:* UNCOMMITTED, validation boot PENDING (the challenge15 boot-watch (a)–(e) list + recipe live in the §5
+🔘 bullet; no overlay change this pass — the installed framework jar is untouched). Diff: `src/framework.rs`
+only, +66/−18 (the implement pass's +61/−15 plus this pass's two comment fixes).
+
+---
+
+### 2026-07-03 — ✅🔘 Validation-boot verdict on the ImageButton.native_setDrawable pass: ALL boot-watch items CONFIRMED — the `ImageButton.native_setDrawable` ULE is GONE (`bound=3`, zero `No implementation found` and zero `UnsatisfiedLinkError` over the WHOLE log), the challenge fragment's lifecycle COMPLETES with no remaining native failure, and NO new ULE appeared → there is NO next native frontier: the native-binding CEILING on the challenge fragment is REACHED and the OWNER-LEVEL web-engine decision is now THE critical path; ImageButton pass committed with this entry.
+
+*Boot:* `/tmp/eclipse-challenge15.log`, 1291 lines, window 2026-07-03 05:21–05:24 UTC (log-line span
+05:21:56–05:24:17), EXIT=124 orchestrator-observed clean 180 s timeout kill (the exit code is not in the log
+body — the log ends mid-Lua-traceback at line 1291, consistent with the SIGKILL). Recipe = the challenge14
+re-drive with stage-0 tap `ECLIPSE_SYNTHETIC_ENGINE_TAP="400,413"` HOLDING (worked first try — tap line 1051 at
+05:22:25.676, LoginV2 36 ms later; no re-calibration this boot); `src/framework.rs` unchanged from the
+fix-and-docs pass (§6 2026-07-03 🔘, diff +66/−18), so the gate is the identical **594 unit + 4 integ +
+2 doctest**.
+
+*Verdicts (each grep-verified against the log):* **(a) CONFIRMED** — `ImageButton.native_setDrawable` ULE GONE
+with NOTHING in its place: `grep -c "No implementation found"` = 0, `grep -c UnsatisfiedLinkError` = 0, and
+`grep -c java_vm_ext` = 0 over the WHOLE log (challenge14 baseline: exactly 1 ULE, its lines 1165+1166);
+`grep -n ImageButton` returns exactly 1 line — the registration line. **(b) CONFIRMED** — line 161: `registered
+Eclipse's non-GTK backing for ImageButton.native_constructor + nativeSetOnClickListener + native_setDrawable
+(per-method best-effort) class="android/widget/ImageButton" bound=3` — `native_setDrawable` appended LAST
+exactly as shipped, `bound=3` (challenge14 line 161 was `bound=2`); siblings unchanged — View line 154
+`bound=27` (parenthetical still the dead trio), ImageView line 160 `bound=3`, WebView line 171 `bound=3`,
+ViewGroup line 175 `bound=2`. **(c) CONFIRMED** — the challenge14 toolbar navigation-icon wiring stack has ZERO
+log occurrences: `hh.i.b` / `RobloxToolbar` / `Toolbar.setNavigationIcon` / `AppCompatImageButton` / `yh.d` /
+`Fragment.performActivityCreated` / `performCreateView` / `FragmentManager` ALL grep 0 —
+`Toolbar.setNavigationIcon` is now served silently, `Fragment.performActivityCreated` COMPLETED, and the
+failure did NOT move to a next frame: it VANISHED (no successor exception stack anywhere — the challenge
+fragment's lifecycle completes with no remaining native failure; the challenge9→13→14 stage-by-stage advance
+pattern TERMINATES here). **(d) CONFIRMED — BASELINE UNCHANGED + chain intact** — onAppReady Landing line 977
+(05:22:22.647, stage-0 tap held — no Landing stall) → synthetic ENGINE tap line 1051 (05:22:25.676, x=400
+y=413) → onAppReady LoginV2 line 1057 (05:22:25.712) → HTTP 403 error body `"Challenge is required to authorize
+the request"` line 1132 (05:22:36.761) → onAppReady ChallengeNativeWrapper line 1136 (05:22:36.779) →
+ChallengeHybridWebView line 1140 (05:22:36.879) → WebView constructs + native_loadUrl one-shot WARN line 1167
+(05:22:48.910, widget=4294967370) → View.native_measure one-shot WARN line 1172 (05:22:50.036, widget=4294967372,
+`width_measure_spec=0 height_measure_spec=0` → honest-served 0×0, the IDENTICAL challenge14 shape; `grep -c
+"View.native_measure: serving"` = 1, zero `upcall failed` of any kind) → recovery onAppReady LoginV2 line 1240
+(05:23:36.894 — 60.01 s after ChallengeHybridWebView, inside the recorded 47–60 s envelope). PRIVACY ABSOLUTE
+HELD: the only `target=` line in the entire log is 1167, exactly `target=https://www.roblox.com` — scheme+host
+only, no path/query/token/payload on any android.webkit.WebView-target line. **(e) NEW-ULE CENSUS — ZERO**:
+grep of every `No implementation found` line (the challenge9→13→14 discovery convention) returns NOTHING — for
+the first time in the challenge-boot series there is NO next native frontier to capture.
+
+*Baseline comparison (challenge14 items verified, one EXPECTED deviation):* 0 `NullPointerException`;
+`StreamCorruptedException` exactly 2 hits (lines 426+436, the known gms pair — challenge14: 420+430); jni_internal
+Canvas class dump exactly 78 lines (contiguous 179–256, ending at the known `nDrawColor(JI)V` register-failure
+line; `Failed to register native method` count 1 in BOTH logs); single survivable `Run book keeping for signal
+11` line (1149, 05:22:36.910, right after the challenge 403 as usual); the known applyStyle `inflate(0x0)`
+upgrade-dialog `Resources$NotFoundException` "Unable to find resource ID #0x0" exactly 1 hit (stack 1025–1047:
+`Dialog.show` ← `com.roblox.client.a.J0:173` ← `ActivityNativeMain` engine-callback machinery, preceded by the
+AssetManager.getResourceName `resid=0x00000000` WARN line 1024); the `nativeIsFocused` ACTIVE_TEXT_FIELD
+one-shot WARN never fired (registration line 154 only). **DEVIATION (the expected improvement):** `framework
+lifecycle step failed` count **2 → 1** — the sole hit is line 1048 (05:22:25.675, the upgrade-dialog
+NotFoundException, challenge14's FIRST failure); challenge14's SECOND failure (its line 1185, the frontier ULE)
+is GONE. Exception census: only known species, counts IDENTICAL to challenge14 minus the ULE
+(FileNotFoundException 8, ClassNotFoundException 4, ClassCastException 3, BootstrapMethodError 3, the
+StreamCorruptedException pair + its RuntimeException wrapper, PackageManager$NameNotFoundException 1, the
+single Resources$NotFoundException, ZERO UnsatisfiedLinkError). vk-overlay: present seam armed line 968, field
+overlay/probe built line 969 (same rect x=181 y=149 w=438 h=46), stage-0 field-probe ink line 970
+`total_ink=8322` and Landing ink `total_ink=5794` (lines 1021–1023) — BOTH ink signatures identical to
+challenge14 (its 961/1011–1013), no drift. Engine alive to the kill: last timestamped line 1284 (05:24:17.654,
+unhandled-Promise-rejection WARN after the user-heartbeats-api 403 "Unauthorized." at 1280–1283 — the same
+ending species as challenge14), then the untimestamped Lua traceback to line 1291.
+
+*Ceiling (the owner-level decision is now THE critical path — recorded, NOT decided):* with zero ULEs there is
+no next native to bind on the challenge fragment: the native-binding ceiling recorded since the 🌐 pass is
+REACHED, not merely approached. Eclipse has NO web engine, so the Arkose/FunCaptcha-style WEB challenge renders
+nothing inside the constructed-but-empty ChallengeHybridWebView and times out to the recovery LoginV2 every
+boot. The gating choice remains the owner's exactly as recorded in the §5 🔘/📏/🌐 bullets: (a) integrate a
+real web engine for the challenge WebView (an owned minimal renderer vs a non-GTK embedding — WebKitGTK is
+banned by the no-GTK/low_4gb constraint; an embedded browser needs a pure-Rust/no-bloat justification cycle),
+or (b) find a non-web login/challenge path. Nothing is implementable on this frontier until the owner decides;
+a session reaching the §5 🔘 bullet should surface the decision to the owner.
+
+*Status:* COMMITTED 2026-07-03 with this entry. Regression guards unchanged from the implement pass (the
+shared-const name/sig pins inside `image_button_class_is_slashed_internal_name` citing the challenge14 log by
+path+lines); the live-boot ImageButton `bound=3` line is the registration-presence guard (house convention —
+RegisterNatives only surfaces under live ART).
 
 ---
 
