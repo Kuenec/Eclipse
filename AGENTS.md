@@ -128,10 +128,130 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-02 — 🌐 `android.webkit.WebView` native surface audited + bound as a CLASS (closes the challenge9
+  `native_constructor` frontier) — ✅ VALIDATED by the 2026-07-03 challenge13 boot + COMMITTED 2026-07-03
+  ⇐ START-HERE-NEXT: bind `android.view.View.native_measure(JII)V` (the 📐-documented-unbound real content-measure
+  native, now the ACTIVE frontier — the challenge fragment's Toolbar → ActionMenuView measure) — but FIRST read the
+  OWNER-LEVEL inflection in the VERDICTS below: binding the View surface CANNOT make the web challenge COMPLETE.**
+  Implements the 📐 bullet's START-HERE-NEXT (full audit table + review dispositions in §6 2026-07-02 🌐; plan =
+  the 2026-07-02 audit/plan workflow, adversarially reviewed fix-then-ship with both must-fixes folded in). AUDIT
+  (baksmali of the installed `~/.cache/eclipse/framework-patched/api-impl.jar`, 2026-07-02): `android/webkit/WebView`
+  is defined ONLY in classes3.dex (stock — NO overlay shadow, first-dex-wins moot; the only webkit overlay presence
+  is the classes.dex ValueCallback interface + the classes2.dex CookieManager, both 2026-06-14, both plain Java) and
+  declares EXACTLY 3 natives — the ONLY natives declared by ANY android/webkit class in ANY of the 3 dexes
+  (grep-verified); **NO vendored drift** (vendored `WebView.java` declares the identical 3). All 3 bound in ONE
+  per-method best-effort pass (`src/framework.rs::register_web_view_natives`, the 58a50f6 pattern, wired into
+  `drive_lifecycle` right after `register_view_subclass_constructor_natives`; the registration line logs `bound=3`):
+  **`native_constructor(Landroid/content/Context;Landroid/util/AttributeSet;)J`** (smali:378) = the EXISTING shared
+  class-agnostic `view_native_constructor` — registry-backed HONEST: the returned long IS `View.widget` (iput-wide
+  right after the call in the ACTIVE classes2 View.smali), read back as the handle by every subsequent
+  View/ViewGroup native, so it must be a live `view_registry` handle ≥ 1 (NO new webview_registry — view_registry
+  already records the concrete class, e.g. `com.roblox.client.hybrid.RBHybridWebView`; deliberately NOT added to
+  `VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` — WebView also carries load natives the constructor-only array shape cannot
+  host, pin-tested + dated in the section comment); **`native_loadUrl(JLjava/lang/String;)V`** (smali:51) +
+  **`native_loadDataWithBaseURL(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V`**
+  (smali:48) = validated no-ops matching UPSTREAM ATL's OWN DEFAULT — reference-default fidelity is the load-bearing
+  honesty argument: the reference C (`ATL_UGLY_ENABLE_WEBVIEW` unset) delegates the constructor to the plain View
+  native and early-returns from BOTH loads (WebKitGTK disabled); write-only smali-proven (invoke-direct, no
+  move-result, NO getUrl/getTitle/getProgress exist on the installed WebView, `internalLoadChanged` has ZERO Java
+  invokers — dead under the no-op backing). Each load native: widget-handle validation against `view_registry`
+  (stale/0 → warn + return, never throw) + its OWN one-shot `tracing::warn!` (the FOCUS_DIVERGENCE_WARNED pattern;
+  tracing target `android.webkit.WebView` — load-bearing for the (e) privacy-grep scoping) stating plainly there is
+  NO web engine and content will NOT load (subsequent calls `debug!`); ALL url logging routed through the new pure
+  helper `url_scheme_and_host_for_log` (TIGHTENED spec per the review must-fix: the literal `"://"` is REQUIRED —
+  absent → the literal `"<non-url>"`; RFC-3986 scheme charset validated; authority cut at the FIRST of `/`, `?`,
+  `#`; userinfo stripped only within that bounded authority; the loadData data payload is NEVER bound to any log
+  macro at any level). **HARD CEILING (the classification's boundary, recorded):** there is NO web engine —
+  WebKitGTK (ATL's reference backing) is GTK, banned by the no-GTK/low_4gb constraint — so web content never loads
+  and the login challenge CANNOT COMPLETE via this pass; expected shape = the fragment constructs ULE-free → the
+  ~60 s challenge timeout → recovery to LoginV2 → capture what the app does next. **OWNER-LEVEL OPEN ITEM:** real
+  challenge web content needs a web-engine phase (an owned minimal renderer vs a non-GTK embedding — WebKitGTK is
+  banned; an embedded browser also needs a pure-Rust/no-bloat justification cycle) — a separate architectural
+  decision the owner must make before the challenge can ever COMPLETE; deliberately NOT started here. **KNOWN
+  OUT-OF-SCOPE LEAK CHANNEL (recorded, untouched):** the installed `WebView.loadUrl` itself `System.out.println`s
+  the FULL URL for `javascript:` URLs BEFORE the native is reached (classes3 WebView.smali :329–:367 — "loadUrl:
+  <url> - not implemented yet") — a framework-dex channel entirely outside Eclipse's binding; overlay-patch that
+  println ONLY if challenge10 shows secrets flowing through it (Surgical Changes). Regression guards (plain
+  `cargo test`, no APK/display): `web_view_native_names_sigs_and_class_match_the_installed_dex` (all 3 name/sig
+  pairs + the class + the shared-constructor decision, mirroring the Paint pin test),
+  `url_scheme_and_host_for_log_serves_scheme_and_host_only_and_never_query_payload_or_credentials` (the
+  review-mandated shapes: `about:blank` → `<non-url>` — the GUARANTEED loadData-path input; payload-bearing AND
+  embedded-`://` `data:` URLs → `<non-url>` with no payload substring; `https://host?token=SECRET` → exactly
+  `https://host`; userinfo stripped; path/fragment cut), and
+  `view_subclass_constructor_classes_are_slashed_internal_names` extended (2026-07-02 dated assert:
+  `android/webkit/WebView` is NOT in the array — bound by its own registrar because it also carries load natives).
+  **DIFF-REVIEW FIX folded into this same pass (2026-07-02, adversarial review of the uncommitted diff; see §6 🌐
+  for the dispositions):** both load-native bodies now describe+clear any pending Java exception on a failed
+  jstring conversion (the openAssetFd house pattern) before the safe-literal fallback — keeps the validated no-op
+  total (never throws back into Java, never issues a JNI call with an exception pending); the `<non-url>` safe
+  literal is hoisted to one shared module const (`NON_URL`).
+  Gate green (fmt / build --all-targets / clippy -D warnings / **593 unit + 4 integ + 2 doctest** / release).
+  **BOOT-WATCH VERDICTS (`/tmp/eclipse-challenge13.log`, 1296 lines, boot window 2026-07-03 00:12–00:14 UTC,
+  EXIT=124 clean 180 s timeout kill; recipe = the challenge9 re-drive with the RE-CALIBRATED stage-0 tap — see the
+  BOOT-RECIPE DRIFT note below): (a) CONFIRMED** — `WebView.native_constructor` ULE is GONE: ZERO
+  `UnsatisfiedLinkError`/`No implementation found` for it (its only log occurrence is the registration line 171).
+  The whole log has exactly 2 `No implementation found` lines and BOTH are the SAME single `View.native_measure`
+  event (the ART java_vm_ext.cc:1130 line 1154 + the exception line 1155 — see (e)). **(b) CONFIRMED** — log line
+  171: `registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared
+  view-registry peer; loadUrl/loadDataWithBaseURL = validated no-ops, upstream-ATL-default semantics — no web
+  engine, content will not load) (per-method best-effort) bound=3`. **(c) CONFIRMED — the predicted positive
+  construction signal FIRED** (log line 1149): `WARN android.webkit.WebView: WebView.native_loadUrl: no web engine
+  — content will not load (validated no-op, upstream-ATL-default semantics; target redacted to scheme+host)
+  widget=4294967370 target=https://www.roblox.com` — so the WebView CONSTRUCTED (widget=4294967370, a live
+  `view_registry` handle ≥ 1) AND the app drove it to loadUrl the challenge URL; both the one-shot WARN semantics
+  and the redaction are proven live. **(d) PRIVACY ABSOLUTE HELD** — the only `target=` line logs exactly
+  `https://www.roblox.com` (scheme+host ONLY — no path, no query string, no token): `url_scheme_and_host_for_log`
+  correctly redacted the REAL challenge URL; no full URL / query / `@`-userinfo / loadData payload appears on any
+  Eclipse-owned (android.webkit.WebView-target) line. **(e) NEW FRONTIER — `View.native_measure(long,int,int)`
+  ULE** (log lines 1154–1176, the ONLY remaining unbound native on the path): stack `View.native_measure(Native
+  Method)` ← `View.onMeasure(Unknown Source:26)` ← `View.measure:19` ← `androidx.appcompat.widget.a.i` ←
+  `androidx.appcompat.view.menu.e.c` ← `androidx.appcompat.widget.ActionMenuView.getMenu` ←
+  `androidx.appcompat.widget.Toolbar.getMenu` ← `yh.d.onCreateView(Unknown Source:246)` ← fragment machinery ←
+  `Handler.dispatchMessage` (framework lifecycle step failed 00:13:04.725, line 1176) — the CHALLENGE FRAGMENT's
+  Toolbar measuring its ActionMenuView (menu). This is the EXACT native the 📐 View pass DELIBERATELY LEFT UNBOUND
+  (a real content-measure pass whose `setMeasuredDimension` is read back via `getMeasuredWidth()/Height()`); the
+  WebView audit PREDICTED it as next-ULE #3. The challenge fragment ADVANCED from `yh.d.onCreateView:237`
+  (challenge9, WebView.native_constructor) to `:246` (challenge13, Toolbar.getMenu → measure) — binding WebView
+  unblocked the fragment further. Challenge chain (all verifiable): onAppReady LoginV2 00:12:40 (line 1042) → 403
+  "Challenge is required to authorize the request" 00:13:00 (line 1114) → onAppReady ChallengeNativeWrapper
+  00:12:51.873 (line 1118) → ChallengeHybridWebView 00:12:51.957 (line 1122) → WebView constructs + loadUrl
+  00:13:03 → native_measure ULE 00:13:04 → recovers to onAppReady LoginV2 00:13:51 (line 1245, the ~47 s challenge
+  timeout) → engine ALIVE to the 180 s kill (last line 00:14:50, LuaAppStarterScript still running, vk-overlay
+  probe still firing). Baseline UNCHANGED vs challenge9: 0 `NullPointerException`; `StreamCorruptedException` 2
+  hits; jni_internal Canvas class dump 78 lines; a single survivable signal-11 bookkeeping line; the known
+  applyStyle `inflate(0x0)` upgrade-dialog `Resources$NotFoundException` "Unable to find resource ID #0x0" 1 hit.
+  **⇐ START-HERE-NEXT: bind `android.view.View.native_measure(JII)V`** — the 📐-documented-unbound real
+  content-measure native, now the active frontier (the challenge fragment's Toolbar → ActionMenuView measure). It
+  IS bindable (next pass will unblock the toolbar and reveal the next native), BUT see the OWNER-LEVEL inflection
+  immediately below: binding the View surface CANNOT make the challenge COMPLETE.
+  **OWNER-LEVEL DECISION NOW ON THE CRITICAL PATH (the strategic open item — NOT to be decided by an
+  implementation pass):** the challenge fragment now inflates its `ChallengeHybridWebView` and the app drives it to
+  load `https://www.roblox.com` challenge content — but Eclipse has NO web engine (the recorded hard ceiling), so
+  an Arkose/FunCaptcha-style WEB challenge can never RENDER or COMPLETE via native-binding alone. `native_measure`
+  is bindable and will unblock the toolbar + reveal the next native, but native-binding progress on the challenge
+  fragment is APPROACHING ITS CEILING. The gating choice is now the owner's: (a) integrate a real web engine for
+  the challenge WebView (an owned minimal renderer vs a non-GTK embedding — WebKitGTK is banned by the
+  no-GTK/low_4gb constraint; an embedded browser needs a pure-Rust/no-bloat justification cycle), or (b) find a
+  non-web login/challenge path. Recorded here as the key open question; NOT decided.
+  **BOOT-RECIPE DRIFT (durable — the old stage-0 coordinate is now STALE):** the challenge9 stage-0 tap
+  `ECLIPSE_SYNTHETIC_ENGINE_TAP="419,531"` NO LONGER reaches the login screen — challenges 10/11/12 all STALLED at
+  `onAppReady: Landing` (the synthetic focus-tap retried ~20× and never focused; LoginV2 never opened) because the
+  engine-drawn Landing screen is a SERVER-DRIVEN Lua UI that DRIFTS across sessions. Re-calibration technique
+  (durable): a `ECLIPSE_VK_SCREENSHOT=1 ECLIPSE_VK_PROBE=1` boot writes `/tmp/eclipse_field_probe.png` (the full
+  800×600 frame == tap-coordinate space); read it, find the visible "Sign In" button, tap its center. This
+  session's Landing showed "Create Account" (~400,346) above "Sign In" (~400,413) — the old 419,531 is now empty
+  space below both. **Stage-0 re-calibrated to `ECLIPSE_SYNTHETIC_ENGINE_TAP="400,413"` (the "Sign In" button
+  center) drove challenge13 all the way through.** ACCURACY POINT: a guest-cache wipe (`rm -rf
+  /tmp/atl_cache/com.roblox.client`) tried before challenge12 did NOT help (12 stalled identically to 11) — the
+  cause was the TAP COORDINATE / server-driven Landing layout, NOT persisted account state (the cache-wipe was a
+  RED HERRING; do not attribute the fix to it). The rest of the chain still worked unchanged: stage-1
+  `ECLIPSE_SYNTHETIC_TYPE="278,179:robloxtest"`, stage-3 NEXT `400,236`, stage-4 TYPE2 password, stage-5 SUBMIT
+  `349,377` — only stage-0 drifted this session.
 - **2026-07-02 — 📐 `android.view.View` LAYOUT/GEOMETRY native remainder audited + bound as a CLASS (closes the
   challenge8 `native_layout` frontier) — ✅ VALIDATED by the 2026-07-02 challenge9 boot + COMMITTED 2026-07-02
   ⇐ START-HERE-NEXT: bind/back the installed framework's `android.webkit.WebView` native surface (plan at the end
-  of this bullet).** Implements the 🖌️ bullet's
+  of this bullet) — IMPLEMENTED 2026-07-02 + ✅ VALIDATED by the 2026-07-03 challenge13 boot + COMMITTED 2026-07-03
+  (see the 🌐 bullet above; the live frontier moved on to `View.native_measure`).** Implements the 🖌️ bullet's
   START-HERE-NEXT (see §6 2026-07-02 📐 for the full audit table). DECLARED-VS-BOUND audit (View has had several
   partial passes, so this pass diffed, not re-enumerated): baksmali of the installed
   `~/.cache/eclipse/framework-patched/api-impl.jar` (vendored smali toolchain + JDK-21 java, 2026-07-02) shows
@@ -167,7 +287,10 @@ before any history-rewriting/force operation.
   `setMeasuredDimension` upcall IS read back via `getMeasuredWidth()/Height()` (installed `onMeasure` calls ONLY
   the native for `haveCustomMeasure == false` views — TextView/ProgressBar/ImageView/Spinner flip the flag to
   route there for Pango/GTK content metrics; unservable honestly headless — the `Paint.native_get_text_bounds`
-  class, clean call-time ULE stays the discovery signal); `native_addClasses(J[Ljava/lang/String;)V` /
+  class, clean call-time ULE stays the discovery signal — 2026-07-03: that discovery signal HAS NOW FIRED
+  (challenge13, the challenge fragment's `Toolbar.getMenu` → `ActionMenuView` measure, `/tmp/eclipse-challenge13.log`
+  lines 1154–1176); `native_measure` has graduated from documented-unbound to the ACTIVE frontier — see the 🌐
+  bullet's VERDICTS + START-HERE-NEXT above); `native_addClasses(J[Ljava/lang/String;)V` /
   `native_removeClass(JLjava/lang/String;)V` / `native_getMatrix(JJ)Z` — declaration-only DEAD CODE (no invoker
   in any of the 3 installed dexes). No widget subclass re-declares any of the 9 (grep-verified) — the View-class
   bindings cover all callers by inheritance. Regression guards (plain `cargo test`):
@@ -207,7 +330,9 @@ before any history-rewriting/force operation.
   ← the engine's getText() poll; `isFocused()` serves only the former) stayed silent — per the recorded decision
   the records stay deliberately un-unified (unify only if the WARN ever fires NEXT TO a focus-gated misbehavior;
   ACTIVE_TEXT_FIELD is a last-getText()-caller heuristic whose export to `isFocused()` would create a
-  false-POSITIVE class). **⇐ START-HERE-NEXT: bind/back the installed framework's `android.webkit.WebView`
+  false-POSITIVE class). **⇐ START-HERE-NEXT (IMPLEMENTED 2026-07-02 + ✅ VALIDATED by the 2026-07-03 challenge13
+  boot + COMMITTED 2026-07-03 — see the 🌐 bullet above; the live frontier moved on to `View.native_measure`):
+  bind/back the installed framework's `android.webkit.WebView`
   native surface per the proven class-pattern** — discovery signal = the (c) `WebView.native_constructor` ULE.
   WebView is expected to be a REAL SUBSYSTEM (a challenge WebView must eventually load real web content), NOT
   another record-and-no-op widget — so the pass starts with the declared-vs-bound audit + scoping (the installed
@@ -5190,6 +5315,176 @@ challenge WebView must eventually load real web content), NOT another record-and
 starts with the declared-vs-bound audit + scoping (the installed WebView + its ATL backing), binds honestly what
 is servable, leaves LEFT-UNBOUND + documented whatever honesty would require a real web engine for, and lets the
 next boot reveal the boundary. An audit/plan workflow is already in flight this session (2026-07-02).
+
+---
+
+### 2026-07-02 — 🌐 The installed framework's `android.webkit.WebView` native surface audited + bound as a CLASS (the challenge9 `native_constructor` frontier): 3 declared natives (classes3-only, NO vendored drift), all 3 bound per-method best-effort — constructor = the shared view-registry peer, both loads = upstream-ATL-DEFAULT validated no-ops with redacted one-shot WARNs; UNCOMMITTED pending the challenge10 validation boot
+
+*Discovery evidence (the §5 📐 START-HERE-NEXT):* the challenge9 boot (`/tmp/eclipse-challenge9.log` lines
+1232–1256) died constructing the rbx.web challenge fragment's WebView child: `UnsatisfiedLinkError: No
+implementation found for long android.webkit.WebView.native_constructor(android.content.Context,
+android.util.AttributeSet)` — `View.<init>` invokes the INSTANCE `native_constructor`, which virtual-dispatches to
+WebView's OWN re-declaration, so the existing `android/view/View` registration cannot cover it (ART resolves
+natives per DECLARING class; the 2026-06-13 subclass-constructor precedent, where WebView was the one
+recorded-unbound declarer). Stack: `WebView.native_constructor` ← `View.<init>:87` ← `ViewGroup.<init>` ←
+`WebView.<init>` ← `nk.d.<init>` ← `com.roblox.client.hybrid.RBHybridWebView.<init>` ← `gi.a.<init>` ←
+`com.roblox.client.c.onCreateView` ← fragment machinery ← `Handler.dispatchMessage`.
+
+*Audit method (the 🎨/🖌️/📐 precedent, all first-party):* baksmali of the installed
+`~/.cache/eclipse/framework-patched/api-impl.jar` (all three dexes; artifacts kept under the 2026-07-02 session
+scratchpad `webview-audit/`, re-verified by the implementing pass). Findings: `android/webkit/WebView` is defined
+ONLY in classes3.dex (stock — NO overlay shadow, so first-dex-wins is moot, unlike View which classes2 shadows;
+the only webkit overlay presence is the classes.dex ValueCallback interface + the classes2.dex CookieManager, both
+2026-06-14, both plain Java); WebView declares EXACTLY 3 natives — the ONLY natives declared by ANY android/webkit
+class in ANY of the 3 dexes (`grep '^.method.*native'` over all webkit smali: 3 hits); **drift finding: NONE** —
+the vendored `vendor/atl/src/api-impl/android/webkit/WebView.java` declares the identical 3. The vendored ATL
+reference C (`vendor/atl/src/api-impl-jni/widgets/android_webkit_WebView.c`) supplied the reference semantics: its
+DEFAULT build path (env `ATL_UGLY_ENABLE_WEBVIEW` unset — an explicit upstream anti-fingerprinting choice)
+delegates `native_constructor` to `Java_android_view_View_native_1constructor` (a plain View peer = the stub
+WebView) and early-returns from BOTH load natives; only with the env var does it build WebKitGTK.
+
+*Audit table (every declared WebView native → disposition; all in `src/framework.rs`):*
+| # | native (sig, installed classes3 WebView.smali line) | disposition |
+|---|---|---|
+| 1 | `native_constructor` `(Landroid/content/Context;Landroid/util/AttributeSet;)J` (:378) | registry-backed HONEST: bind the EXISTING shared class-agnostic `view_native_constructor` on `android/webkit/WebView` — the return IS `View.widget` (`iput-wide` right after the call, ACTIVE classes2 View.smali:720-724) and is read back as the first `J` arg of every subsequent View/ViewGroup native, so it must be a live `view_registry` handle ≥ 1 (records the concrete class, e.g. `com.roblox.client.hybrid.RBHybridWebView`). NO new webview_registry (the 📐 "integrates, never duplicates" rule); deliberately NOT joined to `VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` (WebView also carries load natives the constructor-only array shape cannot host — a dedicated 3-entry registrar is strictly more surgical; the 2026-06-13 "can join the array when/if it surfaces" note is hereby superseded by THIS entry, append-only). Byte-faithful to upstream ATL's default (reference C delegates to the same View native) |
+| 2 | `native_loadUrl` `(JLjava/lang/String;)V` (:51; sole invoker `loadUrl`, :373, invoke-direct, no move-result) | validated no-op + redacted one-shot WARN: write-only — no reader on ANY path (the installed WebView has NO getUrl/getTitle/getProgress; the `internalLoadChanged` upcall target has ZERO Java invokers in any dex — dead under the no-op backing), so the CheckBox rule has no coupled getter to violate; upstream ATL's DEFAULT is literally this exact no-op (reference-default fidelity = the load-bearing honesty argument). Widget handle validated against view_registry (stale/0 → warn + return, never throw); one-shot `tracing::warn!` (own AtomicBool, the FOCUS_DIVERGENCE_WARNED pattern; target `android.webkit.WebView`) states plainly there is no web engine and content will not load; later calls `debug!` |
+| 3 | `native_loadDataWithBaseURL` `(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (:48; sole invoker `loadDataWithBaseURL`, :318, invoke-direct/range; `loadData` routes here with baseUrl/history hardcoded `"about:blank"`, :238/:240/:250) | validated no-op + its OWN one-shot WARN (so the log distinguishes WHICH load entry the app used): same write-only/no-reader/upstream-default basis; logs mime + the REDACTED baseUrl only — the `data` payload (inline challenge HTML, possibly token-bearing) is NEVER bound to any log macro at any level |
+
+*Redaction spec decision (the review's must-fix 1, folded in before implementation):* all WebView url logging
+routes through the new pure helper `url_scheme_and_host_for_log` with the TIGHTENED contract — (1) the literal
+`"://"` is REQUIRED (absent → the safe literal `"<non-url>"` — covers `about:blank`, the GUARANTEED loadData-path
+input, and payload-bearing `data:` URLs); (2) the text before the FIRST `"://"` must be a valid RFC-3986 scheme
+(ASCII letter first, then only alphanumerics/`+`/`-`/`.`) — closes the embedded-`"://"` shape where a `data:`
+payload contains `https://…?token=…` (payload text before the separator fails the charset rule → `"<non-url>"`,
+never a payload substring); (3) the authority is cut at the FIRST of `/`, `?`, `#` (a path-less
+`https://host?token=SECRET` yields exactly `https://host`); (4) userinfo is stripped at the LAST `@` within that
+bounded authority only (a port stays). Hand-rolled ~20 lines, no new dependency (a `url` crate for one log line
+fails pure-Rust/no-bloat). Dated privacy comment at the helper; typed credentials never flow here but the
+redaction rule is absolute.
+
+*What stays out (the recorded boundary):* nothing on `android/webkit/WebView` itself is left unbound — the
+boundary is BEHAVIORAL, not a missing binding: there is NO web engine (WebKitGTK, ATL's reference backing, is GTK
+— banned by the no-GTK/low_4gb constraint), so `internalLoadChanged` never fires, `WebViewClient.onPageStarted/
+onPageFinished` never run, web content NEVER loads, and the login challenge CANNOT COMPLETE via this pass (the
+recorded hard ceiling; expected shape = fragment constructs ULE-free → ~60 s challenge timeout → recovery to
+LoginV2). The real-web-content question (an owned minimal renderer vs a non-GTK embedding) is an OWNER-LEVEL
+architectural decision, deliberately not started. Known out-of-scope leak channel: the installed `WebView.loadUrl`
+`System.out.println`s the FULL URL for `javascript:` URLs BEFORE the native (smali :329–:367) — a framework-dex
+channel Eclipse's redaction cannot touch; overlay-patch it ONLY on challenge10 evidence of secrets flowing there.
+Watch-only divergences (untouched): `getSettings()` returns a NEW `WebSettings` per call (AOSP: per-view
+singleton); the WebSettings UA getters return the literal "GDPR VIOLATION" (a potential server-side
+challenge-behavior variable).
+
+*Review dispositions (adversarial plan review, verdict fix-then-ship — both must-fixes folded into the plan
+revision BEFORE implementation):* must-fix 1 (the redaction helper was underspecified for `about:blank` /
+payload-bearing `data:` URLs / path-less query URLs) → the tightened spec + test shapes above; must-fix 2 (boot
+watch (a) relied on the `allocated non-GTK view-registry peer` line, which is `tracing::debug!` at the INFO-default
+boots — 0 occurrences in challenge9) → (a) amended to zero-constructor-ULE + the downstream one-shot load WARN as
+the positive construction signal, with the optional `RUST_LOG="info,android.view.View=debug"` directive documented
+under its CORRECT target. Low findings: the javascript:-println leak channel recorded out-of-scope + the (e)
+privacy grep scoped to Eclipse's own target-prefixed lines; step-6 comment hygiene clarified (there was never an
+in-code "WebView can join the array" note — grep-verified; a NEW dated line was added to the
+`VIEW_SUBCLASS_CONSTRUCTOR_CLASSES` section comment and the 2026-06-13 §6 note is superseded only by this entry);
+the "attrs=null ⇒ zero further native calls after the constructor" claim verified watch-only (every attr-gated
+native on that tail is already bound).
+
+*Diff-review fix (2026-07-02, adversarial review of the uncommitted implementation diff, verdict fix-then-ship —
+folded in before ship):* the swallowed `try_to_string` Err arms in BOTH load-native bodies (url; baseUrl AND mime)
+now `exception_check` → `exception_describe` → `exception_clear` any pending Java exception (the `openAssetFd`
+house pattern) before falling back to the safe literal — a pending `GetStringUTFChars` OOM would otherwise precede
+the next JNI call in `loadDataWithBaseURL` (JNI-illegal outside the safe subset) and escape the "validated no-op"
+back into Java as exactly the `Handler.dispatchMessage` fragment-kill shape this pass exists to avoid. Also per the
+review's info finding: the `"<non-url>"` safe literal is hoisted to one module const (`NON_URL`) shared by the
+redaction helper and both bodies' null/error fallbacks, so the log vocabulary cannot drift. Gate re-run green
+after the fix.
+
+*Regression guards (plain `cargo test`, no APK/display/boot, all in the existing framework.rs test module):*
+`web_view_native_names_sigs_and_class_match_the_installed_dex` (the class + all 3 name/sig pairs against the
+installed-dex truth + the shared-constructor decision, mirroring the Paint pin test);
+`url_scheme_and_host_for_log_serves_scheme_and_host_only_and_never_query_payload_or_credentials` (the
+review-mandated shapes: `about:blank` → `<non-url>`; payload-bearing AND embedded-`://` `data:` URLs →
+`<non-url>` with no payload substring asserted; `https://host?token=SECRET` → exactly `https://host`; userinfo
+stripped; path/fragment cut; garbage/empty total);
+`view_subclass_constructor_classes_are_slashed_internal_names` extended with the dated assert that
+`android/webkit/WebView` is NOT in the array (it is bound by its own registrar because it also carries load
+natives — prevents a future double-registration). Registration-PRESENCE guard = the challenge10 live boot's
+`bound=3` line (house convention — RegisterNatives only surfaces under live ART).
+
+*Gate:* green — `cargo fmt --all` / `cargo build --all-targets` / `cargo clippy --all-targets --all-features
+-- -D warnings` / `cargo test` (**593 unit + 4 integ + 2 doctest**, 0 failed) / `cargo build --release`.
+
+*Status:* UNCOMMITTED, validation boot PENDING (the challenge10 boot-watch (a)–(e) list lives in the §5 🌐
+bullet; recipe = the identical 180 s challenge9 re-drive; no overlay change this pass — the installed framework
+jar is untouched, so a fresh existing cache needs no rebuild).
+
+### 2026-07-03 — 🌐 Validation-boot verdict on the WebView pass: ALL boot-watch items CONFIRMED — the `WebView.native_constructor` ULE is GONE (`bound=3`), the challenge WebView CONSTRUCTS + is load-driven to the challenge URL (redaction held on the REAL URL), and the NEW frontier is the 📐-documented-unbound `View.native_measure` (the challenge fragment's Toolbar → ActionMenuView measure); WebView pass committed with this entry. Records the OWNER-LEVEL inflection: native-binding the challenge fragment is approaching its ceiling (no web engine).
+
+*Boot:* `/tmp/eclipse-challenge13.log`, 1296 lines, window 2026-07-03 00:12–00:14 UTC, EXIT=124 clean 180 s
+timeout kill. Recipe = the challenge9 re-drive with a RE-CALIBRATED stage-0 tap (see *Boot-recipe drift* below);
+src/framework.rs unchanged from the implement pass (§6 2026-07-02 🌐), so the gate is the identical **593 unit +
+4 integ + 2 doctest**.
+
+*Verdicts (each grep-verified against the log):* **(a) CONFIRMED** — `WebView.native_constructor` ULE GONE: zero
+`UnsatisfiedLinkError`/`No implementation found` for it (only occurrence = the registration line 171); the whole
+log has exactly 2 `No implementation found` lines, BOTH the same single `View.native_measure` event (java_vm_ext.cc:1130
+line 1154 + exception line 1155). **(b) CONFIRMED** — line 171: `registered Eclipse's non-GTK backing for the
+android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL =
+validated no-ops, upstream-ATL-default semantics — no web engine, content will not load) (per-method best-effort)
+bound=3`. **(c) CONFIRMED — the predicted positive construction signal FIRED** (line 1149): `WARN
+android.webkit.WebView: WebView.native_loadUrl: no web engine — content will not load (validated no-op,
+upstream-ATL-default semantics; target redacted to scheme+host) widget=4294967370 target=https://www.roblox.com`
+— the WebView CONSTRUCTED (widget=4294967370, a live `view_registry` handle ≥ 1) AND the app drove it to loadUrl
+the challenge URL; one-shot WARN semantics + redaction proven live. **(d) PRIVACY ABSOLUTE HELD** — the only
+`target=` line is exactly `https://www.roblox.com` (scheme+host only — no path/query/token); `url_scheme_and_host_for_log`
+redacted the REAL challenge URL; no full URL / query / `@`-userinfo / loadData payload on any Eclipse-owned
+(android.webkit.WebView-target) line. **(e) NEW FRONTIER — `View.native_measure(long,int,int)` ULE** (lines
+1154–1176, the ONLY remaining unbound native on the path). Full stack: `View.native_measure(Native Method)` ←
+`View.onMeasure(Unknown Source:26)` ← `View.measure(Unknown Source:19)` ← `androidx.appcompat.widget.a.i(Unknown
+Source:81)` ← `androidx.appcompat.view.menu.e.c(Unknown Source:10)` ← `androidx.appcompat.widget.ActionMenuView.getMenu(Unknown
+Source:55)` ← `androidx.appcompat.widget.Toolbar.j(Unknown Source:13)` ← `androidx.appcompat.widget.Toolbar.getMenu(Unknown
+Source:0)` ← `yh.d.onCreateView(Unknown Source:246)` ← `yh.k.onCreateView` ← `Fragment.performCreateView` →
+`FragmentManager` machinery ← `Handler.handleCallback` ← `Handler.dispatchMessage` (framework lifecycle step
+failed 00:13:04.725, line 1176) — the CHALLENGE FRAGMENT's Toolbar measuring its ActionMenuView (menu). This is
+the EXACT native the 📐 View pass deliberately left unbound (a real content-measure whose `setMeasuredDimension`
+is read back via `getMeasuredWidth()/Height()`); the WebView audit predicted it as next-ULE #3.
+
+*Fragment advance:* `yh.d.onCreateView` moved from `:237` (challenge9, WebView.native_constructor) to `:246`
+(challenge13, Toolbar.getMenu → measure) — binding WebView unblocked the fragment further. Challenge chain
+(verifiable): onAppReady LoginV2 00:12:40 (line 1042) → 403 "Challenge is required to authorize the request"
+00:13:00 (line 1114) → onAppReady ChallengeNativeWrapper 00:12:51.873 (line 1118) → ChallengeHybridWebView
+00:12:51.957 (line 1122) → WebView constructs + loadUrl 00:13:03 → native_measure ULE 00:13:04 → recover to
+onAppReady LoginV2 00:13:51 (line 1245, the ~47 s challenge timeout) → engine alive to the 180 s kill (last line
+00:14:50, LuaAppStarterScript still running, vk-overlay probe still firing). Baseline UNCHANGED vs challenge9: 0
+`NullPointerException`; `StreamCorruptedException` 2 hits; jni_internal Canvas class dump 78 lines; a single
+survivable signal-11 bookkeeping line; the known applyStyle `inflate(0x0)` upgrade-dialog `Resources$NotFoundException`
+"Unable to find resource ID #0x0" 1 hit.
+
+*OWNER-LEVEL DECISION now on the critical path (recorded, NOT decided):* the challenge fragment now inflates its
+`ChallengeHybridWebView` and the app drives it to load `https://www.roblox.com` challenge content — but Eclipse
+has NO web engine (the recorded hard ceiling), so an Arkose/FunCaptcha-style WEB challenge can never RENDER or
+COMPLETE via native-binding alone. `native_measure` is bindable (the next pass, will unblock the toolbar + reveal
+the next native), but binding the View surface CANNOT make the challenge COMPLETE — native-binding progress on the
+challenge fragment is approaching its ceiling. The gating choice is the owner's: (a) integrate a real web engine
+for the challenge WebView (an owned minimal renderer vs a non-GTK embedding — WebKitGTK is banned by the
+no-GTK/low_4gb constraint; an embedded browser needs a pure-Rust/no-bloat justification cycle), or (b) find a
+non-web login/challenge path.
+
+*Boot-recipe drift (durable):* the challenge9 stage-0 tap `ECLIPSE_SYNTHETIC_ENGINE_TAP="419,531"` NO LONGER
+reaches the login screen — challenges 10/11/12 all STALLED at `onAppReady: Landing` (the synthetic focus-tap
+retried ~20× and never focused; LoginV2 never opened) because the engine-drawn Landing screen is a SERVER-DRIVEN
+Lua UI that DRIFTS across sessions. Diagnosed by an `ECLIPSE_VK_SCREENSHOT=1 ECLIPSE_VK_PROBE=1` boot writing
+`/tmp/eclipse_field_probe.png` (the full 800×600 frame == tap-coordinate space): the current Landing shows "Create
+Account" (~400,346) above "Sign In" (~400,413); the old 419,531 is now empty space below both. Re-calibrating
+stage-0 to `ECLIPSE_SYNTHETIC_ENGINE_TAP="400,413"` (the "Sign In" button center) drove challenge13 all the way
+through. ACCURACY POINT: a guest-cache wipe (`rm -rf /tmp/atl_cache/com.roblox.client`) tried before challenge12
+did NOT help (12 stalled identically to 11) — the cause was the TAP COORDINATE / server-driven Landing layout,
+NOT persisted account state (the cache-wipe was a RED HERRING). The rest of the chain worked unchanged: stage-1
+`ECLIPSE_SYNTHETIC_TYPE="278,179:robloxtest"`, stage-3 NEXT `400,236`, stage-4 TYPE2 password, stage-5 SUBMIT
+`349,377` — only stage-0 drifted this session.
+
+*Status:* COMMITTED 2026-07-03. Regression guards unchanged from the implement pass (the 3 plain-`cargo test`
+pins); the live-boot `bound=3` line is the registration-presence guard (house convention — RegisterNatives only
+surfaces under live ART).
 
 ---
 
