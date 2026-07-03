@@ -8901,6 +8901,10 @@ fn register_surface_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
 //   * `PopupWindow` is excluded: its `native_constructor` is ZERO-ARG `()J` (PopupWindow.java:177) and
 //     it is NOT a View — pointing it at the shared `(Context, AttributeSet)J` body would be both wrong
 //     arity and wrong type. It gets its own distinct body if/when it traps.
+//   * 2026-07-02: `android/webkit/WebView` is deliberately NOT in this array — it re-declares the same
+//     `(Context, AttributeSet)J` constructor (the challenge9 ULE) but ALSO carries load natives
+//     (`native_loadUrl`/`native_loadDataWithBaseURL`) this constructor-only array shape cannot host,
+//     so it is bound by its own `register_web_view_natives`; see the pin test.
 
 /// Internal/slashed class names of the concrete, LayoutInflater-instantiable `android.widget.*` View
 /// subclasses that RE-declare `native_constructor(Context, AttributeSet)J` and therefore each need the
@@ -8967,6 +8971,301 @@ fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), Frame
             "registered Eclipse's non-GTK backing for native_constructor on inflatable View subclass (per-method best-effort)"
         );
     }
+    Ok(())
+}
+
+// === Eclipse's own (non-GTK) backing for android.webkit.WebView ==================================
+//
+// 2026-07-02: the challenge9 boot (/tmp/eclipse-challenge9.log lines 1232–1256) died constructing
+// the rbx.web challenge fragment's WebView child: `No implementation found for long
+// android.webkit.WebView.native_constructor(android.content.Context, android.util.AttributeSet)` —
+// `View.<init>` invokes the INSTANCE `native_constructor`, which virtual-dispatches to WebView's
+// OWN re-declaration, so the `android/view/View` class registration cannot cover it (ART resolves
+// natives per DECLARING class; the 2026-06-13 subclass-constructor precedent). Audit of the
+// INSTALLED framework (baksmali of ~/.cache/eclipse/framework-patched/api-impl.jar, 2026-07-02):
+// WebView is defined ONLY in classes3.dex (no overlay shadow) and declares EXACTLY 3 natives — the
+// ONLY natives declared by ANY android/webkit class in ANY of the 3 dexes (grep-verified); the
+// vendored WebView.java declares the identical 3 (NO drift):
+//   * `native_constructor(Landroid/content/Context;Landroid/util/AttributeSet;)J` (WebView.smali
+//     :378) — the return IS `View.widget` (`iput-wide` right after the call, active classes2
+//     View.smali:720-724), read back as the first `J` arg of every subsequent View/ViewGroup
+//     native, so it must be a live [`view_registry`] handle ≥ 1: the shared class-agnostic
+//     [`view_native_constructor`] is the honest backing (records the concrete class, e.g.
+//     `com.roblox.client.hybrid.RBHybridWebView`).
+//   * `native_loadUrl(JLjava/lang/String;)V` (smali:51) + `native_loadDataWithBaseURL(JLjava/lang/
+//     String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (smali:48) — write-only:
+//     invoke-direct, no move-result, no reader on any path (the installed WebView has NO
+//     getUrl/getTitle/getProgress at all, and the `internalLoadChanged` upcall target has ZERO Java
+//     invokers in any dex — dead under the no-op backing), so validated no-ops.
+//
+// 2026-07-02: REFERENCE-DEFAULT FIDELITY is the load-bearing honesty argument for all three
+// dispositions: upstream ATL's own DEFAULT build (env ATL_UGLY_ENABLE_WEBVIEW unset —
+// vendor/atl/src/api-impl-jni/widgets/android_webkit_WebView.c) delegates `native_constructor` to
+// `Java_android_view_View_native_1constructor` (a plain View peer) and early-returns from BOTH load
+// natives with WebKitGTK disabled. Eclipse's stub WebView is not a workaround — it is the exact
+// semantics of the framework the installed dex was built for.
+//
+// HARD CEILING (recorded in AGENTS.md §5): there is NO web engine — WebKitGTK (ATL's reference
+// backing) is GTK, banned by the no-GTK/low_4gb constraint — so web content NEVER loads through
+// these bindings and the login challenge cannot COMPLETE via this pass; the fragment constructs,
+// the app waits out its ~60 s challenge timeout, and recovers to LoginV2 (the observed shape). A
+// real web-content phase is a separate owner-level architectural decision, deliberately NOT
+// started here.
+
+/// `android.webkit.WebView` (internal/slashed name for `find_class`) — hosts the 3 WebView natives.
+pub const WEB_VIEW_CLASS: &JNIStr = jni_str!("android/webkit/WebView");
+
+// JNI names + descriptors for the two WebView load natives, from the installed classes3.dex
+// WebView.smali (lines 51/48, baksmali 2026-07-02). Sole invokers: `WebView.loadUrl` (smali:373)
+// and `WebView.loadDataWithBaseURL` (smali:318), both invoke-direct on `this.widget`, no
+// move-result. The constructor binding reuses the shared `VIEW_NATIVE_CONSTRUCTOR_NAME`/`_SIG`
+// (WebView.smali:378 declares the identical signature).
+const WEB_VIEW_NATIVE_LOAD_URL_NAME: &JNIStr = jni_str!("native_loadUrl");
+const WEB_VIEW_NATIVE_LOAD_URL_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
+const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_NAME: &JNIStr =
+    jni_str!("native_loadDataWithBaseURL");
+const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG: &JNIStr =
+    jni_str!("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+
+/// The safe literal every unparseable/null/unreadable WebView log target redacts to — one const so
+/// the log vocabulary cannot drift between the helper and the native bodies' fallbacks (2026-07-02).
+const NON_URL: &str = "<non-url>";
+
+/// Redact a URL down to `scheme://host` for logging — the ONLY form a WebView target may take in
+/// Eclipse's log. Returns the safe literal [`NON_URL`] for anything that does not parse.
+///
+/// 2026-07-02: challenge URLs may carry session tokens — scheme+host only, never
+/// path/query/userinfo/payload; `loadDataWithBaseURL` data payloads are never logged at any level.
+/// The rules (each closes a verified leak shape; see the redaction test):
+///   1. The literal `"://"` is REQUIRED — absent → `"<non-url>"`. Covers `about:blank` (a
+///      GUARANTEED input: the installed `loadData` hardcodes it as baseUrl/history, WebView.smali
+///      :238/:240) and payload-bearing `data:` URLs (no `"://"` → the payload can never leak).
+///   2. The text before the FIRST `"://"` must be a valid RFC 3986 scheme (ASCII letter first,
+///      then only ASCII alphanumerics/`+`/`-`/`.`) — otherwise `"<non-url>"`. Closes the
+///      embedded-`"://"` shape: a `data:` payload containing `https://…` has payload text (invalid
+///      scheme chars) before its first `"://"`, so no payload substring is ever emitted.
+///   3. The authority is cut at the FIRST of `'/'`, `'?'`, `'#'` after `"://"` — a path-less
+///      `https://host?token=SECRET` yields exactly `https://host`.
+///   4. Userinfo is stripped at the LAST `'@'` within that bounded authority only
+///      (`https://user:pass@host/x` → `https://host`); a port, if present, stays (not sensitive).
+fn url_scheme_and_host_for_log(url: &str) -> String {
+    let Some(sep) = url.find("://") else {
+        return NON_URL.to_string();
+    };
+    let scheme = &url[..sep];
+    let mut chars = scheme.chars();
+    let scheme_valid = match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {
+            chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        _ => false,
+    };
+    if !scheme_valid {
+        return NON_URL.to_string();
+    }
+    let rest = &url[sep + 3..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    format!("{scheme}://{host}")
+}
+
+/// `WebView.native_loadUrl(long widget, String url)` → validate the handle; no-op (2026-07-02).
+/// INSTANCE native, descriptor `(JLjava/lang/String;)V`; sole invoker `WebView.loadUrl`
+/// (WebView.smali:373). Write-only — no move-result, no reader on any path (see the section note) —
+/// and upstream ATL's DEFAULT is this exact no-op (reference-default fidelity), so the honest
+/// backing validates the handle and no-ops. Discovery diagnostic: a one-shot WARN (the
+/// `FOCUS_DIVERGENCE_WARNED` pattern) states plainly that there is no web engine and content will
+/// not load; subsequent calls log at debug. ALL url logging routes through
+/// [`url_scheme_and_host_for_log`] — never the full URL (challenge URLs may carry session tokens).
+extern "system" fn web_view_native_load_url<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    url: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                error = %e,
+                "WebView.native_loadUrl: invalid view handle (ignored)"
+            );
+            return Ok(());
+        }
+        // 2026-07-02: redact BEFORE any logging; a null/unreadable jstring is treated as a
+        // non-URL rather than propagating (the load is a no-op either way). A failed conversion
+        // can leave a pending Java exception (GetStringUTFChars can OOM) — describe+clear it (the
+        // openAssetFd precedent) so the no-op stays total and never throws back into Java.
+        let target = if url.is_null() {
+            NON_URL.to_string()
+        } else {
+            match url.try_to_string(env) {
+                Ok(u) => url_scheme_and_host_for_log(&u),
+                Err(_) => {
+                    if env.exception_check() {
+                        env.exception_describe();
+                        env.exception_clear();
+                    }
+                    NON_URL.to_string()
+                }
+            }
+        };
+        static LOAD_URL_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOAD_URL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                %target,
+                "WebView.native_loadUrl: no web engine — content will not load (validated no-op, \
+                 upstream-ATL-default semantics; target redacted to scheme+host)"
+            );
+        } else {
+            tracing::debug!(
+                target: "android.webkit.WebView",
+                widget,
+                %target,
+                "WebView.native_loadUrl: no web engine (validated no-op)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `WebView.native_loadDataWithBaseURL(long widget, String baseUrl, String data, String mime,
+/// String encoding)` → validate the handle; no-op (2026-07-02). INSTANCE native; sole invoker
+/// `WebView.loadDataWithBaseURL` (WebView.smali:318 — `loadData` routes here with baseUrl/history
+/// hardcoded `"about:blank"`, smali:238/:240, which redacts to `"<non-url>"` — correct and
+/// expected). Write-only + upstream-ATL-default no-op, exactly as [`web_view_native_load_url`].
+/// PRIVACY: the `data` payload (inline challenge HTML, possibly token-bearing) is NEVER read or
+/// bound to any log macro at any level; only mime + the redacted baseUrl are logged.
+extern "system" fn web_view_native_load_data_with_base_url<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    base_url: JString<'local>,
+    _data: JString<'local>,
+    mime: JString<'local>,
+    _encoding: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if let Err(e) = view_registry::with_view(widget, |_v| ()) {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                error = %e,
+                "WebView.native_loadDataWithBaseURL: invalid view handle (ignored)"
+            );
+            return Ok(());
+        }
+        // 2026-07-02: as in native_loadUrl, a failed try_to_string can leave a pending Java
+        // exception — describe+clear it (openAssetFd precedent) before the fallback; letting it
+        // pend would make the NEXT JNI call (the mime conversion below) illegal and would throw
+        // the "validated no-op" back into Java.
+        let base = if base_url.is_null() {
+            NON_URL.to_string()
+        } else {
+            match base_url.try_to_string(env) {
+                Ok(u) => url_scheme_and_host_for_log(&u),
+                Err(_) => {
+                    if env.exception_check() {
+                        env.exception_describe();
+                        env.exception_clear();
+                    }
+                    NON_URL.to_string()
+                }
+            }
+        };
+        // The mime type is not sensitive (the Java side already truncates it at ';'); a null mime
+        // is a legal AOSP call shape.
+        let mime = if mime.is_null() {
+            String::from("<none>")
+        } else {
+            match mime.try_to_string(env) {
+                Ok(m) => m,
+                Err(_) => {
+                    if env.exception_check() {
+                        env.exception_describe();
+                        env.exception_clear();
+                    }
+                    String::from("<none>")
+                }
+            }
+        };
+        static LOAD_DATA_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOAD_DATA_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                %base,
+                %mime,
+                "WebView.native_loadDataWithBaseURL: no web engine — content will not load \
+                 (validated no-op, upstream-ATL-default semantics; baseUrl redacted, data payload \
+                 never logged)"
+            );
+        } else {
+            tracing::debug!(
+                target: "android.webkit.WebView",
+                widget,
+                %base,
+                %mime,
+                "WebView.native_loadDataWithBaseURL: no web engine (validated no-op)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own (non-GTK) backing for `android.webkit.WebView`'s natives (2026-07-02).
+///
+/// Registered before step 4, right after the inflatable-widget constructor batch, because ART
+/// resolves natives per DECLARING class and WebView re-declares View's `native_constructor` — the
+/// challenge9 ULE (see the section note). The constructor is the shared class-agnostic
+/// [`view_native_constructor`] (registry-backed honest — the return becomes `View.widget`); the two
+/// load natives are validated no-ops with a redacted one-shot WARN each (upstream-ATL-default
+/// semantics — no web engine, content will not load; the section note's hard ceiling).
+///
+/// # Safety / soundness
+/// Each fn pointer matches its declared JNI signature by construction (pin test
+/// `web_view_native_names_sigs_and_class_match_the_installed_dex`); every body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // SAFETY (per entry): each fn matches its paired descriptor from the installed classes3.dex
+    // WebView.smali (baksmali 2026-07-02) — `native_constructor`
+    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` (smali:378, instance — the shared
+    // class-agnostic view_native_constructor body), `native_loadUrl` `(JLjava/lang/String;)V`
+    // (smali:51, instance), `native_loadDataWithBaseURL`
+    // `(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (smali:48,
+    // instance).
+    let bindings: [NativeBinding; 3] = [
+        (
+            VIEW_NATIVE_CONSTRUCTOR_NAME,
+            VIEW_NATIVE_CONSTRUCTOR_SIG,
+            view_native_constructor as *mut c_void,
+        ),
+        (
+            WEB_VIEW_NATIVE_LOAD_URL_NAME,
+            WEB_VIEW_NATIVE_LOAD_URL_SIG,
+            web_view_native_load_url as *mut c_void,
+        ),
+        (
+            WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_NAME,
+            WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG,
+            web_view_native_load_data_with_base_url as *mut c_void,
+        ),
+    ];
+    let bound = register_class_natives_best_effort(env, WEB_VIEW_CLASS, &bindings)?;
+    tracing::info!(
+        bound,
+        "registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL = validated no-ops, upstream-ATL-default semantics — no web engine, content will not load) (per-method best-effort)"
+    );
     Ok(())
 }
 
@@ -13958,6 +14257,13 @@ fn drive_lifecycle(
     // ActivityNativeMain content layout hit ProgressBar this way, live boot 2026-06-13). Each reuses
     // the class-agnostic View constructor backing (records the concrete subclass in the tree).
     register_view_subclass_constructor_natives(env)?;
+    // Bind android.webkit.WebView's natives on its own class — the rbx.web challenge fragment
+    // constructs a WebView child (RBHybridWebView, challenge9 live boot 2026-07-02, log lines
+    // 1232–1256) and ART resolves natives per declaring class (WebView re-declares View's
+    // native_constructor and adds two load natives), so this must be bound before step 4 per the
+    // uniform house ordering. Constructor = the shared view-registry backing; the load natives are
+    // validated no-ops (upstream-ATL-default semantics — no web engine).
+    register_web_view_natives(env)?;
     // Bind the inflatable android.widget.* property-setter natives on their OWN declaring classes —
     // once each widget's native_constructor (above) lets LayoutInflater build the content view, the
     // widgets' own setters surface one at a time (the trigger was ProgressBar.native_setIndeterminate,
@@ -16607,6 +16913,120 @@ mod tests {
         // stay OUT of this (Context, AttributeSet)J-signature set.
         assert!(!names.iter().any(|n| n == "android/widget/CompoundButton"));
         assert!(!names.iter().any(|n| n == "android/widget/PopupWindow"));
+        // 2026-07-02: android/webkit/WebView is deliberately NOT in this array — it re-declares the
+        // same (Context, AttributeSet)J constructor but ALSO carries load natives
+        // (native_loadUrl/native_loadDataWithBaseURL) this constructor-only array shape cannot host,
+        // so it is bound by its own register_web_view_natives (all 3 natives in one best-effort
+        // array). Adding it here too would double-register the constructor.
+        assert!(!names.iter().any(|n| n == "android/webkit/WebView"));
+    }
+
+    #[test]
+    fn web_view_native_names_sigs_and_class_match_the_installed_dex() {
+        // Pin android.webkit.WebView's class + the 3 native name/JNI-descriptor pairs against the
+        // INSTALLED framework truth (baksmali of ~/.cache/eclipse/framework-patched/api-impl.jar
+        // classes3.dex WebView.smali lines 48/51/378, 2026-07-02 — WebView is defined ONLY in
+        // classes3.dex, no overlay shadow; these 3 are the ONLY natives declared by ANY
+        // android/webkit class in ANY of the 3 dexes, grep-verified; the vendored WebView.java
+        // declares the identical 3, no drift). A transcription regression would make
+        // RegisterNatives skip the entry (per-method best-effort WARN) and re-open the challenge9
+        // UnsatisfiedLinkError at boot. Host-independent constants.
+        assert_eq!(WEB_VIEW_CLASS.to_str(), "android/webkit/WebView");
+        // The constructor binding is DELIBERATELY the SHARED class-agnostic view_native_constructor
+        // (registry-backed honest: the returned long becomes View.widget — iput-wide right after the
+        // call in the active classes2 View.smali — and is read back as the handle by every
+        // subsequent View/ViewGroup native). No separate WebView registry exists on purpose; this is
+        // also byte-faithful to upstream ATL's DEFAULT (its reference C delegates to
+        // Java_android_view_View_native_1constructor with WebKitGTK disabled).
+        assert_eq!(VIEW_NATIVE_CONSTRUCTOR_NAME.to_str(), "native_constructor");
+        assert_eq!(
+            VIEW_NATIVE_CONSTRUCTOR_SIG.to_str(),
+            "(Landroid/content/Context;Landroid/util/AttributeSet;)J"
+        );
+        // The two load natives (validated no-ops, upstream-ATL-default semantics — no web engine;
+        // internalLoadChanged is deliberately dead under this backing: zero Java invokers exist).
+        assert_eq!(WEB_VIEW_NATIVE_LOAD_URL_NAME.to_str(), "native_loadUrl");
+        assert_eq!(
+            WEB_VIEW_NATIVE_LOAD_URL_SIG.to_str(),
+            "(JLjava/lang/String;)V"
+        );
+        assert_eq!(
+            WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_NAME.to_str(),
+            "native_loadDataWithBaseURL"
+        );
+        assert_eq!(
+            WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG.to_str(),
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
+        );
+    }
+
+    #[test]
+    fn url_scheme_and_host_for_log_serves_scheme_and_host_only_and_never_query_payload_or_credentials(
+    ) {
+        // 2026-07-02: the WebView load natives' privacy guard — challenge URLs may carry session
+        // tokens and loadDataWithBaseURL baseUrls may be data: payloads, so every logged target must
+        // reduce to scheme+host (or the safe literal "<non-url>"). Each case below is a verified
+        // leak shape from the plan review; a regression here logs secrets to the boot log.
+        //
+        // The happy path: path/query/fragment stripped, host kept.
+        assert_eq!(
+            url_scheme_and_host_for_log("https://apps.roblox.com/challenge/verify?token=SECRET"),
+            "https://apps.roblox.com"
+        );
+        // Userinfo stripped (last '@' within the bounded authority); port survives.
+        assert_eq!(
+            url_scheme_and_host_for_log("https://user:pass@host/x"),
+            "https://host"
+        );
+        assert_eq!(
+            url_scheme_and_host_for_log("https://host:8443/path#frag"),
+            "https://host:8443"
+        );
+        // Path-less query URL: the authority is cut at the FIRST of '/', '?', '#' — the query
+        // string (token) must never ride along as part of the "host".
+        assert_eq!(
+            url_scheme_and_host_for_log("https://host?token=SECRET"),
+            "https://host"
+        );
+        // about:blank — a GUARANTEED input: the installed loadData hardcodes it as the
+        // baseUrl/history args (classes3 WebView.smali :238/:240/:250). No "://" → "<non-url>".
+        assert_eq!(url_scheme_and_host_for_log("about:blank"), "<non-url>");
+        // A payload-bearing data: URL — no "://" → "<non-url>"; the payload never leaks.
+        let plain_data = url_scheme_and_host_for_log("data:text/html,<html>SECRET</html>");
+        assert_eq!(plain_data, "<non-url>");
+        assert!(!plain_data.contains("SECRET"));
+        // The embedded-"://" shape: the first "://" sits INSIDE the payload, so the text before it
+        // fails the RFC 3986 scheme-charset rule → "<non-url>", never a payload substring.
+        let embedded = url_scheme_and_host_for_log(
+            "data:text/html,<a href=\"https://x?token=SECRET\">click</a>",
+        );
+        assert_eq!(embedded, "<non-url>");
+        assert!(!embedded.contains("SECRET"));
+        // Garbage / empty / scheme-less inputs → "<non-url>" (total, never panics).
+        assert_eq!(url_scheme_and_host_for_log(""), "<non-url>");
+        assert_eq!(url_scheme_and_host_for_log("no scheme here"), "<non-url>");
+        assert_eq!(url_scheme_and_host_for_log("://host"), "<non-url>");
+        assert_eq!(url_scheme_and_host_for_log("1https://host"), "<non-url>");
+        // No output ever contains a query, fragment, userinfo marker, path segment, or the
+        // sensitive literals from the inputs above.
+        for input in [
+            "https://apps.roblox.com/challenge/verify?token=SECRET",
+            "https://user:pass@host/x",
+            "https://host?token=SECRET",
+            "about:blank",
+            "data:text/html,<html>SECRET</html>",
+            "data:text/html,<a href=\"https://x?token=SECRET\">click</a>",
+        ] {
+            let out = url_scheme_and_host_for_log(input);
+            assert!(
+                !out.contains('?') && !out.contains('#') && !out.contains('@'),
+                "redacted output {out:?} for {input:?} leaked a query/fragment/userinfo marker"
+            );
+            assert!(
+                !out.contains("SECRET") && !out.contains("pass") && !out.contains("/challenge"),
+                "redacted output {out:?} for {input:?} leaked a sensitive substring"
+            );
+        }
     }
 
     #[test]
