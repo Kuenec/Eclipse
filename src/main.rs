@@ -130,6 +130,25 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Hidden dev-host diagnostic (NOT in HELP, 2026-07-03 web-engine plan M3): the FIRST
+        // ART-booting hidden subcommand — boot ART with the installed framework on the classpath
+        // (main thread, like `run`; NO libroblox preload, NO app lifecycle, NO window), then drive
+        // the WebView engine pipeline end-to-end against the public https://www.roblox.com page:
+        // installed-dex Java loadUrl → registered native → spawn-and-forward → eclipse-webview
+        // helper → LoadState over the socket → REAL internalLoadChanged(0/3) JNI upcalls
+        // (WebViewClient.onPageStarted/onPageFinished) → memfd frame staged in THIS process →
+        // CloseView/Shutdown with a clean helper reap. Prints a deterministic SUCCESS marker that
+        // tests/engine_milestones.rs guards. See src/webview/client.rs + framework::drive_webview_smoke.
+        Some("__webview-test") => match run_webview_test() {
+            Ok(report) => {
+                println!("__webview-test: {report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("__webview-test: {e}");
+                ExitCode::FAILURE
+            }
+        },
         // Hidden dev-host diagnostic (NOT in HELP): drive the REAL OpenSL ES audio path end-to-end —
         // slCreateEngine → Realize → CreateOutputMix → CreateAudioPlayer (buffer-queue PCM source) →
         // SetPlayState(PLAYING) → Enqueue a generated 440 Hz sine PCM buffer, then confirm the cpal
@@ -472,6 +491,185 @@ fn preload_app_native_libs(
         loaded.len()
     );
     Ok(loaded)
+}
+
+/// The `__webview-test` result whose `Display` IS the deterministic SUCCESS marker line
+/// (guarded by `tests/engine_milestones.rs::webview_test_fires_load_upcalls_and_stages_frames`).
+struct WebViewTestReport {
+    upcalls_ok: u32,
+    started_ms: u128,
+    finished_ms: u128,
+    http: i32,
+    frame_w: u32,
+    frame_h: u32,
+    distinct: usize,
+}
+
+impl std::fmt::Display for WebViewTestReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WebView engine pipeline OK: internalLoadChanged upcalls {}/2 (state 0 @ {}ms, \
+             state 3 @ {}ms, http {}), frame {}x{} {} distinct pixels, ViewClosed, helper exit 0",
+            self.upcalls_ok,
+            self.started_ms,
+            self.finished_ms,
+            self.http,
+            self.frame_w,
+            self.frame_h,
+            self.distinct
+        )
+    }
+}
+
+/// `eclipse __webview-test` (2026-07-03, web-engine plan M3): the dev-host WebView pipeline
+/// smoke. Boots ART on THIS main thread with the installed framework + APK on the classpath
+/// (`android.webkit.WebView` must be the real installed class for the upcalls to dispatch), then
+/// verifies natives→socket→helper→memfd→staging + the real `internalLoadChanged` upcalls.
+///
+/// Deliberate scope (honest divergence recorded for the ship pass): the vk-overlay COMPOSITE
+/// branch only executes when the ENGINE presents through the interposed `vkQueuePresentKHR` —
+/// i.e. the full M6 libroblox boot — so this harness proves the staged frame has nonzero ink in
+/// the MAIN process and leaves the on-screen composite to the M6 live boot (its pure parts are
+/// unit-pinned). Loads ONLY the public https://www.roblox.com page (M1/M2 precedent) — never a
+/// challenge URL, no APK dex execution beyond framework classes.
+fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
+    use eclipse::webview::client;
+    use std::time::{Duration, Instant};
+    const TARGET_URL: &str = "https://www.roblox.com";
+    // Drive.rs deadline precedents (M2): load-start 30 s, load-finish 90 s, ink-settle 20 s.
+    const START_DEADLINE: Duration = Duration::from_secs(30);
+    const FINISH_DEADLINE: Duration = Duration::from_secs(90);
+    const UPCALL_DEADLINE: Duration = Duration::from_secs(10);
+    const INK_DEADLINE: Duration = Duration::from_secs(20);
+    const CLOSE_DEADLINE: Duration = Duration::from_secs(15);
+
+    let apk_path = eclipse::loader::init_run::find_roblox_apk().ok_or(
+        "no Roblox APK (set ECLIPSE_ROBLOX_APK or place it at the default dev-host path) — \
+         __webview-test boots ART with the installed framework on the classpath",
+    )?;
+    println!(
+        "# __webview-test: booting ART from {} (framework classpath; no libroblox preload, \
+         no lifecycle, no window)…",
+        apk_path.display()
+    );
+    let mut apk = eclipse::apk::Apk::open(&apk_path)?;
+    let manifest = apk.manifest()?;
+    let config = eclipse::config::Config::load()?;
+    let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
+    let vm = eclipse::runtime::boot(&plan, Some(apk_path.as_path()), None)?;
+    println!("# ART booted ✓ — driving the WebView smoke (register → alloc → setWebViewClient → loadUrl)…");
+    let handle = eclipse::framework::drive_webview_smoke(&vm, TARGET_URL)?;
+
+    // Poll the client's observations (the reader thread stages frames + fires the upcalls).
+    let fail_reason =
+        || client::failed_reason().map(|r| format!("web engine helper unavailable: {r}"));
+    let start = Instant::now();
+    let mut started_ms: Option<u128> = None;
+    let (finished_ms, http) = loop {
+        if let Some(reason) = fail_reason() {
+            return Err(reason.into());
+        }
+        let obs = client::load_observed(handle);
+        if let Some(obs) = obs {
+            if obs.started && started_ms.is_none() {
+                started_ms = Some(start.elapsed().as_millis());
+                println!(
+                    "# load-state 0 observed @ {} ms",
+                    start.elapsed().as_millis()
+                );
+            }
+            if let Some(http) = obs.finished_http {
+                println!(
+                    "# load-state 3 observed @ {} ms http={http}",
+                    start.elapsed().as_millis()
+                );
+                break (start.elapsed().as_millis(), http);
+            }
+        }
+        if started_ms.is_none() && start.elapsed() > START_DEADLINE {
+            return Err("load-started (internalLoadChanged 0) not observed within 30 s".into());
+        }
+        if start.elapsed() > FINISH_DEADLINE {
+            return Err("load-finished (internalLoadChanged 3) not observed within 90 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let started_ms = started_ms.ok_or("load-finished arrived without load-started")?;
+
+    // Both upcalls (0 and 3) must have COMPLETED through the real Java dispatch.
+    let upcall_deadline = Instant::now() + UPCALL_DEADLINE;
+    let upcalls_ok = loop {
+        let ok = client::load_observed(handle)
+            .map(|o| o.upcalls_ok)
+            .unwrap_or(0);
+        if ok >= 2 {
+            break ok;
+        }
+        if Instant::now() > upcall_deadline {
+            return Err(format!(
+                "only {ok}/2 internalLoadChanged upcalls completed within 10 s of load-finish"
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Nonzero ink in the MAIN-process staging buffer (the M1/M2 distinct-pixel criterion).
+    let ink_deadline = Instant::now() + INK_DEADLINE;
+    let (frame_w, frame_h, distinct) = loop {
+        if let Some(reason) = fail_reason() {
+            return Err(reason.into());
+        }
+        let census = client::with_latest_frame(handle, |stage| {
+            let mut distinct = std::collections::HashSet::new();
+            for px in stage.bytes.chunks_exact(4) {
+                distinct.insert(u32::from_ne_bytes([px[0], px[1], px[2], px[3]]));
+            }
+            (stage.width, stage.height, distinct.len())
+        });
+        if let Some((w, h, count)) = census {
+            if count > 1 {
+                println!("# staged frame {w}x{h} distinct_pixels={count}");
+                break (w, h, count);
+            }
+        }
+        if Instant::now() > ink_deadline {
+            return Err("no staged frame with nonzero ink within 20 s of load-finish".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // CloseView → ViewClosed (the entry disappears), then Shutdown → helper exit 0.
+    client::close_view(handle).map_err(|e| format!("CloseView send failed: {e}"))?;
+    let close_deadline = Instant::now() + CLOSE_DEADLINE;
+    while client::view_is_tracked(handle) {
+        if let Some(reason) = fail_reason() {
+            return Err(reason.into());
+        }
+        if Instant::now() > close_deadline {
+            return Err("ViewClosed not observed within 15 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("# view-closed ✓ — shutting the helper down…");
+    let report = client::shutdown(Duration::from_secs(15));
+    if report.helper_exit != Some(0) {
+        return Err(format!(
+            "helper exit status {:?} (expected 0; reader_joined={})",
+            report.helper_exit, report.reader_joined
+        )
+        .into());
+    }
+    Ok(WebViewTestReport {
+        upcalls_ok,
+        started_ms,
+        finished_ms,
+        http,
+        frame_w,
+        frame_h,
+        distinct,
+    })
 }
 
 /// Print a one-line summary of a pre-loaded lib (constructors run + `JNI_OnLoad` result).

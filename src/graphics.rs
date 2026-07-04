@@ -166,6 +166,10 @@ struct GameWindow<'vm> {
     /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
     /// keys are pressed/released, and passed as the `metaState` of each engine `KeyEvent`.
     key_meta_state: i32,
+    /// 2026-07-03 (web-engine M3) — `true` while a primary press that landed INSIDE the live
+    /// WebView's composite rect is in flight: the matching release routes to the helper too, so a
+    /// press/release pair never splits between the webview and the engine.
+    webview_pointer_down: bool,
 }
 
 impl ApplicationHandler for GameWindow<'_> {
@@ -354,8 +358,21 @@ impl ApplicationHandler for GameWindow<'_> {
                 self.cursor = Some((position.x as f32, position.y as f32));
                 // Engine mode: while the primary button is down, a move is a DRAG — forward
                 // ACTION_MOVE so the engine tracks it (scroll lists, sliders). No-op otherwise.
+                // 2026-07-03 (web-engine M3): a move INSIDE the live WebView's composite rect
+                // routes to the helper (view-relative) instead and never leaks to the engine.
                 if self.handed_off {
-                    self.engine_pointer_move();
+                    let wv = crate::webview::client::active_view();
+                    let routed = wv != 0
+                        && match webview_relative_point(position.x, position.y) {
+                            Some((rx, ry, true)) => {
+                                crate::webview::client::send_mouse_move(wv, rx, ry);
+                                true
+                            }
+                            _ => false,
+                        };
+                    if !routed {
+                        self.engine_pointer_move();
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -366,9 +383,45 @@ impl ApplicationHandler for GameWindow<'_> {
                 if self.handed_off {
                     // Engine owns rendering + its own Lua UI: forward the raw pointer to the engine's
                     // RBXSurfaceView (no renderer, no Eclipse-view hit-test).
+                    // 2026-07-03 (web-engine M3): a press INSIDE the live WebView's composite rect
+                    // routes to the helper; the matching release follows the press's routing so a
+                    // press/release pair never splits between the webview and the engine.
                     match state {
-                        ElementState::Pressed => self.engine_primary_press(),
-                        ElementState::Released => self.engine_primary_release(),
+                        ElementState::Pressed => {
+                            let wv = crate::webview::client::active_view();
+                            let routed = wv != 0
+                                && match self.cursor.and_then(|(px, py)| {
+                                    webview_relative_point(f64::from(px), f64::from(py))
+                                }) {
+                                    Some((rx, ry, true)) => {
+                                        self.webview_pointer_down = true;
+                                        crate::webview::client::send_mouse_click(wv, rx, ry, true);
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                            if !routed {
+                                self.engine_primary_press();
+                            }
+                        }
+                        ElementState::Released => {
+                            if self.webview_pointer_down {
+                                self.webview_pointer_down = false;
+                                let wv = crate::webview::client::active_view();
+                                if wv != 0 {
+                                    // Release routes to the helper at the (possibly outside)
+                                    // relative position — CEF handles out-of-view releases.
+                                    let (px, py) = self.cursor.unwrap_or((0.0, 0.0));
+                                    if let Some((rx, ry, _inside)) =
+                                        webview_relative_point(f64::from(px), f64::from(py))
+                                    {
+                                        crate::webview::client::send_mouse_click(wv, rx, ry, false);
+                                    }
+                                }
+                            } else {
+                                self.engine_primary_release();
+                            }
+                        }
                     }
                 } else {
                     match state {
@@ -379,17 +432,48 @@ impl ApplicationHandler for GameWindow<'_> {
             }
             // 2026-06-14: keyboard — forward keys to the engine's RBXSurfaceView.dispatchKeyEvent
             // (engine mode only; the pre-handoff Java-view apps have no key path here).
+            // 2026-07-03 (web-engine M3): while a WebView is live, ALL keys route to the helper
+            // (the challenge widget owns keyboard focus) and never reach the engine beneath it.
             WindowEvent::KeyboardInput { event, .. } if self.handed_off => {
-                self.engine_key(&event);
+                let wv = crate::webview::client::active_view();
+                if wv != 0 {
+                    route_key_to_webview(wv, &event);
+                } else {
+                    self.engine_key(&event);
+                }
             }
             // 2026-06-14: mouse wheel — forward to the engine's nativePassMouseWheel (desktop scroll).
+            // 2026-07-03 (web-engine M3): a wheel INSIDE the live WebView's rect routes to the
+            // helper in PIXELS — LineDelta y * 40.0, the inverse of engine_scroll's ÷40 mapping.
             WindowEvent::MouseWheel { delta, .. } if self.handed_off => {
-                let d = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-                };
-                if d != 0.0 {
-                    self.engine_scroll(d);
+                let wv = crate::webview::client::active_view();
+                let routed = wv != 0
+                    && match self
+                        .cursor
+                        .and_then(|(px, py)| webview_relative_point(f64::from(px), f64::from(py)))
+                    {
+                        Some((rx, ry, true)) => {
+                            let dy = match delta {
+                                winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                                    (y * 40.0) as i32
+                                }
+                                winit::event::MouseScrollDelta::PixelDelta(p) => p.y as i32,
+                            };
+                            if dy != 0 {
+                                crate::webview::client::send_mouse_wheel(wv, rx, ry, dy);
+                            }
+                            true
+                        }
+                        _ => false,
+                    };
+                if !routed {
+                    let d = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                    };
+                    if d != 0.0 {
+                        self.engine_scroll(d);
+                    }
                 }
             }
             _ => {}
@@ -472,7 +556,67 @@ impl ApplicationHandler for GameWindow<'_> {
                 crate::framework::query_textbox_geometry(vm);
             }
         }
+        // 2026-07-03 (web-engine M3): cache the live WebView's ABSOLUTE composite rect for the
+        // engine present thread (the TEXTBOX_GEOM pattern above — the present thread must never
+        // walk the registry tree). One registry walk per loop iteration, only while a WebView is
+        // live; gone entirely otherwise (one atomic load).
+        if self.handed_off && crate::webview::client::active_view() != 0 {
+            crate::webview::client::update_composited_rect();
+        }
     }
+}
+
+/// 2026-07-03 (web-engine M3): map a window-pixel point onto the live WebView's CACHED composite
+/// rect. Returns the VIEW-RELATIVE coordinates plus whether the point lies INSIDE the rect
+/// (`None` when no rect is cached — input then stays with the engine; the composite's centered
+/// fallback rect deliberately does not capture input, an M6-revisit note).
+fn webview_relative_point(px: f64, py: f64) -> Option<(i32, i32, bool)> {
+    let (x, y, w, h) = crate::webview::client::composited_rect()?;
+    let rx = px as i32 - x;
+    let ry = py as i32 - y;
+    let inside = rx >= 0 && ry >= 0 && (rx as u32) < w && (ry as u32) < h;
+    Some((rx, ry, inside))
+}
+
+/// 2026-07-03 (web-engine M3): DELIBERATELY MINIMAL keyboard routing for the challenge widget
+/// (extend at M4/M6 only if the widget demands it): printable text fires RAWKEYDOWN + CHAR
+/// (first UTF-16 unit) + KEYUP; Enter/Backspace/Tab/Escape/arrows fire down+up with their
+/// Windows VK codes (the `cef_key_event_t` convention). Everything synthesizes from the winit
+/// PRESS half (the release is dropped — the up was already sent). NEVER logs key contents (the
+/// `engine_key` privacy precedent: keystrokes/credentials must not reach the log).
+fn route_key_to_webview(view: i64, event: &winit::event::KeyEvent) {
+    use winit::keyboard::{Key, NamedKey};
+    if event.state != ElementState::Pressed {
+        return;
+    }
+    let vk = match &event.logical_key {
+        Key::Named(NamedKey::Enter) => Some(0x0D),
+        Key::Named(NamedKey::Backspace) => Some(0x08),
+        Key::Named(NamedKey::Tab) => Some(0x09),
+        Key::Named(NamedKey::Escape) => Some(0x1B),
+        Key::Named(NamedKey::ArrowLeft) => Some(0x25),
+        Key::Named(NamedKey::ArrowUp) => Some(0x26),
+        Key::Named(NamedKey::ArrowRight) => Some(0x27),
+        Key::Named(NamedKey::ArrowDown) => Some(0x28),
+        _ => None,
+    };
+    if let Some(code) = vk {
+        crate::webview::client::send_key(view, 0, code, 0); // down
+        crate::webview::client::send_key(view, 1, code, 0); // up
+        return;
+    }
+    let Some(text) = event.text.as_ref() else {
+        return;
+    };
+    if text.chars().next().is_none_or(char::is_control) {
+        return;
+    }
+    let Some(unit) = text.encode_utf16().next() else {
+        return;
+    };
+    crate::webview::client::send_key(view, 0, 0, 0); // RAWKEYDOWN
+    crate::webview::client::send_key(view, 2, 0, unit); // CHAR
+    crate::webview::client::send_key(view, 1, 0, 0); // KEYUP
 }
 
 impl GameWindow<'_> {
@@ -1074,6 +1218,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_synthetic_submit_done: false,
         engine_reflect_done: false,
         key_meta_state: 0,
+        webview_pointer_down: false,
     };
     event_loop
         .run_app(&mut app)

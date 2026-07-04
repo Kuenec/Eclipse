@@ -9,6 +9,10 @@
 //! under `crate::shared` here. This module must therefore declare the SAME sibling set as
 //! `src/webview/mod.rs` (including [`PROTO_V1`]). Their `#[cfg(test)]` units compile and run
 //! under BOTH crates' `cargo test` — same code, two gates (deliberate parity insurance).
+//!
+//! 2026-07-03 (plan M3): the sibling-set invariant covers the FIVE protocol leaf files below
+//! only — the root's `src/webview/client.rs` (the main-process consumer: spawn, reader thread,
+//! JNI upcalls) is EXCLUDED BY DESIGN and must never be `#[path]`-included here.
 
 #[path = "../../../src/webview/fdpass.rs"]
 pub mod fdpass;

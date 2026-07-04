@@ -6098,12 +6098,17 @@ extern "system" fn view_native_get_window<'local>(
 ///
 /// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
 /// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
+///
+/// 2026-07-03 (web-engine M3): also notifies the webview client so a finalized DRIVEN WebView
+/// sends `CloseView` to the helper ([`crate::webview::client::notify_view_freed`] — its first
+/// line is a two-atomic-load fast return, so every normal view GC stays cheap; it never panics).
 extern "system" fn view_native_destructor<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     widget: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
+        crate::webview::client::notify_view_freed(widget);
         match view_registry::free(widget) {
             Ok(()) => tracing::debug!(
                 target: "android.view.View",
@@ -9235,24 +9240,23 @@ fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), Frame
 //     [`view_native_constructor`] is the honest backing (records the concrete class, e.g.
 //     `com.roblox.client.hybrid.RBHybridWebView`).
 //   * `native_loadUrl(JLjava/lang/String;)V` (smali:51) + `native_loadDataWithBaseURL(JLjava/lang/
-//     String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (smali:48) — write-only:
-//     invoke-direct, no move-result, no reader on any path (the installed WebView has NO
-//     getUrl/getTitle/getProgress at all, and the `internalLoadChanged` upcall target has ZERO Java
-//     invokers in any dex — dead under the no-op backing), so validated no-ops.
+//     String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (smali:48) — write-only in
+//     the DEX sense: invoke-direct, no move-result (the installed WebView has NO getUrl/getTitle/
+//     getProgress at all). 2026-07-03 (web-engine plan M3): both are now SPAWN-AND-FORWARD to the
+//     out-of-process `eclipse-webview` CEF helper via `crate::webview::client`, keyed by the
+//     existing view_registry widget handle; the `internalLoadChanged(int, String)` upcall target
+//     (still with zero Java invokers — it is native-fired by design, exactly ATL's reference C
+//     shape) is fired for driven loads by the client's socket-reader thread through
+//     [`fire_web_view_internal_load_changed`], so `WebViewClient.onPageStarted/onPageFinished`
+//     run for the first time.
 //
-// 2026-07-02: REFERENCE-DEFAULT FIDELITY is the load-bearing honesty argument for all three
-// dispositions: upstream ATL's own DEFAULT build (env ATL_UGLY_ENABLE_WEBVIEW unset —
-// vendor/atl/src/api-impl-jni/widgets/android_webkit_WebView.c) delegates `native_constructor` to
-// `Java_android_view_View_native_1constructor` (a plain View peer) and early-returns from BOTH load
-// natives with WebKitGTK disabled. Eclipse's stub WebView is not a workaround — it is the exact
-// semantics of the framework the installed dex was built for.
-//
-// HARD CEILING (recorded in AGENTS.md §5): there is NO web engine — WebKitGTK (ATL's reference
-// backing) is GTK, banned by the no-GTK/low_4gb constraint — so web content NEVER loads through
-// these bindings and the login challenge cannot COMPLETE via this pass; the fragment constructs,
-// the app waits out its ~60 s challenge timeout, and recovers to LoginV2 (the observed shape). A
-// real web-content phase is a separate owner-level architectural decision, deliberately NOT
-// started here.
+// 2026-07-03 (M3 supersession note): the 2026-07-02 "validated no-op / reference-default
+// fidelity / HARD CEILING (no web engine)" dispositions for the two load natives are SUPERSEDED
+// by owner decision (a) + docs/web-engine-plan.md M3 — Eclipse now has a real out-of-process web
+// engine (CEF in the `eclipse-webview` helper; zero engine bytes in this ART process). The
+// constructor disposition is unchanged (the shared view-registry peer). When the helper is
+// absent/failed, the natives degrade to EXACTLY the pre-M3 honest one-shot-WARN no-op — never a
+// crash, never a fabricated callback.
 
 /// `android.webkit.WebView` (internal/slashed name for `find_class`) — hosts the 3 WebView natives.
 pub const WEB_VIEW_CLASS: &JNIStr = jni_str!("android/webkit/WebView");
@@ -9276,14 +9280,90 @@ const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG: &JNIStr =
 // unchanged via the import below.
 use crate::webview::redact::{url_scheme_and_host_for_log, NON_URL};
 
-/// `WebView.native_loadUrl(long widget, String url)` → validate the handle; no-op (2026-07-02).
-/// INSTANCE native, descriptor `(JLjava/lang/String;)V`; sole invoker `WebView.loadUrl`
-/// (WebView.smali:373). Write-only — no move-result, no reader on any path (see the section note) —
-/// and upstream ATL's DEFAULT is this exact no-op (reference-default fidelity), so the honest
-/// backing validates the handle and no-ops. Discovery diagnostic: a one-shot WARN (the
-/// `FOCUS_DIVERGENCE_WARNED` pattern) states plainly that there is no web engine and content will
-/// not load; subsequent calls log at debug. ALL url logging routes through
-/// [`url_scheme_and_host_for_log`] — never the full URL (challenge URLs may carry session tokens).
+/// The preserved honest degradation of `WebView.native_loadUrl` — the pre-M3 no-op body's WARN
+/// shape (2026-07-03): one-shot WARN carrying the ONE actionable `reason`, debug thereafter.
+/// `target` is ALWAYS pre-redacted (scheme+host or [`NON_URL`]); `reason` strings are
+/// Eclipse-authored and payload-free by construction ([`crate::webview::client::ClientError`]).
+fn warn_load_url_unavailable(widget: jlong, target: &str, reason: &str) {
+    static LOAD_URL_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !LOAD_URL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "android.webkit.WebView",
+            widget,
+            %target,
+            reason,
+            "WebView.native_loadUrl: web engine helper unavailable — content will not load \
+             (honest no-op; target redacted to scheme+host)"
+        );
+    } else {
+        tracing::debug!(
+            target: "android.webkit.WebView",
+            widget,
+            %target,
+            reason,
+            "WebView.native_loadUrl: web engine helper unavailable (honest no-op)"
+        );
+    }
+}
+
+/// The same preserved degradation for `native_loadDataWithBaseURL` (its own one-shot latch, the
+/// pre-M3 `LOAD_DATA_WARNED` shape). `base` is ALWAYS pre-redacted; the data payload is never
+/// logged at any level.
+fn warn_load_data_unavailable(widget: jlong, base: &str, reason: &str) {
+    static LOAD_DATA_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !LOAD_DATA_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "android.webkit.WebView",
+            widget,
+            %base,
+            reason,
+            "WebView.native_loadDataWithBaseURL: web engine helper unavailable — content will \
+             not load (honest no-op; baseUrl redacted, data payload never logged)"
+        );
+    } else {
+        tracing::debug!(
+            target: "android.webkit.WebView",
+            widget,
+            %base,
+            reason,
+            "WebView.native_loadDataWithBaseURL: web engine helper unavailable (honest no-op)"
+        );
+    }
+}
+
+/// Best-known `CreateView` dimensions for a WebView `widget` (2026-07-03, M3): the view's
+/// laid-out frame when it exists, else the published engine-window geometry, else the documented
+/// 1024×768 M1/M2 default (the smoke path drives loadUrl before any layout). Clamped to the
+/// protocol's `1..=u16::MAX`. No `ResizeView` wiring at M3 — challenge-rect fidelity is an M6
+/// item per the plan's recalibration recipe.
+fn web_view_create_dims(widget: jlong) -> (u16, u16) {
+    fn clamp_dim(v: i32) -> u16 {
+        v.clamp(1, i32::from(u16::MAX)) as u16
+    }
+    if let Ok(Some([l, t, r, b])) = view_registry::with_view(widget, |v| v.frame) {
+        if r > l && b > t {
+            return (clamp_dim(r - l), clamp_dim(b - t));
+        }
+    }
+    if let Some((w, h)) = crate::loader::ndk_registry::engine_window_geometry() {
+        if w > 0 && h > 0 {
+            return (clamp_dim(w), clamp_dim(h));
+        }
+    }
+    (1024, 768)
+}
+
+/// `WebView.native_loadUrl(long widget, String url)` → SPAWN-AND-FORWARD to the out-of-process
+/// `eclipse-webview` helper (2026-07-03, web-engine plan M3; supersedes the 2026-07-02 validated
+/// no-op — see the section note). INSTANCE native, descriptor `(JLjava/lang/String;)V`; sole
+/// invoker `WebView.loadUrl` (WebView.smali:373). The FULL url string is read once and retained
+/// ONLY for the control socket (the helper must load it) and the client's recorded
+/// `internalLoadChanged` upcall argument; every log macro binds the pre-redacted `target`
+/// ([`url_scheme_and_host_for_log`] — challenge URLs may carry session tokens). An absent/failed
+/// helper degrades to the preserved honest one-shot WARN no-op ([`warn_load_url_unavailable`]) —
+/// never a crash, never a fabricated callback.
 extern "system" fn web_view_native_load_url<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -9300,41 +9380,48 @@ extern "system" fn web_view_native_load_url<'local>(
             );
             return Ok(());
         }
-        // 2026-07-02: redact BEFORE any logging; a null/unreadable jstring is treated as a
-        // non-URL rather than propagating (the load is a no-op either way). A failed conversion
-        // can leave a pending Java exception (GetStringUTFChars can OOM) — describe+clear it (the
-        // openAssetFd precedent) so the no-op stays total and never throws back into Java.
-        let target = if url.is_null() {
-            NON_URL.to_string()
+        // 2026-07-02: a failed conversion can leave a pending Java exception (GetStringUTFChars
+        // can OOM) — describe+clear it (the openAssetFd precedent) so this native stays total and
+        // never throws back into Java.
+        let full: Option<String> = if url.is_null() {
+            None
         } else {
             match url.try_to_string(env) {
-                Ok(u) => url_scheme_and_host_for_log(&u),
+                Ok(u) => Some(u),
                 Err(_) => {
                     if env.exception_check() {
                         env.exception_describe();
                         env.exception_clear();
                     }
-                    NON_URL.to_string()
+                    None
                 }
             }
         };
-        static LOAD_URL_WARNED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !LOAD_URL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::warn!(
-                target: "android.webkit.WebView",
-                widget,
-                %target,
-                "WebView.native_loadUrl: no web engine — content will not load (validated no-op, \
-                 upstream-ATL-default semantics; target redacted to scheme+host)"
-            );
-        } else {
-            tracing::debug!(
-                target: "android.webkit.WebView",
-                widget,
-                %target,
-                "WebView.native_loadUrl: no web engine (validated no-op)"
-            );
+        let Some(full) = full else {
+            // A null/unreadable URL has no drivable target — the preserved honest no-op.
+            warn_load_url_unavailable(widget, NON_URL, "load target null/unreadable");
+            return Ok(());
+        };
+        let target = url_scheme_and_host_for_log(&full);
+        let (w, h) = web_view_create_dims(widget);
+        // 2026-07-03: get_java_vm hands the reader thread its Send JavaVM handle (runtime.rs Vm
+        // doc's recorded exception); `full` moves to the wire here and is never logged.
+        match env.get_java_vm() {
+            Ok(java_vm) => {
+                match crate::webview::client::drive_load_url(java_vm, widget, full, w, h) {
+                    Ok(()) => tracing::info!(
+                        target: "android.webkit.WebView",
+                        widget,
+                        %target,
+                        "WebView.native_loadUrl: forwarded to the eclipse-webview helper \
+                         (target redacted to scheme+host)"
+                    ),
+                    Err(e) => warn_load_url_unavailable(widget, &target, &e.to_string()),
+                }
+            }
+            Err(e) => {
+                warn_load_url_unavailable(widget, &target, &format!("JavaVM unavailable: {e}"));
+            }
         }
         Ok(())
     })
@@ -9342,20 +9429,27 @@ extern "system" fn web_view_native_load_url<'local>(
 }
 
 /// `WebView.native_loadDataWithBaseURL(long widget, String baseUrl, String data, String mime,
-/// String encoding)` → validate the handle; no-op (2026-07-02). INSTANCE native; sole invoker
-/// `WebView.loadDataWithBaseURL` (WebView.smali:318 — `loadData` routes here with baseUrl/history
-/// hardcoded `"about:blank"`, smali:238/:240, which redacts to `"<non-url>"` — correct and
-/// expected). Write-only + upstream-ATL-default no-op, exactly as [`web_view_native_load_url`].
-/// PRIVACY: the `data` payload (inline challenge HTML, possibly token-bearing) is NEVER read or
-/// bound to any log macro at any level; only mime + the redacted baseUrl are logged.
+/// String encoding)` → SPAWN-AND-FORWARD to the out-of-process `eclipse-webview` helper
+/// (2026-07-03, web-engine plan M3; supersedes the 2026-07-02 validated no-op — see the section
+/// note). INSTANCE native; sole invoker `WebView.loadDataWithBaseURL` (WebView.smali:318 —
+/// `loadData` routes here with baseUrl/history hardcoded `"about:blank"`, smali:238/:240, which
+/// redacts to `"<non-url>"` — correct and expected).
+///
+/// PRIVACY (2026-07-03, M3): `data` (inline challenge HTML, possibly token-bearing) is now read
+/// solely to cross the control socket (proto `LoadDataWithBaseUrl`, 8 MiB cap); it is still
+/// NEVER bound to any log macro at any level. Only the mime type + the pre-redacted baseUrl are
+/// logged. The installed dex's native carries no historyUrl argument (4 strings, smali:48); the
+/// wire's `history_url` field is forwarded empty by the client (the Java layer already hardcodes
+/// history "about:blank" on the loadData route). Null-string mappings per the Android semantics:
+/// `baseUrl` null → `"about:blank"`, `mime`/`encoding` null → empty.
 extern "system" fn web_view_native_load_data_with_base_url<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     widget: jlong,
     base_url: JString<'local>,
-    _data: JString<'local>,
+    data: JString<'local>,
     mime: JString<'local>,
-    _encoding: JString<'local>,
+    encoding: JString<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         if let Err(e) = view_registry::with_view(widget, |_v| ()) {
@@ -9367,74 +9461,73 @@ extern "system" fn web_view_native_load_data_with_base_url<'local>(
             );
             return Ok(());
         }
-        // 2026-07-02: as in native_loadUrl, a failed try_to_string can leave a pending Java
-        // exception — describe+clear it (openAssetFd precedent) before the fallback; letting it
-        // pend would make the NEXT JNI call (the mime conversion below) illegal and would throw
-        // the "validated no-op" back into Java.
-        let base = if base_url.is_null() {
-            NON_URL.to_string()
-        } else {
-            match base_url.try_to_string(env) {
-                Ok(u) => url_scheme_and_host_for_log(&u),
+        // 2026-07-02: a failed try_to_string can leave a pending Java exception — describe+clear
+        // it (openAssetFd precedent) before continuing; letting it pend would make the NEXT JNI
+        // call illegal and would throw this native back into Java.
+        let read_string = |env: &mut Env<'local>, s: &JString<'local>| -> Option<String> {
+            if s.is_null() {
+                return None;
+            }
+            match s.try_to_string(env) {
+                Ok(v) => Some(v),
                 Err(_) => {
                     if env.exception_check() {
                         env.exception_describe();
                         env.exception_clear();
                     }
-                    NON_URL.to_string()
+                    None
                 }
             }
         };
-        // The mime type is not sensitive (the Java side already truncates it at ';'); a null mime
-        // is a legal AOSP call shape.
-        let mime = if mime.is_null() {
-            String::from("<none>")
-        } else {
-            match mime.try_to_string(env) {
-                Ok(m) => m,
-                Err(_) => {
-                    if env.exception_check() {
-                        env.exception_describe();
-                        env.exception_clear();
-                    }
-                    String::from("<none>")
-                }
-            }
+        let base = read_string(env, &base_url);
+        let data_s = read_string(env, &data);
+        let mime_s = read_string(env, &mime);
+        let encoding_s = read_string(env, &encoding);
+        // The ONLY loggable form of the base URL (scheme+host, or "<non-url>" for the hardcoded
+        // about:blank route / a null base).
+        let log_base = base
+            .as_deref()
+            .map(url_scheme_and_host_for_log)
+            .unwrap_or_else(|| NON_URL.to_string());
+        let log_mime = mime_s.clone().unwrap_or_else(|| String::from("<none>"));
+        let Some(data_s) = data_s else {
+            warn_load_data_unavailable(widget, &log_base, "data payload null/unreadable");
+            return Ok(());
         };
-        static LOAD_DATA_WARNED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !LOAD_DATA_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::warn!(
-                target: "android.webkit.WebView",
-                widget,
-                %base,
-                %mime,
-                "WebView.native_loadDataWithBaseURL: no web engine — content will not load \
-                 (validated no-op, upstream-ATL-default semantics; baseUrl redacted, data payload \
-                 never logged)"
-            );
-        } else {
-            tracing::debug!(
-                target: "android.webkit.WebView",
-                widget,
-                %base,
-                %mime,
-                "WebView.native_loadDataWithBaseURL: no web engine (validated no-op)"
-            );
+        let (w, h) = web_view_create_dims(widget);
+        match env.get_java_vm() {
+            Ok(java_vm) => match crate::webview::client::drive_load_data(
+                java_vm, widget, base, data_s, mime_s, encoding_s, w, h,
+            ) {
+                Ok(()) => tracing::info!(
+                    target: "android.webkit.WebView",
+                    widget,
+                    base = %log_base,
+                    mime = %log_mime,
+                    "WebView.native_loadDataWithBaseURL: forwarded to the eclipse-webview \
+                     helper (baseUrl redacted, data payload never logged)"
+                ),
+                Err(e) => warn_load_data_unavailable(widget, &log_base, &e.to_string()),
+            },
+            Err(e) => {
+                warn_load_data_unavailable(widget, &log_base, &format!("JavaVM unavailable: {e}"));
+            }
         }
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.webkit.WebView`'s natives (2026-07-02).
+/// Bind Eclipse's own (non-GTK) backing for `android.webkit.WebView`'s natives (2026-07-02;
+/// load natives upgraded 2026-07-03, web-engine plan M3).
 ///
 /// Registered before step 4, right after the inflatable-widget constructor batch, because ART
 /// resolves natives per DECLARING class and WebView re-declares View's `native_constructor` — the
 /// challenge9 ULE (see the section note). The constructor is the shared class-agnostic
-/// [`view_native_constructor`] (registry-backed honest — the return becomes `View.widget`); the two
-/// load natives are validated no-ops with a redacted one-shot WARN each (upstream-ATL-default
-/// semantics — no web engine, content will not load; the section note's hard ceiling).
+/// [`view_native_constructor`] (registry-backed honest — the return becomes `View.widget`); the
+/// two load natives are spawn-and-forward to the out-of-process `eclipse-webview` helper
+/// (`crate::webview::client`), degrading to the preserved honest one-shot WARN no-op when the
+/// helper is unavailable (never a crash, never a fabricated callback).
 ///
 /// # Safety / soundness
 /// Each fn pointer matches its declared JNI signature by construction (pin test
@@ -9468,9 +9561,214 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let bound = register_class_natives_best_effort(env, WEB_VIEW_CLASS, &bindings)?;
     tracing::info!(
         bound,
-        "registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL = validated no-ops, upstream-ATL-default semantics — no web engine, content will not load) (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL = spawn-and-forward to the out-of-process eclipse-webview helper, honest WARN no-op when the helper is unavailable) (per-method best-effort)"
     );
     Ok(())
+}
+
+// === The internalLoadChanged upcall + the __webview-test smoke driver (web-engine plan M3) =======
+
+// 2026-07-03: signature per ATL's own reference C (vendor WebView.java:38 — package-private
+// instance `void internalLoadChanged(int loadState, String url)`; JNI call_method bypasses Java
+// access, the native_measure setMeasuredDimension house precedent). The sig const is a
+// `MethodSignature` because `call_method`'s only `AsRef<MethodSignature>` impl is itself
+// (the VIEW_SET_MEASURED_DIMENSION_SIG precedent — a jni_str! sig would be rejected).
+const WEB_VIEW_INTERNAL_LOAD_CHANGED_NAME: &JNIStr = jni_str!("internalLoadChanged");
+const WEB_VIEW_INTERNAL_LOAD_CHANGED_SIG: MethodSignature<'static, 'static> =
+    jni_sig!("(ILjava/lang/String;)V");
+
+/// Fire `WebView.internalLoadChanged(state, url)` on the Java object recorded for `widget` —
+/// the previously-dead seam, now driven by the webview client's socket-reader thread for DRIVEN
+/// loads only (2026-07-03, plan M3). Returns `true` iff the Java dispatch completed (the
+/// `__webview-test` "upcalls 2/2" evidence).
+///
+/// Threading: called from the `eclipse-webview-io` thread with the `Send` [`JavaVM`] handle the
+/// load native obtained via `Env::get_java_vm` — `attach_current_thread` performs a real,
+/// thereafter-cached ART attach of that thread (the recorded exception in `runtime::Vm`'s docs;
+/// ART's attached-thread altstack caveat is the recorded native_provider limitation — acceptable,
+/// the reader does no deep recursion). `url` is the REAL driven URL: it is the app's own Java
+/// contract argument (ATL's reference C passes the real URI) and is NEVER bound to a log macro
+/// here — every failure log binds only `widget` + `state`.
+pub fn fire_web_view_internal_load_changed(
+    java_vm: &JavaVM,
+    widget: jlong,
+    state: i32,
+    url: &str,
+) -> bool {
+    let result: Result<bool, FrameworkError> = java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            fire_internal_load_changed_inner(env, widget, state, url)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    });
+    match result {
+        Ok(fired) => fired,
+        Err(e) => {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                state,
+                error = %e,
+                "internalLoadChanged upcall failed (no callback delivered; URL never logged)"
+            );
+            false
+        }
+    }
+}
+
+/// The upcall body on the attached reader thread. The registry lock is held ONLY to create a
+/// local ref of the recorded global (one JNI call — the `with_jobject` lock contract); the Java
+/// dispatch itself runs OUTSIDE the lock, because `onPageStarted`/`onPageFinished` is app code
+/// that may synchronously re-enter WebView natives (→ the registry).
+fn fire_internal_load_changed_inner(
+    env: &mut Env,
+    widget: jlong,
+    state: i32,
+    url: &str,
+) -> Result<bool, FrameworkError> {
+    let local =
+        match view_registry::with_jobject(widget, |global| env.new_local_ref(global.as_obj())) {
+            Ok(Some(Ok(obj))) => obj,
+            Ok(Some(Err(_))) => {
+                if env.exception_check() {
+                    env.exception_describe();
+                    env.exception_clear();
+                }
+                tracing::warn!(
+                    target: "android.webkit.WebView",
+                    widget,
+                    state,
+                    "internalLoadChanged: local ref of the recorded WebView failed (no callback)"
+                );
+                return Ok(false);
+            }
+            // A valid handle with no recorded jobject: never fabricate a callback.
+            Ok(None) => {
+                tracing::debug!(
+                    target: "android.webkit.WebView",
+                    widget,
+                    state,
+                    "internalLoadChanged: no recorded jobject for the view (no callback fabricated)"
+                );
+                return Ok(false);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "android.webkit.WebView",
+                    widget,
+                    state,
+                    error = %e,
+                    "internalLoadChanged: stale/invalid view handle (no callback)"
+                );
+                return Ok(false);
+            }
+        };
+    let jurl = checked(env, "internalLoadChanged new_string", |env| {
+        env.new_string(url)
+    })?;
+    match checked(env, "WebView.internalLoadChanged", |env| {
+        env.call_method(
+            &local,
+            WEB_VIEW_INTERNAL_LOAD_CHANGED_NAME,
+            WEB_VIEW_INTERNAL_LOAD_CHANGED_SIG,
+            &[JValue::Int(state), JValue::Object(&jurl)],
+        )?
+        .v()
+    }) {
+        Ok(()) => Ok(true),
+        // `checked` already described+cleared the throw and logged the step name (no URL bound).
+        Err(_) => Ok(false),
+    }
+}
+
+/// Dev-host `__webview-test` smoke driver (2026-07-03, plan M3): register the WebView natives
+/// (prints the live `bound=3` registration line the milestone guard pins), construct a minimal
+/// REAL `android.webkit.WebView` from the installed framework, wire it into `view_registry`
+/// exactly as production does (global ref + `View.widget`), attach a real `WebViewClient` (so
+/// the upcall executes the REAL Java dispatch into `onPageStarted`/`onPageFinished`, not a
+/// null-client no-op), then call the Java `WebView.loadUrl(String)` — exercising the FULL
+/// production entry: installed-dex Java → registered native → spawn-and-forward. Returns the
+/// `view_registry` handle for the caller's `webview::client` observation polls.
+///
+/// MUST be called on the process main thread with the booted [`Vm`] (the
+/// [`drive_application_lifecycle`] threading/panic contract).
+pub fn drive_webview_smoke(vm: &Vm, url: &str) -> Result<jlong, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
+    // by the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton).
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| webview_smoke_inner(env, url))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError> {
+    register_web_view_natives(env)?;
+    let class = checked(env, "find_class android.webkit.WebView", |env| {
+        env.find_class(WEB_VIEW_CLASS)
+    })?;
+    // 2026-07-03: AllocObject deliberately BYPASSES the constructor chain — this harness has no
+    // android.content.Context to satisfy View.<init>, and the production widget wiring
+    // (native_constructor → the `View.widget` iput) is replaced by the explicit allocate +
+    // set_field below (the same registry peer shape production records).
+    let webview = checked(env, "AllocObject android.webkit.WebView", |env| {
+        env.alloc_object(&class)
+    })?;
+    let handle =
+        view_registry::allocate("android.webkit.WebView").map_err(FrameworkError::ViewRegistry)?;
+    // The upcall path resolves the recorded global ref (with_jobject), so this is load-bearing.
+    let global = env.new_global_ref(&webview)?;
+    view_registry::set_jobject(handle, global).map_err(FrameworkError::ViewRegistry)?;
+    // View.widget = handle: the installed dex's loadUrl passes this.widget as the native's
+    // first J arg (View.java:965 per the destructor doc).
+    // SAFETY: `widget` is a `long` field of android.view.View, so the "J" signature paired with
+    // JavaType::Long is consistent — FieldSignature::from_raw_parts' invariant; set_field
+    // re-checks the value type at runtime.
+    let long_sig = unsafe {
+        FieldSignature::from_raw_parts(jni_str!("J"), JavaType::Primitive(Primitive::Long))
+    };
+    checked(env, "WebView.widget=", |env| {
+        env.set_field(&webview, jni_str!("widget"), &long_sig, handle.into())
+    })?;
+    let client_class = checked(env, "find_class android.webkit.WebViewClient", |env| {
+        env.find_class(jni_str!("android/webkit/WebViewClient"))
+    })?;
+    let client_obj = checked(env, "WebViewClient.<init>", |env| {
+        env.new_object(&client_class, jni_sig!("()V"), &[])
+    })?;
+    checked(env, "WebView.setWebViewClient", |env| {
+        env.call_method(
+            &webview,
+            jni_str!("setWebViewClient"),
+            jni_sig!("(Landroid/webkit/WebViewClient;)V"),
+            &[JValue::Object(&client_obj)],
+        )?
+        .v()
+    })?;
+    // The PRODUCTION entry: installed-dex Java loadUrl → the registered native → the client.
+    let jurl = env.new_string(url)?;
+    checked(env, "WebView.loadUrl", |env| {
+        env.call_method(
+            &webview,
+            jni_str!("loadUrl"),
+            jni_sig!("(Ljava/lang/String;)V"),
+            &[JValue::Object(&jurl)],
+        )?
+        .v()
+    })?;
+    tracing::info!(
+        handle,
+        "__webview-test: WebView.loadUrl driven through the production native path"
+    );
+    Ok(handle)
 }
 
 // === Eclipse's own (non-GTK) backing for the inflatable android.widget.* property setters =========
@@ -14467,8 +14765,9 @@ fn drive_lifecycle(
     // constructs a WebView child (RBHybridWebView, challenge9 live boot 2026-07-02, log lines
     // 1232–1256) and ART resolves natives per declaring class (WebView re-declares View's
     // native_constructor and adds two load natives), so this must be bound before step 4 per the
-    // uniform house ordering. Constructor = the shared view-registry backing; the load natives are
-    // validated no-ops (upstream-ATL-default semantics — no web engine).
+    // uniform house ordering. Constructor = the shared view-registry backing; the load natives
+    // are spawn-and-forward to the out-of-process eclipse-webview helper (2026-07-03, M3), with
+    // the honest one-shot-WARN no-op as the helper-unavailable degradation.
     register_web_view_natives(env)?;
     // Bind the inflatable android.widget.* property-setter natives on their OWN declaring classes —
     // once each widget's native_constructor (above) lets LayoutInflater build the content view, the
@@ -14799,6 +15098,8 @@ pub enum FrameworkError {
     Panicked,
     /// Allocating the Eclipse-owned window-registry handle passed to `createApplication` failed.
     WindowRegistry(window_registry::WindowRegistryError),
+    /// 2026-07-03 (M3): a view-registry operation failed in the `__webview-test` smoke driver.
+    ViewRegistry(view_registry::ViewRegistryError),
 }
 
 impl fmt::Display for FrameworkError {
@@ -14810,6 +15111,7 @@ impl fmt::Display for FrameworkError {
                 f.write_str("a panic was caught at the framework JNI boundary (not propagated)")
             }
             Self::WindowRegistry(e) => write!(f, "window-registry handle allocation failed: {e}"),
+            Self::ViewRegistry(e) => write!(f, "view-registry operation failed: {e}"),
         }
     }
 }
@@ -14819,6 +15121,7 @@ impl std::error::Error for FrameworkError {
         match self {
             Self::Jni(e) => Some(e),
             Self::WindowRegistry(e) => Some(e),
+            Self::ViewRegistry(e) => Some(e),
             Self::NullVm | Self::Panicked => None,
         }
     }
@@ -17226,8 +17529,9 @@ mod tests {
             VIEW_NATIVE_CONSTRUCTOR_SIG.to_str(),
             "(Landroid/content/Context;Landroid/util/AttributeSet;)J"
         );
-        // The two load natives (validated no-ops, upstream-ATL-default semantics — no web engine;
-        // internalLoadChanged is deliberately dead under this backing: zero Java invokers exist).
+        // The two load natives (2026-07-03, M3: spawn-and-forward to the out-of-process
+        // eclipse-webview helper; internalLoadChanged still has zero Java invokers — it is
+        // native-fired by the client's socket-reader thread for driven loads).
         assert_eq!(WEB_VIEW_NATIVE_LOAD_URL_NAME.to_str(), "native_loadUrl");
         assert_eq!(
             WEB_VIEW_NATIVE_LOAD_URL_SIG.to_str(),

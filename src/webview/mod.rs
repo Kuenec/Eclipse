@@ -15,10 +15,14 @@
 //! client adopts the identical contract at the recorded `framework.rs` WebView-native seams.
 //!
 //! 1. **Binary resolution:** the consumer resolves the `eclipse-webview` helper binary from,
-//!    in order: an explicit caller-provided path (M3: config), else `$ECLIPSE_WEBVIEW_HELPER`,
-//!    else a sibling `eclipse-webview` next to the running executable. No hardcoded install
-//!    paths; an unresolvable helper is an actionable error (M3 degrades to the recorded honest
-//!    one-shot WARN no-op — never a crash, never a fabricated callback).
+//!    in order: an explicit caller-provided path (M3: config `webview_helper_path`), else
+//!    `$ECLIPSE_WEBVIEW_HELPER`, else a sibling `eclipse-webview` next to the running
+//!    executable, else (2026-07-03, tier 4 — a dev-tree convenience added at M3) the
+//!    exe-relative checkout builds `<exe_dir>/../../crates/eclipse-webview/target/release/
+//!    eclipse-webview` then `.../debug/eclipse-webview`. An EXPLICIT setting (config/env) that
+//!    points at a missing file is an actionable error, never a silent fallthrough. No hardcoded
+//!    install paths; an unresolvable helper is an actionable error (M3 degrades to the recorded
+//!    honest one-shot WARN no-op — never a crash, never a fabricated callback).
 //! 2. **Control socket:** the consumer creates a `std::os::unix::net::UnixStream::pair()`
 //!    (SOCK_STREAM). One end stays in the consumer; the other end is `dup2`'d onto **fd 3** in
 //!    the child (`pre_exec`), and the helper is spawned with the argv flag **`--ipc-fd=3`**.
@@ -39,13 +43,17 @@
 //!
 //! # M3 adoption note
 //!
-//! 2026-07-03: at M3 the two validated no-op load natives (`framework.rs`
-//! `web_view_native_load_url` / `web_view_native_load_data_with_base_url`) become
+//! 2026-07-03: IMPLEMENTED at M3 by [`client`] — the two load natives (`framework.rs`
+//! `web_view_native_load_url` / `web_view_native_load_data_with_base_url`) are
 //! spawn-and-forward per this contract, keyed by the existing `view_registry` widget handle
-//! ("integrates, never duplicates" — the protocol's `view` field IS that jlong), a
-//! socket-reader thread fires `WebView.internalLoadChanged(0/3)` as JNI upcalls, and helper
-//! frames composite at the `view_registry` frame rect through the vk-overlay present seam.
+//! ("integrates, never duplicates" — the protocol's `view` field IS that jlong), the
+//! `eclipse-webview-io` socket-reader thread fires `WebView.internalLoadChanged(0/3)` as JNI
+//! upcalls, and staged helper frames composite at the cached `view_registry` frame rect through
+//! the vk-overlay present seam. `client` is MAIN-PROCESS-ONLY and deliberately NOT part of the
+//! helper crate's `#[path]` sibling set (`crates/eclipse-webview/src/shared.rs` includes only
+//! the five protocol leaf modules below).
 
+pub mod client;
 pub mod fdpass;
 pub mod proto;
 pub mod redact;
