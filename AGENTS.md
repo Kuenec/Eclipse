@@ -128,6 +128,62 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-03 — 🔗 WEB-ENGINE MILESTONE M3 DONE: main-process wiring at the recorded seams — the two validated
+  no-op load natives are now LIVE spawn-and-forward keyed by the existing view_registry handle, the dead
+  `WebView.internalLoadChanged(0/3)` seam fires as real JNI upcalls, vk-overlay composite + winit input routing
+  landed behind an atomic fast gate, and the hidden `__webview-test` subcommand drove the FULL
+  natives→socket→helper→memfd→staging pipeline through REAL ART — IMPLEMENTED + gate green + dev-host
+  `__webview-test` run VERIFIED 2026-07-03 (full record in §6 2026-07-03 🔗 and the M3 Status block in
+  `docs/web-engine-plan.md`) ⇐ START-HERE-NEXT: MILESTONE M4 of `docs/web-engine-plan.md` — JS bridge + cookies
+  + UA, the completion-handoff surface (overlay pass: back `addJavascriptInterface` for real via renderer-side
+  V8 + CefMessageRouter incl. the synchronous-return corner, `evaluateJavascript` → the overlay-patched
+  ValueCallback, `CookieManager` incl. the overlay 3-arg setCookie/.ROBLOSECURITY handoff via a private
+  session-scoped CefCookieManager store, the honest deliberate UA replacing the recorded "GDPR VIOLATION" one —
+  all Java-surface changes through `tools/framework-overlay/patch-framework.sh`, and overlay-patch the
+  `javascript:`-println full-URL leak channel BEFORE `javascript:` URLs become secret-bearing).** What shipped
+  (workflow wf_b6c4adaa-551: recon ×3 → design → implement → gate → adversarial review ×3 + skeptic verify):
+  (1) NEW `src/webview/client.rs` (1624 lines, std-only, zero cef) — 4-tier helper resolver (config
+  `webview_helper_path` → `ECLIPSE_WEBVIEW_HELPER` env → beside-the-eclipse-binary → dev-tree target),
+  io-thread spawn + handshake per the `src/webview/mod.rs` spawn contract, pure dispatch state machine, staged
+  frames, one-way failure latch, the input/compositor/lifecycle surface; `shm::FrameMapping`'s `!Send` confined
+  to the io thread via the `SendMapping` newtype (SAFETY comment). (2) `framework.rs`:
+  `web_view_native_load_url`/`web_view_native_load_data_with_base_url` become spawn-and-forward keyed by the
+  EXISTING view_registry handle (no new webview_registry) with the one-shot-WARN fallback PRESERVED — an
+  absent/failed helper degrades honestly, never crashes, never fabricates a callback;
+  `fire_web_view_internal_load_changed` fires the previously-dead `WebView.internalLoadChanged(0/3)` as real
+  JNI upcalls (local ref under the registry lock, dispatch OUTSIDE it — app code may re-enter); teardown hook
+  `client::notify_view_freed` in `view_native_destructor`. (3) `vk_overlay.rs`: `WEB_COMPOSITE` +
+  `composite_webview_frame` + pure unit-pinned `classify_swapchain_format`/`bgra_rows_into`/
+  `clamp_webview_rect` behind an `active_view()` atomic fast gate (§2.4: zero per-frame cost when no WebView is
+  live); `graphics.rs`: winit input routing in the four handed_off arms (cached-registry-rect-only capture);
+  `view_registry::absolute_frame()`; `main.rs`: `__webview-test` + `run_webview_test`. MEASURED verify
+  (dev-host main thread, `/tmp/eclipse-webview-m3-test.log`, 42 lines): `timeout 180 cargo run --release --
+  __webview-test` → EXIT=0 + SUCCESS marker `WebView engine pipeline OK: internalLoadChanged upcalls 2/2
+  (state 0 @ 350ms, state 3 @ 700ms, http 200), frame 1024x768 122925 distinct pixels, ViewClosed, helper exit
+  0` — REAL ART booted from the default APK (framework classpath, no libroblox preload, no window),
+  `WebView.loadUrl` driven through the production native path `handle=4294967296`, helper resolved tier-4
+  dev-tree, ozone `wayland` explicit, ink census 122,925 EXACTLY inside the M1/M2 range 122,859–123,156, clean
+  ViewClosed → shutdown → helper exit 0, privacy grep 0 full-URL-shaped lines (scheme+host only), /proc orphan
+  scan clean. HONEST PLAN-WORDING DIVERGENCE (recorded, not papered over): the plan's M3 verify says the page
+  renders "inside Eclipse's own window via … vk-overlay" — the composite executes only under an engine
+  `vkQueuePresentKHR`, so it first runs ON-SCREEN at the M6 live boot; `__webview-test` proves
+  natives→socket→helper→memfd→main-process staging + real upcalls + `bound=3`; the composite's pure parts are
+  unit-pinned; the GL-path composite documented deferred (seam noted in vk_overlay.rs). Gate: root
+  fmt/build/clippy -D warnings/test/release ALL clean — **613 unit + 6 integ + 2 doctest** (was 604+4+2; +11
+  new webview/overlay/registry pins incl. the ALWAYS-RUN `root_lockfile_stays_cef_free` cef-freedom pin and the
+  self-skipping `webview_test_fires_load_upcalls_and_stages_frames` guard — which executed FOR REAL on this
+  host: all 6 engine_milestones guards ran their real paths, ZERO SKIP); helper crate fmt --check/build/clippy
+  -D warnings/test **17 + 11** clean (CEF_PATH = the reused M1 dist); root Cargo.toml/Cargo.lock verified
+  cef-free (the 4 `cef` substring hits in Cargo.lock are hex-checksum digits). Adversarial review (3
+  dimensions, high effort): privacy-redaction 0 findings, portability-scope 0 findings, jni-threading 1 alleged
+  (CLIENT mutex held across a blocking up-to-8-MiB socket write while the reader needs CLIENT for FrameAck →
+  deadlock under helper backpressure) REFUTED by the skeptic with mechanism — the helper's consumer-socket
+  reader thread drains unconditionally into an UNBOUNDED mpsc queue independent of its writer, so the consumer
+  write_all always completes (the backpressure premise is false); 0 confirmed findings, nothing changed
+  post-review. Carried to M6: the ATL 2-arg onPageStarted vs AOSP 3-arg reconciliation; pre-driven
+  self-navigation silence (driven-loads-only contract); input routing vs the centered-fallback composite rect
+  (the fallback rect deliberately does NOT capture input — dated note in `webview_relative_point`);
+  challenge-rect fidelity / ResizeView wiring deferred to M6 per the recalibration recipe.
 - **2026-07-03 — 🔌 WEB-ENGINE MILESTONE M2 DONE: the real `eclipse-webview` helper crate + the owned
   std-only IPC protocol v1 (FROZEN) + the completed dependency-justification cycle — IMPLEMENTED + gate
   green + dev-host drive-run VERIFIED 2026-07-03 (full record in §6 2026-07-03 🔌 and the M2 Status block
@@ -136,7 +192,8 @@ before any history-rewriting/force operation.
   `web_view_native_load_data_with_base_url` become spawn-and-forward keyed by the existing view_registry
   handle; a socket-reader thread fires the dead `WebView.internalLoadChanged(0/3)` seam as JNI upcalls;
   vk-overlay composite at the view frame rect; winit input routing; hidden `__webview-test` subcommand +
-  `engine_milestones.rs` self-skip guard).** What shipped: (1) NEW root module `src/webview/` — the
+  `engine_milestones.rs` self-skip guard) — DONE 2026-07-03 (see the 🔗 bullet above; the live pointer moved to
+  MILESTONE M4).** What shipped: (1) NEW root module `src/webview/` — the
   SHARED, cef-free protocol surface (`proto.rs` = the NORMATIVE v1 wire spec: `[len u32 LE][type u8][body]`
   frames, 16 in-types 0x01–0x10 / 8 out-types 0x81–0x88, 8 MiB global cap enforced before allocation +
   per-type caps, Hello/HelloAck exact-version handshake, total decoder with typed payload-free ProtoError;
@@ -6600,6 +6657,96 @@ redaction fix), `docs/dependency-plan.md` (real cef entries + vendored-row note)
 recorded seams (framework.rs `web_view_native_load_url`/`web_view_native_load_data_with_base_url`
 spawn-and-forward, `internalLoadChanged(0/3)` JNI upcalls, vk-overlay composite, `__webview-test` +
 engine_milestones self-skip guard).
+
+### 2026-07-03 — 🔗 WEB-ENGINE MILESTONE M3 DONE: main-process wiring at the recorded seams — the two validated no-op load natives became LIVE spawn-and-forward keyed by the existing view_registry handle, the dead `WebView.internalLoadChanged(0/3)` seam fires as real JNI upcalls for the first time, vk-overlay composite + winit input routing landed behind an atomic fast gate, and the hidden `__webview-test` subcommand drove the full natives→socket→helper→memfd→staging pipeline through REAL ART (upcalls 2/2, 122,925-distinct-pixel frame, helper exit 0, zero orphans); the live pointer advances to MILESTONE M4
+
+*Provenance:* implements MILESTONE M3 of `docs/web-engine-plan.md` (after the 🔌 M2 record above). Evidence
+chain: workflow wf_b6c4adaa-551 (recon ×3 → design → implement → independent gate agent in a fresh shell →
+adversarial review ×3 + skeptic verify), then the live `__webview-test` run on the orchestrator's main
+thread per the dev-host boundary (live ART boots never run in `cargo test` or subagents). Scope held to the
+plan: a public page only (https://www.roblox.com), no libroblox preload, no challenge URL; "integrates,
+never duplicates" held — per-view identity is the existing `view_registry` widget handle, NO new
+webview_registry.
+
+*Design shipped:*
+- **`src/webview/client.rs` (NEW, 1624 lines; std-only, zero cef)** — the main-process consumer of the
+  frozen v1 protocol: 4-tier helper resolver (config `webview_helper_path` → `ECLIPSE_WEBVIEW_HELPER` env →
+  beside-the-eclipse-binary → dev-tree target), io-thread spawn + handshake per the `src/webview/mod.rs`
+  spawn contract, a pure dispatch state machine, staged frames, a one-way failure latch, and the
+  input/compositor/lifecycle surface. `shm::FrameMapping` is `!Send`; its io-thread confinement crosses via
+  the `SendMapping` newtype with a `// SAFETY:` comment.
+- **`src/framework.rs`** — `web_view_native_load_url`/`web_view_native_load_data_with_base_url` (the two
+  validated no-ops, the recorded M3 seams) become spawn-and-forward keyed by the existing `view_registry`
+  handle; the one-shot-WARN fallback is PRESERVED — an absent/failed helper degrades honestly with an
+  actionable error, never a crash, never a fabricated callback. `fire_web_view_internal_load_changed` fires
+  the previously-dead `WebView.internalLoadChanged(0/3)` as real JNI upcalls (`EnvUnowned`/catch_unwind
+  house shape; the local ref is taken under the registry lock, the dispatch runs OUTSIDE it — app code may
+  re-enter). Teardown: `view_native_destructor` → `client::notify_view_freed`.
+- **`src/loader/vk_overlay.rs`** — `WEB_COMPOSITE` + `composite_webview_frame`, with the pure unit-pinned
+  helpers `classify_swapchain_format`/`bgra_rows_into`/`clamp_webview_rect`, all behind an `active_view()`
+  atomic fast gate (§2.4: zero per-frame cost when no WebView is live).
+- **`src/graphics.rs`** — winit mouse/key routing to the helper in the four `handed_off` arms
+  (cached-registry-rect-only capture); **`src/framework/view_registry.rs`** — `absolute_frame()` (ancestor
+  origin summation) supplies the composite rect; **`src/main.rs`** — hidden `__webview-test` subcommand +
+  `run_webview_test` (house pattern of `__gl-test`, deterministic SUCCESS marker).
+
+*Adversarial review (3 dimensions, high effort): 0 confirmed findings, nothing changed post-review.*
+privacy-redaction 0 findings; portability-scope 0 findings; jni-threading 1 alleged (the CLIENT mutex held
+across a blocking up-to-8-MiB socket write while the reader thread needs CLIENT for FrameAck → deadlock
+under helper backpressure) REFUTED by the skeptic with mechanism: the helper's consumer-socket reader
+thread drains unconditionally into an UNBOUNDED mpsc queue independent of its writer, so the consumer
+`write_all` always completes — the backpressure premise is false.
+
+*Honest plan-wording divergence (recorded, not papered over):* the plan's M3 verify sentence says the page
+renders "inside Eclipse's own window via … vk-overlay". The composite executes only under an engine
+`vkQueuePresentKHR`, so it first runs ON-SCREEN at the M6 live boot; `__webview-test` proves
+natives→socket→helper→memfd→main-process staging + real `internalLoadChanged` upcalls + the `bound=3`
+registration line, and the composite's pure parts are unit-pinned. The GL-path composite is documented as
+deferred (seam noted in `vk_overlay.rs`).
+
+*Notable implementation deviations (each dated in a code comment at its site):* the JavaVM moves into the
+reader thread (no second copy); the GPU copy-to-image runs EVERY present (the engine repaints the whole
+swapchain image — recorded flicker evidence at the text-overlay path), only the CPU row copy is keyed by
+`WEB_COMPOSITE_LAST`; Crash kinds latch one-way; `reader_fatal` demotes to debug once the slot is no longer
+Live (clean-shutdown EOF is not a failure).
+
+*Carried to M6:* the ATL 2-arg `onPageStarted` vs AOSP 3-arg reconciliation; pre-driven self-navigation
+silence (the driven-loads-only contract, carried from M2); input routing vs the centered-fallback composite
+rect (the fallback rect deliberately does NOT capture input — dated note in `webview_relative_point`);
+challenge-rect fidelity / `ResizeView` wiring deferred per the recalibration recipe.
+
+*Regression guards (+11, all green):* the ALWAYS-RUN `root_lockfile_stays_cef_free` cef-freedom pin (the 4
+`cef` substring hits in Cargo.lock are hex-checksum digits — verified, pinned) and the self-skipping
+`webview_test_fires_load_upcalls_and_stages_frames` marker guard in `tests/engine_milestones.rs` (house
+convention), plus new webview/overlay/registry unit pins (client dispatch/resolver, the vk_overlay pure
+trio, `absolute_frame`). Existing pins preserved:
+`web_view_native_names_sigs_and_class_match_the_installed_dex` unchanged, the redaction test extended to
+the IPC boundary, the live `bound=3` registration line intact. On this host the self-skip guards did NOT
+skip: all 6 `engine_milestones` guards ran their real paths, zero SKIP.
+
+*Gate (independent gate agent, fresh shell; all clean, 0 warnings/errors):* [root] `cargo fmt --all` /
+`cargo build --all-targets` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test`
+(**613 unit + 6 integ + 2 doctest**, 0 failed; was 604 + 4 + 2) / `cargo build --release`. [helper crate,
+`CEF_PATH=crates/eclipse-webview-spike/cef-dist/linux-x86_64`] `cargo fmt --check` / `cargo build` /
+`cargo clippy -- -D warnings` / `cargo test` (**17 + 11**) all clean. [root isolation] `Cargo.toml`/
+`Cargo.lock` verified cef-free.
+
+*Live dev-host verify (orchestrator main thread, 2026-07-03; log `/tmp/eclipse-webview-m3-test.log`,
+42 lines):* `timeout 180 cargo run --release -- __webview-test` → EXIT=0 with the SUCCESS marker
+`__webview-test: WebView engine pipeline OK: internalLoadChanged upcalls 2/2 (state 0 @ 350ms, state 3 @
+700ms, http 200), frame 1024x768 122925 distinct pixels, ViewClosed, helper exit 0`. Booted REAL ART from
+the default APK (framework classpath; no libroblox preload, no window), drove `WebView.loadUrl` through the
+production native path (`handle=4294967296`), helper resolved tier-4 dev-tree, ozone `wayland` explicit;
+ink census 122,925 EXACTLY inside the M1/M2 range 122,859–123,156; clean ViewClosed → shutdown → helper
+exit 0. Privacy grep of the log: 0 full-URL-shaped lines (scheme+host only). /proc orphan scan clean.
+origin/main == HEAD at run time.
+
+*Status:* M3 DONE + `__webview-test`-VERIFIED 2026-07-03. Files: `src/webview/client.rs` (new),
+`src/webview/mod.rs`, `src/framework.rs`, `src/framework/view_registry.rs`, `src/graphics.rs`,
+`src/loader/vk_overlay.rs`, `src/loader/init_run.rs`, `src/main.rs`, `src/runtime.rs`, `src/config.rs`,
+`crates/eclipse-webview/src/shared.rs`, `tests/engine_milestones.rs`, `docs/web-engine-plan.md` (header +
+M3 Status block), this file (§5 🔗 bullet ⇐ START-HERE-NEXT = plan M4; §6 this entry). Next session:
+MILESTONE M4 — JS bridge + cookies + UA, the completion-handoff surface (overlay pass).
 
 ---
 

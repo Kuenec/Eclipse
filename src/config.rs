@@ -80,6 +80,13 @@ pub struct Config {
     /// When `true` and no APK path is supplied, `eclipse run` auto-fetches from [`Self::apk_url`].
     /// Off by default (the safest posture: the runtime never acquires the APK unless asked).
     pub auto_fetch_missing: bool,
+    // --- Challenge-WebView engine helper (docs/web-engine-plan.md, M3) ----------------------------
+    /// 2026-07-03: explicit path to the out-of-process `eclipse-webview` helper binary. Resolution
+    /// order (the spawn contract in `src/webview/mod.rs`): this field, else `$ECLIPSE_WEBVIEW_HELPER`,
+    /// else a sibling `eclipse-webview` beside the running executable, else the dev-tree build under
+    /// `crates/eclipse-webview/target/{release,debug}`. A SET-but-missing path is an actionable
+    /// error, never a silent fallthrough. `None` (the default) = resolve automatically.
+    pub webview_helper_path: Option<String>,
 }
 
 impl Default for Config {
@@ -103,6 +110,7 @@ impl Default for Config {
             apk_url: None,
             apk_sha256: None,
             auto_fetch_missing: false,
+            webview_helper_path: None,
         }
     }
 }

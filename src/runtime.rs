@@ -792,6 +792,12 @@ const LIBART_DLOPEN_FLAGS: std::os::raw::c_int =
 /// `AttachCurrentThread`/cross-thread `JNIEnv`. Holding the handle alive keeps a reachable VM on
 /// the main thread for those later calls.
 ///
+/// 2026-07-03 (web-engine M3): the webview socket-reader thread (`eclipse-webview-io`) is the
+/// recorded exception to the sentence above — it holds a `jni::vm::JavaVM` (`Send + Sync` in the
+/// pinned jni 0.22.4 source) obtained via `Env::get_java_vm` inside a main-thread native, and
+/// attaches ITSELF (`attach_current_thread`) to fire the `WebView.internalLoadChanged` upcalls.
+/// `Vm` itself stays main-thread-pinned; its `!Send`/`!Sync` guards below are unchanged.
+///
 /// The libart mapping itself is kept resident for the process lifetime by [`boot`]'s
 /// `Library::into_raw()` leak (see [`boot`]'s docs), so `Vm` does not own the `libloading::Library`
 /// and has **no** `Drop`: tearing the VM down (`DestroyJavaVM` + unload) is a separately-designed

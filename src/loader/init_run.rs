@@ -97,7 +97,10 @@ impl std::error::Error for InitRunError {}
 
 /// The Roblox APK candidates: the explicit env override, then the default dev-host location.
 /// Mirrors `link.rs`'s test helper (kept in sync, dev-host only).
-fn find_roblox_apk() -> Option<std::path::PathBuf> {
+///
+/// 2026-07-03 (web-engine M3): made `pub` so `main.rs::run_webview_test` (the `__webview-test`
+/// dev-host harness) reuses THIS discovery instead of a third copy.
+pub fn find_roblox_apk() -> Option<std::path::PathBuf> {
     std::env::var_os("ECLIPSE_ROBLOX_APK")
         .map(std::path::PathBuf::from)
         .into_iter()

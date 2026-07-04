@@ -477,6 +477,60 @@ pub fn find_by_class(name: &str) -> Option<ViewHandle> {
     None
 }
 
+/// 2026-07-03 (web-engine M3): the ABSOLUTE on-screen rect `(x, y, w, h)` of the view `handle`,
+/// computed by walking the recorded tree from [`active_root`] and summing each ancestor's laid-out
+/// frame origin (frames are recorded PARENT-RELATIVE by `View.native_layout` — see
+/// [`ViewState::frame`]). Returns `None` when the view is unreachable from the active root, has no
+/// recorded frame, or the frame is degenerate. Main-thread cadence only: the webview composite on
+/// the engine present thread reads a CACHED copy (`webview::client::update_composited_rect`) — the
+/// present thread never calls this.
+pub fn absolute_frame(handle: ViewHandle) -> Option<(i32, i32, u32, u32)> {
+    /// Mirrors [`snapshot_tree`]'s nesting cap (defensive against a malformed registry).
+    const MAX_DEPTH: u32 = 256;
+    if handle == 0 {
+        return None;
+    }
+    let root = active_root();
+    if root == 0 {
+        return None;
+    }
+    let reg = lock().ok()?;
+    // Iterative DFS carrying the accumulated ancestor origin. A view with no recorded frame
+    // contributes (0, 0) to its children (never laid out → its parent-relative origin is unknown;
+    // 0 is the honest neutral). Bounds+generation-checked, so a stale/cyclic handle is skipped.
+    let mut stack: Vec<(ViewHandle, i32, i32, u32)> = vec![(root, 0, 0, 0)];
+    while let Some((h, ox, oy, depth)) = stack.pop() {
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let (index, generation) = unpack(h);
+        let Some(slot) = reg.slots.get(index as usize) else {
+            continue;
+        };
+        if slot.generation != generation {
+            continue;
+        }
+        let Some(state) = slot.state.as_ref() else {
+            continue;
+        };
+        if h == handle {
+            let [l, t, r, b] = state.frame?;
+            if r <= l || b <= t {
+                return None;
+            }
+            return Some((ox + l, oy + t, (r - l) as u32, (b - t) as u32));
+        }
+        let (cx, cy) = match state.frame {
+            Some([l, t, _, _]) => (ox + l, oy + t),
+            None => (ox, oy),
+        };
+        for &child in state.children.iter().rev() {
+            stack.push((child, cx, cy, depth + 1));
+        }
+    }
+    None
+}
+
 /// A flattened, owned snapshot of one view in the recorded tree — what the renderer reads per frame.
 ///
 /// 2026-06-05: a depth-first, owned copy (no registry handles / locks held by the renderer) so the
@@ -752,6 +806,39 @@ mod tests {
             ),
             "native_destructor(0) (failed-construct finalizer path) must be Err, never panic"
         );
+    }
+
+    // 2026-07-03 (web-engine M3): the webview composite's rect derivation. Frames are recorded
+    // parent-relative by native_layout, so the absolute rect must sum ancestor origins; a view
+    // unreachable from the active root (or with no recorded frame) must be None so the composite
+    // falls back honestly instead of drawing at a wrong place.
+    #[test]
+    fn absolute_frame_sums_ancestor_origins_and_rejects_unreachable_views() {
+        let child = allocate("android.webkit.WebView").expect("alloc child");
+        set_frame(child, [5, 7, 105, 57]).expect("frame child");
+        let root = allocate("android.widget.FrameLayout").expect("alloc root");
+        set_frame(root, [10, 20, 800, 600]).expect("frame root");
+        with_view(root, |s| s.children.push(child)).expect("wire child");
+        let orphan = allocate("android.view.View").expect("alloc orphan");
+        set_frame(orphan, [1, 1, 2, 2]).expect("frame orphan");
+        let frameless = allocate("android.view.View").expect("alloc frameless");
+        with_view(root, |s| s.children.push(frameless)).expect("wire frameless");
+
+        set_active_root(root);
+        // child absolute = root origin (10, 20) + child frame (5, 7); size from the child frame.
+        assert_eq!(absolute_frame(child), Some((15, 27, 100, 50)));
+        // The root itself: its own frame at the accumulated (0, 0) origin.
+        assert_eq!(absolute_frame(root), Some((10, 20, 790, 580)));
+        // Unreachable from the active root → None (never a fabricated rect).
+        assert_eq!(absolute_frame(orphan), None);
+        // Reachable but never laid out (no frame) → None.
+        assert_eq!(absolute_frame(frameless), None);
+        // The reserved null handle is never resolvable.
+        assert_eq!(absolute_frame(0), None);
+        set_active_root(0);
+        for h in [child, root, orphan, frameless] {
+            free(h).expect("free");
+        }
     }
 
     #[test]

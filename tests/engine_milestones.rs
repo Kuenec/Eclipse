@@ -181,6 +181,87 @@ fn gl_test_anw_binds_real_wsi_handle() {
     );
 }
 
+/// Guards `eclipse __webview-test` (2026-07-03, web-engine plan M3): the WebView engine pipeline —
+/// boot ART (framework classpath), drive the installed-dex `WebView.loadUrl` through the
+/// registered spawn-and-forward native into the out-of-process `eclipse-webview` helper, and
+/// require BOTH real `internalLoadChanged` upcalls (0 and 3), a nonzero-ink staged frame in the
+/// main process, a clean `ViewClosed`, and helper exit 0 — plus the live `bound=3` WebView
+/// registration line (previously only live-boot-pinned). SKIPS when the Roblox APK or a display
+/// server is absent, and when the helper/CEF payload is unavailable on the host (the two
+/// actionable-error substrings are pinned to the client's own `pub const` markers so the skip
+/// condition and the error text can never drift apart) — never a generic-failure skip.
+#[test]
+fn webview_test_fires_load_upcalls_and_stages_frames() {
+    if !roblox_apk_present() {
+        eprintln!(
+            "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK or place it at \
+             $HOME/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk)"
+        );
+        return;
+    }
+    if !display_available() {
+        eprintln!(
+            "SKIP: no display server (WAYLAND_DISPLAY/DISPLAY unset) — the CEF helper needs one"
+        );
+        return;
+    }
+
+    let out = run_eclipse("__webview-test");
+    let text = combined(&out);
+
+    if !out.status.success()
+        && (text.contains(eclipse::webview::client::HELPER_NOT_FOUND_MARKER)
+            || text.contains(eclipse::webview::client::NO_DISPLAY_MARKER))
+    {
+        eprintln!(
+            "SKIP: eclipse-webview helper/CEF unavailable on this host (env limitation)\n{text}"
+        );
+        return;
+    }
+
+    assert!(
+        out.status.success(),
+        "__webview-test exited non-zero ({:?}); WebView engine pipeline regression.\n{text}",
+        out.status.code()
+    );
+    // Display marker (main.rs::WebViewTestReport): "WebView engine pipeline OK:
+    // internalLoadChanged upcalls 2/2 (state 0 @ Xms, state 3 @ Yms, http Z), frame WxH N
+    // distinct pixels, ViewClosed, helper exit 0". "upcalls 2/2" is load-bearing — it counts
+    // SUCCESSFUL Java dispatches of the previously-dead internalLoadChanged seam.
+    assert!(
+        text.contains("WebView engine pipeline OK:") && text.contains("upcalls 2/2"),
+        "missing the WebView pipeline success marker (natives→socket→helper→upcall regression?).\n{text}"
+    );
+    assert!(
+        text.contains("bound=3"),
+        "the WebView native registration count regressed (expected the live bound=3 line).\n{text}"
+    );
+}
+
+/// 2026-07-03 (web-engine plan M3): the root crate must stay cef-free — the CEF engine lives ONLY
+/// in the workspace-detached `crates/eclipse-webview` helper, and the main (ART) process speaks
+/// nothing but the owned std-only IPC protocol in `src/webview/`. This automates the M2-manual
+/// `Cargo.lock` check; it always runs (no precondition), so a dependency edit that drags cef into
+/// the root lockfile fails the plain `cargo test` gate.
+#[test]
+fn root_lockfile_stays_cef_free() {
+    let lock_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock");
+    let lock = std::fs::read_to_string(lock_path)
+        .unwrap_or_else(|e| panic!("cannot read {lock_path}: {e}"));
+    for package in [
+        "name = \"cef\"",
+        "name = \"cef-dll-sys\"",
+        "name = \"download-cef\"",
+        "name = \"export-cef-dir\"",
+    ] {
+        assert!(
+            !lock.contains(package),
+            "the root Cargo.lock gained a CEF package entry ({package}) — the engine must stay \
+             confined to the workspace-detached crates/eclipse-webview helper"
+        );
+    }
+}
+
 /// Guards `eclipse __input-test` (2026-06-05): the REAL `ALooper` input path — register a synthetic
 /// engine input fd, park in `pollOnce`, inject the fd signal (expect the registered ident), then park
 /// again and inject a host-input wake (expect `ALOOPER_POLL_WAKE`). A regression in the looper

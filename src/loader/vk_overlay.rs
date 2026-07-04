@@ -21,6 +21,16 @@
 //! rate-limited-logs the captured state, proving the seam fires and the swapchain image is reachable
 //! BEFORE any GPU drawing is added. The synchronized overlay draw is layered on once Step A is
 //! confirmed by a live boot.
+//!
+//! 2026-07-03 (web-engine plan M3) — WEBVIEW COMPOSITE: while a challenge WebView is live
+//! (`crate::webview::client::active_view() != 0`), each present also composites the helper's
+//! staged BGRA frame into the presented image at the cached view rect
+//! ([`composite_webview_frame`], reusing the [`Probe`] upload machinery). This seam is
+//! VULKAN-ONLY at M3 (honest): the engine present is `vkQueuePresentKHR` (Mode 6 — the live-boot
+//! fact above). The GL-mode composite is DEFERRED with its seam recorded: a tier-0
+//! `eglSwapBuffers` interposer registered in `native_provider.rs` beside
+//! `eclipse_egl_get_display` (first-strong-match), needed only if a GL-mode engine boot ever
+//! meets the challenge.
 
 use ab_glyph::{Font, FontVec, ScaleFont};
 use ash::vk;
@@ -595,6 +605,17 @@ fn find_host_visible_mem_type(
 
 static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 
+/// 2026-07-03 (web-engine M3): the webview composite's own reused [`Probe`] (separate from the
+/// field probe so the two rects/buffers never fight; both are built via [`ensure_probe_in`]).
+static WEB_COMPOSITE: Mutex<Option<Probe>> = Mutex::new(None);
+
+/// The last `(generation << 32 | seq)` whose staged bytes were CPU-copied into the webview
+/// composite buffer. Unchanged staging skips the ~3 MB row copy (the buffer already holds the
+/// pixels); the GPU copy-to-image still runs EVERY present, because the engine repaints the
+/// whole frame each present (the same reason the text overlay draws every present — see the
+/// dated note in `present_with_overlay`).
+static WEB_COMPOSITE_LAST: AtomicU64 = AtomicU64::new(0);
+
 /// Field-readback diagnostic (env `ECLIPSE_VK_PROBE`): copies the login-field rect out of the engine's
 /// presented swapchain image into a host-visible buffer and writes `/tmp/eclipse_field_probe.png` — a
 /// compositor-INDEPENDENT way to SEE exactly what the engine renders in the field (the dev host can't
@@ -991,6 +1012,148 @@ impl Probe {
         }
         true
     }
+
+    /// 2026-07-03 (web-engine M3): write the staged webview BGRA frame into this probe's
+    /// host-visible buffer (CPU row copy, skipped when `refresh` is false — the buffer already
+    /// holds the frame), then copy the buffer INTO the presented swapchain image at `self.rect` —
+    /// exactly the writeback half of [`Self::capture`], without the readback. Returns `true` iff
+    /// the submit consumed `engine_waits` (the caller must then present with a cleared wait
+    /// list); `false` on any error (caller presents unmodified).
+    ///
+    /// # Safety
+    /// As [`Self::capture`]: `queue` is the engine's present queue; `image_raw` the presented
+    /// swapchain image; `engine_waits` the present's wait semaphores (valid for the call).
+    #[allow(clippy::too_many_arguments)] // 2026-07-03: capture-shaped GPU args + the staged-source triple.
+    unsafe fn upload_bgra(
+        &self,
+        queue: vk::Queue,
+        image_raw: u64,
+        engine_waits: &[vk::Semaphore],
+        src: &[u8],
+        src_stride: usize,
+        swizzle: bool,
+        refresh: bool,
+    ) -> bool {
+        let image = vk::Image::from_raw(image_raw);
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        // SAFETY: all handles are this probe's, on `self.device`; the standard fence-wait →
+        // (CPU write) → record → submit → wait sequence. Each fallible step bails (→ caller
+        // presents unmodified). The CPU write happens AFTER the fence wait, so no in-flight
+        // submit reads the buffer while it is rewritten (HOST_VISIBLE|HOST_COHERENT memory).
+        unsafe {
+            if self
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .is_err()
+                || self.device.reset_fences(&[self.fence]).is_err()
+                || self
+                    .device
+                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                    .is_err()
+            {
+                return false;
+            }
+            if refresh {
+                let w = self.rect.extent.width as usize;
+                let h = self.rect.extent.height as usize;
+                let dst = std::slice::from_raw_parts_mut(self.mapped, w * h * 4);
+                if !bgra_rows_into(dst, w * 4, src, src_stride, h, w * 4, swizzle) {
+                    return false;
+                }
+            }
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
+                return false;
+            }
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::MEMORY_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D {
+                    x: self.rect.offset.x,
+                    y: self.rect.offset.y,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: self.rect.extent.width,
+                    height: self.rect.extent.height,
+                    depth: 1,
+                });
+            self.device.cmd_copy_buffer_to_image(
+                self.cmd,
+                self.buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            let back = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[back],
+            );
+            if self.device.end_command_buffer(self.cmd).is_err() {
+                return false;
+            }
+            let wait_stages = vec![vk::PipelineStageFlags::TRANSFER; engine_waits.len()];
+            let cmds = [self.cmd];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(engine_waits)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cmds);
+            if self
+                .device
+                .queue_submit(queue, &[submit], self.fence)
+                .is_err()
+            {
+                return false;
+            }
+            if self
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Drop for Probe {
@@ -1006,24 +1169,28 @@ impl Drop for Probe {
     }
 }
 
-/// Build the probe (best-effort), or rebuild it if the field `rect` changed (the login layout drifts, so
-/// the focused field moves/resizes — the probe's buffer + copy region are sized to the rect).
-fn ensure_probe(rect: vk::Rect2D) {
-    let Ok(mut guard) = PROBE.lock() else { return };
+/// Build (or rebuild on a rect change) the probe object held in `slot` — the shared core of the
+/// field probe and (2026-07-03, M3) the webview composite; both buffers + copy regions are sized
+/// to their rect. Returns `true` iff a NEW probe was built (its mapped buffer starts undefined,
+/// so a webview caller must refresh its CPU contents).
+fn ensure_probe_in(slot: &'static Mutex<Option<Probe>>, rect: vk::Rect2D) -> bool {
+    let Ok(mut guard) = slot.lock() else {
+        return false;
+    };
     if guard.as_ref().is_some_and(|p| {
         p.rect.offset.x == rect.offset.x
             && p.rect.offset.y == rect.offset.y
             && p.rect.extent.width == rect.extent.width
             && p.rect.extent.height == rect.extent.height
     }) {
-        return; // already current
+        return false; // already current
     }
     let device = STATE.lock().map(|s| s.device).unwrap_or(0);
     if device == 0 {
-        return;
+        return false;
     }
     let Some(entry) = super::vulkan_wsi::host_entry() else {
-        return;
+        return false;
     };
     // Drop any stale probe (its Drop idles + frees) BEFORE building the new one for the changed rect.
     *guard = None;
@@ -1040,10 +1207,216 @@ fn ensure_probe(rect: vk::Rect2D) {
             y = rect.offset.y,
             w = rect.extent.width,
             h = rect.extent.height,
-            "vk-overlay: field overlay/probe built for field rect"
+            "vk-overlay: overlay/composite objects built for rect"
         );
         *guard = Some(p);
+        return true;
     }
+    false
+}
+
+/// Build the field probe (best-effort), or rebuild it if the field `rect` changed (the login
+/// layout drifts, so the focused field moves/resizes).
+fn ensure_probe(rect: vk::Rect2D) {
+    let _ = ensure_probe_in(&PROBE, rect);
+}
+
+// === Webview composite (web-engine plan M3, 2026-07-03) ==========================================
+
+/// How the staged BGRA webview frame maps onto the captured swapchain format
+/// (detect-don't-assume: never write garbage for an unknown format).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompositeFormat {
+    /// `B8G8R8A8_{UNORM,SRGB}` — the helper's BGRA bytes copy verbatim.
+    Bgra,
+    /// `R8G8B8A8_{UNORM,SRGB}` — swizzle R↔B during the row copy.
+    RgbaSwizzle,
+    /// Anything else: one-shot WARN + skip (honest degradation, no garbage on screen).
+    Unsupported,
+}
+
+/// Classify the RAW `VkFormat` value captured from the engine's swapchain create-info.
+fn classify_swapchain_format(raw: i32) -> CompositeFormat {
+    let f = vk::Format::from_raw(raw);
+    if f == vk::Format::B8G8R8A8_UNORM || f == vk::Format::B8G8R8A8_SRGB {
+        CompositeFormat::Bgra
+    } else if f == vk::Format::R8G8B8A8_UNORM || f == vk::Format::R8G8B8A8_SRGB {
+        CompositeFormat::RgbaSwizzle
+    } else {
+        CompositeFormat::Unsupported
+    }
+}
+
+/// Row-copy `rows` rows of `row_bytes` from the staged frame (`src`, stride `src_stride`) into
+/// the composite buffer (`dst`, stride `dst_stride`), optionally swizzling BGRA→RGBA. Pure +
+/// total (`false` on any out-of-bounds geometry — never a panic on the present thread).
+fn bgra_rows_into(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    rows: usize,
+    row_bytes: usize,
+    swizzle: bool,
+) -> bool {
+    for r in 0..rows {
+        let Some(src_start) = r.checked_mul(src_stride) else {
+            return false;
+        };
+        let Some(dst_start) = r.checked_mul(dst_stride) else {
+            return false;
+        };
+        let Some(srow) = src.get(src_start..src_start + row_bytes) else {
+            return false;
+        };
+        let Some(drow) = dst.get_mut(dst_start..dst_start + row_bytes) else {
+            return false;
+        };
+        if swizzle {
+            for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        } else {
+            drow.copy_from_slice(srow);
+        }
+    }
+    true
+}
+
+/// Clamp the requested webview rect to the surface AND the staged frame's own dimensions
+/// (top-left crop, no scaling at M3 — documented cut). `None` = no visible overlap (skip the
+/// composite this present). Pure — unit-pinned.
+#[allow(clippy::too_many_arguments)] // 2026-07-03: 8 scalars beat an ad-hoc struct for a pure clamp.
+fn clamp_webview_rect(
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    extent_w: u32,
+    extent_h: u32,
+    stage_w: u32,
+    stage_h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if extent_w == 0 || extent_h == 0 || stage_w == 0 || stage_h == 0 || w == 0 || h == 0 {
+        return None;
+    }
+    let cx = u32::try_from(x.max(0)).ok()?;
+    let cy = u32::try_from(y.max(0)).ok()?;
+    if cx >= extent_w || cy >= extent_h {
+        return None;
+    }
+    let cw = w.min(stage_w).min(extent_w - cx);
+    let ch = h.min(stage_h).min(extent_h - cy);
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    Some((cx, cy, cw, ch))
+}
+
+/// Composite the active WebView's staged helper frame into the presented swapchain image.
+/// Returns `true` iff the submit consumed `engine_waits` (the caller then presents with a
+/// cleared wait list — the probe's `consumed` plumbing).
+///
+/// Runs on the engine present thread: the ONLY client state it touches is the try-locked staging
+/// buffer ([`with_latest_frame`](crate::webview::client::with_latest_frame) — contention skips
+/// this present) and the cached rect; it never walks the registry or touches the socket.
+fn composite_webview_frame(
+    queue: vk::Queue,
+    view: i64,
+    image_raw: u64,
+    extent: vk::Extent2D,
+    format_raw: i32,
+    engine_waits: &[vk::Semaphore],
+) -> bool {
+    let swizzle = match classify_swapchain_format(format_raw) {
+        CompositeFormat::Bgra => false,
+        CompositeFormat::RgbaSwizzle => true,
+        CompositeFormat::Unsupported => {
+            static FORMAT_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FORMAT_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    format = format_raw,
+                    "vk-overlay: webview composite skipped — unsupported swapchain format \
+                     (expected B8G8R8A8/R8G8B8A8 UNORM/SRGB)"
+                );
+            }
+            return false;
+        }
+    };
+    crate::webview::client::with_latest_frame(view, |stage| {
+        if stage.bytes.is_empty() {
+            return false;
+        }
+        // The cached absolute view rect (main-thread refreshed), else a centered rect of the
+        // stage's own dimensions (documented fallback; exact challenge-rect fidelity is
+        // re-validated at M6 per the plan's field-probe recalibration technique).
+        let (x, y, w, h) = match crate::webview::client::composited_rect() {
+            Some(r) => r,
+            None => {
+                let w = stage.width.min(extent.width);
+                let h = stage.height.min(extent.height);
+                (
+                    ((extent.width - w) / 2) as i32,
+                    ((extent.height - h) / 2) as i32,
+                    w,
+                    h,
+                )
+            }
+        };
+        let Some((cx, cy, cw, ch)) = clamp_webview_rect(
+            x,
+            y,
+            w,
+            h,
+            extent.width,
+            extent.height,
+            stage.width,
+            stage.height,
+        ) else {
+            return false;
+        };
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: cx as i32,
+                y: cy as i32,
+            },
+            extent: vk::Extent2D {
+                width: cw,
+                height: ch,
+            },
+        };
+        let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect);
+        let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
+        let refresh = rebuilt || WEB_COMPOSITE_LAST.load(Ordering::Relaxed) != key;
+        let consumed = match WEB_COMPOSITE.lock() {
+            Ok(guard) => match guard.as_ref() {
+                // SAFETY: the probe's objects live on the engine's captured device; `queue` /
+                // `engine_waits` are the engine's own present arguments (the `capture` contract).
+                Some(p) => unsafe {
+                    p.upload_bgra(
+                        queue,
+                        image_raw,
+                        engine_waits,
+                        &stage.bytes,
+                        stage.stride as usize,
+                        swizzle,
+                        refresh,
+                    )
+                },
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if consumed && refresh {
+            WEB_COMPOSITE_LAST.store(key, Ordering::Relaxed);
+        }
+        consumed
+    })
+    .unwrap_or(false)
 }
 
 /// Composite the overlay into the presented image (if our swapchain is being presented + the renderer is
@@ -1058,15 +1431,23 @@ unsafe fn present_with_overlay(
     queue: vk::Queue,
     p_present_info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
-    if p_present_info.is_null() || (!overlay_enabled() && !probe_enabled()) {
-        // Overlay opted out + probe off, or null info → forward the engine's present unchanged.
+    if p_present_info.is_null() {
         // SAFETY: forwarding `(queue, p_present_info)` is the plain host present path.
         return unsafe { host(queue, p_present_info) };
     }
-    // Fast path: the overlay is on by default, but it only has work when a text field is focused. With no
-    // focused field and no probe, skip ALL the per-present work (locks, readback) — zero gameplay cost.
-    // (A cheap atomic check before any lock.)
-    if !probe_enabled() && crate::framework::active_text_field() == 0 {
+    // 2026-07-03 (web-engine M3): a live challenge WebView is the third composite trigger beside
+    // the text overlay and the probe. The idle gate cost stays ONE atomic load per trigger (the
+    // active_text_field §2.4 precedent) — zero per-present work during gameplay.
+    let webview_live = crate::webview::client::active_view() != 0;
+    if !overlay_enabled() && !probe_enabled() && !webview_live {
+        // Overlay opted out + probe off + no webview → forward the engine's present unchanged.
+        // SAFETY: forwarding `(queue, p_present_info)` is the plain host present path.
+        return unsafe { host(queue, p_present_info) };
+    }
+    // Fast path: the overlay is on by default, but it only has work when a text field is focused
+    // (or a webview is live). Otherwise skip ALL the per-present work (locks, readback) — zero
+    // gameplay cost. (Cheap atomic checks before any lock.)
+    if !probe_enabled() && crate::framework::active_text_field() == 0 && !webview_live {
         // SAFETY: plain host present — nothing to composite this frame.
         return unsafe { host(queue, p_present_info) };
     }
@@ -1081,20 +1462,46 @@ unsafe fn present_with_overlay(
         return unsafe { host(queue, p_present_info) };
     };
 
+    let (extent, image_raw, format_raw) = match STATE.lock() {
+        Ok(st) => (
+            vk::Extent2D {
+                width: st.width,
+                height: st.height,
+            },
+            st.images.get(image_index as usize).copied().unwrap_or(0),
+            st.format,
+        ),
+        Err(_) => (vk::Extent2D::default(), 0, 0),
+    };
+    let engine_waits: &[vk::Semaphore] =
+        if pi.wait_semaphore_count > 0 && !pi.p_wait_semaphores.is_null() {
+            // SAFETY: per the contract `p_wait_semaphores` holds `wait_semaphore_count` entries.
+            unsafe {
+                std::slice::from_raw_parts(pi.p_wait_semaphores, pi.wait_semaphore_count as usize)
+            }
+        } else {
+            &[]
+        };
+    // Once ANY composite submit consumes + fence-waits the engine waits, later submits and the
+    // final present must run with an empty wait list (the probe's `consumed` plumbing).
+    let mut waits_consumed = false;
+
+    // --- Webview composite (M3): every present while a staged frame exists — the engine repaints
+    // the whole image each present, so a skipped composite would flicker (the exact reason the
+    // text overlay below also runs on every present). Unchanged staging skips only the CPU copy.
+    if webview_live && image_raw != 0 {
+        let view = crate::webview::client::active_view();
+        if view != 0
+            && composite_webview_frame(queue, view, image_raw, extent, format_raw, engine_waits)
+        {
+            waits_consumed = true;
+        }
+    }
+
     // Field-readback probe takes priority over the draw: copy the field rect out of the presented image,
     // write the PNG, then present with the engine wait semaphores cleared (the probe submit consumed +
     // fence-waited them). Rate-limited — the readback fence-wait stalls the queue, so do it ~twice/sec.
     if probe_enabled() || overlay_enabled() {
-        let (extent, image_raw) = match STATE.lock() {
-            Ok(st) => (
-                vk::Extent2D {
-                    width: st.width,
-                    height: st.height,
-                },
-                st.images.get(image_index as usize).copied().unwrap_or(0),
-            ),
-            Err(_) => (vk::Extent2D::default(), 0),
-        };
         // Text to draw onto the field: the focused field's live text (when overlay enabled), or a
         // hardcoded test string (env `ECLIPSE_VK_TEXT_TEST`) so the render path can be verified without a
         // focused field. `None` → readback-only (probe diagnostic).
@@ -1120,47 +1527,40 @@ unsafe fn present_with_overlay(
         // one). The readback fence-wait stalls the queue, but this only runs under the env-gated overlay/
         // probe (never in a normal/gameplay boot). No active field + not probing → plain present.
         let run = image_raw != 0 && (draw_text.is_some() || probe_enabled());
-        if !run {
-            return unsafe { host(queue, p_present_info) };
-        }
-        // Use the focused field's LIVE geometry (cached from the engine by the main thread) so the text
-        // lands where the field actually is — the login layout drifts. Fall back to the hardcoded login
-        // rect (test/diagnostic). Clamp to the surface.
-        let rect = field_rect(extent);
-        ensure_probe(rect);
-        let engine_waits: &[vk::Semaphore] = if pi.wait_semaphore_count > 0
-            && !pi.p_wait_semaphores.is_null()
-        {
-            // SAFETY: per the contract `p_wait_semaphores` holds `wait_semaphore_count` entries.
-            unsafe {
-                std::slice::from_raw_parts(pi.p_wait_semaphores, pi.wait_semaphore_count as usize)
-            }
-        } else {
-            &[]
-        };
-        let consumed = match PROBE.lock() {
-            Ok(guard) => match guard.as_ref() {
-                // SAFETY: probe objects are on the engine's device; `queue`/`engine_waits` are the engine's.
-                Some(p) => unsafe {
-                    p.capture(queue, image_raw, engine_waits, draw_text.as_deref())
+        if run {
+            // Use the focused field's LIVE geometry (cached from the engine by the main thread) so the
+            // text lands where the field actually is — the login layout drifts. Fall back to the
+            // hardcoded login rect (test/diagnostic). Clamp to the surface.
+            let rect = field_rect(extent);
+            ensure_probe(rect);
+            // 2026-07-03 (M3): if the webview composite above already consumed + fence-waited the
+            // engine waits, the probe submit must not wait on them a second time.
+            let field_waits: &[vk::Semaphore] = if waits_consumed { &[] } else { engine_waits };
+            let consumed = match PROBE.lock() {
+                Ok(guard) => match guard.as_ref() {
+                    // SAFETY: probe objects are on the engine's device; `queue`/the waits are the engine's.
+                    Some(p) => unsafe {
+                        p.capture(queue, image_raw, field_waits, draw_text.as_deref())
+                    },
+                    None => false,
                 },
-                None => false,
-            },
-            Err(_) => false,
-        };
-        if consumed {
-            // The probe consumed + fence-waited the engine waits; present with them cleared so the host
-            // present does not wait on already-consumed semaphores.
-            let mut info = *pi;
-            info.wait_semaphore_count = 0;
-            info.p_wait_semaphores = std::ptr::null();
-            // SAFETY: `info` copies the present info with no wait semaphores; swapchain/image arrays unchanged.
-            return unsafe { host(queue, &info) };
+                Err(_) => false,
+            };
+            if consumed {
+                waits_consumed = true;
+            }
         }
-        return unsafe { host(queue, p_present_info) };
     }
 
-    // Neither probe nor overlay matched (e.g. our swapchain not in this present) → unmodified present.
+    if waits_consumed {
+        // A composite submit consumed + fence-waited the engine waits; present with them cleared so
+        // the host present does not wait on already-consumed semaphores.
+        let mut info = *pi;
+        info.wait_semaphore_count = 0;
+        info.p_wait_semaphores = std::ptr::null();
+        // SAFETY: `info` copies the present info with no wait semaphores; swapchain/image arrays unchanged.
+        return unsafe { host(queue, &info) };
+    }
     // SAFETY: forwarding `(queue, p_present_info)` is the plain host present path.
     unsafe { host(queue, p_present_info) }
 }
@@ -1216,4 +1616,99 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
         unsafe { std::mem::transmute::<usize, vk::PFN_vkQueuePresentKHR>(addr) };
     // SAFETY: forwards (queue, present-info) to the host, compositing the overlay first when applicable.
     unsafe { present_with_overlay(host, queue, p_present_info) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 2026-07-03 (web-engine M3): the webview composite's PURE parts — the row copy/swizzle and
+    // the rect clamp — pinned in plain `cargo test` (no GPU pretense; the GPU half mirrors the
+    // live-proven Probe writeback and is exercised at the M6 live boot).
+
+    #[test]
+    fn bgra_rows_into_copies_and_swizzles_rows() {
+        // 2x2 BGRA source with a wider stride (16) than the row payload (8).
+        #[rustfmt::skip]
+        let src: Vec<u8> = vec![
+            /* row 0 */ 1, 2, 3, 4,  5, 6, 7, 8,  0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+            /* row 1 */ 9, 10, 11, 12,  13, 14, 15, 16,  0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+        ];
+        // Verbatim copy (B8G8R8A8 swapchain): the stride padding must never leak into dst.
+        let mut dst = vec![0u8; 16];
+        assert!(bgra_rows_into(&mut dst, 8, &src, 16, 2, 8, false));
+        assert_eq!(
+            dst,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        // Swizzled copy (R8G8B8A8 swapchain): BGRA → RGBA swaps bytes 0 and 2 of each pixel.
+        let mut dst = vec![0u8; 16];
+        assert!(bgra_rows_into(&mut dst, 8, &src, 16, 2, 8, true));
+        assert_eq!(
+            dst,
+            vec![3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16]
+        );
+        // Total on bad geometry: a source too short for the requested rows is `false`, no panic
+        // (this runs on the engine present thread under panic = "abort").
+        let mut dst = vec![0u8; 16];
+        assert!(!bgra_rows_into(&mut dst, 8, &src[..8], 16, 2, 8, false));
+        let mut dst = vec![0u8; 8];
+        assert!(!bgra_rows_into(&mut dst, 8, &src, 16, 2, 8, false));
+    }
+
+    #[test]
+    fn classify_swapchain_format_detects_bgra_rgba_and_rejects_the_rest() {
+        assert_eq!(
+            classify_swapchain_format(vk::Format::B8G8R8A8_UNORM.as_raw()),
+            CompositeFormat::Bgra
+        );
+        assert_eq!(
+            classify_swapchain_format(vk::Format::B8G8R8A8_SRGB.as_raw()),
+            CompositeFormat::Bgra
+        );
+        assert_eq!(
+            classify_swapchain_format(vk::Format::R8G8B8A8_UNORM.as_raw()),
+            CompositeFormat::RgbaSwizzle
+        );
+        assert_eq!(
+            classify_swapchain_format(vk::Format::R8G8B8A8_SRGB.as_raw()),
+            CompositeFormat::RgbaSwizzle
+        );
+        // Detect-don't-assume: anything else must be refused (skip + one-shot WARN), never
+        // written as garbage.
+        assert_eq!(
+            classify_swapchain_format(vk::Format::R5G6B5_UNORM_PACK16.as_raw()),
+            CompositeFormat::Unsupported
+        );
+        assert_eq!(classify_swapchain_format(0), CompositeFormat::Unsupported);
+    }
+
+    #[test]
+    fn clamp_webview_rect_crops_top_left_to_surface_and_stage() {
+        // Fully inside, stage large enough → unchanged.
+        assert_eq!(
+            clamp_webview_rect(10, 20, 300, 200, 800, 600, 1024, 768),
+            Some((10, 20, 300, 200))
+        );
+        // Rect wider than the staged frame → top-left crop to the stage (no scaling at M3).
+        assert_eq!(
+            clamp_webview_rect(10, 20, 300, 200, 800, 600, 128, 64),
+            Some((10, 20, 128, 64))
+        );
+        // Rect running off the surface → cropped to the surface.
+        assert_eq!(
+            clamp_webview_rect(700, 500, 300, 200, 800, 600, 1024, 768),
+            Some((700, 500, 100, 100))
+        );
+        // Negative origin clamps to 0 (the visible top-left crop).
+        assert_eq!(
+            clamp_webview_rect(-5, -7, 300, 200, 800, 600, 1024, 768),
+            Some((0, 0, 300, 200))
+        );
+        // No overlap / degenerate inputs → None (skip the composite, never a zero-size copy).
+        assert_eq!(clamp_webview_rect(900, 0, 10, 10, 800, 600, 64, 64), None);
+        assert_eq!(clamp_webview_rect(0, 0, 0, 10, 800, 600, 64, 64), None);
+        assert_eq!(clamp_webview_rect(0, 0, 10, 10, 800, 600, 0, 64), None);
+        assert_eq!(clamp_webview_rect(0, 0, 10, 10, 0, 0, 64, 64), None);
+    }
 }
