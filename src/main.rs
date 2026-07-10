@@ -593,6 +593,26 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     const LEG_DEADLINE: Duration = Duration::from_secs(15);
     const CLOSE_DEADLINE: Duration = Duration::from_secs(15);
 
+    // 2026-07-10 (plan M5): display-session echo — OBSERVABILITY ONLY. The helper's own
+    // `select_ozone` remains the single selection authority (the client still passes no ozone
+    // flag); this mirrors its env rule (set AND non-empty counts; `XDG_SESSION_TYPE` never
+    // consulted) so the run log shows the session shape beside the helper's own detection line,
+    // and a no-display host errors actionably BEFORE the ART boot cost.
+    let wayland_set = std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty());
+    let display_set = std::env::var("DISPLAY").is_ok_and(|v| !v.is_empty());
+    match (wayland_set, display_set) {
+        (true, _) => println!("# display: wayland (WAYLAND_DISPLAY set)"),
+        (false, true) => println!("# display: x11 (DISPLAY set, WAYLAND_DISPLAY unset)"),
+        (false, false) => {
+            return Err(
+                "no display detected: neither WAYLAND_DISPLAY nor DISPLAY is set — the \
+                        CEF helper needs a Wayland or X11 session (its own select_ozone would \
+                        refuse with the same error)"
+                    .into(),
+            )
+        }
+    }
+
     // 2026-07-09 (plan M4): an OFFLINE loopback page — a real http:// origin so the cookie + bridge
     // legs run in a normal browsing context (a data:/about:blank origin has opaque cookies).
     let port = start_loopback_page()?;

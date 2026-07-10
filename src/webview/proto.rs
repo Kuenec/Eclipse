@@ -427,6 +427,21 @@ pub enum HelperMsg {
     Console { view: i64, console: Console },
     /// 0x86 — `view == 0` is process-global. `kind`: 0=renderer-gone, 1=engine-init-failed
     /// (e.g. no display / ozone), 2=internal.
+    ///
+    /// 2026-07-10 (plan M5): kind=1 `code` values — 0 = no display / engine-init failure,
+    /// 2 = sandbox unavailable (the helper's policy refusal: neither unprivileged userns nor a
+    /// SUID chrome-sandbox, and the `--allow-unsandboxed` opt-in absent). Codes are DATA — the
+    /// wire layout is unchanged and v1 stays FROZEN (no version bump); the consumer's Crash
+    /// dispatch keys the latch reason on (kind, code).
+    ///
+    /// RECORDED SKEW CORNER (2026-07-10): an M4-built consumer (also protocol v2 — the
+    /// exact-match handshake succeeds) paired with an M5+ helper via `ECLIPSE_WEBVIEW_HELPER`
+    /// or a mixed sibling install maps `(1, 2)` through its code-blind kind=1 arm to the
+    /// no-display text — misleading on a sandbox-refusing host, though the raw `code=2` token
+    /// is embedded and the latch degrades honestly (one-shot WARN no-op, never a crash). This
+    /// deployment is out-of-contract per the recorded same-build-tree rationale for
+    /// exact-match versioning; the reverse direction (M5 consumer + M4 helper's legacy code 0)
+    /// is handled and unit-pinned in `client.rs`.
     Crash { view: i64, kind: u8, code: i32 },
     /// 0x87 — the solicited reply to `CookieGet`/`CookiesClear`, correlated by `request_id`.
     CookieList {

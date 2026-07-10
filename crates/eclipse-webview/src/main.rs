@@ -42,7 +42,9 @@ use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -91,14 +93,98 @@ fn parse_ozone_override<I: Iterator<Item = String>>(args: I) -> Option<String> {
         .last()
 }
 
+/// Live unprivileged-userns capability TEST (plan M5, 2026-07-10) — an honest measurement, not
+/// knob-file reading: the knob names/locations vary per distro (Debian/Arch
+/// `kernel.unprivileged_userns_clone`, Ubuntu 23.10+'s AppArmor gate, plain mainline none), so
+/// the only distro-agnostic answer is to fork a child that actually exercises the capability.
+///
+/// The child tests the predicate the sandbox NEEDS — a USABLE namespace, not a merely
+/// CREATABLE one (2026-07-10 review fix): on stock Ubuntu 24.04+ the default
+/// `kernel.apparmor_restrict_unprivileged_userns=1` is permit-then-confine — a bare
+/// `unshare(CLONE_NEWUSER)` from an unconfined process SUCCEEDS and the task is transitioned
+/// into the `unprivileged_userns` AppArmor profile, which denies every capability inside the
+/// new namespace (uid_map writes, `CLONE_NEWPID`, chroot); Chromium's own in-CefInitialize
+/// viability check then correctly judges the namespace sandbox unusable and LOG(FATAL)s "No
+/// usable sandbox!" AFTER HelloAck — past the designed pre-init refusal. So after a successful
+/// `unshare(CLONE_NEWUSER)` the child must additionally perform one capability-gated raw
+/// syscall inside the new namespace — `unshare(CLONE_NEWPID)` (ns_capable `CAP_SYS_ADMIN`, the
+/// exact capability the sandboxed zygote's `CLONE_NEWPID|CLONE_NEWNET` launch needs; the
+/// namespace creator holds the full capability set on unrestricted kernels, so a capable host
+/// can never be false-negatived).
+///
+/// INVARIANT: this MUST run before this process spawns any thread (it runs in the
+/// post-handshake / pre-`initialize` region, which uses only the main thread — the
+/// reader/writer threads spawn after `initialize`), because `fork` from a multithreaded
+/// process may only run async-signal-safe code in the child. The child here calls only
+/// `unshare` (twice) + `_exit` (all raw syscalls), so it is safe even against a hidden
+/// thread — the single-thread region keeps it trivially sound.
+fn probe_userns() -> bool {
+    // SAFETY: raw fork/unshare/_exit/waitpid. The child executes nothing but three
+    // async-signal-safe syscalls and never returns into Rust; the parent reaps it
+    // unconditionally. A fork failure reads as "not verified" (false) — the SUID tier and the
+    // config opt-in remain, so a false here can only move DOWN the tier ladder, never crash.
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return false;
+        }
+        if pid == 0 {
+            // Create, then USE (see the fn doc): the second unshare is the in-namespace
+            // capability test that fails EPERM under Ubuntu's `unprivileged_userns` profile.
+            let ok =
+                libc::unshare(libc::CLONE_NEWUSER) == 0 && libc::unshare(libc::CLONE_NEWPID) == 0;
+            libc::_exit(if ok { 0 } else { 1 });
+        }
+        let mut status: libc::c_int = 0;
+        if libc::waitpid(pid, &mut status, 0) != pid {
+            return false;
+        }
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+}
+
+/// The pure stat half of Chromium's SUID-helper acceptance predicate
+/// (`sandbox/linux/suid/client/setuid_sandbox_host.cc`): root-owned regular file, setuid
+/// (`S_ISUID`), AND world-executable (`S_IXOTH`) — the source of Chromium's canonical
+/// "owned by root and has mode 4755" FATAL. 2026-07-10 review fix: the earlier
+/// uid==0 && S_ISUID subset accepted a root:root 4750/4700 hardening chmod that Chromium
+/// rejects with a post-HelloAck LOG(FATAL), mis-selecting the Suid tier past the designed
+/// pre-init refusal (whose text names exactly the mode-4755 fix).
+fn suid_sandbox_stat_ok(is_file: bool, uid: u32, mode: u32) -> bool {
+    is_file && uid == 0 && mode & 0o4000 != 0 && mode & 0o001 != 0
+}
+
+/// Measure the SUID `chrome-sandbox` tier: a root-owned setuid world-executable regular file
+/// beside the helper binary (the CEF dist ships it 0755 — an admin `chown root:root && chmod
+/// 4755` enables this tier; the packaged-layout README documents it). Returns the path only
+/// when Chromium's own acceptance predicate holds — [`suid_sandbox_stat_ok`] plus a live
+/// `access(X_OK)` for the invoking user (Chromium requires both) — a measured stat, never an
+/// assumption.
+fn probe_suid_sandbox(exe_dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let path = exe_dir.join("chrome-sandbox");
+    let meta = std::fs::metadata(&path).ok()?;
+    if !suid_sandbox_stat_ok(meta.is_file(), meta.uid(), meta.mode()) {
+        return None;
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: plain libc::access on a valid NUL-terminated path; no memory is handed over.
+    (unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0).then_some(path)
+}
+
 // The `ozone` field is the explicit ozone selection, filled in before `initialize` (browser
 // process only; `None` until the handshake completes). `render_handler` is the renderer-side
-// JS-bridge/eval handler (plan M4) — active only in the CEF-forked renderer subprocess. (Field
-// doc comments are not accepted by the wrap_app! macro grammar.)
+// JS-bridge/eval handler (plan M4) — active only in the CEF-forked renderer subprocess.
+// `degraded_sandbox` (plan M5, 2026-07-10) records the helper's own policy-gated --no-sandbox
+// degradation so the strip loop keeps banning the switch as a PASS-THROUGH while never
+// desyncing Chromium from Settings.no_sandbox=1. (Field doc comments are not accepted by the
+// wrap_app! macro grammar.)
 wrap_app! {
     struct HelperApp {
         ozone: Arc<Mutex<Option<String>>>,
         render_handler: RenderProcessHandler,
+        degraded_sandbox: Arc<AtomicBool>,
     }
 
     impl App {
@@ -121,8 +207,16 @@ wrap_app! {
                 return;
             }
             // Strip the forbidden pass-through switches (the M1 stderr-URL-leak channel and
-            // the never---no-sandbox rule) no matter how they arrived.
+            // the never---no-sandbox rule) no matter how they arrived. 2026-07-10 (plan M5):
+            // routed through switch_should_be_stripped — when the helper ITSELF entered the
+            // policy-gated degradation, CEF propagates Settings.no_sandbox=1 onto this command
+            // line and stripping that copy would desync Chromium's sandbox decision from the
+            // settings; the strip bans pass-through, not the helper's own deliberate act.
+            let degraded = self.degraded_sandbox.load(Ordering::Acquire);
             for name in engine::FORBIDDEN_PASSTHROUGH_SWITCHES {
+                if !engine::switch_should_be_stripped(name, degraded) {
+                    continue;
+                }
                 let key = CefString::from(*name);
                 if cmd.has_switch(Some(&key)) == 1 {
                     log::warn(
@@ -404,6 +498,9 @@ fn main() -> ExitCode {
     let is_browser_process = cmd_line.has_switch(Some(&CefString::from("type"))) != 1;
 
     let ozone_slot: Arc<Mutex<Option<String>>> = Arc::default();
+    // 2026-07-10 (plan M5): set only by the browser process's own policy-gated degradation
+    // (never by argv) — consumed by the strip loop via switch_should_be_stripped.
+    let degraded_sandbox: Arc<AtomicBool> = Arc::default();
     // The renderer-side JS-bridge/eval handler (plan M4). The router + inventory are cheap to
     // construct here; the handler is only USED in the CEF-forked renderer subprocess (App's
     // render_process_handler is called there, never in the browser process).
@@ -411,7 +508,7 @@ fn main() -> ExitCode {
         RendererSideRouter::new(MessageRouterConfig::default()),
         Arc::new(Mutex::new(HashMap::new())),
     );
-    let mut app = HelperApp::new(ozone_slot.clone(), render_handler);
+    let mut app = HelperApp::new(ozone_slot.clone(), render_handler, degraded_sandbox.clone());
     let ret = execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -434,7 +531,10 @@ fn main() -> ExitCode {
         Ok(fd) => fd,
         Err(msg) => {
             log::error(COMPONENT, &msg);
-            eprintln!("usage: eclipse-webview --ipc-fd=<fd> [--ozone-platform=<wayland|x11>]");
+            eprintln!(
+                "usage: eclipse-webview --ipc-fd=<fd> [--ozone-platform=<wayland|x11>] \
+                 [--allow-unsandboxed]"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -535,8 +635,100 @@ fn main() -> ExitCode {
         *slot = Some(selection);
     }
 
-    // ---- Engine init: windowless, external pump, sandbox ON, engine logging OFF. ----
-    let settings = engine::build_settings();
+    // ---- Sandbox-mode selection (plan M5, 2026-07-10 — the dated owner-revisable policy). ----
+    // Runs in the pre-`initialize` single-thread region (the probe_userns invariant — see its
+    // doc). Both inputs are MEASURED capabilities: a live userns USABILITY probe (create + an
+    // in-namespace capability use) and Chromium's own chrome-sandbox acceptance predicate
+    // against the file beside the helper binary; refusal requires BOTH tiers to have measurably
+    // failed AND the config opt-in to be absent — a capable host can never be false-negatived
+    // into degradation by knob guessing.
+    let allow_unsandboxed = std::env::args().any(|a| a == "--allow-unsandboxed");
+    let suid_path = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(probe_suid_sandbox);
+    let sandbox_mode =
+        match engine::select_sandbox_mode(probe_userns(), suid_path.is_some(), allow_unsandboxed) {
+            Ok(mode) => mode,
+            Err(e) => {
+                log::error(COMPONENT, &e.to_string());
+                let _ = write_helper_msg(
+                    &stream,
+                    &HelperMsg::Crash {
+                        view: 0,
+                        kind: 1, // engine-init-failed
+                        code: 2, // 2026-07-10 (M5): sandbox-policy refusal (0 = no display)
+                    },
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+    match &sandbox_mode {
+        engine::SandboxMode::Userns => log::info(
+            COMPONENT,
+            "sandbox mode selected: userns (unprivileged user namespaces verified USABLE by a \
+             live unshare + in-namespace capability probe)",
+        ),
+        engine::SandboxMode::Suid => {
+            let path = suid_path.as_deref().unwrap_or(Path::new("chrome-sandbox"));
+            // 2026-07-10: Chromium's documented SUID-helper path override. set_var runs in the
+            // same pre-threads region as the fork probe (env mutation is thread-unsafe).
+            std::env::set_var("CHROME_DEVEL_SANDBOX", path);
+            log::info(
+                COMPONENT,
+                &format!(
+                    "sandbox mode selected: suid (chrome-sandbox setuid root at {})",
+                    path.file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        engine::SandboxMode::Degraded => {
+            degraded_sandbox.store(true, Ordering::Release);
+            log::warn(
+                COMPONENT,
+                "sandbox mode selected: DEGRADED --no-sandbox by explicit config opt-in \
+                 (webview_allow_unsandboxed) — hostile web content will render UNSANDBOXED",
+            );
+        }
+    }
+
+    // ---- Render-path detection (plan M5, 2026-07-10): LOG-ONLY by design — Chromium's own
+    // GPU-process fallback is the mechanism; the shipped SwiftShader/ANGLE set (pinned into
+    // the packaged payload by tools/webview-dist/package-webview.sh) makes the no-GPU branch a
+    // working degradation. A missing /dev/dri simply reads as no render nodes.
+    let mut render_nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|name| name.starts_with("renderD"))
+                .collect()
+        })
+        .unwrap_or_default();
+    render_nodes.sort();
+    let nvidia_ctl_present = Path::new("/dev/nvidiactl").exists();
+    match engine::classify_render_path(&render_nodes, nvidia_ctl_present) {
+        engine::RenderPathVerdict::GpuCandidates(devices) => log::info(
+            COMPONENT,
+            &format!(
+                "render path: gpu candidate devices present ({}) — Chromium selects the GPU \
+                 path; the bundled SwiftShader remains the automatic fallback",
+                devices.join(", ")
+            ),
+        ),
+        engine::RenderPathVerdict::SoftwareFallback => log::info(
+            COMPONENT,
+            "render path: no GPU render nodes detected — Chromium will use the bundled \
+             SwiftShader software renderer",
+        ),
+    }
+
+    // ---- Engine init: windowless, external pump, sandbox per the selected mode (ON except
+    // the policy-gated Degraded opt-in), engine logging OFF. ----
+    let mut settings = engine::build_settings();
+    engine::apply_sandbox_mode(&mut settings, &sandbox_mode);
     if initialize(
         Some(args.as_main_args()),
         Some(&settings),
@@ -702,5 +894,25 @@ mod tests {
             Some("wayland")
         );
         assert_eq!(parse_ozone_override(args(&["x"])), None);
+    }
+
+    #[test]
+    fn suid_sandbox_stat_predicate_byte_matches_chromiums_acceptance() {
+        // 2026-07-10 (M5 review fix): Chromium's setuid_sandbox_host.cc requires st_uid==0 &&
+        // S_ISUID && S_IXOTH (+ access(X_OK), checked live at the call site) — the canonical
+        // "owned by root and has mode 4755". A subset predicate mis-selected the Suid tier for
+        // root:root 4750/4700 files that Chromium then rejects with a post-HelloAck
+        // LOG(FATAL), bypassing the designed pre-init SandboxUnavailable refusal.
+        // The documented remedy shape passes.
+        assert!(suid_sandbox_stat_ok(true, 0, 0o104755));
+        // Group/owner-restricted hardening chmods Chromium rejects (no S_IXOTH).
+        assert!(!suid_sandbox_stat_ok(true, 0, 0o104750));
+        assert!(!suid_sandbox_stat_ok(true, 0, 0o104700));
+        // The as-shipped 0755 (no S_ISUID) stays tier-unavailable.
+        assert!(!suid_sandbox_stat_ok(true, 0, 0o100755));
+        // Non-root ownership never qualifies, even at 4755.
+        assert!(!suid_sandbox_stat_ok(true, 1000, 0o104755));
+        // Not a regular file never qualifies.
+        assert!(!suid_sandbox_stat_ok(false, 0, 0o104755));
     }
 }

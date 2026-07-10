@@ -29,8 +29,13 @@
 //!    The helper trusts the flag, not the fd number: no `--ipc-fd` → usage error, nonzero
 //!    exit, before any fd use.
 //! 3. **Optional argv:** `--ozone-platform=<wayland|x11>` overrides the helper's own explicit
-//!    ozone selection (the M1-recorded rule: ozone auto is NEVER trusted). No other flags are
-//!    part of the contract; the helper strips `--enable-logging`/`--no-sandbox` defensively.
+//!    ozone selection (the M1-recorded rule: ozone auto is NEVER trusted).
+//!    `--allow-unsandboxed` (2026-07-10, plan M5) forwards the config opt-in
+//!    `webview_allow_unsandboxed` — the helper may then run `--no-sandbox` as a LOUD documented
+//!    degradation when the host has neither unprivileged userns nor a SUID `chrome-sandbox`
+//!    (a boolean flag, argv-safe — no secrets). No other flags are part of the contract; the
+//!    helper strips `--enable-logging`/`--no-sandbox` defensively as PASS-THROUGH switches
+//!    (its own policy-gated degradation is the one exception, applied via `Settings`, not argv).
 //! 4. **No URL ever appears in argv** (token-bearing challenge URLs would leak via
 //!    `/proc/*/cmdline`): every load target crosses the control socket only.
 //! 5. **Orphan prevention:** the helper exits on control-socket EOF (primary); the consumer
@@ -57,6 +62,9 @@
 
 pub mod client;
 pub mod fdpass;
+// 2026-07-10 (plan M5): main-process-only pre-spawn host-lib probe — like `client`, NOT part of
+// the helper crate's `#[path]` sibling set; consumed only by `client`, so crate-visible.
+pub(crate) mod hostprobe;
 pub mod proto;
 pub mod redact;
 pub mod shm;

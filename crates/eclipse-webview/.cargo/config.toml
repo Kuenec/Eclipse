@@ -1,0 +1,13 @@
+# 2026-07-10 (web-engine plan M5): bake RUNPATH=$ORIGIN into every helper build so the packaged
+# helper resolves libcef.so beside itself with no LD_LIBRARY_PATH mutation (the dev tree already
+# has libcef.so beside the binary — cef-dll-sys copies the payload next to the produced
+# binaries). The main-process client (src/webview/client.rs) keeps its LD_LIBRARY_PATH prepend
+# as belt-and-suspenders for helpers built before this change.
+#
+# NOTE: a user-set RUSTFLAGS env OVERRIDES this [build] table entirely (cargo's documented
+# precedence) — the packaging script (tools/webview-dist/package-webview.sh) re-verifies the
+# RUNPATH with readelf regardless, so a silently dropped $ORIGIN fails the package loudly.
+# --enable-new-dtags emits RUNPATH (not the legacy RPATH) so LD_LIBRARY_PATH still wins when a
+# user deliberately sets it.
+[build]
+rustflags = ["-C", "link-args=-Wl,-rpath,$ORIGIN,--enable-new-dtags"]

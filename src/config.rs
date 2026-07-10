@@ -87,6 +87,14 @@ pub struct Config {
     /// `crates/eclipse-webview/target/{release,debug}`. A SET-but-missing path is an actionable
     /// error, never a silent fallthrough. `None` (the default) = resolve automatically.
     pub webview_helper_path: Option<String>,
+    /// 2026-07-10 (web-engine plan M5, the dated owner-revisable sandbox policy in AGENTS.md §6):
+    /// the helper selects, in order, (1) unprivileged user namespaces (live create + use probe),
+    /// (2) a SUID `chrome-sandbox` beside libcef.so, (3) neither → REFUSE with an actionable
+    /// error — UNLESS this is `true`, in which case the helper runs `--no-sandbox` as a LOUD,
+    /// documented degradation (WARN at startup + a visible detection line in every run log).
+    /// The engine renders hostile web content beside the user's session, so silent unsandboxed
+    /// execution is never acceptable; default `false` = refuse with the actionable error.
+    pub webview_allow_unsandboxed: bool,
 }
 
 impl Default for Config {
@@ -111,6 +119,7 @@ impl Default for Config {
             apk_sha256: None,
             auto_fetch_missing: false,
             webview_helper_path: None,
+            webview_allow_unsandboxed: false,
         }
     }
 }
@@ -223,6 +232,9 @@ mod tests {
             GraphicsOptimizationMode::Balanced
         );
         assert_eq!(cfg.touch_mode, TouchMode::Off);
+        // 2026-07-10 (plan M5): the sandbox-degradation opt-in defaults OFF — a missing key
+        // must never silently enable unsandboxed hostile-content rendering.
+        assert!(!cfg.webview_allow_unsandboxed);
     }
 
     #[test]

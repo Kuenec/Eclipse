@@ -136,6 +136,133 @@ pub fn select_ozone(
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox-mode selection (plan M5, 2026-07-10 — the dated owner-revisable policy)
+// ---------------------------------------------------------------------------
+
+/// The helper's selected sandbox tier (plan M5). Order rationale (2026-07-10, owner-revisable
+/// AGENTS.md §6 policy): userns first — the M1-measured default on this class of host AND
+/// Chromium's own preference; the SUID `chrome-sandbox` is the fallback tier (Chromium's
+/// documented pre-userns mechanism, admin-installed root:root mode 4755); `Degraded` is
+/// reachable ONLY through the explicit `webview_allow_unsandboxed` config opt-in — this
+/// component renders hostile web content beside the user's session, so silent unsandboxed
+/// execution is never acceptable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// Unprivileged user namespaces, verified USABLE by a LIVE probe: `unshare(CLONE_NEWUSER)`
+    /// plus a capability-gated `unshare(CLONE_NEWPID)` inside the new namespace (creation alone
+    /// false-positives on Ubuntu 24.04+'s permit-then-confine AppArmor default; 2026-07-10).
+    Userns,
+    /// A root-owned setuid `chrome-sandbox` beside libcef.so (exported via
+    /// `CHROME_DEVEL_SANDBOX`, Chromium's documented helper-path override).
+    Suid,
+    /// The loud, config-gated `--no-sandbox` degradation (`Settings.no_sandbox = 1`).
+    Degraded,
+}
+
+/// Typed, actionable sandbox refusal: neither tier is available and the opt-in is off.
+/// The Display prefix byte-matches the consumer's `SANDBOX_UNAVAILABLE_MARKER`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxUnavailable;
+
+impl std::fmt::Display for SandboxUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sandbox unavailable: this host has neither unprivileged user namespaces nor a SUID \
+             chrome-sandbox; fixes: enable unprivileged user namespaces (sysctl \
+             kernel.unprivileged_userns_clone=1 and user.max_user_namespaces>0; on Ubuntu 23.10+ \
+             also kernel.apparmor_restrict_unprivileged_userns=0 or an AppArmor profile), OR \
+             install chrome-sandbox beside libcef.so as root:root mode 4755, OR set config \
+             webview_allow_unsandboxed=true to accept a loud unsandboxed degradation"
+        )
+    }
+}
+
+impl std::error::Error for SandboxUnavailable {}
+
+/// Pure sandbox-tier decision (the [`select_ozone`] decision-table shape; unit-pinned over the
+/// full 2×2×2 input space). Both capability inputs are MEASURED, never knob-file guesses: the
+/// caller runs a live userns USABILITY probe (create + capability-use, `probe_userns`) and
+/// Chromium's own `chrome-sandbox` acceptance predicate (`probe_suid_sandbox`).
+pub fn select_sandbox_mode(
+    userns_ok: bool,
+    suid_ok: bool,
+    allow_unsandboxed: bool,
+) -> Result<SandboxMode, SandboxUnavailable> {
+    if userns_ok {
+        return Ok(SandboxMode::Userns);
+    }
+    if suid_ok {
+        return Ok(SandboxMode::Suid);
+    }
+    if allow_unsandboxed {
+        return Ok(SandboxMode::Degraded);
+    }
+    Err(SandboxUnavailable)
+}
+
+/// Apply the selected mode to the CEF settings: ONLY `Degraded` flips `no_sandbox` (the
+/// policy-gated exception to the M1 never---no-sandbox rule). [`build_settings`] itself stays
+/// byte-identical (`no_sandbox == 0` — its pin is untouched); this is the one seam that may
+/// change it, and only for the helper's own deliberate act.
+pub fn apply_sandbox_mode(settings: &mut Settings, mode: &SandboxMode) {
+    if matches!(mode, SandboxMode::Degraded) {
+        settings.no_sandbox = 1;
+    }
+}
+
+/// Whether the browser-process strip loop removes `--<name>` from the command line.
+/// 2026-07-10 (plan M5): `enable-logging` is ALWAYS stripped (the M1 stderr-URL-leak channel);
+/// `no-sandbox` is stripped UNLESS the helper itself entered the policy-gated degradation —
+/// CEF propagates `Settings.no_sandbox = 1` onto the command line, and stripping that copy
+/// would desync Chromium's sandbox decision from the settings. The strip exists to ban
+/// PASS-THROUGH switches, not the helper's own deliberate act.
+/// [`FORBIDDEN_PASSTHROUGH_SWITCHES`] stays the documentation constant the loop iterates.
+pub fn switch_should_be_stripped(name: &str, degraded: bool) -> bool {
+    match name {
+        "enable-logging" => true,
+        "no-sandbox" => !degraded,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render-path detection (plan M5, 2026-07-10 — LOG-ONLY by design)
+// ---------------------------------------------------------------------------
+
+/// The render-path detection verdict. LOG-ONLY BY DESIGN: Chromium's own GPU-process fallback
+/// is the detect-don't-assume mechanism (M1-measured: NVIDIA via the bundled ANGLE; SwiftShader
+/// never mapped on a GPU host) — any Eclipse-side forcing risks exactly the two banned failure
+/// modes (failing a no-GPU host / degrading a GPU host into software). The shipped
+/// `libvk_swiftshader.so`/`vk_swiftshader_icd.json`/ANGLE set (pinned into the packaged payload
+/// by tools/webview-dist/package-webview.sh) is what makes the no-GPU branch a working
+/// degradation rather than a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderPathVerdict {
+    /// At least one GPU candidate device exists (basenames listed for the log line).
+    GpuCandidates(Vec<String>),
+    /// No render nodes at all — Chromium will fall back to the bundled SwiftShader.
+    SoftwareFallback,
+}
+
+/// Pure classification over the enumerated `/dev/dri/renderD*` basenames + the NVIDIA control
+/// device's presence. Never gates anything — the caller only logs the verdict.
+pub fn classify_render_path(
+    dri_render_nodes: &[String],
+    nvidia_ctl_present: bool,
+) -> RenderPathVerdict {
+    let mut devices: Vec<String> = dri_render_nodes.to_vec();
+    if nvidia_ctl_present {
+        devices.push("nvidiactl".to_string());
+    }
+    if devices.is_empty() {
+        RenderPathVerdict::SoftwareFallback
+    } else {
+        RenderPathVerdict::GpuCandidates(devices)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Outbox: CEF callbacks never block on a stalled consumer
 // ---------------------------------------------------------------------------
 
@@ -1747,6 +1874,95 @@ mod tests {
         // Neither set → a typed, actionable error (never fall through to ozone auto).
         assert_eq!(select_ozone(None, None, None), Err(NoDisplayError));
         assert_eq!(select_ozone(None, Some(""), Some("")), Err(NoDisplayError));
+    }
+
+    #[test]
+    fn sandbox_mode_selection_prefers_userns_then_suid_then_policy() {
+        // 2026-07-10 (plan M5): the full 2×2×2 decision table — userns wins outright, SUID is
+        // the fallback tier, Degraded is reachable ONLY through the explicit opt-in, and
+        // neither-without-opt-in is a typed refusal naming BOTH fixes + the opt-in.
+        use SandboxMode::*;
+        assert_eq!(select_sandbox_mode(true, true, true), Ok(Userns));
+        assert_eq!(select_sandbox_mode(true, true, false), Ok(Userns));
+        assert_eq!(select_sandbox_mode(true, false, true), Ok(Userns));
+        assert_eq!(select_sandbox_mode(true, false, false), Ok(Userns));
+        assert_eq!(select_sandbox_mode(false, true, true), Ok(Suid));
+        assert_eq!(select_sandbox_mode(false, true, false), Ok(Suid));
+        assert_eq!(select_sandbox_mode(false, false, true), Ok(Degraded));
+        let err = select_sandbox_mode(false, false, false).expect_err("policy refusal");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("sandbox unavailable"),
+            "the Display prefix must byte-match the consumer's SANDBOX_UNAVAILABLE_MARKER: {text}"
+        );
+        for needle in [
+            "kernel.unprivileged_userns_clone=1",
+            "user.max_user_namespaces>0",
+            "apparmor_restrict_unprivileged_userns",
+            "chrome-sandbox beside libcef.so as root:root mode 4755",
+            "webview_allow_unsandboxed=true",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn apply_sandbox_mode_flips_no_sandbox_only_for_degraded() {
+        // 2026-07-10 (plan M5): build_settings stays byte-identical (its no_sandbox == 0 pin
+        // is engine_settings_keep_engine_logging_disabled); this is the ONE seam that may flip
+        // it, and only for the helper's own policy-gated degradation.
+        for (mode, expected) in [
+            (SandboxMode::Userns, 0),
+            (SandboxMode::Suid, 0),
+            (SandboxMode::Degraded, 1),
+        ] {
+            let mut settings = build_settings();
+            apply_sandbox_mode(&mut settings, &mode);
+            assert_eq!(settings.no_sandbox, expected, "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn switch_strip_keeps_the_ban_except_the_helpers_own_degradation() {
+        // 2026-07-10 (plan M5): enable-logging is ALWAYS stripped; no-sandbox is stripped as a
+        // pass-through UNLESS the helper itself degraded (CEF propagates Settings.no_sandbox=1
+        // onto the command line — stripping that copy would desync Chromium from the settings).
+        assert!(switch_should_be_stripped("enable-logging", false));
+        assert!(switch_should_be_stripped("enable-logging", true));
+        assert!(switch_should_be_stripped("no-sandbox", false));
+        assert!(!switch_should_be_stripped("no-sandbox", true));
+        // Unknown switches are never the strip loop's business.
+        assert!(!switch_should_be_stripped("ozone-platform", false));
+        // The documentation constant the loop iterates still names exactly the banned pair.
+        for name in FORBIDDEN_PASSTHROUGH_SWITCHES {
+            assert!(switch_should_be_stripped(name, false));
+        }
+    }
+
+    #[test]
+    fn render_path_classification_never_gates_and_names_the_devices() {
+        // 2026-07-10 (plan M5): log-only classification — empty → SoftwareFallback; any DRI
+        // render node OR the NVIDIA control device → GpuCandidates naming the basenames.
+        assert_eq!(
+            classify_render_path(&[], false),
+            RenderPathVerdict::SoftwareFallback
+        );
+        assert_eq!(
+            classify_render_path(&["renderD128".to_string()], false),
+            RenderPathVerdict::GpuCandidates(vec!["renderD128".to_string()])
+        );
+        assert_eq!(
+            classify_render_path(&[], true),
+            RenderPathVerdict::GpuCandidates(vec!["nvidiactl".to_string()])
+        );
+        assert_eq!(
+            classify_render_path(&["renderD128".to_string(), "renderD129".to_string()], true),
+            RenderPathVerdict::GpuCandidates(vec![
+                "renderD128".to_string(),
+                "renderD129".to_string(),
+                "nvidiactl".to_string(),
+            ])
+        );
     }
 
     #[test]
