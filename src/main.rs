@@ -495,6 +495,8 @@ fn preload_app_native_libs(
 
 /// The `__webview-test` result whose `Display` IS the deterministic SUCCESS marker line
 /// (guarded by `tests/engine_milestones.rs::webview_test_fires_load_upcalls_and_stages_frames`).
+/// 2026-07-09 (plan M4): extended with the bridge/eval/UA/cookie booleans. The marker prints
+/// booleans + counts ONLY — never the UA string, cookie value, bridge arg, or eval result.
 struct WebViewTestReport {
     upcalls_ok: u32,
     started_ms: u128,
@@ -510,7 +512,9 @@ impl std::fmt::Display for WebViewTestReport {
         write!(
             f,
             "WebView engine pipeline OK: internalLoadChanged upcalls {}/2 (state 0 @ {}ms, \
-             state 3 @ {}ms, http {}), frame {}x{} {} distinct pixels, ViewClosed, helper exit 0",
+             state 3 @ {}ms, http {}), frame {}x{} {} distinct pixels, bridge round-trip OK, \
+             evaluateJavascript OK, honest UA OK, cookie set/get OK, cookie callback OK, \
+             ViewClosed, helper exit 0, bound=5",
             self.upcalls_ok,
             self.started_ms,
             self.finished_ms,
@@ -520,6 +524,50 @@ impl std::fmt::Display for WebViewTestReport {
             self.distinct
         )
     }
+}
+
+/// The offline first-party test page (plan M4 §5.2): solid background + large text (robust nonzero
+/// ink) + JS that records the UA and drives the `EclipseTest.echo` bridge round-trip.
+const WEBVIEW_TEST_PAGE: &str = "<!doctype html><meta charset=utf-8><title>eclipse</title>\
+<body style=\"background:#2244aa;color:#fff;font-size:40px\">Eclipse WebView M4\
+<script>window.__eclipseUA=navigator.userAgent;\
+function eclipseBridge(){\
+if(window.EclipseTest&&window.EclipseTest.echo){\
+window.EclipseTest.echo('PING').then(function(r){window.__eclipseBridgeResult=r;},\
+function(e){window.__eclipseBridgeResult='ERR:'+e;});}\
+else{setTimeout(eclipseBridge,50);}}\
+eclipseBridge();</script></body>";
+
+/// Serve [`WEBVIEW_TEST_PAGE`] on a loopback-only ephemeral port (plan M4 §5.1) — a real `http://`
+/// origin so cookies + the bridge run in a normal browsing context, fully offline/deterministic.
+/// The background thread serves one page for `/` (else 404), `Connection: close`. Returns the port
+/// (the thread is a daemon killed at process exit).
+fn start_loopback_page() -> std::io::Result<u16> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req.split_whitespace().nth(1).unwrap_or("/");
+            let (status, body): (&str, &str) = if path == "/" || path.starts_with("/?") {
+                ("200 OK", WEBVIEW_TEST_PAGE)
+            } else {
+                ("404 Not Found", "")
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    Ok(port)
 }
 
 /// `eclipse __webview-test` (2026-07-03, web-engine plan M3): the dev-host WebView pipeline
@@ -534,15 +582,22 @@ impl std::fmt::Display for WebViewTestReport {
 /// unit-pinned). Loads ONLY the public https://www.roblox.com page (M1/M2 precedent) — never a
 /// challenge URL, no APK dex execution beyond framework classes.
 fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
+    use eclipse::framework;
     use eclipse::webview::client;
     use std::time::{Duration, Instant};
-    const TARGET_URL: &str = "https://www.roblox.com";
     // Drive.rs deadline precedents (M2): load-start 30 s, load-finish 90 s, ink-settle 20 s.
     const START_DEADLINE: Duration = Duration::from_secs(30);
     const FINISH_DEADLINE: Duration = Duration::from_secs(90);
     const UPCALL_DEADLINE: Duration = Duration::from_secs(10);
     const INK_DEADLINE: Duration = Duration::from_secs(20);
+    const LEG_DEADLINE: Duration = Duration::from_secs(15);
     const CLOSE_DEADLINE: Duration = Duration::from_secs(15);
+
+    // 2026-07-09 (plan M4): an OFFLINE loopback page — a real http:// origin so the cookie + bridge
+    // legs run in a normal browsing context (a data:/about:blank origin has opaque cookies).
+    let port = start_loopback_page()?;
+    let target_url = format!("http://127.0.0.1:{port}/");
+    println!("# __webview-test: loopback page serving at {target_url}");
 
     let apk_path = eclipse::loader::init_run::find_roblox_apk().ok_or(
         "no Roblox APK (set ECLIPSE_ROBLOX_APK or place it at the default dev-host path) — \
@@ -558,8 +613,12 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     let config = eclipse::config::Config::load()?;
     let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
     let vm = eclipse::runtime::boot(&plan, Some(apk_path.as_path()), None)?;
-    println!("# ART booted ✓ — driving the WebView smoke (register → alloc → setWebViewClient → loadUrl)…");
-    let handle = eclipse::framework::drive_webview_smoke(&vm, TARGET_URL)?;
+    // 2026-07-09 (plan M4): CookieManager.getInstance() triggers Context/AssetManager/Build static
+    // initializers that call android.util.Log.println_native — bind the Log/Process natives (the
+    // production drive_lifecycle does this pre-preload) so the cookie leg's clinit chain resolves.
+    eclipse::framework::register_engine_preload_natives(&vm)?;
+    println!("# ART booted ✓ — driving the WebView smoke (register → alloc → setWebViewClient → addJavascriptInterface → loadUrl)…");
+    let handle = eclipse::framework::drive_webview_smoke(&vm, &target_url)?;
 
     // Poll the client's observations (the reader thread stages frames + fires the upcalls).
     let fail_reason =
@@ -639,6 +698,103 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+
+    // ---- M4 legs (plan §5.3): evaluateJavascript + honest UA, bridge round-trip, cookies. ----
+    // A single evaluateJavascript drive through the JAVA path, polling the probe's recorded result.
+    let eval_and_wait = |script: &str| -> Option<String> {
+        if framework::webview_evaluate(&vm, handle, script).is_err() {
+            return None;
+        }
+        let end = Instant::now() + LEG_DEADLINE;
+        loop {
+            if let Some(v) = framework::read_probe_last_value(&vm) {
+                return Some(v);
+            }
+            if Instant::now() > end {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // UA leg: navigator.userAgent must be the honest Eclipse-identified Chromium 149 (never the
+    // recorded "GDPR VIOLATION"). The value is checked but NEVER printed (payload-free marker).
+    let ua = eval_and_wait("navigator.userAgent")
+        .ok_or("evaluateJavascript(navigator.userAgent) produced no result within 15 s")?;
+    if !(ua.contains("Eclipse-WebView") && ua.contains("Chrome/149"))
+        || ua.contains("GDPR VIOLATION")
+    {
+        return Err(
+            "navigator.userAgent is not the honest Eclipse UA (evaluateJavascript/UA leg failed)"
+                .into(),
+        );
+    }
+    println!("# evaluateJavascript OK; honest UA OK (UA value not printed)");
+
+    // Bridge leg: the page called window.EclipseTest.echo('PING') → JNI reflect-invoke → async
+    // result back to the page (window.__eclipseBridgeResult == "echo:PING"). Poll the read-back.
+    let bridge_deadline = Instant::now() + LEG_DEADLINE;
+    loop {
+        if let Some(r) = eval_and_wait("window.__eclipseBridgeResult||''") {
+            if r.contains("echo:PING") {
+                break;
+            }
+        }
+        if Instant::now() > bridge_deadline {
+            return Err("bridge round-trip did not complete (window.__eclipseBridgeResult != echo:PING within 15 s)".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The @JavascriptInterface method also recorded its arg on the ART side.
+    match framework::read_probe_last(&vm).as_deref() {
+        Some("PING") => {
+            println!("# bridge round-trip OK (page JS → JNI reflect-invoke → async result)")
+        }
+        other => {
+            return Err(format!(
+                "EclipseBridgeProbe.last != PING (JNI reflect-invoke leg failed: {other:?})"
+            )
+            .into())
+        }
+    }
+
+    // Cookie leg: 2-arg setCookie then getCookie round-trips through the session store; the 3-arg
+    // setCookie's REAL callback fires (Boolean.TRUE — never fabricated). Cookie values not printed.
+    framework::cookie_manager_set_cookie(&vm, &target_url, "ECLIPSE_TEST=1; Path=/")
+        .map_err(|e| format!("CookieManager.setCookie(2-arg) failed: {e}"))?;
+    let cookie_deadline = Instant::now() + LEG_DEADLINE;
+    loop {
+        let got = framework::cookie_manager_get_cookie(&vm, &target_url);
+        if got.contains("ECLIPSE_TEST=1") {
+            break;
+        }
+        if Instant::now() > cookie_deadline {
+            return Err("CookieManager.getCookie did not return ECLIPSE_TEST=1 within 15 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    println!("# cookie set/get OK (values not printed)");
+    // The 3-arg setCookie callback carries the REAL success flag.
+    framework::cookie_manager_set_cookie_cb(&vm, &target_url, "ECLIPSE_CB=1; Path=/")
+        .map_err(|e| format!("CookieManager.setCookie(3-arg) failed: {e}"))?;
+    let cb_deadline = Instant::now() + LEG_DEADLINE;
+    let cb_ok = loop {
+        if let Some(v) = framework::read_probe_last_value(&vm) {
+            if v.contains("true") {
+                break true;
+            }
+        }
+        if Instant::now() > cb_deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !cb_ok {
+        return Err(
+            "3-arg setCookie ValueCallback did not fire with Boolean.TRUE within 15 s".into(),
+        );
+    }
+    println!("# cookie callback OK (real Boolean.TRUE, not fabricated)");
 
     // CloseView → ViewClosed (the entry disappears), then Shutdown → helper exit 0.
     client::close_view(handle).map_err(|e| format!("CloseView send failed: {e}"))?;

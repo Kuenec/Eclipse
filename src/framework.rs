@@ -6100,8 +6100,9 @@ extern "system" fn view_native_get_window<'local>(
 /// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
 ///
 /// 2026-07-03 (web-engine M3): also notifies the webview client so a finalized DRIVEN WebView
-/// sends `CloseView` to the helper ([`crate::webview::client::notify_view_freed`] — its first
-/// line is a two-atomic-load fast return, so every normal view GC stays cheap; it never panics).
+/// sends `CloseView` to the helper ([`crate::webview::client::notify_view_freed`] — 2026-07-10:
+/// its bridge-cleanup + drive-tracking gates are a few atomic loads, so every normal view GC
+/// stays cheap; it never panics).
 extern "system" fn view_native_destructor<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -9541,7 +9542,7 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     // (smali:51, instance), `native_loadDataWithBaseURL`
     // `(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (smali:48,
     // instance).
-    let bindings: [NativeBinding; 3] = [
+    let bindings: [NativeBinding; 5] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -9557,11 +9558,22 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG,
             web_view_native_load_data_with_base_url as *mut c_void,
         ),
+        // 2026-07-09 (plan M4): the JS-bridge / evaluateJavascript surface.
+        (
+            WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_NAME,
+            WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_SIG,
+            web_view_native_evaluate_javascript as *mut c_void,
+        ),
+        (
+            WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_NAME,
+            WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG,
+            web_view_native_add_javascript_interface as *mut c_void,
+        ),
     ];
     let bound = register_class_natives_best_effort(env, WEB_VIEW_CLASS, &bindings)?;
     tracing::info!(
         bound,
-        "registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL = spawn-and-forward to the out-of-process eclipse-webview helper, honest WARN no-op when the helper is unavailable) (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL = spawn-and-forward; evaluateJavascript + addJavascriptInterface = M4 bridge/eval surface; honest WARN no-op when the helper is unavailable) (per-method best-effort)"
     );
     Ok(())
 }
@@ -9582,11 +9594,14 @@ const WEB_VIEW_INTERNAL_LOAD_CHANGED_SIG: MethodSignature<'static, 'static> =
 /// loads only (2026-07-03, plan M3). Returns `true` iff the Java dispatch completed (the
 /// `__webview-test` "upcalls 2/2" evidence).
 ///
-/// Threading: called from the `eclipse-webview-io` thread with the `Send` [`JavaVM`] handle the
-/// load native obtained via `Env::get_java_vm` — `attach_current_thread` performs a real,
-/// thereafter-cached ART attach of that thread (the recorded exception in `runtime::Vm`'s docs;
-/// ART's attached-thread altstack caveat is the recorded native_provider limitation — acceptable,
-/// the reader does no deep recursion). `url` is the REAL driven URL: it is the app's own Java
+/// Threading: called from the `eclipse-webview-upcall` thread (2026-07-09 fix: app-code upcalls
+/// moved off the socket-reader thread so a blocking round-trip from app code — e.g. a synchronous
+/// `getCookie` inside `onPageFinished` — cannot self-deadlock the io loop) with the `Send`
+/// [`JavaVM`] handle the load native obtained via `Env::get_java_vm` — `attach_current_thread`
+/// performs a real, thereafter-cached ART attach of that thread (the recorded exception in
+/// `runtime::Vm`'s docs; ART's attached-thread altstack caveat is the recorded native_provider
+/// limitation — acceptable, the upcall thread does no deep recursion). `url` is the REAL driven
+/// URL: it is the app's own Java
 /// contract argument (ATL's reference C passes the real URI) and is NEVER bound to a log macro
 /// here — every failure log binds only `widget` + `state`.
 pub fn fire_web_view_internal_load_changed(
@@ -9712,6 +9727,8 @@ pub fn drive_webview_smoke(vm: &Vm, url: &str) -> Result<jlong, FrameworkError> 
 
 fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError> {
     register_web_view_natives(env)?;
+    // 2026-07-09 (plan M4): the __webview-test cookie leg needs the CookieManager natives bound.
+    register_cookie_manager_natives(env)?;
     let class = checked(env, "find_class android.webkit.WebView", |env| {
         env.find_class(WEB_VIEW_CLASS)
     })?;
@@ -9753,6 +9770,25 @@ fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError
         )?
         .v()
     })?;
+    // 2026-07-09 (plan M4): addJavascriptInterface(new EclipseBridgeProbe(), "EclipseTest") BEFORE
+    // loadUrl (the common order) — drives the new native → the reflective bridge register. The
+    // probe's @JavascriptInterface echo records its arg + returns "echo:<arg>" (the bridge leg).
+    let probe_class = checked(env, "find_class EclipseBridgeProbe", |env| {
+        env.find_class(jni_str!("android/webkit/EclipseBridgeProbe"))
+    })?;
+    let probe = checked(env, "EclipseBridgeProbe.<init>", |env| {
+        env.new_object(&probe_class, jni_sig!("()V"), &[])
+    })?;
+    let iface_name = env.new_string("EclipseTest")?;
+    checked(env, "WebView.addJavascriptInterface", |env| {
+        env.call_method(
+            &webview,
+            jni_str!("addJavascriptInterface"),
+            jni_sig!("(Ljava/lang/Object;Ljava/lang/String;)V"),
+            &[JValue::Object(&probe), JValue::Object(&iface_name)],
+        )?
+        .v()
+    })?;
     // The PRODUCTION entry: installed-dex Java loadUrl → the registered native → the client.
     let jurl = env.new_string(url)?;
     checked(env, "WebView.loadUrl", |env| {
@@ -9769,6 +9805,1681 @@ fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError
         "__webview-test: WebView.loadUrl driven through the production native path"
     );
     Ok(handle)
+}
+
+// --- __webview-test M4 drive helpers (evaluateJavascript / cookie legs) ---------------------------
+//
+// These run ONLY from `__webview-test` (dev-host). They drive the REAL Java methods so the full
+// native paths are exercised: WebView.evaluateJavascript → native → client → helper → reader →
+// ValueCallback; CookieManager.getInstance().getCookie/setCookie → native → client → helper.
+
+/// `android.webkit.EclipseBridgeProbe` (the test-only overlay class: the `@JavascriptInterface`
+/// `echo` target AND a `ValueCallback` recorder into `static last` / `static lastValue`).
+const ECLIPSE_BRIDGE_PROBE_CLASS: &JNIStr = jni_str!("android/webkit/EclipseBridgeProbe");
+
+/// A `FieldSignature` for a `java.lang.Object` reference field.
+fn object_field_sig() -> FieldSignature<'static> {
+    // SAFETY: "Ljava/lang/Object;" is a valid reference-field descriptor paired with JavaType::Object.
+    unsafe { FieldSignature::from_raw_parts(jni_str!("Ljava/lang/Object;"), JavaType::Object) }
+}
+
+/// Drive `WebView.evaluateJavascript(script, probe)` through the Java native path (resetting the
+/// probe's `lastValue` static first). The async result is polled via [`read_probe_last_value`].
+pub fn webview_evaluate(vm: &Vm, widget: jlong, script: &str) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live process VM (non-null, kept alive by `&Vm`) — `from_raw`'s contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), FrameworkError> {
+            let probe_class = checked(env, "find EclipseBridgeProbe", |env| {
+                env.find_class(ECLIPSE_BRIDGE_PROBE_CLASS)
+            })?;
+            // Reset the recorder.
+            checked(env, "reset lastValue", |env| {
+                env.set_static_field(
+                    &probe_class,
+                    jni_str!("lastValue"),
+                    object_field_sig(),
+                    JValue::Object(&JObject::null()),
+                )
+            })?;
+            let probe = checked(env, "EclipseBridgeProbe.<init>", |env| {
+                env.new_object(&probe_class, jni_sig!("()V"), &[])
+            })?;
+            let webview =
+                match view_registry::with_jobject(widget, |g| env.new_local_ref(g.as_obj())) {
+                    Ok(Some(Ok(obj))) => obj,
+                    _ => {
+                        return Err(FrameworkError::Jni(jni::errors::Error::NullPtr(
+                            "no webview object",
+                        )))
+                    }
+                };
+            let jscript = env.new_string(script)?;
+            checked(env, "WebView.evaluateJavascript", |env| {
+                env.call_method(
+                    &webview,
+                    jni_str!("evaluateJavascript"),
+                    jni_sig!("(Ljava/lang/String;Landroid/webkit/ValueCallback;)V"),
+                    &[JValue::Object(&jscript), JValue::Object(&probe)],
+                )?
+                .v()
+            })?;
+            Ok(())
+        })) {
+            Ok(r) => r,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Read `EclipseBridgeProbe.lastValue.toString()` (the recorded evaluateJavascript/cookie-callback
+/// result); `None` while it is still null.
+pub fn read_probe_last_value(vm: &Vm) -> Option<String> {
+    read_probe_object_field(vm, jni_str!("lastValue"))
+}
+
+/// Read `EclipseBridgeProbe.last` (the recorded bridge `echo` arg); `None` while still null.
+pub fn read_probe_last(vm: &Vm) -> Option<String> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: live process VM (non-null, `&Vm`-bound).
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm
+        .attach_current_thread(|env: &mut Env| -> Result<Option<String>, FrameworkError> {
+            match std::panic::catch_unwind(AssertUnwindSafe(|| -> Option<String> {
+                let class = env.find_class(ECLIPSE_BRIDGE_PROBE_CLASS).ok()?;
+                // SAFETY: "Ljava/lang/String;" reference-field descriptor + JavaType::Object.
+                let sig = unsafe {
+                    FieldSignature::from_raw_parts(jni_str!("Ljava/lang/String;"), JavaType::Object)
+                };
+                let v = env
+                    .get_static_field(&class, jni_str!("last"), &sig)
+                    .ok()?
+                    .l()
+                    .ok()?;
+                if v.is_null() {
+                    None
+                } else {
+                    jstring_object_to_string(env, v).ok()
+                }
+            })) {
+                Ok(r) => Ok(r),
+                Err(_) => Err(FrameworkError::Panicked),
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+fn read_probe_object_field(vm: &Vm, field: &JNIStr) -> Option<String> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: live process VM (non-null, `&Vm`-bound).
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm
+        .attach_current_thread(|env: &mut Env| -> Result<Option<String>, FrameworkError> {
+            match std::panic::catch_unwind(AssertUnwindSafe(|| -> Option<String> {
+                let class = env.find_class(ECLIPSE_BRIDGE_PROBE_CLASS).ok()?;
+                let v = env
+                    .get_static_field(&class, field, object_field_sig())
+                    .ok()?
+                    .l()
+                    .ok()?;
+                if v.is_null() {
+                    None
+                } else {
+                    object_to_string(env, &v)
+                }
+            })) {
+                Ok(r) => Ok(r),
+                Err(_) => Err(FrameworkError::Panicked),
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+/// Drive `CookieManager.getInstance().setCookie(url, value)` (2-arg) through the Java native path.
+pub fn cookie_manager_set_cookie(vm: &Vm, url: &str, value: &str) -> Result<(), FrameworkError> {
+    with_cookie_manager(vm, |env, cm| {
+        let jurl = env.new_string(url)?;
+        let jval = env.new_string(value)?;
+        checked(env, "CookieManager.setCookie", |env| {
+            env.call_method(
+                cm,
+                jni_str!("setCookie"),
+                jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"),
+                &[JValue::Object(&jurl), JValue::Object(&jval)],
+            )?
+            .v()
+        })
+    })
+}
+
+/// Drive `CookieManager.getInstance().getCookie(url)` (blocks internally up to 5 s). Returns the
+/// `"n=v; n=v"` string (empty on any failure). Cookie VALUES are not logged.
+pub fn cookie_manager_get_cookie(vm: &Vm, url: &str) -> String {
+    with_cookie_manager(vm, |env, cm| {
+        let jurl = env.new_string(url)?;
+        let obj = checked(env, "CookieManager.getCookie", |env| {
+            env.call_method(
+                cm,
+                jni_str!("getCookie"),
+                jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
+                &[JValue::Object(&jurl)],
+            )?
+            .l()
+        })?;
+        if obj.is_null() {
+            Ok(String::new())
+        } else {
+            jstring_object_to_string(env, obj).map_err(FrameworkError::Jni)
+        }
+    })
+    .unwrap_or_default()
+}
+
+/// Drive `CookieManager.getInstance().setCookie(url, value, probe)` (3-arg) — the real success flag
+/// routes to the probe's `onReceiveValue`, recorded in `lastValue` (polled via
+/// [`read_probe_last_value`], which yields `"true"`/`"false"`). Resets `lastValue` first.
+pub fn cookie_manager_set_cookie_cb(vm: &Vm, url: &str, value: &str) -> Result<(), FrameworkError> {
+    with_cookie_manager(vm, |env, cm| {
+        let probe_class = env
+            .find_class(ECLIPSE_BRIDGE_PROBE_CLASS)
+            .map_err(FrameworkError::Jni)?;
+        checked(env, "reset lastValue (cookie cb)", |env| {
+            env.set_static_field(
+                &probe_class,
+                jni_str!("lastValue"),
+                object_field_sig(),
+                JValue::Object(&JObject::null()),
+            )
+        })?;
+        let probe = checked(env, "EclipseBridgeProbe.<init> (cookie cb)", |env| {
+            env.new_object(&probe_class, jni_sig!("()V"), &[])
+        })?;
+        let jurl = env.new_string(url)?;
+        let jval = env.new_string(value)?;
+        checked(env, "CookieManager.setCookie(3-arg)", |env| {
+            env.call_method(
+                cm,
+                jni_str!("setCookie"),
+                jni_sig!("(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V"),
+                &[
+                    JValue::Object(&jurl),
+                    JValue::Object(&jval),
+                    JValue::Object(&probe),
+                ],
+            )?
+            .v()
+        })
+    })
+}
+
+/// Attach + construct a fresh `CookieManager` and run `f` with it. 2026-07-09: `new
+/// CookieManager()` (trivial ctor) is used INSTEAD of `getInstance()` — the latter reads
+/// `Context.this_application`, triggering the heavy `Context.<clinit>` (AssetManager/Resources
+/// native init) this framework-only harness has no reason to bring up. The natives are stateless
+/// (backed by the process-global session store), so any instance works.
+fn with_cookie_manager<T>(
+    vm: &Vm,
+    f: impl FnOnce(&mut Env, &JObject) -> Result<T, FrameworkError>,
+) -> Result<T, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: live process VM (non-null, `&Vm`-bound) — `from_raw`'s contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<T, FrameworkError> {
+            let cls = checked(env, "find_class CookieManager", |env| {
+                env.find_class(COOKIE_MANAGER_CLASS)
+            })?;
+            let cm = checked(env, "new CookieManager", |env| {
+                env.new_object(&cls, jni_sig!("()V"), &[])
+            })?;
+            f(env, &cm)
+        })) {
+            Ok(r) => r,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+// === M4: JS bridge + evaluateJavascript + CookieManager (web-engine plan M4, 2026-07-09) ==========
+//
+// The completion-handoff surface. Everything here forwards to the out-of-process eclipse-webview
+// helper through `crate::webview::client` (v2 wire); results route back through the client's
+// socket-reader thread into the `fire_*` upcalls below. The ABSOLUTE redaction rule holds
+// verbatim: bridge args/results, eval scripts/results, and cookie VALUES are NEVER bound to a log
+// macro — only method names, ids, lengths, and counts. The reflective bridge invoke exposes ONLY
+// `@JavascriptInterface`-annotated methods (the AOSP security gate).
+
+/// `android.webkit.WebView.native_evaluateJavascript` — descriptor per the overlay WebView.smali
+/// (`(long widget, String script, ValueCallback resultCallback)`).
+const WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_NAME: &JNIStr = jni_str!("native_evaluateJavascript");
+const WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_SIG: &JNIStr =
+    jni_str!("(JLjava/lang/String;Landroid/webkit/ValueCallback;)V");
+/// `android.webkit.WebView.native_addJavascriptInterface` (`(long widget, Object object, String name)`).
+const WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_NAME: &JNIStr =
+    jni_str!("native_addJavascriptInterface");
+const WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG: &JNIStr =
+    jni_str!("(JLjava/lang/Object;Ljava/lang/String;)V");
+
+/// `android.webkit.CookieManager` (the overlay-shadowed class hosting the cookie natives).
+pub const COOKIE_MANAGER_CLASS: &JNIStr = jni_str!("android/webkit/CookieManager");
+const CM_NATIVE_GET_COOKIE_NAME: &JNIStr = jni_str!("native_getCookie");
+const CM_NATIVE_GET_COOKIE_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)Ljava/lang/String;");
+const CM_NATIVE_SET_COOKIE_NAME: &JNIStr = jni_str!("native_setCookie");
+const CM_NATIVE_SET_COOKIE_SIG: &JNIStr = jni_str!("(Ljava/lang/String;Ljava/lang/String;)V");
+const CM_NATIVE_SET_COOKIE_CB_SIG: &JNIStr =
+    jni_str!("(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V");
+const CM_NATIVE_REMOVE_ALL_COOKIES_NAME: &JNIStr = jni_str!("native_removeAllCookies");
+const CM_NATIVE_REMOVE_ALL_COOKIES_SIG: &JNIStr = jni_str!("(Landroid/webkit/ValueCallback;)V");
+const CM_NATIVE_REMOVE_SESSION_COOKIES_NAME: &JNIStr = jni_str!("native_removeSessionCookies");
+const CM_NATIVE_REMOVE_SESSION_COOKIES_SIG: &JNIStr = jni_str!("(Landroid/webkit/ValueCallback;)V");
+const CM_NATIVE_FLUSH_NAME: &JNIStr = jni_str!("native_flush");
+const CM_NATIVE_FLUSH_SIG: &JNIStr = jni_str!("()V");
+
+/// The runtime-retention `@JavascriptInterface` annotation class (provided by the overlay — absent
+/// from stock ATL). Reflection filters exposed methods against it (the AOSP security gate).
+const JAVASCRIPT_INTERFACE_CLASS: &JNIStr = jni_str!("android/webkit/JavascriptInterface");
+
+// --- Registries: GlobalRef-holding, released on Drop (the view_registry slab discipline) ---------
+
+/// One resolved `@JavascriptInterface` method, retained so `fire_bridge_call` never re-reflects.
+struct BridgeMethodMeta {
+    /// `java.lang.reflect.Method` global ref (invoked via `Method.invoke`).
+    method: Global<JObject<'static>>,
+    /// The parameter `Class.getName()` forms (e.g. `"int"`, `"java.lang.String"`), for marshalling.
+    param_types: Vec<String>,
+    /// The return `Class.getName()` form (`"void"` for a void method).
+    return_type: String,
+}
+
+/// One `addJavascriptInterface(object, name)` registration: the retained object + its annotated
+/// methods (only these are exposed — a forged/non-annotated method name is rejected at invoke).
+/// 2026-07-09 fix: each name maps to ALL its annotated overloads (name-only keying silently
+/// dropped all but one arbitrary `getMethods()` survivor); the call-time resolution picks by
+/// argument count, matching the Chromium gin java bridge (`FindMethod(name, num_parameters)`).
+struct BridgeEntry {
+    object: Global<JObject<'static>>,
+    methods: std::collections::HashMap<String, Vec<BridgeMethodMeta>>,
+    /// The [`webview_close_era`] this entry was born in — the stale-drain gate: a queued
+    /// `ViewClosedDrain` drops only entries born BEFORE its close, so a legal close+re-drive's
+    /// re-registered bridges survive (2026-07-10).
+    era: u64,
+}
+
+fn bridge_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(jlong, String), BridgeEntry>> {
+    static R: OnceLock<std::sync::Mutex<std::collections::HashMap<(jlong, String), BridgeEntry>>> =
+        OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Count of live [`BridgeEntry`] registrations — `client::notify_view_freed`'s fast gate, so a
+/// normal view GC on the FinalizerDaemon pays one atomic load when no bridge exists (the
+/// `LIVE_VIEWS` precedent). Maintained under the [`bridge_registry`] lock by storing `len()`
+/// after every mutation (recount-from-truth, never arithmetic). 2026-07-10.
+static WEBVIEW_BRIDGE_ENTRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether ANY `@JavascriptInterface` bridge registration is currently retained (one atomic load).
+pub fn has_webview_bridges() -> bool {
+    WEBVIEW_BRIDGE_ENTRIES.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Monotonic webview "close era". Bumped by the client's reader thread — under the SAME views-lock
+/// hold that removes a `ViewClosed` view, so a re-drive (which must take that lock to re-insert)
+/// always observes the bumped era. Eval callbacks and bridge entries record their birth era; a
+/// queued `ViewClosedDrain` fails/drops only state born in eras ≤ its close era, so a legal
+/// close+re-drive's FRESH callbacks/bridges are never killed by a stale queued drain
+/// (2026-07-10 fix — the drain previously selected by owning widget alone and delivered a wrong
+/// `"null"` to a live browser's `evaluateJavascript`). SeqCst: cheap here (closes are rare) and
+/// makes the bump→register ordering independent of the surrounding lock choreography.
+static WEBVIEW_CLOSE_ERA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current close era (recorded at eval-callback retention / bridge registration).
+fn webview_close_era() -> u64 {
+    WEBVIEW_CLOSE_ERA.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Bump the close era; returns the PRE-bump value — every callback/bridge born before this close
+/// carries an era ≤ the returned value. Called by the webview client's reader thread only.
+pub fn bump_webview_close_era() -> u64 {
+    WEBVIEW_CLOSE_ERA.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// One-shot `ValueCallback` retained under a consumer request id (evaluateJavascript result).
+/// 2026-07-09 fix: the value carries the OWNING widget so view teardown can reach in-flight
+/// entries ([`drain_eval_callbacks_for_view`]) — request-id-only keying leaked the JNI global
+/// when the view closed before the helper's `EvaluateJsResult` arrived. 2026-07-10: the value
+/// also carries the birth [`webview_close_era`], the stale-drain gate (see the era's docs).
+#[allow(clippy::type_complexity)] // 2026-07-10: request_id → (owning widget, birth era, callback).
+fn eval_callbacks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u32, (jlong, u64, Global<JObject<'static>>)>>
+{
+    static R: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, (jlong, u64, Global<JObject<'static>>)>>,
+    > = OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// One-shot `ValueCallback<Boolean>` retained under a request id (3-arg setCookie completion).
+fn cookie_set_callbacks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>> {
+    static R: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>>> =
+        OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// One-shot `ValueCallback<Boolean>` retained under a request id (removeAll/Session completion).
+fn cookie_clear_callbacks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>> {
+    static R: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>>> =
+        OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Release every bridge registration for `widget`, unconditionally (called from
+/// `client::notify_view_freed` when the WebView OBJECT is finalized — the Java object is gone, so
+/// no era gate applies; the FinalizerDaemon is ART-attached, so the `Global` drops are cheap).
+/// Dropping each `BridgeEntry` releases its JNI global refs.
+pub fn drop_bridges_for(widget: jlong) {
+    if let Ok(mut reg) = bridge_registry().lock() {
+        reg.retain(|(w, _), _| *w != widget);
+        WEBVIEW_BRIDGE_ENTRIES.store(reg.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Era-gated release for a helper-confirmed `ViewClosed` (2026-07-10). Runs on the client's
+/// ART-attached upcall thread — NEVER the reader: jni 0.22.4 `Global::drop` on an unattached
+/// thread performs a scoped AttachCurrentThread/DetachCurrentThread per ref, and that hidden JNI
+/// on the io thread could stall it across an ART suspend-all pause until the helper's bounded
+/// outbox declared the consumer dead. Entries born AFTER the close (a legal close+re-drive
+/// re-registered them) survive — the stale-drain gate.
+pub fn drop_bridges_for_view_closed(widget: jlong, upto_era: u64) {
+    if let Ok(mut reg) = bridge_registry().lock() {
+        reg.retain(|(w, _), e| bridge_survives_view_close(*w, e.era, widget, upto_era));
+        WEBVIEW_BRIDGE_ENTRIES.store(reg.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Pure retain predicate for [`drop_bridges_for_view_closed`] (plain-`cargo test` pinned):
+/// an entry survives unless it belongs to the closed widget AND was born before/at the close.
+fn bridge_survives_view_close(
+    entry_widget: jlong,
+    entry_era: u64,
+    closed: jlong,
+    upto_era: u64,
+) -> bool {
+    entry_widget != closed || entry_era > upto_era
+}
+
+/// Release EVERY bridge registration. 2026-07-09 same-pattern audit: after `client::shutdown`
+/// clears the view map and zeroes the live-view gate, the finalize-time [`drop_bridges_for`] path
+/// can never reach these again (and no BridgeCall can ever arrive), so shutdown drops them here.
+pub fn drop_all_bridges() {
+    if let Ok(mut reg) = bridge_registry().lock() {
+        reg.clear();
+        WEBVIEW_BRIDGE_ENTRIES.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// --- WebView.native_evaluateJavascript / native_addJavascriptInterface ---------------------------
+
+/// `WebView.native_evaluateJavascript(long widget, String script, ValueCallback resultCallback)` —
+/// forward `script` to the helper and route the JSON result to `resultCallback` (retained under a
+/// consumer request id). `script` crosses the wire ONLY (never a log macro). A null callback is a
+/// fire-and-forget eval (the overlay routes `javascript:` URLs here with a null callback).
+extern "system" fn web_view_native_evaluate_javascript<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    script: JString<'local>,
+    callback: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if view_registry::with_view(widget, |_v| ()).is_err() {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                "WebView.native_evaluateJavascript: invalid view handle (ignored)"
+            );
+            return Ok(());
+        }
+        let script_s = if script.is_null() {
+            None
+        } else {
+            match script.try_to_string(env) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    if env.exception_check() {
+                        env.exception_describe();
+                        env.exception_clear();
+                    }
+                    None
+                }
+            }
+        };
+        let Some(script_s) = script_s else {
+            tracing::debug!(target: "android.webkit.WebView", widget, "evaluateJavascript: null/unreadable script (ignored)");
+            return Ok(());
+        };
+        let request_id = crate::webview::client::next_request_id();
+        // Retain the ValueCallback under request_id, keyed to the owning widget (fired exactly
+        // once: by the result, by a degrade path below, or by a teardown drain).
+        if !callback.is_null() {
+            match env.new_global_ref(&callback) {
+                Ok(g) => {
+                    if let Ok(mut cbs) = eval_callbacks().lock() {
+                        cbs.insert(request_id, (widget, webview_close_era(), g));
+                    }
+                }
+                Err(_) => {
+                    if env.exception_check() {
+                        env.exception_describe();
+                        env.exception_clear();
+                    }
+                }
+            }
+        }
+        // 2026-07-09 fix: a degrade path FIRES the callback with the AOSP failure value ("null" —
+        // Chromium's evaluateJavascript always invokes the callback, with "null" when evaluation
+        // produced nothing) instead of dropping it unfired, matching the cookie degrade siblings.
+        let degrade = |env: &mut Env| {
+            if let Some((_w, _era, g)) = eval_callbacks()
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&request_id))
+            {
+                match env.new_local_ref(g.as_obj()) {
+                    Ok(local) => fire_string_value_callback(env, &local, "null"),
+                    Err(_) => clear_pending(env),
+                }
+            }
+        };
+        match env.get_java_vm() {
+            Ok(java_vm) => {
+                if let Err(e) =
+                    crate::webview::client::evaluate_js(java_vm, widget, request_id, script_s)
+                {
+                    degrade(env);
+                    warn_bridge_unavailable("evaluateJavascript", widget, &e.to_string());
+                }
+            }
+            Err(e) => {
+                degrade(env);
+                warn_bridge_unavailable("evaluateJavascript", widget, &format!("JavaVM: {e}"));
+            }
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `WebView.native_addJavascriptInterface(long widget, Object object, String name)` — reflect the
+/// object's `@JavascriptInterface`-annotated methods (the SECURITY gate), retain the object + the
+/// resolved `Method` objects, and register the inventory with the helper (which injects
+/// `window.<name>`). Bridge method names cross the wire (the app's own API surface, not user data)
+/// but are logged as a COUNT only.
+extern "system" fn web_view_native_add_javascript_interface<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+    object: JObject<'local>,
+    name: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if view_registry::with_view(widget, |_v| ()).is_err() {
+            tracing::warn!(target: "android.webkit.WebView", widget, "addJavascriptInterface: invalid view handle (ignored)");
+            return Ok(());
+        }
+        if object.is_null() {
+            tracing::warn!(target: "android.webkit.WebView", widget, "addJavascriptInterface: null object (ignored)");
+            return Ok(());
+        }
+        let iface = if name.is_null() {
+            None
+        } else {
+            name.try_to_string(env).ok()
+        };
+        let Some(iface) = iface.filter(|s| !s.is_empty()) else {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            tracing::warn!(target: "android.webkit.WebView", widget, "addJavascriptInterface: null/empty name (ignored)");
+            return Ok(());
+        };
+        // Reflect the @JavascriptInterface methods → (name, param types, return type) + Method global.
+        let methods = match reflect_javascript_interface_methods(env, &object) {
+            Ok(m) => m,
+            Err(_) => {
+                if env.exception_check() {
+                    env.exception_describe();
+                    env.exception_clear();
+                }
+                tracing::warn!(target: "android.webkit.WebView", widget, iface = %iface, "addJavascriptInterface: reflection failed (no bridge registered)");
+                return Ok(());
+            }
+        };
+        let object_global = match env.new_global_ref(&object) {
+            Ok(g) => g,
+            Err(_) => {
+                if env.exception_check() {
+                    env.exception_describe();
+                    env.exception_clear();
+                }
+                return Ok(());
+            }
+        };
+        // One wire entry per NAME (the JS stub is one function per name; overloads share it);
+        // `returns_value` is advisory (proto.rs) — any non-void overload marks the name.
+        let wire_methods: Vec<crate::webview::proto::BridgeMethod> = methods
+            .iter()
+            .map(|(n, overloads)| crate::webview::proto::BridgeMethod {
+                name: n.clone(),
+                returns_value: overloads.iter().any(|m| m.return_type != "void"),
+            })
+            .collect();
+        let method_count = wire_methods.len();
+        if let Ok(mut reg) = bridge_registry().lock() {
+            reg.insert(
+                (widget, iface.clone()),
+                BridgeEntry {
+                    object: object_global,
+                    methods,
+                    era: webview_close_era(),
+                },
+            );
+            WEBVIEW_BRIDGE_ENTRIES.store(reg.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        match env.get_java_vm() {
+            Ok(java_vm) => {
+                match crate::webview::client::register_bridge(java_vm, widget, iface.clone(), wire_methods) {
+                    Ok(()) => tracing::info!(
+                        target: "android.webkit.WebView",
+                        widget,
+                        iface = %iface,
+                        method_count,
+                        "addJavascriptInterface: registered @JavascriptInterface bridge (method names not logged)"
+                    ),
+                    Err(e) => warn_bridge_unavailable("addJavascriptInterface", widget, &e.to_string()),
+                }
+            }
+            Err(e) => warn_bridge_unavailable("addJavascriptInterface", widget, &format!("JavaVM: {e}")),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// One-shot WARN (per feature) for the honest degradation when the helper is unavailable.
+fn warn_bridge_unavailable(feature: &str, widget: jlong, reason: &str) {
+    tracing::warn!(
+        target: "android.webkit.WebView",
+        widget,
+        feature,
+        reason,
+        "WebView bridge feature unavailable — web engine helper degraded (honest no-op)"
+    );
+}
+
+/// Reflect an object's public `@JavascriptInterface`-annotated methods into
+/// `name → [(Method global, param type names, return type name); one per overload]`. Only
+/// annotated methods are collected (the AOSP security gate). Each method is reflected in its own
+/// local frame. 2026-07-09: overloads are all retained (never collapsed to one arbitrary Method).
+fn reflect_javascript_interface_methods(
+    env: &mut Env,
+    object: &JObject,
+) -> jni::errors::Result<std::collections::HashMap<String, Vec<BridgeMethodMeta>>> {
+    let anno_class = env.find_class(JAVASCRIPT_INTERFACE_CLASS)?;
+    let class = env.get_object_class(object)?;
+    // getMethods() returns public methods incl. inherited — @JavascriptInterface methods are public.
+    let arr = env
+        .call_method(
+            &class,
+            jni_str!("getMethods"),
+            jni_sig!("()[Ljava/lang/reflect/Method;"),
+            &[],
+        )?
+        .l()?;
+    let methods: JObjectArray = env.cast_local::<JObjectArray>(arr)?;
+    let n = methods.len(env)?;
+    let mut out: std::collections::HashMap<String, Vec<BridgeMethodMeta>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        // Each method reflected in its own local frame (the jni_register precedent); a `Global`
+        // promoted inside survives the frame pop (frame pop frees only LOCAL refs).
+        let entry: Option<(String, BridgeMethodMeta)> = env.with_local_frame(
+            24,
+            |env| -> jni::errors::Result<Option<(String, BridgeMethodMeta)>> {
+                let m = methods.get_element(env, i)?;
+                let present = env
+                    .call_method(
+                        &m,
+                        jni_str!("isAnnotationPresent"),
+                        jni_sig!("(Ljava/lang/Class;)Z"),
+                        &[JValue::Object(&anno_class)],
+                    )?
+                    .z()?;
+                if !present {
+                    return Ok(None);
+                }
+                let name_obj = env
+                    .call_method(
+                        &m,
+                        jni_str!("getName"),
+                        jni_sig!("()Ljava/lang/String;"),
+                        &[],
+                    )?
+                    .l()?;
+                let mname = jstring_object_to_string(env, name_obj)?;
+                let ret_obj = env
+                    .call_method(
+                        &m,
+                        jni_str!("getReturnType"),
+                        jni_sig!("()Ljava/lang/Class;"),
+                        &[],
+                    )?
+                    .l()?;
+                let return_type = class_get_name(env, ret_obj)?;
+                let params_obj = env
+                    .call_method(
+                        &m,
+                        jni_str!("getParameterTypes"),
+                        jni_sig!("()[Ljava/lang/Class;"),
+                        &[],
+                    )?
+                    .l()?;
+                let params: JObjectArray = env.cast_local::<JObjectArray>(params_obj)?;
+                let pn = params.len(env)?;
+                let mut param_types = Vec::with_capacity(pn);
+                for j in 0..pn {
+                    let p = params.get_element(env, j)?;
+                    param_types.push(class_get_name(env, p)?);
+                }
+                let method = env.new_global_ref(&m)?;
+                Ok(Some((
+                    mname,
+                    BridgeMethodMeta {
+                        method,
+                        param_types,
+                        return_type,
+                    },
+                )))
+            },
+        )?;
+        if let Some((name, meta)) = entry {
+            out.entry(name).or_default().push(meta);
+        }
+    }
+    Ok(out)
+}
+
+/// `Class.getName()` for a `java.lang.Class` object (`"int"`, `"void"`, `"java.lang.String"`, `"[I"`).
+fn class_get_name(env: &mut Env, class_obj: JObject) -> jni::errors::Result<String> {
+    let name_obj = env
+        .call_method(
+            &class_obj,
+            jni_str!("getName"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )?
+        .l()?;
+    jstring_object_to_string(env, name_obj)
+}
+
+/// A `java.lang.String` `JObject` → Rust `String`.
+fn jstring_object_to_string(env: &mut Env, obj: JObject) -> jni::errors::Result<String> {
+    let jstr: JString = env.cast_local::<JString>(obj)?;
+    let chars = jstr.mutf8_chars(env)?;
+    Ok(String::from(chars))
+}
+
+// --- CookieManager natives (real backing via the session-scoped helper store) --------------------
+
+/// `CookieManager.native_getCookie(String url) -> String` — the blocking getCookie. Formats the
+/// helper's cookie list into Android's `"n1=v1; n2=v2"` string. Cookie VALUES are NEVER logged.
+extern "system" fn web_view_cookie_manager_get_cookie<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    url: JString<'local>,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let url_s = read_jstring(env, &url).unwrap_or_default();
+        let cookies = match env.get_java_vm() {
+            Ok(java_vm) => crate::webview::client::cookie_get_blocking(
+                java_vm,
+                url_s,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        env.new_string(format_cookies(&cookies))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `CookieManager.native_setCookie(String url, String value)` — fire-and-forget 2-arg setCookie.
+extern "system" fn web_view_cookie_manager_set_cookie<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    url: JString<'local>,
+    value: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let (Some(url_s), Some(value_s)) = (read_jstring(env, &url), read_jstring(env, &value))
+        else {
+            return Ok(());
+        };
+        let c = parse_set_cookie(&value_s);
+        if let Ok(java_vm) = env.get_java_vm() {
+            let _ = crate::webview::client::cookie_set(
+                java_vm,
+                url_s,
+                c.name,
+                c.value,
+                c.domain,
+                c.path,
+                c.secure,
+                c.http_only,
+                c.expires_epoch_s,
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `CookieManager.native_setCookie(String url, String value, ValueCallback callback)` — the 3-arg
+/// setCookie; the REAL success flag routes back to `callback` (retained under a request id).
+extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    url: JString<'local>,
+    value: JString<'local>,
+    callback: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let (Some(url_s), Some(value_s)) = (read_jstring(env, &url), read_jstring(env, &value))
+        else {
+            return Ok(());
+        };
+        let c = parse_set_cookie(&value_s);
+        let request_id = crate::webview::client::next_request_id();
+        if !callback.is_null() {
+            if let Ok(g) = env.new_global_ref(&callback) {
+                if let Ok(mut cbs) = cookie_set_callbacks().lock() {
+                    cbs.insert(request_id, g);
+                }
+            }
+        }
+        match env.get_java_vm() {
+            Ok(java_vm) => {
+                if crate::webview::client::cookie_set_with_result(
+                    java_vm,
+                    request_id,
+                    url_s,
+                    c.name,
+                    c.value,
+                    c.domain,
+                    c.path,
+                    c.secure,
+                    c.http_only,
+                    c.expires_epoch_s,
+                )
+                .is_err()
+                {
+                    // Honest degrade: the callback never fires from the helper → answer false now.
+                    if let Some(g) = cookie_set_callbacks()
+                        .lock()
+                        .ok()
+                        .and_then(|mut m| m.remove(&request_id))
+                    {
+                        fire_boolean_value_callback(env, &g, false);
+                    }
+                }
+            }
+            Err(_) => {
+                if let Some(g) = cookie_set_callbacks()
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(&request_id))
+                {
+                    fire_boolean_value_callback(env, &g, false);
+                }
+            }
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `CookieManager.native_removeAllCookies(ValueCallback callback)` — clear all cookies.
+extern "system" fn web_view_cookie_manager_remove_all_cookies<'local>(
+    env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    callback: JObject<'local>,
+) {
+    web_view_cookie_manager_remove_impl(env, callback)
+}
+
+/// `CookieManager.native_removeSessionCookies(ValueCallback callback)`. 2026-07-09 divergence:
+/// the v1 wire has one blanket clear, so this clears all cookies (harmless for the in-memory
+/// session store — nothing persists).
+extern "system" fn web_view_cookie_manager_remove_session_cookies<'local>(
+    env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    callback: JObject<'local>,
+) {
+    web_view_cookie_manager_remove_impl(env, callback)
+}
+
+fn web_view_cookie_manager_remove_impl<'local>(
+    mut env: EnvUnowned<'local>,
+    callback: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let request_id = crate::webview::client::next_request_id();
+        if !callback.is_null() {
+            if let Ok(g) = env.new_global_ref(&callback) {
+                if let Ok(mut cbs) = cookie_clear_callbacks().lock() {
+                    cbs.insert(request_id, g);
+                }
+            }
+        }
+        // 2026-07-09 fix: the get_java_vm Err arm previously retained the callback with no removal
+        // (a leak + a never-fired callback); both failure shapes now degrade honestly to FALSE.
+        let send_failed = match env.get_java_vm() {
+            Ok(java_vm) => crate::webview::client::cookies_clear(java_vm, request_id).is_err(),
+            Err(_) => true,
+        };
+        if send_failed {
+            if let Some(g) = cookie_clear_callbacks()
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&request_id))
+            {
+                fire_boolean_value_callback(env, &g, false);
+            }
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `CookieManager.native_flush()` — bound no-op: the session store is in-memory, nothing persists,
+/// so there is nothing to flush (documented 2026-07-09). Bound so the path never `UnsatisfiedLink`s.
+extern "system" fn web_view_cookie_manager_flush<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) {
+    env.with_env(|env: &mut Env| -> jni::errors::Result<()> {
+        let _ = env;
+        tracing::debug!(target: "android.webkit.CookieManager", "flush(): in-memory session store, no-op");
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own backing for `android.webkit.CookieManager`'s natives (2026-07-09, plan M4).
+fn register_cookie_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let bindings: [NativeBinding; 6] = [
+        (
+            CM_NATIVE_GET_COOKIE_NAME,
+            CM_NATIVE_GET_COOKIE_SIG,
+            web_view_cookie_manager_get_cookie as *mut c_void,
+        ),
+        (
+            CM_NATIVE_SET_COOKIE_NAME,
+            CM_NATIVE_SET_COOKIE_SIG,
+            web_view_cookie_manager_set_cookie as *mut c_void,
+        ),
+        (
+            CM_NATIVE_SET_COOKIE_NAME,
+            CM_NATIVE_SET_COOKIE_CB_SIG,
+            web_view_cookie_manager_set_cookie_cb as *mut c_void,
+        ),
+        (
+            CM_NATIVE_REMOVE_ALL_COOKIES_NAME,
+            CM_NATIVE_REMOVE_ALL_COOKIES_SIG,
+            web_view_cookie_manager_remove_all_cookies as *mut c_void,
+        ),
+        (
+            CM_NATIVE_REMOVE_SESSION_COOKIES_NAME,
+            CM_NATIVE_REMOVE_SESSION_COOKIES_SIG,
+            web_view_cookie_manager_remove_session_cookies as *mut c_void,
+        ),
+        (
+            CM_NATIVE_FLUSH_NAME,
+            CM_NATIVE_FLUSH_SIG,
+            web_view_cookie_manager_flush as *mut c_void,
+        ),
+    ];
+    let bound = register_class_natives_best_effort(env, COOKIE_MANAGER_CLASS, &bindings)?;
+    tracing::info!(
+        bound,
+        "registered Eclipse's non-GTK backing for the android.webkit.CookieManager native surface (get/set/set-with-callback/removeAll/removeSession/flush → session-scoped helper store) (per-method best-effort)"
+    );
+    Ok(())
+}
+
+/// Read a `JString` native argument to a Rust `String`, describing+clearing any pending exception
+/// (the openAssetFd house pattern). `None` on null/unreadable.
+fn read_jstring<'local>(env: &mut Env<'local>, s: &JString<'local>) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    match s.try_to_string(env) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            None
+        }
+    }
+}
+
+// --- Pure helpers (unit-tested; no JNI) ----------------------------------------------------------
+
+/// The structured fields parsed from an Android Set-Cookie-style `value` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedSetCookie {
+    name: String,
+    value: String,
+    domain: String,
+    path: String,
+    secure: bool,
+    http_only: bool,
+    /// 0 = session cookie (no Expires/Max-Age).
+    expires_epoch_s: i64,
+}
+
+/// Parse `"name=value; Domain=..; Path=..; Secure; HttpOnly; Max-Age=.."` into structured fields
+/// (the shape `CookieManager.setCookie(url, value)` accepts). `Max-Age` is resolved to an absolute
+/// epoch (now + seconds); a bare `Expires` without `Max-Age` falls back to session (0) — harmless
+/// for the in-memory session store. Pure/total. 2026-07-09.
+fn parse_set_cookie(value: &str) -> ParsedSetCookie {
+    let mut parts = value.split(';');
+    let first = parts.next().unwrap_or("").trim();
+    let (name, val) = match first.split_once('=') {
+        Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
+        None => (first.to_string(), String::new()),
+    };
+    let mut out = ParsedSetCookie {
+        name,
+        value: val,
+        domain: String::new(),
+        path: String::new(),
+        secure: false,
+        http_only: false,
+        expires_epoch_s: 0,
+    };
+    for attr in parts {
+        let attr = attr.trim();
+        if attr.is_empty() {
+            continue;
+        }
+        let (key, v) = match attr.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (attr, ""),
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "domain" => out.domain = v.to_string(),
+            "path" => out.path = v.to_string(),
+            "secure" => out.secure = true,
+            "httponly" => out.http_only = true,
+            "max-age" => {
+                if let Ok(secs) = v.parse::<i64>() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    out.expires_epoch_s = now.saturating_add(secs);
+                }
+            }
+            // Bare epoch-integer Expires is honored; a formatted RFC1123 date falls back to session
+            // (0) — the in-memory session store outlives the challenge regardless.
+            "expires" => {
+                if let Ok(epoch) = v.parse::<i64>() {
+                    out.expires_epoch_s = epoch;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Format a cookie list into Android's `getCookie` string: `"name1=value1; name2=value2"`. Pure.
+fn format_cookies(cookies: &[crate::webview::proto::CookieEntry]) -> String {
+    cookies
+        .iter()
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The marshalling plan for one JSON bridge argument against a Java parameter type name.
+#[derive(Debug, PartialEq, Eq)]
+enum ArgKind {
+    Str,
+    IntBox,
+    LongBox,
+    ShortBox,
+    ByteBox,
+    FloatBox,
+    DoubleBox,
+    BoolBox,
+    Null,
+    /// Unsupported type combination (arrays, arbitrary objects, or a type mismatch).
+    Reject,
+}
+
+/// Pure: decide how a JSON value marshals to a Java `@JavascriptInterface` parameter type (the
+/// getName() form: `"int"`, `"java.lang.String"`, …). Android exposes String + the numeric/boolean
+/// primitives (+ their boxes); everything else is rejected loudly. 2026-07-09.
+fn plan_arg(value: &serde_json::Value, param_type: &str) -> ArgKind {
+    use serde_json::Value;
+    let string_ok = matches!(
+        param_type,
+        "java.lang.String" | "java.lang.CharSequence" | "java.lang.Object"
+    );
+    match value {
+        Value::Null => match param_type {
+            "int" | "long" | "short" | "byte" | "float" | "double" | "boolean" | "char" => {
+                ArgKind::Reject
+            }
+            _ => ArgKind::Null,
+        },
+        Value::String(_) => {
+            if string_ok {
+                ArgKind::Str
+            } else {
+                ArgKind::Reject
+            }
+        }
+        Value::Bool(_) => match param_type {
+            "boolean" | "java.lang.Boolean" | "java.lang.Object" => ArgKind::BoolBox,
+            _ => ArgKind::Reject,
+        },
+        Value::Number(_) => match param_type {
+            "int" | "java.lang.Integer" => ArgKind::IntBox,
+            "long" | "java.lang.Long" => ArgKind::LongBox,
+            "short" | "java.lang.Short" => ArgKind::ShortBox,
+            "byte" | "java.lang.Byte" => ArgKind::ByteBox,
+            "float" | "java.lang.Float" => ArgKind::FloatBox,
+            "double" | "java.lang.Double" | "java.lang.Number" | "java.lang.Object" => {
+                ArgKind::DoubleBox
+            }
+            _ => ArgKind::Reject,
+        },
+        // Arrays / nested objects are not supported by Android's @JavascriptInterface either.
+        Value::Array(_) | Value::Object(_) => ArgKind::Reject,
+    }
+}
+
+/// Pure: pick the `@JavascriptInterface` overload whose arity matches the call's argument count.
+/// 2026-07-09: the reference behavior is Chromium's gin java bridge (`GinJavaBoundObject` keeps a
+/// name→methods multimap and `FindMethod(name, num_parameters)` resolves by argument count at call
+/// time; same-arity overloads are first-match there too — deliberately mirrored here).
+fn select_overload_index(arities: &[usize], argc: usize) -> Option<usize> {
+    arities.iter().position(|&a| a == argc)
+}
+
+/// Pure: a Java numeric `toString()` is embedded as a JSON number when it parses as one, else
+/// quoted as a JSON string (guards NaN/Infinity, which are not valid JSON). 2026-07-09.
+fn number_or_quote(s: &str) -> String {
+    if serde_json::from_str::<serde_json::Number>(s).is_ok() {
+        s.to_string()
+    } else {
+        serde_json::to_string(s).unwrap_or_else(|_| "null".to_string())
+    }
+}
+
+// --- The JNI upcall layer (reflective bridge invoke + ValueCallback dispatch) --------------------
+
+/// Fire a page-invoked bridge call: parse the payload, reflect-invoke the retained
+/// `@JavascriptInterface` method, and return `(ok, result_json)` for the `BridgeResult` reply.
+/// Attaches + `catch_unwind` (the `fire_web_view_internal_load_changed` shape). Runs on the client
+/// UPCALL thread (ART-attached; 2026-07-09 fix — app code must never run on the socket-reader
+/// thread, or a synchronous `CookieManager.getCookie` from a bridge method self-deadlocks the io
+/// loop), OUTSIDE all client locks (the method may re-enter WebView natives). Args/results are
+/// NEVER logged (only method name + call_id + lengths). 2026-07-09.
+pub fn fire_bridge_call(
+    java_vm: &JavaVM,
+    widget: jlong,
+    call_id: u32,
+    payload_json: &str,
+) -> (bool, String) {
+    let result: Result<(bool, String), FrameworkError> =
+        java_vm.attach_current_thread(|env: &mut Env| {
+            match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                fire_bridge_call_inner(env, widget, call_id, payload_json)
+            })) {
+                Ok(pair) => Ok(pair),
+                Err(_) => Err(FrameworkError::Panicked),
+            }
+        });
+    match result {
+        Ok(pair) => pair,
+        Err(_) => (false, "null".to_string()),
+    }
+}
+
+fn fire_bridge_call_inner(
+    env: &mut Env,
+    widget: jlong,
+    call_id: u32,
+    payload_json: &str,
+) -> (bool, String) {
+    const REJECT: &str = "null";
+    let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
+        Ok(v) => v,
+        Err(_) => return (false, "\"eclipse: bad bridge payload\"".to_string()),
+    };
+    let (Some(iface), Some(method)) = (
+        parsed.get("iface").and_then(|v| v.as_str()),
+        parsed.get("method").and_then(|v| v.as_str()),
+    ) else {
+        return (false, "\"eclipse: bad bridge payload\"".to_string());
+    };
+    let args: Vec<serde_json::Value> = parsed
+        .get("args")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Snapshot UNDER the registry lock: local refs of the object + resolved Method + metadata, so
+    // the reflect-invoke runs OUTSIDE the lock (the method may re-enter WebView natives → registry).
+    // 2026-07-09: overload resolution by argument count happens HERE (the gin java bridge rule);
+    // `Err(arities)` = the name exists but no overload matches the call's arity.
+    let snapshot = {
+        let reg = match bridge_registry().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match reg.get(&(widget, iface.to_string())) {
+            // Verify `method` is in the ANNOTATED set (a forged/non-annotated name is rejected).
+            Some(entry) => match entry.methods.get(method) {
+                Some(overloads) => {
+                    let arities: Vec<usize> =
+                        overloads.iter().map(|m| m.param_types.len()).collect();
+                    match select_overload_index(&arities, args.len()) {
+                        Some(i) => {
+                            let meta = &overloads[i];
+                            match (
+                                env.new_local_ref(entry.object.as_obj()),
+                                env.new_local_ref(meta.method.as_obj()),
+                            ) {
+                                (Ok(o), Ok(m)) => Ok(Some((
+                                    o,
+                                    m,
+                                    meta.param_types.clone(),
+                                    meta.return_type.clone(),
+                                ))),
+                                _ => Ok(None),
+                            }
+                        }
+                        None => Err(arities),
+                    }
+                }
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
+    };
+    let snapshot = match snapshot {
+        Ok(s) => s,
+        Err(arities) => {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                call_id,
+                expected_arities = ?arities,
+                got = args.len(),
+                "bridge call arity matches no overload (rejected)"
+            );
+            return (false, REJECT.to_string());
+        }
+    };
+    let Some((obj_local, method_local, param_types, return_type)) = snapshot else {
+        tracing::debug!(target: "android.webkit.WebView", widget, call_id, "bridge call for an unregistered/unknown method (rejected, never fabricated)");
+        return (false, REJECT.to_string());
+    };
+    // Marshal args into an Object[] (rejecting unsupported types loudly, payload-free).
+    let obj_class = match env.find_class(jni_str!("java/lang/Object")) {
+        Ok(c) => c,
+        Err(_) => {
+            clear_pending(env);
+            return (false, REJECT.to_string());
+        }
+    };
+    let array = match env.new_object_array(param_types.len() as i32, &obj_class, JObject::null()) {
+        Ok(a) => a,
+        Err(_) => {
+            clear_pending(env);
+            return (false, REJECT.to_string());
+        }
+    };
+    for (idx, (v, pt)) in args.iter().zip(param_types.iter()).enumerate() {
+        if let Err(reason) = set_bridge_arg(env, &array, idx, v, pt) {
+            // Loud, PAYLOAD-FREE: method + parameter type name only (never the value).
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                call_id,
+                method,
+                param_type = %pt,
+                reason,
+                "bridge arg marshal rejected (unsupported/mismatched type)"
+            );
+            return (false, REJECT.to_string());
+        }
+    }
+    // reflect: Method.invoke(object, boxedArgs)
+    let invoke = env.call_method(
+        &method_local,
+        jni_str!("invoke"),
+        jni_sig!("(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"),
+        &[JValue::Object(&obj_local), JValue::Object(&array)],
+    );
+    let result_obj = match invoke.and_then(|v| v.l()) {
+        Ok(o) => o,
+        Err(_) => {
+            // InvocationTargetException (the @JavascriptInterface method threw) → describe+clear,
+            // reject with a payload-free JSON error string (never the exception's message text).
+            clear_pending(env);
+            tracing::warn!(target: "android.webkit.WebView", widget, call_id, method, "bridge method invocation threw (rejected)");
+            return (false, "\"eclipse: bridge invocation error\"".to_string());
+        }
+    };
+    let result_json = marshal_bridge_return(env, &result_obj, &return_type);
+    (true, result_json)
+}
+
+/// Box one JSON arg per its Java parameter type and set it into `array[idx]`. Returns
+/// `Err(reason)` (a static, payload-free reason) for an unsupported/mismatched type.
+fn set_bridge_arg<'local>(
+    env: &mut Env<'local>,
+    array: &JObjectArray<'local>,
+    idx: usize,
+    v: &serde_json::Value,
+    param_type: &str,
+) -> Result<(), &'static str> {
+    macro_rules! set {
+        ($obj:expr) => {{
+            array
+                .set_element(env, idx, $obj)
+                .map_err(|_| "set-array-element")?;
+        }};
+    }
+    macro_rules! box_num {
+        ($class:literal, $sig:literal, $jv:expr) => {{
+            let boxed = env
+                .call_static_method(
+                    jni_str!($class),
+                    jni_str!("valueOf"),
+                    jni_sig!($sig),
+                    &[$jv],
+                )
+                .and_then(|r| r.l())
+                .map_err(|_| {
+                    clear_pending(env);
+                    "box-number"
+                })?;
+            set!(&boxed);
+        }};
+    }
+    let num = v.as_f64();
+    match plan_arg(v, param_type) {
+        ArgKind::Reject => return Err("unsupported-type"),
+        ArgKind::Null => { /* leave the slot null (already null) */ }
+        ArgKind::Str => {
+            let s = v.as_str().unwrap_or_default();
+            let js = env.new_string(s).map_err(|_| {
+                clear_pending(env);
+                "string-alloc"
+            })?;
+            set!(&js);
+        }
+        ArgKind::IntBox => box_num!(
+            "java/lang/Integer",
+            "(I)Ljava/lang/Integer;",
+            JValue::Int(num.unwrap_or(0.0) as jint)
+        ),
+        ArgKind::LongBox => box_num!(
+            "java/lang/Long",
+            "(J)Ljava/lang/Long;",
+            JValue::Long(num.unwrap_or(0.0) as jlong)
+        ),
+        ArgKind::ShortBox => box_num!(
+            "java/lang/Short",
+            "(S)Ljava/lang/Short;",
+            JValue::Short(num.unwrap_or(0.0) as jshort)
+        ),
+        ArgKind::ByteBox => box_num!(
+            "java/lang/Byte",
+            "(B)Ljava/lang/Byte;",
+            JValue::Byte(num.unwrap_or(0.0) as i8)
+        ),
+        ArgKind::FloatBox => box_num!(
+            "java/lang/Float",
+            "(F)Ljava/lang/Float;",
+            JValue::Float(num.unwrap_or(0.0) as jfloat)
+        ),
+        ArgKind::DoubleBox => box_num!(
+            "java/lang/Double",
+            "(D)Ljava/lang/Double;",
+            JValue::Double(num.unwrap_or(0.0))
+        ),
+        ArgKind::BoolBox => box_num!(
+            "java/lang/Boolean",
+            "(Z)Ljava/lang/Boolean;",
+            JValue::Bool(v.as_bool().unwrap_or(false))
+        ),
+    }
+    Ok(())
+}
+
+/// Marshal a reflective invoke's return `Object` (or null) to a JSON result string, per the return
+/// type name. Values are NEVER logged.
+fn marshal_bridge_return(env: &mut Env, result_obj: &JObject, return_type: &str) -> String {
+    if result_obj.is_null() {
+        // void method OR a null return.
+        return "null".to_string();
+    }
+    match return_type {
+        "boolean" | "java.lang.Boolean" => {
+            match env
+                .call_method(result_obj, jni_str!("booleanValue"), jni_sig!("()Z"), &[])
+                .and_then(|v| v.z())
+            {
+                Ok(true) => "true".to_string(),
+                Ok(false) => "false".to_string(),
+                Err(_) => {
+                    clear_pending(env);
+                    "null".to_string()
+                }
+            }
+        }
+        "int"
+        | "long"
+        | "short"
+        | "byte"
+        | "float"
+        | "double"
+        | "char"
+        | "java.lang.Integer"
+        | "java.lang.Long"
+        | "java.lang.Short"
+        | "java.lang.Byte"
+        | "java.lang.Float"
+        | "java.lang.Double"
+        | "java.lang.Number"
+        | "java.lang.Character" => match object_to_string(env, result_obj) {
+            Some(s) => number_or_quote(&s),
+            None => "null".to_string(),
+        },
+        // String / CharSequence / any other object → its toString() as a JSON string.
+        _ => match object_to_string(env, result_obj) {
+            Some(s) => serde_json::to_string(&s).unwrap_or_else(|_| "null".to_string()),
+            None => "null".to_string(),
+        },
+    }
+}
+
+/// `object.toString()` → Rust String (best-effort; `None` on any JNI failure, exception cleared).
+fn object_to_string(env: &mut Env, obj: &JObject) -> Option<String> {
+    let s = env
+        .call_method(
+            obj,
+            jni_str!("toString"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
+        .and_then(|v| v.l());
+    match s {
+        Ok(str_obj) if !str_obj.is_null() => jstring_object_to_string(env, str_obj).ok(),
+        _ => {
+            clear_pending(env);
+            None
+        }
+    }
+}
+
+/// Clear a pending JNI exception (describe+clear), best-effort.
+fn clear_pending(env: &mut Env) {
+    if env.exception_check() {
+        env.exception_describe();
+        env.exception_clear();
+    }
+}
+
+/// Deliver an `evaluateJavascript` JSON result to the retained `ValueCallback` (removed from the
+/// registry). `value_json` is NEVER logged. Runs on the client upcall thread. 2026-07-09.
+pub fn fire_evaluate_js_result(java_vm: &JavaVM, request_id: u32, ok: bool, value_json: &str) {
+    let value = if ok { value_json } else { "null" };
+    let global = eval_callbacks()
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&request_id))
+        .map(|(_widget, _era, g)| g);
+    let Some(global) = global else {
+        tracing::debug!(
+            request_id,
+            "value-callback result with no retained callback (fire-and-forget)"
+        );
+        return;
+    };
+    fire_string_callback_global(java_vm, &global, value);
+}
+
+/// 2026-07-09 fix (view-closed-mid-eval leak): fail every in-flight `evaluateJavascript`
+/// ValueCallback owned by `widget` with the honest AOSP failure value (`"null"` — the callback
+/// contract is fire-exactly-once; the view's browser is gone, so no result will ever arrive).
+/// Called from the client upcall thread when the helper confirms `ViewClosed`. 2026-07-10 fix:
+/// era-gated — only callbacks born BEFORE this close (`era ≤ upto_era`) are failed, so a legal
+/// close+re-drive's fresh callbacks are never killed by a stale queued drain (the old
+/// owning-widget-only selection delivered a wrong `"null"` to a live browser's eval).
+pub fn drain_eval_callbacks_for_view(java_vm: &JavaVM, widget: jlong, upto_era: u64) {
+    let drained: Vec<(u32, Global<JObject<'static>>)> = match eval_callbacks().lock() {
+        Ok(mut m) => {
+            let ids = eval_drain_victims(&m, widget, upto_era);
+            ids.into_iter()
+                .filter_map(|id| m.remove(&id).map(|(_w, _era, g)| (id, g)))
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    if drained.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        target: "android.webkit.WebView",
+        widget,
+        pending = drained.len(),
+        "WebView closed with evaluateJavascript results still in flight — failing each \
+         ValueCallback honestly (onReceiveValue(\"null\"))"
+    );
+    for (_id, g) in drained {
+        fire_string_callback_global(java_vm, &g, "null");
+    }
+}
+
+/// Pure victim selection for [`drain_eval_callbacks_for_view`]: the ids owned by `widget` whose
+/// birth era is ≤ `upto_era` (retained BEFORE the close being drained). Generic over the retained
+/// value so plain `cargo test` pins it without a JVM (2026-07-10, the stale-drain gate).
+fn eval_drain_victims<V>(
+    m: &std::collections::HashMap<u32, (jlong, u64, V)>,
+    widget: jlong,
+    upto_era: u64,
+) -> Vec<u32> {
+    m.iter()
+        .filter(|(_, (w, era, _))| *w == widget && *era <= upto_era)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// 2026-07-09 fix (failure-latch/shutdown leak): fail EVERY pending webview ValueCallback honestly
+/// — eval → `"null"`, 3-arg setCookie / removeAll(Session)Cookies → `Boolean.FALSE` — mirroring
+/// the per-request send-failure degrades. Called from the client upcall thread exactly once, when
+/// its channel closes (helper crash/EOF/protocol error or a deliberate shutdown); without this the
+/// retained JNI globals outlived the helper for the process lifetime and the callbacks never fired.
+pub fn drain_all_webview_callbacks(java_vm: &JavaVM, reason: &str) {
+    fn take_all<V>(m: &'static std::sync::Mutex<std::collections::HashMap<u32, V>>) -> Vec<V> {
+        m.lock()
+            .ok()
+            .map(|mut m| m.drain().map(|(_, v)| v).collect())
+            .unwrap_or_default()
+    }
+    let evals: Vec<(jlong, u64, Global<JObject<'static>>)> = take_all(eval_callbacks());
+    let sets: Vec<Global<JObject<'static>>> = take_all(cookie_set_callbacks());
+    let clears: Vec<Global<JObject<'static>>> = take_all(cookie_clear_callbacks());
+    if evals.is_empty() && sets.is_empty() && clears.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        target: "android.webkit.WebView",
+        reason,
+        eval_pending = evals.len(),
+        cookie_set_pending = sets.len(),
+        cookie_clear_pending = clears.len(),
+        "web engine helper gone with ValueCallbacks still in flight — failing each honestly"
+    );
+    for (_widget, _era, g) in evals {
+        fire_string_callback_global(java_vm, &g, "null");
+    }
+    for g in sets {
+        fire_boolean_callback_global(java_vm, &g, false);
+    }
+    for g in clears {
+        fire_boolean_callback_global(java_vm, &g, false);
+    }
+}
+
+/// Deliver the REAL 3-arg-setCookie success flag to the retained `ValueCallback<Boolean>`.
+pub fn fire_cookie_set_result(java_vm: &JavaVM, request_id: u32, ok: bool) {
+    fire_boolean_result(java_vm, cookie_set_callbacks(), request_id, ok);
+}
+
+/// Deliver the removeAll/removeSession completion (a completed clear is success → `Boolean.TRUE`).
+pub fn fire_cookies_clear_result(java_vm: &JavaVM, request_id: u32) {
+    fire_boolean_result(java_vm, cookie_clear_callbacks(), request_id, true);
+}
+
+/// Fire `onReceiveValue(String)` on a retained callback global (attach + catch_unwind shape).
+fn fire_string_callback_global(java_vm: &JavaVM, global: &Global<JObject<'static>>, value: &str) {
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let local = env.new_local_ref(global.as_obj())?;
+            fire_string_value_callback(env, &local, value);
+            Ok::<(), FrameworkError>(())
+        })) {
+            Ok(r) => r,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    });
+}
+
+/// Fire `onReceiveValue(Boolean.valueOf(ok))` on a retained callback global (attach shape).
+fn fire_boolean_callback_global(java_vm: &JavaVM, global: &Global<JObject<'static>>, ok: bool) {
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let local = env.new_local_ref(global.as_obj())?;
+            fire_boolean_value_callback(env, &local, ok);
+            Ok::<(), FrameworkError>(())
+        })) {
+            Ok(r) => r,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    });
+}
+
+/// Shared: remove the one-shot callback under `request_id` and fire `onReceiveValue(Boolean)`.
+fn fire_boolean_result(
+    java_vm: &JavaVM,
+    registry: &'static std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>>,
+    request_id: u32,
+    ok: bool,
+) {
+    let global = registry.lock().ok().and_then(|mut m| m.remove(&request_id));
+    let Some(global) = global else {
+        tracing::debug!(
+            request_id,
+            "boolean value-callback with no retained callback"
+        );
+        return;
+    };
+    fire_boolean_callback_global(java_vm, &global, ok);
+}
+
+/// Fire `ValueCallback.onReceiveValue(String)` on `callback` (a live local ref); a throwing
+/// callback is described+cleared (never propagates).
+fn fire_string_value_callback(env: &mut Env, callback: &JObject, value: &str) {
+    let jstr = match env.new_string(value) {
+        Ok(s) => s,
+        Err(_) => {
+            clear_pending(env);
+            return;
+        }
+    };
+    if let Err(e) = checked(env, "ValueCallback.onReceiveValue(String)", |env| {
+        env.call_method(
+            callback,
+            jni_str!("onReceiveValue"),
+            jni_sig!("(Ljava/lang/Object;)V"),
+            &[JValue::Object(&jstr)],
+        )?
+        .v()
+    }) {
+        tracing::debug!(error = %e, "onReceiveValue(String) threw (cleared)");
+    }
+}
+
+/// Fire `ValueCallback.onReceiveValue(Boolean.valueOf(ok))` on `callback` (a live local ref).
+fn fire_boolean_value_callback(env: &mut Env, callback: &JObject, ok: bool) {
+    let boxed = env
+        .call_static_method(
+            jni_str!("java/lang/Boolean"),
+            jni_str!("valueOf"),
+            jni_sig!("(Z)Ljava/lang/Boolean;"),
+            &[JValue::Bool(ok)],
+        )
+        .and_then(|v| v.l());
+    let boxed = match boxed {
+        Ok(b) => b,
+        Err(_) => {
+            clear_pending(env);
+            return;
+        }
+    };
+    if let Err(e) = checked(env, "ValueCallback.onReceiveValue(Boolean)", |env| {
+        env.call_method(
+            callback,
+            jni_str!("onReceiveValue"),
+            jni_sig!("(Ljava/lang/Object;)V"),
+            &[JValue::Object(&boxed)],
+        )?
+        .v()
+    }) {
+        tracing::debug!(error = %e, "onReceiveValue(Boolean) threw (cleared)");
+    }
 }
 
 // === Eclipse's own (non-GTK) backing for the inflatable android.widget.* property setters =========
@@ -14769,6 +16480,9 @@ fn drive_lifecycle(
     // are spawn-and-forward to the out-of-process eclipse-webview helper (2026-07-03, M3), with
     // the honest one-shot-WARN no-op as the helper-unavailable degradation.
     register_web_view_natives(env)?;
+    // 2026-07-09 (plan M4): the CookieManager native surface (get/set/removeAll/flush → the
+    // session-scoped helper cookie store; the CookieProtocol/.ROBLOSECURITY handoff).
+    register_cookie_manager_natives(env)?;
     // Bind the inflatable android.widget.* property-setter natives on their OWN declaring classes —
     // once each widget's native_constructor (above) lets LayoutInflater build the content view, the
     // widgets' own setters surface one at a time (the trigger was ProgressBar.native_setIndeterminate,
@@ -17545,6 +19259,195 @@ mod tests {
             WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG.to_str(),
             "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
         );
+        // 2026-07-09 (plan M4): the two new WebView natives (overlay WebView.smali) — the live
+        // registration line moves from bound=3 to bound=5. A transcription drift re-opens the
+        // UnsatisfiedLinkError at boot for the bridge/eval path.
+        assert_eq!(
+            WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_NAME.to_str(),
+            "native_evaluateJavascript"
+        );
+        assert_eq!(
+            WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_SIG.to_str(),
+            "(JLjava/lang/String;Landroid/webkit/ValueCallback;)V"
+        );
+        assert_eq!(
+            WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_NAME.to_str(),
+            "native_addJavascriptInterface"
+        );
+        assert_eq!(
+            WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG.to_str(),
+            "(JLjava/lang/Object;Ljava/lang/String;)V"
+        );
+        // The M4 CookieManager natives (overlay CookieManager.smali) + the JavascriptInterface
+        // annotation class (overlay javac).
+        assert_eq!(
+            COOKIE_MANAGER_CLASS.to_str(),
+            "android/webkit/CookieManager"
+        );
+        assert_eq!(CM_NATIVE_GET_COOKIE_NAME.to_str(), "native_getCookie");
+        assert_eq!(
+            CM_NATIVE_GET_COOKIE_SIG.to_str(),
+            "(Ljava/lang/String;)Ljava/lang/String;"
+        );
+        assert_eq!(CM_NATIVE_SET_COOKIE_NAME.to_str(), "native_setCookie");
+        assert_eq!(
+            CM_NATIVE_SET_COOKIE_SIG.to_str(),
+            "(Ljava/lang/String;Ljava/lang/String;)V"
+        );
+        assert_eq!(
+            CM_NATIVE_SET_COOKIE_CB_SIG.to_str(),
+            "(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V"
+        );
+        assert_eq!(
+            CM_NATIVE_REMOVE_ALL_COOKIES_NAME.to_str(),
+            "native_removeAllCookies"
+        );
+        assert_eq!(
+            CM_NATIVE_REMOVE_SESSION_COOKIES_NAME.to_str(),
+            "native_removeSessionCookies"
+        );
+        assert_eq!(CM_NATIVE_FLUSH_NAME.to_str(), "native_flush");
+        assert_eq!(CM_NATIVE_FLUSH_SIG.to_str(), "()V");
+        assert_eq!(
+            JAVASCRIPT_INTERFACE_CLASS.to_str(),
+            "android/webkit/JavascriptInterface"
+        );
+    }
+
+    #[test]
+    fn parse_set_cookie_extracts_name_value_domain_path_flags_and_expires() {
+        // 2026-07-09 (plan M4): the pure Set-Cookie parser feeding the CookieManager natives.
+        let c = parse_set_cookie("ECLIPSE_TEST=1; Path=/");
+        assert_eq!(c.name, "ECLIPSE_TEST");
+        assert_eq!(c.value, "1");
+        assert_eq!(c.path, "/");
+        assert_eq!(c.domain, "");
+        assert!(!c.secure && !c.http_only);
+        assert_eq!(c.expires_epoch_s, 0, "no Expires/Max-Age → session (0)");
+
+        let c = parse_set_cookie(
+            ".ROBLOSECURITY=abc; Domain=.roblox.com; Path=/; Secure; HttpOnly; Max-Age=3600",
+        );
+        assert_eq!(c.name, ".ROBLOSECURITY");
+        assert_eq!(c.value, "abc");
+        assert_eq!(c.domain, ".roblox.com");
+        assert_eq!(c.path, "/");
+        assert!(c.secure);
+        assert!(c.http_only);
+        assert!(
+            c.expires_epoch_s > 0,
+            "Max-Age resolves to an absolute future epoch"
+        );
+
+        // A bare name (no '=') and an empty attribute list.
+        let c = parse_set_cookie("justname");
+        assert_eq!(c.name, "justname");
+        assert_eq!(c.value, "");
+    }
+
+    #[test]
+    fn format_cookies_joins_name_value_with_semicolons() {
+        use crate::webview::proto::CookieEntry;
+        let entry = |n: &str, v: &str| CookieEntry {
+            name: n.to_string(),
+            value: v.to_string(),
+            domain: String::new(),
+            path: String::new(),
+            secure: false,
+            http_only: false,
+        };
+        assert_eq!(format_cookies(&[]), "");
+        assert_eq!(format_cookies(&[entry("a", "1")]), "a=1");
+        assert_eq!(
+            format_cookies(&[entry("a", "1"), entry("b", "2")]),
+            "a=1; b=2"
+        );
+    }
+
+    #[test]
+    fn bridge_args_marshal_supported_types_and_reject_unsupported() {
+        // 2026-07-09 (plan M4): the pure arg-marshalling classifier — String/number/bool/null map to
+        // the matching param types; arrays/objects/mismatches reject loudly.
+        use serde_json::json;
+        assert_eq!(plan_arg(&json!("hi"), "java.lang.String"), ArgKind::Str);
+        assert_eq!(
+            plan_arg(&json!("hi"), "java.lang.CharSequence"),
+            ArgKind::Str
+        );
+        assert_eq!(plan_arg(&json!("hi"), "java.lang.Object"), ArgKind::Str);
+        assert_eq!(plan_arg(&json!("hi"), "int"), ArgKind::Reject);
+        assert_eq!(plan_arg(&json!(3), "int"), ArgKind::IntBox);
+        assert_eq!(plan_arg(&json!(3), "long"), ArgKind::LongBox);
+        assert_eq!(plan_arg(&json!(3), "double"), ArgKind::DoubleBox);
+        assert_eq!(plan_arg(&json!(3), "java.lang.Object"), ArgKind::DoubleBox);
+        assert_eq!(plan_arg(&json!(3), "java.lang.String"), ArgKind::Reject);
+        assert_eq!(plan_arg(&json!(true), "boolean"), ArgKind::BoolBox);
+        assert_eq!(plan_arg(&json!(true), "int"), ArgKind::Reject);
+        assert_eq!(plan_arg(&json!(null), "java.lang.String"), ArgKind::Null);
+        // Null to a primitive param is rejected (a primitive cannot be null).
+        assert_eq!(plan_arg(&json!(null), "int"), ArgKind::Reject);
+        // Arrays / nested objects are unsupported (as on real Android).
+        assert_eq!(
+            plan_arg(&json!([1, 2]), "java.lang.Object"),
+            ArgKind::Reject
+        );
+        assert_eq!(
+            plan_arg(&json!({"a":1}), "java.lang.Object"),
+            ArgKind::Reject
+        );
+    }
+
+    #[test]
+    fn bridge_return_number_or_quote_embeds_valid_numbers_and_quotes_the_rest() {
+        // 2026-07-09: a numeric toString embeds as a JSON number; NaN/Infinity/garbage are quoted.
+        assert_eq!(number_or_quote("42"), "42");
+        assert_eq!(number_or_quote("-1.5"), "-1.5");
+        assert_eq!(number_or_quote("NaN"), "\"NaN\"");
+        assert_eq!(number_or_quote("Infinity"), "\"Infinity\"");
+    }
+
+    #[test]
+    fn bridge_overloads_resolve_by_arity_like_the_android_java_bridge() {
+        // 2026-07-09 fix pin: @JavascriptInterface overloads are ALL retained and resolved by
+        // argument count at call time (Chromium gin's FindMethod(name, num_parameters)) — the
+        // name-only registry collapsed e.g. postMessage(String) vs postMessage(String,String) to
+        // one arbitrary getMethods() survivor and rejected calls matching the discarded overload.
+        assert_eq!(select_overload_index(&[1, 2], 2), Some(1));
+        assert_eq!(select_overload_index(&[1, 2], 1), Some(0));
+        // No matching arity: rejected (the loud expected-arities WARN path).
+        assert_eq!(select_overload_index(&[1, 2], 3), None);
+        assert_eq!(select_overload_index(&[], 0), None);
+        // Same-arity overloads: first-match — deliberately the reference (gin) behavior.
+        assert_eq!(select_overload_index(&[2, 2], 2), Some(0));
+    }
+
+    #[test]
+    fn eval_drain_victims_selects_only_pre_close_era_callbacks_of_the_closed_view() {
+        // 2026-07-10 fix pin: a queued ViewClosedDrain must fail only callbacks born BEFORE the
+        // close it belongs to. A close+re-drive of the same widget (close_view is pub; per-view
+        // close deliberately never latches) registers FRESH callbacks whose birth era is > the
+        // close's era — the old owning-widget-only selection delivered a wrong "null" to the
+        // live re-driven browser's evaluateJavascript.
+        let mut m = std::collections::HashMap::new();
+        m.insert(1_u32, (7_i64, 0_u64, ())); // pre-close, closed widget → drained
+        m.insert(2_u32, (7_i64, 3_u64, ())); // era == close era (born before the bump) → drained
+        m.insert(3_u32, (7_i64, 4_u64, ())); // born AFTER the close (re-drive) → survives
+        m.insert(4_u32, (9_i64, 0_u64, ())); // different widget → never selected
+        let mut victims = eval_drain_victims(&m, 7, 3);
+        victims.sort_unstable();
+        assert_eq!(victims, vec![1, 2]);
+        // The other widget's own drain selects exactly its own pre-close entry.
+        assert_eq!(eval_drain_victims(&m, 9, 0), vec![4]);
+    }
+
+    #[test]
+    fn bridge_survives_view_close_only_for_entries_born_after_the_close() {
+        // 2026-07-10 fix pin: the era-gated retain predicate for the upcall-thread bridge drop
+        // (drop_bridges_for_view_closed) — same stale-drain gate as the eval-callback drain.
+        assert!(!bridge_survives_view_close(7, 3, 7, 3)); // born before/at the close → dropped
+        assert!(!bridge_survives_view_close(7, 0, 7, 3));
+        assert!(bridge_survives_view_close(7, 4, 7, 3)); // re-registered after the close → kept
+        assert!(bridge_survives_view_close(9, 0, 7, 3)); // another widget → untouched
     }
 
     // 2026-07-03 (web-engine plan M2): the redaction unit test

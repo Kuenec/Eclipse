@@ -4,7 +4,8 @@
 > **2026-07-03**. Companion to [`dependency-plan.md`](./dependency-plan.md) (the dependency
 > justification) and `AGENTS.md` §6 (2026-07-03 🧭, the decision-log entry). Every milestone
 > gates the next. **M1 is DONE — GO; M2 is DONE (2026-07-03, drive-verified); M3 is DONE
-> (2026-07-03, `__webview-test`-verified);** implementation continues at **M4**.
+> (2026-07-03, `__webview-test`-verified); M4 is DONE (2026-07-10,
+> `__webview-test`-verified);** implementation continues at **M5**.
 
 ## 1. Why a web engine at all (the recorded ceiling)
 
@@ -344,6 +345,101 @@ secret-bearing.
 JS → injected object → JNI method → evaluateJavascript back), cookie set/get round-trip
 through `CookieManager`, and the honest UA — deterministic SUCCESS marker; a privacy grep of
 the run shows scheme+host-only URL lines and zero payload text.
+
+**Status — DONE (2026-07-10; gate + dev-host `__webview-test` run verified).**
+
+- **Protocol v2 shipped as a versioned ADDITIVE extension — v1 layouts stay FROZEN.**
+  `PROTO_V1` → `PROTO_VERSION = 2` with the existing exact-match handshake as the negotiation
+  channel (no capability bits — the helper ships from the same build tree, so consumer and
+  helper are always one version; a skewed peer answers `HelloAck{its version}` and closes,
+  and the consumer latches the M3 honest one-shot-WARN no-op degradation). New wire types
+  ct `0x11–0x14` (`BridgeRegister`/`BridgeResult`/`EvaluateJsForResult`/`CookieSetForResult`)
+  + ht `0x89–0x8B` (`BridgeCall`/`EvaluateJsResult`/`CookieSetResult`), all with caps
+  enforced BEFORE allocation in the total-decoder shape; the FROZEN v1 round-trip pin is
+  untouched (still asserts exactly 24 messages) and a separate v2 pin covers the 7 new ones.
+  Bridge/eval/cookie payloads are OPAQUE to the helper — forwarded unparsed, logged as
+  lengths/counts only.
+- **JS bridge = async Promise (the DOCUMENTED DIVERGENCE from AOSP's synchronous
+  `@JavascriptInterface` contract).** CEF's only cross-process JS↔native primitive
+  (`CefMessageRouter`/`cefQuery`) is asynchronous; a synchronous return would block the
+  sandboxed renderer main thread on renderer→browser→socket→ART→back, which CEF does not
+  offer and which risks renderer deadlock. Renderer-side V8 stubs make every
+  `window.<name>.<method>()` return a Promise; browser-side router → `BridgeCall` over the
+  socket → ART reflect-invoke of the retained `@JavascriptInterface` methods (the annotation,
+  RUNTIME-retained via the new overlay class, is the security gate; overloads resolved by
+  ARGUMENT COUNT per the Chromium gin java-bridge reference) → `BridgeResult` → the page's
+  Promise. The renderer main thread is NEVER blocked; a page expecting a synchronous return
+  gets a Promise — re-validate against `RBHybridWebView`'s real shape at M6 (open question
+  #3). Inventory delivery is a PULL model (the renderer signals `eclipse.bridge.ready` per
+  main-frame context and the browser re-sends the per-view inventory — the design's push was
+  live-observed dropped by CEF).
+- **Cookies = ONE session-scoped private in-memory `RequestContext`** (empty `cache_path`,
+  `persist_session_cookies=0`) shared by every browser and every cookie op — the
+  `.ROBLOSECURITY` handoff lands in the store the challenge WebView reads. The overlay
+  `CookieManager` is native-backed end-to-end (get / 2-arg set / 3-arg set / removeAll /
+  removeSession / flush-no-op, NEW registrar `bound=6`), replacing the fabricated
+  `Boolean.TRUE` with the real async result; `getCookie` is a bounded blocking round-trip
+  (5 s, honest-empty degrade).
+- **Honest deliberate UA** (`Mozilla/5.0 (X11; Linux x86_64) … Chrome/149.0.0.0 …
+  Eclipse-WebView/149.0.6`) set helper-side in `build_settings()` AND returned by the overlay
+  `WebSettings` (`getUserAgentString` + `getDefaultUserAgent`) — byte-matched and pinned in
+  both units; the recorded "GDPR VIOLATION" literal is GONE. It is genuinely Chromium 149 on
+  Linux x86_64 and deliberately identifying — never impersonating a device; the M6 owner
+  caveat on vendor reception stays open question #1.
+- **The `javascript:`-println full-URL leak channel is PATCHED**: the overlay `loadUrl` now
+  routes `javascript:` URLs to `native_evaluateJavascript` and the println is gone — landed
+  BEFORE such URLs become secret-bearing, exactly as this section requires (M6 must
+  overlay-validate it against the real challenge flow). WebView natives grew `bound=3` →
+  **`bound=5`** (`native_evaluateJavascript` + `native_addJavascriptInterface`); the
+  `@JavascriptInterface` runtime annotation + the inert `EclipseBridgeProbe` test class are
+  new javac classes (classes.dex); WebView + WebSettings are shadowed into classes2.dex
+  behind the established anchor/pristine/back-check §-guards.
+- **Threading (the post-review hardening):** a dedicated `eclipse-webview-upcall` thread owns
+  ALL app-facing JNI (internalLoadChanged, bridge reflect-invokes, every ValueCallback, the
+  deferred closed-view bridge drop) — the socket reader is fully JNI-free; era-gated drains
+  give exactly-once, honest-failure callback delivery on every loss path (helper crash/EOF,
+  shutdown, renderer death, view close incl. the close+re-drive corner); reader exit wakes
+  parked `getCookie` waiters immediately.
+- **Measured `__webview-test` run (dev-host main thread, 2026-07-10, log
+  `/tmp/eclipse-webview-m4-test.log`, 52 lines):** `timeout 180 ./target/release/eclipse
+  __webview-test` → EXIT=0 with the SUCCESS marker `WebView engine pipeline OK:
+  internalLoadChanged upcalls 2/2 (state 0 @ 150ms, state 3 @ 150ms, http 200), frame
+  1024x768 237 distinct pixels, bridge round-trip OK, evaluateJavascript OK, honest UA OK,
+  cookie set/get OK, cookie callback OK, ViewClosed, helper exit 0, bound=5` plus the
+  CookieManager `bound=6` registration line. The driven page is now an OFFLINE first-party
+  loopback page (`http://127.0.0.1:<port>` — a real http origin for cookies/bridge; the M3
+  live-roblox.com dependency moves to M6), hence the small ink census (237 distinct pixels —
+  the solid-color test page, not the M1–M3 roblox.com range 122,859–123,156); the handshake
+  logged `engine=cef/149.0.6+g0d0eeb6+chromium-149.0.7827.201 protocol=2`; helper resolved to
+  the release binary; privacy greps: 0 full-URL-shaped lines (scheme+host only), 0
+  ROBLOSECURITY-shaped strings — bridge method names, cookie values, the UA and eval results
+  are deliberately never logged; /proc orphan scan clean. An earlier identical run on the
+  pre-close-out tree also passed EXIT=0 (state 0/3 @ 200 ms).
+- **Gate:** root fmt / build --all-targets / clippy -D warnings / test / release ALL clean —
+  **629 unit + 6 integ + 2 doctest, ZERO SKIP** (was 613+6+2 at M3; the `__webview-test`
+  guard drove the full natives→socket→helper→memfd pipeline through REAL ART); helper crate
+  **23 + 15** clean (was 17+11; `CEF_PATH` = the reused M1 dist); root
+  `Cargo.toml`/`Cargo.lock` stay cef-free.
+- **Review ledger (three-workflow chain):** main workflow (recon ×3 → design → implement →
+  independent gate → adversarial review ×3 dimensions, every finding skeptic-verified) — 7
+  alleged / 7 CONFIRMED / ALL FIXED (ValueCallback JNI-global leaks across
+  teardown/shutdown/latch; the reader-thread reentrancy self-deadlock class — a synchronous
+  `getCookie` from any upcall stalled the io thread 5 s and returned a wrong empty; the eval
+  degrade dropping its callback unfired; `reader_fatal` leaving getCookie waiters parked;
+  `@JavascriptInterface` overload collapse). Post-fix review — 4 alleged: 2 CONFIRMED + fixed
+  (never-driven-view bridge leak; stale queued ViewClosedDrain vs close+re-drive), 1 REFUTED
+  with mechanism (the GC-finalize trigger is unreachable — Eclipse's own per-view jobject
+  global pins every constructed View), 1 unadjudicated (skeptic died) → re-adjudicated by the
+  close-out pass: CONFIRMED (the reader's ViewClosed bridge drop did hidden scoped JNI
+  attach/detach per global) + fixed (the drop moved to the upcall thread, era-gated). Stale
+  protocol-v1 strings fixed tree-wide (the handshake log binds the negotiated `protocol=2`).
+- **Carried:** the M3 carried-to-M6 list stays carried (ATL 2-arg `onPageStarted`
+  reconciliation; driven-loads-only contract; centered-fallback rect no-input;
+  challenge-rect/`ResizeView` at M6). TWO new owner-flagged unconfirmed nuances (bounded,
+  recorded not fixed): an in-flight eval callback of a finalized (notify-path) view whose
+  result raced the finalize is held until the helper-teardown drain; the pre-existing
+  `pending_bridges` inventory-loss nuance on close+re-drive.
+- Implementation continues at **M5**.
 
 ### M5 — Distro-agnostic hardening + packaging
 
