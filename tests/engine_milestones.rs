@@ -211,7 +211,11 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
 
     if !out.status.success()
         && (text.contains(eclipse::webview::client::HELPER_NOT_FOUND_MARKER)
-            || text.contains(eclipse::webview::client::NO_DISPLAY_MARKER))
+            || text.contains(eclipse::webview::client::NO_DISPLAY_MARKER)
+            // 2026-07-10 (plan M5): a host genuinely lacking BOTH sandbox tiers (unprivileged
+            // userns AND a SUID chrome-sandbox) with the config opt-in off is an env
+            // limitation like no-display — the helper's refusal is the DESIGNED outcome.
+            || text.contains(eclipse::webview::client::SANDBOX_UNAVAILABLE_MARKER))
     {
         eprintln!(
             "SKIP: eclipse-webview helper/CEF unavailable on this host (env limitation)\n{text}"
@@ -252,6 +256,21 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
         "the WebView native registration count regressed (expected the live bound=5 line — the M4 \
          evaluateJavascript + addJavascriptInterface natives).\n{text}"
     );
+    // 2026-07-10 (plan M5): the four detect-don't-assume detection lines (stable prefixes only —
+    // the values are session-dependent: wayland vs x11, userns/suid/DEGRADED, resolved counts,
+    // gpu vs SwiftShader). Three are the helper's own stderr lines, one is the client's
+    // pre-spawn host-lib probe. The SUCCESS marker string itself is unchanged from M4.
+    for needle in [
+        "ozone platform selected explicitly: ",
+        "sandbox mode selected: ",
+        "webview host-lib probe: ",
+        "render path: ",
+    ] {
+        assert!(
+            text.contains(needle),
+            "missing the M5 detection line {needle:?} (detect-don't-assume regression?).\n{text}"
+        );
+    }
 }
 
 /// 2026-07-03 (web-engine plan M3): the root crate must stay cef-free — the CEF engine lives ONLY

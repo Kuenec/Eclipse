@@ -4,8 +4,9 @@
 > **2026-07-03**. Companion to [`dependency-plan.md`](./dependency-plan.md) (the dependency
 > justification) and `AGENTS.md` §6 (2026-07-03 🧭, the decision-log entry). Every milestone
 > gates the next. **M1 is DONE — GO; M2 is DONE (2026-07-03, drive-verified); M3 is DONE
-> (2026-07-03, `__webview-test`-verified); M4 is DONE (2026-07-10,
-> `__webview-test`-verified);** implementation continues at **M5**.
+> (2026-07-03, `__webview-test`-verified); M4 is DONE (2026-07-10, `__webview-test`-verified);
+> M5 is DONE (2026-07-10, packaged + four-leg live-verified);** implementation continues at
+> **M6**.
 
 ## 1. Why a web engine at all (the recorded ceiling)
 
@@ -456,6 +457,65 @@ Chromium third-party license aggregate shipped, no hardcoded paths, Flatpak
 passes on both a Wayland and an X11 session on the dev host with the detection lines logged;
 a simulated missing-host-lib run (bwrap/env harness) produces the actionable error, not a
 crash; the measured shipped-payload size recorded in §6.
+
+**Status — DONE (2026-07-10; gate + clean-path cold gate + FOUR dev-host `__webview-test`
+live legs verified).**
+
+- **Sandbox-mode selection = the three-tier ladder** (the implemented answer to open question
+  #2; the full dated policy record is AGENTS.md §6 2026-07-10 🔒): (1) unprivileged user
+  namespaces, verified USABLE by a live fork-child probe (`unshare(CLONE_NEWUSER)` + one
+  capability-gated syscall INSIDE the new namespace — bare creation is NOT the predicate;
+  catches Ubuntu 24.04's permit-then-confine AppArmor default); (2) SUID `chrome-sandbox`
+  beside libcef.so, accepted by Chromium's OWN predicate (root-owned, `S_ISUID`, `S_IXOTH`,
+  `access(X_OK)`); (3) neither → REFUSE pre-init with the typed `SandboxUnavailable`
+  actionable error — unless the user explicitly set `webview_allow_unsandboxed = true`, which
+  selects a LOUD logged `--no-sandbox` degradation (never a default). Both capability inputs
+  are MEASURED live, never knob-file guesses.
+- **`DT_NEEDED` host-lib probe + enriched spawn post-mortem:** NEW `src/webview/hostprobe.rs`
+  resolves the 26 direct DT_NEEDED of libcef.so pre-spawn; a miss WARNs with the exact soname
+  + per-distro package names (apt/dnf/pacman), and the consumer's handshake failure
+  distinguishes the dynamic-linker exit 127 from a normal usage failure, folding the probe
+  result into ONE actionable error. The simulated missing-lib run (bwrap masking
+  `/usr/lib/libnss3.so`) produced exactly that error — controlled EXIT=1, no panic/crash
+  (log `/tmp/eclipse-webview-m5-test-missinglib.log`).
+- **Display + render path:** Wayland and X11 detected and the ozone platform set EXPLICITLY
+  (`# display: wayland (WAYLAND_DISPLAY set)` / `# display: x11 (DISPLAY set, WAYLAND_DISPLAY
+  unset)`); GPU vs bundled SwiftShader is LOG-ONLY detection by design (Chromium owns the
+  selection; this NVIDIA host takes the GPU path; SwiftShader ships as the automatic
+  fallback, not separately exercised).
+- **Packaging (`tools/webview-dist/package-webview.sh`, exit 0):** pin verified
+  `cef_binary_149.0.6+g0d0eeb6+chromium-149.0.7827.201_linux64_minimal.tar.bz2` (sha1
+  `d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72`, sha256
+  `f90dec4c5c42a7bbd4f2bd80a7a77e0ac6aacfc6627bb43572d803e77f26dfbc`); the build-input
+  libcef.so sha256-matches the verified tarball and the ship-set is extracted ONLY from it;
+  libcef.so stripped 1,375,259,784 → 256,322,688 bytes (byte-identical to the M1 reference);
+  locales pruned to en-US (en-US.pak 588,985 B + 3 18-byte grammatical-gender stubs);
+  CREDITS.html (19,678,258 B) + LICENSE.txt shipped; RUNPATH=`$ORIGIN` (the helper
+  `.cargo/config.toml` contract) re-verified; no-display packaged-layout smoke OK.
+  **PACKAGED PAYLOAD: 355428085 bytes (340M)** at `dist/eclipse-linux-x86_64` (§7 #5 —
+  recorded in AGENTS.md §6). Flatpak stays a SKETCH (`tools/webview-dist/README.md`; §7 #7 —
+  full validation trails).
+- **Gate:** root fmt --check / build --all-targets / clippy -D warnings / test / release ALL
+  exit 0 — **638 unit + 6 integ + 2 doctest, ZERO SKIP** (was 629+6+2 at M4); helper crate
+  **28 + 15** clean (was 23+15). Clean-path portability: pristine rsync copy (no
+  target/dist/.git) at `$HOME/eclipse-m5-cleanpath` — the FULL cold gate green in BOTH crates
+  (root 153 crates cold, helper 87 cold), same counts, 0 SKIP verified with `--nocapture`,
+  the detection needles verified there too.
+- **The four live legs (dev-host main thread, 2026-07-10, all zero-orphan):** Wayland EXIT=0
+  (`/tmp/eclipse-webview-m5-test-wayland.log`); X11 EXIT=0 via Xwayland with WAYLAND_DISPLAY
+  unset (`/tmp/eclipse-webview-m5-test-x11.log`) — HONEST caveat: a pure-X11-server host was
+  not available, so §7 #6 (Wayland-only hosts without XWayland / bare-X11 breadth) stays OPEN
+  for M6+; packaged layout EXIT=0 against the dist payload, probe 26/26, handshake
+  `engine=cef/149.0.6+g0d0eeb6+chromium-149.0.7827.201 protocol=2`
+  (`/tmp/eclipse-webview-m5-test-packaged.log`); the missing-host-lib sim controlled EXIT=1
+  (above). All three EXIT=0 legs end in the unchanged M4 SUCCESS marker.
+- **Carried to M6:** the M4 carried list unchanged (the ATL 2-arg `onPageStarted`
+  reconciliation; the driven-loads-only contract; centered-fallback rect no-input;
+  challenge-rect/`ResizeView`; the two owner-flagged eval/bridge nuances; overlay-validate
+  the `javascript:`-URL leak fix against the real challenge flow); the §7 #4 release-cadence
+  ruling stays OPEN (pin-pair mechanics landed — AGENTS.md §6 2026-07-10 🔒); §7 #6 and #7
+  stay open as above.
+- Implementation continues at **M6**.
 
 ### M6 — Live challenge boot: the challenge page renders in the app, then the human completes it
 

@@ -144,6 +144,8 @@ and exactly one big vendored black box (ART)."**
 | Render the web challenge | CEF/Chromium 149 via the `cef` crate in the OUT-OF-PROCESS `crates/eclipse-webview` helper | 🔴 (libcef, the second vendored black box) / 🟢 (every helper line is Rust) | Zero engine bytes in the ART process; lazily spawned, killed after completion. |
 | IPC protocol + frame transport | own std-only Unix-socket protocol + memfd BGRA, `src/webview/` (shared into the helper by `#[path]`) | 🟢 | No tokio; SCM_RIGHTS/memfd confined `unsafe`. |
 | URL redaction contract | `src/webview/redact.rs` (moved from `framework.rs`) | 🟢 | Scheme+host only, both processes. |
+| Host capability probes (DT_NEEDED / sandbox / display / GPU) | `src/webview/hostprobe.rs` (pre-spawn, own `loader::elf` + owned x86-64-row-filtered ld.so.cache reader) + helper `engine.rs`/`main.rs` (live userns usability probe — create + in-namespace capability use, Chromium-predicate SUID stat, ozone table, render-node scan) | 🟢 | 2026-07-10 (plan M5). Detect-don't-assume: advisory before spawn, authoritative only on measured failure; every unavailable capability → an actionable error, never a crash/silent fallback. |
+| Ship packaging (pinned CEF fetch, strip/prune, `$ORIGIN` layout) | `tools/webview-dist/package-webview.sh` (+ README with the Flatpak sketch) | — (tool) | 2026-07-10 (plan M5). Dual-digest pin verification, every shipped CEF byte extracted from the verified tarball, explicit SHIP_MEMBERS, en-US locale prune (owner decision), CREDITS.html + CEF LICENSE.txt shipped, readelf RUNPATH check, guarded OUT wipe, no-display smoke. |
 
 ---
 

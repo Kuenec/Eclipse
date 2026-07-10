@@ -63,7 +63,7 @@ use std::time::{Duration, Instant};
 
 use super::proto::{self, BridgeMethod, ConsumerMsg, CookieEntry, HelperMsg};
 use super::redact;
-use super::{fdpass, shm};
+use super::{fdpass, hostprobe, shm};
 
 /// The stable prefix of the unresolvable-helper error. Pinned as a `pub const` so the
 /// `tests/engine_milestones.rs` self-skip guard and this Display can never drift apart.
@@ -72,6 +72,13 @@ pub const HELPER_NOT_FOUND_MARKER: &str = "helper binary not found";
 /// The stable substring of the helper's engine-init-failure latch reason (`Crash { kind: 1 }` —
 /// no display / ozone). Pinned for the same guard-skip reason as [`HELPER_NOT_FOUND_MARKER`].
 pub const NO_DISPLAY_MARKER: &str = "no display connection";
+
+/// The stable substring of the helper's sandbox-refusal latch reason (`Crash { kind: 1,
+/// code: 2 }` — 2026-07-10, plan M5: the host has neither unprivileged userns nor a SUID
+/// `chrome-sandbox` and `webview_allow_unsandboxed` is off). Pinned for the same guard-skip
+/// reason as the two markers above (a host genuinely lacking both sandbox tiers is an env
+/// limitation, like no-display). Byte-matches the helper's `SandboxUnavailable` Display prefix.
+pub const SANDBOX_UNAVAILABLE_MARKER: &str = "sandbox unavailable";
 
 /// How long the io thread lets the handshake read block. Matches the helper's own 10 s no-`Hello`
 /// watchdog (proto module docs) — the two sides share one deadline notion.
@@ -376,20 +383,46 @@ fn resolve_helper() -> Result<PathBuf, ClientError> {
 
 /// Spawn the helper per the spawn contract: socketpair end dup2'd to fd 3, argv `--ipc-fd=3`,
 /// `PR_SET_PDEATHSIG(SIGTERM)` in `pre_exec`, NO URL in argv, NO ozone flag (D4 — the helper's
-/// own explicit selection runs with the inherited environment).
-fn spawn_helper_process() -> Result<(UnixStream, Child), ClientError> {
+/// own explicit selection runs with the inherited environment). 2026-07-10 (plan M5): also runs
+/// the ADVISORY pre-spawn host-lib probe (returned for the handshake post-mortem) and forwards
+/// the config-gated `--allow-unsandboxed` opt-in.
+fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome), ClientError> {
     use std::os::unix::process::CommandExt as _;
 
     let helper = resolve_helper()?;
+    // 2026-07-10 (plan M5): the pre-spawn host-lib probe — ADVISORY ONLY (§2.9: a probe
+    // false-negative must never degrade a capable host); the spawn proceeds in EVERY case and
+    // the spawn/handshake outcome stays the authority. The outcome rides along so
+    // `enrich_spawn_failure` can name the missing libraries in the handshake post-mortem.
+    let probe = match helper.parent() {
+        Some(dir) => hostprobe::probe(dir),
+        None => hostprobe::ProbeOutcome::Unavailable("helper path has no parent dir".to_string()),
+    };
+    match hostprobe::log_line(&probe) {
+        (false, line) => tracing::info!("{line}"),
+        (true, line) => tracing::warn!("{line}"),
+    }
     let (parent_end, child_end) =
         UnixStream::pair().map_err(|e| ClientError::Spawn(format!("socketpair failed: {e}")))?;
     let mut cmd = std::process::Command::new(&helper);
     cmd.arg("--ipc-fd=3");
-    // 2026-07-03: the built helper has `NEEDED libcef.so` with NO RPATH/RUNPATH (readelf-verified
-    // on the M2 artifact), and cef-dll-sys places libcef.so beside the helper binary — so the
-    // child's LD_LIBRARY_PATH gets the RESOLVED binary's own directory prepended (detect the dir
-    // it is actually in, don't assume an install path). If libcef is genuinely absent the exec
-    // fails and the spawn error degrades honestly. The durable `$ORIGIN` RUNPATH is M5 packaging.
+    // 2026-07-10 (plan M5): the config-gated loud-degradation opt-in (spawn contract §3 — a
+    // boolean flag, argv-safe, no secrets). A second Config::load beside resolve_helper()'s is
+    // acceptable: this is the once-per-process cold spawn path, never per-frame/per-event.
+    if crate::config::Config::load()
+        .map(|c| c.webview_allow_unsandboxed)
+        .unwrap_or(false)
+    {
+        cmd.arg("--allow-unsandboxed");
+    }
+    // 2026-07-03 / updated 2026-07-10 (plan M5): the M5-built helper carries RUNPATH=$ORIGIN
+    // (crates/eclipse-webview/.cargo/config.toml), so libcef.so resolves beside the binary with
+    // no env mutation; this LD_LIBRARY_PATH prepend stays as belt-and-suspenders for helpers
+    // built before M5 or under a user RUSTFLAGS override (which silently replaces the crate's
+    // rustflags — the packaging script re-verifies the RUNPATH with readelf). If the payload or
+    // a host lib is genuinely absent, the failure is NOT a spawn error: `spawn()` succeeds and
+    // the child dies INSIDE ld.so before `main`, so the consumer sees a handshake-EOF — which
+    // `enrich_spawn_failure` post-mortems with the pre-spawn probe findings above.
     if let Some(dir) = helper.parent() {
         let mut ld = dir.as_os_str().to_owned();
         if let Some(inherited) = std::env::var_os("LD_LIBRARY_PATH") {
@@ -437,7 +470,46 @@ fn spawn_helper_process() -> Result<(UnixStream, Child), ClientError> {
         helper = %helper.display(),
         "eclipse-webview helper spawned (fd-3 socketpair, PDEATHSIG, no URL in argv)"
     );
-    Ok((parent_end, child))
+    Ok((parent_end, child, probe))
+}
+
+/// Post-mortem a handshake failure with the pre-spawn probe findings (2026-07-10, plan M5).
+/// Pure and unit-pinned. Enriches ONLY when (a) the failure is the `Handshake` class (an
+/// EOF/protocol error — a `VersionMismatch` helper was alive and spoke protocol) AND (b) the
+/// child exited on its own with a REAL exit code (`status.code()` is `Some`; a signal status is
+/// the consumer's own `kill()` of a hung-but-alive helper and must not be misattributed to
+/// ld.so). An ld.so start failure exits 127 before `main`, which is exactly this shape.
+fn enrich_spawn_failure(
+    base: ClientError,
+    probe: &hostprobe::ProbeOutcome,
+    status: Option<std::process::ExitStatus>,
+) -> ClientError {
+    let ClientError::Handshake(inner) = &base else {
+        return base;
+    };
+    let Some(code) = status.and_then(|s| s.code()) else {
+        return base;
+    };
+    match probe {
+        hostprobe::ProbeOutcome::Report(r) if !r.missing.is_empty() => {
+            ClientError::Handshake(format!(
+                "helper exited before HelloAck (exit status {code}) — the dynamic linker could \
+                 not start the CEF payload; missing host libraries per the pre-spawn probe: {} \
+                 — install them and retry (handshake: {inner})",
+                r.display_missing()
+            ))
+        }
+        hostprobe::ProbeOutcome::PayloadMissing { libcef_path } => ClientError::Handshake(format!(
+            "helper exited before HelloAck (exit status {code}) — the CEF payload (libcef.so) is \
+             missing at {} — run tools/webview-dist/package-webview.sh, or build \
+             crates/eclipse-webview with CEF_PATH set (handshake: {inner})",
+            libcef_path.display()
+        )),
+        _ => ClientError::Handshake(format!(
+            "{inner} (helper exit status {code}) — likely a missing host library; run: \
+             ldd <helper-dir>/libcef.so"
+        )),
+    }
 }
 
 /// Send `Hello` and gate on the `HelloAck` version — the handshake requires an exact
@@ -556,7 +628,7 @@ static IO_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
 /// neither happened before, leaking the JNI globals and stalling parked getters the full timeout).
 fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm: jni::vm::JavaVM) {
     let _ = IO_THREAD_ID.set(std::thread::current().id());
-    let (stream, mut child) = match spawn_helper_process() {
+    let (stream, mut child, probe) = match spawn_helper_process() {
         Ok(x) => x,
         Err(e) => {
             let _ = tx.send(Err(e));
@@ -574,9 +646,14 @@ fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm
             );
         }
         Err(e) => {
+            // 2026-07-10 (plan M5): a child that died inside ld.so (missing host lib / missing
+            // payload) surfaces HERE as a handshake EOF — kill() is a no-op on the corpse,
+            // wait() recovers the real exit status, and the probe findings turn the anonymous
+            // EOF into an actionable post-mortem (→ the latch → the one-shot WARN →
+            // __webview-test's failure output).
             let _ = child.kill();
-            let _ = child.wait();
-            let _ = tx.send(Err(e));
+            let status = child.wait().ok();
+            let _ = tx.send(Err(enrich_spawn_failure(e, &probe, status)));
             return;
         }
     }
@@ -739,13 +816,28 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
         }
         HelperMsg::Crash { view, kind, code } => {
             out.fatal = true;
-            out.fatal_reason = Some(match kind {
+            // 2026-07-10 (plan M5): kind=1 is code-KEYED — code 2 = the helper's sandbox-policy
+            // refusal (distinct actionable text + skip marker); any other code (incl. the legacy
+            // 0 of an M4-built helper resolved via ECLIPSE_WEBVIEW_HELPER) keeps the existing
+            // no-display/engine-init reason. Values are data; the wire layout is unchanged.
+            out.fatal_reason = Some(match (kind, code) {
+                (1, 2) => format!(
+                    "web engine sandbox refused in the helper (crash kind=1 code=2) — \
+                     {SANDBOX_UNAVAILABLE_MARKER}: this host has neither unprivileged user \
+                     namespaces nor a SUID chrome-sandbox; fixes: enable unprivileged user \
+                     namespaces (sysctl kernel.unprivileged_userns_clone=1 and \
+                     user.max_user_namespaces>0; on Ubuntu 23.10+ also \
+                     kernel.apparmor_restrict_unprivileged_userns=0 or an AppArmor profile), OR \
+                     install chrome-sandbox beside libcef.so as root:root mode 4755, OR set \
+                     config webview_allow_unsandboxed=true to accept a loud unsandboxed \
+                     degradation"
+                ),
                 // kind 1 = engine-init-failed (no display / ozone) per the proto spec.
-                1 => format!(
+                (1, code) => format!(
                     "web engine init failed in the helper (crash kind=1 code={code}) — \
                      {NO_DISPLAY_MARKER} or ozone selection failure"
                 ),
-                k => format!("helper crash (view={view} kind={k} code={code})"),
+                (k, code) => format!("helper crash (view={view} kind={k} code={code})"),
             });
         }
         HelperMsg::ViewClosed { view } => {
@@ -2126,6 +2218,134 @@ mod tests {
         let out = dispatch(HelperMsg::ViewClosed { view: widget }, &mut views);
         assert_eq!(out.closed, vec![widget]);
         assert!(!views.contains_key(&widget));
+    }
+
+    #[test]
+    fn crash_kind1_code2_maps_to_the_sandbox_unavailable_reason_and_code0_stays_no_display() {
+        // 2026-07-10 (plan M5): the Crash arm is code-KEYED — kind=1 code=2 is the helper's
+        // sandbox-policy refusal (both fixes named + the skip marker); kind=1 with any other
+        // code (incl. the legacy 0 of an M4-built helper) keeps the no-display reason.
+        let mut views: HashMap<i64, ViewShared> = HashMap::new();
+        let out = dispatch(
+            HelperMsg::Crash {
+                view: 0,
+                kind: 1,
+                code: 2,
+            },
+            &mut views,
+        );
+        assert!(out.fatal);
+        let reason = out.fatal_reason.expect("fatal reason");
+        for needle in [
+            SANDBOX_UNAVAILABLE_MARKER,
+            "unprivileged user namespaces",
+            "kernel.unprivileged_userns_clone=1",
+            "root:root mode 4755",
+            "webview_allow_unsandboxed=true",
+        ] {
+            assert!(reason.contains(needle), "missing {needle:?} in {reason}");
+        }
+        assert!(!reason.contains(NO_DISPLAY_MARKER), "reason: {reason}");
+
+        // Legacy code 0 (and every non-2 code) stays the no-display/engine-init reason —
+        // backward compatible with an M4-built helper resolved via ECLIPSE_WEBVIEW_HELPER.
+        for code in [0, 1, -7] {
+            let out = dispatch(
+                HelperMsg::Crash {
+                    view: 0,
+                    kind: 1,
+                    code,
+                },
+                &mut views,
+            );
+            let reason = out.fatal_reason.expect("fatal reason");
+            assert!(reason.contains(NO_DISPLAY_MARKER), "code {code}: {reason}");
+            assert!(
+                !reason.contains(SANDBOX_UNAVAILABLE_MARKER),
+                "code {code}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn enrich_spawn_failure_names_the_probed_missing_libs_and_exit_status() {
+        // 2026-07-10 (plan M5): the handshake-EOF post-mortem — a child that died inside ld.so
+        // (exit 127 before main) gets the pre-spawn probe's missing-lib findings folded into
+        // the latched reason; the consumer's own kill() of a hung helper (signal status, no
+        // exit code) and non-Handshake failures stay untouched.
+        use std::os::unix::process::ExitStatusExt as _;
+        let exit_127 = std::process::ExitStatus::from_raw(127 << 8);
+        let killed = std::process::ExitStatus::from_raw(9); // SIGKILL — code() is None
+
+        let missing = hostprobe::ProbeOutcome::Report(hostprobe::HostLibReport {
+            total: 26,
+            resolved: 25,
+            missing: vec![hostprobe::MissingLib {
+                soname: "libnss3.so".into(),
+                family_hint: hostprobe::classify("libnss3.so"),
+            }],
+            inconclusive: 0,
+        });
+        let base =
+            || ClientError::Handshake("protocol error before HelloAck: unexpected EOF".into());
+        let enriched = enrich_spawn_failure(base(), &missing, Some(exit_127));
+        let ClientError::Handshake(text) = &enriched else {
+            panic!("expected Handshake, got {enriched:?}");
+        };
+        for needle in [
+            "exit status 127",
+            "dynamic linker could not start the CEF payload",
+            "libnss3.so",
+            "apt: libnss3",
+            "dnf: nss",
+            "pacman: nss",
+            "install them and retry",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in {text}");
+        }
+
+        // PayloadMissing → names the path + the packaging fix.
+        let payload = hostprobe::ProbeOutcome::PayloadMissing {
+            libcef_path: std::path::PathBuf::from("/pkg/libcef.so"),
+        };
+        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &payload, Some(exit_127))
+        else {
+            panic!("expected Handshake");
+        };
+        assert!(text.contains("/pkg/libcef.so") && text.contains("package-webview.sh"));
+
+        // No probe findings → the generic actionable ldd hint appended.
+        let clean = hostprobe::ProbeOutcome::Report(hostprobe::HostLibReport {
+            total: 26,
+            resolved: 26,
+            missing: Vec::new(),
+            inconclusive: 0,
+        });
+        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &clean, Some(exit_127))
+        else {
+            panic!("expected Handshake");
+        };
+        assert!(text.contains("likely a missing host library") && text.contains("ldd"));
+
+        // Signal status (our own kill of a hung helper) → base unchanged, no misattribution.
+        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &missing, Some(killed))
+        else {
+            panic!("expected Handshake");
+        };
+        assert_eq!(text, "protocol error before HelloAck: unexpected EOF");
+        // No status at all → base unchanged.
+        let ClientError::Handshake(text) = enrich_spawn_failure(base(), &missing, None) else {
+            panic!("expected Handshake");
+        };
+        assert_eq!(text, "protocol error before HelloAck: unexpected EOF");
+
+        // Non-Handshake classes (a live helper that spoke protocol) are never rewritten.
+        let vm = enrich_spawn_failure(
+            ClientError::VersionMismatch { helper_version: 1 },
+            &missing,
+            Some(exit_127),
+        );
+        assert!(matches!(vm, ClientError::VersionMismatch { .. }));
     }
 
     #[test]

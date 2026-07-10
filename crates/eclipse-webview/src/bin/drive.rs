@@ -133,6 +133,11 @@ fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child), String>
     if let Some(ozone) = std::env::args().find(|a| a.starts_with("--ozone-platform=")) {
         cmd.arg(ozone);
     }
+    // 2026-07-10 (plan M5): forward the sandbox-degradation opt-in (spawn contract §3 —
+    // reference-consumer parity with the main-process client's config-gated flag).
+    if std::env::args().any(|a| a == "--allow-unsandboxed") {
+        cmd.arg("--allow-unsandboxed");
+    }
     let child_fd = child_end
         .as_fd()
         .try_clone_to_owned()
