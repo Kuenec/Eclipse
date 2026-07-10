@@ -1,5 +1,6 @@
 //! `eclipse-webview-drive` — the dev-host M2 verify driver AND the reference consumer
-//! implementation of the spawn contract (`src/webview/mod.rs`) + protocol v1.
+//! implementation of the spawn contract (`src/webview/mod.rs`) + the wire protocol
+//! (negotiated at `shared::PROTO_VERSION` — v2 since the 2026-07-09 M4 additive extension).
 //!
 //! 2026-07-03: spawns the helper per the contract (socketpair end dup2'd to fd 3,
 //! `--ipc-fd=3`, `PR_SET_PDEATHSIG(SIGTERM)`, no URL in argv), completes the handshake,
@@ -315,14 +316,14 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
 
     // ---- Handshake. ----
     d.send(&ConsumerMsg::Hello {
-        version: shared::PROTO_V1,
+        version: shared::PROTO_VERSION,
     })?;
     let engine = match d.next_msg(Instant::now() + HANDSHAKE_DEADLINE)? {
         HelperMsg::HelloAck { version, engine } => {
             if !proto::hello_ack_version_supported(version) {
                 return fail(format!(
                     "protocol version mismatch: helper v{version}, drive v{}",
-                    shared::PROTO_V1
+                    shared::PROTO_VERSION
                 ));
             }
             engine
@@ -567,6 +568,9 @@ fn name_of(msg: &HelperMsg) -> &'static str {
         HelperMsg::Crash { .. } => "Crash",
         HelperMsg::CookieList { .. } => "CookieList",
         HelperMsg::ViewClosed { .. } => "ViewClosed",
+        HelperMsg::BridgeCall { .. } => "BridgeCall",
+        HelperMsg::EvaluateJsResult { .. } => "EvaluateJsResult",
+        HelperMsg::CookieSetResult { .. } => "CookieSetResult",
     }
 }
 

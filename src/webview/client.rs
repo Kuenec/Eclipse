@@ -1,11 +1,22 @@
 //! Main-process client for the OUT-OF-PROCESS `eclipse-webview` CEF helper (plan M3).
 //!
-//! 2026-07-03: this module is the consumer side of protocol v1 ([`super::proto`]) — it spawns the
-//! helper per the NORMATIVE spawn contract in [`super`]'s module docs (fd-3 socketpair +
-//! `--ipc-fd=3`, PDEATHSIG, no URL ever in argv), completes the `Hello`/`HelloAck` handshake,
-//! and runs a dedicated socket-reader thread (`eclipse-webview-io`) that stages memfd frames and
-//! fires the `WebView.internalLoadChanged(0/3)` JNI upcalls via
-//! [`crate::framework::fire_web_view_internal_load_changed`].
+//! 2026-07-03: this module is the consumer side of the owned wire protocol ([`super::proto`];
+//! the negotiated version is [`super::PROTO_VERSION`] — v2 since the 2026-07-09 M4 additive
+//! extension) — it spawns the helper per the NORMATIVE spawn contract in [`super`]'s module docs
+//! (fd-3 socketpair + `--ipc-fd=3`, PDEATHSIG, no URL ever in argv), completes the
+//! `Hello`/`HelloAck` handshake, and runs a dedicated socket-reader thread (`eclipse-webview-io`)
+//! that stages memfd frames.
+//! 2026-07-09 (M4 fix): every JNI upcall that executes APP code — `internalLoadChanged`,
+//! `@JavascriptInterface` bridge invokes, ValueCallback deliveries — runs on a SEPARATE
+//! `eclipse-webview-upcall` thread fed by an in-order mpsc channel, NEVER on the reader thread:
+//! app code may synchronously re-enter a blocking native (`CookieManager.getCookie`) whose reply
+//! only the reader can deliver, which self-deadlocked the io loop for the full timeout and then
+//! returned a wrong empty result when upcalls ran inline on the reader.
+//! 2026-07-10 fix: the reader thread is now fully JNI-FREE — even the non-app JNI of dropping
+//! retained `Global`s on a helper-confirmed `ViewClosed` moved to the upcall thread, because
+//! jni 0.22.4 `Global::drop` on an unattached thread performs a scoped
+//! AttachCurrentThread/DetachCurrentThread per ref, and an ART suspend-all pause during that
+//! attach could stall the io loop until the helper's bounded outbox declared the consumer dead.
 //!
 //! This file is deliberately MAIN-PROCESS-ONLY: it is NOT part of the helper crate's shared
 //! `#[path]` sibling set (`crates/eclipse-webview/src/shared.rs` includes only the five protocol
@@ -44,13 +55,13 @@ use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::proto::{self, ConsumerMsg, HelperMsg};
+use super::proto::{self, BridgeMethod, ConsumerMsg, CookieEntry, HelperMsg};
 use super::redact;
 use super::{fdpass, shm};
 
@@ -118,7 +129,7 @@ impl std::fmt::Display for ClientError {
             Self::VersionMismatch { helper_version } => write!(
                 f,
                 "helper protocol version mismatch: helper v{helper_version}, consumer v{}",
-                super::PROTO_V1
+                super::PROTO_VERSION
             ),
             Self::Encode(e) => write!(f, "message rejected before send: {e}"),
             Self::Latched(reason) => write!(f, "web engine helper previously failed: {reason}"),
@@ -146,8 +157,9 @@ enum ClientSlot {
 /// The live helper process handle (kept inside [`CLIENT`]).
 ///
 /// 2026-07-03 deviation from the M3 design sketch: no `java_vm` field — the `jni::vm::JavaVM`
-/// (verified `Send + Sync` in the pinned jni 0.22.4 source) is moved INTO the reader thread at
-/// spawn, the only place upcalls happen, so the slot does not need a second copy.
+/// (verified `Send + Sync` in the pinned jni 0.22.4 source) is moved into the upcall thread at
+/// spawn (2026-07-09: previously the reader thread — upcalls moved off it, see the module docs),
+/// the only place upcalls happen, so the slot does not need a second copy.
 struct Client {
     child: Child,
     /// A `try_clone` of the control socket for consumer→helper writes (the reader thread keeps
@@ -156,6 +168,10 @@ struct Client {
     /// The `eclipse-webview-io` thread handle, joined by [`shutdown`] (bounded: the child's death
     /// forces the reader's EOF, so the join cannot hang).
     reader: Option<JoinHandle<()>>,
+    /// The `eclipse-webview-upcall` thread handle, joined by [`shutdown`] AFTER the reader
+    /// (bounded: the reader's exit drops the channel sender, so the upcall loop terminates once
+    /// its queued events — ending in the drain of every pending ValueCallback — are processed).
+    upcall: Option<JoinHandle<()>>,
 }
 
 static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned);
@@ -169,6 +185,22 @@ static ACTIVE_VIEW: AtomicI64 = AtomicI64::new(0);
 /// every normal view GC on the FinalizerDaemon thread pays one atomic load.
 static LIVE_VIEWS: AtomicUsize = AtomicUsize::new(0);
 
+/// Consumer-allocated correlation ids for the v2 request/reply pairs (`evaluateJavascript`,
+/// 3-arg `setCookie`, `getCookie`, `removeAll/SessionCookies`). Monotonic, skips 0 (`0` is a
+/// sentinel in several native paths). Bridge calls use a helper-allocated `call_id` instead — no
+/// consumer id — so the two id spaces never collide.
+static NEXT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
+
+/// A consumer-allocated request id (monotonic; never 0). 2026-07-09 (plan M4).
+pub fn next_request_id() -> u32 {
+    loop {
+        let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 /// State shared between the reader thread, the drive path, and the compositor.
 struct Shared {
     /// One entry per live driven WebView (the challenge flow has exactly one).
@@ -176,6 +208,12 @@ struct Shared {
     /// The cached ABSOLUTE composite rect `(x, y, w, h)` (the `TEXTBOX_GEOM` pattern): written by
     /// [`update_composited_rect`] on the main thread, read by the vk-overlay present path.
     rect: Mutex<Option<(i32, i32, u32, u32)>>,
+    /// The blocking `getCookie` waiters, keyed by consumer request id: the reader thread delivers
+    /// the solicited `CookieList` into the channel, waking [`cookie_get_blocking`] (which parked
+    /// on the receiver WITHOUT holding [`CLIENT`], so the reader is never blocked). A request id is
+    /// registered in exactly ONE sink — either here (getCookie) or a framework ValueCallback
+    /// (removeAll/Session) — so the reader's routing is unambiguous.
+    cookie_get_waiters: Mutex<HashMap<u32, mpsc::Sender<Vec<CookieEntry>>>>,
 }
 
 fn shared() -> &'static Arc<Shared> {
@@ -184,6 +222,7 @@ fn shared() -> &'static Arc<Shared> {
         Arc::new(Shared {
             views: Mutex::new(HashMap::new()),
             rect: Mutex::new(None),
+            cookie_get_waiters: Mutex::new(HashMap::new()),
         })
     })
 }
@@ -401,12 +440,13 @@ fn spawn_helper_process() -> Result<(UnixStream, Child), ClientError> {
     Ok((parent_end, child))
 }
 
-/// Send `Hello` and gate on the `HelloAck` version — v1 requires an exact match. `timeout` is
-/// injected so the unit pin runs without a 10 s sleep. On success the read timeout is cleared
-/// (the reader loop uses plain blocking reads; EOF is its exit signal).
+/// Send `Hello` and gate on the `HelloAck` version — the handshake requires an exact
+/// [`super::PROTO_VERSION`] match. `timeout` is injected so the unit pin runs without a 10 s
+/// sleep. On success the read timeout is cleared (the reader loop uses plain blocking reads;
+/// EOF is its exit signal).
 fn perform_handshake(stream: &UnixStream, timeout: Duration) -> Result<String, ClientError> {
     let hello = ConsumerMsg::Hello {
-        version: super::PROTO_V1,
+        version: super::PROTO_VERSION,
     }
     .encode()
     .map_err(ClientError::Encode)?;
@@ -448,6 +488,9 @@ fn helper_msg_name(msg: &HelperMsg) -> &'static str {
         HelperMsg::Crash { .. } => "Crash",
         HelperMsg::CookieList { .. } => "CookieList",
         HelperMsg::ViewClosed { .. } => "ViewClosed",
+        HelperMsg::BridgeCall { .. } => "BridgeCall",
+        HelperMsg::EvaluateJsResult { .. } => "EvaluateJsResult",
+        HelperMsg::CookieSetResult { .. } => "CookieSetResult",
     }
 }
 
@@ -456,17 +499,18 @@ fn helper_msg_name(msg: &HelperMsg) -> &'static str {
 /// drive; the JNI caller blocks ≤ [`SPAWN_RESULT_TIMEOUT`], ~ms when healthy (the handshake is
 /// pre-engine-init on the helper side).
 fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
-    let (tx, rx) = mpsc::channel::<Result<(UnixStream, Child), ClientError>>();
+    let (tx, rx) = mpsc::channel::<SpawnVerdict>();
     let shared = Arc::clone(shared());
     let handle = std::thread::Builder::new()
         .name("eclipse-webview-io".into())
         .spawn(move || io_thread_main(&tx, &shared, java_vm))
         .map_err(|e| ClientError::Spawn(format!("io-thread spawn failed: {e}")))?;
     match rx.recv_timeout(SPAWN_RESULT_TIMEOUT) {
-        Ok(Ok((writer, child))) => Ok(Client {
+        Ok(Ok((writer, child, upcall))) => Ok(Client {
             child,
             writer,
             reader: Some(handle),
+            upcall: Some(upcall),
         }),
         Ok(Err(e)) => {
             // The io thread reported and exited (it already reaped any child it spawned).
@@ -481,12 +525,37 @@ fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
     }
 }
 
-/// The `eclipse-webview-io` thread body: spawn + handshake, report, then become the read loop.
-fn io_thread_main(
-    tx: &mpsc::Sender<Result<(UnixStream, Child), ClientError>>,
-    shared: &Arc<Shared>,
-    java_vm: jni::vm::JavaVM,
-) {
+/// Ensure the [`CLIENT`] slot is `Live` (lazy spawn on the first drive/op, D2). Called with the
+/// [`CLIENT`] lock held. On spawn failure the slot latches `Failed` and the actionable error is
+/// returned (the honest no-op contract). A caller MUST have checked [`latched_error`] first.
+fn ensure_spawned(slot: &mut ClientSlot, java_vm: jni::vm::JavaVM) -> Result<(), ClientError> {
+    if matches!(&*slot, ClientSlot::Unspawned) {
+        match spawn_client(java_vm) {
+            Ok(client) => *slot = ClientSlot::Live(client),
+            Err(e) => {
+                *slot = ClientSlot::Failed(e.to_string());
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The io thread's spawn/handshake verdict: writer + child + the upcall-thread handle.
+type SpawnVerdict = Result<(UnixStream, Child, JoinHandle<()>), ClientError>;
+
+/// The ThreadId of the one `eclipse-webview-io` thread (set once — the client never respawns).
+/// The [`cookie_get_blocking`] boundary assertion checks it: a blocking wait ON the reader thread
+/// can never be answered (the reply's only reader is the parked caller itself). 2026-07-09.
+static IO_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// The `eclipse-webview-io` thread body: spawn + handshake, spawn the upcall thread, report, then
+/// become the read loop. On ANY read-loop exit (crash/EOF/protocol error or a deliberate
+/// shutdown) it wakes every parked `getCookie` waiter immediately and lets the upcall thread —
+/// whose channel sender drops here — drain the pending ValueCallbacks honestly (2026-07-09 fix:
+/// neither happened before, leaking the JNI globals and stalling parked getters the full timeout).
+fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm: jni::vm::JavaVM) {
+    let _ = IO_THREAD_ID.set(std::thread::current().id());
     let (stream, mut child) = match spawn_helper_process() {
         Ok(x) => x,
         Err(e) => {
@@ -496,7 +565,13 @@ fn io_thread_main(
     };
     match perform_handshake(&stream, HANDSHAKE_TIMEOUT) {
         Ok(engine) => {
-            tracing::info!(%engine, "eclipse-webview helper handshake complete (protocol v1)");
+            // 2026-07-10: log the negotiated version from the one source of truth — the old
+            // hardcoded generation literal went stale when M4 bumped PROTO_VERSION to 2.
+            tracing::info!(
+                %engine,
+                protocol = u64::from(super::PROTO_VERSION),
+                "eclipse-webview helper handshake complete"
+            );
         }
         Err(e) => {
             let _ = child.kill();
@@ -516,22 +591,44 @@ fn io_thread_main(
             return;
         }
     };
-    if let Err(mpsc::SendError(returned)) = tx.send(Ok((writer, child))) {
+    // The upcall thread owns the JavaVM: ALL app-code JNI (load upcalls, bridge invokes,
+    // ValueCallback deliveries) runs there, in channel order, never on this reader thread.
+    let (up_tx, up_rx) = mpsc::channel::<UpcallEvent>();
+    let upcall_shared = Arc::clone(shared);
+    let upcall_handle = match std::thread::Builder::new()
+        .name("eclipse-webview-upcall".into())
+        .spawn(move || upcall_thread_main(&up_rx, &upcall_shared, &java_vm))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = tx.send(Err(ClientError::Spawn(format!(
+                "upcall-thread spawn failed: {e}"
+            ))));
+            return;
+        }
+    };
+    if let Err(mpsc::SendError(returned)) = tx.send(Ok((writer, child, upcall_handle))) {
         // The driving thread timed out and dropped the receiver: recover the child and reap it.
-        if let Ok((_w, mut c)) = returned {
+        if let Ok((_w, mut c, _h)) = returned {
             let _ = c.kill();
             let _ = c.wait();
         }
         return;
     }
-    reader_loop(&stream, shared, &java_vm);
+    reader_loop(&stream, shared, &up_tx);
+    // Reader gone (any reason): wake parked getCookie callers NOW (Disconnected → honest empty,
+    // not a full-timeout stall), then drop `up_tx` so the upcall thread processes its remaining
+    // queue and drains every still-pending ValueCallback honestly before exiting.
+    wake_all_cookie_waiters();
 }
 
 // ---------------------------------------------------------------------------
 // The reader loop + the pure dispatch state machine
 // ---------------------------------------------------------------------------
 
-/// One `internalLoadChanged` upcall the reader must fire (outside all client locks).
+/// One `internalLoadChanged` upcall extracted by [`dispatch`] (handed to the upcall thread).
 struct Upcall {
     widget: i64,
     state: i32,
@@ -548,6 +645,16 @@ struct DispatchOut {
     upcalls: Vec<Upcall>,
     /// Views removed by `ViewClosed` (the loop clears `ACTIVE_VIEW`/`LIVE_VIEWS` for these).
     closed: Vec<i64>,
+    /// v2 (plan M4): page bridge calls `(view, call_id, payload_json)` — dispatched to ART's
+    /// reflective invoke OUTSIDE the locks (payload never logged).
+    bridge_calls: Vec<(i64, u32, String)>,
+    /// v2: eval-with-result completions `(request_id, ok, value_json)`.
+    eval_results: Vec<(u32, bool, String)>,
+    /// v2: 3-arg setCookie completions `(request_id, ok)`.
+    cookie_set_results: Vec<(u32, bool)>,
+    /// v2/v1: solicited cookie lists `(request_id, cookies)` — routed by the reader loop to either
+    /// the blocking-getCookie channel or a framework clear-callback.
+    cookie_lists: Vec<(u32, Vec<CookieEntry>)>,
     fatal: bool,
     /// The actionable latch reason when `fatal` (payload-free by construction).
     fatal_reason: Option<String>,
@@ -646,10 +753,30 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
                 out.closed.push(view);
             }
         }
-        // M4-shaped / out-of-phase messages: debug-ignore (v1 decodes them; M3 has no consumer).
-        other @ (HelperMsg::HelloAck { .. }
-        | HelperMsg::CookieList { .. }
-        | HelperMsg::FrameBufferNew { .. }) => {
+        // v2 (plan M4): the JS-bridge / eval-result / cookie-result surface. dispatch stays PURE
+        // over `views` — it only EXTRACTS these into DispatchOut; the reader loop routes them
+        // (waiter channel wakes inline, JNI upcalls to the upcall thread — 2026-07-09). An
+        // untracked view on a BridgeCall is fine: framework.rs validates the bridge registry at
+        // dispatch (the LoadState untracked-view precedent). Payloads are never logged.
+        HelperMsg::BridgeCall {
+            view,
+            call_id,
+            payload_json,
+        } => out.bridge_calls.push((view, call_id, payload_json)),
+        HelperMsg::EvaluateJsResult {
+            request_id,
+            ok,
+            value_json,
+        } => out.eval_results.push((request_id, ok, value_json)),
+        HelperMsg::CookieSetResult { request_id, ok } => {
+            out.cookie_set_results.push((request_id, ok))
+        }
+        HelperMsg::CookieList {
+            request_id,
+            cookies,
+        } => out.cookie_lists.push((request_id, cookies)),
+        // Out-of-phase messages: debug-ignore (v1 decodes them; the reader has no consumer here).
+        other @ (HelperMsg::HelloAck { .. } | HelperMsg::FrameBufferNew { .. }) => {
             tracing::debug!(
                 msg = helper_msg_name(&other),
                 "webview client: ignoring out-of-phase helper message"
@@ -659,11 +786,116 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
     out
 }
 
+/// One in-order event for the `eclipse-webview-upcall` thread — everything that executes APP code
+/// over JNI. 2026-07-09: introduced so the socket-reader thread NEVER runs app code (a bridge
+/// method / page callback that synchronously calls the blocking `CookieManager.getCookie` parks
+/// its calling thread on a reply only the reader can deliver — inline dispatch self-deadlocked
+/// the io loop for the full 5 s timeout and then served a wrong empty cookie string).
+enum UpcallEvent {
+    /// `WebView.internalLoadChanged(state, url)` (the url is the Java argument, never logged).
+    LoadChanged {
+        widget: i64,
+        state: i32,
+        url: String,
+    },
+    /// A page bridge call to reflect-invoke; the `BridgeResult` reply is written from here.
+    BridgeCall {
+        view: i64,
+        call_id: u32,
+        payload_json: String,
+    },
+    /// `evaluateJavascript` result → the retained ValueCallback.
+    EvalResult {
+        request_id: u32,
+        ok: bool,
+        value_json: String,
+    },
+    /// 3-arg setCookie completion → the retained ValueCallback<Boolean>.
+    CookieSetResult { request_id: u32, ok: bool },
+    /// removeAll/Session completion (a CookieList with no getCookie waiter registered).
+    CookiesClearResult { request_id: u32 },
+    /// The helper confirmed a view close: drop the view's `@JavascriptInterface` bridge globals
+    /// and fail its in-flight eval callbacks honestly. Era-gated (`upto_era` = the close's
+    /// [`crate::framework::bump_webview_close_era`] value), so state born AFTER the close — a
+    /// legal close+re-drive — survives a stale queued drain (2026-07-10 fix). The bridge drop
+    /// runs HERE (this thread is permanently ART-attached after its first upcall), never on the
+    /// reader: jni 0.22.4 `Global::drop` on an unattached thread does a scoped attach/detach per
+    /// ref (2026-07-10 fix — the reader must stay JNI-free).
+    ViewClosedDrain { widget: i64, upto_era: u64 },
+}
+
+/// The `eclipse-webview-upcall` thread body: run every app-code JNI upcall in channel order.
+/// When the channel disconnects (the reader thread exited — crash, EOF, protocol error, or a
+/// deliberate shutdown), drain EVERY still-pending ValueCallback honestly (eval → `"null"`,
+/// cookie set/clear → `Boolean.FALSE`) so the fire-exactly-once contract holds and no JNI global
+/// outlives the helper (2026-07-09 fix — previously nothing drained these on helper death).
+fn upcall_thread_main(
+    rx: &mpsc::Receiver<UpcallEvent>,
+    shared: &Arc<Shared>,
+    java_vm: &jni::vm::JavaVM,
+) {
+    while let Ok(event) = rx.recv() {
+        match event {
+            UpcallEvent::LoadChanged { widget, state, url } => {
+                let fired = crate::framework::fire_web_view_internal_load_changed(
+                    java_vm, widget, state, &url,
+                );
+                if fired {
+                    if let Ok(mut views) = shared.views.lock() {
+                        if let Some(vs) = views.get_mut(&widget) {
+                            vs.upcalls_ok += 1;
+                        }
+                    }
+                }
+            }
+            UpcallEvent::BridgeCall {
+                view,
+                call_id,
+                payload_json,
+            } => {
+                let (ok, result_json) =
+                    crate::framework::fire_bridge_call(java_vm, view, call_id, &payload_json);
+                if !send_reply_if_live(&ConsumerMsg::BridgeResult {
+                    call_id,
+                    ok,
+                    result_json,
+                }) {
+                    reader_fatal("control-socket write failed (BridgeResult)");
+                }
+            }
+            UpcallEvent::EvalResult {
+                request_id,
+                ok,
+                value_json,
+            } => {
+                crate::framework::fire_evaluate_js_result(java_vm, request_id, ok, &value_json);
+            }
+            UpcallEvent::CookieSetResult { request_id, ok } => {
+                crate::framework::fire_cookie_set_result(java_vm, request_id, ok);
+            }
+            UpcallEvent::CookiesClearResult { request_id } => {
+                crate::framework::fire_cookies_clear_result(java_vm, request_id);
+            }
+            UpcallEvent::ViewClosedDrain { widget, upto_era } => {
+                // 2026-07-10: the bridge-global drop moved here from the reader thread (which
+                // must stay JNI-free) — and queue order means a BridgeCall received before the
+                // ViewClosed still finds its registry entry when it fires above.
+                crate::framework::drop_bridges_for_view_closed(widget, upto_era);
+                crate::framework::drain_eval_callbacks_for_view(java_vm, widget, upto_era);
+            }
+        }
+    }
+    // Channel closed: the reader is gone. Queued results above fired normally, in order; whatever
+    // is STILL pending can never be answered — fail each callback honestly, exactly once.
+    crate::framework::drain_all_webview_callbacks(java_vm, "web engine helper connection closed");
+}
+
 /// The reader thread's steady state: decode helper messages on the RAW stream (NEVER a
 /// `BufReader` — the byte after a `FrameBufferNew` frame is the fd sentinel, and a buffered
 /// reader would swallow it and drop the fd; proto.rs module-doc rule), feed the pure state
-/// machine, apply its outputs, and fire the JNI upcalls outside all client locks.
-fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, java_vm: &jni::vm::JavaVM) {
+/// machine, apply its outputs, and hand every app-code JNI upcall to the upcall thread
+/// (2026-07-09: never dispatched inline here — see [`UpcallEvent`]).
+fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender<UpcallEvent>) {
     loop {
         let msg = match proto::read_helper_msg(&mut &*stream) {
             Ok(m) => m,
@@ -732,8 +964,20 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, java_vm: &jni::vm::Jav
             }
             continue;
         }
-        let out = match shared.views.lock() {
-            Ok(mut views) => dispatch(msg, &mut views),
+        let (out, close_eras) = match shared.views.lock() {
+            Ok(mut views) => {
+                let out = dispatch(msg, &mut views);
+                // 2026-07-10: bump the close era for each removed view UNDER the same lock hold
+                // that removed it — a re-drive must take this lock to re-insert, so anything
+                // registered after the removal always observes the bumped era (the stale-drain
+                // gate for ViewClosedDrain; see framework::WEBVIEW_CLOSE_ERA).
+                let eras: Vec<u64> = out
+                    .closed
+                    .iter()
+                    .map(|_| crate::framework::bump_webview_close_era())
+                    .collect();
+                (out, eras)
+            }
             Err(_) => {
                 reader_fatal("views lock poisoned");
                 return;
@@ -745,23 +989,64 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, java_vm: &jni::vm::Jav
                 return;
             }
         }
-        // Upcalls fire OUTSIDE the views/CLIENT locks: onPageStarted/onPageFinished is app code
-        // that may synchronously re-enter drive_load_url / the registry.
+        // App-code JNI (load upcalls / bridge invokes / ValueCallback deliveries) is HANDED OFF to
+        // the upcall thread, in order — never dispatched here (2026-07-09; see [`UpcallEvent`]).
+        // A send error means the upcall thread is gone (it drains on exit); nothing to do here.
         for up in out.upcalls {
-            let fired = crate::framework::fire_web_view_internal_load_changed(
-                java_vm, up.widget, up.state, &up.url,
-            );
-            if fired {
-                if let Ok(mut views) = shared.views.lock() {
-                    if let Some(vs) = views.get_mut(&up.widget) {
-                        vs.upcalls_ok += 1;
-                    }
+            let _ = upcalls.send(UpcallEvent::LoadChanged {
+                widget: up.widget,
+                state: up.state,
+                url: up.url,
+            });
+        }
+        for (view, call_id, payload_json) in out.bridge_calls {
+            let _ = upcalls.send(UpcallEvent::BridgeCall {
+                view,
+                call_id,
+                payload_json,
+            });
+        }
+        for (request_id, ok, value_json) in out.eval_results {
+            let _ = upcalls.send(UpcallEvent::EvalResult {
+                request_id,
+                ok,
+                value_json,
+            });
+        }
+        for (request_id, ok) in out.cookie_set_results {
+            let _ = upcalls.send(UpcallEvent::CookieSetResult { request_id, ok });
+        }
+        for (request_id, cookies) in out.cookie_lists {
+            // Exactly one sink per request id: a blocking getCookie waiter (delivered HERE — a
+            // channel send, no JNI, so a stalled upcall can never block it), else a framework
+            // clear-callback (removeAll/Session). Remove-then-send so a timed-out waiter is gone.
+            let waiter = shared
+                .cookie_get_waiters
+                .lock()
+                .ok()
+                .and_then(|mut w| w.remove(&request_id));
+            match waiter {
+                Some(tx) => {
+                    let _ = tx.send(cookies);
+                }
+                None => {
+                    let _ = upcalls.send(UpcallEvent::CookiesClearResult { request_id });
                 }
             }
         }
-        for closed in out.closed {
+        for (closed, upto_era) in out.closed.into_iter().zip(close_eras) {
             let _ = ACTIVE_VIEW.compare_exchange(closed, 0, Ordering::Relaxed, Ordering::Relaxed);
             LIVE_VIEWS.fetch_sub(1, Ordering::Relaxed);
+            // Clear the (proto-only, JNI-free) buffered inventory inline; the framework-side
+            // bridge-global drop + the eval-callback drain run on the UPCALL thread via
+            // ViewClosedDrain (2026-07-10 fix: dropping `Global`s here did a hidden scoped JNI
+            // attach/detach per ref on this deliberately JNI-free reader; the era gates a stale
+            // queued drain so a close+re-drive's fresh callbacks/bridges survive).
+            remove_pending_bridges(closed);
+            let _ = upcalls.send(UpcallEvent::ViewClosedDrain {
+                widget: closed,
+                upto_era,
+            });
             tracing::info!(view = closed, "webview helper confirmed ViewClosed");
         }
         if out.fatal {
@@ -915,15 +1200,7 @@ fn drive(
     if let Some(e) = latched_error(&slot) {
         return Err(e);
     }
-    if matches!(&*slot, ClientSlot::Unspawned) {
-        match spawn_client(java_vm) {
-            Ok(client) => *slot = ClientSlot::Live(client),
-            Err(e) => {
-                *slot = ClientSlot::Failed(e.to_string());
-                return Err(e);
-            }
-        }
-    }
+    ensure_spawned(&mut slot, java_vm)?;
     // The driven URL for the upcall contract: the URL itself, or the loadData base (the installed
     // Java hardcodes "about:blank" on the loadData route — the Android semantics for a null base).
     let driven_url = match &target {
@@ -954,6 +1231,19 @@ fn drive(
                 height,
             },
         )?;
+        // Flush any bridges registered BEFORE this view's first load
+        // (addJavascriptInterface-before-loadUrl is the common order) so the helper receives
+        // CreateView THEN BridgeRegister — the browser exists before the inventory arrives.
+        for (name, methods) in drain_pending_bridges(widget) {
+            send_locked(
+                &mut slot,
+                &ConsumerMsg::BridgeRegister {
+                    view: widget,
+                    name,
+                    methods,
+                },
+            )?;
+        }
     }
     let load_msg = match target {
         DriveTarget::Url(url) => ConsumerMsg::LoadUrl { view: widget, url },
@@ -1015,6 +1305,250 @@ pub fn drive_load_data(
         width,
         height,
     )
+}
+
+// ---------------------------------------------------------------------------
+// v2 (plan M4): JS bridge / evaluateJavascript-with-result / cookie set/get/clear
+// ---------------------------------------------------------------------------
+
+/// Bridges registered BEFORE their view's first load (the common `addJavascriptInterface` →
+/// `loadUrl` order), keyed by widget then interface name. Flushed by [`drive`] right after
+/// `CreateView`, so the helper always receives `CreateView` before the first `BridgeRegister`
+/// (the browser exists before the inventory arrives). Bounded by the app's own interface count.
+#[allow(clippy::type_complexity)] // 2026-07-09: widget → (iface → methods).
+fn pending_bridges() -> &'static Mutex<HashMap<i64, HashMap<String, Vec<BridgeMethod>>>> {
+    static P: OnceLock<Mutex<HashMap<i64, HashMap<String, Vec<BridgeMethod>>>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Count of widgets with a buffered bridge inventory — [`notify_view_freed`]'s fast gate (one
+/// atomic load per normal view GC on the FinalizerDaemon). Maintained under the
+/// [`pending_bridges`] lock by storing `len()` after every mutation (recount-from-truth, never
+/// arithmetic). 2026-07-10.
+static PENDING_BRIDGE_VIEWS: AtomicUsize = AtomicUsize::new(0);
+
+/// Buffer one `addJavascriptInterface` inventory for `widget` (the ONE insert site — keeps
+/// [`PENDING_BRIDGE_VIEWS`] true to the map). 2026-07-10.
+fn buffer_pending_bridge(widget: i64, name: String, methods: Vec<BridgeMethod>) {
+    if let Ok(mut m) = pending_bridges().lock() {
+        m.entry(widget).or_default().insert(name, methods);
+        PENDING_BRIDGE_VIEWS.store(m.len(), Ordering::Relaxed);
+    }
+}
+
+/// Remove `widget`'s buffered bridge inventory (counter-maintaining). 2026-07-10.
+fn remove_pending_bridges(widget: i64) {
+    if let Ok(mut m) = pending_bridges().lock() {
+        m.remove(&widget);
+        PENDING_BRIDGE_VIEWS.store(m.len(), Ordering::Relaxed);
+    }
+}
+
+/// Take (and clear) the buffered bridge inventory for `widget`.
+fn drain_pending_bridges(widget: i64) -> Vec<(String, Vec<BridgeMethod>)> {
+    pending_bridges()
+        .lock()
+        .ok()
+        .and_then(|mut m| {
+            let taken = m.remove(&widget);
+            PENDING_BRIDGE_VIEWS.store(m.len(), Ordering::Relaxed);
+            taken
+        })
+        .map(|b| b.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Latch check → lazy spawn (D2) → send one frame under the [`CLIENT`] lock (the register/eval/
+/// cookie ops that need no per-view record). A send failure latches (the stream is untrustworthy);
+/// a latched slot returns the actionable reason before any work.
+fn send_with_lazy_spawn(java_vm: jni::vm::JavaVM, msg: &ConsumerMsg) -> Result<(), ClientError> {
+    let mut slot = CLIENT
+        .lock()
+        .map_err(|_| ClientError::Internal("client lock poisoned"))?;
+    if let Some(e) = latched_error(&slot) {
+        return Err(e);
+    }
+    ensure_spawned(&mut slot, java_vm)?;
+    send_locked(&mut slot, msg)
+}
+
+/// Register (or re-register) an `addJavascriptInterface(object, name)` bridge on `widget`. The
+/// Java object + its resolved `@JavascriptInterface` methods are retained in `framework.rs` BEFORE
+/// this call; here we only forward the method inventory. If the view is not yet loaded, the
+/// registration is buffered and flushed by [`drive`] after `CreateView`; if it is already live,
+/// it is sent immediately. Degrades honestly on a latched/absent helper (2026-07-09).
+pub fn register_bridge(
+    java_vm: jni::vm::JavaVM,
+    widget: i64,
+    name: String,
+    methods: Vec<BridgeMethod>,
+) -> Result<(), ClientError> {
+    // Buffer first so a pre-load registration survives until the first CreateView.
+    buffer_pending_bridge(widget, name.clone(), methods.clone());
+    if view_is_tracked(widget) {
+        // The view already has a browser: send now (and the buffered copy is harmlessly re-sent
+        // by a future re-drive only if this view is closed + re-created).
+        send_with_lazy_spawn(
+            java_vm,
+            &ConsumerMsg::BridgeRegister {
+                view: widget,
+                name,
+                methods,
+            },
+        )
+    } else {
+        // Deferred to drive()'s post-CreateView flush; nothing to send (and no reason to spawn).
+        Ok(())
+    }
+}
+
+/// Forward `evaluateJavascript(script, ValueCallback)` — the JSON result routes back as an
+/// `EvaluateJsResult` correlated by `request_id` (framework.rs retained the ValueCallback under
+/// that id first). Lazily spawns; degrades honestly.
+pub fn evaluate_js(
+    java_vm: jni::vm::JavaVM,
+    widget: i64,
+    request_id: u32,
+    script: String,
+) -> Result<(), ClientError> {
+    send_with_lazy_spawn(
+        java_vm,
+        &ConsumerMsg::EvaluateJsForResult {
+            view: widget,
+            request_id,
+            script,
+        },
+    )
+}
+
+/// Fire-and-forget 2-arg `CookieManager.setCookie(url, value)` (v1 `CookieSet`). Lazily spawns.
+#[allow(clippy::too_many_arguments)] // 2026-07-09: mirrors the parsed Set-Cookie fields 1:1.
+pub fn cookie_set(
+    java_vm: jni::vm::JavaVM,
+    url: String,
+    name: String,
+    value: String,
+    domain: String,
+    path: String,
+    secure: bool,
+    http_only: bool,
+    expires_epoch_s: i64,
+) -> Result<(), ClientError> {
+    send_with_lazy_spawn(
+        java_vm,
+        &ConsumerMsg::CookieSet {
+            url,
+            name,
+            value,
+            domain,
+            path,
+            secure,
+            http_only,
+            expires_epoch_s,
+        },
+    )
+}
+
+/// 3-arg `CookieManager.setCookie(url, value, ValueCallback)` (v2 `CookieSetForResult`): the REAL
+/// success flag returns as a `CookieSetResult` correlated by `request_id` (framework.rs retained
+/// the callback under that id first). Lazily spawns.
+#[allow(clippy::too_many_arguments)] // 2026-07-09: mirrors the parsed Set-Cookie fields + id.
+pub fn cookie_set_with_result(
+    java_vm: jni::vm::JavaVM,
+    request_id: u32,
+    url: String,
+    name: String,
+    value: String,
+    domain: String,
+    path: String,
+    secure: bool,
+    http_only: bool,
+    expires_epoch_s: i64,
+) -> Result<(), ClientError> {
+    send_with_lazy_spawn(
+        java_vm,
+        &ConsumerMsg::CookieSetForResult {
+            request_id,
+            url,
+            name,
+            value,
+            domain,
+            path,
+            secure,
+            http_only,
+            expires_epoch_s,
+        },
+    )
+}
+
+/// `removeAllCookies` / `removeSessionCookies` (v1 `CookiesClear`): the completion returns as a
+/// (routed) empty `CookieList` correlated by `request_id`. 2026-07-09 divergence: `CookiesClear`
+/// is a blanket clear, so `removeSessionCookies` also clears persistent cookies — harmless for the
+/// in-memory session store (nothing persists). Lazily spawns.
+pub fn cookies_clear(java_vm: jni::vm::JavaVM, request_id: u32) -> Result<(), ClientError> {
+    send_with_lazy_spawn(java_vm, &ConsumerMsg::CookiesClear { request_id })
+}
+
+/// Blocking `CookieManager.getCookie(url)` (v1 `CookieGet`): register a channel waiter, send the
+/// request, then park the CALLING thread on the receiver WITHOUT holding [`CLIENT`] (so the reader
+/// thread can deliver the reply). On timeout / a latched-or-torn-down helper the waiter is removed
+/// and an empty list is returned (the native formats that to `""` — honest degradation). Cookie
+/// VALUES never touch a log macro on any path (2026-07-09).
+pub fn cookie_get_blocking(
+    java_vm: jni::vm::JavaVM,
+    url: String,
+    timeout: Duration,
+) -> Result<Vec<CookieEntry>, ClientError> {
+    // 2026-07-09 boundary assertion: a blocking wait ON the io thread can never be answered — the
+    // reply's only reader is the parked caller itself. App-code upcalls now run on the dedicated
+    // upcall thread, so this cannot happen; if a future change re-introduces an io-thread JNI
+    // upcall, fail fast + loud instead of a guaranteed self-stall for the full timeout.
+    if IO_THREAD_ID.get() == Some(&std::thread::current().id()) {
+        tracing::warn!(
+            "cookie_get_blocking called ON the eclipse-webview-io thread — the reply could never \
+             be delivered; serving the honest empty list immediately (fix the caller: app-code \
+             upcalls belong on the upcall thread)"
+        );
+        return Ok(Vec::new());
+    }
+    let request_id = next_request_id();
+    let (tx, rx) = mpsc::channel::<Vec<CookieEntry>>();
+    // Register BEFORE sending so no reply can beat the registration.
+    match shared().cookie_get_waiters.lock() {
+        Ok(mut w) => {
+            w.insert(request_id, tx);
+        }
+        Err(_) => return Err(ClientError::Internal("cookie waiters lock poisoned")),
+    }
+    if let Err(e) = send_with_lazy_spawn(java_vm, &ConsumerMsg::CookieGet { request_id, url }) {
+        remove_cookie_waiter(request_id);
+        return Err(e);
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(cookies) => Ok(cookies),
+        // Timeout OR channel disconnected (shutdown dropped the sender) → honest empty.
+        Err(_) => {
+            remove_cookie_waiter(request_id);
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn remove_cookie_waiter(request_id: u32) {
+    if let Ok(mut w) = shared().cookie_get_waiters.lock() {
+        w.remove(&request_id);
+    }
+}
+
+/// Drop EVERY parked `getCookie` waiter's `Sender` so [`cookie_get_blocking`] wakes immediately
+/// (channel `Disconnected` → its honest empty list) instead of blocking its full timeout.
+/// 2026-07-09 fix: called on reader-thread exit (helper crash/EOF/protocol error — previously
+/// only [`shutdown`] cleared the map, so an in-flight getCookie at helper-death time stalled the
+/// full remaining 5 s on the calling ART thread) and by [`shutdown`] (idempotent).
+fn wake_all_cookie_waiters() {
+    if let Ok(mut w) = shared().cookie_get_waiters.lock() {
+        w.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,11 +1657,24 @@ pub fn send_key(view: i64, kind: u8, windows_key_code: i32, character: u16) {
 // Lifecycle (teardown, GC hook, __webview-test observation)
 // ---------------------------------------------------------------------------
 
-/// `View.native_destructor` hook: a driven WebView was garbage-collected. Runs on ART's
-/// FinalizerDaemon thread — never panics/throws; the fast path for every NORMAL view GC is the
-/// two atomic loads on the first line. Sends a best-effort `CloseView` (per-view close never
-/// latches by policy — D5).
+/// `View.native_destructor` hook: a WebView was garbage-collected. Runs on ART's FinalizerDaemon
+/// thread — never panics/throws; the fast path for every NORMAL view GC is a few atomic loads
+/// (2026-07-10: bridge-cleanup gates + the two drive-tracking gates). Sends a best-effort
+/// `CloseView` for driven views (per-view close never latches by policy — D5).
 pub fn notify_view_freed(widget: i64) {
+    // 2026-07-10 fix: bridge registration is INDEPENDENT of drive-tracking —
+    // `addJavascriptInterface` retains its JNI globals and buffers the wire inventory BEFORE any
+    // helper-availability check, so a never-driven WebView (absent/latched helper: `drive`
+    // returns before `record_view`, the view is never tracked) still owns them at finalize time.
+    // Release BOTH before the drive-tracking gates below — the old order early-returned first and
+    // leaked one BridgeEntry of JNI globals per failed challenge attempt for the process
+    // lifetime. The FinalizerDaemon is ART-attached, so the `Global` drops here are cheap.
+    if crate::framework::has_webview_bridges() {
+        crate::framework::drop_bridges_for(widget);
+    }
+    if PENDING_BRIDGE_VIEWS.load(Ordering::Relaxed) != 0 {
+        remove_pending_bridges(widget);
+    }
     if ACTIVE_VIEW.load(Ordering::Relaxed) == 0 && LIVE_VIEWS.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -1248,12 +1795,31 @@ pub fn shutdown(deadline: Duration) -> ShutdownReport {
         .take()
         .map(|h| h.join().is_ok())
         .unwrap_or(false);
+    // Join the upcall thread AFTER the reader: the reader's exit dropped the channel sender, so
+    // the upcall loop finishes its queue, drains every pending ValueCallback honestly
+    // (`framework::drain_all_webview_callbacks`), and exits — bounded like the reader join.
+    if let Some(h) = client.upcall.take() {
+        let _ = h.join();
+    }
     if let Ok(mut views) = shared().views.lock() {
         views.clear();
     }
     if let Ok(mut rect) = shared().rect.lock() {
         *rect = None;
     }
+    // Drop every getCookie sender: any thread parked in cookie_get_blocking wakes (Disconnected)
+    // and returns its honest empty list instead of blocking the full timeout. (The reader-exit
+    // path already did this — idempotent; this also covers a reader that could not be joined.)
+    wake_all_cookie_waiters();
+    if let Ok(mut b) = pending_bridges().lock() {
+        b.clear();
+        PENDING_BRIDGE_VIEWS.store(0, Ordering::Relaxed);
+    }
+    // 2026-07-09 same-pattern audit: after shutdown no upcall thread exists to run a queued
+    // drain, so drop every retained @JavascriptInterface global here (2026-07-10: the
+    // finalize-time drop_bridges_for path now runs unconditionally, but shutdown must not
+    // depend on future finalizers).
+    crate::framework::drop_all_bridges();
     LIVE_VIEWS.store(0, Ordering::Relaxed);
     ShutdownReport {
         helper_exit: exit,
@@ -1375,30 +1941,30 @@ mod tests {
         // deadline is injected so no test path sleeps 10 s.
         let deadline = Duration::from_secs(2);
 
-        // Correct HelloAck v1 → Ok(engine).
+        // Correct current-version HelloAck → Ok(engine).
         let (client_end, helper_end) = UnixStream::pair().expect("pair");
         let ack = HelperMsg::HelloAck {
-            version: super::super::PROTO_V1,
+            version: super::super::PROTO_VERSION,
             engine: "cef/test".into(),
         }
         .encode()
         .expect("encode ack");
         (&mut &helper_end).write_all(&ack).expect("write ack");
-        let engine = perform_handshake(&client_end, deadline).expect("v1 handshake");
+        let engine = perform_handshake(&client_end, deadline).expect("current-version handshake");
         assert_eq!(engine, "cef/test");
         // The Hello frame reached the helper side (the consumer's half of the contract).
         let hello = proto::read_consumer_msg(&mut &helper_end).expect("decode Hello");
         assert_eq!(
             hello,
             ConsumerMsg::Hello {
-                version: super::super::PROTO_V1
+                version: super::super::PROTO_VERSION
             }
         );
 
         // Unsupported version → the typed mismatch (the consumer-side exact-version gate).
         let (client_end, helper_end) = UnixStream::pair().expect("pair");
         let ack = HelperMsg::HelloAck {
-            version: super::super::PROTO_V1 + 1,
+            version: super::super::PROTO_VERSION + 1,
             engine: "cef/future".into(),
         }
         .encode()
@@ -1406,7 +1972,7 @@ mod tests {
         (&mut &helper_end).write_all(&ack).expect("write ack");
         match perform_handshake(&client_end, deadline) {
             Err(ClientError::VersionMismatch { helper_version }) => {
-                assert_eq!(helper_version, super::super::PROTO_V1 + 1);
+                assert_eq!(helper_version, super::super::PROTO_VERSION + 1);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
@@ -1620,5 +2186,168 @@ mod tests {
         }
         // Non-failed slots never produce a latch error (Unspawned drives spawn; Live drives send).
         assert!(latched_error(&ClientSlot::Unspawned).is_none());
+    }
+
+    #[test]
+    fn dispatch_extracts_v2_bridge_eval_and_cookie_outputs() {
+        // 2026-07-09 (plan M4): the pure dispatch state machine extracts the v2 outputs WITHOUT
+        // touching the views map or any global — the reader loop performs the JNI/channel work.
+        let mut views: HashMap<i64, ViewShared> = HashMap::new();
+
+        // BridgeCall for an UNTRACKED view is fine (framework validates the registry).
+        let out = dispatch(
+            HelperMsg::BridgeCall {
+                view: 7,
+                call_id: 3,
+                payload_json: "{\"iface\":\"X\",\"method\":\"m\",\"args\":[]}".to_string(),
+            },
+            &mut views,
+        );
+        assert_eq!(
+            out.bridge_calls,
+            vec![(
+                7,
+                3,
+                "{\"iface\":\"X\",\"method\":\"m\",\"args\":[]}".to_string()
+            )]
+        );
+        assert!(out.upcalls.is_empty() && !out.fatal);
+
+        let out = dispatch(
+            HelperMsg::EvaluateJsResult {
+                request_id: 11,
+                ok: true,
+                value_json: "\"echo:PING\"".to_string(),
+            },
+            &mut views,
+        );
+        assert_eq!(
+            out.eval_results,
+            vec![(11, true, "\"echo:PING\"".to_string())]
+        );
+
+        let out = dispatch(
+            HelperMsg::CookieSetResult {
+                request_id: 12,
+                ok: true,
+            },
+            &mut views,
+        );
+        assert_eq!(out.cookie_set_results, vec![(12, true)]);
+
+        let cookies = vec![CookieEntry {
+            name: "ECLIPSE_TEST".to_string(),
+            value: "1".to_string(),
+            domain: "127.0.0.1".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+        }];
+        let out = dispatch(
+            HelperMsg::CookieList {
+                request_id: 13,
+                cookies: cookies.clone(),
+            },
+            &mut views,
+        );
+        assert_eq!(out.cookie_lists, vec![(13, cookies)]);
+    }
+
+    #[test]
+    fn next_request_id_is_monotonic_and_skips_zero() {
+        // Ids are strictly increasing and never 0 (the sentinel). Two draws differ and are nonzero.
+        let a = next_request_id();
+        let b = next_request_id();
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn reader_exit_wakes_parked_cookie_getters_immediately() {
+        // 2026-07-09 fix pin: the reader's exit path previously left `cookie_get_waiters`
+        // populated (only shutdown() cleared it), so a getCookie in flight at helper-death time
+        // blocked its FULL 5 s timeout. Reader exit and shutdown now both drop every waiter
+        // Sender: a parked receiver wakes with Disconnected (→ the honest empty list) instead of
+        // timing out. Pinned on the shared helper both paths call.
+        let (tx, rx) = mpsc::channel::<Vec<CookieEntry>>();
+        let request_id = next_request_id();
+        shared()
+            .cookie_get_waiters
+            .lock()
+            .expect("waiters lock")
+            .insert(request_id, tx);
+        wake_all_cookie_waiters();
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            other => panic!("expected an immediate Disconnected wake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_view_freed_releases_pending_bridges_for_a_never_driven_view() {
+        // 2026-07-10 fix pin: bridge state is registered by addJavascriptInterface BEFORE any
+        // helper-availability check, so a NEVER-DRIVEN WebView (absent/latched helper — drive()
+        // returns before record_view, the view is never tracked, LIVE_VIEWS stays 0) must still
+        // have its buffered inventory (and, on the same code path, the framework-side BridgeEntry
+        // JNI globals) released at finalize. The old notify_view_freed early-returned at the
+        // two-atomic fast gate / !tracked check FIRST, leaking one inventory per failed challenge
+        // attempt for the process lifetime. This widget handle is unique to this test.
+        let widget = 0x5EED_0001_i64;
+        buffer_pending_bridge(widget, "EclipseTest".into(), Vec::new());
+        assert!(pending_bridges()
+            .lock()
+            .expect("pending lock")
+            .contains_key(&widget));
+        assert_ne!(PENDING_BRIDGE_VIEWS.load(Ordering::Relaxed), 0);
+        assert!(!view_is_tracked(widget), "never driven — never tracked");
+        notify_view_freed(widget);
+        assert!(
+            !pending_bridges()
+                .lock()
+                .expect("pending lock")
+                .contains_key(&widget),
+            "a never-driven view's buffered bridge inventory must be released at finalize"
+        );
+    }
+
+    #[test]
+    fn reader_loop_stays_jni_free_and_hands_bridge_drops_to_the_upcall_thread() {
+        // 2026-07-10 fix pin (source-shape, the lifecycle_drivers_call_on_post_create house
+        // pattern): dropping BridgeEntry `Global`s on the unattached reader thread performed a
+        // hidden scoped AttachCurrentThread/DetachCurrentThread per ref (jni 0.22.4
+        // refs/global.rs::drop), so an ART suspend-all pause could stall the io loop until the
+        // helper's bounded outbox declared the consumer dead and QUIT. The bridge drop + eval
+        // drain must live in upcall_thread_main, never between reader_loop and reader_fatal.
+        let src = include_str!("client.rs");
+        let reader_start = src.find("fn reader_loop").expect("reader_loop present");
+        let reader_end = src[reader_start..]
+            .find("fn reader_fatal")
+            .expect("reader_fatal follows reader_loop")
+            + reader_start;
+        let reader_body = &src[reader_start..reader_end];
+        assert!(
+            !reader_body.contains("drop_bridges_for"),
+            "the reader thread must stay JNI-free (bridge drops belong to the upcall thread)"
+        );
+        assert!(
+            !reader_body.contains("drain_eval_callbacks"),
+            "the reader thread must stay JNI-free (eval drains belong to the upcall thread)"
+        );
+        let upcall_start = src
+            .find("fn upcall_thread_main")
+            .expect("upcall_thread_main present");
+        let upcall_body = &src[upcall_start..reader_start];
+        assert!(
+            upcall_body.contains("drop_bridges_for_view_closed"),
+            "the era-gated bridge drop must run on the upcall thread"
+        );
+        // 2026-07-10 (stale-string pin): the handshake log binds super::PROTO_VERSION — no
+        // hardcoded protocol generation may reappear in this module's strings/docs.
+        let banned = ["protocol ", "v1"].concat();
+        assert!(
+            !src.contains(&banned),
+            "hardcoded protocol generation string found — log/document PROTO_VERSION instead"
+        );
     }
 }

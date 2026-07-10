@@ -1,5 +1,7 @@
-//! Wire protocol v1 for the `eclipse-webview` helper — the NORMATIVE message-set/framing spec
+//! Wire protocol for the `eclipse-webview` helper — the NORMATIVE message-set/framing spec
 //! (docs/web-engine-plan.md M2 keeps only the summary; this file is the source of truth).
+//! The negotiated version is [`super::PROTO_VERSION`] — v2 since the 2026-07-09 M4 additive
+//! extension; the v1 baseline below stays FROZEN.
 //!
 //! 2026-07-03: an owned, std-only protocol over ONE `SOCK_STREAM` `UnixStream` (the control
 //! socket from the spawn contract in [`super`]) — no tokio, no async runtime; blocking
@@ -13,6 +15,18 @@
 //! BEFORE any allocation, plus per-type caps (default 64 KiB; `LoadUrl` 32 KiB;
 //! `LoadDataWithBaseUrl`/`EvaluateJs` 8 MiB).
 //!
+//! # v2 (plan M4, 2026-07-09) — ADDITIVE
+//!
+//! The v2 extension adds seven message types in the disjoint 0x11+ (consumer) / 0x89+ (helper)
+//! ranges for the JS bridge, eval-with-result, and cookie-with-result surfaces. Every v1 message
+//! LAYOUT is untouched (byte-identical, FROZEN); the only change to v1 is the `Hello`/`HelloAck`
+//! version integer ([`super::PROTO_VERSION`], now 2 — the exact-match negotiation channel). An old
+//! v1 peer rejects a v2 type byte as [`ProtoError::UnknownType`] and never mis-decodes it, and the
+//! handshake version gate keeps a mismatched peer from ever exchanging v2 frames in the first
+//! place (it fails loudly-and-honestly instead). The v2 opaque-JSON fields
+//! (`BridgeCall::payload_json`, `BridgeResult::result_json`, `Evaluate*::script`/`value_json`) are
+//! never parsed or logged by the helper — only ART produces/consumes them.
+//!
 //! **Exact-length reads only:** the decoder reads exactly the bytes each frame declares and
 //! NEVER buffers ahead — the byte after a decoded [`HelperMsg::FrameBufferNew`] frame is the
 //! [`super::fdpass`] sentinel carrying the memfd via `SCM_RIGHTS`, and a buffered reader would
@@ -22,12 +36,12 @@
 //! # Handshake
 //!
 //! The first consumer→helper frame MUST be [`ConsumerMsg::Hello`] (magic `b"ECWV"`, version);
-//! the first helper→consumer frame MUST be [`HelperMsg::HelloAck`]. v1 requires an exact
-//! version match: on a bad magic the helper treats the stream as malformed (close); on an
-//! unsupported version the helper sends `HelloAck` carrying ITS version then closes, so the
-//! consumer can raise an actionable mismatch error. The helper exits if no `Hello` arrives
-//! within 10 s of spawn. Wire evolution is gated solely by this version — v1 never skips
-//! unknown frames.
+//! the first helper→consumer frame MUST be [`HelperMsg::HelloAck`]. The handshake requires an
+//! exact [`super::PROTO_VERSION`] match: on a bad magic the helper treats the stream as
+//! malformed (close); on an unsupported version the helper sends `HelloAck` carrying ITS
+//! version then closes, so the consumer can raise an actionable mismatch error. The helper
+//! exits if no `Hello` arrives within 10 s of spawn. Wire evolution is gated solely by this
+//! version — unknown frames are never skipped.
 //!
 //! # Malformed input (both sides, symmetric — never UB, never a panic)
 //!
@@ -55,7 +69,9 @@ const LOAD_URL_CAP: u32 = 32 * 1024;
 /// `LoadDataWithBaseUrl` / `EvaluateJs` frame cap (inline documents/scripts).
 const PAYLOAD_CAP: u32 = GLOBAL_FRAME_CAP;
 
-/// v1 consumer→helper type bytes (0x01–0x10).
+/// Consumer→helper type bytes. v1 = 0x01–0x10 (FROZEN); the additive v2 extension (plan M4,
+/// 2026-07-09) claims the disjoint 0x11+ range so an old decoder rejects them as `UnknownType`
+/// (never mis-decodes) and a v1 peer never emits them.
 mod ct {
     pub(super) const HELLO: u8 = 0x01;
     pub(super) const CREATE_VIEW: u8 = 0x02;
@@ -73,9 +89,14 @@ mod ct {
     pub(super) const COOKIES_CLEAR: u8 = 0x0E;
     pub(super) const FRAME_ACK: u8 = 0x0F;
     pub(super) const SHUTDOWN: u8 = 0x10;
+    // --- v2 (plan M4, additive) ---
+    pub(super) const BRIDGE_REGISTER: u8 = 0x11;
+    pub(super) const BRIDGE_RESULT: u8 = 0x12;
+    pub(super) const EVALUATE_JS_FOR_RESULT: u8 = 0x13;
+    pub(super) const COOKIE_SET_FOR_RESULT: u8 = 0x14;
 }
 
-/// v1 helper→consumer type bytes (0x81–0x88).
+/// Helper→consumer type bytes. v1 = 0x81–0x88 (FROZEN); the additive v2 extension claims 0x89+.
 mod ht {
     pub(super) const HELLO_ACK: u8 = 0x81;
     pub(super) const LOAD_STATE: u8 = 0x82;
@@ -85,6 +106,10 @@ mod ht {
     pub(super) const CRASH: u8 = 0x86;
     pub(super) const COOKIE_LIST: u8 = 0x87;
     pub(super) const VIEW_CLOSED: u8 = 0x88;
+    // --- v2 (plan M4, additive) ---
+    pub(super) const BRIDGE_CALL: u8 = 0x89;
+    pub(super) const EVALUATE_JS_RESULT: u8 = 0x8A;
+    pub(super) const COOKIE_SET_RESULT: u8 = 0x8B;
 }
 
 /// Typed protocol error. Deliberately PAYLOAD-FREE: variants carry the type byte, declared
@@ -105,7 +130,7 @@ pub enum ProtoError {
         declared_len: u32,
         cap: u32,
     },
-    /// Type byte unknown to v1 (in this direction). v1 never skips unknown frames.
+    /// Type byte unknown to the protocol (in this direction) — unknown frames are never skipped.
     UnknownType { type_byte: u8 },
     /// The body ended before the message's fields were fully consumed.
     TruncatedBody { type_byte: u8 },
@@ -117,7 +142,7 @@ pub enum ProtoError {
     BadUtf8 { type_byte: u8 },
     /// A `Hello` whose magic is not [`MAGIC`] (the bytes are deliberately not carried).
     BadMagic,
-    /// A field value outside its v1-legal set (named, payload-free).
+    /// A field value outside its legal set (named, payload-free).
     BadValue { type_byte: u8, what: &'static str },
 }
 
@@ -179,6 +204,17 @@ pub struct CookieEntry {
     pub path: String,
     pub secure: bool,
     pub http_only: bool,
+}
+
+/// One `@JavascriptInterface`-annotated method in a [`ConsumerMsg::BridgeRegister`] inventory
+/// (plan M4, 2026-07-09). `name` is a Java method identifier (the app's own API surface — never
+/// user data); `returns_value` records whether the method's return type is non-`void` (advisory:
+/// the async bridge always delivers a Promise regardless — see docs/web-engine-plan.md §M4 open
+/// question #3 and the M4 design's §0.2 sync-return divergence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeMethod {
+    pub name: String,
+    pub returns_value: bool,
 }
 
 /// A console event whose text is STRUCTURALLY absent: the only public constructor,
@@ -285,7 +321,8 @@ pub enum ConsumerMsg {
         character: u16,
         modifiers: u32,
     },
-    /// 0x0B — fire-and-forget in v1 (the result path is M4 work and a version bump).
+    /// 0x0B — the fire-and-forget eval (the v2 `EvaluateJsForResult` carries the result path —
+    /// plan M4, 2026-07-09).
     EvaluateJs { view: i64, script: String },
     /// 0x0C — the overlay 3-arg `setCookie`/`.ROBLOSECURITY` handoff shape.
     /// `expires_epoch_s == 0` means a session cookie.
@@ -311,6 +348,45 @@ pub enum ConsumerMsg {
     },
     /// 0x10
     Shutdown,
+    // --- v2 (plan M4, additive; the JS-bridge / eval-result / cookie-with-result surface) ---
+    /// 0x11 — register the app's `addJavascriptInterface(object, name)` API on `view`. `methods`
+    /// is the resolved `@JavascriptInterface` inventory (opaque names + returns-value flags); the
+    /// helper injects `window.<name>` stubs in the renderer.
+    BridgeRegister {
+        view: i64,
+        name: String,
+        methods: Vec<BridgeMethod>,
+    },
+    /// 0x12 — the async result of a page-invoked bridge call correlated by the helper-allocated
+    /// `call_id`. `result_json` is opaque JSON produced by ART's reflective invoke — the helper
+    /// forwards it to the page's Promise WITHOUT parsing, and NEVER binds it to a log macro.
+    BridgeResult {
+        call_id: u32,
+        ok: bool,
+        result_json: String,
+    },
+    /// 0x13 — `evaluateJavascript(script, ValueCallback)`: run `script` and route the JSON result
+    /// back as a [`HelperMsg::EvaluateJsResult`] correlated by the consumer-allocated `request_id`.
+    /// `script` crosses the wire only — never a log macro.
+    EvaluateJsForResult {
+        view: i64,
+        request_id: u32,
+        script: String,
+    },
+    /// 0x14 — the 3-arg `setCookie(url, value, ValueCallback)`: set the cookie and answer a
+    /// [`HelperMsg::CookieSetResult`] carrying the REAL success flag (never a fabricated ack),
+    /// correlated by the consumer-allocated `request_id`. `expires_epoch_s == 0` = session cookie.
+    CookieSetForResult {
+        request_id: u32,
+        url: String,
+        name: String,
+        value: String,
+        domain: String,
+        path: String,
+        secure: bool,
+        http_only: bool,
+        expires_epoch_s: i64,
+    },
 }
 
 /// Helper→consumer messages (type bytes 0x81–0x88).
@@ -359,6 +435,27 @@ pub enum HelperMsg {
     },
     /// 0x88 — `CloseView` completion (the M3 re-load/teardown semantics hook).
     ViewClosed { view: i64 },
+    // --- v2 (plan M4, additive) ---
+    /// 0x89 — the page invoked `window.<name>.<method>(...)`. `payload_json` is page-controlled
+    /// JSON (`{iface, method, args}`) OPAQUE to the helper — it is forwarded WITHOUT parsing and
+    /// NEVER bound to a log macro. ART (framework.rs) parses it, reflect-invokes the retained
+    /// Java object, and answers a [`ConsumerMsg::BridgeResult`] correlated by `call_id`.
+    BridgeCall {
+        view: i64,
+        call_id: u32,
+        payload_json: String,
+    },
+    /// 0x8A — the JSON result of a [`ConsumerMsg::EvaluateJsForResult`], correlated by
+    /// `request_id`. `value_json` is opaque (the Android `evaluateJavascript` result string;
+    /// `ok=false` → `"null"`) and NEVER bound to a log macro.
+    EvaluateJsResult {
+        request_id: u32,
+        ok: bool,
+        value_json: String,
+    },
+    /// 0x8B — the REAL completion of a [`ConsumerMsg::CookieSetForResult`], correlated by
+    /// `request_id` (`ok` is the cookie manager's actual success flag).
+    CookieSetResult { request_id: u32, ok: bool },
 }
 
 /// Which side's message set a decoder expects (the two type-byte namespaces are disjoint,
@@ -374,7 +471,12 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
     match dir {
         Dir::FromConsumer => match type_byte {
             ct::LOAD_URL => Some(LOAD_URL_CAP),
-            ct::LOAD_DATA_WITH_BASE_URL | ct::EVALUATE_JS => Some(PAYLOAD_CAP),
+            // v2: BridgeResult (page-controlled result JSON) + EvaluateJsForResult (a script) can
+            // be large, like the v1 inline-document payloads.
+            ct::LOAD_DATA_WITH_BASE_URL
+            | ct::EVALUATE_JS
+            | ct::BRIDGE_RESULT
+            | ct::EVALUATE_JS_FOR_RESULT => Some(PAYLOAD_CAP),
             ct::HELLO
             | ct::CREATE_VIEW
             | ct::CLOSE_VIEW
@@ -387,10 +489,15 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ct::COOKIE_GET
             | ct::COOKIES_CLEAR
             | ct::FRAME_ACK
-            | ct::SHUTDOWN => Some(DEFAULT_CAP),
+            | ct::SHUTDOWN
+            | ct::BRIDGE_REGISTER
+            | ct::COOKIE_SET_FOR_RESULT => Some(DEFAULT_CAP),
             _ => None,
         },
         Dir::FromHelper => match type_byte {
+            // v2: BridgeCall (page-controlled arg JSON) + EvaluateJsResult (result JSON) can be
+            // large.
+            ht::BRIDGE_CALL | ht::EVALUATE_JS_RESULT => Some(PAYLOAD_CAP),
             ht::HELLO_ACK
             | ht::LOAD_STATE
             | ht::FRAME_BUFFER_NEW
@@ -398,7 +505,8 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ht::CONSOLE
             | ht::CRASH
             | ht::COOKIE_LIST
-            | ht::VIEW_CLOSED => Some(DEFAULT_CAP),
+            | ht::VIEW_CLOSED
+            | ht::COOKIE_SET_RESULT => Some(DEFAULT_CAP),
             _ => None,
         },
     }
@@ -437,7 +545,7 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
 /// oversized message fails HERE with a typed error instead of shipping a doomed frame).
 fn compose_frame(dir: Dir, type_byte: u8, body: Vec<u8>) -> Result<Vec<u8>, ProtoError> {
     let declared_len = u32::try_from(body.len().saturating_add(1)).unwrap_or(u32::MAX);
-    // Unwrap-free: every type byte passed here is a v1 const of the right direction.
+    // Unwrap-free: every type byte passed here is a `ct`/`ht` const of the right direction.
     let cap = type_cap(dir, type_byte).unwrap_or(0).min(GLOBAL_FRAME_CAP);
     if declared_len > cap {
         return Err(ProtoError::Oversized {
@@ -454,7 +562,7 @@ fn compose_frame(dir: Dir, type_byte: u8, body: Vec<u8>) -> Result<Vec<u8>, Prot
 }
 
 impl ConsumerMsg {
-    /// Encode into a complete frame (`[len][type][body]`), enforcing the v1 caps.
+    /// Encode into a complete frame (`[len][type][body]`), enforcing the per-type caps.
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut b = Vec::new();
         let t = match self {
@@ -617,13 +725,69 @@ impl ConsumerMsg {
                 ct::FRAME_ACK
             }
             Self::Shutdown => ct::SHUTDOWN,
+            Self::BridgeRegister {
+                view,
+                name,
+                methods,
+            } => {
+                put_i64(&mut b, *view);
+                put_str(&mut b, name);
+                put_u16(&mut b, u16::try_from(methods.len()).unwrap_or(u16::MAX));
+                for m in methods.iter().take(usize::from(u16::MAX)) {
+                    put_str(&mut b, &m.name);
+                    put_bool(&mut b, m.returns_value);
+                }
+                ct::BRIDGE_REGISTER
+            }
+            Self::BridgeResult {
+                call_id,
+                ok,
+                result_json,
+            } => {
+                put_u32(&mut b, *call_id);
+                put_bool(&mut b, *ok);
+                put_str(&mut b, result_json);
+                ct::BRIDGE_RESULT
+            }
+            Self::EvaluateJsForResult {
+                view,
+                request_id,
+                script,
+            } => {
+                put_i64(&mut b, *view);
+                put_u32(&mut b, *request_id);
+                put_str(&mut b, script);
+                ct::EVALUATE_JS_FOR_RESULT
+            }
+            Self::CookieSetForResult {
+                request_id,
+                url,
+                name,
+                value,
+                domain,
+                path,
+                secure,
+                http_only,
+                expires_epoch_s,
+            } => {
+                put_u32(&mut b, *request_id);
+                put_str(&mut b, url);
+                put_str(&mut b, name);
+                put_str(&mut b, value);
+                put_str(&mut b, domain);
+                put_str(&mut b, path);
+                put_bool(&mut b, *secure);
+                put_bool(&mut b, *http_only);
+                put_i64(&mut b, *expires_epoch_s);
+                ct::COOKIE_SET_FOR_RESULT
+            }
         };
         compose_frame(Dir::FromConsumer, t, b)
     }
 }
 
 impl HelperMsg {
-    /// Encode into a complete frame (`[len][type][body]`), enforcing the v1 caps.
+    /// Encode into a complete frame (`[len][type][body]`), enforcing the per-type caps.
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut b = Vec::new();
         let t = match self {
@@ -705,6 +869,31 @@ impl HelperMsg {
             Self::ViewClosed { view } => {
                 put_i64(&mut b, *view);
                 ht::VIEW_CLOSED
+            }
+            Self::BridgeCall {
+                view,
+                call_id,
+                payload_json,
+            } => {
+                put_i64(&mut b, *view);
+                put_u32(&mut b, *call_id);
+                put_str(&mut b, payload_json);
+                ht::BRIDGE_CALL
+            }
+            Self::EvaluateJsResult {
+                request_id,
+                ok,
+                value_json,
+            } => {
+                put_u32(&mut b, *request_id);
+                put_bool(&mut b, *ok);
+                put_str(&mut b, value_json);
+                ht::EVALUATE_JS_RESULT
+            }
+            Self::CookieSetResult { request_id, ok } => {
+                put_u32(&mut b, *request_id);
+                put_bool(&mut b, *ok);
+                ht::COOKIE_SET_RESULT
             }
         };
         compose_frame(Dir::FromHelper, t, b)
@@ -1012,6 +1201,44 @@ pub fn read_consumer_msg<R: Read>(r: &mut R) -> Result<ConsumerMsg, ProtoError> 
             seq: b.u32()?,
         },
         ct::SHUTDOWN => ConsumerMsg::Shutdown,
+        ct::BRIDGE_REGISTER => {
+            let view = b.i64()?;
+            let name = b.string()?;
+            let count = b.u16()?;
+            let mut methods = Vec::with_capacity(usize::from(count).min(256));
+            for _ in 0..count {
+                methods.push(BridgeMethod {
+                    name: b.string()?,
+                    returns_value: b.bool()?,
+                });
+            }
+            ConsumerMsg::BridgeRegister {
+                view,
+                name,
+                methods,
+            }
+        }
+        ct::BRIDGE_RESULT => ConsumerMsg::BridgeResult {
+            call_id: b.u32()?,
+            ok: b.bool()?,
+            result_json: b.string()?,
+        },
+        ct::EVALUATE_JS_FOR_RESULT => ConsumerMsg::EvaluateJsForResult {
+            view: b.i64()?,
+            request_id: b.u32()?,
+            script: b.string()?,
+        },
+        ct::COOKIE_SET_FOR_RESULT => ConsumerMsg::CookieSetForResult {
+            request_id: b.u32()?,
+            url: b.string()?,
+            name: b.string()?,
+            value: b.string()?,
+            domain: b.string()?,
+            path: b.string()?,
+            secure: b.bool()?,
+            http_only: b.bool()?,
+            expires_epoch_s: b.i64()?,
+        },
         // read_frame validated the type byte against this direction's cap table already.
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
@@ -1155,15 +1382,30 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
             }
         }
         ht::VIEW_CLOSED => HelperMsg::ViewClosed { view: b.i64()? },
+        ht::BRIDGE_CALL => HelperMsg::BridgeCall {
+            view: b.i64()?,
+            call_id: b.u32()?,
+            payload_json: b.string()?,
+        },
+        ht::EVALUATE_JS_RESULT => HelperMsg::EvaluateJsResult {
+            request_id: b.u32()?,
+            ok: b.bool()?,
+            value_json: b.string()?,
+        },
+        ht::COOKIE_SET_RESULT => HelperMsg::CookieSetResult {
+            request_id: b.u32()?,
+            ok: b.bool()?,
+        },
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
     b.finish()?;
     Ok(msg)
 }
 
-/// Consumer-side version gate: v1 requires an exact `HelloAck` version match.
+/// Consumer-side version gate: the wire requires an exact `HelloAck` version match (the M4
+/// negotiation decision — no capability bits; a mismatch fails loudly-and-honestly).
 pub fn hello_ack_version_supported(version: u16) -> bool {
-    version == super::PROTO_V1
+    version == super::PROTO_VERSION
 }
 
 #[cfg(test)]
@@ -1175,7 +1417,7 @@ mod tests {
     fn all_consumer_msgs() -> Vec<ConsumerMsg> {
         vec![
             ConsumerMsg::Hello {
-                version: super::super::PROTO_V1,
+                version: super::super::PROTO_VERSION,
             },
             ConsumerMsg::CreateView {
                 view: 0x0000_0002_0000_0001,
@@ -1263,7 +1505,7 @@ mod tests {
     fn all_helper_msgs() -> Vec<HelperMsg> {
         vec![
             HelperMsg::HelloAck {
-                version: super::super::PROTO_V1,
+                version: super::super::PROTO_VERSION,
                 engine: "cef/149.0.6+g0d0eeb6+chromium-149.0.7827.201".to_string(),
             },
             HelperMsg::LoadState {
@@ -1512,7 +1754,7 @@ mod tests {
         // Wrong magic → BadMagic (malformed stream; the helper closes). The bytes are not
         // carried in the error (payload-free rule).
         let good = ConsumerMsg::Hello {
-            version: super::super::PROTO_V1,
+            version: super::super::PROTO_VERSION,
         }
         .encode()
         .expect("encode");
@@ -1525,7 +1767,7 @@ mod tests {
         // own version) but the consumer-side gate rejects it — the rule every future wire
         // evolution (e.g. M4's eval-result messages) hangs off.
         let ack = HelperMsg::HelloAck {
-            version: super::super::PROTO_V1 + 1,
+            version: super::super::PROTO_VERSION + 1,
             engine: "cef/test".to_string(),
         };
         let bytes = ack.encode().expect("encode");
@@ -1533,7 +1775,7 @@ mod tests {
         match read_helper_msg(&mut r).expect("decode") {
             HelperMsg::HelloAck { version, .. } => {
                 assert!(!hello_ack_version_supported(version));
-                assert!(hello_ack_version_supported(super::super::PROTO_V1));
+                assert!(hello_ack_version_supported(super::super::PROTO_VERSION));
             }
             other => panic!("expected HelloAck, got {other:?}"),
         }
@@ -1581,5 +1823,217 @@ mod tests {
             }
             other => panic!("expected Console, got {other:?}"),
         }
+    }
+
+    // ---- v2 (plan M4) — a SEPARATE pin set; the FROZEN v1 pin above is untouched ----
+
+    /// One of every v2 consumer→helper message (4), with adversarial field values.
+    fn all_consumer_msgs_v2() -> Vec<ConsumerMsg> {
+        vec![
+            ConsumerMsg::BridgeRegister {
+                view: 0x0000_0002_0000_0001,
+                name: "EclipseTest".to_string(),
+                methods: vec![
+                    BridgeMethod {
+                        name: "echo".to_string(),
+                        returns_value: true,
+                    },
+                    BridgeMethod {
+                        name: "pöst".to_string(),
+                        returns_value: false,
+                    },
+                ],
+            },
+            ConsumerMsg::BridgeResult {
+                call_id: u32::MAX,
+                ok: false,
+                result_json: String::new(),
+            },
+            ConsumerMsg::EvaluateJsForResult {
+                view: -1,
+                request_id: 7,
+                script: "navigator.userAgent".to_string(),
+            },
+            ConsumerMsg::CookieSetForResult {
+                request_id: 0,
+                url: "https://www.roblox.com/".to_string(),
+                name: ".ROBLOSECURITY".to_string(),
+                value: "v".to_string(),
+                domain: ".roblox.com".to_string(),
+                path: "/".to_string(),
+                secure: true,
+                http_only: true,
+                expires_epoch_s: -5,
+            },
+        ]
+    }
+
+    /// One of every v2 helper→consumer message (3), with adversarial field values.
+    fn all_helper_msgs_v2() -> Vec<HelperMsg> {
+        vec![
+            HelperMsg::BridgeCall {
+                view: 42,
+                call_id: 1,
+                payload_json: "{\"iface\":\"EclipseTest\",\"method\":\"echo\",\"args\":[\"ping\"]}"
+                    .to_string(),
+            },
+            HelperMsg::EvaluateJsResult {
+                request_id: u32::MAX,
+                ok: true,
+                value_json: "\"echo:ping\"".to_string(),
+            },
+            HelperMsg::CookieSetResult {
+                request_id: 9,
+                ok: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn proto_roundtrip_encodes_and_decodes_every_v2_message() {
+        // 2026-07-09 (plan M4): the v2 extension round-trips byte-exactly (decode(encode(m))==m
+        // AND encode(decode(bytes))==bytes). Kept SEPARATE from the FROZEN v1 pin above.
+        let consumer = all_consumer_msgs_v2();
+        let helper = all_helper_msgs_v2();
+        assert_eq!(consumer.len() + helper.len(), 7, "v2 adds exactly 7 types");
+
+        let mut stream = Vec::new();
+        for m in &consumer {
+            stream.extend_from_slice(&m.encode().expect("encode"));
+        }
+        let mut r = stream.as_slice();
+        for m in &consumer {
+            let decoded = read_consumer_msg(&mut r).expect("decode");
+            assert_eq!(&decoded, m);
+            assert_eq!(decoded.encode().expect("re-encode"), m.encode().unwrap());
+        }
+        assert_eq!(read_consumer_msg(&mut r), Err(ProtoError::Eof));
+
+        let mut stream = Vec::new();
+        for m in &helper {
+            stream.extend_from_slice(&m.encode().expect("encode"));
+        }
+        let mut r = stream.as_slice();
+        for m in &helper {
+            let decoded = read_helper_msg(&mut r).expect("decode");
+            assert_eq!(&decoded, m);
+            assert_eq!(decoded.encode().expect("re-encode"), m.encode().unwrap());
+        }
+        assert_eq!(read_helper_msg(&mut r), Err(ProtoError::Eof));
+    }
+
+    #[test]
+    fn proto_v2_caps_reject_oversized_before_allocating() {
+        // A BridgeRegister header declaring 65 KiB is over its DEFAULT_CAP (64 KiB) — rejected
+        // before any body allocation (the stream holds only the header).
+        let declared = 65 * 1024;
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&(declared as u32).to_le_bytes());
+        hostile.push(ct::BRIDGE_REGISTER);
+        let mut r = hostile.as_slice();
+        assert_eq!(
+            read_consumer_msg(&mut r),
+            Err(ProtoError::Oversized {
+                type_byte: Some(ct::BRIDGE_REGISTER),
+                declared_len: declared as u32,
+                cap: DEFAULT_CAP,
+            })
+        );
+
+        // An EvaluateJsForResult declaring 9 MiB exceeds the GLOBAL cap (checked at the header
+        // before the per-type cap, so type_byte is None).
+        let declared = 9 * 1024 * 1024;
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&(declared as u32).to_le_bytes());
+        let mut r = hostile.as_slice();
+        assert_eq!(
+            read_consumer_msg(&mut r),
+            Err(ProtoError::Oversized {
+                type_byte: None,
+                declared_len: declared as u32,
+                cap: GLOBAL_FRAME_CAP,
+            })
+        );
+    }
+
+    #[test]
+    fn proto_v2_decoder_is_total_on_truncated_v2_frames() {
+        // Every strict prefix of a v2 stream decodes to Truncated/Eof — never a panic.
+        let mut stream = Vec::new();
+        for m in all_consumer_msgs_v2() {
+            stream.extend_from_slice(&m.encode().expect("encode"));
+        }
+        for cut in 0..stream.len() {
+            let mut r = &stream[..cut];
+            loop {
+                match read_consumer_msg(&mut r) {
+                    Ok(_) => continue,
+                    Err(ProtoError::Eof) | Err(ProtoError::Truncated) => break,
+                    Err(other) => panic!("consumer prefix len {cut}: unexpected error {other:?}"),
+                }
+            }
+        }
+        let mut stream = Vec::new();
+        for m in all_helper_msgs_v2() {
+            stream.extend_from_slice(&m.encode().expect("encode"));
+        }
+        for cut in 0..stream.len() {
+            let mut r = &stream[..cut];
+            loop {
+                match read_helper_msg(&mut r) {
+                    Ok(_) => continue,
+                    Err(ProtoError::Eof) | Err(ProtoError::Truncated) => break,
+                    Err(other) => panic!("helper prefix len {cut}: unexpected error {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_call_frame_never_leaks_payload_bytes() {
+        // The wire-side companion of the log-side privacy grep: token-bearing bridge/eval/cookie
+        // payloads MUST cross the wire intact (they carry the load-bearing data) — so the encoded
+        // frame CONTAINS them by design. The privacy guarantee is that the payload-free LOGGING
+        // paths (§2.6/§3.7) never surface them; here we assert the wire is lossless AND that the
+        // round-trip preserves the exact bytes so no truncation/corruption silently drops data.
+        let secret = "ROBLOSECURITY-token-SECRET";
+        let call = HelperMsg::BridgeCall {
+            view: 7,
+            call_id: 3,
+            payload_json: format!("{{\"args\":[\"{secret}\"]}}"),
+        };
+        let bytes = call.encode().expect("encode");
+        assert!(
+            bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+            "the page-controlled bridge payload must cross the wire"
+        );
+        let mut r = bytes.as_slice();
+        assert_eq!(read_helper_msg(&mut r).expect("decode"), call);
+
+        let set = ConsumerMsg::CookieSetForResult {
+            request_id: 1,
+            url: "https://www.roblox.com/".to_string(),
+            name: ".ROBLOSECURITY".to_string(),
+            value: secret.to_string(),
+            domain: ".roblox.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            expires_epoch_s: 0,
+        };
+        let bytes = set.encode().expect("encode");
+        assert!(bytes.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        let mut r = bytes.as_slice();
+        assert_eq!(read_consumer_msg(&mut r).expect("decode"), set);
+
+        let eval = ConsumerMsg::EvaluateJsForResult {
+            view: 7,
+            request_id: 2,
+            script: format!("document.cookie=\"{secret}\""),
+        };
+        let bytes = eval.encode().expect("encode");
+        assert!(bytes.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        let mut r = bytes.as_slice();
+        assert_eq!(read_consumer_msg(&mut r).expect("decode"), eval);
     }
 }

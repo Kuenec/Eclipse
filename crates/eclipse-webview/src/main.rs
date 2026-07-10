@@ -28,13 +28,19 @@ mod logging;
 #[allow(dead_code)]
 mod shared;
 
+use cef::wrapper::message_router::{
+    MessageRouterConfig, MessageRouterRendererSide, MessageRouterRendererSideHandlerCallbacks,
+    RendererSideRouter,
+};
 use cef::{args::Args, sys, *};
 use engine::{Engine, Out, Outbox};
 use logging as log;
 use shared::fdpass;
 use shared::proto::{self, ConsumerMsg, HelperMsg, ProtoError};
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -86,14 +92,20 @@ fn parse_ozone_override<I: Iterator<Item = String>>(args: I) -> Option<String> {
 }
 
 // The `ozone` field is the explicit ozone selection, filled in before `initialize` (browser
-// process only; `None` until the handshake completes). (Field doc comments are not accepted
-// by the wrap_app! macro grammar.)
+// process only; `None` until the handshake completes). `render_handler` is the renderer-side
+// JS-bridge/eval handler (plan M4) — active only in the CEF-forked renderer subprocess. (Field
+// doc comments are not accepted by the wrap_app! macro grammar.)
 wrap_app! {
     struct HelperApp {
         ozone: Arc<Mutex<Option<String>>>,
+        render_handler: RenderProcessHandler,
     }
 
     impl App {
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(self.render_handler.clone())
+        }
+
         fn on_before_command_line_processing(
             &self,
             process_type: Option<&CefString>,
@@ -133,6 +145,221 @@ wrap_app! {
                 }
             }
         }
+    }
+}
+
+// === Renderer-side JS bridge + evaluateJavascript (plan M4, 2026-07-09) ===========================
+//
+// Active ONLY in the CEF-forked renderer subprocess (execute_process runs the same binary; App's
+// render_process_handler is called there). Holds the renderer-side cefQuery router + a per-render-
+// process bridge inventory (interface → method names). Injects `window.<name>` stubs on each main-
+// frame context creation, and services `eclipse.bridge.register` / `eclipse.eval` process messages.
+
+wrap_render_process_handler! {
+    struct HelperRenderProcessHandler {
+        router: Arc<RendererSideRouter>,
+        inventory: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    }
+
+    impl RenderProcessHandler {
+        fn on_context_created(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            context: Option<&mut V8Context>,
+        ) {
+            let frame_owned: Option<Frame> = frame.map(|f| f.clone());
+            // (1) Register cefQuery/cefQueryCancel on the new context (the router contract).
+            self.router.on_context_created(
+                browser.map(|b| b.clone()),
+                frame_owned.clone(),
+                context.map(|c| c.clone()),
+            );
+            // (2) On the MAIN frame: inject any already-known stubs, then ask the browser to (re-)send
+            //     the bridge inventory for THIS fresh context (the pull model — a browser→renderer
+            //     send before the renderer was connected is dropped, and each navigation is a new
+            //     context). The browser answers with "eclipse.bridge.register", injecting the stubs.
+            if let Some(frame) = frame_owned {
+                if frame.is_main() != 0 {
+                    self.inject_all_stubs(&frame);
+                    if let Some(mut ready) =
+                        process_message_create(Some(&CefString::from("eclipse.bridge.ready")))
+                    {
+                        frame.send_process_message(ProcessId::BROWSER, Some(&mut ready));
+                    }
+                    log::info("render", "main-frame context ready (requested bridge inventory)");
+                }
+            }
+        }
+
+        fn on_context_released(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            context: Option<&mut V8Context>,
+        ) {
+            self.router.on_context_released(
+                browser.map(|b| b.clone()),
+                frame.map(|f| f.clone()),
+                context.map(|c| c.clone()),
+            );
+        }
+
+        fn on_process_message_received(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> c_int {
+            let name = message
+                .as_ref()
+                .map(|m| CefString::from(&m.name()).to_string())
+                .unwrap_or_default();
+            match name.as_str() {
+                "eclipse.bridge.register" => {
+                    if let Some(msg) = message {
+                        if let Some(args) = msg.argument_list() {
+                            let n = args.size();
+                            if n >= 1 {
+                                let iface = CefString::from(&args.string(0)).to_string();
+                                let methods: Vec<String> = (1..n)
+                                    .map(|i| CefString::from(&args.string(i)).to_string())
+                                    .collect();
+                                if let Ok(mut inv) = self.inventory.lock() {
+                                    inv.insert(iface.clone(), methods.clone());
+                                }
+                                // Inject immediately if the main-frame context already exists.
+                                if let Some(frame) = frame {
+                                    if frame.is_main() != 0 {
+                                        let js = generate_stub_js(&iface, &methods);
+                                        frame.execute_java_script(
+                                            Some(&CefString::from(js.as_str())),
+                                            None,
+                                            0,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    1
+                }
+                "eclipse.eval" => {
+                    if let (Some(msg), Some(frame)) = (message, frame) {
+                        if let Some(args) = msg.argument_list() {
+                            let request_id = args.int(0);
+                            let script = CefString::from(&args.string(1)).to_string();
+                            let (ok, value_json) = eval_in_frame(frame, &script);
+                            if let Some(mut out) = process_message_create(Some(&CefString::from(
+                                "eclipse.eval.result",
+                            ))) {
+                                if let Some(oargs) = out.argument_list() {
+                                    oargs.set_size(3);
+                                    oargs.set_int(0, request_id);
+                                    oargs.set_bool(1, c_int::from(ok));
+                                    oargs.set_string(
+                                        2,
+                                        Some(&CefString::from(value_json.as_str())),
+                                    );
+                                }
+                                frame.send_process_message(ProcessId::BROWSER, Some(&mut out));
+                            }
+                        }
+                    }
+                    1
+                }
+                // Not ours: let the renderer router handle cefQuery replies from the browser.
+                _ => {
+                    if self.router.on_process_message_received(
+                        browser.map(|b| b.clone()),
+                        frame.map(|f| f.clone()),
+                        Some(source_process),
+                        message.map(|m| m.clone()),
+                    ) {
+                        1
+                    } else {
+                        0
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl HelperRenderProcessHandler {
+    /// Inject every stored interface's `window.<name>` stubs into `frame`.
+    fn inject_all_stubs(&self, frame: &Frame) {
+        if let Ok(inv) = self.inventory.lock() {
+            for (iface, methods) in inv.iter() {
+                let js = generate_stub_js(iface, methods);
+                frame.execute_java_script(Some(&CefString::from(js.as_str())), None, 0);
+            }
+        }
+    }
+}
+
+/// Escape a Java identifier defensively for embedding inside a JS double-quoted string literal
+/// (interface/method names are Java identifiers — no real injection risk, but escape anyway).
+fn js_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Generate the `window.<name>` bridge stub JS for one interface. Each method returns a Promise
+/// (the async bridge shape — see the M4 design §0.2 documented sync-return divergence): it
+/// serializes `{iface, method, args}` and sends it through `cefQuery`; onSuccess resolves with the
+/// JSON-parsed result, onFailure rejects with an Error.
+fn generate_stub_js(iface: &str, methods: &[String]) -> String {
+    let name = js_escape(iface);
+    let methods_arr = methods
+        .iter()
+        .map(|m| format!("\"{}\"", js_escape(m)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "(function(){{var q=window.cefQuery;if(!q){{return;}}var o=window[\"{name}\"]=window[\"{name}\"]||{{}};\
+         [{methods_arr}].forEach(function(m){{o[m]=function(){{\
+         var a=Array.prototype.slice.call(arguments);\
+         var r=JSON.stringify({{iface:\"{name}\",method:m,args:a}});\
+         return new Promise(function(res,rej){{q({{request:r,\
+         onSuccess:function(s){{res(s===\"\"?undefined:JSON.parse(s));}},\
+         onFailure:function(c,msg){{rej(new Error(msg));}}}});}});}};}});}})();"
+    )
+}
+
+/// Evaluate `script` in `frame`'s V8 context and return `(ok, value_json)`. The wrapper
+/// `JSON.stringify((function(){return (<script>);})())` yields the JSON-encoded result string
+/// (Android's `evaluateJavascript` contract); `undefined`/non-string → `"null"`.
+fn eval_in_frame(frame: &Frame, script: &str) -> (bool, String) {
+    let wrapper = format!("JSON.stringify((function(){{return ({script});}})())");
+    let Some(ctx) = frame.v8_context() else {
+        return (false, "null".to_string());
+    };
+    let mut retval: Option<V8Value> = None;
+    let mut exception: Option<V8Exception> = None;
+    let code = ctx.eval(
+        Some(&CefString::from(wrapper.as_str())),
+        None,
+        0,
+        Some(&mut retval),
+        Some(&mut exception),
+    );
+    if code == 0 {
+        return (false, "null".to_string());
+    }
+    match retval {
+        Some(v) if v.is_string() != 0 => (true, CefString::from(&v.string_value()).to_string()),
+        // undefined / non-string result → "null" (the Android evaluateJavascript contract).
+        _ => (true, "null".to_string()),
     }
 }
 
@@ -177,7 +404,14 @@ fn main() -> ExitCode {
     let is_browser_process = cmd_line.has_switch(Some(&CefString::from("type"))) != 1;
 
     let ozone_slot: Arc<Mutex<Option<String>>> = Arc::default();
-    let mut app = HelperApp::new(ozone_slot.clone());
+    // The renderer-side JS-bridge/eval handler (plan M4). The router + inventory are cheap to
+    // construct here; the handler is only USED in the CEF-forked renderer subprocess (App's
+    // render_process_handler is called there, never in the browser process).
+    let render_handler = HelperRenderProcessHandler::new(
+        RendererSideRouter::new(MessageRouterConfig::default()),
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+    let mut app = HelperApp::new(ozone_slot.clone(), render_handler);
     let ret = execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -216,14 +450,14 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     match proto::read_consumer_msg(&mut &stream) {
-        Ok(ConsumerMsg::Hello { version }) if version == shared::PROTO_V1 => {}
+        Ok(ConsumerMsg::Hello { version }) if version == shared::PROTO_VERSION => {}
         Ok(ConsumerMsg::Hello { version }) => {
             // Unsupported version: answer with OUR version so the consumer can raise an
             // actionable mismatch error, then close.
             let _ = write_helper_msg(
                 &stream,
                 &HelperMsg::HelloAck {
-                    version: shared::PROTO_V1,
+                    version: shared::PROTO_VERSION,
                     engine: engine::engine_id(),
                 },
             );
@@ -231,7 +465,7 @@ fn main() -> ExitCode {
                 COMPONENT,
                 &format!(
                     "protocol version mismatch: consumer v{version}, helper v{} — closing",
-                    shared::PROTO_V1
+                    shared::PROTO_VERSION
                 ),
             );
             return ExitCode::from(2);
@@ -254,7 +488,7 @@ fn main() -> ExitCode {
     if write_helper_msg(
         &stream,
         &HelperMsg::HelloAck {
-            version: shared::PROTO_V1,
+            version: shared::PROTO_VERSION,
             engine: engine::engine_id(),
         },
     )

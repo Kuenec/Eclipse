@@ -47,8 +47,10 @@
 //! `web_view_native_load_url` / `web_view_native_load_data_with_base_url`) are
 //! spawn-and-forward per this contract, keyed by the existing `view_registry` widget handle
 //! ("integrates, never duplicates" — the protocol's `view` field IS that jlong), the
-//! `eclipse-webview-io` socket-reader thread fires `WebView.internalLoadChanged(0/3)` as JNI
-//! upcalls, and staged helper frames composite at the cached `view_registry` frame rect through
+//! `eclipse-webview-io` socket-reader thread stages frames and hands
+//! `WebView.internalLoadChanged(0/3)` to the dedicated `eclipse-webview-upcall` thread as JNI
+//! upcalls (2026-07-09/10: the reader itself is JNI-free — see [`client`]'s module docs), and
+//! staged helper frames composite at the cached `view_registry` frame rect through
 //! the vk-overlay present seam. `client` is MAIN-PROCESS-ONLY and deliberately NOT part of the
 //! helper crate's `#[path]` sibling set (`crates/eclipse-webview/src/shared.rs` includes only
 //! the five protocol leaf modules below).
@@ -60,6 +62,11 @@ pub mod redact;
 pub mod shm;
 pub mod slots;
 
-/// Wire-protocol version 1 (the `Hello`/`HelloAck` version field). v1 is FROZEN by the M2
-/// round-trip pins in [`proto`]; any message-set or framing change bumps this.
-pub const PROTO_V1: u16 = 1;
+/// Wire-protocol version (the `Hello`/`HelloAck` version field, the exact-match negotiation
+/// channel). 2026-07-09 (plan M4): bumped 1 → 2 for the ADDITIVE v2 extension (JS bridge /
+/// cookie-with-result / eval-with-result). The v1 MESSAGE LAYOUTS in [`proto`] stay byte-identical
+/// (FROZEN by `proto_roundtrip_encodes_and_decodes_every_v1_message`); only this negotiation
+/// integer changes, so a stale v1 peer fails the exact-match handshake loudly-and-honestly rather
+/// than mis-decoding a v2 frame (an old helper answers `HelloAck{version:1}`, the consumer's
+/// `hello_ack_version_supported` rejects it → the honest one-shot WARN no-op).
+pub const PROTO_VERSION: u16 = 2;

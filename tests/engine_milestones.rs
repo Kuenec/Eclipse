@@ -226,15 +226,31 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
     );
     // Display marker (main.rs::WebViewTestReport): "WebView engine pipeline OK:
     // internalLoadChanged upcalls 2/2 (state 0 @ Xms, state 3 @ Yms, http Z), frame WxH N
-    // distinct pixels, ViewClosed, helper exit 0". "upcalls 2/2" is load-bearing — it counts
-    // SUCCESSFUL Java dispatches of the previously-dead internalLoadChanged seam.
+    // distinct pixels, bridge round-trip OK, evaluateJavascript OK, honest UA OK, cookie set/get
+    // OK, cookie callback OK, ViewClosed, helper exit 0, bound=5". "upcalls 2/2" is load-bearing
+    // (SUCCESSFUL Java dispatches of the internalLoadChanged seam); the M4 substrings prove the JS
+    // bridge round-trip, evaluateJavascript result routing, the honest UA, and cookie set/get + the
+    // real (non-fabricated) 3-arg setCookie callback. The marker is payload-free by construction.
     assert!(
         text.contains("WebView engine pipeline OK:") && text.contains("upcalls 2/2"),
         "missing the WebView pipeline success marker (natives→socket→helper→upcall regression?).\n{text}"
     );
+    for needle in [
+        "bridge round-trip OK",
+        "evaluateJavascript OK",
+        "honest UA OK",
+        "cookie set/get OK",
+        "cookie callback OK",
+    ] {
+        assert!(
+            text.contains(needle),
+            "missing the M4 marker substring {needle:?} (bridge/eval/UA/cookie regression?).\n{text}"
+        );
+    }
     assert!(
-        text.contains("bound=3"),
-        "the WebView native registration count regressed (expected the live bound=3 line).\n{text}"
+        text.contains("bound=5"),
+        "the WebView native registration count regressed (expected the live bound=5 line — the M4 \
+         evaluateJavascript + addJavascriptInterface natives).\n{text}"
     );
 }
 

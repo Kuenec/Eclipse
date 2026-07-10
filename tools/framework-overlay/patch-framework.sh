@@ -97,6 +97,18 @@ kg_src="$here/src/android/app/KeyguardManager.java"
 [ -f "$kg_src" ] || fail "patched KeyguardManager.java missing at $kg_src"
 grep -qF 'public boolean isDeviceSecure()' "$kg_src" || fail "patched KeyguardManager.java no longer declares isDeviceSecure() — the NoSuchMethodError fix regressed"
 
+# --- 1f. guard the M4 JavascriptInterface annotation + the EclipseBridgeProbe test class -----
+# 2026-07-09 (web-engine plan M4): @JavascriptInterface must be a RUNTIME-retention annotation for
+# the reflective bridge filtering (framework.rs) + the real app's bridge methods to resolve; the
+# EclipseBridgeProbe is the inert __webview-test probe (@JavascriptInterface echo + ValueCallback).
+ji_src="$here/src/android/webkit/JavascriptInterface.java"
+[ -f "$ji_src" ] || fail "M4 JavascriptInterface.java missing at $ji_src"
+grep -qF 'public @interface JavascriptInterface' "$ji_src" || fail "JavascriptInterface.java is not an @interface — the M4 bridge annotation regressed"
+grep -qF 'RetentionPolicy.RUNTIME' "$ji_src" || fail "JavascriptInterface.java is not RUNTIME-retention — reflection filtering would fail"
+bp_src="$here/src/android/webkit/EclipseBridgeProbe.java"
+[ -f "$bp_src" ] || fail "M4 EclipseBridgeProbe.java missing at $bp_src"
+grep -qF '@JavascriptInterface' "$bp_src" || fail "EclipseBridgeProbe.java lost its @JavascriptInterface echo — __webview-test bridge leg regressed"
+
 # --- 1e. compile against the VENDORED com.android.internal.R (javac constant-inlining guard) --
 # 2026-07-02: javac inlines `static final int` constants from compile inputs into the emitted
 # bytecode. A hand-written stub R.java with placeholder values (attr.id = 0, attr.theme = 0)
@@ -125,11 +137,13 @@ grep -qF 'public static final int theme=0x01010000;' "$r_src" || fail "vendored 
     "$here/src/android/os/PowerManager.java" \
     "$here/src/android/view/LayoutInflater.java" \
     "$here/src/android/webkit/ValueCallback.java" \
+    "$here/src/android/webkit/JavascriptInterface.java" \
+    "$here/src/android/webkit/EclipseBridgeProbe.java" \
     "$here/src/android/app/KeyguardManager.java" \
     "$r_src"
 
 # --- 3. stage ONLY the patched classes (stubs must never reach the dex) ------------------
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class' 'android/app/KeyguardManager*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/app/KeyguardManager*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     cp "$work/classes/"$pattern "$work/stage/$dir/"
@@ -275,17 +289,91 @@ grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali cancel
 perl -0pi -e 's{(\.method public cancel\(\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-07-01: AOSP AutofillManager.requestAutofill(View) no-op (Roblox RbxKeyboard.i() requests autofill for a focused login field; ATL omits it). No autofill service -> no-op.\n.method public requestAutofill(Landroid/view/View;)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$afm"
 grep -qF 'requestAutofill(Landroid/view/View;)V' "$afm" || fail "AutofillManager.smali requestAutofill insert failed (drift?)"
 
-# CookieManager.setCookie(url, value, ValueCallback<Boolean>) — AOSP API 21; Roblox's CookieProtocol sets
-# login cookies through it; ATL ships only the 2-arg setCookie. Delegate to the 2-arg, then report success
-# to the callback (ValueCallback is now an interface — see the javac ValueCallback patch). Anchor on the
-# unique 2-arg setCookie.
+# === CookieManager real backing (web-engine plan M4, 2026-07-09) =========================
+# Roblox's CookieProtocol/.ROBLOSECURITY handoff needs a REAL cookie store. Replace the stock
+# no-op bodies (getCookie->"" / setCookie->void / removeAll->void / flush->void) with native calls
+# into the session-scoped helper cookie store, add the 3-arg setCookie (real callback, replacing
+# the 2026-06-14 fabricated Boolean.TRUE), and declare the six natives. Each body rewrite is a
+# whole-method perl replace guarded by a not-already-patched check + a post-insert grep back-check.
 csm="$work/smali/android/webkit/CookieManager.smali"
 [ -f "$csm" ] || fail "CookieManager.smali not found after baksmali"
-n="$(grep -cF '.method public setCookie(Ljava/lang/String;Ljava/lang/String;)V' "$csm")" || true
-[ "$n" = "1" ] || fail "CookieManager.smali setCookie(String,String) anchor not unique (found $n, expected 1) — installed CookieManager drifted; update patch-framework.sh"
-! grep -qF 'setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V' "$csm" || fail "CookieManager.smali already declares the 3-arg setCookie — drifted; update patch-framework.sh"
-perl -0pi -e 's{(\.method public setCookie\(Ljava/lang/String;Ljava/lang/String;\)V.*?\.end method\n)}{$1\n# ECLIPSE PATCH 2026-06-14: AOSP CookieManager.setCookie(url, value, ValueCallback<Boolean>) (API 21); ATL omits it. Delegate to the 2-arg setCookie, then report success to the callback.\n.method public setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V\n    .locals 1\n\n    invoke-virtual {p0, p1, p2}, Landroid/webkit/CookieManager;->setCookie(Ljava/lang/String;Ljava/lang/String;)V\n\n    if-eqz p3, :cond_eclipse_setcookie_done\n\n    sget-object v0, Ljava/lang/Boolean;->TRUE:Ljava/lang/Boolean;\n\n    invoke-interface {p3, v0}, Landroid/webkit/ValueCallback;->onReceiveValue(Ljava/lang/Object;)V\n\n    :cond_eclipse_setcookie_done\n    return-void\n.end method\n}s' "$csm"
-grep -qF 'setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V' "$csm" || fail "CookieManager.smali setCookie(3-arg) insert failed (drift?)"
+! grep -qF 'native_getCookie' "$csm" || fail "CookieManager.smali already carries native_getCookie — drifted; update patch-framework.sh"
+# getCookie(url) -> return native_getCookie(url)
+perl -0pi -e 's{\.method public getCookie\(Ljava/lang/String;\)Ljava/lang/String;.*?\.end method\n}{.method public getCookie(Ljava/lang/String;)Ljava/lang/String;\n    .registers 3\n\n    invoke-direct {p0, p1}, Landroid/webkit/CookieManager;->native_getCookie(Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v0\n\n    return-object v0\n.end method\n}s' "$csm"
+grep -qF -- '->native_getCookie(Ljava/lang/String;)Ljava/lang/String;' "$csm" || fail "CookieManager getCookie native-body insert failed (drift?)"
+# setCookie(url, value) -> native_setCookie(url, value)  (then INSERT the 3-arg variant after it)
+perl -0pi -e 's{\.method public setCookie\(Ljava/lang/String;Ljava/lang/String;\)V.*?\.end method\n}{.method public setCookie(Ljava/lang/String;Ljava/lang/String;)V\n    .registers 3\n\n    invoke-direct {p0, p1, p2}, Landroid/webkit/CookieManager;->native_setCookie(Ljava/lang/String;Ljava/lang/String;)V\n\n    return-void\n.end method\n\n# ECLIPSE PATCH 2026-07-09 (M4): 3-arg setCookie(url, value, ValueCallback<Boolean>) — the REAL success flag routes back through the native, never a fabricated Boolean.TRUE.\n.method public setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V\n    .registers 4\n\n    invoke-direct {p0, p1, p2, p3}, Landroid/webkit/CookieManager;->native_setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V\n\n    return-void\n.end method\n}s' "$csm"
+grep -qF -- '->native_setCookie(Ljava/lang/String;Ljava/lang/String;)V' "$csm" || fail "CookieManager setCookie(2-arg) native-body insert failed (drift?)"
+grep -qF 'setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V' "$csm" || fail "CookieManager setCookie(3-arg) insert failed (drift?)"
+# removeAllCookies(cb) -> native_removeAllCookies(cb)
+perl -0pi -e 's{\.method public removeAllCookies\(Landroid/webkit/ValueCallback;\)V.*?\.end method\n}{.method public removeAllCookies(Landroid/webkit/ValueCallback;)V\n    .registers 2\n\n    invoke-direct {p0, p1}, Landroid/webkit/CookieManager;->native_removeAllCookies(Landroid/webkit/ValueCallback;)V\n\n    return-void\n.end method\n}s' "$csm"
+grep -qF -- '->native_removeAllCookies(Landroid/webkit/ValueCallback;)V' "$csm" || fail "CookieManager removeAllCookies native-body insert failed (drift?)"
+# removeSessionCookies(cb) -> native_removeSessionCookies(cb)
+perl -0pi -e 's{\.method public removeSessionCookies\(Landroid/webkit/ValueCallback;\)V.*?\.end method\n}{.method public removeSessionCookies(Landroid/webkit/ValueCallback;)V\n    .registers 2\n\n    invoke-direct {p0, p1}, Landroid/webkit/CookieManager;->native_removeSessionCookies(Landroid/webkit/ValueCallback;)V\n\n    return-void\n.end method\n}s' "$csm"
+grep -qF -- '->native_removeSessionCookies(Landroid/webkit/ValueCallback;)V' "$csm" || fail "CookieManager removeSessionCookies native-body insert failed (drift?)"
+# flush() -> native_flush()
+perl -0pi -e 's{\.method public flush\(\)V.*?\.end method\n}{.method public flush()V\n    .registers 1\n\n    invoke-direct {p0}, Landroid/webkit/CookieManager;->native_flush()V\n\n    return-void\n.end method\n}s' "$csm"
+grep -qF -- '->native_flush()V' "$csm" || fail "CookieManager flush native-body insert failed (drift?)"
+# Declare the six natives (appended; a native decl has no body — order is irrelevant in smali).
+cat >> "$csm" <<'ECLIPSE_CM_NATIVES'
+
+# ECLIPSE PATCH 2026-07-09 (M4): CookieManager natives (backed by Eclipse's session-scoped helper store).
+.method private native native_getCookie(Ljava/lang/String;)Ljava/lang/String;
+.end method
+
+.method private native native_setCookie(Ljava/lang/String;Ljava/lang/String;)V
+.end method
+
+.method private native native_setCookie(Ljava/lang/String;Ljava/lang/String;Landroid/webkit/ValueCallback;)V
+.end method
+
+.method private native native_removeAllCookies(Landroid/webkit/ValueCallback;)V
+.end method
+
+.method private native native_removeSessionCookies(Landroid/webkit/ValueCallback;)V
+.end method
+
+.method private native native_flush()V
+.end method
+ECLIPSE_CM_NATIVES
+
+# === WebView + WebSettings shadow (web-engine plan M4, 2026-07-09) ========================
+# WebView is stock in classes3; shadow it (+ WebSettings) into classes2.dex with: loadUrl's
+# javascript: branch routed to native_evaluateJavascript (removing the full-URL System.out.println
+# leak); evaluateJavascript + addJavascriptInterface backed by their natives; and WebSettings'
+# honest deliberate UA replacing "GDPR VIOLATION" (a method-return literal, no javac inlining).
+wvsm="$work/smali/android/webkit/WebView.smali"
+wssm="$work/smali/android/webkit/WebSettings.smali"
+[ -f "$wvsm" ] || fail "WebView.smali not found after baksmali"
+[ -f "$wssm" ] || fail "WebSettings.smali not found after baksmali"
+! grep -qF 'native_evaluateJavascript' "$wvsm" || fail "WebView.smali already carries native_evaluateJavascript — drifted; update patch-framework.sh"
+# loadUrl(String): route javascript: URLs to native_evaluateJavascript(widget, script, null) — no full-URL println.
+grep -qF 'const-string v2, " - not implemented yet"' "$wvsm" || fail "WebView.smali loadUrl no longer carries the javascript: println (installed shape drifted; update patch-framework.sh)"
+perl -0pi -e 's{\.method public loadUrl\(Ljava/lang/String;\)V.*?\.end method\n}{.method public loadUrl(Ljava/lang/String;)V\n    .registers 7\n\n    const-string v0, "javascript:"\n\n    invoke-virtual {p1, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z\n\n    move-result v0\n\n    iget-wide v1, p0, Landroid/view/View;->widget:J\n\n    if-eqz v0, :cond_eclipse_loadurl_normal\n\n    # ECLIPSE PATCH 2026-07-09 (M4): route the javascript: script to the engine (NO full-URL println leak).\n    const/16 v3, 0xb\n\n    invoke-virtual {p1, v3}, Ljava/lang/String;->substring(I)Ljava/lang/String;\n\n    move-result-object v3\n\n    const/4 v4, 0x0\n\n    invoke-direct {p0, v1, v2, v3, v4}, Landroid/webkit/WebView;->native_evaluateJavascript(JLjava/lang/String;Landroid/webkit/ValueCallback;)V\n\n    return-void\n\n    :cond_eclipse_loadurl_normal\n    invoke-direct {p0, v1, v2, p1}, Landroid/webkit/WebView;->native_loadUrl(JLjava/lang/String;)V\n\n    return-void\n.end method\n}s' "$wvsm"
+grep -qF -- '->native_evaluateJavascript(JLjava/lang/String;Landroid/webkit/ValueCallback;)V' "$wvsm" || fail "WebView loadUrl javascript:-route insert failed (drift?)"
+! grep -qF 'const-string v2, " - not implemented yet"' "$wvsm" || fail "WebView loadUrl still carries the full-URL println (leak-fix regressed)"
+# evaluateJavascript(String, ValueCallback) -> native_evaluateJavascript(widget, script, cb)
+perl -0pi -e 's{\.method public evaluateJavascript\(Ljava/lang/String;Landroid/webkit/ValueCallback;\)V.*?\.end method\n}{.method public evaluateJavascript(Ljava/lang/String;Landroid/webkit/ValueCallback;)V\n    .registers 5\n\n    iget-wide v0, p0, Landroid/view/View;->widget:J\n\n    invoke-direct {p0, v0, v1, p1, p2}, Landroid/webkit/WebView;->native_evaluateJavascript(JLjava/lang/String;Landroid/webkit/ValueCallback;)V\n\n    return-void\n.end method\n}s' "$wvsm"
+# addJavascriptInterface(Object, String) -> native_addJavascriptInterface(widget, object, name)
+perl -0pi -e 's{\.method public addJavascriptInterface\(Ljava/lang/Object;Ljava/lang/String;\)V.*?\.end method\n}{.method public addJavascriptInterface(Ljava/lang/Object;Ljava/lang/String;)V\n    .registers 5\n\n    iget-wide v0, p0, Landroid/view/View;->widget:J\n\n    invoke-direct {p0, v0, v1, p1, p2}, Landroid/webkit/WebView;->native_addJavascriptInterface(JLjava/lang/Object;Ljava/lang/String;)V\n\n    return-void\n.end method\n}s' "$wvsm"
+grep -qF -- '->native_addJavascriptInterface(JLjava/lang/Object;Ljava/lang/String;)V' "$wvsm" || fail "WebView addJavascriptInterface native-body insert failed (drift?)"
+# Declare the two new WebView natives.
+cat >> "$wvsm" <<'ECLIPSE_WV_NATIVES'
+
+# ECLIPSE PATCH 2026-07-09 (M4): WebView JS-bridge / evaluateJavascript natives.
+.method private native native_evaluateJavascript(JLjava/lang/String;Landroid/webkit/ValueCallback;)V
+.end method
+
+.method private native native_addJavascriptInterface(JLjava/lang/Object;Ljava/lang/String;)V
+.end method
+ECLIPSE_WV_NATIVES
+# WebSettings: honest deliberate UA (getUserAgentString + getDefaultUserAgent) replacing "GDPR VIOLATION".
+grep -qF 'const-string v0, "GDPR VIOLATION"' "$wssm" || fail "WebSettings.smali no longer returns \"GDPR VIOLATION\" (installed shape drifted; update patch-framework.sh)"
+ECLIPSE_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6'
+ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public getUserAgentString\(\)Ljava/lang/String;.*?\.end method\n}{".method public getUserAgentString()Ljava/lang/String;\n    .registers 2\n\n    # ECLIPSE PATCH 2026-07-09 (M4): the honest deliberate UA (MUST byte-match engine.rs ECLIPSE_USER_AGENT).\n    const-string v0, \"$ua\"\n\n    return-object v0\n.end method\n"}se' "$wssm"
+ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public static getDefaultUserAgent\(Landroid/content/Context;\)Ljava/lang/String;.*?\.end method\n}{".method public static getDefaultUserAgent(Landroid/content/Context;)Ljava/lang/String;\n    .registers 2\n\n    const-string v0, \"$ua\"\n\n    return-object v0\n.end method\n"}se' "$wssm"
+grep -qF 'Eclipse-WebView/149.0.6' "$wssm" || fail "WebSettings honest-UA insert failed (drift?)"
+! grep -qF 'GDPR VIOLATION' "$wssm" || fail "WebSettings still returns \"GDPR VIOLATION\" (honest-UA fix incomplete)"
 
 # JobParameters.getNetwork() -> Network — AOSP API 28; Roblox queries it on a scheduled network job; ATL
 # omits it. Returns null (no Network bound — AOSP-valid; the caller handles null). Anchor on getExtras.
@@ -327,6 +415,8 @@ cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
+cp "$wvsm" "$work/smali-view/android/webkit/WebView.smali"
+cp "$wssm" "$work/smali-view/android/webkit/WebSettings.smali"
 cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
 cp "$psm" "$work/smali-view/android/graphics/Paint.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null

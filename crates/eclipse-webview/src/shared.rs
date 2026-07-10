@@ -4,10 +4,10 @@
 //! have exactly one implementation ("integrates, never duplicates").
 //!
 //! 2026-07-03 SIBLING-MODULE-SHAPE INVARIANT: the included files reference each other ONLY as
-//! siblings (`super::redact`, `super::proto`, `super::PROTO_V1`, …) and use std/libc only —
+//! siblings (`super::redact`, `super::proto`, `super::PROTO_VERSION`, …) and use std/libc only —
 //! never `crate::` paths — so they resolve identically under `crate::webview` in the root and
 //! under `crate::shared` here. This module must therefore declare the SAME sibling set as
-//! `src/webview/mod.rs` (including [`PROTO_V1`]). Their `#[cfg(test)]` units compile and run
+//! `src/webview/mod.rs` (including [`PROTO_VERSION`]). Their `#[cfg(test)]` units compile and run
 //! under BOTH crates' `cargo test` — same code, two gates (deliberate parity insurance).
 //!
 //! 2026-07-03 (plan M3): the sibling-set invariant covers the FIVE protocol leaf files below
@@ -25,6 +25,7 @@ pub mod shm;
 #[path = "../../../src/webview/slots.rs"]
 pub mod slots;
 
-/// Wire-protocol version 1 — MUST mirror `src/webview/mod.rs::PROTO_V1` (the sibling-shape
-/// invariant above; `proto.rs` resolves it as `super::PROTO_V1` in both crates).
-pub const PROTO_V1: u16 = 1;
+/// Wire-protocol version — MUST mirror `src/webview/mod.rs::PROTO_VERSION` (the sibling-shape
+/// invariant above; `proto.rs` resolves it as `super::PROTO_VERSION` in both crates).
+/// 2026-07-09 (plan M4): 2 for the additive v2 extension; kept in exact lockstep with the root.
+pub const PROTO_VERSION: u16 = 2;

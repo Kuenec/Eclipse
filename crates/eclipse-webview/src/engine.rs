@@ -10,16 +10,20 @@
 //! the engine state is uncontended discipline, not a hot lock.
 
 use crate::logging::{self, RedactedTarget};
-use crate::shared::proto::{Console, ConsumerMsg, CookieEntry, HelperMsg};
+use crate::shared::proto::{BridgeMethod, Console, ConsumerMsg, CookieEntry, HelperMsg};
 use crate::shared::shm;
 use crate::shared::slots::SlotTracker;
+use cef::wrapper::message_router::{
+    BrowserSideCallback, BrowserSideHandler, BrowserSideRouter, MessageRouterBrowserSide,
+    MessageRouterBrowserSideHandlerCallbacks, MessageRouterConfig,
+};
 use cef::{rc::Rc as _, sys, *};
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::raw::c_int;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -52,15 +56,40 @@ pub fn engine_id() -> String {
     format!("cef/{text}")
 }
 
+/// The honest, deliberately-identifying User-Agent (plan M4, 2026-07-09). It is GENUINELY
+/// Chromium 149 on Linux x86_64 (CEF runs on the host Linux — true), carries a deliberate
+/// `Eclipse-WebView/149.0.6` product token, and does NOT impersonate a specific Android device or
+/// build. It leaks only the standard reduced-Chrome Linux desktop platform token
+/// (`X11; Linux x86_64` — no username/hostname/kernel/GPU). `149.0.0.0` matches the bundled
+/// Chromium 149.0.7827.201 under Chromium's UA-reduction convention (minor components zeroed).
+/// This literal MUST byte-match the overlay `WebSettings.smali` `getUserAgentString()` return.
+/// (M6 open question #1: if an anti-bot vendor refuses this for a real human, the owner rules on
+/// presenting the app's genuine Android-WebView-context UA — faithful, since Eclipse runs the
+/// Android build. M4 ships the honest-identifying default.)
+pub const ECLIPSE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6";
+
 /// Pure settings policy (unit-tested): windowless OSR, external pump, sandbox ON
 /// (`no_sandbox=0`, never `--no-sandbox`), engine logging DISABLED (`log_severity=DISABLE`,
-/// no `log_file`) — the absolute redaction rule at the settings layer.
+/// no `log_file`) — the absolute redaction rule at the settings layer — plus the honest
+/// deliberate UA ([`ECLIPSE_USER_AGENT`]).
 pub fn build_settings() -> Settings {
     Settings {
         windowless_rendering_enabled: 1,
         external_message_pump: 1,
         no_sandbox: 0,
         log_severity: LogSeverity::DISABLE,
+        user_agent: CefString::from(ECLIPSE_USER_AGENT),
+        ..Default::default()
+    }
+}
+
+/// The session-scoped private `RequestContext` settings (plan M4): an EMPTY `cache_path` =
+/// in-memory/incognito store (NOT the global default), with `persist_session_cookies` off.
+/// Pure/unit-pinned.
+pub fn session_context_settings() -> RequestContextSettings {
+    RequestContextSettings {
+        cache_path: CefString::default(),
+        persist_session_cookies: 0,
         ..Default::default()
     }
 }
@@ -213,6 +242,22 @@ struct EngineState {
     closing_all: bool,
     exit_code: i32,
     close_deadline: Option<Instant>,
+    /// The ONE session-scoped private cookie store shared by every view + the CookieManager
+    /// (plan M4): an in-memory, incognito `RequestContext` created lazily at the first view/cookie
+    /// op. NOT the global default — the `.ROBLOSECURITY` handoff must land in the store the
+    /// challenge WebView reads.
+    request_context: Option<RequestContext>,
+    /// `browser.identifier()` → view handle, built at `create_view` (the bridge router maps a
+    /// query's browser back to its view).
+    browser_view: HashMap<i32, i64>,
+    /// In-flight bridge calls: helper-allocated `call_id` → the router callback that resolves the
+    /// page's Promise when the `BridgeResult` arrives (plan M4).
+    pending_bridge_calls: HashMap<u32, Arc<Mutex<dyn BrowserSideCallback>>>,
+    /// The stored `@JavascriptInterface` inventory per view (interface → methods), re-sent to the
+    /// renderer whenever it signals a new main-frame context via `"eclipse.bridge.ready"` — a PULL
+    /// model, because a process message sent before the renderer is connected is dropped, and each
+    /// navigation is a fresh context (plan M4).
+    view_bridges: HashMap<i64, HashMap<String, Vec<BridgeMethod>>>,
 }
 
 type Shared = Arc<Mutex<EngineState>>;
@@ -230,20 +275,51 @@ fn lock(state: &Shared) -> std::sync::MutexGuard<'_, EngineState> {
 pub struct Engine {
     state: Shared,
     out: Outbox,
+    /// The browser-side query router (`cefQuery`), created once (plan M4). The per-view handlers
+    /// forward its lifecycle callbacks; `Client::on_process_message_received` forwards replies.
+    router: Arc<BrowserSideRouter>,
 }
 
 impl Engine {
     pub fn new(out: Outbox) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(EngineState {
-                views: HashMap::new(),
-                pending_cookies: Vec::new(),
-                closing_all: false,
-                exit_code: 0,
-                close_deadline: None,
-            })),
-            out,
+        let state: Shared = Arc::new(Mutex::new(EngineState {
+            views: HashMap::new(),
+            pending_cookies: Vec::new(),
+            closing_all: false,
+            exit_code: 0,
+            close_deadline: None,
+            request_context: None,
+            browser_view: HashMap::new(),
+            pending_bridge_calls: HashMap::new(),
+            view_bridges: HashMap::new(),
+        }));
+        // The browser-side router + its single bridge handler (added on the UI thread == here).
+        let router = BrowserSideRouter::new(MessageRouterConfig::default());
+        let handler: Arc<dyn BrowserSideHandler> = Arc::new(BridgeHandler {
+            state: state.clone(),
+            out: out.clone(),
+            next_call_id: AtomicU32::new(1),
+        });
+        router.add_handler(handler, false);
+        Self { state, out, router }
+    }
+
+    /// The ONE session-scoped in-memory cookie store, created lazily (empty `cache_path` = a
+    /// private incognito store, NOT the global default). Shared by every browser + every cookie op.
+    fn request_context(&self) -> Option<RequestContext> {
+        let mut st = lock(&self.state);
+        if st.request_context.is_none() {
+            st.request_context =
+                request_context_create_context(Some(&session_context_settings()), None);
         }
+        st.request_context.clone()
+    }
+
+    /// The session store's cookie manager (plan M4): every cookie op routes here, NOT the global
+    /// manager, so CookieManager and the WebViews share one coherent jar.
+    fn session_cookie_manager(&self) -> Option<CookieManager> {
+        self.request_context()
+            .and_then(|rc| rc.cookie_manager(None))
     }
 
     pub fn outbox_dead(&self) -> bool {
@@ -351,7 +427,8 @@ impl Engine {
                 let browser = self.browser_of(view);
                 match browser.as_ref().and_then(|b| b.main_frame()) {
                     Some(frame) => {
-                        // Fire-and-forget in v1 (result routing is M4's message-router work).
+                        // The fire-and-forget eval (the v2 EvaluateJsForResult carries the
+                        // result path — plan M4, 2026-07-09).
                         frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
                     }
                     None => logging::warn(
@@ -403,6 +480,163 @@ impl Engine {
                 logging::info(COMPONENT, "shutdown requested by the consumer");
                 self.begin_shutdown(0);
             }
+            // --- v2 (plan M4) ---
+            ConsumerMsg::BridgeRegister {
+                view,
+                name,
+                methods,
+            } => self.bridge_register(view, &name, &methods),
+            ConsumerMsg::BridgeResult {
+                call_id,
+                ok,
+                result_json,
+            } => self.bridge_result(call_id, ok, &result_json),
+            ConsumerMsg::EvaluateJsForResult {
+                view,
+                request_id,
+                script,
+            } => self.evaluate_js_for_result(view, request_id, &script),
+            ConsumerMsg::CookieSetForResult {
+                request_id,
+                url,
+                name,
+                value,
+                domain,
+                path,
+                secure,
+                http_only,
+                expires_epoch_s,
+            } => self.cookie_set_for_result(
+                request_id,
+                &url,
+                &name,
+                &value,
+                &domain,
+                &path,
+                secure,
+                http_only,
+                expires_epoch_s,
+            ),
+        }
+    }
+
+    /// Store a bridge inventory for `view` (re-sent to the renderer on each `"eclipse.bridge.ready"`
+    /// signal — the PULL model) and best-effort forward it now. Payload-free logging.
+    fn bridge_register(&self, view: i64, name: &str, methods: &[BridgeMethod]) {
+        {
+            let mut st = lock(&self.state);
+            st.view_bridges
+                .entry(view)
+                .or_default()
+                .insert(name.to_string(), methods.to_vec());
+        }
+        // Best-effort immediate send (the renderer may not be connected yet — the ready-pull re-sends).
+        if let Some(frame) = self.browser_of(view).and_then(|b| b.main_frame()) {
+            send_bridge_register_message(&frame, name, methods);
+        }
+        logging::info(
+            COMPONENT,
+            &format!(
+                "bridge_register view={view} methods={} (names not logged)",
+                methods.len()
+            ),
+        );
+    }
+
+    /// Resolve a page bridge Promise: hand the JSON result to the retained router callback.
+    fn bridge_result(&self, call_id: u32, ok: bool, result_json: &str) {
+        let cb = lock(&self.state).pending_bridge_calls.remove(&call_id);
+        let Some(cb) = cb else {
+            logging::warn(
+                COMPONENT,
+                &format!("bridge_result call_id={call_id}: no pending call (dropped)"),
+            );
+            return;
+        };
+        // The result JSON is OPAQUE here — never parsed, never logged (only call_id + len).
+        if let Ok(guard) = cb.lock() {
+            if ok {
+                guard.success_str(result_json);
+            } else {
+                guard.failure(-1, result_json);
+            }
+        }
+        logging::info(
+            COMPONENT,
+            &format!(
+                "bridge_result call_id={call_id} ok={ok} len={}",
+                result_json.len()
+            ),
+        );
+    }
+
+    /// Forward an evaluateJavascript request to the view's renderer as `"eclipse.eval"`; if there
+    /// is no live browser/frame, answer an honest failure immediately.
+    fn evaluate_js_for_result(&self, view: i64, request_id: u32, script: &str) {
+        match self.browser_of(view).and_then(|b| b.main_frame()) {
+            Some(frame) => {
+                if let Some(mut msg) =
+                    process_message_create(Some(&CefString::from("eclipse.eval")))
+                {
+                    if let Some(args) = msg.argument_list() {
+                        args.set_size(2);
+                        args.set_int(0, request_id as i32);
+                        args.set_string(1, Some(&CefString::from(script)));
+                    }
+                    frame.send_process_message(ProcessId::RENDERER, Some(&mut msg));
+                }
+            }
+            None => self.out.send(HelperMsg::EvaluateJsResult {
+                request_id,
+                ok: false,
+                value_json: "null".to_string(),
+            }),
+        }
+    }
+
+    /// 3-arg setCookie with a real completion (plan M4): set through the SESSION store and answer a
+    /// `CookieSetResult` carrying the real success flag (never fabricated).
+    #[allow(clippy::too_many_arguments)] // 2026-07-09: mirrors the CookieSetForResult fields.
+    fn cookie_set_for_result(
+        &self,
+        request_id: u32,
+        url: &str,
+        name: &str,
+        value: &str,
+        domain: &str,
+        path: &str,
+        secure: bool,
+        http_only: bool,
+        expires_epoch_s: i64,
+    ) {
+        let Some(manager) = self.session_cookie_manager() else {
+            self.out.send(HelperMsg::CookieSetResult {
+                request_id,
+                ok: false,
+            });
+            return;
+        };
+        let expires = Basetime {
+            val: (expires_epoch_s + 11_644_473_600) * 1_000_000,
+        };
+        let cookie = Cookie {
+            name: CefString::from(name),
+            value: CefString::from(value),
+            domain: CefString::from(domain),
+            path: CefString::from(path),
+            secure: c_int::from(secure),
+            httponly: c_int::from(http_only),
+            has_expires: c_int::from(expires_epoch_s != 0),
+            expires,
+            ..Default::default()
+        };
+        let url = CefString::from(url);
+        let mut callback = SetCookieResultCallback::new(request_id, self.out.clone());
+        if manager.set_cookie(Some(&url), Some(&cookie), Some(&mut callback)) != 1 {
+            self.out.send(HelperMsg::CookieSetResult {
+                request_id,
+                ok: false,
+            });
         }
     }
 
@@ -577,13 +811,24 @@ impl Engine {
             memfd,
         );
 
-        // 2. The windowless browser, with this view's own handler set.
+        // 2. The windowless browser, with this view's own handler set (the router is threaded into
+        //    the life-span/request/client handlers so it can cancel pending queries + route replies).
         let mut client = HelperClient::new(
             HelperLoadHandler::new(view, self.state.clone(), self.out.clone()),
-            HelperLifeSpanHandler::new(view, self.state.clone(), self.out.clone()),
+            HelperLifeSpanHandler::new(
+                view,
+                self.state.clone(),
+                self.out.clone(),
+                self.router.clone(),
+            ),
             HelperRenderHandler::new(view, self.state.clone(), self.out.clone()),
             HelperDisplayHandler::new(view, self.out.clone()),
-            HelperRequestHandler::new(view, self.out.clone(), pending_data),
+            HelperRequestHandler::new(view, self.out.clone(), pending_data, self.router.clone()),
+            ClientDeps {
+                out: self.out.clone(),
+                router: self.router.clone(),
+                state: self.state.clone(),
+            },
         );
         let window_info = WindowInfo {
             windowless_rendering_enabled: 1,
@@ -594,17 +839,21 @@ impl Engine {
             ..Default::default()
         };
         let url = CefString::from("about:blank");
+        // The ONE session-scoped store (plan M4) — every view shares it, so the cookie handoff is
+        // coherent. Created lazily here (or at the first cookie op) and memoized.
+        let mut request_context = self.request_context();
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
             Some(&url),
             Some(&browser_settings),
             None,
-            None,
+            request_context.as_mut(),
         );
         let mut st = lock(&self.state);
         match browser {
             Some(b) => {
+                st.browser_view.insert(b.identifier(), view);
                 if let Some(v) = st.views.get_mut(&view) {
                     v.browser = Some(b);
                 }
@@ -779,8 +1028,8 @@ impl Engine {
         http_only: bool,
         expires_epoch_s: i64,
     ) {
-        let Some(manager) = cookie_manager_get_global_manager(None) else {
-            logging::error(COMPONENT, "cookie_set: no global cookie manager");
+        let Some(manager) = self.session_cookie_manager() else {
+            logging::error(COMPONENT, "cookie_set: no session cookie manager");
             return;
         };
         // CEF Basetime = microseconds since 1601-01-01; Unix epoch offset 11644473600 s.
@@ -805,8 +1054,8 @@ impl Engine {
     }
 
     fn cookie_get(&self, request_id: u32, url: &str) {
-        let Some(manager) = cookie_manager_get_global_manager(None) else {
-            logging::error(COMPONENT, "cookie_get: no global cookie manager");
+        let Some(manager) = self.session_cookie_manager() else {
+            logging::error(COMPONENT, "cookie_get: no session cookie manager");
             self.out.send(HelperMsg::CookieList {
                 request_id,
                 cookies: Vec::new(),
@@ -832,8 +1081,8 @@ impl Engine {
     }
 
     fn cookies_clear(&self, request_id: u32) {
-        let Some(manager) = cookie_manager_get_global_manager(None) else {
-            logging::error(COMPONENT, "cookies_clear: no global cookie manager");
+        let Some(manager) = self.session_cookie_manager() else {
+            logging::error(COMPONENT, "cookies_clear: no session cookie manager");
             self.out.send(HelperMsg::CookieList {
                 request_id,
                 cookies: Vec::new(),
@@ -978,12 +1227,14 @@ wrap_life_span_handler! {
         view: i64,
         state: Shared,
         out: Outbox,
+        router: Arc<BrowserSideRouter>,
     }
 
     impl LifeSpanHandler {
-        fn on_before_close(&self, _browser: Option<&mut Browser>) {
-            // The browser is gone: drop the view state (its memfd write handle with it) and
-            // complete the CloseView/Shutdown contract.
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            // Cancel any pending bridge queries for this browser (the router contract), THEN drop
+            // the view state (its memfd write handle with it) and complete CloseView/Shutdown.
+            self.router.on_before_close(browser.map(|b| b.clone()));
             lock(&self.state).views.remove(&self.view);
             self.out.send(HelperMsg::ViewClosed { view: self.view });
             logging::info(COMPONENT, &format!("view={} closed", self.view));
@@ -1125,16 +1376,33 @@ wrap_request_handler! {
         view: i64,
         out: Outbox,
         pending_data: Arc<Mutex<Option<PendingData>>>,
+        router: Arc<BrowserSideRouter>,
     }
 
     impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            _is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // Cancel pending queries on a main-frame navigation (the router contract); allow the
+            // navigation (return 0).
+            self.router
+                .on_before_browse(browser.map(|b| b.clone()), frame.map(|f| f.clone()));
+            0
+        }
+
         fn on_render_process_terminated(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _status: TerminationStatus,
             error_code: ::std::os::raw::c_int,
             _error_string: Option<&CefString>,
         ) {
+            self.router.on_render_process_terminated(browser.map(|b| b.clone()));
             logging::error(
                 COMPONENT,
                 &format!("view={}: renderer process terminated code={error_code}", self.view),
@@ -1264,6 +1532,15 @@ wrap_delete_cookies_callback! {
     }
 }
 
+/// The browser-process dependencies `HelperClient::on_process_message_received` needs (bundled so
+/// the macro-generated `new` stays within the arg-count lint). 2026-07-09 (plan M4).
+#[derive(Clone)]
+struct ClientDeps {
+    out: Outbox,
+    router: Arc<BrowserSideRouter>,
+    state: Shared,
+}
+
 wrap_client! {
     struct HelperClient {
         load_handler: LoadHandler,
@@ -1271,6 +1548,7 @@ wrap_client! {
         render_handler: RenderHandler,
         display_handler: DisplayHandler,
         request_handler: RequestHandler,
+        deps: ClientDeps,
     }
 
     impl Client {
@@ -1292,6 +1570,141 @@ wrap_client! {
 
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request_handler.clone())
+        }
+
+        fn on_process_message_received(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            // The renderer's messages (plan M4): eval results + the bridge-ready inventory pull.
+            if let Some(msg) = message.as_ref() {
+                let name = CefString::from(&msg.name()).to_string();
+                if name == "eclipse.eval.result" {
+                    if let Some(args) = msg.argument_list() {
+                        let request_id = args.int(0) as u32;
+                        let ok = args.bool(1) != 0;
+                        let value_json = CefString::from(&args.string(2)).to_string();
+                        self.deps.out.send(HelperMsg::EvaluateJsResult {
+                            request_id,
+                            ok,
+                            value_json,
+                        });
+                    }
+                    return 1;
+                }
+                if name == "eclipse.bridge.ready" {
+                    // The renderer created a new main-frame context and is asking for the bridge
+                    // inventory (the pull model — a pre-connection send would have been dropped).
+                    if let (Some(browser), Some(frame)) = (browser.as_ref(), frame.as_ref()) {
+                        let view = lock(&self.deps.state)
+                            .browser_view
+                            .get(&browser.identifier())
+                            .copied();
+                        if let Some(view) = view {
+                            let bridges: Vec<(String, Vec<BridgeMethod>)> = lock(&self.deps.state)
+                                .view_bridges
+                                .get(&view)
+                                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                                .unwrap_or_default();
+                            for (name, methods) in bridges {
+                                send_bridge_register_message(frame, &name, &methods);
+                            }
+                        }
+                    }
+                    return 1;
+                }
+            }
+            // Otherwise let the browser-side router handle cefQuery replies.
+            if self.deps.router.on_process_message_received(
+                browser.map(|b| b.clone()),
+                frame.map(|f| f.clone()),
+                source_process,
+                message.map(|m| m.clone()),
+            ) {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Send one `"eclipse.bridge.register"` process message (name + method names) to `frame`'s renderer.
+fn send_bridge_register_message(frame: &Frame, name: &str, methods: &[BridgeMethod]) {
+    let Some(mut msg) = process_message_create(Some(&CefString::from("eclipse.bridge.register")))
+    else {
+        return;
+    };
+    if let Some(args) = msg.argument_list() {
+        args.set_size(1 + methods.len());
+        args.set_string(0, Some(&CefString::from(name)));
+        for (i, m) in methods.iter().enumerate() {
+            args.set_string(1 + i, Some(&CefString::from(m.name.as_str())));
+        }
+    }
+    frame.send_process_message(ProcessId::RENDERER, Some(&mut msg));
+}
+
+// --- The browser-side bridge query handler (cefQuery → BridgeCall → BridgeResult) ----------------
+
+/// Handles `window.cefQuery` requests: map the browser to its view, allocate a helper `call_id`,
+/// retain the async router callback, and forward a `BridgeCall` to the consumer (ART reflect-
+/// invokes the `@JavascriptInterface` method and answers a `BridgeResult`). The request is
+/// page-controlled JSON, forwarded WITHOUT parsing and NEVER logged.
+struct BridgeHandler {
+    state: Shared,
+    out: Outbox,
+    next_call_id: AtomicU32,
+}
+
+impl BrowserSideHandler for BridgeHandler {
+    fn on_query_str(
+        &self,
+        browser: Option<Browser>,
+        _frame: Option<Frame>,
+        _query_id: i64,
+        request: &str,
+        _persistent: bool,
+        callback: Arc<Mutex<dyn BrowserSideCallback>>,
+    ) -> bool {
+        let view = match browser
+            .as_ref()
+            .and_then(|b| lock(&self.state).browser_view.get(&b.identifier()).copied())
+        {
+            Some(v) => v,
+            None => return false, // unknown browser: not ours to handle
+        };
+        let mut call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        if call_id == 0 {
+            call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        }
+        lock(&self.state)
+            .pending_bridge_calls
+            .insert(call_id, callback);
+        self.out.send(HelperMsg::BridgeCall {
+            view,
+            call_id,
+            payload_json: request.to_string(),
+        });
+        true
+    }
+}
+
+wrap_set_cookie_callback! {
+    struct SetCookieResultCallback {
+        request_id: u32,
+        out: Outbox,
+    }
+
+    impl SetCookieCallback {
+        fn on_complete(&self, success: ::std::os::raw::c_int) {
+            self.out.send(HelperMsg::CookieSetResult {
+                request_id: self.request_id,
+                ok: success != 0,
+            });
         }
     }
 }
@@ -1352,6 +1765,35 @@ mod tests {
         // The strip list the browser process removes from any passed-through command line.
         assert!(FORBIDDEN_PASSTHROUGH_SWITCHES.contains(&"enable-logging"));
         assert!(FORBIDDEN_PASSTHROUGH_SWITCHES.contains(&"no-sandbox"));
+    }
+
+    #[test]
+    fn build_settings_sets_the_honest_eclipse_user_agent() {
+        // 2026-07-09 (plan M4): the honest deliberate UA is applied at the settings layer, is
+        // genuinely Chromium 149 on Linux desktop, carries the Eclipse product token, and is NOT
+        // the recorded "GDPR VIOLATION" placeholder. MUST byte-match the overlay WebSettings literal.
+        assert!(ECLIPSE_USER_AGENT.contains("Chrome/149"));
+        assert!(ECLIPSE_USER_AGENT.contains("Eclipse-WebView"));
+        assert!(ECLIPSE_USER_AGENT.contains("X11; Linux x86_64"));
+        assert!(!ECLIPSE_USER_AGENT.contains("GDPR VIOLATION"));
+        assert!(
+            !ECLIPSE_USER_AGENT.contains("Android"),
+            "must not impersonate a device"
+        );
+        let settings = build_settings();
+        assert_eq!(settings.user_agent.to_string(), ECLIPSE_USER_AGENT);
+    }
+
+    #[test]
+    fn session_request_context_uses_empty_cache_path() {
+        // 2026-07-09 (plan M4): the session store is in-memory (empty cache_path = incognito),
+        // never persisting cookies to disk — the private, session-scoped store the challenge reads.
+        let settings = session_context_settings();
+        assert!(
+            settings.cache_path.to_string().is_empty(),
+            "empty cache_path = in-memory/incognito store (NOT the global default)"
+        );
+        assert_eq!(settings.persist_session_cookies, 0);
     }
 
     #[test]
