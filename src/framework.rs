@@ -11131,18 +11131,27 @@ fn web_view_cookie_manager_remove_impl<'local>(
             }
         }
         // 2026-07-09 fix: the get_java_vm Err arm previously retained the callback with no removal
-        // (a leak + a never-fired callback); both failure shapes now degrade honestly to FALSE.
-        let send_failed = match env.get_java_vm() {
-            Ok(java_vm) => crate::webview::client::cookies_clear(java_vm, request_id).is_err(),
-            Err(_) => true,
+        // (a leak + a never-fired callback); both failure shapes degrade honestly to FALSE.
+        // 2026-07-16 (§6 🩹➜⛔): a clear taken during the deferred-spawn window is PROVABLY complete
+        // without the engine (`webview::client::EarlyCookies`) — no helper reply is coming, so fire
+        // TRUE here. TRUE is the value the round trip delivers (`fire_cookies_clear_result` passes
+        // it unconditionally), so this is the SAME answer, not a fabricated ack. Inline delivery on
+        // the calling thread is the shape the FALSE arm already used.
+        let answer_now: Option<bool> = match env.get_java_vm() {
+            Ok(java_vm) => match crate::webview::client::cookies_clear(java_vm, request_id) {
+                Ok(crate::webview::client::SendOutcome::Sent) => None,
+                Ok(_) => Some(true),
+                Err(_) => Some(false),
+            },
+            Err(_) => Some(false),
         };
-        if send_failed {
+        if let Some(ok) = answer_now {
             if let Some(g) = cookie_clear_callbacks()
                 .lock()
                 .ok()
                 .and_then(|mut m| m.remove(&request_id))
             {
-                fire_boolean_value_callback(env, &g, false);
+                fire_boolean_value_callback(env, &g, ok);
             }
         }
         Ok(())
