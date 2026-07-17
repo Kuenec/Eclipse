@@ -420,6 +420,41 @@ ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method publi
 grep -qF 'Eclipse-WebView/149.0.6' "$wssm" || fail "WebSettings honest-UA insert failed (drift?)"
 ! grep -qF 'GDPR VIOLATION' "$wssm" || fail "WebSettings still returns \"GDPR VIOLATION\" (honest-UA fix incomplete)"
 
+# --- WebSettings.setUserAgentString DIAGNOSTIC (2026-07-16) — EVIDENCE ONLY, NOT a fix ---------
+# THE QUESTION: does the Roblox app call WebSettings.setUserAgentString(...)? It matters because
+# ATL's setUserAgentString is an EMPTY NO-OP, so if the app DOES set a UA, Eclipse is SILENTLY
+# DISCARDING it and substituting the const-string getUserAgentString returns above — that would be a
+# plain Eclipse bug with a faithful fix (honor the app's UA), NOT the "deliberate honesty policy /
+# owner ruling" §6 2026-07-16 🏆 records it as. On a real device this is exactly where the
+# `Hybrid(Android)` token the challenge page's selector requires comes from. Unproven either way
+# today, so MEASURE instead of guessing: log the call and the UA the app HANDS us.
+# Deliberately does NOT change what the method does (still a no-op) nor what getUserAgentString
+# returns — the recorded honest-UA literal and its engine.rs byte-match contract are untouched.
+#
+# PRIVACY: logging the UA in full is NOT a regression against the ABSOLUTE URL-redaction rule — that
+# rule governs URLs and load payloads (§4 / web-engine-plan.md), and a User-Agent is neither. A UA is
+# the APP'S OWN public product token, sent in cleartext to every server on every request by design; it
+# carries no credential, no session token, and no user-entered text. Under Eclipse every component
+# that composes it is first-party or Eclipse-synthetic (Build.MODEL/VERSION come from ATL's
+# SystemProperties, not real user hardware). Full text (not a length) is logged deliberately: if the
+# answer is "the app sets it", Eclipse must REPRODUCE this string EXACTLY, and a byte count cannot be
+# reproduced. The `[...]` brackets make trailing whitespace unambiguous in the log.
+#
+# The StringBuilder concat is load-bearing, NOT cosmetic: framework.rs's println_native returns -1 and
+# logs NOTHING for a null msg, so passing p1 straight through would make `setUserAgentString(null)`
+# (AOSP: "reset to default" — a REAL call, and exactly the kind we must not miss) invisible. Concat
+# renders it as the literal "null" and keeps the call visible.
+! grep -qF 'ECLIPSE-UA-SET' "$wssm" || fail "WebSettings.smali already carries the ECLIPSE-UA-SET diagnostic — drifted; update patch-framework.sh"
+n="$(grep -cF '.method public setUserAgentString(Ljava/lang/String;)V' "$wssm")" || true
+[ "$n" = "1" ] || fail "WebSettings.smali setUserAgentString anchor not unique (found $n, expected 1) — installed WebSettings drifted; update patch-framework.sh"
+# Whole-body pristine check (the ANCHOR_PC/ANCHOR_ILC/ANCHOR_PSET pattern): the installed body MUST be
+# the empty no-op. If ATL ever gives it a real body, this diagnostic would silently overwrite it.
+ANCHOR_UAS=$'.method public setUserAgentString(Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method'
+ANCHOR_UAS="$ANCHOR_UAS" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_UAS}) >= 0) ? 0 : 1)' "$wssm" || fail "WebSettings.smali setUserAgentString body changed from the expected empty no-op — installed WebSettings drifted; update patch-framework.sh"
+perl -0pi -e 's{\.method public setUserAgentString\(Ljava/lang/String;\)V.*?\.end method\n}{.method public setUserAgentString(Ljava/lang/String;)V\n    .registers 5\n\n    # ECLIPSE DIAGNOSTIC 2026-07-16 (EVIDENCE ONLY): log that the app called setUserAgentString and\n    # the UA it handed us. Still a no-op afterwards — this pass answers a question, it does not fix.\n    const-string v0, "EclipseWebSettings"\n\n    new-instance v1, Ljava/lang/StringBuilder;\n\n    invoke-direct {v1}, Ljava/lang/StringBuilder;-><init>()V\n\n    const-string v2, "ECLIPSE-UA-SET setUserAgentString ua=["\n\n    invoke-virtual {v1, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;\n\n    invoke-virtual {v1, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;\n\n    const-string v2, "]"\n\n    invoke-virtual {v1, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;\n\n    invoke-virtual {v1}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;\n\n    move-result-object v1\n\n    invoke-static {v0, v1}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I\n\n    return-void\n.end method\n}s' "$wssm"
+grep -qF 'ECLIPSE-UA-SET setUserAgentString ua=[' "$wssm" || fail "WebSettings setUserAgentString diagnostic insert failed (drift?)"
+grep -qF -- 'Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I' "$wssm" || fail "WebSettings setUserAgentString diagnostic lost its Log.i call — the boot would go blind to whether the app sets a UA"
+
 # === WebViewClient 3-arg onPageStarted + WebView.internalLoadChanged dispatch (M6, 2026-07-10) ====
 # ATL's WebViewClient declares only 2-arg onPageStarted(WebView,String); AOSP declares ONLY the 3-arg
 # onPageStarted(WebView,String,Bitmap). An AOSP-compiled app's onPageStarted @Override therefore
