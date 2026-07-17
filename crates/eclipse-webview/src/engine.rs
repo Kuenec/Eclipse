@@ -61,6 +61,22 @@ pub fn console_text_diag_enabled(v: Option<&str>) -> bool {
     v == Some("1")
 }
 
+/// Whether the env value selects the bridge SELF-INTROSPECTION diagnostic (plan M6, 2026-07-16).
+/// EXACT-match `"1"` only — mirrors [`console_text_diag_enabled`]'s strictness for the same reason:
+/// a deliberate opt-in that no unrelated env value can trip. Pure/unit-pinned.
+///
+/// DEV-HOST DIAGNOSTIC ONLY. When enabled, the RENDERER installs a load handler that, on each frame
+/// load-end, evaluates a script built from Eclipse's OWN bridge inventory and logs what Eclipse's
+/// OWN injected stub looks like in that frame (see `build_bridge_introspection_js` in `main.rs`).
+/// It answers the M6 frontier question — zero `bridge call received` have EVER reached Eclipse
+/// (challenge16..20) with the injection race and callback delivery both already ruled out, so the
+/// next evidence needed is what our own injection actually IS at the moment the page has run.
+/// Off by default: the renderer returns NO load handler at all, so a default boot pays nothing —
+/// no eval, no log, not even an installed handler.
+pub fn bridge_diag_enabled(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
 /// The per-event page-console-TEXT diagnostic line (plan M6). The `source` stays redacted to
 /// scheme+host (a [`RedactedTarget`], unforgeable from a raw URL); only `text` is raw page console
 /// content — the sanctioned dev-host-diagnostic exposure gated by [`console_text_diag_enabled`].
@@ -2330,6 +2346,19 @@ mod tests {
         assert!(!console_text_diag_enabled(Some("true")));
         assert!(!console_text_diag_enabled(Some("1 ")));
         assert!(!console_text_diag_enabled(None));
+    }
+
+    #[test]
+    fn bridge_diag_gate_is_exact_match_one_only() {
+        // 2026-07-16 (plan M6): the bridge self-introspection diagnostic is a deliberate opt-in —
+        // EXACTLY "1", mirroring console_text_diag_enabled — so an unrelated env value can never
+        // trip it. Unset MUST be false: OFF means the renderer installs no load handler at all.
+        assert!(bridge_diag_enabled(Some("1")));
+        assert!(!bridge_diag_enabled(Some("")));
+        assert!(!bridge_diag_enabled(Some("0")));
+        assert!(!bridge_diag_enabled(Some("true")));
+        assert!(!bridge_diag_enabled(Some("1 ")));
+        assert!(!bridge_diag_enabled(None));
     }
 
     #[test]

@@ -35,6 +35,7 @@ use cef::wrapper::message_router::{
 use cef::{args::Args, sys, *};
 use engine::{Engine, Out, Outbox};
 use logging as log;
+use logging::RedactedTarget;
 use shared::fdpass;
 use shared::proto::{self, ConsumerMsg, HelperMsg, ProtoError};
 use std::collections::HashMap;
@@ -253,9 +254,27 @@ wrap_render_process_handler! {
     struct HelperRenderProcessHandler {
         router: Arc<RendererSideRouter>,
         inventory: Arc<Mutex<HashMap<String, Vec<String>>>>,
+        bridge_diag: Option<LoadHandler>,
     }
 
     impl RenderProcessHandler {
+        fn load_handler(&self) -> Option<LoadHandler> {
+            // 2026-07-16 (plan M6): the bridge SELF-INTROSPECTION seam. The pinned binding's
+            // `_cef_render_process_handler_t::get_load_handler` — "Return the handler for browser
+            // load status events" — installs a LoadHandler whose callbacks CEF delivers on "the
+            // browser process UI thread OR render process main thread (TID_RENDERER)"
+            // (`cef_load_handler_t`'s own doc); returned from the RENDER process handler it is the
+            // renderer's TID_RENDERER, which is the ONLY thread V8 may be touched from and exactly
+            // where `eval_in_frame` already works. That makes `on_load_end` the correct seam: CEF's
+            // own "this frame is done loading" notification, delivered in-process to the thread that
+            // owns the V8 context — no browser→renderer IPC hop and no ordering question about
+            // whether the context still exists.
+            //
+            // Diagnostic OFF (the default) returns None: CEF gets a NULL load handler and the
+            // renderer pays nothing — no handler, no eval, no log.
+            self.bridge_diag.clone()
+        }
+
         fn on_context_created(
             &self,
             browser: Option<&mut Browser>,
@@ -484,6 +503,119 @@ fn generate_stub_js(iface: &str, methods: &[String]) -> String {
     )
 }
 
+// === Bridge self-introspection diagnostic (plan M6, 2026-07-16) ==================================
+//
+// DEV-HOST ONLY, env-gated by ECLIPSE_WEBVIEW_BRIDGE_DIAG=1 (engine::bridge_diag_enabled); OFF is a
+// structural no-op (HelperRenderProcessHandler::load_handler returns None → CEF gets no handler).
+//
+// WHY: the M6 frontier (AGENTS.md §5 🕵️ / §6 2026-07-16). The app registers
+// `addJavascriptInterface iface=__globalRobloxAndroidBridge__ method_count=1`, the renderer logs
+// `bridge stubs applied ifaces=1 methods=1` ~470 ms before the page's bundle first speaks, the page
+// demonstrably runs and fires all four hybrid calls — and yet ZERO `bridge call received` have EVER
+// reached Eclipse across five live boots. The injection race is ruled out, callback delivery is
+// fixed, and UA steering is ruled out AS THE BRIDGE'S CAUSE (silent under both UAs). So the open
+// question is narrow and first-party: what does ECLIPSE'S OWN INJECTED STUB actually look like, in
+// the frame the page runs in, once the page has finished running?
+//
+// SCOPE — FIRST-PARTY ONLY, and enforced by construction: the iface list comes from the RENDERER'S
+// OWN inventory (what Eclipse itself injected, from the app's own registration), never from
+// scanning the page. The script touches exactly two things: `window.cefQuery` (OUR router) and
+// `window[<our iface>]` (the global OUR stub claimed). It reads no page-authored global, no
+// document, no location, no storage, and no page state.
+
+/// Build the bridge SELF-INTROSPECTION expression from Eclipse's OWN bridge inventory (plan M6,
+/// 2026-07-16). `ifaces` MUST be the renderer's own inventory keys — the interfaces Eclipse injected
+/// — never names scraped from the page.
+///
+/// Emits an expression (the shape [`eval_in_frame`] wraps in `JSON.stringify`) reporting, for OUR
+/// injection only: `typeof window.cefQuery` (is OUR router present in this frame?), and per iface
+/// its `typeof` plus each own property name with that property's `typeof` (did OUR method land, and
+/// as what?). `getOwnPropertyNames` is called ONLY on an object/function (it throws on
+/// undefined/null), and each property read is try/caught, so a live getter that throws degrades to
+/// `<throws>` instead of failing the whole eval — an honest partial answer beats no answer.
+/// Identifiers are js-escaped exactly as [`generate_stub_js`] escapes them. Pure/unit-pinned.
+fn build_bridge_introspection_js(ifaces: &[String]) -> String {
+    let names = ifaces
+        .iter()
+        .map(|n| format!("\"{}\"", js_escape(n)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "(function(){{var r={{cefQuery:typeof window.cefQuery,ifaces:[]}};\
+         [{names}].forEach(function(n){{var v=window[n];\
+         var e={{name:n,type:typeof v,props:[]}};\
+         if(v!==null&&(typeof v===\"object\"||typeof v===\"function\")){{\
+         Object.getOwnPropertyNames(v).forEach(function(p){{var t;\
+         try{{t=typeof v[p];}}catch(err){{t=\"<throws>\";}}\
+         e.props.push([p,t]);}});}}\
+         r.ifaces.push(e);}});return r;}})()"
+    )
+}
+
+/// The bridge self-introspection evidence line (plan M6, 2026-07-16). The frame is identified by the
+/// EXISTING redaction contract — a [`RedactedTarget`] (scheme+host, unforgeable from a raw URL), so
+/// the absolute URL-redaction rule holds in the diagnostic exactly as everywhere else. `main_frame`
+/// is CEF's own `is_main()` fact, not a page-observable. `result` is the JSON of OUR OWN
+/// introspection script — Eclipse's own injected identifiers, never page content. Pure/unit-pinned.
+fn format_bridge_diag_line(
+    main_frame: bool,
+    frame: &RedactedTarget,
+    ok: bool,
+    result_json: &str,
+) -> String {
+    format!(
+        "bridge-introspect(diag) main_frame={main_frame} frame={} ok={ok} result={result_json}",
+        frame.as_str()
+    )
+}
+
+wrap_load_handler! {
+    struct BridgeDiagLoadHandler {
+        inventory: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    }
+
+    impl LoadHandler {
+        fn on_load_end(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _http_status_code: c_int,
+        ) {
+            let Some(frame) = frame else { return };
+            // Deliberately NOT main-frame-gated (unlike the injection paths, which only ever inject
+            // into the main frame): the challenge page has cross-origin subframes (console events
+            // arrive from arkoselabs.roblox.com as well as js.rbxcdn.com), so "which frames did OUR
+            // stub actually reach" is precisely the fact in question. main_frame is reported per
+            // line instead.
+            let ifaces: Vec<String> = match self.inventory.lock() {
+                // Sorted so the line is stable across runs (HashMap iteration order is not).
+                Ok(inv) => {
+                    let mut names: Vec<String> = inv.keys().cloned().collect();
+                    names.sort();
+                    names
+                }
+                Err(_) => return,
+            };
+            // An EMPTY inventory is still worth evaluating: it reports whether OUR cefQuery router
+            // reached this frame, and an empty list is itself the answer (the renderer's inventory
+            // was empty here) — the same fact the mode=refresh/mode=sync split already measures.
+            let script = build_bridge_introspection_js(&ifaces);
+            let main_frame = frame.is_main() != 0;
+            let raw_url = CefString::from(&frame.url()).to_string();
+            let (ok, result_json) = eval_in_frame(frame, &script);
+            log::warn(
+                "render",
+                &format_bridge_diag_line(
+                    main_frame,
+                    &RedactedTarget::from_raw_url(&raw_url),
+                    ok,
+                    &result_json,
+                ),
+            );
+        }
+    }
+}
+
 /// Evaluate `script` in `frame`'s V8 context and return `(ok, value_json)`. The wrapper
 /// `JSON.stringify((function(){return (<script>);})())` yields the JSON-encoded result string
 /// (Android's `evaluateJavascript` contract); `undefined`/non-string → `"null"`.
@@ -555,12 +687,37 @@ fn main() -> ExitCode {
     // 2026-07-10 (plan M5): set only by the browser process's own policy-gated degradation
     // (never by argv) — consumed by the strip loop via switch_should_be_stripped.
     let degraded_sandbox: Arc<AtomicBool> = Arc::default();
+    // 2026-07-16 (plan M6): read the dev-host bridge SELF-INTROSPECTION gate ONCE. It MUST be read
+    // HERE — before execute_process — and not beside the other diag reads below: those run in the
+    // browser-only tail, but this diagnostic acts in the CEF-forked RENDERER (V8 lives on
+    // TID_RENDERER), and the renderer returns from execute_process without ever reaching that tail.
+    // This region is still single-threaded (the probe_userns invariant), so the env read is sound.
+    // The var reaches the renderer the same way LD_LIBRARY_PATH already must for it to start at all
+    // (Chromium launches subprocesses with the inherited environment); if that ever failed, the WARN
+    // below would print with no bridge-introspect line following it — the log stays self-evidencing
+    // rather than silently lying.
+    let bridge_diag =
+        engine::bridge_diag_enabled(std::env::var("ECLIPSE_WEBVIEW_BRIDGE_DIAG").ok().as_deref());
+    // Announce from the BROWSER process only — exactly one loud line per boot (each renderer
+    // process would otherwise repeat it).
+    if bridge_diag && is_browser_process {
+        log::warn(
+            COMPONENT,
+            "ECLIPSE_WEBVIEW_BRIDGE_DIAG=1 — the renderer will evaluate a bridge \
+             SELF-INTROSPECTION script on every frame load-end and log what ECLIPSE'S OWN injected \
+             stub looks like (dev-host diagnostic only; first-party — it reads only the globals \
+             Eclipse injected plus our own cefQuery router, never page content; never a default)",
+        );
+    }
     // The renderer-side JS-bridge/eval handler (plan M4). The router + inventory are cheap to
     // construct here; the handler is only USED in the CEF-forked renderer subprocess (App's
     // render_process_handler is called there, never in the browser process).
+    let inventory: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
     let render_handler = HelperRenderProcessHandler::new(
         RendererSideRouter::new(MessageRouterConfig::default()),
-        Arc::new(Mutex::new(HashMap::new())),
+        inventory.clone(),
+        // OFF → None → the renderer installs no load handler at all (a structural no-op).
+        bridge_diag.then(|| BridgeDiagLoadHandler::new(inventory)),
     );
     let mut app = HelperApp::new(ozone_slot.clone(), render_handler, degraded_sandbox.clone());
     let ret = execute_process(
@@ -1011,6 +1168,73 @@ mod tests {
             "interface name not escaped: {js}"
         );
         assert!(js.contains("m\\\\1"), "method name not escaped: {js}");
+    }
+
+    #[test]
+    fn build_bridge_introspection_js_reads_only_our_inventory_and_never_scans_the_page() {
+        // 2026-07-16 (plan M6): the bridge self-introspection diagnostic is FIRST-PARTY BY
+        // CONSTRUCTION. (a) The iface list is exactly the inventory handed in — what ECLIPSE
+        // injected — and each name is js-escaped like generate_stub_js escapes it. (b) It reports
+        // OUR router + each iface's own property names/types. (c) It must never scan or read the
+        // page: no window enumeration, no document/location/storage/navigator, no page state.
+        let js = build_bridge_introspection_js(&["Iface\"x".to_string(), "B\\1".to_string()]);
+
+        // (a) Exactly our inventory's ifaces, escaped — never a name scraped from the page.
+        assert!(
+            js.contains("[\"Iface\\\"x\",\"B\\\\1\"]"),
+            "must iterate exactly the inventory's escaped iface names: {js}"
+        );
+        // (b) Our own router + our own object's shape.
+        assert!(js.contains("typeof window.cefQuery"), "{js}");
+        assert!(js.contains("Object.getOwnPropertyNames"), "{js}");
+        assert!(js.contains("typeof v[p]"), "{js}");
+        // getOwnPropertyNames throws on undefined/null — the guard is what keeps a missing stub a
+        // reportable answer instead of a failed eval.
+        assert!(js.contains("v!==null&&(typeof v===\"object\""), "{js}");
+
+        // (c) No page scanning, no page-authored surface — the scope rule, asserted.
+        for banned in [
+            "Object.keys(window)",
+            "getOwnPropertyNames(window)",
+            "document",
+            "location",
+            "cookie",
+            "navigator",
+            "localStorage",
+            "sessionStorage",
+            "for(var k in window)",
+        ] {
+            assert!(
+                !js.contains(banned),
+                "page-scanning token {banned:?} in: {js}"
+            );
+        }
+
+        // An EMPTY inventory still reports our router (and an empty iface list) — never a page scan.
+        let empty = build_bridge_introspection_js(&[]);
+        assert!(empty.contains("[].forEach"), "{empty}");
+        assert!(empty.contains("typeof window.cefQuery"), "{empty}");
+    }
+
+    #[test]
+    fn format_bridge_diag_line_keeps_the_frame_url_redacted() {
+        // 2026-07-16 (plan M6): the diagnostic never relaxes the absolute URL-redaction rule — the
+        // frame is bound ONLY through RedactedTarget (scheme+host), even though the challenge frame
+        // URL carries a token. The result JSON is our own introspection output.
+        let frame =
+            RedactedTarget::from_raw_url("https://apps.roblox.com/challenge?token=SECRETTOKEN");
+        let line = format_bridge_diag_line(true, &frame, true, "{\"cefQuery\":\"function\"}");
+        assert!(line.contains("frame=https://apps.roblox.com"), "{line}");
+        assert!(!line.contains("SECRETTOKEN"), "frame token leaked: {line}");
+        assert!(!line.contains("/challenge"), "frame path leaked: {line}");
+        assert!(
+            line.contains("main_frame=true") && line.contains("ok=true"),
+            "{line}"
+        );
+        assert!(
+            line.contains("result={\"cefQuery\":\"function\"}"),
+            "{line}"
+        );
     }
 
     #[test]
