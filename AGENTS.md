@@ -128,6 +128,57 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — 🏆 THE BRIDGE BLOCKER IS SOLVED. ROOT CAUSE FOUND IN THE WRAPPER'S OWN SELECTOR, AND PROVEN LIVE:
+  the challenge now COMPLETES and its result REACHES THE APP through the app's own WebView contract. `Load generic
+  challenge failed` = **0** for the first time ever (full record: §6 2026-07-16 🏆).** **THE ROOT CAUSE (verbatim,
+  from the public `RobloxHybridV2_Win32.min.js` inside the `leanBasePage` bundle the challenge page itself
+  loads):**
+  ```js
+  var nativePrefix = function(){
+    var ua = navigator.userAgent.toLowerCase();
+    if (ua.indexOf("roblox/winpcgdk") != -1 || ...) return "win32";
+    if (ua.indexOf("roblox/wininet") != -1) return "UWP";
+    if (ua.indexOf("roblox/darwin") != -1) return "iOS";
+    var isNative = ua.indexOf("hybrid") != -1;              // <<< THE GATE
+    if (isNative) { if (ua.indexOf("ipad")... ) return "iOS";
+                    if (ua.indexOf("android") != -1) return "Android"; }
+    else { ...UWP-only checks... }
+    return null;                                            // <<< null = NO BRIDGE AT ALL
+  }();
+  ```
+  **The bridge is selected PURELY by `navigator.userAgent` substring matching, and it requires BOTH `"hybrid"` AND
+  `"android"`.** Eclipse's honest UA (`X11; Linux x86_64 … Eclipse-WebView`) has NEITHER → `nativePrefix = null` →
+  **no platform module is installed** → `Navigation.navigateToFeature` stays the EMPTY stub
+  (`define("Navigation",{autoGenerateNative:true},…{ exports.navigateToFeature = function(params,callback){} })`)
+  → the page's `Ra()` calls it, nothing happens, and the postMessage fallback is ALSO skipped because it is gated
+  `i && Rr(...)` where `i` = origin = **undefined**. **BOTH transports dead ⇒ total silence, exactly as observed
+  for ten boots.** The page NEVER references `__globalRobloxAndroidBridge__` directly — only `Bridge/Android`
+  does (`window.__globalRobloxAndroidBridge__ && window.__globalRobloxAndroidBridge__.executeRoblox(JSON.stringify(query))`),
+  and `Bridge/Android` is never selected. **⇒ This is why EVERY injection fix was irrelevant** — the stub was
+  always perfect and always unreachable. **⚠️ AND IT EXPLAINS WHY THE 🕵️ UA A/B WAS INCONCLUSIVE ON THE BRIDGE:**
+  that A/B used `Mozilla/5.0 (Linux; Android 13; wv) …` — `"android"` YES, **`"hybrid"` NO** → `isNative=false` →
+  still `null`. A generic Android UA is NOT enough; the **`Hybrid(...)` token is mandatory** (the iOS sibling
+  confirms the shape: `webViewId = ua.match(/Hybrid\((.*)\)/i)`). **PROVEN LIVE
+  (`/tmp/eclipse-challenge26-hybridua.log`, EXIT=124, zero orphans)** with
+  `ECLIPSE_WEBVIEW_UA_DIAG='… Android 13; wv … Mobile Safari/537.36 **Hybrid(Android)**'`:
+  `ECLIPSE-STUB invoke` **0 → 4** · `bridge call received` **0 → 4** — four real `executeRoblox` payloads reached
+  ART's JNI (`arg_lens` 219 / 211 / 221 / **738**), the 738-byte one being **`challengeCompleted`**. **`Load
+  generic challenge failed` = 0** (was 1 EVERY boot). Timeline: 403 `Challenge is required` 02:57:15.8 →
+  ChallengeHybridWebView → bridge calls 36.8/36.9 → **`challengeCompleted` 39.5** → **`data:LoginV2` 39.526 (the
+  app reacted 10 ms later)** → **the app RETRIED `auth.roblox.com/v2/login` at 39.703 (164 ms after the
+  completion)**. The challenge completed in **~24 s** instead of timing out at ~60 s. The retry's 403 is a
+  **CREDENTIALS** failure (the synthetic password is fake) — **not an Eclipse failure**. Regression: Looper throws
+  **0**, ULE **0**, NPE **0**, orphans **0**. **⇒ M6's CORE MECHANISM IS ACHIEVED** — *"renders the challenge page
+  for a real human to complete and hands the callback back through the app's own WebView contract"* (plan §4). ⇐
+  **START-HERE-NEXT: the UA default is now an EVIDENCE-BACKED, MECHANISM-LEVEL owner ruling, not a taste
+  question.** The page's own selector documents the contract: a WebView serving the Roblox Android app must carry
+  `Hybrid(...)` + `Android`. On a real device this app's WebView does exactly that (the app sets it via
+  `WebSettings.setUserAgentString`). Eclipse presenting it is **faithful to the app context Eclipse exists to
+  reproduce** — M4's pre-registered open question #1, whose condition has now materialized twice over. **The
+  change must move BOTH units together** (the CEF `Settings.user_agent` AND the overlay's `WebSettings.smali`
+  literal — M4 requires they byte-match) and must retire the `!contains("Android")` pin. **NOT done here: it is a
+  deliberate, unit-pinned honesty policy and the owner's call — but there is no longer any ambiguity about what it
+  buys or why the page needs it.** The remaining gap to a completed login is then only real credentials.
 - **2026-07-16 — 🚧 THE ⚖️ QUESTION, RE-RULED AND THEN WALLED: reading the wrapper JS is PERMISSIBLE under the
   ACTUAL policy (I over-restricted twice) — but it is NOT REACHABLE, for two concrete reasons, the second of
   which is Eclipse's own ABSOLUTE redaction contract (full record: §6 2026-07-16 🚧).** **First correction:** the
@@ -8406,6 +8457,107 @@ the frame — do not attribute a trace line to a frame; this record has burned o
 fire for a driven load per §6 🌱).
 
 *Files:* `crates/eclipse-webview/src/main.rs` only; this file (§5 🎯 bullet + §6 this entry).
+
+### 2026-07-16 — 🏆 THE BRIDGE BLOCKER IS SOLVED: the wrapper selects its native bridge purely by User-Agent substring, requiring BOTH "hybrid" AND "android". Proven live — the challenge now COMPLETES and its result reaches the app. `Load generic challenge failed` = 0 for the first time.
+
+*How it was found — by removing a constraint I invented.* §6 ⚖️ records that *"reading Roblox's wrapper JS is
+off-policy"* was **my own invention**, not project policy (the recorded prohibition names `libroblox.so`;
+CLAUDE.md's Required-Research section explicitly lists **"source code"** for external APIs a change must
+interoperate with). §6 🚧 then wrongly left the read as an owner question and declared it walled by a token
+requirement and by Eclipse's own console-source redaction. **Both walls were false too.** `WebFetch` returns
+markdown, which **strips `<script>` tags by definition** — a TOOL artifact I misread as "the page needs a token".
+A plain `curl` of `https://www.roblox.com/challenge/cdn/hybrid?dark-mode=false&challenge-type=generic&app-type=android`
+returns **HTTP 200, 18,689 bytes** of full HTML with **every** script tag, **no token needed**, and the bundle
+list is public and content-hashed. **Three invented/misread boundaries stood between this project and its answer
+for an entire session.**
+
+*THE ROOT CAUSE — verbatim, from `RobloxHybridV2_Win32.min.js` inside the public `leanBasePage` bundle
+(`js.rbxcdn.com/9fad0ab4cbc3033509d9dc82426c1340.js`) that the challenge page itself loads:*
+```js
+var nativePrefix = function(){
+  var ua = navigator.userAgent.toLowerCase();
+  if (ua.indexOf("roblox/winpcgdk") != -1 || ua.indexOf("roblox/wininet") != -1 && ua.indexOf("robloxnewbrowser") != -1) return "win32";
+  if (ua.indexOf("roblox/wininet") != -1) return "UWP";
+  if (ua.indexOf("roblox/darwin")  != -1) return "iOS";
+  var isNative = ua.indexOf("hybrid") != -1;                 // <<< THE GATE
+  if (isNative) {
+    if (ua.indexOf("ipad") != -1 || ua.indexOf("iphone") != -1 || ua.indexOf("roblox ios app") != -1) return "iOS";
+    if (ua.indexOf("android") != -1) return "Android";       // <<< the Android bridge
+  } else { /* UWP-cookie / Edge+webview checks only */ }
+  return null;                                               // <<< null = NO BRIDGE AT ALL
+}();
+```
+The module loader installs a platform module **only if `nativePrefix` is non-null**. `Navigation` is declared
+`define("Navigation",{autoGenerateNative:true},…)` with an **EMPTY** `navigateToFeature(params,callback){}` body —
+the native implementation is auto-generated **only** when a prefix exists. The page's send path
+(`Challenge.js`, function `Ra`) is:
+```js
+console.log(wh,"Sending hybrid call:",r," to origin: ",i),
+null===eM.Hybrid||void 0===eM.Hybrid||null==(l=eM.Hybrid.Navigation)||l.navigateToFeature({feature:r,data:a},…);
+… try{ i && Rr(r,a,i) }catch(t){…}      // postMessage fallback, gated on `i` (= origin)
+```
+**Eclipse's honest UA (`X11; Linux x86_64 … Chrome/149 … Eclipse-WebView/149.0.6`) contains NEITHER "hybrid" NOR
+"android" ⇒ `nativePrefix = null` ⇒ no platform module ⇒ `navigateToFeature` stays the empty stub ⇒ the call is a
+silent no-op. And the postMessage fallback is skipped because `i` (origin) is `undefined`. BOTH transports dead ⇒
+total silence.** The page **never references `__globalRobloxAndroidBridge__` directly** — only `Bridge/Android`
+does (`window.__globalRobloxAndroidBridge__ && window.__globalRobloxAndroidBridge__.executeRoblox(JSON.stringify(query))`),
+and `Bridge/Android` is never selected. **⇒ Every injection fix this session was irrelevant to the blocker: the
+stub was always perfect and always unreachable.** (Those fixes remain correct AOSP-conformance work; they are just
+not what was blocking.)
+
+*⚠️ WHY THE 🕵️ UA A/B WAS INCONCLUSIVE ON THE BRIDGE — the near-miss that cost four passes.* That A/B used
+`Mozilla/5.0 (Linux; Android 13; wv) … Mobile Safari/537.36`: `"android"` YES, **`"hybrid"` NO** ⇒
+`isNative = false` ⇒ falls to the else branch ⇒ **still `null`**. It DID flip the challenge outcome
+(`challengeDisplayed` → `challengeCompleted`, §6 🕵️) because other code keys on "android" — but it could never
+wake the bridge. **A generic Android UA is NOT sufficient. The `Hybrid(...)` token is mandatory.** The iOS sibling
+pins the shape: `webViewId = ua.match(/Hybrid\((.*)\)/i)`.
+
+*PROVEN LIVE — `/tmp/eclipse-challenge26-hybridua.log`, EXIT=124, reached the challenge, zero orphans.* Only one
+variable changed:
+`ECLIPSE_WEBVIEW_UA_DIAG='Mozilla/5.0 (Linux; Android 13; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.0.0 Mobile Safari/537.36 Hybrid(Android)'`
+```
+ECLIPSE-STUB invoke     0 -> 4        bridge call received   0 -> 4
+  call_id=1 iface="__globalRobloxAndroidBridge__" method="executeRoblox" args=1 arg_lens=[219]   (challengePageLoaded)
+  call_id=2 …                                                                    arg_lens=[211]   (challengeParsed)
+  call_id=3 …                                                                    arg_lens=[221]   (challengeInitialized)
+  call_id=4 …                                                                    arg_lens=[738]   (challengeCompleted)
+Load generic challenge failed   1 (every boot)  ->  0        <<< THE HEADLINE
+```
+Timeline: 403 `Challenge is required` 02:57:15.8 → ChallengeHybridWebView 15.9 → bridge calls 36.8/36.9 →
+**`challengeCompleted` 39.5** → **`data:LoginV2` 39.526 — the app reacted 10 ms later** → **the app RETRIED
+`auth.roblox.com/v2/login` at 39.703, 164 ms after the completion**. The challenge **completed in ~24 s** instead
+of timing out at ~60 s. The retry's 403 is a **CREDENTIALS** failure (the synthetic password is fake) — **not an
+Eclipse failure**. `ECLIPSE-STUB success` confirms the full round-trip; **the §6 🧵 row-2 deferral's bet HELD** —
+the first real bridge call ran on the Looper-less upcall thread and did NOT throw (`executeRoblox` is a simple
+accessor, exactly as predicted). Regression: Looper throws **0**, ULE **0**, NPE **0**, orphans **0**.
+
+*⇒ M6's CORE MECHANISM IS ACHIEVED:* plan §4's *"Faithful rendering only: Eclipse renders the challenge page for a
+real human to complete and hands the callback back through the app's own WebView contract — it never automates or
+engineers around vendor scoring."* The challenge is completed by the page's own proof-of-work and its result is
+handed to the app through `addJavascriptInterface`. Nothing was bypassed.
+
+*⇐ THE OWNER RULING, now mechanism-level and evidence-backed (still NOT taken here).* M4's open question #1 asked
+whether to present *"the app's genuine Android-WebView-context UA — faithful, since Eclipse runs the Android
+build."* **The page's own selector now documents the contract:** a WebView serving the Roblox Android app must
+carry `Hybrid(...)` + `Android`; on a real device this app sets exactly that via
+`WebSettings.setUserAgentString`. Eclipse presenting it is faithful to the app context Eclipse exists to
+reproduce — it is not impersonating a device (no model needed; `Hybrid(Android)` sufficed). **To ship it:** move
+**BOTH units together** — the CEF `Settings.user_agent` AND the overlay `WebSettings.smali` literal (M4 requires
+they byte-match) — and retire the `!contains("Android")` pin with a dated §6 entry. **Deliberately not done here:**
+the default is a deliberate, unit-pinned honesty policy about how Eclipse presents itself to a third party, and
+that call is the owner's. The `ECLIPSE_WEBVIEW_UA_DIAG` knob reproduces this result in one command. After it, the
+only remaining gap to a completed login is **real credentials**.
+
+*METHODOLOGY — the session's real lesson, now sevenfold.* Every instrument built was right; the prose around them
+was wrong seven times: "race definitively dead"; "the stub is intact in the frame the wrapper runs in" (console
+`source` is the SCRIPT, not the frame); the `len=` fingerprint "proving" sameness; "reading the wrapper JS is
+off-policy" (invented); "inventing a permission mirrors the error" (false symmetry); "the page needs a token" (a
+WebFetch markdown artifact); "our redaction hides the bundle URL" (true, but irrelevant — the HTML lists every
+bundle publicly). **Four of those seven were self-imposed boundaries, and they cost the entire session.** Before
+citing a constraint: `grep` for it. Before believing a wall: try the other tool.
+
+*Files:* none (the fix is the owner's UA ruling; the `Hybrid(Android)` proof used the existing
+`ECLIPSE_WEBVIEW_UA_DIAG` diagnostic). This file (§5 🏆 bullet + §6 this entry) and `docs/web-engine-plan.md`.
 
 ---
 
