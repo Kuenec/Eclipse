@@ -1220,9 +1220,17 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         key_meta_state: 0,
         webview_pointer_down: false,
     };
-    event_loop
-        .run_app(&mut app)
-        .map_err(GraphicsError::EventLoop)?;
+    let run = event_loop.run_app(&mut app);
+    // 2026-07-16 (web-engine M6): the winit loop WAS the main-thread drain for the client's
+    // app-facing WebView callbacks (about_to_wait -> pump_main_looper -> run_pending_main_upcall).
+    // It has just stopped — close the slot and run anything still pending HERE, on main, with the
+    // main Looper still prepared, so a callback posted during teardown fires instead of parking on
+    // a pump that is gone. Before the `?` so the error path closes it too. (`run_apk` never calls
+    // `client::shutdown` — `__webview-test` is its only caller — so this is production's ONLY retire.)
+    if let Some(vm) = vm {
+        crate::framework::retire_main_upcall_dispatch(vm);
+    }
+    run.map_err(GraphicsError::EventLoop)?;
     // run_app returns Ok even if `resumed` failed to create the window; surface that as an error.
     if let Some(e) = app.create_error {
         return Err(GraphicsError::CreateWindow(e));

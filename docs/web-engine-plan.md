@@ -6,7 +6,9 @@
 > gates the next. **M1 is DONE — GO; M2 is DONE (2026-07-03, drive-verified); M3 is DONE
 > (2026-07-03, `__webview-test`-verified); M4 is DONE (2026-07-10, `__webview-test`-verified);
 > M5 is DONE (2026-07-10, packaged + four-leg live-verified);** implementation continues at
-> **M6**.
+> **M6** (2026-07-16: the M6 live boots RAN — the 2026-07-10 pass validated + a deeper
+> Looper-affinity root cause found and fixed; the milestone is NOT complete — the bridge is still
+> silent, now proven an independent defect ranked to UA-steering / open question #1).
 
 ## 1. Why a web engine at all (the recorded ceiling)
 
@@ -518,6 +520,54 @@ live legs verified).**
 - Implementation continues at **M6**.
 
 ### M6 — Live challenge boot: the challenge page renders in the app, then the human completes it
+
+**Status (2026-07-16) — THE LIVE BOOTS RAN. The 2026-07-10 pass is VALIDATED, a deeper root cause
+was found and FIXED, and the milestone is NOT yet complete: the bridge is still silent, now proven
+to be an INDEPENDENT defect (full record: AGENTS.md §6 2026-07-16 🧵).** Three live boots
+(`/tmp/eclipse-challenge17.log`, `…18-consolediag.log`, `…19-looper.log`; dev-host main thread,
+EXIT=124, zero-orphan). **Validated:** (C) the 3-arg `onPageStarted` fix is CONFIRMED — the app's
+real override ran for the first time ever (suspect 3 dead); (D) eager CloseView is CONFIRMED —
+teardown 2 ms + 29 ms `ViewClosed` vs challenge16's ~40 s stale composite; (A) the console
+diagnostic worked and was decisive. **(B) did NOT engage** — both boots log `mode=refresh`, never
+`mode=sync` (a fresh renderer's inventory is empty at `on_context_created`), but it did not matter:
+stubs land ~490 ms before the page's wrapper speaks, so **the injection race is ruled out**.
+**NEW ROOT CAUSE, FIXED:** every app-facing WebView callback was delivered on the Looper-less
+`eclipse-webview-upcall` thread, so ATL `Handler.<init>` threw *"Can't create handler inside thread
+that has not called Looper.prepare()"* inside BOTH real page callbacks — exactly 2×/boot, every
+boot (via `SwipeRefreshLayout.setRefreshing` → `View.startAnimation` → `new Handler()`). AOSP
+delivers these on the UI thread and never on a Looper-less thread. They now run on Eclipse's ART
+main thread via a pure-Rust job slot drained by the existing main-Looper pump; the poster blocks so
+the `upcalls 2/2` marker keeps its exact meaning and global FIFO is preserved. `@JavascriptInterface`
+deliberately stays on the upcall thread (AOSP's own thread identity; deferred + instrumented).
+**Live verdict:** Looper throws 2→0, `internalLoadChanged` failures 2→0, lifecycle failures 3→1
+(only the known upgrade-dialog), the app's own `onPageFinished. url=` log 0→1, zero new ULE/NPE.
+The new overlay `EclipseWebViewClientProbe` gives the pinned `__webview-test` marker teeth for the
+first time (pre-fix it FAILS 0/2; post-fix 2/2). **Frontier:** the page's console fingerprint is
+byte-identical pre/post fix — the bridge silence is a separate bug. The page fires all four hybrid
+calls but every one goes `to origin: undefined` (postMessage vocabulary, not Android-bridge
+vocabulary). Ranked suspect: **UA steering (open question #1) — an OWNER RULING**; next step is a
+temporary env-gated UA A/B **diagnostic**, not a policy flip on suspicion.
+
+**Historical status (2026-07-10) — the pass the boots above validated:**
+A first live boot (challenge16, log `/tmp/eclipse-challenge16.log`) reached the FIRST-EVER app-side
+`onPageFinished` (http 200) on the real ChallengeHybridWebView but the page NEVER called the bridge,
+and GC-only teardown left the stale full-window composite over LoginV2 for ~40 s with no
+`ViewClosed`. This pass landed (all ADDITIVE; the socket wire protocol untouched, PROTO_VERSION
+stays 2): (A) observability making the blocker READABLE — a default-visible (info-level) page
+console surface + an env-gated (`ECLIPSE_WEBVIEW_CONSOLE=1`) raw-text helper diagnostic, a
+renderer `bridge stubs applied mode=sync|refresh` timestamp, a consumer `bridge call received`
+receipt (shape-gated identifiers+lengths only — pre-validation iface/method are page-controlled,
+so URL/token-shaped strings bind as `<non-identifier>`), and a cookie-rejection predicate
+classifier; (B) the root fix
+for the injection race — a reliable `on_render_view_ready` inventory re-push + truly-synchronous
+`V8Context::eval` stub injection before page scripts; (C) overlay — WebView.`internalLoadChanged`
+now dispatches AOSP's **3-arg** `onPageStarted(WebView,String,Bitmap)` at state 0 (the confirmed
+suspect-3 fix), plus a WebViewClient shadow with the AOSP base 3-arg onPageStarted +
+`shouldOverrideUrlLoading`→false (base surface only; **dispatch DEFERRED** — it cannot be wired
+honestly under the driven-loads-only/frozen-protocol contract; rationale in §6); (D) eager
+`CloseView` on the active WebView's detach from the view tree (subtree-tested). Residual: if the
+real blocker is UA-steering (open question #1) the bridge may stay silent even with sync injection
+— this pass makes that verdict readable rather than guaranteeing a bridge call.
 
 End-to-end validation against the real app flow: the 403→ChallengeHybridWebView fragment
 load-drives the real challenge URL into the helper; watch for the first-ever

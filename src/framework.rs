@@ -6604,6 +6604,17 @@ extern "system" fn view_group_native_remove_view<'local>(
                 "ViewGroup.native_removeView: invalid parent handle (ignored)"
             ),
         }
+        // 2026-07-10 (web-engine M6, plan §7 #9): if the removed subtree contains the ACTIVE
+        // challenge WebView, eager-close it — a fragment teardown removes the fragment ROOT (the
+        // WebView is a DESCENDANT, so this must be subtree-based, not a `child == active` test), and
+        // GC-only teardown left the stale full-window composite covering LoginV2 for ~40 s with no
+        // ViewClosed (challenge16). The no-webview path is ONE atomic load (§2.4-clean; removeView
+        // is not hot). The registry lock is already released (with_view returned) before
+        // subtree_contains re-takes it — no nesting.
+        let active = crate::webview::client::active_view();
+        if active != 0 && (child == active || view_registry::subtree_contains(child, active)) {
+            crate::webview::client::notify_view_detached(active);
+        }
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -9589,51 +9600,331 @@ const WEB_VIEW_INTERNAL_LOAD_CHANGED_NAME: &JNIStr = jni_str!("internalLoadChang
 const WEB_VIEW_INTERNAL_LOAD_CHANGED_SIG: MethodSignature<'static, 'static> =
     jni_sig!("(ILjava/lang/String;)V");
 
+// === app-facing WebView callbacks are delivered on the MAIN (UI) thread (web-engine plan M6) ====
+//
+// 2026-07-16 root cause: Eclipse delivered every app-facing WebView callback from the
+// `eclipse-webview-upcall` thread, which is ART-attached but has NO android.os.Looper — nothing
+// ever calls Looper.prepare() there. Roblox's real WebViewClient.onPageStarted/onPageFinished
+// construct a Handler (SwipeRefreshLayout.setRefreshing -> View.startAnimation -> Animation.start
+// -> new Handler()), so ATL Handler.java:197 read Looper.myLooper() == null and threw
+// "Can't create handler inside thread that has not called Looper.prepare()" — twice per boot,
+// killing BOTH real page callbacks (challenge17/18). AOSP delivers them on the UI thread, and
+// every UI thread has a Looper.
+//
+// The defect is thread AFFINITY, not Looper presence. Preparing a Looper on the upcall thread is
+// REJECTED both ways: undrained, every Handler.post the app makes vanishes SILENTLY (worse than a
+// loud throw); drained, the app still mutates the main-thread-owned view hierarchy off-main, which
+// is a data race in Eclipse's own view_registry model — the app wrote that code believing it was
+// on the UI thread. So the callback moves to the thread that HAS the Looper: main.
+
+/// One app-facing WebView callback, queued for the ART main thread. `'static` + `Send` by
+/// construction (each caller MOVES owned data in — the URL String, the retained Global, the
+/// result Sender), which is exactly why this needs NO `unsafe`. 2026-07-16.
+type MainJob = Box<dyn for<'l> FnOnce(&mut Env<'l>) + Send + 'static>;
+
+/// The ONE pending main-thread callback + the drain's lifetime flag, under one lock so the
+/// "can main still run this?" decision and the hand-off are atomic against
+/// [`retire_main_upcall_dispatch`] (no job can slip into a slot nobody will run).
+///
+/// A SLOT, not a queue, and that is a proof rather than a shortcut: the only poster
+/// ([`dispatch_webview_callback_on_main`]) BLOCKS until its job has run, so at most one job exists
+/// at any instant. There is therefore no drain loop, no message-storm budget (the
+/// [`MAIN_LOOPER_MESSAGE_BUDGET`] hazard cannot arise), and no FIFO question — the client's single
+/// upcall thread remains the one serializer for every event kind. 2026-07-16.
+struct MainDispatchSlot {
+    job: Option<MainJob>,
+    /// `false` once main can no longer pump (its winit loop exited / `client::shutdown` finished).
+    open: bool,
+}
+
+static MAIN_DISPATCH: std::sync::Mutex<MainDispatchSlot> =
+    std::sync::Mutex::new(MainDispatchSlot {
+        job: None,
+        open: true,
+    });
+
+/// The `ThreadId` of the thread that ran `Looper.prepareMainLooper()` (lifecycle step 0 /
+/// [`prepare_main_looper`]) — the ONE thread in this process with a prepared `android.os.Looper`,
+/// and the one whose queue the winit loop pumps (`graphics::about_to_wait` -> [`pump_main_looper`]).
+/// AOSP calls it the UI thread; every app-facing WebView callback must be delivered on it. The
+/// `webview::client::IO_THREAD_ID` boundary-assert precedent. 2026-07-16.
+static MAIN_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// One loud line per process when a callback could not be delivered on main (never per event).
+static MAIN_DISPATCH_DEGRADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How long a poster waits for main to run its job before reclaiming it and running it HERE.
+///
+/// This is NOT a tuning knob against normal contention: it is a LIVENESS ESCAPE, not a proof.
+/// 2026-07-16 (corrected same day — the first draft of this comment claimed the deadline "must
+/// EXCEED every legitimate main-thread block, and it does". That is FALSE, and a future reader
+/// must not conclude this branch is unreachable): main has genuinely unbounded blocks — the
+/// renderer's `wait_for_fences`/`acquire_next_image` use `u64::MAX` and a FIFO swapchain on an
+/// occluded/withheld-frame-callback surface can park `RedrawRequested` indefinitely (Wayland
+/// permits withholding `wl_surface.frame`), and one [`drive_main_messages`] batch bounds message
+/// COUNT ([`MAIN_LOOPER_MESSAGE_BUDGET`]) not DURATION, so several app messages each taking
+/// `cookie_get_blocking`'s 5 s cap exceed this on their own. When it fires the job is reclaimed and
+/// run on the Looper-less caller — honest, never dropped, and loudly warned, but it IS the
+/// pre-2026-07-16 delivery (the app's own `new Handler()` will throw again). The durable class-level
+/// fix is the `EventLoopProxy` wake already named at [`register_message_queue_natives`]'s
+/// `nativeWake` no-op. Note the case where main is INSIDE the job (app code parked in a 5 s
+/// getCookie) is NOT this branch: main has already taken the job, so the reclaim finds nothing and
+/// the poster waits unbounded — correct, and it terminates when main finishes.
+const MAIN_DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where one app-facing WebView callback must run. PURE, so plain `cargo test` pins the ladder
+/// with no JVM (the `eval_drain_victims` / `main_looper_poll_should_yield` house precedent).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MainDispatchGate {
+    /// Post to main and block — the AOSP-correct delivery.
+    Post,
+    /// Already ON the UI thread: run here. NOT a degradation — this IS the contract.
+    InlineOnMainThread,
+    /// No main Looper was ever prepared: there is no UI thread to be wrong about.
+    InlineNoMainLooper,
+    /// Main will never pump again (teardown): parking would hang; running here is the honest
+    /// pre-2026-07-16 delivery. Never a DROPPED callback (fire-exactly-once, the 2026-07-09 fix).
+    InlineDrainRetired,
+    /// The slot is occupied — a second concurrent poster, which the blocking contract forbids.
+    /// Degrade loudly rather than lose either job.
+    InlineSlotBusy,
+}
+
+/// 2026-07-16: on-main wins FIRST (running there is the contract, not a degradation).
+fn main_dispatch_gate(
+    on_main_thread: bool,
+    main_looper_prepared: bool,
+    drain_open: bool,
+    slot_free: bool,
+) -> MainDispatchGate {
+    if on_main_thread {
+        return MainDispatchGate::InlineOnMainThread;
+    }
+    if !main_looper_prepared {
+        return MainDispatchGate::InlineNoMainLooper;
+    }
+    if !drain_open {
+        return MainDispatchGate::InlineDrainRetired;
+    }
+    if !slot_free {
+        return MainDispatchGate::InlineSlotBusy;
+    }
+    MainDispatchGate::Post
+}
+
+/// 2026-07-16 (the confirmed challenge17/18 root fix): run one app-facing WebView callback on the
+/// ART MAIN thread — the thread that ran `Looper.prepareMainLooper` (step 0) and whose queue
+/// [`pump_main_looper`] drains from winit's `about_to_wait` — and BLOCK until it has run. Returns
+/// the job's value, or `None` if the job panicked.
+///
+/// BLOCKING is deliberate and load-bearing, twice over:
+///  - it keeps every `fire_*`'s return value meaning EXACTLY "the app's Java callback completed",
+///    never "a message was enqueued" — the pinned `__webview-test` "upcalls 2/2" marker depends on
+///    that; and
+///  - it keeps `webview::client`'s single upcall thread the ONE serializer, so global FIFO across
+///    every event kind is unchanged even though `UpcallEvent::BridgeCall` still runs there (its
+///    AOSP thread identity is already correct — see that arm). In particular the recorded
+///    load-bearing order "a BridgeCall received before a ViewClosed still finds its registry
+///    entry" holds BY CONSTRUCTION.
+///
+/// Deadlock-free (verified 2026-07-16): the caller is never the reader thread (client.rs's
+/// contract, fail-fast in `cookie_get_blocking`) and never main (the gate). App code on main may
+/// synchronously re-enter the BLOCKING `CookieManager.getCookie`, which parks MAIN on a reply only
+/// the reader delivers (a channel send with NO JNI and no upcall involvement) — the reader is
+/// always free, so main always makes progress and this caller unparks. `client::shutdown` is the
+/// one place main would join this thread; it PUMPS while joining (client.rs, 2026-07-16) so that
+/// edge cannot close either.
+fn dispatch_webview_callback_on_main<R: Send + 'static>(
+    java_vm: &JavaVM,
+    what: &'static str,
+    job: impl for<'l> FnOnce(&mut Env<'l>) -> R + Send + 'static,
+) -> Option<R> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<R>(1);
+    let mut boxed: Option<MainJob> = Some(Box::new(move |env| {
+        let _ = tx.send(job(env));
+    }));
+
+    let current = std::thread::current().id();
+    let on_main = MAIN_THREAD_ID.get() == Some(&current);
+    let prepared = MAIN_THREAD_ID.get().is_some();
+    // One lock: read `open` + `job.is_none()` and hand the job over ATOMICALLY against
+    // `retire_main_upcall_dispatch`. NO JNI runs under this lock, ever.
+    let gate = match MAIN_DISPATCH.lock() {
+        Ok(mut slot) => {
+            let g = main_dispatch_gate(on_main, prepared, slot.open, slot.job.is_none());
+            if g == MainDispatchGate::Post {
+                slot.job = boxed.take();
+            }
+            g
+        }
+        // Poisoned: degrade like a retired drain — run it here rather than lose it.
+        Err(_) => MainDispatchGate::InlineDrainRetired,
+    };
+
+    if let Some(job) = boxed {
+        if gate != MainDispatchGate::InlineOnMainThread {
+            warn_main_dispatch_degraded(what, gate);
+        }
+        run_main_job_here(java_vm, job);
+        return rx.recv().ok();
+    }
+
+    match rx.recv_timeout(MAIN_DISPATCH_DEADLINE) {
+        Ok(r) => Some(r),
+        Err(_) => match MAIN_DISPATCH.lock().ok().and_then(|mut s| s.job.take()) {
+            // We won the claim => main NEVER took it and is not pumping. Nothing else holds it:
+            // run it here, loudly. Exactly-once holds — the take is the claim.
+            Some(job) => {
+                warn_main_dispatch_degraded(what, gate);
+                run_main_job_here(java_vm, job);
+                rx.recv().ok()
+            }
+            // Main won the claim => it is INSIDE the job (e.g. app code parked in the 5 s
+            // getCookie). Never double-run: wait it out. Terminates unconditionally — the job
+            // either sends or its Sender drops.
+            None => rx.recv().ok(),
+        },
+    }
+}
+
+/// Run one job on THIS thread (the `fire_string_callback_global` attach + catch_unwind shape).
+fn run_main_job_here(java_vm: &JavaVM, job: MainJob) {
+    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| job(env))) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    });
+}
+
+fn warn_main_dispatch_degraded(what: &'static str, gate: MainDispatchGate) {
+    if !MAIN_DISPATCH_DEGRADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "android.webkit.WebView",
+            callback = what,
+            ?gate,
+            "app-facing WebView callback could NOT be delivered on the main/UI thread — running it \
+             on this Looper-less thread instead (the pre-2026-07-16 delivery: the app's own \
+             new Handler() will throw). Never dropped; logged once. Outside process teardown this \
+             means the main Looper pump is not running — MessageQueue.nativeWake is a deliberate \
+             no-op, so a cross-thread post cannot wake winit; the EventLoopProxy wake named there \
+             is the durable follow-up."
+        );
+    }
+}
+
+/// Run the pending app-facing WebView callback on THIS (main) thread, if any. Called from
+/// [`run_main_looper_once`] INSIDE the pump's re-entrancy guard and `catch_unwind`, immediately
+/// BEFORE [`drive_main_messages`] — so the app's own `new Handler().post(...)` continuation (the
+/// real shape: startAnimation -> Animation.start -> new Handler().post) dispatches in the SAME
+/// UI-thread turn, exactly as on AOSP. The job is taken OUT of the lock before it runs: it is real
+/// app code that re-enters the WebView natives freely. 2026-07-16.
+fn run_pending_main_upcall(env: &mut Env) {
+    let job = match MAIN_DISPATCH.lock() {
+        Ok(mut slot) => slot.job.take(),
+        Err(_) => None,
+    };
+    if let Some(job) = job {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| job(env)));
+    }
+}
+
+/// The main thread will no longer pump: close the dispatch slot and run whatever is still pending
+/// HERE, on main, with the main Looper still prepared. Atomic against posters (flag + slot under
+/// one lock); a poster that observes the closed slot runs its job inline instead (loudly logged) —
+/// never dropped, because the ValueCallback contract is fire-EXACTLY-once (the 2026-07-09 drain
+/// fix). Idempotent. Callers: `graphics::run_windowed` the instant `run_app` returns, and
+/// `webview::client::shutdown` after it has joined the upcall thread. The `&Vm` borrow is the
+/// type-level proof this is main (`Vm` is `!Send`/`!Sync`, compile_fail-pinned). 2026-07-16.
+pub fn retire_main_upcall_dispatch(vm: &Vm) {
+    let job = match MAIN_DISPATCH.lock() {
+        Ok(mut slot) => {
+            slot.open = false;
+            slot.job.take()
+        }
+        Err(_) => return,
+    };
+    let Some(job) = job else { return };
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
+    // by the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton). Identical to
+    // `pump_main_looper`'s wrap on this same thread.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    run_main_job_here(&java_vm, job);
+}
+
 /// Fire `WebView.internalLoadChanged(state, url)` on the Java object recorded for `widget` —
 /// the previously-dead seam, now driven by the webview client's socket-reader thread for DRIVEN
 /// loads only (2026-07-03, plan M3). Returns `true` iff the Java dispatch completed (the
 /// `__webview-test` "upcalls 2/2" evidence).
 ///
-/// Threading: called from the `eclipse-webview-upcall` thread (2026-07-09 fix: app-code upcalls
-/// moved off the socket-reader thread so a blocking round-trip from app code — e.g. a synchronous
-/// `getCookie` inside `onPageFinished` — cannot self-deadlock the io loop) with the `Send`
-/// [`JavaVM`] handle the load native obtained via `Env::get_java_vm` — `attach_current_thread`
-/// performs a real, thereafter-cached ART attach of that thread (the recorded exception in
-/// `runtime::Vm`'s docs; ART's attached-thread altstack caveat is the recorded native_provider
-/// limitation — acceptable, the upcall thread does no deep recursion). `url` is the REAL driven
-/// URL: it is the app's own Java
-/// contract argument (ATL's reference C passes the real URI) and is NEVER bound to a log macro
-/// here — every failure log binds only `widget` + `state`.
+/// Threading (2026-07-16, web-engine M6 root fix): called from the `eclipse-webview-upcall` thread
+/// (2026-07-09 fix: app-code upcalls moved off the socket-reader thread so a blocking round-trip
+/// from app code — e.g. a synchronous `getCookie` inside `onPageFinished` — cannot self-deadlock
+/// the io loop), but the Java dispatch itself is handed to the ART **MAIN (UI) thread** via
+/// [`dispatch_webview_callback_on_main`] and this function BLOCKS until it has run. That is AOSP's
+/// contract for `onPageStarted`/`onPageFinished` (Chromium's `WebViewContentsClientAdapter` calls
+/// them on the UI thread; only `shouldInterceptRequest` is documented non-UI), and it is why the
+/// returned `bool` still means "the app's Java callback completed" — never "a message was
+/// enqueued". Before this fix the dispatch ran on the Looper-less upcall thread and the app's own
+/// `new Handler()` threw (challenge17/18, twice per boot). `url` is the REAL driven URL: it is the
+/// app's own Java contract argument (ATL's reference C passes the real URI) and is NEVER bound to a
+/// log macro here — every failure log binds only `widget` + `state`.
 pub fn fire_web_view_internal_load_changed(
     java_vm: &JavaVM,
     widget: jlong,
     state: i32,
     url: &str,
 ) -> bool {
-    let result: Result<bool, FrameworkError> = java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            fire_internal_load_changed_inner(env, widget, state, url)
-        })) {
-            Ok(result) => result,
-            Err(_) => Err(FrameworkError::Panicked),
-        }
-    });
-    match result {
-        Ok(fired) => fired,
-        Err(e) => {
+    // The URL is OWNED by the job (`MainJob` is 'static) and is still NEVER bound to a log macro.
+    let url = url.to_string();
+    let fired = dispatch_webview_callback_on_main(
+        java_vm,
+        "WebView.internalLoadChanged",
+        move |env: &mut Env| -> bool {
+            match fire_internal_load_changed_inner(env, widget, state, &url) {
+                Ok(fired) => fired,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "android.webkit.WebView",
+                        widget,
+                        state,
+                        error = %e,
+                        "internalLoadChanged upcall failed (no callback delivered; URL never logged)"
+                    );
+                    false
+                }
+            }
+        },
+    );
+    // 2026-07-16: `None` == the job never produced a value — it panicked (caught at the dispatch
+    // boundary) or the JVM attach failed. Pre-2026-07-16 this function wrapped the whole
+    // `attach_current_thread` and warned on ANY `Err`, including those two; moving the body into a
+    // job put the inner warn inside the closure, which covers only `fire_internal_load_changed_inner`'s
+    // `Err`. Restore the lost diagnostic here so a silent 0/2 can never be unexplained: without it
+    // the `__webview-test` marker or a challenge log just shows a missing callback with no reason.
+    // (Release is `panic = "abort"`, so the panic half is a debug/dev-host-boot diagnostic — which
+    // is exactly where the live boots run.) URL still NEVER bound to a log macro.
+    match fired {
+        Some(fired) => fired,
+        None => {
             tracing::warn!(
                 target: "android.webkit.WebView",
                 widget,
                 state,
-                error = %e,
-                "internalLoadChanged upcall failed (no callback delivered; URL never logged)"
+                "internalLoadChanged upcall did not complete — the main-thread dispatch panicked or \
+                 could not attach to the JVM (no callback delivered; URL never logged)"
             );
             false
         }
     }
 }
 
-/// The upcall body on the attached reader thread. The registry lock is held ONLY to create a
+/// The upcall body on the attached MAIN thread (2026-07-16). The registry lock is held ONLY to create a
 /// local ref of the recorded global (one JNI call — the `with_jobject` lock contract); the Java
 /// dispatch itself runs OUTSIDE the lock, because `onPageStarted`/`onPageFinished` is app code
 /// that may synchronously re-enter WebView natives (→ the registry).
@@ -9755,10 +10046,20 @@ fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError
     checked(env, "WebView.widget=", |env| {
         env.set_field(&webview, jni_str!("widget"), &long_sig, handle.into())
     })?;
-    let client_class = checked(env, "find_class android.webkit.WebViewClient", |env| {
-        env.find_class(jni_str!("android/webkit/WebViewClient"))
-    })?;
-    let client_obj = checked(env, "WebViewClient.<init>", |env| {
+    // 2026-07-16 (web-engine M6): the DRIVEN client is EclipseWebViewClientProbe, NOT a stock
+    // `new WebViewClient()`. The stock client's page callbacks are EMPTY BODIES that construct no
+    // Handler — which is EXACTLY why this harness passed green while every real app callback threw
+    // (challenge17/18). The probe carries the app's real shape (`new Handler()`, the
+    // SwipeRefreshLayout.setRefreshing -> View.startAnimation chain) plus the AOSP UI-thread
+    // assertion, so a Looper-less OR merely-non-main dispatch throws, internalLoadChanged returns
+    // false, and the pinned "upcalls 2/2" marker FAILS instead of passing silently. It also
+    // overrides the AOSP 3-arg onPageStarted, pinning the M6 3-arg dispatch end-to-end.
+    let client_class = checked(
+        env,
+        "find_class android.webkit.EclipseWebViewClientProbe",
+        |env| env.find_class(jni_str!("android/webkit/EclipseWebViewClientProbe")),
+    )?;
+    let client_obj = checked(env, "EclipseWebViewClientProbe.<init>", |env| {
         env.new_object(&client_class, jni_sig!("()V"), &[])
     })?;
     checked(env, "WebView.setWebViewClient", |env| {
@@ -10282,6 +10583,7 @@ extern "system" fn web_view_native_evaluate_javascript<'local>(
         if !callback.is_null() {
             match env.new_global_ref(&callback) {
                 Ok(g) => {
+                    note_non_main_callback_registrar("evaluateJavascript ValueCallback");
                     if let Ok(mut cbs) = eval_callbacks().lock() {
                         cbs.insert(request_id, (widget, webview_close_era(), g));
                     }
@@ -10622,6 +10924,7 @@ extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
         let request_id = crate::webview::client::next_request_id();
         if !callback.is_null() {
             if let Ok(g) = env.new_global_ref(&callback) {
+                note_non_main_callback_registrar("setCookie(3-arg) ValueCallback");
                 if let Ok(mut cbs) = cookie_set_callbacks().lock() {
                     cbs.insert(request_id, g);
                 }
@@ -10696,6 +10999,7 @@ fn web_view_cookie_manager_remove_impl<'local>(
         let request_id = crate::webview::client::next_request_id();
         if !callback.is_null() {
             if let Ok(g) = env.new_global_ref(&callback) {
+                note_non_main_callback_registrar("removeAll/SessionCookies ValueCallback");
                 if let Ok(mut cbs) = cookie_clear_callbacks().lock() {
                     cbs.insert(request_id, g);
                 }
@@ -10866,6 +11170,37 @@ fn parse_set_cookie(value: &str) -> ParsedSetCookie {
     out
 }
 
+/// The serialized-JSON byte length of each bridge argument — the payload-free shape the A3 receipt
+/// line binds (plan M6, 2026-07-10). Argument VALUES are never logged; only their lengths, so a
+/// page passing a secret token as a bridge arg leaks nothing. Pure/unit-pinned.
+fn bridge_arg_lens(args: &[serde_json::Value]) -> Vec<usize> {
+    args.iter()
+        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+        .collect()
+}
+
+/// 2026-07-10 (M6 review fix): gate a bridge `iface`/`method` string for the A3 receipt line.
+/// The receipt logs BEFORE registry validation (a wrong-identifier call is itself the diagnosis),
+/// so at that point the strings are PAGE-CONTROLLED — any page script can call `window.cefQuery`
+/// with arbitrary strings (e.g. a full URL or a session token), and binding them verbatim to a
+/// default INFO line would break the scheme+host log contract. A Java-identifier shape
+/// (`[A-Za-z_$][A-Za-z0-9_$]*`, <= 64 bytes — the app-authored bridge surface; a URL can never
+/// match) passes verbatim; anything else binds as the static `"<non-identifier>"`. Pure/unit-pinned.
+fn bridge_identifier_for_log(s: &str) -> &str {
+    let mut chars = s.chars();
+    let identifier_shaped = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+            s.len() <= 64 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        }
+        _ => false,
+    };
+    if identifier_shaped {
+        s
+    } else {
+        "<non-identifier>"
+    }
+}
+
 /// Format a cookie list into Android's `getCookie` string: `"name1=value1; name2=value2"`. Pure.
 fn format_cookies(cookies: &[crate::webview::proto::CookieEntry]) -> String {
     cookies
@@ -10954,6 +11289,36 @@ fn number_or_quote(s: &str) -> String {
 
 // --- The JNI upcall layer (reflective bridge invoke + ValueCallback dispatch) --------------------
 
+/// 2026-07-16 (web-engine M6, row 2 DEFERRED — AGENTS.md §6): one loud line the FIRST time a page
+/// bridge call ever reaches Eclipse. The `eclipse-webview-upcall` thread matches AOSP's thread
+/// IDENTITY for `@JavascriptInterface` (`WebView.java:1915-1918`: "a private, background thread of
+/// this WebView", precisely so a bridge method MAY BLOCK) but has NO android.os.Looper — so a
+/// bridge method that constructs a Handler throws exactly as the page callbacks did (ATL
+/// `Handler.java:197`). Zero bridge calls have ever reached Eclipse, so there is no confirmed
+/// TRIGGER to fix (CLAUDE.md); this line is the trigger's alarm. If the next log line is a
+/// described "Can't create handler inside thread that has not called Looper.prepare()", the
+/// deferral has fired: implement the DRAINED HandlerThread analogue on this thread
+/// (`Looper.prepare` + a Rust drive of its own queue interleaved with the mpsc recv). Do NOT move
+/// it to main (that would be a new AOSP divergence and would park winit on a 5 s getCookie), and do
+/// NOT prepare an UNDRAINED Looper here (every `Handler.post` would silently vanish — worse than
+/// the throw).
+static BRIDGE_CALL_LOOPER_NOTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_first_bridge_call_thread() {
+    if !BRIDGE_CALL_LOOPER_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "android.webkit.WebView",
+            thread = std::thread::current().name().unwrap_or("eclipse-webview-upcall"),
+            "FIRST page bridge call reached Eclipse — it runs on the Looper-less upcall thread \
+             (AOSP's thread IDENTITY is correct here; only the Looper is missing — web-engine M6 \
+             row 2, deferred 2026-07-16). If the following line is a described \"Can't create \
+             handler…\" throw, the deferral's trigger has fired: build the drained HandlerThread \
+             analogue on this thread."
+        );
+    }
+}
+
 /// Fire a page-invoked bridge call: parse the payload, reflect-invoke the retained
 /// `@JavascriptInterface` method, and return `(ok, result_json)` for the `BridgeResult` reply.
 /// Attaches + `catch_unwind` (the `fire_web_view_internal_load_changed` shape). Runs on the client
@@ -10967,6 +11332,7 @@ pub fn fire_bridge_call(
     call_id: u32,
     payload_json: &str,
 ) -> (bool, String) {
+    note_first_bridge_call_thread();
     let result: Result<(bool, String), FrameworkError> =
         java_vm.attach_current_thread(|env: &mut Env| {
             match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -11004,6 +11370,23 @@ fn fire_bridge_call_inner(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+
+    // 2026-07-10 (plan M6): the A/B verdict evidence for the silent-bridge diagnosis — a page that
+    // calls the bridge produces THIS line. It logs BEFORE registry validation (a wrong-identifier
+    // call is itself the diagnosis), so iface/method are page-controlled HERE — the
+    // identifier-shape gate keeps anything URL/token-shaped out of the default log (M6 review
+    // fix); the app's real registered identifiers always pass verbatim. Arg VALUES are never
+    // bound (lengths only).
+    tracing::info!(
+        target: "android.webkit.WebView",
+        widget,
+        call_id,
+        iface = bridge_identifier_for_log(iface),
+        method = bridge_identifier_for_log(method),
+        args = args.len(),
+        arg_lens = ?bridge_arg_lens(&args),
+        "bridge call received (arg values not logged)"
+    );
 
     // Snapshot UNDER the registry lock: local refs of the object + resolved Method + metadata, so
     // the reflect-invoke runs OUTSIDE the lock (the method may re-enter WebView natives → registry).
@@ -11263,6 +11646,36 @@ fn object_to_string(env: &mut Env, obj: &JObject) -> Option<String> {
     }
 }
 
+/// 2026-07-16 (recorded divergence, AGENTS.md §6): note ONCE if an app-facing WebView
+/// ValueCallback is registered from a thread that is NOT main. AOSP fires `evaluateJavascript`'s
+/// callback on the UI thread (`WebView.java:876-879`) and `setCookie`'s 3-arg callback on "the
+/// current thread's Looper" (`CookieManager.java:142-148`; Chromium's
+/// `AwCookieManager.CookieCallback.convert` captures `new Handler()` on the CALLING thread and
+/// THROWS from a Looper-less one). Eclipse pumps exactly ONE Looper — main — so it fires every one
+/// of them on main: byte-identical to AOSP for a main-thread caller, and the only non-swallowing
+/// choice for any other (an unpumped Looper would eat the post). Every caller observed to date is
+/// main. This line is how we would learn otherwise, on the first boot it happens — it converts an
+/// assumption into a fact rather than leaving it in a parenthesis. No JNI: [`MAIN_THREAD_ID`] is
+/// the ART main thread's Rust `ThreadId`, and an app's Java thread is a distinct one.
+static NON_MAIN_REGISTRAR_NOTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_non_main_callback_registrar(what: &'static str) {
+    let main = MAIN_THREAD_ID.get();
+    if main.is_some()
+        && main != Some(&std::thread::current().id())
+        && !NON_MAIN_REGISTRAR_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            target: "android.webkit.WebView",
+            registered_by = what,
+            "an app-facing WebView ValueCallback was registered from a NON-main thread — Eclipse \
+             will fire it on main (it pumps only the main Looper), which diverges from AOSP's \
+             \"the caller's Looper\" for setCookie. Recorded divergence, 2026-07-16; logged once."
+        );
+    }
+}
+
 /// Clear a pending JNI exception (describe+clear), best-effort.
 fn clear_pending(env: &mut Env) {
     if env.exception_check() {
@@ -11287,7 +11700,7 @@ pub fn fire_evaluate_js_result(java_vm: &JavaVM, request_id: u32, ok: bool, valu
         );
         return;
     };
-    fire_string_callback_global(java_vm, &global, value);
+    fire_string_callback_global(java_vm, global, value);
 }
 
 /// 2026-07-09 fix (view-closed-mid-eval leak): fail every in-flight `evaluateJavascript`
@@ -11318,7 +11731,7 @@ pub fn drain_eval_callbacks_for_view(java_vm: &JavaVM, widget: jlong, upto_era: 
          ValueCallback honestly (onReceiveValue(\"null\"))"
     );
     for (_id, g) in drained {
-        fire_string_callback_global(java_vm, &g, "null");
+        fire_string_callback_global(java_vm, g, "null");
     }
 }
 
@@ -11363,13 +11776,13 @@ pub fn drain_all_webview_callbacks(java_vm: &JavaVM, reason: &str) {
         "web engine helper gone with ValueCallbacks still in flight — failing each honestly"
     );
     for (_widget, _era, g) in evals {
-        fire_string_callback_global(java_vm, &g, "null");
+        fire_string_callback_global(java_vm, g, "null");
     }
     for g in sets {
-        fire_boolean_callback_global(java_vm, &g, false);
+        fire_boolean_callback_global(java_vm, g, false);
     }
     for g in clears {
-        fire_boolean_callback_global(java_vm, &g, false);
+        fire_boolean_callback_global(java_vm, g, false);
     }
 }
 
@@ -11383,32 +11796,39 @@ pub fn fire_cookies_clear_result(java_vm: &JavaVM, request_id: u32) {
     fire_boolean_result(java_vm, cookie_clear_callbacks(), request_id, true);
 }
 
-/// Fire `onReceiveValue(String)` on a retained callback global (attach + catch_unwind shape).
-fn fire_string_callback_global(java_vm: &JavaVM, global: &Global<JObject<'static>>, value: &str) {
-    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let local = env.new_local_ref(global.as_obj())?;
-            fire_string_value_callback(env, &local, value);
-            Ok::<(), FrameworkError>(())
-        })) {
-            Ok(r) => r,
-            Err(_) => Err(FrameworkError::Panicked),
-        }
-    });
+/// Fire `onReceiveValue(String)` on a retained callback global.
+///
+/// 2026-07-16 (M6 root fix): dispatched on the MAIN (UI) thread. `WebView.java:876-879` is
+/// explicit — "This method must be called on the UI thread and the callback will be made on the UI
+/// thread." Takes the `Global` BY VALUE: `jni 0.22`'s `Global` is not `Clone`, the job must own it
+/// ('static), and this also moves the DROP onto main (an attached thread) — `Global::drop` on an
+/// unattached thread forces a temporary scoped attach with a severe penalty (jni global.rs:77-85).
+fn fire_string_callback_global(java_vm: &JavaVM, global: Global<JObject<'static>>, value: &str) {
+    let value = value.to_string();
+    let _ = dispatch_webview_callback_on_main(
+        java_vm,
+        "ValueCallback.onReceiveValue(String)",
+        move |env: &mut Env| match env.new_local_ref(global.as_obj()) {
+            Ok(local) => fire_string_value_callback(env, &local, &value),
+            Err(_) => clear_pending(env),
+        },
+    );
 }
 
-/// Fire `onReceiveValue(Boolean.valueOf(ok))` on a retained callback global (attach shape).
-fn fire_boolean_callback_global(java_vm: &JavaVM, global: &Global<JObject<'static>>, ok: bool) {
-    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let local = env.new_local_ref(global.as_obj())?;
-            fire_boolean_value_callback(env, &local, ok);
-            Ok::<(), FrameworkError>(())
-        })) {
-            Ok(r) => r,
-            Err(_) => Err(FrameworkError::Panicked),
-        }
-    });
+/// Fire `onReceiveValue(Boolean.valueOf(ok))` on a retained callback global.
+///
+/// 2026-07-16 (M6 root fix): dispatched on the MAIN (UI) thread. `CookieManager.java:142-148` says
+/// "the current thread's Looper" — the caller's; Eclipse pumps only main's, and every observed
+/// caller IS main (recorded divergence + the [`note_non_main_callback_registrar`] alarm).
+fn fire_boolean_callback_global(java_vm: &JavaVM, global: Global<JObject<'static>>, ok: bool) {
+    let _ = dispatch_webview_callback_on_main(
+        java_vm,
+        "ValueCallback.onReceiveValue(Boolean)",
+        move |env: &mut Env| match env.new_local_ref(global.as_obj()) {
+            Ok(local) => fire_boolean_value_callback(env, &local, ok),
+            Err(_) => clear_pending(env),
+        },
+    );
 }
 
 /// Shared: remove the one-shot callback under `request_id` and fire `onReceiveValue(Boolean)`.
@@ -11426,7 +11846,7 @@ fn fire_boolean_result(
         );
         return;
     };
-    fire_boolean_callback_global(java_vm, &global, ok);
+    fire_boolean_callback_global(java_vm, global, ok);
 }
 
 /// Fire `ValueCallback.onReceiveValue(String)` on `callback` (a live local ref); a throwing
@@ -15216,6 +15636,75 @@ pub fn register_engine_preload_natives(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
+/// The two JNI calls of lifecycle step 0 (`find_class` + `Looper.prepareMainLooper()V`), plus the
+/// [`MAIN_THREAD_ID`] record. Shared by [`drive_application_lifecycle`]'s step 0 (whose surrounding
+/// comment block stays at its call site) and [`prepare_main_looper`].
+///
+/// 2026-07-16: NOT idempotent — the pre-2026-07-16 step-0 comment claimed it was, and that was
+/// stale. On the SAME thread ATL `Looper.java:76-78` throws
+/// `RuntimeException("Only one Looper may be created per thread")` from `prepare(false)`; from a
+/// DIFFERENT thread `Looper.java:92-94` throws
+/// `IllegalStateException("The main Looper has already been prepared.")`. Call it exactly once per
+/// process, on the process main thread. [`drive_application_lifecycle`] and [`prepare_main_looper`]
+/// are never both driven in one process (`__webview-test` drives no lifecycle).
+fn prepare_main_looper_inner(env: &mut Env) -> Result<(), FrameworkError> {
+    let looper_class = env.find_class(LOOPER_CLASS)?;
+    checked(env, "step 0 Looper.prepareMainLooper", |env| {
+        env.call_static_method(
+            &looper_class,
+            jni_str!("prepareMainLooper"),
+            jni_sig!("()V"),
+            &[],
+        )?
+        .v()
+    })?;
+    // The UI thread's identity, recorded once — the dispatch gate's whole basis (2026-07-16).
+    let _ = MAIN_THREAD_ID.set(std::thread::current().id());
+    Ok(())
+}
+
+/// Prepare the ART main `Looper` on THIS (main) thread — [`drive_application_lifecycle`]'s step 0,
+/// exposed 2026-07-16 for the dev-host `__webview-test`, which boots ART WITHOUT the lifecycle and
+/// therefore had NO main Looper and NO pump: its WebView callbacks were delivered Looper-less and it
+/// never noticed. That, plus its stock no-Handler `WebViewClient` (now the overlay's
+/// `EclipseWebViewClientProbe`), is exactly why the harness was blind to the challenge17/18 root
+/// cause. Binds the natives the main Looper needs FIRST, in the same order the lifecycle drive
+/// binds them:
+///  - [`register_system_clock_natives`] — `MessageQueue.next()` reads `SystemClock.uptimeMillis()`
+///    (ATL `MessageQueue.java:143`) on EVERY pump tick. 2026-07-16 MEASURED: without this the very
+///    first [`pump_main_looper`] threw `UnsatisfiedLinkError: No implementation found for long
+///    android.os.SystemClock.uptimeMillis()` out of `MessageQueue.next`, so the harness prepared a
+///    main Looper it could never pump — the prepared-but-undrained shape this whole fix rejects as
+///    worse than a loud throw. The lifecycle drive gets this from its own `register_*` block; a
+///    Looper prepared through THIS entry point must carry it too, or "prepared" is a lie.
+///  - [`register_message_queue_natives`] — `prepareMainLooper` constructs the main `MessageQueue`,
+///    whose ctor calls `nativeInit` (the ordering rule documented on that function).
+///
+/// `&Vm` is `!Send`, pinning this to the boot/main thread.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java
+/// error; [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn prepare_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
+    // by the `&Vm` borrow — exactly `from_raw`'s contract (the `pump_main_looper` precedent below).
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            register_system_clock_natives(env)?;
+            register_message_queue_natives(env)?;
+            prepare_main_looper_inner(env)
+        })) {
+            Ok(r) => r,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
 /// Dispatch a click to the [`view_registry`] view identified by `handle` by calling the public Java
 /// `View.performClick()Z` on its recorded global object — firing the registered `OnClickListener`.
 ///
@@ -15291,6 +15780,17 @@ fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
     // getTarget → dispatchMessage → recycle, exactly ATL's Looper.loop) but caps the work per tick, so
     // about_to_wait always returns and stays responsive. When idle it drains fully in << budget
     // (identical to loop()); only a storm hits the cap.
+    //
+    // 2026-07-16 (web-engine M6 root fix): run the pending app-facing WebView callback FIRST, on
+    // THIS (main) thread — the one thread with a prepared android.os.Looper (step 0) — then
+    // dispatch the messages it posted in the SAME UI-thread turn (the app's real shape:
+    // onPageStarted -> SwipeRefreshLayout.setRefreshing -> View.startAnimation -> Animation.start
+    // -> new Handler().post). It runs INSIDE MAIN_LOOPER_PUMP_IN_PROGRESS (the job is real app
+    // code — strictly more re-entrant than a Looper message) and inside pump_main_looper's
+    // catch_unwind, and it reuses this function's `env`: no second attach, no new `unsafe`.
+    // At most ONE job exists (the poster blocks), so this cannot storm the way
+    // MAIN_LOOPER_MESSAGE_BUDGET exists to bound.
+    run_pending_main_upcall(env);
     let result = drive_main_messages(env);
     let _ = MAIN_LOOPER_PUMP_IN_PROGRESS.try_with(|f| f.set(false));
     result?;
@@ -16547,18 +17047,10 @@ fn drive_lifecycle(
     // main `Looper` must exist before step 4 builds the Activity — otherwise the Activity ctor throws
     // `RuntimeException: Can't create handler inside thread that has not called Looper.prepare()`
     // (2026-06-05, surfaced by com.ashwin.example.accelerometerdemo; the pure-Java demo_app Activity
-    // never touched a Handler, so this gap was previously latent). Idempotent for the process: the
-    // main Looper is prepared once. `.v()` asserts the void return.
-    let looper_class = env.find_class(LOOPER_CLASS)?;
-    checked(env, "step 0 Looper.prepareMainLooper", |env| {
-        env.call_static_method(
-            &looper_class,
-            jni_str!("prepareMainLooper"),
-            jni_sig!("()V"),
-            &[],
-        )?
-        .v()
-    })?;
+    // never touched a Handler, so this gap was previously latent).
+    // 2026-07-16: NOT idempotent — see prepare_main_looper_inner (ATL Looper.java:76-78/92-94 both
+    // throw on a second call).
+    prepare_main_looper_inner(env)?;
 
     // Step 1: `static Context.createApplication(jlong native_window) -> Application`.
     // 2026-06-05: the handle is now a REAL Eclipse-owned registry handle (was the placeholder `0`):
@@ -19398,6 +19890,53 @@ mod tests {
     }
 
     #[test]
+    fn bridge_arg_lens_returns_serialized_lengths_and_never_the_values() {
+        // 2026-07-10 (plan M6) PRIVACY pin: the A3 bridge-receipt line binds arg LENGTHS only — a
+        // secret bridge arg value never appears. bridge_arg_lens returns usize lengths (structurally
+        // value-free); pin the serialized-JSON length semantics and that the Debug rendering the
+        // receipt line binds (arg_lens = ?..) carries no value substring.
+        use serde_json::json;
+        let args = vec![json!("SECRETTOKEN"), json!(42), json!(true), json!(null)];
+        let lens = bridge_arg_lens(&args);
+        // "SECRETTOKEN" serializes to `"SECRETTOKEN"` = 13 bytes; 42 → 2; true → 4; null → 4.
+        assert_eq!(lens, vec![13, 2, 4, 4]);
+        assert!(
+            !format!("{lens:?}").contains("SECRET"),
+            "arg_lens must never echo an arg value"
+        );
+        assert_eq!(bridge_arg_lens(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn bridge_identifier_for_log_passes_identifiers_and_redacts_page_controlled_shapes() {
+        // 2026-07-10 (M6 review fix) PRIVACY pin: the A3 receipt line binds iface/method from
+        // INSIDE the page-controlled cefQuery payload BEFORE registry validation — any page script
+        // can call window.cefQuery with arbitrary strings, so a URL/token-shaped string must never
+        // reach the default log verbatim, while the app's real bridge identifiers always must.
+        assert_eq!(
+            bridge_identifier_for_log("__globalRobloxAndroidBridge__"),
+            "__globalRobloxAndroidBridge__"
+        );
+        assert_eq!(bridge_identifier_for_log("emitEvent"), "emitEvent");
+        assert_eq!(bridge_identifier_for_log("$fn_1"), "$fn_1");
+        // URL-shaped / non-identifier page strings redact to the static marker.
+        for hostile in [
+            "https://apps.roblox.com/challenge?token=SECRETTOKEN",
+            "name with spaces",
+            "1leadingdigit",
+            "",
+            "semi;colon",
+        ] {
+            assert_eq!(bridge_identifier_for_log(hostile), "<non-identifier>");
+        }
+        // Overlong alphanumeric blobs (token-shaped) redact; the 64-byte boundary passes.
+        let over = "A".repeat(65);
+        assert_eq!(bridge_identifier_for_log(&over), "<non-identifier>");
+        let max = "A".repeat(64);
+        assert_eq!(bridge_identifier_for_log(&max), max);
+    }
+
+    #[test]
     fn bridge_return_number_or_quote_embeds_valid_numbers_and_quotes_the_rest() {
         // 2026-07-09: a numeric toString embeds as a JSON number; NaN/Infinity/garbage are quoted.
         assert_eq!(number_or_quote("42"), "42");
@@ -19438,6 +19977,35 @@ mod tests {
         assert_eq!(victims, vec![1, 2]);
         // The other widget's own drain selects exactly its own pre-close entry.
         assert_eq!(eval_drain_victims(&m, 9, 0), vec![4]);
+    }
+
+    /// 2026-07-16: the delivery gate for app-facing WebView callbacks. `Post` is the AOSP-correct
+    /// lane (the main/UI Looper — the ONE thread with a prepared android.os.Looper, lifecycle step
+    /// 0); the four inline arms are the honest degradations, and on-main wins FIRST because
+    /// running there IS the contract, not a degradation. Guards the new ladder's own logic — the
+    /// bug itself is reproduced by `__webview-test`'s EclipseWebViewClientProbe (Guard 1).
+    #[test]
+    fn webview_callback_gate_prefers_the_main_looper_and_degrades_honestly() {
+        use MainDispatchGate::*;
+        assert_eq!(main_dispatch_gate(false, true, true, true), Post);
+        assert_eq!(
+            main_dispatch_gate(true, true, true, true),
+            InlineOnMainThread
+        );
+        // On-main wins even when nothing else is set up — running here IS the contract.
+        assert_eq!(
+            main_dispatch_gate(true, false, false, false),
+            InlineOnMainThread
+        );
+        assert_eq!(
+            main_dispatch_gate(false, false, true, true),
+            InlineNoMainLooper
+        );
+        assert_eq!(
+            main_dispatch_gate(false, true, false, true),
+            InlineDrainRetired
+        );
+        assert_eq!(main_dispatch_gate(false, true, true, false), InlineSlotBusy);
     }
 
     #[test]

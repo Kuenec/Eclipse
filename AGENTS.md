@@ -128,6 +128,105 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — 🧵 WEB-ENGINE M6: THE LIVE BOOTS RAN, THE 2026-07-10 PASS IS VALIDATED, AND A **NEW, DEEPER ROOT
+  CAUSE WAS FOUND AND FIXED** — app-facing WebView callbacks were delivered on a Looper-LESS thread, so BOTH real
+  page callbacks threw on every boot; they now run on the ART MAIN (UI) thread per AOSP. Implemented + gate green +
+  LIVE-VERIFIED (full record in §6 2026-07-16 🧵).** THREE owner live boots on the dev-host main thread
+  (`env -u RUST_LOG`, `timeout 180`, stage-0 tap `400,413` + the full 5-stage synthetic chain, all zero-orphan,
+  all EXIT=124 clean-timeout): `/tmp/eclipse-challenge17.log` (1416 lines, the M5-tree+2026-07-10-pass baseline),
+  `/tmp/eclipse-challenge18-consolediag.log` (1476 lines, `ECLIPSE_WEBVIEW_CONSOLE=1`), and
+  `/tmp/eclipse-challenge19-looper.log` (1321 lines, the post-fix verdict). **2026-07-10 PASS VALIDATED:** (C) the
+  3-arg `onPageStarted` overlay fix is **CONFIRMED** — the app's real `onPageStarted` override ran for the FIRST
+  TIME EVER (suspect 3 was real and is dead); (D) eager CloseView is **CONFIRMED** — teardown went from
+  challenge16's ~40 s stale full-window composite with NO `ViewClosed` to **2 ms** to eager-close + **29 ms** to
+  `ViewClosed`, both boots; (A) the console diagnostic **WORKED** and is what cracked the case. **THE NEW ROOT
+  CAUSE (confirmed by stack trace, reproduced in 2/2 independent boots, then reproduced under `cargo test`):**
+  Eclipse delivered every app-facing WebView callback from the bare-spawned `eclipse-webview-upcall` thread;
+  `attach_current_thread` attaches it to ART but NOTHING calls `Looper.prepare()` there, so ATL `Handler.java:197`
+  read `Looper.myLooper()` → null and threw *"Can't create handler inside thread that has not called
+  Looper.prepare()"* inside the app's `onPageStarted`/`onPageFinished` → `SwipeRefreshLayout.setRefreshing` →
+  `View.startAnimation` → `Animation.start` → `new Handler()`. **EXACTLY 2 throws + 2
+  `step="WebView.internalLoadChanged"` failures per boot, every boot.** The M4 threading fix had traded the
+  reader-deadlock axis for a Looper axis; AOSP delivers these on the UI thread and **no** app-facing WebView
+  callback in real Android is EVER delivered on a Looper-less thread. **THE FIX:** every UI-thread-contract WebView
+  callback now runs on Eclipse's MAIN thread (the one that ran `Looper.prepareMainLooper()` at lifecycle step 0 and
+  whose queue the winit loop already pumps), via an Eclipse-owned pure-Rust job slot
+  (`dispatch_webview_callback_on_main`) drained in `run_main_looper_once` just before `drive_main_messages`. The
+  poster BLOCKS deliberately — that is what keeps `fire_web_view_internal_load_changed`'s `bool` meaning exactly
+  "the app's callback completed" (the pinned `upcalls 2/2` marker) AND keeps the single upcall thread the one
+  serializer so global FIFO is unchanged. **LIVE VERDICT (challenge19 vs challenge17):** Looper throws **2 → 0**;
+  `internalLoadChanged` failures **2 → 0**; total `framework lifecycle step failed` **3 → 1** (only the known
+  upgrade-dialog `NotFoundException` remains); the app's OWN `onPageFinished. url=` log line **0 → 1** (its handler
+  now runs PAST `setRefreshing` to its own logging statement); **zero** new ULE/NPE (the native-binding ceiling
+  holds); zero orphans; privacy greps clean. Gate MEASURED green 2026-07-16: root **643 unit + 6 integ + 2 doctest,
+  0 failed, ZERO SKIP** (measured pre-change baseline **642**+6+2 — note the 2026-07-10 bullet's "641" was a
+  one-test documentation drift, corrected here); helper **34 + 15**; `fmt`/`build --all-targets`/`clippy -D
+  warnings`/`build --release` clean in BOTH crates; `patch-framework.sh` green (`classes2.dex` byte-identical at
+  77660, `classes.dex` 20260 → 21280 = the new probe). **THE REGRESSION GUARD HAS TEETH FOR THE FIRST TIME:** the
+  new overlay `EclipseWebViewClientProbe` gives `__webview-test`'s driven WebViewClient the app's REAL shape
+  (`new Handler()` + a `myLooper()==getMainLooper()` UI-thread assertion) — the stock client's EMPTY callbacks are
+  exactly why the harness passed green while every real app callback threw. **PROVEN by reproduce-then-fix:**
+  pre-fix `cargo test --test engine_milestones webview_test_fires_load_upcalls_and_stages_frames` FAILED with
+  *"only 0/2 internalLoadChanged upcalls completed within 10 s"*; post-fix it PASSES `upcalls 2/2`. ⇐
+  **START-HERE-NEXT: the BRIDGE IS STILL SILENT — and it is now PROVEN to be an INDEPENDENT defect, not a
+  consequence of any of the above.** The page's console fingerprint is byte-for-byte identical before and after the
+  Looper fix (`len=` 17/72/9/~17/79/75/45/71/5/78 in challenge18 AND challenge19), so fixing the callbacks did not
+  change page behaviour at all. The `ECLIPSE_WEBVIEW_CONSOLE=1` boot captured the page's own words: it DOES run the
+  challenge and fires all four hybrid calls — `Hybrid Wrapper: Sending hybrid call: challengePageLoaded` /
+  `challengeParsed` / `challengeInitialized` / `challengeDisplayed` — but EVERY ONE goes **`to origin: undefined`**,
+  which is postMessage vocabulary, NOT Android-bridge vocabulary; plus `The namespace CommonUI.Messages was not
+  found` (warn) and an arkoselabs `Error` (verbose). Zero `bridge call received`, ever, in challenge16/17/18/19.
+  Stubs are demonstrably in place ~490 ms BEFORE the wrapper speaks, so a plain injection race is RULED OUT. The
+  ranked suspect is now **suspect 2 (UA steering)** — the honest desktop-Linux `X11; Linux x86_64` UA steering the
+  hybrid page down its web/postMessage path instead of its Android path — which is **M4's pre-registered OPEN
+  QUESTION #1 and an explicit OWNER RULING** (`engine.rs` `ECLIPSE_USER_AGENT` doc: *"if an anti-bot vendor refuses
+  this for a real human, the owner rules on presenting the app's genuine Android-WebView-context UA — faithful,
+  since Eclipse runs the Android build"*; a `!contains("Android")` unit test pins the current policy). NEXT STEP =
+  a UA A/B **diagnostic** (temporary, env-gated, dev-host only) to CONFIRM or REFUTE steering by evidence before
+  anyone touches the pinned UA policy — diagnose before fix; do NOT flip the UA on suspicion.
+- **2026-07-10 — 🔎 WEB-ENGINE M6 DIAGNOSTIC-INSTRUMENTATION + ROOT-FIX PASS (implemented + gate green; the LIVE
+  M6 challenge boot RAN 2026-07-16 and VALIDATED this pass — see the 🧵 bullet above and §6 2026-07-16).** Implements the reviewed
+  plan against the challenge16 silent-bridge blocker (log `/tmp/eclipse-challenge16.log`: the ChallengeHybridWebView
+  page loaded http 200 + fired the first-ever app-side `onPageFinished`, but NEVER called the bridge, and the
+  GC-only teardown left the stale full-window composite over LoginV2 for ~40 s with no `ViewClosed`). Landed, all
+  ADDITIVE, wire protocol UNTOUCHED (PROTO_VERSION stays 2): **(A) observability** — consumer console event promoted
+  debug!→info! so page console is visible on a default boot (structurally text-free; privacy-clean) + a helper-side
+  env-gated (`ECLIPSE_WEBVIEW_CONSOLE=1`, exact "1") RAW-text diagnostic (source still scheme+host, WARN-announced,
+  never a default); renderer `bridge stubs applied mode=sync|refresh ifaces=N methods=N` timestamp line (measures the
+  injection race vs the engine "load started"); consumer `bridge call received … iface= method= call_id= args=
+  arg_lens=[..]` (the A/B verdict for the silent bridge; SHAPE-GATED identifiers+lengths only — pre-validation
+  iface/method are page-controlled, so URL/token-shaped strings bind as `<non-identifier>` — no arg values); helper cookie
+  `rejected … — <predicate> (url=<scheme+host> domain=<domain> name_len= value_len=)` classifier (mirrors CEF's
+  documented set_cookie sync-false predicates + an async log-only completion on the 2-arg path). **(B) root fix for
+  the injection race** — a RELIABLE `on_render_view_ready` bridge-inventory re-push (fires for the initial renderer
+  AND every process swap) + TRULY-synchronous stub injection via `V8Context::eval` in `on_context_created` (router
+  first so `window.cefQuery` exists, then eval before any page script runs), the pull-model backstop kept. **(C)
+  overlay (via `patch-framework.sh`)** — WebView.`internalLoadChanged` now dispatches AOSP's **3-arg**
+  `onPageStarted(WebView,String,Bitmap)` at state 0 (the confirmed suspect-3 mechanism: ATL only ever called the
+  2-arg form AOSP does not declare, so an AOSP-compiled app override never received state-0), onPageFinished stays
+  2-arg; a NEW WebViewClient shadow lands the AOSP base 3-arg onPageStarted (chaining to the 2-arg for legacy
+  overriders) + `shouldOverrideUrlLoading(WebView,String)`→false (base surface only — DISPATCH deliberately NOT
+  wired this pass; recorded in §6). **(D) eager CloseView on detach** (plan §7 #9) — `ViewGroup.native_removeView`
+  now subtree-tests the removed root for the ACTIVE WebView (`view_registry::subtree_contains`; the WebView is a
+  DESCENDANT of the removed fragment root, not the direct child) and CAS-gated `client::notify_view_detached` eager-
+  closes so the composite releases immediately. Gate MEASURED green 2026-07-10: root **641 unit + 6 integ + 2
+  doctest, 0 failed, ZERO SKIP** (was 638+6+2 at M5); helper (`CEF_PATH` = the M1 dist) **34 + 15**, 0 failed (was
+  28+15); `cargo fmt --all --check` / `build --all-targets` / `clippy --all-targets --all-features -D warnings` /
+  `build --release` clean in BOTH crates; `tools/framework-overlay/patch-framework.sh` exits green (rebuilt the
+  3-dex overlay at `~/.cache/eclipse/framework-patched`; its anchor/pristine-body/back-check greps — incl. the new
+  WebViewClient 3-arg + shouldOverrideUrlLoading + internalLoadChanged pristine-body + 3-arg-invoke + no-2-arg-invoke
+  guards — are the overlay regression guards; disassembly of the built classes2.dex confirmed all three methods).
+  ✅ **THAT LIVE BOOT RAN 2026-07-16 — VERDICTS (full record in the 🧵 §5 bullet above + §6 2026-07-16):
+  (C) 3-arg `onPageStarted` CONFIRMED** (the app's override ran for the first time ever — suspect 3 was real);
+  **(D) eager CloseView CONFIRMED** (2 ms + 29 ms `ViewClosed` vs challenge16's ~40 s stale composite);
+  **(A) console diag CONFIRMED and decisive** (it captured the page's own hybrid calls). **(B) sync injection: the
+  boot logs `mode=refresh`, NOT `mode=sync`** — the renderer's inventory is empty at `on_context_created` on a
+  fresh renderer, so the pull backstop still wins; the recorded escalation (delay the driven load until
+  inventory-ack) stays a follow-up. It did NOT matter: the stubs land ~490 ms BEFORE the page's wrapper speaks, so
+  the injection race is RULED OUT as the bridge blocker. **The A/B verdict came back SILENT** (zero
+  `bridge call received` in challenge16/17/18/19) — and the residual predicted right here is now the live frontier:
+  **suspect 2 (UA steering), an OWNER RULING.** This pass's real payoff was making the verdict readable — which is
+  exactly what exposed the deeper Looper-affinity root cause fixed 2026-07-16.
 - **2026-07-10 — 📦 WEB-ENGINE MILESTONE M5 DONE: distro-agnostic hardening + packaging — the sandbox tier ladder
   (unprivileged-userns live-usability probe → SUID chrome-sandbox per Chromium's own predicate → REFUSE with the
   typed actionable error unless the explicit `webview_allow_unsandboxed` opt-in selects a LOUD logged
@@ -7167,6 +7266,290 @@ landed per the 🔒 entry).
 `tools/webview-dist/README.md`, `.gitignore`, `docs/component-map.md`, `docs/dependency-plan.md`,
 `docs/web-engine-plan.md` (header + M5 Status block), this file (§5 📦 bullet ⇐ START-HERE-NEXT = plan M6;
 §6 this entry). Next session: MILESTONE M6 — the live challenge boot.
+
+### 2026-07-10 — 🔎 WEB-ENGINE M6 diagnostic-instrumentation + root-fix pass (implemented + gate green; the LIVE M6 boot is ORCHESTRATOR-ONLY and has NOT yet run)
+
+*Provenance & scope:* a reviewed implement pass against the challenge16 blocker (log
+`/tmp/eclipse-challenge16.log`, the M5-tree boot EXIT=124). KNOWN from the log: ChallengeHybridWebView →
+`addJavascriptInterface iface=__globalRobloxAndroidBridge__ method_count=1` → `native_loadUrl` forwarded → load
+started → finished http_status=200 → the FIRST-EVER app-side `onPageFinished` — but the page NEVER called the
+bridge (zero BridgeCall/eval/javascript: activity), and the GC-only `notify_view_freed` left the stale full-window
+composite over LoginV2 for ~40 s with NO `ViewClosed`. Ranked suspects for the silent bridge: (1) M4 pull-model
+injection race (renderer stubs injected async AFTER context-ready vs AOSP's synchronous-before-page-scripts); (2)
+honest desktop-Linux Chromium UA steering the hybrid page down a non-Android path; (3) ATL's 2-arg `onPageStarted`
+means an AOSP-3-arg app override never gets state-0 (CONFIRMED by source: ATL WebView.internalLoadChanged calls
+only the 2-arg form; AOSP WebViewClient declares ONLY the 3-arg `onPageStarted(WebView,String,Bitmap)`); (4) the
+async-Promise shape (least likely). Everything ADDITIVE — the socket wire protocol is UNTOUCHED (PROTO_VERSION
+stays 2; the v1/v2 pins are byte-identical); helper-internal CEF process messages are not the wire.
+
+*What landed (A observability / B root-fix / C overlay / D teardown):*
+- **A1 console visibility.** Consumer `HelperMsg::Console` promoted `tracing::debug!`→`info!`
+  (`src/webview/client.rs`) so page console events show on a default boot — the event is STRUCTURALLY text-free
+  (`Console::from_raw` drops the text at construction; `proto.rs` pin untouched), binding only severity + the
+  already-scheme+host source + line + byte length. The full RAW text is a HELPER-side diagnostic gated by
+  `ECLIPSE_WEBVIEW_CONSOLE=1` (exact "1", pure `console_text_diag_enabled`), threaded through `Engine::new` →
+  `HelperDisplayHandler` (new `console_text` field), WARN-announced at startup, source STILL scheme+host even
+  there (`format_console_text_line`); default emits NO extra helper line. Env inherited via the no-`env_clear`
+  spawn (documented in `src/webview/mod.rs` spawn-contract §7).
+- **A2 injection-completion timestamps.** `format_stub_apply_line(mode, ifaces, methods)` → `bridge stubs applied
+  mode=sync|refresh ifaces=N methods=N`, logged at both apply sites in `crates/eclipse-webview/src/main.rs`
+  (counts only, no names). The `logging.rs` ms timestamp makes the race measurable against the engine "load
+  started".
+- **A3 BridgeCall receipt.** `fire_bridge_call_inner` (`src/framework.rs`) logs one INFO
+  `bridge call received … iface= method= call_id= args= arg_lens=[..]` — the A/B verdict for the silent bridge.
+  The receipt logs BEFORE registry validation (a wrong-identifier call is itself the diagnosis), so iface/method
+  are page-controlled there — the M6 review fix binds them through the identifier-shape gate
+  `bridge_identifier_for_log` (`[A-Za-z_$][A-Za-z0-9_$]*`, ≤64 bytes; URL/token-shaped strings bind as the static
+  `<non-identifier>`, the app's real identifiers pass verbatim); arg VALUES never bound (new pure
+  `bridge_arg_lens` → serialized-JSON lengths only; ROBLOSECURITY-style value pin added).
+- **A4 cookie rejection reason.** `classify_cookie_set_rejection(url,name,value,domain,path,secure)` in
+  `crates/eclipse-webview/src/engine.rs` mirrors CEF's documented `set_cookie` sync-false predicates (invalid/
+  non-http(s) URL → name/value/domain/path charset → domain-match → Secure-from-non-https → CEF-internal
+  fallback), applied at BOTH sync-reject sites (`cookie_set`, `cookie_set_for_result`) with a WARN binding url via
+  `RedactedTarget` + domain verbatim + name/value LENGTHS only; the 2-arg path also gains a LOG-ONLY async
+  completion (`LogOnlySetCookieCallback`, emits NO wire message — the v1 fire-and-forget layout stays frozen).
+  challenge16's two 13:39:35.734 sync rejections will now name a predicate; if it says "no local predicate matched
+  — CEF-internal (cookie store unready at first-op …)" the root FIX (completion-gated first op) is a recorded
+  follow-up (diagnose-before-fix).
+- **B synchronous injection (root fix for suspect 1).** `HelperRequestHandler` gained a `state: Shared` field and
+  overrides `on_render_view_ready` (pinned cef-dll-sys doc: fires on the browser UI thread when the render view
+  can receive IPC — for the initial renderer AND after every process swap) to RE-PUSH this view's whole
+  `view_bridges` inventory (the best-effort immediate send in `bridge_register` is kept; the ready-pull backstop
+  is kept). `on_context_created` now injects the stubs TRULY-synchronously via `V8Context::eval` (the same
+  primitive `eval_in_frame` proves) on a clone of the handed-in context — router FIRST so `window.cefQuery`
+  exists, then eval before any page script runs; `CefFrame::ExecuteJavaScript` is NOT contractually synchronous
+  during context creation. The register-message REFRESH path keeps `execute_java_script` (the proven M4 running-
+  page path). Residual (recorded risk): if the M6 boot shows `mode=refresh` after page-script start, the next
+  escalation (delay the driven load until inventory-ack) is a follow-up, not this pass.
+- **C AOSP 3-arg onPageStarted + shouldOverrideUrlLoading base (overlay-only, via `patch-framework.sh`).** All
+  Java-surface changes ride the established baksmali→anchored-perl→grep-back-check pipeline. (1)
+  WebView.`internalLoadChanged` — whole-method anchored replace (pristine-body guard) dispatches the 3-arg
+  `onPageStarted(WebView,String,Bitmap)` (null Bitmap) at state 0, 2-arg `onPageFinished` at state 3; post-greps
+  assert the 3-arg invoke present + the 2-arg onPageStarted invoke ABSENT. (2) NEW WebViewClient shadow into
+  classes2 (stock-only before) adds the AOSP base 3-arg `onPageStarted` (its default body CHAINS to the 2-arg so
+  a legacy ATL-2-arg overrider still receives) + `shouldOverrideUrlLoading(WebView,String)`→false. **DEFERRAL
+  (recorded, dated 2026-07-10):** `shouldOverrideUrlLoading` DISPATCH is scoped DOWN — the base method lands for
+  AOSP class-shape parity (an app @Override resolves; a later dispatch pass is purely additive) but NO call site
+  is wired: AOSP consults it only for NON-driven main-frame navigations, and under the recorded driven-loads-only
+  contract the wire `LoadState` carries no URL and the consumer substitutes the driven URL for every event
+  (`client.rs`), so the overlay cannot honestly identify a non-driven navigation, and honoring a `true` return
+  needs a new synchronous consumer→helper navigation-cancel (a frozen-protocol change) — fabricating a dispatch
+  whose true-return is dishonored would violate the no-workaround rule. challenge16 shows zero post-driven
+  navigations, so no live evidence demands it. `patch-framework.sh` exits green; disassembly of the built
+  classes2.dex confirmed all three methods.
+- **D eager CloseView on detach (plan §7 #9).** androidx fragment teardown funnels
+  `ViewGroup.remove*`→`removeViewInternal`→`native_removeView` (verified in vendored ATL `ViewGroup.java`), and
+  the challenge WebView is a DESCENDANT of the removed fragment ROOT — so `view_group_native_remove_view`
+  (`src/framework.rs`) now subtree-tests the removed child for the ACTIVE view (new
+  `view_registry::subtree_contains` — single lock, iterative DFS, visited-set for totality, stale/dangling
+  handles skipped, LIVE-node match only) and calls `client::notify_view_detached` (new; CAS `ACTIVE_VIEW`
+  widget→0, miss→return, best-effort `CloseView` under the CLIENT lock). No-webview path = one atomic load
+  (§2.4-clean; removeView is not hot). It does NOT drop bridge globals / the tracked entry (the Java object is
+  still alive — GC/`notify_view_freed` owns that; the helper's `ViewClosed` reply removes the tracked entry).
+  Recorded divergence (dated): detach-of-the-active-WebView is treated as teardown; AOSP allows detach-then-
+  reattach, but no recorded boot re-parents the challenge WebView and a false trigger only blanks the composite
+  (made visible by the new INFO line). A `WebView.destroy()` overlay seam was REJECTED this pass (it needs a 6th
+  WebView native, moving the pinned bound=5 line and breaking the frozen M4 `__webview-test` marker) — recorded
+  as the fallback if the M6 boot shows the removeView path is not taken.
+
+*Privacy reconciliation (the recorded contract held):* the default console INFO exposes nothing new (text never
+crosses the wire; source pre-redacted); the full-text channel is env-gated + WARN-announced + source-still-
+redacted; bridge receipt binds shape-gated identifiers + lengths only; cookie WARNs bind url via `RedactedTarget` + domain
+(host-class) + lengths only; renderer/eager-close/render-view-ready lines bind counts/handles only. New pins:
+`console_text_diag_enabled`, `format_console_text_line` (redacted-source), `classify_cookie_set_rejection`
+(predicate table + ROBLOSECURITY no-leak), `generate_stub_js`, `format_stub_apply_line` (helper);
+`bridge_arg_lens` no-value pin + `bridge_identifier_for_log` shape-gate pin (framework); `subtree_contains`
+(self/direct/deep/non-member/stale/cycle); `notify_view_detached` CAS semantics (client).
+
+*Gate (measured 2026-07-10):* root `fmt --all --check` / `build --all-targets` / `clippy --all-targets
+--all-features -- -D warnings` / `test` / `build --release` ALL clean — **641 unit + 6 integ + 2 doctest, 0
+failed, ZERO SKIP** (was 638+6+2 at M5; +3 root pins: subtree_contains, notify_view_detached, bridge_arg_lens).
+Helper (`CEF_PATH=crates/eclipse-webview-spike/cef-dist/linux-x86_64`): same five clean — **34 + 15**, 0 failed
+(was 28+15; +6 helper pins). `tools/framework-overlay/patch-framework.sh` exits green (its own anchor-count /
+pristine-body / back-check greps are the overlay regression guards).
+
+*ORCHESTRATOR-ONLY next (NOT this subagent):* the live M6 boot on the dev-host main thread via `cargo run`
+(the cyber-safeguard false-positives on subagent live-ART/bionic analysis) — `__webview-test` (the M4 marker
+verbatim + a mode=sync/refresh stub-apply line + the console INFO) then the challenge boot (stage-0 tap
+`400,413`, EXIT=124, do NOT wipe `/tmp/atl_cache`) with the §5 grep verdicts; record the A/B bridge verdict and
+the cookie predicate in §5/§6.
+
+*Files:* `src/webview/client.rs`, `src/webview/mod.rs`, `src/framework.rs`,
+`src/framework/view_registry.rs`, `crates/eclipse-webview/src/engine.rs`, `crates/eclipse-webview/src/main.rs`,
+`tools/framework-overlay/patch-framework.sh`, `docs/web-engine-plan.md` (M6 status note), this file (§5 🔎
+bullet + §6 this entry).
+
+### 2026-07-16 — 🧵 WEB-ENGINE M6: the live boots ran; the 2026-07-10 pass VALIDATED; and the REAL root cause found + fixed — app-facing WebView callbacks were delivered on a Looper-LESS thread, violating AOSP's UI-thread contract; they now run on the ART main thread
+
+*Provenance:* THREE owner live boots on the dev-host main thread (orchestrator-only; live ART never in a
+subagent), `env -u RUST_LOG`, `timeout 180`, stage-0 tap `400,413` + the full synthetic chain (stages 1/2
+`278,179`, 3 `400,236`, 4 `241,327`, 5 `349,377`), all EXIT=124 clean-timeout, all zero-orphan:
+`/tmp/eclipse-challenge17.log` (1416 lines) = the 2026-07-10-pass baseline; `/tmp/eclipse-challenge18-consolediag.log`
+(1476 lines) = the same with `ECLIPSE_WEBVIEW_CONSOLE=1`; `/tmp/eclipse-challenge19-looper.log` (1321 lines) = the
+post-fix verdict. NOTE the boot recipe needed a warm-up boot first: `/tmp/atl_cache` did not exist (wiped), and the
+overlay cache was gone too — `patch-framework.sh` was rebuilt first per the recorded invariant.
+
+*The 2026-07-10 pass is VALIDATED (all three landed items confirmed live):* **(C)** the 3-arg
+`onPageStarted(WebView,String,Bitmap)` overlay dispatch is **CONFIRMED** — the app's real `onPageStarted` override
+ran for the FIRST TIME EVER (`[c$k.onPageStarted()-19]` at challenge17:1256). **Suspect 3 was real and is now
+dead.** **(D)** eager CloseView is **CONFIRMED** — challenge16's GC-only teardown left a stale full-window
+composite over LoginV2 for ~40 s with NO `ViewClosed`; challenge17/19 show `Load generic challenge failed` →
+`active WebView detached … eager CloseView` **2 ms** later → `ViewClosed` **29 ms** later. **(A)** the console
+diagnostic **WORKED and was decisive** — it is what cracked the case. **(B) sync injection did NOT engage:** both
+boots log `bridge stubs applied mode=refresh`, never `mode=sync` — on a FRESH renderer the inventory is empty at
+`on_context_created`, so the pull backstop wins and the recorded escalation (delay the driven load until
+inventory-ack) remains a follow-up. **It did not matter:** the stubs land ~490 ms BEFORE the page's wrapper first
+speaks (challenge18: stubs `…396147`, first wrapper console `…396635`), so the injection race is **RULED OUT** as
+the bridge blocker.
+
+*THE ROOT CAUSE (confirmed by stack trace; reproduced 2/2 independent live boots; then reproduced under `cargo
+test`):* Eclipse delivered EVERY app-facing WebView callback from the bare-spawned `eclipse-webview-upcall` thread
+(`client.rs`, `std::thread::Builder`). `JavaVM::attach_current_thread` attaches that thread to ART but **nothing
+ever calls `Looper.prepare()` on it**, so ATL `Handler.java:197` (`mLooper = Looper.myLooper()`) read null and
+threw:
+```
+java.lang.RuntimeException: Can't create handler inside thread that has not called Looper.prepare()
+  at android.os.Handler.<init> <- android.view.animation.Animation.start <- android.view.View.startAnimation
+  <- androidx.swiperefreshlayout.widget.SwipeRefreshLayout.setRefreshing
+  <- com.roblox.client.c$k.onPageStarted <- gi.a$c.onPageStarted <- android.webkit.WebView.internalLoadChanged
+```
+— **exactly 2 throws + 2 `framework lifecycle step failed step="WebView.internalLoadChanged"` per boot, every
+boot**, killing BOTH real page callbacks. The M4 threading hardening (§6 2026-07-10 🌉) correctly moved app JNI OFF
+the reader thread to kill the `getCookie` self-deadlock — but moved it onto a Looper-less thread, **trading the
+reentrancy axis for a Looper axis**. Eclipse had already met and cured this exact disease once: the same exception
+hit the MAIN thread at lifecycle step 4 and was fixed by `Looper.prepareMainLooper()` (step 0) — recorded verbatim
+in `framework.rs`. **The defect is thread AFFINITY, not Looper presence.**
+
+*AOSP contract (cited, and it unifies everything):* **in real Android NO app-facing WebView callback is EVER
+delivered on a Looper-less thread.** `WebView.java:436-439` hard-throws if constructed without a Looper;
+`:2620-2637` `checkThread()` enforces Looper affinity on every public method; Chromium's
+`WebViewContentsClientAdapter` invokes `onPageStarted`/`onPageFinished` **directly on the UI thread** (and uses the
+**3-arg** form — independently confirming (C)); only `shouldInterceptRequest` is documented non-UI.
+`WebView.java:876-879` on `evaluateJavascript`: *"This method must be called on the UI thread and the callback will
+be made on the UI thread."* `CookieManager.java:142-148`: the `ValueCallback` fires *"on the current thread's
+Looper"*, and Chromium's `AwCookieManager` **throws** `IllegalStateException` from a Looper-less caller.
+`@JavascriptInterface` is the ONE deliberate exception — *"a private, background thread"* (`WebView.java:1915-1918`)
+— but that thread is a Chromium `JavaHandlerThread`/`HandlerThread`, i.e. background **and Looper'd**.
+
+*THE FIX (all rows of the class, rulings recorded):* every UI-thread-contract WebView callback now runs on
+Eclipse's MAIN thread — the one thread with a prepared `android.os.Looper` (step 0) and a live drain
+(`graphics.rs about_to_wait` → `pump_main_looper`) — via an Eclipse-owned **pure-Rust job slot**
+(`MAIN_DISPATCH`/`MainJob`/`dispatch_webview_callback_on_main`), drained by `run_pending_main_upcall` inside
+`run_main_looper_once`'s re-entrancy guard immediately BEFORE `drive_main_messages` (so the callback's own
+`new Handler().post(...)` continuation dispatches in the SAME UI turn, as on AOSP). Rows fixed: `internalLoadChanged`
+(confirmed), `evaluateJavascript`'s `ValueCallback<String>`, the 3-arg `setCookie` and `removeAll/removeSession`
+`ValueCallback<Boolean>`, and both era-gated drains. **Key rulings:** (1) **the poster BLOCKS** — the single
+property that keeps `fire_web_view_internal_load_changed`'s `bool` meaning EXACTLY "the app's callback completed"
+(never "a message was enqueued" — the pinned `upcalls 2/2` marker depends on it) AND keeps the client's single
+upcall thread the one serializer, so global FIFO (incl. the load-bearing "a BridgeCall before a ViewClosed still
+finds its registry entry") holds BY CONSTRUCTION; `upcall_thread_main`'s body changed by zero lines. (2) **Rust
+slot, not a Java `Runnable` + `Handler.post`** — §2.1 pure-Rust (the overlay patches ATL's Java; it is not Eclipse's
+transport), and decisively: you cannot un-post a Java `Message`, you CAN `Option::take` a Rust job, which makes
+reclaim race-free. (3) **A slot, not a queue** — the blocking poster means at most ONE job exists ever, which
+deletes the message-storm/budget hazard entirely. (4) **`Global` taken BY VALUE** — `jni 0.22.4`'s `Global` is NOT
+`Clone` (a judge caught this before it was written), and by-value also moves the drop onto an attached thread.
+(5) **M4 anti-deadlock PRESERVED and re-proved:** app code on main may re-enter the blocking `getCookie`, which
+parks MAIN on a reply only the **reader** delivers (a JNI-free channel send) — the reader is always free, so main
+always progresses. The one new edge (main joining the upcall thread in `client::shutdown`) is closed by **pumping
+while joining**, not by a timeout.
+
+*DEFERRAL — row 2, the `@JavascriptInterface` bridge (dated 2026-07-16, THE record the code comments cite):*
+`BridgeCall` DELIBERATELY stays on the upcall thread. Three grounds: (1) **AOSP's thread IDENTITY is already
+matched and main would be WRONG** — the bridge is contractually a private background thread precisely so a bridge
+method MAY BLOCK (Eclipse's own `getCookie` is a 5 s round-trip; on main it would park winit). Only Looper presence
+differs. (2) **The half-fix is worse than the loud throw** — a prepared-but-UNDRAINED `Looper.prepare()` there
+would make `new Handler()` succeed and then **silently swallow every `post`**; the correct fix is a real *drained*
+`HandlerThread` analogue, genuine complexity. (3) **It has never been exercised** — zero bridge calls have EVER
+reached Eclipse, so the mechanism is code-path-confirmed but the TRIGGER is not, and CLAUDE.md forbids changing a
+shipped, gate-green path without a confirmed failure. **Named trigger + live alarm:** `note_first_bridge_call_thread`
+logs one line on the FIRST bridge call ever; if the next line is a described `"Can't create handler…"`, the
+deferral has fired and the drained-HandlerThread fix lands. *Recorded divergence (also dated):* rows 4/5 land on
+**main**, not literally "the caller's Looper" — Eclipse pumps exactly one Looper and every observed caller IS main;
+`note_non_main_callback_registrar` makes a violation live-observable.
+
+*REGRESSION GUARD — and the blindness it closes.* The pinned `__webview-test` `upcalls 2/2` marker
+(`tests/engine_milestones.rs`) passed green through this entire bug because its driven `WebViewClient` was a stock
+client whose page callbacks are EMPTY BODIES that construct no Handler — **the harness could not represent the one
+axis that mattered.** New overlay Java `EclipseWebViewClientProbe` (staged into `classes.dex` per the
+`EclipseBridgeProbe`/`ValueCallback` precedent) carries the app's REAL shape: `new Handler()` in BOTH callbacks,
+an AOSP 3-arg `onPageStarted` override, and a `Looper.myLooper() != Looper.getMainLooper()` assertion (that
+assertion is what makes the tempting WRONG fix — "just `Looper.prepare()` on the upcall thread" — FAIL the guard
+instead of passing green while silently swallowing posts). `__webview-test` also now calls `prepare_main_looper`
+and pumps at all EIGHT poll sites. **Proven by reproduce-then-fix:** on the pre-fix tree
+`cargo test --test engine_milestones webview_test_fires_load_upcalls_and_stages_frames` **FAILED** —
+*"only 0/2 internalLoadChanged upcalls completed within 10 s"* with
+`IllegalStateException: ECLIPSE: WebViewClient.onPageStarted was not dispatched on the UI thread … thread=Thread-0`;
+post-fix it **PASSES** `upcalls 2/2`. Plus: pure gate test `webview_callback_gate_prefers_the_main_looper_and_degrades_honestly`;
+`patch-framework.sh` guards 1g (4 source greps), 3a (**stub-leak + no-constants** — javac DOES emit `.class` files
+for the 4 new compile-only stubs and `classes.dex` is FIRST-DEX-WINS, so a staged stub `android/os/Looper` would
+have SHADOWED the real class and gutted the entire main-Looper pump), and 4a (3 dex-level back-checks). All guards
+were negative-tested (each deliberately broken → the guard fired).
+
+*Deviation forced by evidence:* `prepare_main_looper` must ALSO bind the **SystemClock** natives — the first pump
+threw `UnsatisfiedLinkError: No implementation found for long android.os.SystemClock.uptimeMillis()` from
+`MessageQueue.next` (read every tick). `register_system_clock_natives` was only ever called from
+`drive_application_lifecycle`, which the harness never runs; without it the harness would prepare a Looper it could
+never pump — the exact prepared-but-undrained shape rejected above.
+
+*LIVE VERDICT (challenge19 vs the challenge17 baseline):* Looper throws **2 → 0**; `internalLoadChanged` failures
+**2 → 0**; total `framework lifecycle step failed` **3 → 1** (the survivor is the KNOWN upgrade-dialog
+`Resources$NotFoundException` via `inflate(0x0)` → `AlertController` → `Dialog.show`, matching the challenge15
+baseline); the app's OWN `onPageFinished. url=` log line **0 → 1** — its handler now runs PAST `setRefreshing` to
+its own logging statement, i.e. `SwipeRefreshLayout` → `startAnimation` → `new Handler()` now SUCCEEDS on main;
+`No implementation found` **0**, `UnsatisfiedLinkError` **0**, `NullPointerException` **0** (the native-binding
+ceiling holds and **no new failure surface appeared** — the predicted risk did NOT fire); zero orphans; privacy
+greps clean (0 password, 0 `ROBLOSECURITY`; the only Eclipse `target=` lines are `https://www.roblox.com` and
+`<non-url>`).
+
+*Gate (measured 2026-07-16):* root `fmt`/`build --all-targets`/`clippy --all-targets --all-features -- -D
+warnings`/`test`/`build --release` ALL clean — **643 unit + 6 integ + 2 doctest, 0 failed, ZERO SKIP** (+1 = the
+pure gate test). **Baseline correction:** the measured pre-change baseline was **642**+6+2, not the 641 recorded in
+the 2026-07-10 §5 bullet — a one-test documentation drift, corrected rather than silently carried. Helper
+**34 + 15**, clean. `patch-framework.sh` green: `classes2.dex` **byte-identical at 77660** and `classes3.dex` at
+2498192 vs the session-start measurement, `classes.dex` 20260 → **21280** (= the new probe).
+
+*Post-review corrections (adversarial review + per-finding skeptics, 8 agents; the delivery mechanism survived
+unscathed — no finding landed on it):* (1) `MAIN_DISPATCH_DEADLINE`'s doc claimed it "must EXCEED every legitimate
+main-thread block, and it does" — **that was FALSE and is corrected**: main has genuinely unbounded blocks (the
+renderer's `u64::MAX` `acquire_next_image` on a FIFO swapchain whose frame callbacks a compositor may withhold; a
+`drive_main_messages` batch bounds message COUNT not duration). The deadline is a **liveness escape, not a proof**;
+its fallback is honest (never drops the job, loudly warned) but IS the pre-fix delivery. The durable class-level fix
+is the already-named `EventLoopProxy` wake (`nativeWake` is a deliberate no-op, so a cross-thread post cannot wake
+winit) — out of scope here because it affects ALL main-thread Java, not just WebView. (2) Restored the diagnostic
+`fire_web_view_internal_load_changed` lost: `None` (job panicked / attach failed) was silently `unwrap_or(false)`,
+so a 0/2 could be unexplained; it warns again. Refuted findings (deliberately NOT acted on): the null-`Vm` drop
+(`Vm` has one constructor, past a null check — unreachable by construction) and the poisoned-lock reclaim (nothing
+under that lock can panic; release is `panic = "abort"`); a proposed new `MainDispatchGate` variant was rejected
+because it would seed the pure, exhaustively-pinned gate with a state the function can never return.
+
+*⇐ THE FRONTIER — the bridge is STILL silent, and it is now PROVEN INDEPENDENT.* The page's console fingerprint is
+**byte-for-byte identical** before and after the Looper fix (`len=` 17/72/9/~17/79/75/45/71/5/78 in challenge18 AND
+challenge19) — fixing the callbacks changed page behaviour **not at all**, so these were always **two separate
+bugs**. The `ECLIPSE_WEBVIEW_CONSOLE=1` boot captured the page's own words: the challenge page DOES run and fires
+all four hybrid calls — `Hybrid Wrapper: Sending hybrid call: challengePageLoaded` / `challengeParsed` /
+`challengeInitialized` / `challengeDisplayed` — but every one goes **`to origin: undefined`**, which is
+**postMessage vocabulary, not Android-bridge vocabulary**; plus `The namespace CommonUI.Messages was not found`
+(warn) and an arkoselabs `Error` (verbose). `addJavascriptInterface … iface=__globalRobloxAndroidBridge__
+method_count=1` registers, the stubs apply (`ifaces=1 methods=1`) ~490 ms before the wrapper speaks, and yet
+`bridge call received` is **0 in challenge16/17/18/19**. Injection race: ruled out. Callback delivery: fixed and
+ruled out. **Remaining ranked suspect: suspect 2 — UA steering** (the honest `X11; Linux x86_64` desktop UA
+steering the hybrid page down its web/postMessage path instead of its Android path). This is **M4's pre-registered
+OPEN QUESTION #1 and an explicit OWNER RULING** — `ECLIPSE_USER_AGENT`'s own doc says *"if an anti-bot vendor
+refuses this for a real human, the owner rules on presenting the app's genuine Android-WebView-context UA —
+faithful, since Eclipse runs the Android build"*, and a `!contains("Android")` unit test deliberately pins today's
+policy. **NEXT: a temporary, env-gated, dev-host-only UA A/B DIAGNOSTIC to confirm or refute steering by evidence
+BEFORE anyone touches that pinned policy.** Diagnose before fix; do not flip a deliberately-pinned honesty policy
+on suspicion.
+
+*Files:* `src/framework.rs` (the M6 main-dispatch section, `prepare_main_looper`(+SystemClock), row re-points,
+`Global`-by-value, the pump seam, `note_first_bridge_call_thread`, `note_non_main_callback_registrar`, the probe
+wiring, the gate test), `src/webview/client.rs` (dated row-2 deferral comment; `shutdown(&Vm, …)` pumps while
+joining then retires), `src/graphics.rs` (`run_windowed` retires the slot), `src/main.rs` (`pump_tick`,
+`prepare_main_looper`, 8 poll sites), NEW
+`tools/framework-overlay/src/android/webkit/EclipseWebViewClientProbe.java`, NEW
+`tools/framework-overlay/stubs/{android/webkit/WebView.java,android/webkit/WebViewClient.java,android/os/Handler.java,android/os/Looper.java}`,
+`tools/framework-overlay/patch-framework.sh` (guards 1g/3a/4a + compile-list + stage-whitelist),
+`docs/web-engine-plan.md`, this file (§5 🧵 bullet + §6 this entry).
 
 ---
 

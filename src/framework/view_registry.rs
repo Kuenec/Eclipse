@@ -531,6 +531,49 @@ pub fn absolute_frame(handle: ViewHandle) -> Option<(i32, i32, u32, u32)> {
     None
 }
 
+/// 2026-07-10 (web-engine M6): whether `needle` is `root` itself or a descendant of `root` in the
+/// recorded view tree — the subtree test the eager-CloseView-on-detach seam needs. A fragment
+/// teardown removes the fragment ROOT from its container (`ViewGroup.native_removeView`), and the
+/// challenge WebView is a DESCENDANT of that root, not the direct child — so a `child == active`
+/// test alone would never fire; this walks `root`'s subtree. Single lock acquisition; iterative
+/// DFS with a visited-set for totality (a malformed/cyclic registry can never loop forever);
+/// bounds+generation-checked, so a stale/fabricated handle is skipped, never UB. Returns `false`
+/// for the reserved `0` handle (never a member) and on a poisoned lock.
+pub fn subtree_contains(root: ViewHandle, needle: ViewHandle) -> bool {
+    if root == 0 || needle == 0 {
+        return false;
+    }
+    let Ok(reg) = lock() else {
+        return false;
+    };
+    let mut visited: std::collections::HashSet<ViewHandle> = std::collections::HashSet::new();
+    let mut stack: Vec<ViewHandle> = vec![root];
+    while let Some(h) = stack.pop() {
+        if !visited.insert(h) {
+            continue; // already expanded (cycle guard / shared handle)
+        }
+        let (index, generation) = unpack(h);
+        let Some(slot) = reg.slots.get(index as usize) else {
+            continue;
+        };
+        if slot.generation != generation {
+            continue; // stale handle — skip, never UB
+        }
+        let Some(state) = slot.state.as_ref() else {
+            continue;
+        };
+        // Match only a LIVE node: a dangling stale edge whose jlong equals `needle` (a freed slot
+        // still listed in a parent's children) must NOT count as a member.
+        if h == needle {
+            return true;
+        }
+        for &child in &state.children {
+            stack.push(child);
+        }
+    }
+    false
+}
+
 /// A flattened, owned snapshot of one view in the recorded tree — what the renderer reads per frame.
 ///
 /// 2026-06-05: a depth-first, owned copy (no registry handles / locks held by the renderer) so the
@@ -837,6 +880,58 @@ mod tests {
         assert_eq!(absolute_frame(0), None);
         set_active_root(0);
         for h in [child, root, orphan, frameless] {
+            free(h).expect("free");
+        }
+    }
+
+    #[test]
+    fn subtree_contains_matches_self_direct_and_deep_and_rejects_non_members_and_stale() {
+        // 2026-07-10 (web-engine M6): the eager-CloseView-on-detach subtree test. The challenge
+        // WebView is a DEEP descendant of the removed fragment root, so the test must be
+        // subtree-based (self / direct child / deep descendant true; non-member / stale / null
+        // false); a cyclic registry (impossible but defensive) must still terminate.
+        let deep = allocate("android.webkit.WebView").expect("alloc deep");
+        let mid = allocate("android.widget.FrameLayout").expect("alloc mid");
+        with_view(mid, |s| s.children.push(deep)).expect("wire deep");
+        let root = allocate("android.widget.LinearLayout").expect("alloc root");
+        with_view(root, |s| s.children.push(mid)).expect("wire mid");
+        let outsider = allocate("android.view.View").expect("alloc outsider");
+
+        assert!(subtree_contains(root, root), "a view contains itself");
+        assert!(subtree_contains(root, mid), "direct child");
+        assert!(subtree_contains(root, deep), "deep descendant");
+        assert!(
+            !subtree_contains(root, outsider),
+            "non-member is not contained"
+        );
+        assert!(
+            !subtree_contains(root, 0),
+            "the reserved null handle is never a member"
+        );
+        assert!(
+            !subtree_contains(0, deep),
+            "the reserved null root contains nothing"
+        );
+
+        // A freed (stale) needle is not found; a freed root contains nothing (skipped, not UB).
+        free(deep).expect("free deep");
+        assert!(
+            !subtree_contains(root, deep),
+            "a stale needle handle must not match"
+        );
+
+        // Defensive cycle: mid ← → root (root already points to mid; make mid point back to root).
+        with_view(mid, |s| s.children.push(root)).expect("introduce cycle");
+        assert!(
+            subtree_contains(root, mid),
+            "a cyclic registry still terminates and finds a live member"
+        );
+        assert!(
+            !subtree_contains(root, outsider),
+            "a cyclic registry still terminates for a non-member"
+        );
+
+        for h in [mid, root, outsider] {
             free(h).expect("free");
         }
     }

@@ -581,6 +581,19 @@ fn start_loopback_page() -> std::io::Result<u16> {
 /// the MAIN process and leaves the on-screen composite to the M6 live boot (its pure parts are
 /// unit-pinned). Loads ONLY the public https://www.roblox.com page (M1/M2 precedent) — never a
 /// challenge URL, no APK dex execution beyond framework classes.
+/// 2026-07-16 (web-engine M6): one `__webview-test` poll tick — pump the main Looper, then sleep.
+/// This subcommand has NO winit loop, so it stands in for `graphics::about_to_wait`: the pump is
+/// what runs the client's app-facing WebView callbacks on THIS (main, Looper-prepared) thread and
+/// then dispatches the messages they posted. It is deliberately used at EVERY poll site below — a
+/// prepared-but-unpumped main Looper is the shape the root-cause analysis rejects as worse than a
+/// throw.
+fn pump_tick(vm: &eclipse::runtime::Vm, ms: u64) {
+    if let Err(e) = eclipse::framework::pump_main_looper(vm) {
+        eprintln!("# main Looper pump failed: {e}");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
 fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     use eclipse::framework;
     use eclipse::webview::client;
@@ -637,6 +650,12 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     // initializers that call android.util.Log.println_native — bind the Log/Process natives (the
     // production drive_lifecycle does this pre-preload) so the cookie leg's clinit chain resolves.
     eclipse::framework::register_engine_preload_natives(&vm)?;
+    // 2026-07-16 (web-engine M6 root fix): give this harness's main thread the SAME main Looper
+    // production's lifecycle step 0 gives it. Without it Looper.getMainLooper() is NULL here, the
+    // client's app-facing WebView callbacks have no UI thread to land on, and the harness cannot
+    // represent production at all — which is precisely why it was blind to the challenge17/18
+    // Looper-less-dispatch bug.
+    eclipse::framework::prepare_main_looper(&vm)?;
     println!("# ART booted ✓ — driving the WebView smoke (register → alloc → setWebViewClient → addJavascriptInterface → loadUrl)…");
     let handle = eclipse::framework::drive_webview_smoke(&vm, &target_url)?;
 
@@ -672,7 +691,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         if start.elapsed() > FINISH_DEADLINE {
             return Err("load-finished (internalLoadChanged 3) not observed within 90 s".into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        pump_tick(&vm, 50);
     };
     let started_ms = started_ms.ok_or("load-finished arrived without load-started")?;
 
@@ -691,7 +710,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
             )
             .into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        pump_tick(&vm, 50);
     };
 
     // Nonzero ink in the MAIN-process staging buffer (the M1/M2 distinct-pixel criterion).
@@ -716,7 +735,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         if Instant::now() > ink_deadline {
             return Err("no staged frame with nonzero ink within 20 s of load-finish".into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        pump_tick(&vm, 50);
     };
 
     // ---- M4 legs (plan §5.3): evaluateJavascript + honest UA, bridge round-trip, cookies. ----
@@ -733,7 +752,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
             if Instant::now() > end {
                 return None;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            pump_tick(&vm, 50);
         }
     };
 
@@ -763,7 +782,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         if Instant::now() > bridge_deadline {
             return Err("bridge round-trip did not complete (window.__eclipseBridgeResult != echo:PING within 15 s)".into());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        pump_tick(&vm, 100);
     }
     // The @JavascriptInterface method also recorded its arg on the ART side.
     match framework::read_probe_last(&vm).as_deref() {
@@ -791,7 +810,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         if Instant::now() > cookie_deadline {
             return Err("CookieManager.getCookie did not return ECLIPSE_TEST=1 within 15 s".into());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        pump_tick(&vm, 100);
     }
     println!("# cookie set/get OK (values not printed)");
     // The 3-arg setCookie callback carries the REAL success flag.
@@ -807,7 +826,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         if Instant::now() > cb_deadline {
             break false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        pump_tick(&vm, 50);
     };
     if !cb_ok {
         return Err(
@@ -826,10 +845,10 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         if Instant::now() > close_deadline {
             return Err("ViewClosed not observed within 15 s".into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        pump_tick(&vm, 50);
     }
     println!("# view-closed ✓ — shutting the helper down…");
-    let report = client::shutdown(Duration::from_secs(15));
+    let report = client::shutdown(&vm, Duration::from_secs(15));
     if report.helper_exit != Some(0) {
         return Err(format!(
             "helper exit status {:?} (expected 0; reader_joined={})",
