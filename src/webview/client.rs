@@ -804,8 +804,13 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
             }
         }
         HelperMsg::Console { view, console } => {
-            // Structurally text-free (Console::from_raw + the decode re-redaction).
-            tracing::debug!(
+            // 2026-07-10 (M6): promoted debug!→info! so page console events are visible on a
+            // default boot (RUST_LOG unset). The event is STRUCTURALLY text-free (Console::from_raw
+            // drops the text at construction — proto.rs — and the decode re-redacts); this line
+            // binds only severity + the already-scheme+host source + line + byte length, so the
+            // default privacy greps stay clean. The full text is a helper-side, env-gated diagnostic
+            // (ECLIPSE_WEBVIEW_CONSOLE=1), never on the wire.
+            tracing::info!(
                 view,
                 severity = console.severity(),
                 source = console.source(),
@@ -945,6 +950,19 @@ fn upcall_thread_main(
                 call_id,
                 payload_json,
             } => {
+                // 2026-07-16 (web-engine M6): DELIBERATELY still dispatched on THIS thread while
+                // every other app-facing upcall now runs on the main/UI Looper.
+                // WebView.java:1915-1918 puts @JavascriptInterface methods on "a private,
+                // background thread of this WebView" — this thread already IS that identity,
+                // precisely so a bridge method MAY BLOCK (Eclipse's CookieManager.getCookie is a
+                // 5 s round-trip; on main it would park winit). The only divergence from AOSP
+                // (whose thread is a Chromium JavaHandlerThread with a prepared AND DRAINED
+                // Looper) is Looper presence, and NO bridge call has ever reached Eclipse — the
+                // mechanism is code-path-confirmed but the TRIGGER is not (CLAUDE.md). Preparing an
+                // UNDRAINED Looper here would be WORSE than the loud throw (every Handler.post
+                // would silently vanish). Deferred + instrumented: framework's
+                // note_first_bridge_call_thread logs the verdict on the first call ever.
+                // Recorded in AGENTS.md §6 2026-07-16.
                 let (ok, result_json) =
                     crate::framework::fire_bridge_call(java_vm, view, call_id, &payload_json);
                 if !send_reply_if_live(&ConsumerMsg::BridgeResult {
@@ -1792,6 +1810,43 @@ pub fn notify_view_freed(widget: i64) {
     }
 }
 
+/// 2026-07-10 (web-engine M6, plan §7 #9): the active WebView was detached from the view tree
+/// (a fragment teardown funnels `ViewGroup.remove*` → `native_removeView`; challenge16 showed the
+/// GC-only `notify_view_freed` left the stale full-window composite covering LoginV2 for ~40 s with
+/// NO ViewClosed). Eagerly send `CloseView` so the composite stops on the next present
+/// (`vk_overlay` gate = `active_view() != 0`) and input routing to the dead view stops with it; the
+/// helper's confirming `ViewClosed` completes teardown through the existing path (its `ACTIVE_VIEW`
+/// CAS then no-ops).
+///
+/// Scoped to the ACTIVE view via CAS `widget → 0`: a MISS (this is not the active view) returns
+/// immediately (non-active tracked views keep the GC path). It deliberately does NOT drop the
+/// bridge globals or the tracked entry — the Java object is still alive (GC/`notify_view_freed`
+/// owns that), and the helper's `ViewClosed` reply removes the tracked entry through the existing
+/// reader path. Lock order: no registry lock held here (the caller released it) → CLIENT lock, the
+/// same discipline as `notify_view_freed`.
+///
+/// Recorded divergence (dated): AOSP allows detach-then-reattach without destroy, but no recorded
+/// challenge boot re-parents the WebView; a false trigger only blanks the composite (a re-drive
+/// restores it) and is made visible by the INFO line below.
+pub fn notify_view_detached(widget: i64) {
+    if ACTIVE_VIEW
+        .compare_exchange(widget, 0, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // not the active view — only the active view eager-closes
+    }
+    tracing::info!(
+        view = widget,
+        "webview client: active WebView detached from the view tree — eager CloseView (composite \
+         released; ViewClosed completes teardown)"
+    );
+    if let Ok(mut slot) = CLIENT.lock() {
+        if matches!(&*slot, ClientSlot::Live(_)) {
+            let _ = send_locked(&mut slot, &ConsumerMsg::CloseView { view: widget });
+        }
+    }
+}
+
 /// Ask the helper to close `widget`'s browser; the confirming `ViewClosed` removes the local
 /// entry (observe via [`view_is_tracked`]).
 pub fn close_view(widget: i64) -> Result<(), ClientError> {
@@ -1836,8 +1891,15 @@ pub fn failed_reason() -> Option<String> {
 }
 
 /// Deliberate teardown: polite `Shutdown` → bounded wait → kill+wait → join the reader (bounded:
-/// the child's death forces the reader's EOF). The slot latches so no later drive respawns.
-pub fn shutdown(deadline: Duration) -> ShutdownReport {
+/// the child's death forces the reader's EOF) → PUMP while joining the upcall thread → retire the
+/// main dispatch. The slot latches so no later drive respawns.
+///
+/// 2026-07-16 (web-engine M6): takes `&Vm` because this is the one place MAIN would join the
+/// upcall thread — and the upcall thread's remaining events (including the honest
+/// `drain_all_webview_callbacks` it runs as it exits) now dispatch their app-facing JNI on main and
+/// BLOCK until main runs them. A bare `join()` would park main against a thread parked on main.
+/// `Vm` is `!Send`, so the borrow is also the type-level proof we ARE main.
+pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
     let taken = match CLIENT.lock() {
         Ok(mut slot) => {
             match std::mem::replace(
@@ -1891,6 +1953,18 @@ pub fn shutdown(deadline: Duration) -> ShutdownReport {
     // the upcall loop finishes its queue, drains every pending ValueCallback honestly
     // (`framework::drain_all_webview_callbacks`), and exits — bounded like the reader join.
     if let Some(h) = client.upcall.take() {
+        // 2026-07-16: pump while joining, so every teardown callback still fires on the Looper
+        // thread, exactly once, with no timeout and no AOSP divergence. Bounded by `deadline`:
+        // the reader is already joined, so its channel sender is dropped and this thread WILL
+        // finish its queue and exit. If it somehow has not by the deadline, retire the slot first
+        // so its next post degrades to an inline (loudly logged) delivery instead of parking on a
+        // main that is about to stop pumping — then the join always completes. Never drops a job.
+        let t0 = Instant::now();
+        while !h.is_finished() && t0.elapsed() < deadline {
+            let _ = crate::framework::pump_main_looper(vm);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        crate::framework::retire_main_upcall_dispatch(vm);
         let _ = h.join();
     }
     if let Ok(mut views) = shared().views.lock() {
@@ -2529,6 +2603,37 @@ mod tests {
                 .contains_key(&widget),
             "a never-driven view's buffered bridge inventory must be released at finalize"
         );
+    }
+
+    #[test]
+    fn notify_view_detached_clears_only_the_active_view() {
+        // 2026-07-10 (web-engine M6): CAS semantics — detaching the ACTIVE view clears ACTIVE_VIEW
+        // (the composite/input gate flips off) and best-effort CloseViews; detaching a NON-active
+        // view is a no-op on ACTIVE_VIEW (non-active tracked views keep the GC path). In-harness
+        // the CLIENT slot is Unspawned, so no wire send happens — this pins the atomic gate only.
+        // Unique handles (in-harness, notify_view_detached is the only nonzero writer of ACTIVE_VIEW,
+        // so exact-value assertions are stable under parallel `cargo test`).
+        let active = 0x00A0_0001_0000_0000_i64;
+        let other = 0x00B0_0002_0000_0000_i64;
+        ACTIVE_VIEW.store(active, Ordering::Relaxed);
+        // A non-active widget: the CAS misses, ACTIVE_VIEW is untouched.
+        notify_view_detached(other);
+        assert_eq!(
+            ACTIVE_VIEW.load(Ordering::Relaxed),
+            active,
+            "detaching a non-active view must not clear the active gate"
+        );
+        // The active widget: the CAS clears the gate to 0.
+        notify_view_detached(active);
+        assert_eq!(
+            ACTIVE_VIEW.load(Ordering::Relaxed),
+            0,
+            "detaching the active view clears ACTIVE_VIEW (composite gate off)"
+        );
+        // A second detach of the now-cleared widget is a no-op (idempotent).
+        notify_view_detached(active);
+        assert_eq!(ACTIVE_VIEW.load(Ordering::Relaxed), 0);
+        ACTIVE_VIEW.store(0, Ordering::Relaxed);
     }
 
     #[test]

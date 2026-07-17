@@ -109,6 +109,21 @@ bp_src="$here/src/android/webkit/EclipseBridgeProbe.java"
 [ -f "$bp_src" ] || fail "M4 EclipseBridgeProbe.java missing at $bp_src"
 grep -qF '@JavascriptInterface' "$bp_src" || fail "EclipseBridgeProbe.java lost its @JavascriptInterface echo — __webview-test bridge leg regressed"
 
+# --- 1g. guard the M6 EclipseWebViewClientProbe (the __webview-test Looper-contract probe) ------
+# 2026-07-16 (web-engine plan M6): the probe is __webview-test's driven WebViewClient. It carries
+# the app's real callback shape — `new Handler()` (Roblox: SwipeRefreshLayout.setRefreshing ->
+# View.startAnimation -> Animation.start -> new Handler()) — which THROWS on a Looper-less dispatch
+# thread, PLUS the AOSP UI-thread assertion (without which "just Looper.prepare() on the upcall
+# thread", the tempting wrong fix, would pass green while silently swallowing every post). Lose
+# either line and the harness goes blind to the 2026-07-16 root cause exactly as the stock
+# `new WebViewClient()` did.
+wvcp_src="$here/src/android/webkit/EclipseWebViewClientProbe.java"
+[ -f "$wvcp_src" ] || fail "M6 EclipseWebViewClientProbe.java missing at $wvcp_src"
+grep -qF 'new Handler();' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer constructs a Handler — __webview-test would go blind to the Looper-less-dispatch class (2026-07-16)"
+grep -qF 'Looper.myLooper() != Looper.getMainLooper()' "$wvcp_src" || fail "EclipseWebViewClientProbe.java lost its UI-thread assertion — a prepared-but-undrained Looper on the upcall thread would pass this guard green"
+grep -qF 'onPageStarted(WebView view, String url, Bitmap favicon)' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer overrides the AOSP 3-arg onPageStarted — the M6 state-0 dispatch would go unpinned"
+grep -qF 'onPageFinished(WebView view, String url)' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer overrides onPageFinished — half the confirmed 2026-07-16 defect would go unpinned"
+
 # --- 1e. compile against the VENDORED com.android.internal.R (javac constant-inlining guard) --
 # 2026-07-02: javac inlines `static final int` constants from compile inputs into the emitted
 # bytecode. A hand-written stub R.java with placeholder values (attr.id = 0, attr.theme = 0)
@@ -139,14 +154,33 @@ grep -qF 'public static final int theme=0x01010000;' "$r_src" || fail "vendored 
     "$here/src/android/webkit/ValueCallback.java" \
     "$here/src/android/webkit/JavascriptInterface.java" \
     "$here/src/android/webkit/EclipseBridgeProbe.java" \
+    "$here/src/android/webkit/EclipseWebViewClientProbe.java" \
     "$here/src/android/app/KeyguardManager.java" \
     "$r_src"
 
 # --- 3. stage ONLY the patched classes (stubs must never reach the dex) ------------------
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/app/KeyguardManager*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     cp "$work/classes/"$pattern "$work/stage/$dir/"
+done
+
+# --- 3a. the M6 compile-only stubs must never be dexed, and must never carry constants ---------
+# 2026-07-16: javac DOES emit .class files for sourcepath-resolved stubs into $work/classes
+# (verified). classes.dex is FIRST-dex-wins, so a staged stub would SHADOW the real installed class
+# and silently gut it — a stub android/os/Looper would take out the ENTIRE main-Looper pump, and a
+# stub WebViewClient would shadow the classes2 shadow that carries the M6 3-arg onPageStarted. The
+# step-3 whitelist excludes them by construction; verify DIRECTLY, so a future whitelist edit fails
+# loud. Separately: guard 1e's real lesson is that javac INLINES `static final` constants from
+# compile inputs — these stubs declare none, and must keep declaring none.
+for forbidden in 'android/webkit/WebView.class' 'android/webkit/WebViewClient.class' \
+                 'android/os/Handler.class' 'android/os/Looper.class'; do
+    [ ! -e "$work/stage/$forbidden" ] || fail "compile-only stub $forbidden was staged into classes.dex — it would SHADOW the real class (first-dex-wins); fix the step-3 stage whitelist"
+done
+for stub in android/webkit/WebView.java android/webkit/WebViewClient.java \
+            android/os/Handler.java android/os/Looper.java; do
+    [ -f "$here/stubs/$stub" ] || fail "M6 compile-only stub $stub missing — EclipseWebViewClientProbe would not compile"
+    ! grep -qE 'static[[:space:]]+final' "$here/stubs/$stub" || fail "M6 stub $stub declares a constant — javac would INLINE its placeholder value into the overlay dex (the 2026-07-02 guard-1e class)"
 done
 
 # --- 4. dex the javac-patched classes -> classes.dex -------------------------------------
@@ -162,6 +196,17 @@ lism="$work/smali-check/android/view/LayoutInflater.smali"
 [ -f "$lism" ] || fail "LayoutInflater.smali not found in the built classes.dex"
 grep -qF '0x10100d0' "$lism" || fail "dexed LayoutInflater lost the inlined android:id constant (0x010100d0) — the <include android:id> override would silently drop (2026-07-02 RobloxToolbar NPE class)"
 grep -qF '0x1010000' "$lism" || fail "dexed LayoutInflater lost the inlined android:theme constant (0x01010000) — createView's android:theme handling would silently drop"
+
+# 2026-07-16 (M6): the probe must reach the dex with BOTH its Handler constructions and the AOSP
+# 3-arg onPageStarted override — the latter is ALSO the coupling proof that the compile-only
+# WebViewClient stub agrees with the 3-arg form the classes2 shadow lands (the §(2) post-append
+# grep below keys the IDENTICAL descriptor literal; if the two ever disagree, the probe's method
+# stops overriding and silently never runs).
+wvcpsm="$work/smali-check/android/webkit/EclipseWebViewClientProbe.smali"
+[ -f "$wvcpsm" ] || fail "EclipseWebViewClientProbe.smali not in the built classes.dex — the __webview-test Looper-contract probe did not stage"
+grep -qF 'Landroid/os/Handler;-><init>()V' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost the no-arg Handler construction — the 2026-07-16 Looper-less-dispatch guard would not fire"
+grep -qF 'Landroid/os/Looper;->getMainLooper()' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost its UI-thread assertion"
+grep -qF 'onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost the AOSP 3-arg onPageStarted override — internalLoadChanged's state-0 dispatch would miss it (and the stub has drifted from the classes2 shadow)"
 
 # --- 4b. smali-patch the INSTALLED View + Display -> classes2.dex -------------------------
 # 2026-06-13: ATL's installed View omits AOSP's pointer-capture API (View.OnCapturedPointerListener +
@@ -375,6 +420,68 @@ ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method publi
 grep -qF 'Eclipse-WebView/149.0.6' "$wssm" || fail "WebSettings honest-UA insert failed (drift?)"
 ! grep -qF 'GDPR VIOLATION' "$wssm" || fail "WebSettings still returns \"GDPR VIOLATION\" (honest-UA fix incomplete)"
 
+# === WebViewClient 3-arg onPageStarted + WebView.internalLoadChanged dispatch (M6, 2026-07-10) ====
+# ATL's WebViewClient declares only 2-arg onPageStarted(WebView,String); AOSP declares ONLY the 3-arg
+# onPageStarted(WebView,String,Bitmap). An AOSP-compiled app's onPageStarted @Override therefore
+# never received state-0 (challenge16: onPageFinished fired, the app-side onPageStarted never did).
+# Land the AOSP base surface on WebViewClient (3-arg onPageStarted chaining to the 2-arg for legacy
+# overriders + shouldOverrideUrlLoading returning false) and dispatch the 3-arg form from
+# WebView.internalLoadChanged at state 0. shouldOverrideUrlLoading DISPATCH is SCOPED DOWN this pass:
+# the base method lands for AOSP class-shape parity so an app @Override resolves, but NO call site is
+# wired — under the driven-loads-only contract the wire LoadState carries no per-navigation URL and
+# the consumer substitutes the driven URL for every event, so the overlay cannot honestly identify a
+# non-driven navigation, and honoring a `true` return would need a new synchronous consumer->helper
+# navigation-cancel (a frozen-protocol change). A later additive pass wires the dispatch.
+
+# (1) WebView.internalLoadChanged: dispatch the AOSP 3-arg onPageStarted at state 0 (onPageFinished
+#     stays 2-arg at state 3). Whole-method anchored replace (the ANCHOR_PC pristine-body pattern) so
+#     installed drift fails loud, never a silent mis-insert. Placed AFTER the M4 WebView patches.
+n="$(grep -cF '.method internalLoadChanged(ILjava/lang/String;)V' "$wvsm")" || true
+[ "$n" = "1" ] || fail "WebView.smali internalLoadChanged anchor not unique (found $n, expected 1) — installed WebView drifted; update patch-framework.sh"
+ANCHOR_ILC=$'.method internalLoadChanged(ILjava/lang/String;)V\n    .registers 4\n\n    if-nez p1, :cond_c\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_c\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    :cond_b\n    :goto_b\n    return-void\n\n    :cond_c\n    const/4 v0, 0x3\n\n    if-ne p1, v0, :cond_b\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_b\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    goto :goto_b\n.end method'
+ANCHOR_ILC="$ANCHOR_ILC" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_ILC}) >= 0) ? 0 : 1)' "$wvsm" || fail "WebView.smali internalLoadChanged body changed from the expected 2-arg shape — installed WebView drifted; update patch-framework.sh"
+perl -0pi -e 's{\.method internalLoadChanged\(ILjava/lang/String;\)V.*?\.end method\n}{.method internalLoadChanged(ILjava/lang/String;)V\n    .registers 5\n\n    # ECLIPSE PATCH 2026-07-10 (M6): dispatch AOSP 3-arg onPageStarted(WebView,String,Bitmap) at\n    # state 0 (an AOSP-compiled onPageStarted \@Override never received the ATL-only 2-arg form —\n    # challenge16 saw onPageFinished fire but never onPageStarted). onPageFinished stays 2-arg (its\n    # AOSP shape); null Bitmap (OSR has no favicon). The base 3-arg chains to the 2-arg form.\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_eclipse_ilc_done\n\n    if-nez p1, :cond_eclipse_ilc_finished\n\n    const/4 v1, 0x0\n\n    invoke-virtual {v0, p0, p2, v1}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V\n\n    return-void\n\n    :cond_eclipse_ilc_finished\n    const/4 v1, 0x3\n\n    if-ne p1, v1, :cond_eclipse_ilc_done\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    :cond_eclipse_ilc_done\n    return-void\n.end method\n}s' "$wvsm"
+grep -qF -- '->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvsm" || fail "WebView.smali internalLoadChanged 3-arg onPageStarted dispatch insert failed (drift?)"
+! grep -qF -- '->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;)V' "$wvsm" || fail "WebView.smali still dispatches the 2-arg onPageStarted (M6 3-arg dispatch incomplete)"
+
+# (2) WebViewClient: NEW shadow into classes2 (stock-only today). Add the AOSP base 3-arg
+#     onPageStarted (chaining to the 2-arg for legacy overriders) + shouldOverrideUrlLoading
+#     returning false. Pre-check drift (neither must already exist), append, post-grep both.
+wvcsm="$work/smali/android/webkit/WebViewClient.smali"
+[ -f "$wvcsm" ] || fail "WebViewClient.smali not found after baksmali"
+! grep -qF 'Landroid/graphics/Bitmap;)V' "$wvcsm" || fail "WebViewClient.smali already declares a Bitmap-arg method (3-arg onPageStarted?) — installed WebViewClient drifted; update patch-framework.sh"
+! grep -qF 'shouldOverrideUrlLoading' "$wvcsm" || fail "WebViewClient.smali already declares shouldOverrideUrlLoading — installed WebViewClient drifted; update patch-framework.sh"
+cat >> "$wvcsm" <<'ECLIPSE_WVC_METHODS'
+
+# ECLIPSE PATCH 2026-07-10 (M6): AOSP base WebViewClient.onPageStarted(WebView, String, Bitmap).
+# AOSP declares ONLY this 3-arg form; ATL declared only the 2-arg. The default body CHAINS to the
+# 2-arg onPageStarted so a legacy ATL-2-arg overrider still receives when the subclass overrides the
+# 2-arg but not the 3-arg (WebView.internalLoadChanged now dispatches this 3-arg form).
+.method public onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V
+    .registers 4
+
+    invoke-virtual {p0, p1, p2}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;)V
+
+    return-void
+.end method
+
+# ECLIPSE PATCH 2026-07-10 (M6): AOSP base WebViewClient.shouldOverrideUrlLoading(WebView, String).
+# Returns false (WebView proceeds with the load) — the AOSP base default. SCOPED DOWN this pass: the
+# base method lands for AOSP class-shape parity so an app @Override resolves, but NO call site is
+# wired (the driven-loads-only contract carries no per-navigation URL to honestly gate on, and a
+# true return would need a new synchronous consumer->helper navigation-cancel — a frozen-protocol
+# change). A later additive pass wires the dispatch.
+.method public shouldOverrideUrlLoading(Landroid/webkit/WebView;Ljava/lang/String;)Z
+    .registers 4
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+ECLIPSE_WVC_METHODS
+grep -qF -- 'onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvcsm" || fail "WebViewClient 3-arg onPageStarted insert failed (drift?)"
+grep -qF -- 'shouldOverrideUrlLoading(Landroid/webkit/WebView;Ljava/lang/String;)Z' "$wvcsm" || fail "WebViewClient shouldOverrideUrlLoading insert failed (drift?)"
+
 # JobParameters.getNetwork() -> Network — AOSP API 28; Roblox queries it on a scheduled network job; ATL
 # omits it. Returns null (no Network bound — AOSP-valid; the caller handles null). Anchor on getExtras.
 jpm="$work/smali/android/app/job/JobParameters.smali"
@@ -417,6 +524,7 @@ cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
 cp "$wvsm" "$work/smali-view/android/webkit/WebView.smali"
 cp "$wssm" "$work/smali-view/android/webkit/WebSettings.smali"
+cp "$wvcsm" "$work/smali-view/android/webkit/WebViewClient.smali"
 cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
 cp "$psm" "$work/smali-view/android/graphics/Paint.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
