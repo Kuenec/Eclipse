@@ -561,10 +561,29 @@ callback delivery fixed; UA ruled IN for the challenge path, OUT as the bridge's
 caveat now recorded: the console `len=` fingerprint MISSED this (`challengeDisplayed` and
 `challengeCompleted` are both 18 chars) — equal lengths can never prove sameness.
 
-**⇐ THE LAST BLOCKER — the bridge. Live suspect: §7 #3 / suspect 4, the async-Promise shape.**
-`generate_stub_js` makes every `@JavascriptInterface` method return a Promise; AOSP's
-`addJavascriptInterface` is SYNCHRONOUS. Next step is an env-gated dev-host eval introspecting
-Eclipse's OWN injected stub as the page sees it — evidence before any rewrite.
+**⇐ THE LAST BLOCKER — the bridge. Introspected 2026-07-16 (record: AGENTS.md §6 🔬).** A new
+env-gated dev-host diagnostic (`ECLIPSE_WEBVIEW_BRIDGE_DIAG=1`, renderer `on_load_end` on
+TID_RENDERER) introspects Eclipse's OWN injected stub. Verdict: `main_frame=true
+frame=https://www.roblox.com` → `__globalRobloxAndroidBridge__` is `"object"` with
+`[["executeRoblox","function"]]` and our `cefQuery` router present — **the stub is FULLY INTACT**,
+applied **+3 ms** after `load started` and **539 ms BEFORE** the wrapper's first console line.
+**The injection race is DEFINITIVELY DEAD**; the wrapper has a correct, reachable, correctly-named
+bridge and does not call it. The app's single bridge method is now known: `executeRoblox`.
+
+**Two REAL AOSP-contract divergences are now PROVEN** (each a defect in its own right, neither yet
+shown to BE the blocker): (1) **all-frames injection** — every `main_frame=false
+frame=https://arkoselabs.roblox.com` line reports `"type":"undefined"`; Eclipse injects into the
+main frame ONLY, while AOSP/Chromium's Java Bridge installs the objects into EVERY frame; (2) **the
+synchronous return shape** (§7 #3 / suspect 4) — `generate_stub_js` returns a Promise per method
+where AOSP returns the value directly; `CefMessageRouter` is async BY DESIGN, so this is a real
+design question, not a one-liner.
+
+**Honest status: the bridge blocker is NOT identified.** Ruled out with evidence: the injection
+race, app-callback delivery, and UA steering as the bridge's cause. Not ruled out: the two
+divergences, and the wrapper's own platform detection (unknown — reading Roblox's wrapper JS is
+off-policy, so it stays inferred from first-party observation). **Next:** fix the two proven
+divergences as contract-conformance work and re-measure (success criterion for #1 is mechanical:
+the arkose subframe lines must flip to `"type":"object"`).
 
 **Historical status (2026-07-10) — the pass the boots above validated:**
 A first live boot (challenge16, log `/tmp/eclipse-challenge16.log`) reached the FIRST-EVER app-side

@@ -185,6 +185,42 @@ before any history-rewriting/force operation.
   a UA A/B **diagnostic** (temporary, env-gated, dev-host only) to CONFIRM or REFUTE steering by evidence before
   anyone touches the pinned UA policy — diagnose before fix; do NOT flip the UA on suspicion. **⇒ THAT A/B RAN —
   SEE THE 🕵️ BULLET BELOW: SUSPECT 2 IS CONFIRMED.**
+- **2026-07-16 — 🔬 BRIDGE SELF-INTROSPECTION: the stub is PROVEN INTACT in the frame the wrapper runs in, 539 ms
+  before it speaks — the injection race is DEAD, and TWO REAL AOSP-CONTRACT DIVERGENCES ARE NOW PROVEN
+  (all-frames injection; synchronous return shape). The bridge blocker is NOT yet identified — do not "fix" on
+  suspicion (full record: §6 2026-07-16 🔬).** New env-gated dev-host diagnostic `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1`
+  (renderer-side `RenderProcessHandler::load_handler()` → `on_load_end` on TID_RENDERER — the thread that owns the
+  V8 context; deliberately NOT main-frame-gated) evaluates a SELF-INTROSPECTION script built from the renderer's
+  OWN inventory: it reads only the globals Eclipse itself injected plus Eclipse's own `window.cefQuery` router —
+  never page content. Boot `/tmp/eclipse-challenge22-bridgediag.log` (EXIT=124, zero-orphan; a first attempt
+  `…challenge21…` STALLED at Landing — the KNOWN server-driven Landing drift, stage-1 focus-tap retried ~20× and
+  LoginV2 never opened; a plain re-run fixed it, no re-calibration needed). **THE VERDICT:**
+  `main_frame=true frame=https://www.roblox.com` → `{"cefQuery":"function","ifaces":[{"name":
+  "__globalRobloxAndroidBridge__","type":"object","props":[["executeRoblox","function"]]}]}` — **Eclipse's stub is
+  FULLY INTACT in the main frame**, the router is present, and the app's single bridge method is now known:
+  **`executeRoblox`**. Timeline (challenge22): `load started` …999849 → `bridge stubs applied` …999852 (**+3 ms**)
+  → the wrapper's first console …000391 (**+539 ms**) → introspect confirms the stub intact …000405 → `load
+  finished` …000412. ⇒ **THE INJECTION RACE IS DEFINITIVELY DEAD** (it was already doubted; now it is measured
+  from both ends). The wrapper has a correct, reachable bridge and simply does not call it. **TWO REAL DIVERGENCES
+  PROVEN (both genuine AOSP-contract violations in their own right, independent of whether either is THE
+  blocker):** (1) **ALL-FRAMES INJECTION** — every `main_frame=false frame=https://arkoselabs.roblox.com` line
+  (3×) reports `"type":"undefined"`: Eclipse's stub reaches ONLY the main frame, but AOSP/Chromium's Java Bridge
+  installs injected objects into EVERY frame of the WebView (`addJavascriptInterface`'s objects are not
+  main-frame-only). (2) **SYNCHRONOUS RETURN SHAPE** — `generate_stub_js` makes `executeRoblox` return a
+  **Promise**; AOSP's `@JavascriptInterface` methods return their value **directly/synchronously**. This is M4's
+  recorded suspect 4 and plan §7 #3 ("incl. synchronous returns"), still unvalidated against the real
+  `RBHybridWebView`. ⚠️ **HONEST STATUS: the bridge blocker is NOT identified.** Ruled out with evidence:
+  injection race (measured), callback delivery (fixed, §6 🧵), UA steering as the bridge's cause (silent under
+  BOTH UAs). NOT ruled out: the two divergences above; the wrapper's own platform-detection logic (unknown — and
+  reading Roblox's wrapper JS to find out is OFF-POLICY, so it must stay inferred from first-party observation).
+  ⇐ **START-HERE-NEXT: fix the two PROVEN divergences as contract-conformance work (not as a speculative bridge
+  "fix"), then RE-MEASURE with `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` + `ECLIPSE_WEBVIEW_CONSOLE=1`** — inject into all
+  frames (the arkose subframes must show `"type":"object"`), and make the bridge return synchronously per AOSP
+  (CEF's `CefMessageRouter` is async by design, so a synchronous return needs a different primitive — this is a
+  real design question, not a one-liner; the M4 async-Promise choice was deliberate and is recorded). If the
+  bridge is STILL silent after both, the remaining honest lever is the app-side `RBHybridWebView` contract, and
+  the next diagnostic should widen the introspection window (the wrapper's decision may be captured at bundle
+  module-init, which no load-end snapshot can see).
 - **2026-07-16 — 🕵️ UA A/B DIAGNOSTIC: SUSPECT 2 (UA STEERING) IS **CONFIRMED BY EVIDENCE** — under the app's
   genuine Android-WebView UA the challenge actually **COMPLETES**; under the honest desktop UA it never does. The
   bridge stays silent in BOTH, so bridge-delivery is a THIRD, still-open defect. The DEFAULT UA IS UNCHANGED —
@@ -7678,6 +7714,92 @@ run. That is first-party self-inspection of our own injection and needs no RE of
 
 *Files:* `crates/eclipse-webview/src/engine.rs`, `crates/eclipse-webview/src/main.rs`, `src/webview/mod.rs`
 (spawn-contract §7), this file (§5 🕵️ bullet + §6 this entry), `docs/web-engine-plan.md`.
+
+### 2026-07-16 — 🔬 Bridge self-introspection: Eclipse's stub is PROVEN intact in the main frame 539 ms before the wrapper speaks (injection race DEAD), the app's bridge method is `executeRoblox`, and TWO real AOSP-contract divergences are now proven — all-frames injection and the synchronous return shape. The bridge blocker itself is NOT identified.
+
+*Why:* after 🧵 (Looper fixed) and 🕵️ (UA steering confirmed but NOT the bridge's cause), the bridge remained
+silent across five boots with no confirmed mechanism. CLAUDE.md forbids a fix without one, and its Root-Cause
+Diagnosis section requires improving observability until the mechanism is identified — so: another diagnostic.
+
+*The instrument (env-gated, dev-host-only, first-party):* `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` (exact "1", mirroring
+`console_text_diag_enabled`). Seam = `RenderProcessHandler::load_handler()` → a renderer-owned
+`LoadHandler::on_load_end`, justified from the PINNED bindings (`_cef_render_process_handler_t::get_load_handler`
+exists; `cef_load_handler_t` is documented to run on "the browser process UI thread **or render process main
+thread (TID_RENDERER)**" — returned from the RENDER process handler that is TID_RENDERER, the thread that owns the
+V8 context where `eval_in_frame` is already proven). `on_context_created` is the WRONG seam (it fires before page
+scripts — the opposite of the question); the browser-side load handler is the wrong process (no V8). Deliberately
+NOT main-frame-gated: "which frames did our stub reach" is precisely the open fact, so `main_frame=` is reported
+per line. **Scope discipline:** the script is built from the renderer's OWN inventory and touches exactly two
+things — `window.cefQuery` (Eclipse's router) and `window[<iface Eclipse injected>]`. It never scans the page,
+never reads page-authored state, and the frame is bound through the existing `RedactedTarget` (scheme+host)
+contract. OFF is a structural no-op (`load_handler()` returns `None` → CEF gets a NULL handler).
+
+*Boot:* `/tmp/eclipse-challenge22-bridgediag.log`, EXIT=124, zero-orphan, `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` +
+`ECLIPSE_WEBVIEW_CONSOLE=1`, otherwise identical to challenge20. **Recipe note (durable):** the FIRST attempt
+(`/tmp/eclipse-challenge21-bridgediag.log`) STALLED at `onAppReady: Landing` — stage-0 tap `400,413` fired but
+LoginV2 never opened and the stage-1 focus-tap retried ~20×; `ChallengeHybridWebView` count 0. This is the KNOWN
+server-driven Landing drift (§6 2026-07-03: challenges 10/11/12 stalled identically). **A plain re-run fixed it —
+no re-calibration, same coordinates.** So the drift is at least partly TRANSIENT/per-session, not purely a stale
+coordinate map: re-run once before reaching for `ECLIPSE_VK_SCREENSHOT=1 ECLIPSE_VK_PROBE=1`.
+
+*THE VERDICT (verbatim):*
+```
+bridge-introspect(diag) main_frame=true  frame=https://www.roblox.com        ok=true
+  result={"cefQuery":"function","ifaces":[{"name":"__globalRobloxAndroidBridge__",
+          "type":"object","props":[["executeRoblox","function"]]}]}
+bridge-introspect(diag) main_frame=false frame=https://arkoselabs.roblox.com ok=true   (x3)
+  result={"cefQuery":"function","ifaces":[{"name":"__globalRobloxAndroidBridge__",
+          "type":"undefined","props":[]}]}
+```
+**(1) Eclipse's stub is FULLY INTACT in the main frame** — the object exists, the router exists, and the app's
+single bridge method is now known by name: **`executeRoblox`**. **(2) THE INJECTION RACE IS DEAD**, measured from
+both ends: `load started` …999849 → `bridge stubs applied mode=refresh` …999852 (**+3 ms**) → the wrapper's first
+console line …000391 (**+539 ms**) → introspect confirms the stub still intact …000405 → `load finished` …000412.
+The wrapper had a correct, reachable, correctly-named bridge for over half a second and did not call it. **(3) The
+stub is ABSENT from every arkoselabs subframe.**
+
+*TWO REAL AOSP-CONTRACT DIVERGENCES, NOW PROVEN (each a defect in its own right, independent of whether either is
+THE blocker — record them as such, do not conflate them with a bridge "fix"):*
+1. **All-frames injection.** Eclipse injects the bridge into the MAIN FRAME ONLY (both injection paths are
+   main-frame-gated). AOSP/Chromium's Java Bridge installs `addJavascriptInterface` objects into EVERY frame of
+   the WebView. The three `main_frame=false … "type":"undefined"` lines are the direct measurement of the gap.
+2. **Synchronous return shape (M4 suspect 4 / plan §7 #3, still unvalidated).** `generate_stub_js` makes every
+   method — here `executeRoblox` — return a **Promise**; AOSP's `@JavascriptInterface` methods return their value
+   **directly and synchronously**. The M4 async-Promise choice was deliberate and recorded; CEF's
+   `CefMessageRouter` is asynchronous BY DESIGN, so an AOSP-faithful synchronous return needs a different
+   primitive. **That is a real design question, not a one-liner** — it must be designed, not patched.
+
+*HONEST STATUS — the bridge blocker is NOT identified, and this entry does not pretend otherwise.*
+RULED OUT with evidence: the injection race (measured, above); app-callback delivery (fixed, §6 🧵); UA steering
+as the BRIDGE's cause (silent under both the honest and the Android UA — though the UA does decide whether the
+challenge itself completes, §6 🕵️). NOT ruled out: the two divergences above; and the wrapper's own
+platform-detection logic, which is **unknown and must stay inferred from first-party observation** — reading
+Roblox's wrapper JS to find out is OFF-POLICY and was not done.
+
+*Gate (measured 2026-07-16):* helper **38 + 15** (was 35+15; +3 = `bridge_diag_gate_is_exact_match_one_only`,
+`build_bridge_introspection_js_reads_only_our_inventory_and_never_scans_the_page`,
+`format_bridge_diag_line_keeps_the_frame_url_redacted`); root **643 + 6 + 2** UNCHANGED (root untouched);
+fmt/build/clippy `-D warnings`/test/release clean in both crates. All four guards negative-tested (page-scan token
+→ caught; `js_escape` dropped → caught; raw frame URL past `RedactedTarget` → caught; env gate loosened to a
+substring → caught). No wire-protocol change.
+
+*Recorded instrument limitations (honest):* (a) the `__webview-test` positive control returns `ifaces:[]` — at
+`on_load_end` there the renderer's inventory is still empty (its stub is applied ~17 ms AFTER `load finished`,
+because that harness's page is served instantly); the instrument is therefore validated by the CHALLENGE boot, not
+by the preflight. (b) A load-end snapshot cannot see a decision captured at bundle **module-init**; if the wrapper
+latches its platform at import time, no on_load_end introspection can observe it — widening the window is the next
+diagnostic if the two divergences do not explain the silence. (c) `Object.getOwnPropertyNames` would surface
+page-authored properties if the page pre-created the global before our stub ran (`generate_stub_js` merges via
+`window[name] = window[name] || {}`); in challenge22 it did not (only `executeRoblox` is present).
+
+*⇐ NEXT:* fix the two PROVEN divergences as **contract-conformance work** and RE-MEASURE with the same two diags
+(success criterion for #1 is mechanical and checkable: the arkose subframe lines must flip to `"type":"object"`).
+If the bridge is still silent after both, the honest next lever is the app-side `RBHybridWebView` contract plus a
+wider introspection window — not more guessing.
+
+*Files:* `crates/eclipse-webview/src/engine.rs` (`bridge_diag_enabled`), `crates/eclipse-webview/src/main.rs`
+(`load_handler()` + `BridgeDiagLoadHandler` + `build_bridge_introspection_js` + `format_bridge_diag_line`), this
+file (§5 🔬 bullet + §6 this entry), `docs/web-engine-plan.md`.
 
 ---
 
