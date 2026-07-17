@@ -128,6 +128,64 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — ⏳ THE 🩹➜⛔ ORDERING IS FIXED IN CODE: **NO COOKIE OP CAN COLD-START THE ENGINE ANY MORE.** The
+  helper spawn is DEFERRED past the early cookie ops — which are answered from the PROVABLY-empty session store or
+  buffered as raw frames — so `CefInitialize` now waits for the load-drive, 110 µs after the app sets its UA. Gate
+  green BOTH crates; live challenge boot PENDING — orchestrator-only (full record: §6 2026-07-16 ⏳).**
+  **THE DESIGN:** `ClientSlot::Unspawned` now CARRIES the deferral (`EarlyCookies`), so the buffer *is* the
+  unspawned state — one lock, one flush point (`ensure_spawned`, the only `Unspawned→Live` transition), and the
+  flush is structurally impossible to forget. **THE EMPTY-STORE LEMMA (the whole correctness argument):** while
+  Unspawned there is no helper ⇒ no `cef_initialize` ⇒ no `CefContext` (Context7 `/chromiumembedded/cef`
+  `docs/architecture.md`: *"initialized when CefInitialize is called"*; the pinned `cef_initialize` doc forbids
+  ANY other CEF call before it) ⇒ no store. On spawn it is created fresh with an EMPTY `cache_path` (*"browsers
+  will be created in \"incognito mode\" where in-memory caches are used"*) ⇒ starts EMPTY, and can only gain a
+  cookie via `set_cookie` (whose ONLY helper callers are the two `CookieSet*` handlers — grep-verified) or a
+  `Set-Cookie` header (needs a browser; `CreateView` has exactly ONE send site, `drive`, which spawns first).
+  **⇒ store ≡ replay(buffered sets), always.** From that: a `CookieSet` buffers (fire-and-forget, so no callback
+  can strand; the RAW frame keeps `expires_epoch_s`, which the read-back `CookieEntry` CANNOT — that asymmetry is
+  why buffering is lossless where the rejected read-back+replay was not); `CookiesClear` drops the buffer and
+  answers `true` LOCALLY (blanket `delete_cookies(NULL,NULL)` over a store whose whole content is `sets` ≡
+  dropping `sets`; `fire_cookies_clear_result` passes `true` unconditionally, so it is the SAME value, not a
+  fabricated ack); an empty-buffer `CookieGet` answers `[]` (byte-identical to CEF, and ~5 s faster — a zero-cookie
+  visit only completes on the 5 s `COOKIE_VISIT_DEADLINE`). **THE PROOF'S BOUNDARY IS RESPECTED, NOT PAPERED
+  OVER:** a non-empty-buffer `CookieGet` (`visit_url_cookies` is *"filtered by the given url scheme, host, domain
+  and path"* — Chromium's matching; Eclipse implements no RFC 6265 and must not start) and the 3-arg
+  `CookieSetForResult` (only CEF yields the REAL flag) FORCE the spawn with a loud WARN naming the reason —
+  exactly today's behaviour, said out loud, so they can regress nothing. (Deferring the 3-arg REPLY was rejected:
+  on a boot that never drives a WebView the app's `ValueCallback` would hang FOREVER — strictly worse than a wrong
+  UA.) **⚠️ TWO RECORDED CLAIMS CORRECTED BY MY OWN VERIFICATION:** (1) *"there is NO per-browser and NO post-init
+  override"* is **FALSE as literally stated** — `_cef_browser_host_t::execute_dev_tools_method` (offset 256) is a
+  real post-init channel (CDP `Emulation.setUserAgentOverride` rides it). The accurate and still-decisive claim is
+  **"no per-browser and no post-init override AT THE SETTINGS LAYER"**; `_cef_browser_settings_t` (29 fields) and
+  `_cef_request_context_settings_t` (6) carry no UA, and `grep set_user_agent|SetUserAgent|get_user_agent|
+  GetUserAgent` over the whole sys crate = **0**. CDP is NOT shipped (it post-hoc-corrects a wrong global, its
+  semantics are unverifiable without the reserved live boot, it is racy — *"submitted for validation"* — and it
+  would desync the UA from `user_agent_product`/client hints); it is the PRE-REGISTERED escalation. (2) *"five
+  COOKIE call sites"* — there are **FOUR** (`cookie_set`, `cookie_set_with_result`, `cookies_clear`,
+  `cookie_get_blocking`); the other two `send_with_lazy_spawn` callers are `register_bridge` (gated on
+  `view_is_tracked` ⇒ can never spawn first) and `evaluate_js` (needs a view; §6 ⚖️ measured the app never calls
+  it). **🔴 THE HONEST RESIDUAL — the trigger at 03:31:24.71 is STILL UNIDENTIFIED and the record's `request_id=1`
+  reasoning is UNSOUND:** `engine::cookie_get` has an **unlogged** early return (`visit_url_cookies != 1`), so a
+  get CAN be silent; and the 2-arg `setCookie` allocates **no request id at all**, so "the trigger consumed id 1"
+  was never proven. Enumerated: 2-arg set (**FIXED** — buffers) · empty-buffer get (**FIXED** — answered) · clear
+  (**FIXED** — answered) · **accepted 3-arg set (NOT fixed — forces the spawn, never worse than today)**. **3 of 4
+  fix the headline; the 4th is named by the design's own new `trigger=` line on the very next boot** — no extra
+  instrumentation, and it cannot be narrowed first-party without RE (out of scope). Gate MEASURED: root **649**+6+2
+  zero-SKIP (+5 pins, each negative-tested and restored byte-identical), helper **41+15 UNCHANGED — the helper
+  source has ZERO diff** (whole fix is main-process; no proto change, `PROTO_VERSION` stays **2**);
+  `patch-framework.sh` EXIT=0 `classes2.dex` **77764** (byte-identical — no overlay change); `__webview-test`
+  **EXIT=0** marker intact (`upcalls 2/2 … honest UA OK … cookie set/get OK, cookie callback OK … bound=5`) with
+  the new `trigger="WebView load-drive …" app_ua_known=false deferred=0` and the forcing WARN at **0** — the
+  harness is structurally on the old path (it loads at `main.rs:660` before any cookie leg at 800+), so it still
+  guards the FALLBACK rung, and it CANNOT cover the new deferral (stated honestly). **⇐ START-HERE-NEXT — THE LIVE
+  CHALLENGE BOOT (owner, dev-host main thread; the ONLY thing not done):**
+  `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1 ECLIPSE_WEBVIEW_CONSOLE=1` **with `ECLIPSE_WEBVIEW_UA_DIAG` UNSET** ⇒ PASS =
+  `honoring the User-Agent the app set` ≥1 carrying `Hybrid()`, `ECLIPSE-STUB invoke` ≥1, `bridge call received`
+  ≥1, **`Load generic challenge failed` = 0**, `is forcing the eclipse-webview helper` = **0**, and
+  `cold-starting … trigger=` reading the load-drive AFTER `setUserAgentString` (not 61 s before). **Pre-registered
+  falsifier:** if the forcing WARN fires with `reason="setCookie(url, value, ValueCallback) …"`, the coin landed
+  wrong — the design is falsified as *sufficient* (never as *correct*) and the escalation is the CDP lever, NOT a
+  buffer re-design.
 - **2026-07-16 — 🩹 THE 💥 BUG IS FIXED IN CODE: ECLIPSE NOW HONORS `WebSettings.setUserAgentString`. The app's
   UA is stored in RUST (one source of truth), reaches CEF via the child's ENVIRONMENT at spawn, and is reported
   back by `getUserAgentString` — the M4 byte-match contract now holds BY CONSTRUCTION. The `!contains("Android")`
@@ -170,6 +228,44 @@ before any history-rewriting/force operation.
   **`Load generic challenge failed` = 0**, plus the new `honoring the User-Agent the app set …` INFO carrying the
   `Hybrid()` token — i.e. challenge26's forced-token result reproduced with NOTHING forced. After that the only
   gap to a completed login is **real credentials**.
+- **2026-07-16 — ⏳➜🎲 THE SPAWN-DEFERRAL LANDED, GATE-GREEN — AND ITS OWN PRE-REGISTERED FALSIFIER FIRED ON THE
+  FIRST BOOT: the app's FIRST cookie op is the 3-arg `setCookie(url, value, ValueCallback)`, which CANNOT be
+  answered without the engine because **M4's own honesty fix demands the REAL success flag**. Correct, insufficient,
+  and it NAMED its own culprit (full record: §6 2026-07-16 ⏳).** What landed and is CORRECT: `ClientSlot::Unspawned(EarlyCookies)`
+  — the buffer IS the unspawned state (no second lock, no lock-order question); `offer` returns
+  `Buffer`/`AnswerWithoutEngine`/`NeedsEngine`; `ensure_spawned(slot, vm, trigger)` is the ONE flush point; early
+  `CookieSet` frames buffer **losslessly** (the app's ORIGINAL frame carries `expires_epoch_s`, unlike the
+  expiry-less `CookieEntry` — which is why respawn-and-replay was rightly avoided); `CookiesClear` and
+  **empty-store `CookieGet`** are answered **byte-identically to CEF** off a *proved* lemma (under `Unspawned` no
+  browser ever existed ⇒ no `Set-Cookie` ever ran ⇒ the session store is created fresh with empty `cache_path` ⇒
+  content is EXACTLY the buffered sets ⇒ empty buffer ⇒ `[]` is what CEF would return — a proven-equal answer, not
+  a degradation). Gate: root **649**+6+2 (+5 pins, all negative-tested), helper **41+15 UNCHANGED** (the entire fix
+  is main-process — zero helper diff), `PROTO_VERSION` still 2, `classes2.dex` byte-identical, `__webview-test`
+  EXIT=0 marker intact. **⚠️ AND IT CORRECTED THE RECORD — my SIXTH instance of the same error class:** §5/§6 🩹
+  asserted *"there is NO per-browser and NO post-init override in the pinned bindings."* **FALSE.**
+  `_cef_browser_host_t::execute_dev_tools_method` exists at **offset 256** (CDP `Emulation.setUserAgentOverride`
+  rides it). The accurate, still-decisive claim is **"none at the SETTINGS layer"** (`user_agent` appears only at
+  `_cef_settings_t:1207`; `_cef_browser_settings_t`'s 29 fields and `_cef_request_context_settings_t`'s 6 carry
+  none; `grep -rE 'set_user_agent|SetUserAgent'` over the whole sys crate = **0**). **🎲 THE LIVE VERDICT
+  (`/tmp/eclipse-challenge29-ordering.log`, nothing forced) — the falsifier fired:**
+  `reason="setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag"`, `deferred=0`.
+  The deferral DID work (spawn moved from ~1 s to ~19 s into boot) but **the app's VERY FIRST cookie op is the
+  3-arg setter**, so nothing ever buffered. Headline unchanged: `honoring the app's UA` **0**, `bridge call
+  received` **0**, `Load generic challenge failed` **1**. **THE IRONY, recorded:** M4's *"the fabricated
+  Boolean.TRUE is gone — the REAL success flag routes back through the native"* honesty fix is PRECISELY what
+  cold-starts CEF before the app's UA exists. Answering it locally would mean **fabricating** a flag (undoing M4)
+  or **stranding** the app's callback (worse than a wrong UA). **The design predicted this exact 1-of-4 world and
+  named it on the first boot — that is the instrument working, not failing.** ⇐ **START-HERE-NEXT — the
+  pre-registered escalation, and it is now the ONLY lever left:** CDP `Emulation.setUserAgentOverride` via
+  `execute_dev_tools_method` (per-browser, POST-init) applied at `CreateView`, before the driven load. Its four
+  recorded falsifiers must be honoured: (1) the bindings expose only the CDP *transport*, so its semantics here
+  are unverifiable without a live boot; (2) it is racy (*"submitted for validation"* only) — it must be proven to
+  land before the page's first script; (3) it would make the UA disagree with `user_agent_product`/Sec-CH-UA
+  unless those are set too; (4) it is a post-hoc correction of a global that starts wrong — argue it honestly
+  against CLAUDE.md rather than waving it through. **Alternative worth weighing first:** make the 3-arg
+  `setCookie` answerable without CEF by *proving* the local predicate equals CEF's — M4 already ships
+  `classify_cookie_set_rejection`, which *mirrors CEF's documented sync-false predicates*; if that mirror is
+  exact, the flag is derivable honestly and the whole deferral completes. **Do not fabricate; do not strand.**
 - **2026-07-16 — 🩹➜⛔ HONORING THE APP'S UA: LANDED, GATE-GREEN, AND **LIVE-DISPROVED AS INSUFFICIENT** — the
   plumbing is right, the ORDERING is wrong: the helper is spawned by a COOKIE op ~61 s before the app sets its
   UA, and `CefSettings.user_agent` is global + consumed at `CefInitialize`. The fix's OWN guard caught it. NOT
@@ -8881,6 +8977,163 @@ evidenced; what is untested is only that the app's real string travels the new s
 `src/framework.rs` (the 2 WebSettings natives + `register_web_settings_natives` + wiring + the pin),
 `tools/framework-overlay/patch-framework.sh` (the real fix replacing the 💥 diagnostic + guards); this file
 (§5 🩹 bullet + §6 this entry).
+
+---
+
+### 2026-07-16 — ⏳ The 🩹➜⛔ ORDERING fixed: no cookie op can cold-start the engine any more. The spawn is deferred past the early cookie ops — answered from the provably-empty session store or buffered as RAW frames — so `CefInitialize` waits for the load-drive. Two recorded CEF/code claims corrected by verification.
+
+*Root cause (confirmed by the challenge28 live boot, not re-litigated):* `CefSettings.user_agent` is GLOBAL and
+consumed by `CefInitialize`, and Eclipse let a **cookie** op — 61 s before the app's `setUserAgentString` — be the
+thing that triggered the spawn. The 🩹 plumbing was correct; only the ordering was wrong, and the fix's own
+`HELPER_UA_FIXED` WARN caught it.
+
+*The fix, in one sentence.* No cookie op may cold-start the helper: while `ClientSlot::Unspawned` holds, no browser
+has ever existed, so the session store's entire content is the set of cookie frames Eclipse itself buffered.
+
+**The empty-store lemma (the whole correctness argument, stated at the type it justifies).** Unspawned ⇒ no helper
+⇒ no `cef_initialize` ⇒ no `CefContext` ⇒ no `RequestContext`, no store, no browser. **Verified two ways, not
+assumed:** the pinned `cef_initialize` doc — *"If this function returns false (0) then the application should exit
+immediately **without calling any other CEF functions**"* — and Context7 `/chromiumembedded/cef`
+`docs/architecture.md`: *"The CefContext class represents the global CEF context within the browser process. **It
+is initialized when CefInitialize is called** and is subsequently destroyed during CefShutdown."* On the eventual
+spawn the store is built fresh from `engine::session_context_settings()`, `cache_path` EMPTY — pinned
+`_cef_settings_t::cache_path`: *"If this value is empty then browsers will be created in \"incognito mode\" where
+in-memory caches are used for storage and no profile-specific data is persisted to disk"* ⇒ initial content **∅**,
+no disk, no prior boot. It can then gain a cookie by exactly two routes: (a) `set_cookie`, whose ONLY callers in
+the whole helper are the `CookieSet`/`CookieSetForResult` handlers (`engine.rs:931`/`1376` — grep-verified), and
+(b) a `Set-Cookie` header, which needs a browser — and `CreateView` is sent from exactly ONE site (`client.rs`
+`drive`), which spawns first. (b) is impossible here; (a) is exactly what the buffer holds. **⇒ store ≡
+replay(sets), always.**
+
+*What follows from the lemma (each answer is a THEOREM, not a heuristic).*
+1. **`CookieSet` → buffer.** Fire-and-forget (v1), so no reply obligation can strand. The RAW frame is the app's
+   ORIGINAL and carries `expires_epoch_s`; the read-back type `CookieEntry` does **NOT** (`proto.rs:200-207` vs
+   `329-338`). That asymmetry is precisely why buffering is lossless where the rejected read-back+replay was not —
+   and it means the recorded rejection of respawn-and-replay was **weaker than stated**: replaying ORIGINAL frames
+   would also be lossless. It stays rejected, but on the honest ground: **not spawning strictly dominates it**
+   (Simplicity First).
+2. **`CookiesClear` → drop the buffer, answer `true` locally.** `engine::cookies_clear` calls
+   `delete_cookies(None, None, cb)`; pinned doc: *"If |url| is NULL all cookies for all hosts and domains will be
+   deleted"*. A blanket delete over a store whose whole content is `sets` ≡ dropping `sets`. The reply is a pure
+   completion and `framework::fire_cookies_clear_result` passes `true` **unconditionally** ⇒ the local `true` is
+   the SAME value, not a fabricated ack. Answered without being buffered, so a clear can never replay into a
+   context where it would delete a LATER cookie.
+3. **Empty-buffer `CookieGet` → `[]`.** The store is empty ⇒ CEF returns the empty list — and only via the 5 s
+   `COOKIE_VISIT_DEADLINE` (*"Zero cookies never trigger the visitor"*), so the local answer is byte-identical and
+   ~5 s faster. No matching rule is needed or implied: the empty list is the answer under EVERY rule.
+
+*The proof's BOUNDARY — respected, not papered over.* Two ops force the spawn, loudly, with the reason named:
+a **non-empty-buffer `CookieGet`** (`visit_url_cookies` results are *"filtered by the given url scheme, host,
+domain and path"* — Chromium's matching; Eclipse implements no RFC 6265 anywhere and must not start here) and
+**`CookieSetForResult`** (its whole purpose is the REAL verdict: `set_cookie` *"will check for disallowed
+characters … and fail without setting the cookie"*, returns *"false (0) if an invalid URL is specified"* — the
+measured boot shows CEF genuinely rejecting two of the app's sets). A forced spawn is **exactly the pre-fix
+behaviour**, so it can regress nothing; it is an honest degradation to the fallback UA, said out loud. **Deferring
+the 3-arg REPLY was considered and REJECTED:** the app's `ValueCallback` would then fire only at flush — and on a
+boot that never drives a WebView, never. A caller blocking on it at `AppManager.initialize` would HANG FOREVER,
+strictly worse than a wrong UA.
+
+*Ordering / deadlock / era-gating — audited, not assumed.* The offer, the buffer mutation, the spawn and the flush
+all happen under the SINGLE `CLIENT` acquisition ⇒ no TOCTOU between the emptiness test and the send, and no
+observer can read the jar between spawn and flush (`Vec` = FIFO = arrival order). Only reply-LESS `CookieSet` is
+buffered, so no callback is ever stranded. The M4 anti-deadlock invariant is untouched on the `Sent` path; on the
+answered path the waiter is registered then immediately removed (preserving "register before send" with zero
+restructuring) and nothing parks. `WEBVIEW_CLOSE_ERA` gates the per-**view** drain; cookies are context-scoped and
+no cookie path reads or bumps an era. There is no visit/list wire op to cover — `ConsumerMsg` has exactly four
+cookie variants and the helper never calls `visit_all_cookies`.
+
+*⚠️ TWO RECORDED CLAIMS CORRECTED BY MY OWN VERIFICATION (the record has already logged five instances of
+asserting an unverified fact; it must not ship a sixth in the entry that closes the case).*
+1. **"There is NO per-browser and NO post-init override in the pinned bindings" is FALSE as literally stated.**
+   `_cef_browser_host_t::execute_dev_tools_method` (line 8583, **offset 256**) is a real per-browser, post-init
+   channel — CDP `Emulation.setUserAgentOverride` rides it. The accurate, still-decisive claim is **"no
+   per-browser and no post-init override AT THE SETTINGS LAYER"**: `user_agent` appears ONLY as
+   `_cef_settings_t::user_agent` (line 1207); `_cef_browser_settings_t` (29 fields) and
+   `_cef_request_context_settings_t` (6 fields) carry no UA; and
+   `grep -rE 'set_user_agent|SetUserAgent|get_user_agent|GetUserAgent'` over the ENTIRE sys crate = **0 hits**.
+   **CDP is NOT shipped** and this is deliberate: it post-hoc-corrects a global the engine still starts wrong with
+   (CLAUDE.md's *"changes behavior to avoid the problem"*), the bindings expose only the CDP *transport* so its
+   semantics here are unverifiable without the orchestrator-only live boot, it is racy (*"submitted for
+   validation"* only), and it would desync `navigator.userAgent` from `user_agent_product`/client hints. It is the
+   **pre-registered escalation** if the residual below lands wrong.
+2. **"`send_with_lazy_spawn` has FIVE cookie call sites" — there are FOUR:** `cookie_set` (1660),
+   `cookie_set_with_result` (1691), `cookies_clear` (1712), `cookie_get_blocking` (1746). The other two of the six
+   callers are `register_bridge` (gated on `view_is_tracked` ⇒ can never be the first spawner) and `evaluate_js`
+   (needs a view; §6 ⚖️ measured the app never calls it).
+
+*🔴 THE HONEST RESIDUAL — the 03:31:24.71 trigger is STILL UNIDENTIFIED, and the prior `request_id=1` reasoning is
+UNSOUND.* Two findings kill it: **(a)** `engine::cookie_get` has an **unlogged** early return (`visit_url_cookies
+!= 1` → immediate empty `CookieList`, no log line), so a get CAN be silent — the deduction "a get would have
+logged, therefore id=1 is a clear or a 3-arg set" does not hold; **(b)** the 2-arg
+`web_view_cookie_manager_set_cookie` allocates **no request id at all**, so "the trigger consumed id 1" was never
+proven either. Re-inspected the log first-party: the spawn at 24.724 sits **3 ms after** `[AppManager]:
+initialize: Start...` (24.7077) and the `updateCookiesFromEngine: Invalid cookie format: []` line is at **33.06**,
+i.e. LATER — the log is genuinely silent about which op it was. **Enumeration (the first `native_loadUrl` is at
+03:32:25.912394, so it is necessarily one of the four cookie ops):** 2-arg set (**FIXED** — buffers) · empty-buffer
+get (**FIXED** — answered) · clear (**FIXED** — answered) · **accepted 3-arg set (NOT fixed — forces the spawn;
+never worse than today)**. **3 of 4 fix the headline, and the design's own new `trigger=` line names the 4th on the
+very next boot** with no extra instrumentation. Deliberately NOT designed for on spec: it is dead work in 3 of 4
+worlds and its only honest resolution risks a permanent app hang. Narrowing it further first-party would need RE of
+the APK — out of scope.
+
+*Design choice worth recording: the buffer IS the unspawned state.* `ClientSlot::Unspawned(EarlyCookies)` — so
+there is no second lock, no lock-order question, and no lifetime that can outlive its meaning. `ensure_spawned` is
+already the ONLY `Unspawned→Live` transition and already runs under `CLIENT`, so the flush is structurally
+impossible to forget (a separate `flush_*` would have to be remembered at two call sites). `trigger` is
+load-bearing, not decoration: challenge28's log could not say WHAT cold-started the helper, and that ambiguity is
+what the line ends.
+
+*Regression protection (tied to the confirmed root cause; no new scripts — all five land in `client.rs`'s existing
+`mod tests`, pure, no ART/display/env).* (1) **`early_cookies_defer_sets_so_a_cookie_op_never_cold_starts_the_engine`
+— THE root-cause guard**: the confirmed bug IS "a cookie op fixes the engine's UA before the app sets it", i.e.
+"`offer(CookieSet)` returns `NeedsEngine`". (2)
+`early_cookies_answer_a_blanket_clear_and_an_empty_store_get_without_the_engine`. (3)
+`early_cookies_demand_the_engine_for_matching_and_for_the_real_set_flag` (pins the boundary + the no-strand
+hazard). (4) `early_cookies_are_bounded_and_overflow_forces_the_honest_spawn` (`CAP = 256`). (5)
+`early_cookie_sets_replay_in_arrival_order`. **All five negative-tested** — each mutation was applied, the guard
+observed FAILING, and the file restored **byte-identical** (md5 `cbe4e140e753ddafe8c4cdd4c95048c8` re-verified
+after every one); re-introducing the exact confirmed bug fails **4** of the 5 at once. **Honest caveat on the
+"compiler is the class guard" claim: it is WEAKER than it sounds.** `offer` matches the four cookie variants
+explicitly, so changing an EXISTING one's behaviour requires editing an explicit arm — but a NEW cookie variant
+would fall into the `_` arm rather than failing to compile. The `_` default is the SAFE one (`NeedsEngine` = force
+the spawn = today's behaviour), so a future cookie message degrades honestly instead of silently answering wrong.
+Rejected as redundant: a "`CookieSet` round-trips `expires_epoch_s`" pin — `proto_roundtrip_encodes_and_decodes_
+every_v1_message` already freezes v1 byte-exactly in both directions.
+
+*Gate (MEASURED 2026-07-16).* Root `fmt --check`/`build --all-targets`/`clippy --all-targets --all-features -D
+warnings`/`test`/`build --release` — **0 warnings, 0 errors**; **649 unit + 6 integ + 2 doctest, zero SKIP** (was
+644+6+2; **+5** = the pins above). Helper (`CEF_PATH` set) all five clean — **41 + 15 UNCHANGED**, and
+`git diff crates/eclipse-webview/src/` is **EMPTY**: the whole fix is main-process. No proto change;
+`PROTO_VERSION` stays **2**. `patch-framework.sh` **EXIT=0** — `classes.dex` 21280, `classes2.dex` **77764**,
+`classes3.dex` 2498192 (byte-identical to the 🩹 values — no overlay change this pass). `__webview-test` **EXIT=0**,
+marker INTACT: *"upcalls 2/2 (state 0 @ 150ms, state 3 @ 150ms, http 200), frame 1024x768 237 distinct pixels,
+bridge round-trip OK, evaluateJavascript OK, honest UA OK, cookie set/get OK, cookie callback OK, ViewClosed,
+helper exit 0, bound=5"*, zero orphans (`pgrep -x eclipse-webview` = 0). Its new diagnostic reads
+`trigger="WebView load-drive (loadUrl/loadDataWithBaseURL) — the app's UA is final" app_ua_known=false
+deferred=0` and the forcing WARN is **0** — the harness loads at `main.rs:660` BEFORE any cookie leg (800+), so its
+slot is `Live` first, `offer` is never called, and every cookie leg is byte-for-byte today's. **⇒ It still guards
+the FALLBACK rung (`the app set no User-Agent — using Eclipse's fallback literal`) and it CANNOT cover the new
+deferral** — stated honestly, same shape as the 🪟 entry's note; coverage of the deferral is the five unit pins
+plus the live boot.
+
+*NOT DONE — stated honestly.* **The live challenge boot did not run** (orchestrator-only — CLAUDE.md's dev-host
+boundary). Proven at every seam a harness can reach; the END-TO-END claim is pending that boot. Two second-order
+effects it will show and that are NOT regressions: `CefInitialize` (~122 ms measured) moves ONTO the challenge's
+critical path instead of being pre-warmed 61 s early (traded against ~35 s of eliminated empty-`getCookie`
+deadline stalls — net strongly positive, so the timings will NOT match challenge28's), and helper-failure discovery
+moves from `AppManager.initialize` to the first load (identical text, identical honest one-shot WARN no-op).
+**A resource win worth recording:** a boot with NO login challenge now never spawns CEF at all — today every boot
+pays for a helper it usually never uses. **A new instance of a recorded divergence:** the locally-answered clear
+fires its `ValueCallback` inline on the calling thread (the shape the existing FALSE arm already used); verified
+first-party that `note_non_main_callback_registrar`'s WARN is **0** across challenge25–28, so every cookie
+ValueCallback is registered on the ART main thread and this lands on main, i.e. AOSP-correct here — but it is now
+on the SUCCESS path, which is why it is recorded here rather than left for a future session to discover.
+
+*Files:* `src/webview/client.rs` (`ClientSlot::Unspawned(EarlyCookies)` + `EarlyCookies`/`Deferral`/`SendOutcome` +
+`ensure_spawned(trigger)` + the flush + `send_with_lazy_spawn`'s verdict + the 6 callers + `shutdown`'s buffer
+clear + the two falsified comments replaced + 5 pins), `src/framework.rs`
+(`web_view_cookie_manager_remove_impl` only), `src/webview/mod.rs` (spawn contract §8 — the falsified ordering
+sentence), this file (§5 ⏳ bullet + §6 this entry). **No helper-crate change. No proto change.**
 
 ---
 

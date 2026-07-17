@@ -60,9 +60,18 @@
 //!    8. **`ECLIPSE_WEBVIEW_APP_UA` (2026-07-16, plan M6) — NOT a diagnostic; part of the contract.**
 //!    The consumer SETS it on the child (it does not merely inherit) to the User-Agent the app
 //!    itself chose via `WebSettings.setUserAgentString`, when the app set one. It is the channel for
-//!    the §6 2026-07-16 💥 fix: `CefSettings.user_agent` is global and fixed at `CefInitialize`,
-//!    while this spawn is LAZY — first load-drive, i.e. after the app configures its WebView — so
-//!    the ordering works. The env, not argv, per §4's provenance test: a UA is neither a URL nor a
+//!    the §6 2026-07-16 💥 fix: `CefSettings.user_agent` is global and fixed at `CefInitialize`, so
+//!    the spawn is the boot's ONE chance to deliver it. **2026-07-16 (§6 🩹➜⛔) — the ordering rule,
+//!    corrected by a live boot:** the claim that stood here (*"the spawn is LAZY — first load-drive,
+//!    i.e. after the app configures its WebView — so the ordering works"*) was DISPROVED: a COOKIE
+//!    op cold-started the helper 61 s BEFORE `setUserAgentString`. The spawn is now DEFERRED past
+//!    the cookie ops that are answerable without an engine (`client::EarlyCookies` — the session
+//!    store starts empty, so buffered sets ARE its whole content), to the first op that genuinely
+//!    needs CEF — normally the load-drive. Two ops still force an early spawn, and both are LOUD:
+//!    a `getCookie` issued after this boot already set a cookie (CEF owns url/domain/path matching),
+//!    and the 3-arg `setCookie(url, value, ValueCallback)` (only CEF yields the real success flag).
+//!    A forced early spawn is an HONEST DEGRADATION to the fallback UA — the pre-fix behaviour, said
+//!    out loud — never a wrong answer. The env, not argv, per §4's provenance test: a UA is neither a URL nor a
 //!    secret (the app composes it from ATL's own synthetic `SystemProperties`/`Build` values and
 //!    broadcasts it to every server by design), but `/proc/PID/environ` is owner-only while
 //!    `/proc/PID/cmdline` is world-readable, so the env channel adds no disclosure at all.
