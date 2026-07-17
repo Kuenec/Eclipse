@@ -228,6 +228,36 @@ before any history-rewriting/force operation.
   **`Load generic challenge failed` = 0**, plus the new `honoring the User-Agent the app set …` INFO carrying the
   `Hybrid()` token — i.e. challenge26's forced-token result reproduced with NOTHING forced. After that the only
   gap to a completed login is **real credentials**.
+- **2026-07-16 — ☠️ LEVER (1) IS DEAD BY CONSTRUCTION — the code's own doc kills it. Both named levers are now
+  closed; the UA ordering needs a NEW idea, not one of the two on file.** Lever (1) was *"prove M4's
+  `classify_cookie_set_rejection` mirror is EXACT vs CEF's documented sync-false predicates; if so the 3-arg
+  `setCookie` flag is derivable honestly without the engine and the deferral completes."* **It cannot be.** Its
+  own doc (`crates/eclipse-webview/src/engine.rs`, verbatim): *"Name the **LIKELY** reason a `set_cookie` returned
+  false… Pure and unit-pinned; **observability ONLY — it never changes the set outcome**. Checked in order; **the
+  fallback names the CEF-internal store-unready-at-first-op** / engine-sanitization case so a race that matched no
+  local predicate reads honestly."* ⇒ it is a LIKELY-reason **namer**, not an oracle; it is observability-only BY
+  DESIGN; and its catch-all exists precisely for the case it **cannot** decide — **"store-unready-AT-FIRST-OP"**,
+  which is EXACTLY the app's first cookie op (the measured trigger). Deriving the app's success flag from it would
+  **fabricate** the very flag M4 deliberately stopped fabricating. **Lever (1): CLOSED.** **Lever (2) (CDP
+  `Emulation.setUserAgentOverride` via `execute_dev_tools_method`) was already RULED AGAINST by the design panel
+  on policy** — *"a post-hoc correction of a wrong global (the engine still starts misconfigured)"*, i.e.
+  CLAUDE.md's *"changes behavior to avoid the problem"* — on top of its four standing falsifiers (transport-only
+  bindings ⇒ semantics unverifiable without a boot; racy, *"submitted for validation"* only; desyncs
+  `user_agent_product`/Sec-CH-UA; post-hoc). It is not disqualified forever, but it must be argued past
+  CLAUDE.md's no-workaround rule with evidence, not adopted by elimination. ⇐ **START-HERE-NEXT — the problem,
+  stated exactly, for a fresh session with a fresh design pass:** *`CefSettings.user_agent` is global and consumed
+  by `CefInitialize`; the app's first WebView-relevant call is a 3-arg `setCookie(url, value, ValueCallback)`
+  ~30–60 s BEFORE `setUserAgentString`; that callback needs a REAL flag only the engine yields (M4's honesty fix);
+  answering it locally fabricates, deferring it strands.* **Ideas NOT yet explored, none endorsed:** (a) a
+  SECOND helper/request-context for the WebView with the app's UA, leaving the early cookie helper alone —
+  needs the cookie-store-sharing question answered honestly; (b) a bounded deferral of the 3-arg reply keyed on
+  the first load-drive with a long timer — measure whether the app actually blocks on that callback before
+  believing it; (c) accept a two-phase boot (fallback UA for the pre-login store, correct UA for the challenge) if
+  and only if the stores can be reconciled without loss. **The mechanism is NOT in doubt and never was** —
+  challenge26 proved that with the token present the challenge COMPLETES and its result reaches the app
+  (`Load generic challenge failed` 1 → 0). This is one ordering problem, fully instrumented (`trigger=` /
+  `deferred=` / the forcing WARN name the state on every boot), with every dead end now recorded so nobody
+  re-walks them.
 - **2026-07-16 — ⏳➜🎲 THE SPAWN-DEFERRAL LANDED, GATE-GREEN — AND ITS OWN PRE-REGISTERED FALSIFIER FIRED ON THE
   FIRST BOOT: the app's FIRST cookie op is the 3-arg `setCookie(url, value, ValueCallback)`, which CANNOT be
   answered without the engine because **M4's own honesty fix demands the REAL success flag**. Correct, insufficient,
