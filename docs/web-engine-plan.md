@@ -662,11 +662,26 @@ challenge (no ~60 s timeout-to-LoginV2 recovery); results recorded in §5/§6.
 
 ## 7. Open questions (2026-07-03)
 
-1. **Vendor reception of CEF-shaped clients:** DataDome publicly documents
-   fingerprinting/blocking CEF while Arkose officially supports embedded WebViews — only the
-   M6 live boot answers whether the challenge is served and completable for a real human on
-   genuine Chromium 149; if refused, the recorded fallback is the runner-up (Servo behind its
-   own servoshell real-challenge-URL spike).
+1. **Vendor reception of CEF-shaped clients — ✅ ANSWERED 2026-07-17 by the M6 live boot:
+   NOT REFUSED. The Servo fallback is NOT triggered.** (Record: AGENTS.md §6 2026-07-17 🎉.)
+   The question was *"only the M6 live boot answers whether the challenge is served and
+   completable … on genuine Chromium 149"*. It has now run. **Measured, on genuine bundled
+   Chromium 149.0.7827.201 via CEF:** the challenge page was **SERVED** (`http_status=200`,
+   `www.roblox.com/challenge/cdn/hybrid`, the `arkoselabs.roblox.com` subframes loaded); it
+   **COMPLETED** (`challengeCompleted`, `generic-challenge-type=proofofwork`); and — the
+   decisive part — **the SERVER ACCEPTED IT**: the pre-challenge `auth.roblox.com/v2/login`
+   returns `403 bodySize:82` (= exactly the measured `"Challenge is required to authorize the
+   request"` body), and the post-challenge one returns `403 bodySize:85` — **a different body;
+   the challenge demand is GONE**, and the app never re-enters the challenge. DataDome's
+   published CEF-fingerprinting concern did **not** materialise on this path.
+   **HONEST CAVEATS, which keep part of the question alive:** (a) this was the **proofofwork**
+   challenge type, which completes with **no human interaction** — an *interactive*
+   Arkose/FunCaptcha type may score differently, so *"completable for a real human"* is
+   answered only for the type actually served; (b) the client the vendor saw is genuine
+   Chromium 149 presenting the **app's own Android-WebView User-Agent** (which is what a real
+   device sends — §6 💥/🎉), i.e. CEF-shaped at the engine/TLS layer and Android-app-shaped at
+   the UA layer; (c) a single account/session/IP on one host is not a population. **What is
+   settled: CEF is not rejected out of hand, and the M1 GO decision stands.**
 2. **Sandbox degradation policy (owner ruling needed):** is `--no-sandbox` acceptable as a
    loud, documented degradation on hosts with neither a SUID `chrome-sandbox` nor
    unprivileged user namespaces, given this component renders hostile web content beside the
