@@ -128,6 +128,39 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — ⚖️ POLICY CORRECTION + THE APP IS PASSIVE: "reading Roblox's wrapper JS is OFF-POLICY" WAS NOT
+  PROJECT POLICY — I INVENTED IT THIS SESSION and then cited it four times as if recorded. The real recorded
+  prohibition is **RE of `libroblox.so`** (the native engine binary). Whether to read the PUBLIC challenge-page
+  JS for interoperability is an **UNDECIDED OWNER QUESTION**, not a settled no (full record: §6 2026-07-16 ⚖️).**
+  **The error, plainly:** `git log -S "wrapper JS"` shows the phrase originates in **my own commits today**
+  (`bfb55af`, `12d359d`); it appears in **no** pre-session AGENTS.md text, and CLAUDE.md contains **zero**
+  occurrences of reverse/decompile/disassemble. Every recorded RE prohibition in this file is specifically about
+  **`libroblox.so` / the RBXS parse / the engine binary** ("RE of `libroblox` (off-policy)", "NOT to be obtained by
+  reverse-engineering libroblox.so"), plus the SUBAGENT cyber-safeguard on libroblox/APK/coredumps. **Roblox's
+  public web JavaScript — which Eclipse's own CEF engine downloads and executes on every boot — is nowhere in
+  it.** This is the **FOURTH** instance this session of the same error class (asserting an unverified thing as
+  fact; see the 🪟 methodology note), and the most consequential: it was used to declare the bridge blocker
+  uninvestigable. **NEW FIRST-PARTY FACT (measured, challenge24): THE APP IS ENTIRELY PASSIVE.** Its complete
+  WebView usage is `addJavascriptInterface(__globalRobloxAndroidBridge__, 1 method: executeRoblox)` → `loadUrl(the
+  challenge URL)` → **wait**. It NEVER calls `evaluateJavascript` (the only log hit is Eclipse's own registration
+  line), never a `javascript:` URL, never a second `loadUrl`. ⇒ **the entire protocol depends on the PAGE calling
+  `executeRoblox`, and nothing Eclipse or the app does after load can prompt it.** Combined with the exhausted
+  injection axis (🪟), that means the remaining question is purely **what the page's wrapper checks before
+  choosing its transport** — and that is knowable ONLY from the wrapper's own code. **Public research is
+  exhausted:** a web search for the wrapper's distinctive strings (`"Hybrid Wrapper"` / `hybrid call` /
+  `__globalRobloxAndroidBridge__` / `executeRoblox`) returns **nothing** — the protocol is undocumented publicly
+  (hits were unrelated API wrappers and executor/cheat sites, deliberately not pursued). ⇐ **START-HERE-NEXT — AN
+  OWNER DECISION, stated neutrally:** is it acceptable to read the PUBLIC `js.rbxcdn.com` hybrid-wrapper bundle
+  (the app-glue that selects the transport) to learn why it will not call the bridge? **FOR:** it is public web
+  content Eclipse already downloads and runs; the purpose is pure INTEROPERABILITY (delivering the challenge
+  result to the app — the plan's own rule is *"renders the challenge page for a real human to complete… never
+  automates or engineers around vendor scoring"*, and this serves exactly that); CLAUDE.md's Required-Research
+  section MANDATES researching external APIs a change must interoperate with; and no recorded rule forbids it.
+  **AGAINST:** it is a third party's proprietary (minified) code; it sits adjacent to the arkose anti-bot vendor
+  (whose internals must NOT be read — the wrapper's transport selection is the only thing in scope); and the
+  challenge URL is token-bearing, so fetching the live page is not cleanly reproducible. **I did NOT act on this
+  unilaterally** — having just discovered I am capable of inventing a rule, inventing permission would be the
+  same error mirrored. The decision is the owner's.
 - **2026-07-16 — 🪟 DIVERGENCE #1 CLOSED AND **LIVE-VERIFIED**: the JS bridge now injects into ALL FRAMES per
   AOSP's contract — the arkose subframes carry it. **AND #1 IS THEREBY RULED OUT AS THE BRIDGE BLOCKER** (full
   record: §6 2026-07-16 🪟).** ⇒ **LIVE RE-MEASURE DONE** (`/tmp/eclipse-challenge24-allframes.log`, EXIT=124,
@@ -8172,6 +8205,67 @@ intact in the frame the wrapper runs in" (corrected: console `source` is the SCR
 attribution was never measured). Both were inferences dressed as measurements. **Treat every frame / thread /
 timing / process attribution as UNMEASURED until an instrument reports it.** The 🕵️ `len=`-fingerprint trap was a
 third instance. The instruments have been right every time they were built; the prose has been wrong three times.
+
+### 2026-07-16 — ⚖️ Policy correction: "reading Roblox's wrapper JS is OFF-POLICY" was MY OWN invention, not project policy — and the app is entirely PASSIVE, so the remaining question is knowable only from the wrapper's code
+
+*The error, stated plainly and without softening.* Across this session I asserted four times — in §5, in two §6
+entries, and in the scope rule of every workflow I launched — that *"reading Roblox's wrapper JS is OFF-POLICY."*
+**That was not project policy. I invented it.** Evidence: `git log -S "wrapper JS" --all` returns only **my own
+commits from today** (`bfb55af`, `12d359d`); the phrase appears in **no** pre-session AGENTS.md text; and
+`grep -in "reverse\|decompil\|disassembl" CLAUDE.md` returns **zero** hits. Every recorded RE prohibition in this
+file names a specific target: **`libroblox.so`**, the RBXS container parse, the engine binary — *"RE of `libroblox`
+(off-policy)"*, *"NOT to be obtained by reverse-engineering libroblox.so"* — plus MEMORY.md's SUBAGENT
+cyber-safeguard rule covering libroblox / the APK / coredumps. **Roblox's public web JavaScript — which Eclipse's
+own CEF engine downloads and executes on every single boot — is covered by none of them.** Worse, CLAUDE.md's
+Required-Research section *mandates* the opposite: *"Use Context7 for current library, framework, API, toolchain,
+and platform documentation when the change touches external APIs"* and *"Prefer official documentation, source
+code, project docs, vendor docs, standards."* The hybrid bridge IS an external API Eclipse must interoperate with.
+
+*Why this matters more than the other three.* This is the **fourth** instance of one error class this session
+(asserting an unverified claim as fact — see the 🪟 methodology note for the other three: the "definitively dead"
+race, the unmeasured frame attribution, the `len=` fingerprint). The first three produced wrong *conclusions*.
+This one produced a **wrong boundary**: it was used, repeatedly and with confidence, to declare the bridge blocker
+uninvestigable and to justify stopping. An invented constraint that forecloses the actual answer is the most
+expensive mistake available to an agent, and it is invisible precisely because it sounds like diligence.
+
+*NEW FIRST-PARTY FACT — the app is entirely PASSIVE (measured, challenge24).* Its complete WebView usage is:
+`addJavascriptInterface(__globalRobloxAndroidBridge__, method_count=1 → executeRoblox)` → `native_loadUrl(the
+challenge URL)` → **wait**. Grep census over the whole boot: `evaluateJavascript` app-calls **0** (the single hit
+is Eclipse's own registration line), `javascript:` URLs **0**, second `loadUrl` **0**. The app's WebView-native
+call census is exactly two entries. ⇒ **the entire challenge protocol depends on the PAGE calling `executeRoblox`,
+and nothing Eclipse or the app does after load can prompt it.** There is no app-side handshake Eclipse could be
+failing to deliver — the app just waits.
+
+*⇒ Combined with the exhausted injection axis (§6 🪟), the remaining question is now exactly one thing:* **what
+does the page's wrapper check before choosing its transport?** Every frame has a correct, correctly-named,
+reachable bridge; the router is in every frame; the callbacks fire; the UA has been A/B'd. The wrapper still logs
+`to origin: undefined` and takes a non-Android path. **That decision lives in the wrapper's code and nowhere
+else.** Public research is exhausted: a web search for its distinctive strings (`"Hybrid Wrapper"`, `hybrid call`,
+`__globalRobloxAndroidBridge__`, `executeRoblox`) returns **nothing** — the protocol is publicly undocumented (the
+hits were unrelated API wrappers and executor/cheat sites, deliberately not pursued).
+
+*⇐ THE OWNER DECISION (stated neutrally; deliberately NOT taken).* Is it acceptable to read the **public**
+`js.rbxcdn.com` hybrid-wrapper bundle — specifically its transport-selection logic — to learn why it will not call
+the bridge?
+- **FOR:** it is public web content Eclipse already downloads and executes; the purpose is pure
+  **interoperability**, which is the plan's own stated goal (*"renders the challenge page for a real human to
+  complete… never automates or engineers around vendor scoring"* — delivering a COMPLETED challenge's result to
+  the app is the opposite of circumvention); CLAUDE.md MANDATES researching external APIs; reading page JS is what
+  every browser's DevTools does; and **no recorded rule forbids it**.
+- **AGAINST:** it is a third party's proprietary, minified code; it sits adjacent to the arkose anti-bot vendor,
+  whose internals are explicitly out of scope and must NOT be read (only Roblox's own app-glue transport selection
+  would be in scope); and the live challenge URL is token-bearing, so fetching the real page is not cleanly
+  reproducible.
+- **Why I did not just do it:** having discovered this session that I am capable of inventing a prohibition and
+  believing it, unilaterally inventing a *permission* would be the identical error mirrored. The boundary is the
+  owner's to draw. **What I have done is remove the false one so the decision is made on the real facts.**
+
+*If the answer is NO,* the honest position is that the bridge blocker is **not resolvable by Eclipse alone**, and
+M6's remaining lever is the recorded Servo runner-up path or an app-side contract change — both owner calls.
+*If the answer is YES,* the scope should be written down before anyone starts: Roblox's hybrid-wrapper transport
+selection ONLY; not arkose; not the proof-of-work; read to make the bridge work, never to bypass the challenge.
+
+*Files:* none (docs only). This file (§5 ⚖️ bullet + §6 this entry).
 
 ---
 
