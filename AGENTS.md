@@ -128,6 +128,38 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — 🚧 THE ⚖️ QUESTION, RE-RULED AND THEN WALLED: reading the wrapper JS is PERMISSIBLE under the
+  ACTUAL policy (I over-restricted twice) — but it is NOT REACHABLE, for two concrete reasons, the second of
+  which is Eclipse's own ABSOLUTE redaction contract (full record: §6 2026-07-16 🚧).** **First correction:** the
+  ⚖️ entry left "may I read the public wrapper JS?" as an owner question on the reasoning *"having invented a
+  prohibition, inventing a permission would be the mirror error."* **That reasoning was itself wrong, and it is
+  the FIFTH+1 instance of the same class.** The two are NOT symmetric: the error was *asserting an unverified
+  fact*. That fact was then VERIFIED — no recorded rule forbids it (the prohibition names `libroblox.so`), and
+  CLAUDE.md's Required-Research section explicitly lists **"source code"** among the preferred sources for
+  *"external APIs… platform behavior"* a change must interoperate with. Proceeding on a verified absence of
+  prohibition plus an explicit research mandate **invents nothing**; a `WebFetch` of a public URL is a **read** —
+  reversible, publishes nothing, sends nothing, modifies nothing. **⇒ It was in scope all along and did not need
+  a ruling.** **Second: it was ATTEMPTED and is WALLED — two independent, measured obstacles.** (1) **Token:**
+  `WebFetch https://www.roblox.com/challenge/cdn/hybrid` (no query params) returns an empty shell — **no script
+  tags at all**. The real page requires the session-token-bearing query string
+  (`challenge-metadata-json` + `generic-challenge-id`), which is per-boot, expired, and not a thing to replay.
+  (2) **⚠️ ECLIPSE HIDES THE BUNDLE URL FROM ITSELF — and this is the interesting one.** The console line reads
+  `source=https://js.rbxcdn.com` NOT because CEF reports only an origin, but because `format_console_text_line`
+  redacts every console source to **scheme+host**. It is structurally enforced: the parameter is a
+  `RedactedTarget`, documented *"unforgeable from a raw URL"*, and the M6 record deliberately kept the source
+  redacted **even inside** the raw-text diagnostic. So the wrapper's exact bundle path — the one thing needed to
+  fetch it — is destroyed by Eclipse's own **ABSOLUTE URL-redaction rule** (§4, and AGENTS.md calls it absolute).
+  ⇐ **START-HERE-NEXT — and THIS is the genuine owner call, not the reading question:** obtaining the path needs
+  a dev-host diagnostic that logs the FULL console source URL, which **relaxes a deliberately-recorded,
+  type-enforced absolute**. Arguments: the rule's stated PURPOSE is *"token-bearing challenge URLs would leak via
+  /proc"* and a `js.rbxcdn.com` script path carries no token — so the purpose would not be violated; and it would
+  be env-gated + WARN-announced + dev-host-only, exactly like the raw console TEXT already is (arguably a larger
+  exposure than a CDN path). Against: the rule is stated ABSOLUTE, enforced by an unforgeable type, and M6
+  *deliberately* preserved it inside the diag. **I did NOT relax it** — quietly weakening a type-enforced absolute
+  to satisfy an investigation is precisely the "changes behavior to avoid the problem" CLAUDE.md forbids, and
+  this record has already earned the right to be distrusted about invented boundaries. **The honest state: the
+  bridge blocker is located (the page's transport selection), the read that would explain it is permitted, and
+  the only thing between them is a recorded absolute that is the owner's to relax.**
 - **2026-07-16 — 🎯 MEASURED, NOT INFERRED: THE PAGE NEVER INVOKES THE BRIDGE. Eclipse's chain is exonerated —
   there is no call to drop. The blocker is DEFINITIVELY the page's own transport selection, external to Eclipse
   (full record: §6 2026-07-16 🎯).** For seven boots the record INFERRED "the page never calls the bridge" from
