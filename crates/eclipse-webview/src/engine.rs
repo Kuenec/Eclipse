@@ -108,35 +108,39 @@ pub fn engine_id() -> String {
 /// build. It leaks only the standard reduced-Chrome Linux desktop platform token
 /// (`X11; Linux x86_64` — no username/hostname/kernel/GPU). `149.0.0.0` matches the bundled
 /// Chromium 149.0.7827.201 under Chromium's UA-reduction convention (minor components zeroed).
-/// This literal MUST byte-match the overlay `WebSettings.smali` `getUserAgentString()` return.
-/// (M6 open question #1: if an anti-bot vendor refuses this for a real human, the owner rules on
-/// presenting the app's genuine Android-WebView-context UA — faithful, since Eclipse runs the
-/// Android build. M4 ships the honest-identifying default.)
+/// This literal MUST byte-match the overlay `WebSettings.smali` `getUserAgentString()` FALLBACK
+/// const-string and its `getDefaultUserAgent()` return.
 ///
-/// 2026-07-16 (plan M6): this default is UNCHANGED and REMAINS THE DEFAULT — open question #1 is
-/// still an OPEN OWNER RULING. The ranked suspect for the silent bridge is UA steering (the page's
-/// hybrid wrapper fires all four calls `to origin: undefined` — postMessage vocabulary — never the
-/// Android bridge), so [`effective_user_agent`] adds a TEMPORARY, env-gated, dev-host-only A/B
-/// DIAGNOSTIC (`ECLIPSE_WEBVIEW_UA_DIAG`) to CONFIRM or REFUTE steering by evidence FIRST. The
-/// diagnostic never changes what a default boot presents; the `!contains("Android")` pin below
-/// still guards today's policy. Diagnose before fix — do not flip a pinned honesty policy on
-/// suspicion.
+/// 2026-07-16 (plan M6): this is now the **FALLBACK**, not a policy — it applies only when the app
+/// never sets a UA of its own. It is NOT what Eclipse presents when the app configures its WebView:
+/// the Roblox app CALLS `WebSettings.setUserAgentString(…)` and ATL's stub silently DISCARDED it
+/// for four milestones (§6 2026-07-16 💥), which is what made this literal look like a deliberate
+/// "which UA do we present?" honesty policy. It never was one — Eclipse was substituting its own
+/// string for the app's. `WebSettings.setUserAgentString` is now honored ([`effective_user_agent`]),
+/// so a real boot presents what the app asked for, exactly as AOSP does; this literal is what
+/// remains for a WebView nobody configured (e.g. `__webview-test`) and for AOSP's
+/// `getDefaultUserAgent`, which is documented to IGNORE `setUserAgentString`
+/// (AOSP `frameworks/base/core/java/android/webkit/WebSettings.java`, verified 2026-07-16).
 pub const ECLIPSE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6";
 
-/// Resolve the effective User-Agent from the `ECLIPSE_WEBVIEW_UA_DIAG` env value (plan M6,
-/// 2026-07-16). A non-empty value is used VERBATIM (operator-supplied — the A/B's independent
-/// variable); unset or empty yields the honest [`ECLIPSE_USER_AGENT`] default. Pure/unit-pinned.
+/// Resolve the effective User-Agent CEF is initialized with. Pure/unit-pinned. The precedence
+/// ladder, highest first (2026-07-16, plan M6):
 ///
-/// DEV-HOST DIAGNOSTIC ONLY, and deliberately NOT a policy change: it exists to answer M6's ranked
-/// suspect 2 (UA steering) with evidence before the owner rules on open question #1. The override
-/// moves ONLY the engine-side UA (what `navigator.userAgent` and the HTTP request header carry —
-/// i.e. exactly what the hybrid page's platform detection reads). The overlay's Java-side
-/// `WebSettings.getUserAgentString()` keeps returning the honest literal, so while the diagnostic
-/// is in force the two DELIBERATELY disagree; that asymmetry is acceptable for a measurement and is
-/// one more reason this is never a default. Unset = the shipped honest behaviour, byte-for-byte.
-pub fn effective_user_agent(v: Option<&str>) -> &str {
-    match v {
-        Some(ua) if !ua.is_empty() => ua,
+/// 1. `diag` — the `ECLIPSE_WEBVIEW_UA_DIAG` dev-host A/B override, used VERBATIM when non-empty
+///    (operator-supplied). It outranks the app so a measurement can still force any UA; while it is
+///    in force the Java-side `getUserAgentString()` (which does NOT consult it) deliberately
+///    disagrees — acceptable for a dev-host measurement, and one more reason it is never a default.
+/// 2. `app` — **the User-Agent the APP set** via `WebSettings.setUserAgentString`, forwarded from
+///    the main process by the `ECLIPSE_WEBVIEW_APP_UA` spawn env (see the spawn contract in the
+///    root crate's `webview` module docs). This is the normal, shipped path: honoring what the app
+///    sets is not impersonation, it is what a faithful runtime does (§6 2026-07-16 💥). Already
+///    normalized consumer-side per AOSP's "null or empty ⇒ default" rule, but the empty guard is
+///    repeated here so this fn is total on its own inputs.
+/// 3. [`ECLIPSE_USER_AGENT`] — the fallback for a WebView the app never configured.
+pub fn effective_user_agent<'a>(diag: Option<&'a str>, app: Option<&'a str>) -> &'a str {
+    match (diag, app) {
+        (Some(ua), _) if !ua.is_empty() => ua,
+        (_, Some(ua)) if !ua.is_empty() => ua,
         _ => ECLIPSE_USER_AGENT,
     }
 }
@@ -146,22 +150,24 @@ pub fn effective_user_agent(v: Option<&str>) -> &str {
 /// no `log_file`) — the absolute redaction rule at the settings layer — plus the honest
 /// deliberate UA ([`ECLIPSE_USER_AGENT`]).
 ///
-/// 2026-07-16 (plan M6): this states the SHIPPED DEFAULT policy and is what the UA pin asserts.
-/// The binary now routes through [`build_settings_with_ua`] so the `ECLIPSE_WEBVIEW_UA_DIAG` A/B
-/// diagnostic has a seam, hence dead-code in a non-test bin build; the suppression is scoped to
-/// this one function deliberately (the module-wide `allow` on `mod shared` would hide real rot
-/// here). `effective_user_agent_defaults_to_the_honest_ua_and_only_a_set_diag_overrides_it` pins
-/// the composition the binary ACTUALLY takes — `build_settings_with_ua(effective_user_agent(None))`
-/// — so the default-boot guarantee is guarded on the real path, not only on this one.
+/// 2026-07-16 (plan M6): this states the settings policy with the FALLBACK UA. The binary routes
+/// through [`build_settings_with_ua`] so the UA has a seam (the app's UA and the
+/// `ECLIPSE_WEBVIEW_UA_DIAG` A/B drive it via [`effective_user_agent`]), hence dead-code in a
+/// non-test bin build; the suppression is scoped to this one function deliberately (the
+/// module-wide `allow` on `mod shared` would hide real rot here).
+/// `effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal` pins the
+/// composition the binary ACTUALLY takes — `build_settings_with_ua(effective_user_agent(..))` — so
+/// the guarantee is guarded on the real path, not only on this one.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn build_settings() -> Settings {
     build_settings_with_ua(ECLIPSE_USER_AGENT)
 }
 
-/// [`build_settings`] with the UA as an explicit input (plan M6, 2026-07-16) — the seam the
-/// `ECLIPSE_WEBVIEW_UA_DIAG` A/B diagnostic drives via [`effective_user_agent`]. Every other
-/// setting is identical to [`build_settings`], which delegates here with the honest default; the
-/// UA is the ONLY variable this seam exposes. Pure/unit-pinned.
+/// [`build_settings`] with the UA as an explicit input (plan M6, 2026-07-16) — the seam the app's
+/// own `setUserAgentString` UA and the `ECLIPSE_WEBVIEW_UA_DIAG` A/B drive via
+/// [`effective_user_agent`]. Every other setting is identical to [`build_settings`], which
+/// delegates here with the fallback literal; the UA is the ONLY variable this seam exposes.
+/// Pure/unit-pinned.
 pub fn build_settings_with_ua(ua: &str) -> Settings {
     Settings {
         windowless_rendering_enabled: 1,
@@ -2262,33 +2268,56 @@ mod tests {
     }
 
     #[test]
-    fn build_settings_sets_the_honest_eclipse_user_agent() {
-        // 2026-07-09 (plan M4): the honest deliberate UA is applied at the settings layer, is
-        // genuinely Chromium 149 on Linux desktop, carries the Eclipse product token, and is NOT
-        // the recorded "GDPR VIOLATION" placeholder. MUST byte-match the overlay WebSettings literal.
+    fn build_settings_sets_the_eclipse_fallback_user_agent() {
+        // 2026-07-09 (plan M4): the fallback UA is applied at the settings layer, is genuinely
+        // Chromium 149 on Linux desktop, carries the Eclipse product token, and is NOT the recorded
+        // "GDPR VIOLATION" placeholder. MUST byte-match the overlay WebSettings literal.
         assert!(ECLIPSE_USER_AGENT.contains("Chrome/149"));
         assert!(ECLIPSE_USER_AGENT.contains("Eclipse-WebView"));
         assert!(ECLIPSE_USER_AGENT.contains("X11; Linux x86_64"));
         assert!(!ECLIPSE_USER_AGENT.contains("GDPR VIOLATION"));
-        assert!(
-            !ECLIPSE_USER_AGENT.contains("Android"),
-            "must not impersonate a device"
-        );
+        // 2026-07-16: the `!ECLIPSE_USER_AGENT.contains("Android")` assertion that stood here
+        // ("must not impersonate a device") is RETIRED — it ASSERTED THE BUG. It was written when
+        // `WebSettings.setUserAgentString` was an empty ATL stub, so Eclipse's literal was the ONLY
+        // UA any boot could present and the question looked like "which UA do we choose?". It never
+        // was: the app SETS its own UA and Eclipse was DISCARDING it (§6 2026-07-16 💥). The pin
+        // therefore locked in the discard — it would fail the moment the app's own (Android,
+        // Hybrid()-bearing) string was honored, which is precisely the correct behaviour. The
+        // constant is a FALLBACK, not a policy, so the honest thing to pin is what it IS (an
+        // Eclipse-identifying desktop-Chromium literal, above) and that the app's UA WINS over it
+        // when set (`effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal`).
         let settings = build_settings();
         assert_eq!(settings.user_agent.to_string(), ECLIPSE_USER_AGENT);
     }
 
     #[test]
-    fn effective_user_agent_defaults_to_the_honest_ua_and_only_a_set_diag_overrides_it() {
-        // 2026-07-16 (plan M6): the UA A/B diagnostic gate. Unset/empty MUST yield the shipped
-        // honest default byte-for-byte — the diagnostic is not a policy change and a default boot
-        // must be unaffected. Open question #1 stays an OPEN OWNER RULING.
-        assert_eq!(effective_user_agent(None), ECLIPSE_USER_AGENT);
-        assert_eq!(effective_user_agent(Some("")), ECLIPSE_USER_AGENT);
-        // A non-empty operator-supplied value is used VERBATIM (the A/B's independent variable).
+    fn effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal() {
+        // 2026-07-16 (plan M6): THE REAL CONTRACT, replacing the retired `!contains("Android")` pin.
+        // (a) Nothing set anywhere ⇒ the Eclipse fallback literal, byte-for-byte.
+        assert_eq!(effective_user_agent(None, None), ECLIPSE_USER_AGENT);
+        assert_eq!(effective_user_agent(Some(""), Some("")), ECLIPSE_USER_AGENT);
+        // (b) THE FIX: the UA the app set via WebSettings.setUserAgentString WINS over the fallback
+        // and is used VERBATIM — the byte-match contract is "what CEF sends == what
+        // getUserAgentString() returns", and both are now this one string. This is the exact shape
+        // of the app's real UA (§6 2026-07-16 💥): it carries BOTH the `Hybrid()` and `Android`
+        // substrings the page's own nativePrefix selector requires (§6 2026-07-16 🏆), so a
+        // regression to the old discard-the-app's-UA behaviour fails HERE.
+        let app_ua = "Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; unknown) \
+                      AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.724.735 Phone \
+                      Hybrid()  GooglePlayStore RobloxApp/2.724.735 (GlobalDist; GooglePlayStore)";
+        assert_eq!(effective_user_agent(None, Some(app_ua)), app_ua);
+        assert!(app_ua.to_lowercase().contains("hybrid"));
+        assert!(app_ua.to_lowercase().contains("android"));
+        // (c) The dev-host A/B still outranks the app (a measurement must be able to force any UA).
         let android_ua = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) \
                           Version/4.0 Chrome/149.0.0.0 Mobile Safari/537.36";
-        assert_eq!(effective_user_agent(Some(android_ua)), android_ua);
+        assert_eq!(effective_user_agent(Some(android_ua), None), android_ua);
+        assert_eq!(
+            effective_user_agent(Some(android_ua), Some(app_ua)),
+            android_ua
+        );
+        // An empty diag never masks the app's UA (AOSP's "null or empty" normalization, mirrored).
+        assert_eq!(effective_user_agent(Some(""), Some(app_ua)), app_ua);
         // The override reaches the settings layer, and ONLY the UA differs from the default build.
         let settings = build_settings_with_ua(android_ua);
         assert_eq!(settings.user_agent.to_string(), android_ua);
@@ -2307,12 +2336,19 @@ mod tests {
             settings.log_file.to_string().is_empty(),
             "the diagnostic must never relax the settings-layer redaction rule"
         );
-        // The gate composes to the shipped default when the env var is absent.
+        // The ladder composes to the fallback when neither env var is present, and to the app's UA
+        // when only ECLIPSE_WEBVIEW_APP_UA is — the two compositions the binary actually takes.
         assert_eq!(
-            build_settings_with_ua(effective_user_agent(None))
+            build_settings_with_ua(effective_user_agent(None, None))
                 .user_agent
                 .to_string(),
             ECLIPSE_USER_AGENT
+        );
+        assert_eq!(
+            build_settings_with_ua(effective_user_agent(None, Some(app_ua)))
+                .user_agent
+                .to_string(),
+            app_ua
         );
     }
 
