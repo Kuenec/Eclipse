@@ -228,6 +228,38 @@ before any history-rewriting/force operation.
   **`Load generic challenge failed` = 0**, plus the new `honoring the User-Agent the app set …` INFO carrying the
   `Hybrid()` token — i.e. challenge26's forced-token result reproduced with NOTHING forced. After that the only
   gap to a completed login is **real credentials**.
+- **2026-07-16 — 🔓 CANDIDATE (b) IS DEAD AT THE `getCookie` BOUNDARY — **AND THAT REOPENS RESPAWN-AND-REPLAY,
+  WHICH THE PANEL REJECTED ONLY BECAUSE IT WAS "DOMINATED BY NOT SPAWNING AT ALL". NOT-SPAWNING JUST DIED.** The
+  surviving lever is now identified, and the panel already proved it lossless (full record: §6 2026-07-16 🔓).**
+  **The kill, from two MEASURED facts (checked BEFORE spending a boot on the URL-equality measurement — which
+  would have been necessary but NOT sufficient):** (1) **CEF REJECTS some of the app's sets** — challenge28 logs
+  **2×** `cookie_set: rejected by the cookie manager — url is not a valid http(s) URL`. So a buffered set MAY OR
+  MAY NOT land. (2) **`getCookie` is SYNCHRONOUS and blocking** — `cookie_get_blocking(..., timeout)` with
+  `Duration::from_secs(5)` (`framework.rs:10993`); the app waits, so it cannot be deferred past the deadline.
+  **⇒ answering a `getCookie` from the buffer requires knowing WHICH sets CEF would accept — and §5 ☠️ already
+  proved that is undecidable without CEF** (`classify_cookie_set_rejection` is observability-ONLY and its
+  catch-all is literally *"store-unready-at-first-op"*, the exact case). All three of the ✅❓ options collapse:
+  (i) exact-URL match — insufficient (the blocker is set-ACCEPTANCE, not URL matching); (ii) duplicate RFC 6265 —
+  would ALSO have to duplicate CEF's set-validation, i.e. reimplement the engine, and can still disagree =
+  fabrication; (iii) defer the get — the app blocks 5 s then gets a WRONG empty answer. **Candidate (b): CLOSED.**
+  ⇐ **START-HERE-NEXT — THE SURVIVING LEVER, and it is NOT the CDP one: RESPAWN-AND-REPLAY.** The design panel
+  rejected it with a precise, now-falsified reason (§6 ⏳ §4, verbatim): *"would in fact be **LOSSLESS** if it
+  replayed original frames (§2f), so the recorded rejection reason is weaker than stated; but it is **strictly
+  dominated by not spawning at all**. Reject on Simplicity First."* **Not-spawning is now dead, so the domination
+  is gone — and the panel's own analysis already established the losslessness** (replay the app's ORIGINAL
+  `CookieSet` frames, which carry `expires_epoch_s`; never round-trip through the expiry-less `CookieEntry` —
+  that asymmetry is the whole point). **The shape, for a fresh design pass:** helper A spawns early for cookies
+  (fallback UA) and answers them with REAL CEF semantics — correct, no duplication, no fabrication; Eclipse keeps
+  the ORIGINAL set frames as an append-only log (already built — `EarlyCookies.sets`); at the first load-drive,
+  spawn helper B with the app's UA and replay the log into it. **Why the two stores are EQUIVALENT, not merely
+  similar:** A never creates a browser, so no network `Set-Cookie` ever runs in it ⇒ A's store content is
+  EXACTLY the accepted subset of the replayed frames ⇒ B, replaying the same frames through the same CEF
+  validation, lands the same subset. **Questions it must answer honestly before anyone builds it:** the cost of a
+  second `CefInitialize` (~122 ms measured) and whether A can be shut down cleanly; whether any cookie op between
+  A's spawn and B's exists that is NOT a replayable frame (the get is read-only — fine); the M4 session-scope
+  contract with two contexts; and whether `PROTO_VERSION` needs anything (probably not — A and B each speak v2).
+  **Design it with a falsifier declared in advance, exactly as the ⏳ pass did — that discipline has now killed
+  three candidates cheaply and correctly, each on the first boot or before it.**
 - **2026-07-16 — ✅❓ THE DEFERRAL PROBE ANSWERED ITS QUESTION: **THE APP TOLERATES A DEFERRED 3-ARG setCookie
   CALLBACK** (measured, 3× `ua-set` with callbacks outstanding, zero strand) — the strategy is ALIVE. And it
   exposed the NEXT forcing trigger exactly at the correctness proof's declared boundary: a `getCookie` **757 µs**
