@@ -128,6 +128,36 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — 🎯 MEASURED, NOT INFERRED: THE PAGE NEVER INVOKES THE BRIDGE. Eclipse's chain is exonerated —
+  there is no call to drop. The blocker is DEFINITIVELY the page's own transport selection, external to Eclipse
+  (full record: §6 2026-07-16 🎯).** For seven boots the record INFERRED "the page never calls the bridge" from
+  `bridge call received` = 0. **That inference was never measured, and it was unsound**: if the page HAD invoked
+  the stub and ANY link in Eclipse's own chain dropped it (stub body → `window.cefQuery` → CefMessageRouter →
+  `on_query_str` → socket → `fire_bridge_call`), the observable would be IDENTICAL. Two worlds, one observable,
+  opposite next steps — and one of them was an Eclipse bug we could have fixed. **So it was measured.** New
+  trace inside Eclipse's OWN generated stub (`generate_stub_js`, gated by the existing
+  `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1`; gate-off emits BYTE-IDENTICAL JS, unit-pinned against HEAD): announces
+  `invoke` as its FIRST statement (before `JSON.stringify`, which a circular arg would throw on), `sent` after
+  `cefQuery` accepts, `success`/`failure` at the terminals, and `no-cefQuery` if the installer bails (that bail
+  was previously a SILENT LIE — the Rust caller logs `bridge stubs applied` unconditionally after the eval).
+  Binds iface + method + **argc only — never arg values**. **INSTRUMENT VALIDATED by positive control**
+  (`__webview-test`, a page that provably calls the bridge): the trace fires in exact chain order `invoke` →
+  `sent` → `bridge call received` → `success`, with `upcalls 2/2` intact; gate-off run emits 0 trace lines.
+  **THE LIVE VERDICT (`/tmp/eclipse-challenge25-stubtrace.log`, EXIT=124, reached the challenge):**
+  `ECLIPSE-STUB invoke` = **0** · `ECLIPSE-STUB no-cefQuery` = **0** · `bridge stubs applied` = **11** ·
+  `main_frame=false … "type":"object"` = **3** · `Hybrid Wrapper: Sending hybrid call` = **4** (the only
+  `ECLIPSE-STUB` hit in the whole log is the startup WARN echoing the prefix). ⇒ **The wrapper RAN, fired all
+  four hybrid calls, had a correct and correctly-named bridge in EVERY frame with the installer never bailing —
+  and NEVER INVOKED IT.** ⇒ **ECLIPSE'S BRIDGE CHAIN IS EXONERATED.** There is no dropped call, no lost message,
+  no Eclipse-side bug on this path. Every Eclipse-side hypothesis is now measured closed: injection (all frames,
+  intact 539 ms early), callback delivery (fixed), UA (A/B'd — steers the challenge, not the transport), both
+  inventory-delivery channels (dead), and now the chain itself. **The blocker is the page's own
+  transport-selection logic and nothing else.** ⇐ **START-HERE-NEXT: that logic lives in the wrapper's code and
+  is knowable from nowhere else — which makes the ⚖️ OWNER DECISION below the ONLY remaining lever.** Divergence
+  #2 (the synchronous return shape) is now near-certainly IRRELEVANT: a return shape cannot prevent a call that
+  is never made, and CEF's public API cannot deliver a synchronous bridge anyway (Chromium's own Java Bridge
+  uses SYNC MOJO IPC, which CEF does not expose — that is WHY M4 chose the Promise shape). Do not spend a design
+  pass on #2 to "fix" the bridge.
 - **2026-07-16 — ⚖️ POLICY CORRECTION + THE APP IS PASSIVE: "reading Roblox's wrapper JS is OFF-POLICY" WAS NOT
   PROJECT POLICY — I INVENTED IT THIS SESSION and then cited it four times as if recorded. The real recorded
   prohibition is **RE of `libroblox.so`** (the native engine binary). Whether to read the PUBLIC challenge-page
@@ -8266,6 +8296,84 @@ M6's remaining lever is the recorded Servo runner-up path or an app-side contrac
 selection ONLY; not arkose; not the proof-of-work; read to make the bridge work, never to bypass the challenge.
 
 *Files:* none (docs only). This file (§5 ⚖️ bullet + §6 this entry).
+
+### 2026-07-16 — 🎯 MEASURED, not inferred: the page NEVER invokes the bridge. Eclipse's chain is exonerated — there is no call to drop. The blocker is definitively the page's own transport selection.
+
+*The unverified inference this kills.* For seven boots the record read `bridge call received` = 0 and concluded
+*"the page never calls the bridge."* **That was an inference, never a measurement, and it was unsound.** Eclipse's
+chain is: page JS → **Eclipse's own stub body** (`generate_stub_js`) → `window.cefQuery` → CefMessageRouter →
+`BridgeHandler::on_query_str` → `HelperMsg::BridgeCall` → socket → ART `fire_bridge_call` → the receipt. If the
+page HAD invoked the stub and ANY link dropped it, the observable is **identical**: `bridge call received` = 0.
+Two worlds, one observable — and they have opposite next steps (*the page's own logic, Eclipse-external* vs *an
+ECLIPSE BUG we could fix today*). `__webview-test` proves the chain only for a **local, same-origin, single-frame**
+page; the live topology is cross-origin with cross-origin subframes. The gap was real. **This is the same error
+class the 🪟/⚖️ notes catalogue (now five instances) — caught, this time, before it closed the investigation.**
+
+*The instrument (env-gated, dev-host-only, first-party — it traces ECLIPSE'S OWN generated JS).* Reuses the
+existing `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` gate (no new env var). `generate_stub_js(diag: bool)` emits:
+`invoke` as the **first statement of the method body** (before `JSON.stringify` — verified in node that a circular
+arg throws there, so an announce-after-stringify would have MISSED a genuine Eclipse-side drop), `sent` after
+`cefQuery` accepts (bisecting "our stub threw" from "our transport dropped it"), `success`/`failure` at the
+terminals, and **`no-cefQuery`** if the installer's `if(!q){return;}` bails — that bail was previously a **SILENT
+LIE**, because the Rust caller logs `bridge stubs applied ifaces=N` *unconditionally after* the eval, so a bailed
+installer reports success while installing nothing. Without that line, "trace absent" would have stayed ambiguous
+between *"the page never called"* and *"no stub ever existed"* — reintroducing the very ambiguity this closes.
+Binds **iface + method + argc ONLY — never argument values** (the recorded no-arg-values rule). `console` is
+captured at injection time (a page that later replaces `window.console` would otherwise silence the trace — the
+precise false negative that would produce a wrong verdict). **Gate OFF emits BYTE-IDENTICAL JS**, `assert_eq!`-
+pinned against HEAD's literal, and confirmed at runtime (gate-off boot → 0 trace lines).
+
+*INSTRUMENT VALIDATED — positive control before spending a challenge boot.* `__webview-test` (a page that
+provably calls the bridge) with `BRIDGE_DIAG=1 CONSOLE=1` → EXIT=0, and the trace fires in exact chain order:
+`ECLIPSE-STUB invoke iface=EclipseTest method=echo argc=1` → `ECLIPSE-STUB sent` → the consumer's independent
+`bridge call received … args=1 arg_lens=[6]` → `ECLIPSE-STUB success`, with the pinned `upcalls 2/2` marker
+intact. `argc=1` corroborates the consumer's `args=1` from the other end of the chain. **Trap recorded:**
+`BRIDGE_DIAG=1` ALONE emits the trace but makes it UNREADABLE — the default console line carries severity+len
+only, so `ECLIPSE_WEBVIEW_CONSOLE=1` is REQUIRED to see it (now stated in the startup WARN).
+
+*THE LIVE VERDICT (`/tmp/eclipse-challenge25-stubtrace.log`, EXIT=124, reached the challenge, zero orphans):*
+```
+ECLIPSE-STUB invoke              0     <- the page NEVER invoked our stub
+ECLIPSE-STUB no-cefQuery         0     <- the installer never bailed; the stub really was installed
+bridge stubs applied            11     <- stubs installed across frames
+main_frame=false … "type":"object"  3  <- every arkose subframe carries the bridge
+Hybrid Wrapper: Sending hybrid call 4  <- the wrapper RAN and fired all four hybrid calls
+bridge call received             0
+```
+(The single `ECLIPSE-STUB` hit in the whole log is the startup WARN echoing the prefix.)
+
+*⇒ ECLIPSE'S BRIDGE CHAIN IS EXONERATED — this is the result.* The wrapper **ran**, fired **all four** hybrid
+calls, had a **correct, correctly-named, reachable** bridge in **every frame**, with the installer **never
+bailing** — and **never invoked it**. There is no dropped call, no lost message, no Eclipse-side bug on this
+path. **Every Eclipse-side hypothesis is now MEASURED closed:** injection (all frames, intact 539 ms before the
+wrapper speaks, §6 🔬/🪟), app-callback delivery (fixed, §6 🧵), UA steering (A/B'd — it steers whether the
+CHALLENGE completes, not the transport, §6 🕵️), both inventory-delivery channels (§6 🌱), and now the chain
+itself. **The blocker is the page's own transport-selection logic and nothing else.**
+
+*⇒ Divergence #2 (the synchronous return shape) is now near-certainly IRRELEVANT to the bridge — do NOT spend a
+design pass on it as a bridge "fix".* A return shape cannot prevent a call that is never made. It also cannot be
+delivered through CEF's public API: Chromium's own Java Bridge uses **synchronous mojo IPC** (`[Sync]` messages),
+which CEF does not expose — that is precisely WHY M4 chose the Promise shape, deliberately and on the record. It
+remains a real AOSP divergence worth recording; it is not the lever.
+
+*⇐ THE ONLY REMAINING LEVER is the ⚖️ OWNER DECISION* (§6 2026-07-16 ⚖️): the wrapper's transport-selection logic
+lives in its own code and is knowable from nowhere else — public research is exhausted (the protocol is
+undocumented). Note the ⚖️ entry's correction: *"reading Roblox's wrapper JS is off-policy"* was **never project
+policy** — it was invented in this session's own commits. The real recorded prohibition is RE of `libroblox.so`.
+Whether to read the **public** `js.rbxcdn.com` wrapper bundle's transport selection — for interoperability, to
+DELIVER a completed challenge's result rather than bypass it — is an **undecided owner question**, and it is now
+the single decision M6 turns on.
+
+*Gate (measured 2026-07-16):* helper **41 + 15** (was 39+15; +2 pins: gate-off byte-identity, no-arg-values);
+root **643 + 6 + 2, zero SKIP** (untouched); fmt/build/clippy `-D warnings`/release clean in both; 7 guards
+negative-tested (break → fire → restore, sha256-verified byte-identical). No new env var, no wire-protocol change.
+
+*Honest limits:* the trace carries **no frame identity** (the console line's `source` is the SCRIPT origin, not
+the frame — do not attribute a trace line to a frame; this record has burned on that inference twice). Only the
+`mode=refresh` injection path is live-proven (both paths call the same `generate_stub_js`; `mode=sync` can never
+fire for a driven load per §6 🌱).
+
+*Files:* `crates/eclipse-webview/src/main.rs` only; this file (§5 🎯 bullet + §6 this entry).
 
 ---
 
