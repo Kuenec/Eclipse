@@ -1062,9 +1062,13 @@ fn main() -> ExitCode {
     // ECLIPSE_WEBVIEW_CONSOLE read below: the UA is an input to `Settings`, which `initialize`
     // consumes below, and `CefSettings.user_agent` is GLOBAL and fixed at CefInitialize.
     //   * ECLIPSE_WEBVIEW_APP_UA — THE UA THE APP SET via WebSettings.setUserAgentString, forwarded
-    //     by the consumer at spawn (the ordering works because the helper spawns lazily on the first
-    //     load-drive, which is AFTER the app configures its WebView). This is the SHIPPED path: the
-    //     app's own configuration, honored (§6 2026-07-16 💥) — not a diagnostic, so it is INFO.
+    //     by the consumer at spawn. 2026-07-16 (§6 respawn): the parenthetical that stood here ("the
+    //     ordering works because the helper spawns lazily on the first load-drive") was DISPROVED —
+    //     a cookie op cold-started the helper 61 s earlier. The consumer now guarantees the ordering
+    //     on its side: it defers the spawn where it can, and REPLACES a helper that booted on the
+    //     wrong UA at the first load-drive. Nothing changes here: this process reads its env once and
+    //     initializes once, which is all CefSettings.user_agent permits. This is the SHIPPED path:
+    //     the app's own configuration, honored (§6 2026-07-16 💥) — not a diagnostic, so it is INFO.
     //   * ECLIPSE_WEBVIEW_UA_DIAG — the dev-host A/B override, which outranks it. WARN when in
     //     force: a forced UA means the boot is a measurement and NEVER a default.
     // Both values are the app's/operator's own public product token — not user data — so logging

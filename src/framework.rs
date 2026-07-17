@@ -11920,6 +11920,25 @@ pub fn drain_all_webview_callbacks(java_vm: &JavaVM, reason: &str) {
     }
 }
 
+/// The number of app `ValueCallback`s currently retained against the live helper (2026-07-16, plan
+/// M6 — the §6 respawn): eval results, 3-arg `setCookie` flags, `removeAll`/`removeSession`
+/// completions. Read by `webview::client::respawn_verdict`'s quiescence guard.
+///
+/// Two independent things turn on it, and both are load-bearing:
+/// * **Correctness** — tearing the helper down runs [`drain_all_webview_callbacks`], which answers
+///   each pending callback `false`/`"null"`. That is ACCURATE for a helper that is GONE and WRONG
+///   for one being REPLACED (the replayed frame lands in the successor's store, so `false` would
+///   contradict it). Nonzero ⇒ refuse the replacement rather than answer wrongly.
+/// * **Liveness** — with all three maps empty the drain hits its own early return
+///   ([`drain_all_webview_callbacks`]'s `is_empty` guard) and never dispatches to the main Looper, so
+///   the client's teardown cannot park a thread against a thread parked on main.
+pub fn webview_callbacks_in_flight() -> usize {
+    fn len<V>(m: &'static std::sync::Mutex<std::collections::HashMap<u32, V>>) -> usize {
+        m.lock().map(|m| m.len()).unwrap_or(0)
+    }
+    len(eval_callbacks()) + len(cookie_set_callbacks()) + len(cookie_clear_callbacks())
+}
+
 /// Deliver the REAL 3-arg-setCookie success flag to the retained `ValueCallback<Boolean>`.
 pub fn fire_cookie_set_result(java_vm: &JavaVM, request_id: u32, ok: bool) {
     fire_boolean_result(java_vm, cookie_set_callbacks(), request_id, ok);

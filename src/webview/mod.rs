@@ -70,6 +70,14 @@
 //!    needs CEF — normally the load-drive. Two ops still force an early spawn, and both are LOUD:
 //!    a `getCookie` issued after this boot already set a cookie (CEF owns url/domain/path matching),
 //!    and the 3-arg `setCookie(url, value, ValueCallback)` (only CEF yields the real success flag).
+//!    **2026-07-16 (§6 respawn) — the ordering rule, COMPLETED.** Where an early op genuinely still
+//!    forces a spawn before the app's UA exists (the two above), the first load-drive **REPLACES**
+//!    that helper: the consumer tears it down (fully REAPING the child — CEF's `root_cache_path`
+//!    process singleton forbids two live engines), spawns a replacement with `ECLIPSE_WEBVIEW_APP_UA`
+//!    set, and replays the app's ORIGINAL `CookieSet` frames into it. Sound because a helper that
+//!    never received a `CreateView` has no browser, so no `Set-Cookie` header ever ran in it and its
+//!    store is exactly those frames. `PROTO_VERSION` stays **2** — both helpers speak v2 and the
+//!    replay uses existing frames; no message is added.
 //!    A forced early spawn is an HONEST DEGRADATION to the fallback UA — the pre-fix behaviour, said
 //!    out loud — never a wrong answer. The env, not argv, per §4's provenance test: a UA is neither a URL nor a
 //!    secret (the app composes it from ATL's own synthetic `SystemProperties`/`Build` values and
