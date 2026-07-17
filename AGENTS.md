@@ -128,6 +128,47 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — 💥 THE "OWNER RULING" DISSOLVES: IT WAS NEVER A POLICY QUESTION. **THE APP SETS ITS OWN
+  USER-AGENT — WITH THE `Hybrid()` TOKEN — AND ECLIPSE SILENTLY THROWS IT AWAY.** A plain, confirmed Eclipse bug
+  with a faithful fix (full record: §6 2026-07-16 💥).** **MEASURED LIVE** (`/tmp/eclipse-challenge27-uaset.log`,
+  EXIT=124, reached the challenge; overlay diagnostic on the discarded setter):
+  ```
+  ECLIPSE-UA-SET setUserAgentString ua=[Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; unknown)
+  AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.724.735 Phone Hybrid()  GooglePlayStore
+  RobloxApp/2.724.735 (GlobalDist; GooglePlayStore)]
+  ```
+  **The app's own UA contains BOTH `Hybrid()` AND `Android`** — precisely the two substrings the wrapper's
+  `nativePrefix` selector requires (§6 🏆). **And ATL discards it:**
+  `vendor/atl/src/api-impl/android/webkit/WebSettings.java:18` → `public void setUserAgentString(String
+  userAgentString) {}` — an EMPTY NO-OP (identical in the installed dex: `.registers 2` / `return-void`). Eclipse's
+  overlay then hardcodes `getUserAgentString` to return Eclipse's OWN literal. **⇒ THE COMPLETE CHAIN, end to
+  end:** app builds its UA → **ATL silently drops it** → CEF keeps Eclipse's `X11; Linux x86_64 … Eclipse-WebView`
+  → the page computes `nativePrefix = null` → no platform module → `Navigation.navigateToFeature` is an empty stub
+  → **total bridge silence** → ~60 s timeout → `Load generic challenge failed` → LoginV2. **EVERY BOOT, FOR THE
+  WHOLE PROJECT.** **⚠️ THE FRAMING WAS WRONG AND MUST BE CORRECTED EVERYWHERE:** M4's open question #1, the 🕵️
+  A/B, the ⚖️/🚧 entries and the 🏆 entry all framed this as *"should Eclipse PRESENT the app's genuine
+  Android-WebView-context UA?"* — an honesty policy reserved for the owner. **There is no such question.** Eclipse
+  is not choosing between an honest UA and a dishonest one; **it is discarding the app's UA and substituting its
+  own.** Honoring what the app sets is not impersonation — it is the definition of a faithful runtime, and it is
+  what AOSP does. (The UA is even built from ECLIPSE'S OWN synthetic device values — `0MB`, `960x540`,
+  `HTC unknown` come from ATL's `SystemProperties`/`Build`, not real hardware — so the string Eclipse would
+  present describes Eclipse's own environment. Nothing is fabricated.) **The `!contains("Android")` pin and the
+  "GDPR VIOLATION"→honest-UA M4 work were solving a problem that only existed because the setter was a stub.**
+  ⇐ **START-HERE-NEXT — THE FIX (a bug fix, NOT a ruling; needs design, NOT a one-liner):** honor
+  `WebSettings.setUserAgentString`. **Three coupled problems, all first-party-measured:** (1) **`WebView.getSettings()`
+  returns a FRESH THROWAWAY every call** (`new-instance` + `<init>` + `return`; `WebSettings` has **zero** instance
+  fields and `WebView` has no `WebSettings` field) — so the canonical idiom
+  `webView.getSettings().setUserAgentString(ua)` writes to an object that is immediately garbage with nowhere to
+  store and no back-reference to its WebView. Needs a per-WebView cached instance + a backing field + widget-handle
+  association. (2) **The route to CEF:** `CefSettings.user_agent` is GLOBAL and fixed at `CefInitialize` — but the
+  helper spawns LAZILY on the first load-drive, which is AFTER `setUserAgentString`, so the ordering WORKS; the
+  channel needs choosing (the wire protocol is frozen at v2; the spawn contract already documents env inheritance;
+  a UA is not a secret and not a URL — cf. the §6 🌱 argv/secrets precedent). (3) **Both units must still
+  byte-match** (M4's recorded contract): `getUserAgentString` must return what CEF actually sends. **Verify with
+  the existing instruments:** `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` + `ECLIPSE_WEBVIEW_CONSOLE=1` → expect
+  `ECLIPSE-STUB invoke` ≥1, `bridge call received` ≥1, `Load generic challenge failed` = **0** — exactly what
+  challenge26 proved achievable by forcing the token. **After that, the only gap to a completed login is real
+  credentials.**
 - **2026-07-16 — 🏆 THE BRIDGE BLOCKER IS SOLVED. ROOT CAUSE FOUND IN THE WRAPPER'S OWN SELECTOR, AND PROVEN LIVE:
   the challenge now COMPLETES and its result REACHES THE APP through the app's own WebView contract. `Load generic
   challenge failed` = **0** for the first time ever (full record: §6 2026-07-16 🏆).** **THE ROOT CAUSE (verbatim,
@@ -8558,6 +8599,69 @@ citing a constraint: `grep` for it. Before believing a wall: try the other tool.
 
 *Files:* none (the fix is the owner's UA ruling; the `Hybrid(Android)` proof used the existing
 `ECLIPSE_WEBVIEW_UA_DIAG` diagnostic). This file (§5 🏆 bullet + §6 this entry) and `docs/web-engine-plan.md`.
+
+### 2026-07-16 — 💥 The "owner ruling" dissolves: it was never a policy question. The app SETS its own User-Agent — containing the `Hybrid()` token — and ATL's empty stub throws it away. A plain, confirmed Eclipse bug.
+
+*The measurement (`/tmp/eclipse-challenge27-uaset.log`, EXIT=124, reached the challenge).* An overlay diagnostic
+on the discarded setter (anchored-perl + pristine-body guard + dex back-check, `classes2.dex` 77660 → 77824 =
++164 B, both gates unchanged) answered the question on the first boot:
+```
+ECLIPSE-UA-SET setUserAgentString ua=[Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; unknown)
+AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.724.735 Phone Hybrid()  GooglePlayStore
+RobloxApp/2.724.735 (GlobalDist; GooglePlayStore)]
+```
+**The app's own UA carries BOTH `Hybrid()` AND `Android`** — exactly the two substrings §6 🏆 proved the wrapper's
+`nativePrefix` selector requires. **And ATL discards it:** `vendor/atl/src/api-impl/android/webkit/WebSettings.java:18`
+`public void setUserAgentString(String userAgentString) {}` — an empty no-op (identical in the installed dex:
+`.registers 2` / `return-void`). Eclipse's overlay then hardcodes `getUserAgentString` to Eclipse's own literal.
+
+*THE COMPLETE CHAIN — every boot, for the entire project:* the app builds its UA → **ATL silently drops it** → CEF
+keeps `X11; Linux x86_64 … Eclipse-WebView/149.0.6` → the page computes `nativePrefix = null` → no platform module
+is installed → `Navigation.navigateToFeature` stays an empty stub → **total bridge silence** → ~60 s timeout →
+`Load generic challenge failed` → LoginV2 recovery.
+
+*⚠️ THE FRAMING WAS WRONG, AND IT IS THE SEVENTH+1 INSTANCE OF THIS SESSION'S ERROR CLASS.* M4's open question #1,
+the 🕵️ A/B, the ⚖️ and 🚧 entries, and even the 🏆 entry all framed this as *"should Eclipse PRESENT the app's
+genuine Android-WebView-context UA?"* — an honesty policy deliberately reserved for the owner, pinned by a
+`!contains("Android")` unit test. **There is no such question, and there never was.** Eclipse is not choosing
+between an honest UA and a dishonest one: **it is discarding the app's UA and substituting its own.** Honoring
+what the app sets is not impersonation — it is the definition of a faithful runtime and exactly what AOSP does.
+The string is not even a fabrication: `0MB`, `960x540`, `160x160`, `HTC unknown` are **Eclipse's own synthetic
+values** from ATL's `SystemProperties`/`Build`, so the UA the app composes already describes Eclipse's own
+environment. **The M4 "GDPR VIOLATION" → honest-UA work and its `!contains("Android")` pin were solving a problem
+that existed only because the setter was a stub.** Nobody checked the setter for four milestones; the honest-UA
+literal masked it by making the wrong UA look deliberate.
+
+*THE FIX — a bug fix, NOT a ruling. It needs DESIGN, not a one-liner. Three coupled problems, all measured:*
+1. **`WebView.getSettings()` returns a FRESH THROWAWAY on every call** — `new-instance` + `<init>` + `return`.
+   `WebSettings` has **zero** instance fields (`grep -c '^\.field'` = 0) and `WebView` has **no** `WebSettings`
+   field. So the canonical `webView.getSettings().setUserAgentString(ua)` writes to an object that is immediately
+   garbage, has nowhere to store, and holds no back-reference to its WebView. Needs a per-WebView **cached**
+   instance + a real backing field + widget-handle association.
+2. **The route to CEF.** `CefSettings.user_agent` is GLOBAL and fixed at `CefInitialize` — but the helper spawns
+   **lazily on the first load-drive**, which happens AFTER `setUserAgentString`, so **the ordering works**. The
+   channel must be chosen: the wire protocol is frozen at v2; the spawn contract already documents env
+   inheritance; a UA is neither a secret nor a URL (cf. the §6 🌱 argv/secrets precedent, which refused to launder
+   shape as secrecy and reasoned from provenance — apply the same test here).
+3. **Both units must still byte-match** (M4's recorded contract): whatever CEF sends, `getUserAgentString` must
+   return. The cleanest shape is one source of truth — the app's string — with the Eclipse literal as the fallback
+   only when the app never sets one.
+
+*Verification is already built:* `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` + `ECLIPSE_WEBVIEW_CONSOLE=1` ⇒ expect
+`ECLIPSE-STUB invoke` ≥ 1, `bridge call received` ≥ 1, and **`Load generic challenge failed` = 0** — precisely
+what challenge26 already proved reachable by forcing the token via `ECLIPSE_WEBVIEW_UA_DIAG`. After the fix the
+only remaining gap to a completed login is **real credentials**.
+
+*Same-pattern audit owed (CLAUDE.md: fix the whole class).* `setUserAgentString` was an empty ATL stub that
+silently discarded app intent for four milestones. **The class is "ATL setters that silently swallow app
+configuration."** `WebSettings` alone has a long list of them (`setSupportMultipleWindows`,
+`setJavaScriptEnabled`, `setDomStorageEnabled`, `setAllowContentAccess`, …), all `{}`. Each is a candidate for the
+identical defect shape: the app configures, Eclipse ignores, and the failure surfaces far away as unexplained
+behaviour. **Audit them before assuming this one was unique.** The diagnostic pattern used here (log the
+discarded argument at the stub) generalises cheaply.
+
+*Files:* `tools/framework-overlay/patch-framework.sh` (the diagnostic + 5 guards); this file (§5 💥 bullet + §6
+this entry).
 
 ---
 
