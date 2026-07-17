@@ -11925,6 +11925,28 @@ pub fn fire_cookie_set_result(java_vm: &JavaVM, request_id: u32, ok: bool) {
     fire_boolean_result(java_vm, cookie_set_callbacks(), request_id, ok);
 }
 
+/// 2026-07-16 (the `ECLIPSE_WEBVIEW_DEFER_COOKIE_CB` dev-host probe): fail every still-pending
+/// WebView ValueCallback honestly from MAIN, at teardown, when the client slot never went live and
+/// therefore has no upcall thread to run the normal channel-close drain. Thin `&Vm` wrapper over
+/// [`drain_all_webview_callbacks`] — the drain, its `false` semantics and its exactly-once contract
+/// are the shipped ones; only the VM wrap and the main-thread proof are added.
+///
+/// On the never-live path the eval and clear maps are provably empty (an eval needs a driven view,
+/// which spawns; a clear is answered locally or forces the spawn), so in practice this drains
+/// exactly the probe's deferred setCookie callbacks. It is deliberately the general drain anyway:
+/// a narrower one could silently miss a future retained callback with the same shape.
+pub fn drain_deferred_cookie_set_callbacks(vm: &Vm, reason: &str) {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive by
+    // the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton). Identical to the
+    // wrap in `retire_main_upcall_dispatch` / `pump_main_looper` on this same (main) thread.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    drain_all_webview_callbacks(&java_vm, reason);
+}
+
 /// Deliver the removeAll/removeSession completion (a completed clear is success → `Boolean.TRUE`).
 pub fn fire_cookies_clear_result(java_vm: &JavaVM, request_id: u32) {
     fire_boolean_result(java_vm, cookie_clear_callbacks(), request_id, true);

@@ -261,6 +261,23 @@ fn normalize_app_user_agent(ua: Option<String>) -> Option<String> {
 /// a byte count could not be checked against what CEF sends.
 pub fn set_app_user_agent(ua: Option<String>) {
     let ua = normalize_app_user_agent(ua);
+    // 2026-07-16 PROBE (`ECLIPSE_WEBVIEW_DEFER_COOKIE_CB`) — THE MEASUREMENT. Reaching this line
+    // with a 3-arg setCookie reply still outstanding is the app DEMONSTRATING, not asserting, that
+    // it does not block on that callback: the very thing the deferral was rejected on an unmeasured
+    // assumption about (`EarlyCookies`). `FIRST_DEFER_AT` is set only by the probe, so this is
+    // structurally dead on a default boot.
+    if let Some(t0) = FIRST_DEFER_AT.get() {
+        let outstanding = DEFERRED_CB_IDS.lock().map(|ids| ids.len()).unwrap_or(0);
+        tracing::warn!(
+            target: "android.webkit.WebSettings",
+            outstanding,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "ECLIPSE-DEFER-CB ua-set — the app reached WebSettings.setUserAgentString with \
+             {outstanding} probe-deferred setCookie ValueCallback(s) STILL unanswered. If a \
+             load-drive follows, the app TOLERATES the deferred reply and the ordering fix \
+             completes with no fabrication (§5 2026-07-16 ⏳➜🎲 / ☠️)."
+        );
+    }
     // Read the fixed-flag BEFORE storing: the store is still worth doing (the Java-side getter must
     // report what the app set either way — that is the app's own contract), but the engine can no
     // longer honor it, and a SILENT discard is precisely the bug being fixed here. So say so.
@@ -300,6 +317,138 @@ pub fn set_app_user_agent(ua: Option<String>) {
 /// [`spawn_helper_process`].
 pub fn app_user_agent() -> Option<String> {
     APP_USER_AGENT.lock().ok().and_then(|s| s.clone())
+}
+
+// ---------------------------------------------------------------------------
+// The deferred-3-arg-reply PROBE (2026-07-16) — a DEV-HOST DIAGNOSTIC, NOT a fix
+// ---------------------------------------------------------------------------
+
+/// Whether the env value selects the deferred-3-arg-setCookie-reply PROBE (2026-07-16).
+/// EXACT-match `"1"` only — never `"true"`, never a truthy substring — mirroring the helper crate's
+/// `engine::console_text_diag_enabled` / `engine::bridge_diag_enabled` for the same reason: a
+/// deliberate opt-in that no unrelated env value can trip. Pure/unit-pinned.
+fn defer_cookie_cb_enabled(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// The PROBE's verdict for this process, read ONCE (the env is not re-read per op) — and the place
+/// its one-shot startup WARN is emitted.
+///
+/// # What it measures, and why it is a probe rather than a fix (2026-07-16)
+///
+/// THE ONE OPEN QUESTION behind the §5 ⏳➜🎲 / ☠️ ordering wall: the app's FIRST WebView-relevant
+/// call is a 3-arg `setCookie(url, value, ValueCallback)` ~30–60 s BEFORE `setUserAgentString`, and
+/// it cold-starts the helper — which FIXES the global `CefSettings.user_agent` before the app's UA
+/// exists. Its reply cannot be answered locally (M4 deliberately removed the fabricated
+/// `Boolean.TRUE`; `engine::classify_cookie_set_rejection` is observability-ONLY by its own doc and
+/// explicitly cannot decide the store-unready-at-first-op case — which is precisely this one). The
+/// only remaining honest option is to DEFER the reply until the engine exists, which AOSP permits:
+/// *"This method is asynchronous. If a `ValueCallback` is provided, `ValueCallback#onReceiveValue`
+/// will be called on the current thread's `Looper` once the operation is complete"*
+/// (`frameworks/base/core/java/android/webkit/CookieManager.java`, fetched + read 2026-07-16) —
+/// **no deadline is stated, for either `setCookie` or `removeAllCookies`.**
+///
+/// So the contract permits it and the mechanism is proven (§5 🏆: forcing the `Hybrid()` token makes
+/// the challenge COMPLETE). **The unknown is purely BEHAVIOURAL: does the app WAIT on that callback
+/// before proceeding to login?** Nobody knows; it cannot be settled first-party without RE. This
+/// probe measures it — see [`set_app_user_agent`], whose `ECLIPSE-DEFER-CB ua-set` line reports the
+/// app reaching `setUserAgentString` WITH a reply outstanding, which is the answer.
+///
+/// OFF (the default, and the shipped behaviour) this is a structural no-op: [`EarlyCookies::offer`]
+/// returns `NeedsEngine` for a 3-arg set exactly as before, nothing is ever pushed to
+/// [`DEFERRED_CB_IDS`], [`FIRST_DEFER_AT`] is never set, and every branch this gate guards is dead.
+fn defer_cookie_cb() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let raw = std::env::var("ECLIPSE_WEBVIEW_DEFER_COOKIE_CB").ok();
+        let on = defer_cookie_cb_enabled(raw.as_deref());
+        if on {
+            tracing::warn!(
+                target: "android.webkit.CookieManager",
+                "ECLIPSE-DEFER-CB probe ENABLED (ECLIPSE_WEBVIEW_DEFER_COOKIE_CB=1) — a DEV-HOST \
+                 DIAGNOSTIC, never a default boot and never a fix. An early 3-arg setCookie(url, \
+                 value, ValueCallback) will now BUFFER like a 2-arg set instead of cold-starting the \
+                 helper, and its ValueCallback is held UNANSWERED until the flush replays the \
+                 app's ORIGINAL frame to the live engine (the REAL flag then routes back unchanged \
+                 — nothing is fabricated, nothing is dropped). AOSP states no deadline for this \
+                 callback; whether the APP tolerates the delay is exactly what this measures. If \
+                 the app stalls, this boot stalls — that IS the result."
+            );
+        }
+        on
+    })
+}
+
+/// Request ids of 3-arg setCookies whose `ValueCallback` the PROBE is currently holding.
+/// PROBE-ONLY: nothing is ever pushed here with the gate off. Bounded by [`EarlyCookies::CAP`].
+static DEFERRED_CB_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// When the PROBE deferred its FIRST 3-arg reply — the clock [`set_app_user_agent`] reports
+/// against. PROBE-ONLY (never set with the gate off), so its `get()` is itself the gate on the
+/// measurement line.
+static FIRST_DEFER_AT: OnceLock<Instant> = OnceLock::new();
+
+/// The request id of a 3-arg setCookie frame (the shape that OWES the app a `ValueCallback`), or
+/// `None` for every other message. The one place that knowledge lives.
+fn deferred_cb_request_id(msg: &ConsumerMsg) -> Option<u32> {
+    match msg {
+        ConsumerMsg::CookieSetForResult { request_id, .. } => Some(*request_id),
+        _ => None,
+    }
+}
+
+/// Record + announce one 3-arg setCookie whose `ValueCallback` the PROBE is now holding.
+/// Reached only under the gate (its only caller acts on a `Buffer` verdict for a frame
+/// [`deferred_cb_request_id`] matched, which [`EarlyCookies::offer`] only returns when `defer_cb`).
+fn note_deferred_callback(request_id: u32) {
+    let _ = FIRST_DEFER_AT.set(Instant::now());
+    let outstanding = match DEFERRED_CB_IDS.lock() {
+        Ok(mut ids) => {
+            ids.push(request_id);
+            ids.len()
+        }
+        Err(_) => 0,
+    };
+    tracing::warn!(
+        target: "android.webkit.CookieManager",
+        outstanding,
+        "ECLIPSE-DEFER-CB deferred id={request_id} — holding the app's 3-arg setCookie \
+         ValueCallback UNANSWERED so this op does not cold-start the helper (and fix the engine's \
+         global User-Agent before the app has set its own). The app's ORIGINAL frame is buffered \
+         verbatim; the REAL flag is routed at flush. Watch for `ECLIPSE-DEFER-CB ua-set` — if it \
+         arrives, the app did NOT block on this callback."
+    );
+}
+
+/// Announce that a PROBE-deferred reply's REAL flag has now reached the app. A no-op for any id the
+/// probe never held — and structurally unreachable with the gate off ([`DEFERRED_CB_IDS`] is then
+/// always empty), so a default boot's cookie round-trip is unchanged.
+fn note_deferred_callback_answered(request_id: u32, ok: bool) {
+    if !defer_cookie_cb() {
+        return;
+    }
+    let held = match DEFERRED_CB_IDS.lock() {
+        Ok(mut ids) => {
+            let before = ids.len();
+            ids.retain(|id| *id != request_id);
+            before != ids.len()
+        }
+        Err(_) => false,
+    };
+    if !held {
+        return;
+    }
+    let waited_ms = FIRST_DEFER_AT
+        .get()
+        .map(|t0| t0.elapsed().as_millis())
+        .unwrap_or_default();
+    tracing::warn!(
+        target: "android.webkit.CookieManager",
+        waited_ms,
+        "ECLIPSE-DEFER-CB answered id={request_id} ok={ok} — the ENGINE's REAL success flag \
+         reached the app's ValueCallback (not a fabricated one). The deferral cost the app this \
+         much wait for its reply and nothing else."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -368,10 +517,16 @@ pub enum SendOutcome {
 /// * `CookieSetForResult` — its whole purpose is the REAL verdict: `set_cookie` *"will check for
 ///   disallowed characters ... and fail without setting the cookie"* and returns *"false (0) if an
 ///   invalid URL is specified"* (the measured boot shows CEF genuinely rejecting two of the app's
-///   sets). Only CEF knows. Deferring its reply instead was REJECTED: the app's `ValueCallback`
-///   would then fire only at flush — and if the app never drives a WebView, never. An app that
-///   blocks on it at `AppManager.initialize` would then HANG FOREVER, which is strictly worse than
-///   a wrong UA. Forcing the spawn is exactly the pre-fix behaviour and can regress nothing.
+///   sets). Only CEF knows. Deferring its reply instead was REJECTED **on an assumption that was
+///   never measured**: that the app's `ValueCallback` firing only at flush — never, on a boot that
+///   drives no WebView — would HANG an app that blocks on it at `AppManager.initialize`. Forcing
+///   the spawn is exactly the pre-fix behaviour and can regress nothing, so it remains the SHIPPED
+///   default. **2026-07-16: that assumption is now measurable, and the answer decides the whole
+///   ordering fix** — see [`defer_cookie_cb`], the `ECLIPSE_WEBVIEW_DEFER_COOKIE_CB` dev-host probe,
+///   which flips exactly this arm to `Buffer`. AOSP states NO deadline for the callback, so the
+///   deferral is contract-legal; only the app's behaviour is unknown. The probe bounds the strand
+///   at both ends it can: a `CookiesClear` that would DROP an unanswered frame forces the spawn
+///   instead (below), and [`shutdown`] answers whatever is still deferred.
 struct EarlyCookies {
     /// Deferred `CookieSet` frames in ARRIVAL ORDER, replayed verbatim by [`ensure_spawned`].
     /// RAW frames: nothing is parsed here, so nothing (expiry, creation time, sanitization) can be
@@ -396,11 +551,24 @@ impl EarlyCookies {
         Self { sets: Vec::new() }
     }
 
+    /// Does the buffer hold a 3-arg set whose `ValueCallback` is still owed the engine's REAL flag?
+    /// Only the [`defer_cookie_cb`] probe can make this true (with the gate off a
+    /// `CookieSetForResult` never buffers), so every branch it guards is dead on a default boot.
+    fn holds_unanswered_callback(&self) -> bool {
+        self.sets
+            .iter()
+            .any(|m| deferred_cb_request_id(m).is_some())
+    }
+
     /// Offer one consumer message to the deferral. Total; the caller acts on the verdict. The
     /// cookie variants are matched EXPLICITLY — no `_` arm covers them — so a future cookie message
     /// cannot be added without deciding its pre-engine behaviour. That is the structural guard
     /// against re-opening this defect.
-    fn offer(&mut self, msg: &ConsumerMsg) -> Deferral {
+    ///
+    /// `defer_cb` is the [`defer_cookie_cb`] PROBE (2026-07-16, dev-host only). It is a parameter
+    /// rather than an env read so this stays pure and BOTH settings are unit-pinned — `false` must
+    /// reproduce the shipped verdicts exactly.
+    fn offer(&mut self, msg: &ConsumerMsg, defer_cb: bool) -> Deferral {
         match msg {
             // Fire-and-forget (v1): no reply obligation, so buffering can never strand a callback.
             ConsumerMsg::CookieSet { .. } if self.sets.len() < Self::CAP => {
@@ -410,6 +578,33 @@ impl EarlyCookies {
             ConsumerMsg::CookieSet { .. } => {
                 Deferral::NeedsEngine("the deferred-cookie buffer is full")
             }
+            // PROBE ONLY (`ECLIPSE_WEBVIEW_DEFER_COOKIE_CB=1`): buffer the 3-arg set EXACTLY like
+            // the 2-arg one — the app's ORIGINAL frame, so `expires_epoch_s` and every other field
+            // ride along losslessly — and hold its ValueCallback until [`ensure_spawned`] replays
+            // it to the live engine, where the REAL flag routes back through the unchanged
+            // `CookieSetResult` path. Nothing is fabricated; nothing is dropped. The ONLY thing that
+            // changes is WHEN the app is answered, which AOSP leaves open ([`defer_cookie_cb`]).
+            ConsumerMsg::CookieSetForResult { .. } if defer_cb && self.sets.len() < Self::CAP => {
+                self.sets.push(msg.clone());
+                Deferral::Buffer
+            }
+            ConsumerMsg::CookieSetForResult { .. } if defer_cb => {
+                Deferral::NeedsEngine("the deferred-cookie buffer is full")
+            }
+            ConsumerMsg::CookieSetForResult { .. } => Deferral::NeedsEngine(
+                "setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag",
+            ),
+            // PROBE-only strand guard: a blanket clear is answerable locally by DROPPING `sets`
+            // (the empty-store lemma) — but dropping a frame whose ValueCallback is still owed the
+            // engine's REAL flag would strand the app forever. Force the spawn instead: the sets
+            // replay, every held callback is answered by CEF, and the clear then rides the wire
+            // normally. Unreachable with the gate off.
+            ConsumerMsg::CookiesClear { .. } if self.holds_unanswered_callback() => {
+                Deferral::NeedsEngine(
+                    "removeAll/SessionCookies would DROP a probe-deferred setCookie frame whose \
+                     ValueCallback is still owed the engine's REAL flag",
+                )
+            }
             ConsumerMsg::CookiesClear { .. } => {
                 self.sets.clear();
                 Deferral::AnswerWithoutEngine
@@ -417,9 +612,6 @@ impl EarlyCookies {
             ConsumerMsg::CookieGet { .. } if self.sets.is_empty() => Deferral::AnswerWithoutEngine,
             ConsumerMsg::CookieGet { .. } => Deferral::NeedsEngine(
                 "getCookie after this boot set a cookie — CEF owns url/domain/path matching",
-            ),
-            ConsumerMsg::CookieSetForResult { .. } => Deferral::NeedsEngine(
-                "setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag",
             ),
             _ => Deferral::NeedsEngine("an op that needs the engine reached the pre-engine gate"),
         }
@@ -881,6 +1073,18 @@ fn ensure_spawned(
     // can observe the jar between the spawn and the flush. Cookie-before-CreateView is correct:
     // the store is request-context-scoped, not view-scoped.
     for msg in &deferred {
+        // PROBE (2026-07-16): this is where a held ValueCallback stops being held — the app's
+        // ORIGINAL frame goes to the live engine and the REAL flag routes back on the normal
+        // `CookieSetResult` path (`note_deferred_callback_answered` logs its arrival). Unreachable
+        // with the gate off: `offer` never buffers a `CookieSetForResult` then.
+        if let Some(request_id) = deferred_cb_request_id(msg) {
+            tracing::warn!(
+                target: "android.webkit.CookieManager",
+                "ECLIPSE-DEFER-CB replay id={request_id} — replaying the app's ORIGINAL 3-arg \
+                 setCookie frame to the now-live engine; its ValueCallback will be answered with \
+                 the engine's REAL flag, exactly as it is without the probe"
+            );
+        }
         send_locked(slot, msg)?;
     }
     Ok(())
@@ -1254,6 +1458,9 @@ fn upcall_thread_main(
                 crate::framework::fire_evaluate_js_result(java_vm, request_id, ok, &value_json);
             }
             UpcallEvent::CookieSetResult { request_id, ok } => {
+                // PROBE (2026-07-16): logs ONLY for an id the probe held — the evidence that a
+                // deferred reply completed honestly with the engine's own flag.
+                note_deferred_callback_answered(request_id, ok);
                 crate::framework::fire_cookie_set_result(java_vm, request_id, ok);
             }
             UpcallEvent::CookiesClearResult { request_id } => {
@@ -1761,11 +1968,19 @@ fn send_with_lazy_spawn(
     }
     // Decide and drop the borrow before acting (the verdict owns its &'static str).
     let verdict = match &mut *slot {
-        ClientSlot::Unspawned(early) => Some(early.offer(msg)),
+        ClientSlot::Unspawned(early) => Some(early.offer(msg, defer_cookie_cb())),
         _ => None,
     };
     match verdict {
-        Some(Deferral::Buffer) => return Ok(SendOutcome::Buffered),
+        Some(Deferral::Buffer) => {
+            // PROBE (2026-07-16): a BUFFERED 3-arg set is the one shape that leaves an app callback
+            // outstanding. Announce it; the gate-off path can never reach this (`offer` only
+            // buffers a `CookieSetForResult` when `defer_cb`).
+            if let Some(request_id) = deferred_cb_request_id(msg) {
+                note_deferred_callback(request_id);
+            }
+            return Ok(SendOutcome::Buffered);
+        }
         Some(Deferral::AnswerWithoutEngine) => return Ok(SendOutcome::AnsweredWithoutEngine),
         Some(Deferral::NeedsEngine(why)) => {
             tracing::warn!(
@@ -2212,6 +2427,48 @@ pub fn failed_reason() -> Option<String> {
     }
 }
 
+/// PROBE (2026-07-16, `ECLIPSE_WEBVIEW_DEFER_COOKIE_CB`): answer every 3-arg setCookie the deferral
+/// is STILL holding at teardown. A permanently stranded app callback is not acceptable even in a
+/// diagnostic, so this is the deferral's hard bound: nothing leaves this function still owed.
+///
+/// # ANSWER, not force-the-spawn — and why that is the honest choice here
+///
+/// The two options are to cold-start CEF now purely to obtain real flags, or to answer. Answering
+/// is honest and forcing is not, for reasons specific to THIS moment:
+/// * `false` here is **true**. `setCookie`'s callback value *"indicates whether the cookie was set
+///   successfully"* (AOSP `CookieManager.java`, verified 2026-07-16). No engine ever existed on this
+///   path — no `CefInitialize`, no cookie store (the empty-store lemma, [`EarlyCookies`]) — so the
+///   cookie was, as a matter of fact, never set. Reporting that is an accurate report of a real
+///   non-completion, NOT a fabricated verdict: it is exactly what
+///   [`crate::framework::drain_all_webview_callbacks`] already means by `false`, and what the
+///   3-arg native's own send-failure arm already answers. The flag M4 refused to fabricate is a
+///   `true` nobody measured; a `false` for an operation that provably did not happen is the
+///   opposite of that.
+/// * Forcing a spawn would be the dishonest one. It would run a full engine init (sandbox, GPU,
+///   `CefInitialize`) DURING VM teardown, to set cookies into a store that is destroyed
+///   milliseconds later, and to answer callbacks whose app is already exiting — a real risk of a
+///   hang or a late crash in exchange for a flag with no consumer. That is behaviour changed to
+///   satisfy a diagnostic's bookkeeping, which is what CLAUDE.md forbids.
+///
+/// Delivery reuses the shipped drain: `&Vm` is `!Send`, so the borrow is the type-level proof we are
+/// MAIN, and `dispatch_webview_callback_on_main` therefore takes its `InlineOnMainThread` path —
+/// the AOSP UI-thread contract is satisfied with no pump and no deadline. Called BEFORE
+/// [`retire_main_upcall_dispatch`] and before any join, so nothing is racing it.
+fn answer_stranded_deferred_callbacks(vm: &crate::runtime::Vm, ids: &[u32]) {
+    tracing::warn!(
+        target: "android.webkit.CookieManager",
+        stranded = ids.len(),
+        "ECLIPSE-DEFER-CB shutdown — {} probe-deferred 3-arg setCookie ValueCallback(s) were never \
+         replayed (this boot drove no WebView, so the flush never ran). Answering each FALSE now: \
+         no engine ever existed, so the cookie genuinely was never set. Nothing is left stranded.",
+        ids.len()
+    );
+    crate::framework::drain_deferred_cookie_set_callbacks(
+        vm,
+        "the web engine helper was shut down with probe-deferred setCookie replies outstanding",
+    );
+}
+
 /// Deliberate teardown: polite `Shutdown` → bounded wait → kill+wait → join the reader (bounded:
 /// the child's death forces the reader's EOF) → PUMP while joining the upcall thread → retire the
 /// main dispatch. The slot latches so no later drive respawns.
@@ -2222,6 +2479,10 @@ pub fn failed_reason() -> Option<String> {
 /// BLOCK until main runs them. A bare `join()` would park main against a thread parked on main.
 /// `Vm` is `!Send`, so the borrow is also the type-level proof we ARE main.
 pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
+    // PROBE (2026-07-16): 3-arg setCookie ids the deferral is still holding at teardown — nothing
+    // will ever replay them, so their ValueCallbacks must be answered HERE (below). Always empty
+    // with the gate off, where a `CookieSetForResult` never buffers.
+    let mut stranded_cb_ids: Vec<u32> = Vec::new();
     let taken = match CLIENT.lock() {
         Ok(mut slot) => {
             match std::mem::replace(
@@ -2234,6 +2495,11 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
                     // Unspawned slot may hold deferred cookie SETs nothing will ever replay — drop
                     // their values here, matching the pending_bridges clear below.
                     if let ClientSlot::Unspawned(early) = &mut other {
+                        stranded_cb_ids = early
+                            .sets
+                            .iter()
+                            .filter_map(deferred_cb_request_id)
+                            .collect();
                         early.sets.clear();
                     }
                     *slot = other;
@@ -2244,6 +2510,9 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
         Err(_) => None,
     };
     ACTIVE_VIEW.store(0, Ordering::Relaxed);
+    if !stranded_cb_ids.is_empty() {
+        answer_stranded_deferred_callbacks(vm, &stranded_cb_ids);
+    }
     let Some(mut client) = taken else {
         return ShutdownReport {
             helper_exit: None,
@@ -2913,6 +3182,143 @@ mod tests {
         }
     }
 
+    /// A 3-arg `setCookie` frame — the shape that OWES the app a `ValueCallback`. `expires_epoch_s`
+    /// is deliberately NON-zero: it is the field the read-back `CookieEntry` cannot carry, so it is
+    /// what proves buffering the ORIGINAL frame is lossless.
+    fn a_cookie_set_cb(request_id: u32) -> ConsumerMsg {
+        ConsumerMsg::CookieSetForResult {
+            request_id,
+            url: "https://www.roblox.com/".into(),
+            name: "n".into(),
+            value: "v".into(),
+            domain: ".roblox.com".into(),
+            path: "/".into(),
+            secure: true,
+            http_only: true,
+            expires_epoch_s: 1_800_000_000,
+        }
+    }
+
+    #[test]
+    fn defer_cookie_cb_gate_is_exact_match_one_only() {
+        // 2026-07-16 (the ECLIPSE_WEBVIEW_DEFER_COOKIE_CB probe). Mirrors the helper crate's
+        // `engine::console_text_diag_enabled` / `engine::bridge_diag_enabled` strictness for the
+        // same reason: this probe holds a real app callback unanswered, so it must be a DELIBERATE
+        // opt-in that no unrelated env value can ever trip.
+        assert!(defer_cookie_cb_enabled(Some("1")));
+        assert!(!defer_cookie_cb_enabled(Some("")));
+        assert!(!defer_cookie_cb_enabled(Some("0")));
+        assert!(!defer_cookie_cb_enabled(Some("true")));
+        assert!(!defer_cookie_cb_enabled(Some("yes")));
+        assert!(!defer_cookie_cb_enabled(Some("1 ")));
+        assert!(!defer_cookie_cb_enabled(Some(" 1")));
+        assert!(!defer_cookie_cb_enabled(Some("11")));
+        assert!(!defer_cookie_cb_enabled(None));
+    }
+
+    #[test]
+    fn defer_cookie_cb_off_is_a_structural_no_op_for_every_cookie_shape() {
+        // THE PIN THAT MAKES THE PROBE SAFE TO SHIP DARK (2026-07-16): with the gate off, `offer`
+        // must reproduce the SHIPPED verdicts byte-for-byte — the probe is a measurement, and a
+        // measurement that changes the default boot measures itself. Every cookie shape, and the
+        // reason strings the boot log greps for, are asserted verbatim.
+        let mut early = EarlyCookies::new();
+        assert_eq!(
+            early.offer(&a_cookie_set_cb(1), false),
+            Deferral::NeedsEngine(
+                "setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag"
+            )
+        );
+        // The forced spawn must not buffer it: nothing is held, so nothing can strand.
+        assert!(early.sets.is_empty());
+        assert!(!early.holds_unanswered_callback());
+        // And the ops around it are untouched.
+        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
+        assert_eq!(
+            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, false),
+            Deferral::AnswerWithoutEngine
+        );
+        assert!(early.sets.is_empty());
+        assert_eq!(
+            early.offer(
+                &ConsumerMsg::CookieGet {
+                    request_id: 3,
+                    url: "https://www.roblox.com/".into(),
+                },
+                false
+            ),
+            Deferral::AnswerWithoutEngine
+        );
+    }
+
+    #[test]
+    fn defer_cookie_cb_on_buffers_the_three_arg_set_losslessly_instead_of_spawning() {
+        // THE PROBE'S WHOLE POINT (2026-07-16): the app's FIRST cookie op is a 3-arg setCookie, and
+        // with the gate off it cold-starts CEF — fixing the GLOBAL CefSettings.user_agent ~30-60 s
+        // before the app calls setUserAgentString (§5 ⏳➜🎲). Under the probe it must BUFFER, so no
+        // cookie op can fix the UA, and the frame must be the app's ORIGINAL — nothing re-derived.
+        let mut early = EarlyCookies::new();
+        assert_eq!(early.offer(&a_cookie_set_cb(7), true), Deferral::Buffer);
+        assert_eq!(early.sets.len(), 1);
+        assert!(early.holds_unanswered_callback());
+        // Lossless: the buffered frame IS the app's original, expiry and all (a read-back
+        // `CookieEntry` has no `expires_epoch_s` — that asymmetry is why replay must use the frame).
+        assert_eq!(early.sets[0], a_cookie_set_cb(7));
+        assert_eq!(deferred_cb_request_id(&early.sets[0]), Some(7));
+        // Arrival order is preserved across the 2-arg/3-arg mix — the jar's overwrite semantics.
+        assert_eq!(early.offer(&a_cookie_set("later"), true), Deferral::Buffer);
+        assert_eq!(early.sets, vec![a_cookie_set_cb(7), a_cookie_set("later")]);
+    }
+
+    #[test]
+    fn defer_cookie_cb_never_lets_a_clear_drop_an_unanswered_callback() {
+        // THE STRAND GUARD (2026-07-16). A blanket clear is normally answerable locally by dropping
+        // `sets` (the empty-store lemma) — but dropping a frame whose ValueCallback is still owed
+        // the engine's REAL flag would strand the app FOREVER, which is unacceptable even in a
+        // diagnostic. It must force the spawn instead, so the sets replay and CEF answers each.
+        let mut early = EarlyCookies::new();
+        assert_eq!(early.offer(&a_cookie_set_cb(1), true), Deferral::Buffer);
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, true),
+            Deferral::NeedsEngine(_)
+        ));
+        // The frame SURVIVES the refused clear — it must still be there to replay and be answered.
+        assert_eq!(early.sets.len(), 1);
+        assert!(early.holds_unanswered_callback());
+    }
+
+    #[test]
+    fn defer_cookie_cb_respects_the_lemma_boundary_and_the_buffer_cap() {
+        // The probe widens exactly ONE arm. It must not weaken the proof's boundary: a get with a
+        // non-empty buffer still needs Chromium's url/domain/path matching...
+        let mut early = EarlyCookies::new();
+        assert_eq!(early.offer(&a_cookie_set_cb(1), true), Deferral::Buffer);
+        assert!(matches!(
+            early.offer(
+                &ConsumerMsg::CookieGet {
+                    request_id: 2,
+                    url: "https://www.roblox.com/".into(),
+                },
+                true
+            ),
+            Deferral::NeedsEngine(_)
+        ));
+        // ...and the cap still bounds the held cookie VALUES, degrading to the honest forced spawn.
+        let mut full = EarlyCookies::new();
+        for i in 0..EarlyCookies::CAP {
+            assert_eq!(
+                full.offer(&a_cookie_set(&format!("c{i}")), true),
+                Deferral::Buffer
+            );
+        }
+        assert_eq!(
+            full.offer(&a_cookie_set_cb(9), true),
+            Deferral::NeedsEngine("the deferred-cookie buffer is full")
+        );
+        assert_eq!(full.sets.len(), EarlyCookies::CAP);
+        assert!(!full.holds_unanswered_callback());
+    }
+
     #[test]
     fn early_cookies_defer_sets_so_a_cookie_op_never_cold_starts_the_engine() {
         // 2026-07-16 THE ROOT-CAUSE PIN (§6 🩹➜⛔). The confirmed bug: a COOKIE op spawned the
@@ -2921,8 +3327,8 @@ mod tests {
         // one carrying the `Hybrid()` token the page's own bridge selector requires) could never
         // reach the engine. This fails the moment a fire-and-forget cookie set force-spawns again.
         let mut early = EarlyCookies::new();
-        assert_eq!(early.offer(&a_cookie_set("a")), Deferral::Buffer);
-        assert_eq!(early.offer(&a_cookie_set("b")), Deferral::Buffer);
+        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
+        assert_eq!(early.offer(&a_cookie_set("b"), false), Deferral::Buffer);
         assert_eq!(early.sets.len(), 2);
     }
 
@@ -2935,24 +3341,30 @@ mod tests {
         // content is `sets` is reproduced exactly by dropping `sets`.
         let mut early = EarlyCookies::new();
         assert_eq!(
-            early.offer(&ConsumerMsg::CookieGet {
-                request_id: 1,
-                url: "https://www.roblox.com/".into(),
-            }),
+            early.offer(
+                &ConsumerMsg::CookieGet {
+                    request_id: 1,
+                    url: "https://www.roblox.com/".into(),
+                },
+                false
+            ),
             Deferral::AnswerWithoutEngine
         );
-        assert_eq!(early.offer(&a_cookie_set("a")), Deferral::Buffer);
+        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
         assert_eq!(
-            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }),
+            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, false),
             Deferral::AnswerWithoutEngine
         );
         // The clear emptied the jar, so a get is answerable again — the post-state matches CEF's.
         assert!(early.sets.is_empty());
         assert_eq!(
-            early.offer(&ConsumerMsg::CookieGet {
-                request_id: 3,
-                url: "https://www.roblox.com/".into(),
-            }),
+            early.offer(
+                &ConsumerMsg::CookieGet {
+                    request_id: 3,
+                    url: "https://www.roblox.com/".into(),
+                },
+                false
+            ),
             Deferral::AnswerWithoutEngine
         );
     }
@@ -2967,26 +3379,32 @@ mod tests {
         // cookie"), so its reply must never be fabricated — nor deferred, which could strand the
         // app's ValueCallback forever on a boot that never drives a WebView.
         let mut early = EarlyCookies::new();
-        assert_eq!(early.offer(&a_cookie_set("a")), Deferral::Buffer);
+        assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
         assert!(matches!(
-            early.offer(&ConsumerMsg::CookieGet {
-                request_id: 1,
-                url: "https://www.roblox.com/".into(),
-            }),
+            early.offer(
+                &ConsumerMsg::CookieGet {
+                    request_id: 1,
+                    url: "https://www.roblox.com/".into(),
+                },
+                false
+            ),
             Deferral::NeedsEngine(_)
         ));
         assert!(matches!(
-            early.offer(&ConsumerMsg::CookieSetForResult {
-                request_id: 2,
-                url: "https://www.roblox.com/".into(),
-                name: "n".into(),
-                value: "v".into(),
-                domain: ".roblox.com".into(),
-                path: "/".into(),
-                secure: true,
-                http_only: true,
-                expires_epoch_s: 0,
-            }),
+            early.offer(
+                &ConsumerMsg::CookieSetForResult {
+                    request_id: 2,
+                    url: "https://www.roblox.com/".into(),
+                    name: "n".into(),
+                    value: "v".into(),
+                    domain: ".roblox.com".into(),
+                    path: "/".into(),
+                    secure: true,
+                    http_only: true,
+                    expires_epoch_s: 0,
+                },
+                false
+            ),
             Deferral::NeedsEngine(_)
         ));
         // A forced spawn must not also lose the buffered sets: they still flush at `ensure_spawned`.
@@ -3001,12 +3419,12 @@ mod tests {
         let mut early = EarlyCookies::new();
         for i in 0..EarlyCookies::CAP {
             assert_eq!(
-                early.offer(&a_cookie_set(&format!("c{i}"))),
+                early.offer(&a_cookie_set(&format!("c{i}")), false),
                 Deferral::Buffer
             );
         }
         assert!(matches!(
-            early.offer(&a_cookie_set("overflow")),
+            early.offer(&a_cookie_set("overflow"), false),
             Deferral::NeedsEngine(_)
         ));
         assert_eq!(early.sets.len(), EarlyCookies::CAP);
@@ -3021,7 +3439,7 @@ mod tests {
         // read-back+replay would not be. (The spawn itself is not unit-reachable — no live JavaVM.)
         let mut early = EarlyCookies::new();
         for n in ["first", "second", "third"] {
-            assert_eq!(early.offer(&a_cookie_set(n)), Deferral::Buffer);
+            assert_eq!(early.offer(&a_cookie_set(n), false), Deferral::Buffer);
         }
         let taken = std::mem::take(&mut early.sets);
         let names: Vec<&str> = taken
