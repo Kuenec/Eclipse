@@ -387,7 +387,8 @@ wrap_render_process_handler! {
                                 // "eclipse.bridge.ready" it answers, so injecting into `frame` is
                                 // both correct and sufficient: every frame pulls for itself.
                                 if let Some(frame) = frame {
-                                    let js = generate_stub_js(&iface, &methods);
+                                    let js =
+                                        generate_stub_js(&iface, &methods, self.bridge_diag_on());
                                     frame.execute_java_script(
                                         Some(&CefString::from(js.as_str())),
                                         None,
@@ -447,6 +448,14 @@ wrap_render_process_handler! {
 }
 
 impl HelperRenderProcessHandler {
+    /// Whether the dev-host `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` gate is on in THIS renderer process
+    /// (plan M6, 2026-07-16). Derived from the single field the gate already materializes into —
+    /// `bridge_diag` is `Some` iff `engine::bridge_diag_enabled` said so in `main` — rather than
+    /// copied into a second field that could drift out of step with it.
+    fn bridge_diag_on(&self) -> bool {
+        self.bridge_diag.is_some()
+    }
+
     /// Inject every stored interface's `window.<name>` stubs into `ctx` SYNCHRONOUSLY via
     /// `V8Context::eval` (plan M6, 2026-07-10) and return `(ifaces, total_methods)` for the A2
     /// evidence line. Eval is the same primitive `eval_in_frame` proves against this binding and is
@@ -462,7 +471,7 @@ impl HelperRenderProcessHandler {
         let mut ifaces = 0usize;
         let mut methods_total = 0usize;
         for (iface, methods) in inv.iter() {
-            let js = generate_stub_js(iface, methods);
+            let js = generate_stub_js(iface, methods, self.bridge_diag_on());
             let mut retval: Option<V8Value> = None;
             let mut exception: Option<V8Exception> = None;
             let code = ctx.eval(
@@ -524,25 +533,90 @@ fn format_context_ready_line(main_frame: bool) -> String {
     )
 }
 
+/// The static, greppable prefix every stub-invocation trace line carries (plan M6, 2026-07-16).
+/// Static by construction so a live-boot grep is one fixed literal; see [`generate_stub_js`].
+const STUB_TRACE_PREFIX: &str = "ECLIPSE-STUB";
+
 /// Generate the `window.<name>` bridge stub JS for one interface. Each method returns a Promise
 /// (the async bridge shape — see the M4 design §0.2 documented sync-return divergence): it
 /// serializes `{iface, method, args}` and sends it through `cefQuery`; onSuccess resolves with the
 /// JSON-parsed result, onFailure rejects with an Error.
-fn generate_stub_js(iface: &str, methods: &[String]) -> String {
+///
+/// `diag` is the dev-host `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` gate (`engine::bridge_diag_enabled`, read
+/// once in `main`). 2026-07-16 (plan M6) — WHY THIS EXISTS: across SEVEN live boots the consumer's
+/// `bridge call received` is ZERO, and the record has repeatedly INFERRED "the page never calls the
+/// bridge" from that. The inference is UNSOUND: the chain is stub body → `q(...)` (`window.cefQuery`)
+/// → `CefMessageRouter` → `BridgeHandler::on_query_str` (engine.rs) → `HelperMsg::BridgeCall` → ART.
+/// If the page DID call the stub and ANY link dropped it, the observable is IDENTICAL to the page
+/// never calling — yet the two have opposite next steps (an Eclipse bug we can fix vs the page's own
+/// transport selection, which we cannot). `__webview-test` proves the chain only for a local
+/// same-origin SINGLE-FRAME page; the challenge page is cross-origin with cross-origin subframes.
+/// This trace makes the stub announce its OWN invocation, so the two worlds separate by measurement.
+///
+/// The trace announces at five points: the installer's cefQuery bail (otherwise INVISIBLE — the
+/// `bridge stubs applied` line is logged by the Rust caller either way, so a bail would look exactly
+/// like a page that never called), then per call `invoke` (FIRST statement in the body — before
+/// `JSON.stringify`, which genuinely throws on circular/BigInt args, and before `q`), `sent` (q
+/// accepted the query), and each terminal (`success`/`failure`).
+///
+/// PAYLOAD RULE: iface name, method name, and ARGUMENT COUNT only — never an argument VALUE and
+/// never a URL, matching `framework.rs`'s bridge receipt (which binds `arg_lens` only). Identifiers
+/// are js-escaped exactly as the stub body escapes them.
+///
+/// `diag == false` (the default) emits BYTE-IDENTICAL JS to the pre-diagnostic stub: every fragment
+/// below is empty, so the `format!` collapses to exactly the original text (pinned by
+/// `generate_stub_js_gate_off_is_byte_identical_to_the_pre_diag_stub`). The gate-on body keeps the
+/// stub's semantics unchanged — same cefQuery capture + guard, same JSON payload, same Promise
+/// shape, same terminals; the trace only observes.
+///
+/// The console is captured AT INJECTION TIME (`window.console` + its `log`, called back with the
+/// console as `this`) rather than read per call: on the sync path that capture happens before any
+/// page script runs, so a page that later replaces `window.console` cannot silence the trace — a
+/// silenced trace would read as "absent", i.e. the exact false negative this diagnostic exists to
+/// prevent. Every trace call is try/caught (a missing console collapses into the same catch), so the
+/// diagnostic can never throw into the page's own call path.
+fn generate_stub_js(iface: &str, methods: &[String], diag: bool) -> String {
     let name = js_escape(iface);
     let methods_arr = methods
         .iter()
         .map(|m| format!("\"{}\"", js_escape(m)))
         .collect::<Vec<_>>()
         .join(",");
+    // `C`/`L`/`d` live inside the stub's own IIFE — no page global is touched or shadowed (the
+    // onFailure param `c` is case-distinct from `C`).
+    let trace_prelude = if diag {
+        format!(
+            "var C=window.console,L=C&&C.log,\
+             d=function(t){{try{{L.call(C,\"{STUB_TRACE_PREFIX} \"+t);}}catch(e){{}}}};"
+        )
+    } else {
+        String::new()
+    };
+    let trace = |event: &str, suffix: &str| {
+        if diag {
+            format!("d(\"{event} iface={name} method=\"+m{suffix});")
+        } else {
+            String::new()
+        }
+    };
+    // The bail fires before any method is known, so it binds the iface alone.
+    let trace_no_query = if diag {
+        format!("d(\"no-cefQuery iface={name}\");")
+    } else {
+        String::new()
+    };
+    let trace_invoke = trace("invoke", "+\" argc=\"+arguments.length");
+    let trace_sent = trace("sent", "");
+    let trace_success = trace("success", "");
+    let trace_failure = trace("failure", "");
     format!(
-        "(function(){{var q=window.cefQuery;if(!q){{return;}}var o=window[\"{name}\"]=window[\"{name}\"]||{{}};\
-         [{methods_arr}].forEach(function(m){{o[m]=function(){{\
+        "(function(){{{trace_prelude}var q=window.cefQuery;if(!q){{{trace_no_query}return;}}var o=window[\"{name}\"]=window[\"{name}\"]||{{}};\
+         [{methods_arr}].forEach(function(m){{o[m]=function(){{{trace_invoke}\
          var a=Array.prototype.slice.call(arguments);\
          var r=JSON.stringify({{iface:\"{name}\",method:m,args:a}});\
          return new Promise(function(res,rej){{q({{request:r,\
-         onSuccess:function(s){{res(s===\"\"?undefined:JSON.parse(s));}},\
-         onFailure:function(c,msg){{rej(new Error(msg));}}}});}});}};}});}})();"
+         onSuccess:function(s){{{trace_success}res(s===\"\"?undefined:JSON.parse(s));}},\
+         onFailure:function(c,msg){{{trace_failure}rej(new Error(msg));}}}});{trace_sent}}});}};}});}})();"
     )
 }
 
@@ -748,8 +822,12 @@ fn main() -> ExitCode {
             COMPONENT,
             "ECLIPSE_WEBVIEW_BRIDGE_DIAG=1 — the renderer will evaluate a bridge \
              SELF-INTROSPECTION script on every frame load-end and log what ECLIPSE'S OWN injected \
-             stub looks like (dev-host diagnostic only; first-party — it reads only the globals \
-             Eclipse injected plus our own cefQuery router, never page content; never a default)",
+             stub looks like, AND the injected stubs themselves will trace their own invocation to \
+             the page console with the ECLIPSE-STUB prefix (dev-host diagnostic only; first-party — \
+             it reads only the globals Eclipse injected plus our own cefQuery router, never page \
+             content; never a default). 2026-07-16: the stub trace reaches this log ONLY with \
+             ECLIPSE_WEBVIEW_CONSOLE=1 as well — without it the console line carries severity+len \
+             but no text, so the trace is emitted and NOT readable. Set BOTH.",
         );
     }
     // The renderer-side JS-bridge/eval handler (plan M4). The router + inventory are cheap to
@@ -1191,7 +1269,7 @@ mod tests {
         // 2026-07-10 (plan M6): the bridge stub must (a) guard on window.cefQuery (so a page
         // without the router injected sees no throw), (b) return a Promise per method (the async
         // bridge shape), and (c) js_escape hostile identifier characters into the string literals.
-        let js = generate_stub_js("Iface\"x", &["m\\1".to_string()]);
+        let js = generate_stub_js("Iface\"x", &["m\\1".to_string()], false);
         assert!(
             js.contains("window.cefQuery"),
             "must reference cefQuery: {js}"
@@ -1211,6 +1289,116 @@ mod tests {
             "interface name not escaped: {js}"
         );
         assert!(js.contains("m\\\\1"), "method name not escaped: {js}");
+    }
+
+    #[test]
+    fn generate_stub_js_gate_off_is_byte_identical_to_the_pre_diag_stub() {
+        // 2026-07-16 (plan M6): the stub-invocation trace must be STRUCTURALLY impossible with the
+        // dev-host gate off. This pins the DEFAULT-boot stub byte-for-byte against the literal the
+        // pre-diagnostic `generate_stub_js` emitted (commit e17390a), so any future edit that leaks
+        // diagnostic text — or any other change — into the shipped stub fails here rather than in a
+        // live boot. The trace is a measurement instrument; the default page must never see it.
+        let js = generate_stub_js(
+            "__globalRobloxAndroidBridge__",
+            &["executeRoblox".to_string()],
+            false,
+        );
+        assert_eq!(
+            js,
+            "(function(){var q=window.cefQuery;if(!q){return;}\
+             var o=window[\"__globalRobloxAndroidBridge__\"]=window[\"__globalRobloxAndroidBridge__\"]||{};\
+             [\"executeRoblox\"].forEach(function(m){o[m]=function(){\
+             var a=Array.prototype.slice.call(arguments);\
+             var r=JSON.stringify({iface:\"__globalRobloxAndroidBridge__\",method:m,args:a});\
+             return new Promise(function(res,rej){q({request:r,\
+             onSuccess:function(s){res(s===\"\"?undefined:JSON.parse(s));},\
+             onFailure:function(c,msg){rej(new Error(msg));}});});};});})();"
+        );
+        // The prefix is the grep the live boot runs — it must not exist at all when gated off.
+        assert!(
+            !js.contains(STUB_TRACE_PREFIX),
+            "trace leaked into the default stub: {js}"
+        );
+        assert!(
+            !js.contains("console"),
+            "console leaked into the default stub: {js}"
+        );
+    }
+
+    #[test]
+    fn generate_stub_js_gate_on_traces_the_invocation_and_never_binds_arg_values() {
+        // 2026-07-16 (plan M6): THE GAP THIS CLOSES — across seven live boots the consumer's
+        // `bridge call received` is ZERO, and "the page never calls the bridge" was INFERRED from
+        // that. A page that DID call the stub while Eclipse dropped the call somewhere in
+        // stub → cefQuery → router → on_query_str → BridgeCall → ART is INDISTINGUISHABLE from a
+        // page that never called. This trace separates them, so it must actually bind the facts the
+        // decision turns on — and must never bind an argument VALUE (the recorded no-arg-values
+        // rule; framework.rs's bridge receipt binds arg_lens only).
+        let js = generate_stub_js("Iface\"x", &["m\\1".to_string()], true);
+
+        // (a) The static greppable prefix, plus the iface and method (`m` is the forEach binding,
+        //     concatenated at call time — the runtime method name).
+        assert!(js.contains(STUB_TRACE_PREFIX), "{js}");
+        assert!(
+            js.contains("iface=Iface\\\"x"),
+            "iface not bound/escaped: {js}"
+        );
+        assert!(js.contains("method=\"+m"), "method not bound: {js}");
+        // (b) The ARGUMENT COUNT — never the arguments themselves.
+        assert!(
+            js.contains("argc=\"+arguments.length"),
+            "arg count not bound: {js}"
+        );
+        // (c) Every announcement point: the invisible installer bail, the invocation, the
+        //     q-accepted bisect point, and both terminals.
+        for event in ["no-cefQuery", "invoke", "sent", "success", "failure"] {
+            assert!(
+                js.contains(&format!("d(\"{event} ")),
+                "missing {event} trace: {js}"
+            );
+        }
+        // (d) NO ARG VALUES: the trace must never concatenate the argument array (`a`), an element
+        //     of it, or the serialized payload (`r`) into a console line.
+        for banned in [
+            "\"+a+\"",
+            "\"+a)",
+            "+a+",
+            "+JSON.stringify(a)",
+            "\"+r+\"",
+            "\"+r)",
+            "argv",
+            "args=\"+",
+        ] {
+            assert!(
+                !js.contains(banned),
+                "arg value token {banned:?} in the trace: {js}"
+            );
+        }
+        // (e) The stub's SEMANTICS are unchanged — same guard, same payload, same Promise shape.
+        assert!(js.contains("var q=window.cefQuery;if(!q){"), "{js}");
+        assert!(
+            js.contains("return;}"),
+            "the cefQuery guard must still bail: {js}"
+        );
+        assert!(
+            js.contains("var r=JSON.stringify({iface:\"Iface\\\"x\",method:m,args:a});"),
+            "{js}"
+        );
+        assert!(
+            js.contains("new Promise") && js.contains("onSuccess") && js.contains("onFailure"),
+            "{js}"
+        );
+        // (f) js_escape still applies to the method-name array literal.
+        assert!(js.contains("[\"m\\\\1\"]"), "method name not escaped: {js}");
+        // (g) The trace can never throw into the page's own call path, and the console is captured
+        //     at injection time (a page that later replaces window.console cannot silence it —
+        //     a silenced trace would read as "absent", the exact false negative this must avoid).
+        assert!(js.contains("var C=window.console,L=C&&C.log"), "{js}");
+        assert!(js.contains("try{L.call(C,"), "{js}");
+        assert!(
+            js.contains("catch(e){}"),
+            "the trace must never throw into the page: {js}"
+        );
     }
 
     #[test]
