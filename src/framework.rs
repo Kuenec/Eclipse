@@ -9673,8 +9673,30 @@ extern "system" fn web_settings_native_get_user_agent_string<'local>(
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         match crate::webview::client::app_user_agent() {
-            Some(ua) => env.new_string(ua),
-            None => Ok(JString::default()),
+            Some(ua) => {
+                // 2026-07-17: the app READ its WebView UA. Load-bearing for the M6 frontier — the
+                // whole `get → append → set` round-trip hinges on whether this is ever called, and
+                // this native was previously SILENT, so its absence from a log proved nothing.
+                tracing::info!(
+                    target: "android.webkit.WebSettings",
+                    ua = ua.as_str(),
+                    "the app READ its WebView User-Agent via WebSettings.getUserAgentString — \
+                     returning the UA it set earlier"
+                );
+                env.new_string(ua)
+            }
+            None => {
+                // NULL is load-bearing (see the doc note): the overlay's Java body substitutes
+                // Eclipse's fallback literal, so the app receives that, never null.
+                tracing::info!(
+                    target: "android.webkit.WebSettings",
+                    "the app READ its WebView User-Agent via WebSettings.getUserAgentString BEFORE \
+                     setting one — this native returns null and the overlay substitutes Eclipse's \
+                     fallback literal, so the app sees the fallback (which carries neither the \
+                     `android` nor the `hybrid` token the challenge wrapper selects on)"
+                );
+                Ok(JString::default())
+            }
         }
     })
     .resolve::<LogErrorAndDefault>()
