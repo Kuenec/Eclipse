@@ -157,11 +157,27 @@ enum ClientSlot {
     /// (2026-07-16, the §6 🩹➜⛔ ordering fix: `CefSettings.user_agent` is GLOBAL and consumed by
     /// `CefInitialize`, so the spawn must not happen before the app has set its UA).
     Unspawned(EarlyCookies),
-    /// The helper is running; the reader thread is live.
-    Live(Client),
-    /// Process-lifetime failure latch (D5) carrying the ONE actionable reason.
+    /// The helper is running; the reader thread is live. 2026-07-16 (the §6 respawn): it CARRIES
+    /// the cookie log forward — the frames Eclipse has sent to THIS helper, which (while no
+    /// `CreateView` has been sent) are its entire store. [`maybe_respawn_for_app_ua`] replays them
+    /// into a replacement.
+    Live(Client, EarlyCookies),
+    /// Process-lifetime failure latch (D5) carrying the ONE actionable reason. 2026-07-16 (the §6
+    /// respawn): also the TRANSIENT park state of a respawn ([`RESPAWN_IN_PROGRESS`]) — a latch by
+    /// construction, so no thread can spawn a second helper while the first still holds CEF's
+    /// `root_cache_path` process-singleton lock.
     Failed(String),
 }
+
+/// The reason string a respawn parks the slot with while the old helper is torn down WITHOUT the
+/// [`CLIENT`] lock (2026-07-16, the §6 respawn). Compared BY VALUE in phase 3, so a real failure
+/// that races the swap wins and the log dies with it rather than resurrecting a helper nobody
+/// wants. [`shutdown`] deliberately does not restore it (see there).
+const RESPAWN_IN_PROGRESS: &str =
+    "the web engine helper is being REPLACED so the User-Agent the app set via \
+     WebSettings.setUserAgentString reaches the engine (CefSettings.user_agent is global and \
+     consumed by CefInitialize) — this op arrived inside the swap window and degrades honestly \
+     rather than being answered from a store that is mid-move (§6 2026-07-16 respawn)";
 
 /// The live helper process handle (kept inside [`CLIENT`]).
 ///
@@ -285,12 +301,12 @@ pub fn set_app_user_agent(ua: Option<String>) {
         tracing::warn!(
             target: "android.webkit.WebSettings",
             ua = ua.as_deref().unwrap_or("<reset to default>"),
-            "setUserAgentString called AFTER the engine User-Agent was already fixed at helper spawn — \
-             CefSettings.user_agent is global and consumed by CefInitialize, so this UA will NOT reach \
-             the engine (the Java-side getUserAgentString() will still report it). Reached only when \
-             an early op could not be deferred and forced the spawn first (see `EarlyCookies`) — the \
-             WARN there names which one. MEASURED 2026-07-16: before the deferral this fired on EVERY \
-             boot, 61 s late (§6 🩹➜⛔)."
+            "setUserAgentString called AFTER the LIVE helper's engine User-Agent was fixed at its \
+             spawn — CefSettings.user_agent is global and consumed by CefInitialize, so THIS engine \
+             cannot present it. 2026-07-16 (§6 respawn): that is now RECOVERABLE — if a load-drive \
+             follows while no browser exists, the helper is REPLACED with one carrying this string \
+             (`maybe_respawn_for_app_ua`, which names its verdict either way). This WARN means the \
+             early spawn cost a wasted CefInitialize, NOT that the UA is lost."
         );
     }
     match APP_USER_AGENT.lock() {
@@ -317,6 +333,39 @@ pub fn set_app_user_agent(ua: Option<String>) {
 /// [`spawn_helper_process`].
 pub fn app_user_agent() -> Option<String> {
     APP_USER_AGENT.lock().ok().and_then(|s| s.clone())
+}
+
+/// The User-Agent the CURRENT helper process was spawned with — i.e. what its
+/// `CefSettings.user_agent` actually holds (2026-07-16, plan M6, the §6 respawn). `None` = it booted
+/// on the helper's own fallback literal because the app had set no UA yet.
+///
+/// Written by [`spawn_helper_process`] from the SAME [`app_user_agent`] value it puts into the
+/// child's environment, at the same instant — one read, one record, so the two cannot disagree. That
+/// is the same byte-match-by-construction discipline the §6 💥 fix used for [`APP_USER_AGENT`], and
+/// it matters here because `spawn_helper_process` runs on the io thread while the app's UA can be
+/// written concurrently from a JNI thread: only the value the child ACTUALLY received is a truthful
+/// answer to "what does this engine present?".
+///
+/// Lock order: the spawn's write is serialized by [`CLIENT`] (the thread in `ensure_spawned` holds
+/// it and is parked on the io thread's verdict), and [`respawn_verdict`]'s caller holds [`CLIENT`]
+/// while reading. Nothing ever takes this lock and THEN [`CLIENT`], so no inversion is possible.
+static HELPER_BOOT_UA: Mutex<Option<String>> = Mutex::new(None);
+
+/// The User-Agent the live helper booted with ([`HELPER_BOOT_UA`]).
+fn helper_boot_ua() -> Option<String> {
+    HELPER_BOOT_UA.lock().ok().and_then(|s| s.clone())
+}
+
+/// Whether `ECLIPSE_WEBVIEW_UA_DIAG` is forcing a diagnostic User-Agent (2026-07-16). Read ONCE.
+///
+/// The helper's `engine::effective_user_agent(diag, app)` puts the diag rung ABOVE the app's UA, so
+/// while it is set a respawn would boot the SAME User-Agent it tore down — pure cost, zero effect,
+/// and it would corrupt the A/B by making the measurement's own instrument respawn. This does NOT
+/// duplicate the ladder (a second source of truth is the §6 💥 error class); it only recognizes that
+/// the ladder's TOP rung pins the UA regardless of what the app sets.
+fn ua_diag_forced() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ECLIPSE_WEBVIEW_UA_DIAG").is_ok_and(|v| !v.is_empty()))
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +582,23 @@ struct EarlyCookies {
     /// lost — `ConsumerMsg::CookieSet` carries `expires_epoch_s`, which the read-back type
     /// `CookieEntry` does NOT. That asymmetry is exactly why a read-back+replay was rejected and
     /// why buffering the app's ORIGINAL request is sound.
+    ///
+    /// 2026-07-16 (the §6 respawn): this is no longer only the PRE-spawn buffer — it is the
+    /// APPEND-ONLY LOG of every cookie-mutating frame Eclipse has sent to the CURRENT helper, kept
+    /// across its whole life by [`Self::record_sent`]. While no `CreateView` has been sent, the log
+    /// IS the helper's store (the empty-store lemma above), so replaying it into a replacement
+    /// reproduces that store exactly.
     sets: Vec<ConsumerMsg>,
+    /// Whether `sets` can still be trusted to REPRODUCE the helper's store. Cleared — never
+    /// silently — when the log stops being a faithful transcript:
+    /// * [`Self::CAP`] overflow while Live (the frame is not appended, so the store gains a cookie
+    ///   the log does not have ⇒ a replay would LOSE it);
+    /// * [`Self::retire`] (a browser now exists ⇒ a network `Set-Cookie` can reach the store, which
+    ///   no log can transcribe).
+    ///
+    /// A false value REFUSES the respawn ([`respawn_verdict`]) — it never silently degrades a replay
+    /// into a lossy one. `true` at construction: an empty log faithfully describes an empty store.
+    replayable: bool,
 }
 
 impl EarlyCookies {
@@ -548,7 +613,74 @@ impl EarlyCookies {
     const CAP: usize = 256;
 
     const fn new() -> Self {
-        Self { sets: Vec::new() }
+        Self {
+            sets: Vec::new(),
+            replayable: true,
+        }
+    }
+
+    /// Record one frame that has JUST been written to the LIVE helper (2026-07-16, the §6 respawn),
+    /// so the log keeps describing that helper's store. The mirror image of [`Self::offer`]'s
+    /// mutations — same shapes, same order, no verdict — and the ONE place the Live-side log is
+    /// maintained.
+    ///
+    /// Called ONLY after a successful `send_locked` from [`send_with_lazy_spawn`], never from the
+    /// input/frame path: `send_locked`'s other callers carry `MouseMove`/`Key`/`FrameAck`, which are
+    /// per-event hot-path frames (AGENTS.md §2.4) and can never touch a cookie store. The cookie
+    /// variants are matched EXPLICITLY — no `_` arm covers them — so a future cookie message cannot
+    /// be added without deciding whether it mutates the store.
+    fn record_sent(&mut self, msg: &ConsumerMsg) {
+        match msg {
+            // A set the engine has now applied. Order is the jar's semantics (a later set of the
+            // same name overwrites an earlier one), so push, never dedupe.
+            ConsumerMsg::CookieSet { .. } | ConsumerMsg::CookieSetForResult { .. } => {
+                if self.sets.len() < Self::CAP {
+                    self.sets.push(msg.clone());
+                } else {
+                    // The store now holds a cookie the log does not. Say so LOUDLY and once: a
+                    // silent divergence here would turn the replay into the lossy read-back this
+                    // design exists to avoid. The bound STAYS (cookie VALUES, incl.
+                    // `.ROBLOSECURITY`, must not grow without limit in the ART process); only the
+                    // respawn is given up.
+                    if self.replayable {
+                        tracing::warn!(
+                            target: "android.webkit.CookieManager",
+                            cap = Self::CAP,
+                            "the webview cookie log hit its bound — it can no longer reproduce the \
+                             engine's cookie store, so the app-UA respawn is now REFUSED for this \
+                             boot (§6 2026-07-16 respawn). Honest degradation: the engine keeps the \
+                             User-Agent it booted with."
+                        );
+                    }
+                    self.replayable = false;
+                }
+            }
+            // `delete_cookies(NULL, NULL)` = "If |url| is NULL all cookies for all hosts and
+            // domains will be deleted" (pinned bindings). The engine applies frames in send order
+            // (one socket, one pump thread), so truncating at the send point mirrors the engine
+            // applying the clear at that same point in that same order. Without this, a replay would
+            // RESURRECT cookies the app deliberately cleared.
+            ConsumerMsg::CookiesClear { .. } => self.sets.clear(),
+            // Read-only: `visit_url_cookies` "Visit a subset of cookies" (pinned bindings) cannot
+            // change the store, so a get is not part of the transcript.
+            ConsumerMsg::CookieGet { .. } => {}
+            _ => {}
+        }
+    }
+
+    /// Retire the log: a browser now exists on this helper (2026-07-16, the §6 respawn).
+    ///
+    /// Two independent reasons, and they land on the same line:
+    /// 1. **Correctness** — from the first `CreateView` a network `Set-Cookie` response header can
+    ///    populate the store, and no log Eclipse keeps can transcribe that. The empty-store lemma
+    ///    stops holding, so a replay would silently lose cookies.
+    /// 2. **Bound** — a live view means the respawn is forbidden anyway ([`respawn_verdict`]'s
+    ///    live-view guard: replacing the helper would destroy the app's browser). Holding the app's
+    ///    cookie VALUES (incl. the `.ROBLOSECURITY` auth token) in the ART process for the rest of
+    ///    the session past that point buys nothing and costs disclosure.
+    fn retire(&mut self) {
+        self.sets.clear();
+        self.replayable = false;
     }
 
     /// Does the buffer hold a 3-arg set whose `ValueCallback` is still owed the engine's REAL flag?
@@ -827,13 +959,19 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
     }
     // 2026-07-16 (plan M6, the §6 2026-07-16 💥 fix): forward the UA the app set via
     // `WebSettings.setUserAgentString` so CEF actually SENDS it. `CefSettings.user_agent` is global
-    // and fixed at `CefInitialize`, so THIS read is the boot's one chance to get it right.
+    // and fixed at `CefInitialize`, so THIS read is THIS HELPER's one chance to get it right.
     //
     // 2026-07-16 (§6 🩹➜⛔) — the ordering claim that stood here ("the spawn is lazy, it happens on
     // the first load-drive, AFTER the app configures its WebView, so the ordering works") was
     // DISPROVED by the live boot: a COOKIE op cold-started the helper 61 s BEFORE
     // setUserAgentString. `EarlyCookies` is what makes the ordering actually hold — cookie ops no
     // longer spawn the helper, so by the time this runs the app's UA is normally already set.
+    //
+    // 2026-07-16 (the §6 respawn) — and where an op genuinely still forces an early spawn (the
+    // 3-arg setCookie's REAL flag; a getCookie against a non-empty log), the first load-drive
+    // REPLACES that helper with one carrying the app's UA and replays the log into it
+    // (`maybe_respawn_for_app_ua`). So a wrong UA is no longer a lost boot — it is a bounded
+    // correction on the drive path.
     //
     // THE ENVIRONMENT, NOT ARGV, and this is the §6 🌱 provenance test applied, not a shape
     // argument. The spawn contract's operative predicate is "no secrets in argv" (§4 bans
@@ -846,10 +984,18 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
     // strictly better one exists at equal cost: /proc/PID/environ is owner-only where
     // /proc/PID/cmdline is world-readable. Choose the tighter channel — the disclosure this adds is
     // then zero, not merely "acceptable".
-    if let Some(ua) = app_user_agent() {
+    //
+    // ONE read, TWO consumers, so they cannot disagree: the env the child receives, and
+    // [`HELPER_BOOT_UA`] — which is the ONLY truthful answer to "what UA did this engine initialize
+    // with?" and therefore the ONLY sound input to the respawn decision.
+    let boot_ua = app_user_agent();
+    if let Some(ua) = &boot_ua {
         cmd.env("ECLIPSE_WEBVIEW_APP_UA", ua);
     }
-    // Past this point the helper's global CefSettings.user_agent is fixed; a later
+    if let Ok(mut slot) = HELPER_BOOT_UA.lock() {
+        *slot = boot_ua;
+    }
+    // Past this point THIS helper's global CefSettings.user_agent is fixed; a later
     // setUserAgentString is honestly WARNed rather than silently dropped (`set_app_user_agent`).
     HELPER_UA_FIXED.store(true, Ordering::Relaxed);
     // 2026-07-03 / updated 2026-07-10 (plan M5): the M5-built helper carries RUNPATH=$ORIGIN
@@ -1049,8 +1195,12 @@ fn ensure_spawned(
     java_vm: jni::vm::JavaVM,
     trigger: &str,
 ) -> Result<(), ClientError> {
-    let deferred = match slot {
-        ClientSlot::Unspawned(early) => std::mem::take(&mut early.sets),
+    // 2026-07-16 (the §6 respawn): MOVE the frames out rather than clone — `deferred` is then a
+    // local the replay loop can borrow while `send_locked` mutably borrows `slot`. They are
+    // re-installed into the Live log below, because once written they ARE the new engine's store and
+    // a later respawn must be able to replay them again.
+    let (deferred, replayable) = match slot {
+        ClientSlot::Unspawned(early) => (std::mem::take(&mut early.sets), early.replayable),
         _ => return Ok(()),
     };
     tracing::info!(
@@ -1058,10 +1208,11 @@ fn ensure_spawned(
         app_ua_known = app_user_agent().is_some(),
         deferred = deferred.len(),
         "cold-starting the eclipse-webview helper — this FIXES the engine's global \
-         CefSettings.user_agent for the whole boot (§6 2026-07-16 🩹➜⛔)"
+         CefSettings.user_agent for the whole life of THIS helper (§6 2026-07-16 🩹➜⛔; a load-drive \
+         REPLACES it if the app's UA arrived too late — `maybe_respawn_for_app_ua`)"
     );
     match spawn_client(java_vm) {
-        Ok(client) => *slot = ClientSlot::Live(client),
+        Ok(client) => *slot = ClientSlot::Live(client, EarlyCookies::new()),
         Err(e) => {
             // The deferred sets die with the latch — identical to the pre-fix behaviour, where
             // every one of them would have been a no-op on a latched slot.
@@ -1087,16 +1238,334 @@ fn ensure_spawned(
         }
         send_locked(slot, msg)?;
     }
+    // 2026-07-16 (the §6 respawn): the engine now holds exactly these frames, so the Live log must
+    // too. `replayable` rides across: a log that had already lost the ability to describe its
+    // predecessor's store must not silently regain it here. (A `send_locked` failure above latched
+    // the slot, so this no-ops and the log dies with the latch — today's behaviour.)
+    if let ClientSlot::Live(_, log) = slot {
+        log.sets = deferred;
+        log.replayable = replayable;
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The app-UA helper replacement (2026-07-16, plan M6 — the §6 respawn)
+// ---------------------------------------------------------------------------
+
+/// What [`respawn_verdict`] decided about replacing the live helper (2026-07-16, the §6 respawn).
+#[derive(Debug, PartialEq, Eq)]
+enum RespawnVerdict {
+    /// Tear the live helper down and spawn a replacement carrying the app's UA; replay the log.
+    Respawn,
+    /// Leave the live helper alone. Carries the reason, which IS the log line's `reason=` — every
+    /// arm is nameable, so no boot can leave "why didn't it respawn?" ambiguous. That is the
+    /// property the §6 ⏳ / 🩹 passes proved worth having: each named its own culprit on the first
+    /// boot.
+    Keep(&'static str),
+}
+
+/// PURE (unit-pinned): decide whether the LIVE helper must be replaced so the engine's GLOBAL
+/// `CefSettings.user_agent` carries the User-Agent the app set (2026-07-16, plan M6, the §6
+/// respawn). Every input is injected — no env read, no lock, no `JavaVM` — so all seven arms are
+/// pinned in plain `cargo test`.
+///
+/// # The guards, in order, and why each one comes BEFORE the respawn
+///
+/// * `ua_diag_forced` — `ECLIPSE_WEBVIEW_UA_DIAG` OUTRANKS the app's UA in the helper's own ladder
+///   (`engine::effective_user_agent`), so a replacement would boot the identical string.
+/// * `app_ua == None` — the app never called `setUserAgentString`. The helper's fallback literal is
+///   already the right answer (this is the `__webview-test` path: nothing changes for it, ever).
+/// * `boot_ua == app_ua` — the live helper already carries it. The normal case once the deferral
+///   holds: the load-drive spawns ONE helper, with the app's UA, and this never fires.
+/// * `live_views != 0` — a browser exists. Replacing the helper would DESTROY the app's WebView
+///   mid-flight, and the empty-store lemma no longer holds anyway (a network `Set-Cookie` can have
+///   populated the store behind the log). Measured 2026-07-16: the app's order is create →
+///   setUserAgentString → addJavascriptInterface → loadUrl, so this arm should never fire; if it
+///   does, that measurement is wrong and the design is falsified as SUFFICIENT.
+/// * `!log_replayable` — the log can no longer reproduce the store (CAP overflow / retired). A
+///   replay would silently LOSE cookies, which is the lossy read-back this design exists to avoid.
+/// * `ops_in_flight != 0` — an app `ValueCallback` or a parked `getCookie` is outstanding against
+///   the live helper. Tearing it down runs `framework::drain_all_webview_callbacks`, which answers
+///   each one `false`/`"null"`. That is ACCURATE for a helper that is GONE and WRONG for one that is
+///   being REPLACED (the replayed frame lands in the successor's store, so a `false` flag would
+///   contradict it). It is ALSO what makes the teardown deadlock-free: with the maps empty the drain
+///   early-returns and never dispatches to the main Looper.
+///
+/// Every `Keep` is strictly today's behaviour, said out loud — no arm can regress anything.
+fn respawn_verdict(
+    app_ua: Option<&str>,
+    boot_ua: Option<&str>,
+    ua_diag_forced: bool,
+    live_views: usize,
+    log_replayable: bool,
+    ops_in_flight: usize,
+) -> RespawnVerdict {
+    if ua_diag_forced {
+        return RespawnVerdict::Keep(
+            "ECLIPSE_WEBVIEW_UA_DIAG is forcing a diagnostic User-Agent, which OUTRANKS the app's \
+             in the helper's own ladder — a replacement would boot the identical string",
+        );
+    }
+    let Some(app_ua) = app_ua else {
+        return RespawnVerdict::Keep(
+            "the app never called WebSettings.setUserAgentString — the helper's fallback \
+             User-Agent is already the right answer",
+        );
+    };
+    if boot_ua == Some(app_ua) {
+        return RespawnVerdict::Keep(
+            "the live helper already booted with the User-Agent the app set — nothing to correct",
+        );
+    }
+    if live_views != 0 {
+        return RespawnVerdict::Keep(
+            "a WebView already has a browser — replacing the helper would DESTROY it, and a \
+             network Set-Cookie may have populated the store behind the log; degrading to the \
+             User-Agent the engine booted with (the pre-respawn behaviour, said out loud)",
+        );
+    }
+    if !log_replayable {
+        return RespawnVerdict::Keep(
+            "the cookie log can no longer reproduce the engine's store (bound reached, or a \
+             browser retired it) — a replay would silently LOSE cookies, which is exactly the \
+             lossy read-back this design refuses",
+        );
+    }
+    if ops_in_flight != 0 {
+        return RespawnVerdict::Keep(
+            "an app cookie operation is still in flight against the live helper — tearing it down \
+             would answer that ValueCallback false for a cookie the replay then sets",
+        );
+    }
+    RespawnVerdict::Respawn
+}
+
+/// How long the respawn lets the OLD helper exit before killing it (2026-07-16, the §6 respawn).
+///
+/// The old helper has NO views, so `engine::shutdown_state`'s `if st.views.is_empty() { return
+/// Some((exit_code, true)) }` fires on the very next pump iteration — the clean path, which runs
+/// `cef_shutdown()` and therefore tears down CEF's own child processes. 3 s is ~20x the expected
+/// cost and exists only so a wedged helper cannot park the load-drive forever; the drive already
+/// tolerates up to [`SPAWN_RESULT_TIMEOUT`] (15 s).
+const RESPAWN_TEARDOWN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Count of app operations outstanding against the live helper (2026-07-16, the §6 respawn):
+/// framework-retained `ValueCallback`s plus parked blocking `getCookie` waiters.
+/// [`respawn_verdict`] refuses a teardown while any is nonzero.
+///
+/// Lock order — AUDITED 2026-07-16, because this is called UNDER [`CLIENT`] and both locks it takes
+/// are also touched by the reader and by JNI threads. Every other site takes them in a scope that
+/// ENDS before any [`CLIENT`] acquisition: `cookie_get_blocking` registers its waiter and releases
+/// before `send_with_lazy_spawn`; the reader removes a waiter and releases before `tx.send`;
+/// `framework.rs`'s three registries are each locked in a block that closes before the `client::`
+/// call that follows. Nothing anywhere takes a waiter/registry lock and THEN [`CLIENT`], so the
+/// order is one-directional (CLIENT → these) and no inversion is possible.
+fn ops_in_flight() -> usize {
+    let parked = shared()
+        .cookie_get_waiters
+        .lock()
+        .map(|w| w.len())
+        .unwrap_or(0);
+    crate::framework::webview_callbacks_in_flight() + parked
+}
+
+/// Replace the live helper with one carrying the User-Agent the app set, replaying the cookie log
+/// into it (2026-07-16, plan M6 — the §6 respawn). Returns `true` when it did.
+///
+/// # Why this is a REPLACEMENT and not a correction (CLAUDE.md's no-workaround rule)
+///
+/// The engine's User-Agent is `CefSettings.user_agent`, which is GLOBAL and consumed by
+/// `CefInitialize` (pinned bindings: *"Value that will be returned as the User-Agent HTTP header"*).
+/// An engine that initialized with the wrong one is, permanently, an engine configured wrongly — and
+/// `cef_shutdown` is documented *"Do not call any other CEF functions after calling this function"*,
+/// so it cannot even be re-initialized in place. CDP's `Emulation.setUserAgentOverride` would leave
+/// it wrong and paper over the symptom in the renderer ("changes behavior to avoid the problem").
+/// This instead makes the engine that serves the app's WebView the engine the app configured, which
+/// is the actual mechanism, corrected at its source. The cost is one extra `CefInitialize` (~122 ms
+/// measured) on the drive path, paid once, only on a boot that reaches a challenge.
+///
+/// # The lock discipline — the reason this is three phases and not one
+///
+/// The old helper's reader thread takes [`CLIENT`] on EOF ([`reader_fatal`]), so the teardown MUST
+/// NOT hold it: joining under the lock is a guaranteed hang. But releasing it naively opens a window
+/// in which another thread could spawn a SECOND helper while the first is still alive — and CEF's
+/// documented process singleton on `root_cache_path` (which `build_settings_with_ua` leaves empty,
+/// so it is the shared `~/.config/cef_user_data` default) means the second `CefInitialize` would EXIT
+/// EARLY: *"only a single app instance is allowed to run for a given CefSettings.root_cache_path
+/// value… Client apps should therefore check the cef_initialize() return value for early exit"*
+/// (`_cef_browser_process_handler_t::on_already_running_app_relaunch`, pinned bindings). So phase 1
+/// parks the slot in a `Failed` latch — which no code path can spawn out of — and phase 3 lifts it.
+/// A stale reader that wakes inside the window finds a non-`Live` slot and quietly exits, exactly as
+/// it does after a deliberate [`shutdown`] ([`reader_fatal`]'s existing else-arm), so it can neither
+/// latch nor kill its successor.
+fn maybe_respawn_for_app_ua() -> bool {
+    // ---- Phase 1: decide and detach, UNDER the lock. ----
+    let (old, log) = {
+        let mut slot = match CLIENT.lock() {
+            Ok(s) => s,
+            Err(_) => return false, // poisoned: the drive's own lock take reports it honestly
+        };
+        let ClientSlot::Live(_, log) = &*slot else {
+            // Unspawned: `ensure_spawned` is about to spawn with the app's UA anyway — there is
+            // nothing to replace. Failed: the drive's latch check has already reported it.
+            return false;
+        };
+        let app_ua = app_user_agent();
+        let boot_ua = helper_boot_ua();
+        let verdict = respawn_verdict(
+            app_ua.as_deref(),
+            boot_ua.as_deref(),
+            ua_diag_forced(),
+            LIVE_VIEWS.load(Ordering::Relaxed),
+            log.replayable,
+            ops_in_flight(),
+        );
+        match verdict {
+            RespawnVerdict::Keep(reason) => {
+                // Named on EVERY boot, at INFO, including the healthy "nothing to correct" case:
+                // the §6 ⏳/🩹 passes were cheap precisely because the instrument spoke on the first
+                // boot. A silent no-op here would cost the next session a whole boot.
+                tracing::info!(
+                    target: "android.webkit.WebSettings",
+                    reason,
+                    app_ua_known = app_ua.is_some(),
+                    "webview client: NOT replacing the helper for the app's User-Agent"
+                );
+                return false;
+            }
+            RespawnVerdict::Respawn => {}
+        }
+        let ClientSlot::Live(old, log) = std::mem::replace(
+            &mut *slot,
+            ClientSlot::Failed(RESPAWN_IN_PROGRESS.to_string()),
+        ) else {
+            // Unreachable: the borrow above proved `Live` and the lock has not been released.
+            return false;
+        };
+        // No engine exists from here until phase 3's successor spawns, so a `setUserAgentString`
+        // landing in the window CAN still reach it — `spawn_helper_process` re-reads the store.
+        // Leaving this true would make `set_app_user_agent` warn about a fix that is in progress.
+        HELPER_UA_FIXED.store(false, Ordering::Relaxed);
+        tracing::info!(
+            target: "android.webkit.WebSettings",
+            boot_ua = boot_ua.as_deref().unwrap_or("<the Eclipse fallback literal>"),
+            app_ua = app_ua.as_deref().unwrap_or(""),
+            logged_sets = log.sets.len(),
+            "webview client: REPLACING the eclipse-webview helper so the engine presents the \
+             User-Agent the app set via WebSettings.setUserAgentString — CefSettings.user_agent is \
+             global and consumed by CefInitialize, so an engine that booted on the wrong one can \
+             only be replaced, never corrected (§6 2026-07-16 respawn). The old helper never \
+             created a browser, so its cookie store is EXACTLY the logged frames; they replay into \
+             the replacement verbatim."
+        );
+        (old, log)
+    }; // <<< CLIENT RELEASED HERE — the teardown below must not hold it.
+
+    // ---- Phase 2: tear the old helper down, WITHOUT the lock. ----
+    teardown_replaced_helper(old);
+
+    // ---- Phase 3: hand the log to the deferral, UNDER the lock. ----
+    // Guarded BY VALUE: if a real failure raced the swap (a deliberate `shutdown`), that reason WINS
+    // and the log dies with it — never resurrect a helper nobody wants.
+    if let Ok(mut slot) = CLIENT.lock() {
+        if matches!(&*slot, ClientSlot::Failed(r) if r == RESPAWN_IN_PROGRESS) {
+            *slot = ClientSlot::Unspawned(log);
+            return true;
+        }
+        tracing::warn!(
+            "webview client: the helper replacement was overtaken (a shutdown raced the swap) — \
+             the cookie log is dropped and the winning state stands"
+        );
+    }
+    false
+}
+
+/// Tear down the helper a respawn is replacing (2026-07-16, the §6 respawn). Called with NO locks
+/// held (see [`maybe_respawn_for_app_ua`]'s phase 2).
+///
+/// Deliberately NOT a call to [`shutdown`]: that one latches the slot permanently, takes `&Vm` (a
+/// main-thread proof this path cannot produce — a load-drive runs on whatever thread the app calls
+/// `loadUrl` from), and pumps the main Looper while joining the upcall thread. Here the slot is
+/// already parked, and the pump is unnecessary BY THE QUIESCENCE GUARD: [`respawn_verdict`] refused
+/// unless every ValueCallback map was empty, so the upcall thread's exit drain hits
+/// `framework::drain_all_webview_callbacks`'s all-empty early return and never dispatches to main.
+///
+/// The reader IS joined (it must be: an unjoined reader could still be inside [`reader_fatal`] when
+/// the successor goes `Live`, and it cannot tell the two apart). The upcall thread is NOT — it is
+/// detached by dropping its handle. Joining it would park this thread against a thread that may park
+/// on main, and it has nothing left to do: the reader's exit drops the channel sender, so its loop
+/// ends, its (empty) drain early-returns, and it exits on its own. Nothing is dropped.
+///
+/// The child is fully REAPED (`wait()` returns) before this function does. That is load-bearing, not
+/// hygiene: the successor's `CefInitialize` must not race the old process's singleton lock.
+fn teardown_replaced_helper(mut old: Client) {
+    ACTIVE_VIEW.store(0, Ordering::Relaxed);
+    if let Ok(bytes) = ConsumerMsg::Shutdown.encode() {
+        let _ = (&mut &old.writer).write_all(&bytes);
+    }
+    let t0 = Instant::now();
+    let mut exit: Option<i32> = None;
+    while t0.elapsed() < RESPAWN_TEARDOWN_DEADLINE {
+        match old.child.try_wait() {
+            Ok(Some(status)) => {
+                exit = status.code();
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+    let killed = exit.is_none();
+    if killed {
+        let _ = old.child.kill();
+        if let Ok(status) = old.child.wait() {
+            exit = status.code();
+        }
+    }
+    // Bounded: the child is dead, so the reader's next read is EOF; its `reader_fatal` finds the
+    // parked non-`Live` slot, takes the quiet debug arm, and returns.
+    let reader_joined = old.reader.take().map(|h| h.join().is_ok()).unwrap_or(false);
+    drop(old.upcall.take()); // detach — see the fn doc
+    if killed || !reader_joined {
+        // A helper that had to be SIGKILLed may leave CEF child processes briefly alive, and they
+        // hold the same root_cache_path process singleton the successor is about to need. Say so: if
+        // the successor then fails to initialize, this line is the explanation.
+        tracing::warn!(
+            killed,
+            reader_joined,
+            helper_exit = exit,
+            "webview client: the replaced helper did not exit cleanly — its CEF children may still \
+             hold the root_cache_path process singleton, which can make the replacement's \
+             CefInitialize exit early (pinned bindings: \"only a single app instance is allowed to \
+             run for a given CefSettings.root_cache_path value\")"
+        );
+    } else {
+        tracing::info!(
+            helper_exit = exit,
+            "webview client: the replaced helper exited cleanly (no views ⇒ cef_shutdown ran ⇒ its \
+             CEF children and the process singleton are released)"
+        );
+    }
 }
 
 /// The io thread's spawn/handshake verdict: writer + child + the upcall-thread handle.
 type SpawnVerdict = Result<(UnixStream, Child, JoinHandle<()>), ClientError>;
 
-/// The ThreadId of the one `eclipse-webview-io` thread (set once — the client never respawns).
-/// The [`cookie_get_blocking`] boundary assertion checks it: a blocking wait ON the reader thread
-/// can never be answered (the reply's only reader is the parked caller itself). 2026-07-09.
-static IO_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+/// The ThreadId of the CURRENT `eclipse-webview-io` thread. The [`cookie_get_blocking`] boundary
+/// assertion checks it: a blocking wait ON the reader thread can never be answered (the reply's only
+/// reader is the parked caller itself). 2026-07-09.
+///
+/// 2026-07-16 (the §6 respawn) — WAS a `OnceLock`, on the recorded reasoning "set once — the client
+/// never respawns". THAT IS NO LONGER TRUE, and a `OnceLock` would leave the guard SILENTLY DEAD: it
+/// would pin the FIRST (now exited) io thread's id forever, so the check could never match the
+/// CURRENT io thread and a future io-thread `getCookie` — exactly what it exists to catch — would
+/// sail through into the guaranteed self-stall it is there to prevent. (It could NOT go the other
+/// way: `std::thread::ThreadId` is a monotonic std-owned counter — *"ThreadIds are guaranteed not to
+/// be reused, even when a thread terminates"*, std `thread/id.rs` — so a stale id can never
+/// false-positive onto a live thread.) Overwritten by each io thread at entry; the respawn joins the
+/// old reader before spawning the new one, so the two writes cannot race.
+static IO_THREAD_ID: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
 /// The `eclipse-webview-io` thread body: spawn + handshake, spawn the upcall thread, report, then
 /// become the read loop. On ANY read-loop exit (crash/EOF/protocol error or a deliberate
@@ -1104,7 +1573,9 @@ static IO_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
 /// whose channel sender drops here — drain the pending ValueCallbacks honestly (2026-07-09 fix:
 /// neither happened before, leaking the JNI globals and stalling parked getters the full timeout).
 fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm: jni::vm::JavaVM) {
-    let _ = IO_THREAD_ID.set(std::thread::current().id());
+    if let Ok(mut id) = IO_THREAD_ID.lock() {
+        *id = Some(std::thread::current().id());
+    }
     let (stream, mut child, probe) = match spawn_helper_process() {
         Ok(x) => x,
         Err(e) => {
@@ -1657,13 +2128,13 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender
 fn reader_fatal(reason: &str) {
     ACTIVE_VIEW.store(0, Ordering::Relaxed);
     if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_)) {
+        if matches!(&*slot, ClientSlot::Live(_, _)) {
             tracing::warn!(
                 reason,
                 "eclipse-webview client: helper connection lost — latching the honest no-op \
                  path (no respawn; subsequent WebView loads degrade to the one-shot WARN)"
             );
-            if let ClientSlot::Live(client) =
+            if let ClientSlot::Live(client, _log) =
                 std::mem::replace(&mut *slot, ClientSlot::Failed(reason.to_string()))
             {
                 let mut child = client.child;
@@ -1684,7 +2155,7 @@ fn send_reply_if_live(msg: &ConsumerMsg) -> bool {
     };
     match CLIENT.lock() {
         Ok(slot) => match &*slot {
-            ClientSlot::Live(c) => (&mut &c.writer).write_all(&bytes).is_ok(),
+            ClientSlot::Live(c, _) => (&mut &c.writer).write_all(&bytes).is_ok(),
             _ => true,
         },
         Err(_) => false,
@@ -1741,7 +2212,7 @@ fn record_view(views: &mut HashMap<i64, ViewShared>, widget: i64, driven_url: St
 fn send_locked(slot: &mut ClientSlot, msg: &ConsumerMsg) -> Result<(), ClientError> {
     let bytes = msg.encode().map_err(ClientError::Encode)?;
     let write_result = match &*slot {
-        ClientSlot::Live(c) => (&mut &c.writer).write_all(&bytes),
+        ClientSlot::Live(c, _) => (&mut &c.writer).write_all(&bytes),
         _ => return Err(ClientError::Internal("send on a non-live client slot")),
     };
     if let Err(e) = write_result {
@@ -1751,7 +2222,7 @@ fn send_locked(slot: &mut ClientSlot, msg: &ConsumerMsg) -> Result<(), ClientErr
             "eclipse-webview client: latching the honest no-op path (no respawn)"
         );
         ACTIVE_VIEW.store(0, Ordering::Relaxed);
-        if let ClientSlot::Live(client) =
+        if let ClientSlot::Live(client, _log) =
             std::mem::replace(slot, ClientSlot::Failed(reason.clone()))
         {
             let mut child = client.child;
@@ -1784,6 +2255,13 @@ fn drive(
     width: u16,
     height: u16,
 ) -> Result<(), ClientError> {
+    // 2026-07-16 (plan M6, the §6 respawn): BEFORE the drive takes CLIENT, because tearing the old
+    // helper down must NOT hold it (its reader takes CLIENT on EOF — `reader_fatal`). A no-op unless
+    // a live helper booted with the WRONG User-Agent and every guard passes; it parks the slot
+    // itself, so the window is inert. Measured 2026-07-16: the app calls setUserAgentString ~110 µs
+    // before this, and ~30–60 s AFTER a cookie op has already cold-started the helper.
+    let respawned = maybe_respawn_for_app_ua();
+
     let mut slot = CLIENT
         .lock()
         .map_err(|_| ClientError::Internal("client lock poisoned"))?;
@@ -1793,7 +2271,12 @@ fn drive(
     ensure_spawned(
         &mut slot,
         java_vm,
-        "WebView load-drive (loadUrl/loadDataWithBaseURL) — the app's UA is final",
+        if respawned {
+            "WebView load-drive after the app-UA helper replacement — replaying the cookie log into \
+             an engine that carries the User-Agent the app set"
+        } else {
+            "WebView load-drive (loadUrl/loadDataWithBaseURL) — the app's UA is final"
+        },
     )?;
     // The driven URL for the upcall contract: the URL itself, or the loadData base (the installed
     // Java hardcodes "about:blank" on the loadData route — the Android semantics for a null base).
@@ -1813,6 +2296,14 @@ fn drive(
     };
     if is_new {
         LIVE_VIEWS.fetch_add(1, Ordering::Relaxed);
+        // 2026-07-16 (the §6 respawn): a browser is about to exist. From here a network Set-Cookie
+        // can populate the store behind the log, so the log stops being a faithful transcript — AND
+        // `respawn_verdict`'s live-view guard forbids any future replacement anyway. Retire it at
+        // the earliest honest point rather than holding the app's cookie VALUES (incl. the
+        // .ROBLOSECURITY auth token) in the ART process for the rest of the session.
+        if let ClientSlot::Live(_, log) = &mut *slot {
+            log.retire();
+        }
     }
     // Record BEFORE any send: from here a LoadState for this widget resolves to a driven view.
     ACTIVE_VIEW.store(widget, Ordering::Relaxed);
@@ -1987,15 +2478,25 @@ fn send_with_lazy_spawn(
                 reason = why,
                 "an early op is forcing the eclipse-webview helper to start BEFORE the app has \
                  configured its WebView — CefSettings.user_agent is GLOBAL and consumed by \
-                 CefInitialize, so this boot's engine will present Eclipse's FALLBACK User-Agent, \
-                 not the app's, and the page's own bridge selector will not fire (§6 2026-07-16 \
-                 🏆/💥). Honest degradation — the pre-2026-07-16 behaviour, said out loud."
+                 CefInitialize, so THIS engine will present Eclipse's FALLBACK User-Agent, not the \
+                 app's (§6 2026-07-16 🏆/💥). 2026-07-16 (§6 respawn): no longer a lost boot — the \
+                 first load-drive REPLACES this helper with one carrying the app's UA and replays \
+                 the cookie log into it. The cost is one wasted CefInitialize (~122 ms), paid here, \
+                 refunded there."
             );
             ensure_spawned(&mut slot, java_vm, why)?;
         }
         None => {} // already Live
     }
-    send_locked(&mut slot, msg).map(|()| SendOutcome::Sent)
+    let outcome = send_locked(&mut slot, msg).map(|()| SendOutcome::Sent)?;
+    // 2026-07-16 (the §6 respawn): the frame is now IN the live engine's store, so the log — which
+    // must keep describing that store — records it here, and ONLY here. This is the cookie/bridge/
+    // eval entry point; `send_locked`'s other callers carry per-event hot-path frames
+    // (MouseMove/Key/FrameAck) that can never touch a cookie store, so the hot path pays nothing.
+    if let ClientSlot::Live(_, log) = &mut *slot {
+        log.record_sent(msg);
+    }
+    Ok(outcome)
 }
 
 /// Register (or re-register) an `addJavascriptInterface(object, name)` bridge on `widget`. The
@@ -2140,7 +2641,7 @@ pub fn cookie_get_blocking(
     // reply's only reader is the parked caller itself. App-code upcalls now run on the dedicated
     // upcall thread, so this cannot happen; if a future change re-introduces an io-thread JNI
     // upcall, fail fast + loud instead of a guaranteed self-stall for the full timeout.
-    if IO_THREAD_ID.get() == Some(&std::thread::current().id()) {
+    if IO_THREAD_ID.lock().ok().and_then(|id| *id) == Some(std::thread::current().id()) {
         tracing::warn!(
             "cookie_get_blocking called ON the eclipse-webview-io thread — the reply could never \
              be delivered; serving the honest empty list immediately (fix the caller: app-code \
@@ -2245,7 +2746,7 @@ pub fn with_latest_frame<R>(view: i64, f: impl FnOnce(&Stage) -> R) -> Option<R>
 /// must never crash or log per-event).
 fn send_input(msg: &ConsumerMsg) {
     if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_)) {
+        if matches!(&*slot, ClientSlot::Live(_, _)) {
             let _ = send_locked(&mut slot, msg);
         }
     }
@@ -2341,7 +2842,7 @@ pub fn notify_view_freed(widget: i64) {
         "webview client: driven WebView finalized — sending CloseView (helper stays alive)"
     );
     if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_)) {
+        if matches!(&*slot, ClientSlot::Live(_, _)) {
             let _ = send_locked(&mut slot, &ConsumerMsg::CloseView { view: widget });
         }
     }
@@ -2378,7 +2879,7 @@ pub fn notify_view_detached(widget: i64) {
          released; ViewClosed completes teardown)"
     );
     if let Ok(mut slot) = CLIENT.lock() {
-        if matches!(&*slot, ClientSlot::Live(_)) {
+        if matches!(&*slot, ClientSlot::Live(_, _)) {
             let _ = send_locked(&mut slot, &ConsumerMsg::CloseView { view: widget });
         }
     }
@@ -2489,7 +2990,7 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
                 &mut *slot,
                 ClientSlot::Failed("the web engine helper was shut down".into()),
             ) {
-                ClientSlot::Live(c) => Some(c),
+                ClientSlot::Live(c, _log) => Some(c),
                 mut other => {
                     // Never-live (or already failed): keep the original state. 2026-07-16: an
                     // Unspawned slot may hold deferred cookie SETs nothing will ever replay — drop
@@ -2502,7 +3003,17 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
                             .collect();
                         early.sets.clear();
                     }
-                    *slot = other;
+                    // 2026-07-16 (the §6 respawn): a `RESPAWN_IN_PROGRESS` park is the ONE state
+                    // that must NOT be restored — this latch has to WIN. Restoring it would let
+                    // `maybe_respawn_for_app_ua`'s phase 3 match its own park value and install
+                    // `Unspawned` OVER this shutdown, so a later drive could spawn a helper after
+                    // teardown — breaking this function's own contract ("the slot latches so no
+                    // later drive respawns"). The old helper is already being reaped by phase 2, so
+                    // there is nothing here to tear down; phase 3 sees the changed reason, drops the
+                    // log, and stands down.
+                    if !matches!(&other, ClientSlot::Failed(r) if r == RESPAWN_IN_PROGRESS) {
+                        *slot = other;
+                    }
                     None
                 }
             }
@@ -3450,6 +3961,152 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["first", "second", "third"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The app-UA helper replacement (2026-07-16, the §6 respawn)
+    // -----------------------------------------------------------------------
+
+    /// The app's REAL measured User-Agent (§6 2026-07-16 💥). Shared by the pins below so no test
+    /// can assert against a UA the app does not actually send.
+    const MEASURED_APP_UA: &str = "Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; \
+                                   unknown) AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android \
+                                   App 2.724.735 Phone Hybrid()  GooglePlayStore \
+                                   RobloxApp/2.724.735 (GlobalDist; GooglePlayStore)";
+
+    #[test]
+    fn a_cookie_forced_helper_is_replaced_so_the_apps_user_agent_reaches_the_engine() {
+        // 2026-07-16 THE ROOT-CAUSE PIN (§6 respawn). THE CONFIRMED BUG, measured end to end: the
+        // app's FIRST WebView-relevant call is a cookie op at AppManager.initialize, which
+        // cold-starts the helper ~30–60 s BEFORE setUserAgentString (03:31:24.724 vs 03:32:25.912 —
+        // 61 s). CEF's `CefSettings.user_agent` is GLOBAL and consumed by CefInitialize, so that
+        // engine presented Eclipse's FALLBACK literal forever, `navigator.userAgent` carried neither
+        // `hybrid` nor `android`, the page's own selector returned nativePrefix=null, no bridge
+        // existed, and `Load generic challenge failed` fired on EVERY boot.
+        //
+        // This asserts the EXACT measured state at the load-drive: a live helper that booted with NO
+        // app UA (boot_ua=None), the app's real UA now known, no browser yet, a clean replayable
+        // log, nothing in flight. It MUST replace the helper. Revert the respawn and this fails.
+        assert_eq!(
+            respawn_verdict(Some(MEASURED_APP_UA), None, false, 0, true, 0),
+            RespawnVerdict::Respawn
+        );
+        // ...and the string it delivers must be the one that unblocks the page: the wrapper's
+        // `nativePrefix` selector requires BOTH substrings, case-insensitively (§6 🏆).
+        let lower = MEASURED_APP_UA.to_lowercase();
+        assert!(
+            lower.contains("hybrid"),
+            "the app's UA must carry the Hybrid() token"
+        );
+        assert!(
+            lower.contains("android"),
+            "the app's UA must carry the android token"
+        );
+    }
+
+    #[test]
+    fn respawn_verdict_keeps_the_live_helper_for_every_recorded_reason() {
+        // One assertion per `Keep` arm — every refusal is strictly today's behaviour, said out loud.
+        let app = Some(MEASURED_APP_UA);
+        // A forced diagnostic UA outranks the app's — a replacement boots the same string.
+        assert!(matches!(
+            respawn_verdict(app, None, true, 0, true, 0),
+            RespawnVerdict::Keep(_)
+        ));
+        // The app never set a UA: the __webview-test path — nothing changes for it, EVER.
+        assert!(matches!(
+            respawn_verdict(None, None, false, 0, true, 0),
+            RespawnVerdict::Keep(_)
+        ));
+        // Already correct.
+        assert!(matches!(
+            respawn_verdict(app, app, false, 0, true, 0),
+            RespawnVerdict::Keep(_)
+        ));
+        // A live browser: a respawn would DESTROY the app's WebView (and the lemma is broken).
+        assert!(matches!(
+            respawn_verdict(app, None, false, 1, true, 0),
+            RespawnVerdict::Keep(_)
+        ));
+        // The log cannot reproduce the store: a replay would silently lose cookies.
+        assert!(matches!(
+            respawn_verdict(app, None, false, 0, false, 0),
+            RespawnVerdict::Keep(_)
+        ));
+        // An app callback is in flight: the teardown drain would answer it wrongly (and could park
+        // main).
+        assert!(matches!(
+            respawn_verdict(app, None, false, 0, true, 1),
+            RespawnVerdict::Keep(_)
+        ));
+        // Precedence: the diag rung is checked FIRST, so it wins even over a live view.
+        assert!(matches!(
+            respawn_verdict(app, None, true, 1, true, 1),
+            RespawnVerdict::Keep(_)
+        ));
+    }
+
+    #[test]
+    fn cookie_log_records_sets_after_the_spawn_and_a_clear_truncates_it() {
+        // 2026-07-16 (§6 respawn). THE TWO OBLIGATIONS THE DESIGN OWES, pinned together because they
+        // are one invariant: the log must equal `apply(frames)` on a store whose entire content is
+        // those frames. A set after the helper spawned lands in ITS store, so it MUST be logged; and
+        // `delete_cookies(NULL, NULL)` — "If |url| is NULL all cookies for all hosts and domains
+        // will be deleted" (pinned bindings) — empties that store, so the log MUST truncate or a
+        // replay would RESURRECT cookies the app deliberately cleared.
+        let mut log = EarlyCookies::new();
+        log.record_sent(&a_cookie_set("a"));
+        log.record_sent(&a_cookie_set_cb(1));
+        assert_eq!(log.sets, vec![a_cookie_set("a"), a_cookie_set_cb(1)]);
+        // A get is read-only (`visit_url_cookies` "Visit a subset of cookies") — never a transcript
+        // entry.
+        log.record_sent(&ConsumerMsg::CookieGet {
+            request_id: 2,
+            url: "https://www.roblox.com/".into(),
+        });
+        assert_eq!(log.sets.len(), 2);
+        // The clear truncates — this is the resurrection guard.
+        log.record_sent(&ConsumerMsg::CookiesClear { request_id: 3 });
+        assert!(log.sets.is_empty());
+        assert!(
+            log.replayable,
+            "a clear leaves an EMPTY log that faithfully describes an EMPTY store"
+        );
+        // Post-clear sets rebuild the transcript from the truncation point.
+        log.record_sent(&a_cookie_set("after"));
+        assert_eq!(log.sets, vec![a_cookie_set("after")]);
+        // Lossless: the logged frame IS the app's original, expiry and all (`CookieEntry` has no
+        // expires_epoch_s — that asymmetry is why the replay must use the frame).
+        assert_eq!(log.sets[0], a_cookie_set("after"));
+    }
+
+    #[test]
+    fn cookie_log_overflow_and_retirement_refuse_the_respawn_instead_of_lying() {
+        // The bound must stay (cookie VALUES incl. .ROBLOSECURITY must not grow unbounded in ART),
+        // so on overflow the store gains a cookie the log does not — the transcript is broken and
+        // the respawn must be REFUSED, never silently degraded into the lossy replay this design
+        // rejects.
+        let mut log = EarlyCookies::new();
+        for i in 0..EarlyCookies::CAP {
+            log.record_sent(&a_cookie_set(&format!("c{i}")));
+        }
+        assert!(log.replayable);
+        log.record_sent(&a_cookie_set("overflow"));
+        assert_eq!(log.sets.len(), EarlyCookies::CAP, "the bound holds");
+        assert!(
+            !log.replayable,
+            "and the respawn is surrendered, not the bound"
+        );
+        assert!(matches!(
+            respawn_verdict(Some(MEASURED_APP_UA), None, false, 0, log.replayable, 0),
+            RespawnVerdict::Keep(_)
+        ));
+        // Retirement (a browser exists) clears AND poisons — the values must not linger for the
+        // session.
+        let mut log = EarlyCookies::new();
+        log.record_sent(&a_cookie_set("a"));
+        log.retire();
+        assert!(log.sets.is_empty() && !log.replayable);
     }
 
     #[test]
