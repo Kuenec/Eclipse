@@ -128,6 +128,41 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-17 — 🔁 RESPAWN-AND-REPLAY IS IMPLEMENTED: a helper that booted on the WRONG User-Agent is now
+  REPLACED at the first load-drive, with the app's ORIGINAL cookie frames replayed into its successor. Gate green
+  BOTH crates (root **658**+6+2 zero-SKIP / helper **41+15**); `__webview-test` **EXIT=0** marker intact, zero
+  orphans, and it provably does NOT respawn. Live challenge boot PENDING — orchestrator-only (full record: §6
+  2026-07-17 🔁).** **WHY THIS AND NOT THE ALTERNATIVES:** the panel rejected respawn-and-replay ONLY as *"strictly
+  dominated by not spawning at all"* — and §5 🔓 killed not-spawning at the `getCookie` boundary, so the domination
+  is gone; the panel's own analysis had already established the LOSSLESSNESS (replay the app's ORIGINAL
+  `CookieSet` frames, which carry `expires_epoch_s`; never round-trip the expiry-less `CookieEntry`).
+  **THE EQUIVALENCE (a theorem, not an approximation):** helper A never receives a `CreateView` (`drive` is its ONE
+  send site, and the respawn is refused when `LIVE_VIEWS != 0`) ⇒ no browser ⇒ no network `Set-Cookie` ever ran in
+  it ⇒ A's store is EXACTLY the accepted subset of the logged frames; B is a fresh process (empty `cache_path` =
+  *"incognito mode … in-memory caches"*, pinned bindings) replaying the SAME frames through the SAME CEF 149.3.0
+  validation ⇒ same subset. **THE LOG:** `EarlyCookies` now rides `Live` too — `record_sent` appends every
+  `CookieSet`/`CookieSetForResult` written to the live helper and TRUNCATES on `CookiesClear` (without which a
+  replay would RESURRECT cleared cookies); `CookieGet` is never logged (`visit_url_cookies` is read-only). It
+  REFUSES rather than lies: CAP-overflow or `retire()` (a browser exists) clears `replayable`, and every refusal is
+  a named `Keep` arm at INFO. **SIX GUARDS, all pure/unit-pinned** (`respawn_verdict`): diag-forced · no app UA
+  (**the `__webview-test` path — nothing changes for it, EVER**, verified live) · already-correct · **live view**
+  (a respawn would DESTROY the app's WebView) · unusable log · **not quiescent** (the teardown drain would answer a
+  ValueCallback `false` for a cookie the replay sets — and an empty drain is what keeps the teardown
+  deadlock-free). **THREE-PHASE LOCK DISCIPLINE:** the old reader takes `CLIENT` on EOF, so phase 2 must NOT hold
+  it — phase 1 parks the slot in a `Failed(RESPAWN_IN_PROGRESS)` latch (nothing can spawn out of it, so CEF's
+  `root_cache_path` process singleton can never see two live engines), phase 2 tears down + fully REAPS without the
+  lock, phase 3 lifts the park by VALUE. **⚠️ THE PRE-DECLARED FALSIFIER — CEF'S PROCESS SINGLETON, which the panel
+  never saw:** `build_settings_with_ua` leaves BOTH `cache_path` and `root_cache_path` empty ⇒ the shared
+  `~/.config/cef_user_data` default ⇒ *"only a single app instance is allowed to run for a given
+  CefSettings.root_cache_path value… Client apps should therefore check the cef_initialize() return value for early
+  exit"* (pinned `on_already_running_app_relaunch`). If B's `CefInitialize` early-exits, the design is falsified AS
+  CORRECT (the boot then has NO WebView where today it has a wrong-UA one — phase 1 is a point of no return) and
+  the escalation is an explicit per-boot `root_cache_path`, argued separately, NOT waved through. **⇐
+  START-HERE-NEXT — THE LIVE CHALLENGE BOOT (owner, dev-host main thread; the ONLY thing not done):**
+  `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1 ECLIPSE_WEBVIEW_CONSOLE=1` with **`ECLIPSE_WEBVIEW_UA_DIAG` UNSET** ⇒ PASS =
+  `REPLACING the eclipse-webview helper` ≥1, `honoring the User-Agent the app set` ≥1 carrying `Hybrid()`,
+  `ECLIPSE-STUB invoke` ≥1, `bridge call received` ≥1, **`Load generic challenge failed` = 0**, `CefInitialize
+  failed` = 0, `did not exit cleanly` = 0, Looper throws/ULE/NPE 0, `pgrep -x eclipse-webview` = 0 (BOTH helpers).
 - **2026-07-16 — ⏳ THE 🩹➜⛔ ORDERING IS FIXED IN CODE: **NO COOKIE OP CAN COLD-START THE ENGINE ANY MORE.** The
   helper spawn is DEFERRED past the early cookie ops — which are answered from the PROVABLY-empty session store or
   buffered as raw frames — so `CefInitialize` now waits for the load-drive, 110 µs after the app sets its UA. Gate
@@ -228,6 +263,39 @@ before any history-rewriting/force operation.
   **`Load generic challenge failed` = 0**, plus the new `honoring the User-Agent the app set …` INFO carrying the
   `Hybrid()` token — i.e. challenge26's forced-token result reproduced with NOTHING forced. After that the only
   gap to a completed login is **real credentials**.
+- **2026-07-17 — 🎉🎉 **M6 CORE MECHANISM COMPLETE — THE CHALLENGE WORKS END-TO-END WITH NOTHING FORCED.** The
+  app's OWN User-Agent now reaches the engine, the page's bridge selector fires, and the challenge COMPLETES and
+  delivers its result to the app. `Load generic challenge failed` = **0** with `ECLIPSE_WEBVIEW_UA_DIAG` UNSET
+  (full record: §6 2026-07-17 🎉).** **THE FIX — respawn-and-replay:** when the first load-drive arrives (~110 µs
+  after `setUserAgentString`) and the live helper booted with a DIFFERENT UA and no browser exists yet, Eclipse
+  tears that helper down, spawns a replacement with the app's UA, and replays the app's **ORIGINAL** `CookieSet`
+  frames into it. **Why it is correct, not approximate:** helper A never received a `CreateView`, so no network
+  `Set-Cookie` ever ran in it ⇒ A's store is EXACTLY the accepted subset of the logged frames ⇒ B, replaying the
+  SAME original frames through the SAME CEF validation, lands the SAME subset — `store(B) = apply(L, ∅) =
+  store(A)`. **Lossless** because the app's original frame carries `expires_epoch_s`; the read-back `CookieEntry`
+  does NOT — that asymmetry is the whole reason this shape works and read-back+replay was rightly refused. **A
+  second `CefInitialize` in one process is FORBIDDEN** (pinned binding: *"Do not call any other CEF functions
+  after calling this function"*) — which is why the replacement is a new PROCESS, and why this was only possible
+  **because the engine was already out-of-process** (the M2 architecture paying off years-deep). **🎯 THE LIVE
+  RESULT (`/tmp/eclipse-challenge31-respawn.log`, EXIT=124, NOTHING forced):** `REPLACING the eclipse-webview
+  helper` **1** · `honoring the User-Agent the app set … ua=Mozilla/5.0 (0MB; 960x540; …) … ROBLOX Android App
+  2.724.735 Phone **Hybrid()** …` **1** · `ECLIPSE-STUB invoke` **4** · `bridge call received` **4**
+  (`executeRoblox`, arg_lens 219/211/221/**738**) · page console `challengePageLoaded` → `challengeParsed` →
+  `challengeInitialized` → **`challengeCompleted`** · **`Load generic challenge failed` = 0** (was **1 on EVERY
+  boot for the entire project**) · `CefInitialize failed` **0** · `did not exit cleanly` **0** · Looper throws
+  **0** · ULE **0** · NPE **0** · orphans **0** (BOTH helpers gone). **THE PRE-DECLARED PRIMARY FALSIFIER DID NOT
+  FIRE:** CEF's process singleton (both cache paths empty ⇒ shared `~/.config/cef_user_data`; *"only a single app
+  instance is allowed to run for a given root_cache_path"*) — A's views-empty clean close ⇒ real `cef_shutdown()`
+  ⇒ the lock released before B initialized, exactly as designed. That hazard was found by the design pass and
+  named BEFORE the boot; it is the reason A must be fully `wait()`ed before B spawns. Gate: root **658**+6+2
+  (+4 pins; **12 mutations negative-tested**), helper **41+15 UNCHANGED** (the whole fix is main-process),
+  `PROTO_VERSION` still **2**, `classes2.dex` byte-identical, `__webview-test` EXIT=0 marker intact and provably
+  does NOT respawn (it never sets a UA). ⇐ **START-HERE-NEXT: the remaining gap to a COMPLETED LOGIN is REAL
+  CREDENTIALS** — the synthetic password is fake, so the post-challenge `v2/login` still 403s on credentials, not
+  on Eclipse. Also open (unchanged, all owner-facing): §7 #1 vendor reception by a real human, #4 LTS-vs-stable
+  cadence, #5 payload sign-off. Recorded divergences carried: `apply` not proved deterministic (CEF's *"or if
+  cookies cannot be accessed"* race); expiry crossing the ~300 ms swap; the microsecond quiescence race (it
+  announces itself); the `RESPAWN_IN_PROGRESS` park's honest degradation.
 - **2026-07-16 — 🔓 CANDIDATE (b) IS DEAD AT THE `getCookie` BOUNDARY — **AND THAT REOPENS RESPAWN-AND-REPLAY,
   WHICH THE PANEL REJECTED ONLY BECAUSE IT WAS "DOMINATED BY NOT SPAWNING AT ALL". NOT-SPAWNING JUST DIED.** The
   surviving lever is now identified, and the panel already proved it lossless (full record: §6 2026-07-16 🔓).**
@@ -9230,6 +9298,211 @@ on the SUCCESS path, which is why it is recorded here rather than left for a fut
 clear + the two falsified comments replaced + 5 pins), `src/framework.rs`
 (`web_view_cookie_manager_remove_impl` only), `src/webview/mod.rs` (spawn contract §8 — the falsified ordering
 sentence), this file (§5 ⏳ bullet + §6 this entry). **No helper-crate change. No proto change.**
+
+---
+
+### 2026-07-17 — 🔁 RESPAWN-AND-REPLAY implemented: a helper that booted on the wrong User-Agent is REPLACED at the first load-drive and the app's ORIGINAL cookie frames replay into its successor. Two of the approved design's own load-bearing claims were FALSIFIED by verification and fixed.
+
+*Root cause (confirmed §6 💥/🏆/⏳, not re-litigated):* the page's `nativePrefix` selector needs BOTH `hybrid` and
+`android` in `navigator.userAgent`; the app sets exactly such a UA ~110 µs before its first `loadUrl`; Eclipse now
+honors it — but `CefSettings.user_agent` is GLOBAL and consumed by `CefInitialize`, and an op that genuinely needs
+CEF (the 3-arg `setCookie`'s REAL flag; a `getCookie` against a non-empty log) can still cold-start the helper
+~30–60 s EARLIER. That engine is then permanently misconfigured. **§5 🔓 killed the last "just don't spawn"
+option**, so the surviving lever is to REPLACE the engine — which is also the only honest one: `cef_shutdown` is
+documented *"Do not call any other CEF functions after calling this function"*, so an engine cannot be
+re-initialized in place, and CDP's `Emulation.setUserAgentOverride` would leave the global wrong and paper over the
+symptom in the renderer (CLAUDE.md's *"changes behavior to avoid the problem"*).
+
+*The equivalence argument — a theorem with its holes NAMED.* A never receives a `CreateView` (`drive` is its ONE
+send site; the respawn is refused when `LIVE_VIEWS != 0`) ⇒ no browser ⇒ route (b) into a cookie store (a
+`Set-Cookie` header) never runs ⇒ A's content is entirely route (a), `set_cookie`, whose ONLY helper callers are
+the two `CookieSet*` handlers (`engine.rs:931`/`1376`, grep-verified). B starts at ∅ (pinned `cache_path`: *"If
+this value is empty then browsers will be created in \"incognito mode\" where in-memory caches are used for
+storage"*) and replays the SAME original frames through the SAME CEF 149.3.0 validation ⇒ same accepted subset.
+**Where it does NOT reach, stated:** `apply` is not proved deterministic (`set_cookie` returns false *"if an
+invalid URL is specified **or if cookies cannot be accessed**"* — the second clause is a race, and
+`classify_cookie_set_rejection`'s catch-all is literally that case; both MEASURED rejections were the deterministic
+URL class, but I do not claim the class is closed); an expiry falling inside the swap window diverges; a callback
+registered between the quiescence read and A's exit drain gets a wrong `false` (microseconds, unobserved, and it
+ANNOUNCES itself via `cookie_set_pending=N` in A's drain WARN).
+
+*⚠️ TWO OF THE APPROVED DESIGN'S LOAD-BEARING CLAIMS WERE FALSIFIED BY VERIFICATION — the §6 error class caught
+BEFORE shipping this time, which is the point of verifying a design instead of transcribing it.*
+1. **The `IO_THREAD_ID` `OnceLock → Mutex` rationale was FACTUALLY WRONG.** The design said a `OnceLock` would pin
+   a dead thread's id and *"the OS may RECYCLE that id onto an unrelated thread — a legitimate `getCookie` from
+   that thread would then false-positive the boundary check and be served a WRONG empty cookie list."* **Rust
+   forbids that:** `std::thread::ThreadId` is a std-owned monotonic `AtomicU64` counter — *"`ThreadId`s are
+   guaranteed not to be reused, even when a thread terminates. `ThreadId`s are under the control of Rust's standard
+   library and there may not be any relationship between `ThreadId` and the underlying platform's notion of a
+   thread identifier"* (`std/src/thread/id.rs`, read this pass). A stale id can NEVER false-positive onto a live
+   thread. **The change is still required — for the OPPOSITE failure mode:** a `OnceLock` pins the FIRST (now
+   exited) io thread's id, so after a respawn the check can never match the CURRENT io thread and the guard goes
+   SILENTLY DEAD (a false NEGATIVE — an io-thread `getCookie` would sail into the guaranteed self-stall the
+   assertion exists to catch). Same fix, honest reason, recorded at the static.
+2. **The design's phase-3 value-guard did NOT hold, and its own stated protection was vacuous.** It claimed *"if a
+   real failure raced the swap (a crash latch, a `shutdown`), that reason WINS and the log dies with it"*. In the
+   REAL code neither racer can make that true: `reader_fatal` only latches a **`Live`** slot, so it takes the quiet
+   arm against a park and never overwrites it; and `shutdown`'s non-`Live` arm does `*slot = other` — it
+   **RESTORES** the original state, so it would hand `Failed(RESPAWN_IN_PROGRESS)` straight back, phase 3 would
+   match its own park value, and `Unspawned(log)` would be installed **OVER the shutdown latch** — a later drive
+   could then spawn a helper AFTER teardown, breaking `shutdown`'s own recorded contract (*"The slot latches so no
+   later drive respawns"*). **FIXED** (3 lines, dated at the site): `shutdown` must not restore the park; its latch
+   wins, phase 3 sees the changed reason, drops the log, and stands down.
+
+*The design as built.* `ClientSlot::Live(Client, EarlyCookies)` — the log rides the live helper, so it is
+structurally impossible to have a live engine with no transcript. `record_sent` (the ONE Live-side append site,
+called only after a successful `send_locked` from `send_with_lazy_spawn`, so the MouseMove/Key/FrameAck hot path
+pays nothing) appends `CookieSet`/`CookieSetForResult` and **truncates on `CookiesClear`** — *"If |url| is NULL all
+cookies for all hosts and domains will be deleted"* (pinned) — **without which a replay would RESURRECT cookies the
+app deliberately cleared**. `CookieGet` is never logged (`visit_url_cookies` is read-only). It REFUSES rather than
+lies: CAP-overflow (the bound STAYS — `.ROBLOSECURITY` values must not grow unbounded in ART) and `retire()` (a
+browser exists ⇒ a network `Set-Cookie` can outrun any transcript) clear `replayable`, which `respawn_verdict`
+then honours. `HELPER_BOOT_UA` is written by `spawn_helper_process` from the SAME read it puts in the child's env
+— one read, two consumers, so "what UA did this engine initialize with?" cannot be answered wrongly.
+**Three-phase lock discipline** (`maybe_respawn_for_app_ua`, called BEFORE `drive` takes `CLIENT`): the old reader
+takes `CLIENT` on EOF, so joining under it is a guaranteed hang — phase 1 decides + parks under the lock, phase 2
+tears down and fully **REAPS** without it (load-bearing: the successor's `CefInitialize` must not race the old
+process's singleton), phase 3 lifts the park by value. The upcall thread is deliberately DETACHED, not joined
+(joining would park this thread against one that may park on main); with the maps empty by the quiescence guard its
+exit drain hits `drain_all_webview_callbacks`'s all-empty early return and never dispatches to main. Duplicate
+replay replies are safe by the SHIPPED code: `fire_boolean_result` is remove-then-fire, so the second
+`CookieSetResult` for an id finds nothing and takes the existing debug arm.
+
+*Lock order — AUDITED, not assumed (this pass calls `ops_in_flight()` UNDER `CLIENT`).* Every other site takes the
+waiter/registry locks in a scope that ENDS before any `CLIENT` acquisition: `cookie_get_blocking` registers and
+releases before `send_with_lazy_spawn`; the reader removes a waiter and releases before `tx.send`; `framework.rs`'s
+three callback registries are each locked in a block that closes before the `client::` call after it. Nothing takes
+a waiter/registry lock and THEN `CLIENT` ⇒ the order is one-directional and no inversion is possible. Recorded at
+`ops_in_flight`.
+
+*Regression protection (tied to the confirmed root cause; no new scripts — all four land in `client.rs`'s existing
+`mod tests`, pure, no ART/display/env).* (1) **`a_cookie_forced_helper_is_replaced_so_the_apps_user_agent_reaches_
+the_engine` — THE root-cause guard**: the exact measured state at the load-drive (live helper, `boot_ua=None`, the
+app's REAL UA known, no browser, clean log, nothing in flight) MUST return `Respawn`, and the delivered string must
+carry both selector substrings. (2) `respawn_verdict_keeps_the_live_helper_for_every_recorded_reason` — one
+assertion per `Keep` arm incl. precedence. (3) `cookie_log_records_sets_after_the_spawn_and_a_clear_truncates_it` —
+the two obligations the design owed. (4) `cookie_log_overflow_and_retirement_refuse_the_respawn_instead_of_lying`.
+**All NEGATIVE-TESTED — 12 mutations** (revert the respawn; drop the clear-truncation; stop logging post-spawn
+sets; break the bound; keep `replayable` on overflow; un-poison `retire`; and each of the six `Keep` guards
+individually): every mutation was applied, the guard observed FAILING, and the file restored **byte-identical**
+(md5 `9c8e881d496f549ac9f59b8534c0a8ab` re-verified after every one).
+
+*Gate (MEASURED 2026-07-17).* Root `fmt`/`build --all-targets`/`clippy --all-targets --all-features -D warnings`/
+`test`/`build --release` — **0 warnings, 0 errors**; **658 unit + 6 integ + 2 doctest, zero SKIP** (was 654+6+2;
+**+4** = the pins above). Helper (`CEF_PATH` set) all five clean — **41 + 15 UNCHANGED**, and the helper diff is
+**comment-only** (one falsified parenthetical corrected); no proto change, `PROTO_VERSION` stays **2** (A and B
+both speak v2; the replay uses existing frames). `patch-framework.sh` **EXIT=0** — `classes2.dex` **77764**
+(byte-identical; no overlay change this pass). `__webview-test` **EXIT=0**, marker INTACT: *"upcalls 2/2 (state 0 @
+150ms, state 3 @ 150ms, http 200), frame 1024x768 237 distinct pixels, bridge round-trip OK, evaluateJavascript OK,
+honest UA OK, cookie set/get OK, cookie callback OK, ViewClosed, helper exit 0, bound=5"*, `pgrep -x
+eclipse-webview` = **0**. **It provably does NOT respawn** — `REPLACING`=0, and its slot is `Unspawned` at the
+first drive (it loads at `main.rs:660` before any cookie leg), so phase 1 returns before any verdict; its
+`trigger=` still reads the non-respawn branch and it still guards the FALLBACK rung. Stated honestly: **it cannot
+cover the respawn** — that is the four unit pins plus the live boot.
+
+*NOT DONE — stated honestly.* **The live challenge boot did not run** (orchestrator-only — CLAUDE.md's dev-host
+boundary). **The one falsifier no harness can reach is CEF's process singleton** (§5 🔁): both `cache_path` and
+`root_cache_path` are empty ⇒ the shared `~/.config/cef_user_data` default ⇒ *"only a single app instance is
+allowed to run for a given CefSettings.root_cache_path value"*. The design's ordering (A's views-empty clean close
+⇒ real `cef_shutdown()` ⇒ CEF's children released; full `wait()` before B spawns) is built to make it moot, and
+today's boots never trip a stale lock — **weak supporting evidence, not proof. I have NOT measured it.** If it
+fires, phase 1 is a point of no return: the boot has NO WebView where today it has a wrong-UA one. That is the
+honest cost of replacing a process, and the first boot settles it.
+
+*Files:* `src/webview/client.rs` (`ClientSlot::Live(Client, EarlyCookies)` + `RESPAWN_IN_PROGRESS` +
+`EarlyCookies::{replayable, record_sent, retire}` + `HELPER_BOOT_UA`/`helper_boot_ua`/`ua_diag_forced` +
+`RespawnVerdict`/`respawn_verdict` + `maybe_respawn_for_app_ua`/`teardown_replaced_helper`/`ops_in_flight` +
+`ensure_spawned`'s log re-install + `send_with_lazy_spawn`'s append + `drive`'s respawn point + `retire` +
+`IO_THREAD_ID` `OnceLock→Mutex` + `shutdown`'s park fix + the two falsified log lines + 4 pins),
+`src/framework.rs` (`webview_callbacks_in_flight` only), `src/webview/mod.rs` (spawn contract §8),
+`crates/eclipse-webview/src/main.rs` (comment-only); this file (§5 🔁 bullet + §6 this entry).
+
+### 2026-07-17 — 🎉 M6 CORE MECHANISM COMPLETE: the challenge works end-to-end with NOTHING forced. The app's own User-Agent reaches the engine, the bridge fires, the challenge COMPLETES and its result reaches the app. `Load generic challenge failed` 1 → 0.
+
+*The whole chain, as finally understood.* Roblox's challenge page selects its native bridge PURELY by
+`navigator.userAgent`, needing BOTH `"hybrid"` AND `"android"` (§6 🏆, read from the page's own public bundle:
+`var isNative = ua.indexOf("hybrid") != -1; … if (ua.indexOf("android") != -1) return "Android"; … return null`).
+The app SETS exactly such a UA via `WebSettings.setUserAgentString` — `…ROBLOX Android App 2.724.735 Phone
+Hybrid()…` — and ATL's empty stub DISCARDED it (§6 💥). Eclipse then honored it (§6 🩹) — but `CefSettings.user_agent`
+is GLOBAL and consumed at `CefInitialize`, and the helper was cold-started ~30–60 s EARLIER by the app's 3-arg
+`setCookie` at `AppManager.initialize` (§6 ⏳🎲). Deferring that op died at the `getCookie` boundary (§6 🔓): the
+get is synchronous with a 5 s deadline, and answering it from buffered sets needs to know which sets CEF would
+ACCEPT — undecidable without CEF (§6 ☠️). **That kill removed the only thing dominating respawn-and-replay**,
+which the design panel had rejected in one line: *"would in fact be LOSSLESS if it replayed original frames…
+but it is strictly dominated by not spawning at all."*
+
+*THE FIX.* At the first load-drive — ~110 µs after `setUserAgentString` — if the live helper booted with a
+different UA and no browser exists yet: tear it down, spawn a replacement with the app's UA, replay the app's
+ORIGINAL `CookieSet` frames into it, then drive the load. **A second `CefInitialize` in one process is FORBIDDEN**
+(pinned binding, `cef_shutdown`: *"Do not call any other CEF functions after calling this function"*) — so the
+replacement must be a new PROCESS. **This was only possible because the engine was already out-of-process**: the
+M2 decision, three milestones back, is what made the whole fix expressible.
+
+*THE EQUIVALENCE THEOREM (why correct, not approximate).* Helper A never receives a `CreateView` (sent only from
+`drive`) ⇒ no browser ⇒ no network `Set-Cookie` ever runs in it. The store starts empty in every process (pinned
+`cache_path` doc: empty ⇒ incognito, in-memory). Therefore **A's store content is EXACTLY the accepted subset of
+the logged frames**, and B — replaying the SAME original frames through the SAME CEF validation — lands the SAME
+subset: `store(B) = apply(L, ∅) = store(A)`. **Lossless** because the app's original `CookieSet` frame carries
+`expires_epoch_s` while the read-back `CookieEntry` (`proto.rs:200`) does **not** — that asymmetry is precisely
+why the replay must use the frame, and why read-back+replay was correctly refused. The log truncates on
+`CookiesClear` (else replay would RESURRECT cleared cookies), never logs `CookieGet` (read-only), and REFUSES the
+respawn rather than lie when it overflows or retires.
+
+*🎯 THE LIVE RESULT — `/tmp/eclipse-challenge31-respawn.log`, EXIT=124, `ECLIPSE_WEBVIEW_UA_DIAG` UNSET:*
+```
+REPLACING the eclipse-webview helper …                              1
+honoring the User-Agent the app set … ua=…Phone Hybrid()…           1   <- the APP'S OWN string
+ECLIPSE-STUB invoke                                                 4
+bridge call received  executeRoblox  arg_lens 219/211/221/738       4
+page console: challengePageLoaded → challengeParsed
+              → challengeInitialized → challengeCompleted
+Load generic challenge failed                                       0   <<< was 1 on EVERY boot, ever
+CefInitialize failed 0 · did not exit cleanly 0 · Looper 0 · ULE 0 · NPE 0 · orphans 0
+```
+
+*THE PRE-DECLARED PRIMARY FALSIFIER DID NOT FIRE — and that it was declared at all is the point.* The design pass
+found a hazard nobody had seen: CEF's **process singleton**. Both `cache_path` and `root_cache_path` are empty
+(`build_settings_with_ua`'s `..Default::default()`), so A and B share `~/.config/cef_user_data`, and the pinned
+doc is explicit — *"only a single app instance is allowed to run for a given CefSettings.root_cache_path value…
+the app checks a process singleton lock and then forwards the new launch arguments to the already running app
+process before exiting early. Client apps should therefore check the cef_initialize() return value for early
+exit."* If A's lock had outlived A, B would have exited early and the boot would have had **NO WebView at all** —
+strictly worse than today. It held because A has no views ⇒ `shutdown_state` ⇒ `(exit_code, true)` ⇒ a real
+`cef_shutdown()` ⇒ the lock released, and A is fully `wait()`ed before B spawns. **Phase 1 is a point of no
+return and there is no rollback — that is inherent to replacing a process, and the record says so rather than
+pretending otherwise.**
+
+*Gate (measured):* root **658 unit + 6 integ + 2 doctest, zero SKIP** (+4 pins; **12 mutations negative-tested**,
+each observed failing then restored byte-identical); helper **41 + 15 UNCHANGED** — the entire fix is
+main-process, the helper diff is comment-only; `PROTO_VERSION` still **2**; `classes2.dex` byte-identical;
+`__webview-test` EXIT=0 with the pinned marker intact, provably NOT respawning (it never sets a UA, so it guards
+the fallback rung and honestly cannot cover the respawn).
+
+*Two implementer deviations, both forced by verification and both worth keeping:* (1) the design claimed
+`IO_THREAD_ID` needed a `Mutex` because "the OS may RECYCLE that id" — **false**: Rust guarantees `ThreadId`s are
+never reused. The change is still right, for the OPPOSITE reason: a `OnceLock` pins the DEAD io thread's id, so
+the boundary guard goes **silently dead** for the new one. Same fix, honest reason. (2) The design's phase-3
+guard was vacuous; worse, `shutdown`'s non-Live arm would have RESTORED the respawn park over a shutdown latch,
+letting a later drive spawn a helper after teardown. Fixed in three dated lines: the shutdown latch wins.
+
+*⇐ WHAT REMAINS:* **real credentials.** The post-challenge `v2/login` still 403s — on the fake synthetic
+password, not on Eclipse. Owner-facing and unchanged: §7 #1 (vendor reception by a real human), #4 (LTS-vs-stable
+cadence), #5 (payload sign-off). Recorded divergences carried honestly: `apply` is not proved deterministic
+(CEF's *"or if cookies cannot be accessed"* is a race — both measured rejections were the deterministic URL
+class, but the class is not proven closed); expiry crossing the ~300 ms swap window; the microsecond quiescence
+race (a callback registered between the guard read and A's drain gets a wrong `false` — it announces itself);
+the `RESPAWN_IN_PROGRESS` park's honest, greppable degradation.
+
+*METHODOLOGY — the session's real lesson, and it is why this entry exists at all.* Every instrument built was
+right; the prose around them was wrong **six** times, and **two of those six were invented boundaries** that
+foreclosed the answer for hours — including *"reading Roblox's wrapper JS is off-policy"*, which was never
+project policy and which I invented and then cited as fact. The answer was found by demolishing walls I had built
+myself. The falsifier-first discipline then killed **four** candidates cheaply and correctly — each on the first
+boot or before it — and named the winner. **Before citing a constraint, grep for it. Before believing a wall, try
+the other tool. Trust the instrument, never the narrative.**
+
+*Files:* `src/webview/client.rs`, `src/framework.rs`, `src/webview/mod.rs` (spawn contract §8),
+`crates/eclipse-webview/src/main.rs` (comment-only), this file (§5 🎉 bullet + §6 this entry).
 
 ---
 
