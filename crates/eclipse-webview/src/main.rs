@@ -263,19 +263,29 @@ wrap_render_process_handler! {
             context: Option<&mut V8Context>,
         ) {
             let frame_owned: Option<Frame> = frame.map(|f| f.clone());
-            // (1) Register cefQuery/cefQueryCancel on the new context (the router contract).
+            // 2026-07-10 (plan M6): clone the handed-in context BEFORE the router consumes it, so we
+            // can eval the stubs synchronously on THIS same context after cefQuery is registered.
+            let ctx_for_eval: Option<V8Context> = context.as_deref().cloned();
+            // (1) Register cefQuery/cefQueryCancel on the new context FIRST (the router contract) so
+            //     window.cefQuery exists before the stub eval references it.
             self.router.on_context_created(
                 browser.map(|b| b.clone()),
                 frame_owned.clone(),
                 context.map(|c| c.clone()),
             );
-            // (2) On the MAIN frame: inject any already-known stubs, then ask the browser to (re-)send
-            //     the bridge inventory for THIS fresh context (the pull model — a browser→renderer
+            // (2) On the MAIN frame: inject any already-known stubs SYNCHRONOUSLY via V8Context::eval
+            //     (guaranteed to run before on_context_created returns — i.e. before any page script
+            //     executes in this new context; CefFrame::ExecuteJavaScript is NOT contractually
+            //     synchronous during context creation). Then ask the browser to (re-)send the bridge
+            //     inventory for THIS fresh context (the pull model / backstop — a browser→renderer
             //     send before the renderer was connected is dropped, and each navigation is a new
-            //     context). The browser answers with "eclipse.bridge.register", injecting the stubs.
+            //     context). The browser answers with "eclipse.bridge.register".
             if let Some(frame) = frame_owned {
                 if frame.is_main() != 0 {
-                    self.inject_all_stubs(&frame);
+                    let (ifaces, methods) = self.inject_all_stubs(ctx_for_eval.as_ref());
+                    if ifaces > 0 {
+                        log::info("render", &format_stub_apply_line("sync", ifaces, methods));
+                    }
                     if let Some(mut ready) =
                         process_message_create(Some(&CefString::from("eclipse.bridge.ready")))
                     {
@@ -323,7 +333,10 @@ wrap_render_process_handler! {
                                 if let Ok(mut inv) = self.inventory.lock() {
                                     inv.insert(iface.clone(), methods.clone());
                                 }
-                                // Inject immediately if the main-frame context already exists.
+                                // Inject immediately if the main-frame context already exists. This
+                                // REFRESH path keeps frame.execute_java_script — the proven M4
+                                // round-trip path for an already-running page (the sync-eval path is
+                                // on_context_created, before page scripts).
                                 if let Some(frame) = frame {
                                     if frame.is_main() != 0 {
                                         let js = generate_stub_js(&iface, &methods);
@@ -331,6 +344,11 @@ wrap_render_process_handler! {
                                             Some(&CefString::from(js.as_str())),
                                             None,
                                             0,
+                                        );
+                                        // 2026-07-10 (plan M6): the A2 evidence line (counts only).
+                                        log::info(
+                                            "render",
+                                            &format_stub_apply_line("refresh", 1, methods.len()),
                                         );
                                     }
                                 }
@@ -382,14 +400,41 @@ wrap_render_process_handler! {
 }
 
 impl HelperRenderProcessHandler {
-    /// Inject every stored interface's `window.<name>` stubs into `frame`.
-    fn inject_all_stubs(&self, frame: &Frame) {
-        if let Ok(inv) = self.inventory.lock() {
-            for (iface, methods) in inv.iter() {
-                let js = generate_stub_js(iface, methods);
-                frame.execute_java_script(Some(&CefString::from(js.as_str())), None, 0);
+    /// Inject every stored interface's `window.<name>` stubs into `ctx` SYNCHRONOUSLY via
+    /// `V8Context::eval` (plan M6, 2026-07-10) and return `(ifaces, total_methods)` for the A2
+    /// evidence line. Eval is the same primitive `eval_in_frame` proves against this binding and is
+    /// guaranteed to run before `on_context_created` returns (before page scripts). An eval failure
+    /// is logged once (payload-free) and does not abort the remaining interfaces.
+    fn inject_all_stubs(&self, ctx: Option<&V8Context>) -> (usize, usize) {
+        let Some(ctx) = ctx else {
+            return (0, 0);
+        };
+        let Ok(inv) = self.inventory.lock() else {
+            return (0, 0);
+        };
+        let mut ifaces = 0usize;
+        let mut methods_total = 0usize;
+        for (iface, methods) in inv.iter() {
+            let js = generate_stub_js(iface, methods);
+            let mut retval: Option<V8Value> = None;
+            let mut exception: Option<V8Exception> = None;
+            let code = ctx.eval(
+                Some(&CefString::from(js.as_str())),
+                None,
+                0,
+                Some(&mut retval),
+                Some(&mut exception),
+            );
+            if code == 0 {
+                log::warn(
+                    "render",
+                    "bridge stub injection failed (context eval error)",
+                );
             }
+            ifaces += 1;
+            methods_total += methods.len();
         }
+        (ifaces, methods_total)
     }
 }
 
@@ -406,6 +451,15 @@ fn js_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// The renderer stub-injection evidence line (plan M6, 2026-07-10): `mode` is `sync` (the
+/// on_context_created eval, before any page script runs) or `refresh` (a late
+/// `eclipse.bridge.register` re-inject for an already-running page). COUNTS only — no interface or
+/// method names (matches the "names not logged" stance). The A2 timestamp makes the injection
+/// race measurable against the engine's "load started" line. Pure/unit-pinned.
+fn format_stub_apply_line(mode: &str, ifaces: usize, methods: usize) -> String {
+    format!("bridge stubs applied mode={mode} ifaces={ifaces} methods={methods}")
 }
 
 /// Generate the `window.<name>` bridge stub JS for one interface. Each method returns a Promise
@@ -813,8 +867,22 @@ fn main() -> ExitCode {
         }
     });
 
+    // 2026-07-10 (plan M6): read the dev-host page-console-TEXT diagnostic gate ONCE
+    // (ECLIPSE_WEBVIEW_CONSOLE=1, inherited via the consumer's no-env_clear spawn). Announce it
+    // loudly when ON — the page console text is page-controlled content, so a diag-enabled log is
+    // by definition a dev-host artifact and NEVER a default boot.
+    let console_text =
+        engine::console_text_diag_enabled(std::env::var("ECLIPSE_WEBVIEW_CONSOLE").ok().as_deref());
+    if console_text {
+        log::warn(
+            COMPONENT,
+            "ECLIPSE_WEBVIEW_CONSOLE=1 — page console TEXT will be logged (dev-host diagnostic \
+             only; page-controlled content; never a default)",
+        );
+    }
+
     // ---- The pump loop (CEF UI thread == this thread). ----
-    let engine = Engine::new(outbox.clone());
+    let engine = Engine::new(outbox.clone(), console_text);
     let (exit_code, clean_close) = loop {
         do_message_loop_work();
         loop {
@@ -894,6 +962,46 @@ mod tests {
             Some("wayland")
         );
         assert_eq!(parse_ozone_override(args(&["x"])), None);
+    }
+
+    #[test]
+    fn generate_stub_js_emits_the_promise_shape_guarded_by_cefquery_and_escapes_identifiers() {
+        // 2026-07-10 (plan M6): the bridge stub must (a) guard on window.cefQuery (so a page
+        // without the router injected sees no throw), (b) return a Promise per method (the async
+        // bridge shape), and (c) js_escape hostile identifier characters into the string literals.
+        let js = generate_stub_js("Iface\"x", &["m\\1".to_string()]);
+        assert!(
+            js.contains("window.cefQuery"),
+            "must reference cefQuery: {js}"
+        );
+        assert!(
+            js.contains("if(!q)"),
+            "must guard on cefQuery presence: {js}"
+        );
+        assert!(
+            js.contains("new Promise"),
+            "each method returns a Promise: {js}"
+        );
+        assert!(js.contains("onSuccess") && js.contains("onFailure"), "{js}");
+        // The hostile `"` and `\` are escaped, never emitted raw into the literal.
+        assert!(
+            js.contains("Iface\\\"x"),
+            "interface name not escaped: {js}"
+        );
+        assert!(js.contains("m\\\\1"), "method name not escaped: {js}");
+    }
+
+    #[test]
+    fn format_stub_apply_line_shape_is_counts_only() {
+        // 2026-07-10 (plan M6): the A2 evidence line binds mode + counts ONLY (never names).
+        assert_eq!(
+            format_stub_apply_line("sync", 1, 3),
+            "bridge stubs applied mode=sync ifaces=1 methods=3"
+        );
+        assert_eq!(
+            format_stub_apply_line("refresh", 2, 5),
+            "bridge stubs applied mode=refresh ifaces=2 methods=5"
+        );
     }
 
     #[test]

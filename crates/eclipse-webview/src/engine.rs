@@ -48,6 +48,36 @@ const CLOSE_ALL_DEADLINE: Duration = Duration::from_secs(10);
 /// `no-sandbox` is banned outright (the M1 rule — the userns sandbox engages by default).
 pub const FORBIDDEN_PASSTHROUGH_SWITCHES: &[&str] = &["enable-logging", "no-sandbox"];
 
+/// Whether the env value selects the page-console-TEXT diagnostic (plan M6, 2026-07-10).
+/// EXACT-match `"1"` only — never `"true"`, never a truthy substring — so the diagnostic is a
+/// deliberate opt-in and can never be tripped by an unrelated env value. Pure/unit-pinned.
+///
+/// DEV-HOST DIAGNOSTIC ONLY: when enabled, the helper logs raw page console TEXT (page-controlled
+/// content that may itself contain URLs) — a diag-enabled log is by definition a dev-host artifact
+/// and NEVER a default boot. The source URL stays redacted to scheme+host even in diag mode; only
+/// the message text is raw. Off by default (the consumer's structurally text-free INFO line is the
+/// default console surface).
+pub fn console_text_diag_enabled(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// The per-event page-console-TEXT diagnostic line (plan M6). The `source` stays redacted to
+/// scheme+host (a [`RedactedTarget`], unforgeable from a raw URL); only `text` is raw page console
+/// content — the sanctioned dev-host-diagnostic exposure gated by [`console_text_diag_enabled`].
+/// Pure/unit-pinned. NEVER call this on a default boot.
+pub fn format_console_text_line(
+    view: i64,
+    severity: u8,
+    source: &RedactedTarget,
+    line: u32,
+    text: &str,
+) -> String {
+    format!(
+        "console-text(diag) view={view} level={severity} source={} line={line} text={text}",
+        source.as_str()
+    )
+}
+
 /// The engine identity string for `HelloAck` (from the pinned binding's version constant),
 /// e.g. `"cef/149.0.6+g0d0eeb6+chromium-149.0.7827.201"`.
 pub fn engine_id() -> String {
@@ -224,6 +254,71 @@ pub fn switch_should_be_stripped(name: &str, degraded: bool) -> bool {
         "no-sandbox" => !degraded,
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cookie-set rejection classifier (plan M6, 2026-07-10 — observability only)
+// ---------------------------------------------------------------------------
+
+/// Name the LIKELY reason a `set_cookie` returned false, mirroring the DOCUMENTED CEF
+/// `cef_cookie_manager_t::set_cookie` sync-false predicates (the pinned cef-dll-sys header:
+/// "check for disallowed characters (e.g. ';' … within the cookie value) … fail without setting …
+/// Returns false (0) if an invalid URL is specified or if cookies cannot be accessed"). Pure and
+/// unit-pinned; observability ONLY — it never changes the set outcome. Checked in order; the
+/// fallback names the CEF-internal store-unready-at-first-op / engine-sanitization case so a race
+/// that matched no local predicate reads honestly. PRIVACY: takes name/value but returns only a
+/// static reason — it NEVER embeds them (the caller binds lengths only).
+pub fn classify_cookie_set_rejection(
+    url: &str,
+    name: &str,
+    value: &str,
+    domain: &str,
+    path: &str,
+    secure: bool,
+) -> &'static str {
+    let is_ctrl = |c: char| (c as u32) < 0x20;
+    // (1) the URL must redact to a real scheme://host and the scheme must be http(s).
+    let redacted = crate::shared::redact::url_scheme_and_host_for_log(url);
+    if redacted == crate::shared::redact::NON_URL {
+        return "url is not a valid http(s) URL";
+    }
+    let Some((scheme, host)) = redacted.split_once("://") else {
+        return "url is not a valid http(s) URL";
+    };
+    if scheme != "http" && scheme != "https" {
+        return "url is not a valid http(s) URL";
+    }
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    // (2) cookie name.
+    if name.chars().any(|c| c == ';' || c == '=' || is_ctrl(c)) {
+        return "name contains a disallowed character";
+    }
+    // (3) cookie value.
+    if value.chars().any(|c| c == ';' || is_ctrl(c)) {
+        return "value contains a disallowed character (';' or control)";
+    }
+    // (4) domain charset.
+    if domain.chars().any(|c| c == ';' || c == ' ' || is_ctrl(c)) {
+        return "domain contains a disallowed character";
+    }
+    // (5) non-empty domain must domain-match the URL host (strip a leading '.').
+    if !domain.is_empty() {
+        let d = domain.strip_prefix('.').unwrap_or(domain);
+        let matches = host_no_port == d || host_no_port.ends_with(&format!(".{d}"));
+        if !matches {
+            return "domain does not domain-match the URL host";
+        }
+    }
+    // (6) path charset.
+    if path.chars().any(|c| c == ';' || is_ctrl(c)) {
+        return "path contains a disallowed character";
+    }
+    // (7) a Secure cookie requires an https origin.
+    if secure && scheme != "https" {
+        return "Secure cookie set from a non-https URL";
+    }
+    // (8) nothing local matched — the CEF-internal case.
+    "no local predicate matched — CEF-internal (cookie store unready at first-op, or engine-side sanitization)"
 }
 
 // ---------------------------------------------------------------------------
@@ -405,10 +500,13 @@ pub struct Engine {
     /// The browser-side query router (`cefQuery`), created once (plan M4). The per-view handlers
     /// forward its lifecycle callbacks; `Client::on_process_message_received` forwards replies.
     router: Arc<BrowserSideRouter>,
+    /// 2026-07-10 (plan M6): the dev-host page-console-TEXT diagnostic gate (ECLIPSE_WEBVIEW_CONSOLE
+    /// =1). Threaded into each view's `HelperDisplayHandler`. Off = the default (no extra line).
+    console_text: bool,
 }
 
 impl Engine {
-    pub fn new(out: Outbox) -> Self {
+    pub fn new(out: Outbox, console_text: bool) -> Self {
         let state: Shared = Arc::new(Mutex::new(EngineState {
             views: HashMap::new(),
             pending_cookies: Vec::new(),
@@ -428,7 +526,12 @@ impl Engine {
             next_call_id: AtomicU32::new(1),
         });
         router.add_handler(handler, false);
-        Self { state, out, router }
+        Self {
+            state,
+            out,
+            router,
+            console_text,
+        }
     }
 
     /// The ONE session-scoped in-memory cookie store, created lazily (empty `cache_path` = a
@@ -757,9 +860,23 @@ impl Engine {
             expires,
             ..Default::default()
         };
-        let url = CefString::from(url);
+        let url_cef = CefString::from(url);
         let mut callback = SetCookieResultCallback::new(request_id, self.out.clone());
-        if manager.set_cookie(Some(&url), Some(&cookie), Some(&mut callback)) != 1 {
+        if manager.set_cookie(Some(&url_cef), Some(&cookie), Some(&mut callback)) != 1 {
+            // 2026-07-10 (plan M6): name the LIKELY sync-false reason (observability only — the
+            // ok=false reply below is unchanged). Same redaction as the 2-arg path.
+            let predicate = classify_cookie_set_rejection(url, name, value, domain, path, secure);
+            logging::warn(
+                COMPONENT,
+                &format!(
+                    "cookie_set: rejected by the cookie manager — {predicate} (url={} domain={} \
+                     name_len={} value_len={})",
+                    RedactedTarget::from_raw_url(url).as_str(),
+                    domain,
+                    name.len(),
+                    value.len()
+                ),
+            );
             self.out.send(HelperMsg::CookieSetResult {
                 request_id,
                 ok: false,
@@ -949,8 +1066,14 @@ impl Engine {
                 self.router.clone(),
             ),
             HelperRenderHandler::new(view, self.state.clone(), self.out.clone()),
-            HelperDisplayHandler::new(view, self.out.clone()),
-            HelperRequestHandler::new(view, self.out.clone(), pending_data, self.router.clone()),
+            HelperDisplayHandler::new(view, self.out.clone(), self.console_text),
+            HelperRequestHandler::new(
+                view,
+                self.state.clone(),
+                self.out.clone(),
+                pending_data,
+                self.router.clone(),
+            ),
             ClientDeps {
                 out: self.out.clone(),
                 router: self.router.clone(),
@@ -1174,9 +1297,29 @@ impl Engine {
             expires,
             ..Default::default()
         };
-        let url = CefString::from(url);
-        if manager.set_cookie(Some(&url), Some(&cookie), None) != 1 {
-            logging::warn(COMPONENT, "cookie_set: rejected by the cookie manager");
+        let url_cef = CefString::from(url);
+        // 2026-07-10 (plan M6): the 2-arg path was fire-and-forget (callback=None), so an ASYNC
+        // engine-sanitization failure was silent. Attach a LOG-ONLY completion callback — it WARNs
+        // on an async failure and emits NO wire message (the v1 fire-and-forget layout stays frozen).
+        let mut callback = LogOnlySetCookieCallback::new(
+            RedactedTarget::from_raw_url(url).as_str().to_string(),
+            domain.to_string(),
+            name.len(),
+            value.len(),
+        );
+        if manager.set_cookie(Some(&url_cef), Some(&cookie), Some(&mut callback)) != 1 {
+            let predicate = classify_cookie_set_rejection(url, name, value, domain, path, secure);
+            logging::warn(
+                COMPONENT,
+                &format!(
+                    "cookie_set: rejected by the cookie manager — {predicate} (url={} domain={} \
+                     name_len={} value_len={})",
+                    RedactedTarget::from_raw_url(url).as_str(),
+                    domain,
+                    name.len(),
+                    value.len()
+                ),
+            );
         }
     }
 
@@ -1466,6 +1609,7 @@ wrap_display_handler! {
     struct HelperDisplayHandler {
         view: i64,
         out: Outbox,
+        console_text: bool,
     }
 
     impl DisplayHandler {
@@ -1480,16 +1624,30 @@ wrap_display_handler! {
             let severity = sys::cef_log_severity_t::from(level) as i32;
             let source = source.map(|s| s.to_string()).unwrap_or_default();
             let message = message.map(|m| m.to_string()).unwrap_or_default();
+            let severity_u8 = severity.clamp(0, 255) as u8;
+            let line_u32 = line.max(0) as u32;
+            // 2026-07-10 (plan M6): the dev-host page-console-TEXT diagnostic (ECLIPSE_WEBVIEW_CONSOLE
+            // =1). Default OFF → NO extra line (the consumer's structurally text-free INFO event is
+            // the default surface — no duplication). When ON, log the RAW text HELPER-SIDE only (it
+            // never crosses the frozen text-free wire Console); the source stays redacted to
+            // scheme+host even here.
+            if self.console_text {
+                logging::warn(
+                    COMPONENT,
+                    &format_console_text_line(
+                        self.view,
+                        severity_u8,
+                        &RedactedTarget::from_raw_url(&source),
+                        line_u32,
+                        &message,
+                    ),
+                );
+            }
             // Console::from_raw redacts the source and STRUCTURALLY drops the text — only
             // its length crosses the wire.
             self.out.send(HelperMsg::Console {
                 view: self.view,
-                console: Console::from_raw(
-                    severity.clamp(0, 255) as u8,
-                    &source,
-                    line.max(0) as u32,
-                    &message,
-                ),
+                console: Console::from_raw(severity_u8, &source, line_u32, &message),
             });
             // Returning 1 suppresses Chromium's default console-to-stderr forwarding — the
             // exact channel M1 measured leaking full page URLs.
@@ -1501,12 +1659,43 @@ wrap_display_handler! {
 wrap_request_handler! {
     struct HelperRequestHandler {
         view: i64,
+        state: Shared,
         out: Outbox,
         pending_data: Arc<Mutex<Option<PendingData>>>,
         router: Arc<BrowserSideRouter>,
     }
 
     impl RequestHandler {
+        fn on_render_view_ready(&self, browser: Option<&mut Browser>) {
+            // 2026-07-10 (plan M6): the RELIABLE bridge-inventory push. The pinned cef-dll-sys
+            // header: "Called on the browser process UI thread when the render view associated
+            // with |browser| is ready to receive/handle IPC messages in the render process" — it
+            // fires for the INITIAL renderer AND after every renderer process swap, which the
+            // best-effort immediate send in bridge_register can miss (BridgeRegister and the
+            // renderer connect can share a millisecond; challenge16 log 1233-1235). Re-push this
+            // view's whole @JavascriptInterface inventory so the stubs exist before page scripts.
+            let Some(browser) = browser else { return };
+            let Some(frame) = browser.main_frame() else { return };
+            let bridges: Vec<(String, Vec<BridgeMethod>)> = {
+                let st = lock(&self.state);
+                st.view_bridges
+                    .get(&self.view)
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default()
+            };
+            let ifaces = bridges.len();
+            for (name, methods) in bridges {
+                send_bridge_register_message(&frame, &name, &methods);
+            }
+            logging::info(
+                COMPONENT,
+                &format!(
+                    "bridge inventory pushed on render-view-ready view={} ifaces={ifaces}",
+                    self.view
+                ),
+            );
+        }
+
         fn on_before_browse(
             &self,
             browser: Option<&mut Browser>,
@@ -1836,6 +2025,35 @@ wrap_set_cookie_callback! {
     }
 }
 
+// 2026-07-10 (plan M6): the LOG-ONLY completion for the 2-arg fire-and-forget `cookie_set`.
+// It WARNs on an async engine-sanitization failure (success==0) and emits NO wire message —
+// the v1 2-arg `CookieSet` layout stays fire-and-forget/frozen. Fields are pre-redacted /
+// lengths only (never the cookie name/value). (Field doc comments are not accepted by the
+// wrap_set_cookie_callback! macro grammar — see the wrap_app! precedent in main.rs.)
+wrap_set_cookie_callback! {
+    struct LogOnlySetCookieCallback {
+        url_redacted: String,
+        domain: String,
+        name_len: usize,
+        value_len: usize,
+    }
+
+    impl SetCookieCallback {
+        fn on_complete(&self, success: ::std::os::raw::c_int) {
+            if success == 0 {
+                logging::warn(
+                    COMPONENT,
+                    &format!(
+                        "cookie_set: async completion reported failure (engine sanitization) \
+                         (url={} domain={} name_len={} value_len={})",
+                        self.url_redacted, self.domain, self.name_len, self.value_len
+                    ),
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2018,6 +2236,128 @@ mod tests {
         assert!(urls_equivalent("https://host/x", "https://host/x"));
         assert!(!urls_equivalent("https://host/x", "https://host/y"));
         assert!(!urls_equivalent("https://host", "https://host/x"));
+    }
+
+    #[test]
+    fn console_text_diag_gate_is_exact_match_one_only() {
+        // 2026-07-10 (plan M6): the page-console-TEXT diagnostic is a deliberate opt-in — EXACTLY
+        // "1", never "true"/""/None/"0"/"1 " — so an unrelated env value can never trip it.
+        assert!(console_text_diag_enabled(Some("1")));
+        assert!(!console_text_diag_enabled(Some("")));
+        assert!(!console_text_diag_enabled(Some("0")));
+        assert!(!console_text_diag_enabled(Some("true")));
+        assert!(!console_text_diag_enabled(Some("1 ")));
+        assert!(!console_text_diag_enabled(None));
+    }
+
+    #[test]
+    fn format_console_text_line_keeps_the_source_redacted_even_in_diag_mode() {
+        // 2026-07-10 (plan M6): even with the diagnostic ON, the SOURCE stays scheme+host — only
+        // the page console TEXT is raw (the sanctioned dev-host exposure). A token-bearing source
+        // URL must reduce to scheme+host; the raw text passes through verbatim.
+        let source =
+            RedactedTarget::from_raw_url("https://apps.roblox.com/challenge?token=SECRETTOKEN");
+        let line = format_console_text_line(42, 2, &source, 17, "page said hello");
+        assert!(line.contains("source=https://apps.roblox.com"), "{line}");
+        assert!(!line.contains("SECRETTOKEN"), "source token leaked: {line}");
+        assert!(!line.contains("/challenge"), "source path leaked: {line}");
+        assert!(line.contains("text=page said hello"), "{line}");
+        assert!(line.contains("view=42") && line.contains("level=2") && line.contains("line=17"));
+    }
+
+    #[test]
+    fn classify_cookie_set_rejection_names_each_documented_predicate_in_order() {
+        // 2026-07-10 (plan M6): the classifier mirrors the documented CEF set_cookie sync-false
+        // predicate set, checked in order. Observability only — it never sets a cookie.
+        use classify_cookie_set_rejection as c;
+        // (1) invalid / non-http(s) URL.
+        assert_eq!(
+            c("about:blank", "n", "v", "", "/", false),
+            "url is not a valid http(s) URL"
+        );
+        assert_eq!(
+            c("ftp://host", "n", "v", "", "/", false),
+            "url is not a valid http(s) URL"
+        );
+        // (2) name charset (checked before value).
+        assert_eq!(
+            c("https://host", "na=me", "v", "", "/", false),
+            "name contains a disallowed character"
+        );
+        // (3) value charset.
+        assert_eq!(
+            c("https://host", "n", "va;lue", "", "/", false),
+            "value contains a disallowed character (';' or control)"
+        );
+        // (4) domain charset.
+        assert_eq!(
+            c("https://host", "n", "v", "ba d.com", "/", false),
+            "domain contains a disallowed character"
+        );
+        // (5) domain does not domain-match the URL host.
+        assert_eq!(
+            c(
+                "https://www.roblox.com",
+                "n",
+                "v",
+                "example.com",
+                "/",
+                false
+            ),
+            "domain does not domain-match the URL host"
+        );
+        // (5) a matching domain (leading '.' stripped, suffix match) passes to later checks.
+        assert_eq!(
+            c(
+                "https://www.roblox.com",
+                "n",
+                "v",
+                ".roblox.com",
+                "/x;y",
+                false
+            ),
+            "path contains a disallowed character"
+        );
+        // (7) Secure cookie from a non-https origin.
+        assert_eq!(
+            c("http://host", "n", "v", "", "/", true),
+            "Secure cookie set from a non-https URL"
+        );
+        // (8) nothing local matched → the CEF-internal fallback.
+        assert!(
+            c("https://www.roblox.com", "n", "v", ".roblox.com", "/", true)
+                .starts_with("no local predicate matched")
+        );
+    }
+
+    #[test]
+    fn classify_cookie_set_rejection_never_embeds_the_cookie_name_or_value() {
+        // 2026-07-10 (plan M6) PRIVACY pin: the classifier returns a STATIC reason and must never
+        // echo a `.ROBLOSECURITY` secret value/name back into the log stream.
+        for reason in [
+            classify_cookie_set_rejection(
+                "https://www.roblox.com",
+                ".ROBLOSECURITY",
+                "SECRETSESSIONTOKEN",
+                ".roblox.com",
+                "/",
+                true,
+            ),
+            classify_cookie_set_rejection(
+                "about:blank",
+                ".ROBLOSECURITY",
+                "SECRETSESSIONTOKEN",
+                "",
+                "/",
+                false,
+            ),
+        ] {
+            assert!(
+                !reason.contains("SECRETSESSIONTOKEN"),
+                "value leaked: {reason}"
+            );
+            assert!(!reason.contains("ROBLOSECURITY"), "name leaked: {reason}");
+        }
     }
 
     #[test]

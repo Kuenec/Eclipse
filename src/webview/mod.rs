@@ -45,6 +45,11 @@
 //! 6. **Handshake:** the first consumer→helper frame MUST be `Hello`; the helper answers
 //!    `HelloAck` and exits if no `Hello` arrives within 10 s of spawn ([`proto`] has the full
 //!    framing/version rules).
+//! 7. **Inherited env (2026-07-10, plan M6):** the spawn does NOT `env_clear`, so
+//!    `ECLIPSE_WEBVIEW_CONSOLE=1` reaches the helper. It is a DEV-HOST DIAGNOSTIC ONLY: when set,
+//!    the helper logs raw page console TEXT helper-side (page-controlled content — the text never
+//!    crosses the frozen text-free wire `Console`; the source stays redacted to scheme+host). Off
+//!    by default; a diag-enabled log is by definition a dev-host artifact, never a default boot.
 //!
 //! # M3 adoption note
 //!
