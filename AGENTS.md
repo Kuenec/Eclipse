@@ -185,6 +185,41 @@ before any history-rewriting/force operation.
   a UA A/B **diagnostic** (temporary, env-gated, dev-host only) to CONFIRM or REFUTE steering by evidence before
   anyone touches the pinned UA policy — diagnose before fix; do NOT flip the UA on suspicion. **⇒ THAT A/B RAN —
   SEE THE 🕵️ BULLET BELOW: SUSPECT 2 IS CONFIRMED.**
+- **2026-07-16 — 🌱 NEGATIVE RESULT (valuable, cheaply bought): the bridge inventory CANNOT be delivered to a
+  renderer before its first V8 context — NEITHER by browser→renderer IPC NOR by the child command line. Both
+  channels are now MEASURED closed. The launch-seed design was built, judged, live-tested, DISPROVED by its own
+  pre-declared falsifier, and REVERTED — nothing shipped (full record: §6 2026-07-16 🌱).** A judge-panel design
+  (3 approaches × 3 adversarial lenses × 13 verified rulings) concluded the ONLY channel reaching a renderer
+  before its first context is its **command line**, seeded at child-process launch via
+  `on_before_child_process_launch` and read via `command_line_get_global()` at the top of `on_context_created`.
+  Built, both gates green (helper 44+15, root untouched), preflight EXIT=0 with the pinned marker intact and the
+  seam inert-safe. **Live boot `/tmp/eclipse-challenge23-seed.log` fired the DISPROOF branch exactly as
+  pre-declared:** `bridge seed appended onto a launching renderer command line ifaces=1` (**1** occurrence, and
+  the browser-side verify confirmed it stuck — `did NOT stick` WARN = **0**) followed 7 ms later by `bridge seed
+  read from command line seeded=false ifaces=0 methods=0` (**`seeded=true` = 0**), and `mode=sync` still **0**.
+  ⇒ **CEF's `on_before_child_process_launch` command-line modifications DO NOT reach a zygote-forked renderer's
+  global command line** (R1/R2 disproved together; Eclipse's renderers are zygote FORKS — `docs/web-engine-plan.md`
+  records the M1 kernel probe, and the default sandbox tier is `userns`). **REVERTED in full** — shipping ~200
+  lines of dead code plus a new world-readable argv disclosure channel that delivers NOTHING would violate
+  CLAUDE.md; the tree is back at the green committed baseline. ⚠️ **AND IT CORRECTED MY OWN 🔬 DIAGNOSIS:** the 🔬
+  entry said the 11 ms bridge-less window's *"only explanation is a RENDERER PROCESS SWAP"*. **That was
+  incomplete.** The design panel found, in Eclipse's own log, that renderer **A lost the race too, with NO swap
+  involved**: the browser pushed the inventory to A at …999646, and A's `main-frame context ready` at …999660
+  STILL reported an EMPTY inventory — **14 ms AFTER the push** — applying `mode=refresh` 13 ms late. Browser→
+  renderer process messages queue on the renderer's task loop and **do not jump ahead of context creation**. The
+  swap makes it unrecoverable; the async hop loses it **even without one**. ⇒ **No IPC-shaped fix can EVER
+  close this window**, and the escalation this project pre-registered — *"delay the driven load until
+  inventory-ack"* — is **ARCHITECTURALLY CIRCULAR and is hereby RETIRED**: the acker does not exist before the
+  navigation, because the renderer that must ack is created BY the load you would delay. ⇐ **START-HERE-NEXT: the
+  ONE remaining untested channel is `extra_info` at browser creation** — `on_browser_created(browser, extra_info)`
+  fires in EVERY renderer process for that browser (including swap renderers) BEFORE any context, but its
+  dictionary is fixed at `CreateBrowser` time, and today's `client.rs::drive()` order is CreateView →
+  BridgeRegister → LoadUrl, so the browser is created BEFORE the bridge is known. **The untested idea: DEFER the
+  helper's `CreateBrowser` until the first load-drive** (by which time BridgeRegister has arrived), so
+  `extra_info` can carry the inventory. It uses no argv, no IPC race, and no new disclosure channel. It is NOT
+  yet designed and NOT yet evidence-backed — design it properly, do not patch it in. **Also still open and
+  UNTOUCHED: divergence #1 (all-frames injection — mechanical criterion: the arkose subframe lines flip to
+  `"type":"object"`) and #2 (the synchronous return shape).** The bridge blocker itself remains UNIDENTIFIED.
 - **2026-07-16 — 🔬 BRIDGE SELF-INTROSPECTION: the stub is PROVEN INTACT in the frame the wrapper runs in, 539 ms
   before it speaks — the injection race is DEAD, and TWO REAL AOSP-CONTRACT DIVERGENCES ARE NOW PROVEN
   (all-frames injection; synchronous return shape). The bridge blocker is NOT yet identified — do not "fix" on
@@ -7843,6 +7878,98 @@ wider introspection window — not more guessing.
 *Files:* `crates/eclipse-webview/src/engine.rs` (`bridge_diag_enabled`), `crates/eclipse-webview/src/main.rs`
 (`load_handler()` + `BridgeDiagLoadHandler` + `build_bridge_introspection_js` + `format_bridge_diag_line`), this
 file (§5 🔬 bullet + §6 this entry), `docs/web-engine-plan.md`.
+
+### 2026-07-16 — 🌱 NEGATIVE RESULT: the bridge inventory cannot reach a renderer before its first V8 context by EITHER channel — IPC loses the race even without a process swap, and the child command line does not survive the zygote fork. Designed, built, live-DISPROVED by its own falsifier, REVERTED. The pre-registered "delay the load until inventory-ack" escalation is retired as architecturally circular.
+
+*Why this was attempted:* §6 🔬 proved an 11 ms window in which the driven document's V8 context exists with NO
+bridge — a real AOSP divergence (AOSP guarantees `addJavascriptInterface` objects exist in EVERY frame BEFORE ANY
+page script). It is also the last surviving injection hypothesis for the silent bridge: if the page latches its
+platform at module-init inside that window, every later observation is blind to it. Closing the window makes the
+hypothesis falsifiable. That is a legitimate, evidence-driven objective — not a guess.
+
+*The design (judge panel: 3 approaches × 3 adversarial lenses × 13 rulings, each verified against the pinned
+`cef =149.3.0` bindings rather than averaged).* Conclusion: the ONLY channel that reaches a renderer before its
+first V8 context is its **command line** — seeded at child-process launch via
+`CefBrowserProcessHandler::on_before_child_process_launch` (fires on the **UI** thread for a render process; the
+brief's "IO thread" was wrong and all three candidates caught it) and read via `command_line_get_global()` as the
+first statement of `on_context_created` (a data dependency inside ONE function body — zero inter-callback
+argument). Rulings that mattered: reading the seed in `main()` is **dead code** (renderers are zygote FORKS and
+never re-enter it); `switch_value` on an absent switch `eprintln!`s "Invalid UTF-16 string" (M1 measured and
+closed the stderr channels) so `has_switch` must gate it; the identifier gate must mirror
+`bridge_identifier_for_log` byte-for-byte (`"9lives"` must be rejected); `external_message_pump: 1` makes a first
+`BrowserProcessHandler` a live pump callback (benign, but must be named).
+
+*The argv/secrets ruling (recorded because it was the crux, even though the design died):* the normative spawn
+contract's operative predicate is **"no secrets in argv"** (it bans token-bearing URLs and already admits
+`--allow-unsandboxed` as *"argv-safe — no secrets"*). Bridge iface/method names are not secrets **by provenance,
+not by shape** — the tempting "the identifier gate proves secrecy" argument was explicitly REFUSED (`SECRETTOKEN`
+passes any identifier gate). They are compile-time APK literals, annotation-gated by `@JavascriptInterface`, not
+page-controlled on this path, already readable by every script in the page (Eclipse's own 🔬 introspection printed
+them), and already bound to a DEFAULT-level log line by `framework.rs`. Ruled in-policy — while naming the
+genuinely new disclosure (`/proc/<renderer>/cmdline` is world-readable) and leaving it owner-overrulable. **Moot
+now, but the reasoning is the precedent for the next design that eyes argv.**
+
+*THE LIVE DISPROOF — its own pre-declared falsifier, on the first boot.* Built, both gates green (helper 44+15,
+root 643+6+2 UNCHANGED, `Cargo.lock` still cef-free, PROTO_VERSION still 2, all five guards negative-tested);
+preflight `__webview-test` EXIT=0 with the pinned `upcalls 2/2` marker intact (the seam is inert-safe) but
+**uninformative** (that harness launches no renderer AFTER `BridgeRegister`, so nothing was ever appended — the
+plan pre-declared this exact branch as "not a failure"). The live challenge boot
+(`/tmp/eclipse-challenge23-seed.log`, EXIT=124, reached the challenge) fired the **DISPROOF** branch:
+```
+…540104 [helper] bridge seed appended onto a launching renderer command line ifaces=1
+…540111 [render] bridge seed read from command line seeded=false ifaces=0 methods=0 pid=1
+…540111 [render] main-frame context ready (requested bridge inventory)
+…540118 [engine] load started view=… target=https://www.roblox.com
+```
+Census: `appended`=**1**, `did NOT stick` WARN=**0** (so the browser-side verify confirmed the switch DID stick on
+the `CefCommandLine` object), `seeded=true`=**0**, `seeded=false`=**2**, `mode=sync`=**0**, `mode=refresh`=5.
+⇒ **CEF's `on_before_child_process_launch` command-line modifications DO NOT reach a zygote-forked renderer's
+global command line** — R1 (does the switch survive the fork?) and R2 (is `command_line_get_global()` the child's
+own?) are disproved together, and no further first-party experiment can separate them. Eclipse's renderers ARE
+zygote forks (the M1 kernel probe, recorded in `docs/web-engine-plan.md`; the default sandbox tier is `userns`).
+
+*REVERTED IN FULL — nothing shipped.* ~200 lines of dead code plus a new world-readable argv disclosure channel,
+delivering NOTHING, is exactly what CLAUDE.md forbids. `git checkout` restored the green committed baseline
+(helper 38+15, root 643+6+2, fmt clean). **The cost was one design pass and one boot; the return is two channels
+permanently eliminated for every future design.** This is what a pre-declared falsifier buys — the instrument told
+us definitively instead of leaving a plausible-looking fix in the tree.
+
+*⚠️ AND IT CORRECTED §6 🔬's DIAGNOSIS — the more important half of this entry.* 🔬 concluded the window's *"only
+explanation is a RENDERER PROCESS SWAP"*. **Incomplete.** The panel found, in Eclipse's own already-captured log,
+that renderer **A lost the race too — in its own process, with NO swap involved**:
+```
+…999646 [engine] bridge inventory pushed on render-view-ready ifaces=1   <- browser pushes to renderer A
+…999660 [render] main-frame context ready (requested bridge inventory)   <- A's context: EMPTY, 14 ms AFTER
+…999673 [render] bridge stubs applied mode=refresh                       <- A applies it, 13 ms LATE
+```
+Browser→renderer process messages queue on the renderer's task loop and **do not jump ahead of context creation**.
+The swap makes the loss unrecoverable; **the async hop loses the race even without one.** ⇒ **No IPC-shaped fix
+can EVER close this window.** Combined with the argv disproof above, **both channels are now measured closed.**
+
+*RETIRED — the pre-registered escalation.* §6 🔬 (and the M6 plan before it) pre-registered *"delay the driven load
+until inventory-ack"*. **It is architecturally CIRCULAR and is hereby retired:** the renderer that must ack is
+created BY the load you would delay. The only process that can ack early is the about:blank renderer, which is not
+the process that runs the page. Do not re-propose it.
+
+*⇐ NEXT — the ONE remaining untested channel, and it is NOT yet designed.* `on_browser_created(browser,
+extra_info)` fires in EVERY renderer process for a browser (including swap renderers) BEFORE any V8 context, and
+its dictionary comes from `CefBrowserHost::CreateBrowser`. Today it cannot carry the inventory because
+`client.rs::drive()` orders CreateView → BridgeRegister → LoadUrl, so the browser exists before the bridge is
+known. **The untested idea: DEFER the helper's `CreateBrowser` until the first load-drive**, by which time
+BridgeRegister has arrived — then `extra_info` carries the inventory, with no argv, no IPC race, and no new
+disclosure channel. Honest caveats before anyone starts: it must not break `CreateView`'s current contract or the
+`ViewClosed`/retry path; AOSP permits `addJavascriptInterface` AFTER the first load, which `extra_info` alone
+cannot serve (the pull backstop must remain for those); and whether `on_browser_created` truly precedes
+`on_context_created` in a swap renderer is UNVERIFIED. **Design it properly with a falsifier, exactly as this pass
+did — the negative result cost one boot because the falsifier was declared in advance.**
+
+*Also still open and UNTOUCHED:* divergence **#1 all-frames injection** (Eclipse injects main-frame-only; AOSP
+injects into every frame — mechanical criterion: the arkose subframe introspection lines flip from
+`"type":"undefined"` to `"type":"object"`) and **#2 the synchronous return shape** (`generate_stub_js` returns a
+Promise; AOSP returns the value directly; `CefMessageRouter` is async BY DESIGN, so this needs design too).
+**The bridge blocker itself remains UNIDENTIFIED** — `bridge call received` = 0 in challenge23 as in 16–22.
+
+*Files:* none (fully reverted). This file (§5 🌱 bullet + §6 this entry) and `docs/web-engine-plan.md` only.
 
 ---
 

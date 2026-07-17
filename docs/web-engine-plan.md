@@ -573,14 +573,24 @@ early one** (self-correction, same day): `context ready (requested inventory)` �
 an **11 ms window** in which the new document's context exists with NO bridge, and a load-end
 snapshot is blind to a module-init latch inside it.
 
-**Why M6 (B)'s synchronous injection never engaged — and cannot:** the renderer's inventory is
-created once per renderer PROCESS and never cleared, yet `context ready (requested inventory)` fires
-TWICE — so the real page runs in a **fresh renderer process** (Chromium's cross-document process
-swap). Its inventory is empty by construction, so `mode=sync` can never fire for a driven load: the
-process that needs the inventory at `on_context_created` is created BY the navigation being injected
-into. AOSP has no such window. The recorded escalation ("delay the driven load until inventory-ack")
-needs real design — CEF has no synchronous renderer→browser pull, and `on_browser_created`'s
-`extra_info` / `CefRegisterExtension` both fire before the inventory is known.
+**Why M6 (B)'s synchronous injection never engaged — and cannot (updated 2026-07-16 after a live
+disproof; record: AGENTS.md §6 🌱):** BOTH delivery channels are now MEASURED closed. **(i) IPC loses
+the race even without a process swap** — the browser pushed the inventory to renderer A at …999646
+and A's `main-frame context ready` at …999660 STILL reported it EMPTY, 14 ms *after* the push:
+browser→renderer messages queue on the renderer's task loop and do not jump ahead of context
+creation. (An earlier note here blamed the cross-document process swap alone; that was incomplete —
+the swap makes the loss unrecoverable, the async hop loses it regardless.) **(ii) The child command
+line does not survive the zygote fork** — a full launch-seed design (`on_before_child_process_launch`
++ `command_line_get_global()`) was built, gated green, and live-tested: the browser logged `bridge
+seed appended … ifaces=1` and *verified it stuck*, yet the forked renderer read `seeded=false`, and
+`mode=sync` stayed 0. Disproved by its own pre-declared falsifier on the first boot and **reverted in
+full** (Eclipse's renderers are zygote forks — the M1 kernel probe below). **The pre-registered
+escalation "delay the driven load until inventory-ack" is RETIRED as architecturally circular:** the
+renderer that must ack is created BY the load you would delay. **The one remaining untested channel**
+is `extra_info` at `CreateBrowser` (delivered to every renderer for that browser, including swap
+renderers, before any context) — which would require DEFERRING the helper's `CreateBrowser` until the
+first load-drive, since `drive()` orders CreateView → BridgeRegister → LoadUrl. Not yet designed; it
+must be designed with a falsifier, not patched in.
 
 **Three REAL AOSP-contract divergences are now PROVEN** (each a defect in its own right, neither yet
 shown to BE the blocker): (1) **all-frames injection** — every `main_frame=false
