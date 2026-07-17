@@ -363,7 +363,7 @@ impl ApplicationHandler for GameWindow<'_> {
                 if self.handed_off {
                     let wv = crate::webview::client::active_view();
                     let routed = wv != 0
-                        && match webview_relative_point(position.x, position.y) {
+                        && match webview_relative_point(wv, position.x, position.y) {
                             Some((rx, ry, true)) => {
                                 crate::webview::client::send_mouse_move(wv, rx, ry);
                                 true
@@ -391,7 +391,7 @@ impl ApplicationHandler for GameWindow<'_> {
                             let wv = crate::webview::client::active_view();
                             let routed = wv != 0
                                 && match self.cursor.and_then(|(px, py)| {
-                                    webview_relative_point(f64::from(px), f64::from(py))
+                                    webview_relative_point(wv, f64::from(px), f64::from(py))
                                 }) {
                                     Some((rx, ry, true)) => {
                                         self.webview_pointer_down = true;
@@ -413,7 +413,7 @@ impl ApplicationHandler for GameWindow<'_> {
                                     // relative position — CEF handles out-of-view releases.
                                     let (px, py) = self.cursor.unwrap_or((0.0, 0.0));
                                     if let Some((rx, ry, _inside)) =
-                                        webview_relative_point(f64::from(px), f64::from(py))
+                                        webview_relative_point(wv, f64::from(px), f64::from(py))
                                     {
                                         crate::webview::client::send_mouse_click(wv, rx, ry, false);
                                     }
@@ -448,10 +448,9 @@ impl ApplicationHandler for GameWindow<'_> {
             WindowEvent::MouseWheel { delta, .. } if self.handed_off => {
                 let wv = crate::webview::client::active_view();
                 let routed = wv != 0
-                    && match self
-                        .cursor
-                        .and_then(|(px, py)| webview_relative_point(f64::from(px), f64::from(py)))
-                    {
+                    && match self.cursor.and_then(|(px, py)| {
+                        webview_relative_point(wv, f64::from(px), f64::from(py))
+                    }) {
                         Some((rx, ry, true)) => {
                             let dy = match delta {
                                 winit::event::MouseScrollDelta::LineDelta(_, y) => {
@@ -566,16 +565,30 @@ impl ApplicationHandler for GameWindow<'_> {
     }
 }
 
-/// 2026-07-03 (web-engine M3): map a window-pixel point onto the live WebView's CACHED composite
-/// rect. Returns the VIEW-RELATIVE coordinates plus whether the point lies INSIDE the rect
-/// (`None` when no rect is cached — input then stays with the engine; the composite's centered
-/// fallback rect deliberately does not capture input, an M6-revisit note).
-fn webview_relative_point(px: f64, py: f64) -> Option<(i32, i32, bool)> {
-    let (x, y, w, h) = crate::webview::client::composited_rect()?;
+/// 2026-07-03 (web-engine M3): map a window-pixel point onto the live WebView. Returns the
+/// VIEW-RELATIVE coordinates plus whether the point lies INSIDE the rect.
+///
+/// 2026-07-17: it now maps against the rect the compositor ACTUALLY DREW `view` at
+/// (`composited_screen_rect`), not the registry cache it used to read. Reading the cache made the
+/// hit-test resolve the rect INDEPENDENTLY of the composite, and the two disagreed: the cache is
+/// `None` for the challenge WebView (never measured headless), so the page drew at the composite's
+/// centered fallback rect while `?` bailed here — every press fell through to the engine beneath a
+/// visible page (measured 2026-07-17: 45 down + 45 up to the engine, 0 to the WebView). `None` now
+/// means only "nothing composited for this view yet", i.e. nothing on screen to click.
+fn webview_relative_point(view: i64, px: f64, py: f64) -> Option<(i32, i32, bool)> {
+    let rect = crate::webview::client::composited_screen_rect(view)?;
+    Some(relative_point_in(rect, px, py))
+}
+
+/// 2026-07-17: pure window-pixel → view-relative mapping against the composited rect. The blit
+/// puts stage pixel (0,0) at the rect's origin (`upload_bgra`'s `image_offset`), so subtracting
+/// that origin IS the view-relative coordinate — including when the clamp moved it.
+fn relative_point_in(rect: (i32, i32, u32, u32), px: f64, py: f64) -> (i32, i32, bool) {
+    let (x, y, w, h) = rect;
     let rx = px as i32 - x;
     let ry = py as i32 - y;
     let inside = rx >= 0 && ry >= 0 && (rx as u32) < w && (ry as u32) < h;
-    Some((rx, ry, inside))
+    (rx, ry, inside)
 }
 
 /// 2026-07-03 (web-engine M3): DELIBERATELY MINIMAL keyboard routing for the challenge widget
@@ -6775,5 +6788,53 @@ mod tests {
             let words = read_spirv(spv).unwrap_or_else(|e| panic!("{name} SPIR-V invalid: {e}"));
             assert!(!words.is_empty(), "{name} SPIR-V is empty");
         }
+    }
+
+    /// 2026-07-17 REGRESSION GUARD for the confirmed input-routing bug: the owner reached a REAL
+    /// 2-Step-Verification page, SAW it, and could not click it — 45 presses + 45 releases all went
+    /// to the engine's surface beneath, 0 to the WebView. Root cause: the compositor drew the
+    /// centered FALLBACK rect (no registry frame is recorded for the challenge WebView — it is
+    /// never measured headless) while the hit-test read the registry cache directly and bailed on
+    /// its `None`. This pins the two to ONE rect: what `resolve_webview_rect` draws is what
+    /// `webview_relative_point` maps against. Pure — no GPU, no display, no ART.
+    #[test]
+    fn a_centre_click_routes_into_a_webview_that_has_no_measured_frame_rect() {
+        // The measured state: `composited_rect()` = None, 800x600 window, 800x600 staged frame.
+        let drawn = crate::loader::vk_overlay::resolve_webview_rect(None, 800, 600, 800, 600)
+            .expect("the composite draws the centered fallback when no frame rect is cached");
+        // The rect the owner SAW ("composite objects built for rect x=0 y=0 w=800 h=600").
+        assert_eq!(drawn, (0, 0, 800, 600));
+
+        // The compositor publishes exactly what it drew; the hit-test consumes exactly that.
+        // (Process-global: this is the only test that publishes a screen rect.)
+        const VIEW: i64 = 0x5eed_1234;
+        crate::webview::client::publish_composited_screen_rect(
+            VIEW,
+            (drawn.0 as i32, drawn.1 as i32, drawn.2, drawn.3),
+        );
+
+        // The click the owner could not land: the centre of the window.
+        let (rx, ry, inside) = webview_relative_point(VIEW, 400.0, 300.0)
+            .expect("the hit-test must see the rect the compositor drew");
+        assert!(
+            inside,
+            "a click on the drawn page must route to the WebView, never fall through to the engine"
+        );
+        assert_eq!(
+            (rx, ry),
+            (400, 300),
+            "view-relative coords of the window centre"
+        );
+
+        // Negative: a view the compositor never drew captures nothing (input stays with the
+        // engine), so a successor view can never inherit its predecessor's rect.
+        assert!(webview_relative_point(VIEW + 1, 400.0, 300.0).is_none());
+        // Negative: a point outside the drawn rect is reported outside, not silently swallowed.
+        assert!(!relative_point_in(drawn_i32(drawn), 900.0, 300.0).2);
+        assert!(!relative_point_in(drawn_i32(drawn), -1.0, 300.0).2);
+    }
+
+    fn drawn_i32(r: (u32, u32, u32, u32)) -> (i32, i32, u32, u32) {
+        (r.0 as i32, r.1 as i32, r.2, r.3)
     }
 }

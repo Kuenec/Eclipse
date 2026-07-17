@@ -506,9 +506,15 @@ unsafe extern "system" fn eclipse_vk_get_swapchain_images_khr(
     r
 }
 
-/// The login text field's on-screen rect (from `NativeTextBoxInfo`: x=181, y=149, w=438, h=46 in the
-/// 800×600 surface space — matches the focused field), clamped to the surface. STEP B1 hardcodes this to
-/// prove compositing; B3 will use the live focused-field geometry + gate on focus. 2026-06-14.
+/// A hardcoded login-field rect (x=181, y=149, w=438, h=46 in the 800×600 surface space — the value
+/// `NativeTextBoxInfo` reported for the login field on 2026-06-14), clamped to the surface.
+///
+/// 2026-07-17: this is now reachable ONLY from the env-gated `ECLIPSE_VK_PROBE` diagnostic, which must
+/// still be able to read a rect back with no field focused. It is NOT a fallback for the draw path: it
+/// used to be, and that turned the engine's own "no field is focused" answer into "draw at a guess" —
+/// see [`resolve_field_rect`]. (The retired 2026-06-14 note promised B3 would "use the live
+/// focused-field geometry + gate on focus"; B3 delivered the geometry and neither the removal nor the
+/// gate, which is precisely where the stale credential overlay lived.)
 fn login_field_rect(extent: vk::Extent2D) -> vk::Rect2D {
     let x = 181u32.min(extent.width.saturating_sub(1));
     let y = 149u32.min(extent.height.saturating_sub(1));
@@ -526,38 +532,57 @@ fn login_field_rect(extent: vk::Extent2D) -> vk::Rect2D {
     }
 }
 
+/// Resolve the focused field's on-screen rect from the engine's cached `NativeTextBoxInfo` geometry,
+/// clamped to the surface — or `None` when there is NO live textbox session, in which case the overlay
+/// must draw NOTHING.
+///
+/// 2026-07-17: `None` in ⇒ `None` out is the entire point. This used to fall back to a hardcoded login
+/// rect, which discarded the one honest clear signal Eclipse already observes
+/// (`nativeGetTextBoxInfo() == null`, recorded by `framework::record_textbox_session`): 20 s after the
+/// owner reached the home screen the overlay was still compositing the credential `EditText`'s
+/// still-registered text onto that hardcoded rect. No timer, no heuristic — the engine's own protocol
+/// already answers "is a field live?", it was simply being overruled here.
+///
+/// Pure (clamp math byte-identical to the geometry arm it replaces) and unit-pinned, no GPU — the
+/// [`resolve_webview_rect`] precedent (2026-07-17).
+fn resolve_field_rect(
+    geom: Option<(i32, i32, u32, u32)>,
+    extent: vk::Extent2D,
+) -> Option<vk::Rect2D> {
+    let (gx, gy, gw, gh) = geom?;
+    if gw == 0 || gh == 0 {
+        return None;
+    }
+    let x = (gx.max(0) as u32).min(extent.width.saturating_sub(1));
+    let y = (gy.max(0) as u32).min(extent.height.saturating_sub(1));
+    let w = gw.min(extent.width - x).max(1);
+    let h = gh.min(extent.height - y).max(1);
+    Some(vk::Rect2D {
+        offset: vk::Offset2D {
+            x: x as i32,
+            y: y as i32,
+        },
+        extent: vk::Extent2D {
+            width: w,
+            height: h,
+        },
+    })
+}
+
 /// The focused field's on-screen rect: the engine's LIVE `NativeTextBoxInfo` geometry (cached by the main
-/// thread via `framework::textbox_geometry`, clamped to the surface) so the overlay text lands where the
-/// field actually is (the login layout drifts). Falls back to the hardcoded login rect (test/diagnostic).
-fn field_rect(extent: vk::Extent2D) -> vk::Rect2D {
+/// thread via `framework::textbox_geometry`) so the overlay text lands where the field actually is (the
+/// login layout drifts). `None` = no live field ⇒ nothing to draw.
+fn field_rect(extent: vk::Extent2D) -> Option<vk::Rect2D> {
     // Diagnostic: ECLIPSE_VK_SCREENSHOT → capture the WHOLE frame (the probe then writes a full-screen
     // PNG so the dev host can see the current UI + find drifted button/field positions).
     static SHOT: OnceLock<bool> = OnceLock::new();
     if *SHOT.get_or_init(|| std::env::var_os("ECLIPSE_VK_SCREENSHOT").is_some()) {
-        return vk::Rect2D {
+        return Some(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
-        };
+        });
     }
-    match crate::framework::textbox_geometry() {
-        Some((gx, gy, gw, gh)) if gw > 0 && gh > 0 => {
-            let x = (gx.max(0) as u32).min(extent.width.saturating_sub(1));
-            let y = (gy.max(0) as u32).min(extent.height.saturating_sub(1));
-            let w = gw.min(extent.width - x).max(1);
-            let h = gh.min(extent.height - y).max(1);
-            vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: x as i32,
-                    y: y as i32,
-                },
-                extent: vk::Extent2D {
-                    width: w,
-                    height: h,
-                },
-            }
-        }
-        _ => login_field_rect(extent),
-    }
+    resolve_field_rect(crate::framework::textbox_geometry(), extent)
 }
 
 /// Find the index of the engine's `our_sc` swapchain in the present info + the image index it presents.
@@ -1316,13 +1341,54 @@ fn clamp_webview_rect(
     Some((cx, cy, cw, ch))
 }
 
+/// 2026-07-17: THE single answer to "where is the live WebView on screen" — the cached absolute
+/// frame when the registry has one, else the centered fallback of the staged frame's own
+/// dimensions, in both cases CLAMPED to the surface + stage. `None` = nothing visible (skip).
+///
+/// It exists because the compositor and the input hit-test used to resolve this INDEPENDENTLY and
+/// disagreed: the composite fell back to a centered rect when `composited_rect()` was `None`, while
+/// `graphics::webview_relative_point` bailed on `None` — so the challenge WebView (whose recorded
+/// frame is degenerate: it is never measured headless, so `absolute_frame` returns `None`) DREW
+/// full-window but captured NO input, and 90/90 measured presses fell through to the engine
+/// beneath it. Both callers now consume this one function, so they cannot diverge again.
+///
+/// The CLAMPED rect is the honest one for both: `upload_bgra` blits stage pixel (0,0) to screen
+/// `(cx, cy)`, so `(cx, cy)` is where the view's origin actually lands (a negative requested origin
+/// SHIFTS the drawn content rather than cropping it — the M3 "top-left crop, no scaling" cut).
+/// Pure — unit-pinned, no GPU. `pub(crate)` so the input path's regression guard
+/// (`graphics::tests`) can compose it with the hit-test mapping it feeds.
+pub(crate) fn resolve_webview_rect(
+    cached: Option<(i32, i32, u32, u32)>,
+    extent_w: u32,
+    extent_h: u32,
+    stage_w: u32,
+    stage_h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let (x, y, w, h) = match cached {
+        Some(r) => r,
+        None => {
+            // `min` keeps both subtractions non-negative; a zero extent is refused by the clamp.
+            let w = stage_w.min(extent_w);
+            let h = stage_h.min(extent_h);
+            (
+                ((extent_w - w) / 2) as i32,
+                ((extent_h - h) / 2) as i32,
+                w,
+                h,
+            )
+        }
+    };
+    clamp_webview_rect(x, y, w, h, extent_w, extent_h, stage_w, stage_h)
+}
+
 /// Composite the active WebView's staged helper frame into the presented swapchain image.
 /// Returns `true` iff the submit consumed `engine_waits` (the caller then presents with a
 /// cleared wait list — the probe's `consumed` plumbing).
 ///
 /// Runs on the engine present thread: the ONLY client state it touches is the try-locked staging
 /// buffer ([`with_latest_frame`](crate::webview::client::with_latest_frame) — contention skips
-/// this present) and the cached rect; it never walks the registry or touches the socket.
+/// this present), the cached rect, and (2026-07-17) the screen rect it PUBLISHES for the input
+/// hit-test; it never walks the registry or touches the socket.
 fn composite_webview_frame(
     queue: vk::Queue,
     view: i64,
@@ -1347,37 +1413,20 @@ fn composite_webview_frame(
             return false;
         }
     };
-    crate::webview::client::with_latest_frame(view, |stage| {
+    // 2026-07-17: `resolve_webview_rect` is the ONE resolver the input hit-test consumes too (via
+    // the publish below) — the rect the user SEES is the rect the user CLICKS, by construction.
+    let (consumed, drawn) = crate::webview::client::with_latest_frame(view, |stage| {
         if stage.bytes.is_empty() {
-            return false;
+            return (false, None);
         }
-        // The cached absolute view rect (main-thread refreshed), else a centered rect of the
-        // stage's own dimensions (documented fallback; exact challenge-rect fidelity is
-        // re-validated at M6 per the plan's field-probe recalibration technique).
-        let (x, y, w, h) = match crate::webview::client::composited_rect() {
-            Some(r) => r,
-            None => {
-                let w = stage.width.min(extent.width);
-                let h = stage.height.min(extent.height);
-                (
-                    ((extent.width - w) / 2) as i32,
-                    ((extent.height - h) / 2) as i32,
-                    w,
-                    h,
-                )
-            }
-        };
-        let Some((cx, cy, cw, ch)) = clamp_webview_rect(
-            x,
-            y,
-            w,
-            h,
+        let Some((cx, cy, cw, ch)) = resolve_webview_rect(
+            crate::webview::client::composited_rect(),
             extent.width,
             extent.height,
             stage.width,
             stage.height,
         ) else {
-            return false;
+            return (false, None);
         };
         let rect = vk::Rect2D {
             offset: vk::Offset2D {
@@ -1414,9 +1463,17 @@ fn composite_webview_frame(
         if consumed && refresh {
             WEB_COMPOSITE_LAST.store(key, Ordering::Relaxed);
         }
-        consumed
+        // `upload_bgra` is `true` only once the blit SUBMITTED and its fence signalled, so it is
+        // an exact "these pixels are in the presented image" signal — publish the rect only then,
+        // never on a skipped/failed composite (input would then aim at pixels nobody drew).
+        (consumed, consumed.then_some((cx as i32, cy as i32, cw, ch)))
     })
-    .unwrap_or(false)
+    .unwrap_or((false, None));
+    // Published OUTSIDE the `views` try-lock the closure holds: the screen-rect lock stays a leaf.
+    if let Some(rect) = drawn {
+        crate::webview::client::publish_composited_screen_rect(view, rect);
+    }
+    consumed
 }
 
 /// Composite the overlay into the presented image (if our swapchain is being presented + the renderer is
@@ -1527,11 +1584,17 @@ unsafe fn present_with_overlay(
         // one). The readback fence-wait stalls the queue, but this only runs under the env-gated overlay/
         // probe (never in a normal/gameplay boot). No active field + not probing → plain present.
         let run = image_raw != 0 && (draw_text.is_some() || probe_enabled());
-        if run {
-            // Use the focused field's LIVE geometry (cached from the engine by the main thread) so the
-            // text lands where the field actually is — the login layout drifts. Fall back to the
-            // hardcoded login rect (test/diagnostic). Clamp to the surface.
-            let rect = field_rect(extent);
+        // 2026-07-17: ...and even then, only where the engine says the field IS. `None` = no live
+        // textbox session ⇒ draw NOTHING (see `resolve_field_rect`); the hardcoded login rect survives
+        // only for the env-gated probe, which must still read a frame back with no field focused.
+        // Resolved INSIDE `run` so a live-WebView present with no focused field keeps costing zero
+        // (`field_rect` takes the geometry lock — §2.4: no per-frame work off the trigger).
+        if let Some(rect) = run
+            .then(|| {
+                field_rect(extent).or_else(|| probe_enabled().then(|| login_field_rect(extent)))
+            })
+            .flatten()
+        {
             ensure_probe(rect);
             // 2026-07-03 (M3): if the webview composite above already consumed + fence-waited the
             // engine waits, the probe submit must not wait on them a second time.
@@ -1710,5 +1773,109 @@ mod tests {
         assert_eq!(clamp_webview_rect(0, 0, 0, 10, 800, 600, 64, 64), None);
         assert_eq!(clamp_webview_rect(0, 0, 10, 10, 800, 600, 0, 64), None);
         assert_eq!(clamp_webview_rect(0, 0, 10, 10, 0, 0, 64, 64), None);
+    }
+
+    /// 2026-07-17: the ONE rect the composite draws AND the input hit-test maps against. The
+    /// fallback arm is byte-for-byte the M3 composite's own (verified against the replaced code):
+    /// this fuses the fallback + clamp that were already there, it does not change what is drawn.
+    #[test]
+    fn resolve_webview_rect_falls_back_to_the_centered_stage_rect_and_always_clamps() {
+        // No cached frame — the MEASURED challenge-WebView case (`absolute_frame` returns None:
+        // the content is never measured headless). The page still draws, so it must still click.
+        assert_eq!(
+            resolve_webview_rect(None, 800, 600, 800, 600),
+            Some((0, 0, 800, 600))
+        );
+        // A stage smaller than the surface centers.
+        assert_eq!(
+            resolve_webview_rect(None, 800, 600, 400, 300),
+            Some((200, 150, 400, 300))
+        );
+        // A stage larger than the surface fills it (the fallback's own `min`).
+        assert_eq!(
+            resolve_webview_rect(None, 800, 600, 1024, 768),
+            Some((0, 0, 800, 600))
+        );
+        // A cached frame wins over the fallback...
+        assert_eq!(
+            resolve_webview_rect(Some((10, 20, 300, 200)), 800, 600, 1024, 768),
+            Some((10, 20, 300, 200))
+        );
+        // ...and is CLAMPED — the hit-test must agree with what is on screen, not the request.
+        assert_eq!(
+            resolve_webview_rect(Some((700, 500, 300, 200)), 800, 600, 1024, 768),
+            Some((700, 500, 100, 100))
+        );
+        // A negative origin lands the stage's (0,0) at the clamped origin (the M3 no-scaling cut),
+        // so the clamped rect is also the honest one to subtract in the hit-test.
+        assert_eq!(
+            resolve_webview_rect(Some((-5, -7, 300, 200)), 800, 600, 1024, 768),
+            Some((0, 0, 300, 200))
+        );
+        // Nothing visible → no composite → (via the publish) no input capture either.
+        assert_eq!(resolve_webview_rect(None, 0, 0, 800, 600), None);
+        assert_eq!(resolve_webview_rect(None, 800, 600, 0, 0), None);
+        assert_eq!(
+            resolve_webview_rect(Some((900, 0, 10, 10)), 800, 600, 64, 64),
+            None
+        );
+    }
+
+    /// 2026-07-17: no live textbox session ⇒ NO rect ⇒ the overlay draws nothing.
+    ///
+    /// This pins the fix for the stale masked-password overlay. MEASURED
+    /// (`/tmp/eclipse-owner-manual2.log`): `onAppReady: Home` at 06:11:20.461, and at 06:11:40.333 —
+    /// 20 s later, with the login long finished — `vk-overlay field-probe ink |
+    /// =-#*==#-=@=-@=#= | total_ink=408`, byte-identical to the 06:10:57.778 line, i.e. the
+    /// credential `EditText`'s still-registered text still being composited. The rect it was drawn at
+    /// came from `field_rect`'s hardcoded `login_field_rect` fallback, which fired precisely BECAUSE
+    /// the engine had answered "no field is focused" (`nativeGetTextBoxInfo() == null` ⇒ geometry
+    /// `None`). The clear signal was already there; the fallback threw it away.
+    ///
+    /// The `login_field_rect` constant must never be reachable from this resolver: that is the
+    /// difference between drawing where the engine says the field IS and drawing at a guess.
+    #[test]
+    fn resolve_field_rect_draws_nothing_without_a_live_textbox_session() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let as_tuple = |r: Option<vk::Rect2D>| {
+            r.map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
+        };
+        // THE BUG: no live session (the engine reported a null textbox info) ⇒ nothing is drawn.
+        // Pre-fix this returned the hardcoded login rect (181, 149, 438, 46) and the overlay drew.
+        assert_eq!(as_tuple(resolve_field_rect(None, extent)), None);
+        // A degenerate rect is not a drawable session either (and pre-fix it too fell through to the
+        // hardcoded rect, via the `gw > 0 && gh > 0` match guard).
+        assert_eq!(
+            as_tuple(resolve_field_rect(Some((181, 149, 0, 46)), extent)),
+            None
+        );
+        assert_eq!(
+            as_tuple(resolve_field_rect(Some((181, 149, 438, 0)), extent)),
+            None
+        );
+        // A live session draws at the geometry the ENGINE reported — the login layout drifts, which is
+        // why the hardcoded rect was wrong even while a field WAS focused. Both values are MEASURED
+        // (the boot's two `overlay/composite objects built for rect` lines, 06:09:30 and 06:09:34).
+        assert_eq!(
+            as_tuple(resolve_field_rect(Some((181, 300, 390, 46)), extent)),
+            Some((181, 300, 390, 46))
+        );
+        assert_eq!(
+            as_tuple(resolve_field_rect(Some((181, 149, 438, 46)), extent)),
+            Some((181, 149, 438, 46))
+        );
+        // ...and is CLAMPED to the surface (unchanged math — the field must never index outside it).
+        assert_eq!(
+            as_tuple(resolve_field_rect(Some((700, 560, 438, 46)), extent)),
+            Some((700, 560, 100, 40))
+        );
+        // A negative origin clamps to the surface origin rather than wrapping the `as u32` cast.
+        assert_eq!(
+            as_tuple(resolve_field_rect(Some((-5, -7, 300, 40)), extent)),
+            Some((0, 0, 300, 40))
+        );
     }
 }

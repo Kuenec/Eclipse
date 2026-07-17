@@ -12232,11 +12232,51 @@ pub fn textbox_input_type() -> i32 {
     TEXTBOX_INPUT_TYPE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 2026-07-17: the ONE writer of the focused-textbox cache. The geometry and the input type are two
+/// fields of ONE `NativeTextBoxInfo`, so they describe one textbox session and MUST be invalidated as
+/// a pair — `Some` records a complete live session, `None` clears BOTH.
+///
+/// Why this exists: `TEXTBOX_INPUT_TYPE` used to have one store and NO clear anywhere in the tree, so
+/// a mask outlived the session that justified it. Measured (`/tmp/eclipse-owner-manual2.log`):
+/// `text_input_type=5` (secure) was recorded ONCE at 06:09:29 and never again across three credential
+/// fields AND the home screen, while the overlay was still compositing the credential `EditText`'s
+/// text at 06:11:40 — 20 s after `onAppReady: Home`. The masking coin merely landed the safe way up:
+/// had the last recorded type been the username's `7`, the same incoherence would have rendered the
+/// password in PLAINTEXT (the geometry and the type advance together here; `ACTIVE_TEXT_FIELD`, which
+/// selects the TEXT, is a separate identity that this record cannot and does not speak for).
+fn record_textbox_session(session: Option<(i32, i32, u32, u32, i32)>) {
+    match session {
+        Some((x, y, w, h, input_type)) => {
+            if let Ok(mut g) = TEXTBOX_GEOM.lock() {
+                *g = Some((x, y, w, h));
+            }
+            TEXTBOX_INPUT_TYPE.store(input_type, std::sync::atomic::Ordering::Relaxed);
+            // Log once per distinct value (so the username vs password input-type values surface).
+            static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+            if LAST.swap(input_type, std::sync::atomic::Ordering::Relaxed) != input_type {
+                tracing::info!(text_input_type = input_type, "focused textbox input type");
+            }
+        }
+        None => {
+            if let Ok(mut g) = TEXTBOX_GEOM.lock() {
+                *g = None;
+            }
+            TEXTBOX_INPUT_TYPE.store(i32::MIN, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Query the engine for the focused textbox's geometry (`NativeGLInterface.nativeGetTextBoxInfo` →
 /// `x/y/width/height` floats) and cache it for the overlay. MUST be called on the JNI-attached main thread
-/// (the engine's `getTextBoxInfo` is a normal Java-thread query — no reentrancy into Eclipse). Best-effort:
-/// a missing class/method/field or a JNI throw is cleared and leaves the cache unchanged; a null info (no
-/// active textbox) clears it. 2026-06-14.
+/// (the engine's `getTextBoxInfo` is a normal Java-thread query — no reentrancy into Eclipse).
+///
+/// 2026-07-17: the cache holds a session only while the engine's last ANSWERED query described a
+/// complete, drawable one. Once `nativeGetTextBoxInfo` has answered, EVERY exit records that answer via
+/// [`record_textbox_session`] — a null info (no active textbox), a degenerate rect, or an unreadable
+/// field all clear BOTH halves. Failing closed (the overlay skips a frame) is correct where failing open
+/// re-renders a previous session's credentials under a previous session's mask. A query that never got
+/// an answer (the class/method is missing, or the call itself throws) is NOT an answer and deliberately
+/// leaves the cache unchanged — see the `checked` arms below.
 pub fn query_textbox_geometry(vm: &Vm) {
     let raw = vm.as_raw();
     if raw.is_null() {
@@ -12262,12 +12302,12 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 )?
                 .l()
             }) else {
+                // The query never answered — no information, so the cache is left as it is.
                 return;
             };
             if info.is_null() {
-                if let Ok(mut g) = TEXTBOX_GEOM.lock() {
-                    *g = None;
-                }
+                // The engine's own "no textbox is focused" signal — authoritative. 2026-07-17.
+                record_textbox_session(None);
                 return;
             }
             let Ok(info_cls) = checked(env, "Object.getClass", |env| {
@@ -12279,6 +12319,7 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 )?
                 .l()
             }) else {
+                record_textbox_session(None);
                 return;
             };
             // Read one `float` field of `info` by name (getDeclaredField → setAccessible → getFloat).
@@ -12320,6 +12361,7 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 read(env, "width"),
                 read(env, "height"),
             ) else {
+                record_textbox_session(None);
                 return;
             };
             // Read the `int` textInputType (for password masking): getDeclaredField → setAccessible → getInt.
@@ -12355,19 +12397,15 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 })
                 .ok()
             })();
-            if w > 0.0 && h > 0.0 {
-                if let Ok(mut g) = TEXTBOX_GEOM.lock() {
-                    *g = Some((x as i32, y as i32, w as u32, h as u32));
+            // 2026-07-17: a session needs BOTH a drawable rect and its input type. A degenerate rect
+            // (nothing to draw on) or an unreadable `textInputType` (nothing to mask WITH) is not one:
+            // recording the halves independently is what let the geometry advance to the password while
+            // the mask still described the username.
+            match (w > 0.0 && h > 0.0, input_type) {
+                (true, Some(it)) => {
+                    record_textbox_session(Some((x as i32, y as i32, w as u32, h as u32, it)))
                 }
-                if let Some(it) = input_type {
-                    TEXTBOX_INPUT_TYPE.store(it, std::sync::atomic::Ordering::Relaxed);
-                    // Log once per distinct value (so the username vs password input-type values surface).
-                    static LAST: std::sync::atomic::AtomicI32 =
-                        std::sync::atomic::AtomicI32::new(i32::MIN);
-                    if LAST.swap(it, std::sync::atomic::Ordering::Relaxed) != it {
-                        tracing::info!(text_input_type = it, "focused textbox input type");
-                    }
-                }
+                _ => record_textbox_session(None),
             }
         }));
         Ok(())
@@ -17539,6 +17577,46 @@ mod tests {
     // threads where ART aborts (`scoped_thread_state_change`) — the same constraint documented for
     // `runtime::boot`. It is validated from `main()` via `eclipse run <demo.apk>`. The host-thread-
     // independent data — the encoded recipe — is unit-tested here.
+
+    /// 2026-07-17: the focused-textbox geometry and its `textInputType` are two fields of ONE
+    /// `NativeTextBoxInfo` and MUST be invalidated together.
+    ///
+    /// `TEXTBOX_INPUT_TYPE` had exactly one write site and NO clear anywhere in the tree, so the mask
+    /// outlived its session. MEASURED (`/tmp/eclipse-owner-manual2.log`): `focused textbox input
+    /// type text_input_type=5` appears EXACTLY ONCE, at 06:09:29.436 — across three credential fields
+    /// (username → password → 2FA) AND the home screen — while the overlay was still compositing
+    /// credential text at 06:11:40, 20 s after `onAppReady: Home`. The masking coin happened to land
+    /// the safe way up; had the last recorded type been the username's `7`, the identical incoherence
+    /// would have rendered the PASSWORD IN PLAINTEXT. Masking a secure field is a security feature, so
+    /// what is pinned here is that the mask cannot outlive the field it describes.
+    ///
+    /// Extracting the writer is what makes this testable at all: the clear used to live inside a JNI
+    /// closure needing a booted ART VM, which is why it was never pinned. This test is VM-free — but it
+    /// does touch process-global statics, so both phases stay in this one function.
+    #[test]
+    fn record_textbox_session_invalidates_geometry_and_input_type_together() {
+        // A live session records BOTH halves.
+        record_textbox_session(Some((10, 20, 300, 40, 5)));
+        assert_eq!(textbox_geometry(), Some((10, 20, 300, 40)));
+        assert_eq!(textbox_input_type(), 5);
+
+        // The engine reports no live textbox ⇒ BOTH halves clear. Pre-fix the geometry cleared and the
+        // input type did not, leaving `5` (or, just as reachable, a stale `7`) to mask the next draw.
+        record_textbox_session(None);
+        assert_eq!(textbox_geometry(), None);
+        assert_eq!(
+            textbox_input_type(),
+            i32::MIN,
+            "the mask must not outlive the session that justified it"
+        );
+
+        // The username's type (7) must not survive into a later session either — the pair moves as one.
+        record_textbox_session(Some((181, 149, 438, 46, 7)));
+        assert_eq!(textbox_input_type(), 7);
+        record_textbox_session(None);
+        assert_eq!(textbox_geometry(), None);
+        assert_eq!(textbox_input_type(), i32::MIN);
+    }
 
     #[test]
     fn recipe_descriptors_match_confirmed_spec() {
