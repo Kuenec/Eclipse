@@ -228,6 +228,40 @@ before any history-rewriting/force operation.
   **`Load generic challenge failed` = 0**, plus the new `honoring the User-Agent the app set …` INFO carrying the
   `Hybrid()` token — i.e. challenge26's forced-token result reproduced with NOTHING forced. After that the only
   gap to a completed login is **real credentials**.
+- **2026-07-16 — ✅❓ THE DEFERRAL PROBE ANSWERED ITS QUESTION: **THE APP TOLERATES A DEFERRED 3-ARG setCookie
+  CALLBACK** (measured, 3× `ua-set` with callbacks outstanding, zero strand) — the strategy is ALIVE. And it
+  exposed the NEXT forcing trigger exactly at the correctness proof's declared boundary: a `getCookie` **757 µs**
+  after the sets, against a now-NON-EMPTY buffer (full record: §6 2026-07-16 ✅❓).** Probe:
+  `ECLIPSE_WEBVIEW_DEFER_COOKIE_CB=1` (exact "1"; ships **DARK** — the default 3-arg arm still forces, i.e.
+  today's behaviour; OFF is a structurally-pinned no-op). Under the gate a 3-arg `CookieSetForResult` buffers its
+  **original frame** (lossless — `expires_epoch_s` rides along) and is answered with the ENGINE's REAL flag on
+  replay — **nothing fabricated, nothing dropped**. Strand bounded at BOTH ends: a `CookiesClear` holding an
+  unanswered callback returns `NeedsEngine` (the shipped clear would have DROPPED the owed frame — found while
+  implementing, not in the brief); `shutdown` answers **false**, which is *accurate*, not fabricated (AOSP: the
+  value "indicates whether the cookie was set successfully"; on that path no engine ever existed, so it genuinely
+  was not set — the flag M4 refused to fabricate is a `true` nobody measured). AOSP re-checked verbatim: *"This
+  method is asynchronous… `onReceiveValue` will be called on the current thread's `Looper` once the operation is
+  complete"* — **no deadline**, so the deferral is contract-legal. Gate: root **654**+6+2 (+5 pins, every one
+  negative-tested), helper **41+15 UNCHANGED** (zero helper diff), `__webview-test` EXIT=0 marker intact both ON
+  and OFF. **THE MEASUREMENT (`/tmp/eclipse-challenge30-defercb.log`):** `ECLIPSE-DEFER-CB deferred` **2** ·
+  **`ECLIPSE-DEFER-CB ua-set` 3** ← *the app reached `setUserAgentString` ~30 s later with the callbacks STILL
+  unanswered* · `shutdown`-strand **0**. **⇒ THE APP DOES NOT BLOCK ON THE COOKIE CALLBACK. Candidate (b) is
+  VIABLE.** **BUT the headline still fails** (`honoring the app's UA` 0, `bridge call received` 0, `Load generic
+  challenge failed` 1) because a NEW trigger forced the spawn: `reason="getCookie after this boot set a cookie —
+  CEF owns url/domain/path matching"`. **The app's startup pattern is measured: setCookie, setCookie, getCookie —
+  all inside 757 µs at `AppManager.initialize`.** The two sets deferred; the get then hit the **non-empty buffer**,
+  which the §6 ⏳ proof EXPLICITLY declared it would not cross (*"it says nothing about `CookieSetForResult` or a
+  non-empty-buffer `CookieGet` — that is the proof's boundary, and the design respects it rather than papering
+  over it"*). The proof held exactly as written; the boundary is simply where the app lives. ⇐ **START-HERE-NEXT —
+  ONE well-posed question, and the whole chain turns on it:** *can Eclipse answer `getCookie(url)` against its own
+  buffered sets WITHOUT duplicating CEF's RFC-6265 url/domain/path matching?* Options, none endorsed: (i) prove
+  the app's get-URL is byte-equal to its set-URLs on this path (measure it — the frames are in hand; if so, an
+  exact-match answer is provably equal WITHOUT a matching engine, and the deferral completes); (ii) accept
+  duplicating a narrow, well-specified subset of RFC 6265 with a differential test against CEF (expensive, and the
+  design rejected it once — revisit only with evidence); (iii) the CDP lever (§5 ☠️ — still owes an argument past
+  CLAUDE.md's no-workaround rule). **Everything else is now known:** the app tolerates deferral, the sets buffer
+  losslessly, the strand is bounded, and forcing the token makes the challenge COMPLETE and reach the app
+  (challenge26). This is the last unknown.
 - **2026-07-16 — ☠️ LEVER (1) IS DEAD BY CONSTRUCTION — the code's own doc kills it. Both named levers are now
   closed; the UA ordering needs a NEW idea, not one of the two on file.** Lever (1) was *"prove M4's
   `classify_cookie_set_rejection` mirror is EXACT vs CEF's documented sync-false predicates; if so the 3-arg
