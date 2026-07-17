@@ -567,10 +567,22 @@ TID_RENDERER) introspects Eclipse's OWN injected stub. Verdict: `main_frame=true
 frame=https://www.roblox.com` → `__globalRobloxAndroidBridge__` is `"object"` with
 `[["executeRoblox","function"]]` and our `cefQuery` router present — **the stub is FULLY INTACT**,
 applied **+3 ms** after `load started` and **539 ms BEFORE** the wrapper's first console line.
-**The injection race is DEFINITIVELY DEAD**; the wrapper has a correct, reachable, correctly-named
-bridge and does not call it. The app's single bridge method is now known: `executeRoblox`.
+The wrapper has a correct, reachable, correctly-named bridge at load-end and does not call it. The
+app's single bridge method is now known: `executeRoblox`. **A LATE race is excluded — but NOT an
+early one** (self-correction, same day): `context ready (requested inventory)` → `stubs applied` is
+an **11 ms window** in which the new document's context exists with NO bridge, and a load-end
+snapshot is blind to a module-init latch inside it.
 
-**Two REAL AOSP-contract divergences are now PROVEN** (each a defect in its own right, neither yet
+**Why M6 (B)'s synchronous injection never engaged — and cannot:** the renderer's inventory is
+created once per renderer PROCESS and never cleared, yet `context ready (requested inventory)` fires
+TWICE — so the real page runs in a **fresh renderer process** (Chromium's cross-document process
+swap). Its inventory is empty by construction, so `mode=sync` can never fire for a driven load: the
+process that needs the inventory at `on_context_created` is created BY the navigation being injected
+into. AOSP has no such window. The recorded escalation ("delay the driven load until inventory-ack")
+needs real design — CEF has no synchronous renderer→browser pull, and `on_browser_created`'s
+`extra_info` / `CefRegisterExtension` both fire before the inventory is known.
+
+**Three REAL AOSP-contract divergences are now PROVEN** (each a defect in its own right, neither yet
 shown to BE the blocker): (1) **all-frames injection** — every `main_frame=false
 frame=https://arkoselabs.roblox.com` line reports `"type":"undefined"`; Eclipse injects into the
 main frame ONLY, while AOSP/Chromium's Java Bridge installs the objects into EVERY frame; (2) **the

@@ -200,8 +200,27 @@ before any history-rewriting/force operation.
   FULLY INTACT in the main frame**, the router is present, and the app's single bridge method is now known:
   **`executeRoblox`**. Timeline (challenge22): `load started` …999849 → `bridge stubs applied` …999852 (**+3 ms**)
   → the wrapper's first console …000391 (**+539 ms**) → introspect confirms the stub intact …000405 → `load
-  finished` …000412. ⇒ **THE INJECTION RACE IS DEFINITIVELY DEAD** (it was already doubted; now it is measured
-  from both ends). The wrapper has a correct, reachable bridge and simply does not call it. **TWO REAL DIVERGENCES
+  finished` …000412. ⇒ **the race is dead FOR THE WRAPPER'S LOGGED CALLS** — but see the CORRECTION below: it is
+  NOT dead for a module-init latch. The wrapper has a correct, reachable bridge at load-end and does not call it.
+  ⚠️ **SELF-CORRECTION (same day, before this shipped — do not repeat the error):** an earlier draft of this entry
+  claimed "THE INJECTION RACE IS DEFINITIVELY DEAD". **That was an OVERCLAIM.** What is measured is that the stub
+  is present 539 ms before the wrapper *logs*. It is NOT proven that the stub was present before the page's FIRST
+  SCRIPT ran: `main-frame context ready (requested bridge inventory)` …999841 → `bridge stubs applied` …999852 is
+  an **11 ms window** in which the new document's context exists and page scripts may run with NO bridge. If the
+  wrapper latches its platform at bundle module-init inside that window, the race is ALIVE and every later
+  observation (including this introspection) is blind to it. **NEW STRUCTURAL FINDING that makes this worse and
+  explains M6 (B)'s failure to engage:** the renderer's inventory is an `Arc<Mutex<HashMap>>` created ONCE PER
+  RENDERER PROCESS (`main.rs:715`) and never cleared — yet the log shows `context ready (requested …)` **twice**,
+  the second time for the real page. The only explanation is a **renderer PROCESS SWAP** on the cross-document
+  navigation (about:blank → www.roblox.com): Chromium starts a FRESH renderer whose inventory is empty, so the
+  pull model must round-trip again. **⇒ `mode=sync` can NEVER fire for a driven load** — the M6 (B) "truly
+  synchronous injection" root fix is architecturally unable to engage, because the process that would need the
+  inventory at `on_context_created` was created by the very navigation being injected into. AOSP has no such
+  window: `addJavascriptInterface` objects exist before ANY page script in EVERY frame. **That is a THIRD proven
+  AOSP divergence and the pre-registered escalation ("delay the driven load until inventory-ack") is the recorded
+  answer — it needs real design (CEF has no synchronous renderer→browser pull; candidate seams are
+  `on_browser_created`'s `extra_info` and `CefRegisterExtension`, neither of which knows the inventory at the time
+  it fires).** **TWO REAL DIVERGENCES
   PROVEN (both genuine AOSP-contract violations in their own right, independent of whether either is THE
   blocker):** (1) **ALL-FRAMES INJECTION** — every `main_frame=false frame=https://arkoselabs.roblox.com` line
   (3×) reports `"type":"undefined"`: Eclipse's stub reaches ONLY the main frame, but AOSP/Chromium's Java Bridge
@@ -7769,12 +7788,36 @@ THE blocker — record them as such, do not conflate them with a bridge "fix"):*
    `CefMessageRouter` is asynchronous BY DESIGN, so an AOSP-faithful synchronous return needs a different
    primitive. **That is a real design question, not a one-liner** — it must be designed, not patched.
 
+*⚠️ SELF-CORRECTION — an overclaim caught before it shipped; recorded so the error is not repeated.* The first
+draft of this entry concluded "THE INJECTION RACE IS DEFINITIVELY DEAD". **It is not.** What is measured is that
+the stub is intact 539 ms before the wrapper **LOGS** — that says nothing about when the wrapper **LATCHED** its
+platform. The real window is `main-frame context ready (requested bridge inventory)` …999841 → `bridge stubs
+applied` …999852 = **11 ms** in which the new document's V8 context exists and page scripts can run with NO
+bridge. A load-end snapshot is structurally blind to a module-init latch inside it. The honest claim is narrower:
+**a LATE race is excluded; an EARLY (module-init) race is NOT.**
+
+*NEW STRUCTURAL FINDING — why M6 (B)'s "truly synchronous injection" never engaged, and architecturally cannot.*
+The renderer's inventory is an `Arc<Mutex<HashMap<String, Vec<String>>>>` created ONCE PER RENDERER PROCESS
+(`crates/eclipse-webview/src/main.rs:715`) and **never cleared**. Yet the log shows `main-frame context ready
+(requested bridge inventory)` **twice** — once for about:blank, again for the real page — with a matching second
+`bridge inventory pushed on render-view-ready`. If both contexts lived in ONE renderer, the second
+`on_context_created` would have found a populated inventory and logged `mode=sync`. It logged `requested`. **⇒ the
+real page runs in a FRESH RENDERER PROCESS** (Chromium's cross-document process swap, about:blank →
+www.roblox.com), whose inventory is empty by construction. **Therefore `mode=sync` can NEVER fire for a driven
+load:** the process that would need the inventory at `on_context_created` is created BY the very navigation being
+injected into. This is a **THIRD proven AOSP divergence** — AOSP has no such window (`addJavascriptInterface`
+objects exist before ANY page script, in EVERY frame). The pre-registered escalation ("delay the driven load until
+inventory-ack") is the recorded answer and **needs real design, not a patch**: CEF offers no synchronous
+renderer→browser pull, and the obvious seams (`on_browser_created`'s `extra_info`; `CefRegisterExtension` at
+WebKit-init) both fire BEFORE the inventory is known. Deliberately NOT attempted at the end of this session.
+
 *HONEST STATUS — the bridge blocker is NOT identified, and this entry does not pretend otherwise.*
-RULED OUT with evidence: the injection race (measured, above); app-callback delivery (fixed, §6 🧵); UA steering
-as the BRIDGE's cause (silent under both the honest and the Android UA — though the UA does decide whether the
-challenge itself completes, §6 🕵️). NOT ruled out: the two divergences above; and the wrapper's own
-platform-detection logic, which is **unknown and must stay inferred from first-party observation** — reading
-Roblox's wrapper JS to find out is OFF-POLICY and was not done.
+RULED OUT with evidence: a LATE injection race (the stub is intact and correctly named 539 ms before the
+wrapper's calls); app-callback delivery (fixed, §6 🧵); UA steering as the BRIDGE's cause (silent under both the
+honest and the Android UA — though the UA does decide whether the challenge itself completes, §6 🕵️). NOT ruled
+out: an EARLY module-init race inside the 11 ms window; the THREE divergences (all-frames, synchronous shape,
+before-first-script); and the wrapper's own platform-detection logic, which is **unknown and must stay inferred
+from first-party observation** — reading Roblox's wrapper JS to find out is OFF-POLICY and was not done.
 
 *Gate (measured 2026-07-16):* helper **38 + 15** (was 35+15; +3 = `bridge_diag_gate_is_exact_match_one_only`,
 `build_bridge_introspection_js_reads_only_our_inventory_and_never_scans_the_page`,
