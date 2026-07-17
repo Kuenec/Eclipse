@@ -293,7 +293,17 @@ before any history-rewriting/force operation.
   does NOT respawn (it never sets a UA). ⇐ **START-HERE-NEXT: the remaining gap to a COMPLETED LOGIN is REAL
   CREDENTIALS** — the synthetic password is fake, so the post-challenge `v2/login` still 403s on credentials, not
   on Eclipse. Also open (unchanged, all owner-facing): §7 #1 vendor reception by a real human, #4 LTS-vs-stable
-  cadence, #5 payload sign-off. Recorded divergences carried: `apply` not proved deterministic (CEF's *"or if
+  cadence, #5 payload sign-off. **✅ AND THE SERVER ITSELF CONFIRMS THE CHALLENGE IS SATISFIED — MEASURED, not
+  inferred:** the PRE-challenge `auth.roblox.com/v2/login` returns `403 bodySize:`**`82`**, and the known body
+  `{"errors":[{"code":0,"message":"Challenge is required to authorize the request"}]}` is **exactly 82 bytes**
+  (measured, not eyeballed) — matching it byte-for-byte. The POST-challenge `v2/login` returns
+  `403 bodySize:`**`85`** — **a DIFFERENT body: the server has STOPPED demanding a challenge.** The app's own
+  datamodel flow agrees: `LoginV2 → ChallengeNativeWrapper → ChallengeHybridWebView → LoginV2`, and it **never
+  re-enters the challenge**. ⇒ **ECLIPSE'S PART OF THE LOGIN CHALLENGE IS COMPLETE.** ⚠️ HONEST LIMIT: the
+  85-byte body was NOT logged with a warning triad, so its text is **UNREAD** — do NOT claim it says "incorrect
+  username or password". What is PROVEN is only that it is **not a challenge demand**; the one remaining variable
+  on this path is the synthetic/fake credential, which only the owner can supply. Recorded divergences carried:
+  `apply` not proved deterministic (CEF's *"or if
   cookies cannot be accessed"* race); expiry crossing the ~300 ms swap; the microsecond quiescence race (it
   announces itself); the `RESPAWN_IN_PROGRESS` park's honest degradation.
 - **2026-07-16 — 🔓 CANDIDATE (b) IS DEAD AT THE `getCookie` BOUNDARY — **AND THAT REOPENS RESPAWN-AND-REPLAY,
