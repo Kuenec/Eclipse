@@ -303,6 +303,25 @@ fn env_path(var: &str) -> Option<PathBuf> {
     }
 }
 
+/// Split `ECLIPSE_VM_OPTIONS` into individual `JavaVMOption` strings (2026-07-17, dev-host
+/// diagnostic — see the `boot` call site).
+///
+/// `;`-separated, NOT `:`, because ART's own options embed colons (`-Xmethod-trace-file:<path>`).
+/// Empty/whitespace segments are dropped so a trailing or doubled `;` never becomes an empty option
+/// (an empty `JavaVMOption` makes `JNI_CreateJavaVM` fail). Pure over its argument — the process
+/// environment is read by the caller — so it is unit-testable without mutating global env state.
+fn vm_options_from_env(raw: Option<&std::ffi::OsStr>) -> Vec<String> {
+    raw.map(|s| {
+        s.to_string_lossy()
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Stock ATL framework install dir — the **last-resort** framework source. `find_framework`
 /// prefers `ECLIPSE_ANDROID_FRAMEWORK_DIR`, then the auto-detected patched overlay
 /// ([`patched_overlay_dir`]); this stock dir is used only when neither is present. 2026-06-14:
@@ -892,6 +911,22 @@ pub fn boot(
     let mut option_strings: Vec<CString> = Vec::new();
     option_strings.push(make_cstring(format!("-Ximage:{}", boot_image.display()))?);
     for opt in plan.vm_options() {
+        option_strings.push(make_cstring(opt)?);
+    }
+    // 2026-07-17 — dev-host diagnostic passthrough (`ECLIPSE_VM_OPTIONS`), absent in normal runs, so
+    // the option array is byte-identical when it is unset. The env read belongs HERE and not in
+    // `BootPlan::vm_options`: that fn is pure over the plan (and unit-tested as such) — the same
+    // reason `-Ximage:` is added here from a *discovered* path rather than modelled in the plan.
+    // Separator is `;` because ART's own options embed colons (`-Xmethod-trace-file:<path>`).
+    // Motivating use: `-Xmethod-trace` + `-Xmethod-trace-file:<f>` — the only remaining instrument
+    // that can show which methods the app calls while it declines to build the challenge WebView
+    // (AGENTS.md §6, 2026-07-17). WARN-announced: an unfaithful VM is never configured silently.
+    for opt in vm_options_from_env(std::env::var_os("ECLIPSE_VM_OPTIONS").as_deref()) {
+        tracing::warn!(
+            opt = opt.as_str(),
+            "ECLIPSE_VM_OPTIONS is adding a dev-host VM option — this VM is NOT the shipped \
+             configuration"
+        );
         option_strings.push(make_cstring(opt)?);
     }
     // With an APK, add the app + framework to the classpath (and the framework natives to
@@ -1518,6 +1553,38 @@ mod tests {
                 .count();
             assert_eq!(count, 1, "duplicate soname entry: {}", entry.soname);
         }
+    }
+
+    // 2026-07-17: guards the ECLIPSE_VM_OPTIONS dev-host passthrough (`boot`). The load-bearing
+    // property is the DEFAULT: unset -> ZERO options, so a normal boot's JavaVMOption array is
+    // byte-identical to the pre-change one. The `;` split (not `:`) and the empty-segment drop are
+    // the other two: ART options embed colons, and an empty JavaVMOption fails JNI_CreateJavaVM.
+    #[test]
+    fn vm_options_from_env_defaults_to_none_and_splits_on_semicolons_never_colons() {
+        use std::ffi::OsStr;
+
+        // The default a shipped run takes: absent or empty -> nothing added at all.
+        assert!(vm_options_from_env(None).is_empty());
+        assert!(vm_options_from_env(Some(OsStr::new(""))).is_empty());
+        assert!(vm_options_from_env(Some(OsStr::new("  ;; ; "))).is_empty());
+
+        // A colon-bearing ART option must survive INTACT — splitting on `:` would shred it.
+        assert_eq!(
+            vm_options_from_env(Some(OsStr::new("-Xmethod-trace-file:/tmp/t.bin"))),
+            vec!["-Xmethod-trace-file:/tmp/t.bin".to_owned()]
+        );
+
+        // Multiple options, with a doubled/trailing separator and padding, are cleanly split.
+        assert_eq!(
+            vm_options_from_env(Some(OsStr::new(
+                " -Xmethod-trace ;; -Xmethod-trace-file:/tmp/t.bin ; -Xmethod-trace-file-size:8000000 ;"
+            ))),
+            vec![
+                "-Xmethod-trace".to_owned(),
+                "-Xmethod-trace-file:/tmp/t.bin".to_owned(),
+                "-Xmethod-trace-file-size:8000000".to_owned(),
+            ]
+        );
     }
 
     #[test]

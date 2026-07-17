@@ -9621,6 +9621,327 @@ the other tool. Trust the instrument, never the narrative.**
 
 ---
 
+### 2026-07-17 — APK 2.724.735 → 2.730.790: upgrade gate CLEARED, loader untouched; new blocker is a
+### native (non-WebView) challenge. Confirmed side-find: the vendored ART `LambdaMetafactory` returns `null`.
+
+*Owner acquired the newer app himself* (APKMirror **universal** variant — the only row on that page carrying
+`x86_64`; every other variant is ARM-only. `minAPI26`, versionCode **2718**, 216 MB, all three ABIs, already
+merged so **no bundletool step** — unlike the 2.724.735 `base.apk` + `split_config.x86_64.apk` route). Not
+committed (§8 `.gitignore` guards `*.apk`). **Nothing pushed** — owner instruction *"just dont push to github"*
+stands and overrides §8's push policy.
+
+*LOADER: ZERO CHANGES NEEDED — the headline result.* `__run-libroblox-init` on 2.730.790: **ALL 3511/3511
+constructors completed without a crash, EXIT=0**. Under `BIND_NOW` that resolves the full import table for real.
+`DT_NEEDED` is **byte-identical** across versions (same 10 libs); `libroblox.so` grew only 2.8%
+(111,823,960 → 114,915,632). Undefined-symbol diff: **+4** (`fmal`, `lround`, `powl`, `sinhf`), **−3**
+(`basename`, `getpwuid_r`, `__pread64_chk`). Three of the four new ones looked unresolvable on paper —
+`sinhf` is genuinely absent from `libm-shim`'s `fwd1_f32!` list (which *does* carry `coshf`/`tanhf`), and
+`fmal`/`powl` are `long double`, which the pure-Rust `libm` crate has no support for. **All four resolve
+anyway**: the real loader routes math to **host glibc libm** (`bionic_env.rs:75`), and `libm-shim` serves only
+the legacy apkenv path. Three milestones of hardening against 2.724.735 specifically did not cost a line.
+
+*UPGRADE GATE: CLEARED.* `upgradeStatus` **2 → 3** (2 was terminal on every prior boot); `UpgradeCheckHelper`
+now takes a *different branch* — "Perform upgrade check with the server..." instead of "Rely on the
+upgrade-status set by the Init process" (no-compare). Manifest read correctly: `Version = 2.730.790, Code =
+2718`. Reaches `LoginV2`. Zero `UnsatisfiedLinkError`, zero panics. **`canStartGame = false: Upgrade required`
+was never re-reached** — but note it fired at *Play-click* time, and login never completed, so the gate is
+**cleared at startup, unproven at Play**.
+
+*NEW BLOCKER.* Login submits fine (log shows each keystroke `engine key → active text field (typed)` and the
+submit tap `consumed=true`; the 403 proves input works end-to-end). Then: `403 "Challenge is required to
+authorize the request"` → **+0.2 ms** → `[FLog::Warning] Rendering native challenge.` → `onAppReady:
+ChallengeNativeWrapper` → back to `LoginV2` → **no `v2/login` retry, ever** → permanent spinner.
+**Root cause of the hang: UNDIAGNOSED** at the time this entry was written.
+
+> ⚠️ **CORRECTED SAME DAY — see the `2026-07-17 (later)` entry below. This paragraph originally concluded
+> *"the app no longer asks for a WebView … it is an immediate, designed reaction to the 403 … M6 is not
+> broken; it is bypassed."* **That was WRONG.** `ChallengeNativeWrapper` is only a WRAPPER; with the app's
+> own logs kept at INFO (the first run's filter had hidden them) the very next line is `Rendering generic
+> web challenge.` → `ChallengeHybridWebView`. It IS the web challenge, and **M6's path is the RIGHT one —
+> it is simply never reached.** The zero webview counters were the SYMPTOM, not the design. Do not cite the
+> "bypassed by design" reading.
+
+*CONFIRMED SIDE-FIND — real, class-wide, and NOT the blocker.* `/usr/lib/java/dex/art/core-oj-hostdex.jar`
+ships AOSP's **placeholder** `java.lang.invoke.LambdaMetafactory`: both `metafactory` and `altMetafactory` are
+literally `const/4 v0, 0x0 / return-object v0` (**`return null;`**) — verified by hand in the smali. The same
+boot classpath retains **342 un-desugared `invoke-custom` sites** (339 core-oj + 3 core-libart), and
+`strings libart.so` yields **zero** `LambdaMetafactory` hits — no native special-casing. So ART really does call
+it, gets null, and throws `Bootstrap method returned null`. **The boot classpath is internally inconsistent**;
+every Java lambda/method-ref in it is dead. `java.time` is provably gone (`DateTimeFormatterBuilder.<clinit>`),
+reached from app code via `dg.p.h(long)`. **EXONERATED for the challenge:** both APKs' dex reference
+`LambdaMetafactory` **0 / 3 files** — D8-desugared, so app code never calls the BSM; it only bites *indirectly*
+through `java.*` classes. Fix is a real milestone (desugar the vendored boot jars, or implement a working
+metafactory) and the jar lives at a **root-owned `/usr/lib` path** — a distro-agnostic problem in itself.
+
+*THE 96%-INVISIBLE HAZARD — record this even though the lens was exonerated.* `libart.so` has exactly **two**
+class_linker reporter strings — `" failed initialization: "` and `"Rejecting re-init on previously-failed
+class "`. Both are **class-initialization** reporters; there is **no generic uncaught-exception logger**. Only
+**15 of 342** invoke-custom sites live in a `<clinit>` and can *ever* be logged; the other **327 (96%) throw
+`BootstrapMethodError` silently, with zero log output**. And **13 of the 15 visible sites are `java.time`** — so
+"the only invoke-custom failure I can see is java.time telemetry" is near-**tautological**. Absence of evidence
+here is not evidence of absence, by construction.
+
+*Also re-confirmed (documented deferral, probably not the blocker):* Eclipse **never runs a measure/layout
+pass** (`framework.rs:59`, `:4760`), so every Java `View` reports 0×0 — the `RBXSurfaceView` geometry check at
+`framework.rs:16482`, whose own comment says it exists to *"prove the surface is attached + laid out"*, logs
+`width=0 height=0` and **fails its own proof** while proceeding. Discounted because `ChallengeNativeWrapper` is
+an engine-rendered Lua/Roact surface that never consults Java view geometry — same as the login screen, which
+renders fine.
+
+*METHODOLOGY — the `is_math()` trap is the SAME error as 2026-07-10's six, and it recurred.* I read
+`bionic_env.rs`'s curated 40-name `is_math()` allowlist and reasoned about symbol *resolution* from it — but its
+own doc comment says it is **attribution for a report** ("harmless for the work-list"). A **report-only code
+path mistaken for the real resolution path**, for the second time. I then made the *same shape* of error on the
+ART lens: treating "the failure is 90 s early on a background thread" as exculpatory, when the reporter can only
+ever show 13 java.time sites out of 342. A 4-lens panel with adversarial skeptics (default-refuted) returned
+**0 of 4 hypotheses surviving** — and the refutations were worth more than any confirmation would have been.
+**When a log's silence is load-bearing, first prove the log CAN speak.** Grep the reporter, count the sites it
+can reach, and only then read absence as evidence.
+
+*Next actions:* the log is exhausted as an instrument — the native challenge is engine-side and silent. Next
+step is **observability at the JNI seam** (trace Eclipse-owned upcalls/registry entries across the challenge
+window), not more inference. Open, unranked: (a) the `LambdaMetafactory` boot-classpath fix; (b) the
+measure/layout pass; (c) `canStartGame` at Play remains **unproven** on 2.730.790.
+
+*Files:* none changed (investigation only — tree clean, 23 commits unpushed); this file (§6 this entry).
+
+---
+
+### 2026-07-17 (later) — CORRECTION + the blocker narrowed: it IS the web challenge, and the app never
+### calls Eclipse's WebView natives. Instrument route PROVEN; the whole-jar smali round-trip is LOSSY.
+
+*THE CORRECTION — read this before the entry above.* That entry concluded 2.730.790 had moved the challenge
+to a native renderer and **"M6 is bypassed, not broken."** **FALSE.** The first boot ran with the app's own
+logs at INFO but I read only the surface names; the second boot (`RUST_LOG=info,eclipse=trace`) shows the
+full sequence:
+```
+403 "Challenge is required"  →+0.2ms→ Rendering native challenge.    → ChallengeNativeWrapper  (a WRAPPER)
+                             →+105ms→ Rendering generic web challenge. → ChallengeHybridWebView (the real one)
+                             →+61s  → Load generic challenge failed.   → LoginV2 → spinner
+```
+⇒ **It is the WEB challenge. M6's machinery is the RIGHT path and is simply never reached.** The zero webview
+counters were the SYMPTOM, not a design change. `Load generic challenge failed` — which M6 drove 1→0 and held
+— is **BACK**, and the 60 s timeout is the classic pre-M6 signature.
+
+*THE DEFECT, PRECISELY.* Eclipse REGISTERS its `android.webkit.WebView`/`WebSettings`/`CookieManager` natives
+(logged at boot) and the app then **calls none of them**: `setUserAgentString` **0**, `addJavascriptInterface`
+**0**, `native_loadUrl` **0**. Java receives `onAppReady: ChallengeHybridWebView` and emits **61 seconds of
+ABSOLUTE SILENCE** — no exception, no `startActivity`, no Fragment — then the challenge times out.
+**M6's respawn behaved CORRECTLY**: `respawn_verdict` returned `Keep("the app never called
+WebSettings.setUserAgentString")`. The logic is right; **the premise changed underneath it**. Note 2.730.790's
+own UA *is* `…ROBLOX Android App 2.730.790 Phone Hybrid…` — it HAS the `hybrid` token M6 proved the wrapper
+requires — but the app never pushes it to `WebSettings`, so the helper boots Eclipse's **fallback literal**
+(`[helper] the app set no User-Agent — using Eclipse's fallback literal`) after an **early op** cold-starts it.
+
+*RULED OUT this session, each by evidence:* the "native by design" reading (above); an Activity launch
+(**1** `startActivity` all boot — the initial `ActivityNativeMain`; ATL's `startActivity`/
+`startActivityForResult` are IMPLEMENTED and **log on entry**, `Context.java:550` / `Activity.java:338`); a
+thrown Java exception (**none** in the 61 s window); a stale overlay (`~/.cache/eclipse/framework-patched/
+api-impl.jar` built 01:31 today, ART compiles against it — NOT a `WebSettings` no-op regression).
+
+*PRIME SUSPECT — the silent `BootstrapMethodError`.* It is the only failure mode that yields "silent, instant,
+unlogged death of a dispatch". ⚠️ The earlier entry "EXONERATED" it because both APKs' dex name
+`LambdaMetafactory` **0/3** (D8-desugared) — **that only proves the app never calls the BSM DIRECTLY.** It says
+nothing about app code calling a `java.*` class that uses lambdas internally, which is **exactly** how
+`DateTimeFormatter` already dies here (`dg.p.h(long)` → `<clinit>` → BootstrapMethodError). **The skeptic panel
+was right and I was wrong on this same shape three times.**
+
+*INSTRUMENT ROUTE — PROVEN, reusable, needs no `sudo`.* `libart.so` derives its boot-jar dir **relative to its
+own location** (`strings` → `/../java/dex/art/`, `/core-oj-hostdex.jar`, `ANDROID_ROOT`). So `cp -a /usr/lib/art`
+→ `~/.cache/eclipse/art-patched/art` (14M) and `/usr/lib/java` → `.../java` (30M), then
+`ECLIPSE_LIBART=.../art/libart.so` + `ECLIPSE_ART_BOOT_IMAGE=.../java/dex/art/oat/boot.art`. **CONTROL BOOT
+PASSED** (copy + pristine jar): dex2oat logged `setting boot class path to /home/kue/.cache/eclipse/art-patched/
+java/dex/art/core-oj-hostdex.jar:…` and the app reached `ChallengeHybridWebView`. `find_boot_image`'s
+grandparent check is satisfied. ART's 2 `Could not create image space` / `Runtime aborting` lines on the copy
+are its own fallback-then-recompile, NOT fatal. Passwordless sudo IS available and was deliberately NOT used —
+the system install stays untouched (md5-verified).
+
+*FAILED TECHNIQUE — DO NOT REPEAT.* Whole-jar baksmali→smali round-trip (vendored
+`vendor/toolchain/smali/{baksmali,smali}-2.5.2.jar`, 3296 classes) is **LOSSY**: the original dex is **038**,
+smali 2.5.2 emits **039 regardless of `-a 28`/`-a 34`**, and the rebuild left `java.util.Comparator`
+**erroneous** → `Rejecting class java.lang.String$CaseInsensitiveComparator that attempts to sub-type erroneous
+class java.util.Comparator` → `dex2oat F java_vm_ext.cc:563 JNI DETECTED ERROR: java_class == null in call to
+IsInstanceOf` → abort. **The control isolated this to the surgery, not the redirect.** Needs a *surgical*
+single-method dex edit (dexlib2 directly) or another route. The diagnostic patch itself was correct and
+verified (log + `Throwable.printStackTrace()` to `System.err`, behavior unchanged/still returns null; 4
+`ECLIPSE-LMF` strings in the rebuilt dex, 0 in the system dex) — reusable once assembly is fixed. Goal: learn
+**who** calls `metafactory` during the `ChallengeHybridWebView` window.
+
+*NEW real bug (relevance UNPROVEN — do not claim it as the fix).* **`PackageManager.java:2153` describes an
+IMPOSSIBLE device.** `hasSystemFeature` returns `true` for exactly one name —
+`android.hardware.touchscreen.multitouch.distinct` — and `false` + `"!!!!!!! … is not implemented yet"` for
+everything else, **including `android.hardware.touchscreen`**, which `multitouch.distinct` *implies* in AOSP's
+feature hierarchy. Eclipse forwards touch events all day and then denies having a touchscreen. Roblox probes it
+3× at boot; also false: `android.hardware.type.pc`, `org.chromium.arc.device_management`,
+`android.hardware.type.embedded`, `cn.google`; plus `getSystemService("batterymanager")` unimplemented
+(`ContextImpl.java:150`). **All 15 probes fire at BOOT (06:50:30–06:51:12); NONE in the challenge window** ⇒
+real defect, **no evidence** it causes the hang. Same silent-wrong-answer class as the `WebSettings` no-op.
+Also noted: `ClientAppSettings.json: FileNotFoundException` — Roblox's **local fast-flag override** file; a
+possible lever for raising engine log verbosity. Untried.
+
+*METHODOLOGY — three self-inflicted traps in one session; two are tooling, one is the recurring one.*
+(i) `CreateView = 1` was a **false grep match** on `onCreateView: tag="AppShellFragment"` — a Fragment
+lifecycle call, not Eclipse's webview protocol op; I nearly built on a phantom signal. (ii)
+`RUST_LOG=eclipse=trace` **SILENCES THE APP** — Roblox's logs arrive under the `liblog` / `android.util.Log`
+targets, so that filter turned Eclipse up and Roblox off (495 lines, zero `APP_READY`); **use
+`RUST_LOG=info,eclipse=trace`**. (iii) `pkill -f eclipse-webview` **matches its own shell's cmdline and kills
+the shell** (exit 144, boot never launched) — use `pkill -x`. And the recurring one, stated once more:
+**when a log's silence is load-bearing, FIRST PROVE THE LOG CAN SPEAK.**
+
+*Next actions:* (1) surgical `LambdaMetafactory` instrument via the proven redirect → identify the caller in
+the challenge window; (2) if confirmed, the real fix (desugar the vendored boot jars, or implement a working
+metafactory) — milestone-sized, and the jar lives at a root-owned `/usr/lib` path, a distro-agnostic problem in
+itself; (3) `PackageManager.hasSystemFeature` touchscreen ladder — correctness fix, independent of the hang;
+(4) `canStartGame` at Play remains **unproven** on 2.730.790.
+
+*Files:* none changed (investigation only — tree clean, **21 commits unpushed, none ever pushed**); this file
+(§6 this entry + the ⚠️ correction marker on the entry above).
+
+---
+
+### 2026-07-17 (latest) — `LambdaMetafactory` EXCLUDED by live instrument. Four new dev-host capabilities,
+### all zero-code-change. The app is NOT hung: it CHOOSES to do nothing.
+
+*🎯 THE RESULT — `LambdaMetafactory` is NOT the blocker, PROVEN not assumed.* Built the instrument, ran it,
+read the answer. Patched `metafactory`/`altMetafactory` to `System.err.println` + `Throwable.printStackTrace()`
+(behavior UNCHANGED — still returns null; 4 `ECLIPSE-LMF` strings in the artifact, 0 in the system dex). Live,
+across **two independent boots**: **total metafactory calls = 1**, and it is the already-known one —
+```
+ECLIPSE-LMF metafactory name=queryFrom type=()TemporalQuery
+  at java.lang.invoke.LambdaMetafactory.metafactory(LambdaMetafactory.java:42)
+  at java.time.format.DateTimeFormatterBuilder.<clinit>(DateTimeFormatterBuilder.java:160)
+  at dg.p.h → dg.p.o → dg.f.f → dg.b.call → cc.o0.run → ThreadPoolExecutor.runWorker
+```
+**The entire challenge window contains ZERO invoke-custom calls.** ⇒ The lens the skeptics correctly said
+"cannot be decided from this log" is now decided, and it is **CLOSED**. The `LambdaMetafactory` defect remains
+real and worth fixing on its own merits (java.time is dead), but it is **not** the login blocker. Cost: one
+2 KB jar. *This is what the instrument was for — build it, don't argue about it.*
+
+*✅ CAPABILITY 1 — BOOTCLASSPATH PREPEND. The right way to override a boot class. USE THIS.* `strings libart.so`
+documents the precedence: **cmdline `-Xbootclasspath:` → `BOOTCLASSPATH` env → default constructed from
+libart.so's own path** ("bootclasspath wasn't provided on cmdline, wasn't provided by env, and we failed to get
+the full path to libart.so…"). So: hand-write ONE `.smali`, assemble ONLY it (2024-byte dex), zip, and
+**prepend** via `BOOTCLASSPATH=<ourjar>:<the 10 stock jars>` — first-dex-wins. Boots clean; **no `sudo`, no
+copy of ART needed, system jars md5-untouched**. `-Xbootclasspath/a:` is APPEND-only and useless here.
+The 10 jars in order: core-oj, apachehttp, apache-xml, bouncycastle, core-junit, core-libart, hamcrest,
+junit-runner, okhttp, wolfssljni (`-hostdex.jar`, in `/usr/lib/java/dex/art/`).
+
+*❌ PROVEN LOSSY — whole-jar baksmali→smali. Control run, NO edit at all, failed IDENTICALLY* (`Rejecting class
+java.lang.String$CaseInsensitiveComparator that attempts to sub-type erroneous class java.util.Comparator` →
+`dex2oat F java_vm_ext.cc:563 JNI DETECTED ERROR: java_class == null in call to IsInstanceOf` → abort). Original
+dex is **038**; smali 2.5.2 emits **039 regardless of `-a 28`/`-a 34`**. **My edit was innocent.** The
+ART-copy + `ECLIPSE_LIBART`/`ECLIPSE_ART_BOOT_IMAGE` redirect DOES work (control booted, dex2oat logged the
+patched BCP) — it is simply unnecessary now that BOOTCLASSPATH prepend exists.
+
+*✅ CAPABILITY 2 — FULLY AUTONOMOUS LOGIN DRIVE, no code change.* 2.730.790's login is a **one-screen** flow
+(remembered user → password → Submit); the synthetic drive was built for the **two-screen** flow, and stage 5
+(`ECLIPSE_SYNTHETIC_SUBMIT`) gates on `engine_synthetic_typed2_done` — **stage 4 — which a one-screen login
+never reaches**, so SUBMIT can never fire. But stage 3's "Next" is *just a tap* and gates only on stage 1/2
+typing + 3 s. So point NEXT at the submit button:
+```
+ECLIPSE_SYNTHETIC_ENGINE_TAP="159,297"     # Landing → LoginV2
+ECLIPSE_SYNTHETIC_TYPE="378,320:<password>" # auto-focused field; re-taps until focused, then types
+ECLIPSE_SYNTHETIC_NEXT="298,401"            # = the Submit button
+```
+Verified: `stage 0 → stage 2 (10/10 chars handled=true) → stage 3 → 403 → challenge`, hands-free. (Coords were
+recovered by replaying the owner's OWN taps out of a prior log — a good trick.) ⚠️ Password lands in the
+process env (`/proc/<pid>/environ`) — owner-authorized, temp password, **rotate**.
+
+*✅ CAPABILITY 3 — SIGQUIT THREAD DUMPS. Zero code change. Should have been the FIRST instrument.* `kill -3
+<vm-pid>` → ART's signal catcher emits a full `DALVIK THREADS` dump into Eclipse's own log (+1806 lines, 154
+markers, every thread's Java+native stack, `palette_fake.cc:57`). No patching, no VM options, no rebuild.
+
+*🎯 CAPABILITY 3'S FIRST RESULT — THE APP IS NOT HUNG.* Dumped in the stuck state (post-bail, spinner):
+```
+"main" prio=5 tid=1 Native
+  at android.os.SystemClock.uptimeMillis(Native method)
+  at android.os.MessageQueue.next(unavailable:-1)   - locked <0x07588fca> (a android.os.MessageQueue)
+```
+**A normal IDLE UI loop.** No deadlock, no blocked call, nothing awaited. ⇒ **The whole "it's hung / blocked /
+waiting" hypothesis family is DEAD.** The app receives the challenge notification, **decides to do nothing**,
+and returns to idle. The 61 s is not a stall — it is the app's own timeout elapsing over a decision already
+made. **Look for what makes it DECIDE, not for what blocks it.**
+
+*🔎 NEW PRIME SUSPECT — a silent, unloggable `NameNotFoundException`.* `PackageManager.java:1389`
+(`vendor/atl/src/api-impl/`) — `getPackageInfo` returns real data ONLY for the app's own package and `"atl"`,
+and for **everything else `throw new NameNotFoundException(packageName)` — with NO logging**. ⇒ **package
+probes are STRUCTURALLY INVISIBLE in the log**; the absence of `Failed to find package` lines proves nothing
+(the single one we do see is the APP's own Firebase catch, tagged `FirebaseMessa…`, at early boot). An app
+probing for a WebView provider (`getCurrentWebViewPackage()` / `com.google.android.webview`) would get a silent
+throw, catch it, and quietly decline to build the WebView — **silent, instant, no visible exception, main
+thread returns to idle: an exact signature match.** Same lying-PackageManager class as
+`hasSystemFeature`'s impossible device. **NOT yet proven — instrument `getPackageInfo` (log every query +
+verdict) via the framework overlay's first-dex-wins and re-run.**
+
+*Also measured:* the challenge TYPE varies per attempt — **identical 403 body** (`"Challenge is required to
+authorize the request"`, bodySize 91) yet ~2 of 6 attempts draw `Rendering generic web challenge` →
+`ChallengeHybridWebView` and the rest bail `ChallengeNativeWrapper → LoginV2` in ~130 ms. The type arrives in
+response HEADERS (unlogged), so it is server-chosen. **Both paths fail.** Stopped the retry hunt after 4 boots
+rather than hammer `auth.roblox.com` and risk flagging the owner's account.
+
+*METHODOLOGY.* `pkill -f eclipse-webview` / `pkill -f hunt.sh` **matches its own shell's cmdline and kills the
+shell** (exit 144, work silently never runs) — I hit this **three times**, including after recording it. **Use
+`pkill -x <exact-name>` or the `[h]unt` bracket trick.** And the session's real lesson, earned twice more: the
+`LambdaMetafactory` question was unanswerable by argument and trivial by instrument; `getPackageInfo` is the
+same shape. **Build the instrument. Stop reasoning about silence.**
+
+*Next actions:* (1) instrument `PackageManager.getPackageInfo` (+ `getCurrentWebViewPackage`/`queryIntentActivities`
+if present) via the overlay → re-run the autonomous drive → read what the app probes for before deciding;
+(2) SIGQUIT during the `ChallengeHybridWebView` 61 s window specifically (only the bail path has been dumped so
+far); (3) `PackageManager.hasSystemFeature` touchscreen ladder — correctness fix, independent; (4) `canStartGame`
+at Play still **unproven** on 2.730.790.
+
+*Files:* none changed (investigation only — tree clean, **21 commits unpushed**); this file (§6 this entry).
+
+---
+
+### 2026-07-17 (latest+1) — `getPackageInfo` EXCLUDED by instrument too. Framework-instrumentation route
+### PROVEN. Blocker still open; the suspect list is now empty and that is the finding.
+
+*✅ CAPABILITY 4 — FRAMEWORK CLASS INSTRUMENTATION, no repo change, real overlay untouched.* `find_framework`
+prefers **`ECLIPSE_ANDROID_FRAMEWORK_DIR`** over the auto-detected overlay ⇒ build an instrumented COPY and
+point at it. Recipe: `cp -a ~/.cache/eclipse/framework-patched <dir>` → unzip `classes2.dex`+`classes3.dex` →
+baksmali both → take the target class's smali **from classes3** (the stock 1548-class dex), patch it, drop it
+into the **classes2** smali set (only 14 classes) → `smali a s2 -a 28 -o classes2.dex` → zip back. **This is the
+"assemble only the classes you need" pattern, NOT a whole-jar round-trip — it works** (new classes2.dex
+102,076 B vs 77,764 B; booted clean). First-dex-wins makes classes2 shadow classes3, exactly as the overlay
+already shadows View/Activity/Display. Register widening is fine (`.registers 13 → 16`; params shift, smali
+resolves `pN` automatically).
+
+*🎯 RESULT — `getPackageInfo` is EXCLUDED.* Instrumented every call (name + `Throwable.printStackTrace()`).
+Live, on a boot that DID draw the hybrid path: **27 queries, and the app probes exactly THREE packages —
+`com.android.vending` ×14, `com.roblox.client` ×12, `com.google.android.gms` ×1 — ALL at early boot, and
+ZERO after `Rendering generic web challenge.`** ⇒ the app does **not** probe for a WebView provider; the
+silent-`NameNotFoundException` hypothesis is **dead**. (The defect is still real: `PackageManager.java:1389`
+throws unlogged for every foreign package — but it is not this bug.)
+
+*Hybrid path re-confirmed under instrumentation, honestly counted:* `real webview native calls = 0`,
+`the app set its WebView User-Agent via… = 0`, `REPLACING/ECLIPSE-STUB/bridge call received = 0`,
+`Load generic challenge failed = 1`. Combined with the SIGQUIT dump (main thread **idle** in
+`MessageQueue.next()`), the app **decides to do nothing** and the 61 s is its own timeout.
+
+*⚠️ THE SESSION'S RECURRING SELF-INFLICTED WOUND — a grep matched Eclipse's own PROSE, for the FOURTH time,
+and I announced it as a breakthrough before checking.* `grep -c 'setUserAgentString'` scored **2** — both were
+Eclipse's REGISTRATION lines, whose message text reads *"registered Eclipse's backing for the
+android.webkit.WebSettings User-Agent surface (the app's setUserAgentStr…)"*. Zero actual calls. Same shape as
+`CreateView` matching `onCreateView`. **Every count of an EVENT must exclude the log's own narration** (e.g.
+`grep 'eclipse::framework' | grep -v 'registered Eclipse' | grep -c …`), and a count that suddenly changes is a
+grep bug until proven otherwise.
+
+*STATE OF THE HUNT — the suspect list is now EMPTY, and that is itself the finding.* Excluded **by instrument
+or evidence**, not argument: LambdaMetafactory/invoke-custom (0 in window), `getPackageInfo` (0 in window),
+blocked/hung/deadlock (main thread idle), thrown exception (none), `startActivity` (1 all boot, and it logs),
+stale overlay (fresh), "native by design" (it IS the web challenge), M6 respawn misbehaving (verdict correct).
+⇒ **Next must widen observability rather than name a new suspect.** Best options: (a) SIGQUIT repeatedly
+*inside* the hybrid 61 s window and diff thread sets (only ONE hybrid dump exists, taken ~40 s in); (b) ART
+method tracing `-Xmethod-trace-file:<f>` — needs a VM-option passthrough in `BootPlan::vm_options`, the one
+small code change that would show **every method the app calls** in those 61 s; (c) instrument the overlay's
+`LayoutInflater`/`Fragment` (already shadowed in classes2) to see if the challenge view is ever inflated.
+
+*Files:* none changed (investigation only — tree clean, **21 commits unpushed**); this file (§6 this entry).
+
+---
+
 ## 7. Doc index
 
 | File | Purpose |
