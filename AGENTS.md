@@ -128,6 +128,89 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — 🩹 THE 💥 BUG IS FIXED IN CODE: ECLIPSE NOW HONORS `WebSettings.setUserAgentString`. The app's
+  UA is stored in RUST (one source of truth), reaches CEF via the child's ENVIRONMENT at spawn, and is reported
+  back by `getUserAgentString` — the M4 byte-match contract now holds BY CONSTRUCTION. The `!contains("Android")`
+  pin is RETIRED (it asserted the bug). Gates green; live challenge boot PENDING — orchestrator-only (full
+  record: §6 2026-07-16 🩹).** **THE DESIGN (all three §6 💥 coupled problems dissolved, not worked around):**
+  (1) *The throwaway-`getSettings()` problem is GONE:* the store is `webview::client::APP_USER_AGENT` — a
+  process-wide `Mutex<Option<String>>` — so nothing depends on ATL's fieldless, per-call `WebSettings`
+  (independently re-verified against the installed dex this pass: `grep -c '^\.field'` = **0**, `getSettings()` =
+  `new-instance`+`<init>`+`return`). The AOSP divergence (AOSP settings are per-WebView) is recorded honestly at
+  the static: ATL's WebSettings is genuinely stateless/per-call AND Eclipse drives exactly one challenge WebView
+  AND `CefSettings.user_agent` is itself global — three independent reasons process-wide is *correct*, not a
+  shortcut. (2) *The route to CEF is the ENV, not argv:* `ECLIPSE_WEBVIEW_APP_UA`, set on the child by
+  `spawn_helper_process`. The §6 🌱 provenance test applied: a UA is not a secret **by provenance** (ATL's own
+  synthetic `SystemProperties`/`Build` values; broadcast in cleartext to every server by design) and is not a
+  URL — but `/proc/PID/environ` is **owner-only** where `/proc/PID/cmdline` is **world-readable**, so the tighter
+  channel costs nothing and the added disclosure is **zero**. Spawn contract §4 + a new §7/8 record it.
+  PROTO_VERSION stays **2**; the redaction contract is untouched. (3) *Byte-match holds by construction:* both
+  units read the ONE store. **THE LADDER:** `ECLIPSE_WEBVIEW_UA_DIAG` (dev-host A/B; still outranks) > **the
+  app's UA** > `ECLIPSE_USER_AGENT` (now a **FALLBACK**, not a policy). **AOSP CONFORMANCE — researched, not
+  assumed** (`frameworks/base/core/java/android/webkit/WebSettings.java`, fetched + read this pass): *"If the
+  string is null **or empty**, the system default value will be used"* ⇒ both reset (`normalize_app_user_agent`,
+  unit-pinned); and `getDefaultUserAgent` is documented to **IGNORE** `setUserAgentString` ⇒ it correctly keeps
+  returning the Eclipse literal. **THE `!contains("Android")` PIN IS RETIRED** with a dated explanation at the
+  site: it asserted the bug — written when the setter was a stub, it locked in the discard and would have failed
+  the moment the app's own (Android/`Hybrid()`-bearing) string was honored. Replaced by
+  `effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal`, which pins the REAL contract
+  (fallback literal is the Eclipse one; the app's UA WINS when set) using the app's REAL measured UA. **THE
+  SAME-PATTERN AUDIT THE 💥 ENTRY OWED IS DONE AND IT CLOSES THE CLASS — with evidence that also explains WHY the
+  UA was the one that broke:** the stock dex declares **31** empty `WebSettings` setters, but **`getUserAgentString`
+  + `getDefaultUserAgent` are the ONLY read-back methods on the entire class** (grep-verified). The other 30
+  setters have **no getter and no engine-observable contradiction** — their discard lands on CEF's defaults
+  (unimplemented features), whereas the UA's discard SUBSTITUTED an Eclipse-invented value that
+  `navigator.userAgent` handed straight to the page's selector. Across all of `android/webkit` the
+  "constant-returning getter whose paired setter silently discards" shape has exactly **three** instances:
+  `getCookie` (**already fixed at M4**, same class), `getUserAgentString` (**fixed here**), and
+  `getDefaultUserAgent` (**correct by the AOSP contract**, verified). **⇐ START-HERE-NEXT — THE LIVE CHALLENGE
+  BOOT (owner, dev-host main thread; the ONLY thing not done here):**
+  `ECLIPSE_WEBVIEW_BRIDGE_DIAG=1 ECLIPSE_WEBVIEW_CONSOLE=1` **with `ECLIPSE_WEBVIEW_UA_DIAG` UNSET** (the whole
+  point is that the app's own UA now suffices) ⇒ PASS = `ECLIPSE-STUB invoke` ≥1, `bridge call received` ≥1,
+  **`Load generic challenge failed` = 0**, plus the new `honoring the User-Agent the app set …` INFO carrying the
+  `Hybrid()` token — i.e. challenge26's forced-token result reproduced with NOTHING forced. After that the only
+  gap to a completed login is **real credentials**.
+- **2026-07-16 — 🩹➜⛔ HONORING THE APP'S UA: LANDED, GATE-GREEN, AND **LIVE-DISPROVED AS INSUFFICIENT** — the
+  plumbing is right, the ORDERING is wrong: the helper is spawned by a COOKIE op ~61 s before the app sets its
+  UA, and `CefSettings.user_agent` is global + consumed at `CefInitialize`. The fix's OWN guard caught it. NOT
+  DONE (full record: §6 2026-07-16 🩹).** What landed and is CORRECT: `client::APP_USER_AGENT` store +
+  `set_app_user_agent` native (WebSettings surface, `bound=2`), the pure ladder
+  `effective_user_agent(diag, app)` = `UA_DIAG` > **app UA** > `ECLIPSE_USER_AGENT` (now a FALLBACK, not a
+  policy), `ECLIPSE_WEBVIEW_APP_UA` passed via the child's **env** (not argv — `/proc/PID/environ` is owner-only
+  vs world-readable `cmdline`, so added disclosure is ZERO), and `getUserAgentString` reporting the app's string
+  with the overlay literal substituted only when the app set none (byte-match **by construction** — one store,
+  no third copy). **The `!contains("Android")` pin is RETIRED** — it asserted the bug: written when the setter
+  was a stub, it locked in the discard and would have failed the moment the app's own string was honored.
+  **Same-pattern audit CLOSED with evidence:** 31 empty `WebSettings` setters exist, but `getUserAgentString` +
+  `getDefaultUserAgent` are the **only read-back methods on the class** — the other 30 have no getter and no
+  Eclipse-invented contradiction, so their discard lands on CEF's defaults (unimplemented features, NOT
+  discard-and-contradict bugs). Across `android/webkit` the confirmed shape has exactly **three** instances:
+  `getCookie` (**already fixed at M4** — same class, one milestone earlier!), `getUserAgentString` (this pass),
+  `getDefaultUserAgent` (**AOSP-correct as-is** — its javadoc says it IGNORES `setUserAgentString`). AOSP
+  research corrected the design twice: null **OR EMPTY** resets to default; `getDefaultUserAgent` must ignore
+  the setter. Gate: root **644**+6+2 (+1 pin), helper 41+15, `patch-framework.sh` green (classes2 77660 →
+  **77764**), `__webview-test` EXIT=0 marker intact (it exercises the FALLBACK rung green). **⛔ BUT THE LIVE
+  BOOT (`/tmp/eclipse-challenge28-uafix.log`, nothing forced) SAYS IT DOES NOT WORK:** `honoring the User-Agent
+  the app set` = **0**, `ECLIPSE-STUB invoke` = **0**, `bridge call received` = **0**, `Load generic challenge
+  failed` = **1**. **THE FIX'S OWN WARN FIRED AND NAMED THE CAUSE** — *"setUserAgentString called AFTER the
+  engine User-Agent was already fixed at helper spawn"*, whose comment asserted *"Not observed on any measured
+  boot: the app configures its WebView before the first load, and the first load is what spawns the helper."*
+  **THAT ASSUMPTION IS FALSE.** MEASURED: helper spawned **03:31:24.724**; app called `setUserAgentString`
+  **03:32:25.912** — **61 s later**. The helper is NOT spawned by a load-drive: `send_with_lazy_spawn` has
+  **five COOKIE call sites** (get/set/clear) and the app hits `CookieManager` at `AppManager.initialize`, long
+  before any WebView exists (the first `native_loadUrl` is at 03:32:25.912394 — 110 µs AFTER the UA is set;
+  the WebView flow is create → setUserAgentString → addJavascriptInterface → loadUrl, always together).
+  **AND CEF OFFERS NO ESCAPE — verified in the pinned bindings:** the UA exists ONLY as
+  `_cef_settings_t::user_agent`; there is **no** per-browser and **no** post-init override (a per-request header
+  override would not help — the wrapper reads `navigator.userAgent`, which the renderer takes from the global
+  setting). ⇐ **START-HERE-NEXT — the ORDERING, and it needs DESIGN not a patch:** CEF must not initialize
+  before Eclipse knows the UA, yet cookie ops need the store first. Candidates, none yet designed: (a) defer the
+  helper spawn to the first load-drive and serve/buffer early cookie ops from an Eclipse-side store, replaying
+  into CEF at spawn (note the measured early ops are degenerate — `updateCookiesFromEngine: Invalid cookie
+  format: []` and `cookie visit … 0 cookie(s)` — but do NOT design on that); (b) an ADDITIVE `PROTO_VERSION`
+  3 `SetUserAgent` message + deferred `CefInitialize` in the helper (M4's 1→2 additive bump is the precedent) —
+  but cookie ops arriving before it would still block. **The mechanism is NOT in doubt** (§6 🏆/💥 + challenge26
+  proved forcing the token makes the challenge complete); only the delivery ordering is unsolved.
 - **2026-07-16 — 💥 THE "OWNER RULING" DISSOLVES: IT WAS NEVER A POLICY QUESTION. **THE APP SETS ITS OWN
   USER-AGENT — WITH THE `Hybrid()` TOKEN — AND ECLIPSE SILENTLY THROWS IT AWAY.** A plain, confirmed Eclipse bug
   with a faithful fix (full record: §6 2026-07-16 💥).** **MEASURED LIVE** (`/tmp/eclipse-challenge27-uaset.log`,
@@ -8662,6 +8745,142 @@ discarded argument at the stub) generalises cheaply.
 
 *Files:* `tools/framework-overlay/patch-framework.sh` (the diagnostic + 5 guards); this file (§5 💥 bullet + §6
 this entry).
+
+### 2026-07-16 — 🩹 The 💥 bug FIXED: `WebSettings.setUserAgentString` is honored. The app's UA is stored in Rust (one source of truth), routed to CEF via the child's ENVIRONMENT, and reported back by `getUserAgentString`. The `!contains("Android")` pin is RETIRED — it asserted the bug.
+
+*Root cause (confirmed in §6 💥, not re-litigated):* ATL's `setUserAgentString` is an empty no-op, so Eclipse
+silently DISCARDED the app's UA — which carries both the `Hybrid()` and `Android` substrings the page's
+`nativePrefix` selector requires (§6 🏆) — and substituted its own literal. `nativePrefix = null` → no platform
+module → total bridge silence → `Load generic challenge failed`, every boot. **This pass fixes the mechanism.**
+
+*The three coupled problems, dissolved rather than worked around.*
+1. **The throwaway `getSettings()`.** Independently RE-VERIFIED against the installed dex this pass (not taken on
+   the record's word): `WebSettings` `grep -c '^\.field'` = **0**; `getSettings()` is `new-instance` + `<init>` +
+   `return`. The fix stores the UA in **Rust** — `webview::client::APP_USER_AGENT`, a process-wide
+   `Mutex<Option<String>>` — so the fieldless per-call `WebSettings` is never asked to hold state and no
+   WebSettings→WebView association (which ATL does not have) needs inventing. **The AOSP divergence is recorded
+   honestly at the static:** AOSP's settings are per-WebView; process-wide is correct HERE for three independent
+   reasons — ATL's WebSettings is genuinely stateless/per-call (no per-instance state to be wrong about), Eclipse
+   drives exactly ONE challenge WebView, and `CefSettings.user_agent` is itself global. The comment names the
+   seam that must grow a key if Eclipse ever drives two WebViews with different UAs (and notes CEF has no
+   per-browser UA at the settings layer, so the engine side would have to move first).
+2. **The route to CEF: the child's ENVIRONMENT (`ECLIPSE_WEBVIEW_APP_UA`), set at spawn.** Ordering works because
+   the spawn is LAZY — first load-drive, after the app configures its WebView. **The §6 🌱 provenance test
+   applied, not a shape argument:** the spawn contract's operative predicate is *"no secrets in argv"*; a UA is
+   not a secret **by provenance** (the app composes it from ATL's OWN synthetic `SystemProperties`/`Build` values
+   — `0MB`, `960x540`, `HTC unknown`; no real hardware, no user data — and it is broadcast in cleartext to every
+   server by design) and it is not a URL, so the absolute redaction rule does not reach it. **But argv would still
+   be the wrong channel when a strictly better one exists at equal cost:** `/proc/PID/environ` is **owner-only**,
+   `/proc/PID/cmdline` is **world-readable**. Choosing env makes the added disclosure **zero**, not merely
+   "acceptable" — the 🌱 entry's lesson (it named its own world-readable argv channel as a genuine new disclosure)
+   applied prospectively. `PROTO_VERSION` stays **2**; the URL-redaction contract is untouched.
+   `src/webview/mod.rs`'s NORMATIVE spawn contract is updated: §4 now states the provenance predicate and the
+   env-over-argv preference; a new §8 documents `ECLIPSE_WEBVIEW_APP_UA` as **contract, not diagnostic**.
+3. **Byte-match by construction.** Both units M4 names read the ONE store: the spawn forwards it to CEF, and
+   `native_getUserAgentString` returns it to Java. The fallback literal stays in exactly the **two** places it
+   already lived (the overlay smali and `engine::ECLIPSE_USER_AGENT`) — the native returns **null** when the app
+   set nothing and the overlay smali substitutes the literal, deliberately avoiding a THIRD copy in `framework.rs`
+   for the byte-match contract to drift against. **Verified programmatically this pass:** the literal extracted
+   from the built `classes2.dex` is byte-identical to `ECLIPSE_USER_AGENT` (125 bytes).
+
+*The ladder (pure, unit-pinned):* `ECLIPSE_WEBVIEW_UA_DIAG` (dev-host A/B — still outranks, so a measurement can
+force any UA) > **the app's UA** > `ECLIPSE_USER_AGENT` (**now a FALLBACK, not a policy** — for a WebView the app
+never configured, e.g. `__webview-test`). Under the diag the Java getter deliberately disagrees (it does not
+consult it) — the pre-existing, already-recorded asymmetry, unchanged.
+
+*AOSP conformance — RESEARCHED, not assumed (CLAUDE.md's Required-Research mandate; the `developer.android.com`
+reference page was fetch-truncated, so the authoritative SOURCE was read instead:
+`android.googlesource.com/platform/frameworks/base` `core/java/android/webkit/WebSettings.java`, 2026-07-16).*
+Two contract facts changed the design: (a) *"Sets the WebView's user-agent string. If the string is `null` **or
+empty**, the system default value will be used."* ⇒ **empty resets too**, not just null — pinned by
+`normalize_app_user_agent_treats_null_and_empty_as_a_reset_to_the_default` (a whitespace-only UA is NOT empty and
+is carried through). Guessing here would have shipped an empty UA where AOSP sends the default. (b)
+*"Returns the default User-Agent used by a WebView. An instance of WebView could use a different User-Agent if a
+call is made to `setUserAgentString`."* ⇒ `getDefaultUserAgent` is documented to **IGNORE** the set UA, so leaving
+it returning the Eclipse literal is AOSP-CORRECT, not an oversight.
+
+*THE `!contains("Android")` PIN IS RETIRED — verbatim reasoning, left at the site.* It asserted `"must not
+impersonate a device"`. **It asserted the bug.** It was written when `setUserAgentString` was an empty stub, so
+Eclipse's literal was the only UA any boot could present and the question LOOKED like "which UA do we choose?".
+It never was: the app SETS its own and Eclipse was discarding it. The pin therefore **locked in the discard** — it
+would fail the moment the app's own (Android-bearing, `Hybrid()`-bearing) string was honored, which is exactly the
+correct behaviour. Replaced by `effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal`,
+which pins the REAL contract — the fallback literal is the Eclipse one, the app's UA WINS when present — using the
+app's REAL measured UA and asserting it carries both selector substrings, so a regression to the discard fails
+there. `build_settings_sets_the_honest_eclipse_user_agent` → `…_the_eclipse_fallback_user_agent` (it pins what the
+constant IS, not a policy it no longer encodes).
+
+*Observability: the `ECLIPSE-UA-SET` smali diagnostic is SUPERSEDED, not lost.* `set_app_user_agent` logs the full
+UA at INFO — the same value, at the same moment, in the **one place that also stores it**, so the log can no
+longer disagree with what Eclipse presents. The helper additionally reports which rung won (WARN for a forced
+diag; INFO for the app's UA; INFO for the fallback), so a boot log can never leave it ambiguous. Privacy reasoning
+carried over verbatim from the diagnostic (a UA is neither URL nor payload; full text, not a length, because the
+string must be reproduced EXACTLY). An `Ordering::Relaxed` `HELPER_UA_FIXED` flag makes a post-spawn
+`setUserAgentString` a loud WARN instead of a silent discard (the global `CefSettings.user_agent` is fixed at
+`CefInitialize`) — one atomic, deliberately NOT a `CLIENT` lock, so there is no lock-order inversion with the
+spawn path (which holds `CLIENT` while reading `APP_USER_AGENT`). Not observed on any measured boot.
+
+*SAME-PATTERN AUDIT — the 💥 entry owed it; it is DONE, and it CLOSES the class with evidence that also explains
+why the UA was the one that broke.* The 💥 entry framed the class as *"ATL setters that silently swallow app
+configuration"* and listed `setJavaScriptEnabled`/`setDomStorageEnabled`/… as candidates for *"the identical
+defect shape"*. **Measured:** the stock dex declares **31** empty (`return-void`-only) `WebSettings` setters —
+but `getUserAgentString` + `getDefaultUserAgent` are the **ONLY read-back methods on the entire class**
+(grep-verified: no `getJavaScriptEnabled`, no `getDomStorageEnabled`, nothing). **⇒ The other 30 are NOT the
+identical shape.** The confirmed defect is *"the app configures a value, ATL discards it, and Eclipse then
+presents a CONTRADICTING value of its own that the app or the page reads back"*. The UA had a read-back path that
+is engine-observable (`navigator.userAgent`) and load-bearing (the page's selector) — that is precisely why it
+broke the challenge. The other 30 have no getter and no Eclipse-invented contradiction; their discard lands on
+CEF's engine defaults (JS on, DOM storage on, images on — which for the challenge flow coincides with what the app
+asks for). They are **unimplemented features, not discard-and-contradict bugs**, and fixing them speculatively —
+with no evidence any is called with a diverging value, and no observable to check against — is exactly the
+speculative work CLAUDE.md forbids. **Across all of `android/webkit` the confirmed shape has exactly THREE
+instances:** `CookieManager.getCookie`/`setCookie` (**already fixed at M4** — the same class of bug, one milestone
+earlier), `WebSettings.getUserAgentString`/`setUserAgentString` (**fixed here**), and
+`WebSettings.getDefaultUserAgent` (**correct by the AOSP contract**, verified above). The three other
+overlay-rewritten constant getters (`Display.getRefreshRate`, `JobParameters.getExtras`, `getWidth`) are AOSP-gap
+fills with **no paired setter at all** (grep: 0) — the app never configures them, so nothing is discarded. **The
+class is closed.**
+
+*Regression protection (tied to the confirmed root cause; no new scripts — every guard lands in an existing
+harness).* (1) `effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal` — would have
+caught the bug: it fails if the app's UA stops winning. (2)
+`normalize_app_user_agent_treats_null_and_empty_as_a_reset_to_the_default` — pins the researched AOSP rule.
+(3) `web_settings_native_names_sigs_and_class_match_the_overlay` (folded into the existing WebView pin test) —
+a name/descriptor drift would make `RegisterNatives` skip the entry and re-open the bug as a call-time ULE.
+(4) **In the overlay itself, the strongest guard:** a whole-body index check that the empty no-op body is **GONE**
+after the rewrite — if `setUserAgentString` is ever a silent discard again, `patch-framework.sh` FAILS. (It is a
+perl `index` check, not `grep -F`: `grep -F` cannot express a multi-line pattern — it would treat each line as its
+own alternative and match anything. That bug was caught and fixed during this pass.) Plus the pre-existing
+pristine-body/uniqueness/back-check guards, all retained.
+
+*Gate (MEASURED 2026-07-16):* root `fmt`/`build --all-targets`/`clippy --all-targets --all-features -D warnings`/
+`test`/`build --release` all clean — **644 unit + 6 integ + 2 doctest, zero SKIP** (was 643+6+2; **+1** =
+the `normalize_app_user_agent` pin). Helper (`CEF_PATH` set) all five clean — **41 + 15** (UNCHANGED: two pins
+were rewritten in place, not added). `patch-framework.sh` **EXIT=0** — `classes.dex` **21280**, `classes2.dex`
+**77764** (pristine 77660 → 77824 with the now-removed 💥 diagnostic → **77764** with the real fix: **+104 B**
+over pristine, **−60 B** vs the diagnostic it replaces), `classes3.dex` **2498192**. **Back-checked the INSTALLED
+dex, not just the script's greps:** baksmali of the built `classes2.dex` shows the intended bodies round-tripped
+(`invoke-direct` → `native_getUserAgentString`, `if-nez` → `:cond_8` fallback, both `private native` decls), and
+the fallback literal is **byte-identical to `ECLIPSE_USER_AGENT`** (125 bytes, compared programmatically).
+`__webview-test` **EXIT=0** with the pinned marker **INTACT** — `upcalls 2/2 … honest UA OK … bound=5` (WebSettings
+binds on its own class, so WebView's `bound=5` is untouched); the helper logged `the app set no User-Agent — using
+Eclipse's fallback literal`, i.e. **the harness exercised the fallback rung and it is green**, which is what that
+leg now guards.
+
+*NOT DONE — stated honestly.* **The live challenge boot did not run** (orchestrator-only; a workflow subagent must
+not drive an ART/bionic boot — CLAUDE.md's dev-host/harness boundary). So the fix is proven correct at every seam
+a harness can reach (unit, dex back-check, byte-match, live `__webview-test` through real ART) but the END-TO-END
+claim — that the app's own UA wakes the bridge with nothing forced — is **PENDING that boot**. It is the same
+result challenge26 already achieved by FORCING the token via `ECLIPSE_WEBVIEW_UA_DIAG`, so the mechanism is
+evidenced; what is untested is only that the app's real string travels the new store→env→CEF path intact.
+
+*Files:* `crates/eclipse-webview/src/engine.rs` (ladder + fallback docs + the two rewritten pins),
+`crates/eclipse-webview/src/main.rs` (the two env reads + which-rung-won logging),
+`src/webview/client.rs` (`APP_USER_AGENT` store + `normalize_app_user_agent` + `set/app_user_agent` +
+`HELPER_UA_FIXED` + the spawn `env`), `src/webview/mod.rs` (spawn contract §4 + §8),
+`src/framework.rs` (the 2 WebSettings natives + `register_web_settings_natives` + wiring + the pin),
+`tools/framework-overlay/patch-framework.sh` (the real fix replacing the 💥 diagnostic + guards); this file
+(§5 🩹 bullet + §6 this entry).
 
 ---
 
