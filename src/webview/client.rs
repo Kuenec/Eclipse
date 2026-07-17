@@ -750,6 +750,19 @@ impl EarlyCookies {
     }
 }
 
+/// 2026-07-17: the rect the compositor last DREW a WebView at, and the view it drew. Keying by
+/// `view` is what makes a rect left over from a closed view unusable for its successor WITHOUT
+/// clearing it at all six `ACTIVE_VIEW` write sites (a "forget one" hazard; challenge16's stale
+/// full-window composite is the recorded precedent for stale-rect bugs on this surface).
+#[derive(Clone, Copy)]
+struct DrawnRect {
+    view: i64,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
 /// State shared between the reader thread, the drive path, and the compositor.
 struct Shared {
     /// One entry per live driven WebView (the challenge flow has exactly one).
@@ -757,6 +770,10 @@ struct Shared {
     /// The cached ABSOLUTE composite rect `(x, y, w, h)` (the `TEXTBOX_GEOM` pattern): written by
     /// [`update_composited_rect`] on the main thread, read by the vk-overlay present path.
     rect: Mutex<Option<(i32, i32, u32, u32)>>,
+    /// 2026-07-17: the CLAMPED screen rect the compositor ACTUALLY drew the WebView at: written by
+    /// the vk-overlay present path (the ONE place that resolves it), read by the input hit-test —
+    /// which is what stops the two from diverging. Leaf lock: no other lock is taken while held.
+    screen_rect: Mutex<Option<DrawnRect>>,
     /// The blocking `getCookie` waiters, keyed by consumer request id: the reader thread delivers
     /// the solicited `CookieList` into the channel, waking [`cookie_get_blocking`] (which parked
     /// on the receiver WITHOUT holding [`CLIENT`], so the reader is never blocked). A request id is
@@ -771,6 +788,7 @@ fn shared() -> &'static Arc<Shared> {
         Arc::new(Shared {
             views: Mutex::new(HashMap::new()),
             rect: Mutex::new(None),
+            screen_rect: Mutex::new(None),
             cookie_get_waiters: Mutex::new(HashMap::new()),
         })
     })
@@ -2710,9 +2728,33 @@ pub fn active_view() -> i64 {
 }
 
 /// The cached ABSOLUTE composite rect of the active WebView, or `None` (the composite then
-/// falls back to a centered rect of the staged frame's own dimensions).
+/// falls back to a centered rect of the staged frame's own dimensions). 2026-07-17: this is the
+/// registry-measured REQUEST, not what is on screen — it is one INPUT to
+/// `vk_overlay::resolve_webview_rect`, whose CLAMPED result (published below) is what both the
+/// composite and the input hit-test use. Input must never read this directly: it is `None` for the
+/// challenge WebView (never measured headless) and it is un-clamped.
 pub fn composited_rect() -> Option<(i32, i32, u32, u32)> {
     shared().rect.lock().ok().and_then(|r| *r)
+}
+
+/// 2026-07-17: publish the CLAMPED rect the composite just drew `view` at — called by the
+/// vk-overlay present path once per present whose blit landed.
+pub fn publish_composited_screen_rect(view: i64, rect: (i32, i32, u32, u32)) {
+    let (x, y, w, h) = rect;
+    if let Ok(mut r) = shared().screen_rect.lock() {
+        *r = Some(DrawnRect { view, x, y, w, h });
+    }
+}
+
+/// 2026-07-17: the rect `view` is ACTUALLY composited at on screen — what the input hit-test maps
+/// against, so a click lands where the page is drawn. `None` until this view's first composite
+/// lands (nothing drawn ⇒ nothing to click ⇒ input correctly stays with the engine), and `None`
+/// for any view other than the one the rect was drawn for (a successor never inherits it).
+pub fn composited_screen_rect(view: i64) -> Option<(i32, i32, u32, u32)> {
+    match *shared().screen_rect.lock().ok()? {
+        Some(r) if r.view == view => Some((r.x, r.y, r.w, r.h)),
+        _ => None,
+    }
 }
 
 /// Refresh the cached composite rect from the view registry (main-thread cadence — called from

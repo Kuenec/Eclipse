@@ -128,6 +128,56 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-17 — 🖱️ THE CHALLENGE PAGE IS NOW CLICKABLE IN CODE: the compositor and the input
+  hit-test resolved the WebView's rect INDEPENDENTLY and disagreed; they now consume ONE resolver.
+  Gate green BOTH crates (root **660**+6+2 zero-SKIP / helper **41+15**, zero helper diff);
+  `__webview-test` **EXIT=0** marker intact, zero orphans. Live 2SV click boot PENDING —
+  orchestrator-only (full record: §6 2026-07-17 🖱️).** **THE MEASURED BUG** (owner-interactive
+  boot): the owner reached a REAL 2-Step-Verification page, **SAW it**, and could not click or type
+  in it — **45× ACTION_DOWN + 45× ACTION_UP, all 90 delivered to `RBXSurfaceView`, ZERO to the
+  WebView**, while the overlay logged `composite objects built for rect x=0 y=0 w=800 h=600` (the
+  full window). **THE ROOT CAUSE — two answers to one question:** the composite did
+  `match composited_rect() { Some(r) => r, None => <centered fallback> }` (so it DREW), while
+  `graphics::webview_relative_point` did `composited_rect()?` (so on `None` it BAILED ⇒ `routed`
+  false ⇒ `engine_primary_press()`). `update_composited_rect` feeds that cache from
+  `view_registry::absolute_frame`, which is **`None` for the challenge WebView** — its content is
+  never measured headless, so the recorded frame is degenerate. The code PREDICTED this in its own
+  comment (*"the centered fallback rect deliberately does not capture input, an M6-revisit note"*)
+  and §5/§6 carried it as an open M6 item. **THE FIX (structural, not coincidental):**
+  `vk_overlay::resolve_webview_rect(cached, extent, stage)` is now the ONE resolver (pure: today's
+  fallback + clamp fused, byte-identical math ⇒ **what is DRAWN is unchanged**, which was the
+  requirement — the owner already saw the page). The compositor PUBLISHES the **clamped** rect it
+  actually drew (`publish_composited_screen_rect`, gated on `upload_bgra` returning true — which is
+  `true` **only** once the blit submitted AND its fence signalled, i.e. an exact *"these pixels are
+  in the presented image"* signal), and the hit-test maps against **that** (`composited_screen_rect`).
+  **WHY THE CLAMPED RECT IS THE HONEST ONE (verified, not assumed):** `upload_bgra` blits stage
+  pixel (0,0) to `image_offset` = the CLAMPED origin, so subtracting that origin **is** the
+  view-relative coordinate — this also fixes a **second, quieter instance of the same class** that
+  nobody had hit yet: a negative requested origin (`clamp(-5,-7,…) → (0,0,…)`) SHIFTS the drawn
+  content, so the old pre-clamp hit-test would have mis-mapped every point in it. **The rect is
+  keyed by view handle**, which makes a rect left over from a closed view unusable for its
+  successor WITHOUT clearing it at all **six** `ACTIVE_VIEW` write sites (a "forget one" hazard;
+  challenge16's stale full-window composite is the recorded precedent). **CLASS AUDIT:** all three
+  hit-test consumers (press/release, `CursorMoved`, `MouseWheel`) went through the one bailing
+  function ⇒ all three fixed by the one change. **Keyboard did NOT have this bug** — it gates on
+  `active_view()` only, never on the rect, so keys always routed; the owner could not type because
+  no click ever reached the page to focus an input, a DOWNSTREAM effect. Deliberately NOT changed
+  (Surgical Changes): keys still route on `active_view()` alone (the M3 "the challenge widget owns
+  keyboard focus while live" contract). **REGRESSION GUARD** (pure, no GPU/display/ART):
+  `graphics::tests::a_centre_click_routes_into_a_webview_that_has_no_measured_frame_rect` — with NO
+  cached frame rect (the measured state) it resolves the drawn rect, publishes it, and asserts a
+  centre click maps INSIDE, i.e. routes to the WebView. **Negative-tested BOTH ways:** reverting the
+  hit-test to `composited_rect()?` fails it (*"the hit-test must see the rect the compositor
+  drew"*), and deleting the resolver's fallback arm fails it (*"the composite draws the centered
+  fallback…"*) — it pins the compositor↔input equivalence, not just one side.
+  **⇐ START-HERE-NEXT — THE LIVE 2SV CLICK BOOT (owner, dev-host main thread; the ONLY thing not
+  done):** drive to the 2SV page and CLICK it ⇒ PASS = the page reacts (focus ring / typed text
+  appearing) and `engine pointer ACTION_DOWN` **stops** tracking
+  1:1 with clicks on the page. **⚠️ PRE-REGISTERED FALSIFIER — CEF FOCUS, named in advance:** the
+  helper has **ZERO** `SendFocusEvent`/`SetFocus` (grep over `crates/eclipse-webview/src/` = 0). If
+  clicks now land but **typing still does nothing**, that is the named suspect — a CEF OSR browser
+  may need an explicit focus event before key events are honoured; it is NOT fixed here because it
+  is unconfirmed and CLAUDE.md forbids speculative changes.
 - **2026-07-17 — 🔁 RESPAWN-AND-REPLAY IS IMPLEMENTED: a helper that booted on the WRONG User-Agent is now
   REPLACED at the first load-drive, with the app's ORIGINAL cookie frames replayed into its successor. Gate green
   BOTH crates (root **658**+6+2 zero-SKIP / helper **41+15**); `__webview-test` **EXIT=0** marker intact, zero
@@ -3493,6 +3543,55 @@ before any history-rewriting/force operation.
 ---
 
 ## 6. Decisions Log  *(append-only, dated)*
+
+### 2026-07-17 🖱️ — the composite rect and the input hit-test are now ONE resolver
+
+**1. The evidence (measured, owner-interactive boot — not inferred).** The owner reached a REAL 2SV
+page rendered by Eclipse, saw it, and could not interact: **45× `engine pointer ACTION_DOWN` + 45×
+ACTION_UP, all 90 delivered to `RBXSurfaceView.onTouchEventInternal`; input reaching the WebView
+client: ZERO**; overlay: `composite objects built for rect x=0 y=0 w=800 h=600` (full window).
+
+**2. Root cause.** Rendering and input answered *"where is the WebView?"* independently:
+`vk_overlay` fell back to a centered rect of the stage's dims when `client::composited_rect()` was
+`None` (⇒ it drew); `graphics::webview_relative_point` did `composited_rect()?` (⇒ on `None` it
+returned `None`, `routed` stayed false, and every press fell through to `engine_primary_press()`).
+The cache is `None` for the challenge WebView because `view_registry::absolute_frame` returns `None`
+for a degenerate frame and the challenge content is **never measured headless**. This was a known,
+recorded M6 item and the source comment had predicted the exact failure.
+
+**3. Why THIS shape.** The brief offered "publish from the overlay" vs "a pure function both call".
+Chosen: **both** — a pure resolver whose result is published. A pure recomputation in `graphics.rs`
+was REJECTED on evidence: it would need the stage dims (behind the `views` **try**-lock, on the
+input path — a lock MISS would silently misroute, recreating this exact bug class
+nondeterministically) and the swapchain extent (overlay-private). Publishing what the blit actually
+landed is strictly more honest than recomputing what it *should* have landed: it also refuses to
+capture input when the composite never ran (unsupported format ⇒ nothing on screen ⇒ input
+correctly stays with the engine). The pure part stays unit-pinnable with **no GPU**, which was the
+stated point.
+
+**4. What the clamp taught us (verified against `upload_bgra`, not assumed).** The blit sets
+`image_offset` = the CLAMPED origin and copies from the stage's start ⇒ stage (0,0) lands at
+`(cx, cy)` ⇒ subtracting the **clamped** origin *is* the view-relative coordinate. So the hit-test
+must use the clamped rect — and the old code's pre-clamp rect was a **second instance of the same
+class** (a negative origin SHIFTS content: `clamp(-5,-7,300,200,…) → (0,0,300,200)`), latent because
+the measured case never produced a negative origin. Fixed by the same change; pinned.
+
+**5. Scope discipline.** Composite output is **byte-identical** (the fallback math + clamp were
+fused, not altered) — the page already rendered correctly and that was a hard requirement. The
+press/release latch (`webview_pointer_down`) is untouched, so a pair still never splits.
+`PROTO_VERSION` unchanged; **zero helper diff**; no new deps.
+
+**6. The class audit.** All three rect-consuming input paths (press/release, `CursorMoved`,
+`MouseWheel`) funnelled through the one bailing function ⇒ one fix covers all three. **Keyboard is
+NOT an instance**: it gates on `active_view()` alone and always routed. The owner's "cannot type" is
+downstream of "cannot click" (nothing ever focused an input). Left unchanged deliberately.
+
+**7. Honest gaps, named rather than papered over.** (a) **CEF focus** — the helper has **zero**
+`SendFocusEvent`/`SetFocus` (grep = 0). If clicks now land but typing still does nothing, that is
+the pre-registered suspect; not fixed here because it is unconfirmed and a live boot is
+orchestrator-only. (b) The published rect can be **≤1 frame stale** if a present skips (try-lock
+contention) — same order as the pre-existing once-per-loop cache, and self-correcting. (c) The
+window-pixel ≡ swapchain-extent assumption is pre-existing and unchanged by this pass.
 
 > **2026-06-11 trim:** the granular session-by-session narrative from 2026-06-04/05 (the M0
 > AUR-install path, the M1 launcher build-out, the engine-load tower, the 27 + 33 + 8 NDK
