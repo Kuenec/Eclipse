@@ -153,8 +153,10 @@ impl std::error::Error for ClientError {}
 
 /// The one helper-process slot. Spawn / control-socket writes / teardown are serialized here.
 enum ClientSlot {
-    /// No helper has been needed yet (lazy spawn on the first drive).
-    Unspawned,
+    /// No helper has been needed yet (lazy spawn), carrying the cookie ops deferred so far
+    /// (2026-07-16, the §6 🩹➜⛔ ordering fix: `CefSettings.user_agent` is GLOBAL and consumed by
+    /// `CefInitialize`, so the spawn must not happen before the app has set its UA).
+    Unspawned(EarlyCookies),
     /// The helper is running; the reader thread is live.
     Live(Client),
     /// Process-lifetime failure latch (D5) carrying the ONE actionable reason.
@@ -181,7 +183,7 @@ struct Client {
     upcall: Option<JoinHandle<()>>,
 }
 
-static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned);
+static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned(EarlyCookies::new()));
 
 /// The widget handle of the most recently driven (live) WebView; `0` = none. The cheap
 /// present/input gate — one atomic load on every hot-path check (the `ACTIVE_TEXT_FIELD`
@@ -268,9 +270,10 @@ pub fn set_app_user_agent(ua: Option<String>) {
             ua = ua.as_deref().unwrap_or("<reset to default>"),
             "setUserAgentString called AFTER the engine User-Agent was already fixed at helper spawn — \
              CefSettings.user_agent is global and consumed by CefInitialize, so this UA will NOT reach \
-             the engine (the Java-side getUserAgentString() will still report it). Not observed on any \
-             measured boot: the app configures its WebView before the first load, and the first load is \
-             what spawns the helper."
+             the engine (the Java-side getUserAgentString() will still report it). Reached only when \
+             an early op could not be deferred and forced the spawn first (see `EarlyCookies`) — the \
+             WARN there names which one. MEASURED 2026-07-16: before the deferral this fired on EVERY \
+             boot, 61 s late (§6 🩹➜⛔)."
         );
     }
     match APP_USER_AGENT.lock() {
@@ -297,6 +300,130 @@ pub fn set_app_user_agent(ua: Option<String>) {
 /// [`spawn_helper_process`].
 pub fn app_user_agent() -> Option<String> {
     APP_USER_AGENT.lock().ok().and_then(|s| s.clone())
+}
+
+// ---------------------------------------------------------------------------
+// The deferred-spawn cookie window (2026-07-16, plan M6 — the §6 🩹➜⛔ ordering fix)
+// ---------------------------------------------------------------------------
+
+/// What [`EarlyCookies::offer`] decided about one message while the helper is UNSPAWNED.
+#[derive(Debug, PartialEq, Eq)]
+enum Deferral {
+    /// Hold the raw frame; nothing crosses the wire and no reply is coming.
+    Buffer,
+    /// PROVABLY answerable without the engine — the caller produces CEF's own answer itself.
+    AnswerWithoutEngine,
+    /// Not answerable without CEF: spawn NOW. Carries the reason for the honest WARN, which
+    /// doubles as the `trigger=` the spawn is logged with.
+    NeedsEngine(&'static str),
+}
+
+/// What [`send_with_lazy_spawn`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Written to the live helper; any reply arrives normally.
+    Sent,
+    /// Held in [`EarlyCookies`] for the flush (fire-and-forget only — nothing waits on it).
+    Buffered,
+    /// Answered without the engine; no reply is coming.
+    AnsweredWithoutEngine,
+}
+
+/// The cookie ops deferred while the helper spawn is held back.
+///
+/// # Why this is CORRECT and is NOT a reimplementation of cookie semantics (2026-07-16)
+///
+/// It buffers RAW [`ConsumerMsg`] frames and replays them verbatim; it never parses, matches or
+/// expires a cookie. It answers exactly two questions, and only where the answer is a THEOREM:
+///
+/// **The empty-store lemma.** While this variant is live, no helper process exists ⇒ no
+/// `cef_initialize` ⇒ no `CefContext` (CEF `docs/architecture.md`: *"initialized when CefInitialize
+/// is called"*; the pinned `cef_initialize` doc forbids ANY other CEF call before it) ⇒ no
+/// `RequestContext`, no cookie store, no browser. On the eventual spawn the store is created fresh
+/// from `engine::session_context_settings()`, whose `cache_path` is EMPTY — pinned
+/// `_cef_settings_t::cache_path`: *"If this value is empty then browsers will be created in
+/// \"incognito mode\" where in-memory caches are used for storage and no profile-specific data is
+/// persisted to disk"* — so it starts EMPTY on every process start, with no disk and no prior boot.
+/// It can then gain a cookie by exactly two routes: (a) `cef_cookie_manager_t::set_cookie`, whose
+/// only callers in the whole helper are the `CookieSet` / `CookieSetForResult` handlers
+/// (`engine.rs` — grep-verified 2026-07-16), and (b) a `Set-Cookie` response header, which needs a
+/// browser — and `CreateView` is sent from exactly ONE site ([`drive`]), which spawns first. (b) is
+/// therefore impossible here and (a) is exactly what this buffer holds.
+/// **⇒ store_contents ≡ replay(self.sets), always.**
+///
+/// From the lemma:
+/// * `CookiesClear` — `engine::cookies_clear` calls `delete_cookies(None, None, cb)`; pinned doc:
+///   *"If |url| is NULL all cookies for all hosts and domains will be deleted"*. A blanket delete
+///   over a store whose entire content is `sets` is reproduced EXACTLY by dropping `sets`. Its wire
+///   reply is a pure completion signal, and `framework::fire_cookies_clear_result` passes `true`
+///   UNCONDITIONALLY — so the locally delivered `true` is the same value, not a fabricated ack.
+/// * `CookieGet` with an EMPTY buffer — the store is empty ⇒ CEF answers the empty list. (It does
+///   so only via the 5 s `COOKIE_VISIT_DEADLINE`: *"Zero cookies never trigger the visitor"*,
+///   `engine::poll`.) Byte-identical, and ~5 s faster.
+///
+/// And what it must NOT try to answer — for reasons that are also quotes:
+/// * `CookieGet` with a NON-EMPTY buffer — `visit_url_cookies` results are *"filtered by the given
+///   url scheme, host, domain and path"*. That matching is Chromium's. Eclipse does not implement
+///   RFC 6265 anywhere and must not start here.
+/// * `CookieSetForResult` — its whole purpose is the REAL verdict: `set_cookie` *"will check for
+///   disallowed characters ... and fail without setting the cookie"* and returns *"false (0) if an
+///   invalid URL is specified"* (the measured boot shows CEF genuinely rejecting two of the app's
+///   sets). Only CEF knows. Deferring its reply instead was REJECTED: the app's `ValueCallback`
+///   would then fire only at flush — and if the app never drives a WebView, never. An app that
+///   blocks on it at `AppManager.initialize` would then HANG FOREVER, which is strictly worse than
+///   a wrong UA. Forcing the spawn is exactly the pre-fix behaviour and can regress nothing.
+struct EarlyCookies {
+    /// Deferred `CookieSet` frames in ARRIVAL ORDER, replayed verbatim by [`ensure_spawned`].
+    /// RAW frames: nothing is parsed here, so nothing (expiry, creation time, sanitization) can be
+    /// lost — `ConsumerMsg::CookieSet` carries `expires_epoch_s`, which the read-back type
+    /// `CookieEntry` does NOT. That asymmetry is exactly why a read-back+replay was rejected and
+    /// why buffering the app's ORIGINAL request is sound.
+    sets: Vec<ConsumerMsg>,
+}
+
+impl EarlyCookies {
+    /// Bound on the buffer. NOT speculative future-proofing — this design creates a genuinely new
+    /// unbounded path and this is the evidence for it: a boot with NO login challenge (the COMMON
+    /// case) never drives a WebView, so the buffer NEVER flushes while the app keeps setting
+    /// cookies for the whole session (the measured log shows `Updated WebViewCookieHandler with
+    /// Cookies from URL …` recurring). Unbounded growth of cookie VALUES — including the
+    /// `.ROBLOSECURITY` auth token — in the ART process is not acceptable (AGENTS.md §2: global
+    /// state is bounded). 256 is ~10x the measured pre-load set count, so a challenge boot cannot
+    /// reach it; overflow degrades to the honest forced spawn, i.e. exactly today's behaviour.
+    const CAP: usize = 256;
+
+    const fn new() -> Self {
+        Self { sets: Vec::new() }
+    }
+
+    /// Offer one consumer message to the deferral. Total; the caller acts on the verdict. The
+    /// cookie variants are matched EXPLICITLY — no `_` arm covers them — so a future cookie message
+    /// cannot be added without deciding its pre-engine behaviour. That is the structural guard
+    /// against re-opening this defect.
+    fn offer(&mut self, msg: &ConsumerMsg) -> Deferral {
+        match msg {
+            // Fire-and-forget (v1): no reply obligation, so buffering can never strand a callback.
+            ConsumerMsg::CookieSet { .. } if self.sets.len() < Self::CAP => {
+                self.sets.push(msg.clone());
+                Deferral::Buffer
+            }
+            ConsumerMsg::CookieSet { .. } => {
+                Deferral::NeedsEngine("the deferred-cookie buffer is full")
+            }
+            ConsumerMsg::CookiesClear { .. } => {
+                self.sets.clear();
+                Deferral::AnswerWithoutEngine
+            }
+            ConsumerMsg::CookieGet { .. } if self.sets.is_empty() => Deferral::AnswerWithoutEngine,
+            ConsumerMsg::CookieGet { .. } => Deferral::NeedsEngine(
+                "getCookie after this boot set a cookie — CEF owns url/domain/path matching",
+            ),
+            ConsumerMsg::CookieSetForResult { .. } => Deferral::NeedsEngine(
+                "setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag",
+            ),
+            _ => Deferral::NeedsEngine("an op that needs the engine reached the pre-engine gate"),
+        }
+    }
 }
 
 /// State shared between the reader thread, the drive path, and the compositor.
@@ -508,8 +635,13 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
     }
     // 2026-07-16 (plan M6, the §6 2026-07-16 💥 fix): forward the UA the app set via
     // `WebSettings.setUserAgentString` so CEF actually SENDS it. `CefSettings.user_agent` is global
-    // and fixed at `CefInitialize`, and this spawn is lazy — it happens on the first load-drive,
-    // AFTER the app has configured its WebView — so the ordering works.
+    // and fixed at `CefInitialize`, so THIS read is the boot's one chance to get it right.
+    //
+    // 2026-07-16 (§6 🩹➜⛔) — the ordering claim that stood here ("the spawn is lazy, it happens on
+    // the first load-drive, AFTER the app configures its WebView, so the ordering works") was
+    // DISPROVED by the live boot: a COOKIE op cold-started the helper 61 s BEFORE
+    // setUserAgentString. `EarlyCookies` is what makes the ordering actually hold — cookie ops no
+    // longer spawn the helper, so by the time this runs the app's UA is normally already set.
     //
     // THE ENVIRONMENT, NOT ARGV, and this is the §6 🌱 provenance test applied, not a shape
     // argument. The spawn contract's operative predicate is "no secrets in argv" (§4 bans
@@ -710,18 +842,46 @@ fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
     }
 }
 
-/// Ensure the [`CLIENT`] slot is `Live` (lazy spawn on the first drive/op, D2). Called with the
-/// [`CLIENT`] lock held. On spawn failure the slot latches `Failed` and the actionable error is
-/// returned (the honest no-op contract). A caller MUST have checked [`latched_error`] first.
-fn ensure_spawned(slot: &mut ClientSlot, java_vm: jni::vm::JavaVM) -> Result<(), ClientError> {
-    if matches!(&*slot, ClientSlot::Unspawned) {
-        match spawn_client(java_vm) {
-            Ok(client) => *slot = ClientSlot::Live(client),
-            Err(e) => {
-                *slot = ClientSlot::Failed(e.to_string());
-                return Err(e);
-            }
+/// Ensure the [`CLIENT`] slot is `Live` (lazy spawn, D2). Called with the [`CLIENT`] lock held.
+/// On spawn failure the slot latches `Failed` and the actionable error is returned (the honest
+/// no-op contract). A caller MUST have checked [`latched_error`] first.
+///
+/// 2026-07-16 (plan M6, §6 🩹➜⛔): this is where [`spawn_helper_process`] reads [`APP_USER_AGENT`]
+/// into the child's env, so this is the instant the engine's GLOBAL `CefSettings.user_agent` is
+/// fixed for the whole boot. `trigger` is therefore load-bearing, not decoration: challenge28's log
+/// could not say WHAT cold-started the helper 61 s before the app set its UA, and that ambiguity is
+/// what this line ends. It is also where the deferred cookie ops replay, in arrival order, BEFORE
+/// the message that triggered the spawn.
+fn ensure_spawned(
+    slot: &mut ClientSlot,
+    java_vm: jni::vm::JavaVM,
+    trigger: &str,
+) -> Result<(), ClientError> {
+    let deferred = match slot {
+        ClientSlot::Unspawned(early) => std::mem::take(&mut early.sets),
+        _ => return Ok(()),
+    };
+    tracing::info!(
+        trigger,
+        app_ua_known = app_user_agent().is_some(),
+        deferred = deferred.len(),
+        "cold-starting the eclipse-webview helper — this FIXES the engine's global \
+         CefSettings.user_agent for the whole boot (§6 2026-07-16 🩹➜⛔)"
+    );
+    match spawn_client(java_vm) {
+        Ok(client) => *slot = ClientSlot::Live(client),
+        Err(e) => {
+            // The deferred sets die with the latch — identical to the pre-fix behaviour, where
+            // every one of them would have been a no-op on a latched slot.
+            *slot = ClientSlot::Failed(e.to_string());
+            return Err(e);
         }
+    }
+    // Replay BEFORE the triggering message (and before drive()'s CreateView/LoadUrl), so nothing
+    // can observe the jar between the spawn and the flush. Cookie-before-CreateView is correct:
+    // the store is request-context-scoped, not view-scoped.
+    for msg in &deferred {
+        send_locked(slot, msg)?;
     }
     Ok(())
 }
@@ -1423,7 +1583,11 @@ fn drive(
     if let Some(e) = latched_error(&slot) {
         return Err(e);
     }
-    ensure_spawned(&mut slot, java_vm)?;
+    ensure_spawned(
+        &mut slot,
+        java_vm,
+        "WebView load-drive (loadUrl/loadDataWithBaseURL) — the app's UA is final",
+    )?;
     // The driven URL for the upcall contract: the URL itself, or the loadData base (the installed
     // Java hardcodes "about:blank" on the loadData route — the Android semantics for a null base).
     let driven_url = match &target {
@@ -1581,18 +1745,42 @@ fn drain_pending_bridges(widget: i64) -> Vec<(String, Vec<BridgeMethod>)> {
         .unwrap_or_default()
 }
 
-/// Latch check → lazy spawn (D2) → send one frame under the [`CLIENT`] lock (the register/eval/
-/// cookie ops that need no per-view record). A send failure latches (the stream is untrustworthy);
-/// a latched slot returns the actionable reason before any work.
-fn send_with_lazy_spawn(java_vm: jni::vm::JavaVM, msg: &ConsumerMsg) -> Result<(), ClientError> {
+/// Latch check → the deferred-spawn cookie window ([`EarlyCookies`]) → lazy spawn (D2) → send one
+/// frame under the [`CLIENT`] lock (the register/eval/cookie ops that need no per-view record). A
+/// send failure latches (the stream is untrustworthy); a latched slot returns the actionable reason
+/// before any work.
+fn send_with_lazy_spawn(
+    java_vm: jni::vm::JavaVM,
+    msg: &ConsumerMsg,
+) -> Result<SendOutcome, ClientError> {
     let mut slot = CLIENT
         .lock()
         .map_err(|_| ClientError::Internal("client lock poisoned"))?;
     if let Some(e) = latched_error(&slot) {
         return Err(e);
     }
-    ensure_spawned(&mut slot, java_vm)?;
-    send_locked(&mut slot, msg)
+    // Decide and drop the borrow before acting (the verdict owns its &'static str).
+    let verdict = match &mut *slot {
+        ClientSlot::Unspawned(early) => Some(early.offer(msg)),
+        _ => None,
+    };
+    match verdict {
+        Some(Deferral::Buffer) => return Ok(SendOutcome::Buffered),
+        Some(Deferral::AnswerWithoutEngine) => return Ok(SendOutcome::AnsweredWithoutEngine),
+        Some(Deferral::NeedsEngine(why)) => {
+            tracing::warn!(
+                reason = why,
+                "an early op is forcing the eclipse-webview helper to start BEFORE the app has \
+                 configured its WebView — CefSettings.user_agent is GLOBAL and consumed by \
+                 CefInitialize, so this boot's engine will present Eclipse's FALLBACK User-Agent, \
+                 not the app's, and the page's own bridge selector will not fire (§6 2026-07-16 \
+                 🏆/💥). Honest degradation — the pre-2026-07-16 behaviour, said out loud."
+            );
+            ensure_spawned(&mut slot, java_vm, why)?;
+        }
+        None => {} // already Live
+    }
+    send_locked(&mut slot, msg).map(|()| SendOutcome::Sent)
 }
 
 /// Register (or re-register) an `addJavascriptInterface(object, name)` bridge on `widget`. The
@@ -1619,6 +1807,7 @@ pub fn register_bridge(
                 methods,
             },
         )
+        .map(|_| ())
     } else {
         // Deferred to drive()'s post-CreateView flush; nothing to send (and no reason to spawn).
         Ok(())
@@ -1642,6 +1831,7 @@ pub fn evaluate_js(
             script,
         },
     )
+    .map(|_| ())
 }
 
 /// Fire-and-forget 2-arg `CookieManager.setCookie(url, value)` (v1 `CookieSet`). Lazily spawns.
@@ -1670,6 +1860,7 @@ pub fn cookie_set(
             expires_epoch_s,
         },
     )
+    .map(|_| ())
 }
 
 /// 3-arg `CookieManager.setCookie(url, value, ValueCallback)` (v2 `CookieSetForResult`): the REAL
@@ -1702,13 +1893,21 @@ pub fn cookie_set_with_result(
             expires_epoch_s,
         },
     )
+    .map(|_| ())
 }
 
 /// `removeAllCookies` / `removeSessionCookies` (v1 `CookiesClear`): the completion returns as a
 /// (routed) empty `CookieList` correlated by `request_id`. 2026-07-09 divergence: `CookiesClear`
 /// is a blanket clear, so `removeSessionCookies` also clears persistent cookies — harmless for the
 /// in-memory session store (nothing persists). Lazily spawns.
-pub fn cookies_clear(java_vm: jni::vm::JavaVM, request_id: u32) -> Result<(), ClientError> {
+///
+/// 2026-07-16 (§6 🩹➜⛔): during the deferred-spawn window a blanket clear is PROVABLY complete
+/// without the engine ([`EarlyCookies`]) and returns [`SendOutcome::AnsweredWithoutEngine`] — the
+/// caller must then fire the app's `ValueCallback` itself, because no helper reply is coming.
+pub fn cookies_clear(
+    java_vm: jni::vm::JavaVM,
+    request_id: u32,
+) -> Result<SendOutcome, ClientError> {
     send_with_lazy_spawn(java_vm, &ConsumerMsg::CookiesClear { request_id })
 }
 
@@ -1743,9 +1942,19 @@ pub fn cookie_get_blocking(
         }
         Err(_) => return Err(ClientError::Internal("cookie waiters lock poisoned")),
     }
-    if let Err(e) = send_with_lazy_spawn(java_vm, &ConsumerMsg::CookieGet { request_id, url }) {
-        remove_cookie_waiter(request_id);
-        return Err(e);
+    match send_with_lazy_spawn(java_vm, &ConsumerMsg::CookieGet { request_id, url }) {
+        Ok(SendOutcome::Sent) => {}
+        // 2026-07-16 (§6 🩹➜⛔): answered without the engine — the session store is PROVABLY empty
+        // ([`EarlyCookies`]), so this IS what CEF would have replied (and ~5 s sooner: a zero-cookie
+        // visit only completes on the COOKIE_VISIT_DEADLINE). No reply is coming, so do not park.
+        Ok(_) => {
+            remove_cookie_waiter(request_id);
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            remove_cookie_waiter(request_id);
+            return Err(e);
+        }
     }
     match rx.recv_timeout(timeout) {
         Ok(cookies) => Ok(cookies),
@@ -2020,8 +2229,13 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
                 ClientSlot::Failed("the web engine helper was shut down".into()),
             ) {
                 ClientSlot::Live(c) => Some(c),
-                other => {
-                    // Never-live (or already failed): keep the original state.
+                mut other => {
+                    // Never-live (or already failed): keep the original state. 2026-07-16: an
+                    // Unspawned slot may hold deferred cookie SETs nothing will ever replay — drop
+                    // their values here, matching the pending_bridges clear below.
+                    if let ClientSlot::Unspawned(early) = &mut other {
+                        early.sets.clear();
+                    }
                     *slot = other;
                     None
                 }
@@ -2592,7 +2806,7 @@ mod tests {
             other => panic!("expected the latched error, got {other:?}"),
         }
         // Non-failed slots never produce a latch error (Unspawned drives spawn; Live drives send).
-        assert!(latched_error(&ClientSlot::Unspawned).is_none());
+        assert!(latched_error(&ClientSlot::Unspawned(EarlyCookies::new())).is_none());
     }
 
     #[test]
@@ -2683,6 +2897,141 @@ mod tests {
             normalize_app_user_agent(Some(" ".to_string())),
             Some(" ".to_string())
         );
+    }
+
+    /// A `CookieSet` frame for the deferral pins (values are irrelevant — `offer` never parses).
+    fn a_cookie_set(name: &str) -> ConsumerMsg {
+        ConsumerMsg::CookieSet {
+            url: "https://www.roblox.com/".into(),
+            name: name.into(),
+            value: "v".into(),
+            domain: ".roblox.com".into(),
+            path: "/".into(),
+            secure: true,
+            http_only: true,
+            expires_epoch_s: 0,
+        }
+    }
+
+    #[test]
+    fn early_cookies_defer_sets_so_a_cookie_op_never_cold_starts_the_engine() {
+        // 2026-07-16 THE ROOT-CAUSE PIN (§6 🩹➜⛔). The confirmed bug: a COOKIE op spawned the
+        // helper at AppManager.initialize — 61 s BEFORE the app called setUserAgentString — and
+        // `CefSettings.user_agent` is GLOBAL and consumed by `CefInitialize`, so the app's UA (the
+        // one carrying the `Hybrid()` token the page's own bridge selector requires) could never
+        // reach the engine. This fails the moment a fire-and-forget cookie set force-spawns again.
+        let mut early = EarlyCookies::new();
+        assert_eq!(early.offer(&a_cookie_set("a")), Deferral::Buffer);
+        assert_eq!(early.offer(&a_cookie_set("b")), Deferral::Buffer);
+        assert_eq!(early.sets.len(), 2);
+    }
+
+    #[test]
+    fn early_cookies_answer_a_blanket_clear_and_an_empty_store_get_without_the_engine() {
+        // The empty-store lemma (see `EarlyCookies`): with no helper there is no CefContext, hence
+        // no cookie store; the store is created fresh with an EMPTY cache_path (in-memory/incognito)
+        // and only Eclipse's own sets can populate it. So a get on an empty buffer IS the empty list
+        // CEF would return, and a blanket delete_cookies(NULL, NULL) over a store whose entire
+        // content is `sets` is reproduced exactly by dropping `sets`.
+        let mut early = EarlyCookies::new();
+        assert_eq!(
+            early.offer(&ConsumerMsg::CookieGet {
+                request_id: 1,
+                url: "https://www.roblox.com/".into(),
+            }),
+            Deferral::AnswerWithoutEngine
+        );
+        assert_eq!(early.offer(&a_cookie_set("a")), Deferral::Buffer);
+        assert_eq!(
+            early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }),
+            Deferral::AnswerWithoutEngine
+        );
+        // The clear emptied the jar, so a get is answerable again — the post-state matches CEF's.
+        assert!(early.sets.is_empty());
+        assert_eq!(
+            early.offer(&ConsumerMsg::CookieGet {
+                request_id: 3,
+                url: "https://www.roblox.com/".into(),
+            }),
+            Deferral::AnswerWithoutEngine
+        );
+    }
+
+    #[test]
+    fn early_cookies_demand_the_engine_for_matching_and_for_the_real_set_flag() {
+        // The proof's BOUNDARY, pinned so it is never quietly widened. A get with a non-empty buffer
+        // needs `visit_url_cookies`, whose results are "filtered by the given url scheme, host,
+        // domain and path" — Chromium's matching, which Eclipse does not implement and must not
+        // start implementing here. And the 3-arg setCookie exists ONLY for the REAL verdict
+        // (`set_cookie` "will check for disallowed characters ... and fail without setting the
+        // cookie"), so its reply must never be fabricated — nor deferred, which could strand the
+        // app's ValueCallback forever on a boot that never drives a WebView.
+        let mut early = EarlyCookies::new();
+        assert_eq!(early.offer(&a_cookie_set("a")), Deferral::Buffer);
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookieGet {
+                request_id: 1,
+                url: "https://www.roblox.com/".into(),
+            }),
+            Deferral::NeedsEngine(_)
+        ));
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookieSetForResult {
+                request_id: 2,
+                url: "https://www.roblox.com/".into(),
+                name: "n".into(),
+                value: "v".into(),
+                domain: ".roblox.com".into(),
+                path: "/".into(),
+                secure: true,
+                http_only: true,
+                expires_epoch_s: 0,
+            }),
+            Deferral::NeedsEngine(_)
+        ));
+        // A forced spawn must not also lose the buffered sets: they still flush at `ensure_spawned`.
+        assert_eq!(early.sets.len(), 1);
+    }
+
+    #[test]
+    fn early_cookies_are_bounded_and_overflow_forces_the_honest_spawn() {
+        // A boot with no login challenge never drives a WebView, so the buffer never flushes while
+        // the app keeps setting cookies all session. Cookie VALUES (incl. the auth token) must not
+        // grow without bound in the ART process; overflow degrades to the pre-fix behaviour, loudly.
+        let mut early = EarlyCookies::new();
+        for i in 0..EarlyCookies::CAP {
+            assert_eq!(
+                early.offer(&a_cookie_set(&format!("c{i}"))),
+                Deferral::Buffer
+            );
+        }
+        assert!(matches!(
+            early.offer(&a_cookie_set("overflow")),
+            Deferral::NeedsEngine(_)
+        ));
+        assert_eq!(early.sets.len(), EarlyCookies::CAP);
+    }
+
+    #[test]
+    fn early_cookie_sets_replay_in_arrival_order() {
+        // `ensure_spawned` replays `sets` verbatim, in order, BEFORE the triggering message. Order
+        // is the cookie jar's semantics (a later set of the same name overwrites an earlier one),
+        // and the frames are the app's ORIGINALS — so `expires_epoch_s`, which the read-back type
+        // `CookieEntry` cannot carry, survives. That is why buffering is lossless where a
+        // read-back+replay would not be. (The spawn itself is not unit-reachable — no live JavaVM.)
+        let mut early = EarlyCookies::new();
+        for n in ["first", "second", "third"] {
+            assert_eq!(early.offer(&a_cookie_set(n)), Deferral::Buffer);
+        }
+        let taken = std::mem::take(&mut early.sets);
+        let names: Vec<&str> = taken
+            .iter()
+            .map(|m| match m {
+                ConsumerMsg::CookieSet { name, .. } => name.as_str(),
+                _ => "not-a-set",
+            })
+            .collect();
+        assert_eq!(names, vec!["first", "second", "third"]);
     }
 
     #[test]
