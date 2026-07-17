@@ -292,7 +292,13 @@ before any history-rewriting/force operation.
   `PROTO_VERSION` still **2**, `classes2.dex` byte-identical, `__webview-test` EXIT=0 marker intact and provably
   does NOT respawn (it never sets a UA). ⇐ **START-HERE-NEXT: the remaining gap to a COMPLETED LOGIN is REAL
   CREDENTIALS** — the synthetic password is fake, so the post-challenge `v2/login` still 403s on credentials, not
-  on Eclipse. Also open (unchanged, all owner-facing): §7 #1 vendor reception by a real human, #4 LTS-vs-stable
+  on Eclipse. **§7 #1 (vendor reception of CEF-shaped clients) is now ✅ ANSWERED — NOT REFUSED** (the M6 boot
+  answered the exact question it reserved: SERVED http 200, COMPLETED via proofofwork, and **ACCEPTED by the
+  server** — the `v2/login` challenge demand disappeared, 82 → 85 bytes; DataDome's published CEF-fingerprinting
+  concern did NOT materialise; **the Servo runner-up path is NOT triggered and the M1 GO decision stands**).
+  Caveats keeping part of it alive: the type served was **proofofwork** (no human interaction — an *interactive*
+  Arkose type may score differently), the vendor saw genuine Chromium 149 presenting the **app's own** Android
+  WebView UA, and one account/session/IP is not a population. Still open, and all owner-facing: #4 LTS-vs-stable
   cadence, #5 payload sign-off. **✅ AND THE SERVER ITSELF CONFIRMS THE CHALLENGE IS SATISFIED — MEASURED, not
   inferred:** the PRE-challenge `auth.roblox.com/v2/login` returns `403 bodySize:`**`82`**, and the known body
   `{"errors":[{"code":0,"message":"Challenge is required to authorize the request"}]}` is **exactly 82 bytes**
