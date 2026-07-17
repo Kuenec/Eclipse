@@ -128,6 +128,62 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-16 — 🪟 DIVERGENCE #1 CLOSED AND **LIVE-VERIFIED**: the JS bridge now injects into ALL FRAMES per
+  AOSP's contract — the arkose subframes carry it. **AND #1 IS THEREBY RULED OUT AS THE BRIDGE BLOCKER** (full
+  record: §6 2026-07-16 🪟).** ⇒ **LIVE RE-MEASURE DONE** (`/tmp/eclipse-challenge24-allframes.log`, EXIT=124,
+  reached the challenge, zero orphans): the pre-registered mechanical criterion **PASSED** —
+  `main_frame=false … "type":"undefined"` went **3 → 0** and `main_frame=false … "type":"object"` went **0 → 3**
+  (each arkose subframe now reports `__globalRobloxAndroidBridge__` as an `object` carrying `executeRoblox`). **No
+  regression:** Looper throws **0**, `internalLoadChanged` failures **0**, ULE **0**, NPE **0**, orphans **0**.
+  **BUT `bridge call received` = 0, AND the page's console text is BYTE-IDENTICAL** (`challengePageLoaded` /
+  `challengeParsed` / `challengeInitialized` / `challengeDisplayed`, every one still `to origin: undefined`;
+  `The namespace CommonUI.Messages was not found` unchanged). ⇒ **the wrapper is NOT blocked by a missing subframe
+  bridge — #1 was a real conformance defect and is now fixed, but it is NOT the blocker.** The 🪟 hypothesis below
+  (that the wrapper might run in an arkose subframe) is therefore **DEAD or irrelevant**: either the wrapper runs
+  in the main frame after all, or it runs in a subframe that now HAS the bridge and still will not call it. Either
+  way the injection axis is now **exhausted** — every frame in the page has a correct, correctly-named,
+  reachable bridge before the wrapper speaks, and it still does not call it.
+  The AOSP contract was verified against the authoritative sources, not assumed: `addJavascriptInterface`'s
+  normative javadoc — *"The object is injected into all frames of the web page, including all the iframes"* /
+  *"there is no way to tell the calling frame's origin"* — plus the official guide (*"available to every frame
+  within the WebView, including iframes"*, *"lacks origin-based access control"*) and Chromium's per-RenderFrame
+  implementation. **THE LOAD-BEARING FINDING: there is NO security delta.** The cefQuery router was ALREADY
+  registered on every context (🔬 measured `"cefQuery":"function"` in all three arkose subframes) and the
+  browser-side `BridgeHandler::on_query_str` (`engine.rs`) takes **`_frame` and IGNORES it**, resolving the view
+  from `browser.identifier()` alone — so an arkose subframe could ALREADY invoke `executeRoblox` by hand-building
+  the cefQuery payload. **The main-frame stub gate was a convenience gate, never a boundary**; ungating changes the
+  ergonomics of an already-open door. AOSP's one enforcement lever — the `@JavascriptInterface` annotation gate —
+  is pulled unconditionally in `framework.rs::reflect_javascript_interface_methods`, so the exposed surface stays
+  exactly the one method Roblox opted into. **Do not "harden" the gate back: it buys nothing and re-opens the
+  defect;** the frame-blind `on_query_str` is faithful to AOSP (which has no origin control either) and is NOT a
+  bug. **⚠️ The authorizing ruling was WRONG that this needed browser-side design work** — the browser's
+  `"eclipse.bridge.ready"` handler ALREADY answers the ASKING frame (never `browser.main_frame()`), so the pull was
+  already frame-correct and process-agnostic; the only reason subframes never pulled is that the `bridge.ready`
+  send sat inside the same `is_main` gate. **It was a two-gate change** (`on_context_created` sync-inject +
+  pull-send; the `bridge.register` refresh-inject), both in `crates/eclipse-webview/src/main.rs`; the router and
+  the two browser-side main-frame push backstops are untouched; no `mode=sync` assert; no wire-protocol change;
+  root crate untouched. The now-per-frame log literal was renamed to pure/unit-pinned
+  `context ready (requested bridge inventory) main_frame=1|0` (boolean only — no frame URL), so **historical greps
+  for `main-frame context ready` will miss on boots after this**. Gate MEASURED: helper **39 + 15** (+1 guard,
+  negative-tested both ways); root **643 + 6 + 2, zero SKIP** (untouched); fmt/build/clippy `-D warnings`/release
+  clean in BOTH; `__webview-test` **EXIT=0** with the pinned `upcalls 2/2` + `bridge round-trip OK` marker intact,
+  zero orphans. ⚠️ **The preflight CANNOT validate this** — its loopback page is single-frame (both `context ready`
+  lines are `main_frame=1`); it proved only no main-frame regression, which is why the live re-measure above was
+  required. **⚠️ AND IT CORRECTED THE RECORD (the catch that motivated shipping this):** 🔬's title *"the stub is
+  PROVEN intact in the frame the wrapper runs in"* was an **UNCAUGHT OVERCLAIM** — the wrapper's console `source`
+  (`https://js.rbxcdn.com`) identifies the **SCRIPT, not the FRAME**, and `on_console_message` carries no frame
+  identity, so frame attribution had been INFERRED from script origin (a second instance of the species of error 🔬
+  self-corrected once — **this record has now made the same mistake twice; treat any frame/thread/timing
+  attribution as unmeasured until an instrument says otherwise**). That made "the wrapper runs in an arkose
+  subframe with no bridge" a live hypothesis. **The re-measure KILLED it:** every frame now has the bridge and the
+  page behaves identically. ⇐ **START-HERE-NEXT: the injection axis is EXHAUSTED — stop fixing injection.** Every
+  frame has a correct, correctly-named, reachable bridge; the router is present everywhere; a late race is
+  excluded; both inventory-delivery channels are measured closed (§6 🌱). **The surviving suspects are #2 (the
+  synchronous return shape — `generate_stub_js` returns a Promise where AOSP returns the value directly; needs
+  design, `CefMessageRouter` is async BY DESIGN) and the app-side `RBHybridWebView` contract / the wrapper's own
+  platform detection (unknown; reading Roblox's wrapper JS is OFF-POLICY).** #3 (before-first-script) also stays
+  open but both its channels are dead — do not re-attempt without a NEW channel. **The bridge blocker remains
+  UNIDENTIFIED.**
 - **2026-07-16 — 🧵 WEB-ENGINE M6: THE LIVE BOOTS RAN, THE 2026-07-10 PASS IS VALIDATED, AND A **NEW, DEEPER ROOT
   CAUSE WAS FOUND AND FIXED** — app-facing WebView callbacks were delivered on a Looper-LESS thread, so BOTH real
   page callbacks threw on every boot; they now run on the ART MAIN (UI) thread per AOSP. Implemented + gate green +
@@ -7970,6 +8026,152 @@ Promise; AOSP returns the value directly; `CefMessageRouter` is async BY DESIGN,
 **The bridge blocker itself remains UNIDENTIFIED** — `bridge call received` = 0 in challenge23 as in 16–22.
 
 *Files:* none (fully reverted). This file (§5 🌱 bullet + §6 this entry) and `docs/web-engine-plan.md` only.
+
+### 2026-07-16 — 🪟 Divergence #1 CLOSED IN CODE: the JS bridge now injects into ALL FRAMES per AOSP's contract. The main-frame gate was NOT a security boundary — the transport was already frame-blind — so ungating grants zero new capability. Contract-conformance work, not a bridge "fix". Live re-measure PENDING.
+
+*The decision (owner may veto on sight):* SHIP faithful all-frames injection. Recorded here because it is
+security-*adjacent* and must never be silently "hardened" back.
+
+*THE AOSP CONTRACT — verified against the authoritative sources, not assumed.* `WebView.addJavascriptInterface`'s
+normative javadoc (AOSP `core/java/android/webkit/WebView.java`): **"The object is injected into all frames of the
+web page, including all the iframes"**, and **"there is no way to tell the calling frame's origin"**. The official
+guide (*Access native APIs with JavaScript bridge*) is explicit: the legacy API **"is available to every frame
+within the WebView, including iframes"** and **"lacks origin-based access control"** — origin scoping exists only
+in the NEWER opt-in API the app did not call (`addWebMessageListener`/`allowedOriginRules`). Chromium implements
+all-frames: `gin_java_bridge_dispatcher_host.cc` fans `AddNamedObject` over every live frame; the renderer's
+`GinJavaBridgeDispatcher` is a per-RenderFrame `RenderFrameObserver`. ⚠️ **Trap pinned for the next reader:**
+Chromium carries TWO STALE "main frame" comments (`GinJavaBridgeDispatcher`'s class comment; `JavascriptInjector`'s
+javadoc) left over from the RenderView→RenderFrame refactor — both are contradicted by the dispatch code. CLAUDE.md
+governs: do not trust old comments over code. *Factual correction to the record:* the annotation gate is
+**`JELLY_BEAN_MR1` = API 17**, not MR2.
+
+*THE LOAD-BEARING FINDING — there is NO security delta, and this is why the ruling is safe.* The premise "all-frames
+injection HANDS the bridge to third-party JS" is **false against Eclipse's own shipped state**: (a) the cefQuery
+router is registered **unconditionally on every context** (`main.rs` `on_context_created` step 1) — the 🔬
+introspection MEASURED `"cefQuery":"function"` in all three arkose subframes; (b) the browser-side dispatcher
+`BridgeHandler::on_query_str` (`engine.rs`) takes **`_frame: Option<Frame>` and ignores it**, resolving the view
+from `browser.identifier()` alone — **no frame check, no origin check**. ⇒ an arkose subframe could ALREADY invoke
+`executeRoblox` by hand-building the cefQuery payload the stub would have sent. **The main-frame stub gate was a
+convenience gate, never a boundary** — it withheld the ergonomic wrapper while leaving transport and dispatch fully
+reachable. Removing it changes the ergonomics of an already-open door. **Write this down so nobody later mistakes
+the stub gate for a security control and hardens the wrong thing:** the frame-blind `on_query_str` is faithful to
+AOSP (which has no origin control either) and is therefore NOT a bug. AOSP hands the platform exactly ONE
+enforcement lever — the `@JavascriptInterface` annotation gate — and Eclipse pulls it **unconditionally** in
+`framework.rs::reflect_javascript_interface_methods` (`isAnnotationPresent` → non-annotated `return Ok(None)`;
+only `Method` objects reflected, never fields). Exposed surface stays exactly what Roblox opted into: **one method,
+`executeRoblox`**. On a real device this same APK already exposes it to that same arkose frame. **Eclipse is the
+platform, not the app author** — the risk decision belongs to Roblox and Roblox already made it.
+
+*Why not same-origin-only:* `arkoselabs.roblox.com` is **cross-origin** to `www.roblox.com`, so a same-origin
+restriction injects into **nothing new** — a no-op for the entire measured case that would fail 🔬's own criterion
+while claiming to close the defect, and would silently substitute a different API's semantics. Rejected on
+mechanics before principle.
+
+*⚠️ CORRECTION TO THE RULING THAT AUTHORIZED THIS (found by reading the code it cited).* The ruling called this a
+**design task**, claiming four gates and that "a cross-process arkose frame needs the browser-side push to reach
+it" (flagging `engine.rs` `bridge_register` and `on_render_view_ready`, both of which target `b.main_frame()`).
+**That is wrong.** The browser-side `"eclipse.bridge.ready"` handler (`engine.rs`) **already answers the ASKING
+frame** — it uses the frame the message arrived on, never `browser.main_frame()` — and the pinned binding's
+`_cef_frame_t::send_process_message` routes per-frame. **The pull model was already frame-correct and
+process-agnostic.** The ONLY reason subframes never pulled is that the `bridge.ready` SEND itself sat inside the
+`is_main` gate. ⇒ dropping the **two renderer-side gates** is sufficient for BOTH same-process subframes (inventory
+already populated → `mode=sync`) and site-isolated cross-process ones (empty inventory → they pull for themselves →
+`mode=refresh`). The two browser-side main-frame pushes are backstops/optimizations, not the mechanism subframes
+depend on; both LEFT INTACT. **It was a two-gate change, not a design task.**
+
+*What shipped (`crates/eclipse-webview/src/main.rs` only):* the `frame.is_main() != 0` gate dropped from (1)
+`on_context_created`'s sync stub-inject + `bridge.ready` pull-send and (2) the `"eclipse.bridge.register"`
+refresh-inject. The cefQuery router registration was ALREADY unconditional and is untouched; the pull backstop is
+intact; **no `mode=sync` assert added anywhere**; no wire-protocol change; root crate untouched.
+
+*Log-line honesty:* the bare literal `"main-frame context ready (requested bridge inventory)"` now fires per FRAME,
+so it became a stale lie. Replaced by pure, unit-pinned `format_context_ready_line(main_frame)` →
+`context ready (requested bridge inventory) main_frame=1|0` (boolean ONLY — the frame URL is deliberately not
+logged; frame URLs reach the log only via `RedactedTarget`). **Historical greps for the old literal will now miss —
+challenges 16–23 predate this rename.**
+
+*Regression guard (honest about its reach):* `format_context_ready_line_binds_the_frame_kind_and_never_a_url`,
+negative-tested BOTH ways (collapsed back to the stale "main-frame" literal → caught; raw frame URL appended →
+caught). ⚠️ **It does NOT guard the gate itself** — `on_context_created` is a CEF renderer callback needing a live
+renderer, which `cargo test` cannot host. It guards the SIGNAL that makes the gate's return observable in a live
+log. **The real guard is the pre-registered mechanical live criterion**, unchanged from 🔬: the arkose subframe
+introspection lines must flip `"type":"undefined"` → `"type":"object"`.
+
+*Gate (MEASURED 2026-07-16):* helper **39 + 15** (was 38+15; +1 = the guard above); root **643 unit + 6 integ + 2
+doctest, 0 failed, ZERO SKIP** (unchanged — root untouched); `fmt --check`/`build --all-targets`/`clippy
+--all-targets --all-features -D warnings`/`test`/`build --release` clean in BOTH crates. `cargo run --
+__webview-test` **EXIT=0**, pinned marker intact: *"internalLoadChanged upcalls 2/2 … bridge round-trip OK,
+evaluateJavascript OK, honest UA OK, cookie set/get OK, cookie callback OK, ViewClosed, helper exit 0, bound=5"*;
+zero orphans.
+
+*Recorded limitation (honest):* `__webview-test` serves a **single-frame** loopback page — both its `context ready`
+lines are `main_frame=1`. **The preflight CANNOT exercise the subframe path**; it proves only that all-frames
+injection did not REGRESS the main-frame bridge. Like the 🔬 instrument, this change is validated by the CHALLENGE
+boot, not by the preflight.
+
+*⇐ NEXT — the live re-measure (orchestrator, dev-host main thread; NOT a subagent).* Re-run the challenge boot with
+`ECLIPSE_WEBVIEW_BRIDGE_DIAG=1` + `ECLIPSE_WEBVIEW_CONSOLE=1`. **PASS** = every `main_frame=false` arkose
+`bridge-introspect(diag)` line reports `"type":"object"` with `executeRoblox` in `props` (divergence #1 closed).
+**FAIL** = any arkose line still `"type":"undefined"`. **Expect new `context ready … main_frame=0` lines — that is
+the fix working, not a defect.** ⚠️ **DO NOT credit this with curing the bridge, and do not read a still-silent
+bridge as this change failing** — they are independent claims. Divergence #1 is shipped because it IS the contract
+and costs nothing in exposure, NOT because it will fix the bridge; `bridge call received` may well stay 0.
+
+*⚠️ AN UNCAUGHT OVERCLAIM IN THE RECORD, corrected here.* §5/§6 🔬 is titled *"the stub is PROVEN intact **in the
+frame the wrapper runs in**"*. **That was never measured.** The evidence is that the wrapper's console `source` is
+`https://js.rbxcdn.com` — which identifies the **SCRIPT, not the FRAME**. CEF's `on_console_message(browser, level,
+message, source, line)` carries **no frame identity**, and a CDN-served script can execute in ANY frame, including
+an arkose subframe. Frame attribution of the wrapper was **inferred from script origin**. This is a SECOND instance
+of the species of error 🔬 already self-corrected once (*"race DEFINITIVELY DEAD"* → *"a LATE race is excluded"*).
+Positive reasons to doubt the main-frame assumption: Arkose/FunCaptcha's standard embedding is an **iframe**, three
+arkose subframes were measured, and 🕵️ recorded the wrapper logging **`to origin: undefined`** for every hybrid
+call. ⇒ #1 may be a stronger surviving hypothesis than the record implies — but it stays a HYPOTHESIS. **The fix is
+its own diagnostic:** `on_query_str` already RECEIVES the frame it discards; binding it through the existing
+`RedactedTarget` into the `bridge call received` receipt would answer frame identity definitively on the first
+call. Deliberately NOT done here (out of scope; needs its own pass). **Do NOT probe for page-authored globals to
+locate the wrapper** — that breaches 🔬's recorded scope discipline.
+
+*Still open and UNTOUCHED:* divergence **#2 the synchronous return shape** (`generate_stub_js` returns a Promise;
+AOSP returns directly; `CefMessageRouter` is async BY DESIGN — needs design, not a patch) and **#3 the
+before-first-script window** (an all-frames subframe that pulls cross-process gets its stub via the async
+round-trip, so #1 does NOT close #3 — same architectural reason recorded in 🌱). **The bridge blocker remains
+UNIDENTIFIED.**
+
+*Files:* `crates/eclipse-webview/src/main.rs`, this file (§5 🪟 bullet + §6 this entry),
+`docs/web-engine-plan.md`.
+
+*LIVE VERDICT (added by the orchestrator after the boot the implement pass could not run) —
+`/tmp/eclipse-challenge24-allframes.log`, EXIT=124, reached the challenge, zero orphans:*
+**THE PRE-REGISTERED CRITERION PASSED.** `main_frame=false … "type":"undefined"` **3 → 0**;
+`main_frame=false … "type":"object"` **0 → 3** — every `arkoselabs.roblox.com` subframe now reports
+`__globalRobloxAndroidBridge__` as an `object` carrying `executeRoblox`, alongside the already-present
+`"cefQuery":"function"`. **Divergence #1 is CLOSED and live-verified.** No regression: Looper throws **0**,
+`internalLoadChanged` failures **0**, `UnsatisfiedLinkError` **0**, `NullPointerException` **0**, orphans **0**.
+
+*AND #1 IS RULED OUT AS THE BRIDGE BLOCKER.* `bridge call received` = **0**, and the page's console text is
+**byte-identical** to challenge22/23: `challengePageLoaded` / `challengeParsed` / `challengeInitialized` /
+`challengeDisplayed`, every one still `to origin: undefined`, plus the unchanged
+`The namespace CommonUI.Messages was not found`. The hypothesis this pass was shipped to test — that the wrapper
+might run in an arkose subframe that had no bridge — is **DEAD or irrelevant**: either the wrapper is in the main
+frame after all, or it is in a subframe that now HAS the bridge and still will not call it.
+
+*⇒ THE INJECTION AXIS IS EXHAUSTED. Stop fixing injection.* Every frame in the page now has a correct,
+correctly-named, reachable bridge before the wrapper speaks; the `cefQuery` router is present in every frame; a
+LATE race is excluded (the stub is intact 539 ms before the wrapper's first call); and BOTH inventory-delivery
+channels are measured closed (§6 🌱). Four passes have now improved injection and the page's behaviour has not
+changed by one byte across challenge22/23/24. **Surviving suspects: (1) divergence #2 — the synchronous return
+shape (`generate_stub_js` returns a Promise per method; AOSP's `@JavascriptInterface` returns the value directly;
+`CefMessageRouter` is async BY DESIGN, so this needs DESIGN, not a patch); (2) the app-side `RBHybridWebView`
+contract / the wrapper's own platform detection — UNKNOWN, and reading Roblox's wrapper JS to learn it is
+OFF-POLICY.** Divergence #3 (before-first-script) stays open but has no surviving channel — do not re-attempt it
+without a genuinely new one.
+
+*METHODOLOGY — this record has now made the SAME class of error twice, and that is the durable lesson.* 🔬 claimed
+"THE INJECTION RACE IS DEFINITIVELY DEAD" (corrected: only a LATE race was excluded) and "the stub is PROVEN
+intact in the frame the wrapper runs in" (corrected: console `source` is the SCRIPT, not the FRAME — frame
+attribution was never measured). Both were inferences dressed as measurements. **Treat every frame / thread /
+timing / process attribution as UNMEASURED until an instrument reports it.** The 🕵️ `len=`-fingerprint trap was a
+third instance. The instruments have been right every time they were built; the prose has been wrong three times.
 
 ---
 

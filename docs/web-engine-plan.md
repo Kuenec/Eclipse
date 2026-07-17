@@ -600,6 +600,17 @@ synchronous return shape** (§7 #3 / suspect 4) — `generate_stub_js` returns a
 where AOSP returns the value directly; `CefMessageRouter` is async BY DESIGN, so this is a real
 design question, not a one-liner.
 
+> **2026-07-16 — divergence (1) is CLOSED IN CODE; live re-measure PENDING** (full record: AGENTS.md
+> §6 2026-07-16 🪟). Both renderer-side `is_main` gates are dropped, so stubs follow AOSP's *"injected
+> into all frames … including all the iframes"* contract. **There is no security delta:** the cefQuery
+> router was already registered on every context and the browser-side `on_query_str` already ignores
+> the frame entirely (resolving the view from `browser.identifier()`), so a subframe could already
+> reach `executeRoblox` by hand-building the payload — the gate withheld the wrapper, never the
+> transport. AOSP's one lever, the `@JavascriptInterface` annotation gate, is enforced unconditionally
+> in `framework.rs`. **Do not re-add the gate.** PASS criterion for the live re-measure is unchanged:
+> the arkose lines must flip to `"type":"object"`. Divergences (2) and (3) remain OPEN — (1) does not
+> close (3), since a cross-process subframe still pulls via the async round-trip.
+
 **Honest status: the bridge blocker is NOT identified.** Ruled out with evidence: the injection
 race, app-callback delivery, and UA steering as the bridge's cause. Not ruled out: the two
 divergences, and the wrapper's own platform detection (unknown — reading Roblox's wrapper JS is
