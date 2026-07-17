@@ -292,26 +292,49 @@ wrap_render_process_handler! {
                 frame_owned.clone(),
                 context.map(|c| c.clone()),
             );
-            // (2) On the MAIN frame: inject any already-known stubs SYNCHRONOUSLY via V8Context::eval
+            // (2) On EVERY frame: inject any already-known stubs SYNCHRONOUSLY via V8Context::eval
             //     (guaranteed to run before on_context_created returns — i.e. before any page script
             //     executes in this new context; CefFrame::ExecuteJavaScript is NOT contractually
             //     synchronous during context creation). Then ask the browser to (re-)send the bridge
             //     inventory for THIS fresh context (the pull model / backstop — a browser→renderer
             //     send before the renderer was connected is dropped, and each navigation is a new
-            //     context). The browser answers with "eclipse.bridge.register".
+            //     context). The browser answers with "eclipse.bridge.register" addressed to the
+            //     frame that asked (engine.rs), so a site-isolated subframe in its own renderer
+            //     process — whose per-process inventory starts empty — pulls its own copy.
+            //
+            // 2026-07-16 (plan M6, divergence #1): NOT main-frame-gated. This is AOSP's contract,
+            // not a choice. `WebView.addJavascriptInterface`'s normative javadoc: "The object is
+            // injected into all frames of the web page, including all the iframes" — and Chromium
+            // implements exactly that (gin_java_bridge_dispatcher_host.cc fans AddNamedObject out
+            // over every live frame; the renderer's GinJavaBridgeDispatcher is a per-RenderFrame
+            // RenderFrameObserver binding on each frame's DidClearWindowObject). The developer
+            // guide is explicit that the legacy API "is available to every frame within the
+            // WebView, including iframes" and "lacks origin-based access control". The old gate
+            // made Eclipse measurably MORE restrictive than the platform it stands in for
+            // (§6 2026-07-16 🔬 measured three arkose subframes at "type":"undefined").
+            //
+            // SECURITY CONSEQUENCE OF UNGATING: none — there is no delta. The cefQuery router is
+            // registered on EVERY context above (step 1), and the browser-side dispatcher
+            // (engine.rs `BridgeHandler::on_query_str`) resolves the view from the BROWSER identity
+            // and ignores the frame entirely. Any subframe can therefore ALREADY invoke the app's
+            // method by hand-building the cefQuery payload this stub would have sent: the gate
+            // withheld the ergonomic wrapper, never the transport, so it was never a security
+            // boundary. AOSP hands the platform exactly one enforcement lever — the
+            // @JavascriptInterface annotation gate — and Eclipse pulls it unconditionally in
+            // `framework.rs::reflect_javascript_interface_methods`. Do not "harden" this back into
+            // a main-frame gate: it would buy nothing and re-open the conformance defect.
             if let Some(frame) = frame_owned {
-                if frame.is_main() != 0 {
-                    let (ifaces, methods) = self.inject_all_stubs(ctx_for_eval.as_ref());
-                    if ifaces > 0 {
-                        log::info("render", &format_stub_apply_line("sync", ifaces, methods));
-                    }
-                    if let Some(mut ready) =
-                        process_message_create(Some(&CefString::from("eclipse.bridge.ready")))
-                    {
-                        frame.send_process_message(ProcessId::BROWSER, Some(&mut ready));
-                    }
-                    log::info("render", "main-frame context ready (requested bridge inventory)");
+                let main_frame = frame.is_main() != 0;
+                let (ifaces, methods) = self.inject_all_stubs(ctx_for_eval.as_ref());
+                if ifaces > 0 {
+                    log::info("render", &format_stub_apply_line("sync", ifaces, methods));
                 }
+                if let Some(mut ready) =
+                    process_message_create(Some(&CefString::from("eclipse.bridge.ready")))
+                {
+                    frame.send_process_message(ProcessId::BROWSER, Some(&mut ready));
+                }
+                log::info("render", &format_context_ready_line(main_frame));
             }
         }
 
@@ -352,24 +375,29 @@ wrap_render_process_handler! {
                                 if let Ok(mut inv) = self.inventory.lock() {
                                     inv.insert(iface.clone(), methods.clone());
                                 }
-                                // Inject immediately if the main-frame context already exists. This
+                                // Inject immediately into the frame this register arrived on. This
                                 // REFRESH path keeps frame.execute_java_script — the proven M4
                                 // round-trip path for an already-running page (the sync-eval path is
                                 // on_context_created, before page scripts).
+                                //
+                                // 2026-07-16 (plan M6, divergence #1): NOT main-frame-gated, for the
+                                // same AOSP contract as the on_context_created path above — the
+                                // object belongs in "all frames of the web page, including all the
+                                // iframes". The browser addresses each register to the frame whose
+                                // "eclipse.bridge.ready" it answers, so injecting into `frame` is
+                                // both correct and sufficient: every frame pulls for itself.
                                 if let Some(frame) = frame {
-                                    if frame.is_main() != 0 {
-                                        let js = generate_stub_js(&iface, &methods);
-                                        frame.execute_java_script(
-                                            Some(&CefString::from(js.as_str())),
-                                            None,
-                                            0,
-                                        );
-                                        // 2026-07-10 (plan M6): the A2 evidence line (counts only).
-                                        log::info(
-                                            "render",
-                                            &format_stub_apply_line("refresh", 1, methods.len()),
-                                        );
-                                    }
+                                    let js = generate_stub_js(&iface, &methods);
+                                    frame.execute_java_script(
+                                        Some(&CefString::from(js.as_str())),
+                                        None,
+                                        0,
+                                    );
+                                    // 2026-07-10 (plan M6): the A2 evidence line (counts only).
+                                    log::info(
+                                        "render",
+                                        &format_stub_apply_line("refresh", 1, methods.len()),
+                                    );
                                 }
                             }
                         }
@@ -479,6 +507,21 @@ fn js_escape(s: &str) -> String {
 /// race measurable against the engine's "load started" line. Pure/unit-pinned.
 fn format_stub_apply_line(mode: &str, ifaces: usize, methods: usize) -> String {
     format!("bridge stubs applied mode={mode} ifaces={ifaces} methods={methods}")
+}
+
+/// The renderer per-frame "context ready, inventory requested" evidence line (plan M6).
+///
+/// 2026-07-16: was the bare literal `"main-frame context ready (requested bridge inventory)"`, which
+/// only ever fired for the main frame. Now that stub injection follows AOSP's all-frames contract
+/// this fires per FRAME, so the line binds `main_frame=1|0` instead of asserting "main-frame" — a
+/// subframe pull is exactly what the all-frames fix is expected to produce, and a line that still
+/// said "main-frame" would be a stale lie. Boolean only: the frame URL is deliberately NOT logged
+/// (the privacy absolute — frame URLs reach the log only through `RedactedTarget`). Pure/unit-pinned.
+fn format_context_ready_line(main_frame: bool) -> String {
+    format!(
+        "context ready (requested bridge inventory) main_frame={}",
+        u8::from(main_frame)
+    )
 }
 
 /// Generate the `window.<name>` bridge stub JS for one interface. Each method returns a Promise
@@ -1248,6 +1291,37 @@ mod tests {
             format_stub_apply_line("refresh", 2, 5),
             "bridge stubs applied mode=refresh ifaces=2 methods=5"
         );
+    }
+
+    #[test]
+    fn format_context_ready_line_binds_the_frame_kind_and_never_a_url() {
+        // 2026-07-16 (plan M6, divergence #1): stub injection now follows AOSP's all-frames
+        // contract, so this line fires per FRAME. It must (a) distinguish the frames rather than
+        // claim "main-frame" for all of them — a subframe pull is the fix's expected signal — and
+        // (b) stay URL-free: frame URLs reach the log only via `RedactedTarget`.
+        assert_eq!(
+            format_context_ready_line(true),
+            "context ready (requested bridge inventory) main_frame=1"
+        );
+        assert_eq!(
+            format_context_ready_line(false),
+            "context ready (requested bridge inventory) main_frame=0"
+        );
+        // The two frame kinds must not collapse to the same line (that is what makes the
+        // all-frames fix observable in a live log).
+        assert_ne!(
+            format_context_ready_line(true),
+            format_context_ready_line(false)
+        );
+        for line in [
+            format_context_ready_line(true),
+            format_context_ready_line(false),
+        ] {
+            assert!(
+                !line.contains("://"),
+                "frame URL must never be logged: {line}"
+            );
+        }
     }
 
     #[test]
