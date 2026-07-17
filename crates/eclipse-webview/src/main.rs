@@ -1057,25 +1057,44 @@ fn main() -> ExitCode {
         ),
     }
 
-    // 2026-07-16 (plan M6): read the dev-host UA A/B diagnostic gate ONCE (ECLIPSE_WEBVIEW_UA_DIAG,
-    // inherited via the consumer's no-env_clear spawn). It MUST be read here rather than beside the
+    // 2026-07-16 (plan M6): resolve the User-Agent ONCE from the two inherited env channels (the
+    // consumer's spawn does not env_clear). They MUST be read here rather than beside the
     // ECLIPSE_WEBVIEW_CONSOLE read below: the UA is an input to `Settings`, which `initialize`
-    // consumes on the next line. Announce it loudly when ON — a non-default UA is in force, so the
-    // boot is by definition a dev-host measurement and NEVER a default. Unset = the honest default,
-    // byte-for-byte; the value is operator-supplied (not user data), so logging it is in-policy.
+    // consumes below, and `CefSettings.user_agent` is GLOBAL and fixed at CefInitialize.
+    //   * ECLIPSE_WEBVIEW_APP_UA — THE UA THE APP SET via WebSettings.setUserAgentString, forwarded
+    //     by the consumer at spawn (the ordering works because the helper spawns lazily on the first
+    //     load-drive, which is AFTER the app configures its WebView). This is the SHIPPED path: the
+    //     app's own configuration, honored (§6 2026-07-16 💥) — not a diagnostic, so it is INFO.
+    //   * ECLIPSE_WEBVIEW_UA_DIAG — the dev-host A/B override, which outranks it. WARN when in
+    //     force: a forced UA means the boot is a measurement and NEVER a default.
+    // Both values are the app's/operator's own public product token — not user data — so logging
+    // them in full is in-policy (and a byte count could not be reproduced; see the overlay note).
     let ua_diag = std::env::var("ECLIPSE_WEBVIEW_UA_DIAG").ok();
-    let user_agent = engine::effective_user_agent(ua_diag.as_deref());
-    // Warn iff a NON-DEFAULT UA is actually in force, so the message is true by construction (an
-    // unset/empty var — or one set to the honest literal — is a default boot and stays silent).
-    if user_agent != engine::ECLIPSE_USER_AGENT {
+    let app_ua = std::env::var("ECLIPSE_WEBVIEW_APP_UA").ok();
+    let user_agent = engine::effective_user_agent(ua_diag.as_deref(), app_ua.as_deref());
+    // Report which rung of the ladder actually won, so a boot log can never leave it ambiguous.
+    if ua_diag.as_deref().is_some_and(|v| !v.is_empty()) {
         log::warn(
             COMPONENT,
             &format!(
-                "ECLIPSE_WEBVIEW_UA_DIAG set — a NON-DEFAULT diagnostic User-Agent is in force \
-                 (dev-host A/B diagnostic only; the honest default is UNCHANGED and remains the \
-                 default; never a default boot; the overlay's Java getUserAgentString() still \
-                 returns the honest literal, so the two deliberately disagree): ua={user_agent}"
+                "ECLIPSE_WEBVIEW_UA_DIAG set — a FORCED diagnostic User-Agent is in force and \
+                 OUTRANKS the app's own (dev-host A/B diagnostic only; never a default boot; the \
+                 overlay's Java getUserAgentString() does NOT consult it and still reports the \
+                 app's/fallback UA, so the two deliberately disagree): ua={user_agent}"
             ),
+        );
+    } else if app_ua.as_deref().is_some_and(|v| !v.is_empty()) {
+        log::info(
+            COMPONENT,
+            &format!(
+                "honoring the User-Agent the app set via WebSettings.setUserAgentString \
+                 (ECLIPSE_WEBVIEW_APP_UA): ua={user_agent}"
+            ),
+        );
+    } else {
+        log::info(
+            COMPONENT,
+            "the app set no User-Agent — using Eclipse's fallback literal",
         );
     }
 

@@ -208,6 +208,97 @@ pub fn next_request_id() -> u32 {
     }
 }
 
+/// The User-Agent the app set via `WebSettings.setUserAgentString`, or `None` when it never set one
+/// (2026-07-16, plan M6 — the §6 2026-07-16 💥 fix). THE ONE SOURCE OF TRUTH for the app's UA: both
+/// the engine side (forwarded to the helper at spawn by [`spawn_helper_process`]) and the Java side
+/// (`framework.rs`'s `native_getUserAgentString`) read exactly this, so M4's recorded byte-match
+/// contract — `getUserAgentString()` returns what CEF actually sends — holds by construction rather
+/// than by two literals being kept in sync.
+///
+/// PROCESS-WIDE, deliberately, and this is a DIVERGENCE FROM AOSP recorded honestly: AOSP's
+/// `WebSettings` is per-WebView state. ATL's is not and cannot be — its `WebSettings` has ZERO
+/// instance fields and `WebView.getSettings()` returns a FRESH THROWAWAY on every call
+/// (`new-instance` + `<init>` + `return`, verified against the installed dex 2026-07-16), so the
+/// canonical `webView.getSettings().setUserAgentString(ua)` writes to an object that is immediately
+/// garbage with no back-reference to its WebView. Storing per-instance would therefore require
+/// inventing a WebSettings→WebView association ATL does not have. A process-wide store is CORRECT
+/// here for two independent reasons: ATL's WebSettings is genuinely stateless/per-call, so there is
+/// no per-instance state to be wrong about; and Eclipse drives exactly ONE challenge WebView, whose
+/// UA is what `CefSettings.user_agent` — itself GLOBAL and fixed at `CefInitialize` — carries. If
+/// Eclipse ever drives two WebViews with different UAs, this is the seam that must grow a key, and
+/// the engine side would need a per-browser UA channel first (CEF has none at the settings layer).
+static APP_USER_AGENT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set once [`spawn_helper_process`] has read [`APP_USER_AGENT`] into the child's environment: past
+/// that point the helper's GLOBAL `CefSettings.user_agent` is fixed (it is consumed by
+/// `CefInitialize`), so a later `setUserAgentString` can no longer reach the engine. One atomic —
+/// no lock is taken against [`CLIENT`] from the setter, so no lock-order inversion with the spawn
+/// path (which holds [`CLIENT`] while reading [`APP_USER_AGENT`]) is possible.
+static HELPER_UA_FIXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Normalize an app-supplied User-Agent per AOSP's documented contract (2026-07-16): *"Sets the
+/// WebView's user-agent string. If the string is null **or empty**, the system default value will
+/// be used."* (AOSP `frameworks/base/core/java/android/webkit/WebSettings.java`
+/// `setUserAgentString`, verified 2026-07-16). `None` here therefore means "use Eclipse's fallback"
+/// for BOTH an explicit `null` and an empty string — a reset, not an empty UA. Pure/unit-pinned:
+/// the empty rule is easy to drop and would silently make Eclipse send an empty UA where AOSP sends
+/// the default.
+fn normalize_app_user_agent(ua: Option<String>) -> Option<String> {
+    ua.filter(|s| !s.is_empty())
+}
+
+/// Record the User-Agent the app set via `WebSettings.setUserAgentString` (2026-07-16, plan M6).
+/// `None`/empty resets to Eclipse's fallback, per AOSP ([`normalize_app_user_agent`]).
+///
+/// Logs the UA in full at INFO — this is the fix's observability, and it replaces the 2026-07-16
+/// overlay `ECLIPSE-UA-SET` smali diagnostic it supersedes (one place now logs it, and it is the
+/// same place that stores it, so the log can never disagree with what Eclipse will present). A UA
+/// is the app's own public product token — sent in cleartext to every server on every request by
+/// design — so it is neither a URL nor a secret and the ABSOLUTE URL-redaction rule does not reach
+/// it; full text (not a length) is deliberate, because Eclipse must present this string EXACTLY and
+/// a byte count could not be checked against what CEF sends.
+pub fn set_app_user_agent(ua: Option<String>) {
+    let ua = normalize_app_user_agent(ua);
+    // Read the fixed-flag BEFORE storing: the store is still worth doing (the Java-side getter must
+    // report what the app set either way — that is the app's own contract), but the engine can no
+    // longer honor it, and a SILENT discard is precisely the bug being fixed here. So say so.
+    if HELPER_UA_FIXED.load(Ordering::Relaxed) {
+        tracing::warn!(
+            target: "android.webkit.WebSettings",
+            ua = ua.as_deref().unwrap_or("<reset to default>"),
+            "setUserAgentString called AFTER the engine User-Agent was already fixed at helper spawn — \
+             CefSettings.user_agent is global and consumed by CefInitialize, so this UA will NOT reach \
+             the engine (the Java-side getUserAgentString() will still report it). Not observed on any \
+             measured boot: the app configures its WebView before the first load, and the first load is \
+             what spawns the helper."
+        );
+    }
+    match APP_USER_AGENT.lock() {
+        Ok(mut slot) => {
+            tracing::info!(
+                target: "android.webkit.WebSettings",
+                ua = ua.as_deref().unwrap_or("<reset to default>"),
+                "the app set its WebView User-Agent via WebSettings.setUserAgentString — Eclipse will \
+                 present it (AOSP contract: null/empty resets to the default)"
+            );
+            *slot = ua;
+        }
+        // A poisoned lock means a panic while holding it; the honest degradation is the fallback UA
+        // (an unfaithful-but-loud UA), never a fabricated one.
+        Err(_) => tracing::warn!(
+            target: "android.webkit.WebSettings",
+            "setUserAgentString: the app-UA store is poisoned — Eclipse's fallback UA stands"
+        ),
+    }
+}
+
+/// The User-Agent the app set via `WebSettings.setUserAgentString`, or `None` if it never set one
+/// (2026-07-16, plan M6). Read by the Java-side `native_getUserAgentString` and by
+/// [`spawn_helper_process`].
+pub fn app_user_agent() -> Option<String> {
+    APP_USER_AGENT.lock().ok().and_then(|s| s.clone())
+}
+
 /// State shared between the reader thread, the drive path, and the compositor.
 struct Shared {
     /// One entry per live driven WebView (the challenge flow has exactly one).
@@ -415,6 +506,28 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
     {
         cmd.arg("--allow-unsandboxed");
     }
+    // 2026-07-16 (plan M6, the §6 2026-07-16 💥 fix): forward the UA the app set via
+    // `WebSettings.setUserAgentString` so CEF actually SENDS it. `CefSettings.user_agent` is global
+    // and fixed at `CefInitialize`, and this spawn is lazy — it happens on the first load-drive,
+    // AFTER the app has configured its WebView — so the ordering works.
+    //
+    // THE ENVIRONMENT, NOT ARGV, and this is the §6 🌱 provenance test applied, not a shape
+    // argument. The spawn contract's operative predicate is "no secrets in argv" (§4 bans
+    // token-bearing URLs because /proc/*/cmdline is WORLD-READABLE; it already admits
+    // `--allow-unsandboxed` as argv-safe). A User-Agent is not a secret BY PROVENANCE: the app
+    // composes it from ATL's own synthetic `SystemProperties`/`Build` values (`0MB`, `960x540`,
+    // `HTC unknown` — no real hardware, no user data), and by design it is broadcast in cleartext to
+    // every server it contacts. It is also not a URL, so the absolute redaction rule does not reach
+    // it. Argv would nonetheless be the WRONG channel for a per-boot app-supplied string when a
+    // strictly better one exists at equal cost: /proc/PID/environ is owner-only where
+    // /proc/PID/cmdline is world-readable. Choose the tighter channel — the disclosure this adds is
+    // then zero, not merely "acceptable".
+    if let Some(ua) = app_user_agent() {
+        cmd.env("ECLIPSE_WEBVIEW_APP_UA", ua);
+    }
+    // Past this point the helper's global CefSettings.user_agent is fixed; a later
+    // setUserAgentString is honestly WARNed rather than silently dropped (`set_app_user_agent`).
+    HELPER_UA_FIXED.store(true, Ordering::Relaxed);
     // 2026-07-03 / updated 2026-07-10 (plan M5): the M5-built helper carries RUNPATH=$ORIGIN
     // (crates/eclipse-webview/.cargo/config.toml), so libcef.so resolves beside the binary with
     // no env mutation; this LD_LIBRARY_PATH prepend stays as belt-and-suspenders for helpers
@@ -2545,6 +2658,31 @@ mod tests {
             &mut views,
         );
         assert_eq!(out.cookie_lists, vec![(13, cookies)]);
+    }
+
+    #[test]
+    fn normalize_app_user_agent_treats_null_and_empty_as_a_reset_to_the_default() {
+        // 2026-07-16 (plan M6): AOSP's setUserAgentString contract, verbatim: "If the string is
+        // null OR EMPTY, the system default value will be used"
+        // (frameworks/base/core/java/android/webkit/WebSettings.java, verified 2026-07-16). Both
+        // reset — `None` here means "Eclipse's fallback", never "send an empty User-Agent".
+        assert_eq!(normalize_app_user_agent(None), None);
+        assert_eq!(normalize_app_user_agent(Some(String::new())), None);
+        // Anything else is the app's intent and is carried VERBATIM — no trimming, no rewriting.
+        // This is the app's REAL UA (§6 2026-07-16 💥); the double spaces and the empty `Hybrid()`
+        // argument are the app's own bytes, and Eclipse must present them exactly.
+        let app_ua = "Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; unknown) \
+                      AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.724.735 Phone \
+                      Hybrid()  GooglePlayStore RobloxApp/2.724.735 (GlobalDist; GooglePlayStore)";
+        assert_eq!(
+            normalize_app_user_agent(Some(app_ua.to_string())),
+            Some(app_ua.to_string())
+        );
+        // A whitespace-only UA is NOT empty: AOSP resets on empty only, so it is carried through.
+        assert_eq!(
+            normalize_app_user_agent(Some(" ".to_string())),
+            Some(" ".to_string())
+        );
     }
 
     #[test]

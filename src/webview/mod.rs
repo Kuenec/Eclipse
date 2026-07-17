@@ -37,7 +37,11 @@
 //!    helper strips `--enable-logging`/`--no-sandbox` defensively as PASS-THROUGH switches
 //!    (its own policy-gated degradation is the one exception, applied via `Settings`, not argv).
 //! 4. **No URL ever appears in argv** (token-bearing challenge URLs would leak via
-//!    `/proc/*/cmdline`): every load target crosses the control socket only.
+//!    `/proc/*/cmdline`): every load target crosses the control socket only. 2026-07-16: the
+//!    operative predicate is **no secrets in argv**, judged BY PROVENANCE, not by shape (the §6
+//!    2026-07-16 🌱 ruling). Where a value is genuinely not a secret but is also not required to be
+//!    in argv, prefer the child's ENVIRONMENT (§7): `/proc/PID/environ` is owner-only where
+//!    `/proc/PID/cmdline` is world-readable, so the tighter channel costs nothing.
 //! 5. **Orphan prevention:** the helper exits on control-socket EOF (primary); the consumer
 //!    sets `PR_SET_PDEATHSIG(SIGTERM)` in `pre_exec` (secondary — note PDEATHSIG fires when
 //!    the spawning THREAD exits, so spawn from a stable thread); the consumer's kill()+wait()
@@ -51,11 +55,20 @@
 //!    crosses the frozen text-free wire `Console`; the source stays redacted to scheme+host). Off
 //!    by default; a diag-enabled log is by definition a dev-host artifact, never a default boot.
 //!    2026-07-16 (plan M6): `ECLIPSE_WEBVIEW_UA_DIAG` reaches the helper the same way. It is a
-//!    TEMPORARY DEV-HOST A/B DIAGNOSTIC for M6's ranked suspect 2 (UA steering): a non-empty value
-//!    replaces the engine-side User-Agent VERBATIM (`engine::effective_user_agent`), and the helper
-//!    announces it with a loud startup WARN. Unset/empty = the honest `ECLIPSE_USER_AGENT` default,
-//!    byte-for-byte — the shipped default is UNCHANGED, open question #1 remains an OPEN OWNER
-//!    RULING, and this exists to answer it with evidence, never to pre-empt it.
+//!    TEMPORARY DEV-HOST A/B DIAGNOSTIC: a non-empty value replaces the engine-side User-Agent
+//!    VERBATIM and OUTRANKS the app's own, and the helper announces it with a loud startup WARN.
+//!    8. **`ECLIPSE_WEBVIEW_APP_UA` (2026-07-16, plan M6) — NOT a diagnostic; part of the contract.**
+//!    The consumer SETS it on the child (it does not merely inherit) to the User-Agent the app
+//!    itself chose via `WebSettings.setUserAgentString`, when the app set one. It is the channel for
+//!    the §6 2026-07-16 💥 fix: `CefSettings.user_agent` is global and fixed at `CefInitialize`,
+//!    while this spawn is LAZY — first load-drive, i.e. after the app configures its WebView — so
+//!    the ordering works. The env, not argv, per §4's provenance test: a UA is neither a URL nor a
+//!    secret (the app composes it from ATL's own synthetic `SystemProperties`/`Build` values and
+//!    broadcasts it to every server by design), but `/proc/PID/environ` is owner-only while
+//!    `/proc/PID/cmdline` is world-readable, so the env channel adds no disclosure at all.
+//!    Precedence in the helper (`engine::effective_user_agent`): `ECLIPSE_WEBVIEW_UA_DIAG` >
+//!    `ECLIPSE_WEBVIEW_APP_UA` > `engine::ECLIPSE_USER_AGENT` (the fallback, for a WebView the app
+//!    never configured). Unset = the fallback literal, byte-for-byte.
 //!
 //! # M3 adoption note
 //!

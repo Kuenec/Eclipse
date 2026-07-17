@@ -9589,6 +9589,131 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Eclipse's own backing for android.webkit.WebSettings' User-Agent =============================
+//
+// 2026-07-16 (plan M6, the §6 2026-07-16 💥 fix): the Roblox app CALLS
+// `WebSettings.setUserAgentString(...)` — MEASURED, with the UA it hands us logged in full — and
+// ATL's implementation is an EMPTY NO-OP (`public void setUserAgentString(String) {}`,
+// vendor/atl/src/api-impl/android/webkit/WebSettings.java:18; identical `.registers 2`/`return-void`
+// in the installed dex). Eclipse therefore SILENTLY DISCARDED the app's UA and substituted its own
+// literal for four milestones. The app's string carries BOTH the `Hybrid()` and `Android` substrings
+// that the challenge page's own `nativePrefix` selector requires (§6 2026-07-16 🏆), so discarding it
+// left `nativePrefix = null` → no platform module → total bridge silence → `Load generic challenge
+// failed`, every boot. Honoring what the app sets is not impersonation: it is what a faithful runtime
+// does, and what AOSP does.
+//
+// WHY THE STORE IS IN RUST AND NOT IN SMALI STATE — the shape ATL forces (verified against the
+// installed dex, 2026-07-16): `WebSettings` declares ZERO instance fields and
+// `WebView.getSettings()` returns a FRESH THROWAWAY on every call (`new-instance` + `<init>` +
+// `return`), so the canonical `webView.getSettings().setUserAgentString(ua)` writes to an object
+// that is immediately garbage, has nowhere to store, and holds no back-reference to its WebView.
+// A Java-side field would have to be paired with a WebSettings→WebView association ATL does not
+// have. `crate::webview::client`'s process-wide store dissolves that entirely and gives ONE source
+// of truth for both units M4's byte-match contract names (what CEF sends, and what
+// `getUserAgentString()` returns) — see its `APP_USER_AGENT` docs for the recorded AOSP divergence.
+//
+// The two natives below are the WebSettings surface; the overlay's `setUserAgentString` /
+// `getUserAgentString` bodies call them (tools/framework-overlay/patch-framework.sh). The getter
+// returns NULL when the app never set one, and the overlay substitutes Eclipse's fallback literal —
+// deliberately: that keeps the fallback literal in exactly the two places it already lived (the
+// overlay smali and the helper's `engine::ECLIPSE_USER_AGENT`) instead of adding a third copy here
+// for the byte-match contract to drift against.
+
+/// `android.webkit.WebSettings` (internal/slashed name for `find_class`) — hosts the 2 UA natives.
+pub const WEB_SETTINGS_CLASS: &JNIStr = jni_str!("android/webkit/WebSettings");
+
+// JNI names + descriptors for the two overlay-declared WebSettings natives (2026-07-16;
+// patch-framework.sh appends them as `private native` and calls them `invoke-direct` from the
+// same class — the CookieManager M4 precedent).
+const WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_NAME: &JNIStr =
+    jni_str!("native_setUserAgentString");
+const WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V");
+const WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_NAME: &JNIStr =
+    jni_str!("native_getUserAgentString");
+const WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
+
+/// `WebSettings.native_setUserAgentString(String ua)` — record the UA the app set, so the engine
+/// presents it (2026-07-16, plan M6). INSTANCE native (the receiver is the throwaway `getSettings()`
+/// instance and is deliberately unused — see the section note). AOSP's contract: a `null` or empty
+/// `ua` resets to the default; `crate::webview::client::set_app_user_agent` normalizes and logs.
+extern "system" fn web_settings_native_set_user_agent_string<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    ua: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if ua.is_null() {
+            // AOSP: an explicit null is a REAL call meaning "reset to the default" — never ignored.
+            crate::webview::client::set_app_user_agent(None);
+            return Ok(());
+        }
+        match read_jstring(env, &ua) {
+            Some(s) => crate::webview::client::set_app_user_agent(Some(s)),
+            // Unreadable (e.g. GetStringUTFChars OOM) is NOT a null: it carries no intent, so the
+            // previously-set UA must stand rather than be silently reset to the fallback.
+            None => tracing::warn!(
+                target: "android.webkit.WebSettings",
+                "setUserAgentString: the UA string was unreadable (exception cleared) — the \
+                 previously set User-Agent stands"
+            ),
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `WebSettings.native_getUserAgentString() -> String` — the UA the app set, or NULL when it never
+/// set one (2026-07-16, plan M6). NULL is load-bearing: the overlay's `getUserAgentString` body
+/// substitutes Eclipse's fallback literal for it (see the section note), so this returns the app's
+/// UA or nothing — never a second copy of the fallback. Honors M4's byte-match contract by
+/// construction: the string returned here is the same store the spawn forwards to CEF.
+extern "system" fn web_settings_native_get_user_agent_string<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        match crate::webview::client::app_user_agent() {
+            Some(ua) => env.new_string(ua),
+            None => Ok(JString::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind Eclipse's own backing for `android.webkit.WebSettings`' UA natives (2026-07-16, plan M6).
+///
+/// Registered beside [`register_web_view_natives`] and for the same reason: ART resolves natives per
+/// DECLARING class, and the app configures its WebView (`getSettings().setUserAgentString(...)`)
+/// during the lifecycle, so these must be bound before step 4.
+///
+/// # Safety / soundness
+/// Each fn pointer matches its declared JNI signature by construction (pin test
+/// `web_settings_native_names_sigs_and_class_match_the_overlay`); every body is
+/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
+fn register_web_settings_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // SAFETY (per entry): each fn matches its paired descriptor from the overlay's appended
+    // declarations (patch-framework.sh) — `native_setUserAgentString` `(Ljava/lang/String;)V` and
+    // `native_getUserAgentString` `()Ljava/lang/String;`, both instance natives.
+    let bindings: [NativeBinding; 2] = [
+        (
+            WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_NAME,
+            WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_SIG,
+            web_settings_native_set_user_agent_string as *mut c_void,
+        ),
+        (
+            WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_NAME,
+            WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_SIG,
+            web_settings_native_get_user_agent_string as *mut c_void,
+        ),
+    ];
+    let bound = register_class_natives_best_effort(env, WEB_SETTINGS_CLASS, &bindings)?;
+    tracing::info!(
+        bound,
+        "registered Eclipse's backing for the android.webkit.WebSettings User-Agent surface (the app's setUserAgentString is HONORED, not discarded; getUserAgentString reports it, falling back to the overlay literal when the app set none) (per-method best-effort)"
+    );
+    Ok(())
+}
+
 // === The internalLoadChanged upcall + the __webview-test smoke driver (web-engine plan M3) =======
 
 // 2026-07-03: signature per ATL's own reference C (vendor WebView.java:38 — package-private
@@ -16980,6 +17105,11 @@ fn drive_lifecycle(
     // are spawn-and-forward to the out-of-process eclipse-webview helper (2026-07-03, M3), with
     // the honest one-shot-WARN no-op as the helper-unavailable degradation.
     register_web_view_natives(env)?;
+    // 2026-07-16 (plan M6): the WebSettings User-Agent surface — the app calls
+    // getSettings().setUserAgentString(...) while configuring its challenge WebView (MEASURED), and
+    // ATL's stub discarded it; these natives make Eclipse honor it (§6 2026-07-16 💥). Bound here
+    // for the same per-declaring-class reason as the WebView natives above, and before step 4.
+    register_web_settings_natives(env)?;
     // 2026-07-09 (plan M4): the CookieManager native surface (get/set/removeAll/flush → the
     // session-scoped helper cookie store; the CookieProtocol/.ROBLOSECURITY handoff).
     register_cookie_manager_natives(env)?;
@@ -19769,6 +19899,27 @@ mod tests {
         assert_eq!(
             WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG.to_str(),
             "(JLjava/lang/Object;Ljava/lang/String;)V"
+        );
+        // 2026-07-16 (plan M6): the two WebSettings UA natives (overlay WebSettings.smali). They
+        // are on their OWN class, so they do NOT move WebView's bound=5 marker. A transcription
+        // drift here would make RegisterNatives skip the entry (best-effort WARN) and re-open the
+        // §6 2026-07-16 💥 bug — the app's UA discarded — as a call-time UnsatisfiedLinkError.
+        assert_eq!(WEB_SETTINGS_CLASS.to_str(), "android/webkit/WebSettings");
+        assert_eq!(
+            WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_NAME.to_str(),
+            "native_setUserAgentString"
+        );
+        assert_eq!(
+            WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_SIG.to_str(),
+            "(Ljava/lang/String;)V"
+        );
+        assert_eq!(
+            WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_NAME.to_str(),
+            "native_getUserAgentString"
+        );
+        assert_eq!(
+            WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_SIG.to_str(),
+            "()Ljava/lang/String;"
         );
         // The M4 CookieManager natives (overlay CookieManager.smali) + the JavascriptInterface
         // annotation class (overlay javac).
