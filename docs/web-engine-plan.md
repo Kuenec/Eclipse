@@ -545,8 +545,26 @@ The new overlay `EclipseWebViewClientProbe` gives the pinned `__webview-test` ma
 first time (pre-fix it FAILS 0/2; post-fix 2/2). **Frontier:** the page's console fingerprint is
 byte-identical pre/post fix — the bridge silence is a separate bug. The page fires all four hybrid
 calls but every one goes `to origin: undefined` (postMessage vocabulary, not Android-bridge
-vocabulary). Ranked suspect: **UA steering (open question #1) — an OWNER RULING**; next step is a
-temporary env-gated UA A/B **diagnostic**, not a policy flip on suspicion.
+vocabulary). Ranked suspect was **UA steering (open question #1)**.
+
+**UA A/B RAN 2026-07-16 — SUSPECT 2 CONFIRMED; open question #1 is now an OWNER RULING WITH
+EVIDENCE (record: AGENTS.md §6 2026-07-16 🕵️).** A temporary env-gated `ECLIPSE_WEBVIEW_UA_DIAG`
+override (default UNCHANGED, its `!contains("Android")` pin still green) gave a clean
+3-control/1-treatment result: `challengeCompleted` appears **0×** in challenge17/18/19 (honest
+desktop UA) and **1×** in challenge20 (the app's genuine Android-WebView UA). The
+`generic-challenge-type=proofofwork` challenge **genuinely completes** under the Android-WebView
+context and genuinely does not under a desktop-Linux Chromium UA. **But it does not unblock login:**
+`bridge call received` is 0 under BOTH UAs — the wrapper still says `to origin: undefined`, so the
+completed challenge is never delivered and the ~60 s `Load generic challenge failed` → LoginV2
+recovery is unchanged. **The bridge is a THIRD, independent defect** (injection race ruled out;
+callback delivery fixed; UA ruled IN for the challenge path, OUT as the bridge's cause). Methodology
+caveat now recorded: the console `len=` fingerprint MISSED this (`challengeDisplayed` and
+`challengeCompleted` are both 18 chars) — equal lengths can never prove sameness.
+
+**⇐ THE LAST BLOCKER — the bridge. Live suspect: §7 #3 / suspect 4, the async-Promise shape.**
+`generate_stub_js` makes every `@JavascriptInterface` method return a Promise; AOSP's
+`addJavascriptInterface` is SYNCHRONOUS. Next step is an env-gated dev-host eval introspecting
+Eclipse's OWN injected stub as the page sees it — evidence before any rewrite.
 
 **Historical status (2026-07-10) — the pass the boots above validated:**
 A first live boot (challenge16, log `/tmp/eclipse-challenge16.log`) reached the FIRST-EVER app-side

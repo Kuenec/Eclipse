@@ -183,7 +183,47 @@ before any history-rewriting/force operation.
   this for a real human, the owner rules on presenting the app's genuine Android-WebView-context UA — faithful,
   since Eclipse runs the Android build"*; a `!contains("Android")` unit test pins the current policy). NEXT STEP =
   a UA A/B **diagnostic** (temporary, env-gated, dev-host only) to CONFIRM or REFUTE steering by evidence before
-  anyone touches the pinned UA policy — diagnose before fix; do NOT flip the UA on suspicion.
+  anyone touches the pinned UA policy — diagnose before fix; do NOT flip the UA on suspicion. **⇒ THAT A/B RAN —
+  SEE THE 🕵️ BULLET BELOW: SUSPECT 2 IS CONFIRMED.**
+- **2026-07-16 — 🕵️ UA A/B DIAGNOSTIC: SUSPECT 2 (UA STEERING) IS **CONFIRMED BY EVIDENCE** — under the app's
+  genuine Android-WebView UA the challenge actually **COMPLETES**; under the honest desktop UA it never does. The
+  bridge stays silent in BOTH, so bridge-delivery is a THIRD, still-open defect. The DEFAULT UA IS UNCHANGED —
+  M4 open question #1 is now an OWNER RULING WITH EVIDENCE, not a hypothesis (full record: §6 2026-07-16 🕵️).**
+  Method: a temporary, env-gated, dev-host-only `ECLIPSE_WEBVIEW_UA_DIAG=<ua>` override in the helper (loud
+  startup WARN; the honest `ECLIPSE_USER_AGENT` remains the shipped default and its `!contains("Android")` pin
+  stays green). Boot `/tmp/eclipse-challenge20-uadiag.log` (1393 lines, EXIT=124, zero-orphan) with
+  `ECLIPSE_WEBVIEW_UA_DIAG='Mozilla/5.0 (Linux; Android 13; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0
+  Chrome/149.0.0.0 Mobile Safari/537.36'` + `ECLIPSE_WEBVIEW_CONSOLE=1`, everything else identical to
+  challenge17/18/19. **THE RESULT — a clean 3-control/1-treatment A/B:** `grep -c challengeCompleted` = **0 in
+  challenge17, 0 in challenge18, 0 in challenge19** (all honest-UA) and **1 in challenge20** (Android UA). The
+  page's own console under the Android UA ends `Hybrid Wrapper: Sending hybrid call: **challengeCompleted**`
+  where every honest-UA boot stops at `challengeDisplayed`. **The `generic-challenge-type=proofofwork` challenge
+  genuinely COMPLETES under the app's real Android-WebView context and genuinely does not under a desktop-Linux
+  Chromium UA.** ⚠️ **CAUTION — the `len=` console fingerprint MISSED this**: `challengeDisplayed` and
+  `challengeCompleted` are both 18 chars, so the length fingerprint is byte-identical (…len=78) across the two;
+  only the `ECLIPSE_WEBVIEW_CONSOLE=1` RAW TEXT distinguishes them. Never conclude "same behaviour" from the
+  length fingerprint alone again. **WHAT THIS DOES AND DOES NOT SETTLE:** it SETTLES that the UA materially
+  steers the vendor/page path (suspect 2 real). It does NOT unblock login: `bridge call received` is **0 in
+  challenge20 too**, the wrapper still says `to origin: undefined`, so the completed challenge is never delivered
+  to the app → the same ~60 s `Load generic challenge failed` → LoginV2 recovery (00:39:05 completed → 00:39:51
+  failed). ⇐ **START-HERE-NEXT (two independent items, in this order): (1) THE BRIDGE — the last blocker, and now
+  the ONLY thing between Eclipse and a completed login.** Injection race: ruled out. Callback delivery: fixed
+  (§6 🧵). UA: ruled IN for the challenge path but ruled OUT as the bridge's cause (silent under both UAs). The
+  live-code suspect is now **suspect 4, the async-Promise bridge shape** — `generate_stub_js`
+  (`crates/eclipse-webview/src/main.rs`) makes every `@JavascriptInterface` method return a **Promise**, but
+  AOSP's `addJavascriptInterface` is **SYNCHRONOUS** (a real bridge method returns its value directly). This is
+  exactly the divergence M4 recorded and plan §7 #3 flagged for re-validation against the real `RBHybridWebView`
+  ("incl. synchronous returns"). NEXT DIAGNOSTIC = an env-gated, dev-host-only helper-side eval on load-finish
+  that introspects **Eclipse's OWN injected stub as the page sees it** (`typeof
+  window.__globalRobloxAndroidBridge__`, its own-property names, whether the method is present when page scripts
+  run) — first-party self-inspection of our own injection, no RE of Roblox code. Evidence first; do NOT rewrite
+  the bridge shape on suspicion. **(2) THE UA — OWNER RULING, now evidence-backed.** M4's `ECLIPSE_USER_AGENT`
+  doc pre-registered exactly this: *"if an anti-bot vendor refuses this for a real human, the owner rules on
+  presenting the app's genuine Android-WebView-context UA — faithful, since Eclipse runs the Android build."*
+  The vendor demonstrably DOES treat the desktop-UA client differently, and the challenge only completes under
+  the Android-WebView context — so the pre-registered condition has MATERIALIZED. Deliberately NOT flipped
+  unilaterally: the default is a pinned honesty policy about how Eclipse presents itself to a third party, and
+  the project reserved that call for the owner. The A/B knob stays so the owner can re-run it in one command.
 - **2026-07-10 — 🔎 WEB-ENGINE M6 DIAGNOSTIC-INSTRUMENTATION + ROOT-FIX PASS (implemented + gate green; the LIVE
   M6 challenge boot RAN 2026-07-16 and VALIDATED this pass — see the 🧵 bullet above and §6 2026-07-16).** Implements the reviewed
   plan against the challenge16 silent-bridge blocker (log `/tmp/eclipse-challenge16.log`: the ChallengeHybridWebView
@@ -7550,6 +7590,94 @@ joining then retires), `src/graphics.rs` (`run_windowed` retires the slot), `src
 `tools/framework-overlay/stubs/{android/webkit/WebView.java,android/webkit/WebViewClient.java,android/os/Handler.java,android/os/Looper.java}`,
 `tools/framework-overlay/patch-framework.sh` (guards 1g/3a/4a + compile-list + stage-whitelist),
 `docs/web-engine-plan.md`, this file (§5 🧵 bullet + §6 this entry).
+
+### 2026-07-16 — 🕵️ UA A/B diagnostic: suspect 2 (UA steering) CONFIRMED by evidence — the challenge COMPLETES under the app's genuine Android-WebView UA and never does under the honest desktop UA; the bridge stays silent under BOTH, so bridge-delivery is a third, independent defect. Default UA deliberately UNCHANGED — open question #1 becomes an owner ruling WITH EVIDENCE
+
+*Why this was run:* the 🧵 pass fixed the confirmed Looper-affinity defect and proved the bridge silence was
+independent of it (identical page behaviour before/after). That left suspect 2 (UA steering) as the ranked
+hypothesis, and CLAUDE.md forbids changing code as "the fix" without a confirmed mechanism — so the next step was
+a **diagnostic**, not a policy flip.
+
+*The instrument (temporary, env-gated, dev-host-only; the `ECLIPSE_WEBVIEW_CONSOLE` precedent's shape):* new
+`ECLIPSE_WEBVIEW_UA_DIAG=<ua>` read pre-`CefInitialize` in the helper, threaded via a new pure
+`effective_user_agent(Option<&str>)` (unset/empty → `ECLIPSE_USER_AGENT`, the honest default) into a new
+`build_settings_with_ua(ua)`; `build_settings()` delegates to it so its behaviour is byte-identical. A LOUD startup
+WARN announces the non-default UA and states that the overlay's Java `getUserAgentString()` still returns the
+honest literal (the two deliberately disagree while the diag is in force). **The shipped default is UNCHANGED and
+its `!contains("Android")` pin stays green.** Honest note recorded: because production now composes
+`build_settings_with_ua(effective_user_agent(env))`, the ORIGINAL pin no longer sits on the production path — the
+new test therefore asserts the production composition itself
+(`build_settings_with_ua(effective_user_agent(None)) == ECLIPSE_USER_AGENT`), negative-tested both ways
+(empty-override-leak → caught; default-flipped-to-Android → caught). `build_settings()` consequently needed a
+narrowly-scoped `#[cfg_attr(not(test), allow(dead_code))]`; the alternative (an `apply_ua_diag_override` mutation
+mirroring `apply_sandbox_mode`, keeping the original pin load-bearing with no dead code) is recorded as the
+cleaner shape to adopt if this knob becomes permanent.
+
+*The experiment:* `/tmp/eclipse-challenge20-uadiag.log` (1393 lines, EXIT=124, zero-orphan) —
+`ECLIPSE_WEBVIEW_UA_DIAG='Mozilla/5.0 (Linux; Android 13; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0
+Chrome/149.0.0.0 Mobile Safari/537.36'` (deliberately device-GENERIC: the `wv` WebView token and Android platform,
+no specific device model to impersonate) + `ECLIPSE_WEBVIEW_CONSOLE=1`, every other variable identical to
+challenge17/18/19 (same tree, same synthetic chain, same tap, same APK).
+
+*THE RESULT — 3 controls, 1 treatment, unambiguous:* `grep -c challengeCompleted` = **0** in challenge17, **0** in
+challenge18, **0** in challenge19 (all honest-UA), **1** in challenge20 (Android UA). Under the honest desktop UA
+the page's console always ends at `Hybrid Wrapper: Sending hybrid call: challengeDisplayed`; under the Android UA
+it ends at `Hybrid Wrapper: Sending hybrid call: **challengeCompleted**`. **The `generic-challenge-type=proofofwork`
+challenge genuinely completes under the app's real Android-WebView context and genuinely does not under a
+desktop-Linux Chromium UA.** Suspect 2 is CONFIRMED.
+
+*⚠️ A METHODOLOGY LESSON WORTH MORE THAN THE RESULT — the `len=` fingerprint LIED.* The 🧵 entry used the
+structurally-text-free console `len=` sequence as a "page behaviour fingerprint" and concluded from its identity
+that page behaviour was unchanged. `challengeDisplayed` and `challengeCompleted` are **both 18 characters**, so the
+fingerprint is byte-identical (…len=78) across the two outcomes. The length fingerprint is a WEAK proxy: it can
+prove *change* but can never prove *sameness*. Only the `ECLIPSE_WEBVIEW_CONSOLE=1` raw text distinguished them.
+The 🧵 conclusion it supported (bridge silence is independent of the Looper fix) still holds — it is independently
+established by `bridge call received` = 0 under BOTH UAs and by the ruled-out injection race — but never again
+infer "same behaviour" from equal lengths.
+
+*WHAT THIS SETTLES AND WHAT IT DOES NOT.* SETTLED: the UA materially steers the vendor/page path. NOT SETTLED —
+and this is the important half: **it does not unblock login.** `bridge call received` is **0 in challenge20 too**;
+the wrapper still logs `to origin: undefined` for every hybrid call; so the *completed* challenge is never
+delivered to the app and the boot still runs the identical ~60 s `Load generic challenge failed` → LoginV2
+recovery (completed 00:39:05.9 → failed 00:39:51.8). **The bridge is a THIRD, independent defect** — silent under
+both UAs, with the injection race ruled out (stubs land ~3 ms after `load started`, ~470 ms before the page's
+bundle first speaks) and callback delivery fixed (🧵).
+
+*THE OWNER RULING (deliberately NOT taken here).* `ECLIPSE_USER_AGENT`'s own doc pre-registered this exact
+condition: *"M6 open question #1: if an anti-bot vendor refuses this for a real human, the owner rules on
+presenting the app's genuine Android-WebView-context UA — faithful, since Eclipse runs the Android build. M4 ships
+the honest-identifying default."* **That condition has now materialized with evidence.** The argument FOR the
+Android-WebView UA is stronger than "it works": Eclipse IS running the Android build, the WebView IS standing in
+for Android's WebView on behalf of Android app code, the challenge URL itself carries `app-type=android`, and on a
+real device this exact app sends an Android UA — so it is arguably the *more* faithful of the two truths, which is
+precisely what the M4 note anticipated. The argument AGAINST is that the shipped default is a deliberate,
+unit-pinned honesty policy about how Eclipse represents itself to a third party, and the project explicitly
+reserved that call for the owner. **This pass therefore delivers the evidence and leaves the default untouched.**
+The knob stays so the ruling can be re-verified in one command.
+
+*Gate (measured 2026-07-16):* helper **35 + 15** (was 34+15; +1 = `effective_user_agent_defaults_to_the_honest_ua_and_only_a_set_diag_overrides_it`);
+root **643 unit + 6 integ + 2 doctest** (unchanged — the root crate is untouched by this pass);
+`fmt`/`build --all-targets`/`clippy --all-targets --all-features -- -D warnings`/`build --release` clean in both.
+No wire-protocol change; no default change.
+
+*Recorded asymmetry (honest caveat):* the override moves only the ENGINE-side UA (`navigator.userAgent` + the
+request header). The overlay's Java `getUserAgentString()` is a hardcoded smali literal and still returns the
+honest UA, so while the diag is in force the two deliberately disagree. That is the correct knob for the suspected
+mechanism (the page reads `navigator.userAgent`) and the result CONFIRMS steering regardless — but had the verdict
+been REFUTED it would have been inconclusive for a page that consults the Java side instead. If the owner rules to
+adopt the Android UA, BOTH units must move together (the M4 record already requires them to byte-match).
+
+*⇐ NEXT: THE BRIDGE — the last blocker.* Live suspect: **suspect 4, the async-Promise shape.**
+`generate_stub_js` (`crates/eclipse-webview/src/main.rs`) makes every `@JavascriptInterface` method return a
+**Promise**; AOSP's `addJavascriptInterface` is **SYNCHRONOUS** — a real bridge method returns its value directly.
+M4 recorded this divergence and plan §7 #3 flagged it for re-validation against the real `RBHybridWebView`
+("incl. synchronous returns"). NEXT DIAGNOSTIC (evidence before any rewrite): an env-gated, dev-host-only
+helper-side eval on load-finish introspecting **Eclipse's OWN injected stub as the page sees it** — `typeof
+window.__globalRobloxAndroidBridge__`, its own-property names, and whether the method is present when page scripts
+run. That is first-party self-inspection of our own injection and needs no RE of Roblox code.
+
+*Files:* `crates/eclipse-webview/src/engine.rs`, `crates/eclipse-webview/src/main.rs`, `src/webview/mod.rs`
+(spawn-contract §7), this file (§5 🕵️ bullet + §6 this entry), `docs/web-engine-plan.md`.
 
 ---
 
