@@ -50,6 +50,12 @@
 //!    the helper logs raw page console TEXT helper-side (page-controlled content — the text never
 //!    crosses the frozen text-free wire `Console`; the source stays redacted to scheme+host). Off
 //!    by default; a diag-enabled log is by definition a dev-host artifact, never a default boot.
+//!    2026-07-16 (plan M6): `ECLIPSE_WEBVIEW_UA_DIAG` reaches the helper the same way. It is a
+//!    TEMPORARY DEV-HOST A/B DIAGNOSTIC for M6's ranked suspect 2 (UA steering): a non-empty value
+//!    replaces the engine-side User-Agent VERBATIM (`engine::effective_user_agent`), and the helper
+//!    announces it with a loud startup WARN. Unset/empty = the honest `ECLIPSE_USER_AGENT` default,
+//!    byte-for-byte — the shipped default is UNCHANGED, open question #1 remains an OPEN OWNER
+//!    RULING, and this exists to answer it with evidence, never to pre-empt it.
 //!
 //! # M3 adoption note
 //!

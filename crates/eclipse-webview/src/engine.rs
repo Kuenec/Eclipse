@@ -96,19 +96,63 @@ pub fn engine_id() -> String {
 /// (M6 open question #1: if an anti-bot vendor refuses this for a real human, the owner rules on
 /// presenting the app's genuine Android-WebView-context UA — faithful, since Eclipse runs the
 /// Android build. M4 ships the honest-identifying default.)
+///
+/// 2026-07-16 (plan M6): this default is UNCHANGED and REMAINS THE DEFAULT — open question #1 is
+/// still an OPEN OWNER RULING. The ranked suspect for the silent bridge is UA steering (the page's
+/// hybrid wrapper fires all four calls `to origin: undefined` — postMessage vocabulary — never the
+/// Android bridge), so [`effective_user_agent`] adds a TEMPORARY, env-gated, dev-host-only A/B
+/// DIAGNOSTIC (`ECLIPSE_WEBVIEW_UA_DIAG`) to CONFIRM or REFUTE steering by evidence FIRST. The
+/// diagnostic never changes what a default boot presents; the `!contains("Android")` pin below
+/// still guards today's policy. Diagnose before fix — do not flip a pinned honesty policy on
+/// suspicion.
 pub const ECLIPSE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6";
+
+/// Resolve the effective User-Agent from the `ECLIPSE_WEBVIEW_UA_DIAG` env value (plan M6,
+/// 2026-07-16). A non-empty value is used VERBATIM (operator-supplied — the A/B's independent
+/// variable); unset or empty yields the honest [`ECLIPSE_USER_AGENT`] default. Pure/unit-pinned.
+///
+/// DEV-HOST DIAGNOSTIC ONLY, and deliberately NOT a policy change: it exists to answer M6's ranked
+/// suspect 2 (UA steering) with evidence before the owner rules on open question #1. The override
+/// moves ONLY the engine-side UA (what `navigator.userAgent` and the HTTP request header carry —
+/// i.e. exactly what the hybrid page's platform detection reads). The overlay's Java-side
+/// `WebSettings.getUserAgentString()` keeps returning the honest literal, so while the diagnostic
+/// is in force the two DELIBERATELY disagree; that asymmetry is acceptable for a measurement and is
+/// one more reason this is never a default. Unset = the shipped honest behaviour, byte-for-byte.
+pub fn effective_user_agent(v: Option<&str>) -> &str {
+    match v {
+        Some(ua) if !ua.is_empty() => ua,
+        _ => ECLIPSE_USER_AGENT,
+    }
+}
 
 /// Pure settings policy (unit-tested): windowless OSR, external pump, sandbox ON
 /// (`no_sandbox=0`, never `--no-sandbox`), engine logging DISABLED (`log_severity=DISABLE`,
 /// no `log_file`) — the absolute redaction rule at the settings layer — plus the honest
 /// deliberate UA ([`ECLIPSE_USER_AGENT`]).
+///
+/// 2026-07-16 (plan M6): this states the SHIPPED DEFAULT policy and is what the UA pin asserts.
+/// The binary now routes through [`build_settings_with_ua`] so the `ECLIPSE_WEBVIEW_UA_DIAG` A/B
+/// diagnostic has a seam, hence dead-code in a non-test bin build; the suppression is scoped to
+/// this one function deliberately (the module-wide `allow` on `mod shared` would hide real rot
+/// here). `effective_user_agent_defaults_to_the_honest_ua_and_only_a_set_diag_overrides_it` pins
+/// the composition the binary ACTUALLY takes — `build_settings_with_ua(effective_user_agent(None))`
+/// — so the default-boot guarantee is guarded on the real path, not only on this one.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_settings() -> Settings {
+    build_settings_with_ua(ECLIPSE_USER_AGENT)
+}
+
+/// [`build_settings`] with the UA as an explicit input (plan M6, 2026-07-16) — the seam the
+/// `ECLIPSE_WEBVIEW_UA_DIAG` A/B diagnostic drives via [`effective_user_agent`]. Every other
+/// setting is identical to [`build_settings`], which delegates here with the honest default; the
+/// UA is the ONLY variable this seam exposes. Pure/unit-pinned.
+pub fn build_settings_with_ua(ua: &str) -> Settings {
     Settings {
         windowless_rendering_enabled: 1,
         external_message_pump: 1,
         no_sandbox: 0,
         log_severity: LogSeverity::DISABLE,
-        user_agent: CefString::from(ECLIPSE_USER_AGENT),
+        user_agent: CefString::from(ua),
         ..Default::default()
     }
 }
@@ -2216,6 +2260,44 @@ mod tests {
         );
         let settings = build_settings();
         assert_eq!(settings.user_agent.to_string(), ECLIPSE_USER_AGENT);
+    }
+
+    #[test]
+    fn effective_user_agent_defaults_to_the_honest_ua_and_only_a_set_diag_overrides_it() {
+        // 2026-07-16 (plan M6): the UA A/B diagnostic gate. Unset/empty MUST yield the shipped
+        // honest default byte-for-byte — the diagnostic is not a policy change and a default boot
+        // must be unaffected. Open question #1 stays an OPEN OWNER RULING.
+        assert_eq!(effective_user_agent(None), ECLIPSE_USER_AGENT);
+        assert_eq!(effective_user_agent(Some("")), ECLIPSE_USER_AGENT);
+        // A non-empty operator-supplied value is used VERBATIM (the A/B's independent variable).
+        let android_ua = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) \
+                          Version/4.0 Chrome/149.0.0.0 Mobile Safari/537.36";
+        assert_eq!(effective_user_agent(Some(android_ua)), android_ua);
+        // The override reaches the settings layer, and ONLY the UA differs from the default build.
+        let settings = build_settings_with_ua(android_ua);
+        assert_eq!(settings.user_agent.to_string(), android_ua);
+        let default = build_settings();
+        assert_eq!(
+            settings.windowless_rendering_enabled,
+            default.windowless_rendering_enabled
+        );
+        assert_eq!(
+            settings.external_message_pump,
+            default.external_message_pump
+        );
+        assert_eq!(settings.no_sandbox, default.no_sandbox);
+        assert_eq!(settings.log_severity, default.log_severity);
+        assert!(
+            settings.log_file.to_string().is_empty(),
+            "the diagnostic must never relax the settings-layer redaction rule"
+        );
+        // The gate composes to the shipped default when the env var is absent.
+        assert_eq!(
+            build_settings_with_ua(effective_user_agent(None))
+                .user_agent
+                .to_string(),
+            ECLIPSE_USER_AGENT
+        );
     }
 
     #[test]
