@@ -36,6 +36,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
+use crc32fast::Hasher as Crc32;
 use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipArchive};
 
@@ -51,6 +52,38 @@ const TARGET_ABI: &str = "x86_64";
 /// attacker-controlled uncompressed-size field cannot force a large allocation up front.
 /// Sized generously above any real manifest-class entry (8 MiB).
 const READ_ENTRY_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
+/// Stack buffer used to verify an already-extracted entry without allocating.
+const EXTRACTED_ENTRY_HASH_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Return whether `path` still contains the entry represented by `size` + `crc32`.
+///
+/// Size alone is not an identity check: Roblox APK upgrades can replace a file with different
+/// bytes of the same length. Eclipse previously skipped those files, mixing the new APK's Java/
+/// engine payload with old cached native libraries and model checksums. CRC32 is the integrity
+/// value carried by the ZIP entry itself; hashing the destination through a fixed stack buffer
+/// keeps the check allocation-free. A missing destination is simply not a match; other I/O errors
+/// stay actionable instead of being hidden behind a later rewrite failure.
+fn extracted_entry_matches(path: &Path, size: u64, crc32: u32) -> io::Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() != size {
+        return Ok(false);
+    }
+
+    let mut hasher = Crc32::new();
+    let mut buffer = [0_u8; EXTRACTED_ENTRY_HASH_BUFFER_SIZE];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize() == crc32)
+}
 
 /// An opened local APK (zip container) ready for parsing.
 ///
@@ -214,8 +247,9 @@ impl Apk {
     /// filesystem for the translation linker to load them via `java.library.path` on
     /// `System.loadLibrary` — this is the runtime's prerequisite for reaching `onCreate`.
     /// Streams each entry to disk (constant memory — `libroblox.so` is ~111 MB) and is
-    /// **idempotent**: an entry whose destination already exists with the same uncompressed size
-    /// is skipped, so repeat boots don't re-extract ~119 MB.
+    /// **idempotent**: an entry whose destination has the same uncompressed size and ZIP CRC32 is
+    /// skipped, so repeat boots don't re-extract ~119 MB while APK upgrades cannot retain stale
+    /// same-size libraries.
     pub fn extract_native_libs(
         &mut self,
         abi: &str,
@@ -236,10 +270,9 @@ impl Apk {
             let base = name.rsplit('/').next().unwrap_or(name.as_str());
             let dest = dest_dir.join(base);
             let mut entry = self.archive.by_name(&name)?;
-            // Idempotent: skip if already extracted with the right (uncompressed) size. Safe
-            // because we publish only fully-written files (atomic temp+rename below), so a
-            // size match means the bytes are complete — never a truncated mid-copy file.
-            if std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(entry.size()) {
+            // 2026-07-17: size alone let a different, same-size library from an older APK survive
+            // an upgrade. Match both ZIP integrity fields against the cached file instead.
+            if extracted_entry_matches(&dest, entry.size(), entry.crc32())? {
                 extracted.push(dest);
                 continue;
             }
@@ -273,8 +306,9 @@ impl Apk {
     /// every entry is validated via the `zip` crate's [`enclosed_name`](zip::read::ZipFile::enclosed_name)
     /// (rejects NUL bytes, `..` traversal, and absolute paths — the recommended safe-extraction
     /// check; verified 2026-06-13 via Context7 against zip 2.x); an entry that fails it is skipped,
-    /// never extracted outside `dest_dir`. **Idempotent**: an entry whose destination already exists
-    /// with the same uncompressed size is skipped (so repeat boots don't rewrite ~105 MB).
+    /// never extracted outside `dest_dir`. **Idempotent**: an entry whose destination matches the
+    /// ZIP entry's uncompressed size and CRC32 is skipped (so repeat boots don't rewrite ~105 MB,
+    /// while an APK upgrade replaces changed same-size assets).
     pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError> {
         const PREFIX: &str = "assets/";
         // Collect matching entry names first (immutable borrow), then extract (mutable borrow) —
@@ -304,10 +338,9 @@ impl Apk {
                 continue;
             }
             let dest = dest_dir.join(rel);
-            // Idempotent: skip if already extracted with the right (uncompressed) size. Safe
-            // because we publish only fully-written files (atomic temp+rename below), so a size
-            // match means the bytes are complete — never a truncated mid-copy file.
-            if std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(entry.size()) {
+            // 2026-07-17: an APK upgrade changed Roblox's 128-byte UniversalApp checksum without
+            // changing its length. Size-only reuse kept the old checksum beside the new model.
+            if extracted_entry_matches(&dest, entry.size(), entry.crc32())? {
                 continue;
             }
             // Create parent dirs (the assets/ tree is nested, unlike the flat lib/<abi>/ layout).
@@ -982,12 +1015,45 @@ mod tests {
             "non-.so must not extract"
         );
 
-        // Idempotent: a second call returns the same set (skipping already-extracted files).
+        // Idempotent: a second call returns the same set (skipping CRC-matching files).
         let again = apk.extract_native_libs("x86_64", &dir).expect("re-extract");
         assert_eq!(again.len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn extract_native_libs_replaces_a_changed_same_size_entry_after_an_apk_upgrade() {
+        // 2026-07-17 root-cause guard: the 2.724 and 2.730 APKs carried different
+        // libyuv_shared.so bytes with the same uncompressed size. The old size-only skip left the
+        // 2.724 library beside the 2.730 Java/engine payload. Model that exact cross-APK shape.
+        let old_bytes = build_apk(&[("lib/x86_64/libsame.so", b"OLD-LIB")]);
+        let new_bytes = build_apk(&[("lib/x86_64/libsame.so", b"NEW-LIB")]);
+        assert_eq!(b"OLD-LIB".len(), b"NEW-LIB".len());
+        let (mut old_apk, old_path) = open_apk(&old_bytes, "extract-upgrade-old");
+        let (mut new_apk, new_path) = open_apk(&new_bytes, "extract-upgrade-new");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-upgrade-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        old_apk
+            .extract_native_libs("x86_64", &dir)
+            .expect("extract old APK");
+        new_apk
+            .extract_native_libs("x86_64", &dir)
+            .expect("extract upgraded APK");
+        assert_eq!(
+            std::fs::read(dir.join("libsame.so")).unwrap(),
+            b"NEW-LIB",
+            "same-size old library must not survive an APK upgrade"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&old_path).ok();
+        std::fs::remove_file(&new_path).ok();
     }
 
     #[test]
@@ -1028,12 +1094,52 @@ mod tests {
             "non-asset entry must not be extracted"
         );
 
-        // Idempotent: a second extract rewrites nothing (every dest already exists same-size).
+        // Idempotent: a second extract rewrites nothing (every destination matches size + CRC32).
         let again = apk.extract_assets(&dir).expect("re-extract assets");
         assert_eq!(again, 0, "idempotent re-extract writes 0 files");
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn extract_assets_replaces_a_changed_same_size_entry_after_an_apk_upgrade() {
+        // 2026-07-17 root-cause guard: 2.730's UniversalApp model was extracted, but its
+        // 128-byte checksum had the same length as 2.724's and was skipped. The resulting mixed
+        // model/checksum state coincided with an engine-to-Java challenge schema mismatch.
+        let old_bytes = build_apk(&[(
+            "assets/ExtraContent/models/UniversalApp/UniversalApp_checksum",
+            b"OLD-CHECKSUM",
+        )]);
+        let new_bytes = build_apk(&[(
+            "assets/ExtraContent/models/UniversalApp/UniversalApp_checksum",
+            b"NEW-CHECKSUM",
+        )]);
+        assert_eq!(b"OLD-CHECKSUM".len(), b"NEW-CHECKSUM".len());
+        let (mut old_apk, old_path) = open_apk(&old_bytes, "asset-upgrade-old");
+        let (mut new_apk, new_path) = open_apk(&new_bytes, "asset-upgrade-new");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-asset-upgrade-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(old_apk.extract_assets(&dir).expect("extract old APK"), 1);
+        assert_eq!(
+            new_apk.extract_assets(&dir).expect("extract upgraded APK"),
+            1,
+            "same-size changed asset must be rewritten"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("ExtraContent/models/UniversalApp/UniversalApp_checksum"))
+                .unwrap(),
+            b"NEW-CHECKSUM",
+            "same-size old checksum must not survive an APK upgrade"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&old_path).ok();
+        std::fs::remove_file(&new_path).ok();
     }
 
     #[test]

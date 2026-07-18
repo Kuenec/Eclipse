@@ -27,6 +27,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }  # �
 # dropped `axmldecoder 0.3` — it *panics* on hostile AXML (aborts under panic=abort); our reader
 # is total (typed errors, never panics) + pure-Rust-we-own (§2.1/2.5/2.8).
 sha2 = "0.10"                                          # 🟢 artifact integrity (WIRED M1)
+crc32fast = "1"                                        # 🟢 WIRED 2026-07-17: stream-check existing extracted APK entries against ZIP CRC32; already transitive via zip (zero new crates), closes same-size cross-version cache reuse
+httpdate = "1.0.3"                                     # 🟢 WIRED 2026-07-17: parse CookieManager Set-Cookie `Expires` HTTP dates before the structured CEF handoff; one tiny pure-Rust/forbid-unsafe crate, prevents persistent cookies being mislabeled as session cookies
 # apk-info = "*"        # 🟢 OPTIONAL: full AXML+ARSC if we need resources
 # ring = "0.17"         # 🟢/🟡 OPTIONAL: APK signature v2/v3 verification
 

@@ -1,6 +1,6 @@
 # Patched ATL framework overlay (`framework-patched`)
 
-Rebuilds the **patched `api-impl.jar` overlay** Eclipse boots Roblox against. This tooling
+Rebuilds the patched **`api-impl.jar` plus libcore boot-jar overlay** Eclipse boots Roblox against. This tooling
 lives in-repo because the 2026-06-11 cache wipe destroyed the previous out-of-tree build
 script (`~/.cache/eclipse/patch-framework.sh`) together with its output — the overlay is a
 cache artifact, but its **generator must survive** (CLAUDE.md "Build and Environment
@@ -17,14 +17,23 @@ fields and wrong/missing pure-Java method behavior:
 | `android.os.Build` | `SUPPORTED_{32,64}_BIT_ABIS` fields missing | `RobloxApplication.onCreate` (`NoSuchFieldError`) |
 | `android.net.NetworkRequest$Builder` | not AOSP-shaped: inner (non-static) class, no no-arg ctor, no `addCapability(int)`/`addTransportType(int)` | jobqueue lib in `ActivitySplash.onCreate` (`NoSuchMethodError`) |
 | `android.app.ActivityManager$RunningAppProcessInfo` | `importance` always 0 (never `IMPORTANCE_FOREGROUND`=100) and **no `pkgList` field** | Roblox's foreground-process check (dex `yj.s.b`): scans `getRunningAppProcesses()` for an entry with `importance == 100` whose `pkgList` contains the package; finds none → logs **"Background process detected"** |
+| `android.location.LocationManager` | API-level-1 `isProviderEnabled(String)` missing; the overlay returns false for every non-null name because ATL advertises an empty provider set, and preserves AOSP's `IllegalArgumentException` for null | Current-client Backtrace watchdog plus two adjacent SDK paths (`NoSuchMethodError` reached Roblox's process-fatal uncaught handler → `System.exit(10)`) |
+| `android.view.PixelCopy` | API-24 class entirely absent; Eclipse posts the honest `ERROR_SOURCE_NO_DATA` result because its framework SurfaceView has no Android pixel-copy backend | Current-client transition screenshot during `surfaceDestroyed` (`NoClassDefFoundError` blocked one shutdown callback) |
+| `WolfSSLImplementSSLSession` (libcore boot jar) | installed hostdex returns an empty peer-certificate array although its own vendored source throws `SSLPeerUnverifiedException`; the overlay restores the source/`SSLSession` contract | Current-client background OkHttp hostname verification indexed `[0]`, then its fatal handler called `System.exit(10)` during close |
 
 ## Mechanism
 
 Multidex **first-dex-wins**: the output `api-impl.jar` is
-`[classes.dex = the patched classes only | classes2.dex = ATL's original whole api-impl dex]`.
+`[classes.dex = javac-patched classes | classes2.dex = smali-patched installed classes | classes3.dex = ATL's original whole api-impl dex]`.
 ART's `DexPathList` resolves each class from the first dex that defines it, so the patched
 `Build*`, `NetworkRequest*`, and `ActivityManager*` classes shadow the originals and every
-other class resolves unchanged from `classes2.dex`.
+other class resolves unchanged from `classes3.dex`.
+
+The output also contains `art/`: all ten boot jars in the pinned art_standalone order, with only
+`wolfssljni-hostdex.jar` changed. The generator writes `.eclipse-art-overlay-v1` last; Eclipse
+selects the ART overlay only when that marker and every jar are present. Parent ART and child
+`dex2oat` processes use the same overlay paths as both byte sources and logical identities, keeping
+boot-image checksums coherent without modifying the distro's `/usr` files.
 
 - `android/os/Build.java` is **generated** from the vendored ATL source
   (`vendor/atl/src/api-impl`) by inserting the two fields after the unique
@@ -59,6 +68,7 @@ Everything is env-overridable, nothing user-specific is hardcoded:
 |---|---|---|
 | `ATL_SRC` | `<repo>/vendor/atl/src/api-impl` | ATL api-impl Java sources (for `Build.java`) |
 | `ORIG_FW` | `/usr/lib/java/dex/android_translation_layer` | installed stock framework dir |
+| `ART_DIR` | `/usr/lib/java/dex/art` | installed pinned art_standalone boot jars copied/patched into the overlay |
 | `OUT` | `${XDG_CACHE_HOME:-$HOME/.cache}/eclipse/framework-patched` | output overlay dir |
 | `JAVAC`/`JAR`/`JAVA` | repo `vendor/toolchain/jdk-*/bin/*`, else `PATH` | Java compiler / jar / runtime |
 | `DX` | `dx` on `PATH` | dexer (class file ≤ v52, hence `--release 8`) |

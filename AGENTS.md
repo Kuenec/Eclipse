@@ -128,6 +128,57 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-17 — 🔬 REAL CREDENTIAL SUBMISSION IS NOW MEASURED, AND THE CURRENT BLOCKER IS
+  SERVER-SELECTED PLAY INTEGRITY, NOT ECLIPSE'S LOGIN UI. The corrected release renders LoginV2
+  normally (dark screen, bounded password field, masked text); three owner-authorized submissions
+  were entered through an echo-disabled stdin-only input path and neither credential nor plaintext
+  screenshot entered argv/env/log/repo. All three responses selected `ChallengeNativeWrapper`, then
+  returned to `LoginV2` in ~100 ms. The generic WebView route was not offered, so authenticated
+  Home + relaunch persistence remain PENDING (full record: §6 2026-07-17 🔬).** A temporary
+  coordinate-gated ART instrument captured **1,732,589 Java events / 24,307,015 bytes / overflow=false**
+  over the exact Submit window and was then removed completely. It proves the native route's
+  support handler returns from Roblox-local code without consulting ANY Android/Eclipse capability;
+  the token handler calls one Roblox-local boolean and immediately serializes token/result, with
+  no GMS/provider/framework call. The packaged handler's previously measured `support=true` is
+  therefore not an Eclipse capability lie Eclipse can correct. Eclipse has no Play Store/GMS and
+  cannot legitimately mint a Play Integrity attestation; patching Roblox or fabricating a token is
+  explicitly out of scope. **THE WHITE/GIANT-PASSWORD REGRESSION IS CLOSED LIVE:** the current
+  release screen is visually normal and all ten input events were consumed by the secure text
+  field; the prior screenshot was the stale pre-fix binary. **⇐ START-HERE-NEXT:** do not hammer
+  authentication. The one legitimate completion path is a server-offered generic challenge, whose
+  CEF completion and clickable compositor/input fix are already implemented. On the next spaced
+  owner attempt, if `Rendering generic web challenge` appears, complete it, require Home, close via
+  the clean lifecycle/flush/reap path, then relaunch with no synthetic input and require Home again.
+  **FINAL MEASURED GATE:** root fmt/build/clippy `-D warnings`/test/release clean:
+  **676 library + 1 binary + 7 integration + 2 doc tests**; detached helper fmt/build/clippy/test/
+  release clean against pinned CEF: **43 main + 16 drive**; framework overlay EXIT=0,
+  `classes2.dex` **79684**. Zero Eclipse or helper processes remained after the live attempts.
+- **2026-07-17 — 🔐 THE OWNER LOGIN BUILD IS NOW PRIVACY-SAFE, UPGRADE-SAFE, AND DURABLE IN
+  CODE; BOTH FULL GATES + THE FRAMEWORK OVERLAY ARE GREEN. The corrected release client is live at
+  `LoginV2`, waiting only for owner-entered credentials; authenticated shutdown/relaunch proof is
+  PENDING (full record: §6 2026-07-17 🔐).** **THE SCREENSHOT WAS A STALE BINARY, not the corrected
+  source:** the visible process started at 10:02, the secure-geometry/privacy source landed at
+  10:06, and the binary on disk was still the 10:00 build. It was closed through the host window
+  path and proved the new clean teardown: status 0, both `surfaceDestroyed` callbacks,
+  `surface_destroyed=true`, helper exit 0 + reaped, zero helper orphan. **THE UNDERLYING BUG IS
+  FIXED STRUCTURALLY:** textbox identity, geometry, and input type are one coherent
+  `TextboxSession`; stale data from another widget cannot combine; only the measured username type
+  7 can render plaintext; secure AND unknown types render bullets; and the full-window readback
+  probe can never become a text draw rect. **APK UPGRADES ARE ALSO STRUCTURAL NOW:** extracted
+  entries are reused only when size AND ZIP CRC32 match, so a changed same-size framework/app entry
+  from an older APK cannot survive. **AUTH DURABILITY:** CEF now uses Eclipse's private persistent
+  profile (`0700` root/profile, observed cookie files `0600`) with session-cookie persistence;
+  protocol v3 adds real flush completion and a distinct `CookiesClearSession`/
+  `CookiesClearDone`; removeAll deletes the whole jar, removeSession visits and deletes only
+  `has_expires == 0`, and both return CEF's actual removed-anything result. HTTP-date `Expires`
+  values are parsed with pure-Rust `httpdate` (integer form retained; explicit epoch never aliases
+  the wire's session sentinel), preventing durable auth cookies from being mislabeled and erased.
+  **MEASURED GATE:** root fmt/build/clippy `-D warnings`/test/release clean: **676 + 1 + 7 + 2**;
+  helper clean with pinned CEF: **43 + 16**; overlay EXIT=0, `classes2.dex` **79684**. **⇐
+  START-HERE-NEXT:** the corrected release window is at `LoginV2`; the owner must type the
+  credential directly (never argv/env/log/screenshot). Then require Home, close through the host
+  window, require clean flush + helper reap, relaunch without synthetic input, and require Home
+  again from the durable session before committing.
 - **2026-07-17 — 🖱️ THE CHALLENGE PAGE IS NOW CLICKABLE IN CODE: the compositor and the input
   hit-test resolved the WebView's rect INDEPENDENTLY and disagreed; they now consume ONE resolver.
   Gate green BOTH crates (root **660**+6+2 zero-SKIP / helper **41+15**, zero helper diff);
@@ -9939,6 +9990,194 @@ small code change that would show **every method the app calls** in those 61 s; 
 `LayoutInflater`/`Fragment` (already shadowed in classes2) to see if the challenge view is ever inflated.
 
 *Files:* none changed (investigation only — tree clean, **21 commits unpushed**); this file (§6 this entry).
+
+---
+
+### 2026-07-17 🔐 — secure login rendering, APK freshness, and persistent-cookie semantics are
+### root-cause-fixed; owner credential + authenticated relaunch remain
+
+**1. The user-visible failure and the evidence.** The owner saw a password rendered at enormous
+full-window scale while the loader remained active. Process/source/binary times proved that window
+was the stale pre-fix executable: process 10:02, privacy fix source 10:06, binary 10:00. Closing it
+was itself a live teardown proof: process status 0, two surface-destroy callbacks,
+`surface_destroyed=true`, helper clean exit 0 and reaped, no orphan. This does not excuse the bug
+shape: the old renderer could combine independently cached textbox identity/geometry/input type,
+and the full-frame field-detection probe was eligible to position text.
+
+**2. Privacy fix, by invariant rather than redaction after the fact.** `TextboxSession` now owns
+the widget, geometry, and input type under one lock; both writers verify the active widget, so no
+cross-widget combination exists. The renderer permits plaintext only for the one live-measured
+username input type (7). Secure and unknown values are bullets. The full-frame probe is explicitly
+readback-only and cannot expand or invent a draw rect. Regression pins cover coherent invalidation,
+secure/unknown masking, and the full-frame exclusion. The credential is deliberately never placed
+in a command, environment variable, log grep, screenshot, or repo file; the owner types it in the
+focused app window.
+
+**3. APK-upgrade root cause.** Extraction's old idempotence test treated equal length as equal
+content. A same-size file from a prior APK therefore survived an upgrade and could silently keep a
+stale framework/native asset. Reuse now requires ZIP CRC32 equality as well as size. `crc32fast`
+was already transitive through `zip`, so making it direct adds zero transitive crates; two negative
+regressions replace changed-same-size native and asset entries.
+
+**4. Why persistence forced protocol and CookieManager semantics to change together.** Moving
+from an incognito request context to a private persistent CEF profile made three previously hidden
+aliases destructive: `removeSessionCookies` shared blanket removeAll, both completions were inferred
+from an empty `CookieList`, and a formatted HTTP `Expires` silently fell back to the session
+sentinel. Protocol v3 therefore adds `CookieFlush`/`CookieFlushDone`,
+`CookiesClearSession`/`CookiesClearDone`, preserving all v1/v2 layouts. CookieList now has exactly
+one meaning: getCookie. removeAll uses CEF `delete_cookies(NULL,NULL)` and its deletion count;
+removeSession uses `visit_all_cookies`, sets `deleteCookie=1` only for `has_expires == 0`, and
+returns whether it marked any entry. A zero-cookie visit uses the existing bounded completion
+deadline. Every clear reaches CEF even before a helper exists because the prior-boot jar is not
+provably empty.
+
+**5. Expiry correctness and dependency ruling.** `Expires` is an HTTP date, not generally an
+integer. `httpdate` 1.0.3 was chosen over a partial home-grown parser: pure Rust,
+`forbid(unsafe_code)`, MSRV 1.56, one small crate, and support for the three HTTP date forms. A valid
+Max-Age wins regardless of attribute order; integer Expires remains accepted; the explicit Unix
+epoch maps to -1 because wire 0 is reserved for a session cookie. The persistent profile root is
+canonical, owner-only and passed in the child's environment (not world-readable argv); helper-side
+validation rejects relative/non-UTF-8 roots instead of falling back to incognito. The dev drive
+uses a private temporary profile so tests cannot mutate the owner's authenticated jar.
+
+**6. Verification and honest boundary.** Root quality gate is clean: fmt, all-target build,
+warning-denied all-feature clippy, **676 library + 1 binary + 7 integration + 2 doc tests**, release.
+Detached helper gate is clean against pinned CEF: fmt/build/clippy/test/release, **43 main + 16
+drive**. Overlay build EXIT=0 (`classes2.dex` 79684). A fresh live release reached LoginV2 with
+protocol 3 and secure input type 5; its profile is 0700 and CEF cookie/state files are 0600. What is
+not yet claimed: successful owner authentication or persistence across relaunch. Those require the
+owner-entered credential, Home, a clean flush/reap shutdown, and a second no-synthetic Home boot.
+
+---
+
+### 2026-07-17 🔬 — current-client real login measured: native challenge assumes Play Integrity;
+### the secure UI is live-correct, and the generic challenge remains the legitimate completion path
+
+**User-visible regression closed live.** The current rebuilt 2.730.790 release rendered the normal
+dark LoginV2 screen with an 800×600-bounded password field. This directly falsifies the owner's
+earlier white/giant-password screenshot as current-source behaviour and agrees with the process/source
+timestamps in the 🔐 entry: that screenshot came from the stale pre-privacy-fix executable. Ten
+credential characters were delivered to `active_text_field`, all ten reported handled, and the
+renderer remained in secure input type 5. The credential travelled only through `ydotool type
+--file=-` under `stty -echo`; it was never placed in argv, environment, a file, log text, repo diff,
+or post-entry screenshot.
+
+**Three spaced real submissions, same server choice.** All three owner-authorized attempts returned
+`auth.roblox.com/v2/login` 403 bodySize 82, then `Rendering native challenge` →
+`ChallengeNativeWrapper` → `LoginV2` in about 100 ms. None offered `ChallengeHybridWebView`; no
+WebView was created. All three processes then closed through the host window and completed Android
+surface/activity teardown plus helper exit 0/reap with no orphan. The final spaced probe is recorded
+at `/home/kue/.cache/eclipse/client-login-final-20260717.log`: native=1, generic=0, both
+`surfaceDestroyed` callbacks, helper exit 0/reaped, and process status 0. This is not
+a recurrence of the WebView compositing or click-routing bugs: the server selected a different
+challenge implementation before the WebView path existed.
+
+**The diagnostic escalated from sampling to exact method instrumentation, then was removed.** The
+first buffered sampling trace was valid but intentionally coarse: 31,325 bytes / 1,651 events over
+5.019608 s, showing only the loading animation around the 100 ms transition. A temporary
+coordinate-gated call to the vendored `dalvik.system.VMDebug.startMethodTracing` then captured the
+exact one-second Submit window in buffered, non-streaming mode: **24,307,015 bytes, 1,732,589 calls,
+`data-file-overflow=false`, elapsed 1.050944 s**. This also corrects the old blanket memory claim
+that buffered ART tracing “flushes nothing”: explicit `VMDebug.stopMethodTracing()` flushes it;
+only streaming remains invalid on host TIDs. The temporary Rust entry points, env gate, state and
+logs were removed completely before the final gate. Evidence remains outside the repo at
+`/home/kue/.cache/eclipse/client-login-method-window-20260717.log` and
+`/home/kue/.cache/eclipse/login-window-method.trace`.
+
+**What the trace proves.** At +259.797 ms, Roblox's message bus runs the support request:
+`km.a.a → km.c.a → JNIAccountProtocol.getSupportKey → JSON response`. It makes **zero** calls into
+Android, Eclipse, GMS or any provider before answering; the earlier payload measurement established
+that answer as `support=true`. At +260.368 ms the token request runs
+`km.b.a → km.c.b → km.i.e`; it reads the request hash/timeout, calls only the app-local
+`oe.a.c()Z`, then immediately builds the `token`/`result` JSON response and returns. Again there is
+**zero** provider/framework/GMS call. The trace has no `IntegrityManager`, attestation, token-provider
+or verification method. Thus Eclipse does not falsely advertise the capability through an Android
+API: Roblox's packaged Java handler assumes support internally and immediately returns an empty
+result when its app-local provider state is unavailable.
+
+**Correct boundary, not a workaround.** Eclipse has no Play Store/GMS and a distro-agnostic Linux
+compatibility runtime cannot legitimately mint a Google Play Integrity attestation. Patching the
+Roblox handler, rewriting its message-bus reply, importing a browser session, or fabricating a token
+would modify/bypass the app's authentication control and is not an Eclipse fix. Implementing genuine
+Play Integrity would require Google's certified proprietary environment, conflicting with Eclipse's
+open, distro-agnostic architecture and still not being a self-contained Rust implementation. The
+legitimate route is the server-offered generic challenge: Eclipse already completed that challenge
+end-to-end on 2.724 and fixed the current WebView's draw/input rect mismatch; this session simply did
+not receive that server-selected route.
+
+**Old-client fallback also closed honestly.** A fresh-cache 2.724.735 retry no longer reaches its
+historical working login: current server-delivered content references `Enum.AppShellFeature.WatchPage`,
+which that older engine does not define, and reports a required upgrade. The original ATL cache was
+restored byte-for-byte after the experiment. Weakening the version gate or keeping the stale client
+would be a compatibility regression, not a solution.
+
+**Final verification after removing all temporary trace instrumentation.** Root fmt, all-target
+build, all-feature Clippy with warnings denied, tests (**676 library + 1 binary + 7 integration + 2
+doc tests**) and release build are clean. The detached helper's fmt/build/clippy/test/release gate is
+clean against pinned CEF (**43 main + 16 drive**). The Android framework overlay rebuilt EXIT=0 with
+`classes2.dex` **79684**. `git diff --check` is clean, and no Eclipse/helper process remains.
+
+**Next action:** space the next real attempt rather than hammering auth. If the server supplies
+`Rendering generic web challenge`, verify the live click/focus fix, complete the challenge, require
+Home, close through lifecycle + cookie flush + helper reap, then relaunch without synthetic input and
+require Home again. If the server continues to require native Play Integrity, report the external
+compatibility boundary honestly; there is no safe local patch. The temporary credential must be
+rotated after validation. **No push**: owner instruction remains in force.
+
+---
+
+### 2026-07-17 🧱 — current-client Android gaps, cookie URL compatibility, and clean host shutdown
+
+**Current-client Java/API gaps are closed at their real boundary.** The installed ATL
+`LocationManager` omitted API-level-1 `isProviderEnabled(String)`; three current-client SDK paths
+reached it and Backtrace's watchdog let the resulting `NoSuchMethodError` hit Roblox's process-fatal
+handler. The overlay now returns false for every non-null provider because ATL advertises an empty
+provider set, while preserving AOSP's null `IllegalArgumentException`—no GPS capability is
+fabricated. `android.view.PixelCopy` was entirely absent during the transition-screenshot callback;
+Eclipse now posts `ERROR_SOURCE_NO_DATA` through the caller's `Handler`, the honest result because
+there is no Android SurfaceFlinger/ThreadedRenderer copy source. The installed wolfSSL boot jar also
+diverged from its own pinned vendored source by returning an empty peer-certificate array; the
+generator restores the source/`SSLSession` contract (`SSLPeerUnverifiedException`) and verifies the
+built dex method.
+
+**The non-Rust surface is justified under §2.1, not smuggled in.** `PixelCopy` and the two smali
+repairs must be Java/dex because the app resolves those exact Android classes and method descriptors
+inside ART; Rust cannot satisfy a missing Java class before class linking. They contain only the
+minimum ABI-compatible policy described above and compile into the already-required framework
+overlay—no new native library, dependency, FFI call, or gameplay-hot-path code. Stability therefore
+wins at the physically-Java boundary while all host/runtime orchestration remains Rust.
+
+**ART overlay selection is checksum-coherent and interruption-safe.** The generator copies the
+pinned ten-jar boot class path, patches only the stale wolfSSL method, removes the readiness marker
+before installation, and writes `.eclipse-art-overlay-v1` last. Launcher startup selects it only when
+the marker and all jars exist, sets one immutable `BOOTCLASSPATH` before any thread, and passes those
+same paths as both parent ART byte sources and logical locations. Separately exec'd dex2oat children
+therefore validate the same identities instead of mixing patched bytes with stock `/usr` locations.
+
+**CookieManager now accepts the measured Android/WebView input shape without becoming a general URL
+parser.** Roblox supplies bare hosts/domains where CEF requires a URL. Eclipse preserves already
+schemed strings, fixes only the validated host[/path]/numeric-port subset, maps port 443 to HTTPS,
+and carries classic leading-dot input into `Domain=` only when the cookie did not specify one.
+Invalid/ambiguous strings pass through unchanged for CEF to reject. This closes the measured
+post-login-cookie `<non-url>` rejection while leaving Chromium in charge of cookie validation.
+
+**Host close now follows owned boundaries before process reclamation.** Exactly once, while the
+winit window is alive, Eclipse marks live activities finishing and drives `onPause` → the exact
+`SurfaceHolder.Callback.surfaceDestroyed(holder)` fan-out → `onStop` → `onDestroy`, then flushes the
+persistent cookie store and retires/reaps the helper before window destruction. Callback iteration
+uses a snapshot so self-removal cannot skip the engine callback. Initialized native images are
+structurally process-lifetime (`ManuallyDrop` owner), preventing lexical teardown from unmapping code
+still referenced by foreign workers. After every owned boundary completes, the Android-hosting
+launcher uses POSIX `_exit`; this matches Android process reclamation and avoids the measured
+libroblox `atexit` abort. Live proof: status 0, both surface-destroy callbacks, helper exit 0/reaped,
+zero orphan.
+
+**Verification.** Root fmt/build/clippy `-D warnings`/test/release: **676 library + 1 binary + 7
+integration + 2 doc tests**, all clean. Detached helper against pinned CEF: **43 main + 16 drive**,
+all clean. Framework overlay EXIT=0, `classes2.dex` **79684**, ten ART jars installed and wolfSSL
+contract verified. The external login boundary remains the 🔬 finding immediately above: three current-client
+credential submissions were assigned native Play Integrity rather than Eclipse's completed generic
+WebView path.
 
 ---
 

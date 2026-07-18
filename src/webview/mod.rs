@@ -65,19 +65,20 @@
 //!    corrected by a live boot:** the claim that stood here (*"the spawn is LAZY — first load-drive,
 //!    i.e. after the app configures its WebView — so the ordering works"*) was DISPROVED: a COOKIE
 //!    op cold-started the helper 61 s BEFORE `setUserAgentString`. The spawn is now DEFERRED past
-//!    the cookie ops that are answerable without an engine (`client::EarlyCookies` — the session
-//!    store starts empty, so buffered sets ARE its whole content), to the first op that genuinely
-//!    needs CEF — normally the load-drive. Two ops still force an early spawn, and both are LOUD:
-//!    a `getCookie` issued after this boot already set a cookie (CEF owns url/domain/path matching),
-//!    and the 3-arg `setCookie(url, value, ValueCallback)` (only CEF yields the real success flag).
+//!    fire-and-forget cookie sets (`client::EarlyCookies` retains their original frames), to the
+//!    first op that genuinely needs CEF — normally the load-drive. The persistent profile means
+//!    gets, both clear scopes, flushes, and 3-arg `setCookie(..., ValueCallback)` still force an
+//!    early spawn, each with a LOUD reason: only CEF owns the prior-boot jar, cookie matching,
+//!    expiry classification, durable completion, and the real success flag.
 //!    **2026-07-16 (§6 respawn) — the ordering rule, COMPLETED.** Where an early op genuinely still
 //!    forces a spawn before the app's UA exists (the two above), the first load-drive **REPLACES**
 //!    that helper: the consumer tears it down (fully REAPING the child — CEF's `root_cache_path`
 //!    process singleton forbids two live engines), spawns a replacement with `ECLIPSE_WEBVIEW_APP_UA`
-//!    set, and replays the app's ORIGINAL `CookieSet` frames into it. Sound because a helper that
-//!    never received a `CreateView` has no browser, so no `Set-Cookie` header ever ran in it and its
-//!    store is exactly those frames. `PROTO_VERSION` stays **2** — both helpers speak v2 and the
-//!    replay uses existing frames; no message is added.
+//!    set, and replays the app's ordered ORIGINAL cookie-mutation frames into it. Sound because a
+//!    helper that never received a `CreateView` has no browser, so no network `Set-Cookie` header
+//!    can escape that transcript; applying the same mutations over the same persistent profile
+//!    reproduces its jar. The respawn itself adds no message. `PROTO_VERSION` is now **3** for the
+//!    later durable-flush and scoped-clear completion pairs; v1/v2 layouts remain frozen.
 //!    A forced early spawn is an HONEST DEGRADATION to the fallback UA — the pre-fix behaviour, said
 //!    out loud — never a wrong answer. The env, not argv, per §4's provenance test: a UA is neither a URL nor a
 //!    secret (the app composes it from ATL's own synthetic `SystemProperties`/`Build` values and
@@ -112,10 +113,10 @@ pub mod shm;
 pub mod slots;
 
 /// Wire-protocol version (the `Hello`/`HelloAck` version field, the exact-match negotiation
-/// channel). 2026-07-09 (plan M4): bumped 1 → 2 for the ADDITIVE v2 extension (JS bridge /
-/// cookie-with-result / eval-with-result). The v1 MESSAGE LAYOUTS in [`proto`] stay byte-identical
-/// (FROZEN by `proto_roundtrip_encodes_and_decodes_every_v1_message`); only this negotiation
-/// integer changes, so a stale v1 peer fails the exact-match handshake loudly-and-honestly rather
-/// than mis-decoding a v2 frame (an old helper answers `HelloAck{version:1}`, the consumer's
+/// channel). 2026-07-17: bumped 2 → 3 for the ADDITIVE durable-cookie flush and scoped-clear
+/// completion pairs. The v1/v2 MESSAGE LAYOUTS in [`proto`] stay byte-identical (FROZEN by their
+/// separate round-trip pins); only this negotiation integer changes, so a stale peer fails the exact-match handshake
+/// loudly-and-honestly rather than mis-decoding a newer frame (an old helper answers its version,
+/// and the consumer's
 /// `hello_ack_version_supported` rejects it → the honest one-shot WARN no-op).
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;

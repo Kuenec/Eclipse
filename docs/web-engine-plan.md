@@ -5,10 +5,10 @@
 > justification) and `AGENTS.md` §6 (2026-07-03 🧭, the decision-log entry). Every milestone
 > gates the next. **M1 is DONE — GO; M2 is DONE (2026-07-03, drive-verified); M3 is DONE
 > (2026-07-03, `__webview-test`-verified); M4 is DONE (2026-07-10, `__webview-test`-verified);
-> M5 is DONE (2026-07-10, packaged + four-leg live-verified);** implementation continues at
-> **M6** (2026-07-16: the M6 live boots RAN — the 2026-07-10 pass validated + a deeper
-> Looper-affinity root cause found and fixed; the milestone is NOT complete — the bridge is still
-> silent, now proven an independent defect ranked to UA-steering / open question #1).
+> M5 is DONE (2026-07-10, packaged + four-leg live-verified); M6's core mechanism is DONE
+> (2026-07-17, real challenge served, completed, bridged back, and accepted by the server with
+> nothing forced).** The remaining release proof is durable authenticated-session validation:
+> complete a real owner-entered login, shut down cleanly, and relaunch into the authenticated state.
 
 ## 1. Why a web engine at all (the recorded ceiling)
 
@@ -336,8 +336,8 @@ synthesizing the exact `window.<name>` objects, forwarded helper→Eclipse→JNI
 `@JavascriptInterface` methods; test the synchronous-return corner), `evaluateJavascript` →
 `CefFrame::ExecuteJavaScript` with the result routed to the overlay-patched `ValueCallback`,
 `CookieManager` get/set incl. the overlay 3-arg `setCookie` (the
-CookieProtocol/`.ROBLOSECURITY` handoff) via `CefCookieManager` with a private session-scoped
-store, and replace the recorded "GDPR VIOLATION" UA with an honest deliberate UA. All
+CookieProtocol/`.ROBLOSECURITY` handoff) via `CefCookieManager` with a private store, and replace
+the recorded "GDPR VIOLATION" UA with an honest deliberate UA. All
 Java-surface changes go through `tools/framework-overlay/patch-framework.sh` (never stub a
 static-final constant — the 2026-07-02 include-id lesson); overlay-patch the known
 `javascript:`-println full-URL leak channel now that `javascript:` URLs become live and
@@ -376,13 +376,21 @@ the run shows scheme+host-only URL lines and zero payload text.
   #3). Inventory delivery is a PULL model (the renderer signals `eclipse.bridge.ready` per
   main-frame context and the browser re-sends the per-view inventory — the design's push was
   live-observed dropped by CEF).
-- **Cookies = ONE session-scoped private in-memory `RequestContext`** (empty `cache_path`,
-  `persist_session_cookies=0`) shared by every browser and every cookie op — the
+- **Historical M4 baseline: cookies = ONE session-scoped private in-memory `RequestContext`**
+  (empty `cache_path`, `persist_session_cookies=0`) shared by every browser and every cookie op — the
   `.ROBLOSECURITY` handoff lands in the store the challenge WebView reads. The overlay
   `CookieManager` is native-backed end-to-end (get / 2-arg set / 3-arg set / removeAll /
   removeSession / flush-no-op, NEW registrar `bound=6`), replacing the fabricated
   `Boolean.TRUE` with the real async result; `getCookie` is a bounded blocking round-trip
   (5 s, honest-empty degrade).
+- **2026-07-17 durability addendum (current contract):** the same one-context invariant now uses
+  Eclipse's private persistent CEF profile with `persist_session_cookies=1`; protocol v3 adds
+  `CookieFlush`/`CookieFlushDone` and keeps `removeAllCookies` distinct from
+  `removeSessionCookies`. The former deletes the whole jar; the latter visits the jar and marks
+  only cookies with `has_expires == 0` for deletion. Both return CEF's real "anything removed"
+  result through `CookiesClearDone`, rather than reusing `CookieList` or fabricating `true`.
+  `Expires` attributes are parsed as HTTP dates (with the existing integer form retained), so a
+  persistent cookie cannot silently collapse into a session cookie and be deleted on shutdown.
 - **Honest deliberate UA** (`Mozilla/5.0 (X11; Linux x86_64) … Chrome/149.0.0.0 …
   Eclipse-WebView/149.0.6`) set helper-side in `build_settings()` AND returned by the overlay
   `WebSettings` (`getUserAgentString` + `getDefaultUserAgent`) — byte-matched and pinned in
@@ -517,11 +525,16 @@ live legs verified).**
   the `javascript:`-URL leak fix against the real challenge flow); the §7 #4 release-cadence
   ruling stays OPEN (pin-pair mechanics landed — AGENTS.md §6 2026-07-10 🔒); §7 #6 and #7
   stay open as above.
-- Implementation continues at **M6**.
+- M6's core mechanism is complete; authenticated-session durability/relaunch validation remains.
 
 ### M6 — Live challenge boot: the challenge page renders in the app, then the human completes it
 
-**Status (2026-07-16) — THE LIVE BOOTS RAN. The 2026-07-10 pass is VALIDATED, a deeper root cause
+**Current status (2026-07-17) — CORE MECHANISM COMPLETE.** With the app's own User-Agent and
+nothing forced, the real challenge loaded, completed, called Eclipse's injected bridge four times,
+and was accepted by the server; the app did not re-enter the challenge. The remaining owner-facing
+proof is a real credential submission followed by clean shutdown and an authenticated relaunch.
+
+**Historical status through 2026-07-16 — THE LIVE BOOTS RAN. The 2026-07-10 pass is VALIDATED, a deeper root cause
 was found and FIXED, and the milestone is NOT yet complete: the bridge is still silent, now proven
 to be an INDEPENDENT defect (full record: AGENTS.md §6 2026-07-16 🧵).** Three live boots
 (`/tmp/eclipse-challenge17.log`, `…18-consolediag.log`, `…19-looper.log`; dev-host main thread,
