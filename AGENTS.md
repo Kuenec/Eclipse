@@ -128,6 +128,27 @@ before any history-rewriting/force operation.
 
 ## 5. Living State  *(UPDATE EACH SESSION)*
 
+- **2026-07-17 — 🧪 SOBER COMPARISON IS NOW MEASURED: THIS MACHINE'S WORKING SOBER
+  SESSION IS A MAY-20 COOKIE RESUME, NOT A CURRENT PASSWORD LOGIN; SOBER'S CURRENT APK VERSION
+  DOES NOT CHANGE ECLIPSE'S CHALLENGE RESULT (full record: §6 2026-07-17 🧪).** Before any
+  comparison launch, Sober 1.7.1's `data/sober/cookies` was born **2026-05-20 00:22** and was
+  **986 bytes**. Every retained Sober log then present (2026-07-03 onward) contained exactly one
+  `userDidLogin` and **zero** `LoginV2`, `/v2/login`, `ChallengeNativeWrapper`, or
+  `ChallengeHybridWebView` events: none recorded a fresh login. A normal current Sober launch went
+  directly to the authenticated Home page with friends/recommendations, made **zero** login or
+  challenge requests, and rewrote that existing jar **986 → 1037 bytes**; clean exit status was 0.
+  Sober currently pins Roblox **2.729.839**, while the earlier Eclipse attempts used 2.730.790.
+  That variable is now closed: Eclipse ran a verified merge of Sober's exact base+x86_64 split
+  (`libroblox.so` byte-identical; **3496/3496** constructors) and a real credential submission still
+  produced `403 bodySize:82 → Rendering native challenge → ChallengeNativeWrapper → LoginV2` with
+  **zero** generic WebView events. Thus the APK version is not the explanation, and the observed
+  Sober success does not demonstrate a Play Integrity implementation. The unobservable historical
+  question remains bounded: Sober's initial May-20 login predates the retained logs, and its
+  proprietary/EULA-protected runtime was not disassembled or instrumented. **⇐ START-HERE-NEXT:**
+  retain the external-boundary verdict from 🔬; do not disturb or copy Sober's working auth token.
+  A future naturally unauthenticated Sober login can be compared from normal logs, but current
+  Sober Home is evidence only of durable session persistence. **GATE:** root fmt/build/clippy
+  `-D warnings`/test/release clean: **676 library + 1 binary + 7 integration + 2 doc tests**.
 - **2026-07-17 — 🔬 REAL CREDENTIAL SUBMISSION IS NOW MEASURED, AND THE CURRENT BLOCKER IS
   SERVER-SELECTED PLAY INTEGRITY, NOT ECLIPSE'S LOGIN UI. The corrected release renders LoginV2
   normally (dark screen, bounded password field, masked text); three owner-authorized submissions
@@ -10178,6 +10199,68 @@ all clean. Framework overlay EXIT=0, `classes2.dex` **79684**, ten ART jars inst
 contract verified. The external login boundary remains the 🔬 finding immediately above: three current-client
 credential submissions were assigned native Play Integrity rather than Eclipse's completed generic
 WebView path.
+
+---
+
+### 2026-07-17 🧪 — direct Sober comparison: its observed success is persisted authentication;
+### the Sober-pinned Roblox version reproduces Eclipse's native challenge
+
+**The claim tested, not assumed.** The owner reported that Sober logs in without the Eclipse failure.
+The installed runtime is Sober **1.7.1** (Flathub commit `ab64aca69914`, artifact
+`2026-07-12_3f5b513`). Its proprietary implementation was not reverse-engineered: the shipped EULA
+expressly prohibits disassembly/decompilation, and public Sober documentation says the source is
+closed. The comparison therefore used only package metadata, normal application logs, filesystem
+metadata, and normal launches; cookie contents, credentials, and tokens were never read or printed.
+
+**What the local history actually records.** Before the comparison, Sober's private cookie file
+(`0600`) had birth time **2026-05-20 00:22:28 -0500**, size **986 bytes**, and a modification time of
+2026-07-12. Every retained application log present at the initial census (2026-07-03 through
+2026-07-12) had exactly one `userDidLogin` and zero `LoginV2`, `auth.roblox.com/v2/login`, native
+challenge, generic challenge, or hybrid-WebView events. The successful initial login is older than
+the retained logs; all observable launches were resumptions. A normal Sober launch on the current
+package then rendered the authenticated Home page (account header, friends and recommendations)
+without a login POST or either challenge. It updated the existing cookie file **986 → 1037 bytes**
+and exited cleanly with status 0. This directly explains the owner's current Sober experience:
+Sober restores its durable session cookie and does not execute the password-login route at all.
+
+**Public boundary corroboration.** This is consistent with Sober's own maintainers, not a guess
+about its closed implementation: a Sober team member says Google Play Integrity is something
+*"we can't pass"* (`vinegarhq/sober#837`, 2025-04-15), and another says password login was broken
+for most users and recommends Quick Sign-In (`vinegarhq/sober#1224`, 2026-03-09). Those statements
+do not reconstruct the owner's historical May-20 acquisition, but they independently falsify the
+theory that current Sober generically mints or bypasses Play Integrity attestations.
+
+**APK-version A/B.** Sober's own update service installed Roblox **2.729.839**; the earlier current
+Eclipse experiment used 2.730.790. To isolate that variable without touching Sober's cookie, its
+official `base.apk` and `split_config.x86_64.apk` were merged into an ignored local-cache artifact by
+adding only `lib/x86_64/*` to the base (never the split manifest/signature). `unzip -t` passed;
+`libroblox.so` SHA-256 was byte-identical between split and merged artifact; the Eclipse loader
+resolved all strong symbols and completed **3496/3496** constructors. The owner-authorized password
+was entered through an echo-disabled stdin-only `ydotool --file=-` path (10 secure-field key events;
+never argv/env/file/log/screenshot), then Next was clicked once. Result:
+`v2/login 403 bodySize:82 → Rendering native challenge → ChallengeNativeWrapper → LoginV2` in
+~126 ms, with zero generic/hybrid-WebView events. Host close then completed both
+`surfaceDestroyed` callbacks, persistent-cookie flush/helper clean exit 0 + reap, process status 0,
+and zero orphans.
+
+**Conclusion and boundary.** Sober's pinned APK does not avoid the server-selected native challenge
+under Eclipse, so app version is ruled out. The current Sober Home session does not prove Sober can
+pass Play Integrity; it proves Sober persists a session acquired on or before May 20. The exact
+historical acquisition path cannot be recovered from the rotated logs, and a current clean Sober
+login was deliberately not forced because that would disturb the owner's only working auth state.
+The honest remaining possibilities for that historical login are a then-unrequired challenge or a
+different server-selected flow; neither is evidence for minting Integrity tokens. Temporary private
+screenshots and merge-work directories created for the comparison were moved to Trash after use;
+the verified merged APK and credential-free event logs remain outside the repository under
+`~/.cache/eclipse/` for reproducibility. No Sober cookie/token content was copied into Eclipse.
+
+**Gate/environment note.** `cargo fmt --all`, build, clippy with `-D warnings`, all tests, and the
+release build are clean (**676 + 1 + 7 + 2**). The first test pass alone hit `ENOSPC` while staging
+the real `libroblox.so`: `/tmp` was 99% full with 39 inactive, owner-owned
+`/tmp/eclipse-engine-*` staging directories (4.5 GiB total), and no Eclipse/helper process was
+running. Only those reproducible temporary `.so` stages were deleted; the test rerun then passed.
+
+*Files:* `AGENTS.md` only. No runtime/source behavior changed.
 
 ---
 
