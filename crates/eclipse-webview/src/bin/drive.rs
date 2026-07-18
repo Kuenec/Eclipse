@@ -1,6 +1,6 @@
 //! `eclipse-webview-drive` — the dev-host M2 verify driver AND the reference consumer
 //! implementation of the spawn contract (`src/webview/mod.rs`) + the wire protocol
-//! (negotiated at `shared::PROTO_VERSION` — v2 since the 2026-07-09 M4 additive extension).
+//! (negotiated at `shared::PROTO_VERSION` — v3 since the 2026-07-17 durable-cookie extension).
 //!
 //! 2026-07-03: spawns the helper per the contract (socketpair end dup2'd to fd 3,
 //! `--ipc-fd=3`, `PR_SET_PDEATHSIG(SIGTERM)`, no URL in argv), completes the handshake,
@@ -124,11 +124,42 @@ fn resolve_helper() -> Result<std::path::PathBuf, String> {
     ))
 }
 
-fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child), String> {
+struct TempProfile {
+    root: std::path::PathBuf,
+}
+
+impl TempProfile {
+    fn create() -> Result<Self, String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("system clock before Unix epoch: {e}"))?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-webview-drive-profile-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root)
+            .map_err(|e| format!("create temporary CEF profile failed: {e}"))?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("restrict temporary CEF profile failed: {e}"))?;
+        Ok(Self { root })
+    }
+}
+
+impl Drop for TempProfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child, TempProfile), String> {
     let (parent_end, child_end) =
         UnixStream::pair().map_err(|e| format!("socketpair failed: {e}"))?;
     let mut cmd = Command::new(helper);
     cmd.arg("--ipc-fd=3");
+    let profile = TempProfile::create()?;
+    cmd.env("ECLIPSE_WEBVIEW_DATA_DIR", &profile.root);
     // Forward an explicit ozone override if the drive was given one (contract flag).
     if let Some(ozone) = std::env::args().find(|a| a.starts_with("--ozone-platform=")) {
         cmd.arg(ozone);
@@ -169,7 +200,7 @@ fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child), String>
         .map_err(|e| format!("spawn {} failed: {e}", helper.display()))?;
     drop(child_fd);
     drop(child_end);
-    Ok((parent_end, child))
+    Ok((parent_end, child, profile))
 }
 
 impl Drive {
@@ -284,7 +315,7 @@ fn run() -> DResult<String> {
     let start = Instant::now();
     let helper_path = resolve_helper().map_err(DriveError::Fail)?;
     println!("[0 ms] helper={}", helper_path.display());
-    let (stream, child) = spawn_helper(&helper_path).map_err(DriveError::Fail)?;
+    let (stream, child, _profile) = spawn_helper(&helper_path).map_err(DriveError::Fail)?;
     let mut drive = Drive {
         stream,
         child,
@@ -576,6 +607,8 @@ fn name_of(msg: &HelperMsg) -> &'static str {
         HelperMsg::BridgeCall { .. } => "BridgeCall",
         HelperMsg::EvaluateJsResult { .. } => "EvaluateJsResult",
         HelperMsg::CookieSetResult { .. } => "CookieSetResult",
+        HelperMsg::CookieFlushDone { .. } => "CookieFlushDone",
+        HelperMsg::CookiesClearDone { .. } => "CookiesClearDone",
     }
 }
 

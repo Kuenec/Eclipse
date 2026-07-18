@@ -23,6 +23,7 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::raw::c_int;
 use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -179,15 +180,43 @@ pub fn build_settings_with_ua(ua: &str) -> Settings {
     }
 }
 
-/// The session-scoped private `RequestContext` settings (plan M4): an EMPTY `cache_path` =
-/// in-memory/incognito store (NOT the global default), with `persist_session_cookies` off.
-/// Pure/unit-pinned.
-pub fn session_context_settings() -> RequestContextSettings {
-    RequestContextSettings {
-        cache_path: CefString::default(),
-        persist_session_cookies: 0,
-        ..Default::default()
+/// The CEF-owned paths derived from the consumer-provided persistent data root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentProfilePaths {
+    pub root: String,
+    pub profile: String,
+}
+
+/// Validate and derive CEF's persistent profile paths. CEF requires absolute UTF-8 paths and
+/// requires `cache_path` to equal or descend from `root_cache_path`.
+/// The consumer creates and permission-hardens `root`; this helper independently validates the
+/// cross-process contract before `CefInitialize` so a malformed environment fails actionably.
+pub fn persistent_profile_paths(root: &Path) -> Result<PersistentProfilePaths, &'static str> {
+    if !root.is_absolute() {
+        return Err("ECLIPSE_WEBVIEW_DATA_DIR must be an absolute path");
     }
+    let root = root
+        .to_str()
+        .ok_or("ECLIPSE_WEBVIEW_DATA_DIR must be valid UTF-8 for CEF")?;
+    let profile = PathBuf::from(root).join("profile");
+    Ok(PersistentProfilePaths {
+        root: root.to_string(),
+        profile: profile
+            .to_str()
+            .ok_or("derived CEF profile path is not valid UTF-8")?
+            .to_string(),
+    })
+}
+
+/// Add the persistent global-profile settings to the otherwise-fixed helper settings.
+/// `root_cache_path` gives this Eclipse installation its own CEF singleton lock. The helper is a
+/// dedicated process, so its global context is also Eclipse-private; using it avoids racing a
+/// separately-created on-disk request context's asynchronous initialization. Session cookies
+/// persist because Android's CookieManager contract spans app process restarts.
+pub fn apply_persistent_profile(settings: &mut Settings, paths: &PersistentProfilePaths) {
+    settings.root_cache_path = CefString::from(paths.root.as_str());
+    settings.cache_path = CefString::from(paths.profile.as_str());
+    settings.persist_session_cookies = 1;
 }
 
 /// Typed, actionable ozone-selection failure.
@@ -524,16 +553,28 @@ struct PendingCookieGet {
     deadline: Instant,
 }
 
+#[derive(Default)]
+struct SessionCookieClearAcc {
+    deleted: usize,
+    finished: bool,
+}
+
+struct PendingSessionCookieClear {
+    request_id: u32,
+    acc: Arc<Mutex<SessionCookieClearAcc>>,
+    deadline: Instant,
+}
+
 struct EngineState {
     views: HashMap<i64, ViewState>,
     pending_cookies: Vec<PendingCookieGet>,
+    pending_session_cookie_clears: Vec<PendingSessionCookieClear>,
     closing_all: bool,
     exit_code: i32,
     close_deadline: Option<Instant>,
-    /// The ONE session-scoped private cookie store shared by every view + the CookieManager
-    /// (plan M4): an in-memory, incognito `RequestContext` created lazily at the first view/cookie
-    /// op. NOT the global default — the `.ROBLOSECURITY` handoff must land in the store the
-    /// challenge WebView reads.
+    /// The ONE private persistent cookie store shared by every view + the CookieManager. This is
+    /// the global request context selected by `CefSettings.cache_path`; the `.ROBLOSECURITY`
+    /// handoff and the challenge WebView must read and mutate the same durable jar.
     request_context: Option<RequestContext>,
     /// `browser.identifier()` → view handle, built at `create_view` (the bridge router maps a
     /// query's browser back to its view).
@@ -576,6 +617,7 @@ impl Engine {
         let state: Shared = Arc::new(Mutex::new(EngineState {
             views: HashMap::new(),
             pending_cookies: Vec::new(),
+            pending_session_cookie_clears: Vec::new(),
             closing_all: false,
             exit_code: 0,
             close_deadline: None,
@@ -600,20 +642,20 @@ impl Engine {
         }
     }
 
-    /// The ONE session-scoped in-memory cookie store, created lazily (empty `cache_path` = a
-    /// private incognito store, NOT the global default). Shared by every browser + every cookie op.
+    /// The ONE private persistent cookie store shared by every browser and CookieManager
+    /// operation. `CefSettings.cache_path` makes the dedicated helper's global context private to
+    /// Eclipse while preserving the app's authenticated session across restarts.
     fn request_context(&self) -> Option<RequestContext> {
         let mut st = lock(&self.state);
         if st.request_context.is_none() {
-            st.request_context =
-                request_context_create_context(Some(&session_context_settings()), None);
+            st.request_context = request_context_get_global_context();
         }
         st.request_context.clone()
     }
 
-    /// The session store's cookie manager (plan M4): every cookie op routes here, NOT the global
-    /// manager, so CookieManager and the WebViews share one coherent jar.
-    fn session_cookie_manager(&self) -> Option<CookieManager> {
+    /// The persistent store's cookie manager: every cookie op routes here so CookieManager and the
+    /// WebViews share one coherent jar.
+    fn persistent_cookie_manager(&self) -> Option<CookieManager> {
         self.request_context()
             .and_then(|rc| rc.cookie_manager(None))
     }
@@ -753,7 +795,7 @@ impl Engine {
                 expires_epoch_s,
             ),
             ConsumerMsg::CookieGet { request_id, url } => self.cookie_get(request_id, &url),
-            ConsumerMsg::CookiesClear { request_id } => self.cookies_clear(request_id),
+            ConsumerMsg::CookiesClear { request_id } => self.cookies_clear_all(request_id),
             ConsumerMsg::FrameAck {
                 view,
                 generation,
@@ -813,6 +855,10 @@ impl Engine {
                 http_only,
                 expires_epoch_s,
             ),
+            ConsumerMsg::CookieFlush { request_id } => self.cookie_flush(request_id),
+            ConsumerMsg::CookiesClearSession { request_id } => {
+                self.cookies_clear_session(request_id)
+            }
         }
     }
 
@@ -905,7 +951,7 @@ impl Engine {
         http_only: bool,
         expires_epoch_s: i64,
     ) {
-        let Some(manager) = self.session_cookie_manager() else {
+        let Some(manager) = self.persistent_cookie_manager() else {
             self.out.send(HelperMsg::CookieSetResult {
                 request_id,
                 ok: false,
@@ -1001,15 +1047,29 @@ impl Engine {
     /// Periodic work off the pump loop: cookie-visit completion/deadlines.
     pub fn poll(&self) {
         let mut due: Vec<(u32, Vec<CookieEntry>, bool)> = Vec::new();
+        let mut clear_due: Vec<(u32, bool, bool)> = Vec::new();
         {
             let mut st = lock(&self.state);
+            let now = Instant::now();
             st.pending_cookies.retain(|p| {
                 let acc = match p.acc.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                if acc.finished || Instant::now() > p.deadline {
+                if acc.finished || now > p.deadline {
                     due.push((p.request_id, acc.cookies.clone(), acc.finished));
+                    false
+                } else {
+                    true
+                }
+            });
+            st.pending_session_cookie_clears.retain(|p| {
+                let acc = match p.acc.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if acc.finished || now > p.deadline {
+                    clear_due.push((p.request_id, acc.deleted != 0, acc.finished));
                     false
                 } else {
                     true
@@ -1031,6 +1091,22 @@ impl Engine {
             self.out.send(HelperMsg::CookieList {
                 request_id,
                 cookies,
+            });
+        }
+        for (request_id, removed, finished) in clear_due {
+            if !finished {
+                // Zero cookies never trigger the visitor — see COOKIE_VISIT_DEADLINE.
+                logging::warn(
+                    COMPONENT,
+                    &format!(
+                        "session-cookie clear request_id={request_id} completed by deadline; \
+                         removed={removed}"
+                    ),
+                );
+            }
+            self.out.send(HelperMsg::CookiesClearDone {
+                request_id,
+                removed,
             });
         }
     }
@@ -1155,16 +1231,15 @@ impl Engine {
             ..Default::default()
         };
         let url = CefString::from("about:blank");
-        // The ONE session-scoped store (plan M4) — every view shares it, so the cookie handoff is
-        // coherent. Created lazily here (or at the first cookie op) and memoized.
-        let mut request_context = self.request_context();
+        // The ONE helper-private persistent store — every view shares it with CookieManager, so
+        // the handoff is coherent. The global context is memoized on its first use.
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
             Some(&url),
             Some(&browser_settings),
             None,
-            request_context.as_mut(),
+            None,
         );
         let mut st = lock(&self.state);
         match browser {
@@ -1344,8 +1419,8 @@ impl Engine {
         http_only: bool,
         expires_epoch_s: i64,
     ) {
-        let Some(manager) = self.session_cookie_manager() else {
-            logging::error(COMPONENT, "cookie_set: no session cookie manager");
+        let Some(manager) = self.persistent_cookie_manager() else {
+            logging::error(COMPONENT, "cookie_set: no persistent cookie manager");
             return;
         };
         // CEF Basetime = microseconds since 1601-01-01; Unix epoch offset 11644473600 s.
@@ -1390,8 +1465,8 @@ impl Engine {
     }
 
     fn cookie_get(&self, request_id: u32, url: &str) {
-        let Some(manager) = self.session_cookie_manager() else {
-            logging::error(COMPONENT, "cookie_get: no session cookie manager");
+        let Some(manager) = self.persistent_cookie_manager() else {
+            logging::error(COMPONENT, "cookie_get: no persistent cookie manager");
             self.out.send(HelperMsg::CookieList {
                 request_id,
                 cookies: Vec::new(),
@@ -1416,20 +1491,79 @@ impl Engine {
         });
     }
 
-    fn cookies_clear(&self, request_id: u32) {
-        let Some(manager) = self.session_cookie_manager() else {
-            logging::error(COMPONENT, "cookies_clear: no session cookie manager");
-            self.out.send(HelperMsg::CookieList {
+    fn cookies_clear_all(&self, request_id: u32) {
+        let Some(manager) = self.persistent_cookie_manager() else {
+            logging::error(COMPONENT, "cookies_clear_all: no persistent cookie manager");
+            self.out.send(HelperMsg::CookiesClearDone {
                 request_id,
-                cookies: Vec::new(),
+                removed: false,
             });
             return;
         };
         let mut callback = ClearDoneCallback::new(request_id, self.out.clone());
         if manager.delete_cookies(None, None, Some(&mut callback)) != 1 {
-            self.out.send(HelperMsg::CookieList {
+            self.out.send(HelperMsg::CookiesClearDone {
                 request_id,
-                cookies: Vec::new(),
+                removed: false,
+            });
+        }
+    }
+
+    /// Delete only cookies without an expiration date. CEF exposes this scope through
+    /// `visit_all_cookies`'s `deleteCookie` out-parameter, not `delete_cookies`; the pending
+    /// accumulator supplies Android's real "did anything get removed?" callback value. A zero-cookie
+    /// visit never calls the visitor, so [`COOKIE_VISIT_DEADLINE`] is the completion fallback.
+    fn cookies_clear_session(&self, request_id: u32) {
+        let Some(manager) = self.persistent_cookie_manager() else {
+            logging::error(
+                COMPONENT,
+                "cookies_clear_session: no persistent cookie manager",
+            );
+            self.out.send(HelperMsg::CookiesClearDone {
+                request_id,
+                removed: false,
+            });
+            return;
+        };
+        let acc: Arc<Mutex<SessionCookieClearAcc>> = Arc::default();
+        let mut visitor = SessionCookieClearVisitor::new(acc.clone());
+        if manager.visit_all_cookies(Some(&mut visitor)) != 1 {
+            self.out.send(HelperMsg::CookiesClearDone {
+                request_id,
+                removed: false,
+            });
+            return;
+        }
+        lock(&self.state)
+            .pending_session_cookie_clears
+            .push(PendingSessionCookieClear {
+                request_id,
+                acc,
+                deadline: Instant::now() + COOKIE_VISIT_DEADLINE,
+            });
+    }
+
+    /// Flush the persistent CEF cookie store. The completion frame is emitted only from CEF's
+    /// `CompletionCallback`; an immediate scheduling failure is reported as `ok=false` so the
+    /// consumer's blocking Android `CookieManager.flush()` boundary never hangs.
+    fn cookie_flush(&self, request_id: u32) {
+        let Some(manager) = self.persistent_cookie_manager() else {
+            logging::error(COMPONENT, "cookie_flush: no persistent cookie manager");
+            self.out.send(HelperMsg::CookieFlushDone {
+                request_id,
+                ok: false,
+            });
+            return;
+        };
+        let mut callback = FlushDoneCallback::new(request_id, self.out.clone());
+        if manager.flush_store(Some(&mut callback)) != 1 {
+            logging::error(
+                COMPONENT,
+                "cookie_flush: CEF refused to schedule the store flush",
+            );
+            self.out.send(HelperMsg::CookieFlushDone {
+                request_id,
+                ok: false,
             });
         }
     }
@@ -1890,6 +2024,43 @@ wrap_cookie_visitor! {
     }
 }
 
+/// CEF marks cookies without an expiration date with `has_expires == 0`; those, and only those,
+/// are Android session cookies. Kept pure so the scope boundary is regression-pinned without CEF.
+const fn session_cookie_should_delete(has_expires: c_int) -> bool {
+    has_expires == 0
+}
+
+wrap_cookie_visitor! {
+    struct SessionCookieClearVisitor {
+        acc: Arc<Mutex<SessionCookieClearAcc>>,
+    }
+
+    impl CookieVisitor {
+        fn visit(
+            &self,
+            cookie: Option<&Cookie>,
+            count: ::std::os::raw::c_int,
+            total: ::std::os::raw::c_int,
+            delete_cookie: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let mut acc = match self.acc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let (Some(cookie), Some(delete_cookie)) = (cookie, delete_cookie) {
+                if session_cookie_should_delete(cookie.has_expires) {
+                    *delete_cookie = 1;
+                    acc.deleted = acc.deleted.saturating_add(1);
+                }
+            }
+            if count.saturating_add(1) >= total {
+                acc.finished = true;
+            }
+            1
+        }
+    }
+}
+
 wrap_delete_cookies_callback! {
     struct ClearDoneCallback {
         request_id: u32,
@@ -1905,10 +2076,25 @@ wrap_delete_cookies_callback! {
                     self.request_id
                 ),
             );
-            // The solicited empty CookieList completes the request.
-            self.out.send(HelperMsg::CookieList {
+            self.out.send(HelperMsg::CookiesClearDone {
                 request_id: self.request_id,
-                cookies: Vec::new(),
+                removed: num_deleted > 0,
+            });
+        }
+    }
+}
+
+wrap_completion_callback! {
+    struct FlushDoneCallback {
+        request_id: u32,
+        out: Outbox,
+    }
+
+    impl CompletionCallback {
+        fn on_complete(&self) {
+            self.out.send(HelperMsg::CookieFlushDone {
+                request_id: self.request_id,
+                ok: true,
             });
         }
     }
@@ -2353,15 +2539,28 @@ mod tests {
     }
 
     #[test]
-    fn session_request_context_uses_empty_cache_path() {
-        // 2026-07-09 (plan M4): the session store is in-memory (empty cache_path = incognito),
-        // never persisting cookies to disk — the private, session-scoped store the challenge reads.
-        let settings = session_context_settings();
-        assert!(
-            settings.cache_path.to_string().is_empty(),
-            "empty cache_path = in-memory/incognito store (NOT the global default)"
-        );
-        assert_eq!(settings.persist_session_cookies, 0);
+    fn persistent_profile_path_is_an_absolute_private_child_and_restores_session_cookies() {
+        // 2026-07-17: the authenticated cookie jar must survive the ART/helper process restart.
+        let paths = persistent_profile_paths(Path::new("/tmp/eclipse-test-profile"))
+            .expect("absolute profile root");
+        assert_eq!(paths.root, "/tmp/eclipse-test-profile");
+        assert_eq!(paths.profile, "/tmp/eclipse-test-profile/profile");
+        assert!(persistent_profile_paths(Path::new("relative/profile")).is_err());
+
+        let mut global = build_settings_with_ua(ECLIPSE_USER_AGENT);
+        apply_persistent_profile(&mut global, &paths);
+        assert_eq!(global.root_cache_path.to_string(), paths.root);
+        assert_eq!(global.cache_path.to_string(), paths.profile);
+        assert_eq!(global.persist_session_cookies, 1);
+    }
+
+    #[test]
+    fn remove_session_cookies_deletes_only_cookies_without_an_expiry() {
+        // 2026-07-17: the previous framework alias sent removeSessionCookies through the blanket
+        // delete-all operation. Once the jar became persistent that erased durable login cookies.
+        assert!(session_cookie_should_delete(0));
+        assert!(!session_cookie_should_delete(1));
+        assert!(!session_cookie_should_delete(-1));
     }
 
     #[test]

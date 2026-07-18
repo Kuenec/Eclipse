@@ -40,8 +40,9 @@
 //! release `panic = "abort"` profile (§2.4), a panic can never unwind across this FFI; when we
 //! later register Rust JNI *callbacks*, each must wrap its body in `catch_unwind` (§2.8).
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void, CString, OsStr, OsString};
 use std::fmt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -72,6 +73,24 @@ const LIBART_DEFAULT: &str = "/usr/lib/art/libart.so";
 /// it into the dalvik-cache, e.g. `~/.cache/art`, on first run). Overridable via
 /// `ECLIPSE_ART_BOOT_IMAGE`.
 const BOOT_IMAGE_DEFAULT: &str = "/usr/lib/java/dex/art/oat/boot.art";
+/// Default directory containing art_standalone's libcore boot jars.
+const ART_DATA_DIR_DEFAULT: &str = "/usr/lib/java/dex/art";
+/// Generator readiness marker written only after every patched boot jar is installed.
+const ART_OVERLAY_MARKER: &str = ".eclipse-art-overlay-v1";
+const ART_OVERLAY_MARKER_CONTENT: &str = "eclipse-art-overlay-v1\n";
+/// Pinned art_standalone boot-class-path order (from the vendored fork's parsed_options.cc).
+const ART_BOOT_JARS: [&str; 10] = [
+    "core-oj-hostdex.jar",
+    "apachehttp-hostdex.jar",
+    "apache-xml-hostdex.jar",
+    "bouncycastle-hostdex.jar",
+    "core-junit-hostdex.jar",
+    "core-libart-hostdex.jar",
+    "hamcrest-hostdex.jar",
+    "junit-runner-hostdex.jar",
+    "okhttp-hostdex.jar",
+    "wolfssljni-hostdex.jar",
+];
 
 /// The `dex2oat`/ART x86 instruction-set feature tokens, in ART's canonical emit order.
 ///
@@ -271,28 +290,134 @@ pub fn find_libart() -> Result<PathBuf, RuntimeError> {
 /// from these itself — see `docs/art-and-runtime.md`).
 const LIBCORE_PRIMARY_JAR: &str = "core-oj-hostdex.jar";
 
-/// Locate the ART boot-image location (`ECLIPSE_ART_BOOT_IMAGE` override, else the default).
-///
-/// The path is a *location key*, not an on-disk file: ART derives a dalvik-cache name from it
-/// and compiles the image there on first run (e.g. `~/.cache/art`), and the literal
-/// `.../oat/boot.art` need not — and on this install does not — exist. So validation checks
-/// that the ART data dir holding the libcore boot jars is present (the location's grandparent,
-/// e.g. `/usr/lib/java/dex/art/`, containing [`LIBCORE_PRIMARY_JAR`]), not the image file.
-/// Returns [`RuntimeError::BootImageNotFound`] otherwise — detect-don't-assume (§9).
-pub fn find_boot_image() -> Result<PathBuf, RuntimeError> {
-    let path =
-        env_path("ECLIPSE_ART_BOOT_IMAGE").unwrap_or_else(|| PathBuf::from(BOOT_IMAGE_DEFAULT));
-    // `.../art/oat/boot.art` → grandparent `.../art/` holds the libcore boot jars.
-    let installed = path
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtBootPaths {
+    image_location: PathBuf,
+    /// A self-contained non-stock boot class path. `None` means use art_standalone's baked stock
+    /// class path. When present, the same value is the logical-location list: a separate dex2oat
+    /// process reopens those locations to validate the boot-image checksums.
+    boot_class_path: Option<OsString>,
+}
+
+fn art_dir_from_image(image_location: &Path) -> Option<PathBuf> {
+    image_location
         .parent()
         .and_then(Path::parent)
-        .map(|art_dir| art_dir.join(LIBCORE_PRIMARY_JAR).exists())
-        .unwrap_or(false);
-    if installed {
-        Ok(path)
-    } else {
-        Err(RuntimeError::BootImageNotFound(path))
+        .map(Path::to_path_buf)
+}
+
+fn first_missing_art_jar(art_dir: &Path) -> Option<PathBuf> {
+    ART_BOOT_JARS
+        .iter()
+        .map(|name| art_dir.join(name))
+        .find(|path| !path.is_file())
+}
+
+fn boot_class_path_for(art_dir: &Path) -> Result<OsString, RuntimeError> {
+    std::env::join_paths(ART_BOOT_JARS.iter().map(|name| art_dir.join(name)))
+        .map_err(RuntimeError::BootClassPathJoin)
+}
+
+fn overlay_art_dir() -> Option<PathBuf> {
+    env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR")
+        .or_else(patched_overlay_dir)
+        .map(|dir| dir.join("art"))
+}
+
+fn overlay_is_ready(art_dir: &Path) -> Result<bool, RuntimeError> {
+    let marker = art_dir.join(ART_OVERLAY_MARKER);
+    match std::fs::read_to_string(&marker) {
+        Ok(content) if content == ART_OVERLAY_MARKER_CONTENT => Ok(true),
+        Ok(_) => Err(RuntimeError::ArtOverlayMarkerInvalid(marker)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(RuntimeError::ArtOverlayMarkerRead(marker, error)),
     }
+}
+
+fn resolve_boot_image_location(
+    explicit: Option<PathBuf>,
+    overlay_art: Option<PathBuf>,
+    overlay_ready: bool,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        path
+    } else if let Some(art_dir) = overlay_art.filter(|_| overlay_ready) {
+        art_dir.join("oat").join("boot.art")
+    } else {
+        PathBuf::from(BOOT_IMAGE_DEFAULT)
+    }
+}
+
+/// Resolve the image plus any checksum-coherent self-contained boot class path.
+fn find_art_boot_paths() -> Result<ArtBootPaths, RuntimeError> {
+    let explicit = env_path("ECLIPSE_ART_BOOT_IMAGE");
+    let overlay_art = overlay_art_dir();
+    let overlay_ready = if explicit.is_none() {
+        overlay_art
+            .as_deref()
+            .map(overlay_is_ready)
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let image_location =
+        resolve_boot_image_location(explicit.clone(), overlay_art.clone(), overlay_ready);
+    let art_dir = art_dir_from_image(&image_location)
+        .ok_or_else(|| RuntimeError::BootImageNotFound(image_location.clone()))?;
+
+    if overlay_ready {
+        if let Some(missing) = first_missing_art_jar(&art_dir) {
+            return Err(RuntimeError::ArtOverlayIncomplete(missing));
+        }
+    } else if !art_dir.join(LIBCORE_PRIMARY_JAR).is_file() {
+        return Err(RuntimeError::BootImageNotFound(image_location));
+    }
+
+    // A complete explicit non-stock ART tree is authoritative even without Eclipse's marker. The
+    // marker is required only for AUTO-detection because the generator removes it before copying
+    // and writes it last, preventing an interrupted update from being selected.
+    let self_contained =
+        art_dir != Path::new(ART_DATA_DIR_DEFAULT) && first_missing_art_jar(&art_dir).is_none();
+    let boot_class_path = self_contained
+        .then(|| boot_class_path_for(&art_dir))
+        .transpose()?;
+
+    Ok(ArtBootPaths {
+        image_location,
+        boot_class_path,
+    })
+}
+
+/// Prepare process-global ART environment before any worker thread exists.
+///
+/// The patched boot overlay must also reach the separate `dex2oat` processes that ATL launches
+/// lazily. That fork does not propagate `-Xbootclasspath-locations`, but its child parser consumes
+/// `BOOTCLASSPATH`; setting the exact self-contained list here keeps parent, boot image, and compiler
+/// checksum identities equal. Call this once at launcher startup, before diagnostics or helpers can
+/// create threads. [`boot`] verifies the value and refuses an unprepared overlay.
+pub fn prepare_art_boot_environment() -> Result<(), RuntimeError> {
+    let paths = find_art_boot_paths()?;
+    if let Some(boot_class_path) = paths.boot_class_path {
+        if std::env::var_os("BOOTCLASSPATH").as_ref() != Some(&boot_class_path) {
+            // SAFETY: the launcher calls this at the very start of `main`, before diagnostics,
+            // loopback servers, ART, winit, or any Eclipse worker thread exists. The value remains
+            // fixed for the process lifetime so later ART/dex2oat readers never race a mutation.
+            unsafe { std::env::set_var("BOOTCLASSPATH", boot_class_path) };
+        }
+    }
+    Ok(())
+}
+
+/// Locate the ART boot-image location (`ECLIPSE_ART_BOOT_IMAGE` override, then the complete
+/// framework-patched ART overlay, else the stock install).
+///
+/// The path is a *location key*, not necessarily an on-disk file: ART derives a dalvik-cache name
+/// and compiles the image there on first run. Validation therefore checks its grandparent boot-jar
+/// directory. An auto-detected overlay additionally requires the generator's write-last readiness
+/// marker and all ten pinned jars.
+pub fn find_boot_image() -> Result<PathBuf, RuntimeError> {
+    find_art_boot_paths().map(|paths| paths.image_location)
 }
 
 /// Read an environment variable as a non-empty `PathBuf`.
@@ -904,12 +1029,30 @@ pub fn boot(
     app_lib_dir: Option<&Path>,
 ) -> Result<Vm, RuntimeError> {
     let libart = find_libart()?;
-    let boot_image = find_boot_image()?;
+    let art_boot = find_art_boot_paths()?;
+    let boot_image = &art_boot.image_location;
 
     // Build the option strings; keep the CStrings alive across the JNI_CreateJavaVM call (the
     // JavaVMOption array holds borrowed pointers into them).
     let mut option_strings: Vec<CString> = Vec::new();
     option_strings.push(make_cstring(format!("-Ximage:{}", boot_image.display()))?);
+    if let Some(boot_class_path) = art_boot.boot_class_path.as_deref() {
+        let actual = std::env::var_os("BOOTCLASSPATH");
+        if actual.as_deref() != Some(boot_class_path) {
+            return Err(RuntimeError::BootClassPathEnvironment {
+                expected: boot_class_path.to_os_string(),
+                actual,
+            });
+        }
+        // Use the same self-contained paths as both byte sources and logical locations. A child
+        // dex2oat process reopens the logical locations to validate each boot-oat checksum; naming
+        // stock /usr jars here while reading patched bytes would deterministically mismatch.
+        option_strings.push(make_os_option("-Xbootclasspath:", boot_class_path)?);
+        option_strings.push(make_os_option(
+            "-Xbootclasspath-locations:",
+            boot_class_path,
+        )?);
+    }
     for opt in plan.vm_options() {
         option_strings.push(make_cstring(opt)?);
     }
@@ -1042,6 +1185,14 @@ fn make_cstring(s: String) -> Result<CString, RuntimeError> {
     CString::new(s).map_err(|_| RuntimeError::OptionHasNul)
 }
 
+/// Build an ART option whose value is an OS path list without lossy UTF-8 conversion.
+fn make_os_option(prefix: &str, value: &OsStr) -> Result<CString, RuntimeError> {
+    let mut bytes = Vec::with_capacity(prefix.len() + value.as_bytes().len());
+    bytes.extend_from_slice(prefix.as_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    CString::new(bytes).map_err(|_| RuntimeError::OptionHasNul)
+}
+
 /// Errors from the runtime subsystem.
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -1049,6 +1200,23 @@ pub enum RuntimeError {
     LibartNotFound(PathBuf),
     /// The ART boot-image location's directory was not found.
     BootImageNotFound(PathBuf),
+    /// Joining the exact ART boot-jar paths into a platform path list failed (for example, a path
+    /// itself contained the `:` separator).
+    BootClassPathJoin(std::env::JoinPathsError),
+    /// A self-contained ART overlay was selected after worker threads could safely mutate the
+    /// process environment; launcher startup failed to call [`prepare_art_boot_environment`].
+    BootClassPathEnvironment {
+        /// Exact path list the parent VM and child dex2oat processes must share.
+        expected: OsString,
+        /// Existing process value, if any.
+        actual: Option<OsString>,
+    },
+    /// The ART overlay readiness marker existed but did not carry the supported schema value.
+    ArtOverlayMarkerInvalid(PathBuf),
+    /// Reading the ART overlay readiness marker failed.
+    ArtOverlayMarkerRead(PathBuf, std::io::Error),
+    /// The write-last marker claimed readiness but a required boot jar was absent.
+    ArtOverlayIncomplete(PathBuf),
     /// The vendored Android framework (`api-impl.jar`) was not found.
     FrameworkNotFound(PathBuf),
     /// No home/cache base directory could be determined for the native-lib cache dir.
@@ -1098,6 +1266,33 @@ impl fmt::Display for RuntimeError {
                     p.display()
                 )
             }
+            Self::BootClassPathJoin(error) => {
+                write!(f, "could not encode the ART boot class path: {error}")
+            }
+            Self::BootClassPathEnvironment { expected, actual } => write!(
+                f,
+                "the patched ART overlay was selected but BOOTCLASSPATH was not prepared before \
+                 worker threads started (expected {:?}, found {:?}); call \
+                 runtime::prepare_art_boot_environment at launcher startup",
+                expected, actual
+            ),
+            Self::ArtOverlayMarkerInvalid(path) => write!(
+                f,
+                "ART overlay readiness marker {} has an unsupported value; rebuild it with \
+                 tools/framework-overlay/patch-framework.sh",
+                path.display()
+            ),
+            Self::ArtOverlayMarkerRead(path, error) => write!(
+                f,
+                "could not read ART overlay readiness marker {}: {error}",
+                path.display()
+            ),
+            Self::ArtOverlayIncomplete(path) => write!(
+                f,
+                "ART overlay readiness marker is present but required boot jar {} is missing; \
+                 rebuild it with tools/framework-overlay/patch-framework.sh",
+                path.display()
+            ),
             Self::FrameworkNotFound(p) => {
                 write!(
                     f,
@@ -1146,6 +1341,8 @@ impl std::error::Error for RuntimeError {
             | Self::ResolveSymbol(e)
             | Self::OpenGlobalScope(e)
             | Self::ResolveDlParse(e) => Some(e),
+            Self::BootClassPathJoin(e) => Some(e),
+            Self::ArtOverlayMarkerRead(_, e) => Some(e),
             Self::ProvisionSoname(_, e) => Some(e),
             _ => None,
         }
@@ -1185,6 +1382,50 @@ mod tests {
     fn feature_string_mixed_keeps_order_and_prefix() {
         let s = format_feature_string(|t| matches!(t, "ssse3" | "sse4.1" | "sse4.2"));
         assert_eq!(s, "ssse3,sse4.1,sse4.2,-avx,-avx2,-popcnt");
+    }
+
+    #[test]
+    fn art_boot_image_precedence_is_explicit_then_ready_overlay_then_stock() {
+        let overlay = PathBuf::from("/cache/eclipse/framework-patched/art");
+        assert_eq!(
+            resolve_boot_image_location(
+                Some(PathBuf::from("/custom/art/oat/boot.art")),
+                Some(overlay.clone()),
+                true,
+            ),
+            PathBuf::from("/custom/art/oat/boot.art")
+        );
+        assert_eq!(
+            resolve_boot_image_location(None, Some(overlay.clone()), true),
+            overlay.join("oat/boot.art")
+        );
+        assert_eq!(
+            resolve_boot_image_location(None, Some(overlay), false),
+            PathBuf::from(BOOT_IMAGE_DEFAULT)
+        );
+        assert_eq!(
+            resolve_boot_image_location(None, None, true),
+            PathBuf::from(BOOT_IMAGE_DEFAULT),
+            "an impossible ready-without-directory state must degrade to stock without panicking"
+        );
+    }
+
+    #[test]
+    fn art_boot_class_path_keeps_the_pinned_order_and_uses_one_identity() {
+        let art_dir = Path::new("/cache/eclipse/framework-patched/art");
+        let joined = boot_class_path_for(art_dir).expect("test paths contain no separator");
+        let paths: Vec<PathBuf> = std::env::split_paths(&joined).collect();
+        let expected: Vec<PathBuf> = ART_BOOT_JARS
+            .iter()
+            .map(|name| art_dir.join(name))
+            .collect();
+        assert_eq!(paths, expected);
+
+        let bytes = make_os_option("-Xbootclasspath:", &joined).expect("no NUL in test path");
+        assert_eq!(
+            bytes.as_bytes(),
+            format!("-Xbootclasspath:{}", joined.to_string_lossy()).as_bytes()
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

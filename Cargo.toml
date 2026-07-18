@@ -43,6 +43,15 @@ directories = "6"                                                   # portable X
 # ~2 crates are accepted as the cost of a pure-Rust decoder; revisit if zip exposes a leaner path.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"                                     # streaming artifact-integrity hash (lowercase hex via std::fmt, no `hex` crate)
+# 2026-07-17: validate an existing extracted APK entry against the ZIP entry's CRC32 before
+# skipping it. `crc32fast` is already in the graph through `zip`, so making it direct adds zero
+# transitive crates; it prevents same-size files from an older APK surviving an upgrade.
+crc32fast = "1"
+# 2026-07-17: Android CookieManager accepts RFC HTTP-date `Expires` attributes. Eclipse must
+# preserve that expiry when translating the raw Set-Cookie string into CEF's structured cookie;
+# otherwise a persistent cookie is mislabeled as session-only and removeSessionCookies deletes it.
+# `httpdate` is pure Rust, `forbid(unsafe_code)`, MSRV 1.56, and only one small crate.
+httpdate = "1.0.3"
 # --- Runtime: boot the vendored ART VM (M1) -------------------------------------
 # 2026-06-05: 0.8 (was 0.9) unifies the tree on the single libloading already pulled by ash/
 # wayland-sys/khronos-egl — removing the duplicate 0.9 (§2.5 no-bloat) and letting egl_engine.rs

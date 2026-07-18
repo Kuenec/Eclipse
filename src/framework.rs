@@ -8473,6 +8473,11 @@ const VIEW_WIDGET_FIELD_SIG: &JNIStr = jni_str!("J");
 /// dispatching `surfaceCreated`/`surfaceChanged`.
 const ARRAY_LIST_SIG: &JNIStr = jni_str!("Ljava/util/ArrayList;");
 
+/// Descriptor of `SurfaceView.mSurfaceHolder`, paired with [`JavaType::Object`] at each JNI read.
+/// Host shutdown needs the exact holder instance that `surfaceCreated`/`surfaceChanged` supplied to
+/// the callbacks, so `surfaceDestroyed` closes the same lifecycle rather than fabricating one.
+const SURFACE_HOLDER_SIG: &JNIStr = jni_str!("Landroid/view/SurfaceHolder;");
+
 /// `TextView.native_setText(String text)` → record the text on the receiver's [`view_registry`] peer
 /// (2026-06-05).
 ///
@@ -8498,11 +8503,12 @@ extern "system" fn text_view_native_set_text<'local>(
             Some(text.try_to_string(env)?)
         };
         match view_registry::with_view(widget, |v| v.text = value.clone()) {
+            // 2026-07-17: UI text may contain credentials; logs carry length only at every level.
             Ok(()) => tracing::debug!(
                 target: "android.widget.TextView",
                 widget,
-                text = value.as_deref().unwrap_or(""),
-                "TextView.native_setText: recorded text on non-GTK view peer"
+                chars = value.as_deref().map_or(0, |text| text.chars().count()),
+                "TextView.native_setText: recorded text length on non-GTK view peer"
             ),
             Err(e) => tracing::debug!(
                 target: "android.widget.TextView",
@@ -10435,6 +10441,18 @@ pub fn cookie_manager_get_cookie(vm: &Vm, url: &str) -> String {
     .unwrap_or_default()
 }
 
+/// Drive the blocking `CookieManager.flush()` Java/native path. Returning means the native's
+/// bounded CEF completion wait finished; any durability failure is logged by the native because
+/// Android's API itself returns void.
+pub fn cookie_manager_flush(vm: &Vm) -> Result<(), FrameworkError> {
+    with_cookie_manager(vm, |env, cm| {
+        checked(env, "CookieManager.flush", |env| {
+            env.call_method(cm, jni_str!("flush"), jni_sig!("()V"), &[])?
+                .v()
+        })
+    })
+}
+
 /// Drive `CookieManager.getInstance().setCookie(url, value, probe)` (3-arg) — the real success flag
 /// routes to the probe's `onReceiveValue`, recorded in `lastValue` (polled via
 /// [`read_probe_last_value`], which yields `"true"`/`"false"`). Resets `lastValue` first.
@@ -10476,7 +10494,7 @@ pub fn cookie_manager_set_cookie_cb(vm: &Vm, url: &str, value: &str) -> Result<(
 /// CookieManager()` (trivial ctor) is used INSTEAD of `getInstance()` — the latter reads
 /// `Context.this_application`, triggering the heavy `Context.<clinit>` (AssetManager/Resources
 /// native init) this framework-only harness has no reason to bring up. The natives are stateless
-/// (backed by the process-global session store), so any instance works.
+/// (backed by the process-global private persistent store), so any instance works.
 fn with_cookie_manager<T>(
     vm: &Vm,
     f: impl FnOnce(&mut Env, &JObject) -> Result<T, FrameworkError>,
@@ -10997,7 +11015,7 @@ fn jstring_object_to_string(env: &mut Env, obj: JObject) -> jni::errors::Result<
     Ok(String::from(chars))
 }
 
-// --- CookieManager natives (real backing via the session-scoped helper store) --------------------
+// --- CookieManager natives (real backing via the private persistent helper store) ----------------
 
 /// `CookieManager.native_getCookie(String url) -> String` — the blocking getCookie. Formats the
 /// helper's cookie list into Android's `"n1=v1; n2=v2"` string. Cookie VALUES are NEVER logged.
@@ -11008,10 +11026,11 @@ extern "system" fn web_view_cookie_manager_get_cookie<'local>(
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         let url_s = read_jstring(env, &url).unwrap_or_default();
+        let fixed = fixup_webview_cookie_url(&url_s);
         let cookies = match env.get_java_vm() {
             Ok(java_vm) => crate::webview::client::cookie_get_blocking(
                 java_vm,
-                url_s,
+                fixed.url,
                 std::time::Duration::from_secs(5),
             )
             .unwrap_or_default(),
@@ -11034,11 +11053,17 @@ extern "system" fn web_view_cookie_manager_set_cookie<'local>(
         else {
             return Ok(());
         };
-        let c = parse_set_cookie(&value_s);
+        let fixed = fixup_webview_cookie_url(&url_s);
+        let mut c = parse_set_cookie(&value_s);
+        if c.domain.is_empty() {
+            if let Some(domain) = fixed.implied_domain {
+                c.domain = domain;
+            }
+        }
         if let Ok(java_vm) = env.get_java_vm() {
             let _ = crate::webview::client::cookie_set(
                 java_vm,
-                url_s,
+                fixed.url,
                 c.name,
                 c.value,
                 c.domain,
@@ -11067,7 +11092,13 @@ extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
         else {
             return Ok(());
         };
-        let c = parse_set_cookie(&value_s);
+        let fixed = fixup_webview_cookie_url(&url_s);
+        let mut c = parse_set_cookie(&value_s);
+        if c.domain.is_empty() {
+            if let Some(domain) = fixed.implied_domain {
+                c.domain = domain;
+            }
+        }
         let request_id = crate::webview::client::next_request_id();
         if !callback.is_null() {
             if let Ok(g) = env.new_global_ref(&callback) {
@@ -11082,7 +11113,7 @@ extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
                 if crate::webview::client::cookie_set_with_result(
                     java_vm,
                     request_id,
-                    url_s,
+                    fixed.url,
                     c.name,
                     c.value,
                     c.domain,
@@ -11124,23 +11155,29 @@ extern "system" fn web_view_cookie_manager_remove_all_cookies<'local>(
     _this: JObject<'local>,
     callback: JObject<'local>,
 ) {
-    web_view_cookie_manager_remove_impl(env, callback)
+    web_view_cookie_manager_remove_impl(env, callback, CookieClearScope::All)
 }
 
-/// `CookieManager.native_removeSessionCookies(ValueCallback callback)`. 2026-07-09 divergence:
-/// the v1 wire has one blanket clear, so this clears all cookies (harmless for the in-memory
-/// session store — nothing persists).
+/// `CookieManager.native_removeSessionCookies(ValueCallback callback)` — clear only cookies
+/// without an expiration date, preserving persistent cookies.
 extern "system" fn web_view_cookie_manager_remove_session_cookies<'local>(
     env: EnvUnowned<'local>,
     _this: JObject<'local>,
     callback: JObject<'local>,
 ) {
-    web_view_cookie_manager_remove_impl(env, callback)
+    web_view_cookie_manager_remove_impl(env, callback, CookieClearScope::Session)
+}
+
+#[derive(Clone, Copy)]
+enum CookieClearScope {
+    All,
+    Session,
 }
 
 fn web_view_cookie_manager_remove_impl<'local>(
     mut env: EnvUnowned<'local>,
     callback: JObject<'local>,
+    scope: CookieClearScope,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let request_id = crate::webview::client::next_request_id();
@@ -11154,17 +11191,19 @@ fn web_view_cookie_manager_remove_impl<'local>(
         }
         // 2026-07-09 fix: the get_java_vm Err arm previously retained the callback with no removal
         // (a leak + a never-fired callback); both failure shapes degrade honestly to FALSE.
-        // 2026-07-16 (§6 🩹➜⛔): a clear taken during the deferred-spawn window is PROVABLY complete
-        // without the engine (`webview::client::EarlyCookies`) — no helper reply is coming, so fire
-        // TRUE here. TRUE is the value the round trip delivers (`fire_cookies_clear_result` passes
-        // it unconditionally), so this is the SAME answer, not a fabricated ack. Inline delivery on
-        // the calling thread is the shape the FALSE arm already used.
+        // 2026-07-17: the jar is persistent, so even an unspawned helper may have prior-boot
+        // cookies. Every clear must reach CEF; only a send failure is answered locally (FALSE).
         let answer_now: Option<bool> = match env.get_java_vm() {
-            Ok(java_vm) => match crate::webview::client::cookies_clear(java_vm, request_id) {
-                Ok(crate::webview::client::SendOutcome::Sent) => None,
-                Ok(_) => Some(true),
-                Err(_) => Some(false),
-            },
+            Ok(java_vm) => match scope {
+                CookieClearScope::All => {
+                    crate::webview::client::cookies_clear_all(java_vm, request_id)
+                }
+                CookieClearScope::Session => {
+                    crate::webview::client::cookies_clear_session(java_vm, request_id)
+                }
+            }
+            .err()
+            .map(|_| false),
             Err(_) => Some(false),
         };
         if let Some(ok) = answer_now {
@@ -11181,15 +11220,29 @@ fn web_view_cookie_manager_remove_impl<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `CookieManager.native_flush()` — bound no-op: the session store is in-memory, nothing persists,
-/// so there is nothing to flush (documented 2026-07-09). Bound so the path never `UnsatisfiedLink`s.
+/// `CookieManager.native_flush()` — synchronously wait for CEF's persistent-store completion,
+/// matching Android's documented blocking durability boundary. The wait is bounded so a dead
+/// helper cannot hang an ART thread forever; failure is loud because Java's API returns void.
 extern "system" fn web_view_cookie_manager_flush<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
 ) {
     env.with_env(|env: &mut Env| -> jni::errors::Result<()> {
-        let _ = env;
-        tracing::debug!(target: "android.webkit.CookieManager", "flush(): in-memory session store, no-op");
+        let ok = match env.get_java_vm() {
+            Ok(java_vm) => crate::webview::client::cookie_flush_blocking(
+                java_vm,
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap_or(false),
+            Err(_) => false,
+        };
+        if !ok {
+            tracing::warn!(
+                target: "android.webkit.CookieManager",
+                "CookieManager.flush(): the persistent CEF store did not confirm completion \
+                 within the bounded wait; cookies may not survive an immediate process exit"
+            );
+        }
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -11232,7 +11285,7 @@ fn register_cookie_manager_natives(env: &mut Env) -> Result<(), FrameworkError> 
     let bound = register_class_natives_best_effort(env, COOKIE_MANAGER_CLASS, &bindings)?;
     tracing::info!(
         bound,
-        "registered Eclipse's non-GTK backing for the android.webkit.CookieManager native surface (get/set/set-with-callback/removeAll/removeSession/flush → session-scoped helper store) (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for the android.webkit.CookieManager native surface (get/set/set-with-callback/removeAll/removeSession/flush → private persistent helper store) (per-method best-effort)"
     );
     Ok(())
 }
@@ -11270,10 +11323,79 @@ struct ParsedSetCookie {
     expires_epoch_s: i64,
 }
 
-/// Parse `"name=value; Domain=..; Path=..; Secure; HttpOnly; Max-Age=.."` into structured fields
-/// (the shape `CookieManager.setCookie(url, value)` accepts). `Max-Age` is resolved to an absolute
-/// epoch (now + seconds); a bare `Expires` without `Max-Age` falls back to session (0) — harmless
-/// for the in-memory session store. Pure/total. 2026-07-09.
+/// Android WebView's compatibility fixup for the relaxed host/domain strings apps historically
+/// pass to `CookieManager`. Chromium applies its `WebAddressParser` before every get/set; Eclipse
+/// preserves already-schemed inputs and implements the measured scheme-less host subset without
+/// pretending to be a general URL parser. Invalid shapes remain unchanged so CEF rejects them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CookieUrlFixup {
+    url: String,
+    /// Classic WebView treated a leading-dot input as a domain and appended `Domain=<input>` when
+    /// the cookie lacked an explicit Domain attribute.
+    implied_domain: Option<String>,
+}
+
+fn fixup_webview_cookie_url(input: &str) -> CookieUrlFixup {
+    if input.contains("://") || input.is_empty() {
+        return CookieUrlFixup {
+            url: input.to_string(),
+            implied_domain: None,
+        };
+    }
+
+    let (authority, suffix) = input.find('/').map_or((input, ""), |at| input.split_at(at));
+    let (host_port, leading_dot) = match authority.strip_prefix('.') {
+        Some(host) if !host.is_empty() => (host, true),
+        _ => (authority, false),
+    };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            (host, Some(port))
+        }
+        _ => (host_port, None),
+    };
+    let host_ok = !host.is_empty()
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if !host_ok || suffix.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        return CookieUrlFixup {
+            url: input.to_string(),
+            implied_domain: None,
+        };
+    }
+    let scheme = if port == Some("443") { "https" } else { "http" };
+    let path = if suffix.is_empty() { "/" } else { suffix };
+    CookieUrlFixup {
+        url: format!("{scheme}://{host_port}{path}"),
+        implied_domain: leading_dot.then(|| format!(".{host}")),
+    }
+}
+
+/// Convert an explicit cookie expiry into the protocol's nonzero Unix-epoch representation.
+/// HTTP's epoch itself is remapped to `-1`: wire value `0` is the session-cookie sentinel, while an
+/// explicit 1970 expiry means "already expired" and must remain an expiring cookie.
+fn parse_cookie_expiry_epoch_s(value: &str) -> Option<i64> {
+    let epoch = if let Ok(epoch) = value.parse::<i64>() {
+        epoch
+    } else {
+        let time = httpdate::parse_http_date(value).ok()?;
+        match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            Err(before) => i64::try_from(before.duration().as_secs())
+                .unwrap_or(i64::MAX)
+                .saturating_neg(),
+        }
+    };
+    Some(if epoch == 0 { -1 } else { epoch })
+}
+
+/// Parse `"name=value; Domain=..; Path=..; Secure; HttpOnly; Max-Age=..; Expires=.."` into
+/// structured CEF fields (the shape `CookieManager.setCookie(url, value)` accepts). `Max-Age` is
+/// resolved to an absolute epoch and takes precedence over `Expires`; standard/legacy HTTP dates
+/// are parsed by `httpdate`. Invalid expiry text leaves a session cookie. Pure/total. 2026-07-17.
 fn parse_set_cookie(value: &str) -> ParsedSetCookie {
     let mut parts = value.split(';');
     let first = parts.next().unwrap_or("").trim();
@@ -11290,6 +11412,7 @@ fn parse_set_cookie(value: &str) -> ParsedSetCookie {
         http_only: false,
         expires_epoch_s: 0,
     };
+    let mut has_valid_max_age = false;
     for attr in parts {
         let attr = attr.trim();
         if attr.is_empty() {
@@ -11308,17 +11431,17 @@ fn parse_set_cookie(value: &str) -> ParsedSetCookie {
                 if let Ok(secs) = v.parse::<i64>() {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
+                        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
                         .unwrap_or(0);
                     out.expires_epoch_s = now.saturating_add(secs);
+                    has_valid_max_age = true;
                 }
             }
-            // Bare epoch-integer Expires is honored; a formatted RFC1123 date falls back to session
-            // (0) — the in-memory session store outlives the challenge regardless.
-            "expires" => {
-                if let Ok(epoch) = v.parse::<i64>() {
-                    out.expires_epoch_s = epoch;
-                }
+            "expires" if !has_valid_max_age => {
+                let Some(epoch) = parse_cookie_expiry_epoch_s(v) else {
+                    continue;
+                };
+                out.expires_epoch_s = epoch;
             }
             _ => {}
         }
@@ -11988,9 +12111,10 @@ pub fn drain_deferred_cookie_set_callbacks(vm: &Vm, reason: &str) {
     drain_all_webview_callbacks(&java_vm, reason);
 }
 
-/// Deliver the removeAll/removeSession completion (a completed clear is success → `Boolean.TRUE`).
-pub fn fire_cookies_clear_result(java_vm: &JavaVM, request_id: u32) {
-    fire_boolean_result(java_vm, cookie_clear_callbacks(), request_id, true);
+/// Deliver CEF's real removeAll/removeSession result: true only when at least one cookie was
+/// removed, matching Android's `ValueCallback<Boolean>` contract.
+pub fn fire_cookies_clear_result(java_vm: &JavaVM, request_id: u32, removed: bool) {
+    fire_boolean_result(java_vm, cookie_clear_callbacks(), request_id, removed);
 }
 
 /// Fire `onReceiveValue(String)` on a retained callback global.
@@ -12215,75 +12339,116 @@ static ACTIVE_TEXT_FIELD: std::sync::atomic::AtomicI64 = std::sync::atomic::Atom
 /// synthetic-input harness re-tap until a field is actually focused before typing (focus-on-tap is
 /// asynchronous + occasionally missed). 2026-06-14.
 pub fn active_text_field() -> i64 {
-    ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Relaxed)
+    ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// The current text of the focused text field (the `EditText` the engine last polled), or `None` if no
-/// field is active. The Vulkan present-path overlay draws THIS onto the field so host-typed text is
-/// visible — Eclipse compositing the Android input view, the platform's job. Re-read under the registry
-/// lock each call (a stale handle → `None`). 2026-06-14.
-pub fn active_text_field_text() -> Option<String> {
-    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Relaxed);
-    if widget == 0 {
-        return None;
-    }
-    view_registry::with_view(widget, |v| v.text.clone())
-        .ok()
-        .flatten()
+/// One coherent engine textbox answer, keyed to the exact `EditText` whose text Eclipse would draw.
+/// Geometry/type without this identity is unsafe: the active field can advance from username to
+/// password between independent reads, making a stale non-secure type authorize plaintext from the
+/// new secure field. 2026-07-17.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextboxSession {
+    widget: i64,
+    geometry: (i32, i32, u32, u32),
+    input_type: i32,
 }
 
-/// The focused textbox's on-screen rect `(x, y, w, h)` from the engine, or `None` if no field is active.
-/// Cached by [`query_textbox_geometry`] (run on the JNI-attached main thread) so the Vulkan present-path
-/// overlay — which runs on the engine render thread and must NOT call into the engine — can position the
-/// text where the field actually is (the login layout drifts, so a fixed rect goes stale). 2026-06-14.
-static TEXTBOX_GEOM: std::sync::Mutex<Option<(i32, i32, u32, u32)>> = std::sync::Mutex::new(None);
-
-/// The focused textbox's `NativeTextBoxInfo.textInputType` (an engine enum), cached alongside the
-/// geometry. Lets the overlay MASK secure fields (a password renders as `•`, never plaintext). `i32::MIN`
-/// = unknown/no field. 2026-06-14.
-static TEXTBOX_INPUT_TYPE: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(i32::MIN);
+/// The focused textbox's complete snapshot. One mutex makes widget identity, geometry, and input type
+/// advance/invalidate atomically; the Vulkan render thread reads this once per active-field frame.
+static TEXTBOX_SESSION: std::sync::Mutex<Option<TextboxSession>> = std::sync::Mutex::new(None);
 
 /// The cached focused-textbox geometry `(x, y, w, h)`, or `None`.
 pub fn textbox_geometry() -> Option<(i32, i32, u32, u32)> {
-    TEXTBOX_GEOM.lock().ok().and_then(|g| *g)
+    TEXTBOX_SESSION
+        .lock()
+        .ok()
+        .and_then(|session| session.map(|session| session.geometry))
 }
 
 /// The cached focused-textbox `textInputType` (engine enum), or `i32::MIN` if no field is focused.
 pub fn textbox_input_type() -> i32 {
-    TEXTBOX_INPUT_TYPE.load(std::sync::atomic::Ordering::Relaxed)
+    TEXTBOX_SESSION
+        .lock()
+        .ok()
+        .and_then(|session| session.map(|session| session.input_type))
+        .unwrap_or(i32::MIN)
 }
 
-/// 2026-07-17: the ONE writer of the focused-textbox cache. The geometry and the input type are two
-/// fields of ONE `NativeTextBoxInfo`, so they describe one textbox session and MUST be invalidated as
-/// a pair — `Some` records a complete live session, `None` clears BOTH.
+/// The exact live overlay snapshot for one field identity.
+pub(crate) struct ActiveTextOverlay {
+    pub(crate) text: String,
+    pub(crate) geometry: (i32, i32, u32, u32),
+    pub(crate) input_type: i32,
+}
+
+/// Return text + geometry + input type for ONE live field identity.
 ///
-/// Why this exists: `TEXTBOX_INPUT_TYPE` used to have one store and NO clear anywhere in the tree, so
-/// a mask outlived the session that justified it. Measured (`/tmp/eclipse-owner-manual2.log`):
+/// The session is copied under its mutex, then the text is read from that session's registry peer.
+/// `ACTIVE_TEXT_FIELD` is checked on both sides of the registry read; if focus changes at either
+/// boundary, nothing is returned. Rendering nothing for one frame is safe, while rendering text under
+/// metadata belonging to another field can disclose a password.
+pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
+    let session = TEXTBOX_SESSION.lock().ok().and_then(|session| *session)?;
+    if !textbox_session_matches_active(
+        session,
+        ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire),
+    ) {
+        return None;
+    }
+    let text = view_registry::with_view(session.widget, |view| view.text.clone())
+        .ok()
+        .flatten()?;
+    if !textbox_session_matches_active(
+        session,
+        ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire),
+    ) {
+        return None;
+    }
+    Some(ActiveTextOverlay {
+        text,
+        geometry: session.geometry,
+        input_type: session.input_type,
+    })
+}
+
+fn textbox_session_matches_active(session: TextboxSession, active_widget: i64) -> bool {
+    active_widget != 0 && session.widget == active_widget
+}
+
+/// 2026-07-17: the ONE writer of the focused-textbox cache. Widget identity, geometry, and input type
+/// describe one textbox session and MUST advance/invalidate atomically — `Some` records one complete
+/// live snapshot, `None` clears it.
+///
+/// Why this exists: the old input-type cache had one store and no clear anywhere in the tree, so a
+/// mask outlived the session that justified it. Measured (`/tmp/eclipse-owner-manual2.log`):
 /// `text_input_type=5` (secure) was recorded ONCE at 06:09:29 and never again across three credential
 /// fields AND the home screen, while the overlay was still compositing the credential `EditText`'s
 /// text at 06:11:40 — 20 s after `onAppReady: Home`. The masking coin merely landed the safe way up:
 /// had the last recorded type been the username's `7`, the same incoherence would have rendered the
-/// password in PLAINTEXT (the geometry and the type advance together here; `ACTIVE_TEXT_FIELD`, which
-/// selects the TEXT, is a separate identity that this record cannot and does not speak for).
-fn record_textbox_session(session: Option<(i32, i32, u32, u32, i32)>) {
+/// password in PLAINTEXT. The 07:53 live boot then proved that merely clearing geometry/type together
+/// was still insufficient: the full-screen probe could combine cleared metadata with text retained by
+/// `ACTIVE_TEXT_FIELD`. `TextboxSession.widget` now binds all three pieces to one identity.
+fn record_textbox_session(session: Option<TextboxSession>) {
     match session {
-        Some((x, y, w, h, input_type)) => {
-            if let Ok(mut g) = TEXTBOX_GEOM.lock() {
-                *g = Some((x, y, w, h));
+        Some(session) => {
+            if let Ok(mut current) = TEXTBOX_SESSION.lock() {
+                *current = Some(session);
             }
-            TEXTBOX_INPUT_TYPE.store(input_type, std::sync::atomic::Ordering::Relaxed);
             // Log once per distinct value (so the username vs password input-type values surface).
             static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
-            if LAST.swap(input_type, std::sync::atomic::Ordering::Relaxed) != input_type {
-                tracing::info!(text_input_type = input_type, "focused textbox input type");
+            if LAST.swap(session.input_type, std::sync::atomic::Ordering::Relaxed)
+                != session.input_type
+            {
+                tracing::info!(
+                    text_input_type = session.input_type,
+                    "focused textbox input type"
+                );
             }
         }
         None => {
-            if let Ok(mut g) = TEXTBOX_GEOM.lock() {
-                *g = None;
+            if let Ok(mut current) = TEXTBOX_SESSION.lock() {
+                *current = None;
             }
-            TEXTBOX_INPUT_TYPE.store(i32::MIN, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -12306,6 +12471,11 @@ pub fn query_textbox_geometry(vm: &Vm) {
     }
     // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
     let java_vm = unsafe { JavaVM::from_raw(raw) };
+    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
+    if widget == 0 {
+        record_textbox_session(None);
+        return;
+    }
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let cls = match env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface")) {
@@ -12424,8 +12594,14 @@ pub fn query_textbox_geometry(vm: &Vm) {
             // recording the halves independently is what let the geometry advance to the password while
             // the mask still described the username.
             match (w > 0.0 && h > 0.0, input_type) {
-                (true, Some(it)) => {
-                    record_textbox_session(Some((x as i32, y as i32, w as u32, h as u32, it)))
+                (true, Some(input_type))
+                    if ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire) == widget =>
+                {
+                    record_textbox_session(Some(TextboxSession {
+                        widget,
+                        geometry: (x as i32, y as i32, w as u32, h as u32),
+                        input_type,
+                    }));
                 }
                 _ => record_textbox_session(None),
             }
@@ -12457,11 +12633,12 @@ extern "system" fn widget_native_set_text<'local>(
             Some(text.try_to_string(env)?)
         };
         match view_registry::with_view(widget, |v| v.text = value.clone()) {
+            // 2026-07-17: keep the all-widget logging rule structural, even for choice labels.
             Ok(()) => tracing::debug!(
                 target: "android.widget",
                 widget,
-                text = value.as_deref().unwrap_or(""),
-                "Widget.native_setText: recorded text on non-GTK view peer"
+                chars = value.as_deref().map_or(0, |text| text.chars().count()),
+                "Widget.native_setText: recorded text length on non-GTK view peer"
             ),
             Err(e) => tracing::debug!(
                 target: "android.widget",
@@ -12491,7 +12668,7 @@ extern "system" fn edit_text_native_get_text<'local>(
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         // The engine reads the focused field's text via getText(); record it as the active input field.
-        ACTIVE_TEXT_FIELD.store(widget, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE_TEXT_FIELD.store(widget, std::sync::atomic::Ordering::Release);
         let text = view_registry::with_view(widget, |v| v.text.clone())
             .ok()
             .flatten()
@@ -12651,7 +12828,7 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
         }
         Err(_) => {
             // Stale handle (the field's peer was destroyed, e.g. on navigation) — clear + not active.
-            ACTIVE_TEXT_FIELD.store(0, std::sync::atomic::Ordering::Relaxed);
+            ACTIVE_TEXT_FIELD.store(0, std::sync::atomic::Ordering::Release);
             false
         }
     }
@@ -12991,11 +13168,12 @@ extern "system" fn radio_button_set_text<'local>(
             Some(JString::cast_local(env, s)?.try_to_string(env)?)
         };
         match view_registry::with_view(widget, |v| v.text = value.clone()) {
+            // 2026-07-17: labels share the UI-text privacy rule; log metadata, never content.
             Ok(()) => tracing::debug!(
                 target: "android.widget.RadioButton",
                 widget,
-                text = value.as_deref().unwrap_or(""),
-                "RadioButton.setText: recorded text on non-GTK view peer"
+                chars = value.as_deref().map_or(0, |text| text.chars().count()),
+                "RadioButton.setText: recorded text length on non-GTK view peer"
             ),
             Err(e) => tracing::debug!(
                 target: "android.widget.RadioButton",
@@ -14989,6 +15167,8 @@ const ACTIVITY_IS_IN_MULTI_WINDOW_MODE_NAME: &JNIStr = jni_str!("isInMultiWindow
 const ACTIVITY_IS_IN_MULTI_WINDOW_MODE_SIG: &JNIStr = jni_str!("()Z");
 const ACTIVITY_IS_TASK_ROOT_NAME: &JNIStr = jni_str!("isTaskRoot");
 const ACTIVITY_IS_TASK_ROOT_SIG: &JNIStr = jni_str!("()Z");
+const ACTIVITY_FINISHING_FIELD_NAME: &JNIStr = jni_str!("finishing");
+const BOOLEAN_FIELD_SIG: &JNIStr = jni_str!("Z");
 
 /// One Eclipse-driven Activity instance: a JNI global ref (the identity anchor for
 /// `IsSameObject`) plus whether [`activity_native_finish`] already drove its down-lifecycle.
@@ -16735,16 +16915,23 @@ const WINDOW_FORMAT_RGBA_8888: jint = 1;
 /// (runtime supertype `android.view.SurfaceView`). Returns the current callback count; a thrown Java
 /// exception is described + cleared into a typed [`FrameworkError::Jni`] by [`checked`], never left
 /// pending.
-fn surface_callbacks_size(env: &mut Env, surface_view: &JObject) -> Result<jint, FrameworkError> {
+fn surface_callbacks<'local>(
+    env: &mut Env<'local>,
+    surface_view: &JObject,
+) -> Result<JObject<'local>, FrameworkError> {
     // SAFETY: "Ljava/util/ArrayList;" paired with JavaType::Object is consistent
     // (FieldSignature::from_raw_parts' invariant); `mCallbacks` is a `final ArrayList` field of
     // android.view.SurfaceView (SurfaceView.java:13), the receiver's runtime supertype, so the
     // read is type-correct. JNI reads private/package fields (no Java access check).
     let callbacks_sig = unsafe { FieldSignature::from_raw_parts(ARRAY_LIST_SIG, JavaType::Object) };
-    let callbacks = checked(env, "SurfaceView.mCallbacks get_field", |env| {
+    checked(env, "SurfaceView.mCallbacks get_field", |env| {
         env.get_field(surface_view, jni_str!("mCallbacks"), &callbacks_sig)?
             .l()
-    })?;
+    })
+}
+
+fn surface_callbacks_size(env: &mut Env, surface_view: &JObject) -> Result<jint, FrameworkError> {
+    let callbacks = surface_callbacks(env, surface_view)?;
     checked(env, "SurfaceView.mCallbacks.size", |env| {
         env.call_method(&callbacks, jni_str!("size"), jni_sig!("()I"), &[])?
             .i()
@@ -16922,6 +17109,91 @@ fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, Fra
             tracing::debug!(handle, error = %e, "dispatch_surface_lifecycle: peer not dispatchable (retry)");
             Ok(false)
         }
+    }
+}
+
+/// Close the engine surface lifecycle before the host window can disappear. ATL's vendored
+/// `SurfaceView` exposes private fan-out methods for `surfaceCreated` and `surfaceChanged`, but has
+/// no matching `surfaceDestroyed` method. Waiting for winit to drop the Wayland/X11 window therefore
+/// bypassed every registered `SurfaceHolder.Callback`; libroblox kept rendering through a dead host
+/// surface and faulted immediately after `run_app` returned (measured 2026-07-17).
+///
+/// Snapshot the callback list before invoking app code, matching AOSP's mutation-safe fan-out: a
+/// callback may remove itself while handling destruction without shifting the remaining iteration.
+/// The exact `mSurfaceHolder` object used by the creation path is passed back to every callback.
+/// Each callback is attempted even if an earlier one throws, because the app-shell callback that
+/// synchronously pauses libroblox must never be skipped by an unrelated screenshot callback.
+fn destroy_engine_surface(env: &mut Env) -> Result<bool, FrameworkError> {
+    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
+        return Ok(false);
+    };
+    let surface_view =
+        match view_registry::with_jobject(handle, |global| env.new_local_ref(global.as_obj())) {
+            Ok(Some(Ok(local))) => local,
+            Ok(Some(Err(error))) => return Err(FrameworkError::Jni(error)),
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                tracing::debug!(handle, error = %error, "surface destroy: peer not dispatchable");
+                return Ok(false);
+            }
+        };
+    let callbacks = surface_callbacks(env, &surface_view)?;
+    let snapshot_object = checked(env, "SurfaceView.mCallbacks.toArray", |env| {
+        env.call_method(
+            &callbacks,
+            jni_str!("toArray"),
+            jni_sig!("()[Ljava/lang/Object;"),
+            &[],
+        )?
+        .l()
+    })?;
+    let snapshot = env
+        .cast_local::<JObjectArray>(snapshot_object)
+        .map_err(FrameworkError::Jni)?;
+    let count = snapshot.len(env).map_err(FrameworkError::Jni)?;
+    if count == 0 {
+        return Ok(false);
+    }
+
+    // SAFETY: `mSurfaceHolder` is declared `SurfaceHolder`, so its descriptor paired with
+    // JavaType::Object satisfies FieldSignature::from_raw_parts. `get_field` resolves the real
+    // inherited private field and runtime-checks the receiver.
+    let holder_sig =
+        unsafe { FieldSignature::from_raw_parts(SURFACE_HOLDER_SIG, JavaType::Object) };
+    let holder = checked(env, "SurfaceView.mSurfaceHolder get_field", |env| {
+        env.get_field(&surface_view, jni_str!("mSurfaceHolder"), &holder_sig)?
+            .l()
+    })?;
+
+    let mut first_error = None;
+    for index in 0..count {
+        let callback = match snapshot.get_element(env, index) {
+            Ok(callback) => callback,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(FrameworkError::Jni(error));
+                }
+                continue;
+            }
+        };
+        if let Err(error) = checked(env, "SurfaceHolder.Callback.surfaceDestroyed", |env| {
+            env.call_method(
+                &callback,
+                jni_str!("surfaceDestroyed"),
+                jni_sig!("(Landroid/view/SurfaceHolder;)V"),
+                &[JValue::Object(&holder)],
+            )?
+            .v()
+        }) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(true)
     }
 }
 
@@ -17220,8 +17492,9 @@ fn drive_lifecycle(
     // ATL's stub discarded it; these natives make Eclipse honor it (§6 2026-07-16 💥). Bound here
     // for the same per-declaring-class reason as the WebView natives above, and before step 4.
     register_web_settings_natives(env)?;
-    // 2026-07-09 (plan M4): the CookieManager native surface (get/set/removeAll/flush → the
-    // session-scoped helper cookie store; the CookieProtocol/.ROBLOSECURITY handoff).
+    // 2026-07-09 (plan M4), durable semantics completed 2026-07-17: the CookieManager native
+    // surface (get/set/removeAll/removeSession/flush → the private persistent helper cookie
+    // store; the CookieProtocol/.ROBLOSECURITY handoff).
     register_cookie_manager_natives(env)?;
     // Bind the inflatable android.widget.* property-setter natives on their OWN declaring classes —
     // once each widget's native_constructor (above) lets LayoutInflater build the content view, the
@@ -17518,19 +17791,209 @@ fn drive_activity_down_lifecycle<'local>(
     env: &mut Env<'local>,
     activity: &JObject,
 ) -> Result<(), FrameworkError> {
-    checked(env, "nativeFinish Activity.onPause", |env| {
+    call_activity_on_pause(env, activity, "nativeFinish Activity.onPause")?;
+    call_activity_on_stop(env, activity, "nativeFinish Activity.onStop")?;
+    call_activity_on_destroy(env, activity, "nativeFinish Activity.onDestroy")?;
+    Ok(())
+}
+
+fn call_activity_on_pause<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+    what: &str,
+) -> Result<(), FrameworkError> {
+    checked(env, what, |env| {
         env.call_method(activity, jni_str!("onPause"), jni_sig!("()V"), &[])?
             .v()
-    })?;
-    checked(env, "nativeFinish Activity.onStop", |env| {
+    })
+}
+
+fn call_activity_on_stop<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+    what: &str,
+) -> Result<(), FrameworkError> {
+    checked(env, what, |env| {
         env.call_method(activity, jni_str!("onStop"), jni_sig!("()V"), &[])?
             .v()
-    })?;
-    checked(env, "nativeFinish Activity.onDestroy", |env| {
+    })
+}
+
+fn call_activity_on_destroy<'local>(
+    env: &mut Env<'local>,
+    activity: &JObject,
+    what: &str,
+) -> Result<(), FrameworkError> {
+    checked(env, what, |env| {
         env.call_method(activity, jni_str!("onDestroy"), jni_sig!("()V"), &[])?
             .v()
-    })?;
-    Ok(())
+    })
+}
+
+/// Host-close lifecycle ordering. Production iterates this exact table; the regression test pins
+/// the root-cause boundary (`surfaceDestroyed` after pause, before stop/destroy) without needing a
+/// display server, ART, or libroblox in the test process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostShutdownStep {
+    PauseActivities,
+    DestroyEngineSurface,
+    StopActivities,
+    DestroyActivities,
+}
+
+const HOST_SHUTDOWN_SEQUENCE: [HostShutdownStep; 4] = [
+    HostShutdownStep::PauseActivities,
+    HostShutdownStep::DestroyEngineSurface,
+    HostShutdownStep::StopActivities,
+    HostShutdownStep::DestroyActivities,
+];
+
+/// Drive every live Eclipse-owned Activity down while the host window and its native surface are
+/// still valid. This is the host-window counterpart to [`activity_native_finish`], with one crucial
+/// addition: Android's `SurfaceHolder.Callback.surfaceDestroyed` boundary is delivered between
+/// `onPause` and `onStop`. Roblox's app-shell callback synchronously pauses the native engine there;
+/// skipping it left libroblox workers using a destroyed Wayland surface and produced the measured
+/// close-time SIGSEGV on 2026-07-17.
+///
+/// All live activities are captured newest-first and marked finished before app code runs, so any
+/// already-posted `Activity$2` finish sees the existing exactly-once gate. Their private base
+/// `Activity.finishing` field is set before `onPause`, making app `isFinishing()` branches observe
+/// the real host-close state without invoking Roblox's override of `finish()` (which may call
+/// `System.exit` before orderly native teardown completes). Failures are described/cleared and the
+/// remaining teardown steps still run; the first typed error is returned after best-effort cleanup.
+///
+/// # Errors
+/// Returns [`FrameworkError::NullVm`] for a null VM, [`FrameworkError::Jni`] for the first JNI/Java
+/// failure, [`FrameworkError::ActivityTrackerPoisoned`] if live activities could not be captured,
+/// or [`FrameworkError::Panicked`] if the guarded Rust body panicked.
+pub fn drive_application_shutdown_lifecycle(vm: &Vm) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live process JavaVM from `boot()`, kept alive by `&Vm`; this function is
+    // called synchronously on the same main thread that drove startup and owns the winit loop.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| drive_application_shutdown_inner(env))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+fn drive_application_shutdown_inner(env: &mut Env) -> Result<(), FrameworkError> {
+    let (activities, mut first_error) = snapshot_live_activities_for_shutdown(env);
+    tracing::info!(
+        activities = activities.len(),
+        "host shutdown: driving Android lifecycle before the host window is destroyed"
+    );
+    let mut surface_destroyed = false;
+
+    for step in HOST_SHUTDOWN_SEQUENCE {
+        match step {
+            HostShutdownStep::PauseActivities => {
+                for activity in &activities {
+                    remember_shutdown_error(
+                        &mut first_error,
+                        set_activity_finishing(env, activity),
+                    );
+                    remember_shutdown_error(
+                        &mut first_error,
+                        call_activity_on_pause(env, activity, "host shutdown Activity.onPause"),
+                    );
+                }
+            }
+            HostShutdownStep::DestroyEngineSurface => match destroy_engine_surface(env) {
+                Ok(dispatched) => surface_destroyed = dispatched,
+                Err(error) => remember_shutdown_error(&mut first_error, Err(error)),
+            },
+            HostShutdownStep::StopActivities => {
+                for activity in &activities {
+                    remember_shutdown_error(
+                        &mut first_error,
+                        call_activity_on_stop(env, activity, "host shutdown Activity.onStop"),
+                    );
+                }
+            }
+            HostShutdownStep::DestroyActivities => {
+                for activity in &activities {
+                    remember_shutdown_error(
+                        &mut first_error,
+                        call_activity_on_destroy(env, activity, "host shutdown Activity.onDestroy"),
+                    );
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        activities = activities.len(),
+        surface_destroyed,
+        "host shutdown: Android activity/surface lifecycle completed before window teardown"
+    );
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn snapshot_live_activities_for_shutdown<'local>(
+    env: &mut Env<'local>,
+) -> (Vec<JObject<'local>>, Option<FrameworkError>) {
+    let mut tracker = match TRACKED_ACTIVITIES.lock() {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            tracing::warn!(
+                target: "android.app.Activity",
+                error = %error,
+                "host shutdown: activity tracker poisoned; surface teardown will still run"
+            );
+            return (Vec::new(), Some(FrameworkError::ActivityTrackerPoisoned));
+        }
+    };
+    let mut activities = Vec::new();
+    let mut first_error = None;
+    for entry in tracker.iter_mut().rev().filter(|entry| !entry.finished) {
+        match checked(env, "host shutdown Activity NewLocalRef", |env| {
+            env.new_local_ref(entry.jobject.as_obj())
+        }) {
+            Ok(activity) => {
+                entry.finished = true;
+                activities.push(activity);
+            }
+            Err(error) => remember_shutdown_error(&mut first_error, Err(error)),
+        }
+    }
+    (activities, first_error)
+}
+
+fn set_activity_finishing(env: &mut Env, activity: &JObject) -> Result<(), FrameworkError> {
+    // SAFETY: ATL's base Activity declares `private boolean finishing`; "Z" paired with
+    // Primitive::Boolean is FieldSignature::from_raw_parts' invariant. JNI intentionally bypasses
+    // Java visibility, and set_field runtime-checks the receiver/field before writing.
+    let boolean_sig = unsafe {
+        FieldSignature::from_raw_parts(BOOLEAN_FIELD_SIG, JavaType::Primitive(Primitive::Boolean))
+    };
+    checked(env, "host shutdown Activity.finishing", |env| {
+        env.set_field(
+            activity,
+            ACTIVITY_FINISHING_FIELD_NAME,
+            &boolean_sig,
+            JValue::Bool(true),
+        )
+    })
+}
+
+fn remember_shutdown_error(
+    first_error: &mut Option<FrameworkError>,
+    result: Result<(), FrameworkError>,
+) {
+    if first_error.is_none() {
+        if let Err(error) = result {
+            *first_error = Some(error);
+        }
+    }
 }
 
 /// Errors from the framework lifecycle driver.
@@ -17538,6 +18001,9 @@ fn drive_activity_down_lifecycle<'local>(
 pub enum FrameworkError {
     /// The held VM pointer was null (would violate `JavaVM::from_raw`'s contract).
     NullVm,
+    /// The Activity tracker mutex was poisoned; surface teardown still ran, but Activity callbacks
+    /// could not be captured safely.
+    ActivityTrackerPoisoned,
     /// A JNI/Java-side error (class not found, pending exception, …) — the typed `jni` error.
     Jni(jni::errors::Error),
     /// A Rust panic was caught at the JNI boundary (it must never unwind into ART's C++).
@@ -17552,6 +18018,9 @@ impl fmt::Display for FrameworkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NullVm => f.write_str("framework driver received a null JavaVM pointer"),
+            Self::ActivityTrackerPoisoned => {
+                f.write_str("the framework Activity tracker was poisoned")
+            }
             Self::Jni(e) => write!(f, "JNI error driving the framework lifecycle: {e}"),
             Self::Panicked => {
                 f.write_str("a panic was caught at the framework JNI boundary (not propagated)")
@@ -17568,7 +18037,7 @@ impl std::error::Error for FrameworkError {
             Self::Jni(e) => Some(e),
             Self::WindowRegistry(e) => Some(e),
             Self::ViewRegistry(e) => Some(e),
-            Self::NullVm | Self::Panicked => None,
+            Self::NullVm | Self::ActivityTrackerPoisoned | Self::Panicked => None,
         }
     }
 }
@@ -17600,6 +18069,22 @@ mod tests {
     // `runtime::boot`. It is validated from `main()` via `eclipse run <demo.apk>`. The host-thread-
     // independent data — the encoded recipe — is unit-tested here.
 
+    #[test]
+    fn host_shutdown_destroys_engine_surface_before_window_teardown() {
+        // Regression for the measured close-time libroblox SIGSEGV: production consumes this exact
+        // table, so no refactor can move `surfaceDestroyed` after Activity destruction (or omit it)
+        // without breaking the GPU-free/ART-free pin.
+        assert_eq!(
+            HOST_SHUTDOWN_SEQUENCE,
+            [
+                HostShutdownStep::PauseActivities,
+                HostShutdownStep::DestroyEngineSurface,
+                HostShutdownStep::StopActivities,
+                HostShutdownStep::DestroyActivities,
+            ]
+        );
+    }
+
     /// 2026-07-17: the focused-textbox geometry and its `textInputType` are two fields of ONE
     /// `NativeTextBoxInfo` and MUST be invalidated together.
     ///
@@ -17617,8 +18102,12 @@ mod tests {
     /// does touch process-global statics, so both phases stay in this one function.
     #[test]
     fn record_textbox_session_invalidates_geometry_and_input_type_together() {
-        // A live session records BOTH halves.
-        record_textbox_session(Some((10, 20, 300, 40, 5)));
+        // A live session records identity + geometry + type as ONE snapshot.
+        record_textbox_session(Some(TextboxSession {
+            widget: 41,
+            geometry: (10, 20, 300, 40),
+            input_type: 5,
+        }));
         assert_eq!(textbox_geometry(), Some((10, 20, 300, 40)));
         assert_eq!(textbox_input_type(), 5);
 
@@ -17632,12 +18121,58 @@ mod tests {
             "the mask must not outlive the session that justified it"
         );
 
-        // The username's type (7) must not survive into a later session either — the pair moves as one.
-        record_textbox_session(Some((181, 149, 438, 46, 7)));
+        // The username's type (7) must not survive into a later session either — the snapshot moves
+        // as one, including its widget identity.
+        record_textbox_session(Some(TextboxSession {
+            widget: 42,
+            geometry: (181, 149, 438, 46),
+            input_type: 7,
+        }));
         assert_eq!(textbox_input_type(), 7);
         record_textbox_session(None);
         assert_eq!(textbox_geometry(), None);
         assert_eq!(textbox_input_type(), i32::MIN);
+
+        // Metadata for the username field must never authorize text from the password field. The
+        // pre-fix overlay read these identities independently and combined exactly this mismatch.
+        let username = TextboxSession {
+            widget: 42,
+            geometry: (181, 149, 438, 46),
+            input_type: 7,
+        };
+        assert!(textbox_session_matches_active(username, 42));
+        assert!(!textbox_session_matches_active(username, 43));
+        assert!(!textbox_session_matches_active(username, 0));
+    }
+
+    /// 2026-07-17: every native UI-text writer must log only character counts. A verbose login
+    /// trace exposed that TextView and RadioButton still bound their raw Java strings while the
+    /// Widget/EditText path had already been made length-only. These writers can receive account or
+    /// credential-adjacent content, so a debug level must never weaken the privacy contract.
+    #[test]
+    fn native_ui_text_writers_keep_raw_text_out_of_logs() {
+        let src = include_str!("framework.rs");
+        for marker in [
+            "extern \"system\" fn text_view_native_set_text",
+            "extern \"system\" fn widget_native_set_text",
+            "extern \"system\" fn radio_button_set_text",
+        ] {
+            let start = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing {marker}"));
+            let rest = &src[start..];
+            let end = rest.find("\n///").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("chars = value.as_deref().map_or"),
+                "{marker} must log only the character count"
+            );
+            assert!(
+                !body.contains("\n                text =")
+                    && !body.contains("\n                value ="),
+                "{marker} must never bind raw UI text to a log field"
+            );
+        }
     }
 
     #[test]
@@ -20132,10 +20667,77 @@ mod tests {
             "Max-Age resolves to an absolute future epoch"
         );
 
+        let c = parse_set_cookie("persist=1; Expires=Sun, 06 Nov 1994 08:49:37 GMT; Path=/");
+        assert_eq!(
+            c.expires_epoch_s, 784_111_777,
+            "an HTTP-date expiry must not be mislabeled as a session cookie"
+        );
+        let c = parse_set_cookie("delete=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/");
+        assert_eq!(
+            c.expires_epoch_s, -1,
+            "the explicit Unix epoch must not collide with the session-cookie sentinel"
+        );
+        let c =
+            parse_set_cookie("precedence=1; Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+        assert!(
+            c.expires_epoch_s > 784_111_777,
+            "Max-Age must take precedence over Expires regardless of attribute order"
+        );
+
         // A bare name (no '=') and an empty attribute list.
         let c = parse_set_cookie("justname");
         assert_eq!(c.name, "justname");
         assert_eq!(c.value, "");
+    }
+
+    #[test]
+    fn cookie_manager_url_fixup_matches_androids_relaxed_host_boundary() {
+        // 2026-07-17 root-cause pin: Roblox passed a host/domain where CEF requires a URL, so
+        // every post-login cookie (including the auth token) was rejected as `<non-url>`.
+        assert_eq!(
+            fixup_webview_cookie_url("roblox.com"),
+            CookieUrlFixup {
+                url: "http://roblox.com/".to_string(),
+                implied_domain: None,
+            }
+        );
+        assert_eq!(
+            fixup_webview_cookie_url("roblox.com/account"),
+            CookieUrlFixup {
+                url: "http://roblox.com/account".to_string(),
+                implied_domain: None,
+            }
+        );
+        assert_eq!(
+            fixup_webview_cookie_url("roblox.com:443"),
+            CookieUrlFixup {
+                url: "https://roblox.com:443/".to_string(),
+                implied_domain: None,
+            }
+        );
+        assert_eq!(
+            fixup_webview_cookie_url(".roblox.com"),
+            CookieUrlFixup {
+                url: "http://roblox.com/".to_string(),
+                implied_domain: Some(".roblox.com".to_string()),
+            }
+        );
+        let full = "https://auth.roblox.com/v2/login";
+        assert_eq!(fixup_webview_cookie_url(full).url, full);
+        let invalid = "not a host value";
+        assert_eq!(fixup_webview_cookie_url(invalid).url, invalid);
+
+        // The leading-dot compatibility domain is used only when the cookie did not already carry
+        // an explicit Domain attribute; explicit attributes remain authoritative, as Chromium's
+        // appendDomain implementation requires.
+        let fixed = fixup_webview_cookie_url(".roblox.com");
+        let mut no_domain = parse_set_cookie("session=value; Path=/");
+        no_domain.domain = fixed.implied_domain.expect("compat domain");
+        assert_eq!(no_domain.domain, ".roblox.com");
+        assert_eq!(
+            parse_set_cookie("session=value; Domain=auth.roblox.com").domain,
+            "auth.roblox.com"
+        );
     }
 
     #[test]

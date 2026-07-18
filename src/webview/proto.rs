@@ -1,7 +1,7 @@
 //! Wire protocol for the `eclipse-webview` helper — the NORMATIVE message-set/framing spec
 //! (docs/web-engine-plan.md M2 keeps only the summary; this file is the source of truth).
-//! The negotiated version is [`super::PROTO_VERSION`] — v2 since the 2026-07-09 M4 additive
-//! extension; the v1 baseline below stays FROZEN.
+//! The negotiated version is [`super::PROTO_VERSION`] — v3 since the 2026-07-17 durable-cookie
+//! extension; the v1/v2 baselines below stay FROZEN.
 //!
 //! 2026-07-03: an owned, std-only protocol over ONE `SOCK_STREAM` `UnixStream` (the control
 //! socket from the spawn contract in [`super`]) — no tokio, no async runtime; blocking
@@ -20,12 +20,20 @@
 //! The v2 extension adds seven message types in the disjoint 0x11+ (consumer) / 0x89+ (helper)
 //! ranges for the JS bridge, eval-with-result, and cookie-with-result surfaces. Every v1 message
 //! LAYOUT is untouched (byte-identical, FROZEN); the only change to v1 is the `Hello`/`HelloAck`
-//! version integer ([`super::PROTO_VERSION`], now 2 — the exact-match negotiation channel). An old
+//! version integer ([`super::PROTO_VERSION`], now 3 — the exact-match negotiation channel). An old
 //! v1 peer rejects a v2 type byte as [`ProtoError::UnknownType`] and never mis-decodes it, and the
 //! handshake version gate keeps a mismatched peer from ever exchanging v2 frames in the first
 //! place (it fails loudly-and-honestly instead). The v2 opaque-JSON fields
 //! (`BridgeCall::payload_json`, `BridgeResult::result_json`, `Evaluate*::script`/`value_json`) are
 //! never parsed or logged by the helper — only ART produces/consumes them.
+//!
+//! # v3 (2026-07-17) — ADDITIVE
+//!
+//! The v3 extension adds `CookieFlush`/`CookieFlushDone` plus
+//! `CookiesClearSession`/`CookiesClearDone` in the next disjoint type-byte slots. These are the
+//! completion and scope boundaries required once the helper's cookie store became persistent:
+//! Android `flush()` must wait for CEF, and `removeSessionCookies()` must not erase persistent
+//! cookies. Every v1/v2 message layout remains byte-identical.
 //!
 //! **Exact-length reads only:** the decoder reads exactly the bytes each frame declares and
 //! NEVER buffers ahead — the byte after a decoded [`HelperMsg::FrameBufferNew`] frame is the
@@ -94,6 +102,9 @@ mod ct {
     pub(super) const BRIDGE_RESULT: u8 = 0x12;
     pub(super) const EVALUATE_JS_FOR_RESULT: u8 = 0x13;
     pub(super) const COOKIE_SET_FOR_RESULT: u8 = 0x14;
+    // --- v3 (durable CookieManager.flush, additive) ---
+    pub(super) const COOKIE_FLUSH: u8 = 0x15;
+    pub(super) const COOKIES_CLEAR_SESSION: u8 = 0x16;
 }
 
 /// Helper→consumer type bytes. v1 = 0x81–0x88 (FROZEN); the additive v2 extension claims 0x89+.
@@ -110,6 +121,9 @@ mod ht {
     pub(super) const BRIDGE_CALL: u8 = 0x89;
     pub(super) const EVALUATE_JS_RESULT: u8 = 0x8A;
     pub(super) const COOKIE_SET_RESULT: u8 = 0x8B;
+    // --- v3 (durable CookieManager.flush, additive) ---
+    pub(super) const COOKIE_FLUSH_DONE: u8 = 0x8C;
+    pub(super) const COOKIES_CLEAR_DONE: u8 = 0x8D;
 }
 
 /// Typed protocol error. Deliberately PAYLOAD-FREE: variants carry the type byte, declared
@@ -261,7 +275,7 @@ impl Console {
     }
 }
 
-/// Consumer→helper messages (type bytes 0x01–0x10).
+/// Consumer→helper messages (type bytes 0x01–0x16).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsumerMsg {
     /// 0x01 — MUST be the first frame on the stream. The magic is implicit (written at
@@ -338,7 +352,7 @@ pub enum ConsumerMsg {
     },
     /// 0x0D — solicits a [`HelperMsg::CookieList`] correlated by `request_id`.
     CookieGet { request_id: u32, url: String },
-    /// 0x0E — solicits an empty [`HelperMsg::CookieList`] (completion) by `request_id`.
+    /// 0x0E — delete every cookie and solicit [`HelperMsg::CookiesClearDone`].
     CookiesClear { request_id: u32 },
     /// 0x0F — releases the published slot named by the matching [`HelperMsg::FrameReady`].
     FrameAck {
@@ -387,9 +401,15 @@ pub enum ConsumerMsg {
         http_only: bool,
         expires_epoch_s: i64,
     },
+    /// 0x15 — flush the persistent cookie store and answer with
+    /// [`HelperMsg::CookieFlushDone`] after CEF's completion callback fires.
+    CookieFlush { request_id: u32 },
+    /// 0x16 — delete only cookies without an expiration date and solicit
+    /// [`HelperMsg::CookiesClearDone`].
+    CookiesClearSession { request_id: u32 },
 }
 
-/// Helper→consumer messages (type bytes 0x81–0x88).
+/// Helper→consumer messages (type bytes 0x81–0x8D).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperMsg {
     /// 0x81 — MUST be the first frame on the stream. `engine` names the backing engine,
@@ -443,7 +463,7 @@ pub enum HelperMsg {
     /// exact-match versioning; the reverse direction (M5 consumer + M4 helper's legacy code 0)
     /// is handled and unit-pinned in `client.rs`.
     Crash { view: i64, kind: u8, code: i32 },
-    /// 0x87 — the solicited reply to `CookieGet`/`CookiesClear`, correlated by `request_id`.
+    /// 0x87 — the solicited reply to `CookieGet`, correlated by `request_id`.
     CookieList {
         request_id: u32,
         cookies: Vec<CookieEntry>,
@@ -471,6 +491,12 @@ pub enum HelperMsg {
     /// 0x8B — the REAL completion of a [`ConsumerMsg::CookieSetForResult`], correlated by
     /// `request_id` (`ok` is the cookie manager's actual success flag).
     CookieSetResult { request_id: u32, ok: bool },
+    /// 0x8C — completion of [`ConsumerMsg::CookieFlush`]. `ok=false` means CEF refused to
+    /// schedule the flush; Android's void API cannot surface it, but Eclipse logs it honestly.
+    CookieFlushDone { request_id: u32, ok: bool },
+    /// 0x8D — completion of either cookie-clear operation. `removed` is CEF's real
+    /// "at least one cookie was removed" result, matching Android's callback contract.
+    CookiesClearDone { request_id: u32, removed: bool },
 }
 
 /// Which side's message set a decoder expects (the two type-byte namespaces are disjoint,
@@ -506,7 +532,9 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ct::FRAME_ACK
             | ct::SHUTDOWN
             | ct::BRIDGE_REGISTER
-            | ct::COOKIE_SET_FOR_RESULT => Some(DEFAULT_CAP),
+            | ct::COOKIE_SET_FOR_RESULT
+            | ct::COOKIE_FLUSH
+            | ct::COOKIES_CLEAR_SESSION => Some(DEFAULT_CAP),
             _ => None,
         },
         Dir::FromHelper => match type_byte {
@@ -521,7 +549,9 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ht::CRASH
             | ht::COOKIE_LIST
             | ht::VIEW_CLOSED
-            | ht::COOKIE_SET_RESULT => Some(DEFAULT_CAP),
+            | ht::COOKIE_SET_RESULT
+            | ht::COOKIE_FLUSH_DONE
+            | ht::COOKIES_CLEAR_DONE => Some(DEFAULT_CAP),
             _ => None,
         },
     }
@@ -796,6 +826,14 @@ impl ConsumerMsg {
                 put_i64(&mut b, *expires_epoch_s);
                 ct::COOKIE_SET_FOR_RESULT
             }
+            Self::CookieFlush { request_id } => {
+                put_u32(&mut b, *request_id);
+                ct::COOKIE_FLUSH
+            }
+            Self::CookiesClearSession { request_id } => {
+                put_u32(&mut b, *request_id);
+                ct::COOKIES_CLEAR_SESSION
+            }
         };
         compose_frame(Dir::FromConsumer, t, b)
     }
@@ -909,6 +947,19 @@ impl HelperMsg {
                 put_u32(&mut b, *request_id);
                 put_bool(&mut b, *ok);
                 ht::COOKIE_SET_RESULT
+            }
+            Self::CookieFlushDone { request_id, ok } => {
+                put_u32(&mut b, *request_id);
+                put_bool(&mut b, *ok);
+                ht::COOKIE_FLUSH_DONE
+            }
+            Self::CookiesClearDone {
+                request_id,
+                removed,
+            } => {
+                put_u32(&mut b, *request_id);
+                put_bool(&mut b, *removed);
+                ht::COOKIES_CLEAR_DONE
             }
         };
         compose_frame(Dir::FromHelper, t, b)
@@ -1254,6 +1305,12 @@ pub fn read_consumer_msg<R: Read>(r: &mut R) -> Result<ConsumerMsg, ProtoError> 
             http_only: b.bool()?,
             expires_epoch_s: b.i64()?,
         },
+        ct::COOKIE_FLUSH => ConsumerMsg::CookieFlush {
+            request_id: b.u32()?,
+        },
+        ct::COOKIES_CLEAR_SESSION => ConsumerMsg::CookiesClearSession {
+            request_id: b.u32()?,
+        },
         // read_frame validated the type byte against this direction's cap table already.
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
@@ -1410,6 +1467,14 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
         ht::COOKIE_SET_RESULT => HelperMsg::CookieSetResult {
             request_id: b.u32()?,
             ok: b.bool()?,
+        },
+        ht::COOKIE_FLUSH_DONE => HelperMsg::CookieFlushDone {
+            request_id: b.u32()?,
+            ok: b.bool()?,
+        },
+        ht::COOKIES_CLEAR_DONE => HelperMsg::CookiesClearDone {
+            request_id: b.u32()?,
+            removed: b.bool()?,
         },
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
@@ -1933,6 +1998,53 @@ mod tests {
             let decoded = read_helper_msg(&mut r).expect("decode");
             assert_eq!(&decoded, m);
             assert_eq!(decoded.encode().expect("re-encode"), m.encode().unwrap());
+        }
+        assert_eq!(read_helper_msg(&mut r), Err(ProtoError::Eof));
+    }
+
+    #[test]
+    fn proto_roundtrip_encodes_and_decodes_every_v3_message() {
+        // 2026-07-17: the separate v1/v2 pins above freeze every older layout while this test pins
+        // exactly the four additive v3 type bytes and fields.
+        let consumer = [
+            ConsumerMsg::CookieFlush {
+                request_id: u32::MAX,
+            },
+            ConsumerMsg::CookiesClearSession { request_id: 7 },
+        ];
+        let helper = [
+            HelperMsg::CookieFlushDone {
+                request_id: u32::MAX,
+                ok: true,
+            },
+            HelperMsg::CookiesClearDone {
+                request_id: 7,
+                removed: false,
+            },
+        ];
+        assert_eq!(consumer.len() + helper.len(), 4, "v3 adds exactly 4 types");
+
+        let mut stream = Vec::new();
+        for msg in &consumer {
+            stream.extend_from_slice(&msg.encode().expect("encode consumer v3"));
+        }
+        assert_eq!(stream[4], ct::COOKIE_FLUSH);
+        assert_eq!(stream[13], ct::COOKIES_CLEAR_SESSION);
+        let mut r = stream.as_slice();
+        for msg in &consumer {
+            assert_eq!(read_consumer_msg(&mut r).expect("decode consumer v3"), *msg);
+        }
+        assert_eq!(read_consumer_msg(&mut r), Err(ProtoError::Eof));
+
+        let mut stream = Vec::new();
+        for msg in &helper {
+            stream.extend_from_slice(&msg.encode().expect("encode helper v3"));
+        }
+        assert_eq!(stream[4], ht::COOKIE_FLUSH_DONE);
+        assert_eq!(stream[14], ht::COOKIES_CLEAR_DONE);
+        let mut r = stream.as_slice();
+        for msg in &helper {
+            assert_eq!(read_helper_msg(&mut r).expect("decode helper v3"), *msg);
         }
         assert_eq!(read_helper_msg(&mut r), Err(ProtoError::Eof));
     }

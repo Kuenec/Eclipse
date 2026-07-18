@@ -27,5 +27,5 @@ pub mod slots;
 
 /// Wire-protocol version — MUST mirror `src/webview/mod.rs::PROTO_VERSION` (the sibling-shape
 /// invariant above; `proto.rs` resolves it as `super::PROTO_VERSION` in both crates).
-/// 2026-07-09 (plan M4): 2 for the additive v2 extension; kept in exact lockstep with the root.
-pub const PROTO_VERSION: u16 = 2;
+/// 2026-07-17: 3 for the additive durable-cookie extension; kept in exact lockstep with the root.
+pub const PROTO_VERSION: u16 = 3;

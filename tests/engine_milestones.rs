@@ -231,7 +231,7 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
     // Display marker (main.rs::WebViewTestReport): "WebView engine pipeline OK:
     // internalLoadChanged upcalls 2/2 (state 0 @ Xms, state 3 @ Yms, http Z), frame WxH N
     // distinct pixels, bridge round-trip OK, evaluateJavascript OK, honest UA OK, cookie set/get
-    // OK, cookie callback OK, ViewClosed, helper exit 0, bound=5". "upcalls 2/2" is load-bearing
+    // OK, cookie callback OK, cookie flush OK, ViewClosed, helper exit 0, bound=5". "upcalls 2/2" is load-bearing
     // (SUCCESSFUL Java dispatches of the internalLoadChanged seam); the M4 substrings prove the JS
     // bridge round-trip, evaluateJavascript result routing, the honest UA, and cookie set/get + the
     // real (non-fabricated) 3-arg setCookie callback. The marker is payload-free by construction.
@@ -245,6 +245,7 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
         "honest UA OK",
         "cookie set/get OK",
         "cookie callback OK",
+        "cookie flush OK",
     ] {
         assert!(
             text.contains(needle),
@@ -293,6 +294,30 @@ fn root_lockfile_stays_cef_free() {
             !lock.contains(package),
             "the root Cargo.lock gained a CEF package entry ({package}) — the engine must stay \
              confined to the workspace-detached crates/eclipse-webview helper"
+        );
+    }
+}
+
+/// 2026-07-17: the current client calls Android's API-level-1
+/// `LocationManager.isProviderEnabled(String)` from three SDK paths. ATL's installed class omits it,
+/// and Backtrace's watchdog lets the resulting `NoSuchMethodError` reach Roblox's process-fatal
+/// uncaught handler (`System.exit(10)`) before login becomes interactive. The overlay generator is
+/// the durable source of the Java-level fix, so pin all three contract pieces without requiring a
+/// local ART/toolchain install: method present, null rejected like AOSP, and ATL's advertised-empty
+/// provider set answered disabled rather than fabricating GPS support.
+#[test]
+fn framework_overlay_preserves_location_manager_provider_query_contract() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        ".method public isProviderEnabled(Ljava/lang/String;)Z",
+        "Ljava/lang/IllegalArgumentException;-><init>(Ljava/lang/String;)V",
+        ":eclipse_location_provider_non_null",
+        "cp \"$lmsm\" \"$work/smali-view/android/location/LocationManager.smali\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost LocationManager provider-query contract fragment {needle:?}; \
+             the current client would regress to NoSuchMethodError/System.exit(10)"
         );
     }
 }
