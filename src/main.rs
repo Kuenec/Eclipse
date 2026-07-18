@@ -34,9 +34,22 @@ STATUS:
 ";
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("run") | Some("__webview-test")
+    ) {
+        // 2026-07-17: do this before diagnostics or the WebView smoke's loopback server can create
+        // any thread. A self-contained patched ART overlay must set one immutable BOOTCLASSPATH so
+        // ATL's separately exec'd dex2oat children reopen the same patched jars as the parent VM.
+        if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
+            eprintln!("eclipse ART startup: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     eclipse::diagnostics::init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     tracing::debug!(
         version = eclipse::VERSION,
         command = args.first(),
@@ -47,13 +60,16 @@ fn main() -> ExitCode {
             println!("eclipse {}", eclipse::VERSION);
             ExitCode::SUCCESS
         }
-        Some("run") => match run_apk(args.get(1).map(String::as_str)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("eclipse run: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("run") => {
+            let status = match run_apk(args.get(1).map(String::as_str)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("eclipse run: {e}");
+                    1
+                }
+            };
+            finish_android_process(status)
+        }
         Some("config") => match show_config() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -174,6 +190,27 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Finish the process that hosted Android without running host C/C++ exit handlers.
+///
+/// Android's process model does not unload an app's initialized native libraries or run their
+/// global destructors after `Activity.onDestroy`; the OS reclaims the process. Roblox likewise
+/// leaves native and ART workers alive after its blocking destroy returns. On 2026-07-17 a normal
+/// libc `exit` called a `libroblox.so` `atexit` handler after that completed destroy, and the foreign
+/// handler deliberately aborted. Eclipse therefore completes every owned boundary first (Android
+/// lifecycle, render surface, WebView helper), flushes its Rust output, and uses POSIX `_exit` as
+/// the final process boundary. The libc wrapper terminates every thread and skips `atexit` handlers.
+fn finish_android_process(status: libc::c_int) -> ! {
+    use std::io::Write as _;
+
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+
+    // SAFETY: this is the launcher main thread's terminal action after `run_apk` has either
+    // completed all owned shutdown boundaries or reported its setup error. No Rust or foreign
+    // state is accessed afterward; the process and all its threads must terminate together.
+    unsafe { libc::_exit(status) }
 }
 
 /// Print the effective configuration (file values merged over defaults) and its path.
@@ -367,13 +404,14 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
 
     // Route the app's x86_64 JNI libs through Eclipse's OWN Rust loader (NOT the apkenv shim linker,
     // which aborts on their modern relocs — R_X86_64_TPOFF64). Each is mapped + relocated + fully
-    // resolved + init-run + (if it exports JNI_OnLoad) handed the REAL ART JavaVM. The returned images
-    // are BOUND for the process lifetime (libroblox spawns workers that execute the mapped text).
+    // resolved + init-run + (if it exports JNI_OnLoad) handed the REAL ART JavaVM. The returned
+    // descriptors own process-lifetime/no-drop images: libroblox spawns workers that continue to
+    // execute mapped text after Android's lifecycle has stopped.
     // Skipped entirely for APKs without lib/x86_64/libroblox.so (e.g. the pure-Java demo_app), so the
     // demo lifecycle path is unchanged. Runs on this (main) thread, VM alive + JNI-attached, BEFORE the
     // lifecycle drives Roblox's onCreate (where androidx.startup would call System.loadLibrary for
     // libroblox AND zstd-jni — both now already loaded here, so neither falls to apkenv).
-    let _engines =
+    let _preloaded_libs =
         preload_app_native_libs(&mut apk, std::path::Path::new(apk_path), &app_lib_dir, &vm)?;
 
     // Drive the confirmed lifecycle recipe on this (main) thread, with the VM alive: wrap the held VM
@@ -409,10 +447,11 @@ const ENGINE_FILENAME: &str = "libroblox.so";
 /// Pre-load the app's x86-64 JNI libs through Eclipse's own Rust loader (map, relocate, resolve, init,
 /// `JNI_OnLoad`), so each is already loaded — and its native methods registered — BEFORE the framework
 /// lifecycle, instead of falling to ART's `Runtime.nativeLoad` → the apkenv shim linker (which aborts
-/// on their modern relocations). Returns the persistent
-/// [`PreloadedLib`](eclipse::loader::engine::PreloadedLib)s the caller binds for the process lifetime,
-/// or an empty `Vec` for an APK without `lib/x86_64/libroblox.so` (pure-Java demo APKs keep the
-/// framework-only path — no regression).
+/// on their modern relocations). Returns process-lifetime
+/// [`PreloadedLib`](eclipse::loader::engine::PreloadedLib) descriptors, or an empty `Vec` for an APK
+/// without `lib/x86_64/libroblox.so` (pure-Java demo APKs keep the framework-only path — no
+/// regression). Each descriptor structurally prevents its initialized image from being unmapped by
+/// lexical scope teardown; dropping the `Vec` releases metadata only.
 ///
 /// `libroblox` is loaded FIRST and is **mandatory** (its workers + `JNI_OnLoad` are load-bearing; a
 /// failure aborts the boot). The remaining libs (e.g. `libzstd-jni`, which `androidx.startup` loads in
@@ -514,6 +553,7 @@ impl std::fmt::Display for WebViewTestReport {
             "WebView engine pipeline OK: internalLoadChanged upcalls {}/2 (state 0 @ {}ms, \
              state 3 @ {}ms, http {}), frame {}x{} {} distinct pixels, bridge round-trip OK, \
              evaluateJavascript OK, honest UA OK, cookie set/get OK, cookie callback OK, \
+             cookie flush OK, \
              ViewClosed, helper exit 0, bound=5",
             self.upcalls_ok,
             self.started_ms,
@@ -797,8 +837,15 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         }
     }
 
-    // Cookie leg: 2-arg setCookie then getCookie round-trips through the session store; the 3-arg
-    // setCookie's REAL callback fires (Boolean.TRUE — never fabricated). Cookie values not printed.
+    // Cookie leg: optionally prove a prior helper process's session cookie was restored BEFORE
+    // writing this run's value, then exercise set/get, the real 3-arg callback, and blocking flush.
+    if std::env::var("ECLIPSE_WEBVIEW_EXPECT_PERSISTED_TEST_COOKIE").as_deref() == Ok("1") {
+        let restored = framework::cookie_manager_get_cookie(&vm, &target_url);
+        if !restored.contains("ECLIPSE_TEST=1") {
+            return Err("persistent-cookie probe did not restore ECLIPSE_TEST before this process's setCookie".into());
+        }
+        println!("# persisted cookie restored OK (value not printed)");
+    }
     framework::cookie_manager_set_cookie(&vm, &target_url, "ECLIPSE_TEST=1; Path=/")
         .map_err(|e| format!("CookieManager.setCookie(2-arg) failed: {e}"))?;
     let cookie_deadline = Instant::now() + LEG_DEADLINE;
@@ -834,6 +881,8 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         );
     }
     println!("# cookie callback OK (real Boolean.TRUE, not fabricated)");
+    framework::cookie_manager_flush(&vm).map_err(|e| format!("CookieManager.flush failed: {e}"))?;
+    println!("# cookie flush OK (CEF persistent-store completion boundary returned)");
 
     // CloseView → ViewClosed (the entry disappears), then Shutdown → helper exit 0.
     client::close_view(handle).map_err(|e| format!("CloseView send failed: {e}"))?;
@@ -880,4 +929,44 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
         None => "lazy natives (no JNI_OnLoad)".to_string(),
     };
     println!("  {} ✓ ({ctors}; {onload})", lib.soname);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_android_process;
+
+    const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
+
+    extern "C" fn abort_if_atexit_runs() {
+        std::process::abort();
+    }
+
+    #[test]
+    fn android_process_exit_skips_unsafe_foreign_atexit_handlers() {
+        if std::env::var_os(RAW_EXIT_CHILD).is_some() {
+            // SAFETY: the callback has the required C ABI and static lifetime. This child process
+            // exists solely to prove that `finish_android_process` bypasses the registered handler.
+            let registered = unsafe { libc::atexit(abort_if_atexit_runs) };
+            assert_eq!(registered, 0, "the child must register its atexit sentinel");
+            finish_android_process(0);
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test harness executable must have a path"),
+        )
+        .args([
+            "--exact",
+            "tests::android_process_exit_skips_unsafe_foreign_atexit_handlers",
+        ])
+        .env(RAW_EXIT_CHILD, "1")
+        .output()
+        .expect("the raw-exit child must start");
+
+        assert!(
+            output.status.success(),
+            "the raw-exit child ran an atexit handler: status={:?}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

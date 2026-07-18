@@ -569,20 +569,63 @@ fn resolve_field_rect(
     })
 }
 
-/// The focused field's on-screen rect: the engine's LIVE `NativeTextBoxInfo` geometry (cached by the main
-/// thread via `framework::textbox_geometry`) so the overlay text lands where the field actually is (the
-/// login layout drifts). `None` = no live field ⇒ nothing to draw.
-fn field_rect(extent: vk::Extent2D) -> Option<vk::Rect2D> {
-    // Diagnostic: ECLIPSE_VK_SCREENSHOT → capture the WHOLE frame (the probe then writes a full-screen
-    // PNG so the dev host can see the current UI + find drifted button/field positions).
+/// Whether the probe should capture the whole surface instead of its normal field-sized diagnostic
+/// rect. This must affect readback only; it must never become the text overlay's draw rectangle.
+fn screenshot_enabled() -> bool {
     static SHOT: OnceLock<bool> = OnceLock::new();
-    if *SHOT.get_or_init(|| std::env::var_os("ECLIPSE_VK_SCREENSHOT").is_some()) {
-        return Some(vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        });
+    *SHOT.get_or_init(|| std::env::var_os("ECLIPSE_VK_SCREENSHOT").is_some())
+}
+
+fn full_surface_rect(extent: vk::Extent2D) -> Option<vk::Rect2D> {
+    if extent.width == 0 || extent.height == 0 {
+        return None;
     }
-    resolve_field_rect(crate::framework::textbox_geometry(), extent)
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent,
+    })
+}
+
+/// Select the ONE rectangle for this text/probe pass.
+///
+/// A text draw is authorized only by a coherent live textbox geometry and always uses that geometry.
+/// Probe-only readback may instead use the full surface or the historical calibration rect. Keeping
+/// these branches disjoint fixes the 2026-07-17 privacy failure where `ECLIPSE_VK_SCREENSHOT=1`
+/// expanded a password overlay to 800×600 and rendered the credential hundreds of pixels tall.
+fn select_text_probe_rect(
+    geometry: Option<(i32, i32, u32, u32)>,
+    extent: vk::Extent2D,
+    drawing_text: bool,
+    probing: bool,
+    full_screenshot: bool,
+) -> Option<vk::Rect2D> {
+    let live = resolve_field_rect(geometry, extent);
+    if drawing_text {
+        return live;
+    }
+    if !probing {
+        return None;
+    }
+    if full_screenshot {
+        return full_surface_rect(extent);
+    }
+    live.or_else(|| {
+        let rect = login_field_rect(extent);
+        (rect.extent.width != 0 && rect.extent.height != 0).then_some(rect)
+    })
+}
+
+/// Convert live field text to what may be composited. Input type `7` is the measured plain-text
+/// username type; every other value, including unknown/no metadata, fails closed to bullets. The
+/// previous `type == 5` check failed open after Roblox cleared the secure field's metadata while its
+/// `EditText` text remained cached, exposing the temporary password in the probe boot.
+fn mask_overlay_text(text: &str, input_type: i32) -> String {
+    const MEASURED_PLAIN_TEXT_INPUT_TYPE: i32 = 7;
+    if input_type == MEASURED_PLAIN_TEXT_INPUT_TYPE {
+        text.to_owned()
+    } else {
+        "\u{2022}".repeat(text.chars().count())
+    }
 }
 
 /// Find the index of the engine's `our_sc` swapchain in the present info + the image index it presents.
@@ -809,6 +852,7 @@ impl Probe {
         image_raw: u64,
         engine_waits: &[vk::Semaphore],
         draw_text: Option<&str>,
+        write_probe: bool,
     ) -> bool {
         let image = vk::Image::from_raw(image_raw);
         let range = vk::ImageSubresourceRange::default()
@@ -989,51 +1033,55 @@ impl Probe {
                     }
                 }
             }
-            let w = self.rect.extent.width as usize;
-            let h = self.rect.extent.height as usize;
-            let size = w * h * 4;
-            // Compositor-independent screenshot: write a PNG of the captured rect EVERY capture (so it
-            // reflects the CURRENT frame — `grim` can't reach the buried window). Force alpha opaque.
-            {
-                let data = std::slice::from_raw_parts(self.mapped, size);
-                let mut png_rgba = data.to_vec();
-                for px in png_rgba.chunks_exact_mut(4) {
-                    px[3] = 255;
-                }
-                let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
-                let _ = std::fs::write("/tmp/eclipse_field_probe.png", png);
-            }
-            // Analyze the readback into an ASCII ink-profile sparkline (light glyphs on the dark field).
-            // Rate-limited (~once/sec) so per-frame overlay drawing doesn't spam the log.
-            static LOG_TICK: AtomicU64 = AtomicU64::new(0);
-            if !LOG_TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
-                return true;
-            }
-            let data = std::slice::from_raw_parts(self.mapped, size);
-            const BUCKETS: usize = 64;
-            let mut col_ink = [0u32; BUCKETS];
-            let mut total_ink = 0u32;
-            let (y0, y1) = (h * 3 / 10, h * 7 / 10); // middle band → the text row, not the borders
-            for y in y0..y1 {
-                for x in 0..w {
-                    let i = (y * w + x) * 4;
-                    let lum =
-                        (u32::from(data[i]) + u32::from(data[i + 1]) + u32::from(data[i + 2])) / 3;
-                    if lum > 90 {
-                        total_ink += 1;
-                        col_ink[x * BUCKETS / w] += 1;
+            if write_probe {
+                let w = self.rect.extent.width as usize;
+                let h = self.rect.extent.height as usize;
+                let size = w * h * 4;
+                // Explicit diagnostic only: normal overlay drawing must never persist a credential
+                // field image to `/tmp`. Force alpha opaque for the compositor-independent PNG.
+                {
+                    let data = std::slice::from_raw_parts(self.mapped, size);
+                    let mut png_rgba = data.to_vec();
+                    for px in png_rgba.chunks_exact_mut(4) {
+                        px[3] = 255;
                     }
+                    let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
+                    let _ = std::fs::write("/tmp/eclipse_field_probe.png", png);
+                }
+                // Analyze only under the same explicit probe gate. Even a masked field's ink profile
+                // can disclose credential length; a normal boot emits no such diagnostic.
+                static LOG_TICK: AtomicU64 = AtomicU64::new(0);
+                if LOG_TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
+                    let data = std::slice::from_raw_parts(self.mapped, size);
+                    const BUCKETS: usize = 64;
+                    let mut col_ink = [0u32; BUCKETS];
+                    let mut total_ink = 0u32;
+                    let (y0, y1) = (h * 3 / 10, h * 7 / 10);
+                    for y in y0..y1 {
+                        for x in 0..w {
+                            let i = (y * w + x) * 4;
+                            let lum = (u32::from(data[i])
+                                + u32::from(data[i + 1])
+                                + u32::from(data[i + 2]))
+                                / 3;
+                            if lum > 90 {
+                                total_ink += 1;
+                                col_ink[x * BUCKETS / w] += 1;
+                            }
+                        }
+                    }
+                    let max = col_ink.iter().copied().max().unwrap_or(1).max(1);
+                    let levels = [' ', '.', ':', '-', '=', '+', '*', '#', '@'];
+                    let spark: String = col_ink
+                        .iter()
+                        .map(|&c| {
+                            levels[(c as usize * (levels.len() - 1) / max as usize)
+                                .min(levels.len() - 1)]
+                        })
+                        .collect();
+                    tracing::info!(total_ink, "vk-overlay field-probe ink |{spark}|");
                 }
             }
-            let max = col_ink.iter().copied().max().unwrap_or(1).max(1);
-            let levels = [' ', '.', ':', '-', '=', '+', '*', '#', '@'];
-            let spark: String = col_ink
-                .iter()
-                .map(|&c| {
-                    levels[(c as usize * (levels.len() - 1) / max as usize).min(levels.len() - 1)]
-                })
-                .collect();
-            tracing::info!(total_ink, "vk-overlay field-probe ink |{spark}|");
         }
         true
     }
@@ -1555,43 +1603,54 @@ unsafe fn present_with_overlay(
         }
     }
 
-    // Field-readback probe takes priority over the draw: copy the field rect out of the presented image,
-    // write the PNG, then present with the engine wait semaphores cleared (the probe submit consumed +
-    // fence-waited them). Rate-limited — the readback fence-wait stalls the queue, so do it ~twice/sec.
+    // Text overlay / explicit field-readback probe. Text is authorized only by one coherent snapshot
+    // that binds the active widget, geometry, input type, and text. Probe-only capture may use a wider
+    // diagnostic rect, but that rect can never authorize or position a text draw.
     if probe_enabled() || overlay_enabled() {
-        // Text to draw onto the field: the focused field's live text (when overlay enabled), or a
-        // hardcoded test string (env `ECLIPSE_VK_TEXT_TEST`) so the render path can be verified without a
-        // focused field. `None` → readback-only (probe diagnostic).
-        let draw_text: Option<String> = if overlay_enabled() {
-            crate::framework::active_text_field_text()
-                .filter(|s| !s.is_empty())
-                .or_else(|| std::env::var("ECLIPSE_VK_TEXT_TEST").ok())
+        let live = if overlay_enabled() {
+            crate::framework::active_text_overlay().filter(|overlay| !overlay.text.is_empty())
         } else {
             None
         };
-        // SECURITY: a password field (engine `textInputType == 5`, confirmed live: the login password
-        // step) must NEVER render plaintext — mask it to one `•` per character. (Username is type 7.)
-        const SECURE_INPUT_TYPE: i32 = 5;
-        let draw_text = draw_text.map(|s| {
-            if crate::framework::textbox_input_type() == SECURE_INPUT_TYPE {
-                "\u{2022}".repeat(s.chars().count())
-            } else {
-                s
-            }
-        });
+        let text_test = live
+            .is_none()
+            .then(|| std::env::var("ECLIPSE_VK_TEXT_TEST").ok())
+            .flatten();
+        let (draw_text, geometry) = if let Some(overlay) = live {
+            (
+                Some(mask_overlay_text(&overlay.text, overlay.input_type)),
+                Some(overlay.geometry),
+            )
+        } else if let Some(text) = text_test {
+            // Explicit developer test: no credential source is involved. Keep its historical
+            // field-sized placement even when the full-frame screenshot diagnostic is also enabled.
+            let rect = login_field_rect(extent);
+            (
+                Some(text),
+                Some((
+                    rect.offset.x,
+                    rect.offset.y,
+                    rect.extent.width,
+                    rect.extent.height,
+                )),
+            )
+        } else {
+            (None, crate::framework::textbox_geometry())
+        };
         // Run on EVERY present when overlay-drawing (else the text flickers — the engine repaints the
         // field each frame) or when probing (so the PNG/sparkline reflect the CURRENT frame, not a stale
         // one). The readback fence-wait stalls the queue, but this only runs under the env-gated overlay/
         // probe (never in a normal/gameplay boot). No active field + not probing → plain present.
         let run = image_raw != 0 && (draw_text.is_some() || probe_enabled());
-        // 2026-07-17: ...and even then, only where the engine says the field IS. `None` = no live
-        // textbox session ⇒ draw NOTHING (see `resolve_field_rect`); the hardcoded login rect survives
-        // only for the env-gated probe, which must still read a frame back with no field focused.
-        // Resolved INSIDE `run` so a live-WebView present with no focused field keeps costing zero
-        // (`field_rect` takes the geometry lock — §2.4: no per-frame work off the trigger).
         if let Some(rect) = run
             .then(|| {
-                field_rect(extent).or_else(|| probe_enabled().then(|| login_field_rect(extent)))
+                select_text_probe_rect(
+                    geometry,
+                    extent,
+                    draw_text.is_some(),
+                    probe_enabled(),
+                    screenshot_enabled(),
+                )
             })
             .flatten()
         {
@@ -1603,7 +1662,13 @@ unsafe fn present_with_overlay(
                 Ok(guard) => match guard.as_ref() {
                     // SAFETY: probe objects are on the engine's device; `queue`/the waits are the engine's.
                     Some(p) => unsafe {
-                        p.capture(queue, image_raw, field_waits, draw_text.as_deref())
+                        p.capture(
+                            queue,
+                            image_raw,
+                            field_waits,
+                            draw_text.as_deref(),
+                            probe_enabled(),
+                        )
                     },
                     None => false,
                 },
@@ -1877,5 +1942,46 @@ mod tests {
             as_tuple(resolve_field_rect(Some((-5, -7, 300, 40)), extent)),
             Some((0, 0, 300, 40))
         );
+    }
+
+    /// 2026-07-17: a full-frame probe is a READBACK choice, never a text-placement choice.
+    /// The measured failure expanded a 390×46 password field to 800×600, which made the credential
+    /// enormous and caused the capture path to write those altered pixels back into the live window.
+    #[test]
+    fn full_frame_probe_never_expands_or_invents_a_text_draw_rect() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let as_tuple = |r: Option<vk::Rect2D>| {
+            r.map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
+        };
+        let live = Some((181, 300, 390, 46));
+
+        // Text always draws in the engine-reported live field, even with both diagnostics enabled.
+        assert_eq!(
+            as_tuple(select_text_probe_rect(live, extent, true, true, true)),
+            Some((181, 300, 390, 46))
+        );
+        // With no text to draw, the same diagnostic may read the full frame.
+        assert_eq!(
+            as_tuple(select_text_probe_rect(live, extent, false, true, true)),
+            Some((0, 0, 800, 600))
+        );
+        // Stale text without a coherent live session authorizes NO draw, even under the probe.
+        assert_eq!(
+            as_tuple(select_text_probe_rect(None, extent, true, true, true)),
+            None
+        );
+    }
+
+    /// Only the live-measured username type is allowed to render as entered; secure and unknown
+    /// metadata both fail closed. This is intentionally stricter than checking only `type == 5`.
+    #[test]
+    fn overlay_text_masks_secure_and_unknown_input_types() {
+        assert_eq!(mask_overlay_text("Ab1!", 7), "Ab1!");
+        assert_eq!(mask_overlay_text("Ab1!", 5), "••••");
+        assert_eq!(mask_overlay_text("Ab1!", i32::MIN), "••••");
+        assert_eq!(mask_overlay_text("", i32::MIN), "");
     }
 }

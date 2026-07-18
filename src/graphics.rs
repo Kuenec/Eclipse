@@ -170,6 +170,10 @@ struct GameWindow<'vm> {
     /// WebView's composite rect is in flight: the matching release routes to the helper too, so a
     /// press/release pair never splits between the webview and the engine.
     webview_pointer_down: bool,
+    /// Exactly-once gate for orderly runtime teardown. CloseRequested, winit's `exiting` callback,
+    /// and the post-`run_app` fallback all call the same method; only the first may drive Java/native
+    /// lifecycle or retire the helper.
+    runtime_shutdown_started: bool,
 }
 
 impl ApplicationHandler for GameWindow<'_> {
@@ -311,7 +315,8 @@ impl ApplicationHandler for GameWindow<'_> {
         }
         match event {
             WindowEvent::CloseRequested => {
-                tracing::info!("window close requested; exiting event loop");
+                tracing::info!("window close requested; stopping Android before event-loop exit");
+                self.shutdown_runtime();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -492,7 +497,6 @@ impl ApplicationHandler for GameWindow<'_> {
         if let Err(e) = crate::framework::pump_main_looper(vm) {
             tracing::error!(error = %e, "main Looper pump failed");
         }
-
         // 2026-06-13 — render Phase 2.1 present-loop handoff (DROP-BEFORE-DISPATCH). Once Eclipse's
         // REAL WSI window is published (`engine_window` Some) AND the engine has subscribed its
         // `SurfaceView` `SurfaceHolder.Callback` (`engine_surface_callback_ready` — non-empty
@@ -562,6 +566,13 @@ impl ApplicationHandler for GameWindow<'_> {
         if self.handed_off && crate::webview::client::active_view() != 0 {
             crate::webview::client::update_composited_rect();
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Winit guarantees this callback immediately before irreversible loop exit. Normal window
+        // close already ran the method while handling CloseRequested; this is the idempotent safety
+        // net for create errors or another future exit path.
+        self.shutdown_runtime();
     }
 }
 
@@ -633,6 +644,43 @@ fn route_key_to_webview(view: i64, event: &winit::event::KeyEvent) {
 }
 
 impl GameWindow<'_> {
+    /// Stop Android/Roblox and the out-of-process web engine while [`Self::window`] and
+    /// [`Self::engine_window`] are still alive. The old CloseRequested arm called `exit()` directly;
+    /// winit then destroyed the host surface underneath live libroblox workers, producing an
+    /// immediate native SIGSEGV. This method is deliberately synchronous and exactly-once: Android's
+    /// surface/activity teardown comes first, then the final persistent-cookie flush, then helper
+    /// shutdown, and only its caller may allow winit to exit/drop the window.
+    fn shutdown_runtime(&mut self) {
+        if self.runtime_shutdown_started {
+            return;
+        }
+        self.runtime_shutdown_started = true;
+        let Some(vm) = self.vm else {
+            return;
+        };
+
+        if let Err(error) = crate::framework::drive_application_shutdown_lifecycle(vm) {
+            tracing::warn!(
+                error = %error,
+                "host shutdown: Android lifecycle reported an error; continuing remaining teardown"
+            );
+        }
+        if crate::webview::client::needs_cookie_flush_before_shutdown() {
+            if let Err(error) = crate::framework::cookie_manager_flush(vm) {
+                tracing::warn!(
+                    error = %error,
+                    "host shutdown: CookieManager.flush dispatch failed; continuing helper teardown"
+                );
+            }
+        }
+        let report = crate::webview::client::shutdown(vm, std::time::Duration::from_secs(10));
+        tracing::info!(
+            helper_exit = report.helper_exit,
+            reader_joined = report.reader_joined,
+            "host shutdown: web engine retired before the host window is destroyed"
+        );
+    }
+
     /// Begin a primary-button touch: hit-test the rendered View tree at the press position and, if it
     /// resolves to a clickable view, remember it and dispatch a real Android `MotionEvent` of
     /// `ACTION_DOWN` to it via `View.dispatchTouchEvent`.
@@ -1232,8 +1280,13 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_reflect_done: false,
         key_meta_state: 0,
         webview_pointer_down: false,
+        runtime_shutdown_started: false,
     };
     let run = event_loop.run_app(&mut app);
+    // `ApplicationHandler::exiting` is the primary fallback, but keep this idempotent call while
+    // `app` (and therefore its Window/EngineNativeWindow) is still alive in case a platform returns
+    // an event-loop error without delivering that callback.
+    app.shutdown_runtime();
     // 2026-07-16 (web-engine M6): the winit loop WAS the main-thread drain for the client's
     // app-facing WebView callbacks (about_to_wait -> pump_main_looper -> run_pending_main_upcall).
     // It has just stopped — close the slot and run anything still pending HERE, on main, with the

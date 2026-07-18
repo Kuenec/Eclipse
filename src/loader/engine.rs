@@ -20,8 +20,9 @@
 //! ## Persistence (no munmap)
 //! [`LoadedEngine`] owns the [`LoadedImageSet`], whose `Drop` `munmap`s the 112 MiB mapping. The
 //! engine's constructors spawn background worker threads ("RBX Worker A") that keep executing the
-//! mapped text, so the image MUST stay mapped for the process lifetime. The caller binds the returned
-//! [`LoadedEngine`] for the whole run (it is never dropped while the workers run).
+//! mapped text, so the image MUST stay mapped for the process lifetime. Low-level callers must keep a
+//! returned [`LoadedEngine`] alive; the production [`PreloadedLib`] path enforces that invariant with
+//! a private no-drop owner.
 //!
 //! ## `unsafe` scope
 //! Two confined `unsafe` jumps into foreign code: the `DT_INIT_ARRAY` constructors (shared with the
@@ -31,6 +32,7 @@
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
 use std::io::Write;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -590,10 +592,32 @@ pub fn call_jni_onload(
     Ok(version)
 }
 
+/// A fully initialized native image whose mapping must remain resident until the kernel tears down
+/// the process.
+///
+/// 2026-07-17: this is deliberately a no-drop owner. `libroblox` constructors leave worker threads
+/// alive after Android's blocking `destroyLuaApp` completes, and ART retains native entry pointers
+/// from every preloaded JNI library. Letting ordinary Rust scope teardown drop [`LoadedEngine`]
+/// therefore `munmap`ped code that foreign threads could still execute. [`ManuallyDrop`] makes the
+/// already-documented process-lifetime contract structural, matching `runtime::boot` keeping
+/// `libart.so` mapped while ART daemon threads remain. This is bounded to the one app/native-lib set
+/// in this process; the kernel reclaims every mapping at process exit.
+struct ProcessLifetimeEngine {
+    _engine: ManuallyDrop<LoadedEngine>,
+}
+
+impl ProcessLifetimeEngine {
+    fn new(engine: LoadedEngine) -> Self {
+        Self {
+            _engine: ManuallyDrop::new(engine),
+        }
+    }
+}
+
 /// The outcome of pre-loading one app native lib through Eclipse's Rust loader.
 ///
 /// `None` for a lib already loaded (deduped — its soname was in the registry). `Some` carries the
-/// persistent [`LoadedEngine`] (kept alive by the caller for the process lifetime) plus what ran.
+/// process-lifetime native mapping plus what ran.
 #[must_use]
 pub struct PreloadedLib {
     /// The lib's resolved soname (the registry/dedup key).
@@ -603,9 +627,9 @@ pub struct PreloadedLib {
     /// `Some(version)` if the lib exported `JNI_OnLoad` and it was called (the returned JNI version),
     /// `None` if it exports none (a lazy-native lib whose `Java_*` methods ART binds on demand).
     pub jni_onload_version: Option<jint>,
-    /// The loaded image, kept alive for the process lifetime (its `Drop` would `munmap` the mapping;
-    /// libs that spawn workers — e.g. libroblox — execute the mapped text, so it must stay bound).
-    pub engine: LoadedEngine,
+    /// The initialized image. This private no-drop owner prevents lexical scope teardown from
+    /// unmapping code still referenced by foreign workers or ART's registered native pointers.
+    _engine: ProcessLifetimeEngine,
 }
 
 /// Pre-load one app native lib `lib/x86_64/<filename>` through Eclipse's own Rust loader — the SAME
@@ -737,7 +761,7 @@ pub fn load_app_native_lib(
         soname,
         constructors_run,
         jni_onload_version,
-        engine,
+        _engine: ProcessLifetimeEngine::new(engine),
     }))
 }
 
@@ -764,6 +788,15 @@ mod tests {
         // The exact exported symbol ART/Eclipse invokes — a stable part of the JNI ABI. A typo here
         // would silently make jni_onload_addr() return None (NoJniOnLoad) on a real load.
         assert_eq!(JNI_ONLOAD_SYMBOL, "JNI_OnLoad");
+    }
+
+    #[test]
+    fn initialized_native_images_cannot_be_unmapped_by_scope_teardown() {
+        // 2026-07-17 regression for the clean-close instruction-fetch MAPERR: if this wrapper ever
+        // regains automatic drop glue, a local `Vec<PreloadedLib>` can again unregister + munmap
+        // libroblox while its foreign workers are still alive. `needs_drop == false` is the strong
+        // direction of the std contract: dropping this wrapper has no destructor side effect.
+        assert!(!std::mem::needs_drop::<ProcessLifetimeEngine>());
     }
 
     #[test]

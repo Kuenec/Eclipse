@@ -1,7 +1,7 @@
 //! Main-process client for the OUT-OF-PROCESS `eclipse-webview` CEF helper (plan M3).
 //!
 //! 2026-07-03: this module is the consumer side of the owned wire protocol ([`super::proto`];
-//! the negotiated version is [`super::PROTO_VERSION`] — v2 since the 2026-07-09 M4 additive
+//! the negotiated version is [`super::PROTO_VERSION`] — v3 since the 2026-07-17 durable-cookie
 //! extension) — it spawns the helper per the NORMATIVE spawn contract in [`super`]'s module docs
 //! (fd-3 socketpair + `--ipc-fd=3`, PDEATHSIG, no URL ever in argv), completes the
 //! `Hello`/`HelloAck` handshake, and runs a dedicated socket-reader thread (`eclipse-webview-io`)
@@ -98,6 +98,8 @@ pub enum ClientError {
     ExplicitPathMissing { source: &'static str, path: PathBuf },
     /// Spawning the helper process (or its io thread) failed.
     Spawn(String),
+    /// Preparing the private persistent CEF profile failed.
+    Storage(String),
     /// The `Hello`/`HelloAck` handshake failed or timed out.
     Handshake(String),
     /// The helper answered with an unsupported protocol version.
@@ -132,6 +134,7 @@ impl std::fmt::Display for ClientError {
                 write!(f, "{source} points at a missing file: {}", path.display())
             }
             Self::Spawn(e) => write!(f, "helper spawn failed: {e}"),
+            Self::Storage(e) => write!(f, "persistent webview storage unavailable: {e}"),
             Self::Handshake(e) => write!(f, "helper handshake failed: {e}"),
             Self::VersionMismatch { helper_version } => write!(
                 f,
@@ -509,8 +512,6 @@ fn note_deferred_callback_answered(request_id: u32, ok: bool) {
 enum Deferral {
     /// Hold the raw frame; nothing crosses the wire and no reply is coming.
     Buffer,
-    /// PROVABLY answerable without the engine — the caller produces CEF's own answer itself.
-    AnswerWithoutEngine,
     /// Not answerable without CEF: spawn NOW. Carries the reason for the honest WARN, which
     /// doubles as the `trigger=` the spawn is logged with.
     NeedsEngine(&'static str),
@@ -523,46 +524,30 @@ pub enum SendOutcome {
     Sent,
     /// Held in [`EarlyCookies`] for the flush (fire-and-forget only — nothing waits on it).
     Buffered,
-    /// Answered without the engine; no reply is coming.
-    AnsweredWithoutEngine,
 }
 
-/// The cookie ops deferred while the helper spawn is held back.
+/// The cookie mutations deferred while the helper spawn is held back, and the bounded mutation
+/// transcript used by the app-UA helper replacement.
 ///
-/// # Why this is CORRECT and is NOT a reimplementation of cookie semantics (2026-07-16)
+/// # Why this is CORRECT and is NOT a reimplementation of cookie semantics (2026-07-17)
 ///
-/// It buffers RAW [`ConsumerMsg`] frames and replays them verbatim; it never parses, matches or
-/// expires a cookie. It answers exactly two questions, and only where the answer is a THEOREM:
+/// It buffers RAW [`ConsumerMsg`] frames and replays them verbatim; it never parses, matches, or
+/// expires a cookie. The store is now persistent, so an unspawned helper says NOTHING about jar
+/// contents: cookies from a prior Eclipse process may exist on disk. Consequently `CookieGet`,
+/// `CookiesClear*`, and `CookieFlush` always require CEF. Only fire-and-forget sets may be buffered,
+/// because they owe no callback and their original frames preserve every field losslessly.
 ///
-/// **The empty-store lemma.** While this variant is live, no helper process exists ⇒ no
-/// `cef_initialize` ⇒ no `CefContext` (CEF `docs/architecture.md`: *"initialized when CefInitialize
-/// is called"*; the pinned `cef_initialize` doc forbids ANY other CEF call before it) ⇒ no
-/// `RequestContext`, no cookie store, no browser. On the eventual spawn the store is created fresh
-/// from `engine::session_context_settings()`, whose `cache_path` is EMPTY — pinned
-/// `_cef_settings_t::cache_path`: *"If this value is empty then browsers will be created in
-/// \"incognito mode\" where in-memory caches are used for storage and no profile-specific data is
-/// persisted to disk"* — so it starts EMPTY on every process start, with no disk and no prior boot.
-/// It can then gain a cookie by exactly two routes: (a) `cef_cookie_manager_t::set_cookie`, whose
-/// only callers in the whole helper are the `CookieSet` / `CookieSetForResult` handlers
-/// (`engine.rs` — grep-verified 2026-07-16), and (b) a `Set-Cookie` response header, which needs a
-/// browser — and `CreateView` is sent from exactly ONE site ([`drive`]), which spawns first. (b) is
-/// therefore impossible here and (a) is exactly what this buffer holds.
-/// **⇒ store_contents ≡ replay(self.sets), always.**
+/// The respawn transcript is relative to the persistent base: before a browser exists, every
+/// Eclipse-originated mutation is a `CookieSet*` or `CookiesClear*` frame. Replaying those ORIGINAL
+/// frames in order over the SAME persistent profile reproduces the old helper's post-mutation jar;
+/// importantly, a clear remains in the transcript instead of truncating it, so a cookie still on
+/// disk can never be resurrected by the replacement. A network `Set-Cookie` still requires a
+/// browser, and [`Self::retire`] still disables replay at the first `CreateView`.
 ///
-/// From the lemma:
-/// * `CookiesClear` — `engine::cookies_clear` calls `delete_cookies(None, None, cb)`; pinned doc:
-///   *"If |url| is NULL all cookies for all hosts and domains will be deleted"*. A blanket delete
-///   over a store whose entire content is `sets` is reproduced EXACTLY by dropping `sets`. Its wire
-///   reply is a pure completion signal, and `framework::fire_cookies_clear_result` passes `true`
-///   UNCONDITIONALLY — so the locally delivered `true` is the same value, not a fabricated ack.
-/// * `CookieGet` with an EMPTY buffer — the store is empty ⇒ CEF answers the empty list. (It does
-///   so only via the 5 s `COOKIE_VISIT_DEADLINE`: *"Zero cookies never trigger the visitor"*,
-///   `engine::poll`.) Byte-identical, and ~5 s faster.
-///
-/// And what it must NOT try to answer — for reasons that are also quotes:
-/// * `CookieGet` with a NON-EMPTY buffer — `visit_url_cookies` results are *"filtered by the given
-///   url scheme, host, domain and path"*. That matching is Chromium's. Eclipse does not implement
-///   RFC 6265 anywhere and must not start here.
+/// What it must NOT try to answer:
+/// * `CookieGet` — `visit_url_cookies` results are *"filtered by the given url scheme, host,
+///   domain and path"*. Chromium owns both that matching and the persistent base.
+/// * `CookiesClear*` / `CookieFlush` — only CEF can mutate or durably flush the prior-boot store.
 /// * `CookieSetForResult` — its whole purpose is the REAL verdict: `set_cookie` *"will check for
 ///   disallowed characters ... and fail without setting the cookie"* and returns *"false (0) if an
 ///   invalid URL is specified"* (the measured boot shows CEF genuinely rejecting two of the app's
@@ -574,22 +559,20 @@ pub enum SendOutcome {
 ///   ordering fix** — see [`defer_cookie_cb`], the `ECLIPSE_WEBVIEW_DEFER_COOKIE_CB` dev-host probe,
 ///   which flips exactly this arm to `Buffer`. AOSP states NO deadline for the callback, so the
 ///   deferral is contract-legal; only the app's behaviour is unknown. The probe bounds the strand
-///   at both ends it can: a `CookiesClear` that would DROP an unanswered frame forces the spawn
-///   instead (below), and [`shutdown`] answers whatever is still deferred.
+///   at both ends it can: either `CookiesClear*` operation that would DROP an unanswered frame
+///   forces the spawn instead (below), and [`shutdown`] answers whatever is still deferred.
 struct EarlyCookies {
-    /// Deferred `CookieSet` frames in ARRIVAL ORDER, replayed verbatim by [`ensure_spawned`].
+    /// Cookie mutation frames in ARRIVAL ORDER, replayed verbatim by [`ensure_spawned`].
     /// RAW frames: nothing is parsed here, so nothing (expiry, creation time, sanitization) can be
     /// lost — `ConsumerMsg::CookieSet` carries `expires_epoch_s`, which the read-back type
     /// `CookieEntry` does NOT. That asymmetry is exactly why a read-back+replay was rejected and
     /// why buffering the app's ORIGINAL request is sound.
     ///
-    /// 2026-07-16 (the §6 respawn): this is no longer only the PRE-spawn buffer — it is the
-    /// APPEND-ONLY LOG of every cookie-mutating frame Eclipse has sent to the CURRENT helper, kept
-    /// across its whole life by [`Self::record_sent`]. While no `CreateView` has been sent, the log
-    /// IS the helper's store (the empty-store lemma above), so replaying it into a replacement
-    /// reproduces that store exactly.
-    sets: Vec<ConsumerMsg>,
-    /// Whether `sets` can still be trusted to REPRODUCE the helper's store. Cleared — never
+    /// While no `CreateView` has been sent, applying this transcript over the persistent base
+    /// reproduces the helper's store. It contains clears as well as sets; read/flush frames are not
+    /// mutations and are omitted.
+    mutations: Vec<ConsumerMsg>,
+    /// Whether `mutations` can still be trusted to reproduce the helper's mutations. Cleared — never
     /// silently — when the log stops being a faithful transcript:
     /// * [`Self::CAP`] overflow while Live (the frame is not appended, so the store gains a cookie
     ///   the log does not have ⇒ a replay would LOSE it);
@@ -597,7 +580,8 @@ struct EarlyCookies {
     ///   no log can transcribe).
     ///
     /// A false value REFUSES the respawn ([`respawn_verdict`]) — it never silently degrades a replay
-    /// into a lossy one. `true` at construction: an empty log faithfully describes an empty store.
+    /// into a lossy one. `true` at construction: an empty transcript faithfully describes no
+    /// mutations over the persistent base.
     replayable: bool,
 }
 
@@ -614,9 +598,24 @@ impl EarlyCookies {
 
     const fn new() -> Self {
         Self {
-            sets: Vec::new(),
+            mutations: Vec::new(),
             replayable: true,
         }
+    }
+
+    fn push_mutation(&mut self, msg: &ConsumerMsg) {
+        if self.mutations.len() < Self::CAP {
+            self.mutations.push(msg.clone());
+            return;
+        }
+        tracing::warn!(
+            target: "android.webkit.CookieManager",
+            cap = Self::CAP,
+            "the webview cookie-mutation log hit its bound — it can no longer reproduce the \
+             engine's changes over the persistent store, so the app-UA respawn is now REFUSED \
+             for this boot. Honest degradation: the engine keeps the User-Agent it booted with."
+        );
+        self.replayable = false;
     }
 
     /// Record one frame that has JUST been written to the LIVE helper (2026-07-16, the §6 respawn),
@@ -630,40 +629,26 @@ impl EarlyCookies {
     /// variants are matched EXPLICITLY — no `_` arm covers them — so a future cookie message cannot
     /// be added without deciding whether it mutates the store.
     fn record_sent(&mut self, msg: &ConsumerMsg) {
+        // Once a browser retires the transcript, never retain later cookie values (including the
+        // auth token) merely for a respawn that is structurally forbidden.
+        if !self.replayable {
+            return;
+        }
         match msg {
             // A set the engine has now applied. Order is the jar's semantics (a later set of the
             // same name overwrites an earlier one), so push, never dedupe.
             ConsumerMsg::CookieSet { .. } | ConsumerMsg::CookieSetForResult { .. } => {
-                if self.sets.len() < Self::CAP {
-                    self.sets.push(msg.clone());
-                } else {
-                    // The store now holds a cookie the log does not. Say so LOUDLY and once: a
-                    // silent divergence here would turn the replay into the lossy read-back this
-                    // design exists to avoid. The bound STAYS (cookie VALUES, incl.
-                    // `.ROBLOSECURITY`, must not grow without limit in the ART process); only the
-                    // respawn is given up.
-                    if self.replayable {
-                        tracing::warn!(
-                            target: "android.webkit.CookieManager",
-                            cap = Self::CAP,
-                            "the webview cookie log hit its bound — it can no longer reproduce the \
-                             engine's cookie store, so the app-UA respawn is now REFUSED for this \
-                             boot (§6 2026-07-16 respawn). Honest degradation: the engine keeps the \
-                             User-Agent it booted with."
-                        );
-                    }
-                    self.replayable = false;
-                }
+                self.push_mutation(msg);
             }
-            // `delete_cookies(NULL, NULL)` = "If |url| is NULL all cookies for all hosts and
-            // domains will be deleted" (pinned bindings). The engine applies frames in send order
-            // (one socket, one pump thread), so truncating at the send point mirrors the engine
-            // applying the clear at that same point in that same order. Without this, a replay would
-            // RESURRECT cookies the app deliberately cleared.
-            ConsumerMsg::CookiesClear { .. } => self.sets.clear(),
+            // Persistent-base resurrection guard: the replacement must apply the same blanket
+            // delete before later sets. Truncation was correct only for the retired incognito
+            // store; with disk state it would resurrect prior-boot cookies.
+            ConsumerMsg::CookiesClear { .. } | ConsumerMsg::CookiesClearSession { .. } => {
+                self.push_mutation(msg);
+            }
             // Read-only: `visit_url_cookies` "Visit a subset of cookies" (pinned bindings) cannot
             // change the store, so a get is not part of the transcript.
-            ConsumerMsg::CookieGet { .. } => {}
+            ConsumerMsg::CookieGet { .. } | ConsumerMsg::CookieFlush { .. } => {}
             _ => {}
         }
     }
@@ -672,22 +657,22 @@ impl EarlyCookies {
     ///
     /// Two independent reasons, and they land on the same line:
     /// 1. **Correctness** — from the first `CreateView` a network `Set-Cookie` response header can
-    ///    populate the store, and no log Eclipse keeps can transcribe that. The empty-store lemma
-    ///    stops holding, so a replay would silently lose cookies.
+    ///    mutate the persistent store, and no log Eclipse keeps can transcribe that.
     /// 2. **Bound** — a live view means the respawn is forbidden anyway ([`respawn_verdict`]'s
     ///    live-view guard: replacing the helper would destroy the app's browser). Holding the app's
     ///    cookie VALUES (incl. the `.ROBLOSECURITY` auth token) in the ART process for the rest of
     ///    the session past that point buys nothing and costs disclosure.
     fn retire(&mut self) {
-        self.sets.clear();
+        self.mutations.clear();
         self.replayable = false;
     }
 
     /// Does the buffer hold a 3-arg set whose `ValueCallback` is still owed the engine's REAL flag?
     /// Only the [`defer_cookie_cb`] probe can make this true (with the gate off a
     /// `CookieSetForResult` never buffers), so every branch it guards is dead on a default boot.
+    #[cfg(test)]
     fn holds_unanswered_callback(&self) -> bool {
-        self.sets
+        self.mutations
             .iter()
             .any(|m| deferred_cb_request_id(m).is_some())
     }
@@ -703,8 +688,8 @@ impl EarlyCookies {
     fn offer(&mut self, msg: &ConsumerMsg, defer_cb: bool) -> Deferral {
         match msg {
             // Fire-and-forget (v1): no reply obligation, so buffering can never strand a callback.
-            ConsumerMsg::CookieSet { .. } if self.sets.len() < Self::CAP => {
-                self.sets.push(msg.clone());
+            ConsumerMsg::CookieSet { .. } if self.mutations.len() < Self::CAP => {
+                self.mutations.push(msg.clone());
                 Deferral::Buffer
             }
             ConsumerMsg::CookieSet { .. } => {
@@ -716,8 +701,10 @@ impl EarlyCookies {
             // it to the live engine, where the REAL flag routes back through the unchanged
             // `CookieSetResult` path. Nothing is fabricated; nothing is dropped. The ONLY thing that
             // changes is WHEN the app is answered, which AOSP leaves open ([`defer_cookie_cb`]).
-            ConsumerMsg::CookieSetForResult { .. } if defer_cb && self.sets.len() < Self::CAP => {
-                self.sets.push(msg.clone());
+            ConsumerMsg::CookieSetForResult { .. }
+                if defer_cb && self.mutations.len() < Self::CAP =>
+            {
+                self.mutations.push(msg.clone());
                 Deferral::Buffer
             }
             ConsumerMsg::CookieSetForResult { .. } if defer_cb => {
@@ -726,24 +713,17 @@ impl EarlyCookies {
             ConsumerMsg::CookieSetForResult { .. } => Deferral::NeedsEngine(
                 "setCookie(url, value, ValueCallback) — only the engine yields the REAL success flag",
             ),
-            // PROBE-only strand guard: a blanket clear is answerable locally by DROPPING `sets`
-            // (the empty-store lemma) — but dropping a frame whose ValueCallback is still owed the
-            // engine's REAL flag would strand the app forever. Force the spawn instead: the sets
-            // replay, every held callback is answered by CEF, and the clear then rides the wire
-            // normally. Unreachable with the gate off.
-            ConsumerMsg::CookiesClear { .. } if self.holds_unanswered_callback() => {
-                Deferral::NeedsEngine(
-                    "removeAll/SessionCookies would DROP a probe-deferred setCookie frame whose \
-                     ValueCallback is still owed the engine's REAL flag",
-                )
-            }
-            ConsumerMsg::CookiesClear { .. } => {
-                self.sets.clear();
-                Deferral::AnswerWithoutEngine
-            }
-            ConsumerMsg::CookieGet { .. } if self.sets.is_empty() => Deferral::AnswerWithoutEngine,
+            ConsumerMsg::CookiesClear { .. } => Deferral::NeedsEngine(
+                "removeAllCookies — the persistent store may contain prior-boot cookies",
+            ),
+            ConsumerMsg::CookiesClearSession { .. } => Deferral::NeedsEngine(
+                "removeSessionCookies — only CEF can identify cookies without an expiry",
+            ),
             ConsumerMsg::CookieGet { .. } => Deferral::NeedsEngine(
-                "getCookie after this boot set a cookie — CEF owns url/domain/path matching",
+                "getCookie — CEF owns the persistent jar and url/domain/path matching",
+            ),
+            ConsumerMsg::CookieFlush { .. } => Deferral::NeedsEngine(
+                "CookieManager.flush — only CEF can confirm persistent-store completion",
             ),
             _ => Deferral::NeedsEngine("an op that needs the engine reached the pre-engine gate"),
         }
@@ -776,10 +756,13 @@ struct Shared {
     screen_rect: Mutex<Option<DrawnRect>>,
     /// The blocking `getCookie` waiters, keyed by consumer request id: the reader thread delivers
     /// the solicited `CookieList` into the channel, waking [`cookie_get_blocking`] (which parked
-    /// on the receiver WITHOUT holding [`CLIENT`], so the reader is never blocked). A request id is
-    /// registered in exactly ONE sink — either here (getCookie) or a framework ValueCallback
-    /// (removeAll/Session) — so the reader's routing is unambiguous.
+    /// on the receiver WITHOUT holding [`CLIENT`], so the reader is never blocked). `CookieList`
+    /// belongs exclusively to this sink; v3 clear callbacks use the distinct `CookiesClearDone`
+    /// frame, so a late list can never be mistaken for a removal result.
     cookie_get_waiters: Mutex<HashMap<u32, mpsc::Sender<Vec<CookieEntry>>>>,
+    /// Blocking `CookieManager.flush()` waiters. Kept separate from cookie-list routing because a
+    /// flush has its own v3 completion frame and never executes app code on the reader thread.
+    cookie_flush_waiters: Mutex<HashMap<u32, mpsc::Sender<bool>>>,
 }
 
 fn shared() -> &'static Arc<Shared> {
@@ -790,6 +773,7 @@ fn shared() -> &'static Arc<Shared> {
             rect: Mutex::new(None),
             screen_rect: Mutex::new(None),
             cookie_get_waiters: Mutex::new(HashMap::new()),
+            cookie_flush_waiters: Mutex::new(HashMap::new()),
         })
     })
 }
@@ -937,6 +921,52 @@ fn resolve_helper() -> Result<PathBuf, ClientError> {
     )
 }
 
+/// Create and permission-harden Eclipse's private persistent CEF root. `base` is the same
+/// distro-portable app-data directory exposed to Android; a relative explicit override is made
+/// absolute against `current_dir` because CEF rejects relative cache paths. Canonicalizing after
+/// creation also removes `..` and resolves a caller-provided symlink before it crosses processes.
+fn prepare_webview_data_root_from(base: &Path, current_dir: &Path) -> Result<PathBuf, ClientError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let absolute_base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        current_dir.join(base)
+    };
+    let requested = absolute_base.join("webview-cef");
+    std::fs::create_dir_all(&requested)
+        .map_err(|e| ClientError::Storage(format!("cannot create {}: {e}", requested.display())))?;
+    let root = requested.canonicalize().map_err(|e| {
+        ClientError::Storage(format!("cannot canonicalize {}: {e}", requested.display()))
+    })?;
+    if root.to_str().is_none() {
+        return Err(ClientError::Storage(format!(
+            "CEF requires a UTF-8 profile path, but {} is not UTF-8",
+            root.display()
+        )));
+    }
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        ClientError::Storage(format!(
+            "cannot restrict {} to owner-only mode 0700: {e}",
+            root.display()
+        ))
+    })?;
+    Ok(root)
+}
+
+fn prepare_webview_data_root() -> Result<PathBuf, ClientError> {
+    let base = crate::framework::app_data_dir().ok_or_else(|| {
+        ClientError::Storage(
+            "no XDG/home app-data directory is available; set ECLIPSE_APP_DATA_DIR to an \
+             absolute writable directory"
+                .to_string(),
+        )
+    })?;
+    let current_dir = std::env::current_dir()
+        .map_err(|e| ClientError::Storage(format!("cannot resolve current directory: {e}")))?;
+    prepare_webview_data_root_from(&base, &current_dir)
+}
+
 // ---------------------------------------------------------------------------
 // Spawn + handshake (the io thread's startup half)
 // ---------------------------------------------------------------------------
@@ -950,6 +980,7 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
     use std::os::unix::process::CommandExt as _;
 
     let helper = resolve_helper()?;
+    let webview_data_root = prepare_webview_data_root()?;
     // 2026-07-10 (plan M5): the pre-spawn host-lib probe — ADVISORY ONLY (§2.9: a probe
     // false-negative must never degrade a capable host); the spawn proceeds in EVERY case and
     // the spawn/handshake outcome stays the authority. The outcome rides along so
@@ -966,6 +997,10 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
         UnixStream::pair().map_err(|e| ClientError::Spawn(format!("socketpair failed: {e}")))?;
     let mut cmd = std::process::Command::new(&helper);
     cmd.arg("--ipc-fd=3");
+    // 2026-07-17: private persistent cookie/profile root. Environment, never argv: the absolute
+    // path may disclose the local user name through world-readable /proc/*/cmdline. The helper
+    // validates it independently and refuses incognito fallback.
+    cmd.env("ECLIPSE_WEBVIEW_DATA_DIR", &webview_data_root);
     // 2026-07-10 (plan M5): the config-gated loud-degradation opt-in (spawn contract §3 — a
     // boolean flag, argv-safe, no secrets). A second Config::load beside resolve_helper()'s is
     // acceptable: this is the once-per-process cold spawn path, never per-frame/per-event.
@@ -1164,6 +1199,8 @@ fn helper_msg_name(msg: &HelperMsg) -> &'static str {
         HelperMsg::BridgeCall { .. } => "BridgeCall",
         HelperMsg::EvaluateJsResult { .. } => "EvaluateJsResult",
         HelperMsg::CookieSetResult { .. } => "CookieSetResult",
+        HelperMsg::CookieFlushDone { .. } => "CookieFlushDone",
+        HelperMsg::CookiesClearDone { .. } => "CookiesClearDone",
     }
 }
 
@@ -1218,7 +1255,7 @@ fn ensure_spawned(
     // re-installed into the Live log below, because once written they ARE the new engine's store and
     // a later respawn must be able to replay them again.
     let (deferred, replayable) = match slot {
-        ClientSlot::Unspawned(early) => (std::mem::take(&mut early.sets), early.replayable),
+        ClientSlot::Unspawned(early) => (std::mem::take(&mut early.mutations), early.replayable),
         _ => return Ok(()),
     };
     tracing::info!(
@@ -1261,7 +1298,7 @@ fn ensure_spawned(
     // predecessor's store must not silently regain it here. (A `send_locked` failure above latched
     // the slot, so this no-ops and the log dies with the latch — today's behaviour.)
     if let ClientSlot::Live(_, log) = slot {
-        log.sets = deferred;
+        log.mutations = deferred;
         log.replayable = replayable;
     }
     Ok(())
@@ -1380,12 +1417,17 @@ const RESPAWN_TEARDOWN_DEADLINE: Duration = Duration::from_secs(3);
 /// call that follows. Nothing anywhere takes a waiter/registry lock and THEN [`CLIENT`], so the
 /// order is one-directional (CLIENT → these) and no inversion is possible.
 fn ops_in_flight() -> usize {
-    let parked = shared()
+    let get_parked = shared()
         .cookie_get_waiters
         .lock()
         .map(|w| w.len())
         .unwrap_or(0);
-    crate::framework::webview_callbacks_in_flight() + parked
+    let flush_parked = shared()
+        .cookie_flush_waiters
+        .lock()
+        .map(|w| w.len())
+        .unwrap_or(0);
+    crate::framework::webview_callbacks_in_flight() + get_parked + flush_parked
 }
 
 /// Replace the live helper with one carrying the User-Agent the app set, replaying the cookie log
@@ -1408,10 +1450,10 @@ fn ops_in_flight() -> usize {
 /// The old helper's reader thread takes [`CLIENT`] on EOF ([`reader_fatal`]), so the teardown MUST
 /// NOT hold it: joining under the lock is a guaranteed hang. But releasing it naively opens a window
 /// in which another thread could spawn a SECOND helper while the first is still alive — and CEF's
-/// documented process singleton on `root_cache_path` (which `build_settings_with_ua` leaves empty,
-/// so it is the shared `~/.config/cef_user_data` default) means the second `CefInitialize` would EXIT
-/// EARLY: *"only a single app instance is allowed to run for a given CefSettings.root_cache_path
-/// value… Client apps should therefore check the cef_initialize() return value for early exit"*
+/// documented process singleton on `root_cache_path` (now Eclipse's private persistent profile
+/// root, shared by both generations) means the second `CefInitialize` would EXIT EARLY: *"only a
+/// single app instance is allowed to run for a given CefSettings.root_cache_path value… Client apps
+/// should therefore check the cef_initialize() return value for early exit"*
 /// (`_cef_browser_process_handler_t::on_already_running_app_relaunch`, pinned bindings). So phase 1
 /// parks the slot in a `Failed` latch — which no code path can spawn out of — and phase 3 lifts it.
 /// A stale reader that wakes inside the window finds a non-`Live` slot and quietly exits, exactly as
@@ -1469,13 +1511,13 @@ fn maybe_respawn_for_app_ua() -> bool {
             target: "android.webkit.WebSettings",
             boot_ua = boot_ua.as_deref().unwrap_or("<the Eclipse fallback literal>"),
             app_ua = app_ua.as_deref().unwrap_or(""),
-            logged_sets = log.sets.len(),
+            logged_mutations = log.mutations.len(),
             "webview client: REPLACING the eclipse-webview helper so the engine presents the \
              User-Agent the app set via WebSettings.setUserAgentString — CefSettings.user_agent is \
              global and consumed by CefInitialize, so an engine that booted on the wrong one can \
              only be replaced, never corrected (§6 2026-07-16 respawn). The old helper never \
-             created a browser, so its cookie store is EXACTLY the logged frames; they replay into \
-             the replacement verbatim."
+             created a browser, so the ordered logged mutations completely describe its changes \
+             over the same persistent base; they replay into the replacement verbatim."
         );
         (old, log)
     }; // <<< CLIENT RELEASED HERE — the teardown below must not hold it.
@@ -1661,10 +1703,9 @@ fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm
         return;
     }
     reader_loop(&stream, shared, &up_tx);
-    // Reader gone (any reason): wake parked getCookie callers NOW (Disconnected → honest empty,
-    // not a full-timeout stall), then drop `up_tx` so the upcall thread processes its remaining
-    // queue and drains every still-pending ValueCallback honestly before exiting.
-    wake_all_cookie_waiters();
+    // Reader gone (any reason): wake all blocking cookie callers NOW instead of leaving ART
+    // threads parked until their deadlines, then let the upcall thread drain ValueCallbacks.
+    wake_all_blocking_cookie_waiters();
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,9 +1736,12 @@ struct DispatchOut {
     eval_results: Vec<(u32, bool, String)>,
     /// v2: 3-arg setCookie completions `(request_id, ok)`.
     cookie_set_results: Vec<(u32, bool)>,
-    /// v2/v1: solicited cookie lists `(request_id, cookies)` — routed by the reader loop to either
-    /// the blocking-getCookie channel or a framework clear-callback.
+    /// v1: solicited cookie lists `(request_id, cookies)` for blocking getCookie callers.
     cookie_lists: Vec<(u32, Vec<CookieEntry>)>,
+    /// v3: persistent-store flush completions, delivered directly to blocking waiter channels.
+    cookie_flush_results: Vec<(u32, bool)>,
+    /// v3: removeAll/removeSession completions `(request_id, removed)` from CEF's real result.
+    cookie_clear_results: Vec<(u32, bool)>,
     fatal: bool,
     /// The actionable latch reason when `fatal` (payload-free by construction).
     fatal_reason: Option<String>,
@@ -1803,6 +1847,10 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
                      config webview_allow_unsandboxed=true to accept a loud unsandboxed \
                      degradation"
                 ),
+                (1, 3) => "web engine init failed in the helper (crash kind=1 code=3) — \
+                           persistent webview storage is unavailable or violates CEF's absolute \
+                           root/cache-path contract; verify ECLIPSE_APP_DATA_DIR is writable"
+                    .to_string(),
                 // kind 1 = engine-init-failed (no display / ozone) per the proto spec.
                 (1, code) => format!(
                     "web engine init failed in the helper (crash kind=1 code={code}) — \
@@ -1838,6 +1886,13 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
             request_id,
             cookies,
         } => out.cookie_lists.push((request_id, cookies)),
+        HelperMsg::CookieFlushDone { request_id, ok } => {
+            out.cookie_flush_results.push((request_id, ok));
+        }
+        HelperMsg::CookiesClearDone {
+            request_id,
+            removed,
+        } => out.cookie_clear_results.push((request_id, removed)),
         // Out-of-phase messages: debug-ignore (v1 decodes them; the reader has no consumer here).
         other @ (HelperMsg::HelloAck { .. } | HelperMsg::FrameBufferNew { .. }) => {
             tracing::debug!(
@@ -1875,8 +1930,8 @@ enum UpcallEvent {
     },
     /// 3-arg setCookie completion → the retained ValueCallback<Boolean>.
     CookieSetResult { request_id: u32, ok: bool },
-    /// removeAll/Session completion (a CookieList with no getCookie waiter registered).
-    CookiesClearResult { request_id: u32 },
+    /// removeAll/Session completion with CEF's real "at least one cookie was removed" result.
+    CookiesClearResult { request_id: u32, removed: bool },
     /// The helper confirmed a view close: drop the view's `@JavascriptInterface` bridge globals
     /// and fail its in-flight eval callbacks honestly. Era-gated (`upto_era` = the close's
     /// [`crate::framework::bump_webview_close_era`] value), so state born AFTER the close — a
@@ -1952,8 +2007,11 @@ fn upcall_thread_main(
                 note_deferred_callback_answered(request_id, ok);
                 crate::framework::fire_cookie_set_result(java_vm, request_id, ok);
             }
-            UpcallEvent::CookiesClearResult { request_id } => {
-                crate::framework::fire_cookies_clear_result(java_vm, request_id);
+            UpcallEvent::CookiesClearResult {
+                request_id,
+                removed,
+            } => {
+                crate::framework::fire_cookies_clear_result(java_vm, request_id, removed);
             }
             UpcallEvent::ViewClosedDrain { widget, upto_era } => {
                 // 2026-07-10: the bridge-global drop moved here from the reader thread (which
@@ -2096,22 +2154,38 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender
             let _ = upcalls.send(UpcallEvent::CookieSetResult { request_id, ok });
         }
         for (request_id, cookies) in out.cookie_lists {
-            // Exactly one sink per request id: a blocking getCookie waiter (delivered HERE — a
-            // channel send, no JNI, so a stalled upcall can never block it), else a framework
-            // clear-callback (removeAll/Session). Remove-then-send so a timed-out waiter is gone.
+            // CookieList belongs only to blocking getCookie. Deliver HERE — a channel send, no
+            // JNI, so a stalled upcall can never block it. Remove-then-send so a timed-out waiter
+            // is gone; a late list is simply stale, never reinterpreted as another operation.
             let waiter = shared
                 .cookie_get_waiters
                 .lock()
                 .ok()
                 .and_then(|mut w| w.remove(&request_id));
-            match waiter {
-                Some(tx) => {
-                    let _ = tx.send(cookies);
-                }
-                None => {
-                    let _ = upcalls.send(UpcallEvent::CookiesClearResult { request_id });
-                }
+            if let Some(tx) = waiter {
+                let _ = tx.send(cookies);
+            } else {
+                tracing::debug!(
+                    request_id,
+                    "webview client: dropping a late CookieList with no getCookie waiter"
+                );
             }
+        }
+        for (request_id, ok) in out.cookie_flush_results {
+            let waiter = shared
+                .cookie_flush_waiters
+                .lock()
+                .ok()
+                .and_then(|mut w| w.remove(&request_id));
+            if let Some(tx) = waiter {
+                let _ = tx.send(ok);
+            }
+        }
+        for (request_id, removed) in out.cookie_clear_results {
+            let _ = upcalls.send(UpcallEvent::CookiesClearResult {
+                request_id,
+                removed,
+            });
         }
         for (closed, upto_era) in out.closed.into_iter().zip(close_eras) {
             let _ = ACTIVE_VIEW.compare_exchange(closed, 0, Ordering::Relaxed, Ordering::Relaxed);
@@ -2490,7 +2564,6 @@ fn send_with_lazy_spawn(
             }
             return Ok(SendOutcome::Buffered);
         }
-        Some(Deferral::AnswerWithoutEngine) => return Ok(SendOutcome::AnsweredWithoutEngine),
         Some(Deferral::NeedsEngine(why)) => {
             tracing::warn!(
                 reason = why,
@@ -2630,19 +2703,16 @@ pub fn cookie_set_with_result(
     .map(|_| ())
 }
 
-/// `removeAllCookies` / `removeSessionCookies` (v1 `CookiesClear`): the completion returns as a
-/// (routed) empty `CookieList` correlated by `request_id`. 2026-07-09 divergence: `CookiesClear`
-/// is a blanket clear, so `removeSessionCookies` also clears persistent cookies — harmless for the
-/// in-memory session store (nothing persists). Lazily spawns.
-///
-/// 2026-07-16 (§6 🩹➜⛔): during the deferred-spawn window a blanket clear is PROVABLY complete
-/// without the engine ([`EarlyCookies`]) and returns [`SendOutcome::AnsweredWithoutEngine`] — the
-/// caller must then fire the app's `ValueCallback` itself, because no helper reply is coming.
-pub fn cookies_clear(
-    java_vm: jni::vm::JavaVM,
-    request_id: u32,
-) -> Result<SendOutcome, ClientError> {
-    send_with_lazy_spawn(java_vm, &ConsumerMsg::CookiesClear { request_id })
+/// `removeAllCookies` (v1 `CookiesClear`): CEF deletes the whole persistent jar and answers with
+/// its real removed-anything result. No unspawned state can claim the prior-boot jar is empty.
+pub fn cookies_clear_all(java_vm: jni::vm::JavaVM, request_id: u32) -> Result<(), ClientError> {
+    send_with_lazy_spawn(java_vm, &ConsumerMsg::CookiesClear { request_id }).map(|_| ())
+}
+
+/// `removeSessionCookies` (v3 `CookiesClearSession`): CEF visits the persistent jar and deletes
+/// only entries without an expiration date, preserving durable authentication cookies.
+pub fn cookies_clear_session(java_vm: jni::vm::JavaVM, request_id: u32) -> Result<(), ClientError> {
+    send_with_lazy_spawn(java_vm, &ConsumerMsg::CookiesClearSession { request_id }).map(|_| ())
 }
 
 /// Blocking `CookieManager.getCookie(url)` (v1 `CookieGet`): register a channel waiter, send the
@@ -2678,12 +2748,11 @@ pub fn cookie_get_blocking(
     }
     match send_with_lazy_spawn(java_vm, &ConsumerMsg::CookieGet { request_id, url }) {
         Ok(SendOutcome::Sent) => {}
-        // 2026-07-16 (§6 🩹➜⛔): answered without the engine — the session store is PROVABLY empty
-        // ([`EarlyCookies`]), so this IS what CEF would have replied (and ~5 s sooner: a zero-cookie
-        // visit only completes on the COOKIE_VISIT_DEADLINE). No reply is coming, so do not park.
-        Ok(_) => {
+        Ok(SendOutcome::Buffered) => {
             remove_cookie_waiter(request_id);
-            return Ok(Vec::new());
+            return Err(ClientError::Internal(
+                "CookieGet was buffered even though the persistent store owns its answer",
+            ));
         }
         Err(e) => {
             remove_cookie_waiter(request_id);
@@ -2706,13 +2775,66 @@ fn remove_cookie_waiter(request_id: u32) {
     }
 }
 
-/// Drop EVERY parked `getCookie` waiter's `Sender` so [`cookie_get_blocking`] wakes immediately
-/// (channel `Disconnected` → its honest empty list) instead of blocking its full timeout.
+/// Blocking Android `CookieManager.flush()`: register before sending, then wait without holding
+/// [`CLIENT`] until the helper's v3 `CookieFlushDone` reports CEF's completion callback. A timeout,
+/// disconnect, or immediate CEF refusal returns `false`; the void Java API logs that degradation.
+pub fn cookie_flush_blocking(
+    java_vm: jni::vm::JavaVM,
+    timeout: Duration,
+) -> Result<bool, ClientError> {
+    if IO_THREAD_ID.lock().ok().and_then(|id| *id) == Some(std::thread::current().id()) {
+        tracing::warn!(
+            "cookie_flush_blocking called ON the eclipse-webview-io thread — the completion could \
+             never be delivered; refusing the self-deadlock"
+        );
+        return Ok(false);
+    }
+    let request_id = next_request_id();
+    let (tx, rx) = mpsc::channel::<bool>();
+    match shared().cookie_flush_waiters.lock() {
+        Ok(mut w) => {
+            w.insert(request_id, tx);
+        }
+        Err(_) => return Err(ClientError::Internal("cookie flush waiters lock poisoned")),
+    }
+    match send_with_lazy_spawn(java_vm, &ConsumerMsg::CookieFlush { request_id }) {
+        Ok(SendOutcome::Sent) => {}
+        Ok(SendOutcome::Buffered) => {
+            remove_cookie_flush_waiter(request_id);
+            return Err(ClientError::Internal(
+                "cookie flush was not sent to the persistent engine",
+            ));
+        }
+        Err(e) => {
+            remove_cookie_flush_waiter(request_id);
+            return Err(e);
+        }
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(ok) => Ok(ok),
+        Err(_) => {
+            remove_cookie_flush_waiter(request_id);
+            Ok(false)
+        }
+    }
+}
+
+fn remove_cookie_flush_waiter(request_id: u32) {
+    if let Ok(mut w) = shared().cookie_flush_waiters.lock() {
+        w.remove(&request_id);
+    }
+}
+
+/// Drop EVERY parked blocking-cookie waiter's `Sender` so `getCookie`/`flush` wake immediately
+/// (channel `Disconnected`) instead of blocking their full timeouts.
 /// 2026-07-09 fix: called on reader-thread exit (helper crash/EOF/protocol error — previously
 /// only [`shutdown`] cleared the map, so an in-flight getCookie at helper-death time stalled the
-/// full remaining 5 s on the calling ART thread) and by [`shutdown`] (idempotent).
-fn wake_all_cookie_waiters() {
+/// full remaining 5 s on the calling ART thread). 2026-07-17 extends the same invariant to flush.
+fn wake_all_blocking_cookie_waiters() {
     if let Ok(mut w) = shared().cookie_get_waiters.lock() {
+        w.clear();
+    }
+    if let Ok(mut w) = shared().cookie_flush_waiters.lock() {
         w.clear();
     }
 }
@@ -2970,6 +3092,26 @@ pub fn failed_reason() -> Option<String> {
     }
 }
 
+/// Whether orderly process shutdown has cookie work that must cross Android's blocking
+/// `CookieManager.flush()` boundary before the helper is retired. A live helper may hold dirty CEF
+/// state; an unspawned client needs a flush only when this boot buffered cookie mutations. An empty
+/// unspawned slot is intentionally false so a framework-only app never cold-starts CEF merely because
+/// its host window closed.
+pub fn needs_cookie_flush_before_shutdown() -> bool {
+    CLIENT
+        .lock()
+        .map(|slot| slot_needs_cookie_flush(&slot))
+        .unwrap_or(false)
+}
+
+fn slot_needs_cookie_flush(slot: &ClientSlot) -> bool {
+    match slot {
+        ClientSlot::Live(_, _) => true,
+        ClientSlot::Unspawned(early) => !early.mutations.is_empty(),
+        ClientSlot::Failed(_) => false,
+    }
+}
+
 /// PROBE (2026-07-16, `ECLIPSE_WEBVIEW_DEFER_COOKIE_CB`): answer every 3-arg setCookie the deferral
 /// is STILL holding at teardown. A permanently stranded app callback is not acceptable even in a
 /// diagnostic, so this is the deferral's hard bound: nothing leaves this function still owed.
@@ -2979,19 +3121,19 @@ pub fn failed_reason() -> Option<String> {
 /// The two options are to cold-start CEF now purely to obtain real flags, or to answer. Answering
 /// is honest and forcing is not, for reasons specific to THIS moment:
 /// * `false` here is **true**. `setCookie`'s callback value *"indicates whether the cookie was set
-///   successfully"* (AOSP `CookieManager.java`, verified 2026-07-16). No engine ever existed on this
-///   path — no `CefInitialize`, no cookie store (the empty-store lemma, [`EarlyCookies`]) — so the
-///   cookie was, as a matter of fact, never set. Reporting that is an accurate report of a real
+///   successfully"* (AOSP `CookieManager.java`, verified 2026-07-16). This deferred frame never
+///   reached a helper and was never applied to the persistent profile, irrespective of what older
+///   cookies that profile contains. Reporting that is an accurate report of this operation's real
 ///   non-completion, NOT a fabricated verdict: it is exactly what
 ///   [`crate::framework::drain_all_webview_callbacks`] already means by `false`, and what the
 ///   3-arg native's own send-failure arm already answers. The flag M4 refused to fabricate is a
 ///   `true` nobody measured; a `false` for an operation that provably did not happen is the
 ///   opposite of that.
 /// * Forcing a spawn would be the dishonest one. It would run a full engine init (sandbox, GPU,
-///   `CefInitialize`) DURING VM teardown, to set cookies into a store that is destroyed
-///   milliseconds later, and to answer callbacks whose app is already exiting — a real risk of a
-///   hang or a late crash in exchange for a flag with no consumer. That is behaviour changed to
-///   satisfy a diagnostic's bookkeeping, which is what CLAUDE.md forbids.
+///   `CefInitialize`) DURING VM teardown and mutate the durable profile after the app has begun
+///   exiting, merely to answer a diagnostic callback — a real risk of a hang or late crash plus an
+///   unintended next-boot side effect. That is behaviour changed to satisfy a diagnostic's
+///   bookkeeping, which is what CLAUDE.md forbids.
 ///
 /// Delivery reuses the shipped drain: `&Vm` is `!Send`, so the borrow is the type-level proof we are
 /// MAIN, and `dispatch_webview_callback_on_main` therefore takes its `InlineOnMainThread` path —
@@ -3003,7 +3145,8 @@ fn answer_stranded_deferred_callbacks(vm: &crate::runtime::Vm, ids: &[u32]) {
         stranded = ids.len(),
         "ECLIPSE-DEFER-CB shutdown — {} probe-deferred 3-arg setCookie ValueCallback(s) were never \
          replayed (this boot drove no WebView, so the flush never ran). Answering each FALSE now: \
-         no engine ever existed, so the cookie genuinely was never set. Nothing is left stranded.",
+         those frames never reached the persistent engine, so those cookie operations genuinely \
+         did not complete. Nothing is left stranded.",
         ids.len()
     );
     crate::framework::drain_deferred_cookie_set_callbacks(
@@ -3039,11 +3182,11 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
                     // their values here, matching the pending_bridges clear below.
                     if let ClientSlot::Unspawned(early) = &mut other {
                         stranded_cb_ids = early
-                            .sets
+                            .mutations
                             .iter()
                             .filter_map(deferred_cb_request_id)
                             .collect();
-                        early.sets.clear();
+                        early.mutations.clear();
                     }
                     // 2026-07-16 (the §6 respawn): a `RESPAWN_IN_PROGRESS` park is the ONE state
                     // that must NOT be restored — this latch has to WIN. Restoring it would let
@@ -3125,7 +3268,7 @@ pub fn shutdown(vm: &crate::runtime::Vm, deadline: Duration) -> ShutdownReport {
     // Drop every getCookie sender: any thread parked in cookie_get_blocking wakes (Disconnected)
     // and returns its honest empty list instead of blocking the full timeout. (The reader-exit
     // path already did this — idempotent; this also covers a reader that could not be joined.)
-    wake_all_cookie_waiters();
+    wake_all_blocking_cookie_waiters();
     if let Ok(mut b) = pending_bridges().lock() {
         b.clear();
         PENDING_BRIDGE_VIEWS.store(0, Ordering::Relaxed);
@@ -3247,6 +3390,26 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ECLIPSE_WEBVIEW_HELPER"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persistent_webview_root_is_absolute_canonical_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_dir("persistent-profile");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let prepared = prepare_webview_data_root_from(Path::new("relative-data"), &cwd)
+            .expect("prepare persistent profile");
+        assert!(prepared.is_absolute());
+        assert_eq!(prepared, cwd.join("relative-data/webview-cef"));
+        let mode = std::fs::metadata(&prepared)
+            .expect("profile metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "cookie profile must be owner-only");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3632,8 +3795,8 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_extracts_v2_bridge_eval_and_cookie_outputs() {
-        // 2026-07-09 (plan M4): the pure dispatch state machine extracts the v2 outputs WITHOUT
+    fn dispatch_extracts_bridge_eval_cookie_clear_and_flush_outputs() {
+        // The pure dispatch state machine extracts v2/v3 outputs WITHOUT
         // touching the views map or any global — the reader loop performs the JNI/channel work.
         let mut views: HashMap<i64, ViewShared> = HashMap::new();
 
@@ -3694,6 +3857,24 @@ mod tests {
             &mut views,
         );
         assert_eq!(out.cookie_lists, vec![(13, cookies)]);
+
+        let out = dispatch(
+            HelperMsg::CookieFlushDone {
+                request_id: 14,
+                ok: true,
+            },
+            &mut views,
+        );
+        assert_eq!(out.cookie_flush_results, vec![(14, true)]);
+
+        let out = dispatch(
+            HelperMsg::CookiesClearDone {
+                request_id: 15,
+                removed: false,
+            },
+            &mut views,
+        );
+        assert_eq!(out.cookie_clear_results, vec![(15, false)]);
     }
 
     #[test]
@@ -3770,11 +3951,25 @@ mod tests {
     }
 
     #[test]
-    fn defer_cookie_cb_off_is_a_structural_no_op_for_every_cookie_shape() {
-        // THE PIN THAT MAKES THE PROBE SAFE TO SHIP DARK (2026-07-16): with the gate off, `offer`
-        // must reproduce the SHIPPED verdicts byte-for-byte — the probe is a measurement, and a
-        // measurement that changes the default boot measures itself. Every cookie shape, and the
-        // reason strings the boot log greps for, are asserted verbatim.
+    fn host_shutdown_does_not_spawn_cef_for_an_empty_cookie_deferral() {
+        let empty = ClientSlot::Unspawned(EarlyCookies::new());
+        assert!(!slot_needs_cookie_flush(&empty));
+
+        let mut dirty = EarlyCookies::new();
+        assert_eq!(
+            dirty.offer(&a_cookie_set("shutdown"), false),
+            Deferral::Buffer
+        );
+        assert!(slot_needs_cookie_flush(&ClientSlot::Unspawned(dirty)));
+        assert!(!slot_needs_cookie_flush(&ClientSlot::Failed(
+            "already retired".into()
+        )));
+    }
+
+    #[test]
+    fn defer_cookie_cb_off_keeps_only_fire_and_forget_sets_bufferable() {
+        // 2026-07-17: persistence narrows the pre-engine theorem to one shape. The probe stays
+        // dark; get/either-clear/flush now require CEF because a prior-boot jar may exist.
         let mut early = EarlyCookies::new();
         assert_eq!(
             early.offer(&a_cookie_set_cb(1), false),
@@ -3783,16 +3978,20 @@ mod tests {
             )
         );
         // The forced spawn must not buffer it: nothing is held, so nothing can strand.
-        assert!(early.sets.is_empty());
+        assert!(early.mutations.is_empty());
         assert!(!early.holds_unanswered_callback());
         // And the ops around it are untouched.
         assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
-        assert_eq!(
+        assert!(matches!(
             early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, false),
-            Deferral::AnswerWithoutEngine
-        );
-        assert!(early.sets.is_empty());
-        assert_eq!(
+            Deferral::NeedsEngine(_)
+        ));
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookiesClearSession { request_id: 3 }, false),
+            Deferral::NeedsEngine(_)
+        ));
+        assert_eq!(early.mutations, vec![a_cookie_set("a")]);
+        assert!(matches!(
             early.offer(
                 &ConsumerMsg::CookieGet {
                     request_id: 3,
@@ -3800,8 +3999,12 @@ mod tests {
                 },
                 false
             ),
-            Deferral::AnswerWithoutEngine
-        );
+            Deferral::NeedsEngine(_)
+        ));
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookieFlush { request_id: 4 }, false),
+            Deferral::NeedsEngine(_)
+        ));
     }
 
     #[test]
@@ -3812,31 +4015,37 @@ mod tests {
         // cookie op can fix the UA, and the frame must be the app's ORIGINAL — nothing re-derived.
         let mut early = EarlyCookies::new();
         assert_eq!(early.offer(&a_cookie_set_cb(7), true), Deferral::Buffer);
-        assert_eq!(early.sets.len(), 1);
+        assert_eq!(early.mutations.len(), 1);
         assert!(early.holds_unanswered_callback());
         // Lossless: the buffered frame IS the app's original, expiry and all (a read-back
         // `CookieEntry` has no `expires_epoch_s` — that asymmetry is why replay must use the frame).
-        assert_eq!(early.sets[0], a_cookie_set_cb(7));
-        assert_eq!(deferred_cb_request_id(&early.sets[0]), Some(7));
+        assert_eq!(early.mutations[0], a_cookie_set_cb(7));
+        assert_eq!(deferred_cb_request_id(&early.mutations[0]), Some(7));
         // Arrival order is preserved across the 2-arg/3-arg mix — the jar's overwrite semantics.
         assert_eq!(early.offer(&a_cookie_set("later"), true), Deferral::Buffer);
-        assert_eq!(early.sets, vec![a_cookie_set_cb(7), a_cookie_set("later")]);
+        assert_eq!(
+            early.mutations,
+            vec![a_cookie_set_cb(7), a_cookie_set("later")]
+        );
     }
 
     #[test]
     fn defer_cookie_cb_never_lets_a_clear_drop_an_unanswered_callback() {
-        // THE STRAND GUARD (2026-07-16). A blanket clear is normally answerable locally by dropping
-        // `sets` (the empty-store lemma) — but dropping a frame whose ValueCallback is still owed
-        // the engine's REAL flag would strand the app FOREVER, which is unacceptable even in a
-        // diagnostic. It must force the spawn instead, so the sets replay and CEF answers each.
+        // THE STRAND GUARD (2026-07-16, retained after persistence). Neither clear scope may discard
+        // a buffered frame whose ValueCallback is still owed the engine's REAL flag. Both force the
+        // spawn, so the sets replay and CEF answers each before performing the clear.
         let mut early = EarlyCookies::new();
         assert_eq!(early.offer(&a_cookie_set_cb(1), true), Deferral::Buffer);
         assert!(matches!(
             early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, true),
             Deferral::NeedsEngine(_)
         ));
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookiesClearSession { request_id: 3 }, true),
+            Deferral::NeedsEngine(_)
+        ));
         // The frame SURVIVES the refused clear — it must still be there to replay and be answered.
-        assert_eq!(early.sets.len(), 1);
+        assert_eq!(early.mutations.len(), 1);
         assert!(early.holds_unanswered_callback());
     }
 
@@ -3868,7 +4077,7 @@ mod tests {
             full.offer(&a_cookie_set_cb(9), true),
             Deferral::NeedsEngine("the deferred-cookie buffer is full")
         );
-        assert_eq!(full.sets.len(), EarlyCookies::CAP);
+        assert_eq!(full.mutations.len(), EarlyCookies::CAP);
         assert!(!full.holds_unanswered_callback());
     }
 
@@ -3882,18 +4091,16 @@ mod tests {
         let mut early = EarlyCookies::new();
         assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
         assert_eq!(early.offer(&a_cookie_set("b"), false), Deferral::Buffer);
-        assert_eq!(early.sets.len(), 2);
+        assert_eq!(early.mutations.len(), 2);
     }
 
     #[test]
-    fn early_cookies_answer_a_blanket_clear_and_an_empty_store_get_without_the_engine() {
-        // The empty-store lemma (see `EarlyCookies`): with no helper there is no CefContext, hence
-        // no cookie store; the store is created fresh with an EMPTY cache_path (in-memory/incognito)
-        // and only Eclipse's own sets can populate it. So a get on an empty buffer IS the empty list
-        // CEF would return, and a blanket delete_cookies(NULL, NULL) over a store whose entire
-        // content is `sets` is reproduced exactly by dropping `sets`.
+    fn early_cookies_never_guess_about_the_persistent_base() {
+        // 2026-07-17 root-cause pin: no helper does not mean no cookie jar once the profile is
+        // durable. A get, either clear scope, and flush all force CEF even before this process
+        // buffered a set.
         let mut early = EarlyCookies::new();
-        assert_eq!(
+        assert!(matches!(
             early.offer(
                 &ConsumerMsg::CookieGet {
                     request_id: 1,
@@ -3901,25 +4108,22 @@ mod tests {
                 },
                 false
             ),
-            Deferral::AnswerWithoutEngine
-        );
+            Deferral::NeedsEngine(_)
+        ));
         assert_eq!(early.offer(&a_cookie_set("a"), false), Deferral::Buffer);
-        assert_eq!(
+        assert!(matches!(
             early.offer(&ConsumerMsg::CookiesClear { request_id: 2 }, false),
-            Deferral::AnswerWithoutEngine
-        );
-        // The clear emptied the jar, so a get is answerable again — the post-state matches CEF's.
-        assert!(early.sets.is_empty());
-        assert_eq!(
-            early.offer(
-                &ConsumerMsg::CookieGet {
-                    request_id: 3,
-                    url: "https://www.roblox.com/".into(),
-                },
-                false
-            ),
-            Deferral::AnswerWithoutEngine
-        );
+            Deferral::NeedsEngine(_)
+        ));
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookiesClearSession { request_id: 3 }, false),
+            Deferral::NeedsEngine(_)
+        ));
+        assert_eq!(early.mutations, vec![a_cookie_set("a")]);
+        assert!(matches!(
+            early.offer(&ConsumerMsg::CookieFlush { request_id: 4 }, false),
+            Deferral::NeedsEngine(_)
+        ));
     }
 
     #[test]
@@ -3961,7 +4165,7 @@ mod tests {
             Deferral::NeedsEngine(_)
         ));
         // A forced spawn must not also lose the buffered sets: they still flush at `ensure_spawned`.
-        assert_eq!(early.sets.len(), 1);
+        assert_eq!(early.mutations.len(), 1);
     }
 
     #[test]
@@ -3980,7 +4184,7 @@ mod tests {
             early.offer(&a_cookie_set("overflow"), false),
             Deferral::NeedsEngine(_)
         ));
-        assert_eq!(early.sets.len(), EarlyCookies::CAP);
+        assert_eq!(early.mutations.len(), EarlyCookies::CAP);
     }
 
     #[test]
@@ -3994,7 +4198,7 @@ mod tests {
         for n in ["first", "second", "third"] {
             assert_eq!(early.offer(&a_cookie_set(n), false), Deferral::Buffer);
         }
-        let taken = std::mem::take(&mut early.sets);
+        let taken = std::mem::take(&mut early.mutations);
         let names: Vec<&str> = taken
             .iter()
             .map(|m| match m {
@@ -4089,37 +4293,37 @@ mod tests {
     }
 
     #[test]
-    fn cookie_log_records_sets_after_the_spawn_and_a_clear_truncates_it() {
-        // 2026-07-16 (§6 respawn). THE TWO OBLIGATIONS THE DESIGN OWES, pinned together because they
-        // are one invariant: the log must equal `apply(frames)` on a store whose entire content is
-        // those frames. A set after the helper spawned lands in ITS store, so it MUST be logged; and
-        // `delete_cookies(NULL, NULL)` — "If |url| is NULL all cookies for all hosts and domains
-        // will be deleted" (pinned bindings) — empties that store, so the log MUST truncate or a
-        // replay would RESURRECT cookies the app deliberately cleared.
+    fn cookie_log_replays_sets_and_clears_over_the_persistent_base_in_order() {
+        // 2026-07-17: the transcript is RELATIVE to a persistent base. A clear must remain in it;
+        // truncating (the old incognito-store rule) would let the replacement reopen prior-boot
+        // cookies from disk and resurrect what the app explicitly deleted.
         let mut log = EarlyCookies::new();
         log.record_sent(&a_cookie_set("a"));
         log.record_sent(&a_cookie_set_cb(1));
-        assert_eq!(log.sets, vec![a_cookie_set("a"), a_cookie_set_cb(1)]);
+        assert_eq!(log.mutations, vec![a_cookie_set("a"), a_cookie_set_cb(1)]);
         // A get is read-only (`visit_url_cookies` "Visit a subset of cookies") — never a transcript
         // entry.
         log.record_sent(&ConsumerMsg::CookieGet {
             request_id: 2,
             url: "https://www.roblox.com/".into(),
         });
-        assert_eq!(log.sets.len(), 2);
-        // The clear truncates — this is the resurrection guard.
-        log.record_sent(&ConsumerMsg::CookiesClear { request_id: 3 });
-        assert!(log.sets.is_empty());
-        assert!(
-            log.replayable,
-            "a clear leaves an EMPTY log that faithfully describes an EMPTY store"
+        assert_eq!(log.mutations.len(), 2);
+        let clear = ConsumerMsg::CookiesClear { request_id: 3 };
+        log.record_sent(&clear);
+        assert_eq!(
+            log.mutations,
+            vec![a_cookie_set("a"), a_cookie_set_cb(1), clear.clone()]
         );
-        // Post-clear sets rebuild the transcript from the truncation point.
+        assert!(log.replayable);
+        let clear_session = ConsumerMsg::CookiesClearSession { request_id: 4 };
+        log.record_sent(&clear_session);
+        assert_eq!(log.mutations.last(), Some(&clear_session));
+        // Post-clear sets stay after the marker so replay yields exactly clear(base) + set(after).
         log.record_sent(&a_cookie_set("after"));
-        assert_eq!(log.sets, vec![a_cookie_set("after")]);
+        assert_eq!(log.mutations.last(), Some(&a_cookie_set("after")));
         // Lossless: the logged frame IS the app's original, expiry and all (`CookieEntry` has no
         // expires_epoch_s — that asymmetry is why the replay must use the frame).
-        assert_eq!(log.sets[0], a_cookie_set("after"));
+        assert_eq!(log.mutations[4], a_cookie_set("after"));
     }
 
     #[test]
@@ -4134,7 +4338,7 @@ mod tests {
         }
         assert!(log.replayable);
         log.record_sent(&a_cookie_set("overflow"));
-        assert_eq!(log.sets.len(), EarlyCookies::CAP, "the bound holds");
+        assert_eq!(log.mutations.len(), EarlyCookies::CAP, "the bound holds");
         assert!(
             !log.replayable,
             "and the respawn is surrendered, not the bound"
@@ -4148,7 +4352,12 @@ mod tests {
         let mut log = EarlyCookies::new();
         log.record_sent(&a_cookie_set("a"));
         log.retire();
-        assert!(log.sets.is_empty() && !log.replayable);
+        assert!(log.mutations.is_empty() && !log.replayable);
+        log.record_sent(&a_cookie_set("auth-token-shaped"));
+        assert!(
+            log.mutations.is_empty(),
+            "post-CreateView auth cookies must not be retained in the ART process"
+        );
     }
 
     #[test]
@@ -4162,7 +4371,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_exit_wakes_parked_cookie_getters_immediately() {
+    fn reader_exit_wakes_all_blocking_cookie_calls_immediately() {
         // 2026-07-09 fix pin: the reader's exit path previously left `cookie_get_waiters`
         // populated (only shutdown() cleared it), so a getCookie in flight at helper-death time
         // blocked its FULL 5 s timeout. Reader exit and shutdown now both drop every waiter
@@ -4175,10 +4384,20 @@ mod tests {
             .lock()
             .expect("waiters lock")
             .insert(request_id, tx);
-        wake_all_cookie_waiters();
+        let (flush_tx, flush_rx) = mpsc::channel::<bool>();
+        shared()
+            .cookie_flush_waiters
+            .lock()
+            .expect("flush waiters lock")
+            .insert(next_request_id(), flush_tx);
+        wake_all_blocking_cookie_waiters();
         match rx.recv_timeout(Duration::from_millis(200)) {
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
             other => panic!("expected an immediate Disconnected wake, got {other:?}"),
+        }
+        match flush_rx.recv_timeout(Duration::from_millis(200)) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            other => panic!("expected an immediate flush Disconnected wake, got {other:?}"),
         }
     }
 

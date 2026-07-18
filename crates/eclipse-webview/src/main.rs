@@ -48,11 +48,14 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const COMPONENT: &str = "helper";
 /// No `Hello` within this window after spawn → exit (the handshake watchdog).
 const HELLO_WATCHDOG: Duration = Duration::from_secs(10);
+/// A persistent profile initializes asynchronously after `CefInitialize`; do not create a browser
+/// or ask for its cookie manager until CEF reports that the global context is ready.
+const CONTEXT_INIT_DEADLINE: Duration = Duration::from_secs(10);
 /// The M1-spike-proven external-pump cadence.
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 /// Outbound queue high-water mark: FrameReady flow control bounds pixel traffic to one
@@ -174,6 +177,23 @@ fn probe_suid_sandbox(exe_dir: &Path) -> Option<PathBuf> {
     (unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0).then_some(path)
 }
 
+// 2026-07-17: CEF's persistent global profile initializes asynchronously. The browser-process
+// callback publishes the only honest ready signal; the main thread pumps until it arrives before
+// accepting cookie/view work. Incognito startup happened to complete soon enough without this
+// gate, but an on-disk profile made the missing lifecycle edge observable.
+wrap_browser_process_handler! {
+    struct HelperBrowserProcessHandler {
+        context_initialized: Arc<AtomicBool>,
+    }
+
+    impl BrowserProcessHandler {
+        fn on_context_initialized(&self) {
+            self.context_initialized.store(true, Ordering::Release);
+            log::info(COMPONENT, "persistent global request context initialized");
+        }
+    }
+}
+
 // The `ozone` field is the explicit ozone selection, filled in before `initialize` (browser
 // process only; `None` until the handshake completes). `render_handler` is the renderer-side
 // JS-bridge/eval handler (plan M4) — active only in the CEF-forked renderer subprocess.
@@ -186,9 +206,14 @@ wrap_app! {
         ozone: Arc<Mutex<Option<String>>>,
         render_handler: RenderProcessHandler,
         degraded_sandbox: Arc<AtomicBool>,
+        browser_handler: BrowserProcessHandler,
     }
 
     impl App {
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(self.browser_handler.clone())
+        }
+
         fn render_process_handler(&self) -> Option<RenderProcessHandler> {
             Some(self.render_handler.clone())
         }
@@ -840,7 +865,14 @@ fn main() -> ExitCode {
         // OFF → None → the renderer installs no load handler at all (a structural no-op).
         bridge_diag.then(|| BridgeDiagLoadHandler::new(inventory)),
     );
-    let mut app = HelperApp::new(ozone_slot.clone(), render_handler, degraded_sandbox.clone());
+    let context_initialized: Arc<AtomicBool> = Arc::default();
+    let browser_handler = HelperBrowserProcessHandler::new(context_initialized.clone());
+    let mut app = HelperApp::new(
+        ozone_slot.clone(),
+        render_handler,
+        degraded_sandbox.clone(),
+        browser_handler,
+    );
     let ret = execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -1057,6 +1089,63 @@ fn main() -> ExitCode {
         ),
     }
 
+    // 2026-07-17: the consumer owns creation/permissions for Eclipse's persistent CEF root and
+    // passes it through the child environment (never argv; the path may contain a user name).
+    // Validate independently before CefInitialize: CEF requires an absolute root and profile
+    // cache path beneath it. Missing/malformed storage is a typed engine-init failure,
+    // never a silent fall back to incognito (which would discard the authenticated session).
+    let profile_paths = match std::env::var_os("ECLIPSE_WEBVIEW_DATA_DIR") {
+        Some(root) if Path::new(&root).is_dir() => {
+            match engine::persistent_profile_paths(Path::new(&root)) {
+                Ok(paths) => paths,
+                Err(reason) => {
+                    log::error(COMPONENT, reason);
+                    let _ = write_helper_msg(
+                        &stream,
+                        &HelperMsg::Crash {
+                            view: 0,
+                            kind: 1,
+                            code: 3,
+                        },
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Some(_) => {
+            log::error(
+                COMPONENT,
+                "ECLIPSE_WEBVIEW_DATA_DIR is not an existing directory; the consumer must create \
+                 the private persistent CEF root before spawning the helper",
+            );
+            let _ = write_helper_msg(
+                &stream,
+                &HelperMsg::Crash {
+                    view: 0,
+                    kind: 1,
+                    code: 3,
+                },
+            );
+            return ExitCode::FAILURE;
+        }
+        None => {
+            log::error(
+                COMPONENT,
+                "missing ECLIPSE_WEBVIEW_DATA_DIR in the helper spawn environment; persistent \
+                 cookies are required by Android CookieManager",
+            );
+            let _ = write_helper_msg(
+                &stream,
+                &HelperMsg::Crash {
+                    view: 0,
+                    kind: 1,
+                    code: 3,
+                },
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     // 2026-07-16 (plan M6): resolve the User-Agent ONCE from the two inherited env channels (the
     // consumer's spawn does not env_clear). They MUST be read here rather than beside the
     // ECLIPSE_WEBVIEW_CONSOLE read below: the UA is an input to `Settings`, which `initialize`
@@ -1105,6 +1194,7 @@ fn main() -> ExitCode {
     // ---- Engine init: windowless, external pump, sandbox per the selected mode (ON except
     // the policy-gated Degraded opt-in), engine logging OFF. ----
     let mut settings = engine::build_settings_with_ua(user_agent);
+    engine::apply_persistent_profile(&mut settings, &profile_paths);
     engine::apply_sandbox_mode(&mut settings, &sandbox_mode);
     if initialize(
         Some(args.as_main_args()),
@@ -1125,6 +1215,31 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     log::info(COMPONENT, &format!("initialized {}", engine::engine_id()));
+
+    // 2026-07-17: `CefInitialize` returning means the process is initialized, not that an on-disk
+    // global RequestContext is ready. Pump the UI thread until the documented callback fires. A
+    // bounded failure is actionable and preserves the protocol's honest engine-init failure path.
+    let context_deadline = Instant::now() + CONTEXT_INIT_DEADLINE;
+    while !context_initialized.load(Ordering::Acquire) && Instant::now() < context_deadline {
+        do_message_loop_work();
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    if !context_initialized.load(Ordering::Acquire) {
+        log::error(
+            COMPONENT,
+            "persistent global request context did not initialize within 10 seconds",
+        );
+        let _ = write_helper_msg(
+            &stream,
+            &HelperMsg::Crash {
+                view: 0,
+                kind: 1,
+                code: 3,
+            },
+        );
+        shutdown();
+        return ExitCode::FAILURE;
+    }
 
     // ---- Writer thread: owns the socket write half behind a bounded queue. ----
     let (out_tx, out_rx) = mpsc::sync_channel::<Out>(OUT_QUEUE_HIGH_WATER);
