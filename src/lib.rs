@@ -46,6 +46,7 @@ pub mod loader;
 pub mod performance;
 pub mod runtime;
 pub mod services;
+pub mod system_cursor;
 pub mod webview;
 
 /// Eclipse version (from Cargo).

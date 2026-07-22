@@ -379,6 +379,14 @@ impl Apk {
             }
             Err(e) => return Err(ApkError::Zip(e)),
         };
+        // Android Roblox normally paints its own white keyboard/mouse pointer. In Eclipse's desktop
+        // system-cursor mode, keep every APK existence/error semantic above but substitute a valid
+        // transparent image for the narrow standard-cursor allowlist. This one byte-read seam covers
+        // both Java AssetManager and NDK AAssetManager consumers; the filesystem content-root path is
+        // handled by `system_cursor::install` after extraction.
+        if let Some(replacement) = crate::system_cursor::replacement_apk_entry(name) {
+            return Ok(replacement.to_vec());
+        }
         // size() is the uncompressed length from the (untrusted) central directory; cap the
         // speculative pre-allocation so a hostile entry declaring a huge size can't trigger a
         // large allocation before any bytes are read. The Vec still grows if the real data is
