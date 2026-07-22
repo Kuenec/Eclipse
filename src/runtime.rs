@@ -64,7 +64,7 @@ const DEFAULT_SDK_INT: u32 = 33;
 /// 2026-06-04: ATL's 256 MiB default OOMs Roblox during asset loading; the M0 bisect
 /// (AGENTS.md §5) found 768 MiB clears the GC-thrash OOM and, paired with
 /// `-XX:DisableHSpaceCompactForOOM`, fits a single contiguous reservation.
-const HEAP_MIB: u32 = 768;
+pub(crate) const HEAP_MIB: u32 = 768;
 
 /// Default install path of the vendored ART VM library (Arch/AUR `art_standalone`).
 /// Overridable via `ECLIPSE_LIBART` for other distros (detect-don't-assume, §9).

@@ -6,7 +6,7 @@
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
 #   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*, KeyguardManager*, PixelCopy*)
-#   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + LocationManager + Vibrator + AutofillManager + CookieManager + JobParameters + Paint = installed classes + AOSP gaps
+#   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + LocationManager + Vibrator + SystemProperties (honest ro.build.tags) + AutofillManager + CookieManager + JobParameters + Paint = installed classes + AOSP gaps
 #   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
@@ -116,6 +116,25 @@ kg_src="$here/src/android/app/KeyguardManager.java"
 [ -f "$kg_src" ] || fail "patched KeyguardManager.java missing at $kg_src"
 grep -qF 'public boolean isDeviceSecure()' "$kg_src" || fail "patched KeyguardManager.java no longer declares isDeviceSecure() — the NoSuchMethodError fix regressed"
 
+# --- 1e. guard ActivityManager's Linux-backed memory surface + AOSP parcel shape ------------
+# 2026-07-18: ATL's getMemoryInfo reassigned only its local parameter, leaving Roblox to report
+# `0MB`. The four natives are the Java↔Rust contract; the hidden threshold fields make the parcel
+# long enough for current Roblox's guarded final-32-byte read. Fail before javac if either regresses.
+am_src="$here/src/android/app/ActivityManager.java"
+[ -f "$am_src" ] || fail "patched ActivityManager.java missing at $am_src"
+for am_needle in \
+    'private static native void native_fillMemoryInfo(MemoryInfo outInfo);' \
+    'private static native int native_getMemoryClass();' \
+    'private static native int native_getLargeMemoryClass();' \
+    'private static native boolean native_isLowRamDevice();' \
+    'public long hiddenAppThreshold;' \
+    'public long foregroundAppThreshold;' \
+    'dest.writeLong(foregroundAppThreshold);'
+do
+    grep -qF "$am_needle" "$am_src" || fail "ActivityManager memory patch regressed: missing '$am_needle'"
+done
+! grep -qF 'outInfo = new MemoryInfo();' "$am_src" || fail "ActivityManager.getMemoryInfo again reassigns only its local parameter — the 0MB bug regressed"
+
 # --- 1f. guard the M4 JavascriptInterface annotation + the EclipseBridgeProbe test class -----
 # 2026-07-09 (web-engine plan M4): @JavascriptInterface must be a RUNTIME-retention annotation for
 # the reflective bridge filtering (framework.rs) + the real app's bridge methods to resolve; the
@@ -155,7 +174,7 @@ grep -qF 'listenerThread.post(new Runnable()' "$pc_src" || fail "PixelCopy.java 
 grep -qF 'listener.onPixelCopyFinished(ERROR_SOURCE_NO_DATA);' "$pc_src" || fail "PixelCopy.java no longer reports the honest ERROR_SOURCE_NO_DATA result"
 ! grep -qF 'listener.onPixelCopyFinished(SUCCESS);' "$pc_src" || fail "PixelCopy.java fabricates SUCCESS without a pixel-copy backend"
 
-# --- 1e. compile against the VENDORED com.android.internal.R (javac constant-inlining guard) --
+# --- 1i. compile against the VENDORED com.android.internal.R (javac constant-inlining guard) --
 # 2026-07-02: javac inlines `static final int` constants from compile inputs into the emitted
 # bytecode. A hand-written stub R.java with placeholder values (attr.id = 0, attr.theme = 0)
 # compiled LayoutInflater.parseInclude's <include android:id> override into
@@ -239,6 +258,7 @@ grep -qF '0x1010000' "$lism" || fail "dexed LayoutInflater lost the inlined andr
 wvcpsm="$work/smali-check/android/webkit/EclipseWebViewClientProbe.smali"
 [ -f "$wvcpsm" ] || fail "EclipseWebViewClientProbe.smali not in the built classes.dex — the __webview-test Looper-contract probe did not stage"
 grep -qF 'Landroid/os/Handler;-><init>()V' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost the no-arg Handler construction — the 2026-07-16 Looper-less-dispatch guard would not fire"
+
 grep -qF 'Landroid/os/Looper;->getMainLooper()' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost its UI-thread assertion"
 grep -qF 'onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost the AOSP 3-arg onPageStarted override — internalLoadChanged's state-0 dispatch would miss it (and the stub has drifted from the classes2 shadow)"
 
@@ -631,6 +651,25 @@ ANCHOR_PSET="$ANCHOR_PSET" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_PSET}) >=
 perl -0pi -e 's{(\.method public set\(Landroid/graphics/Paint;\)V\n    \.registers 4\n)}{$1\n    # ECLIPSE PATCH 2026-07-02: AOSP self-set guard — AOSP Paint.set(Paint src) no-ops when src == this.\n    # ATL recycles this.paint BEFORE cloning paint.paint, so an unguarded self-set clones a freed\n    # handle (use-after-free in the ATL reference C native; a warn-logged reset to a DEFAULT paint\n    # under the Eclipse paint registry, where AOSP preserves the state). Guard restores the contract.\n    if-ne p0, p1, :eclipse_not_self_set\n\n    return-void\n\n    :eclipse_not_self_set\n}s' "$psm"
 grep -qF 'if-ne p0, p1, :eclipse_not_self_set' "$psm" || fail "Paint.smali self-set guard insert failed (drift?)"
 
+# SystemProperties.ro.build.tags: "release-keys" -> "test-keys" (honest uncertified signal). 2026-07-21.
+# ATL hard-codes ro.build.tags="release-keys", which claims an OEM-certified, production-signed build.
+# Eclipse is an uncertified compatibility runtime with NO OEM signing keys, so release-keys is a
+# fabricated SECURITY-CERTIFICATION capability — the CLAUDE.md §0/§2.7/§2.9 class (fall back honestly,
+# never fabricate a capability, no hard-coded vendor assumptions). Unlike ATL's synthetic device NAMES
+# (HTC/google/model — benign placeholders that only describe the synthetic environment, kept as-is per
+# the WebSettings note above), release-keys asserts a certification Eclipse does not have. Report the
+# honest AOSP "test-keys". Build.TAGS reads this store; it feeds the app's own device self-report.
+# This is honesty, NOT engineering around vendor scoring: a client that truthfully reports it is
+# uncertified, and is then offered the web challenge, is the app/server's own correct fallback for a
+# device that cannot do Play Integrity — the opposite of faking a certified PASS (which release-keys did).
+spsm="$work/smali/android/os/SystemProperties.smali"
+[ -f "$spsm" ] || fail "SystemProperties.smali not found after baksmali"
+rk="$(grep -cF '"release-keys"' "$spsm")" || true
+[ "$rk" = "1" ] || fail "SystemProperties.smali '\"release-keys\"' count = $rk (expected 1) — ATL SystemProperties drifted; re-verify the honest-tags patch"
+perl -0pi -e 's{(const-string [vp]\d+, )"release-keys"}{$1"test-keys"}' "$spsm"
+grep -qF '"test-keys"' "$spsm" || fail "SystemProperties.smali test-keys insert failed (drift?)"
+! grep -qF '"release-keys"' "$spsm" || fail "SystemProperties.smali still reports release-keys — honest-tags fix regressed"
+
 # assemble View(+nested) + Display(+Mode) + Activity + Fragment + LocationManager + Vibrator +
 # AutofillManager + CookieManager + JobParameters + Paint -> classes2.dex
 mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
@@ -642,6 +681,7 @@ cp "$asm" "$work/smali-view/android/app/Activity.smali"
 cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
+cp "$spsm" "$work/smali-view/android/os/SystemProperties.smali"
 cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
 cp "$wvsm" "$work/smali-view/android/webkit/WebView.smali"

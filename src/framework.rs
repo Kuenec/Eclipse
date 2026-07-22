@@ -91,6 +91,8 @@ pub mod asset_registry;
 pub mod bitmap_registry;
 pub mod canvas_registry;
 pub mod matrix_registry;
+pub(crate) mod memory;
+mod message_queue;
 pub mod paint_registry;
 pub mod path_registry;
 pub mod sqlite;
@@ -4041,55 +4043,43 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.os.MessageQueue.nativeInit ====================
+// === Eclipse's host backing for android.os.MessageQueue ========================================
 //
-// 2026-06-05: step 0 (`Looper.prepareMainLooper`) builds the main thread's `MessageQueue`, whose
-// constructor calls `nativeInit()` and stores the returned `long` as `mPtr`. The first native the
-// dev-host run surfaces inside `prepareMainLooper` is `MessageQueue.nativeInit()` (`No
-// implementation found for long android.os.MessageQueue.nativeInit()`, run log 2026-06-05 against
-// com.ashwin.example.accelerometerdemo). AOSP's `MessageQueue.java` declares it
-//   `private native long nativeInit();`
-// — an INSTANCE native returning the native message-queue handle. `MessageQueue.<init>` then does
-// `if (mPtr == 0) throw new IllegalStateException("Unable to allocate native queue");`, so the only
-// Java-side contract is that the returned handle is **non-zero**.
+// Eclipse externally pumps Android's MAIN Looper from winit, so its empty/future poll must yield
+// instead of blocking the window thread. Ordinary Android worker loopers have the opposite contract:
+// `Looper.loop()` owns their thread and must sleep until a producer enqueues work and calls
+// `nativeWake`. A per-queue host handle records which policy applies and supplies a condition-variable
+// wait for workers. This is required by Play Core's `HandlerThread`: its Standard Integrity warm-up
+// is posted immediately after `getLooper()` returns, leaving exactly the race that a global
+// yield-on-empty implementation loses (the worker exits before the post arrives).
 //
-// 2026-06-12: the lifecycle still drives on a single attached main thread, but that thread is now
-// handed to winit's `run_windowed`, which PUMPS the main `Looper` once per frame via
-// [`pump_main_looper`] (`Looper.loop()` driven with the non-blocking [`message_queue_native_poll_once`]
-// below). So `nativePollOnce`/`nativeWake` ARE now bound; `nativeIsPolling`/`nativeDestroy` are NOT
-// (the main queue never idles-with-handler-tracking nor disposes — they'd raise a clean
-// `UnsatisfiedLinkError`, not UB, if reached). The handle (`mPtr`) is STILL not dereferenced: the poll
-// native applies its yield decision purely from the `timeoutMillis` arg and ignores `ptr`, so a full
-// generational-slab registry would still be dead weight (Simplicity First, AGENTS.md §Surgical). The
-// `nativeInit` sentinel therefore stays a stable non-zero, plainly-not-a-pointer marker. (A WORKER
-// thread that ran its own `Looper.loop()` would see the same yield-when-empty `nativePollOnce` and
-// exit immediately rather than block — none occur today; backing worker queues with a real blocking
-// wait is the documented follow-up if one appears.)
+// ATL's exact framework bytecode declares all five methods below as private static natives. Its
+// patched `nativePollOnce(JI)Z` returns `true` to make `MessageQueue.next()` yield `null`; `false`
+// makes Java re-check the synchronized message list. The worker wait therefore always returns false,
+// while only the winit-owned main queue returns true for a non-zero timeout.
 
-/// `android.os.MessageQueue` (internal/slashed name for `find_class`) — hosts the `nativeInit`
-/// queue-allocation native.
+/// `android.os.MessageQueue` (internal/slashed name for `find_class`).
 pub const MESSAGE_QUEUE_CLASS: &JNIStr = jni_str!("android/os/MessageQueue");
 
-// JNI name + descriptor for MessageQueue's native, exactly as declared in AOSP's `MessageQueue.java`:
-// `private native long nativeInit();` → an INSTANCE native, descriptor `()J`. (The ATL framework is
-// AOSP-derived; the run's `No implementation found for long android.os.MessageQueue.nativeInit()`
-// line + the `MessageQueue.<init> → nativeInit` stack confirm the name/arity/return.)
+// JNI names + descriptors exactly as declared by ATL's MessageQueue class.
 const MESSAGE_QUEUE_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
 const MESSAGE_QUEUE_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
-
-// 2026-06-12: bound so the MAIN-thread Looper can be PUMPED from the winit loop (`pump_main_looper`).
-// ATL declares these `private native static` (MessageQueue.java:53-54): `nativePollOnce(long,int)Z`
-// and `nativeWake(long)V`. ATL's patched `next()` (MessageQueue.java:137) is
-// `if (nativePollOnce(mPtr, timeout)) return null;` — so the yield/block decision lives ENTIRELY here.
-// Eclipse's main thread runs winit, not `Looper.loop()`, so the pump drives `Looper.loop()` once per
-// frame with a NON-BLOCKING `nativePollOnce`: it returns `false` for `timeout==0` (let `next()` pull a
-// ready message) and `true` otherwise (empty `-1` or future-delayed `>0` → yield → `next()` returns
-// null → `loop()` drains the ready batch and returns). A delayed message simply fires on the next
-// per-frame pump at/after its deadline (no WaitUntil re-arm — the renderer self-drives redraws).
+const MESSAGE_QUEUE_NATIVE_DESTROY_NAME: &JNIStr = jni_str!("nativeDestroy");
+const MESSAGE_QUEUE_NATIVE_DESTROY_SIG: &JNIStr = jni_str!("(J)V");
+const MESSAGE_QUEUE_NATIVE_IS_IDLING_NAME: &JNIStr = jni_str!("nativeIsIdling");
+const MESSAGE_QUEUE_NATIVE_IS_IDLING_SIG: &JNIStr = jni_str!("(J)Z");
 const MESSAGE_QUEUE_NATIVE_POLL_ONCE_NAME: &JNIStr = jni_str!("nativePollOnce");
 const MESSAGE_QUEUE_NATIVE_POLL_ONCE_SIG: &JNIStr = jni_str!("(JI)Z");
 const MESSAGE_QUEUE_NATIVE_WAKE_NAME: &JNIStr = jni_str!("nativeWake");
 const MESSAGE_QUEUE_NATIVE_WAKE_SIG: &JNIStr = jni_str!("(J)V");
+
+/// Thread that registers the framework natives and then creates the main `MessageQueue` during
+/// `Looper.prepareMainLooper`. `nativeInit` compares against this marker to distinguish that one
+/// externally-pumped queue from queues created by `HandlerThread`s. This is process-global rather
+/// than TLS so worker teardown cannot trigger the release-build `panic = "abort"` failure seen with
+/// an earlier diagnostic counter.
+static ANDROID_MAIN_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> =
+    std::sync::OnceLock::new();
 
 thread_local! {
     /// Main-thread re-entrancy guard for [`run_main_looper_once`]: set on pump entry, cleared on exit;
@@ -4106,63 +4096,79 @@ thread_local! {
 static MAIN_LOOPER_PUMP_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// The non-zero, non-pointer sentinel `MessageQueue.nativeInit()` returns as `mPtr`.
+/// Allocate one opaque, non-zero host queue handle.
 ///
-/// 2026-06-05: Java only checks `mPtr != 0`; this value is never dereferenced (no queue-consuming
-/// native is bound — see the section comment). A small, recognizable, plainly-not-a-pointer constant.
-const MESSAGE_QUEUE_HANDLE_SENTINEL: jlong = 0x4d51; // 'MQ' — a non-zero, non-pointer marker.
-
-/// `MessageQueue.nativeInit()` → a stable non-zero handle (`mPtr`).
-///
-/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are `(EnvUnowned, JObject this)`.
-/// `this` is not dereferenced. Returns [`MESSAGE_QUEUE_HANDLE_SENTINEL`] — non-zero so
-/// `MessageQueue.<init>`'s `mPtr == 0` guard passes; never a pointer (the handle has no dereferencing
-/// consumer in Eclipse's no-`Looper.loop()` lifecycle — see the section comment).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
-/// error/panic — but the body is infallible, so the sentinel is always returned.
+/// JNI ABI: a static `()J` native, hence `(EnvUnowned, JClass)`. Returning zero is ATL's ordinary
+/// allocation-failure signal; no Rust pointer crosses the Java boundary.
 extern "system" fn message_queue_native_init<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    _class: JClass<'local>,
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
+        let current_thread = std::thread::current().id();
+        let is_main = ANDROID_MAIN_THREAD_ID
+            .get()
+            .is_none_or(|main_thread| *main_thread == current_thread);
+        let Some(handle) = message_queue::create(is_main) else {
+            tracing::error!(
+                target: "android.os.MessageQueue",
+                "MessageQueue.nativeInit: host handle allocation failed"
+            );
+            return Ok(0);
+        };
         tracing::debug!(
             target: "android.os.MessageQueue",
-            handle = MESSAGE_QUEUE_HANDLE_SENTINEL,
-            "MessageQueue.nativeInit: returning non-GTK non-zero queue sentinel (no Looper.loop)"
+            handle,
+            is_main,
+            "MessageQueue.nativeInit: allocated host queue handle"
         );
-        Ok(MESSAGE_QUEUE_HANDLE_SENTINEL)
+        Ok(handle)
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `MessageQueue.nativePollOnce(long ptr, int timeoutMillis)` → the NON-BLOCKING yield decision that
-/// lets [`pump_main_looper`] drive `Looper.loop()` once and return (2026-06-12).
+/// Retire a queue handle. Any defensive in-flight waiter is released before its final Java check.
+extern "system" fn message_queue_native_destroy<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if !message_queue::destroy(ptr) {
+            tracing::debug!(
+                target: "android.os.MessageQueue",
+                handle = ptr,
+                "MessageQueue.nativeDestroy: ignored stale queue handle"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Report whether a worker queue is currently asleep in its host poll.
+extern "system" fn message_queue_native_is_idling<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(message_queue::is_idling(ptr)) })
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// Poll a queue according to its owner: yield the winit-driven main Looper, block worker Loopers.
 ///
-/// JNI ABI: a `static` native returning `jboolean` (jni-sys `jboolean` = Rust `bool`), parameters
-/// `(EnvUnowned, JClass, jlong ptr, jint timeout)`. `ptr` is the queue's `mPtr` (the sentinel) — NOT
-/// dereferenced. ATL's `next()` does `if (nativePollOnce(mPtr, timeout)) return null;`, so:
-/// - `timeout == 0` → return **`false`**: `next()` proceeds to pull the one ready message (counted).
-/// - `timeout != 0` (`-1` empty, or `> 0` a future-delayed head) → return **`true`**: `next()` returns
-///   null → `Looper.loop()` exits. The delayed message stays queued and fires on the next per-frame
-///   pump at/after its deadline. NEVER blocks (Eclipse's main thread is the winit thread, not a
-///   `Looper.loop()` thread). Counts `false` returns in [`MAIN_LOOPER_POLL_FALSE_COUNT`] for the drain log.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `jboolean` default (`false`) on error/panic — harmless (a spurious `false` just makes `next()` do one
-/// extra empty queue check, then yield on the following `-1` poll).
+/// ATL's `MessageQueue.next()` interprets `true` as an Eclipse-specific yield. Main polls therefore
+/// retain the established pure timeout decision. Worker polls sleep for `-1`/positive timeouts and
+/// then return false so Java can observe the posted message, elapsed deadline, or `mQuitting`.
 extern "system" fn message_queue_native_poll_once<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
-    _ptr: jlong,
+    ptr: jlong,
     timeout_millis: jint,
 ) -> jboolean {
     env.with_env(|_env| -> jni::errors::Result<jboolean> {
-        // No thread-local / no global state: this native runs on ANY thread (main pump AND any worker
-        // that runs its own Looper.loop()), so it must be allocation- and TLS-free to stay panic-free
-        // during a worker's teardown (panic = "abort"). The decision is purely a function of `timeout`.
-        Ok(main_looper_poll_should_yield(timeout_millis))
+        Ok(message_queue::poll_should_yield(ptr, timeout_millis))
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -4171,45 +4177,54 @@ extern "system" fn message_queue_native_poll_once<'local>(
 /// `timeout == 0` (a ready message exists → let `MessageQueue.next()` pull it); `true` otherwise
 /// (`-1` empty, or `> 0` a future-delayed head → yield so the driven `Looper.loop()` returns instead of
 /// blocking the winit/main thread; the delayed message fires on the next per-frame pump).
+#[cfg(test)]
 fn main_looper_poll_should_yield(timeout_millis: jint) -> bool {
     timeout_millis != 0
 }
 
-/// `MessageQueue.nativeWake(long ptr)` → no-op (2026-06-12).
-///
-/// JNI ABI: a `static` native returning void, parameters `(EnvUnowned, JClass, jlong ptr)`. On real
-/// Android this writes the queue's wake fd to break a blocking `nativePollOnce`. Eclipse never blocks
-/// in `nativePollOnce` (the winit loop re-pumps the main Looper every frame via the renderer's
-/// self-driven `request_redraw`), so a wake is implicit: any newly-enqueued message is dispatched on
-/// the next per-frame pump. Validated handle-free no-op; a cross-thread `EventLoopProxy` wake is a
-/// documented follow-up for the renderer-absent case.
+/// Wake a worker poll after Java enqueues work. Main-queue wakes remain harmless and durable.
 extern "system" fn message_queue_native_wake<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
-    _ptr: jlong,
+    ptr: jlong,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> { Ok(()) })
-        .resolve::<LogErrorAndDefault>()
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if !message_queue::wake(ptr) {
+            tracing::debug!(
+                target: "android.os.MessageQueue",
+                handle = ptr,
+                "MessageQueue.nativeWake: ignored stale queue handle"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.os.MessageQueue`'s `nativeInit`.
+/// Bind Eclipse's host backing for all ATL `android.os.MessageQueue` natives.
 ///
-/// Locates `android/os/MessageQueue` and registers the native via `RegisterNatives` (which wins over
-/// name-based lazy binding — JNI 1.1 spec). MUST run before step 0 (`Looper.prepareMainLooper`), which
-/// constructs the main `MessageQueue` and calls `nativeInit`; it is registered before the lifecycle
-/// drive alongside the other `android.os.*` natives.
+/// This runs on the future winit/main thread before `Looper.prepareMainLooper`, which both establishes
+/// the main-thread marker and ensures the constructor can call `nativeInit`.
 ///
 /// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI signature.
-/// It does, by construction — [`message_queue_native_init`] is written to the exact `()J` descriptor
-/// as an instance native (`EnvUnowned, JObject this`). The native body is `catch_unwind`-guarded via
-/// [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
+/// `register_native_methods` is `unsafe`: every function pointer below matches its ATL descriptor and
+/// all methods are static (`EnvUnowned, JClass, ...`). Native bodies resolve errors at the JNI edge.
 fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let registering_thread = std::thread::current().id();
+    let main_thread = ANDROID_MAIN_THREAD_ID.get_or_init(|| registering_thread);
+    if *main_thread != registering_thread {
+        tracing::warn!(
+            target: "android.os.MessageQueue",
+            expected = ?main_thread,
+            actual = ?registering_thread,
+            "MessageQueue natives registered from a different thread than the established Android main thread"
+        );
+    }
+
     let class = env.find_class(MESSAGE_QUEUE_CLASS)?;
     let methods = [
-        // SAFETY: `message_queue_native_init` matches the paired `()J` signature as an instance
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
+        // SAFETY: each function matches the paired static-native descriptor; the cast is the API's
+        // required representation for an `extern "system"` JNI function pointer.
         unsafe {
             NativeMethod::from_raw_parts(
                 MESSAGE_QUEUE_NATIVE_INIT_NAME,
@@ -4217,8 +4232,20 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 message_queue_native_init as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `message_queue_native_poll_once` matches the paired `(JI)Z` signature as a static
-        // native (MessageQueue.java:53); the cast is how `NativeMethod::from_raw_parts` takes it.
+        unsafe {
+            NativeMethod::from_raw_parts(
+                MESSAGE_QUEUE_NATIVE_DESTROY_NAME,
+                MESSAGE_QUEUE_NATIVE_DESTROY_SIG,
+                message_queue_native_destroy as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                MESSAGE_QUEUE_NATIVE_IS_IDLING_NAME,
+                MESSAGE_QUEUE_NATIVE_IS_IDLING_SIG,
+                message_queue_native_is_idling as *mut std::ffi::c_void,
+            )
+        },
         unsafe {
             NativeMethod::from_raw_parts(
                 MESSAGE_QUEUE_NATIVE_POLL_ONCE_NAME,
@@ -4226,8 +4253,6 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 message_queue_native_poll_once as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `message_queue_native_wake` matches the paired `(J)V` signature as a static native
-        // (MessageQueue.java:54); the cast is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 MESSAGE_QUEUE_NATIVE_WAKE_NAME,
@@ -4237,12 +4262,11 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
         },
     ];
     // SAFETY: `class` is the loaded android/os/MessageQueue; `methods` hold valid fn pointers whose
-    // signatures match the class's `native` declarations (AOSP/ATL `MessageQueue.java`: `nativeInit()J`,
-    // `nativePollOnce(JI)Z`, `nativeWake(J)V`, 2026-06-05/2026-06-12).
+    // signatures match ATL's five static native declarations, verified from framework bytecode.
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/MessageQueue",
-        "registered Eclipse's non-GTK backing for nativeInit + nativePollOnce + nativeWake (main-Looper pump)"
+        "registered Eclipse's host queue lifecycle + main/worker poll backing"
     );
     Ok(())
 }
@@ -9595,6 +9619,194 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
+// === Linux-backed android.app.ActivityManager memory surface ==================================
+//
+// 2026-07-18: ATL's `getMemoryInfo(MemoryInfo outInfo)` assigned a new object only to its LOCAL
+// parameter, leaving the caller's object unchanged at `totalMem = 10_000` bytes. Current Roblox's
+// `am.a.c(Context)` divides that field by 1 MiB for its device profile / Android User-Agent, so
+// Eclipse advertised the measured impossible `0MB`. Sober's independently logged 31,663 MiB is
+// exactly this host's `/proc/meminfo` MemTotal (32,423,572 KiB) truncated to MiB, proving the source
+// of the divergence. The overlay now delegates the surface to these Rust natives; `memory` reads the
+// Linux kernel and reports Eclipse's actual ART heap cap rather than another synthetic phone.
+
+/// `android.app.ActivityManager` (internal/slashed name for `find_class`).
+pub const ACTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/app/ActivityManager");
+
+const AM_NATIVE_FILL_MEMORY_INFO_NAME: &JNIStr = jni_str!("native_fillMemoryInfo");
+const AM_NATIVE_FILL_MEMORY_INFO_SIG: &JNIStr =
+    jni_str!("(Landroid/app/ActivityManager$MemoryInfo;)V");
+const AM_NATIVE_GET_MEMORY_CLASS_NAME: &JNIStr = jni_str!("native_getMemoryClass");
+const AM_NATIVE_GET_MEMORY_CLASS_SIG: &JNIStr = jni_str!("()I");
+const AM_NATIVE_GET_LARGE_MEMORY_CLASS_NAME: &JNIStr = jni_str!("native_getLargeMemoryClass");
+const AM_NATIVE_GET_LARGE_MEMORY_CLASS_SIG: &JNIStr = jni_str!("()I");
+const AM_NATIVE_IS_LOW_RAM_DEVICE_NAME: &JNIStr = jni_str!("native_isLowRamDevice");
+const AM_NATIVE_IS_LOW_RAM_DEVICE_SIG: &JNIStr = jni_str!("()Z");
+
+const MEMORY_INFO_AVAIL_MEM_FIELD: &JNIStr = jni_str!("availMem");
+const MEMORY_INFO_TOTAL_MEM_FIELD: &JNIStr = jni_str!("totalMem");
+const MEMORY_INFO_THRESHOLD_FIELD: &JNIStr = jni_str!("threshold");
+const MEMORY_INFO_LOW_MEMORY_FIELD: &JNIStr = jni_str!("lowMemory");
+const MEMORY_INFO_HIDDEN_THRESHOLD_FIELD: &JNIStr = jni_str!("hiddenAppThreshold");
+const MEMORY_INFO_SECONDARY_THRESHOLD_FIELD: &JNIStr = jni_str!("secondaryServerThreshold");
+const MEMORY_INFO_VISIBLE_THRESHOLD_FIELD: &JNIStr = jni_str!("visibleAppThreshold");
+const MEMORY_INFO_FOREGROUND_THRESHOLD_FIELD: &JNIStr = jni_str!("foregroundAppThreshold");
+const LONG_FIELD_SIG: &JNIStr = jni_str!("J");
+
+fn memory_bytes_to_jlong(bytes: u64) -> jlong {
+    jlong::try_from(bytes).unwrap_or(jlong::MAX)
+}
+
+/// Fill the caller-provided `ActivityManager.MemoryInfo` object from the Linux kernel.
+///
+/// The Android low-memory-killer thresholds remain zero: Linux has no Android LMK and inventing a
+/// phone profile would be less honest than explicitly reporting the capability as unavailable. The
+/// overlay's AOSP-shaped `writeToParcel` still carries all four zero fields so current Roblox sees
+/// the correct parcel wire shape instead of rejecting the old 28-byte stub.
+extern "system" fn activity_manager_native_fill_memory_info<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    out_info: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let Some(snapshot) = memory::host_memory_snapshot() else {
+            tracing::warn!(
+                target: "android.app.ActivityManager",
+                "getMemoryInfo: neither /proc/meminfo nor sysinfo produced a truthful memory \
+                 snapshot; leaving the caller's zero-initialized MemoryInfo unchanged"
+            );
+            return Ok(());
+        };
+
+        // SAFETY: every named field is a `long` on the committed ActivityManager.MemoryInfo
+        // overlay; pairing descriptor `J` with Primitive::Long satisfies FieldSignature's invariant.
+        // `set_field` additionally checks each receiver/field at runtime.
+        let long_sig = unsafe {
+            FieldSignature::from_raw_parts(LONG_FIELD_SIG, JavaType::Primitive(Primitive::Long))
+        };
+        let values = [
+            (
+                MEMORY_INFO_AVAIL_MEM_FIELD,
+                memory_bytes_to_jlong(snapshot.available_bytes),
+            ),
+            (
+                MEMORY_INFO_TOTAL_MEM_FIELD,
+                memory_bytes_to_jlong(snapshot.total_bytes),
+            ),
+            (MEMORY_INFO_THRESHOLD_FIELD, 0),
+            (MEMORY_INFO_HIDDEN_THRESHOLD_FIELD, 0),
+            (MEMORY_INFO_SECONDARY_THRESHOLD_FIELD, 0),
+            (MEMORY_INFO_VISIBLE_THRESHOLD_FIELD, 0),
+            (MEMORY_INFO_FOREGROUND_THRESHOLD_FIELD, 0),
+        ];
+        for (field, value) in values {
+            env.set_field(&out_info, field, &long_sig, JValue::Long(value))?;
+        }
+
+        // SAFETY: `lowMemory` is a `boolean` field on the same committed overlay; `Z` paired with
+        // Primitive::Boolean satisfies FieldSignature's invariant, and set_field runtime-checks it.
+        let boolean_sig = unsafe {
+            FieldSignature::from_raw_parts(
+                BOOLEAN_FIELD_SIG,
+                JavaType::Primitive(Primitive::Boolean),
+            )
+        };
+        env.set_field(
+            &out_info,
+            MEMORY_INFO_LOW_MEMORY_FIELD,
+            &boolean_sig,
+            JValue::Bool(false),
+        )?;
+
+        tracing::info!(
+            target: "android.app.ActivityManager",
+            total_mib = snapshot.total_mib(),
+            available_mib = snapshot.available_bytes / (1024 * 1024),
+            "getMemoryInfo: populated the caller's object from the Linux kernel"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn activity_manager_native_get_memory_class<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        Ok(jint::try_from(memory::managed_heap_mib()).unwrap_or(jint::MAX))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn activity_manager_native_get_large_memory_class<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jint {
+    env.with_env(|_env| -> jni::errors::Result<jint> {
+        // Eclipse starts one ART heap with one cap; `largeHeap` cannot enlarge it after VM startup.
+        Ok(jint::try_from(memory::managed_heap_mib()).unwrap_or(jint::MAX))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn activity_manager_native_is_low_ram_device<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> {
+        let Some(snapshot) = memory::host_memory_snapshot() else {
+            tracing::warn!(
+                target: "android.app.ActivityManager",
+                "isLowRamDevice: host memory could not be detected; returning false"
+            );
+            return Ok(false);
+        };
+        Ok(snapshot.is_low_ram_device())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Bind the four native methods declared by Eclipse's ActivityManager overlay.
+///
+/// # Safety / soundness
+/// Every pointer matches its exact static JNI descriptor, pinned by
+/// `activity_manager_memory_native_names_sigs_and_class_match_the_overlay`; all bodies use
+/// `EnvUnowned::with_env`, so a Rust panic cannot unwind across JNI.
+fn register_activity_manager_memory_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    // SAFETY (per entry): each extern-system function matches its paired private-static native
+    // declaration in tools/framework-overlay/src/android/app/ActivityManager.java.
+    let bindings: [NativeBinding; 4] = [
+        (
+            AM_NATIVE_FILL_MEMORY_INFO_NAME,
+            AM_NATIVE_FILL_MEMORY_INFO_SIG,
+            activity_manager_native_fill_memory_info as *mut c_void,
+        ),
+        (
+            AM_NATIVE_GET_MEMORY_CLASS_NAME,
+            AM_NATIVE_GET_MEMORY_CLASS_SIG,
+            activity_manager_native_get_memory_class as *mut c_void,
+        ),
+        (
+            AM_NATIVE_GET_LARGE_MEMORY_CLASS_NAME,
+            AM_NATIVE_GET_LARGE_MEMORY_CLASS_SIG,
+            activity_manager_native_get_large_memory_class as *mut c_void,
+        ),
+        (
+            AM_NATIVE_IS_LOW_RAM_DEVICE_NAME,
+            AM_NATIVE_IS_LOW_RAM_DEVICE_SIG,
+            activity_manager_native_is_low_ram_device as *mut c_void,
+        ),
+    ];
+    let bound = register_class_natives_best_effort(env, ACTIVITY_MANAGER_CLASS, &bindings)?;
+    tracing::info!(
+        bound,
+        "registered Linux-backed ActivityManager memory APIs (kernel total/available RAM, actual \
+         ART heap class, detected low-RAM class; Android LMK thresholds honestly unavailable) \
+         (per-method best-effort)"
+    );
+    Ok(())
+}
+
 // === Eclipse's own backing for android.webkit.WebSettings' User-Agent =============================
 //
 // 2026-07-16 (plan M6, the §6 2026-07-16 💥 fix): the Roblox app CALLS
@@ -9820,8 +10032,9 @@ static MAIN_DISPATCH_DEGRADED: std::sync::atomic::AtomicBool =
 /// `cookie_get_blocking`'s 5 s cap exceed this on their own. When it fires the job is reclaimed and
 /// run on the Looper-less caller — honest, never dropped, and loudly warned, but it IS the
 /// pre-2026-07-16 delivery (the app's own `new Handler()` will throw again). The durable class-level
-/// fix is the `EventLoopProxy` wake already named at [`register_message_queue_natives`]'s
-/// `nativeWake` no-op. Note the case where main is INSIDE the job (app code parked in a 5 s
+/// fix is an `EventLoopProxy` wake for the externally-pumped main queue; worker `nativeWake` is now
+/// fully backed, but a main-queue wake still cannot interrupt winit. Note the case where main is
+/// INSIDE the job (app code parked in a 5 s
 /// getCookie) is NOT this branch: main has already taken the job, so the reclaim finds nothing and
 /// the poster waits unbounded — correct, and it terminates when main finishes.
 const MAIN_DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -9960,9 +10173,8 @@ fn warn_main_dispatch_degraded(what: &'static str, gate: MainDispatchGate) {
             "app-facing WebView callback could NOT be delivered on the main/UI thread — running it \
              on this Looper-less thread instead (the pre-2026-07-16 delivery: the app's own \
              new Handler() will throw). Never dropped; logged once. Outside process teardown this \
-             means the main Looper pump is not running — MessageQueue.nativeWake is a deliberate \
-             no-op, so a cross-thread post cannot wake winit; the EventLoopProxy wake named there \
-             is the durable follow-up."
+             means the main Looper pump is not running — a main-queue MessageQueue.nativeWake \
+             cannot wake winit without an EventLoopProxy; that host wake is the durable follow-up."
         );
     }
 }
@@ -10153,7 +10365,35 @@ fn fire_internal_load_changed_inner(
 ///
 /// MUST be called on the process main thread with the booted [`Vm`] (the
 /// [`drive_application_lifecycle`] threading/panic contract).
+#[derive(Clone, Copy)]
+enum DirectWebViewMode {
+    Smoke,
+    RobloxLogin,
+}
+
+/// Open Roblox's first-party HTTPS login page in Eclipse's production WebView profile.
+///
+/// This deliberately creates an ordinary WebView with a stock `WebViewClient`: unlike the smoke
+/// harness it exposes no test JavaScript interface. The helper uses the same persistent cookie
+/// profile as Android's `CookieManager`, so a login completed by the owner remains first-party and
+/// can be observed naturally on the next app boot. No credential or challenge URL is logged.
+pub fn drive_roblox_web_login(vm: &Vm) -> Result<jlong, FrameworkError> {
+    drive_direct_webview(
+        vm,
+        "https://www.roblox.com/login",
+        DirectWebViewMode::RobloxLogin,
+    )
+}
+
 pub fn drive_webview_smoke(vm: &Vm, url: &str) -> Result<jlong, FrameworkError> {
+    drive_direct_webview(vm, url, DirectWebViewMode::Smoke)
+}
+
+fn drive_direct_webview(
+    vm: &Vm,
+    url: &str,
+    mode: DirectWebViewMode,
+) -> Result<jlong, FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
@@ -10162,14 +10402,18 @@ pub fn drive_webview_smoke(vm: &Vm, url: &str) -> Result<jlong, FrameworkError> 
     // by the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton).
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| webview_smoke_inner(env, url))) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| direct_webview_inner(env, url, mode))) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
         }
     })
 }
 
-fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError> {
+fn direct_webview_inner(
+    env: &mut Env,
+    url: &str,
+    mode: DirectWebViewMode,
+) -> Result<jlong, FrameworkError> {
     register_web_view_natives(env)?;
     // 2026-07-09 (plan M4): the __webview-test cookie leg needs the CookieManager natives bound.
     register_cookie_manager_natives(env)?;
@@ -10199,20 +10443,23 @@ fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError
     checked(env, "WebView.widget=", |env| {
         env.set_field(&webview, jni_str!("widget"), &long_sig, handle.into())
     })?;
-    // 2026-07-16 (web-engine M6): the DRIVEN client is EclipseWebViewClientProbe, NOT a stock
-    // `new WebViewClient()`. The stock client's page callbacks are EMPTY BODIES that construct no
-    // Handler — which is EXACTLY why this harness passed green while every real app callback threw
-    // (challenge17/18). The probe carries the app's real shape (`new Handler()`, the
-    // SwipeRefreshLayout.setRefreshing -> View.startAnimation chain) plus the AOSP UI-thread
-    // assertion, so a Looper-less OR merely-non-main dispatch throws, internalLoadChanged returns
-    // false, and the pinned "upcalls 2/2" marker FAILS instead of passing silently. It also
-    // overrides the AOSP 3-arg onPageStarted, pinning the M6 3-arg dispatch end-to-end.
-    let client_class = checked(
-        env,
-        "find_class android.webkit.EclipseWebViewClientProbe",
-        |env| env.find_class(jni_str!("android/webkit/EclipseWebViewClientProbe")),
-    )?;
-    let client_obj = checked(env, "EclipseWebViewClientProbe.<init>", |env| {
+    // The smoke uses EclipseWebViewClientProbe because its callbacks assert main-thread delivery.
+    // The real login uses the stock client and exposes no probe-only behavior to first-party web
+    // content.
+    let (client_class_name, client_step) = match mode {
+        DirectWebViewMode::Smoke => (
+            jni_str!("android/webkit/EclipseWebViewClientProbe"),
+            "EclipseWebViewClientProbe.<init>",
+        ),
+        DirectWebViewMode::RobloxLogin => (
+            jni_str!("android/webkit/WebViewClient"),
+            "WebViewClient.<init>",
+        ),
+    };
+    let client_class = checked(env, "find WebViewClient class", |env| {
+        env.find_class(client_class_name)
+    })?;
+    let client_obj = checked(env, client_step, |env| {
         env.new_object(&client_class, jni_sig!("()V"), &[])
     })?;
     checked(env, "WebView.setWebViewClient", |env| {
@@ -10224,25 +10471,25 @@ fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError
         )?
         .v()
     })?;
-    // 2026-07-09 (plan M4): addJavascriptInterface(new EclipseBridgeProbe(), "EclipseTest") BEFORE
-    // loadUrl (the common order) — drives the new native → the reflective bridge register. The
-    // probe's @JavascriptInterface echo records its arg + returns "echo:<arg>" (the bridge leg).
-    let probe_class = checked(env, "find_class EclipseBridgeProbe", |env| {
-        env.find_class(jni_str!("android/webkit/EclipseBridgeProbe"))
-    })?;
-    let probe = checked(env, "EclipseBridgeProbe.<init>", |env| {
-        env.new_object(&probe_class, jni_sig!("()V"), &[])
-    })?;
-    let iface_name = env.new_string("EclipseTest")?;
-    checked(env, "WebView.addJavascriptInterface", |env| {
-        env.call_method(
-            &webview,
-            jni_str!("addJavascriptInterface"),
-            jni_sig!("(Ljava/lang/Object;Ljava/lang/String;)V"),
-            &[JValue::Object(&probe), JValue::Object(&iface_name)],
-        )?
-        .v()
-    })?;
+    if matches!(mode, DirectWebViewMode::Smoke) {
+        // The test-only bridge is never registered on the first-party login view.
+        let probe_class = checked(env, "find_class EclipseBridgeProbe", |env| {
+            env.find_class(jni_str!("android/webkit/EclipseBridgeProbe"))
+        })?;
+        let probe = checked(env, "EclipseBridgeProbe.<init>", |env| {
+            env.new_object(&probe_class, jni_sig!("()V"), &[])
+        })?;
+        let iface_name = env.new_string("EclipseTest")?;
+        checked(env, "WebView.addJavascriptInterface", |env| {
+            env.call_method(
+                &webview,
+                jni_str!("addJavascriptInterface"),
+                jni_sig!("(Ljava/lang/Object;Ljava/lang/String;)V"),
+                &[JValue::Object(&probe), JValue::Object(&iface_name)],
+            )?
+            .v()
+        })?;
+    }
     // The PRODUCTION entry: installed-dex Java loadUrl → the registered native → the client.
     let jurl = env.new_string(url)?;
     checked(env, "WebView.loadUrl", |env| {
@@ -10254,10 +10501,16 @@ fn webview_smoke_inner(env: &mut Env, url: &str) -> Result<jlong, FrameworkError
         )?
         .v()
     })?;
-    tracing::info!(
-        handle,
-        "__webview-test: WebView.loadUrl driven through the production native path"
-    );
+    match mode {
+        DirectWebViewMode::Smoke => tracing::info!(
+            handle,
+            "__webview-test: WebView.loadUrl driven through the production native path"
+        ),
+        DirectWebViewMode::RobloxLogin => tracing::info!(
+            handle,
+            "opened Roblox's first-party login page in Eclipse's persistent WebView profile"
+        ),
+    }
     Ok(handle)
 }
 
@@ -16227,9 +16480,10 @@ const MAIN_LOOPER_MESSAGE_BUDGET: usize = 512;
 /// Drive up to [`MAIN_LOOPER_MESSAGE_BUDGET`] ready main-thread messages, mirroring
 /// `android.os.Looper.loop()`'s body (`myQueue` → `next` → `getTarget` → `dispatchMessage` → `recycle`,
 /// exactly ATL's `Looper.loop`) but RETURNING after the cap instead of looping until the queue is empty.
-/// `MessageQueue.next()` is non-blocking under Eclipse (ATL's `nativePollOnce` returns rather than
-/// blocking when no message is ready, so `next()` yields `null`), so the loop ends early once the queue
-/// drains. Each message is dispatched inside its own local frame (bounded JNI local refs over the loop)
+/// The MAIN `MessageQueue.next()` is non-blocking under Eclipse (ATL's `nativePollOnce` returns rather
+/// than blocking when no message is ready, so `next()` yields `null`), so the loop ends early once the
+/// queue drains. Worker queues retain normal blocking semantics. Each message is dispatched inside its
+/// own local frame (bounded JNI local refs over the loop)
 /// and a thrown handler is described+cleared so one bad handler can't stop the batch — stricter than
 /// `Looper.loop`, which aborts the whole loop on a throw.
 fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
@@ -17411,6 +17665,11 @@ fn drive_lifecycle(
     // isActiveNetworkMetered / nativeGetNetworkAvailable) — Roblox's jobqueue connectivity monitor calls
     // registerNetworkCallback in ActivitySplash.onCreate (step 5). Non-GTK no-op/available backing.
     register_connectivity_natives(env)?;
+    // 2026-07-18: bind Eclipse's host-backed ActivityManager memory surface before app startup.
+    // ATL's getMemoryInfo only reassigned its local out-parameter, making Roblox report `0MB` in
+    // its device profile/User-Agent; the overlay now fills that exact caller object from the Linux
+    // kernel and reports Eclipse's real ART heap cap.
+    register_activity_manager_memory_natives(env)?;
     // Bind android.os.Vibrator's FULL declared native list — getSystemService("vibrator")
     // constructs the class from a main-Looper message (Roblox InitHelper's AsyncTask
     // onPostExecute), and its CONSTRUCTOR calls native_constructor(); unbound, the
@@ -17668,7 +17927,6 @@ fn drive_lifecycle(
     // `activity_start`: the Activity reaches the RESUMED (running/interactive) state, running the
     // app's own `onResume` override.
     call_activity_on_resume(env, &activity, "step 7 Activity.onResume")?;
-
     tracing::info!(
         activity = launcher_activity,
         "Activity resumed: recipe steps 1–7 driven (launcher Activity onStart + onResume)"
@@ -19678,18 +19936,18 @@ mod tests {
 
     #[test]
     fn message_queue_native_name_sig_and_class_match_art_reported() {
-        // Pin android.os.MessageQueue.nativeInit's class, method name, and JNI descriptor against the
-        // exact signature ART reported missing (`No implementation found for long
-        // android.os.MessageQueue.nativeInit()`, run log 2026-06-05) + AOSP `MessageQueue.java`'s
-        // `private native long nativeInit();`: a transcription regression would make RegisterNatives
-        // throw NoSuchMethodError at step 0 (or the native go unbound, re-throwing the
-        // UnsatisfiedLinkError that blocked Looper.prepareMainLooper). Host-independent constants.
+        // Pin all five static natives against ATL's disassembled MessageQueue declarations. A
+        // descriptor regression would make RegisterNatives throw before Looper.prepareMainLooper.
         assert_eq!(MESSAGE_QUEUE_CLASS.to_str(), "android/os/MessageQueue");
         assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_NAME.to_str(), "nativeInit");
         assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_SIG.to_str(), "()J");
-        // 2026-06-12: nativePollOnce/nativeWake — the main-Looper pump natives (MessageQueue.java:53-54).
-        // A descriptor regression would make RegisterNatives throw NoSuchMethodError, or leave next()'s
-        // nativePollOnce unbound → UnsatisfiedLinkError the moment pump_main_looper drives Looper.loop().
+        assert_eq!(MESSAGE_QUEUE_NATIVE_DESTROY_NAME.to_str(), "nativeDestroy");
+        assert_eq!(MESSAGE_QUEUE_NATIVE_DESTROY_SIG.to_str(), "(J)V");
+        assert_eq!(
+            MESSAGE_QUEUE_NATIVE_IS_IDLING_NAME.to_str(),
+            "nativeIsIdling"
+        );
+        assert_eq!(MESSAGE_QUEUE_NATIVE_IS_IDLING_SIG.to_str(), "(J)Z");
         assert_eq!(
             MESSAGE_QUEUE_NATIVE_POLL_ONCE_NAME.to_str(),
             "nativePollOnce"
@@ -19699,9 +19957,6 @@ mod tests {
         assert_eq!(MESSAGE_QUEUE_NATIVE_WAKE_SIG.to_str(), "(J)V");
         // The Looper class whose static prepareMainLooper() (step 0) builds the MessageQueue.
         assert_eq!(LOOPER_CLASS.to_str(), "android/os/Looper");
-        // Java's MessageQueue.<init> requires mPtr != 0; the sentinel must be non-zero (and is a
-        // plainly-non-pointer marker, never dereferenced — see register_message_queue_natives docs).
-        assert_ne!(MESSAGE_QUEUE_HANDLE_SENTINEL, 0);
     }
 
     #[test]
@@ -20526,6 +20781,41 @@ mod tests {
         // so it is bound by its own register_web_view_natives (all 3 natives in one best-effort
         // array). Adding it here too would double-register the constructor.
         assert!(!names.iter().any(|n| n == "android/webkit/WebView"));
+    }
+
+    #[test]
+    fn activity_manager_memory_native_names_sigs_and_class_match_the_overlay() {
+        // 2026-07-18: pin all four private-static natives declared by the committed
+        // ActivityManager.java overlay. A drift makes RegisterNatives skip that entry and restores
+        // the impossible 0MB device profile (or the old 20/60 MiB synthetic heap classes).
+        assert_eq!(
+            ACTIVITY_MANAGER_CLASS.to_str(),
+            "android/app/ActivityManager"
+        );
+        assert_eq!(
+            AM_NATIVE_FILL_MEMORY_INFO_NAME.to_str(),
+            "native_fillMemoryInfo"
+        );
+        assert_eq!(
+            AM_NATIVE_FILL_MEMORY_INFO_SIG.to_str(),
+            "(Landroid/app/ActivityManager$MemoryInfo;)V"
+        );
+        assert_eq!(
+            AM_NATIVE_GET_MEMORY_CLASS_NAME.to_str(),
+            "native_getMemoryClass"
+        );
+        assert_eq!(AM_NATIVE_GET_MEMORY_CLASS_SIG.to_str(), "()I");
+        assert_eq!(
+            AM_NATIVE_GET_LARGE_MEMORY_CLASS_NAME.to_str(),
+            "native_getLargeMemoryClass"
+        );
+        assert_eq!(AM_NATIVE_GET_LARGE_MEMORY_CLASS_SIG.to_str(), "()I");
+        assert_eq!(
+            AM_NATIVE_IS_LOW_RAM_DEVICE_NAME.to_str(),
+            "native_isLowRamDevice"
+        );
+        assert_eq!(AM_NATIVE_IS_LOW_RAM_DEVICE_SIG.to_str(), "()Z");
+        assert_eq!(memory_bytes_to_jlong(u64::MAX), jlong::MAX);
     }
 
     #[test]
