@@ -449,6 +449,17 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let asset_count = apk.extract_assets(&assets_dir)?;
     println!("extracted {asset_count} asset file(s) ✓");
 
+    // Android Roblox intentionally draws its own white software pointer. In keyboard/mouse mode
+    // Eclipse keeps the user's real compositor cursor instead, so suppress only Roblox's standard
+    // desktop/camera cursor textures before ART or an engine worker can cache them. Touch modes keep
+    // the original Android visuals. APK byte reads receive the same replacement through `Apk`.
+    let cursor_asset_count = eclipse::system_cursor::install(&assets_dir, config.touch_mode)?;
+    if config.touch_mode == eclipse::config::TouchMode::Off {
+        println!(
+            "desktop system cursor active (suppressed {cursor_asset_count} extracted Roblox cursor texture(s)) ✓"
+        );
+    }
+
     // Boot the ART VM from this (main) thread — the production entry point — with the APK on the
     // classpath, so ART loads Roblox's Java (+ the android.* framework) alongside libcore, and the
     // extracted app-lib dir on java.library.path so System.loadLibrary finds libroblox.so.
