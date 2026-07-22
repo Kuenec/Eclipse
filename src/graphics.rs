@@ -69,6 +69,16 @@ const COMPOSITE_FRAG_SPV: &[u8] = include_bytes!("../shaders/composite.frag.spv"
 /// descriptor pool to this avoids a per-frame pool rebuild.
 const MAX_COMPOSITE_VIEWS: usize = 16;
 
+/// Once Roblox owns the surface, winit still has to pump Android's main Looper because this process
+/// has no `Looper.loop()` call. A deadline keeps that bridge responsive without `ControlFlow::Poll`'s
+/// unbounded hot spin (measured at a full host CPU core while Roblox was idle). Four milliseconds is
+/// a 250 Hz ceiling: just above Roblox's 240 FPS maximum while leaving render workers the CPU.
+const ENGINE_MAIN_LOOP_TICK: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Wayland does not guarantee a `WindowEvent::Moved`, so periodically re-read `current_monitor()`.
+/// The profile cache means this becomes one small winit query and no JNI work when unchanged.
+const DISPLAY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Pixel height the glyph atlas is rasterized at, and the text color drawn over view rects.
 const TEXT_PX: f32 = 28.0;
 const TEXT_COLOR: [f32; 4] = [0.08, 0.09, 0.12, 1.0]; // near-black, reads on the light view quads
@@ -91,6 +101,9 @@ struct GameWindow<'vm> {
     /// then clicks are hit-tested but not dispatched. The borrow keeps the VM alive for the whole
     /// event loop; the loop runs on the JNI-attached main thread, so the VM is reachable here.
     vm: Option<&'vm crate::runtime::Vm>,
+    /// Sober-compatible input presentation. `Off` routes the host mouse through Roblox's dedicated
+    /// desktop JNI bridge; `On`/`FakeOff` retain touchscreen-style `MotionEvent` delivery.
+    touch_mode: crate::config::TouchMode,
     /// The last pointer position in window pixels (top-left origin), updated on `CursorMoved`. `None`
     /// until the pointer first moves over the window. The press/release click uses this position.
     cursor: Option<(f32, f32)>,
@@ -163,9 +176,6 @@ struct GameWindow<'vm> {
     engine_synthetic_submit_done: bool,
     /// 2026-06-14 — set once the env-gated engine-input-bridge reflection diagnostic has fired.
     engine_reflect_done: bool,
-    /// 2026-06-14 — running Android `META_*` modifier bitmask (shift/ctrl/alt), updated as modifier
-    /// keys are pressed/released, and passed as the `metaState` of each engine `KeyEvent`.
-    key_meta_state: i32,
     /// 2026-07-03 (web-engine M3) — `true` while a primary press that landed INSIDE the live
     /// WebView's composite rect is in flight: the matching release routes to the helper too, so a
     /// press/release pair never splits between the webview and the engine.
@@ -174,6 +184,73 @@ struct GameWindow<'vm> {
     /// and the post-`run_app` fallback all call the same method; only the first may drive Java/native
     /// lifecycle or retire the helper.
     runtime_shutdown_started: bool,
+    /// Last host display profile successfully published to Roblox. Kept in integer millihertz so
+    /// monitor moves can cheaply avoid repeating JNI calls and fractional rates compare exactly.
+    published_display_refresh_profile: Option<DisplayRefreshProfile>,
+    /// Next deadline for the Wayland-safe monitor refresh check. `WindowEvent::Moved` is retained as
+    /// the immediate path on backends that provide it; this closes the Wayland notification gap.
+    next_display_refresh_poll: std::time::Instant,
+}
+
+/// Current + supported refresh rates for the monitor containing the Eclipse window. Android's
+/// `Display.getSupportedRefreshRates()` reports rates for the display's default/current-resolution
+/// modes, so alternate-resolution-only modes are deliberately excluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayRefreshProfile {
+    current_millihertz: Option<u32>,
+    supported_millihertz: Vec<u32>,
+}
+
+impl DisplayRefreshProfile {
+    fn current_hz(&self) -> Option<f32> {
+        self.current_millihertz.map(|rate| rate as f32 / 1000.0)
+    }
+
+    fn supported_hz(&self) -> Vec<f32> {
+        self.supported_millihertz
+            .iter()
+            .map(|rate| *rate as f32 / 1000.0)
+            .collect()
+    }
+}
+
+/// Normalize a monitor's raw modes into the Android display profile sent to Roblox. Pure and
+/// window-free so the exact filter/dedup/fallback contract has a regression test.
+fn normalize_display_refresh_profile(
+    current_millihertz: Option<u32>,
+    current_size: (u32, u32),
+    modes: impl IntoIterator<Item = ((u32, u32), u32)>,
+) -> Option<DisplayRefreshProfile> {
+    let current_millihertz = current_millihertz.filter(|rate| *rate > 0);
+    let mut supported_millihertz: Vec<u32> = modes
+        .into_iter()
+        .filter_map(|(size, rate)| (size == current_size && rate > 0).then_some(rate))
+        .collect();
+    if let Some(current) = current_millihertz {
+        supported_millihertz.push(current);
+    }
+    supported_millihertz.sort_unstable();
+    supported_millihertz.dedup();
+    (!supported_millihertz.is_empty()).then_some(DisplayRefreshProfile {
+        current_millihertz,
+        supported_millihertz,
+    })
+}
+
+fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
+    let monitor = window.current_monitor()?;
+    let size = monitor.size();
+    normalize_display_refresh_profile(
+        monitor.refresh_rate_millihertz(),
+        (size.width, size.height),
+        monitor.video_modes().map(|mode| {
+            let mode_size = mode.size();
+            (
+                (mode_size.width, mode_size.height),
+                mode.refresh_rate_millihertz(),
+            )
+        }),
+    )
 }
 
 impl ApplicationHandler for GameWindow<'_> {
@@ -303,6 +380,7 @@ impl ApplicationHandler for GameWindow<'_> {
         }
 
         self.window = Some(window);
+        self.publish_engine_display_refresh_rates();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -335,7 +413,13 @@ impl ApplicationHandler for GameWindow<'_> {
                     .as_ref()
                     .map(|w| w.as_native_window() as usize);
                 publish_engine_window_geometry(wsi_ptr, geo.width, geo.height);
+                // The initial Wayland configure commonly makes `current_monitor()` available only
+                // after `resumed`; retry here. The profile cache makes ordinary resizes a no-op.
+                self.publish_engine_display_refresh_rates();
             }
+            // Re-publish when the window crosses monitors; Roblox should offer the capabilities of
+            // the display it is actually rendering on, not the launch monitor forever.
+            WindowEvent::Moved(_) => self.publish_engine_display_refresh_rates(),
             WindowEvent::RedrawRequested => {
                 // Draw cascade: before the frame, drive each custom View's onDraw(Canvas) into an
                 // Eclipse Pixmap, then hand the drawn canvases to the renderer to composite this frame.
@@ -360,9 +444,13 @@ impl ApplicationHandler for GameWindow<'_> {
             // `View.dispatchTouchEvent`, which runs the View's own touch handling + click detection.
             // Multi-touch / ACTION_MOVE / key / NDK-AInputQueue dispatch is the documented follow-up.
             WindowEvent::CursorMoved { position, .. } => {
+                let previous = self.cursor;
                 self.cursor = Some((position.x as f32, position.y as f32));
-                // Engine mode: while the primary button is down, a move is a DRAG — forward
-                // ACTION_MOVE so the engine tracks it (scroll lists, sliders). No-op otherwise.
+                let (dx, dy) = previous.map_or((0.0, 0.0), |(old_x, old_y)| {
+                    (position.x as f32 - old_x, position.y as f32 - old_y)
+                });
+                // Engine mode: desktop input forwards every host move through Roblox's own
+                // nativePassMouseMove bridge. Touch modes forward ACTION_MOVE only during a press.
                 // 2026-07-03 (web-engine M3): a move INSIDE the live WebView's composite rect
                 // routes to the helper (view-relative) instead and never leaks to the engine.
                 if self.handed_off {
@@ -376,18 +464,14 @@ impl ApplicationHandler for GameWindow<'_> {
                             _ => false,
                         };
                     if !routed {
-                        self.engine_pointer_move();
+                        self.engine_pointer_move(dx, dy);
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if self.handed_off {
+            WindowEvent::MouseInput { state, button, .. } if self.handed_off => {
+                if button == MouseButton::Left {
                     // Engine owns rendering + its own Lua UI: forward the raw pointer to the engine's
-                    // RBXSurfaceView (no renderer, no Eclipse-view hit-test).
+                    // selected desktop/touch bridge (no renderer, no Eclipse-view hit-test).
                     // 2026-07-03 (web-engine M3): a press INSIDE the live WebView's composite rect
                     // routes to the helper; the matching release follows the press's routing so a
                     // press/release pair never splits between the webview and the engine.
@@ -429,14 +513,19 @@ impl ApplicationHandler for GameWindow<'_> {
                         }
                     }
                 } else {
-                    match state {
-                        ElementState::Pressed => self.handle_primary_press(),
-                        ElementState::Released => self.handle_primary_release(),
-                    }
+                    self.engine_aux_mouse_button(button, state == ElementState::Pressed);
                 }
             }
-            // 2026-06-14: keyboard — forward keys to the engine's RBXSurfaceView.dispatchKeyEvent
-            // (engine mode only; the pre-handoff Java-view apps have no key path here).
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => self.handle_primary_press(),
+                ElementState::Released => self.handle_primary_release(),
+            },
+            // Hardware keyboard — forward keys through Roblox's NativeGLInterface bridge (engine
+            // mode only; the pre-handoff Java-view apps have no key path here).
             // 2026-07-03 (web-engine M3): while a WebView is live, ALL keys route to the helper
             // (the challenge widget owns keyboard focus) and never reach the engine beneath it.
             WindowEvent::KeyboardInput { event, .. } if self.handed_off => {
@@ -512,12 +601,22 @@ impl ApplicationHandler for GameWindow<'_> {
         // dispatch makes the surface free before the engine takes it. The dispatch is itself self-gated
         // (no-op into an empty callback list), so this is safe to retry: `Ok(false)`/`Err` = retry.
         // RedrawRequested's `Some(renderer)` guard means Eclipse stops drawing once the renderer is
-        // gone; we keep pumping the main Looper above and switch to Poll so the loop keeps ticking.
+        // gone; we keep pumping the main Looper above on the deadline-driven tick armed below.
         if !self.handed_off && self.engine_window.is_some() {
             match crate::framework::engine_surface_callback_ready(vm) {
                 Ok(true) => {
                     let (w, h) =
                         crate::loader::ndk_registry::engine_window_geometry().unwrap_or((1, 1));
+                    // Remote client settings initialize after libroblox's constructors and can
+                    // replace host-required defaults (notably disabling FMOD's AAudio→OpenSL
+                    // fallback). Re-apply the semantically located booleans at the last safe seam:
+                    // immediately before surfaceCreated starts the Lua app, and well before UGC
+                    // audio initialization.
+                    let runtime_overrides = crate::loader::engine::reapply_host_bool_overrides();
+                    tracing::info!(
+                        runtime_overrides,
+                        "re-applied host runtime overrides before SurfaceView lifecycle"
+                    );
                     // (1) Release the surface BEFORE the engine creates its EGL window surface on it.
                     self.renderer = None;
                     // (2) Hand the (now-free) surface to the engine.
@@ -526,7 +625,6 @@ impl ApplicationHandler for GameWindow<'_> {
                     }
                     self.handed_off = true;
                     self.handoff_at = Some(std::time::Instant::now());
-                    event_loop.set_control_flow(ControlFlow::Poll);
                     tracing::info!(
                         width = w,
                         height = h,
@@ -565,6 +663,19 @@ impl ApplicationHandler for GameWindow<'_> {
         // live; gone entirely otherwise (one atomic load).
         if self.handed_off && crate::webview::client::active_view() != 0 {
             crate::webview::client::update_composited_rect();
+        }
+        let now = std::time::Instant::now();
+        if now >= self.next_display_refresh_poll {
+            self.publish_engine_display_refresh_rates();
+            self.next_display_refresh_poll = now + DISPLAY_REFRESH_POLL_INTERVAL;
+        }
+        if self.handed_off {
+            // Re-arm every iteration: once a WaitUntil deadline has elapsed it is in the past, which
+            // otherwise degenerates into the same busy loop as Poll. Window/input events still wake
+            // the loop immediately, before this deadline.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + ENGINE_MAIN_LOOP_TICK,
+            ));
         }
     }
 
@@ -644,6 +755,41 @@ fn route_key_to_webview(view: i64, event: &winit::event::KeyEvent) {
 }
 
 impl GameWindow<'_> {
+    /// Send the real monitor's refresh profile through Roblox's Android display bridge. This runs
+    /// after winit creates the host window because only then can Eclipse know which monitor owns it;
+    /// the earlier Java `Activity.onStart` call sees the framework's conservative 60 Hz fallback.
+    fn publish_engine_display_refresh_rates(&mut self) {
+        let Some(profile) = self.window.as_ref().and_then(display_refresh_profile) else {
+            tracing::debug!("host monitor refresh rates unavailable; keeping Android fallback");
+            return;
+        };
+        if self.published_display_refresh_profile.as_ref() == Some(&profile) {
+            return;
+        }
+        let Some(vm) = self.vm else { return };
+        let supported_hz = profile.supported_hz();
+        match crate::framework::publish_engine_display_refresh_rates(
+            vm,
+            profile.current_hz(),
+            &supported_hz,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    current_hz = ?profile.current_hz(),
+                    supported_hz = ?supported_hz,
+                    "published host display refresh rates to Roblox"
+                );
+                self.published_display_refresh_profile = Some(profile);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not publish host display refresh rates to Roblox"
+                );
+            }
+        }
+    }
+
     /// Stop Android/Roblox and the out-of-process web engine while [`Self::window`] and
     /// [`Self::engine_window`] are still alive. The old CloseRequested arm called `exit()` directly;
     /// winit then destroyed the host surface underneath live libroblox workers, producing an
@@ -792,6 +938,20 @@ impl GameWindow<'_> {
         self.engine_tap_downtime = None;
         let Some(vm) = self.vm else { return };
         let Some((px, py)) = self.cursor else { return };
+        // Android transfers focus away from an EditText before delivering a press to another
+        // control/content surface. Eclipse owns that focus boundary in host-window mode: clear the
+        // prior textbox route first; if this press targets another textbox, RbxKeyboard's ensuing
+        // native_getText poll records it again. This prevents a home-search field from swallowing
+        // W/A/S/D after the LuaApp hands off to a game.
+        if crate::framework::clear_active_text_field() {
+            tracing::info!("engine surface press cleared the active text field");
+        }
+        if self.touch_mode == crate::config::TouchMode::Off {
+            if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, true, 0) {
+                tracing::warn!(error = %e, "engine desktop mouse-button down dispatch failed (ignored)");
+            }
+            return;
+        }
         match crate::framework::dispatch_touch_to_engine_surface(
             vm,
             crate::framework::MotionAction::Down,
@@ -821,6 +981,12 @@ impl GameWindow<'_> {
         let down_time = self.engine_tap_downtime.take();
         let Some(vm) = self.vm else { return };
         let Some((px, py)) = self.cursor else { return };
+        if self.touch_mode == crate::config::TouchMode::Off {
+            if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, false, 0) {
+                tracing::warn!(error = %e, "engine desktop mouse-button up dispatch failed (ignored)");
+            }
+            return;
+        }
         match crate::framework::dispatch_touch_to_engine_surface(
             vm,
             crate::framework::MotionAction::Up,
@@ -847,7 +1013,15 @@ impl GameWindow<'_> {
     /// downTime so the engine groups it into the same gesture (drag-scroll, sliders). No-op when no
     /// press is in flight (a bare hover — a touchscreen-modeled engine does not expect hover events).
     /// Quiet on success (drags fire at pointer rate); only a dispatch error is logged.
-    fn engine_pointer_move(&mut self) {
+    fn engine_pointer_move(&mut self, dx: f32, dy: f32) {
+        if self.touch_mode == crate::config::TouchMode::Off {
+            let Some(vm) = self.vm else { return };
+            let Some((px, py)) = self.cursor else { return };
+            if let Err(e) = crate::framework::dispatch_mouse_move(vm, px, py, dx, dy) {
+                tracing::warn!(error = %e, "engine desktop mouse-move dispatch failed (ignored)");
+            }
+            return;
+        }
         let Some(down_time) = self.engine_tap_downtime else {
             return;
         };
@@ -864,33 +1038,44 @@ impl GameWindow<'_> {
         }
     }
 
-    /// 2026-06-14 — ENGINE-MODE keyboard: forward a winit key event to the engine's `RBXSurfaceView`
-    /// via `dispatchKeyEvent`. Modifier keys (shift/ctrl/alt) update the running meta-state and are
-    /// not dispatched as standalone keys. The typed character (winit's already layout/shift-resolved
-    /// `text`) rides on the `KeyEvent.unicodeValue` so the engine's `getUnicodeChar()` yields it. Logs
-    /// only `consumed` + the press/release half — NEVER the key or character (do not log keystrokes/
-    /// credentials).
-    fn engine_key(&mut self, event: &winit::event::KeyEvent) {
-        use winit::keyboard::{Key, NamedKey};
-        let pressed = event.state == ElementState::Pressed;
-        // Modifiers fire as their own events: maintain the meta bitmask; do not dispatch them as keys.
-        let meta_bit = match &event.logical_key {
-            Key::Named(NamedKey::Shift) => Some(0x1), // META_SHIFT_ON
-            Key::Named(NamedKey::Control) => Some(0x1000), // META_CTRL_ON
-            Key::Named(NamedKey::Alt) => Some(0x02),  // META_ALT_ON
-            _ => None,
-        };
-        if let Some(bit) = meta_bit {
-            if pressed {
-                self.key_meta_state |= bit;
-            } else {
-                self.key_meta_state &= !bit;
-            }
+    /// Desktop-only non-primary mouse buttons. Roblox's APK maps Android mouse button bit values to
+    /// the integer passed to `nativePassMouseButton` by subtracting one (primary=0, secondary=1,
+    /// tertiary=3, back=7, forward=15); preserve that mapping for host buttons.
+    fn engine_aux_mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        if self.touch_mode != crate::config::TouchMode::Off {
             return;
         }
-        let Some(key_code) = winit_keycode(&event.logical_key) else {
-            return; // no clean Android mapping (e.g. dead/unidentified key) — dropped
+        let Some(button) = desktop_mouse_button(button) else {
+            return;
         };
+        let Some(vm) = self.vm else { return };
+        let Some((px, py)) = self.cursor else { return };
+        if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, pressed, button) {
+            tracing::warn!(error = %e, "engine auxiliary mouse-button dispatch failed (ignored)");
+        }
+    }
+
+    /// ENGINE-MODE hardware keyboard: forward the Linux evdev scan code and Android key code through
+    /// Roblox's real Activity path, `NativeGLInterface.nativePassKeyEvent(isDown, scanCode, keyCode,
+    /// isRepeat)`. The scan code is load-bearing: the current client maps it to Roblox's internal key
+    /// enum and ignores the Java key-code argument. Winit exposes exactly the Linux scan code on
+    /// Wayland/X11 through `PhysicalKeyExtScancode`, so no layout-dependent reconstruction is needed.
+    /// Modifier keys are ordinary native key events; dropping them breaks shortcuts. Never log the
+    /// key, scan code, or character.
+    fn engine_key(&mut self, event: &winit::event::KeyEvent) {
+        use winit::platform::scancode::PhysicalKeyExtScancode;
+
+        let pressed = event.state == ElementState::Pressed;
+        let Some(scan_code) = event
+            .physical_key
+            .to_scancode()
+            .and_then(|code| i32::try_from(code).ok())
+        else {
+            return;
+        };
+        // The current native client keys off scanCode. Preserve a best-effort Android keyCode as the
+        // third argument for ABI fidelity and future client builds; unknown/F-keys still dispatch.
+        let key_code = winit_keycode(&event.logical_key).unwrap_or(0);
         // winit's resolved printable text → Unicode codepoint (0 for non-printing keys).
         let unicode = event
             .text
@@ -909,7 +1094,7 @@ impl GameWindow<'_> {
             if (printable || backspace)
                 && crate::framework::type_into_active_text_field(vm, unicode, backspace)
             {
-                tracing::info!(pressed, "engine key → active text field (typed)");
+                tracing::debug!(pressed, "engine key → active text field (typed)");
                 return;
             }
         }
@@ -918,19 +1103,24 @@ impl GameWindow<'_> {
         } else {
             crate::framework::KeyAction::Up
         };
-        match crate::framework::dispatch_key_to_engine_surface(
+        match crate::framework::pass_hardware_key_to_engine(
             vm,
             action,
+            scan_code,
             key_code,
-            unicode,
-            self.key_meta_state,
+            event.repeat,
         ) {
-            Ok(consumed) => {
-                tracing::info!(
-                    pressed,
-                    consumed,
-                    "engine key → RBXSurfaceView.dispatchKeyEvent (key/char not logged)"
-                );
+            Ok(()) => {
+                // A held movement key produces repeat events at the compositor rate. Keep one INFO
+                // breadcrumb proving the hardware route is live, then make the hot path silent at
+                // normal log levels so input does not turn into avoidable formatting/file I/O.
+                static HARDWARE_KEY_PATH_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !HARDWARE_KEY_PATH_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("engine hardware-key input path active (keys not logged)");
+                } else {
+                    tracing::trace!(pressed, "engine hardware key dispatched (key not logged)");
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "engine key dispatch failed (ignored)");
@@ -1252,7 +1442,11 @@ impl GameWindow<'_> {
 /// (hit-test only). Returns when the window is closed, or a typed [`GraphicsError`] if the event loop
 /// or window cannot be created. A Vulkan init failure is NOT returned here — it is logged and the
 /// window stays open blank.
-pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), GraphicsError> {
+pub fn run_windowed(
+    title: &str,
+    vm: Option<&crate::runtime::Vm>,
+    touch_mode: crate::config::TouchMode,
+) -> Result<(), GraphicsError> {
     let event_loop = EventLoop::new().map_err(GraphicsError::EventLoop)?;
     let mut app = GameWindow {
         title: title.to_owned(),
@@ -1260,6 +1454,7 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         renderer: None,
         create_error: None,
         vm,
+        touch_mode,
         cursor: None,
         primary_press: None,
         synthetic_tap_done: false,
@@ -1278,9 +1473,10 @@ pub fn run_windowed(title: &str, vm: Option<&crate::runtime::Vm>) -> Result<(), 
         engine_typed2_at: None,
         engine_synthetic_submit_done: false,
         engine_reflect_done: false,
-        key_meta_state: 0,
         webview_pointer_down: false,
         runtime_shutdown_started: false,
+        published_display_refresh_profile: None,
+        next_display_refresh_poll: std::time::Instant::now(),
     };
     let run = event_loop.run_app(&mut app);
     // `ApplicationHandler::exiting` is the primary fallback, but keep this idempotent call while
@@ -1951,6 +2147,20 @@ fn parse_xy_text(spec: &std::ffi::OsStr) -> Option<(f32, f32, String)> {
         ys.trim().parse().ok()?,
         text.to_string(),
     ))
+}
+
+/// Map winit's named host buttons to the integer Roblox's Android generic-mouse handler passes to
+/// `nativePassMouseButton`. Android button constants are bit values and the APK subtracts one before
+/// calling native: primary=0, secondary=1, tertiary=3, back=7, forward=15.
+fn desktop_mouse_button(button: MouseButton) -> Option<i32> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Right => Some(1),
+        MouseButton::Middle => Some(3),
+        MouseButton::Back => Some(7),
+        MouseButton::Forward => Some(15),
+        MouseButton::Other(_) => None,
+    }
 }
 
 /// 2026-06-14 — map a winit logical key to the Android `KEYCODE_*` for the keys needed to type
@@ -5807,6 +6017,36 @@ mod tests {
         }
     }
 
+    /// Regression for the missing native Roblox FPS setting: the old framework shim advertised only
+    /// 60 Hz even on a high-refresh monitor. Preserve all unique host modes at the current resolution,
+    /// include the active fractional rate, and do not invent rates from lower-resolution modes.
+    #[test]
+    fn display_refresh_profile_preserves_real_high_refresh_modes() {
+        let profile = normalize_display_refresh_profile(
+            Some(143_996),
+            (1920, 1080),
+            [
+                ((1920, 1080), 60_000),
+                ((1920, 1080), 143_996),
+                ((1920, 1080), 120_000),
+                ((1920, 1080), 60_000),
+                ((1280, 720), 240_000),
+                ((1920, 1080), 0),
+            ],
+        )
+        .expect("the current display has usable rates");
+
+        assert_eq!(profile.current_millihertz, Some(143_996));
+        assert_eq!(profile.supported_millihertz, vec![60_000, 120_000, 143_996]);
+        assert_eq!(profile.current_hz(), Some(143.996));
+        assert_eq!(profile.supported_hz(), vec![60.0, 120.0, 143.996]);
+        assert_eq!(
+            normalize_display_refresh_profile(None, (1920, 1080), [((1280, 720), 240_000)]),
+            None,
+            "alternate-resolution-only modes must not fabricate current display rates"
+        );
+    }
+
     #[test]
     fn surface_format_prefers_bgra8_srgb() {
         let formats = [
@@ -5858,6 +6098,37 @@ mod tests {
         assert_eq!(winit_keycode(&Key::Character("#".into())), Some(0));
         // A key with no mapping at all → None (dropped, not sent as keycode 0).
         assert_eq!(winit_keycode(&Key::Named(NamedKey::F1)), None);
+    }
+
+    #[test]
+    fn desktop_mouse_buttons_match_the_apk_generic_motion_mapping() {
+        assert_eq!(desktop_mouse_button(MouseButton::Left), Some(0));
+        assert_eq!(desktop_mouse_button(MouseButton::Right), Some(1));
+        assert_eq!(desktop_mouse_button(MouseButton::Middle), Some(3));
+        assert_eq!(desktop_mouse_button(MouseButton::Back), Some(7));
+        assert_eq!(desktop_mouse_button(MouseButton::Forward), Some(15));
+        assert_eq!(desktop_mouse_button(MouseButton::Other(42)), None);
+    }
+
+    // Roblox's nativePassKeyEvent maps Linux scanCode—not Android keyCode—to its internal key enum.
+    // Pin winit's platform conversion for gameplay and shortcut keys so a future input refactor cannot
+    // silently regress to the logical/layout-dependent code that broke WASD.
+    #[test]
+    fn winit_physical_keys_preserve_linux_evdev_scancodes() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        use winit::platform::scancode::PhysicalKeyExtScancode;
+
+        assert_eq!(PhysicalKey::Code(KeyCode::KeyW).to_scancode(), Some(17));
+        assert_eq!(PhysicalKey::Code(KeyCode::KeyA).to_scancode(), Some(30));
+        assert_eq!(
+            PhysicalKey::Code(KeyCode::ShiftLeft).to_scancode(),
+            Some(42)
+        );
+        assert_eq!(
+            PhysicalKey::Code(KeyCode::ControlLeft).to_scancode(),
+            Some(29)
+        );
+        assert_eq!(PhysicalKey::Code(KeyCode::F1).to_scancode(), Some(59));
     }
 
     #[test]

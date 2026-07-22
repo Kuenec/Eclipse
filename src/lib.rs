@@ -43,6 +43,7 @@ pub mod framework;
 pub mod graphics;
 pub mod input;
 pub mod loader;
+pub mod performance;
 pub mod runtime;
 pub mod services;
 pub mod webview;

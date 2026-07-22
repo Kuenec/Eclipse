@@ -615,13 +615,13 @@ fn select_text_probe_rect(
     })
 }
 
-/// Convert live field text to what may be composited. Input type `7` is the measured plain-text
-/// username type; every other value, including unknown/no metadata, fails closed to bullets. The
-/// previous `type == 5` check failed open after Roblox cleared the secure field's metadata while its
-/// `EditText` text remained cached, exposing the temporary password in the probe boot.
+/// Convert live field text to what may be composited. Roblox's Android keyboard adapter maps engine
+/// type `0` (its default/fallthrough, measured on in-game chat), types `1..=4`, `7`, and `8` to
+/// non-password Android `InputType` values; types `5`, `6`, `9`, and `10` are password variants.
+/// Unknown metadata still fails closed to bullets. The explicit allow-list keeps real password fields
+/// masked while letting the measured Home search (`1`) and in-game chat (`0`) render normally.
 fn mask_overlay_text(text: &str, input_type: i32) -> String {
-    const MEASURED_PLAIN_TEXT_INPUT_TYPE: i32 = 7;
-    if input_type == MEASURED_PLAIN_TEXT_INPUT_TYPE {
+    if matches!(input_type, 0..=4 | 7 | 8) {
         text.to_owned()
     } else {
         "\u{2022}".repeat(text.chars().count())
@@ -657,6 +657,14 @@ unsafe fn locate_image_index(pi: &vk::PresentInfoKHR<'_>, our_sc: u64) -> Option
 fn probe_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| std::env::var_os("ECLIPSE_VK_PROBE").is_some())
+}
+
+/// Present-rate diagnostics are process-start configuration just like the overlay/probe gates.
+/// Cache the environment lookup so even a diagnostic run does not lock the process environment on
+/// every game frame—the measurement must not become part of what it measures.
+fn fps_probe_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("ECLIPSE_VK_FPS").is_some())
 }
 
 /// The first host-visible+coherent memory type supporting `type_bits`, or `None`.
@@ -1719,7 +1727,7 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
     }
     // Present-rate (fps) every ~120 frames — measures any overlay overhead (it composites only while a
     // field is focused). Env-gated diagnostic to avoid steady-state logging.
-    if std::env::var_os("ECLIPSE_VK_FPS").is_some() && n.is_multiple_of(120) {
+    if fps_probe_enabled() && n.is_multiple_of(120) {
         static LAST: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
         if let Ok(mut g) = LAST.lock() {
             let now = std::time::Instant::now();
@@ -1975,12 +1983,18 @@ mod tests {
         );
     }
 
-    /// Only the live-measured username type is allowed to render as entered; secure and unknown
-    /// metadata both fail closed. This is intentionally stricter than checking only `type == 5`.
+    /// Every non-password type in Roblox's engine→Android mapping renders as entered; all password
+    /// variants and unknown metadata fail closed. Chat is measured as type 0, search as type 1, and
+    /// username as type 7.
     #[test]
     fn overlay_text_masks_secure_and_unknown_input_types() {
-        assert_eq!(mask_overlay_text("Ab1!", 7), "Ab1!");
-        assert_eq!(mask_overlay_text("Ab1!", 5), "••••");
+        for plain in [0, 1, 2, 3, 4, 7, 8] {
+            assert_eq!(mask_overlay_text("Ab1!", plain), "Ab1!");
+        }
+        for secure in [5, 6, 9, 10] {
+            assert_eq!(mask_overlay_text("Ab1!", secure), "••••");
+        }
+        assert_eq!(mask_overlay_text("Ab1!", 11), "••••");
         assert_eq!(mask_overlay_text("Ab1!", i32::MIN), "••••");
         assert_eq!(mask_overlay_text("", i32::MIN), "");
     }

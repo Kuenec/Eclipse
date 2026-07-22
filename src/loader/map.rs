@@ -44,7 +44,9 @@
 
 use std::ptr::NonNull;
 
-use rustix::mm::{mmap_anonymous, mprotect, munmap, MapFlags, MprotectFlags, ProtFlags};
+use rustix::mm::{
+    madvise, mmap_anonymous, mprotect, munmap, Advice, MapFlags, MprotectFlags, ProtFlags,
+};
 
 use super::elf::{ElfImage, LoadSegment, RelroSegment, PF_R, PF_W, PF_X};
 use super::reloc::{self, RelocError, RelocImage, SymbolResolver};
@@ -309,6 +311,18 @@ impl MappedObject {
         .map_err(MapError::Os)?;
         // The kernel returns a page-aligned, non-null address on success.
         let base = NonNull::new(ptr.cast::<u8>()).ok_or(MapError::Os(rustix::io::Errno::NOMEM))?;
+
+        // Large anonymously-mapped engine images have a broad instruction working set. Opt in to
+        // transparent huge pages before segment `mprotect` splits the reservation into permission
+        // VMAs: on kernels configured with THP=`madvise`, this avoids millions of iTLB/dTLB misses
+        // without requiring reserved hugetlb pages. It is only a performance hint, so unsupported
+        // kernels/filesystems retain ordinary 4 KiB pages rather than failing the ELF load.
+        const HUGE_PAGE_THRESHOLD: usize = 2 * 1024 * 1024;
+        if span >= HUGE_PAGE_THRESHOLD {
+            // SAFETY: `ptr..ptr+span` is the live mapping returned immediately above. `madvise`
+            // changes only the kernel's paging policy and neither reads nor writes through `ptr`.
+            let _ = unsafe { madvise(ptr, span, Advice::LinuxHugepage) };
+        }
 
         // The reserved region's address corresponds to `region_start` in image-vaddr space. The
         // load base used by relocations (`base + vaddr` = run-time address) is therefore

@@ -36,6 +36,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// A packed NDK opaque-handle value: the `u64` a native casts to/from the opaque `*mut T`. The low
@@ -239,7 +240,7 @@ pub struct AssetState {
 /// State behind an `AConfiguration*` handle: Eclipse's minimal-correct device configuration values.
 /// Real getters read these back. Defaults are sane desktop-Linux values (mdpi, the window geometry
 /// in dp, portrait) until a real device-config source is wired.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConfigurationState {
     /// Display density in dpi (`AConfiguration_getDensity`); `ACONFIGURATION_DENSITY_MEDIUM` = 160.
     pub density: i32,
@@ -313,74 +314,79 @@ pub fn apk_path() -> Option<&'static PathBuf> {
 /// **publishes the live window's geometry here** (the same window the engine's EGL surface presents
 /// to — see [`crate::egl_engine`]). When unset, the natives fall back to a documented portrait
 /// default (a sound geometry, never a crash). Updated on resize so the engine can re-query.
-static ENGINE_WINDOW_GEOMETRY: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static ENGINE_WINDOW_GEOMETRY: AtomicU64 = AtomicU64::new(0);
+
+fn pack_geometry(width: i32, height: i32) -> u64 {
+    (u64::from(width.max(1) as u32) << 32) | u64::from(height.max(1) as u32)
+}
+
+fn unpack_geometry(value: u64) -> Option<(i32, i32)> {
+    if value == 0 {
+        return None;
+    }
+    Some(((value >> 32) as u32 as i32, value as u32 as i32))
+}
 
 /// Publish Eclipse's live window geometry (physical pixels) for the `ANativeWindow_*` geometry
 /// natives. Called by the run/test path when the window is created and on each resize. Clamped to
-/// ≥ 1×1 (a zero dimension is not a valid surface size). A poisoned lock is ignored (best-effort
-/// publish; the natives then read the last good / default value) so this never panics.
+/// ≥ 1×1 (a zero dimension is not a valid surface size). This is lock-free because Roblox queries
+/// the geometry from many render workers every frame.
 pub fn set_engine_window_geometry(width: i32, height: i32) {
-    if let Ok(mut g) = ENGINE_WINDOW_GEOMETRY.lock() {
-        *g = Some((width.max(1), height.max(1)));
+    let geometry = pack_geometry(width, height);
+    ENGINE_WINDOW_GEOMETRY.store(geometry, Ordering::Release);
+    if FALLBACK_NATIVE_WINDOW_GEOMETRY.load(Ordering::Acquire) != 0 {
+        FALLBACK_NATIVE_WINDOW_GEOMETRY.store(geometry, Ordering::Release);
     }
 }
 
 /// The published engine-window geometry `(width, height)` in physical pixels, or `None` if the run/
 /// test path has not opened a window yet (then the geometry natives use their documented default).
 pub fn engine_window_geometry() -> Option<(i32, i32)> {
-    ENGINE_WINDOW_GEOMETRY.lock().ok().and_then(|g| *g)
+    unpack_geometry(ENGINE_WINDOW_GEOMETRY.load(Ordering::Acquire))
 }
 
-/// The engine render WSI bind: a map from the **real WSI native-window pointer** (a Wayland
-/// `wl_egl_window*` / an X11 XID, as a `usize`) to that window's geometry.
+/// The engine render WSI bind: the **real WSI native-window pointer** (a Wayland `wl_egl_window*` /
+/// an X11 XID, as a `usize`) and that window's geometry.
 ///
 /// 2026-06-05 — why this exists: Roblox's native engine creates its OWN EGL surface by calling host
 /// `eglCreateWindowSurface(display, config, (EGLNativeWindowType)<the `ANativeWindow*` it got from
 /// `ANativeWindow_fromSurface`>, …)`. For that surface to land on Eclipse's window, the
 /// `ANativeWindow*` Eclipse hands the engine must BE the real WSI handle host EGL accepts. So
 /// `ANativeWindow_fromSurface` returns that real WSI pointer (owned by [`crate::egl_engine::
-/// EngineNativeWindow`], which lives on the main thread alongside the `winit` window), and this map
+/// EngineNativeWindow`], which lives on the main thread alongside the `winit` window), and this record
 /// lets the geometry natives (`ANativeWindow_getWidth`/`getHeight`), which take that pointer back,
 /// answer with the real size — a bounds-safe table lookup (unknown pointer → `None` → the NDK `-1`
 /// sentinel), never a dereference of an engine-supplied pointer. Only the pointer **value** + the
-/// geometry (both `Copy`) cross into this process-global table; the `EngineNativeWindow` itself never
-/// leaves its owning thread.
-static WSI_WINDOWS: Mutex<Vec<(usize, (i32, i32))>> = Mutex::new(Vec::new());
+/// geometry (both `Copy`) cross into this process-global record; the `EngineNativeWindow` itself
+/// never leaves its owning thread. Eclipse owns exactly one game window, so atomics preserve the
+/// exact-pointer rejection contract without putting a mutex in the per-frame native hot path.
+static WSI_WINDOW: AtomicUsize = AtomicUsize::new(0);
+static WSI_WINDOW_GEOMETRY: AtomicU64 = AtomicU64::new(0);
 
 /// Register a real WSI native-window pointer + its geometry as the backing for the engine's
-/// `ANativeWindow*`. Idempotent on the pointer (re-registering updates the geometry). A poisoned
-/// lock is ignored (best-effort; never panics — AGENTS.md §2.8).
+/// `ANativeWindow*`. Idempotent on the pointer (re-registering updates the geometry).
 pub fn register_wsi_window(native_window: usize, width: i32, height: i32) {
     if native_window == 0 {
         return; // a NULL pointer is never a valid WSI window (reserved as the ANativeWindow NULL).
     }
-    if let Ok(mut v) = WSI_WINDOWS.lock() {
-        let geo = (width.max(1), height.max(1));
-        if let Some(entry) = v.iter_mut().find(|(p, _)| *p == native_window) {
-            entry.1 = geo;
-        } else {
-            v.push((native_window, geo));
-        }
-    }
+    WSI_WINDOW_GEOMETRY.store(pack_geometry(width, height), Ordering::Release);
+    WSI_WINDOW.store(native_window, Ordering::Release);
 }
 
 /// Remove a WSI native-window pointer registered by [`register_wsi_window`] (called when its owning
-/// [`crate::egl_engine::EngineNativeWindow`] is torn down). A poisoned lock / unknown pointer is a
-/// no-op; never panics.
+/// [`crate::egl_engine::EngineNativeWindow`] is torn down). An unknown pointer is a no-op.
 pub fn unregister_wsi_window(native_window: usize) {
-    if let Ok(mut v) = WSI_WINDOWS.lock() {
-        v.retain(|(p, _)| *p != native_window);
-    }
+    let _ = WSI_WINDOW.compare_exchange(native_window, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// The geometry registered for a WSI native-window pointer, or `None` if it is not a known WSI
 /// window (a fabricated/stale `ANativeWindow*` → `None` → the geometry native returns the NDK `-1`
-/// sentinel, never a dereference). Poisoned lock → `None`.
+/// sentinel, never a dereference).
 pub fn wsi_window_geometry(native_window: usize) -> Option<(i32, i32)> {
-    WSI_WINDOWS
-        .lock()
-        .ok()
-        .and_then(|v| v.iter().find(|(p, _)| *p == native_window).map(|(_, g)| *g))
+    if native_window == 0 || WSI_WINDOW.load(Ordering::Acquire) != native_window {
+        return None;
+    }
+    unpack_geometry(WSI_WINDOW_GEOMETRY.load(Ordering::Acquire))
 }
 
 /// The real WSI native-window pointer Eclipse currently exposes (the most recently registered — there
@@ -389,10 +395,40 @@ pub fn wsi_window_geometry(native_window: usize) -> Option<(i32, i32)> {
 /// `ANativeWindow*` the engine gets IS the real WSI handle host EGL accepts; when `None` the native
 /// falls back to a sound geometry-only handle (the window does not exist yet at that point).
 pub fn current_wsi_window() -> Option<usize> {
-    WSI_WINDOWS
-        .lock()
-        .ok()
-        .and_then(|v| v.last().map(|(p, _)| *p))
+    match WSI_WINDOW.load(Ordering::Acquire) {
+        0 => None,
+        native_window => Some(native_window),
+    }
+}
+
+/// Stable Eclipse-owned token used only when Java asks for an `ANativeWindow*` before winit has
+/// created the real WSI window. The token is never dereferenced or passed off as a host WSI object;
+/// getters accept it only by exact identity. Keeping one process-lifetime token mirrors Android's
+/// long-lived Surface and avoids a contended generational-slab mutex in Roblox's per-frame geometry
+/// queries (the hottest Eclipse frame-time site in the 2026-07-22 profile).
+static FALLBACK_NATIVE_WINDOW_TOKEN: AtomicU8 = AtomicU8::new(0);
+static FALLBACK_NATIVE_WINDOW_GEOMETRY: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_NATIVE_WINDOW_FORMAT: AtomicI32 = AtomicI32::new(0);
+
+/// Publish the fallback window state and return its stable opaque token.
+pub fn register_fallback_native_window(state: NativeWindowState) -> usize {
+    FALLBACK_NATIVE_WINDOW_GEOMETRY
+        .store(pack_geometry(state.width, state.height), Ordering::Release);
+    FALLBACK_NATIVE_WINDOW_FORMAT.store(state.format, Ordering::Release);
+    std::ptr::addr_of!(FALLBACK_NATIVE_WINDOW_TOKEN) as usize
+}
+
+/// Resolve the exact fallback token without taking a lock. An unknown/fabricated token is rejected.
+pub fn fallback_native_window_state(native_window: usize) -> Option<NativeWindowState> {
+    if native_window != std::ptr::addr_of!(FALLBACK_NATIVE_WINDOW_TOKEN) as usize {
+        return None;
+    }
+    let (width, height) = unpack_geometry(FALLBACK_NATIVE_WINDOW_GEOMETRY.load(Ordering::Acquire))?;
+    Some(NativeWindowState {
+        width,
+        height,
+        format: FALLBACK_NATIVE_WINDOW_FORMAT.load(Ordering::Acquire),
+    })
 }
 
 /// 2026-06-13 — the winit Wayland `wl_display*` connection (as a `usize`) the engine's EGLDisplay must
@@ -410,7 +446,7 @@ pub fn current_wsi_window() -> Option<usize> {
 /// identical to what `egl_engine` does for `__gl-test-anw`. `None` on X11/other: an X11 window XID is
 /// server-scoped (not connection-scoped the same way), so passing `EGL_DEFAULT_DISPLAY` through is
 /// correct there. Stores only the pointer VALUE as `usize` (this module is `#![forbid(unsafe_code)]`),
-/// exactly like [`WSI_WINDOWS`] stores the native-window pointer.
+/// exactly like [`WSI_WINDOW`] stores the native-window pointer.
 static WSI_DISPLAY: Mutex<Option<usize>> = Mutex::new(None);
 
 /// Record the winit Wayland `wl_display*` (as a `usize`), or `None` on X11/other (see [`WSI_DISPLAY`]).

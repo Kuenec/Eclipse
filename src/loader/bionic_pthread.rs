@@ -53,7 +53,7 @@
 //! pointers) and the two raw syscalls (`futex`, `gettid`), each with a dated `// SAFETY:` note. The
 //! reloc/elf/resolve cores stay `#![forbid(unsafe_code)]`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -70,6 +70,12 @@ const EINVAL: c_int = 22;
 const EDEADLK: c_int = 35;
 /// `EPERM` — unlocking a mutex the calling thread does not own (errorcheck).
 const EPERM: c_int = 1;
+/// `ETIMEDOUT` — the absolute deadline of a timed condition wait expired.
+const ETIMEDOUT: c_int = 110;
+/// `EINTR` — the futex wait was interrupted; pthread condition waits retry instead of exposing it.
+const EINTR: c_int = 4;
+/// `EAGAIN` — the futex word changed before the kernel could park the caller.
+const EAGAIN: c_int = 11;
 
 /// `PTHREAD_MUTEX_NORMAL` (== `_DEFAULT`): no owner tracking, no recursion.
 const PTHREAD_MUTEX_NORMAL: c_int = 0;
@@ -103,7 +109,13 @@ const SYS_GETTID: c_long = 186;
 const SYS_FUTEX: c_long = 202;
 const FUTEX_WAIT: c_int = 0;
 const FUTEX_WAKE: c_int = 1;
+/// Absolute-deadline futex wait. Without `FUTEX_CLOCK_REALTIME`, its clock is `CLOCK_MONOTONIC`.
+const FUTEX_WAIT_BITSET: c_int = 9;
 const FUTEX_PRIVATE_FLAG: c_int = 128;
+/// Select `CLOCK_REALTIME` for `FUTEX_WAIT_BITSET`; otherwise the kernel uses monotonic time.
+const FUTEX_CLOCK_REALTIME: c_int = 256;
+/// Wake/wait on every futex bit. Required by `FUTEX_WAIT_BITSET`.
+const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 /// `SYS_tgkill` on x86-64 — send a signal to a specific (tgid, tid). The kernel primitive behind a
 /// TID-keyed `pthread_kill` (avoids the glibc-`pthread_t` ABI the host export would need). 2026-06-05.
 const SYS_TGKILL: c_long = 234;
@@ -137,6 +149,44 @@ fn futex_wait(addr: &AtomicI32, expected: i32) {
             expected,
             std::ptr::null::<c_void>(),
         );
+    }
+}
+
+/// `futex(FUTEX_WAIT_BITSET_PRIVATE, ..., absolute_deadline, ..., MATCH_ANY)` — park until the
+/// sequence changes or the condition variable's configured absolute clock deadline expires. Returns
+/// `0` on a wake, otherwise the positive Linux errno (`ETIMEDOUT`, `EAGAIN`, `EINTR`, ...).
+fn futex_wait_until(
+    addr: &AtomicI32,
+    expected: i32,
+    deadline: &libc::timespec,
+    clock: c_int,
+) -> c_int {
+    let clock_flag = if clock == CLOCK_MONOTONIC {
+        0
+    } else {
+        FUTEX_CLOCK_REALTIME
+    };
+    // SAFETY: `addr` is a live aligned atomic word and `deadline` is a valid kernel-timespec for the
+    // duration of the syscall. FUTEX_WAIT_BITSET only reads both; the fifth argument is unused and
+    // MATCH_ANY is the required nonzero bitset. The syscall returns -1 and sets thread-local errno on
+    // timeout/interruption/race, which is converted to the pthread-style positive error below.
+    let result = unsafe {
+        libc::syscall(
+            SYS_FUTEX,
+            addr.as_ptr(),
+            FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | clock_flag,
+            expected,
+            deadline as *const libc::timespec,
+            std::ptr::null::<c_void>(),
+            FUTEX_BITSET_MATCH_ANY,
+        )
+    };
+    if result == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(EINVAL)
     }
 }
 
@@ -246,25 +296,18 @@ unsafe extern "C" fn eclipse_pthread_mutex_init(m: *mut c_void, attr: *const c_v
         // read its low bits, which hold the type set by `pthread_mutexattr_settype`.
         (unsafe { *(attr as *const c_int) }) & 0x3
     };
-    // SAFETY: 2026-06-05 — `m` is a valid 40-byte mutex; each `word` access is in-bounds. We
-    // establish the full encoding (state 0, magic stamped, type recorded, owner/depth cleared)
-    // before any thread can contend (init precedes use per the pthread contract).
+    // SAFETY: `pthread_mutex_init` requires exclusive access to a valid 40-byte object. Bulk-zeroing
+    // all ten ABI words is both the documented initialization and materially cheaper in the measured
+    // high-frequency engine path than five separately guarded atomic stores. The type is written
+    // before the release-store of the magic, which publishes the complete encoding to later users.
     unsafe {
-        if let Some(w) = word(m, MUTEX_STATE, MUTEX_WORDS) {
-            w.store(0, Ordering::Relaxed);
-        }
-        if let Some(w) = word(m, MUTEX_TYPE, MUTEX_WORDS) {
-            w.store(ty, Ordering::Relaxed);
-        }
-        if let Some(w) = word(m, MUTEX_OWNER, MUTEX_WORDS) {
-            w.store(0, Ordering::Relaxed);
-        }
-        if let Some(w) = word(m, MUTEX_DEPTH, MUTEX_WORDS) {
-            w.store(0, Ordering::Relaxed);
-        }
-        if let Some(w) = word(m, MUTEX_MAGIC, MUTEX_WORDS) {
-            w.store(MUTEX_INIT_MAGIC, Ordering::Release);
-        }
+        std::ptr::write_bytes(m.cast::<u8>(), 0, MUTEX_WORDS * size_of::<c_int>());
+        word(m, MUTEX_TYPE, MUTEX_WORDS)
+            .unwrap()
+            .store(ty, Ordering::Relaxed);
+        word(m, MUTEX_MAGIC, MUTEX_WORDS)
+            .unwrap()
+            .store(MUTEX_INIT_MAGIC, Ordering::Release);
     }
     0
 }
@@ -549,11 +592,8 @@ unsafe extern "C" fn eclipse_pthread_cond_init(c: *mut c_void, attr: *const c_vo
     0
 }
 
-/// Common cond-wait body. Records the current sequence, releases `m`, parks on the sequence word
-/// until it changes (signal/broadcast bumps it), then re-acquires `m`. `timeout_ns` is ignored for
-/// the infinite `pthread_cond_wait`; for `cond_timedwait` we still park on the futex (the kernel
-/// honors a relative timeout via the syscall, but the public contract only requires we not wait
-/// forever — see the timed variant). Returns 0.
+/// Common infinite cond-wait body. Records the current sequence, releases `m`, parks on the sequence
+/// word until it changes (signal/broadcast bumps it), then re-acquires `m`. Returns 0.
 ///
 /// # Safety
 /// `c`/`m` are valid bionic cond/mutex; the caller holds `m`.
@@ -588,24 +628,67 @@ unsafe extern "C" fn eclipse_pthread_cond_wait(c: *mut c_void, m: *mut c_void) -
     unsafe { cond_wait_impl(c, m) }
 }
 
-/// `int pthread_cond_timedwait(pthread_cond_t*, pthread_mutex_t*, const struct timespec*)`. The
-/// relative timeout is passed to the futex so the wait is bounded; on return the caller re-checks
-/// its predicate (a spurious/timeout wake is legal). Returns 0.
+/// `int pthread_cond_timedwait(pthread_cond_t*, pthread_mutex_t*, const struct timespec*)`. Atomically
+/// releases `m`, waits for a signal or the condition's absolute clock deadline, then re-acquires `m`.
+/// Returns 0 when the sequence changed and `ETIMEDOUT` when the deadline expired.
 ///
 /// # Safety
 /// `c`/`m` are null or valid; `abstime` is null or a valid `timespec`.
 unsafe extern "C" fn eclipse_pthread_cond_timedwait(
     c: *mut c_void,
     m: *mut c_void,
-    _abstime: *const c_void,
+    abstime: *const c_void,
 ) -> c_int {
-    // 2026-06-05: we park on the sequence futex (bounded by the next signal); the absolute deadline
-    // is honored loosely — the caller MUST re-check its predicate after waking (the pthread
-    // contract), so a slightly-late or spurious return is correct, never a lost wakeup. A precise
-    // deadline (clock-relative futex timeout) is a refinement; the predicate-recheck contract makes
-    // the current form sound.
-    // SAFETY: 2026-06-05 — same cond-wait contract.
-    unsafe { cond_wait_impl(c, m) }
+    if c.is_null() || m.is_null() || abstime.is_null() {
+        return EINVAL;
+    }
+    // SAFETY: per the native contract `abstime` points to an LP64 bionic `timespec`, which has the
+    // same two-field ABI as Linux x86-64's `libc::timespec`; copy it before releasing the mutex.
+    let deadline = unsafe { *(abstime as *const libc::timespec) };
+    if !(0..1_000_000_000).contains(&deadline.tv_nsec) {
+        return EINVAL;
+    }
+
+    // SAFETY: `c`/`m` are valid (checked above). Capture the sequence and selected clock while the
+    // caller still owns `m`, then release and wait. A signal between the sequence load and futex
+    // syscall changes the word, so FUTEX_WAIT_BITSET returns EAGAIN instead of losing the wake.
+    unsafe {
+        cond_ensure_init(c);
+        let Some(seq) = word(c, COND_SEQ, COND_WORDS) else {
+            return EINVAL;
+        };
+        let Some(clock_word) = word(c, COND_CLOCK, COND_WORDS) else {
+            return EINVAL;
+        };
+        let clock = clock_word.load(Ordering::Acquire);
+        if clock != 0 && clock != CLOCK_MONOTONIC {
+            return EINVAL;
+        }
+        let observed = seq.load(Ordering::Acquire);
+        let unlock_result = eclipse_pthread_mutex_unlock(m);
+        if unlock_result != 0 {
+            return unlock_result;
+        }
+
+        let wait_result = loop {
+            if seq.load(Ordering::Acquire) != observed {
+                break 0;
+            }
+            match futex_wait_until(seq, observed, &deadline, clock) {
+                0 | EAGAIN | EINTR => continue,
+                ETIMEDOUT => break ETIMEDOUT,
+                _ => break EINVAL,
+            }
+        };
+
+        // POSIX requires the mutex to be owned again on every normal/error return from the wait.
+        let lock_result = eclipse_pthread_mutex_lock(m);
+        if lock_result == 0 {
+            wait_result
+        } else {
+            lock_result
+        }
+    }
 }
 
 /// `int pthread_cond_signal(pthread_cond_t*)` — wake one waiter (bump the sequence, futex-wake 1).
@@ -952,6 +1035,18 @@ struct KeySlot {
 
 static KEY_TABLE: Mutex<Option<KeyTable>> = Mutex::new(None);
 
+/// Lock-free publication of each allocated key's current generation. `0` means unallocated; a
+/// non-zero value is the generation a thread-local value must match. Key creation/deletion still
+/// take [`KEY_TABLE`] because they are rare and must update destructor metadata coherently, while
+/// the engine's extremely hot get/set path needs only this acquire load.
+///
+/// A live 2026-07-22 profile at 155–200 FPS found the old global `KEY_TABLE` mutex in every busy
+/// Roblox worker: `pthread_getspecific` alone repeatedly contended in `Mutex::lock`/unlock while the
+/// GPU was only 33–36% utilized. Publishing the generation separately preserves stale-key rejection
+/// without serializing unrelated threads on every TLS access.
+static KEY_GENERATIONS: [AtomicU32; PTHREAD_KEYS_MAX] =
+    [const { AtomicU32::new(0) }; PTHREAD_KEYS_MAX];
+
 /// The number of allocated keys (for tests/reporting).
 fn key_table_with<R>(f: impl FnOnce(&mut KeyTable) -> R) -> R {
     let mut guard = KEY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -971,13 +1066,29 @@ fn key_table_with<R>(f: impl FnOnce(&mut KeyTable) -> R) -> R {
 thread_local! {
     /// This thread's TLS values, indexed by key. Each entry carries the key generation it was set
     /// under, so a stale value (set, key deleted, key index reused) reads back as NULL.
-    static TLS_VALUES: RefCell<Vec<TlsValue>> = RefCell::new(vec![TlsValue::default(); PTHREAD_KEYS_MAX]);
+    /// Per-slot `Cell` removes `RefCell`'s dynamic borrow counter from the profiled hot path without
+    /// manufacturing references into interior-mutable storage. Each array belongs to one OS thread.
+    static TLS_VALUES: [Cell<TlsValue>; PTHREAD_KEYS_MAX] =
+        const { [const { Cell::new(TlsValue::EMPTY) }; PTHREAD_KEYS_MAX] };
 }
 
 #[derive(Clone, Copy, Default)]
 struct TlsValue {
     ptr: usize,
     generation: u32,
+}
+
+impl TlsValue {
+    const EMPTY: Self = Self {
+        ptr: 0,
+        generation: 0,
+    };
+}
+
+#[inline(always)]
+fn current_key_generation(k: usize) -> Option<u32> {
+    let generation = KEY_GENERATIONS[k].load(Ordering::Acquire);
+    (generation != 0).then_some(generation)
 }
 
 /// `int pthread_key_create(pthread_key_t* key, void (*dtor)(void*))` — allocate a key. Writes the
@@ -995,6 +1106,12 @@ unsafe extern "C" fn eclipse_pthread_key_create(key: *mut c_void, dtor: Option<K
                 slot.in_use = true;
                 slot.dtor = dtor;
                 slot.generation = slot.generation.wrapping_add(1);
+                // Zero is reserved for "unallocated" in the lock-free publication array.
+                if slot.generation == 0 {
+                    slot.generation = 1;
+                }
+                // Publish only after the destructor metadata and generation are complete.
+                KEY_GENERATIONS[i].store(slot.generation, Ordering::Release);
                 return Some((i, slot.generation));
             }
         }
@@ -1023,6 +1140,7 @@ unsafe extern "C" fn eclipse_pthread_key_delete(key: c_int) -> c_int {
         }
         t.slots[k].in_use = false;
         t.slots[k].dtor = None;
+        KEY_GENERATIONS[k].store(0, Ordering::Release);
         // Bump generation so any per-thread value set under this key reads back as NULL hereafter.
         t.slots[k].generation = t.slots[k].generation.wrapping_add(1);
         0
@@ -1036,15 +1154,7 @@ unsafe extern "C" fn eclipse_pthread_getspecific(key: c_int) -> *mut c_void {
     if k >= PTHREAD_KEYS_MAX {
         return std::ptr::null_mut();
     }
-    // The key's current generation (NULL if the key is not allocated).
-    let cur_gen = key_table_with(|t| {
-        if t.slots[k].in_use {
-            Some(t.slots[k].generation)
-        } else {
-            None
-        }
-    });
-    let Some(cur_gen) = cur_gen else {
+    let Some(cur_gen) = current_key_generation(k) else {
         return std::ptr::null_mut();
     };
     // 2026-06-12: `try_with`, not `with` — an engine `__cxa_thread_atexit_impl` destructor may
@@ -1055,8 +1165,7 @@ unsafe extern "C" fn eclipse_pthread_getspecific(key: c_int) -> *mut c_void {
     // Teardown fallback: NULL — the per-thread store is gone, the defined "no value" answer.
     TLS_VALUES
         .try_with(|v| {
-            let v = v.borrow();
-            let entry = v[k];
+            let entry = v[k].get();
             if entry.generation == cur_gen {
                 entry.ptr as *mut c_void
             } else {
@@ -1073,14 +1182,7 @@ unsafe extern "C" fn eclipse_pthread_setspecific(key: c_int, value: *const c_voi
     if k >= PTHREAD_KEYS_MAX {
         return EINVAL;
     }
-    let cur_gen = key_table_with(|t| {
-        if t.slots[k].in_use {
-            Some(t.slots[k].generation)
-        } else {
-            None
-        }
-    });
-    let Some(cur_gen) = cur_gen else {
+    let Some(cur_gen) = current_key_generation(k) else {
         return EINVAL;
     };
     // 2026-06-12: `try_with` for the same teardown reason as `pthread_getspecific` above.
@@ -1088,11 +1190,10 @@ unsafe extern "C" fn eclipse_pthread_setspecific(key: c_int, value: *const c_voi
     // recorded; a defined error return, never an abort (an Eclipse-model limit at the teardown
     // edge — bionic's own store lives until the thread truly exits).
     match TLS_VALUES.try_with(|v| {
-        let mut v = v.borrow_mut();
-        v[k] = TlsValue {
+        v[k].set(TlsValue {
             ptr: value as usize,
             generation: cur_gen,
-        };
+        });
     }) {
         Ok(()) => 0,
         Err(_) => EINVAL,
@@ -1124,17 +1225,16 @@ fn run_thread_key_destructors() {
         // per-thread values left to destroy; return instead of aborting.
         let mut to_run: Vec<(usize, *mut c_void, KeyDtor)> = Vec::new();
         let alive = TLS_VALUES.try_with(|v| {
-            let mut v = v.borrow_mut();
             key_table_with(|t| {
-                for k in 0..PTHREAD_KEYS_MAX {
-                    let entry = v[k];
+                for (k, value) in v.iter().enumerate() {
+                    let entry = value.get();
                     if entry.ptr != 0
                         && t.slots[k].in_use
                         && t.slots[k].generation == entry.generation
                     {
                         if let Some(dtor) = t.slots[k].dtor {
                             to_run.push((k, entry.ptr as *mut c_void, dtor));
-                            v[k] = TlsValue::default(); // clear before running (POSIX)
+                            value.set(TlsValue::EMPTY); // clear before running (POSIX)
                         }
                     }
                 }
@@ -1956,9 +2056,27 @@ unsafe extern "C" fn eclipse_pthread_getschedparam(
     0
 }
 
-/// `int pthread_setschedparam(pthread_t, int policy, const sched_param* param)` — set the thread's
-/// scheduling policy/priority via the TID-based `sched_setscheduler`. A permission failure (`EPERM`,
-/// common for real-time policies as a normal user) is reported, never fatal. Returns 0/errno.
+/// Translate an Android app's scheduling request to a safe host-Linux request.
+///
+/// Android's app scheduler applies process cgroups, capability limits, and framework policy around
+/// real-time requests. Passing `SCHED_FIFO`/`SCHED_RR` straight through on a desktop host is not
+/// equivalent: on hosts whose user session permits RT scheduling, Roblox promotes dozens of general
+/// engine workers to priority 99. A live profile on 2026-07-22 showed those workers starving the
+/// render path; demoting them to `SCHED_OTHER` immediately raised the same max-quality scene from
+/// roughly 120–170 FPS to 180–210 FPS. Preserve ordinary policies, but map Android RT requests to
+/// the normal host scheduler instead of granting unbounded FIFO/RR priority.
+fn host_sched_request(policy: c_int, priority: c_int) -> (c_int, c_int) {
+    if policy == libc::SCHED_FIFO || policy == libc::SCHED_RR {
+        (libc::SCHED_OTHER, 0)
+    } else {
+        (policy, priority)
+    }
+}
+
+/// `int pthread_setschedparam(pthread_t, int policy, const sched_param* param)` — apply the requested
+/// ordinary scheduling policy via TID-based `sched_setscheduler`; Android real-time requests are
+/// safely translated by [`host_sched_request`]. A kernel failure is reported, never fatal. Returns
+/// 0/errno.
 ///
 /// # Safety
 /// `param` is null or a valid `sched_param` (first int = priority).
@@ -1968,19 +2086,45 @@ unsafe extern "C" fn eclipse_pthread_setschedparam(
     param: *const c_int,
 ) -> c_int {
     let tid = thread as c_int;
-    let mut sp: libc::sched_param = unsafe { std::mem::zeroed() };
-    if !param.is_null() {
+    let requested_priority = if param.is_null() {
+        0
+    } else {
         // SAFETY: 2026-06-05 — `param`'s first int is the requested priority.
-        sp.sched_priority = unsafe { *param };
-    }
-    // SAFETY: 2026-06-05 — `sched_setscheduler(tid, policy, &sp)` sets the TID's policy/priority; a
-    // failure returns -1 and sets errno (we surface it as the POSIX `pthread_*` return value).
-    let rc = unsafe { libc::sched_setscheduler(tid, policy, &sp) };
+        unsafe { *param }
+    };
+    // SAFETY: `tid`, policy, and the local priority object satisfy the direct scheduler shim's ABI.
+    let rc = unsafe { eclipse_sched_setscheduler(tid, policy, &requested_priority) };
     if rc == 0 {
         0
     } else {
         eclipse_errno_value()
     }
+}
+
+/// `int sched_setscheduler(pid_t, int, const sched_param*)` — direct sibling of
+/// [`eclipse_pthread_setschedparam`]. Roblox imports and uses both entry points, so translating only
+/// the pthread spelling still lets its worker pool become host `SCHED_FIFO/99`.
+///
+/// # Safety
+/// `param` is null or points to a readable `sched_param` whose first field is the priority.
+unsafe extern "C" fn eclipse_sched_setscheduler(
+    tid: c_int,
+    policy: c_int,
+    param: *const c_int,
+) -> c_int {
+    let requested_priority = if param.is_null() {
+        0
+    } else {
+        // SAFETY: the direct scheduler ABI gives a readable `sched_param`; its first field is int.
+        unsafe { *param }
+    };
+    let (host_policy, host_priority) = host_sched_request(policy, requested_priority);
+    let sp = libc::sched_param {
+        sched_priority: host_priority,
+    };
+    // SAFETY: the translated policy/priority is a valid Linux scheduler request and `sp` lives for
+    // the call. Preserve sched_setscheduler's native 0/-1+errno return convention.
+    unsafe { libc::sched_setscheduler(tid, host_policy, &sp) }
 }
 
 // =================================================================================================
@@ -2008,7 +2152,8 @@ extern "C" {
 /// primitives the init path needs. Breakdown: mutex 5, mutexattr 3, cond 6, condattr 3, rwlock 5,
 /// once 1, TLS keys 4, identity/lifecycle 5, sem 4, syscall 1 = 37, **plus** the thread LIFECYCLE
 /// (2026-06-05): create/join/detach 3, setname_np 1, kill 1, getattr_np 1, get/setschedparam 2,
-/// attr_* 6 = 14, **plus** `__cxa_thread_atexit_impl` + `pthread_atfork` (2026-06-12) = **53**.
+/// attr_* 6 = 14, **plus** `__cxa_thread_atexit_impl` + `pthread_atfork` (2026-06-12), plus the
+/// direct `sched_setscheduler` spelling (2026-07-22) = **54**.
 /// The lifecycle is Eclipse-owned (TID-based `pthread_t`) because the init path DOES spawn
 /// threads, and the mixed Eclipse-`pthread_self`/host-glibc-`pthread_setname_np` ABI crashed the
 /// worker (gdb-proven, `docs/libroblox-init-run.md` §8).
@@ -2026,7 +2171,7 @@ extern "C" {
 /// glibc's 128 (a non-null `oldset` made glibc WRITE 128 bytes through it) — it is provided by
 /// `native_provider`'s bionic signal-ABI section (with `sigaction`/`sigprocmask`/`sigemptyset`/
 /// `sigaddset`/`sigfillset`) and counted there.
-pub const PTHREAD_NATIVE_COUNT: usize = 53;
+pub const PTHREAD_NATIVE_COUNT: usize = 54;
 
 /// Append every Eclipse-owned bionic pthread/TLS/sem/syscall native to `register` as
 /// `(name, address)` pairs. Called by [`super::native_provider::EclipseNativeProvider`] so the
@@ -2105,6 +2250,7 @@ pub fn register_natives(mut register: impl FnMut(&'static str, u64)) {
     reg!("pthread_getattr_np", eclipse_pthread_getattr_np);
     reg!("pthread_getschedparam", eclipse_pthread_getschedparam);
     reg!("pthread_setschedparam", eclipse_pthread_setschedparam);
+    reg!("sched_setscheduler", eclipse_sched_setscheduler);
     reg!("pthread_attr_init", eclipse_pthread_attr_init);
     reg!("pthread_attr_destroy", eclipse_pthread_attr_destroy);
     reg!(
@@ -2251,6 +2397,101 @@ mod tests {
         let mut n = 0;
         register_natives(|_, _| n += 1);
         assert_eq!(n, PTHREAD_NATIVE_COUNT);
+    }
+
+    #[test]
+    fn android_realtime_requests_do_not_become_unbounded_host_realtime() {
+        assert_eq!(
+            host_sched_request(libc::SCHED_FIFO, 99),
+            (libc::SCHED_OTHER, 0)
+        );
+        assert_eq!(
+            host_sched_request(libc::SCHED_RR, 42),
+            (libc::SCHED_OTHER, 0)
+        );
+        assert_eq!(
+            host_sched_request(libc::SCHED_OTHER, 0),
+            (libc::SCHED_OTHER, 0),
+            "ordinary Android scheduling requests pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn cond_timedwait_honors_configured_deadline_and_relocks_mutex() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        for clock in [0, CLOCK_MONOTONIC] {
+            // Leak until the watchdog joins so even an assertion panic cannot leave that thread with
+            // a dangling condition pointer. The allocation is reclaimed at the end of the case.
+            let cond: &'static mut [i32] = Box::leak(zeroed_words(COND_WORDS));
+            let mut mutex = zeroed_words(MUTEX_WORDS);
+            let cp = cond.as_mut_ptr() as *mut c_void;
+            let mp = mutex.as_mut_ptr() as *mut c_void;
+            let mut attr = -1;
+            let ap = std::ptr::addr_of_mut!(attr) as *mut c_void;
+
+            // A watchdog prevents a regression from hanging the suite forever: the pre-fix shim
+            // ignored `abstime` and only returned after this fallback signal (with 0, failing below).
+            let (cancel_tx, cancel_rx) = mpsc::channel();
+            let cond_addr = cp as usize;
+            let watchdog = std::thread::spawn(move || {
+                if cancel_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                    // SAFETY: the test keeps the boxed condition alive until this thread joins.
+                    unsafe { eclipse_pthread_cond_signal(cond_addr as *mut c_void) };
+                }
+            });
+
+            let mut deadline = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: every pointer references a correctly sized, stable test object; `clock` is
+            // realtime or monotonic and `deadline` is a valid host/bionic-LP64 timespec out-pointer.
+            let result = unsafe {
+                assert_eq!(eclipse_pthread_condattr_init(ap), 0);
+                assert_eq!(eclipse_pthread_condattr_setclock(ap, clock), 0);
+                assert_eq!(eclipse_pthread_cond_init(cp, ap), 0);
+                assert_eq!(eclipse_pthread_mutex_lock(mp), 0);
+                assert_eq!(libc::clock_gettime(clock, &mut deadline), 0);
+                deadline.tv_nsec += 30_000_000;
+                if deadline.tv_nsec >= 1_000_000_000 {
+                    deadline.tv_sec += 1;
+                    deadline.tv_nsec -= 1_000_000_000;
+                }
+                let started = Instant::now();
+                let result = eclipse_pthread_cond_timedwait(
+                    cp,
+                    mp,
+                    std::ptr::addr_of!(deadline) as *const c_void,
+                );
+                assert!(
+                    started.elapsed() >= Duration::from_millis(20),
+                    "clock {clock}: the absolute deadline must bound a real wait"
+                );
+                result
+            };
+
+            let _ = cancel_tx.send(());
+            watchdog.join().unwrap();
+            assert_eq!(
+                result, ETIMEDOUT,
+                "clock {clock}: an unsignaled timed wait must return ETIMEDOUT"
+            );
+            // POSIX requires `pthread_cond_timedwait` to re-acquire the mutex before returning.
+            // SAFETY: `mp` is still live and owned by this thread after the timed wait.
+            unsafe {
+                assert_eq!(eclipse_pthread_mutex_trylock(mp), EBUSY);
+                assert_eq!(eclipse_pthread_mutex_unlock(mp), 0);
+                assert_eq!(eclipse_pthread_cond_destroy(cp), 0);
+                assert_eq!(eclipse_pthread_mutex_destroy(mp), 0);
+                assert_eq!(eclipse_pthread_condattr_destroy(ap), 0);
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    cp as *mut i32,
+                    COND_WORDS,
+                )));
+            }
+        }
     }
 
     // ---- mutex lock / unlock / trylock cycle ----------------------------------------------------

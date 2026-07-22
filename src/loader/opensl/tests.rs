@@ -155,6 +155,21 @@ fn fill_output_spans_multiple_buffers() {
 
 extern "C" fn noop_cb(_caller: *mut c_void, _ctx: *mut c_void) {}
 
+#[test]
+fn public_opensl_constants_match_khronos_abi() {
+    // These values arrive from libroblox/FM0D, not from Eclipse-owned structs. A self-referential
+    // harness previously used wrong values for OUTPUTMIX and ANDROIDSIMPLEBUFFERQUEUE and therefore
+    // passed while rejecting production's literal Android values.
+    assert_eq!(SL_RESULT_PRECONDITIONS_VIOLATED, 1);
+    assert_eq!(SL_RESULT_PARAMETER_INVALID, 2);
+    assert_eq!(SL_RESULT_MEMORY_FAILURE, 3);
+    assert_eq!(SL_RESULT_BUFFER_INSUFFICIENT, 7);
+    assert_eq!(SL_RESULT_FEATURE_UNSUPPORTED, 12);
+    assert_eq!(SL_DATALOCATOR_OUTPUTMIX, 4);
+    assert_eq!(SL_DATALOCATOR_BUFFERQUEUE, 6);
+    assert_eq!(SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 0x8000_07BD);
+}
+
 // A tiny accessor so the test can set PLAYING without exposing the const publicly.
 #[allow(non_snake_case)]
 fn SL_PLAYSTATE_PLAYING_TEST() -> u32 {
@@ -174,6 +189,8 @@ fn itf_offsets_recover_the_owning_object() {
         engine_itf: engine_vtable(),
         play_itf: std::ptr::null(),
         bufferqueue_itf: std::ptr::null(),
+        volume_itf: std::ptr::null(),
+        android_config_itf: std::ptr::null(),
         state: 0,
         kind: ObjectKind::OutputMix,
     });
@@ -184,6 +201,14 @@ fn itf_offsets_recover_the_owning_object() {
     let recovered =
         unsafe { object_from_itf_field(engine_field as *mut c_void, off.engine) } as usize;
     assert_eq!(recovered, base, "object_from_itf_field round-trips");
+    assert_eq!(
+        std::ptr::addr_of!(sample.volume_itf) as usize - base,
+        off.volume
+    );
+    assert_eq!(
+        std::ptr::addr_of!(sample.android_config_itf) as usize - base,
+        off.android_config
+    );
 }
 
 // ---- Object registry soundness ---------------------------------------------------------------
@@ -311,7 +336,10 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors_no_device() {
         p_format: std::ptr::null(),
     };
     let mut player: *mut c_void = std::ptr::null_mut();
-    // SAFETY: eng_itf is the engine itf; src/snk are valid for the call.
+    // FMOD's production shape explicitly requests BUFFERQUEUE, VOLUME, and Android Configuration.
+    let requested = [iid_value(2), iid_value(6), iid_value(0)];
+    let required = [SL_BOOLEAN_TRUE; 3];
+    // SAFETY: eng_itf is the engine itf; src/snk and interface arrays are valid for the call.
     let r = unsafe {
         let vt = *(eng_itf as *const *const EngineItfVtable);
         ((*vt).create_audio_player)(
@@ -319,13 +347,48 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors_no_device() {
             std::ptr::addr_of_mut!(player).cast(),
             std::ptr::addr_of!(src) as *mut c_void,
             std::ptr::addr_of!(snk) as *mut c_void,
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
+            requested.len() as u32,
+            requested.as_ptr().cast(),
+            required.as_ptr().cast(),
         )
     };
     assert_eq!(r, SL_RESULT_SUCCESS);
     assert!(!player.is_null());
+
+    // AndroidConfiguration is intentionally obtained/configured BEFORE Realize.
+    let mut config_itf: *mut c_void = std::ptr::null_mut();
+    assert_eq!(
+        obj_get_interface(
+            player,
+            iid_value(0),
+            std::ptr::addr_of_mut!(config_itf).cast()
+        ),
+        SL_RESULT_SUCCESS
+    );
+    let performance_key = b"androidPerformanceMode\0";
+    let requested_mode = 0u32;
+    // SAFETY: config_itf is the Android configuration interface; key/value are valid for the call.
+    let r = unsafe {
+        let vt = *(config_itf as *const *const AndroidConfigurationItfVtable);
+        ((*vt).set_configuration)(
+            config_itf,
+            performance_key.as_ptr().cast(),
+            std::ptr::addr_of!(requested_mode).cast(),
+            std::mem::size_of_val(&requested_mode) as u32,
+        )
+    };
+    assert_eq!(r, SL_RESULT_SUCCESS);
+
+    // Standard interfaces remain unavailable until realization.
+    let mut early_play: *mut c_void = std::ptr::null_mut();
+    assert_eq!(
+        obj_get_interface(
+            player,
+            iid_value(4),
+            std::ptr::addr_of_mut!(early_play).cast()
+        ),
+        SL_RESULT_PRECONDITIONS_VIOLATED
+    );
     assert_eq!(obj_realize(player, 0), SL_RESULT_SUCCESS);
 
     // GetInterface(PLAY) + GetInterface(BUFFERQUEUE).
@@ -343,6 +406,24 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors_no_device() {
         obj_get_interface(player, iid_value(1), std::ptr::addr_of_mut!(bq_itf).cast()),
         SL_RESULT_SUCCESS
     );
+    let mut volume_itf: *mut c_void = std::ptr::null_mut();
+    assert_eq!(
+        obj_get_interface(
+            player,
+            iid_value(6),
+            std::ptr::addr_of_mut!(volume_itf).cast()
+        ),
+        SL_RESULT_SUCCESS
+    );
+    // FMOD obtains and drives Volume after realization; prove the vtable is live, not just non-null.
+    let mut level = -1i16;
+    // SAFETY: volume_itf is live and level is a valid SLmillibel out-parameter.
+    let r = unsafe {
+        let vt = *(volume_itf as *const *const VolumeItfVtable);
+        ((*vt).get_volume_level)(volume_itf, &mut level)
+    };
+    assert_eq!(r, SL_RESULT_SUCCESS);
+    assert_eq!(level, 0);
 
     // SetPlayState(PLAYING).
     // SAFETY: play_itf is the player's play itf.

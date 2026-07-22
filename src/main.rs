@@ -7,6 +7,11 @@
 
 use std::process::ExitCode;
 
+const CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV: &str = "ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE";
+const CLIENT_SETTINGS_PATH_ENV: &str = "ECLIPSE_CLIENT_APP_SETTINGS_PATH";
+const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
+    include_bytes!(env!("ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO"));
+
 const HELP: &str = "\
 eclipse — run the Android Roblox build on Linux (open-source, Rust)
 
@@ -35,6 +40,15 @@ STATUS:
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("run"))
+        && std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV).is_none()
+    {
+        if let Err(error) = install_client_settings_and_reexec(&args) {
+            eprintln!("eclipse Android settings setup: {error}");
+            return ExitCode::FAILURE;
+        }
+        unreachable!("a successful settings-path handoff replaces this process");
+    }
     if matches!(
         args.first().map(String::as_str),
         Some("run") | Some("__webview-test")
@@ -192,6 +206,78 @@ fn main() -> ExitCode {
     }
 }
 
+/// Materialize the Sober-compatible Fast Flag map and replace this launcher with a copy whose host
+/// ART file calls redirect Roblox's `/data/local/tmp/ClientAppSettings.json` to that per-user file.
+///
+/// Roblox reads this exact absolute path before its local settings initialize. A normal host user
+/// cannot populate root-owned `/data/local/tmp`. The embedded preload shim intercepts only this exact
+/// path and forwards every other open/stat/access operation unchanged; unlike a mount namespace, it
+/// leaves Roblox's native initialization environment identical to the proven working launch.
+fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt as _;
+
+    let config = eclipse::config::Config::load()?;
+    let app_data_dir = eclipse::framework::app_data_dir().ok_or(
+        "cannot resolve Eclipse's app-data directory; set HOME, XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR",
+    )?;
+    let runtime_dir = app_data_dir.join("runtime");
+    std::fs::create_dir_all(&runtime_dir)?;
+
+    let settings_path = runtime_dir.join("ClientAppSettings.json");
+    let temporary_path = runtime_dir.join(format!(
+        ".ClientAppSettings.json.{}.tmp",
+        std::process::id()
+    ));
+    let mut json = serde_json::to_vec_pretty(&config.roblox_client_app_settings())?;
+    json.push(b'\n');
+    std::fs::write(&temporary_path, json)?;
+    std::fs::rename(&temporary_path, &settings_path)?;
+
+    let shim_path = runtime_dir.join("libeclipse_client_settings_path.so");
+    let shim_is_current =
+        std::fs::read(&shim_path).is_ok_and(|bytes| bytes.as_slice() == CLIENT_SETTINGS_PATH_SHIM);
+    if !shim_is_current {
+        let temporary_shim = runtime_dir.join(format!(
+            ".libeclipse_client_settings_path.so.{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&temporary_shim, CLIENT_SETTINGS_PATH_SHIM)?;
+        std::fs::rename(temporary_shim, &shim_path)?;
+    }
+
+    let settings_path = settings_path.canonicalize()?;
+    let shim_path = shim_path.canonicalize()?;
+
+    println!(
+        "# Roblox Fast Flags staged at {} (Android /data/local/tmp/ClientAppSettings.json)",
+        settings_path.display()
+    );
+
+    let preload = match std::env::var_os("LD_PRELOAD") {
+        Some(existing) if !existing.is_empty() => {
+            let mut value = shim_path.as_os_str().to_os_string();
+            value.push(":");
+            value.push(existing);
+            value
+        }
+        _ => shim_path.as_os_str().to_os_string(),
+    };
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+
+    let current_exe = std::env::current_exe()?;
+    let error = std::process::Command::new(current_exe)
+        .args(args)
+        .env(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV, "1")
+        .env(CLIENT_SETTINGS_PATH_ENV, &settings_path)
+        .env("LD_PRELOAD", preload)
+        .exec();
+    Err(
+        format!("could not restart Eclipse with the Android client-settings path bridge: {error}")
+            .into(),
+    )
+}
+
 /// Finish the process that hosted Android without running host C/C++ exit handlers.
 ///
 /// Android's process model does not unload an app's initialized native libraries or run their
@@ -293,6 +379,16 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     eclipse::loader::ndk_registry::set_apk_path(std::path::PathBuf::from(apk_path));
     let manifest = apk.manifest()?;
     let config = eclipse::config::Config::load()?;
+    let has_native_engine = apk
+        .native_abis()
+        .iter()
+        .any(|abi| abi.name == TARGET_ABI && abi.has_engine);
+    if has_native_engine {
+        // Apply before ART or libroblox creates any thread. In performance mode this makes the
+        // engine's bionic `_SC_NPROCESSORS_ONLN` query report physical cores rather than SMT
+        // siblings, so its worker pool is sized for low frame latency instead of oversubscription.
+        eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
+    }
     let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
 
     println!("# ART boot plan (dry run) for {apk_path}");
@@ -446,7 +542,11 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // to the hit Android view via JNI (the minimal sound input path). `vm` stays alive (bound above)
     // for the whole event loop on this main thread, so the borrow is valid for its duration.
     println!("# Opening the host window (winit; close it to exit)…");
-    eclipse::graphics::run_windowed(&format!("Eclipse — {}", manifest.package), Some(&vm))?;
+    eclipse::graphics::run_windowed(
+        &format!("Eclipse — {}", manifest.package),
+        Some(&vm),
+        config.touch_mode,
+    )?;
     Ok(())
 }
 

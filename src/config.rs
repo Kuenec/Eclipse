@@ -15,6 +15,12 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+/// Roblox's CoreScript-side settings save bridge. The Android client contains the same native
+/// `Settings::saveState` path as desktop, but gates the reflection call that reaches it behind this
+/// Fast Flag. Eclipse enables it by default so changes made in Roblox Settings are written to
+/// `GlobalBasicSettings_13.xml` instead of disappearing at process exit.
+pub const SETTINGS_SAVE_STATE_FLAG: &str = "FFlagGlobalBasicSettingsSaveStateReflection";
+
 /// `graphics_optimization_mode` — Sober's quality/perf trade-off knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -33,6 +39,18 @@ pub enum TouchMode {
     Off,
     On,
     FakeOff,
+}
+
+impl TouchMode {
+    /// Stable spelling shared by config JSON, the ART system property, and the framework overlay.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::FakeOff => "fake-off",
+        }
+    }
 }
 
 /// Eclipse configuration, mirroring Sober's `config.json` (docs/sober-research.md §5.2).
@@ -160,6 +178,17 @@ impl Config {
     pub fn to_json_pretty(&self) -> Result<String, ConfigError> {
         Ok(serde_json::to_string_pretty(self)?)
     }
+
+    /// Build the `ClientAppSettings.json` object Roblox reads from Android's
+    /// `/data/local/tmp`. User-provided Fast Flags pass through unchanged; the settings-save bridge
+    /// is enabled only when the user has not explicitly supplied a value for it.
+    pub fn roblox_client_app_settings(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut settings = self.fflags.clone();
+        settings
+            .entry(SETTINGS_SAVE_STATE_FLAG.to_string())
+            .or_insert(serde_json::Value::Bool(true));
+        settings
+    }
 }
 
 /// Errors from loading/saving configuration.
@@ -256,6 +285,35 @@ mod tests {
             GraphicsOptimizationMode::Performance
         );
         assert_eq!(cfg.touch_mode, TouchMode::FakeOff);
+        assert_eq!(TouchMode::Off.as_str(), "off");
+        assert_eq!(TouchMode::On.as_str(), "on");
+        assert_eq!(TouchMode::FakeOff.as_str(), "fake-off");
+    }
+
+    #[test]
+    fn client_app_settings_enable_persistence_and_preserve_user_fflags() {
+        let mut cfg = Config::default();
+        cfg.fflags.insert(
+            "DFIntExample".to_string(),
+            serde_json::Value::Number(42.into()),
+        );
+        let settings = cfg.roblox_client_app_settings();
+        assert_eq!(
+            settings.get(SETTINGS_SAVE_STATE_FLAG),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(settings.get("DFIntExample"), Some(&serde_json::json!(42)));
+
+        cfg.fflags.insert(
+            SETTINGS_SAVE_STATE_FLAG.to_string(),
+            serde_json::Value::Bool(false),
+        );
+        assert_eq!(
+            cfg.roblox_client_app_settings()
+                .get(SETTINGS_SAVE_STATE_FLAG),
+            Some(&serde_json::Value::Bool(false)),
+            "an explicit user override must win"
+        );
     }
 
     #[test]
