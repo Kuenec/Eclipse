@@ -322,6 +322,56 @@ fn framework_overlay_preserves_location_manager_provider_query_contract() {
     }
 }
 
+/// 2026-07-18: ATL's `ActivityManager.getMemoryInfo(out)` reassigned only its local parameter,
+/// leaving the app's object at a 10,000-byte placeholder and producing the measured `0MB` device
+/// profile. Pin the committed Java half of the repair independently from JNI's Rust constants:
+/// the caller object must be filled, both heap classes must come from Rust, and Android 13's eight
+/// `MemoryInfo` fields must remain in AOSP parcel order. This test needs no ART/JDK/host capability.
+#[test]
+fn framework_overlay_preserves_activity_manager_memory_contract() {
+    let source = include_str!("../tools/framework-overlay/src/android/app/ActivityManager.java");
+    for needle in [
+        "private static native void native_fillMemoryInfo(MemoryInfo outInfo);",
+        "native_fillMemoryInfo(outInfo);",
+        "private static native int native_getMemoryClass();",
+        "public int getMemoryClass() {return native_getMemoryClass();}",
+        "private static native int native_getLargeMemoryClass();",
+        "public int getLargeMemoryClass() {return native_getLargeMemoryClass();}",
+        "private static native boolean native_isLowRamDevice();",
+        "public boolean isLowRamDevice() {return native_isLowRamDevice();}",
+    ] {
+        assert!(
+            source.contains(needle),
+            "framework overlay lost ActivityManager memory contract fragment {needle:?}"
+        );
+    }
+    assert!(
+        !source.contains("outInfo = new MemoryInfo();"),
+        "getMemoryInfo again reassigns only its local parameter instead of filling the caller"
+    );
+
+    let memory_info = source
+        .split_once("public static class MemoryInfo")
+        .map(|(_, tail)| tail)
+        .expect("ActivityManager overlay must define MemoryInfo");
+    let mut remaining = memory_info;
+    for field_write in [
+        "dest.writeLong(availMem);",
+        "dest.writeLong(totalMem);",
+        "dest.writeLong(threshold);",
+        "dest.writeInt(lowMemory ? 1 : 0);",
+        "dest.writeLong(hiddenAppThreshold);",
+        "dest.writeLong(secondaryServerThreshold);",
+        "dest.writeLong(visibleAppThreshold);",
+        "dest.writeLong(foregroundAppThreshold);",
+    ] {
+        let (_, tail) = remaining.split_once(field_write).unwrap_or_else(|| {
+            panic!("MemoryInfo parcel lost or reordered AOSP field write {field_write:?}")
+        });
+        remaining = tail;
+    }
+}
+
 /// Guards `eclipse __input-test` (2026-06-05): the REAL `ALooper` input path — register a synthetic
 /// engine input fd, park in `pollOnce`, inject the fd signal (expect the registered ident), then park
 /// again and inject a host-input wake (expect `ALOOPER_POLL_WAKE`). A regression in the looper

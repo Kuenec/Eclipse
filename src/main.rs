@@ -427,6 +427,17 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         eclipse::framework::drive_application_lifecycle(&vm, apk_path, &plan.launcher_activity)?;
     println!("framework lifecycle driven: {progress:?} (non-GTK Context/Window/View natives bound; launcher Activity = {}) ✓", plan.launcher_activity);
 
+    // Owner-driven, first-party sign-in escape hatch for platforms without Google Play Integrity.
+    // It is deliberately opt-in and carries no credential/session material: the owner types into
+    // Roblox's official HTTPS page, rendered by the same persistent WebView/CookieManager profile
+    // the app uses. Keep this after lifecycle so the app has finalized its WebView User-Agent and
+    // initial cookie mutations before the browser is created.
+    if std::env::var("ECLIPSE_WEB_LOGIN").is_ok_and(|value| value == "1") {
+        println!("# Opening Roblox's official web login in Eclipse…");
+        let handle = eclipse::framework::drive_roblox_web_login(&vm)?;
+        println!("official Roblox web login opened (WebView handle {handle}) ✓");
+    }
+
     // Open the host game window via winit (no GTK — keeps the low_4gb window clear for ART, the
     // Step 3.5 win). The Activity Surface + engine rendering will hang off this window next; for
     // now it opens the window and runs the event loop until closed. Runs on the main thread, with

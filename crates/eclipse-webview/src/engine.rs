@@ -720,6 +720,15 @@ impl Engine {
                     1 => MouseButtonType::MIDDLE,
                     _ => MouseButtonType::RIGHT, // decode validated 0..=2
                 };
+                // A windowless CEF browser has no native child window from which Chromium can
+                // infer focus. Tell it explicitly before the press; without this the page paints
+                // and receives pointer coordinates, but editable controls never acquire keyboard
+                // focus (the first-party Roblox login form was visibly inert). Repeating `true` is
+                // idempotent and keeps focus tied to real routed input rather than fabricating it
+                // when a view is merely created.
+                if down {
+                    host.set_focus(1);
+                }
                 host.send_mouse_click_event(
                     Some(&event),
                     button,
@@ -746,6 +755,9 @@ impl Engine {
                 character,
                 modifiers,
             } => self.with_host(view, |host| {
+                // Keyboard input can arrive through Tab navigation before the first pointer press.
+                // Windowless CEF still needs the same explicit focus notification in that path.
+                host.set_focus(1);
                 let event = KeyEvent {
                     type_: match kind {
                         0 => KeyEventType::RAWKEYDOWN,
