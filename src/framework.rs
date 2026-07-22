@@ -77,7 +77,10 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use jni::errors::LogErrorAndDefault;
-use jni::objects::{JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray, JString};
+use jni::objects::{
+    JByteArray, JClass, JFloatArray, JIntArray, JLongArray, JMethodID, JObject, JObjectArray,
+    JString,
+};
 use jni::refs::{Global, Reference};
 use jni::signature::{FieldSignature, JavaType, MethodSignature, Primitive};
 use jni::strings::JNIStr;
@@ -4811,8 +4814,8 @@ pub const VIEW_CLASS: &JNIStr = jni_str!("android/view/View");
 ///
 /// All three are stable, general public Android API.
 pub const MOTION_EVENT_CLASS: &JNIStr = jni_str!("android/view/MotionEvent");
-/// `android.view.KeyEvent` (slashed internal name) — keyboard input events dispatched to the engine's
-/// `RBXSurfaceView.dispatchKeyEvent` (see [`dispatch_key_to_engine_surface`]).
+/// `android.view.KeyEvent` (slashed internal name), retained for framework compatibility contracts.
+/// Gameplay hardware input uses Roblox's direct [`pass_hardware_key_to_engine`] bridge.
 pub const KEY_EVENT_CLASS: &JNIStr = jni_str!("android/view/KeyEvent");
 
 // JNI name + descriptor for View's native peer constructor, exactly as declared in `View.java`
@@ -12595,6 +12598,37 @@ pub fn active_text_field() -> i64 {
     ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Clear the host's text-input routing before a pointer press enters Roblox's engine surface.
+/// Android normally transfers focus away from an `EditText` when another control/content surface is
+/// pressed. Eclipse's headless view layer has no window focus manager, so the last field polled by
+/// `RbxKeyboard` otherwise remains active across navigation and printable game keys are appended to
+/// that stale field instead of reaching `nativePassKeyEvent`.
+///
+/// Returns whether a field was active. A click on another textbox is safe: its subsequent
+/// `native_getText` poll records the newly focused field again.
+pub fn clear_active_text_field() -> bool {
+    let widget = ACTIVE_TEXT_FIELD.swap(0, std::sync::atomic::Ordering::AcqRel);
+    record_textbox_session(None);
+    widget != 0
+}
+
+/// Invalidate one observed textbox only if it is still the active one. The conditional exchange is
+/// used after a JNI query so a late answer for an old field cannot clear a newer focus session.
+fn clear_active_text_field_if(widget: i64) {
+    if widget != 0
+        && ACTIVE_TEXT_FIELD
+            .compare_exchange(
+                widget,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        record_textbox_session(None);
+    }
+}
+
 /// One coherent engine textbox answer, keyed to the exact `EditText` whose text Eclipse would draw.
 /// Geometry/type without this identity is unsafe: the active field can advance from username to
 /// password between independent reads, making a stale non-secure type authorize plaintext from the
@@ -12666,6 +12700,14 @@ pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
 
 fn textbox_session_matches_active(session: TextboxSession, active_widget: i64) -> bool {
     active_widget != 0 && session.widget == active_widget
+}
+
+fn has_live_textbox_session(widget: i64) -> bool {
+    TEXTBOX_SESSION
+        .lock()
+        .ok()
+        .and_then(|session| *session)
+        .is_some_and(|session| textbox_session_matches_active(session, widget))
 }
 
 /// 2026-07-17: the ONE writer of the focused-textbox cache. Widget identity, geometry, and input type
@@ -12752,7 +12794,7 @@ pub fn query_textbox_geometry(vm: &Vm) {
             };
             if info.is_null() {
                 // The engine's own "no textbox is focused" signal — authoritative. 2026-07-17.
-                record_textbox_session(None);
+                clear_active_text_field_if(widget);
                 return;
             }
             let Ok(info_cls) = checked(env, "Object.getClass", |env| {
@@ -13048,6 +13090,19 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
     if widget == 0 {
         return false;
     }
+    // `native_getText` is only a focus heuristic: an old RbxKeyboard poll can survive a LuaApp →
+    // game transition. Require the engine's current `NativeTextBoxInfo` snapshot to authenticate the
+    // same widget before swallowing a printable hardware key. Without this check the 2026-07-22 live
+    // session routed W/A/S/D into the home search field for the entire game.
+    if !has_live_textbox_session(widget) {
+        // Do not drop the first character merely because the normal main-loop geometry poll has not
+        // run since focus changed. Authenticate once synchronously; a stale field yields the engine's
+        // null answer, clears itself, and falls through to gameplay input.
+        query_textbox_geometry(vm);
+    }
+    if !has_live_textbox_session(widget) {
+        return false;
+    }
     // Edit the stored text under the registry lock, computing the precise `onTextChanged` delta via the
     // pure [`apply_text_edit`]; capture the result to notify watchers OUTSIDE the lock (an engine
     // TextWatcher re-enters the registry via getText → with_view, which would deadlock).
@@ -13081,7 +13136,7 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
         }
         Err(_) => {
             // Stale handle (the field's peer was destroyed, e.g. on navigation) — clear + not active.
-            ACTIVE_TEXT_FIELD.store(0, std::sync::atomic::Ordering::Release);
+            clear_active_text_field_if(widget);
             false
         }
     }
@@ -16304,9 +16359,9 @@ pub fn register_engine_preload_natives(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-/// The two JNI calls of lifecycle step 0 (`find_class` + `Looper.prepareMainLooper()V`), plus the
-/// [`MAIN_THREAD_ID`] record. Shared by [`drive_application_lifecycle`]'s step 0 (whose surrounding
-/// comment block stays at its call site) and [`prepare_main_looper`].
+/// Lifecycle step 0: prepare Android's main Looper, record [`MAIN_THREAD_ID`], and initialize the
+/// cached queue/method IDs used by the external pump. Shared by [`drive_application_lifecycle`]'s
+/// step 0 (whose surrounding comment block stays at its call site) and [`prepare_main_looper`].
 ///
 /// 2026-07-16: NOT idempotent — the pre-2026-07-16 step-0 comment claimed it was, and that was
 /// stale. On the SAME thread ATL `Looper.java:76-78` throws
@@ -16326,8 +16381,77 @@ fn prepare_main_looper_inner(env: &mut Env) -> Result<(), FrameworkError> {
         )?
         .v()
     })?;
+    initialize_main_looper_jni_cache(env, &looper_class)?;
     // The UI thread's identity, recorded once — the dispatch gate's whole basis (2026-07-16).
     let _ = MAIN_THREAD_ID.set(std::thread::current().id());
+    Ok(())
+}
+
+/// JNI state used by the externally pumped Android main queue. The queue is immutable after
+/// `Looper.prepareMainLooper`, and JNI method IDs are explicitly reusable across calls and threads
+/// while their declaring classes remain loaded. Keeping global class references here satisfies that
+/// lifetime requirement and removes the measured per-tick `FindClass`/`GetMethodID`/`GetObjectClass`
+/// work from the gameplay main thread.
+struct MainLooperJniCache {
+    queue: Global<JObject<'static>>,
+    queue_next: JMethodID,
+    message_get_target: JMethodID,
+    handler_dispatch_message: JMethodID,
+    message_recycle: JMethodID,
+    // JNI method IDs may be invalidated if their declaring class unloads. These globals deliberately
+    // have no read sites: retaining them for the process lifetime is what keeps every ID above valid.
+    _queue_class: Global<JClass<'static>>,
+    _message_class: Global<JClass<'static>>,
+    _handler_class: Global<JClass<'static>>,
+}
+
+static MAIN_LOOPER_JNI_CACHE: OnceLock<MainLooperJniCache> = OnceLock::new();
+
+/// Resolve the main queue and its four hot method IDs once, immediately after the main Looper is
+/// prepared. This is deliberately part of step 0: a failure is a boot-time JNI error rather than a
+/// recurring error (and repeated lookup cost) from `about_to_wait` during gameplay.
+fn initialize_main_looper_jni_cache(
+    env: &mut Env,
+    looper_class: &JClass,
+) -> Result<(), FrameworkError> {
+    let queue = checked(env, "Looper.myQueue for cached main pump", |env| {
+        env.call_static_method(
+            looper_class,
+            jni_str!("myQueue"),
+            jni_sig!("()Landroid/os/MessageQueue;"),
+            &[],
+        )?
+        .l()
+    })?;
+    let queue_class = env.get_object_class(&queue)?;
+    let message_class = env.find_class(jni_str!("android/os/Message"))?;
+    let handler_class = env.find_class(jni_str!("android/os/Handler"))?;
+
+    let cache = MainLooperJniCache {
+        queue_next: env.get_method_id(
+            &queue_class,
+            jni_str!("next"),
+            jni_sig!("()Landroid/os/Message;"),
+        )?,
+        message_get_target: env.get_method_id(
+            &message_class,
+            jni_str!("getTarget"),
+            jni_sig!("()Landroid/os/Handler;"),
+        )?,
+        handler_dispatch_message: env.get_method_id(
+            &handler_class,
+            jni_str!("dispatchMessage"),
+            jni_sig!("(Landroid/os/Message;)V"),
+        )?,
+        message_recycle: env.get_method_id(&message_class, jni_str!("recycle"), jni_sig!("()V"))?,
+        queue: env.new_global_ref(&queue)?,
+        _queue_class: env.new_global_ref(&queue_class)?,
+        _message_class: env.new_global_ref(&message_class)?,
+        _handler_class: env.new_global_ref(&handler_class)?,
+    };
+    // Step 0 is intentionally once-per-process. If a future caller violates that invariant, retain
+    // the first cache (which belongs to the only valid main Looper) rather than replacing it.
+    let _ = MAIN_LOOPER_JNI_CACHE.set(cache);
     Ok(())
 }
 
@@ -16487,6 +16611,12 @@ const MAIN_LOOPER_MESSAGE_BUDGET: usize = 512;
 /// and a thrown handler is described+cleared so one bad handler can't stop the batch — stricter than
 /// `Looper.loop`, which aborts the whole loop on a throw.
 fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
+    if let Some(cache) = MAIN_LOOPER_JNI_CACHE.get() {
+        return drive_main_messages_cached(env, cache);
+    }
+
+    // Defensive fallback for a future non-standard caller that pumps without the normal step-0
+    // preparation path. Production and the WebView harness always use the cached branch above.
     let looper_class = env.find_class(LOOPER_CLASS)?;
     // Looper.myQueue() (public static) → the current (main) thread's MessageQueue.
     let queue = checked(env, "Looper.myQueue", |env| {
@@ -16543,6 +16673,90 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
             if let Err(e) = checked(env, "Message.recycle", |env| {
                 env.call_method(&msg, jni_str!("recycle"), jni_sig!("()V"), &[])?
                     .v()
+            }) {
+                tracing::debug!(error = %e, "Message.recycle failed (ignored)");
+            }
+            Ok(true)
+        })?;
+        if !processed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Hot main-queue drain using the queue and exact method IDs resolved at Looper setup. Each unchecked
+/// invocation is paired with the descriptor used to create its cached ID in
+/// [`initialize_main_looper_jni_cache`]; return types and argument counts therefore match by
+/// construction. Calls still run through [`checked`], so Java exceptions are described and cleared
+/// exactly like the former name-resolving path.
+fn drive_main_messages_cached(
+    env: &mut Env,
+    cache: &MainLooperJniCache,
+) -> Result<(), FrameworkError> {
+    for _ in 0..MAIN_LOOPER_MESSAGE_BUDGET {
+        let processed = env.with_local_frame(16, |env| -> Result<bool, FrameworkError> {
+            let msg = checked(env, "MessageQueue.next (cached)", |env| {
+                // SAFETY: `queue_next` was resolved from MessageQueue with descriptor
+                // `()Landroid/os/Message;`; `cache.queue` is the retained main MessageQueue.
+                unsafe {
+                    env.call_method_unchecked(
+                        cache.queue.as_obj(),
+                        cache.queue_next,
+                        JavaType::Object,
+                        &[],
+                    )
+                }?
+                .l()
+            })?;
+            if msg.is_null() {
+                return Ok(false);
+            }
+
+            let target = checked(env, "Message.getTarget (cached)", |env| {
+                // SAFETY: `message_get_target` was resolved from Message with descriptor
+                // `()Landroid/os/Handler;`, and `msg` is the Message returned by queue.next().
+                unsafe {
+                    env.call_method_unchecked(
+                        &msg,
+                        cache.message_get_target,
+                        JavaType::Object,
+                        &[],
+                    )
+                }?
+                .l()
+            })?;
+            if !target.is_null() {
+                let args = [JValue::Object(&msg).as_jni()];
+                if let Err(e) = checked(env, "Handler.dispatchMessage (cached)", |env| {
+                    // SAFETY: `handler_dispatch_message` was resolved from Handler with descriptor
+                    // `(Landroid/os/Message;)V`; `target` and the sole Message argument match it.
+                    unsafe {
+                        env.call_method_unchecked(
+                            &target,
+                            cache.handler_dispatch_message,
+                            JavaType::Primitive(Primitive::Void),
+                            &args,
+                        )
+                    }?
+                    .v()
+                }) {
+                    tracing::debug!(error = %e, "main-looper message handler threw (cleared, continuing)");
+                }
+            }
+
+            if let Err(e) = checked(env, "Message.recycle (cached)", |env| {
+                // SAFETY: `message_recycle` was resolved from Message with descriptor `()V`; `msg`
+                // is still live within this local frame and dispatch has completed.
+                unsafe {
+                    env.call_method_unchecked(
+                        &msg,
+                        cache.message_recycle,
+                        JavaType::Primitive(Primitive::Void),
+                        &[],
+                    )
+                }?
+                .v()
             }) {
                 tracing::debug!(error = %e, "Message.recycle failed (ignored)");
             }
@@ -16635,13 +16849,12 @@ impl MotionAction {
     }
 }
 
-/// Which half of a key press a [`dispatch_key_to_engine_surface`] call carries, mapped to the public
-/// `android.view.KeyEvent` action code via [`Self::code`] (`ACTION_DOWN = 0`, `ACTION_UP = 1`).
+/// Which half of a hardware-key event a [`pass_hardware_key_to_engine`] call carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
-    /// `KeyEvent.ACTION_DOWN` — a key was pressed. Carries the typed character (`unicodeValue`).
+    /// The key was pressed (`isDown = true`).
     Down,
-    /// `KeyEvent.ACTION_UP` — a key was released.
+    /// The key was released (`isDown = false`).
     Up,
 }
 
@@ -16844,6 +17057,94 @@ pub fn dispatch_scroll(vm: &Vm, x: f32, y: f32, delta: f32) {
     });
 }
 
+/// Forward one host mouse-button transition through Roblox's desktop input bridge:
+/// `NativeInputInterface.nativePassMouseButton(float x, float y, boolean down, int button)`.
+/// The current APK's own generic-motion handler calls this exact method for Android mouse
+/// `ACTION_BUTTON_PRESS`/`ACTION_BUTTON_RELEASE`; calling it directly avoids misclassifying a host
+/// mouse as a touchscreen.
+pub fn dispatch_mouse_button(
+    vm: &Vm,
+    x: f32,
+    y: f32,
+    down: bool,
+    button: i32,
+) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: the live process VM is kept alive by `&Vm` and was checked non-null above.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let class = checked(env, "NativeInputInterface class for mouse button", |env| {
+                env.find_class(jni_str!("com/roblox/engine/jni/NativeInputInterface"))
+            })?;
+            checked(env, "NativeInputInterface.nativePassMouseButton", |env| {
+                env.call_static_method(
+                    &class,
+                    jni_str!("nativePassMouseButton"),
+                    jni_sig!("(FFZI)V"),
+                    &[
+                        JValue::Float(x),
+                        JValue::Float(y),
+                        JValue::Bool(down),
+                        JValue::Int(button),
+                    ],
+                )?
+                .v()
+            })?;
+            Ok(())
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+/// Forward host pointer motion through Roblox's desktop input bridge:
+/// `NativeInputInterface.nativePassMouseMove(float x, float y, float dx, float dy)`. The APK uses
+/// these same absolute and relative values in its generic-motion handler.
+pub fn dispatch_mouse_move(
+    vm: &Vm,
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: the live process VM is kept alive by `&Vm` and was checked non-null above.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let class = checked(env, "NativeInputInterface class for mouse move", |env| {
+                env.find_class(jni_str!("com/roblox/engine/jni/NativeInputInterface"))
+            })?;
+            checked(env, "NativeInputInterface.nativePassMouseMove", |env| {
+                env.call_static_method(
+                    &class,
+                    jni_str!("nativePassMouseMove"),
+                    jni_sig!("(FFFF)V"),
+                    &[
+                        JValue::Float(x),
+                        JValue::Float(y),
+                        JValue::Float(dx),
+                        JValue::Float(dy),
+                    ],
+                )?
+                .v()
+            })?;
+            Ok(())
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
 /// Dispatch a single-pointer `MotionEvent` of `action` at window pixel `(x, y)` to the engine's
 /// `RBXSurfaceView` via ATL's touch driver `onTouchEventInternal`, which invokes the view's
 /// `OnTouchListener` — the GLSurfaceView input entry point Roblox's engine wires (via
@@ -17018,41 +17319,50 @@ fn touch_engine_surface(
     })
 }
 
-/// Dispatch one hardware-keyboard key event of `action` to the engine's `RBXSurfaceView` by building an
-/// `android.view.KeyEvent` and calling `dispatchKeyEvent` — the GLSurfaceView key entry the
-/// engine overrides to forward into native (`NativeGLInterface.nativePassKeyEvent`). NOT
-/// `setOnKeyListener` (an ATL no-op that discards the listener, View.java:1197) nor `onKeyUp` (a live
-/// boot showed it is absent on the view, and base `onKeyDown` is a `return false` stub).
-/// `key_code` is the Android `KEYCODE_*`, `unicode` the typed codepoint (0 for non-printing keys),
-/// `meta_state` the `META_*` modifier bitmask.
-///
-/// 2026-06-14 LOAD-BEARING: ATL's `KeyEvent.getUnicodeChar()` returns the package-private `unicodeValue`
-/// field verbatim (its keymap path is disabled), and the public constructors leave it 0 — so this sets
-/// `unicodeValue = unicode` via JNI `SetIntField`, or no character is typed even though the keyCode
-/// arrives (exactly what ATL's own GTK key driver does before dispatch).
+/// Pass one hardware-keyboard event through the exact bridge Roblox's `ActivityNativeMain.onKeyDown`
+/// and `onKeyUp` use: `NativeGLInterface.nativePassKeyEvent(isDown, scanCode, keyCode, isRepeat)`.
+/// `scan_code` is the Linux evdev scan code exposed by winit on Wayland/X11; it is load-bearing because
+/// the current native client maps that second JNI value to its internal key enum. `key_code` is the
+/// Android `KEYCODE_*` compatibility value. This bypasses `RBXSurfaceView.dispatchKeyEvent`, which the
+/// APK does not override and which therefore always returned `false` without reaching the engine.
 ///
 /// Soundness mirrors [`dispatch_touch_to_engine_surface`]: null-VM guard, `attach_current_thread`,
-/// `catch_unwind`, every JNI call through [`checked`]. Returns whether `dispatchKeyEvent` consumed
-/// the event (informational), or a no-op `false` if the surface is not registered.
+/// `catch_unwind`, and every JNI call through [`checked`].
 ///
 /// # Errors
 /// [`FrameworkError::NullVm`]/[`FrameworkError::Jni`]/[`FrameworkError::Panicked`] as for the touch path.
-pub fn dispatch_key_to_engine_surface(
+pub fn pass_hardware_key_to_engine(
     vm: &Vm,
     action: KeyAction,
+    scan_code: jint,
     key_code: jint,
-    unicode: jint,
-    meta_state: jint,
-) -> Result<bool, FrameworkError> {
+    is_repeat: bool,
+) -> Result<(), FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: as `dispatch_touch_to_engine_surface` — the live process VM kept alive by `&Vm`, non-null.
+    // SAFETY: the live process VM is kept alive by `&Vm` and was checked non-null above.
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            key_engine_surface(env, action, key_code, unicode, meta_state)
+            let class = checked(env, "NativeGLInterface class for hardware key", |env| {
+                env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface"))
+            })?;
+            checked(env, "NativeGLInterface.nativePassKeyEvent", |env| {
+                env.call_static_method(
+                    &class,
+                    jni_str!("nativePassKeyEvent"),
+                    jni_sig!("(ZIIZ)V"),
+                    &[
+                        JValue::Bool(matches!(action, KeyAction::Down)),
+                        JValue::Int(scan_code),
+                        JValue::Int(key_code),
+                        JValue::Bool(is_repeat),
+                    ],
+                )?
+                .v()
+            })
         })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
@@ -17060,102 +17370,89 @@ pub fn dispatch_key_to_engine_surface(
     })
 }
 
-/// Build a `KeyEvent` for `action`/`key_code` (with `unicodeValue = unicode` and `metaState`) and call
-/// `dispatchKeyEvent` on the engine's `RBXSurfaceView`. No-op `false` if the surface is unregistered.
-fn key_engine_surface(
-    env: &mut Env,
-    action: KeyAction,
-    key_code: jint,
-    unicode: jint,
-    meta_state: jint,
-) -> Result<bool, FrameworkError> {
-    let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
-        tracing::debug!(
-            ?action,
-            "engine key: RBXSurfaceView not registered yet (no-op)"
-        );
-        return Ok(false);
-    };
-    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
-        let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
-        let now = checked(env, "SystemClock.uptimeMillis", |env| {
-            env.call_static_method(
-                &system_clock,
-                jni_str!("uptimeMillis"),
-                jni_sig!("()J"),
-                &[],
-            )?
-            .j()
-        })?;
-        // new KeyEvent(downTime, eventTime, action, code, repeat=0, metaState).
-        let key_event_class = env.find_class(KEY_EVENT_CLASS)?;
-        let event = checked(env, "KeyEvent.<init>", |env| {
-            env.new_object(
-                &key_event_class,
-                jni_sig!("(JJIIII)V"),
-                &[
-                    JValue::Long(now),
-                    JValue::Long(now),
-                    JValue::Int(action.code()),
-                    JValue::Int(key_code),
-                    JValue::Int(0), // repeat
-                    JValue::Int(meta_state),
-                ],
-            )
-        })?;
-        // CRITICAL (2026-06-14): populate the package-private `unicodeValue` field so getUnicodeChar()
-        // returns the typed character (public ctors leave it 0; ATL's keymap path is disabled). JNI
-        // SetIntField bypasses Java access control. A failure is logged, not fatal.
-        if let Err(e) = checked(env, "KeyEvent.unicodeValue=", |env| {
-            // SAFETY: `unicodeValue` is an `int` field of android.view.KeyEvent (ATL KeyEvent.java),
-            // so the "I" signature paired with JavaType::Int is consistent — exactly
-            // FieldSignature::from_raw_parts' invariant; set_field re-checks the value type at runtime.
-            let int_sig = unsafe {
-                FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int))
-            };
-            env.set_field(
-                &event,
-                jni_str!("unicodeValue"),
-                &int_sig,
-                JValue::Int(unicode),
-            )
-        }) {
-            tracing::debug!(error = %e, "KeyEvent.unicodeValue set failed (char may not type)");
-        }
-        // Call dispatchKeyEvent(event) — the event carries its own action (DOWN/UP). 2026-06-14: a live
-        // boot proved RBXSurfaceView does NOT expose onKeyUp and its onKeyDown is ATL's base
-        // `return false` stub (engine not reached, consumed=false) — so the engine overrides
-        // dispatchKeyEvent (the path ATL's own GTK key driver uses, WrapperWidget.c). dispatchKeyEvent
-        // reaches that override; for a view that instead overrode onKeyDown, ATL's base dispatchKeyEvent
-        // still routes DOWN→onKeyDown (UP would then be dropped — acceptable, the DOWN carries the
-        // typed char). The action is read from the event, but `key_code` stays meaningful for callers.
-        let _ = key_code;
-        checked(env, "RBXSurfaceView.dispatchKeyEvent", |env| {
-            env.call_method(
-                global.as_obj(),
-                jni_str!("dispatchKeyEvent"),
-                jni_sig!("(Landroid/view/KeyEvent;)Z"),
-                &[JValue::Object(&event)],
-            )?
-            .z()
-        })
-    });
-    match result {
-        Ok(Some(Ok(c))) => Ok(c),
-        Ok(Some(Err(e))) => Err(e),
-        Ok(None) => Ok(false),
-        Err(e) => {
-            tracing::debug!(error = %e, "engine key: surface not dispatchable (ignored)");
-            Ok(false)
-        }
-    }
-}
-
 /// The concrete class of Roblox's engine `SurfaceView` peer, captured into [`view_registry`] by
 /// [`view_native_constructor`] (via [`view_registry::find_by_class`]). The engine's `AndroidGLView`
 /// subscribes to this view's `SurfaceHolder` (`getHolder().addCallback(...)`), so its `mCallbacks`
 /// list becomes non-empty once it has registered — the gate for dispatching the surface lifecycle.
 const RBX_SURFACE_VIEW_CLASS: &str = "com.roblox.client.RBXSurfaceView";
+
+/// Publish the host window's real display refresh-rate capabilities to Roblox's existing Android
+/// bridge. `Activity.onStart` asks ATL's `Display` before winit is allowed to create a window, so the
+/// framework overlay can initially provide only its conservative 60 Hz fallback. Once winit's
+/// `resumed` callback has a real monitor, [`crate::graphics`] calls this with that monitor's current
+/// rate and same-resolution modes. Roblox consumes the same two methods its Android shell normally
+/// calls, so its native in-game "Maximum Frame Rate" setting—not an Eclipse overlay—gets the real
+/// choices.
+///
+/// Invalid/non-positive rates are ignored and an empty supported set is a no-op. This function is
+/// best-effort at the window boundary: callers log a typed JNI error without taking down rendering.
+///
+/// # Errors
+/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
+/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
+pub fn publish_engine_display_refresh_rates(
+    vm: &Vm,
+    current_hz: Option<f32>,
+    supported_hz: &[f32],
+) -> Result<(), FrameworkError> {
+    let supported_hz: Vec<jfloat> = supported_hz
+        .iter()
+        .copied()
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .collect();
+    if supported_hz.is_empty() {
+        return Ok(());
+    }
+    let current_hz = current_hz.filter(|rate| rate.is_finite() && *rate > 0.0);
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    // SAFETY: `raw` is the live process VM returned by `boot()`, remains alive for the `&Vm`
+    // borrow, and was checked non-null above—the complete `JavaVM::from_raw` contract.
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let class = checked(env, "NativeGLInterface class for display rates", |env| {
+                env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface"))
+            })?;
+            if let Some(current_hz) = current_hz {
+                checked(
+                    env,
+                    "NativeGLInterface.nativePassCurrentDisplayRefreshRate",
+                    |env| {
+                        env.call_static_method(
+                            &class,
+                            jni_str!("nativePassCurrentDisplayRefreshRate"),
+                            jni_sig!("(F)V"),
+                            &[JValue::Float(current_hz)],
+                        )?
+                        .v()
+                    },
+                )?;
+            }
+            let rates = JFloatArray::new(env, supported_hz.len())?;
+            rates.set_region(env, 0, &supported_hz)?;
+            checked(
+                env,
+                "NativeGLInterface.nativePassSupportedRefreshRates",
+                |env| {
+                    env.call_static_method(
+                        &class,
+                        jni_str!("nativePassSupportedRefreshRates"),
+                        jni_sig!("([F)V"),
+                        &[JValue::Object(&rates)],
+                    )?
+                    .v()
+                },
+            )?;
+            Ok(())
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
 
 /// The window pixel format Eclipse passes as `SurfaceView.surfaceChanged(format, w, h)`'s `format`.
 /// 2026-06-13: `WINDOW_FORMAT_RGBA_8888 = 1` — the public Android `PixelFormat.RGBA_8888` value, the
@@ -18401,6 +18698,28 @@ mod tests {
         assert!(textbox_session_matches_active(username, 42));
         assert!(!textbox_session_matches_active(username, 43));
         assert!(!textbox_session_matches_active(username, 0));
+
+        // A surface click clears both routing and metadata, so the old home-search field cannot
+        // consume printable gameplay keys after navigation.
+        ACTIVE_TEXT_FIELD.store(42, std::sync::atomic::Ordering::Release);
+        record_textbox_session(Some(username));
+        assert!(has_live_textbox_session(42));
+        assert!(clear_active_text_field());
+        assert_eq!(active_text_field(), 0);
+        assert!(!has_live_textbox_session(42));
+
+        // A late null answer for field 42 must not erase a newer field 43.
+        let password = TextboxSession {
+            widget: 43,
+            geometry: (181, 219, 438, 46),
+            input_type: 5,
+        };
+        ACTIVE_TEXT_FIELD.store(43, std::sync::atomic::Ordering::Release);
+        record_textbox_session(Some(password));
+        clear_active_text_field_if(42);
+        assert_eq!(active_text_field(), 43);
+        assert!(has_live_textbox_session(43));
+        assert!(clear_active_text_field());
     }
 
     /// 2026-07-17: every native UI-text writer must log only character counts. A verbose login

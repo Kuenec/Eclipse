@@ -662,7 +662,7 @@ impl SymbolProvider for EclipseNativeProvider {
 ///
 /// # Safety
 /// The returned pointer is an `ANativeWindow*` Eclipse owns (the real WSI handle when a window exists,
-/// else a sound geometry-only slab handle); the caller passes it to host EGL / the geometry getters.
+/// else a sound geometry-only token); the caller passes it to host EGL / the geometry getters.
 #[must_use]
 pub fn anativewindow_from_surface_via_provider() -> Option<*mut c_void> {
     let provider = EclipseNativeProvider::with_bionic_natives();
@@ -3206,6 +3206,52 @@ fn default_configuration() -> ConfigurationState {
     }
 }
 
+/// Configuration values are immutable in normal operation (`fromAssetManager` merely restores the
+/// same device snapshot), but the generic sound-handle slab must lock for every lookup. Roblox calls
+/// these tiny getters from many workers, and profiling showed that registry mutex in the gameplay hot
+/// path. Cache a validated copy per calling thread, guarded by a process epoch that advances whenever
+/// a configuration handle is created, reset, or removed. Steady-state reads are then one TLS access +
+/// two integer comparisons, while a stale/fabricated handle is still rejected after every mutation.
+#[derive(Clone, Copy)]
+struct ConfigurationCacheEntry {
+    handle: ndk_registry::NdkHandle,
+    epoch: u64,
+    state: ConfigurationState,
+}
+
+static CONFIGURATION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static CONFIGURATION_CACHE: std::cell::Cell<Option<ConfigurationCacheEntry>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn advance_configuration_epoch() {
+    CONFIGURATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+fn configuration_snapshot(config: *const c_void) -> Option<ConfigurationState> {
+    let handle = ptr_to_handle(config);
+    let epoch = CONFIGURATION_EPOCH.load(Ordering::Acquire);
+    CONFIGURATION_CACHE.with(|cache| {
+        if let Some(entry) = cache
+            .get()
+            .filter(|entry| entry.handle == handle && entry.epoch == epoch)
+        {
+            return Some(entry.state);
+        }
+        let state = ndk_registry::configurations()
+            .with(handle, |state| *state)
+            .ok()?;
+        cache.set(Some(ConfigurationCacheEntry {
+            handle,
+            epoch,
+            state,
+        }));
+        Some(state)
+    })
+}
+
 /// The [`NativeWindowState`] an `ANativeWindow_*` handle reports: the **real live geometry** of
 /// Eclipse's engine window when the run/test path has published it ([`ndk_registry::
 /// engine_window_geometry`] — the same window the engine's EGL surface presents to, see
@@ -3403,7 +3449,10 @@ unsafe extern "C" fn eclipse_aasset_openfiledescriptor(
 /// values), or NULL on registry exhaustion.
 extern "C" fn eclipse_aconfiguration_new() -> *mut c_void {
     match ndk_registry::configurations().insert(default_configuration()) {
-        Ok(h) => handle_to_ptr(h),
+        Ok(h) => {
+            advance_configuration_epoch();
+            handle_to_ptr(h)
+        }
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -3414,7 +3463,12 @@ extern "C" fn eclipse_aconfiguration_new() -> *mut c_void {
 /// # Safety
 /// `config` must be an `AConfiguration*` from an Eclipse native (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_aconfiguration_delete(config: *mut c_void) {
-    let _ = ndk_registry::configurations().remove(ptr_to_handle(config));
+    if ndk_registry::configurations()
+        .remove(ptr_to_handle(config))
+        .is_ok()
+    {
+        advance_configuration_epoch();
+    }
 }
 
 /// `void AConfiguration_fromAssetManager(AConfiguration* out, AAssetManager* am)` — fill `out` with
@@ -3426,8 +3480,12 @@ unsafe extern "C" fn eclipse_aconfiguration_delete(config: *mut c_void) {
 /// `out` must be an `AConfiguration*` from [`eclipse_aconfiguration_new`]; `am` is unused (Eclipse's
 /// config is manager-independent here) and may be any value.
 unsafe extern "C" fn eclipse_aconfiguration_fromassetmanager(out: *mut c_void, _am: *mut c_void) {
-    let _ =
-        ndk_registry::configurations().with(ptr_to_handle(out), |c| *c = default_configuration());
+    if ndk_registry::configurations()
+        .with(ptr_to_handle(out), |c| *c = default_configuration())
+        .is_ok()
+    {
+        advance_configuration_epoch();
+    }
 }
 
 /// `void AConfiguration_getCountry(AConfiguration* config, char* outCountry)` — write the 2-char
@@ -3443,7 +3501,7 @@ unsafe extern "C" fn eclipse_aconfiguration_getcountry(
     if out_country.is_null() {
         return;
     }
-    if let Ok(country) = ndk_registry::configurations().with(ptr_to_handle(config), |c| c.country) {
+    if let Some(country) = configuration_snapshot(config).map(|c| c.country) {
         // SAFETY: 2026-06-05 — the public contract guarantees `out_country` has ≥ 2 writable bytes;
         // we write exactly the 2 country chars (no NUL, per the NDK contract).
         unsafe {
@@ -3465,8 +3523,7 @@ unsafe extern "C" fn eclipse_aconfiguration_getlanguage(
     if out_language.is_null() {
         return;
     }
-    if let Ok(language) = ndk_registry::configurations().with(ptr_to_handle(config), |c| c.language)
-    {
+    if let Some(language) = configuration_snapshot(config).map(|c| c.language) {
         // SAFETY: 2026-06-05 — the public contract guarantees `out_language` has ≥ 2 writable bytes;
         // we write exactly the 2 language chars (no NUL, per the NDK contract).
         unsafe {
@@ -3482,9 +3539,7 @@ unsafe extern "C" fn eclipse_aconfiguration_getlanguage(
 /// # Safety
 /// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_aconfiguration_getnavhidden(config: *mut c_void) -> i32 {
-    ndk_registry::configurations()
-        .with(ptr_to_handle(config), |c| c.nav_hidden)
-        .unwrap_or(0)
+    configuration_snapshot(config).map_or(0, |c| c.nav_hidden)
 }
 
 /// `int32_t AConfiguration_getScreenHeightDp(AConfiguration* config)`. **minimal-correct.** Stale
@@ -3493,9 +3548,7 @@ unsafe extern "C" fn eclipse_aconfiguration_getnavhidden(config: *mut c_void) ->
 /// # Safety
 /// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_aconfiguration_getscreenheightdp(config: *mut c_void) -> i32 {
-    ndk_registry::configurations()
-        .with(ptr_to_handle(config), |c| c.screen_height_dp)
-        .unwrap_or(0)
+    configuration_snapshot(config).map_or(0, |c| c.screen_height_dp)
 }
 
 /// `int32_t AConfiguration_getScreenSize(AConfiguration* config)`. **minimal-correct.** Stale handle
@@ -3504,9 +3557,7 @@ unsafe extern "C" fn eclipse_aconfiguration_getscreenheightdp(config: *mut c_voi
 /// # Safety
 /// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_aconfiguration_getscreensize(config: *mut c_void) -> i32 {
-    ndk_registry::configurations()
-        .with(ptr_to_handle(config), |c| c.screen_size)
-        .unwrap_or(0)
+    configuration_snapshot(config).map_or(0, |c| c.screen_size)
 }
 
 /// `int32_t AConfiguration_getScreenWidthDp(AConfiguration* config)`. **minimal-correct.** Stale
@@ -3515,9 +3566,7 @@ unsafe extern "C" fn eclipse_aconfiguration_getscreensize(config: *mut c_void) -
 /// # Safety
 /// `config` must be an Eclipse `AConfiguration*` (or garbage, which is rejected).
 unsafe extern "C" fn eclipse_aconfiguration_getscreenwidthdp(config: *mut c_void) -> i32 {
-    ndk_registry::configurations()
-        .with(ptr_to_handle(config), |c| c.screen_width_dp)
-        .unwrap_or(0)
+    configuration_snapshot(config).map_or(0, |c| c.screen_width_dp)
 }
 
 // ---- ALooper (7) — REAL fd-backed, wakeable Eclipse per-thread looper ----------------------------
@@ -4028,7 +4077,7 @@ unsafe extern "C" fn eclipse_egl_get_display(display_id: *mut c_void) -> *mut c_
 // NOT pre-create a competing EGL context on the engine path (the engine owns its context — two
 // contexts must not fight over one surface). Validated engine-style by `eclipse __gl-test-anw`.
 // Until the window exists (the engine may probe `fromSurface` earlier), it falls back to a sound
-// geometry-only slab handle ([`default_native_window`]). `setBuffersGeometry`/`lock`/`unlockAndPost`
+// geometry-only process-lifetime token ([`default_native_window`]). `setBuffersGeometry`/`lock`/`unlockAndPost`
 // are NOT in libroblox's 5-symbol ANativeWindow import set (verified vs the engine), so they are
 // intentionally not registered (§ simplicity); 2026-06-12: `getFormat` IS registered — not for
 // libroblox (its set stays the 5) but for `libsurface_util_jni.so`, whose pre-load failed on
@@ -4039,8 +4088,7 @@ unsafe extern "C" fn eclipse_egl_get_display(display_id: *mut c_void) -> *mut c_
 /// a Java `Surface`. **WSI-bound:** when the render path has built the real WSI window on Eclipse's
 /// window, returns that real `EGLNativeWindowType` pointer (a `wl_egl_window*` / XID), so the engine's
 /// own `eglCreateWindowSurface(this ANativeWindow*)` presents to Eclipse's window. Until then, falls
-/// back to a sound geometry-only slab handle (the window may not exist yet). Returns NULL only on
-/// registry exhaustion — never a fake non-window pointer.
+/// back to a sound geometry-only process-lifetime token (the window may not exist yet).
 ///
 /// # Safety
 /// `env`/`surface` are the JNI args; this native does not dereference them (Eclipse owns the window
@@ -4059,16 +4107,15 @@ unsafe extern "C" fn eclipse_anativewindow_fromsurface(
         ndk_registry::set_engine_claimed_surface(true);
         return p as *mut c_void;
     }
-    // Fallback (window not built yet): a sound geometry-only handle from the slab.
-    match ndk_registry::native_windows().insert(default_native_window()) {
-        Ok(h) => handle_to_ptr(h),
-        Err(_) => std::ptr::null_mut(),
-    }
+    // Fallback (window not built yet): one stable, exact-match token. Roblox retains this early
+    // handle and queries it from many threads every frame, so its immutable identity + atomic live
+    // geometry deliberately avoid the generic registry mutex.
+    ndk_registry::register_fallback_native_window(default_native_window()) as *mut c_void
 }
 
 /// `int32_t ANativeWindow_getWidth(ANativeWindow* window)` — the window width in pixels. **sound:**
-/// a real WSI window resolves via the WSI map; a fallback slab handle via the slab; a stale/fabricated
-/// pointer → `-1` (the NDK negative-error contract), never a fake size or a dereference.
+/// a real WSI window resolves via the WSI record; the exact fallback token resolves lock-free; a
+/// stale/fabricated pointer → `-1` (the NDK negative-error contract), never a wild dereference.
 ///
 /// # Safety
 /// `window` must be an `ANativeWindow*` from an Eclipse window native (or garbage, which is rejected).
@@ -4076,13 +4123,12 @@ unsafe extern "C" fn eclipse_anativewindow_getwidth(window: *mut c_void) -> i32 
     if let Some((w, _)) = ndk_registry::wsi_window_geometry(window as usize) {
         return w;
     }
-    ndk_registry::native_windows()
-        .with(ptr_to_handle(window), |w| w.width)
-        .unwrap_or(-1)
+    ndk_registry::fallback_native_window_state(window as usize).map_or(-1, |w| w.width)
 }
 
 /// `int32_t ANativeWindow_getHeight(ANativeWindow* window)` — the window height in pixels. **sound:**
-/// real WSI geometry via the WSI map, else the slab handle; stale/fabricated pointer → `-1`.
+/// real WSI geometry via the WSI record, else the exact fallback token; stale/fabricated pointer →
+/// `-1`.
 ///
 /// # Safety
 /// `window` must be an `ANativeWindow*` from an Eclipse window native (or garbage, which is rejected).
@@ -4090,15 +4136,13 @@ unsafe extern "C" fn eclipse_anativewindow_getheight(window: *mut c_void) -> i32
     if let Some((_, h)) = ndk_registry::wsi_window_geometry(window as usize) {
         return h;
     }
-    ndk_registry::native_windows()
-        .with(ptr_to_handle(window), |w| w.height)
-        .unwrap_or(-1)
+    ndk_registry::fallback_native_window_state(window as usize).map_or(-1, |w| w.height)
 }
 
 /// `int32_t ANativeWindow_getFormat(ANativeWindow* window)` — the window pixel format. **sound:**
 /// the exact sibling of [`eclipse_anativewindow_getwidth`] — a real WSI window reports Eclipse's
 /// surface format (`WINDOW_FORMAT_RGBA_8888`, the RGBA8888 config the engine render path builds on
-/// Eclipse's window); a fallback slab handle reports its recorded [`NativeWindowState::format`]; a
+/// Eclipse's window); the fallback token reports its recorded [`NativeWindowState::format`]; a
 /// stale/fabricated pointer → `-1` (the NDK negative-error contract), never a fake format or a
 /// dereference. 2026-06-12: provided because `libsurface_util_jni.so`'s pre-load failed on exactly
 /// this 1 import (owner live validation `/tmp/eclipse-866509-validate.log` line 98) — a failed
@@ -4112,9 +4156,7 @@ unsafe extern "C" fn eclipse_anativewindow_getformat(window: *mut c_void) -> i32
     if ndk_registry::wsi_window_geometry(window as usize).is_some() {
         return WINDOW_FORMAT_RGBA_8888;
     }
-    ndk_registry::native_windows()
-        .with(ptr_to_handle(window), |w| w.format)
-        .unwrap_or(-1)
+    ndk_registry::fallback_native_window_state(window as usize).map_or(-1, |w| w.format)
 }
 
 /// `void ANativeWindow_acquire(ANativeWindow* window)` — add a reference. **sound-stub:** Eclipse
@@ -4582,7 +4624,7 @@ mod tests {
 
     // Serializes the ANativeWindow tests that share the process-global `ANativeWindow_fromSurface`
     // path + the WSI-window registry: one test registers a real WSI window (so fromSurface returns
-    // it), the others assert the no-WSI fallback (a slab handle). Running them concurrently would let
+    // it), the others assert the no-WSI fallback token. Running them concurrently would let
     // a transient registration cross-contaminate. A plain `std::sync::Mutex` (no dep) serializes them
     // without weakening any assertion. 2026-06-05.
     static ANW_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -6458,8 +6500,8 @@ mod tests {
         unsafe {
             assert_eq!(eclipse_anativewindow_getwidth(win), def.width);
             assert_eq!(eclipse_anativewindow_getheight(win), def.height);
-            // 2026-06-12: getFormat (libsurface_util_jni's sole pre-load import) reports the slab
-            // handle's recorded format — the documented RGBA_8888 default.
+            // 2026-06-12: getFormat (libsurface_util_jni's sole pre-load import) reports the
+            // fallback token's recorded format — the documented RGBA_8888 default.
             assert_eq!(eclipse_anativewindow_getformat(win), def.format);
             // acquire/release are sound no-ops.
             eclipse_anativewindow_acquire(win);
@@ -6473,10 +6515,6 @@ mod tests {
         assert_eq!(unsafe { eclipse_anativewindow_getheight(stale) }, -1);
         // SAFETY: `stale` is fabricated; rejected (the same negative-error contract for getFormat).
         assert_eq!(unsafe { eclipse_anativewindow_getformat(stale) }, -1);
-        // Free the live window's slot to keep the registry tidy.
-        ndk_registry::native_windows()
-            .remove(ptr_to_handle(win))
-            .ok();
     }
 
     #[test]
@@ -6496,9 +6534,6 @@ mod tests {
             assert_eq!(eclipse_anativewindow_getwidth(win), 1600, "live width");
             assert_eq!(eclipse_anativewindow_getheight(win), 900, "live height");
         }
-        ndk_registry::native_windows()
-            .remove(ptr_to_handle(win))
-            .ok();
     }
 
     #[test]
@@ -6508,9 +6543,9 @@ mod tests {
         // native-window pointer (the EGLNativeWindowType host EGL accepts — a wl_egl_window*/XID),
         // ANativeWindow_fromSurface must return THAT pointer (so the engine's own
         // eglCreateWindowSurface lands on Eclipse's window), and the geometry getters must resolve it
-        // via the WSI map. A fake-but-pointer-shaped value stands in for the real WSI pointer here (no
+        // via the WSI record. A fake-but-pointer-shaped value stands in for the real WSI pointer here (no
         // window/GPU in a unit test); the binding logic is identical.
-        let fake_wsi: usize = 0x7F00_1234_5670; // 16-byte aligned, never a slab handle (gen high bits)
+        let fake_wsi: usize = 0x7F00_1234_5670; // 16-byte aligned, distinct from the fallback token
         ndk_registry::register_wsi_window(fake_wsi, 1280, 720);
 
         // SAFETY: JNI args unused; any value accepted.
@@ -6521,7 +6556,7 @@ mod tests {
             win as usize, fake_wsi,
             "fromSurface must return the real WSI handle the engine passes to host eglCreateWindowSurface"
         );
-        // SAFETY: `win` is the registered WSI pointer; the getters resolve it via the WSI map (no deref).
+        // SAFETY: `win` is the registered WSI pointer; the getters resolve it exactly (no deref).
         unsafe {
             assert_eq!(
                 eclipse_anativewindow_getwidth(win),

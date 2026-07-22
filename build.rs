@@ -16,9 +16,8 @@
 //! `src/loader/native_provider.rs` / `src/loader/bionic_pthread.rs` for the full rationale.
 //!
 //! Also builds the apkenv-loadable `libm` shim cdylib (`crates/libm-shim`, see `build_libm_shim`) and
-//! exposes its `.so` path via `cargo:rustc-env=ECLIPSE_LIBM_SHIM_SO`, so `runtime` can provision it as
-//! the app's `libm.so` (a clean-relocation, correct-math replacement for the host glibc `libm.so.6`
-//! that the apkenv shim linker cannot load — its `R_X86_64_TPOFF64`/RELR relocs abort the load).
+//! the host-ART client-settings path shim (`src/client_settings_path_shim.c`). Their `.so` paths are
+//! exposed as compile-time environment values so the runtime can embed/stage each artifact.
 //!
 //! ## Why the `cc` crate (justified per AGENTS.md §2.1 / §5)
 //! `cc` is the standard, well-established Rust build-time bridge for compiling a small C source as
@@ -39,6 +38,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/loader/native_load_shim.cpp");
     println!("cargo:rerun-if-changed=src/loader/stdio_shim.c");
     println!("cargo:rerun-if-changed=src/loader/sigaltstack_shim.c");
+    println!("cargo:rerun-if-changed=src/client_settings_path_shim.c");
 
     // `compile` emits `cargo:rustc-link-lib=static=eclipse_liblog_shim` + the link-search path, so
     // the archive is linked into the lib, the bin, AND the test harness. The shim's two symbols are
@@ -92,6 +92,40 @@ fn main() {
         .compile("eclipse_native_load_shim");
 
     build_libm_shim();
+    build_client_settings_path_shim();
+}
+
+/// Build the tiny host-ART path interposer used to expose Eclipse's per-user
+/// `ClientAppSettings.json` at Roblox's fixed Android path. This is a separate shared object because
+/// glibc resolves `open@GLIBC_2.2.5` for already-built ART libraries before Rust code runs; an
+/// `LD_PRELOAD` interposer is the narrow, deterministic seam. The C source uses raw syscalls and
+/// redirects one exact path only.
+fn build_client_settings_path_shim() {
+    use std::path::Path;
+    use std::process::Command;
+
+    let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR set by cargo");
+    let output = Path::new(&out_dir).join("libeclipse_client_settings_path.so");
+    let compiler = cc::Build::new().get_compiler();
+    let mut command = Command::new(compiler.path());
+    command
+        .args(compiler.args())
+        .args(["-shared", "-fPIC", "-O2"])
+        .arg("src/client_settings_path_shim.c")
+        .arg("-Wl,-z,relro,-z,now")
+        .arg("-o")
+        .arg(&output);
+    let status = command
+        .status()
+        .expect("failed to spawn the C compiler for the client-settings path shim");
+    assert!(
+        status.success(),
+        "building src/client_settings_path_shim.c failed"
+    );
+    println!(
+        "cargo:rustc-env=ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO={}",
+        output.display()
+    );
 }
 
 /// Build the apkenv-loadable `libm` shim cdylib (`crates/libm-shim`) and expose its `.so` path to

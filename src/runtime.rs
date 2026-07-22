@@ -49,7 +49,7 @@ use std::process::Command;
 use directories::ProjectDirs;
 
 use crate::apk::Manifest;
-use crate::config::Config;
+use crate::config::{Config, TouchMode};
 
 /// Default Android API level used when the manifest declares no `android:targetSdkVersion`.
 ///
@@ -200,6 +200,9 @@ pub struct BootPlan {
     pub instruction_set_features: String,
     /// The graphics backend for the surface (Vulkan default, OpenGL when forced).
     pub graphics_backend: GraphicsBackend,
+    /// Sober-compatible touch presentation, also published to the Java framework so
+    /// `PackageManager.hasSystemFeature` and host event routing agree.
+    pub touch_mode: TouchMode,
 }
 
 impl BootPlan {
@@ -217,6 +220,7 @@ impl BootPlan {
             } else {
                 GraphicsBackend::Vulkan
             },
+            touch_mode: config.touch_mode,
         }
     }
 
@@ -236,7 +240,7 @@ impl BootPlan {
     /// the two destinations would feed dex2oat flags to the VM.
     #[must_use]
     pub fn vm_options(&self) -> Vec<String> {
-        let mut opts = Vec::with_capacity(4);
+        let mut opts = Vec::with_capacity(5);
         opts.push(format!("-Xmx{}m", self.heap_mib));
         opts.push(format!("-XX:HeapGrowthLimit={}m", self.heap_mib));
         if self.disable_hspace_compact {
@@ -257,6 +261,10 @@ impl BootPlan {
         // `RESOURCES_SDK_INT` auto-follows `SDK_INT` in ATL when its own property is unset, so this
         // single option keeps them matched (a SDK_INT/RESOURCES_SDK_INT mismatch can crash).
         opts.push(format!("-DBuild.VERSION.SDK_INT={}", self.sdk_int.min(28)));
+        // Consumed by the patched PackageManager.hasSystemFeature implementation. Keeping this in
+        // the immutable boot plan makes the Java capability probe agree with the host input bridge:
+        // off = desktop/no touch, on = touch/mobile UI, fake-off = touch events/desktop UI.
+        opts.push(format!("-Declipse.touch_mode={}", self.touch_mode.as_str()));
         opts
     }
 
@@ -1454,6 +1462,7 @@ mod tests {
         assert_eq!(plan.heap_mib, HEAP_MIB);
         assert!(plan.disable_hspace_compact);
         assert_eq!(plan.graphics_backend, GraphicsBackend::Vulkan);
+        assert_eq!(plan.touch_mode, TouchMode::Off);
     }
 
     #[test]
@@ -1517,6 +1526,22 @@ mod tests {
                 .contains(&"-DBuild.VERSION.SDK_INT=21".to_owned()),
             "a sub-28 target is propagated verbatim"
         );
+    }
+
+    #[test]
+    fn vm_options_publish_sober_touch_mode_to_the_framework() {
+        for (touch_mode, expected) in [
+            (TouchMode::Off, "-Declipse.touch_mode=off"),
+            (TouchMode::On, "-Declipse.touch_mode=on"),
+            (TouchMode::FakeOff, "-Declipse.touch_mode=fake-off"),
+        ] {
+            let config = Config {
+                touch_mode,
+                ..Config::default()
+            };
+            let options = BootPlan::new(&manifest_with(Some(35)), &config).vm_options();
+            assert!(options.contains(&expected.to_owned()), "{options:?}");
+        }
     }
 
     #[test]

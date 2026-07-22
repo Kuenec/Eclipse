@@ -46,7 +46,7 @@
 //! parsed as data only, nothing in it is executed by this module.
 
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -58,13 +58,15 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 /// The operation succeeded.
 pub const SL_RESULT_SUCCESS: u32 = 0x0000_0000;
 /// A parameter was invalid (used for a stale/null handle, a missing interface, a bad format).
-pub const SL_RESULT_PARAMETER_INVALID: u32 = 0x0000_000D;
+pub const SL_RESULT_PARAMETER_INVALID: u32 = 0x0000_0002;
 /// Memory allocation failed.
-pub const SL_RESULT_MEMORY_FAILURE: u32 = 0x0000_0001;
+pub const SL_RESULT_MEMORY_FAILURE: u32 = 0x0000_0003;
+/// The caller's output buffer is smaller than the queried configuration value.
+pub const SL_RESULT_BUFFER_INSUFFICIENT: u32 = 0x0000_0007;
 /// The requested feature is unsupported (returned when no host audio device exists).
 pub const SL_RESULT_FEATURE_UNSUPPORTED: u32 = 0x0000_000C;
 /// A precondition was violated (e.g. `GetInterface` before `Realize`).
-pub const SL_RESULT_PRECONDITIONS_VIOLATED: u32 = 0x0000_0008;
+pub const SL_RESULT_PRECONDITIONS_VIOLATED: u32 = 0x0000_0001;
 
 /// `SLObjectItf` object states (`SL_OBJECT_STATE_*`).
 const SL_OBJECT_STATE_UNREALIZED: u32 = 0x0000_0001;
@@ -77,15 +79,27 @@ const SL_PLAYSTATE_PLAYING: u32 = 0x0000_0003;
 
 /// `SLboolean`.
 const SL_BOOLEAN_FALSE: u32 = 0x0000_0000;
+const SL_BOOLEAN_TRUE: u32 = 0x0000_0001;
+
+/// Android OpenSL configuration defaults for an audio player.
+const SL_ANDROID_STREAM_MEDIA: i32 = 3;
+const SL_ANDROID_PERFORMANCE_LATENCY: u32 = 1;
 
 // =================================================================================================
 // SLDataLocator / SLDataFormat tags (public OpenSL ES 1.0.1 + Android extension).
 // =================================================================================================
 
-/// `SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE` (Android extension `OpenSLES_AndroidConfiguration.h`).
-const SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE: u32 = 0x8000_0001;
+/// `SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE` (Android extension `OpenSLES_Android.h`).
+///
+/// This value crosses the libroblox/FM0D ABI boundary, so it must be the literal Android NDK value.
+/// A former self-consistent `0x8000_0001` typo let Eclipse's own test pass while rejecting the real
+/// locator FMOD supplied, causing `System::init` to report `FMOD_ERR_OUTPUT_NODRIVERS` (51).
+const SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE: u32 = 0x8000_07BD;
+/// Standard OpenSL buffer queue. Android accepts this as an audio-player alias for the Android
+/// simple-buffer-queue locator, and some OpenSL clients use it even when running on Android.
+const SL_DATALOCATOR_BUFFERQUEUE: u32 = 0x0000_0006;
 /// `SL_DATALOCATOR_OUTPUTMIX`.
-const SL_DATALOCATOR_OUTPUTMIX: u32 = 0x0000_0007;
+const SL_DATALOCATOR_OUTPUTMIX: u32 = 0x0000_0004;
 /// `SL_DATAFORMAT_PCM`.
 const SL_DATAFORMAT_PCM: u32 = 0x0000_0002;
 
@@ -256,6 +270,14 @@ struct PcmRing {
     drained_buffers: u64,
     /// Count of bq-callback invocations (fired once per fully-drained buffer). Test-observable.
     callback_fires: u64,
+    /// `SLVolumeItf` attenuation in millibels (0 = unity; negative = quieter).
+    volume_level_mb: i16,
+    /// `SLVolumeItf` mute state.
+    muted: bool,
+    /// Stored stereo-position controls. The host bridge currently applies only level/mute; these
+    /// values still round-trip exactly through the public interface.
+    stereo_position_enabled: bool,
+    stereo_position: i16,
 }
 
 impl PcmRing {
@@ -267,6 +289,10 @@ impl PcmRing {
             callback: None,
             drained_buffers: 0,
             callback_fires: 0,
+            volume_level_mb: 0,
+            muted: false,
+            stereo_position_enabled: false,
+            stereo_position: 0,
         }
     }
 
@@ -310,6 +336,15 @@ fn fill_output(ring: &mut PcmRing, out: &mut [f32]) -> Vec<BufferQueueCallback> 
         ring.front_pos += n;
         written += n;
     }
+    let gain = if ring.muted {
+        0.0
+    } else {
+        // OpenSL volume is hundredths of a decibel: amplitude = 10^(dB/20) = 10^(mB/2000).
+        10.0_f32.powf(f32::from(ring.volume_level_mb) / 2000.0)
+    };
+    if gain != 1.0 {
+        out.iter_mut().for_each(|sample| *sample *= gain);
+    }
     to_fire
 }
 
@@ -338,6 +373,9 @@ struct PlayerState {
     /// The live host output stream. `None` if no host device exists (the player is then a sound-stub
     /// that accepts Enqueues but produces no sound — a clean "no device" posture, never a fake).
     stream: Option<cpal::Stream>,
+    /// Android configuration values exposed before realization, matching platform defaults.
+    stream_type: i32,
+    performance_mode: u32,
 }
 
 /// The leading layout of every Eclipse OpenSL object: an `SLObjectItf_*` vtable pointer (what the
@@ -355,6 +393,8 @@ struct ObjectState {
     engine_itf: *const EngineItfVtable,
     play_itf: *const PlayItfVtable,
     bufferqueue_itf: *const BufferQueueItfVtable,
+    volume_itf: *const VolumeItfVtable,
+    android_config_itf: *const AndroidConfigurationItfVtable,
     /// The object's realized state (`SL_OBJECT_STATE_*`).
     state: u32,
     /// The object-kind payload.
@@ -550,6 +590,31 @@ struct BufferQueueItfVtable {
     register_callback: extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> u32,
 }
 
+/// `struct SLVolumeItf_` (public OpenSL ES 1.0.1). Method order is ABI-significant.
+#[repr(C)]
+struct VolumeItfVtable {
+    set_volume_level: extern "C" fn(*mut c_void, i16) -> u32,
+    get_volume_level: extern "C" fn(*mut c_void, *mut i16) -> u32,
+    get_max_volume_level: extern "C" fn(*mut c_void, *mut i16) -> u32,
+    set_mute: extern "C" fn(*mut c_void, u32) -> u32,
+    get_mute: extern "C" fn(*mut c_void, *mut u32) -> u32,
+    enable_stereo_position: extern "C" fn(*mut c_void, u32) -> u32,
+    is_stereo_position_enabled: extern "C" fn(*mut c_void, *mut u32) -> u32,
+    set_stereo_position: extern "C" fn(*mut c_void, i16) -> u32,
+    get_stereo_position: extern "C" fn(*mut c_void, *mut i16) -> u32,
+}
+
+/// `struct SLAndroidConfigurationItf_` from the Android OpenSL extension. Modern NDK headers append
+/// the two Java-routing proxy methods after the original Set/Get pair; they are present so every
+/// possible client slot is a valid function pointer, but Eclipse has no Java AudioTrack proxy.
+#[repr(C)]
+struct AndroidConfigurationItfVtable {
+    set_configuration: extern "C" fn(*mut c_void, *const i8, *const c_void, u32) -> u32,
+    get_configuration: extern "C" fn(*mut c_void, *const i8, *mut u32, *mut c_void) -> u32,
+    acquire_java_proxy: extern "C" fn(*mut c_void, u32, *mut c_void) -> u32,
+    release_java_proxy: extern "C" fn(*mut c_void, u32) -> u32,
+}
+
 /// `SLAndroidSimpleBufferQueueState { SLuint32 count; SLuint32 index; }`.
 #[repr(C)]
 struct SlBufferQueueState {
@@ -597,6 +662,8 @@ struct ItfOffsets {
     engine: usize,
     play: usize,
     bufferqueue: usize,
+    volume: usize,
+    android_config: usize,
 }
 
 fn itf_offsets() -> ItfOffsets {
@@ -609,6 +676,8 @@ fn itf_offsets() -> ItfOffsets {
             engine_itf: std::ptr::null(),
             play_itf: std::ptr::null(),
             bufferqueue_itf: std::ptr::null(),
+            volume_itf: std::ptr::null(),
+            android_config_itf: std::ptr::null(),
             state: 0,
             kind: ObjectKind::OutputMix,
         };
@@ -617,6 +686,8 @@ fn itf_offsets() -> ItfOffsets {
             engine: std::ptr::addr_of!(sample.engine_itf) as usize - base,
             play: std::ptr::addr_of!(sample.play_itf) as usize - base,
             bufferqueue: std::ptr::addr_of!(sample.bufferqueue_itf) as usize - base,
+            volume: std::ptr::addr_of!(sample.volume_itf) as usize - base,
+            android_config: std::ptr::addr_of!(sample.android_config_itf) as usize - base,
         }
     })
 }
@@ -707,6 +778,37 @@ fn bufferqueue_vtable() -> *const BufferQueueItfVtable {
     .0
 }
 
+fn volume_vtable() -> *const VolumeItfVtable {
+    static V: OnceLock<VtableWrap<VolumeItfVtable>> = OnceLock::new();
+    &V.get_or_init(|| {
+        VtableWrap(VolumeItfVtable {
+            set_volume_level: volume_set_level,
+            get_volume_level: volume_get_level,
+            get_max_volume_level: volume_get_max_level,
+            set_mute: volume_set_mute,
+            get_mute: volume_get_mute,
+            enable_stereo_position: volume_enable_stereo_position,
+            is_stereo_position_enabled: volume_is_stereo_position_enabled,
+            set_stereo_position: volume_set_stereo_position,
+            get_stereo_position: volume_get_stereo_position,
+        })
+    })
+    .0
+}
+
+fn android_configuration_vtable() -> *const AndroidConfigurationItfVtable {
+    static V: OnceLock<VtableWrap<AndroidConfigurationItfVtable>> = OnceLock::new();
+    &V.get_or_init(|| {
+        VtableWrap(AndroidConfigurationItfVtable {
+            set_configuration: android_config_set,
+            get_configuration: android_config_get,
+            acquire_java_proxy: android_config_acquire_java_proxy,
+            release_java_proxy: android_config_release_java_proxy,
+        })
+    })
+    .0
+}
+
 // =================================================================================================
 // Helper: validate an `self` SLObjectItf and run a closure with the locked object.
 // =================================================================================================
@@ -781,14 +883,22 @@ extern "C" fn obj_get_interface(obj: SlObjectItf, iid: *const c_void, p_itf: *mu
     }
     let off = itf_offsets();
     let r = with_object(obj, |st, _| {
-        if st.state != SL_OBJECT_STATE_REALIZED {
+        let which = crate::loader::native_provider::sl_iid_index(iid as usize);
+        // AndroidConfiguration is explicitly available before realization so callers can choose the
+        // stream/performance mode. Every standard OpenSL interface retains the realized-state gate.
+        if st.state != SL_OBJECT_STATE_REALIZED && which != Some(0) {
             return Err(SL_RESULT_PRECONDITIONS_VIOLATED);
         }
         // The requested interface field address (an `SL_IID_*` selects which one). We match by the
         // documented `SL_IID_*` data pointer the native_provider registered.
         let base = (st as *mut ObjectState) as *mut u8;
-        let which = crate::loader::native_provider::sl_iid_index(iid as usize);
         let (field_ptr, present) = match which {
+            // SL_IID_ANDROIDCONFIGURATION
+            Some(0) => (
+                // SAFETY: `base` is the live object; `off.android_config` is its field offset.
+                unsafe { base.add(off.android_config) },
+                !st.android_config_itf.is_null(),
+            ),
             // SL_IID_ENGINE
             Some(3) => (
                 // SAFETY: 2026-06-05 — `base` is the live object; `off.engine` is its field offset.
@@ -806,6 +916,12 @@ extern "C" fn obj_get_interface(obj: SlObjectItf, iid: *const c_void, p_itf: *mu
                 // SAFETY: 2026-06-05 — as above for the bufferqueue-itf field.
                 unsafe { base.add(off.bufferqueue) },
                 !st.bufferqueue_itf.is_null(),
+            ),
+            // SL_IID_VOLUME
+            Some(6) => (
+                // SAFETY: as above for the volume-itf field.
+                unsafe { base.add(off.volume) },
+                !st.volume_itf.is_null(),
             ),
             _ => (std::ptr::null_mut(), false),
         };
@@ -931,6 +1047,7 @@ extern "C" fn eng_create_output_mix(
     };
     // SAFETY: 2026-06-05 — `p_mix` is the caller's non-null out-param for the new `SLObjectItf`.
     unsafe { *(p_mix as *mut *mut c_void) = obj_ptr };
+    tracing::info!("OpenSL: output mix created");
     SL_RESULT_SUCCESS
 }
 
@@ -953,7 +1070,8 @@ extern "C" fn eng_create_audio_player(
         return SL_RESULT_PARAMETER_INVALID;
     }
 
-    // Decode the data source: locator must be AndroidSimpleBufferQueue, format must be PCM.
+    // Decode the data source: Android permits either its simple buffer queue or the standard OpenSL
+    // buffer queue for an audio player; the format must be PCM.
     // SAFETY: 2026-06-05 — `p_audio_src` is a caller `SLDataSource*`; we read its two pointer fields,
     // then the pointed-to locator/format headers. The OpenSL ES contract guarantees these are valid
     // for a CreateAudioPlayer call; each tag is checked before trusting the rest of the struct.
@@ -963,7 +1081,12 @@ extern "C" fn eng_create_audio_player(
     }
     // SAFETY: 2026-06-05 — locator/format pointers are non-null (checked); read the leading u32 tag.
     let loc_type = unsafe { *(src.p_locator as *const u32) };
-    if loc_type != SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE {
+    if loc_type != SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE && loc_type != SL_DATALOCATOR_BUFFERQUEUE
+    {
+        tracing::warn!(
+            locator_type = format_args!("{loc_type:#010x}"),
+            "OpenSL: unsupported player source locator"
+        );
         return SL_RESULT_FEATURE_UNSUPPORTED;
     }
     // SAFETY: 2026-06-05 — the locator tag matched, so the full bufferqueue locator is present.
@@ -972,6 +1095,10 @@ extern "C" fn eng_create_audio_player(
                                            // SAFETY: 2026-06-05 — `p_format` non-null; read the leading format-type tag.
     let fmt_type = unsafe { *(src.p_format as *const u32) };
     if fmt_type != SL_DATAFORMAT_PCM {
+        tracing::warn!(
+            format_type = format_args!("{fmt_type:#010x}"),
+            "OpenSL: unsupported player source format"
+        );
         return SL_RESULT_FEATURE_UNSUPPORTED;
     }
     // SAFETY: 2026-06-05 — the format tag matched PCM, so the full PCM format struct is present.
@@ -992,6 +1119,10 @@ extern "C" fn eng_create_audio_player(
     // SAFETY: 2026-06-05 — sink locator non-null; read its leading tag.
     let snk_loc_type = unsafe { *(snk.p_locator as *const u32) };
     if snk_loc_type != SL_DATALOCATOR_OUTPUTMIX {
+        tracing::warn!(
+            locator_type = format_args!("{snk_loc_type:#010x}"),
+            "OpenSL: unsupported player sink locator"
+        );
         return SL_RESULT_FEATURE_UNSUPPORTED;
     }
     // SAFETY: 2026-06-05 — the sink tag matched; reading the OutputMix locator's `output_mix` field is
@@ -1002,11 +1133,18 @@ extern "C" fn eng_create_audio_player(
     let ring = Arc::new(Mutex::new(PcmRing::new()));
     // No host device → a clean "no device" player that still accepts Enqueues (the engine sees a
     // working player; it just produces no sound). Never a fake success that crashes later.
-    let stream = start_host_stream(&ring, format).ok();
+    let stream_result = start_host_stream(&ring, format);
+    let host_stream_live = stream_result.is_ok();
+    if let Err(error) = stream_result {
+        tracing::warn!(?error, "OpenSL: host output stream unavailable");
+    }
+    let stream = stream_result.ok();
     let player = Box::new(PlayerState {
         format,
         ring,
         stream,
+        stream_type: SL_ANDROID_STREAM_MEDIA,
+        performance_mode: SL_ANDROID_PERFORMANCE_LATENCY,
     });
     let obj_ptr = match mint_object(ObjectKind::Player(player)) {
         Ok(p) => p,
@@ -1014,6 +1152,13 @@ extern "C" fn eng_create_audio_player(
     };
     // SAFETY: 2026-06-05 — `p_player` is the caller's non-null out-param for the new `SLObjectItf`.
     unsafe { *(p_player as *mut *mut c_void) = obj_ptr };
+    tracing::info!(
+        channels = format.channels,
+        sample_rate = format.sample_rate,
+        bits_per_sample = format.bits_per_sample,
+        host_stream_live,
+        "OpenSL: audio player created"
+    );
     SL_RESULT_SUCCESS
 }
 
@@ -1346,6 +1491,252 @@ extern "C" fn bq_register_callback(
 }
 
 // =================================================================================================
+// SLVolumeItf methods — FMOD requests this explicit interface on its buffer-queue player.
+// =================================================================================================
+
+extern "C" fn volume_set_level(self_itf: *mut c_void, level: i16) -> u32 {
+    if level > 0 {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+        ring.volume_level_mb = level;
+    }) {
+        Ok(()) => SL_RESULT_SUCCESS,
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn volume_get_level(self_itf: *mut c_void, p_level: *mut i16) -> u32 {
+    if p_level.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+        ring.volume_level_mb
+    }) {
+        Ok(level) => {
+            // SAFETY: the caller supplied a non-null SLmillibel out-parameter.
+            unsafe { *p_level = level };
+            SL_RESULT_SUCCESS
+        }
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn volume_get_max_level(_self_itf: *mut c_void, p_level: *mut i16) -> u32 {
+    if p_level.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    // SAFETY: the caller supplied a non-null SLmillibel out-parameter.
+    unsafe { *p_level = 0 };
+    SL_RESULT_SUCCESS
+}
+
+extern "C" fn volume_set_mute(self_itf: *mut c_void, mute: u32) -> u32 {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+        ring.muted = mute != SL_BOOLEAN_FALSE;
+    }) {
+        Ok(()) => SL_RESULT_SUCCESS,
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn volume_get_mute(self_itf: *mut c_void, p_mute: *mut u32) -> u32 {
+    if p_mute.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| ring.muted) {
+        Ok(muted) => {
+            // SAFETY: the caller supplied a non-null SLboolean out-parameter.
+            unsafe {
+                *p_mute = if muted {
+                    SL_BOOLEAN_TRUE
+                } else {
+                    SL_BOOLEAN_FALSE
+                }
+            };
+            SL_RESULT_SUCCESS
+        }
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn volume_enable_stereo_position(self_itf: *mut c_void, enable: u32) -> u32 {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+        ring.stereo_position_enabled = enable != SL_BOOLEAN_FALSE;
+    }) {
+        Ok(()) => SL_RESULT_SUCCESS,
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn volume_is_stereo_position_enabled(self_itf: *mut c_void, p_enabled: *mut u32) -> u32 {
+    if p_enabled.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+        ring.stereo_position_enabled
+    }) {
+        Ok(enabled) => {
+            // SAFETY: the caller supplied a non-null SLboolean out-parameter.
+            unsafe {
+                *p_enabled = if enabled {
+                    SL_BOOLEAN_TRUE
+                } else {
+                    SL_BOOLEAN_FALSE
+                }
+            };
+            SL_RESULT_SUCCESS
+        }
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn volume_set_stereo_position(self_itf: *mut c_void, position: i16) -> u32 {
+    if !(-1000..=1000).contains(&position) {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+        ring.stereo_position = position;
+    }) {
+        Ok(()) => SL_RESULT_SUCCESS,
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn volume_get_stereo_position(self_itf: *mut c_void, p_position: *mut i16) -> u32 {
+    if p_position.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+        ring.stereo_position
+    }) {
+        Ok(position) => {
+            // SAFETY: the caller supplied a non-null SLpermille out-parameter.
+            unsafe { *p_position = position };
+            SL_RESULT_SUCCESS
+        }
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+// =================================================================================================
+// SLAndroidConfigurationItf — available before player realization by Android's contract.
+// =================================================================================================
+
+fn with_player_config_state<R>(
+    self_itf: *mut c_void,
+    field_off: usize,
+    f: impl FnOnce(&mut PlayerState) -> R,
+) -> Result<R, ObjectError> {
+    if self_itf.is_null() {
+        return Err(ObjectError::OutOfRange);
+    }
+    // SAFETY: GetInterface returned the address of this interface field within a live ObjectState.
+    let obj = unsafe { object_from_itf_field(self_itf, field_off) };
+    with_object(obj.cast(), |state, _| {
+        let ObjectKind::Player(player) = &mut state.kind else {
+            return Err(ObjectError::OutOfRange);
+        };
+        Ok(f(player))
+    })?
+}
+
+fn android_config_key(config_key: *const i8) -> Result<&'static [u8], ()> {
+    if config_key.is_null() {
+        return Err(());
+    }
+    // SAFETY: OpenSL requires a valid NUL-terminated SLchar string for the duration of this call.
+    let key = unsafe { CStr::from_ptr(config_key) };
+    Ok(match key.to_bytes() {
+        b"androidPlaybackStreamType" => b"androidPlaybackStreamType",
+        b"androidPerformanceMode" => b"androidPerformanceMode",
+        _ => return Err(()),
+    })
+}
+
+extern "C" fn android_config_set(
+    self_itf: *mut c_void,
+    config_key: *const i8,
+    value: *const c_void,
+    value_size: u32,
+) -> u32 {
+    let Ok(key) = android_config_key(config_key) else {
+        return SL_RESULT_PARAMETER_INVALID;
+    };
+    if value.is_null() || value_size < std::mem::size_of::<u32>() as u32 {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    // SAFETY: value is non-null and valueSize proves four readable bytes; a void* need not be aligned.
+    let raw = unsafe { std::ptr::read_unaligned(value.cast::<u32>()) };
+    with_player_config_state(self_itf, itf_offsets().android_config, |player| match key {
+        b"androidPlaybackStreamType" if raw <= 5 => {
+            player.stream_type = raw as i32;
+            SL_RESULT_SUCCESS
+        }
+        b"androidPerformanceMode" if raw <= 3 => {
+            player.performance_mode = raw;
+            SL_RESULT_SUCCESS
+        }
+        _ => SL_RESULT_PARAMETER_INVALID,
+    })
+    .unwrap_or(SL_RESULT_PARAMETER_INVALID)
+}
+
+extern "C" fn android_config_get(
+    self_itf: *mut c_void,
+    config_key: *const i8,
+    value_size: *mut u32,
+    value: *mut c_void,
+) -> u32 {
+    let Ok(key) = android_config_key(config_key) else {
+        return SL_RESULT_PARAMETER_INVALID;
+    };
+    if value_size.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    // SAFETY: checked non-null; the caller owns this SLuint32 for the duration of the call.
+    let capacity = unsafe { *value_size };
+    // SAFETY: as above. Android reports the required size even for a null/undersized buffer.
+    unsafe { *value_size = std::mem::size_of::<u32>() as u32 };
+    if value.is_null() {
+        return SL_RESULT_SUCCESS;
+    }
+    if capacity < std::mem::size_of::<u32>() as u32 {
+        return SL_RESULT_BUFFER_INSUFFICIENT;
+    }
+    let result =
+        with_player_config_state(self_itf, itf_offsets().android_config, |player| match key {
+            b"androidPlaybackStreamType" => player.stream_type as u32,
+            b"androidPerformanceMode" => player.performance_mode,
+            _ => unreachable!("android_config_key rejects unknown keys"),
+        });
+    match result {
+        Ok(raw) => {
+            // SAFETY: capacity proves four writable bytes; a void* need not be aligned.
+            unsafe { std::ptr::write_unaligned(value.cast::<u32>(), raw) };
+            SL_RESULT_SUCCESS
+        }
+        Err(_) => SL_RESULT_PARAMETER_INVALID,
+    }
+}
+
+extern "C" fn android_config_acquire_java_proxy(
+    _self_itf: *mut c_void,
+    _proxy_type: u32,
+    proxy: *mut c_void,
+) -> u32 {
+    if !proxy.is_null() {
+        // SAFETY: this is a jobject* out-parameter. Eclipse has no Android AudioTrack proxy.
+        unsafe { *(proxy as *mut *mut c_void) = std::ptr::null_mut() };
+    }
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+extern "C" fn android_config_release_java_proxy(_self_itf: *mut c_void, _proxy_type: u32) -> u32 {
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+// =================================================================================================
 // Object minting + validation + host stream.
 // =================================================================================================
 
@@ -1381,6 +1772,14 @@ fn mint_object(kind: ObjectKind) -> Result<*mut c_void, ObjectError> {
         },
         bufferqueue_itf: match &kind {
             ObjectKind::Player(_) => bufferqueue_vtable(),
+            _ => std::ptr::null(),
+        },
+        volume_itf: match &kind {
+            ObjectKind::Player(_) => volume_vtable(),
+            _ => std::ptr::null(),
+        },
+        android_config_itf: match &kind {
+            ObjectKind::Player(_) => android_configuration_vtable(),
             _ => std::ptr::null(),
         },
         state: SL_OBJECT_STATE_UNREALIZED,
@@ -1519,6 +1918,7 @@ pub unsafe extern "C" fn eclipse_sl_create_engine(
         Ok(obj) => {
             // SAFETY: 2026-06-05 — `p_engine` is the caller's non-null `SLObjectItf*` out-param.
             unsafe { *(p_engine as *mut *mut c_void) = obj };
+            tracing::info!("OpenSL: engine created");
             SL_RESULT_SUCCESS
         }
         Err(_) => SL_RESULT_MEMORY_FAILURE,

@@ -6,7 +6,7 @@
 #
 # Mechanism: multidex first-dex-wins. Output api-impl.jar layout:
 #   classes.dex  = javac-patched classes (Build*, NetworkRequest*, ActivityManager*, PowerManager*, LayoutInflater*, KeyguardManager*, PixelCopy*)
-#   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + LocationManager + Vibrator + SystemProperties (honest ro.build.tags) + AutofillManager + CookieManager + JobParameters + Paint = installed classes + AOSP gaps
+#   classes2.dex = smali-patched View (+View$OnCapturedPointerListener) + Display (+Display$Mode) + Activity + Fragment + LocationManager + Vibrator + SystemProperties (honest ro.build.tags) + PackageManager (desktop input + real Eclipse audio capabilities) + AutofillManager + CookieManager + JobParameters + Paint = installed classes + AOSP gaps
 #   classes3.dex = ATL's original whole api-impl dex
 # ART's DexPathList resolves each class from the first dex defining it.
 set -euo pipefail
@@ -670,9 +670,36 @@ perl -0pi -e 's{(const-string [vp]\d+, )"release-keys"}{$1"test-keys"}' "$spsm"
 grep -qF '"test-keys"' "$spsm" || fail "SystemProperties.smali test-keys insert failed (drift?)"
 ! grep -qF '"release-keys"' "$spsm" || fail "SystemProperties.smali still reports release-keys — honest-tags fix regressed"
 
+# PackageManager.hasSystemFeature: advertise Eclipse's desktop-PC input profile and the low-latency
+# audio capability it actually implements. Roblox probes `android.hardware.type.pc` and
+# `android.hardware.touchscreen` together when a game starts. Eclipse has a host mouse/keyboard and
+# no touch digitizer by default. Read the immutable `eclipse.touch_mode` VM property so all three
+# Sober-compatible modes agree with host routing: off=(PC true,touch false), on=(PC false,touch true),
+# fake-off=(PC true,touch false while host mouse events use the touch bridge). Leaving both probes in
+# ATL's unimplemented fallback made Roblox select its Android/mobile control profile even though host
+# keyboard events were available. 2026-07-22: FMOD first verifies checkInit(), then requires
+# FEATURE_AUDIO_LOW_LATENCY before selecting OpenSL; ATL's catch-all false made it select AAudio on
+# API 28, but Eclipse intentionally exposes OpenSL rather than libaaudio. Eclipse's OpenSL buffer
+# queue is backed by a live cpal stream and honors FMOD's accepted 256-frame blocks, so returning
+# true for this one exact feature is the honest platform contract. Keep audio.pro false: that is a
+# stronger Android certification Eclipse does not claim. Patch the installed class so its other
+# environment-sensitive feature behavior stays byte-for-byte unchanged.
+pmsm="$work/smali/android/content/pm/PackageManager.smali"
+[ -f "$pmsm" ] || fail "PackageManager.smali not found after baksmali"
+n="$(grep -cF '.method public hasSystemFeature(Ljava/lang/String;)Z' "$pmsm")" || true
+[ "$n" = "1" ] || fail "PackageManager.smali hasSystemFeature anchor not unique (found $n, expected 1) — installed PackageManager drifted; update patch-framework.sh"
+! grep -qF ':eclipse_not_desktop_pc' "$pmsm" || fail "PackageManager.smali already carries the Eclipse desktop feature patch — installed framework drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public hasSystemFeature\(Ljava/lang/String;\)Z\n    \.registers 6\n)}{$1\n    # ECLIPSE PATCH 2026-07-22: Sober-compatible host input presentation.\n    const-string v0, "android.hardware.type.pc"\n\n    invoke-virtual {p1, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    if-eqz v0, :eclipse_not_desktop_pc\n\n    const-string v1, "eclipse.touch_mode"\n\n    const-string v2, "off"\n\n    invoke-static {v1, v2}, Ljava/lang/System;->getProperty(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v1\n\n    const-string v2, "on"\n\n    invoke-virtual {v1, v2}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    xor-int/lit8 v0, v0, 0x1\n\n    return v0\n\n    :eclipse_not_desktop_pc\n    const-string v0, "android.hardware.touchscreen"\n\n    invoke-virtual {p1, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    if-eqz v0, :eclipse_not_touchscreen\n\n    const-string v1, "eclipse.touch_mode"\n\n    const-string v2, "off"\n\n    invoke-static {v1, v2}, Ljava/lang/System;->getProperty(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v1\n\n    const-string v2, "on"\n\n    invoke-virtual {v1, v2}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    return v0\n\n    :eclipse_not_touchscreen\n    # OpenSL+cpal implements this exact capability.\n    const-string v0, "android.hardware.audio.low_latency"\n\n    invoke-virtual {p1, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v0\n\n    if-eqz v0, :eclipse_not_low_latency_audio\n\n    const/4 v0, 0x1\n\n    return v0\n\n    :eclipse_not_low_latency_audio\n}s' "$pmsm"
+grep -qF ':eclipse_not_desktop_pc' "$pmsm" || fail "PackageManager.smali desktop feature insert failed (drift?)"
+grep -qF ':eclipse_not_touchscreen' "$pmsm" || fail "PackageManager.smali touchscreen feature insert failed (drift?)"
+grep -qF ':eclipse_not_low_latency_audio' "$pmsm" || fail "PackageManager.smali audio feature insert failed (drift?)"
+grep -qF '"android.hardware.type.pc"' "$pmsm" || fail "PackageManager.smali lost the exact desktop-PC feature literal"
+grep -qF '"android.hardware.touchscreen"' "$pmsm" || fail "PackageManager.smali lost the exact touchscreen feature literal"
+grep -qF '"android.hardware.audio.low_latency"' "$pmsm" || fail "PackageManager.smali lost the exact low-latency feature literal"
+
 # assemble View(+nested) + Display(+Mode) + Activity + Fragment + LocationManager + Vibrator +
-# AutofillManager + CookieManager + JobParameters + Paint -> classes2.dex
-mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
+# PackageManager + AutofillManager + CookieManager + JobParameters + Paint -> classes2.dex
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content/pm" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
@@ -682,6 +709,7 @@ cp "$fsm" "$work/smali-view/android/app/Fragment.smali"
 cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$spsm" "$work/smali-view/android/os/SystemProperties.smali"
+cp "$pmsm" "$work/smali-view/android/content/pm/PackageManager.smali"
 cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
 cp "$wvsm" "$work/smali-view/android/webkit/WebView.smali"
