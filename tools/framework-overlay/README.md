@@ -17,6 +17,7 @@ fields and wrong/missing pure-Java method behavior:
 | `android.os.Build` | `SUPPORTED_{32,64}_BIT_ABIS` fields missing | `RobloxApplication.onCreate` (`NoSuchFieldError`) |
 | `android.net.NetworkRequest$Builder` | not AOSP-shaped: inner (non-static) class, no no-arg ctor, no `addCapability(int)`/`addTransportType(int)` | jobqueue lib in `ActivitySplash.onCreate` (`NoSuchMethodError`) |
 | `android.app.ActivityManager$RunningAppProcessInfo` | `importance` always 0 (never `IMPORTANCE_FOREGROUND`=100) and **no `pkgList` field** | Roblox's foreground-process check (dex `yj.s.b`): scans `getRunningAppProcesses()` for an entry with `importance == 100` whose `pkgList` contains the package; finds none → logs **"Background process detected"** |
+| `android.app.ActivityManager` / `$MemoryInfo` | `getMemoryInfo(out)` reassigns only its local parameter; RAM is hardcoded to 10,000 bytes; heap classes are arbitrary 20/60 MiB; parcel omits AOSP's final four LMK fields | Roblox reads `totalMem / 1 MiB` into its device profile/User-Agent (producing impossible `0MB`) and reads the memory/low-RAM classes into `DeviceParams` |
 | `android.location.LocationManager` | API-level-1 `isProviderEnabled(String)` missing; the overlay returns false for every non-null name because ATL advertises an empty provider set, and preserves AOSP's `IllegalArgumentException` for null | Current-client Backtrace watchdog plus two adjacent SDK paths (`NoSuchMethodError` reached Roblox's process-fatal uncaught handler → `System.exit(10)`) |
 | `android.view.PixelCopy` | API-24 class entirely absent; Eclipse posts the honest `ERROR_SOURCE_NO_DATA` result because its framework SurfaceView has no Android pixel-copy backend | Current-client transition screenshot during `surfaceDestroyed` (`NoClassDefFoundError` blocked one shutdown callback) |
 | `WolfSSLImplementSSLSession` (libcore boot jar) | installed hostdex returns an empty peer-certificate array although its own vendored source throws `SSLPeerUnverifiedException`; the overlay restores the source/`SSLSession` contract | Current-client background OkHttp hostname verification indexed `[0]`, then its fatal handler called `System.exit(10)` during close |
@@ -41,6 +42,9 @@ boot-image checksums coherent without modifying the distro's `/usr` files.
   loudly if the anchor is missing or duplicated.
 - `src/android/net/NetworkRequest.java` and `src/android/app/ActivityManager.java` are
   committed **patched copies** of ATL's (Apache-2.0) sources, with `ECLIPSE PATCH` markers.
+  ActivityManager's memory methods delegate to Rust via `RegisterNatives`: Rust reads Linux
+  `MemTotal`/`MemAvailable`, reports Eclipse's actual ART heap cap, and leaves unavailable Android
+  low-memory-killer thresholds explicitly zero. Its `MemoryInfo` parcel retains the AOSP field order.
 - `stubs/` are **compile-only** shells so `javac` can compile the patched sources without
   ATL's full source tree (`api-impl.jar` ships dex, not classfiles, so it cannot be a
   javac classpath). Stubs are **excluded from the dex** — only the whitelisted patched
