@@ -1,4 +1,4 @@
-// 2026-06-13: compile-only stub for the <requestFocus/> LayoutInflater overlay patch (NEVER dexed).
+
 package android.view;
 public class View {
 	public int getId() { return 0; }

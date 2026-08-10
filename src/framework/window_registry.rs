@@ -1,38 +1,3 @@
-//! Process-global generational-slab registry for Eclipse-owned window handles.
-//!
-//! 2026-06-05: the `jlong` window handle Eclipse passes to the launcher lifecycle natives
-//! (`createApplication`/`createMainActivity`) is an **Eclipse-owned registry index into this
-//! generational slab — NOT `Box::into_raw`, NOT a raw pointer** (`docs/art-and-runtime.md`
-//! "Non-GTK Window/Surface backing — design"). ATL casts that `jlong` to a `GtkWidget*`; Eclipse
-//! owns both sides of the `jlong`, so it defines its own meaning. A registry index is chosen over
-//! `Box::into_raw(WindowState)` for **soundness**: a stale or fabricated `jlong` (from a buggy
-//! framework path or the engine) becomes a **bounds-checked + generation-checked lookup that
-//! returns `Err`**, never a wild dereference / use-after-free / UB. `Box::into_raw` would turn any
-//! wrong `jlong` into UB.
-//!
-//! ## Handle layout
-//! A handle is an [`i64`] (`jlong`) packing a `u32` **slot index** in the low 32 bits and a `u32`
-//! **generation** in the high 32 bits. Freeing a slot bumps its generation, so an old handle to a
-//! later-reused slot fails the generation check ([`WindowRegistryError::StaleHandle`]) instead of
-//! aliasing the new occupant. Generations start at 1, so a freshly allocated slot's handle always
-//! has non-zero high bits — `0` can never be a valid handle, keeping `jlong = 0` reserved as the
-//! null sentinel that steps 1–3 store but never look up.
-//!
-//! ## Thread-safety
-//! The slab lives behind a [`Mutex`] inside a [`OnceLock`] (process-global, std-only, no new dep).
-//! [`WindowState`] is intended to be touched only on the VM/winit main thread; the `Mutex` makes
-//! the registry itself safe to call from anywhere, and a poisoned lock is surfaced as the typed
-//! [`WindowRegistryError::Poisoned`] rather than a panic on the JNI path (AGENTS.md §2.8).
-//!
-//! ## Scope (this increment)
-//! [`WindowState`] holds **only** what is needed before a winit `Window` exists at allocation time
-//! (`createApplication` runs after boot but **before** the winit window is created): a `title`, a
-//! `root_view` handle, and (2026-06-13) a captured JNI global ref to the Java `android.view.Window`
-//! object ([`set_jobject`]/[`with_jobject`], so `View.native_get_window` can hand the view tree its
-//! owning Window). It deliberately holds **no** winit `Window` — none exists yet — which avoids the
-//! aliasing hazard the design flagged (the live winit window is reached through the event-loop
-//! callback, not the registry). Associating the real winit window is a later, dev-host-gated step.
-
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -42,36 +7,18 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use jni::objects::JObject;
 use jni::refs::Global;
 
-/// Process-global slab of [`WindowState`], guarded by a [`Mutex`]. Initialized on first use.
 static WINDOWS: OnceLock<Mutex<Registry>> = OnceLock::new();
 
-/// 2026-06-13: the handle of the single live process-shared window, published by [`allocate`] and
-/// cleared by [`free`]. `View.native_get_window` reads it (via [`active_window`]) to map any view's
-/// `widget` handle to the one Window object whose view tree it belongs to (Eclipse's
-/// one-window-per-launch model — `framework.rs` `drive_application_lifecycle`). `0` = none allocated.
-///
-/// An `AtomicI64` (not behind the slab `Mutex`) so the lookup is lock-free; it stores only the packed
-/// `jlong` handle (an opaque index, not a pointer), validated against the slab on use — so a stale
-/// value is a checked `Err`, never UB. Mirrors [`view_registry::ACTIVE_ROOT`](super::view_registry).
 static ACTIVE_WINDOW: AtomicI64 = AtomicI64::new(0);
 
-/// A window-registry handle as it travels across JNI: a `jlong` (`i64`) packing the slot index
-/// (low 32 bits) and the slot's generation (high 32 bits). See the module docs for the layout and
-/// why `0` is reserved.
 pub type WindowHandle = i64;
 
-/// Errors from the window registry. Every fallible path returns one of these instead of panicking,
-/// so a stale/out-of-range/fabricated `jlong` from Java can never cause UB or unwind across JNI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowRegistryError {
-    /// The handle's slot index is outside the slab (fabricated handle, or the reserved `0`/null).
     OutOfRange,
-    /// The slot exists but its current generation does not match the handle's: the handle refers to
-    /// a freed (and possibly reused) slot. The key soundness rejection — never aliases the new
-    /// occupant.
+
     StaleHandle,
-    /// The registry mutex was poisoned by a panic in another holder. Surfaced as an error (not a
-    /// re-panic) so the JNI path stays panic-free (AGENTS.md §2.8).
+
     Poisoned,
 }
 
@@ -91,69 +38,36 @@ impl fmt::Display for WindowRegistryError {
 
 impl std::error::Error for WindowRegistryError {}
 
-/// Per-window state held in a registry slot.
-///
-/// 2026-06-05: minimal by design — `createApplication` allocates a slot **before** the winit window
-/// exists, so this holds NO winit `Window` (that would alias the event loop's `&mut` access and
-/// there is nothing to store yet). It carries only metadata the early lifecycle natives set:
-/// the window `title` (default empty), the `root_view` handle, and (2026-06-13) the captured JNI
-/// global ref to the Java `Window` object that `Window.set_jobject` stores via [`set_jobject`] (see
-/// that field's docs) so `View.native_get_window` can return the view tree's owning Window.
 #[derive(Debug, Default)]
 pub struct WindowState {
-    /// Window title (`Window.set_title` stores this; applied to the real winit window when associated).
     pub title: String,
-    /// 2026-06-13: a JNI **global** reference to this window's Java `android.view.Window` object,
-    /// captured by `Window.set_jobject(long ptr, Window obj)` (Window.java line 188, called from
-    /// `set_native_window` AFTER `this.native_window` is populated — Window.java lines 58-60). Held so
-    /// `View.native_get_window` can hand the engine's view tree back the SAME Window object that owns
-    /// it (its `native_window` field is already valid), which ATL's `getViewTreeObserver` reads to
-    /// build a real `ViewTreeObserver`. `None` until `set_jobject` captures it (then
-    /// `native_get_window` returns null and ATL builds a floating observer — View.java lines 1245-1254).
-    /// A `Global` is `Send`, so it lives soundly in this process-global slab; its `Drop` releases the
-    /// JNI global ref when the slot is [`free`]d or this `Option` is replaced (mirrors
-    /// [`view_registry::ViewState::jobject`](super::view_registry)). Was `Option<()>` (a presence-only
-    /// placeholder) before this increment.
+
     pub jobject: Option<Global<JObject<'static>>>,
-    /// 2026-06-05: the content-root view handle (`Window.set_widget_as_root`), an index into the
-    /// [`view_registry`](super::view_registry) slab — the root of this window's view tree, or `None`
-    /// until set. Stored as a handle (not a reference), so no cross-registry aliasing.
+
     pub root_view: Option<i64>,
 }
 
-/// A generational slot: the current generation plus the optional occupant. A live slot is
-/// `Some(state)`; a freed slot is `None` but keeps (and on free, bumped) its generation so stale
-/// handles to it are rejected.
 struct Slot {
-    /// Current generation. Starts at 1 (so the first handle has non-zero high bits — `0` stays the
-    /// reserved null), bumped on every [`free`]. A handle is valid only if its generation equals
-    /// this.
     generation: u32,
-    /// The occupant, or `None` if the slot is free.
+
     state: Option<WindowState>,
 }
 
-/// The slab + free list. `slots[i].generation` is authoritative for slot `i`; `free` holds the
-/// indices of currently-free slots for O(1) reuse.
 #[derive(Default)]
 struct Registry {
     slots: Vec<Slot>,
     free: Vec<u32>,
 }
 
-/// Pack a slot index + generation into a `jlong` handle (generation high, index low).
 fn pack(index: u32, generation: u32) -> WindowHandle {
     ((generation as u64) << 32 | index as u64) as i64
 }
 
-/// Unpack a `jlong` handle into (slot index, generation).
 fn unpack(handle: WindowHandle) -> (u32, u32) {
     let bits = handle as u64;
     ((bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32)
 }
 
-/// Lock the process-global registry, mapping a poisoned mutex to the typed
-/// [`WindowRegistryError::Poisoned`] (never a panic — AGENTS.md §2.8).
 fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, WindowRegistryError> {
     WINDOWS
         .get_or_init(|| Mutex::new(Registry::default()))
@@ -161,12 +75,6 @@ fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, WindowRegistryErro
         .map_err(|_: PoisonError<_>| WindowRegistryError::Poisoned)
 }
 
-/// Allocate a fresh registry slot and return its packed [`WindowHandle`] (`jlong`).
-///
-/// Reuses a freed slot when one is available (its generation was already bumped on [`free`]),
-/// otherwise grows the slab. The returned handle's generation is ≥ 1, so it is never `0` (the
-/// reserved null). Returns [`WindowRegistryError::Poisoned`] only if the registry mutex was
-/// poisoned — never panics.
 pub fn allocate() -> Result<WindowHandle, WindowRegistryError> {
     let mut reg = lock()?;
     let handle = if let Some(index) = reg.free.pop() {
@@ -185,22 +93,11 @@ pub fn allocate() -> Result<WindowHandle, WindowRegistryError> {
         });
         pack(index, 1)
     };
-    // 2026-06-13: publish this as the live process-shared window so `View.native_get_window` can map
-    // any view's `widget` to it (one-window-per-launch). Lock-free read via [`active_window`]; the
-    // store happens under the slab lock here but is read without it, which is fine — the handle is
-    // validated against the slab on use, so a torn/stale value is a checked `Err`, never UB.
+
     ACTIVE_WINDOW.store(handle, Ordering::Release);
     Ok(handle)
 }
 
-/// Look up the [`WindowState`] for a `handle` and run `f` against it under the registry lock.
-///
-/// Bounds-checks the slot index **and** verifies the handle's generation matches the slot's current
-/// generation, so a stale (freed/reused), out-of-range, or fabricated handle returns `Err` and
-/// never dereferences out of bounds or aliases a different window. The reserved `0`/null handle
-/// fails the generation check (slot 0's live generation is ≥ 1) and returns
-/// [`WindowRegistryError::StaleHandle`] for an existing slot 0, or
-/// [`WindowRegistryError::OutOfRange`] when slot 0 does not exist.
 pub fn with_window<R>(
     handle: WindowHandle,
     f: impl FnOnce(&mut WindowState) -> R,
@@ -221,11 +118,6 @@ pub fn with_window<R>(
     Ok(f(state))
 }
 
-/// Free the slot a `handle` refers to, bumping its generation so any other handle to it (or this
-/// one, reused later) is rejected as [`WindowRegistryError::StaleHandle`].
-///
-/// Validates the handle the same way [`with_window`] does before freeing, so freeing an
-/// already-freed, stale, or fabricated handle returns `Err` rather than corrupting the free list.
 pub fn free(handle: WindowHandle) -> Result<(), WindowRegistryError> {
     let (index, generation) = unpack(handle);
     let mut reg = lock()?;
@@ -237,25 +129,14 @@ pub fn free(handle: WindowHandle) -> Result<(), WindowRegistryError> {
         return Err(WindowRegistryError::StaleHandle);
     }
     slot.state = None;
-    // Bump the generation so the just-freed handle (and any copy of it) is now stale. Saturating so
-    // a (practically unreachable) 2^32 reuse cycle never wraps a generation back onto a live value.
+
     slot.generation = slot.generation.saturating_add(1);
     reg.free.push(index);
-    // 2026-06-13: if the freed handle was the published live window, clear it so a later
-    // [`active_window`] returns `0` (none) instead of a stale handle. `compare_exchange` only clears
-    // when it still names this exact handle (a newer `allocate` may have already replaced it).
+
     let _ = ACTIVE_WINDOW.compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire);
     Ok(())
 }
 
-/// Capture the JNI **global** reference to a window's Java `android.view.Window` object onto its
-/// registry slot, so `View.native_get_window` can hand the view tree back the real Window object.
-///
-/// 2026-06-13: called by `Window.set_jobject` from a global ref it created over the Window `this`. A
-/// `Global` is `Send` and owns the underlying JNI global reference (released on `Drop` when the slot
-/// is [`free`]d or this `Option` is replaced — so re-capturing on a later `set_jobject` drops the
-/// prior ref). Validates the handle like [`with_window`], so a stale/fabricated handle is a typed
-/// `Err`, never UB. Mirrors [`view_registry::set_jobject`](super::view_registry).
 pub fn set_jobject(
     handle: WindowHandle,
     jobject: Global<JObject<'static>>,
@@ -263,15 +144,6 @@ pub fn set_jobject(
     with_window(handle, move |w| w.jobject = Some(jobject))
 }
 
-/// Run `f` with a **borrow** of the window's stored Java-object global reference, if one is recorded.
-///
-/// 2026-06-13: the `View.native_get_window` path. Returns `Ok(None)` when the handle is valid but no
-/// global ref was captured yet (`set_jobject` has not run — the native then returns null and ATL
-/// builds a floating observer); `Ok(Some(r))` with `f`'s result otherwise; `Err` for a
-/// stale/fabricated handle or a poisoned lock. `f` receives `&Global<JObject<'static>>` (not
-/// ownership), so the slot keeps the ref alive across the call. The registry lock is held for the
-/// duration of `f`, so `f` must not re-enter the registry (the caller only makes a leaf JNI
-/// `NewLocalRef` call, which does not). Mirrors [`view_registry::with_jobject`](super::view_registry).
 pub fn with_jobject<R>(
     handle: WindowHandle,
     f: impl FnOnce(&Global<JObject<'static>>) -> R,
@@ -279,8 +151,6 @@ pub fn with_jobject<R>(
     with_window(handle, |w| w.jobject.as_ref().map(f))
 }
 
-/// The currently published live process-shared window handle, or `0` if none is allocated. Lock-free
-/// (a single atomic load). 2026-06-13: `View.native_get_window` maps any view to this single window.
 pub fn active_window() -> WindowHandle {
     ACTIVE_WINDOW.load(Ordering::Acquire)
 }
@@ -290,26 +160,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // 2026-06-05: these tests run fully in-harness — no VM, no display. They prove the soundness
-    // contract of the owned-handle registry: distinct handles, correct-slot mutation, and (the key
-    // property) that a freed handle becomes Stale after the slot is reused with a bumped generation,
-    // so a stale/fabricated `jlong` from Java is an `Err`, never UB / cross-talk.
-    //
-    // The registry slab is process-global, so tests share one slab. Slab-level reads/writes are
-    // order-independent: each allocates its own handles and never asserts absolute slot indices, and
-    // the generation check makes one test's handles invisible to another's lookups.
-    //
-    // 2026-06-13: `allocate`/`free` ALSO publish/clear the process-global `ACTIVE_WINDOW` atomic (the
-    // single live window `View.native_get_window` maps to). So any test that asserts an ABSOLUTE
-    // `active_window()` value across an `allocate()`/`free()` boundary is NOT safe under `cargo test`'s
-    // default parallel runner: a sibling test's `allocate()` (which stores `ACTIVE_WINDOW`) can land
-    // between this test's `allocate()` and its `active_window()` read and overwrite the global. Serialize
-    // every test that touches `allocate`/`free`/`active_window` behind this lock so those assertions are
-    // deterministic. Mirrors the `ANW_TEST_LOCK` precedent in `loader::native_provider` tests; a plain
-    // `std::sync::Mutex` (no new dep) and poison-tolerant lock (a panic in one holder must not cascade)
-    // serialize them without weakening any assertion. (`view_registry`'s ACTIVE_ROOT tests need no such
-    // lock because `allocate` there does NOT write ACTIVE_ROOT — only the explicit `set_active_root`
-    // does, and those tests scope it back-to-back with no intervening allocate.)
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -326,7 +176,7 @@ mod tests {
         let a = allocate().expect("allocate a");
         let b = allocate().expect("allocate b");
         assert_ne!(a, b, "distinct allocations must yield distinct handles");
-        // Generations start at 1, so a valid handle's high bits are non-zero ⇒ never the null 0.
+
         assert_ne!(a, 0, "a valid handle is never the reserved null 0");
         assert_ne!(b, 0, "a valid handle is never the reserved null 0");
         free(a).expect("free a");
@@ -351,23 +201,20 @@ mod tests {
     #[test]
     fn freed_handle_is_stale_and_does_not_alias_reused_slot() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // The key soundness property. Allocate, write, free, re-allocate; the freed handle must NOT
-        // see the new occupant — it must be rejected as StaleHandle.
+
         let old = allocate().expect("allocate old");
         with_window(old, |s| s.title = "old".to_owned()).expect("write old");
         free(old).expect("free old");
 
-        // Reuse: the registry pops the just-freed slot but with a bumped generation.
         let new = allocate().expect("allocate new");
         with_window(new, |s| s.title = "new".to_owned()).expect("write new");
 
-        // The OLD handle must now be Stale — not silently reading/writing the NEW window's state.
         assert_eq!(
             with_window(old, |s| s.title.clone()),
             Err(WindowRegistryError::StaleHandle),
             "a freed handle must be StaleHandle, never alias the reused slot"
         );
-        // The new handle still works and is unaffected by the stale lookup.
+
         assert_eq!(
             with_window(new, |s| s.title.clone()),
             Ok("new".to_owned()),
@@ -378,16 +225,13 @@ mod tests {
 
     #[test]
     fn out_of_range_and_fabricated_handles_return_err_not_panic() {
-        // A handle whose slot index is far past the slab is OutOfRange (bounds-checked, no panic).
         let fabricated = pack(u32::MAX, 1);
         assert_eq!(
             with_window(fabricated, |_| ()),
             Err(WindowRegistryError::OutOfRange),
             "a fabricated out-of-range index must be OutOfRange, never an out-of-bounds deref"
         );
-        // The reserved null handle (0) — slot index 0, generation 0 — is never a live generation
-        // (live generations are ≥ 1), so it is rejected: Stale if slot 0 exists, OutOfRange if not.
-        // Either way it is an Err and never aliases a real window.
+
         let null_lookup = with_window(0, |_| ());
         assert!(
             matches!(
@@ -396,7 +240,7 @@ mod tests {
             ),
             "the reserved null handle 0 must be rejected, got {null_lookup:?}"
         );
-        // free of a fabricated handle is likewise an error, not a panic or free-list corruption.
+
         assert_eq!(free(fabricated), Err(WindowRegistryError::OutOfRange));
     }
 
@@ -405,30 +249,18 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = allocate().expect("allocate");
         free(h).expect("first free");
-        // The same handle is now stale (generation bumped); a second free must not corrupt the
-        // free list or panic — it returns StaleHandle.
+
         assert_eq!(free(h), Err(WindowRegistryError::StaleHandle));
     }
-
-    // 2026-06-13: the `View.native_get_window` additions. Mirror view_registry's jobject/active
-    // tests (fully in-harness — no VM/display). They would have caught the `Option<()>` regression
-    // this change fixes (a window with no captured ref must be the null/floating-observer path, and
-    // a stale handle must never alias a window) and the active-window lifecycle the native maps over.
-    //
-    // Creating a REAL `Global<JObject>` needs a live VM, so (like
-    // `view_registry::with_jobject_is_none_without_a_recorded_object_and_err_when_stale`) these
-    // exercise only the `Ok(None)` (no-ref → null return → floating observer) and `Err(StaleHandle)`
-    // (never UB) paths; the round-trip-and-released-on-free property is validated on the dev-host run.
 
     #[test]
     fn with_jobject_is_none_without_a_captured_object_and_err_when_stale() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = allocate().expect("alloc");
-        // No jobject captured yet (no VM in-harness, and set_jobject has not run) → Ok(None): a valid
-        // window whose `native_get_window` returns null, so ATL builds a floating observer.
+
         assert_eq!(with_jobject(h, |_| 1i32), Ok(None));
         free(h).expect("free");
-        // Stale handle → Err, never UB / never aliasing a reused slot's ref.
+
         assert_eq!(
             with_jobject(h, |_| 1i32),
             Err(WindowRegistryError::StaleHandle)
@@ -439,25 +271,21 @@ mod tests {
     fn active_window_tracks_allocate_and_clears_on_free() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = allocate().expect("alloc");
-        // allocate publishes the new handle as the live process-shared window.
+
         assert_eq!(
             active_window(),
             h,
             "allocate must publish the active window"
         );
         free(h).expect("free");
-        // Freeing the published window clears the active handle (so native_get_window returns null,
-        // not a stale handle that would fail the generation check on lookup anyway).
+
         assert_eq!(active_window(), 0, "free must clear the active window");
     }
 
     #[test]
     fn freeing_a_superseded_window_does_not_clear_a_newer_active() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // The one-window-per-launch invariant: if a window is freed AFTER a newer allocate replaced
-        // the active handle, freeing the old one must NOT clear the newer live window (compare_exchange
-        // only clears when ACTIVE_WINDOW still names the freed handle). Held under TEST_LOCK so a
-        // sibling test's allocate cannot overwrite ACTIVE_WINDOW between these allocates and the reads.
+
         let old = allocate().expect("alloc old");
         let new = allocate().expect("alloc new");
         assert_eq!(

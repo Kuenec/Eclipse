@@ -1,10 +1,3 @@
-//! Desktop system-cursor mode for Roblox's Android client.
-//!
-//! Android Roblox resolves a null platform pointer icon and renders its keyboard/mouse cursor as
-//! engine textures. On a Linux desktop the compositor cursor is already visible, so that Android
-//! behavior produces a second white cursor. Eclipse keeps the real host cursor and replaces only
-//! Roblox's standard keyboard/mouse + camera cursor textures with a valid transparent PNG.
-
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write as _};
@@ -13,8 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::TouchMode;
 
-/// A valid 1×1, fully transparent, grayscale+alpha PNG. A valid texture is used instead of an
-/// empty file so Roblox's image decoder succeeds and has no reason to substitute a fallback icon.
 const TRANSPARENT_CURSOR_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
@@ -23,9 +14,6 @@ const TRANSPARENT_CURSOR_PNG: &[u8] = &[
     0xae, 0x42, 0x60, 0x82,
 ];
 
-/// APK-asset-relative paths for Roblox's own standard desktop pointer visuals. Deliberately excludes
-/// gamepad/virtual cursors and tool/game-specific cursor art: those convey distinct game state and
-/// are not the duplicate white desktop pointer this mode removes.
 const ROBLOX_DESKTOP_CURSOR_ASSETS: &[&str] = &[
     "content/textures/ArrowCursor.png",
     "content/textures/ArrowFarCursor.png",
@@ -43,19 +31,8 @@ const ROBLOX_DESKTOP_CURSOR_ASSETS: &[&str] = &[
     "content/textures/advCursor-white.png",
 ];
 
-/// Asset reads occur on engine workers after launcher setup, so publish the completed override with
-/// release/acquire ordering. It starts disabled, keeping library tests and non-desktop touch modes
-/// byte-for-byte faithful to the APK unless the launcher explicitly installs desktop mode.
 static SYSTEM_CURSOR_OVERRIDE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Install desktop system-cursor mode after the APK's asset tree has been extracted.
-///
-/// `TouchMode::Off` is Eclipse's keyboard/mouse mode. Its extracted standard cursor files are
-/// atomically replaced before ART boots, and subsequent in-memory APK reads receive the same valid
-/// transparent PNG through [`replacement_apk_entry`]. Touch modes retain the original Android
-/// cursor assets. Returns the number of extracted files changed this call; absent version-specific
-/// assets are skipped because the in-memory interception still covers any path Roblox actually asks
-/// for.
 pub fn install(assets_dir: &Path, touch_mode: TouchMode) -> io::Result<usize> {
     SYSTEM_CURSOR_OVERRIDE_ENABLED.store(false, Ordering::Release);
     if touch_mode != TouchMode::Off {
@@ -67,8 +44,6 @@ pub fn install(assets_dir: &Path, touch_mode: TouchMode) -> io::Result<usize> {
     Ok(changed)
 }
 
-/// Return the transparent replacement for a present APK entry while desktop mode is enabled.
-/// Callers first resolve the real ZIP entry, so this never fabricates an asset absent from the APK.
 pub(crate) fn replacement_apk_entry(name: &str) -> Option<&'static [u8]> {
     replacement_for(name, SYSTEM_CURSOR_OVERRIDE_ENABLED.load(Ordering::Acquire))
 }

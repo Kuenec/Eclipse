@@ -1,28 +1,3 @@
-//! Process-global generational-slab registry for Eclipse-owned `android.graphics.Path` geometry.
-//!
-//! 2026-06-05: AOSP's modern `Path` routes its construction operations through a *builder*:
-//! `Path.getBuilder()` calls `native long native_create_builder(long nativePath, long reserve)` once
-//! (lazily, on the first `moveTo`/`lineTo`/… after a mutation), then each `moveTo`/`lineTo`/`quadTo`/
-//! `cubicTo`/`close`/`addRoundRect`/… is a native op against that builder handle, and the builder is
-//! folded back into the `Path`'s native object. ATL backs this in C against Skia/GTK; Eclipse must NOT
-//! pull in GTK (AGENTS.md §5 Step 3.5), and a `Path` is **real vector geometry** — so a `Path`'s/
-//! builder's `long` handle is an **Eclipse-owned generational-slab index into this slab — NOT
-//! `Box::into_raw`, NOT a raw pointer**, exactly the soundness pattern of the sibling registries
-//! ([`matrix_registry`](super::matrix_registry) etc.). A stale/fabricated `jlong` from Java is a
-//! bounds+generation-checked `Err`, never a wild dereference / UB.
-//!
-//! ## Handle layout
-//! Identical to the sibling registries: a [`jlong`] packing a `u32` slot index (low 32 bits) + a
-//! `u32` generation (high 32 bits). Generations start at 1, so a valid handle is never `0` (the
-//! reserved "no path" / null sentinel AOSP `Path.java` uses for an empty native object).
-//!
-//! ## The geometry value
-//! [`PathGeometry`] holds the **real** path as an ordered list of [`Verb`]s + a flat point buffer (the
-//! exact contour data the `moveTo`/`lineTo`/`quadTo`/`cubicTo`/`close` ops build). This is the
-//! resolution-independent source of truth; the software rasterizer ([`crate::graphics`]) walks it into
-//! a tiny-skia path for filling. No GPU/GTK is needed to build geometry — faking it is forbidden
-//! (AGENTS.md core principle); these ops record the actual parsed coordinates.
-
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -30,24 +5,16 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use jni::sys::jlong;
 
-/// Process-global slab of [`PathGeometry`], guarded by a [`Mutex`]. Initialized on first use.
 static PATHS: OnceLock<Mutex<Registry>> = OnceLock::new();
 
-/// A path-registry handle as it travels across JNI: a `jlong` packing the slot index (low 32 bits)
-/// and the slot's generation (high 32 bits). `0` is the reserved "no path" / null sentinel.
 pub type PathHandle = jlong;
 
-/// Errors from the path registry. Every fallible path returns one of these instead of panicking, so a
-/// stale/out-of-range/fabricated `jlong` from Java can never cause UB or unwind across JNI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathRegistryError {
-    /// The handle's slot index is outside the slab (fabricated handle, or the reserved `0`).
     OutOfRange,
-    /// The slot exists but its generation does not match: the handle refers to a freed (and possibly
-    /// reused) slot. Never aliases the new occupant.
+
     StaleHandle,
-    /// The registry mutex was poisoned by a panic in another holder. Surfaced as an error (not a
-    /// re-panic) so the JNI path stays panic-free (AGENTS.md §2.8).
+
     Poisoned,
 }
 
@@ -67,25 +34,20 @@ impl fmt::Display for PathRegistryError {
 
 impl std::error::Error for PathRegistryError {}
 
-/// A single path command, mirroring `android.graphics.Path` / Skia contour verbs. Each verb's point
-/// arguments are appended to [`PathGeometry::points`] in order; the verb names how many of those
-/// trailing points it consumes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Verb {
-    /// `Path.moveTo(x, y)` — start a new contour at the next 1 point.
     MoveTo,
-    /// `Path.lineTo(x, y)` — straight segment to the next 1 point.
+
     LineTo,
-    /// `Path.quadTo(cx, cy, x, y)` — quadratic Bézier through the next 2 points (control, end).
+
     QuadTo,
-    /// `Path.cubicTo(c1x, c1y, c2x, c2y, x, y)` — cubic Bézier through the next 3 points.
+
     CubicTo,
-    /// `Path.close()` — close the current contour back to its start. Consumes no points.
+
     Close,
 }
 
 impl Verb {
-    /// How many `(x, y)` points this verb consumes from the flat point buffer.
     pub const fn point_count(self) -> usize {
         match self {
             Self::MoveTo | Self::LineTo => 1,
@@ -96,66 +58,50 @@ impl Verb {
     }
 }
 
-/// The real vector geometry of one `android.graphics.Path` / `PathBuilder`.
-///
-/// 2026-06-05: an ordered [`Verb`] list plus a flat `(x, y)` point buffer (`points[2*i]` = x,
-/// `points[2*i+1]` = y). This is exactly the contour data `PathParser`/`Path.moveTo`… build; it is the
-/// resolution-independent source the rasterizer consumes. Default is an empty path.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PathGeometry {
-    /// Path commands in build order.
     pub verbs: Vec<Verb>,
-    /// Flat `[x0, y0, x1, y1, …]` point buffer; consumed by the verbs in order.
+
     pub points: Vec<f32>,
 }
 
 impl PathGeometry {
-    /// `Path.moveTo(x, y)`.
     pub fn move_to(&mut self, x: f32, y: f32) {
         self.verbs.push(Verb::MoveTo);
         self.points.push(x);
         self.points.push(y);
     }
 
-    /// `Path.lineTo(x, y)`.
     pub fn line_to(&mut self, x: f32, y: f32) {
         self.verbs.push(Verb::LineTo);
         self.points.push(x);
         self.points.push(y);
     }
 
-    /// `Path.quadTo(cx, cy, x, y)` (control point then end point).
     pub fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
         self.verbs.push(Verb::QuadTo);
         self.points.extend_from_slice(&[cx, cy, x, y]);
     }
 
-    /// `Path.cubicTo(c1x, c1y, c2x, c2y, x, y)` (two control points then end point).
-    #[allow(clippy::too_many_arguments)] // mirrors AOSP Path.cubicTo's 6 float args exactly.
+    #[allow(clippy::too_many_arguments)]
     pub fn cubic_to(&mut self, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
         self.verbs.push(Verb::CubicTo);
         self.points.extend_from_slice(&[c1x, c1y, c2x, c2y, x, y]);
     }
 
-    /// `Path.close()`.
     pub fn close(&mut self) {
         self.verbs.push(Verb::Close);
     }
 
-    /// `Path.reset()` / `Path.rewind()` — drop all geometry, keeping the allocation for reuse.
     pub fn reset(&mut self) {
         self.verbs.clear();
         self.points.clear();
     }
 
-    /// `true` iff this path has no contours (`Path.isEmpty()`).
     pub fn is_empty(&self) -> bool {
         self.verbs.is_empty()
     }
 
-    /// Axis-aligned bounds of all points (`Path.computeBounds`-style), as `(min_x, min_y, max_x,
-    /// max_y)`, or `None` for an empty path. Uses the raw control/anchor points (a conservative
-    /// superset of the true curve bounds — sufficient for sizing a raster target without overflow).
     pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
         let mut it = self.points.chunks_exact(2);
         let first = it.next()?;
@@ -171,32 +117,26 @@ impl PathGeometry {
     }
 }
 
-/// A generational slot: the current generation plus the optional occupant.
 struct Slot {
     generation: u32,
     geometry: Option<PathGeometry>,
 }
 
-/// The slab + free list (same shape as the sibling registries).
 #[derive(Default)]
 struct Registry {
     slots: Vec<Slot>,
     free: Vec<u32>,
 }
 
-/// Pack a slot index + generation into a `jlong` handle (generation high, index low).
 fn pack(index: u32, generation: u32) -> PathHandle {
     ((generation as u64) << 32 | index as u64) as i64
 }
 
-/// Unpack a `jlong` handle into (slot index, generation).
 fn unpack(handle: PathHandle) -> (u32, u32) {
     let bits = handle as u64;
     ((bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32)
 }
 
-/// Lock the process-global registry, mapping a poisoned mutex to the typed
-/// [`PathRegistryError::Poisoned`] (never a panic — AGENTS.md §2.8).
 fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, PathRegistryError> {
     PATHS
         .get_or_init(|| Mutex::new(Registry::default()))
@@ -204,9 +144,6 @@ fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, PathRegistryError>
         .map_err(|_: PoisonError<_>| PathRegistryError::Poisoned)
 }
 
-/// Allocate a fresh path slot holding `geometry` and return its packed [`PathHandle`] (`jlong`,
-/// generation ≥ 1, never the reserved `0`). Reuses a freed slot when available, else grows the slab.
-/// Returns [`PathRegistryError::Poisoned`] only on a poisoned mutex — never panics.
 pub fn allocate(geometry: PathGeometry) -> Result<PathHandle, PathRegistryError> {
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -226,9 +163,6 @@ pub fn allocate(geometry: PathGeometry) -> Result<PathHandle, PathRegistryError>
     Ok(pack(index, 1))
 }
 
-/// Read a clone of the [`PathGeometry`] a `handle` refers to. Bounds-checks the slot index **and**
-/// verifies the handle's generation, so a stale/out-of-range/fabricated handle returns `Err` and never
-/// dereferences out of bounds. Used by the rasterizer to snapshot a path's geometry.
 pub fn get(handle: PathHandle) -> Result<PathGeometry, PathRegistryError> {
     let (index, generation) = unpack(handle);
     let reg = lock()?;
@@ -242,10 +176,6 @@ pub fn get(handle: PathHandle) -> Result<PathGeometry, PathRegistryError> {
     slot.geometry.clone().ok_or(PathRegistryError::StaleHandle)
 }
 
-/// Look up the [`PathGeometry`] for a `handle` and run `f` against it (mutable) under the registry
-/// lock. Bounds-checks the slot index **and** verifies the handle's generation, so a stale/
-/// out-of-range/fabricated handle returns `Err` and never dereferences out of bounds or aliases a
-/// different path. The reserved `0` handle fails the check (live generations are ≥ 1).
 pub fn with_path<R>(
     handle: PathHandle,
     f: impl FnOnce(&mut PathGeometry) -> R,
@@ -266,9 +196,6 @@ pub fn with_path<R>(
     Ok(f(geometry))
 }
 
-/// Free the slot a `handle` refers to, bumping its generation so any other handle to it (or this one,
-/// reused later) is rejected as [`PathRegistryError::StaleHandle`]. Validates the handle the same way
-/// [`with_path`] does, so freeing an already-freed/stale/fabricated handle returns `Err`.
 pub fn free(handle: PathHandle) -> Result<(), PathRegistryError> {
     let (index, generation) = unpack(handle);
     let mut reg = lock()?;
@@ -280,7 +207,7 @@ pub fn free(handle: PathHandle) -> Result<(), PathRegistryError> {
         return Err(PathRegistryError::StaleHandle);
     }
     slot.geometry = None;
-    // Bump (saturating) so the freed handle and any copy become stale and can never alias a reuse.
+
     slot.generation = slot.generation.saturating_add(1);
     reg.free.push(index);
     Ok(())
@@ -289,9 +216,6 @@ pub fn free(handle: PathHandle) -> Result<(), PathRegistryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // 2026-06-05: soundness contract matches the sibling registries + the verb-buffer ops are exact.
-    // Fully in-harness (no VM, GPU-free).
 
     #[test]
     fn allocate_returns_distinct_nonzero_handles() {
@@ -326,7 +250,7 @@ mod tests {
                 Verb::Close
             ]
         );
-        // 1 + 1 + 2 + 3 points = 7 points = 14 floats; Close consumes none.
+
         assert_eq!(g.points.len(), 14);
         assert_eq!(&g.points[0..4], &[10.0, 20.0, 30.0, 40.0]);
         assert_eq!(&g.points[4..8], &[50.0, 60.0, 70.0, 80.0]);
@@ -336,8 +260,6 @@ mod tests {
 
     #[test]
     fn verb_point_counts_match_the_flat_buffer() {
-        // The sum of verb point-counts (×2 floats) must equal the buffer length — the invariant the
-        // rasterizer relies on to walk verbs against points without overrun.
         let mut g = PathGeometry::default();
         g.move_to(0.0, 0.0);
         g.cubic_to(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);

@@ -1,75 +1,3 @@
-//! Android framework backends + lifecycle driver (component-map E · 🟢 Rust native side).
-//!
-//! The `android.*` framework is reimplemented as Java-on-ART (`api-impl.jar`); this module
-//! is the **native (JNI) side** of those classes — the part ATL writes in C, we write in
-//! Rust via the `jni` crate. It also drives the launcher lifecycle from native: the JNI call
-//! sequence that takes a booted ART VM ([`runtime::boot`](crate::runtime::boot)) to Roblox's
-//! `Application.onCreate` and beyond.
-//!
-//! ## What this module implements *now* (M2)
-//! [`drive_application_lifecycle`] runs the **window-independent foundation** of the confirmed
-//! onCreate recipe (`docs/art-and-runtime.md` "onCreate JNI recipe (confirmed)"): it wraps the
-//! held VM with [`jni::vm::JavaVM::from_raw`], attaches the (already-attached) main thread via
-//! `attach_current_thread`, **binds Eclipse's own non-GTK backing for the two natives
-//! `android.content.Context`'s static initializer calls** (`native_get_apk_path` +
-//! `native_updateConfig`) via `RegisterNatives`, resolves the recipe's bootstrap classes
-//! ([`CONTEXT_CLASS`]/[`APPLICATION_CLASS`]) with `find_class` to prove the typed-`Env` bridge
-//! reaches the loaded `android.*` framework, and then **drives recipe steps 1–7** —
-//! `Context.createApplication(J)` → `ContentProvider.createContentProviders()` →
-//! `Application.onCreate()` → `Activity.createMainActivity(String, J, String)` →
-//! `Activity.onCreate(Bundle)` → `Activity.onStart()` → `Activity.onResume()` — driving the launcher
-//! Activity to the RESUMED (running/interactive) state for a pure-Java APK. The recipe steps are
-//! encoded as typed constants ([`STEP1_CREATE_APPLICATION`] … [`STEP7_ACTIVITY_ON_RESUME`]).
-//!
-//! ### The `jlong` handle passed to `createApplication(J)` (real, Eclipse-owned)
-//! 2026-06-05: step 1 now passes a **real Eclipse-owned window-registry handle** from
-//! [`window_registry::allocate`] — the design-confirmed contract (`docs/art-and-runtime.md`
-//! "Non-GTK Window/Surface backing — design"): the `jlong` is a generational-slab **registry
-//! index**, NOT `Box::into_raw` and NOT a raw pointer, so a stale/fabricated handle is a
-//! bounds+generation-checked `Err`, never UB. It is still safe for steps 1–3 because those are
-//! **pure Java** — they only *store* the `jlong native_window` in an `Application` field; they do
-//! **not** dereference it (`docs/art-and-runtime.md` "Tier A":
-//! `createApplication`/`createContentProviders`/`Application.onCreate` invoke no native that touches
-//! the handle). The handle is first dereferenced at step 4 (`Activity.createMainActivity` → the
-//! Window/View natives), which now reuse the **same** handle (one window per launch), so the slot is
-//! intentionally not freed during the run.
-//!
-//! ### Why bind those two natives (the non-GTK backing — confirmed)
-//! ATL's `api-impl.jar` declares `native_get_apk_path`/`native_updateConfig` and backs them in C
-//! against GTK/GDK (`libtranslation_layer_main.so`). Eclipse must NOT pull in GTK (it re-crowds
-//! the low_4gb window — AGENTS.md §5 Step 3.5), so it supplies its OWN Rust implementations and
-//! binds them by name via `RegisterNatives` (which takes precedence over the lazy symbol-name
-//! binding ATL relies on — JNI 1.1 spec). They are registered BEFORE `Context.<clinit>` can run
-//! (`find_class` loads/links but does not initialize the class), so the static initializer finds
-//! them already bound and GTK-free. Only these two are bound — they are the only natives the
-//! static initializer reaches for the pure-Java demo APK (`Context.java` `static { … }`).
-//!
-//! ## Steps 4–7 (driven against Eclipse-owned handles, 2026-06-05)
-//! Steps **4–7** — `Activity.createMainActivity(String, jlong, String)→Activity`,
-//! `Activity.onCreate(Bundle)`, then `Activity.onStart()` and `Activity.onResume()` (ATL's
-//! `activity_start`, no-arg instance calls on the step-4 object that drive the launcher Activity to
-//! the RESUMED state) — are now driven. The `jlong` is the **same Eclipse-owned
-//! [`window_registry`] handle** step 1 received; because Eclipse owns BOTH sides of the `jlong` (it
-//! supplies the non-GTK Window/View natives via `RegisterNatives`, which win over ATL's GTK
-//! symbol-name binding — JNI 1.1 spec), the handle never reaches a `GtkWidget*` cast. The
-//! handle-dereferencing Window/View natives the `setContentView` cascade reaches
-//! (`Window.set_*`, the `View`/`ViewGroup`/`FrameLayout`/`TextView` `native_constructor`/`native_*`)
-//! are bound minimal-and-sound against [`window_registry`]/[`view_registry`] — they record the
-//! view-tree shape (class names, text, child edges) with **no** GTK widget and **no** real
-//! layout/measure/draw; the ash/Vulkan surface + rendering is the deferred big build (AGENTS.md §5).
-//! Each such native is added as the dev-host run surfaces it (`No implementation found …`). See
-//! [`LifecycleProgress`].
-//!
-//! ## `unsafe`
-//! 2026-06-05: confined to the JNI FFI surface, each block carrying a `// SAFETY:` note —
-//! [`jni::vm::JavaVM::from_raw`] in [`drive_application_lifecycle`], the
-//! [`NativeMethod::from_raw_parts`]/`register_native_methods` calls that bind the two Context
-//! natives, and the [`FieldSignature::from_raw_parts`] pairing the `"I"` signature with
-//! `JavaType::Int`. The JNI work runs under `attach_current_thread`; the driver closure is wrapped
-//! in `std::panic::catch_unwind`, and each registered native body runs inside
-//! [`EnvUnowned::with_env`] (which `catch_unwind`-wraps it), so a Rust panic can never unwind into
-//! ART's C++ under the release `panic = "abort"` profile (AGENTS.md §2.8; CLAUDE.md).
-
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -104,71 +32,24 @@ pub mod view_registry;
 pub mod window_registry;
 pub mod xml_registry;
 
-/// Whether this ART build's `android.graphics.Canvas` supports Eclipse's draw cascade — i.e. its draw
-/// ops bind as the modern-AOSP `nDraw*` natives AND a `Canvas(long)` ctor exists. Set by
-/// [`register_canvas_natives`]: `true` if the `nDraw*` RegisterNatives succeeds, `false` if it throws
-/// (the Canvas is GskCanvas/Bitmap-backed on this build — section note at `register_canvas_natives`).
-/// [`drive_view_draw`] reads it to skip the cascade entirely when unsupported, so a missing
-/// `Canvas(long)` ctor isn't re-attempted (and re-logged) every frame. Starts `false`; the lifecycle
-/// driver always calls `register_canvas_natives` once before any frame, so it is set before the first
-/// cascade. Atomic (lock-free, no dep) — read once per frame on the main thread.
 static CANVAS_DRAW_SUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-// === Eclipse's own (non-GTK) backing for android.content.Context's static-init natives =========
-//
-// 2026-06-05: `android.content.Context`'s static initializer (ATL `api-impl/android/content/
-// Context.java` `static { … }`, lines 113–155) invokes exactly two native methods before the
-// launcher lifecycle begins — `native_updateConfig(Configuration)` (line 117) and
-// `native_get_apk_path()` (lines 121, 136). ATL backs these in C against GTK/GDK
-// (`api-impl-jni/content/android_content_Context.c`: `native_get_apk_path` returns
-// `NewStringUTF(apk_path)`; `native_updateConfig` sets `Configuration.screenWidthDp`/
-// `screenHeightDp` from `gdk_monitor_get_geometry`). Eclipse must NOT pull in GTK/GDK (it would
-// re-crowd the low_4gb window — AGENTS.md §5 Step 3.5), so we bind our OWN Rust backing for those
-// two symbols via `RegisterNatives` (which wins over name-based lazy binding — JNI 1.1 spec)
-// BEFORE the class is statically initialized. Only these two are bound; the other Context natives
-// (`nativeOpenFile`, `nativeExportUnifiedPush`, …) are NOT reached by static init for the pure-Java
-// demo APK and remain unbound (deferred).
-
-/// The real on-disk APK path `native_get_apk_path` returns. Stashed once by
-/// [`register_context_natives`] before the natives are registered (hence before
-/// `Context.<clinit>` can call them), then read by the native on the main thread.
-///
-/// 2026-06-05: a process-wide `OnceLock<String>` is the simplest sound carrier — the value is set
-/// once before any native call and only read afterward, and the lifecycle runs solely on the
-/// attached main thread, so there is no contention and no per-call allocation beyond the JNI
-/// string the JVM copies. `Env::new_string` takes `impl AsRef<str>`, so a `String` suffices.
 static APK_PATH: OnceLock<String> = OnceLock::new();
 
-/// Configuration screen dimensions Eclipse reports at `Context.<clinit>` (density-independent
-/// pixels). ATL reads these from the real monitor via GDK; Eclipse uses safe, non-zero defaults so
-/// the framework's `Resources`/`Configuration` are well-formed without querying GTK/GDK. 720p-class
-/// dp values are a neutral, widely-valid baseline; a real surface size can replace them once the
-/// window/Surface design (component-map F) lands.
 const DEFAULT_SCREEN_WIDTH_DP: i32 = 1280;
 const DEFAULT_SCREEN_HEIGHT_DP: i32 = 720;
 
-// JNI method names + descriptors for the two Context static-init natives, exactly as declared in
-// `Context.java` (2026-06-05): `private static native String native_get_apk_path();` and
-// `protected static native void native_updateConfig(Configuration config);`.
 const NATIVE_GET_APK_PATH_NAME: &JNIStr = jni_str!("native_get_apk_path");
 const NATIVE_GET_APK_PATH_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
 const NATIVE_UPDATE_CONFIG_NAME: &JNIStr = jni_str!("native_updateConfig");
 const NATIVE_UPDATE_CONFIG_SIG: &JNIStr = jni_str!("(Landroid/content/res/Configuration;)V");
 
-/// `Context.native_get_apk_path()` → the real APK path as a `java.lang.String`.
-///
-/// JNI ABI: a `static` native, so the second argument is the `JClass`. The body runs inside
-/// [`EnvUnowned::with_env`], which wraps it in `catch_unwind` internally so a Rust panic can never
-/// unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns a neutral default (a null `JString`) on any error/panic rather than propagating.
 extern "system" fn native_get_apk_path<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        // Stashed by register_context_natives before this native could be called. Absent ⇒ a logic
-        // error (registration without a path); surface it as a JNI error, not a panic/unwrap.
         let path = APK_PATH
             .get()
             .ok_or(jni::errors::Error::JniCall(jni::errors::JniError::Unknown))?;
@@ -177,25 +58,12 @@ extern "system" fn native_get_apk_path<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Context.native_updateConfig(Configuration)` → set `screenWidthDp`/`screenHeightDp` to safe,
-/// GTK-free defaults.
-///
-/// JNI ABI: a `static` native taking one object argument, so the parameters are
-/// `(EnvUnowned, JClass, JObject config)`. Sets the two `int` fields ATL's GDK-backed version sets,
-/// but with fixed defaults — Eclipse must NOT query GDK/GTK (AGENTS.md §5 Step 3.5). The body is
-/// `catch_unwind`-guarded by `with_env`; `resolve::<LogErrorAndDefault>` returns the `()` default on
-/// error/panic. `()` is the correct neutral value for this `void` native.
 extern "system" fn native_update_config<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     config: JObject<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        // SAFETY: "screenWidthDp"/"screenHeightDp" are `public int` fields of
-        // android.content.res.Configuration (ATL `api-impl/android/content/res/Configuration.java`
-        // lines 600/615), so the "I" signature paired with JavaType::Int is consistent — exactly
-        // FieldSignature::from_raw_parts' invariant. `set_field` additionally re-checks the value
-        // type against the field at runtime, so a mismatch returns a typed error, never UB.
         let int_sig =
             unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
         env.set_field(
@@ -215,36 +83,17 @@ extern "system" fn native_update_config<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-// Field names + the primitive-int signature used by native_update_config.
 const SCREEN_WIDTH_DP_FIELD: &JNIStr = jni_str!("screenWidthDp");
 const SCREEN_HEIGHT_DP_FIELD: &JNIStr = jni_str!("screenHeightDp");
 const INT_SIG: &JNIStr = jni_str!("I");
-/// JNI field descriptor for a `java.lang.CharSequence` field (the `TypedValue.string` field that
-/// `loadResourceValue` sets to a resolved pooled string).
+
 const CHAR_SEQUENCE_SIG: &JNIStr = jni_str!("Ljava/lang/CharSequence;");
 
-/// Bind Eclipse's own (non-GTK) backing for `android.content.Context`'s two static-init natives.
-///
-/// Stashes the real `apk_path` for [`native_get_apk_path`], then locates `android/content/Context`
-/// and registers both natives via `RegisterNatives`. MUST be called BEFORE anything triggers the
-/// class's static initializer (`<clinit>`) — `find_class` loads and links the class but does not
-/// initialize it (JNI spec: `<clinit>` runs on first active use), so registering here means the two
-/// natives are already bound when `<clinit>` later calls them.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointers must match the declared JNI
-/// signatures. They do, by construction — [`native_get_apk_path`]/[`native_update_config`] are
-/// written to the exact `()Ljava/lang/String;` / `(Landroid/content/res/Configuration;)V`
-/// descriptors. Each native body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust
-/// panic can cross the JNI boundary (AGENTS.md §2.8).
 fn register_context_natives(env: &mut Env, apk_path: &str) -> Result<(), FrameworkError> {
-    // Set-once; a second call (only one boot per process) keeps the first value — harmless.
     let _ = APK_PATH.set(apk_path.to_owned());
 
     let class = env.find_class(CONTEXT_CLASS)?;
     let methods = [
-        // SAFETY: each fn matches the paired signature (see the natives' docs); casting the
-        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 NATIVE_GET_APK_PATH_NAME,
@@ -252,7 +101,6 @@ fn register_context_natives(env: &mut Env, apk_path: &str) -> Result<(), Framewo
                 native_get_apk_path as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: as above for native_update_config / native_updateConfig.
         unsafe {
             NativeMethod::from_raw_parts(
                 NATIVE_UPDATE_CONFIG_NAME,
@@ -261,8 +109,7 @@ fn register_context_natives(env: &mut Env, apk_path: &str) -> Result<(), Framewo
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/content/Context; `methods` hold valid fn pointers whose
-    // signatures match the class's `native` declarations (verified against Context.java, 2026-06-05).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/Context",
@@ -271,30 +118,11 @@ fn register_context_natives(env: &mut Env, apk_path: &str) -> Result<(), Framewo
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.util.Log.println_native ========================
-//
-// 2026-06-05: `android.util.Log` (ATL `api-impl/android/util/Log.java`) routes every log call
-// (`v`/`d`/`i`/`w`/`e`/`println`/`wtf`) through the single native
-// `static native int println_native(int bufID, int priority, String tag, String msg)` (line 367).
-// ATL backs it in C (`api-impl-jni/android_util_Log.c`): it null-checks `msg` (→ -1), range-checks
-// `bufID` against `LOG_ID_MAX` (= 4: LOG_ID_MAIN..LOG_ID_SYSTEM, util.h:23-30) (→ -1), then forwards
-// to `__android_log_buf_write(bufID, priority, tag, msg)` (liblog) and returns its byte count. That
-// path is GTK-free — it only writes to the Android log buffer (host: stderr/logcat). Eclipse's
-// GTK-free equivalent forwards the `[tag] msg` to the `tracing` log (the `diagnostics` module) at the
-// priority-mapped level and returns the message byte count, matching `Log.println`'s documented
-// "number of bytes written" contract without pulling liblog or GTK.
-
-/// `android.util.Log` (internal/slashed name for `find_class`) — hosts the single `println_native`.
 pub const LOG_CLASS: &JNIStr = jni_str!("android/util/Log");
 
-// JNI name + descriptor for the one Log native, exactly as declared in `Log.java` (2026-06-05):
-// `public static native int println_native(int bufID, int priority, String tag, String msg);`.
 const PRINTLN_NATIVE_NAME: &JNIStr = jni_str!("println_native");
 const PRINTLN_NATIVE_SIG: &JNIStr = jni_str!("(IILjava/lang/String;Ljava/lang/String;)I");
 
-/// `android.util.Log`'s priority constants (`Log.java` lines 56-81): the `priority` arg's meaning.
-/// Used only to map to a `tracing` level for the GTK-free forward; an unknown value falls through to
-/// a default level (never an error — ATL does not validate `priority`).
 const LOG_PRIORITY_VERBOSE: jint = 2;
 const LOG_PRIORITY_DEBUG: jint = 3;
 const LOG_PRIORITY_INFO: jint = 4;
@@ -302,23 +130,8 @@ const LOG_PRIORITY_WARN: jint = 5;
 const LOG_PRIORITY_ERROR: jint = 6;
 const LOG_PRIORITY_ASSERT: jint = 7;
 
-/// Number of Android log buffer IDs (`LOG_ID_MAIN`=0 … `LOG_ID_SYSTEM`=3, then `LOG_ID_MAX`), from
-/// ATL `util.h` (`log_id_t`). `bufID` outside `0..LOG_ID_MAX` is rejected with `-1`, mirroring
-/// `android_util_Log.c`'s `bufID < 0 || bufID >= LOG_ID_MAX` guard.
 const LOG_ID_MAX: jint = 4;
 
-/// `Log.println_native(int bufID, int priority, String tag, String msg)` → bytes written.
-///
-/// Mirrors ATL's `android_util_Log.c` observable behavior, GTK-free: returns `-1` if `msg` is null
-/// or `bufID` is out of `0..LOG_ID_MAX`; otherwise forwards `[tag] msg` to `tracing` at the
-/// priority-mapped level and returns the message's byte length (ATL returns
-/// `__android_log_buf_write`'s byte count, which `Log.println` documents as "number of bytes
-/// written").
-///
-/// JNI ABI: a `static` native, so the second argument is the `JClass`. The body runs inside
-/// [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can never unwind into
-/// ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>` returns the
-/// `jint` default (`0`) on any error/panic — a sound neutral byte count.
 extern "system" fn println_native<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -328,16 +141,14 @@ extern "system" fn println_native<'local>(
     msg: JString<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<jint> {
-        // ATL: `if (msgObj == NULL) return -1;` — a null message is a caller error, not logged.
         if msg.is_null() {
             return Ok(-1);
         }
-        // ATL: `if (bufID < 0 || bufID >= LOG_ID_MAX) return -1;`.
+
         if !(0..LOG_ID_MAX).contains(&buf_id) {
             return Ok(-1);
         }
 
-        // ATL reads `tag` only if non-null (GetStringUTFChars else NULL); mirror that.
         let tag_str = if tag.is_null() {
             None
         } else {
@@ -345,9 +156,6 @@ extern "system" fn println_native<'local>(
         };
         let msg_str = msg.try_to_string(env)?;
 
-        // GTK-free forward: route to `tracing` at the priority-mapped level (the diagnostics module),
-        // the host equivalent of ATL's `__android_log_buf_write` → log buffer/stderr. `target` carries
-        // the Android tag so existing `RUST_LOG`/EnvFilter setups can filter on it.
         let tag_ref = tag_str.as_deref().unwrap_or("");
         match priority {
             LOG_PRIORITY_VERBOSE => {
@@ -365,46 +173,25 @@ extern "system" fn println_native<'local>(
             LOG_PRIORITY_ERROR | LOG_PRIORITY_ASSERT => {
                 tracing::error!(target: "android.util.Log", tag = tag_ref, "{msg_str}")
             }
-            // ATL does not validate `priority`; an unknown value still logs. Use info as the neutral
-            // default rather than dropping the message.
+
             _ => tracing::info!(target: "android.util.Log", tag = tag_ref, priority, "{msg_str}"),
         }
 
-        // ATL returns `__android_log_buf_write`'s byte count; report the message byte length, which
-        // `Log.println` documents as the return value. `jint` is i32; a message longer than i32::MAX
-        // bytes cannot occur in practice, but saturate to stay total (no overflow panic).
         Ok(jint::try_from(msg_str.len()).unwrap_or(jint::MAX))
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.util.Log`'s `println_native`.
-///
-/// Locates `android/util/Log` and registers the native via `RegisterNatives` (which wins over
-/// name-based lazy binding — JNI 1.1 spec), so ATL's liblog-backed C symbol is not used. Like
-/// [`register_context_natives`], this MUST run before anything triggers `Log`'s first active use;
-/// it is registered before the lifecycle drive (ART resolves natives lazily during the lifecycle).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
-/// signature. It does, by construction — [`println_native`] is written to the exact
-/// `(IILjava/lang/String;Ljava/lang/String;)I` descriptor. The native body is `catch_unwind`-guarded
-/// via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
 fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(LOG_CLASS)?;
-    let methods = [
-        // SAFETY: `println_native` matches the paired signature (see the native's docs); casting the
-        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PRINTLN_NATIVE_NAME,
-                PRINTLN_NATIVE_SIG,
-                println_native as *mut std::ffi::c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded android/util/Log; `methods` holds a valid fn pointer whose
-    // signature matches the class's `native` declaration (verified against Log.java, 2026-06-05).
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            PRINTLN_NATIVE_NAME,
+            PRINTLN_NATIVE_SIG,
+            println_native as *mut std::ffi::c_void,
+        )
+    }];
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/util/Log",
@@ -413,22 +200,8 @@ fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.net.ConnectivityManager =========================
-//
-// 2026-06-11: ATL's `ConnectivityManager` (api-impl/android/net/ConnectivityManager.java) declares THREE
-// `native` methods backed by ATL's GTK lib (`libtranslation_layer_main.so`), which Eclipse does NOT load:
-// `registerNetworkCallback(NetworkRequest, NetworkCallback)`, `isActiveNetworkMetered()`, and
-// `nativeGetNetworkAvailable()`. Roblox's `com.birbit.android.jobqueue` connectivity monitor calls
-// `registerNetworkCallback` in `ActivitySplash.onCreate` (step 5), surfacing `UnsatisfiedLinkError`. Like
-// the Context/Log/View natives, Eclipse binds its OWN GTK-free backing via `RegisterNatives` — durable
-// (compiled into the binary, so it works without the framework-jar overlay). The host desktop network is
-// treated as available + unmetered, and Eclipse delivers no connectivity callbacks (a sound no-op: Roblox
-// degrades gracefully without connectivity-change events).
-
-/// `android.net.ConnectivityManager` (internal/slashed name for `find_class`).
 pub const CONNECTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/net/ConnectivityManager");
 
-// JNI names + descriptors, exactly as declared in ATL's ConnectivityManager.java (2026-06-11).
 const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("registerNetworkCallback");
 const CM_REGISTER_NETWORK_CALLBACK_SIG: &JNIStr =
     jni_str!("(Landroid/net/NetworkRequest;Landroid/net/ConnectivityManager$NetworkCallback;)V");
@@ -437,9 +210,6 @@ const CM_IS_ACTIVE_NETWORK_METERED_SIG: &JNIStr = jni_str!("()Z");
 const CM_NATIVE_GET_NETWORK_AVAILABLE_NAME: &JNIStr = jni_str!("nativeGetNetworkAvailable");
 const CM_NATIVE_GET_NETWORK_AVAILABLE_SIG: &JNIStr = jni_str!("()Z");
 
-/// `ConnectivityManager.registerNetworkCallback(NetworkRequest, NetworkCallback)` — no-op. Eclipse does
-/// not deliver connectivity-change callbacks; Roblox's network monitor degrades gracefully without them.
-/// Instance native (second arg is the `this` `JObject`). `with_env` `catch_unwind`-guards the body.
 extern "system" fn cm_register_network_callback<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -450,41 +220,25 @@ extern "system" fn cm_register_network_callback<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `ConnectivityManager.isActiveNetworkMetered()` → `false` (the host desktop network is unmetered).
 extern "system" fn cm_is_active_network_metered<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
 ) -> jboolean {
-    // jni 0.22 maps `jboolean` to Rust `bool`. The desktop host network is treated as unmetered.
     env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(false) })
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `ConnectivityManager.nativeGetNetworkAvailable()` → `true` (the host desktop network is available).
 extern "system" fn cm_native_get_network_available<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
 ) -> jboolean {
-    // jni 0.22 maps `jboolean` to Rust `bool`. The desktop host network is treated as available.
     env.with_env(|_env| -> jni::errors::Result<jboolean> { Ok(true) })
         .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.net.ConnectivityManager`'s three `native` methods.
-///
-/// Locates `android/net/ConnectivityManager` and registers the natives via `RegisterNatives` (which wins
-/// over ATL's GTK-lib symbol binding — JNI 1.1 spec). Like [`register_log_natives`], it runs before the
-/// lifecycle drive so the natives are bound before `ActivitySplash.onCreate`'s connectivity-monitor call.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature. They do,
-/// by construction (the descriptors are taken verbatim from ATL's `ConnectivityManager.java`). Each body
-/// is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary.
 fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(CONNECTIVITY_MANAGER_CLASS)?;
     let methods = [
-        // SAFETY: each fn matches its paired signature (verbatim from ConnectivityManager.java); casting
-        // the `extern "system"` fn to `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 CM_REGISTER_NETWORK_CALLBACK_NAME,
@@ -507,8 +261,7 @@ fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/net/ConnectivityManager; `methods` hold valid fn pointers
-    // whose signatures match the class's `native` declarations (verified against ConnectivityManager.java).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/net/ConnectivityManager",
@@ -517,197 +270,52 @@ fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.content.res.AssetManager.init ==================
-//
-// 2026-06-05: `android.content.res.AssetManager`'s constructors (ATL `api-impl/android/content/res/
-// AssetManager.java`) call `init(android.os.Build.VERSION.RESOURCES_SDK_INT)` as the first native
-// before any asset path is set (lines 112, 160); the declaration is
-// `private native final void init(int sdk_version);` (line 779) — an INSTANCE native, JNI signature
-// `(I)V`, exactly the signature ART reported missing. In AOSP/ATL, `init` creates the native
-// asset-manager object and stores its handle in the `private long mObject` field
-// ("For communication with native code." — line 87); subsequent natives (`native_setApkAssets`,
-// `addAssetPathNative`, the `openAsset*`/resource lookups) consume `mObject`. ATL backs all of these
-// in C against its own asset/zip machinery; Eclipse must NOT pull in that GTK-coupled native layer.
-//
-// MINIMAL STUB (to be refined when its behavior actually matters): Eclipse's `init` is a GTK-free
-// no-op. `mObject` is left at its Java zero-init `0` — the AssetManager exists but holds no native
-// asset table yet. This is sound, not behavior-faking: it lets `<init>` proceed past `init` so the
-// re-run empirically reveals the NEXT native the constructor reaches (`native_setApkAssets(Object[],
-// int)`, the first to touch `mObject`), which is the diagnostic discovery loop. When real asset
-// access is needed, this native gains an Eclipse-owned asset-table handle (mirroring the
-// window_registry pattern) stored back into `mObject` and the path/read natives are bound against it.
-
-/// `android.content.res.AssetManager` (internal/slashed name for `find_class`) — hosts the `init`
-/// native the constructor calls before setting any asset paths.
 pub const ASSET_MANAGER_CLASS: &JNIStr = jni_str!("android/content/res/AssetManager");
 
-// JNI name + descriptor for AssetManager's init native, exactly as declared in `AssetManager.java`
-// (2026-06-05, line 779): `private native final void init(int sdk_version);`.
 const ASSET_MANAGER_INIT_NAME: &JNIStr = jni_str!("init");
 const ASSET_MANAGER_INIT_SIG: &JNIStr = jni_str!("(I)V");
 
-// 2026-06-05: AssetManager is a DENYLISTED class (its native does asset/mmap/zip/parsing work), so
-// this native is bound SIGNATURE-ONLY from the exact JNI signature ART reported missing
-// (`No implementation found for void android.content.res.AssetManager.native_setApkAssets(
-// java.lang.Object[], int)`), WITHOUT reading the class's Java or api-impl-jni C source. JNI
-// descriptor `([Ljava/lang/Object;I)V` — an INSTANCE native (the receiver `this`, then an
-// `Object[]` of ApkAssets, then an `int`). DISCOVERY-LOOP STUB: a sound GTK-free no-op so the
-// constructor proceeds past it and the re-run reveals the NEXT native; to be refined once Eclipse
-// has its own asset-table handle. `mObject` stays at its Java zero-init `0` (no native asset table
-// is installed) — sound, not behavior-faking.
 const ASSET_MANAGER_SET_APK_ASSETS_NAME: &JNIStr = jni_str!("native_setApkAssets");
 const ASSET_MANAGER_SET_APK_ASSETS_SIG: &JNIStr = jni_str!("([Ljava/lang/Object;I)V");
 
-// 2026-06-05: AssetManager is DENYLISTED, so this native is bound SIGNATURE-ONLY from the exact JNI
-// signature ART reported missing (`No implementation found for void
-// android.content.res.AssetManager.setConfiguration(int, int, java.lang.String, int ×14)`; mangled
-// `...setConfiguration__IILjava_lang_String_2IIIIIIIIIIIIII`), WITHOUT reading the class's source.
-// JNI descriptor `(IILjava/lang/String;IIIIIIIIIIIIII)V` — an INSTANCE native: 2 ints, a String,
-// then 14 ints (configuration parameters: mcc/mnc/locale/orientation/density/etc., consumed by the
-// asset/resource table). DISCOVERY-LOOP STUB: a sound GTK-free no-op so the constructor proceeds and
-// the re-run reveals the NEXT native; refine once Eclipse has its own asset-table handle.
 const ASSET_MANAGER_SET_CONFIGURATION_NAME: &JNIStr = jni_str!("setConfiguration");
 const ASSET_MANAGER_SET_CONFIGURATION_SIG: &JNIStr =
     jni_str!("(IILjava/lang/String;IIIIIIIIIIIIII)V");
 
-// 2026-06-05: `openXmlAssetNative(int cookie, String fileName)` is the native AOSP's
-// `AssetManager.openXmlBlockAsset` calls to parse a binary-XML asset into a native tree and return a
-// `long` handle (the framework wraps it as an `XmlBlock`/`XmlResourceParser`). The JNI signature ART
-// reported missing was `(ILjava/lang/String;)J` (`No implementation found for long
-// android.content.res.AssetManager.openXmlAssetNative(int, java.lang.String)`). The earlier no-op
-// `0` return made `openXmlBlockAsset` throw `FileNotFoundException: Asset XML file:
-// AndroidManifest.xml` (run log 2026-06-05), stalling `Context.<clinit>`. This is now a REAL
-// Eclipse-owned backing (NOT ATL's C asset layer, NOT GTK): it reads `fileName` from the APK zip via
-// the `apk` crate, parses it with the `axml` reader into an [`crate::apk::axml::XmlDocument`], stores
-// it in the Eclipse-owned [`xml_registry`] generational slab, and returns the slab handle (≥ 1, never
-// the reserved `0`). A genuine open failure (missing entry / parse error) returns `0`, which is the
-// correct trigger for the framework's `FileNotFoundException` — not a fake success.
 const ASSET_MANAGER_OPEN_XML_ASSET_NAME: &JNIStr = jni_str!("openXmlAssetNative");
 const ASSET_MANAGER_OPEN_XML_ASSET_SIG: &JNIStr = jni_str!("(ILjava/lang/String;)J");
 
-// 2026-06-05: `retrieveAttributes` is the styled-attribute path AOSP's `TypedArray` drives when the
-// framework resolves a tag's framework attributes against `resources.arsc`. AssetManager is
-// DENYLISTED, so this native is bound from the exact JNI signature ART reported missing
-// (`No implementation found for boolean android.content.res.AssetManager.retrieveAttributes(long,
-// int[], int, long, long)`, mangled `...retrieveAttributes__J_3IIJJ`, run log 2026-06-05) WITHOUT
-// reading the class's Java or api-impl-jni C source. JNI descriptor `(J[IIJJ)Z` — an INSTANCE native
-// whose args are `(long parseStateHandle, int[] attrs, int <parser/length>, long outValues, long
-// outIndices)` returning a boolean (whether any non-default styled value was set). `outValues` and
-// `outIndices` are raw pointers to native off-heap `int[]` buffers the framework's `TypedArray`
-// allocated and sized; Eclipse fills them per the PUBLIC AOSP `TypedArray` ABI (see
-// `retrieve_attributes` for the grounded layout). This is the genuine next asset subsystem
-// (ARSC + the TypedArray ABI), not one more easy native.
 const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_NAME: &JNIStr = jni_str!("retrieveAttributes");
 const ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG: &JNIStr = jni_str!("(J[IIJJ)Z");
 
-// 2026-06-05: `newTheme()` is the native AOSP's `Resources.newTheme()`/`AssetManager.createTheme()`
-// calls to create a native theme object and return its `long` handle (the framework wraps it as a
-// `Resources$Theme`; later `applyStyle`/`resolveAttributes`/`releaseTheme` consume the handle).
-// Surfaced by the dev-host run during step 4 (`View.<init>` → `Context.obtainStyledAttributes` →
-// `getTheme` → `Resources.newTheme` → `AssetManager.newTheme()`). AssetManager is DENYLISTED, so this
-// is bound from the exact JNI signature ART reported missing (`No implementation found for long
-// android.content.res.AssetManager.newTheme()`, run log 2026-06-05) WITHOUT reading the class's
-// source. JNI descriptor `()J` — an INSTANCE native returning the theme handle. Backed non-GTK by the
-// Eclipse-owned [`theme_registry`] (a generational-slab index, NOT a raw pointer — a stale/fabricated
-// theme handle from a later native is a bounds+generation-checked `Err`, never UB).
 const ASSET_MANAGER_NEW_THEME_NAME: &JNIStr = jni_str!("newTheme");
 const ASSET_MANAGER_NEW_THEME_SIG: &JNIStr = jni_str!("()J");
 
-// 2026-06-05: `applyThemeStyle(long theme, int styleRes, boolean force)` is the native AOSP's
-// `Resources$Theme.applyStyle` calls to merge a style resource into a theme. Surfaced by the dev-host
-// run during step 4 (`View.<init>` → `obtainStyledAttributes` → `getTheme` → `Theme.applyStyle` →
-// `AssetManager.applyThemeStyle`). AssetManager is DENYLISTED, so this is bound from the exact JNI
-// signature ART reported missing (`No implementation found for void
-// android.content.res.AssetManager.applyThemeStyle(long, int, boolean)`, mangled `...__JIZ`, run log
-// 2026-06-05) WITHOUT reading the class's source. JNI descriptor `(JIZ)V` — an INSTANCE native
-// (theme handle, style resource id, force flag). Records the applied style id on the
-// [`theme_registry`] theme (bounds+generation-checked — a bad theme handle is a typed Err, never UB);
-// no real style resolution yet (the View cascade only needs the call to succeed).
 const ASSET_MANAGER_APPLY_THEME_STYLE_NAME: &JNIStr = jni_str!("applyThemeStyle");
 const ASSET_MANAGER_APPLY_THEME_STYLE_SIG: &JNIStr = jni_str!("(JIZ)V");
 
-// 2026-06-05: `copyTheme(long dest, long source)` is the native AOSP's `Resources$Theme.setTo` calls
-// to copy one theme's state into another. Surfaced by the dev-host run during step 4
-// (`Theme.setTo` → `AssetManager.copyTheme`). AssetManager is DENYLISTED, so this is bound from the
-// exact JNI signature ART reported missing (`No implementation found for void
-// android.content.res.AssetManager.copyTheme(long, long)`, mangled `...__JJ`, run log 2026-06-05)
-// WITHOUT reading the class's source. JNI descriptor `(JJ)V` — an INSTANCE native (dest handle,
-// source handle). Copies the source [`theme_registry`] theme's recorded styles into the dest theme
-// (both bounds+generation-checked — a bad handle is a typed Err, never UB).
 const ASSET_MANAGER_COPY_THEME_NAME: &JNIStr = jni_str!("copyTheme");
 const ASSET_MANAGER_COPY_THEME_SIG: &JNIStr = jni_str!("(JJ)V");
 
-// 2026-06-05: `applyStyle(long theme, long parser, int defStyleAttr, int defStyleRes, int[] attrs,
-// int length, long outValues, long outIndices)` is the THEME styled-attribute path AOSP's
-// `Resources$Theme.obtainStyledAttributes` drives (the theme-resolved counterpart of the XML-driven
-// `retrieveAttributes`). Surfaced by the dev-host run during step 4 (`View.<init>` →
-// `Context.obtainStyledAttributes` → `Theme.obtainStyledAttributes` → `AssetManager.applyStyle`).
-// AssetManager is DENYLISTED, so this is bound from the exact JNI signature ART reported missing
-// (`No implementation found for void android.content.res.AssetManager.applyStyle(long, long, int,
-// int, int[], int, long, long)`, mangled `...__JJII_3IIJJ`, run log 2026-06-05) WITHOUT reading the
-// class's source. JNI descriptor `(JJII[IIJJ)V` — an INSTANCE native; `outValues`/`outIndices` are
-// the same framework-allocated `TypedArray` off-heap buffers `retrieveAttributes` fills. A fresh
-// View carries no theme-resolved style values yet, so Eclipse writes `TYPE_NULL` for every requested
-// attribute (the View then uses its built-in defaults — sound AOSP fallback, NOT a value fake) and
-// `outIndices[0] = 0`. Reuses the bounds-proven `fill_typed_array` writer.
 const ASSET_MANAGER_APPLY_STYLE_NAME: &JNIStr = jni_str!("applyStyle");
 const ASSET_MANAGER_APPLY_STYLE_SIG: &JNIStr = jni_str!("(JJII[IIJJ)V");
 
-// 2026-06-05: `getResourceName(int resid)` is the native AOSP's `Resources.getResourceName` calls to
-// turn a packed resource id into its full `package:type/entry` name. Surfaced by the dev-host run
-// during step 5 (`MainActivity.onCreate` → `setContentView` → `LayoutInflater.inflate` →
-// `Resources.getResourceName`). AssetManager is DENYLISTED, so this is bound from the exact JNI
-// signature ART reported missing (`No implementation found for java.lang.String
-// android.content.res.AssetManager.getResourceName(int)`, mangled `...__I`, run log 2026-06-05)
-// WITHOUT reading the class's source. JNI descriptor `(I)Ljava/lang/String;` — an INSTANCE native.
-// Backed by Eclipse's own [`apk::arsc`](crate::apk::arsc) `resources.arsc` reader: resolves the id's
-// package/type/entry names and returns `package:type/entry`. Returns null for an unresolvable id
-// (the framework then throws `NotFoundException` — the correct, non-faked outcome).
 const ASSET_MANAGER_GET_RESOURCE_NAME_NAME: &JNIStr = jni_str!("getResourceName");
 const ASSET_MANAGER_GET_RESOURCE_NAME_SIG: &JNIStr = jni_str!("(I)Ljava/lang/String;");
 
-// 2026-06-11: `getResourcePackageName(int resid)` is the native AOSP's `Resources.getResourcePackageName`
-// calls to turn a packed resource id into JUST its package name (the `package` of `package:type/entry`).
-// Surfaced by the real Roblox run during `FirebaseInitProvider.onCreate` (→ `Resources.
-// getResourcePackageName`). Bound from the exact JNI signature ART reported missing (`No implementation
-// found for java.lang.String android.content.res.AssetManager.getResourcePackageName(int)`, mangled
-// `...__I`, run log 2026-06-11) — an INSTANCE native, descriptor `(I)Ljava/lang/String;`. Backed by the
-// same `apk::arsc` reader as `getResourceName`: returns the id's package name (`arsc::package_name` of
-// the id's high-byte package), or null for an unresolvable id (→ `NotFoundException`, the non-faked outcome).
 const ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_NAME: &JNIStr = jni_str!("getResourcePackageName");
 const ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_SIG: &JNIStr = jni_str!("(I)Ljava/lang/String;");
 
-// 2026-06-11: `getResourceIdentifier(String name, String defType, String defPackage)` is the REVERSE
-// of `getResourceName` — AOSP's `Resources.getIdentifier` calls it to turn a resource NAME into its
-// packed id (0 if absent). Surfaced by the real Roblox run during `FirebaseInitProvider.onCreate`.
-// Bound from the exact JNI signature ART reported missing (`No implementation found for int
-// android.content.res.AssetManager.getResourceIdentifier(java.lang.String, java.lang.String,
-// java.lang.String)`, run log 2026-06-11), descriptor `(Ljava/lang/String;Ljava/lang/String;
-// Ljava/lang/String;)I`, an INSTANCE native. Backed by the `apk::arsc` reverse lookup
-// ([`arsc::ResTable::find_resource_id`]); returns 0 for an unknown name (AOSP's "not found").
 const ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_NAME: &JNIStr = jni_str!("getResourceIdentifier");
 const ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_SIG: &JNIStr =
     jni_str!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I");
 
-// 2026-06-11: the asset-STREAM natives behind `AssetManager.open(fileName)` → an `AssetInputStream`.
-// `openAsset(String,int)` (confirmed from the ART `No implementation found … openAsset(java.lang.
-// String, int)` line, run log 2026-06-11, returns `long`) opens an asset and returns a handle; the
-// read cycle (`readAsset`/`readAssetChar`/`seekAsset`/`getAssetLength`/`getAssetRemainingLength`/
-// `destroyAsset`) operates on it. Bound non-GTK against Eclipse's own [`asset_registry`] (jlong =
-// slab index, never a raw pointer) + the `src/apk` reader (reads `assets/<fileName>`). The
-// signatures are registered best-effort ([`register_asset_stream_natives`]) so a sig drift on the
-// read cycle is logged + discovered, never breaking the main AssetManager natives.
-// 2026-07-02: the RETURN CONTRACTS are ATL's, not AOSP's — readAsset returns 0 at EOF (negative
-// throws Java IOException; see [`atl_read_asset_return`]) and seekAsset's whence is the AOSP Java
-// convention (<0 SET / 0 CUR / >0 END; see [`atl_seek_whence_to_lseek`]).
 const ASSET_MANAGER_OPEN_ASSET_NAME: &JNIStr = jni_str!("openAsset");
 const ASSET_MANAGER_OPEN_ASSET_SIG: &JNIStr = jni_str!("(Ljava/lang/String;I)J");
 const ASSET_MANAGER_READ_ASSET_NAME: &JNIStr = jni_str!("readAsset");
-// ATL's readAsset takes the off/len as `long` (run log 2026-06-11: vtable shows
-// `readAsset(long, byte[], long, long)`, mangled `__J_3BJJ`), NOT the classic AOSP `(J[BII)I`.
+
 const ASSET_MANAGER_READ_ASSET_SIG: &JNIStr = jni_str!("(J[BJJ)I");
-// 2026-07-02: readAssetChar(J)I — the single-byte AssetInputStream.read() native (vendored
-// AssetManager.java line 685); unbound it was a call-time UnsatisfiedLinkError.
+
 const ASSET_MANAGER_READ_ASSET_CHAR_NAME: &JNIStr = jni_str!("readAssetChar");
 const ASSET_MANAGER_READ_ASSET_CHAR_SIG: &JNIStr = jni_str!("(J)I");
 const ASSET_MANAGER_SEEK_ASSET_NAME: &JNIStr = jni_str!("seekAsset");
@@ -718,151 +326,52 @@ const ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_NAME: &JNIStr = jni_str!("getAsse
 const ASSET_MANAGER_GET_ASSET_REMAINING_LENGTH_SIG: &JNIStr = jni_str!("(J)J");
 const ASSET_MANAGER_DESTROY_ASSET_NAME: &JNIStr = jni_str!("destroyAsset");
 const ASSET_MANAGER_DESTROY_ASSET_SIG: &JNIStr = jni_str!("(J)V");
-// 2026-06-12: `openAssetFd(String, int, long[], long[])` → an OWNED raw fd on the APK file (the
-// out-arrays receive [0] = data offset / [0] = length), or a NEGATIVE value → the Java side throws
-// the designed FileNotFoundException (`openFd_internal`). Declared `(Ljava/lang/String;I[J[J)I`
-// (artifact classes2.dex, flags 0x112) and tripped by androidx.profileinstaller reading
-// `dexopt/baseline.prof` on a worker thread — unbound, the UnsatisfiedLinkError (an Error, not the
-// caught IOException) hit the vendored-libcore default uncaught handler → `System.exit(10)`, the
-// EXIT=10 boot's actual death. `openNonAssetFd` shares Java's `openFd_internal`, so this one
-// binding covers both.
+
 const ASSET_MANAGER_OPEN_ASSET_FD_NAME: &JNIStr = jni_str!("openAssetFd");
 const ASSET_MANAGER_OPEN_ASSET_FD_SIG: &JNIStr = jni_str!("(Ljava/lang/String;I[J[J)I");
 
-// 2026-06-05: `loadResourceValue(int resid, short density, TypedValue outValue, boolean resolveRefs)`
-// is the native AOSP's `AssetManager.getResourceValue`/`Resources.getValue` calls to resolve a
-// resource id into a `Res_value` written onto a `TypedValue`. Surfaced by the dev-host run during
-// step 5 (`setContentView` → `LayoutInflater.inflate` → `getLayout` → `loadXmlResourceParser` →
-// `Resources.getValue` → `AssetManager.getResourceValue` → `loadResourceValue`). AssetManager is
-// DENYLISTED, so this is bound from the exact JNI signature ART reported missing (`No implementation
-// found for int android.content.res.AssetManager.loadResourceValue(int, short,
-// android.util.TypedValue, boolean)`, mangled `...__ISLandroid_util_TypedValue_2Z`, run log
-// 2026-06-05) WITHOUT reading the class's source. JNI descriptor `(ISLandroid/util/TypedValue;Z)I`.
-// Backed by Eclipse's own `resources.arsc` reader: resolves the id and writes type/data (+ the
-// resolved string for a `TYPE_STRING`, e.g. a layout file path) onto the public `TypedValue` fields.
-// Returns the asset cookie (1) on success, 0 if the id is absent (the framework treats 0 as
-// not-found — correct, not a fake value).
 const ASSET_MANAGER_LOAD_RESOURCE_VALUE_NAME: &JNIStr = jni_str!("loadResourceValue");
 const ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG: &JNIStr = jni_str!("(ISLandroid/util/TypedValue;Z)I");
 
-// 2026-06-05: `loadThemeAttributeValue(long theme, int ident, TypedValue outValue, boolean
-// resolveRefs)` is the native AOSP's `AssetManager.getThemeValue` / `Resources$Theme.resolveAttribute`
-// calls to resolve a THEME attribute id (`?attr/foo`) against an applied theme into a `TypedValue`.
-// Surfaced by the dev-host run during step 5 (accelerometerdemo's `setContentView` →
-// `AppCompatDelegateImplV9.createSubDecor` → `Theme.resolveAttribute` → `AssetManager.getThemeValue`).
-// AssetManager is DENYLISTED, so this is bound from the exact JNI signature ART reported missing (`No
-// implementation found for int android.content.res.AssetManager.loadThemeAttributeValue(long, int,
-// android.util.TypedValue, boolean)`, mangled `...__JILandroid_util_TypedValue_2Z`, run log
-// 2026-06-05) WITHOUT reading the class's source. JNI descriptor `(JILandroid/util/TypedValue;Z)I` —
-// an INSTANCE native. Backed by the theme handle's merged attribute map (built by applyThemeStyle):
-// resolves `ident` via the same [`resolve_theme_attr`] reference-chasing the styled-attribute path
-// uses and writes type/data/resourceId onto the public `TypedValue` fields. Returns the asset cookie
-// (1) when the attribute is in the theme, 0 when absent (the framework treats 0 as not-resolved —
-// correct, not a fake value).
 const ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME: &JNIStr = jni_str!("loadThemeAttributeValue");
 const ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG: &JNIStr =
     jni_str!("(JILandroid/util/TypedValue;Z)I");
 
-// 2026-07-01: `getPooledString(int block, int id)` (AssetManager.java line 286, `/*package*/ native
-// final CharSequence getPooledString(int block, int id);`) — `TypedArray.loadStringValueAt` calls it
-// for any TYPE_STRING whose asset cookie is `>= 0`, i.e. exactly the ARSC-pool strings the
-// styled-attribute natives now mark with [`ARSC_APP_COOKIE`]/[`ARSC_FRAMEWORK_COOKIE`]. Unbound it
-// would be a call-time UnsatisfiedLinkError the moment the cookie fix routes a string here.
 const ASSET_MANAGER_GET_POOLED_STRING_NAME: &JNIStr = jni_str!("getPooledString");
 const ASSET_MANAGER_GET_POOLED_STRING_SIG: &JNIStr = jni_str!("(II)Ljava/lang/CharSequence;");
 
-/// `Res_value.dataType` for a string-pool reference (`TYPE_STRING`); its `data` is a value-pool index.
 const RES_VALUE_TYPE_STRING: u8 = 0x03;
-/// The single asset cookie Eclipse reports (one APK). `loadResourceValue` returns it on success.
+
 const ECLIPSE_ASSET_COOKIE: jint = 1;
 
-// === ATL TypedArray ABI: the per-attribute window layout the styled-attribute natives write ========
-//
-// 2026-06-05: ATL reuses the **standard AOSP (API 29+) `TypedArray` window layout** unchanged — the
-// per-attribute window is `STYLE_NUM_ENTRIES = 7` ints: `[TYPE(0), DATA(1), ASSET_COOKIE(2),
-// RESOURCE_ID(3), CHANGING_CONFIGURATIONS(4), DENSITY(5), SOURCE_RESOURCE_ID(6)]`. This was confirmed
-// **empirically** from the dev-host run (a benign, allowed observation) WITHOUT reading the denylisted
-// `TypedArray.java`/`AssetManager.java` source, then corroborated by reading the runtime framework's
-// own `com.android.internal.R$styleable.View_id` constant (= 9) via reflection:
-//
-//   • The launcher inflates a `<TextView android:id="@id/0x7f030000">`; `LayoutInflater` +
-//     `View.<init>` read the id via `TypedArray.getResourceId(View_id, NO_ID)` and call `setId`, which
-//     is what `findViewById` later matches. With the wrong layout, `getResourceId` returned `NO_ID`,
-//     so `findViewById(0x7f030000)` was `null` → `setText` NPE at `MainActivity.onCreate:16`.
-//   • Probing the stride: writing the id into the full window at index `View_id * S` for stride `S`
-//     and observing the NPE clear pinned `S = 7` (only S=7 made `getResourceId` resolve; S=6 did not).
-//   • Probing the slots within the stride-7 window: only `TYPE@0` + `RESOURCE_ID@3` cleared the NPE
-//     (TYPE@1/DATA@1/RESID@4 etc. did not). `DATA@1` follows from the standard layout and is what
-//     `getInteger`/`getString` read (manifest integers + `<activity android:name>` resolve with it).
-//
-// The styled-attribute natives (`applyStyle`, `retrieveAttributes`) write into the SAME framework
-// `int[]` indexed by the styleable position; `outValues` is sized `attrs.length * STYLE_NUM_ENTRIES`.
-// The accessor-read slots are TYPE, DATA, and (for references like `android:id`) RESOURCE_ID; cookie /
-// changing-config / density / source stay at the framework's zero pre-fill (not consumed here). A
-// `TYPE_STRING` value's DATA is the XmlBlock string-pool index, resolved by `getString` via the XML
-// string pool (cookie slot = 0 routes to `mXml.getPooledString(data)`, satisfied by the already-bound
-// XML natives — no new native needed).
-//
-// THE ONE ABI ASSUMPTION (faithful): the run-confirmed `STYLE_NUM_ENTRIES = 7` stride with TYPE@0 /
-// DATA@1 / RESOURCE_ID@3. A regression here would mis-place the entries; the offsets are pinned by
-// `typed_array_window_layout_is_pinned` + the `fill_typed_array` bounds test below so a change fails loudly.
-
-/// AOSP `TypedArray` per-attribute window stride in `outValues` (run-confirmed 2026-06-05; standard
-/// AOSP API 29+ layout — see the ABI note above).
 const STYLE_NUM_ENTRIES: usize = 7;
-/// Offset of the `TypedValue.TYPE_*` byte within an attribute's window (AOSP = 0).
+
 const STYLE_TYPE: usize = 0;
-/// Offset of the `Res_value.data` word within an attribute's window (AOSP = 1). For a `TYPE_STRING`
-/// this is the XmlBlock string-pool index `getString` resolves via the XML string pool.
+
 const STYLE_DATA: usize = 1;
-/// Offset of the asset cookie within an attribute's window (AOSP = 2). For an XML-block-sourced string
-/// value (a manifest/layout inline attribute) this is set to [`XML_BLOCK_COOKIE`] (`-1`) so
-/// `TypedArray.getString` resolves the value via `mXml.getPooledString(data)` (the XmlBlock's own Java
-/// string pool, backed by the bound XML natives) rather than the native `AssetManager.getPooledString`.
+
 const STYLE_ASSET_COOKIE: usize = 2;
-/// Offset of the resolved resource id within an attribute's window (AOSP = 3) — what
-/// `TypedArray.getResourceId` returns (e.g. `android:id` → the view's id for `findViewById`).
+
 const STYLE_RESOURCE_ID: usize = 3;
-/// The asset cookie AOSP's `TypedArray.getString` treats as "string lives in the XmlBlock's own pool"
-/// (`cookie < 0`) — routing resolution to `mXml.getPooledString(data)` in Java (no native needed),
-/// since Eclipse's inline string values come from the parsed XML block, not a separate asset.
+
 const XML_BLOCK_COOKIE: i32 = -1;
-/// `TypedValue.TYPE_NULL` — "no value" (the framework then uses the attribute's default). Written
-/// into a requested attribute's `STYLE_TYPE` slot when that id is absent from the current tag.
+
 const TYPE_NULL: i32 = 0;
-/// `TypedValue.TYPE_REFERENCE` — a resource reference (`@id/foo`, `@drawable/bar`); its `data` is the
-/// referenced resource id, which is also placed in the `STYLE_RESOURCE_ID` slot.
+
 const TYPE_REFERENCE: u8 = 0x01;
-/// `TypedValue.TYPE_ATTRIBUTE` — a theme-attribute reference (`?attr/foo`); like a reference for the
-/// purpose of the `STYLE_RESOURCE_ID` slot.
+
 const TYPE_ATTRIBUTE: u8 = 0x02;
-/// `TypedValue.TYPE_STRING` — an interned string; its `data` is the source string-pool index, resolved
-/// by `getString` via the XmlBlock pool (cookie [`XML_BLOCK_COOKIE`]).
+
 const TYPE_STRING: u8 = 0x03;
 
-// 2026-07-01: positive asset cookies marking a TYPE_STRING whose `data` indexes a `resources.arsc`
-// GLOBAL value string pool (vs the XmlBlock pool, cookie -1). `TypedArray.loadStringValueAt` routes
-// `cookie >= 0` to `AssetManager.getPooledString(cookie, data)` (AssetManager.java line 286), which
-// [`asset_manager_get_pooled_string`] backs. ROOT CAUSE this closes (challenge boot,
-// /tmp/eclipse-challenge3.log): a styled attribute whose reference chase landed on an ARSC
-// TYPE_STRING (a file-path drawable such as `@drawable/topbar_ic_close` →
-// "res/drawable-mdpi-v4/topbar_ic_close.png") kept cookie -1, so Java resolved the ARSC pool index
-// against the LAYOUT XmlBlock's pool → null → `Resource is not a Drawable (color or path):
-// TypedValue{t=0x3/d=0x456 "<null>" a=-1 r=0x7f080173}` (d=0x456 == the ARSC pool index of that
-// exact path — verified with Eclipse's own `apk::arsc` reader).
-
-/// Asset cookie for a string in the APP `resources.arsc` global value pool (== [`ECLIPSE_ASSET_COOKIE`]).
 const ARSC_APP_COOKIE: i32 = 1;
-/// Asset cookie for a string in the FRAMEWORK table's (`framework-res.apk`) global value pool.
+
 const ARSC_FRAMEWORK_COOKIE: i32 = 2;
 
-/// The ARSC string-pool cookie for the table that defines resource id `resid` — mirrors
-/// [`arsc_bytes_for`]'s package dispatch (package `0x01` → the framework table, else the app table).
 fn arsc_cookie_for(resid: u32) -> i32 {
     arsc_cookie_for_package((resid >> 24) as u8)
 }
 
-/// The ARSC string-pool cookie for a package id (`0x01` → framework table, else app table).
 fn arsc_cookie_for_package(package_id: u8) -> i32 {
     if package_id == 0x01 {
         ARSC_FRAMEWORK_COOKIE
@@ -871,13 +380,7 @@ fn arsc_cookie_for_package(package_id: u8) -> i32 {
     }
 }
 
-/// Resolve a global ARSC value-pool string by its positive asset `cookie` + pool `index` — the
-/// native backing for `AssetManager.getPooledString` and the `TypedValue.string` fill of
-/// [`asset_manager_load_theme_attribute_value`]. Returns `None` for an unknown cookie, a missing
-/// table, or an out-of-range index (never panics; the caller logs + returns null, the observable
-/// diagnostic for a wrong-pool regression).
 fn arsc_pool_string(cookie: i32, index: u32) -> Option<String> {
-    // Any resid with the right package byte selects the table in arsc_bytes_for.
     let probe_resid: u32 = match cookie {
         ARSC_FRAMEWORK_COOKIE => 0x0100_0000,
         ARSC_APP_COOKIE => 0x7f00_0000,
@@ -888,26 +391,12 @@ fn arsc_pool_string(cookie: i32, index: u32) -> Option<String> {
     table.value_string(index).ok().flatten()
 }
 
-/// `AssetManager.init(int sdk_version)` → GTK-free no-op (minimal stub, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native (the Java method is not `static`), so the second argument is the
-/// `JObject` receiver (`this`), then the `int sdk_version` (the resources SDK version the
-/// constructor passes). Per the AssetManager native-backing note above, this is intentionally a
-/// no-op for now: it leaves the receiver's `mObject` native handle at `0` (Java zero-init) so the
-/// AssetManager constructs without pulling ATL's C asset layer, and the re-run surfaces the next
-/// native (`native_setApkAssets`) — the diagnostic discovery loop, not a behavior fake.
-///
-/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
-/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns the `()` default on any error/panic — the correct neutral value for this `void` native.
 extern "system" fn asset_manager_init<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     sdk_version: jint,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // 2026-06-05: minimal stub — no native asset table is created yet. Tracing records the call
-        // (and the SDK version) so the dev-host boot log shows the constructor reached `init`.
         tracing::debug!(
             target: "android.content.res.AssetManager",
             sdk_version,
@@ -918,19 +407,6 @@ extern "system" fn asset_manager_init<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.native_setApkAssets(Object[] apkAssets, int invalidateCaches)` → GTK-free no-op
-/// (signature-only discovery-loop stub, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native, so the parameters are `(EnvUnowned, JObject this, JObject apkAssets,
-/// jint invalidateCaches)`. `apkAssets` is a `java.lang.Object[]`; it is a `jobject` at the ABI
-/// level, taken as a `JObject` and **never dereferenced** (AssetManager is DENYLISTED — bound from
-/// the ART-reported signature alone, without reading its source). No native asset table is installed
-/// (`mObject` stays `0`); this lets the constructor proceed past `native_setApkAssets` so the re-run
-/// surfaces the next native — the diagnostic discovery loop, not behavior-faking.
-///
-/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
-/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns the `()` default on any error/panic — the correct neutral value for this `void` native.
 extern "system" fn asset_manager_set_apk_assets<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -938,8 +414,8 @@ extern "system" fn asset_manager_set_apk_assets<'local>(
     invalidate_caches: jint,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // 2026-06-05: signature-only no-op (AssetManager denylisted). `_apk_assets` is intentionally
-        // not inspected. Tracing records the call so the dev-host log shows the constructor reached it.
+
+
         tracing::debug!(
             target: "android.content.res.AssetManager",
             invalidate_caches,
@@ -950,23 +426,6 @@ extern "system" fn asset_manager_set_apk_assets<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.setConfiguration(int, int, String, int ×14)` → GTK-free no-op (signature-only
-/// discovery-loop stub, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native, so the parameters are `(EnvUnowned, JObject this, ...17 args)`:
-/// 2 ints, a `String` locale, then 14 configuration ints. The `String` is a `jobject` at the ABI
-/// level, taken as a `JObject` and **never dereferenced** (AssetManager is DENYLISTED — bound from
-/// the ART-reported signature alone, without reading its source). No native asset table exists
-/// (`mObject` stays `0`), so there is nothing to reconfigure; this lets the framework proceed so the
-/// re-run surfaces the next native — the diagnostic discovery loop, not behavior-faking.
-///
-/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
-/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns the `()` default on any error/panic — the correct neutral value for this `void` native.
-//
-// 2026-06-05: arity is fixed by the JNI signature ART reported (17 args); a signature-only stub must
-// match it exactly. clippy's `too_many_arguments` does not fire on `extern "system"` fns, so no
-// `#[expect]`/`#[allow]` is needed here.
 extern "system" fn asset_manager_set_configuration<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -989,9 +448,6 @@ extern "system" fn asset_manager_set_configuration<'local>(
     _major_version: jint,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // 2026-06-05: signature-only no-op (AssetManager denylisted). The arg names mirror the
-        // standard AOSP AssetManager.setConfiguration parameter order for documentation only; none
-        // are inspected. `mcc`/`mnc` are traced as a low-noise call marker for the dev-host log.
         tracing::debug!(
             target: "android.content.res.AssetManager",
             mcc,
@@ -1003,22 +459,6 @@ extern "system" fn asset_manager_set_configuration<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.openXmlAssetNative(int cookie, String fileName)` → a real Eclipse-owned
-/// [`xml_registry`] block handle (2026-06-05), or `0` on a genuine open failure.
-///
-/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
-/// `(EnvUnowned, JObject this, jint cookie, JString fileName)`. Reads `fileName` from the APK zip
-/// (path stashed in [`APK_PATH`]) via [`crate::apk::Apk::read_entry`], parses it with
-/// [`crate::apk::axml::parse_document`], stores the parsed [`crate::apk::axml::XmlDocument`] in
-/// [`xml_registry`], and returns the slab handle (≥ 1, never `0`). A missing entry or parse failure
-/// returns `0` — the "no asset" sentinel the framework turns into `FileNotFoundException` (correct
-/// behavior, not a fake success). 2026-07-01: `cookie` selects the archive —
-/// [`ARSC_FRAMEWORK_COOKIE`] routes to `framework-res.apk`, anything else to the app APK (see
-/// [`open_xml_block`]).
-///
-/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
-/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns the `jlong` default (`0`) on any error/panic — the same neutral "no asset" handle.
 extern "system" fn asset_manager_open_xml_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1027,8 +467,6 @@ extern "system" fn asset_manager_open_xml_asset<'local>(
 ) -> jlong {
     env.with_env(|env| -> jni::errors::Result<jlong> {
         if file_name.is_null() {
-            // A null asset name cannot name an entry; return the "no asset" sentinel (the framework
-            // throws FileNotFoundException), never a panic.
             return Ok(0);
         }
         let name = file_name.try_to_string(env)?;
@@ -1044,8 +482,6 @@ extern "system" fn asset_manager_open_xml_asset<'local>(
                 Ok(handle)
             }
             Err(e) => {
-                // Genuine failure (entry absent, not binary-XML, malformed, or no APK path). Return
-                // 0 so the framework raises FileNotFoundException — the correct, non-faked outcome.
                 tracing::warn!(
                     target: "android.content.res.AssetManager",
                     cookie,
@@ -1060,53 +496,6 @@ extern "system" fn asset_manager_open_xml_asset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.retrieveAttributes(long parseState, int[] attrs, int parser, long outValues,
-/// long outIndices)` → whether any requested attribute was found on the current XML tag.
-///
-/// JNI ABI: an INSTANCE native returning `jboolean` (jni-sys `jboolean` = Rust `bool`), so the
-/// parameters are `(EnvUnowned, JObject this, jlong parse_state, JIntArray attrs, jint parser,
-/// jlong out_values, jlong out_indices)`. `out_values`/`out_indices` are raw pointers to native
-/// off-heap `int[]` buffers the framework's `TypedArray` allocated and sized.
-///
-/// ## What this resolves (real XML-attribute extraction — no ARSC needed)
-/// 2026-06-05: this is AOSP's *XML-attribute* `retrieveAttributes` (the variant the framework drives
-/// while reading the manifest's `<activity>`/`<service>`/… tags), NOT the theme/style `applyStyle`
-/// path. `attrs` is a list of **framework attribute resource ids** (e.g. `android.R.attr.name` =
-/// `0x01010003`); for each, the native looks up the attribute on the current parse-state's XML
-/// element whose decoded `name_resource` equals that id and writes its **inline `Res_value`**
-/// (`value_type` + `value_data`) into that attribute's [`STYLE_NUM_ENTRIES`]-wide `outValues` window.
-/// Those values are already decoded by Eclipse's own [`axml`](crate::apk::axml) parser
-/// (`XmlAttribute.{name_resource,value_type,value_data}`), so **no `resources.arsc` decode is
-/// required** — manifest attribute values are inline in the AXML and their ids come from the AXML
-/// resource-map chunk. A minimal first pass that returned `TYPE_NULL` for every attribute made the
-/// framework log "`<activity> does not specify android:name`" and `System.exit(1)` (run log
-/// 2026-06-05), proving real per-attribute values are required here; this is the smallest sound step
-/// that supplies them, grounded in data Eclipse already parses (not a new subsystem).
-///
-/// For each requested id the window's run-confirmed slots are filled: `STYLE_TYPE` (ATL offset 1) =
-/// the value's `Res_value.dataType` (the same byte as `TypedValue.TYPE_*`), `STYLE_DATA` (ATL offset
-/// 3) = the value's `Res_value.data` word (for a `TYPE_STRING` this is the XmlBlock string-pool
-/// index). The remaining slots stay at the framework's zero pre-fill (their exact ATL offsets are not
-/// yet confirmed). A requested id not present on the tag gets `STYLE_TYPE = TYPE_NULL` (the framework
-/// then uses the attribute's default). `outIndices[0]` is the count of attributes that were found, and
-/// `outIndices[1..=count]` are their 1-based positions in `attrs`. The return is `true` iff at least
-/// one attribute was found. Both integer/boolean attributes (the boot advances past
-/// `PackageParser.parsePackage`) AND `String`-valued attributes (e.g. `<activity android:name>`)
-/// resolve: `TypedArray.getString` reads the string-pool index from DATA@3 (cookie slot = 0) and
-/// resolves it via the XmlBlock string pool — satisfied by the already-bound XML natives, no new
-/// native needed (run-confirmed 2026-06-05; see the `STYLE_*` constants' note).
-///
-/// ## Bounds soundness (the raw-pointer writes)
-/// `out_values`/`out_indices` are written via `*mut i32` derived from the `jlong`s. The writes are
-/// provably in bounds: the framework's `TypedArray` sizes `outValues` to `attrs.length *
-/// STYLE_NUM_ENTRIES` ints and `outIndices` to `attrs.length + 1` ints (the AOSP TypedArray ABI), and
-/// this native writes **only** offsets `< n * STYLE_NUM_ENTRIES` (outValues) and `<= n` (outIndices),
-/// where `n = attrs.len()`. A `0` pointer means the framework provided no buffer; that buffer is then
-/// skipped (no write). See [`fill_typed_array`] for the (`unsafe`) writes and their SAFETY argument.
-///
-/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
-/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns the `jboolean` default (`false`) on any error/panic — the same neutral "nothing resolved".
 extern "system" fn asset_manager_retrieve_attributes<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1117,34 +506,22 @@ extern "system" fn asset_manager_retrieve_attributes<'local>(
     out_indices: jlong,
 ) -> jboolean {
     env.with_env(|env| -> jni::errors::Result<jboolean> {
-        // Number of requested attributes — the single value that sizes both output buffers. A null
-        // attrs array means nothing to resolve; honestly return false (no buffer write).
         if attrs.is_null() {
             return Ok(false);
         }
         let n = attrs.len(env)?;
         if n == 0 {
-            // No requested ids: outIndices[0] = 0 (no entries), nothing in outValues. Still write the
-            // count so the framework reads a defined value.
             fill_typed_array(out_values, out_indices, &[]);
             return Ok(false);
         }
 
-        // Copy the requested framework attribute ids out of the Java int[] into a Rust buffer. A
-        // jsize start of 0 + the array's own length is exactly in range (get_region bounds-checks).
         let mut ids = vec![0i32; n];
         let start = jint::try_from(0).unwrap_or(0);
         attrs.get_region(env, start, &mut ids)?;
 
-        // Resolve each requested id against the current XML element's decoded attributes (by
-        // name_resource). Build the per-attribute TypedArray windows; this reads only Eclipse's own
-        // parsed axml data via the bounds+generation-checked registry (a bad parse_state handle is a
-        // typed Err → no entries resolved, never UB).
         let entries = resolve_xml_attributes(parse_state, &ids);
         let changed = entries.iter().filter(|e| e.is_some()).count();
 
-        // Write the windows + the changed-index list into the framework's off-heap buffers (bounded
-        // to exactly the AOSP-sized regions; a 0 pointer is skipped). See fill_typed_array's SAFETY.
         fill_typed_array(out_values, out_indices, &entries);
 
         tracing::debug!(
@@ -1157,50 +534,30 @@ extern "system" fn asset_manager_retrieve_attributes<'local>(
             out_indices_null = (out_indices == 0),
             "AssetManager.retrieveAttributes: resolved manifest XML attributes by resource id"
         );
-        // true iff at least one requested attribute was present on the tag.
+
         Ok(changed > 0)
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// One resolved `Res_value` to place in a [`STYLE_NUM_ENTRIES`]-wide `outValues` window: the
-/// `TypedValue.TYPE_*` code, the data word, and the resolved resource id (for references). `None` for
-/// a requested id absent from the tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TypedEntry {
-    /// `Res_value.dataType` (== `TypedValue.TYPE_*`).
     value_type: i32,
-    /// `Res_value.data` (for a string, the XmlBlock string-pool index).
+
     data: i32,
-    /// The value's resolved resource id for the `STYLE_RESOURCE_ID` slot. For a `TYPE_REFERENCE` /
-    /// `TYPE_ATTRIBUTE` (e.g. `android:id="@id/foo"`) this is the referenced id (== `data`), which is
-    /// what `TypedArray.getResourceId` returns; for every other value type it is `0` (no resource id).
+
     resource_id: i32,
-    /// The asset cookie for the `STYLE_ASSET_COOKIE` slot. For a `TYPE_STRING` this routes string
-    /// resolution to the pool `data` actually indexes: [`XML_BLOCK_COOKIE`] (`-1`) for an inline
-    /// XmlBlock string (`mXml.getPooledString`), or the positive [`ARSC_APP_COOKIE`] /
-    /// [`ARSC_FRAMEWORK_COOKIE`] for a value resolved through `resources.arsc`
-    /// (`AssetManager.getPooledString`, 2026-07-01). `0` for every other value type.
+
     asset_cookie: i32,
 }
 
-/// For each requested framework attribute id in `ids`, find the matching attribute on the current
-/// element of XML parse-state `parse_state` (by decoded `name_resource`) and return its `Res_value`,
-/// or `None` if the id is not present on the tag.
-///
-/// Reads only Eclipse's own parsed [`axml`](crate::apk::axml) data through the bounds+generation-
-/// checked [`xml_registry::with_block`]: a stale/fabricated `parse_state` handle is a typed `Err`,
-/// which yields all-`None` (no entries) — never a wild dereference or panic. Allocates one
-/// `Vec<Option<TypedEntry>>` sized to `ids` (the launcher resolves a handful of attribute sets; this
-/// is off the gameplay hot path).
 fn resolve_xml_attributes(parse_state: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>> {
     xml_registry::with_block(parse_state, |block| {
         let element = block.current_element();
         ids.iter()
             .map(|&id| {
                 let element = element?;
-                // Framework attribute ids are non-zero; a 0 here means "not a framework resource
-                // attribute", which never matches a real requested id.
+
                 let id_u32 = u32::from_ne_bytes(id.to_ne_bytes());
                 let attr = element
                     .attributes
@@ -1213,56 +570,32 @@ fn resolve_xml_attributes(parse_state: jlong, ids: &[i32]) -> Vec<Option<TypedEn
     .unwrap_or_else(|_| vec![None; ids.len()])
 }
 
-/// Resolve one inline XML attribute `(value_type, value_data)` to the [`TypedEntry`] that
-/// `applyStyle`/`obtainStyledAttributes(AttributeSet, int[])` writes into the `TypedArray` window.
-///
-/// 2026-06-05: a concrete value (color/int/float/dimension/boolean/string) is returned directly. A
-/// `TYPE_REFERENCE` (`@color/x`, `@drawable/y`, …) is FOLLOWED into `resources.arsc` to a concrete
-/// `Res_value` (so e.g. a vector drawable's `android:fillColor="@color/c"` resolves to its ARGB
-/// before `TypedArray.getColor` reads it — without this, `getColor` throws
-/// `UnsupportedOperationException: Can't convert to color: type=0x1`, surfaced 2026-06-05 by
-/// accelerometerdemo's `VectorDrawableCompat`). The original referenced id is kept in the
-/// `STYLE_RESOURCE_ID` slot (what `getResourceId` returns). This mirrors [`resolve_theme_attr`]'s
-/// reference chase, fixing the same-pattern gap where the THEME path resolved references but the
-/// inline-XML path did not. Bounded by [`MAX_ATTR_RESOLVE_DEPTH`]; never panics. An unresolvable
-/// reference (`@null`, a bag, or an absent target) keeps the reference itself (its resource id stays
-/// useful to `getResourceId`) — the sound AOSP fallback, not a value fake.
 fn resolve_inline_attr_value(value_type: u8, value_data: u32) -> TypedEntry {
     let mut cur_type = value_type;
     let mut cur_data = value_data;
-    // getResourceId reports the FIRST referenced id (for a reference/attribute); 0 otherwise.
+
     let resource_id = if value_type == TYPE_REFERENCE || value_type == TYPE_ATTRIBUTE {
         u32_to_i32(value_data)
     } else {
         0
     };
-    // Follow resource references (`@…`) to a concrete value. `TYPE_ATTRIBUTE` (`?attr/…`) has no
-    // theme context here (this is an inline AttributeSet value, not a theme bag), so it is left as-is
-    // for the framework to resolve against the active theme.
-    //
-    // 2026-07-01: track which string pool a TYPE_STRING's `data` indexes. The INLINE value's string
-    // lives in the XmlBlock's own pool (cookie -1 → mXml.getPooledString). But once the chase
-    // resolves through resources.arsc, the value's `data` indexes THAT TABLE's global pool — the
-    // matching positive ARSC cookie routes Java to AssetManager.getPooledString (the challenge-boot
-    // "Resource is not a Drawable … \"<null>\" a=-1" root cause was leaving these at -1).
+
     let mut string_pool_cookie = XML_BLOCK_COOKIE;
     for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
         if cur_type != TYPE_REFERENCE || cur_data == 0 {
-            break; // concrete value, a non-reference, or the explicit @null reference: done.
+            break;
         }
         match resolve_res_value(cur_data) {
             Some(v) => {
-                // The resolved value came from the table that defines `cur_data`.
                 string_pool_cookie = arsc_cookie_for(cur_data);
                 cur_type = u8::try_from(v.type_).unwrap_or(0);
                 cur_data = u32::from_ne_bytes(v.data.to_ne_bytes());
             }
-            // Target is a bag / absent: keep the reference itself (resource_id still set).
+
             None => break,
         }
     }
-    // A string's cookie routes getString to the pool its data indexes (XmlBlock or ARSC, above).
-    // Other types: cookie 0.
+
     let asset_cookie = if cur_type == TYPE_STRING {
         string_pool_cookie
     } else {
@@ -1276,36 +609,12 @@ fn resolve_inline_attr_value(value_type: u8, value_data: u32) -> TypedEntry {
     }
 }
 
-/// Reinterpret a `u32` `Res_value.data` word as the `i32` the TypedArray `int[]` stores (bit-for-bit;
-/// the framework reads it back as the same 32 bits). `as` would also work, but `from_ne_bytes` makes
-/// the bit-preservation explicit and lint-clean.
 fn u32_to_i32(v: u32) -> i32 {
     i32::from_ne_bytes(v.to_ne_bytes())
 }
 
-/// Maximum theme parent-chain depth walked by [`merge_theme_style`]. Real Material/AppCompat chains
-/// are ~6–8 deep (verified 2026-06-05: the accelerometer demo's AppTheme chain is 7 styles); this cap
-/// (2026-06-05) sits well above any legitimate depth while bounding work and breaking any cycle a
-/// malformed/hostile table might encode.
 const MAX_THEME_PARENT_DEPTH: usize = 64;
 
-/// Merge a style resource id's bag + its parent chain into `out` (attribute id → resolved value),
-/// child overriding parent. Returns the number of attributes the chain contributed.
-///
-/// 2026-06-05: an AOSP theme is a `<style>` (a `resources.arsc` bag of attribute id → `Res_value`,
-/// plus a parent style id). The activity's theme (from the manifest `android:theme` or the AppCompat
-/// default) is applied via `applyThemeStyle(styleRes)`; resolving the theme's full attribute set —
-/// which `obtainStyledAttributes(int[])` reads — requires walking the parent chain so AppCompat's own
-/// attributes (`windowActionBar`/`colorPrimary`/…), defined up the chain in the app's bundled
-/// AppCompat resources, are present. Walk from the applied style UPWARD: insert each attribute only if
-/// absent, so the more-specific (child) value wins over the parent's. Parents can cross packages
-/// (e.g. the app theme's chain ends in a framework `android:Theme.*`, package `0x01`), so each node is
-/// read through [`arsc_bytes_for`] (framework table for package `0x01`, app table otherwise).
-///
-/// Total + bounded: [`MAX_THEME_PARENT_DEPTH`] caps the walk (breaking any cycle), a node whose ARSC
-/// is missing/corrupt/absent simply ends the walk, and the underlying [`apk::arsc`](crate::apk::arsc)
-/// decode is itself never-panicking. Re-parses the ARSC per node (off the gameplay hot path — themes
-/// are set up once during activity create).
 fn merge_theme_style(
     out: &mut std::collections::HashMap<i32, theme_registry::ThemeAttr>,
     style_res: u32,
@@ -1315,31 +624,29 @@ fn merge_theme_style(
     let mut visited = std::collections::HashSet::new();
     for _ in 0..MAX_THEME_PARENT_DEPTH {
         if current == 0 || !visited.insert(current) {
-            break; // no parent, or a cycle — stop.
+            break;
         }
         let Some(bytes) = arsc_bytes_for(current) else {
-            break; // the table for this node is unavailable — end the walk.
+            break;
         };
         let Ok(table) = crate::apk::arsc::parse_arsc(&bytes) else {
             break;
         };
         let Some(style) = table.resolve_style(current) else {
-            break; // not a style/bag (or absent) — nothing more to merge.
+            break;
         };
         for entry in &style.entries {
-            // attr_id 0 is not a real attribute; skip it (defensive against malformed bags).
             if entry.attr_id == 0 {
                 continue;
             }
             let key = u32_to_i32(entry.attr_id);
-            // Insert only if absent → the child (seen first, walking upward) overrides the parent.
+
             out.entry(key).or_insert_with(|| {
                 contributed += 1;
                 theme_registry::ThemeAttr {
                     type_: entry.type_,
                     data: entry.data,
-                    // 2026-07-01: a TYPE_STRING bag value's `data` indexes the GLOBAL pool of the
-                    // table THIS style node lives in — record it for the string-pool cookie.
+
                     source_package: (current >> 24) as u8,
                 }
             });
@@ -1349,39 +656,23 @@ fn merge_theme_style(
     contributed
 }
 
-/// Maximum reference-chase depth when resolving a theme attribute's value to a concrete one
-/// (`TYPE_REFERENCE`/`TYPE_ATTRIBUTE` hops). Real chains are 1–3 deep; this cap (2026-06-05) bounds
-/// work and breaks any cycle.
 const MAX_ATTR_RESOLVE_DEPTH: usize = 16;
 
-/// Resolve one theme attribute id to the [`TypedEntry`] `obtainStyledAttributes(int[])` writes.
-///
-/// 2026-06-05: looks `attr_id` up in the theme's merged attribute map (`attrs`). For a concrete value
-/// (boolean/int/color/dimension/…) returns it directly. For a `TYPE_REFERENCE` (`@id/@color/…`),
-/// follows it into `resources.arsc` to a concrete `Res_value` (so e.g. `colorPrimary → @color/x →
-/// ARGB` resolves) while keeping the original referenced id in the `STYLE_RESOURCE_ID` slot (what
-/// `getResourceId` returns). For a `TYPE_ATTRIBUTE` (`?attr/foo`), looks the referenced attribute back
-/// up in the SAME theme map (one theme-indirection hop). Returns `None` when the attribute is not in
-/// the theme — the caller then writes `TYPE_NULL` (the framework uses the attribute's default), the
-/// sound AOSP fallback, not a value fake. Bounded by [`MAX_ATTR_RESOLVE_DEPTH`]; never panics.
 fn resolve_theme_attr(
     attrs: &std::collections::HashMap<i32, theme_registry::ThemeAttr>,
     attr_id: i32,
 ) -> Option<TypedEntry> {
     let mut cur = *attrs.get(&attr_id)?;
-    // The resource id reported by getResourceId: for a reference, the FIRST referenced id.
+
     let mut resource_id = if cur.type_ == TYPE_REFERENCE {
         u32_to_i32(cur.data)
     } else {
         0
     };
-    // 2026-07-01: a theme value is ALWAYS resources.arsc-sourced (a style bag), so a TYPE_STRING's
-    // `data` indexes the GLOBAL pool of the table the bag (or the chased target) lives in — never
-    // the XmlBlock pool. Track it for the string-pool cookie.
+
     let mut string_pool_cookie = arsc_cookie_for_package(cur.source_package);
     for _ in 0..MAX_ATTR_RESOLVE_DEPTH {
         match cur.type_ {
-            // A theme-attribute reference (`?attr/foo`): re-resolve against the theme map.
             TYPE_ATTRIBUTE => {
                 let next_id = u32_to_i32(cur.data);
                 cur = *attrs.get(&next_id)?;
@@ -1390,33 +681,29 @@ fn resolve_theme_attr(
                     resource_id = u32_to_i32(cur.data);
                 }
             }
-            // A resource reference (`@color/x`): follow into resources.arsc to a concrete value.
+
             TYPE_REFERENCE => {
-                // A 0 reference (`@null` / @0) is the explicit null value: keep it as a reference
-                // with no concrete target (getResourceId returns 0).
                 if cur.data == 0 {
                     break;
                 }
                 match resolve_res_value(cur.data) {
                     Some(v) => {
-                        // The resolved value came from the table that defines the referenced id.
                         string_pool_cookie = arsc_cookie_for(cur.data);
                         cur = theme_registry::ThemeAttr {
                             type_: u8::try_from(v.type_).unwrap_or(0),
                             data: u32::from_ne_bytes(v.data.to_ne_bytes()),
                             source_package: (cur.data >> 24) as u8,
                         };
-                        // If it points to ANOTHER reference, keep chasing and update resource_id.
+
                         if cur.type_ == TYPE_REFERENCE {
                             resource_id = v.data;
                         }
                     }
-                    // The reference target is not a single value (a bag) or is absent: keep the
-                    // reference itself (its resource id is still useful to getResourceId).
+
                     None => break,
                 }
             }
-            // A concrete value: done.
+
             _ => break,
         }
     }
@@ -1433,13 +720,6 @@ fn resolve_theme_attr(
     })
 }
 
-/// Resolve the requested attribute ids against a theme handle's merged attribute map, returning the
-/// per-attribute [`TypedEntry`]s `obtainStyledAttributes(int[])` (the no-parser path) writes.
-///
-/// 2026-06-05: this is the theme-only branch of AOSP's `applyStyle`/`Theme.obtainStyledAttributes` —
-/// AppCompat's `theme.obtainStyledAttributes(R.styleable.AppCompatTheme)` drives it with `parser == 0`.
-/// A stale/fabricated theme handle (or an empty theme) yields all-`None` (every attribute `TYPE_NULL`)
-/// — never UB — which is what triggered AppCompat's IllegalStateException before themes resolved.
 fn resolve_theme_attributes(theme: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>> {
     theme_registry::with_theme(theme, |t| {
         ids.iter()
@@ -1449,17 +729,6 @@ fn resolve_theme_attributes(theme: jlong, ids: &[i32]) -> Vec<Option<TypedEntry>
     .unwrap_or_else(|_| vec![None; ids.len()])
 }
 
-/// In-place: resolve any `entries` slot still holding a `TYPE_ATTRIBUTE` (`?attr/foo`) inline-XML value
-/// against the active `theme`'s merged attribute map.
-///
-/// 2026-06-05: an inline `AttributeSet` value can be a theme reference (`android:background="?attr/…"`).
-/// [`resolve_xml_attributes`] records it as a `TYPE_ATTRIBUTE` `TypedEntry` whose `data` is the
-/// referenced attribute id (it has no theme to resolve against). AOSP's `TypedArray.getDrawable`/
-/// `getColor`/… throw `UnsupportedOperationException` on an unresolved `TYPE_ATTRIBUTE`, so this hop
-/// must happen before the framework reads the slot. [`resolve_theme_attr`] looks the referenced
-/// attribute id up in the theme map and resolves its value (chasing references), exactly as AOSP's
-/// `Theme.resolveAttribute` does. A stale/empty theme, or an attribute the theme does not define,
-/// leaves the slot unchanged (the faithful "not in theme" outcome — not a fabricated value).
 fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>]) {
     let _ = theme_registry::with_theme(theme, |t| {
         for slot in entries.iter_mut() {
@@ -1474,58 +743,19 @@ fn resolve_inline_theme_refs(theme: jlong, entries: &mut [Option<TypedEntry>]) {
     });
 }
 
-/// Fill the framework-allocated `TypedArray` output buffers from `entries` (one per requested
-/// attribute, in request order): each `Some` writes its value's [`STYLE_TYPE`]/[`STYLE_DATA`] and —
-/// for a reference — [`STYLE_RESOURCE_ID`] slots of its [`STYLE_NUM_ENTRIES`]-wide window (the rest
-/// stay at the framework's zero pre-fill), each `None` writes `TYPE_NULL` into its window's
-/// `STYLE_TYPE` slot; `outIndices[0]` is set to the number of `Some` entries, followed by their 1-based
-/// request positions.
-///
-/// `out_values`/`out_indices` are the raw `jlong` pointers the framework passed; `0` means the
-/// framework provided no buffer and that buffer is skipped (no write). The writes are bounded to the
-/// AOSP-sized regions: offsets `< n * STYLE_NUM_ENTRIES` for `outValues` and `<= n` for `outIndices`,
-/// where `n == entries.len()`.
-///
-/// # Safety
-/// 2026-06-05: this performs raw `*mut i32` writes, justified by the AOSP `TypedArray` ABI (which ATL
-/// reuses unchanged): the framework's `TypedArray` allocates `outValues` with `attrs.length *
-/// STYLE_NUM_ENTRIES` ints and `outIndices` with `attrs.length + 1` ints, and passes their base
-/// addresses as these two `jlong`s; `n = entries.len()` here IS `attrs.length` (`entries` is built
-/// one-per-`ids` entry, and `ids.len()` is `attrs.len()` from `JIntArray::len`). For `outValues` every
-/// written offset is `attr * STYLE_NUM_ENTRIES + slot` with `attr < n` and `slot ∈ {STYLE_TYPE,
-/// STYLE_DATA, STYLE_RESOURCE_ID} < STYLE_NUM_ENTRIES`, hence `< n * STYLE_NUM_ENTRIES`. For
-/// `outIndices` the written offsets are `0` (the count) and `1..=changed` where `changed <= n`, hence
-/// `<= n`. Both are strictly inside the framework's allocation — no out-of-bounds access. A `0` pointer
-/// is treated as "no buffer" and never dereferenced. The ABI assumption (documented at the `STYLE_*`
-/// constants and pinned by `typed_array_window_layout_is_pinned`) is the run-confirmed
-/// `STYLE_NUM_ENTRIES = 7` / TYPE@0 / DATA@1 / RESOURCE_ID@3 layout. Each `i32` is written to a
-/// `.add(k)`-offset of a `*mut i32`; the buffers are framework-owned native `int[]`s (4-byte aligned
-/// by construction), so the writes are aligned and non-overlapping.
 fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<TypedEntry>]) {
-    // n == entries.len() is the framework's attrs.length (see the # Safety note); used implicitly as
-    // the iteration bound below — every offset stays < n*STYLE_NUM_ENTRIES (values) or <= n (indices).
     if out_values != 0 {
         let base = out_values as usize as *mut i32;
         for (attr, entry) in entries.iter().enumerate() {
-            let window = attr * STYLE_NUM_ENTRIES; // < n * STYLE_NUM_ENTRIES for attr < n.
+            let window = attr * STYLE_NUM_ENTRIES;
             match entry {
-                Some(e) => {
-                    // SAFETY: window + STYLE_RESOURCE_ID <= window + (STYLE_NUM_ENTRIES-1) <
-                    // (attr+1)*STYLE_NUM_ENTRIES <= n*STYLE_NUM_ENTRIES = the framework's outValues
-                    // int-count (see the fn-level # Safety). `base` is non-null (checked) and points
-                    // at that framework-owned, 4-byte-aligned int[]. TYPE/DATA/RESOURCE_ID/COOKIE are the
-                    // accessor-read slots; the rest stay at the framework's zero pre-fill (the neutral
-                    // default — changing-config/density/source are not consumed by the launcher).
-                    unsafe {
-                        base.add(window + STYLE_TYPE).write(e.value_type);
-                        base.add(window + STYLE_DATA).write(e.data);
-                        base.add(window + STYLE_RESOURCE_ID).write(e.resource_id);
-                        base.add(window + STYLE_ASSET_COOKIE).write(e.asset_cookie);
-                    }
-                }
+                Some(e) => unsafe {
+                    base.add(window + STYLE_TYPE).write(e.value_type);
+                    base.add(window + STYLE_DATA).write(e.data);
+                    base.add(window + STYLE_RESOURCE_ID).write(e.resource_id);
+                    base.add(window + STYLE_ASSET_COOKIE).write(e.asset_cookie);
+                },
                 None => {
-                    // SAFETY: window + STYLE_TYPE < n*STYLE_NUM_ENTRIES (as above). TYPE_NULL marks
-                    // the attribute absent; the framework then uses its default.
                     unsafe { base.add(window + STYLE_TYPE).write(TYPE_NULL) };
                 }
             }
@@ -1534,38 +764,21 @@ fn fill_typed_array(out_values: jlong, out_indices: jlong, entries: &[Option<Typ
 
     if out_indices != 0 {
         let base = out_indices as usize as *mut i32;
-        // outIndices[0] = number of attributes found; [1..=count] = their 1-based request positions
-        // (AOSP packs only the changed indices). count <= n, so the last write is at offset count <= n,
-        // strictly inside the n+1-int allocation.
+
         let mut count: i32 = 0;
         for (attr, entry) in entries.iter().enumerate() {
             if entry.is_some() {
                 count += 1;
-                // SAFETY: count <= attr+1 <= n, so `count` is a valid offset into the n+1-int buffer.
-                // `base` is non-null (checked) and 4-byte-aligned by construction. The 1-based request
-                // position (attr+1) fits i32 (attr < n <= i32 array length).
+
                 let pos = i32::try_from(attr + 1).unwrap_or(i32::MAX);
                 unsafe { base.add(count as usize).write(pos) };
             }
         }
-        // SAFETY: offset 0 is within the n+1-int buffer (always >= 1 int). Written last so a found
-        // attribute's index write above never clobbers the count.
+
         unsafe { base.write(count) };
     }
 }
 
-/// `AssetManager.newTheme()` → a real Eclipse-owned [`theme_registry`] theme handle (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are `(EnvUnowned, JObject this)`.
-/// Allocates a [`theme_registry`] slot and returns its slab handle (≥ 1, never `0`). The framework
-/// wraps it as a `Resources$Theme`; later theme natives (`applyStyle`/`resolveAttributes`/
-/// `releaseTheme`) look it up through the bounds+generation-checked registry. Returns `0` (no theme)
-/// only on a registry error — which the framework treats as a failed theme create, never a fake
-/// success.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
-/// error/panic — a sound neutral "no theme" handle.
 extern "system" fn asset_manager_new_theme<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1593,17 +806,6 @@ extern "system" fn asset_manager_new_theme<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.applyThemeStyle(long theme, int styleRes, boolean force)` → record the applied
-/// style id on the [`theme_registry`] theme (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void, so the parameters are
-/// `(EnvUnowned, JObject this, jlong theme, jint style_res, jboolean force)`. Looks the theme handle
-/// up through the bounds+generation-checked [`theme_registry`] and appends `style_res` to its applied
-/// styles (a stale/fabricated theme handle is a typed `Err` — logged + ignored, never UB). No real
-/// style resolution is performed yet (the View cascade only needs the call to succeed without GTK).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
 extern "system" fn asset_manager_apply_theme_style<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1612,17 +814,13 @@ extern "system" fn asset_manager_apply_theme_style<'local>(
     force: jboolean,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // Resolve the applied style's bag + its parent chain from resources.arsc into a fresh map
-        // (child overriding parent). This happens OUTSIDE the registry lock (it reads the APK), then
-        // the result is merged into the theme under the lock.
         let mut chain = std::collections::HashMap::new();
         let style_u32 = u32::from_ne_bytes(style_res.to_ne_bytes());
         let resolved = merge_theme_style(&mut chain, style_u32);
 
         let merged = theme_registry::with_theme(theme, |t| {
             t.styles.push(style_res);
-            // `force` (AOSP): the applied style overrides existing theme values; otherwise it only
-            // fills attributes the theme does not already define.
+
             for (attr, val) in &chain {
                 if force {
                     t.attrs.insert(*attr, *val);
@@ -1655,18 +853,6 @@ extern "system" fn asset_manager_apply_theme_style<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.copyTheme(long dest, long source)` → copy the source [`theme_registry`] theme's
-/// recorded styles into the dest theme (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void, so the parameters are
-/// `(EnvUnowned, JObject this, jlong dest, jlong source)`. Reads the source theme's styles, then
-/// writes them onto the dest theme — both through the bounds+generation-checked [`theme_registry`]
-/// (a stale/fabricated handle on either side is a typed `Err`, logged + ignored, never UB). Two
-/// separate `with_theme` locks (read-then-write) avoid holding the registry lock across both; the
-/// launcher is single-threaded on the VM main thread, so no interleaving occurs.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
 extern "system" fn asset_manager_copy_theme<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1674,8 +860,6 @@ extern "system" fn asset_manager_copy_theme<'local>(
     source: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // Copy both the applied-style ids AND the merged attribute map (the latter is what
-        // obtainStyledAttributes reads — copying only `styles` would leave the dest theme empty).
         let src = theme_registry::with_theme(source, |t| (t.styles.clone(), t.attrs.clone()));
         match src {
             Ok((styles, attrs)) => {
@@ -1712,28 +896,6 @@ extern "system" fn asset_manager_copy_theme<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.applyStyle(long theme, long parser, int defStyleAttr, int defStyleRes,
-/// int[] attrs, int length, long outValues, long outIndices)` → resolve each requested styled
-/// attribute from the XML element (when `parser != 0`) and/or the theme's merged attribute map, and
-/// write the per-attribute `TypedArray` windows.
-///
-/// JNI ABI: an INSTANCE native returning void. `outValues`/`outIndices` are the framework's
-/// `TypedArray` off-heap buffers (same ABI as [`asset_manager_retrieve_attributes`]). 2026-06-05:
-/// this is AOSP's combined `obtainStyledAttributes(AttributeSet, int[], defStyleAttr, defStyleRes)`.
-/// Values layer theme < XML element (the inline XML attributes win; the theme fills the rest). The
-/// **theme** path (`parser == 0`) is what `Theme.obtainStyledAttributes(int[])` drives — including
-/// AppCompat's `theme.obtainStyledAttributes(R.styleable.AppCompatTheme)`; each requested attribute is
-/// looked up in the theme's merged map (built by [`merge_theme_style`] from the applied style's bag +
-/// parent chain in `resources.arsc`) and any `TYPE_REFERENCE`/`TYPE_ATTRIBUTE` is resolved to a
-/// concrete value (see [`resolve_theme_attr`]). An attribute absent from both the XML and the theme
-/// gets `TYPE_NULL` (the framework uses its built-in default — the sound AOSP fallback, not a value
-/// fake). A stale/fabricated theme handle yields all-`None` for the theme part — never UB.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept). `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
-//
-// 2026-06-05: arity is fixed by the JNI signature ART reported (8 args after `this`); a stub must
-// match it exactly. clippy's `too_many_arguments` does not fire on `extern "system"` fns.
 extern "system" fn asset_manager_apply_style<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1747,37 +909,18 @@ extern "system" fn asset_manager_apply_style<'local>(
     out_indices: jlong,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        // Size the fill to the requested attribute count. A null attrs array means nothing to fill;
-        // still write outIndices[0]=0 so the framework reads a defined count.
         let n = if attrs.is_null() { 0 } else { attrs.len(env)? };
         let mut entries = vec![None; n];
-        // 2026-06-05: ATL's `applyStyle` IS the combined obtainStyledAttributes(AttributeSet, int[])
-        // path. AOSP layers the result: theme < (def-style) < XML-style < explicit XML attributes. Two
-        // distinct callers:
-        //   • parser != 0 — a View constructor / inflater with an XML element: styled values come FIRST
-        //     from the element's inline attributes (e.g. `android:id`, which LayoutInflater + `View.
-        //     <init>` read via `getResourceId`), then the theme fills any attribute the XML did not set.
-        //   • parser == 0 — `Theme.obtainStyledAttributes(int[])` (no XML): every value comes from the
-        //     theme's merged attribute map. THIS is the path AppCompat's
-        //     `theme.obtainStyledAttributes(R.styleable.AppCompatTheme)` drives; before themes resolved,
-        //     it returned all-NULL → `windowActionBar` unset → the "Theme.AppCompat" IllegalStateException.
+
         if n != 0 {
             let mut ids = vec![0i32; n];
             attrs.get_region(env, 0, &mut ids)?;
             if parser != 0 {
                 entries = resolve_xml_attributes(parser, &ids);
-                // 2026-06-05: an inline XML attribute value can itself be a theme reference
-                // (`?attr/foo`, `TYPE_ATTRIBUTE`) — e.g. AppCompat's `ActionBarView$HomeView`/
-                // `ImageView` set `android:background="?attr/…"`. `resolve_xml_attributes` cannot
-                // resolve it (it has no theme), so the unresolved `TYPE_ATTRIBUTE` would reach
-                // `TypedArray.getDrawable`/`getColor`, which throw `UnsupportedOperationException:
-                // Failed to resolve attribute at index N`. Resolve each such value HERE against the
-                // active theme (the handle this native already holds) — the same theme map the
-                // `parser == 0` path uses. Surfaced by multitouch.test's AppCompat ActionBar inflation.
+
                 resolve_inline_theme_refs(theme, &mut entries);
             }
-            // Theme fallback: fill any attribute not already resolved from the XML element. For
-            // parser == 0 this resolves ALL of them from the theme.
+
             let theme_entries = resolve_theme_attributes(theme, &ids);
             for (slot, theme_entry) in entries.iter_mut().zip(theme_entries) {
                 if slot.is_none() {
@@ -1786,7 +929,7 @@ extern "system" fn asset_manager_apply_style<'local>(
             }
         }
         let changed = entries.iter().filter(|e| e.is_some()).count();
-        // Reuses the bounds-proven writer (writes only < n*STYLE_NUM_ENTRIES / <= n; a 0 ptr skipped).
+
         fill_typed_array(out_values, out_indices, &entries);
         tracing::debug!(
             target: "android.content.res.AssetManager",
@@ -1801,17 +944,6 @@ extern "system" fn asset_manager_apply_style<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.getResourceName(int resid)` → the resource's full `package:type/entry` name, or
-/// null if it cannot be resolved (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning a `String`, so the parameters are
-/// `(EnvUnowned, JObject this, jint resid)`. Resolves the packed id via Eclipse's own
-/// [`apk::arsc`](crate::apk::arsc) `resources.arsc` reader (see [`resolve_resource_name`]) and returns
-/// `package:type/entry`. A null `JString` is returned for an unresolvable id — which the framework
-/// turns into a `Resources.NotFoundException` (the correct outcome, not a fake name).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns a null `JString` on error/panic.
 extern "system" fn asset_manager_get_resource_name<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1842,12 +974,6 @@ extern "system" fn asset_manager_get_resource_name<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.getResourcePackageName(int resid)` → the resource id's package name, or null.
-///
-/// JNI ABI: an INSTANCE native (`(EnvUnowned, JObject this, jint)`). Mirrors
-/// [`asset_manager_get_resource_name`] but returns only the package component via
-/// [`resolve_resource_package_name`]. `resolve::<LogErrorAndDefault>` returns the default (null) on an
-/// internal error/panic; an unresolvable id returns null explicitly (→ `NotFoundException`).
 extern "system" fn asset_manager_get_resource_package_name<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1878,10 +1004,6 @@ extern "system" fn asset_manager_get_resource_package_name<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Resolve a packed resource id to JUST its package name via the matching `resources.arsc` (framework
-/// table for package `0x01`, app table otherwise; see [`arsc_bytes_for`]). The package id is the id's
-/// high byte. Returns `None` for any failure (no path, missing/corrupt ARSC, or a package the table
-/// does not name) — never panics. Parses fresh per call (mirrors [`resolve_resource_name`]).
 fn resolve_resource_package_name(resid: u32) -> Option<String> {
     let bytes = arsc_bytes_for(resid)?;
     let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
@@ -1889,12 +1011,6 @@ fn resolve_resource_package_name(resid: u32) -> Option<String> {
     table.package_name(package_id).map(str::to_owned)
 }
 
-/// `AssetManager.getResourceIdentifier(String name, String defType, String defPackage)` → the packed
-/// resource id, or 0 if not found (AOSP's `Resources.getIdentifier`).
-///
-/// JNI ABI: an INSTANCE native (`(EnvUnowned, JObject this, jstring, jstring, jstring)`). Resolves via
-/// [`resolve_resource_identifier`]; `resolve::<LogErrorAndDefault>` returns the `jint` default (`0`) on
-/// an internal error/panic, and a not-found name returns `0` explicitly — both the correct "no such id".
 extern "system" fn asset_manager_get_resource_identifier<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -1925,21 +1041,13 @@ extern "system" fn asset_manager_get_resource_identifier<'local>(
             resid = format_args!("0x{resid:08x}"),
             "AssetManager.getResourceIdentifier"
         );
-        // jint is i32; reinterpret the u32 id's bits (a valid id fits, 0 = not found).
+
         Ok(i32::from_ne_bytes(resid.to_ne_bytes()))
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Resolve `Resources.getIdentifier(name, defType, defPackage)` to a packed resource id (or `0`).
-///
-/// Parses the AOSP `[package:][type/]entry` form of `name` (falling back to `defType`/`defPackage` for
-/// the type/package), selects the framework table for package `android` else the app table (via
-/// [`arsc_bytes_for`]'s id-dispatch with a probe id), and reverse-looks-up the id with
-/// [`arsc::ResTable::find_resource_id`](crate::apk::arsc::ResTable::find_resource_id). Returns `0`
-/// (AOSP's "not found") for an empty entry, an unknown name, or any ARSC failure — never panics.
 fn resolve_resource_identifier(name: &str, def_type: &str, def_package: &str) -> u32 {
-    // Parse the optional "package:" prefix, then the optional "type/" prefix, then the entry.
     let (pkg_in_name, rest) = match name.split_once(':') {
         Some((p, r)) => (Some(p), r),
         None => (None, name),
@@ -1964,9 +1072,9 @@ fn resolve_resource_identifier(name: &str, def_type: &str, def_package: &str) ->
     };
     let pkg = pick(pkg_in_name, def_package);
     let Some(typ) = pick(type_in_name, def_type) else {
-        return 0; // no type → cannot identify a resource
+        return 0;
     };
-    // Pick the table by package: the framework ("android") table (package 0x01) vs the app table.
+
     let probe_id: u32 = if pkg.as_deref() == Some("android") {
         0x0100_0000
     } else {
@@ -1983,47 +1091,20 @@ fn resolve_resource_identifier(name: &str, def_type: &str, def_package: &str) ->
         .unwrap_or(0)
 }
 
-/// Read an asset from the booted APK via Eclipse's own `src/apk` reader. `None` if the APK path is
-/// unset or the entry is absent/unreadable (the caller returns `0` → `FileNotFoundException`).
-///
-/// 2026-06-11: ATL's `AssetManager.open` passes `openAsset` the FULL APK-relative path (already
-/// `assets/…`), unlike stock AOSP (a path relative to `assets/`). Accept BOTH: use the name as-is when
-/// it already has the `assets/` prefix, else prepend it (so a double `assets/assets/…` can't happen).
-///
-/// 2026-07-01: ATL's `AssetManager.openNonAsset` (AssetManager.java line 393) funnels through the
-/// SAME `openAsset` native with an APK-ROOT-relative path (the AOSP openNonAsset contract — e.g.
-/// `Resources.loadDrawable` opening `res/drawable-mdpi-v4/topbar_ic_close.png`). Serve the exact
-/// entry when it exists, and only fall back to the `assets/` prefix for the assets-relative form —
-/// detection, not an assumed prefix.
 fn read_asset_bytes(name: &str) -> Option<Vec<u8>> {
     read_asset_bytes_from(APK_PATH.get()?, name)
 }
 
-/// [`read_asset_bytes`] against an explicit APK path (the testable seam — the global
-/// [`APK_PATH`] is process-wide and set once by the boot).
 fn read_asset_bytes_from(apk_path: &str, name: &str) -> Option<Vec<u8>> {
     let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
     asset_entry_candidates(name).find_map(|entry| apk.read_entry(&entry).ok())
 }
 
-/// The zip-entry candidates for an asset `name`, in resolution order — the ONE shared rule for
-/// every asset consumer (2026-07-02: the byte path [`read_asset_bytes`] and the fd path
-/// [`asset_fd_for`] had diverged; only the byte path served APK-root-relative names).
-///
-/// Order: the exact entry first (ATL's `openNonAsset`/`openNonAssetFd` pass APK-root-relative
-/// paths such as `res/…`), then the `assets/`-prefixed form for an assets-relative name. An
-/// already-`assets/`-prefixed name gets no fallback (a double `assets/assets/…` can't happen);
-/// its exact miss is a genuine miss.
 fn asset_entry_candidates(name: &str) -> impl Iterator<Item = String> {
     let fallback = (!name.starts_with("assets/")).then(|| format!("assets/{name}"));
     std::iter::once(name.to_owned()).chain(fallback)
 }
 
-/// `AssetManager.openAsset(String fileName, int accessMode)` → an [`asset_registry`] handle, or `0`.
-///
-/// JNI ABI: an INSTANCE native. Reads `assets/<fileName>` via [`read_asset_bytes`] and stores it as an
-/// open stream; the `accessMode` (random/streaming/buffer) is advisory and ignored (Eclipse buffers
-/// the whole asset). Returns `0` on a missing asset (→ `FileNotFoundException`, the non-faked outcome).
 extern "system" fn asset_manager_open_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2065,18 +1146,12 @@ extern "system" fn asset_manager_open_asset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Errors from [`asset_fd_for`]. Every variant maps to the NEGATIVE `openAssetFd` return that
-/// makes ATL's `openFd_internal` throw the designed, caught-by-callers `FileNotFoundException`
-/// (androidx.profileinstaller's no-profile path catches exactly that `IOException`). 2026-06-12.
 #[derive(Debug)]
 enum AssetFdError {
-    /// The APK could not be opened or the entry is absent (the typed `src/apk` error).
     Apk(crate::apk::ApkError),
-    /// The entry exists but is NOT Stored — AOSP's own `openAssetFd` refuses compressed assets
-    /// (an fd+offset+length can only serve raw Stored bytes), so the FileNotFoundException is
-    /// the correct caught outcome, matching real-Android behavior for this APK.
+
     Compressed,
-    /// Re-opening the APK file for the fresh fd failed.
+
     Io(std::io::Error),
 }
 
@@ -2090,18 +1165,6 @@ impl fmt::Display for AssetFdError {
     }
 }
 
-/// Resolve an asset name to the fd-servable triple `(fresh APK fd, data offset, uncompressed
-/// length)` behind `AssetManager.openAssetFd`. Resolves the entry through the same
-/// [`asset_entry_candidates`] rule as [`read_asset_bytes`] (2026-07-02: exact/APK-root-relative
-/// first — ATL's `openNonAssetFd` shares `openFd_internal` — then the `assets/` prefix; the fd
-/// path previously prepended `assets/` unconditionally, so root-relative entries could never be
-/// fd-served).
-///
-/// 2026-06-12: a FRESH fd is opened per call because ownership transfers to Java
-/// (`FileDescriptor.setInt$` → `ParcelFileDescriptor` → `AssetFileDescriptor`, which closes it) —
-/// never a shared/dup'd cached fd. The triple is only produced for a Stored entry
-/// ([`crate::apk::Apk::entry_span`]); anything else is the typed `Err` → the caller's `-1` →
-/// Java's designed `FileNotFoundException`.
 fn asset_fd_for(apk_path: &str, name: &str) -> Result<(c_int, u64, u64), AssetFdError> {
     let mut apk =
         crate::apk::Apk::open(std::path::Path::new(apk_path)).map_err(AssetFdError::Apk)?;
@@ -2129,10 +1192,6 @@ fn asset_fd_for(apk_path: &str, name: &str) -> Result<(c_int, u64, u64), AssetFd
     ))
 }
 
-/// Write `value` into `arr[0]` (an `openAssetFd` out-param `long[]`), returning `false` on
-/// failure with the JNI exception described+cleared (the caller then closes the fd and reports
-/// `-1` — never a half-written success). A null array is skipped (`true`), mirroring AOSP's
-/// null-tolerant out-params.
 fn write_long_out_param(env: &mut Env, arr: &JLongArray, value: jlong, which: &str) -> bool {
     if arr.is_null() {
         return true;
@@ -2155,17 +1214,6 @@ fn write_long_out_param(env: &mut Env, arr: &JLongArray, value: jlong, which: &s
     }
 }
 
-/// `AssetManager.openAssetFd(String fileName, int mode, long[] outOffsets, long[] outLengths)` →
-/// an OWNED raw fd on the APK file with `outOffsets[0]`/`outLengths[0]` set, or `-1`.
-///
-/// 2026-06-12: the REAL fd implementation (the EXIT=10 fix — see the constants' section note).
-/// A Stored `assets/<fileName>` entry is served as `(fresh APK fd, data_start, uncompressed
-/// length)` via [`asset_fd_for`]; fd ownership transfers to Java (`ParcelFileDescriptor` closes
-/// it). Absent or compressed entries return `-1` → ATL's `openFd_internal` throws the designed
-/// `FileNotFoundException` (the caught no-profile path). The body NEVER propagates a JNI error
-/// (which would resolve to the default `0` — a VALID fd number); every failure is an explicit
-/// `-1` with any pending exception described+cleared, and an fd whose out-params could not be
-/// written is closed here (Java never owned it).
 extern "system" fn asset_manager_open_asset_fd<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2213,18 +1261,14 @@ extern "system" fn asset_manager_open_asset_fd<'local>(
                 return Ok(-1);
             }
         };
-        // u64 → jlong, total: a real APK is far below i64::MAX, but a conversion failure must
-        // close the fresh fd and report -1, never wrap into a bogus offset/length.
+
         let (Ok(offset), Ok(length)) = (jlong::try_from(offset), jlong::try_from(length)) else {
-            // SAFETY: `fd` was freshly opened by asset_fd_for and not yet handed to Java; Eclipse
-            // still owns it, so closing it here is sound and leak-free.
             unsafe { libc::close(fd) };
             return Ok(-1);
         };
         if !write_long_out_param(env, &out_offsets, offset, "outOffsets")
             || !write_long_out_param(env, &out_lengths, length, "outLengths")
         {
-            // SAFETY: as above — the fd was never returned, Eclipse still owns it.
             unsafe { libc::close(fd) };
             return Ok(-1);
         }
@@ -2241,16 +1285,6 @@ extern "system" fn asset_manager_open_asset_fd<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Map a registry read outcome to ATL's `readAsset` native return contract (2026-07-02): `n > 0`
-/// bytes read → `n`; `0` at EOF; NEGATIVE only for a genuine error (stale/fabricated handle).
-///
-/// ATL's `readAsset_internal` (vendored `AssetManager.java` line 592) throws `IOException` for ANY
-/// negative native return and itself maps `0` → the `InputStream` `-1` EOF — the reference native
-/// (`Asset_read` → `android::Asset::read`) returns `0` at EOF. Eclipse previously used the AOSP
-/// framework convention (`-1` at EOF) here, so EVERY `AssetInputStream` read to EOF threw
-/// `IOException` (caught by the dictionary/cacert readers all along; FATAL once the 2026-07-01
-/// drawable fix routed the splash PNG through `BitmapFactory.nativeDecodeStream` → the Java
-/// stream — the challenge4 `Resources$NotFoundException` boot abort).
 fn atl_read_asset_return(outcome: &Result<Vec<u8>, asset_registry::AssetRegistryError>) -> jint {
     match outcome {
         Ok(read) => i32::try_from(read.len()).unwrap_or(jint::MAX),
@@ -2258,14 +1292,6 @@ fn atl_read_asset_return(outcome: &Result<Vec<u8>, asset_registry::AssetRegistry
     }
 }
 
-/// `AssetManager.readAsset(long asset, byte[] b, long off, long len)` → bytes read, `0` at EOF, or
-/// `-1` on a bad handle.
-///
-/// JNI ABI: an INSTANCE native. Reads up to `len` bytes from the stream's cursor into `b[off..]`.
-/// The return value follows the ATL contract ([`atl_read_asset_return`]): `0` at EOF (ATL's Java
-/// maps it to the `InputStream` `-1`), negative ONLY for a genuine error (→ Java `IOException`).
-/// `resolve::<LogErrorAndDefault>` returns `0` only on an internal JNI error (e.g. the array write
-/// throwing `ArrayIndexOutOfBounds`).
 extern "system" fn asset_manager_read_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2278,8 +1304,7 @@ extern "system" fn asset_manager_read_asset<'local>(
         if len <= 0 {
             return Ok(0);
         }
-        // Bound the read to what actually fits in b[off..] so set_region can never throw
-        // ArrayIndexOutOfBounds (a pending JNI exception ATL would surface as IOException).
+
         let array_len = i64::try_from(b.len(env).unwrap_or(0)).unwrap_or(i64::MAX);
         let off = off.clamp(0, array_len);
         let fits = (array_len - off).max(0);
@@ -2293,14 +1318,12 @@ extern "system" fn asset_manager_read_asset<'local>(
             tmp.truncate(n);
             tmp
         });
-        // 2026-07-02: the ATL return contract lives in atl_read_asset_return — a stale/fabricated
-        // handle is the ONLY negative (→ Java IOException); EOF is 0, never -1.
+
         let ret = atl_read_asset_return(&outcome);
         let Ok(read) = outcome else {
             return Ok(ret);
         };
         if !read.is_empty() {
-            // Java bytes are jbyte = i8; reinterpret each byte's bits (no lossy cast).
             let signed: Vec<i8> = read.iter().map(|&x| i8::from_ne_bytes([x])).collect();
             let start = jni::sys::jsize::try_from(off).unwrap_or(jni::sys::jsize::MAX);
             b.set_region(env, start, &signed)?;
@@ -2315,14 +1338,6 @@ extern "system" fn asset_manager_read_asset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.readAssetChar(long asset)` → the next byte (`0..=255`), or `-1` at EOF / on a bad
-/// handle.
-///
-/// 2026-07-02: the single-byte `AssetInputStream.read()` native (vendored `AssetManager.java` line
-/// 685) — previously unbound, so any one-byte read was a call-time `UnsatisfiedLinkError`. The
-/// reference native (`readAssetChar` in ATL's `android_content_res_AssetManager.c`) returns the
-/// byte when exactly 1 was read, else `-1` (the `InputStream.read()` EOF contract — no `IOException`
-/// mapping on this path, so `-1` is correct here, unlike [`atl_read_asset_return`]).
 extern "system" fn asset_manager_read_asset_char<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2335,32 +1350,20 @@ extern "system" fn asset_manager_read_asset_char<'local>(
         });
         Ok(match byte {
             Ok(Some(b)) => jint::from(b),
-            Ok(None) | Err(_) => -1, // EOF, or a stale/fabricated handle
+            Ok(None) | Err(_) => -1,
         })
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Translate the `whence` ATL's `AssetInputStream` passes `seekAsset` into the lseek-style whence
-/// [`asset_registry::AssetStream::seek`] takes (2026-07-02).
-///
-/// The Java side (vendored `AssetManager.java`, copied from AOSP) uses the AOSP-native convention:
-/// `mark()` queries the position with `seekAsset(0, 0)` (CUR), `reset()` restores with
-/// `seekAsset(mMarkPos, -1)` (SET), `skip(n)` advances with `seekAsset(n, 0)` (CUR) — i.e. `< 0` =
-/// SET, `0` = CUR, `> 0` = END (AOSP `android_util_AssetManager.cpp`'s exact mapping). Passing the
-/// value through raw (lseek: `0` = SET) made `mark()` REWIND the stream and `reset()` fail — the
-/// same Java-contract-vs-native-convention split as [`atl_read_asset_return`]. (ATL's own C passes
-/// whence raw into `Asset::seek` — an upstream divergence from its Java; Eclipse serves the Java.)
 fn atl_seek_whence_to_lseek(whence: jint) -> i32 {
     match whence {
-        w if w < 0 => 0, // SET
-        0 => 1,          // CUR
-        _ => 2,          // END
+        w if w < 0 => 0,
+        0 => 1,
+        _ => 2,
     }
 }
 
-/// `AssetManager.seekAsset(long asset, long offset, int whence)` → the new cursor position, or `-1`.
-/// `whence` uses the AOSP Java convention, translated by [`atl_seek_whence_to_lseek`].
 extern "system" fn asset_manager_seek_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2379,7 +1382,6 @@ extern "system" fn asset_manager_seek_asset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.getAssetLength(long asset)` → the asset's total length, or `-1` on a bad handle.
 extern "system" fn asset_manager_get_asset_length<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2394,7 +1396,6 @@ extern "system" fn asset_manager_get_asset_length<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.getAssetRemainingLength(long asset)` → bytes from the cursor to EOF, or `-1`.
 extern "system" fn asset_manager_get_asset_remaining_length<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2411,46 +1412,30 @@ extern "system" fn asset_manager_get_asset_remaining_length<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.destroyAsset(long asset)` → free the stream (idempotent on a stale handle).
 extern "system" fn asset_manager_destroy_asset<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     asset: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        let _ = asset_registry::free(asset); // a double/stale free is a harmless no-op
+        let _ = asset_registry::free(asset);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind the asset-STREAM read cycle (`readAsset`/`readAssetChar`/`seekAsset`/`getAssetLength`/
-/// `getAssetRemainingLength`/`destroyAsset`) plus the fd-serving `openAssetFd` (2026-06-12) on
-/// `android/content/res/AssetManager`, BEST-EFFORT.
-///
-/// `openAsset` is bound in the main [`register_asset_manager_natives`] array (its signature is
-/// confirmed). These follow-on natives use the classic AOSP signatures; if this ATL build declares any
-/// differently, RegisterNatives throws and we clear+log it (the dev-host run then names the real
-/// signature) instead of aborting — so a read-cycle sig drift never breaks the already-registered
-/// `openAsset`/resource natives. On the standard signatures the full asset stream works in one bind.
 fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // Register each native INDEPENDENTLY (best-effort) so the ones this ATL build DOES declare bind
-    // even if a sibling does not: ATL has `getAssetLength(J)J`/`destroyAsset(J)V` but reads assets
-    // without the classic `readAsset(J[BII)I` (a grouped bind would fail as a whole on that one). Each
-    // entry's fn matches its paired signature; a `NoSuchMethodError` is cleared + logged, not fatal.
     let natives: [(&JNIStr, &JNIStr, *mut c_void); 7] = [
         (
             ASSET_MANAGER_READ_ASSET_NAME,
             ASSET_MANAGER_READ_ASSET_SIG,
             asset_manager_read_asset as *mut c_void,
         ),
-        // 2026-07-02: the single-byte read() native (previously unbound → UnsatisfiedLinkError).
         (
             ASSET_MANAGER_READ_ASSET_CHAR_NAME,
             ASSET_MANAGER_READ_ASSET_CHAR_SIG,
             asset_manager_read_asset_char as *mut c_void,
         ),
-        // 2026-06-12: the fd-serving open (covers openNonAssetFd via Java's shared openFd_internal).
         (
             ASSET_MANAGER_OPEN_ASSET_FD_NAME,
             ASSET_MANAGER_OPEN_ASSET_FD_SIG,
@@ -2480,8 +1465,7 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let mut bound = 0u32;
     for (name, sig, ptr) in natives {
         let class = env.find_class(ASSET_MANAGER_CLASS)?;
-        // SAFETY: `class` is the loaded AssetManager; `ptr` is an `extern "system"` fn whose signature
-        // is `sig` by construction. A method this build doesn't declare throws (cleared best-effort).
+
         let method = unsafe { NativeMethod::from_raw_parts(name, sig, ptr) };
         match unsafe { env.register_native_methods(&class, std::slice::from_ref(&method)) } {
             Ok(()) => bound += 1,
@@ -2505,49 +1489,25 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-/// The framework `resources.arsc` bytes (from `framework-res.apk`), cached once.
-///
-/// 2026-06-05: `android.R.*` ids live in package `0x01` (the AOSP framework resource table), which
-/// the app's own `resources.arsc` (package `0x7f`) does not contain — e.g. `android.R.id.text1`
-/// (`0x01020002`). The app side reads its ARSC fresh per call from the zip; here we read
-/// `framework-res.apk`'s `resources.arsc` **once** and own the bytes for the rest of the process
-/// (parsed per call into a borrowed [`ResTable`](crate::apk::arsc::ResTable), mirroring the app
-/// path — no self-referential struct, no UB). The lifecycle runs solely on the attached main
-/// thread, so `OnceLock` has no contention.
 static FRAMEWORK_ARSC: OnceLock<Vec<u8>> = OnceLock::new();
 
-/// Owned `resources.arsc` bytes for the table that serves `resid`, dispatched by its high byte
-/// (the package id): `0x01` → the framework table ([`FRAMEWORK_ARSC`], from `framework-res.apk`),
-/// anything else → the app table (read fresh from the APK at [`APK_PATH`], preserving the existing
-/// per-call behavior). Returns `None` on any failure (no path, missing/corrupt entry) — never panics.
 fn arsc_bytes_for(resid: u32) -> Option<Vec<u8>> {
     if (resid >> 24) as u8 == 0x01 {
-        // Framework table: load+cache framework-res.apk's resources.arsc bytes once.
         if let Some(bytes) = FRAMEWORK_ARSC.get() {
             return Some(bytes.clone());
         }
         let fw = crate::runtime::find_framework().ok()?;
         let mut apk = crate::apk::Apk::open(&fw.framework_res_apk).ok()?;
         let bytes = apk.read_entry("resources.arsc").ok()?;
-        // Race-free: another caller may have set it first; either way we end up with cached bytes.
+
         Some(FRAMEWORK_ARSC.get_or_init(|| bytes).clone())
     } else {
-        // App table: read fresh from the APK zip (the launcher resolves few names; avoids holding a
-        // borrowed ResTable across the JNI boundary).
         let apk_path = APK_PATH.get()?;
         let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
         apk.read_entry("resources.arsc").ok()
     }
 }
 
-/// Resolve a packed resource id to its full `package:type/entry` name via the matching `resources.arsc`.
-///
-/// Reads the right table's `resources.arsc` bytes via [`arsc_bytes_for`] (framework table for
-/// package `0x01`, app table otherwise), parses it with
-/// [`apk::arsc::parse_arsc`](crate::apk::arsc::parse_arsc), then composes the package name + 1-based
-/// type name + entry (key) name. Returns `None` for any failure (no path, missing/corrupt ARSC,
-/// or an id whose package/type/entry is absent) — never panics. Parses fresh per call (avoids
-/// holding a borrowed `ResTable` across the JNI boundary, mirroring [`open_xml_block`]).
 fn resolve_resource_name(resid: u32) -> Option<String> {
     let bytes = arsc_bytes_for(resid)?;
     let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
@@ -2560,30 +1520,24 @@ fn resolve_resource_name(resid: u32) -> Option<String> {
         .key_name(package_id, resolved.key_index)
         .ok()
         .flatten()?;
-    // AOSP getResourceName format is `package:type/entry`; the package name is optional in the ARSC.
+
     match table.package_name(package_id) {
         Some(pkg) => Some(format!("{pkg}:{type_name}/{entry_name}")),
         None => Some(format!("{type_name}/{entry_name}")),
     }
 }
 
-/// A resource value resolved from `resources.arsc` for `loadResourceValue`: the `Res_value`
-/// type/data plus, for a `TYPE_STRING`, the resolved pooled string (e.g. a layout file path).
 struct ResolvedResValue {
     type_: i32,
     data: i32,
     string: Option<String>,
 }
 
-/// Resolve a packed resource id to its `Res_value` (and pooled string for a `TYPE_STRING`) via the
-/// matching `resources.arsc` (framework table for package `0x01`, app table otherwise; see
-/// [`arsc_bytes_for`]). `None` for any failure (no path, missing/corrupt ARSC, complex/absent
-/// entry) — never panics. Parses fresh per call (mirrors [`resolve_resource_name`]).
 fn resolve_res_value(resid: u32) -> Option<ResolvedResValue> {
     let bytes = arsc_bytes_for(resid)?;
     let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
     let resolved = table.resource_value(resid)?;
-    // A complex (bag/map) entry has no single Res_value; loadResourceValue cannot represent it here.
+
     if resolved.is_complex {
         return None;
     }
@@ -2599,19 +1553,6 @@ fn resolve_res_value(resid: u32) -> Option<ResolvedResValue> {
     })
 }
 
-/// `AssetManager.loadResourceValue(int resid, short density, TypedValue outValue, boolean
-/// resolveRefs)` → write the resolved `Res_value` onto `outValue`; return the asset cookie or 0.
-///
-/// JNI ABI: an INSTANCE native returning `jint`, so the parameters are
-/// `(EnvUnowned, JObject this, jint resid, jshort density, JObject out_value, jboolean resolve_refs)`.
-/// Resolves `resid` via Eclipse's own [`apk::arsc`](crate::apk::arsc) reader and writes the public
-/// `TypedValue` fields (`type`/`data`/`assetCookie`/`resourceId`/`density`, and `string` for a
-/// `TYPE_STRING`). Returns [`ECLIPSE_ASSET_COOKIE`] on success, `0` if the id is absent/complex (the
-/// framework then reports not-found — the correct outcome, not a fake value).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jint` default (`0`) on
-/// error/panic — the same neutral "not found".
 extern "system" fn asset_manager_load_resource_value<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2631,14 +1572,9 @@ extern "system" fn asset_manager_load_resource_value<'local>(
             return Ok(0);
         };
         if out_value.is_null() {
-            // No TypedValue to fill; report not-found rather than risk a null write.
             return Ok(0);
         }
 
-        // SAFETY: "type"/"data"/"assetCookie"/"resourceId"/"density" are `public int` fields of
-        // android.util.TypedValue (TypedValue.java lines 242/252/258/263/274), so the "I" signature
-        // paired with JavaType::Int is consistent — exactly FieldSignature::from_raw_parts' invariant.
-        // set_field re-checks the value type at runtime, so a mismatch is a typed error, never UB.
         let int_sig =
             unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
         env.set_field(
@@ -2648,8 +1584,7 @@ extern "system" fn asset_manager_load_resource_value<'local>(
             resolved.type_.into(),
         )?;
         env.set_field(&out_value, jni_str!("data"), &int_sig, resolved.data.into())?;
-        // 2026-07-01: the cookie names the TABLE the value (and, for TYPE_STRING, its pool index)
-        // came from — app (1) vs framework (2) — matching AssetManager.getPooledString's routing.
+
         env.set_field(
             &out_value,
             jni_str!("assetCookie"),
@@ -2663,15 +1598,10 @@ extern "system" fn asset_manager_load_resource_value<'local>(
             &int_sig,
             jint::from(density).into(),
         )?;
-        // For a TYPE_STRING, set the `string` CharSequence field to the resolved pooled string (e.g.
-        // the layout file path the framework opens). new_string yields a java.lang.String, which IS a
-        // CharSequence, so the field set is type-correct.
+
         if let Some(s) = &resolved.string {
             let jstr = env.new_string(s)?;
-            // SAFETY: `string` is a `public CharSequence` field of android.util.TypedValue
-            // (TypedValue.java line 247), so the `Ljava/lang/CharSequence;` descriptor paired with
-            // `JavaType::Object` is consistent — exactly FieldSignature::from_raw_parts' invariant.
-            // set_field re-checks the value (a java.lang.String IS a CharSequence) at runtime.
+
             let cs_sig =
                 unsafe { FieldSignature::from_raw_parts(CHAR_SEQUENCE_SIG, JavaType::Object) };
             env.set_field(
@@ -2694,22 +1624,6 @@ extern "system" fn asset_manager_load_resource_value<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.loadThemeAttributeValue(long theme, int ident, TypedValue outValue, boolean
-/// resolveRefs)` → resolve theme attribute `ident` against the applied theme and write it onto
-/// `outValue`; return the asset cookie or 0 (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning `jint`, so the parameters are
-/// `(EnvUnowned, JObject this, jlong theme, jint ident, JObject out_value, jboolean resolve_refs)`.
-/// Looks `ident` up in the theme handle's merged attribute map (built by `applyThemeStyle`) via the
-/// same [`resolve_theme_attr`] reference chase the styled-attribute path uses, then writes the public
-/// `TypedValue` fields (`type`/`data`/`assetCookie`/`resourceId`/`density`, and `string` for a
-/// `TYPE_STRING`). Returns [`ECLIPSE_ASSET_COOKIE`] when the attribute is present in the theme, `0`
-/// when absent / the theme handle is stale (AOSP's `resolveAttribute` returns false for an unresolved
-/// theme attribute — the correct outcome, not a faked value).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jint` default (`0`) on
-/// error/panic — the same neutral "not resolved".
 extern "system" fn asset_manager_load_theme_attribute_value<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2720,11 +1634,11 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<jint> {
         if out_value.is_null() {
-            // No TypedValue to fill; report not-resolved rather than risk a null write.
+
             return Ok(0);
         }
-        // Resolve `ident` against the theme's merged attribute map (reference-chased to a concrete
-        // value). A stale/empty theme or an absent attribute → None → not-resolved (0).
+
+
         let entry = theme_registry::with_theme(theme, |t| resolve_theme_attr(&t.attrs, ident))
             .ok()
             .flatten();
@@ -2738,10 +1652,10 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             return Ok(0);
         };
 
-        // SAFETY: "type"/"data"/"assetCookie"/"resourceId" are `public int` fields of
-        // android.util.TypedValue, so the "I" signature paired with JavaType::Int is consistent —
-        // exactly FieldSignature::from_raw_parts' invariant. set_field re-checks the value type at
-        // runtime, so a mismatch is a typed error, never UB.
+
+
+
+
         let int_sig =
             unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
         env.set_field(
@@ -2763,20 +1677,20 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             &int_sig,
             entry.resource_id.into(),
         )?;
-        // 2026-07-01: same-pattern audit fix alongside the styled-attribute string-pool routing —
-        // this native previously left `TypedValue.string` NULL for a TYPE_STRING theme value, so
-        // `Theme.resolveAttribute` consumers (e.g. `Resources.loadDrawable` on a theme drawable)
-        // hit the identical "Resource is not a Drawable … \"<null>\"" failure. Resolve the pooled
-        // string from the table the entry's cookie names, exactly like `loadResourceValue`.
+
+
+
+
+
         if entry.value_type == i32::from(TYPE_STRING) {
             if let Some(s) =
                 arsc_pool_string(entry.asset_cookie, u32::from_ne_bytes(entry.data.to_ne_bytes()))
             {
                 let jstr = env.new_string(&s)?;
-                // SAFETY: `string` is a `public CharSequence` field of android.util.TypedValue, so
-                // the `Ljava/lang/CharSequence;` descriptor paired with `JavaType::Object` is
-                // consistent — exactly FieldSignature::from_raw_parts' invariant. set_field
-                // re-checks the value (a java.lang.String IS a CharSequence) at runtime.
+
+
+
+
                 let cs_sig =
                     unsafe { FieldSignature::from_raw_parts(CHAR_SEQUENCE_SIG, JavaType::Object) };
                 env.set_field(
@@ -2809,21 +1723,6 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `AssetManager.getPooledString(int block, int id)` → the ARSC global value-pool string the
-/// `(block, id)` pair names, or null (2026-07-01).
-///
-/// JNI ABI: an INSTANCE native returning `CharSequence`, so the parameters are
-/// `(EnvUnowned, JObject this, jint block, jint id)`. `block` is the positive asset cookie the
-/// styled-attribute natives wrote ([`ARSC_APP_COOKIE`] = the app `resources.arsc`,
-/// [`ARSC_FRAMEWORK_COOKIE`] = `framework-res.apk`'s); `id` is the index into that table's global
-/// value string pool. This is what `TypedArray.loadStringValueAt` calls for a `cookie >= 0` string
-/// (`getString`/`getText`/`loadDrawable` path). An unknown cookie or out-of-range index returns
-/// null with a WARN — the loud, observable signal of a wrong-pool regression (the silent form of
-/// which was the challenge boot's `Resource is not a Drawable … "<null>"`).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns a null `JString` on error/panic
-/// (a `java.lang.String` IS a `CharSequence`, so the declared return type is satisfied).
 extern "system" fn asset_manager_get_pooled_string<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -2848,17 +1747,6 @@ extern "system" fn asset_manager_get_pooled_string<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Read `name` from the APK zip, parse it as binary XML, and store it as an [`xml_registry`] block.
-///
-/// Returns the non-zero block handle, or a typed [`AssetError`] on any failure (no stashed APK path,
-/// missing entry, parse error, or registry error) — the caller maps that to the `0` "no asset"
-/// sentinel. Opens the APK fresh per call (the launcher opens few XML assets; this avoids holding a
-/// `ZipArchive` across the JNI boundary and keeps the asset state a single `OnceLock<String>` path).
-///
-/// 2026-07-01: `cookie` selects the archive, matching the tables' cookies —
-/// [`ARSC_FRAMEWORK_COOKIE`] opens `framework-res.apk` (a framework XML file path resolved from the
-/// framework table, e.g. a theme drawable), anything else the app APK (the existing behavior; ATL's
-/// `Resources.loadXmlResourceParser` passes `TypedValue.assetCookie` through `openXmlResourceParser`).
 fn open_xml_block(cookie: jint, name: &str) -> Result<jlong, AssetError> {
     let bytes = if cookie == ARSC_FRAMEWORK_COOKIE {
         let fw = crate::runtime::find_framework().map_err(|_| AssetError::NoApkPath)?;
@@ -2874,17 +1762,14 @@ fn open_xml_block(cookie: jint, name: &str) -> Result<jlong, AssetError> {
     Ok(handle)
 }
 
-/// Errors from opening an XML asset out of the APK for [`open_xml_block`]. Internal to the asset
-/// backing; surfaced only as a log line + the `0` sentinel return (never panics across JNI).
 #[derive(Debug)]
 enum AssetError {
-    /// No APK path was stashed before the asset call (a registration ordering bug).
     NoApkPath,
-    /// Reading the entry from the APK zip failed (missing entry, zip error, I/O).
+
     Apk(crate::apk::ApkError),
-    /// The entry was not parseable binary XML.
+
     Axml(crate::apk::axml::AxmlError),
-    /// Storing the parsed block in the registry failed (poisoned mutex / slab full).
+
     Registry(xml_registry::XmlRegistryError),
 }
 
@@ -2915,26 +1800,9 @@ impl From<xml_registry::XmlRegistryError> for AssetError {
     }
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.content.res.AssetManager`'s `init` native.
-///
-/// Locates `android/content/res/AssetManager` and registers the native via `RegisterNatives` (which
-/// wins over name-based lazy binding — JNI 1.1 spec). Like [`register_context_natives`]/
-/// [`register_log_natives`], this MUST run before anything triggers `AssetManager`'s first active use
-/// (an `AssetManager` constructor); it is registered before the lifecycle drive, since ART resolves
-/// natives lazily during the lifecycle and the framework builds an `AssetManager` early in init.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
-/// signature. It does, by construction — [`asset_manager_init`] is written to the exact `(I)V`
-/// descriptor as an instance native (`EnvUnowned, JObject this, jint`). The native body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary
-/// (AGENTS.md §2.8).
 fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(ASSET_MANAGER_CLASS)?;
     let methods = [
-        // SAFETY: `asset_manager_init` matches the paired `(I)V` signature as an instance native
-        // (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_INIT_NAME,
@@ -2942,9 +1810,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_init as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_set_apk_assets` matches the paired `([Ljava/lang/Object;I)V`
-        // signature as an instance native (see the native's docs); casting the `extern "system"`
-        // fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_SET_APK_ASSETS_NAME,
@@ -2952,10 +1817,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_set_apk_assets as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_set_configuration` matches the paired
-        // `(IILjava/lang/String;IIIIIIIIIIIIII)V` signature as an instance native (see the native's
-        // docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_SET_CONFIGURATION_NAME,
@@ -2963,9 +1824,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_set_configuration as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_open_xml_asset` matches the paired `(ILjava/lang/String;)J`
-        // signature as an instance native returning `jlong` (see the native's docs); casting the
-        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_OPEN_XML_ASSET_NAME,
@@ -2973,9 +1831,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_open_xml_asset as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_retrieve_attributes` matches the paired `(J[IIJJ)Z` signature as an
-        // instance native returning `jboolean` (see the native's docs); casting the `extern "system"`
-        // fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_RETRIEVE_ATTRIBUTES_NAME,
@@ -2983,9 +1838,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_retrieve_attributes as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_new_theme` matches the paired `()J` signature as an instance native
-        // returning `jlong` (see the native's docs); casting the `extern "system"` fn to a
-        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_NEW_THEME_NAME,
@@ -2993,9 +1845,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_new_theme as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_apply_theme_style` matches the paired `(JIZ)V` signature as an
-        // instance native (see the native's docs); casting the `extern "system"` fn to a
-        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_APPLY_THEME_STYLE_NAME,
@@ -3003,9 +1852,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_apply_theme_style as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_copy_theme` matches the paired `(JJ)V` signature as an instance
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_COPY_THEME_NAME,
@@ -3013,9 +1859,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_copy_theme as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_apply_style` matches the paired `(JJII[IIJJ)V` signature as an
-        // instance native (see the native's docs); casting the `extern "system"` fn to a
-        // `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_APPLY_STYLE_NAME,
@@ -3023,9 +1866,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_apply_style as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_get_resource_name` matches the paired `(I)Ljava/lang/String;`
-        // signature as an instance native (see the native's docs); casting the `extern "system"` fn
-        // to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_GET_RESOURCE_NAME_NAME,
@@ -3033,9 +1873,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_get_resource_name as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_get_resource_package_name` matches the paired `(I)Ljava/lang/String;`
-        // signature as an instance native (see the native's docs); casting the `extern "system"` fn to
-        // a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_NAME,
@@ -3043,10 +1880,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_get_resource_package_name as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_get_resource_identifier` matches the paired
-        // `(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I` signature as an instance native
-        // (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_NAME,
@@ -3054,10 +1887,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_get_resource_identifier as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_open_asset` matches the paired `(Ljava/lang/String;I)J` signature as
-        // an instance native (confirmed from the ART-reported line); casting the `extern "system"` fn
-        // to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it. The read-cycle natives are
-        // bound separately (best-effort) by `register_asset_stream_natives`.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_OPEN_ASSET_NAME,
@@ -3065,10 +1894,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_open_asset as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_load_resource_value` matches the paired
-        // `(ISLandroid/util/TypedValue;Z)I` signature as an instance native (see the native's docs);
-        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
-        // takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_LOAD_RESOURCE_VALUE_NAME,
@@ -3076,8 +1901,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_load_resource_value as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_load_theme_attribute_value` matches the paired
-        // `(JILandroid/util/TypedValue;Z)I` signature as an instance native (see the native's docs).
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME,
@@ -3085,9 +1908,6 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 asset_manager_load_theme_attribute_value as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `asset_manager_get_pooled_string` matches the paired
-        // `(II)Ljava/lang/CharSequence;` signature as an instance native (AssetManager.java line
-        // 286; see the native's docs) — it returns a JString, which IS a CharSequence.
         unsafe {
             NativeMethod::from_raw_parts(
                 ASSET_MANAGER_GET_POOLED_STRING_NAME,
@@ -3096,10 +1916,7 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/content/res/AssetManager; `methods` hold valid fn
-    // pointers whose signatures match the class's `native` declarations (`init` verified against
-    // AssetManager.java line 779; `native_setApkAssets` bound signature-only from the ART-reported
-    // signature `([Ljava/lang/Object;I)V` — AssetManager is denylisted, 2026-06-05).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/AssetManager",
@@ -3108,145 +1925,64 @@ fn register_asset_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.content.res.XmlBlock parser natives ===========
-//
-// 2026-06-05: once `openXmlAssetNative` returns a real block handle (above), AOSP's framework wraps
-// it as an `android.content.res.XmlBlock` and walks it through a set of `static native` methods on
-// `XmlBlock` (the `XmlBlock.Parser`/`XmlResourceParser` event cursor). Discovered via the dev-host
-// run, the first is `nativeCreateParseState(long block)` (`No implementation found for long
-// android.content.res.XmlBlock.nativeCreateParseState(long)`, run log 2026-06-05). These are the
-// standard AOSP `XmlBlock` parser natives (stable public XmlPullParser semantics), bound against the
-// Eclipse-owned [`xml_registry`] block + cursor — NOT ATL's C asset layer, NOT GTK. Each new native
-// the run surfaces is added here, implemented against the parsed [`crate::apk::axml::XmlDocument`].
-
-/// `android.content.res.XmlBlock` (internal/slashed name for `find_class`) — hosts the parser walk
-/// natives the framework calls on the handle `openXmlAssetNative` returned.
 pub const XML_BLOCK_CLASS: &JNIStr = jni_str!("android/content/res/XmlBlock");
 
-// `static native long nativeCreateParseState(long block)` — create a parser cursor over `block` and
-// return a parse-state handle. JNI descriptor `(J)J`, from the ART-reported signature
-// `long ...XmlBlock.nativeCreateParseState(long)` (run log 2026-06-05).
 const XML_BLOCK_CREATE_PARSE_STATE_NAME: &JNIStr = jni_str!("nativeCreateParseState");
 const XML_BLOCK_CREATE_PARSE_STATE_SIG: &JNIStr = jni_str!("(J)J");
 
-// `static native int nativeNext(long state)` — advance the parser cursor and return the next
-// XmlPullParser event. JNI descriptor `(J)I` (`int ...XmlBlock.nativeNext(long)`, run log 2026-06-05).
 const XML_BLOCK_NEXT_NAME: &JNIStr = jni_str!("nativeNext");
 const XML_BLOCK_NEXT_SIG: &JNIStr = jni_str!("(J)I");
 
-// `static native void nativeDestroyParseState(long state)` — release the parser cursor. JNI
-// descriptor `(J)V` (`void ...XmlBlock.nativeDestroyParseState(long)`, run log 2026-06-05).
 const XML_BLOCK_DESTROY_PARSE_STATE_NAME: &JNIStr = jni_str!("nativeDestroyParseState");
 const XML_BLOCK_DESTROY_PARSE_STATE_SIG: &JNIStr = jni_str!("(J)V");
 
-// `static native String nativeGetName(long state)` — the current tag's name. JNI descriptor
-// `(J)Ljava/lang/String;` (`String ...XmlBlock.nativeGetName(long)`, run log 2026-06-05).
 const XML_BLOCK_GET_NAME_NAME: &JNIStr = jni_str!("nativeGetName");
 const XML_BLOCK_GET_NAME_SIG: &JNIStr = jni_str!("(J)Ljava/lang/String;");
 
-// `static native void nativeDestroy(long block)` — release the parsed block itself (distinct from
-// nativeDestroyParseState). JNI descriptor `(J)V` (`void ...XmlBlock.nativeDestroy(long)`, run log
-// 2026-06-05).
 const XML_BLOCK_DESTROY_NAME: &JNIStr = jni_str!("nativeDestroy");
 const XML_BLOCK_DESTROY_SIG: &JNIStr = jni_str!("(J)V");
 
-// `static native int nativeGetAttributeIndex(long state, String namespace, String name)` — the
-// index of the (namespace, name) attribute on the current tag, or -1. JNI descriptor
-// `(JLjava/lang/String;Ljava/lang/String;)I` (run log 2026-06-05).
 const XML_BLOCK_GET_ATTR_INDEX_NAME: &JNIStr = jni_str!("nativeGetAttributeIndex");
 const XML_BLOCK_GET_ATTR_INDEX_SIG: &JNIStr = jni_str!("(JLjava/lang/String;Ljava/lang/String;)I");
 
-/// The "attribute not found" sentinel AOSP's `XmlResourceParser` accessors return.
 const XML_ATTR_NOT_FOUND: jint = -1;
 
-// `static native String nativeGetAttributeStringValue(long state, int idx)` — the string value of
-// the idx-th attribute on the current tag. JNI descriptor `(JI)Ljava/lang/String;` (run log
-// 2026-06-05).
 const XML_BLOCK_GET_ATTR_STRING_VALUE_NAME: &JNIStr = jni_str!("nativeGetAttributeStringValue");
 const XML_BLOCK_GET_ATTR_STRING_VALUE_SIG: &JNIStr = jni_str!("(JI)Ljava/lang/String;");
 
-// `static native int nativeGetAttributeDataType(long state, int idx)` — the `Res_value.dataType`
-// byte of the idx-th attribute on the current tag (a `TypedValue.TYPE_*` constant). JNI descriptor
-// `(JI)I` (`int ...XmlBlock.nativeGetAttributeDataType(long, int)`, run log 2026-06-05,
-// accelerometerdemo's VectorDrawableCompat reads its <vector>/<path> attribute types via
-// AttributeSet.getAttributeValue → TypedArrayUtils.getNamedFloat).
 const XML_BLOCK_GET_ATTR_DATA_TYPE_NAME: &JNIStr = jni_str!("nativeGetAttributeDataType");
 const XML_BLOCK_GET_ATTR_DATA_TYPE_SIG: &JNIStr = jni_str!("(JI)I");
 
-// `static native int nativeGetAttributeCount(long state)` — the number of attributes on the current
-// tag. JNI descriptor `(J)I` (`int ...XmlBlock.nativeGetAttributeCount(long)`, run log 2026-06-05,
-// AppCompatColorStateListInflater iterating a <selector>'s attributes). Returns the current element's
-// attribute count, or 0 when not on a tag / bad handle.
 const XML_BLOCK_GET_ATTR_COUNT_NAME: &JNIStr = jni_str!("nativeGetAttributeCount");
 const XML_BLOCK_GET_ATTR_COUNT_SIG: &JNIStr = jni_str!("(J)I");
 
-// `static native int nativeGetAttributeResource(long state, int idx)` — the RESOURCE ID OF THE
-// ATTRIBUTE'S NAME (`AttributeSet.getAttributeNameResource`), i.e. the framework attr id the attribute
-// binds to (e.g. `android:color` → `0x010101...`), or 0 if the attribute's name is not a framework
-// resource. JNI descriptor `(JI)I` (`int ...XmlBlock.nativeGetAttributeResource(long, int)`, run log
-// 2026-06-05, AppCompatColorStateListInflater). This is the decoded `name_resource` Eclipse's axml
-// reader already stores, NOT the value — distinct from nativeGetAttributeData (the value word).
 const XML_BLOCK_GET_ATTR_RESOURCE_NAME: &JNIStr = jni_str!("nativeGetAttributeResource");
 const XML_BLOCK_GET_ATTR_RESOURCE_SIG: &JNIStr = jni_str!("(JI)I");
 
-// `static native int nativeGetAttributeData(long state, int idx)` — the `Res_value.data` word of the
-// idx-th attribute on the current tag (the raw int / boolean / float-bits / packed-color / resource
-// ref, paired with the dataType). JNI descriptor `(JI)I` (`int
-// ...XmlBlock.nativeGetAttributeData(long, int)`, run log 2026-06-05). Consulted right after
-// nativeGetAttributeDataType by AttributeSet / TypedArrayUtils to read the typed value.
 const XML_BLOCK_GET_ATTR_DATA_NAME: &JNIStr = jni_str!("nativeGetAttributeData");
 const XML_BLOCK_GET_ATTR_DATA_SIG: &JNIStr = jni_str!("(JI)I");
 
-/// `TypedValue.TYPE_NULL` — the data type AOSP returns for an absent attribute. Matches AOSP's
-/// `XmlBlock` returning `TYPE_NULL` (`0x00`) for an out-of-range index / not-on-a-tag.
 const XML_TYPE_NULL: jint = 0x00;
 
-// `static native int nativeGetLineNumber(long state)` — the current node's source line number (used
-// only by `getPositionDescription` for error messages). JNI descriptor `(J)I` (run log 2026-06-05).
-// Eclipse's axml reader does not track source line numbers, so this honestly returns -1 ("unknown"),
-// which AOSP's XmlResourceParser uses when a line is unavailable.
 const XML_BLOCK_GET_LINE_NUMBER_NAME: &JNIStr = jni_str!("nativeGetLineNumber");
 const XML_BLOCK_GET_LINE_NUMBER_SIG: &JNIStr = jni_str!("(J)I");
 
-// `static native String nativeGetPooledString(long state, int idx)` — the block's `idx`-th pooled
-// string. JNI descriptor `(JI)Ljava/lang/String;` (`String ...XmlBlock.nativeGetPooledString(long,
-// int)`, run log 2026-06-05). Reached when a `TYPE_STRING` styled attribute's `TypedArray` cookie is
-// XML_BLOCK_COOKIE: `TypedArray.getString` calls `mXml.getPooledString(data)` where `data` is the
-// source string-pool index, which routes here. Backed by [`xml_registry::XmlBlock::pooled_string`].
 const XML_BLOCK_GET_POOLED_STRING_NAME: &JNIStr = jni_str!("nativeGetPooledString");
 const XML_BLOCK_GET_POOLED_STRING_SIG: &JNIStr = jni_str!("(JI)Ljava/lang/String;");
 
-/// The "unknown line" sentinel AOSP's `XmlResourceParser.getLineNumber` returns when unavailable.
 const XML_LINE_UNKNOWN: jint = -1;
 
-// org.xmlpull.v1.XmlPullParser event constants (stable public API) that AOSP's XmlBlock.Parser
-// returns from nativeNext. Namespace nodes are tracked internally and NOT surfaced as pull events.
-// (START_DOCUMENT=0 is the Java-side pre-first-`next` state, never returned by nativeNext, so it is
-// not encoded here.)
 const XML_EVENT_END_DOCUMENT: jint = 1;
 const XML_EVENT_START_TAG: jint = 2;
 const XML_EVENT_END_TAG: jint = 3;
 const XML_EVENT_TEXT: jint = 4;
 
-/// `XmlBlock.nativeCreateParseState(long block)` → a parse-state handle.
-///
-/// JNI ABI: a `static` native, so the second argument is the `JClass`, then the `jlong block`
-/// handle. Eclipse's [`xml_registry`] block already owns its own parser cursor, so the parse state
-/// **is** the block: this validates the handle (a bounds+generation-checked [`xml_registry::with_block`]
-/// lookup — a stale/fabricated handle is rejected, never UB) and returns the same handle for the
-/// subsequent walk natives to use. Returns `0` (the "no state" sentinel) if the handle is invalid.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on
-/// any error/panic — a sound neutral "no state" handle.
 extern "system" fn xml_block_create_parse_state<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     block: jlong,
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
-        // Reset the cursor to the start of the document so each parser begins at START_DOCUMENT, and
-        // validate the handle. A bad handle → 0 (the framework treats it as a failed parser create).
         match xml_registry::with_block(block, |b| {
             b.cursor = 0;
             b.current = None;
@@ -3266,34 +2002,20 @@ extern "system" fn xml_block_create_parse_state<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeNext(long state)` → the next XmlPullParser event constant.
-///
-/// JNI ABI: a `static` native (`JClass`, then the `jlong state` handle — the same registry handle
-/// `nativeCreateParseState` returned). Advances the block's cursor past any namespace nodes (AOSP's
-/// `XmlBlock.Parser` tracks namespaces internally and does not surface them as pull events) and maps
-/// the node under the cursor to its [`XmlPullParser`](https://developer.android.com) event int:
-/// `START_TAG`(2)/`END_TAG`(3)/`TEXT`(4); `END_DOCUMENT`(1) at/after the end. A bad/stale handle
-/// yields `END_DOCUMENT` so the framework's walk loop terminates cleanly rather than spinning.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8). `resolve` returns
-/// the `jint` default (`0` = `START_DOCUMENT`) on error/panic — a neutral, non-advancing event.
 extern "system" fn xml_block_next<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     state: jlong,
 ) -> jint {
     env.with_env(|_env| -> jni::errors::Result<jint> {
-        let event = xml_registry::with_block(state, |b| {
-            // Skip namespace bookkeeping nodes; return the first content event (or end).
-            loop {
-                match b.next_event() {
-                    Some(crate::apk::axml::XmlEventKind::StartTag(_)) => break XML_EVENT_START_TAG,
-                    Some(crate::apk::axml::XmlEventKind::EndTag(_)) => break XML_EVENT_END_TAG,
-                    Some(crate::apk::axml::XmlEventKind::Text(_)) => break XML_EVENT_TEXT,
-                    Some(crate::apk::axml::XmlEventKind::StartNamespace(_))
-                    | Some(crate::apk::axml::XmlEventKind::EndNamespace(_)) => continue,
-                    None => break XML_EVENT_END_DOCUMENT,
-                }
+        let event = xml_registry::with_block(state, |b| loop {
+            match b.next_event() {
+                Some(crate::apk::axml::XmlEventKind::StartTag(_)) => break XML_EVENT_START_TAG,
+                Some(crate::apk::axml::XmlEventKind::EndTag(_)) => break XML_EVENT_END_TAG,
+                Some(crate::apk::axml::XmlEventKind::Text(_)) => break XML_EVENT_TEXT,
+                Some(crate::apk::axml::XmlEventKind::StartNamespace(_))
+                | Some(crate::apk::axml::XmlEventKind::EndNamespace(_)) => continue,
+                None => break XML_EVENT_END_DOCUMENT,
             }
         });
         match event {
@@ -3312,25 +2034,12 @@ extern "system" fn xml_block_next<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeDestroyParseState(long state)` → release the parser cursor.
-///
-/// JNI ABI: a `static` native returning void. In Eclipse's model the parse state and the block are
-/// the **same** [`xml_registry`] entry (one cursor per block), and the framework destroys the parse
-/// state *before* the block (`nativeDestroy`). So this must NOT free the entry — doing so would
-/// invalidate the block handle the framework still holds. It only validates the handle (a stale one
-/// is logged + ignored); the entry is freed by [`xml_block_destroy`] (`nativeDestroy`). Idempotent;
-/// never UB or panic — the registry rejects a bad handle.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic — the correct neutral value for this `void` native.
 extern "system" fn xml_block_destroy_parse_state<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     state: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // Validate-only (do NOT free): the block handle equals the parse-state handle in Eclipse's
-        // model and is freed later by nativeDestroy. with_block bounds+generation-checks it.
         if let Err(e) = xml_registry::with_block(state, |_b| ()) {
             tracing::debug!(
                 target: "android.content.res.XmlBlock",
@@ -3344,45 +2053,25 @@ extern "system" fn xml_block_destroy_parse_state<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetName(long state)` → the current tag's local name as a `java.lang.String`.
-///
-/// JNI ABI: a `static` native returning a `String` (`JClass`, then the `jlong state`). Returns the
-/// current element's resolved name when the cursor is on a start/end tag; a null `JString` otherwise
-/// (text node, document edges, or an invalid handle) — AOSP's `XmlResourceParser.getName` returns
-/// null when not positioned on a tag.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns a
-/// null `JString` on error/panic.
 extern "system" fn xml_block_get_name<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     state: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        // Resolve the current element's name under the registry lock, then build the JString outside
-        // it (new_string needs &mut Env; the lock guard is dropped first).
         let name =
             xml_registry::with_block(state, |b| b.current_element().and_then(|e| e.name.clone()))
                 .ok()
                 .flatten();
         match name {
             Some(n) => env.new_string(n),
-            // Not on a tag (or bad handle): null name, matching getName()'s contract.
+
             None => Ok(JString::default()),
         }
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeDestroy(long block)` → release the parsed block.
-///
-/// JNI ABI: a `static` native returning void. Frees the [`xml_registry`] entry — the parsed document
-/// is no longer needed once the framework finished walking the asset and destroyed its parse state.
-/// A bad/stale/already-freed handle is logged and ignored (idempotent; the registry rejects it,
-/// never UB or panic).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn xml_block_destroy<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3402,18 +2091,6 @@ extern "system" fn xml_block_destroy<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetAttributeIndex(long state, String namespace, String name)` → the attribute's
-/// index on the current tag, or `-1`.
-///
-/// JNI ABI: a `static` native (`JClass`, `jlong state`, then two `JString`s). Matches an attribute
-/// by name and namespace: a null/empty `namespace` argument matches an attribute with no namespace
-/// (AOSP treats the empty namespace as "no namespace"); a non-empty `namespace` must equal the
-/// attribute's resolved namespace URI. Returns the 0-based index into the current element's
-/// attributes, or `-1` if not found / not on a tag / bad handle.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `jint` default (`0`) on error/panic — but every real path returns an explicit value, so an
-/// error yields `-1` (not found).
 extern "system" fn xml_block_get_attribute_index<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3422,12 +2099,11 @@ extern "system" fn xml_block_get_attribute_index<'local>(
     name: JString<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<jint> {
-        // A null name cannot match; not found.
         if name.is_null() {
             return Ok(XML_ATTR_NOT_FOUND);
         }
         let want_name = name.try_to_string(env)?;
-        // Empty / null namespace means "no namespace" (AOSP semantics).
+
         let want_ns = if namespace.is_null() {
             String::new()
         } else {
@@ -3452,16 +2128,6 @@ extern "system" fn xml_block_get_attribute_index<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetAttributeStringValue(long state, int idx)` → the idx-th attribute's string
-/// value as a `java.lang.String`, or null.
-///
-/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the resolved string for
-/// a `TYPE_STRING` attribute; null for a non-string-typed attribute (AOSP's
-/// `getAttributeValue`/`nativeGetAttributeStringValue` returns the pooled string only when the
-/// value is string-typed), for an out-of-range index, when not on a tag, or for a bad handle.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns a
-/// null `JString` on error/panic.
 extern "system" fn xml_block_get_attribute_string_value<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3478,18 +2144,6 @@ extern "system" fn xml_block_get_attribute_string_value<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetAttributeDataType(long state, int idx)` → the idx-th attribute's
-/// `Res_value.dataType` (a `TypedValue.TYPE_*` constant), or `TYPE_NULL`.
-///
-/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the attribute's parsed
-/// `value_type` byte (e.g. `TYPE_STRING`=3, `TYPE_INT_DEC`=0x10, `TYPE_FLOAT`=4) widened to `jint` —
-/// the exact byte Eclipse's axml reader stored from the binary XML `Res_value`. Returns
-/// [`XML_TYPE_NULL`] (`0`) for an out-of-range index, when not on a tag, or for a bad handle, matching
-/// AOSP `XmlBlock` returning `TYPE_NULL` for an absent attribute. This is the type discriminator
-/// `AttributeSet.getAttributeValue`/`TypedArrayUtils.getNamedFloat` consult before reading the value.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `jint` default (`0` = `TYPE_NULL`) on error/panic — the correct neutral value.
 extern "system" fn xml_block_get_attribute_data_type<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3497,26 +2151,12 @@ extern "system" fn xml_block_get_attribute_data_type<'local>(
     idx: jint,
 ) -> jint {
     env.with_env(|_env| -> jni::errors::Result<jint> {
-        // value_type is the Res_value.dataType byte; widen to jint. Absent attr → TYPE_NULL.
         let data_type = current_attribute(state, idx, |a| jint::from(a.value_type));
         Ok(data_type.unwrap_or(XML_TYPE_NULL))
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetAttributeData(long state, int idx)` → the idx-th attribute's `Res_value.data`
-/// word (the raw typed value), or `0`.
-///
-/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the attribute's parsed
-/// `value_data` word — the raw 32-bit value whose interpretation is given by the paired
-/// `nativeGetAttributeDataType` (an int for `TYPE_INT_*`, the IEEE-754 bits for `TYPE_FLOAT`, the
-/// packed ARGB for `TYPE_*_COLOR`, the string-pool index for `TYPE_STRING`, the resource id for
-/// `TYPE_REFERENCE`). The `u32` data word is reinterpreted as `jint` (the JNI return type) with the
-/// same bit pattern — AOSP's `nativeGetAttributeData` returns the raw `Res_value.data` int unchanged.
-/// Returns `0` for an out-of-range index, when not on a tag, or for a bad handle.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `jint` default (`0`) on error/panic — the correct neutral value.
 extern "system" fn xml_block_get_attribute_data<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3524,24 +2164,12 @@ extern "system" fn xml_block_get_attribute_data<'local>(
     idx: jint,
 ) -> jint {
     env.with_env(|_env| -> jni::errors::Result<jint> {
-        // value_data is the raw Res_value.data word; reinterpret the u32 bits as jint (AOSP returns
-        // the raw int unchanged — TYPE_FLOAT carries IEEE-754 bits, colors are packed ARGB, etc.).
         let data = current_attribute(state, idx, |a| a.value_data as i32);
         Ok(data.unwrap_or(0))
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetAttributeCount(long state)` → the number of attributes on the current tag, or
-/// `0`.
-///
-/// JNI ABI: a `static` native (`JClass`, `jlong state`). Returns the current element's attribute count
-/// (what `XmlPullParser.getAttributeCount` returns, the loop bound the attribute accessors are indexed
-/// within). Returns `0` when not on a start/end tag or for a bad handle (AOSP returns `0`/`-1` when no
-/// attributes — `0` is the safe "no attributes" loop bound).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `jint` default (`0`) on error/panic — the correct neutral count.
 extern "system" fn xml_block_get_attribute_count<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3557,17 +2185,6 @@ extern "system" fn xml_block_get_attribute_count<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetAttributeResource(long state, int idx)` → the resource id of the idx-th
-/// attribute's NAME (`getAttributeNameResource`), or `0`.
-///
-/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Returns the decoded
-/// `name_resource` Eclipse's axml reader stored for the attribute (the framework attr id its name binds
-/// to, e.g. `android:color`), reinterpreted to `jint`; `0` when the name is not a framework resource,
-/// for an out-of-range index, when not on a tag, or for a bad handle. Distinct from
-/// `nativeGetAttributeData` (which returns the attribute's VALUE word).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `jint` default (`0`) on error/panic — the correct neutral value.
 extern "system" fn xml_block_get_attribute_resource<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3575,23 +2192,12 @@ extern "system" fn xml_block_get_attribute_resource<'local>(
     idx: jint,
 ) -> jint {
     env.with_env(|_env| -> jni::errors::Result<jint> {
-        // name_resource is the decoded framework attr id of the attribute's NAME; reinterpret u32 bits.
         let res = current_attribute(state, idx, |a| u32_to_i32(a.name_resource));
         Ok(res.unwrap_or(0))
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetLineNumber(long state)` → the current node's source line, or `-1` (unknown).
-///
-/// JNI ABI: a `static` native (`JClass`, then the `jlong state`). Eclipse's axml reader does not
-/// retain source line numbers (binary XML carries them but the reader discards them), so this
-/// honestly returns [`XML_LINE_UNKNOWN`] (`-1`) — the value AOSP's `XmlResourceParser` uses when a
-/// line is unavailable. It is only consumed by `getPositionDescription` for error messages, so `-1`
-/// is correct, not a fake. Validates the handle so an invalid one is logged (still returns `-1`).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `jint` default (`0`) on error/panic, but every path returns an explicit value (`-1`).
 extern "system" fn xml_block_get_line_number<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3606,22 +2212,12 @@ extern "system" fn xml_block_get_line_number<'local>(
                 "XmlBlock.nativeGetLineNumber: invalid state handle → -1 (unknown)"
             );
         }
-        // axml does not track source lines; -1 ("unknown") is the honest AOSP sentinel.
+
         Ok(XML_LINE_UNKNOWN)
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `XmlBlock.nativeGetPooledString(long state, int idx)` → the block's `idx`-th pooled string, or null.
-///
-/// JNI ABI: a `static` native (`JClass`, `jlong state`, `jint idx`). Reached when a `TYPE_STRING`
-/// styled attribute's `TypedArray` cookie is [`XML_BLOCK_COOKIE`] (`-1`): `TypedArray.getString` calls
-/// `mXml.getPooledString(data)` with `data` = the source string-pool index, routing here. Returns the
-/// block's pooled string at `idx` (via [`xml_registry::XmlBlock::pooled_string`]); a null `JString`
-/// for a negative/out-of-range index or a bad handle (AOSP returns null for an absent pooled string).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns a
-/// null `JString` on error/panic.
 extern "system" fn xml_block_get_pooled_string<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3629,7 +2225,6 @@ extern "system" fn xml_block_get_pooled_string<'local>(
     idx: jint,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        // A negative index has no pooled string; usize::try_from rejects it cleanly.
         let value = usize::try_from(idx).ok().and_then(|i| {
             xml_registry::with_block(state, |b| b.pooled_string(i).map(str::to_owned))
                 .ok()
@@ -3643,11 +2238,6 @@ extern "system" fn xml_block_get_pooled_string<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Run `f` against the idx-th attribute of the current element of block `state`.
-///
-/// Returns `Some(f(attr))` when the handle is valid, the cursor is on a start/end tag, and `idx` is
-/// in range; `None` otherwise. Centralizes the handle + bounds checks the per-attribute `nativeGet*`
-/// accessors share, so a bad handle or out-of-range index is always a clean `None`, never UB/panic.
 fn current_attribute<R>(
     state: jlong,
     idx: jint,
@@ -3661,23 +2251,9 @@ fn current_attribute<R>(
     .flatten()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.content.res.XmlBlock`'s parser natives.
-///
-/// Registered before the lifecycle drive, alongside the AssetManager natives, since the framework
-/// constructs an `XmlBlock` parser during `Context.<clinit>` (reading `AndroidManifest.xml`). Each
-/// native is added as the dev-host run surfaces it (`No implementation found …`).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
-/// They do, by construction — each native is written to the exact descriptor the run reported. Every
-/// native body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic crosses the
-/// JNI boundary (AGENTS.md §2.8).
 fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(XML_BLOCK_CLASS)?;
     let methods = [
-        // SAFETY: `xml_block_create_parse_state` matches the paired `(J)J` signature as a static
-        // native; casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_CREATE_PARSE_STATE_NAME,
@@ -3685,7 +2261,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_create_parse_state as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_next` matches the paired `(J)I` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_NEXT_NAME,
@@ -3693,8 +2268,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_next as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_destroy_parse_state` matches the paired `(J)V` signature as a static
-        // native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_DESTROY_PARSE_STATE_NAME,
@@ -3702,8 +2275,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_destroy_parse_state as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_name` matches the paired `(J)Ljava/lang/String;` signature as a
-        // static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_NAME_NAME,
@@ -3711,7 +2282,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_name as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_destroy` matches the paired `(J)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_DESTROY_NAME,
@@ -3719,8 +2289,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_destroy as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_attribute_index` matches the paired
-        // `(JLjava/lang/String;Ljava/lang/String;)I` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_ATTR_INDEX_NAME,
@@ -3728,8 +2296,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_attribute_index as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_attribute_string_value` matches the paired
-        // `(JI)Ljava/lang/String;` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_ATTR_STRING_VALUE_NAME,
@@ -3737,8 +2303,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_attribute_string_value as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_attribute_count` matches the paired `(J)I` signature as a static
-        // native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_ATTR_COUNT_NAME,
@@ -3746,8 +2310,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_attribute_count as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_attribute_resource` matches the paired `(JI)I` signature as a static
-        // native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_ATTR_RESOURCE_NAME,
@@ -3755,8 +2317,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_attribute_resource as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_attribute_data_type` matches the paired `(JI)I` signature as a
-        // static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_ATTR_DATA_TYPE_NAME,
@@ -3764,8 +2324,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_attribute_data_type as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_attribute_data` matches the paired `(JI)I` signature as a static
-        // native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_ATTR_DATA_NAME,
@@ -3773,7 +2331,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_attribute_data as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_line_number` matches the paired `(J)I` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_LINE_NUMBER_NAME,
@@ -3781,8 +2338,6 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 xml_block_get_line_number as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `xml_block_get_pooled_string` matches the paired `(JI)Ljava/lang/String;` signature
-        // as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 XML_BLOCK_GET_POOLED_STRING_NAME,
@@ -3791,9 +2346,7 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/content/res/XmlBlock; `methods` hold valid fn pointers
-    // whose signatures match the class's `native` declarations (from the ART-reported signatures,
-    // 2026-06-05).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/content/res/XmlBlock",
@@ -3802,49 +2355,11 @@ fn register_xml_block_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.os.Environment.native_get_app_data_dir =========
-//
-// 2026-06-05: `android.os.Environment` (ATL `api-impl/android/os/Environment.java`) declares
-// `private static native String native_get_app_data_dir();` (line 336) — a STATIC native, JNI
-// signature `()Ljava/lang/String;`, exactly the signature ART reported missing. Its only caller is
-// `getExternalStorageDirectory()` (lines 328–334): `app_data_dir_file = new File(native_get_app_data_dir())`
-// — i.e. the returned String is the app's external-storage / data directory root, cached as a `File`.
-// ATL backs this in C; Eclipse must NOT pull GTK and must not hardcode an Android-device path like
-// `/data` or `/sdcard` (those do not exist on the Linux host; §9 detect-don't-assume).
-//
-// Eclipse's GTK-free equivalent returns a REAL, portable, host-valid directory derived from the XDG
-// data dir via `directories::ProjectDirs` — the same portable pattern as
-// `runtime::native_lib_cache_dir` (`$XDG_DATA_HOME/eclipse/app-data`, never a hardcoded
-// `/tmp`/`/home`/username/`/data` path; CLAUDE.md "Build & Environment Portability"). Returning a
-// non-null path is required, not optional: the Java caller does `new File(<string>)`, so a null
-// would throw `NullPointerException` and stall the lifecycle — a null "stub" would NOT let the
-// lifecycle proceed. This is minimal-but-correct, grounded in the Java caller + standard Android
-// semantics, not behavior-faking. The directory is not created here (Android's contract: the path
-// may not yet exist — `getExternalStorageDirectory` docs); a later increment can `mkdirs` it when an
-// app actually reads/writes app data.
-
-/// `android.os.Environment` (internal/slashed name for `find_class`) — hosts the static
-/// `native_get_app_data_dir` the framework calls from `getExternalStorageDirectory()`.
 pub const ENVIRONMENT_CLASS: &JNIStr = jni_str!("android/os/Environment");
 
-// JNI name + descriptor for Environment's native, exactly as declared in `Environment.java`
-// (2026-06-05, line 336): `private static native String native_get_app_data_dir();`.
 const GET_APP_DATA_DIR_NAME: &JNIStr = jni_str!("native_get_app_data_dir");
 const GET_APP_DATA_DIR_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
 
-/// Resolve Eclipse's portable per-app data directory (the value `native_get_app_data_dir` returns).
-///
-/// 2026-06-05: mirrors [`runtime::native_lib_cache_dir`](crate::runtime::native_lib_cache_dir)'s
-/// portable `directories::ProjectDirs` pattern — `$XDG_DATA_HOME/eclipse/app-data`
-/// (`~/.local/share/eclipse/app-data` by default), overridable via `ECLIPSE_APP_DATA_DIR`, never a
-/// hardcoded `/data`/`/sdcard`/`/home`/`/tmp` path (§9, CLAUDE.md portability). Returns `None` only
-/// when no home/data base can be determined (e.g. `$HOME` unset) — the native then surfaces a JNI
-/// error rather than fabricating a path.
-///
-/// 2026-06-13: `pub` so the boot flow (`main.rs::run_apk`) can extract the APK's bundled `assets/`
-/// tree to this SAME directory's `files/assets/` content root that the engine reads — single source
-/// of truth for the path, so the extraction destination can never drift from what
-/// `native_get_app_data_dir` returns.
 pub fn app_data_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("ECLIPSE_APP_DATA_DIR") {
         return Some(std::path::PathBuf::from(dir));
@@ -3853,62 +2368,29 @@ pub fn app_data_dir() -> Option<std::path::PathBuf> {
     Some(dirs.data_dir().join("app-data"))
 }
 
-/// `Environment.native_get_app_data_dir()` → the app's data directory path as a `java.lang.String`.
-///
-/// JNI ABI: a `static` native (the Java method is `static`), so the second argument is the `JClass`.
-/// Returns a real, portable, host-valid directory (see the Environment native-backing note above);
-/// the Java caller wraps it in `new File(...)`, so it must be non-null. The body runs inside
-/// [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can never unwind into
-/// ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>` returns a
-/// null `JString` only on an unrecoverable error (no XDG base, or string conversion failure) rather
-/// than propagating — surfaced as a JNI error the dev-host log shows.
 extern "system" fn native_get_app_data_dir<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        // No XDG/home base ⇒ we must not fabricate a path (§9); surface a JNI error → null JString.
         let dir =
             app_data_dir().ok_or(jni::errors::Error::JniCall(jni::errors::JniError::Unknown))?;
-        // `to_string_lossy` keeps this total for non-UTF-8 paths (rare on Linux); a fabricated path
-        // is never produced — `dir` is the resolved XDG/override directory.
+
         env.new_string(dir.to_string_lossy())
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.os.Environment`'s `native_get_app_data_dir`.
-///
-/// Locates `android/os/Environment` and registers the native via `RegisterNatives` (which wins over
-/// name-based lazy binding — JNI 1.1 spec). Like [`register_context_natives`]/[`register_log_natives`]/
-/// [`register_asset_manager_natives`], this MUST run before anything triggers `Environment`'s first
-/// active use (`Environment.<clinit>` / `getExternalStorageDirectory`); it is registered before the
-/// lifecycle drive, since ART resolves natives lazily during the lifecycle and the framework queries
-/// external storage early in init.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
-/// signature. It does, by construction — [`native_get_app_data_dir`] is written to the exact
-/// `()Ljava/lang/String;` descriptor as a static native (`EnvUnowned, JClass`). The native body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary
-/// (AGENTS.md §2.8).
 fn register_environment_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(ENVIRONMENT_CLASS)?;
-    let methods = [
-        // SAFETY: `native_get_app_data_dir` matches the paired `()Ljava/lang/String;` signature as a
-        // static native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void`
-        // is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                GET_APP_DATA_DIR_NAME,
-                GET_APP_DATA_DIR_SIG,
-                native_get_app_data_dir as *mut std::ffi::c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded android/os/Environment; `methods` holds a valid fn pointer whose
-    // signature matches the class's `native` declaration (verified against Environment.java line 336,
-    // 2026-06-05).
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            GET_APP_DATA_DIR_NAME,
+            GET_APP_DATA_DIR_SIG,
+            native_get_app_data_dir as *mut std::ffi::c_void,
+        )
+    }];
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/Environment",
@@ -3917,54 +2399,16 @@ fn register_environment_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.os.SystemClock's monotonic clock ==============
-//
-// 2026-06-05: the Roblox-APK run surfaced `No implementation found for long
-// android.os.SystemClock.elapsedRealtime()` (run log /tmp/eclipse-roblox.log) — thrown from inside
-// Roblox's own `com.roblox.client.RobloxApplication.<init>` during step 1 `Context.createApplication`
-// (the demo APK never calls it, so it only appears under a real app). This is a benign framework
-// timekeeping native, NOT an asset/resource/GTK/engine concern. `SystemClock.java` line 148 declares
-//   `native public static long elapsedRealtime();`
-// → static native `()J`, documented as "elapsed milliseconds since boot, including time spent in
-// sleep" and "guaranteed to be monotonic" (SystemClock.java lines 52–56, 143–148). The load-bearing
-// contract is MONOTONICITY (the value is used only as an interval-timing reference). Eclipse backs it
-// GTK-free with a process-anchored monotonic clock (`std::time::Instant`, which uses CLOCK_MONOTONIC
-// on Linux), returning milliseconds since the first call — sound, no `unsafe`, no libc dep, honoring
-// the monotonic guarantee. ATL backs this in C; we do not read that source (denylisted) — the Java
-// contract above is the ground truth.
-
-/// `android.os.SystemClock` (internal/slashed name for `find_class`) — hosts the static
-/// `elapsedRealtime` monotonic-clock native.
 pub const SYSTEM_CLOCK_CLASS: &JNIStr = jni_str!("android/os/SystemClock");
 
-// JNI name + descriptor for SystemClock's native, exactly as declared in `SystemClock.java`
-// (2026-06-05, line 148): `native public static long elapsedRealtime();`.
 const ELAPSED_REALTIME_NAME: &JNIStr = jni_str!("elapsedRealtime");
 const ELAPSED_REALTIME_SIG: &JNIStr = jni_str!("()J");
 
-// JNI name + descriptor for SystemClock.uptimeMillis, from the ART-reported signature `long
-// android.os.SystemClock.uptimeMillis()` (run log 2026-06-05, accelerometerdemo's Handler.postDelayed
-// timing): a static native, descriptor `()J`. AOSP defines uptimeMillis as "milliseconds since boot,
-// not counting deep sleep" and "the basis for most interval timing" — its load-bearing contract is the
-// same MONOTONICITY as elapsedRealtime, so it shares the same process-anchored monotonic source.
 const UPTIME_MILLIS_NAME: &JNIStr = jni_str!("uptimeMillis");
 const UPTIME_MILLIS_SIG: &JNIStr = jni_str!("()J");
 
-/// Process-wide monotonic anchor for [`system_clock_elapsed_realtime`]. Set once on the first call,
-/// so `elapsedRealtime()` returns milliseconds since the first query — a correct monotonic clock
-/// (the contract guarantees monotonicity, not a true since-boot value). `Instant` is monotonic on
-/// Linux (CLOCK_MONOTONIC); `OnceLock` makes the anchor sound across the VM/winit main thread.
 static MONOTONIC_ANCHOR: OnceLock<Instant> = OnceLock::new();
 
-/// `SystemClock.elapsedRealtime()` → monotonic milliseconds since the first call, as a `jlong`.
-///
-/// JNI ABI: a `static` native (the Java method is `static`), so the second argument is the `JClass`.
-/// The body runs inside [`EnvUnowned::with_env`], which `catch_unwind`-wraps it so a Rust panic can
-/// never unwind into ART's C++ (AGENTS.md §2.8; `panic = "abort"` kept). `resolve::<LogErrorAndDefault>`
-/// returns the `jlong` default (`0`) on any error/panic — a sound neutral timestamp. The
-/// `OnceLock::get_or_init` anchors the clock on first use; subsequent calls are monotonically
-/// non-decreasing. `as_millis()` is `u128`; a 32-bit-day overflow cannot occur in a session, but the
-/// `try_from`/`unwrap_or` saturation keeps the native total (no overflow panic).
 extern "system" fn system_clock_elapsed_realtime<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3973,14 +2417,6 @@ extern "system" fn system_clock_elapsed_realtime<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `SystemClock.uptimeMillis()` → monotonic milliseconds since the first call, as a `jlong`.
-///
-/// JNI ABI: a `static` native (the Java method is `static`), so the second argument is the `JClass`.
-/// Shares [`MONOTONIC_ANCHOR`] with [`system_clock_elapsed_realtime`] — AOSP's `uptimeMillis` and
-/// `elapsedRealtime` differ only in whether deep sleep is counted, which is irrelevant here (no device
-/// sleep), and both must be monotonic. The body is `catch_unwind`-wrapped via [`EnvUnowned::with_env`]
-/// (AGENTS.md §2.8); `resolve` returns the `jlong` default (`0`) on error/panic — a sound neutral
-/// timestamp.
 extern "system" fn system_clock_uptime_millis<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -3989,9 +2425,6 @@ extern "system" fn system_clock_uptime_millis<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// Monotonic milliseconds since the process's first clock query (the shared body of
-/// `elapsedRealtime`/`uptimeMillis`). Anchors [`MONOTONIC_ANCHOR`] on first use; subsequent calls are
-/// non-decreasing. `as_millis()` is `u128`; the `try_from`/`unwrap_or` saturates (no overflow panic).
 fn monotonic_millis() -> jlong {
     let elapsed_ms = MONOTONIC_ANCHOR
         .get_or_init(Instant::now)
@@ -4000,25 +2433,9 @@ fn monotonic_millis() -> jlong {
     jlong::try_from(elapsed_ms).unwrap_or(jlong::MAX)
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.os.SystemClock`'s `elapsedRealtime`.
-///
-/// Locates `android/os/SystemClock` and registers the native via `RegisterNatives` (which wins over
-/// name-based lazy binding — JNI 1.1 spec). Like [`register_environment_natives`], this MUST run
-/// before anything triggers `SystemClock`'s first active use; it is registered before the lifecycle
-/// drive, since ART resolves natives lazily and a real app's `Application.<init>` may query the clock
-/// during step 1 `Context.createApplication` (observed for Roblox's `RobloxApplication.<init>`).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI
-/// signature. It does, by construction — [`system_clock_elapsed_realtime`] is written to the exact
-/// `()J` descriptor as a static native (`EnvUnowned, JClass`). The native body is `catch_unwind`-
-/// guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary (AGENTS.md §2.8).
 fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(SYSTEM_CLOCK_CLASS)?;
     let methods = [
-        // SAFETY: `system_clock_elapsed_realtime` matches the paired `()J` signature as a static
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 ELAPSED_REALTIME_NAME,
@@ -4026,7 +2443,6 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 system_clock_elapsed_realtime as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `system_clock_uptime_millis` matches the paired `()J` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 UPTIME_MILLIS_NAME,
@@ -4035,9 +2451,7 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/os/SystemClock; `methods` hold valid fn pointers whose
-    // signatures match the class's `native` declarations (verified against SystemClock.java line 148 +
-    // the ART-reported `uptimeMillis()J`, 2026-06-05).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/SystemClock",
@@ -4046,25 +2460,8 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's host backing for android.os.MessageQueue ========================================
-//
-// Eclipse externally pumps Android's MAIN Looper from winit, so its empty/future poll must yield
-// instead of blocking the window thread. Ordinary Android worker loopers have the opposite contract:
-// `Looper.loop()` owns their thread and must sleep until a producer enqueues work and calls
-// `nativeWake`. A per-queue host handle records which policy applies and supplies a condition-variable
-// wait for workers. This is required by Play Core's `HandlerThread`: its Standard Integrity warm-up
-// is posted immediately after `getLooper()` returns, leaving exactly the race that a global
-// yield-on-empty implementation loses (the worker exits before the post arrives).
-//
-// ATL's exact framework bytecode declares all five methods below as private static natives. Its
-// patched `nativePollOnce(JI)Z` returns `true` to make `MessageQueue.next()` yield `null`; `false`
-// makes Java re-check the synchronized message list. The worker wait therefore always returns false,
-// while only the winit-owned main queue returns true for a non-zero timeout.
-
-/// `android.os.MessageQueue` (internal/slashed name for `find_class`).
 pub const MESSAGE_QUEUE_CLASS: &JNIStr = jni_str!("android/os/MessageQueue");
 
-// JNI names + descriptors exactly as declared by ATL's MessageQueue class.
 const MESSAGE_QUEUE_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
 const MESSAGE_QUEUE_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
 const MESSAGE_QUEUE_NATIVE_DESTROY_NAME: &JNIStr = jni_str!("nativeDestroy");
@@ -4076,33 +2473,20 @@ const MESSAGE_QUEUE_NATIVE_POLL_ONCE_SIG: &JNIStr = jni_str!("(JI)Z");
 const MESSAGE_QUEUE_NATIVE_WAKE_NAME: &JNIStr = jni_str!("nativeWake");
 const MESSAGE_QUEUE_NATIVE_WAKE_SIG: &JNIStr = jni_str!("(J)V");
 
-/// Thread that registers the framework natives and then creates the main `MessageQueue` during
-/// `Looper.prepareMainLooper`. `nativeInit` compares against this marker to distinguish that one
-/// externally-pumped queue from queues created by `HandlerThread`s. This is process-global rather
-/// than TLS so worker teardown cannot trigger the release-build `panic = "abort"` failure seen with
-/// an earlier diagnostic counter.
 static ANDROID_MAIN_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> =
     std::sync::OnceLock::new();
 
 thread_local! {
-    /// Main-thread re-entrancy guard for [`run_main_looper_once`]: set on pump entry, cleared on exit;
-    /// a (theoretical) nested drive of the single main queue no-ops. **Accessed via `try_with`** so a
-    /// thread-local-teardown edge can never panic — and under `panic = "abort"` a panic would ABORT the
-    /// process (the regression that a worker-thread-accessed counter here caused on 2026-06-12).
+
+
+
+
     static MAIN_LOOPER_PUMP_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One-time confirmation that the winit loop is actually pumping the Android main `Looper` (set on the
-/// first successful drive). A process-global atomic, NOT a thread-local — `nativePollOnce` runs on
-/// worker threads too and a thread-local accessed during a worker's teardown panic-aborts under
-/// `panic = "abort"`. Logged once so the dev-host boot shows the pump came alive without 60 Hz spam.
 static MAIN_LOOPER_PUMP_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Allocate one opaque, non-zero host queue handle.
-///
-/// JNI ABI: a static `()J` native, hence `(EnvUnowned, JClass)`. Returning zero is ATL's ordinary
-/// allocation-failure signal; no Rust pointer crosses the Java boundary.
 extern "system" fn message_queue_native_init<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -4130,7 +2514,6 @@ extern "system" fn message_queue_native_init<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Retire a queue handle. Any defensive in-flight waiter is released before its final Java check.
 extern "system" fn message_queue_native_destroy<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -4149,7 +2532,6 @@ extern "system" fn message_queue_native_destroy<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Report whether a worker queue is currently asleep in its host poll.
 extern "system" fn message_queue_native_is_idling<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -4159,11 +2541,6 @@ extern "system" fn message_queue_native_is_idling<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// Poll a queue according to its owner: yield the winit-driven main Looper, block worker Loopers.
-///
-/// ATL's `MessageQueue.next()` interprets `true` as an Eclipse-specific yield. Main polls therefore
-/// retain the established pure timeout decision. Worker polls sleep for `-1`/positive timeouts and
-/// then return false so Java can observe the posted message, elapsed deadline, or `mQuitting`.
 extern "system" fn message_queue_native_poll_once<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -4176,16 +2553,11 @@ extern "system" fn message_queue_native_poll_once<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// The non-blocking `nativePollOnce` yield decision (pure, for the regression test). `false` only for
-/// `timeout == 0` (a ready message exists → let `MessageQueue.next()` pull it); `true` otherwise
-/// (`-1` empty, or `> 0` a future-delayed head → yield so the driven `Looper.loop()` returns instead of
-/// blocking the winit/main thread; the delayed message fires on the next per-frame pump).
 #[cfg(test)]
 fn main_looper_poll_should_yield(timeout_millis: jint) -> bool {
     timeout_millis != 0
 }
 
-/// Wake a worker poll after Java enqueues work. Main-queue wakes remain harmless and durable.
 extern "system" fn message_queue_native_wake<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -4204,14 +2576,6 @@ extern "system" fn message_queue_native_wake<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's host backing for all ATL `android.os.MessageQueue` natives.
-///
-/// This runs on the future winit/main thread before `Looper.prepareMainLooper`, which both establishes
-/// the main-thread marker and ensures the constructor can call `nativeInit`.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: every function pointer below matches its ATL descriptor and
-/// all methods are static (`EnvUnowned, JClass, ...`). Native bodies resolve errors at the JNI edge.
 fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let registering_thread = std::thread::current().id();
     let main_thread = ANDROID_MAIN_THREAD_ID.get_or_init(|| registering_thread);
@@ -4226,8 +2590,6 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
 
     let class = env.find_class(MESSAGE_QUEUE_CLASS)?;
     let methods = [
-        // SAFETY: each function matches the paired static-native descriptor; the cast is the API's
-        // required representation for an `extern "system"` JNI function pointer.
         unsafe {
             NativeMethod::from_raw_parts(
                 MESSAGE_QUEUE_NATIVE_INIT_NAME,
@@ -4264,8 +2626,7 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/os/MessageQueue; `methods` hold valid fn pointers whose
-    // signatures match ATL's five static native declarations, verified from framework bytecode.
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/MessageQueue",
@@ -4274,52 +2635,12 @@ fn register_message_queue_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's honest (no-sensor) backing for android.hardware.SensorManager ===================
-//
-// 2026-06-05: accelerometerdemo's MainActivity.initViews calls getSystemService(SENSOR_SERVICE) →
-// SensorManager.getDefaultSensor(TYPE_ACCELEROMETER) → registerListener(listener, sensor, rate). ATL's
-// SensorManager Java implements `registerListener` by calling the native
-//   register_accelerometer_listener_native(SensorEventListener listener, Sensor sensor, int rate)
-// — an INSTANCE native returning void (the run's `No implementation found for void
-// android.hardware.SensorManager.register_accelerometer_listener_native(android.hardware.
-// SensorEventListener, android.hardware.Sensor, int)` line + the `registerListener →
-// register_accelerometer_listener_native` stack confirm the name/arity/return). Descriptor:
-// `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V`.
-//
-// This Linux desktop has NO accelerometer device. The TRUTHFUL behavior of `registerListener` against
-// hardware that is not present is that no event source is wired up and the listener's
-// `onSensorChanged` is never invoked — exactly what a real Android device does when an app registers a
-// listener for a sensor it lacks (registration succeeds vacuously; no events ever arrive). This native
-// therefore validates its arguments and returns without registering any source or fabricating any
-// sensor sample (faking accelerometer data is forbidden, AGENTS.md §Core Principle). The app's listener
-// stays dormant and its UI simply shows no readings — its normal no-sensor path. No GTK, no registry
-// handle (nothing later dereferences anything this returns — it is void), and no event-delivery thread
-// is started (none exists to start: there is no sensor). If a future host gains a real sensor source,
-// this is the single seam to wire it to.
-
-/// `android.hardware.SensorManager` (internal/slashed name for `find_class`) — hosts ATL's
-/// accelerometer-listener registration native.
 pub const SENSOR_MANAGER_CLASS: &JNIStr = jni_str!("android/hardware/SensorManager");
 
-// JNI name + descriptor for ATL's SensorManager registration native, exactly as ART reported it
-// missing (run log 2026-06-05, accelerometerdemo): `void register_accelerometer_listener_native(
-// SensorEventListener, Sensor, int)` → an INSTANCE native, descriptor
-// `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V`.
 const SENSOR_MANAGER_REGISTER_NAME: &JNIStr = jni_str!("register_accelerometer_listener_native");
 const SENSOR_MANAGER_REGISTER_SIG: &JNIStr =
     jni_str!("(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V");
 
-/// `SensorManager.register_accelerometer_listener_native(listener, sensor, rate)` → honest no-op.
-///
-/// JNI ABI: an INSTANCE native returning void, so the parameters are `(EnvUnowned, JObject this,
-/// JObject listener, JObject sensor, jint rate)`. None of the objects are dereferenced. On this
-/// no-accelerometer host the truthful behavior is to register no event source and deliver no
-/// `onSensorChanged` callbacks — the same outcome a real device gives an app that registers a listener
-/// for an absent sensor. No sensor data is fabricated.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve` returns the `()` default on any error/panic. The body is
-/// infallible.
 extern "system" fn sensor_manager_register_accelerometer_listener<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -4339,37 +2660,16 @@ extern "system" fn sensor_manager_register_accelerometer_listener<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's honest (no-sensor) backing for `android.hardware.SensorManager`.
-///
-/// Locates `android/hardware/SensorManager` and registers the native via `RegisterNatives` (which wins
-/// over name-based lazy binding — JNI 1.1 spec). Registered before the lifecycle drive alongside the
-/// other framework natives, since an app may register a sensor listener during `Activity.onCreate`
-/// (accelerometerdemo does, in `initViews`).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the function pointer must match the declared JNI signature.
-/// It does, by construction — [`sensor_manager_register_accelerometer_listener`] is written to the
-/// exact `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V` descriptor as an
-/// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic
-/// can cross the JNI boundary (AGENTS.md §2.8).
 fn register_sensor_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(SENSOR_MANAGER_CLASS)?;
-    let methods = [
-        // SAFETY: `sensor_manager_register_accelerometer_listener` matches the paired
-        // `(Landroid/hardware/SensorEventListener;Landroid/hardware/Sensor;I)V` signature as an
-        // instance native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void`
-        // is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                SENSOR_MANAGER_REGISTER_NAME,
-                SENSOR_MANAGER_REGISTER_SIG,
-                sensor_manager_register_accelerometer_listener as *mut std::ffi::c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded android/hardware/SensorManager; `methods` holds a valid fn pointer
-    // whose signature matches the class's `native` declaration (ART-reported `No implementation found`
-    // line, 2026-06-05).
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            SENSOR_MANAGER_REGISTER_NAME,
+            SENSOR_MANAGER_REGISTER_SIG,
+            sensor_manager_register_accelerometer_listener as *mut std::ffi::c_void,
+        )
+    }];
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/hardware/SensorManager",
@@ -4378,51 +2678,18 @@ fn register_sensor_manager_natives(env: &mut Env) -> Result<(), FrameworkError> 
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.os.Vibrator ====================================
-//
-// 2026-06-12 (core 1223806 boot, /tmp/eclipse-947663-validate.log line 691): Roblox's InitHelper
-// AsyncTask `onPostExecute` → `ContextWrapper.getSystemService("vibrator")` constructed
-// `android.os.Vibrator`, whose CONSTRUCTOR calls `native_constructor()` — unbound, so the
-// `UnsatisfiedLinkError` propagated out of `Looper.loop`, `pump_main_looper` returned the error,
-// and the main Looper pump was permanently dead 17 ms before the crash (no main-thread Handler
-// continuation ever dispatched again — the splash init state machine killed). The loud pump
-// failure is CORRECT behavior (it surfaced this gap; no catch-and-continue is added there) — the
-// fix is binding the class's FULL declared native list, read from the vendored ATL
-// `src/api-impl/android/os/Vibrator.java` (2026-06-12): exactly two —
-//   `private native int native_constructor();`            → `()I`  (instance)
-//   `private native void native_vibrate(int fd, long millis);` → `(IJ)V` (instance)
-// Binding BOTH (not just the constructor ART reported) so a later vibrate can never re-kill the
-// pump the same way. Same-pattern audit (2026-06-12): of ATL ContextImpl.getSystemService's 27
-// service classes, Vibrator is the ONLY one whose constructor invokes a native — the others'
-// natives are method-level and stay on the discovery loop (bind on run evidence).
-
-/// `android.os.Vibrator` (internal/slashed name for `find_class`) — hosts the vibrator natives.
 pub const VIBRATOR_CLASS: &JNIStr = jni_str!("android/os/Vibrator");
 
-// `Vibrator.java` line 38 (vendored ATL): `private native int native_constructor();` — an
-// instance native returning the vibrator device fd, `-1` = no device (the Java `vibrate(long)`
-// checks `fd != -1` and logs instead of vibrating).
 const VIBRATOR_NATIVE_CONSTRUCTOR_NAME: &JNIStr = jni_str!("native_constructor");
 const VIBRATOR_NATIVE_CONSTRUCTOR_SIG: &JNIStr = jni_str!("()I");
 
-// `Vibrator.java` line 37 (vendored ATL): `private native void native_vibrate(int fd, long
-// millis);` — an instance native; only reachable when the constructor returned a real fd.
 const VIBRATOR_NATIVE_VIBRATE_NAME: &JNIStr = jni_str!("native_vibrate");
 const VIBRATOR_NATIVE_VIBRATE_SIG: &JNIStr = jni_str!("(IJ)V");
 
-/// `Vibrator.native_constructor()` → `-1` = "no vibration device".
-///
-/// 2026-06-12: the documented constant-handle host semantic — a Linux desktop has no vibration
-/// motor (ATL's own C backing opens `/dev/input/eventX` and returns `-1` when absent; Eclipse
-/// detects-not-assumes by reporting the honest no-device value). The Java class handles `-1`
-/// itself (`vibrate` logs instead of calling `native_vibrate`), so this is intentional capability
-/// handling, not a stub: every Vibrator API stays callable and well-defined.
 extern "system" fn vibrator_native_constructor<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
 ) -> jint {
-    // The closure is infallible (returns `Ok(-1)`); `LogErrorAndDefault`'s `0` on the unreachable
-    // error path is still sound — `native_vibrate(0, …)` is bound below and no-ops.
     env.with_env(|_env| -> jni::errors::Result<jint> {
         tracing::debug!(
             target: "android.os.Vibrator",
@@ -4433,12 +2700,6 @@ extern "system" fn vibrator_native_constructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Vibrator.native_vibrate(int fd, long millis)` → recorded no-op.
-///
-/// 2026-06-12: unreachable through Eclipse's own constructor (it returns `-1` and the Java side
-/// gates on it), but bound anyway — the FULL declared native list — so no code path through this
-/// class can ever surface another `UnsatisfiedLinkError` out of `Looper.loop` (the core-1223806
-/// pump kill). Logged so a real call is visible evidence, never silent.
 extern "system" fn vibrator_native_vibrate<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -4457,23 +2718,9 @@ extern "system" fn vibrator_native_vibrate<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's backing for `android.os.Vibrator`'s FULL declared native list.
-///
-/// Registered before the lifecycle drive: `getSystemService("vibrator")` constructs the class
-/// from a main-Looper message (InitHelper's `AsyncTask.onPostExecute`), and an unbound native
-/// there kills the main Looper pump (2026-06-12, core-1223806 boot).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
-/// They do, by construction — both natives are written to the exact descriptors declared in the
-/// vendored ATL `Vibrator.java` (pinned by `vibrator_native_names_sigs_and_class_match_vibrator_java`).
-/// Both bodies are `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_vibrator_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(VIBRATOR_CLASS)?;
     let methods = [
-        // SAFETY: `vibrator_native_constructor` matches the paired `()I` signature as an instance
-        // native (see the native's docs); casting the `extern "system"` fn to a `*mut c_void` is
-        // how `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 VIBRATOR_NATIVE_CONSTRUCTOR_NAME,
@@ -4481,8 +2728,6 @@ fn register_vibrator_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 vibrator_native_constructor as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `vibrator_native_vibrate` matches the paired `(IJ)V` signature as an instance
-        // native (see the native's docs); same casting contract as above.
         unsafe {
             NativeMethod::from_raw_parts(
                 VIBRATOR_NATIVE_VIBRATE_NAME,
@@ -4491,10 +2736,7 @@ fn register_vibrator_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/os/Vibrator; `methods` hold valid fn pointers whose
-    // signatures match the class's two `native` declarations (verified against the vendored ATL
-    // `Vibrator.java`, 2026-06-12; constructor signature also from the ART
-    // `No implementation found for int android.os.Vibrator.native_constructor()` line).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/Vibrator",
@@ -4503,32 +2745,11 @@ fn register_vibrator_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own backing for android.os.Process.getElapsedCpuTime =============================
-//
-// 2026-06-12 (EXIT=10 boot, /tmp/eclipse-1223806-validate.log:634-637): Roblox's telemetry
-// (LoggingProtocol's process-timestamp path — the engine logged `process timestamps will be
-// inaccurate`) called the unbound `static native long getElapsedCpuTime()` 4× on a worker thread;
-// the caller caught the UnsatisfiedLinkError itself this boot, but (a) under the vendored libcore
-// EVERY uncaught worker exception is process-fatal (`hacky_uncaught_exception_handler` →
-// System.exit(10)), and (b) process timestamps were absent from telemetry for the whole boot.
-// AOSP contract (frameworks/base android_util_Process.cpp, public behavior): elapsed CPU time of
-// this process — `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` in MILLISECONDS, 0 on clock failure.
-// The class's other declared natives (getFreeMemory/getPss/…, classes2.dex) stay on the discovery
-// loop — bind on run evidence, no speculative pre-binding (Simplicity First).
-
-/// `android.os.Process` (internal/slashed name for `find_class`).
 pub const PROCESS_CLASS: &JNIStr = jni_str!("android/os/Process");
 
-// JNI name + descriptor, exactly as declared in the boot artifact's classes2.dex (2026-06-12):
-// `public static final native long getElapsedCpuTime();` (flags 0x119) → `()J`.
 const PROCESS_GET_ELAPSED_CPU_TIME_NAME: &JNIStr = jni_str!("getElapsedCpuTime");
 const PROCESS_GET_ELAPSED_CPU_TIME_SIG: &JNIStr = jni_str!("()J");
 
-/// `Process.getElapsedCpuTime()` → this process's consumed CPU time in milliseconds.
-///
-/// 2026-06-12: real implementation per the AOSP contract — `CLOCK_PROCESS_CPUTIME_ID` converted
-/// to ms; `0` on a (practically impossible on Linux ≥ 2.6.12) clock failure, matching AOSP's
-/// 0-on-error posture rather than throwing.
 extern "system" fn process_get_elapsed_cpu_time<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -4538,14 +2759,12 @@ extern "system" fn process_get_elapsed_cpu_time<'local>(
             tv_sec: 0,
             tv_nsec: 0,
         };
-        // SAFETY: `ts` is a valid out-pointer for the duration of the call;
-        // CLOCK_PROCESS_CPUTIME_ID is a standard POSIX clock id.
+
         let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
         if rc != 0 {
             return Ok(0);
         }
-        // Saturating sec→ms + nsec→ms fold: total for any representable timespec (tv_sec/tv_nsec
-        // are i64 on this LP64 target).
+
         let ms = ts
             .tv_sec
             .saturating_mul(1000)
@@ -4555,35 +2774,16 @@ extern "system" fn process_get_elapsed_cpu_time<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's backing for `android.os.Process.getElapsedCpuTime`.
-///
-/// Registered BOTH by [`register_engine_preload_natives`] (the engine's `JNI_OnLoad`-time
-/// LoggingProtocol init calls it before the lifecycle drive — the registration-ordering gap,
-/// 2026-06-12) and by `drive_lifecycle`'s block (re-registering identical fn pointers is
-/// spec-legal and idempotent, so neither path can regress the other).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature.
-/// It does, by construction — `()J` as a STATIC native (pinned by
-/// `process_native_name_sig_and_class_match_api_impl_dex`). The body is `catch_unwind`-guarded
-/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_process_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(PROCESS_CLASS)?;
-    let methods = [
-        // SAFETY: `process_get_elapsed_cpu_time` matches the paired `()J` signature as a static
-        // native; the cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                PROCESS_GET_ELAPSED_CPU_TIME_NAME,
-                PROCESS_GET_ELAPSED_CPU_TIME_SIG,
-                process_get_elapsed_cpu_time as *mut std::ffi::c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded android/os/Process; the method holds a valid fn pointer whose
-    // signature matches the class's `native` declaration (artifact classes2.dex, 2026-06-12; the
-    // exact ART-reported line `No implementation found for long
-    // android.os.Process.getElapsedCpuTime()`).
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            PROCESS_GET_ELAPSED_CPU_TIME_NAME,
+            PROCESS_GET_ELAPSED_CPU_TIME_SIG,
+            process_get_elapsed_cpu_time as *mut std::ffi::c_void,
+        )
+    }];
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/Process",
@@ -4592,27 +2792,9 @@ fn register_process_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.view.inputmethod.InputMethodManager =============
-//
-// 2026-06-15: ATL's InputMethodManager (api-impl/android/view/inputmethod/InputMethodManager.java) declares a
-// STATIC native `nativeInit()` that returns a `long` — a GtkIMContext pointer in ATL, but Eclipse has no
-// soft keyboard (no GTK), so this returns a dummy non-null handle (0 is valid as "no context"). UNBOUND,
-// this threw during the post-logout LuaApp re-init (2×). The `im_context` class field stores the handle;
-// Eclipse's 0 sentinel means "no IM context" (hideSoftInput/showSoftInput no-ops).
-
-/// `android.view.inputmethod.InputMethodManager` (internal/slashed name for `find_class`).
 pub const INPUT_METHOD_MANAGER_CLASS: &JNIStr =
     jni_str!("android/view/inputmethod/InputMethodManager");
 
-// JNI names + descriptors for InputMethodManager's natives, exactly as declared in the installed
-// InputMethodManager dex (baksmali-confirmed 2026-07-01):
-//   `private static native long nativeInit();`                                             → STATIC ()J
-//   `private native void nativeHideSoftInput(long);`                                        → INSTANCE (J)V
-//   `private native boolean nativeShowSoftInput(long, long, InputConnection, int);`         → INSTANCE (JJLandroid/view/inputmethod/InputConnection;I)Z
-// nativeInit backs the class <clinit>'s `im_context` field; hide/show are the soft-keyboard show/hide
-// path (`hideSoftInputFromWindow`/`showSoftInput`). Eclipse has no soft keyboard (no GTK/GtkIMContext),
-// and Roblox's visible login typing is delivered via the engine text bridge + Eclipse's Vulkan overlay
-// (AGENTS.md §5), NOT the Android IME — so hide is a no-op and show honestly reports "not shown".
 const IMM_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
 const IMM_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
 const IMM_NATIVE_HIDE_SOFT_INPUT_NAME: &JNIStr = jni_str!("nativeHideSoftInput");
@@ -4621,18 +2803,11 @@ const IMM_NATIVE_SHOW_SOFT_INPUT_NAME: &JNIStr = jni_str!("nativeShowSoftInput")
 const IMM_NATIVE_SHOW_SOFT_INPUT_SIG: &JNIStr =
     jni_str!("(JJLandroid/view/inputmethod/InputConnection;I)Z");
 
-/// `InputMethodManager.nativeInit()` → 0 (2026-06-15). STATIC native, descriptor `()J`. Eclipse has no
-/// soft keyboard (no GTK/GtkIMContext), so this returns 0 as a "no IM context" sentinel. UNBOUND, this
-/// threw during the post-logout LuaApp re-init (2×).
 extern "system" fn imm_native_init<'local>(mut env: EnvUnowned<'local>) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> { Ok(0) })
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `InputMethodManager.nativeHideSoftInput(long im_context)` → no-op (2026-07-01). INSTANCE native,
-/// descriptor `(J)V`. Called from `hideSoftInputFromWindow` on the `RbxKeyboard` keyboard path
-/// (post-login field defocus). Eclipse has no soft keyboard to hide, so this is a sound no-op; the
-/// `im_context` arg is the [`imm_native_init`] 0 sentinel and is not dereferenced.
 extern "system" fn imm_native_hide_soft_input<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -4642,12 +2817,6 @@ extern "system" fn imm_native_hide_soft_input<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `InputMethodManager.nativeShowSoftInput(long im_context, long view, InputConnection ic, int flags)`
-/// → `false` (2026-07-01). INSTANCE native, descriptor `(JJLandroid/view/inputmethod/InputConnection;I)Z`.
-/// Called from `showSoftInput` on the `RbxKeyboard` keyboard path (post-login field focus). Eclipse has
-/// no soft keyboard, so the honest answer is "no soft input was shown" (`false`) — this is a capability
-/// report, not a workaround: Roblox's visible login typing is delivered via the engine text bridge +
-/// Eclipse's Vulkan overlay (AGENTS.md §5), not the Android IME. Args are not dereferenced.
 extern "system" fn imm_native_show_soft_input<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -4660,25 +2829,9 @@ extern "system" fn imm_native_show_soft_input<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `InputMethodManager`'s `nativeInit` +
-/// `nativeHideSoftInput` + `nativeShowSoftInput`.
-///
-/// All three are declared `native` in the shipped dex (baksmali-confirmed 2026-07-01), so the atomic
-/// `register_native_methods` array binds cleanly. Binding the full declared-native set in one pass
-/// (per the batch-binding discipline in AGENTS.md §6) closes the whole soft-keyboard path at once
-/// rather than one gap per boot.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature. They
-/// do, by construction — `nativeInit ()J` (STATIC), `nativeHideSoftInput (J)V` (INSTANCE),
-/// `nativeShowSoftInput (JJLandroid/view/inputmethod/InputConnection;I)Z` (INSTANCE) — pinned by
-/// `imm_native_name_sig_and_class_match_api_impl_dex`. Every body is `catch_unwind`-guarded via
-/// [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(INPUT_METHOD_MANAGER_CLASS)?;
     let methods = [
-        // SAFETY: `imm_native_init` matches the paired `()J` signature as a static native; the cast
-        // is how `NativeMethod::from_raw_parts` takes the fn pointer.
         unsafe {
             NativeMethod::from_raw_parts(
                 IMM_NATIVE_INIT_NAME,
@@ -4686,7 +2839,6 @@ fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkE
                 imm_native_init as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `imm_native_hide_soft_input` matches the paired `(J)V` signature as an instance native.
         unsafe {
             NativeMethod::from_raw_parts(
                 IMM_NATIVE_HIDE_SOFT_INPUT_NAME,
@@ -4694,8 +2846,6 @@ fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkE
                 imm_native_hide_soft_input as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `imm_native_show_soft_input` matches the paired
-        // `(JJLandroid/view/inputmethod/InputConnection;I)Z` signature as an instance native.
         unsafe {
             NativeMethod::from_raw_parts(
                 IMM_NATIVE_SHOW_SOFT_INPUT_NAME,
@@ -4704,9 +2854,7 @@ fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkE
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/view/inputmethod/InputMethodManager; each method holds a
-    // valid fn pointer whose signature matches the class's `native` declaration (installed IMM dex,
-    // baksmali-confirmed 2026-07-01).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/inputmethod/InputMethodManager",
@@ -4715,25 +2863,11 @@ fn register_input_method_manager_natives(env: &mut Env) -> Result<(), FrameworkE
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.app.Dialog =====================================
-//
-// 2026-06-15: ATL's Dialog (api-impl/android/app/Dialog.java) declares an INSTANCE native `nativeInit()`
-// that returns a `long` — a GtkWindow dialog pointer in ATL, but Eclipse has no dialog system (no GTK),
-// so this returns a dummy non-null handle (1 as a "dialog placeholder"). UNBOUND, this threw during the
-// post-logout LuaApp re-init (2×). The `nativePtr` instance field stores the handle; Eclipse's sentinel
-// means "no real dialog" (setTitle/setContentView/show/close no-ops).
-
-/// `android.app.Dialog` (internal/slashed name for `find_class`).
 pub const DIALOG_CLASS: &JNIStr = jni_str!("android/app/Dialog");
 
-// JNI name + descriptor for Dialog.nativeInit, exactly as declared in Dialog.java (line 23):
-// `protected native long nativeInit();` → INSTANCE, descriptor `()J`.
 const DIALOG_NATIVE_INIT_NAME: &JNIStr = jni_str!("nativeInit");
 const DIALOG_NATIVE_INIT_SIG: &JNIStr = jni_str!("()J");
 
-/// `Dialog.nativeInit()` → 1 (2026-06-15). INSTANCE native, descriptor `()J`. Eclipse has no dialog
-/// system (no GTK/GtkWindow), so this returns 1 as a "dialog placeholder" sentinel. UNBOUND, this
-/// threw during the post-logout LuaApp re-init (2×).
 extern "system" fn dialog_native_init<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -4742,28 +2876,16 @@ extern "system" fn dialog_native_init<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `Dialog.nativeInit()`.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature.
-/// It does, by construction — `()J` as an INSTANCE native (pinned by
-/// `dialog_native_name_sig_and_class_match_api_impl_dex`). The body is `catch_unwind`-guarded
-/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_dialog_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(DIALOG_CLASS)?;
-    let methods = [
-        // SAFETY: `dialog_native_init` matches the paired `()J` signature as an instance native;
-        // the cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                DIALOG_NATIVE_INIT_NAME,
-                DIALOG_NATIVE_INIT_SIG,
-                dialog_native_init as *mut std::ffi::c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded android/app/Dialog; the method holds a valid fn pointer whose
-    // signature matches the class's `native` declaration (Dialog.java line 23, ATL api-impl).
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            DIALOG_NATIVE_INIT_NAME,
+            DIALOG_NATIVE_INIT_SIG,
+            dialog_native_init as *mut std::ffi::c_void,
+        )
+    }];
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/app/Dialog",
@@ -4772,329 +2894,100 @@ fn register_dialog_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.view.View native peer construction =============
-//
-// 2026-06-05: step 4 (`Activity.createMainActivity`) constructs the launcher Activity, whose
-// view hierarchy is fully native-handle-backed. The first native the dev-host run surfaces is
-// `View.native_constructor(Context, AttributeSet)` (`No implementation found for long
-// android.view.View.native_constructor(...)`, run log 2026-06-05). `View.java` line 1166 declares it
-//   `protected native long native_constructor(Context context, AttributeSet attrs);` // GtkWidget
-// — an INSTANCE native returning the native View peer handle (a `long`). ATL's C backing creates a
-// GtkWidget; Eclipse must NOT pull in GTK (AGENTS.md §5 Step 3.5). Eclipse's GTK-free equivalent
-// allocates a sound [`view_registry`] slot (keyed on the receiver's actual Java class name, so the
-// recorded tree shows FrameLayout/TextView/etc.) and returns that slab handle — a generational index,
-// NOT a raw pointer, so a stale/fabricated handle from later View natives is a bounds+generation-
-// checked `Err`, never UB. No layout/measure/draw and no winit/Vulkan surface is created here (the
-// deferred big build); only the view-tree metadata is recorded — sound, not behavior-faking.
-
-/// `android.view.View` (internal/slashed name for `find_class`) — hosts the View peer natives.
 pub const VIEW_CLASS: &JNIStr = jni_str!("android/view/View");
 
-// === Eclipse → real Android MotionEvent touch dispatch (2026-06-05) ===========================
-//
-// 2026-06-05: the proper Android input event for a pointer touch is a `MotionEvent` routed to the
-// hit View via `dispatchTouchEvent` (which itself calls `onTouchEvent` + the View's click
-// detection). This is the faithful follow-up to INPUT v0's `performClick`-only path. We build the
-// event with the PUBLIC Java factory `MotionEvent.obtain(...)` (a recycler-pool allocation, all
-// Java; no Eclipse native is needed unless the ART surfaces one), dispatch it, then `recycle()` it.
-// Single-pointer DOWN/UP only this increment; multi-touch/MOVE/key are the documented follow-ups.
-
-/// `android.view.MotionEvent` (internal/slashed name for `find_class`) — hosts the public static
-/// `obtain(...)` factory and the instance `recycle()`. 2026-06-05.
-///
-/// The touch-dispatch call sites use inline `jni_str!`/`jni_sig!` literals (single source of truth,
-/// no runtime signature parse), pinned against this module's documented descriptors by the unit test
-/// `motion_event_dispatch_descriptors_are_the_public_android_api`:
-///   * `MotionEvent.obtain(long downTime, long eventTime, int action, float x, float y, int metaState)`
-///     → `(JJIFFI)Landroid/view/MotionEvent;` (the public Java recycler-pool factory; Eclipse calls,
-///     does not back it).
-///   * `MotionEvent.recycle()` → `()V` (returns the event to the recycler pool).
-///   * `View.dispatchTouchEvent(MotionEvent)` → `(Landroid/view/MotionEvent;)Z` (routes through
-///     `onTouchEvent` + the View's click detection).
-///
-/// All three are stable, general public Android API.
 pub const MOTION_EVENT_CLASS: &JNIStr = jni_str!("android/view/MotionEvent");
-/// `android.view.KeyEvent` (slashed internal name), retained for framework compatibility contracts.
-/// Gameplay hardware input uses Roblox's direct [`pass_hardware_key_to_engine`] bridge.
+
 pub const KEY_EVENT_CLASS: &JNIStr = jni_str!("android/view/KeyEvent");
 
-// JNI name + descriptor for View's native peer constructor, exactly as declared in `View.java`
-// (2026-06-05, line 1166): `protected native long native_constructor(Context context, AttributeSet
-// attrs);` → an instance native, descriptor `(Landroid/content/Context;Landroid/util/AttributeSet;)J`.
 const VIEW_NATIVE_CONSTRUCTOR_NAME: &JNIStr = jni_str!("native_constructor");
 const VIEW_NATIVE_CONSTRUCTOR_SIG: &JNIStr =
     jni_str!("(Landroid/content/Context;Landroid/util/AttributeSet;)J");
 
-// JNI name + descriptor for View.native_setPadding, exactly as declared in `View.java` (2026-06-05,
-// line 1310): `public native void native_setPadding(long widget, int left, int top, int right, int
-// bottom);` → an instance native, descriptor `(JIIII)V`. Surfaced by the dev-host run during
-// `View.<init>` (run log 2026-06-05). Padding is layout data Eclipse does not act on yet (no
-// layout/draw without the deferred surface), so the backing validates the view handle and no-ops.
 const VIEW_NATIVE_SET_PADDING_NAME: &JNIStr = jni_str!("native_setPadding");
 const VIEW_NATIVE_SET_PADDING_SIG: &JNIStr = jni_str!("(JIIII)V");
 
-// JNI name + descriptor for View.native_setLayoutParams, exactly as declared in `View.java`
-// (2026-06-05, line 1167): `public native void native_setLayoutParams(long widget, int width, int
-// height, int gravity, float weight, int leftMargin, int topMargin, int rightMargin, int
-// bottomMargin);` → an instance native, descriptor `(JIIIFIIII)V`. Surfaced during `ViewGroup.addView`
-// (run log 2026-06-05). Layout sizing/margins are data Eclipse does not act on yet (deferred layout),
-// so the backing validates the view handle and no-ops.
 const VIEW_NATIVE_SET_LAYOUT_PARAMS_NAME: &JNIStr = jni_str!("native_setLayoutParams");
 const VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG: &JNIStr = jni_str!("(JIIIFIIII)V");
 
-// JNI name + descriptor for View.native_requestLayout, exactly as declared in `View.java`
-// (2026-06-05, line 1175): `protected native void native_requestLayout(long widget);` → an instance
-// native, descriptor `(J)V`. Surfaced during `ViewGroup.addView` → `View.requestLayout` (run log
-// 2026-06-05). Layout invalidation is a no-op until real layout lands; the backing validates the
-// handle and no-ops.
 const VIEW_NATIVE_REQUEST_LAYOUT_NAME: &JNIStr = jni_str!("native_requestLayout");
 const VIEW_NATIVE_REQUEST_LAYOUT_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-06-05: `View.setBackgroundDrawable` calls `native_setBackgroundDrawable(widget, drawable)` to
-// attach a background drawable to a view. It was unreached until themes resolved
-// `android:windowBackground` (which makes `setContentView → Window/View.setBackgroundDrawable` run);
-// the ART error line gives the exact signature `void android.view.View.native_setBackgroundDrawable(
-// long, long)` → `(JJ)V` instance. `drawable` is a Drawable peer handle (the non-pointer sentinel
-// from `Drawable.native_constructor`), NOT a view/registry handle, so it is taken but not dereferenced;
-// the real background draw is the deferred 2D/Skia path. Validates the view handle + no-op.
 const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME: &JNIStr = jni_str!("native_setBackgroundDrawable");
 const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
 
-// 2026-06-05: `View.<init>` (and `setVisibility`/`setAlpha`) call `native_setVisibility(widget,
-// visibility, alpha)` to push the view's visibility (VISIBLE=0/INVISIBLE=4/GONE=8) and alpha onto its
-// native peer. Surfaced when AppCompat's sub-decor inflation constructed an `ActionBarContextView`
-// (`View.<init>` → `native_setVisibility`, run log 2026-06-05). The ART error line gives the exact
-// signature `void android.view.View.native_setVisibility(long, int, float)` → `(JIF)V` instance.
-// Validates the view handle + no-op: the snapshot renderer does not yet consume visibility/alpha (a
-// GONE view should be skipped in layout — documented follow-up), so recording them is not yet
-// load-bearing; the handle check keeps it sound.
 const VIEW_NATIVE_SET_VISIBILITY_NAME: &JNIStr = jni_str!("native_setVisibility");
 const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIF)V");
 
-// 2026-06-05: `View.setOnClickListener` calls `nativeSetOnClickListener(widget)` directly on the
-// `android.view.View` class (multitouch.test's custom View registers a click listener — run log
-// `No implementation found for void android.view.View.nativeSetOnClickListener(long)`). The same
-// native was already bound on `ImageButton` (resolved per declaring class); the handler
-// [`image_button_set_on_click_listener`] is class-agnostic (it marks the peer clickable in
-// [`view_registry`]), so the View-class binding reuses it. Instance native, descriptor `(J)V`.
 const VIEW_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
 const VIEW_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-06-13: `View.setOnTouchListener`/`setOnLongClickListener` each call a `(long widget)` native
-// then store the listener in a View Java field (`on_touch_listener`/`on_long_click_listener`,
-// View.java lines 1153/1446) — the SAME shape as `setOnClickListener`/`nativeSetOnClickListener`. The
-// owner's live boot of the pointer-capture overlay (EXIT=124 clean) advanced `ActivityNativeMain.d1`
-// to `No implementation found for void android.view.View.nativeSetOnTouchListener(long)`; the
-// `nativeSetOnLongClickListener` sibling is the same record-the-listener pattern reached on the same
-// view-setup path. Both are `protected native void …(long)` → instance descriptor `(J)V` (View.java
-// lines 1155/1448). Eclipse is headless (no GTK signal wiring): the listener object lives Java-side
-// and the engine/input path dispatches, so the native only has to exist, validate the handle, and not
-// throw — UNLIKE `nativeSetOnClickListener`, these do NOT flip `view_registry`'s `clickable` flag
-// (that flag gates only the click hit-test; touch/long-click are distinct in Android and dispatched
-// by the engine input path, not the click hit-test). See [`view_set_input_listener`].
 const VIEW_SET_ON_TOUCH_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnTouchListener");
 const VIEW_SET_ON_TOUCH_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 const VIEW_SET_ON_LONG_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnLongClickListener");
 const VIEW_SET_ON_LONG_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-06-05: `View.setBackgroundColor` calls `native_setBackgroundColor(long widget, int color)` to
-// set a solid background fill on the native peer; surfaced by multitouch.test (run log `No
-// implementation found for void android.view.View.native_setBackgroundColor(long, int)`). `color` is
-// `Color.argb`/`0xAARRGGBB`. Eclipse RECORDS it on the `view_registry` peer; the renderer fills the
-// view's rect with this color (real fidelity over the synthetic depth color). Instance native, `(JI)V`.
 const VIEW_SET_BACKGROUND_COLOR_NAME: &JNIStr = jni_str!("native_setBackgroundColor");
 const VIEW_SET_BACKGROUND_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
 
-// 2026-06-11: `View.setSystemUiVisibility` calls `nativeSetFullscreen(widget, fullscreen)` to
-// hide/show the system UI (status/navigation bars) for the SYSTEM_UI_FLAG_FULLSCREEN flags.
-// Surfaced by Roblox's `ActivitySplash.onCreate` → `com.roblox.client.a.F0` (run log 2026-06-11:
-// `No implementation found for void android.view.View.nativeSetFullscreen(long, boolean)`).
-// `View.java` line 1214 declares `private native void nativeSetFullscreen(long widget, boolean
-// fullscreen);` → an instance native, descriptor `(JZ)V`. Eclipse's desktop window has no system
-// bars to hide, so the honest backing validates the view handle and no-ops (host window
-// fullscreen, if ever wanted, is `graphics::run_windowed`'s concern, not the Android View's).
 const VIEW_NATIVE_SET_FULLSCREEN_NAME: &JNIStr = jni_str!("nativeSetFullscreen");
 const VIEW_NATIVE_SET_FULLSCREEN_SIG: &JNIStr = jni_str!("(JZ)V");
 
-// 2026-06-13: `View.getViewTreeObserver()` calls `native_get_window(widget)` to obtain the Window
-// that owns this view's tree, so it can hand it to `new ViewTreeObserver(window)` (View.java lines
-// 1244-1255). Surfaced by Roblox's `ActivityNativeMain.onCreate` → `d1()` → `getViewTreeObserver()`
-// (live-boot stack, commit 4e7cd42: `No implementation found for android.view.Window
-// android.view.View.native_get_window(long)`). `View.java` line 1244 declares
-// `public native Window native_get_window(long widget);` → an INSTANCE native returning a Window,
-// descriptor `(J)Landroid/view/Window;`. Eclipse returns the process-shared Java `Window` object
-// (the one `internalCreateActivity` built and `set_native_window` populated — Activity.java line 82,
-// Window.java lines 58-60), captured at `Window.set_jobject`. A null return is contract-valid: ATL
-// builds a floating observer (View.java line 1252), so the native is sound even before capture.
 const VIEW_NATIVE_GET_WINDOW_NAME: &JNIStr = jni_str!("native_get_window");
 const VIEW_NATIVE_GET_WINDOW_SIG: &JNIStr = jni_str!("(J)Landroid/view/Window;");
 
-// 2026-06-13: `View.finalize()` calls `native_destructor(widget)` to free the view's native peer when
-// the Java View is garbage-collected (View.java line 1679, `native_destructor(widget)`). `View.java`
-// line 1168 declares `protected native void native_destructor(long widget);` → an INSTANCE native
-// taking the peer handle and returning void, descriptor `(J)V`. Declared on View and NOT overridden by
-// any subclass, so binding it on `android/view/View` covers every View subclass (incl. SurfaceView) by
-// inheritance. Surfaced by Roblox's live boot (commit 95f964c): the ART FinalizerDaemon cleaning up a
-// half-built `com.roblox.client.RBXSurfaceView` (whose `native_constructor` had thrown) hit
-// `No implementation found for void android.view.View.native_destructor(long)`. Frees the
-// [`view_registry`] peer for the handle; it MUST tolerate `widget == 0` and any stale/fabricated
-// handle (the failed-construct path leaves `View.widget` at its default `0`), which
-// [`view_registry::free`] does via its bounds+generation check (logged + ignored, never throws/UB).
 const VIEW_NATIVE_DESTRUCTOR_NAME: &JNIStr = jni_str!("native_destructor");
 const VIEW_NATIVE_DESTRUCTOR_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-06-15: post-login Home-screen natives. `View.getWindowVisibleDisplayFrame(Rect)` (View.java:2216,
-// `public native void getWindowVisibleDisplayFrame(Rect rect)` — INSTANCE, no widget handle) and
-// `View.nativeIsAttachedToWindow(long widget)` (View.java:2012, `private native boolean`, `(J)Z`). Both
-// were UNBOUND and threw on the LuaApp Home setup (`Handler.dispatchMessage` failed every cycle →
-// Home re-navigated Startup→…→Home in a tight loop, hammering APIs into HTTP 429). ATL backs the visible
-// frame against its GtkWindow; Eclipse has no system bars/insets, so the visible frame IS the full host
-// window — filled from the published `ndk_registry::engine_window_geometry()`. `isAttachedToWindow` → true
-// (the view tree is on the live window). Live boot 2026-06-15: this loop is what blocked the post-login Home.
 const VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_NAME: &JNIStr =
     jni_str!("getWindowVisibleDisplayFrame");
 const VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_SIG: &JNIStr = jni_str!("(Landroid/graphics/Rect;)V");
 const VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_NAME: &JNIStr = jni_str!("nativeIsAttachedToWindow");
 const VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG: &JNIStr = jni_str!("(J)Z");
 
-// 2026-06-15: Home-screen view-focus/geometry natives. `View.native_getGlobalVisibleRect(long, Rect)` (View.java:2179,
-// `protected native boolean native_getGlobalVisibleRect(long widget, Rect visibleRect)`, returns `(JLandroid/graphics/Rect;)Z`)
-// and `View.nativeRequestFocus(long, int)` (View.java:1298, `private native void nativeRequestFocus(long widget, int direction)`,
-// descriptor `(JI)V`). UNBOUND, these threw on the post-logout LuaApp re-init (4× getGlobalVisibleRect, 2× requestFocus).
-// Eclipse has no window hierarchy, so the global visible rect is the full window frame (0,0,w,h) taken from
-// `ndk_registry::engine_window_geometry()`, and focus is a no-op (no focus manager).
 const VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_NAME: &JNIStr = jni_str!("native_getGlobalVisibleRect");
 const VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_SIG: &JNIStr = jni_str!("(JLandroid/graphics/Rect;)Z");
 const VIEW_NATIVE_REQUEST_FOCUS_NAME: &JNIStr = jni_str!("nativeRequestFocus");
 const VIEW_NATIVE_REQUEST_FOCUS_SIG: &JNIStr = jni_str!("(JI)V");
 
-// 2026-06-13: `View.setBackgroundColor(int)` is NOT RegisterNatives-bound here. Commit 58a50f6 added
-// a binding for it citing the *vendored* View.java (line 1284 `public native void
-// setBackgroundColor(int color);`), but the live boot at 58a50f6 proved the *shipped* framework
-// disagrees with the vendored source: ART rejected the entry with `jni_internal.cc: Failed to
-// register non-native method android.view.View.setBackgroundColor(I)V as native` → `No such method:
-// no native method "Landroid/view/View;.setBackgroundColor(I)V"`. In the installed framework
-// `setBackgroundColor(int)` is a PLAIN Java method, so RegisterNatives — which is atomic over the
-// whole array — failed entirely and took the lifecycle-critical View natives
-// (native_constructor/native_destructor/native_get_window) down with it, aborting the boot.
-// 2026-07-02: the declared-vs-bound audit of the installed dex (baksmali of BOTH the classes2.dex
-// shadowed View and the stock classes3.dex View — identical 30-native surfaces) re-confirms
-// `setBackgroundColor(I)V` is absent from the native set, so it stays out. `native_keep_screen_on
-// (JZ)V` — which 58a50f6 also embargoed pending proof of its shipped native-ness — IS declared
-// `private static native` in both dexes (the exact declaration RegisterNatives validates against),
-// so it is now bound below as a validated no-op; the per-method best-effort registrar additionally
-// makes any residual mismatch non-fatal (a WARN + call-time UnsatisfiedLinkError, never a class abort).
-
-// 2026-07-02: the View LAYOUT/GEOMETRY remainder pass (the challenge8 `View.native_layout` ULE, log
-// lines 1153–1188: `SwipeRefreshLayout.<init>` → `setTargetOffsetTopAndBottom` →
-// `View.offsetTopAndBottom` → `View.layout` inside the rbx.web fragment inflation). Declared-vs-bound
-// audit of the INSTALLED framework (baksmali of `~/.cache/eclipse/framework-patched/api-impl.jar`;
-// the classes2.dex overlay-shadowed View is the active first-dex-wins copy and declares the IDENTICAL
-// 30 natives as the stock classes3.dex View): 17 were already bound; the 13-native remainder is
-// classified below. The frame IS read back by Java everywhere (`getLeft`/`getTop`/`getRight`/
-// `getBottom`/`getWidth`/`getHeight`/`offsetTopAndBottom`/`offsetLeftAndRight`) — but from Java
-// FIELDS: the installed `View.layout(l,t,r,b)` stores `left`/`top`/`right`/`bottom` on `this` BEFORE
-// invoking `native_layout` (smali-verified; the vendored View.java's `native getWidth()/getHeight()`
-// declarations have DRIFTED — the installed getters are plain-Java field reads). So `native_layout`
-// is a write-only sink (ATL's reference C forwards it to gtk_widget_size_allocate) and Eclipse
-// RECORDS the frame on the `view_registry` peer (real laid-out geometry beside the requested
-// LayoutParams — the honest registry-backed disposition, never a Java read-back source).
 const VIEW_NATIVE_LAYOUT_NAME: &JNIStr = jni_str!("native_layout");
 const VIEW_NATIVE_LAYOUT_SIG: &JNIStr = jni_str!("(JIIII)V");
 
-// 2026-07-02: `View.invalidate()`/`invalidate(int,int,int,int)`/`invalidate(Rect)`/
-// `invalidateDrawable(Drawable)` all call the STATIC `nativeInvalidate(widget)` (ATL reference C:
-// `wrapper_widget_queue_draw` — a GTK redraw request with no reader). Validated no-op: nothing reads
-// back, the engine renders the real screen. Static native → the second JNI parameter is the JClass.
 const VIEW_NATIVE_INVALIDATE_NAME: &JNIStr = jni_str!("nativeInvalidate");
 const VIEW_NATIVE_INVALIDATE_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-07-02: `View.isFocused()` returns the STATIC `nativeIsFocused(widget)` answer VERBATIM
-// (installed smali: `invoke-static … move-result v0 … return v0`; ATL reference C:
-// `gtk_widget_has_focus`), and `View.requestFocus()` → `nativeRequestFocus(widget, direction)` is
-// the only focus writer on the class — a coupled read-back pair (the CheckBox `isChecked`/
-// `setChecked` rule, 2026-06-13: never no-op the setter while the getter reads it back). Eclipse has
-// no GTK focus, so `nativeRequestFocus` (already bound) now RECORDS the requesting view as
-// `view_registry`'s focused view and `nativeIsFocused` serves handle equality against that record —
-// the last view that requested focus is focused (the honest headless model; Android focus likewise
-// moves to the latest successful requester).
 const VIEW_NATIVE_IS_FOCUSED_NAME: &JNIStr = jni_str!("nativeIsFocused");
 const VIEW_NATIVE_IS_FOCUSED_SIG: &JNIStr = jni_str!("(J)Z");
 
-// 2026-07-02: `View.setKeepScreenOn(boolean)` + `onAttachedToWindow()`/`onDetachedFromWindow()` call
-// the STATIC `native_keep_screen_on(widget, keepScreenOn)` (ATL reference C: GtkApplication
-// inhibit/uninhibit of host suspend/idle — a host power-management side effect with no reader).
-// Validated no-op: Eclipse sets no host screen-wake policy (the desktop compositor owns idle), and
-// nothing reads back. Bound now that the installed dex proves the declaration (see the 58a50f6
-// embargo note above).
 const VIEW_NATIVE_KEEP_SCREEN_ON_NAME: &JNIStr = jni_str!("native_keep_screen_on");
 const VIEW_NATIVE_KEEP_SCREEN_ON_SIG: &JNIStr = jni_str!("(JZ)V");
 
-// 2026-07-02: GTK CSS style-class natives `native_addClass(widget, String)` /
-// `native_removeClasses(widget, String[])` (ATL reference C: `gtk_widget_add_css_class`/
-// `gtk_widget_remove_css_class` — styling hints with no reader). Installed-dex invokers (full
-// per-method scan of all three dexes, 2026-07-02; every call resolves to View's declaration by
-// inheritance — no subclass re-declares either native): `View.setTextAlignment(int)`
-// ("ATL-text-align-left/center/right"), `TextView.setAllCaps(boolean)` ("ATL-text-uppercase"),
-// `TextView.setTypeface(Typeface,int)` ("ATL-font-bold"/"ATL-font-italic"), and `Button.<init>`
-// ("ATL-no-border", addClass only). Validated no-ops: Eclipse has no GTK style context, nothing
-// reads back — the disposition holds for EVERY caller, so neither native may be downgraded to dead
-// code while any of those paths exist. The sibling `native_addClasses(J[Ljava/lang/String;)V` /
-// `native_removeClass(JLjava/lang/String;)V` are DECLARATION-ONLY dead code in the installed dex (no
-// invoker in any of the three dexes) and stay unbound like the 🎨 pass's dead BitmapFactory natives.
 const VIEW_NATIVE_ADD_CLASS_NAME: &JNIStr = jni_str!("native_addClass");
 const VIEW_NATIVE_ADD_CLASS_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
 const VIEW_NATIVE_REMOVE_CLASSES_NAME: &JNIStr = jni_str!("native_removeClasses");
 const VIEW_NATIVE_REMOVE_CLASSES_SIG: &JNIStr = jni_str!("(J[Ljava/lang/String;)V");
 
-// 2026-07-02: `View.draw(Canvas)`/`onDraw(Canvas)` call `native_drawBackground(widget, snapshot)` /
-// `native_drawContent(widget, snapshot)` ONLY under an `instanceof android.atl.GskCanvas` guard
-// (installed smali; the `snapshot` is the GskCanvas's GSK snapshot pointer — ATL reference C:
-// `gtk_widget_snapshot_child`). Validated no-ops, the `Drawable.native_draw(JJII)V` precedent
-// (2026-07-02 🎨): write-only render bookkeeping with no reader — the engine renders the real
-// screen, and Eclipse never constructs a GskCanvas, so the guard normally keeps these unreached.
 const VIEW_NATIVE_DRAW_BACKGROUND_NAME: &JNIStr = jni_str!("native_drawBackground");
 const VIEW_NATIVE_DRAW_BACKGROUND_SIG: &JNIStr = jni_str!("(JJ)V");
 const VIEW_NATIVE_DRAW_CONTENT_NAME: &JNIStr = jni_str!("native_drawContent");
 const VIEW_NATIVE_DRAW_CONTENT_SIG: &JNIStr = jni_str!("(JJ)V");
 
-// 2026-07-02: `View.setTranslationX(float)`/`setTranslationY(float)` store the translation in the
-// view's OWN Java field, then call `native_queueAllocate` on the PARENT's widget handle (installed
-// smali; ATL reference C: `gtk_widget_queue_allocate` — a GTK re-layout request with no reader).
-// Validated no-op; note the handle passed is the parent's, so the handler validates whatever live
-// handle arrives.
 const VIEW_NATIVE_QUEUE_ALLOCATE_NAME: &JNIStr = jni_str!("native_queueAllocate");
 const VIEW_NATIVE_QUEUE_ALLOCATE_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-07-02: `native_measure(JII)V` — bound (the challenge13 frontier: ART ULE at
-// Toolbar.getMenu → ActionMenuView, /tmp/eclipse-challenge13.log lines 1154–1176). A real
-// content-measure pass; headless Eclipse serves the installed getDefaultSize semantics via the
-// MANDATORY setMeasuredDimension(II)V upcall (see view_native_measure).
 const VIEW_NATIVE_MEASURE_NAME: &JNIStr = jni_str!("native_measure");
 const VIEW_NATIVE_MEASURE_SIG: &JNIStr = jni_str!("(JII)V");
-// Upcall targets (installed-dex smali-verified — cite the INSTALLED dex, not the drifted vendored
-// View.java: setMeasuredDimension is plain-Java `protected final` iput×2; getSuggestedMinimum* are
-// plain minWidth/minHeight field reads; JNI call_method bypasses Java access — the surfaceCreated()V
-// house precedent). Names are `&JNIStr` (call_method's `N: AsRef<JNIStr>`); signatures are
-// `MethodSignature` consts (call_method's `S: AsRef<MethodSignature>` — its ONLY AsRef impl is
-// MethodSignature itself, so a jni_str! sig const would be rejected; jni_sig! is const-evaluable).
+
 const VIEW_SET_MEASURED_DIMENSION_NAME: &JNIStr = jni_str!("setMeasuredDimension");
 const VIEW_SET_MEASURED_DIMENSION_SIG: MethodSignature<'static, 'static> = jni_sig!("(II)V");
 const VIEW_GET_SUGGESTED_MIN_WIDTH_NAME: &JNIStr = jni_str!("getSuggestedMinimumWidth");
 const VIEW_GET_SUGGESTED_MIN_HEIGHT_NAME: &JNIStr = jni_str!("getSuggestedMinimumHeight");
 const VIEW_GET_SUGGESTED_MIN_SIG: MethodSignature<'static, 'static> = jni_sig!("()I");
-// MeasureSpec encoding (installed View$MeasureSpec smali: MODE_MASK = -0x40000000, EXACTLY =
-// 0x40000000, AT_MOST = -0x80000000; size = low 30 bits). The mode lives in the TOP 2 bits, so
-// AT_MOST and the mask are NEGATIVE jints — mode/size math must be bit-pattern-exact and
-// sign-agnostic (bitwise ops only; never arithmetic/sign-dependent handling of a spec). Written as
-// u32 casts for clarity about the bit patterns.
+
 const MEASURE_SPEC_MODE_MASK: jint = (0x3u32 << 30) as jint;
 const MEASURE_SPEC_EXACTLY: jint = (1u32 << 30) as jint;
 const MEASURE_SPEC_AT_MOST: jint = (2u32 << 30) as jint;
 
-/// Installed `View.getDefaultSize(int size, int measureSpec)` semantics (smali sparse-switch:
-/// AT_MOST/EXACTLY → spec size; UNSPECIFIED (0x0) AND the switch DEFAULT (the degenerate 0b11
-/// mode) → the supplied size, i.e. the suggested minimum). Pure, unit-tested.
 fn measure_default_size(measure_spec: jint, suggested_minimum: jint) -> jint {
     match measure_spec & MEASURE_SPEC_MODE_MASK {
         m if m == MEASURE_SPEC_EXACTLY || m == MEASURE_SPEC_AT_MOST => {
@@ -5104,25 +2997,6 @@ fn measure_default_size(measure_spec: jint, suggested_minimum: jint) -> jint {
     }
 }
 
-// 2026-07-02: deliberately LEFT UNBOUND from the 30-native audit (the honest call-time
-// UnsatisfiedLinkError stays the discovery signal — the 🎨/🖌️ rule):
-//   * `native_addClasses(J[Ljava/lang/String;)V`, `native_removeClass(JLjava/lang/String;)V`,
-//     `native_getMatrix(JJ)Z` — declaration-only DEAD CODE: no invoker anywhere in the installed
-//     dexes (classes.dex/classes2.dex/classes3.dex all grepped 2026-07-02).
-
-/// `View.native_constructor(Context, AttributeSet)` → a real Eclipse-owned [`view_registry`] handle.
-///
-/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are
-/// `(EnvUnowned, JObject this, JObject context, JObject attrs)`. `context`/`attrs` are not
-/// dereferenced (a GTK widget would consume them; Eclipse records metadata only). Resolves the
-/// receiver's actual Java class name (`this.getClass().getName()`) so the recorded view tree names
-/// the concrete subclass (e.g. `android.widget.FrameLayout`), allocates a [`view_registry`] slot with
-/// it, and returns the slab handle (≥ 1, never `0`). On any failure returns `0` (no peer) — which the
-/// framework treats as a failed construct, never a fake success.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
-/// error/panic — a sound neutral "no peer" handle.
 extern "system" fn view_native_constructor<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -5133,11 +3007,11 @@ extern "system" fn view_native_constructor<'local>(
         let class_name = view_class_name(env, &this).unwrap_or_default();
         match view_registry::allocate(&class_name) {
             Ok(handle) => {
-                // 2026-06-05: record a JNI global ref to the Java View object so a pointer click
-                // resolved to this view (by handle) can dispatch View.performClick() on the REAL
-                // object from the event loop (firing its OnClickListener). A failure to create the
-                // global ref (or to store it) leaves the view non-dispatchable but still drawn —
-                // logged, never fatal. `new_global_ref` over a non-null `this` is sound here.
+
+
+
+
+
                 match env.new_global_ref(&this) {
                     Ok(global) => {
                         if let Err(e) = view_registry::set_jobject(handle, global) {
@@ -5180,9 +3054,6 @@ extern "system" fn view_native_constructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Resolve a Java object's concrete class name (dotted, e.g. `android.widget.FrameLayout`) via
-/// `obj.getClass().getName()`. Returns `None` on any JNI error (the caller then records an empty
-/// class name — harmless for the tree shape). Off the gameplay hot path (view construction only).
 fn view_class_name(env: &mut Env, obj: &JObject) -> Option<String> {
     let class = env.get_object_class(obj).ok()?;
     let name = env
@@ -5195,24 +3066,11 @@ fn view_class_name(env: &mut Env, obj: &JObject) -> Option<String> {
         .ok()?
         .l()
         .ok()?;
-    // getName() returns a java.lang.String; cast_local is a safe, runtime-checked JObject→JString
-    // cast (returns Err if it were ever not a String — never UB).
+
     let name = JString::cast_local(env, name).ok()?;
     name.try_to_string(env).ok()
 }
 
-/// `View.native_setPadding(long widget, int left, int top, int right, int bottom)` → record the
-/// padding on the view's [`view_registry`] peer (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void, so the parameters are
-/// `(EnvUnowned, JObject this, jlong widget, jint left, jint top, jint right, jint bottom)`. Padding
-/// is the gap inside the view around its content; Eclipse's measure/layout pass (`graphics.rs`) honors
-/// it when sizing/positioning. This records `[left, top, right, bottom]` onto the peer's
-/// [`view_registry::LayoutParams::padding`] through the bounds+generation-checked registry (a
-/// stale/fabricated handle is logged + ignored, never UB).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
 extern "system" fn view_native_set_padding<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5243,22 +3101,6 @@ extern "system" fn view_native_set_padding<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_setLayoutParams(long widget, int width, int height, int gravity, float weight,
-/// int leftMargin, int topMargin, int rightMargin, int bottomMargin)` → record the layout params on
-/// the view's [`view_registry`] peer (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void (`View.java` line 1167). `width`/`height` use Android's
-/// sentinels (`MATCH_PARENT` = -1, `WRAP_CONTENT` = -2, else exact px), `gravity` is the packed
-/// `layout_gravity` bitmask, `weight` the `layout_weight`. Eclipse's measure/layout pass (`graphics.rs`)
-/// consumes these to compute each view's absolute rect. This records them onto the peer's
-/// [`view_registry::LayoutParams`] through the bounds+generation-checked registry (a bad handle is
-/// logged + ignored, never UB), preserving any padding already set by `native_setPadding`.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
-//
-// 2026-06-05: arity is fixed by View.java's declaration (9 args after `this`); clippy's
-// `too_many_arguments` does not fire on `extern "system"` fns.
 extern "system" fn view_native_set_layout_params<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5297,14 +3139,6 @@ extern "system" fn view_native_set_layout_params<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_requestLayout(long widget)` → validate handle; no-op (layout deferred, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void (`View.java` line 1175). Layout invalidation is a no-op
-/// until real layout lands; validates the `widget` handle through the bounds+generation-checked
-/// [`view_registry`] (a bad handle is logged + ignored, never UB).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn view_native_request_layout<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5324,18 +3158,6 @@ extern "system" fn view_native_request_layout<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_setBackgroundDrawable(long widget, long drawable)` → validate the view handle; no-op
-/// (background draw deferred to the 2D/Skia path, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle;
-/// `drawable` is a `Drawable` peer handle (the non-pointer sentinel from `Drawable.native_constructor`)
-/// — taken but NOT dereferenced (it is not a registry handle). Validates the `widget` handle through
-/// the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored, never UB) and
-/// no-ops; the actual background rasterization is the deferred drawable/Skia render. Surfaced once
-/// theme resolution let `setContentView → setBackgroundDrawable` run.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn view_native_set_background_drawable<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5364,19 +3186,6 @@ extern "system" fn view_native_set_background_drawable<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_setVisibility(long widget, int visibility, float alpha)` → validate the view handle;
-/// no-op (visibility/alpha not yet consumed by the snapshot renderer, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle;
-/// `visibility` is `View.VISIBLE`(0)/`INVISIBLE`(4)/`GONE`(8) and `alpha` is `[0,1]`. Validates the
-/// handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored,
-/// never UB) and no-ops: the snapshot layout/draw pass does not yet honor visibility/alpha (a GONE
-/// view should be excluded from layout — a documented follow-up), so recording them is not yet
-/// load-bearing for advancing. Surfaced when AppCompat's sub-decor inflation built an
-/// `ActionBarContextView` (`View.<init>` → `native_setVisibility`).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn view_native_set_visibility<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5400,17 +3209,6 @@ extern "system" fn view_native_set_visibility<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_setBackgroundColor(long widget, int color)` → record the solid ARGB background color
-/// on the view's [`view_registry`] peer (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle;
-/// `color` is `Color.argb`/`0xAARRGGBB`. Eclipse records it through the bounds+generation-checked
-/// [`view_registry::set_background_color`] (a bad handle is logged + ignored, never UB); the renderer's
-/// layout pass fills the view's rect with this color for real fidelity (vs the synthetic depth color).
-/// Surfaced 2026-06-05 by multitouch.test setting a background on its content view.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn view_native_set_background_color<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5437,17 +3235,6 @@ extern "system" fn view_native_set_background_color<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeSetFullscreen(long widget, boolean fullscreen)` → validate the view handle; no-op
-/// (no system bars exist on Eclipse's desktop window, 2026-06-11).
-///
-/// JNI ABI: an INSTANCE native returning void (`(JZ)V`; jni 0.22 maps `jboolean` to Rust `bool`).
-/// `widget` is the view's [`view_registry`] handle. Validates it through the bounds+generation-
-/// checked [`view_registry`] (a bad handle is logged + ignored, never UB) and no-ops: the Android
-/// semantic is "hide the status/navigation bars", and Eclipse's host window has none. Surfaced by
-/// Roblox's `ActivitySplash.onCreate` (`setSystemUiVisibility`, run log 2026-06-11).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn view_native_set_fullscreen<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5476,29 +3263,6 @@ extern "system" fn view_native_set_fullscreen<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_get_window(long widget) -> android.view.Window` → the process-shared Java `Window`
-/// object that owns this view's tree (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning a Window object (`View.java` line 1244,
-/// `(J)Landroid/view/Window;`), so the parameters are `(EnvUnowned, JObject this, jlong widget)`.
-/// `widget` is the view's [`view_registry`] handle; it is validated (a bad handle is logged and the
-/// native returns null) but it does NOT locate the Window — Eclipse's model is one process-shared
-/// window per launch (the [`window_registry`] handle allocated once in `drive_application_lifecycle`
-/// and threaded through every `internalCreateActivity` via `set_native_window`). The Window's Java
-/// object was captured at `Window.set_jobject` ([`window_set_jobject`]); this returns a frame-local
-/// reference to it. ATL then reads `window.native_window` (already populated before `set_jobject`
-/// ran — Window.java lines 58-60) to build a real `ViewTreeObserver` (ViewTreeObserver.java line 307).
-///
-/// Returning null is contract-valid: when no Window object has been captured yet, ATL's
-/// `getViewTreeObserver` builds a floating observer (View.java line 1252). The body runs inside
-/// [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8); `resolve::<LogErrorAndDefault>`
-/// returns the `JObject` default (a JNI null) on any error/panic — itself the floating-observer path.
-/// `View.getWindowVisibleDisplayFrame(Rect rect)` → fill `rect` with the host window's visible frame
-/// (2026-06-15). INSTANCE native (no widget handle), descriptor `(Landroid/graphics/Rect;)V`. Eclipse's
-/// window has no system bars/insets, so the visible frame is the full window `(0, 0, w, h)` taken from
-/// the published [`ndk_registry::engine_window_geometry`] (default 800×600 before the window opens). A
-/// null `rect` is a no-op. UNBOUND, this threw on every Home/LuaApp setup tick (`Handler.dispatchMessage`)
-/// and drove the post-login Home into a Startup→Home re-navigation loop (HTTP 429 storms).
 extern "system" fn view_get_window_visible_display_frame<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5509,8 +3273,7 @@ extern "system" fn view_get_window_visible_display_frame<'local>(
             return Ok(());
         }
         let (w, h) = crate::loader::ndk_registry::engine_window_geometry().unwrap_or((800, 600));
-        // SAFETY: "I" paired with JavaType::Int is FieldSignature::from_raw_parts' invariant; Rect's
-        // left/top/right/bottom are `public int` (Rect.java:28-31), so each set is type-correct.
+
         let int_sig =
             unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
         env.set_field(&rect, jni_str!("left"), &int_sig, 0i32.into())?;
@@ -5528,9 +3291,6 @@ extern "system" fn view_get_window_visible_display_frame<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeIsAttachedToWindow(long widget)` → `true` (2026-06-15). INSTANCE native, `(J)Z`. jni 0.22
-/// maps `jboolean` to Rust `bool`. The view tree is wired onto the single live host window, so report
-/// attached; UNBOUND, this threw on the Home setup path (a sibling gap of `getWindowVisibleDisplayFrame`).
 extern "system" fn view_native_is_attached_to_window<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5540,11 +3300,6 @@ extern "system" fn view_native_is_attached_to_window<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_getGlobalVisibleRect(long widget, Rect visibleRect)` → fill `rect` with the window frame
-/// (2026-06-15). INSTANCE native, descriptor `(JLandroid/graphics/Rect;)Z` (View.java:2179). Eclipse's
-/// window has no insets, so the global visible rect is the full window `(0, 0, w, h)` taken from
-/// `ndk_registry::engine_window_geometry()`. Returns `true` (success). UNBOUND, this threw on the
-/// post-logout LuaApp re-init (4×).
 extern "system" fn view_native_get_global_visible_rect<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5556,8 +3311,7 @@ extern "system" fn view_native_get_global_visible_rect<'local>(
             return Ok(false);
         }
         let (w, h) = crate::loader::ndk_registry::engine_window_geometry().unwrap_or((800, 600));
-        // SAFETY: "I" paired with JavaType::Int is FieldSignature::from_raw_parts' invariant; Rect's
-        // left/top/right/bottom are `public int` (Rect.java:28-31), so each set is type-correct.
+
         let int_sig =
             unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
         env.set_field(&rect, jni_str!("left"), &int_sig, 0i32.into())?;
@@ -5575,15 +3329,6 @@ extern "system" fn view_native_get_global_visible_rect<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeRequestFocus(long widget, int direction)` → record the requesting view as the
-/// focused view (2026-06-15, upgraded 2026-07-02). INSTANCE native, descriptor `(JI)V`
-/// (View.java:1298). UNBOUND, this threw on the post-logout LuaApp re-init (2×).
-///
-/// 2026-07-02: was a pure no-op; now that `nativeIsFocused` is bound (its coupled read-back — see
-/// the consts note), a valid `widget` is RECORDED via [`view_registry::set_focused_view`] so
-/// `isFocused()` serves an honest answer (the last view that requested focus is focused). An
-/// invalid/stale handle is logged and NOT recorded (never throws — same tolerance as the other
-/// handle-validating no-ops).
 extern "system" fn view_native_request_focus<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5614,26 +3359,6 @@ extern "system" fn view_native_request_focus<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeIsFocused(long widget) -> boolean` → whether `widget` is the recorded focused view
-/// (2026-07-02). STATIC native (the second JNI parameter is the `JClass`), descriptor `(J)Z`. The
-/// installed `isFocused()` returns this answer VERBATIM (smali: `invoke-static … return v0`), so it
-/// must be honest: served from the [`view_registry::is_focused`] record `nativeRequestFocus` writes
-/// (the coupled pair — see the consts note). Before any view requests focus, every view honestly
-/// reads unfocused (`false`), matching a freshly attached tree.
-///
-/// 2026-07-02 (review finding, recorded — behavior deliberately unchanged): Eclipse holds a SECOND
-/// de-facto focus record, [`ACTIVE_TEXT_FIELD`] — the `EditText` whose `getText()` was last polled
-/// (the engine-tap focus signal the vk-overlay + host typing consume). The engine-tap path calls no
-/// Java `requestFocus()` Eclipse can see, so the two records can diverge and this getter would then
-/// serve `false` for the very field Eclipse types into. No isFocused-gated caller has misbehaved on
-/// any live boot (framework-side only `AbsListView` calls `isFocused()`; app dex is not inspectable
-/// in-policy), and `ACTIVE_TEXT_FIELD` is a last-`getText()`-caller HEURISTIC (any Java reader of
-/// any field sets it — serving it here would trade the hypothetical false-negative for a real
-/// false-POSITIVE class), so per the evidence standard the answer stays the `requestFocus` record.
-/// The divergence is kept OBSERVABLE instead: a one-shot WARN below (the `getPooledString`-WARN
-/// discovery-diagnostic precedent, 2026-07-01 🧵) fires the first time `false` is served for the
-/// current active text field. If a boot pairs that WARN with a focus-gated misbehavior, unify the
-/// records then, with that evidence in hand.
 extern "system" fn view_native_is_focused<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -5642,8 +3367,6 @@ extern "system" fn view_native_is_focused<'local>(
     env.with_env(|_env| -> jni::errors::Result<jboolean> {
         let focused = view_registry::is_focused(widget);
         if !focused && widget != 0 && widget == active_text_field() {
-            // 2026-07-02: one-shot divergence diagnostic — Java asked about the field Eclipse's
-            // engine-focus signal names, but no requestFocus() ever recorded it (see the fn doc).
             static FOCUS_DIVERGENCE_WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !FOCUS_DIVERGENCE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -5661,17 +3384,6 @@ extern "system" fn view_native_is_focused<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_layout(long widget, int l, int t, int r, int b)` → RECORD the laid-out frame on the
-/// view's [`view_registry`] peer (2026-07-02 — the challenge8 discovery signal:
-/// `SwipeRefreshLayout.setTargetOffsetTopAndBottom` → `View.offsetTopAndBottom` → `View.layout`).
-///
-/// JNI ABI: an INSTANCE native returning void, descriptor `(JIIII)V`. The installed
-/// `View.layout(l,t,r,b)` stores the frame in its OWN Java `left`/`top`/`right`/`bottom` fields
-/// BEFORE invoking this native, and every Java read-back (`getLeft`/`getWidth`/`offset*`) reads
-/// those fields (smali-verified) — so this record is Eclipse-side bookkeeping (real laid-out
-/// geometry for the renderer/overlay), never a Java read-back source. ATL's reference C forwards to
-/// `gtk_widget_size_allocate`; Eclipse records through the bounds+generation-checked
-/// [`view_registry::set_frame`] (a bad handle is logged + ignored, never UB).
 extern "system" fn view_native_layout<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5708,11 +3420,6 @@ extern "system" fn view_native_layout<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeInvalidate(long widget)` → validate the handle; no-op (2026-07-02). STATIC native
-/// (the second JNI parameter is the `JClass`), descriptor `(J)V`, called by every `invalidate*()`
-/// overload. ATL's reference C queues a GTK redraw; nothing reads back and the engine renders the
-/// real screen, so the honest backing validates the handle (bounds+generation-checked, a bad handle
-/// is logged + ignored, never UB) and no-ops.
 extern "system" fn view_native_invalidate<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -5732,12 +3439,6 @@ extern "system" fn view_native_invalidate<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_keep_screen_on(long widget, boolean keepScreenOn)` → validate the handle; no-op
-/// (2026-07-02). STATIC native, descriptor `(JZ)V`, called by `setKeepScreenOn` +
-/// `onAttachedToWindow`/`onDetachedFromWindow`. ATL's reference C inhibits host suspend/idle via
-/// GtkApplication; Eclipse sets no host power policy (the desktop compositor owns idle) and nothing
-/// reads back, so the honest backing validates the handle and no-ops. Bound now that the installed
-/// dex proves the declaration the 58a50f6 embargo demanded (see the consts note).
 extern "system" fn view_native_keep_screen_on<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -5759,10 +3460,6 @@ extern "system" fn view_native_keep_screen_on<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_addClass(long widget, String className)` → validate the handle; no-op (2026-07-02).
-/// INSTANCE native, descriptor `(JLjava/lang/String;)V` (`setTextAlignment` passes the literal
-/// "ATL-text-align-*" GTK CSS classes). Eclipse has no GTK style context and nothing reads back, so
-/// the honest backing validates the handle and no-ops; the class-name string is not dereferenced.
 extern "system" fn view_native_add_class<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5783,9 +3480,6 @@ extern "system" fn view_native_add_class<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_removeClasses(long widget, String[] classNames)` → validate the handle; no-op
-/// (2026-07-02). INSTANCE native, descriptor `(J[Ljava/lang/String;)V` — the array-remove sibling of
-/// [`view_native_add_class`] on the same `setTextAlignment` path (GTK CSS classes, no reader).
 extern "system" fn view_native_remove_classes<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5806,12 +3500,6 @@ extern "system" fn view_native_remove_classes<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_drawBackground(long widget, long snapshot)` → validate the handle; no-op
-/// (2026-07-02). INSTANCE native, descriptor `(JJ)V`, reached from `View.draw(Canvas)` ONLY under an
-/// `instanceof android.atl.GskCanvas` guard (the `snapshot` is the GskCanvas's GSK snapshot pointer
-/// — NOT a registry handle, taken but never dereferenced). Validated no-op per the
-/// `Drawable.native_draw` precedent (2026-07-02 🎨): write-only render bookkeeping with no reader —
-/// the engine renders the real screen.
 extern "system" fn view_native_draw_background<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5833,9 +3521,6 @@ extern "system" fn view_native_draw_background<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_drawContent(long widget, long snapshot)` → validate the handle; no-op (2026-07-02).
-/// INSTANCE native, descriptor `(JJ)V` — the `onDraw(Canvas)` sibling of
-/// [`view_native_draw_background`], behind the same GskCanvas guard (write-only, no reader).
 extern "system" fn view_native_draw_content<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5857,10 +3542,6 @@ extern "system" fn view_native_draw_content<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_queueAllocate(long widget)` → validate the handle; no-op (2026-07-02). INSTANCE
-/// native, descriptor `(J)V`. `setTranslationX`/`setTranslationY` store the translation in the
-/// view's OWN Java field, then call this on the PARENT's widget (a GTK re-layout request in ATL's
-/// reference C; no reader). The honest backing validates whatever live handle arrives and no-ops.
 extern "system" fn view_native_queue_allocate<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -5880,45 +3561,6 @@ extern "system" fn view_native_queue_allocate<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_measure(long widget, int widthMeasureSpec, int heightMeasureSpec)` (2026-07-02 —
-/// the challenge13 discovery signal: ART ULE `No implementation found for void
-/// android.view.View.native_measure(long, int, int)` at Toolbar.getMenu → ActionMenuView,
-/// /tmp/eclipse-challenge13.log lines 1154–1176). INSTANCE native (installed smali:
-/// invoke-virtual, receiver `this`; the jlong IS the `View.widget` field = the live
-/// [`view_registry`] handle) — unlike its 2026-07-02 geometry siblings it uses BOTH the live
-/// `env` and `this`.
-///
-/// A REAL content-measure pass whose result IS read back: the installed `onMeasure`
-/// (`haveCustomMeasure == false` branch) calls ONLY this native, and the installed `measure(II)V`
-/// caches the specs (`oldWidth/HeightMeasureSpec` iput) BEFORE invoking `onMeasure` — so a
-/// skipped `setMeasuredDimension` upcall is SILENT sticky 0×0 (the ctor zero-init; the sole
-/// post-init writer is setMeasuredDimension) until requestLayout or a spec change, with no
-/// exception. Eclipse mirrors the ATL reference-C SHAPE (compute a size → MANDATORY
-/// `setMeasuredDimension(II)V` upcall on `this`; `protected final` is no obstacle — JNI
-/// call_method bypasses Java access, the surfaceCreated()V house precedent) but sources the
-/// dimensions from the installed `getDefaultSize` semantics, since headless Eclipse has no
-/// content metrics (the Paint.native_get_text_bounds Pango-metrics class):
-///
-/// - EXACTLY/AT_MOST axis → spec size. AT_MOST serving the FULL parent budget is a deliberate,
-///   documented divergence from the reference C's clamped-CONTENT answer (content is unknowable
-///   headless; serving 0 would lie that content is empty and collapse the toolbar) — it is
-///   exactly what the installed static `View.getDefaultSize` serves on those modes.
-/// - Any OTHER mode (UNSPECIFIED 0x0 AND the degenerate 0b11) → the suggested minimum via a live
-///   `this.getSuggestedMinimumWidth()/getSuggestedMinimumHeight()` upcall (virtual dispatch —
-///   tracks whatever the installed dex actually does, including future overlay drift; the
-///   installed getDefaultSize's sswitch DEFAULT branch also returns the supplied minimum).
-///
-/// The upcall fires on EVERY call, including invalid-handle calls (skipping it would convert the
-/// loud pre-binding ULE into silent sticky 0×0). The answer is spec-derived, never
-/// registry-derived, so an invalid/stale `widget` handle is diagnostics-only (debug log, answer
-/// still served) — a deliberate, documented divergence from the validated-no-op siblings'
-/// early-return-on-bad-handle shape. A one-shot WARN (the LOAD_URL_WARNED pattern) records the
-/// content-measure honesty limit in BOTH directions (AT_MOST children may be OVERSIZED;
-/// non-EXACTLY/AT_MOST children may be UNDERSIZED to the suggested minimum — ctor default 0).
-///
-/// Exception-safety invariant: the getSuggestedMinimum upcalls run BEFORE setMeasuredDimension
-/// and every Err path describe+clears before the next JNI call; setMeasuredDimension is the LAST
-/// JNI call in the body.
 extern "system" fn view_native_measure<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -5927,8 +3569,6 @@ extern "system" fn view_native_measure<'local>(
     height_measure_spec: jint,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        // 1) Handle validation — diagnostics ONLY (the answer is spec-derived; the upcall always
-        //    fires, see the doc invariant).
         if let Err(e) = view_registry::with_view(widget, |_v| ()) {
             tracing::debug!(
                 target: "android.view.View",
@@ -5937,9 +3577,7 @@ extern "system" fn view_native_measure<'local>(
                 "View.native_measure: invalid view handle (measured answer still served)"
             );
         }
-        // 2) Suggested minimum, per axis, ONLY when the mode is neither EXACTLY nor AT_MOST
-        //    (matches the installed getDefaultSize switch INCLUDING its default branch; zero
-        //    extra JNI calls on the common EXACTLY/AT_MOST paths).
+
         let w_min = suggested_minimum_if_needed(
             env,
             &this,
@@ -5952,12 +3590,10 @@ extern "system" fn view_native_measure<'local>(
             height_measure_spec,
             VIEW_GET_SUGGESTED_MIN_HEIGHT_NAME,
         );
-        // 3) Pure decode (installed getDefaultSize semantics; unit-tested).
+
         let width = measure_default_size(width_measure_spec, w_min);
         let height = measure_default_size(height_measure_spec, h_min);
-        // 4) One-shot honesty WARN (the LOAD_URL_WARNED AtomicBool pattern) naming BOTH
-        //    divergence directions — the discovery record that replaces the ULE. Measure is
-        //    layout-hot, so subsequent calls are trace-level (the view_native_layout discipline).
+
         static MEASURE_HONESTY_WARNED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !MEASURE_HONESTY_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -5985,7 +3621,7 @@ extern "system" fn view_native_measure<'local>(
                 "View.native_measure: served installed getDefaultSize semantics"
             );
         }
-        // 5) MANDATORY upcall — every call, even on an invalid handle (see the doc invariant).
+
         if let Err(e) = env
             .call_method(
                 &this,
@@ -5995,9 +3631,6 @@ extern "system" fn view_native_measure<'local>(
             )
             .and_then(|v| v.v())
         {
-            // Describe-and-clear (the openAssetFd/WebView house pattern): never leave a pending
-            // exception to poison later JNI calls, never throw back into Java. Should-never-fire
-            // (plain final field-setter) — WARN loudly.
             if env.exception_check() {
                 env.exception_describe();
                 env.exception_clear();
@@ -6017,17 +3650,9 @@ extern "system" fn view_native_measure<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Per-axis suggested minimum for [`view_native_measure`]: a live JNI upcall
-/// `this.getSuggestedMinimumWidth()/getSuggestedMinimumHeight()` `()I`, run ONLY when the spec
-/// mode is neither EXACTLY nor AT_MOST. 2026-07-02: the gate MUST mirror
-/// [`measure_default_size`]'s match arms exactly — gating on `mode != 0` would serve a hardcoded
-/// 0 for the degenerate 0b11 mode, where the installed getDefaultSize DEFAULT branch serves the
-/// live minimum. On upcall failure: describe+clear (never leave a pending exception before the
-/// caller's next JNI call) + debug log + 0 (the View ctor's zero-init default).
 fn suggested_minimum_if_needed(env: &mut Env, this: &JObject, spec: jint, name: &JNIStr) -> jint {
     let mode = spec & MEASURE_SPEC_MODE_MASK;
     if mode == MEASURE_SPEC_EXACTLY || mode == MEASURE_SPEC_AT_MOST {
-        // The decoder serves the spec size on these axes; the minimum is unused.
         return 0;
     }
     match env
@@ -6058,8 +3683,8 @@ extern "system" fn view_native_get_window<'local>(
     widget: jlong,
 ) -> JObject<'local> {
     env.with_env(|env| -> jni::errors::Result<JObject> {
-        // Validate-and-log the view handle (it identifies the calling view, but not the window —
-        // see the native's docs). A bad handle is not fatal: the window is still the shared one.
+
+
         if let Err(e) = view_registry::with_view(widget, |_v| ()) {
             tracing::debug!(
                 target: "android.view.View",
@@ -6068,21 +3693,21 @@ extern "system" fn view_native_get_window<'local>(
                 "View.native_get_window: invalid view handle (returning the shared window anyway)"
             );
         }
-        // Map any view to the single live process-shared window and return a frame-local reference to
-        // its captured Java Window object. `with_jobject` borrows the stored Global under the registry
-        // lock and we make only the leaf `NewLocalRef` call inside (it does not re-enter the registry),
-        // mirroring how the click-dispatch path borrows view_registry globals. Returning a fresh local
-        // ref (never the Global raw) keeps the returned object valid in the caller's frame.
+
+
+
+
+
         let active = window_registry::active_window();
         let local = match window_registry::with_jobject(active, |global| {
             env.new_local_ref(global.as_obj())
         }) {
-            // A window with a captured Window object: return a frame-local ref to it.
+
             Ok(Some(Ok(obj))) => obj,
-            // NewLocalRef itself failed: propagate as an error → LogErrorAndDefault returns null.
+
             Ok(Some(Err(e))) => return Err(e),
-            // Valid window but no Window object captured yet (set_jobject has not run): null →
-            // ATL builds a floating observer (View.java line 1252).
+
+
             Ok(None) => {
                 tracing::debug!(
                     target: "android.view.Window",
@@ -6092,7 +3717,7 @@ extern "system" fn view_native_get_window<'local>(
                 );
                 JObject::null()
             }
-            // No live window / stale active handle: null → floating observer (never UB).
+
             Err(e) => {
                 tracing::debug!(
                     target: "android.view.Window",
@@ -6109,27 +3734,6 @@ extern "system" fn view_native_get_window<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.native_destructor(long widget)` → free the view's [`view_registry`] peer (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void (`View.java` line 1168, `(J)V`), so the parameters are
-/// `(EnvUnowned, JObject this, jlong widget)`. Called from `View.finalize()` (View.java line 1679) on
-/// the ART FinalizerDaemon thread when a Java View is garbage-collected, to release the native peer.
-///
-/// Frees the slab handle through the bounds+generation-checked [`view_registry::free`], which bumps the
-/// slot's generation so any other copy of the handle becomes [`view_registry::ViewRegistryError::StaleHandle`]
-/// (never UB). It MUST tolerate `widget == 0` and any stale/fabricated handle gracefully: when
-/// `native_constructor` threw, `View.widget` (View.java line 965) was never assigned and stays the
-/// `long` default `0`, then the finalizer calls `native_destructor(0)`. `free(0)` (index 0 / generation
-/// 0; live generations are ≥ 1) returns `Err` — logged and ignored, NEVER thrown (a throw on the
-/// finalizer thread would re-produce the live boot's second `UnsatisfiedLinkError`-shaped failure).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
-///
-/// 2026-07-03 (web-engine M3): also notifies the webview client so a finalized DRIVEN WebView
-/// sends `CloseView` to the helper ([`crate::webview::client::notify_view_freed`] — 2026-07-10:
-/// its bridge-cleanup + drive-tracking gates are a few atomic loads, so every normal view GC
-/// stays cheap; it never panics).
 extern "system" fn view_native_destructor<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -6143,8 +3747,7 @@ extern "system" fn view_native_destructor<'local>(
                 widget,
                 "View.native_destructor: freed view-registry peer"
             ),
-            // widget==0 (failed construct) or a stale/double-finalized handle: log + ignore. NEVER
-            // throw — this runs on the FinalizerDaemon thread (see the native's docs).
+
             Err(e) => tracing::debug!(
                 target: "android.view.View",
                 widget,
@@ -6157,21 +3760,8 @@ extern "system" fn view_native_destructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// A `(JNI name, JNI descriptor, fn pointer)` triple for one native to bind on a class — the unit the
-/// best-effort registrar ([`register_class_natives_best_effort`]) registers independently.
 type NativeBinding = (&'static JNIStr, &'static JNIStr, *mut c_void);
 
-/// Drive the per-method best-effort loop: `step` is called for EVERY entry in `bindings`, in order,
-/// returning `true` when that entry was bound and `false` when it was skipped (already logged by
-/// `step`). Returns the number of bound entries. The loop NEVER short-circuits — a `false` (skipped)
-/// entry does not stop the rest.
-///
-/// 2026-06-13: this is the pure control-flow core of [`register_class_natives_best_effort`], split out
-/// so it is unit-testable without a JVM (the real JNI calls need a live ART VM, which can't run
-/// in-harness). It encodes the one invariant the 58a50f6 atomic-RegisterNatives abort violated: a
-/// single failing entry must NOT prevent the remaining entries from being attempted. A regression that
-/// re-introduces `?`/early-return on a per-entry failure fails
-/// `register_class_natives_best_effort_skips_unbindable_method_and_continues`.
 fn fold_best_effort(
     bindings: &[NativeBinding],
     mut step: impl FnMut(&NativeBinding) -> bool,
@@ -6185,43 +3775,17 @@ fn fold_best_effort(
     bound
 }
 
-/// Register each native in `bindings` on `class_name` INDEPENDENTLY (best-effort), so a single entry the
-/// SHIPPED framework does not declare native cannot abort the whole class's registration.
-///
-/// 2026-06-13: `RegisterNatives` is ATOMIC over its `NativeMethod` array — ART validates every entry
-/// against the class's declared methods first and rejects the WHOLE array on the first mismatch. The
-/// 58a50f6 boot break was exactly this: a speculative `View.setBackgroundColor(I)V` that the shipped
-/// dex declares as PLAIN Java took the lifecycle-critical `native_constructor`/`native_destructor`/
-/// `native_get_window` bindings down with it (`jni_internal.cc: Failed to register non-native method …
-/// as native`). Registering one entry at a time degrades that fatal whole-class abort into a deferred
-/// call-time `UnsatisfiedLinkError` on ONLY the bad method — the same loud per-method discovery signal
-/// the project already relies on. This mirrors the existing per-native best-effort precedent in
-/// [`register_asset_stream_natives`], but logs each unbindable method at WARN (not debug): it must stay
-/// LOUD so it never silently masks a genuinely-needed native — it only prevents one bad entry from
-/// destroying its siblings. Returns the count bound.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each `ptr` must be an `extern "system"` fn matching its paired
-/// `sig`. Callers guarantee this by construction (the same guarantee the atomic path required). A method
-/// the class does not declare native makes `register_native_methods` throw; the exception is cleared and
-/// the entry skipped (WARN), never propagated.
 fn register_class_natives_best_effort(
     env: &mut Env,
     class_name: &JNIStr,
     bindings: &[NativeBinding],
 ) -> Result<u32, FrameworkError> {
-    // `find_class` is the one operation that may legitimately fail the whole registration (the class
-    // must load); resolve it once up front so a load failure propagates, not a per-method skip.
     let class = env.find_class(class_name)?;
     let bound = fold_best_effort(bindings, |&(name, sig, ptr)| {
-        // SAFETY: `ptr` is an `extern "system"` fn whose signature is `sig` by the caller's
-        // construction. A method this build does not declare native throws (cleared best-effort below),
-        // never UB.
         let method = unsafe { NativeMethod::from_raw_parts(name, sig, ptr) };
         match unsafe { env.register_native_methods(&class, std::slice::from_ref(&method)) } {
             Ok(()) => true,
             Err(_) => {
-                // Clear the pending NoSuchMethodError ART raised so the next entry registers cleanly.
                 if env.exception_check() {
                     env.exception_clear();
                 }
@@ -6239,35 +3803,7 @@ fn register_class_natives_best_effort(
     Ok(bound)
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.view.View`'s peer natives.
-///
-/// Registered before the lifecycle drive, alongside the other framework natives, since step 4
-/// (`Activity.createMainActivity`) constructs Views during the lifecycle. Each new View native the
-/// dev-host run surfaces (`No implementation found …`) is added here, implemented against
-/// [`view_registry`].
-///
-/// 2026-06-13: bound PER METHOD (best-effort, via [`register_class_natives_best_effort`]) rather than as
-/// one atomic array — so a single entry the shipped dex disagrees with (the 58a50f6 mechanism) cannot
-/// abort the lifecycle-critical `native_constructor`/`native_destructor`/`native_get_window` bindings.
-///
-/// # Safety / soundness
-/// Each fn pointer matches the declared JNI signature by construction — each native is written to the
-/// exact descriptor declared in `View.java`. Every native body is `catch_unwind`-guarded via
-/// [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
 fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: bound PER METHOD (best-effort) so a single entry the shipped dex disagrees with cannot
-    // abort the whole class — the 58a50f6 regression mechanism (a non-native `setBackgroundColor(I)V`
-    // took the lifecycle-critical natives down with it under atomic RegisterNatives). The casts to
-    // `*mut c_void` pair each fn with its declared JNI descriptor (verified against View.java lines
-    // 1166/1310, 2026-06-05; `native_setBackgroundDrawable`/`native_setVisibility`/`nativeSetOnClickListener`
-    // from the ART No-implementation-found lines, 2026-06-05; `native_destructor` View.java line 1168,
-    // 2026-06-13). NO `setBackgroundColor(I)V` here — the shipped framework's `setBackgroundColor(int)`
-    // is plain Java, not native (see the consts comment near `VIEW_SET_ON_CLICK_LISTENER_NAME` for the
-    // 58a50f6 live-log evidence; re-verified against the installed dex 2026-07-02). 2026-07-02:
-    // `native_keep_screen_on(JZ)V` — which 58a50f6 embargoed alongside it — IS declared
-    // `private static native` in both installed dexes and is now IN this array (see the consts note);
-    // the best-effort registrar additionally makes any future such drift non-fatal (deferred
-    // per-method UnsatisfiedLinkError).
     let bindings: [NativeBinding; 27] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
@@ -6299,16 +3835,11 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_SET_VISIBILITY_SIG,
             view_native_set_visibility as *mut c_void,
         ),
-        // `image_button_set_on_click_listener` is the class-agnostic `(J)V` instance native that marks
-        // the peer clickable; bound here for `View.nativeSetOnClickListener` (multitouch.test, 2026-06-05).
         (
             VIEW_SET_ON_CLICK_LISTENER_NAME,
             VIEW_SET_ON_CLICK_LISTENER_SIG,
             image_button_set_on_click_listener as *mut c_void,
         ),
-        // 2026-06-13: `nativeSetOnTouchListener`/`nativeSetOnLongClickListener` are the record-the-
-        // listener siblings of `nativeSetOnClickListener` (View.java lines 1155/1448, both `(J)V`). The
-        // listener object is stored Java-side; `view_set_input_listener` validates the handle + no-ops.
         (
             VIEW_SET_ON_TOUCH_LISTENER_NAME,
             VIEW_SET_ON_TOUCH_LISTENER_SIG,
@@ -6339,8 +3870,6 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_DESTRUCTOR_SIG,
             view_native_destructor as *mut c_void,
         ),
-        // 2026-06-15: post-login Home-screen gaps (View.java:2216/2012). UNBOUND, these threw on every
-        // LuaApp Home setup tick and drove the Startup→Home re-navigation loop (HTTP 429 storm).
         (
             VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_NAME,
             VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_SIG,
@@ -6351,9 +3880,6 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG,
             view_native_is_attached_to_window as *mut c_void,
         ),
-        // 2026-06-15: post-logout LuaApp re-init gaps (View.java:2179/1298). UNBOUND, these threw during
-        // the LuaApp reload (4× getGlobalVisibleRect, 2× requestFocus). Eclipse has no window hierarchy,
-        // so the global visible rect is the full window frame and focus is a no-op.
         (
             VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_NAME,
             VIEW_NATIVE_GET_GLOBAL_VISIBLE_RECT_SIG,
@@ -6364,11 +3890,6 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_REQUEST_FOCUS_SIG,
             view_native_request_focus as *mut c_void,
         ),
-        // 2026-07-02: the View LAYOUT/GEOMETRY remainder pass (declared-vs-bound audit of the
-        // installed dex — see the consts cluster for the per-native classification evidence).
-        // `native_layout` records the laid-out frame (the challenge8 discovery signal);
-        // `nativeIsFocused` serves the focus record `nativeRequestFocus` writes; the rest are
-        // validated no-ops. Only the declaration-only dead trio stays unbound.
         (
             VIEW_NATIVE_LAYOUT_NAME,
             VIEW_NATIVE_LAYOUT_SIG,
@@ -6414,15 +3935,13 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             VIEW_NATIVE_QUEUE_ALLOCATE_SIG,
             view_native_queue_allocate as *mut c_void,
         ),
-        // 2026-07-02: the challenge13 measure frontier — see view_native_measure.
         (
             VIEW_NATIVE_MEASURE_NAME,
             VIEW_NATIVE_MEASURE_SIG,
             view_native_measure as *mut c_void,
         ),
     ];
-    // SAFETY: each `ptr` is an `extern "system"` fn matching its paired descriptor by construction (see
-    // the per-entry references above); the registrar binds them per method on `android/view/View`.
+
     let bound = register_class_natives_best_effort(env, VIEW_CLASS, &bindings)?;
     tracing::info!(
         class = "android/view/View",
@@ -6432,40 +3951,12 @@ fn register_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own backing for android.view.ViewTreeObserver ====================================
-//
-// 2026-06-13: once `View.native_get_window` returns a real Window, `View.getViewTreeObserver()`
-// builds a `ViewTreeObserver`, and `ActivityNativeMain.d1()` immediately registers a global-layout
-// listener on it. ATL's `addOnGlobalLayoutListener`/`removeOnGlobalLayoutListener`/`merge`/`kill`
-// call `native_set_have_global_layout_listeners(boolean)` whenever the listener count crosses 0↔1
-// (ViewTreeObserver.java lines 344/506/545/763) so the native side knows whether to fire
-// `onGlobalLayout`. It is the very next native on the view-tree-setup path after `native_get_window`
-// succeeds; unbound, the `addOnGlobalLayoutListener` right after `getViewTreeObserver` throws the
-// next `UnsatisfiedLinkError` and dead-ends the same `onCreate`, so it is bound now.
-//
-// `ViewTreeObserver.java` line 1049 declares
-//   `private native void native_set_have_global_layout_listeners(boolean have_listeners);`
-// — an INSTANCE native, descriptor `(Z)V`. The ViewTreeObserver carries its own `private long window`
-// field (line 57) — no view_registry/window_registry handle is passed — so there is no handle to
-// validate. Eclipse has no GTK/host layout signal to drive `onGlobalLayout`, so the honest backing
-// records the flag and no-ops (mirrors `nativeSetFullscreen`/`native_setVisibility`); a real
-// layout-callback driver is the deferred render-integration build, not a fall-through here.
-
-/// `android.view.ViewTreeObserver` (internal/slashed name for `find_class`).
 pub const VIEW_TREE_OBSERVER_CLASS: &JNIStr = jni_str!("android/view/ViewTreeObserver");
 
-// JNI name + descriptor, exactly as declared in `ViewTreeObserver.java` line 1049.
 const VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_NAME: &JNIStr =
     jni_str!("native_set_have_global_layout_listeners");
 const VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG: &JNIStr = jni_str!("(Z)V");
 
-/// `ViewTreeObserver.native_set_have_global_layout_listeners(boolean have_listeners)` → no-op
-/// (Eclipse has no host layout signal to gate; 2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void (`(Z)V`; jni maps `jboolean` to Rust `bool`). No
-/// handle is passed (the observer holds its own `window` field), so there is nothing to validate —
-/// the native logs the crossed flag and no-ops. The body runs inside [`EnvUnowned::with_env`]
-/// (`catch_unwind`-wrapped, AGENTS.md §2.8); `resolve` returns the `()` default on error/panic.
 extern "system" fn view_tree_observer_set_have_global_layout_listeners<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -6482,27 +3973,16 @@ extern "system" fn view_tree_observer_set_have_global_layout_listeners<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind `android.view.ViewTreeObserver.native_set_have_global_layout_listeners` on its own class.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
-/// does, by construction (`(Z)V`, ViewTreeObserver.java line 1049). The body is `catch_unwind`-guarded
-/// via [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
 fn register_view_tree_observer_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(VIEW_TREE_OBSERVER_CLASS)?;
-    let methods = [
-        // SAFETY: `view_tree_observer_set_have_global_layout_listeners` matches the paired `(Z)V`
-        // signature as an instance native (see the native's docs).
-        unsafe {
-            NativeMethod::from_raw_parts(
-                VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_NAME,
-                VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG,
-                view_tree_observer_set_have_global_layout_listeners as *mut std::ffi::c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded android/view/ViewTreeObserver; `methods` hold a valid fn pointer
-    // whose signature matches the class's `native` declaration (ViewTreeObserver.java line 1049).
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_NAME,
+            VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG,
+            view_tree_observer_set_have_global_layout_listeners as *mut std::ffi::c_void,
+        )
+    }];
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/ViewTreeObserver",
@@ -6511,47 +3991,15 @@ fn register_view_tree_observer_natives(env: &mut Env) -> Result<(), FrameworkErr
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.view.ViewGroup tree wiring =====================
-//
-// 2026-06-05: `setContentView` → `LayoutInflater.rInflate` → `ViewGroup.addView` wires the inflated
-// child views into their parent, surfacing `ViewGroup.native_addView(long parent, long child, int
-// index, ViewGroup$LayoutParams params)` (run log 2026-06-05). `ViewGroup.java` (line 186) declares
-//   `protected native void native_addView(long widget, long child, int index, LayoutParams params);`
-// — an INSTANCE native. ATL's C backing reparents GtkWidgets; Eclipse must NOT pull GTK (AGENTS.md
-// §5 Step 3.5), so it records the parent→child TREE EDGE in [`view_registry`] (the `children` field) —
-// the actual view hierarchy, sound + handle-checked, with no GTK and no layout/draw (deferred). This
-// is what `set_widget_as_root` + `native_addView` together make into a queryable view tree.
-
-/// `android.view.ViewGroup` (internal/slashed name for `find_class`) — hosts the tree-wiring natives.
 pub const VIEW_GROUP_CLASS: &JNIStr = jni_str!("android/view/ViewGroup");
 
-// JNI name + descriptor for ViewGroup.native_addView, exactly as declared in `ViewGroup.java`
-// (2026-06-05, line 186): `protected native void native_addView(long widget, long child, int index,
-// LayoutParams params);` → an instance native, descriptor
-// `(JJILandroid/view/ViewGroup$LayoutParams;)V`.
 const VIEW_GROUP_NATIVE_ADD_VIEW_NAME: &JNIStr = jni_str!("native_addView");
 const VIEW_GROUP_NATIVE_ADD_VIEW_SIG: &JNIStr =
     jni_str!("(JJILandroid/view/ViewGroup$LayoutParams;)V");
 
-// JNI name + descriptor for ViewGroup.native_removeView, from the ART-reported signature `void
-// android.view.ViewGroup.native_removeView(long, long)` (run log 2026-06-05, multitouch.test's
-// `MultitouchTest.onCreate` re-parenting its content): an instance native, descriptor `(JJ)V` (the
-// parent widget handle + the child widget handle).
 const VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME: &JNIStr = jni_str!("native_removeView");
 const VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG: &JNIStr = jni_str!("(JJ)V");
 
-/// `ViewGroup.native_addView(long parent, long child, int index, ViewGroup.LayoutParams params)` →
-/// record the parent→child tree edge in [`view_registry`].
-///
-/// JNI ABI: an INSTANCE native returning void, so the parameters are
-/// `(EnvUnowned, JObject this, jlong parent, jlong child, jint index, JObject params)`. Validates the
-/// `child` handle, then inserts it into the `parent` view's `children` at `index` (clamped into
-/// range) — both through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
-/// ignored, never UB). `params` is not dereferenced (layout deferred). This builds the real view tree
-/// edges without GTK.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
 extern "system" fn view_group_native_add_view<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -6561,11 +4009,9 @@ extern "system" fn view_group_native_add_view<'local>(
     _params: JObject<'local>,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // Only record a valid child handle as an edge (a bad child would record a dangling edge).
         let child_ok = view_registry::with_view(child, |_v| ()).is_ok();
         match view_registry::with_view(parent, |p| {
             if child_ok {
-                // Clamp the insertion index into [0, len]; AOSP allows index -1 (= append).
                 let pos = if index < 0 {
                     p.children.len()
                 } else {
@@ -6595,18 +4041,6 @@ extern "system" fn view_group_native_add_view<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `ViewGroup.native_removeView(long parent, long child)` → remove the parent→child tree edge in
-/// [`view_registry`] (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void, so the parameters are
-/// `(EnvUnowned, JObject this, jlong parent, jlong child)`. Removes the `child` handle from the
-/// `parent` view's `children` list through the bounds+generation-checked [`view_registry`] (a bad
-/// parent handle is logged + ignored, never UB). Mirrors [`view_group_native_add_view`]'s edge
-/// recording so a view re-parented during `onCreate` (multitouch.test detaches its content view before
-/// re-adding it) leaves the recorded tree consistent. Surfaced 2026-06-05 by multitouch.test.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn view_group_native_remove_view<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -6631,13 +4065,7 @@ extern "system" fn view_group_native_remove_view<'local>(
                 "ViewGroup.native_removeView: invalid parent handle (ignored)"
             ),
         }
-        // 2026-07-10 (web-engine M6, plan §7 #9): if the removed subtree contains the ACTIVE
-        // challenge WebView, eager-close it — a fragment teardown removes the fragment ROOT (the
-        // WebView is a DESCENDANT, so this must be subtree-based, not a `child == active` test), and
-        // GC-only teardown left the stale full-window composite covering LoginV2 for ~40 s with no
-        // ViewClosed (challenge16). The no-webview path is ONE atomic load (§2.4-clean; removeView
-        // is not hot). The registry lock is already released (with_view returned) before
-        // subtree_contains re-takes it — no nesting.
+
         let active = crate::webview::client::active_view();
         if active != 0 && (child == active || view_registry::subtree_contains(child, active)) {
             crate::webview::client::notify_view_detached(active);
@@ -6647,24 +4075,7 @@ extern "system" fn view_group_native_remove_view<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.view.ViewGroup`'s tree-wiring natives.
-///
-/// Registered before step 4, alongside the View/Window natives. Each is implemented against
-/// [`view_registry`]; new ViewGroup natives the run surfaces are added here.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — [`view_group_native_add_view`] is written to ViewGroup.java line 186's exact descriptor and
-/// [`view_group_native_remove_view`] to line 187's. The bodies are `catch_unwind`-guarded via
-/// [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_view_group_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: per-method best-effort (via `register_class_natives_best_effort`) so a single entry
-    // the shipped dex disagrees with is a deferred call-time UnsatisfiedLinkError on that method, not a
-    // fatal whole-class abort taking its siblings down (the 58a50f6 class of bug).
-    // SAFETY: `view_group_native_add_view` matches the paired
-    // `(JJILandroid/view/ViewGroup$LayoutParams;)V` instance native (ViewGroup.java line 186);
-    // `view_group_native_remove_view` matches the paired `(JJ)V` instance native (ViewGroup.java line
-    // 187, surfaced by multitouch.test re-parenting its content, run log 2026-06-05).
     let bindings: [NativeBinding; 2] = [
         (
             VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
@@ -6686,73 +4097,23 @@ fn register_view_group_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.graphics.Paint native objects =================
-//
-// 2026-06-05: a `<TextView>` constructs a `TextPaint`/`Paint` during step 5's `setContentView`,
-// surfacing `Paint.native_create()` (run log 2026-06-05). `Paint` is on the graphics subsystem; ATL
-// backs it in C against GTK/Cairo. Eclipse must NOT pull GTK (AGENTS.md §5 Step 3.5) and does NO
-// drawing at onCreate (the ash/Vulkan render is the deferred big build), so a Paint is backed by the
-// Eclipse-owned [`paint_registry`] — a generational-slab index (NOT a raw pointer), holding only the
-// drawing config (color, text size). A fresh Paint with defaults is a valid Paint; recording its
-// config soundly lets the TextView construct without GTK.
-//
-// 2026-07-02: the WHOLE reachable Paint native surface of the INSTALLED framework audited + bound in
-// one per-method best-effort pass (the 🎨 drawable-pass class pattern), after the challenge7 boot
-// died on `Paint.native_set_stroke_cap` (androidx CircularProgressDrawable ring ← SwipeRefreshLayout
-// ← the rbx.web fragment's CustomSwipeRefreshLayout). The installed classes3.dex `Paint.smali`
-// declares exactly 20 natives (baksmali-confirmed 2026-07-02; NO drift from the vendored
-// `Paint.java`, unlike Drawable): create/clone/recycle lifecycle, get/set for
-// color/alpha/style/stroke-width/stroke-cap/stroke-join/text-size, the write-only
-// color-filter/text-align setters, and `native_get_text_bounds`. Every get* is READ BACK by its Java
-// caller (getStrokeCap/getStrokeJoin/getStyle index `Enum.values[...]` with the return — the value
-// MUST be an in-range ordinal), so the getters serve honest values from the registry (the
-// native_getText precedent: record on set, serve on get). `native_get_text_bounds` is deliberately
-// LEFT UNBOUND: it is real text measurement (the ATL reference native runs a Pango layout), its Rect
-// out-param is read back (`getTextBounds`/`getTextWidths`), and the headless recording model cannot
-// serve honest metrics — the clean call-time UnsatisfiedLinkError stays the discovery signal
-// (🎨 rule, same as the Bitmap pixel-content natives).
-
-/// `android.graphics.Paint` (internal/slashed name for `find_class`) — hosts the Paint natives.
 pub const PAINT_CLASS: &JNIStr = jni_str!("android/graphics/Paint");
 
-// JNI name + descriptor for Paint.native_create, from the ART-reported signature `long
-// android.graphics.Paint.native_create()` (run log 2026-06-05): a static native, descriptor `()J`.
 const PAINT_NATIVE_CREATE_NAME: &JNIStr = jni_str!("native_create");
 const PAINT_NATIVE_CREATE_SIG: &JNIStr = jni_str!("()J");
 
-// JNI name + descriptor for Paint.native_set_color, from the ART-reported signature `void
-// android.graphics.Paint.native_set_color(long, int)` (run log 2026-06-05, accelerometerdemo's
-// ColorDrawable.<init> → Paint.setColor): a static native (the mangled name takes the paint handle
-// as its first arg), descriptor `(JI)V`.
 const PAINT_NATIVE_SET_COLOR_NAME: &JNIStr = jni_str!("native_set_color");
 const PAINT_NATIVE_SET_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
 
-// JNI name + descriptor for Paint.native_set_stroke_width, from the ART-reported signature `void
-// android.graphics.Paint.native_set_stroke_width(long, float)` (run log 2026-06-05, multitouch.test's
-// custom View `MultiTouch.<init>` → Paint.setStrokeWidth): a static native (the handle is the first
-// arg), descriptor `(JF)V`.
 const PAINT_NATIVE_SET_STROKE_WIDTH_NAME: &JNIStr = jni_str!("native_set_stroke_width");
 const PAINT_NATIVE_SET_STROKE_WIDTH_SIG: &JNIStr = jni_str!("(JF)V");
 
-// JNI name + descriptor for Paint.native_set_style, from the ART-reported signature `void
-// android.graphics.Paint.native_set_style(long, int)` (run log 2026-06-05, multitouch.test's custom
-// View `MultiTouch.<init>` → Paint.setStyle): a static native, descriptor `(JI)V`. The int is the
-// `Paint.Style` ordinal (FILL=0, STROKE=1, FILL_AND_STROKE=2).
 const PAINT_NATIVE_SET_STYLE_NAME: &JNIStr = jni_str!("native_set_style");
 const PAINT_NATIVE_SET_STYLE_SIG: &JNIStr = jni_str!("(JI)V");
 
-// JNI name + descriptor for Paint.native_set_text_size, from the ART-reported signature `void
-// android.graphics.Paint.native_set_text_size(long, float)` (run log 2026-06-05, multitouch.test's
-// custom View `MultiTouch.<init>` → Paint.setTextSize): a static native, descriptor `(JF)V`.
 const PAINT_NATIVE_SET_TEXT_SIZE_NAME: &JNIStr = jni_str!("native_set_text_size");
 const PAINT_NATIVE_SET_TEXT_SIZE_SIG: &JNIStr = jni_str!("(JF)V");
 
-// 2026-07-02: the rest of the installed Paint native surface (all `private static native`,
-// installed classes3.dex `Paint.smali`, baksmali-confirmed 2026-07-02; identical declarations in the
-// vendored `Paint.java`). `native_set_stroke_cap(JI)V` is the challenge7 discovery signal
-// (`No implementation found for void android.graphics.Paint.native_set_stroke_cap(long, int)` at
-// `Paint.setStrokeCap` ← the androidx CircularProgressDrawable ring, /tmp/eclipse-challenge7.log
-// lines 1543–1576).
 const PAINT_NATIVE_CLONE_NAME: &JNIStr = jni_str!("native_clone");
 const PAINT_NATIVE_CLONE_SIG: &JNIStr = jni_str!("(J)J");
 const PAINT_NATIVE_RECYCLE_NAME: &JNIStr = jni_str!("native_recycle");
@@ -6782,15 +4143,6 @@ const PAINT_NATIVE_SET_COLOR_FILTER_SIG: &JNIStr = jni_str!("(JII)V");
 const PAINT_NATIVE_SET_TEXT_ALIGN_NAME: &JNIStr = jni_str!("native_set_text_align");
 const PAINT_NATIVE_SET_TEXT_ALIGN_SIG: &JNIStr = jni_str!("(JI)V");
 
-/// `Paint.native_create()` → a real Eclipse-owned [`paint_registry`] handle (2026-06-05).
-///
-/// JNI ABI: a `static` native returning `jlong` (the mangled name has no receiver-typed overload), so
-/// the parameters are `(EnvUnowned, JClass)`. Allocates a [`paint_registry`] slot (default config)
-/// and returns its slab handle (≥ 1, never `0`). On a registry error returns `0` (no paint).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
-/// error/panic — a sound neutral "no paint" handle.
 extern "system" fn paint_native_create<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -6818,16 +4170,6 @@ extern "system" fn paint_native_create<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_color(long native_paint, int color)` → record the ARGB color on the paint
-/// (2026-06-05).
-///
-/// JNI ABI: a `static` native returning void (the mangled name has no receiver-typed overload), so
-/// the parameters are `(EnvUnowned, JClass, jlong native_paint, jint color)`. Writes `color` into the
-/// paint's [`paint_registry`] slot (the same `color` field `PaintState` already holds). A bad/stale
-/// handle is logged and ignored (the registry rejects it — never UB or panic).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic — the correct neutral value for this `void` native.
 extern "system" fn paint_native_set_color<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -6848,17 +4190,6 @@ extern "system" fn paint_native_set_color<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_stroke_width(long native_paint, float width)` → record the stroke width on the
-/// paint (2026-06-05).
-///
-/// JNI ABI: a `static` native returning void, so the parameters are `(EnvUnowned, JClass, jlong
-/// native_paint, float width)`. Writes `width` into the paint's [`paint_registry`] slot; the Canvas
-/// stroke draws (`drawCircle`/`drawPath` with a STROKE style) read it for the tiny-skia `Stroke::width`.
-/// A bad/stale handle is logged and ignored (the registry rejects it — never UB or panic). Surfaced
-/// 2026-06-05 by multitouch.test's custom-View Paint setup.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn paint_native_set_stroke_width<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -6879,17 +4210,6 @@ extern "system" fn paint_native_set_stroke_width<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_style(long native_paint, int style)` → record the fill/stroke style on the paint
-/// (2026-06-05).
-///
-/// JNI ABI: a `static` native returning void, so the parameters are `(EnvUnowned, JClass, jlong
-/// native_paint, jint style)`. `style` is the AOSP `Paint.Style` ordinal (FILL=0, STROKE=1,
-/// FILL_AND_STROKE=2), mapped via [`paint_registry::PaintStyle::from_ordinal`] (unknown → FILL). The
-/// Canvas draws read it to choose tiny-skia fill vs stroke. A bad/stale handle is logged + ignored
-/// (the registry rejects it — never UB or panic). Surfaced 2026-06-05 by multitouch.test's custom View.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn paint_native_set_style<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -6912,16 +4232,6 @@ extern "system" fn paint_native_set_style<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_text_size(long native_paint, float size)` → record the text size on the paint
-/// (2026-06-05).
-///
-/// JNI ABI: a `static` native returning void, so the parameters are `(EnvUnowned, JClass, jlong
-/// native_paint, float size)`. Writes `size` into the paint's [`paint_registry`] slot (the `text_size`
-/// field `PaintState` already holds; `Canvas.drawText` reads it). A bad/stale handle is logged +
-/// ignored (the registry rejects it — never UB or panic). Surfaced 2026-06-05 by multitouch.test.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn paint_native_set_text_size<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -6942,31 +4252,10 @@ extern "system" fn paint_native_set_text_size<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// AOSP `Paint.setAlpha` color merge: replace ONLY the alpha channel of an ARGB color, preserving
-/// RGB (2026-07-02). The ATL reference native does exactly this (`color.alpha = (alpha & 0xFF)/255`
-/// with red/green/blue untouched). `alpha` is masked to its low byte first, so an out-of-range Java
-/// int cannot corrupt the RGB bits. Pure — unit-tested without a VM
-/// (`paint_color_with_alpha_replaces_only_the_alpha_channel`).
 fn paint_color_with_alpha(color: jint, alpha: jint) -> jint {
     (color & 0x00FF_FFFF) | ((alpha & 0xFF) << 24)
 }
 
-/// `Paint.native_clone(long src)` → a NEW registry handle whose state copies `src`'s (2026-07-02).
-///
-/// Static native `(J)J` — the backing for the `Paint(Paint)` copy constructor and `Paint.set(Paint)`
-/// (installed `Paint.smali`: both store the return into `this.paint`, which every later get/set
-/// resolves — so the clone must be a live, independent handle, exactly [`paint_registry::clone_of`]).
-/// A stale/`0` source (e.g. a Paint whose handle Eclipse never saw) degrades to a FRESH default
-/// paint (warn-logged): AOSP's `Paint(Paint)` always yields a working Paint, so a broken source must
-/// not produce a dead clone that poisons every later call on the new Paint. Returns `0` only if the
-/// registry itself fails.
-///
-/// 2026-07-02 (review fix): the one ATL caller shape that fed this fallback a freed handle — a
-/// self-set `p.set(p)`, whose installed Java recycles `this.paint` BEFORE cloning `paint.paint` (a
-/// use-after-free in ATL's own reference native; a state-losing default-paint reset here, where AOSP
-/// preserves the state) — is closed at the ROOT by the overlay's AOSP self-set guard in
-/// `Paint.set(Paint)` (`tools/framework-overlay/patch-framework.sh`, anchor-guarded). So this warn
-/// firing in a boot log now means a genuinely dead/foreign source, not a self-set.
 extern "system" fn paint_native_clone<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -6997,12 +4286,6 @@ extern "system" fn paint_native_clone<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_recycle(long paint)` → free the recorded registry slot (2026-07-02).
-///
-/// Static native `(J)V`, called from `Paint.set(Paint)` (frees the old handle before storing the
-/// clone — installed `Paint.smali`). The ONE free bookkeeping in the recorded-paint model. `0` is
-/// skipped ("no paint"); a stale/fabricated handle is a bounds+generation-checked debug log, never
-/// UB (mirrors `Bitmap.native_recycle`).
 extern "system" fn paint_native_recycle<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7030,11 +4313,6 @@ extern "system" fn paint_native_recycle<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_get_color(long paint)` → the recorded ARGB color (2026-07-02).
-///
-/// Static native `(J)I`; `Paint.getColor()` returns it verbatim, so it serves the honest recorded
-/// value. A dead handle reads as the default-paint color (opaque black — what a fresh AOSP/ATL
-/// paint reports), debug-logged.
 extern "system" fn paint_native_get_color<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7056,12 +4334,6 @@ extern "system" fn paint_native_get_color<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_alpha(long paint, int alpha)` → replace the recorded color's alpha channel
-/// (2026-07-02).
-///
-/// Static native `(JI)V`. AOSP/ATL semantics: ONLY the alpha byte changes, RGB is preserved
-/// ([`paint_color_with_alpha`]) — `Paint.getAlpha()` then reads it back through
-/// `native_get_alpha`. A bad/stale handle is logged and ignored.
 extern "system" fn paint_native_set_alpha<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7084,11 +4356,6 @@ extern "system" fn paint_native_set_alpha<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_get_alpha(long paint)` → the recorded color's alpha byte (2026-07-02).
-///
-/// Static native `(J)I`; `Paint.getAlpha()` returns it verbatim. A dead handle reads as 255 (a
-/// fresh AOSP/ATL paint is fully opaque — 0 would make alpha-scaling callers compute
-/// fully-transparent), debug-logged.
 extern "system" fn paint_native_get_alpha<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7112,11 +4379,6 @@ extern "system" fn paint_native_get_alpha<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_get_style(long paint)` → the recorded style's AOSP ordinal (2026-07-02).
-///
-/// Static native `(J)I`; `Paint.getStyle()` indexes `Style.values[...]` with the return, so the
-/// value MUST be in 0..=2 — [`paint_registry::PaintStyle::ordinal`] is in-range by construction.
-/// A dead handle reads as 0 (FILL, the AOSP default), debug-logged.
 extern "system" fn paint_native_get_style<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7138,11 +4400,6 @@ extern "system" fn paint_native_get_style<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_get_stroke_width(long paint)` → the recorded stroke width (2026-07-02).
-///
-/// Static native `(J)F`; `Paint.getStrokeWidth()` returns it verbatim. Eclipse records the width
-/// as set — including AOSP's 0 = hairline (the ATL reference coerces 0 → 1 only because GSK cannot
-/// represent a hairline; the recording model has no such limitation). A dead handle reads as 0.0.
 extern "system" fn paint_native_get_stroke_width<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7164,14 +4421,6 @@ extern "system" fn paint_native_get_stroke_width<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_stroke_cap(long paint, int cap)` → record the stroke end-cap (2026-07-02).
-///
-/// Static native `(JI)V` — THE challenge7 discovery signal (`Paint.setStrokeCap` ← `f5.b$c.<init>`,
-/// the androidx CircularProgressDrawable ring ← SwipeRefreshLayout ← the rbx.web fragment's
-/// CustomSwipeRefreshLayout, /tmp/eclipse-challenge7.log). `cap` is the AOSP `Paint.Cap` ordinal
-/// (BUTT=0, ROUND=1, SQUARE=2), mapped via [`paint_registry::StrokeCap::from_ordinal`] (unknown →
-/// BUTT); `Paint.getStrokeCap()` reads it back through `native_get_stroke_cap`. A bad/stale handle
-/// is logged and ignored.
 extern "system" fn paint_native_set_stroke_cap<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7194,10 +4443,6 @@ extern "system" fn paint_native_set_stroke_cap<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_get_stroke_cap(long paint)` → the recorded cap's AOSP ordinal (2026-07-02).
-///
-/// Static native `(J)I`; `Paint.getStrokeCap()` indexes `Cap.values[...]` with the return — in
-/// 0..=2 by construction ([`paint_registry::StrokeCap::ordinal`]). A dead handle reads as 0 (BUTT).
 extern "system" fn paint_native_get_stroke_cap<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7221,11 +4466,6 @@ extern "system" fn paint_native_get_stroke_cap<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_stroke_join(long paint, int join)` → record the stroke join (2026-07-02).
-///
-/// Static native `(JI)V`. `join` is the AOSP `Paint.Join` ordinal (MITER=0, ROUND=1, BEVEL=2),
-/// mapped via [`paint_registry::StrokeJoin::from_ordinal`] (unknown → MITER);
-/// `Paint.getStrokeJoin()` reads it back. A bad/stale handle is logged and ignored.
 extern "system" fn paint_native_set_stroke_join<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7248,10 +4488,6 @@ extern "system" fn paint_native_set_stroke_join<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_get_stroke_join(long paint)` → the recorded join's AOSP ordinal (2026-07-02).
-///
-/// Static native `(J)I`; `Paint.getStrokeJoin()` indexes `Join.values[...]` with the return — in
-/// 0..=2 by construction ([`paint_registry::StrokeJoin::ordinal`]). A dead handle reads as 0 (MITER).
 extern "system" fn paint_native_get_stroke_join<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7275,12 +4511,6 @@ extern "system" fn paint_native_get_stroke_join<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_get_text_size(long paint)` → the recorded text size (2026-07-02).
-///
-/// Static native `(J)F`; read back by `Paint.getTextSize()` AND consumed by the vendored Java's own
-/// text math (`ascent()` returns `-getTextSize()`; `measureText` approximates from it), so the
-/// honest recorded value keeps that math consistent with what setters stored. A dead handle reads
-/// as 0.0 (the ATL reference also reports 0 on a fresh pango font description).
 extern "system" fn paint_native_get_text_size<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7302,13 +4532,6 @@ extern "system" fn paint_native_get_text_size<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_color_filter(long paint, int mode, int color)` → validated no-op (2026-07-02).
-///
-/// Static native `(JII)V`, called from `Paint.setColorFilter` (a PorterDuff mode ordinal + color,
-/// or `(-1, 0)` to clear). Write-only in the recording model: the Java side retains the
-/// `ColorFilter` object itself and serves `getColorFilter()` from it (installed `Paint.smali` — no
-/// native reader exists), and the headless model composites nothing (the engine renders the
-/// screen). Recording nothing is honest; the trace log keeps the call observable.
 extern "system" fn paint_native_set_color_filter<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7329,13 +4552,6 @@ extern "system" fn paint_native_set_color_filter<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Paint.native_set_text_align(long paint, int align)` → validated no-op (2026-07-02).
-///
-/// Static native `(JI)V`, called from `Paint.setTextAlign` with the AOSP `Paint.Align` ordinal.
-/// Write-only in the recording model: the Java side stores the `Align` in its own `align` field
-/// FIRST and serves `getTextAlign()` from that field (installed `Paint.smali` — no native reader
-/// exists; the ATL reference native just stashes the int for its Pango draw, which Eclipse does not
-/// run). The trace log keeps the call observable.
 extern "system" fn paint_native_set_text_align<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7354,29 +4570,7 @@ extern "system" fn paint_native_set_text_align<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Paint`'s natives.
-///
-/// Registered before step 4, alongside the View/Window natives, since the View hierarchy's
-/// `TextPaint`/`Paint` construct during step 5. Each native is implemented against [`paint_registry`].
-///
-/// 2026-07-02: covers the WHOLE installed Paint native surface (20 declared, 19 bound — see the
-/// section note above; `native_get_text_bounds` deliberately left unbound as the honest
-/// text-measurement discovery signal) and registered per-method best-effort (the 58a50f6 pattern,
-/// [`register_class_natives_best_effort`]) so a framework-build drift on any single method cannot
-/// take the lifecycle-critical `native_create` binding down with it.
-///
-/// # Safety / soundness
-/// Each fn pointer matches its declared JNI signature by construction (see each native's docs and
-/// the pin test `paint_native_name_sig_and_class_match_art_reported`). Every native body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_paint_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // SAFETY (per entry): each fn matches its paired descriptor — all 19 are `private static native`
-    // on the installed classes3.dex `Paint.smali` (baksmali-confirmed 2026-07-02, identical to the
-    // vendored Paint.java declarations): `native_create` `()J`, `native_clone` `(J)J`,
-    // `native_recycle` `(J)V`, get/set color `(J)I`/`(JI)V`, alpha `(J)I`/`(JI)V`, style
-    // `(J)I`/`(JI)V`, stroke-width `(J)F`/`(JF)V`, stroke-cap `(J)I`/`(JI)V`, stroke-join
-    // `(J)I`/`(JI)V`, text-size `(J)F`/`(JF)V`, `native_set_color_filter` `(JII)V`,
-    // `native_set_text_align` `(JI)V`.
     let bindings: [NativeBinding; 19] = [
         (
             PAINT_NATIVE_CREATE_NAME,
@@ -7482,55 +4676,20 @@ fn register_paint_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.graphics.Matrix native objects =================
-//
-// 2026-06-05: AppCompat's `VectorDrawableCompat.<init>` constructs an `android.graphics.Matrix`
-// during step 5 (`setContentView` → `AppCompatDrawableManager.checkVectorDrawableSetup`), surfacing
-// `long android.graphics.Matrix.native_create(long)` (run log 2026-06-05, accelerometerdemo). A
-// `Matrix` is AOSP's 3x3 transform — **pure float math, no GPU/raster/GTK needed** — so it is backed
-// by the Eclipse-owned [`matrix_registry`] generational slab (a slab index, NOT a raw pointer). The
-// math is REAL and exact (3x3 multiply / perspective map), never a sentinel: a Matrix's transform is
-// load-bearing for the vector-drawable geometry, so faking it is forbidden (AGENTS.md core principle).
-// Each Matrix native is added here as the run surfaces it, with the descriptor taken from the exact
-// ART `No implementation found` line + the AOSP `Matrix.java` native declarations.
-
-/// `android.graphics.Matrix` (internal/slashed name for `find_class`) — hosts the Matrix natives.
 pub const MATRIX_CLASS: &JNIStr = jni_str!("android/graphics/Matrix");
 
-// JNI name + descriptor for Matrix.native_create, from the ART-reported signature `long
-// android.graphics.Matrix.native_create(long)` (run log 2026-06-05): a static native, descriptor
-// `(J)J`. The `long` arg is the source Matrix's native handle (`0` = a fresh identity matrix; a
-// non-zero handle = copy that matrix), per AOSP `Matrix(Matrix src)` / `Matrix()`.
 const MATRIX_NATIVE_CREATE_NAME: &JNIStr = jni_str!("native_create");
 const MATRIX_NATIVE_CREATE_SIG: &JNIStr = jni_str!("(J)J");
 
-// JNI name + descriptor for Matrix.finalizer, from the ART-reported signature `void
-// android.graphics.Matrix.finalizer(long)` (run log 2026-06-05): a static native, descriptor `(J)V`.
-// AOSP's `Matrix` registers `finalizer` as its `sNativeFinalizer` via `sun.misc.Cleaner`/`NativeAllocationRegistry`;
-// it frees the native matrix object. Eclipse frees the matrix_registry slot (so the handle becomes
-// stale and the slot can be reused) — runs on the GC/finalizer thread.
 const MATRIX_FINALIZER_NAME: &JNIStr = jni_str!("finalizer");
 const MATRIX_FINALIZER_SIG: &JNIStr = jni_str!("(J)V");
 
-/// `Matrix.native_create(long src)` → a real Eclipse-owned [`matrix_registry`] handle (2026-06-05).
-///
-/// JNI ABI: a `static` native (`(J)J`), so the parameters are `(EnvUnowned, JClass, jlong src)`.
-/// `src == 0` allocates a fresh identity matrix; a non-zero `src` allocates a COPY of that matrix's
-/// value (exact, via [`matrix_registry::get`]). Returns the new slab handle (≥ 1, never `0`). On a
-/// registry error returns `0` (AOSP treats a `0` native instance as the identity, so this degrades to
-/// an identity Matrix rather than UB).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
-/// error/panic.
 extern "system" fn matrix_native_create<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     src: jlong,
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
-        // Copy the source matrix's value (identity when src == 0), then allocate a new slab slot
-        // holding that value — exact, no aliasing of the source slot.
         let value = match matrix_registry::get(src) {
             Ok(v) => v,
             Err(e) => {
@@ -7566,18 +4725,6 @@ extern "system" fn matrix_native_create<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Matrix.finalizer(long native_instance)` → free the Eclipse-owned [`matrix_registry`] slot
-/// (2026-06-05).
-///
-/// JNI ABI: a `static` native returning void (AOSP registers it as the `sNativeFinalizer` run by
-/// `NativeAllocationRegistry`/`Cleaner` on the GC/finalizer thread), so the parameters are
-/// `(EnvUnowned, JClass, jlong native_instance)`. Frees the matrix slot so its handle becomes stale
-/// and the slot can be reused. A `0` handle (the identity sentinel, which has no slot) or a
-/// stale/already-freed handle is logged at debug and ignored (the registry rejects it — never UB or
-/// double-free; the generational slab makes a freed handle permanently stale).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic — the correct neutral value for this `void` native.
 extern "system" fn matrix_finalizer<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7597,22 +4744,9 @@ extern "system" fn matrix_finalizer<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Matrix`'s natives.
-///
-/// Registered before step 4, alongside the View/Paint natives, since AppCompat's drawable manager
-/// constructs a `Matrix` during step 5. Each native is implemented against [`matrix_registry`] with
-/// exact 3x3 affine/perspective math (no GTK, no raster).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — each native is written to the exact descriptor the run reported. Every native body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_matrix_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(MATRIX_CLASS)?;
     let methods = [
-        // SAFETY: `matrix_native_create` matches the paired `(J)J` signature as a static native;
-        // casting the `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts`
-        // takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 MATRIX_NATIVE_CREATE_NAME,
@@ -7620,7 +4754,6 @@ fn register_matrix_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 matrix_native_create as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `matrix_finalizer` matches the paired `(J)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 MATRIX_FINALIZER_NAME,
@@ -7629,8 +4762,7 @@ fn register_matrix_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/graphics/Matrix; the fn pointers' signatures match its
-    // `native_create`/`finalizer` declarations (from the ART-reported signatures, 2026-06-05).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/graphics/Matrix",
@@ -7639,37 +4771,11 @@ fn register_matrix_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.graphics.Path vector geometry ==================
-//
-// 2026-06-05: `AdaptiveIconDrawable.<init> → PathParser.createPathFromPathData → Path.moveTo` builds
-// the adaptive-icon mask, surfacing `long android.graphics.Path.native_create_builder(long, long)`
-// (run log 2026-06-05, AdaptiveIconDemo). This ART build routes `Path` construction through a builder:
-// `Path.getBuilder()` calls `native_create_builder` once (lazily), then each `moveTo`/`lineTo`/
-// `quadTo`/`cubicTo`/`close` is a native op on that builder handle. A `Path` is REAL vector geometry,
-// so it is backed by the Eclipse-owned [`path_registry`] generational slab (a slab index, NOT a raw
-// pointer). The geometry is recorded faithfully (the actual parsed coordinates) — never a sentinel;
-// faking the shape is forbidden (AGENTS.md core principle). Each Path native is added here as the
-// discovery loop surfaces it, with the descriptor taken from the exact ART `No implementation found`
-// line + the AOSP `Path.java` native declarations.
-
-/// `android.graphics.Path` (internal/slashed name for `find_class`) — hosts the Path natives.
 pub const PATH_CLASS: &JNIStr = jni_str!("android/graphics/Path");
 
-// JNI name + descriptor for Path.native_create_builder, from the ART-reported signature `long
-// android.graphics.Path.native_create_builder(long, long)` (run log 2026-06-05): a static native,
-// descriptor `(JJ)J`. The first `long` is the existing native path object to seed the builder from
-// (`0` = empty); the second `long` is a reserve/hint AOSP passes through. Eclipse allocates a fresh
-// path_registry geometry slot (seeded from the source path's geometry when non-zero) and returns its
-// slab handle; the subsequent moveTo/lineTo/… ops mutate that slot's geometry.
 const PATH_NATIVE_CREATE_BUILDER_NAME: &JNIStr = jni_str!("native_create_builder");
 const PATH_NATIVE_CREATE_BUILDER_SIG: &JNIStr = jni_str!("(JJ)J");
 
-// JNI names + descriptors for the Path builder mutation ops, from the ART-reported signatures (run
-// log 2026-06-05) + AOSP `Path.java`'s native declarations. The first `long` of each is the builder
-// handle returned by `native_create_builder`; the trailing `float`s are the contour coordinates.
-// `native_move_to(long, float, float)` was confirmed surfaced by the discovery loop; `line_to`/
-// `quad_to`/`cubic_to`/`close` follow the same builder-op pattern (each is bound here and confirmed/
-// corrected by the loop). They record the REAL parsed geometry on the builder's path_registry slot.
 const PATH_NATIVE_MOVE_TO_NAME: &JNIStr = jni_str!("native_move_to");
 const PATH_NATIVE_MOVE_TO_SIG: &JNIStr = jni_str!("(JFF)V");
 const PATH_NATIVE_LINE_TO_NAME: &JNIStr = jni_str!("native_line_to");
@@ -7681,47 +4787,15 @@ const PATH_NATIVE_CUBIC_TO_SIG: &JNIStr = jni_str!("(JFFFFFF)V");
 const PATH_NATIVE_CLOSE_NAME: &JNIStr = jni_str!("native_close");
 const PATH_NATIVE_CLOSE_SIG: &JNIStr = jni_str!("(J)V");
 
-// JNI name + descriptor for Path.native_create_path, from the ART-reported signature `long
-// android.graphics.Path.native_create_path(long)` (run log 2026-06-05): a static native, descriptor
-// `(J)J`. AOSP's `Path.getGskPath()`/`Path.<init>` calls it to FOLD the builder back into a finalized
-// native path object — the `long` arg is the builder handle, the return is the finalized path's
-// handle. Eclipse allocates a new path_registry slot holding a COPY of the builder's real geometry
-// (the finalized, immutable path) and returns its slab handle.
 const PATH_NATIVE_CREATE_PATH_NAME: &JNIStr = jni_str!("native_create_path");
 const PATH_NATIVE_CREATE_PATH_SIG: &JNIStr = jni_str!("(J)J");
 
-// JNI name + descriptor for Path.native_ref_path, from the ART-reported signature `long
-// android.graphics.Path.native_ref_path(long)` (run log 2026-06-05): a static native, descriptor
-// `(J)J`. In AOSP-GSK's refcounted model `Path.<init>` calls it to take ownership of the GSK path
-// into `mNativePath`, returning the native handle. Eclipse's registry is a generational slab (not a
-// refcount), so this allocates a new slot holding a COPY of the source geometry — independent
-// ownership matching `Path(Path src)` semantics, never a shared-mutation alias across the slab.
 const PATH_NATIVE_REF_PATH_NAME: &JNIStr = jni_str!("native_ref_path");
 const PATH_NATIVE_REF_PATH_SIG: &JNIStr = jni_str!("(J)J");
 
-// 2026-06-11: `Path.reset()`/`rewind()` call `native_reset(long path, long builder)` — a static
-// native, descriptor `(JJ)V` (Path.java line 252; ART-reported `void android.graphics.Path.
-// native_reset(long, long)`, run log 2026-06-11 — Roblox's splash spinner animates a vector
-// drawable, calling reset() per frame). ATL's GSK backing unrefs both native objects and Java
-// zeroes its fields; Eclipse frees both [`path_registry`] slots (either handle may be `0` =
-// absent — the normal case, since a Path holds only ONE of path/builder at a time).
 const PATH_NATIVE_RESET_NAME: &JNIStr = jni_str!("native_reset");
 const PATH_NATIVE_RESET_SIG: &JNIStr = jni_str!("(JJ)V");
 
-/// `Path.native_create_builder(long nativePath, long reserve)` → a real Eclipse-owned
-/// [`path_registry`] geometry handle (2026-06-05).
-///
-/// JNI ABI: a `static` native (`(JJ)J`), so the parameters are
-/// `(EnvUnowned, JClass, jlong native_path, jlong reserve)`. `native_path == 0` allocates a fresh
-/// empty path; a non-zero `native_path` seeds the builder with a COPY of that path's geometry (exact,
-/// via [`path_registry::get`]) so `getBuilder` can continue appending to an existing `Path`. The
-/// `reserve` hint is not load-bearing for a `Vec`-backed buffer (it grows on demand) and is logged
-/// only. Returns the new slab handle (≥ 1, never `0`). On a registry error returns `0` (AOSP treats a
-/// `0` native object as an empty path, so this degrades to an empty path rather than UB).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
-/// error/panic.
 extern "system" fn path_native_create_builder<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7729,8 +4803,6 @@ extern "system" fn path_native_create_builder<'local>(
     reserve: jlong,
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
-        // Seed the builder from the source path's geometry (empty when native_path == 0) — a COPY, so
-        // it never aliases the source slot.
         let geometry = if native_path == 0 {
             path_registry::PathGeometry::default()
         } else {
@@ -7771,10 +4843,6 @@ extern "system" fn path_native_create_builder<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Record a geometry op on the builder handle's [`path_registry`] slot. Shared by the move/line/quad/
-/// cubic/close natives: it locates the slot (bounds+generation-checked), runs `op` against its real
-/// geometry, and logs a debug line. A stale/fabricated handle is logged at warn and ignored (the
-/// registry rejects it — never UB). `op_name` names the op for the log only.
 fn path_record(
     handle: jlong,
     op_name: &'static str,
@@ -7801,11 +4869,6 @@ fn path_record(
     }
 }
 
-/// `Path.native_move_to(long builder, float x, float y)` → record a `moveTo` on the builder's geometry.
-///
-/// JNI ABI: a `static` native returning void (`(JFF)V`), so the parameters are
-/// `(EnvUnowned, JClass, jlong builder, jfloat x, jfloat y)`. Records the REAL coordinates on the
-/// builder's [`path_registry`] slot. `catch_unwind`-guarded via `with_env`; `resolve` returns `()`.
 extern "system" fn path_native_move_to<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7820,9 +4883,6 @@ extern "system" fn path_native_move_to<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Path.native_line_to(long builder, float x, float y)` → record a `lineTo` on the builder's geometry.
-///
-/// JNI ABI: a `static` native returning void (`(JFF)V`). See [`path_native_move_to`] for the contract.
 extern "system" fn path_native_line_to<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7837,10 +4897,6 @@ extern "system" fn path_native_line_to<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Path.native_quad_to(long builder, float cx, float cy, float x, float y)` → record a quadratic
-/// Bézier on the builder's geometry.
-///
-/// JNI ABI: a `static` native returning void (`(JFFFF)V`). See [`path_native_move_to`] for the contract.
 extern "system" fn path_native_quad_to<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7857,11 +4913,6 @@ extern "system" fn path_native_quad_to<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Path.native_cubic_to(long builder, float c1x, float c1y, float c2x, float c2y, float x, float y)`
-/// → record a cubic Bézier on the builder's geometry.
-///
-/// JNI ABI: a `static` native returning void (`(JFFFFFF)V`). See [`path_native_move_to`] for the
-/// contract.
 extern "system" fn path_native_cubic_to<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7880,9 +4931,6 @@ extern "system" fn path_native_cubic_to<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Path.native_close(long builder)` → record a `close` on the builder's geometry.
-///
-/// JNI ABI: a `static` native returning void (`(J)V`). See [`path_native_move_to`] for the contract.
 extern "system" fn path_native_close<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7895,12 +4943,6 @@ extern "system" fn path_native_close<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Allocate a new [`path_registry`] slot holding a COPY of `source`'s geometry, returning its slab
-/// handle. Shared by `native_create_path` (fold builder → finalized path) and `native_ref_path` (take
-/// independent ownership into a `Path`): both produce a new, independently-owned native path object
-/// from a source handle in Eclipse's generational-slab model. A `0`/stale `source` yields an empty
-/// path (logged); a registry-allocate error yields `0` (AOSP treats `0` as an empty native path →
-/// degrades, never UB). `op_name` names the op for the log only.
 fn path_clone_handle(source: jlong, op_name: &'static str) -> jlong {
     let geometry = if source == 0 {
         path_registry::PathGeometry::default()
@@ -7942,15 +4984,6 @@ fn path_clone_handle(source: jlong, op_name: &'static str) -> jlong {
     }
 }
 
-/// `Path.native_create_path(long builder)` → fold the builder into a finalized native path
-/// (2026-06-05).
-///
-/// JNI ABI: a `static` native (`(J)J`), so the parameters are `(EnvUnowned, JClass, jlong builder)`.
-/// Allocates a new [`path_registry`] slot holding a COPY of the builder's real geometry (the finalized
-/// path) and returns its slab handle (via [`path_clone_handle`]).
-///
-/// `catch_unwind`-guarded via `with_env`; `resolve::<LogErrorAndDefault>` returns the `jlong` default
-/// (`0`) on error/panic.
 extern "system" fn path_native_create_path<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7962,15 +4995,6 @@ extern "system" fn path_native_create_path<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Path.native_ref_path(long src)` → take independent ownership of the source path's geometry into a
-/// `Path`'s `mNativePath` (2026-06-05).
-///
-/// JNI ABI: a `static` native (`(J)J`), so the parameters are `(EnvUnowned, JClass, jlong src)`.
-/// Allocates a new [`path_registry`] slot holding a COPY of `src`'s geometry (via
-/// [`path_clone_handle`]) — Eclipse's slab models AOSP-GSK's ref by independent ownership.
-///
-/// `catch_unwind`-guarded via `with_env`; `resolve::<LogErrorAndDefault>` returns the `jlong` default
-/// (`0`) on error/panic.
 extern "system" fn path_native_ref_path<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -7982,18 +5006,6 @@ extern "system" fn path_native_ref_path<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Path.native_reset(long path, long builder)` → free both [`path_registry`] slots (2026-06-11).
-///
-/// JNI ABI: a `static` native (`(JJ)V`), so the parameters are
-/// `(EnvUnowned, JClass, jlong path, jlong builder)`. `Path.reset()` passes its CURRENT `path` and
-/// `builder` handles (a Path holds only one at a time, so one is normally `0`) and zeroes both Java
-/// fields afterwards — the native must release the old geometry. `0` = absent (skipped silently,
-/// AOSP's null native object); a non-zero stale/fabricated handle is logged + ignored (the
-/// generational slab rejects it — never UB, never a double free). Surfaced by Roblox's splash
-/// spinner resetting its vector-drawable path every animation frame (run log 2026-06-11).
-///
-/// `catch_unwind`-guarded via `with_env`; `resolve::<LogErrorAndDefault>` returns the `()` default
-/// on error/panic.
 extern "system" fn path_native_reset<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -8020,23 +5032,9 @@ extern "system" fn path_native_reset<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Path`'s natives.
-///
-/// Registered before step 4, alongside the View/Paint/Matrix natives, since a launcher's onCreate may
-/// build a vector-drawable path during step 5 (AdaptiveIconDemo's `getDrawable` →
-/// `AdaptiveIconDrawable.<init>` → `PathParser`). Each native is implemented against [`path_registry`]
-/// recording the REAL parsed geometry (no GTK, no Skia-C).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — each native is written to the exact descriptor the run reported. Every native body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(PATH_CLASS)?;
     let methods = [
-        // SAFETY: `path_native_create_builder` matches the paired `(JJ)J` signature as a static
-        // native; casting the `extern "system"` fn to a `*mut c_void` is how
-        // `NativeMethod::from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_CREATE_BUILDER_NAME,
@@ -8044,7 +5042,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_create_builder as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_move_to` matches the paired `(JFF)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_MOVE_TO_NAME,
@@ -8052,7 +5049,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_move_to as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_line_to` matches the paired `(JFF)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_LINE_TO_NAME,
@@ -8060,7 +5056,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_line_to as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_quad_to` matches the paired `(JFFFF)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_QUAD_TO_NAME,
@@ -8068,7 +5063,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_quad_to as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_cubic_to` matches the paired `(JFFFFFF)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_CUBIC_TO_NAME,
@@ -8076,7 +5070,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_cubic_to as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_close` matches the paired `(J)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_CLOSE_NAME,
@@ -8084,7 +5077,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_close as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_create_path` matches the paired `(J)J` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_CREATE_PATH_NAME,
@@ -8092,7 +5084,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_create_path as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_ref_path` matches the paired `(J)J` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_REF_PATH_NAME,
@@ -8100,8 +5091,6 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 path_native_ref_path as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `path_native_reset` matches the paired `(JJ)V` signature as a static native
-        // (Path.java line 252; surfaced by Roblox's splash spinner, run log 2026-06-11).
         unsafe {
             NativeMethod::from_raw_parts(
                 PATH_NATIVE_RESET_NAME,
@@ -8110,9 +5099,7 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/graphics/Path; the fn pointers' signatures match its
-    // `native_create_builder`/`native_move_to`/… declarations (from the ART-reported signatures,
-    // 2026-06-05 + native_reset 2026-06-11).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/graphics/Path",
@@ -8121,41 +5108,8 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.graphics.Canvas draw natives =================
-//
-// 2026-06-05: a CUSTOM View's `onDraw(Canvas)` issues Canvas draw calls (e.g. multitouch.test's
-// `MultiTouch.onDraw` draws touch circles). The draw-cascade driver ([`drive_view_draw`]) constructs
-// a Java `Canvas` whose native backing is an Eclipse-owned [`canvas_registry`] slab handle (a tiny-skia
-// `Pixmap`, NOT a GTK/Cairo/Skia-C context), then invokes `View.draw(Canvas)`; if Canvas's draw ops
-// resolve to natives Eclipse can bind, they issue REAL tiny-skia fills/strokes into that Pixmap. The
-// renderer then uploads the Pixmap as an RGBA GPU texture over the view's rect (`CanvasCompositor`).
-//
-// ⚠️ DEV-HOST DISCOVERY (run log 2026-06-05, multitouch.test, `/tmp/eclipse-draw.log`): THIS ART/ATL
-// build's `android.graphics.Canvas` is NOT the modern-AOSP `nDraw*`-native shape. Its vtable dump shows
-// the draw ops are **public Java methods** (`drawColor(int)`, `drawCircle(float,float,float,Paint)`,
-// `drawRect(...)`, `drawPath(Path,Paint)`, …) backed by an `android.atl.GskCanvas gsk_canvas` field
-// (GTK GSK render node) + a `Bitmap bitmap` field — there is NO `nDrawColor`/`nDrawRect`/… native and
-// NO `Canvas(long)` constructor (only `Canvas()` and `Canvas(Bitmap)`). So binding `nDraw*` natives
-// here throws `NoSuchMethodError`. RegisterNatives is therefore BEST-EFFORT (see
-// [`register_canvas_natives`]): when the methods aren't natives on this build, registration is logged
-// + skipped and the lifecycle still reaches RESUMED (the draw cascade then composites nothing — the
-// view quads + text still draw). The durable faithful path on this build is a `Canvas(Bitmap)` whose
-// Bitmap Eclipse owns (so the Java draw methods raster into Eclipse-readable pixels via the Bitmap/
-// GskCanvas natives) — a separate Bitmap/GskCanvas subsystem build (deferred; AGENTS.md §5). The
-// `canvas_registry` Pixmap raster + the RGBA composite are real + unit-tested and are reused unchanged
-// once that consumer exists. The `nDraw*` names below are kept as the attempted binding (they are the
-// modern-AOSP set); they are the right names on an AOSP-shaped Canvas build and harmlessly skipped on
-// this GTK-backed one.
-
-/// `android.graphics.Canvas` (internal/slashed name for `find_class`) — the class the draw-cascade
-/// driver constructs + (best-effort) binds draw natives on. NOTE (2026-06-05): on this ATL build Canvas
-/// is GskCanvas-backed with public-Java draw methods + only `Canvas()`/`Canvas(Bitmap)` ctors (no
-/// `Canvas(long)`), so the binding + `Canvas(long)` construction are best-effort (see the section note).
 pub const CANVAS_CLASS: &JNIStr = jni_str!("android/graphics/Canvas");
 
-// JNI names + descriptors for the modern-AOSP `BaseCanvas` draw natives (bound static with the canvas
-// handle as the first arg). Best-effort: skipped if absent on a GTK-backed Canvas build (see the
-// section note). Each is paired with its `extern "system"` fn below; pinned by `canvas_native_names_and_sigs`.
 const CANVAS_N_DRAW_COLOR_NAME: &JNIStr = jni_str!("nDrawColor");
 const CANVAS_N_DRAW_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
 const CANVAS_N_DRAW_RECT_NAME: &JNIStr = jni_str!("nDrawRect");
@@ -8165,35 +5119,17 @@ const CANVAS_N_DRAW_CIRCLE_SIG: &JNIStr = jni_str!("(JFFFJ)V");
 const CANVAS_N_DRAW_PATH_NAME: &JNIStr = jni_str!("nDrawPath");
 const CANVAS_N_DRAW_PATH_SIG: &JNIStr = jni_str!("(JJJ)V");
 
-/// Snapshot a [`paint_registry`] handle into a [`canvas_registry::PaintConfig`] for a Canvas draw.
-///
-/// 2026-06-05: reads the `Paint`'s recorded color/style/stroke-width under the paint lock and returns a
-/// plain value, so the canvas lock and the paint lock are never held at once (no lock-order hazard).
-/// A bad/stale/`0` paint handle (e.g. a draw with a default Paint Eclipse never saw construct) yields
-/// [`canvas_registry::PaintConfig::default`] (opaque black, fill) — AOSP's default Paint, so the draw
-/// is still real, never UB.
 fn paint_config_from_handle(paint: jlong) -> canvas_registry::PaintConfig {
     paint_registry::with_paint(paint, |p| canvas_registry::PaintConfig {
         argb: p.color,
         style: p.style,
         stroke_width: p.stroke_width,
-        // AOSP `Path.getFillType` defaults to WINDING; even-odd is per-path, not per-paint, so the
-        // path's own geometry/fill carries it. Canvas circle/rect ignore it; drawPath reads the
-        // geometry's recorded rule via the path handle below.
+
         even_odd: false,
     })
     .unwrap_or_default()
 }
 
-/// `Canvas.nDrawColor(long canvas, int color)` → fill the whole Pixmap with a solid ARGB color.
-///
-/// JNI ABI: a `static` native returning void (`(JI)V`), so the parameters are
-/// `(EnvUnowned, JClass, jlong canvas, jint color)`. Issues a real [`canvas_registry`] `draw_color`
-/// (tiny-skia `Pixmap::fill`). A bad/stale canvas handle is logged + ignored (never UB). This is the
-/// op a custom View's `onDraw` typically issues first to clear its canvas.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8); `resolve`
-/// returns the `()` default on error/panic.
 extern "system" fn canvas_n_draw_color<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -8218,12 +5154,6 @@ extern "system" fn canvas_n_draw_color<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Canvas.nDrawRect(long canvas, float left, float top, float right, float bottom, long paint)` →
-/// fill/stroke an axis-aligned rectangle into the Pixmap.
-///
-/// JNI ABI: a `static` native returning void (`(JFFFFJ)V`). Reads the Paint config from the `paint`
-/// handle ([`paint_config_from_handle`]) and issues a real [`canvas_registry`] `draw_rect`. Bad canvas
-/// handle → logged + ignored.
 extern "system" fn canvas_n_draw_rect<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -8254,11 +5184,6 @@ extern "system" fn canvas_n_draw_rect<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Canvas.nDrawCircle(long canvas, float cx, float cy, float radius, long paint)` → fill/stroke a
-/// circle into the Pixmap (the op multitouch.test's `onDraw` issues per touch point).
-///
-/// JNI ABI: a `static` native returning void (`(JFFFJ)V`). Reads the Paint config from `paint` and
-/// issues a real [`canvas_registry`] `draw_circle`. Bad canvas handle → logged + ignored.
 extern "system" fn canvas_n_draw_circle<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -8287,13 +5212,6 @@ extern "system" fn canvas_n_draw_circle<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Canvas.nDrawPath(long canvas, long path, long paint)` → fill/stroke an arbitrary contour into the
-/// Pixmap from a [`path_registry`] geometry.
-///
-/// JNI ABI: a `static` native returning void (`(JJJ)V`). Snapshots the [`path_registry`] geometry +
-/// its fill rule and the [`paint_registry`] config, then issues a real [`canvas_registry`] `draw_path`.
-/// A bad canvas/path handle is logged + ignored (never UB). The geometry is COPIED out under the path
-/// lock so the canvas lock and path lock are never held at once.
 extern "system" fn canvas_n_draw_path<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -8302,7 +5220,6 @@ extern "system" fn canvas_n_draw_path<'local>(
     paint: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // Copy the path geometry + fill rule out under the path lock (clone into an owned value).
         let geometry = path_registry::with_path(path, |g| g.clone());
         let Ok(geometry) = geometry else {
             tracing::debug!(
@@ -8312,8 +5229,7 @@ extern "system" fn canvas_n_draw_path<'local>(
             );
             return Ok(());
         };
-        // 2026-06-05: `PathGeometry` records verbs+points only (no fill rule); AOSP `Path`'s default
-        // fill type is WINDING, which `PaintConfig::default`/`paint_config_from_handle` already use.
+
         let cfg = paint_config_from_handle(paint);
         match canvas_registry::with_canvas(canvas, |c| c.draw_path(&geometry, &cfg)) {
             Ok(()) => tracing::trace!(
@@ -8332,23 +5248,9 @@ extern "system" fn canvas_n_draw_path<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.graphics.Canvas`'s draw natives.
-///
-/// Registered before step 4 (alongside the other graphics natives) so the natives are resolvable the
-/// moment a custom View's `onDraw(Canvas)` issues them during the draw cascade. Each is implemented
-/// against [`canvas_registry`] (real tiny-skia raster) + [`paint_registry`]/[`path_registry`]. New
-/// Canvas natives a dev-host run surfaces (`nDrawText`/`nDrawBitmap`/…) are added here.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do, by construction — each native is written to the modern-AOSP `BaseCanvas` descriptor (provenance
-/// note above; the discovery loop confirms/corrects names on the dev host). Every native body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(CANVAS_CLASS)?;
     let methods = [
-        // SAFETY: `canvas_n_draw_color` matches the paired `(JI)V` signature as a static native;
-        // casting the `extern "system"` fn to a `*mut c_void` is how `from_raw_parts` takes it.
         unsafe {
             NativeMethod::from_raw_parts(
                 CANVAS_N_DRAW_COLOR_NAME,
@@ -8356,7 +5258,6 @@ fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 canvas_n_draw_color as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `canvas_n_draw_rect` matches the paired `(JFFFFJ)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 CANVAS_N_DRAW_RECT_NAME,
@@ -8364,7 +5265,6 @@ fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 canvas_n_draw_rect as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `canvas_n_draw_circle` matches the paired `(JFFFJ)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 CANVAS_N_DRAW_CIRCLE_NAME,
@@ -8372,7 +5272,6 @@ fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 canvas_n_draw_circle as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `canvas_n_draw_path` matches the paired `(JJJ)V` signature as a static native.
         unsafe {
             NativeMethod::from_raw_parts(
                 CANVAS_N_DRAW_PATH_NAME,
@@ -8381,18 +5280,9 @@ fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // BEST-EFFORT (2026-06-05): on this ATL build Canvas has no `nDraw*` natives (it is GskCanvas-
-    // backed with public-Java draw methods — section note), so RegisterNatives throws
-    // `NoSuchMethodError`. That must NOT abort the lifecycle (the app still reaches RESUMED + the view
-    // quads/text render; the draw cascade just composites nothing). So we attempt the bind and, on
-    // failure, clear the pending exception + log it as the discovery signal, returning Ok. On an
-    // AOSP-shaped Canvas build (where these natives exist) the bind succeeds and the cascade composites.
-    // SAFETY: `class` is the loaded android/graphics/Canvas; the fn pointers' signatures match the
-    // modern-AOSP BaseCanvas draw-native descriptors.
+
     match unsafe { env.register_native_methods(&class, &methods) } {
         Ok(()) => {
-            // The nDraw* natives bound → this build's Canvas is the AOSP-shaped one the cascade can
-            // drive. Enable it (drive_view_draw will construct Canvas(long) + run View.draw).
             CANVAS_DRAW_SUPPORTED.store(true, std::sync::atomic::Ordering::Release);
             tracing::info!(
                 class = "android/graphics/Canvas",
@@ -8400,10 +5290,6 @@ fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
             );
         }
         Err(e) => {
-            // Clear the NoSuchMethodError RegisterNatives left pending so it can't poison the next JNI
-            // call; log it as the discovery signal (this build backs Canvas via GskCanvas/Bitmap), and
-            // DISABLE the cascade so drive_view_draw doesn't re-attempt (+ re-log) the missing
-            // Canvas(long) ctor every frame.
             if env.exception_check() {
                 env.exception_clear();
             }
@@ -8418,104 +5304,35 @@ fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-/// `true` if this ART build's `android.graphics.Canvas` supports the draw cascade (set by
-/// [`register_canvas_natives`] after probing the `nDraw*` natives). [`drive_view_draw`] short-circuits
-/// when this is `false` so the missing `Canvas(long)` ctor is not re-attempted every frame.
 pub fn canvas_draw_supported() -> bool {
     CANVAS_DRAW_SUPPORTED.load(std::sync::atomic::Ordering::Acquire)
 }
 
-// === Eclipse's own (non-GTK) backing for android.widget.TextView native peer construction =======
-//
-// 2026-06-05: the launcher layout contains a `<TextView>`, so step 5 (`setContentView` →
-// `LayoutInflater`) constructs an `android.widget.TextView`, surfacing
-// `TextView.native_constructor(Context, AttributeSet)` (run log 2026-06-05). ART resolves natives
-// per declaring class, and `TextView.java` (line 89) re-declares its own
-// `protected native long native_constructor(Context, AttributeSet);` (same signature as
-// `View.native_constructor`). The backing is class-agnostic (it records the receiver's ACTUAL class
-// name into [`view_registry`]), so the SAME [`view_native_constructor`] fn is registered on
-// `android/widget/TextView` — recording `android.widget.TextView` in the view tree. TextView-specific
-// natives (`native_setText`, …) are added here as the run surfaces them.
-
-/// `android.widget.TextView` (internal/slashed name for `find_class`) — re-declares `native_constructor`.
 pub const TEXT_VIEW_CLASS: &JNIStr = jni_str!("android/widget/TextView");
 
-// JNI name + descriptor for TextView.native_setText, exactly as declared in `TextView.java`
-// (2026-06-05, line 111): `public native final void native_setText(String text);` → an INSTANCE
-// native, descriptor `(Ljava/lang/String;)V`. Surfaced during step 5: both the inflated `<TextView
-// android:text="Hello World!">` (TextView.<init> → setText) AND the launcher's own
-// `findViewById(...).setText(...)` (MainActivity.onCreate:16) route here. ATL backs it against the
-// GtkLabel; Eclipse records the text on the receiver's [`view_registry`] peer (no GTK, no draw).
 const TEXT_VIEW_NATIVE_SET_TEXT_NAME: &JNIStr = jni_str!("native_setText");
 const TEXT_VIEW_NATIVE_SET_TEXT_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V");
 
-// 2026-06-11: `TextView.setTextColor` (called from `TextView.<init>` line 153) is backed by
-// `native_setTextColor(int color)` — TextView.java line 120 declares it with NO widget param
-// (ATL's C reads `this.widget`), descriptor `(I)V`. Surfaced by Roblox's `ActivitySplash`
-// `setContentView` inflating its splash layout (`com.roblox.client.components.LoadingBar` →
-// `AppCompatTextView`, run log 2026-06-11). The snapshot renderer draws glyphs with the fixed
-// `graphics::TEXT_COLOR` and does not consume a per-view text color yet (documented follow-up
-// like visibility/alpha), so the backing validates the receiver's widget handle and no-ops.
 const TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME: &JNIStr = jni_str!("native_setTextColor");
 const TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG: &JNIStr = jni_str!("(I)V");
 
-// 2026-07-01: `TextView.setTextSize(float size)` — the INSTALLED TextView declares it `public
-// native setTextSize(F)V` (baksmali of the shipped api-impl dex, line 1609) and calls it from
-// `TextView.<init>` (Unknown Source:171), so EVERY TextView construction hits it. Surfaced FATALLY
-// by the Roblox login anti-bot challenge (`onAppReady: ChallengeNativeWrapper` → challenge layout
-// inflation → UnsatisfiedLinkError out of Handler.dispatchMessage → the "stuck loading" sign-in,
-// /tmp/eclipse-continue3.log). No widget param — reads `this.widget` like `native_setTextColor`.
-// The renderer draws no per-view text size (the engine renders the real UI; the vk_overlay gets its
-// font size from NativeTextBoxInfo), so validate-and-no-op is the honest backing.
 const TEXT_VIEW_SET_TEXT_SIZE_NAME: &JNIStr = jni_str!("setTextSize");
 const TEXT_VIEW_SET_TEXT_SIZE_SIG: &JNIStr = jni_str!("(F)V");
 
-// 2026-07-01: `TextView.native_set_markup(int enable)` — installed TextView declares it
-// `private final native native_set_markup(I)V` (baksmali line 472); called from
-// `setText(CharSequence, BufferType)` when the text is a `Spanned` (styled challenge/legal text).
-// Same shape as `native_setTextColor`: no widget param, reads `this.widget`; the recorded peer
-// carries plain text only (markup is a GTK-label rendering concern ATL's C backing owns) →
-// validate-and-no-op.
 const TEXT_VIEW_NATIVE_SET_MARKUP_NAME: &JNIStr = jni_str!("native_set_markup");
 const TEXT_VIEW_NATIVE_SET_MARKUP_SIG: &JNIStr = jni_str!("(I)V");
 
-// 2026-07-01: `TextView.native_setCompoundDrawables(long widget, long left, long top, long right,
-// long bottom)` — installed TextView declares it `protected native (JJJJJ)V` (baksmali line 990);
-// `setCompoundDrawables(Drawable×4)` passes `this.widget` + each drawable's `paintable` handle
-// (0 for null). Drawable draw is deferred (the Button sibling `native_setCompoundDrawables(JJ)V`
-// is the same validated no-op) → validate the widget handle and no-op.
 const TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_NAME: &JNIStr =
     jni_str!("native_setCompoundDrawables");
 const TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_SIG: &JNIStr = jni_str!("(JJJJJ)V");
 
-// JNI name + descriptor for View.widget — the `public long widget` field (`View.java` line 888) that
-// holds the view's [`view_registry`] handle. An instance native like `native_setText` (which receives
-// only the text, not the handle) reads it off `this` to find the peer to update.
 const VIEW_WIDGET_FIELD_NAME: &JNIStr = jni_str!("widget");
 const VIEW_WIDGET_FIELD_SIG: &JNIStr = jni_str!("J");
 
-/// 2026-06-13: descriptor of `SurfaceView.mCallbacks` — the `final ArrayList<SurfaceHolder.Callback>`
-/// field (`vendor/atl/.../android/view/SurfaceView.java:13`) the render Phase 2 surface-lifecycle
-/// gate reads via `get_field` to check the engine has subscribed its `SurfaceHolder.Callback` before
-/// dispatching `surfaceCreated`/`surfaceChanged`.
 const ARRAY_LIST_SIG: &JNIStr = jni_str!("Ljava/util/ArrayList;");
 
-/// Descriptor of `SurfaceView.mSurfaceHolder`, paired with [`JavaType::Object`] at each JNI read.
-/// Host shutdown needs the exact holder instance that `surfaceCreated`/`surfaceChanged` supplied to
-/// the callbacks, so `surfaceDestroyed` closes the same lifecycle rather than fabricating one.
 const SURFACE_HOLDER_SIG: &JNIStr = jni_str!("Landroid/view/SurfaceHolder;");
 
-/// `TextView.native_setText(String text)` → record the text on the receiver's [`view_registry`] peer
-/// (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void, so the parameters are
-/// `(EnvUnowned, JObject this, JString text)`. The view-registry handle is the receiver's `widget`
-/// field (`View.java` `public long widget`); this reads it off `this`, then records `text` on that
-/// peer through the bounds+generation-checked [`view_registry`] (a stale/fabricated handle is logged +
-/// ignored, never UB). No GTK label, no layout/draw — the text is metadata until the deferred render.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
 extern "system" fn text_view_native_set_text<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -8523,14 +5340,13 @@ extern "system" fn text_view_native_set_text<'local>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let widget = view_widget_handle(env, &this);
-        // A null text clears it (AOSP setText(null) → empty); record None vs Some.
+
         let value = if text.is_null() {
             None
         } else {
             Some(text.try_to_string(env)?)
         };
         match view_registry::with_view(widget, |v| v.text = value.clone()) {
-            // 2026-07-17: UI text may contain credentials; logs carry length only at every level.
             Ok(()) => tracing::debug!(
                 target: "android.widget.TextView",
                 widget,
@@ -8549,17 +5365,6 @@ extern "system" fn text_view_native_set_text<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `TextView.native_setTextColor(int color)` → validate the receiver's widget handle; no-op (the
-/// snapshot renderer draws text with the fixed `graphics::TEXT_COLOR`, 2026-06-11).
-///
-/// JNI ABI: an INSTANCE native returning void with descriptor `(I)V` — no widget param; the
-/// receiver's [`view_registry`] handle is read off `this.widget` (like [`text_view_native_set_text`]).
-/// Validates it through the bounds+generation-checked registry (a bad handle is logged + ignored,
-/// never UB) and no-ops: per-view text color is not yet consumed by the renderer (a documented
-/// follow-up, like visibility/alpha). Surfaced by Roblox's `ActivitySplash` splash-layout inflation.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn text_view_native_set_text_color<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -8588,12 +5393,6 @@ extern "system" fn text_view_native_set_text_color<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `TextView.setTextSize(float size)` — Eclipse's non-GTK backing. Instance native with NO widget
-/// param (reads `this.widget`, the `native_setTextColor` shape). Called from `TextView.<init>`
-/// (installed dex, Unknown Source:171), so EVERY TextView construction reaches it — surfaced
-/// FATALLY 2026-07-01 by the login anti-bot challenge layout (`ChallengeNativeWrapper`), where the
-/// UnsatisfiedLinkError escaped `Handler.dispatchMessage` and left sign-in "stuck loading".
-/// Validated no-op: the engine renders the real UI; no bound native getter reads a text size back.
 extern "system" fn text_view_set_text_size<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -8622,10 +5421,6 @@ extern "system" fn text_view_set_text_size<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `TextView.native_set_markup(int enable)` — Eclipse's non-GTK backing. Instance native with NO
-/// widget param (reads `this.widget`); called from `setText(CharSequence, BufferType)` when the
-/// text is a `Spanned` (styled challenge/legal text). Markup rendering is a GTK-label concern of
-/// ATL's C backing; Eclipse's recorded peer carries plain text → validated no-op.
 extern "system" fn text_view_native_set_markup<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -8654,11 +5449,6 @@ extern "system" fn text_view_native_set_markup<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `TextView.native_setCompoundDrawables(long widget, long left, long top, long right, long
-/// bottom)` — Eclipse's non-GTK backing. STATIC-shaped instance call in ATL style: the widget
-/// handle is the FIRST param (the drawable `paintable` handles follow, 0 for null). Drawable draw
-/// is deferred project-wide (the Button `native_setCompoundDrawables(JJ)V` sibling is the same
-/// validated no-op) → validate the widget handle and no-op.
 extern "system" fn text_view_native_set_compound_drawables<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -8696,12 +5486,7 @@ extern "system" fn text_view_native_set_compound_drawables<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Read a View's `widget` (`long`) field off `this` — its [`view_registry`] handle. Returns `0` (the
-/// reserved null handle, which the registry rejects) on any JNI error, so the caller still no-ops
-/// soundly. Off the gameplay hot path (per text/attribute set during inflation).
 fn view_widget_handle(env: &mut Env, this: &JObject) -> jlong {
-    // SAFETY: "J" paired with JavaType::Long is consistent — FieldSignature::from_raw_parts' invariant;
-    // `widget` is `public long` on View, the receiver's runtime supertype, so the read is type-correct.
     let sig = unsafe {
         FieldSignature::from_raw_parts(VIEW_WIDGET_FIELD_SIG, JavaType::Primitive(Primitive::Long))
     };
@@ -8710,35 +5495,7 @@ fn view_widget_handle(env: &mut Env, this: &JObject) -> jlong {
         .unwrap_or(0)
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.widget.TextView`'s peer natives.
-///
-/// `native_constructor` (TextView.java line 89, same `(Landroid/content/Context;Landroid/util/
-/// AttributeSet;)J` signature as View's) reuses the class-agnostic [`view_native_constructor`], which
-/// records the receiver's actual class (`android.widget.TextView`) in [`view_registry`].
-/// `native_setText` (TextView.java line 111) records the text on the receiver's peer. Registered
-/// before step 4, alongside the View/Window natives.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — each native is written to the exact descriptor declared in `TextView.java`. The bodies are
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: per-method best-effort (via `register_class_natives_best_effort`) so a single entry
-    // the shipped dex disagrees with is a deferred call-time UnsatisfiedLinkError on that method, not a
-    // fatal whole-class abort (the 58a50f6 class of bug). TextView is the SUPERTYPE of
-    // EditText/Button/CheckBox/RadioButton, so an atomic abort here would break LayoutInflater for
-    // every text widget — keeping `native_constructor` bindable independently of `native_setText`/
-    // `native_setTextColor` is exactly the lifecycle-critical protection 58a50f6 lacked.
-    // SAFETY: `view_native_constructor` matches the paired
-    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` instance native (shared with
-    // View.native_constructor, TextView.java line 89); `text_view_native_set_text` matches the paired
-    // `(Ljava/lang/String;)V` instance native (TextView.java line 111); `text_view_native_set_text_color`
-    // matches the paired `(I)V` instance native (TextView.java line 120, surfaced by Roblox's
-    // splash-layout inflation, run log 2026-06-11); `text_view_set_text_size` matches the paired
-    // `(F)V` instance native (installed-dex baksmali line 1609, surfaced FATALLY by the login
-    // challenge, /tmp/eclipse-continue3.log 2026-07-01); `text_view_native_set_markup` matches the
-    // paired `(I)V` instance native (baksmali line 472); `text_view_native_set_compound_drawables`
-    // matches the paired `(JJJJJ)V` instance native (baksmali line 990).
     let bindings: [NativeBinding; 6] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
@@ -8780,52 +5537,14 @@ fn register_text_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.widget.ImageView native peer construction ======
-//
-// 2026-06-05: a launcher layout containing an `<ImageView>` (e.g. AdaptiveIconDemo) makes step 5
-// (`setContentView` → `LayoutInflater`) construct an `android.widget.ImageView`, surfacing
-// `ImageView.native_constructor(Context, AttributeSet)` (run log 2026-06-05 against AdaptiveIconDemo).
-// Exactly like `TextView`, ART resolves natives per declaring class and `ImageView.java` re-declares
-// its own `protected native long native_constructor(Context, AttributeSet);` (same signature as
-// `View.native_constructor`). The backing is class-agnostic (records the receiver's ACTUAL class name
-// into [`view_registry`]), so the SAME [`view_native_constructor`] fn is registered on
-// `android/widget/ImageView` — recording `android.widget.ImageView` in the view tree. ImageView's
-// image-source natives (`native_setImage*`) are added here if/when a run surfaces them; the demo's
-// drawable rendering is the deferred render build (no GTK, no draw here).
-
-/// `android.widget.ImageView` (internal/slashed name for `find_class`) — re-declares `native_constructor`.
 pub const IMAGE_VIEW_CLASS: &JNIStr = jni_str!("android/widget/ImageView");
 
-// 2026-06-05: `ImageView.setScaleType` calls `native_setScaleType(long, int)` to record the
-// scale type on its native peer; surfaced by multitouch.test's AppCompat `ActionBarView`/`HomeView`
-// `ImageView` (run log `No implementation found for void android.widget.ImageView.native_setScaleType(
-// long, int)`). The scale type is a draw-time hint for how an ImageView fits its image to its bounds;
-// no ImageView image-source native is bound yet (the layered-drawable bitmap path is deferred), so
-// this validates the `widget` handle + no-ops. Instance native, descriptor `(JI)V`.
 const IMAGE_VIEW_SET_SCALE_TYPE_NAME: &JNIStr = jni_str!("native_setScaleType");
 const IMAGE_VIEW_SET_SCALE_TYPE_SIG: &JNIStr = jni_str!("(JI)V");
 
-// 2026-06-05: `ImageView.setImageDrawable` calls `native_setDrawable(long widget, long drawable)` to
-// attach the image drawable to its native peer; surfaced by multitouch.test's AppCompat ActionBar
-// `HomeView` ImageView (run log `No implementation found for void android.widget.ImageView.
-// native_setDrawable(long, long)`). `drawable` is a `Drawable` native handle. ImageView image drawing
-// has no draw consumer yet (the layered-drawable bitmap raster is deferred), so this validates the
-// `widget` view handle + no-ops. Instance native, descriptor `(JJ)V`.
 const IMAGE_VIEW_SET_DRAWABLE_NAME: &JNIStr = jni_str!("native_setDrawable");
 const IMAGE_VIEW_SET_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
 
-/// `ImageView.native_setScaleType(long widget, int scaleType)` → validate the handle; no-op
-/// (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void. `widget` is the ImageView's [`view_registry`] handle;
-/// `scaleType` is the `ImageView.ScaleType` ordinal. Scale type only affects how an image is fitted
-/// when the ImageView draws it; no ImageView image-source native is bound (the layered-drawable bitmap
-/// path is the deferred render build), so there is no draw consumer to record it for. Validates the
-/// handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged + ignored,
-/// never UB) so a fabricated `widget` can never reach a wild dereference.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn image_view_set_scale_type<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -8852,18 +5571,6 @@ extern "system" fn image_view_set_scale_type<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `ImageView.native_setDrawable(long widget, long drawable)` → validate the handle; no-op
-/// (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void. `widget` is the ImageView's [`view_registry`] handle;
-/// `drawable` is the image `Drawable`'s native handle. ImageView image drawing has no draw consumer
-/// yet (the layered-drawable bitmap raster + composite for an ImageView's image is deferred), so this
-/// validates the `widget` handle through the bounds+generation-checked [`view_registry`] (a bad handle
-/// is logged + ignored, never UB) and no-ops. When the ImageView image raster lands, the `drawable`
-/// handle is recorded on the peer here.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn image_view_set_drawable<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -8890,28 +5597,7 @@ extern "system" fn image_view_set_drawable<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.widget.ImageView`'s peer natives.
-///
-/// `native_constructor` (same `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as
-/// View's/TextView's) reuses the class-agnostic [`view_native_constructor`], which records the
-/// receiver's actual class (`android.widget.ImageView`) in [`view_registry`]. Registered before step 4,
-/// alongside the View/TextView natives, because ART resolves natives per declaring class.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It does
-/// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
-/// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_image_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: per-method best-effort (via `register_class_natives_best_effort`) so a single entry
-    // the shipped dex disagrees with is a deferred call-time UnsatisfiedLinkError on that method, not a
-    // fatal whole-class abort taking the lifecycle-critical `native_constructor` down (the 58a50f6
-    // class of bug).
-    // SAFETY: `view_native_constructor` matches the paired
-    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` instance native (shared with
-    // View/TextView native_constructor, ImageView.java line 208); `image_view_set_scale_type` matches
-    // the paired `(JI)V` instance native (ImageView.java line 210); `image_view_set_drawable` matches
-    // the paired `(JJ)V` instance native (ImageView.java line 209; both surfaced by multitouch.test's
-    // ImageView, run log 2026-06-05).
     let bindings: [NativeBinding; 3] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
@@ -8938,37 +5624,11 @@ fn register_image_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-/// `android.widget.ImageButton` (internal/slashed name) — re-resolves `native_constructor` per class.
-///
-/// 2026-06-05: AppCompat's `Toolbar` builds an `AppCompatImageButton` (extends `ImageButton extends
-/// ImageView`) for its navigation button; ART resolved `native_constructor` against the `ImageButton`
-/// class (`No implementation found for long android.widget.ImageButton.native_constructor(Context,
-/// AttributeSet)`, run log 2026-06-05). Same `(Context, AttributeSet)J` signature as View/ImageView,
-/// so it reuses the class-agnostic [`view_native_constructor`] (records `android.widget.ImageButton`).
 pub const IMAGE_BUTTON_CLASS: &JNIStr = jni_str!("android/widget/ImageButton");
 
-// 2026-06-05: `View.setOnClickListener` calls `nativeSetOnClickListener(widget)` to mark the view
-// clickable on its native peer; ART resolved it against the ImageButton class (`No implementation
-// found for void android.widget.ImageButton.nativeSetOnClickListener(long)`, run log 2026-06-05, the
-// Toolbar nav button). Instance native, descriptor `(J)V`. The handler marks the peer clickable in
-// [`view_registry`] — the renderer's hit-test targets clickable views and dispatches
-// `View.performClick()` (the minimal click path; see [`image_button_set_on_click_listener`]).
 const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
 const IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
 
-/// `View.nativeSetOnClickListener(long widget)` → mark the view clickable on its [`view_registry`]
-/// peer (2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void. `widget` is the view's [`view_registry`] handle.
-/// Android calls this from `View.setOnClickListener` to mark the native peer clickable; Eclipse
-/// records `clickable = true` on the peer through the bounds+generation-checked [`view_registry`] (a
-/// bad handle is logged + ignored, never UB). The renderer's hit-test then targets this view on a
-/// pointer click and dispatches `View.performClick()` to it (the minimal click path, 2026-06-05);
-/// full `MotionEvent`/`InputQueue` touch+move+key dispatch is the documented follow-up. Surfaced
-/// 2026-06-05 by AppCompat's Toolbar setting its navigation button's click listener.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn image_button_set_on_click_listener<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -8993,21 +5653,6 @@ extern "system" fn image_button_set_on_click_listener<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `View.nativeSetOnTouchListener(long)` / `View.nativeSetOnLongClickListener(long)` → validate the
-/// [`view_registry`] handle + headless no-op (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void; `widget` is the view's [`view_registry`] handle.
-/// `View.setOnTouchListener`/`setOnLongClickListener` (View.java lines 1151/1444) call this then store
-/// the listener object in a View Java field — Eclipse is headless (no GTK signal wiring), so the
-/// listener lives Java-side and the engine/input path dispatches to it; the native only has to exist,
-/// confirm the peer handle is live, and not throw. It deliberately does NOT mark the peer `clickable`
-/// (that flag gates only the click hit-test; touch/long-click dispatch is owned by the engine input
-/// path, the documented follow-up). A stale/fabricated handle is logged + ignored, never UB, via the
-/// bounds+generation-checked [`view_registry::with_view`]. Shared by both natives since neither carries
-/// the listener object in its signature (only the handle), so their backing is identical.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn view_set_input_listener<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -9032,49 +5677,7 @@ extern "system" fn view_set_input_listener<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.widget.ImageButton`'s peer natives.
-///
-/// `native_constructor` reuses the class-agnostic [`view_native_constructor`] (records the receiver's
-/// actual class in [`view_registry`]); `nativeSetOnClickListener` marks the peer clickable in
-/// [`view_registry`] (the renderer's hit-test target); `native_setDrawable` reuses the class-agnostic
-/// [`image_view_set_drawable`] (validated no-op — ImageButton RE-declares ImageView's native; see the
-/// dated 2026-07-02 comment in the body). Registered before step 4, alongside the View/ImageView
-/// natives, because ART resolves natives per declaring class. This covers ImageButton's WHOLE declared
-/// native surface (3/3 — installed classes3.dex ImageButton.smali :36/:39/:42, baksmali audit
-/// 2026-07-02); the installed dex's `ImageButton.native_setScaleType(JI)V` is a PLAIN Java
-/// `return-void` override (smali :45, NOT a native — absent from the vendored ImageButton.java), so it
-/// can never ULE on ImageButton and must NOT be registered (a non-native entry fails per-method
-/// best-effort with a per-boot WARN).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — `view_native_constructor` is the exact `(Context, AttributeSet)J` instance native,
-/// `image_button_set_on_click_listener` the `(J)V` instance native, and `image_view_set_drawable` the
-/// `(JJ)V` instance native. Each body is `catch_unwind`-guarded via [`EnvUnowned::with_env`]
-/// (AGENTS.md §2.8).
 fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: per-method best-effort so a shipped-dex drift on any entry is a deferred call-time
-    // UnsatisfiedLinkError on that method, not a fatal whole-class abort (the 58a50f6 class of bug).
-    // 2026-07-02: native_setDrawable(JJ)V added — ImageButton RE-declares ImageView's native (installed
-    // classes3.dex ImageButton.smali:42) and ART resolves natives per DECLARING class, so ImageView's
-    // own bound copy does not cover it: the 2026-07-03 challenge14 boot's ONLY ULE (`No implementation
-    // found for void android.widget.ImageButton.native_setDrawable(long, long)`,
-    // /tmp/eclipse-challenge14.log lines 1165–1184; Toolbar.setNavigationIcon →
-    // AppCompatImageButton.setImageDrawable → ImageView.setImageDrawable:38, virtually dispatched onto
-    // the ImageButton subclass — the 2026-06-13 WebView.native_constructor subclass-redeclaration
-    // pattern). The binding reuses the class-agnostic [`image_view_set_drawable`] verbatim under the
-    // shared IMAGE_VIEW_SET_DRAWABLE_NAME/SIG consts (the view_native_constructor const-sharing shape):
-    // the native is a display-side peer notification with NO Java read-back (the `drawable` field is
-    // iput BEFORE the call and is the sole getDrawable() source), so the validated no-op is honest.
-    // ImageButton calls trace under the "android.widget.ImageView" target (class-agnostic message —
-    // the tolerated label mismatch of the View.nativeSetOnClickListener reuse precedent; the registry
-    // peer + this registration line carry the ImageButton identity).
-    // SAFETY: `view_native_constructor` matches the paired
-    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` instance native (shared with
-    // View/ImageView native_constructor; ImageButton.smali:39); `image_button_set_on_click_listener`
-    // matches the paired `(J)V` instance native (ImageButton.smali:36; constructor + click listener
-    // both surfaced by the run lines 2026-06-05); `image_view_set_drawable` matches the paired `(JJ)V`
-    // instance native (ImageButton.smali:42, the 2026-07-03 challenge14 ULE).
     let bindings: [NativeBinding; 3] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
@@ -9086,8 +5689,6 @@ fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
             IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG,
             image_button_set_on_click_listener as *mut c_void,
         ),
-        // `image_view_set_drawable` is the class-agnostic `(JJ)V` instance native (validated no-op);
-        // bound here for ImageButton's re-declaration — see the dated 2026-07-02 comment above.
         (
             IMAGE_VIEW_SET_DRAWABLE_NAME,
             IMAGE_VIEW_SET_DRAWABLE_SIG,
@@ -9103,45 +5704,9 @@ fn register_image_button_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.view.SurfaceView native peer construction =========
-//
-// 2026-06-13: Roblox's `ActivityNativeMain.onCreate` → `d1()` → `LayoutInflater.inflate` constructs
-// `com.roblox.client.RBXSurfaceView` (extends `android.view.SurfaceView`), surfacing the live boot's
-// `No implementation found for long android.view.SurfaceView.native_constructor(Context, AttributeSet)`
-// (commit 95f964c). `SurfaceView.java` line 40 `@Override protected native long native_constructor(
-// Context, AttributeSet);` — SurfaceView RE-declares View's constructor, and ART resolves natives per
-// declaring class, so it MUST get its own RegisterNatives binding on `android/view/SurfaceView` (it is
-// NOT inherited from the View-class binding). Same `(Context, AttributeSet)J` signature as
-// View/TextView/ImageView, so it reuses the class-agnostic [`view_native_constructor`], which records
-// the receiver's ACTUAL class (`com.roblox.client.RBXSurfaceView`) in [`view_registry`] and returns a
-// real slab handle ≥ 1 (never the reserved 0). That makes `View.widget` (View.java line 965) non-zero,
-// which SurfaceView copies into `mSurface.widget` (SurfaceView.java lines 18/24) so `Surface.isValid()`
-// holds. Records view-tree metadata only — no GTK, no layout/draw, no surface (the SurfaceHolder
-// surface → host `ANativeWindow` render-integration is the deferred next-workflow step).
-
-/// `android.view.SurfaceView` (internal/slashed name) — re-declares `native_constructor` per class.
 pub const SURFACE_VIEW_CLASS: &JNIStr = jni_str!("android/view/SurfaceView");
 
-/// Bind Eclipse's own (non-GTK) backing for `android.view.SurfaceView`'s peer natives.
-///
-/// `native_constructor` (SurfaceView.java line 40, same `(Landroid/content/Context;Landroid/util/
-/// AttributeSet;)J` signature as View's, `@Override`) reuses the class-agnostic
-/// [`view_native_constructor`], which records the receiver's actual class
-/// (`com.roblox.client.RBXSurfaceView`) in [`view_registry`]. Registered before step 4, alongside the
-/// other per-class View-subclass natives, because ART resolves natives per declaring class and
-/// SurfaceView re-declares the constructor — so it needs its own binding before `LayoutInflater` runs.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It does
-/// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
-/// instance native. The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_surface_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: per-method best-effort (one entry) so a shipped-dex drift on this class is a deferred
-    // call-time UnsatisfiedLinkError, not a fatal whole-class abort (the 58a50f6 class of bug).
-    // SAFETY: `view_native_constructor` matches the paired
-    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
-    // (shared with View/TextView/ImageView native_constructor; SurfaceView.java line 40 @Override,
-    // surfaced by the live boot 2026-06-13).
     let bindings: [NativeBinding; 1] = [(
         VIEW_NATIVE_CONSTRUCTOR_NAME,
         VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -9156,58 +5721,6 @@ fn register_surface_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for the inflatable android.widget.* View subclasses ==========
-//
-// 2026-06-13: ART resolves natives PER DECLARING CLASS, and `android.view.View`'s
-// `native_constructor(Context, AttributeSet)` (View.java line 1166) is RE-declared verbatim by every
-// concrete `android.widget.*` View subclass the vendored ATL ships (each carries its own
-// `protected native long native_constructor(Context context, AttributeSet attrs);`). So the
-// `register_view_natives` binding on `android/view/View` does NOT satisfy them — each subclass that
-// `LayoutInflater` instantiates needs the shared `view_native_constructor` registered on its OWN class
-// before step 4 runs, or `LayoutInflater.inflate` throws `UnsatisfiedLinkError`. Roblox's
-// `ActivityNativeMain` content layout walked into this one class at a time (SurfaceView, then
-// `ProgressBar`, …); binding the whole set the overlay declares `native_constructor` on, in one pass,
-// stops the one-per-boot discovery churn for these widgets. Surfaced concretely by the live boot of
-// commit 2194f02 (`No implementation found for long android.widget.ProgressBar.native_constructor(
-// android.content.Context, android.util.AttributeSet)` at `LayoutInflater.inflate`).
-//
-// ONLY `native_constructor` is bound here. Each class also declares its own extra natives (e.g.
-// `ProgressBar.native_setProgress`, SeekBar's, …) — those stay UNBOUND on purpose so the next real
-// layout/draw trip surfaces them one at a time (the deliberate loud discovery signal, exactly as
-// `register_surface_view_natives` omits `native_createSnapshot`/`native_postSnapshot`).
-// `View.native_destructor(long)` is declared on View and NOT re-declared by any of these (View.java
-// line 1168), so the single `register_view_natives` binding covers destruction for all of them by
-// inheritance — no per-class destructor binding is needed.
-//
-// Caveats verified against the vendored ATL overlay (`vendor/atl/src/api-impl/android/widget/`):
-//   * Each class below declares `native_constructor(Context, AttributeSet)J` DIRECTLY on itself
-//     (Button.java:39, EditText.java:24, ProgressBar.java:49, CheckBox.java:19, RadioButton.java:17,
-//     SeekBar.java:17, Spinner.java:26, ScrollView.java:18) — so `RegisterNatives` finds the method
-//     (a class that only inherited it would NoSuchMethodError). All eight share the exact
-//     `VIEW_NATIVE_CONSTRUCTOR_SIG`, so the class-agnostic `view_native_constructor` is the backing.
-//   * `CompoundButton` is ABSTRACT (CompoundButton.java:9), so LayoutInflater cannot instantiate it —
-//     excluded; its concrete subclasses CheckBox/RadioButton re-declare the native and ARE bound.
-//   * The abstract layout parents `AbsSeekBar`/`AbsSpinner`/`AdapterView` do NOT declare
-//     `native_constructor`; the concrete leaves SeekBar/Spinner re-declare it and are the inflatable
-//     entry points — bound here.
-//   * `PopupWindow` is excluded: its `native_constructor` is ZERO-ARG `()J` (PopupWindow.java:177) and
-//     it is NOT a View — pointing it at the shared `(Context, AttributeSet)J` body would be both wrong
-//     arity and wrong type. It gets its own distinct body if/when it traps.
-//   * 2026-07-02: `android/webkit/WebView` is deliberately NOT in this array — it re-declares the same
-//     `(Context, AttributeSet)J` constructor (the challenge9 ULE) but ALSO carries load natives
-//     (`native_loadUrl`/`native_loadDataWithBaseURL`) this constructor-only array shape cannot host,
-//     so it is bound by its own `register_web_view_natives`; see the pin test.
-
-/// Internal/slashed class names of the concrete, LayoutInflater-instantiable `android.widget.*` View
-/// subclasses that RE-declare `native_constructor(Context, AttributeSet)J` and therefore each need the
-/// shared `view_native_constructor` bound on their own class (ART resolves natives per declaring class).
-///
-/// Kept as one list (not one fn per class) because every entry binds the identical class-agnostic
-/// backing — the shared body already records the receiver's ACTUAL class, so per-class functions would
-/// be pure boilerplate. Each name is verified to declare the 2-arg `native_constructor` directly (see
-/// the section comment); `register_view_subclass_constructor_natives` binds exactly this set, and
-/// `view_subclass_constructor_classes_are_slashed_internal_names` pins it so a dropped class fails CI.
-// Internal/slashed class names (single source of truth, reused by `register_widget_property_setter_natives`).
 pub const BUTTON_CLASS: &JNIStr = jni_str!("android/widget/Button");
 pub const EDIT_TEXT_CLASS: &JNIStr = jni_str!("android/widget/EditText");
 pub const PROGRESS_BAR_CLASS: &JNIStr = jni_str!("android/widget/ProgressBar");
@@ -9228,29 +5741,8 @@ const VIEW_SUBCLASS_CONSTRUCTOR_CLASSES: &[&JNIStr] = &[
     SCROLL_VIEW_CLASS,
 ];
 
-/// Bind Eclipse's own (non-GTK) backing for the `native_constructor` of every concrete inflatable
-/// `android.widget.*` View subclass in [`VIEW_SUBCLASS_CONSTRUCTOR_CLASSES`].
-///
-/// Each class re-declares View's `native_constructor(Context, AttributeSet)J`, so the class-agnostic
-/// [`view_native_constructor`] (which records the receiver's actual class in [`view_registry`] and
-/// returns a real slab handle ≥ 1) is registered on each. Registered before step 4, alongside the
-/// other per-class View-subclass natives, because ART resolves natives per declaring class and these
-/// re-declare the constructor — so each needs its own binding before `LayoutInflater` runs.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It does
-/// — [`view_native_constructor`] is written to the exact `(Context, AttributeSet)J` descriptor as an
-/// instance native, and every class in the set declares that exact signature (verified against the
-/// vendored ATL overlay). The body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (§2.8).
 fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: per-method best-effort (single entry per class) so a class that — like the 58a50f6
-    // `setBackgroundColor(I)V` — turns out NOT to declare the native in the shipped dex cannot abort the
-    // others (it degrades to a deferred call-time UnsatisfiedLinkError on that one class only).
     for &class_name in VIEW_SUBCLASS_CONSTRUCTOR_CLASSES {
-        // SAFETY: `view_native_constructor` matches the paired
-        // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` signature as an instance native
-        // (shared with View/TextView/ImageView/SurfaceView native_constructor); each class re-declares
-        // that exact 2-arg signature (verified against the vendored ATL overlay, see the section comment).
         let bindings: [NativeBinding; 1] = [(
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -9266,51 +5758,8 @@ fn register_view_subclass_constructor_natives(env: &mut Env) -> Result<(), Frame
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.webkit.WebView ==================================
-//
-// 2026-07-02: the challenge9 boot (/tmp/eclipse-challenge9.log lines 1232–1256) died constructing
-// the rbx.web challenge fragment's WebView child: `No implementation found for long
-// android.webkit.WebView.native_constructor(android.content.Context, android.util.AttributeSet)` —
-// `View.<init>` invokes the INSTANCE `native_constructor`, which virtual-dispatches to WebView's
-// OWN re-declaration, so the `android/view/View` class registration cannot cover it (ART resolves
-// natives per DECLARING class; the 2026-06-13 subclass-constructor precedent). Audit of the
-// INSTALLED framework (baksmali of ~/.cache/eclipse/framework-patched/api-impl.jar, 2026-07-02):
-// WebView is defined ONLY in classes3.dex (no overlay shadow) and declares EXACTLY 3 natives — the
-// ONLY natives declared by ANY android/webkit class in ANY of the 3 dexes (grep-verified); the
-// vendored WebView.java declares the identical 3 (NO drift):
-//   * `native_constructor(Landroid/content/Context;Landroid/util/AttributeSet;)J` (WebView.smali
-//     :378) — the return IS `View.widget` (`iput-wide` right after the call, active classes2
-//     View.smali:720-724), read back as the first `J` arg of every subsequent View/ViewGroup
-//     native, so it must be a live [`view_registry`] handle ≥ 1: the shared class-agnostic
-//     [`view_native_constructor`] is the honest backing (records the concrete class, e.g.
-//     `com.roblox.client.hybrid.RBHybridWebView`).
-//   * `native_loadUrl(JLjava/lang/String;)V` (smali:51) + `native_loadDataWithBaseURL(JLjava/lang/
-//     String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (smali:48) — write-only in
-//     the DEX sense: invoke-direct, no move-result (the installed WebView has NO getUrl/getTitle/
-//     getProgress at all). 2026-07-03 (web-engine plan M3): both are now SPAWN-AND-FORWARD to the
-//     out-of-process `eclipse-webview` CEF helper via `crate::webview::client`, keyed by the
-//     existing view_registry widget handle; the `internalLoadChanged(int, String)` upcall target
-//     (still with zero Java invokers — it is native-fired by design, exactly ATL's reference C
-//     shape) is fired for driven loads by the client's socket-reader thread through
-//     [`fire_web_view_internal_load_changed`], so `WebViewClient.onPageStarted/onPageFinished`
-//     run for the first time.
-//
-// 2026-07-03 (M3 supersession note): the 2026-07-02 "validated no-op / reference-default
-// fidelity / HARD CEILING (no web engine)" dispositions for the two load natives are SUPERSEDED
-// by owner decision (a) + docs/web-engine-plan.md M3 — Eclipse now has a real out-of-process web
-// engine (CEF in the `eclipse-webview` helper; zero engine bytes in this ART process). The
-// constructor disposition is unchanged (the shared view-registry peer). When the helper is
-// absent/failed, the natives degrade to EXACTLY the pre-M3 honest one-shot-WARN no-op — never a
-// crash, never a fabricated callback.
-
-/// `android.webkit.WebView` (internal/slashed name for `find_class`) — hosts the 3 WebView natives.
 pub const WEB_VIEW_CLASS: &JNIStr = jni_str!("android/webkit/WebView");
 
-// JNI names + descriptors for the two WebView load natives, from the installed classes3.dex
-// WebView.smali (lines 51/48, baksmali 2026-07-02). Sole invokers: `WebView.loadUrl` (smali:373)
-// and `WebView.loadDataWithBaseURL` (smali:318), both invoke-direct on `this.widget`, no
-// move-result. The constructor binding reuses the shared `VIEW_NATIVE_CONSTRUCTOR_NAME`/`_SIG`
-// (WebView.smali:378 declares the identical signature).
 const WEB_VIEW_NATIVE_LOAD_URL_NAME: &JNIStr = jni_str!("native_loadUrl");
 const WEB_VIEW_NATIVE_LOAD_URL_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
 const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_NAME: &JNIStr =
@@ -9318,17 +5767,8 @@ const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_NAME: &JNIStr =
 const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG: &JNIStr =
     jni_str!("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
 
-// 2026-07-03 (web-engine plan M2): `NON_URL` + `url_scheme_and_host_for_log` (and their §6-cited
-// redaction unit test) MOVED VERBATIM to `crate::webview::redact` — the ONE canonical
-// implementation, shared into the out-of-process `eclipse-webview` helper by `#[path]` so the
-// absolute redaction rule crosses the process boundary without a second copy. Call sites here are
-// unchanged via the import below.
 use crate::webview::redact::{url_scheme_and_host_for_log, NON_URL};
 
-/// The preserved honest degradation of `WebView.native_loadUrl` — the pre-M3 no-op body's WARN
-/// shape (2026-07-03): one-shot WARN carrying the ONE actionable `reason`, debug thereafter.
-/// `target` is ALWAYS pre-redacted (scheme+host or [`NON_URL`]); `reason` strings are
-/// Eclipse-authored and payload-free by construction ([`crate::webview::client::ClientError`]).
 fn warn_load_url_unavailable(widget: jlong, target: &str, reason: &str) {
     static LOAD_URL_WARNED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -9352,9 +5792,6 @@ fn warn_load_url_unavailable(widget: jlong, target: &str, reason: &str) {
     }
 }
 
-/// The same preserved degradation for `native_loadDataWithBaseURL` (its own one-shot latch, the
-/// pre-M3 `LOAD_DATA_WARNED` shape). `base` is ALWAYS pre-redacted; the data payload is never
-/// logged at any level.
 fn warn_load_data_unavailable(widget: jlong, base: &str, reason: &str) {
     static LOAD_DATA_WARNED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -9378,11 +5815,6 @@ fn warn_load_data_unavailable(widget: jlong, base: &str, reason: &str) {
     }
 }
 
-/// Best-known `CreateView` dimensions for a WebView `widget` (2026-07-03, M3): the view's
-/// laid-out frame when it exists, else the published engine-window geometry, else the documented
-/// 1024×768 M1/M2 default (the smoke path drives loadUrl before any layout). Clamped to the
-/// protocol's `1..=u16::MAX`. No `ResizeView` wiring at M3 — challenge-rect fidelity is an M6
-/// item per the plan's recalibration recipe.
 fn web_view_create_dims(widget: jlong) -> (u16, u16) {
     fn clamp_dim(v: i32) -> u16 {
         v.clamp(1, i32::from(u16::MAX)) as u16
@@ -9400,15 +5832,6 @@ fn web_view_create_dims(widget: jlong) -> (u16, u16) {
     (1024, 768)
 }
 
-/// `WebView.native_loadUrl(long widget, String url)` → SPAWN-AND-FORWARD to the out-of-process
-/// `eclipse-webview` helper (2026-07-03, web-engine plan M3; supersedes the 2026-07-02 validated
-/// no-op — see the section note). INSTANCE native, descriptor `(JLjava/lang/String;)V`; sole
-/// invoker `WebView.loadUrl` (WebView.smali:373). The FULL url string is read once and retained
-/// ONLY for the control socket (the helper must load it) and the client's recorded
-/// `internalLoadChanged` upcall argument; every log macro binds the pre-redacted `target`
-/// ([`url_scheme_and_host_for_log`] — challenge URLs may carry session tokens). An absent/failed
-/// helper degrades to the preserved honest one-shot WARN no-op ([`warn_load_url_unavailable`]) —
-/// never a crash, never a fabricated callback.
 extern "system" fn web_view_native_load_url<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -9425,9 +5848,7 @@ extern "system" fn web_view_native_load_url<'local>(
             );
             return Ok(());
         }
-        // 2026-07-02: a failed conversion can leave a pending Java exception (GetStringUTFChars
-        // can OOM) — describe+clear it (the openAssetFd precedent) so this native stays total and
-        // never throws back into Java.
+
         let full: Option<String> = if url.is_null() {
             None
         } else {
@@ -9443,14 +5864,12 @@ extern "system" fn web_view_native_load_url<'local>(
             }
         };
         let Some(full) = full else {
-            // A null/unreadable URL has no drivable target — the preserved honest no-op.
             warn_load_url_unavailable(widget, NON_URL, "load target null/unreadable");
             return Ok(());
         };
         let target = url_scheme_and_host_for_log(&full);
         let (w, h) = web_view_create_dims(widget);
-        // 2026-07-03: get_java_vm hands the reader thread its Send JavaVM handle (runtime.rs Vm
-        // doc's recorded exception); `full` moves to the wire here and is never logged.
+
         match env.get_java_vm() {
             Ok(java_vm) => {
                 match crate::webview::client::drive_load_url(java_vm, widget, full, w, h) {
@@ -9473,20 +5892,6 @@ extern "system" fn web_view_native_load_url<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `WebView.native_loadDataWithBaseURL(long widget, String baseUrl, String data, String mime,
-/// String encoding)` → SPAWN-AND-FORWARD to the out-of-process `eclipse-webview` helper
-/// (2026-07-03, web-engine plan M3; supersedes the 2026-07-02 validated no-op — see the section
-/// note). INSTANCE native; sole invoker `WebView.loadDataWithBaseURL` (WebView.smali:318 —
-/// `loadData` routes here with baseUrl/history hardcoded `"about:blank"`, smali:238/:240, which
-/// redacts to `"<non-url>"` — correct and expected).
-///
-/// PRIVACY (2026-07-03, M3): `data` (inline challenge HTML, possibly token-bearing) is now read
-/// solely to cross the control socket (proto `LoadDataWithBaseUrl`, 8 MiB cap); it is still
-/// NEVER bound to any log macro at any level. Only the mime type + the pre-redacted baseUrl are
-/// logged. The installed dex's native carries no historyUrl argument (4 strings, smali:48); the
-/// wire's `history_url` field is forwarded empty by the client (the Java layer already hardcodes
-/// history "about:blank" on the loadData route). Null-string mappings per the Android semantics:
-/// `baseUrl` null → `"about:blank"`, `mime`/`encoding` null → empty.
 extern "system" fn web_view_native_load_data_with_base_url<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -9506,9 +5911,7 @@ extern "system" fn web_view_native_load_data_with_base_url<'local>(
             );
             return Ok(());
         }
-        // 2026-07-02: a failed try_to_string can leave a pending Java exception — describe+clear
-        // it (openAssetFd precedent) before continuing; letting it pend would make the NEXT JNI
-        // call illegal and would throw this native back into Java.
+
         let read_string = |env: &mut Env<'local>, s: &JString<'local>| -> Option<String> {
             if s.is_null() {
                 return None;
@@ -9528,8 +5931,7 @@ extern "system" fn web_view_native_load_data_with_base_url<'local>(
         let data_s = read_string(env, &data);
         let mime_s = read_string(env, &mime);
         let encoding_s = read_string(env, &encoding);
-        // The ONLY loggable form of the base URL (scheme+host, or "<non-url>" for the hardcoded
-        // about:blank route / a null base).
+
         let log_base = base
             .as_deref()
             .map(url_scheme_and_host_for_log)
@@ -9563,29 +5965,7 @@ extern "system" fn web_view_native_load_data_with_base_url<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.webkit.WebView`'s natives (2026-07-02;
-/// load natives upgraded 2026-07-03, web-engine plan M3).
-///
-/// Registered before step 4, right after the inflatable-widget constructor batch, because ART
-/// resolves natives per DECLARING class and WebView re-declares View's `native_constructor` — the
-/// challenge9 ULE (see the section note). The constructor is the shared class-agnostic
-/// [`view_native_constructor`] (registry-backed honest — the return becomes `View.widget`); the
-/// two load natives are spawn-and-forward to the out-of-process `eclipse-webview` helper
-/// (`crate::webview::client`), degrading to the preserved honest one-shot WARN no-op when the
-/// helper is unavailable (never a crash, never a fabricated callback).
-///
-/// # Safety / soundness
-/// Each fn pointer matches its declared JNI signature by construction (pin test
-/// `web_view_native_names_sigs_and_class_match_the_installed_dex`); every body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // SAFETY (per entry): each fn matches its paired descriptor from the installed classes3.dex
-    // WebView.smali (baksmali 2026-07-02) — `native_constructor`
-    // `(Landroid/content/Context;Landroid/util/AttributeSet;)J` (smali:378, instance — the shared
-    // class-agnostic view_native_constructor body), `native_loadUrl` `(JLjava/lang/String;)V`
-    // (smali:51, instance), `native_loadDataWithBaseURL`
-    // `(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V` (smali:48,
-    // instance).
     let bindings: [NativeBinding; 5] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
@@ -9602,7 +5982,6 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG,
             web_view_native_load_data_with_base_url as *mut c_void,
         ),
-        // 2026-07-09 (plan M4): the JS-bridge / evaluateJavascript surface.
         (
             WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_NAME,
             WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_SIG,
@@ -9622,17 +6001,6 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Linux-backed android.app.ActivityManager memory surface ==================================
-//
-// 2026-07-18: ATL's `getMemoryInfo(MemoryInfo outInfo)` assigned a new object only to its LOCAL
-// parameter, leaving the caller's object unchanged at `totalMem = 10_000` bytes. Current Roblox's
-// `am.a.c(Context)` divides that field by 1 MiB for its device profile / Android User-Agent, so
-// Eclipse advertised the measured impossible `0MB`. Sober's independently logged 31,663 MiB is
-// exactly this host's `/proc/meminfo` MemTotal (32,423,572 KiB) truncated to MiB, proving the source
-// of the divergence. The overlay now delegates the surface to these Rust natives; `memory` reads the
-// Linux kernel and reports Eclipse's actual ART heap cap rather than another synthetic phone.
-
-/// `android.app.ActivityManager` (internal/slashed name for `find_class`).
 pub const ACTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/app/ActivityManager");
 
 const AM_NATIVE_FILL_MEMORY_INFO_NAME: &JNIStr = jni_str!("native_fillMemoryInfo");
@@ -9659,12 +6027,6 @@ fn memory_bytes_to_jlong(bytes: u64) -> jlong {
     jlong::try_from(bytes).unwrap_or(jlong::MAX)
 }
 
-/// Fill the caller-provided `ActivityManager.MemoryInfo` object from the Linux kernel.
-///
-/// The Android low-memory-killer thresholds remain zero: Linux has no Android LMK and inventing a
-/// phone profile would be less honest than explicitly reporting the capability as unavailable. The
-/// overlay's AOSP-shaped `writeToParcel` still carries all four zero fields so current Roblox sees
-/// the correct parcel wire shape instead of rejecting the old 28-byte stub.
 extern "system" fn activity_manager_native_fill_memory_info<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -9680,9 +6042,6 @@ extern "system" fn activity_manager_native_fill_memory_info<'local>(
             return Ok(());
         };
 
-        // SAFETY: every named field is a `long` on the committed ActivityManager.MemoryInfo
-        // overlay; pairing descriptor `J` with Primitive::Long satisfies FieldSignature's invariant.
-        // `set_field` additionally checks each receiver/field at runtime.
         let long_sig = unsafe {
             FieldSignature::from_raw_parts(LONG_FIELD_SIG, JavaType::Primitive(Primitive::Long))
         };
@@ -9705,8 +6064,6 @@ extern "system" fn activity_manager_native_fill_memory_info<'local>(
             env.set_field(&out_info, field, &long_sig, JValue::Long(value))?;
         }
 
-        // SAFETY: `lowMemory` is a `boolean` field on the same committed overlay; `Z` paired with
-        // Primitive::Boolean satisfies FieldSignature's invariant, and set_field runtime-checks it.
         let boolean_sig = unsafe {
             FieldSignature::from_raw_parts(
                 BOOLEAN_FIELD_SIG,
@@ -9746,7 +6103,6 @@ extern "system" fn activity_manager_native_get_large_memory_class<'local>(
     _class: JClass<'local>,
 ) -> jint {
     env.with_env(|_env| -> jni::errors::Result<jint> {
-        // Eclipse starts one ART heap with one cap; `largeHeap` cannot enlarge it after VM startup.
         Ok(jint::try_from(memory::managed_heap_mib()).unwrap_or(jint::MAX))
     })
     .resolve::<LogErrorAndDefault>()
@@ -9769,15 +6125,7 @@ extern "system" fn activity_manager_native_is_low_ram_device<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind the four native methods declared by Eclipse's ActivityManager overlay.
-///
-/// # Safety / soundness
-/// Every pointer matches its exact static JNI descriptor, pinned by
-/// `activity_manager_memory_native_names_sigs_and_class_match_the_overlay`; all bodies use
-/// `EnvUnowned::with_env`, so a Rust panic cannot unwind across JNI.
 fn register_activity_manager_memory_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // SAFETY (per entry): each extern-system function matches its paired private-static native
-    // declaration in tools/framework-overlay/src/android/app/ActivityManager.java.
     let bindings: [NativeBinding; 4] = [
         (
             AM_NATIVE_FILL_MEMORY_INFO_NAME,
@@ -9810,42 +6158,8 @@ fn register_activity_manager_memory_natives(env: &mut Env) -> Result<(), Framewo
     Ok(())
 }
 
-// === Eclipse's own backing for android.webkit.WebSettings' User-Agent =============================
-//
-// 2026-07-16 (plan M6, the §6 2026-07-16 💥 fix): the Roblox app CALLS
-// `WebSettings.setUserAgentString(...)` — MEASURED, with the UA it hands us logged in full — and
-// ATL's implementation is an EMPTY NO-OP (`public void setUserAgentString(String) {}`,
-// vendor/atl/src/api-impl/android/webkit/WebSettings.java:18; identical `.registers 2`/`return-void`
-// in the installed dex). Eclipse therefore SILENTLY DISCARDED the app's UA and substituted its own
-// literal for four milestones. The app's string carries BOTH the `Hybrid()` and `Android` substrings
-// that the challenge page's own `nativePrefix` selector requires (§6 2026-07-16 🏆), so discarding it
-// left `nativePrefix = null` → no platform module → total bridge silence → `Load generic challenge
-// failed`, every boot. Honoring what the app sets is not impersonation: it is what a faithful runtime
-// does, and what AOSP does.
-//
-// WHY THE STORE IS IN RUST AND NOT IN SMALI STATE — the shape ATL forces (verified against the
-// installed dex, 2026-07-16): `WebSettings` declares ZERO instance fields and
-// `WebView.getSettings()` returns a FRESH THROWAWAY on every call (`new-instance` + `<init>` +
-// `return`), so the canonical `webView.getSettings().setUserAgentString(ua)` writes to an object
-// that is immediately garbage, has nowhere to store, and holds no back-reference to its WebView.
-// A Java-side field would have to be paired with a WebSettings→WebView association ATL does not
-// have. `crate::webview::client`'s process-wide store dissolves that entirely and gives ONE source
-// of truth for both units M4's byte-match contract names (what CEF sends, and what
-// `getUserAgentString()` returns) — see its `APP_USER_AGENT` docs for the recorded AOSP divergence.
-//
-// The two natives below are the WebSettings surface; the overlay's `setUserAgentString` /
-// `getUserAgentString` bodies call them (tools/framework-overlay/patch-framework.sh). The getter
-// returns NULL when the app never set one, and the overlay substitutes Eclipse's fallback literal —
-// deliberately: that keeps the fallback literal in exactly the two places it already lived (the
-// overlay smali and the helper's `engine::ECLIPSE_USER_AGENT`) instead of adding a third copy here
-// for the byte-match contract to drift against.
-
-/// `android.webkit.WebSettings` (internal/slashed name for `find_class`) — hosts the 2 UA natives.
 pub const WEB_SETTINGS_CLASS: &JNIStr = jni_str!("android/webkit/WebSettings");
 
-// JNI names + descriptors for the two overlay-declared WebSettings natives (2026-07-16;
-// patch-framework.sh appends them as `private native` and calls them `invoke-direct` from the
-// same class — the CookieManager M4 precedent).
 const WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_NAME: &JNIStr =
     jni_str!("native_setUserAgentString");
 const WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V");
@@ -9853,10 +6167,6 @@ const WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_NAME: &JNIStr =
     jni_str!("native_getUserAgentString");
 const WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_SIG: &JNIStr = jni_str!("()Ljava/lang/String;");
 
-/// `WebSettings.native_setUserAgentString(String ua)` — record the UA the app set, so the engine
-/// presents it (2026-07-16, plan M6). INSTANCE native (the receiver is the throwaway `getSettings()`
-/// instance and is deliberately unused — see the section note). AOSP's contract: a `null` or empty
-/// `ua` resets to the default; `crate::webview::client::set_app_user_agent` normalizes and logs.
 extern "system" fn web_settings_native_set_user_agent_string<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -9864,14 +6174,12 @@ extern "system" fn web_settings_native_set_user_agent_string<'local>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         if ua.is_null() {
-            // AOSP: an explicit null is a REAL call meaning "reset to the default" — never ignored.
             crate::webview::client::set_app_user_agent(None);
             return Ok(());
         }
         match read_jstring(env, &ua) {
             Some(s) => crate::webview::client::set_app_user_agent(Some(s)),
-            // Unreadable (e.g. GetStringUTFChars OOM) is NOT a null: it carries no intent, so the
-            // previously-set UA must stand rather than be silently reset to the fallback.
+
             None => tracing::warn!(
                 target: "android.webkit.WebSettings",
                 "setUserAgentString: the UA string was unreadable (exception cleared) — the \
@@ -9883,11 +6191,6 @@ extern "system" fn web_settings_native_set_user_agent_string<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `WebSettings.native_getUserAgentString() -> String` — the UA the app set, or NULL when it never
-/// set one (2026-07-16, plan M6). NULL is load-bearing: the overlay's `getUserAgentString` body
-/// substitutes Eclipse's fallback literal for it (see the section note), so this returns the app's
-/// UA or nothing — never a second copy of the fallback. Honors M4's byte-match contract by
-/// construction: the string returned here is the same store the spawn forwards to CEF.
 extern "system" fn web_settings_native_get_user_agent_string<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -9895,9 +6198,6 @@ extern "system" fn web_settings_native_get_user_agent_string<'local>(
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         match crate::webview::client::app_user_agent() {
             Some(ua) => {
-                // 2026-07-17: the app READ its WebView UA. Load-bearing for the M6 frontier — the
-                // whole `get → append → set` round-trip hinges on whether this is ever called, and
-                // this native was previously SILENT, so its absence from a log proved nothing.
                 tracing::info!(
                     target: "android.webkit.WebSettings",
                     ua = ua.as_str(),
@@ -9907,8 +6207,6 @@ extern "system" fn web_settings_native_get_user_agent_string<'local>(
                 env.new_string(ua)
             }
             None => {
-                // NULL is load-bearing (see the doc note): the overlay's Java body substitutes
-                // Eclipse's fallback literal, so the app receives that, never null.
                 tracing::info!(
                     target: "android.webkit.WebSettings",
                     "the app READ its WebView User-Agent via WebSettings.getUserAgentString BEFORE \
@@ -9923,20 +6221,7 @@ extern "system" fn web_settings_native_get_user_agent_string<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own backing for `android.webkit.WebSettings`' UA natives (2026-07-16, plan M6).
-///
-/// Registered beside [`register_web_view_natives`] and for the same reason: ART resolves natives per
-/// DECLARING class, and the app configures its WebView (`getSettings().setUserAgentString(...)`)
-/// during the lifecycle, so these must be bound before step 4.
-///
-/// # Safety / soundness
-/// Each fn pointer matches its declared JNI signature by construction (pin test
-/// `web_settings_native_names_sigs_and_class_match_the_overlay`); every body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_web_settings_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // SAFETY (per entry): each fn matches its paired descriptor from the overlay's appended
-    // declarations (patch-framework.sh) — `native_setUserAgentString` `(Ljava/lang/String;)V` and
-    // `native_getUserAgentString` `()Ljava/lang/String;`, both instance natives.
     let bindings: [NativeBinding; 2] = [
         (
             WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_NAME,
@@ -9957,51 +6242,15 @@ fn register_web_settings_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === The internalLoadChanged upcall + the __webview-test smoke driver (web-engine plan M3) =======
-
-// 2026-07-03: signature per ATL's own reference C (vendor WebView.java:38 — package-private
-// instance `void internalLoadChanged(int loadState, String url)`; JNI call_method bypasses Java
-// access, the native_measure setMeasuredDimension house precedent). The sig const is a
-// `MethodSignature` because `call_method`'s only `AsRef<MethodSignature>` impl is itself
-// (the VIEW_SET_MEASURED_DIMENSION_SIG precedent — a jni_str! sig would be rejected).
 const WEB_VIEW_INTERNAL_LOAD_CHANGED_NAME: &JNIStr = jni_str!("internalLoadChanged");
 const WEB_VIEW_INTERNAL_LOAD_CHANGED_SIG: MethodSignature<'static, 'static> =
     jni_sig!("(ILjava/lang/String;)V");
 
-// === app-facing WebView callbacks are delivered on the MAIN (UI) thread (web-engine plan M6) ====
-//
-// 2026-07-16 root cause: Eclipse delivered every app-facing WebView callback from the
-// `eclipse-webview-upcall` thread, which is ART-attached but has NO android.os.Looper — nothing
-// ever calls Looper.prepare() there. Roblox's real WebViewClient.onPageStarted/onPageFinished
-// construct a Handler (SwipeRefreshLayout.setRefreshing -> View.startAnimation -> Animation.start
-// -> new Handler()), so ATL Handler.java:197 read Looper.myLooper() == null and threw
-// "Can't create handler inside thread that has not called Looper.prepare()" — twice per boot,
-// killing BOTH real page callbacks (challenge17/18). AOSP delivers them on the UI thread, and
-// every UI thread has a Looper.
-//
-// The defect is thread AFFINITY, not Looper presence. Preparing a Looper on the upcall thread is
-// REJECTED both ways: undrained, every Handler.post the app makes vanishes SILENTLY (worse than a
-// loud throw); drained, the app still mutates the main-thread-owned view hierarchy off-main, which
-// is a data race in Eclipse's own view_registry model — the app wrote that code believing it was
-// on the UI thread. So the callback moves to the thread that HAS the Looper: main.
-
-/// One app-facing WebView callback, queued for the ART main thread. `'static` + `Send` by
-/// construction (each caller MOVES owned data in — the URL String, the retained Global, the
-/// result Sender), which is exactly why this needs NO `unsafe`. 2026-07-16.
 type MainJob = Box<dyn for<'l> FnOnce(&mut Env<'l>) + Send + 'static>;
 
-/// The ONE pending main-thread callback + the drain's lifetime flag, under one lock so the
-/// "can main still run this?" decision and the hand-off are atomic against
-/// [`retire_main_upcall_dispatch`] (no job can slip into a slot nobody will run).
-///
-/// A SLOT, not a queue, and that is a proof rather than a shortcut: the only poster
-/// ([`dispatch_webview_callback_on_main`]) BLOCKS until its job has run, so at most one job exists
-/// at any instant. There is therefore no drain loop, no message-storm budget (the
-/// [`MAIN_LOOPER_MESSAGE_BUDGET`] hazard cannot arise), and no FIFO question — the client's single
-/// upcall thread remains the one serializer for every event kind. 2026-07-16.
 struct MainDispatchSlot {
     job: Option<MainJob>,
-    /// `false` once main can no longer pump (its winit loop exited / `client::shutdown` finished).
+
     open: bool,
 }
 
@@ -10011,56 +6260,26 @@ static MAIN_DISPATCH: std::sync::Mutex<MainDispatchSlot> =
         open: true,
     });
 
-/// The `ThreadId` of the thread that ran `Looper.prepareMainLooper()` (lifecycle step 0 /
-/// [`prepare_main_looper`]) — the ONE thread in this process with a prepared `android.os.Looper`,
-/// and the one whose queue the winit loop pumps (`graphics::about_to_wait` -> [`pump_main_looper`]).
-/// AOSP calls it the UI thread; every app-facing WebView callback must be delivered on it. The
-/// `webview::client::IO_THREAD_ID` boundary-assert precedent. 2026-07-16.
 static MAIN_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
 
-/// One loud line per process when a callback could not be delivered on main (never per event).
 static MAIN_DISPATCH_DEGRADED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// How long a poster waits for main to run its job before reclaiming it and running it HERE.
-///
-/// This is NOT a tuning knob against normal contention: it is a LIVENESS ESCAPE, not a proof.
-/// 2026-07-16 (corrected same day — the first draft of this comment claimed the deadline "must
-/// EXCEED every legitimate main-thread block, and it does". That is FALSE, and a future reader
-/// must not conclude this branch is unreachable): main has genuinely unbounded blocks — the
-/// renderer's `wait_for_fences`/`acquire_next_image` use `u64::MAX` and a FIFO swapchain on an
-/// occluded/withheld-frame-callback surface can park `RedrawRequested` indefinitely (Wayland
-/// permits withholding `wl_surface.frame`), and one [`drive_main_messages`] batch bounds message
-/// COUNT ([`MAIN_LOOPER_MESSAGE_BUDGET`]) not DURATION, so several app messages each taking
-/// `cookie_get_blocking`'s 5 s cap exceed this on their own. When it fires the job is reclaimed and
-/// run on the Looper-less caller — honest, never dropped, and loudly warned, but it IS the
-/// pre-2026-07-16 delivery (the app's own `new Handler()` will throw again). The durable class-level
-/// fix is an `EventLoopProxy` wake for the externally-pumped main queue; worker `nativeWake` is now
-/// fully backed, but a main-queue wake still cannot interrupt winit. Note the case where main is
-/// INSIDE the job (app code parked in a 5 s
-/// getCookie) is NOT this branch: main has already taken the job, so the reclaim finds nothing and
-/// the poster waits unbounded — correct, and it terminates when main finishes.
 const MAIN_DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Where one app-facing WebView callback must run. PURE, so plain `cargo test` pins the ladder
-/// with no JVM (the `eval_drain_victims` / `main_looper_poll_should_yield` house precedent).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MainDispatchGate {
-    /// Post to main and block — the AOSP-correct delivery.
     Post,
-    /// Already ON the UI thread: run here. NOT a degradation — this IS the contract.
+
     InlineOnMainThread,
-    /// No main Looper was ever prepared: there is no UI thread to be wrong about.
+
     InlineNoMainLooper,
-    /// Main will never pump again (teardown): parking would hang; running here is the honest
-    /// pre-2026-07-16 delivery. Never a DROPPED callback (fire-exactly-once, the 2026-07-09 fix).
+
     InlineDrainRetired,
-    /// The slot is occupied — a second concurrent poster, which the blocking contract forbids.
-    /// Degrade loudly rather than lose either job.
+
     InlineSlotBusy,
 }
 
-/// 2026-07-16: on-main wins FIRST (running there is the contract, not a degradation).
 fn main_dispatch_gate(
     on_main_thread: bool,
     main_looper_prepared: bool,
@@ -10082,28 +6301,6 @@ fn main_dispatch_gate(
     MainDispatchGate::Post
 }
 
-/// 2026-07-16 (the confirmed challenge17/18 root fix): run one app-facing WebView callback on the
-/// ART MAIN thread — the thread that ran `Looper.prepareMainLooper` (step 0) and whose queue
-/// [`pump_main_looper`] drains from winit's `about_to_wait` — and BLOCK until it has run. Returns
-/// the job's value, or `None` if the job panicked.
-///
-/// BLOCKING is deliberate and load-bearing, twice over:
-///  - it keeps every `fire_*`'s return value meaning EXACTLY "the app's Java callback completed",
-///    never "a message was enqueued" — the pinned `__webview-test` "upcalls 2/2" marker depends on
-///    that; and
-///  - it keeps `webview::client`'s single upcall thread the ONE serializer, so global FIFO across
-///    every event kind is unchanged even though `UpcallEvent::BridgeCall` still runs there (its
-///    AOSP thread identity is already correct — see that arm). In particular the recorded
-///    load-bearing order "a BridgeCall received before a ViewClosed still finds its registry
-///    entry" holds BY CONSTRUCTION.
-///
-/// Deadlock-free (verified 2026-07-16): the caller is never the reader thread (client.rs's
-/// contract, fail-fast in `cookie_get_blocking`) and never main (the gate). App code on main may
-/// synchronously re-enter the BLOCKING `CookieManager.getCookie`, which parks MAIN on a reply only
-/// the reader delivers (a channel send with NO JNI and no upcall involvement) — the reader is
-/// always free, so main always makes progress and this caller unparks. `client::shutdown` is the
-/// one place main would join this thread; it PUMPS while joining (client.rs, 2026-07-16) so that
-/// edge cannot close either.
 fn dispatch_webview_callback_on_main<R: Send + 'static>(
     java_vm: &JavaVM,
     what: &'static str,
@@ -10117,8 +6314,7 @@ fn dispatch_webview_callback_on_main<R: Send + 'static>(
     let current = std::thread::current().id();
     let on_main = MAIN_THREAD_ID.get() == Some(&current);
     let prepared = MAIN_THREAD_ID.get().is_some();
-    // One lock: read `open` + `job.is_none()` and hand the job over ATOMICALLY against
-    // `retire_main_upcall_dispatch`. NO JNI runs under this lock, ever.
+
     let gate = match MAIN_DISPATCH.lock() {
         Ok(mut slot) => {
             let g = main_dispatch_gate(on_main, prepared, slot.open, slot.job.is_none());
@@ -10127,7 +6323,7 @@ fn dispatch_webview_callback_on_main<R: Send + 'static>(
             }
             g
         }
-        // Poisoned: degrade like a retired drain — run it here rather than lose it.
+
         Err(_) => MainDispatchGate::InlineDrainRetired,
     };
 
@@ -10142,22 +6338,17 @@ fn dispatch_webview_callback_on_main<R: Send + 'static>(
     match rx.recv_timeout(MAIN_DISPATCH_DEADLINE) {
         Ok(r) => Some(r),
         Err(_) => match MAIN_DISPATCH.lock().ok().and_then(|mut s| s.job.take()) {
-            // We won the claim => main NEVER took it and is not pumping. Nothing else holds it:
-            // run it here, loudly. Exactly-once holds — the take is the claim.
             Some(job) => {
                 warn_main_dispatch_degraded(what, gate);
                 run_main_job_here(java_vm, job);
                 rx.recv().ok()
             }
-            // Main won the claim => it is INSIDE the job (e.g. app code parked in the 5 s
-            // getCookie). Never double-run: wait it out. Terminates unconditionally — the job
-            // either sends or its Sender drops.
+
             None => rx.recv().ok(),
         },
     }
 }
 
-/// Run one job on THIS thread (the `fire_string_callback_global` attach + catch_unwind shape).
 fn run_main_job_here(java_vm: &JavaVM, job: MainJob) {
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         match std::panic::catch_unwind(AssertUnwindSafe(|| job(env))) {
@@ -10182,12 +6373,6 @@ fn warn_main_dispatch_degraded(what: &'static str, gate: MainDispatchGate) {
     }
 }
 
-/// Run the pending app-facing WebView callback on THIS (main) thread, if any. Called from
-/// [`run_main_looper_once`] INSIDE the pump's re-entrancy guard and `catch_unwind`, immediately
-/// BEFORE [`drive_main_messages`] — so the app's own `new Handler().post(...)` continuation (the
-/// real shape: startAnimation -> Animation.start -> new Handler().post) dispatches in the SAME
-/// UI-thread turn, exactly as on AOSP. The job is taken OUT of the lock before it runs: it is real
-/// app code that re-enters the WebView natives freely. 2026-07-16.
 fn run_pending_main_upcall(env: &mut Env) {
     let job = match MAIN_DISPATCH.lock() {
         Ok(mut slot) => slot.job.take(),
@@ -10198,13 +6383,6 @@ fn run_pending_main_upcall(env: &mut Env) {
     }
 }
 
-/// The main thread will no longer pump: close the dispatch slot and run whatever is still pending
-/// HERE, on main, with the main Looper still prepared. Atomic against posters (flag + slot under
-/// one lock); a poster that observes the closed slot runs its job inline instead (loudly logged) —
-/// never dropped, because the ValueCallback contract is fire-EXACTLY-once (the 2026-07-09 drain
-/// fix). Idempotent. Callers: `graphics::run_windowed` the instant `run_app` returns, and
-/// `webview::client::shutdown` after it has joined the upcall thread. The `&Vm` borrow is the
-/// type-level proof this is main (`Vm` is `!Send`/`!Sync`, compile_fail-pinned). 2026-07-16.
 pub fn retire_main_upcall_dispatch(vm: &Vm) {
     let job = match MAIN_DISPATCH.lock() {
         Ok(mut slot) => {
@@ -10218,37 +6396,17 @@ pub fn retire_main_upcall_dispatch(vm: &Vm) {
     if raw.is_null() {
         return;
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
-    // by the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton). Identical to
-    // `pump_main_looper`'s wrap on this same thread.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     run_main_job_here(&java_vm, job);
 }
 
-/// Fire `WebView.internalLoadChanged(state, url)` on the Java object recorded for `widget` —
-/// the previously-dead seam, now driven by the webview client's socket-reader thread for DRIVEN
-/// loads only (2026-07-03, plan M3). Returns `true` iff the Java dispatch completed (the
-/// `__webview-test` "upcalls 2/2" evidence).
-///
-/// Threading (2026-07-16, web-engine M6 root fix): called from the `eclipse-webview-upcall` thread
-/// (2026-07-09 fix: app-code upcalls moved off the socket-reader thread so a blocking round-trip
-/// from app code — e.g. a synchronous `getCookie` inside `onPageFinished` — cannot self-deadlock
-/// the io loop), but the Java dispatch itself is handed to the ART **MAIN (UI) thread** via
-/// [`dispatch_webview_callback_on_main`] and this function BLOCKS until it has run. That is AOSP's
-/// contract for `onPageStarted`/`onPageFinished` (Chromium's `WebViewContentsClientAdapter` calls
-/// them on the UI thread; only `shouldInterceptRequest` is documented non-UI), and it is why the
-/// returned `bool` still means "the app's Java callback completed" — never "a message was
-/// enqueued". Before this fix the dispatch ran on the Looper-less upcall thread and the app's own
-/// `new Handler()` threw (challenge17/18, twice per boot). `url` is the REAL driven URL: it is the
-/// app's own Java contract argument (ATL's reference C passes the real URI) and is NEVER bound to a
-/// log macro here — every failure log binds only `widget` + `state`.
 pub fn fire_web_view_internal_load_changed(
     java_vm: &JavaVM,
     widget: jlong,
     state: i32,
     url: &str,
 ) -> bool {
-    // The URL is OWNED by the job (`MainJob` is 'static) and is still NEVER bound to a log macro.
     let url = url.to_string();
     let fired = dispatch_webview_callback_on_main(
         java_vm,
@@ -10269,14 +6427,7 @@ pub fn fire_web_view_internal_load_changed(
             }
         },
     );
-    // 2026-07-16: `None` == the job never produced a value — it panicked (caught at the dispatch
-    // boundary) or the JVM attach failed. Pre-2026-07-16 this function wrapped the whole
-    // `attach_current_thread` and warned on ANY `Err`, including those two; moving the body into a
-    // job put the inner warn inside the closure, which covers only `fire_internal_load_changed_inner`'s
-    // `Err`. Restore the lost diagnostic here so a silent 0/2 can never be unexplained: without it
-    // the `__webview-test` marker or a challenge log just shows a missing callback with no reason.
-    // (Release is `panic = "abort"`, so the panic half is a debug/dev-host-boot diagnostic — which
-    // is exactly where the live boots run.) URL still NEVER bound to a log macro.
+
     match fired {
         Some(fired) => fired,
         None => {
@@ -10292,10 +6443,6 @@ pub fn fire_web_view_internal_load_changed(
     }
 }
 
-/// The upcall body on the attached MAIN thread (2026-07-16). The registry lock is held ONLY to create a
-/// local ref of the recorded global (one JNI call — the `with_jobject` lock contract); the Java
-/// dispatch itself runs OUTSIDE the lock, because `onPageStarted`/`onPageFinished` is app code
-/// that may synchronously re-enter WebView natives (→ the registry).
 fn fire_internal_load_changed_inner(
     env: &mut Env,
     widget: jlong,
@@ -10318,7 +6465,7 @@ fn fire_internal_load_changed_inner(
                 );
                 return Ok(false);
             }
-            // A valid handle with no recorded jobject: never fabricate a callback.
+
             Ok(None) => {
                 tracing::debug!(
                     target: "android.webkit.WebView",
@@ -10352,34 +6499,17 @@ fn fire_internal_load_changed_inner(
         .v()
     }) {
         Ok(()) => Ok(true),
-        // `checked` already described+cleared the throw and logged the step name (no URL bound).
+
         Err(_) => Ok(false),
     }
 }
 
-/// Dev-host `__webview-test` smoke driver (2026-07-03, plan M3): register the WebView natives
-/// (prints the live `bound=3` registration line the milestone guard pins), construct a minimal
-/// REAL `android.webkit.WebView` from the installed framework, wire it into `view_registry`
-/// exactly as production does (global ref + `View.widget`), attach a real `WebViewClient` (so
-/// the upcall executes the REAL Java dispatch into `onPageStarted`/`onPageFinished`, not a
-/// null-client no-op), then call the Java `WebView.loadUrl(String)` — exercising the FULL
-/// production entry: installed-dex Java → registered native → spawn-and-forward. Returns the
-/// `view_registry` handle for the caller's `webview::client` observation polls.
-///
-/// MUST be called on the process main thread with the booted [`Vm`] (the
-/// [`drive_application_lifecycle`] threading/panic contract).
 #[derive(Clone, Copy)]
 enum DirectWebViewMode {
     Smoke,
     RobloxLogin,
 }
 
-/// Open Roblox's first-party HTTPS login page in Eclipse's production WebView profile.
-///
-/// This deliberately creates an ordinary WebView with a stock `WebViewClient`: unlike the smoke
-/// harness it exposes no test JavaScript interface. The helper uses the same persistent cookie
-/// profile as Android's `CookieManager`, so a login completed by the owner remains first-party and
-/// can be observed naturally on the next app boot. No credential or challenge URL is logged.
 pub fn drive_roblox_web_login(vm: &Vm) -> Result<jlong, FrameworkError> {
     drive_direct_webview(
         vm,
@@ -10401,8 +6531,7 @@ fn drive_direct_webview(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
-    // by the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton).
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| direct_webview_inner(env, url, mode))) {
@@ -10418,37 +6547,28 @@ fn direct_webview_inner(
     mode: DirectWebViewMode,
 ) -> Result<jlong, FrameworkError> {
     register_web_view_natives(env)?;
-    // 2026-07-09 (plan M4): the __webview-test cookie leg needs the CookieManager natives bound.
+
     register_cookie_manager_natives(env)?;
     let class = checked(env, "find_class android.webkit.WebView", |env| {
         env.find_class(WEB_VIEW_CLASS)
     })?;
-    // 2026-07-03: AllocObject deliberately BYPASSES the constructor chain — this harness has no
-    // android.content.Context to satisfy View.<init>, and the production widget wiring
-    // (native_constructor → the `View.widget` iput) is replaced by the explicit allocate +
-    // set_field below (the same registry peer shape production records).
+
     let webview = checked(env, "AllocObject android.webkit.WebView", |env| {
         env.alloc_object(&class)
     })?;
     let handle =
         view_registry::allocate("android.webkit.WebView").map_err(FrameworkError::ViewRegistry)?;
-    // The upcall path resolves the recorded global ref (with_jobject), so this is load-bearing.
+
     let global = env.new_global_ref(&webview)?;
     view_registry::set_jobject(handle, global).map_err(FrameworkError::ViewRegistry)?;
-    // View.widget = handle: the installed dex's loadUrl passes this.widget as the native's
-    // first J arg (View.java:965 per the destructor doc).
-    // SAFETY: `widget` is a `long` field of android.view.View, so the "J" signature paired with
-    // JavaType::Long is consistent — FieldSignature::from_raw_parts' invariant; set_field
-    // re-checks the value type at runtime.
+
     let long_sig = unsafe {
         FieldSignature::from_raw_parts(jni_str!("J"), JavaType::Primitive(Primitive::Long))
     };
     checked(env, "WebView.widget=", |env| {
         env.set_field(&webview, jni_str!("widget"), &long_sig, handle.into())
     })?;
-    // The smoke uses EclipseWebViewClientProbe because its callbacks assert main-thread delivery.
-    // The real login uses the stock client and exposes no probe-only behavior to first-party web
-    // content.
+
     let (client_class_name, client_step) = match mode {
         DirectWebViewMode::Smoke => (
             jni_str!("android/webkit/EclipseWebViewClientProbe"),
@@ -10475,7 +6595,6 @@ fn direct_webview_inner(
         .v()
     })?;
     if matches!(mode, DirectWebViewMode::Smoke) {
-        // The test-only bridge is never registered on the first-party login view.
         let probe_class = checked(env, "find_class EclipseBridgeProbe", |env| {
             env.find_class(jni_str!("android/webkit/EclipseBridgeProbe"))
         })?;
@@ -10493,7 +6612,7 @@ fn direct_webview_inner(
             .v()
         })?;
     }
-    // The PRODUCTION entry: installed-dex Java loadUrl → the registered native → the client.
+
     let jurl = env.new_string(url)?;
     checked(env, "WebView.loadUrl", |env| {
         env.call_method(
@@ -10517,37 +6636,25 @@ fn direct_webview_inner(
     Ok(handle)
 }
 
-// --- __webview-test M4 drive helpers (evaluateJavascript / cookie legs) ---------------------------
-//
-// These run ONLY from `__webview-test` (dev-host). They drive the REAL Java methods so the full
-// native paths are exercised: WebView.evaluateJavascript → native → client → helper → reader →
-// ValueCallback; CookieManager.getInstance().getCookie/setCookie → native → client → helper.
-
-/// `android.webkit.EclipseBridgeProbe` (the test-only overlay class: the `@JavascriptInterface`
-/// `echo` target AND a `ValueCallback` recorder into `static last` / `static lastValue`).
 const ECLIPSE_BRIDGE_PROBE_CLASS: &JNIStr = jni_str!("android/webkit/EclipseBridgeProbe");
 
-/// A `FieldSignature` for a `java.lang.Object` reference field.
 fn object_field_sig() -> FieldSignature<'static> {
-    // SAFETY: "Ljava/lang/Object;" is a valid reference-field descriptor paired with JavaType::Object.
     unsafe { FieldSignature::from_raw_parts(jni_str!("Ljava/lang/Object;"), JavaType::Object) }
 }
 
-/// Drive `WebView.evaluateJavascript(script, probe)` through the Java native path (resetting the
-/// probe's `lastValue` static first). The async result is polled via [`read_probe_last_value`].
 pub fn webview_evaluate(vm: &Vm, widget: jlong, script: &str) -> Result<(), FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live process VM (non-null, kept alive by `&Vm`) — `from_raw`'s contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), FrameworkError> {
             let probe_class = checked(env, "find EclipseBridgeProbe", |env| {
                 env.find_class(ECLIPSE_BRIDGE_PROBE_CLASS)
             })?;
-            // Reset the recorder.
+
             checked(env, "reset lastValue", |env| {
                 env.set_static_field(
                     &probe_class,
@@ -10586,25 +6693,22 @@ pub fn webview_evaluate(vm: &Vm, widget: jlong, script: &str) -> Result<(), Fram
     })
 }
 
-/// Read `EclipseBridgeProbe.lastValue.toString()` (the recorded evaluateJavascript/cookie-callback
-/// result); `None` while it is still null.
 pub fn read_probe_last_value(vm: &Vm) -> Option<String> {
     read_probe_object_field(vm, jni_str!("lastValue"))
 }
 
-/// Read `EclipseBridgeProbe.last` (the recorded bridge `echo` arg); `None` while still null.
 pub fn read_probe_last(vm: &Vm) -> Option<String> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return None;
     }
-    // SAFETY: live process VM (non-null, `&Vm`-bound).
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm
         .attach_current_thread(|env: &mut Env| -> Result<Option<String>, FrameworkError> {
             match std::panic::catch_unwind(AssertUnwindSafe(|| -> Option<String> {
                 let class = env.find_class(ECLIPSE_BRIDGE_PROBE_CLASS).ok()?;
-                // SAFETY: "Ljava/lang/String;" reference-field descriptor + JavaType::Object.
+
                 let sig = unsafe {
                     FieldSignature::from_raw_parts(jni_str!("Ljava/lang/String;"), JavaType::Object)
                 };
@@ -10632,7 +6736,7 @@ fn read_probe_object_field(vm: &Vm, field: &JNIStr) -> Option<String> {
     if raw.is_null() {
         return None;
     }
-    // SAFETY: live process VM (non-null, `&Vm`-bound).
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm
         .attach_current_thread(|env: &mut Env| -> Result<Option<String>, FrameworkError> {
@@ -10657,7 +6761,6 @@ fn read_probe_object_field(vm: &Vm, field: &JNIStr) -> Option<String> {
         .flatten()
 }
 
-/// Drive `CookieManager.getInstance().setCookie(url, value)` (2-arg) through the Java native path.
 pub fn cookie_manager_set_cookie(vm: &Vm, url: &str, value: &str) -> Result<(), FrameworkError> {
     with_cookie_manager(vm, |env, cm| {
         let jurl = env.new_string(url)?;
@@ -10674,8 +6777,6 @@ pub fn cookie_manager_set_cookie(vm: &Vm, url: &str, value: &str) -> Result<(), 
     })
 }
 
-/// Drive `CookieManager.getInstance().getCookie(url)` (blocks internally up to 5 s). Returns the
-/// `"n=v; n=v"` string (empty on any failure). Cookie VALUES are not logged.
 pub fn cookie_manager_get_cookie(vm: &Vm, url: &str) -> String {
     with_cookie_manager(vm, |env, cm| {
         let jurl = env.new_string(url)?;
@@ -10697,9 +6798,6 @@ pub fn cookie_manager_get_cookie(vm: &Vm, url: &str) -> String {
     .unwrap_or_default()
 }
 
-/// Drive the blocking `CookieManager.flush()` Java/native path. Returning means the native's
-/// bounded CEF completion wait finished; any durability failure is logged by the native because
-/// Android's API itself returns void.
 pub fn cookie_manager_flush(vm: &Vm) -> Result<(), FrameworkError> {
     with_cookie_manager(vm, |env, cm| {
         checked(env, "CookieManager.flush", |env| {
@@ -10709,9 +6807,6 @@ pub fn cookie_manager_flush(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-/// Drive `CookieManager.getInstance().setCookie(url, value, probe)` (3-arg) — the real success flag
-/// routes to the probe's `onReceiveValue`, recorded in `lastValue` (polled via
-/// [`read_probe_last_value`], which yields `"true"`/`"false"`). Resets `lastValue` first.
 pub fn cookie_manager_set_cookie_cb(vm: &Vm, url: &str, value: &str) -> Result<(), FrameworkError> {
     with_cookie_manager(vm, |env, cm| {
         let probe_class = env
@@ -10746,11 +6841,6 @@ pub fn cookie_manager_set_cookie_cb(vm: &Vm, url: &str, value: &str) -> Result<(
     })
 }
 
-/// Attach + construct a fresh `CookieManager` and run `f` with it. 2026-07-09: `new
-/// CookieManager()` (trivial ctor) is used INSTEAD of `getInstance()` — the latter reads
-/// `Context.this_application`, triggering the heavy `Context.<clinit>` (AssetManager/Resources
-/// native init) this framework-only harness has no reason to bring up. The natives are stateless
-/// (backed by the process-global private persistent store), so any instance works.
 fn with_cookie_manager<T>(
     vm: &Vm,
     f: impl FnOnce(&mut Env, &JObject) -> Result<T, FrameworkError>,
@@ -10759,7 +6849,7 @@ fn with_cookie_manager<T>(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: live process VM (non-null, `&Vm`-bound) — `from_raw`'s contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<T, FrameworkError> {
@@ -10777,27 +6867,15 @@ fn with_cookie_manager<T>(
     })
 }
 
-// === M4: JS bridge + evaluateJavascript + CookieManager (web-engine plan M4, 2026-07-09) ==========
-//
-// The completion-handoff surface. Everything here forwards to the out-of-process eclipse-webview
-// helper through `crate::webview::client` (v2 wire); results route back through the client's
-// socket-reader thread into the `fire_*` upcalls below. The ABSOLUTE redaction rule holds
-// verbatim: bridge args/results, eval scripts/results, and cookie VALUES are NEVER bound to a log
-// macro — only method names, ids, lengths, and counts. The reflective bridge invoke exposes ONLY
-// `@JavascriptInterface`-annotated methods (the AOSP security gate).
-
-/// `android.webkit.WebView.native_evaluateJavascript` — descriptor per the overlay WebView.smali
-/// (`(long widget, String script, ValueCallback resultCallback)`).
 const WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_NAME: &JNIStr = jni_str!("native_evaluateJavascript");
 const WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_SIG: &JNIStr =
     jni_str!("(JLjava/lang/String;Landroid/webkit/ValueCallback;)V");
-/// `android.webkit.WebView.native_addJavascriptInterface` (`(long widget, Object object, String name)`).
+
 const WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_NAME: &JNIStr =
     jni_str!("native_addJavascriptInterface");
 const WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG: &JNIStr =
     jni_str!("(JLjava/lang/Object;Ljava/lang/String;)V");
 
-/// `android.webkit.CookieManager` (the overlay-shadowed class hosting the cookie natives).
 pub const COOKIE_MANAGER_CLASS: &JNIStr = jni_str!("android/webkit/CookieManager");
 const CM_NATIVE_GET_COOKIE_NAME: &JNIStr = jni_str!("native_getCookie");
 const CM_NATIVE_GET_COOKIE_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)Ljava/lang/String;");
@@ -10812,33 +6890,20 @@ const CM_NATIVE_REMOVE_SESSION_COOKIES_SIG: &JNIStr = jni_str!("(Landroid/webkit
 const CM_NATIVE_FLUSH_NAME: &JNIStr = jni_str!("native_flush");
 const CM_NATIVE_FLUSH_SIG: &JNIStr = jni_str!("()V");
 
-/// The runtime-retention `@JavascriptInterface` annotation class (provided by the overlay — absent
-/// from stock ATL). Reflection filters exposed methods against it (the AOSP security gate).
 const JAVASCRIPT_INTERFACE_CLASS: &JNIStr = jni_str!("android/webkit/JavascriptInterface");
 
-// --- Registries: GlobalRef-holding, released on Drop (the view_registry slab discipline) ---------
-
-/// One resolved `@JavascriptInterface` method, retained so `fire_bridge_call` never re-reflects.
 struct BridgeMethodMeta {
-    /// `java.lang.reflect.Method` global ref (invoked via `Method.invoke`).
     method: Global<JObject<'static>>,
-    /// The parameter `Class.getName()` forms (e.g. `"int"`, `"java.lang.String"`), for marshalling.
+
     param_types: Vec<String>,
-    /// The return `Class.getName()` form (`"void"` for a void method).
+
     return_type: String,
 }
 
-/// One `addJavascriptInterface(object, name)` registration: the retained object + its annotated
-/// methods (only these are exposed — a forged/non-annotated method name is rejected at invoke).
-/// 2026-07-09 fix: each name maps to ALL its annotated overloads (name-only keying silently
-/// dropped all but one arbitrary `getMethods()` survivor); the call-time resolution picks by
-/// argument count, matching the Chromium gin java bridge (`FindMethod(name, num_parameters)`).
 struct BridgeEntry {
     object: Global<JObject<'static>>,
     methods: std::collections::HashMap<String, Vec<BridgeMethodMeta>>,
-    /// The [`webview_close_era`] this entry was born in — the stale-drain gate: a queued
-    /// `ViewClosedDrain` drops only entries born BEFORE its close, so a legal close+re-drive's
-    /// re-registered bridges survive (2026-07-10).
+
     era: u64,
 }
 
@@ -10849,45 +6914,24 @@ fn bridge_registry(
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Count of live [`BridgeEntry`] registrations — `client::notify_view_freed`'s fast gate, so a
-/// normal view GC on the FinalizerDaemon pays one atomic load when no bridge exists (the
-/// `LIVE_VIEWS` precedent). Maintained under the [`bridge_registry`] lock by storing `len()`
-/// after every mutation (recount-from-truth, never arithmetic). 2026-07-10.
 static WEBVIEW_BRIDGE_ENTRIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Whether ANY `@JavascriptInterface` bridge registration is currently retained (one atomic load).
 pub fn has_webview_bridges() -> bool {
     WEBVIEW_BRIDGE_ENTRIES.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
-/// Monotonic webview "close era". Bumped by the client's reader thread — under the SAME views-lock
-/// hold that removes a `ViewClosed` view, so a re-drive (which must take that lock to re-insert)
-/// always observes the bumped era. Eval callbacks and bridge entries record their birth era; a
-/// queued `ViewClosedDrain` fails/drops only state born in eras ≤ its close era, so a legal
-/// close+re-drive's FRESH callbacks/bridges are never killed by a stale queued drain
-/// (2026-07-10 fix — the drain previously selected by owning widget alone and delivered a wrong
-/// `"null"` to a live browser's `evaluateJavascript`). SeqCst: cheap here (closes are rare) and
-/// makes the bump→register ordering independent of the surrounding lock choreography.
 static WEBVIEW_CLOSE_ERA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The current close era (recorded at eval-callback retention / bridge registration).
 fn webview_close_era() -> u64 {
     WEBVIEW_CLOSE_ERA.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Bump the close era; returns the PRE-bump value — every callback/bridge born before this close
-/// carries an era ≤ the returned value. Called by the webview client's reader thread only.
 pub fn bump_webview_close_era() -> u64 {
     WEBVIEW_CLOSE_ERA.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// One-shot `ValueCallback` retained under a consumer request id (evaluateJavascript result).
-/// 2026-07-09 fix: the value carries the OWNING widget so view teardown can reach in-flight
-/// entries ([`drain_eval_callbacks_for_view`]) — request-id-only keying leaked the JNI global
-/// when the view closed before the helper's `EvaluateJsResult` arrived. 2026-07-10: the value
-/// also carries the birth [`webview_close_era`], the stale-drain gate (see the era's docs).
-#[allow(clippy::type_complexity)] // 2026-07-10: request_id → (owning widget, birth era, callback).
+#[allow(clippy::type_complexity)]
 fn eval_callbacks(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<u32, (jlong, u64, Global<JObject<'static>>)>>
 {
@@ -10897,7 +6941,6 @@ fn eval_callbacks(
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// One-shot `ValueCallback<Boolean>` retained under a request id (3-arg setCookie completion).
 fn cookie_set_callbacks(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>> {
     static R: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>>> =
@@ -10905,7 +6948,6 @@ fn cookie_set_callbacks(
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// One-shot `ValueCallback<Boolean>` retained under a request id (removeAll/Session completion).
 fn cookie_clear_callbacks(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>> {
     static R: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>>> =
@@ -10913,10 +6955,6 @@ fn cookie_clear_callbacks(
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Release every bridge registration for `widget`, unconditionally (called from
-/// `client::notify_view_freed` when the WebView OBJECT is finalized — the Java object is gone, so
-/// no era gate applies; the FinalizerDaemon is ART-attached, so the `Global` drops are cheap).
-/// Dropping each `BridgeEntry` releases its JNI global refs.
 pub fn drop_bridges_for(widget: jlong) {
     if let Ok(mut reg) = bridge_registry().lock() {
         reg.retain(|(w, _), _| *w != widget);
@@ -10924,12 +6962,6 @@ pub fn drop_bridges_for(widget: jlong) {
     }
 }
 
-/// Era-gated release for a helper-confirmed `ViewClosed` (2026-07-10). Runs on the client's
-/// ART-attached upcall thread — NEVER the reader: jni 0.22.4 `Global::drop` on an unattached
-/// thread performs a scoped AttachCurrentThread/DetachCurrentThread per ref, and that hidden JNI
-/// on the io thread could stall it across an ART suspend-all pause until the helper's bounded
-/// outbox declared the consumer dead. Entries born AFTER the close (a legal close+re-drive
-/// re-registered them) survive — the stale-drain gate.
 pub fn drop_bridges_for_view_closed(widget: jlong, upto_era: u64) {
     if let Ok(mut reg) = bridge_registry().lock() {
         reg.retain(|(w, _), e| bridge_survives_view_close(*w, e.era, widget, upto_era));
@@ -10937,8 +6969,6 @@ pub fn drop_bridges_for_view_closed(widget: jlong, upto_era: u64) {
     }
 }
 
-/// Pure retain predicate for [`drop_bridges_for_view_closed`] (plain-`cargo test` pinned):
-/// an entry survives unless it belongs to the closed widget AND was born before/at the close.
 fn bridge_survives_view_close(
     entry_widget: jlong,
     entry_era: u64,
@@ -10948,9 +6978,6 @@ fn bridge_survives_view_close(
     entry_widget != closed || entry_era > upto_era
 }
 
-/// Release EVERY bridge registration. 2026-07-09 same-pattern audit: after `client::shutdown`
-/// clears the view map and zeroes the live-view gate, the finalize-time [`drop_bridges_for`] path
-/// can never reach these again (and no BridgeCall can ever arrive), so shutdown drops them here.
 pub fn drop_all_bridges() {
     if let Ok(mut reg) = bridge_registry().lock() {
         reg.clear();
@@ -10958,12 +6985,6 @@ pub fn drop_all_bridges() {
     }
 }
 
-// --- WebView.native_evaluateJavascript / native_addJavascriptInterface ---------------------------
-
-/// `WebView.native_evaluateJavascript(long widget, String script, ValueCallback resultCallback)` —
-/// forward `script` to the helper and route the JSON result to `resultCallback` (retained under a
-/// consumer request id). `script` crosses the wire ONLY (never a log macro). A null callback is a
-/// fire-and-forget eval (the overlay routes `javascript:` URLs here with a null callback).
 extern "system" fn web_view_native_evaluate_javascript<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -10999,8 +7020,8 @@ extern "system" fn web_view_native_evaluate_javascript<'local>(
             return Ok(());
         };
         let request_id = crate::webview::client::next_request_id();
-        // Retain the ValueCallback under request_id, keyed to the owning widget (fired exactly
-        // once: by the result, by a degrade path below, or by a teardown drain).
+
+
         if !callback.is_null() {
             match env.new_global_ref(&callback) {
                 Ok(g) => {
@@ -11017,9 +7038,9 @@ extern "system" fn web_view_native_evaluate_javascript<'local>(
                 }
             }
         }
-        // 2026-07-09 fix: a degrade path FIRES the callback with the AOSP failure value ("null" —
-        // Chromium's evaluateJavascript always invokes the callback, with "null" when evaluation
-        // produced nothing) instead of dropping it unfired, matching the cookie degrade siblings.
+
+
+
         let degrade = |env: &mut Env| {
             if let Some((_w, _era, g)) = eval_callbacks()
                 .lock()
@@ -11051,11 +7072,6 @@ extern "system" fn web_view_native_evaluate_javascript<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `WebView.native_addJavascriptInterface(long widget, Object object, String name)` — reflect the
-/// object's `@JavascriptInterface`-annotated methods (the SECURITY gate), retain the object + the
-/// resolved `Method` objects, and register the inventory with the helper (which injects
-/// `window.<name>`). Bridge method names cross the wire (the app's own API surface, not user data)
-/// but are logged as a COUNT only.
 extern "system" fn web_view_native_add_javascript_interface<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -11085,7 +7101,7 @@ extern "system" fn web_view_native_add_javascript_interface<'local>(
             tracing::warn!(target: "android.webkit.WebView", widget, "addJavascriptInterface: null/empty name (ignored)");
             return Ok(());
         };
-        // Reflect the @JavascriptInterface methods → (name, param types, return type) + Method global.
+
         let methods = match reflect_javascript_interface_methods(env, &object) {
             Ok(m) => m,
             Err(_) => {
@@ -11107,8 +7123,8 @@ extern "system" fn web_view_native_add_javascript_interface<'local>(
                 return Ok(());
             }
         };
-        // One wire entry per NAME (the JS stub is one function per name; overloads share it);
-        // `returns_value` is advisory (proto.rs) — any non-void overload marks the name.
+
+
         let wire_methods: Vec<crate::webview::proto::BridgeMethod> = methods
             .iter()
             .map(|(n, overloads)| crate::webview::proto::BridgeMethod {
@@ -11148,7 +7164,6 @@ extern "system" fn web_view_native_add_javascript_interface<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// One-shot WARN (per feature) for the honest degradation when the helper is unavailable.
 fn warn_bridge_unavailable(feature: &str, widget: jlong, reason: &str) {
     tracing::warn!(
         target: "android.webkit.WebView",
@@ -11159,17 +7174,13 @@ fn warn_bridge_unavailable(feature: &str, widget: jlong, reason: &str) {
     );
 }
 
-/// Reflect an object's public `@JavascriptInterface`-annotated methods into
-/// `name → [(Method global, param type names, return type name); one per overload]`. Only
-/// annotated methods are collected (the AOSP security gate). Each method is reflected in its own
-/// local frame. 2026-07-09: overloads are all retained (never collapsed to one arbitrary Method).
 fn reflect_javascript_interface_methods(
     env: &mut Env,
     object: &JObject,
 ) -> jni::errors::Result<std::collections::HashMap<String, Vec<BridgeMethodMeta>>> {
     let anno_class = env.find_class(JAVASCRIPT_INTERFACE_CLASS)?;
     let class = env.get_object_class(object)?;
-    // getMethods() returns public methods incl. inherited — @JavascriptInterface methods are public.
+
     let arr = env
         .call_method(
             &class,
@@ -11183,8 +7194,6 @@ fn reflect_javascript_interface_methods(
     let mut out: std::collections::HashMap<String, Vec<BridgeMethodMeta>> =
         std::collections::HashMap::new();
     for i in 0..n {
-        // Each method reflected in its own local frame (the jni_register precedent); a `Global`
-        // promoted inside survives the frame pop (frame pop frees only LOCAL refs).
         let entry: Option<(String, BridgeMethodMeta)> = env.with_local_frame(
             24,
             |env| -> jni::errors::Result<Option<(String, BridgeMethodMeta)>> {
@@ -11251,7 +7260,6 @@ fn reflect_javascript_interface_methods(
     Ok(out)
 }
 
-/// `Class.getName()` for a `java.lang.Class` object (`"int"`, `"void"`, `"java.lang.String"`, `"[I"`).
 fn class_get_name(env: &mut Env, class_obj: JObject) -> jni::errors::Result<String> {
     let name_obj = env
         .call_method(
@@ -11264,17 +7272,12 @@ fn class_get_name(env: &mut Env, class_obj: JObject) -> jni::errors::Result<Stri
     jstring_object_to_string(env, name_obj)
 }
 
-/// A `java.lang.String` `JObject` → Rust `String`.
 fn jstring_object_to_string(env: &mut Env, obj: JObject) -> jni::errors::Result<String> {
     let jstr: JString = env.cast_local::<JString>(obj)?;
     let chars = jstr.mutf8_chars(env)?;
     Ok(String::from(chars))
 }
 
-// --- CookieManager natives (real backing via the private persistent helper store) ----------------
-
-/// `CookieManager.native_getCookie(String url) -> String` — the blocking getCookie. Formats the
-/// helper's cookie list into Android's `"n1=v1; n2=v2"` string. Cookie VALUES are NEVER logged.
 extern "system" fn web_view_cookie_manager_get_cookie<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -11297,7 +7300,6 @@ extern "system" fn web_view_cookie_manager_get_cookie<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `CookieManager.native_setCookie(String url, String value)` — fire-and-forget 2-arg setCookie.
 extern "system" fn web_view_cookie_manager_set_cookie<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -11334,8 +7336,6 @@ extern "system" fn web_view_cookie_manager_set_cookie<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `CookieManager.native_setCookie(String url, String value, ValueCallback callback)` — the 3-arg
-/// setCookie; the REAL success flag routes back to `callback` (retained under a request id).
 extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -11380,7 +7380,6 @@ extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
                 )
                 .is_err()
                 {
-                    // Honest degrade: the callback never fires from the helper → answer false now.
                     if let Some(g) = cookie_set_callbacks()
                         .lock()
                         .ok()
@@ -11405,7 +7404,6 @@ extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `CookieManager.native_removeAllCookies(ValueCallback callback)` — clear all cookies.
 extern "system" fn web_view_cookie_manager_remove_all_cookies<'local>(
     env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -11414,8 +7412,6 @@ extern "system" fn web_view_cookie_manager_remove_all_cookies<'local>(
     web_view_cookie_manager_remove_impl(env, callback, CookieClearScope::All)
 }
 
-/// `CookieManager.native_removeSessionCookies(ValueCallback callback)` — clear only cookies
-/// without an expiration date, preserving persistent cookies.
 extern "system" fn web_view_cookie_manager_remove_session_cookies<'local>(
     env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -11445,10 +7441,7 @@ fn web_view_cookie_manager_remove_impl<'local>(
                 }
             }
         }
-        // 2026-07-09 fix: the get_java_vm Err arm previously retained the callback with no removal
-        // (a leak + a never-fired callback); both failure shapes degrade honestly to FALSE.
-        // 2026-07-17: the jar is persistent, so even an unspawned helper may have prior-boot
-        // cookies. Every clear must reach CEF; only a send failure is answered locally (FALSE).
+
         let answer_now: Option<bool> = match env.get_java_vm() {
             Ok(java_vm) => match scope {
                 CookieClearScope::All => {
@@ -11476,9 +7469,6 @@ fn web_view_cookie_manager_remove_impl<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `CookieManager.native_flush()` — synchronously wait for CEF's persistent-store completion,
-/// matching Android's documented blocking durability boundary. The wait is bounded so a dead
-/// helper cannot hang an ART thread forever; failure is loud because Java's API returns void.
 extern "system" fn web_view_cookie_manager_flush<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -11504,7 +7494,6 @@ extern "system" fn web_view_cookie_manager_flush<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own backing for `android.webkit.CookieManager`'s natives (2026-07-09, plan M4).
 fn register_cookie_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let bindings: [NativeBinding; 6] = [
         (
@@ -11546,8 +7535,6 @@ fn register_cookie_manager_natives(env: &mut Env) -> Result<(), FrameworkError> 
     Ok(())
 }
 
-/// Read a `JString` native argument to a Rust `String`, describing+clearing any pending exception
-/// (the openAssetFd house pattern). `None` on null/unreadable.
 fn read_jstring<'local>(env: &mut Env<'local>, s: &JString<'local>) -> Option<String> {
     if s.is_null() {
         return None;
@@ -11564,9 +7551,6 @@ fn read_jstring<'local>(env: &mut Env<'local>, s: &JString<'local>) -> Option<St
     }
 }
 
-// --- Pure helpers (unit-tested; no JNI) ----------------------------------------------------------
-
-/// The structured fields parsed from an Android Set-Cookie-style `value` string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedSetCookie {
     name: String,
@@ -11575,19 +7559,14 @@ struct ParsedSetCookie {
     path: String,
     secure: bool,
     http_only: bool,
-    /// 0 = session cookie (no Expires/Max-Age).
+
     expires_epoch_s: i64,
 }
 
-/// Android WebView's compatibility fixup for the relaxed host/domain strings apps historically
-/// pass to `CookieManager`. Chromium applies its `WebAddressParser` before every get/set; Eclipse
-/// preserves already-schemed inputs and implements the measured scheme-less host subset without
-/// pretending to be a general URL parser. Invalid shapes remain unchanged so CEF rejects them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CookieUrlFixup {
     url: String,
-    /// Classic WebView treated a leading-dot input as a domain and appended `Domain=<input>` when
-    /// the cookie lacked an explicit Domain attribute.
+
     implied_domain: Option<String>,
 }
 
@@ -11630,9 +7609,6 @@ fn fixup_webview_cookie_url(input: &str) -> CookieUrlFixup {
     }
 }
 
-/// Convert an explicit cookie expiry into the protocol's nonzero Unix-epoch representation.
-/// HTTP's epoch itself is remapped to `-1`: wire value `0` is the session-cookie sentinel, while an
-/// explicit 1970 expiry means "already expired" and must remain an expiring cookie.
 fn parse_cookie_expiry_epoch_s(value: &str) -> Option<i64> {
     let epoch = if let Ok(epoch) = value.parse::<i64>() {
         epoch
@@ -11648,10 +7624,6 @@ fn parse_cookie_expiry_epoch_s(value: &str) -> Option<i64> {
     Some(if epoch == 0 { -1 } else { epoch })
 }
 
-/// Parse `"name=value; Domain=..; Path=..; Secure; HttpOnly; Max-Age=..; Expires=.."` into
-/// structured CEF fields (the shape `CookieManager.setCookie(url, value)` accepts). `Max-Age` is
-/// resolved to an absolute epoch and takes precedence over `Expires`; standard/legacy HTTP dates
-/// are parsed by `httpdate`. Invalid expiry text leaves a session cookie. Pure/total. 2026-07-17.
 fn parse_set_cookie(value: &str) -> ParsedSetCookie {
     let mut parts = value.split(';');
     let first = parts.next().unwrap_or("").trim();
@@ -11705,22 +7677,12 @@ fn parse_set_cookie(value: &str) -> ParsedSetCookie {
     out
 }
 
-/// The serialized-JSON byte length of each bridge argument — the payload-free shape the A3 receipt
-/// line binds (plan M6, 2026-07-10). Argument VALUES are never logged; only their lengths, so a
-/// page passing a secret token as a bridge arg leaks nothing. Pure/unit-pinned.
 fn bridge_arg_lens(args: &[serde_json::Value]) -> Vec<usize> {
     args.iter()
         .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
         .collect()
 }
 
-/// 2026-07-10 (M6 review fix): gate a bridge `iface`/`method` string for the A3 receipt line.
-/// The receipt logs BEFORE registry validation (a wrong-identifier call is itself the diagnosis),
-/// so at that point the strings are PAGE-CONTROLLED — any page script can call `window.cefQuery`
-/// with arbitrary strings (e.g. a full URL or a session token), and binding them verbatim to a
-/// default INFO line would break the scheme+host log contract. A Java-identifier shape
-/// (`[A-Za-z_$][A-Za-z0-9_$]*`, <= 64 bytes — the app-authored bridge surface; a URL can never
-/// match) passes verbatim; anything else binds as the static `"<non-identifier>"`. Pure/unit-pinned.
 fn bridge_identifier_for_log(s: &str) -> &str {
     let mut chars = s.chars();
     let identifier_shaped = match chars.next() {
@@ -11736,7 +7698,6 @@ fn bridge_identifier_for_log(s: &str) -> &str {
     }
 }
 
-/// Format a cookie list into Android's `getCookie` string: `"name1=value1; name2=value2"`. Pure.
 fn format_cookies(cookies: &[crate::webview::proto::CookieEntry]) -> String {
     cookies
         .iter()
@@ -11745,7 +7706,6 @@ fn format_cookies(cookies: &[crate::webview::proto::CookieEntry]) -> String {
         .join("; ")
 }
 
-/// The marshalling plan for one JSON bridge argument against a Java parameter type name.
 #[derive(Debug, PartialEq, Eq)]
 enum ArgKind {
     Str,
@@ -11757,13 +7717,10 @@ enum ArgKind {
     DoubleBox,
     BoolBox,
     Null,
-    /// Unsupported type combination (arrays, arbitrary objects, or a type mismatch).
+
     Reject,
 }
 
-/// Pure: decide how a JSON value marshals to a Java `@JavascriptInterface` parameter type (the
-/// getName() form: `"int"`, `"java.lang.String"`, …). Android exposes String + the numeric/boolean
-/// primitives (+ their boxes); everything else is rejected loudly. 2026-07-09.
 fn plan_arg(value: &serde_json::Value, param_type: &str) -> ArgKind {
     use serde_json::Value;
     let string_ok = matches!(
@@ -11799,21 +7756,15 @@ fn plan_arg(value: &serde_json::Value, param_type: &str) -> ArgKind {
             }
             _ => ArgKind::Reject,
         },
-        // Arrays / nested objects are not supported by Android's @JavascriptInterface either.
+
         Value::Array(_) | Value::Object(_) => ArgKind::Reject,
     }
 }
 
-/// Pure: pick the `@JavascriptInterface` overload whose arity matches the call's argument count.
-/// 2026-07-09: the reference behavior is Chromium's gin java bridge (`GinJavaBoundObject` keeps a
-/// name→methods multimap and `FindMethod(name, num_parameters)` resolves by argument count at call
-/// time; same-arity overloads are first-match there too — deliberately mirrored here).
 fn select_overload_index(arities: &[usize], argc: usize) -> Option<usize> {
     arities.iter().position(|&a| a == argc)
 }
 
-/// Pure: a Java numeric `toString()` is embedded as a JSON number when it parses as one, else
-/// quoted as a JSON string (guards NaN/Infinity, which are not valid JSON). 2026-07-09.
 fn number_or_quote(s: &str) -> String {
     if serde_json::from_str::<serde_json::Number>(s).is_ok() {
         s.to_string()
@@ -11822,21 +7773,6 @@ fn number_or_quote(s: &str) -> String {
     }
 }
 
-// --- The JNI upcall layer (reflective bridge invoke + ValueCallback dispatch) --------------------
-
-/// 2026-07-16 (web-engine M6, row 2 DEFERRED — AGENTS.md §6): one loud line the FIRST time a page
-/// bridge call ever reaches Eclipse. The `eclipse-webview-upcall` thread matches AOSP's thread
-/// IDENTITY for `@JavascriptInterface` (`WebView.java:1915-1918`: "a private, background thread of
-/// this WebView", precisely so a bridge method MAY BLOCK) but has NO android.os.Looper — so a
-/// bridge method that constructs a Handler throws exactly as the page callbacks did (ATL
-/// `Handler.java:197`). Zero bridge calls have ever reached Eclipse, so there is no confirmed
-/// TRIGGER to fix (CLAUDE.md); this line is the trigger's alarm. If the next log line is a
-/// described "Can't create handler inside thread that has not called Looper.prepare()", the
-/// deferral has fired: implement the DRAINED HandlerThread analogue on this thread
-/// (`Looper.prepare` + a Rust drive of its own queue interleaved with the mpsc recv). Do NOT move
-/// it to main (that would be a new AOSP divergence and would park winit on a 5 s getCookie), and do
-/// NOT prepare an UNDRAINED Looper here (every `Handler.post` would silently vanish — worse than
-/// the throw).
 static BRIDGE_CALL_LOOPER_NOTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -11854,13 +7790,6 @@ fn note_first_bridge_call_thread() {
     }
 }
 
-/// Fire a page-invoked bridge call: parse the payload, reflect-invoke the retained
-/// `@JavascriptInterface` method, and return `(ok, result_json)` for the `BridgeResult` reply.
-/// Attaches + `catch_unwind` (the `fire_web_view_internal_load_changed` shape). Runs on the client
-/// UPCALL thread (ART-attached; 2026-07-09 fix — app code must never run on the socket-reader
-/// thread, or a synchronous `CookieManager.getCookie` from a bridge method self-deadlocks the io
-/// loop), OUTSIDE all client locks (the method may re-enter WebView natives). Args/results are
-/// NEVER logged (only method name + call_id + lengths). 2026-07-09.
 pub fn fire_bridge_call(
     java_vm: &JavaVM,
     widget: jlong,
@@ -11906,12 +7835,6 @@ fn fire_bridge_call_inner(
         .cloned()
         .unwrap_or_default();
 
-    // 2026-07-10 (plan M6): the A/B verdict evidence for the silent-bridge diagnosis — a page that
-    // calls the bridge produces THIS line. It logs BEFORE registry validation (a wrong-identifier
-    // call is itself the diagnosis), so iface/method are page-controlled HERE — the
-    // identifier-shape gate keeps anything URL/token-shaped out of the default log (M6 review
-    // fix); the app's real registered identifiers always pass verbatim. Arg VALUES are never
-    // bound (lengths only).
     tracing::info!(
         target: "android.webkit.WebView",
         widget,
@@ -11923,17 +7846,12 @@ fn fire_bridge_call_inner(
         "bridge call received (arg values not logged)"
     );
 
-    // Snapshot UNDER the registry lock: local refs of the object + resolved Method + metadata, so
-    // the reflect-invoke runs OUTSIDE the lock (the method may re-enter WebView natives → registry).
-    // 2026-07-09: overload resolution by argument count happens HERE (the gin java bridge rule);
-    // `Err(arities)` = the name exists but no overload matches the call's arity.
     let snapshot = {
         let reg = match bridge_registry().lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         match reg.get(&(widget, iface.to_string())) {
-            // Verify `method` is in the ANNOTATED set (a forged/non-annotated name is rejected).
             Some(entry) => match entry.methods.get(method) {
                 Some(overloads) => {
                     let arities: Vec<usize> =
@@ -11980,7 +7898,7 @@ fn fire_bridge_call_inner(
         tracing::debug!(target: "android.webkit.WebView", widget, call_id, "bridge call for an unregistered/unknown method (rejected, never fabricated)");
         return (false, REJECT.to_string());
     };
-    // Marshal args into an Object[] (rejecting unsupported types loudly, payload-free).
+
     let obj_class = match env.find_class(jni_str!("java/lang/Object")) {
         Ok(c) => c,
         Err(_) => {
@@ -11997,7 +7915,6 @@ fn fire_bridge_call_inner(
     };
     for (idx, (v, pt)) in args.iter().zip(param_types.iter()).enumerate() {
         if let Err(reason) = set_bridge_arg(env, &array, idx, v, pt) {
-            // Loud, PAYLOAD-FREE: method + parameter type name only (never the value).
             tracing::warn!(
                 target: "android.webkit.WebView",
                 widget,
@@ -12010,7 +7927,7 @@ fn fire_bridge_call_inner(
             return (false, REJECT.to_string());
         }
     }
-    // reflect: Method.invoke(object, boxedArgs)
+
     let invoke = env.call_method(
         &method_local,
         jni_str!("invoke"),
@@ -12020,8 +7937,6 @@ fn fire_bridge_call_inner(
     let result_obj = match invoke.and_then(|v| v.l()) {
         Ok(o) => o,
         Err(_) => {
-            // InvocationTargetException (the @JavascriptInterface method threw) → describe+clear,
-            // reject with a payload-free JSON error string (never the exception's message text).
             clear_pending(env);
             tracing::warn!(target: "android.webkit.WebView", widget, call_id, method, "bridge method invocation threw (rejected)");
             return (false, "\"eclipse: bridge invocation error\"".to_string());
@@ -12031,8 +7946,6 @@ fn fire_bridge_call_inner(
     (true, result_json)
 }
 
-/// Box one JSON arg per its Java parameter type and set it into `array[idx]`. Returns
-/// `Err(reason)` (a static, payload-free reason) for an unsupported/mismatched type.
 fn set_bridge_arg<'local>(
     env: &mut Env<'local>,
     array: &JObjectArray<'local>,
@@ -12067,7 +7980,7 @@ fn set_bridge_arg<'local>(
     let num = v.as_f64();
     match plan_arg(v, param_type) {
         ArgKind::Reject => return Err("unsupported-type"),
-        ArgKind::Null => { /* leave the slot null (already null) */ }
+        ArgKind::Null => {}
         ArgKind::Str => {
             let s = v.as_str().unwrap_or_default();
             let js = env.new_string(s).map_err(|_| {
@@ -12115,11 +8028,8 @@ fn set_bridge_arg<'local>(
     Ok(())
 }
 
-/// Marshal a reflective invoke's return `Object` (or null) to a JSON result string, per the return
-/// type name. Values are NEVER logged.
 fn marshal_bridge_return(env: &mut Env, result_obj: &JObject, return_type: &str) -> String {
     if result_obj.is_null() {
-        // void method OR a null return.
         return "null".to_string();
     }
     match return_type {
@@ -12154,7 +8064,7 @@ fn marshal_bridge_return(env: &mut Env, result_obj: &JObject, return_type: &str)
             Some(s) => number_or_quote(&s),
             None => "null".to_string(),
         },
-        // String / CharSequence / any other object → its toString() as a JSON string.
+
         _ => match object_to_string(env, result_obj) {
             Some(s) => serde_json::to_string(&s).unwrap_or_else(|_| "null".to_string()),
             None => "null".to_string(),
@@ -12162,7 +8072,6 @@ fn marshal_bridge_return(env: &mut Env, result_obj: &JObject, return_type: &str)
     }
 }
 
-/// `object.toString()` → Rust String (best-effort; `None` on any JNI failure, exception cleared).
 fn object_to_string(env: &mut Env, obj: &JObject) -> Option<String> {
     let s = env
         .call_method(
@@ -12181,17 +8090,6 @@ fn object_to_string(env: &mut Env, obj: &JObject) -> Option<String> {
     }
 }
 
-/// 2026-07-16 (recorded divergence, AGENTS.md §6): note ONCE if an app-facing WebView
-/// ValueCallback is registered from a thread that is NOT main. AOSP fires `evaluateJavascript`'s
-/// callback on the UI thread (`WebView.java:876-879`) and `setCookie`'s 3-arg callback on "the
-/// current thread's Looper" (`CookieManager.java:142-148`; Chromium's
-/// `AwCookieManager.CookieCallback.convert` captures `new Handler()` on the CALLING thread and
-/// THROWS from a Looper-less one). Eclipse pumps exactly ONE Looper — main — so it fires every one
-/// of them on main: byte-identical to AOSP for a main-thread caller, and the only non-swallowing
-/// choice for any other (an unpumped Looper would eat the post). Every caller observed to date is
-/// main. This line is how we would learn otherwise, on the first boot it happens — it converts an
-/// assumption into a fact rather than leaving it in a parenthesis. No JNI: [`MAIN_THREAD_ID`] is
-/// the ART main thread's Rust `ThreadId`, and an app's Java thread is a distinct one.
 static NON_MAIN_REGISTRAR_NOTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -12211,7 +8109,6 @@ fn note_non_main_callback_registrar(what: &'static str) {
     }
 }
 
-/// Clear a pending JNI exception (describe+clear), best-effort.
 fn clear_pending(env: &mut Env) {
     if env.exception_check() {
         env.exception_describe();
@@ -12219,8 +8116,6 @@ fn clear_pending(env: &mut Env) {
     }
 }
 
-/// Deliver an `evaluateJavascript` JSON result to the retained `ValueCallback` (removed from the
-/// registry). `value_json` is NEVER logged. Runs on the client upcall thread. 2026-07-09.
 pub fn fire_evaluate_js_result(java_vm: &JavaVM, request_id: u32, ok: bool, value_json: &str) {
     let value = if ok { value_json } else { "null" };
     let global = eval_callbacks()
@@ -12238,13 +8133,6 @@ pub fn fire_evaluate_js_result(java_vm: &JavaVM, request_id: u32, ok: bool, valu
     fire_string_callback_global(java_vm, global, value);
 }
 
-/// 2026-07-09 fix (view-closed-mid-eval leak): fail every in-flight `evaluateJavascript`
-/// ValueCallback owned by `widget` with the honest AOSP failure value (`"null"` — the callback
-/// contract is fire-exactly-once; the view's browser is gone, so no result will ever arrive).
-/// Called from the client upcall thread when the helper confirms `ViewClosed`. 2026-07-10 fix:
-/// era-gated — only callbacks born BEFORE this close (`era ≤ upto_era`) are failed, so a legal
-/// close+re-drive's fresh callbacks are never killed by a stale queued drain (the old
-/// owning-widget-only selection delivered a wrong `"null"` to a live browser's eval).
 pub fn drain_eval_callbacks_for_view(java_vm: &JavaVM, widget: jlong, upto_era: u64) {
     let drained: Vec<(u32, Global<JObject<'static>>)> = match eval_callbacks().lock() {
         Ok(mut m) => {
@@ -12270,9 +8158,6 @@ pub fn drain_eval_callbacks_for_view(java_vm: &JavaVM, widget: jlong, upto_era: 
     }
 }
 
-/// Pure victim selection for [`drain_eval_callbacks_for_view`]: the ids owned by `widget` whose
-/// birth era is ≤ `upto_era` (retained BEFORE the close being drained). Generic over the retained
-/// value so plain `cargo test` pins it without a JVM (2026-07-10, the stale-drain gate).
 fn eval_drain_victims<V>(
     m: &std::collections::HashMap<u32, (jlong, u64, V)>,
     widget: jlong,
@@ -12284,11 +8169,6 @@ fn eval_drain_victims<V>(
         .collect()
 }
 
-/// 2026-07-09 fix (failure-latch/shutdown leak): fail EVERY pending webview ValueCallback honestly
-/// — eval → `"null"`, 3-arg setCookie / removeAll(Session)Cookies → `Boolean.FALSE` — mirroring
-/// the per-request send-failure degrades. Called from the client upcall thread exactly once, when
-/// its channel closes (helper crash/EOF/protocol error or a deliberate shutdown); without this the
-/// retained JNI globals outlived the helper for the process lifetime and the callbacks never fired.
 pub fn drain_all_webview_callbacks(java_vm: &JavaVM, reason: &str) {
     fn take_all<V>(m: &'static std::sync::Mutex<std::collections::HashMap<u32, V>>) -> Vec<V> {
         m.lock()
@@ -12321,18 +8201,6 @@ pub fn drain_all_webview_callbacks(java_vm: &JavaVM, reason: &str) {
     }
 }
 
-/// The number of app `ValueCallback`s currently retained against the live helper (2026-07-16, plan
-/// M6 — the §6 respawn): eval results, 3-arg `setCookie` flags, `removeAll`/`removeSession`
-/// completions. Read by `webview::client::respawn_verdict`'s quiescence guard.
-///
-/// Two independent things turn on it, and both are load-bearing:
-/// * **Correctness** — tearing the helper down runs [`drain_all_webview_callbacks`], which answers
-///   each pending callback `false`/`"null"`. That is ACCURATE for a helper that is GONE and WRONG
-///   for one being REPLACED (the replayed frame lands in the successor's store, so `false` would
-///   contradict it). Nonzero ⇒ refuse the replacement rather than answer wrongly.
-/// * **Liveness** — with all three maps empty the drain hits its own early return
-///   ([`drain_all_webview_callbacks`]'s `is_empty` guard) and never dispatches to the main Looper, so
-///   the client's teardown cannot park a thread against a thread parked on main.
 pub fn webview_callbacks_in_flight() -> usize {
     fn len<V>(m: &'static std::sync::Mutex<std::collections::HashMap<u32, V>>) -> usize {
         m.lock().map(|m| m.len()).unwrap_or(0)
@@ -12340,46 +8208,24 @@ pub fn webview_callbacks_in_flight() -> usize {
     len(eval_callbacks()) + len(cookie_set_callbacks()) + len(cookie_clear_callbacks())
 }
 
-/// Deliver the REAL 3-arg-setCookie success flag to the retained `ValueCallback<Boolean>`.
 pub fn fire_cookie_set_result(java_vm: &JavaVM, request_id: u32, ok: bool) {
     fire_boolean_result(java_vm, cookie_set_callbacks(), request_id, ok);
 }
 
-/// 2026-07-16 (the `ECLIPSE_WEBVIEW_DEFER_COOKIE_CB` dev-host probe): fail every still-pending
-/// WebView ValueCallback honestly from MAIN, at teardown, when the client slot never went live and
-/// therefore has no upcall thread to run the normal channel-close drain. Thin `&Vm` wrapper over
-/// [`drain_all_webview_callbacks`] — the drain, its `false` semantics and its exactly-once contract
-/// are the shipped ones; only the VM wrap and the main-thread proof are added.
-///
-/// On the never-live path the eval and clear maps are provably empty (an eval needs a driven view,
-/// which spawns; a clear is answered locally or forces the spawn), so in practice this drains
-/// exactly the probe's deferred setCookie callbacks. It is deliberately the general drain anyway:
-/// a narrower one could silently miss a future retained callback with the same shape.
 pub fn drain_deferred_cookie_set_callbacks(vm: &Vm, reason: &str) {
     let raw = vm.as_raw();
     if raw.is_null() {
         return;
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive by
-    // the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton). Identical to the
-    // wrap in `retire_main_upcall_dispatch` / `pump_main_looper` on this same (main) thread.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     drain_all_webview_callbacks(&java_vm, reason);
 }
 
-/// Deliver CEF's real removeAll/removeSession result: true only when at least one cookie was
-/// removed, matching Android's `ValueCallback<Boolean>` contract.
 pub fn fire_cookies_clear_result(java_vm: &JavaVM, request_id: u32, removed: bool) {
     fire_boolean_result(java_vm, cookie_clear_callbacks(), request_id, removed);
 }
 
-/// Fire `onReceiveValue(String)` on a retained callback global.
-///
-/// 2026-07-16 (M6 root fix): dispatched on the MAIN (UI) thread. `WebView.java:876-879` is
-/// explicit — "This method must be called on the UI thread and the callback will be made on the UI
-/// thread." Takes the `Global` BY VALUE: `jni 0.22`'s `Global` is not `Clone`, the job must own it
-/// ('static), and this also moves the DROP onto main (an attached thread) — `Global::drop` on an
-/// unattached thread forces a temporary scoped attach with a severe penalty (jni global.rs:77-85).
 fn fire_string_callback_global(java_vm: &JavaVM, global: Global<JObject<'static>>, value: &str) {
     let value = value.to_string();
     let _ = dispatch_webview_callback_on_main(
@@ -12392,11 +8238,6 @@ fn fire_string_callback_global(java_vm: &JavaVM, global: Global<JObject<'static>
     );
 }
 
-/// Fire `onReceiveValue(Boolean.valueOf(ok))` on a retained callback global.
-///
-/// 2026-07-16 (M6 root fix): dispatched on the MAIN (UI) thread. `CookieManager.java:142-148` says
-/// "the current thread's Looper" — the caller's; Eclipse pumps only main's, and every observed
-/// caller IS main (recorded divergence + the [`note_non_main_callback_registrar`] alarm).
 fn fire_boolean_callback_global(java_vm: &JavaVM, global: Global<JObject<'static>>, ok: bool) {
     let _ = dispatch_webview_callback_on_main(
         java_vm,
@@ -12408,7 +8249,6 @@ fn fire_boolean_callback_global(java_vm: &JavaVM, global: Global<JObject<'static
     );
 }
 
-/// Shared: remove the one-shot callback under `request_id` and fire `onReceiveValue(Boolean)`.
 fn fire_boolean_result(
     java_vm: &JavaVM,
     registry: &'static std::sync::Mutex<std::collections::HashMap<u32, Global<JObject<'static>>>>,
@@ -12426,8 +8266,6 @@ fn fire_boolean_result(
     fire_boolean_callback_global(java_vm, global, ok);
 }
 
-/// Fire `ValueCallback.onReceiveValue(String)` on `callback` (a live local ref); a throwing
-/// callback is described+cleared (never propagates).
 fn fire_string_value_callback(env: &mut Env, callback: &JObject, value: &str) {
     let jstr = match env.new_string(value) {
         Ok(s) => s,
@@ -12449,7 +8287,6 @@ fn fire_string_value_callback(env: &mut Env, callback: &JObject, value: &str) {
     }
 }
 
-/// Fire `ValueCallback.onReceiveValue(Boolean.valueOf(ok))` on `callback` (a live local ref).
 fn fire_boolean_value_callback(env: &mut Env, callback: &JObject, ok: bool) {
     let boxed = env
         .call_static_method(
@@ -12479,92 +8316,27 @@ fn fire_boolean_value_callback(env: &mut Env, callback: &JObject, ok: bool) {
     }
 }
 
-// === Eclipse's own (non-GTK) backing for the inflatable android.widget.* property setters =========
-//
-// 2026-06-13: with each inflatable widget's `native_constructor` bound (above), `LayoutInflater` builds
-// the content view and the widgets' own property-setter natives surface one at a time (the trigger was
-// `No implementation found for void android.widget.ProgressBar.native_setIndeterminate(boolean)`). ART
-// resolves natives PER DECLARING CLASS, so each property setter is bound on the class that declares it
-// (verified against the vendored ATL overlay `vendor/atl/src/api-impl/android/widget/`). Honest
-// semantics, per widget:
-//   * Text setters (`Button`/`EditText`/`CheckBox` `native_setText(long, String)`, `RadioButton`
-//     `setText(CharSequence)`) RECORD the text on the view-registry peer — the renderer draws
-//     `RenderNode.text`, so it is load-bearing consumed state (reuses the [`text_view_native_set_text`]
-//     pattern).
-//   * `ScrollView.native_addView`/`native_removeView` re-declare ViewGroup's tree-wiring natives on
-//     their own class (ScrollView.java:20/22); they reuse the class-agnostic
-//     [`view_group_native_add_view`]/[`view_group_native_remove_view`] bodies, recording the real
-//     parent→child tree edges the renderer walks.
-//   * Progress/indeterminate/max/adapter/compound-drawable setters are VALIDATED-HANDLE NO-OPS: the
-//     headless renderer draws none of these widget chromes (real game frames come from the engine GL
-//     surface, not these android.widget views), there is no view-registry field they feed, and — the
-//     decisive check — NO bound native getter reads them back, so the Java caller does not depend on a
-//     native side effect (ProgressBar/Spinner's getters return Java fields; SeekBar's `native_getProgress`
-//     is left UNBOUND — see below). They mirror the existing `ImageView.native_setScaleType`/
-//     `View.nativeSetFullscreen` validated-no-op setters.
-//
-// DELIBERATELY LEFT UNBOUND (return value drives Java control flow — must not be no-op'd, per policy;
-// each surfaces loudly as the next discovery signal if a real layout calls it):
-//   * `SeekBar.native_getProgress(long) -> int` (SeekBar.java:20, the return of `SeekBar.getProgress()`).
-//   * `EditText.native_getText(long) -> String` (EditText.java:25, feeds `getText()`/`getEditableText()`).
-//   * `Button.getText() -> CharSequence` (Button.java:51).
-//   * `CheckBox`/`RadioButton` `isChecked() -> boolean` + their coupled `setChecked(boolean)` — a
-//     stateful boolean pair with NO consumed view-registry field; no-op'ing `setChecked` while
-//     `isChecked` reads it back would be a silent wrong answer, so BOTH stay unbound (the loud
-//     `isChecked` trip is the honest signal) rather than faking the setter.
-//   * The remaining listener registrations (`*OnClickListener`/`*OnCheckedChangeListener`/
-//     `setOnSeekBarChangeListener`/`setOnItemSelectedListener`) — whether they fire is
-//     RBX-bytecode/owner-run-data-gated, so each stays the deliberate discovery signal.
-//
-// 2026-06-13: EditText's `native_addTextChangedListener`/`native_removeTextChangedListener`/
-// `native_setOnEditorActionListener` ARE bound below (the RbxKeyboard/AppCompatEditText construction
-// path reaches them — live boot 2026-06-13) with honest RECORD-the-listener semantics: each RETAINS a
-// global ref to the listener on the `view_registry` peer (Eclipse's `EditText` keeps no Java field, so
-// the native must hold it). No input occurs during boot, so recording is complete + correct now;
-// DISPATCHING the TextWatcher/editor-action callbacks on real input is a future input-integration step.
-
-// JNI names + descriptors, exactly as declared in the vendored ATL overlay. The `native_setText`
-// text-recording setters all share `(JLjava/lang/String;)V` (an explicit `long widget` + String) but
-// are declared on three different classes, so each is bound on its own class with the shared body.
 const WIDGET_NATIVE_SET_TEXT_NAME: &JNIStr = jni_str!("native_setText");
 const WIDGET_NATIVE_SET_TEXT_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
 
-// `RadioButton.setText(CharSequence)` (RadioButton.java:29) is a native taking a CharSequence and no
-// explicit widget (reads `this.widget`), descriptor `(Ljava/lang/CharSequence;)V`.
 const RADIO_BUTTON_SET_TEXT_NAME: &JNIStr = jni_str!("setText");
 const RADIO_BUTTON_SET_TEXT_SIG: &JNIStr = jni_str!("(Ljava/lang/CharSequence;)V");
 
-// `ProgressBar.native_setIndeterminate(boolean)` (ProgressBar.java:106) reads `this.widget`, `(Z)V`.
 const PROGRESS_BAR_SET_INDETERMINATE_NAME: &JNIStr = jni_str!("native_setIndeterminate");
 const PROGRESS_BAR_SET_INDETERMINATE_SIG: &JNIStr = jni_str!("(Z)V");
-// `ProgressBar.native_setProgress(long, float)` (ProgressBar.java:50), `(JF)V`. SeekBar re-declares the
-// same `native_setProgress` (SeekBar.java:19) on its own class — same name/sig, bound there too.
+
 const PROGRESS_NATIVE_SET_PROGRESS_NAME: &JNIStr = jni_str!("native_setProgress");
 const PROGRESS_NATIVE_SET_PROGRESS_SIG: &JNIStr = jni_str!("(JF)V");
-// `SeekBar.native_setMax(long, int)` (SeekBar.java:21), `(JI)V`.
+
 const SEEK_BAR_SET_MAX_NAME: &JNIStr = jni_str!("native_setMax");
 const SEEK_BAR_SET_MAX_SIG: &JNIStr = jni_str!("(JI)V");
-// `Button.native_setCompoundDrawables(long, long)` (Button.java:43), `(JJ)V` — the `long paintable` is
-// a Drawable peer handle, not a view-registry handle.
+
 const BUTTON_SET_COMPOUND_DRAWABLES_NAME: &JNIStr = jni_str!("native_setCompoundDrawables");
 const BUTTON_SET_COMPOUND_DRAWABLES_SIG: &JNIStr = jni_str!("(JJ)V");
-// `Spinner.native_setAdapter(long, SpinnerAdapter)` (Spinner.java:27), `(JLandroid/widget/SpinnerAdapter;)V`.
+
 const SPINNER_SET_ADAPTER_NAME: &JNIStr = jni_str!("native_setAdapter");
 const SPINNER_SET_ADAPTER_SIG: &JNIStr = jni_str!("(JLandroid/widget/SpinnerAdapter;)V");
 
-// 2026-06-13: EditText's listener-registration natives, all declared native in the vendored overlay
-// (`EditText.java:26/27/28`) and reached on the RbxKeyboard/AppCompatEditText construction path
-// (live boot 2026-06-13: `No implementation found for void
-// android.widget.EditText.native_addTextChangedListener(long, android.text.TextWatcher)` at
-// `addTextChangedListener` → `AppCompatEditText.<init>` → `RbxKeyboard.<init>` → `LayoutInflater` →
-// `ActivityNativeMain.onCreate`). Honest RECORD-the-listener semantics: `EditText.addTextChangedListener`
-// / `setOnEditorActionListener` (EditText.java:52/57) pass the listener STRAIGHT to the native with no
-// Java field, so the native must RETAIN it (a `view_registry` global ref on the peer) or it is collected
-// the moment the call returns. No input occurs during boot, so recording is the complete correct
-// behavior now; actually DISPATCHING `TextWatcher.onTextChanged`/`onEditorAction` on real input is a
-// future input-integration step. `addTextChangedListener`/`removeTextChangedListener` share
-// `(JLandroid/text/TextWatcher;)V`; the editor-action listener is the nested `TextView$OnEditorActionListener`
-// (TextView.java:287, an unqualified nested type resolved through EditText's TextView supertype).
 const EDIT_TEXT_ADD_TEXT_CHANGED_LISTENER_NAME: &JNIStr = jni_str!("native_addTextChangedListener");
 const EDIT_TEXT_REMOVE_TEXT_CHANGED_LISTENER_NAME: &JNIStr =
     jni_str!("native_removeTextChangedListener");
@@ -12573,47 +8345,22 @@ const EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_NAME: &JNIStr =
     jni_str!("native_setOnEditorActionListener");
 const EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG: &JNIStr =
     jni_str!("(JLandroid/widget/TextView$OnEditorActionListener;)V");
-// 2026-06-14: EditText.native_getText(long widget) → String (EditText.java:25). `EditText.getText()`
-// wraps it in a SpannableStringBuilder. Roblox's RbxKeyboard polls the FOCUSED field's getText(), so
-// this is also Eclipse's signal for "which EditText is the active text input" (see ACTIVE_TEXT_FIELD).
+
 const EDIT_TEXT_GET_TEXT_NAME: &JNIStr = jni_str!("native_getText");
 const EDIT_TEXT_GET_TEXT_SIG: &JNIStr = jni_str!("(J)Ljava/lang/String;");
 
-/// 2026-06-14: the [`view_registry`] handle of the `EditText` the engine is currently using as its text
-/// input — the field whose `native_getText` it most recently called (`RbxKeyboard` polls the focused
-/// field's `getText()`). `0` = none. Host-typed characters route here (see
-/// [`type_into_active_text_field`]); set by [`edit_text_native_get_text`]. A process-global atomic
-/// (single ART process; the value is just a `view_registry` handle, re-validated under the registry
-/// lock on use, so a stale value is a sound no-op, never UB).
-///
-/// 2026-07-02: this is a de-facto SECOND focus record beside `view_registry`'s `FOCUSED_VIEW`
-/// (written only by `View.nativeRequestFocus`); `View.nativeIsFocused` serves ONLY the latter and
-/// carries a one-shot divergence WARN — see [`view_native_is_focused`]'s doc before unifying them.
 static ACTIVE_TEXT_FIELD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-/// The currently-focused text field's [`view_registry`] handle, or `0` if none. Lets the graphics
-/// synthetic-input harness re-tap until a field is actually focused before typing (focus-on-tap is
-/// asynchronous + occasionally missed). 2026-06-14.
 pub fn active_text_field() -> i64 {
     ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Clear the host's text-input routing before a pointer press enters Roblox's engine surface.
-/// Android normally transfers focus away from an `EditText` when another control/content surface is
-/// pressed. Eclipse's headless view layer has no window focus manager, so the last field polled by
-/// `RbxKeyboard` otherwise remains active across navigation and printable game keys are appended to
-/// that stale field instead of reaching `nativePassKeyEvent`.
-///
-/// Returns whether a field was active. A click on another textbox is safe: its subsequent
-/// `native_getText` poll records the newly focused field again.
 pub fn clear_active_text_field() -> bool {
     let widget = ACTIVE_TEXT_FIELD.swap(0, std::sync::atomic::Ordering::AcqRel);
     record_textbox_session(None);
     widget != 0
 }
 
-/// Invalidate one observed textbox only if it is still the active one. The conditional exchange is
-/// used after a JNI query so a late answer for an old field cannot clear a newer focus session.
 fn clear_active_text_field_if(widget: i64) {
     if widget != 0
         && ACTIVE_TEXT_FIELD
@@ -12629,10 +8376,6 @@ fn clear_active_text_field_if(widget: i64) {
     }
 }
 
-/// One coherent engine textbox answer, keyed to the exact `EditText` whose text Eclipse would draw.
-/// Geometry/type without this identity is unsafe: the active field can advance from username to
-/// password between independent reads, making a stale non-secure type authorize plaintext from the
-/// new secure field. 2026-07-17.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TextboxSession {
     widget: i64,
@@ -12640,11 +8383,8 @@ struct TextboxSession {
     input_type: i32,
 }
 
-/// The focused textbox's complete snapshot. One mutex makes widget identity, geometry, and input type
-/// advance/invalidate atomically; the Vulkan render thread reads this once per active-field frame.
 static TEXTBOX_SESSION: std::sync::Mutex<Option<TextboxSession>> = std::sync::Mutex::new(None);
 
-/// The cached focused-textbox geometry `(x, y, w, h)`, or `None`.
 pub fn textbox_geometry() -> Option<(i32, i32, u32, u32)> {
     TEXTBOX_SESSION
         .lock()
@@ -12652,7 +8392,6 @@ pub fn textbox_geometry() -> Option<(i32, i32, u32, u32)> {
         .and_then(|session| session.map(|session| session.geometry))
 }
 
-/// The cached focused-textbox `textInputType` (engine enum), or `i32::MIN` if no field is focused.
 pub fn textbox_input_type() -> i32 {
     TEXTBOX_SESSION
         .lock()
@@ -12661,19 +8400,12 @@ pub fn textbox_input_type() -> i32 {
         .unwrap_or(i32::MIN)
 }
 
-/// The exact live overlay snapshot for one field identity.
 pub(crate) struct ActiveTextOverlay {
     pub(crate) text: String,
     pub(crate) geometry: (i32, i32, u32, u32),
     pub(crate) input_type: i32,
 }
 
-/// Return text + geometry + input type for ONE live field identity.
-///
-/// The session is copied under its mutex, then the text is read from that session's registry peer.
-/// `ACTIVE_TEXT_FIELD` is checked on both sides of the registry read; if focus changes at either
-/// boundary, nothing is returned. Rendering nothing for one frame is safe, while rendering text under
-/// metadata belonging to another field can disclose a password.
 pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
     let session = TEXTBOX_SESSION.lock().ok().and_then(|session| *session)?;
     if !textbox_session_matches_active(
@@ -12710,26 +8442,13 @@ fn has_live_textbox_session(widget: i64) -> bool {
         .is_some_and(|session| textbox_session_matches_active(session, widget))
 }
 
-/// 2026-07-17: the ONE writer of the focused-textbox cache. Widget identity, geometry, and input type
-/// describe one textbox session and MUST advance/invalidate atomically — `Some` records one complete
-/// live snapshot, `None` clears it.
-///
-/// Why this exists: the old input-type cache had one store and no clear anywhere in the tree, so a
-/// mask outlived the session that justified it. Measured (`/tmp/eclipse-owner-manual2.log`):
-/// `text_input_type=5` (secure) was recorded ONCE at 06:09:29 and never again across three credential
-/// fields AND the home screen, while the overlay was still compositing the credential `EditText`'s
-/// text at 06:11:40 — 20 s after `onAppReady: Home`. The masking coin merely landed the safe way up:
-/// had the last recorded type been the username's `7`, the same incoherence would have rendered the
-/// password in PLAINTEXT. The 07:53 live boot then proved that merely clearing geometry/type together
-/// was still insufficient: the full-screen probe could combine cleared metadata with text retained by
-/// `ACTIVE_TEXT_FIELD`. `TextboxSession.widget` now binds all three pieces to one identity.
 fn record_textbox_session(session: Option<TextboxSession>) {
     match session {
         Some(session) => {
             if let Ok(mut current) = TEXTBOX_SESSION.lock() {
                 *current = Some(session);
             }
-            // Log once per distinct value (so the username vs password input-type values surface).
+
             static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
             if LAST.swap(session.input_type, std::sync::atomic::Ordering::Relaxed)
                 != session.input_type
@@ -12748,23 +8467,12 @@ fn record_textbox_session(session: Option<TextboxSession>) {
     }
 }
 
-/// Query the engine for the focused textbox's geometry (`NativeGLInterface.nativeGetTextBoxInfo` →
-/// `x/y/width/height` floats) and cache it for the overlay. MUST be called on the JNI-attached main thread
-/// (the engine's `getTextBoxInfo` is a normal Java-thread query — no reentrancy into Eclipse).
-///
-/// 2026-07-17: the cache holds a session only while the engine's last ANSWERED query described a
-/// complete, drawable one. Once `nativeGetTextBoxInfo` has answered, EVERY exit records that answer via
-/// [`record_textbox_session`] — a null info (no active textbox), a degenerate rect, or an unreadable
-/// field all clear BOTH halves. Failing closed (the overlay skips a frame) is correct where failing open
-/// re-renders a previous session's credentials under a previous session's mask. A query that never got
-/// an answer (the class/method is missing, or the call itself throws) is NOT an answer and deliberately
-/// leaves the cache unchanged — see the `checked` arms below.
 pub fn query_textbox_geometry(vm: &Vm) {
     let raw = vm.as_raw();
     if raw.is_null() {
         return;
     }
-    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
     if widget == 0 {
@@ -12789,11 +8497,9 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 )?
                 .l()
             }) else {
-                // The query never answered — no information, so the cache is left as it is.
                 return;
             };
             if info.is_null() {
-                // The engine's own "no textbox is focused" signal — authoritative. 2026-07-17.
                 clear_active_text_field_if(widget);
                 return;
             }
@@ -12809,7 +8515,7 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 record_textbox_session(None);
                 return;
             };
-            // Read one `float` field of `info` by name (getDeclaredField → setAccessible → getFloat).
+
             let read = |env: &mut Env, name: &str| -> Option<f32> {
                 let jname = env.new_string(name).ok()?;
                 let field = checked(env, "Class.getDeclaredField", |env| {
@@ -12851,7 +8557,7 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 record_textbox_session(None);
                 return;
             };
-            // Read the `int` textInputType (for password masking): getDeclaredField → setAccessible → getInt.
+
             let input_type = (|| -> Option<i32> {
                 let jname = env.new_string("textInputType").ok()?;
                 let field = checked(env, "Class.getDeclaredField", |env| {
@@ -12884,10 +8590,7 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 })
                 .ok()
             })();
-            // 2026-07-17: a session needs BOTH a drawable rect and its input type. A degenerate rect
-            // (nothing to draw on) or an unreadable `textInputType` (nothing to mask WITH) is not one:
-            // recording the halves independently is what let the geometry advance to the password while
-            // the mask still described the username.
+
             match (w > 0.0 && h > 0.0, input_type) {
                 (true, Some(input_type))
                     if ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire) == widget =>
@@ -12905,16 +8608,6 @@ pub fn query_textbox_geometry(vm: &Vm) {
     });
 }
 
-/// `<Widget>.native_setText(long widget, String text)` → record the text on the receiver's
-/// [`view_registry`] peer (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void with an explicit `long widget` first arg (Button.java:40,
-/// EditText.java:29, CheckBox.java:44; all `(JLjava/lang/String;)V`). Records `text` (null → cleared)
-/// on the peer through the bounds+generation-checked [`view_registry`] (a stale/fabricated handle is
-/// logged + ignored, never UB). The renderer draws `RenderNode.text`, so this is consumed state.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn widget_native_set_text<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -12928,7 +8621,6 @@ extern "system" fn widget_native_set_text<'local>(
             Some(text.try_to_string(env)?)
         };
         match view_registry::with_view(widget, |v| v.text = value.clone()) {
-            // 2026-07-17: keep the all-widget logging rule structural, even for choice labels.
             Ok(()) => tracing::debug!(
                 target: "android.widget",
                 widget,
@@ -12947,22 +8639,12 @@ extern "system" fn widget_native_set_text<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `EditText.native_getText(long widget) -> String` → return the text recorded on the receiver's
-/// [`view_registry`] peer (empty if none) AND mark `widget` as the active text-input field
-/// ([`ACTIVE_TEXT_FIELD`]) so host-typed characters route to it. Roblox's `RbxKeyboard` polls the
-/// FOCUSED field's `getText()`, so this call IS the "which field is focused" signal (2026-06-14).
-///
-/// JNI ABI: an INSTANCE native returning `java.lang.String`, descriptor `(J)Ljava/lang/String;`
-/// (EditText.java:25). The framework's first VALUE-returning native: `with_env(...).resolve::<P>()`
-/// needs the return type `Default` for the error fallback — `JString<'local>` is `Default` (a null
-/// string ref), the AOSP-sound result for getText on a broken peer.
 extern "system" fn edit_text_native_get_text<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     widget: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        // The engine reads the focused field's text via getText(); record it as the active input field.
         ACTIVE_TEXT_FIELD.store(widget, std::sync::atomic::Ordering::Release);
         let text = view_registry::with_view(widget, |v| v.text.clone())
             .ok()
@@ -12973,33 +8655,23 @@ extern "system" fn edit_text_native_get_text<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Pure: apply one keystroke to `old` and return `(new_text, start, before, count)` — the Android
-/// `onTextChanged(s, start, before, count)` delta for that single edit (`count` chars at `start`
-/// replaced `before` chars). Appends a printable `unicode` codepoint; `backspace` removes the last
-/// char; a non-printable codepoint or backspace-on-empty is a no-op (`before == count == 0`). Operates
-/// on Unicode chars (not bytes), so indices are char offsets. VM/registry-free → unit-testable.
-/// 2026-06-14.
 fn apply_text_edit(old: &str, unicode: i32, backspace: bool) -> (String, jint, jint, jint) {
     let old_len = jint::try_from(old.chars().count()).unwrap_or(jint::MAX);
     let mut s = old.to_string();
     if backspace {
         return if s.pop().is_some() {
-            (s, old_len - 1, 1, 0) // removed 1 char at the new end
+            (s, old_len - 1, 1, 0)
         } else {
-            (s, 0, 0, 0) // nothing to delete (empty)
+            (s, 0, 0, 0)
         };
     }
     if let Some(c) = char::from_u32(unicode as u32).filter(|c| !c.is_control()) {
         s.push(c);
-        return (s, old_len, 0, 1); // appended 1 char at the old end
+        return (s, old_len, 0, 1);
     }
-    (s, 0, 0, 0) // non-printable / unmappable — no text change
+    (s, 0, 0, 0)
 }
 
-/// Pure: map a typed `unicode` codepoint (or `backspace`) to the `(KEYCODE_*, metaState)` pair the engine
-/// expects from `nativePassKeyEvent`, or `None` if the codepoint is not one of the credential-typing keys
-/// Eclipse forwards. Android constants: `KEYCODE_A`=29, `KEYCODE_0`=7, `KEYCODE_SPACE`=62, `KEYCODE_DEL`=67,
-/// `META_SHIFT_ON`=1 (set for uppercase letters). VM-free → unit-testable. 2026-06-14.
 fn android_keycode_for(unicode: i32, backspace: bool) -> Option<(jint, jint)> {
     if backspace {
         return Some((67, 0));
@@ -13014,14 +8686,6 @@ fn android_keycode_for(unicode: i32, backspace: bool) -> Option<(jint, jint)> {
     }
 }
 
-/// Forward one keystroke to the engine's OWN key bridge, `NativeGLInterface.nativePassKeyEvent(boolean
-/// isDown, int keyCode, int metaState, boolean isRepeat)`, as a DOWN+UP pair. This is the engine's
-/// hardware-keyboard path — the one Roblox uses to draw typed characters in a focused TextBox on
-/// desktop/console — and is distinct from the IME-text bridges ([`sync_engine_textbox`]). The engine
-/// derives the character from `keyCode`+`metaState` (the `getUnicodeChar` model), so we map the codepoint
-/// to an Android `KEYCODE_*` (+ `META_SHIFT_ON` for uppercase). Only credential-typing keys are mapped; an
-/// unmappable codepoint is skipped. All args are value types (no handle) → crash-safe; a missing
-/// class/method or JNI throw is described+cleared, never fatal. 2026-06-14.
 fn pass_key_event_to_engine(vm: &Vm, unicode: i32, backspace: bool) {
     let Some((key_code, meta)) = android_keycode_for(unicode, backspace) else {
         return;
@@ -13030,7 +8694,7 @@ fn pass_key_event_to_engine(vm: &Vm, unicode: i32, backspace: bool) {
     if raw.is_null() {
         return;
     }
-    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -13064,48 +8728,25 @@ fn pass_key_event_to_engine(vm: &Vm, unicode: i32, backspace: bool) {
     });
 }
 
-/// Which per-keystroke host-input delivery paths fire (env `ECLIPSE_TEXT_PATHS`, cached). Letters:
-/// `w` EditText TextWatcher (RbxKeyboard validation → "Next"), `p` `nativePassText`, `s`
-/// `syncTextboxTextAndCursorPosition2`, `k` `nativePassKeyEvent`, `e` `updateKeyboardSize`. Default `w`
-/// (TextWatcher only — detection without the kick-out/tripling the engine-render bridges cause; the
-/// overlay handles display). Firing multiple text-delivery paths duplicates each typed char. 2026-06-14.
 fn text_paths() -> &'static str {
     static PATHS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    // Default `w` (the EditText TextWatcher only): it delivers typed text to the engine for DETECTION/
-    // validation (RbxKeyboard's standard path — confirmed live: the username resolved + advanced to the
-    // password step) WITHOUT the per-keystroke kick-out/tripling the other engine bridges (`p`/`s`/`k`,
-    // esp. composing) cause. The VISIBLE text is drawn by the Vulkan overlay, not the engine, so no
-    // engine-render bridge is needed. 2026-06-14.
+
     PATHS.get_or_init(|| std::env::var("ECLIPSE_TEXT_PATHS").unwrap_or_else(|_| "w".to_string()))
 }
 
-/// Route a host keystroke into the active text-input `EditText` — the field whose `native_getText` the
-/// engine last polled ([`ACTIVE_TEXT_FIELD`]). A printable `unicode` codepoint is appended; `backspace`
-/// removes the last char. Mutates the field's [`view_registry`] `text` and fires the retained
-/// `TextWatcher`s (via [`fire_text_watchers`]) so the engine reads the updated `getText()` and re-renders
-/// the field. Returns `true` iff a valid active field was edited (the caller then does NOT also forward
-/// the key to the game surface); `false` → no active field (a stale handle self-clears). 2026-06-14.
 pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bool {
     let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Relaxed);
     if widget == 0 {
         return false;
     }
-    // `native_getText` is only a focus heuristic: an old RbxKeyboard poll can survive a LuaApp →
-    // game transition. Require the engine's current `NativeTextBoxInfo` snapshot to authenticate the
-    // same widget before swallowing a printable hardware key. Without this check the 2026-07-22 live
-    // session routed W/A/S/D into the home search field for the entire game.
+
     if !has_live_textbox_session(widget) {
-        // Do not drop the first character merely because the normal main-loop geometry poll has not
-        // run since focus changed. Authenticate once synchronously; a stale field yields the engine's
-        // null answer, clears itself, and falls through to gameplay input.
         query_textbox_geometry(vm);
     }
     if !has_live_textbox_session(widget) {
         return false;
     }
-    // Edit the stored text under the registry lock, computing the precise `onTextChanged` delta via the
-    // pure [`apply_text_edit`]; capture the result to notify watchers OUTSIDE the lock (an engine
-    // TextWatcher re-enters the registry via getText → with_view, which would deadlock).
+
     let edited = view_registry::with_view(widget, |v| {
         let old = v.text.clone().unwrap_or_default();
         let (new, start, before, count) = apply_text_edit(&old, unicode, backspace);
@@ -13114,51 +8755,35 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
     });
     match edited {
         Ok((old_text, new_text, start, before, count)) => {
-            // 2026-06-14: each keystroke can reach the engine via several delivery paths; firing more than
-            // one duplicates the character (one keypress rendered N times). `text_paths()` selects which
-            // fire so the single clean path can be isolated. Letters: `w` TextWatcher (validation/Next),
-            // `p` nativePassText, `s` syncTextbox, `k` nativePassKeyEvent, `e` updateKeyboardSize.
             let paths = text_paths();
-            // (w) Fire the EditText TextWatcher contract (validation — enables e.g. the "Next" button).
+
             if paths.contains('w') {
                 fire_text_watchers(vm, widget, &old_text, &new_text, start, before, count);
             }
-            // (p/s/e) Push the full text + cursor to the engine's Lua TextBox (the engine renders its own
-            // textbox, not the Android EditText). `sync_engine_textbox` internally honors `paths`.
+
             let cursor = jint::try_from(new_text.chars().count()).unwrap_or(jint::MAX);
             sync_engine_textbox(vm, &new_text, cursor);
-            // (k) Forward the keystroke via the engine's hardware-key bridge — an APPEND path (it adds a
-            // char on top of nativePassText), so it is the prime duplication suspect; off unless selected.
+
             if paths.contains('k') {
                 pass_key_event_to_engine(vm, unicode, backspace);
             }
             true
         }
         Err(_) => {
-            // Stale handle (the field's peer was destroyed, e.g. on navigation) — clear + not active.
             clear_active_text_field_if(widget);
             false
         }
     }
 }
 
-/// Push the active text field's full `text` + `cursor` to the engine's Lua TextBox via the engine's own
-/// `com.roblox.engine.jni.NativeGLInterface.syncTextboxTextAndCursorPosition2(String, int)` bridge
-/// (a static native the engine exports + Java calls to sync its on-screen text input — discovered via
-/// reflection, [`reflect_engine_input_methods`]). The engine RENDERS its Lua TextBox from this, not from
-/// the Android `EditText`, so this is what makes host-typed text VISIBLE in the field. Best-effort: a
-/// missing class/method or a JNI throw is described+cleared, never fatal. 2026-06-14.
 fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
     let raw = vm.as_raw();
     if raw.is_null() {
         return;
     }
-    // 2026-06-14 experiment (ECLIPSE_TEXT_COMPOSING): deliver each keystroke to `nativePassText` as IME
-    // COMPOSING/preedit text (`isComposing=true`) instead of committed (`false`) — the one delivery
-    // variant untested for whether the engine draws the field text LIVE (preedit is what some engines
-    // render live). Default off (committed). A/B without rebuilding.
+
     let composing = std::env::var_os("ECLIPSE_TEXT_COMPOSING").is_some();
-    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -13173,13 +8798,13 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
                 return;
             };
             let paths = text_paths();
-            // updateKeyboardSize(boolean shown, int x, int y, int w, int h) tells the engine the soft
-            // keyboard is visible. On Android the engine only activates its on-screen text-input rendering
-            // once the IME reports shown; Eclipse has no real soft keyboard (ATL stubs showSoftInput), so
-            // without this the engine accepts text for validation (Next enables) but never RENDERS it in the
-            // focused TextBox. We assert shown + a plausible bottom-strip rect before pushing text. The exact
-            // rect is non-gating (the engine pans layout off it); the `shown` flag is what unlocks the render
-            // path. 2026-06-14.
+
+
+
+
+
+
+
             if paths.contains('e') {
             if let Err(e) = checked(env, "NativeGLInterface.updateKeyboardSize", |env| {
                 env.call_static_method(
@@ -13199,10 +8824,10 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
                 tracing::debug!(error = %e, "updateKeyboardSize threw (cleared)");
             }
             }
-            // nativePassText(long eventTime, String text, boolean isComposing, int cursor) — the engine
-            // RENDERS the focused TextBox text LIVE from this when `isComposing=true` (IME preedit;
-            // env `ECLIPSE_TEXT_COMPOSING`), the confirmed live-display path. The `long` is an eventTime,
-            // not a textbox handle (NativeTextBoxInfo exposes no handle), so 0 is safe. 2026-06-14.
+
+
+
+
             if paths.contains('p') {
             if let Err(e) = checked(env, "NativeGLInterface.nativePassText", |env| {
                 env.call_static_method(
@@ -13243,12 +8868,6 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
     });
 }
 
-/// Fire `TextWatcher.onTextChanged` on each watcher retained for the EditText `widget`, so an engine
-/// that observes the field via `addTextChangedListener` (Roblox's `RbxKeyboard`) reads the new
-/// `getText()` and re-renders. The watcher `Global`s live in [`view_registry`] (not `Clone`); their raw
-/// refs are snapshotted UNDER the registry lock (just copying pointers — no JNI), then the JNI calls run
-/// OUTSIDE the lock (a watcher re-enters the registry via getText). Best-effort: a null VM, no watchers,
-/// or a JNI/Java error is logged + skipped, never fatal. 2026-06-14.
 fn fire_text_watchers(
     vm: &Vm,
     widget: jlong,
@@ -13258,10 +8877,6 @@ fn fire_text_watchers(
     before: jint,
     count: jint,
 ) {
-    // SAFETY of the raw-ref snapshot: each `jobject` is the live global ref of a `Global` stored in the
-    // registry for `widget`; those `Global`s are not dropped during this call (they stay in the slot),
-    // so each pointer is valid for the JNI calls below. We wrap them as non-owning `JObject`s (drop is a
-    // no-op — they are NOT owned locals), so no global ref is wrongly deleted.
     let ptrs: Vec<jni::sys::jobject> = match view_registry::with_view(widget, |v| {
         v.text_watchers
             .iter()
@@ -13278,17 +8893,16 @@ fn fire_text_watchers(
     if raw.is_null() {
         return;
     }
-    // SAFETY: `raw` is the live process `*mut JavaVM` (kept alive by `&Vm`, non-null) — exactly
-    // `JavaVM::from_raw`'s contract, same as the other dispatch paths.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
             let s = env.new_string(new_text)?;
             let old_s = env.new_string(old_text)?;
-            // Build an Editable (SpannableStringBuilder) holding the new text for afterTextChanged — many
-            // TextWatchers (incl. the engine's) update the model/display in afterTextChanged, not just
-            // onTextChanged. Built once; reused per watcher. None on a class/ctor error (afterTextChanged
-            // is then skipped — onTextChanged still fires).
+
+
+
+
             let editable = match env.find_class(jni_str!("android/text/SpannableStringBuilder")) {
                 Ok(cls) => env
                     .new_object(
@@ -13300,13 +8914,13 @@ fn fire_text_watchers(
                 Err(_) => None,
             };
             for ptr in &ptrs {
-                // SAFETY: see the snapshot note above — `*ptr` is a live global ref; a non-owning view
-                // (`from_raw`'s `&Env` only binds the lifetime, it does not retain a borrow of `env`).
+
+
                 let watcher = unsafe { JObject::from_raw(env, *ptr) };
-                // TextWatcher.beforeTextChanged(CharSequence s=OLD text, int start, int count, int after):
-                // `count` old chars at `start` are about to be replaced by `after` new chars. The full
-                // contract (before→on→after) is what a real EditText fires; the engine's display logic may
-                // need the before-state. Maps our delta: count = `before` (replaced), after = `count` (inserted).
+
+
+
+
                 if let Err(e) = checked(env, "TextWatcher.beforeTextChanged", |env| {
                     env.call_method(
                         &watcher,
@@ -13323,8 +8937,8 @@ fn fire_text_watchers(
                 }) {
                     tracing::debug!(error = %e, "TextWatcher.beforeTextChanged threw (cleared, continuing)");
                 }
-                // TextWatcher.onTextChanged(CharSequence s, int start, int before, int count): `count`
-                // chars at `start` just replaced `before` chars (the exact single-keystroke delta).
+
+
                 if let Err(e) = checked(env, "TextWatcher.onTextChanged", |env| {
                     env.call_method(
                         &watcher,
@@ -13341,7 +8955,7 @@ fn fire_text_watchers(
                 }) {
                     tracing::debug!(error = %e, "TextWatcher.onTextChanged threw (cleared, continuing)");
                 }
-                // TextWatcher.afterTextChanged(Editable s): the final edit hook (display/model sync).
+
                 if let Some(ed) = &editable {
                     if let Err(e) = checked(env, "TextWatcher.afterTextChanged", |env| {
                         env.call_method(
@@ -13364,18 +8978,12 @@ fn fire_text_watchers(
     });
 }
 
-/// Dev-host diagnostic (env `ECLIPSE_REFLECT_INPUT`): log the engine's input-bridge classes' declared
-/// methods via JNI reflection (a runtime API on loaded classes — NOT binary RE; Eclipse already reflects
-/// Roblox classes' native methods by design, jni_register.rs), so the orchestrator can read the exact
-/// signature of the engine's text-input native (`NativeGLInterface.nativePassText` /
-/// `NativeInputInterface.nativePassInput`, per `native_provider`'s note) — the candidate path for VISIBLE
-/// login typing (the engine's display reads its own input buffer, not the EditText TextWatcher). 2026-06-14.
 pub fn reflect_engine_input_methods(vm: &Vm) {
     let raw = vm.as_raw();
     if raw.is_null() {
         return;
     }
-    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -13424,7 +9032,7 @@ pub fn reflect_engine_input_methods(vm: &Vm) {
                     }) else {
                         continue;
                     };
-                    // SAFETY: toString returns a String; wrap the ref (env binds the lifetime).
+
                     let s = unsafe { JString::from_raw(env, s_obj.into_raw()) };
                     if let Ok(desc) = s.try_to_string(env) {
                         if desc.contains("Pass")
@@ -13443,16 +9051,6 @@ pub fn reflect_engine_input_methods(vm: &Vm) {
     });
 }
 
-/// `RadioButton.setText(CharSequence text)` → record the text on the receiver's [`view_registry`] peer
-/// (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void with descriptor `(Ljava/lang/CharSequence;)V` — no widget
-/// param; the handle is read off `this.widget`. `text` is a `CharSequence`; its `toString()` is the
-/// recorded label (null → cleared). Records it through the bounds+generation-checked [`view_registry`]
-/// (a bad handle is logged + ignored, never UB); the renderer draws `RenderNode.text`.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn radio_button_set_text<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -13460,8 +9058,7 @@ extern "system" fn radio_button_set_text<'local>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let widget = view_widget_handle(env, &this);
-        // A CharSequence is not a String — call toString() to get the displayable text. A null
-        // CharSequence clears the text (records None).
+
         let value = if text.is_null() {
             None
         } else {
@@ -13476,7 +9073,6 @@ extern "system" fn radio_button_set_text<'local>(
             Some(JString::cast_local(env, s)?.try_to_string(env)?)
         };
         match view_registry::with_view(widget, |v| v.text = value.clone()) {
-            // 2026-07-17: labels share the UI-text privacy rule; log metadata, never content.
             Ok(()) => tracing::debug!(
                 target: "android.widget.RadioButton",
                 widget,
@@ -13495,17 +9091,6 @@ extern "system" fn radio_button_set_text<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `ProgressBar.native_setIndeterminate(boolean indeterminate)` → validate the handle; no-op
-/// (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void with descriptor `(Z)V` — no widget param; the handle is
-/// read off `this.widget`. The headless renderer draws no progress-bar chrome and no bound native
-/// getter reads the flag back (`ProgressBar.isIndeterminate()` returns a Java field, ProgressBar.java:52),
-/// so this validates the handle through the bounds+generation-checked [`view_registry`] (a bad handle
-/// is logged + ignored, never UB) and no-ops — the honest backing of the surfaced trigger.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn progress_bar_set_indeterminate<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -13534,17 +9119,6 @@ extern "system" fn progress_bar_set_indeterminate<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `<ProgressBar|SeekBar>.native_setProgress(long widget, float fraction)` → validate the handle; no-op
-/// (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void with an explicit `long widget` first arg (ProgressBar.java:50,
-/// SeekBar.java:19; both `(JF)V`). The headless renderer draws no progress chrome and no bound native
-/// getter reads the value back (ProgressBar's `getProgress()` is a Java field; SeekBar's
-/// `native_getProgress` is left UNBOUND), so this validates the handle through the bounds+generation-
-/// checked [`view_registry`] (a bad handle is logged + ignored, never UB) and no-ops.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn progress_native_set_progress<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -13571,15 +9145,6 @@ extern "system" fn progress_native_set_progress<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `SeekBar.native_setMax(long widget, int max)` → validate the handle; no-op (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void, descriptor `(JI)V` (SeekBar.java:21). The headless
-/// renderer draws no seek-bar chrome and no bound native getter reads `max` back (`native_getProgress`
-/// is left UNBOUND), so this validates the handle through the bounds+generation-checked [`view_registry`]
-/// (a bad handle is logged + ignored, never UB) and no-ops.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn seek_bar_set_max<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -13606,18 +9171,6 @@ extern "system" fn seek_bar_set_max<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Button.native_setCompoundDrawables(long widget, long paintable)` → validate the view handle; no-op
-/// (compound-drawable draw deferred, 2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void, descriptor `(JJ)V` (Button.java:43). `widget` is the
-/// view's [`view_registry`] handle; `paintable` is a `Drawable` peer handle (the non-pointer sentinel
-/// from `Drawable.native_constructor`) — taken but NOT dereferenced (not a registry handle). Validates
-/// the `widget` handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
-/// ignored, never UB) and no-ops: compound-drawable rasterization is the deferred drawable/Skia path,
-/// mirroring [`view_native_set_background_drawable`].
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn button_set_compound_drawables<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -13644,18 +9197,6 @@ extern "system" fn button_set_compound_drawables<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Spinner.native_setAdapter(long widget, SpinnerAdapter adapter)` → validate the view handle; no-op
-/// (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void, descriptor `(JLandroid/widget/SpinnerAdapter;)V`
-/// (Spinner.java:27). `widget` is the view's [`view_registry`] handle; `adapter` is the Java adapter,
-/// taken but NOT dereferenced. The headless renderer draws no spinner dropdown and `Spinner.getAdapter()`
-/// returns the Java-side adapter (not a native read), so no caller depends on a native side effect; this
-/// validates the handle through the bounds+generation-checked [`view_registry`] (a bad handle is logged +
-/// ignored, never UB) and no-ops.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn spinner_set_adapter<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -13681,19 +9222,6 @@ extern "system" fn spinner_set_adapter<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `EditText.native_addTextChangedListener(long widget, TextWatcher watcher)` → RETAIN the watcher on
-/// the receiver's [`view_registry`] peer (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void, descriptor `(JLandroid/text/TextWatcher;)V`
-/// (EditText.java:26). Eclipse's `EditText.addTextChangedListener` (EditText.java:52) passes the watcher
-/// straight here with NO Java field, so the native must hold a global ref or the watcher is collected
-/// the moment this returns. Records a JNI global ref to the watcher on the peer through the
-/// bounds+generation-checked [`view_registry`] (a stale/fabricated handle is logged + ignored, never UB;
-/// a null watcher is ignored). No input occurs during boot, so retaining the listener is the complete
-/// correct behavior now — a future input-dispatch path invokes `onTextChanged(...)` on the held object.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn edit_text_add_text_changed_listener<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -13709,8 +9237,8 @@ extern "system" fn edit_text_add_text_changed_listener<'local>(
             );
             return Ok(());
         }
-        // Retain the watcher (a Send `Global`) on the peer so it outlives this call. A failure to
-        // create the global ref leaves the listener unrecorded but is non-fatal (logged, never UB).
+
+
         let global = env.new_global_ref(&watcher)?;
         match view_registry::add_text_watcher(widget, global) {
             Ok(()) => tracing::debug!(
@@ -13730,17 +9258,6 @@ extern "system" fn edit_text_add_text_changed_listener<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `EditText.native_removeTextChangedListener(long widget, TextWatcher watcher)` → drop the matching
-/// retained watcher from the receiver's [`view_registry`] peer (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void, descriptor `(JLandroid/text/TextWatcher;)V`
-/// (EditText.java:27). Drops the retained `Global` whose object is the SAME Java object as `watcher`
-/// (`IsSameObject`, a leaf identity check run under the registry lock — the same JNI-under-lock contract
-/// as [`view_registry::with_jobject`]), releasing that global ref. A stale/fabricated handle or a null
-/// watcher is logged + ignored, never UB; an unmatched watcher drops nothing (a no-op, not an error).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn edit_text_remove_text_changed_listener<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -13756,9 +9273,9 @@ extern "system" fn edit_text_remove_text_changed_listener<'local>(
             );
             return Ok(());
         }
-        // `keep` returns false for the watcher that IS the same Java object as `watcher` (dropping it,
-        // releasing its global ref). An `IsSameObject` failure conservatively keeps the watcher (false
-        // negative is safe — it stays retained, never wrongly dropped).
+
+
+
         let result = view_registry::retain_text_watchers(widget, |held| {
             !env.is_same_object(held.as_obj(), &watcher).unwrap_or(false)
         });
@@ -13781,19 +9298,6 @@ extern "system" fn edit_text_remove_text_changed_listener<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `EditText.native_setOnEditorActionListener(long widget, TextView$OnEditorActionListener l)` → RETAIN
-/// (replacing any prior) the editor-action listener on the receiver's [`view_registry`] peer (2026-06-13).
-///
-/// JNI ABI: an INSTANCE native returning void, descriptor
-/// `(JLandroid/widget/TextView$OnEditorActionListener;)V` (EditText.java:28). `EditText.setOnEditorActionListener`
-/// (EditText.java:57) passes the listener straight here with NO Java field, so the native must hold a
-/// global ref or it is collected on return. Records a JNI global ref on the peer (replacing any prior,
-/// whose `Drop` releases its ref) through the bounds+generation-checked [`view_registry`] (a
-/// stale/fabricated handle is logged + ignored; a null listener clears the recorded one). No input
-/// occurs during boot — a future IME-dispatch path invokes `onEditorAction(...)` on the held object.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic.
 extern "system" fn edit_text_set_on_editor_action_listener<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -13825,31 +9329,13 @@ extern "system" fn edit_text_set_on_editor_action_listener<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for the property-setter natives of the inflatable
-/// `android.widget.*` View subclasses, each on its OWN declaring class (ART resolves natives per
-/// declaring class). Wired before step 4 so the `LayoutInflater` pass finds them.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature. They
-/// do — every native is written to the exact descriptor the vendored ATL overlay declares (see the
-/// section comment for the per-class line references). Every body is `catch_unwind`-guarded via
-/// [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
 fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // 2026-06-13: every class binds PER METHOD (best-effort, via `register_class_natives_best_effort`)
-    // so a single entry the shipped dex disagrees with (the 58a50f6 mechanism) cannot abort the rest of
-    // a class's setters — it degrades to a deferred call-time UnsatisfiedLinkError on only that method.
-    // Each `*mut c_void` cast pairs the fn with its declared JNI descriptor (per-class line references
-    // in the section comment + below).
-
-    // Button: native_setText(long, String) records text; native_setCompoundDrawables(long, long) no-op.
     let button: [NativeBinding; 2] = [
-        // SAFETY: `widget_native_set_text` matches Button.java:40's `(JLjava/lang/String;)V`.
         (
             WIDGET_NATIVE_SET_TEXT_NAME,
             WIDGET_NATIVE_SET_TEXT_SIG,
             widget_native_set_text as *mut c_void,
         ),
-        // SAFETY: `button_set_compound_drawables` matches Button.java:43's `(JJ)V`.
         (
             BUTTON_SET_COMPOUND_DRAWABLES_NAME,
             BUTTON_SET_COMPOUND_DRAWABLES_SIG,
@@ -13858,37 +9344,27 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
     ];
     register_class_natives_best_effort(env, BUTTON_CLASS, &button)?;
 
-    // EditText: native_setText records text; the three listener natives RETAIN the listener on the peer
-    // (EditText.java:52/57 pass them straight to the native with no Java field — 2026-06-13 boot trip).
     let edit_text: [NativeBinding; 5] = [
-        // SAFETY: `widget_native_set_text` matches EditText.java:29's `(JLjava/lang/String;)V`.
         (
             WIDGET_NATIVE_SET_TEXT_NAME,
             WIDGET_NATIVE_SET_TEXT_SIG,
             widget_native_set_text as *mut c_void,
         ),
-        // SAFETY: `edit_text_native_get_text` matches EditText.java:25's `(J)Ljava/lang/String;`.
         (
             EDIT_TEXT_GET_TEXT_NAME,
             EDIT_TEXT_GET_TEXT_SIG,
             edit_text_native_get_text as *mut c_void,
         ),
-        // SAFETY: `edit_text_add_text_changed_listener` matches EditText.java:26's
-        // `(JLandroid/text/TextWatcher;)V`.
         (
             EDIT_TEXT_ADD_TEXT_CHANGED_LISTENER_NAME,
             EDIT_TEXT_TEXT_CHANGED_LISTENER_SIG,
             edit_text_add_text_changed_listener as *mut c_void,
         ),
-        // SAFETY: `edit_text_remove_text_changed_listener` matches EditText.java:27's
-        // `(JLandroid/text/TextWatcher;)V`.
         (
             EDIT_TEXT_REMOVE_TEXT_CHANGED_LISTENER_NAME,
             EDIT_TEXT_TEXT_CHANGED_LISTENER_SIG,
             edit_text_remove_text_changed_listener as *mut c_void,
         ),
-        // SAFETY: `edit_text_set_on_editor_action_listener` matches EditText.java:28's
-        // `(JLandroid/widget/TextView$OnEditorActionListener;)V`.
         (
             EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_NAME,
             EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG,
@@ -13897,37 +9373,26 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
     ];
     register_class_natives_best_effort(env, EDIT_TEXT_CLASS, &edit_text)?;
 
-    // CheckBox: native_setText(long, String) records text.
-    let check_box: [NativeBinding; 1] = [
-        // SAFETY: `widget_native_set_text` matches CheckBox.java:44's `(JLjava/lang/String;)V`.
-        (
-            WIDGET_NATIVE_SET_TEXT_NAME,
-            WIDGET_NATIVE_SET_TEXT_SIG,
-            widget_native_set_text as *mut c_void,
-        ),
-    ];
+    let check_box: [NativeBinding; 1] = [(
+        WIDGET_NATIVE_SET_TEXT_NAME,
+        WIDGET_NATIVE_SET_TEXT_SIG,
+        widget_native_set_text as *mut c_void,
+    )];
     register_class_natives_best_effort(env, CHECK_BOX_CLASS, &check_box)?;
 
-    // RadioButton: setText(CharSequence) records text.
-    let radio_button: [NativeBinding; 1] = [
-        // SAFETY: `radio_button_set_text` matches RadioButton.java:29's `(Ljava/lang/CharSequence;)V`.
-        (
-            RADIO_BUTTON_SET_TEXT_NAME,
-            RADIO_BUTTON_SET_TEXT_SIG,
-            radio_button_set_text as *mut c_void,
-        ),
-    ];
+    let radio_button: [NativeBinding; 1] = [(
+        RADIO_BUTTON_SET_TEXT_NAME,
+        RADIO_BUTTON_SET_TEXT_SIG,
+        radio_button_set_text as *mut c_void,
+    )];
     register_class_natives_best_effort(env, RADIO_BUTTON_CLASS, &radio_button)?;
 
-    // ProgressBar: native_setIndeterminate(boolean) + native_setProgress(long, float), both no-op.
     let progress_bar: [NativeBinding; 2] = [
-        // SAFETY: `progress_bar_set_indeterminate` matches ProgressBar.java:106's `(Z)V`.
         (
             PROGRESS_BAR_SET_INDETERMINATE_NAME,
             PROGRESS_BAR_SET_INDETERMINATE_SIG,
             progress_bar_set_indeterminate as *mut c_void,
         ),
-        // SAFETY: `progress_native_set_progress` matches ProgressBar.java:50's `(JF)V`.
         (
             PROGRESS_NATIVE_SET_PROGRESS_NAME,
             PROGRESS_NATIVE_SET_PROGRESS_SIG,
@@ -13936,15 +9401,12 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
     ];
     register_class_natives_best_effort(env, PROGRESS_BAR_CLASS, &progress_bar)?;
 
-    // SeekBar: native_setProgress(long, float) + native_setMax(long, int), both no-op.
     let seek_bar: [NativeBinding; 2] = [
-        // SAFETY: `progress_native_set_progress` matches SeekBar.java:19's `(JF)V`.
         (
             PROGRESS_NATIVE_SET_PROGRESS_NAME,
             PROGRESS_NATIVE_SET_PROGRESS_SIG,
             progress_native_set_progress as *mut c_void,
         ),
-        // SAFETY: `seek_bar_set_max` matches SeekBar.java:21's `(JI)V`.
         (
             SEEK_BAR_SET_MAX_NAME,
             SEEK_BAR_SET_MAX_SIG,
@@ -13953,28 +9415,19 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
     ];
     register_class_natives_best_effort(env, SEEK_BAR_CLASS, &seek_bar)?;
 
-    // Spinner: native_setAdapter(long, SpinnerAdapter) no-op.
-    let spinner: [NativeBinding; 1] = [
-        // SAFETY: `spinner_set_adapter` matches Spinner.java:27's `(JLandroid/widget/SpinnerAdapter;)V`.
-        (
-            SPINNER_SET_ADAPTER_NAME,
-            SPINNER_SET_ADAPTER_SIG,
-            spinner_set_adapter as *mut c_void,
-        ),
-    ];
+    let spinner: [NativeBinding; 1] = [(
+        SPINNER_SET_ADAPTER_NAME,
+        SPINNER_SET_ADAPTER_SIG,
+        spinner_set_adapter as *mut c_void,
+    )];
     register_class_natives_best_effort(env, SPINNER_CLASS, &spinner)?;
 
-    // ScrollView: native_addView/native_removeView re-declared per class — reuse the class-agnostic
-    // ViewGroup tree-wiring bodies (record the real parent→child edges the renderer walks).
     let scroll_view: [NativeBinding; 2] = [
-        // SAFETY: `view_group_native_add_view` matches ScrollView.java:20's
-        // `(JJILandroid/view/ViewGroup$LayoutParams;)V` (same as ViewGroup.native_addView).
         (
             VIEW_GROUP_NATIVE_ADD_VIEW_NAME,
             VIEW_GROUP_NATIVE_ADD_VIEW_SIG,
             view_group_native_add_view as *mut c_void,
         ),
-        // SAFETY: `view_group_native_remove_view` matches ScrollView.java:22's `(JJ)V`.
         (
             VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME,
             VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG,
@@ -13992,76 +9445,17 @@ fn register_widget_property_setter_natives(env: &mut Env) -> Result<(), Framewor
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.graphics.drawable.Drawable.native_constructor ===
-//
-// 2026-06-05: a launcher that loads a drawable in onCreate (e.g. AdaptiveIconDemo's
-// `Context.getDrawable` → `Resources.loadDrawable` → `Drawable.createFromXml` →
-// `AdaptiveIconDrawable.<init>` → `Drawable.<init>`) calls `Drawable.native_constructor()`, surfacing
-// `No implementation found for long android.graphics.drawable.Drawable.native_constructor()` (run log
-// 2026-06-05 against AdaptiveIconDemo). AOSP's `Drawable.java` declares it
-//   `private native long native_constructor();`
-// — an INSTANCE native (called from `Drawable.<init>` on `this`, no Java args) returning the native
-// drawable peer handle (`Drawable.mNativePtr`). `Drawable.<init>` then registers `mNativePtr` for
-// native-allocation cleanup, so the handle must be **non-zero**.
-//
-// Like `MessageQueue.nativeInit`, Eclipse drives the lifecycle WITHOUT a draw pass, so the drawable's
-// drawing/bounds natives (`native_draw`/`native_setBounds`/…) are never invoked — none are bound, and
-// if one ever were it would raise a clean `UnsatisfiedLinkError` (not UB). The returned handle thus
-// has NO dereferencing consumer, so a full generational-slab registry would be dead weight (Simplicity
-// First, AGENTS.md §Surgical). The minimal-sound backing returns a stable non-zero sentinel that is
-// plainly NOT a pointer, satisfying the non-zero contract without faking any drawing. If a drawable
-// draw/bounds native is ever bound (i.e. the deferred render build draws drawables), this must become
-// a real registry handle (mirroring `paint_registry`) so the consumer can validate it — flagged here.
-
-/// `android.graphics.drawable.Drawable` (internal/slashed name) — hosts the `native_constructor` peer
-/// allocation native.
 pub const DRAWABLE_CLASS: &JNIStr = jni_str!("android/graphics/drawable/Drawable");
 
-// JNI name + descriptor for Drawable's native, exactly as declared in AOSP's `Drawable.java`:
-// `private native long native_constructor();` → an INSTANCE native, descriptor `()J`. (Confirmed by
-// the run's `No implementation found for long android.graphics.drawable.Drawable.native_constructor()`
-// line + the `Drawable.<init> → native_constructor` stack.)
 const DRAWABLE_NATIVE_CONSTRUCTOR_NAME: &JNIStr = jni_str!("native_constructor");
 const DRAWABLE_NATIVE_CONSTRUCTOR_SIG: &JNIStr = jni_str!("()J");
 
-// JNI name + descriptor for Drawable.native_unref, from the ART-reported signature `void
-// android.graphics.drawable.Drawable.native_unref(long)` (run log 2026-06-05): a static native,
-// descriptor `(J)V`. AOSP registers it as the drawable's native-allocation free callback (run on the
-// GC/finalizer thread). The handle is the non-pointer [`DRAWABLE_HANDLE_SENTINEL`] (no registry slot
-// backs it), so unref is a sound no-op.
 const DRAWABLE_NATIVE_UNREF_NAME: &JNIStr = jni_str!("native_unref");
 const DRAWABLE_NATIVE_UNREF_SIG: &JNIStr = jni_str!("(J)V");
 
-// JNI name + descriptor for Drawable.native_invalidate, from the ART-reported signature `void
-// android.graphics.drawable.Drawable.native_invalidate(long)` (run log 2026-07-01, live boot):
-// `protected native void native_invalidate(long paintable)` in ATL's `Drawable.java:386` — an
-// INSTANCE native (called `invoke-virtual {this, paintable}` from `Drawable.invalidateSelf()`,
-// `Drawable.java:139`), descriptor `(J)V`. Surfaced when `GradientDrawable.setShape → invalidateSelf`
-// runs during an AppCompat ActionBar drawable inflate (post-login LuaApp init). ATL's C backing asks
-// GTK to repaint the paintable; Eclipse's lifecycle is draw-free and the `paintable` here is the
-// non-pointer [`DRAWABLE_HANDLE_SENTINEL`] (never dereferenced — see the section comment), so
-// invalidation is a sound no-op (no surface to redraw). Bound alongside native_constructor/native_unref.
 const DRAWABLE_NATIVE_INVALIDATE_NAME: &JNIStr = jni_str!("native_invalidate");
 const DRAWABLE_NATIVE_INVALIDATE_SIG: &JNIStr = jni_str!("(J)V");
 
-// 2026-07-02: the INSTALLED framework dex is the authority for this class — the vendored ATL
-// `Drawable.java` has DRIFTED (it lacks `setPaintable`/`native_ref` entirely). Baksmali of the
-// installed `api-impl.jar` (classes3.dex, `Drawable.smali`) declares the full paintable lifecycle:
-//   `protected native void native_ref(long)`   — instance, called from `setPaintable(J)` (ref the
-//     incoming paintable) and UNCONDITIONALLY from the `Drawable(long)` ctor (even for 0);
-//   `protected native void native_draw(long paintable, long snapshot, int width, int height)` —
-//     instance, called from `draw(Canvas)` ONLY when the canvas `instanceof android.atl.GskCanvas`;
-//   `protected static native long native_paintable_from_path(String path)` — static, called from
-//     `createFromPath` for non-`.9.png` paths; the result feeds `Drawable(long)` → `native_ref`.
-// The validation boot `/tmp/eclipse-challenge5.log` (line 538) hit exactly this drift: the splash
-// PNG decode now succeeds, `BitmapDrawable.<init>` → `setPaintable` → `native_ref(long)` →
-// call-time `UnsatisfiedLinkError` → step-5 abort. The `paintable` here is either a live
-// [`bitmap_registry`] handle (`Bitmap.getTexture()` hands back `nativeDecodeStream`'s record), a
-// non-pointer sentinel ([`DRAWABLE_HANDLE_SENTINEL`] / [`DRAWABLE_CONTAINER_HANDLE_SENTINEL`]), or
-// 0 — never dereferenced. Refcount bookkeeping has no reader in the recorded model (the registry
-// retains records; `Bitmap.native_recycle` is the free bookkeeping), so ref/draw are validated
-// no-ops and `native_paintable_from_path` is registry-backed (its return IS read back through
-// `native_ref`/`native_get_width` on the shared-handle model).
 const DRAWABLE_NATIVE_REF_NAME: &JNIStr = jni_str!("native_ref");
 const DRAWABLE_NATIVE_REF_SIG: &JNIStr = jni_str!("(J)V");
 const DRAWABLE_NATIVE_DRAW_NAME: &JNIStr = jni_str!("native_draw");
@@ -14069,26 +9463,10 @@ const DRAWABLE_NATIVE_DRAW_SIG: &JNIStr = jni_str!("(JJII)V");
 const DRAWABLE_PAINTABLE_FROM_PATH_NAME: &JNIStr = jni_str!("native_paintable_from_path");
 const DRAWABLE_PAINTABLE_FROM_PATH_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)J");
 
-// 2026-07-02: `android.graphics.drawable.DrawableContainer` (the StateListDrawable /
-// AnimationDrawable base — every `<selector>`/`<animation-list>` drawable XML the now-working
-// `Resources.loadDrawable` pipeline inflates) declares ITS OWN natives (installed classes3.dex,
-// `DrawableContainer.smali`): `protected native long native_constructor()` (instance, called from
-// `<init>` and fed to `setPaintable` → `native_ref`) and
-// `protected native void native_selectChild(long container, long child)` (instance, called from
-// `selectDrawable(int)` on state change with the container + child paintables). ART resolves
-// natives per DECLARING class, so Drawable's bindings do not cover these.
 const DRAWABLE_CONTAINER_CLASS: &JNIStr = jni_str!("android/graphics/drawable/DrawableContainer");
 const DRAWABLE_CONTAINER_SELECT_CHILD_NAME: &JNIStr = jni_str!("native_selectChild");
 const DRAWABLE_CONTAINER_SELECT_CHILD_SIG: &JNIStr = jni_str!("(JJ)V");
 
-// 2026-07-02: `android.graphics.drawable.NinePatchDrawable` (installed classes3.dex,
-// `NinePatchDrawable.smali`) declares three private instance natives, all reachable from the same
-// loadDrawable pipeline (`Drawable.createFromResourceStream` routes `.9.png` files to
-// `new NinePatchDrawable(String)`; `createFromPath` does the same):
-//   `private native long nativeCreate(String path)`            — `<init>(String)` → `setPaintable`;
-//   `private native long nativeCreate(byte[] chunk, long texture)` — `<init>(Resources, Bitmap,
-//     byte[], Rect, String)` passes `bitmap.getTexture()` (a [`bitmap_registry`] handle);
-//   `private native void nativeSetTint(long paintable, int tint)` — `setTint(int)` override.
 const NINE_PATCH_DRAWABLE_CLASS: &JNIStr = jni_str!("android/graphics/drawable/NinePatchDrawable");
 const NINE_PATCH_CREATE_NAME: &JNIStr = jni_str!("nativeCreate");
 const NINE_PATCH_CREATE_FROM_PATH_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)J");
@@ -14096,30 +9474,10 @@ const NINE_PATCH_CREATE_FROM_CHUNK_SIG: &JNIStr = jni_str!("([BJ)J");
 const NINE_PATCH_SET_TINT_NAME: &JNIStr = jni_str!("nativeSetTint");
 const NINE_PATCH_SET_TINT_SIG: &JNIStr = jni_str!("(JI)V");
 
-/// The non-zero, non-pointer sentinel `Drawable.native_constructor()` returns as `mNativePtr`.
-///
-/// 2026-06-05: Java only needs `mNativePtr != 0` (for the native-allocation registration); this value
-/// is never dereferenced (no drawable draw/bounds native is bound — see the section comment). A small,
-/// recognizable, plainly-not-a-pointer constant.
-const DRAWABLE_HANDLE_SENTINEL: jlong = 0x4452; // 'DR' — a non-zero, non-pointer marker.
+const DRAWABLE_HANDLE_SENTINEL: jlong = 0x4452;
 
-/// The non-zero, non-pointer sentinel `DrawableContainer.native_constructor()` returns (2026-07-02).
-///
-/// Same contract as [`DRAWABLE_HANDLE_SENTINEL`] (Java only feeds it to `setPaintable` →
-/// `native_ref`/`native_selectChild`, all Eclipse no-ops that never dereference); a distinct value
-/// so a log line tells the container apart from a plain drawable peer.
-const DRAWABLE_CONTAINER_HANDLE_SENTINEL: jlong = 0x4443; // 'DC' — a non-zero, non-pointer marker.
+const DRAWABLE_CONTAINER_HANDLE_SENTINEL: jlong = 0x4443;
 
-/// `Drawable.native_constructor()` → a stable non-zero peer handle (`mNativePtr`).
-///
-/// JNI ABI: an INSTANCE native returning `jlong`, so the parameters are `(EnvUnowned, JObject this)`.
-/// `this` is not dereferenced. Returns [`DRAWABLE_HANDLE_SENTINEL`] — non-zero so `Drawable.<init>`'s
-/// native-allocation registration accepts it; never a pointer (the handle has no dereferencing consumer
-/// in Eclipse's draw-free lifecycle — see the section comment).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `jlong` default (`0`) on any
-/// error/panic — but the body is infallible, so the sentinel is always returned.
 extern "system" fn drawable_native_constructor<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14135,15 +9493,6 @@ extern "system" fn drawable_native_constructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Drawable.native_unref(long native_ptr)` → free the native drawable peer (2026-06-05).
-///
-/// JNI ABI: a `static` native returning void (AOSP runs it as the drawable's native-allocation free
-/// callback on the GC/finalizer thread), so the parameters are `(EnvUnowned, JClass, jlong native_ptr)`.
-/// `native_ptr` is the non-pointer [`DRAWABLE_HANDLE_SENTINEL`] (no registry slot backs it — see the
-/// section comment), so unref is a sound no-op. It is NOT dereferenced.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic — the correct neutral value for this `void` native.
 extern "system" fn drawable_native_unref<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14160,17 +9509,6 @@ extern "system" fn drawable_native_unref<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Drawable.native_invalidate(long paintable)` → no-op repaint request (2026-07-01).
-///
-/// JNI ABI: an INSTANCE native returning void (`Drawable.invalidateSelf()` calls
-/// `invoke-virtual {this, paintable}`, `Drawable.java:139`), so the parameters are
-/// `(EnvUnowned, JObject this, jlong paintable)`. `paintable` is the non-pointer
-/// [`DRAWABLE_HANDLE_SENTINEL`] (no registry slot backs it — see the section comment), so it is taken
-/// but NOT dereferenced. ATL's C backing repaints the GTK paintable; Eclipse's lifecycle is draw-free
-/// (no surface to redraw), so the sound behavior is a no-op.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns the
-/// `()` default on error/panic — the correct neutral value for this `void` native.
 extern "system" fn drawable_native_invalidate<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14187,19 +9525,6 @@ extern "system" fn drawable_native_invalidate<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Drawable.native_ref(long paintable)` → no-op refcount bookkeeping (2026-07-02).
-///
-/// JNI ABI: an INSTANCE native returning void (`setPaintable(J)` and the `Drawable(long)` ctor call
-/// `invoke-virtual {this, paintable}` — installed classes3.dex `Drawable.smali`), so the parameters
-/// are `(EnvUnowned, JObject this, jlong paintable)`. The `Drawable(long)` ctor refs UNCONDITIONALLY
-/// (even `0`), so this must tolerate `0`, a sentinel, a live [`bitmap_registry`] handle, or a stale
-/// one — it is taken but NEVER dereferenced. ATL's C backing bumps the GTK paintable's refcount;
-/// Eclipse's registry retains records until `Bitmap.native_recycle` (the free bookkeeping), so ref
-/// is a sound no-op with no reader. This was the `/tmp/eclipse-challenge5.log` splash abort
-/// (`UnsatisfiedLinkError` from `BitmapDrawable.<init>` → `setPaintable`, line 538).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic — the correct neutral value for this `void` native.
 extern "system" fn drawable_native_ref<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14216,19 +9541,6 @@ extern "system" fn drawable_native_ref<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Drawable.native_draw(long paintable, long snapshot, int width, int height)` → no-op
-/// (2026-07-02).
-///
-/// JNI ABI: an INSTANCE native returning void (installed classes3.dex `Drawable.smali`:
-/// `draw(Canvas)` calls `invoke-virtual/range {this, paintable, snapshot, w, h}` ONLY when the
-/// canvas is `instanceof android.atl.GskCanvas`), so the parameters are
-/// `(EnvUnowned, JObject this, jlong paintable, jlong snapshot, jint width, jint height)`. ATL's C
-/// backing appends the paintable to the GSK render snapshot; Eclipse's framework is headless (the
-/// engine renders the screen; the view/drawable tree is only recorded), so drawing is a sound no-op
-/// — nothing reads a value back. Neither handle is dereferenced.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn drawable_native_draw<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14251,18 +9563,6 @@ extern "system" fn drawable_native_draw<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Drawable.native_paintable_from_path(String path)` → a recorded [`bitmap_registry`] handle for
-/// the image file, or `0` when unreadable (2026-07-02).
-///
-/// JNI ABI: a `static` native returning `jlong` (installed classes3.dex `Drawable.smali`), so the
-/// parameters are `(EnvUnowned, JClass, JString path)`. Called from `Drawable.createFromPath` for
-/// non-`.9.png` paths; the result feeds `new Drawable(long)` → `native_ref` (unconditional, so `0`
-/// is tolerated) and travels as the drawable `paintable`. Registry-backed via
-/// [`record_bitmap_from_file`] — the same headless recording `nativeDecodeStream` performs (real
-/// dimensions from the encoded header, bytes retained; no raster).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// `0` on an internal JNI error (the "no paintable" value every caller guards for).
 extern "system" fn drawable_native_paintable_from_path<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14281,16 +9581,6 @@ extern "system" fn drawable_native_paintable_from_path<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `DrawableContainer.native_constructor()` → a stable non-zero container peer handle (2026-07-02).
-///
-/// JNI ABI: an INSTANCE native returning `jlong` (installed classes3.dex `DrawableContainer.smali`,
-/// called from `<init>` on `this` with no Java args). The result only feeds `setPaintable` →
-/// [`drawable_native_ref`]/[`drawable_container_native_select_child`] — Eclipse no-ops that never
-/// dereference — so the minimal-sound backing is the non-pointer
-/// [`DRAWABLE_CONTAINER_HANDLE_SENTINEL`] (same shape as [`drawable_native_constructor`]).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); the body is
-/// infallible, so the sentinel is always returned.
 extern "system" fn drawable_container_native_constructor<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14306,17 +9596,6 @@ extern "system" fn drawable_container_native_constructor<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `DrawableContainer.native_selectChild(long container, long child)` → no-op selection
-/// bookkeeping (2026-07-02).
-///
-/// JNI ABI: an INSTANCE native returning void (installed classes3.dex `DrawableContainer.smali`,
-/// called from `selectDrawable(int)` with the container paintable + the selected child's
-/// paintable). The selection state Java reads back lives in the Java `curIndex` field; ATL's C
-/// backing re-parents the GTK paintable, which the headless recording model has no counterpart
-/// for. Neither handle is dereferenced.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn drawable_container_native_select_child<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14335,14 +9614,6 @@ extern "system" fn drawable_container_native_select_child<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `NinePatchDrawable.nativeCreate(String path)` → a recorded [`bitmap_registry`] handle for the
-/// `.9.png` file, or `0` when unreadable (2026-07-02).
-///
-/// JNI ABI: a private INSTANCE native returning `jlong` (installed classes3.dex
-/// `NinePatchDrawable.smali`, called from `<init>(String)`), so the parameters are
-/// `(EnvUnowned, JObject this, JString path)`. The result feeds `setPaintable` (which skips
-/// `native_ref` for `0`). Registry-backed via [`record_bitmap_from_file`]; the nine-patch stretch
-/// metadata is inside the recorded PNG bytes for the deferred raster pass.
 extern "system" fn nine_patch_native_create_from_path<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14361,16 +9632,6 @@ extern "system" fn nine_patch_native_create_from_path<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `NinePatchDrawable.nativeCreate(byte[] chunk, long texture)` → the underlying recorded texture
-/// handle, or `0` for a dead one (2026-07-02).
-///
-/// JNI ABI: a private INSTANCE native returning `jlong` (installed classes3.dex
-/// `NinePatchDrawable.smali`, called from `<init>(Resources, Bitmap, byte[], Rect, String)` with
-/// the bitmap's `getTexture()` handle), so the parameters are
-/// `(EnvUnowned, JObject this, JByteArray chunk, jlong texture)`. In the recorded model the
-/// nine-patch paintable IS the underlying bitmap record (the chunk is stretch metadata the
-/// headless framework does not rasterize), so a live [`bitmap_registry`] `texture` passes through
-/// as the paintable; a stale/fabricated one yields `0` (logged), which `setPaintable` tolerates.
 extern "system" fn nine_patch_native_create_from_chunk<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14394,13 +9655,6 @@ extern "system" fn nine_patch_native_create_from_chunk<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `NinePatchDrawable.nativeSetTint(long paintable, int tint)` → no-op tint bookkeeping
-/// (2026-07-02).
-///
-/// JNI ABI: a private INSTANCE native returning void (installed classes3.dex
-/// `NinePatchDrawable.smali`, called from the `setTint(int)` override). ATL's C backing tints the
-/// GTK paintable; nothing reads the tint back and the headless model draws nothing, so a validated
-/// no-op is sound. The handle is not dereferenced.
 extern "system" fn nine_patch_native_set_tint<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -14419,29 +9673,7 @@ extern "system" fn nine_patch_native_set_tint<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for the drawable paintable-lifecycle natives:
-/// `android.graphics.drawable.Drawable` (`native_constructor`/`native_unref`/`native_invalidate`/
-/// `native_ref`/`native_draw`/`native_paintable_from_path`), `DrawableContainer`
-/// (`native_constructor`/`native_selectChild`), and `NinePatchDrawable` (`nativeCreate` ×2 /
-/// `nativeSetTint`).
-///
-/// MUST run before step 4, since a launcher's onCreate may load a drawable (the splash inflation
-/// does — `/tmp/eclipse-challenge5.log`). 2026-07-02: registered per-method best-effort (the
-/// 58a50f6 pattern, [`register_class_natives_best_effort`]) instead of one atomic array, so a
-/// framework-build drift on any single method cannot take the lifecycle-critical
-/// `native_constructor`/`native_ref` bindings down with it. ART resolves natives per DECLARING
-/// class, so the container/nine-patch classes get their own registrations.
-///
-/// # Safety / soundness
-/// Each fn pointer matches its declared JNI signature by construction (see each native's docs and
-/// the pin test `drawable_native_name_sig_and_class_match_art_reported`). Every native body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI
-/// boundary (AGENTS.md §2.8).
 fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // SAFETY (per entry): each fn matches its paired descriptor — `native_constructor` `()J`
-    // (instance), `native_unref`/`native_invalidate`/`native_ref` `(J)V`, `native_draw` `(JJII)V`
-    // (instance), `native_paintable_from_path` `(Ljava/lang/String;)J` (static) — installed
-    // classes3.dex `Drawable.smali`, baksmali-confirmed 2026-07-02.
     let drawable_bindings: [NativeBinding; 6] = [
         (
             DRAWABLE_NATIVE_CONSTRUCTOR_NAME,
@@ -14476,8 +9708,7 @@ fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
     ];
     let drawable_bound =
         register_class_natives_best_effort(env, DRAWABLE_CLASS, &drawable_bindings)?;
-    // SAFETY (per entry): `native_constructor` `()J` + `native_selectChild` `(JJ)V`, both instance —
-    // installed classes3.dex `DrawableContainer.smali`, baksmali-confirmed 2026-07-02.
+
     let container_bindings: [NativeBinding; 2] = [
         (
             DRAWABLE_NATIVE_CONSTRUCTOR_NAME,
@@ -14492,9 +9723,7 @@ fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
     ];
     let container_bound =
         register_class_natives_best_effort(env, DRAWABLE_CONTAINER_CLASS, &container_bindings)?;
-    // SAFETY (per entry): `nativeCreate` `(Ljava/lang/String;)J` / `([BJ)J` + `nativeSetTint`
-    // `(JI)V`, all private instance — installed classes3.dex `NinePatchDrawable.smali`,
-    // baksmali-confirmed 2026-07-02.
+
     let nine_patch_bindings: [NativeBinding; 3] = [
         (
             NINE_PATCH_CREATE_NAME,
@@ -14523,55 +9752,20 @@ fn register_drawable_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.graphics.BitmapFactory / Bitmap ================
-//
-// 2026-07-01: the styled-attribute string-pool fix (see [`ARSC_APP_COOKIE`]) lets
-// `Resources.loadDrawable` resolve file-path drawables for the first time, so its `.png` branch now
-// actually runs: `openNonAsset` → `BitmapFactory.decodeStream` → `nativeDecodeStream` →
-// `new Bitmap(texture)` → `native_get_width`/`native_get_height` (Bitmap.java line 51) →
-// `BitmapDrawable.paintable = bitmap.getTexture()`. ATL backs these with GTK (`GdkTexture`);
-// Eclipse's framework is HEADLESS (the view tree is recorded; the engine renders the screen), so
-// the faithful non-GTK backing is the same recording model every widget native uses: read the
-// encoded stream, parse the image header for the REAL dimensions, retain the bytes in
-// [`bitmap_registry`], and hand Java a generational-slab handle. Without these bindings the newly
-// reachable path would abort inflation with a call-time `UnsatisfiedLinkError` (an `Error`, so not
-// even `Resources.loadDrawable`'s `catch (Exception)` contains it) — the exact regression cliff the
-// challenge-fix validation boot must not hit. Pixel decode/raster stays the deferred render build.
-
-/// `android.graphics.BitmapFactory` (internal/slashed name for `find_class`).
 const BITMAP_FACTORY_CLASS: &JNIStr = jni_str!("android/graphics/BitmapFactory");
-/// `android.graphics.Bitmap` (internal/slashed name for `find_class`).
+
 const BITMAP_CLASS: &JNIStr = jni_str!("android/graphics/Bitmap");
 
-// `private static native long nativeDecodeStream(InputStream is, byte[] storage, Rect outPadding,
-// Options opts);` — BitmapFactory.java line 666.
 const BITMAP_FACTORY_DECODE_STREAM_NAME: &JNIStr = jni_str!("nativeDecodeStream");
 const BITMAP_FACTORY_DECODE_STREAM_SIG: &JNIStr = jni_str!(
     "(Ljava/io/InputStream;[BLandroid/graphics/Rect;Landroid/graphics/BitmapFactory$Options;)J"
 );
-// `private static native int native_get_width(long texture);` / `..._get_height` — Bitmap.java
-// lines 236–237 (called by the `Bitmap(long texture)` constructor, line 51).
+
 const BITMAP_GET_WIDTH_NAME: &JNIStr = jni_str!("native_get_width");
 const BITMAP_GET_WIDTH_SIG: &JNIStr = jni_str!("(J)I");
 const BITMAP_GET_HEIGHT_NAME: &JNIStr = jni_str!("native_get_height");
 const BITMAP_GET_HEIGHT_SIG: &JNIStr = jni_str!("(J)I");
-// 2026-07-02: the Bitmap texture/snapshot LIFECYCLE natives (installed classes3.dex,
-// `Bitmap.smali`, all static) — reachable from the now-working BitmapDrawable pipeline:
-//   `native_recycle(JJ)V`        — `recycle()` (and `finalize()` → `recycle()`, so EVERY recorded
-//     bitmap hits it on GC) frees both peers; Eclipse's free bookkeeping on [`bitmap_registry`].
-//   `native_create_texture(JIIII)J` — `getTexture()` when `texture == 0` (a `createBitmap`-made or
-//     snapshot-converted Bitmap entering `BitmapDrawable`/`setImageBitmap`/`NinePatchDrawable`).
-//     ATL's GTK `GdkTexture` constructor — the exact GTK fallback Eclipse must not leave reachable.
-//   `native_create_snapshot(J)J` — `getSnapshot()` when `snapshot == 0` (`Canvas(Bitmap)` ctor and
-//     every Canvas op re-sync). Java MOVES the value between its `texture`/`snapshot` fields
-//     (zeroing the source), so in the recorded model both conversions are identity moves of the
-//     same registry record.
-//   `native_ref_texture(J)J`     — `createBitmap(Bitmap)` / `copy()` duplicate a texture; the
-//     recorded backing clones the record so each Bitmap owns an independently-recyclable handle.
-// The pixel-CONTENT natives (`native_erase_color`, `native_get_pixels`/`native_set_pixels`,
-// `native_copy_to_buffer`, `native_save_to_png`) stay unbound: their callers read pixel data back,
-// which the headless recording model cannot honestly serve — a clean call-time
-// `UnsatisfiedLinkError` is the correct discovery signal (deferred raster build, AGENTS.md §5).
+
 const BITMAP_RECYCLE_NAME: &JNIStr = jni_str!("native_recycle");
 const BITMAP_RECYCLE_SIG: &JNIStr = jni_str!("(JJ)V");
 const BITMAP_CREATE_TEXTURE_NAME: &JNIStr = jni_str!("native_create_texture");
@@ -14581,21 +9775,14 @@ const BITMAP_CREATE_SNAPSHOT_SIG: &JNIStr = jni_str!("(J)J");
 const BITMAP_REF_TEXTURE_NAME: &JNIStr = jni_str!("native_ref_texture");
 const BITMAP_REF_TEXTURE_SIG: &JNIStr = jni_str!("(J)J");
 
-/// Cap on how many encoded-image bytes [`bitmap_factory_native_decode_stream`] will buffer from one
-/// stream (2026-07-01). Resource images are ≤ a few MiB; the cap keeps a hostile/endless stream from
-/// exhausting memory while staying far above any legitimate drawable.
 const BITMAP_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-/// Parse an encoded image header for its pixel dimensions (2026-07-01). Currently PNG (the format
-/// of this APK's file-backed drawables): 8-byte signature + the mandatory first IHDR chunk carrying
-/// big-endian width/height at byte offsets 16/20. Returns `None` for any other/truncated encoding —
-/// never panics (all access via `get`).
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
     if bytes.get(..8)? != PNG_SIGNATURE {
         return None;
     }
-    // Chunk 1 must be IHDR per the PNG spec: length(4) + "IHDR"(4) + width(4 BE) + height(4 BE).
+
     if bytes.get(12..16)? != b"IHDR" {
         return None;
     }
@@ -14604,12 +9791,6 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// Read an image FILE into a recorded [`bitmap_registry`] handle, or `0` when unreadable
-/// (2026-07-02). The file-path twin of [`bitmap_factory_native_decode_stream`]'s recording: real
-/// dimensions from the encoded header ([`png_dimensions`]; an unrecognized encoding records `0×0`
-/// with a WARN discovery signal), bytes retained verbatim, size capped by
-/// [`BITMAP_DECODE_MAX_BYTES`]. Shared by `Drawable.native_paintable_from_path` and
-/// `NinePatchDrawable.nativeCreate(String)`. `caller` labels the log lines.
 fn record_bitmap_from_file(path: &str, caller: &str) -> jlong {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -14681,21 +9862,6 @@ fn record_bitmap_from_file(path: &str, caller: &str) -> jlong {
     }
 }
 
-/// `BitmapFactory.nativeDecodeStream(InputStream is, byte[] storage, Rect outPadding, Options opts)`
-/// → a live [`bitmap_registry`] handle recording the image (2026-07-01).
-///
-/// JNI ABI: a `static` native returning `jlong`, so the parameters are
-/// `(EnvUnowned, JClass, JObject is, JByteArray storage, JObject outPadding, JObject opts)`.
-/// Reads the stream to EOF via `InputStream.read(byte[])` (using the caller's `storage` buffer when
-/// provided, else an own 8 KiB array), parses the encoded header for the REAL dimensions
-/// ([`png_dimensions`]), and stores `{width, height, bytes}` in [`bitmap_registry`]. An
-/// unrecognized encoding still returns a live handle (dimensions `0×0`, bytes retained) with a WARN
-/// — the total, headless-recording outcome; returning `0` would send `Bitmap.getTexture()` into the
-/// unbound GTK `native_create_texture` (`UnsatisfiedLinkError` aborting inflation).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// `0` only on an internal JNI error (e.g. the stream `read` itself threw — `decodeStream`'s caller
-/// then fails as it would for a broken stream).
 extern "system" fn bitmap_factory_native_decode_stream<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14706,9 +9872,9 @@ extern "system" fn bitmap_factory_native_decode_stream<'local>(
 ) -> jlong {
     env.with_env(|env| -> jni::errors::Result<jlong> {
         if is.is_null() {
-            return Ok(0); // no stream, no bitmap (decodeStream null-checks before calling).
+            return Ok(0);
         }
-        // Use the caller-provided temp buffer when it exists (its AOSP purpose), else our own.
+
         let buf = if !storage.is_null() && storage.len(env)? > 0 {
             storage
         } else {
@@ -14721,7 +9887,7 @@ extern "system" fn bitmap_factory_native_decode_stream<'local>(
                 .call_method(&is, jni_str!("read"), jni_sig!("([B)I"), &[JValue::Object(&buf)])?
                 .i()?;
             if n <= 0 {
-                break; // -1 = EOF (0 is defensive: never spin on a pathological stream).
+                break;
             }
             let n = usize::try_from(n).unwrap_or(0).min(buf_len);
             let mut chunk = vec![0i8; n];
@@ -14742,8 +9908,8 @@ extern "system" fn bitmap_factory_native_decode_stream<'local>(
                 i32::try_from(h).unwrap_or(i32::MAX),
             ),
             None => {
-                // Unrecognized encoding: record it 0×0 (headless — nothing samples the pixels) and
-                // leave a discovery signal for the format (e.g. JPEG/WebP header parsing).
+
+
                 tracing::warn!(
                     target: "android.graphics.BitmapFactory",
                     len = bytes.len(),
@@ -14780,8 +9946,6 @@ extern "system" fn bitmap_factory_native_decode_stream<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Bitmap.native_get_width(long texture)` → the recorded width, or `0` for a bad handle
-/// (2026-07-01). Static native; validated through the bounds+generation-checked [`bitmap_registry`].
 extern "system" fn bitmap_native_get_width<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14803,8 +9967,6 @@ extern "system" fn bitmap_native_get_width<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Bitmap.native_get_height(long texture)` → the recorded height, or `0` for a bad handle
-/// (2026-07-01). Static native; validated through the bounds+generation-checked [`bitmap_registry`].
 extern "system" fn bitmap_native_get_height<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14826,15 +9988,6 @@ extern "system" fn bitmap_native_get_height<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Bitmap.native_recycle(long texture, long snapshot)` → free the recorded registry slots
-/// (2026-07-02). Static native (`Bitmap.recycle()`, also reached via `Bitmap.finalize()` on EVERY
-/// GC'd bitmap — the first splash-bitmap GC would otherwise throw a finalizer-thread
-/// `UnsatisfiedLinkError`). This is the ONE free bookkeeping in the recorded-bitmap model (ref/
-/// unref are no-ops), so retained encoded bytes are released when Java releases the Bitmap. `0` is
-/// the "no peer" value (skipped); a stale/fabricated handle is a bounds+generation-checked debug
-/// log, never UB. A `BitmapDrawable` paintable sharing the handle keeps the Bitmap strongly
-/// referenced (its `bitmap` field), so Java's own reachability ordering makes the free safe; any
-/// later call on the freed handle degrades to a validated stale-handle log.
 extern "system" fn bitmap_native_recycle<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14867,16 +10020,6 @@ extern "system" fn bitmap_native_recycle<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Bitmap.native_create_texture(long snapshot, int width, int height, int stride, int format)` →
-/// the texture-form handle for the record (2026-07-02). Static native (`Bitmap.getTexture()` when
-/// `texture == 0`) — ATL's GTK `GdkTexture` constructor, the exact GTK fallback that must not stay
-/// reachable-unbound now that `BitmapDrawable.<init>`/`setImageBitmap`/`NinePatchDrawable` call
-/// `getTexture()` on arbitrary Bitmaps. Java MOVES the value `snapshot` → `texture` (zeroing
-/// `snapshot`), so a live [`bitmap_registry`] `snapshot` passes through unchanged (identity move —
-/// same record, new owner field). `snapshot == 0` is a `createBitmap`-made surface with no content
-/// yet: record a fresh `{width, height, no bytes}` slot so `Bitmap(long)`-style readers and
-/// `native_recycle` stay exact. A stale nonzero handle yields `0` (logged; callers pass `0` around
-/// as "no texture"). `stride`/`format` are GDK memory-layout params with no recorded counterpart.
 extern "system" fn bitmap_native_create_texture<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14938,11 +10081,6 @@ extern "system" fn bitmap_native_create_texture<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Bitmap.native_create_snapshot(long texture)` → the snapshot-form handle for the record
-/// (2026-07-02). Static native (`Bitmap.getSnapshot()` when `snapshot == 0` — the `Canvas(Bitmap)`
-/// ctor and every Canvas op re-sync). The exact mirror of [`bitmap_native_create_texture`]'s
-/// identity move: Java zeroes `texture` after this returns, so the record simply changes owner
-/// field. `0`/stale → `0` (logged for stale), never UB.
 extern "system" fn bitmap_native_create_snapshot<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -14975,14 +10113,6 @@ extern "system" fn bitmap_native_create_snapshot<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Bitmap.native_ref_texture(long texture)` → an independent duplicate of the record
-/// (2026-07-02). Static native (`Bitmap.createBitmap(Bitmap)` / `Bitmap.copy()` wrap the result in
-/// `new Bitmap(long)`, which reads it back through `native_get_width`/`native_get_height` — so a
-/// live handle is REQUIRED, not a sentinel). ATL refs the GTK texture; [`bitmap_registry`] has no
-/// refcount, so the honest recorded backing CLONES the record — each Bitmap then owns an
-/// independently-recyclable handle and `native_recycle` bookkeeping stays exact. A dead source
-/// handle yields `0` (the "decode failed" value `createBitmap`'s `Bitmap(long)` path tolerates as
-/// a `0×0` bitmap).
 extern "system" fn bitmap_native_ref_texture<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -15029,30 +10159,7 @@ extern "system" fn bitmap_native_ref_texture<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `BitmapFactory.nativeDecodeStream` and
-/// `Bitmap.native_get_width`/`native_get_height` — the exact natives on
-/// `Resources.loadDrawable`'s newly-reachable `.png` path (see the section comment).
-///
-/// 2026-07-02: also binds the texture/snapshot LIFECYCLE natives (`native_recycle`,
-/// `native_create_texture`, `native_create_snapshot`, `native_ref_texture` — see the consts
-/// comment): `finalize()` reaches `native_recycle` on every GC'd bitmap, and `getTexture()`'s
-/// `native_create_texture` is ATL's GTK-texture constructor (the GTK fallback must not stay
-/// reachable-unbound). Registered per-method best-effort (the 58a50f6 pattern): a native this ATL
-/// build does not declare is skipped with a warn line instead of aborting the whole class
-/// registration. The pixel-CONTENT natives (`native_erase_color`, `native_get_pixels`/
-/// `native_set_pixels`, `native_copy_to_buffer`, `native_save_to_png`) stay unbound as call-time
-/// discovery signals — their callers read pixel data back, which the headless recording model
-/// cannot honestly serve.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointers must match the declared JNI signatures.
-/// They do — see each native's docs and the descriptor pin test
-/// `bitmap_native_names_sigs_and_classes_match_bitmap_java`. Every body is `catch_unwind`-guarded
-/// via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_bitmap_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    // SAFETY: `bitmap_factory_native_decode_stream` matches the paired
-    // `(Ljava/io/InputStream;[BLandroid/graphics/Rect;Landroid/graphics/BitmapFactory$Options;)J`
-    // static native (BitmapFactory.java line 666).
     let factory_bindings: [NativeBinding; 1] = [(
         BITMAP_FACTORY_DECODE_STREAM_NAME,
         BITMAP_FACTORY_DECODE_STREAM_SIG,
@@ -15060,11 +10167,7 @@ fn register_bitmap_natives(env: &mut Env) -> Result<(), FrameworkError> {
     )];
     let factory_bound =
         register_class_natives_best_effort(env, BITMAP_FACTORY_CLASS, &factory_bindings)?;
-    // SAFETY: `bitmap_native_get_width`/`bitmap_native_get_height` match the paired `(J)I` static
-    // natives (Bitmap.java lines 236–237); `bitmap_native_recycle` `(JJ)V`,
-    // `bitmap_native_create_texture` `(JIIII)J`, `bitmap_native_create_snapshot` `(J)J`, and
-    // `bitmap_native_ref_texture` `(J)J` match the static natives in the installed classes3.dex
-    // `Bitmap.smali` (baksmali-confirmed 2026-07-02).
+
     let bitmap_bindings: [NativeBinding; 6] = [
         (
             BITMAP_GET_WIDTH_NAME,
@@ -15106,26 +10209,8 @@ fn register_bitmap_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own (non-GTK) backing for android.view.Window native window setup ================
-//
-// 2026-06-05: step 4 (`Activity.createMainActivity` → `internalCreateActivity` → `Window.<init>` →
-// `Window.set_native_window`) wires the launcher's Window onto the native window handle. The Window
-// natives the dev-host run surfaces are declared in `View.java`'s sibling `Window.java` (lines
-// 184–188, android/view — read for the exact modifiers/signatures, NOT content/res):
-//   L188 `private static native void set_jobject(long ptr, Window obj);`            → static (JLandroid/view/Window;)V
-//   L185 `private native void set_title(long native_window, String title);`         → instance (JLjava/lang/String;)V
-//   L187 `public native void set_layout(long native_window, int width, int height);`→ instance (JII)V
-//   L184 `public native void set_widget_as_root(long native_window, long widget);`  → instance (JJ)V
-// The `long native_window` is the SAME Eclipse-owned [`window_registry`] handle steps 1–4 received,
-// so these dereference it through the bounds+generation-checked registry — NEVER a GtkWidget* cast,
-// never UB. ATL's C backing drives GTK; Eclipse records the window metadata (jobject set, title,
-// layout, root view handle) with no GTK and no real surface/layout/draw (the deferred big build).
-
-/// `android.view.Window` (internal/slashed name for `find_class`) — hosts the window-setup natives.
 pub const WINDOW_CLASS: &JNIStr = jni_str!("android/view/Window");
 
-// JNI names + descriptors for Window's natives, exactly as declared in `Window.java` (2026-06-05).
-// `set_jobject` is STATIC (line 188); the others are instance methods on the Java Window.
 const WINDOW_SET_JOBJECT_NAME: &JNIStr = jni_str!("set_jobject");
 const WINDOW_SET_JOBJECT_SIG: &JNIStr = jni_str!("(JLandroid/view/Window;)V");
 const WINDOW_SET_TITLE_NAME: &JNIStr = jni_str!("set_title");
@@ -15134,32 +10219,10 @@ const WINDOW_SET_LAYOUT_NAME: &JNIStr = jni_str!("set_layout");
 const WINDOW_SET_LAYOUT_SIG: &JNIStr = jni_str!("(JII)V");
 const WINDOW_SET_WIDGET_AS_ROOT_NAME: &JNIStr = jni_str!("set_widget_as_root");
 const WINDOW_SET_WIDGET_AS_ROOT_SIG: &JNIStr = jni_str!("(JJ)V");
-// 2026-06-05: `Window.setBackgroundDrawable` (ATL) calls `remove_gtk_background(native_window)` to
-// drop any prior GTK background before applying a new one. It was unreached until themes resolved
-// `android:windowBackground` (which makes `setContentView → setBackgroundDrawable` run); the ART
-// error line gives the exact signature `void android.view.Window.remove_gtk_background(long)` → `(J)V`
-// instance. Eclipse is non-GTK (no GTK background exists), so this is a validate-handle no-op,
-// matching the other Window natives.
+
 const WINDOW_REMOVE_GTK_BACKGROUND_NAME: &JNIStr = jni_str!("remove_gtk_background");
 const WINDOW_REMOVE_GTK_BACKGROUND_SIG: &JNIStr = jni_str!("(J)V");
 
-/// `Window.set_jobject(long ptr, Window obj)` → capture a JNI **global** reference to the Java
-/// `android.view.Window` object on the [`window_registry`] window.
-///
-/// JNI ABI: a STATIC native returning void (`Window.java` line 188), so the parameters are
-/// `(EnvUnowned, JClass, jlong ptr, JObject window)`. `ptr` is the Eclipse-owned window-registry
-/// handle; `window` is the Java `android.view.Window`. 2026-06-13: this is the one place the Window
-/// object flows into Eclipse, called from `set_native_window` AFTER `this.native_window` is populated
-/// (Window.java lines 58-60), so the captured object always has a valid `native_window` field — which
-/// `View.native_get_window` hands back so ATL can build a real `ViewTreeObserver`. A global ref is
-/// created over `window` and stored on the slot (re-capture on a later `set_jobject` drops the prior
-/// ref via the `Option`'s `Drop`). Validates the handle through the bounds+generation-checked
-/// [`window_registry`] (a bad handle is logged + ignored, never UB); a failure to create or store the
-/// global ref leaves the window without a captured object (so `native_get_window` returns null and ATL
-/// builds a floating observer) — logged, never fatal.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, AGENTS.md §2.8;
-/// `panic = "abort"` kept); `resolve::<LogErrorAndDefault>` returns the `()` default on error/panic.
 extern "system" fn window_set_jobject<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -15167,11 +10230,6 @@ extern "system" fn window_set_jobject<'local>(
     window: JObject<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        // Capture a global ref to the Java Window so View.native_get_window can return the SAME object
-        // (its native_window field is already populated — set_native_window sets it before this runs).
-        // `new_global_ref` over a non-null `window` is sound here; a failure leaves the window without
-        // a captured object (logged, non-fatal — native_get_window then yields the floating-observer
-        // path) rather than unwinding across JNI.
         match env.new_global_ref(&window) {
             Ok(global) => match window_registry::set_jobject(ptr, global) {
                 Ok(()) => tracing::debug!(
@@ -15198,16 +10256,6 @@ extern "system" fn window_set_jobject<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Window.set_title(long native_window, String title)` → store the title on the [`window_registry`]
-/// window (applied to the real winit window when one is associated).
-///
-/// JNI ABI: an INSTANCE native returning void (`Window.java` line 185), so the parameters are
-/// `(EnvUnowned, JObject this, jlong native_window, JString title)`. Reads the title string and
-/// stores it on the window slot (the design's `WindowState.title`); a null title stores empty. The
-/// handle is bounds+generation-checked (a bad handle is logged + ignored, never UB).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn window_set_title<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -15239,16 +10287,6 @@ extern "system" fn window_set_title<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Window.set_layout(long native_window, int width, int height)` → validate the window handle;
-/// no-op (layout deferred, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void (`Window.java` line 187). Window layout sizing is
-/// applied once a real winit window/surface is associated (deferred); for now this validates the
-/// `native_window` handle through the bounds+generation-checked [`window_registry`] (a bad handle is
-/// logged + ignored, never UB) and no-ops, letting the Window setup proceed.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn window_set_layout<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -15276,18 +10314,6 @@ extern "system" fn window_set_layout<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Window.remove_gtk_background(long native_window)` → validate the window handle; no-op (Eclipse is
-/// non-GTK, so there is no GTK background to remove, 2026-06-05).
-///
-/// JNI ABI: an INSTANCE native returning void. ATL's `Window.setBackgroundDrawable` calls this to drop
-/// any prior GTK background before applying a new one; on Eclipse the Window is non-GTK (it has no GTK
-/// background), so this validates the `native_window` handle through the bounds+generation-checked
-/// [`window_registry`] (a bad handle is logged + ignored, never UB) and no-ops. A new
-/// `android:windowBackground` is recorded by the renderer's view tree, not a GTK widget. Surfaced once
-/// theme resolution let `setContentView → setBackgroundDrawable` run.
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn window_remove_gtk_background<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -15313,18 +10339,6 @@ extern "system" fn window_remove_gtk_background<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Window.set_widget_as_root(long native_window, long widget)` → record the root view handle on the
-/// [`window_registry`] window (the content-view tree root).
-///
-/// JNI ABI: an INSTANCE native returning void (`Window.java` line 184), so the parameters are
-/// `(EnvUnowned, JObject this, jlong native_window, jlong widget)`. `widget` is the
-/// [`view_registry`] handle of the View made the window's content root. Validates BOTH handles
-/// (window + view, each bounds+generation-checked — a bad handle is logged + ignored, never UB). The
-/// root view handle is recorded as the window's sole child edge so the view tree's root is known
-/// without GTK; no real attach/layout/draw is performed (deferred surface).
-///
-/// The body runs inside [`EnvUnowned::with_env`] (`catch_unwind`-wrapped, §2.8); `resolve` returns
-/// the `()` default on error/panic.
 extern "system" fn window_set_widget_as_root<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -15332,13 +10346,10 @@ extern "system" fn window_set_widget_as_root<'local>(
     widget: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        // Validate the view handle (the root) before recording it as the window's root edge.
         let view_ok = view_registry::with_view(widget, |_v| ()).is_ok();
-        // Publish the content-root handle so the renderer's per-frame snapshot draws this subtree
-        // (the single source of truth for "what is on screen"); clear it if the view handle is bad.
+
         view_registry::set_active_root(if view_ok { widget } else { 0 });
         match window_registry::with_window(native_window, |w| {
-            // The window's "children" is its single content root; replace any prior root.
             w.root_view = if view_ok { Some(widget) } else { None };
         }) {
             Ok(()) => tracing::debug!(
@@ -15361,22 +10372,9 @@ extern "system" fn window_set_widget_as_root<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's own (non-GTK) backing for `android.view.Window`'s window-setup natives.
-///
-/// Registered before the lifecycle drive, alongside the other framework natives, since step 4
-/// (`Activity.createMainActivity`) sets up the Window during the lifecycle. Each is implemented
-/// against [`window_registry`] / [`view_registry`].
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match the declared JNI signature.
-/// They do, by construction — each native is written to the exact descriptor declared in
-/// `Window.java` (lines 184–188). Every native body is `catch_unwind`-guarded via
-/// [`EnvUnowned::with_env`], so no Rust panic crosses the JNI boundary (AGENTS.md §2.8).
 fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(WINDOW_CLASS)?;
     let methods = [
-        // SAFETY: `window_set_jobject` matches the paired `(JLandroid/view/Window;)V` signature as a
-        // static native; the cast is how `NativeMethod::from_raw_parts` takes the fn pointer.
         unsafe {
             NativeMethod::from_raw_parts(
                 WINDOW_SET_JOBJECT_NAME,
@@ -15384,8 +10382,6 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 window_set_jobject as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `window_set_title` matches the paired `(JLjava/lang/String;)V` signature as an
-        // instance native.
         unsafe {
             NativeMethod::from_raw_parts(
                 WINDOW_SET_TITLE_NAME,
@@ -15393,7 +10389,6 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 window_set_title as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `window_set_layout` matches the paired `(JII)V` signature as an instance native.
         unsafe {
             NativeMethod::from_raw_parts(
                 WINDOW_SET_LAYOUT_NAME,
@@ -15401,8 +10396,6 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 window_set_layout as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `window_set_widget_as_root` matches the paired `(JJ)V` signature as an instance
-        // native.
         unsafe {
             NativeMethod::from_raw_parts(
                 WINDOW_SET_WIDGET_AS_ROOT_NAME,
@@ -15410,8 +10403,6 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 window_set_widget_as_root as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `window_remove_gtk_background` matches the paired `(J)V` signature as an instance
-        // native.
         unsafe {
             NativeMethod::from_raw_parts(
                 WINDOW_REMOVE_GTK_BACKGROUND_NAME,
@@ -15420,9 +10411,7 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/view/Window; `methods` hold valid fn pointers whose
-    // signatures match the class's `native` declarations (verified against Window.java lines 184–188,
-    // 2026-06-05; `remove_gtk_background` from the ART No-implementation-found line, 2026-06-05).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/Window",
@@ -15431,39 +10420,6 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === Eclipse's own backing for android.app.Activity's transition/lifecycle natives ==============
-//
-// 2026-06-12 (EXIT=10 boot, /tmp/eclipse-1223806-validate.log): `android.app.Activity` declares
-// EXACTLY 7 natives — re-enumerated this session from the actual boot artifact
-// (`framework-patched/api-impl.jar` classes2.dex, androguard; the full-declared-list discipline
-// from the Vibrator fix):
-//   static  void    nativeStartActivity(Activity)     `(Landroid/app/Activity;)V`               0x109 — BOUND
-//   private void    nativeFinish(long)                `(J)V`                                    0x102 — BOUND (instance)
-//   static  boolean nativeResumeActivity(Class,Intent)`(Ljava/lang/Class;Landroid/content/Intent;)Z` 0x109 — BOUND
-//   public  boolean isInMultiWindowMode()             `()Z`                                     0x101 — BOUND (instance)
-//   public  boolean isTaskRoot()                      `()Z`                                     0x101 — BOUND (instance)
-//   static  void    nativeOpenURI(String)             `(Ljava/lang/String;)V`                   0x109 — RECORDED, not bound
-//   public  void    nativeFileChooser(int,String,String,int) `(ILjava/lang/String;Ljava/lang/String;I)V` 0x101 — RECORDED, not bound
-//
-// Why this matters (the splash→main handoff): ActivitySplash's NORMAL NEW_STARTUP transition is
-// `startActivity(ActivityNativeMain intent)` then `finish()` (twice — dex-proven). ATL's
-// `Context.startActivity` posts `Context$6` to the main Looper, whose `run()` constructs the new
-// Activity Java-side (`internalCreateActivity` — its Window wraps the SAME process-shared
-// [`window_registry`] handle as `Application.native_window`) and then calls the STATIC
-// `nativeStartActivity` to drive it up; `finish()` posts `Activity$2`, which calls the INSTANCE
-// `nativeFinish(window.native_window)` to drive the finishing activity down. The native owns BOTH
-// lifecycle halves — no api-impl Java drives a started activity's up-lifecycle or a finishing
-// one's down-lifecycle (dex xref-swept). Unbound, both threw `UnsatisfiedLinkError` out of
-// `Looper.loop`; the pump described+cleared each, but `Looper.loop` had already DEQUEUED the
-// message, so the transition was irrecoverably consumed: ActivityNativeMain (the activity hosting
-// the game engine surface) never reached `onCreate`, dead-ending the boot on a stranded splash.
-//
-// `nativeOpenURI`/`nativeFileChooser` are deliberately NOT bound (signatures recorded above from
-// the artifact): neither tripped this boot, and both need a real host action (a detected URI
-// opener / a file dialog) — a no-op would be a workaround; unbound they surface loudly through
-// the pump signal, the established discovery loop.
-
-// JNI names + descriptors, exactly as declared in the boot artifact's classes2.dex (2026-06-12).
 const ACTIVITY_NATIVE_START_ACTIVITY_NAME: &JNIStr = jni_str!("nativeStartActivity");
 const ACTIVITY_NATIVE_START_ACTIVITY_SIG: &JNIStr = jni_str!("(Landroid/app/Activity;)V");
 const ACTIVITY_NATIVE_FINISH_NAME: &JNIStr = jni_str!("nativeFinish");
@@ -15478,28 +10434,15 @@ const ACTIVITY_IS_TASK_ROOT_SIG: &JNIStr = jni_str!("()Z");
 const ACTIVITY_FINISHING_FIELD_NAME: &JNIStr = jni_str!("finishing");
 const BOOLEAN_FIELD_SIG: &JNIStr = jni_str!("Z");
 
-/// One Eclipse-driven Activity instance: a JNI global ref (the identity anchor for
-/// `IsSameObject`) plus whether [`activity_native_finish`] already drove its down-lifecycle.
 struct TrackedActivity {
-    /// Global ref to the Java `Activity` object (owned; released when the entry is dropped).
     jobject: Global<JObject<'static>>,
-    /// `true` once the down-lifecycle (onPause→onStop→onDestroy) ran — the idempotence gate for
-    /// the dex-proven double `finish()` post (two queued `Activity$2`s for the splash).
+
     finished: bool,
 }
 
-/// Eclipse-driven activities in creation order (oldest first). The lifecycle driver tracks the
-/// step-4 launcher activity; [`activity_native_start_activity`] tracks each started activity.
-/// Consulted by `nativeFinish` (finished-once gate), `nativeResumeActivity` (live-instance
-/// lookup), and `isTaskRoot` (oldest-live identity). Guarded by a `Mutex`; holders make only
-/// leaf JNI calls (IsSameObject/IsInstanceOf/NewLocalRef — never app code) under the lock, so
-/// an app callback re-entering these natives cannot deadlock.
 static TRACKED_ACTIVITIES: std::sync::Mutex<Vec<TrackedActivity>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Record `activity` in [`TRACKED_ACTIVITIES`] (creation order). Best-effort: a global-ref or
-/// lock failure logs and leaves it untracked — the finish-idempotence and `isTaskRoot` answers
-/// then degrade for that one instance (logged, never fatal/UB).
 fn track_activity(env: &Env, activity: &JObject, finished: bool) {
     match env.new_global_ref(activity) {
         Ok(global) => match TRACKED_ACTIVITIES.lock() {
@@ -15521,15 +10464,10 @@ fn track_activity(env: &Env, activity: &JObject, finished: bool) {
     }
 }
 
-/// Mark `activity` finished, returning `true` iff this is its FIRST finish (the caller then
-/// drives the down-lifecycle exactly once). An untracked instance (global-ref failure at
-/// creation) is tracked now as finished, so the second queued `Activity$2` still dedupes.
 fn mark_activity_finished_once(env: &mut Env, activity: &JObject) -> bool {
     let mut tracker = match TRACKED_ACTIVITIES.lock() {
         Ok(t) => t,
         Err(e) => {
-            // Poisoned: no dedupe possible — drive the down-lifecycle (loud, logged) rather than
-            // silently dropping the Android destruction contract.
             tracing::warn!(
                 target: "android.app.Activity",
                 error = %e,
@@ -15539,7 +10477,6 @@ fn mark_activity_finished_once(env: &mut Env, activity: &JObject) -> bool {
         }
     };
     for entry in tracker.iter_mut() {
-        // IsSameObject is a leaf JNI identity check (no app code) — safe under the lock.
         match env.is_same_object(entry.jobject.as_obj(), activity) {
             Ok(true) => {
                 if entry.finished {
@@ -15561,15 +10498,6 @@ fn mark_activity_finished_once(env: &mut Env, activity: &JObject) -> bool {
     true
 }
 
-/// `static Activity.nativeStartActivity(Activity activity)` — drive the ALREADY-CONSTRUCTED
-/// started activity up through exactly recipe steps 5–7 (`onCreate(null)` → `onStart` →
-/// `onResume`), the same implementation `drive_lifecycle` uses (factored helpers below).
-///
-/// 2026-06-12: ATL's `Context$6.run` (the posted `startActivity` continuation) has already built
-/// the Activity + Window Java-side (`internalCreateActivity`; the Window wraps the SAME shared
-/// [`window_registry`] handle, so `setContentView` flows through the existing view path — no
-/// registry work here). Any Java exception a step throws is described+cleared by [`checked`]
-/// (never left pending across the native return); a failed step stops the cascade, loudly.
 extern "system" fn activity_native_start_activity<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -15590,11 +10518,7 @@ extern "system" fn activity_native_start_activity<'local>(
             "Activity.nativeStartActivity: driving the started activity to RESUMED (steps 5–7)"
         );
         track_activity(env, &activity, false);
-        // Each helper routes through `checked` (describe+clear on a Java throw). A failure is
-        // already logged there; stop the up-cascade and return cleanly (no pending exception).
-        // 2026-06-13: onPostCreate is driven BETWEEN onCreate and onStart (the same AOSP ordering as
-        // `drive_lifecycle`) so the activity's androidx LifecycleRegistry reaches CREATED before
-        // onStart — see `call_activity_on_post_create`.
+
         if call_activity_on_create(env, &activity, "nativeStartActivity Activity.onCreate").is_err()
             || call_activity_on_post_create(
                 env,
@@ -15619,26 +10543,14 @@ extern "system" fn activity_native_start_activity<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Activity.nativeFinish(long native_window)` (instance) — drive the finishing activity DOWN:
-/// `onPause` → `onStop` → `onDestroy` (the Android destruction contract; the native owns it).
-///
-/// 2026-06-12 contract details, all dex-proven:
-/// * the `jlong` is `Window.native_window` = the PROCESS-SHARED [`window_registry`] handle
-///   (every activity's Window wraps the same slot as `Application.native_window`), so this MUST
-///   NOT `window_registry::free` it and MUST NOT close the host winit window — Java zeroes only
-///   the finishing activity's field, and ActivityNativeMain's Window still wraps the slot;
-/// * the splash calls `finish()` twice (once in `Z0`, once in `s()`), and `Activity$2` zeroes
-///   `native_window` only AFTER a successful native return — so a same-boot double call is
-///   reachable and the down-lifecycle is gated to run once per instance
-///   ([`mark_activity_finished_once`]).
 extern "system" fn activity_native_finish<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
     native_window: jlong,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        // Validate the shared handle (bounds+generation-checked — a stale/fabricated jlong logs
-        // and returns, never UB). The state itself is not touched.
+
+
         if let Err(e) = window_registry::with_window(native_window, |_| ()) {
             tracing::warn!(
                 target: "android.app.Activity",
@@ -15670,23 +10582,15 @@ extern "system" fn activity_native_finish<'local>(
             handle = native_window,
             "Activity.nativeFinish: driving the finishing activity down (onPause → onStop → onDestroy)"
         );
-        // A thrown Java exception is described+cleared by `checked` (already logged); the
-        // cascade stops there and the native returns cleanly. The handle stays allocated and
-        // the host window stays up (see the contract note above).
+
+
+
         let _ = drive_activity_down_lifecycle(env, &this);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `static Activity.nativeResumeActivity(Class cls, Intent intent)` — the CLEAR_TOP branch of
-/// the same `Context$6` dispatch: report whether a LIVE Eclipse-tracked instance of `cls`
-/// exists, resuming it if so.
-///
-/// 2026-06-12, the dex-proven minimal contract: no live instance → `false` (Java falls through
-/// to `internalCreateActivity` + `nativeStartActivity` — correct by construction); a live
-/// instance → drive it to RESUMED and return `true`. `onNewIntent` delivery is NOT yet
-/// evidence-pinned (recorded next-diagnostic), so the `intent` is not delivered here.
 extern "system" fn activity_native_resume_activity<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -15697,11 +10601,9 @@ extern "system" fn activity_native_resume_activity<'local>(
         if cls.is_null() {
             return Ok(false);
         }
-        // Runtime-checked JObject→JClass cast (the arg is a java.lang.Class instance).
+
         let cls = env.cast_local::<JClass>(cls)?;
-        // Find the FIRST live (not finished) tracked instance of `cls`. Only leaf JNI calls
-        // (IsInstanceOf/NewLocalRef) run under the lock; onResume — real app code — runs AFTER
-        // the lock is dropped so a callback re-entering these natives cannot deadlock.
+
         let target: Option<JObject<'_>> = {
             let tracker = match TRACKED_ACTIVITIES.lock() {
                 Ok(t) => t,
@@ -15742,8 +10644,7 @@ extern "system" fn activity_native_resume_activity<'local>(
                     class = %class_name,
                     "Activity.nativeResumeActivity: live instance found — driving to RESUMED"
                 );
-                // The live instance EXISTS, so report `true` even if onResume threw (described+
-                // cleared by `checked`) — `false` would make Java construct a DUPLICATE activity.
+
                 let _ = call_activity_on_resume(
                     env,
                     &activity,
@@ -15757,10 +10658,6 @@ extern "system" fn activity_native_resume_activity<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `Activity.isInMultiWindowMode()` (instance) → `false`.
-///
-/// 2026-06-12: Eclipse hosts exactly one activity stack in one host winit window — there is no
-/// split-screen/multi-window mode on this desktop host (intentional capability answer, not a stub).
 extern "system" fn activity_is_in_multi_window_mode<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -15769,8 +10666,6 @@ extern "system" fn activity_is_in_multi_window_mode<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `Activity.isTaskRoot()` (instance) → `true` iff the receiver is the OLDEST live
-/// Eclipse-tracked activity (the task's bottom — the launcher activity until it finishes).
 extern "system" fn activity_is_task_root<'local>(
     mut env: EnvUnowned<'local>,
     this: JObject<'local>,
@@ -15789,7 +10684,6 @@ extern "system" fn activity_is_task_root<'local>(
         };
         for entry in tracker.iter() {
             if !entry.finished {
-                // IsSameObject is a leaf identity check — safe under the lock.
                 return Ok(env
                     .is_same_object(entry.jobject.as_obj(), &this)
                     .unwrap_or(false));
@@ -15800,23 +10694,9 @@ extern "system" fn activity_is_task_root<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's backing for the 5 load-bearing `android.app.Activity` natives (of the
-/// artifact-verified 7 declared — `nativeOpenURI`/`nativeFileChooser` stay recorded, unbound).
-///
-/// Registered before step 4: the splash→main transition (`Context$6`/`Activity$2`, both
-/// main-Looper messages) calls `nativeStartActivity`/`nativeFinish`, and unbound natives there
-/// consumed the transition messages (2026-06-12, EXIT=10 boot).
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: each fn pointer must match its declared JNI signature.
-/// They do, by construction — the descriptors are transcribed from the boot artifact's
-/// classes2.dex (pinned by `activity_native_names_sigs_and_class_match_api_impl_dex`). Every
-/// body is `catch_unwind`-guarded via [`EnvUnowned::with_env`] (AGENTS.md §2.8).
 fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(ACTIVITY_CLASS)?;
     let methods = [
-        // SAFETY: `activity_native_start_activity` matches `(Landroid/app/Activity;)V` as a
-        // STATIC native (second arg JClass); the cast is how NativeMethod takes the fn pointer.
         unsafe {
             NativeMethod::from_raw_parts(
                 ACTIVITY_NATIVE_START_ACTIVITY_NAME,
@@ -15824,7 +10704,6 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 activity_native_start_activity as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `activity_native_finish` matches `(J)V` as an INSTANCE native.
         unsafe {
             NativeMethod::from_raw_parts(
                 ACTIVITY_NATIVE_FINISH_NAME,
@@ -15832,8 +10711,6 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 activity_native_finish as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `activity_native_resume_activity` matches
-        // `(Ljava/lang/Class;Landroid/content/Intent;)Z` as a STATIC native.
         unsafe {
             NativeMethod::from_raw_parts(
                 ACTIVITY_NATIVE_RESUME_ACTIVITY_NAME,
@@ -15841,7 +10718,6 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 activity_native_resume_activity as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `activity_is_in_multi_window_mode` matches `()Z` as an INSTANCE native.
         unsafe {
             NativeMethod::from_raw_parts(
                 ACTIVITY_IS_IN_MULTI_WINDOW_MODE_NAME,
@@ -15849,7 +10725,6 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 activity_is_in_multi_window_mode as *mut std::ffi::c_void,
             )
         },
-        // SAFETY: `activity_is_task_root` matches `()Z` as an INSTANCE native.
         unsafe {
             NativeMethod::from_raw_parts(
                 ACTIVITY_IS_TASK_ROOT_NAME,
@@ -15858,9 +10733,7 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
             )
         },
     ];
-    // SAFETY: `class` is the loaded android/app/Activity; `methods` hold valid fn pointers whose
-    // signatures match the class's `native` declarations (artifact classes2.dex, 2026-06-12; the
-    // two exact ART-reported gaps nativeStartActivity/nativeFinish from the EXIT=10 boot log).
+
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/app/Activity",
@@ -15869,193 +10742,86 @@ fn register_activity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-// === The confirmed onCreate recipe, encoded as typed constants ===================
-//
-// 2026-06-04: class internal names (slashed, for `find_class`) and JNI method descriptors,
-// transcribed from `docs/art-and-runtime.md` "onCreate JNI recipe (confirmed)" (sourced from
-// ATL's `src/main-executable/main.c` + `api-impl/android/{content,app}/*.java`). The window is
-// passed as a `jlong`/intptr_t handle, NOT an `android.view.Surface` object.
-
-/// Step-1 bootstrap class: `android.content.Context` (internal/slashed name for `find_class`).
-/// Hosts the `static` `createApplication(J)` entry point that begins the lifecycle.
 pub const CONTEXT_CLASS: &JNIStr = jni_str!("android/content/Context");
-/// The `android.app.Application` class (internal name) — the object step 1 returns and step 3
-/// (`Application.onCreate`) is invoked on.
+
 pub const APPLICATION_CLASS: &JNIStr = jni_str!("android/app/Application");
-/// Step-2 class: `android.content.ContentProvider` (internal name) — hosts the `static`
-/// `createContentProviders()` entry point.
+
 pub const CONTENT_PROVIDER_CLASS: &JNIStr = jni_str!("android/content/ContentProvider");
 
-/// `android.os.Looper` (internal name) — hosts the `static prepareMainLooper()` entry point.
-///
-/// 2026-06-05: the lifecycle runs on a single JNI-attached main thread that has no Android
-/// `Looper` of its own. Android's `Handler.<init>` requires `Looper.myLooper() != null`, and a
-/// real Activity (e.g. any `AppCompatActivity`/`FragmentActivity`, which build a `Handler` in a
-/// field initializer) is constructed during step 4 — so the main `Looper` must be prepared first,
-/// matching ATL's recipe (its boot sequence starts with `prepare_main_looper`). The pure-Java
-/// `demo_app` Activity never touched a `Handler`, so this gap only surfaced with the second app
-/// (`com.ashwin.example.accelerometerdemo`): step 4 threw
-/// `RuntimeException: Can't create handler inside thread that has not called Looper.prepare()`.
 pub const LOOPER_CLASS: &JNIStr = jni_str!("android/os/Looper");
 
-/// Step 1: `static Context.createApplication(jlong native_window) -> Application`.
-///
-/// 2026-06-05: descriptor RE-VERIFIED against the compiled framework. `api-impl.jar` packages a
-/// single `classes.dex` (no per-class `.class`), so `javap` cannot read it; the ground truth is
-/// the api-impl source the jar is built from: `Context.java` L164
-/// `static Application createApplication(long native_window)` → package-private **static**,
-/// descriptor `(J)Landroid/app/Application;`. This matches the constant exactly — the earlier
-/// `GetStaticMethodID(... createApplication ...) returning NULL` was NOT a signature mismatch but a
-/// failed `Context.<clinit>` (an `UnsatisfiedLinkError` from the WolfSSL JCA provider load left the
-/// class erroneous → method-ID lookup returns NULL). Fixed in `runtime::boot` (RTLD_GLOBAL); see §6.
 pub const STEP1_CREATE_APPLICATION: RecipeStep = RecipeStep {
     class: "android/content/Context",
     method: "createApplication",
     descriptor: "(J)Landroid/app/Application;",
 };
-/// Step 2 (deferred): `static ContentProvider.createContentProviders() -> void`.
+
 pub const STEP2_CREATE_CONTENT_PROVIDERS: RecipeStep = RecipeStep {
     class: "android/content/ContentProvider",
     method: "createContentProviders",
     descriptor: "()V",
 };
-/// Step 3 (deferred): instance `Application.onCreate() -> void` (on the step-1 object).
+
 pub const STEP3_APPLICATION_ON_CREATE: RecipeStep = RecipeStep {
     class: "android/app/Application",
     method: "onCreate",
     descriptor: "()V",
 };
-/// Step 4: `static Activity.createMainActivity(String className, jlong native_window, String uri)
-/// -> Activity`. The `className` is the launcher Activity's dotted Java class name (from the
-/// manifest's MAIN/LAUNCHER intent-filter); `native_window` is the same Eclipse-owned
-/// [`window_registry`] handle step 1 received (step 4's Window natives dereference it); `uri` is the
-/// launch URI (`null` for a plain launch). 2026-06-05: driven (the prior "deferred" note is stale).
+
 pub const STEP4_CREATE_MAIN_ACTIVITY: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "createMainActivity",
     descriptor: "(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;",
 };
-/// Step 5: instance `Activity.onCreate(Bundle) -> void` (on the step-4 object), invoked with a
-/// `null` `Bundle` (a fresh launch has no saved instance state). 2026-06-05: driven.
+
 pub const STEP5_ACTIVITY_ON_CREATE: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "onCreate",
     descriptor: "(Landroid/os/Bundle;)V",
 };
-/// Step 5b: instance `Activity.onPostCreate(Bundle) -> void` (on the step-4 object), invoked with a
-/// `null` `Bundle`, BETWEEN [`STEP5_ACTIVITY_ON_CREATE`] and [`STEP6_ACTIVITY_ON_START`].
-///
-/// 2026-06-13: restores AOSP's `performCreate` → `onPostCreate` → `dispatchActivityCreated`
-/// ordering that ATL omits (ATL/Eclipse has no `performCreate`, so without an explicit drive
-/// `onPostCreate` never runs). The overlay's patched base `Activity.onPostCreate` dispatches
-/// `Fragment.onActivityCreated(savedInstanceState)` to each fragment — which fires androidx's
-/// `ReportFragment.onActivityCreated` → `LifecycleRegistry.handleLifecycleEvent(ON_CREATE)` while
-/// the registry is at CREATED, BEFORE `onStart` dispatches ON_START. Without this, `onStart`'s
-/// ON_START is the first event the registry sees, so it back-fills ON_CREATE to observers while
-/// already STARTED — and an observer's `registerForActivityResult` (its `ActivityResultRegistry`
-/// guard requires the state be below STARTED at register time) throws `IllegalStateException`.
+
 pub const STEP_ACTIVITY_ON_POST_CREATE: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "onPostCreate",
     descriptor: "(Landroid/os/Bundle;)V",
 };
-/// Step 6: instance `Activity.onStart() -> void` (on the step-4 object). The first half of ATL's
-/// `activity_start` (`main.c`): after `onCreate`, the launcher Activity is moved to the STARTED
-/// state. No-arg instance method. 2026-06-05: driven.
+
 pub const STEP6_ACTIVITY_ON_START: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "onStart",
     descriptor: "()V",
 };
-/// Step 7: instance `Activity.onResume() -> void` (on the step-4 object). The second half of ATL's
-/// `activity_start`: the Activity reaches the RESUMED (running/interactive) state — the app is now
-/// live. No-arg instance method. 2026-06-05: driven.
+
 pub const STEP7_ACTIVITY_ON_RESUME: RecipeStep = RecipeStep {
     class: "android/app/Activity",
     method: "onResume",
     descriptor: "()V",
 };
-/// The `android.app.Activity` class (internal name) — hosts the `static` `createMainActivity` entry
-/// point (step 4) and the instance `onCreate(Bundle)`/`onStart()`/`onResume()` (steps 5–7).
+
 pub const ACTIVITY_CLASS: &JNIStr = jni_str!("android/app/Activity");
 
-/// One step of the confirmed launcher-lifecycle JNI recipe: a `class.method` and its JNI
-/// descriptor. Encoded so the (still-deferred, window-dependent) call sites bind verified
-/// descriptors rather than inline string literals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecipeStep {
-    /// Java class internal (slashed) name, e.g. `android/content/Context`.
     pub class: &'static str,
-    /// Method name, e.g. `createApplication`.
+
     pub method: &'static str,
-    /// JNI method descriptor, e.g. `(J)Landroid/app/Application;`.
+
     pub descriptor: &'static str,
 }
 
-/// How far the lifecycle driver progressed before stopping.
-///
-/// 2026-06-05: the driver now attempts the full recipe 1–7. It reaches
-/// [`ApplicationOnCreate`](LifecycleProgress::ApplicationOnCreate) (steps 1–3 proven), then drives
-/// step 4 (`Activity.createMainActivity`) and step 5 (`Activity.onCreate`) —
-/// [`ActivityOnCreate`](LifecycleProgress::ActivityOnCreate) — then steps 6–7 (`Activity.onStart` +
-/// `Activity.onResume`, ATL's `activity_start`), reaching
-/// [`ActivityResumed`](LifecycleProgress::ActivityResumed). Step 4 onward consume the `jlong` window
-/// handle, which the Window/View natives **dereference** (unlike steps 1–3, which only store it) —
-/// those natives are bound non-GTK against [`window_registry`]/[`view_registry`] as the dev-host run
-/// surfaces them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleProgress {
-    /// `find_class` resolved both [`CONTEXT_CLASS`] and [`APPLICATION_CLASS`] from the attached
-    /// main thread: the `from_raw` + `attach_current_thread` + `find_class` bridge to the loaded
-    /// `android.*` framework works. An intermediate milestone on the way to
-    /// [`ApplicationOnCreate`](Self::ApplicationOnCreate).
     BridgeProven,
-    /// Recipe steps 1–3 ran on the attached main thread: `Context.createApplication(window)` returned
-    /// an `Application`, `ContentProvider.createContentProviders()` completed, and
-    /// `Application.onCreate()` was invoked on the returned object.
+
     ApplicationOnCreate,
-    /// Recipe steps 4–5 also ran: `Activity.createMainActivity(className, window, uri)` returned an
-    /// `Activity` and `Activity.onCreate(null Bundle)` was invoked on it. The launcher Activity's
-    /// `onCreate` reached.
+
     ActivityOnCreate,
-    /// Recipe steps 6–7 also ran: `Activity.onStart()` then `Activity.onResume()` were invoked on the
-    /// step-4 `Activity` object (ATL's `activity_start`). The launcher Activity reached the RESUMED
-    /// (running/interactive) state — the increment's milestone.
+
     ActivityResumed,
 }
 
-// === Eclipse's interception of ART's java.lang.Runtime.nativeLoad ================================
-//
-// 2026-06-11: ART's `System.loadLibrary(name)` → `Runtime.nativeLoad(path, loader, caller)` →
-// `art::JavaVMExt::LoadNativeLibrary(path)` → `bionic_dlopen(path)` (the apkenv shim linker). For the
-// app's engine JNI libs (e.g. `libzstd-jni`, loaded by `androidx.startup` during `onCreate`) the
-// apkenv linker ABORTS — it cannot apply their modern relocations / its dependency-graph walk
-// NULL-derefs (docs/libroblox-init-run.md §9–§11) → SIGSEGV. Eclipse already PRE-LOADS those libs
-// through its own Rust loader (src/loader/engine.rs): mapped + relocated + fully-resolved (+
-// `JNI_OnLoad` called for the engine) BEFORE the lifecycle. The MISSING half was the CONSULT — making
-// `Runtime.nativeLoad` report a pre-loaded soname as already-loaded so it never re-enters apkenv.
-//
-// This binds Eclipse's own `Runtime.nativeLoad` via RegisterNatives (wins over the libcore native).
-// Per call:
-//   * derive the soname from the resolved path; if Eclipse pre-loaded it → return `null` = SUCCESS
-//     (ART's `nativeLoad` contract: `null` on success, an error `String` on failure), skipping
-//     apkenv entirely — this is the documented §10/§11 "registry consult";
-//   * else → DELEGATE to ART's REAL `JavaVMExt::LoadNativeLibrary` so every OTHER library (e.g.
-//     `libwolfssljni`, a discovery-based lib loaded during cert verification) loads through ART's
-//     normal path — its handle goes into `libraries_`, its `JNI_OnLoad` runs, its `Java_*` symbols
-//     stay discoverable — EXACTLY as before this interception existed (zero regression).
-//
-// With NO pre-loaded lib in the registry (e.g. a pure-Java demo APK) the interception is a pure
-// passthrough (delegates everything), so it is a no-op there. It may run on a background thread
-// (Roblox loads zstd-jni on its `AppStartupTaskM` thread); all of it is thread-safe (the registry is
-// Mutex-guarded; delegation re-enters ART with the calling thread's `JNIEnv`, which ART locks).
-
 unsafe extern "C" {
-    /// Delegate one `nativeLoad` to ART's real `art::JavaVMExt::LoadNativeLibrary` via the C++ shim
-    /// (`src/loader/native_load_shim.cpp`), which builds the `std::string` args with the host
-    /// libstdc++ (correct ABI) and calls `load_fn` (the runtime-`dlsym`'d member-function address,
-    /// invoked with an explicit `this` per the Itanium C++ ABI for a non-virtual member). Returns 1
-    /// on success (lib loaded), 0 on failure (error copied NUL-terminated into `err_buf`).
+
     fn eclipse_art_load_native_library(
         load_fn: *mut c_void,
         vm: *mut c_void,
@@ -16068,22 +10834,12 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// The mangled symbol of `art::JavaVMExt::LoadNativeLibrary(JNIEnv*, const std::string&, jobject,
-/// jclass, std::string*)`, exported (`T`) by `libart.so` (verified `nm -D`). `dlsym`'d from the global
-/// scope (libart is opened RTLD_GLOBAL by `runtime::boot`) to delegate non-pre-loaded `nativeLoad`
-/// calls to ART's real loader. 2026-06-11.
 const ART_LOAD_NATIVE_LIBRARY_SYMBOL: &[u8] =
     b"_ZN3art9JavaVMExt17LoadNativeLibraryEP7_JNIEnvRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEP8_jobjectP7_jclassPS8_\0";
 
-/// The runtime address of ART's `JavaVMExt::LoadNativeLibrary` (resolved once, cached). `None` if the
-/// symbol is absent (libart not RTLD_GLOBAL, or a build without it) — then the interception cannot
-/// delegate and reports a load *failure* for a non-pre-loaded lib rather than silently faking success.
 fn art_load_native_library_fn() -> Option<*mut c_void> {
     static FN: OnceLock<usize> = OnceLock::new();
     let addr = *FN.get_or_init(|| {
-        // SAFETY: 2026-06-11 — `dlsym(RTLD_DEFAULT, name)` with a NUL-terminated C symbol name.
-        // `libart.so` is opened RTLD_GLOBAL by `runtime::boot` (so its symbols are in the global
-        // scope) before any lifecycle/native runs. `dlsym` returns null if the symbol is absent.
         let p = unsafe {
             libc::dlsym(
                 libc::RTLD_DEFAULT,
@@ -16095,33 +10851,16 @@ fn art_load_native_library_fn() -> Option<*mut c_void> {
     (addr != 0).then_some(addr as *mut c_void)
 }
 
-/// The library soname = the final path component of the resolved load path ART hands `nativeLoad`
-/// (e.g. `/…/native-libs/libzstd-jni-1.5.7-6.so` → `libzstd-jni-1.5.7-6.so`). Pure; unit-tested.
 fn soname_from_load_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// `java.lang.Runtime` (internal/slashed name) — hosts the `nativeLoad` Eclipse intercepts.
 const RUNTIME_CLASS: &JNIStr = jni_str!("java/lang/Runtime");
-// JNI name + descriptor for `Runtime.nativeLoad`, the API-26+ libcore form
-// `private static native String nativeLoad(String filename, ClassLoader loader, Class<?> caller);`
-// (the `caller` arg matches `LoadNativeLibrary`'s `jclass caller_class`). A signature mismatch makes
-// RegisterNatives throw (best-effort handled in [`register_runtime_native_load_natives`]).
+
 const NATIVE_LOAD_NAME: &JNIStr = jni_str!("nativeLoad");
 const NATIVE_LOAD_SIG: &JNIStr =
     jni_str!("(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;");
 
-/// `Runtime.nativeLoad(String filename, ClassLoader loader, Class caller)` → `null` on success, an
-/// error `String` on failure (ART's contract).
-///
-/// Eclipse's interception: a pre-loaded soname (Eclipse's Rust loader already mapped + relocated +
-/// resolved it) → `null` (success, apkenv skipped); otherwise DELEGATE to ART's real
-/// `LoadNativeLibrary` so the lib loads through ART's normal path unchanged.
-///
-/// JNI ABI: a `static` native, so the second argument is the `JClass`. The body runs inside
-/// [`EnvUnowned::with_env`] (`catch_unwind`-wrapped so a Rust panic can never unwind into ART's C++,
-/// AGENTS.md §2.8). `resolve::<LogErrorAndDefault>` returns the default (a null `JString`) only on an
-/// internal JNI error/panic; the normal success/failure outcomes are returned explicitly.
 extern "system" fn runtime_native_load<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
@@ -16130,50 +10869,50 @@ extern "system" fn runtime_native_load<'local>(
     caller: JClass<'local>,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        // A null filename has no soname to consult — fall through to delegation (ART treats a null
-        // path as "the running executable", which its loader handles).
+
+
         let path = if filename.is_null() {
             String::new()
         } else {
             filename.try_to_string(env)?
         };
 
-        // 1) CONSULT Eclipse's pre-load registry by soname. A pre-loaded lib is already mapped +
-        //    relocated + resolved (+ JNI_OnLoad called for the engine) — report success, skip apkenv.
+
+
         if !path.is_empty() && crate::loader::engine::is_preloaded(soname_from_load_path(&path)) {
             tracing::info!(
                 soname = soname_from_load_path(&path),
                 "Runtime.nativeLoad: already pre-loaded by Eclipse's Rust loader — reporting success (apkenv skipped)"
             );
-            return Ok(JString::default()); // null == success per ART's nativeLoad contract
+            return Ok(JString::default());
         }
 
-        // 2) NOT pre-loaded: delegate to ART's real LoadNativeLibrary so this lib loads through ART's
-        //    normal path (handle in libraries_, JNI_OnLoad, Java_* discovery) exactly as before.
+
+
         let Some(load_fn) = art_load_native_library_fn() else {
-            // Cannot delegate: report a real failure (an error String) rather than fake success —
-            // returning null would wrongly mark the lib loaded and its natives would never bind.
+
+
             return env.new_string(format!(
                 "Eclipse: cannot load \"{path}\": ART JavaVMExt::LoadNativeLibrary not found (is libart RTLD_GLOBAL?)"
             ));
         };
-        let java_vm = env.get_java_vm()?.get_raw() as *mut c_void; // JavaVMExt* == the JavaVM*
+        let java_vm = env.get_java_vm()?.get_raw() as *mut c_void;
         let raw_env = env.get_raw() as *mut c_void;
         let loader_raw = loader.as_raw() as *mut c_void;
         let caller_raw = caller.as_raw() as *mut c_void;
-        // A path with an interior NUL cannot be a real file path → a load failure.
+
         let c_path = match CString::new(path.as_str()) {
             Ok(s) => s,
             Err(_) => return env.new_string(format!("Eclipse: invalid library path \"{path}\"")),
         };
         let mut err_buf = [0u8; 1024];
-        // SAFETY: 2026-06-11 — `load_fn` is the dlsym'd `JavaVMExt::LoadNativeLibrary` (a non-virtual
-        // member, callable as a free fn with explicit `this` per the Itanium C++ ABI); `java_vm` is
-        // the live `JavaVMExt*` (ART upcasts `JavaVM*`→`JavaVMExt*`, same address); `raw_env` is the
-        // calling thread's `JNIEnv*`; `loader_raw`/`caller_raw` are the JNI args; `c_path` is a valid
-        // NUL-terminated path held alive across the call; `err_buf` is a 1 KiB out buffer. The C++
-        // shim builds the `std::string` args with the host libstdc++ ART also links. This re-enters
-        // ART's loader exactly as the libcore `Runtime_nativeLoad` native does (same JNI context).
+
+
+
+
+
+
+
         let ok = unsafe {
             eclipse_art_load_native_library(
                 load_fn,
@@ -16187,9 +10926,9 @@ extern "system" fn runtime_native_load<'local>(
             )
         };
         if ok == 1 {
-            Ok(JString::default()) // success
+            Ok(JString::default())
         } else {
-            // Build the error String from the shim's NUL-terminated buffer and return it (failure).
+
             let end = err_buf.iter().position(|&b| b == 0).unwrap_or(err_buf.len());
             let msg = String::from_utf8_lossy(&err_buf[..end]).into_owned();
             let msg = if msg.is_empty() {
@@ -16203,34 +10942,16 @@ extern "system" fn runtime_native_load<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// Bind Eclipse's `Runtime.nativeLoad` interception on `java/lang/Runtime`.
-///
-/// BEST-EFFORT: if this libcore's `nativeLoad` has a different arity/signature, RegisterNatives
-/// throws — we describe+clear+log it and leave ART's original `nativeLoad` in place (so non-engine
-/// libs are unaffected) rather than aborting the boot. The dev-host log then shows `Runtime`'s method
-/// table (as for Canvas), naming the real signature. A pre-loaded lib is still pre-loaded; only the
-/// apkenv-skip is missing if registration fails.
-///
-/// # Safety / soundness
-/// `register_native_methods` is `unsafe`: the fn pointer must match the declared JNI signature. It
-/// does, by construction — [`runtime_native_load`] is written to the exact `(Ljava/lang/String;
-/// Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;` descriptor. The body is
-/// `catch_unwind`-guarded via [`EnvUnowned::with_env`], so no Rust panic can cross the JNI boundary.
 fn register_runtime_native_load_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(RUNTIME_CLASS)?;
-    let methods = [
-        // SAFETY: `runtime_native_load` matches the paired signature (see its docs); casting the
-        // `extern "system"` fn to a `*mut c_void` is how `NativeMethod::from_raw_parts` takes it.
-        unsafe {
-            NativeMethod::from_raw_parts(
-                NATIVE_LOAD_NAME,
-                NATIVE_LOAD_SIG,
-                runtime_native_load as *mut c_void,
-            )
-        },
-    ];
-    // SAFETY: `class` is the loaded java/lang/Runtime; the fn pointer's signature matches the
-    // declared native. On a signature mismatch ART throws (handled best-effort below).
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            NATIVE_LOAD_NAME,
+            NATIVE_LOAD_SIG,
+            runtime_native_load as *mut c_void,
+        )
+    }];
+
     match unsafe { env.register_native_methods(&class, &methods) } {
         Ok(()) => {
             tracing::info!(
@@ -16239,8 +10960,6 @@ fn register_runtime_native_load_natives(env: &mut Env) -> Result<(), FrameworkEr
             );
         }
         Err(e) => {
-            // Clear any pending exception so it can't poison the next JNI call; log it as the
-            // discovery signal (the dev-host run then dumps Runtime's method table = the real sig).
             if env.exception_check() {
                 env.exception_clear();
             }
@@ -16254,62 +10973,17 @@ fn register_runtime_native_load_natives(env: &mut Env) -> Result<(), FrameworkEr
     Ok(())
 }
 
-/// Drive the booted ART VM to Roblox's `Application.onCreate` (recipe steps 1–3).
-///
-/// Wraps the held [`Vm`]'s raw `*mut JavaVM` with [`jni::vm::JavaVM::from_raw`], attaches the
-/// current (main) thread, binds Eclipse's own non-GTK backing for `android.content.Context`'s two
-/// static-init natives (`native_get_apk_path` returns `apk_path`; `native_updateConfig` sets the
-/// `Configuration` screen dims to safe defaults), resolves the recipe's bootstrap classes
-/// ([`CONTEXT_CLASS`], [`APPLICATION_CLASS`]) to prove the typed-`Env` bridge reaches the loaded
-/// `android.*` framework, then **drives steps 1–3**: `Context.createApplication(0)` →
-/// `ContentProvider.createContentProviders()` → `Application.onCreate()`. Returns
-/// [`LifecycleProgress::ApplicationOnCreate`] on success.
-///
-/// `apk_path` is the on-disk APK path the framework's `native_get_apk_path` must return (the same
-/// path passed to [`runtime::boot`](crate::runtime::boot)); it is stashed before the natives are
-/// registered, so it is available the moment `Context.<clinit>` calls the native.
-///
-/// MUST be called on the process **main thread** — the thread that booted the VM
-/// ([`runtime::boot`](crate::runtime::boot)) and on which winit's event loop runs. `Vm` is
-/// `!Send`/`!Sync`, so the borrow checker keeps the caller on that thread; the main thread is
-/// already JNI-attached after `JNI_CreateJavaVM`, so `attach_current_thread` is cheap.
-///
-/// The JNI closure body is wrapped in `std::panic::catch_unwind` so a Rust panic can never
-/// unwind into ART's C++ under the release `panic = "abort"` profile (AGENTS.md §2.8). Each step's
-/// failure — including a pending Java exception — surfaces as the typed [`FrameworkError::Jni`]
-/// (never a panic/unwrap); a thrown exception is additionally described to stderr (to name the next
-/// missing native/class for the dev-host discovery loop) and cleared before returning.
-///
-/// # Steps 4–7
-/// Drives step 4 (`Activity.createMainActivity(launcher_activity, window, null)`), step 5
-/// (`Activity.onCreate(null Bundle)`), then step 6 (`Activity.onStart()`) and step 7
-/// (`Activity.onResume()`) after steps 1–3. `launcher_activity` is the dotted Java class name of the
-/// manifest's MAIN/LAUNCHER Activity. The `jlong` window handle is the same Eclipse-owned
-/// [`window_registry`] handle steps 1–3 received; step 4's Window/View natives dereference it (bound
-/// non-GTK against [`window_registry`]/[`view_registry`]). Steps 6–7 are ATL's `activity_start`: they
-/// call `onStart()` then `onResume()` on the step-4 `Activity` object (no args), driving it to the
-/// RESUMED state. Returns [`LifecycleProgress::ActivityResumed`] on success; if a step's native is
-/// not yet bound the run's `No implementation found` line names the next one to add (the dev-host
-/// discovery loop).
 pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
     launcher_activity: &str,
 ) -> Result<LifecycleProgress, FrameworkError> {
-    // SAFETY: `vm.as_raw()` is the live `*mut JavaVM` that this process's `JNI_CreateJavaVM`
-    // returned (verified non-null by `boot()`'s `NullEnv` check), supporting JNI 1.6 ≥ 1.4 —
-    // exactly `from_raw`'s contract. We guard null here too so a null can never reach
-    // `from_raw`'s internal `assert!` (which would panic). `&Vm` keeps the VM alive and pins us
-    // to its (main) thread for the duration.
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
     let java_vm = unsafe { JavaVM::from_raw(raw) };
 
-    // Run the JNI work under attach_current_thread (the main thread is already attached, so this
-    // is cheap and does not detach on return). Wrap the closure body in catch_unwind so a panic
-    // from inside JNI/ART can never unwind across the FFI boundary (panic = "abort"; §2.8).
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
             drive_lifecycle(env, apk_path, launcher_activity)
@@ -16320,33 +10994,12 @@ pub fn drive_application_lifecycle(
     })
 }
 
-/// Register the framework natives an engine `JNI_OnLoad` can reach, BEFORE the engine pre-load.
-///
-/// 2026-06-12 (registration-ordering gap): `run_apk` runs `preload_app_native_libs` (where
-/// libroblox's `JNI_OnLoad` executes) BEFORE `drive_application_lifecycle`, but every framework
-/// native was registered only inside `drive_lifecycle` — so the engine's one `JNI_OnLoad`-time
-/// Java `Log` call (LoggingProtocol init, tag=JNIMain) missed `println_native` and the engine
-/// warned `process timestamps will be inaccurate` for the whole boot. This entry point is called
-/// by `run_apk` BEFORE the pre-load and registers exactly the evidence-backed set: `Log` (the
-/// observed miss) + `Process` (the same LoggingProtocol init path calls `getElapsedCpuTime`).
-/// `drive_lifecycle` keeps registering both too — RegisterNatives with identical fn pointers is
-/// spec-legal and idempotent, so neither call site can regress the other. Sweep result, dated:
-/// no OTHER registration in `drive_lifecycle`'s block has evidence of an engine-`JNI_OnLoad`-time
-/// caller today; grow this set on run evidence only.
-///
-/// Same threading/panic contract as [`drive_application_lifecycle`] (main thread, `&Vm` pins it,
-/// `catch_unwind` at the JNI boundary).
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI error;
-/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn register_engine_preload_natives(vm: &Vm) -> Result<(), FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
-    // by the `&Vm` borrow — exactly `from_raw`'s contract (the process VM singleton).
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -16359,17 +11012,6 @@ pub fn register_engine_preload_natives(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-/// Lifecycle step 0: prepare Android's main Looper, record [`MAIN_THREAD_ID`], and initialize the
-/// cached queue/method IDs used by the external pump. Shared by [`drive_application_lifecycle`]'s
-/// step 0 (whose surrounding comment block stays at its call site) and [`prepare_main_looper`].
-///
-/// 2026-07-16: NOT idempotent — the pre-2026-07-16 step-0 comment claimed it was, and that was
-/// stale. On the SAME thread ATL `Looper.java:76-78` throws
-/// `RuntimeException("Only one Looper may be created per thread")` from `prepare(false)`; from a
-/// DIFFERENT thread `Looper.java:92-94` throws
-/// `IllegalStateException("The main Looper has already been prepared.")`. Call it exactly once per
-/// process, on the process main thread. [`drive_application_lifecycle`] and [`prepare_main_looper`]
-/// are never both driven in one process (`__webview-test` drives no lifecycle).
 fn prepare_main_looper_inner(env: &mut Env) -> Result<(), FrameworkError> {
     let looper_class = env.find_class(LOOPER_CLASS)?;
     checked(env, "step 0 Looper.prepareMainLooper", |env| {
@@ -16382,24 +11024,18 @@ fn prepare_main_looper_inner(env: &mut Env) -> Result<(), FrameworkError> {
         .v()
     })?;
     initialize_main_looper_jni_cache(env, &looper_class)?;
-    // The UI thread's identity, recorded once — the dispatch gate's whole basis (2026-07-16).
+
     let _ = MAIN_THREAD_ID.set(std::thread::current().id());
     Ok(())
 }
 
-/// JNI state used by the externally pumped Android main queue. The queue is immutable after
-/// `Looper.prepareMainLooper`, and JNI method IDs are explicitly reusable across calls and threads
-/// while their declaring classes remain loaded. Keeping global class references here satisfies that
-/// lifetime requirement and removes the measured per-tick `FindClass`/`GetMethodID`/`GetObjectClass`
-/// work from the gameplay main thread.
 struct MainLooperJniCache {
     queue: Global<JObject<'static>>,
     queue_next: JMethodID,
     message_get_target: JMethodID,
     handler_dispatch_message: JMethodID,
     message_recycle: JMethodID,
-    // JNI method IDs may be invalidated if their declaring class unloads. These globals deliberately
-    // have no read sites: retaining them for the process lifetime is what keeps every ID above valid.
+
     _queue_class: Global<JClass<'static>>,
     _message_class: Global<JClass<'static>>,
     _handler_class: Global<JClass<'static>>,
@@ -16407,9 +11043,6 @@ struct MainLooperJniCache {
 
 static MAIN_LOOPER_JNI_CACHE: OnceLock<MainLooperJniCache> = OnceLock::new();
 
-/// Resolve the main queue and its four hot method IDs once, immediately after the main Looper is
-/// prepared. This is deliberately part of step 0: a failure is a boot-time JNI error rather than a
-/// recurring error (and repeated lookup cost) from `about_to_wait` during gameplay.
 fn initialize_main_looper_jni_cache(
     env: &mut Env,
     looper_class: &JClass,
@@ -16449,41 +11082,17 @@ fn initialize_main_looper_jni_cache(
         _message_class: env.new_global_ref(&message_class)?,
         _handler_class: env.new_global_ref(&handler_class)?,
     };
-    // Step 0 is intentionally once-per-process. If a future caller violates that invariant, retain
-    // the first cache (which belongs to the only valid main Looper) rather than replacing it.
+
     let _ = MAIN_LOOPER_JNI_CACHE.set(cache);
     Ok(())
 }
 
-/// Prepare the ART main `Looper` on THIS (main) thread — [`drive_application_lifecycle`]'s step 0,
-/// exposed 2026-07-16 for the dev-host `__webview-test`, which boots ART WITHOUT the lifecycle and
-/// therefore had NO main Looper and NO pump: its WebView callbacks were delivered Looper-less and it
-/// never noticed. That, plus its stock no-Handler `WebViewClient` (now the overlay's
-/// `EclipseWebViewClientProbe`), is exactly why the harness was blind to the challenge17/18 root
-/// cause. Binds the natives the main Looper needs FIRST, in the same order the lifecycle drive
-/// binds them:
-///  - [`register_system_clock_natives`] — `MessageQueue.next()` reads `SystemClock.uptimeMillis()`
-///    (ATL `MessageQueue.java:143`) on EVERY pump tick. 2026-07-16 MEASURED: without this the very
-///    first [`pump_main_looper`] threw `UnsatisfiedLinkError: No implementation found for long
-///    android.os.SystemClock.uptimeMillis()` out of `MessageQueue.next`, so the harness prepared a
-///    main Looper it could never pump — the prepared-but-undrained shape this whole fix rejects as
-///    worse than a loud throw. The lifecycle drive gets this from its own `register_*` block; a
-///    Looper prepared through THIS entry point must carry it too, or "prepared" is a lie.
-///  - [`register_message_queue_natives`] — `prepareMainLooper` constructs the main `MessageQueue`,
-///    whose ctor calls `nativeInit` (the ordering rule documented on that function).
-///
-/// `&Vm` is `!Send`, pinning this to the boot/main thread.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java
-/// error; [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn prepare_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()` (non-null verified above), kept alive
-    // by the `&Vm` borrow — exactly `from_raw`'s contract (the `pump_main_looper` precedent below).
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -16497,52 +11106,12 @@ pub fn prepare_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-/// Dispatch a click to the [`view_registry`] view identified by `handle` by calling the public Java
-/// `View.performClick()Z` on its recorded global object — firing the registered `OnClickListener`.
-///
-/// 2026-06-05: the minimal SOUND click path. The winit event loop (`graphics.rs`) hit-tests the laid-
-/// out view tree on a primary pointer press+release, then calls this with the hit view's handle and a
-/// borrow of the held [`Vm`]. The `&Vm` keeps the VM alive (and pins us to its main thread) for the
-/// call; the event loop runs on that same JNI-attached main thread, so re-attaching is cheap and the
-/// VM is reachable. The full `MotionEvent`/`InputQueue` touch+move+key dispatch is the documented
-/// follow-up.
-///
-/// The JNI work is `catch_unwind`-guarded so a Rust panic can never unwind into ART's C++; a thrown
-/// Java exception is described + cleared by [`checked`]. Returns `true` iff `performClick` ran and
-/// returned `true` (Android: a listener was invoked); `false`/typed `Err` otherwise — never a panic
-/// across the boundary.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
-/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
-///
-/// ---
-///
-/// Pump the Android **main** `Looper` once: dispatch every currently-ready main-thread message
-/// (`Handler.post` continuations, `SurfaceHolder` callbacks, etc.) and return (2026-06-12).
-///
-/// Eclipse drives the lifecycle on the main thread then hands it to winit's `run_windowed`, so the
-/// main thread never runs `Looper.loop()` — main-thread messages queue but never dispatch, stalling
-/// Roblox after `onResume`. This drives `Looper.loop()` ONCE from the winit `about_to_wait` hook; with
-/// the non-blocking [`message_queue_native_poll_once`], `loop()` drains the ready batch and returns
-/// instead of blocking. Returns the approximate number of messages dispatched this tick (for the
-/// drain log / the "is the queue even non-empty" check).
-///
-/// Runs on the winit/main thread — the SAME thread that called `Looper.prepareMainLooper` (step 0), so
-/// `Looper.myLooper()` resolves to the main Looper. The `&Vm` borrow pins it to that thread (`Vm` is
-/// `!Send`/`!Sync`). `catch_unwind`-guarded (a dispatched message runs real app code that may panic);
-/// [`checked`] describes+clears any thrown Java exception so one bad handler can't poison the batch.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error
-/// from `Looper.loop`; [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn pump_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: identical to `dispatch_click_to_view` — `raw` is the live `*mut JavaVM` from `boot()`,
-    // kept alive by the `&Vm` borrow (non-null verified); `from_raw` returns the process VM singleton.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| run_main_looper_once(env))) {
@@ -16552,41 +11121,19 @@ pub fn pump_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-/// Drive `android.os.Looper.loop()V` exactly once on the current (main) thread. Re-entrancy-guarded
-/// ([`MAIN_LOOPER_PUMP_IN_PROGRESS`], accessed via `try_with` so it can never panic-abort) so a message
-/// that synchronously re-enters the winit path can't recursively drive the single main queue.
 fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
-    // `try_with` (not `with`): on the main thread the TLS is always live, but a teardown edge must
-    // degrade to "not in progress" + proceed, never panic (panic = "abort"). Default true = skip.
     let already = MAIN_LOOPER_PUMP_IN_PROGRESS
         .try_with(|f| f.replace(true))
         .unwrap_or(true);
     if already {
-        return Ok(()); // already pumping (or TLS unavailable) — a nested drive would corrupt the queue
+        return Ok(());
     }
-    // 2026-06-14: drive a BOUNDED batch of ready messages instead of `Looper.loop()`. `Looper.loop()`
-    // returns only when the queue drains to empty — but a live app (e.g. the landing screen's auth/
-    // fragment error-retry paths) RE-POSTS main-thread messages continuously, so the queue is never
-    // empty and `loop()` never returns, FREEZING the winit event loop (about_to_wait never returns →
-    // no host input is delivered). `drive_main_messages` mirrors `loop()`'s body (myQueue → next →
-    // getTarget → dispatchMessage → recycle, exactly ATL's Looper.loop) but caps the work per tick, so
-    // about_to_wait always returns and stays responsive. When idle it drains fully in << budget
-    // (identical to loop()); only a storm hits the cap.
-    //
-    // 2026-07-16 (web-engine M6 root fix): run the pending app-facing WebView callback FIRST, on
-    // THIS (main) thread — the one thread with a prepared android.os.Looper (step 0) — then
-    // dispatch the messages it posted in the SAME UI-thread turn (the app's real shape:
-    // onPageStarted -> SwipeRefreshLayout.setRefreshing -> View.startAnimation -> Animation.start
-    // -> new Handler().post). It runs INSIDE MAIN_LOOPER_PUMP_IN_PROGRESS (the job is real app
-    // code — strictly more re-entrant than a Looper message) and inside pump_main_looper's
-    // catch_unwind, and it reuses this function's `env`: no second attach, no new `unsafe`.
-    // At most ONE job exists (the poster blocks), so this cannot storm the way
-    // MAIN_LOOPER_MESSAGE_BUDGET exists to bound.
+
     run_pending_main_upcall(env);
     let result = drive_main_messages(env);
     let _ = MAIN_LOOPER_PUMP_IN_PROGRESS.try_with(|f| f.set(false));
     result?;
-    // One-time confirmation the pump is live (process-global atomic, no TLS — see its docs).
+
     if !MAIN_LOOPER_PUMP_ACTIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::info!(
             "main Looper pump active: dispatching main-thread messages from the winit loop"
@@ -16595,30 +11142,15 @@ fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-/// The max main-thread messages [`drive_main_messages`] dispatches per pump tick before returning to
-/// the winit loop, even if more are ready. Bounds a message storm (a live app re-posting continuously)
-/// so the winit event loop stays responsive; an idle queue drains in far fewer (identical to
-/// `Looper.loop`). 512 comfortably covers the lifecycle's per-tick bursts while capping a runaway storm.
 const MAIN_LOOPER_MESSAGE_BUDGET: usize = 512;
 
-/// Drive up to [`MAIN_LOOPER_MESSAGE_BUDGET`] ready main-thread messages, mirroring
-/// `android.os.Looper.loop()`'s body (`myQueue` → `next` → `getTarget` → `dispatchMessage` → `recycle`,
-/// exactly ATL's `Looper.loop`) but RETURNING after the cap instead of looping until the queue is empty.
-/// The MAIN `MessageQueue.next()` is non-blocking under Eclipse (ATL's `nativePollOnce` returns rather
-/// than blocking when no message is ready, so `next()` yields `null`), so the loop ends early once the
-/// queue drains. Worker queues retain normal blocking semantics. Each message is dispatched inside its
-/// own local frame (bounded JNI local refs over the loop)
-/// and a thrown handler is described+cleared so one bad handler can't stop the batch — stricter than
-/// `Looper.loop`, which aborts the whole loop on a throw.
 fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
     if let Some(cache) = MAIN_LOOPER_JNI_CACHE.get() {
         return drive_main_messages_cached(env, cache);
     }
 
-    // Defensive fallback for a future non-standard caller that pumps without the normal step-0
-    // preparation path. Production and the WebView harness always use the cached branch above.
     let looper_class = env.find_class(LOOPER_CLASS)?;
-    // Looper.myQueue() (public static) → the current (main) thread's MessageQueue.
+
     let queue = checked(env, "Looper.myQueue", |env| {
         env.call_static_method(
             &looper_class,
@@ -16630,8 +11162,8 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
     })?;
     for _ in 0..MAIN_LOOPER_MESSAGE_BUDGET {
         let processed = env.with_local_frame(16, |env| -> Result<bool, FrameworkError> {
-            // MessageQueue.next() — package-private, non-blocking here (yields null when no ready
-            // message). JNI ignores Java access modifiers, so the methodID resolves.
+
+
             let msg = checked(env, "MessageQueue.next", |env| {
                 env.call_method(
                     &queue,
@@ -16642,10 +11174,10 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
                 .l()
             })?;
             if msg.is_null() {
-                return Ok(false); // queue drained this tick — stop
+                return Ok(false);
             }
-            // Message.getTarget() (public) → Handler; dispatch, catching a handler throw so one bad
-            // handler can't poison the batch (ATL's Looper.loop aborts the whole loop on a throw).
+
+
             let target = checked(env, "Message.getTarget", |env| {
                 env.call_method(
                     &msg,
@@ -16668,8 +11200,8 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
                     tracing::debug!(error = %e, "main-looper message handler threw (cleared, continuing)");
                 }
             }
-            // Return the message to ATL's pool (mirrors Looper.loop's msg.recycle(); ATL's recycle has
-            // no in-use check, so it is safe post-dispatch). A recycle failure is logged, never fatal.
+
+
             if let Err(e) = checked(env, "Message.recycle", |env| {
                 env.call_method(&msg, jni_str!("recycle"), jni_sig!("()V"), &[])?
                     .v()
@@ -16685,11 +11217,6 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-/// Hot main-queue drain using the queue and exact method IDs resolved at Looper setup. Each unchecked
-/// invocation is paired with the descriptor used to create its cached ID in
-/// [`initialize_main_looper_jni_cache`]; return types and argument counts therefore match by
-/// construction. Calls still run through [`checked`], so Java exceptions are described and cleared
-/// exactly like the former name-resolving path.
 fn drive_main_messages_cached(
     env: &mut Env,
     cache: &MainLooperJniCache,
@@ -16697,8 +11224,8 @@ fn drive_main_messages_cached(
     for _ in 0..MAIN_LOOPER_MESSAGE_BUDGET {
         let processed = env.with_local_frame(16, |env| -> Result<bool, FrameworkError> {
             let msg = checked(env, "MessageQueue.next (cached)", |env| {
-                // SAFETY: `queue_next` was resolved from MessageQueue with descriptor
-                // `()Landroid/os/Message;`; `cache.queue` is the retained main MessageQueue.
+
+
                 unsafe {
                     env.call_method_unchecked(
                         cache.queue.as_obj(),
@@ -16714,8 +11241,8 @@ fn drive_main_messages_cached(
             }
 
             let target = checked(env, "Message.getTarget (cached)", |env| {
-                // SAFETY: `message_get_target` was resolved from Message with descriptor
-                // `()Landroid/os/Handler;`, and `msg` is the Message returned by queue.next().
+
+
                 unsafe {
                     env.call_method_unchecked(
                         &msg,
@@ -16729,8 +11256,8 @@ fn drive_main_messages_cached(
             if !target.is_null() {
                 let args = [JValue::Object(&msg).as_jni()];
                 if let Err(e) = checked(env, "Handler.dispatchMessage (cached)", |env| {
-                    // SAFETY: `handler_dispatch_message` was resolved from Handler with descriptor
-                    // `(Landroid/os/Message;)V`; `target` and the sole Message argument match it.
+
+
                     unsafe {
                         env.call_method_unchecked(
                             &target,
@@ -16746,8 +11273,8 @@ fn drive_main_messages_cached(
             }
 
             if let Err(e) = checked(env, "Message.recycle (cached)", |env| {
-                // SAFETY: `message_recycle` was resolved from Message with descriptor `()V`; `msg`
-                // is still live within this local frame and dispatch has completed.
+
+
                 unsafe {
                     env.call_method_unchecked(
                         &msg,
@@ -16777,9 +11304,7 @@ pub fn dispatch_click_to_view(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
-    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
-    // process VM singleton (idempotent across calls).
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| perform_click(env, handle))) {
@@ -16789,14 +11314,7 @@ pub fn dispatch_click_to_view(
     })
 }
 
-/// Call `View.performClick()Z` on the global object recorded for `handle`. Returns `false` (not an
-/// error) when the handle is valid but has no recorded global object (a non-dispatchable view) or is
-/// stale/fabricated — those are normal "nothing to click" outcomes the event loop ignores. A thrown
-/// Java exception inside `performClick` is turned into a typed [`FrameworkError::Jni`] by [`checked`].
 fn perform_click(env: &mut Env, handle: view_registry::ViewHandle) -> Result<bool, FrameworkError> {
-    // Hold the registry lock only long enough to read the global ref into a `call_method`. The
-    // closure makes exactly one JNI call (no registry re-entry), so the lock contract of
-    // `with_jobject` is honored.
     let result = view_registry::with_jobject(handle, |global| {
         checked(env, "View.performClick", |env| {
             env.call_method(
@@ -16811,9 +11329,9 @@ fn perform_click(env: &mut Env, handle: view_registry::ViewHandle) -> Result<boo
     match result {
         Ok(Some(Ok(clicked))) => Ok(clicked),
         Ok(Some(Err(e))) => Err(e),
-        // Valid handle but no recorded jobject: a non-dispatchable view — nothing to click.
+
         Ok(None) => Ok(false),
-        // Stale/fabricated handle or poisoned lock: nothing to click (logged, not fatal).
+
         Err(e) => {
             tracing::debug!(handle, error = %e, "performClick: view not dispatchable (ignored)");
             Ok(false)
@@ -16821,80 +11339,41 @@ fn perform_click(env: &mut Env, handle: view_registry::ViewHandle) -> Result<boo
     }
 }
 
-/// A single-pointer touch action — the subset Eclipse dispatches this increment (DOWN/UP). 2026-06-05:
-/// `MOVE` and multi-touch/key are documented follow-ups. The discriminant maps to the public Android
-/// `MotionEvent` action code via [`Self::code`] (`ACTION_DOWN = 0`, `ACTION_UP = 1`, `ACTION_MOVE = 2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionAction {
-    /// `MotionEvent.ACTION_DOWN` — the pointer first contacts the view (press).
     Down,
-    /// `MotionEvent.ACTION_UP` — the pointer leaves the view (release); the View's own click
-    /// detection fires its `OnClickListener` on an UP that completes a tap.
+
     Up,
-    /// `MotionEvent.ACTION_MOVE` — the pointer moved while down (a drag); carries the same downTime as
-    /// the gesture's `ACTION_DOWN`. Lets the engine track drags (scroll lists, sliders).
+
     Move,
 }
 
 impl MotionAction {
-    /// The public Android `MotionEvent` action code (`android.view.MotionEvent.ACTION_*`): a stable
-    /// part of the Android API. `ACTION_DOWN = 0`, `ACTION_UP = 1`, `ACTION_MOVE = 2`. Pure
-    /// (GPU/VM-free) so it is unit-testable; passed verbatim as the `action` arg to `MotionEvent.obtain`.
     pub fn code(self) -> jint {
         match self {
-            Self::Down => 0, // MotionEvent.ACTION_DOWN
-            Self::Up => 1,   // MotionEvent.ACTION_UP
-            Self::Move => 2, // MotionEvent.ACTION_MOVE
+            Self::Down => 0,
+            Self::Up => 1,
+            Self::Move => 2,
         }
     }
 }
 
-/// Which half of a hardware-key event a [`pass_hardware_key_to_engine`] call carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
-    /// The key was pressed (`isDown = true`).
     Down,
-    /// The key was released (`isDown = false`).
+
     Up,
 }
 
 impl KeyAction {
-    /// The public Android `KeyEvent` action code (`android.view.KeyEvent.ACTION_*`): `ACTION_DOWN = 0`,
-    /// `ACTION_UP = 1`. Pure (GPU/VM-free), so it is unit-testable; passed verbatim as the `action` arg
-    /// to the `KeyEvent` constructor.
     pub fn code(self) -> jint {
         match self {
-            Self::Down => 0, // KeyEvent.ACTION_DOWN
-            Self::Up => 1,   // KeyEvent.ACTION_UP
+            Self::Down => 0,
+            Self::Up => 1,
         }
     }
 }
 
-/// Dispatch a real Android [`MotionEvent`] of `action` at window pixel `(x, y)` to the
-/// [`view_registry`] view identified by `handle`, by building the event with the public Java factory
-/// `MotionEvent.obtain(...)` and routing it through `View.dispatchTouchEvent(MotionEvent)`.
-///
-/// 2026-06-05: the faithful Android-input follow-up to [`dispatch_click_to_view`] (which only fired
-/// `View.performClick`). The winit event loop (`graphics.rs`) calls this with `Down` on a primary
-/// press over a clickable hit view, then `Up` on the release over the same view; the View's own click
-/// detection then fires the registered `OnClickListener` from the UP. The event's `downTime`/
-/// `eventTime` come from `SystemClock.uptimeMillis()` (Eclipse's bound monotonic clock), exactly as
-/// Android's input pipeline times them; `metaState` is `0` (no modifier keys this increment). Full
-/// `MotionEvent` MOVE/multi-touch/key dispatch is the documented follow-up.
-///
-/// Mirrors [`dispatch_click_to_view`]'s soundness: attaches the held VM's main thread (the `&Vm`
-/// borrow keeps it alive + pins us to that thread), wraps the JNI work in `catch_unwind` so a Rust
-/// panic can never unwind into ART's C++ (`panic = "abort"`, §2.8), and routes every JNI call through
-/// [`checked`] (a thrown Java exception is described + cleared into a typed [`FrameworkError::Jni`]).
-/// The obtained `MotionEvent` is `recycle()`d after dispatch on every path.
-///
-/// Returns `true` iff `dispatchTouchEvent` returned `true` (the View consumed the event); `false`
-/// when the view has no dispatchable Java object, or `dispatchTouchEvent` returned `false`; a typed
-/// `Err` on a VM/JNI/Java error — never a panic across the boundary.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
-/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn dispatch_touch_to_view(
     vm: &Vm,
     handle: view_registry::ViewHandle,
@@ -16906,9 +11385,7 @@ pub fn dispatch_touch_to_view(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
-    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
-    // process VM singleton (idempotent across calls), same as `dispatch_click_to_view`.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| touch_view(env, handle, action, x, y))) {
@@ -16918,11 +11395,6 @@ pub fn dispatch_touch_to_view(
     })
 }
 
-/// Build a [`MotionEvent`] for `action` at `(x, y)` and dispatch it to the global object recorded for
-/// `handle` via `View.dispatchTouchEvent`, then `recycle()` the event. Returns `false` (not an error)
-/// when the handle is valid but has no recorded global object (a non-dispatchable view) or is
-/// stale/fabricated — the event loop treats those as no-ops. A thrown Java exception is turned into a
-/// typed [`FrameworkError::Jni`] by [`checked`].
 fn touch_view(
     env: &mut Env,
     handle: view_registry::ViewHandle,
@@ -16930,12 +11402,7 @@ fn touch_view(
     x: f32,
     y: f32,
 ) -> Result<bool, FrameworkError> {
-    // Hold the registry lock only long enough to dispatch (the closure makes JNI calls but never
-    // re-enters the registry), honoring `with_jobject`'s contract.
     let result = view_registry::with_jobject(handle, |global| {
-        // Monotonic event time from Eclipse's bound SystemClock.uptimeMillis (the time Android's
-        // input pipeline stamps a MotionEvent with). One call serves as both downTime and eventTime
-        // for a single isolated press/release — adequate for the single-pointer DOWN/UP this increment.
         let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
         let now = checked(env, "SystemClock.uptimeMillis", |env| {
             env.call_static_method(
@@ -16947,7 +11414,6 @@ fn touch_view(
             .j()
         })?;
 
-        // MotionEvent.obtain(downTime, eventTime, action, x, y, metaState) — the public Java factory.
         let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
         let event = checked(env, "MotionEvent.obtain", |env| {
             env.call_static_method(
@@ -16960,13 +11426,12 @@ fn touch_view(
                     JValue::Int(action.code()),
                     JValue::Float(x),
                     JValue::Float(y),
-                    JValue::Int(0), // metaState: no modifier keys this increment
+                    JValue::Int(0),
                 ],
             )?
             .l()
         })?;
 
-        // View.dispatchTouchEvent(event) — routes through onTouchEvent + the View's click detection.
         let consumed = checked(env, "View.dispatchTouchEvent", |env| {
             env.call_method(
                 global.as_obj(),
@@ -16977,9 +11442,6 @@ fn touch_view(
             .z()
         });
 
-        // Recycle the event on EVERY path (success or dispatch error) — it is pooled, not GC-freed
-        // promptly, so returning it avoids exhausting the recycler over many touches. A recycle
-        // failure is logged but does not mask the dispatch result.
         if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
             env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
                 .v()
@@ -16991,9 +11453,9 @@ fn touch_view(
     match result {
         Ok(Some(Ok(consumed))) => Ok(consumed),
         Ok(Some(Err(e))) => Err(e),
-        // Valid handle but no recorded jobject: a non-dispatchable view — nothing to touch.
+
         Ok(None) => Ok(false),
-        // Stale/fabricated handle or poisoned lock: nothing to touch (logged, not fatal).
+
         Err(e) => {
             tracing::debug!(handle, error = %e, "dispatchTouchEvent: view not dispatchable (ignored)");
             Ok(false)
@@ -17001,36 +11463,22 @@ fn touch_view(
     }
 }
 
-/// The outcome of dispatching one pointer event to the engine's `RBXSurfaceView` via
-/// [`dispatch_touch_to_engine_surface`].
 pub struct EngineTouchOutcome {
-    /// `true` iff `RBXSurfaceView.onTouchEvent` returned `true` (the engine consumed the event).
     pub consumed: bool,
-    /// The `downTime` (ms, `SystemClock.uptimeMillis`) used for this gesture. The caller threads the
-    /// SAME value from the press's `ACTION_DOWN` into the matching `ACTION_UP` so the engine groups
-    /// them as one gesture stream (downTime is constant across a gesture, per the Android contract).
+
     pub down_time_ms: i64,
 }
 
-/// Resolve the engine's content `RBXSurfaceView` handle (the `SurfaceView` Roblox's engine draws into
-/// and reads input from), or `None` if it is not yet registered in [`view_registry`]. Thin wrapper over
-/// [`view_registry::find_by_class`] so the pointer path (`graphics.rs`) targets the engine surface
-/// without duplicating the class constant.
 pub fn engine_surface_view_handle() -> Option<view_registry::ViewHandle> {
     view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS)
 }
 
-/// Forward a host mouse-wheel scroll to the engine's `com.roblox.engine.jni.NativeInputInterface.
-/// nativePassMouseWheel(float x, float y, float delta)` (a static native discovered via
-/// [`reflect_engine_input_methods`] — the engine's desktop wheel handler). Best-effort: a missing
-/// class/method or a JNI throw is described+cleared, never fatal. (Roblox's Android UI also scrolls via
-/// touch-drag, which Eclipse already forwards as `ACTION_MOVE`; this adds the desktop wheel.) 2026-06-14.
 pub fn dispatch_scroll(vm: &Vm, x: f32, y: f32, delta: f32) {
     let raw = vm.as_raw();
     if raw.is_null() {
         return;
     }
-    // SAFETY: live process VM kept alive by `&Vm`, non-null — `JavaVM::from_raw`'s contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -17057,11 +11505,6 @@ pub fn dispatch_scroll(vm: &Vm, x: f32, y: f32, delta: f32) {
     });
 }
 
-/// Forward one host mouse-button transition through Roblox's desktop input bridge:
-/// `NativeInputInterface.nativePassMouseButton(float x, float y, boolean down, int button)`.
-/// The current APK's own generic-motion handler calls this exact method for Android mouse
-/// `ACTION_BUTTON_PRESS`/`ACTION_BUTTON_RELEASE`; calling it directly avoids misclassifying a host
-/// mouse as a touchscreen.
 pub fn dispatch_mouse_button(
     vm: &Vm,
     x: f32,
@@ -17073,7 +11516,7 @@ pub fn dispatch_mouse_button(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: the live process VM is kept alive by `&Vm` and was checked non-null above.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -17102,9 +11545,6 @@ pub fn dispatch_mouse_button(
     })
 }
 
-/// Forward host pointer motion through Roblox's desktop input bridge:
-/// `NativeInputInterface.nativePassMouseMove(float x, float y, float dx, float dy)`. The APK uses
-/// these same absolute and relative values in its generic-motion handler.
 pub fn dispatch_mouse_move(
     vm: &Vm,
     x: f32,
@@ -17116,7 +11556,7 @@ pub fn dispatch_mouse_move(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: the live process VM is kept alive by `&Vm` and was checked non-null above.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -17145,33 +11585,6 @@ pub fn dispatch_mouse_move(
     })
 }
 
-/// Dispatch a single-pointer `MotionEvent` of `action` at window pixel `(x, y)` to the engine's
-/// `RBXSurfaceView` via ATL's touch driver `onTouchEventInternal`, which invokes the view's
-/// `OnTouchListener` — the GLSurfaceView input entry point Roblox's engine wires (via
-/// `setOnTouchListener`) to push the event into native through its
-/// `com.roblox.engine.jni.NativeInputInterface` bridge. The engine is NOT a NativeActivity (it imports
-/// zero `AInputQueue_*`; only `ALooper_*`), so the Java view layer pushes input in — see
-/// `native_provider`'s "winit → ALooper input feed" note.
-///
-/// 2026-06-14: the ENGINE-MODE pointer path, used post-handoff when the engine owns rendering and
-/// Eclipse's `VulkanRenderer` + own view tree are gone. Distinct from [`dispatch_touch_to_view`],
-/// which calls `View.dispatchTouchEvent` (a no-op on ATL's base `View`) against an Eclipse-hit-tested
-/// view — that path cannot reach the engine-drawn Lua UI. This targets the engine's real content
-/// surface (the same peer Eclipse drives the surface lifecycle on, see [`dispatch_surface_lifecycle`]).
-///
-/// `down_time_ms`: `None` for the gesture's `ACTION_DOWN` — samples `SystemClock.uptimeMillis()` as the
-/// downTime and returns it (in [`EngineTouchOutcome::down_time_ms`]); the caller stores it and passes
-/// `Some(it)` for the matching `ACTION_UP`, so both events carry the IDENTICAL downTime. `eventTime` is
-/// always the current uptime (`== downTime` for the DOWN, `>= downTime` for the UP).
-///
-/// Soundness mirrors [`dispatch_touch_to_view`]: null-VM guard, `attach_current_thread`, `catch_unwind`
-/// so a Rust panic cannot cross into ART, every JNI call through [`checked`], and the obtained
-/// `MotionEvent` is `recycle()`d on every path. Returns a no-op outcome (`consumed = false`) if the
-/// `RBXSurfaceView` is not registered yet.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
-/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn dispatch_touch_to_engine_surface(
     vm: &Vm,
     action: MotionAction,
@@ -17183,8 +11596,7 @@ pub fn dispatch_touch_to_engine_surface(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` from `boot()`, kept alive by the `&Vm` borrow and
-    // verified non-null — exactly `JavaVM::from_raw`'s contract (same as `dispatch_touch_to_view`).
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -17196,11 +11608,6 @@ pub fn dispatch_touch_to_engine_surface(
     })
 }
 
-/// Build a `MotionEvent` for `action` at `(x, y)` and dispatch it to the engine's `RBXSurfaceView` via
-/// `onTouchEvent`, then `recycle()` it. Resolves the surface from [`view_registry`] each call (it is the
-/// engine's stable content view). Returns a no-op outcome when the surface is not registered or not
-/// dispatchable. On the gesture's `ACTION_DOWN` (`down_time_ms == None`) logs the resolved surface's
-/// width/height (attached+laid-out proof + a coordinate-space check, detect-don't-assume).
 fn touch_engine_surface(
     env: &mut Env,
     action: MotionAction,
@@ -17233,8 +11640,6 @@ fn touch_engine_surface(
         let down_time = down_time_ms.unwrap_or(now);
         used_down_time = down_time;
 
-        // On the DOWN, prove the surface is attached + laid out and confirm the coordinate space (a
-        // full-window content view's local space == window pixels; verify rather than assume).
         if down_time_ms.is_none() {
             let w = checked(env, "View.getWidth", |env| {
                 env.call_method(global.as_obj(), jni_str!("getWidth"), jni_sig!("()I"), &[])?
@@ -17256,7 +11661,6 @@ fn touch_engine_surface(
             );
         }
 
-        // MotionEvent.obtain(downTime, eventTime, action, x, y, metaState) — the public Java factory.
         let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
         let event = checked(env, "MotionEvent.obtain", |env| {
             env.call_static_method(
@@ -17269,20 +11673,12 @@ fn touch_engine_surface(
                     JValue::Int(action.code()),
                     JValue::Float(x),
                     JValue::Float(y),
-                    JValue::Int(0), // metaState: no modifier keys this increment
+                    JValue::Int(0),
                 ],
             )?
             .l()
         })?;
 
-        // RBXSurfaceView.onTouchEventInternal(event, false) — ATL's REAL touch driver (View.java:1133):
-        // it invokes the view's OnTouchListener (which a GLSurfaceView-style engine sets via
-        // setOnTouchListener to forward into native), then onTouchEvent. We must NOT call
-        // dispatchTouchEvent (ATL base is a `return false` no-op, View.java:2062) nor the base
-        // onTouchEvent (also a `return false` stub, View.java:1147) — both silently drop the tap. The
-        // boolean return is informational: the engine's listener may return false yet still have
-        // forwarded the event to native. `handle_gestures = false` (no performClick fallback; the
-        // engine's listener owns the gesture).
         let consumed = checked(env, "RBXSurfaceView.onTouchEventInternal", |env| {
             env.call_method(
                 global.as_obj(),
@@ -17293,8 +11689,6 @@ fn touch_engine_surface(
             .z()
         });
 
-        // Recycle on EVERY path (pooled object; mirrors `touch_view`). A recycle failure is logged but
-        // never masks the dispatch result.
         if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
             env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
                 .v()
@@ -17306,7 +11700,7 @@ fn touch_engine_surface(
     let consumed = match result {
         Ok(Some(Ok(c))) => c,
         Ok(Some(Err(e))) => return Err(e),
-        // Valid handle but no recorded jobject, or stale/poisoned: nothing to touch (no-op).
+
         Ok(None) => false,
         Err(e) => {
             tracing::debug!(error = %e, "engine touch: surface not dispatchable (ignored)");
@@ -17319,18 +11713,6 @@ fn touch_engine_surface(
     })
 }
 
-/// Pass one hardware-keyboard event through the exact bridge Roblox's `ActivityNativeMain.onKeyDown`
-/// and `onKeyUp` use: `NativeGLInterface.nativePassKeyEvent(isDown, scanCode, keyCode, isRepeat)`.
-/// `scan_code` is the Linux evdev scan code exposed by winit on Wayland/X11; it is load-bearing because
-/// the current native client maps that second JNI value to its internal key enum. `key_code` is the
-/// Android `KEYCODE_*` compatibility value. This bypasses `RBXSurfaceView.dispatchKeyEvent`, which the
-/// APK does not override and which therefore always returned `false` without reaching the engine.
-///
-/// Soundness mirrors [`dispatch_touch_to_engine_surface`]: null-VM guard, `attach_current_thread`,
-/// `catch_unwind`, and every JNI call through [`checked`].
-///
-/// # Errors
-/// [`FrameworkError::NullVm`]/[`FrameworkError::Jni`]/[`FrameworkError::Panicked`] as for the touch path.
 pub fn pass_hardware_key_to_engine(
     vm: &Vm,
     action: KeyAction,
@@ -17342,7 +11724,7 @@ pub fn pass_hardware_key_to_engine(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: the live process VM is kept alive by `&Vm` and was checked non-null above.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -17370,26 +11752,8 @@ pub fn pass_hardware_key_to_engine(
     })
 }
 
-/// The concrete class of Roblox's engine `SurfaceView` peer, captured into [`view_registry`] by
-/// [`view_native_constructor`] (via [`view_registry::find_by_class`]). The engine's `AndroidGLView`
-/// subscribes to this view's `SurfaceHolder` (`getHolder().addCallback(...)`), so its `mCallbacks`
-/// list becomes non-empty once it has registered — the gate for dispatching the surface lifecycle.
 const RBX_SURFACE_VIEW_CLASS: &str = "com.roblox.client.RBXSurfaceView";
 
-/// Publish the host window's real display refresh-rate capabilities to Roblox's existing Android
-/// bridge. `Activity.onStart` asks ATL's `Display` before winit is allowed to create a window, so the
-/// framework overlay can initially provide only its conservative 60 Hz fallback. Once winit's
-/// `resumed` callback has a real monitor, [`crate::graphics`] calls this with that monitor's current
-/// rate and same-resolution modes. Roblox consumes the same two methods its Android shell normally
-/// calls, so its native in-game "Maximum Frame Rate" setting—not an Eclipse overlay—gets the real
-/// choices.
-///
-/// Invalid/non-positive rates are ignored and an empty supported set is a no-op. This function is
-/// best-effort at the window boundary: callers log a typed JNI error without taking down rendering.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
-/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn publish_engine_display_refresh_rates(
     vm: &Vm,
     current_hz: Option<f32>,
@@ -17408,8 +11772,7 @@ pub fn publish_engine_display_refresh_rates(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live process VM returned by `boot()`, remains alive for the `&Vm`
-    // borrow, and was checked non-null above—the complete `JavaVM::from_raw` contract.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -17454,26 +11817,12 @@ pub fn publish_engine_display_refresh_rates(
     })
 }
 
-/// The window pixel format Eclipse passes as `SurfaceView.surfaceChanged(format, w, h)`'s `format`.
-/// 2026-06-13: `WINDOW_FORMAT_RGBA_8888 = 1` — the public Android `PixelFormat.RGBA_8888` value, the
-/// RGBA8888 config Eclipse's window/engine render path is built on (the same constant
-/// `native_provider::eclipse_anativewindow_getformat` reports for the real WSI window).
 const WINDOW_FORMAT_RGBA_8888: jint = 1;
 
-/// 2026-06-13: the single source of truth for reading `SurfaceView.mCallbacks.size()` — shared by the
-/// dispatch self-gate ([`surface_lifecycle`]) and the readiness probe ([`engine_surface_callback_ready`])
-/// so the load-bearing field read lives in one place. `surface_view` is the `RBXSurfaceView` peer
-/// (runtime supertype `android.view.SurfaceView`). Returns the current callback count; a thrown Java
-/// exception is described + cleared into a typed [`FrameworkError::Jni`] by [`checked`], never left
-/// pending.
 fn surface_callbacks<'local>(
     env: &mut Env<'local>,
     surface_view: &JObject,
 ) -> Result<JObject<'local>, FrameworkError> {
-    // SAFETY: "Ljava/util/ArrayList;" paired with JavaType::Object is consistent
-    // (FieldSignature::from_raw_parts' invariant); `mCallbacks` is a `final ArrayList` field of
-    // android.view.SurfaceView (SurfaceView.java:13), the receiver's runtime supertype, so the
-    // read is type-correct. JNI reads private/package fields (no Java access check).
     let callbacks_sig = unsafe { FieldSignature::from_raw_parts(ARRAY_LIST_SIG, JavaType::Object) };
     checked(env, "SurfaceView.mCallbacks get_field", |env| {
         env.get_field(surface_view, jni_str!("mCallbacks"), &callbacks_sig)?
@@ -17489,34 +11838,12 @@ fn surface_callbacks_size(env: &mut Env, surface_view: &JObject) -> Result<jint,
     })
 }
 
-/// Render Phase 2.1 — readiness probe: has the engine's `AndroidGLView` registered its
-/// `SurfaceHolder.Callback` on the `RBXSurfaceView` (its `mCallbacks` list non-empty)? Returns
-/// `Ok(true)` iff the peer exists AND `mCallbacks` is non-empty — i.e. dispatching `surfaceCreated`
-/// now would actually reach the engine. It dispatches NOTHING; it shares the exact `mCallbacks` read
-/// ([`surface_callbacks_size`]) with [`surface_lifecycle`].
-///
-/// 2026-06-13: factored out of the dispatch self-gate so `graphics.rs` can DROP its `VulkanRenderer`
-/// (releasing the `wl_surface`) STRICTLY BEFORE dispatching `surfaceCreated` — otherwise two owners
-/// hold one `wl_surface` and the engine's `eglCreateWindowSurface` fails with `EGL_BAD_ALLOC` (3003).
-///
-/// Mirrors [`dispatch_surface_lifecycle`]'s soundness: null-guarded [`JavaVM::from_raw`], attaches the
-/// held VM's main thread, `catch_unwind`-guards the JNI work, and routes every JNI call through
-/// [`checked`].
-///
-/// Returns `Ok(false)` if no `RBXSurfaceView` peer is recorded yet OR its callback list is still empty
-/// (retry next tick); a typed `Err` on a VM/JNI/Java error.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
-/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn engine_surface_callback_ready(vm: &Vm) -> Result<bool, FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
-    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
-    // process VM singleton (idempotent across calls), same as `dispatch_surface_lifecycle`.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| surface_callback_ready(env))) {
@@ -17526,22 +11853,19 @@ pub fn engine_surface_callback_ready(vm: &Vm) -> Result<bool, FrameworkError> {
     })
 }
 
-/// Locate the `RBXSurfaceView` peer and report whether its `mCallbacks` list is non-empty. See
-/// [`engine_surface_callback_ready`] for the contract. Dispatches nothing.
 fn surface_callback_ready(env: &mut Env) -> Result<bool, FrameworkError> {
     let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
         return Ok(false);
     };
-    // Hold the registry lock only across the JNI read on the recorded global ref (the closure makes
-    // JNI calls but never re-enters the registry), honoring `with_jobject`'s contract.
+
     let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
         Ok(surface_callbacks_size(env, global.as_obj())? > 0)
     });
     match result {
         Ok(Some(inner)) => inner,
-        // Valid handle but no recorded jobject yet — not ready, retry (transient at worst).
+
         Ok(None) => Ok(false),
-        // Stale/fabricated handle or poisoned lock: not ready this tick (logged, not fatal).
+
         Err(e) => {
             tracing::debug!(handle, error = %e, "engine_surface_callback_ready: peer not readable (retry)");
             Ok(false)
@@ -17549,34 +11873,6 @@ fn surface_callback_ready(env: &mut Env) -> Result<bool, FrameworkError> {
     }
 }
 
-/// Render Phase 2 — JNI-dispatch the `SurfaceView` surface lifecycle to the engine's
-/// `SurfaceHolder.Callback`s: `surfaceCreated()` then `surfaceChanged(format, width, height)`, so the
-/// engine's `AndroidGLView` pulls Eclipse's published `ANativeWindow` and begins rendering into it.
-///
-/// 2026-06-13: the production driver for the engine's render path. Eclipse's vendored `SurfaceView`
-/// (`vendor/atl/.../android/view/SurfaceView.java`) has `private surfaceCreated()`/`surfaceChanged(int,
-/// int,int)` that fan a `SurfaceHolder` lifecycle out to each subscribed callback, but NOTHING in ATL
-/// calls them — the native must. A JNI `call_method` bypasses Java private-access checks.
-///
-/// SELF-GATED (the prior abort's lesson — never blank the window prematurely): the engine subscribes
-/// its `AndroidGLView` callback via `getHolder().addCallback(...)` only after it is ready, so this
-/// reads the `SurfaceView` `mCallbacks` `ArrayList` (`get_field` of `Ljava/util/ArrayList;`, then
-/// `size()I`) and dispatches ONLY when it is non-empty — returning `Ok(false)` (retry next tick) while
-/// it is still empty. Returns `Ok(true)` once the lifecycle was dispatched.
-///
-/// Mirrors [`dispatch_touch_to_view`]'s soundness: the held VM's `*mut JavaVM` is null-guarded before
-/// [`JavaVM::from_raw`], the main thread is attached (the `&Vm` borrow keeps it alive + pins us), the
-/// JNI work is `catch_unwind`-guarded so a Rust panic can never unwind into ART's C++ (`panic =
-/// "abort"`, §2.8), and every JNI call routes through [`checked`] (a thrown Java exception is
-/// described + cleared into a typed [`FrameworkError::Jni`], never left pending).
-///
-/// Returns `Ok(true)` if the lifecycle was dispatched this call; `Ok(false)` if no `RBXSurfaceView`
-/// peer is recorded yet OR its callback list is still empty (retry next tick); a typed `Err` on a
-/// VM/JNI/Java error.
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] on a JNI/Java error;
-/// [`FrameworkError::Panicked`] if a panic was caught at the boundary.
 pub fn dispatch_surface_lifecycle(
     vm: &Vm,
     width: i32,
@@ -17586,9 +11882,7 @@ pub fn dispatch_surface_lifecycle(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
-    // this call (verified non-null above); `from_raw`'s contract is exactly that. It returns the
-    // process VM singleton (idempotent across calls), same as `dispatch_touch_to_view`.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| surface_lifecycle(env, width, height))) {
@@ -17598,33 +11892,18 @@ pub fn dispatch_surface_lifecycle(
     })
 }
 
-/// Locate the `RBXSurfaceView` peer, gate on its non-empty `mCallbacks`, and (when gated open)
-/// dispatch `surfaceCreated()` then `surfaceChanged(format, width, height)` on the real Java object.
-/// See [`dispatch_surface_lifecycle`] for the contract. Returns `Ok(false)` (retry) when no peer is
-/// recorded yet or the callback list is still empty; `Ok(true)` once dispatched.
 fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, FrameworkError> {
-    // (a) Locate the engine's SurfaceView peer by its concrete class. None → not constructed yet.
     let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
         return Ok(false);
     };
 
-    // Hold the registry lock only across the JNI dispatch on the recorded global ref (the closure
-    // makes JNI calls but never re-enters the registry), honoring `with_jobject`'s contract.
     let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
         let surface_view = global.as_obj();
 
-        // (b) SELF-GATE: read the SurfaceView `mCallbacks` ArrayList and check it is non-empty. The
-        // engine registers its AndroidGLView SurfaceHolder.Callback via getHolder().addCallback(...);
-        // until then the list is empty and dispatching would fan out to nobody — retry next tick.
         if surface_callbacks_size(env, surface_view)? <= 0 {
-            // Engine has not subscribed its SurfaceHolder.Callback yet — do NOT dispatch into an
-            // empty callback list; retry next tick.
             return Ok(false);
         }
 
-        // (c) DISPATCH the lifecycle on the real Java object: surfaceCreated() BEFORE
-        // surfaceChanged(format, w, h), per the AOSP SurfaceHolder.Callback contract. Both are
-        // `private` on SurfaceView; the JNI call bypasses Java access checks.
         checked(env, "SurfaceView.surfaceCreated", |env| {
             env.call_method(
                 surface_view,
@@ -17652,10 +11931,9 @@ fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, Fra
 
     match result {
         Ok(Some(inner)) => inner,
-        // Valid handle but no recorded jobject: the peer is non-dispatchable — retry (the live boot
-        // captures the global ref in view_native_constructor, so this is transient at worst).
+
         Ok(None) => Ok(false),
-        // Stale/fabricated handle or poisoned lock: nothing to dispatch this tick (logged, not fatal).
+
         Err(e) => {
             tracing::debug!(handle, error = %e, "dispatch_surface_lifecycle: peer not dispatchable (retry)");
             Ok(false)
@@ -17663,17 +11941,6 @@ fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, Fra
     }
 }
 
-/// Close the engine surface lifecycle before the host window can disappear. ATL's vendored
-/// `SurfaceView` exposes private fan-out methods for `surfaceCreated` and `surfaceChanged`, but has
-/// no matching `surfaceDestroyed` method. Waiting for winit to drop the Wayland/X11 window therefore
-/// bypassed every registered `SurfaceHolder.Callback`; libroblox kept rendering through a dead host
-/// surface and faulted immediately after `run_app` returned (measured 2026-07-17).
-///
-/// Snapshot the callback list before invoking app code, matching AOSP's mutation-safe fan-out: a
-/// callback may remove itself while handling destruction without shifting the remaining iteration.
-/// The exact `mSurfaceHolder` object used by the creation path is passed back to every callback.
-/// Each callback is attempted even if an earlier one throws, because the app-shell callback that
-/// synchronously pauses libroblox must never be skipped by an unrelated screenshot callback.
 fn destroy_engine_surface(env: &mut Env) -> Result<bool, FrameworkError> {
     let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
         return Ok(false);
@@ -17706,9 +11973,6 @@ fn destroy_engine_surface(env: &mut Env) -> Result<bool, FrameworkError> {
         return Ok(false);
     }
 
-    // SAFETY: `mSurfaceHolder` is declared `SurfaceHolder`, so its descriptor paired with
-    // JavaType::Object satisfies FieldSignature::from_raw_parts. `get_field` resolves the real
-    // inherited private field and runtime-checks the receiver.
     let holder_sig =
         unsafe { FieldSignature::from_raw_parts(SURFACE_HOLDER_SIG, JavaType::Object) };
     let holder = checked(env, "SurfaceView.mSurfaceHolder get_field", |env| {
@@ -17748,64 +12012,26 @@ fn destroy_engine_surface(env: &mut Env) -> Result<bool, FrameworkError> {
     }
 }
 
-/// A view that should have its `onDraw(Canvas)` driven: its [`view_registry`] handle and the pixel
-/// size of its laid-out rect (the [`canvas_registry`] Pixmap is allocated at this size).
-///
-/// 2026-06-05: computed by the renderer's GPU-free layout pass (`graphics::layout_views`) and handed
-/// to [`drive_view_draw`]; kept a plain `Copy` value so the geometry stays GPU-free and the framework
-/// crate need not depend on the renderer's layout types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrawTarget {
-    /// The view's [`view_registry`] handle (the same `jlong` the native peer holds).
     pub handle: view_registry::ViewHandle,
-    /// The laid-out width in pixels (`>= 1`; the renderer clamps a degenerate rect out).
+
     pub width: u32,
-    /// The laid-out height in pixels (`>= 1`).
+
     pub height: u32,
 }
 
-/// One drawn custom view: its [`view_registry`] handle paired with the [`canvas_registry`] handle of
-/// the Pixmap its `onDraw(Canvas)` rasterized into. The renderer uploads the Pixmap over the view's
-/// rect, then [`canvas_registry::free`]s the handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrawnCanvas {
-    /// The custom view whose `onDraw` ran.
     pub view: view_registry::ViewHandle,
-    /// The Pixmap-backed Canvas its `onDraw` rasterized into.
+
     pub canvas: canvas_registry::CanvasHandle,
 }
 
-/// Drive `View.draw(Canvas)` for each custom view in `targets`, rasterizing each into an Eclipse-owned
-/// [`canvas_registry`] Pixmap, and return the `(view, canvas)` pairs that drew successfully.
-///
-/// 2026-06-05: the DRAW CASCADE. Android's `ViewRootImpl.performTraversals` is what normally calls
-/// `View.draw(Canvas)`; Eclipse's minimal lifecycle never runs it, so a custom View's `onDraw` (e.g.
-/// multitouch.test's touch circles) never fires. This drives it directly: for each target it allocates
-/// a Pixmap-backed Canvas sized to the view's laid-out rect, constructs a Java
-/// `android.graphics.Canvas(long nativeCanvas)` over that handle, and invokes `View.draw(Canvas)` on
-/// the view's recorded global object (which dispatches into the View's `onDraw` + the bound
-/// [Canvas draw natives](register_canvas_natives), filling the Pixmap with REAL tiny-skia raster). The
-/// renderer then uploads each returned Pixmap as an RGBA texture over the owning view's rect (the
-/// composite) and frees it.
-///
-/// MUST be called on the VM/winit main thread (the `&Vm` borrow keeps the VM alive + pins us there).
-/// The JNI work is wrapped in `catch_unwind` so a Rust panic can never unwind into ART's C++
-/// (`panic = "abort"`, §2.8); every JNI call routes through [`checked`] (a thrown Java exception is
-/// described + cleared into a typed error, never left pending). A target whose Canvas can't be built,
-/// whose view has no recorded Java object, or whose `draw` throws is skipped (its Pixmap is freed) —
-/// the others still draw. Returns the successfully-drawn canvases; an empty `Vec` on no VM-reachable
-/// drawable target (never a panic across the boundary).
-///
-/// # Errors
-/// [`FrameworkError::NullVm`] if the VM pointer is null; [`FrameworkError::Jni`] only on an attach
-/// failure (per-target Java errors are skipped, not surfaced).
 pub fn drive_view_draw(
     vm: &Vm,
     targets: &[DrawTarget],
 ) -> Result<Vec<DrawnCanvas>, FrameworkError> {
-    // Skip the cascade entirely on a Canvas build that can't back it (no nDraw* natives / no
-    // Canvas(long) ctor — set by register_canvas_natives). Avoids re-attempting + re-logging the
-    // missing constructor every frame; the view quads + text still render.
     if targets.is_empty() || !canvas_draw_supported() {
         return Ok(Vec::new());
     }
@@ -17813,8 +12039,7 @@ pub fn drive_view_draw(
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live `*mut JavaVM` `boot()` produced, kept alive by the `&Vm` borrow for
-    // this call (verified non-null above); `from_raw`'s contract is exactly that.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| draw_targets(env, targets))) {
@@ -17824,16 +12049,10 @@ pub fn drive_view_draw(
     })
 }
 
-/// Run the draw cascade body: build a `Canvas` + invoke `View.draw` for each target, collecting the
-/// drawn `(view, canvas)` pairs. Split out so the panic guard in [`drive_view_draw`] wraps one call.
-/// A per-target failure frees that target's Canvas (if allocated) and continues — never aborts the
-/// whole cascade. Always returns `Ok` (per-target errors are logged, not propagated).
 fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas>, FrameworkError> {
-    // Resolve the Canvas class + its `(long)` constructor once for the whole cascade.
     let canvas_class = env.find_class(CANVAS_CLASS)?;
     let mut drawn = Vec::with_capacity(targets.len());
     for t in targets {
-        // Allocate the Pixmap-backed Canvas at the view's laid-out size (rejects 0/oversize).
         let canvas_handle = match canvas_registry::allocate(t.width, t.height) {
             Ok(h) => h,
             Err(e) => {
@@ -17842,9 +12061,7 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
                 continue;
             }
         };
-        // Construct `new android.graphics.Canvas(canvas_handle)` — the standard AOSP public ctor whose
-        // `long` is the native canvas handle (here the Eclipse slab index). The draw natives this
-        // Canvas's ops resolve to are bound by `register_canvas_natives`.
+
         let canvas_obj = match checked(env, "Canvas.<init>(long)", |env| {
             env.new_object(
                 &canvas_class,
@@ -17860,10 +12077,7 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
                 continue;
             }
         };
-        // Invoke `View.draw(Canvas)` on the view's recorded global object — this dispatches the View's
-        // own draw pass (background + onDraw + children), so the custom view's `onDraw` runs and its
-        // Canvas ops raster into the Pixmap. `with_jobject` holds the registry lock only to read the
-        // global ref; the single JNI call inside does not re-enter the registry (lock contract honored).
+
         let result = view_registry::with_jobject(t.handle, |global| {
             checked(env, "View.draw(Canvas)", |env| {
                 env.call_method(
@@ -17889,7 +12103,7 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
                     canvas: canvas_handle,
                 });
             }
-            // A Java exception, a non-dispatchable view, or a stale handle: free the Canvas + skip.
+
             other => {
                 if let Ok(Some(Err(e))) = &other {
                     tracing::debug!(view = t.handle, error = %e, "draw cascade: View.draw threw (skipped)");
@@ -17903,204 +12117,85 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
     Ok(drawn)
 }
 
-/// Prove the bridge, then drive recipe steps 1–5 to the launcher Activity's `onCreate`. Split out so
-/// the panic guard in [`drive_application_lifecycle`] wraps a single named call.
-///
-/// All JNI calls go through [`checked`], so a thrown Java exception is described + cleared and
-/// surfaced as the typed [`FrameworkError::Jni`] rather than left pending or panicking. The recipe
-/// class names / descriptors are the [`RecipeStep`] constants ([`STEP1_CREATE_APPLICATION`] …);
-/// the matching compile-time `jni_str!`/`jni_sig!` literals at the call sites are pinned equal to
-/// those constants by the unit test `call_site_literals_match_recipe_constants` (single source of
-/// truth, no per-call allocation or fallible runtime signature parse).
 fn drive_lifecycle(
     env: &mut Env,
     apk_path: &str,
     launcher_activity: &str,
 ) -> Result<LifecycleProgress, FrameworkError> {
-    // Bind native_get_apk_path + native_updateConfig BEFORE Context's static initializer can run
-    // (find_class loads/links the class but does not initialize it — JNI spec), so the two natives
-    // are already resolvable, non-GTK, when <clinit> later calls them. RegisterNatives wins over
-    // name-based lazy binding (JNI 1.1 spec), so ATL's GTK-backed symbols are not used.
     register_context_natives(env, apk_path)?;
-    // Bind android.util.Log.println_native on its own class. ART resolves natives lazily during the
-    // lifecycle, so all discovered natives are registered (per class) BEFORE step 1; the framework
-    // logs heavily during init, so this must be bound before createApplication touches Log.
-    // 2026-06-12: ALSO registered earlier by register_engine_preload_natives (the engine's
-    // JNI_OnLoad logs before the lifecycle); kept here too — idempotent — so neither path regresses.
+
     register_log_natives(env)?;
-    // Bind android.os.Process.getElapsedCpuTime — Roblox telemetry calls it from workers AND from
-    // the engine's JNI_OnLoad-time LoggingProtocol init (also in register_engine_preload_natives).
+
     register_process_natives(env)?;
-    // Bind android.content.res.AssetManager.init on its own class — the framework builds an
-    // AssetManager early in init (Resources/asset access), so this must be bound before step 1.
+
     register_asset_manager_natives(env)?;
-    // Bind the asset-STREAM read cycle (readAsset/seekAsset/getAssetLength/.../destroyAsset) on the
-    // same class, best-effort (a sig drift logs + is discovered, never breaks the natives above). A
-    // real app's Application.onCreate opens assets (Roblox's startup tasks do), so bind before step 1.
+
     register_asset_stream_natives(env)?;
-    // Bind android.content.res.XmlBlock's parser natives on its own class — once openXmlAssetNative
-    // returns a real block handle, the framework walks it via XmlBlock (reading AndroidManifest.xml
-    // during Context.<clinit>), so these must be bound before step 1.
+
     register_xml_block_natives(env)?;
-    // Bind android.os.Environment.native_get_app_data_dir on its own class — the framework queries
-    // external storage early in init (`getExternalStorageDirectory`), so this must be bound before
-    // step 1.
+
     register_environment_natives(env)?;
-    // Bind android.os.SystemClock.elapsedRealtime on its own class — a real app's Application.<init>
-    // may query the monotonic clock during step 1 (observed for Roblox's RobloxApplication.<init>),
-    // so this must be bound before step 1. GTK-free; std::time::Instant-backed.
+
     register_system_clock_natives(env)?;
-    // Bind android.os.MessageQueue.nativeInit on its own class — step 0 (Looper.prepareMainLooper)
-    // builds the main thread's MessageQueue, which calls nativeInit() in its constructor, so this must
-    // be bound before step 0. GTK-free; returns a non-zero non-pointer sentinel (no Looper.loop runs).
+
     register_message_queue_natives(env)?;
-    // Bind android.hardware.SensorManager's accelerometer-listener registration native — an app may
-    // register a sensor listener during Activity.onCreate (accelerometerdemo does, in initViews). Honest
-    // no-sensor backing: registers no source, delivers no events (this Linux desktop has no accelerometer).
+
     register_sensor_manager_natives(env)?;
-    // Bind android.net.ConnectivityManager's three GTK-backed natives (registerNetworkCallback /
-    // isActiveNetworkMetered / nativeGetNetworkAvailable) — Roblox's jobqueue connectivity monitor calls
-    // registerNetworkCallback in ActivitySplash.onCreate (step 5). Non-GTK no-op/available backing.
+
     register_connectivity_natives(env)?;
-    // 2026-07-18: bind Eclipse's host-backed ActivityManager memory surface before app startup.
-    // ATL's getMemoryInfo only reassigned its local out-parameter, making Roblox report `0MB` in
-    // its device profile/User-Agent; the overlay now fills that exact caller object from the Linux
-    // kernel and reports Eclipse's real ART heap cap.
+
     register_activity_manager_memory_natives(env)?;
-    // Bind android.os.Vibrator's FULL declared native list — getSystemService("vibrator")
-    // constructs the class from a main-Looper message (Roblox InitHelper's AsyncTask
-    // onPostExecute), and its CONSTRUCTOR calls native_constructor(); unbound, the
-    // UnsatisfiedLinkError escaped Looper.loop and permanently killed the main Looper pump
-    // (2026-06-12, core-1223806 boot). No-vibration-device host backing (fd = -1).
+
     register_vibrator_natives(env)?;
-    // Bind android.database.sqlite.SQLiteConnection's natives (libsqlite3-backed) — Roblox's
-    // ActivitySplash.onCreate (step 5) opens a SQLite DB (SQLiteOpenHelper.getWritableDatabase).
-    // Phase A: open + statement lifecycle + non-cursor executes (nativeExecuteForCursorWindow is Phase B).
+
     sqlite::register_natives(env)?;
-    // Bind android.app.Activity's transition/lifecycle natives on its own class — the splash→main
-    // handoff (`Context.startActivity` → `Context$6` → STATIC nativeStartActivity; `finish()` →
-    // `Activity$2` → INSTANCE nativeFinish) dispatches from main-Looper messages, and an unbound
-    // native there consumes the transition irrecoverably (2026-06-12, EXIT=10 boot: the splash's
-    // normal NEW_STARTUP transition to ActivityNativeMain was lost twice over). Before step 4.
+
     register_activity_natives(env)?;
-    // Bind android.view.View's peer natives on its own class — step 4 (createMainActivity) constructs
-    // the launcher Activity's View hierarchy, so these must be bound before step 4. Bound non-GTK
-    // against view_registry; each new View native the run surfaces is added to register_view_natives.
+
     register_view_natives(env)?;
-    // Bind android.view.ViewTreeObserver.native_set_have_global_layout_listeners on its own class —
-    // ActivityNativeMain.onCreate (step 4+) calls View.getViewTreeObserver() (which uses
-    // native_get_window above) and then registers a global-layout listener, which crosses the
-    // listener count 0→1 and calls this native (ViewTreeObserver.java line 344). Unbound, it threw
-    // the next UnsatisfiedLinkError on the same view-tree-setup path (2026-06-13).
+
     register_view_tree_observer_natives(env)?;
-    // Bind android.view.inputmethod.InputMethodManager.nativeInit — the class holds a static `im_context`
-    // field initialized by nativeInit() during class static init (InputMethodManager.java line 10). UNBOUND,
-    // this threw during the post-logout LuaApp re-init (2026-06-15). Eclipse returns 0 (no soft keyboard).
+
     register_input_method_manager_natives(env)?;
-    // Bind android.app.Dialog.nativeInit — Dialog constructor calls nativeInit() to allocate its native
-    // peer (Dialog.java line 38). UNBOUND, this threw during the post-logout LuaApp re-init (2026-06-15).
-    // Eclipse returns 1 (no dialog system placeholder).
+
     register_dialog_natives(env)?;
-    // Bind android.view.Window's window-setup natives on its own class — step 4 wires the launcher's
-    // Window onto the native window handle (set_jobject/set_title/set_layout/set_widget_as_root), so
-    // these must be bound before step 4. Bound non-GTK against window_registry/view_registry.
+
     register_window_natives(env)?;
-    // Bind android.widget.TextView's peer natives on its own class — the launcher layout inflates a
-    // <TextView> during step 5, and ART resolves natives per declaring class (TextView re-declares
-    // native_constructor), so this must be bound before step 4. Reuses the View constructor backing.
+
     register_text_view_natives(env)?;
-    // Bind android.widget.ImageView's native_constructor on its own class — a launcher layout may
-    // inflate an <ImageView> during step 5 (e.g. AdaptiveIconDemo), and ART resolves natives per
-    // declaring class (ImageView re-declares native_constructor), so this must be bound before step 4.
-    // Reuses the class-agnostic View constructor backing (records android.widget.ImageView in the tree).
+
     register_image_view_natives(env)?;
-    // Bind android.widget.ImageButton's peer natives on its own class — AppCompat's Toolbar builds an
-    // AppCompatImageButton (extends ImageButton) during step 5's setContentView, and ART resolves
-    // natives per declaring class (ImageButton re-declares native_constructor AND ImageView's
-    // native_setDrawable — the 2026-07-03 challenge14 ULE), so this must be bound before step 4.
-    // Reuses the class-agnostic View constructor + ImageView setDrawable backings (records
-    // android.widget.ImageButton in the tree).
+
     register_image_button_natives(env)?;
-    // Bind android.view.SurfaceView's native_constructor on its own class — Roblox's
-    // ActivityNativeMain.onCreate inflates com.roblox.client.RBXSurfaceView (extends SurfaceView)
-    // during step 4's LayoutInflater pass, and ART resolves natives per declaring class (SurfaceView
-    // @Override-re-declares native_constructor), so this must be bound before step 4 or LayoutInflater
-    // hits UnsatisfiedLinkError (live boot 2026-06-13). Reuses the class-agnostic View constructor
-    // backing (records com.roblox.client.RBXSurfaceView in the tree).
+
     register_surface_view_natives(env)?;
-    // Bind native_constructor on the concrete inflatable android.widget.* View subclasses (Button,
-    // EditText, ProgressBar, CheckBox, RadioButton, SeekBar, Spinner, ScrollView) on their OWN classes
-    // — ART resolves natives per declaring class and each re-declares View's constructor, so they must
-    // be bound before step 4's LayoutInflater pass or it throws UnsatisfiedLinkError (Roblox's
-    // ActivityNativeMain content layout hit ProgressBar this way, live boot 2026-06-13). Each reuses
-    // the class-agnostic View constructor backing (records the concrete subclass in the tree).
+
     register_view_subclass_constructor_natives(env)?;
-    // Bind android.webkit.WebView's natives on its own class — the rbx.web challenge fragment
-    // constructs a WebView child (RBHybridWebView, challenge9 live boot 2026-07-02, log lines
-    // 1232–1256) and ART resolves natives per declaring class (WebView re-declares View's
-    // native_constructor and adds two load natives), so this must be bound before step 4 per the
-    // uniform house ordering. Constructor = the shared view-registry backing; the load natives
-    // are spawn-and-forward to the out-of-process eclipse-webview helper (2026-07-03, M3), with
-    // the honest one-shot-WARN no-op as the helper-unavailable degradation.
+
     register_web_view_natives(env)?;
-    // 2026-07-16 (plan M6): the WebSettings User-Agent surface — the app calls
-    // getSettings().setUserAgentString(...) while configuring its challenge WebView (MEASURED), and
-    // ATL's stub discarded it; these natives make Eclipse honor it (§6 2026-07-16 💥). Bound here
-    // for the same per-declaring-class reason as the WebView natives above, and before step 4.
+
     register_web_settings_natives(env)?;
-    // 2026-07-09 (plan M4), durable semantics completed 2026-07-17: the CookieManager native
-    // surface (get/set/removeAll/removeSession/flush → the private persistent helper cookie
-    // store; the CookieProtocol/.ROBLOSECURITY handoff).
+
     register_cookie_manager_natives(env)?;
-    // Bind the inflatable android.widget.* property-setter natives on their OWN declaring classes —
-    // once each widget's native_constructor (above) lets LayoutInflater build the content view, the
-    // widgets' own setters surface one at a time (the trigger was ProgressBar.native_setIndeterminate,
-    // live boot 2026-06-13). ART resolves natives per declaring class, so each setter is bound on its
-    // class before step 4's LayoutInflater pass. Text setters record (renderer-consumed); ScrollView's
-    // add/removeView record tree edges; progress/indeterminate/max/adapter/compound-drawable are
-    // validated-handle no-ops (no chrome drawn, no bound getter reads them back).
+
     register_widget_property_setter_natives(env)?;
-    // Bind the drawable paintable-lifecycle natives (Drawable + DrawableContainer +
-    // NinePatchDrawable, each on its own declaring class) — a launcher's onCreate loads drawables
-    // during step 5 (the splash inflation's BitmapDrawable hit the unbound native_ref,
-    // /tmp/eclipse-challenge5.log 2026-07-02), so this must be bound before step 4. GTK-free:
-    // sentinels/registry handles + validated no-ops (the engine renders; the tree is recorded).
+
     register_drawable_natives(env)?;
-    // 2026-07-01: the recorded-bitmap backing on Resources.loadDrawable's `.png` path (reachable
-    // now that styled-attribute TYPE_STRING values resolve — see the BitmapFactory section note).
+
     register_bitmap_natives(env)?;
-    // Bind android.view.ViewGroup's tree-wiring natives on its own class — setContentView's
-    // LayoutInflater wires children via ViewGroup.addView during step 5, so this must be bound before
-    // step 4. Bound non-GTK against view_registry (records the tree edges).
+
     register_view_group_natives(env)?;
-    // Bind android.graphics.Paint's natives on its own class — the View hierarchy's TextPaint/Paint
-    // construct during step 5's setContentView, so this must be bound before step 4. Bound non-GTK
-    // against paint_registry (config only; no drawing).
+
     register_paint_natives(env)?;
-    // Bind android.graphics.Matrix's natives on its own class — AppCompat's VectorDrawableCompat
-    // constructs a Matrix during step 5's setContentView (drawable manager), so this must be bound
-    // before step 4. Bound non-GTK against matrix_registry with exact 3x3 affine math (no drawing).
+
     register_matrix_natives(env)?;
-    // Bind android.graphics.Path's geometry natives on its own class — a launcher's onCreate may
-    // build a vector-drawable path during step 5 (e.g. AdaptiveIconDemo's getDrawable →
-    // AdaptiveIconDrawable → PathParser → Path.moveTo), so this must be bound before step 4. Bound
-    // non-GTK against path_registry, recording the REAL parsed contour geometry (no GTK, no Skia-C).
+
     register_path_natives(env)?;
-    // Bind android.graphics.Canvas's draw natives on its own class — a CUSTOM View's onDraw(Canvas)
-    // issues these during the draw cascade ([`drive_view_draw`], after RESUMED), so they must be bound
-    // before the cascade runs. Bound non-GTK against canvas_registry (real tiny-skia raster).
+
     register_canvas_natives(env)?;
-    // Intercept java.lang.Runtime.nativeLoad BEFORE step 1: Context.<clinit>'s APK signature
-    // verification does System.loadLibrary("wolfssljni") (delegated to ART's real loader, unchanged),
-    // and Application.onCreate's androidx.startup does System.loadLibrary("zstd-jni") — which Eclipse
-    // PRE-LOADED through its Rust loader, so the interception reports it already-loaded and skips the
-    // apkenv shim linker (which SIGSEGVs on it). Best-effort: a libcore nativeLoad-signature mismatch
-    // logs + leaves ART's original in place (docs/libroblox-init-run.md §10/§11).
+
     register_runtime_native_load_natives(env)?;
 
-    // Resolve the recipe's bootstrap classes — proves the from_raw + attach + find_class bridge to
-    // the loaded android.* framework before any call. `find_class` takes a `&JNIStr`; the `jni_str!`
-    // constants are MUTF-8 encoded at compile time.
     env.find_class(CONTEXT_CLASS)?;
     env.find_class(APPLICATION_CLASS)?;
     tracing::info!(
@@ -18109,29 +12204,8 @@ fn drive_lifecycle(
         "framework bridge proven: Context static-init natives registered + bootstrap classes resolved via JNI"
     );
 
-    // Step 0: `static Looper.prepareMainLooper() -> void` on the attached main thread, matching
-    // ATL's recipe (its boot sequence's first step is `prepare_main_looper`). Android's
-    // `Handler.<init>` requires `Looper.myLooper() != null`; a real launcher Activity constructs a
-    // `Handler` in a field initializer (every `AppCompatActivity`/`FragmentActivity` does), so the
-    // main `Looper` must exist before step 4 builds the Activity — otherwise the Activity ctor throws
-    // `RuntimeException: Can't create handler inside thread that has not called Looper.prepare()`
-    // (2026-06-05, surfaced by com.ashwin.example.accelerometerdemo; the pure-Java demo_app Activity
-    // never touched a Handler, so this gap was previously latent).
-    // 2026-07-16: NOT idempotent — see prepare_main_looper_inner (ATL Looper.java:76-78/92-94 both
-    // throw on a second call).
     prepare_main_looper_inner(env)?;
 
-    // Step 1: `static Context.createApplication(jlong native_window) -> Application`.
-    // 2026-06-05: the handle is now a REAL Eclipse-owned registry handle (was the placeholder `0`):
-    // `window_registry::allocate()` reserves a generational-slab slot and returns its packed `jlong`
-    // (`docs/art-and-runtime.md` "Non-GTK Window/Surface backing — design"). This is the
-    // design-confirmed contract — a genuine Eclipse-owned handle, not a raw pointer — and is still
-    // safe for steps 1–3, which only STORE the handle and never dereference it (deref begins at the
-    // deferred step 4; "Tier A"). A stale/fabricated handle would be a bounds+generation-checked
-    // `Err`, never UB. The slot is intentionally NOT freed during the short run: it stays valid for
-    // step 4 (a later, dev-host-gated increment) and the process exits with the window closed.
-    // `<clinit>` runs here on first active use of Context, calling the two natives bound above.
-    // `.l()` unwraps the returned Application JObject; a wrong return type is a typed error.
     let window_handle = window_registry::allocate()?;
     let context = env.find_class(CONTEXT_CLASS)?;
     let app = checked(env, "step 1 Context.createApplication", |env| {
@@ -18144,8 +12218,6 @@ fn drive_lifecycle(
         .l()
     })?;
 
-    // Step 2: `static ContentProvider.createContentProviders() -> void` — instantiate the
-    // manifest-declared providers. `.v()` asserts the void return.
     let content_provider = env.find_class(CONTENT_PROVIDER_CLASS)?;
     checked(
         env,
@@ -18161,21 +12233,12 @@ fn drive_lifecycle(
         },
     )?;
 
-    // Step 3: instance `Application.onCreate() -> void` on the object from step 1 — the app's Java
-    // shell self-init.
     checked(env, "step 3 Application.onCreate", |env| {
         env.call_method(&app, jni_str!("onCreate"), jni_sig!("()V"), &[])?
             .v()
     })?;
     tracing::info!("Application.onCreate reached: recipe steps 1–3 driven");
 
-    // Step 4: `static Activity.createMainActivity(String className, jlong native_window, String uri)
-    // -> Activity`. `className` is the launcher Activity's dotted Java class name; `native_window` is
-    // the SAME Eclipse-owned window-registry handle step 1 received (one window per launch), which
-    // step 4's Window/View natives now dereference through window_registry/view_registry (bounds+
-    // generation-checked — a bad handle is a typed Err, never UB); `uri` is null (a plain launch, no
-    // deep-link). This is the first call that triggers the Window/setContentView/View native cascade.
-    // `.l()` unwraps the returned Activity JObject; a wrong return type is a typed error.
     let activity_class = env.find_class(ACTIVITY_CLASS)?;
     let class_name_jstr = env.new_string(launcher_activity)?;
     let activity = checked(env, "step 4 Activity.createMainActivity", |env| {
@@ -18186,43 +12249,24 @@ fn drive_lifecycle(
             &[
                 JValue::Object(&class_name_jstr),
                 JValue::Long(window_handle),
-                // null uri (a fresh launch has no launch URI). A null JObject is the JNI null arg.
                 JValue::Object(&JObject::null()),
             ],
         )?
         .l()
     })?;
 
-    // 2026-06-12: track the step-4 launcher activity (oldest live = the task root) so
-    // nativeFinish's finished-once gate, nativeResumeActivity's live-instance lookup, and
-    // isTaskRoot answer correctly for it (the splash is the first activity to call finish()).
     track_activity(env, &activity, false);
 
-    // Step 5: instance `Activity.onCreate(Bundle) -> void` on the object from step 4, with a null
-    // Bundle (a fresh launch has no saved instance state). Reaching this — which runs the Activity's
-    // setContentView → View-hierarchy inflation — is the increment's milestone. 2026-06-12: steps
-    // 5–7 are driven through the shared helpers `Activity.nativeStartActivity` also uses.
     call_activity_on_create(env, &activity, "step 5 Activity.onCreate")?;
     tracing::info!(
         activity = launcher_activity,
         "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
     );
 
-    // Step 5b: instance `Activity.onPostCreate(null Bundle)` — driven BETWEEN onCreate and onStart
-    // (AOSP's performCreate → onPostCreate ordering ATL omits). The overlay's base
-    // `Activity.onPostCreate` dispatches `Fragment.onActivityCreated` (androidx ReportFragment →
-    // ON_CREATE) here, so the activity's androidx LifecycleRegistry reaches CREATED before onStart
-    // moves it to STARTED — fixing the "register while STARTED" IllegalStateException (2026-06-13).
     call_activity_on_post_create(env, &activity, "step 5b Activity.onPostCreate")?;
 
-    // Step 6: instance `Activity.onStart() -> void` on the step-4 object — the first half of ATL's
-    // `activity_start` (`main.c`): the launcher Activity moves to the STARTED state, running the
-    // app's own `onStart` override.
     call_activity_on_start(env, &activity, "step 6 Activity.onStart")?;
 
-    // Step 7: instance `Activity.onResume() -> void` on the step-4 object — the second half of
-    // `activity_start`: the Activity reaches the RESUMED (running/interactive) state, running the
-    // app's own `onResume` override.
     call_activity_on_resume(env, &activity, "step 7 Activity.onResume")?;
     tracing::info!(
         activity = launcher_activity,
@@ -18231,21 +12275,6 @@ fn drive_lifecycle(
     Ok(LifecycleProgress::ActivityResumed)
 }
 
-/// Run a single JNI step, turning a thrown Java exception into a typed [`FrameworkError::Jni`].
-///
-/// 2026-06-05: the closure's `&mut Env<'local>` and the returned `T` share the **named** outer
-/// `'local`, so a local ref the step produces (e.g. step 1's `Application` `JObject<'local>`) is
-/// tied to the attachment scope and stays usable in later steps — not to a short reborrow inside
-/// this helper. An elided `&mut Env` here would pin `T` to that reborrow and reject any
-/// lifetime-bearing return (`error: lifetime may not live long enough`).
-///
-/// 2026-06-05: the `jni` crate's `call_*` return `Err(Error::JavaException)` on a thrown exception
-/// but **leave it pending** (verified in the crate source, env.rs "this will _not_ clear the
-/// exception"). A still-pending exception poisons the next JNI call, so on any error we
-/// `exception_describe` it (prints the Java stack trace to stderr — names the next missing
-/// native/class for the dev-host discovery loop) and `exception_clear` it before returning. The
-/// `exception_check` guard avoids describing when the error was not a Java throw (e.g. a Rust-side
-/// `WrongJValueType`). No unwrap/expect — the typed error propagates via `?`.
 fn checked<'local, T>(
     env: &mut Env<'local>,
     what: &str,
@@ -18264,15 +12293,6 @@ fn checked<'local, T>(
     }
 }
 
-// === The shared Activity up/down lifecycle calls (2026-06-12) ====================================
-//
-// Factored out of `drive_lifecycle`'s inline steps 5–7 so the launcher path and
-// `Activity.nativeStartActivity` (the splash→main handoff) share ONE implementation per call —
-// the EXIT=10 boot's fix directive. Each routes through [`checked`], so a thrown Java exception
-// is described+cleared (named for the discovery loop), never left pending.
-
-/// Instance `Activity.onCreate(Bundle)` with a null `Bundle` (a fresh launch has no saved
-/// instance state) — recipe step 5's call shape ([`STEP5_ACTIVITY_ON_CREATE`]).
 fn call_activity_on_create<'local>(
     env: &mut Env<'local>,
     activity: &JObject,
@@ -18289,15 +12309,6 @@ fn call_activity_on_create<'local>(
     })
 }
 
-/// Instance `Activity.onPostCreate(Bundle)` with a null `Bundle` — recipe step 5b's call shape
-/// ([`STEP_ACTIVITY_ON_POST_CREATE`]), driven BETWEEN `onCreate` and `onStart`.
-///
-/// 2026-06-13: ATL/Eclipse has no AOSP `performCreate` to invoke `onPostCreate` after `onCreate`
-/// returns, so the lifecycle driver must call it explicitly. The overlay's patched base
-/// `Activity.onPostCreate` dispatches `Fragment.onActivityCreated` (androidx `ReportFragment` →
-/// `ON_CREATE`) at this point — after the full `onCreate` super-chain injected the ReportFragment,
-/// and before `onStart` dispatches ON_START — so the activity's androidx `LifecycleRegistry`
-/// reaches CREATED before STARTED.
 fn call_activity_on_post_create<'local>(
     env: &mut Env<'local>,
     activity: &JObject,
@@ -18314,7 +12325,6 @@ fn call_activity_on_post_create<'local>(
     })
 }
 
-/// Instance `Activity.onStart()` — recipe step 6's call shape ([`STEP6_ACTIVITY_ON_START`]).
 fn call_activity_on_start<'local>(
     env: &mut Env<'local>,
     activity: &JObject,
@@ -18326,7 +12336,6 @@ fn call_activity_on_start<'local>(
     })
 }
 
-/// Instance `Activity.onResume()` — recipe step 7's call shape ([`STEP7_ACTIVITY_ON_RESUME`]).
 fn call_activity_on_resume<'local>(
     env: &mut Env<'local>,
     activity: &JObject,
@@ -18338,10 +12347,6 @@ fn call_activity_on_resume<'local>(
     })
 }
 
-/// The Android destruction contract for a finishing activity: instance `onPause()` → `onStop()`
-/// → `onDestroy()` (no-arg `()V` instance methods, like steps 6–7). 2026-06-12: the native owns
-/// this — no api-impl Java drives a finishing activity's down-lifecycle (dex xref-swept). A
-/// thrown step stops the cascade (already described+cleared by [`checked`]).
 fn drive_activity_down_lifecycle<'local>(
     env: &mut Env<'local>,
     activity: &JObject,
@@ -18385,9 +12390,6 @@ fn call_activity_on_destroy<'local>(
     })
 }
 
-/// Host-close lifecycle ordering. Production iterates this exact table; the regression test pins
-/// the root-cause boundary (`surfaceDestroyed` after pause, before stop/destroy) without needing a
-/// display server, ART, or libroblox in the test process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostShutdownStep {
     PauseActivities,
@@ -18403,31 +12405,12 @@ const HOST_SHUTDOWN_SEQUENCE: [HostShutdownStep; 4] = [
     HostShutdownStep::DestroyActivities,
 ];
 
-/// Drive every live Eclipse-owned Activity down while the host window and its native surface are
-/// still valid. This is the host-window counterpart to [`activity_native_finish`], with one crucial
-/// addition: Android's `SurfaceHolder.Callback.surfaceDestroyed` boundary is delivered between
-/// `onPause` and `onStop`. Roblox's app-shell callback synchronously pauses the native engine there;
-/// skipping it left libroblox workers using a destroyed Wayland surface and produced the measured
-/// close-time SIGSEGV on 2026-07-17.
-///
-/// All live activities are captured newest-first and marked finished before app code runs, so any
-/// already-posted `Activity$2` finish sees the existing exactly-once gate. Their private base
-/// `Activity.finishing` field is set before `onPause`, making app `isFinishing()` branches observe
-/// the real host-close state without invoking Roblox's override of `finish()` (which may call
-/// `System.exit` before orderly native teardown completes). Failures are described/cleared and the
-/// remaining teardown steps still run; the first typed error is returned after best-effort cleanup.
-///
-/// # Errors
-/// Returns [`FrameworkError::NullVm`] for a null VM, [`FrameworkError::Jni`] for the first JNI/Java
-/// failure, [`FrameworkError::ActivityTrackerPoisoned`] if live activities could not be captured,
-/// or [`FrameworkError::Panicked`] if the guarded Rust body panicked.
 pub fn drive_application_shutdown_lifecycle(vm: &Vm) -> Result<(), FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
     }
-    // SAFETY: `raw` is the live process JavaVM from `boot()`, kept alive by `&Vm`; this function is
-    // called synchronously on the same main thread that drove startup and owns the winit loop.
+
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| drive_application_shutdown_inner(env))) {
@@ -18524,9 +12507,6 @@ fn snapshot_live_activities_for_shutdown<'local>(
 }
 
 fn set_activity_finishing(env: &mut Env, activity: &JObject) -> Result<(), FrameworkError> {
-    // SAFETY: ATL's base Activity declares `private boolean finishing`; "Z" paired with
-    // Primitive::Boolean is FieldSignature::from_raw_parts' invariant. JNI intentionally bypasses
-    // Java visibility, and set_field runtime-checks the receiver/field before writing.
     let boolean_sig = unsafe {
         FieldSignature::from_raw_parts(BOOLEAN_FIELD_SIG, JavaType::Primitive(Primitive::Boolean))
     };
@@ -18551,21 +12531,18 @@ fn remember_shutdown_error(
     }
 }
 
-/// Errors from the framework lifecycle driver.
 #[derive(Debug)]
 pub enum FrameworkError {
-    /// The held VM pointer was null (would violate `JavaVM::from_raw`'s contract).
     NullVm,
-    /// The Activity tracker mutex was poisoned; surface teardown still ran, but Activity callbacks
-    /// could not be captured safely.
+
     ActivityTrackerPoisoned,
-    /// A JNI/Java-side error (class not found, pending exception, …) — the typed `jni` error.
+
     Jni(jni::errors::Error),
-    /// A Rust panic was caught at the JNI boundary (it must never unwind into ART's C++).
+
     Panicked,
-    /// Allocating the Eclipse-owned window-registry handle passed to `createApplication` failed.
+
     WindowRegistry(window_registry::WindowRegistryError),
-    /// 2026-07-03 (M3): a view-registry operation failed in the `__webview-test` smoke driver.
+
     ViewRegistry(view_registry::ViewRegistryError),
 }
 
@@ -18597,17 +12574,12 @@ impl std::error::Error for FrameworkError {
     }
 }
 
-// 2026-06-05: `?` on `window_registry::allocate()` in `drive_steps_1_to_3` folds a registry error
-// into the typed `WindowRegistry` variant (no unwrap/expect, §2.8).
 impl From<window_registry::WindowRegistryError> for FrameworkError {
     fn from(e: window_registry::WindowRegistryError) -> Self {
         Self::WindowRegistry(e)
     }
 }
 
-// 2026-06-04: `JavaVM::attach_current_thread` requires the callback's error type implement
-// `From<jni::errors::Error>` (it folds its own attach errors into it). Mapping a `jni` error to
-// the typed `Jni` variant keeps the boundary typed (no unwrap/expect, §2.8).
 impl From<jni::errors::Error> for FrameworkError {
     fn from(e: jni::errors::Error) -> Self {
         Self::Jni(e)
@@ -18618,17 +12590,8 @@ impl From<jni::errors::Error> for FrameworkError {
 mod tests {
     use super::*;
 
-    // The live JNI sequence (from_raw/attach/find_class) is NOT an in-harness test: it needs a
-    // booted ART VM on the process main thread, but the cargo-test harness runs tests on worker
-    // threads where ART aborts (`scoped_thread_state_change`) — the same constraint documented for
-    // `runtime::boot`. It is validated from `main()` via `eclipse run <demo.apk>`. The host-thread-
-    // independent data — the encoded recipe — is unit-tested here.
-
     #[test]
     fn host_shutdown_destroys_engine_surface_before_window_teardown() {
-        // Regression for the measured close-time libroblox SIGSEGV: production consumes this exact
-        // table, so no refactor can move `surfaceDestroyed` after Activity destruction (or omit it)
-        // without breaking the GPU-free/ART-free pin.
         assert_eq!(
             HOST_SHUTDOWN_SEQUENCE,
             [
@@ -18640,24 +12603,8 @@ mod tests {
         );
     }
 
-    /// 2026-07-17: the focused-textbox geometry and its `textInputType` are two fields of ONE
-    /// `NativeTextBoxInfo` and MUST be invalidated together.
-    ///
-    /// `TEXTBOX_INPUT_TYPE` had exactly one write site and NO clear anywhere in the tree, so the mask
-    /// outlived its session. MEASURED (`/tmp/eclipse-owner-manual2.log`): `focused textbox input
-    /// type text_input_type=5` appears EXACTLY ONCE, at 06:09:29.436 — across three credential fields
-    /// (username → password → 2FA) AND the home screen — while the overlay was still compositing
-    /// credential text at 06:11:40, 20 s after `onAppReady: Home`. The masking coin happened to land
-    /// the safe way up; had the last recorded type been the username's `7`, the identical incoherence
-    /// would have rendered the PASSWORD IN PLAINTEXT. Masking a secure field is a security feature, so
-    /// what is pinned here is that the mask cannot outlive the field it describes.
-    ///
-    /// Extracting the writer is what makes this testable at all: the clear used to live inside a JNI
-    /// closure needing a booted ART VM, which is why it was never pinned. This test is VM-free — but it
-    /// does touch process-global statics, so both phases stay in this one function.
     #[test]
     fn record_textbox_session_invalidates_geometry_and_input_type_together() {
-        // A live session records identity + geometry + type as ONE snapshot.
         record_textbox_session(Some(TextboxSession {
             widget: 41,
             geometry: (10, 20, 300, 40),
@@ -18666,8 +12613,6 @@ mod tests {
         assert_eq!(textbox_geometry(), Some((10, 20, 300, 40)));
         assert_eq!(textbox_input_type(), 5);
 
-        // The engine reports no live textbox ⇒ BOTH halves clear. Pre-fix the geometry cleared and the
-        // input type did not, leaving `5` (or, just as reachable, a stale `7`) to mask the next draw.
         record_textbox_session(None);
         assert_eq!(textbox_geometry(), None);
         assert_eq!(
@@ -18676,8 +12621,6 @@ mod tests {
             "the mask must not outlive the session that justified it"
         );
 
-        // The username's type (7) must not survive into a later session either — the snapshot moves
-        // as one, including its widget identity.
         record_textbox_session(Some(TextboxSession {
             widget: 42,
             geometry: (181, 149, 438, 46),
@@ -18688,8 +12631,6 @@ mod tests {
         assert_eq!(textbox_geometry(), None);
         assert_eq!(textbox_input_type(), i32::MIN);
 
-        // Metadata for the username field must never authorize text from the password field. The
-        // pre-fix overlay read these identities independently and combined exactly this mismatch.
         let username = TextboxSession {
             widget: 42,
             geometry: (181, 149, 438, 46),
@@ -18699,8 +12640,6 @@ mod tests {
         assert!(!textbox_session_matches_active(username, 43));
         assert!(!textbox_session_matches_active(username, 0));
 
-        // A surface click clears both routing and metadata, so the old home-search field cannot
-        // consume printable gameplay keys after navigation.
         ACTIVE_TEXT_FIELD.store(42, std::sync::atomic::Ordering::Release);
         record_textbox_session(Some(username));
         assert!(has_live_textbox_session(42));
@@ -18708,7 +12647,6 @@ mod tests {
         assert_eq!(active_text_field(), 0);
         assert!(!has_live_textbox_session(42));
 
-        // A late null answer for field 42 must not erase a newer field 43.
         let password = TextboxSession {
             widget: 43,
             geometry: (181, 219, 438, 46),
@@ -18722,10 +12660,6 @@ mod tests {
         assert!(clear_active_text_field());
     }
 
-    /// 2026-07-17: every native UI-text writer must log only character counts. A verbose login
-    /// trace exposed that TextView and RadioButton still bound their raw Java strings while the
-    /// Widget/EditText path had already been made length-only. These writers can receive account or
-    /// credential-adjacent content, so a debug level must never weaken the privacy contract.
     #[test]
     fn native_ui_text_writers_keep_raw_text_out_of_logs() {
         let src = include_str!("framework.rs");
@@ -18754,7 +12688,6 @@ mod tests {
 
     #[test]
     fn recipe_descriptors_match_confirmed_spec() {
-        // Pin the confirmed JNI descriptors so a transcription regression fails loudly.
         assert_eq!(STEP1_CREATE_APPLICATION.class, "android/content/Context");
         assert_eq!(STEP1_CREATE_APPLICATION.method, "createApplication");
         assert_eq!(
@@ -18772,16 +12705,14 @@ mod tests {
             STEP5_ACTIVITY_ON_CREATE.descriptor,
             "(Landroid/os/Bundle;)V"
         );
-        // Step 5b: Activity.onPostCreate(Bundle) — driven between onCreate and onStart so the
-        // androidx LifecycleRegistry reaches CREATED before STARTED (2026-06-13). Same (Bundle)V
-        // shape as onCreate; a transcription drift would call the wrong method/sig at boot.
+
         assert_eq!(STEP_ACTIVITY_ON_POST_CREATE.class, "android/app/Activity");
         assert_eq!(STEP_ACTIVITY_ON_POST_CREATE.method, "onPostCreate");
         assert_eq!(
             STEP_ACTIVITY_ON_POST_CREATE.descriptor,
             "(Landroid/os/Bundle;)V"
         );
-        // Steps 6–7: Activity.onStart/onResume are no-arg void instance methods (2026-06-05).
+
         assert_eq!(STEP6_ACTIVITY_ON_START.class, "android/app/Activity");
         assert_eq!(STEP6_ACTIVITY_ON_START.method, "onStart");
         assert_eq!(STEP6_ACTIVITY_ON_START.descriptor, "()V");
@@ -18790,25 +12721,16 @@ mod tests {
         assert_eq!(STEP7_ACTIVITY_ON_RESUME.descriptor, "()V");
     }
 
-    // 2026-06-05: the MotionEvent touch-dispatch path. The action codes are the stable public Android
-    // `MotionEvent.ACTION_*` constants — a regression here would dispatch the wrong gesture (e.g. a
-    // DOWN that never lifts). Pure data, host-thread-independent (no VM), so unit-tested in-harness.
     #[test]
     fn motion_action_codes_match_public_android_constants() {
-        // android.view.MotionEvent.ACTION_DOWN = 0, ACTION_UP = 1 (public Android API).
         assert_eq!(MotionAction::Down.code(), 0, "ACTION_DOWN must be 0");
         assert_eq!(MotionAction::Up.code(), 1, "ACTION_UP must be 1");
     }
 
-    // 2026-06-05: pin the touch-dispatch class + the call-site `jni_str!`/`jni_sig!` literals against
-    // the documented public Android API (single source of truth — the call sites in `touch_view` use
-    // these exact literals). A transcription regression (wrong descriptor / method name) fails loudly,
-    // the same regression guard the recipe descriptors use. `jni_sig!` yields a `MethodSignature`; its
-    // `.sig()` is the `&JNIStr` descriptor we compare.
     #[test]
     fn motion_event_dispatch_descriptors_are_the_public_android_api() {
         assert_eq!(MOTION_EVENT_CLASS.to_str(), "android/view/MotionEvent");
-        // MotionEvent.obtain(downTime, eventTime, action, x, y, metaState) → MotionEvent.
+
         assert_eq!(jni_str!("obtain").to_str(), "obtain");
         assert_eq!(
             jni_sig!("(JJIFFI)Landroid/view/MotionEvent;")
@@ -18816,7 +12738,7 @@ mod tests {
                 .to_str(),
             "(JJIFFI)Landroid/view/MotionEvent;"
         );
-        // View.dispatchTouchEvent(MotionEvent) → boolean.
+
         assert_eq!(
             jni_str!("dispatchTouchEvent").to_str(),
             "dispatchTouchEvent"
@@ -18825,10 +12747,10 @@ mod tests {
             jni_sig!("(Landroid/view/MotionEvent;)Z").sig().to_str(),
             "(Landroid/view/MotionEvent;)Z"
         );
-        // MotionEvent.recycle() → void.
+
         assert_eq!(jni_str!("recycle").to_str(), "recycle");
         assert_eq!(jni_sig!("()V").sig().to_str(), "()V");
-        // SystemClock.uptimeMillis() → long (the event-time source; matches the bound native).
+
         assert_eq!(
             jni_str!("uptimeMillis").to_str(),
             UPTIME_MILLIS_NAME.to_str()
@@ -18836,61 +12758,49 @@ mod tests {
         assert_eq!(jni_sig!("()J").sig().to_str(), "()J");
     }
 
-    // 2026-06-14: pin the KeyEvent action codes against the public Android API — a regression would
-    // dispatch the wrong key half (e.g. a DOWN reported as UP). Pure data, no VM.
     #[test]
     fn key_action_codes_match_public_android_constants() {
-        // android.view.KeyEvent.ACTION_DOWN = 0, ACTION_UP = 1 (public Android API).
         assert_eq!(KeyAction::Down.code(), 0, "KeyEvent.ACTION_DOWN must be 0");
         assert_eq!(KeyAction::Up.code(), 1, "KeyEvent.ACTION_UP must be 1");
     }
 
-    // 2026-06-14: pin the key-dispatch class + the `key_engine_surface` call-site literals against the
-    // public Android API, including the package-private `unicodeValue` field name/descriptor that
-    // getUnicodeChar() reads (a transcription drift there silently breaks all typing). Mirrors
-    // motion_event_dispatch_descriptors_are_the_public_android_api.
     #[test]
     fn key_event_dispatch_descriptors_are_the_public_android_api() {
         assert_eq!(KEY_EVENT_CLASS.to_str(), "android/view/KeyEvent");
-        // new KeyEvent(downTime, eventTime, action, code, repeat, metaState).
+
         assert_eq!(jni_sig!("(JJIIII)V").sig().to_str(), "(JJIIII)V");
-        // View.dispatchKeyEvent(KeyEvent) → boolean (the engine's overridden key entry; a live boot
-        // showed onKeyUp is absent and onKeyDown is the base stub, so dispatchKeyEvent is the route).
+
         assert_eq!(jni_str!("dispatchKeyEvent").to_str(), "dispatchKeyEvent");
         assert_eq!(
             jni_sig!("(Landroid/view/KeyEvent;)Z").sig().to_str(),
             "(Landroid/view/KeyEvent;)Z"
         );
-        // KeyEvent.unicodeValue : int — the field getUnicodeChar() returns verbatim (ATL keymap off).
+
         assert_eq!(jni_str!("unicodeValue").to_str(), "unicodeValue");
         assert_eq!(INT_SIG.to_str(), "I");
     }
 
-    // 2026-06-14: pin the per-keystroke text-edit delta the EditText TextWatcher path reports via
-    // onTextChanged(s, start, before, count). A wrong delta mis-renders typed text (the first cut used
-    // start=0/count=fullLen and the field stayed wrong). Pure (no VM/registry), so unit-tested.
     #[test]
     fn apply_text_edit_computes_android_ontextchanged_delta() {
-        // Append to empty: 1 char inserted at index 0 (before=0, count=1).
         assert_eq!(
             apply_text_edit("", 'a' as i32, false),
             ("a".to_string(), 0, 0, 1)
         );
-        // Append to "ro": 1 char inserted at index 2.
+
         assert_eq!(
             apply_text_edit("ro", 'b' as i32, false),
             ("rob".to_string(), 2, 0, 1)
         );
-        // Backspace "rob": 1 char removed at the new end (start=2, before=1, count=0).
+
         assert_eq!(apply_text_edit("rob", 0, true), ("ro".to_string(), 2, 1, 0));
-        // Backspace on empty: no-op.
+
         assert_eq!(apply_text_edit("", 0, true), (String::new(), 0, 0, 0));
-        // Control char (ESC = 0x1b): no text change.
+
         assert_eq!(
             apply_text_edit("ro", 0x1b, false),
             ("ro".to_string(), 0, 0, 0)
         );
-        // Char COUNT (not byte) indices: 'é' is 2 bytes but 1 char — append lands at char index 1.
+
         assert_eq!(
             apply_text_edit("é", 'x' as i32, false),
             ("éx".to_string(), 1, 0, 1)
@@ -18899,40 +12809,31 @@ mod tests {
 
     #[test]
     fn android_keycode_for_maps_credential_keys() {
-        // Letters: KEYCODE_A=29 .. KEYCODE_Z=54, no meta when lowercase.
         assert_eq!(android_keycode_for('a' as i32, false), Some((29, 0)));
         assert_eq!(android_keycode_for('z' as i32, false), Some((54, 0)));
-        assert_eq!(android_keycode_for('r' as i32, false), Some((46, 0))); // 'r' in "robloxtest"
-                                                                           // Uppercase letters: same keyCode + META_SHIFT_ON=1.
+        assert_eq!(android_keycode_for('r' as i32, false), Some((46, 0)));
+
         assert_eq!(android_keycode_for('A' as i32, false), Some((29, 1)));
         assert_eq!(android_keycode_for('Z' as i32, false), Some((54, 1)));
-        // Digits: KEYCODE_0=7 .. KEYCODE_9=16.
+
         assert_eq!(android_keycode_for('0' as i32, false), Some((7, 0)));
         assert_eq!(android_keycode_for('9' as i32, false), Some((16, 0)));
-        // Space + backspace (DEL=67; backspace ignores the codepoint).
+
         assert_eq!(android_keycode_for(' ' as i32, false), Some((62, 0)));
         assert_eq!(android_keycode_for(0, true), Some((67, 0)));
-        // Unmapped printable (e.g. '@') and control/unmappable codepoints → None.
+
         assert_eq!(android_keycode_for('@' as i32, false), None);
-        assert_eq!(android_keycode_for(0x1b, false), None); // ESC
+        assert_eq!(android_keycode_for(0x1b, false), None);
     }
 
     #[test]
     fn bootstrap_class_constants_are_slashed_internal_names() {
-        // find_class needs slashed internal names, not dotted; guard against a dotted regression.
-        // `JNIStr::to_str` returns the MUTF-8-decoded `Cow<str>`; these ASCII names round-trip.
         assert_eq!(CONTEXT_CLASS.to_str(), "android/content/Context");
         assert_eq!(APPLICATION_CLASS.to_str(), "android/app/Application");
     }
 
     #[test]
     fn call_site_literals_match_recipe_constants() {
-        // 2026-06-05: the steps-1–3 call sites in `drive_steps_1_to_3` use inline compile-time
-        // `jni_str!`/`jni_sig!` literals (not the `RecipeStep` constants, which the `jni` API cannot
-        // take directly). Pin those literals equal to the documented constants so the two cannot
-        // drift — a mismatch would call the wrong method/signature at boot with no compile error.
-        // `jni_str!` yields a `&JNIStr` (the method name); `jni_sig!` yields a `MethodSignature`
-        // whose `.sig()` is the raw descriptor `&JNIStr`.
         assert_eq!(
             jni_str!("createApplication").to_str(),
             STEP1_CREATE_APPLICATION.method
@@ -18957,7 +12858,7 @@ mod tests {
             jni_sig!("()V").sig().to_str(),
             STEP3_APPLICATION_ON_CREATE.descriptor
         );
-        // Step 4 createMainActivity + step 5 Activity.onCreate call-site literals (2026-06-05).
+
         assert_eq!(
             jni_str!("createMainActivity").to_str(),
             STEP4_CREATE_MAIN_ACTIVITY.method
@@ -18976,8 +12877,7 @@ mod tests {
             jni_sig!("(Landroid/os/Bundle;)V").sig().to_str(),
             STEP5_ACTIVITY_ON_CREATE.descriptor
         );
-        // Step 5b onPostCreate call-site literals (2026-06-13): `call_activity_on_post_create` uses
-        // these exact literals — pin them equal to the constant so the two cannot drift.
+
         assert_eq!(
             jni_str!("onPostCreate").to_str(),
             STEP_ACTIVITY_ON_POST_CREATE.method
@@ -18986,7 +12886,7 @@ mod tests {
             jni_sig!("(Landroid/os/Bundle;)V").sig().to_str(),
             STEP_ACTIVITY_ON_POST_CREATE.descriptor
         );
-        // Step 6 onStart + step 7 onResume call-site literals (2026-06-05).
+
         assert_eq!(jni_str!("onStart").to_str(), STEP6_ACTIVITY_ON_START.method);
         assert_eq!(
             jni_sig!("()V").sig().to_str(),
@@ -19000,7 +12900,7 @@ mod tests {
             jni_sig!("()V").sig().to_str(),
             STEP7_ACTIVITY_ON_RESUME.descriptor
         );
-        // The step-4–7 Activity class internal (slashed) name used by find_class.
+
         assert_eq!(ACTIVITY_CLASS.to_str(), "android/app/Activity");
         assert_eq!(STEP4_CREATE_MAIN_ACTIVITY.class, "android/app/Activity");
         assert_eq!(STEP5_ACTIVITY_ON_CREATE.class, "android/app/Activity");
@@ -19009,26 +12909,15 @@ mod tests {
         assert_eq!(STEP7_ACTIVITY_ON_RESUME.class, "android/app/Activity");
     }
 
-    // 2026-06-13: pin the ACTUAL driving order onCreate → onPostCreate → onStart → onResume in BOTH
-    // lifecycle drivers (`drive_lifecycle` and `activity_native_start_activity`). The fix for the
-    // androidx "register while STARTED" IllegalStateException depends on `onPostCreate` (which
-    // dispatches Fragment.onActivityCreated → ReportFragment ON_CREATE) running BETWEEN onCreate and
-    // onStart — a reverted or mis-ordered insert reintroduces the boot break. ART cannot run under
-    // cargo test, so this reads this source file and asserts the call-helper order textually (the
-    // smallest JVM-free check tied to the confirmed root cause). `include_str!("framework.rs")`
-    // reads THIS file (the path is relative to the file containing the macro) — no machine-specific
-    // path, runs from any clean checkout.
     #[test]
     fn lifecycle_drivers_call_on_post_create_between_on_create_and_on_start() {
         let src = include_str!("framework.rs");
 
-        // Extract a named fn's body span [signature .. next "\nfn " at column 0] and assert the four
-        // up-lifecycle helper calls appear in onCreate → onPostCreate → onStart → onResume order.
         fn assert_order(src: &str, marker: &str) {
             let start = src
                 .find(marker)
                 .unwrap_or_else(|| panic!("missing {marker}"));
-            // End the span at the next top-level `fn ` after the marker (drivers are distinct fns).
+
             let rest = &src[start + marker.len()..];
             let end = rest
                 .find("\nfn ")
@@ -19053,9 +12942,6 @@ mod tests {
             );
         }
 
-        // Both lifecycle drivers must keep the create-phase ordering: the static
-        // `activity_native_start_activity` (matched by its fn signature) and `drive_lifecycle`'s
-        // steps 5–7 (matched by its step-5 onCreate call literal, which begins that driver's span).
         assert_order(src, "fn activity_native_start_activity<'local>");
         assert_order(
             src,
@@ -19065,13 +12951,9 @@ mod tests {
 
     #[test]
     fn resolve_theme_attr_returns_concrete_values_and_none_for_missing() {
-        // GPU-free guard for the theme obtainStyledAttributes(int[]) value resolution. A concrete
-        // (non-reference) attribute is returned verbatim; an attribute absent from the theme is None
-        // (the caller then writes TYPE_NULL → the framework default, NOT a fake value — the exact
-        // behavior that, when the map was empty, threw AppCompat's IllegalStateException).
         use crate::framework::theme_registry::ThemeAttr;
         let mut attrs = std::collections::HashMap::new();
-        // windowActionBar (0x7f010058) = TYPE_INT_BOOLEAN(0x12) true — the AppCompat check attribute.
+
         let win_action_bar = u32_to_i32(0x7f01_0058);
         attrs.insert(
             win_action_bar,
@@ -19090,7 +12972,6 @@ mod tests {
         );
         assert_eq!(e.resource_id, 0, "a concrete value has no resource id");
 
-        // A missing attribute is None (→ TYPE_NULL by the caller).
         assert!(
             resolve_theme_attr(&attrs, u32_to_i32(0x7f01_9999)).is_none(),
             "an attribute absent from the theme must be None, not a fabricated value"
@@ -19099,13 +12980,11 @@ mod tests {
 
     #[test]
     fn resolve_theme_attr_follows_theme_attribute_indirection_and_breaks_cycles() {
-        // A `?attr/foo` (TYPE_ATTRIBUTE) value re-resolves against the SAME theme map (one hop), and a
-        // self/loop reference is bounded (no infinite loop / panic — totality under panic=abort).
         use crate::framework::theme_registry::ThemeAttr;
         let mut attrs = std::collections::HashMap::new();
         let alias = u32_to_i32(0x7f01_0001);
         let target = u32_to_i32(0x7f01_0002);
-        // alias = ?attr/target ; target = a concrete int 7.
+
         attrs.insert(
             alias,
             ThemeAttr {
@@ -19126,7 +13005,6 @@ mod tests {
         assert_eq!(e.value_type, 0x10, "resolved to the target's concrete type");
         assert_eq!(e.data, 7, "resolved to the target's concrete data");
 
-        // A self-referential ?attr cycle must terminate (bounded by MAX_ATTR_RESOLVE_DEPTH).
         let mut cyc = std::collections::HashMap::new();
         let a = u32_to_i32(0x7f01_00aa);
         cyc.insert(
@@ -19137,29 +13015,22 @@ mod tests {
                 source_package: 0x7f,
             },
         );
-        // Must return (not hang); the value stays the unresolved attribute reference.
+
         let e = resolve_theme_attr(&cyc, a).expect("cycle terminates with a value");
         assert_eq!(e.value_type, i32::from(TYPE_ATTRIBUTE));
     }
 
     #[test]
     fn styled_type_string_cookie_routes_to_the_owning_pool() {
-        // 2026-07-01 regression guard tied to the confirmed challenge-boot root cause
-        // (/tmp/eclipse-challenge3.log): a styled TYPE_STRING resolved through resources.arsc was
-        // written with the XmlBlock cookie (-1), so TypedArray.loadStringValueAt resolved the ARSC
-        // pool index against the LAYOUT XmlBlock's pool → null → `Resource is not a Drawable
-        // (color or path): TypedValue{t=0x3/d=0x456 "<null>" a=-1 r=0x7f080173}` for EVERY
-        // file-path drawable/color/font reached via TypedArray or a theme, all boot long.
         use crate::framework::theme_registry::ThemeAttr;
 
-        // A theme bag's TYPE_STRING is ALWAYS ARSC-sourced: the cookie must name its table.
         let mut attrs = std::collections::HashMap::new();
         let app_attr = u32_to_i32(0x7f01_0010);
         attrs.insert(
             app_attr,
             ThemeAttr {
                 type_: TYPE_STRING,
-                data: 0x456, // an ARSC global-pool index, NOT an XmlBlock index
+                data: 0x456,
                 source_package: 0x7f,
             },
         );
@@ -19183,22 +13054,18 @@ mod tests {
             "a framework-table theme string must carry the framework ARSC cookie"
         );
 
-        // An INLINE XML string (no reference chase) genuinely lives in the XmlBlock pool: -1 stays.
         let inline = resolve_inline_attr_value(TYPE_STRING, 42);
         assert_eq!(
             inline.asset_cookie, XML_BLOCK_COOKIE,
             "an inline XmlBlock string keeps the XmlBlock cookie"
         );
-        // Non-string values keep the neutral 0 cookie.
+
         let non_string = resolve_inline_attr_value(0x10, 5);
         assert_eq!(non_string.asset_cookie, 0);
     }
 
     #[test]
     fn png_dimensions_parses_ihdr_and_rejects_non_png() {
-        // 2026-07-01: the recorded-bitmap decode parses the PNG IHDR for the REAL dimensions
-        // Bitmap(long) reads back via native_get_width/height. Minimal valid prefix: signature +
-        // IHDR length/tag + width/height (the rest of the chunk is irrelevant to the parse).
         let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
         png.extend_from_slice(&13u32.to_be_bytes());
         png.extend_from_slice(b"IHDR");
@@ -19215,12 +13082,6 @@ mod tests {
 
     #[test]
     fn bitmap_native_names_sigs_and_classes_match_bitmap_java() {
-        // Pin the recorded-bitmap natives against the vendored ATL sources (2026-07-01):
-        // BitmapFactory.java line 666 `private static native long nativeDecodeStream(InputStream is,
-        // byte[] storage, Rect outPadding, Options opts);` and Bitmap.java lines 236–237
-        // `private static native int native_get_width(long texture);` / `..._get_height`. A
-        // transcription regression would surface as a boot-time NoSuchMethodError (best-effort skip)
-        // and re-open the UnsatisfiedLinkError inflation abort on the `.png` drawable path.
         assert_eq!(
             BITMAP_FACTORY_CLASS.to_str(),
             "android/graphics/BitmapFactory"
@@ -19238,11 +13099,7 @@ mod tests {
         assert_eq!(BITMAP_GET_WIDTH_SIG.to_str(), "(J)I");
         assert_eq!(BITMAP_GET_HEIGHT_NAME.to_str(), "native_get_height");
         assert_eq!(BITMAP_GET_HEIGHT_SIG.to_str(), "(J)I");
-        // 2026-07-02: the texture/snapshot lifecycle natives from the installed classes3.dex
-        // Bitmap.smali (all static). native_recycle is reached by finalize() on EVERY GC'd bitmap;
-        // native_create_texture is getTexture()'s GTK-texture constructor (the GTK fallback that
-        // must never be reachable-unbound). A transcription regression surfaces as a boot-time
-        // best-effort skip → a call-time UnsatisfiedLinkError on the drawable/bitmap path.
+
         assert_eq!(BITMAP_RECYCLE_NAME.to_str(), "native_recycle");
         assert_eq!(BITMAP_RECYCLE_SIG.to_str(), "(JJ)V");
         assert_eq!(BITMAP_CREATE_TEXTURE_NAME.to_str(), "native_create_texture");
@@ -19258,10 +13115,6 @@ mod tests {
 
     #[test]
     fn record_bitmap_from_file_records_dimensions_and_is_total_on_bad_paths() {
-        // 2026-07-02: the file-path twin of the nativeDecodeStream recording, shared by
-        // Drawable.native_paintable_from_path + NinePatchDrawable.nativeCreate(String). A valid
-        // PNG file records its REAL IHDR dimensions; a missing file is the tolerated 0 ("no
-        // paintable" — Drawable(long) refs it unconditionally through Eclipse's no-op native_ref).
         let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
         png.extend_from_slice(&13u32.to_be_bytes());
         png.extend_from_slice(b"IHDR");
@@ -19292,8 +13145,6 @@ mod tests {
 
     #[test]
     fn resolve_theme_attributes_reads_a_registered_theme_and_is_total_on_bad_handles() {
-        // The theme handle path: a registered theme's merged attrs resolve in request order; a
-        // stale/fabricated handle yields all-None (every requested attr → TYPE_NULL), never UB.
         use crate::framework::theme_registry;
         let theme = theme_registry::allocate().expect("allocate theme");
         let attr_a = u32_to_i32(0x7f01_0058);
@@ -19310,13 +13161,11 @@ mod tests {
         })
         .expect("populate theme");
 
-        // attr_a present, attr_b absent → Some/None in request order.
         let out = resolve_theme_attributes(theme, &[attr_a, attr_b]);
         assert_eq!(out.len(), 2);
         assert!(out[0].is_some(), "registered attr resolves");
         assert!(out[1].is_none(), "unset attr is None (→ TYPE_NULL default)");
 
-        // A fabricated handle yields all-None of the right length (no panic, no UB).
         let bogus = i64::MAX;
         let out = resolve_theme_attributes(bogus, &[attr_a, attr_b]);
         assert_eq!(out, vec![None, None]);
@@ -19326,19 +13175,15 @@ mod tests {
 
     #[test]
     fn resolve_inline_theme_refs_resolves_attribute_values_against_the_theme() {
-        // 2026-06-05 root-cause regression guard for multitouch.test's AppCompat ActionBar inflation:
-        // an inline XML attribute whose value is a `?attr/foo` (TYPE_ATTRIBUTE) must be resolved
-        // against the active theme before the framework reads it; otherwise TypedArray.getDrawable/
-        // getColor throw `UnsupportedOperationException: Failed to resolve attribute at index N`.
         use crate::framework::theme_registry;
         let theme = theme_registry::allocate().expect("allocate theme");
-        // The theme defines attr 0x7f010001 = a concrete int 42.
+
         let referenced_attr = 0x7f01_0001u32;
         theme_registry::with_theme(theme, |t| {
             t.attrs.insert(
                 u32_to_i32(referenced_attr),
                 theme_registry::ThemeAttr {
-                    type_: 0x10, // TYPE_INT_DEC
+                    type_: 0x10,
                     data: 42,
                     source_package: 0x7f,
                 },
@@ -19346,8 +13191,6 @@ mod tests {
         })
         .expect("populate theme");
 
-        // Slot 0: an inline `?attr/0x7f010001` value (what resolve_xml_attributes records). Slot 1: an
-        // already-concrete value (must be left untouched). Slot 2: None (must stay None).
         let mut entries = vec![
             Some(TypedEntry {
                 value_type: i32::from(TYPE_ATTRIBUTE),
@@ -19356,7 +13199,7 @@ mod tests {
                 asset_cookie: 0,
             }),
             Some(TypedEntry {
-                value_type: 0x1c, // TYPE_INT_COLOR_ARGB8 — concrete
+                value_type: 0x1c,
                 data: 0x1234_5678,
                 resource_id: 0,
                 asset_cookie: 0,
@@ -19377,8 +13220,6 @@ mod tests {
         );
         assert!(entries[2].is_none(), "absent slot stays None");
 
-        // An attribute the theme does not define is left as the unresolved reference (faithful
-        // "not in theme" outcome, not a fabricated value).
         let mut undefined = vec![Some(TypedEntry {
             value_type: i32::from(TYPE_ATTRIBUTE),
             data: u32_to_i32(0x7f01_9999),
@@ -19397,20 +13238,11 @@ mod tests {
 
     #[test]
     fn resolve_xml_attributes_serves_include_android_id_and_never_matches_attr_zero() {
-        // 2026-07-02 regression guard for the challenge-fragment RobloxToolbar NPE: ATL's
-        // LayoutInflater.parseInclude reads the <include android:id> override via
-        // obtainStyledAttributes(attrs, {com.android.internal.R.attr.id}) → applyStyle →
-        // resolve_xml_attributes. The Eclipse-native half of that contract: (a) android:id
-        // (0x010100d0) on the include element must resolve with the referenced id preserved in
-        // resource_id and a non-NULL value type (both are what TypedArray.getResourceId reads);
-        // (b) a requested attr id of 0 — what the overlay's mis-stubbed internal R constant
-        // compiled to, dropping the override — must NEVER match anything.
         use crate::apk::axml::{XmlAttribute, XmlDocument, XmlElement, XmlEventKind};
         let include = XmlElement {
             namespace: None,
             name: Some("include".to_string()),
             attributes: vec![
-                // android:id="@id/toolbar1" — the real shape from res/layout/toolbar_frame.xml.
                 XmlAttribute {
                     namespace: Some("http://schemas.android.com/apk/res/android".to_string()),
                     name: Some("id".to_string()),
@@ -19419,7 +13251,6 @@ mod tests {
                     value_data: 0x7f09_027b,
                     value_string: None,
                 },
-                // layout="@layout/toolbar_include" — no name resource (not an android: attr).
                 XmlAttribute {
                     namespace: None,
                     name: Some("layout".to_string()),
@@ -19439,7 +13270,7 @@ mod tests {
             strings: vec![],
         };
         let handle = xml_registry::store(doc).expect("store include block");
-        // Position the cursor on the <include> START_TAG (what rInflate's parser.next() did).
+
         xml_registry::with_block(handle, |b| {
             b.next_event();
         })
@@ -19467,9 +13298,6 @@ mod tests {
 
     #[test]
     fn context_native_names_and_sigs_match_context_java() {
-        // Pin the two Context static-init native method names + JNI descriptors against
-        // `Context.java` (2026-06-05): a transcription regression (wrong name or sig) would make
-        // RegisterNatives throw NoSuchMethodError at boot. These are host-independent constants.
         assert_eq!(NATIVE_GET_APK_PATH_NAME.to_str(), "native_get_apk_path");
         assert_eq!(NATIVE_GET_APK_PATH_SIG.to_str(), "()Ljava/lang/String;");
         assert_eq!(NATIVE_UPDATE_CONFIG_NAME.to_str(), "native_updateConfig");
@@ -19477,7 +13305,7 @@ mod tests {
             NATIVE_UPDATE_CONFIG_SIG.to_str(),
             "(Landroid/content/res/Configuration;)V"
         );
-        // The Configuration int fields native_updateConfig writes, and their JNI type.
+
         assert_eq!(SCREEN_WIDTH_DP_FIELD.to_str(), "screenWidthDp");
         assert_eq!(SCREEN_HEIGHT_DP_FIELD.to_str(), "screenHeightDp");
         assert_eq!(INT_SIG.to_str(), "I");
@@ -19485,19 +13313,15 @@ mod tests {
 
     #[test]
     fn log_native_name_sig_and_class_match_log_java() {
-        // Pin android.util.Log.println_native's class, method name, and JNI descriptor against
-        // `Log.java` (line 367) + the generated header `android_util_Log.h` (Signature
-        // `(IILjava/lang/String;Ljava/lang/String;)I`): a transcription regression would make
-        // RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
         assert_eq!(LOG_CLASS.to_str(), "android/util/Log");
         assert_eq!(PRINTLN_NATIVE_NAME.to_str(), "println_native");
         assert_eq!(
             PRINTLN_NATIVE_SIG.to_str(),
             "(IILjava/lang/String;Ljava/lang/String;)I"
         );
-        // Buffer-ID upper bound mirrors ATL `util.h` log_id_t (LOG_ID_MAIN..LOG_ID_SYSTEM, then MAX).
+
         assert_eq!(LOG_ID_MAX, 4);
-        // Priority constants mirror Log.java VERBOSE=2 … ASSERT=7.
+
         assert_eq!(LOG_PRIORITY_VERBOSE, 2);
         assert_eq!(LOG_PRIORITY_DEBUG, 3);
         assert_eq!(LOG_PRIORITY_INFO, 4);
@@ -19508,18 +13332,13 @@ mod tests {
 
     #[test]
     fn asset_manager_init_name_sig_and_class_match_asset_manager_java() {
-        // Pin android.content.res.AssetManager.init's class, method name, and JNI descriptor against
-        // `AssetManager.java` line 779 (`private native final void init(int sdk_version);` → `(I)V`):
-        // a transcription regression would make RegisterNatives throw NoSuchMethodError at boot, or
-        // (worse) bind the wrong arity. Host-independent constants.
         assert_eq!(
             ASSET_MANAGER_CLASS.to_str(),
             "android/content/res/AssetManager"
         );
         assert_eq!(ASSET_MANAGER_INIT_NAME.to_str(), "init");
         assert_eq!(ASSET_MANAGER_INIT_SIG.to_str(), "(I)V");
-        // native_setApkAssets bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature; pin name + descriptor so a transcription regression throws NoSuchMethodError.
+
         assert_eq!(
             ASSET_MANAGER_SET_APK_ASSETS_NAME.to_str(),
             "native_setApkAssets"
@@ -19528,8 +13347,7 @@ mod tests {
             ASSET_MANAGER_SET_APK_ASSETS_SIG.to_str(),
             "([Ljava/lang/Object;I)V"
         );
-        // setConfiguration bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature; pin name + descriptor so a transcription regression throws NoSuchMethodError.
+
         assert_eq!(
             ASSET_MANAGER_SET_CONFIGURATION_NAME.to_str(),
             "setConfiguration"
@@ -19538,8 +13356,7 @@ mod tests {
             ASSET_MANAGER_SET_CONFIGURATION_SIG.to_str(),
             "(IILjava/lang/String;IIIIIIIIIIIIII)V"
         );
-        // openXmlAssetNative bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature; pin name + descriptor so a transcription regression throws NoSuchMethodError.
+
         assert_eq!(
             ASSET_MANAGER_OPEN_XML_ASSET_NAME.to_str(),
             "openXmlAssetNative"
@@ -19548,37 +13365,28 @@ mod tests {
             ASSET_MANAGER_OPEN_XML_ASSET_SIG.to_str(),
             "(ILjava/lang/String;)J"
         );
-        // retrieveAttributes bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature `(J[IIJJ)Z` (mangled `...retrieveAttributes__J_3IIJJ`); pin name + descriptor so
-        // a transcription regression throws NoSuchMethodError at boot.
+
         assert_eq!(
             ASSET_MANAGER_RETRIEVE_ATTRIBUTES_NAME.to_str(),
             "retrieveAttributes"
         );
         assert_eq!(ASSET_MANAGER_RETRIEVE_ATTRIBUTES_SIG.to_str(), "(J[IIJJ)Z");
-        // newTheme bound signature-only (AssetManager denylisted) from the ART-reported signature
-        // `()J`; pin name + descriptor so a transcription regression throws NoSuchMethodError at boot.
+
         assert_eq!(ASSET_MANAGER_NEW_THEME_NAME.to_str(), "newTheme");
         assert_eq!(ASSET_MANAGER_NEW_THEME_SIG.to_str(), "()J");
-        // applyThemeStyle bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature `(JIZ)V` (mangled `...__JIZ`); pin name + descriptor so a transcription
-        // regression throws NoSuchMethodError at boot.
+
         assert_eq!(
             ASSET_MANAGER_APPLY_THEME_STYLE_NAME.to_str(),
             "applyThemeStyle"
         );
         assert_eq!(ASSET_MANAGER_APPLY_THEME_STYLE_SIG.to_str(), "(JIZ)V");
-        // copyTheme bound signature-only (AssetManager denylisted) from the ART-reported signature
-        // `(JJ)V` (mangled `...__JJ`); pin name + descriptor so a regression throws NoSuchMethodError.
+
         assert_eq!(ASSET_MANAGER_COPY_THEME_NAME.to_str(), "copyTheme");
         assert_eq!(ASSET_MANAGER_COPY_THEME_SIG.to_str(), "(JJ)V");
-        // applyStyle bound signature-only (AssetManager denylisted) from the ART-reported signature
-        // `(JJII[IIJJ)V` (mangled `...__JJII_3IIJJ`); pin name + descriptor so a transcription
-        // regression throws NoSuchMethodError at boot.
+
         assert_eq!(ASSET_MANAGER_APPLY_STYLE_NAME.to_str(), "applyStyle");
         assert_eq!(ASSET_MANAGER_APPLY_STYLE_SIG.to_str(), "(JJII[IIJJ)V");
-        // getResourceName bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature `(I)Ljava/lang/String;` (mangled `...__I`); pin name + descriptor.
+
         assert_eq!(
             ASSET_MANAGER_GET_RESOURCE_NAME_NAME.to_str(),
             "getResourceName"
@@ -19587,9 +13395,7 @@ mod tests {
             ASSET_MANAGER_GET_RESOURCE_NAME_SIG.to_str(),
             "(I)Ljava/lang/String;"
         );
-        // loadResourceValue bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature `(ISLandroid/util/TypedValue;Z)I` (mangled `...__ISLandroid_util_TypedValue_2Z`);
-        // pin name + descriptor. Also pin the TypedValue field constants it sets.
+
         assert_eq!(
             ASSET_MANAGER_LOAD_RESOURCE_VALUE_NAME.to_str(),
             "loadResourceValue"
@@ -19598,9 +13404,7 @@ mod tests {
             ASSET_MANAGER_LOAD_RESOURCE_VALUE_SIG.to_str(),
             "(ISLandroid/util/TypedValue;Z)I"
         );
-        // loadThemeAttributeValue bound signature-only (AssetManager denylisted) from the ART-reported
-        // signature `(JILandroid/util/TypedValue;Z)I` (mangled `...__JILandroid_util_TypedValue_2Z`,
-        // run log 2026-06-05, accelerometerdemo's Theme.resolveAttribute); pin name + descriptor.
+
         assert_eq!(
             ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_NAME.to_str(),
             "loadThemeAttributeValue"
@@ -19609,10 +13413,7 @@ mod tests {
             ASSET_MANAGER_LOAD_THEME_ATTRIBUTE_VALUE_SIG.to_str(),
             "(JILandroid/util/TypedValue;Z)I"
         );
-        // getPooledString: AssetManager.java line 286 (`/*package*/ native final CharSequence
-        // getPooledString(int block, int id);`) — TypedArray.loadStringValueAt's cookie >= 0 route
-        // (2026-07-01). A transcription regression is a call-time UnsatisfiedLinkError the first
-        // time a styled TYPE_STRING resolves through resources.arsc.
+
         assert_eq!(
             ASSET_MANAGER_GET_POOLED_STRING_NAME.to_str(),
             "getPooledString"
@@ -19624,21 +13425,14 @@ mod tests {
         assert_eq!(CHAR_SEQUENCE_SIG.to_str(), "Ljava/lang/CharSequence;");
         assert_eq!(RES_VALUE_TYPE_STRING, 0x03);
         assert_eq!(ECLIPSE_ASSET_COOKIE, 1);
-        // 2026-07-01: the ARSC string-pool cookies must stay non-negative (TypedArray routes
-        // `cookie < 0` to the XmlBlock pool) and must agree with getPooledString's dispatch.
+
         assert_eq!(ARSC_APP_COOKIE, 1);
         assert_eq!(ARSC_FRAMEWORK_COOKIE, 2);
         assert_eq!(arsc_cookie_for(0x7f08_0173), ARSC_APP_COOKIE);
         assert_eq!(arsc_cookie_for(0x0108_0000), ARSC_FRAMEWORK_COOKIE);
         assert_eq!(arsc_cookie_for_package(0x7f), ARSC_APP_COOKIE);
         assert_eq!(arsc_cookie_for_package(0x01), ARSC_FRAMEWORK_COOKIE);
-        // Pin the run-confirmed AOSP TypedArray window layout the styled-attribute natives write
-        // (corrected 2026-06-05: stride 7, TYPE@0, DATA@1, ASSET_COOKIE@2, RESOURCE_ID@3 — the
-        // standard AOSP API 29+ layout, corroborated by the runtime `R.styleable.View_id`=9 read).
-        // RESOURCE_ID@3 is what `getResourceId` returns for `android:id`; without it `findViewById`
-        // returns null and `setText` NPEs in `MainActivity.onCreate`. A stride/offset regression
-        // (which would re-break getResourceId/getString/getInteger and mis-place TypedValue entries)
-        // fails loudly here.
+
         assert_eq!(STYLE_NUM_ENTRIES, 7);
         assert_eq!(STYLE_TYPE, 0);
         assert_eq!(STYLE_DATA, 1);
@@ -19653,13 +13447,6 @@ mod tests {
 
     #[test]
     fn fill_typed_array_writes_exact_bounds_values_and_indices() {
-        // SOUNDNESS guard for the raw-pointer writes in the styled-attribute natives (no VM needed):
-        // the writes must stay strictly inside the AOSP-sized buffers (n * STYLE_NUM_ENTRIES ints for
-        // outValues, n + 1 for outIndices), write the accessor slots for each found attribute,
-        // TYPE_NULL for each absent one, and pack outIndices[0]=count + the 1-based positions.
-        //
-        // Sentinel-bracketed buffers detect any out-of-bounds write: a leading + trailing guard cell
-        // must keep its sentinel. entries: [string, absent, reference, absent] (mixed).
         let entries = [
             Some(TypedEntry {
                 value_type: i32::from(TYPE_STRING),
@@ -19680,21 +13467,18 @@ mod tests {
         let vals_len = n * STYLE_NUM_ENTRIES;
         let idx_len = n + 1;
 
-        let mut values = vec![-1i32; vals_len + 2]; // [guard][n*7 values][guard]
-        let mut indices = vec![-1i32; idx_len + 2]; // [guard][n+1 indices][guard]
+        let mut values = vec![-1i32; vals_len + 2];
+        let mut indices = vec![-1i32; idx_len + 2];
 
         let v_ptr = values[1..1 + vals_len].as_mut_ptr() as jlong;
         let i_ptr = indices[1..1 + idx_len].as_mut_ptr() as jlong;
         fill_typed_array(v_ptr, i_ptr, &entries);
 
-        // Guards untouched (no underflow / overflow write).
         assert_eq!(values[0], -1, "outValues underflow guard");
         assert_eq!(values[vals_len + 1], -1, "outValues overflow guard");
         assert_eq!(indices[0], -1, "outIndices underflow guard");
         assert_eq!(indices[idx_len + 1], -1, "outIndices overflow guard");
 
-        // Found attributes (0 and 2): TYPE@0, DATA@1, COOKIE@2, RESOURCE_ID@3 are written; the
-        // remaining slots stay at the caller value (the framework's zero pre-fill in real use).
         let written = [
             STYLE_TYPE,
             STYLE_DATA,
@@ -19722,7 +13506,7 @@ mod tests {
                 }
             }
         }
-        // Absent attributes (1 and 3): only STYLE_TYPE @0 = TYPE_NULL written.
+
         for attr in [1usize, 3usize] {
             let win = 1 + attr * STYLE_NUM_ENTRIES;
             assert_eq!(values[win + STYLE_TYPE], TYPE_NULL, "absent → TYPE_NULL @0");
@@ -19733,7 +13517,6 @@ mod tests {
             }
         }
 
-        // outIndices: [0] = count of found (2); [1..=2] = 1-based positions (1 and 3).
         assert_eq!(indices[1], 2, "outIndices[0] = number found");
         assert_eq!(indices[2], 1, "first found at request position 1 (1-based)");
         assert_eq!(
@@ -19745,10 +13528,6 @@ mod tests {
 
     #[test]
     fn fill_typed_array_reference_resource_id_is_at_style_resource_id_slot() {
-        // REGRESSION for the findViewById fix (2026-06-05): a REFERENCE-typed `android:id` must place
-        // its referenced id in the STYLE_RESOURCE_ID slot, which is what `TypedArray.getResourceId`
-        // reads to set the view's id. Pin offset = View_id-style window + STYLE_RESOURCE_ID, so a layout
-        // regression that mis-places it (re-breaking findViewById/setText) fails loudly here.
         let id = 0x7f03_0000i32;
         let entries = [Some(TypedEntry {
             value_type: i32::from(TYPE_REFERENCE),
@@ -19768,8 +13547,6 @@ mod tests {
 
     #[test]
     fn fill_typed_array_null_pointers_are_a_no_op() {
-        // A 0 ("no buffer") pointer for either output must be skipped — never dereferenced. A
-        // non-empty entries slice ensures the loop body would run if the guard were missing.
         let entries = [Some(TypedEntry {
             value_type: i32::from(TYPE_STRING),
             data: 1,
@@ -19781,8 +13558,7 @@ mod tests {
 
     #[test]
     fn fill_typed_array_zero_attrs_writes_only_changed_count() {
-        // n == 0: outValues has no windows; outIndices is a single int (the count) set to 0.
-        let mut indices = [-1i32; 3]; // [guard][count][guard]
+        let mut indices = [-1i32; 3];
         let i_ptr = indices[1..2].as_mut_ptr() as jlong;
         fill_typed_array(0, i_ptr, &[]);
         assert_eq!(indices[0], -1, "underflow guard untouched");
@@ -19792,8 +13568,6 @@ mod tests {
 
     #[test]
     fn u32_to_i32_preserves_all_bits() {
-        // The Res_value.data word must be stored bit-for-bit (the framework reads back the same 32
-        // bits); spot-check the boundary values incl. the 0xffffffff bool-true the manifest uses.
         for &v in &[0u32, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x0101_0003] {
             assert_eq!(u32_to_i32(v).to_ne_bytes(), v.to_ne_bytes());
         }
@@ -19801,10 +13575,6 @@ mod tests {
 
     #[test]
     fn xml_block_native_names_sigs_and_class_match_art_reported() {
-        // Pin android.content.res.XmlBlock's parser-native class, method names, and JNI descriptors
-        // against the exact signatures ART reported missing (run log 2026-06-05) and the standard
-        // AOSP XmlBlock parser ABI. A transcription regression would make RegisterNatives throw
-        // NoSuchMethodError at boot (or bind a wrong arity). Host-independent constants.
         assert_eq!(XML_BLOCK_CLASS.to_str(), "android/content/res/XmlBlock");
         assert_eq!(
             XML_BLOCK_CREATE_PARSE_STATE_NAME.to_str(),
@@ -19838,21 +13608,19 @@ mod tests {
             XML_BLOCK_GET_ATTR_STRING_VALUE_SIG.to_str(),
             "(JI)Ljava/lang/String;"
         );
-        // nativeGetAttributeCount: `(J)I` — surfaced 2026-06-05 by AppCompatColorStateListInflater.
+
         assert_eq!(
             XML_BLOCK_GET_ATTR_COUNT_NAME.to_str(),
             "nativeGetAttributeCount"
         );
         assert_eq!(XML_BLOCK_GET_ATTR_COUNT_SIG.to_str(), "(J)I");
-        // nativeGetAttributeResource: `(JI)I` — the attribute NAME's resource id
-        // (getAttributeNameResource), surfaced 2026-06-05 by AppCompatColorStateListInflater.
+
         assert_eq!(
             XML_BLOCK_GET_ATTR_RESOURCE_NAME.to_str(),
             "nativeGetAttributeResource"
         );
         assert_eq!(XML_BLOCK_GET_ATTR_RESOURCE_SIG.to_str(), "(JI)I");
-        // nativeGetAttributeDataType/Data: `(JI)I` — surfaced 2026-06-05 by VectorDrawableCompat
-        // reading <vector>/<path> attribute types+values via AttributeSet/TypedArrayUtils.
+
         assert_eq!(
             XML_BLOCK_GET_ATTR_DATA_TYPE_NAME.to_str(),
             "nativeGetAttributeDataType"
@@ -19863,7 +13631,7 @@ mod tests {
             "nativeGetAttributeData"
         );
         assert_eq!(XML_BLOCK_GET_ATTR_DATA_SIG.to_str(), "(JI)I");
-        // nativeGetLineNumber: `(J)I`, returns -1 (axml does not track source lines).
+
         assert_eq!(
             XML_BLOCK_GET_LINE_NUMBER_NAME.to_str(),
             "nativeGetLineNumber"
@@ -19878,7 +13646,7 @@ mod tests {
             "(JI)Ljava/lang/String;"
         );
         assert_eq!(XML_LINE_UNKNOWN, -1);
-        // XmlPullParser event constants nativeNext maps to (stable public API).
+
         assert_eq!(XML_EVENT_END_DOCUMENT, 1);
         assert_eq!(XML_EVENT_START_TAG, 2);
         assert_eq!(XML_EVENT_END_TAG, 3);
@@ -19888,10 +13656,6 @@ mod tests {
 
     #[test]
     fn environment_native_name_sig_and_class_match_environment_java() {
-        // Pin android.os.Environment.native_get_app_data_dir's class, method name, and JNI descriptor
-        // against `Environment.java` line 336 (`private static native String native_get_app_data_dir();`
-        // → `()Ljava/lang/String;`): a transcription regression would make RegisterNatives throw
-        // NoSuchMethodError at boot. Host-independent constants.
         assert_eq!(ENVIRONMENT_CLASS.to_str(), "android/os/Environment");
         assert_eq!(GET_APP_DATA_DIR_NAME.to_str(), "native_get_app_data_dir");
         assert_eq!(GET_APP_DATA_DIR_SIG.to_str(), "()Ljava/lang/String;");
@@ -19899,44 +13663,29 @@ mod tests {
 
     #[test]
     fn system_clock_native_name_sig_and_class_match_system_clock_java() {
-        // Pin android.os.SystemClock.elapsedRealtime's class, method name, and JNI descriptor against
-        // `SystemClock.java` line 148 (`native public static long elapsedRealtime();` → `()J`) and the
-        // ART `No implementation found for long android.os.SystemClock.elapsedRealtime()` line: a
-        // transcription regression would make RegisterNatives throw NoSuchMethodError at boot (or the
-        // native go unbound, re-throwing the UnsatisfiedLinkError that this binding cleared).
-        // Host-independent constants.
         assert_eq!(SYSTEM_CLOCK_CLASS.to_str(), "android/os/SystemClock");
         assert_eq!(ELAPSED_REALTIME_NAME.to_str(), "elapsedRealtime");
         assert_eq!(ELAPSED_REALTIME_SIG.to_str(), "()J");
-        // uptimeMillis() → `()J`, surfaced 2026-06-05 by Handler.postDelayed; same monotonic source.
+
         assert_eq!(UPTIME_MILLIS_NAME.to_str(), "uptimeMillis");
         assert_eq!(UPTIME_MILLIS_SIG.to_str(), "()J");
     }
 
     #[test]
     fn runtime_native_load_name_sig_and_class_match_art() {
-        // Pin java.lang.Runtime.nativeLoad's class, method, and JNI descriptor (the API-26+ libcore
-        // form `nativeLoad(String, ClassLoader, Class) -> String`, whose `Class caller` matches
-        // JavaVMExt::LoadNativeLibrary's `jclass caller_class`). A drift would make RegisterNatives
-        // throw (best-effort: the boot log then dumps Runtime's method table). Host-independent.
         assert_eq!(RUNTIME_CLASS.to_str(), "java/lang/Runtime");
         assert_eq!(NATIVE_LOAD_NAME.to_str(), "nativeLoad");
         assert_eq!(
             NATIVE_LOAD_SIG.to_str(),
             "(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;"
         );
-        // The delegation target: the exact mangled `art::JavaVMExt::LoadNativeLibrary` exported by
-        // libart.so (verified `nm -D`), NUL-terminated for `dlsym`. A typo silently disables
-        // delegation (non-pre-loaded libs would then report a load failure, not crash).
+
         assert!(ART_LOAD_NATIVE_LIBRARY_SYMBOL.starts_with(b"_ZN3art9JavaVMExt17LoadNativeLibrary"));
         assert_eq!(*ART_LOAD_NATIVE_LIBRARY_SYMBOL.last().unwrap(), 0u8);
     }
 
     #[test]
     fn soname_from_load_path_returns_the_basename() {
-        // The consult derives the soname from the path ART resolved, to match the engine pre-load
-        // registry. Full path → basename; a bare soname → itself; no slash → itself. Stays total
-        // (no panic) on degenerate inputs.
         assert_eq!(
             soname_from_load_path("/home/u/.cache/eclipse/native-libs/libzstd-jni-1.5.7-6.so"),
             "libzstd-jni-1.5.7-6.so"
@@ -19952,10 +13701,6 @@ mod tests {
 
     #[test]
     fn asset_manager_get_resource_package_name_name_sig_match_art_reported() {
-        // Pin AssetManager.getResourcePackageName's name + JNI descriptor against the exact signature
-        // ART reported missing (`No implementation found for java.lang.String
-        // android.content.res.AssetManager.getResourcePackageName(int)`, mangled `...__I`, run log
-        // 2026-06-11 from FirebaseInitProvider.onCreate). A drift re-throws the UnsatisfiedLinkError.
         assert_eq!(
             ASSET_MANAGER_GET_RESOURCE_PACKAGE_NAME_NAME.to_str(),
             "getResourcePackageName"
@@ -19968,10 +13713,6 @@ mod tests {
 
     #[test]
     fn asset_manager_get_resource_identifier_name_sig_match_art_reported() {
-        // Pin AssetManager.getResourceIdentifier's name + JNI descriptor against the exact signature
-        // ART reported missing (`No implementation found for int
-        // android.content.res.AssetManager.getResourceIdentifier(java.lang.String, java.lang.String,
-        // java.lang.String)`, run log 2026-06-11 from FirebaseInitProvider.onCreate).
         assert_eq!(
             ASSET_MANAGER_GET_RESOURCE_IDENTIFIER_NAME.to_str(),
             "getResourceIdentifier"
@@ -19984,19 +13725,15 @@ mod tests {
 
     #[test]
     fn asset_manager_stream_native_names_and_sigs_are_the_classic_aosp_set() {
-        // openAsset's signature is confirmed from the ART-reported line; the read cycle uses the
-        // classic AOSP signatures (bound best-effort). Pin them so a transcription drift is caught.
         assert_eq!(ASSET_MANAGER_OPEN_ASSET_NAME.to_str(), "openAsset");
         assert_eq!(
             ASSET_MANAGER_OPEN_ASSET_SIG.to_str(),
             "(Ljava/lang/String;I)J"
         );
         assert_eq!(ASSET_MANAGER_READ_ASSET_NAME.to_str(), "readAsset");
-        // ATL's readAsset uses long off/len (run log 2026-06-11), not the classic AOSP int/int.
+
         assert_eq!(ASSET_MANAGER_READ_ASSET_SIG.to_str(), "(J[BJJ)I");
-        // 2026-07-02: readAssetChar — the single-byte AssetInputStream.read() native
-        // (AssetManager.java line 685); a transcription drift leaves one-byte reads an
-        // UnsatisfiedLinkError.
+
         assert_eq!(ASSET_MANAGER_READ_ASSET_CHAR_NAME.to_str(), "readAssetChar");
         assert_eq!(ASSET_MANAGER_READ_ASSET_CHAR_SIG.to_str(), "(J)I");
         assert_eq!(ASSET_MANAGER_SEEK_ASSET_NAME.to_str(), "seekAsset");
@@ -20012,12 +13749,7 @@ mod tests {
         );
         assert_eq!(ASSET_MANAGER_DESTROY_ASSET_NAME.to_str(), "destroyAsset");
         assert_eq!(ASSET_MANAGER_DESTROY_ASSET_SIG.to_str(), "(J)V");
-        // 2026-06-12: openAssetFd, pinned against the artifact (classes2.dex `openAssetFd
-        // (Ljava/lang/String;I[J[J)I`, flags 0x112) and the exact ART-reported gap (`No
-        // implementation found for int android.content.res.AssetManager.openAssetFd(java.lang.
-        // String, int, long[], long[])`, the EXIT=10 boot's trigger). A transcription regression
-        // leaves it unbound → an uncaught worker UnsatisfiedLinkError → the vendored-libcore
-        // default handler's System.exit(10).
+
         assert_eq!(ASSET_MANAGER_OPEN_ASSET_FD_NAME.to_str(), "openAssetFd");
         assert_eq!(
             ASSET_MANAGER_OPEN_ASSET_FD_SIG.to_str(),
@@ -20027,15 +13759,9 @@ mod tests {
 
     #[test]
     fn asset_fd_for_serves_stored_entries_and_refuses_absent_and_compressed() {
-        // 2026-06-12: the openAssetFd contract over a zip fixture — a Stored asset yields a FRESH
-        // owned fd on the APK file whose (offset, length) window contains exactly the asset bytes
-        // (read back through the fd to prove the triple is usable as ParcelFileDescriptor would);
-        // an absent entry and a compressed entry are typed Errs (→ the native's -1 → Java's
-        // designed FileNotFoundException). Uses only std + a temp file — host-independent.
         use std::io::{Read, Seek, SeekFrom, Write};
         const PAYLOAD: &[u8] = b"baseline-profile-bytes";
 
-        // Build the fixture zip (Stored asset + Deflated sibling) in a temp file.
         let mut zip_bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
@@ -20061,15 +13787,11 @@ mod tests {
         std::fs::write(&path, &zip_bytes).expect("write fixture apk");
         let apk_path = path.to_str().expect("utf-8 temp path");
 
-        // Stored: the triple must be readable through the returned fd. Both name forms (with and
-        // without the assets/ prefix ATL's openFd prepends) resolve to the same entry.
         for name in ["assets/dexopt/baseline.prof", "dexopt/baseline.prof"] {
             let (fd, offset, length) = asset_fd_for(apk_path, name).expect("stored asset fd");
             assert!(fd >= 0, "a real owned fd");
             assert_eq!(length, PAYLOAD.len() as u64);
-            // SAFETY: `fd` was freshly opened by asset_fd_for and is owned by this test (the
-            // JNI transfer never happened); From<OwnedFd>-style adoption via from_raw_fd closes
-            // it when `file` drops — exactly once.
+
             let mut file: std::fs::File = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
             file.seek(SeekFrom::Start(offset)).expect("seek to offset");
             let mut got = vec![0u8; PAYLOAD.len()];
@@ -20077,12 +13799,11 @@ mod tests {
             assert_eq!(got, PAYLOAD, "the (fd, offset, length) window IS the asset");
         }
 
-        // Absent → typed Err (the FileNotFoundException path).
         assert!(matches!(
             asset_fd_for(apk_path, "assets/absent.bin"),
             Err(AssetFdError::Apk(crate::apk::ApkError::EntryMissing(_)))
         ));
-        // Compressed → typed Err (AOSP's openAssetFd refuses compressed assets).
+
         assert!(matches!(
             asset_fd_for(apk_path, "assets/compressed.bin"),
             Err(AssetFdError::Compressed)
@@ -20092,12 +13813,6 @@ mod tests {
 
     #[test]
     fn atl_read_asset_return_maps_eof_to_zero_and_errors_negative() {
-        // 2026-07-02: the confirmed root cause of the challenge4 splash-PNG boot abort — ATL's
-        // `readAsset_internal` (vendored AssetManager.java line 592) throws IOException for ANY
-        // negative native return and itself maps 0 → the InputStream -1 EOF. Returning the AOSP
-        // convention (-1 at EOF) turned EVERY AssetInputStream read-to-EOF into IOException
-        // (fatal once the drawable fix made BitmapFactory.nativeDecodeStream consume the splash
-        // PNG's stream to EOF).
         assert_eq!(atl_read_asset_return(&Ok(vec![7u8; 3])), 3);
         assert_eq!(
             atl_read_asset_return(&Ok(Vec::new())),
@@ -20113,10 +13828,6 @@ mod tests {
 
     #[test]
     fn atl_seek_whence_translation_matches_asset_input_stream_callers() {
-        // 2026-07-02: ATL's AssetInputStream uses the AOSP Java whence convention — mark() is
-        // `seekAsset(0, 0)` (query CURrent), reset() is `seekAsset(mMarkPos, -1)` (SET), skip(n)
-        // is `seekAsset(n, 0)` (CUR) — exactly AOSP android_util_AssetManager.cpp's mapping.
-        // Passing whence through raw (lseek: 0 = SET) made mark() REWIND the stream.
         assert_eq!(atl_seek_whence_to_lseek(-1), 0, "whence < 0 is SET");
         assert_eq!(atl_seek_whence_to_lseek(0), 1, "whence 0 is CUR");
         assert_eq!(atl_seek_whence_to_lseek(1), 2, "whence > 0 is END");
@@ -20124,19 +13835,12 @@ mod tests {
 
     #[test]
     fn root_relative_res_entry_serves_open_read_seek_and_length_via_the_shared_rule() {
-        // 2026-07-02: the challenge4 regression class end-to-end over a zip fixture (no APK
-        // dependency): an APK-root-relative `res/…` entry — the ATL openNonAsset contract
-        // Resources.loadDrawable uses for file-path drawables — must be servable through the SAME
-        // code paths the Java natives call: the byte/open path (openAsset → read_asset_bytes),
-        // the opened stream's read/seek/length cycle under the ATL return contracts, and the fd
-        // path (openAssetFd → asset_fd_for, which used to prepend `assets/` unconditionally).
         use std::io::{Read, Seek, SeekFrom, Write};
-        // A minimal PNG (signature + IHDR w=2 h=3) — the splash asset's shape.
+
         const PNG: &[u8] = &[
-            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, // signature
-            0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R', // IHDR length + tag
-            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, // width=2, height=3
-            0x08, 0x06, 0x00, 0x00, 0x00, // bit depth / color / etc.
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x08, 0x06, 0x00, 0x00,
+            0x00,
         ];
         const CFG: &[u8] = b"cfg-bytes";
         let mut zip_bytes = Vec::new();
@@ -20162,9 +13866,6 @@ mod tests {
         std::fs::write(&path, &zip_bytes).expect("write fixture apk");
         let apk_path = path.to_str().expect("utf-8 temp path");
 
-        // (a) The open/byte path: the exact root-relative entry, the assets-relative form, and
-        // the already-prefixed form all resolve via the ONE candidate rule; a prefixed miss is a
-        // genuine miss (no assets/assets/ double prefix, no res/ mangling).
         let bytes = read_asset_bytes_from(apk_path, "res/drawable-hdpi-v4/roblox_logo.png")
             .expect("root-relative res entry must open");
         assert_eq!(bytes, PNG);
@@ -20178,8 +13879,6 @@ mod tests {
         );
         assert!(read_asset_bytes_from(apk_path, "assets/roblox_logo.png").is_none());
 
-        // (b) The opened stream's read/seek/length cycle (what readAsset/seekAsset/getAssetLength/
-        // getAssetRemainingLength drive) under the ATL contracts.
         let handle = asset_registry::store(bytes).expect("store opened asset");
         assert_eq!(
             asset_registry::with_stream(handle, |s| s.len()),
@@ -20206,8 +13905,7 @@ mod tests {
             "the terminal EOF read must map to 0 — -1 makes ATL's readAsset_internal throw \
              IOException (the challenge4 splash fatal)"
         );
-        // reset() (`seekAsset(pos, -1)` = SET) rewinds; mark() (`seekAsset(0, 0)` = CUR) is a
-        // position QUERY and must NOT move the cursor.
+
         assert_eq!(
             asset_registry::with_stream(handle, |s| s.seek(0, atl_seek_whence_to_lseek(-1))),
             Ok(0)
@@ -20216,7 +13914,7 @@ mod tests {
             asset_registry::with_stream(handle, |s| s.remaining()),
             Ok(PNG.len())
         );
-        drop(read_chunk(4)); // advance the cursor to 4
+        drop(read_chunk(4));
         assert_eq!(
             asset_registry::with_stream(handle, |s| s.seek(0, atl_seek_whence_to_lseek(0))),
             Ok(4),
@@ -20229,12 +13927,10 @@ mod tests {
         );
         asset_registry::free(handle).expect("free");
 
-        // (c) The fd path serves the root-relative Stored entry through the same rule.
         let (fd, offset, length) = asset_fd_for(apk_path, "res/drawable-hdpi-v4/roblox_logo.png")
             .expect("root-relative res entry must be fd-servable");
         assert_eq!(length, PNG.len() as u64);
-        // SAFETY: `fd` was freshly opened by asset_fd_for and is owned by this test (never handed
-        // to Java); from_raw_fd adoption closes it exactly once when `file` drops.
+
         let mut file: std::fs::File = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
         file.seek(SeekFrom::Start(offset)).expect("seek to offset");
         let mut got = vec![0u8; PNG.len()];
@@ -20245,18 +13941,13 @@ mod tests {
 
     #[test]
     fn resolve_resource_identifier_parses_name_forms_and_returns_zero_when_unresolvable() {
-        // Pure parse/fallback logic (no ARSC needed for the not-found paths): an empty entry → 0; a
-        // name with no type and no defType → 0. The real reverse lookup is covered by an arsc test;
-        // here we pin that the AOSP `[package:][type/]entry` parsing + 0-fallback never panics.
         assert_eq!(resolve_resource_identifier("", "string", "com.x"), 0);
-        assert_eq!(resolve_resource_identifier("foo", "", ""), 0); // no type → not identifiable
-        assert_eq!(resolve_resource_identifier("type/", "", ""), 0); // empty entry → 0
+        assert_eq!(resolve_resource_identifier("foo", "", ""), 0);
+        assert_eq!(resolve_resource_identifier("type/", "", ""), 0);
     }
 
     #[test]
     fn message_queue_native_name_sig_and_class_match_art_reported() {
-        // Pin all five static natives against ATL's disassembled MessageQueue declarations. A
-        // descriptor regression would make RegisterNatives throw before Looper.prepareMainLooper.
         assert_eq!(MESSAGE_QUEUE_CLASS.to_str(), "android/os/MessageQueue");
         assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_NAME.to_str(), "nativeInit");
         assert_eq!(MESSAGE_QUEUE_NATIVE_INIT_SIG.to_str(), "()J");
@@ -20274,18 +13965,12 @@ mod tests {
         assert_eq!(MESSAGE_QUEUE_NATIVE_POLL_ONCE_SIG.to_str(), "(JI)Z");
         assert_eq!(MESSAGE_QUEUE_NATIVE_WAKE_NAME.to_str(), "nativeWake");
         assert_eq!(MESSAGE_QUEUE_NATIVE_WAKE_SIG.to_str(), "(J)V");
-        // The Looper class whose static prepareMainLooper() (step 0) builds the MessageQueue.
+
         assert_eq!(LOOPER_CLASS.to_str(), "android/os/Looper");
     }
 
     #[test]
     fn main_looper_poll_yield_table_matches_atl_next_contract() {
-        // The non-blocking nativePollOnce decision IS the whole pump correctness: ATL's MessageQueue
-        // .next() does `if (nativePollOnce(mPtr, timeout)) return null;`. timeout==0 MUST NOT yield (a
-        // ready message exists → next() pulls it); every other timeout (-1 empty, >0 future-delayed)
-        // MUST yield so the driven Looper.loop() returns instead of blocking the winit/main thread. A
-        // regression here would either hang the window (false when it should yield → busy/forever loop)
-        // or never dispatch (true when it should pull). Host-independent pure logic.
         assert!(
             !main_looper_poll_should_yield(0),
             "timeout==0 must pull, not yield"
@@ -20306,13 +13991,6 @@ mod tests {
 
     #[test]
     fn sensor_manager_native_name_sig_and_class_match_art_reported() {
-        // Pin android.hardware.SensorManager.register_accelerometer_listener_native's class, method
-        // name, and JNI descriptor against the exact signature ART reported missing (`No implementation
-        // found for void android.hardware.SensorManager.register_accelerometer_listener_native(
-        // android.hardware.SensorEventListener, android.hardware.Sensor, int)`, run log 2026-06-05): a
-        // transcription regression would make RegisterNatives throw NoSuchMethodError, or the native go
-        // unbound and re-throw the UnsatisfiedLinkError that blocked accelerometerdemo's onCreate.
-        // Host-independent constants.
         assert_eq!(
             SENSOR_MANAGER_CLASS.to_str(),
             "android/hardware/SensorManager"
@@ -20329,16 +14007,6 @@ mod tests {
 
     #[test]
     fn vibrator_native_names_sigs_and_class_match_vibrator_java() {
-        // 2026-06-12 (core-1223806 boot): pin android.os.Vibrator's class, method names, and JNI
-        // descriptors against the vendored ATL `Vibrator.java`'s FULL declared native list
-        // (`private native int native_constructor();` → `()I`; `private native void
-        // native_vibrate(int fd, long millis);` → `(IJ)V`) and the exact ART-reported gap
-        // (`No implementation found for int android.os.Vibrator.native_constructor()`,
-        // /tmp/eclipse-947663-validate.log:691). A transcription regression would make
-        // RegisterNatives throw NoSuchMethodError — or leave a native unbound, whose
-        // UnsatisfiedLinkError escapes Looper.loop and permanently kills the main Looper pump
-        // (the splash-init death this binding fixes). Both natives asserted = the full-list
-        // count pin. Host-independent constants.
         assert_eq!(VIBRATOR_CLASS.to_str(), "android/os/Vibrator");
         assert_eq!(
             VIBRATOR_NATIVE_CONSTRUCTOR_NAME.to_str(),
@@ -20351,16 +14019,6 @@ mod tests {
 
     #[test]
     fn activity_native_names_sigs_and_class_match_api_impl_dex() {
-        // 2026-06-12 (EXIT=10 boot): pin android.app.Activity's bound natives against the
-        // artifact-verified declared list (api-impl.jar classes2.dex, androguard re-enumeration:
-        // EXACTLY 7 declared natives — 5 bound here, nativeOpenURI `(Ljava/lang/String;)V` +
-        // nativeFileChooser `(ILjava/lang/String;Ljava/lang/String;I)V` recorded-not-bound) and
-        // the two exact ART-reported gaps (`No implementation found for void
-        // android.app.Activity.nativeStartActivity(android.app.Activity)` /
-        // `...nativeFinish(long)`, /tmp/eclipse-1223806-validate.log). A transcription regression
-        // would make RegisterNatives throw NoSuchMethodError — or leave a native unbound, whose
-        // UnsatisfiedLinkError consumes the splash→main transition message out of Looper.loop
-        // (the stranded-splash death this binding fixes). Host-independent constants.
         assert_eq!(ACTIVITY_CLASS.to_str(), "android/app/Activity");
         assert_eq!(
             ACTIVITY_NATIVE_START_ACTIVITY_NAME.to_str(),
@@ -20391,12 +14049,6 @@ mod tests {
 
     #[test]
     fn process_native_name_sig_and_class_match_api_impl_dex() {
-        // 2026-06-12: pin android.os.Process.getElapsedCpuTime against the artifact declaration
-        // (classes2.dex `getElapsedCpuTime ()J`, flags 0x119) and the exact ART-reported line
-        // (4× `No implementation found for long android.os.Process.getElapsedCpuTime()`,
-        // /tmp/eclipse-1223806-validate.log:634-637). A transcription regression leaves it
-        // unbound: caught by Roblox telemetry today, but any future UNCAUGHT worker call site is
-        // process-fatal under the vendored libcore (System.exit(10)). Host-independent constants.
         assert_eq!(PROCESS_CLASS.to_str(), "android/os/Process");
         assert_eq!(
             PROCESS_GET_ELAPSED_CPU_TIME_NAME.to_str(),
@@ -20407,26 +14059,16 @@ mod tests {
 
     #[test]
     fn engine_preload_natives_entry_point_exists_and_covers_log_and_process() {
-        // 2026-06-12 (registration-ordering gap): the pre-preload entry point must keep existing
-        // with this exact shape — `run_apk` calls it BEFORE preload_app_native_libs so the
-        // engine's JNI_OnLoad-time Log/Process calls resolve. A refactor that drops or renames it
-        // breaks this compile-time binding; the registered names/sigs are pinned by their own
-        // tests (`log_native_name_sig_and_class_match_log_java` /
-        // `process_native_name_sig_and_class_match_api_impl_dex`). The live signal is the
-        // `process timestamps will be inaccurate` WARN disappearing from the next owner boot.
         let entry: fn(&Vm) -> Result<(), FrameworkError> = register_engine_preload_natives;
-        // A fn item is never null; the assert keeps `entry` load-bearing (not optimized away).
+
         assert!((entry as usize) != 0);
-        // The two registrations it performs target these pinned classes.
+
         assert_eq!(LOG_CLASS.to_str(), "android/util/Log");
         assert_eq!(PROCESS_CLASS.to_str(), "android/os/Process");
     }
 
     #[test]
     fn monotonic_anchor_clock_is_non_decreasing() {
-        // The elapsedRealtime contract guarantees monotonicity (SystemClock.java lines 52–56). Prove
-        // the process-anchored clock never goes backwards across calls. Host-independent (uses only
-        // the monotonic Instant anchor, no JNI). Anchor on first read, then read again.
         let anchor = MONOTONIC_ANCHOR.get_or_init(Instant::now);
         let first = anchor.elapsed().as_millis();
         let second = anchor.elapsed().as_millis();
@@ -20438,77 +14080,64 @@ mod tests {
 
     #[test]
     fn view_native_names_sigs_and_class_match_view_java() {
-        // Pin android.view.View's peer-native class, method name, and JNI descriptor against
-        // `View.java` line 1166 (`protected native long native_constructor(Context context,
-        // AttributeSet attrs);` → `(Landroid/content/Context;Landroid/util/AttributeSet;)J`) and the
-        // exact signature ART reported missing (run log 2026-06-05): a transcription regression would
-        // make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
         assert_eq!(VIEW_CLASS.to_str(), "android/view/View");
         assert_eq!(VIEW_NATIVE_CONSTRUCTOR_NAME.to_str(), "native_constructor");
         assert_eq!(
             VIEW_NATIVE_CONSTRUCTOR_SIG.to_str(),
             "(Landroid/content/Context;Landroid/util/AttributeSet;)J"
         );
-        // native_setPadding: View.java line 1310 → `(JIIII)V`.
+
         assert_eq!(VIEW_NATIVE_SET_PADDING_NAME.to_str(), "native_setPadding");
         assert_eq!(VIEW_NATIVE_SET_PADDING_SIG.to_str(), "(JIIII)V");
-        // native_setLayoutParams: View.java line 1167 → `(JIIIFIIII)V`.
+
         assert_eq!(
             VIEW_NATIVE_SET_LAYOUT_PARAMS_NAME.to_str(),
             "native_setLayoutParams"
         );
         assert_eq!(VIEW_NATIVE_SET_LAYOUT_PARAMS_SIG.to_str(), "(JIIIFIIII)V");
-        // native_requestLayout: View.java line 1175 → `(J)V`.
+
         assert_eq!(
             VIEW_NATIVE_REQUEST_LAYOUT_NAME.to_str(),
             "native_requestLayout"
         );
         assert_eq!(VIEW_NATIVE_REQUEST_LAYOUT_SIG.to_str(), "(J)V");
-        // native_setBackgroundDrawable: the ART No-implementation-found line → `(JJ)V`.
+
         assert_eq!(
             VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME.to_str(),
             "native_setBackgroundDrawable"
         );
         assert_eq!(VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG.to_str(), "(JJ)V");
-        // native_setVisibility: the ART No-implementation-found line → `(JIF)V` (long widget, int
-        // visibility, float alpha), surfaced 2026-06-05 by AppCompat sub-decor View.<init>.
+
         assert_eq!(
             VIEW_NATIVE_SET_VISIBILITY_NAME.to_str(),
             "native_setVisibility"
         );
         assert_eq!(VIEW_NATIVE_SET_VISIBILITY_SIG.to_str(), "(JIF)V");
-        // nativeSetOnClickListener(long) → `(J)V`, surfaced 2026-06-05 by multitouch.test's custom View
-        // (same native already bound on ImageButton; reuses the class-agnostic handler).
+
         assert_eq!(
             VIEW_SET_ON_CLICK_LISTENER_NAME.to_str(),
             "nativeSetOnClickListener"
         );
         assert_eq!(VIEW_SET_ON_CLICK_LISTENER_SIG.to_str(), "(J)V");
-        // nativeSetOnTouchListener(long) → `(J)V`, View.java line 1155; surfaced 2026-06-13 by the
-        // owner's pointer-capture-overlay live boot (`No implementation found for void
-        // android.view.View.nativeSetOnTouchListener(long)` at ActivityNativeMain.d1). A drift here
-        // would re-produce that exact runtime UnsatisfiedLinkError instead of failing in the harness.
+
         assert_eq!(
             VIEW_SET_ON_TOUCH_LISTENER_NAME.to_str(),
             "nativeSetOnTouchListener"
         );
         assert_eq!(VIEW_SET_ON_TOUCH_LISTENER_SIG.to_str(), "(J)V");
-        // nativeSetOnLongClickListener(long) → `(J)V`, View.java line 1448; the record-the-listener
-        // sibling reached on the same view-setup path. Pin name+descriptor to View.java.
+
         assert_eq!(
             VIEW_SET_ON_LONG_CLICK_LISTENER_NAME.to_str(),
             "nativeSetOnLongClickListener"
         );
         assert_eq!(VIEW_SET_ON_LONG_CLICK_LISTENER_SIG.to_str(), "(J)V");
-        // native_setBackgroundColor(long, int) → `(JI)V`, surfaced 2026-06-05 by multitouch.test
-        // (records the ARGB background on the view_registry peer). Pinned to the ART-reported sig.
+
         assert_eq!(
             VIEW_SET_BACKGROUND_COLOR_NAME.to_str(),
             "native_setBackgroundColor"
         );
         assert_eq!(VIEW_SET_BACKGROUND_COLOR_SIG.to_str(), "(JI)V");
-        // 2026-06-15 post-login Home natives, pinned to View.java (2216/2012). A descriptor regression
-        // re-introduces the UnsatisfiedLinkError that drove the Startup→Home loop (HTTP 429 storm).
+
         assert_eq!(
             VIEW_GET_WINDOW_VISIBLE_DISPLAY_FRAME_NAME.to_str(),
             "getWindowVisibleDisplayFrame"
@@ -20522,57 +14151,37 @@ mod tests {
             "nativeIsAttachedToWindow"
         );
         assert_eq!(VIEW_NATIVE_IS_ATTACHED_TO_WINDOW_SIG.to_str(), "(J)Z");
-        // nativeSetFullscreen(long, boolean) → `(JZ)V`, View.java line 1214; surfaced 2026-06-11 by
-        // Roblox's ActivitySplash.onCreate setSystemUiVisibility (the ART No-implementation-found line).
+
         assert_eq!(
             VIEW_NATIVE_SET_FULLSCREEN_NAME.to_str(),
             "nativeSetFullscreen"
         );
         assert_eq!(VIEW_NATIVE_SET_FULLSCREEN_SIG.to_str(), "(JZ)V");
-        // native_get_window(long) → `(J)Landroid/view/Window;`, View.java line 1244; surfaced
-        // 2026-06-13 by Roblox's ActivityNativeMain.onCreate getViewTreeObserver (the live-boot stack:
-        // `No implementation found for android.view.Window android.view.View.native_get_window(long)`).
-        // A drift here would re-produce that exact runtime UnsatisfiedLinkError instead of failing in
-        // the harness, so this pins the name+descriptor ART named.
+
         assert_eq!(VIEW_NATIVE_GET_WINDOW_NAME.to_str(), "native_get_window");
         assert_eq!(
             VIEW_NATIVE_GET_WINDOW_SIG.to_str(),
             "(J)Landroid/view/Window;"
         );
-        // native_destructor(long) → `(J)V`, View.java line 1168 (called from View.finalize line 1679);
-        // surfaced 2026-06-13 by Roblox's FinalizerDaemon cleaning up a half-built RBXSurfaceView (the
-        // live-boot stack: `No implementation found for void android.view.View.native_destructor(long)`).
-        // A drift here would re-produce that exact runtime UnsatisfiedLinkError on the finalizer thread
-        // instead of failing in the harness, so this pins the name+descriptor ART named.
+
         assert_eq!(VIEW_NATIVE_DESTRUCTOR_NAME.to_str(), "native_destructor");
         assert_eq!(VIEW_NATIVE_DESTRUCTOR_SIG.to_str(), "(J)V");
-        // 2026-07-02 — the View LAYOUT/GEOMETRY remainder pass, pinned against the INSTALLED dex
-        // (baksmali of api-impl.jar: the classes2.dex overlay-shadowed View and the stock
-        // classes3.dex View declare the IDENTICAL 30-native surface). native_layout(JIIII)V is the
-        // challenge8 ART-reported ULE (`No implementation found for void
-        // android.view.View.native_layout(long, int, int, int, int)`); a drift here re-produces that
-        // exact boot failure instead of failing in the harness.
+
         assert_eq!(VIEW_NATIVE_LAYOUT_NAME.to_str(), "native_layout");
         assert_eq!(VIEW_NATIVE_LAYOUT_SIG.to_str(), "(JIIII)V");
-        // nativeIsFocused(J)Z is STATIC + value-returning: isFocused() returns it verbatim, served
-        // from the focus record its coupled writer nativeRequestFocus(JI)V (pinned above) stores.
+
         assert_eq!(VIEW_NATIVE_IS_FOCUSED_NAME.to_str(), "nativeIsFocused");
         assert_eq!(VIEW_NATIVE_IS_FOCUSED_SIG.to_str(), "(J)Z");
-        // nativeInvalidate(J)V — STATIC, every invalidate*() overload; validated no-op (GTK redraw
-        // request, no reader).
+
         assert_eq!(VIEW_NATIVE_INVALIDATE_NAME.to_str(), "nativeInvalidate");
         assert_eq!(VIEW_NATIVE_INVALIDATE_SIG.to_str(), "(J)V");
-        // native_keep_screen_on(JZ)V — STATIC; bound now that the installed dex proves the
-        // declaration the 58a50f6 embargo demanded (setBackgroundColor(I)V stays OUT — still plain
-        // Java in the installed dex, re-verified 2026-07-02).
+
         assert_eq!(
             VIEW_NATIVE_KEEP_SCREEN_ON_NAME.to_str(),
             "native_keep_screen_on"
         );
         assert_eq!(VIEW_NATIVE_KEEP_SCREEN_ON_SIG.to_str(), "(JZ)V");
-        // native_addClass / native_removeClasses — GTK-CSS-class styling no-ops; invoked (via
-        // View's declaration — no subclass re-declares) from View.setTextAlignment,
-        // TextView.setAllCaps/setTypeface, and Button.<init> (addClass only). No reader anywhere.
+
         assert_eq!(VIEW_NATIVE_ADD_CLASS_NAME.to_str(), "native_addClass");
         assert_eq!(VIEW_NATIVE_ADD_CLASS_SIG.to_str(), "(JLjava/lang/String;)V");
         assert_eq!(
@@ -20583,8 +14192,7 @@ mod tests {
             VIEW_NATIVE_REMOVE_CLASSES_SIG.to_str(),
             "(J[Ljava/lang/String;)V"
         );
-        // native_drawBackground / native_drawContent — the GskCanvas-guarded draw pair (validated
-        // no-ops, the Drawable.native_draw precedent).
+
         assert_eq!(
             VIEW_NATIVE_DRAW_BACKGROUND_NAME.to_str(),
             "native_drawBackground"
@@ -20592,24 +14200,16 @@ mod tests {
         assert_eq!(VIEW_NATIVE_DRAW_BACKGROUND_SIG.to_str(), "(JJ)V");
         assert_eq!(VIEW_NATIVE_DRAW_CONTENT_NAME.to_str(), "native_drawContent");
         assert_eq!(VIEW_NATIVE_DRAW_CONTENT_SIG.to_str(), "(JJ)V");
-        // native_queueAllocate(J)V — setTranslationX/Y's parent re-layout request (validated no-op).
+
         assert_eq!(
             VIEW_NATIVE_QUEUE_ALLOCATE_NAME.to_str(),
             "native_queueAllocate"
         );
         assert_eq!(VIEW_NATIVE_QUEUE_ALLOCATE_SIG.to_str(), "(J)V");
-        // 2026-07-02 — native_measure(JII)V, bound: the challenge13 ART-reported ULE (`No
-        // implementation found for void android.view.View.native_measure(long, int, int)`,
-        // /tmp/eclipse-challenge13.log lines 1154–1176). A drift here re-produces that exact boot
-        // failure instead of failing in the harness.
+
         assert_eq!(VIEW_NATIVE_MEASURE_NAME.to_str(), "native_measure");
         assert_eq!(VIEW_NATIVE_MEASURE_SIG.to_str(), "(JII)V");
-        // The measure upcall targets, pinned to the INSTALLED dex (setMeasuredDimension is
-        // plain-Java `protected final` iput×2; getSuggestedMinimum* are plain field reads — JNI
-        // call_method bypasses Java access, the surfaceCreated()V precedent below). A typo here
-        // would be a SILENT wrong answer under describe-and-clear, not a crash — and these pin
-        // the SAME consts the call sites pass, so the guard cannot decouple from the load-bearing
-        // string. The sig consts are `MethodSignature`; `.sig()` is the `&JNIStr` descriptor.
+
         assert_eq!(
             VIEW_SET_MEASURED_DIMENSION_NAME.to_str(),
             "setMeasuredDimension"
@@ -20624,54 +14224,37 @@ mod tests {
             "getSuggestedMinimumHeight"
         );
         assert_eq!(VIEW_GET_SUGGESTED_MIN_SIG.sig().to_str(), "()I");
-        // 2026-07-02 — deliberately UNBOUND from the 30-native installed-dex audit (documented
-        // decision; the clean call-time UnsatisfiedLinkError stays the discovery signal):
-        //   * native_addClasses(J[Ljava/lang/String;)V, native_removeClass(JLjava/lang/String;)V,
-        //     native_getMatrix(JJ)Z — declaration-only dead code (no invoker in any installed dex).
-        // The View.widget field (the view_registry handle on `this`) instance natives read.
+
         assert_eq!(VIEW_WIDGET_FIELD_NAME.to_str(), "widget");
         assert_eq!(VIEW_WIDGET_FIELD_SIG.to_str(), "J");
-        // 2026-06-13 — render Phase 2 surface-lifecycle dispatch (dispatch_surface_lifecycle). These
-        // pin the EXACT strings the JNI dispatch transcribes from the vendored SurfaceView.java so a
-        // typo would fail in the harness, not silently no-op (empty mCallbacks read) or NoSuchMethod
-        // on the live boot. mCallbacks: `final ArrayList<...>` (SurfaceView.java:13);
-        // surfaceCreated()V (line 33), surfaceChanged(int,int,int)V (line 27) — both private, reached
-        // via JNI call_method (bypasses Java access). RBXSurfaceView is the concrete peer class
-        // view_native_constructor records; the format is PixelFormat.RGBA_8888 (1).
+
         assert_eq!(ARRAY_LIST_SIG.to_str(), "Ljava/util/ArrayList;");
         assert_eq!(RBX_SURFACE_VIEW_CLASS, "com.roblox.client.RBXSurfaceView");
         assert_eq!(WINDOW_FORMAT_RGBA_8888, 1);
-        // TextView re-declares native_constructor (same signature); pin its class internal name.
+
         assert_eq!(TEXT_VIEW_CLASS.to_str(), "android/widget/TextView");
-        // TextView.native_setText: TextView.java line 111 → instance `(Ljava/lang/String;)V`.
+
         assert_eq!(TEXT_VIEW_NATIVE_SET_TEXT_NAME.to_str(), "native_setText");
         assert_eq!(
             TEXT_VIEW_NATIVE_SET_TEXT_SIG.to_str(),
             "(Ljava/lang/String;)V"
         );
-        // TextView.native_setTextColor: TextView.java line 120 → instance `(I)V` (NO widget param —
-        // ATL reads `this.widget`); pinned to the ART No-implementation-found line (2026-06-11,
-        // Roblox splash-layout inflation).
+
         assert_eq!(
             TEXT_VIEW_NATIVE_SET_TEXT_COLOR_NAME.to_str(),
             "native_setTextColor"
         );
         assert_eq!(TEXT_VIEW_NATIVE_SET_TEXT_COLOR_SIG.to_str(), "(I)V");
-        // 2026-07-01: TextView.setTextSize — installed dex declares `public native setTextSize(F)V`
-        // (baksmali line 1609), called from TextView.<init>; pinned to the exact ART
-        // No-implementation-found line the login challenge surfaced (/tmp/eclipse-continue3.log —
-        // the "stuck loading" sign-in). A drift re-produces that fatal UnsatisfiedLinkError.
+
         assert_eq!(TEXT_VIEW_SET_TEXT_SIZE_NAME.to_str(), "setTextSize");
         assert_eq!(TEXT_VIEW_SET_TEXT_SIZE_SIG.to_str(), "(F)V");
-        // 2026-07-01: TextView.native_set_markup — installed dex `private final native (I)V`
-        // (baksmali line 472), called from setText(CharSequence, BufferType) for Spanned text.
+
         assert_eq!(
             TEXT_VIEW_NATIVE_SET_MARKUP_NAME.to_str(),
             "native_set_markup"
         );
         assert_eq!(TEXT_VIEW_NATIVE_SET_MARKUP_SIG.to_str(), "(I)V");
-        // 2026-07-01: TextView.native_setCompoundDrawables — installed dex `protected native
-        // (JJJJJ)V` (baksmali line 990): widget handle first, then 4 drawable paintable handles.
+
         assert_eq!(
             TEXT_VIEW_NATIVE_SET_COMPOUND_DRAWABLES_NAME.to_str(),
             "native_setCompoundDrawables"
@@ -20682,36 +14265,24 @@ mod tests {
         );
     }
 
-    // 2026-07-02: pin the pure measure decoder against the INSTALLED `View.getDefaultSize` smali
-    // (sparse-switch: AT_MOST -0x80000000 / EXACTLY 0x40000000 → spec size; UNSPECIFIED 0x0 AND
-    // the switch DEFAULT — the degenerate 0b11 mode — → the supplied suggested minimum). An
-    // AT_MOST spec and the mode mask are NEGATIVE jints (sign-bit mode encoding), so the decode
-    // must be bit-pattern-exact and sign-agnostic — the negativity asserts fail if a refactor
-    // ever makes the constants positive-only or the masking arithmetic/sign-dependent.
     #[test]
     fn measure_default_size_serves_installed_get_default_size_semantics() {
-        // EXACTLY → spec size (the suggested minimum is ignored).
         assert_eq!(measure_default_size(MEASURE_SPEC_EXACTLY | 240, 17), 240);
-        // AT_MOST → spec size (the full parent budget). The spec int is NEGATIVE (installed
-        // smali: AT_MOST = -0x80000000, MODE_MASK = -0x40000000).
+
         let s = MEASURE_SPEC_AT_MOST | 800;
         assert!(
             s < 0,
             "an AT_MOST spec must be a negative jint (sign-bit mode encoding)"
         );
-        // Compile-time (const-block, the graphics.rs MAX_COMPOSITE_VIEWS house form): the mode
-        // mask itself is a negative jint — a positive-only refactor fails the build.
+
         const { assert!(MEASURE_SPEC_MODE_MASK < 0) };
         assert_eq!(measure_default_size(s, 17), 800);
-        // UNSPECIFIED (mode 0) → suggested minimum, verbatim — including the ctor default 0 and
-        // a non-zero minimum with a non-zero size payload (mode 0 must IGNORE the size bits).
+
         assert_eq!(measure_default_size(0, 0), 0);
         assert_eq!(measure_default_size(55, 17), 17);
-        // The degenerate 0b11 mode → suggested minimum (the installed sparse-switch DEFAULT
-        // branch — which the suggested_minimum_if_needed gate must also route to the
-        // live-minimum path, never a hardcoded 0).
+
         assert_eq!(measure_default_size(MEASURE_SPEC_MODE_MASK | 320, 17), 17);
-        // Full-width 30-bit size masking under AT_MOST/EXACTLY.
+
         assert_eq!(
             measure_default_size(MEASURE_SPEC_AT_MOST | 0x3FFF_FFFF, 17),
             0x3FFF_FFFF
@@ -20724,11 +14295,6 @@ mod tests {
 
     #[test]
     fn view_tree_observer_native_name_sig_and_class_match_view_tree_observer_java() {
-        // Pin android.view.ViewTreeObserver's class, method name, and JNI descriptor against
-        // `ViewTreeObserver.java` line 1049 (`private native void
-        // native_set_have_global_layout_listeners(boolean have_listeners);` → instance `(Z)V`). This
-        // is the next native on the view-tree-setup path after native_get_window; a transcription
-        // drift would make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
         assert_eq!(
             VIEW_TREE_OBSERVER_CLASS.to_str(),
             "android/view/ViewTreeObserver"
@@ -20742,10 +14308,6 @@ mod tests {
 
     #[test]
     fn window_native_names_sigs_and_class_match_window_java() {
-        // Pin android.view.Window's window-setup native class, method names, and JNI descriptors
-        // against `Window.java` lines 184–188 (set_jobject is static; the rest are instance) and the
-        // exact signatures ART reported missing (run log 2026-06-05): a transcription regression would
-        // make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
         assert_eq!(WINDOW_CLASS.to_str(), "android/view/Window");
         assert_eq!(WINDOW_SET_JOBJECT_NAME.to_str(), "set_jobject");
         assert_eq!(WINDOW_SET_JOBJECT_SIG.to_str(), "(JLandroid/view/Window;)V");
@@ -20767,39 +14329,28 @@ mod tests {
 
     #[test]
     fn paint_native_name_sig_and_class_match_art_reported() {
-        // Pin android.graphics.Paint.native_create's class, method name, and JNI descriptor against
-        // the exact signature ART reported missing (run log 2026-06-05): a transcription regression
-        // would make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
         assert_eq!(PAINT_CLASS.to_str(), "android/graphics/Paint");
         assert_eq!(PAINT_NATIVE_CREATE_NAME.to_str(), "native_create");
         assert_eq!(PAINT_NATIVE_CREATE_SIG.to_str(), "()J");
-        // native_set_color(long, int) — surfaced 2026-06-05 by ColorDrawable.<init> → Paint.setColor.
+
         assert_eq!(PAINT_NATIVE_SET_COLOR_NAME.to_str(), "native_set_color");
         assert_eq!(PAINT_NATIVE_SET_COLOR_SIG.to_str(), "(JI)V");
-        // native_set_stroke_width(long, float) — surfaced 2026-06-05 by multitouch.test's custom-View
-        // Paint.setStrokeWidth. Pinned to the exact ART-reported descriptor.
+
         assert_eq!(
             PAINT_NATIVE_SET_STROKE_WIDTH_NAME.to_str(),
             "native_set_stroke_width"
         );
         assert_eq!(PAINT_NATIVE_SET_STROKE_WIDTH_SIG.to_str(), "(JF)V");
-        // native_set_style(long, int) — surfaced 2026-06-05 by multitouch.test's custom-View
-        // Paint.setStyle. Pinned to the exact ART-reported descriptor.
+
         assert_eq!(PAINT_NATIVE_SET_STYLE_NAME.to_str(), "native_set_style");
         assert_eq!(PAINT_NATIVE_SET_STYLE_SIG.to_str(), "(JI)V");
-        // native_set_text_size(long, float) — surfaced 2026-06-05 by multitouch.test's custom-View
-        // Paint.setTextSize. Pinned to the exact ART-reported descriptor.
+
         assert_eq!(
             PAINT_NATIVE_SET_TEXT_SIZE_NAME.to_str(),
             "native_set_text_size"
         );
         assert_eq!(PAINT_NATIVE_SET_TEXT_SIZE_SIG.to_str(), "(JF)V");
-        // 2026-07-02: the rest of the installed Paint native surface (baksmali of the installed
-        // classes3.dex Paint.smali — 20 declared natives, identical to the vendored Paint.java; NO
-        // drift, unlike Drawable). native_set_stroke_cap was the challenge7 crash (`No implementation
-        // found for void android.graphics.Paint.native_set_stroke_cap(long, int)` at Paint.setStrokeCap
-        // ← the androidx CircularProgressDrawable ring ← SwipeRefreshLayout ← the rbx.web fragment's
-        // CustomSwipeRefreshLayout); a transcription regression re-opens that UnsatisfiedLinkError.
+
         assert_eq!(PAINT_NATIVE_CLONE_NAME.to_str(), "native_clone");
         assert_eq!(PAINT_NATIVE_CLONE_SIG.to_str(), "(J)J");
         assert_eq!(PAINT_NATIVE_RECYCLE_NAME.to_str(), "native_recycle");
@@ -20852,19 +14403,10 @@ mod tests {
             "native_set_text_align"
         );
         assert_eq!(PAINT_NATIVE_SET_TEXT_ALIGN_SIG.to_str(), "(JI)V");
-        // The 20th declared native, native_get_text_bounds(JLjava/lang/String;Landroid/graphics/Rect;)V,
-        // is DELIBERATELY unbound (real text measurement — the ATL reference runs a Pango layout; its
-        // Rect out-param is read back by getTextBounds/getTextWidths, which the headless recording
-        // model cannot serve honestly). The clean call-time UnsatisfiedLinkError is the discovery
-        // signal (🎨 rule, 2026-07-02); no constant exists on purpose.
     }
 
     #[test]
     fn paint_color_with_alpha_replaces_only_the_alpha_channel() {
-        // 2026-07-02: AOSP/ATL Paint.setAlpha semantics — ONLY the alpha byte changes, RGB preserved;
-        // out-of-range alphas are masked to their low byte so they can never corrupt the RGB bits.
-        // Paint.getAlpha/getColor read the merged value back, so a merge regression would corrupt
-        // every alpha-animated drawable (e.g. the androidx swipe-refresh ring's setAlpha).
         assert_eq!(
             paint_color_with_alpha(0x1234_5678, 0xFF),
             0xFF34_5678u32 as i32
@@ -20877,41 +14419,28 @@ mod tests {
             paint_color_with_alpha(0x8000_0001u32 as i32, 0x80),
             0x8000_0001u32 as i32
         );
-        // Alpha is masked to its low byte (0x1FF → 0xFF), matching the ATL reference (`alpha & 0xFF`).
+
         assert_eq!(
             paint_color_with_alpha(0x0034_5678, 0x1FF),
             0xFF34_5678u32 as i32
         );
-        // Round-trip with the getter's extraction: (color >> 24) & 0xFF.
+
         let merged = paint_color_with_alpha(0x0012_3456, 0xAB);
         assert_eq!((merged >> 24) & 0xFF, 0xAB);
     }
 
     #[test]
     fn matrix_native_name_sig_and_class_match_art_reported() {
-        // Pin android.graphics.Matrix.native_create's class, method name, and JNI descriptor against
-        // the exact signature ART reported missing (`No implementation found for long
-        // android.graphics.Matrix.native_create(long)`, run log 2026-06-05, accelerometerdemo): a
-        // transcription regression would make RegisterNatives throw NoSuchMethodError when AppCompat's
-        // VectorDrawableCompat constructs a Matrix. The arg is the source Matrix native handle (0 =
-        // identity). Host-independent constants.
         assert_eq!(MATRIX_CLASS.to_str(), "android/graphics/Matrix");
         assert_eq!(MATRIX_NATIVE_CREATE_NAME.to_str(), "native_create");
         assert_eq!(MATRIX_NATIVE_CREATE_SIG.to_str(), "(J)J");
-        // finalizer(long) → `(J)V`, surfaced 2026-06-05; frees the matrix_registry slot.
+
         assert_eq!(MATRIX_FINALIZER_NAME.to_str(), "finalizer");
         assert_eq!(MATRIX_FINALIZER_SIG.to_str(), "(J)V");
     }
 
     #[test]
     fn path_native_names_sigs_and_class_match_art_reported() {
-        // Pin android.graphics.Path's class + the geometry natives' names/descriptors against the exact
-        // signatures ART reported missing during AdaptiveIconDemo's adaptive-icon path build (run logs
-        // 2026-06-05: `native_create_builder(long, long)`, then `native_move_to(long, float, float)`,
-        // then `native_create_path(long)`, then `native_ref_path(long)`). A transcription regression
-        // would make RegisterNatives throw NoSuchMethodError when PathParser builds the mask path. The
-        // line/quad/cubic/close ops follow the same builder-op pattern (the loop bound them with no new
-        // UnsatisfiedLinkError). Host-independent constants.
         assert_eq!(PATH_CLASS.to_str(), "android/graphics/Path");
         assert_eq!(
             PATH_NATIVE_CREATE_BUILDER_NAME.to_str(),
@@ -20932,18 +14461,13 @@ mod tests {
         assert_eq!(PATH_NATIVE_CREATE_PATH_SIG.to_str(), "(J)J");
         assert_eq!(PATH_NATIVE_REF_PATH_NAME.to_str(), "native_ref_path");
         assert_eq!(PATH_NATIVE_REF_PATH_SIG.to_str(), "(J)J");
-        // native_reset(long path, long builder) → static `(JJ)V` (Path.java line 252); pinned to the
-        // ART-reported line (2026-06-11, Roblox splash spinner reset() per animation frame).
+
         assert_eq!(PATH_NATIVE_RESET_NAME.to_str(), "native_reset");
         assert_eq!(PATH_NATIVE_RESET_SIG.to_str(), "(JJ)V");
     }
 
     #[test]
     fn canvas_native_names_and_sigs() {
-        // Pin android.graphics.Canvas's class + the draw natives' names/descriptors. These are the
-        // modern-AOSP `BaseCanvas` draw-native set bound static-with-handle (see the provenance note at
-        // register_canvas_natives); the dev-host discovery loop confirms/corrects them on a real run.
-        // A transcription regression here would silently bind the wrong descriptor — this catches it.
         assert_eq!(CANVAS_CLASS.to_str(), "android/graphics/Canvas");
         assert_eq!(CANVAS_N_DRAW_COLOR_NAME.to_str(), "nDrawColor");
         assert_eq!(CANVAS_N_DRAW_COLOR_SIG.to_str(), "(JI)V");
@@ -20957,9 +14481,6 @@ mod tests {
 
     #[test]
     fn paint_config_from_handle_reads_paint_then_defaults_when_invalid() {
-        // The draw cascade snapshots a paint_registry handle into a canvas_registry PaintConfig. A real
-        // handle reflects the recorded color/style/stroke-width; a bad/0 handle yields AOSP's default
-        // Paint (opaque black, fill) so a draw with an unseen default Paint is still real, never UB.
         let p = paint_registry::allocate().expect("allocate paint");
         paint_registry::with_paint(p, |s| {
             s.color = 0x80AB_CDEFu32 as i32;
@@ -20972,7 +14493,7 @@ mod tests {
         assert_eq!(cfg.style, paint_registry::PaintStyle::Stroke);
         assert_eq!(cfg.stroke_width, 3.5);
         paint_registry::free(p).expect("free paint");
-        // A fabricated/0 handle falls back to the default Paint (opaque black, fill).
+
         let def = paint_config_from_handle(0);
         assert_eq!(def.argb, canvas_registry::PaintConfig::default().argb);
         assert_eq!(def.style, paint_registry::PaintStyle::Fill);
@@ -20980,14 +14501,12 @@ mod tests {
 
     #[test]
     fn draw_target_and_drawn_canvas_are_plain_copy_values() {
-        // DrawTarget/DrawnCanvas carry only opaque handles + pixel dims across the draw-cascade boundary
-        // (GPU-free, Copy). This pins their field meaning so the renderer + framework agree.
         let t = DrawTarget {
             handle: 42,
             width: 100,
             height: 50,
         };
-        let t2 = t; // Copy, not move.
+        let t2 = t;
         assert_eq!(t, t2);
         assert_eq!(t.width, 100);
         assert_eq!(t.height, 50);
@@ -21001,77 +14520,39 @@ mod tests {
 
     #[test]
     fn image_view_class_is_slashed_internal_name() {
-        // Pin android.widget.ImageView's internal name: ImageView re-declares native_constructor (same
-        // signature as View/TextView, surfaced by the run line 2026-06-05), and ART resolves natives per
-        // declaring class, so register_image_view_natives must find the class by this exact name or
-        // RegisterNatives throws NoClassDefFoundError. The shared constructor name/sig are pinned by
-        // view_native_names_sigs_and_class_match_view_java. Host-independent constant.
         assert_eq!(IMAGE_VIEW_CLASS.to_str(), "android/widget/ImageView");
-        // native_setScaleType(long, int) → `(JI)V`, surfaced 2026-06-05 by multitouch.test's
-        // AppCompat ActionBar ImageView (no-op handle-validation). Pinned to the ART-reported sig.
+
         assert_eq!(
             IMAGE_VIEW_SET_SCALE_TYPE_NAME.to_str(),
             "native_setScaleType"
         );
         assert_eq!(IMAGE_VIEW_SET_SCALE_TYPE_SIG.to_str(), "(JI)V");
-        // native_setDrawable(long, long) → `(JJ)V`, surfaced 2026-06-05 by multitouch.test's
-        // AppCompat ActionBar ImageView (no-op handle-validation). Pinned to the ART-reported sig.
+
         assert_eq!(IMAGE_VIEW_SET_DRAWABLE_NAME.to_str(), "native_setDrawable");
         assert_eq!(IMAGE_VIEW_SET_DRAWABLE_SIG.to_str(), "(JJ)V");
     }
 
     #[test]
     fn image_button_class_is_slashed_internal_name() {
-        // Pin android.widget.ImageButton's internal name: AppCompat's Toolbar builds an
-        // AppCompatImageButton (extends ImageButton) and ART resolved native_constructor against the
-        // ImageButton class (run log 2026-06-05), so register_image_button_natives must find the class
-        // by this exact name or RegisterNatives throws NoClassDefFoundError. The shared constructor
-        // name/sig are pinned by view_native_names_sigs_and_class_match_view_java. Host-independent.
         assert_eq!(IMAGE_BUTTON_CLASS.to_str(), "android/widget/ImageButton");
-        // nativeSetOnClickListener(long) → `(J)V`, surfaced 2026-06-05 by Toolbar nav button (marks
-        // the peer clickable in view_registry — the renderer's click hit-test target).
+
         assert_eq!(
             IMAGE_BUTTON_SET_ON_CLICK_LISTENER_NAME.to_str(),
             "nativeSetOnClickListener"
         );
         assert_eq!(IMAGE_BUTTON_SET_ON_CLICK_LISTENER_SIG.to_str(), "(J)V");
-        // 2026-07-02: native_setDrawable(long, long) → `(JJ)V` — the 2026-07-03 challenge14 boot's
-        // ONLY ULE (`No implementation found for void
-        // android.widget.ImageButton.native_setDrawable(long, long)`, /tmp/eclipse-challenge14.log
-        // lines 1165–1184): ImageButton RE-declares ImageView's native (installed classes3.dex
-        // ImageButton.smali:42) and ART resolves natives per declaring class, so ImageView's own
-        // bound copy did not cover Toolbar.setNavigationIcon → AppCompatImageButton.setImageDrawable.
-        // The binding DELIBERATELY reuses the SHARED IMAGE_VIEW_SET_DRAWABLE_NAME/SIG consts (the
-        // same pair register_image_view_natives passes — the view_native_constructor const-sharing
-        // shape), so re-assert them here: these pins cover the exact consts the ImageButton call site
-        // passes. A transcription regression would make RegisterNatives skip the entry (per-method
-        // best-effort WARN) and re-open the challenge14 UnsatisfiedLinkError at boot.
+
         assert_eq!(IMAGE_VIEW_SET_DRAWABLE_NAME.to_str(), "native_setDrawable");
         assert_eq!(IMAGE_VIEW_SET_DRAWABLE_SIG.to_str(), "(JJ)V");
     }
 
     #[test]
     fn surface_view_class_is_slashed_internal_name() {
-        // Pin android.view.SurfaceView's internal name: Roblox inflates com.roblox.client.RBXSurfaceView
-        // (extends SurfaceView), which @Override-re-declares native_constructor (SurfaceView.java line
-        // 40, same signature as View), and ART resolves natives per declaring class — so
-        // register_surface_view_natives must find the class by this EXACT internal name or
-        // RegisterNatives throws NoClassDefFoundError at boot. The shared constructor name/sig are
-        // pinned by view_native_names_sigs_and_class_match_view_java. Host-independent constant.
         assert_eq!(SURFACE_VIEW_CLASS.to_str(), "android/view/SurfaceView");
     }
 
     #[test]
     fn view_subclass_constructor_classes_are_slashed_internal_names() {
-        // Pin the FULL set of concrete inflatable android.widget.* View subclasses whose
-        // native_constructor is bound by register_view_subclass_constructor_natives. ART resolves
-        // natives per declaring class and each of these RE-declares View's
-        // native_constructor(Context, AttributeSet) (verified against the vendored ATL overlay), so
-        // register_view_subclass_constructor_natives must find each by its EXACT slashed internal name
-        // or RegisterNatives throws NoClassDefFoundError at boot. The shared constructor name/sig are
-        // pinned by view_native_names_sigs_and_class_match_view_java. Asserting the exact set (and its
-        // length) makes a DROPPED class — re-introducing the one-per-boot UnsatisfiedLinkError this
-        // pass fixes — fail the test. Host-independent constants.
         let names: Vec<String> = VIEW_SUBCLASS_CONSTRUCTOR_CLASSES
             .iter()
             .map(|c| c.to_str().into_owned())
@@ -21089,24 +14570,15 @@ mod tests {
                 "android/widget/ScrollView",
             ],
         );
-        // No abstract / non-View class slipped into the set: CompoundButton is abstract (not
-        // instantiable) and PopupWindow's native_constructor is zero-arg ()J and not a View — both must
-        // stay OUT of this (Context, AttributeSet)J-signature set.
+
         assert!(!names.iter().any(|n| n == "android/widget/CompoundButton"));
         assert!(!names.iter().any(|n| n == "android/widget/PopupWindow"));
-        // 2026-07-02: android/webkit/WebView is deliberately NOT in this array — it re-declares the
-        // same (Context, AttributeSet)J constructor but ALSO carries load natives
-        // (native_loadUrl/native_loadDataWithBaseURL) this constructor-only array shape cannot host,
-        // so it is bound by its own register_web_view_natives (all 3 natives in one best-effort
-        // array). Adding it here too would double-register the constructor.
+
         assert!(!names.iter().any(|n| n == "android/webkit/WebView"));
     }
 
     #[test]
     fn activity_manager_memory_native_names_sigs_and_class_match_the_overlay() {
-        // 2026-07-18: pin all four private-static natives declared by the committed
-        // ActivityManager.java overlay. A drift makes RegisterNatives skip that entry and restores
-        // the impossible 0MB device profile (or the old 20/60 MiB synthetic heap classes).
         assert_eq!(
             ACTIVITY_MANAGER_CLASS.to_str(),
             "android/app/ActivityManager"
@@ -21139,29 +14611,14 @@ mod tests {
 
     #[test]
     fn web_view_native_names_sigs_and_class_match_the_installed_dex() {
-        // Pin android.webkit.WebView's class + the 3 native name/JNI-descriptor pairs against the
-        // INSTALLED framework truth (baksmali of ~/.cache/eclipse/framework-patched/api-impl.jar
-        // classes3.dex WebView.smali lines 48/51/378, 2026-07-02 — WebView is defined ONLY in
-        // classes3.dex, no overlay shadow; these 3 are the ONLY natives declared by ANY
-        // android/webkit class in ANY of the 3 dexes, grep-verified; the vendored WebView.java
-        // declares the identical 3, no drift). A transcription regression would make
-        // RegisterNatives skip the entry (per-method best-effort WARN) and re-open the challenge9
-        // UnsatisfiedLinkError at boot. Host-independent constants.
         assert_eq!(WEB_VIEW_CLASS.to_str(), "android/webkit/WebView");
-        // The constructor binding is DELIBERATELY the SHARED class-agnostic view_native_constructor
-        // (registry-backed honest: the returned long becomes View.widget — iput-wide right after the
-        // call in the active classes2 View.smali — and is read back as the handle by every
-        // subsequent View/ViewGroup native). No separate WebView registry exists on purpose; this is
-        // also byte-faithful to upstream ATL's DEFAULT (its reference C delegates to
-        // Java_android_view_View_native_1constructor with WebKitGTK disabled).
+
         assert_eq!(VIEW_NATIVE_CONSTRUCTOR_NAME.to_str(), "native_constructor");
         assert_eq!(
             VIEW_NATIVE_CONSTRUCTOR_SIG.to_str(),
             "(Landroid/content/Context;Landroid/util/AttributeSet;)J"
         );
-        // The two load natives (2026-07-03, M3: spawn-and-forward to the out-of-process
-        // eclipse-webview helper; internalLoadChanged still has zero Java invokers — it is
-        // native-fired by the client's socket-reader thread for driven loads).
+
         assert_eq!(WEB_VIEW_NATIVE_LOAD_URL_NAME.to_str(), "native_loadUrl");
         assert_eq!(
             WEB_VIEW_NATIVE_LOAD_URL_SIG.to_str(),
@@ -21175,9 +14632,7 @@ mod tests {
             WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG.to_str(),
             "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
         );
-        // 2026-07-09 (plan M4): the two new WebView natives (overlay WebView.smali) — the live
-        // registration line moves from bound=3 to bound=5. A transcription drift re-opens the
-        // UnsatisfiedLinkError at boot for the bridge/eval path.
+
         assert_eq!(
             WEB_VIEW_NATIVE_EVALUATE_JAVASCRIPT_NAME.to_str(),
             "native_evaluateJavascript"
@@ -21194,10 +14649,7 @@ mod tests {
             WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG.to_str(),
             "(JLjava/lang/Object;Ljava/lang/String;)V"
         );
-        // 2026-07-16 (plan M6): the two WebSettings UA natives (overlay WebSettings.smali). They
-        // are on their OWN class, so they do NOT move WebView's bound=5 marker. A transcription
-        // drift here would make RegisterNatives skip the entry (best-effort WARN) and re-open the
-        // §6 2026-07-16 💥 bug — the app's UA discarded — as a call-time UnsatisfiedLinkError.
+
         assert_eq!(WEB_SETTINGS_CLASS.to_str(), "android/webkit/WebSettings");
         assert_eq!(
             WEB_SETTINGS_NATIVE_SET_USER_AGENT_STRING_NAME.to_str(),
@@ -21215,8 +14667,7 @@ mod tests {
             WEB_SETTINGS_NATIVE_GET_USER_AGENT_STRING_SIG.to_str(),
             "()Ljava/lang/String;"
         );
-        // The M4 CookieManager natives (overlay CookieManager.smali) + the JavascriptInterface
-        // annotation class (overlay javac).
+
         assert_eq!(
             COOKIE_MANAGER_CLASS.to_str(),
             "android/webkit/CookieManager"
@@ -21253,7 +14704,6 @@ mod tests {
 
     #[test]
     fn parse_set_cookie_extracts_name_value_domain_path_flags_and_expires() {
-        // 2026-07-09 (plan M4): the pure Set-Cookie parser feeding the CookieManager natives.
         let c = parse_set_cookie("ECLIPSE_TEST=1; Path=/");
         assert_eq!(c.name, "ECLIPSE_TEST");
         assert_eq!(c.value, "1");
@@ -21293,7 +14743,6 @@ mod tests {
             "Max-Age must take precedence over Expires regardless of attribute order"
         );
 
-        // A bare name (no '=') and an empty attribute list.
         let c = parse_set_cookie("justname");
         assert_eq!(c.name, "justname");
         assert_eq!(c.value, "");
@@ -21301,8 +14750,6 @@ mod tests {
 
     #[test]
     fn cookie_manager_url_fixup_matches_androids_relaxed_host_boundary() {
-        // 2026-07-17 root-cause pin: Roblox passed a host/domain where CEF requires a URL, so
-        // every post-login cookie (including the auth token) was rejected as `<non-url>`.
         assert_eq!(
             fixup_webview_cookie_url("roblox.com"),
             CookieUrlFixup {
@@ -21336,9 +14783,6 @@ mod tests {
         let invalid = "not a host value";
         assert_eq!(fixup_webview_cookie_url(invalid).url, invalid);
 
-        // The leading-dot compatibility domain is used only when the cookie did not already carry
-        // an explicit Domain attribute; explicit attributes remain authoritative, as Chromium's
-        // appendDomain implementation requires.
         let fixed = fixup_webview_cookie_url(".roblox.com");
         let mut no_domain = parse_set_cookie("session=value; Path=/");
         no_domain.domain = fixed.implied_domain.expect("compat domain");
@@ -21370,8 +14814,6 @@ mod tests {
 
     #[test]
     fn bridge_args_marshal_supported_types_and_reject_unsupported() {
-        // 2026-07-09 (plan M4): the pure arg-marshalling classifier — String/number/bool/null map to
-        // the matching param types; arrays/objects/mismatches reject loudly.
         use serde_json::json;
         assert_eq!(plan_arg(&json!("hi"), "java.lang.String"), ArgKind::Str);
         assert_eq!(
@@ -21388,9 +14830,9 @@ mod tests {
         assert_eq!(plan_arg(&json!(true), "boolean"), ArgKind::BoolBox);
         assert_eq!(plan_arg(&json!(true), "int"), ArgKind::Reject);
         assert_eq!(plan_arg(&json!(null), "java.lang.String"), ArgKind::Null);
-        // Null to a primitive param is rejected (a primitive cannot be null).
+
         assert_eq!(plan_arg(&json!(null), "int"), ArgKind::Reject);
-        // Arrays / nested objects are unsupported (as on real Android).
+
         assert_eq!(
             plan_arg(&json!([1, 2]), "java.lang.Object"),
             ArgKind::Reject
@@ -21403,14 +14845,10 @@ mod tests {
 
     #[test]
     fn bridge_arg_lens_returns_serialized_lengths_and_never_the_values() {
-        // 2026-07-10 (plan M6) PRIVACY pin: the A3 bridge-receipt line binds arg LENGTHS only — a
-        // secret bridge arg value never appears. bridge_arg_lens returns usize lengths (structurally
-        // value-free); pin the serialized-JSON length semantics and that the Debug rendering the
-        // receipt line binds (arg_lens = ?..) carries no value substring.
         use serde_json::json;
         let args = vec![json!("SECRETTOKEN"), json!(42), json!(true), json!(null)];
         let lens = bridge_arg_lens(&args);
-        // "SECRETTOKEN" serializes to `"SECRETTOKEN"` = 13 bytes; 42 → 2; true → 4; null → 4.
+
         assert_eq!(lens, vec![13, 2, 4, 4]);
         assert!(
             !format!("{lens:?}").contains("SECRET"),
@@ -21421,17 +14859,13 @@ mod tests {
 
     #[test]
     fn bridge_identifier_for_log_passes_identifiers_and_redacts_page_controlled_shapes() {
-        // 2026-07-10 (M6 review fix) PRIVACY pin: the A3 receipt line binds iface/method from
-        // INSIDE the page-controlled cefQuery payload BEFORE registry validation — any page script
-        // can call window.cefQuery with arbitrary strings, so a URL/token-shaped string must never
-        // reach the default log verbatim, while the app's real bridge identifiers always must.
         assert_eq!(
             bridge_identifier_for_log("__globalRobloxAndroidBridge__"),
             "__globalRobloxAndroidBridge__"
         );
         assert_eq!(bridge_identifier_for_log("emitEvent"), "emitEvent");
         assert_eq!(bridge_identifier_for_log("$fn_1"), "$fn_1");
-        // URL-shaped / non-identifier page strings redact to the static marker.
+
         for hostile in [
             "https://apps.roblox.com/challenge?token=SECRETTOKEN",
             "name with spaces",
@@ -21441,7 +14875,7 @@ mod tests {
         ] {
             assert_eq!(bridge_identifier_for_log(hostile), "<non-identifier>");
         }
-        // Overlong alphanumeric blobs (token-shaped) redact; the 64-byte boundary passes.
+
         let over = "A".repeat(65);
         assert_eq!(bridge_identifier_for_log(&over), "<non-identifier>");
         let max = "A".repeat(64);
@@ -21450,7 +14884,6 @@ mod tests {
 
     #[test]
     fn bridge_return_number_or_quote_embeds_valid_numbers_and_quotes_the_rest() {
-        // 2026-07-09: a numeric toString embeds as a JSON number; NaN/Infinity/garbage are quoted.
         assert_eq!(number_or_quote("42"), "42");
         assert_eq!(number_or_quote("-1.5"), "-1.5");
         assert_eq!(number_or_quote("NaN"), "\"NaN\"");
@@ -21459,43 +14892,29 @@ mod tests {
 
     #[test]
     fn bridge_overloads_resolve_by_arity_like_the_android_java_bridge() {
-        // 2026-07-09 fix pin: @JavascriptInterface overloads are ALL retained and resolved by
-        // argument count at call time (Chromium gin's FindMethod(name, num_parameters)) — the
-        // name-only registry collapsed e.g. postMessage(String) vs postMessage(String,String) to
-        // one arbitrary getMethods() survivor and rejected calls matching the discarded overload.
         assert_eq!(select_overload_index(&[1, 2], 2), Some(1));
         assert_eq!(select_overload_index(&[1, 2], 1), Some(0));
-        // No matching arity: rejected (the loud expected-arities WARN path).
+
         assert_eq!(select_overload_index(&[1, 2], 3), None);
         assert_eq!(select_overload_index(&[], 0), None);
-        // Same-arity overloads: first-match — deliberately the reference (gin) behavior.
+
         assert_eq!(select_overload_index(&[2, 2], 2), Some(0));
     }
 
     #[test]
     fn eval_drain_victims_selects_only_pre_close_era_callbacks_of_the_closed_view() {
-        // 2026-07-10 fix pin: a queued ViewClosedDrain must fail only callbacks born BEFORE the
-        // close it belongs to. A close+re-drive of the same widget (close_view is pub; per-view
-        // close deliberately never latches) registers FRESH callbacks whose birth era is > the
-        // close's era — the old owning-widget-only selection delivered a wrong "null" to the
-        // live re-driven browser's evaluateJavascript.
         let mut m = std::collections::HashMap::new();
-        m.insert(1_u32, (7_i64, 0_u64, ())); // pre-close, closed widget → drained
-        m.insert(2_u32, (7_i64, 3_u64, ())); // era == close era (born before the bump) → drained
-        m.insert(3_u32, (7_i64, 4_u64, ())); // born AFTER the close (re-drive) → survives
-        m.insert(4_u32, (9_i64, 0_u64, ())); // different widget → never selected
+        m.insert(1_u32, (7_i64, 0_u64, ()));
+        m.insert(2_u32, (7_i64, 3_u64, ()));
+        m.insert(3_u32, (7_i64, 4_u64, ()));
+        m.insert(4_u32, (9_i64, 0_u64, ()));
         let mut victims = eval_drain_victims(&m, 7, 3);
         victims.sort_unstable();
         assert_eq!(victims, vec![1, 2]);
-        // The other widget's own drain selects exactly its own pre-close entry.
+
         assert_eq!(eval_drain_victims(&m, 9, 0), vec![4]);
     }
 
-    /// 2026-07-16: the delivery gate for app-facing WebView callbacks. `Post` is the AOSP-correct
-    /// lane (the main/UI Looper — the ONE thread with a prepared android.os.Looper, lifecycle step
-    /// 0); the four inline arms are the honest degradations, and on-main wins FIRST because
-    /// running there IS the contract, not a degradation. Guards the new ladder's own logic — the
-    /// bug itself is reproduced by `__webview-test`'s EclipseWebViewClientProbe (Guard 1).
     #[test]
     fn webview_callback_gate_prefers_the_main_looper_and_degrades_honestly() {
         use MainDispatchGate::*;
@@ -21504,7 +14923,7 @@ mod tests {
             main_dispatch_gate(true, true, true, true),
             InlineOnMainThread
         );
-        // On-main wins even when nothing else is set up — running here IS the contract.
+
         assert_eq!(
             main_dispatch_gate(true, false, false, false),
             InlineOnMainThread
@@ -21522,28 +14941,14 @@ mod tests {
 
     #[test]
     fn bridge_survives_view_close_only_for_entries_born_after_the_close() {
-        // 2026-07-10 fix pin: the era-gated retain predicate for the upcall-thread bridge drop
-        // (drop_bridges_for_view_closed) — same stale-drain gate as the eval-callback drain.
-        assert!(!bridge_survives_view_close(7, 3, 7, 3)); // born before/at the close → dropped
+        assert!(!bridge_survives_view_close(7, 3, 7, 3));
         assert!(!bridge_survives_view_close(7, 0, 7, 3));
-        assert!(bridge_survives_view_close(7, 4, 7, 3)); // re-registered after the close → kept
-        assert!(bridge_survives_view_close(9, 0, 7, 3)); // another widget → untouched
+        assert!(bridge_survives_view_close(7, 4, 7, 3));
+        assert!(bridge_survives_view_close(9, 0, 7, 3));
     }
-
-    // 2026-07-03 (web-engine plan M2): the redaction unit test
-    // `url_scheme_and_host_for_log_serves_scheme_and_host_only_and_never_query_payload_or_credentials`
-    // moved intact (same name, same assertions) to `crate::webview::redact` with the function.
 
     #[test]
     fn widget_property_setter_names_sigs_and_classes_match_overlay() {
-        // Pin the EXACT class internal names + method name/JNI descriptors that
-        // register_widget_property_setter_natives binds, against the vendored ATL overlay
-        // (`vendor/atl/src/api-impl/android/widget/`). ART resolves natives per declaring class and each
-        // setter is bound on its own class, so a transcribed-wrong name/sig (or a dropped class) would
-        // make RegisterNatives throw NoSuchMethodError/NoClassDefFoundError at boot — re-introducing the
-        // one-per-boot UnsatisfiedLinkError this pass fixes. Host-independent constants.
-        //
-        // Classes (reuse the constructor-set consts; pinned slashed by the test above).
         assert_eq!(BUTTON_CLASS.to_str(), "android/widget/Button");
         assert_eq!(EDIT_TEXT_CLASS.to_str(), "android/widget/EditText");
         assert_eq!(CHECK_BOX_CLASS.to_str(), "android/widget/CheckBox");
@@ -21553,47 +14958,45 @@ mod tests {
         assert_eq!(SPINNER_CLASS.to_str(), "android/widget/Spinner");
         assert_eq!(SCROLL_VIEW_CLASS.to_str(), "android/widget/ScrollView");
 
-        // Text setters: Button.java:40 / EditText.java:29 / CheckBox.java:44 all `(JLjava/lang/String;)V`.
         assert_eq!(WIDGET_NATIVE_SET_TEXT_NAME.to_str(), "native_setText");
         assert_eq!(
             WIDGET_NATIVE_SET_TEXT_SIG.to_str(),
             "(JLjava/lang/String;)V"
         );
-        // RadioButton.java:29 `setText(CharSequence)` → `(Ljava/lang/CharSequence;)V` (this.widget).
+
         assert_eq!(RADIO_BUTTON_SET_TEXT_NAME.to_str(), "setText");
         assert_eq!(
             RADIO_BUTTON_SET_TEXT_SIG.to_str(),
             "(Ljava/lang/CharSequence;)V"
         );
-        // ProgressBar.java:106 `native_setIndeterminate(boolean)` → `(Z)V` (this.widget) — the trigger.
+
         assert_eq!(
             PROGRESS_BAR_SET_INDETERMINATE_NAME.to_str(),
             "native_setIndeterminate"
         );
         assert_eq!(PROGRESS_BAR_SET_INDETERMINATE_SIG.to_str(), "(Z)V");
-        // ProgressBar.java:50 / SeekBar.java:19 `native_setProgress(long, float)` → `(JF)V`.
+
         assert_eq!(
             PROGRESS_NATIVE_SET_PROGRESS_NAME.to_str(),
             "native_setProgress"
         );
         assert_eq!(PROGRESS_NATIVE_SET_PROGRESS_SIG.to_str(), "(JF)V");
-        // SeekBar.java:21 `native_setMax(long, int)` → `(JI)V`.
+
         assert_eq!(SEEK_BAR_SET_MAX_NAME.to_str(), "native_setMax");
         assert_eq!(SEEK_BAR_SET_MAX_SIG.to_str(), "(JI)V");
-        // Button.java:43 `native_setCompoundDrawables(long, long)` → `(JJ)V`.
+
         assert_eq!(
             BUTTON_SET_COMPOUND_DRAWABLES_NAME.to_str(),
             "native_setCompoundDrawables"
         );
         assert_eq!(BUTTON_SET_COMPOUND_DRAWABLES_SIG.to_str(), "(JJ)V");
-        // Spinner.java:27 `native_setAdapter(long, SpinnerAdapter)` → `(JLandroid/widget/SpinnerAdapter;)V`.
+
         assert_eq!(SPINNER_SET_ADAPTER_NAME.to_str(), "native_setAdapter");
         assert_eq!(
             SPINNER_SET_ADAPTER_SIG.to_str(),
             "(JLandroid/widget/SpinnerAdapter;)V"
         );
-        // ScrollView.java:20/22 reuse ViewGroup's add/removeView name/sig (pinned by the ViewGroup test
-        // below); assert the exact descriptors here so a ScrollView-side transcription error fails too.
+
         assert_eq!(VIEW_GROUP_NATIVE_ADD_VIEW_NAME.to_str(), "native_addView");
         assert_eq!(
             VIEW_GROUP_NATIVE_ADD_VIEW_SIG.to_str(),
@@ -21604,12 +15007,7 @@ mod tests {
             "native_removeView"
         );
         assert_eq!(VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG.to_str(), "(JJ)V");
-        // 2026-06-13: EditText's listener natives, bound with record-the-listener semantics (the
-        // RbxKeyboard/AppCompatEditText construction path reaches `native_addTextChangedListener` —
-        // live boot 2026-06-13). All declared native in the vendored overlay (EditText.java:26/27/28).
-        // add/remove share `(JLandroid/text/TextWatcher;)V`; the editor-action listener is the nested
-        // `TextView$OnEditorActionListener`. A transcription drift here re-introduces the boot-blocking
-        // UnsatisfiedLinkError, so pin the exact names/descriptors.
+
         assert_eq!(
             EDIT_TEXT_ADD_TEXT_CHANGED_LISTENER_NAME.to_str(),
             "native_addTextChangedListener"
@@ -21630,34 +15028,16 @@ mod tests {
             EDIT_TEXT_SET_ON_EDITOR_ACTION_LISTENER_SIG.to_str(),
             "(JLandroid/widget/TextView$OnEditorActionListener;)V"
         );
-        // 2026-06-13: NOTE — base-View `setBackgroundColor(I)V` is intentionally NOT pinned/bound
-        // here. The shipped framework's `setBackgroundColor(int)` is plain Java (live boot at
-        // 58a50f6: `Failed to register non-native method
-        // android.view.View.setBackgroundColor(I)V as native`), which aborted the atomic
-        // RegisterNatives for the whole View class; see `register_view_natives` for the removal.
-        // 2026-07-02: `native_keep_screen_on(JZ)V` — which 58a50f6 embargoed alongside it — IS
-        // declared `private static native` in both installed dexes, so it is now bound + pinned
-        // above (the 📐 View layout/geometry pass). The View/widget per-class registrations bind
-        // PER METHOD (best-effort), so such a drift is a deferred call-time UnsatisfiedLinkError
-        // rather than a fatal whole-class abort — guarded by
-        // `register_class_natives_best_effort_skips_unbindable_method_and_continues`.
     }
 
     #[test]
     fn register_class_natives_best_effort_skips_unbindable_method_and_continues() {
-        // 2026-06-13: the smallest check that would have caught the 58a50f6 atomic-abort regression.
-        // `register_class_natives_best_effort` drives `fold_best_effort` (its pure control-flow core,
-        // testable without a JVM); the invariant is that ONE unbindable entry is skipped while every
-        // OTHER entry is still attempted — the exact behavior the old atomic RegisterNatives violated
-        // (a single non-native `setBackgroundColor(I)V` took the whole View class down). The `ptr` is
-        // inert data here (never dereferenced by the loop), so a null is fine for the control-flow test.
         let bindings: [NativeBinding; 3] = [
             (
                 VIEW_NATIVE_CONSTRUCTOR_NAME,
                 VIEW_NATIVE_CONSTRUCTOR_SIG,
                 std::ptr::null_mut(),
             ),
-            // The "bad" entry — stands in for a method the shipped dex declares as plain Java.
             (
                 VIEW_SET_BACKGROUND_COLOR_NAME,
                 VIEW_SET_BACKGROUND_COLOR_SIG,
@@ -21670,16 +15050,13 @@ mod tests {
             ),
         ];
 
-        // `step` fails ONLY the middle entry (simulating ART rejecting one non-native method) and
-        // records the order every entry was visited in.
         let mut visited: Vec<String> = Vec::new();
         let bound = fold_best_effort(&bindings, |&(name, _sig, _ptr)| {
             visited.push(name.to_str().into_owned());
-            // Fail the second entry; the first and third must still be attempted AND counted.
+
             name.to_str() != VIEW_SET_BACKGROUND_COLOR_NAME.to_str()
         });
 
-        // Every entry was attempted in order — the failing one did NOT abort the rest (the 58a50f6 fix).
         assert_eq!(
             visited,
             vec![
@@ -21689,7 +15066,7 @@ mod tests {
             ],
             "a single unbindable entry must not short-circuit the remaining methods"
         );
-        // The two lifecycle-critical natives bound; only the bad entry was skipped.
+
         assert_eq!(
             bound, 2,
             "skipped entry is not counted; the rest still bind"
@@ -21698,12 +15075,6 @@ mod tests {
 
     #[test]
     fn drawable_native_name_sig_and_class_match_art_reported() {
-        // Pin android.graphics.drawable.Drawable.native_constructor's class, method name, and JNI
-        // descriptor against the exact signature ART reported missing (`No implementation found for long
-        // android.graphics.drawable.Drawable.native_constructor()`, run log 2026-06-05) + AOSP
-        // `Drawable.java`'s `private native long native_constructor();`: a transcription regression
-        // would make RegisterNatives throw NoSuchMethodError when a launcher loads a drawable.
-        // Host-independent constants.
         assert_eq!(
             DRAWABLE_CLASS.to_str(),
             "android/graphics/drawable/Drawable"
@@ -21713,21 +15084,16 @@ mod tests {
             "native_constructor"
         );
         assert_eq!(DRAWABLE_NATIVE_CONSTRUCTOR_SIG.to_str(), "()J");
-        // native_unref(long) → `(J)V`, surfaced 2026-06-05; the drawable peer free callback (no-op).
+
         assert_eq!(DRAWABLE_NATIVE_UNREF_NAME.to_str(), "native_unref");
         assert_eq!(DRAWABLE_NATIVE_UNREF_SIG.to_str(), "(J)V");
-        // native_invalidate(long) → `(J)V`, surfaced 2026-07-01 (GradientDrawable.setShape →
-        // invalidateSelf during a post-login ActionBar drawable inflate); instance, no-op repaint.
+
         assert_eq!(
             DRAWABLE_NATIVE_INVALIDATE_NAME.to_str(),
             "native_invalidate"
         );
         assert_eq!(DRAWABLE_NATIVE_INVALIDATE_SIG.to_str(), "(J)V");
-        // 2026-07-02: the paintable-lifecycle set from the INSTALLED dex (baksmali classes3.dex —
-        // the vendored Drawable.java has drifted and lacks setPaintable/native_ref entirely).
-        // native_ref was the /tmp/eclipse-challenge5.log splash abort (`No implementation found for
-        // void android.graphics.drawable.Drawable.native_ref(long)` from BitmapDrawable.<init> →
-        // setPaintable); a transcription regression re-opens that UnsatisfiedLinkError cliff.
+
         assert_eq!(DRAWABLE_NATIVE_REF_NAME.to_str(), "native_ref");
         assert_eq!(DRAWABLE_NATIVE_REF_SIG.to_str(), "(J)V");
         assert_eq!(DRAWABLE_NATIVE_DRAW_NAME.to_str(), "native_draw");
@@ -21740,9 +15106,7 @@ mod tests {
             DRAWABLE_PAINTABLE_FROM_PATH_SIG.to_str(),
             "(Ljava/lang/String;)J"
         );
-        // DrawableContainer declares its OWN native_constructor (ART resolves per declaring class)
-        // plus native_selectChild — the StateListDrawable/AnimationDrawable (<selector>/
-        // <animation-list>) base on the same loadDrawable pipeline.
+
         assert_eq!(
             DRAWABLE_CONTAINER_CLASS.to_str(),
             "android/graphics/drawable/DrawableContainer"
@@ -21752,8 +15116,7 @@ mod tests {
             "native_selectChild"
         );
         assert_eq!(DRAWABLE_CONTAINER_SELECT_CHILD_SIG.to_str(), "(JJ)V");
-        // NinePatchDrawable's private natives — reached by `.9.png` file-path drawables
-        // (createFromResourceStream/createFromPath route them to the NinePatchDrawable ctors).
+
         assert_eq!(
             NINE_PATCH_DRAWABLE_CLASS.to_str(),
             "android/graphics/drawable/NinePatchDrawable"
@@ -21766,21 +15129,15 @@ mod tests {
         assert_eq!(NINE_PATCH_CREATE_FROM_CHUNK_SIG.to_str(), "([BJ)J");
         assert_eq!(NINE_PATCH_SET_TINT_NAME.to_str(), "nativeSetTint");
         assert_eq!(NINE_PATCH_SET_TINT_SIG.to_str(), "(JI)V");
-        // Java's Drawable.<init> registers mNativePtr for native-allocation cleanup; it must be non-zero
-        // (and is a plainly-non-pointer marker, never dereferenced — see register_drawable_natives docs).
+
         assert_ne!(DRAWABLE_HANDLE_SENTINEL, 0);
-        // Same non-zero contract for the container sentinel; distinct so log lines tell them apart.
+
         assert_ne!(DRAWABLE_CONTAINER_HANDLE_SENTINEL, 0);
         assert_ne!(DRAWABLE_CONTAINER_HANDLE_SENTINEL, DRAWABLE_HANDLE_SENTINEL);
     }
 
     #[test]
     fn imm_native_name_sig_and_class_match_api_impl_dex() {
-        // Pin android.view.inputmethod.InputMethodManager's class + the three native names/descriptors
-        // against the installed dex (baksmali-confirmed 2026-07-01): a transcription regression would make
-        // the atomic RegisterNatives array throw NoSuchMethodError (aborting ALL three, incl. the
-        // <clinit>-critical nativeInit), or leave nativeHideSoftInput/nativeShowSoftInput unbound so the
-        // RbxKeyboard soft-keyboard path throws UnsatisfiedLinkError. Host-independent constants.
         assert_eq!(
             INPUT_METHOD_MANAGER_CLASS.to_str(),
             "android/view/inputmethod/InputMethodManager"
@@ -21804,19 +15161,13 @@ mod tests {
 
     #[test]
     fn view_group_native_name_sig_and_class_match_view_group_java() {
-        // Pin android.view.ViewGroup.native_addView's class, method name, and JNI descriptor against
-        // `ViewGroup.java` line 186 (`protected native void native_addView(long widget, long child,
-        // int index, LayoutParams params);` → `(JJILandroid/view/ViewGroup$LayoutParams;)V`) and the
-        // exact signature ART reported missing (run log 2026-06-05): a transcription regression would
-        // make RegisterNatives throw NoSuchMethodError at boot. Host-independent constants.
         assert_eq!(VIEW_GROUP_CLASS.to_str(), "android/view/ViewGroup");
         assert_eq!(VIEW_GROUP_NATIVE_ADD_VIEW_NAME.to_str(), "native_addView");
         assert_eq!(
             VIEW_GROUP_NATIVE_ADD_VIEW_SIG.to_str(),
             "(JJILandroid/view/ViewGroup$LayoutParams;)V"
         );
-        // native_removeView(long, long) → `(JJ)V`, surfaced 2026-06-05 by multitouch.test re-parenting
-        // its content view (removes the parent→child edge). Pinned to the ART-reported descriptor.
+
         assert_eq!(
             VIEW_GROUP_NATIVE_REMOVE_VIEW_NAME.to_str(),
             "native_removeView"
@@ -21824,10 +15175,6 @@ mod tests {
         assert_eq!(VIEW_GROUP_NATIVE_REMOVE_VIEW_SIG.to_str(), "(JJ)V");
     }
 
-    /// A hand-built `resources.arsc` for a package whose id is `package_id`, with one type (id 1)
-    /// holding one simple entry (id 0) carrying `TYPE_INT_DEC` data 7. Mirrors `arsc::build_fixture`
-    /// but is parameterized on the package id so a host-independent framework table (id 0x01) can be
-    /// built. Kept local to this guard (the only place needing a 0x01-package fixture).
     fn build_arsc_package(package_id: u32) -> Vec<u8> {
         fn u16(v: &mut Vec<u8>, x: u16) {
             v.extend_from_slice(&x.to_le_bytes());
@@ -21835,7 +15182,7 @@ mod tests {
         fn u32(v: &mut Vec<u8>, x: u32) {
             v.extend_from_slice(&x.to_le_bytes());
         }
-        // Empty global value string pool (RES_STRING_POOL_TYPE = 0x0001, header-only 28 bytes).
+
         let mut pool = Vec::new();
         u16(&mut pool, 0x0001);
         u16(&mut pool, 28);
@@ -21845,63 +15192,53 @@ mod tests {
         u32(&mut pool, 0);
         u32(&mut pool, 28);
         u32(&mut pool, 0);
-        // Type chunk (RES_TABLE_TYPE_TYPE = 0x0201): type id 1, one simple entry.
+
         let mut type_chunk = Vec::new();
         u16(&mut type_chunk, 0x0201);
-        u16(&mut type_chunk, 20); // headerSize (0-length config)
-        u32(&mut type_chunk, 40); // size = 20 + 4 + 8 + 8
-        type_chunk.push(1); // type id 1
-        type_chunk.push(0); // res0
-        u16(&mut type_chunk, 0); // res1
-        u32(&mut type_chunk, 1); // entryCount
-        u32(&mut type_chunk, 24); // entriesStart = header(20) + offsets(4)
-        u32(&mut type_chunk, 0); // entry 0 offset
-        u16(&mut type_chunk, 8); // ResTable_entry size
-        u16(&mut type_chunk, 0); // flags (simple)
-        u32(&mut type_chunk, 0); // key index
-        u16(&mut type_chunk, 8); // Res_value size
-        type_chunk.push(0); // res0
-        type_chunk.push(0x10); // dataType = TYPE_INT_DEC
-        u32(&mut type_chunk, 7); // data
-                                 // Package chunk (RES_TABLE_PACKAGE_TYPE = 0x0200): header(8)+id(4)+name[128]u16(256)+
-                                 // 4×u32(16) = 284 bytes (matches arsc::PACKAGE_HEADER_MIN), then the type chunk.
+        u16(&mut type_chunk, 20);
+        u32(&mut type_chunk, 40);
+        type_chunk.push(1);
+        type_chunk.push(0);
+        u16(&mut type_chunk, 0);
+        u32(&mut type_chunk, 1);
+        u32(&mut type_chunk, 24);
+        u32(&mut type_chunk, 0);
+        u16(&mut type_chunk, 8);
+        u16(&mut type_chunk, 0);
+        u32(&mut type_chunk, 0);
+        u16(&mut type_chunk, 8);
+        type_chunk.push(0);
+        type_chunk.push(0x10);
+        u32(&mut type_chunk, 7);
+
         const PKG_HEADER: usize = 284;
         let mut pkg = Vec::new();
         u16(&mut pkg, 0x0200);
         u16(&mut pkg, PKG_HEADER as u16);
         u32(&mut pkg, (PKG_HEADER + type_chunk.len()) as u32);
         u32(&mut pkg, package_id);
-        pkg.resize(pkg.len() + 256, 0); // name[128] u16
-        u32(&mut pkg, 0); // typeStrings (absent)
-        u32(&mut pkg, 0); // lastPublicType
-        u32(&mut pkg, 0); // keyStrings (absent)
-        u32(&mut pkg, 0); // lastPublicKey
+        pkg.resize(pkg.len() + 256, 0);
+        u32(&mut pkg, 0);
+        u32(&mut pkg, 0);
+        u32(&mut pkg, 0);
+        u32(&mut pkg, 0);
         debug_assert_eq!(pkg.len(), PKG_HEADER);
         pkg.extend_from_slice(&type_chunk);
-        // Table chunk (RES_TABLE_TYPE = 0x0002): 12-byte header + pool + package.
+
         let mut table = Vec::new();
         u16(&mut table, 0x0002);
         u16(&mut table, 12);
         u32(&mut table, (12 + pool.len() + pkg.len()) as u32);
-        u32(&mut table, 1); // packageCount
+        u32(&mut table, 1);
         table.extend_from_slice(&pool);
         table.extend_from_slice(&pkg);
         table
     }
 
-    /// Regression guard for the by-package dispatch (2026-06-05): an id whose high byte is `0x01`
-    /// (the framework package, e.g. `android.R.*`) must be served by `framework-res.apk`'s table, not
-    /// the app's `resources.arsc` (package `0x7f`). Before the fix, only the app table was loaded, so
-    /// every `0x01`-package lookup returned `None`. Builds a host-independent synthetic
-    /// `framework-res.apk` in a temp dir (no machine assumptions), points
-    /// `ECLIPSE_ANDROID_FRAMEWORK_DIR` at it, and asserts `arsc_bytes_for(0x01…)` yields a table
-    /// whose package id is `0x01`.
     #[test]
     fn arsc_bytes_for_routes_framework_package_to_framework_res_apk() {
         use std::io::Write;
 
-        // Unique temp dir holding a dummy api-impl.jar (find_framework requires it) + a synthetic
-        // framework-res.apk whose resources.arsc declares package 0x01.
         let dir = std::env::temp_dir().join(format!(
             "eclipse-fwarsc-{}-{:?}",
             std::process::id(),
@@ -21921,8 +15258,6 @@ mod tests {
         };
         std::fs::write(dir.join("framework-res.apk"), &apk_bytes).expect("write framework-res.apk");
 
-        // SAFETY: set_var is unsafe (Rust 2024); this test owns the var for its duration and removes
-        // it before returning. No other test reads ECLIPSE_ANDROID_FRAMEWORK_DIR concurrently here.
         unsafe {
             std::env::set_var("ECLIPSE_ANDROID_FRAMEWORK_DIR", &dir);
         }

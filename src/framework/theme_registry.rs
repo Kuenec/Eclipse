@@ -1,25 +1,3 @@
-//! Process-global generational-slab registry for Eclipse-owned `Resources.Theme` native handles.
-//!
-//! 2026-06-05: AOSP's `AssetManager.newTheme()` creates a native theme object and returns its `long`
-//! handle (`Resources$Theme` stores it; `applyStyle`/`resolveAttributes`/`AssetManager.releaseTheme`
-//! consume it). ATL backs this in C; Eclipse must NOT pull in GTK (AGENTS.md §5 Step 3.5), so a
-//! theme's `long` handle is an **Eclipse-owned generational-slab index into this slab — NOT
-//! `Box::into_raw`, NOT a raw pointer**, exactly the soundness pattern of
-//! [`window_registry`](super::window_registry) / [`view_registry`](super::view_registry) /
-//! [`xml_registry`](super::xml_registry). A stale/fabricated `jlong` from Java is a
-//! bounds+generation-checked `Err`, never a wild dereference / use-after-free / UB.
-//!
-//! ## Handle layout
-//! Identical to the sibling registries: a [`jlong`] packing a `u32` slot index (low 32 bits) + a
-//! `u32` generation (high 32 bits). Generations start at 1, so a valid handle is never `0` — `0`
-//! stays the reserved "no theme" / null sentinel.
-//!
-//! ## Scope (this increment)
-//! [`ThemeState`] records the **non-GTK theme attribute set** the theme natives accumulate (resource
-//! ids → resolved style data, applied via `applyStyle`). It is a minimal placeholder until a theme
-//! native actually needs to read it back; recording themes soundly is what lets the View constructors
-//! (`obtainStyledAttributes` → `getTheme` → `newTheme`) proceed past theme creation without GTK.
-
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -28,24 +6,16 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use jni::sys::jlong;
 
-/// Process-global slab of [`ThemeState`], guarded by a [`Mutex`]. Initialized on first use.
 static THEMES: OnceLock<Mutex<Registry>> = OnceLock::new();
 
-/// A theme-registry handle as it travels across JNI: a `jlong` (`i64`) packing the slot index (low
-/// 32 bits) and the slot's generation (high 32 bits). `0` is the reserved "no theme" / null sentinel.
 pub type ThemeHandle = jlong;
 
-/// Errors from the theme registry. Every fallible path returns one of these instead of panicking, so
-/// a stale/out-of-range/fabricated `jlong` from Java can never cause UB or unwind across JNI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeRegistryError {
-    /// The handle's slot index is outside the slab (fabricated handle, or the reserved `0`).
     OutOfRange,
-    /// The slot exists but its generation does not match: the handle refers to a freed (and
-    /// possibly reused) slot. Never aliases the new occupant.
+
     StaleHandle,
-    /// The registry mutex was poisoned by a panic in another holder. Surfaced as an error (not a
-    /// re-panic) so the JNI path stays panic-free (AGENTS.md §2.8).
+
     Poisoned,
 }
 
@@ -65,69 +35,42 @@ impl fmt::Display for ThemeRegistryError {
 
 impl std::error::Error for ThemeRegistryError {}
 
-/// One resolved theme attribute value: the `Res_value` type + data a theme attribute is set to.
-///
-/// 2026-06-05: a theme is, after style + parent-chain merge, a map of attribute resource id →
-/// this value. `obtainStyledAttributes(int[])` (the no-parser path) looks each requested attr id up
-/// here. `type_` is the `Res_value.dataType` (== `TypedValue.TYPE_*`); `data` is the raw 32-bit
-/// payload (a referenced resource id for `TYPE_REFERENCE`, an attribute id for `TYPE_ATTRIBUTE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeAttr {
-    /// `Res_value.dataType` (== `TypedValue.TYPE_*`).
     pub type_: u8,
-    /// `Res_value.data` (raw 32-bit payload).
+
     pub data: u32,
-    /// The package id of the `resources.arsc` table the style bag defining this value lives in
-    /// (`0x01` = the framework table, anything else = the app table).
-    ///
-    /// 2026-07-01: for a `TYPE_STRING` value, `data` is an index into THAT table's GLOBAL value
-    /// string pool — NOT the XmlBlock pool — so `framework`'s `TypedEntry` must carry the matching
-    /// positive ARSC asset cookie (the challenge-boot "Resource is not a Drawable … \"<null>\""
-    /// root cause was routing these to the XmlBlock pool via cookie `-1`).
+
     pub source_package: u8,
 }
 
-/// Per-theme state held in a registry slot: the non-GTK theme attribute set.
-///
-/// 2026-06-05: `attrs` is the theme's MERGED attribute map (attribute resource id → [`ThemeAttr`]),
-/// built by `framework`'s `applyThemeStyle` from the applied style's bag + its parent chain in
-/// `resources.arsc` (child overrides parent). `obtainStyledAttributes(int[])` resolves each requested
-/// attribute from it. `styles` records the applied style resource ids in application order (kept for
-/// diagnostics + `force` semantics; a freshly created theme has both empty).
 #[derive(Debug, Default)]
 pub struct ThemeState {
-    /// Applied style resource ids (`Resources.Theme.applyStyle`), in application order.
     pub styles: Vec<i32>,
-    /// The merged theme attribute map: attribute resource id → resolved value.
+
     pub attrs: HashMap<i32, ThemeAttr>,
 }
 
-/// A generational slot: the current generation plus the optional occupant.
 struct Slot {
     generation: u32,
     state: Option<ThemeState>,
 }
 
-/// The slab + free list (same shape as the sibling registries).
 #[derive(Default)]
 struct Registry {
     slots: Vec<Slot>,
     free: Vec<u32>,
 }
 
-/// Pack a slot index + generation into a `jlong` handle (generation high, index low).
 fn pack(index: u32, generation: u32) -> ThemeHandle {
     ((generation as u64) << 32 | index as u64) as i64
 }
 
-/// Unpack a `jlong` handle into (slot index, generation).
 fn unpack(handle: ThemeHandle) -> (u32, u32) {
     let bits = handle as u64;
     ((bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32)
 }
 
-/// Lock the process-global registry, mapping a poisoned mutex to the typed
-/// [`ThemeRegistryError::Poisoned`] (never a panic — AGENTS.md §2.8).
 fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, ThemeRegistryError> {
     THEMES
         .get_or_init(|| Mutex::new(Registry::default()))
@@ -135,9 +78,6 @@ fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, ThemeRegistryError
         .map_err(|_: PoisonError<_>| ThemeRegistryError::Poisoned)
 }
 
-/// Allocate a fresh theme slot and return its packed [`ThemeHandle`] (`jlong`, generation ≥ 1, never
-/// the reserved `0`). Reuses a freed slot when one is available, otherwise grows the slab. Returns
-/// [`ThemeRegistryError::Poisoned`] only on a poisoned mutex — never panics.
 pub fn allocate() -> Result<ThemeHandle, ThemeRegistryError> {
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
@@ -157,10 +97,6 @@ pub fn allocate() -> Result<ThemeHandle, ThemeRegistryError> {
     Ok(pack(index, 1))
 }
 
-/// Look up the [`ThemeState`] for a `handle` and run `f` against it (mutable) under the registry
-/// lock. Bounds-checks the slot index **and** verifies the handle's generation, so a stale/
-/// out-of-range/fabricated handle returns `Err` and never dereferences out of bounds or aliases a
-/// different theme. The reserved `0` handle fails the check (live generations are ≥ 1).
 pub fn with_theme<R>(
     handle: ThemeHandle,
     f: impl FnOnce(&mut ThemeState) -> R,
@@ -178,9 +114,6 @@ pub fn with_theme<R>(
     Ok(f(state))
 }
 
-/// Free the slot a `handle` refers to, bumping its generation so any other handle to it (or this one,
-/// reused later) is rejected as [`ThemeRegistryError::StaleHandle`]. Validates the handle the same
-/// way [`with_theme`] does, so freeing an already-freed/stale/fabricated handle returns `Err`.
 pub fn free(handle: ThemeHandle) -> Result<(), ThemeRegistryError> {
     let (index, generation) = unpack(handle);
     let mut reg = lock()?;
@@ -192,7 +125,7 @@ pub fn free(handle: ThemeHandle) -> Result<(), ThemeRegistryError> {
         return Err(ThemeRegistryError::StaleHandle);
     }
     slot.state = None;
-    // Bump (saturating) so the freed handle and any copy become stale and can never alias a reuse.
+
     slot.generation = slot.generation.saturating_add(1);
     reg.free.push(index);
     Ok(())
@@ -201,8 +134,6 @@ pub fn free(handle: ThemeHandle) -> Result<(), ThemeRegistryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // 2026-06-05: same soundness contract as the sibling registries; fully in-harness (no VM).
 
     #[test]
     fn allocate_returns_distinct_nonzero_handles() {
@@ -276,8 +207,6 @@ mod tests {
 
     #[test]
     fn attrs_map_round_trips_and_copies_independently() {
-        // 2026-06-05: the merged theme attribute map is what obtainStyledAttributes(int[]) reads;
-        // copyTheme must copy it (not just `styles`). Guard the round-trip + the copy independence.
         let src = allocate().expect("allocate src");
         with_theme(src, |t| {
             t.attrs.insert(
@@ -291,7 +220,6 @@ mod tests {
         })
         .expect("populate src");
 
-        // Read it back.
         let got = with_theme(src, |t| t.attrs.get(&0x7f01_0058).copied())
             .expect("read src")
             .expect("attr present");
@@ -304,7 +232,6 @@ mod tests {
             }
         );
 
-        // Copy into a dest theme (as copyTheme does), then mutate src and confirm dest is unaffected.
         let dest = allocate().expect("allocate dest");
         let snapshot = with_theme(src, |t| t.attrs.clone()).expect("clone src attrs");
         with_theme(dest, |t| t.attrs = snapshot).expect("write dest attrs");

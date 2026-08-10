@@ -1,28 +1,3 @@
-//! APK parsing & verification (component-map B · 🟢 pure Rust).
-//!
-//! Opens a *local* Roblox Android APK (a zip), reads the binary `AndroidManifest.xml`
-//! (package id, launcher Activity, sdk levels, `largeHeap`), enumerates the native ABIs
-//! present and locates the x86-64 engine (`lib/x86_64/libroblox.so`), extracts the native
-//! libraries to disk (for `System.loadLibrary`), and verifies file integrity with a streaming
-//! SHA-256.
-//!
-//! Network acquisition (fetch from a backend service), APK-signature (v2/v3) verification,
-//! and full ARSC/resource decoding are intentionally **deferred** — see
-//! `docs/dependency-plan.md`. This module never downloads or redistributes the APK
-//! (project policy).
-//!
-//! ## Manifest field reliability (verified 2026-06-04 against Roblox v2.724.735)
-//! `package`, the launcher activity, `android:minSdkVersion`, `android:targetSdkVersion`
-//! and `android:largeHeap` all read cleanly from the binary manifest via Eclipse's own
-//! [`axml`] reader (2026-06-04: replaced the panic-prone `axmldecoder` dependency — see
-//! [`axml`]'s module docs). `min_sdk`/`target_sdk` are exposed as `Option<u32>` because
-//! `<uses-sdk>` (or the attribute) may legitimately be absent in some APKs — we never
-//! fabricate a value. The launcher is **resolved from the manifest** (the
-//! `<activity>`/`<activity-alias>` whose `<intent-filter>` carries `action MAIN` +
-//! `category LAUNCHER`), never hardcoded: for v2.724.735 that is
-//! `com.roblox.client.startup.ActivitySplash`, *not* `ActivityNativeMain` (which has no
-//! intent-filter). Measured `largeHeap` was `false`.
-
 #![forbid(unsafe_code)]
 
 pub mod arsc;
@@ -42,27 +17,16 @@ use zip::{CompressionMethod, ZipArchive};
 
 use axml::AxmlError;
 
-/// The binary manifest entry name, fixed by the Android APK format.
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
-/// The native engine library Eclipse must run (the Roblox C++ engine).
+
 const ENGINE_LIB: &str = "libroblox.so";
-/// The ABI directory Eclipse targets (Android x86-64).
+
 const TARGET_ABI: &str = "x86_64";
-/// Upper bound on the speculative buffer pre-allocation in [`Apk::read_entry`], so an
-/// attacker-controlled uncompressed-size field cannot force a large allocation up front.
-/// Sized generously above any real manifest-class entry (8 MiB).
+
 const READ_ENTRY_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
-/// Stack buffer used to verify an already-extracted entry without allocating.
+
 const EXTRACTED_ENTRY_HASH_BUFFER_SIZE: usize = 64 * 1024;
 
-/// Return whether `path` still contains the entry represented by `size` + `crc32`.
-///
-/// Size alone is not an identity check: Roblox APK upgrades can replace a file with different
-/// bytes of the same length. Eclipse previously skipped those files, mixing the new APK's Java/
-/// engine payload with old cached native libraries and model checksums. CRC32 is the integrity
-/// value carried by the ZIP entry itself; hashing the destination through a fixed stack buffer
-/// keeps the check allocation-free. A missing destination is simply not a match; other I/O errors
-/// stay actionable instead of being hidden behind a later rewrite failure.
 fn extracted_entry_matches(path: &Path, size: u64, crc32: u32) -> io::Result<bool> {
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -85,60 +49,41 @@ fn extracted_entry_matches(path: &Path, size: u64, crc32: u32) -> io::Result<boo
     Ok(hasher.finalize() == crc32)
 }
 
-/// An opened local APK (zip container) ready for parsing.
-///
-/// Holds the buffered zip archive plus the source path (used for the streaming integrity
-/// hash, which re-reads the file rather than buffering it in memory).
 pub struct Apk {
     path: PathBuf,
     archive: ZipArchive<BufReader<File>>,
 }
 
-/// Fields read from a binary `AndroidManifest.xml`.
-///
-/// `min_sdk`/`target_sdk` are `Option` because the manifest may omit `<uses-sdk>` — an
-/// absent value is reported as `None`, never invented. `large_heap` defaults to `false`
-/// (the Android default when `android:largeHeap` is absent).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    /// Application package id (root `<manifest>` `package` attribute).
     pub package: String,
-    /// Fully-qualified launcher Activity class (resolved from the MAIN/LAUNCHER filter).
+
     pub launcher_activity: String,
-    /// `android:minSdkVersion`, if declared.
+
     pub min_sdk: Option<u32>,
-    /// `android:targetSdkVersion`, if declared.
+
     pub target_sdk: Option<u32>,
-    /// `android:largeHeap` on `<application>` (`false` when absent).
+
     pub large_heap: bool,
 }
 
-/// A native ABI directory present under `lib/` in the APK.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NativeAbi {
-    /// The ABI name (e.g. `x86_64`, `arm64-v8a`).
     pub name: String,
-    /// Whether this ABI ships the Roblox engine library (`libroblox.so`).
+
     pub has_engine: bool,
 }
 
-/// The located x86-64 engine library inside the APK.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X8664Engine {
-    /// The full zip entry path (`lib/x86_64/libroblox.so`).
     pub entry: String,
-    /// Uncompressed size in bytes.
+
     pub size: u64,
-    /// `true` when stored uncompressed — required so ART can `mmap` it directly
-    /// (2026-06-04: Roblox ships `libroblox.so` Stored for exactly this reason).
+
     pub stored: bool,
 }
 
 impl Apk {
-    /// Open a local APK file for reading.
-    ///
-    /// `std::fs::File` is `Read + Seek`, which `ZipArchive` requires; the `BufReader`
-    /// cuts syscalls during the central-directory scan.
     pub fn open(path: &Path) -> Result<Self, ApkError> {
         let file = File::open(path)?;
         let archive = ZipArchive::new(BufReader::new(file))?;
@@ -148,13 +93,6 @@ impl Apk {
         })
     }
 
-    /// Parse the binary `AndroidManifest.xml`.
-    ///
-    /// 2026-06-04: parsing is delegated to Eclipse's own [`axml`] reader, which is *total* —
-    /// it returns a typed [`AxmlError`] for every malformed/hostile manifest and never panics
-    /// (the previous `axmldecoder` dependency panicked on adversarial AXML, which aborts under
-    /// the release `panic = "abort"` profile; see [`axml`]'s module docs). The manifest entry
-    /// is read into memory first because the reader operates on a byte slice.
     pub fn manifest(&mut self) -> Result<Manifest, ApkError> {
         let bytes = self.read_entry(MANIFEST_ENTRY)?;
         let parsed = axml::read_manifest(&bytes)?;
@@ -167,12 +105,7 @@ impl Apk {
         })
     }
 
-    /// List the native ABIs present under `lib/<abi>/`, flagging which carry the engine.
-    ///
-    /// ABIs are discovered by parsing entry names (detect-don't-assume — no fixed ABI set
-    /// is assumed). `file_names()` borrows immutably, so this needs only `&self`.
     pub fn native_abis(&self) -> Vec<NativeAbi> {
-        // BTreeMap keeps the output sorted+deduped while allocating each ABI name once.
         let mut abis: BTreeMap<String, bool> = BTreeMap::new();
         for name in self.archive.file_names() {
             let Some(rest) = name.strip_prefix("lib/") else {
@@ -194,20 +127,12 @@ impl Apk {
             .collect()
     }
 
-    /// List the `.so` file names directly under `lib/<abi>/` (flat — no nested dirs), sorted.
-    ///
-    /// 2026-06-05: the engine pre-load loop ([`crate::loader::engine::load_app_native_lib`]) enumerates
-    /// the app's x86-64 JNI libs to route each through Eclipse's Rust loader before the framework
-    /// lifecycle (so `androidx.startup`'s `System.loadLibrary("zstd-jni")` finds it already loaded
-    /// instead of falling to the apkenv shim linker). `file_names()` borrows immutably (`&self`); the
-    /// result is the bare file names (e.g. `libzstd-jni-1.5.7-6.so`), not full entry paths.
     pub fn native_lib_filenames(&self, abi: &str) -> Vec<String> {
         let prefix = format!("lib/{abi}/");
         let mut names: Vec<String> = self
             .archive
             .file_names()
             .filter_map(|n| n.strip_prefix(&prefix))
-            // Only flat `.so` files directly under lib/<abi>/ (no nested-dir entries, no the dir itself).
             .filter(|rest| !rest.is_empty() && !rest.contains('/') && rest.ends_with(".so"))
             .map(str::to_owned)
             .collect();
@@ -215,10 +140,6 @@ impl Apk {
         names
     }
 
-    /// Locate the x86-64 engine library and report whether it is stored uncompressed.
-    ///
-    /// Returns [`ApkError::EngineMissing`] if `lib/x86_64/libroblox.so` is not present —
-    /// an APK without it cannot run on Eclipse's target ABI.
     pub fn x86_64_engine(&mut self) -> Result<X8664Engine, ApkError> {
         let entry = format!("lib/{TARGET_ABI}/{ENGINE_LIB}");
         let file = match self.archive.by_name(&entry) {
@@ -235,28 +156,17 @@ impl Apk {
         })
     }
 
-    /// The path this APK was opened from.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Extract the native libraries under `lib/<abi>/` to `dest_dir` (flat layout), returning
-    /// the extracted file paths.
-    ///
-    /// Roblox's manifest sets `extractNativeLibs=true`, so the engine's `.so`s must live on the
-    /// filesystem for the translation linker to load them via `java.library.path` on
-    /// `System.loadLibrary` — this is the runtime's prerequisite for reaching `onCreate`.
-    /// Streams each entry to disk (constant memory — `libroblox.so` is ~111 MB) and is
-    /// **idempotent**: an entry whose destination has the same uncompressed size and ZIP CRC32 is
-    /// skipped, so repeat boots don't re-extract ~119 MB while APK upgrades cannot retain stale
-    /// same-size libraries.
     pub fn extract_native_libs(
         &mut self,
         abi: &str,
         dest_dir: &Path,
     ) -> Result<Vec<PathBuf>, ApkError> {
         let prefix = format!("lib/{abi}/");
-        // Collect matching entry names first (immutable borrow), then extract (mutable borrow).
+
         let names: Vec<String> = self
             .archive
             .file_names()
@@ -266,19 +176,15 @@ impl Apk {
         std::fs::create_dir_all(dest_dir)?;
         let mut extracted = Vec::with_capacity(names.len());
         for name in names {
-            // Entries are lib/<abi>/<base>.so (no nested dirs expected); flatten to the basename.
             let base = name.rsplit('/').next().unwrap_or(name.as_str());
             let dest = dest_dir.join(base);
             let mut entry = self.archive.by_name(&name)?;
-            // 2026-07-17: size alone let a different, same-size library from an older APK survive
-            // an upgrade. Match both ZIP integrity fields against the cached file instead.
+
             if extracted_entry_matches(&dest, entry.size(), entry.crc32())? {
                 extracted.push(dest);
                 continue;
             }
-            // 2026-06-04: write to a temp sibling, fsync, then rename into place. A kill mid-copy
-            // of the 111 MB libroblox.so leaves only a `.partial` file (never a same-size-but-
-            // corrupt dest the skip above would accept and System.loadLibrary would then load).
+
             let tmp = dest_dir.join(format!("{base}.partial"));
             let mut out = File::create(&tmp)?;
             io::copy(&mut entry, &mut out)?;
@@ -290,30 +196,9 @@ impl Apk {
         Ok(extracted)
     }
 
-    /// Extract the bundled `assets/` tree to `dest_dir`, preserving sub-paths, returning the
-    /// number of files written this call.
-    ///
-    /// 2026-06-13: the Roblox engine reads its shader packs (and fonts/content) from the
-    /// FILESYSTEM under its content root (`app_data_dir/files/assets/shaders/shaders_*.pack`),
-    /// not through the JNI `AssetManager` path — so the APK's `assets/` tree (~105 MB) must be
-    /// materialised on disk before the engine's `SurfaceController` opens the shader pack
-    /// (`Mode 4 failed: Error opening shader pack` → `RenderView is NULL` otherwise). Mirrors
-    /// [`Self::extract_native_libs`]: collect matching entry names under the `assets/` prefix
-    /// (immutable borrow), then stream each to disk (mutable borrow) — constant memory. Each
-    /// entry's destination is `dest_dir.join(<path-without-the-assets/-prefix>)`, so
-    /// `assets/shaders/x.pack` lands at `dest_dir/shaders/x.pack`. Directory entries (names
-    /// ending in `/`) are skipped — parent dirs are created from the file entries. Path safety:
-    /// every entry is validated via the `zip` crate's [`enclosed_name`](zip::read::ZipFile::enclosed_name)
-    /// (rejects NUL bytes, `..` traversal, and absolute paths — the recommended safe-extraction
-    /// check; verified 2026-06-13 via Context7 against zip 2.x); an entry that fails it is skipped,
-    /// never extracted outside `dest_dir`. **Idempotent**: an entry whose destination matches the
-    /// ZIP entry's uncompressed size and CRC32 is skipped (so repeat boots don't rewrite ~105 MB,
-    /// while an APK upgrade replaces changed same-size assets).
     pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError> {
         const PREFIX: &str = "assets/";
-        // Collect matching entry names first (immutable borrow), then extract (mutable borrow) —
-        // the same two-phase borrow as `extract_native_libs`. Directory entries (trailing `/`) are
-        // excluded here; parent dirs are created per-file below.
+
         let names: Vec<String> = self
             .archive
             .file_names()
@@ -324,10 +209,7 @@ impl Apk {
         let mut written = 0usize;
         for name in names {
             let mut entry = self.archive.by_name(&name)?;
-            // Safe path: `enclosed_name` rejects NUL bytes, `..` traversal, and absolute names, so
-            // the result stays inside the archive's namespace; strip the leading `assets/`
-            // component to map `assets/shaders/x.pack` → `shaders/x.pack` under `dest_dir`. An
-            // unsafe/empty entry is skipped (never written outside `dest_dir`).
+
             let Some(safe) = entry.enclosed_name() else {
                 continue;
             };
@@ -338,19 +220,15 @@ impl Apk {
                 continue;
             }
             let dest = dest_dir.join(rel);
-            // 2026-07-17: an APK upgrade changed Roblox's 128-byte UniversalApp checksum without
-            // changing its length. Size-only reuse kept the old checksum beside the new model.
+
             if extracted_entry_matches(&dest, entry.size(), entry.crc32())? {
                 continue;
             }
-            // Create parent dirs (the assets/ tree is nested, unlike the flat lib/<abi>/ layout).
+
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Write to a temp sibling, fsync, then rename into place (same atomicity as
-            // `extract_native_libs`): a kill mid-copy leaves only a `.partial` file, never a
-            // same-size-but-corrupt dest the idempotency skip above would later accept. The temp
-            // sibling lives in the same parent dir (created above), so the rename is intra-dir.
+
             let file_name = dest.file_name().unwrap_or(rel.as_os_str());
             let tmp = dest.with_file_name(format!("{}.partial", file_name.to_string_lossy()));
             let mut out = File::create(&tmp)?;
@@ -363,14 +241,6 @@ impl Apk {
         Ok(written)
     }
 
-    /// Read a named zip entry fully into memory.
-    ///
-    /// 2026-06-05: `pub` so Eclipse's own (non-GTK) AssetManager XML backing can read a binary-XML
-    /// asset (e.g. `AndroidManifest.xml`) straight from the APK zip to parse via
-    /// [`axml::parse_document`], replacing the no-op `openXmlAssetNative` stub. Returns
-    /// [`ApkError::EntryMissing`] when the named entry is absent (the framework maps that to the
-    /// Java `FileNotFoundException` its asset API expects), and the speculative-allocation cap still
-    /// applies (an untrusted uncompressed-size field cannot force a large up-front allocation).
     pub fn read_entry(&mut self, name: &str) -> Result<Vec<u8>, ApkError> {
         let mut entry = match self.archive.by_name(name) {
             Ok(e) => e,
@@ -379,35 +249,17 @@ impl Apk {
             }
             Err(e) => return Err(ApkError::Zip(e)),
         };
-        // Android Roblox normally paints its own white keyboard/mouse pointer. In Eclipse's desktop
-        // system-cursor mode, keep every APK existence/error semantic above but substitute a valid
-        // transparent image for the narrow standard-cursor allowlist. This one byte-read seam covers
-        // both Java AssetManager and NDK AAssetManager consumers; the filesystem content-root path is
-        // handled by `system_cursor::install` after extraction.
+
         if let Some(replacement) = crate::system_cursor::replacement_apk_entry(name) {
             return Ok(replacement.to_vec());
         }
-        // size() is the uncompressed length from the (untrusted) central directory; cap the
-        // speculative pre-allocation so a hostile entry declaring a huge size can't trigger a
-        // large allocation before any bytes are read. The Vec still grows if the real data is
-        // larger; manifest-class entries are well under this bound (2026-06-04).
+
         let cap = entry.size().min(READ_ENTRY_PREALLOC_CAP) as usize;
         let mut buf = Vec::with_capacity(cap);
         entry.read_to_end(&mut buf)?;
         Ok(buf)
     }
 
-    /// Locate a named zip entry's raw byte span inside the APK **file itself**: the offset of its
-    /// data (past the local file header), its uncompressed size, and whether it is Stored.
-    ///
-    /// 2026-06-12: the general accessor behind `AssetManager.openAssetFd` — an asset served by
-    /// file descriptor is `(fd-of-the-APK, data_start, length)`, which is only meaningful for a
-    /// **Stored** entry (the bytes at `data_start` ARE the asset; a Deflated entry's raw bytes are
-    /// compressed, and AOSP's own `openAssetFd` refuses compressed assets). Generalizes the
-    /// engine-lib-only `stored` flag of [`Self::x86_64_engine`]. `data_start` comes from the local
-    /// header (the zip crate parses it when the entry is opened), so it is exact for this file.
-    /// Returns [`ApkError::EntryMissing`] when the entry is absent (the framework maps that to the
-    /// Java `FileNotFoundException` its asset API expects).
     pub fn entry_span(&mut self, name: &str) -> Result<EntrySpan, ApkError> {
         let entry = match self.archive.by_name(name) {
             Ok(e) => e,
@@ -424,26 +276,15 @@ impl Apk {
     }
 }
 
-/// A named zip entry's raw byte span inside the APK file (see [`Apk::entry_span`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntrySpan {
-    /// Byte offset of the entry's data in the APK file (just past its local file header).
     pub data_start: u64,
-    /// Uncompressed length in bytes. For a Stored entry this is also the raw byte count at
-    /// `data_start`.
+
     pub uncompressed_size: u64,
-    /// `true` when stored uncompressed — the precondition for serving the entry by `(fd, offset,
-    /// length)` straight from the APK file.
+
     pub stored: bool,
 }
 
-/// Verify a file's integrity against an expected SHA-256 digest (lowercase hex).
-///
-/// The comparison is case-insensitive (callers may pass an upper- or mixed-case digest).
-/// Hashing streams the file through `io::copy` in fixed chunks, so memory stays constant
-/// regardless of the APK size (~215 MB for Roblox). Returns
-/// [`ApkError::InvalidDigest`] if `expected_hex` is not 64 hex characters, and
-/// [`ApkError::Integrity`] on a mismatch.
 pub fn verify_integrity(path: &Path, expected_hex: &str) -> Result<(), ApkError> {
     if expected_hex.len() != 64 || !expected_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ApkError::InvalidDigest(expected_hex.to_owned()));
@@ -459,47 +300,34 @@ pub fn verify_integrity(path: &Path, expected_hex: &str) -> Result<(), ApkError>
     }
 }
 
-/// Stream a file through SHA-256 and return the lowercase-hex digest.
 fn sha256_hex(path: &Path) -> Result<String, ApkError> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    // io::copy streams the file through the hasher (Sha256: io::Write via sha2's `std`
-    // feature); it never loads the whole file into memory.
+
     io::copy(&mut file, &mut hasher)?;
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for byte in digest {
-        // Writing a formatted byte into a String is infallible.
         let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
 }
 
-/// Errors from opening, parsing, or verifying an APK.
 #[derive(Debug)]
 pub enum ApkError {
-    /// Opening or reading the APK file failed.
     Io(io::Error),
-    /// The zip container could not be read.
+
     Zip(zip::result::ZipError),
-    /// The binary `AndroidManifest.xml` could not be parsed. Carries Eclipse's own typed
-    /// [`AxmlError`] (2026-06-04: the reader is total — every malformed/hostile manifest,
-    /// including the missing-`<manifest>`/`package`/launcher cases, is an [`AxmlError`]
-    /// variant, never a panic).
+
     Axml(AxmlError),
-    /// A required zip entry was absent.
+
     EntryMissing(String),
-    /// The x86-64 engine library (`lib/x86_64/libroblox.so`) was absent.
+
     EngineMissing,
-    /// The expected digest was not a 64-character hex string.
+
     InvalidDigest(String),
-    /// The file's SHA-256 did not match the expected digest.
-    Integrity {
-        /// The expected digest (lowercase hex).
-        expected: String,
-        /// The computed digest (lowercase hex).
-        actual: String,
-    },
+
+    Integrity { expected: String, actual: String },
 }
 
 impl fmt::Display for ApkError {
@@ -567,33 +395,14 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
-    /// A minimal, checked-in binary `AndroidManifest.xml` (see `tests/fixtures/README.md`
-    /// for provenance), so the manifest tests need no APK and no network. The bytes encode:
-    /// package=com.example.app, `<uses-sdk>` min=26 target=35,
-    /// `<application android:largeHeap="true">`, and a launcher activity `.SplashActivity`
-    /// reached via a MAIN/LAUNCHER intent-filter, plus a second activity (`.MainActivity`)
-    /// with no filter (negative case for the launcher resolver).
     const FIXTURE_MANIFEST: &[u8] = include_bytes!("../../tests/fixtures/AndroidManifest-min.bin");
 
-    /// A structurally valid AXML whose single attribute carried an invalid resource
-    /// value-type byte that made the old `axmldecoder` 0.3 dependency *panic* (not `Err`).
-    /// 2026-06-04: it is the root-cause regression input — Eclipse's own [`axml`] reader must
-    /// return a typed `ApkError::Axml(..)` for it instead of panicking/aborting.
     const FIXTURE_PANIC: &[u8] = include_bytes!("../../tests/fixtures/AndroidManifest-panic.bin");
 
-    /// A valid AXML manifest with no `<uses-sdk>` and no `android:largeHeap` (see
-    /// `tests/fixtures/README.md`), to pin the documented defaults: `min_sdk`/`target_sdk`
-    /// are `None` (never fabricated) and `large_heap` is `false` when those are absent.
     const FIXTURE_ABSENT: &[u8] = include_bytes!("../../tests/fixtures/AndroidManifest-absent.bin");
 
-    /// The same logical manifest as [`FIXTURE_MANIFEST`] but with a **UTF-16** string pool
-    /// (UTF8_FLAG cleared), so the `decode_utf16` path — the one the *real* Roblox manifest
-    /// uses — is exercised on both good input (here) and adversarial input (the totality
-    /// fuzz). The other fixtures use a UTF-8 pool, so without this the production decoder
-    /// would never be driven by the regression guard (2026-06-04).
     const FIXTURE_UTF16: &[u8] = include_bytes!("../../tests/fixtures/AndroidManifest-utf16.bin");
 
-    /// Build an in-memory APK (zip) containing the given entries (name, bytes), all Stored.
     fn build_apk(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let methoded: Vec<(&str, &[u8], CompressionMethod)> = entries
             .iter()
@@ -602,9 +411,6 @@ mod tests {
         build_apk_methods(&methoded)
     }
 
-    /// Build an in-memory APK with a per-entry compression method. Lets tests exercise both
-    /// the real APK's mix (Deflated AndroidManifest.xml, Stored libroblox.so) and the Stored
-    /// path that `build_apk` covers.
     fn build_apk_methods(entries: &[(&str, &[u8], CompressionMethod)]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, bytes, method) in entries {
@@ -615,9 +421,7 @@ mod tests {
         writer.finish().expect("finish").into_inner()
     }
 
-    /// Write bytes to a unique temp file and return its path (caller removes it).
     fn temp_file(tag: &str, bytes: &[u8]) -> PathBuf {
-        // Unique per call via tag + thread id, under the OS temp dir (no hardcoded path).
         let mut path = std::env::temp_dir();
         path.push(format!(
             "eclipse-apk-test-{tag}-{:?}.tmp",
@@ -641,7 +445,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(manifest.package, "com.example.app");
-        // Launcher is resolved from the MAIN/LAUNCHER filter, not the first activity.
+
         assert_eq!(manifest.launcher_activity, ".SplashActivity");
         assert_eq!(manifest.min_sdk, Some(26));
         assert_eq!(manifest.target_sdk, Some(35));
@@ -650,9 +454,6 @@ mod tests {
 
     #[test]
     fn manifest_defaults_when_uses_sdk_and_large_heap_absent() {
-        // Guards the documented contract: absent <uses-sdk> => sdk None (never fabricated),
-        // absent android:largeHeap => large_heap false. The real Roblox manifest measured
-        // large_heap == false, so this is the production-relevant case.
         let bytes = build_apk(&[(MANIFEST_ENTRY, FIXTURE_ABSENT)]);
         let (mut apk, path) = open_apk(&bytes, "manifest-absent");
         let manifest = apk.manifest().expect("parse manifest");
@@ -667,9 +468,6 @@ mod tests {
 
     #[test]
     fn manifest_reads_deflate_compressed_entry() {
-        // Regression guard: the real Roblox AndroidManifest.xml is Deflate-compressed (only
-        // libroblox.so is Stored). With the zip crate's `deflate` feature disabled this fails
-        // with ZipError::UnsupportedArchive; this test pins that the feature stays enabled.
         let bytes = build_apk_methods(&[(
             MANIFEST_ENTRY,
             FIXTURE_MANIFEST,
@@ -684,7 +482,6 @@ mod tests {
 
     #[test]
     fn manifest_missing_entry_is_typed_error() {
-        // An APK with no AndroidManifest.xml must surface EntryMissing, not panic.
         let bytes = build_apk(&[("lib/x86_64/libroblox.so", b"stub")]);
         let (mut apk, path) = open_apk(&bytes, "nomanifest");
         let err = apk.manifest().expect_err("should be missing");
@@ -697,7 +494,6 @@ mod tests {
 
     #[test]
     fn garbage_manifest_is_typed_error() {
-        // Non-AXML bytes are rejected by the reader as a typed ApkError::Axml(_), not a panic.
         let bytes = build_apk(&[(MANIFEST_ENTRY, b"this is not binary xml at all")]);
         let (mut apk, path) = open_apk(&bytes, "garbage");
         let err = apk.manifest().expect_err("garbage must fail");
@@ -707,12 +503,6 @@ mod tests {
 
     #[test]
     fn panic_fixture_returns_typed_error_not_panic() {
-        // ROOT-CAUSE regression guard (2026-06-04): this exact fixture made the old
-        // axmldecoder 0.3 dependency *panic* internally (invalid resource value-type byte),
-        // which aborts the process under the release `panic = "abort"` profile. Eclipse's own
-        // total reader must instead return a typed ApkError::Axml(..) — proving the root cause
-        // (a library that panics on hostile AXML) is fixed. The test reaching this assertion
-        // at all (rather than the harness reporting a panic) is the proof of totality.
         let bytes = build_apk(&[(MANIFEST_ENTRY, FIXTURE_PANIC)]);
         let (mut apk, path) = open_apk(&bytes, "panic");
         let err = apk
@@ -724,25 +514,12 @@ mod tests {
 
     #[test]
     fn reader_is_total_under_truncation_and_mutation() {
-        // TOTALITY guard for the confirmed root cause (a parser that panics on malformed AXML
-        // aborts under panic=abort). Starting from a known-good manifest, this exhaustively:
-        //   (a) truncates it at *every* length 0..=len, and
-        //   (b) flips bytes at a strided set of offsets to 0x00 / 0x7F / 0xFF,
-        // and calls the reader on each input, requiring it to return a Result (Ok or Err)
-        // without panicking. Because the test process completes, every one of these thousands
-        // of adversarial inputs was handled without a panic — that is the operational meaning
-        // of "total" for a #[forbid(unsafe_code)] reader: no input drives it to abort.
-        // Drive BOTH string-pool encodings: the UTF-8 fixture and the UTF-16 fixture (the
-        // encoding the real Roblox manifest uses), so the decode_utf16 path is fuzzed too.
         for base in [FIXTURE_MANIFEST, FIXTURE_UTF16] {
-            // (a) Truncation at every prefix length.
             for len in 0..=base.len() {
-                // Must not panic; we only require *a* Result, not a particular variant.
                 let _ = axml::read_manifest(&base[..len]);
             }
 
-            // (b) Byte mutation across a stride, each over three boundary values.
-            let stride = 7; // coprime-ish with struct sizes so it hits varied fields cheaply
+            let stride = 7;
             for off in (0..base.len()).step_by(stride) {
                 for &val in &[0x00u8, 0x7F, 0xFF] {
                     let mut buf = base.to_vec();
@@ -755,13 +532,9 @@ mod tests {
 
     #[test]
     fn parse_document_walks_manifest_events_and_attributes() {
-        // Regression guard tied to the asset-XML root cause (2026-06-05): the general event walk
-        // axml::parse_document must actually parse a real binary manifest into START_TAG events with
-        // resolved tag names + attributes — this is what backs the framework's openXmlAssetNative /
-        // XmlBlock parser natives. Drive BOTH string-pool encodings (UTF-8 + the real-Roblox UTF-16).
         for base in [FIXTURE_MANIFEST, FIXTURE_UTF16] {
             let doc = axml::parse_document(base).expect("parse_document on a valid manifest");
-            // The root <manifest> must appear as a start-tag with a `package` attribute.
+
             let manifest_el = doc
                 .elements
                 .iter()
@@ -773,14 +546,14 @@ mod tests {
                 .find(|a| a.name.as_deref() == Some("package"))
                 .expect("package attribute present");
             assert_eq!(pkg.value_string.as_deref(), Some("com.example.app"));
-            // The launcher <activity> tag is reached as a start-tag event.
+
             assert!(
                 doc.elements
                     .iter()
                     .any(|e| e.name.as_deref() == Some("activity")),
                 "activity element must appear in the event walk"
             );
-            // Events must be balanced: equal number of start- and end-tags (the manifest is well-formed).
+
             let starts = doc
                 .events
                 .iter()
@@ -804,18 +577,12 @@ mod tests {
 
     #[test]
     fn parse_document_is_total_on_garbage() {
-        // Totality: non-AXML bytes are a typed AxmlError, never a panic (same guarantee as
-        // read_manifest — both go through the bounds-checked chunk/string-pool readers).
         assert!(axml::parse_document(b"not binary xml at all").is_err());
         assert!(axml::parse_document(&[]).is_err());
     }
 
     #[test]
     fn manifest_parses_utf16_string_pool() {
-        // The real Roblox manifest uses a UTF-16 string pool (aapt2/bundletool), which drives
-        // axml::decode_utf16 — a path the UTF-8 fixtures never reach. FIXTURE_UTF16 is the same
-        // logical manifest as FIXTURE_MANIFEST with UTF8_FLAG cleared, so it must parse to the
-        // identical fields.
         let utf16 = build_apk(&[(MANIFEST_ENTRY, FIXTURE_UTF16)]);
         let (mut apk16, p16) = open_apk(&utf16, "manifest-utf16");
         let m16 = apk16.manifest().expect("parse utf16 manifest");
@@ -827,8 +594,6 @@ mod tests {
         assert_eq!(m16.target_sdk, Some(35));
         assert!(m16.large_heap);
 
-        // Cross-check: the UTF-16 and UTF-8 encodings of the same logical manifest must yield
-        // identical results — proves the decoder, not just the fixture.
         let utf8 = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST)]);
         let (mut apk8, p8) = open_apk(&utf8, "manifest-utf8-xcheck");
         let m8 = apk8.manifest().expect("parse utf8 manifest");
@@ -842,7 +607,6 @@ mod tests {
             ("lib/x86_64/libroblox.so", b"engine"),
             ("lib/arm64-v8a/libroblox.so", b"engine"),
             ("lib/x86_64/libother.so", b"other"),
-            // armeabi-v7a ships a native lib but NOT the engine (has_engine false branch).
             ("lib/armeabi-v7a/libfoo.so", b"foo"),
             ("classes.dex", b"dex"),
         ]);
@@ -851,8 +615,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let names: Vec<&str> = abis.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["arm64-v8a", "armeabi-v7a", "x86_64"]); // sorted, deduped
-                                                                       // Both flag states are pinned: engine ABIs true, the engine-less one false.
+        assert_eq!(names, vec!["arm64-v8a", "armeabi-v7a", "x86_64"]);
+
         assert!(abis.iter().find(|a| a.name == "x86_64").unwrap().has_engine);
         assert!(
             abis.iter()
@@ -871,15 +635,13 @@ mod tests {
 
     #[test]
     fn native_lib_filenames_lists_flat_so_files_for_the_abi_sorted() {
-        // The engine pre-load loop enumerates lib/x86_64/*.so. Pin: only flat `.so` files under the
-        // requested ABI, bare file names, sorted, deduped of the dir entry / wrong ABI / non-.so / nested.
         let bytes = build_apk(&[
             ("lib/x86_64/libroblox.so", b"engine"),
             ("lib/x86_64/libzstd-jni-1.5.7-6.so", b"zstd"),
             ("lib/x86_64/libeigen_blas.so", b"blas"),
-            ("lib/x86_64/notashared.txt", b"txt"), // non-.so under the ABI: excluded
-            ("lib/x86_64/nested/deep.so", b"nested"), // nested dir: excluded (flat only)
-            ("lib/arm64-v8a/libroblox.so", b"arm"), // wrong ABI: excluded
+            ("lib/x86_64/notashared.txt", b"txt"),
+            ("lib/x86_64/nested/deep.so", b"nested"),
+            ("lib/arm64-v8a/libroblox.so", b"arm"),
             ("classes.dex", b"dex"),
         ]);
         let (apk, path) = open_apk(&bytes, "lib-filenames");
@@ -893,7 +655,7 @@ mod tests {
                 "libzstd-jni-1.5.7-6.so".to_string(),
             ]
         );
-        // A pure-Java APK (no lib/<abi>/) yields an empty list — the gate that skips the pre-load loop.
+
         let java_only = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST), ("classes.dex", b"dex")]);
         let (apk2, p2) = open_apk(&java_only, "lib-filenames-empty");
         assert!(apk2.native_lib_filenames("x86_64").is_empty());
@@ -902,12 +664,11 @@ mod tests {
 
     #[test]
     fn native_abis_negative_case_no_x86_64() {
-        // Negative case: an arm-only APK has no x86_64 ABI and no x86_64 engine.
         let bytes = build_apk(&[("lib/arm64-v8a/libroblox.so", b"engine")]);
         let (mut apk, path) = open_apk(&bytes, "armonly");
         let abis = apk.native_abis();
         assert!(!abis.iter().any(|a| a.name == TARGET_ABI));
-        // And the engine lookup reports it missing, as a typed error.
+
         let err = apk.x86_64_engine().expect_err("no x86_64 engine");
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, ApkError::EngineMissing), "got {err:?}");
@@ -922,14 +683,11 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(engine.entry, "lib/x86_64/libroblox.so");
         assert_eq!(engine.size, payload.len() as u64);
-        assert!(engine.stored); // fixture writes Stored
+        assert!(engine.stored);
     }
 
     #[test]
     fn x86_64_engine_reports_not_stored_when_deflated() {
-        // Guards the mmap-readiness invariant in the other direction: a Deflated engine must
-        // report stored == false (ART cannot mmap it), while size still reports the
-        // uncompressed length. Without this, an inverted comparison would pass the suite.
         let payload = b"libroblox-engine-bytes-deflated";
         let bytes = build_apk_methods(&[(
             "lib/x86_64/libroblox.so",
@@ -945,11 +703,6 @@ mod tests {
 
     #[test]
     fn entry_span_reports_stored_offset_size_and_rejects_absent() {
-        // 2026-06-12: the fd-serving contract behind AssetManager.openAssetFd — for a Stored
-        // entry the bytes at data_start..data_start+uncompressed_size in the APK FILE are exactly
-        // the asset bytes (assert by slicing the zip image); a Deflated entry reports
-        // stored == false (the fd path must refuse it, like AOSP's openAssetFd); an absent entry
-        // is the typed EntryMissing (→ the Java FileNotFoundException profileinstaller catches).
         const PAYLOAD: &[u8] = b"profile-bytes-0123456789";
         let bytes = build_apk_methods(&[
             (
@@ -993,8 +746,8 @@ mod tests {
         let bytes = build_apk(&[
             ("lib/x86_64/libroblox.so", b"ENGINE-BYTES"),
             ("lib/x86_64/libother.so", b"OTHER"),
-            ("lib/arm64-v8a/libfoo.so", b"ARM-ONLY"), // wrong ABI: must NOT be extracted
-            ("classes.dex", b"dex"),                  // non-.so: must NOT be extracted
+            ("lib/arm64-v8a/libfoo.so", b"ARM-ONLY"),
+            ("classes.dex", b"dex"),
         ]);
         let (mut apk, apk_path) = open_apk(&bytes, "extract");
         let dir = std::env::temp_dir().join(format!(
@@ -1023,7 +776,6 @@ mod tests {
             "non-.so must not extract"
         );
 
-        // Idempotent: a second call returns the same set (skipping CRC-matching files).
         let again = apk.extract_native_libs("x86_64", &dir).expect("re-extract");
         assert_eq!(again.len(), 2);
 
@@ -1033,9 +785,6 @@ mod tests {
 
     #[test]
     fn extract_native_libs_replaces_a_changed_same_size_entry_after_an_apk_upgrade() {
-        // 2026-07-17 root-cause guard: the 2.724 and 2.730 APKs carried different
-        // libyuv_shared.so bytes with the same uncompressed size. The old size-only skip left the
-        // 2.724 library beside the 2.730 Java/engine payload. Model that exact cross-APK shape.
         let old_bytes = build_apk(&[("lib/x86_64/libsame.so", b"OLD-LIB")]);
         let new_bytes = build_apk(&[("lib/x86_64/libsame.so", b"NEW-LIB")]);
         assert_eq!(b"OLD-LIB".len(), b"NEW-LIB".len());
@@ -1066,17 +815,11 @@ mod tests {
 
     #[test]
     fn extract_assets_strips_prefix_preserves_subpaths_skips_non_assets_and_is_idempotent() {
-        // 2026-06-13: regression guard for the shader-pack render blocker. The engine reads its
-        // shader packs from the filesystem under `files/assets/shaders/…`; this proves the APK's
-        // `assets/` tree extracts to that content root with the `assets/` prefix stripped and
-        // sub-paths preserved, that NON-asset entries (e.g. lib/<abi>/*.so) are skipped, and that a
-        // second extract is idempotent (0 files written, no error) — so repeat boots don't rewrite
-        // ~105 MB.
         let bytes = build_apk(&[
             ("assets/shaders/shaders_glsles3.pack", b"GLSLES3-PACK"),
             ("assets/baz.txt", b"BAZ"),
-            ("lib/x86_64/libroblox.so", b"ENGINE"), // non-asset: must NOT be extracted
-            ("classes.dex", b"dex"),                // non-asset: must NOT be extracted
+            ("lib/x86_64/libroblox.so", b"ENGINE"),
+            ("classes.dex", b"dex"),
         ]);
         let (mut apk, apk_path) = open_apk(&bytes, "extract-assets");
         let dir = std::env::temp_dir().join(format!(
@@ -1102,7 +845,6 @@ mod tests {
             "non-asset entry must not be extracted"
         );
 
-        // Idempotent: a second extract rewrites nothing (every destination matches size + CRC32).
         let again = apk.extract_assets(&dir).expect("re-extract assets");
         assert_eq!(again, 0, "idempotent re-extract writes 0 files");
 
@@ -1112,9 +854,6 @@ mod tests {
 
     #[test]
     fn extract_assets_replaces_a_changed_same_size_entry_after_an_apk_upgrade() {
-        // 2026-07-17 root-cause guard: 2.730's UniversalApp model was extracted, but its
-        // 128-byte checksum had the same length as 2.724's and was skipped. The resulting mixed
-        // model/checksum state coincided with an engine-to-Java challenge schema mismatch.
         let old_bytes = build_apk(&[(
             "assets/ExtraContent/models/UniversalApp/UniversalApp_checksum",
             b"OLD-CHECKSUM",
@@ -1152,7 +891,6 @@ mod tests {
 
     #[test]
     fn verify_integrity_matches_correct_digest() {
-        // SHA-256 of "abc" (RFC test vector) — a fixed, machine-independent regression guard.
         let path = temp_file("sha-ok", b"abc");
         let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         let result = verify_integrity(&path, expected);
@@ -1189,21 +927,19 @@ mod tests {
 
     #[test]
     fn open_missing_file_is_io_error() {
-        // A non-existent path must surface a typed ApkError::Io, never panic.
         let mut path = std::env::temp_dir();
         path.push(format!(
             "eclipse-apk-test-nonexistent-{:?}.tmp",
             std::thread::current().id()
         ));
-        std::fs::remove_file(&path).ok(); // ensure it does not exist
-                                          // Apk has no Debug impl (it holds a ZipArchive), so inspect the Err via .err().
+        std::fs::remove_file(&path).ok();
+
         let err = Apk::open(&path).err().expect("missing file must fail");
         assert!(matches!(err, ApkError::Io(_)), "got {err:?}");
     }
 
     #[test]
     fn open_non_zip_file_is_zip_error() {
-        // A real file that is not a zip must surface a typed ApkError::Zip, never panic.
         let path = temp_file("notzip", b"this is plainly not a zip archive");
         let err = Apk::open(&path).err().expect("non-zip must fail");
         std::fs::remove_file(&path).ok();
@@ -1213,26 +949,14 @@ mod tests {
     #[test]
     fn verify_integrity_rejects_malformed_expected() {
         let path = temp_file("sha-malformed", b"abc");
-        // Too short and non-hex must be rejected before hashing.
+
         let err = verify_integrity(&path, "not-a-digest").expect_err("must reject");
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, ApkError::InvalidDigest(_)), "got {err:?}");
     }
 
-    // === Adversarial robustness pass (2026-06-05) ==========================================
-    // The zip-container parsing itself is delegated to the `zip` 2.x crate, which returns typed
-    // `ZipError` (InvalidArchive/UnsupportedArchive/Io) for malformed archives and bounds reads
-    // with `take(compressed_size)` + an early `uncompressed_size` decompression limit (verified
-    // 2026-06-05 via Context7 against zip 2.4.2). What Eclipse OWNS here and these tests guard:
-    //   (1) every malformed/truncated/missing input surfaces a typed `ApkError`, never a panic;
-    //   (2) the `READ_ENTRY_PREALLOC_CAP` keeps a hostile uncompressed-size field from forcing a
-    //       gigabyte up-front allocation, while still reading the entry's true bytes.
-
     #[test]
     fn open_truncated_zip_at_every_boundary_is_typed_error_never_panic() {
-        // Build a real multi-entry APK, then truncate it at every prefix length. Each truncation is
-        // fed to Apk::open: it must return a typed ApkError (Zip/Io) or — if enough of the central
-        // directory survived — Ok, but NEVER panic. The loop completing is the totality proof.
         let bytes = build_apk(&[
             (MANIFEST_ENTRY, FIXTURE_MANIFEST),
             ("lib/x86_64/libroblox.so", b"engine-bytes-payload"),
@@ -1240,8 +964,7 @@ mod tests {
         ]);
         for len in 0..=bytes.len() {
             let path = temp_file(&format!("trunc-{len}"), &bytes[..len]);
-            // Whatever the verdict, it must be a Result, not a panic. On Ok, also drive read_entry
-            // (still total) so a truncated-but-openable archive's entry read can't panic either.
+
             if let Ok(mut apk) = Apk::open(&path) {
                 let _ = apk.read_entry(MANIFEST_ENTRY);
                 let _ = apk.x86_64_engine();
@@ -1253,13 +976,11 @@ mod tests {
 
     #[test]
     fn open_corrupted_central_directory_is_typed_zip_error() {
-        // Flip bytes across the tail of a valid APK (where the central directory + end-of-CD record
-        // live). Each mutation must yield a typed ApkError (or Ok), never a panic.
         let bytes = build_apk(&[
             (MANIFEST_ENTRY, FIXTURE_MANIFEST),
             ("classes.dex", b"dex-bytes"),
         ]);
-        // The EOCD/central directory is in the last ~128 bytes; stride through them.
+
         let start = bytes.len().saturating_sub(128);
         for off in (start..bytes.len()).step_by(3) {
             for &val in &[0x00u8, 0xFF] {
@@ -1276,13 +997,8 @@ mod tests {
 
     #[test]
     fn read_entry_prealloc_cap_bounds_upfront_allocation() {
-        // Regression guard for the documented hostile-uncompressed-size defense: the speculative
-        // Vec::with_capacity in read_entry is capped at READ_ENTRY_PREALLOC_CAP, so an attacker's
-        // size field cannot drive a gigabyte up-front allocation. Pin the cap is sane (≤ 8 MiB,
-        // well under any OOM threshold) and that the cap math (size.min(cap)) is what bounds it.
         assert_eq!(READ_ENTRY_PREALLOC_CAP, 8 * 1024 * 1024);
-        // For a real small entry, capacity == its true size (cap doesn't shrink real reads), and
-        // the bytes read back are exactly the entry's content (cap never truncates data).
+
         let payload: &[u8] = b"a-small-manifest-class-entry";
         let cap = (payload.len() as u64).min(READ_ENTRY_PREALLOC_CAP) as usize;
         assert_eq!(cap, payload.len(), "small entry: cap is the true size");
@@ -1295,8 +1011,6 @@ mod tests {
 
     #[test]
     fn read_entry_missing_is_typed_error_not_panic() {
-        // A read of an absent entry is EntryMissing, never a panic (the framework maps this to
-        // FileNotFoundException).
         let bytes = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST)]);
         let (mut apk, path) = open_apk(&bytes, "read-missing");
         let err = apk
@@ -1311,13 +1025,9 @@ mod tests {
 
     #[test]
     fn read_entry_deflated_is_bounded_and_roundtrips() {
-        // A Deflate-compressed, highly-repetitive entry (compresses tiny, expands to its declared
-        // uncompressed size): the zip crate's take(compressed_size) + uncompressed-size limit keeps
-        // the read bounded (no OOM), and the bytes must round-trip exactly — proving the decompress
-        // path is enforced by the declared size, not driven unbounded by the stream.
-        let payload = vec![0x41u8; 256 * 1024]; // 256 KiB of 'A' → compresses to a few hundred bytes
+        let payload = vec![0x41u8; 256 * 1024];
         let bytes = build_apk_methods(&[("big.bin", &payload, CompressionMethod::Deflated)]);
-        // The container itself is far smaller than the uncompressed payload (compression worked).
+
         assert!(
             bytes.len() < payload.len() / 2,
             "repetitive payload should compress well in the fixture"
@@ -1335,7 +1045,6 @@ mod tests {
 
     #[test]
     fn empty_file_open_is_typed_error() {
-        // A zero-byte file (no zip structure at all) must be a typed error, never a panic.
         let path = temp_file("empty", b"");
         let err = Apk::open(&path).err().expect("empty file must fail");
         std::fs::remove_file(&path).ok();

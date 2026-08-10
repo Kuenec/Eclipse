@@ -1,23 +1,23 @@
-//! `eclipse-webview-drive` — the dev-host M2 verify driver AND the reference consumer
-//! implementation of the spawn contract (`src/webview/mod.rs`) + the wire protocol
-//! (negotiated at `shared::PROTO_VERSION` — v3 since the 2026-07-17 durable-cookie extension).
-//!
-//! 2026-07-03: spawns the helper per the contract (socketpair end dup2'd to fd 3,
-//! `--ipc-fd=3`, `PR_SET_PDEATHSIG(SIGTERM)`, no URL in argv), completes the handshake,
-//! creates one 1024x768 view, loads https://www.roblox.com, observes `LoadState` 0→3 over
-//! the socket, receives the `FrameBufferNew` + `SCM_RIGHTS` memfd, maps it via the shared
-//! `shm` guard, runs a distinct-pixel census on a published frame (must be > 1),
-//! sends a MouseMove/MouseClick smoke, round-trips `CookieGet`→`CookieList`,
-//! `CloseView`→`ViewClosed`, `Shutdown`, reaps the child, and scans /proc for orphans —
-//! then prints the deterministic `ECLIPSE_WEBVIEW_M2_DRIVE_SUCCESS` marker (or an honest
-//! `ECLIPSE_WEBVIEW_M2_DRIVE_FAILURE reason=...`; no retries-until-green).
-//!
-//! Run with `LD_LIBRARY_PATH` including the libcef.so dir (the helper links it); a display
-//! session (Wayland or X11) is required. NOT part of `cargo test`; NOT `cargo run -- run`.
 
-// 2026-07-03: the shared src/webview/* surface is compiled per binary; the drive uses the
-// consumer-role halves (decode HelperMsg, recv fd, map) — the helper-role halves are
-// intentionally unused HERE and exercised by this crate's own `cargo test`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #[allow(dead_code)]
 #[path = "../shared.rs"]
 mod shared;
@@ -36,13 +36,13 @@ const VIEW: i64 = 1;
 const WIDTH: u16 = 1024;
 const HEIGHT: u16 = 768;
 const TARGET_URL: &str = "https://www.roblox.com";
-/// Safe to log: scheme+host only (matches the redaction contract by construction).
+
 const TARGET_FOR_LOG: &str = "https://www.roblox.com";
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 const LOAD_START_DEADLINE: Duration = Duration::from_secs(30);
 const LOAD_FINISH_DEADLINE: Duration = Duration::from_secs(90);
-/// After load-finished: sample published frames until ink appears (fonts/images settle).
+
 const INK_DEADLINE: Duration = Duration::from_secs(20);
 const COOKIE_DEADLINE: Duration = Duration::from_secs(10);
 const CLOSE_DEADLINE: Duration = Duration::from_secs(15);
@@ -52,7 +52,7 @@ fn now_ms(start: Instant) -> u128 {
     start.elapsed().as_millis()
 }
 
-/// The mapped frame buffer of the CURRENT generation.
+
 struct Buffer {
     mapping: shm::FrameMapping,
     generation: u32,
@@ -100,8 +100,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Resolve the helper binary: `$ECLIPSE_WEBVIEW_HELPER`, else the sibling `eclipse-webview`
-/// next to this executable (the spawn-contract resolution rule; no hardcoded paths).
+
+
 fn resolve_helper() -> Result<std::path::PathBuf, String> {
     if let Ok(explicit) = std::env::var("ECLIPSE_WEBVIEW_HELPER") {
         let p = std::path::PathBuf::from(explicit);
@@ -160,12 +160,12 @@ fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child, TempProf
     cmd.arg("--ipc-fd=3");
     let profile = TempProfile::create()?;
     cmd.env("ECLIPSE_WEBVIEW_DATA_DIR", &profile.root);
-    // Forward an explicit ozone override if the drive was given one (contract flag).
+
     if let Some(ozone) = std::env::args().find(|a| a.starts_with("--ozone-platform=")) {
         cmd.arg(ozone);
     }
-    // 2026-07-10 (plan M5): forward the sandbox-degradation opt-in (spawn contract §3 —
-    // reference-consumer parity with the main-process client's config-gated flag).
+
+
     if std::env::args().any(|a| a == "--allow-unsandboxed") {
         cmd.arg("--allow-unsandboxed");
     }
@@ -173,11 +173,11 @@ fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child, TempProf
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| e.to_string())?;
-    // SAFETY (pre_exec runs between fork and exec — async-signal-safe calls only):
-    // - dup2 moves the socketpair end onto fd 3 (the spawn contract); dup2 does not copy
-    //   FD_CLOEXEC, so fd 3 survives exec. If the fd already IS 3, F_SETFD clears CLOEXEC.
-    // - prctl(PR_SET_PDEATHSIG, SIGTERM) is the orphan-prevention secondary layer; it fires
-    //   when the spawning THREAD exits, so the drive spawns from its stable main thread.
+
+
+
+
+
     unsafe {
         use std::os::fd::AsRawFd;
         let raw = child_fd.as_raw_fd();
@@ -212,10 +212,10 @@ impl Drive {
         Ok(())
     }
 
-    /// Read the next helper message with an absolute deadline. Handles the cross-cutting
-    /// messages every phase must tolerate: `Console` (counted; text is structurally absent),
-    /// `Crash` (fatal), `FrameBufferNew` (remap — receives the fd immediately, per the
-    /// sentinel adjacency rule). Everything else is returned to the caller.
+
+
+
+
     fn next_msg(&mut self, deadline: Instant) -> DResult<HelperMsg> {
         loop {
             let remaining = deadline
@@ -263,12 +263,12 @@ impl Drive {
                          {width}x{height} stride={stride} slot_bytes={slot_bytes} slots={slot_count}",
                         now_ms(self.start)
                     );
-                    // The sentinel + SCM_RIGHTS memfd is the very next unread byte.
+
                     let fd = fdpass::recv_fd_after_sentinel(&self.stream)
                         .map_err(|e| DriveError::Fail(format!("fd receive failed: {e}")))?;
                     let expected = slot_bytes as usize * usize::from(slot_count);
-                    // The previous generation's mapping (if any) is unmapped on replace —
-                    // this reader is single-threaded, so no read can be in progress.
+
+
                     let mapping = shm::map_frame_buffer(fd.as_fd(), expected)
                         .map_err(|e| DriveError::Fail(format!("memfd map rejected: {e}")))?;
                     self.buffer = Some(Buffer {
@@ -282,7 +282,7 @@ impl Drive {
         }
     }
 
-    /// Census a published slot: distinct BGRA pixel values.
+
     fn census(&self, generation: u32, slot: u8) -> DResult<usize> {
         let Some(buf) = self.buffer.as_ref() else {
             return fail("frame ready before any frame buffer");
@@ -327,7 +327,7 @@ fn run() -> DResult<String> {
 
     let result = run_protocol(&mut drive);
 
-    // Backstop: whatever happened, never leave the helper running.
+
     let exit_status = reap(&mut drive, result.is_ok())?;
     let orphans = orphan_scan(&drive.helper_path);
 
@@ -350,7 +350,7 @@ fn run() -> DResult<String> {
 fn run_protocol(d: &mut Drive) -> DResult<String> {
     let start = d.start;
 
-    // ---- Handshake. ----
+
     d.send(&ConsumerMsg::Hello {
         version: shared::PROTO_VERSION,
     })?;
@@ -368,14 +368,14 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
     };
     println!("[{} ms] hello-ack engine={engine}", now_ms(start));
 
-    // ---- CreateView (the FrameBufferNew + fd arrives via next_msg's handler). ----
+
     d.send(&ConsumerMsg::CreateView {
         view: VIEW,
         width: WIDTH,
         height: HEIGHT,
     })?;
 
-    // ---- LoadUrl (the URL crosses the wire, never argv; logged scheme+host only). ----
+
     d.send(&ConsumerMsg::LoadUrl {
         view: VIEW,
         url: TARGET_URL.to_string(),
@@ -385,7 +385,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         now_ms(start)
     );
 
-    // ---- LoadState 0 then 3; ack every FrameReady on the way. ----
+
     let mut load_started_ms: Option<u128> = None;
     let mut load_finished: Option<(u128, i32)> = None;
     let started_deadline = Instant::now() + LOAD_START_DEADLINE;
@@ -406,7 +406,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                     "[{} ms] load-state state={state} http_status={http_status} target={TARGET_FOR_LOG}",
                     now_ms(start)
                 );
-                // Decode validated state ∈ {0, 3}.
+
                 if state == 0 {
                     if load_started_ms.is_none() {
                         load_started_ms = Some(now_ms(start));
@@ -421,7 +421,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                 slot: _,
                 seq,
             } if view == VIEW => {
-                // Keep the publish/ack flow moving; census comes after load-finished.
+
                 if d.buffer
                     .as_ref()
                     .is_some_and(|b| b.generation == generation)
@@ -441,7 +441,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
     };
     let (finished_ms, http_status) = load_finished.unwrap_or((0, 0));
 
-    // ---- Frame ink: sample published frames until distinct pixels > 1. ----
+
     let ink_deadline = Instant::now() + INK_DEADLINE;
     let census = loop {
         match d.next_msg(ink_deadline)? {
@@ -455,8 +455,8 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                 if stale {
                     continue;
                 }
-                // Read the slot BETWEEN FrameReady and our FrameAck (the no-torn-frame
-                // window), then release it.
+
+
                 let count = d.census(generation, slot)?;
                 d.ack(generation, seq)?;
                 if count > 1 {
@@ -479,7 +479,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         }
     };
 
-    // ---- Input smoke: a MouseMove and a full left click at the view center. ----
+
     d.send(&ConsumerMsg::MouseMove {
         view: VIEW,
         x: i32::from(WIDTH) / 2,
@@ -500,7 +500,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
     }
     println!("[{} ms] input smoke sent (move + click)", now_ms(start));
 
-    // ---- CookieGet → CookieList round-trip (correlated by request_id). ----
+
     const COOKIE_REQ: u32 = 7;
     d.send(&ConsumerMsg::CookieGet {
         request_id: COOKIE_REQ,
@@ -518,7 +518,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                         "cookie list correlation mismatch: got request_id={request_id}"
                     ));
                 }
-                // Names/domains only in the log — never cookie values.
+
                 for c in &cookies {
                     println!(
                         "[{} ms] cookie name={} domain={} secure={} http_only={}",
@@ -556,7 +556,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         now_ms(start)
     );
 
-    // ---- CloseView → ViewClosed. ----
+
     d.send(&ConsumerMsg::CloseView { view: VIEW })?;
     let close_deadline = Instant::now() + CLOSE_DEADLINE;
     loop {
@@ -584,7 +584,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
     }
     println!("[{} ms] view-closed", now_ms(start));
 
-    // ---- Shutdown (the reap happens in run()). ----
+
     d.send(&ConsumerMsg::Shutdown)?;
 
     Ok(format!(
@@ -612,8 +612,8 @@ fn name_of(msg: &HelperMsg) -> &'static str {
     }
 }
 
-/// Wait for the child to exit (after `Shutdown` on the success path); on the failure path or
-/// a hung child, kill it. Returns the exit code if it exited by itself.
+
+
 fn reap(d: &mut Drive, expect_clean: bool) -> DResult<Option<i32>> {
     let deadline = Instant::now() + EXIT_DEADLINE;
     if expect_clean {
@@ -629,7 +629,7 @@ fn reap(d: &mut Drive, expect_clean: bool) -> DResult<Option<i32>> {
             now_ms(d.start)
         );
     }
-    // Failure path (or hung child): kill + reap — never leave the helper running.
+
     let _ = d.child.kill();
     match d.child.wait() {
         Ok(status) => Ok(status.code()),
@@ -637,12 +637,12 @@ fn reap(d: &mut Drive, expect_clean: bool) -> DResult<Option<i32>> {
     }
 }
 
-/// Scan /proc for any surviving process whose argv[0] is the helper binary (CEF children
-/// re-exec the same binary). The drive's own pid/path never matches (different basename).
+
+
 fn orphan_scan(helper: &std::path::Path) -> usize {
     let helper = helper.to_string_lossy();
     let mut count = 0usize;
-    // A freshly killed tree can take a moment to unwind: settle briefly, then scan once.
+
     std::thread::sleep(Duration::from_millis(500));
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return 0;

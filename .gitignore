@@ -1,32 +1,32 @@
-# Rust
+
 /target/
-# Sub-crate build dirs (e.g. crates/libm-shim/target/ when built standalone) — 2026-06-05
+
 **/target/
 **/*.rs.bk
-# 2026-07-10 (web-engine plan M5): tools/webview-dist/package-webview.sh's default OUT — the
-# assembled shippable payload (~350 MB of built binaries + CEF runtime), never committed.
+
+
 /dist/
 
-# Vendored runtime build artifacts (ART/ATL — large, built/pinned in CI, never committed)
+
 /vendor/
 /build/
 
-# Roblox APKs must never be committed (we do not redistribute Roblox)
+
 *.apk
 *.apks
 *.xapk
 
-# M0 / diagnostic outputs
+
 *.log
 /m0-artifacts/
 framework-worklist.txt
 
-# Workflow/agent internals — worktrees and harness state, never committed (2026-06-05)
+
 .claude/
-# Local scratch examples (ad-hoc dump/probe binaries, not part of the crate) (2026-06-05)
+
 /examples/
 
-# Editor / OS
+
 .idea/
 .vscode/
 *.swp

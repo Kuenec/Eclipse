@@ -1,47 +1,3 @@
-//! Pure-Rust PT_LOAD segment mapper + base relocator — the loader's third piece.
-//!
-//! 2026-06-05: [`elf`](super::elf) decodes a `.so`'s bytes; [`reloc`](super::reloc) applies
-//! relocations over a [`reloc::RelocImage`]. This module is the step between them: it **maps** a
-//! parsed [`ElfImage`]'s `PT_LOAD` segments into one contiguous anonymous region (forming the
-//! [`reloc::RelocImage`] the applier writes through), applies the base-only relocations
-//! (`R_X86_64_RELATIVE` + `DT_RELR`), and `mprotect`s each segment to its final permissions.
-//!
-//! ## What it does (and the strict boundary of what it does NOT)
-//! - **MAP:** reserve `max(vaddr+memsz) - min(vaddr)` (page-rounded) anonymous bytes
-//!   `PROT_NONE`/`MAP_PRIVATE` to claim a contiguous range + get a load base; copy each segment's
-//!   `p_filesz` file bytes to `base + vaddr`; the `[filesz, memsz)` bss tail is already zero
-//!   (fresh anonymous pages). One big reservation (not per-segment `mmap`) makes the standard ELF
-//!   page-overlap — a segment's final partial page shared with the next segment's first page —
-//!   correct by construction: bytes are placed by vaddr into the single region.
-//! - **RELOCATE (base-only):** with the region writable, apply via [`reloc`] ONLY the relocations
-//!   that need just the load base: `R_X86_64_RELATIVE` (from `.rela.dyn`) and `DT_RELR`. Then
-//!   `mprotect` each segment to its `p_flags` (`PF_R/W/X` → `PROT_READ/WRITE/EXEC`).
-//! - **SYMBOL RELOCATIONS (step 5) — [`MappedObject::relocate_symbols`]:** a follow-on pass applies
-//!   `R_X86_64_JUMP_SLOT` / `GLOB_DAT` / `R_X86_64_64` through a [`Scope`]
-//!   ([`reloc::SymbolResolver`]); [`MappedObject::map_and_relocate_with_scope`] does both passes in
-//!   one call. They reference dynamic symbols, so the caller supplies the resolution scope.
-//! - **STATIC-TLS RELOCATIONS (step 4) — [`MappedObject::relocate_tls`]:** a follow-on pass applies
-//!   `R_X86_64_TPOFF64` through a [`TlsLayout`] ([`super::tls`]) + a [`TlsResolver`]. It writes the
-//!   variant-II tp-relative offset (`-offset_i + st_value`) the static-TLS symbol resolves to. The
-//!   computed offsets are correct per the psABI; **binding the assembled TLS block to a live thread
-//!   pointer (`%fs`/TCB) is a separate integration step** (see `tls.rs` / AGENTS.md §5) — this pass
-//!   does the offset math + application, not runtime `%fs` reachability.
-//! - **DEFERRED — still not attempted here (documented why):**
-//!   - `R_X86_64_IRELATIVE` needs **executing** the library's ifunc resolver functions — explicitly
-//!     out of scope; this module **never executes, jumps into, or runs init functions** of the
-//!     mapped object. It maps + relocates + verifies only.
-//!
-//! ## Safety
-//! Unlike `reloc.rs`/`elf.rs` (`#![forbid(unsafe_code)]`), this module performs the raw
-//! `mmap`/`mprotect`/`munmap` syscalls (via `rustix::mm`) and writes through the returned pointer,
-//! so `unsafe` is unavoidable and is confined here (AGENTS.md §2.3). Every `unsafe` block carries a
-//! `// SAFETY:` comment justifying the pointer/length/alignment invariant it relies on. The mapped
-//! region is exposed to the relocation pass as a safe `&mut [u8]` ([`MappedObject::image_bytes`]),
-//! so the relocation arithmetic itself stays in the bounds-checked, `unsafe`-free `reloc` core.
-//!
-//! ## RAII
-//! [`MappedObject`] owns the mapping and `munmap`s the whole reserved span on `Drop` — no leak.
-
 use std::ptr::NonNull;
 
 use rustix::mm::{
@@ -53,26 +9,18 @@ use super::reloc::{self, RelocError, RelocImage, SymbolResolver};
 use super::resolve::{Scope, ScopedResolver};
 use super::tls::{TlsLayout, TlsResolver};
 
-/// Errors from mapping or base-relocating a parsed ELF image.
 #[derive(Debug)]
 pub enum MapError {
-    /// The image declared no `PT_LOAD` segments — nothing to map.
     NoLoadSegments,
-    /// The page-rounded total span overflowed `usize`, or a segment's vaddr/memsz/filesz arithmetic
-    /// overflowed. Carries a short static description of the offending computation.
+
     SpanOverflow(&'static str),
-    /// A segment's `p_filesz` bytes are not present in the file slice `[file_offset, +file_size)`.
-    /// Carries the segment's `file_offset`.
+
     SegmentOutOfFile(u64),
-    /// A `PT_LOAD` segment's `p_filesz` exceeds its `p_memsz`. This violates the ELF invariant
-    /// that the in-memory image of a segment is at least as large as its file image; a hostile
-    /// object can use it to make `populate_segment`'s `filesz`-sized copy overrun the `memsz`-sized
-    /// writable page range into an adjacent not-yet-writable (`PROT_NONE`) segment, faulting.
-    /// Carries `(file_size, mem_size)`. 2026-06-05.
+
     FileSizeExceedsMemSize(u64, u64),
-    /// The underlying `mmap`/`mprotect`/`munmap` syscall failed. Carries the OS error.
+
     Os(rustix::io::Errno),
-    /// A relocation failed (out of bounds / unsupported). Carries the [`RelocError`].
+
     Reloc(RelocError),
 }
 
@@ -104,105 +52,72 @@ impl From<RelocError> for MapError {
     }
 }
 
-/// x86-64 `R_X86_64_IRELATIVE` (type 37): an ifunc relocation whose value is produced by
-/// **executing** the library's resolver function — explicitly out of scope for this map/relocate
-/// core (nothing is executed). Counted as deferred by [`MappedObject::relocate_symbols`].
 const R_X86_64_IRELATIVE: u32 = 37;
 
-/// Counts from a successful [`MappedObject::map_and_relocate`], for verification/reporting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MapStats {
-    /// Number of `PT_LOAD` segments mapped.
     pub segments_mapped: usize,
-    /// Number of `R_X86_64_RELATIVE` relocations applied (from `.rela.dyn`/`.rela.plt`).
+
     pub relative_applied: usize,
-    /// Number of `DT_RELR`-encoded relative relocations applied.
+
     pub relr_applied: usize,
-    /// Number of relocations skipped (deferred) by type — JUMP_SLOT/GLOB_DAT/64/TPOFF64/IRELATIVE
-    /// and any other non-base type, which need the symbol resolver / static-TLS block / ifunc
-    /// execution (out of scope for this map+base-relocate step).
+
     pub skipped_by_type: usize,
 }
 
-/// Counts from a [`MappedObject::relocate_symbols`] pass, for verification/reporting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SymbolRelocStats {
-    /// Number of `R_X86_64_GLOB_DAT` relocations applied (GOT entries → symbol addresses).
     pub glob_dat_applied: usize,
-    /// Number of `R_X86_64_JUMP_SLOT` relocations applied (PLT entries → symbol addresses; eager
-    /// under `BIND_NOW`).
+
     pub jump_slot_applied: usize,
-    /// Number of `R_X86_64_64` relocations applied (`sym + addend`).
+
     pub abs64_applied: usize,
-    /// Number of symbol relocations that resolved to a **non-null** address (a real definition).
-    /// The remainder (`total_symbol - resolved_nonnull`) are weak-undef → 0, which is legal.
+
     pub resolved_nonnull: usize,
-    /// Number of relocations deferred (not applied) by this pass: `R_X86_64_TPOFF64` (needs the
-    /// static-TLS block + `%fs`/TCB) and `R_X86_64_IRELATIVE` (needs executing ifunc resolvers),
-    /// plus any other non-symbol type already handled by the base pass.
+
     pub deferred: usize,
 }
 
 impl SymbolRelocStats {
-    /// Total symbol-dependent relocations applied in this pass.
     pub fn total_applied(&self) -> usize {
         self.glob_dat_applied + self.jump_slot_applied + self.abs64_applied
     }
 }
 
-/// Counts from a [`MappedObject::relocate_tls`] pass, for verification/reporting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TlsRelocStats {
-    /// Number of `R_X86_64_TPOFF64` relocations applied (static-TLS tp-relative offsets written).
     pub tpoff64_applied: usize,
-    /// Number of relocations still deferred after this pass: only `R_X86_64_IRELATIVE` (needs
-    /// **executing** the library's ifunc resolvers — explicitly out of scope; nothing is executed).
+
     pub deferred: usize,
 }
 
-/// Counts from a [`MappedObject::relocate_symbols_partial`] pass — the **bionic-env baseline**
-/// partial GOT/PLT fill. Unlike [`MappedObject::relocate_symbols`] (all-or-nothing: it aborts on the
-/// first unresolved-strong symbol), this pass applies **only** the symbol relocations the scope
-/// resolves and records the rest, never aborting and never fabricating an address.
-///
-/// 2026-06-05 — HONEST: a resolved address here is a **host** (glibc/host-GL) address, a
-/// relocation-pipeline baseline, NOT bionic-ABI-correct execution (see `bionic_env.rs`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartialSymbolStats {
-    /// Symbol relocations (`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`) applied with a **non-null** resolved
-    /// address (the meaningful host-baseline GOT/PLT fill).
     pub applied_nonnull: usize,
-    /// Symbol relocations applied as a **weak-undef → 0** (legal per the psABI; the slot is 0).
+
     pub applied_weak_zero: usize,
-    /// Symbol relocations **left unapplied** because the referenced **strong** symbol did not resolve
-    /// in the scope (recorded in [`Self::unresolved`], the Eclipse-bionic-native work-list — never
-    /// fabricated, no GOT write).
+
     pub unresolved_strong: usize,
-    /// `R_X86_64_TPOFF64` + `R_X86_64_IRELATIVE` counted as deferred (this pass owns neither).
+
     pub deferred: usize,
-    /// The names of the unresolved **strong** symbols (sorted, de-duped), the work-list this object
-    /// still needs Eclipse-owned bionic natives for.
+
     pub unresolved: Vec<String>,
 }
 
 impl PartialSymbolStats {
-    /// Total symbol relocations applied (non-null + weak-zero) by this partial pass.
     pub fn total_applied(&self) -> usize {
         self.applied_nonnull + self.applied_weak_zero
     }
 }
 
-/// Round `addr` down to the start of its page.
 fn page_floor(addr: u64, page: u64) -> u64 {
     addr & !(page - 1)
 }
 
-/// Round `addr` up to the next page boundary. Returns `None` on overflow.
 fn page_ceil(addr: u64, page: u64) -> Option<u64> {
     addr.checked_add(page - 1).map(|a| a & !(page - 1))
 }
 
-/// `p_flags` (`PF_R/W/X`) → `rustix` [`ProtFlags`] for the relocated, final protection.
 fn prot_of(flags: u32) -> ProtFlags {
     let mut p = ProtFlags::empty();
     if flags & PF_R != 0 {
@@ -217,40 +132,20 @@ fn prot_of(flags: u32) -> ProtFlags {
     p
 }
 
-/// A library image mapped into one contiguous anonymous region, owning the mapping for RAII.
-///
-/// The whole reserved span is `munmap`ped on [`Drop`]. While alive, [`MappedObject::image_bytes`]
-/// hands the relocation pass a safe `&mut [u8]` over the region, and [`MappedObject::load_base`]
-/// gives the run-time load address relocations are computed against.
 pub struct MappedObject {
-    /// Page-aligned start of the reserved anonymous region (the load base for relocations: the
-    /// image's lowest `p_vaddr` is page-floored to 0, so `base + vaddr` is the run-time address).
     base: NonNull<u8>,
-    /// Total page-rounded length of the reserved region (the `munmap` length).
+
     span: usize,
-    /// Module static-TLS tp-relative base offset, forwarded to the [`RelocImage`]. Unused by the
-    /// base-only relocations applied here (TPOFF64 is deferred) — kept 0 until the static-TLS step.
+
     static_tls_offset: i64,
-    /// Page-floored lowest `PT_LOAD` vaddr (image-vaddr space; 0 for a PIE). The reserved region's
-    /// address corresponds to this vaddr, so a vaddr's region-relative byte offset is
-    /// `vaddr - region_start`. Stored at map time so [`Self::apply_relro`] need not re-derive it.
+
     region_start: u64,
 }
 
-// SAFETY: 2026-06-05 — `MappedObject` owns an exclusive mmap'd region (created `MAP_PRIVATE`, never
-// shared with another owner). The raw pointer is just the region's address; there is no interior
-// thread-affinity. Sending/sharing it across threads is as sound as sending a `Box<[u8]>`: all
-// access goes through `&self`/`&mut self`, which Rust's borrow rules already serialize.
 unsafe impl Send for MappedObject {}
 unsafe impl Sync for MappedObject {}
 
 impl MappedObject {
-    /// Map the parsed image's `PT_LOAD` segments and apply the base-only relocations.
-    ///
-    /// `file` is the same byte slice [`ElfImage::parse`] decoded (the segment file bytes are copied
-    /// from it). `page_size` is the host page size (use [`host_page_size`]). On success the region
-    /// is mapped, RELATIVE+RELR are applied, and each segment is `mprotect`ed to its final
-    /// `p_flags`. Symbol/TLS/ifunc relocations are counted as `skipped_by_type` and deferred.
     pub fn map_and_relocate(
         img: &ElfImage<'_>,
         file: &[u8],
@@ -260,17 +155,9 @@ impl MappedObject {
             return Err(MapError::NoLoadSegments);
         }
 
-        // 1) Compute the total vaddr span: [min(vaddr) page-floored, max(vaddr+memsz) page-ceiled).
-        // PIE objects start at vaddr 0, but compute min explicitly so a non-zero-based image (or one
-        // with a gap before the first segment) still maps correctly.
         let min_vaddr = img.loads.iter().map(|s| s.vaddr).min().expect("non-empty");
         let mut max_end: u64 = 0;
         for s in &img.loads {
-            // 2026-06-05: reject p_filesz > p_memsz BEFORE mapping. The copy in `populate_segment`
-            // is `filesz`-sized but only the `memsz`-sized page range is made writable; a hostile
-            // segment whose `filesz` overruns its `memsz` into a later (not-yet-writable) segment's
-            // pages would fault the copy. Enforcing the ELF invariant here turns that into a typed
-            // error before any byte is mapped or written.
             if s.file_size > s.mem_size {
                 return Err(MapError::FileSizeExceedsMemSize(s.file_size, s.mem_size));
             }
@@ -292,14 +179,6 @@ impl MappedObject {
             return Err(MapError::NoLoadSegments);
         }
 
-        // 2) Reserve the whole span as one PROT_NONE anonymous mapping to claim a contiguous range
-        // and obtain the load base. Mapping the entire object in one reservation makes the standard
-        // ELF page-overlap (a segment's final partial page shared with the next segment's start)
-        // correct by construction — bytes are placed by vaddr into this single region.
-        // SAFETY: 2026-06-05 — `mmap_anonymous(NULL, span, …)` with a non-zero `span` lets the kernel
-        // choose a fresh, page-aligned address for a private anonymous region. NULL addr means "no
-        // fixed placement", so no existing mapping can be clobbered. `span` is the page-rounded byte
-        // length computed above (> 0). The returned address owns `span` bytes for this object's life.
         let ptr = unsafe {
             mmap_anonymous(
                 std::ptr::null_mut(),
@@ -309,24 +188,14 @@ impl MappedObject {
             )
         }
         .map_err(MapError::Os)?;
-        // The kernel returns a page-aligned, non-null address on success.
+
         let base = NonNull::new(ptr.cast::<u8>()).ok_or(MapError::Os(rustix::io::Errno::NOMEM))?;
 
-        // Large anonymously-mapped engine images have a broad instruction working set. Opt in to
-        // transparent huge pages before segment `mprotect` splits the reservation into permission
-        // VMAs: on kernels configured with THP=`madvise`, this avoids millions of iTLB/dTLB misses
-        // without requiring reserved hugetlb pages. It is only a performance hint, so unsupported
-        // kernels/filesystems retain ordinary 4 KiB pages rather than failing the ELF load.
         const HUGE_PAGE_THRESHOLD: usize = 2 * 1024 * 1024;
         if span >= HUGE_PAGE_THRESHOLD {
-            // SAFETY: `ptr..ptr+span` is the live mapping returned immediately above. `madvise`
-            // changes only the kernel's paging policy and neither reads nor writes through `ptr`.
             let _ = unsafe { madvise(ptr, span, Advice::LinuxHugepage) };
         }
 
-        // The reserved region's address corresponds to `region_start` in image-vaddr space. The
-        // load base used by relocations (`base + vaddr` = run-time address) is therefore
-        // `mapping_addr - region_start`. For a PIE (region_start == 0) this is just the mapping addr.
         let load_base = (base.as_ptr() as u64).wrapping_sub(region_start);
 
         let mut obj = MappedObject {
@@ -336,15 +205,10 @@ impl MappedObject {
             region_start,
         };
 
-        // 3) For each PT_LOAD: make its pages writable, copy filesz file bytes to base+vaddr (the
-        // bss tail [filesz, memsz) is already zero from the fresh anonymous pages). Protections are
-        // set to final values in step 5 after relocation.
         for seg in &img.loads {
             obj.populate_segment(file, seg, region_start, page_size)?;
         }
 
-        // 4) Apply base-only relocations over a writable view of the whole region. RELATIVE (from
-        // .rela.dyn/.rela.plt) and DT_RELR need only the load base; everything else is deferred.
         let relas = img
             .relocations()
             .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
@@ -357,7 +221,6 @@ impl MappedObject {
             ..Default::default()
         };
 
-        // Partition .rela entries: apply only RELATIVE here; count the rest as deferred.
         let mut relative: Vec<reloc::Rela> = Vec::new();
         for r in &relas {
             if r.r_type == reloc::R_X86_64_RELATIVE {
@@ -367,16 +230,9 @@ impl MappedObject {
             }
         }
         stats.relative_applied = relative.len();
-        // DT_RELR words encode a variable number of relocations; count the expansion (address words
-        // + set bitmap bits) for the report via a small wrapper mirroring `apply_relr`'s decoding.
+
         stats.relr_applied = count_relr_targets(&relr);
 
-        // 2026-06-05: `DT_RELR` ADDRESS words are in-object virtual addresses (image base 0), but
-        // `reloc::apply_relr` (matching its `.rela` sibling, which rebases internally) expects the
-        // address words to be RUN-TIME addresses (`load_base + vaddr`). Rebase each EVEN (address)
-        // word by `load_base`; ODD (bitmap) words are bit-flags, not addresses, and pass through
-        // unchanged. This keeps the `reloc` core's "address words are run-time addresses" contract
-        // (`reloc.rs` unchanged) and is the correct file→runtime boundary for the table.
         let relr_runtime: Vec<u64> = relr
             .iter()
             .map(|&w| {
@@ -391,20 +247,13 @@ impl MappedObject {
         {
             let base_addr = load_base;
             let tls_off = obj.static_tls_offset;
-            // SAFETY: 2026-06-05 — `image_bytes` exposes the mapping as `&mut [u8]` of exactly `span`
-            // bytes (see its SAFETY). The region's pages were made writable in step 3
-            // (`populate_segment` upgrades each to RW before copying; final protection is set in
-            // step 5). The reloc core only writes within `[0, span)`, all bounds-checked.
+
             let bytes = unsafe { obj.image_bytes() };
             let mut image = reloc::SliceImage::new(base_addr, tls_off, bytes);
             reloc::apply_rela(&mut image, &NullResolver, &relative)?;
             reloc::apply_relr(&mut image, &relr_runtime)?;
         }
 
-        // 5) Set each segment's final protection from p_flags (page-rounded). RELRO is left at its
-        // segment's RW/R flags here; the read-only-after-reloc hardening of PT_GNU_RELRO is a
-        // separate later step (it overlaps a segment and must run after all relocations of a full
-        // dependency graph). For map+base-relocate verification, segment p_flags are sufficient.
         for seg in &img.loads {
             obj.protect_segment(seg, region_start, page_size)?;
         }
@@ -412,26 +261,6 @@ impl MappedObject {
         Ok((obj, stats))
     }
 
-    /// Apply the **symbol-dependent** relocations through a resolution [`Scope`], the step
-    /// [`Self::map_and_relocate`] deferred. Resolves `R_X86_64_GLOB_DAT` / `R_X86_64_JUMP_SLOT`
-    /// (eager — `BIND_NOW`) / `R_X86_64_64` for `img`'s `.rela.dyn` + `.rela.plt`, writing each
-    /// resolved symbol address into its GOT/PLT slot via the [`reloc`] core.
-    ///
-    /// `img` must be the same parsed image [`Self::map_and_relocate`] mapped (its `dynsyms` index
-    /// the relocations' `sym_index`es, and its `relocations()` name the slots). `scope` is the
-    /// ordered provider scope (typically a [`super::resolve::LoadedObjectProvider`] of this object
-    /// followed by a [`super::resolve::HostDlsymProvider`]); build it with this object's
-    /// [`Self::load_base`] + `img.dynsyms`.
-    ///
-    /// `R_X86_64_TPOFF64` (static-TLS) and `R_X86_64_IRELATIVE` (ifunc) are **counted as deferred**
-    /// by *this* pass: `TPOFF64` is applied by the separate [`Self::relocate_tls`] pass (it needs a
-    /// [`TlsLayout`]), and ifunc needs executing resolvers (out of scope). `R_X86_64_RELATIVE`/
-    /// `DT_RELR` were already applied by the base pass.
-    ///
-    /// The relocation targets (GOT/PLT) sit in writable or RELRO-but-still-RW segments, which
-    /// `map_and_relocate` left writable (RELRO hardening is a later step). This pass makes every
-    /// segment writable, applies, then restores each segment's final `p_flags` protection — so a
-    /// GOT slot in a nominally read-only-after-reloc region is still patchable here.
     pub fn relocate_symbols(
         &mut self,
         img: &ElfImage<'_>,
@@ -446,8 +275,6 @@ impl MappedObject {
             .ok_or(MapError::NoLoadSegments)?;
         let region_start = page_floor(min_vaddr, page_size);
 
-        // Partition the relocations: apply only the symbol-address types; count TPOFF64/IRELATIVE
-        // (and any leftover non-symbol type) as deferred.
         let relas = img
             .relocations()
             .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
@@ -468,8 +295,7 @@ impl MappedObject {
                     symbol_relas.push(*r);
                 }
                 reloc::R_X86_64_TPOFF64 | R_X86_64_IRELATIVE => stats.deferred += 1,
-                // RELATIVE / DT_RELR were applied by the base pass; anything else is not a symbol
-                // reloc this pass owns. Don't double-count base types as deferred.
+
                 _ => {}
             }
         }
@@ -478,7 +304,6 @@ impl MappedObject {
         let load_base = self.load_base().wrapping_sub(region_start);
         let tls_off = self.static_tls_offset;
 
-        // Make every segment writable for the patch, apply, then restore final protections.
         for seg in &img.loads {
             self.mprotect_segment_pages(
                 seg,
@@ -489,13 +314,10 @@ impl MappedObject {
         }
 
         let resolved_nonnull = {
-            // SAFETY: 2026-06-05 — every segment was just made RW above; `image_bytes` exposes the
-            // mapping as `&mut [u8]` of exactly `span` bytes (see its SAFETY); the reloc core only
-            // writes within `[0, span)`, all bounds-checked.
             let bytes = unsafe { self.image_bytes() };
             let mut image = reloc::SliceImage::new(load_base, tls_off, bytes);
             reloc::apply_rela(&mut image, &resolver, &symbol_relas)?;
-            // Count how many slots now hold a non-null address (a real definition; weak-undef = 0).
+
             let mut nonnull = 0usize;
             for r in &symbol_relas {
                 let off = usize::try_from(r.offset)
@@ -508,7 +330,6 @@ impl MappedObject {
         };
         stats.resolved_nonnull = resolved_nonnull;
 
-        // Restore each segment's final protection (the post-reloc state map_and_relocate set).
         for seg in &img.loads {
             self.protect_segment(seg, region_start, page_size)?;
         }
@@ -516,22 +337,6 @@ impl MappedObject {
         Ok(stats)
     }
 
-    /// **Partial** symbol-relocation pass (the bionic-env BASELINE): apply only the symbol
-    /// relocations (`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`) whose referenced symbol `scope` resolves,
-    /// and **record** the rest — never abort, never fabricate.
-    ///
-    /// 2026-06-05 — This differs from [`Self::relocate_symbols`] (all-or-nothing: it runs
-    /// [`reloc::apply_rela`] over every symbol reloc and aborts on the first unresolved-strong one).
-    /// For the engine's first bionic-env cut, the host can resolve only a *subset* of the 584 UND
-    /// imports; the rest need Eclipse-owned bionic natives (`bionic_env.rs`). This pass fills the
-    /// GOT/PLT slots for the host-resolvable subset (proving the symbol-reloc pipeline on the real
-    /// engine) and leaves every unresolved-strong slot untouched (recorded in
-    /// [`PartialSymbolStats::unresolved`]). A weak-undef the scope does not define is applied as 0
-    /// (legal per the psABI). **HONEST:** the resolved addresses are host (glibc/host-GL) addresses —
-    /// a relocation-pipeline baseline, NOT bionic-ABI-correct execution (see `bionic_env.rs`).
-    ///
-    /// Like [`Self::relocate_symbols`], this makes every segment writable, applies, then restores the
-    /// final protections (so a GOT slot in a RELRO-but-still-RW region is patchable here).
     pub fn relocate_symbols_partial(
         &mut self,
         img: &ElfImage<'_>,
@@ -550,9 +355,6 @@ impl MappedObject {
             .relocations()
             .map_err(|_| MapError::SpanOverflow("relocations decode"))?;
 
-        // Partition: for each symbol reloc, ask the scope's resolver. A `Some(nonzero)` → apply
-        // (host baseline fill); `Some(0)` → weak-undef, apply as 0 (legal); `None` → unresolved
-        // strong, RECORD (no write). TPOFF64/IRELATIVE → deferred (this pass owns neither).
         let resolver = ScopedResolver::new(scope, &img.dynsyms);
         let mut to_apply: Vec<reloc::Rela> = Vec::new();
         let mut stats = PartialSymbolStats::default();
@@ -563,8 +365,6 @@ impl MappedObject {
                 reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64 => {
                     match resolver.resolve_symbol(r.sym_index) {
                         Some(0) => {
-                            // Weak-undef → 0 (legal). The slot is already 0 in a fresh GOT, but
-                            // applying it keeps the count honest and is a correct no-op write.
                             stats.applied_weak_zero += 1;
                             to_apply.push(*r);
                         }
@@ -573,7 +373,6 @@ impl MappedObject {
                             to_apply.push(*r);
                         }
                         None => {
-                            // Unresolved STRONG: record (the work-list), never fabricate, no write.
                             stats.unresolved_strong += 1;
                             let name = img
                                 .dynsyms
@@ -587,7 +386,7 @@ impl MappedObject {
                     }
                 }
                 reloc::R_X86_64_TPOFF64 | R_X86_64_IRELATIVE => stats.deferred += 1,
-                // RELATIVE / DT_RELR were applied by the base pass; nothing else this pass owns.
+
                 _ => {}
             }
         }
@@ -596,7 +395,6 @@ impl MappedObject {
         let load_base = self.load_base().wrapping_sub(region_start);
         let tls_off = self.static_tls_offset;
 
-        // Make every segment writable, apply the resolvable subset, restore final protections.
         for seg in &img.loads {
             self.mprotect_segment_pages(
                 seg,
@@ -606,11 +404,6 @@ impl MappedObject {
             )?;
         }
         {
-            // SAFETY: 2026-06-05 — every segment was just made RW above; `image_bytes` exposes the
-            // mapping as `&mut [u8]` of exactly `span` bytes (see its SAFETY); the reloc core only
-            // writes within `[0, span)`, all bounds-checked. Only the pre-filtered resolvable relocs
-            // are applied, so `apply_one` cannot hit an `UnresolvedSymbol` (the strong-unresolved
-            // ones were partitioned out above).
             let bytes = unsafe { self.image_bytes() };
             let mut image = reloc::SliceImage::new(load_base, tls_off, bytes);
             for r in &to_apply {
@@ -624,28 +417,6 @@ impl MappedObject {
         Ok(stats)
     }
 
-    /// Apply the **static-TLS** relocations (`R_X86_64_TPOFF64`) through a [`TlsLayout`], the last
-    /// non-ifunc relocation class. For each `TPOFF64` in `img`'s `.rela.dyn`/`.rela.plt`, a
-    /// [`TlsResolver`] (wrapping `inner` for any non-TLS lookup) resolves the referenced TLS symbol
-    /// to its tp-relative value (`-offset_i + st_value` of the **defining** module in `layout`), and
-    /// the [`reloc`] core writes `tp_offset + addend` into the slot.
-    ///
-    /// `inner` is the non-TLS resolver (typically a [`ScopedResolver`]); it is delegated to but
-    /// `TPOFF64` only consults the TLS path. `layout` must already contain the module that **defines**
-    /// each referenced TLS symbol (e.g. for `libm.so.6`'s `errno` import, the layout of `libc.so.6`).
-    /// `own_tp_offset` is this object's **own** TLS module tp-relative base in `layout` (`None` if it
-    /// declares no `PT_TLS`); it resolves a self-referential `STN_UNDEF` (sym 0) `TPOFF64` — the
-    /// relocation against the object's own thread-locals (e.g. `libc.so.6`'s 15 sym-0 TPOFF64).
-    ///
-    /// ## tp-offset reachability (HONEST scope — 2026-06-05)
-    /// The written values are the correct tp-relative offsets per the x86-64 variant-II psABI, but
-    /// they are only *reachable at runtime* once the assembled TLS block is bound to a live thread
-    /// pointer (`%fs`/TCB) — a **separate** integration step this loader does not take (see
-    /// `tls.rs` and AGENTS.md §5). This pass delivers the offset computation + `TPOFF64` application.
-    ///
-    /// `R_X86_64_IRELATIVE` (ifunc) stays **deferred** (needs executing resolvers; nothing is run).
-    /// The relocation targets sit in writable/RELRO-but-still-RW segments, so this pass makes every
-    /// segment writable, applies, then restores each segment's final `p_flags` protection.
     pub fn relocate_tls<R: reloc::SymbolResolver>(
         &mut self,
         img: &ElfImage<'_>,
@@ -674,8 +445,7 @@ impl MappedObject {
                     tls_relas.push(*r);
                 }
                 R_X86_64_IRELATIVE => stats.deferred += 1,
-                // RELATIVE/RELR (base pass) and GLOB_DAT/JUMP_SLOT/64 (symbol pass) are not this
-                // pass's; don't double-count them.
+
                 _ => {}
             }
         }
@@ -697,13 +467,6 @@ impl MappedObject {
         }
 
         {
-            // SAFETY: 2026-06-05 — every segment was just made RW above; `image_bytes` exposes the
-            // mapping as `&mut [u8]` of exactly `span` bytes (see its SAFETY); the reloc core only
-            // writes within `[0, span)`, all bounds-checked.
-            //
-            // The image's `static_tls_offset` is 0 by contract: `TlsResolver::resolve_tls_offset`
-            // already returns the COMPLETE tp-relative value (`-offset_i + st_value`), so the
-            // applier's `static_tls_offset + tls_offset + addend` yields exactly `tp_offset + addend`.
             let bytes = unsafe { self.image_bytes() };
             let mut image = reloc::SliceImage::new(load_base, 0, bytes);
             reloc::apply_rela(&mut image, &resolver, &tls_relas)?;
@@ -716,10 +479,6 @@ impl MappedObject {
         Ok(stats)
     }
 
-    /// Map + base-relocate (via [`Self::map_and_relocate`]) **and** apply symbol relocations through
-    /// `build_scope`, in one call. `build_scope` is given this object's run-time load base and the
-    /// image's dynamic symbols so it can construct the resolution [`Scope`] (which must reference
-    /// this object's definitions plus any host/already-loaded providers).
     pub fn map_and_relocate_with_scope(
         img: &ElfImage<'_>,
         file: &[u8],
@@ -732,8 +491,6 @@ impl MappedObject {
         Ok((obj, map_stats, sym_stats))
     }
 
-    /// Copy one segment's file bytes into the mapped region and ensure its pages are writable for
-    /// the relocation pass. The bss tail is already zero (fresh anonymous pages).
     fn populate_segment(
         &mut self,
         file: &[u8],
@@ -741,7 +498,6 @@ impl MappedObject {
         region_start: u64,
         page_size: u64,
     ) -> Result<(), MapError> {
-        // Region-relative byte offset of this segment's content.
         let seg_off_in_region = seg
             .vaddr
             .checked_sub(region_start)
@@ -749,8 +505,6 @@ impl MappedObject {
         let seg_off = usize::try_from(seg_off_in_region)
             .map_err(|_| MapError::SpanOverflow("segment offset as usize"))?;
 
-        // Make this segment's page range writable so the copy + later relocations can write. The
-        // pages spanning [vaddr, vaddr+memsz) (rounded out) get PROT_READ|WRITE temporarily.
         self.mprotect_segment_pages(
             seg,
             region_start,
@@ -772,13 +526,6 @@ impl MappedObject {
             .get(file_off..file_end)
             .ok_or(MapError::SegmentOutOfFile(seg.file_offset))?;
 
-        // SAFETY: 2026-06-05 — `seg_off + filesz <= span`: `seg_off` is `vaddr - region_start` and
-        // `vaddr + memsz <= region_end`, with `filesz <= memsz` ENFORCED by `map_and_relocate`'s
-        // `FileSizeExceedsMemSize` check (so the `filesz`-sized copy stays within this segment's
-        // `memsz`-sized writable page range — it cannot overrun into an adjacent not-yet-writable
-        // segment). `dst` is the mapping's writable bytes at `seg_off`; `src` is exactly `filesz`
-        // bytes from the file slice; the two never alias (different allocations). The `end > span`
-        // guard below is a redundant defense. The segment's pages were made writable above.
         let dst = unsafe {
             let end = seg_off
                 .checked_add(filesz)
@@ -792,7 +539,6 @@ impl MappedObject {
         Ok(())
     }
 
-    /// Set this segment's final protection (`p_flags` → PROT bits), page-rounded.
     fn protect_segment(
         &self,
         seg: &LoadSegment,
@@ -803,8 +549,6 @@ impl MappedObject {
         self.mprotect_segment_pages(seg, region_start, page_size, prot)
     }
 
-    /// `mprotect` the pages spanning a segment's `[vaddr, vaddr+memsz)` (rounded out to whole pages)
-    /// to `prot`. Page-floors the start and page-ceils the end so partial pages are covered.
     fn mprotect_segment_pages(
         &self,
         seg: &LoadSegment,
@@ -819,7 +563,7 @@ impl MappedObject {
             .ok_or(MapError::SpanOverflow("vaddr + memsz"))?;
         let seg_end = page_ceil(seg_end_unaligned, page_size)
             .ok_or(MapError::SpanOverflow("segment end ceil"))?;
-        // A zero-length segment range needs no protection change.
+
         if seg_end <= seg_start {
             return Ok(());
         }
@@ -833,9 +577,7 @@ impl MappedObject {
         if off.checked_add(len).map(|e| e > self.span).unwrap_or(true) {
             return Err(MapError::SpanOverflow("protect range past span"));
         }
-        // SAFETY: 2026-06-05 — `[off, off+len)` is within `[0, span)` (checked just above) of this
-        // object's own mapping, and both `off` and `len` are page-multiples (page_floor/page_ceil).
-        // `mprotect` on a sub-range of an owned mapping with valid page-aligned bounds is sound.
+
         unsafe {
             mprotect(
                 self.base.as_ptr().add(off).cast(),
@@ -846,30 +588,16 @@ impl MappedObject {
         .map_err(MapError::Os)
     }
 
-    /// Honor `PT_GNU_RELRO`: after all relocations have been applied, `mprotect` the read-only-
-    /// after-relocation region to `PROT_READ` (no write). The dynamic linker writes the GOT and
-    /// other relocated data while relocating, then hardens this region read-only so a later bug or
-    /// exploit cannot rewrite it.
-    ///
-    /// 2026-06-05: The region is `[vaddr, vaddr + memsz)`. The ELF/psABI guarantee is that
-    /// `PT_GNU_RELRO`'s start is page-aligned and its size, while not necessarily a page multiple,
-    /// covers only data meant to become read-only; the linker rounds the protected range to whole
-    /// pages. Per the glibc/bionic convention we page-floor the start (already page-aligned) and
-    /// page-floor the end so we never make a page read-only that also holds still-writable data
-    /// past the RELRO region (a partial trailing page stays RW). Call this **after** every
-    /// relocation pass (base + symbol + TLS) — the caller's responsibility; in the root-only map
-    /// mode (no symbol providers) the base pass is the only one that wrote into this region.
     pub fn apply_relro(&self, relro: &RelroSegment, page_size: u64) -> Result<(), MapError> {
         let prot_start = page_floor(relro.vaddr, page_size);
         let end_unaligned = relro
             .vaddr
             .checked_add(relro.mem_size)
             .ok_or(MapError::SpanOverflow("relro vaddr + memsz"))?;
-        // Page-FLOOR the end: only whole pages fully inside the RELRO region are hardened, so a
-        // partial trailing page (which may share data with the following writable area) stays RW.
+
         let prot_end = page_floor(end_unaligned, page_size);
         if prot_end <= prot_start {
-            return Ok(()); // RELRO covers less than one whole page → nothing to harden.
+            return Ok(());
         }
         let off_in_region = prot_start
             .checked_sub(self.region_start)
@@ -881,10 +609,7 @@ impl MappedObject {
         if off.checked_add(len).map(|e| e > self.span).unwrap_or(true) {
             return Err(MapError::SpanOverflow("relro range past span"));
         }
-        // SAFETY: 2026-06-05 — `[off, off+len)` is within `[0, span)` (checked above) of this
-        // object's own mapping, and both `off` and `len` are page-multiples (page_floor). Marking a
-        // sub-range of an owned mapping read-only is sound; no later code writes the RELRO region in
-        // this map-only mode (relocations already applied), so no write fault can follow.
+
         unsafe {
             mprotect(
                 self.base.as_ptr().add(off).cast(),
@@ -895,25 +620,14 @@ impl MappedObject {
         .map_err(MapError::Os)
     }
 
-    /// The run-time load base relocations are computed against (`load_base + vaddr` = run-time
-    /// address of `vaddr`). For a PIE (lowest vaddr 0) this equals the mapping address.
     pub fn load_base(&self) -> u64 {
-        // Recompute from the stored base — region_start is folded in at map time, but for the public
-        // accessor we expose the mapping address itself (PIE region_start is 0, the common case);
-        // internal relocation used the precise `load_base`. Callers comparing reloc targets should
-        // use [`Self::span`]-bounded `[load_base, load_base+span)`.
         self.base.as_ptr() as u64
     }
 
-    /// Total length (bytes) of the reserved region.
     pub fn span(&self) -> usize {
         self.span
     }
 
-    /// Read a little-endian `u64` from the mapped image at region-relative byte offset `off` (an
-    /// in-object vaddr for a PIE). Returns [`MapError::SpanOverflow`] if `[off, off+8)` is outside
-    /// the region. A safe read accessor (e.g. to inspect a relocated GOT/PLT slot after a symbol
-    /// pass) — the mapped pages are readable in their final protection here, so the read is sound.
     pub fn read_u64(&self, off: usize) -> Result<u64, MapError> {
         let end = off
             .checked_add(8)
@@ -921,40 +635,22 @@ impl MappedObject {
         if end > self.span {
             return Err(MapError::SpanOverflow("read past span"));
         }
-        // SAFETY: 2026-06-05 — `[off, off+8)` is within `[0, span)` (checked above) of this object's
-        // own readable mapping; `u8` has no alignment requirement; the bytes are read into an owned
-        // array (no aliasing). The mapper sets every segment's final protection to include
-        // `PROT_READ`, so the region is readable for the object's whole life.
+
         let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr().add(off), 8) };
         Ok(u64::from_le_bytes(bytes.try_into().expect("8-byte slice")))
     }
 
-    /// A safe `&mut [u8]` over the whole mapped region, for the relocation pass.
-    ///
-    /// # Safety
-    /// The caller must ensure the pages being written are currently writable (`PROT_WRITE`) — the
-    /// mapper makes every segment's pages RW before relocating and only sets final (possibly
-    /// read-only) protections afterward. Writing to a page that has been `mprotect`ed read-only
-    /// would fault. The returned slice borrows `self` mutably, so no aliasing `&mut` can coexist.
     pub unsafe fn image_bytes(&mut self) -> &mut [u8] {
-        // SAFETY: 2026-06-05 — `base` points at `span` owned, mapped, readable bytes; `u8` has no
-        // alignment requirement; the `&mut` is unique for its lifetime (borrows `*self` mutably).
-        // Writability is the caller's documented precondition (see the fn-level # Safety).
         unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.span) }
     }
 }
 
 impl Drop for MappedObject {
     fn drop(&mut self) {
-        // SAFETY: 2026-06-05 — `base`/`span` are exactly the address + length returned by this
-        // object's `mmap_anonymous`; `munmap`ping precisely the region we own, once, on the single
-        // owner's drop, is sound and leaks nothing. The result is ignored: there is no recovery
-        // from a failed unmap at drop time, and on a well-formed mapping it cannot fail.
         let _ = unsafe { munmap(self.base.as_ptr().cast(), self.span) };
     }
 }
 
-/// `ProtFlags` → `MprotectFlags` (same bit meanings; `rustix` types them separately).
 fn mprotect_flags(prot: ProtFlags) -> MprotectFlags {
     let mut m = MprotectFlags::empty();
     if prot.contains(ProtFlags::READ) {
@@ -969,10 +665,6 @@ fn mprotect_flags(prot: ProtFlags) -> MprotectFlags {
     m
 }
 
-/// A resolver that resolves nothing — used for the base-only pass, where only `R_X86_64_RELATIVE`
-/// (no symbol) is applied. Symbol/TLS relocations are partitioned out before the pass, so this is
-/// never consulted; if a stray symbol reloc reached the applier it would surface as a typed
-/// `UnresolvedSymbol` error rather than a bogus write.
 struct NullResolver;
 impl reloc::SymbolResolver for NullResolver {
     fn resolve_symbol(&self, _i: u32) -> Option<u64> {
@@ -983,21 +675,18 @@ impl reloc::SymbolResolver for NullResolver {
     }
 }
 
-/// Count how many individual relocations a `DT_RELR` word table expands to (address words + set
-/// bitmap bits), mirroring [`reloc::apply_relr`]'s decoding, for reporting `MapStats::relr_applied`.
 fn count_relr_targets(entries: &[u64]) -> usize {
     let mut n = 0usize;
     for &entry in entries {
         if entry & 1 == 0 {
-            n += 1; // address word: one relocated location
+            n += 1;
         } else {
-            n += (entry >> 1).count_ones() as usize; // bitmap: one per set data bit
+            n += (entry >> 1).count_ones() as usize;
         }
     }
     n
 }
 
-/// The host page size, queried at runtime (detect-don't-assume; 4K on x86-64, 16K on some configs).
 pub fn host_page_size() -> u64 {
     rustix::param::page_size() as u64
 }
@@ -1008,31 +697,21 @@ mod tests {
     use crate::loader::elf::{ElfImage, PF_R, PF_W, PF_X};
     use crate::loader::reloc::R_X86_64_RELATIVE;
 
-    // ---- Minimal in-memory ELF fixture with two PT_LOAD segments (R-X text + RW data+bss) -------
-    //
-    // Builds a valid little-endian x86-64 ET_DYN whose file layout maps 1:1 to its vaddrs, with two
-    // page-aligned PT_LOAD segments so the mapper's page-rounding, copy, bss-zeroing, and
-    // protection split are all exercised. Page size 0x1000.
-    //   LOAD0 (R-X): vaddr 0x0000, file [0, 0x1000), memsz 0x1000  — headers + .dynamic + text
-    //   LOAD1 (RW ): vaddr 0x1000, file [0x1000, 0x1000+0x40), memsz 0x80  — data (0x40) + bss (0x40)
-    // Dynamic + rela + relr live inside LOAD0; the RELATIVE/RELR targets live inside LOAD1.
-
     const PAGE: u64 = 0x1000;
     const PH_OFF: usize = 0x40;
     const DYN_OFF: u64 = 0x200;
-    const SYM_OFF: u64 = 0x280; // one null Elf64_Sym (24 bytes); satisfies elf.rs's DT_SYMTAB check
+    const SYM_OFF: u64 = 0x280;
     const RELA_OFF: u64 = 0x300;
     const RELR_OFF: u64 = 0x380;
     const STR_OFF: u64 = 0x3c0;
-    // Targets in LOAD1 (the RW segment).
-    const RELA_TARGET: u64 = 0x1000; // word 0 of the data segment
-    const RELR_TARGET: u64 = 0x1008; // word 1 of the data segment
+
+    const RELA_TARGET: u64 = 0x1000;
+    const RELR_TARGET: u64 = 0x1008;
     const DATA_FILE_OFF: u64 = 0x1000;
     const DATA_FILESZ: u64 = 0x40;
-    const DATA_MEMSZ: u64 = 0x80; // 0x40 data + 0x40 bss
-    const FILE_SIZE: usize = 0x1040; // headers/text page + 0x40 of data file bytes
+    const DATA_MEMSZ: u64 = 0x80;
+    const FILE_SIZE: usize = 0x1040;
 
-    // Reuse elf.rs's constants by value (kept local to avoid touching the forbid-unsafe module).
     const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
     const ELFCLASS64: u8 = 2;
     const ELFDATA2LSB: u8 = 1;
@@ -1099,17 +778,15 @@ mod tests {
         put_u64(buf, off + 8, val);
     }
 
-    /// Distinctive marker bytes seeded into the text segment so we can prove the copy landed.
     const TEXT_MARK_OFF: usize = 0x100;
     const TEXT_MARK: u64 = 0xdead_beef_cafe_babe;
-    /// Pre-reloc value stored at the RELATIVE target (its addend) and the RELR target (its base-add).
+
     const RELA_ADDEND: i64 = 0x1234;
     const RELR_SEED: u64 = 0x40;
 
     fn build_two_segment_fixture() -> Vec<u8> {
         let mut buf = vec![0u8; FILE_SIZE];
 
-        // Ehdr.
         buf[0..4].copy_from_slice(&ELF_MAGIC);
         buf[EI_CLASS] = ELFCLASS64;
         buf[EI_DATA] = ELFDATA2LSB;
@@ -1120,9 +797,8 @@ mod tests {
         put_u64(&mut buf, 32, PH_OFF as u64);
         put_u16(&mut buf, 52, EHDR_SIZE as u16);
         put_u16(&mut buf, 54, PHDR_SIZE as u16);
-        put_u16(&mut buf, 56, 3); // LOAD0, LOAD1, DYNAMIC
+        put_u16(&mut buf, 56, 3);
 
-        // LOAD0 = R-X over the first page; LOAD1 = RW over the data; DYNAMIC inside LOAD0.
         put_phdr(&mut buf, 0, PT_LOAD, PF_R | PF_X, 0, 0, PAGE, PAGE, PAGE);
         put_phdr(
             &mut buf,
@@ -1147,51 +823,42 @@ mod tests {
             8,
         );
 
-        // .dynamic.
         let mut slot = 0;
         let mut d = |buf: &mut [u8], tag: i64, val: u64| {
             put_dyn(buf, slot, tag, val);
             slot += 1;
         };
         d(&mut buf, DT_RELA, RELA_OFF);
-        d(&mut buf, DT_RELASZ, RELA_ENT); // one entry
+        d(&mut buf, DT_RELASZ, RELA_ENT);
         d(&mut buf, DT_RELAENT, RELA_ENT);
         d(&mut buf, DT_RELR, RELR_OFF);
-        d(&mut buf, DT_RELRSZ, 8); // one word
+        d(&mut buf, DT_RELRSZ, 8);
         d(&mut buf, DT_RELRENT, 8);
-        d(&mut buf, DT_SYMTAB, SYM_OFF); // one null symbol; required because .rela is present
+        d(&mut buf, DT_SYMTAB, SYM_OFF);
         d(&mut buf, DT_SYMENT, SYM_ENT);
         d(&mut buf, DT_STRTAB, STR_OFF);
         d(&mut buf, DT_STRSZ, 1);
         d(&mut buf, DT_NULL, 0);
 
-        // .rela.dyn: one RELATIVE at RELA_TARGET, addend RELA_ADDEND.
         put_u64(&mut buf, RELA_OFF as usize, RELA_TARGET);
         put_u64(&mut buf, RELA_OFF as usize + 8, R_X86_64_RELATIVE as u64);
         put_u64(&mut buf, RELA_OFF as usize + 16, RELA_ADDEND as u64);
 
-        // .relr: one even address word naming RELR_TARGET.
         put_u64(&mut buf, RELR_OFF as usize, RELR_TARGET);
 
-        // .dynstr: just a NUL.
         buf[STR_OFF as usize] = 0;
 
-        // Seed a marker in the text page and the RELR pre-value in the data file bytes.
         put_u64(&mut buf, TEXT_MARK_OFF, TEXT_MARK);
-        // RELR target is at file offset 0x1008 (data file bytes start at 0x1000); seed it.
+
         put_u64(&mut buf, RELR_TARGET as usize, RELR_SEED);
-        // RELA target word (0x1000) starts zero; RELATIVE overwrites it wholesale.
 
         buf
     }
 
-    /// The two-segment fixture plus a `PT_GNU_RELRO` program header covering the whole RW data page
-    /// (`[0x1000, 0x2000)`), so [`MappedObject::apply_relro`] hardens a real, page-aligned region.
-    /// Identical to [`build_two_segment_fixture`] except `e_phnum = 4` and a 4th phdr is written.
     fn build_relro_fixture() -> Vec<u8> {
         let mut buf = build_two_segment_fixture();
-        put_u16(&mut buf, 56, 4); // LOAD0, LOAD1, DYNAMIC, GNU_RELRO
-                                  // RELRO over the full data page [0x1000, 0x2000): page-aligned start, one whole page.
+        put_u16(&mut buf, 56, 4);
+
         put_phdr(
             &mut buf,
             3,
@@ -1207,8 +874,6 @@ mod tests {
     }
 
     fn read_word(obj: &mut MappedObject, vaddr: u64) -> u64 {
-        // SAFETY (test-only): the region is mapped readable; vaddr < span. We read after relocation
-        // and after final protections, all of which include PROT_READ for these segments.
         let bytes = unsafe { obj.image_bytes() };
         let off = vaddr as usize;
         u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
@@ -1224,10 +889,8 @@ mod tests {
             MappedObject::map_and_relocate(&img, &buf, PAGE).expect("map+relocate");
         assert_eq!(stats.segments_mapped, 2);
 
-        // Text marker copied at its vaddr (LOAD0 maps file 1:1 here).
         assert_eq!(read_word(&mut obj, TEXT_MARK_OFF as u64), TEXT_MARK);
 
-        // The bss tail [filesz, memsz) of LOAD1 (data 0x40..0x80) is zero — fresh anonymous pages.
         for off in (DATA_FILESZ..DATA_MEMSZ).step_by(8) {
             assert_eq!(read_word(&mut obj, 0x1000 + off), 0, "bss word at {off:#x}");
         }
@@ -1241,11 +904,10 @@ mod tests {
 
         assert_eq!(stats.relative_applied, 1);
         let base = obj.load_base();
-        // RELATIVE: *(RELA_TARGET) = base + addend.
+
         let got = read_word(&mut obj, RELA_TARGET);
         assert_eq!(got, base.wrapping_add(RELA_ADDEND as u64));
-        // The relocated word points INSIDE [base, base+span) only if base+addend does; addend is
-        // small and positive, so it lands in the mapped region.
+
         assert!(
             got >= base && got < base + obj.span() as u64,
             "RELATIVE target {got:#x} must be inside [{base:#x}, {:#x})",
@@ -1261,7 +923,7 @@ mod tests {
 
         assert_eq!(stats.relr_applied, 1);
         let base = obj.load_base();
-        // RELR: *(RELR_TARGET) += base. Seeded value was RELR_SEED.
+
         let got = read_word(&mut obj, RELR_TARGET);
         assert_eq!(got, base.wrapping_add(RELR_SEED));
         assert!(got >= base && got < base + obj.span() as u64);
@@ -1269,7 +931,6 @@ mod tests {
 
     #[test]
     fn page_rounding_span_is_correct() {
-        // LOAD0 ends at page 0x1000; LOAD1 ends at 0x1000+0x80=0x1080 → ceiled to 0x2000. Span = 2 pages.
         let buf = build_two_segment_fixture();
         let img = ElfImage::parse(&buf).unwrap();
         let (obj, _) = MappedObject::map_and_relocate(&img, &buf, PAGE).unwrap();
@@ -1278,7 +939,6 @@ mod tests {
 
     #[test]
     fn no_load_segments_is_typed_err() {
-        // Hand-build a header with zero program headers → no PT_LOAD.
         let mut buf = vec![0u8; EHDR_SIZE];
         buf[0..4].copy_from_slice(&ELF_MAGIC);
         buf[EI_CLASS] = ELFCLASS64;
@@ -1297,8 +957,6 @@ mod tests {
 
     #[test]
     fn drop_unmaps_without_leak() {
-        // Map and drop many times; if Drop didn't munmap, the address space would exhaust on a
-        // 32-bit-ish span budget. This both exercises Drop and proves no double-free/UB on drop.
         let buf = build_two_segment_fixture();
         let img = ElfImage::parse(&buf).unwrap();
         for _ in 0..256 {
@@ -1310,10 +968,6 @@ mod tests {
 
     #[test]
     fn apply_relro_hardens_region_and_keeps_it_readable() {
-        // 2026-06-05: map a fixture with a PT_GNU_RELRO over the RW data page, apply the base relocs,
-        // then harden RELRO. The helper must succeed (the mprotect syscall returns Ok) and the region
-        // must stay READABLE (RELRO = read-only, not no-access): the relocated values are read back
-        // intact. This exercises the apply_relro offset/length math + the syscall on a real mapping.
         let buf = build_relro_fixture();
         let img = ElfImage::parse(&buf).expect("relro fixture parses");
         assert!(img.relro.is_some(), "fixture declares PT_GNU_RELRO");
@@ -1326,24 +980,19 @@ mod tests {
         assert_eq!(stats.relative_applied, 1);
         let base = obj.load_base();
 
-        // Harden the RELRO region read-only after relocation.
         obj.apply_relro(&relro, PAGE).expect("apply_relro succeeds");
 
-        // The RELATIVE target (0x1000, inside RELRO) holds base+addend and is still readable.
         assert_eq!(read_word(&mut obj, RELA_TARGET), base + RELA_ADDEND as u64);
-        // The RELR target (0x1008, inside RELRO) holds seed+base and is still readable.
+
         assert_eq!(read_word(&mut obj, RELR_TARGET), RELR_SEED + base);
     }
 
     #[test]
     fn apply_relro_subpage_region_is_a_clean_noop() {
-        // 2026-06-05: a RELRO region smaller than one whole page page-floors to a zero-length range
-        // → apply_relro is a clean Ok no-op (it never makes a partial trailing page read-only, which
-        // could clobber adjacent still-writable data). Proves the page-floor-end boundary math.
         let buf = build_two_segment_fixture();
         let img = ElfImage::parse(&buf).unwrap();
         let (obj, _) = MappedObject::map_and_relocate(&img, &buf, PAGE).unwrap();
-        // A sub-page RELRO at the data page start (0x40 bytes < PAGE): floors to no whole page.
+
         let tiny = RelroSegment {
             vaddr: 0x1000,
             mem_size: 0x40,
@@ -1354,21 +1003,15 @@ mod tests {
 
     #[test]
     fn count_relr_targets_matches_encoding() {
-        // One address word + a bitmap with 3 set data bits = 4 relocations.
-        let data_bits = 0b1011u64; // 3 bits set
+        let data_bits = 0b1011u64;
         let bitmap = (data_bits << 1) | 1;
         assert_eq!(count_relr_targets(&[0x1000, bitmap]), 1 + 3);
-        // Empty table → 0.
+
         assert_eq!(count_relr_targets(&[]), 0);
     }
 
-    // ---- REAL test: parse + map + base-relocate /usr/lib/libm.so.6 (skips cleanly if absent) -----
-
     #[test]
     fn real_libm_maps_and_base_relocates() {
-        // 2026-06-05: end-to-end on a real toolchain-produced .so. Maps its PT_LOAD segments, applies
-        // RELATIVE+RELR, and asserts every relocated relative target now points INSIDE the mapped
-        // object. SKIP (not fail) if no host libm is present — never fabricate.
         const CANDIDATES: &[&str] = &[
             "/usr/lib/libm.so.6",
             "/usr/lib/x86_64-linux-gnu/libm.so.6",
@@ -1393,13 +1036,9 @@ mod tests {
         );
         assert_eq!(stats.segments_mapped, img.loads.len());
 
-        // Every RELATIVE target word must now hold a value inside [base, base+span): a relative
-        // reloc points within the object. Re-read each from the mapped image.
         let relas = img.relocations().unwrap();
         let mut checked_relative = 0usize;
         {
-            // SAFETY (test): the region is readable post-relocation; offsets are < span (RELATIVE
-            // r_offset is an in-object vaddr, which the mapper laid out within [0, span)).
             let image = unsafe { obj.image_bytes() };
             for r in &relas {
                 if r.r_type != R_X86_64_RELATIVE {
@@ -1417,7 +1056,6 @@ mod tests {
             }
         }
 
-        // RELR targets likewise point inside the object after *p += base.
         let relr = img.relr().unwrap();
         let relr_count = count_relr_targets(&relr);
 
@@ -1429,17 +1067,8 @@ mod tests {
         assert_eq!(stats.relr_applied, relr_count);
     }
 
-    // ---- REAL test: resolve + apply libm.so.6's symbol relocations through a Scope --------------
-
     #[test]
     fn real_libm_resolves_and_applies_symbol_relocations() {
-        // 2026-06-05: the step-5 end-to-end. Map libm, build a Scope = [LoadedObjectProvider(libm),
-        // HostDlsymProvider], and apply its GLOB_DAT (+ any JUMP_SLOT / R_X86_64_64) symbol relocs.
-        // Asserts: no unresolved-STRONG error, no panic, and every STRONG symbol reloc resolved to a
-        // non-null address in a sane range — while WEAK-undef ones legitimately resolve to 0.
-        // libm's symbol relocs are 32 GLOB_DAT (no JUMP_SLOT) per `readelf -r`; of these a handful
-        // are weak-undef in this process (`__gmon_start__`, `_ITM_*`) → 0, which is correct.
-        // SKIP (not fail) if no host libm — never fabricate.
         use super::super::resolve::{
             HostDlsymProvider, LoadedObjectProvider, Scope, SymbolProvider,
         };
@@ -1463,8 +1092,7 @@ mod tests {
             let (obj, map_stats) =
                 MappedObject::map_and_relocate(&img, &bytes, page).expect("map+base-relocate libm");
             let base = obj.load_base();
-            // Scope: libm's own exported definitions first (resolves its self-references like
-            // __signgam / _LIB_VERSION), then the host process (resolves libc imports via dlsym).
+
             let mut scope = Scope::new();
             scope
                 .push(Box::new(LoadedObjectProvider::new(base, &img.dynsyms)))
@@ -1473,7 +1101,7 @@ mod tests {
             let sym_stats = obj
                 .relocate_symbols(&img, &scope, page)
                 .unwrap_or_else(|e| panic!("symbol relocate {path}: {e}"));
-            // Sanity: the base pass deferred exactly these symbol relocs to us.
+
             assert_eq!(
                 sym_stats.total_applied() + sym_stats.deferred,
                 map_stats.skipped_by_type,
@@ -1485,8 +1113,6 @@ mod tests {
         let base = obj.load_base();
         let span = obj.span() as u64;
 
-        // Independently classify each symbol reloc and verify the written slot value matches the
-        // gABI rules: STRONG symbol → non-null, in a sane range; WEAK-undef → 0.
         let relas = img.relocations().unwrap();
         let mut scope = Scope::new();
         scope
@@ -1496,7 +1122,6 @@ mod tests {
         let mut weak_zero_count = 0usize;
         let mut total_symbol = 0usize;
         {
-            // SAFETY (test): region readable post-reloc; symbol-reloc r_offsets are in-object vaddrs.
             let image = unsafe { obj.image_bytes() };
             for r in &relas {
                 let is_symbol = matches!(
@@ -1513,13 +1138,9 @@ mod tests {
                 let sym = &img.dynsyms[r.sym_index as usize];
                 let scope_hit = scope.resolve(&sym.name);
                 if scope_hit.is_some() {
-                    // A resolved (strong or scope-found) symbol must be written non-null. For
-                    // R_X86_64_64 the addend is folded in, but libm has none of those; GLOB_DAT/
-                    // JUMP_SLOT write the bare address.
                     assert_ne!(word, 0, "resolved {} wrote a null slot", sym.name);
                     strong_count += 1;
-                    // A definition from libm itself must land inside the mapped object; a host
-                    // (dlsym) definition is outside it. Only check in-object for the self-defined.
+
                     if let Some(off_in_obj) = LoadedObjectProvider::new(base, &img.dynsyms)
                         .resolve(&sym.name)
                         .filter(|s| !s.weak || scope_hit == Some(*s))
@@ -1535,9 +1156,8 @@ mod tests {
                         }
                     }
                 } else {
-                    // No definition in scope: this is only legal for a WEAK reference (→ 0).
                     assert_eq!(
-                        sym.bind, 2, /* STB_WEAK */
+                        sym.bind, 2,
                         "STRONG symbol {} was unresolved (would be a typed error)",
                         sym.name
                     );
@@ -1559,28 +1179,18 @@ mod tests {
             sym_stats.deferred,
         );
 
-        // Every symbol reloc is either a non-null strong resolution or a legal weak-undef zero.
         assert_eq!(strong_count + weak_zero_count, total_symbol);
         assert_eq!(sym_stats.total_applied(), total_symbol);
         assert_eq!(sym_stats.resolved_nonnull, strong_count);
-        // libm must have at least the well-known libc imports resolved (sanity floor).
+
         assert!(
             strong_count >= 20,
             "expected most of libm's symbol relocs to resolve, got {strong_count}/{total_symbol}"
         );
     }
 
-    // ---- REAL test: apply libm.so.6's single TPOFF64 through a libc.so.6 static-TLS layout -------
-
     #[test]
     fn real_libm_applies_tpoff64_through_libc_tls_layout() {
-        // 2026-06-05: the step-4 end-to-end. libm.so.6 has exactly ONE R_X86_64_TPOFF64, against
-        // `errno@GLIBC_PRIVATE` — a TLS GLOBAL **UND** import (libm itself has NO PT_TLS). `errno`
-        // is DEFINED in libc.so.6's PT_TLS. So we lay out libc's static-TLS block (variant II),
-        // which assigns `errno` a tp-relative offset (`-roundup(memsz, align) + st_value`), and apply
-        // libm's TPOFF64 through that layout. The written slot must equal `tp_offset + addend`, and —
-        // since libm has 0 IRELATIVE — every one of libm's 33 relocs is now applied (base + symbol +
-        // TLS) with NOTHING deferred: libm is fully relocated modulo ifunc. SKIP if no host libs.
         use super::super::resolve::{HostDlsymProvider, LoadedObjectProvider, Scope};
         use super::super::tls::TlsLayout;
 
@@ -1606,7 +1216,6 @@ mod tests {
 
         let page = host_page_size();
 
-        // --- Lay out libc.so.6's PT_TLS so `errno` gets a tp-relative offset. ---
         let libc_bytes = std::fs::read(libc_path).expect("read libc bytes");
         let libc_img =
             ElfImage::parse(&libc_bytes).unwrap_or_else(|e| panic!("parse {libc_path}: {e}"));
@@ -1621,18 +1230,14 @@ mod tests {
             .add_module(&libc_tls, &libc_bytes, tdata_off as u64, &libc_img.dynsyms)
             .unwrap_or_else(|e| panic!("layout libc TLS: {e}"));
 
-        // Independently compute the expected `errno` tp-offset from libc's PT_TLS + its st_value, so
-        // the assertion does not just re-run the code under test.
         let errno_sym = libc_img
             .dynsyms
             .iter()
-            .find(
-                |s| s.name == "errno" && s.shndx != 0 && s.sym_type == 6, /* STT_TLS */
-            )
+            .find(|s| s.name == "errno" && s.shndx != 0 && s.sym_type == 6)
             .expect("libc defines a TLS `errno`");
         let memsz = libc_tls.mem_size;
         let align = libc_tls.align.max(1);
-        let offset_1 = memsz.div_ceil(align) * align; // roundup(memsz, align)
+        let offset_1 = memsz.div_ceil(align) * align;
         let expected_errno_tp = -(offset_1 as i64) + errno_sym.value as i64;
         assert_eq!(
             tls_layout.tp_offset_of("errno"),
@@ -1640,7 +1245,6 @@ mod tests {
             "TlsLayout's errno tp-offset must match the variant-II hand computation"
         );
 
-        // --- Map libm.so.6 fully: base + symbol + TLS passes. ---
         let libm_bytes = std::fs::read(libm_path).expect("read libm bytes");
         let libm_img =
             ElfImage::parse(&libm_bytes).unwrap_or_else(|e| panic!("parse {libm_path}: {e}"));
@@ -1649,7 +1253,6 @@ mod tests {
             .expect("map+base-relocate libm");
         let base = obj.load_base();
 
-        // Symbol pass (GLOB_DAT) so we can assert the full deferred-accounting at the end.
         let mut scope = Scope::new();
         scope
             .push(Box::new(LoadedObjectProvider::new(base, &libm_img.dynsyms)))
@@ -1658,23 +1261,18 @@ mod tests {
             .relocate_symbols(&libm_img, &scope, page)
             .expect("symbol relocate libm");
 
-        // TLS pass: apply libm's TPOFF64 through the libc layout. The inner resolver is the same
-        // scope (TPOFF64 only consults the TLS path, but the wrapper requires an inner resolver).
         let inner = ScopedResolver::new(&scope, &libm_img.dynsyms);
-        // libm declares no PT_TLS, so its own tp-offset is None (its one TPOFF64 references `errno`,
-        // a named cross-module symbol — sym_index != 0 — resolved via the libc layout, not sym 0).
+
         let tls_stats = obj
             .relocate_tls(&libm_img, &inner, &tls_layout, None, page)
             .expect("tls relocate libm");
 
-        // libm has exactly one TPOFF64 and zero IRELATIVE → one applied, none deferred.
         assert_eq!(tls_stats.tpoff64_applied, 1, "libm has exactly one TPOFF64");
         assert_eq!(
             tls_stats.deferred, 0,
             "libm has zero IRELATIVE → nothing deferred"
         );
 
-        // --- Verify the written slot value == tp_offset + addend. ---
         let relas = libm_img.relocations().unwrap();
         let tpoff = relas
             .iter()
@@ -1683,7 +1281,6 @@ mod tests {
         let sym_name = libm_img.dynsyms[tpoff.sym_index as usize].name.clone();
         let expected = expected_errno_tp.wrapping_add(tpoff.addend) as u64;
         let written = {
-            // SAFETY (test): region readable post-reloc; r_offset is an in-object vaddr in [0, span).
             let image = unsafe { obj.image_bytes() };
             let off = tpoff.offset as usize;
             u64::from_le_bytes(image[off..off + 8].try_into().unwrap())
@@ -1693,12 +1290,10 @@ mod tests {
             "TPOFF64 for {sym_name} wrote {written:#x}, expected tp_offset+addend {expected:#x}"
         );
 
-        // --- libm is now FULLY relocated modulo ifunc: base + symbol + TLS account for all relocs,
-        // and there is no IRELATIVE to defer. ---
         let total_relocs = relas.len();
         let applied =
             map_stats.relative_applied + sym_stats.total_applied() + tls_stats.tpoff64_applied;
-        // RELR-encoded relatives are separate from the .rela count; the .rela relocs are all applied.
+
         assert_eq!(
             applied, total_relocs,
             "every libm .rela reloc applied (base RELATIVE + symbol + TPOFF64): {applied} of {total_relocs}"
@@ -1716,39 +1311,22 @@ mod tests {
         );
     }
 
-    // ---- Adversarial / malformed-input hardening (2026-06-05) -----------------------------------
-    //
-    // These tests feed HAND-CRAFTED hostile PT_LOAD layouts to `map_and_relocate` and assert it
-    // returns a typed `MapError` (never panics, overflows, OOBs, faults, or attempts an absurd
-    // mmap). The `filesz > memsz` overrun case is the REGRESSION GUARD for the confirmed defect
-    // fixed this session (the `filesz`-sized copy could overrun the `memsz`-sized writable range
-    // into an adjacent not-yet-writable segment, faulting); the rest are guards over already-robust
-    // span/overflow paths.
-
-    /// Build a two-PT_LOAD fixture exactly like [`build_two_segment_fixture`], but override LOAD0's
-    /// `p_filesz` to `bad_filesz` so the caller can craft a `filesz > memsz` overrun. LOAD0 keeps
-    /// `memsz = PAGE`; with `bad_filesz` spilling into LOAD1's page, the unfixed copy would write
-    /// into LOAD1's still-`PROT_NONE` pages (LOAD1 is populated AFTER LOAD0).
     fn build_load0_filesz_overrun_fixture(bad_filesz: u64) -> Vec<u8> {
         let mut buf = build_two_segment_fixture();
-        // The file must actually contain `bad_filesz` bytes for LOAD0 (else SegmentOutOfFile would
-        // mask the overrun). Grow the buffer so the copy source exists.
+
         let needed = bad_filesz as usize;
         if buf.len() < needed {
             buf.resize(needed, 0);
         }
-        // LOAD0 is phdr index 0: rewrite its p_filesz (offset +32 within the phdr).
+
         let ph0 = PH_OFF;
-        put_u64(&mut buf, ph0 + 32, bad_filesz); // p_filesz
-                                                 // p_memsz (offset +40) stays PAGE → filesz > memsz.
+        put_u64(&mut buf, ph0 + 32, bad_filesz);
+
         buf
     }
 
     #[test]
     fn filesz_greater_than_memsz_is_typed_err_no_fault() {
-        // The confirmed defect: LOAD0 filesz=0x1800 (> memsz=PAGE=0x1000) overruns into LOAD1's
-        // page [0x1000, 0x2000), which is PROT_NONE when LOAD0 is copied. Pre-fix this faulted
-        // (SIGSEGV). Post-fix it is rejected up front with a typed error and nothing is mapped.
         let buf = build_load0_filesz_overrun_fixture(0x1800);
         let img = ElfImage::parse(&buf).expect("fixture still parses (header/phdr valid)");
         assert!(img.loads[0].file_size > img.loads[0].mem_size);
@@ -1764,8 +1342,6 @@ mod tests {
 
     #[test]
     fn filesz_one_byte_over_memsz_is_rejected() {
-        // Boundary: filesz exactly one byte past memsz is still a violation (the SAFETY argument
-        // requires filesz <= memsz; off-by-one must not slip through).
         let buf = build_load0_filesz_overrun_fixture(PAGE + 1);
         let img = ElfImage::parse(&buf).unwrap();
         assert!(matches!(
@@ -1776,9 +1352,7 @@ mod tests {
 
     #[test]
     fn filesz_equal_to_memsz_still_maps() {
-        // The guard must not over-reject: filesz == memsz is legal (a fully-initialized segment with
-        // no bss). LOAD0 filesz=PAGE=memsz must still map cleanly.
-        let buf = build_load0_filesz_overrun_fixture(PAGE); // filesz == memsz == PAGE
+        let buf = build_load0_filesz_overrun_fixture(PAGE);
         let img = ElfImage::parse(&buf).unwrap();
         let (obj, stats) =
             MappedObject::map_and_relocate(&img, &buf, PAGE).expect("filesz==memsz is legal");
@@ -1788,12 +1362,11 @@ mod tests {
 
     #[test]
     fn vaddr_plus_memsz_overflow_is_typed_err() {
-        // A segment whose p_vaddr + p_memsz overflows u64 must be a typed SpanOverflow, not a panic.
         let mut buf = build_two_segment_fixture();
-        let ph1 = PH_OFF + PHDR_SIZE; // LOAD1
-        put_u64(&mut buf, ph1 + 16, u64::MAX - 0x10); // p_vaddr near the top
-        put_u64(&mut buf, ph1 + 32, 0); // p_filesz 0 (avoid SegmentOutOfFile / filesz>memsz first)
-        put_u64(&mut buf, ph1 + 40, 0x1000); // p_memsz → vaddr + memsz overflows
+        let ph1 = PH_OFF + PHDR_SIZE;
+        put_u64(&mut buf, ph1 + 16, u64::MAX - 0x10);
+        put_u64(&mut buf, ph1 + 32, 0);
+        put_u64(&mut buf, ph1 + 40, 0x1000);
         let img = ElfImage::parse(&buf).unwrap();
         assert!(matches!(
             MappedObject::map_and_relocate(&img, &buf, PAGE),
@@ -1803,15 +1376,11 @@ mod tests {
 
     #[test]
     fn absurdly_huge_span_refuses_rather_than_mmaps() {
-        // A PT_LOAD claiming a ~2^62-byte memsz must NOT attempt that mmap: either the span/page
-        // math overflows (SpanOverflow) or the kernel refuses the reservation (Os). Either way it is
-        // a typed error — never a successful absurd allocation, never a panic. filesz=0 so the
-        // filesz>memsz guard does not fire first.
         let mut buf = build_two_segment_fixture();
-        let ph1 = PH_OFF + PHDR_SIZE; // LOAD1
-        put_u64(&mut buf, ph1 + 16, 0x1000); // p_vaddr (valid, just above LOAD0)
-        put_u64(&mut buf, ph1 + 32, 0); // p_filesz 0
-        put_u64(&mut buf, ph1 + 40, 1u64 << 62); // p_memsz ≈ 4 EiB
+        let ph1 = PH_OFF + PHDR_SIZE;
+        put_u64(&mut buf, ph1 + 16, 0x1000);
+        put_u64(&mut buf, ph1 + 32, 0);
+        put_u64(&mut buf, ph1 + 40, 1u64 << 62);
         let img = ElfImage::parse(&buf).unwrap();
         match MappedObject::map_and_relocate(&img, &buf, PAGE) {
             Err(MapError::SpanOverflow(_)) | Err(MapError::Os(_)) => {}
@@ -1822,14 +1391,11 @@ mod tests {
 
     #[test]
     fn segment_filesz_past_file_bytes_is_typed_err() {
-        // LOAD1's p_offset+p_filesz points past the end of the (truncated) file slice → a typed
-        // SegmentOutOfFile, never an OOB read of the source slice. Keep filesz <= memsz so that
-        // guard does not fire first; enlarge memsz to match.
         let mut buf = build_two_segment_fixture();
-        let ph1 = PH_OFF + PHDR_SIZE; // LOAD1
-        put_u64(&mut buf, ph1 + 8, 0x1000); // p_offset
-        put_u64(&mut buf, ph1 + 32, 0x4000); // p_filesz far past the 0x1040-byte file
-        put_u64(&mut buf, ph1 + 40, 0x4000); // p_memsz == filesz (legal ratio)
+        let ph1 = PH_OFF + PHDR_SIZE;
+        put_u64(&mut buf, ph1 + 8, 0x1000);
+        put_u64(&mut buf, ph1 + 32, 0x4000);
+        put_u64(&mut buf, ph1 + 40, 0x4000);
         let img = ElfImage::parse(&buf).unwrap();
         assert!(matches!(
             MappedObject::map_and_relocate(&img, &buf, PAGE),
