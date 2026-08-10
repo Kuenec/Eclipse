@@ -1,26 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package android.view;
 
 import android.content.Context;
@@ -39,7 +17,6 @@ import org.xmlpull.v1.XmlPullParserFactory;
 
 public class LayoutInflater {
 	private static final String TAG = "LayoutInflater";
-
 
 	private int indent = 1;
 	private String tabs(int indent) {
@@ -101,9 +78,6 @@ public class LayoutInflater {
 		return view_instance;
 	}
 
-
-
-
 	protected View onCreateView(String name, AttributeSet attrs) throws Exception {
 		try {
 			return createView(name, "android.view.", attrs);
@@ -115,9 +89,6 @@ public class LayoutInflater {
 			}
 		}
 	}
-
-
-
 
 	protected View onCreateView(View parent, String name, AttributeSet attrs) throws Exception {
 		return onCreateView(name, attrs);
@@ -172,7 +143,6 @@ public class LayoutInflater {
 
 		View result = root;
 
-
 		int type;
 		while ((type = parser.next()) != XmlPullParser.START_TAG &&
 		       type != XmlPullParser.END_DOCUMENT) {
@@ -210,12 +180,10 @@ public class LayoutInflater {
 			if (root != null) {
 				Slog.v(TAG, tabs(indent) + "Creating params from root: " + root);
 
-
 				try {
 					params = root.generateLayoutParams(attrs);
 					params.resolveLayoutDirection(root.getLayoutDirection());
 					if (!attachToRoot) {
-
 
 						temp.setLayoutParams(params);
 					}
@@ -226,18 +194,13 @@ public class LayoutInflater {
 
 			Slog.v(TAG, tabs(indent) + "-----> start inflating children");
 
-
 			rInflate(parser, temp, attrs, true);
 
 			Slog.v(TAG, tabs(indent) + "-----> done inflating children");
 
-
-
 			if (root != null && attachToRoot) {
 				root.addView(temp, params);
 			}
-
-
 
 			if (root == null || !attachToRoot) {
 				result = temp;
@@ -264,7 +227,6 @@ public class LayoutInflater {
 
 			if (name.equals("requestFocus")) {
 
-
 				parseRequestFocus(parser, parent);
 			} else if (name.equals("include")) {
 				if (parser.getDepth() == 0) {
@@ -275,10 +237,6 @@ public class LayoutInflater {
 				throw new Exception("<merge /> must be the root element");
 			} else if (name.equals("blink")) {
 				throw new Exception("<blink> not supported atm");
-
-
-
-
 
 			} else {
 				final View view = createViewFromTag(parent, name, attrs);
@@ -300,18 +258,9 @@ public class LayoutInflater {
 			parent.onFinishInflate();
 	}
 
-
-
-
-
-
-
-
 	private void parseRequestFocus(XmlPullParser parser, View view) throws Exception {
 		consumeChildElements(parser);
 	}
-
-
 
 	private void consumeChildElements(XmlPullParser parser) throws Exception {
 		int type;
@@ -341,7 +290,6 @@ public class LayoutInflater {
 
 		final String childName = childParser.getName();
 		if ("merge".equals(childName)) {
-
 
 			rInflate(childParser, parent, childAttrs, false);
 		} else {

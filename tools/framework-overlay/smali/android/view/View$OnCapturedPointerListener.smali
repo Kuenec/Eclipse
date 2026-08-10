@@ -1,14 +1,6 @@
 
-
-
-
-
-
-
 .class public interface abstract Landroid/view/View$OnCapturedPointerListener;
 .super Ljava/lang/Object;
-
-
 
 .annotation system Ldalvik/annotation/EnclosingClass;
     value = Landroid/view/View;
@@ -18,8 +10,6 @@
     accessFlags = 0x609
     name = "OnCapturedPointerListener"
 .end annotation
-
-
 
 .method public abstract onCapturedPointer(Landroid/view/View;Landroid/view/MotionEvent;)Z
 .end method

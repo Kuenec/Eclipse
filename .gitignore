@@ -4,28 +4,22 @@
 **/target/
 **/*.rs.bk
 
-
 /dist/
-
 
 /vendor/
 /build/
-
 
 *.apk
 *.apks
 *.xapk
 
-
 *.log
 /m0-artifacts/
 framework-worklist.txt
 
-
 .claude/
 
 /examples/
-
 
 .idea/
 .vscode/

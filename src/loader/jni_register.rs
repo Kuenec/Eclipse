@@ -82,12 +82,8 @@ pub fn register_preloaded_natives(
             let name_str = JNIString::from(*method);
             let sig_str = JNIString::from(*sig);
 
-
-
-
             let nm =
                 unsafe { NativeMethod::from_raw_parts(&name_str, &sig_str, *addr as *mut c_void) };
-
 
             match unsafe { env.register_native_methods(&cls, std::slice::from_ref(&nm)) } {
                 Ok(()) => {

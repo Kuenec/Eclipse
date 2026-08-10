@@ -9,16 +9,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-
-
-
-
-
-
-
-
-
-
 static const char eclipse_android_settings_path[] =
     "/data/local/tmp/ClientAppSettings.json";
 static const char eclipse_host_settings_env[] =

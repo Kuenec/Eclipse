@@ -1,9 +1,4 @@
 
-
-
-
-
-
 package android.webkit;
 
 import android.graphics.Bitmap;

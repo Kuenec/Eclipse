@@ -4,21 +4,6 @@ import android.graphics.Bitmap;
 import android.os.Handler;
 import android.os.Looper;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 public class EclipseWebViewClientProbe extends WebViewClient {
 
     public static volatile Handler lastHandler;

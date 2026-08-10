@@ -1,26 +1,14 @@
 #!/usr/bin/env bash
 
-
-
-
-
-
-
-
-
-
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 
-
 ATL_SRC="${ATL_SRC:-$repo/vendor/atl/src/api-impl}"
 ORIG_FW="${ORIG_FW:-/usr/lib/java/dex/android_translation_layer}"
 ART_DIR="${ART_DIR:-/usr/lib/java/dex/art}"
 OUT="${OUT:-${XDG_CACHE_HOME:-$HOME/.cache}/eclipse/framework-patched}"
-
-
 
 ART_BOOT_JARS=(
     core-oj-hostdex.jar
@@ -34,7 +22,6 @@ ART_BOOT_JARS=(
     okhttp-hostdex.jar
     wolfssljni-hostdex.jar
 )
-
 
 find_jdk_tool() {
     local tool="$1" cand
@@ -57,8 +44,6 @@ for art_jar in "${ART_BOOT_JARS[@]}"; do
     [ -f "$ART_DIR/$art_jar" ] || fail "ART boot jar missing at $ART_DIR/$art_jar (set ART_DIR; install the pinned art_standalone runtime)"
 done
 
-
-
 JAVA="${JAVA:-$(find_jdk_tool java)}"
 BAKSMALI_JAR="${BAKSMALI_JAR:-$repo/vendor/toolchain/smali/baksmali-2.5.2.jar}"
 SMALI_JAR="${SMALI_JAR:-$repo/vendor/toolchain/smali/smali-2.5.2.jar}"
@@ -69,9 +54,6 @@ SMALI_JAR="${SMALI_JAR:-$repo/vendor/toolchain/smali/smali-2.5.2.jar}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/gen/android/os" "$work/classes" "$work/stage" "$work/jar" "$work/art"
-
-
-
 
 anchor='public static final String[] SUPPORTED_ABIS'
 hits="$(grep -cF "$anchor" "$ATL_SRC/android/os/Build.java")" || true
@@ -89,34 +71,18 @@ awk -v anchor="$anchor" '
     }
 ' "$ATL_SRC/android/os/Build.java" > "$work/gen/android/os/Build.java"
 
-
-
 li_src="$here/src/android/view/LayoutInflater.java"
 [ -f "$li_src" ] || fail "patched LayoutInflater.java missing at $li_src"
 grep -qF 'parseRequestFocus(parser, parent);' "$li_src" || fail "patched LayoutInflater.java no longer calls parseRequestFocus — the <requestFocus/> fix regressed"
 ! grep -qF '<requestFocus /> not supported atm' "$li_src" || fail "patched LayoutInflater.java still throws the old <requestFocus/> 'not supported atm' — the fix regressed"
 
-
-
-
-
-
 vc_src="$here/src/android/webkit/ValueCallback.java"
 [ -f "$vc_src" ] || fail "patched ValueCallback.java missing at $vc_src"
 grep -qE 'public[[:space:]]+interface[[:space:]]+ValueCallback' "$vc_src" || fail "patched ValueCallback.java is not an interface — the IncompatibleClassChangeError fix regressed"
 
-
-
-
-
-
 kg_src="$here/src/android/app/KeyguardManager.java"
 [ -f "$kg_src" ] || fail "patched KeyguardManager.java missing at $kg_src"
 grep -qF 'public boolean isDeviceSecure()' "$kg_src" || fail "patched KeyguardManager.java no longer declares isDeviceSecure() — the NoSuchMethodError fix regressed"
-
-
-
-
 
 am_src="$here/src/android/app/ActivityManager.java"
 [ -f "$am_src" ] || fail "patched ActivityManager.java missing at $am_src"
@@ -133,10 +99,6 @@ do
 done
 ! grep -qF 'outInfo = new MemoryInfo();' "$am_src" || fail "ActivityManager.getMemoryInfo again reassigns only its local parameter — the 0MB bug regressed"
 
-
-
-
-
 ji_src="$here/src/android/webkit/JavascriptInterface.java"
 [ -f "$ji_src" ] || fail "M4 JavascriptInterface.java missing at $ji_src"
 grep -qF 'public @interface JavascriptInterface' "$ji_src" || fail "JavascriptInterface.java is not an @interface — the M4 bridge annotation regressed"
@@ -145,25 +107,12 @@ bp_src="$here/src/android/webkit/EclipseBridgeProbe.java"
 [ -f "$bp_src" ] || fail "M4 EclipseBridgeProbe.java missing at $bp_src"
 grep -qF '@JavascriptInterface' "$bp_src" || fail "EclipseBridgeProbe.java lost its @JavascriptInterface echo — __webview-test bridge leg regressed"
 
-
-
-
-
-
-
-
-
 wvcp_src="$here/src/android/webkit/EclipseWebViewClientProbe.java"
 [ -f "$wvcp_src" ] || fail "M6 EclipseWebViewClientProbe.java missing at $wvcp_src"
 grep -qF 'new Handler();' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer constructs a Handler — __webview-test would go blind to the Looper-less-dispatch class (2026-07-16)"
 grep -qF 'Looper.myLooper() != Looper.getMainLooper()' "$wvcp_src" || fail "EclipseWebViewClientProbe.java lost its UI-thread assertion — a prepared-but-undrained Looper on the upcall thread would pass this guard green"
 grep -qF 'onPageStarted(WebView view, String url, Bitmap favicon)' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer overrides the AOSP 3-arg onPageStarted — the M6 state-0 dispatch would go unpinned"
 grep -qF 'onPageFinished(WebView view, String url)' "$wvcp_src" || fail "EclipseWebViewClientProbe.java no longer overrides onPageFinished — half the confirmed 2026-07-16 defect would go unpinned"
-
-
-
-
-
 
 pc_src="$here/src/android/view/PixelCopy.java"
 [ -f "$pc_src" ] || fail "PixelCopy.java compatibility surface missing at $pc_src"
@@ -172,25 +121,11 @@ grep -qF 'listenerThread.post(new Runnable()' "$pc_src" || fail "PixelCopy.java 
 grep -qF 'listener.onPixelCopyFinished(ERROR_SOURCE_NO_DATA);' "$pc_src" || fail "PixelCopy.java no longer reports the honest ERROR_SOURCE_NO_DATA result"
 ! grep -qF 'listener.onPixelCopyFinished(SUCCESS);' "$pc_src" || fail "PixelCopy.java fabricates SUCCESS without a pixel-copy backend"
 
-
-
-
-
-
-
-
-
-
-
-
 r_src="$ATL_SRC/com/android/internal/R.java"
 [ -f "$r_src" ] || fail "vendored com/android/internal/R.java not found at $r_src (set ATL_SRC)"
 grep -qF 'public static final int id=0x010100d0;' "$r_src" || fail "vendored internal R.attr.id != 0x010100d0 — ATL source drifted; re-verify the overlay's inlined constants"
 grep -qF 'public static final int theme=0x01010000;' "$r_src" || fail "vendored internal R.attr.theme != 0x01010000 — ATL source drifted; re-verify the overlay's inlined constants"
 [ ! -e "$here/stubs/com/android/internal/R.java" ] || fail "stub com/android/internal/R.java re-appeared — javac would inline its placeholder constants into the overlay dex (the 2026-07-02 include-id NPE class); delete it (the vendored R.java is the compile input)"
-
-
-
 
 "$JAVAC" --release 8 -Xlint:-options -d "$work/classes" \
     -sourcepath "$work/gen:$here/src:$here/stubs" \
@@ -207,20 +142,11 @@ grep -qF 'public static final int theme=0x01010000;' "$r_src" || fail "vendored 
     "$pc_src" \
     "$r_src"
 
-
 for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     cp "$work/classes/"$pattern "$work/stage/$dir/"
 done
-
-
-
-
-
-
-
-
 
 for forbidden in 'android/webkit/WebView.class' 'android/webkit/WebViewClient.class' \
                  'android/os/Handler.class' 'android/os/Looper.class' \
@@ -234,13 +160,7 @@ for stub in android/webkit/WebView.java android/webkit/WebViewClient.java \
     ! grep -qE 'static[[:space:]]+final' "$here/stubs/$stub" || fail "M6 stub $stub declares a constant — javac would INLINE its placeholder value into the overlay dex (the 2026-07-02 guard-1e class)"
 done
 
-
 "$DX" --dex --output="$work/jar/classes.dex" "$work/stage"
-
-
-
-
-
 
 "$JAVA" -jar "$BAKSMALI_JAR" disassemble "$work/jar/classes.dex" -o "$work/smali-check" >/dev/null
 lism="$work/smali-check/android/view/LayoutInflater.smali"
@@ -248,20 +168,12 @@ lism="$work/smali-check/android/view/LayoutInflater.smali"
 grep -qF '0x10100d0' "$lism" || fail "dexed LayoutInflater lost the inlined android:id constant (0x010100d0) — the <include android:id> override would silently drop (2026-07-02 RobloxToolbar NPE class)"
 grep -qF '0x1010000' "$lism" || fail "dexed LayoutInflater lost the inlined android:theme constant (0x01010000) — createView's android:theme handling would silently drop"
 
-
-
-
-
-
 wvcpsm="$work/smali-check/android/webkit/EclipseWebViewClientProbe.smali"
 [ -f "$wvcpsm" ] || fail "EclipseWebViewClientProbe.smali not in the built classes.dex — the __webview-test Looper-contract probe did not stage"
 grep -qF 'Landroid/os/Handler;-><init>()V' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost the no-arg Handler construction — the 2026-07-16 Looper-less-dispatch guard would not fire"
 
 grep -qF 'Landroid/os/Looper;->getMainLooper()' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost its UI-thread assertion"
 grep -qF 'onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvcpsm" || fail "dexed EclipseWebViewClientProbe lost the AOSP 3-arg onPageStarted override — internalLoadChanged's state-0 dispatch would miss it (and the stub has drifted from the classes2 shadow)"
-
-
-
 
 pcsm="$work/smali-check/android/view/PixelCopy.smali"
 pcrsm="$work/smali-check/android/view/PixelCopy\$1.smali"
@@ -271,13 +183,6 @@ grep -qF 'request(Landroid/view/SurfaceView;Landroid/graphics/Bitmap;Landroid/vi
 grep -qF 'Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z' "$pcsm" || fail "dexed PixelCopy no longer posts completion through Handler"
 grep -qF 'Landroid/view/PixelCopy$OnPixelCopyFinishedListener;->onPixelCopyFinished(I)V' "$pcrsm" || fail "dexed PixelCopy Runnable no longer invokes its listener"
 grep -qE 'const/4 v[0-9]+, 0x3' "$pcrsm" || fail "dexed PixelCopy Runnable no longer reports ERROR_SOURCE_NO_DATA (3)"
-
-
-
-
-
-
-
 
 unzip -p "$ORIG_FW/api-impl.jar" classes.dex > "$work/stock-classes.dex"
 "$JAVA" -jar "$BAKSMALI_JAR" disassemble "$work/stock-classes.dex" -o "$work/smali" >/dev/null
@@ -299,15 +204,9 @@ perl -0pi -e 's{(value = \{\n)(        Landroid/view/View\$DeclaredOnClickListen
 grep -qF 'setOnCapturedPointerListener(Landroid/view/View$OnCapturedPointerListener;)V' "$vsm" || fail "View.smali setter insert failed (drift?)"
 grep -qF 'mCapturedPointerListener:Landroid/view/View$OnCapturedPointerListener;' "$vsm" || fail "View.smali field insert failed (drift?)"
 
-
-
-
 perl -0pi -e 's{(\.method public setOnCapturedPointerListener\(Landroid/view/View\$OnCapturedPointerListener;\)V.*?\.end method\n)}{$1no-ops (RbxKeyboard configures the login EditText for autofill; ATL omits these). No autofill service.\n.method public setAutofillHints([Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method\n\n.method public setImportantForAutofill(I)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$vsm"
 grep -qF 'setAutofillHints([Ljava/lang/String;)V' "$vsm" || fail "View.smali setAutofillHints insert failed (drift?)"
 grep -qF 'setImportantForAutofill(I)V' "$vsm" || fail "View.smali setImportantForAutofill insert failed (drift?)"
-
-
-
 
 dsm="$work/smali/android/view/Display.smali"
 [ -f "$dsm" ] || fail "Display.smali not found after baksmali"
@@ -316,31 +215,11 @@ n="$(grep -cF '.method public getRefreshRate()F' "$dsm")" || true
 perl -0pi -e 's{(\.method public getRefreshRate\(\)F.*?\.end method\n)}{$1n Activity.onStart for framerate setup; ATL omits it). Returns {60.0f} to match getRefreshRate above.\n.method public getSupportedRefreshRates()[F\n    .locals 3\n\n    const/4 v0, 0x1\n\n    new-array v0, v0, [F\n\n    const/4 v1, 0x0\n\n    const/high16 v2, 0x42700000    # 60.0f\n\n    aput v2, v0, v1\n\n    return-object v0\n.end method\n}s' "$dsm"
 grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali getSupportedRefreshRates insert failed (drift?)"
 
-
-
 n="$(grep -cF '.method public getWidth()I' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali getWidth anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
 ! grep -qF 'getMode()Landroid/view/Display$Mode;' "$dsm" || fail "Display.smali already declares getMode — installed Display drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public getWidth\(\)I.*?\.end method\n)}{$1nResume startup; ATL omits it + Display\$Mode). Build a Mode from window_width/window_height + 60.0f (consistent with getWidth/getHeight/getRefreshRate).\n.method public getMode()Landroid/view/Display\$Mode;\n    .locals 5\n\n    new-instance v0, Landroid/view/Display\$Mode;\n\n    const/4 v1, 0x0\n\n    sget v2, Landroid/view/Display;->window_width:I\n\n    sget v3, Landroid/view/Display;->window_height:I\n\n    const/high16 v4, 0x42700000    # 60.0f\n\n    invoke-direct {v0, v1, v2, v3, v4}, Landroid/view/Display\$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n}s' "$dsm"
 grep -qF 'getMode()Landroid/view/Display$Mode;' "$dsm" || fail "Display.smali getMode insert failed (drift?)"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fsm="$work/smali/android/app/Fragment.smali"
 [ -f "$fsm" ] || fail "Fragment.smali not found after baksmali"
@@ -354,27 +233,14 @@ grep -qF 'onActivityCreated(Landroid/os/Bundle;)V' "$fsm" || fail "Fragment.smal
 asm="$work/smali/android/app/Activity.smali"
 [ -f "$asm" ] || fail "Activity.smali not found after baksmali"
 
-
-
-
 ANCHOR_PC=$'.method protected onPostCreate(Landroid/os/Bundle;)V\n    .registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static {v0, v1}, Landroid/util/Slog;->i(Ljava/lang/String;Ljava/lang/String;)I\n\n    return-void\n.end method'
 n="$(grep -cF '.method protected onPostCreate(Landroid/os/Bundle;)V' "$asm")" || true
 [ "$n" = "1" ] || fail "Activity.smali onPostCreate anchor not unique (found $n, expected 1) — installed Activity drifted; update patch-framework.sh"
 ANCHOR_PC="$ANCHOR_PC" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_PC}) >= 0) ? 0 : 1)' "$asm" || fail "Activity.smali onPostCreate body changed from the expected no-op — installed Activity drifted; update patch-framework.sh"
 ! grep -qF 'onActivityCreated(Landroid/os/Bundle;)V' "$asm" || fail "Activity.smali already dispatches onActivityCreated — installed Activity drifted; update patch-framework.sh"
 
-
 perl -0pi -e 's{\.method protected onPostCreate\(Landroid/os/Bundle;\)V\n    \.registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i\(Ljava/lang/String;Ljava/lang/String;\)I\n\n    return-void\n\.end method}{.method protected onPostCreate(Landroid/os/Bundle;)V\n    .registers 4\n\n    const-string v0, "Activity"\n\n    const-string v1, "- onPostCreate - yay!"\n\n    invoke-static \{v0, v1\}, Landroid/util/Slog;->i(Ljava/lang/String;Ljava/lang/String;)I\nnt.onActivityCreated(savedInstanceState) (AOSP create-ndroidx ReportFragment fires Lifecycle.Event.ON_CREATE while thenStart dispatches ON_START. Eclipse drives onPostCreaten onCreate and onStart, after the onCreate super-chain has injected the ReportFragment.\n    iget-object v0, p0, Landroid/app/Activity;->fragments:Ljava/util/List;\n\n    invoke-interface \{v0\}, Ljava/util/List;->iterator()Ljava/util/Iterator;\n\n    move-result-object v1\n\n    :goto_pc\n    invoke-interface \{v1\}, Ljava/util/Iterator;->hasNext()Z\n\n    move-result v0\n\n    if-eqz v0, :cond_pc\n\n    invoke-interface \{v1\}, Ljava/util/Iterator;->next()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, Landroid/app/Fragment;\n\n    invoke-virtual \{v0, p1\}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V\n\n    goto :goto_pc\n\n    :cond_pc\n    return-void\n.end method}s' "$asm"
 grep -qF 'invoke-virtual {v0, p1}, Landroid/app/Fragment;->onActivityCreated(Landroid/os/Bundle;)V' "$asm" || fail "Activity.smali onPostCreate dispatch insert failed (drift?)"
-
-
-
-
-
-
-
-
-
 
 lmsm="$work/smali/android/location/LocationManager.smali"
 [ -f "$lmsm" ] || fail "LocationManager.smali not found after baksmali"
@@ -386,9 +252,6 @@ grep -qF '.method public isProviderEnabled(Ljava/lang/String;)Z' "$lmsm" || fail
 grep -qF 'Ljava/lang/IllegalArgumentException;-><init>(Ljava/lang/String;)V' "$lmsm" || fail "LocationManager.smali null-provider contract insert failed"
 grep -qF ':eclipse_location_provider_non_null' "$lmsm" || fail "LocationManager.smali disabled-provider return path insert failed"
 
-
-
-
 vibsm="$work/smali/android/os/Vibrator.smali"
 [ -f "$vibsm" ] || fail "Vibrator.smali not found after baksmali"
 n="$(grep -cF '.method public vibrate(J)V' "$vibsm")" || true
@@ -396,11 +259,6 @@ n="$(grep -cF '.method public vibrate(J)V' "$vibsm")" || true
 ! grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali already declares cancel — installed Vibrator drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public vibrate\(J\)V.*?\.end method\n)}{$1ncel() no-op (Roblox calls it on a Timer thread; ATL omits it). No vibration device -> nothing to cancel.\n.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$vibsm"
 grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali cancel insert failed (drift?)"
-
-
-
-
-
 
 afm="$work/smali/android/view/autofill/AutofillManager.smali"
 [ -f "$afm" ] || fail "AutofillManager.smali not found after baksmali"
@@ -410,18 +268,9 @@ n="$(grep -cF '.method public unregisterCallback(Landroid/view/autofill/Autofill
 perl -0pi -e 's{(\.method public unregisterCallback\(Landroid/view/autofill/AutofillManager\$AutofillCallback;\)V.*?\.end method\n)}{$1nager.cancel() no-op (Roblox RbxKeyboard.i() calls it when showing text input for a focused login field; ATL omits it). No autofill service -> nothing to cancel.\n.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$afm"
 grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali cancel insert failed (drift?)"
 
-
-
-
 ! grep -qF 'requestAutofill(Landroid/view/View;)V' "$afm" || fail "AutofillManager.smali already declares requestAutofill — drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public cancel\(\)V.*?\.end method\n)}{$1nager.requestAutofill(View) no-op (Roblox RbxKeyboard.i() requests autofill for a focused login field; ATL omits it). No autofill service -> no-op.\n.method public requestAutofill(Landroid/view/View;)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$afm"
 grep -qF 'requestAutofill(Landroid/view/View;)V' "$afm" || fail "AutofillManager.smali requestAutofill insert failed (drift?)"
-
-
-
-
-
-
 
 csm="$work/smali/android/webkit/CookieManager.smali"
 [ -f "$csm" ] || fail "CookieManager.smali not found after baksmali"
@@ -465,11 +314,6 @@ cat >> "$csm" <<'ECLIPSE_CM_NATIVES'
 .end method
 ECLIPSE_CM_NATIVES
 
-
-
-
-
-
 wvsm="$work/smali/android/webkit/WebView.smali"
 wssm="$work/smali/android/webkit/WebSettings.smali"
 [ -f "$wvsm" ] || fail "WebView.smali not found after baksmali"
@@ -499,53 +343,21 @@ ECLIPSE_WV_NATIVES
 grep -qF 'const-string v0, "GDPR VIOLATION"' "$wssm" || fail "WebSettings.smali no longer returns \"GDPR VIOLATION\" (installed shape drifted; update patch-framework.sh)"
 ECLIPSE_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6'
 
-
-
-
-
-
 ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public getUserAgentString\(\)Ljava/lang/String;.*?\.end method\n}{".method public getUserAgentString()Ljava/lang/String;\n    .registers 2\nntString wins; null = it set none.\n    invoke-direct {p0}, Landroid/webkit/WebSettings;->native_getUserAgentString()Ljava/lang/String;\n\n    move-result-object v0\n\n    if-nez v0, :cond_eclipse_ua_app\nno UA: the Eclipse fallback literal (MUST byte-match engine.rs ECLIPSE_USER_AGENT).\n    const-string v0, \"$ua\"\n\n    :cond_eclipse_ua_app\n    return-object v0\n.end method\n"}se' "$wssm"
 grep -qF -- '->native_getUserAgentString()Ljava/lang/String;' "$wssm" || fail "WebSettings getUserAgentString native-body insert failed (drift?)"
 ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public static getDefaultUserAgent\(Landroid/content/Context;\)Ljava/lang/String;.*?\.end method\n}{".method public static getDefaultUserAgent(Landroid/content/Context;)Ljava/lang/String;\n    .registers 2\n\n    const-string v0, \"$ua\"\n\n    return-object v0\n.end method\n"}se' "$wssm"
 grep -qF 'Eclipse-WebView/149.0.6' "$wssm" || fail "WebSettings honest-UA insert failed (drift?)"
 ! grep -qF 'GDPR VIOLATION' "$wssm" || fail "WebSettings still returns \"GDPR VIOLATION\" (honest-UA fix incomplete)"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ! grep -qF 'native_setUserAgentString' "$wssm" || fail "WebSettings.smali already carries native_setUserAgentString — drifted; update patch-framework.sh"
 n="$(grep -cF '.method public setUserAgentString(Ljava/lang/String;)V' "$wssm")" || true
 [ "$n" = "1" ] || fail "WebSettings.smali setUserAgentString anchor not unique (found $n, expected 1) — installed WebSettings drifted; update patch-framework.sh"
 
-
 ANCHOR_UAS=$'.method public setUserAgentString(Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method'
 ANCHOR_UAS="$ANCHOR_UAS" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_UAS}) >= 0) ? 0 : 1)' "$wssm" || fail "WebSettings.smali setUserAgentString body changed from the expected empty no-op — installed WebSettings drifted; update patch-framework.sh"
 
-
 perl -0pi -e 's{\.method public setUserAgentString\(Ljava/lang/String;\)V.*?\.end method\n}{.method public setUserAgentString(Ljava/lang/String;)V\n    .registers 2\n\x27s UA — ATL\x27s stub silently discarded it (§6 💥).\n    invoke-direct {p0, p1}, Landroid/webkit/WebSettings;->native_setUserAgentString(Ljava/lang/String;)V\n\n    return-void\n.end method\n}s' "$wssm"
 grep -qF -- '->native_setUserAgentString(Ljava/lang/String;)V' "$wssm" || fail "WebSettings setUserAgentString native-body insert failed (drift?)"
-
-
 
 ANCHOR_UAS="$ANCHOR_UAS" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_UAS}) >= 0) ? 1 : 0)' "$wssm" || fail "WebSettings.setUserAgentString is still the empty no-op — the app's UA would be silently discarded again (§6 2026-07-16 💥)"
 
@@ -559,22 +371,6 @@ cat >> "$wssm" <<'ECLIPSE_WS_NATIVES'
 .end method
 ECLIPSE_WS_NATIVES
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 n="$(grep -cF '.method internalLoadChanged(ILjava/lang/String;)V' "$wvsm")" || true
 [ "$n" = "1" ] || fail "WebView.smali internalLoadChanged anchor not unique (found $n, expected 1) — installed WebView drifted; update patch-framework.sh"
 ANCHOR_ILC=$'.method internalLoadChanged(ILjava/lang/String;)V\n    .registers 4\n\n    if-nez p1, :cond_c\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_c\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    :cond_b\n    :goto_b\n    return-void\n\n    :cond_c\n    const/4 v0, 0x3\n\n    if-ne p1, v0, :cond_b\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_b\n\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    goto :goto_b\n.end method'
@@ -582,9 +378,6 @@ ANCHOR_ILC="$ANCHOR_ILC" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_ILC}) >= 0)
 perl -0pi -e 's{\.method internalLoadChanged\(ILjava/lang/String;\)V.*?\.end method\n}{.method internalLoadChanged(ILjava/lang/String;)V\n    .registers 5\nnPageStarted(WebView,String,Bitmap) atn AOSP-compiled onPageStarted \@Override never received the ATL-only 2-arg form —nge16 saw onPageFinished fire but never onPageStarted). onPageFinished stays 2-arg (itsnull Bitmap (OSR has no favicon). The base 3-arg chains to the 2-arg form.\n    iget-object v0, p0, Landroid/webkit/WebView;->webViewClient:Landroid/webkit/WebViewClient;\n\n    if-eqz v0, :cond_eclipse_ilc_done\n\n    if-nez p1, :cond_eclipse_ilc_finished\n\n    const/4 v1, 0x0\n\n    invoke-virtual {v0, p0, p2, v1}, Landroid/webkit/WebViewClient;->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V\n\n    return-void\n\n    :cond_eclipse_ilc_finished\n    const/4 v1, 0x3\n\n    if-ne p1, v1, :cond_eclipse_ilc_done\n\n    invoke-virtual {v0, p0, p2}, Landroid/webkit/WebViewClient;->onPageFinished(Landroid/webkit/WebView;Ljava/lang/String;)V\n\n    :cond_eclipse_ilc_done\n    return-void\n.end method\n}s' "$wvsm"
 grep -qF -- '->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvsm" || fail "WebView.smali internalLoadChanged 3-arg onPageStarted dispatch insert failed (drift?)"
 ! grep -qF -- '->onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;)V' "$wvsm" || fail "WebView.smali still dispatches the 2-arg onPageStarted (M6 3-arg dispatch incomplete)"
-
-
-
 
 wvcsm="$work/smali/android/webkit/WebViewClient.smali"
 [ -f "$wvcsm" ] || fail "WebViewClient.smali not found after baksmali"
@@ -621,8 +414,6 @@ ECLIPSE_WVC_METHODS
 grep -qF -- 'onPageStarted(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V' "$wvcsm" || fail "WebViewClient 3-arg onPageStarted insert failed (drift?)"
 grep -qF -- 'shouldOverrideUrlLoading(Landroid/webkit/WebView;Ljava/lang/String;)Z' "$wvcsm" || fail "WebViewClient shouldOverrideUrlLoading insert failed (drift?)"
 
-
-
 jpm="$work/smali/android/app/job/JobParameters.smali"
 [ -f "$jpm" ] || fail "JobParameters.smali not found after baksmali"
 n="$(grep -cF '.method public getExtras()Landroid/os/PersistableBundle;' "$jpm")" || true
@@ -630,14 +421,6 @@ n="$(grep -cF '.method public getExtras()Landroid/os/PersistableBundle;' "$jpm")
 ! grep -qF 'getNetwork()Landroid/net/Network;' "$jpm" || fail "JobParameters.smali already declares getNetwork — drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public getExtras\(\)Landroid/os/PersistableBundle;.*?\.end method\n)}{$1ns null (no Network bound — AOSP-valid; the caller handles null).\n.method public getNetwork()Landroid/net/Network;\n    .locals 1\n\n    const/4 v0, 0x0\n\n    return-object v0\n.end method\n}s' "$jpm"
 grep -qF 'getNetwork()Landroid/net/Network;' "$jpm" || fail "JobParameters.smali getNetwork insert failed (drift?)"
-
-
-
-
-
-
-
-
 
 psm="$work/smali/android/graphics/Paint.smali"
 [ -f "$psm" ] || fail "Paint.smali not found after baksmali"
@@ -649,17 +432,6 @@ ANCHOR_PSET="$ANCHOR_PSET" perl -0777 -ne 'exit((index($_, $ENV{ANCHOR_PSET}) >=
 perl -0pi -e 's{(\.method public set\(Landroid/graphics/Paint;\)V\n    \.registers 4\n)}{$1nt.set(Paint src) no-ops when src == this.nt BEFORE cloning paint.paint, so an unguarded self-set clones a freedndle (use-after-free in the ATL reference C native; a warn-logged reset to a DEFAULT paintnder the Eclipse paint registry, where AOSP preserves the state). Guard restores the contract.\n    if-ne p0, p1, :eclipse_not_self_set\n\n    return-void\n\n    :eclipse_not_self_set\n}s' "$psm"
 grep -qF 'if-ne p0, p1, :eclipse_not_self_set' "$psm" || fail "Paint.smali self-set guard insert failed (drift?)"
 
-
-
-
-
-
-
-
-
-
-
-
 spsm="$work/smali/android/os/SystemProperties.smali"
 [ -f "$spsm" ] || fail "SystemProperties.smali not found after baksmali"
 rk="$(grep -cF '"release-keys"' "$spsm")" || true
@@ -667,20 +439,6 @@ rk="$(grep -cF '"release-keys"' "$spsm")" || true
 perl -0pi -e 's{(const-string [vp]\d+, )"release-keys"}{$1"test-keys"}' "$spsm"
 grep -qF '"test-keys"' "$spsm" || fail "SystemProperties.smali test-keys insert failed (drift?)"
 ! grep -qF '"release-keys"' "$spsm" || fail "SystemProperties.smali still reports release-keys — honest-tags fix regressed"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pmsm="$work/smali/android/content/pm/PackageManager.smali"
 [ -f "$pmsm" ] || fail "PackageManager.smali not found after baksmali"
@@ -694,8 +452,6 @@ grep -qF ':eclipse_not_low_latency_audio' "$pmsm" || fail "PackageManager.smali 
 grep -qF '"android.hardware.type.pc"' "$pmsm" || fail "PackageManager.smali lost the exact desktop-PC feature literal"
 grep -qF '"android.hardware.touchscreen"' "$pmsm" || fail "PackageManager.smali lost the exact touchscreen feature literal"
 grep -qF '"android.hardware.audio.low_latency"' "$pmsm" || fail "PackageManager.smali lost the exact low-latency feature literal"
-
-
 
 mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content/pm" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
@@ -717,19 +473,8 @@ cp "$jpm" "$work/smali-view/android/app/job/JobParameters.smali"
 cp "$psm" "$work/smali-view/android/graphics/Paint.smali"
 "$JAVA" -jar "$SMALI_JAR" assemble "$work/smali-view" -o "$work/jar/classes2.dex" >/dev/null
 
-
-
-
 cp "$work/stock-classes.dex" "$work/jar/classes3.dex"
 (cd "$work/jar" && "$JAR" cf api-impl.jar classes.dex classes2.dex classes3.dex)
-
-
-
-
-
-
-
-
 
 wolf_src="$repo/vendor/atl/thirdparty/art_standalone/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java"
 [ -f "$wolf_src" ] || fail "vendored WolfSSLImplementSSLSession.java missing at $wolf_src"
@@ -759,11 +504,8 @@ if WOLF_ZERO_ANCHOR="$WOLF_ZERO_ANCHOR" perl -0777 -ne 'exit(index($_, $ENV{WOLF
     (cd "$work/wolf-jar-update" && "$JAR" uf "$work/art/wolfssljni-hostdex.jar" classes.dex)
 else
 
-
-
     perl -0777 -ne 'exit(/getPeerCertificateNum\(\)I.*?move-result v7.*?if-nez v7,.*?new-instance .*?SSLPeerUnverifiedException;.*?const-string .*?"No peer certificate".*?throw .*?new-array v1, v7/s ? 0 : 1)' "$work/wolf-peer-method.smali" || fail "wolfSSL getPeerCertificates no longer matches either the known stale body or the source-correct zero guard — ART hostdex drifted"
 fi
-
 
 unzip -p "$work/art/wolfssljni-hostdex.jar" classes.dex > "$work/wolf-verify.dex"
 "$JAVA" -jar "$BAKSMALI_JAR" disassemble "$work/wolf-verify.dex" -o "$work/wolf-verify-smali" >/dev/null
@@ -771,14 +513,10 @@ wolf_verify="$work/wolf-verify-smali/com/wolfssl/provider/jsse/WolfSSLImplementS
 perl -0777 -ne 'if (/(\.method public declared-synchronized getPeerCertificates\(\)\[Ljava\/security\/cert\/Certificate;.*?\.end method)/s) { print $1 }' "$wolf_verify" > "$work/wolf-peer-method-verify.smali"
 perl -0777 -ne 'exit(/getPeerCertificateNum\(\)I.*?move-result v7.*?if-nez v7,.*?new-instance .*?SSLPeerUnverifiedException;.*?const-string .*?"No peer certificate".*?throw .*?new-array v1, v7/s ? 0 : 1)' "$work/wolf-peer-method-verify.smali" || fail "built wolfssljni-hostdex.jar does not enforce the zero-peer-certificate SSLSession contract"
 
-
 mkdir -p "$OUT"
 cp "$work/jar/api-impl.jar" "$OUT/api-impl.jar"
 ln -sfn "$ORIG_FW/framework-res.apk" "$OUT/framework-res.apk"
 ln -sfn "$ORIG_FW/natives" "$OUT/natives"
-
-
-
 
 mkdir -p "$OUT/art"
 art_ready="$OUT/art/.eclipse-art-overlay-v1"

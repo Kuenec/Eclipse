@@ -2157,8 +2157,6 @@ use crate::loader::looper::{
 
 thread_local! {
 
-
-
     static THREAD_LOOPER: std::cell::Cell<Option<ndk_registry::NdkHandle>> =
         const { std::cell::Cell::new(None) };
 }

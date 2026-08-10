@@ -1,11 +1,5 @@
 package android.webkit;
 
-
-
-
-
-
-
 @SuppressWarnings({"rawtypes", "unchecked"})
 public class EclipseBridgeProbe implements ValueCallback {
 

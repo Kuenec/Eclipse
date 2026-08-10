@@ -1,29 +1,6 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 mod engine;
 mod logging;
-
-
-
 
 #[allow(dead_code)]
 mod shared;
@@ -54,15 +31,11 @@ const COMPONENT: &str = "helper";
 
 const HELLO_WATCHDOG: Duration = Duration::from_secs(10);
 
-
 const CONTEXT_INIT_DEADLINE: Duration = Duration::from_secs(10);
 
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 
-
-
 const OUT_QUEUE_HIGH_WATER: usize = 1024;
-
 
 fn parse_ipc_fd<I: Iterator<Item = String>>(args: I) -> Result<RawFd, String> {
     let mut found: Option<RawFd> = None;
@@ -91,41 +64,12 @@ fn parse_ipc_fd<I: Iterator<Item = String>>(args: I) -> Result<RawFd, String> {
     })
 }
 
-
 fn parse_ozone_override<I: Iterator<Item = String>>(args: I) -> Option<String> {
     args.filter_map(|a| a.strip_prefix("--ozone-platform=").map(str::to_string))
         .last()
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn probe_userns() -> bool {
-
-
-
 
     unsafe {
         let pid = libc::fork();
@@ -133,7 +77,6 @@ fn probe_userns() -> bool {
             return false;
         }
         if pid == 0 {
-
 
             let ok =
                 libc::unshare(libc::CLONE_NEWUSER) == 0 && libc::unshare(libc::CLONE_NEWPID) == 0;
@@ -147,22 +90,9 @@ fn probe_userns() -> bool {
     }
 }
 
-
-
-
-
-
-
-
 fn suid_sandbox_stat_ok(is_file: bool, uid: u32, mode: u32) -> bool {
     is_file && uid == 0 && mode & 0o4000 != 0 && mode & 0o001 != 0
 }
-
-
-
-
-
-
 
 fn probe_suid_sandbox(exe_dir: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -177,10 +107,6 @@ fn probe_suid_sandbox(exe_dir: &Path) -> Option<PathBuf> {
     (unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0).then_some(path)
 }
 
-
-
-
-
 wrap_browser_process_handler! {
     struct HelperBrowserProcessHandler {
         context_initialized: Arc<AtomicBool>,
@@ -193,13 +119,6 @@ wrap_browser_process_handler! {
         }
     }
 }
-
-
-
-
-
-
-
 
 wrap_app! {
     struct HelperApp {
@@ -224,7 +143,6 @@ wrap_app! {
             command_line: Option<&mut CommandLine>,
         ) {
 
-
             let is_browser = process_type
                 .map(|p| p.to_string().is_empty())
                 .unwrap_or(true);
@@ -232,11 +150,6 @@ wrap_app! {
             if !is_browser {
                 return;
             }
-
-
-
-
-
 
             let degraded = self.degraded_sandbox.load(Ordering::Acquire);
             for name in engine::FORBIDDEN_PASSTHROUGH_SWITCHES {
@@ -253,7 +166,6 @@ wrap_app! {
                 }
             }
 
-
             let ozone_key = CefString::from("ozone-platform");
             if cmd.has_switch(Some(&ozone_key)) != 1 {
                 let selected = self.ozone.lock().ok().and_then(|s| s.clone());
@@ -268,13 +180,6 @@ wrap_app! {
     }
 }
 
-
-
-
-
-
-
-
 wrap_render_process_handler! {
     struct HelperRenderProcessHandler {
         router: Arc<RendererSideRouter>,
@@ -284,18 +189,6 @@ wrap_render_process_handler! {
 
     impl RenderProcessHandler {
         fn load_handler(&self) -> Option<LoadHandler> {
-
-
-
-
-
-
-
-
-
-
-
-
 
             self.bridge_diag.clone()
         }
@@ -308,45 +201,13 @@ wrap_render_process_handler! {
         ) {
             let frame_owned: Option<Frame> = frame.map(|f| f.clone());
 
-
             let ctx_for_eval: Option<V8Context> = context.as_deref().cloned();
-
 
             self.router.on_context_created(
                 browser.map(|b| b.clone()),
                 frame_owned.clone(),
                 context.map(|c| c.clone()),
             );
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
             if let Some(frame) = frame_owned {
                 let main_frame = frame.is_main() != 0;
@@ -400,16 +261,6 @@ wrap_render_process_handler! {
                                 if let Ok(mut inv) = self.inventory.lock() {
                                     inv.insert(iface.clone(), methods.clone());
                                 }
-
-
-
-
-
-
-
-
-
-
 
                                 if let Some(frame) = frame {
                                     let js =
@@ -474,17 +325,9 @@ wrap_render_process_handler! {
 
 impl HelperRenderProcessHandler {
 
-
-
-
     fn bridge_diag_on(&self) -> bool {
         self.bridge_diag.is_some()
     }
-
-
-
-
-
 
     fn inject_all_stubs(&self, ctx: Option<&V8Context>) -> (usize, usize) {
         let Some(ctx) = ctx else {
@@ -519,8 +362,6 @@ impl HelperRenderProcessHandler {
     }
 }
 
-
-
 fn js_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
@@ -534,22 +375,9 @@ fn js_escape(s: &str) -> String {
     out
 }
 
-
-
-
-
-
 fn format_stub_apply_line(mode: &str, ifaces: usize, methods: usize) -> String {
     format!("bridge stubs applied mode={mode} ifaces={ifaces} methods={methods}")
 }
-
-
-
-
-
-
-
-
 
 fn format_context_ready_line(main_frame: bool) -> String {
     format!(
@@ -558,47 +386,7 @@ fn format_context_ready_line(main_frame: bool) -> String {
     )
 }
 
-
-
 const STUB_TRACE_PREFIX: &str = "ECLIPSE-STUB";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn generate_stub_js(iface: &str, methods: &[String], diag: bool) -> String {
     let name = js_escape(iface);
@@ -607,7 +395,6 @@ fn generate_stub_js(iface: &str, methods: &[String], diag: bool) -> String {
         .map(|m| format!("\"{}\"", js_escape(m)))
         .collect::<Vec<_>>()
         .join(",");
-
 
     let trace_prelude = if diag {
         format!(
@@ -645,37 +432,6 @@ fn generate_stub_js(iface: &str, methods: &[String], diag: bool) -> String {
     )
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn build_bridge_introspection_js(ifaces: &[String]) -> String {
     let names = ifaces
         .iter()
@@ -693,11 +449,6 @@ fn build_bridge_introspection_js(ifaces: &[String]) -> String {
          r.ifaces.push(e);}});return r;}})()"
     )
 }
-
-
-
-
-
 
 fn format_bridge_diag_line(
     main_frame: bool,
@@ -725,10 +476,6 @@ wrap_load_handler! {
         ) {
             let Some(frame) = frame else { return };
 
-
-
-
-
             let ifaces: Vec<String> = match self.inventory.lock() {
 
                 Ok(inv) => {
@@ -738,8 +485,6 @@ wrap_load_handler! {
                 }
                 Err(_) => return,
             };
-
-
 
             let script = build_bridge_introspection_js(&ifaces);
             let main_frame = frame.is_main() != 0;
@@ -757,9 +502,6 @@ wrap_load_handler! {
         }
     }
 }
-
-
-
 
 fn eval_in_frame(frame: &Frame, script: &str) -> (bool, String) {
     let wrapper = format!("JSON.stringify((function(){{return ({script});}})())");
@@ -785,10 +527,8 @@ fn eval_in_frame(frame: &Frame, script: &str) -> (bool, String) {
     }
 }
 
-
 enum Command {
     Msg(ConsumerMsg),
-
 
     Dead,
 }
@@ -798,7 +538,6 @@ fn write_helper_msg(stream: &UnixStream, msg: &HelperMsg) -> std::io::Result<()>
         Ok(bytes) => (&mut &*stream).write_all(&bytes),
         Err(e) => {
 
-
             log::error(COMPONENT, &format!("outbound frame encode failed: {e}"));
             Ok(())
         }
@@ -806,7 +545,6 @@ fn write_helper_msg(stream: &UnixStream, msg: &HelperMsg) -> std::io::Result<()>
 }
 
 fn set_cloexec(stream: &UnixStream) {
-
 
     let ok = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     if ok != 0 {
@@ -827,20 +565,10 @@ fn main() -> ExitCode {
 
     let ozone_slot: Arc<Mutex<Option<String>>> = Arc::default();
 
-
     let degraded_sandbox: Arc<AtomicBool> = Arc::default();
-
-
-
-
-
-
-
-
 
     let bridge_diag =
         engine::bridge_diag_enabled(std::env::var("ECLIPSE_WEBVIEW_BRIDGE_DIAG").ok().as_deref());
-
 
     if bridge_diag && is_browser_process {
         log::warn(
@@ -855,8 +583,6 @@ fn main() -> ExitCode {
              but no text, so the trace is emitted and NOT readable. Set BOTH.",
         );
     }
-
-
 
     let inventory: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
     let render_handler = HelperRenderProcessHandler::new(
@@ -890,7 +616,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-
     let ipc_fd = match parse_ipc_fd(std::env::args()) {
         Ok(fd) => fd,
         Err(msg) => {
@@ -903,11 +628,8 @@ fn main() -> ExitCode {
         }
     };
 
-
-
     let stream = unsafe { UnixStream::from_raw_fd(ipc_fd) };
     set_cloexec(&stream);
-
 
     if stream.set_read_timeout(Some(HELLO_WATCHDOG)).is_err() {
         log::error(COMPONENT, "cannot arm the handshake watchdog");
@@ -916,7 +638,6 @@ fn main() -> ExitCode {
     match proto::read_consumer_msg(&mut &stream) {
         Ok(ConsumerMsg::Hello { version }) if version == shared::PROTO_VERSION => {}
         Ok(ConsumerMsg::Hello { version }) => {
-
 
             let _ = write_helper_msg(
                 &stream,
@@ -963,7 +684,6 @@ fn main() -> ExitCode {
     }
     let _ = stream.set_read_timeout(None);
 
-
     let override_flag = parse_ozone_override(std::env::args());
     let selection = match engine::select_ozone(
         override_flag.as_deref(),
@@ -999,13 +719,6 @@ fn main() -> ExitCode {
         *slot = Some(selection);
     }
 
-
-
-
-
-
-
-
     let allow_unsandboxed = std::env::args().any(|a| a == "--allow-unsandboxed");
     let suid_path = std::env::current_exe()
         .ok()
@@ -1037,7 +750,6 @@ fn main() -> ExitCode {
         engine::SandboxMode::Suid => {
             let path = suid_path.as_deref().unwrap_or(Path::new("chrome-sandbox"));
 
-
             std::env::set_var("CHROME_DEVEL_SANDBOX", path);
             log::info(
                 COMPONENT,
@@ -1058,10 +770,6 @@ fn main() -> ExitCode {
             );
         }
     }
-
-
-
-
 
     let mut render_nodes: Vec<String> = std::fs::read_dir("/dev/dri")
         .map(|rd| {
@@ -1088,11 +796,6 @@ fn main() -> ExitCode {
              SwiftShader software renderer",
         ),
     }
-
-
-
-
-
 
     let profile_paths = match std::env::var_os("ECLIPSE_WEBVIEW_DATA_DIR") {
         Some(root) if Path::new(&root).is_dir() => {
@@ -1146,22 +849,6 @@ fn main() -> ExitCode {
         }
     };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     let ua_diag = std::env::var("ECLIPSE_WEBVIEW_UA_DIAG").ok();
     let app_ua = std::env::var("ECLIPSE_WEBVIEW_APP_UA").ok();
     let user_agent = engine::effective_user_agent(ua_diag.as_deref(), app_ua.as_deref());
@@ -1191,8 +878,6 @@ fn main() -> ExitCode {
         );
     }
 
-
-
     let mut settings = engine::build_settings_with_ua(user_agent);
     engine::apply_persistent_profile(&mut settings, &profile_paths);
     engine::apply_sandbox_mode(&mut settings, &sandbox_mode);
@@ -1216,9 +901,6 @@ fn main() -> ExitCode {
     }
     log::info(COMPONENT, &format!("initialized {}", engine::engine_id()));
 
-
-
-
     let context_deadline = Instant::now() + CONTEXT_INIT_DEADLINE;
     while !context_initialized.load(Ordering::Acquire) && Instant::now() < context_deadline {
         do_message_loop_work();
@@ -1241,7 +923,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-
     let (out_tx, out_rx) = mpsc::sync_channel::<Out>(OUT_QUEUE_HIGH_WATER);
     let outbox = Outbox::new(out_tx);
     let writer_stream = match stream.try_clone() {
@@ -1258,7 +939,6 @@ fn main() -> ExitCode {
                 Out::Msg(msg) => write_helper_msg(&writer_stream, &msg),
                 Out::MsgWithFd(msg, fd) => write_helper_msg(&writer_stream, &msg).and_then(|()| {
 
-
                     fdpass::send_fd_with_sentinel(&writer_stream, fd.as_fd())
                         .map_err(|e| std::io::Error::other(e.to_string()))
                 }),
@@ -1269,7 +949,6 @@ fn main() -> ExitCode {
             }
         }
     });
-
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let reader_stream = match stream.try_clone() {
@@ -1305,10 +984,6 @@ fn main() -> ExitCode {
         }
     });
 
-
-
-
-
     let console_text =
         engine::console_text_diag_enabled(std::env::var("ECLIPSE_WEBVIEW_CONSOLE").ok().as_deref());
     if console_text {
@@ -1318,7 +993,6 @@ fn main() -> ExitCode {
              only; page-controlled content; never a default)",
         );
     }
-
 
     let engine = Engine::new(outbox.clone(), console_text);
     let (exit_code, clean_close) = loop {
@@ -1344,8 +1018,6 @@ fn main() -> ExitCode {
         std::thread::sleep(PUMP_INTERVAL);
     };
 
-
-
     drop(engine);
     drop(outbox);
     let _ = writer.join();
@@ -1370,14 +1042,12 @@ mod tests {
     #[test]
     fn ipc_fd_argument_is_required_and_validated() {
 
-
         let args = |v: &[&str]| {
             v.iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .into_iter()
         };
-
 
         let err = parse_ipc_fd(args(&["eclipse-webview"])).unwrap_err();
         assert!(err.contains("--ipc-fd"));
@@ -1394,7 +1064,6 @@ mod tests {
             Ok(7)
         );
 
-
         assert_eq!(
             parse_ozone_override(args(&["x", "--ozone-platform=wayland"])).as_deref(),
             Some("wayland")
@@ -1404,8 +1073,6 @@ mod tests {
 
     #[test]
     fn generate_stub_js_emits_the_promise_shape_guarded_by_cefquery_and_escapes_identifiers() {
-
-
 
         let js = generate_stub_js("Iface\"x", &["m\\1".to_string()], false);
         assert!(
@@ -1431,10 +1098,6 @@ mod tests {
 
     #[test]
     fn generate_stub_js_gate_off_is_byte_identical_to_the_pre_diag_stub() {
-
-
-
-
 
         let js = generate_stub_js(
             "__globalRobloxAndroidBridge__",
@@ -1466,15 +1129,7 @@ mod tests {
     #[test]
     fn generate_stub_js_gate_on_traces_the_invocation_and_never_binds_arg_values() {
 
-
-
-
-
-
-
         let js = generate_stub_js("Iface\"x", &["m\\1".to_string()], true);
-
-
 
         assert!(js.contains(STUB_TRACE_PREFIX), "{js}");
         assert!(
@@ -1488,14 +1143,12 @@ mod tests {
             "arg count not bound: {js}"
         );
 
-
         for event in ["no-cefQuery", "invoke", "sent", "success", "failure"] {
             assert!(
                 js.contains(&format!("d(\"{event} ")),
                 "missing {event} trace: {js}"
             );
         }
-
 
         for banned in [
             "\"+a+\"",
@@ -1529,8 +1182,6 @@ mod tests {
 
         assert!(js.contains("[\"m\\\\1\"]"), "method name not escaped: {js}");
 
-
-
         assert!(js.contains("var C=window.console,L=C&&C.log"), "{js}");
         assert!(js.contains("try{L.call(C,"), "{js}");
         assert!(
@@ -1542,12 +1193,7 @@ mod tests {
     #[test]
     fn build_bridge_introspection_js_reads_only_our_inventory_and_never_scans_the_page() {
 
-
-
-
-
         let js = build_bridge_introspection_js(&["Iface\"x".to_string(), "B\\1".to_string()]);
-
 
         assert!(
             js.contains("[\"Iface\\\"x\",\"B\\\\1\"]"),
@@ -1558,9 +1204,7 @@ mod tests {
         assert!(js.contains("Object.getOwnPropertyNames"), "{js}");
         assert!(js.contains("typeof v[p]"), "{js}");
 
-
         assert!(js.contains("v!==null&&(typeof v===\"object\""), "{js}");
-
 
         for banned in [
             "Object.keys(window)",
@@ -1579,7 +1223,6 @@ mod tests {
             );
         }
 
-
         let empty = build_bridge_introspection_js(&[]);
         assert!(empty.contains("[].forEach"), "{empty}");
         assert!(empty.contains("typeof window.cefQuery"), "{empty}");
@@ -1587,8 +1230,6 @@ mod tests {
 
     #[test]
     fn format_bridge_diag_line_keeps_the_frame_url_redacted() {
-
-
 
         let frame =
             RedactedTarget::from_raw_url("https://apps.roblox.com/challenge?token=SECRETTOKEN");
@@ -1622,9 +1263,6 @@ mod tests {
     #[test]
     fn format_context_ready_line_binds_the_frame_kind_and_never_a_url() {
 
-
-
-
         assert_eq!(
             format_context_ready_line(true),
             "context ready (requested bridge inventory) main_frame=1"
@@ -1633,7 +1271,6 @@ mod tests {
             format_context_ready_line(false),
             "context ready (requested bridge inventory) main_frame=0"
         );
-
 
         assert_ne!(
             format_context_ready_line(true),
@@ -1652,11 +1289,6 @@ mod tests {
 
     #[test]
     fn suid_sandbox_stat_predicate_byte_matches_chromiums_acceptance() {
-
-
-
-
-
 
         assert!(suid_sandbox_stat_ok(true, 0, 0o104755));
 
