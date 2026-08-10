@@ -1,48 +1,9 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include <cstddef>
 #include <cstring>
 #include <string>
 
 extern "C" {
-
-
-
-
-
-
-
-
-
-
-
 
 int eclipse_art_load_native_library(void* load_fn,
                                     void* vm,
@@ -59,8 +20,6 @@ int eclipse_art_load_native_library(void* load_fn,
         }
         return 0;
     }
-
-
 
     typedef bool (*LoadNativeLibraryFn)(void* self,
                                         void* env,

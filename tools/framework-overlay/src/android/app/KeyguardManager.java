@@ -1,16 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
 package android.app;
 
 public class KeyguardManager {
@@ -25,12 +13,6 @@ public class KeyguardManager {
 	public boolean isKeyguardSecure() {
 		return true;
 	}
-
-
-
-
-
-
 
 	public boolean isDeviceSecure() {
 		return false;

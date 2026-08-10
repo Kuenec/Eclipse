@@ -1,40 +1,7 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include <stdarg.h>
 
-
-
 extern long syscall(long number, ...);
-
-
-
-
-
-
-
 
 long eclipse_bionic_syscall(long number, ...) {
     va_list ap;

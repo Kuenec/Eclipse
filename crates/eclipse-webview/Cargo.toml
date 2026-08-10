@@ -1,29 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 [package]
 name = "eclipse-webview"
 version = "0.0.0"
@@ -42,7 +17,5 @@ path = "src/main.rs"
 [[bin]]
 name = "eclipse-webview-drive"
 path = "src/bin/drive.rs"
-
-
 
 [workspace]

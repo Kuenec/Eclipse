@@ -4,14 +4,6 @@ package android.view;
 import android.graphics.Bitmap;
 import android.os.Handler;
 
-
-
-
-
-
-
-
-
 public final class PixelCopy {
     public static final int SUCCESS = 0;
     public static final int ERROR_UNKNOWN = 1;
@@ -20,15 +12,11 @@ public final class PixelCopy {
     public static final int ERROR_SOURCE_INVALID = 4;
     public static final int ERROR_DESTINATION_INVALID = 5;
 
-
     public interface OnPixelCopyFinishedListener {
         void onPixelCopyFinished(int copyResult);
     }
 
     private PixelCopy() {}
-
-
-
 
     public static void request(
             SurfaceView source,
@@ -45,9 +33,6 @@ public final class PixelCopy {
         if (listenerThread == null) {
             throw new IllegalArgumentException("Handler cannot be null");
         }
-
-
-
 
         listenerThread.post(new Runnable() {
             @Override

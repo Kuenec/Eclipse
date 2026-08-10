@@ -1,14 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
 use crate::logging::{self, RedactedTarget};
 use crate::shared::proto::{BridgeMethod, Console, ConsumerMsg, CookieEntry, HelperMsg};
 use crate::shared::shm;
@@ -35,52 +25,19 @@ const SLOT_COUNT: u8 = 2;
 
 const WINDOWLESS_FPS: c_int = 30;
 
-
-
-
 const COOKIE_VISIT_DEADLINE: Duration = Duration::from_secs(5);
-
 
 const CLOSE_ALL_DEADLINE: Duration = Duration::from_secs(10);
 
-
-
-
-
 pub const FORBIDDEN_PASSTHROUGH_SWITCHES: &[&str] = &["enable-logging", "no-sandbox"];
-
-
-
-
-
-
-
-
-
 
 pub fn console_text_diag_enabled(v: Option<&str>) -> bool {
     v == Some("1")
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 pub fn bridge_diag_enabled(v: Option<&str>) -> bool {
     v == Some("1")
 }
-
-
-
-
 
 pub fn format_console_text_line(
     view: i64,
@@ -95,48 +52,13 @@ pub fn format_console_text_line(
     )
 }
 
-
-
 pub fn engine_id() -> String {
     let bytes = sys::CEF_VERSION;
     let text = std::str::from_utf8(&bytes[..bytes.len().saturating_sub(1)]).unwrap_or("unknown");
     format!("cef/{text}")
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 pub const ECLIPSE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub fn effective_user_agent<'a>(diag: Option<&'a str>, app: Option<&'a str>) -> &'a str {
     match (diag, app) {
@@ -146,28 +68,10 @@ pub fn effective_user_agent<'a>(diag: Option<&'a str>, app: Option<&'a str>) -> 
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn build_settings() -> Settings {
     build_settings_with_ua(ECLIPSE_USER_AGENT)
 }
-
-
-
-
-
 
 pub fn build_settings_with_ua(ua: &str) -> Settings {
     Settings {
@@ -180,16 +84,11 @@ pub fn build_settings_with_ua(ua: &str) -> Settings {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentProfilePaths {
     pub root: String,
     pub profile: String,
 }
-
-
-
-
 
 pub fn persistent_profile_paths(root: &Path) -> Result<PersistentProfilePaths, &'static str> {
     if !root.is_absolute() {
@@ -208,17 +107,11 @@ pub fn persistent_profile_paths(root: &Path) -> Result<PersistentProfilePaths, &
     })
 }
 
-
-
-
-
-
 pub fn apply_persistent_profile(settings: &mut Settings, paths: &PersistentProfilePaths) {
     settings.root_cache_path = CefString::from(paths.root.as_str());
     settings.cache_path = CefString::from(paths.profile.as_str());
     settings.persist_session_cookies = 1;
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoDisplayError;
@@ -235,12 +128,6 @@ impl std::fmt::Display for NoDisplayError {
 }
 
 impl std::error::Error for NoDisplayError {}
-
-
-
-
-
-
 
 pub fn select_ozone(
     override_flag: Option<&str>,
@@ -260,31 +147,15 @@ pub fn select_ozone(
     Err(NoDisplayError)
 }
 
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxMode {
 
-
-
     Userns,
-
 
     Suid,
 
     Degraded,
 }
-
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxUnavailable;
@@ -305,10 +176,6 @@ impl std::fmt::Display for SandboxUnavailable {
 
 impl std::error::Error for SandboxUnavailable {}
 
-
-
-
-
 pub fn select_sandbox_mode(
     userns_ok: bool,
     suid_ok: bool,
@@ -326,22 +193,11 @@ pub fn select_sandbox_mode(
     Err(SandboxUnavailable)
 }
 
-
-
-
-
 pub fn apply_sandbox_mode(settings: &mut Settings, mode: &SandboxMode) {
     if matches!(mode, SandboxMode::Degraded) {
         settings.no_sandbox = 1;
     }
 }
-
-
-
-
-
-
-
 
 pub fn switch_should_be_stripped(name: &str, degraded: bool) -> bool {
     match name {
@@ -350,18 +206,6 @@ pub fn switch_should_be_stripped(name: &str, degraded: bool) -> bool {
         _ => false,
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub fn classify_cookie_set_rejection(
     url: &str,
@@ -416,17 +260,6 @@ pub fn classify_cookie_set_rejection(
     "no local predicate matched — CEF-internal (cookie store unready at first-op, or engine-side sanitization)"
 }
 
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderPathVerdict {
 
@@ -434,8 +267,6 @@ pub enum RenderPathVerdict {
 
     SoftwareFallback,
 }
-
-
 
 pub fn classify_render_path(
     dri_render_nodes: &[String],
@@ -452,19 +283,10 @@ pub fn classify_render_path(
     }
 }
 
-
-
-
-
-
-
 pub enum Out {
     Msg(HelperMsg),
     MsgWithFd(HelperMsg, OwnedFd),
 }
-
-
-
 
 #[derive(Clone)]
 pub struct Outbox {
@@ -512,10 +334,6 @@ impl Outbox {
     }
 }
 
-
-
-
-
 struct PendingData {
     base_url: String,
     data: String,
@@ -533,10 +351,6 @@ struct ViewState {
     slot_bytes: u32,
 
     pending_data: Arc<Mutex<Option<PendingData>>>,
-
-
-
-
 
     driven_url: Option<String>,
 }
@@ -573,18 +387,11 @@ struct EngineState {
     exit_code: i32,
     close_deadline: Option<Instant>,
 
-
-
     request_context: Option<RequestContext>,
-
 
     browser_view: HashMap<i32, i64>,
 
-
     pending_bridge_calls: HashMap<u32, Arc<Mutex<dyn BrowserSideCallback>>>,
-
-
-
 
     view_bridges: HashMap<i64, HashMap<String, Vec<BridgeMethod>>>,
 }
@@ -593,21 +400,17 @@ type Shared = Arc<Mutex<EngineState>>;
 
 fn lock(state: &Shared) -> std::sync::MutexGuard<'_, EngineState> {
 
-
     match state.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
 
-
 pub struct Engine {
     state: Shared,
     out: Outbox,
 
-
     router: Arc<BrowserSideRouter>,
-
 
     console_text: bool,
 }
@@ -642,9 +445,6 @@ impl Engine {
         }
     }
 
-
-
-
     fn request_context(&self) -> Option<RequestContext> {
         let mut st = lock(&self.state);
         if st.request_context.is_none() {
@@ -652,8 +452,6 @@ impl Engine {
         }
         st.request_context.clone()
     }
-
-
 
     fn persistent_cookie_manager(&self) -> Option<CookieManager> {
         self.request_context()
@@ -663,7 +461,6 @@ impl Engine {
     pub fn outbox_dead(&self) -> bool {
         self.out.is_dead()
     }
-
 
     pub fn handle(&self, msg: ConsumerMsg) {
         match msg {
@@ -721,11 +518,6 @@ impl Engine {
                     _ => MouseButtonType::RIGHT,
                 };
 
-
-
-
-
-
                 if down {
                     host.set_focus(1);
                 }
@@ -756,7 +548,6 @@ impl Engine {
                 modifiers,
             } => self.with_host(view, |host| {
 
-
                 host.set_focus(1);
                 let event = KeyEvent {
                     type_: match kind {
@@ -777,7 +568,6 @@ impl Engine {
                 let browser = self.browser_of(view);
                 match browser.as_ref().and_then(|b| b.main_frame()) {
                     Some(frame) => {
-
 
                         frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
                     }
@@ -874,8 +664,6 @@ impl Engine {
         }
     }
 
-
-
     fn bridge_register(&self, view: i64, name: &str, methods: &[BridgeMethod]) {
         {
             let mut st = lock(&self.state);
@@ -896,7 +684,6 @@ impl Engine {
             ),
         );
     }
-
 
     fn bridge_result(&self, call_id: u32, ok: bool, result_json: &str) {
         let cb = lock(&self.state).pending_bridge_calls.remove(&call_id);
@@ -924,8 +711,6 @@ impl Engine {
         );
     }
 
-
-
     fn evaluate_js_for_result(&self, view: i64, request_id: u32, script: &str) {
         match self.browser_of(view).and_then(|b| b.main_frame()) {
             Some(frame) => {
@@ -947,8 +732,6 @@ impl Engine {
             }),
         }
     }
-
-
 
     #[allow(clippy::too_many_arguments)]
     fn cookie_set_for_result(
@@ -988,7 +771,6 @@ impl Engine {
         let mut callback = SetCookieResultCallback::new(request_id, self.out.clone());
         if manager.set_cookie(Some(&url_cef), Some(&cookie), Some(&mut callback)) != 1 {
 
-
             let predicate = classify_cookie_set_rejection(url, name, value, domain, path, secure);
             logging::warn(
                 COMPONENT,
@@ -1007,8 +789,6 @@ impl Engine {
             });
         }
     }
-
-
 
     pub fn begin_shutdown(&self, exit_code: i32) {
         let mut st = lock(&self.state);
@@ -1040,8 +820,6 @@ impl Engine {
         }
     }
 
-
-
     pub fn shutdown_state(&self) -> Option<(i32, bool)> {
         let st = lock(&self.state);
         if !st.closing_all {
@@ -1055,7 +833,6 @@ impl Engine {
             _ => None,
         }
     }
-
 
     pub fn poll(&self) {
         let mut due: Vec<(u32, Vec<CookieEntry>, bool)> = Vec::new();
@@ -1155,7 +932,6 @@ impl Engine {
             }
         }
 
-
         let generation = 1u32;
         let (memfd, slot_bytes) = match shm::create_sealed_frame_memfd(width, height, SLOT_COUNT) {
             Ok(pair) => pair,
@@ -1209,8 +985,6 @@ impl Engine {
             memfd,
         );
 
-
-
         let mut client = HelperClient::new(
             HelperLoadHandler::new(view, self.state.clone(), self.out.clone()),
             HelperLifeSpanHandler::new(
@@ -1243,7 +1017,6 @@ impl Engine {
             ..Default::default()
         };
         let url = CefString::from("about:blank");
-
 
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -1329,7 +1102,6 @@ impl Engine {
             memfd,
         );
 
-
         if let Some(host) = browser.as_ref().and_then(|b| b.host()) {
             host.was_resized();
         }
@@ -1368,7 +1140,6 @@ impl Engine {
                     &logging::format_load_event("drive", view, &target),
                 );
 
-
                 if let Some(v) = lock(&self.state).views.get_mut(&view) {
                     v.driven_url = Some(url.to_string());
                 }
@@ -1380,10 +1151,6 @@ impl Engine {
             ),
         }
     }
-
-
-
-
 
     fn load_data_with_base_url(&self, view: i64, base_url: String, data: String, mime: String) {
         let base = RedactedTarget::from_raw_url(&base_url);
@@ -1452,8 +1219,6 @@ impl Engine {
         };
         let url_cef = CefString::from(url);
 
-
-
         let mut callback = LogOnlySetCookieCallback::new(
             RedactedTarget::from_raw_url(url).as_str().to_string(),
             domain.to_string(),
@@ -1521,10 +1286,6 @@ impl Engine {
         }
     }
 
-
-
-
-
     fn cookies_clear_session(&self, request_id: u32) {
         let Some(manager) = self.persistent_cookie_manager() else {
             logging::error(
@@ -1555,9 +1316,6 @@ impl Engine {
             });
     }
 
-
-
-
     fn cookie_flush(&self, request_id: u32) {
         let Some(manager) = self.persistent_cookie_manager() else {
             logging::error(COMPONENT, "cookie_flush: no persistent cookie manager");
@@ -1580,15 +1338,6 @@ impl Engine {
         }
     }
 }
-
-
-
-
-
-
-
-
-
 
 fn suppress_load_state(driven_url: Option<&str>, frame_url: &str) -> bool {
     match driven_url {
@@ -1715,7 +1464,6 @@ wrap_life_span_handler! {
     impl LifeSpanHandler {
         fn on_before_close(&self, browser: Option<&mut Browser>) {
 
-
             self.router.on_before_close(browser.map(|b| b.clone()));
             lock(&self.state).views.remove(&self.view);
             self.out.send(HelperMsg::ViewClosed { view: self.view });
@@ -1738,7 +1486,6 @@ wrap_render_handler! {
                 let st = lock(&self.state);
                 match st.views.get(&self.view) {
                     Some(v) => (v.width, v.height),
-
 
                     None => (1, 1),
                 }
@@ -1782,7 +1529,6 @@ wrap_render_handler! {
                 return;
             };
 
-
             if width != c_int::from(v.width) || height != c_int::from(v.height) {
                 return;
             }
@@ -1792,8 +1538,6 @@ wrap_render_handler! {
             let Some(file) = v.frame_file.as_ref() else {
                 return;
             };
-
-
 
             let pixels = unsafe { std::slice::from_raw_parts(buffer, len) };
             if let Err(e) = file.write_all_at(pixels, offset) {
@@ -1839,10 +1583,6 @@ wrap_display_handler! {
             let severity_u8 = severity.clamp(0, 255) as u8;
             let line_u32 = line.max(0) as u32;
 
-
-
-
-
             if self.console_text {
                 logging::warn(
                     COMPONENT,
@@ -1856,12 +1596,10 @@ wrap_display_handler! {
                 );
             }
 
-
             self.out.send(HelperMsg::Console {
                 view: self.view,
                 console: Console::from_raw(severity_u8, &source, line_u32, &message),
             });
-
 
             1
         }
@@ -1879,12 +1617,6 @@ wrap_request_handler! {
 
     impl RequestHandler {
         fn on_render_view_ready(&self, browser: Option<&mut Browser>) {
-
-
-
-
-
-
 
             let Some(browser) = browser else { return };
             let Some(frame) = browser.main_frame() else { return };
@@ -1916,7 +1648,6 @@ wrap_request_handler! {
             _user_gesture: ::std::os::raw::c_int,
             _is_redirect: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
-
 
             self.router
                 .on_before_browse(browser.map(|b| b.clone()), frame.map(|f| f.clone()));
@@ -1953,7 +1684,6 @@ wrap_request_handler! {
             _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
         ) -> Option<ResourceRequestHandler> {
 
-
             let url = request.map(|r| CefString::from(&r.url()).to_string())?;
             let mut pending = self.pending_data.lock().ok()?;
             let matches = pending
@@ -1970,8 +1700,6 @@ wrap_request_handler! {
         }
     }
 }
-
-
 
 fn urls_equivalent(a: &str, b: &str) -> bool {
     a == b || a.strip_suffix('/').unwrap_or(a) == b.strip_suffix('/').unwrap_or(b)
@@ -2035,8 +1763,6 @@ wrap_cookie_visitor! {
         }
     }
 }
-
-
 
 const fn session_cookie_should_delete(has_expires: c_int) -> bool {
     has_expires == 0
@@ -2112,8 +1838,6 @@ wrap_completion_callback! {
     }
 }
 
-
-
 #[derive(Clone)]
 struct ClientDeps {
     out: Outbox,
@@ -2177,7 +1901,6 @@ wrap_client! {
                 }
                 if name == "eclipse.bridge.ready" {
 
-
                     if let (Some(browser), Some(frame)) = (browser.as_ref(), frame.as_ref()) {
                         let view = lock(&self.deps.state)
                             .browser_view
@@ -2212,7 +1935,6 @@ wrap_client! {
     }
 }
 
-
 fn send_bridge_register_message(frame: &Frame, name: &str, methods: &[BridgeMethod]) {
     let Some(mut msg) = process_message_create(Some(&CefString::from("eclipse.bridge.register")))
     else {
@@ -2227,12 +1949,6 @@ fn send_bridge_register_message(frame: &Frame, name: &str, methods: &[BridgeMeth
     }
     frame.send_process_message(ProcessId::RENDERER, Some(&mut msg));
 }
-
-
-
-
-
-
 
 struct BridgeHandler {
     state: Shared,
@@ -2289,11 +2005,6 @@ wrap_set_cookie_callback! {
     }
 }
 
-
-
-
-
-
 wrap_set_cookie_callback! {
     struct LogOnlySetCookieCallback {
         url_redacted: String,
@@ -2325,9 +2036,6 @@ mod tests {
     #[test]
     fn ozone_selection_is_explicit_and_never_auto() {
 
-
-
-
         assert_eq!(
             select_ozone(Some("wayland"), None, Some(":0")).as_deref(),
             Ok("wayland")
@@ -2341,7 +2049,6 @@ mod tests {
             select_ozone(None, Some("wayland-1"), Some(":0")).as_deref(),
             Ok("wayland")
         );
-
 
         assert_eq!(select_ozone(None, None, Some(":0")).as_deref(), Ok("x11"));
 
@@ -2360,8 +2067,6 @@ mod tests {
 
     #[test]
     fn sandbox_mode_selection_prefers_userns_then_suid_then_policy() {
-
-
 
         use SandboxMode::*;
         assert_eq!(select_sandbox_mode(true, true, true), Ok(Userns));
@@ -2391,8 +2096,6 @@ mod tests {
     #[test]
     fn apply_sandbox_mode_flips_no_sandbox_only_for_degraded() {
 
-
-
         for (mode, expected) in [
             (SandboxMode::Userns, 0),
             (SandboxMode::Suid, 0),
@@ -2406,8 +2109,6 @@ mod tests {
 
     #[test]
     fn switch_strip_keeps_the_ban_except_the_helpers_own_degradation() {
-
-
 
         assert!(switch_should_be_stripped("enable-logging", false));
         assert!(switch_should_be_stripped("enable-logging", true));
@@ -2423,7 +2124,6 @@ mod tests {
 
     #[test]
     fn render_path_classification_never_gates_and_names_the_devices() {
-
 
         assert_eq!(
             classify_render_path(&[], false),
@@ -2450,7 +2150,6 @@ mod tests {
     #[test]
     fn engine_settings_keep_engine_logging_disabled() {
 
-
         let settings = build_settings();
         assert_eq!(settings.log_severity, LogSeverity::DISABLE);
         assert_eq!(settings.no_sandbox, 0, "the sandbox must stay ON");
@@ -2468,21 +2167,10 @@ mod tests {
     #[test]
     fn build_settings_sets_the_eclipse_fallback_user_agent() {
 
-
-
         assert!(ECLIPSE_USER_AGENT.contains("Chrome/149"));
         assert!(ECLIPSE_USER_AGENT.contains("Eclipse-WebView"));
         assert!(ECLIPSE_USER_AGENT.contains("X11; Linux x86_64"));
         assert!(!ECLIPSE_USER_AGENT.contains("GDPR VIOLATION"));
-
-
-
-
-
-
-
-
-
 
         let settings = build_settings();
         assert_eq!(settings.user_agent.to_string(), ECLIPSE_USER_AGENT);
@@ -2491,14 +2179,8 @@ mod tests {
     #[test]
     fn effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal() {
 
-
         assert_eq!(effective_user_agent(None, None), ECLIPSE_USER_AGENT);
         assert_eq!(effective_user_agent(Some(""), Some("")), ECLIPSE_USER_AGENT);
-
-
-
-
-
 
         let app_ua = "Mozilla/5.0 (0MB; 960x540; 160x160; 960x540; HTC unknown; unknown) \
                       AppleWebKit/537.36 (KHTML, like Gecko)  ROBLOX Android App 2.724.735 Phone \
@@ -2535,7 +2217,6 @@ mod tests {
             "the diagnostic must never relax the settings-layer redaction rule"
         );
 
-
         assert_eq!(
             build_settings_with_ua(effective_user_agent(None, None))
                 .user_agent
@@ -2569,7 +2250,6 @@ mod tests {
     #[test]
     fn remove_session_cookies_deletes_only_cookies_without_an_expiry() {
 
-
         assert!(session_cookie_should_delete(0));
         assert!(!session_cookie_should_delete(1));
         assert!(!session_cookie_should_delete(-1));
@@ -2586,7 +2266,6 @@ mod tests {
     #[test]
     fn console_text_diag_gate_is_exact_match_one_only() {
 
-
         assert!(console_text_diag_enabled(Some("1")));
         assert!(!console_text_diag_enabled(Some("")));
         assert!(!console_text_diag_enabled(Some("0")));
@@ -2598,8 +2277,6 @@ mod tests {
     #[test]
     fn bridge_diag_gate_is_exact_match_one_only() {
 
-
-
         assert!(bridge_diag_enabled(Some("1")));
         assert!(!bridge_diag_enabled(Some("")));
         assert!(!bridge_diag_enabled(Some("0")));
@@ -2610,8 +2287,6 @@ mod tests {
 
     #[test]
     fn format_console_text_line_keeps_the_source_redacted_even_in_diag_mode() {
-
-
 
         let source =
             RedactedTarget::from_raw_url("https://apps.roblox.com/challenge?token=SECRETTOKEN");
@@ -2625,7 +2300,6 @@ mod tests {
 
     #[test]
     fn classify_cookie_set_rejection_names_each_documented_predicate_in_order() {
-
 
         use classify_cookie_set_rejection as c;
 
@@ -2691,7 +2365,6 @@ mod tests {
     #[test]
     fn classify_cookie_set_rejection_never_embeds_the_cookie_name_or_value() {
 
-
         for reason in [
             classify_cookie_set_rejection(
                 "https://www.roblox.com",
@@ -2720,9 +2393,6 @@ mod tests {
 
     #[test]
     fn load_state_suppresses_the_about_blank_bootstrap_but_never_driven_loads() {
-
-
-
 
         assert!(suppress_load_state(None, "about:blank"));
         assert!(suppress_load_state(None, "https://www.roblox.com/"));

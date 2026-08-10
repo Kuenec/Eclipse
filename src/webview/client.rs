@@ -363,11 +363,6 @@ impl EarlyCookies {
                 Deferral::NeedsEngine("the deferred-cookie buffer is full")
             }
 
-
-
-
-
-
             ConsumerMsg::CookieSetForResult { .. }
                 if defer_cb && self.mutations.len() < Self::CAP =>
             {

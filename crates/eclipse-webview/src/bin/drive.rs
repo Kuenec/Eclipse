@@ -1,23 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[allow(dead_code)]
 #[path = "../shared.rs"]
 mod shared;
@@ -51,7 +32,6 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(15);
 fn now_ms(start: Instant) -> u128 {
     start.elapsed().as_millis()
 }
-
 
 struct Buffer {
     mapping: shm::FrameMapping,
@@ -99,8 +79,6 @@ fn main() -> ExitCode {
         }
     }
 }
-
-
 
 fn resolve_helper() -> Result<std::path::PathBuf, String> {
     if let Ok(explicit) = std::env::var("ECLIPSE_WEBVIEW_HELPER") {
@@ -165,7 +143,6 @@ fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child, TempProf
         cmd.arg(ozone);
     }
 
-
     if std::env::args().any(|a| a == "--allow-unsandboxed") {
         cmd.arg("--allow-unsandboxed");
     }
@@ -173,10 +150,6 @@ fn spawn_helper(helper: &std::path::Path) -> Result<(UnixStream, Child, TempProf
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| e.to_string())?;
-
-
-
-
 
     unsafe {
         use std::os::fd::AsRawFd;
@@ -211,10 +184,6 @@ impl Drive {
             .map_err(|e| format!("socket write failed: {e}"))?;
         Ok(())
     }
-
-
-
-
 
     fn next_msg(&mut self, deadline: Instant) -> DResult<HelperMsg> {
         loop {
@@ -268,7 +237,6 @@ impl Drive {
                         .map_err(|e| DriveError::Fail(format!("fd receive failed: {e}")))?;
                     let expected = slot_bytes as usize * usize::from(slot_count);
 
-
                     let mapping = shm::map_frame_buffer(fd.as_fd(), expected)
                         .map_err(|e| DriveError::Fail(format!("memfd map rejected: {e}")))?;
                     self.buffer = Some(Buffer {
@@ -281,7 +249,6 @@ impl Drive {
             }
         }
     }
-
 
     fn census(&self, generation: u32, slot: u8) -> DResult<usize> {
         let Some(buf) = self.buffer.as_ref() else {
@@ -327,7 +294,6 @@ fn run() -> DResult<String> {
 
     let result = run_protocol(&mut drive);
 
-
     let exit_status = reap(&mut drive, result.is_ok())?;
     let orphans = orphan_scan(&drive.helper_path);
 
@@ -350,7 +316,6 @@ fn run() -> DResult<String> {
 fn run_protocol(d: &mut Drive) -> DResult<String> {
     let start = d.start;
 
-
     d.send(&ConsumerMsg::Hello {
         version: shared::PROTO_VERSION,
     })?;
@@ -368,13 +333,11 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
     };
     println!("[{} ms] hello-ack engine={engine}", now_ms(start));
 
-
     d.send(&ConsumerMsg::CreateView {
         view: VIEW,
         width: WIDTH,
         height: HEIGHT,
     })?;
-
 
     d.send(&ConsumerMsg::LoadUrl {
         view: VIEW,
@@ -384,7 +347,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         "[{} ms] load-url sent target={TARGET_FOR_LOG}",
         now_ms(start)
     );
-
 
     let mut load_started_ms: Option<u128> = None;
     let mut load_finished: Option<(u128, i32)> = None;
@@ -441,7 +403,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
     };
     let (finished_ms, http_status) = load_finished.unwrap_or((0, 0));
 
-
     let ink_deadline = Instant::now() + INK_DEADLINE;
     let census = loop {
         match d.next_msg(ink_deadline)? {
@@ -455,7 +416,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                 if stale {
                     continue;
                 }
-
 
                 let count = d.census(generation, slot)?;
                 d.ack(generation, seq)?;
@@ -479,7 +439,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         }
     };
 
-
     d.send(&ConsumerMsg::MouseMove {
         view: VIEW,
         x: i32::from(WIDTH) / 2,
@@ -499,7 +458,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         })?;
     }
     println!("[{} ms] input smoke sent (move + click)", now_ms(start));
-
 
     const COOKIE_REQ: u32 = 7;
     d.send(&ConsumerMsg::CookieGet {
@@ -556,7 +514,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         now_ms(start)
     );
 
-
     d.send(&ConsumerMsg::CloseView { view: VIEW })?;
     let close_deadline = Instant::now() + CLOSE_DEADLINE;
     loop {
@@ -583,7 +540,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         }
     }
     println!("[{} ms] view-closed", now_ms(start));
-
 
     d.send(&ConsumerMsg::Shutdown)?;
 
@@ -612,8 +568,6 @@ fn name_of(msg: &HelperMsg) -> &'static str {
     }
 }
 
-
-
 fn reap(d: &mut Drive, expect_clean: bool) -> DResult<Option<i32>> {
     let deadline = Instant::now() + EXIT_DEADLINE;
     if expect_clean {
@@ -636,8 +590,6 @@ fn reap(d: &mut Drive, expect_clean: bool) -> DResult<Option<i32>> {
         Err(e) => fail(format!("kill+wait failed: {e}")),
     }
 }
-
-
 
 fn orphan_scan(helper: &std::path::Path) -> usize {
     let helper = helper.to_string_lossy();

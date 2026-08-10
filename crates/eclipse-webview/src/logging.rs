@@ -1,17 +1,6 @@
 
-
-
-
-
-
-
-
-
-
 use crate::shared::redact;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-
 
 pub struct RedactedTarget(String);
 
@@ -49,13 +38,9 @@ pub fn error(component: &str, msg: &str) {
     line("ERROR", component, msg);
 }
 
-
-
 pub fn format_load_event(event: &str, view: i64, target: &RedactedTarget) -> String {
     format!("load {event} view={view} target={}", target.as_str())
 }
-
-
 
 pub fn format_load_data_event(view: i64, mime: &str, base: &RedactedTarget) -> String {
     format!(
@@ -71,9 +56,6 @@ mod tests {
     #[test]
     fn helper_log_lines_redact_urls_to_scheme_and_host() {
 
-
-
-
         let target =
             RedactedTarget::from_raw_url("https://apps.roblox.com/challenge/verify?token=SECRET");
         let line = format_load_event("started", 42, &target);
@@ -87,7 +69,6 @@ mod tests {
             "load data-with-base-url view=7 mime=text/html base=https://host"
         );
         assert!(!line.contains("TOPSECRET"));
-
 
         let data_base = RedactedTarget::from_raw_url("data:text/html,<html>SECRET</html>");
         assert_eq!(data_base.as_str(), "<non-url>");

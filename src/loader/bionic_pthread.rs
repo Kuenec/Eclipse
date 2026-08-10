@@ -714,9 +714,6 @@ fn key_table_with<R>(f: impl FnOnce(&mut KeyTable) -> R) -> R {
 
 thread_local! {
 
-
-
-
     static TLS_VALUES: [Cell<TlsValue>; PTHREAD_KEYS_MAX] =
         const { [const { Cell::new(TlsValue::EMPTY) }; PTHREAD_KEYS_MAX] };
 }
@@ -889,7 +886,6 @@ impl Drop for CxaThreadDtorList {
 }
 
 thread_local! {
-
 
     static CXA_THREAD_DTORS: CxaThreadDtorList = const {
         CxaThreadDtorList {

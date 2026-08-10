@@ -1,43 +1,8 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include <stdarg.h>
 #include <stdio.h>
 
-
-
-
-
-
 extern FILE *eclipse_sf_translate_stream(FILE *stream);
-
-
-
-
-
-
 
 int eclipse_fprintf(FILE *stream, const char *fmt, ...) {
     va_list ap;
@@ -53,12 +18,6 @@ int eclipse_fprintf(FILE *stream, const char *fmt, ...) {
     return written;
 }
 
-
-
-
-
-
-
 int eclipse_fscanf(FILE *stream, const char *fmt, ...) {
     va_list ap;
     int converted;
@@ -72,13 +31,6 @@ int eclipse_fscanf(FILE *stream, const char *fmt, ...) {
     va_end(ap);
     return converted;
 }
-
-
-
-
-
-
-
 
 int eclipse_vfprintf(FILE *stream, const char *fmt, va_list ap) {
     if (fmt == NULL) {

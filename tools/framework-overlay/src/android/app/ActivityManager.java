@@ -1,14 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
 package android.app;
 
 import android.content.Context;
@@ -29,8 +19,6 @@ public class ActivityManager {
 
 	public static class RunningAppProcessInfo{
 
-
-
 		public static final int IMPORTANCE_FOREGROUND = 100;
 
 		public int importance;
@@ -39,8 +27,6 @@ public class ActivityManager {
 		public String processName;
 
 		public String[] pkgList;
-
-
 
 		public RunningAppProcessInfo() {}
 
@@ -62,10 +48,6 @@ public class ActivityManager {
 		return Arrays.asList(new RunningAppProcessInfo(Process.myPid(), Context.this_application.getPackageName()));
 	}
 
-
-
-
-
 	private static native boolean native_isLowRamDevice();
 	public boolean isLowRamDevice() {return native_isLowRamDevice();}
 
@@ -79,19 +61,10 @@ public class ActivityManager {
 
 		public boolean lowMemory;
 
-
-
-
-
-
-
 		public long hiddenAppThreshold;
 		public long secondaryServerThreshold;
 		public long visibleAppThreshold;
 		public long foregroundAppThreshold;
-
-
-
 
 		public int describeContents() {
 			return 0;
@@ -109,11 +82,6 @@ public class ActivityManager {
 		}
 	}
 
-
-
-
-
-
 	private static native void native_fillMemoryInfo(MemoryInfo outInfo);
 	public void getMemoryInfo(MemoryInfo outInfo)
 	{
@@ -126,7 +94,6 @@ public class ActivityManager {
 	public ConfigurationInfo getDeviceConfigurationInfo() {
 		return new ConfigurationInfo();
 	}
-
 
 	private static native int native_getMemoryClass();
 	private static native int native_getLargeMemoryClass();
@@ -158,7 +125,6 @@ public class ActivityManager {
 			return;
 		}
 	}
-
 
 	public List<RunningServiceInfo> getRunningServices(int maxNum)
 		throws SecurityException {

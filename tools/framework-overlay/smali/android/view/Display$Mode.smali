@@ -1,12 +1,6 @@
 
-
-
-
-
 .class public final Landroid/view/Display$Mode;
 .super Ljava/lang/Object;
-
-
 
 .annotation system Ldalvik/annotation/EnclosingClass;
     value = Landroid/view/Display;
@@ -17,8 +11,6 @@
     name = "Mode"
 .end annotation
 
-
-
 .field private final mModeId:I
 
 .field private final mWidth:I
@@ -26,8 +18,6 @@
 .field private final mHeight:I
 
 .field private final mRefreshRate:F
-
-
 
 .method public constructor <init>(IIIF)V
     .registers 5
@@ -44,8 +34,6 @@
 
     return-void
 .end method
-
-
 
 .method public getModeId()I
     .registers 2

@@ -415,7 +415,6 @@ extern "system" fn asset_manager_set_apk_assets<'local>(
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
 
-
         tracing::debug!(
             target: "android.content.res.AssetManager",
             invalidate_caches,
@@ -1638,7 +1637,6 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             return Ok(0);
         }
 
-
         let entry = theme_registry::with_theme(theme, |t| resolve_theme_attr(&t.attrs, ident))
             .ok()
             .flatten();
@@ -1651,10 +1649,6 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             );
             return Ok(0);
         };
-
-
-
-
 
         let int_sig =
             unsafe { FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int)) };
@@ -1678,18 +1672,11 @@ extern "system" fn asset_manager_load_theme_attribute_value<'local>(
             entry.resource_id.into(),
         )?;
 
-
-
-
-
         if entry.value_type == i32::from(TYPE_STRING) {
             if let Some(s) =
                 arsc_pool_string(entry.asset_cookie, u32::from_ne_bytes(entry.data.to_ne_bytes()))
             {
                 let jstr = env.new_string(&s)?;
-
-
-
 
                 let cs_sig =
                     unsafe { FieldSignature::from_raw_parts(CHAR_SEQUENCE_SIG, JavaType::Object) };
@@ -2478,9 +2465,6 @@ static ANDROID_MAIN_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> =
 
 thread_local! {
 
-
-
-
     static MAIN_LOOPER_PUMP_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -3007,10 +2991,6 @@ extern "system" fn view_native_constructor<'local>(
         let class_name = view_class_name(env, &this).unwrap_or_default();
         match view_registry::allocate(&class_name) {
             Ok(handle) => {
-
-
-
-
 
                 match env.new_global_ref(&this) {
                     Ok(global) => {
@@ -3684,7 +3664,6 @@ extern "system" fn view_native_get_window<'local>(
 ) -> JObject<'local> {
     env.with_env(|env| -> jni::errors::Result<JObject> {
 
-
         if let Err(e) = view_registry::with_view(widget, |_v| ()) {
             tracing::debug!(
                 target: "android.view.View",
@@ -3694,10 +3673,6 @@ extern "system" fn view_native_get_window<'local>(
             );
         }
 
-
-
-
-
         let active = window_registry::active_window();
         let local = match window_registry::with_jobject(active, |global| {
             env.new_local_ref(global.as_obj())
@@ -3706,7 +3681,6 @@ extern "system" fn view_native_get_window<'local>(
             Ok(Some(Ok(obj))) => obj,
 
             Ok(Some(Err(e))) => return Err(e),
-
 
             Ok(None) => {
                 tracing::debug!(
@@ -7021,7 +6995,6 @@ extern "system" fn web_view_native_evaluate_javascript<'local>(
         };
         let request_id = crate::webview::client::next_request_id();
 
-
         if !callback.is_null() {
             match env.new_global_ref(&callback) {
                 Ok(g) => {
@@ -7038,8 +7011,6 @@ extern "system" fn web_view_native_evaluate_javascript<'local>(
                 }
             }
         }
-
-
 
         let degrade = |env: &mut Env| {
             if let Some((_w, _era, g)) = eval_callbacks()
@@ -7123,7 +7094,6 @@ extern "system" fn web_view_native_add_javascript_interface<'local>(
                 return Ok(());
             }
         };
-
 
         let wire_methods: Vec<crate::webview::proto::BridgeMethod> = methods
             .iter()
@@ -8799,12 +8769,6 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
             };
             let paths = text_paths();
 
-
-
-
-
-
-
             if paths.contains('e') {
             if let Err(e) = checked(env, "NativeGLInterface.updateKeyboardSize", |env| {
                 env.call_static_method(
@@ -8824,9 +8788,6 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
                 tracing::debug!(error = %e, "updateKeyboardSize threw (cleared)");
             }
             }
-
-
-
 
             if paths.contains('p') {
             if let Err(e) = checked(env, "NativeGLInterface.nativePassText", |env| {
@@ -8900,9 +8861,6 @@ fn fire_text_watchers(
             let s = env.new_string(new_text)?;
             let old_s = env.new_string(old_text)?;
 
-
-
-
             let editable = match env.find_class(jni_str!("android/text/SpannableStringBuilder")) {
                 Ok(cls) => env
                     .new_object(
@@ -8915,11 +8873,7 @@ fn fire_text_watchers(
             };
             for ptr in &ptrs {
 
-
                 let watcher = unsafe { JObject::from_raw(env, *ptr) };
-
-
-
 
                 if let Err(e) = checked(env, "TextWatcher.beforeTextChanged", |env| {
                     env.call_method(
@@ -8937,7 +8891,6 @@ fn fire_text_watchers(
                 }) {
                     tracing::debug!(error = %e, "TextWatcher.beforeTextChanged threw (cleared, continuing)");
                 }
-
 
                 if let Err(e) = checked(env, "TextWatcher.onTextChanged", |env| {
                     env.call_method(
@@ -9238,7 +9191,6 @@ extern "system" fn edit_text_add_text_changed_listener<'local>(
             return Ok(());
         }
 
-
         let global = env.new_global_ref(&watcher)?;
         match view_registry::add_text_watcher(widget, global) {
             Ok(()) => tracing::debug!(
@@ -9273,8 +9225,6 @@ extern "system" fn edit_text_remove_text_changed_listener<'local>(
             );
             return Ok(());
         }
-
-
 
         let result = view_registry::retain_text_watchers(widget, |held| {
             !env.is_same_object(held.as_obj(), &watcher).unwrap_or(false)
@@ -9908,7 +9858,6 @@ extern "system" fn bitmap_factory_native_decode_stream<'local>(
                 i32::try_from(h).unwrap_or(i32::MAX),
             ),
             None => {
-
 
                 tracing::warn!(
                     target: "android.graphics.BitmapFactory",
@@ -10550,7 +10499,6 @@ extern "system" fn activity_native_finish<'local>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
 
-
         if let Err(e) = window_registry::with_window(native_window, |_| ()) {
             tracing::warn!(
                 target: "android.app.Activity",
@@ -10582,8 +10530,6 @@ extern "system" fn activity_native_finish<'local>(
             handle = native_window,
             "Activity.nativeFinish: driving the finishing activity down (onPause → onStop → onDestroy)"
         );
-
-
 
         let _ = drive_activity_down_lifecycle(env, &this);
         Ok(())
@@ -10870,14 +10816,11 @@ extern "system" fn runtime_native_load<'local>(
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
 
-
         let path = if filename.is_null() {
             String::new()
         } else {
             filename.try_to_string(env)?
         };
-
-
 
         if !path.is_empty() && crate::loader::engine::is_preloaded(soname_from_load_path(&path)) {
             tracing::info!(
@@ -10887,10 +10830,7 @@ extern "system" fn runtime_native_load<'local>(
             return Ok(JString::default());
         }
 
-
-
         let Some(load_fn) = art_load_native_library_fn() else {
-
 
             return env.new_string(format!(
                 "Eclipse: cannot load \"{path}\": ART JavaVMExt::LoadNativeLibrary not found (is libart RTLD_GLOBAL?)"
@@ -10906,12 +10846,6 @@ extern "system" fn runtime_native_load<'local>(
             Err(_) => return env.new_string(format!("Eclipse: invalid library path \"{path}\"")),
         };
         let mut err_buf = [0u8; 1024];
-
-
-
-
-
-
 
         let ok = unsafe {
             eclipse_art_load_native_library(
@@ -11163,7 +11097,6 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
     for _ in 0..MAIN_LOOPER_MESSAGE_BUDGET {
         let processed = env.with_local_frame(16, |env| -> Result<bool, FrameworkError> {
 
-
             let msg = checked(env, "MessageQueue.next", |env| {
                 env.call_method(
                     &queue,
@@ -11176,7 +11109,6 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
             if msg.is_null() {
                 return Ok(false);
             }
-
 
             let target = checked(env, "Message.getTarget", |env| {
                 env.call_method(
@@ -11201,7 +11133,6 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
                 }
             }
 
-
             if let Err(e) = checked(env, "Message.recycle", |env| {
                 env.call_method(&msg, jni_str!("recycle"), jni_sig!("()V"), &[])?
                     .v()
@@ -11225,7 +11156,6 @@ fn drive_main_messages_cached(
         let processed = env.with_local_frame(16, |env| -> Result<bool, FrameworkError> {
             let msg = checked(env, "MessageQueue.next (cached)", |env| {
 
-
                 unsafe {
                     env.call_method_unchecked(
                         cache.queue.as_obj(),
@@ -11242,7 +11172,6 @@ fn drive_main_messages_cached(
 
             let target = checked(env, "Message.getTarget (cached)", |env| {
 
-
                 unsafe {
                     env.call_method_unchecked(
                         &msg,
@@ -11256,7 +11185,6 @@ fn drive_main_messages_cached(
             if !target.is_null() {
                 let args = [JValue::Object(&msg).as_jni()];
                 if let Err(e) = checked(env, "Handler.dispatchMessage (cached)", |env| {
-
 
                     unsafe {
                         env.call_method_unchecked(
@@ -11273,7 +11201,6 @@ fn drive_main_messages_cached(
             }
 
             if let Err(e) = checked(env, "Message.recycle (cached)", |env| {
-
 
                 unsafe {
                     env.call_method_unchecked(

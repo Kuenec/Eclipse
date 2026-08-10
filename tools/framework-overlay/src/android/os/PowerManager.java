@@ -1,15 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-
 package android.os;
 
 public final class PowerManager {
@@ -38,7 +27,6 @@ public final class PowerManager {
 	public boolean isPowerSaveMode() {
 		return false;
 	}
-
 
 	public boolean isDeviceIdleMode() {
 		return false;

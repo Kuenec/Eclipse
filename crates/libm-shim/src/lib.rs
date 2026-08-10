@@ -1,47 +1,15 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
 
 use core::ffi::{c_char, c_int, c_long, c_longlong};
 
-
-
-
-
-
-
-
-
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
 
-
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }
-
-
-
 
 macro_rules! fwd1_f64 {
     ($($name:ident),* $(,)?) => {$(
@@ -54,9 +22,6 @@ fwd1_f64!(
     tanh,
 );
 
-
-
-
 macro_rules! fwd1_f32 {
     ($($name:ident),* $(,)?) => {$(
         #[no_mangle]
@@ -67,9 +32,6 @@ fwd1_f32!(
     acosf, asinf, atanf, cbrtf, cosf, coshf, erfcf, erff, exp2f, expf, log10f, log2f, logf, sinf,
     tanf, tanhf,
 );
-
-
-
 
 #[no_mangle]
 pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
@@ -104,18 +66,10 @@ pub extern "C" fn nextafterf(x: f32, y: f32) -> f32 {
     libm::nextafterf(x, y)
 }
 
-
-
-
 #[no_mangle]
 pub extern "C" fn ilogb(x: f64) -> c_int {
     libm::ilogb(x) as c_int
 }
-
-
-
-
-
 
 #[no_mangle]
 pub extern "C" fn ldexp(x: f64, n: c_int) -> f64 {
@@ -125,13 +79,6 @@ pub extern "C" fn ldexp(x: f64, n: c_int) -> f64 {
 pub extern "C" fn ldexpf(x: f32, n: c_int) -> f32 {
     libm::ldexpf(x, n)
 }
-
-
-
-
-
-
-
 
 #[no_mangle]
 pub unsafe extern "C" fn frexp(x: f64, exp: *mut c_int) -> f64 {
@@ -209,13 +156,6 @@ pub unsafe extern "C" fn remquof(x: f32, y: f32, quo: *mut c_int) -> f32 {
     }
     rem
 }
-
-
-
-
-
-
-
 
 #[no_mangle]
 pub extern "C" fn lround(x: f64) -> c_long {
