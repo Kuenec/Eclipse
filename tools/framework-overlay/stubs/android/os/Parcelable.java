@@ -2,7 +2,7 @@
 package android.os;
 
 public interface Parcelable {
-	int describeContents();
+  int describeContents();
 
-	void writeToParcel(Parcel dest, int flags);
+  void writeToParcel(Parcel dest, int flags);
 }
