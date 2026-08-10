@@ -5,8 +5,8 @@ version = "0.0.0"
 edition = "2021"
 
 rust-version = "1.95"
-description = "Open-source, Rust, distro-agnostic runtime for running the Android Roblox build on Linux"
-license = "TBD"
+description = "Open-source Rust runtime for running the Android x86-64 Roblox client on Linux"
+license = "MIT"
 publish = false
 
 [dependencies]
