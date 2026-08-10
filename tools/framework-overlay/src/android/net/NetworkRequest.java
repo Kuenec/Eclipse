@@ -2,21 +2,19 @@
 package android.net;
 
 public class NetworkRequest {
+  public static class Builder {
+    public Builder() {}
 
-	public static class Builder {
+    public Builder addCapability(int capability) {
+      return this;
+    }
 
-		public Builder() {}
+    public Builder addTransportType(int transportType) {
+      return this;
+    }
 
-		public Builder addCapability(int capability) {
-			return this;
-		}
-
-		public Builder addTransportType(int transportType) {
-			return this;
-		}
-
-		public NetworkRequest build() {
-			return new NetworkRequest();
-		}
-	}
+    public NetworkRequest build() {
+      return new NetworkRequest();
+    }
+  }
 }
