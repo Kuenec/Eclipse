@@ -1,13 +1,13 @@
-# ECLIPSE PATCH 2026-06-13: AOSP android.view.Display.Mode (nested). ATL's installed Display omits both
-# getMode() and this Mode class; Roblox queries Display.getMode() in ActivityNativeMain.onResume startup
-# (NoSuchMethodError without it). Display.getMode() (added in patch-framework.sh) constructs one of these
-# from window_width/window_height + 60.0f (consistent with the installed Display.getWidth/getHeight/
-# getRefreshRate). Public static final nested class (accessFlags 0x19), like AOSP.
+
+
+
+
+
 .class public final Landroid/view/Display$Mode;
 .super Ljava/lang/Object;
 
 
-# annotations
+
 .annotation system Ldalvik/annotation/EnclosingClass;
     value = Landroid/view/Display;
 .end annotation
@@ -18,7 +18,7 @@
 .end annotation
 
 
-# instance fields
+
 .field private final mModeId:I
 
 .field private final mWidth:I
@@ -28,7 +28,7 @@
 .field private final mRefreshRate:F
 
 
-# direct methods
+
 .method public constructor <init>(IIIF)V
     .registers 5
 
@@ -46,7 +46,7 @@
 .end method
 
 
-# virtual methods
+
 .method public getModeId()I
     .registers 2
 

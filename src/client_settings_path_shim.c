@@ -9,15 +9,15 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-/*
- * Roblox's Android settings loader opens this fixed platform path. Eclipse stores the file in its
- * per-user XDG data directory and re-execs with this tiny shim preloaded, so only this exact path is
- * redirected. Every other host path goes straight to the same Linux syscall unchanged.
- *
- * Raw syscalls avoid dlsym recursion inside an open(2) interposer. The ABI below is the glibc x86-64
- * ABI Eclipse and its vendored host ART use; Roblox's bionic imports are resolved separately by the
- * Rust loader and therefore never enter this shim.
- */
+
+
+
+
+
+
+
+
+
 
 static const char eclipse_android_settings_path[] =
     "/data/local/tmp/ClientAppSettings.json";

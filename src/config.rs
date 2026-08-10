@@ -1,13 +1,3 @@
-//! Configuration (component-map A · 🟢 pure Rust).
-//!
-//! Loads/saves `config.json` from the XDG config dir, mirroring Sober's schema
-//! (see `docs/sober-research.md` §5.2). Field names and defaults match Sober so existing
-//! user expectations carry over; `fflags` is an open pass-through of Roblox Fast Flags.
-//!
-//! On Linux the file lives at `$XDG_CONFIG_HOME/eclipse/config.json`
-//! (`~/.config/eclipse/config.json` by default) — resolved via `directories`, never a
-//! hardcoded path.
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -15,13 +5,8 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-/// Roblox's CoreScript-side settings save bridge. The Android client contains the same native
-/// `Settings::saveState` path as desktop, but gates the reflection call that reaches it behind this
-/// Fast Flag. Eclipse enables it by default so changes made in Roblox Settings are written to
-/// `GlobalBasicSettings_13.xml` instead of disappearing at process exit.
 pub const SETTINGS_SAVE_STATE_FLAG: &str = "FFlagGlobalBasicSettingsSaveStateReflection";
 
-/// `graphics_optimization_mode` — Sober's quality/perf trade-off knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum GraphicsOptimizationMode {
@@ -31,7 +16,6 @@ pub enum GraphicsOptimizationMode {
     Performance,
 }
 
-/// `touch_mode` — how Roblox's touch input layer is presented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum TouchMode {
@@ -42,7 +26,6 @@ pub enum TouchMode {
 }
 
 impl TouchMode {
-    /// Stable spelling shared by config JSON, the ART system property, and the framework overlay.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -53,72 +36,48 @@ impl TouchMode {
     }
 }
 
-/// Eclipse configuration, mirroring Sober's `config.json` (docs/sober-research.md §5.2).
-///
-/// `#[serde(default)]` makes every field optional in the file: a partial `config.json`
-/// (or a first run with no file) fills the rest from [`Config::default`]. Unknown keys are
-/// ignored (forward-compatible with newer/older schemas).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Force OpenGL instead of Vulkan.
     pub use_opengl: bool,
-    /// Quality/balanced/performance trade-off.
+
     pub graphics_optimization_mode: GraphicsOptimizationMode,
-    /// Use Feral GameMode for performance.
+
     pub enable_gamemode: bool,
-    /// Scale the window to display DPI.
+
     pub enable_hidpi: bool,
-    /// Discord Rich Presence.
+
     pub discord_rpc_enabled: bool,
-    /// Allow the Discord "join" button.
+
     pub discord_rpc_show_join_button: bool,
-    /// Show the server-region popup on join.
+
     pub server_location_indicator_enabled: bool,
-    /// Quit Eclipse when you leave a game.
+
     pub close_on_leave: bool,
-    /// Touch input presentation.
+
     pub touch_mode: TouchMode,
-    /// Controller support.
+
     pub allow_gamepad_permission: bool,
-    /// Console UI instead of desktop UI.
+
     pub use_console_experience: bool,
-    /// Store the session via libsecret.
+
     pub use_libsecret: bool,
-    /// Pass-through Roblox Fast Flags (engine config). Open-ended; values may be bool,
-    /// number, or string, so they are kept as raw JSON. `BTreeMap` keeps `save` output
-    /// stable (sorted keys).
+
     pub fflags: BTreeMap<String, serde_json::Value>,
-    // --- APK auto-fetch (opt-in; Eclipse never hosts/hard-codes a Roblox source — see apk::fetch) ---
-    /// User-configured APK download URL (a single merged/universal APK the user chooses to fetch from).
-    /// Empty/`None` = no source (the default; supply the APK path instead). Also `ECLIPSE_APK_URL`.
+
     pub apk_url: Option<String>,
-    /// Optional SHA-256 (lowercase hex) the fetched APK must match before it is used (defense-in-depth).
+
     pub apk_sha256: Option<String>,
-    /// When `true` and no APK path is supplied, `eclipse run` auto-fetches from [`Self::apk_url`].
-    /// Off by default (the safest posture: the runtime never acquires the APK unless asked).
+
     pub auto_fetch_missing: bool,
-    // --- Challenge-WebView engine helper (docs/web-engine-plan.md, M3) ----------------------------
-    /// 2026-07-03: explicit path to the out-of-process `eclipse-webview` helper binary. Resolution
-    /// order (the spawn contract in `src/webview/mod.rs`): this field, else `$ECLIPSE_WEBVIEW_HELPER`,
-    /// else a sibling `eclipse-webview` beside the running executable, else the dev-tree build under
-    /// `crates/eclipse-webview/target/{release,debug}`. A SET-but-missing path is an actionable
-    /// error, never a silent fallthrough. `None` (the default) = resolve automatically.
+
     pub webview_helper_path: Option<String>,
-    /// 2026-07-10 (web-engine plan M5, the dated owner-revisable sandbox policy in AGENTS.md §6):
-    /// the helper selects, in order, (1) unprivileged user namespaces (live create + use probe),
-    /// (2) a SUID `chrome-sandbox` beside libcef.so, (3) neither → REFUSE with an actionable
-    /// error — UNLESS this is `true`, in which case the helper runs `--no-sandbox` as a LOUD,
-    /// documented degradation (WARN at startup + a visible detection line in every run log).
-    /// The engine renders hostile web content beside the user's session, so silent unsandboxed
-    /// execution is never acceptable; default `false` = refuse with the actionable error.
+
     pub webview_allow_unsandboxed: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        // Defaults match Sober (docs/sober-research.md §5.2): most are `false`, but
-        // `enable_gamemode` and `close_on_leave` default to `true`.
         Self {
             use_opengl: false,
             graphics_optimization_mode: GraphicsOptimizationMode::default(),
@@ -143,18 +102,11 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Resolve the config file path (`$XDG_CONFIG_HOME/eclipse/config.json`).
-    ///
-    /// Errors with [`ConfigError::NoConfigDir`] only when no home/config base directory can
-    /// be determined (e.g. `$HOME` unset) — an actionable failure, not a silent fallback.
     pub fn config_path() -> Result<PathBuf, ConfigError> {
         let dirs = ProjectDirs::from("", "", "eclipse").ok_or(ConfigError::NoConfigDir)?;
         Ok(dirs.config_dir().join("config.json"))
     }
 
-    /// Load the config, or return defaults when the file does not exist yet (first run is
-    /// not an error). I/O and parse failures are surfaced so a corrupt file is never
-    /// silently reset.
     pub fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
         match std::fs::read_to_string(&path) {
@@ -164,7 +116,6 @@ impl Config {
         }
     }
 
-    /// Write the config as pretty JSON, creating the config directory if needed.
     pub fn save(&self) -> Result<(), ConfigError> {
         let path = Self::config_path()?;
         if let Some(parent) = path.parent() {
@@ -174,14 +125,10 @@ impl Config {
         Ok(())
     }
 
-    /// Serialize to pretty JSON (used by `save` and the `eclipse config` command).
     pub fn to_json_pretty(&self) -> Result<String, ConfigError> {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    /// Build the `ClientAppSettings.json` object Roblox reads from Android's
-    /// `/data/local/tmp`. User-provided Fast Flags pass through unchanged; the settings-save bridge
-    /// is enabled only when the user has not explicitly supplied a value for it.
     pub fn roblox_client_app_settings(&self) -> BTreeMap<String, serde_json::Value> {
         let mut settings = self.fflags.clone();
         settings
@@ -191,14 +138,12 @@ impl Config {
     }
 }
 
-/// Errors from loading/saving configuration.
 #[derive(Debug)]
 pub enum ConfigError {
-    /// No home/config base directory could be determined.
     NoConfigDir,
-    /// Reading or writing the config file failed.
+
     Io(std::io::Error),
-    /// Parsing or serializing the config JSON failed.
+
     Json(serde_json::Error),
 }
 
@@ -250,25 +195,21 @@ mod tests {
 
     #[test]
     fn partial_config_fills_missing_from_defaults() {
-        // Only one field present; the rest must come from defaults (the `#[serde(default)]`
-        // contract that lets partial / first-run config files work).
         let cfg: Config = serde_json::from_str(r#"{"use_opengl": true}"#).expect("parse");
         assert!(cfg.use_opengl);
-        assert!(cfg.enable_gamemode); // default true, not the bool default of false
-        assert!(cfg.close_on_leave); // default true
+        assert!(cfg.enable_gamemode);
+        assert!(cfg.close_on_leave);
         assert_eq!(
             cfg.graphics_optimization_mode,
             GraphicsOptimizationMode::Balanced
         );
         assert_eq!(cfg.touch_mode, TouchMode::Off);
-        // 2026-07-10 (plan M5): the sandbox-degradation opt-in defaults OFF — a missing key
-        // must never silently enable unsandboxed hostile-content rendering.
+
         assert!(!cfg.webview_allow_unsandboxed);
     }
 
     #[test]
     fn unknown_keys_are_ignored() {
-        // Forward/backward compatibility: a key Eclipse does not model must not break load.
         let cfg: Config =
             serde_json::from_str(r#"{"some_future_key": 42}"#).expect("parse with extra key");
         assert_eq!(cfg, Config::default());
@@ -318,7 +259,6 @@ mod tests {
 
     #[test]
     fn config_path_lives_under_eclipse_dir() {
-        // Skip rather than fail in an environment with no resolvable home dir.
         if let Ok(path) = Config::config_path() {
             assert!(path.ends_with("eclipse/config.json"), "got {path:?}");
         }

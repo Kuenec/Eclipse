@@ -1,18 +1,5 @@
-//! The 2-slot publish/ack frame state machine (helper-side policy object).
-//!
-//! 2026-07-03: torn frames are impossible BY CONSTRUCTION, not by seqlock spinning — the
-//! invariant is *"a slot named in an outstanding (un-acked) `FrameReady` is NEVER handed out
-//! for writing."* While a `FrameReady` is outstanding, every new paint coalesces latest-wins
-//! into the spare slot; the consumer's `FrameAck` both releases the published slot and
-//! immediately publishes the dirty spare (swap). The consumer reads slot pixels only between
-//! `FrameReady` and its own `FrameAck`, so at most one `FrameReady` is ever in flight
-//! (bounded socket traffic) and the read window never overlaps a write.
-//!
-//! Pure logic, no I/O — property-tested under plain `cargo test`.
-
 #![forbid(unsafe_code)]
 
-/// A `FrameReady` publication the caller must send to the consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Publish {
     pub generation: u32,
@@ -20,16 +7,15 @@ pub struct Publish {
     pub seq: u32,
 }
 
-/// The 2-slot tracker for one view's current buffer generation.
 #[derive(Debug)]
 pub struct SlotTracker {
     generation: u32,
     next_seq: u32,
-    /// The outstanding (published, un-acked) slot and its seq, if any.
+
     published: Option<(u8, u32)>,
-    /// Whether the spare slot holds a newer coalesced frame awaiting the ack-swap.
+
     spare_dirty: bool,
-    /// The slot to write when nothing is outstanding.
+
     write_slot: u8,
 }
 
@@ -48,20 +34,13 @@ impl SlotTracker {
         self.generation
     }
 
-    /// Per-generation reset (resize): the new memfd starts with both slots free and a fresh
-    /// seq space; acks for the old generation become stale and are ignored.
     pub fn reset(&mut self, generation: u32) {
         *self = Self::new(generation);
     }
 
-    /// The helper painted a new frame. Returns `(write_slot, publish)`: the caller must copy
-    /// the pixels into `write_slot` and, if `publish` is `Some`, send that `FrameReady`
-    /// AFTER the copy completes. `None` means the frame was coalesced into the spare
-    /// (latest-wins) because a `FrameReady` is still outstanding.
     pub fn on_paint(&mut self) -> (u8, Option<Publish>) {
         match self.published {
             Some((published_slot, _)) => {
-                // Invariant: never hand out the published-unacked slot for writing.
                 let spare = 1 - published_slot;
                 self.spare_dirty = true;
                 (spare, None)
@@ -84,10 +63,6 @@ impl SlotTracker {
         }
     }
 
-    /// The consumer acked `(generation, seq)`. A stale generation or a seq that does not
-    /// match the outstanding publication is ignored (`None`, state untouched). A matching
-    /// ack releases the published slot; if the spare is dirty it is published immediately
-    /// (the swap) and the returned `FrameReady` must be sent.
     pub fn on_ack(&mut self, generation: u32, seq: u32) -> Option<Publish> {
         if generation != self.generation {
             return None;
@@ -97,10 +72,9 @@ impl SlotTracker {
             return None;
         }
         self.published = None;
-        // The released slot becomes the next free-write target...
+
         self.write_slot = published_slot;
         if self.spare_dirty {
-            // ...unless the spare holds a newer frame: publish it now (latest-wins swap).
             self.spare_dirty = false;
             let spare = 1 - published_slot;
             self.next_seq = self.next_seq.wrapping_add(1);
@@ -115,7 +89,6 @@ impl SlotTracker {
         None
     }
 
-    /// The outstanding publication, if any (introspection for the helper/tests).
     pub fn outstanding(&self) -> Option<(u8, u32)> {
         self.published
     }
@@ -125,7 +98,6 @@ impl SlotTracker {
 mod tests {
     use super::*;
 
-    /// Deterministic xorshift PRNG — no `rand` dependency (no-bloat §2.5).
     struct XorShift(u64);
     impl XorShift {
         fn next(&mut self) -> u64 {
@@ -140,15 +112,9 @@ mod tests {
 
     #[test]
     fn frame_slots_never_write_a_published_unacked_slot() {
-        // 2026-07-03: pins the torn-frame impossibility argument — (a) the write slot never
-        // equals the published-unacked slot, (b) latest-wins coalescing publishes the newest
-        // spare on ack, (c) stale-generation acks are ignored. Exhaustive-ish randomized
-        // paint/ack/resize sequences with a deterministic seed.
         let mut rng = XorShift(0x00E0_C11B_5E00_2026);
         let mut tracker = SlotTracker::new(1);
 
-        // Model: stamp every paint; track each slot's latest stamp and the newest stamp
-        // overall. `outstanding` mirrors what the consumer would hold.
         let mut stamp: u64 = 0;
         let mut slot_stamp = [0u64; 2];
         let mut newest_stamp = 0u64;
@@ -157,10 +123,9 @@ mod tests {
 
         for step in 0..50_000u32 {
             match rng.next() % 10 {
-                // Paint (most common).
                 0..=5 => {
                     let (write_slot, publish) = tracker.on_paint();
-                    // (a) never write the published-unacked slot.
+
                     if let Some(p) = outstanding {
                         assert_ne!(
                             write_slot, p.slot,
@@ -180,13 +145,11 @@ mod tests {
                         outstanding = Some(p);
                     }
                 }
-                // Correct ack of the outstanding FrameReady.
+
                 6 | 7 => {
                     if let Some(p) = outstanding.take() {
                         let next = tracker.on_ack(p.generation, p.seq);
                         if let Some(n) = next {
-                            // (b) the ack-swap publishes the spare, which must hold the
-                            // NEWEST painted frame (latest-wins coalescing).
                             assert_ne!(n.slot, p.slot, "swap must publish the other slot");
                             assert_eq!(
                                 slot_stamp[usize::from(n.slot)],
@@ -198,18 +161,17 @@ mod tests {
                         }
                     }
                 }
-                // Hostile/stale acks: wrong seq, or a recorded previous-generation ack.
+
                 8 => {
                     let before = tracker.outstanding();
-                    let bogus_seq = rng.next() as u32 | 0x8000_0000; // far from real seqs
+                    let bogus_seq = rng.next() as u32 | 0x8000_0000;
                     assert_eq!(tracker.on_ack(tracker.generation(), bogus_seq), None);
                     if let Some((g, s)) = old_generation_acks.last().copied() {
-                        // (c) stale-generation acks are ignored.
                         assert_eq!(tracker.on_ack(g, s), None);
                     }
                     assert_eq!(tracker.outstanding(), before, "ignored ack mutated state");
                 }
-                // Resize → new generation; everything outstanding becomes stale.
+
                 _ => {
                     if let Some(p) = outstanding.take() {
                         old_generation_acks.push((p.generation, p.seq));
@@ -221,7 +183,7 @@ mod tests {
                     assert_eq!(tracker.outstanding(), None);
                 }
             }
-            // Global invariant: the tracker's outstanding view matches the model's.
+
             assert_eq!(
                 tracker.outstanding(),
                 outstanding.map(|p| (p.slot, p.seq)),
@@ -229,8 +191,6 @@ mod tests {
             );
         }
 
-        // Deterministic coalescing scenario: paint→publish, 3 paints coalesce into the one
-        // spare, ack swaps in the newest.
         let mut t = SlotTracker::new(7);
         let (s0, p0) = t.on_paint();
         let p0 = p0.expect("first paint publishes");

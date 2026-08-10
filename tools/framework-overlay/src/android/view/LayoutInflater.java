@@ -1,25 +1,25 @@
-/*
- * portions Copyright (C) 2007 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 
-// ECLIPSE PATCH 2026-06-13: committed patched copy of vendor/atl/src/api-impl/android/view/LayoutInflater.java
-// (Apache-2.0). The ONLY change vs the vendored original is <requestFocus/> support in rInflate (search
-// "ECLIPSE PATCH"); every other method is byte-for-byte the vendored source. Shadows the stock class via the
-// framework overlay's classes.dex (multidex first-dex-wins). Root cause: ATL stubbed the standard <requestFocus/>
-// layout tag with a "not supported" throw that aborted ActivityNativeMain.onCreate's LayoutInflater.inflate
-// (live log, commit 521ba34).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 package android.view;
 
@@ -40,7 +40,7 @@ import org.xmlpull.v1.XmlPullParserFactory;
 public class LayoutInflater {
 	private static final String TAG = "LayoutInflater";
 
-	/* pretty print for debugging */
+
 	private int indent = 1;
 	private String tabs(int indent) {
 		return indent > 0 ? String.format("%"+indent+"s", "").replace(" ", "\t") : "";
@@ -101,11 +101,11 @@ public class LayoutInflater {
 		return view_instance;
 	}
 
-	/**
-	 * taken as-is
-	 */
+
+
+
 	protected View onCreateView(String name, AttributeSet attrs) throws Exception {
-		try { // FIXME ugly
+		try {
 			return createView(name, "android.view.", attrs);
 		} catch (java.lang.ClassNotFoundException e) {
 			try {
@@ -116,9 +116,9 @@ public class LayoutInflater {
 		}
 	}
 
-	/**
-	 * taken as-is
-	 */
+
+
+
 	protected View onCreateView(View parent, String name, AttributeSet attrs) throws Exception {
 		return onCreateView(name, attrs);
 	}
@@ -172,11 +172,11 @@ public class LayoutInflater {
 
 		View result = root;
 
-		// Look for the root node.
+
 		int type;
 		while ((type = parser.next()) != XmlPullParser.START_TAG &&
 		       type != XmlPullParser.END_DOCUMENT) {
-			// Empty
+
 		}
 
 		if (type != XmlPullParser.START_TAG) {
@@ -196,11 +196,11 @@ public class LayoutInflater {
 
 			rInflate(parser, root, attrs, false);
 		} else {
-			// Temp is the root view that was found in the xml
+
 			View temp;
 			if (name.equals("blink")) {
 				throw new Exception("<blink> not supported atm");
-				/*temp = new BlinkLayout(mContext, attrs);*/
+
 			} else {
 				temp = createViewFromTag(root, name, attrs);
 			}
@@ -210,13 +210,13 @@ public class LayoutInflater {
 			if (root != null) {
 				Slog.v(TAG, tabs(indent) + "Creating params from root: " + root);
 
-				// Create layout params that match root, if supplied
+
 				try {
 					params = root.generateLayoutParams(attrs);
 					params.resolveLayoutDirection(root.getLayoutDirection());
 					if (!attachToRoot) {
-						// Set the layout params for temp if we are not
-						// attaching. (If we are, we use addView, below)
+
+
 						temp.setLayoutParams(params);
 					}
 				} catch (RuntimeException e) {
@@ -226,19 +226,19 @@ public class LayoutInflater {
 
 			Slog.v(TAG, tabs(indent) + "-----> start inflating children");
 
-			// Inflate all children under temp
+
 			rInflate(parser, temp, attrs, true);
 
 			Slog.v(TAG, tabs(indent) + "-----> done inflating children");
 
-			// We are supposed to attach all the views we found (int temp)
-			// to root. Do that now.
+
+
 			if (root != null && attachToRoot) {
 				root.addView(temp, params);
 			}
 
-			// Decide whether to return the root that was passed in or the
-			// top view found in xml.
+
+
 			if (root == null || !attachToRoot) {
 				result = temp;
 			}
@@ -251,7 +251,7 @@ public class LayoutInflater {
 		final int depth = parser.getDepth();
 		int type;
 
-		indent++; // prettyprint for debugging
+		indent++;
 		while (((type = parser.next()) != XmlPullParser.END_TAG ||
 		       parser.getDepth() > depth) &&
 		       type != XmlPullParser.END_DOCUMENT) {
@@ -263,8 +263,8 @@ public class LayoutInflater {
 			final String name = parser.getName();
 
 			if (name.equals("requestFocus")) {
-				// ECLIPSE PATCH 2026-06-13: ATL stubbed this branch with a "not supported" throw that
-				// aborted ActivityNativeMain.onCreate inflation; handle the standard AOSP tag instead.
+
+
 				parseRequestFocus(parser, parent);
 			} else if (name.equals("include")) {
 				if (parser.getDepth() == 0) {
@@ -275,11 +275,11 @@ public class LayoutInflater {
 				throw new Exception("<merge /> must be the root element");
 			} else if (name.equals("blink")) {
 				throw new Exception("<blink> not supported atm");
-				/*final View view = new BlinkLayout(mContext, attrs);
-				final ViewGroup viewGroup = (ViewGroup) parent;
-				final ViewGroup.LayoutParams params = viewGroup.generateLayoutParams(attrs);
-				rInflate(parser, view, attrs, true);
-				viewGroup.addView(view, params);*/
+
+
+
+
+
 			} else {
 				final View view = createViewFromTag(parent, name, attrs);
 				final ViewGroup viewGroup = (ViewGroup)parent;
@@ -294,32 +294,32 @@ public class LayoutInflater {
 				viewGroup.addView(view, params);
 			}
 		}
-		indent--; // prettyprint for debugging
+		indent--;
 
 		if (finishInflate)
 			parent.onFinishInflate();
 	}
 
-	// ECLIPSE PATCH 2026-06-13: AOSP frameworks/base LayoutInflater.parseRequestFocus semantics, minus the
-	// View.requestFocus() call. Eclipse is headless (no GTK) and binds NO nativeRequestFocus native (View.requestFocus()
-	// bottoms out in `private native void nativeRequestFocus(long, int)`, vendored View.java; its only impl is ATL's
-	// GTK gtk_widget_grab_focus, which Eclipse never loads). Calling requestFocus() here would throw UnsatisfiedLinkError
-	// — trading one inflation abort for another. The engine owns input focus headlessly; we consume the (empty)
-	// <requestFocus/> element so rInflate's loop resumes at the next sibling. The `view` param mirrors the AOSP
-	// signature and is intentionally unused.
+
+
+
+
+
+
+
 	private void parseRequestFocus(XmlPullParser parser, View view) throws Exception {
 		consumeChildElements(parser);
 	}
 
-	// ECLIPSE PATCH 2026-06-13: byte-for-byte the AOSP frameworks/base consumeChildElements idiom (and identical to
-	// rInflate's own depth-guard above): advances the parser past the current element's children to its matching END_TAG.
+
+
 	private void consumeChildElements(XmlPullParser parser) throws Exception {
 		int type;
 		final int currentDepth = parser.getDepth();
 		while (((type = parser.next()) != XmlPullParser.END_TAG ||
 		       parser.getDepth() > currentDepth) &&
 		       type != XmlPullParser.END_DOCUMENT) {
-			// Empty.
+
 		}
 	}
 
@@ -333,7 +333,7 @@ public class LayoutInflater {
 
 		while ((type = childParser.next()) != XmlPullParser.START_TAG &&
 			type != XmlPullParser.END_DOCUMENT) {
-			// Empty.
+
 		}
 		if (type != XmlPullParser.START_TAG) {
 			throw new Exception(childParser.getPositionDescription() + ": No start tag found!");
@@ -341,8 +341,8 @@ public class LayoutInflater {
 
 		final String childName = childParser.getName();
 		if ("merge".equals(childName)) {
-			// The <merge> tag doesn't support android:theme, so
-			// nothing special to do here.
+
+
 			rInflate(childParser, parent, childAttrs, false);
 		} else {
 			final View view = createViewFromTag(parent, childName, childAttrs);
@@ -351,14 +351,14 @@ public class LayoutInflater {
 			try {
 				params = group.generateLayoutParams(attrs);
 			} catch (RuntimeException e) {
-				// Ignore, just fail over to child attrs.
+
 			}
 			if (params == null) {
 				params = group.generateLayoutParams(childAttrs);
 			}
 			params.resolveLayoutDirection(group.getLayoutDirection());
 			view.setLayoutParams(params);
-			// Inflate all children.
+
 			rInflate(childParser, view, childAttrs, true);
 
 			TypedArray ta = context.obtainStyledAttributes(attrs, new int[]{com.android.internal.R.attr.id});

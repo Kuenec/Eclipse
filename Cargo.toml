@@ -1,162 +1,162 @@
-# Eclipse — crate manifest.
-#
-# Deps are added per subsystem, only when that subsystem is actually built — we don't pull
-# unverified crate versions or system libs (vulkan/pulse/gtk dev headers, the vendored ART)
-# ahead of need. M1 has wired diagnostics + config + apk + the runtime ART-boot FFI; the
-# remaining subsystems (audio, input, services, bionic) are still stubs (graphics has the winit
-# host window + an ash/Vulkan surface+swapchain+clear-present loop; the View-tree draw / engine
-# WSI forwarding are next).
-#
-# The full, annotated dependency PLAN (what each subsystem will use, and why) lives in
-# docs/dependency-plan.md. Add deps to this file only when wiring up the subsystem, after
-# verifying the version with `cargo add` (priorities: stability > pure-Rust > no bloat).
-#
-# Single crate for now (simplicity-first). Split into a workspace once subsystems grow.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 [package]
 name = "eclipse"
 version = "0.0.0"
 edition = "2021"
-# 2026-06-04: pinned to the dev/CI toolchain (conservative). The code itself needs far less
-# (let-else = 1.65); the true MSRV floor is a dependency's (winit/jni-sys/zip) — lower this
-# once verified against older toolchains (none installed here). Pinned, not minimal (§2.11).
+
+
+
 rust-version = "1.95"
 description = "Open-source, Rust, distro-agnostic runtime for running the Android Roblox build on Linux"
-license = "TBD"            # deferred per project decision
+license = "TBD"
 publish = false
 
 [dependencies]
-# --- Launcher foundation: diagnostics + config (M1) -----------------------------
-tracing = "0.1"                                                     # structured diagnostics facade
-tracing-subscriber = { version = "0.3", features = ["env-filter"] } # RUST_LOG-driven subscriber
-serde = { version = "1", features = ["derive"] }                    # config.json (mirror Sober schema)
-serde_json = "1"                                                    # config.json (de)serialization
-directories = "6"                                                   # portable XDG dirs (no hardcoded paths)
-# --- APK parse / verify (M1) ----------------------------------------------------
-# Local-only: open the APK zip, read binary AndroidManifest.xml, verify SHA-256.
-# Network fetch (ureq/rustls) WIRED 2026-06-11 for the opt-in APK auto-fetch (see below + src/apk/fetch.rs).
-# APK container. `deflate` decompresses the Deflate-compressed AndroidManifest.xml (libroblox.so
-# is Stored). 2026-06-04: `deflate` is the ONLY pure-Rust deflate option in zip 2.4.2 — it pulls
-# flate2/rust_backend (miniz_oxide) and, unavoidably, the zopfli compressor we never use; the
-# zopfli-free alternatives (`deflate-zlib`/`-zlib-ng`) link a C zlib, violating pure-Rust/
-# portability (§2.1/§9), and `deflate-flate2` alone has no backend (won't compile). So zopfli's
-# ~2 crates are accepted as the cost of a pure-Rust decoder; revisit if zip exposes a leaner path.
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+
+
+
+
+
+
+
+
+
 zip = { version = "2", default-features = false, features = ["deflate"] }
-sha2 = "0.10"                                     # streaming artifact-integrity hash (lowercase hex via std::fmt, no `hex` crate)
-# 2026-07-17: validate an existing extracted APK entry against the ZIP entry's CRC32 before
-# skipping it. `crc32fast` is already in the graph through `zip`, so making it direct adds zero
-# transitive crates; it prevents same-size files from an older APK surviving an upgrade.
+sha2 = "0.10"
+
+
+
 crc32fast = "1"
-# 2026-07-17: Android CookieManager accepts RFC HTTP-date `Expires` attributes. Eclipse must
-# preserve that expiry when translating the raw Set-Cookie string into CEF's structured cookie;
-# otherwise a persistent cookie is mislabeled as session-only and removeSessionCookies deletes it.
-# `httpdate` is pure Rust, `forbid(unsafe_code)`, MSRV 1.56, and only one small crate.
+
+
+
+
 httpdate = "1.0.3"
-# --- Runtime: boot the vendored ART VM (M1) -------------------------------------
-# 2026-06-05: 0.8 (was 0.9) unifies the tree on the single libloading already pulled by ash/
-# wayland-sys/khronos-egl — removing the duplicate 0.9 (§2.5 no-bloat) and letting egl_engine.rs
-# construct the `khronos-egl` `DynamicInstance` from the SAME libloading::Library type it expects
-# (a 0.9 Library is a distinct type → mismatch). The `os::unix` API runtime.rs uses is identical.
-libloading = "0.8"                                # dlopen the vendored /usr/lib/art/libart.so (no link-time ART dep)
-jni-sys = "0.4"                                   # raw JNI invocation types used by boot()'s JNI_CreateJavaVM
-jni = "0.22"                                      # safe JNI wrapper for the onCreate framework driver (wraps the held *mut JavaVM)
-# --- Graphics/window: the host game window (M2) ----------------------------------
-winit = "0.30"                                    # Wayland/X11 window + event loop (NO GTK — keeps low_4gb clear for ART; ash/khronos-egl for forwarding come later)
-# 2026-06-05: mmap/mprotect/munmap for the bionic-loader's PT_LOAD segment mapper (src/loader/map.rs).
-# `mm` feature ONLY. rustix is ALREADY in the tree (winit→x11rb/wayland/polling pull rustix 1.x), so this
-# adds ZERO new transitive crates (verified `cargo tree`); more pure-Rust than `libc` (linux_raw backend
-# issues syscalls directly, no C-library link) — aligns with §2.1 pure-Rust + §9 portability + §2.5 no-bloat.
+
+
+
+
+
+libloading = "0.8"
+jni-sys = "0.4"
+jni = "0.22"
+
+winit = "0.30"
+
+
+
+
 rustix = { version = "1", default-features = false, features = ["mm", "param"] }
-# 2026-06-05: dlsym(RTLD_DEFAULT) for the bionic-loader's host-symbol provider (src/loader/resolve.rs's
-# HostDlsymProvider, the "satisfy an import from an already-loaded provider" path). `rustix` has NO
-# dlopen/dlsym API (it deliberately omits dynamic linking), so `libc` is the ONLY sound dlsym path; it is
-# ALREADY in the tree (transitively via directories/winit — `cargo tree -i libc`), so this adds ZERO new
-# crates (§2.5 no-bloat). The dlsym FFI is the one unavoidable `unsafe`, confined to resolve.rs (§2.3).
+
+
+
+
+
 libc = "0.2"
-# 2026-06-05: Vulkan surface+swapchain+present foundation on the winit window. `loaded` makes ash
-# dlopen the host libvulkan.so at runtime (Entry::load) — detect-don't-assume, no link-time Vulkan
-# dep (§9 portability). `std` gives std::error::Error on vk::Result; `debug` gives the Debug impls.
+
+
+
 ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
-ash-window = "0.13"                               # ash ↔ raw-window-handle interop: required surface extensions + VkSurfaceKHR from the window
-raw-window-handle = "0.6"                         # the window/display handle abstraction (deduped with winit 0.30's own dep)
-# 2026-06-05: the ENGINE's GLES2/EGL render surface on Eclipse's window (src/egl_engine.rs). The
-# Roblox x86-64 engine renders the whole frame into an ANativeWindow via EGL (91 EGL/GLESv2 imports →
-# host Mesa, NOT Vulkan — docs/libroblox-characterization.md). `dynamic` makes khronos-egl dlopen the
-# host libEGL.so.1 at runtime (detect-don't-assume §9, no link-time EGL dep) via `libloading` 0.8 —
-# ALREADY in Cargo.lock (transitively) → ZERO new transitive crates beyond khronos-egl itself; the
-# smallest sound option vs glutin (which bundles window-management Eclipse already does with winit).
+ash-window = "0.13"
+raw-window-handle = "0.6"
+
+
+
+
+
+
 khronos-egl = { version = "6", features = ["dynamic"] }
-# 2026-06-05: pure-Rust glyph rasterizer for the View-tree TEXT pass — rasterizes each TextView's
-# text into an R8 glyph atlas the text pipeline samples. Pure Rust (ttf-parser/owned_ttf_parser),
-# no C/system font lib (§2.1); the system font FILE is found portably at runtime via fontconfig
-# `fc-match` / known font dirs (detect-don't-assume §9), never linking fontconfig.
+
+
+
+
 ab_glyph = "0.2"
-# 2026-06-05: host audio output for the REAL OpenSL ES path (src/loader/opensl.rs). libroblox's
-# x86-64 build imports OpenSL ES (slCreateEngine + SL_IID_*); Eclipse returns a working SLObjectItf
-# whose buffer-queue Enqueue feeds a host output stream. `cpal` is the smallest portable Linux sound
-# option: it auto-selects ALSA (which modern distros route through PipeWire/Pulse's ALSA-compat layer)
-# — detect-don't-assume (§9), no hardcoded backend. It is pure-Rust except the ALSA-C link (the
-# documented "purity ceiling" in docs/dependency-plan.md — no pure-Rust Linux audio exists). Adds 4
-# new crates (cpal, alsa, alsa-sys, dasp_sample); libc/bitflags/cfg-if/pkg-config already in tree.
+
+
+
+
+
+
+
 cpal = "0.17"
-# 2026-06-05: pure-Rust software 2D rasterizer (a Skia subset, no C/Skia link) for the vector-drawable
-# pass — fills each android.graphics.Path's REAL recorded geometry (path_registry) into an RGBA Pixmap
-# the renderer uploads as a GPU texture (mirroring the glyph atlas). `std` + `simd` (default) kept;
-# `png-format` dropped (no PNG encode/decode — Eclipse uploads raw RGBA straight to the GPU; no bloat
-# §2.5). Pure Rust (tiny-skia-path/png/fdeflate), no GTK/Cairo/Skia-C (§2.1).
+
+
+
+
+
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
-# 2026-06-11: the SQLite engine behind android.database.sqlite.SQLiteConnection's natives. ATL declares
-# the full AOSP SQLiteConnection native surface (nativeOpen/prepare/bind/step/column/…) but backs it in
-# its GTK lib (libtranslation_layer_main.so) Eclipse does not load, so Roblox's ActivitySplash.onCreate
-# DB open is an UnsatisfiedLinkError. Eclipse binds these natives itself (RegisterNatives, like Context/
-# ConnectivityManager) against the RAW libsqlite3-sys FFI (sqlite3*/sqlite3_stmt* round-trip as the jlong
-# handles the Java side stores — the JNI contract IS a thin C-API surface, so the raw -sys crate fits
-# better than rusqlite's safe wrapper, and is leaner: no rusqlite/smallvec/fallible-iterator). `bundled`
-# compiles the vendored SQLite amalgamation via the `cc` crate (already a build-dep) and links it
-# statically — NO system libsqlite3, deterministic version, distro-portable (detect-don't-assume §9). No
-# pure-Rust SQLite is production-grade (stability §3.1), so a thin binding to the gold-standard C engine
-# is the accepted shape — the one new C black box here, same rationale as cpal→ALSA / the cc shims; adds
-# only libsqlite3-sys (+ vcpkg, a Windows-only build helper). Logged in docs/dependency-plan.md + §6.
+
+
+
+
+
+
+
+
+
+
+
+
 libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }
-# 2026-06-11: the OPT-IN APK auto-fetch (src/apk/fetch.rs) — a blocking, streaming HTTPS GET to download
-# a Roblox APK from a USER-CONFIGURED source (Eclipse never hosts/hard-codes one — see fetch.rs policy).
-# `ureq` is the smallest blocking HTTP client (no async runtime — §2.5); `default-features = false` +
-# `rustls` gives PURE-RUST TLS (no system OpenSSL — §2.1 pure-Rust, §9 distro-portable), pulling rustls
-# 0.23 + webpki-roots (the planned ureq+rustls pair, docs/dependency-plan.md). SHA-256 reuses `sha2`.
+
+
+
+
+
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
-# 2026-06-04: dropped `axmldecoder 0.3` (it panicked on hostile AXML — see src/apk/axml.rs).
-# The binary AndroidManifest.xml reader is now Eclipse's own pure-Rust, total module (§2.1/2.5/2.8).
-# Remaining subsystem deps are still planned-only — see docs/dependency-plan.md.
+
+
+
 
 [build-dependencies]
-# 2026-06-05: compile the clean-room liblog VARIADIC shim (src/loader/liblog_shim.c) — the two
-# C-variadic bionic natives (`__android_log_print`/`__android_log_assert`) Rust stable cannot DEFINE
-# (the `c_variadic` feature is nightly-only; Eclipse builds on stable, §2.11). `cc` is the standard
-# build-time bridge for compiling a small C source; it DISCOVERS the host C compiler (no hardcoded
-# paths, §9) and fails with an actionable error if none exists. Already present transitively in
-# Cargo.lock → promoting it to a direct build-dep adds ZERO new crates (§2.5). See build.rs.
+
+
+
+
+
+
 cc = "1"
 
-# Enforce the project requirements (see AGENTS.md). CI/local gate before any commit:
-#   cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
+
+
 [lints.rust]
-unsafe_op_in_unsafe_fn = "deny"   # unsafe must be explicit even inside unsafe fns
-unreachable_pub = "warn"          # keep the public surface tight (no bloat)
-unused = { level = "warn", priority = -1 }   # group: lower priority so specific lints win
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+unused = { level = "warn", priority = -1 }
 
 [lints.clippy]
-all = { level = "warn", priority = -1 }   # promoted to errors in CI via -D warnings
+all = { level = "warn", priority = -1 }
 
-# "Optimized as much as possible" — max runtime speed, smallest binary (no bloat).
+
 [profile.release]
 opt-level = 3
-lto = true              # fat LTO: best runtime perf (trades build time — fine, we have few deps)
-codegen-units = 1       # better optimization at the cost of parallel codegen
-# 2026-06-04: panic = "abort" per AGENTS.md §2.4 (smallest binary, best codegen, and a strict
-# no-unwind posture for the future FFI/JNI boundaries — a panic must never unwind across them).
-# This is safe because the only untrusted-input parser, the binary AndroidManifest.xml reader
-# (src/apk/axml.rs), is now *total*: it returns a typed ApkError::Axml(AxmlError) for every
-# malformed/hostile manifest and never panics (§2.8). The previous catch_unwind-based guard
-# (which required unwind) is gone with the panic-prone axmldecoder dependency it protected.
+lto = true
+codegen-units = 1
+
+
+
+
+
+
 panic = "abort"
-strip = true            # strip symbols from the shipped binary
+strip = true

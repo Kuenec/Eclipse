@@ -1,16 +1,9 @@
-//! Host wait/wake state for `android.os.MessageQueue` native handles.
-//!
-//! Eclipse pumps Android's main queue from winit, so that one queue must yield when no message is
-//! ready. Android worker loopers have the opposite contract: `Looper.loop()` must block until a
-//! producer calls `nativeWake`. A distinct handle per queue lets the shared JNI natives preserve
-//! both behaviours without baking thread names or app-specific knowledge into the framework.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-const FIRST_HANDLE: i64 = 0x4d51_0000; // "MQ", visibly not a host pointer.
+const FIRST_HANDLE: i64 = 0x4d51_0000;
 
 #[derive(Debug)]
 struct QueueState {
@@ -100,11 +93,6 @@ fn state(handle: i64) -> Option<Arc<QueueState>> {
     lock_registry().get(&handle).cloned()
 }
 
-/// Allocate one opaque, never-reused Java `mPtr` handle.
-///
-/// `None` is the allocation-failure signal expected by `MessageQueue` (`nativeInit` returns zero).
-/// Avoiding assertions here matters because release builds use `panic = "abort"` and this function
-/// is called from a JNI boundary.
 pub(super) fn create(is_main: bool) -> Option<i64> {
     static NEXT_HANDLE: AtomicI64 = AtomicI64::new(FIRST_HANDLE);
     let handle = NEXT_HANDLE
@@ -124,14 +112,8 @@ pub(super) fn create(is_main: bool) -> Option<i64> {
     }
 }
 
-/// Implement ATL's boolean `nativePollOnce` convention.
-///
-/// `true` asks its patched `MessageQueue.next()` to yield `null`. Only the externally pumped main
-/// queue does that. A worker waits as Android requires, then returns `false` so Java re-examines its
-/// synchronized message list (and observes either the new message, its timeout, or `mQuitting`).
 pub(super) fn poll_should_yield(handle: i64, timeout_millis: i32) -> bool {
     let Some(state) = state(handle) else {
-        // A stale/destroyed handle must never block an ART thread.
         return timeout_millis != 0;
     };
     if state.is_main {
@@ -141,7 +123,6 @@ pub(super) fn poll_should_yield(handle: i64, timeout_millis: i32) -> bool {
     false
 }
 
-/// Wake a worker poll. The pending bit makes a wake durable across the small pre-wait race window.
 pub(super) fn wake(handle: i64) -> bool {
     let Some(state) = state(handle) else {
         return false;
@@ -150,12 +131,10 @@ pub(super) fn wake(handle: i64) -> bool {
     true
 }
 
-/// Whether the queue is currently inside a blocking worker poll.
 pub(super) fn is_idling(handle: i64) -> bool {
     state(handle).is_some_and(|state| state.waiting.load(Ordering::Acquire))
 }
 
-/// Retire a Java queue handle and wake any defensive in-flight waiter.
 pub(super) fn destroy(handle: i64) -> bool {
     let removed = lock_registry().remove(&handle);
     if let Some(state) = removed {
