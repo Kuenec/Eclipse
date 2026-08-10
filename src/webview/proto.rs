@@ -1978,15 +1978,17 @@ mod tests {
 
     #[test]
     fn bridge_call_frame_never_leaks_payload_bytes() {
-        let secret = "opaque-test-value";
+        let payload = "opaque-test-value";
         let call = HelperMsg::BridgeCall {
             view: 7,
             call_id: 3,
-            payload_json: format!("{{\"args\":[\"{secret}\"]}}"),
+            payload_json: format!("{{\"args\":[\"{payload}\"]}}"),
         };
         let bytes = call.encode().expect("encode");
         assert!(
-            bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+            bytes
+                .windows(payload.len())
+                .any(|w| w == payload.as_bytes()),
             "the page-controlled bridge payload must cross the wire"
         );
         let mut r = bytes.as_slice();
@@ -1996,7 +1998,7 @@ mod tests {
             request_id: 1,
             url: "https://www.roblox.com/".to_string(),
             name: ".ROBLOSECURITY".to_string(),
-            value: secret.to_string(),
+            value: payload.to_string(),
             domain: ".roblox.com".to_string(),
             path: "/".to_string(),
             secure: true,
@@ -2004,17 +2006,21 @@ mod tests {
             expires_epoch_s: 0,
         };
         let bytes = set.encode().expect("encode");
-        assert!(bytes.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        assert!(bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_bytes()));
         let mut r = bytes.as_slice();
         assert_eq!(read_consumer_msg(&mut r).expect("decode"), set);
 
         let eval = ConsumerMsg::EvaluateJsForResult {
             view: 7,
             request_id: 2,
-            script: format!("document.cookie=\"{secret}\""),
+            script: format!("document.cookie=\"{payload}\""),
         };
         let bytes = eval.encode().expect("encode");
-        assert!(bytes.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        assert!(bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_bytes()));
         let mut r = bytes.as_slice();
         assert_eq!(read_consumer_msg(&mut r).expect("decode"), eval);
     }
