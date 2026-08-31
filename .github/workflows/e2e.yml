@@ -1,0 +1,93 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  engine-e2e:
+    name: Engine / headless Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install headless graphics and audio dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libasound2-dev \
+            libegl1-mesa \
+            libgles2-mesa \
+            mesa-utils \
+            pkg-config \
+            xauth \
+            xvfb
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-headless
+
+      - name: Build the E2E binary
+        run: cargo build --locked
+
+      - name: Run engine milestone integration tests
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          WINIT_UNIX_BACKEND: x11
+        run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked --test engine_milestones -- --nocapture
+
+      - name: Exercise native input pipeline
+        run: target/debug/eclipse __input-test
+
+      - name: Exercise OpenSL-to-host audio pipeline
+        run: target/debug/eclipse __audio-test
+
+      - name: Render GLES2 frames through EGL
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          WINIT_UNIX_BACKEND: x11
+        run: xvfb-run -a -s "-screen 0 1280x720x24" timeout 30s target/debug/eclipse __gl-test
+
+      - name: Bind ANativeWindow to the real WSI handle
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          WINIT_UNIX_BACKEND: x11
+        run: xvfb-run -a -s "-screen 0 1280x720x24" timeout 30s target/debug/eclipse __gl-test-anw
+
+  full-runtime-e2e:
+    name: Full runtime / APK + ART + WebView
+    if: github.event_name != 'pull_request' && vars.ECLIPSE_FULL_E2E_ENABLED == 'true'
+    runs-on: [self-hosted, linux, x64, eclipse-e2e]
+    timeout-minutes: 60
+    env:
+      ECLIPSE_ROBLOX_APK: ${{ vars.ECLIPSE_E2E_APK_PATH }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run the full provisioned-host milestone suite
+        run: cargo test --locked --test engine_milestones -- --nocapture

@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev pkg-config shellcheck
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quality
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint Eclipse
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Lint libm shim
+        run: cargo clippy --manifest-path crates/libm-shim/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Lint shell scripts
+        run: git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck
+
+      - name: Lint GitHub Actions workflows
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+  test:
+    name: Tests / stable
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev pkg-config
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests-stable
+
+      - name: Run every Eclipse target and test
+        run: cargo test --all-targets --locked
+
+      - name: Test detached libm shim crate
+        run: cargo test --manifest-path crates/libm-shim/Cargo.toml --all-targets --locked
+
+  msrv:
+    name: MSRV / Rust 1.95
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev pkg-config
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-1.95
+
+      - name: Check every target against the MSRV
+        run: cargo check --all-targets --locked
+
+  release-build:
+    name: Release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev pkg-config
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - name: Build optimized binary
+        run: cargo build --release --locked
+
+      - name: Smoke-test the CLI
+        run: |
+          target/release/eclipse --version
+          target/release/eclipse help
+
+      - name: Package standalone binary
+        run: |
+          mkdir -p artifacts
+          tar -C target/release -czf artifacts/eclipse-linux-x86_64.tar.gz eclipse
+          sha256sum artifacts/eclipse-linux-x86_64.tar.gz > artifacts/SHA256SUMS
+
+      - name: Upload release-build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: eclipse-linux-x86_64
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [quality, test, msrv, release-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          BUILD_RESULT: ${{ needs.release-build.result }}
+        run: |
+          test "$QUALITY_RESULT" = success
+          test "$TEST_RESULT" = success
+          test "$MSRV_RESULT" = success
+          test "$BUILD_RESULT" = success

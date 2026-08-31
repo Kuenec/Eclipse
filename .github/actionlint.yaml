@@ -1,0 +1,3 @@
+self-hosted-runner:
+  labels:
+    - eclipse-e2e
