@@ -126,10 +126,7 @@ fn parse_launcher_url(value: &str) -> Option<u64> {
     }
 
     let (path, query) = path_and_query.split_once('?')?;
-    if (path != "game/PlaceLauncher.ashx" && path != "Game/PlaceLauncher.ashx")
-        || query.is_empty()
-        || query.contains('#')
-    {
+    if !launcher_path(path) || query.is_empty() || query.contains('#') {
         return None;
     }
 
@@ -138,6 +135,7 @@ fn parse_launcher_url(value: &str) -> Option<u64> {
     let mut saw_browser_tracker = false;
     let mut saw_play_together = false;
     let mut saw_party_leader = false;
+    let mut saw_referring_player = false;
     let mut saw_join_attempt_id = false;
     let mut saw_join_attempt_origin = false;
 
@@ -155,7 +153,10 @@ fn parse_launcher_url(value: &str) -> Option<u64> {
             "isPartyLeader" if !saw_party_leader && value == "false" => {
                 saw_party_leader = true;
             }
-            "joinAttemptId" if !saw_join_attempt_id && uuid(value) => {
+            "referredByPlayerId" if !saw_referring_player && decimal(value, true).is_some() => {
+                saw_referring_player = true;
+            }
+            "joinAttemptId" if !saw_join_attempt_id && identifier(value, 64, false) => {
                 saw_join_attempt_id = true;
             }
             "joinAttemptOrigin" if !saw_join_attempt_origin && identifier(value, 64, false) => {
@@ -170,6 +171,26 @@ fn parse_launcher_url(value: &str) -> Option<u64> {
     } else {
         None
     }
+}
+
+fn launcher_path(path: &str) -> bool {
+    if matches!(path, "game/PlaceLauncher.ashx" | "Game/PlaceLauncher.ashx") {
+        return true;
+    }
+    let mut segments = path.split('/');
+    let (Some(locale), Some("Game"), Some("PlaceLauncher.ashx"), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    !locale.is_empty()
+        && locale.len() <= 16
+        && locale
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn decimal(value: &str, allow_zero: bool) -> Option<u64> {
@@ -192,17 +213,6 @@ fn identifier(value: &str, max_len: usize, allow_empty: bool) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
-fn uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,7 +231,7 @@ mod tests {
 
     #[test]
     fn accepts_current_roblox_web_metadata() {
-        let protocol = "roblox-player:1+launchmode:play+gameinfo:SECRET_TICKET+launchtime:1788192000000+placelauncherurl:https%3A%2F%2Fwww.roblox.com%2FGame%2FPlaceLauncher.ashx%3FjoinAttemptOrigin%3DPlayButton%26placeId%3D90441122676618%26request%3DRequestGame%26browserTrackerId%3D216042055264%26isPlayTogetherGame%3Dfalse%26isPartyLeader%3Dfalse%26joinAttemptId%3Db73f85b1-aebe-4224-ae2c-10eb9df28964+browsertrackerid:216042055264+robloxLocale:fr_fr+gameLocale:fr_fr+channel:+LaunchExp:InApp";
+        let protocol = "roblox-player:1+launchmode:play+gameinfo:SECRET_TICKET+launchtime:1788192000000+placelauncherurl:https%3A%2F%2Fwww.roblox.com%2Ffr%2FGame%2FPlaceLauncher.ashx%3FjoinAttemptOrigin%3DPlayButton%26placeId%3D90441122676618%26request%3DRequestGame%26browserTrackerId%3D216042055264%26isPlayTogetherGame%3Dfalse%26isPartyLeader%3Dfalse%26referredByPlayerId%3D0%26joinAttemptId%3D3a5e0cf49-3e23-46a0-9dc7-887dad37e760+browsertrackerid:216042055264+robloxLocale:fr_fr+gameLocale:fr_fr+channel:+LaunchExp:InApp";
         assert_eq!(place_id(protocol).unwrap(), PLACE_ID);
     }
 
