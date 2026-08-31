@@ -1,7 +1,6 @@
 
 package android.content;
 public abstract class Context {
-  public static android.app.Application this_application;
   public String getPackageName() {
     return null;
   }

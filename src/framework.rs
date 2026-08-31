@@ -203,7 +203,7 @@ fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
 
 pub const CONNECTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/net/ConnectivityManager");
 
-const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("registerNetworkCallback");
+const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("nativeRegisterNetworkCallback");
 const CM_REGISTER_NETWORK_CALLBACK_SIG: &JNIStr =
     jni_str!("(Landroid/net/NetworkRequest;Landroid/net/ConnectivityManager$NetworkCallback;)V");
 const CM_IS_ACTIVE_NETWORK_METERED_NAME: &JNIStr = jni_str!("isActiveNetworkMetered");
@@ -266,7 +266,7 @@ fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/net/ConnectivityManager",
-        "registered Eclipse's non-GTK backing for registerNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
+        "registered Eclipse's non-GTK backing for nativeRegisterNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
     );
     Ok(())
 }
@@ -2934,7 +2934,7 @@ const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME: &JNIStr = jni_str!("native_setBa
 const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
 
 const VIEW_NATIVE_SET_VISIBILITY_NAME: &JNIStr = jni_str!("native_setVisibility");
-const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIF)V");
+const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIFZ)V");
 
 const VIEW_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
 const VIEW_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
@@ -3207,6 +3207,7 @@ extern "system" fn view_native_set_visibility<'local>(
     widget: jlong,
     visibility: jint,
     alpha: f32,
+    sensitive: jboolean,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
         if let Err(e) = view_registry::with_view(widget, |_v| ()) {
@@ -3215,8 +3216,18 @@ extern "system" fn view_native_set_visibility<'local>(
                 widget,
                 visibility,
                 alpha,
+                sensitive,
                 error = %e,
                 "View.native_setVisibility: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget,
+                visibility,
+                alpha,
+                sensitive,
+                "View.native_setVisibility: validated handle, visibility retained by Java view state"
             );
         }
         Ok(())
@@ -10378,6 +10389,13 @@ const WINDOW_SET_WIDGET_AS_ROOT_SIG: &JNIStr = jni_str!("(JJ)V");
 
 const WINDOW_REMOVE_GTK_BACKGROUND_NAME: &JNIStr = jni_str!("remove_gtk_background");
 const WINDOW_REMOVE_GTK_BACKGROUND_SIG: &JNIStr = jni_str!("(J)V");
+const WINDOW_INSTALL_THEME_CSS_NAME: &JNIStr = jni_str!("native_install_theme_css");
+const WINDOW_INSTALL_THEME_CSS_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
+const WINDOW_SET_SCREEN_BRIGHTNESS_NAME: &JNIStr = jni_str!("set_screen_brightness");
+const WINDOW_SET_SCREEN_BRIGHTNESS_SIG: &JNIStr = jni_str!("(F)V");
+const WINDOW_TAKE_INPUT_QUEUE_NAME: &JNIStr = jni_str!("take_input_queue");
+const WINDOW_TAKE_INPUT_QUEUE_SIG: &JNIStr =
+    jni_str!("(JLandroid/view/InputQueue$Callback;Landroid/view/InputQueue;)V");
 
 extern "system" fn window_set_jobject<'local>(
     mut env: EnvUnowned<'local>,
@@ -10496,6 +10514,81 @@ extern "system" fn window_remove_gtk_background<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+extern "system" fn window_install_theme_css<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+    css: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let css_len = if css.is_null() {
+            0
+        } else {
+            css.try_to_string(env)?.len()
+        };
+        if let Err(e) = window_registry::with_window(native_window, |_w| ()) {
+            tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                error = %e,
+                "Window.native_install_theme_css: invalid window handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.Window",
+                native_window,
+                css_len,
+                "Window.native_install_theme_css: validated handle, no-op (non-GTK window)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn window_set_screen_brightness<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    brightness: jfloat,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.view.Window",
+            brightness,
+            "Window.set_screen_brightness: no-op (desktop brightness remains user-controlled)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn window_take_input_queue<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+    _callback: JObject<'local>,
+    _queue: JObject<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = window_registry::with_window(native_window, |_w| ()) {
+            tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                error = %e,
+                "Window.take_input_queue: invalid window handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.Window",
+                native_window,
+                "Window.take_input_queue: no-op (input is dispatched by Eclipse's winit bridge)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 extern "system" fn window_set_widget_as_root<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -10567,12 +10660,33 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 window_remove_gtk_background as *mut std::ffi::c_void,
             )
         },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_INSTALL_THEME_CSS_NAME,
+                WINDOW_INSTALL_THEME_CSS_SIG,
+                window_install_theme_css as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_SET_SCREEN_BRIGHTNESS_NAME,
+                WINDOW_SET_SCREEN_BRIGHTNESS_SIG,
+                window_set_screen_brightness as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_TAKE_INPUT_QUEUE_NAME,
+                WINDOW_TAKE_INPUT_QUEUE_SIG,
+                window_take_input_queue as *mut std::ffi::c_void,
+            )
+        },
     ];
 
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/Window",
-        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root + remove_gtk_background"
+        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root + remove_gtk_background + native_install_theme_css + set_screen_brightness + take_input_queue"
     );
     Ok(())
 }
@@ -14429,7 +14543,7 @@ mod tests {
             VIEW_NATIVE_SET_VISIBILITY_NAME.to_str(),
             "native_setVisibility"
         );
-        assert_eq!(VIEW_NATIVE_SET_VISIBILITY_SIG.to_str(), "(JIF)V");
+        assert_eq!(VIEW_NATIVE_SET_VISIBILITY_SIG.to_str(), "(JIFZ)V");
 
         assert_eq!(
             VIEW_SET_ON_CLICK_LISTENER_NAME.to_str(),
@@ -14653,6 +14767,24 @@ mod tests {
             "remove_gtk_background"
         );
         assert_eq!(WINDOW_REMOVE_GTK_BACKGROUND_SIG.to_str(), "(J)V");
+        assert_eq!(
+            WINDOW_INSTALL_THEME_CSS_NAME.to_str(),
+            "native_install_theme_css"
+        );
+        assert_eq!(
+            WINDOW_INSTALL_THEME_CSS_SIG.to_str(),
+            "(JLjava/lang/String;)V"
+        );
+        assert_eq!(
+            WINDOW_SET_SCREEN_BRIGHTNESS_NAME.to_str(),
+            "set_screen_brightness"
+        );
+        assert_eq!(WINDOW_SET_SCREEN_BRIGHTNESS_SIG.to_str(), "(F)V");
+        assert_eq!(WINDOW_TAKE_INPUT_QUEUE_NAME.to_str(), "take_input_queue");
+        assert_eq!(
+            WINDOW_TAKE_INPUT_QUEUE_SIG.to_str(),
+            "(JLandroid/view/InputQueue$Callback;Landroid/view/InputQueue;)V"
+        );
     }
 
     #[test]

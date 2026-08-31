@@ -173,7 +173,7 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+id
 grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+theme[[:space:]]*=[[:space:]]*0x01010000;' "$r_src" || fail "vendored internal R.attr.theme != 0x01010000 — ATL source drifted; re-verify the overlay's inlined constants"
 [ ! -e "$here/stubs/com/android/internal/R.java" ] || fail "stub com/android/internal/R.java re-appeared — javac would inline its placeholder constants into the overlay dex (the 2026-07-02 include-id NPE class); delete it (the vendored R.java is the compile input)"
 
-"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/classes" \
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Xlint:-options -Werror -d "$work/classes" \
     -sourcepath "$work/gen:$here/src:$here/stubs" \
     "$work/gen/android/os/Build.java" \
     "$here/src/android/net/NetworkRequest.java" \
@@ -197,7 +197,11 @@ done
 
 for forbidden in 'android/webkit/WebView.class' 'android/webkit/WebViewClient.class' \
                  'android/os/Handler.class' 'android/os/Looper.class' \
-                 'android/graphics/Bitmap.class' 'android/view/SurfaceView.class'; do
+                 'android/graphics/Bitmap.class' 'android/view/SurfaceView.class' \
+                 'android/atl/ATLLoadedApp.class' \
+                 'android/atl/EarlyPackageParser.class' \
+                 'android/content/pm/PackageParser.class' \
+                 'android/util/DisplayMetrics.class'; do
     [ ! -e "$work/stage/$forbidden" ] || fail "compile-only stub $forbidden was staged into classes.dex — it would SHADOW the real class (first-dex-wins); fix the step-3 stage whitelist"
 done
 for stub in android/webkit/WebView.java android/webkit/WebViewClient.java \
@@ -251,7 +255,282 @@ do
 done
 
 unzip -p "$ORIG_FW/api-impl.jar" classes.dex > "$work/stock-classes.dex"
-"$JAVA" -jar "$BAKSMALI_JAR" disassemble "$work/stock-classes.dex" -o "$work/smali" >/dev/null
+"$JAVA" -jar "$BAKSMALI_JAR" disassemble --debug-info false \
+    "$work/stock-classes.dex" -o "$work/smali" >/dev/null
+
+crsm="$work/smali/android/content/ContentResolver.smali"
+[ -f "$crsm" ] || fail "ContentResolver.smali not found after baksmali of the installed framework"
+for cr_method in \
+    'acquireContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
+    'acquireContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
+    'acquireUnstableContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
+    'acquireUnstableContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
+    'openTypedAssetFile(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;'
+do
+    ! grep -qF "$cr_method" "$crsm" \
+        || fail "ContentResolver.smali already declares $cr_method — installed framework drifted; update patch-framework.sh"
+done
+cat >> "$crsm" <<'ECLIPSE_CONTENT_RESOLVER_METHODS'
+
+
+.method public final acquireContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return-object v0
+.end method
+
+.method public final acquireContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return-object v0
+.end method
+
+.method public final acquireUnstableContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return-object v0
+.end method
+
+.method public final acquireUnstableContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return-object v0
+.end method
+
+.method public openTypedAssetFile(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;
+    .registers 5
+
+    invoke-virtual {p0, p1, p2, p3, p4}, Landroid/content/ContentResolver;->openTypedAssetFileDescriptor(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+ECLIPSE_CONTENT_RESOLVER_METHODS
+for cr_method in \
+    'acquireContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
+    'acquireContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
+    'acquireUnstableContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
+    'acquireUnstableContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
+    'openTypedAssetFile(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;'
+do
+    grep -qF "$cr_method" "$crsm" || fail "ContentResolver $cr_method insert failed"
+done
+grep -qF -- '->openTypedAssetFileDescriptor(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;' "$crsm" \
+    || fail "ContentResolver openTypedAssetFile bridge body insert failed"
+
+connectivity_sm="$work/smali/android/net/ConnectivityManager.smali"
+[ -f "$connectivity_sm" ] || fail "ConnectivityManager.smali not found after baksmali of the installed framework"
+for connectivity_method in \
+    'getLinkProperties(Landroid/net/Network;)Landroid/net/LinkProperties;' \
+    'getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;'
+do
+    ! grep -qF "$connectivity_method" "$connectivity_sm" \
+        || fail "ConnectivityManager.smali already declares $connectivity_method — installed framework drifted; update patch-framework.sh"
+done
+cat >> "$connectivity_sm" <<'ECLIPSE_CONNECTIVITY_MANAGER_METHODS'
+
+
+.method public getLinkProperties(Landroid/net/Network;)Landroid/net/LinkProperties;
+    .registers 3
+
+    new-instance v0, Landroid/net/LinkProperties;
+
+    invoke-direct {v0}, Landroid/net/LinkProperties;-><init>()V
+
+    return-object v0
+.end method
+
+.method public getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;
+    .registers 3
+
+    invoke-virtual {p0}, Landroid/net/ConnectivityManager;->getActiveNetworkInfo()Landroid/net/NetworkInfo;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+ECLIPSE_CONNECTIVITY_MANAGER_METHODS
+for connectivity_method in \
+    'getLinkProperties(Landroid/net/Network;)Landroid/net/LinkProperties;' \
+    'getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;'
+do
+    grep -qF "$connectivity_method" "$connectivity_sm" \
+        || fail "ConnectivityManager $connectivity_method insert failed"
+done
+
+shortcut_sm="$work/smali/android/content/pm/ShortcutManager.smali"
+[ -f "$shortcut_sm" ] || fail "ShortcutManager.smali not found after baksmali of the installed framework"
+for stock_shortcut_method in \
+    'getShortcuts(I)Ljava/util/List;' \
+    'removeAllDynamicShortcuts()V' \
+    'setDynamicShortcuts(Ljava/util/List;)Z'
+do
+    grep -qF "$stock_shortcut_method" "$shortcut_sm" \
+        || fail "ShortcutManager.smali lost stock method $stock_shortcut_method — installed framework drifted; update patch-framework.sh"
+done
+set_dynamic_true=$'    const/4 v0, 0x1\n\n    return v0\n.end method'
+set_dynamic_false=$'    const/4 v0, 0x0\n\n    return v0\n.end method'
+SET_DYNAMIC_TRUE="$set_dynamic_true" SET_DYNAMIC_FALSE="$set_dynamic_false" perl -0pi -e '
+    $method = qr{(\.method public setDynamicShortcuts\(Ljava/util/List;\)Z.*?)(?=\.method|\z)}s;
+    s{$method}{
+        $body = $1;
+        index($body, $ENV{SET_DYNAMIC_TRUE}) >= 0
+            or die "setDynamicShortcuts body changed";
+        $body =~ s/\Q$ENV{SET_DYNAMIC_TRUE}\E/$ENV{SET_DYNAMIC_FALSE}/;
+        $body
+    }e;
+' "$shortcut_sm" || fail "ShortcutManager.setDynamicShortcuts body drifted; update patch-framework.sh"
+grep -A20 -F '.method public setDynamicShortcuts(Ljava/util/List;)Z' "$shortcut_sm" \
+    | grep -qF 'const/4 v0, 0x0' \
+    || fail "ShortcutManager.setDynamicShortcuts honest-false patch failed"
+for shortcut_method in \
+    'addDynamicShortcuts(Ljava/util/List;)Z' \
+    'disableShortcuts(Ljava/util/List;)V' \
+    'enableShortcuts(Ljava/util/List;)V' \
+    'getDynamicShortcuts()Ljava/util/List;' \
+    'getManifestShortcuts()Ljava/util/List;' \
+    'getMaxShortcutCountPerActivity()I' \
+    'getPinnedShortcuts()Ljava/util/List;' \
+    'isRateLimitingActive()Z' \
+    'isRequestPinShortcutSupported()Z' \
+    'pushDynamicShortcut(Landroid/content/pm/ShortcutInfo;)V' \
+    'removeDynamicShortcuts(Ljava/util/List;)V' \
+    'reportShortcutUsed(Ljava/lang/String;)V' \
+    'requestPinShortcut(Landroid/content/pm/ShortcutInfo;Landroid/content/IntentSender;)Z'
+do
+    ! grep -qF "$shortcut_method" "$shortcut_sm" \
+        || fail "ShortcutManager.smali already declares $shortcut_method — installed framework drifted; update patch-framework.sh"
+done
+cat >> "$shortcut_sm" <<'ECLIPSE_SHORTCUT_MANAGER_METHODS'
+
+
+.method public addDynamicShortcuts(Ljava/util/List;)Z
+    .registers 3
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+
+.method public disableShortcuts(Ljava/util/List;)V
+    .registers 2
+
+    return-void
+.end method
+
+.method public enableShortcuts(Ljava/util/List;)V
+    .registers 2
+
+    return-void
+.end method
+
+.method public getDynamicShortcuts()Ljava/util/List;
+    .registers 2
+
+    invoke-static {}, Ljava/util/Collections;->emptyList()Ljava/util/List;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+
+.method public getManifestShortcuts()Ljava/util/List;
+    .registers 2
+
+    invoke-static {}, Ljava/util/Collections;->emptyList()Ljava/util/List;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+
+.method public getMaxShortcutCountPerActivity()I
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+
+.method public getPinnedShortcuts()Ljava/util/List;
+    .registers 2
+
+    invoke-static {}, Ljava/util/Collections;->emptyList()Ljava/util/List;
+
+    move-result-object v0
+
+    return-object v0
+.end method
+
+.method public isRateLimitingActive()Z
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+
+.method public isRequestPinShortcutSupported()Z
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+
+.method public pushDynamicShortcut(Landroid/content/pm/ShortcutInfo;)V
+    .registers 2
+
+    return-void
+.end method
+
+.method public removeDynamicShortcuts(Ljava/util/List;)V
+    .registers 2
+
+    return-void
+.end method
+
+.method public reportShortcutUsed(Ljava/lang/String;)V
+    .registers 2
+
+    return-void
+.end method
+
+.method public requestPinShortcut(Landroid/content/pm/ShortcutInfo;Landroid/content/IntentSender;)Z
+    .registers 4
+
+    const/4 v0, 0x0
+
+    return v0
+.end method
+ECLIPSE_SHORTCUT_MANAGER_METHODS
+for shortcut_method in \
+    'addDynamicShortcuts(Ljava/util/List;)Z' \
+    'disableShortcuts(Ljava/util/List;)V' \
+    'enableShortcuts(Ljava/util/List;)V' \
+    'getDynamicShortcuts()Ljava/util/List;' \
+    'getManifestShortcuts()Ljava/util/List;' \
+    'getMaxShortcutCountPerActivity()I' \
+    'getPinnedShortcuts()Ljava/util/List;' \
+    'isRateLimitingActive()Z' \
+    'isRequestPinShortcutSupported()Z' \
+    'pushDynamicShortcut(Landroid/content/pm/ShortcutInfo;)V' \
+    'removeDynamicShortcuts(Ljava/util/List;)V' \
+    'reportShortcutUsed(Ljava/lang/String;)V' \
+    'requestPinShortcut(Landroid/content/pm/ShortcutInfo;Landroid/content/IntentSender;)Z'
+do
+    grep -qF "$shortcut_method" "$shortcut_sm" || fail "ShortcutManager $shortcut_method insert failed"
+done
+
 vsm="$work/smali/android/view/View.smali"
 [ -f "$vsm" ] || fail "View.smali not found after baksmali of the installed framework"
 for a in \
@@ -520,8 +799,9 @@ jpm="$work/smali/android/app/job/JobParameters.smali"
 [ -f "$jpm" ] || fail "JobParameters.smali not found after baksmali"
 n="$(grep -cF '.method public getExtras()Landroid/os/PersistableBundle;' "$jpm")" || true
 [ "$n" = "1" ] || fail "JobParameters.smali getExtras anchor not unique (found $n, expected 1) — installed JobParameters drifted; update patch-framework.sh"
-! grep -qF 'getNetwork()Landroid/net/Network;' "$jpm" || fail "JobParameters.smali already declares getNetwork — drifted; update patch-framework.sh"
-perl -0pi -e 's{(\.method public getExtras\(\)Landroid/os/PersistableBundle;.*?\.end method\n)}{$1.method public getNetwork()Landroid/net/Network;\n    .locals 1\n\n    const/4 v0, 0x0\n\n    return-object v0\n.end method\n}s' "$jpm"
+if ! grep -qF 'getNetwork()Landroid/net/Network;' "$jpm"; then
+    perl -0pi -e 's{(\.method public getExtras\(\)Landroid/os/PersistableBundle;.*?\.end method\n)}{$1.method public getNetwork()Landroid/net/Network;\n    .locals 1\n\n    const/4 v0, 0x0\n\n    return-object v0\n.end method\n}s' "$jpm"
+fi
 grep -qF 'getNetwork()Landroid/net/Network;' "$jpm" || fail "JobParameters.smali getNetwork insert failed (drift?)"
 
 psm="$work/smali/android/graphics/Paint.smali"
@@ -555,7 +835,11 @@ grep -qF '"android.hardware.type.pc"' "$pmsm" || fail "PackageManager.smali lost
 grep -qF '"android.hardware.touchscreen"' "$pmsm" || fail "PackageManager.smali lost the exact touchscreen feature literal"
 grep -qF '"android.hardware.audio.low_latency"' "$pmsm" || fail "PackageManager.smali lost the exact low-latency feature literal"
 
-mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content/pm" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
+mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
+cp "$crsm" "$work/smali-view/android/content/ContentResolver.smali"
+cp "$connectivity_sm" "$work/smali-view/android/net/ConnectivityManager.smali"
+cp "$here/smali/android/net/LinkProperties.smali" "$work/smali-view/android/net/"
+cp "$here/smali/android/net/LinkAddress.smali" "$work/smali-view/android/net/"
 cp "$vsm" "$work/smali-view/android/view/View.smali"
 cp "$dsm" "$work/smali-view/android/view/Display.smali"
 cp "$here/smali/android/view/View\$OnCapturedPointerListener.smali" "$work/smali-view/android/view/"
@@ -566,6 +850,7 @@ cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$spsm" "$work/smali-view/android/os/SystemProperties.smali"
 cp "$pmsm" "$work/smali-view/android/content/pm/PackageManager.smali"
+cp "$shortcut_sm" "$work/smali-view/android/content/pm/ShortcutManager.smali"
 cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
 cp "$wvsm" "$work/smali-view/android/webkit/WebView.smali"
@@ -673,7 +958,7 @@ perl -0777 -ne 'exit(/iget-object v2, p0, Lcom\/wolfssl\/provider\/jsse\/WolfSSL
 date_time_probe="$here/tests/DateTimeFormatterProbe.java"
 [ -f "$date_time_probe" ] || fail "date-time formatter regression probe missing at $date_time_probe"
 mkdir -p "$work/date-time-probe/classes" "$work/date-time-probe/cache" "$work/date-time-probe/data"
-"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/date-time-probe/classes" "$date_time_probe"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Xlint:-options -Werror -d "$work/date-time-probe/classes" "$date_time_probe"
 "$DX" --dex --output="$work/date-time-probe/probe.jar" "$work/date-time-probe/classes"
 boot_class_path=''
 boot_class_path_locations=''
@@ -705,7 +990,7 @@ probe_output="$(env \
 keygen_probe="$here/tests/KeyGenParameterSpecProbe.java"
 [ -f "$keygen_probe" ] || fail "key-generation regression probe missing at $keygen_probe"
 mkdir -p "$work/keygen-probe/classes"
-"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -cp "$work/classes" \
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Xlint:-options -Werror -cp "$work/classes" \
     -d "$work/keygen-probe/classes" "$keygen_probe"
 keygen_output="$("$JAVA" -cp "$work/classes:$work/keygen-probe/classes" KeyGenParameterSpecProbe)"
 [ "$keygen_output" = 'keygen-parameter-spec-ok' ] \
