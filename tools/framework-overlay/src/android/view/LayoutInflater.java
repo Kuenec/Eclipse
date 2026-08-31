@@ -129,7 +129,7 @@ public class LayoutInflater {
   public View inflate(int layoutResID, ViewGroup root, boolean attachToRoot) {
     Slog.v(TAG,
         "inflating view from layout id: " + String.format("%x", layoutResID) + ", id_str: "
-            + Context.this_application.getResources().getResourceName(layoutResID));
+            + context.getResources().getResourceName(layoutResID));
     XmlResourceParser xpp = context.getResources().getLayout(layoutResID);
 
     try {
