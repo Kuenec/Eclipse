@@ -1,4 +1,3 @@
-
 #[path = "../../../src/webview/fdpass.rs"]
 pub mod fdpass;
 #[path = "../../../src/webview/proto.rs"]
@@ -10,4 +9,4 @@ pub mod shm;
 #[path = "../../../src/webview/slots.rs"]
 pub mod slots;
 
-pub const PROTO_VERSION: u16 = 3;
+pub const PROTO_VERSION: u16 = 4;

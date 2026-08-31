@@ -77,79 +77,185 @@ fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-fn draw_text_onto_rgba(buf: &mut [u8], w: u32, h: u32, text: &str) {
-    if text.is_empty() {
+const OVERLAY_TEXT_PADDING: f32 = 10.0;
+const MAX_OVERLAY_FONT_SIZE: f32 = 100.0;
+
+fn overlay_font_size(font_size: f32) -> f32 {
+    if font_size.is_finite() && font_size > 0.0 {
+        font_size.min(MAX_OVERLAY_FONT_SIZE)
+    } else {
+        14.0
+    }
+}
+
+fn blend_text_pixel(buf: &mut [u8], index: usize, color: [u8; 4], coverage: f32) {
+    let alpha = coverage.clamp(0.0, 1.0) * f32::from(color[3]) / 255.0;
+    for channel in 0..3 {
+        let background = f32::from(buf[index + channel]);
+        buf[index + channel] =
+            (f32::from(color[channel]) * alpha + background * (1.0 - alpha)) as u8;
+    }
+}
+
+fn visible_line_end<F: Font>(
+    text: &str,
+    scaled: &impl ScaleFont<F>,
+    width: f32,
+    wrapped: bool,
+) -> (usize, usize, bool) {
+    let mut line_width = 0.0;
+    for (index, character) in text.char_indices() {
+        if character == '\n' {
+            return (index, index + character.len_utf8(), false);
+        }
+        let advance = scaled.h_advance(scaled.glyph_id(character));
+        if line_width + advance > width {
+            if wrapped {
+                let end = if index == 0 {
+                    character.len_utf8()
+                } else {
+                    index
+                };
+                return (end, end, false);
+            }
+            return (index, index, true);
+        }
+        line_width += advance;
+    }
+    (text.len(), text.len(), false)
+}
+
+fn draw_text_onto_rgba(
+    buf: &mut [u8],
+    w: u32,
+    h: u32,
+    overlay: &crate::framework::ActiveTextOverlay,
+) {
+    if overlay.text.is_empty() {
         return;
     }
     let Some(font) = overlay_font() else {
         return;
     };
-    let scale = (h as f32 * 0.55).max(8.0);
+    let scale = overlay_font_size(overlay.font_size);
     let scaled = font.as_scaled(scale);
     let ascent = scaled.ascent();
-    let baseline_y = (h as f32 - scale) * 0.5 + ascent;
-    let mut pen_x = 10.0f32;
-    for ch in text.chars() {
-        if ch == '\u{2022}' {
-            let r = (scale * 0.13).max(2.0);
-            let cxi = (pen_x + r) as i32;
-            let cyi = (h as f32 * 0.5) as i32;
-            let ri = r as i32;
-            for dy in -ri..=ri {
-                for dx in -ri..=ri {
-                    if (dx * dx + dy * dy) as f32 <= r * r {
-                        let px = cxi + dx;
-                        let py = cyi + dy;
-                        if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
-                            let idx = ((py as u32 * w + px as u32) * 4) as usize;
-                            if idx + 2 < buf.len() {
-                                buf[idx] = 255;
-                                buf[idx + 1] = 255;
-                                buf[idx + 2] = 255;
+    let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
+    let color_bytes = (overlay.text_color as u32).to_be_bytes();
+    let color = [
+        color_bytes[1],
+        color_bytes[2],
+        color_bytes[3],
+        color_bytes[0],
+    ];
+    let available_width = (w as f32 - OVERLAY_TEXT_PADDING * 2.0).max(1.0);
+    let available_height = (h as f32 - OVERLAY_TEXT_PADDING * 2.0).max(line_height);
+    let maximum_lines = if overlay.multiline {
+        (available_height / line_height).floor().max(1.0) as usize
+    } else {
+        1
+    };
+    let first_baseline = if overlay.multiline || overlay.y_alignment == 0 {
+        OVERLAY_TEXT_PADDING + ascent
+    } else if overlay.y_alignment == 2 {
+        h as f32 - OVERLAY_TEXT_PADDING - scale + ascent
+    } else {
+        (h as f32 - scale) * 0.5 + ascent
+    };
+    let mut remaining = overlay.text.as_str();
+    let mut caret = None;
+    let mut complete = false;
+
+    for line_index in 0..maximum_lines {
+        let (draw_end, consumed, clipped_line) =
+            visible_line_end(remaining, &scaled, available_width, overlay.text_wrapped);
+        let line = &remaining[..draw_end];
+        let line_width = line
+            .chars()
+            .map(|character| scaled.h_advance(scaled.glyph_id(character)))
+            .sum::<f32>();
+        let mut pen_x = match overlay.x_alignment {
+            1 => (w as f32 - OVERLAY_TEXT_PADDING - line_width).max(OVERLAY_TEXT_PADDING),
+            2 => ((w as f32 - line_width) * 0.5).max(OVERLAY_TEXT_PADDING),
+            _ => OVERLAY_TEXT_PADDING,
+        };
+        let baseline_y = first_baseline + line_index as f32 * line_height;
+
+        for character in line.chars() {
+            if character == '\u{2022}' {
+                let radius = (scale * 0.13).max(2.0);
+                let center_x = (pen_x + radius) as i32;
+                let center_y = (baseline_y - ascent + scale * 0.5) as i32;
+                let integer_radius = radius as i32;
+                for delta_y in -integer_radius..=integer_radius {
+                    for delta_x in -integer_radius..=integer_radius {
+                        if (delta_x * delta_x + delta_y * delta_y) as f32 <= radius * radius {
+                            let pixel_x = center_x + delta_x;
+                            let pixel_y = center_y + delta_y;
+                            if pixel_x >= 0
+                                && pixel_y >= 0
+                                && (pixel_x as u32) < w
+                                && (pixel_y as u32) < h
+                            {
+                                let index = ((pixel_y as u32 * w + pixel_x as u32) * 4) as usize;
+                                if index + 2 < buf.len() {
+                                    blend_text_pixel(buf, index, color, 1.0);
+                                }
                             }
                         }
                     }
                 }
+                pen_x += radius * 3.0;
+                continue;
             }
-            pen_x += r * 3.0;
-            continue;
-        }
-        let gid = scaled.glyph_id(ch);
-        let advance = scaled.h_advance(gid);
-        let glyph = gid.with_scale_and_position(scale, ab_glyph::point(pen_x, baseline_y));
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            outlined.draw(|gx, gy, c| {
-                let px = bounds.min.x as i32 + gx as i32;
-                let py = bounds.min.y as i32 + gy as i32;
-                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
-                    let idx = ((py as u32 * w + px as u32) * 4) as usize;
-                    let a = c.clamp(0.0, 1.0);
-
-                    for k in 0..3 {
-                        let bg = f32::from(buf[idx + k]);
-                        buf[idx + k] = (255.0 * a + bg * (1.0 - a)) as u8;
+            let glyph_id = scaled.glyph_id(character);
+            let advance = scaled.h_advance(glyph_id);
+            let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(pen_x, baseline_y));
+            if let Some(outlined) = font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                outlined.draw(|glyph_x, glyph_y, coverage| {
+                    let pixel_x = bounds.min.x as i32 + glyph_x as i32;
+                    let pixel_y = bounds.min.y as i32 + glyph_y as i32;
+                    if pixel_x >= 0 && pixel_y >= 0 && (pixel_x as u32) < w && (pixel_y as u32) < h
+                    {
+                        let index = ((pixel_y as u32 * w + pixel_x as u32) * 4) as usize;
+                        blend_text_pixel(buf, index, color, coverage);
                     }
-                }
-            });
+                });
+            }
+            pen_x += advance;
         }
-        pen_x += advance;
+
+        if clipped_line {
+            break;
+        }
+        if consumed == remaining.len() {
+            caret = Some((pen_x, baseline_y));
+            complete = true;
+            break;
+        }
+        remaining = &remaining[consumed..];
+        if remaining.is_empty() {
+            caret = Some((OVERLAY_TEXT_PADDING, baseline_y + line_height));
+            complete = line_index + 1 < maximum_lines;
+            break;
+        }
     }
 
     static BLINK: AtomicU64 = AtomicU64::new(0);
-    if (BLINK.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
-        let cx = pen_x as i32 + 1;
-        let y0 = (baseline_y - scale * 0.72).max(0.0) as u32;
-        let y1 = ((baseline_y + scale * 0.08) as u32).min(h);
-        for cy in y0..y1 {
-            for dx in 0..2 {
-                let px = cx + dx;
-                if px >= 0 && (px as u32) < w {
-                    let idx = ((cy * w + px as u32) * 4) as usize;
-                    if idx + 2 < buf.len() {
-                        buf[idx] = 255;
-                        buf[idx + 1] = 255;
-                        buf[idx + 2] = 255;
+    if complete && (BLINK.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
+        if let Some((pen_x, baseline_y)) = caret {
+            let cx = pen_x as i32 + 1;
+            let y0 = (baseline_y - scale * 0.72).max(0.0) as u32;
+            let y1 = ((baseline_y + scale * 0.08) as u32).min(h);
+            for cy in y0..y1 {
+                for dx in 0..2 {
+                    let px = cx + dx;
+                    if px >= 0 && (px as u32) < w {
+                        let idx = ((cy * w + px as u32) * 4) as usize;
+                        if idx + 2 < buf.len() {
+                            blend_text_pixel(buf, idx, color, 1.0);
+                        }
                     }
                 }
             }
@@ -164,6 +270,7 @@ fn overlay_enabled() -> bool {
 
 static HOST_GDPA: AtomicU64 = AtomicU64::new(0);
 static HOST_CREATE_DEVICE: AtomicU64 = AtomicU64::new(0);
+static HOST_DESTROY_DEVICE: AtomicU64 = AtomicU64::new(0);
 static HOST_QUEUE_PRESENT: AtomicU64 = AtomicU64::new(0);
 static HOST_CREATE_SWAPCHAIN: AtomicU64 = AtomicU64::new(0);
 static HOST_GET_SWAPCHAIN_IMAGES: AtomicU64 = AtomicU64::new(0);
@@ -211,7 +318,7 @@ fn cached(a: &AtomicU64) -> Option<usize> {
     }
 }
 
-pub unsafe fn intercept_instance_proc(
+pub(crate) unsafe fn intercept_instance_proc(
     instance: vk::Instance,
     name: &CStr,
     host_gipa: vk::PFN_vkGetInstanceProcAddr,
@@ -253,6 +360,16 @@ unsafe extern "system" fn eclipse_vk_get_device_proc_addr(
 
     let name = unsafe { CStr::from_ptr(p_name) };
 
+    if name == c"vkDestroyDevice" {
+        let host = unsafe { host_gdpa(device, p_name) };
+        HOST_DESTROY_DEVICE.store(pfn_to_addr(host), Ordering::Relaxed);
+
+        return Some(unsafe {
+            std::mem::transmute::<vk::PFN_vkDestroyDevice, unsafe extern "system" fn()>(
+                eclipse_vk_destroy_device,
+            )
+        });
+    }
     if name == c"vkQueuePresentKHR" {
         let host = unsafe { host_gdpa(device, p_name) };
         HOST_QUEUE_PRESENT.store(pfn_to_addr(host), Ordering::Relaxed);
@@ -285,6 +402,21 @@ unsafe extern "system" fn eclipse_vk_get_device_proc_addr(
     }
 
     unsafe { host_gdpa(device, p_name) }
+}
+
+unsafe extern "system" fn eclipse_vk_destroy_device(
+    device: vk::Device,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    let Some(addr) = cached(&HOST_DESTROY_DEVICE) else {
+        tracing::error!("vk-overlay: missing host vkDestroyDevice");
+        return;
+    };
+    let host: vk::PFN_vkDestroyDevice =
+        unsafe { std::mem::transmute::<usize, vk::PFN_vkDestroyDevice>(addr) };
+
+    release_overlay_device_resources(device);
+    unsafe { host(device, p_allocator) };
 }
 
 unsafe extern "system" fn eclipse_vk_create_device(
@@ -470,9 +602,9 @@ fn select_text_probe_rect(
     })
 }
 
-fn mask_overlay_text(text: &str, input_type: i32) -> String {
+fn mask_overlay_text(text: String, input_type: i32) -> String {
     if matches!(input_type, 0..=4 | 7 | 8) {
-        text.to_owned()
+        text
     } else {
         "\u{2022}".repeat(text.chars().count())
     }
@@ -522,6 +654,46 @@ static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 static WEB_COMPOSITE: Mutex<Option<Probe>> = Mutex::new(None);
 
 static WEB_COMPOSITE_LAST: AtomicU64 = AtomicU64::new(0);
+
+fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Device) {
+    let mut probe = match slot.lock() {
+        Ok(probe) => probe,
+        Err(poisoned) => {
+            tracing::warn!("vk-overlay: recovering poisoned probe lock during device teardown");
+            poisoned.into_inner()
+        }
+    };
+    if probe
+        .as_ref()
+        .is_some_and(|probe| probe.device.handle() == device)
+    {
+        *probe = None;
+    }
+}
+
+fn release_overlay_device_resources(device: vk::Device) {
+    release_probe_for_device(&PROBE, device);
+    release_probe_for_device(&WEB_COMPOSITE, device);
+
+    let mut state = match STATE.lock() {
+        Ok(state) => state,
+        Err(poisoned) => {
+            tracing::warn!("vk-overlay: recovering poisoned state lock during device teardown");
+            poisoned.into_inner()
+        }
+    };
+    if state.device != device.as_raw() {
+        return;
+    }
+
+    *state = OverlayState::default();
+    PHYSICAL_DEVICE.store(0, Ordering::Relaxed);
+    QUEUE_FAMILY.store(u32::MAX, Ordering::Relaxed);
+    HOST_QUEUE_PRESENT.store(0, Ordering::Relaxed);
+    HOST_CREATE_SWAPCHAIN.store(0, Ordering::Relaxed);
+    HOST_GET_SWAPCHAIN_IMAGES.store(0, Ordering::Relaxed);
+    WEB_COMPOSITE_LAST.store(0, Ordering::Relaxed);
+}
 
 struct Probe {
     device: ash::Device,
@@ -671,7 +843,7 @@ impl Probe {
         queue: vk::Queue,
         image_raw: u64,
         engine_waits: &[vk::Semaphore],
-        draw_text: Option<&str>,
+        draw_text: Option<&crate::framework::ActiveTextOverlay>,
         write_probe: bool,
     ) -> bool {
         let image = vk::Image::from_raw(image_raw);
@@ -1343,15 +1515,29 @@ unsafe fn present_with_overlay(
             .is_none()
             .then(|| std::env::var("ECLIPSE_VK_TEXT_TEST").ok())
             .flatten();
-        let (draw_text, geometry) = if let Some(overlay) = live {
-            (
-                Some(mask_overlay_text(&overlay.text, overlay.input_type)),
-                Some(overlay.geometry),
-            )
+        let (draw_text, geometry) = if let Some(mut overlay) = live {
+            overlay.text = mask_overlay_text(overlay.text, overlay.input_type);
+            let geometry = overlay.geometry;
+            (Some(overlay), Some(geometry))
         } else if let Some(text) = text_test {
             let rect = login_field_rect(extent);
             (
-                Some(text),
+                Some(crate::framework::ActiveTextOverlay {
+                    text,
+                    geometry: (
+                        rect.offset.x,
+                        rect.offset.y,
+                        rect.extent.width,
+                        rect.extent.height,
+                    ),
+                    input_type: 0,
+                    font_size: 25.0,
+                    multiline: false,
+                    text_wrapped: false,
+                    text_color: -1,
+                    x_alignment: 0,
+                    y_alignment: 1,
+                }),
                 Some((
                     rect.offset.x,
                     rect.offset.y,
@@ -1386,7 +1572,7 @@ unsafe fn present_with_overlay(
                             queue,
                             image_raw,
                             field_waits,
-                            draw_text.as_deref(),
+                            draw_text.as_ref(),
                             probe_enabled(),
                         )
                     },
@@ -1654,13 +1840,38 @@ mod tests {
     #[test]
     fn overlay_text_masks_secure_and_unknown_input_types() {
         for plain in [0, 1, 2, 3, 4, 7, 8] {
-            assert_eq!(mask_overlay_text("Ab1!", plain), "Ab1!");
+            assert_eq!(mask_overlay_text("Ab1!".to_string(), plain), "Ab1!");
         }
         for secure in [5, 6, 9, 10] {
-            assert_eq!(mask_overlay_text("Ab1!", secure), "••••");
+            assert_eq!(mask_overlay_text("Ab1!".to_string(), secure), "••••");
         }
-        assert_eq!(mask_overlay_text("Ab1!", 11), "••••");
-        assert_eq!(mask_overlay_text("Ab1!", i32::MIN), "••••");
-        assert_eq!(mask_overlay_text("", i32::MIN), "");
+        assert_eq!(mask_overlay_text("Ab1!".to_string(), 11), "••••");
+        assert_eq!(mask_overlay_text("Ab1!".to_string(), i32::MIN), "••••");
+        assert_eq!(mask_overlay_text(String::new(), i32::MIN), "");
+    }
+
+    #[test]
+    fn focused_text_uses_native_font_size_instead_of_field_height() {
+        let source = include_str!("vk_overlay.rs");
+
+        assert!(!source.contains(concat!("(h as f32", " * 0.55).max(8.0)")));
+        assert!(source.contains("overlay_font_size(overlay.font_size)"));
+        assert_eq!(overlay_font_size(14.0), 14.0);
+        assert_eq!(overlay_font_size(155.0), MAX_OVERLAY_FONT_SIZE);
+        assert_eq!(overlay_font_size(f32::NAN), 14.0);
+    }
+
+    #[test]
+    fn device_destruction_releases_overlay_children_before_host_device() {
+        let source = include_str!("vk_overlay.rs");
+
+        assert!(source.contains("if name == c\"vkDestroyDevice\""));
+        let release = source
+            .find("release_overlay_device_resources(device)")
+            .expect("device destruction must release overlay children");
+        let host_destroy = source
+            .find("host(device, p_allocator)")
+            .expect("device destruction must call the host driver");
+        assert!(release < host_destroy);
     }
 }

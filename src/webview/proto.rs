@@ -37,6 +37,7 @@ mod ct {
 
     pub(super) const COOKIE_FLUSH: u8 = 0x15;
     pub(super) const COOKIES_CLEAR_SESSION: u8 = 0x16;
+    pub(super) const GO_BACK: u8 = 0x17;
 }
 
 mod ht {
@@ -55,6 +56,7 @@ mod ht {
 
     pub(super) const COOKIE_FLUSH_DONE: u8 = 0x8C;
     pub(super) const COOKIES_CLEAR_DONE: u8 = 0x8D;
+    pub(super) const NAVIGATION_STATE: u8 = 0x8E;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +348,10 @@ pub enum ConsumerMsg {
     CookiesClearSession {
         request_id: u32,
     },
+
+    GoBack {
+        view: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,6 +430,11 @@ pub enum HelperMsg {
         request_id: u32,
         removed: bool,
     },
+
+    NavigationState {
+        view: i64,
+        can_go_back: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -457,7 +468,8 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ct::BRIDGE_REGISTER
             | ct::COOKIE_SET_FOR_RESULT
             | ct::COOKIE_FLUSH
-            | ct::COOKIES_CLEAR_SESSION => Some(DEFAULT_CAP),
+            | ct::COOKIES_CLEAR_SESSION
+            | ct::GO_BACK => Some(DEFAULT_CAP),
             _ => None,
         },
         Dir::FromHelper => match type_byte {
@@ -472,7 +484,8 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             | ht::VIEW_CLOSED
             | ht::COOKIE_SET_RESULT
             | ht::COOKIE_FLUSH_DONE
-            | ht::COOKIES_CLEAR_DONE => Some(DEFAULT_CAP),
+            | ht::COOKIES_CLEAR_DONE
+            | ht::NAVIGATION_STATE => Some(DEFAULT_CAP),
             _ => None,
         },
     }
@@ -748,6 +761,10 @@ impl ConsumerMsg {
                 put_u32(&mut b, *request_id);
                 ct::COOKIES_CLEAR_SESSION
             }
+            Self::GoBack { view } => {
+                put_i64(&mut b, *view);
+                ct::GO_BACK
+            }
         };
         compose_frame(Dir::FromConsumer, t, b)
     }
@@ -873,6 +890,11 @@ impl HelperMsg {
                 put_u32(&mut b, *request_id);
                 put_bool(&mut b, *removed);
                 ht::COOKIES_CLEAR_DONE
+            }
+            Self::NavigationState { view, can_go_back } => {
+                put_i64(&mut b, *view);
+                put_bool(&mut b, *can_go_back);
+                ht::NAVIGATION_STATE
             }
         };
         compose_frame(Dir::FromHelper, t, b)
@@ -1213,6 +1235,7 @@ pub fn read_consumer_msg<R: Read>(r: &mut R) -> Result<ConsumerMsg, ProtoError> 
         ct::COOKIES_CLEAR_SESSION => ConsumerMsg::CookiesClearSession {
             request_id: b.u32()?,
         },
+        ct::GO_BACK => ConsumerMsg::GoBack { view: b.i64()? },
 
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
@@ -1374,6 +1397,10 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
         ht::COOKIES_CLEAR_DONE => HelperMsg::CookiesClearDone {
             request_id: b.u32()?,
             removed: b.bool()?,
+        },
+        ht::NAVIGATION_STATE => HelperMsg::NavigationState {
+            view: b.i64()?,
+            can_go_back: b.bool()?,
         },
         _ => return Err(ProtoError::UnknownType { type_byte: t }),
     };
@@ -1912,6 +1939,29 @@ mod tests {
             assert_eq!(read_helper_msg(&mut r).expect("decode helper v3"), *msg);
         }
         assert_eq!(read_helper_msg(&mut r), Err(ProtoError::Eof));
+    }
+
+    #[test]
+    fn proto_roundtrip_encodes_and_decodes_every_v4_message() {
+        let consumer = ConsumerMsg::GoBack { view: 42 };
+        let helper = HelperMsg::NavigationState {
+            view: 42,
+            can_go_back: true,
+        };
+
+        let bytes = consumer.encode().expect("encode consumer v4");
+        assert_eq!(bytes[4], ct::GO_BACK);
+        assert_eq!(
+            read_consumer_msg(&mut bytes.as_slice()).expect("decode consumer v4"),
+            consumer
+        );
+
+        let bytes = helper.encode().expect("encode helper v4");
+        assert_eq!(bytes[4], ht::NAVIGATION_STATE);
+        assert_eq!(
+            read_helper_msg(&mut bytes.as_slice()).expect("decode helper v4"),
+            helper
+        );
     }
 
     #[test]

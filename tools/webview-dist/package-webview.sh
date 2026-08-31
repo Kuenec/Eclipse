@@ -26,7 +26,7 @@ Environment parameters (all optional; defaults are repo-relative — no machine 
   OUT        the output payload dir (default: \$repo/dist/eclipse-linux-x86_64; wiped per
              run — but ONLY when it is absent, empty, or carries the
              .eclipse-webview-payload stamp of a previous run)
-  STRIP/READELF/SHA1SUM/SHA256SUM/TAR/DU/CARGO  tool overrides (default: discovered on PATH)
+  STRIP/READELF/SHA1SUM/SHA256SUM/TAR/DU/CARGO/CURL  tool overrides (default: discovered on PATH)
   EXPORT_CEF_DIR  the export-cef-dir binary (default: discovered; only needed to fetch)
 
 The pinned archive: $PIN_ARCHIVE
@@ -48,6 +48,7 @@ SHA256SUM="${SHA256SUM:-$(command -v sha256sum || true)}"
 TAR="${TAR:-$(command -v tar || true)}"
 DU="${DU:-$(command -v du || true)}"
 CARGO="${CARGO:-$(command -v cargo || true)}"
+CURL="${CURL:-$(command -v curl || true)}"
 EXPORT_CEF_DIR="${EXPORT_CEF_DIR:-$(command -v export-cef-dir || true)}"
 [ -n "$STRIP" ] && [ -x "$STRIP" ] || fail "strip not found (install binutils, or set STRIP)"
 [ -n "$READELF" ] && [ -x "$READELF" ] || fail "readelf not found (install binutils, or set READELF)"
@@ -84,14 +85,26 @@ dist_sha1="$(sed -n 's/.*"sha1"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CE
 [ "$dist_name" = "$PIN_ARCHIVE" ] || fail "CEF dist archive name mismatch: got '$dist_name', pinned '$PIN_ARCHIVE' (wrong/stale CEF_DIST — the pin and the helper's cef crate version move together)"
 [ "$dist_sha1" = "$PIN_SHA1" ] || fail "CEF dist archive.json sha1 mismatch: got '$dist_sha1', pinned '$PIN_SHA1'"
 
-tarball="$(dirname "$CEF_DIST")/$PIN_ARCHIVE"
-[ -f "$tarball" ] || fail "pinned tarball not found at $tarball — export-cef-dir keeps it beside the export; re-fetch with 'export-cef-dir --force $CEF_DIST' (CDN: $CEF_CDN)"
+archive_cache="$(dirname "$CEF_DIST")/$PIN_ARCHIVE"
+tarball="$archive_cache"
+if [ ! -f "$tarball" ]; then
+    [ -n "$CURL" ] && [ -x "$CURL" ] \
+        || fail "pinned tarball is not cached at $archive_cache and curl was not found (install curl, or set CURL)"
+    tarball="$work/$PIN_ARCHIVE"
+    echo "# fetching the pinned CEF archive from $CEF_CDN …"
+    "$CURL" --fail --location --output "$tarball" "$CEF_CDN$PIN_ARCHIVE" \
+        || fail "CEF archive download failed (network / CDN $CEF_CDN)"
+fi
 echo "# verifying the pinned tarball (sha1 + sha256) …"
 got_sha1="$("$SHA1SUM" "$tarball" | cut -d' ' -f1)"
 got_sha256="$("$SHA256SUM" "$tarball" | cut -d' ' -f1)"
 [ "$got_sha1" = "$PIN_SHA1" ] || fail "tarball sha1 mismatch: got $got_sha1, pinned $PIN_SHA1"
 [ "$got_sha256" = "$PIN_SHA256" ] || fail "tarball sha256 mismatch: got $got_sha256, pinned $PIN_SHA256"
 echo "# pin verified: $PIN_ARCHIVE (sha1 $PIN_SHA1, sha256 $PIN_SHA256)"
+if [ "$tarball" != "$archive_cache" ]; then
+    cp "$tarball" "$archive_cache"
+    tarball="$archive_cache"
+fi
 
 prefix="${PIN_ARCHIVE%.tar.bz2}"
 SHIP_MEMBERS=(

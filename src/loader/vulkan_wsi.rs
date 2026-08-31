@@ -25,7 +25,7 @@ fn clamp_window_extent(win: (i32, i32), min: vk::Extent2D, max: vk::Extent2D) ->
     }
 }
 
-pub unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilities_khr(
+pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilities_khr(
     physical_device: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     p_caps: *mut vk::SurfaceCapabilitiesKHR,
@@ -46,7 +46,7 @@ pub unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilitie
     }
 }
 
-pub unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilities2_khr(
+pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilities2_khr(
     physical_device: vk::PhysicalDevice,
     p_surface_info: *const vk::PhysicalDeviceSurfaceInfo2KHR<'_>,
     p_caps: *mut vk::SurfaceCapabilities2KHR<'_>,
@@ -67,7 +67,10 @@ pub unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capabilitie
     }
 }
 
-pub unsafe extern "C" fn eclipse_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+pub(crate) unsafe extern "C" fn eclipse_dlsym(
+    handle: *mut c_void,
+    symbol: *const c_char,
+) -> *mut c_void {
     if !symbol.is_null() {
         let name = unsafe { CStr::from_ptr(symbol) };
         let shim: Option<*mut c_void> = if name == c"vkGetInstanceProcAddr" {
@@ -119,7 +122,7 @@ unsafe fn swap_android_for_wayland_surface(names: &[*const c_char]) -> Vec<*cons
         .collect()
 }
 
-pub unsafe extern "system" fn eclipse_vk_get_instance_proc_addr(
+pub(crate) unsafe extern "system" fn eclipse_vk_get_instance_proc_addr(
     instance: vk::Instance,
     p_name: *const c_char,
 ) -> vk::PFN_vkVoidFunction {
@@ -174,7 +177,7 @@ pub unsafe extern "system" fn eclipse_vk_get_instance_proc_addr(
     unsafe { host_gipa(instance, p_name) }
 }
 
-pub unsafe extern "system" fn eclipse_vk_create_instance(
+pub(crate) unsafe extern "system" fn eclipse_vk_create_instance(
     p_create_info: *const vk::InstanceCreateInfo<'_>,
     p_allocator: *const vk::AllocationCallbacks<'_>,
     p_instance: *mut vk::Instance,
@@ -216,7 +219,7 @@ pub unsafe extern "system" fn eclipse_vk_create_instance(
     r
 }
 
-pub unsafe extern "system" fn eclipse_vk_create_android_surface_khr(
+pub(crate) unsafe extern "system" fn eclipse_vk_create_android_surface_khr(
     instance: vk::Instance,
     _p_create_info: *const vk::AndroidSurfaceCreateInfoKHR<'_>,
     p_allocator: *const vk::AllocationCallbacks<'_>,

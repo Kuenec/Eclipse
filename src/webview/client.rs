@@ -459,6 +459,7 @@ struct ViewShared {
     stage: Stage,
     started: bool,
     finished_http: Option<i32>,
+    can_go_back: bool,
 
     upcalls_ok: u32,
 }
@@ -742,6 +743,7 @@ fn helper_msg_name(msg: &HelperMsg) -> &'static str {
         HelperMsg::CookieSetResult { .. } => "CookieSetResult",
         HelperMsg::CookieFlushDone { .. } => "CookieFlushDone",
         HelperMsg::CookiesClearDone { .. } => "CookiesClearDone",
+        HelperMsg::NavigationState { .. } => "NavigationState",
     }
 }
 
@@ -1224,6 +1226,11 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
             request_id,
             removed,
         } => out.cookie_clear_results.push((request_id, removed)),
+        HelperMsg::NavigationState { view, can_go_back } => {
+            if let Some(state) = views.get_mut(&view) {
+                state.can_go_back = can_go_back;
+            }
+        }
 
         other @ (HelperMsg::HelloAck { .. } | HelperMsg::FrameBufferNew { .. }) => {
             tracing::debug!(
@@ -1558,6 +1565,7 @@ fn record_view(views: &mut HashMap<i64, ViewShared>, widget: i64, driven_url: St
                 stage: Stage::default(),
                 started: false,
                 finished_http: None,
+                can_go_back: false,
                 upcalls_ok: 0,
             });
             true
@@ -2112,6 +2120,19 @@ pub fn send_key(view: i64, kind: u8, windows_key_code: i32, character: u16) {
     });
 }
 
+pub fn can_go_back(view: i64) -> bool {
+    shared()
+        .views
+        .lock()
+        .ok()
+        .and_then(|views| views.get(&view).map(|state| state.can_go_back))
+        .unwrap_or(false)
+}
+
+pub fn go_back(view: i64) {
+    send_input(&ConsumerMsg::GoBack { view });
+}
+
 pub fn notify_view_freed(widget: i64) {
     if crate::framework::has_webview_bridges() {
         crate::framework::drop_bridges_for(widget);
@@ -2568,6 +2589,16 @@ mod tests {
         assert_eq!(out.upcalls.len(), 1);
         assert_eq!(out.upcalls[0].state, 3);
         assert_eq!(views.get(&widget).unwrap().finished_http, Some(200));
+
+        let out = dispatch(
+            HelperMsg::NavigationState {
+                view: widget,
+                can_go_back: true,
+            },
+            &mut views,
+        );
+        assert!(!out.fatal);
+        assert!(views.get(&widget).unwrap().can_go_back);
 
         let out = dispatch(
             HelperMsg::FrameReady {

@@ -4,6 +4,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use ab_glyph::{Font, FontVec, ScaleFont};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{
     JByteArray, JClass, JFloatArray, JIntArray, JLongArray, JMethodID, JObject, JObjectArray,
@@ -387,7 +388,7 @@ fn arsc_pool_string(cookie: i32, index: u32) -> Option<String> {
         _ => return None,
     };
     let bytes = arsc_bytes_for(probe_resid)?;
-    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
     table.value_string(index).ok().flatten()
 }
 
@@ -628,7 +629,7 @@ fn merge_theme_style(
         let Some(bytes) = arsc_bytes_for(current) else {
             break;
         };
-        let Ok(table) = crate::apk::arsc::parse_arsc(&bytes) else {
+        let Ok(table) = crate::apk::arsc::parse_arsc(bytes) else {
             break;
         };
         let Some(style) = table.resolve_style(current) else {
@@ -1005,7 +1006,7 @@ extern "system" fn asset_manager_get_resource_package_name<'local>(
 
 fn resolve_resource_package_name(resid: u32) -> Option<String> {
     let bytes = arsc_bytes_for(resid)?;
-    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
     let package_id = (resid >> 24) as u8;
     table.package_name(package_id).map(str::to_owned)
 }
@@ -1082,7 +1083,7 @@ fn resolve_resource_identifier(name: &str, def_type: &str, def_package: &str) ->
     let Some(bytes) = arsc_bytes_for(probe_id) else {
         return 0;
     };
-    let Ok(table) = crate::apk::arsc::parse_arsc(&bytes) else {
+    let Ok(table) = crate::apk::arsc::parse_arsc(bytes) else {
         return 0;
     };
     table
@@ -1488,28 +1489,35 @@ fn register_asset_stream_natives(env: &mut Env) -> Result<(), FrameworkError> {
     Ok(())
 }
 
-static FRAMEWORK_ARSC: OnceLock<Vec<u8>> = OnceLock::new();
+static APP_ARSC: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+static FRAMEWORK_ARSC: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
-fn arsc_bytes_for(resid: u32) -> Option<Vec<u8>> {
+fn cached_arsc_bytes(
+    cache: &OnceLock<Option<Vec<u8>>>,
+    load: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<&[u8]> {
+    cache.get_or_init(load).as_deref()
+}
+
+fn arsc_bytes_for(resid: u32) -> Option<&'static [u8]> {
     if (resid >> 24) as u8 == 0x01 {
-        if let Some(bytes) = FRAMEWORK_ARSC.get() {
-            return Some(bytes.clone());
-        }
         let fw = crate::runtime::find_framework().ok()?;
-        let mut apk = crate::apk::Apk::open(&fw.framework_res_apk).ok()?;
-        let bytes = apk.read_entry("resources.arsc").ok()?;
-
-        Some(FRAMEWORK_ARSC.get_or_init(|| bytes).clone())
+        cached_arsc_bytes(&FRAMEWORK_ARSC, || {
+            let mut apk = crate::apk::Apk::open(&fw.framework_res_apk).ok()?;
+            apk.read_entry("resources.arsc").ok()
+        })
     } else {
         let apk_path = APK_PATH.get()?;
-        let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
-        apk.read_entry("resources.arsc").ok()
+        cached_arsc_bytes(&APP_ARSC, || {
+            let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
+            apk.read_entry("resources.arsc").ok()
+        })
     }
 }
 
 fn resolve_resource_name(resid: u32) -> Option<String> {
     let bytes = arsc_bytes_for(resid)?;
-    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
 
     let package_id = (resid >> 24) as u8;
     let type_id = ((resid >> 16) & 0xff) as u8;
@@ -1534,7 +1542,7 @@ struct ResolvedResValue {
 
 fn resolve_res_value(resid: u32) -> Option<ResolvedResValue> {
     let bytes = arsc_bytes_for(resid)?;
-    let table = crate::apk::arsc::parse_arsc(&bytes).ok()?;
+    let table = crate::apk::arsc::parse_arsc(bytes).ok()?;
     let resolved = table.resource_value(resid)?;
 
     if resolved.is_complex {
@@ -2390,6 +2398,8 @@ pub const SYSTEM_CLOCK_CLASS: &JNIStr = jni_str!("android/os/SystemClock");
 
 const ELAPSED_REALTIME_NAME: &JNIStr = jni_str!("elapsedRealtime");
 const ELAPSED_REALTIME_SIG: &JNIStr = jni_str!("()J");
+const ELAPSED_REALTIME_NANOS_NAME: &JNIStr = jni_str!("elapsedRealtimeNanos");
+const ELAPSED_REALTIME_NANOS_SIG: &JNIStr = jni_str!("()J");
 
 const UPTIME_MILLIS_NAME: &JNIStr = jni_str!("uptimeMillis");
 const UPTIME_MILLIS_SIG: &JNIStr = jni_str!("()J");
@@ -2412,12 +2422,28 @@ extern "system" fn system_clock_uptime_millis<'local>(
         .resolve::<LogErrorAndDefault>()
 }
 
+extern "system" fn system_clock_elapsed_realtime_nanos<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    env.with_env(|_env| -> jni::errors::Result<jlong> { Ok(monotonic_nanos()) })
+        .resolve::<LogErrorAndDefault>()
+}
+
 fn monotonic_millis() -> jlong {
     let elapsed_ms = MONOTONIC_ANCHOR
         .get_or_init(Instant::now)
         .elapsed()
         .as_millis();
     jlong::try_from(elapsed_ms).unwrap_or(jlong::MAX)
+}
+
+fn monotonic_nanos() -> jlong {
+    let elapsed_ns = MONOTONIC_ANCHOR
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos();
+    jlong::try_from(elapsed_ns).unwrap_or(jlong::MAX)
 }
 
 fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
@@ -2432,6 +2458,13 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
         },
         unsafe {
             NativeMethod::from_raw_parts(
+                ELAPSED_REALTIME_NANOS_NAME,
+                ELAPSED_REALTIME_NANOS_SIG,
+                system_clock_elapsed_realtime_nanos as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
                 UPTIME_MILLIS_NAME,
                 UPTIME_MILLIS_SIG,
                 system_clock_uptime_millis as *mut std::ffi::c_void,
@@ -2442,7 +2475,7 @@ fn register_system_clock_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/os/SystemClock",
-        "registered Eclipse's non-GTK backing for elapsedRealtime + uptimeMillis"
+        "registered Eclipse's non-GTK backing for elapsedRealtime, elapsedRealtimeNanos, and uptimeMillis"
     );
     Ok(())
 }
@@ -3132,6 +3165,8 @@ extern "system" fn view_native_request_layout<'local>(
                 error = %e,
                 "View.native_requestLayout: invalid view handle (ignored)"
             );
+        } else {
+            mark_global_layout_pending();
         }
         Ok(())
     })
@@ -3375,15 +3410,18 @@ extern "system" fn view_native_layout<'local>(
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
         match view_registry::set_frame(widget, [l, t, r, b]) {
-            Ok(()) => tracing::trace!(
-                target: "android.view.View",
-                widget,
-                l,
-                t,
-                r,
-                b,
-                "View.native_layout: recorded laid-out frame on view peer"
-            ),
+            Ok(()) => {
+                mark_global_layout_pending();
+                tracing::trace!(
+                    target: "android.view.View",
+                    widget,
+                    l,
+                    t,
+                    r,
+                    b,
+                    "View.native_layout: recorded laid-out frame on view peer"
+                );
+            }
             Err(e) => tracing::debug!(
                 target: "android.view.View",
                 widget,
@@ -3930,17 +3968,116 @@ pub const VIEW_TREE_OBSERVER_CLASS: &JNIStr = jni_str!("android/view/ViewTreeObs
 const VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_NAME: &JNIStr =
     jni_str!("native_set_have_global_layout_listeners");
 const VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG: &JNIStr = jni_str!("(Z)V");
+const MAX_GLOBAL_LAYOUT_OBSERVERS: usize = 16;
+
+struct GlobalLayoutObserver {
+    jobject: Global<JObject<'static>>,
+    pending: bool,
+}
+
+static GLOBAL_LAYOUT_OBSERVERS: std::sync::Mutex<Vec<GlobalLayoutObserver>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn update_global_layout_observer(
+    env: &Env,
+    observer: &JObject,
+    have_listeners: bool,
+) -> jni::errors::Result<()> {
+    let mut observers = GLOBAL_LAYOUT_OBSERVERS.lock().map_err(|error| {
+        tracing::error!(
+            target: "android.view.ViewTreeObserver",
+            %error,
+            "global-layout observer registry poisoned"
+        );
+        jni::errors::Error::JniCall(jni::errors::JniError::Unknown)
+    })?;
+
+    let mut matching_index = None;
+    for (index, entry) in observers.iter().enumerate() {
+        if env.is_same_object(entry.jobject.as_obj(), observer)? {
+            matching_index = Some(index);
+            break;
+        }
+    }
+
+    if have_listeners {
+        if let Some(index) = matching_index {
+            observers[index].pending = true;
+            return Ok(());
+        }
+        if observers.len() == MAX_GLOBAL_LAYOUT_OBSERVERS {
+            tracing::error!(
+                target: "android.view.ViewTreeObserver",
+                limit = MAX_GLOBAL_LAYOUT_OBSERVERS,
+                "global-layout observer limit reached"
+            );
+            return Err(jni::errors::Error::JniCall(jni::errors::JniError::Unknown));
+        }
+        observers.push(GlobalLayoutObserver {
+            jobject: env.new_global_ref(observer)?,
+            pending: true,
+        });
+    } else if let Some(index) = matching_index {
+        observers.remove(index);
+    }
+    Ok(())
+}
+
+fn mark_global_layout_pending() {
+    match GLOBAL_LAYOUT_OBSERVERS.lock() {
+        Ok(mut observers) => {
+            for observer in observers.iter_mut() {
+                observer.pending = true;
+            }
+        }
+        Err(error) => tracing::error!(
+            target: "android.view.ViewTreeObserver",
+            %error,
+            "global-layout observer registry poisoned while scheduling layout"
+        ),
+    }
+}
+
+fn dispatch_pending_global_layout(env: &mut Env) -> Result<(), FrameworkError> {
+    let pending = {
+        let mut observers = GLOBAL_LAYOUT_OBSERVERS
+            .lock()
+            .map_err(|_| FrameworkError::GlobalLayoutObserverRegistryPoisoned)?;
+        let mut pending = Vec::with_capacity(observers.len());
+        for observer in observers.iter_mut().filter(|observer| observer.pending) {
+            pending.push(checked(env, "ViewTreeObserver NewLocalRef", |env| {
+                env.new_local_ref(observer.jobject.as_obj())
+            })?);
+            observer.pending = false;
+        }
+        pending
+    };
+
+    for observer in pending {
+        checked(env, "ViewTreeObserver.dispatchOnGlobalLayout", |env| {
+            env.call_method(
+                &observer,
+                jni_str!("dispatchOnGlobalLayout"),
+                jni_sig!("()V"),
+                &[],
+            )?
+            .v()
+        })?;
+    }
+    Ok(())
+}
 
 extern "system" fn view_tree_observer_set_have_global_layout_listeners<'local>(
     mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
+    this: JObject<'local>,
     have_listeners: jboolean,
 ) {
-    env.with_env(|_env| -> jni::errors::Result<()> {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        update_global_layout_observer(env, &this, have_listeners)?;
         tracing::trace!(
             target: "android.view.ViewTreeObserver",
             have_listeners,
-            "ViewTreeObserver.native_set_have_global_layout_listeners: recorded flag, no-op (no host layout signal)"
+            "ViewTreeObserver.native_set_have_global_layout_listeners: updated bounded host dispatch registration"
         );
         Ok(())
     })
@@ -5740,6 +5877,10 @@ const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_NAME: &JNIStr =
     jni_str!("native_loadDataWithBaseURL");
 const WEB_VIEW_NATIVE_LOAD_DATA_WITH_BASE_URL_SIG: &JNIStr =
     jni_str!("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+const WEB_VIEW_NATIVE_CAN_GO_BACK_NAME: &JNIStr = jni_str!("native_canGoBack");
+const WEB_VIEW_NATIVE_CAN_GO_BACK_SIG: &JNIStr = jni_str!("(J)Z");
+const WEB_VIEW_NATIVE_GO_BACK_NAME: &JNIStr = jni_str!("native_goBack");
+const WEB_VIEW_NATIVE_GO_BACK_SIG: &JNIStr = jni_str!("(J)V");
 
 use crate::webview::redact::{url_scheme_and_host_for_log, NON_URL};
 
@@ -5939,8 +6080,40 @@ extern "system" fn web_view_native_load_data_with_base_url<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+extern "system" fn web_view_native_can_go_back<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) -> jboolean {
+    env.with_env(|_env| -> jni::errors::Result<jboolean> {
+        Ok(crate::webview::client::can_go_back(widget))
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn web_view_native_go_back<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    widget: jlong,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(error) = view_registry::with_view(widget, |_| ()) {
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                %error,
+                "WebView.native_goBack: invalid view handle"
+            );
+            return Ok(());
+        }
+        crate::webview::client::go_back(widget);
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
-    let bindings: [NativeBinding; 5] = [
+    let bindings: [NativeBinding; 7] = [
         (
             VIEW_NATIVE_CONSTRUCTOR_NAME,
             VIEW_NATIVE_CONSTRUCTOR_SIG,
@@ -5966,11 +6139,21 @@ fn register_web_view_natives(env: &mut Env) -> Result<(), FrameworkError> {
             WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG,
             web_view_native_add_javascript_interface as *mut c_void,
         ),
+        (
+            WEB_VIEW_NATIVE_CAN_GO_BACK_NAME,
+            WEB_VIEW_NATIVE_CAN_GO_BACK_SIG,
+            web_view_native_can_go_back as *mut c_void,
+        ),
+        (
+            WEB_VIEW_NATIVE_GO_BACK_NAME,
+            WEB_VIEW_NATIVE_GO_BACK_SIG,
+            web_view_native_go_back as *mut c_void,
+        ),
     ];
     let bound = register_class_natives_best_effort(env, WEB_VIEW_CLASS, &bindings)?;
     tracing::info!(
         bound,
-        "registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL = spawn-and-forward; evaluateJavascript + addJavascriptInterface = M4 bridge/eval surface; honest WARN no-op when the helper is unavailable) (per-method best-effort)"
+        "registered Eclipse's non-GTK backing for the android.webkit.WebView native surface (constructor = shared view-registry peer; loadUrl/loadDataWithBaseURL = spawn-and-forward; canGoBack/goBack = CEF history; evaluateJavascript + addJavascriptInterface = M4 bridge/eval surface; honest WARN no-op when the helper is unavailable) (per-method best-effort)"
     );
     Ok(())
 }
@@ -8320,6 +8503,23 @@ const EDIT_TEXT_GET_TEXT_NAME: &JNIStr = jni_str!("native_getText");
 const EDIT_TEXT_GET_TEXT_SIG: &JNIStr = jni_str!("(J)Ljava/lang/String;");
 
 static ACTIVE_TEXT_FIELD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static ACTIVE_TEXT_SELECTION_ALL: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+static ACTIVE_TEXT_CURSOR_UTF16: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+const ROBLOX_CODE_FONT: i32 = 10;
+const ROBLOX_CODE_FONT_RATIO: f32 = 0.953_288_85;
+const TEXT_POINTER_LIFETIME: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Clone, Copy)]
+struct PendingTextPointer {
+    position: (f32, f32),
+    recorded_at: Instant,
+}
+
+static PENDING_TEXT_POINTER: std::sync::Mutex<Option<PendingTextPointer>> =
+    std::sync::Mutex::new(None);
 
 pub fn active_text_field() -> i64 {
     ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire)
@@ -8327,8 +8527,32 @@ pub fn active_text_field() -> i64 {
 
 pub fn clear_active_text_field() -> bool {
     let widget = ACTIVE_TEXT_FIELD.swap(0, std::sync::atomic::Ordering::AcqRel);
+    ACTIVE_TEXT_SELECTION_ALL.store(0, std::sync::atomic::Ordering::Release);
+    ACTIVE_TEXT_CURSOR_UTF16.store(0, std::sync::atomic::Ordering::Release);
+    if let Ok(mut pending) = PENDING_TEXT_POINTER.lock() {
+        *pending = None;
+    }
     record_textbox_session(None);
     widget != 0
+}
+
+pub(crate) fn invalidate_active_text_field_session() -> bool {
+    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
+    if widget == 0 {
+        return false;
+    }
+    ACTIVE_TEXT_SELECTION_ALL.store(0, std::sync::atomic::Ordering::Release);
+    record_textbox_session(None);
+    true
+}
+
+pub fn select_all_active_text_field() -> bool {
+    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
+    if widget == 0 {
+        return false;
+    }
+    ACTIVE_TEXT_SELECTION_ALL.store(widget, std::sync::atomic::Ordering::Release);
+    true
 }
 
 fn clear_active_text_field_if(widget: i64) {
@@ -8342,15 +8566,27 @@ fn clear_active_text_field_if(widget: i64) {
             )
             .is_ok()
     {
+        ACTIVE_TEXT_SELECTION_ALL.store(0, std::sync::atomic::Ordering::Release);
+        ACTIVE_TEXT_CURSOR_UTF16.store(0, std::sync::atomic::Ordering::Release);
+        if let Ok(mut pending) = PENDING_TEXT_POINTER.lock() {
+            *pending = None;
+        }
         record_textbox_session(None);
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct TextboxSession {
     widget: i64,
     geometry: (i32, i32, u32, u32),
     input_type: i32,
+    font: i32,
+    font_size: f32,
+    multiline: bool,
+    text_wrapped: bool,
+    text_color: i32,
+    x_alignment: i32,
+    y_alignment: i32,
 }
 
 static TEXTBOX_SESSION: std::sync::Mutex<Option<TextboxSession>> = std::sync::Mutex::new(None);
@@ -8370,10 +8606,25 @@ pub fn textbox_input_type() -> i32 {
         .unwrap_or(i32::MIN)
 }
 
+pub fn active_text_field_accepts_line_breaks() -> bool {
+    let active = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
+    TEXTBOX_SESSION
+        .lock()
+        .ok()
+        .and_then(|session| *session)
+        .is_some_and(|session| textbox_session_matches_active(session, active) && session.multiline)
+}
+
 pub(crate) struct ActiveTextOverlay {
     pub(crate) text: String,
     pub(crate) geometry: (i32, i32, u32, u32),
     pub(crate) input_type: i32,
+    pub(crate) font_size: f32,
+    pub(crate) multiline: bool,
+    pub(crate) text_wrapped: bool,
+    pub(crate) text_color: i32,
+    pub(crate) x_alignment: i32,
+    pub(crate) y_alignment: i32,
 }
 
 pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
@@ -8381,7 +8632,8 @@ pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
     if !textbox_session_matches_active(
         session,
         ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire),
-    ) {
+    ) || (session.text_color as u32 >> 24) == 0
+    {
         return None;
     }
     let text = view_registry::with_view(session.widget, |view| view.text.clone())
@@ -8397,6 +8649,12 @@ pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
         text,
         geometry: session.geometry,
         input_type: session.input_type,
+        font_size: session.font_size,
+        multiline: session.multiline,
+        text_wrapped: session.text_wrapped,
+        text_color: session.text_color,
+        x_alignment: session.x_alignment,
+        y_alignment: session.y_alignment,
     })
 }
 
@@ -8413,28 +8671,130 @@ fn has_live_textbox_session(widget: i64) -> bool {
 }
 
 fn record_textbox_session(session: Option<TextboxSession>) {
-    match session {
-        Some(session) => {
-            if let Ok(mut current) = TEXTBOX_SESSION.lock() {
-                *current = Some(session);
-            }
-
-            static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
-            if LAST.swap(session.input_type, std::sync::atomic::Ordering::Relaxed)
-                != session.input_type
-            {
-                tracing::info!(
-                    text_input_type = session.input_type,
-                    "focused textbox input type"
-                );
-            }
+    if let Ok(mut current) = TEXTBOX_SESSION.lock() {
+        *current = session;
+    }
+    if let Some(session) = session {
+        static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+        if LAST.swap(session.input_type, std::sync::atomic::Ordering::Relaxed) != session.input_type
+        {
+            tracing::info!(
+                text_input_type = session.input_type,
+                "focused textbox input type"
+            );
         }
-        None => {
-            if let Ok(mut current) = TEXTBOX_SESSION.lock() {
-                *current = None;
-            }
+        let pending = PENDING_TEXT_POINTER
+            .lock()
+            .ok()
+            .and_then(|mut pointer| pointer.take())
+            .filter(|pointer| pointer.recorded_at.elapsed() <= TEXT_POINTER_LIFETIME);
+        if let Some(pointer) = pending {
+            update_active_text_cursor_from_pointer(session, pointer.position);
         }
     }
+}
+
+fn roblox_code_font() -> Option<&'static FontVec> {
+    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        FontVec::try_from_vec(read_asset_bytes("content/fonts/Inconsolata-Regular.ttf")?).ok()
+    })
+    .as_ref()
+}
+
+fn code_text_cursor_from_pointer(
+    text: &str,
+    session: TextboxSession,
+    position: (f32, f32),
+) -> Option<jint> {
+    if session.font != ROBLOX_CODE_FONT || session.text_wrapped {
+        return None;
+    }
+    let (x, y, width, height) = session.geometry;
+    let relative_x = position.0 - x as f32;
+    let relative_y = position.1 - y as f32;
+    if relative_x < 0.0
+        || relative_y < 0.0
+        || relative_x > width as f32
+        || relative_y > height as f32
+    {
+        return None;
+    }
+    let font = roblox_code_font()?;
+    let scale = session.font_size * ROBLOX_CODE_FONT_RATIO;
+    let scaled = font.as_scaled(scale);
+    let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
+    let requested_line = if session.multiline {
+        (relative_y / line_height).floor().max(0.0) as usize
+    } else {
+        0
+    };
+    let mut utf16_before_line = 0usize;
+    for (line_index, line) in text.split('\n').enumerate() {
+        if line_index != requested_line {
+            utf16_before_line = utf16_before_line
+                .saturating_add(line.encode_utf16().count())
+                .saturating_add(1);
+            continue;
+        }
+        let line_width = line
+            .chars()
+            .map(|character| scaled.h_advance(scaled.glyph_id(character)))
+            .sum::<f32>();
+        let line_origin = match session.x_alignment {
+            1 => (width as f32 - line_width).max(0.0),
+            2 => ((width as f32 - line_width) * 0.5).max(0.0),
+            _ => 0.0,
+        };
+        let requested_x = (relative_x - line_origin).max(0.0);
+        let mut used_width = 0.0;
+        let mut line_utf16 = 0usize;
+        for character in line.chars() {
+            let advance = scaled.h_advance(scaled.glyph_id(character));
+            if requested_x < used_width + advance * 0.5 {
+                return jint::try_from(utf16_before_line.saturating_add(line_utf16)).ok();
+            }
+            used_width += advance;
+            line_utf16 = line_utf16.saturating_add(character.len_utf16());
+        }
+        return jint::try_from(utf16_before_line.saturating_add(line_utf16)).ok();
+    }
+    jint::try_from(text.encode_utf16().count()).ok()
+}
+
+fn update_active_text_cursor_from_pointer(session: TextboxSession, position: (f32, f32)) -> bool {
+    if active_text_field() != session.widget {
+        return false;
+    }
+    let text =
+        view_registry::with_view(session.widget, |view| view.text.clone().unwrap_or_default());
+    let Ok(text) = text else {
+        return false;
+    };
+    let Some(cursor) = code_text_cursor_from_pointer(&text, session, position) else {
+        return false;
+    };
+    ACTIVE_TEXT_CURSOR_UTF16.store(i64::from(cursor), std::sync::atomic::Ordering::Release);
+    true
+}
+
+pub(crate) fn prepare_text_field_pointer_press(position: (f32, f32)) -> bool {
+    if let Ok(mut pending) = PENDING_TEXT_POINTER.lock() {
+        *pending = Some(PendingTextPointer {
+            position,
+            recorded_at: Instant::now(),
+        });
+    }
+    let active = active_text_field();
+    let session = TEXTBOX_SESSION
+        .lock()
+        .ok()
+        .and_then(|session| *session)
+        .filter(|session| textbox_session_matches_active(*session, active));
+    if let Some(session) = session {
+        update_active_text_cursor_from_pointer(session, position);
+    }
+    invalidate_active_text_field_session()
 }
 
 pub fn query_textbox_geometry(vm: &Vm) {
@@ -8447,6 +8807,9 @@ pub fn query_textbox_geometry(vm: &Vm) {
     let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
     if widget == 0 {
         record_textbox_session(None);
+        return;
+    }
+    if has_live_textbox_session(widget) {
         return;
     }
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
@@ -8473,102 +8836,81 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 clear_active_text_field_if(widget);
                 return;
             }
-            let Ok(info_cls) = checked(env, "Object.getClass", |env| {
-                env.call_method(
-                    &info,
-                    jni_str!("getClass"),
-                    jni_sig!("()Ljava/lang/Class;"),
-                    &[],
-                )?
-                .l()
-            }) else {
+            let float_sig = unsafe {
+                FieldSignature::from_raw_parts(jni_str!("F"), JavaType::Primitive(Primitive::Float))
+            };
+            let int_sig = unsafe {
+                FieldSignature::from_raw_parts(INT_SIG, JavaType::Primitive(Primitive::Int))
+            };
+            let bool_sig = unsafe {
+                FieldSignature::from_raw_parts(
+                    BOOLEAN_FIELD_SIG,
+                    JavaType::Primitive(Primitive::Boolean),
+                )
+            };
+            let read_float = |env: &mut Env, name: &JNIStr| -> Option<f32> {
+                checked(env, "NativeTextBoxInfo float field", |env| {
+                    env.get_field(&info, name, &float_sig)?.f()
+                })
+                .ok()
+            };
+            let read_int = |env: &mut Env, name: &JNIStr| -> Option<i32> {
+                checked(env, "NativeTextBoxInfo int field", |env| {
+                    env.get_field(&info, name, &int_sig)?.i()
+                })
+                .ok()
+            };
+            let read_bool = |env: &mut Env, name: &JNIStr| -> Option<bool> {
+                checked(env, "NativeTextBoxInfo boolean field", |env| {
+                    env.get_field(&info, name, &bool_sig)?.z()
+                })
+                .ok()
+            };
+            let (
+                Some(x),
+                Some(y),
+                Some(w),
+                Some(h),
+                Some(font_size),
+                Some(font),
+                Some(input_type),
+                Some(multiline),
+                Some(text_wrapped),
+                Some(text_color),
+                Some(x_alignment),
+                Some(y_alignment),
+            ) = (
+                read_float(env, jni_str!("x")),
+                read_float(env, jni_str!("y")),
+                read_float(env, jni_str!("width")),
+                read_float(env, jni_str!("height")),
+                read_float(env, jni_str!("fontSize")),
+                read_int(env, jni_str!("font")),
+                read_int(env, jni_str!("textInputType")),
+                read_bool(env, jni_str!("multiline")),
+                read_bool(env, jni_str!("textWrapped")),
+                read_int(env, jni_str!("textColor")),
+                read_int(env, jni_str!("xAlignment")),
+                read_int(env, jni_str!("yAlignment")),
+            )
+            else {
                 record_textbox_session(None);
                 return;
             };
 
-            let read = |env: &mut Env, name: &str| -> Option<f32> {
-                let jname = env.new_string(name).ok()?;
-                let field = checked(env, "Class.getDeclaredField", |env| {
-                    env.call_method(
-                        &info_cls,
-                        jni_str!("getDeclaredField"),
-                        jni_sig!("(Ljava/lang/String;)Ljava/lang/reflect/Field;"),
-                        &[JValue::Object(&jname)],
-                    )?
-                    .l()
-                })
-                .ok()?;
-                let _ = checked(env, "Field.setAccessible", |env| {
-                    env.call_method(
-                        &field,
-                        jni_str!("setAccessible"),
-                        jni_sig!("(Z)V"),
-                        &[JValue::Bool(true)],
-                    )?
-                    .v()
-                });
-                checked(env, "Field.getFloat", |env| {
-                    env.call_method(
-                        &field,
-                        jni_str!("getFloat"),
-                        jni_sig!("(Ljava/lang/Object;)F"),
-                        &[JValue::Object(&info)],
-                    )?
-                    .f()
-                })
-                .ok()
-            };
-            let (Some(x), Some(y), Some(w), Some(h)) = (
-                read(env, "x"),
-                read(env, "y"),
-                read(env, "width"),
-                read(env, "height"),
-            ) else {
-                record_textbox_session(None);
-                return;
-            };
-
-            let input_type = (|| -> Option<i32> {
-                let jname = env.new_string("textInputType").ok()?;
-                let field = checked(env, "Class.getDeclaredField", |env| {
-                    env.call_method(
-                        &info_cls,
-                        jni_str!("getDeclaredField"),
-                        jni_sig!("(Ljava/lang/String;)Ljava/lang/reflect/Field;"),
-                        &[JValue::Object(&jname)],
-                    )?
-                    .l()
-                })
-                .ok()?;
-                let _ = checked(env, "Field.setAccessible", |env| {
-                    env.call_method(
-                        &field,
-                        jni_str!("setAccessible"),
-                        jni_sig!("(Z)V"),
-                        &[JValue::Bool(true)],
-                    )?
-                    .v()
-                });
-                checked(env, "Field.getInt", |env| {
-                    env.call_method(
-                        &field,
-                        jni_str!("getInt"),
-                        jni_sig!("(Ljava/lang/Object;)I"),
-                        &[JValue::Object(&info)],
-                    )?
-                    .i()
-                })
-                .ok()
-            })();
-
-            match (w > 0.0 && h > 0.0, input_type) {
-                (true, Some(input_type))
-                    if ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire) == widget =>
-                {
+            match w > 0.0 && h > 0.0 && font_size.is_finite() && font_size > 0.0 {
+                true if ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire) == widget => {
                     record_textbox_session(Some(TextboxSession {
                         widget,
                         geometry: (x as i32, y as i32, w as u32, h as u32),
                         input_type,
+                        font,
+                        font_size,
+                        multiline,
+                        text_wrapped,
+                        text_color,
+                        x_alignment,
+                        y_alignment,
                     }));
                 }
                 _ => record_textbox_session(None),
@@ -8590,13 +8932,24 @@ extern "system" fn widget_native_set_text<'local>(
         } else {
             Some(text.try_to_string(env)?)
         };
-        match view_registry::with_view(widget, |v| v.text = value.clone()) {
-            Ok(()) => tracing::debug!(
+        match view_registry::with_view(widget, |view| {
+            let changed = view.text != value;
+            view.text = value.clone();
+            changed
+        }) {
+            Ok(changed) => {
+                if changed && active_text_field() == widget {
+                    let cursor = java_cursor_position(value.as_deref().unwrap_or_default());
+                    ACTIVE_TEXT_CURSOR_UTF16
+                        .store(i64::from(cursor), std::sync::atomic::Ordering::Release);
+                }
+                tracing::debug!(
                 target: "android.widget",
                 widget,
                 chars = value.as_deref().map_or(0, |text| text.chars().count()),
                 "Widget.native_setText: recorded text length on non-GTK view peer"
-            ),
+                )
+            }
             Err(e) => tracing::debug!(
                 target: "android.widget",
                 widget,
@@ -8615,93 +8968,92 @@ extern "system" fn edit_text_native_get_text<'local>(
     widget: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        ACTIVE_TEXT_FIELD.store(widget, std::sync::atomic::Ordering::Release);
+        let previous = ACTIVE_TEXT_FIELD.swap(widget, std::sync::atomic::Ordering::AcqRel);
         let text = view_registry::with_view(widget, |v| v.text.clone())
             .ok()
             .flatten()
             .unwrap_or_default();
+        let text_end = i64::from(java_cursor_position(&text));
+        if previous != widget {
+            ACTIVE_TEXT_CURSOR_UTF16.store(text_end, std::sync::atomic::Ordering::Release);
+        } else {
+            ACTIVE_TEXT_CURSOR_UTF16.fetch_min(text_end, std::sync::atomic::Ordering::AcqRel);
+        }
         env.new_string(&text)
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-fn apply_text_edit(old: &str, unicode: i32, backspace: bool) -> (String, jint, jint, jint) {
-    let old_len = jint::try_from(old.chars().count()).unwrap_or(jint::MAX);
-    let mut s = old.to_string();
+fn utf16_cursor_byte_offset(text: &str, requested: jint) -> (usize, jint) {
+    let requested = requested.max(0) as usize;
+    let mut utf16_offset = 0usize;
+    for (byte_offset, character) in text.char_indices() {
+        let next_utf16 = utf16_offset.saturating_add(character.len_utf16());
+        if next_utf16 > requested {
+            return (
+                byte_offset,
+                jint::try_from(utf16_offset).unwrap_or(jint::MAX),
+            );
+        }
+        utf16_offset = next_utf16;
+        if utf16_offset == requested {
+            return (
+                byte_offset + character.len_utf8(),
+                jint::try_from(utf16_offset).unwrap_or(jint::MAX),
+            );
+        }
+    }
+    (
+        text.len(),
+        jint::try_from(utf16_offset).unwrap_or(jint::MAX),
+    )
+}
+
+fn apply_text_edit_at_utf16(
+    old: &str,
+    cursor: jint,
+    unicode: i32,
+    backspace: bool,
+    replace_all: bool,
+) -> (String, jint) {
+    let inserted = char::from_u32(unicode as u32)
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'));
+    if replace_all {
+        if backspace {
+            return (String::new(), 0);
+        }
+        if let Some(character) = inserted {
+            return (
+                character.to_string(),
+                jint::try_from(character.len_utf16()).unwrap_or(jint::MAX),
+            );
+        }
+        return (old.to_string(), cursor.clamp(0, java_cursor_position(old)));
+    }
+    let (cursor_byte, cursor) = utf16_cursor_byte_offset(old, cursor);
     if backspace {
-        return if s.pop().is_some() {
-            (s, old_len - 1, 1, 0)
-        } else {
-            (s, 0, 0, 0)
+        let Some((previous_byte, previous)) = old[..cursor_byte].char_indices().next_back() else {
+            return (old.to_string(), 0);
         };
+        let mut edited = String::with_capacity(old.len() - previous.len_utf8());
+        edited.push_str(&old[..previous_byte]);
+        edited.push_str(&old[cursor_byte..]);
+        let cursor = cursor.saturating_sub(previous.len_utf16() as jint);
+        return (edited, cursor);
     }
-    if let Some(c) = char::from_u32(unicode as u32).filter(|c| !c.is_control()) {
-        s.push(c);
-        return (s, old_len, 0, 1);
+    if let Some(character) = inserted {
+        let mut edited = String::with_capacity(old.len() + character.len_utf8());
+        edited.push_str(&old[..cursor_byte]);
+        edited.push(character);
+        edited.push_str(&old[cursor_byte..]);
+        let cursor = cursor.saturating_add(character.len_utf16() as jint);
+        return (edited, cursor);
     }
-    (s, 0, 0, 0)
+    (old.to_string(), cursor)
 }
 
-fn android_keycode_for(unicode: i32, backspace: bool) -> Option<(jint, jint)> {
-    if backspace {
-        return Some((67, 0));
-    }
-    let c = char::from_u32(unicode as u32)?;
-    match c {
-        'a'..='z' => Some((29 + (c as jint - 'a' as jint), 0)),
-        'A'..='Z' => Some((29 + (c as jint - 'A' as jint), 1)),
-        '0'..='9' => Some((7 + (c as jint - '0' as jint), 0)),
-        ' ' => Some((62, 0)),
-        _ => None,
-    }
-}
-
-fn pass_key_event_to_engine(vm: &Vm, unicode: i32, backspace: bool) {
-    let Some((key_code, meta)) = android_keycode_for(unicode, backspace) else {
-        return;
-    };
-    let raw = vm.as_raw();
-    if raw.is_null() {
-        return;
-    }
-
-    let java_vm = unsafe { JavaVM::from_raw(raw) };
-    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let cls = match env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface")) {
-                Ok(c) => c,
-                Err(_) => {
-                    env.exception_clear();
-                    return;
-                }
-            };
-            for is_down in [true, false] {
-                if let Err(e) = checked(env, "NativeGLInterface.nativePassKeyEvent", |env| {
-                    env.call_static_method(
-                        &cls,
-                        jni_str!("nativePassKeyEvent"),
-                        jni_sig!("(ZIIZ)V"),
-                        &[
-                            JValue::Bool(is_down),
-                            JValue::Int(key_code),
-                            JValue::Int(meta),
-                            JValue::Bool(false),
-                        ],
-                    )?
-                    .v()
-                }) {
-                    tracing::debug!(error = %e, "nativePassKeyEvent threw (cleared)");
-                }
-            }
-        }));
-        Ok(())
-    });
-}
-
-fn text_paths() -> &'static str {
-    static PATHS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-    PATHS.get_or_init(|| std::env::var("ECLIPSE_TEXT_PATHS").unwrap_or_else(|_| "w".to_string()))
+fn java_cursor_position(text: &str) -> jint {
+    jint::try_from(text.encode_utf16().count()).unwrap_or(jint::MAX)
 }
 
 pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bool {
@@ -8719,24 +9071,25 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
 
     let edited = view_registry::with_view(widget, |v| {
         let old = v.text.clone().unwrap_or_default();
-        let (new, start, before, count) = apply_text_edit(&old, unicode, backspace);
+        let cursor = ACTIVE_TEXT_CURSOR_UTF16
+            .load(std::sync::atomic::Ordering::Acquire)
+            .clamp(0, i64::from(jint::MAX)) as jint;
+        let replace_all = ACTIVE_TEXT_SELECTION_ALL
+            .compare_exchange(
+                widget,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        let (new, cursor) = apply_text_edit_at_utf16(&old, cursor, unicode, backspace, replace_all);
         v.text = Some(new.clone());
-        (old, new, start, before, count)
+        (new, cursor)
     });
     match edited {
-        Ok((old_text, new_text, start, before, count)) => {
-            let paths = text_paths();
-
-            if paths.contains('w') {
-                fire_text_watchers(vm, widget, &old_text, &new_text, start, before, count);
-            }
-
-            let cursor = jint::try_from(new_text.chars().count()).unwrap_or(jint::MAX);
+        Ok((new_text, cursor)) => {
+            ACTIVE_TEXT_CURSOR_UTF16.store(i64::from(cursor), std::sync::atomic::Ordering::Release);
             sync_engine_textbox(vm, &new_text, cursor);
-
-            if paths.contains('k') {
-                pass_key_event_to_engine(vm, unicode, backspace);
-            }
             true
         }
         Err(_) => {
@@ -8752,8 +9105,6 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
         return;
     }
 
-    let composing = std::env::var_os("ECLIPSE_TEXT_COMPOSING").is_some();
-
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -8767,47 +9118,6 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
             let Ok(s) = env.new_string(text) else {
                 return;
             };
-            let paths = text_paths();
-
-            if paths.contains('e') {
-            if let Err(e) = checked(env, "NativeGLInterface.updateKeyboardSize", |env| {
-                env.call_static_method(
-                    &cls,
-                    jni_str!("updateKeyboardSize"),
-                    jni_sig!("(ZIIII)V"),
-                    &[
-                        JValue::Bool(true),
-                        JValue::Int(0),
-                        JValue::Int(360),
-                        JValue::Int(800),
-                        JValue::Int(240),
-                    ],
-                )?
-                .v()
-            }) {
-                tracing::debug!(error = %e, "updateKeyboardSize threw (cleared)");
-            }
-            }
-
-            if paths.contains('p') {
-            if let Err(e) = checked(env, "NativeGLInterface.nativePassText", |env| {
-                env.call_static_method(
-                    &cls,
-                    jni_str!("nativePassText"),
-                    jni_sig!("(JLjava/lang/String;ZI)V"),
-                    &[
-                        JValue::Long(0),
-                        JValue::Object(&s),
-                        JValue::Bool(composing),
-                        JValue::Int(cursor),
-                    ],
-                )?
-                .v()
-            }) {
-                tracing::debug!(error = %e, "nativePassText threw (cleared)");
-            }
-            }
-            if paths.contains('s') {
             if let Err(e) = checked(
                 env,
                 "NativeGLInterface.syncTextboxTextAndCursorPosition2",
@@ -8823,111 +9133,8 @@ fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
             ) {
                 tracing::debug!(error = %e, "syncTextboxTextAndCursorPosition2 threw (cleared)");
             }
-            }
         }));
         Ok(())
-    });
-}
-
-fn fire_text_watchers(
-    vm: &Vm,
-    widget: jlong,
-    old_text: &str,
-    new_text: &str,
-    start: jint,
-    before: jint,
-    count: jint,
-) {
-    let ptrs: Vec<jni::sys::jobject> = match view_registry::with_view(widget, |v| {
-        v.text_watchers
-            .iter()
-            .map(|g| g.as_obj().as_raw())
-            .collect::<Vec<_>>()
-    }) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    if ptrs.is_empty() {
-        return;
-    }
-    let raw = vm.as_raw();
-    if raw.is_null() {
-        return;
-    }
-
-    let java_vm = unsafe { JavaVM::from_raw(raw) };
-    let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let s = env.new_string(new_text)?;
-            let old_s = env.new_string(old_text)?;
-
-            let editable = match env.find_class(jni_str!("android/text/SpannableStringBuilder")) {
-                Ok(cls) => env
-                    .new_object(
-                        &cls,
-                        jni_sig!("(Ljava/lang/CharSequence;)V"),
-                        &[JValue::Object(&s)],
-                    )
-                    .ok(),
-                Err(_) => None,
-            };
-            for ptr in &ptrs {
-
-                let watcher = unsafe { JObject::from_raw(env, *ptr) };
-
-                if let Err(e) = checked(env, "TextWatcher.beforeTextChanged", |env| {
-                    env.call_method(
-                        &watcher,
-                        jni_str!("beforeTextChanged"),
-                        jni_sig!("(Ljava/lang/CharSequence;III)V"),
-                        &[
-                            JValue::Object(&old_s),
-                            JValue::Int(start),
-                            JValue::Int(before),
-                            JValue::Int(count),
-                        ],
-                    )?
-                    .v()
-                }) {
-                    tracing::debug!(error = %e, "TextWatcher.beforeTextChanged threw (cleared, continuing)");
-                }
-
-                if let Err(e) = checked(env, "TextWatcher.onTextChanged", |env| {
-                    env.call_method(
-                        &watcher,
-                        jni_str!("onTextChanged"),
-                        jni_sig!("(Ljava/lang/CharSequence;III)V"),
-                        &[
-                            JValue::Object(&s),
-                            JValue::Int(start),
-                            JValue::Int(before),
-                            JValue::Int(count),
-                        ],
-                    )?
-                    .v()
-                }) {
-                    tracing::debug!(error = %e, "TextWatcher.onTextChanged threw (cleared, continuing)");
-                }
-
-                if let Some(ed) = &editable {
-                    if let Err(e) = checked(env, "TextWatcher.afterTextChanged", |env| {
-                        env.call_method(
-                            &watcher,
-                            jni_str!("afterTextChanged"),
-                            jni_sig!("(Landroid/text/Editable;)V"),
-                            &[JValue::Object(ed)],
-                        )?
-                        .v()
-                    }) {
-                        tracing::debug!(error = %e, "TextWatcher.afterTextChanged threw (cleared, continuing)");
-                    }
-                }
-            }
-            Ok::<(), FrameworkError>(())
-        })) {
-            Ok(r) => r,
-            Err(_) => Err(FrameworkError::Panicked),
-        }
     });
 }
 
@@ -10252,6 +10459,7 @@ extern "system" fn window_set_layout<'local>(
                 "Window.set_layout: invalid window handle (ignored)"
             );
         } else {
+            mark_global_layout_pending();
             tracing::trace!(
                 target: "android.view.Window",
                 native_window, width, height,
@@ -10445,6 +10653,46 @@ fn mark_activity_finished_once(env: &mut Env, activity: &JObject) -> bool {
     drop(tracker);
     track_activity(env, activity, true);
     true
+}
+
+pub fn dispatch_back_to_active_activity(vm: &Vm) -> Result<bool, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| dispatch_back_to_latest_activity(env))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+fn dispatch_back_to_latest_activity(env: &mut Env) -> Result<bool, FrameworkError> {
+    let activity = {
+        let tracker = TRACKED_ACTIVITIES
+            .lock()
+            .map_err(|_| FrameworkError::ActivityTrackerPoisoned)?;
+        let Some(entry) = tracker.iter().rev().find(|entry| !entry.finished) else {
+            return Ok(false);
+        };
+        checked(env, "Activity Back NewLocalRef", |env| {
+            env.new_local_ref(entry.jobject.as_obj())
+        })?
+    };
+    let class_name = view_class_name(env, &activity).unwrap_or_default();
+    checked(env, "Activity.onBackPressed", |env| {
+        env.call_method(&activity, jni_str!("onBackPressed"), jni_sig!("()V"), &[])?
+            .v()
+    })?;
+    tracing::info!(
+        target: "android.app.Activity",
+        class = %class_name,
+        "desktop Back dispatched to Activity.onBackPressed"
+    );
+    Ok(true)
 }
 
 extern "system" fn activity_native_start_activity<'local>(
@@ -11065,8 +11313,10 @@ fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
 
     run_pending_main_upcall(env);
     let result = drive_main_messages(env);
+    let layout_result = dispatch_pending_global_layout(env);
     let _ = MAIN_LOOPER_PUMP_IN_PROGRESS.try_with(|f| f.set(false));
     result?;
+    layout_result?;
 
     if !MAIN_LOOPER_PUMP_ACTIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::info!(
@@ -12464,6 +12714,8 @@ pub enum FrameworkError {
 
     ActivityTrackerPoisoned,
 
+    GlobalLayoutObserverRegistryPoisoned,
+
     Jni(jni::errors::Error),
 
     Panicked,
@@ -12479,6 +12731,9 @@ impl fmt::Display for FrameworkError {
             Self::NullVm => f.write_str("framework driver received a null JavaVM pointer"),
             Self::ActivityTrackerPoisoned => {
                 f.write_str("the framework Activity tracker was poisoned")
+            }
+            Self::GlobalLayoutObserverRegistryPoisoned => {
+                f.write_str("the framework global-layout observer registry was poisoned")
             }
             Self::Jni(e) => write!(f, "JNI error driving the framework lifecycle: {e}"),
             Self::Panicked => {
@@ -12496,7 +12751,10 @@ impl std::error::Error for FrameworkError {
             Self::Jni(e) => Some(e),
             Self::WindowRegistry(e) => Some(e),
             Self::ViewRegistry(e) => Some(e),
-            Self::NullVm | Self::ActivityTrackerPoisoned | Self::Panicked => None,
+            Self::NullVm
+            | Self::ActivityTrackerPoisoned
+            | Self::GlobalLayoutObserverRegistryPoisoned
+            | Self::Panicked => None,
         }
     }
 }
@@ -12517,6 +12775,8 @@ impl From<jni::errors::Error> for FrameworkError {
 mod tests {
     use super::*;
 
+    static TEXTBOX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn host_shutdown_destroys_engine_surface_before_window_teardown() {
         assert_eq!(
@@ -12532,10 +12792,18 @@ mod tests {
 
     #[test]
     fn record_textbox_session_invalidates_geometry_and_input_type_together() {
+        let _textbox_test_guard = TEXTBOX_TEST_LOCK.lock().expect("textbox test lock");
         record_textbox_session(Some(TextboxSession {
             widget: 41,
             geometry: (10, 20, 300, 40),
             input_type: 5,
+            font: 39,
+            font_size: 18.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 1,
         }));
         assert_eq!(textbox_geometry(), Some((10, 20, 300, 40)));
         assert_eq!(textbox_input_type(), 5);
@@ -12552,6 +12820,13 @@ mod tests {
             widget: 42,
             geometry: (181, 149, 438, 46),
             input_type: 7,
+            font: 39,
+            font_size: 18.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 1,
         }));
         assert_eq!(textbox_input_type(), 7);
         record_textbox_session(None);
@@ -12562,6 +12837,13 @@ mod tests {
             widget: 42,
             geometry: (181, 149, 438, 46),
             input_type: 7,
+            font: 39,
+            font_size: 18.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 1,
         };
         assert!(textbox_session_matches_active(username, 42));
         assert!(!textbox_session_matches_active(username, 43));
@@ -12578,12 +12860,43 @@ mod tests {
             widget: 43,
             geometry: (181, 219, 438, 46),
             input_type: 5,
+            font: 39,
+            font_size: 18.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 1,
         };
         ACTIVE_TEXT_FIELD.store(43, std::sync::atomic::Ordering::Release);
         record_textbox_session(Some(password));
         clear_active_text_field_if(42);
         assert_eq!(active_text_field(), 43);
         assert!(has_live_textbox_session(43));
+        assert!(clear_active_text_field());
+    }
+
+    #[test]
+    fn pointer_press_revalidation_preserves_the_active_text_field() {
+        let _textbox_test_guard = TEXTBOX_TEST_LOCK.lock().expect("textbox test lock");
+        let session = TextboxSession {
+            widget: 44,
+            geometry: (54, 10, 720, 280),
+            input_type: 0,
+            font: ROBLOX_CODE_FONT,
+            font_size: 14.0,
+            multiline: true,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 0,
+        };
+        ACTIVE_TEXT_FIELD.store(44, std::sync::atomic::Ordering::Release);
+        record_textbox_session(Some(session));
+
+        assert!(invalidate_active_text_field_session());
+        assert_eq!(active_text_field(), 44);
+        assert!(!has_live_textbox_session(44));
         assert!(clear_active_text_field());
     }
 
@@ -12708,49 +13021,117 @@ mod tests {
     }
 
     #[test]
-    fn apply_text_edit_computes_android_ontextchanged_delta() {
+    fn host_text_edit_handles_end_cursor_and_invalid_characters() {
         assert_eq!(
-            apply_text_edit("", 'a' as i32, false),
-            ("a".to_string(), 0, 0, 1)
+            apply_text_edit_at_utf16("", 0, 'a' as i32, false, false),
+            ("a".to_string(), 1)
         );
 
         assert_eq!(
-            apply_text_edit("ro", 'b' as i32, false),
-            ("rob".to_string(), 2, 0, 1)
-        );
-
-        assert_eq!(apply_text_edit("rob", 0, true), ("ro".to_string(), 2, 1, 0));
-
-        assert_eq!(apply_text_edit("", 0, true), (String::new(), 0, 0, 0));
-
-        assert_eq!(
-            apply_text_edit("ro", 0x1b, false),
-            ("ro".to_string(), 0, 0, 0)
+            apply_text_edit_at_utf16("ro", 2, 'b' as i32, false, false),
+            ("rob".to_string(), 3)
         );
 
         assert_eq!(
-            apply_text_edit("é", 'x' as i32, false),
-            ("éx".to_string(), 1, 0, 1)
+            apply_text_edit_at_utf16("rob", 3, 0, true, false),
+            ("ro".to_string(), 2)
+        );
+
+        assert_eq!(
+            apply_text_edit_at_utf16("", 0, 0, true, false),
+            (String::new(), 0)
+        );
+
+        assert_eq!(
+            apply_text_edit_at_utf16("ro", 2, 0x1b, false, false),
+            ("ro".to_string(), 2)
+        );
+
+        assert_eq!(
+            apply_text_edit_at_utf16("é", 1, 'x' as i32, false, false),
+            ("éx".to_string(), 2)
         );
     }
 
     #[test]
-    fn android_keycode_for_maps_credential_keys() {
-        assert_eq!(android_keycode_for('a' as i32, false), Some((29, 0)));
-        assert_eq!(android_keycode_for('z' as i32, false), Some((54, 0)));
-        assert_eq!(android_keycode_for('r' as i32, false), Some((46, 0)));
+    fn host_text_edit_uses_the_selected_utf16_cursor() {
+        assert_eq!(
+            apply_text_edit_at_utf16("print()", 5, 'x' as i32, false, false),
+            ("printx()".to_string(), 6)
+        );
+        assert_eq!(
+            apply_text_edit_at_utf16("print()", 5, 0, true, false),
+            ("prin()".to_string(), 4)
+        );
+        assert_eq!(
+            apply_text_edit_at_utf16("a💫b", 3, 'x' as i32, false, false),
+            ("a💫xb".to_string(), 4)
+        );
+        assert_eq!(
+            apply_text_edit_at_utf16("a💫b", 3, 0, true, false),
+            ("ab".to_string(), 1)
+        );
+    }
 
-        assert_eq!(android_keycode_for('A' as i32, false), Some((29, 1)));
-        assert_eq!(android_keycode_for('Z' as i32, false), Some((54, 1)));
+    #[test]
+    fn select_all_replacement_sets_the_new_utf16_cursor() {
+        assert_eq!(
+            apply_text_edit_at_utf16("print('old')", 4, 'x' as i32, false, true),
+            ("x".to_string(), 1)
+        );
+        assert_eq!(
+            apply_text_edit_at_utf16("éx", 1, 0, true, true),
+            (String::new(), 0)
+        );
+    }
 
-        assert_eq!(android_keycode_for('0' as i32, false), Some((7, 0)));
-        assert_eq!(android_keycode_for('9' as i32, false), Some((16, 0)));
+    #[test]
+    fn host_text_input_uses_the_apk_non_composing_synchronization_route() {
+        let src = include_str!("framework.rs");
+        let input_start = src
+            .find("pub fn type_into_active_text_field")
+            .expect("host text-input entry point");
+        let input_end = src[input_start..]
+            .find("\nfn sync_engine_textbox")
+            .map(|offset| input_start + offset)
+            .expect("engine textbox synchronization helper");
+        let input = &src[input_start..input_end];
+        assert!(input.contains("sync_engine_textbox(vm, &new_text, cursor)"));
+        assert!(!input.contains("fire_text_watchers"));
 
-        assert_eq!(android_keycode_for(' ' as i32, false), Some((62, 0)));
-        assert_eq!(android_keycode_for(0, true), Some((67, 0)));
+        let sync_start = input_end;
+        let sync_end = src[sync_start..]
+            .find("\npub fn reflect_engine_input_methods")
+            .map(|offset| sync_start + offset)
+            .expect("input reflection helper");
+        let sync = &src[sync_start..sync_end];
+        assert!(sync.contains("syncTextboxTextAndCursorPosition2"));
+        assert!(!sync.contains("nativePassText"));
+        assert!(!sync.contains("JObject::from_raw"));
+    }
 
-        assert_eq!(android_keycode_for('@' as i32, false), None);
-        assert_eq!(android_keycode_for(0x1b, false), None);
+    #[test]
+    fn focused_textbox_geometry_is_read_once_without_reflection_marshalling() {
+        let source = include_str!("framework.rs");
+        let start = source
+            .find("pub fn query_textbox_geometry")
+            .expect("textbox geometry query");
+        let end = source[start..]
+            .find("\nextern \"system\" fn widget_native_set_text")
+            .map(|offset| start + offset)
+            .expect("textbox geometry query boundary");
+        let query = &source[start..end];
+        assert!(query.contains("if has_live_textbox_session(widget)"));
+        assert!(query.contains("env.get_field"));
+        assert!(!query.contains("getDeclaredField"));
+        assert!(!query.contains("setAccessible"));
+    }
+
+    #[test]
+    fn java_cursor_position_counts_utf16_code_units() {
+        assert_eq!(java_cursor_position("Karma"), 5);
+        assert_eq!(java_cursor_position("é"), 1);
+        assert_eq!(java_cursor_position("💫"), 2);
     }
 
     #[test]
@@ -13593,6 +13974,8 @@ mod tests {
         assert_eq!(SYSTEM_CLOCK_CLASS.to_str(), "android/os/SystemClock");
         assert_eq!(ELAPSED_REALTIME_NAME.to_str(), "elapsedRealtime");
         assert_eq!(ELAPSED_REALTIME_SIG.to_str(), "()J");
+        assert_eq!(ELAPSED_REALTIME_NANOS_NAME.to_str(), "elapsedRealtimeNanos");
+        assert_eq!(ELAPSED_REALTIME_NANOS_SIG.to_str(), "()J");
 
         assert_eq!(UPTIME_MILLIS_NAME.to_str(), "uptimeMillis");
         assert_eq!(UPTIME_MILLIS_SIG.to_str(), "()J");
@@ -14003,6 +14386,13 @@ mod tests {
             second >= first,
             "elapsedRealtime must be monotonic: {first} then {second}"
         );
+
+        let first_nanos = monotonic_nanos();
+        let second_nanos = monotonic_nanos();
+        assert!(
+            second_nanos >= first_nanos,
+            "elapsedRealtimeNanos must be monotonic: {first_nanos} then {second_nanos}"
+        );
     }
 
     #[test]
@@ -14231,6 +14621,17 @@ mod tests {
             "native_set_have_global_layout_listeners"
         );
         assert_eq!(VIEW_TREE_OBSERVER_SET_HAVE_LISTENERS_SIG.to_str(), "(Z)V");
+    }
+
+    #[test]
+    fn global_layout_listener_registration_queues_dispatch_from_main_pump() {
+        let source = include_str!("framework.rs");
+        let obsolete = ["no-op (no host ", "layout signal)"].concat();
+
+        assert!(!source.contains(&obsolete));
+        assert!(source.contains("GLOBAL_LAYOUT_OBSERVERS"));
+        assert!(source.contains("let layout_result = dispatch_pending_global_layout(env);"));
+        assert!(source.contains("dispatchOnGlobalLayout"));
     }
 
     #[test]
@@ -14576,6 +14977,13 @@ mod tests {
             WEB_VIEW_NATIVE_ADD_JAVASCRIPT_INTERFACE_SIG.to_str(),
             "(JLjava/lang/Object;Ljava/lang/String;)V"
         );
+        assert_eq!(
+            WEB_VIEW_NATIVE_CAN_GO_BACK_NAME.to_str(),
+            "native_canGoBack"
+        );
+        assert_eq!(WEB_VIEW_NATIVE_CAN_GO_BACK_SIG.to_str(), "(J)Z");
+        assert_eq!(WEB_VIEW_NATIVE_GO_BACK_NAME.to_str(), "native_goBack");
+        assert_eq!(WEB_VIEW_NATIVE_GO_BACK_SIG.to_str(), "(J)V");
 
         assert_eq!(WEB_SETTINGS_CLASS.to_str(), "android/webkit/WebSettings");
         assert_eq!(
@@ -15163,6 +15571,22 @@ mod tests {
     }
 
     #[test]
+    fn arsc_byte_cache_loads_once_and_reuses_the_backing_storage() {
+        let cache = OnceLock::new();
+        let loads = std::cell::Cell::new(0usize);
+        let first = cached_arsc_bytes(&cache, || {
+            loads.set(loads.get() + 1);
+            Some(vec![1, 2, 3, 4])
+        })
+        .expect("first load succeeds");
+        let repeated = cached_arsc_bytes(&cache, || panic!("cached table must not reload"))
+            .expect("cached load succeeds");
+
+        assert_eq!(loads.get(), 1);
+        assert!(std::ptr::eq(first.as_ptr(), repeated.as_ptr()));
+    }
+
+    #[test]
     fn arsc_bytes_for_routes_framework_package_to_framework_res_apk() {
         use std::io::Write;
 
@@ -15190,7 +15614,7 @@ mod tests {
         }
 
         let bytes = arsc_bytes_for(0x0101_0000).expect("framework id routes to a loadable table");
-        let table = crate::apk::arsc::parse_arsc(&bytes).expect("framework arsc parses");
+        let table = crate::apk::arsc::parse_arsc(bytes).expect("framework arsc parses");
         assert_eq!(
             table.package_ids(),
             vec![0x01],
@@ -15204,9 +15628,17 @@ mod tests {
             "resolved from the framework table, not the app table"
         );
 
+        let repeated = arsc_bytes_for(0x0101_0000).expect("framework table remains available");
+        let reused = std::ptr::eq(bytes.as_ptr(), repeated.as_ptr());
+
         unsafe {
             std::env::remove_var("ECLIPSE_ANDROID_FRAMEWORK_DIR");
         }
         let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            reused,
+            "resource resolution must borrow one cached table instead of cloning megabytes per attribute"
+        );
     }
 }

@@ -7,4 +7,4 @@ pub mod redact;
 pub mod shm;
 pub mod slots;
 
-pub const PROTO_VERSION: u16 = 3;
+pub const PROTO_VERSION: u16 = 4;

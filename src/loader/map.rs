@@ -640,7 +640,7 @@ impl MappedObject {
         Ok(u64::from_le_bytes(bytes.try_into().expect("8-byte slice")))
     }
 
-    pub unsafe fn image_bytes(&mut self) -> &mut [u8] {
+    pub(crate) unsafe fn image_bytes(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.span) }
     }
 }

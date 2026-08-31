@@ -236,7 +236,7 @@ pub(crate) fn iterate_with_host(
     unsafe { host_dl_iterate_phdr(Some(callback), data) }
 }
 
-pub unsafe extern "C" fn eclipse_dl_iterate_phdr(
+pub(crate) unsafe extern "C" fn eclipse_dl_iterate_phdr(
     callback: Option<DlIteratePhdrCb>,
     data: *mut c_void,
 ) -> c_int {
@@ -272,7 +272,10 @@ fn dladdr_lookup(
     Some((m.name.as_ptr(), m.base, sym))
 }
 
-pub unsafe extern "C" fn eclipse_dladdr(addr: *const c_void, info: *mut libc::Dl_info) -> c_int {
+pub(crate) unsafe extern "C" fn eclipse_dladdr(
+    addr: *const c_void,
+    info: *mut libc::Dl_info,
+) -> c_int {
     if info.is_null() {
         return 0;
     }

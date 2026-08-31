@@ -80,7 +80,7 @@ const DT_ANDROID_RELRSZ: i64 = 0x6fff_e001;
 
 const DT_ANDROID_RELRENT: i64 = 0x6fff_e003;
 
-const APS2_MAGIC: [u8; 4] = [b'A', b'P', b'S', b'2'];
+const APS2_MAGIC: [u8; 4] = *b"APS2";
 
 const RELOCATION_GROUPED_BY_INFO_FLAG: i64 = 1;
 
