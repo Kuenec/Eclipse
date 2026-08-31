@@ -277,19 +277,16 @@ fn framework_overlay_preserves_connectivity_v2_contract() {
         );
     }
 
-    let link_properties = include_str!(
-        "../tools/framework-overlay/smali/android/net/LinkProperties.smali"
-    );
+    let link_properties =
+        include_str!("../tools/framework-overlay/smali/android/net/LinkProperties.smali");
     assert!(
         link_properties.contains("getLinkAddresses()Ljava/util/List;")
             && link_properties.contains("Ljava/util/Collections;->emptyList()Ljava/util/List;"),
         "LinkProperties must expose a non-null empty address list when host addresses are unavailable"
     );
-    let link_address = include_str!("../tools/framework-overlay/smali/android/net/LinkAddress.smali");
-    for needle in [
-        "getAddress()Ljava/net/InetAddress;",
-        "getPrefixLength()I",
-    ] {
+    let link_address =
+        include_str!("../tools/framework-overlay/smali/android/net/LinkAddress.smali");
+    for needle in ["getAddress()Ljava/net/InetAddress;", "getPrefixLength()I"] {
         assert!(
             link_address.contains(needle),
             "LinkAddress lost app-referenced contract fragment {needle:?}"
