@@ -11273,6 +11273,7 @@ pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
     launcher_activity: &str,
+    android_deep_link: Option<&str>,
 ) -> Result<LifecycleProgress, FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
@@ -11282,7 +11283,7 @@ pub fn drive_application_lifecycle(
 
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            drive_lifecycle(env, apk_path, launcher_activity)
+            drive_lifecycle(env, apk_path, launcher_activity, android_deep_link)
         })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
@@ -12412,6 +12413,7 @@ fn drive_lifecycle(
     env: &mut Env,
     apk_path: &str,
     launcher_activity: &str,
+    android_deep_link: Option<&str>,
 ) -> Result<LifecycleProgress, FrameworkError> {
     register_context_natives(env, apk_path)?;
 
@@ -12531,16 +12533,29 @@ fn drive_lifecycle(
     tracing::info!("Application.onCreate reached: recipe steps 1–3 driven");
 
     let activity_class = env.find_class(ACTIVITY_CLASS)?;
-    let class_name_jstr = env.new_string(launcher_activity)?;
+    let (activity_name, activity_uri) =
+        activity_start_arguments(launcher_activity, android_deep_link);
+    let class_name_jstr = activity_name.map(|name| env.new_string(name)).transpose()?;
+    let activity_uri_jstr = activity_uri.map(|uri| env.new_string(uri)).transpose()?;
+    let null_class_name = JObject::null();
+    let null_activity_uri = JObject::null();
+    let class_name_object: &JObject = class_name_jstr
+        .as_ref()
+        .map(AsRef::as_ref)
+        .unwrap_or(&null_class_name);
+    let activity_uri_object: &JObject = activity_uri_jstr
+        .as_ref()
+        .map(AsRef::as_ref)
+        .unwrap_or(&null_activity_uri);
     let activity = checked(env, "step 4 Activity.createMainActivity", |env| {
         env.call_static_method(
             &activity_class,
             jni_str!("createMainActivity"),
             jni_sig!("(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;"),
             &[
-                JValue::Object(&class_name_jstr),
+                JValue::Object(class_name_object),
                 JValue::Long(window_handle),
-                JValue::Object(&JObject::null()),
+                JValue::Object(activity_uri_object),
             ],
         )?
         .l()
@@ -12550,7 +12565,7 @@ fn drive_lifecycle(
 
     call_activity_on_create(env, &activity, "step 5 Activity.onCreate")?;
     tracing::info!(
-        activity = launcher_activity,
+        activity = activity_name.unwrap_or("<resolved ACTION_VIEW activity>"),
         "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
     );
 
@@ -12560,10 +12575,20 @@ fn drive_lifecycle(
 
     call_activity_on_resume(env, &activity, "step 7 Activity.onResume")?;
     tracing::info!(
-        activity = launcher_activity,
+        activity = activity_name.unwrap_or("<resolved ACTION_VIEW activity>"),
         "Activity resumed: recipe steps 1–7 driven (launcher Activity onStart + onResume)"
     );
     Ok(LifecycleProgress::ActivityResumed)
+}
+
+fn activity_start_arguments<'a>(
+    launcher_activity: &'a str,
+    android_deep_link: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    match android_deep_link {
+        Some(uri) => (None, Some(uri)),
+        None => (Some(launcher_activity), None),
+    }
 }
 
 fn checked<'local, T>(
@@ -12890,6 +12915,21 @@ mod tests {
     use super::*;
 
     static TEXTBOX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn deep_link_launch_uses_manifest_resolution_instead_of_the_launcher_activity() {
+        let launcher = "com.roblox.client.startup.ActivitySplash";
+        let uri = "roblox://placeId=90441122676618";
+
+        assert_eq!(
+            activity_start_arguments(launcher, None),
+            (Some(launcher), None)
+        );
+        assert_eq!(
+            activity_start_arguments(launcher, Some(uri)),
+            (None, Some(uri))
+        );
+    }
 
     #[test]
     fn host_shutdown_destroys_engine_surface_before_window_teardown() {
