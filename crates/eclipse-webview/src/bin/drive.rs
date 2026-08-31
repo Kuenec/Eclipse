@@ -1,4 +1,3 @@
-
 #[allow(dead_code)]
 #[path = "../shared.rs"]
 mod shared;
@@ -383,7 +382,6 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                 slot: _,
                 seq,
             } if view == VIEW => {
-
                 if d.buffer
                     .as_ref()
                     .is_some_and(|b| b.generation == generation)
@@ -565,6 +563,7 @@ fn name_of(msg: &HelperMsg) -> &'static str {
         HelperMsg::CookieSetResult { .. } => "CookieSetResult",
         HelperMsg::CookieFlushDone { .. } => "CookieFlushDone",
         HelperMsg::CookiesClearDone { .. } => "CookiesClearDone",
+        HelperMsg::NavigationState { .. } => "NavigationState",
     }
 }
 

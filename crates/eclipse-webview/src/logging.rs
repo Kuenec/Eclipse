@@ -1,11 +1,9 @@
-
 use crate::shared::redact;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct RedactedTarget(String);
 
 impl RedactedTarget {
-
     pub fn from_raw_url(url: &str) -> Self {
         Self(redact::url_scheme_and_host_for_log(url))
     }
@@ -55,7 +53,6 @@ mod tests {
 
     #[test]
     fn helper_log_lines_redact_urls_to_scheme_and_host() {
-
         let target =
             RedactedTarget::from_raw_url("https://apps.roblox.com/challenge/verify?token=SECRET");
         let line = format_load_event("started", 42, &target);

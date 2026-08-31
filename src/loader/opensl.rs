@@ -1556,7 +1556,7 @@ pub enum AudioHostError {
     PlayFailed,
 }
 
-pub unsafe extern "C" fn eclipse_sl_create_engine(
+pub(crate) unsafe extern "C" fn eclipse_sl_create_engine(
     p_engine: *mut c_void,
     _num_options: u32,
     _p_engine_options: *const c_void,

@@ -1,4 +1,3 @@
-
 mod engine;
 mod logging;
 
@@ -55,7 +54,6 @@ fn parse_ipc_fd<I: Iterator<Item = String>>(args: I) -> Result<RawFd, String> {
                 }
             }
         } else if arg == "--ipc-fd" {
-
             return Err("--ipc-fd requires the --ipc-fd=<fd> form".to_string());
         }
     }
@@ -70,14 +68,12 @@ fn parse_ozone_override<I: Iterator<Item = String>>(args: I) -> Option<String> {
 }
 
 fn probe_userns() -> bool {
-
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
             return false;
         }
         if pid == 0 {
-
             let ok =
                 libc::unshare(libc::CLONE_NEWUSER) == 0 && libc::unshare(libc::CLONE_NEWPID) == 0;
             libc::_exit(if ok { 0 } else { 1 });
@@ -324,7 +320,6 @@ wrap_render_process_handler! {
 }
 
 impl HelperRenderProcessHandler {
-
     fn bridge_diag_on(&self) -> bool {
         self.bridge_diag.is_some()
     }
@@ -537,7 +532,6 @@ fn write_helper_msg(stream: &UnixStream, msg: &HelperMsg) -> std::io::Result<()>
     match msg.encode() {
         Ok(bytes) => (&mut &*stream).write_all(&bytes),
         Err(e) => {
-
             log::error(COMPONENT, &format!("outbound frame encode failed: {e}"));
             Ok(())
         }
@@ -545,7 +539,6 @@ fn write_helper_msg(stream: &UnixStream, msg: &HelperMsg) -> std::io::Result<()>
 }
 
 fn set_cloexec(stream: &UnixStream) {
-
     let ok = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     if ok != 0 {
         log::warn(COMPONENT, "could not set FD_CLOEXEC on the control socket");
@@ -553,7 +546,6 @@ fn set_cloexec(stream: &UnixStream) {
 }
 
 fn main() -> ExitCode {
-
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     let args = Args::new();
@@ -588,7 +580,6 @@ fn main() -> ExitCode {
     let render_handler = HelperRenderProcessHandler::new(
         RendererSideRouter::new(MessageRouterConfig::default()),
         inventory.clone(),
-
         bridge_diag.then(|| BridgeDiagLoadHandler::new(inventory)),
     );
     let context_initialized: Arc<AtomicBool> = Arc::default();
@@ -605,7 +596,6 @@ fn main() -> ExitCode {
         std::ptr::null_mut(),
     );
     if !is_browser_process {
-
         return ExitCode::from(ret.clamp(0, 255) as u8);
     }
     if ret != -1 {
@@ -638,7 +628,6 @@ fn main() -> ExitCode {
     match proto::read_consumer_msg(&mut &stream) {
         Ok(ConsumerMsg::Hello { version }) if version == shared::PROTO_VERSION => {}
         Ok(ConsumerMsg::Hello { version }) => {
-
             let _ = write_helper_msg(
                 &stream,
                 &HelperMsg::HelloAck {
@@ -938,7 +927,6 @@ fn main() -> ExitCode {
             let result = match out {
                 Out::Msg(msg) => write_helper_msg(&writer_stream, &msg),
                 Out::MsgWithFd(msg, fd) => write_helper_msg(&writer_stream, &msg).and_then(|()| {
-
                     fdpass::send_fd_with_sentinel(&writer_stream, fd.as_fd())
                         .map_err(|e| std::io::Error::other(e.to_string()))
                 }),
@@ -969,13 +957,11 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(ProtoError::Eof) => {
-
                     log::warn(COMPONENT, "consumer closed the control socket (EOF)");
                     let _ = cmd_tx.send(Command::Dead);
                     break;
                 }
                 Err(e) => {
-
                     log::error(COMPONENT, &format!("malformed control stream: {e}"));
                     let _ = cmd_tx.send(Command::Dead);
                     break;
@@ -1041,7 +1027,6 @@ mod tests {
 
     #[test]
     fn ipc_fd_argument_is_required_and_validated() {
-
         let args = |v: &[&str]| {
             v.iter()
                 .map(|s| s.to_string())
@@ -1073,7 +1058,6 @@ mod tests {
 
     #[test]
     fn generate_stub_js_emits_the_promise_shape_guarded_by_cefquery_and_escapes_identifiers() {
-
         let js = generate_stub_js("Iface\"x", &["m\\1".to_string()], false);
         assert!(
             js.contains("window.cefQuery"),
@@ -1098,7 +1082,6 @@ mod tests {
 
     #[test]
     fn generate_stub_js_gate_off_is_byte_identical_to_the_pre_diag_stub() {
-
         let js = generate_stub_js(
             "__globalRobloxAndroidBridge__",
             &["executeRoblox".to_string()],
@@ -1128,7 +1111,6 @@ mod tests {
 
     #[test]
     fn generate_stub_js_gate_on_traces_the_invocation_and_never_binds_arg_values() {
-
         let js = generate_stub_js("Iface\"x", &["m\\1".to_string()], true);
 
         assert!(js.contains(STUB_TRACE_PREFIX), "{js}");
@@ -1192,7 +1174,6 @@ mod tests {
 
     #[test]
     fn build_bridge_introspection_js_reads_only_our_inventory_and_never_scans_the_page() {
-
         let js = build_bridge_introspection_js(&["Iface\"x".to_string(), "B\\1".to_string()]);
 
         assert!(
@@ -1230,7 +1211,6 @@ mod tests {
 
     #[test]
     fn format_bridge_diag_line_keeps_the_frame_url_redacted() {
-
         let frame =
             RedactedTarget::from_raw_url("https://apps.roblox.com/challenge?token=SECRETTOKEN");
         let line = format_bridge_diag_line(true, &frame, true, "{\"cefQuery\":\"function\"}");
@@ -1249,7 +1229,6 @@ mod tests {
 
     #[test]
     fn format_stub_apply_line_shape_is_counts_only() {
-
         assert_eq!(
             format_stub_apply_line("sync", 1, 3),
             "bridge stubs applied mode=sync ifaces=1 methods=3"
@@ -1262,7 +1241,6 @@ mod tests {
 
     #[test]
     fn format_context_ready_line_binds_the_frame_kind_and_never_a_url() {
-
         assert_eq!(
             format_context_ready_line(true),
             "context ready (requested bridge inventory) main_frame=1"
@@ -1289,7 +1267,6 @@ mod tests {
 
     #[test]
     fn suid_sandbox_stat_predicate_byte_matches_chromiums_acceptance() {
-
         assert!(suid_sandbox_stat_ok(true, 0, 0o104755));
 
         assert!(!suid_sandbox_stat_ok(true, 0, 0o104750));

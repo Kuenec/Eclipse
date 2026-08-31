@@ -497,7 +497,11 @@ extern "C" {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn eclipse_liblog_emit(prio: c_int, tag: *const c_char, msg: *const c_char) {
+pub(crate) unsafe extern "C" fn eclipse_liblog_emit(
+    prio: c_int,
+    tag: *const c_char,
+    msg: *const c_char,
+) {
     let tag = unsafe { cstr_opt(tag) }.unwrap_or_default();
 
     let msg = unsafe { cstr_opt(msg) }.unwrap_or_default();
@@ -1243,7 +1247,7 @@ fn describe_code_address(addr: u64) -> Option<String> {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn eclipse_sigaltstack_record(
+pub(crate) unsafe extern "C" fn eclipse_sigaltstack_record(
     ss: *const libc::stack_t,
     old_ss: *mut libc::stack_t,
     caller: *const c_void,

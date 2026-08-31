@@ -180,9 +180,9 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
         );
     }
     assert!(
-        text.contains("bound=5"),
-        "the WebView native registration count regressed (expected the live bound=5 line — the M4 \
-         evaluateJavascript + addJavascriptInterface natives).\n{text}"
+        text.contains("bound=7"),
+        "the WebView native registration count regressed (expected the live bound=7 line — load, \
+         history, evaluateJavascript, and addJavascriptInterface natives).\n{text}"
     );
 
     for needle in [
@@ -235,8 +235,113 @@ fn framework_overlay_preserves_location_manager_provider_query_contract() {
 }
 
 #[test]
+fn framework_overlay_preserves_key_generation_quote_contract() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source_path =
+        root.join("tools/framework-overlay/src/android/security/keystore/KeyGenParameterSpec.java");
+    let source = std::fs::read_to_string(&source_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", source_path.display()));
+    for needle in [
+        "implements AlgorithmParameterSpec",
+        "setAlgorithmParameterSpec(AlgorithmParameterSpec spec)",
+        "setDigests(String... digests)",
+        "setAttestationChallenge(byte[] attestationChallenge)",
+        "setKeyValidityStart(Date keyValidityStart)",
+        "setIsStrongBoxBacked(boolean strongBoxBacked)",
+        "setCertificateSubject(X500Principal certificateSubject)",
+        "setCertificateSerialNumber(BigInteger certificateSerialNumber)",
+        "setCertificateNotBefore(Date certificateNotBefore)",
+        "setCertificateNotAfter(Date certificateNotAfter)",
+        "getAlgorithmParameterSpec()",
+        "getAttestationChallenge()",
+        "digests.clone()",
+        "cloneBytes(builder.attestationChallenge)",
+        "return cloneBytes(attestationChallenge);",
+    ] {
+        assert!(
+            source.contains(needle),
+            "KeyGenParameterSpec overlay lost app-used contract fragment {needle:?}"
+        );
+    }
+
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "KeyGenParameterSpec.java",
+        "android/security/keystore/KeyGenParameterSpec*.class",
+        "KeyGenParameterSpecProbe.java",
+        "\"$JAVA\" -cp \"$work/classes:$work/keygen-probe/classes\"",
+        "keygen-parameter-spec-ok",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework generator lost the key-generation runtime guard {needle:?}"
+        );
+    }
+    assert!(
+        !generator.contains("--output=\"$work/keygen-probe/probe.jar\""),
+        "the key-generation semantic probe must not use the raw Dalvik shutdown path; exact DEX \
+         descriptors are verified independently"
+    );
+    for needle in [
+        "boot_class_path_locations",
+        "/system/framework/$art_jar",
+        "date_time_boot_class_path=\"$boot_class_path:$work/date-time-probe/probe.jar\"",
+        "date_time_boot_class_path_locations=\"$boot_class_path_locations:/system/framework/probe.jar\"",
+        "-Ximage-compiler-option --no-generate-debug-info",
+        "-Ximage-compiler-option --no-generate-mini-debug-info",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework verification lost its warning-free ART probe fragment {needle:?}"
+        );
+    }
+    assert!(
+        !generator.contains("        --release \\")
+            && !generator.contains("-cp \"$work/date-time-probe/probe.jar\""),
+        "the old ART probe must retain compatible D8 output and avoid a separately compiled app \
+         dex path"
+    );
+}
+
+#[test]
+fn framework_overlay_preserves_webview_back_history_contract() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        ".method public canGoBack()Z",
+        "->native_canGoBack(J)Z",
+        ".method public goBack()V",
+        "->native_goBack(J)V",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost WebView history contract fragment {needle:?}; Roblox Back would throw or remain inside Chromium"
+        );
+    }
+}
+
+#[test]
+fn framework_overlay_avoids_caught_wolfssl_null_store_signal() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "WolfSSLKeyX509.smali",
+        "if-nez v2, :eclipse_wolf_has_key_store",
+        ":eclipse_wolf_has_key_store",
+        "built wolfssljni-hostdex.jar does not guard its nullable key store",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost the WolfSSL nullable-key-store guard fragment {needle:?}; ART would again implement the caught null dereference as SIGSEGV"
+        );
+    }
+}
+
+#[test]
 fn framework_overlay_preserves_activity_manager_memory_contract() {
     let source = include_str!("../tools/framework-overlay/src/android/app/ActivityManager.java");
+    let source_without_whitespace: String = source
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
     for needle in [
         "private static native void native_fillMemoryInfo(MemoryInfo outInfo);",
         "native_fillMemoryInfo(outInfo);",
@@ -247,8 +352,12 @@ fn framework_overlay_preserves_activity_manager_memory_contract() {
         "private static native boolean native_isLowRamDevice();",
         "public boolean isLowRamDevice() {return native_isLowRamDevice();}",
     ] {
+        let needle_without_whitespace: String = needle
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
         assert!(
-            source.contains(needle),
+            source_without_whitespace.contains(&needle_without_whitespace),
             "framework overlay lost ActivityManager memory contract fragment {needle:?}"
         );
     }

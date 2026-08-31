@@ -84,6 +84,8 @@ struct GameWindow<'vm> {
 
     runtime_shutdown_started: bool,
 
+    modifiers: winit::keyboard::ModifiersState,
+
     published_display_refresh_profile: Option<DisplayRefreshProfile>,
 
     next_display_refresh_poll: std::time::Instant,
@@ -355,10 +357,19 @@ impl ApplicationHandler for GameWindow<'_> {
                 ElementState::Released => self.handle_primary_release(),
             },
 
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+
             WindowEvent::KeyboardInput { event, .. } if self.handed_off => {
                 let wv = crate::webview::client::active_view();
                 if wv != 0 {
-                    route_key_to_webview(wv, &event);
+                    match active_webview_key_route(&event.logical_key) {
+                        ActiveWebViewKeyRoute::ActivityBack => {
+                            if event.state == ElementState::Pressed {
+                                self.activity_back();
+                            }
+                        }
+                        ActiveWebViewKeyRoute::Chromium => route_key_to_webview(wv, &event),
+                    }
                 } else {
                     self.engine_key(&event);
                 }
@@ -485,6 +496,44 @@ fn relative_point_in(rect: (i32, i32, u32, u32), px: f64, py: f64) -> (i32, i32,
     (rx, ry, inside)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveWebViewKeyRoute {
+    ActivityBack,
+    Chromium,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineKeyRoute {
+    TextEdit,
+    Consume,
+    Engine,
+}
+
+fn engine_key_route(
+    active_text_field: bool,
+    pressed: bool,
+    editable: bool,
+    menu_toggle: bool,
+) -> EngineKeyRoute {
+    if active_text_field && !menu_toggle {
+        if pressed && editable {
+            EngineKeyRoute::TextEdit
+        } else {
+            EngineKeyRoute::Consume
+        }
+    } else {
+        EngineKeyRoute::Engine
+    }
+}
+
+fn active_webview_key_route(key: &winit::keyboard::Key) -> ActiveWebViewKeyRoute {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Named(NamedKey::Escape) => ActiveWebViewKeyRoute::ActivityBack,
+        _ => ActiveWebViewKeyRoute::Chromium,
+    }
+}
+
 fn route_key_to_webview(view: i64, event: &winit::event::KeyEvent) {
     use winit::keyboard::{Key, NamedKey};
     if event.state != ElementState::Pressed {
@@ -521,6 +570,18 @@ fn route_key_to_webview(view: i64, event: &winit::event::KeyEvent) {
 }
 
 impl GameWindow<'_> {
+    fn activity_back(&self) {
+        let Some(vm) = self.vm else {
+            tracing::warn!("active WebView Back input has no JavaVM");
+            return;
+        };
+        match crate::framework::dispatch_back_to_active_activity(vm) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("active WebView Back input has no live Android Activity"),
+            Err(error) => tracing::warn!(%error, "active WebView Back dispatch failed"),
+        }
+    }
+
     fn publish_engine_display_refresh_rates(&mut self) {
         let Some(profile) = self.window.as_ref().and_then(display_refresh_profile) else {
             tracing::debug!("host monitor refresh rates unavailable; keeping Android fallback");
@@ -666,8 +727,8 @@ impl GameWindow<'_> {
         let Some(vm) = self.vm else { return };
         let Some((px, py)) = self.cursor else { return };
 
-        if crate::framework::clear_active_text_field() {
-            tracing::info!("engine surface press cleared the active text field");
+        if crate::framework::prepare_text_field_pointer_press((px, py)) {
+            tracing::debug!("engine surface press queued active text field revalidation");
         }
         if self.touch_mode == crate::config::TouchMode::Off {
             if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, true, 0) {
@@ -789,16 +850,60 @@ impl GameWindow<'_> {
             .unwrap_or(0);
         let Some(vm) = self.vm else { return };
 
-        if pressed {
-            let backspace = key_code == 67;
-            let printable =
-                unicode != 0 && char::from_u32(unicode as u32).is_some_and(|c| !c.is_control());
-            if (printable || backspace)
-                && crate::framework::type_into_active_text_field(vm, unicode, backspace)
+        let active_text_field = crate::framework::active_text_field() != 0;
+        let select_all = active_text_field
+            && self.modifiers.control_key()
+            && matches!(
+                &event.logical_key,
+                winit::keyboard::Key::Character(character)
+                    if character.eq_ignore_ascii_case("a")
+            );
+        if pressed && select_all {
+            crate::framework::select_all_active_text_field();
+        }
+
+        let command_modifier =
+            self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
+        let backspace = key_code == 67 && !command_modifier;
+        let line_break = !command_modifier
+            && matches!(
+                event.logical_key,
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter)
+            )
+            && crate::framework::active_text_field_accepts_line_breaks();
+        let tab = !command_modifier
+            && matches!(
+                event.logical_key,
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab)
+            );
+        let printable = !command_modifier
+            && unicode != 0
+            && char::from_u32(unicode as u32).is_some_and(|c| !c.is_control());
+        let edit_unicode = if line_break {
+            '\n' as i32
+        } else if tab {
+            '\t' as i32
+        } else {
+            unicode
+        };
+        let menu_toggle = matches!(
+            event.logical_key,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Insert)
+        );
+        match engine_key_route(
+            active_text_field,
+            pressed,
+            printable || backspace || line_break || tab,
+            menu_toggle,
+        ) {
+            EngineKeyRoute::TextEdit
+                if crate::framework::type_into_active_text_field(vm, edit_unicode, backspace) =>
             {
                 tracing::debug!(pressed, "engine key → active text field (typed)");
                 return;
             }
+            EngineKeyRoute::Consume => return,
+            EngineKeyRoute::TextEdit | EngineKeyRoute::Engine => {}
         }
         let action = if pressed {
             crate::framework::KeyAction::Down
@@ -1106,6 +1211,7 @@ pub fn run_windowed(
         engine_reflect_done: false,
         webview_pointer_down: false,
         runtime_shutdown_started: false,
+        modifiers: winit::keyboard::ModifiersState::default(),
         published_display_refresh_profile: None,
         next_display_refresh_poll: std::time::Instant::now(),
     };
@@ -1640,7 +1746,8 @@ fn winit_keycode(key: &winit::keyboard::Key) -> Option<i32> {
         Key::Named(NamedKey::Backspace) => 67,
         Key::Named(NamedKey::Enter) => 66,
         Key::Named(NamedKey::Tab) => 61,
-        Key::Named(NamedKey::Escape) => 111,
+        Key::Named(NamedKey::Escape) => 4,
+        Key::Named(NamedKey::Insert) => 124,
         Key::Named(NamedKey::Delete) => 112,
         Key::Named(NamedKey::ArrowLeft) => 21,
         Key::Named(NamedKey::ArrowRight) => 22,
@@ -5021,6 +5128,54 @@ mod tests {
         assert_eq!(winit_keycode(&Key::Character("#".into())), Some(0));
 
         assert_eq!(winit_keycode(&Key::Named(NamedKey::F1)), None);
+    }
+
+    #[test]
+    fn escape_maps_to_android_back_navigation() {
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(winit_keycode(&Key::Named(NamedKey::Escape)), Some(4));
+    }
+
+    #[test]
+    fn insert_maps_to_android_insert_for_internal_menu_toggle() {
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(winit_keycode(&Key::Named(NamedKey::Insert)), Some(124));
+    }
+
+    #[test]
+    fn escape_bypasses_chromium_for_activity_back_navigation() {
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(
+            active_webview_key_route(&Key::Named(NamedKey::Escape)),
+            ActiveWebViewKeyRoute::ActivityBack
+        );
+    }
+
+    #[test]
+    fn focused_text_field_consumes_both_key_edges_and_non_text_keys() {
+        assert_eq!(
+            engine_key_route(true, true, true, false),
+            EngineKeyRoute::TextEdit
+        );
+        assert_eq!(
+            engine_key_route(true, false, true, false),
+            EngineKeyRoute::Consume
+        );
+        assert_eq!(
+            engine_key_route(true, true, false, false),
+            EngineKeyRoute::Consume
+        );
+        assert_eq!(
+            engine_key_route(true, true, false, true),
+            EngineKeyRoute::Engine
+        );
+        assert_eq!(
+            engine_key_route(false, true, true, false),
+            EngineKeyRoute::Engine
+        );
     }
 
     #[test]

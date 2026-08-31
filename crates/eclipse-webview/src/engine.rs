@@ -1,4 +1,3 @@
-
 use crate::logging::{self, RedactedTarget};
 use crate::shared::proto::{BridgeMethod, Console, ConsumerMsg, CookieEntry, HelperMsg};
 use crate::shared::shm;
@@ -149,7 +148,6 @@ pub fn select_ozone(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxMode {
-
     Userns,
 
     Suid,
@@ -262,7 +260,6 @@ pub fn classify_cookie_set_rejection(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderPathVerdict {
-
     GpuCandidates(Vec<String>),
 
     SoftwareFallback,
@@ -399,7 +396,6 @@ struct EngineState {
 type Shared = Arc<Mutex<EngineState>>;
 
 fn lock(state: &Shared) -> std::sync::MutexGuard<'_, EngineState> {
-
     match state.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -465,7 +461,6 @@ impl Engine {
     pub fn handle(&self, msg: ConsumerMsg) {
         match msg {
             ConsumerMsg::Hello { .. } => {
-
                 logging::error(
                     COMPONENT,
                     "protocol violation: repeated Hello — shutting down",
@@ -492,6 +487,17 @@ impl Engine {
                 encoding: _,
                 history_url: _,
             } => self.load_data_with_base_url(view, base_url, data, mime),
+            ConsumerMsg::GoBack { view } => match self.browser_of(view) {
+                Some(browser) if browser.can_go_back() != 0 => browser.go_back(),
+                Some(_) => logging::warn(
+                    COMPONENT,
+                    &format!("goBack view={view}: browser has no back history (no-op)"),
+                ),
+                None => logging::warn(
+                    COMPONENT,
+                    &format!("goBack view={view}: no live browser (no-op)"),
+                ),
+            },
             ConsumerMsg::MouseMove {
                 view,
                 x,
@@ -547,7 +553,6 @@ impl Engine {
                 character,
                 modifiers,
             } => self.with_host(view, |host| {
-
                 host.set_focus(1);
                 let event = KeyEvent {
                     type_: match kind {
@@ -568,7 +573,6 @@ impl Engine {
                 let browser = self.browser_of(view);
                 match browser.as_ref().and_then(|b| b.main_frame()) {
                     Some(frame) => {
-
                         frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
                     }
                     None => logging::warn(
@@ -605,7 +609,6 @@ impl Engine {
             } => {
                 let mut st = lock(&self.state);
                 if let Some(v) = st.views.get_mut(&view) {
-
                     if let Some(publish) = v.tracker.on_ack(generation, seq) {
                         self.out.send(HelperMsg::FrameReady {
                             view,
@@ -770,7 +773,6 @@ impl Engine {
         let url_cef = CefString::from(url);
         let mut callback = SetCookieResultCallback::new(request_id, self.out.clone());
         if manager.set_cookie(Some(&url_cef), Some(&cookie), Some(&mut callback)) != 1 {
-
             let predicate = classify_cookie_set_rejection(url, name, value, domain, path, secure);
             logging::warn(
                 COMPONENT,
@@ -793,7 +795,6 @@ impl Engine {
     pub fn begin_shutdown(&self, exit_code: i32) {
         let mut st = lock(&self.state);
         if st.closing_all {
-
             if exit_code != 0 && st.exit_code == 0 {
                 st.exit_code = exit_code;
             }
@@ -867,7 +868,6 @@ impl Engine {
         }
         for (request_id, cookies, finished) in due {
             if !finished {
-
                 logging::warn(
                     COMPONENT,
                     &format!(
@@ -884,7 +884,6 @@ impl Engine {
         }
         for (request_id, removed, finished) in clear_due {
             if !finished {
-
                 logging::warn(
                     COMPONENT,
                     &format!(
@@ -1114,7 +1113,6 @@ impl Engine {
                 Some(v) => match v.browser.clone() {
                     Some(b) => Some(b),
                     None => {
-
                         st.views.remove(&view);
                         None
                     }
@@ -1254,7 +1252,6 @@ impl Engine {
         let mut visitor = ListCookieVisitor::new(acc.clone());
         let url = CefString::from(url);
         if manager.visit_url_cookies(Some(&url), 1, Some(&mut visitor)) != 1 {
-
             self.out.send(HelperMsg::CookieList {
                 request_id,
                 cookies: Vec::new(),
@@ -1354,6 +1351,19 @@ wrap_load_handler! {
     }
 
     impl LoadHandler {
+        fn on_loading_state_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _is_loading: c_int,
+            can_go_back: c_int,
+            _can_go_forward: c_int,
+        ) {
+            self.out.send(HelperMsg::NavigationState {
+                view: self.view,
+                can_go_back: can_go_back != 0,
+            });
+        }
+
         fn on_load_start(
             &self,
             _browser: Option<&mut Browser>,
@@ -2035,7 +2045,6 @@ mod tests {
 
     #[test]
     fn ozone_selection_is_explicit_and_never_auto() {
-
         assert_eq!(
             select_ozone(Some("wayland"), None, Some(":0")).as_deref(),
             Ok("wayland")
@@ -2067,7 +2076,6 @@ mod tests {
 
     #[test]
     fn sandbox_mode_selection_prefers_userns_then_suid_then_policy() {
-
         use SandboxMode::*;
         assert_eq!(select_sandbox_mode(true, true, true), Ok(Userns));
         assert_eq!(select_sandbox_mode(true, true, false), Ok(Userns));
@@ -2095,7 +2103,6 @@ mod tests {
 
     #[test]
     fn apply_sandbox_mode_flips_no_sandbox_only_for_degraded() {
-
         for (mode, expected) in [
             (SandboxMode::Userns, 0),
             (SandboxMode::Suid, 0),
@@ -2109,7 +2116,6 @@ mod tests {
 
     #[test]
     fn switch_strip_keeps_the_ban_except_the_helpers_own_degradation() {
-
         assert!(switch_should_be_stripped("enable-logging", false));
         assert!(switch_should_be_stripped("enable-logging", true));
         assert!(switch_should_be_stripped("no-sandbox", false));
@@ -2124,7 +2130,6 @@ mod tests {
 
     #[test]
     fn render_path_classification_never_gates_and_names_the_devices() {
-
         assert_eq!(
             classify_render_path(&[], false),
             RenderPathVerdict::SoftwareFallback
@@ -2149,7 +2154,6 @@ mod tests {
 
     #[test]
     fn engine_settings_keep_engine_logging_disabled() {
-
         let settings = build_settings();
         assert_eq!(settings.log_severity, LogSeverity::DISABLE);
         assert_eq!(settings.no_sandbox, 0, "the sandbox must stay ON");
@@ -2166,7 +2170,6 @@ mod tests {
 
     #[test]
     fn build_settings_sets_the_eclipse_fallback_user_agent() {
-
         assert!(ECLIPSE_USER_AGENT.contains("Chrome/149"));
         assert!(ECLIPSE_USER_AGENT.contains("Eclipse-WebView"));
         assert!(ECLIPSE_USER_AGENT.contains("X11; Linux x86_64"));
@@ -2178,7 +2181,6 @@ mod tests {
 
     #[test]
     fn effective_user_agent_prefers_the_apps_ua_and_falls_back_to_the_eclipse_literal() {
-
         assert_eq!(effective_user_agent(None, None), ECLIPSE_USER_AGENT);
         assert_eq!(effective_user_agent(Some(""), Some("")), ECLIPSE_USER_AGENT);
 
@@ -2233,7 +2235,6 @@ mod tests {
 
     #[test]
     fn persistent_profile_path_is_an_absolute_private_child_and_restores_session_cookies() {
-
         let paths = persistent_profile_paths(Path::new("/tmp/eclipse-test-profile"))
             .expect("absolute profile root");
         assert_eq!(paths.root, "/tmp/eclipse-test-profile");
@@ -2249,7 +2250,6 @@ mod tests {
 
     #[test]
     fn remove_session_cookies_deletes_only_cookies_without_an_expiry() {
-
         assert!(session_cookie_should_delete(0));
         assert!(!session_cookie_should_delete(1));
         assert!(!session_cookie_should_delete(-1));
@@ -2265,7 +2265,6 @@ mod tests {
 
     #[test]
     fn console_text_diag_gate_is_exact_match_one_only() {
-
         assert!(console_text_diag_enabled(Some("1")));
         assert!(!console_text_diag_enabled(Some("")));
         assert!(!console_text_diag_enabled(Some("0")));
@@ -2276,7 +2275,6 @@ mod tests {
 
     #[test]
     fn bridge_diag_gate_is_exact_match_one_only() {
-
         assert!(bridge_diag_enabled(Some("1")));
         assert!(!bridge_diag_enabled(Some("")));
         assert!(!bridge_diag_enabled(Some("0")));
@@ -2287,7 +2285,6 @@ mod tests {
 
     #[test]
     fn format_console_text_line_keeps_the_source_redacted_even_in_diag_mode() {
-
         let source =
             RedactedTarget::from_raw_url("https://apps.roblox.com/challenge?token=SECRETTOKEN");
         let line = format_console_text_line(42, 2, &source, 17, "page said hello");
@@ -2300,7 +2297,6 @@ mod tests {
 
     #[test]
     fn classify_cookie_set_rejection_names_each_documented_predicate_in_order() {
-
         use classify_cookie_set_rejection as c;
 
         assert_eq!(
@@ -2364,7 +2360,6 @@ mod tests {
 
     #[test]
     fn classify_cookie_set_rejection_never_embeds_the_cookie_name_or_value() {
-
         for reason in [
             classify_cookie_set_rejection(
                 "https://www.roblox.com",
@@ -2393,7 +2388,6 @@ mod tests {
 
     #[test]
     fn load_state_suppresses_the_about_blank_bootstrap_but_never_driven_loads() {
-
         assert!(suppress_load_state(None, "about:blank"));
         assert!(suppress_load_state(None, "https://www.roblox.com/"));
 
