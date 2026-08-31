@@ -76,6 +76,16 @@ Then inspect the CLI and launch a user-supplied APK:
 ./target/release/eclipse run /path/to/Roblox-x86_64.apk
 ```
 
+To make Roblox's website Play button launch Eclipse on Linux, register the
+`roblox-player:` handler once while supplying your APK:
+
+```bash
+./target/release/eclipse install-url-handler /path/to/Roblox-x86_64.apk
+```
+
+The browser URL is parsed by Eclipse, its authentication ticket is discarded,
+and only the validated Roblox place ID is delivered to the Android client.
+
 Eclipse can also fetch from a URL you explicitly configure. It never ships, mirrors or hard-codes a Roblox APK source.
 
 ## Configuration

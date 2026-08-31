@@ -1,5 +1,8 @@
 use std::process::ExitCode;
 
+mod browser_launch;
+mod desktop_integration;
+
 const CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV: &str = "ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE";
 const CLIENT_SETTINGS_PATH_ENV: &str = "ECLIPSE_CLIENT_APP_SETTINGS_PATH";
 const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
@@ -15,6 +18,8 @@ COMMANDS:
     run [APK]  Parse the APK, boot the ART VM (Roblox on the classpath), open the window.
                With no APK and `auto_fetch_missing`+`apk_url` set (or ECLIPSE_APK_URL),
                auto-downloads from your configured source first.
+    install-url-handler [APK]
+               Register Eclipse for browser Play clicks and remember the Roblox APK.
     fetch      Report the latest upstream Roblox version + download the APK from your
                configured source (config `apk_url` / ECLIPSE_APK_URL) into the cache.
     config     Show effective configuration and its path
@@ -32,8 +37,15 @@ STATUS:
 ";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("run"))
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let args = match normalize_browser_launch(raw_args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("eclipse browser launch: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if is_android_run_command(args.first().map(String::as_str))
         && std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV).is_none()
     {
         if let Err(error) = install_client_settings_and_reexec(&args) {
@@ -42,10 +54,9 @@ fn main() -> ExitCode {
         }
         unreachable!("a successful settings-path handoff replaces this process");
     }
-    if matches!(
-        args.first().map(String::as_str),
-        Some("run") | Some("__webview-test")
-    ) {
+    if is_android_run_command(args.first().map(String::as_str))
+        || matches!(args.first().map(String::as_str), Some("__webview-test"))
+    {
         if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
             eprintln!("eclipse ART startup: {error}");
             return ExitCode::FAILURE;
@@ -65,7 +76,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("run") => {
-            let status = match run_apk(args.get(1).map(String::as_str)) {
+            let status = match parse_run_apk_path(&args[1..])
+                .and_then(|apk_path| run_apk(apk_path, None).map_err(|error| error.to_string()))
+            {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("eclipse run: {e}");
@@ -74,6 +87,25 @@ fn main() -> ExitCode {
             };
             finish_android_process(status)
         }
+        Some("__run-browser-place") => {
+            let status = match parse_internal_place_id(&args[1..]).and_then(|place_id| {
+                run_apk(None, Some(place_id)).map_err(|error| error.to_string())
+            }) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("eclipse browser launch: {error}");
+                    1
+                }
+            };
+            finish_android_process(status)
+        }
+        Some("install-url-handler") => match install_url_handler_command(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("eclipse install-url-handler: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some("config") => match show_config() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -158,11 +190,46 @@ fn main() -> ExitCode {
             print!("{HELP}");
             ExitCode::SUCCESS
         }
-        Some(other) => {
-            eprintln!("unknown command: {other}\n\n{HELP}");
+        Some(_) => {
+            eprintln!("unknown command\n\n{HELP}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn is_android_run_command(command: Option<&str>) -> bool {
+    matches!(command, Some("run") | Some("__run-browser-place"))
+}
+
+fn normalize_browser_launch(mut arguments: Vec<String>) -> Result<Vec<String>, String> {
+    if !matches!(
+        arguments.first().map(String::as_str),
+        Some(desktop_integration::BROWSER_HANDLER_COMMAND)
+    ) {
+        return Ok(arguments);
+    }
+    if arguments.len() != 2 {
+        return Err("the roblox-player handler requires exactly one URL".to_string());
+    }
+
+    let place_id = browser_launch::place_id(&arguments[1]).map_err(|error| error.to_string())?;
+    arguments.clear();
+    arguments.push("__run-browser-place".to_string());
+    arguments.push(place_id.to_string());
+    Ok(arguments)
+}
+
+fn parse_internal_place_id(arguments: &[String]) -> Result<u64, String> {
+    let [place_id] = arguments else {
+        return Err("invalid internal browser launch request".to_string());
+    };
+    let place_id = place_id
+        .parse::<u64>()
+        .map_err(|_| "invalid internal browser launch request".to_string())?;
+    if place_id == 0 {
+        return Err("invalid internal browser launch request".to_string());
+    }
+    Ok(place_id)
 }
 
 fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -274,9 +341,89 @@ fn fetch_apk_command() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn parse_run_apk_path(arguments: &[String]) -> Result<Option<&str>, String> {
+    match arguments {
+        [] => Ok(None),
+        [apk_path] => Ok(Some(apk_path)),
+        _ => Err("usage: eclipse run [APK]".to_string()),
+    }
+}
+
+fn last_apk_path_file() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    Ok(eclipse::config::Config::config_path()?.with_file_name("last-apk.json"))
+}
+
+fn remember_apk_path(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let path = path.canonicalize()?;
+    if !path.is_file() {
+        return Err(format!("Roblox APK is not a file: {}", path.display()).into());
+    }
+    let setting = last_apk_path_file()?;
+    let parent = setting
+        .parent()
+        .ok_or("the remembered APK setting has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".last-apk.{}.tmp", std::process::id()));
+    let text = path
+        .to_str()
+        .ok_or("the Roblox APK path is not valid UTF-8")?;
+    std::fs::write(&temporary, serde_json::to_vec(text)?)?;
+    std::fs::rename(&temporary, &setting)?;
+    Ok(path)
+}
+
+fn remembered_apk_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let setting = last_apk_path_file()?;
+    let bytes = std::fs::read(&setting).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::new(
+                error.kind(),
+                "no Roblox APK is remembered; run `eclipse install-url-handler /path/to/roblox.apk`",
+            )
+        } else {
+            error
+        }
+    })?;
+    let text: String = serde_json::from_slice(&bytes)?;
+    let path = std::path::PathBuf::from(text);
+    if !path.is_file() {
+        return Err(format!(
+            "the remembered Roblox APK no longer exists: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(path)
+}
+
+fn install_url_handler_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let apk_path = match arguments {
+        [] => remembered_apk_path()?,
+        [apk_path] => {
+            let mut apk = eclipse::apk::Apk::open(std::path::Path::new(apk_path))?;
+            apk.manifest()?;
+            remember_apk_path(std::path::Path::new(apk_path))?
+        }
+        _ => return Err("usage: eclipse install-url-handler [APK]".into()),
+    };
+    let desktop_path = desktop_integration::install_url_handler()?;
+    println!(
+        "Roblox browser Play handler installed: {} (APK: {}) ✓",
+        desktop_path.display(),
+        apk_path.display()
+    );
+    Ok(())
+}
+
+fn run_apk(
+    apk_path: Option<&str>,
+    browser_place_id: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let resolved: String = match apk_path {
         Some(p) => p.to_string(),
+        None if browser_place_id.is_some() => remembered_apk_path()?.to_string_lossy().into_owned(),
         None => {
             let config = eclipse::config::Config::load()?;
             let env_url = std::env::var_os("ECLIPSE_APK_URL").is_some();
@@ -301,6 +448,7 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
 
     eclipse::loader::ndk_registry::set_apk_path(std::path::PathBuf::from(apk_path));
     let manifest = apk.manifest()?;
+    remember_apk_path(std::path::Path::new(apk_path))?;
     let config = eclipse::config::Config::load()?;
     let has_native_engine = apk
         .native_abis()
@@ -389,9 +537,19 @@ fn run_apk(apk_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         preload_app_native_libs(&mut apk, std::path::Path::new(apk_path), &app_lib_dir, &vm)?;
 
     println!("# Driving the framework lifecycle (JNI; steps 1–7 to Activity.onResume / RESUMED)…");
-    let progress =
-        eclipse::framework::drive_application_lifecycle(&vm, apk_path, &plan.launcher_activity)?;
-    println!("framework lifecycle driven: {progress:?} (non-GTK Context/Window/View natives bound; launcher Activity = {}) ✓", plan.launcher_activity);
+    let android_deep_link = browser_place_id.map(|place_id| format!("roblox://placeId={place_id}"));
+    let progress = eclipse::framework::drive_application_lifecycle(
+        &vm,
+        apk_path,
+        &plan.launcher_activity,
+        android_deep_link.as_deref(),
+    )?;
+    let activity_target = if browser_place_id.is_some() {
+        "resolved ACTION_VIEW activity"
+    } else {
+        plan.launcher_activity.as_str()
+    };
+    println!("framework lifecycle driven: {progress:?} (non-GTK Context/Window/View natives bound; launcher Activity = {activity_target}) ✓");
 
     if std::env::var("ECLIPSE_WEB_LOGIN").is_ok_and(|value| value == "1") {
         println!("# Opening Roblox's official web login in Eclipse…");
@@ -824,12 +982,36 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 
 #[cfg(test)]
 mod tests {
-    use super::finish_android_process;
+    use super::{finish_android_process, normalize_browser_launch, parse_run_apk_path};
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
 
     extern "C" fn abort_if_atexit_runs() {
         std::process::abort();
+    }
+
+    #[test]
+    fn run_accepts_at_most_one_apk_argument() {
+        let apk = "roblox.apk".to_string();
+        assert_eq!(parse_run_apk_path(&[]).unwrap(), None);
+        assert_eq!(
+            parse_run_apk_path(std::slice::from_ref(&apk)).unwrap(),
+            Some("roblox.apk")
+        );
+        assert!(parse_run_apk_path(&[apk, "roblox://placeId=1".into()]).is_err());
+    }
+
+    #[test]
+    fn browser_ticket_is_replaced_before_android_startup() {
+        let secret = "SUPER_SECRET_TICKET_4f9d8c";
+        let protocol = format!(
+            "roblox-player:1+launchmode:play+gameinfo:{secret}+placelauncherurl:https%3A%2F%2Fassetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx%3Frequest%3DRequestGame%26placeId%3D90441122676618"
+        );
+        let normalized =
+            normalize_browser_launch(vec!["__handle-roblox-player-url".to_string(), protocol])
+                .unwrap();
+        assert_eq!(normalized, ["__run-browser-place", "90441122676618"]);
+        assert!(!normalized.iter().any(|argument| argument.contains(secret)));
     }
 
     #[test]
