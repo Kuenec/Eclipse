@@ -187,6 +187,10 @@ Focused bug reports and pull requests are welcome. Before opening a PR:
 
 Please do not attach APKs, client assets, account data, cookies or authentication material to issues.
 
+## Contributors
+
+- [Yoshi-OOF](https://github.com/Yoshi-OOF) — framework, CI, and browser launch improvements
+
 ## Project scope and disclaimer
 
 Eclipse is an independent, unofficial compatibility project. It is **not affiliated with, authorized by or endorsed by Roblox Corporation**. Roblox is a trademark of Roblox Corporation.
