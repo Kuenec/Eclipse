@@ -2579,7 +2579,7 @@ fn build_text_pipeline(
     Ok((pipeline_layout, pipeline))
 }
 
-use ab_glyph::{Font, FontVec, ScaleFont};
+use crate::font::RasterFont;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2665,8 +2665,8 @@ fn first_font_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     subdirs.into_iter().find_map(|d| first_font_in_dir(&d))
 }
 
-fn build_glyph_atlas(font: &FontVec, max_width: u32) -> Option<GlyphAtlas> {
-    let scaled = font.as_scaled(TEXT_PX);
+fn build_glyph_atlas(font: &RasterFont, max_width: u32) -> Option<GlyphAtlas> {
+    let mut scaled = font.scaled(TEXT_PX)?;
     let ascent = scaled.ascent();
     let line_height = scaled.height() + scaled.line_gap();
 
@@ -2684,31 +2684,16 @@ fn build_glyph_atlas(font: &FontVec, max_width: u32) -> Option<GlyphAtlas> {
     let mut rasters: Vec<Raster> = Vec::new();
     for byte in ATLAS_CHARS {
         let ch = byte as char;
-        let advance = scaled.h_advance(scaled.glyph_id(ch));
-        let glyph = font
-            .glyph_id(ch)
-            .with_scale_and_position(TEXT_PX, ab_glyph::point(0.0, 0.0));
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            let w = bounds.width().ceil() as u32;
-            let h = bounds.height().ceil() as u32;
-            if w == 0 || h == 0 {
-                rasters.push(Raster {
-                    ch,
-                    w: 0,
-                    h: 0,
-                    pixels: Vec::new(),
-                    bearing_x: bounds.min.x,
-                    bearing_y: bounds.min.y,
-                    advance,
-                });
-                continue;
-            }
+        let advance = scaled.advance(ch);
+        if let Some(glyph) = scaled.glyph(ch) {
+            let placement = glyph.placement();
+            let w = placement.width;
+            let h = placement.height;
             let mut pixels = vec![0u8; (w * h) as usize];
-            outlined.draw(|x, y, c| {
+            glyph.draw(|x, y, coverage| {
                 let idx = (y * w + x) as usize;
                 if idx < pixels.len() {
-                    pixels[idx] = (c.clamp(0.0, 1.0) * 255.0) as u8;
+                    pixels[idx] = (coverage.clamp(0.0, 1.0) * 255.0) as u8;
                 }
             });
             rasters.push(Raster {
@@ -2716,8 +2701,8 @@ fn build_glyph_atlas(font: &FontVec, max_width: u32) -> Option<GlyphAtlas> {
                 w,
                 h,
                 pixels,
-                bearing_x: bounds.min.x,
-                bearing_y: bounds.min.y,
+                bearing_x: placement.left as f32,
+                bearing_y: placement.top as f32,
                 advance,
             });
         } else {
@@ -4135,7 +4120,7 @@ impl TextRenderer {
                 return Ok(None);
             }
         };
-        let font = match FontVec::try_from_vec(bytes) {
+        let font = match RasterFont::try_from_vec(bytes) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(path = %font_path.display(), error = %e, "font parse failed; text disabled");
@@ -5856,7 +5841,7 @@ mod tests {
         let Ok(bytes) = std::fs::read(&path) else {
             return;
         };
-        let Ok(font) = FontVec::try_from_vec(bytes) else {
+        let Ok(font) = RasterFont::try_from_vec(bytes) else {
             return;
         };
         let atlas = build_glyph_atlas(&font, 1024).expect("atlas builds from a real font");
