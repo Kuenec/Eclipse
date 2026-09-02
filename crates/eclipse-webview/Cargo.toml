@@ -7,7 +7,7 @@ publish = false
 description = "Out-of-process CEF helper for the Eclipse challenge WebView: windowless OSR over an owned Unix-socket protocol + memfd BGRA frames"
 
 [dependencies]
-cef = "=149.3.0"
+cef = "=151.8.0"
 libc = "0.2"
 
 [[bin]]
