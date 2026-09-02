@@ -997,11 +997,6 @@ mod tests {
         }
 
         let libm = &set.objects[0];
-        assert!(
-            libm.sym_stats.total_applied() >= 30,
-            "libm symbol relocs applied: {:?}",
-            libm.sym_stats
-        );
         let libm_unresolved: Vec<&UnresolvedSymbol> = set
             .unresolved
             .iter()
@@ -1012,9 +1007,35 @@ mod tests {
             "libm must have no unresolved strong symbols: {libm_unresolved:?}"
         );
 
+        let libm_image = libm.image().expect("parse mapped libm");
+        let libm_relas = libm_image.relocations().expect("decode libm relocations");
+        let expected_symbol_relocs = libm_relas
+            .iter()
+            .filter(|rela| {
+                matches!(
+                    rela.r_type,
+                    reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
+                )
+            })
+            .count();
+        assert!(
+            expected_symbol_relocs > 0,
+            "host libm must exercise symbol relocation"
+        );
         assert_eq!(
-            libm.tls_stats.tpoff64_applied, 1,
-            "libm's errno TPOFF64 applies via libc's PT_TLS in the multi-module layout"
+            libm.sym_stats.total_applied(),
+            expected_symbol_relocs,
+            "every libm symbol relocation applies: {:?}",
+            libm.sym_stats
+        );
+
+        let expected_tpoff64 = libm_relas
+            .iter()
+            .filter(|rela| rela.r_type == reloc::R_X86_64_TPOFF64)
+            .count();
+        assert_eq!(
+            libm.tls_stats.tpoff64_applied, expected_tpoff64,
+            "every libm TPOFF64 applies via the multi-module TLS layout"
         );
 
         let errno_off = set.tls_layout.tp_offset_of("errno");
@@ -1023,9 +1044,22 @@ mod tests {
             "errno tp-relative offset must be negative (variant-II): {errno_off:?}"
         );
 
-        assert!(
-            set.stats.irelative_deferred > 0,
-            "libc's ifunc IRELATIVE are deferred (the documented ifunc tail): {:?}",
+        let expected_irelative = set
+            .objects
+            .iter()
+            .map(|object| {
+                let image = object.image().expect("parse linked object");
+                image
+                    .relocations()
+                    .expect("decode linked object relocations")
+                    .iter()
+                    .filter(|rela| rela.r_type == R_X86_64_IRELATIVE)
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            set.stats.irelative_deferred, expected_irelative,
+            "every graph IRELATIVE is recorded as deferred: {:?}",
             set.stats
         );
 

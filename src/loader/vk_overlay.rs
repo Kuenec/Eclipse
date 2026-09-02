@@ -1,16 +1,16 @@
-use ab_glyph::{Font, FontVec, ScaleFont};
+use crate::font::{RasterFont, ScaledFont};
 use ash::vk;
 use ash::vk::Handle;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-fn overlay_font() -> Option<&'static FontVec> {
-    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+fn overlay_font() -> Option<&'static RasterFont> {
+    static FONT: OnceLock<Option<RasterFont>> = OnceLock::new();
     FONT.get_or_init(|| {
         let path = crate::graphics::discover_font_path()?;
         let bytes = std::fs::read(path).ok()?;
-        FontVec::try_from_vec(bytes).ok()
+        RasterFont::try_from_vec(bytes).ok()
     })
     .as_ref()
 }
@@ -97,9 +97,9 @@ fn blend_text_pixel(buf: &mut [u8], index: usize, color: [u8; 4], coverage: f32)
     }
 }
 
-fn visible_line_end<F: Font>(
+fn visible_line_end(
     text: &str,
-    scaled: &impl ScaleFont<F>,
+    scaled: &mut ScaledFont,
     width: f32,
     wrapped: bool,
 ) -> (usize, usize, bool) {
@@ -108,7 +108,7 @@ fn visible_line_end<F: Font>(
         if character == '\n' {
             return (index, index + character.len_utf8(), false);
         }
-        let advance = scaled.h_advance(scaled.glyph_id(character));
+        let advance = scaled.advance(character);
         if line_width + advance > width {
             if wrapped {
                 let end = if index == 0 {
@@ -138,7 +138,9 @@ fn draw_text_onto_rgba(
         return;
     };
     let scale = overlay_font_size(overlay.font_size);
-    let scaled = font.as_scaled(scale);
+    let Some(mut scaled) = font.scaled(scale) else {
+        return;
+    };
     let ascent = scaled.ascent();
     let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
     let color_bytes = (overlay.text_color as u32).to_be_bytes();
@@ -167,12 +169,16 @@ fn draw_text_onto_rgba(
     let mut complete = false;
 
     for line_index in 0..maximum_lines {
-        let (draw_end, consumed, clipped_line) =
-            visible_line_end(remaining, &scaled, available_width, overlay.text_wrapped);
+        let (draw_end, consumed, clipped_line) = visible_line_end(
+            remaining,
+            &mut scaled,
+            available_width,
+            overlay.text_wrapped,
+        );
         let line = &remaining[..draw_end];
         let line_width = line
             .chars()
-            .map(|character| scaled.h_advance(scaled.glyph_id(character)))
+            .map(|character| scaled.advance(character))
             .sum::<f32>();
         let mut pen_x = match overlay.x_alignment {
             1 => (w as f32 - OVERLAY_TEXT_PADDING - line_width).max(OVERLAY_TEXT_PADDING),
@@ -208,14 +214,12 @@ fn draw_text_onto_rgba(
                 pen_x += radius * 3.0;
                 continue;
             }
-            let glyph_id = scaled.glyph_id(character);
-            let advance = scaled.h_advance(glyph_id);
-            let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(pen_x, baseline_y));
-            if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                outlined.draw(|glyph_x, glyph_y, coverage| {
-                    let pixel_x = bounds.min.x as i32 + glyph_x as i32;
-                    let pixel_y = bounds.min.y as i32 + glyph_y as i32;
+            let advance = scaled.advance(character);
+            if let Some(glyph) = scaled.glyph_at(character, pen_x, baseline_y) {
+                let placement = glyph.placement();
+                glyph.draw(|glyph_x, glyph_y, coverage| {
+                    let pixel_x = placement.left + glyph_x as i32;
+                    let pixel_y = placement.top + glyph_y as i32;
                     if pixel_x >= 0 && pixel_y >= 0 && (pixel_x as u32) < w && (pixel_y as u32) < h
                     {
                         let index = ((pixel_y as u32 * w + pixel_x as u32) * 4) as usize;
@@ -1027,7 +1031,7 @@ impl Probe {
                 {
                     let data = std::slice::from_raw_parts(self.mapped, size);
                     let mut png_rgba = data.to_vec();
-                    for px in png_rgba.chunks_exact_mut(4) {
+                    for px in png_rgba.as_chunks_mut::<4>().0 {
                         px[3] = 255;
                     }
                     let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
@@ -1301,7 +1305,9 @@ fn bgra_rows_into(
             return false;
         };
         if swizzle {
-            for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
+            let (destination_pixels, _) = drow.as_chunks_mut::<4>();
+            let (source_pixels, _) = srow.as_chunks::<4>();
+            for (d, s) in destination_pixels.iter_mut().zip(source_pixels) {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];

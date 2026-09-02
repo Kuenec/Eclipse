@@ -4,7 +4,6 @@ use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use ab_glyph::{Font, FontVec, ScaleFont};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{
     JByteArray, JClass, JFloatArray, JIntArray, JLongArray, JMethodID, JObject, JObjectArray,
@@ -17,6 +16,7 @@ use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
+use crate::font::RasterFont;
 use crate::runtime::Vm;
 
 pub mod asset_registry;
@@ -203,7 +203,7 @@ fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
 
 pub const CONNECTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/net/ConnectivityManager");
 
-const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("registerNetworkCallback");
+const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("nativeRegisterNetworkCallback");
 const CM_REGISTER_NETWORK_CALLBACK_SIG: &JNIStr =
     jni_str!("(Landroid/net/NetworkRequest;Landroid/net/ConnectivityManager$NetworkCallback;)V");
 const CM_IS_ACTIVE_NETWORK_METERED_NAME: &JNIStr = jni_str!("isActiveNetworkMetered");
@@ -266,7 +266,7 @@ fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/net/ConnectivityManager",
-        "registered Eclipse's non-GTK backing for registerNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
+        "registered Eclipse's non-GTK backing for nativeRegisterNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
     );
     Ok(())
 }
@@ -2934,7 +2934,7 @@ const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_NAME: &JNIStr = jni_str!("native_setBa
 const VIEW_NATIVE_SET_BACKGROUND_DRAWABLE_SIG: &JNIStr = jni_str!("(JJ)V");
 
 const VIEW_NATIVE_SET_VISIBILITY_NAME: &JNIStr = jni_str!("native_setVisibility");
-const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIF)V");
+const VIEW_NATIVE_SET_VISIBILITY_SIG: &JNIStr = jni_str!("(JIFZ)V");
 
 const VIEW_SET_ON_CLICK_LISTENER_NAME: &JNIStr = jni_str!("nativeSetOnClickListener");
 const VIEW_SET_ON_CLICK_LISTENER_SIG: &JNIStr = jni_str!("(J)V");
@@ -3207,6 +3207,7 @@ extern "system" fn view_native_set_visibility<'local>(
     widget: jlong,
     visibility: jint,
     alpha: f32,
+    sensitive: jboolean,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
         if let Err(e) = view_registry::with_view(widget, |_v| ()) {
@@ -3215,8 +3216,18 @@ extern "system" fn view_native_set_visibility<'local>(
                 widget,
                 visibility,
                 alpha,
+                sensitive,
                 error = %e,
                 "View.native_setVisibility: invalid view handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.View",
+                widget,
+                visibility,
+                alpha,
+                sensitive,
+                "View.native_setVisibility: validated handle, visibility retained by Java view state"
             );
         }
         Ok(())
@@ -8694,10 +8705,10 @@ fn record_textbox_session(session: Option<TextboxSession>) {
     }
 }
 
-fn roblox_code_font() -> Option<&'static FontVec> {
-    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+fn roblox_code_font() -> Option<&'static RasterFont> {
+    static FONT: OnceLock<Option<RasterFont>> = OnceLock::new();
     FONT.get_or_init(|| {
-        FontVec::try_from_vec(read_asset_bytes("content/fonts/Inconsolata-Regular.ttf")?).ok()
+        RasterFont::try_from_vec(read_asset_bytes("content/fonts/Inconsolata-Regular.ttf")?).ok()
     })
     .as_ref()
 }
@@ -8722,7 +8733,7 @@ fn code_text_cursor_from_pointer(
     }
     let font = roblox_code_font()?;
     let scale = session.font_size * ROBLOX_CODE_FONT_RATIO;
-    let scaled = font.as_scaled(scale);
+    let mut scaled = font.scaled(scale)?;
     let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
     let requested_line = if session.multiline {
         (relative_y / line_height).floor().max(0.0) as usize
@@ -8739,7 +8750,7 @@ fn code_text_cursor_from_pointer(
         }
         let line_width = line
             .chars()
-            .map(|character| scaled.h_advance(scaled.glyph_id(character)))
+            .map(|character| scaled.advance(character))
             .sum::<f32>();
         let line_origin = match session.x_alignment {
             1 => (width as f32 - line_width).max(0.0),
@@ -8750,7 +8761,7 @@ fn code_text_cursor_from_pointer(
         let mut used_width = 0.0;
         let mut line_utf16 = 0usize;
         for character in line.chars() {
-            let advance = scaled.h_advance(scaled.glyph_id(character));
+            let advance = scaled.advance(character);
             if requested_x < used_width + advance * 0.5 {
                 return jint::try_from(utf16_before_line.saturating_add(line_utf16)).ok();
             }
@@ -10378,6 +10389,13 @@ const WINDOW_SET_WIDGET_AS_ROOT_SIG: &JNIStr = jni_str!("(JJ)V");
 
 const WINDOW_REMOVE_GTK_BACKGROUND_NAME: &JNIStr = jni_str!("remove_gtk_background");
 const WINDOW_REMOVE_GTK_BACKGROUND_SIG: &JNIStr = jni_str!("(J)V");
+const WINDOW_INSTALL_THEME_CSS_NAME: &JNIStr = jni_str!("native_install_theme_css");
+const WINDOW_INSTALL_THEME_CSS_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
+const WINDOW_SET_SCREEN_BRIGHTNESS_NAME: &JNIStr = jni_str!("set_screen_brightness");
+const WINDOW_SET_SCREEN_BRIGHTNESS_SIG: &JNIStr = jni_str!("(F)V");
+const WINDOW_TAKE_INPUT_QUEUE_NAME: &JNIStr = jni_str!("take_input_queue");
+const WINDOW_TAKE_INPUT_QUEUE_SIG: &JNIStr =
+    jni_str!("(JLandroid/view/InputQueue$Callback;Landroid/view/InputQueue;)V");
 
 extern "system" fn window_set_jobject<'local>(
     mut env: EnvUnowned<'local>,
@@ -10496,6 +10514,81 @@ extern "system" fn window_remove_gtk_background<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+extern "system" fn window_install_theme_css<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+    css: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let css_len = if css.is_null() {
+            0
+        } else {
+            css.try_to_string(env)?.len()
+        };
+        if let Err(e) = window_registry::with_window(native_window, |_w| ()) {
+            tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                error = %e,
+                "Window.native_install_theme_css: invalid window handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.Window",
+                native_window,
+                css_len,
+                "Window.native_install_theme_css: validated handle, no-op (non-GTK window)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn window_set_screen_brightness<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    brightness: jfloat,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        tracing::trace!(
+            target: "android.view.Window",
+            brightness,
+            "Window.set_screen_brightness: no-op (desktop brightness remains user-controlled)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+extern "system" fn window_take_input_queue<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    native_window: jlong,
+    _callback: JObject<'local>,
+    _queue: JObject<'local>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        if let Err(e) = window_registry::with_window(native_window, |_w| ()) {
+            tracing::debug!(
+                target: "android.view.Window",
+                native_window,
+                error = %e,
+                "Window.take_input_queue: invalid window handle (ignored)"
+            );
+        } else {
+            tracing::trace!(
+                target: "android.view.Window",
+                native_window,
+                "Window.take_input_queue: no-op (input is dispatched by Eclipse's winit bridge)"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 extern "system" fn window_set_widget_as_root<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -10567,12 +10660,33 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
                 window_remove_gtk_background as *mut std::ffi::c_void,
             )
         },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_INSTALL_THEME_CSS_NAME,
+                WINDOW_INSTALL_THEME_CSS_SIG,
+                window_install_theme_css as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_SET_SCREEN_BRIGHTNESS_NAME,
+                WINDOW_SET_SCREEN_BRIGHTNESS_SIG,
+                window_set_screen_brightness as *mut std::ffi::c_void,
+            )
+        },
+        unsafe {
+            NativeMethod::from_raw_parts(
+                WINDOW_TAKE_INPUT_QUEUE_NAME,
+                WINDOW_TAKE_INPUT_QUEUE_SIG,
+                window_take_input_queue as *mut std::ffi::c_void,
+            )
+        },
     ];
 
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/Window",
-        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root + remove_gtk_background"
+        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root + remove_gtk_background + native_install_theme_css + set_screen_brightness + take_input_queue"
     );
     Ok(())
 }
@@ -11159,6 +11273,7 @@ pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
     launcher_activity: &str,
+    android_deep_link: Option<&str>,
 ) -> Result<LifecycleProgress, FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
@@ -11168,7 +11283,7 @@ pub fn drive_application_lifecycle(
 
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            drive_lifecycle(env, apk_path, launcher_activity)
+            drive_lifecycle(env, apk_path, launcher_activity, android_deep_link)
         })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
@@ -12298,6 +12413,7 @@ fn drive_lifecycle(
     env: &mut Env,
     apk_path: &str,
     launcher_activity: &str,
+    android_deep_link: Option<&str>,
 ) -> Result<LifecycleProgress, FrameworkError> {
     register_context_natives(env, apk_path)?;
 
@@ -12417,16 +12533,29 @@ fn drive_lifecycle(
     tracing::info!("Application.onCreate reached: recipe steps 1–3 driven");
 
     let activity_class = env.find_class(ACTIVITY_CLASS)?;
-    let class_name_jstr = env.new_string(launcher_activity)?;
+    let (activity_name, activity_uri) =
+        activity_start_arguments(launcher_activity, android_deep_link);
+    let class_name_jstr = activity_name.map(|name| env.new_string(name)).transpose()?;
+    let activity_uri_jstr = activity_uri.map(|uri| env.new_string(uri)).transpose()?;
+    let null_class_name = JObject::null();
+    let null_activity_uri = JObject::null();
+    let class_name_object: &JObject = class_name_jstr
+        .as_ref()
+        .map(AsRef::as_ref)
+        .unwrap_or(&null_class_name);
+    let activity_uri_object: &JObject = activity_uri_jstr
+        .as_ref()
+        .map(AsRef::as_ref)
+        .unwrap_or(&null_activity_uri);
     let activity = checked(env, "step 4 Activity.createMainActivity", |env| {
         env.call_static_method(
             &activity_class,
             jni_str!("createMainActivity"),
             jni_sig!("(Ljava/lang/String;JLjava/lang/String;)Landroid/app/Activity;"),
             &[
-                JValue::Object(&class_name_jstr),
+                JValue::Object(class_name_object),
                 JValue::Long(window_handle),
-                JValue::Object(&JObject::null()),
+                JValue::Object(activity_uri_object),
             ],
         )?
         .l()
@@ -12436,7 +12565,7 @@ fn drive_lifecycle(
 
     call_activity_on_create(env, &activity, "step 5 Activity.onCreate")?;
     tracing::info!(
-        activity = launcher_activity,
+        activity = activity_name.unwrap_or("<resolved ACTION_VIEW activity>"),
         "Activity.onCreate reached: recipe steps 1–5 driven (launcher Activity onCreate)"
     );
 
@@ -12446,10 +12575,20 @@ fn drive_lifecycle(
 
     call_activity_on_resume(env, &activity, "step 7 Activity.onResume")?;
     tracing::info!(
-        activity = launcher_activity,
+        activity = activity_name.unwrap_or("<resolved ACTION_VIEW activity>"),
         "Activity resumed: recipe steps 1–7 driven (launcher Activity onStart + onResume)"
     );
     Ok(LifecycleProgress::ActivityResumed)
+}
+
+fn activity_start_arguments<'a>(
+    launcher_activity: &'a str,
+    android_deep_link: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    match android_deep_link {
+        Some(uri) => (None, Some(uri)),
+        None => (Some(launcher_activity), None),
+    }
 }
 
 fn checked<'local, T>(
@@ -12776,6 +12915,21 @@ mod tests {
     use super::*;
 
     static TEXTBOX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn deep_link_launch_uses_manifest_resolution_instead_of_the_launcher_activity() {
+        let launcher = "com.roblox.client.startup.ActivitySplash";
+        let uri = "roblox://placeId=90441122676618";
+
+        assert_eq!(
+            activity_start_arguments(launcher, None),
+            (Some(launcher), None)
+        );
+        assert_eq!(
+            activity_start_arguments(launcher, Some(uri)),
+            (None, Some(uri))
+        );
+    }
 
     #[test]
     fn host_shutdown_destroys_engine_surface_before_window_teardown() {
@@ -14429,7 +14583,7 @@ mod tests {
             VIEW_NATIVE_SET_VISIBILITY_NAME.to_str(),
             "native_setVisibility"
         );
-        assert_eq!(VIEW_NATIVE_SET_VISIBILITY_SIG.to_str(), "(JIF)V");
+        assert_eq!(VIEW_NATIVE_SET_VISIBILITY_SIG.to_str(), "(JIFZ)V");
 
         assert_eq!(
             VIEW_SET_ON_CLICK_LISTENER_NAME.to_str(),
@@ -14653,6 +14807,24 @@ mod tests {
             "remove_gtk_background"
         );
         assert_eq!(WINDOW_REMOVE_GTK_BACKGROUND_SIG.to_str(), "(J)V");
+        assert_eq!(
+            WINDOW_INSTALL_THEME_CSS_NAME.to_str(),
+            "native_install_theme_css"
+        );
+        assert_eq!(
+            WINDOW_INSTALL_THEME_CSS_SIG.to_str(),
+            "(JLjava/lang/String;)V"
+        );
+        assert_eq!(
+            WINDOW_SET_SCREEN_BRIGHTNESS_NAME.to_str(),
+            "set_screen_brightness"
+        );
+        assert_eq!(WINDOW_SET_SCREEN_BRIGHTNESS_SIG.to_str(), "(F)V");
+        assert_eq!(WINDOW_TAKE_INPUT_QUEUE_NAME.to_str(), "take_input_queue");
+        assert_eq!(
+            WINDOW_TAKE_INPUT_QUEUE_SIG.to_str(),
+            "(JLandroid/view/InputQueue$Callback;Landroid/view/InputQueue;)V"
+        );
     }
 
     #[test]

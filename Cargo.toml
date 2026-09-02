@@ -28,7 +28,7 @@ libloading = "0.8"
 jni-sys = "0.4"
 jni = "0.22"
 
-winit = "0.30"
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-crossfont"] }
 
 rustix = { version = "1", default-features = false, features = ["mm", "param"] }
 
@@ -40,7 +40,7 @@ raw-window-handle = "0.6"
 
 khronos-egl = { version = "6", features = ["dynamic"] }
 
-ab_glyph = "0.2"
+freetype-rs = "0.36"
 
 cpal = "0.17"
 
