@@ -4,7 +4,6 @@ use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use ab_glyph::{Font, FontVec, ScaleFont};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{
     JByteArray, JClass, JFloatArray, JIntArray, JLongArray, JMethodID, JObject, JObjectArray,
@@ -17,6 +16,7 @@ use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
+use crate::font::RasterFont;
 use crate::runtime::Vm;
 
 pub mod asset_registry;
@@ -8705,10 +8705,10 @@ fn record_textbox_session(session: Option<TextboxSession>) {
     }
 }
 
-fn roblox_code_font() -> Option<&'static FontVec> {
-    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+fn roblox_code_font() -> Option<&'static RasterFont> {
+    static FONT: OnceLock<Option<RasterFont>> = OnceLock::new();
     FONT.get_or_init(|| {
-        FontVec::try_from_vec(read_asset_bytes("content/fonts/Inconsolata-Regular.ttf")?).ok()
+        RasterFont::try_from_vec(read_asset_bytes("content/fonts/Inconsolata-Regular.ttf")?).ok()
     })
     .as_ref()
 }
@@ -8733,7 +8733,7 @@ fn code_text_cursor_from_pointer(
     }
     let font = roblox_code_font()?;
     let scale = session.font_size * ROBLOX_CODE_FONT_RATIO;
-    let scaled = font.as_scaled(scale);
+    let mut scaled = font.scaled(scale)?;
     let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
     let requested_line = if session.multiline {
         (relative_y / line_height).floor().max(0.0) as usize
@@ -8750,7 +8750,7 @@ fn code_text_cursor_from_pointer(
         }
         let line_width = line
             .chars()
-            .map(|character| scaled.h_advance(scaled.glyph_id(character)))
+            .map(|character| scaled.advance(character))
             .sum::<f32>();
         let line_origin = match session.x_alignment {
             1 => (width as f32 - line_width).max(0.0),
@@ -8761,7 +8761,7 @@ fn code_text_cursor_from_pointer(
         let mut used_width = 0.0;
         let mut line_utf16 = 0usize;
         for character in line.chars() {
-            let advance = scaled.h_advance(scaled.glyph_id(character));
+            let advance = scaled.advance(character);
             if requested_x < used_width + advance * 0.5 {
                 return jint::try_from(utf16_before_line.saturating_add(line_utf16)).ok();
             }

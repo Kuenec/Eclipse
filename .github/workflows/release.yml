@@ -34,6 +34,8 @@ jobs:
             cmake \
             curl \
             libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
             libgtk-3-dev \
             libnss3 \
             ninja-build \

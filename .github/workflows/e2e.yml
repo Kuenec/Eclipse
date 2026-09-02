@@ -33,6 +33,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
             libegl1 \
             libgles2 \
             mesa-utils \

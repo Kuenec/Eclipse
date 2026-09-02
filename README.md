@@ -50,7 +50,7 @@ Traditional solutions run an entire Android guest. Eclipse takes a narrower appr
 
 - Linux on x86-64 with X11 or Wayland
 - Rust **1.95** or newer
-- A C/C++ toolchain, `pkg-config`, ALSA development headers and host graphics drivers
+- A C/C++ toolchain, `pkg-config`, ALSA, Fontconfig and FreeType development headers, and host graphics drivers
 - A compatible Android x86-64 Roblox APK that you obtained yourself
 - The ART/framework runtime assets expected by Eclipse for a full client boot
 
@@ -58,7 +58,7 @@ On Ubuntu or Debian, the core build dependencies can be installed with:
 
 ```bash
 sudo apt update
-sudo apt install build-essential pkg-config libasound2-dev libegl1 libgles2
+sudo apt install build-essential pkg-config libasound2-dev libfontconfig1-dev libfreetype6-dev libegl1 libgles2
 ```
 
 Build Eclipse from source:
