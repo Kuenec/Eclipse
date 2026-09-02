@@ -173,7 +173,7 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+id
 grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+theme[[:space:]]*=[[:space:]]*0x01010000;' "$r_src" || fail "vendored internal R.attr.theme != 0x01010000 — ATL source drifted; re-verify the overlay's inlined constants"
 [ ! -e "$here/stubs/com/android/internal/R.java" ] || fail "stub com/android/internal/R.java re-appeared — javac would inline its placeholder constants into the overlay dex (the 2026-07-02 include-id NPE class); delete it (the vendored R.java is the compile input)"
 
-"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Xlint:-options -Werror -d "$work/classes" \
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/classes" \
     -sourcepath "$work/gen:$here/src:$here/stubs" \
     "$work/gen/android/os/Build.java" \
     "$here/src/android/net/NetworkRequest.java" \
@@ -958,7 +958,7 @@ perl -0777 -ne 'exit(/iget-object v2, p0, Lcom\/wolfssl\/provider\/jsse\/WolfSSL
 date_time_probe="$here/tests/DateTimeFormatterProbe.java"
 [ -f "$date_time_probe" ] || fail "date-time formatter regression probe missing at $date_time_probe"
 mkdir -p "$work/date-time-probe/classes" "$work/date-time-probe/cache" "$work/date-time-probe/data"
-"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Xlint:-options -Werror -d "$work/date-time-probe/classes" "$date_time_probe"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/date-time-probe/classes" "$date_time_probe"
 "$DX" --dex --output="$work/date-time-probe/probe.jar" "$work/date-time-probe/classes"
 boot_class_path=''
 boot_class_path_locations=''
@@ -990,7 +990,7 @@ probe_output="$(env \
 keygen_probe="$here/tests/KeyGenParameterSpecProbe.java"
 [ -f "$keygen_probe" ] || fail "key-generation regression probe missing at $keygen_probe"
 mkdir -p "$work/keygen-probe/classes"
-"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Xlint:-options -Werror -cp "$work/classes" \
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -cp "$work/classes" \
     -d "$work/keygen-probe/classes" "$keygen_probe"
 keygen_output="$("$JAVA" -cp "$work/classes:$work/keygen-probe/classes" KeyGenParameterSpecProbe)"
 [ "$keygen_output" = 'keygen-parameter-spec-ok' ] \

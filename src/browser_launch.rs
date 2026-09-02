@@ -50,8 +50,6 @@ fn parse_place_id(input: &str) -> Option<u64> {
         match name {
             "launchmode" if !saw_launch_mode && value == "play" => saw_launch_mode = true,
             "gameinfo" if !saw_game_info && !value.is_empty() => {
-                // The authentication ticket is intentionally discarded here. Only the place ID
-                // from Roblox's trusted launcher URL crosses into the Android client.
                 saw_game_info = true;
             }
             "placelauncherurl" if launcher_url.is_none() && !value.is_empty() => {
