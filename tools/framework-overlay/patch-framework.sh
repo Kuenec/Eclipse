@@ -51,9 +51,16 @@ JAR="${JAR:-$(find_jdk_tool jar)}"
 DX="${DX:-$(command -v dx || true)}"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
-[ -n "$JAVAC" ] && [ -x "$JAVAC" ] || fail "javac not found (set JAVAC, or vendor a JDK at vendor/toolchain/jdk-*/)"
-[ -n "$JAR" ] && [ -x "$JAR" ] || fail "jar not found (set JAR, or vendor a JDK at vendor/toolchain/jdk-*/)"
-[ -n "$DX" ] && [ -x "$DX" ] || fail "dx not found (set DX or install the Android dx tool)"
+require_executable() {
+    local executable="$1"
+    local failure="$2"
+    if [ -z "$executable" ] || [ ! -x "$executable" ]; then
+        fail "$failure"
+    fi
+}
+require_executable "$JAVAC" "javac not found (set JAVAC, or vendor a JDK at vendor/toolchain/jdk-*/)"
+require_executable "$JAR" "jar not found (set JAR, or vendor a JDK at vendor/toolchain/jdk-*/)"
+require_executable "$DX" "dx not found (set DX or install the Android dx tool)"
 if "$JAVAC" --release 8 -version >/dev/null 2>&1; then
     JAVAC_8_FLAGS=(--release 8)
 else
@@ -70,9 +77,9 @@ fi
 r8_sha256="$(sha256sum "$R8_JAR" | awk '{print $1}')"
 [ "$r8_sha256" = "$R8_SHA256" ] || fail "R8 checksum mismatch at $R8_JAR (expected $R8_SHA256, got $r8_sha256)"
 R8_JAVA="${R8_JAVA:-$(find_r8_java)}"
-[ -n "$R8_JAVA" ] && [ -x "$R8_JAVA" ] || fail "Java runtime compatible with R8 8.13.23 not found (set R8_JAVA)"
+require_executable "$R8_JAVA" "Java runtime compatible with R8 8.13.23 not found (set R8_JAVA)"
 DALVIKVM="${DALVIKVM:-$(command -v dalvikvm || true)}"
-[ -n "$DALVIKVM" ] && [ -x "$DALVIKVM" ] || fail "dalvikvm not found (set DALVIKVM or install art_standalone)"
+require_executable "$DALVIKVM" "dalvikvm not found (set DALVIKVM or install art_standalone)"
 for art_jar in "${ART_BOOT_JARS[@]}"; do
     [ -f "$ART_DIR/$art_jar" ] || fail "ART boot jar missing at $ART_DIR/$art_jar (set ART_DIR; install the pinned art_standalone runtime)"
 done
@@ -80,7 +87,7 @@ done
 JAVA="${JAVA:-$(find_jdk_tool java)}"
 BAKSMALI_JAR="${BAKSMALI_JAR:-$repo/vendor/toolchain/smali/baksmali-2.5.2.jar}"
 SMALI_JAR="${SMALI_JAR:-$repo/vendor/toolchain/smali/smali-2.5.2.jar}"
-[ -n "$JAVA" ] && [ -x "$JAVA" ] || fail "java not found (set JAVA, or vendor a JDK at vendor/toolchain/jdk-*/)"
+require_executable "$JAVA" "java not found (set JAVA, or vendor a JDK at vendor/toolchain/jdk-*/)"
 [ -f "$BAKSMALI_JAR" ] || fail "baksmali not found at $BAKSMALI_JAR (vendored at vendor/toolchain/smali/; set BAKSMALI_JAR, or 'pacman -S smali')"
 [ -f "$SMALI_JAR" ] || fail "smali not found at $SMALI_JAR (vendored at vendor/toolchain/smali/; set SMALI_JAR, or 'pacman -S smali')"
 
@@ -192,7 +199,9 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
 for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
-    cp "$work/classes/"$pattern "$work/stage/$dir/"
+    mapfile -t class_files < <(compgen -G "$work/classes/$pattern")
+    [ "${#class_files[@]}" -gt 0 ] || fail "compiled classes missing for $pattern"
+    cp "${class_files[@]}" "$work/stage/$dir/"
 done
 
 for forbidden in 'android/webkit/WebView.class' 'android/webkit/WebViewClient.class' \
@@ -230,9 +239,9 @@ pcsm="$work/smali-check/android/view/PixelCopy.smali"
 pcrsm="$work/smali-check/android/view/PixelCopy\$1.smali"
 [ -f "$pcsm" ] || fail "PixelCopy.smali not in the built classes.dex — the shutdown compatibility surface did not stage"
 [ -f "$pcrsm" ] || fail "PixelCopy anonymous completion Runnable not in the built classes.dex"
-grep -qF 'request(Landroid/view/SurfaceView;Landroid/graphics/Bitmap;Landroid/view/PixelCopy$OnPixelCopyFinishedListener;Landroid/os/Handler;)V' "$pcsm" || fail "dexed PixelCopy lost its SurfaceView request overload"
+grep -qF "request(Landroid/view/SurfaceView;Landroid/graphics/Bitmap;Landroid/view/PixelCopy\$OnPixelCopyFinishedListener;Landroid/os/Handler;)V" "$pcsm" || fail "dexed PixelCopy lost its SurfaceView request overload"
 grep -qF 'Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z' "$pcsm" || fail "dexed PixelCopy no longer posts completion through Handler"
-grep -qF 'Landroid/view/PixelCopy$OnPixelCopyFinishedListener;->onPixelCopyFinished(I)V' "$pcrsm" || fail "dexed PixelCopy Runnable no longer invokes its listener"
+grep -qF "Landroid/view/PixelCopy\$OnPixelCopyFinishedListener;->onPixelCopyFinished(I)V" "$pcrsm" || fail "dexed PixelCopy Runnable no longer invokes its listener"
 grep -qE 'const/4 v[0-9]+, 0x3' "$pcrsm" || fail "dexed PixelCopy Runnable no longer reports ERROR_SOURCE_NO_DATA (3)"
 
 kgpssm="$work/smali-check/android/security/keystore/KeyGenParameterSpec.smali"
@@ -241,15 +250,15 @@ kgpsbsm="$work/smali-check/android/security/keystore/KeyGenParameterSpec\$Builde
 [ -f "$kgpsbsm" ] || fail "KeyGenParameterSpec Builder smali not in the built classes.dex"
 grep -qF '.implements Ljava/security/spec/AlgorithmParameterSpec;' "$kgpssm" || fail "dexed KeyGenParameterSpec does not implement AlgorithmParameterSpec"
 for kgps_method in \
-    'setAlgorithmParameterSpec(Ljava/security/spec/AlgorithmParameterSpec;)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setDigests([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setAttestationChallenge([B)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setKeyValidityStart(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setIsStrongBoxBacked(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setCertificateSubject(Ljavax/security/auth/x500/X500Principal;)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setCertificateSerialNumber(Ljava/math/BigInteger;)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setCertificateNotBefore(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;' \
-    'setCertificateNotAfter(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;'
+    "setAlgorithmParameterSpec(Ljava/security/spec/AlgorithmParameterSpec;)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setDigests([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setAttestationChallenge([B)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setKeyValidityStart(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setIsStrongBoxBacked(Z)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setCertificateSubject(Ljavax/security/auth/x500/X500Principal;)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setCertificateSerialNumber(Ljava/math/BigInteger;)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setCertificateNotBefore(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec\$Builder;" \
+    "setCertificateNotAfter(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec\$Builder;"
 do
     grep -qF "$kgps_method" "$kgpsbsm" || fail "dexed KeyGenParameterSpec Builder lost '$kgps_method'"
 done
@@ -534,9 +543,9 @@ done
 vsm="$work/smali/android/view/View.smali"
 [ -f "$vsm" ] || fail "View.smali not found after baksmali of the installed framework"
 for a in \
-    '.field private on_touch_listener:Landroid/view/View$OnTouchListener;' \
-    '.method public setOnClickListener(Landroid/view/View$OnClickListener;)V' \
-    '        Landroid/view/View$DeclaredOnClickListener;,'; do
+    ".field private on_touch_listener:Landroid/view/View\$OnTouchListener;" \
+    ".method public setOnClickListener(Landroid/view/View\$OnClickListener;)V" \
+    "        Landroid/view/View\$DeclaredOnClickListener;,"; do
     n="$(grep -cF "$a" "$vsm")" || true
     [ "$n" = "1" ] || fail "View.smali anchor not unique (found $n, expected 1): $a — installed View drifted; update patch-framework.sh"
 done
@@ -546,8 +555,8 @@ perl -0pi -e 's{(\.field private on_touch_listener:Landroid/view/View\$OnTouchLi
 perl -0pi -e 's{(\.method public setOnClickListener\(Landroid/view/View\$OnClickListener;\)V.*?\.end method\n)}{$1.method public setOnCapturedPointerListener(Landroid/view/View\$OnCapturedPointerListener;)V\n    .registers 2\n\n    iput-object p1, p0, Landroid/view/View;->mCapturedPointerListener:Landroid/view/View\$OnCapturedPointerListener;\n\n    return-void\n.end method\n}s' "$vsm"
 
 perl -0pi -e 's{(value = \{\n)(        Landroid/view/View\$DeclaredOnClickListener;,\n)}{$1        Landroid/view/View\$OnCapturedPointerListener;,\n$2}' "$vsm"
-grep -qF 'setOnCapturedPointerListener(Landroid/view/View$OnCapturedPointerListener;)V' "$vsm" || fail "View.smali setter insert failed (drift?)"
-grep -qF 'mCapturedPointerListener:Landroid/view/View$OnCapturedPointerListener;' "$vsm" || fail "View.smali field insert failed (drift?)"
+grep -qF "setOnCapturedPointerListener(Landroid/view/View\$OnCapturedPointerListener;)V" "$vsm" || fail "View.smali setter insert failed (drift?)"
+grep -qF "mCapturedPointerListener:Landroid/view/View\$OnCapturedPointerListener;" "$vsm" || fail "View.smali field insert failed (drift?)"
 
 perl -0pi -e 's{(\.method public setOnCapturedPointerListener\(Landroid/view/View\$OnCapturedPointerListener;\)V.*?\.end method\n)}{$1.method public setAutofillHints([Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method\n\n.method public setImportantForAutofill(I)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$vsm"
 grep -qF 'setAutofillHints([Ljava/lang/String;)V' "$vsm" || fail "View.smali setAutofillHints insert failed (drift?)"
@@ -562,9 +571,9 @@ grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali getSupport
 
 n="$(grep -cF '.method public getWidth()I' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali getWidth anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-! grep -qF 'getMode()Landroid/view/Display$Mode;' "$dsm" || fail "Display.smali already declares getMode — installed Display drifted; update patch-framework.sh"
+! grep -qF "getMode()Landroid/view/Display\$Mode;" "$dsm" || fail "Display.smali already declares getMode — installed Display drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public getWidth\(\)I.*?\.end method\n)}{$1.method public getMode()Landroid/view/Display\$Mode;\n    .locals 5\n\n    new-instance v0, Landroid/view/Display\$Mode;\n\n    const/4 v1, 0x0\n\n    sget v2, Landroid/view/Display;->window_width:I\n\n    sget v3, Landroid/view/Display;->window_height:I\n\n    const/high16 v4, 0x42700000\n\n    invoke-direct {v0, v1, v2, v3, v4}, Landroid/view/Display\$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n}s' "$dsm"
-grep -qF 'getMode()Landroid/view/Display$Mode;' "$dsm" || fail "Display.smali getMode insert failed (drift?)"
+grep -qF "getMode()Landroid/view/Display\$Mode;" "$dsm" || fail "Display.smali getMode insert failed (drift?)"
 
 fsm="$work/smali/android/app/Fragment.smali"
 [ -f "$fsm" ] || fail "Fragment.smali not found after baksmali"
@@ -607,7 +616,7 @@ grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali cancel inse
 
 afm="$work/smali/android/view/autofill/AutofillManager.smali"
 [ -f "$afm" ] || fail "AutofillManager.smali not found after baksmali"
-n="$(grep -cF '.method public unregisterCallback(Landroid/view/autofill/AutofillManager$AutofillCallback;)V' "$afm")" || true
+n="$(grep -cF ".method public unregisterCallback(Landroid/view/autofill/AutofillManager\$AutofillCallback;)V" "$afm")" || true
 [ "$n" = "1" ] || fail "AutofillManager.smali unregisterCallback anchor not unique (found $n, expected 1) — installed AutofillManager drifted; update patch-framework.sh"
 ! grep -qF '.method public cancel()V' "$afm" || fail "AutofillManager.smali already declares cancel — installed AutofillManager drifted; update patch-framework.sh"
 perl -0pi -e 's{(\.method public unregisterCallback\(Landroid/view/autofill/AutofillManager\$AutofillCallback;\)V.*?\.end method\n)}{$1.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$afm"
@@ -1010,6 +1019,9 @@ done
 printf '%s\n' 'eclipse-art-overlay-v1' > "$art_ready"
 
 echo "OK: patched framework overlay installed at $OUT"
-echo "    classes.dex (javac-patched): $(ls -l "$work/jar/classes.dex" | awk '{print $5}') bytes; classes2.dex (smali Android API gaps, including LocationManager): $(ls -l "$work/jar/classes2.dex" | awk '{print $5}') bytes; classes3.dex (stock): $(ls -l "$work/jar/classes3.dex" | awk '{print $5}') bytes"
+classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
+classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
+classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
+echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
 echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, date-time, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""
