@@ -1027,7 +1027,7 @@ impl Probe {
                 {
                     let data = std::slice::from_raw_parts(self.mapped, size);
                     let mut png_rgba = data.to_vec();
-                    for px in png_rgba.chunks_exact_mut(4) {
+                    for px in png_rgba.as_chunks_mut::<4>().0 {
                         px[3] = 255;
                     }
                     let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
@@ -1301,7 +1301,9 @@ fn bgra_rows_into(
             return false;
         };
         if swizzle {
-            for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
+            let (destination_pixels, _) = drow.as_chunks_mut::<4>();
+            let (source_pixels, _) = srow.as_chunks::<4>();
+            for (d, s) in destination_pixels.iter_mut().zip(source_pixels) {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];
