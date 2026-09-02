@@ -235,6 +235,66 @@ fn framework_overlay_preserves_location_manager_provider_query_contract() {
 }
 
 #[test]
+fn framework_overlay_preserves_shortcut_manager_contract() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        ".method public getMaxShortcutCountPerActivity()I",
+        "setDynamicShortcuts honest-false patch failed",
+        ".method public getDynamicShortcuts()Ljava/util/List;",
+        "cp \"$shortcut_sm\" \"$work/smali-view/android/content/pm/ShortcutManager.smali\"",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost ShortcutManager contract fragment {needle:?}; Roblox's OS-search worker would regress to NoSuchMethodError/System.exit(10)"
+        );
+    }
+    let max_body = generator
+        .split_once(".method public getMaxShortcutCountPerActivity()I")
+        .expect("ShortcutManager max-count method missing")
+        .1
+        .split_once(".end method")
+        .expect("ShortcutManager max-count method is incomplete")
+        .0;
+    assert!(
+        max_body.contains("const/4 v0, 0x0"),
+        "ShortcutManager must report zero capacity when Eclipse has no desktop shortcut backend"
+    );
+}
+
+#[test]
+fn framework_overlay_preserves_connectivity_v2_contract() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        ".method public getLinkProperties(Landroid/net/Network;)Landroid/net/LinkProperties;",
+        ".method public getNetworkInfo(Landroid/net/Network;)Landroid/net/NetworkInfo;",
+        "cp \"$connectivity_sm\" \"$work/smali-view/android/net/ConnectivityManager.smali\"",
+        "smali/android/net/LinkProperties.smali",
+        "smali/android/net/LinkAddress.smali",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost ConnectivityManager contract fragment {needle:?}; Roblox ConnectivityV2 would regress to NoSuchMethodError"
+        );
+    }
+
+    let link_properties =
+        include_str!("../tools/framework-overlay/smali/android/net/LinkProperties.smali");
+    assert!(
+        link_properties.contains("getLinkAddresses()Ljava/util/List;")
+            && link_properties.contains("Ljava/util/Collections;->emptyList()Ljava/util/List;"),
+        "LinkProperties must expose a non-null empty address list when host addresses are unavailable"
+    );
+    let link_address =
+        include_str!("../tools/framework-overlay/smali/android/net/LinkAddress.smali");
+    for needle in ["getAddress()Ljava/net/InetAddress;", "getPrefixLength()I"] {
+        assert!(
+            link_address.contains(needle),
+            "LinkAddress lost app-referenced contract fragment {needle:?}"
+        );
+    }
+}
+
+#[test]
 fn framework_overlay_preserves_key_generation_quote_contract() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_path =

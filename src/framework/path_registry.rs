@@ -103,7 +103,7 @@ impl PathGeometry {
     }
 
     pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
-        let mut it = self.points.chunks_exact(2);
+        let mut it = self.points.as_chunks::<2>().0.iter();
         let first = it.next()?;
         let (mut min_x, mut min_y) = (first[0], first[1]);
         let (mut max_x, mut max_y) = (first[0], first[1]);

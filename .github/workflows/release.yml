@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux-payload:
+    name: Linux x86-64 payload
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            cmake \
+            curl \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgtk-3-dev \
+            libnss3 \
+            ninja-build \
+            pkg-config \
+            zstd
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo caches
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-payload
+          workspaces: |
+            . -> target
+            crates/eclipse-webview -> target
+
+      - name: Install pinned CEF exporter
+        run: cargo install download-cef --version 2.3.2 --locked
+
+      - name: Build and verify the complete CEF payload
+        run: tools/webview-dist/package-webview.sh
+
+      - name: Create compressed release archive
+        run: |
+          mkdir -p release
+          if [[ "$GITHUB_REF_TYPE" = tag ]]; then
+            archive_name="eclipse-${GITHUB_REF_NAME}-linux-x86_64.tar.zst"
+          else
+            archive_name="eclipse-${GITHUB_SHA:0:7}-linux-x86_64.tar.zst"
+          fi
+          tar --zstd -cf "release/$archive_name" -C dist eclipse-linux-x86_64
+          sha256sum "release/$archive_name" > release/SHA256SUMS
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: eclipse-complete-linux-x86_64
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --generate-notes --title "Eclipse $GITHUB_REF_NAME" --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" release/* --clobber
