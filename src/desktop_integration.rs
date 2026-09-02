@@ -10,7 +10,7 @@ const URL_HANDLER_MIME: &str = "x-scheme-handler/roblox-player";
 pub(super) const BROWSER_HANDLER_COMMAND: &str = "__handle-roblox-player-url";
 
 pub(super) fn install_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let handler = handler_executable()?;
+    let handler = std::env::current_exe()?.canonicalize()?;
     let base_dirs = BaseDirs::new().ok_or_else(|| {
         io::Error::new(
             ErrorKind::NotFound,
@@ -93,25 +93,6 @@ pub(super) fn install_url_handler() -> Result<PathBuf, Box<dyn std::error::Error
     }
 
     Ok(desktop_path)
-}
-
-fn handler_executable() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let executable = std::env::current_exe()?.canonicalize()?;
-    if let Some(root) = cargo_project_root(&executable) {
-        let script = root.join("run-roblox.sh");
-        if is_executable(&script) {
-            return Ok(script.canonicalize()?);
-        }
-    }
-    Ok(executable)
-}
-
-fn cargo_project_root(executable: &Path) -> Option<&Path> {
-    let profile = executable.parent()?;
-    let target = profile.parent()?;
-    (target.file_name()? == "target")
-        .then(|| target.parent())
-        .flatten()
 }
 
 fn desktop_entry(handler: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -213,14 +194,6 @@ mod tests {
         assert_eq!(
             desktop_exec_argument(OsStr::new("/work/100% ready/eclipse")).unwrap(),
             "\"/work/100%% ready/eclipse\""
-        );
-    }
-
-    #[test]
-    fn recognizes_cargo_target_layout() {
-        assert_eq!(
-            cargo_project_root(Path::new("/work/Eclipse/target/release/eclipse")),
-            Some(Path::new("/work/Eclipse"))
         );
     }
 }
