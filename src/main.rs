@@ -820,7 +820,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
         }
         let census = client::with_latest_frame(handle, |stage| {
             let mut distinct = std::collections::HashSet::new();
-            for px in stage.bytes.chunks_exact(4) {
+            for px in stage.bytes.as_chunks::<4>().0 {
                 distinct.insert(u32::from_ne_bytes([px[0], px[1], px[2], px[3]]));
             }
             (stage.width, stage.height, distinct.len())

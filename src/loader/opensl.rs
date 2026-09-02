@@ -119,7 +119,7 @@ impl PcmFormat {
 pub fn pcm_to_f32(bytes: &[u8], bits: u32, out: &mut Vec<f32>) {
     match bits {
         16 => {
-            for frame in bytes.chunks_exact(2) {
+            for frame in bytes.as_chunks::<2>().0 {
                 let s = i16::from_le_bytes([frame[0], frame[1]]);
                 out.push(s as f32 / 32768.0);
             }
