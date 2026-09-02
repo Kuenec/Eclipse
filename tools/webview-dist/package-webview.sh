@@ -41,6 +41,13 @@ CEF_DIST="${CEF_DIST:-$repo/vendor/cef/linux-x86_64}"
 OUT="${OUT:-$repo/dist/eclipse-linux-x86_64}"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
+require_executable() {
+    local executable="$1"
+    local failure="$2"
+    if [ -z "$executable" ] || [ ! -x "$executable" ]; then
+        fail "$failure"
+    fi
+}
 STRIP="${STRIP:-$(command -v strip || true)}"
 READELF="${READELF:-$(command -v readelf || true)}"
 SHA1SUM="${SHA1SUM:-$(command -v sha1sum || true)}"
@@ -50,13 +57,13 @@ DU="${DU:-$(command -v du || true)}"
 CARGO="${CARGO:-$(command -v cargo || true)}"
 CURL="${CURL:-$(command -v curl || true)}"
 EXPORT_CEF_DIR="${EXPORT_CEF_DIR:-$(command -v export-cef-dir || true)}"
-[ -n "$STRIP" ] && [ -x "$STRIP" ] || fail "strip not found (install binutils, or set STRIP)"
-[ -n "$READELF" ] && [ -x "$READELF" ] || fail "readelf not found (install binutils, or set READELF)"
-[ -n "$SHA1SUM" ] && [ -x "$SHA1SUM" ] || fail "sha1sum not found (install coreutils, or set SHA1SUM)"
-[ -n "$SHA256SUM" ] && [ -x "$SHA256SUM" ] || fail "sha256sum not found (install coreutils, or set SHA256SUM)"
-[ -n "$TAR" ] && [ -x "$TAR" ] || fail "tar not found (install tar, or set TAR)"
-[ -n "$DU" ] && [ -x "$DU" ] || fail "du not found (install coreutils, or set DU)"
-[ -n "$CARGO" ] && [ -x "$CARGO" ] || fail "cargo not found (install Rust, or set CARGO)"
+require_executable "$STRIP" "strip not found (install binutils, or set STRIP)"
+require_executable "$READELF" "readelf not found (install binutils, or set READELF)"
+require_executable "$SHA1SUM" "sha1sum not found (install coreutils, or set SHA1SUM)"
+require_executable "$SHA256SUM" "sha256sum not found (install coreutils, or set SHA256SUM)"
+require_executable "$TAR" "tar not found (install tar, or set TAR)"
+require_executable "$DU" "du not found (install coreutils, or set DU)"
+require_executable "$CARGO" "cargo not found (install Rust, or set CARGO)"
 
 guard_out() {
     [ -e "$OUT" ] || return 0
@@ -72,8 +79,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 if [ ! -d "$CEF_DIST" ]; then
-    [ -n "$EXPORT_CEF_DIR" ] && [ -x "$EXPORT_CEF_DIR" ] \
-        || fail "CEF dist not found at $CEF_DIST — 'cargo install export-cef-dir', then re-run (or set CEF_DIST to an existing export)"
+    require_executable "$EXPORT_CEF_DIR" "CEF dist not found at $CEF_DIST — 'cargo install export-cef-dir', then re-run (or set CEF_DIST to an existing export)"
     echo "# fetching the pinned CEF dist via export-cef-dir into $CEF_DIST …"
     "$EXPORT_CEF_DIR" --force "$CEF_DIST" || fail "export-cef-dir failed (network / CDN $CEF_CDN)"
 fi
@@ -88,8 +94,7 @@ dist_sha1="$(sed -n 's/.*"sha1"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CE
 archive_cache="$(dirname "$CEF_DIST")/$PIN_ARCHIVE"
 tarball="$archive_cache"
 if [ ! -f "$tarball" ]; then
-    [ -n "$CURL" ] && [ -x "$CURL" ] \
-        || fail "pinned tarball is not cached at $archive_cache and curl was not found (install curl, or set CURL)"
+    require_executable "$CURL" "pinned tarball is not cached at $archive_cache and curl was not found (install curl, or set CURL)"
     tarball="$work/$PIN_ARCHIVE"
     echo "# fetching the pinned CEF archive from $CEF_CDN …"
     "$CURL" --fail --location --output "$tarball" "$CEF_CDN$PIN_ARCHIVE" \
@@ -159,7 +164,7 @@ printf 'eclipse-webview payload (tools/webview-dist/package-webview.sh) — safe
 cp "$repo/target/release/eclipse" "$OUT/eclipse"
 cp "$repo/crates/eclipse-webview/target/release/eclipse-webview" "$OUT/eclipse-webview"
 
-"$READELF" -d "$OUT/eclipse-webview" | grep -Eq 'RUNPATH.*\$ORIGIN' \
+"$READELF" -d "$OUT/eclipse-webview" | grep -Eq "RUNPATH.*\\\$ORIGIN" \
     || fail "eclipse-webview lacks RUNPATH=\$ORIGIN (a RUSTFLAGS env override replaced crates/eclipse-webview/.cargo/config.toml's rustflags? rebuild without RUSTFLAGS)"
 echo "# RUNPATH=\$ORIGIN verified in eclipse-webview"
 
@@ -167,8 +172,9 @@ echo "# stripping libcef.so ($(stat -c%s "$work/verified/Release/libcef.so") byt
 "$STRIP" -o "$OUT/libcef.so" "$work/verified/Release/libcef.so"
 stripped_size="$(stat -c%s "$OUT/libcef.so")"
 
-[ "$stripped_size" -ge 200000000 ] && [ "$stripped_size" -le 300000000 ] \
-    || fail "stripped libcef.so is $stripped_size bytes — outside the 200–300 MB sanity envelope (M1 reference 256,322,688)"
+if [ "$stripped_size" -lt 200000000 ] || [ "$stripped_size" -gt 300000000 ]; then
+    fail "stripped libcef.so is $stripped_size bytes — outside the 200–300 MB sanity envelope (M1 reference 256,322,688)"
+fi
 echo "# libcef.so stripped to $stripped_size bytes"
 
 for m in "${SHIP_MEMBERS[@]}"; do
