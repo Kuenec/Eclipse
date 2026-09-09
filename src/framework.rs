@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 use jni::errors::LogErrorAndDefault;
@@ -267,6 +267,60 @@ fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     tracing::info!(
         class = "android/net/ConnectivityManager",
         "registered Eclipse's non-GTK backing for nativeRegisterNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
+    );
+    Ok(())
+}
+
+pub const CLIPBOARD_MANAGER_CLASS: &JNIStr = jni_str!("android/content/ClipboardManager");
+
+const CLIPBOARD_NATIVE_SET_NAME: &JNIStr = jni_str!("native_set_clipboard");
+const CLIPBOARD_NATIVE_SET_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V");
+
+static CLIPBOARD_TEXT: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+extern "system" fn clipboard_native_set_clipboard<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        // 2026-09-09: Roblox drives MessageBus -> ClipboardManager.setPrimaryClip at
+        // startup; ATL's ClipboardManager routes it to this native. Without a backing
+        // ART aborts (UnsatisfiedLinkError -> SIGABRT -> Eclipse death). Keep the text
+        // in-process; there is no host clipboard sync on this backend.
+        let stored = if text.is_null() {
+            None
+        } else {
+            Some(text.try_to_string(env)?)
+        };
+        let chars = stored.as_ref().map(String::len).unwrap_or(0);
+        if let Ok(mut slot) = CLIPBOARD_TEXT.lock() {
+            *slot = stored;
+        }
+        tracing::debug!(
+            target: "android.content.ClipboardManager",
+            chars,
+            "ClipboardManager.native_set_clipboard: stored in-process (no host clipboard sync)"
+        );
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+fn register_clipboard_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let class = env.find_class(CLIPBOARD_MANAGER_CLASS)?;
+    let methods = [unsafe {
+        NativeMethod::from_raw_parts(
+            CLIPBOARD_NATIVE_SET_NAME,
+            CLIPBOARD_NATIVE_SET_SIG,
+            clipboard_native_set_clipboard as *mut std::ffi::c_void,
+        )
+    }];
+
+    unsafe { env.register_native_methods(&class, &methods) }?;
+    tracing::info!(
+        class = "android/content/ClipboardManager",
+        "registered Eclipse's in-process backing for native_set_clipboard"
     );
     Ok(())
 }
@@ -12436,6 +12490,8 @@ fn drive_lifecycle(
     register_sensor_manager_natives(env)?;
 
     register_connectivity_natives(env)?;
+
+    register_clipboard_natives(env)?;
 
     register_activity_manager_memory_natives(env)?;
 
