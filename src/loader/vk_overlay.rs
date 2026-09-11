@@ -278,6 +278,8 @@ static HOST_DESTROY_DEVICE: AtomicU64 = AtomicU64::new(0);
 static HOST_QUEUE_PRESENT: AtomicU64 = AtomicU64::new(0);
 static HOST_CREATE_SWAPCHAIN: AtomicU64 = AtomicU64::new(0);
 static HOST_GET_SWAPCHAIN_IMAGES: AtomicU64 = AtomicU64::new(0);
+static HOST_ACQUIRE_NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
+static HOST_ACQUIRE_NEXT_IMAGE2: AtomicU64 = AtomicU64::new(0);
 static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 static INSTANCE: AtomicU64 = AtomicU64::new(0);
@@ -404,8 +406,59 @@ unsafe extern "system" fn eclipse_vk_get_device_proc_addr(
             )
         });
     }
+    if name == c"vkAcquireNextImageKHR" {
+        let host = unsafe { host_gdpa(device, p_name) };
+        HOST_ACQUIRE_NEXT_IMAGE.store(pfn_to_addr(host), Ordering::Relaxed);
+
+        return Some(unsafe {
+            std::mem::transmute::<vk::PFN_vkAcquireNextImageKHR, unsafe extern "system" fn()>(
+                eclipse_vk_acquire_next_image_khr,
+            )
+        });
+    }
+    if name == c"vkAcquireNextImage2KHR" {
+        let host = unsafe { host_gdpa(device, p_name) };
+        HOST_ACQUIRE_NEXT_IMAGE2.store(pfn_to_addr(host), Ordering::Relaxed);
+
+        return Some(unsafe {
+            std::mem::transmute::<vk::PFN_vkAcquireNextImage2KHR, unsafe extern "system" fn()>(
+                eclipse_vk_acquire_next_image2_khr,
+            )
+        });
+    }
 
     unsafe { host_gdpa(device, p_name) }
+}
+
+unsafe extern "system" fn eclipse_vk_acquire_next_image_khr(
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+    timeout: u64,
+    semaphore: vk::Semaphore,
+    fence: vk::Fence,
+    p_image_index: *mut u32,
+) -> vk::Result {
+    let Some(addr) = cached(&HOST_ACQUIRE_NEXT_IMAGE) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let host: vk::PFN_vkAcquireNextImageKHR =
+        unsafe { std::mem::transmute::<usize, vk::PFN_vkAcquireNextImageKHR>(addr) };
+    let _swapchain = swapchain_lock();
+    unsafe { host(device, swapchain, timeout, semaphore, fence, p_image_index) }
+}
+
+unsafe extern "system" fn eclipse_vk_acquire_next_image2_khr(
+    device: vk::Device,
+    p_acquire_info: *const vk::AcquireNextImageInfoKHR<'_>,
+    p_image_index: *mut u32,
+) -> vk::Result {
+    let Some(addr) = cached(&HOST_ACQUIRE_NEXT_IMAGE2) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let host: vk::PFN_vkAcquireNextImage2KHR =
+        unsafe { std::mem::transmute::<usize, vk::PFN_vkAcquireNextImage2KHR>(addr) };
+    let _swapchain = swapchain_lock();
+    unsafe { host(device, p_acquire_info, p_image_index) }
 }
 
 unsafe extern "system" fn eclipse_vk_destroy_device(
@@ -436,11 +489,37 @@ unsafe extern "system" fn eclipse_vk_create_device(
     let host: vk::PFN_vkCreateDevice =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateDevice>(addr) };
 
-    let r = unsafe { host(physical_device, p_create_info, p_allocator, p_device) };
+    let create_info = unsafe { p_create_info.as_ref() };
+    let engine_queues = create_info
+        .filter(|ci| ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null())
+        .map(|ci| unsafe {
+            std::slice::from_raw_parts(ci.p_queue_create_infos, ci.queue_create_info_count as usize)
+        });
+    let reservation = engine_queues.and_then(|infos| {
+        let available = queue_family_queue_count(physical_device, infos[0].queue_family_index)?;
+        reserve_web_present_queue(available, infos[0].queue_count).map(|index| (index, infos))
+    });
+    let (r, reserved_index) = match (reservation, create_info) {
+        (Some((index, infos)), Some(ci)) => {
+            let priorities = vec![1.0f32; index as usize + 1];
+            let mut queue_infos = infos.to_vec();
+            queue_infos[0] = queue_infos[0].queue_priorities(&priorities);
+            let widened = ci.queue_create_infos(&queue_infos);
+            (
+                unsafe { host(physical_device, &widened, p_allocator, p_device) },
+                index,
+            )
+        }
+        _ => (
+            unsafe { host(physical_device, p_create_info, p_allocator, p_device) },
+            u32::MAX,
+        ),
+    };
     if r == vk::Result::SUCCESS && !p_device.is_null() {
         let device = unsafe { *p_device };
 
         PHYSICAL_DEVICE.store(physical_device.as_raw(), Ordering::Relaxed);
+        WEB_PRESENT_QUEUE_INDEX.store(reserved_index, Ordering::Relaxed);
         if !p_create_info.is_null() {
             let ci = unsafe { &*p_create_info };
             if ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null() {
@@ -659,6 +738,756 @@ static WEB_COMPOSITE: Mutex<Option<Probe>> = Mutex::new(None);
 
 static WEB_COMPOSITE_LAST: AtomicU64 = AtomicU64::new(0);
 
+static SWAPCHAIN_LOCK: Mutex<()> = Mutex::new(());
+
+static WEB_PRESENT_QUEUE_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
+
+static LAST_ENGINE_PRESENT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+static WEB_PRESENTER: Mutex<Option<WebPresenter>> = Mutex::new(None);
+
+const WEB_PRESENT_ENGINE_GAP: std::time::Duration = std::time::Duration::from_millis(12);
+
+fn swapchain_lock() -> std::sync::MutexGuard<'static, ()> {
+    SWAPCHAIN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn note_engine_present() {
+    if let Ok(mut last) = LAST_ENGINE_PRESENT.lock() {
+        *last = Some(std::time::Instant::now());
+    }
+}
+
+fn engine_presented_within(gap: std::time::Duration) -> bool {
+    LAST_ENGINE_PRESENT
+        .lock()
+        .ok()
+        .and_then(|last| *last)
+        .is_some_and(|at| at.elapsed() < gap)
+}
+
+fn reserve_web_present_queue(family_queue_count: u32, engine_queue_count: u32) -> Option<u32> {
+    (engine_queue_count > 0 && family_queue_count > engine_queue_count)
+        .then_some(engine_queue_count)
+}
+
+fn queue_family_queue_count(physical_device: vk::PhysicalDevice, family: u32) -> Option<u32> {
+    let entry = super::vulkan_wsi::host_entry()?;
+    let instance_raw = INSTANCE.load(Ordering::Relaxed);
+    if instance_raw == 0 {
+        return None;
+    }
+    let instance =
+        unsafe { ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(instance_raw)) };
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    families.get(family as usize).map(|f| f.queue_count)
+}
+
+fn find_device_local_mem_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+) -> Option<u32> {
+    let usable = |i: u32| (type_bits & (1u32 << i)) != 0;
+    (0..props.memory_type_count)
+        .find(|&i| {
+            usable(i)
+                && props.memory_types[i as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        })
+        .or_else(|| (0..props.memory_type_count).find(|&i| usable(i)))
+}
+
+struct WebPresenter {
+    device: ash::Device,
+    device_raw: u64,
+    queue: vk::Queue,
+    acquire_next_image: vk::PFN_vkAcquireNextImageKHR,
+    queue_present: vk::PFN_vkQueuePresentKHR,
+    swapchain: u64,
+    extent: vk::Extent2D,
+    images: Vec<u64>,
+    command_pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    acquire: vk::Semaphore,
+    done: Vec<vk::Semaphore>,
+    saved: vk::Image,
+    saved_memory: vk::DeviceMemory,
+    saved_valid: bool,
+    frame: vk::Buffer,
+    frame_memory: vk::DeviceMemory,
+    frame_mapped: *mut u8,
+    frame_rect: vk::Rect2D,
+    frame_key: u64,
+}
+
+unsafe impl Send for WebPresenter {}
+
+fn color_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1)
+}
+
+fn color_layers() -> vk::ImageSubresourceLayers {
+    vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1)
+}
+
+unsafe fn record_save_engine_frame(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    saved: vk::Image,
+    extent: vk::Extent2D,
+) {
+    let to_src = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(color_range());
+    let saved_writable = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(saved)
+        .subresource_range(color_range());
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_src, saved_writable],
+        );
+        let copy = vk::ImageCopy::default()
+            .src_subresource(color_layers())
+            .dst_subresource(color_layers())
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            });
+        device.cmd_copy_image(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            saved,
+            vk::ImageLayout::GENERAL,
+            &[copy],
+        );
+    }
+}
+
+impl WebPresenter {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        entry: &ash::Entry,
+        instance_raw: u64,
+        device_raw: u64,
+        physical_raw: u64,
+        queue_family: u32,
+        queue_index: u32,
+        swapchain: u64,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        images: Vec<u64>,
+    ) -> Option<WebPresenter> {
+        if instance_raw == 0
+            || device_raw == 0
+            || physical_raw == 0
+            || queue_family == u32::MAX
+            || swapchain == 0
+            || extent.width == 0
+            || extent.height == 0
+            || images.is_empty()
+        {
+            return None;
+        }
+        let host_gdpa_addr = cached(&HOST_GDPA)?;
+        let host_gdpa: vk::PFN_vkGetDeviceProcAddr =
+            unsafe { std::mem::transmute::<usize, vk::PFN_vkGetDeviceProcAddr>(host_gdpa_addr) };
+        let device_handle = vk::Device::from_raw(device_raw);
+        let acquire_next_image: vk::PFN_vkAcquireNextImageKHR = unsafe {
+            std::mem::transmute::<vk::PFN_vkVoidFunction, Option<vk::PFN_vkAcquireNextImageKHR>>(
+                host_gdpa(device_handle, c"vkAcquireNextImageKHR".as_ptr()),
+            )
+        }?;
+        let queue_present: vk::PFN_vkQueuePresentKHR = unsafe {
+            std::mem::transmute::<vk::PFN_vkVoidFunction, Option<vk::PFN_vkQueuePresentKHR>>(
+                host_gdpa(device_handle, c"vkQueuePresentKHR".as_ptr()),
+            )
+        }?;
+
+        let instance =
+            unsafe { ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(instance_raw)) };
+        let device = unsafe { ash::Device::load(instance.fp_v1_0(), device_handle) };
+        let mem_props = unsafe {
+            instance
+                .get_physical_device_memory_properties(vk::PhysicalDevice::from_raw(physical_raw))
+        };
+        let queue = unsafe { device.get_device_queue(queue_family, queue_index) };
+
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(queue_family);
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }.ok()?;
+        let mut presenter = WebPresenter {
+            device: device.clone(),
+            device_raw,
+            queue,
+            acquire_next_image,
+            queue_present,
+            swapchain,
+            extent,
+            images,
+            command_pool,
+            cmd: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            acquire: vk::Semaphore::null(),
+            done: Vec::new(),
+            saved: vk::Image::null(),
+            saved_memory: vk::DeviceMemory::null(),
+            saved_valid: false,
+            frame: vk::Buffer::null(),
+            frame_memory: vk::DeviceMemory::null(),
+            frame_mapped: std::ptr::null_mut(),
+            frame_rect: vk::Rect2D::default(),
+            frame_key: 0,
+        };
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        presenter.cmd = unsafe { device.allocate_command_buffers(&alloc) }
+            .ok()?
+            .into_iter()
+            .next()?;
+        presenter.fence = unsafe {
+            device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        }
+        .ok()?;
+        presenter.acquire =
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.ok()?;
+        for _ in 0..presenter.images.len() {
+            let done =
+                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                    .ok()?;
+            presenter.done.push(done);
+        }
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        presenter.saved = unsafe { device.create_image(&image_info, None) }.ok()?;
+        let image_req = unsafe { device.get_image_memory_requirements(presenter.saved) };
+        let image_mt = find_device_local_mem_type(&mem_props, image_req.memory_type_bits)?;
+        presenter.saved_memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(image_req.size)
+                    .memory_type_index(image_mt),
+                None,
+            )
+        }
+        .ok()?;
+        unsafe { device.bind_image_memory(presenter.saved, presenter.saved_memory, 0) }.ok()?;
+
+        let frame_bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(frame_bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        presenter.frame = unsafe { device.create_buffer(&buffer_info, None) }.ok()?;
+        let buffer_req = unsafe { device.get_buffer_memory_requirements(presenter.frame) };
+        let buffer_mt = find_host_visible_mem_type(&mem_props, buffer_req.memory_type_bits)?;
+        presenter.frame_memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(buffer_req.size)
+                    .memory_type_index(buffer_mt),
+                None,
+            )
+        }
+        .ok()?;
+        unsafe { device.bind_buffer_memory(presenter.frame, presenter.frame_memory, 0) }.ok()?;
+        presenter.frame_mapped = unsafe {
+            device.map_memory(
+                presenter.frame_memory,
+                0,
+                frame_bytes,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .ok()?
+        .cast::<u8>();
+
+        unsafe { presenter.initialize_saved_layout() }.then_some(presenter)
+    }
+
+    unsafe fn initialize_saved_layout(&mut self) -> bool {
+        unsafe {
+            if self.device.reset_fences(&[self.fence]).is_err() {
+                return false;
+            }
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
+                return false;
+            }
+            let to_general = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.saved)
+                .subresource_range(color_range());
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_general],
+            );
+            if self.device.end_command_buffer(self.cmd).is_err() {
+                return false;
+            }
+            let cmds = [self.cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            self.device
+                .queue_submit(self.queue, &[submit], self.fence)
+                .is_ok()
+                && self
+                    .device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .is_ok()
+        }
+    }
+
+    fn saved_target(&self, extent: vk::Extent2D) -> Option<vk::Image> {
+        (self.extent == extent).then_some(self.saved)
+    }
+
+    fn matches(&self, swapchain: u64, extent: vk::Extent2D, images: &[u64]) -> bool {
+        self.swapchain == swapchain && self.extent == extent && self.images == images
+    }
+
+    unsafe fn fill(
+        &mut self,
+        key: u64,
+        rect: vk::Rect2D,
+        src: &[u8],
+        src_stride: usize,
+        swizzle: bool,
+    ) -> bool {
+        if rect.extent.width == 0
+            || rect.extent.height == 0
+            || rect.extent.width > self.extent.width
+            || rect.extent.height > self.extent.height
+        {
+            return false;
+        }
+        if self.frame_key == key && self.frame_rect == rect {
+            return true;
+        }
+        if unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .is_err()
+        } {
+            return false;
+        }
+        let row_bytes = rect.extent.width as usize * 4;
+        let rows = rect.extent.height as usize;
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.frame_mapped, row_bytes * rows) };
+        if !bgra_rows_into(dst, row_bytes, src, src_stride, rows, row_bytes, swizzle) {
+            return false;
+        }
+        self.frame_key = key;
+        self.frame_rect = rect;
+        true
+    }
+
+    unsafe fn present(&mut self) -> bool {
+        let mut image_index = 0u32;
+        let acquired = unsafe {
+            (self.acquire_next_image)(
+                vk::Device::from_raw(self.device_raw),
+                vk::SwapchainKHR::from_raw(self.swapchain),
+                0,
+                self.acquire,
+                vk::Fence::null(),
+                &mut image_index,
+            )
+        };
+        if acquired != vk::Result::SUCCESS && acquired != vk::Result::SUBOPTIMAL_KHR {
+            return false;
+        }
+        let Some(&image_raw) = self.images.get(image_index as usize) else {
+            return false;
+        };
+        let Some(&done) = self.done.get(image_index as usize) else {
+            return false;
+        };
+        let image = vk::Image::from_raw(image_raw);
+        let full = vk::Extent3D {
+            width: self.extent.width,
+            height: self.extent.height,
+            depth: 1,
+        };
+        unsafe {
+            if self.device.reset_fences(&[self.fence]).is_err()
+                || self
+                    .device
+                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                    .is_err()
+            {
+                return false;
+            }
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
+                return false;
+            }
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_range());
+            let saved_readable = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.saved)
+                .subresource_range(color_range());
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst, saved_readable],
+            );
+            if self.saved_valid {
+                let copy = vk::ImageCopy::default()
+                    .src_subresource(color_layers())
+                    .dst_subresource(color_layers())
+                    .extent(full);
+                self.device.cmd_copy_image(
+                    self.cmd,
+                    self.saved,
+                    vk::ImageLayout::GENERAL,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy],
+                );
+                let ordered = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(color_range());
+                self.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[ordered],
+                );
+            } else {
+                self.device.cmd_clear_color_image(
+                    self.cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                    &[color_range()],
+                );
+            }
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(color_layers())
+                .image_offset(vk::Offset3D {
+                    x: self.frame_rect.offset.x,
+                    y: self.frame_rect.offset.y,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: self.frame_rect.extent.width,
+                    height: self.frame_rect.extent.height,
+                    depth: 1,
+                });
+            self.device.cmd_copy_buffer_to_image(
+                self.cmd,
+                self.frame,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            let to_present = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_range());
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+            if self.device.end_command_buffer(self.cmd).is_err() {
+                return false;
+            }
+            let waits = [self.acquire];
+            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let cmds = [self.cmd];
+            let signals = [done];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals);
+            if self
+                .device
+                .queue_submit(self.queue, &[submit], self.fence)
+                .is_err()
+            {
+                return false;
+            }
+            let swapchains = [vk::SwapchainKHR::from_raw(self.swapchain)];
+            let indices = [image_index];
+            let present = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signals)
+                .swapchains(&swapchains)
+                .image_indices(&indices);
+            let presented = (self.queue_present)(self.queue, &present);
+            let _ = self.device.wait_for_fences(&[self.fence], true, u64::MAX);
+            presented == vk::Result::SUCCESS || presented == vk::Result::SUBOPTIMAL_KHR
+        }
+    }
+}
+
+impl Drop for WebPresenter {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            for done in self.done.drain(..) {
+                self.device.destroy_semaphore(done, None);
+            }
+            self.device.destroy_semaphore(self.acquire, None);
+            self.device.destroy_buffer(self.frame, None);
+            self.device.free_memory(self.frame_memory, None);
+            self.device.destroy_image(self.saved, None);
+            self.device.free_memory(self.saved_memory, None);
+            self.device.destroy_fence(self.fence, None);
+            self.device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+fn ensure_web_presenter() -> bool {
+    let queue_index = WEB_PRESENT_QUEUE_INDEX.load(Ordering::Relaxed);
+    if queue_index == u32::MAX {
+        return false;
+    }
+    let (device, swapchain, extent, format, images) = match STATE.lock() {
+        Ok(st) => (
+            st.device,
+            st.swapchain,
+            vk::Extent2D {
+                width: st.width,
+                height: st.height,
+            },
+            vk::Format::from_raw(st.format),
+            st.images.clone(),
+        ),
+        Err(_) => return false,
+    };
+    if device == 0 || swapchain == 0 || images.is_empty() {
+        return false;
+    }
+    let Ok(mut slot) = WEB_PRESENTER.lock() else {
+        return false;
+    };
+    if slot
+        .as_ref()
+        .is_some_and(|p| p.matches(swapchain, extent, &images))
+    {
+        return true;
+    }
+    *slot = None;
+    let Some(entry) = super::vulkan_wsi::host_entry() else {
+        return false;
+    };
+    match WebPresenter::build(
+        entry,
+        INSTANCE.load(Ordering::Relaxed),
+        device,
+        PHYSICAL_DEVICE.load(Ordering::Relaxed),
+        QUEUE_FAMILY.load(Ordering::Relaxed),
+        queue_index,
+        swapchain,
+        extent,
+        format,
+        images,
+    ) {
+        Some(presenter) => {
+            tracing::info!(
+                queue_index,
+                width = extent.width,
+                height = extent.height,
+                "vk-overlay: independent WebView presenter armed on Eclipse's reserved queue"
+            );
+            *slot = Some(presenter);
+            true
+        }
+        None => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "vk-overlay: independent WebView presenter unavailable; WebView frames \
+                     will only reach the screen when the engine presents"
+                );
+            }
+            false
+        }
+    }
+}
+
+fn engine_frame_save_target(extent: vk::Extent2D) -> Option<vk::Image> {
+    if !ensure_web_presenter() {
+        return None;
+    }
+    WEB_PRESENTER
+        .lock()
+        .ok()?
+        .as_ref()
+        .and_then(|p| p.saved_target(extent))
+}
+
+fn mark_engine_frame_saved() {
+    if let Ok(mut slot) = WEB_PRESENTER.lock() {
+        if let Some(p) = slot.as_mut() {
+            p.saved_valid = true;
+        }
+    }
+}
+
+pub(crate) fn present_staged_webview_frame(view: i64) {
+    if crate::webview::client::active_view() != view
+        || engine_presented_within(WEB_PRESENT_ENGINE_GAP)
+    {
+        return;
+    }
+    let _swapchain = swapchain_lock();
+    if engine_presented_within(WEB_PRESENT_ENGINE_GAP) || !ensure_web_presenter() {
+        return;
+    }
+    let (extent, format_raw) = match STATE.lock() {
+        Ok(st) => (
+            vk::Extent2D {
+                width: st.width,
+                height: st.height,
+            },
+            st.format,
+        ),
+        Err(_) => return,
+    };
+    let swizzle = match classify_swapchain_format(format_raw) {
+        CompositeFormat::Bgra => false,
+        CompositeFormat::RgbaSwizzle => true,
+        CompositeFormat::Unsupported => return,
+    };
+    let Ok(mut slot) = WEB_PRESENTER.lock() else {
+        return;
+    };
+    let Some(presenter) = slot.as_mut() else {
+        return;
+    };
+    let filled = crate::webview::client::with_latest_frame(view, |stage| {
+        if stage.bytes.is_empty() {
+            return false;
+        }
+        let Some((x, y, w, h)) = resolve_webview_rect(
+            crate::webview::client::composited_rect(),
+            extent.width,
+            extent.height,
+            stage.width,
+            stage.height,
+        ) else {
+            return false;
+        };
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x as i32,
+                y: y as i32,
+            },
+            extent: vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        };
+        let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
+        unsafe { presenter.fill(key, rect, &stage.bytes, stage.stride as usize, swizzle) }
+    })
+    .unwrap_or(false);
+    if filled {
+        unsafe { presenter.present() };
+    }
+}
+
 fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Device) {
     let mut probe = match slot.lock() {
         Ok(probe) => probe,
@@ -678,6 +1507,14 @@ fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Dev
 fn release_overlay_device_resources(device: vk::Device) {
     release_probe_for_device(&PROBE, device);
     release_probe_for_device(&WEB_COMPOSITE, device);
+    if let Ok(mut slot) = WEB_PRESENTER.lock() {
+        if slot
+            .as_ref()
+            .is_some_and(|p| p.device_raw == device.as_raw())
+        {
+            *slot = None;
+        }
+    }
 
     let mut state = match STATE.lock() {
         Ok(state) => state,
@@ -696,6 +1533,9 @@ fn release_overlay_device_resources(device: vk::Device) {
     HOST_QUEUE_PRESENT.store(0, Ordering::Relaxed);
     HOST_CREATE_SWAPCHAIN.store(0, Ordering::Relaxed);
     HOST_GET_SWAPCHAIN_IMAGES.store(0, Ordering::Relaxed);
+    HOST_ACQUIRE_NEXT_IMAGE.store(0, Ordering::Relaxed);
+    HOST_ACQUIRE_NEXT_IMAGE2.store(0, Ordering::Relaxed);
+    WEB_PRESENT_QUEUE_INDEX.store(u32::MAX, Ordering::Relaxed);
     WEB_COMPOSITE_LAST.store(0, Ordering::Relaxed);
 }
 
@@ -1084,6 +1924,7 @@ impl Probe {
         src_stride: usize,
         swizzle: bool,
         refresh: bool,
+        save_into: Option<(vk::Image, vk::Extent2D)>,
     ) -> bool {
         let image = vk::Image::from_raw(image_raw);
         let range = vk::ImageSubresourceRange::default()
@@ -1158,10 +1999,15 @@ impl Probe {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[region],
             );
+            let mut presented_from = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+            if let Some((saved, extent)) = save_into {
+                record_save_engine_frame(&self.device, self.cmd, image, saved, extent);
+                presented_from = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+            }
             let back = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .old_layout(presented_from)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ)
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -1421,6 +2267,7 @@ fn composite_webview_frame(
         let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect);
         let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
         let refresh = rebuilt || WEB_COMPOSITE_LAST.load(Ordering::Relaxed) != key;
+        let save_into = engine_frame_save_target(extent).map(|saved| (saved, extent));
         let consumed = match WEB_COMPOSITE.lock() {
             Ok(guard) => match guard.as_ref() {
                 Some(p) => unsafe {
@@ -1432,12 +2279,16 @@ fn composite_webview_frame(
                         stage.stride as usize,
                         swizzle,
                         refresh,
+                        save_into,
                     )
                 },
                 None => false,
             },
             Err(_) => false,
         };
+        if consumed && save_into.is_some() {
+            mark_engine_frame_saved();
+        }
         if consumed && refresh {
             WEB_COMPOSITE_LAST.store(key, Ordering::Relaxed);
         }
@@ -1646,12 +2497,23 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
     let host: vk::PFN_vkQueuePresentKHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkQueuePresentKHR>(addr) };
 
+    note_engine_present();
+    let _swapchain = swapchain_lock();
     unsafe { present_with_overlay(host, queue, p_present_info) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_present_queue_is_reserved_only_when_the_family_has_a_spare_queue() {
+        assert_eq!(reserve_web_present_queue(16, 1), Some(1));
+        assert_eq!(reserve_web_present_queue(2, 1), Some(1));
+        assert_eq!(reserve_web_present_queue(3, 2), Some(2));
+        assert_eq!(reserve_web_present_queue(1, 1), None);
+        assert_eq!(reserve_web_present_queue(4, 0), None);
+    }
 
     #[test]
     fn bgra_rows_into_copies_and_swizzles_rows() {

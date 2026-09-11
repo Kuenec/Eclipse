@@ -1084,6 +1084,8 @@ struct DispatchOut {
     replies: Vec<ConsumerMsg>,
     upcalls: Vec<Upcall>,
 
+    staged_view: Option<i64>,
+
     closed: Vec<i64>,
 
     bridge_calls: Vec<(i64, u32, String)>,
@@ -1149,6 +1151,7 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
                             vs.stage.stride = map.stride;
                             vs.stage.generation = generation;
                             vs.stage.seq = seq;
+                            out.staged_view = Some(view);
                             out.replies.push(ConsumerMsg::FrameAck {
                                 view,
                                 generation,
@@ -1425,6 +1428,9 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender
                 reader_fatal("control-socket write failed (FrameAck)");
                 return;
             }
+        }
+        if let Some(view) = out.staged_view {
+            crate::loader::vk_overlay::present_staged_webview_frame(view);
         }
 
         for up in out.upcalls {
@@ -2106,6 +2112,14 @@ pub fn send_mouse_wheel(view: i64, x: i32, y: i32, delta_y: i32) {
         delta_x: 0,
         delta_y,
         modifiers: 0,
+    });
+}
+
+pub fn resize_view(view: i64, width: u16, height: u16) {
+    send_input(&ConsumerMsg::ResizeView {
+        view,
+        width,
+        height,
     });
 }
 

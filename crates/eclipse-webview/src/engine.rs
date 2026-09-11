@@ -22,7 +22,7 @@ const COMPONENT: &str = "engine";
 
 const SLOT_COUNT: u8 = 2;
 
-const WINDOWLESS_FPS: c_int = 30;
+const WINDOWLESS_FPS: c_int = 60;
 
 const COOKIE_VISIT_DEADLINE: Duration = Duration::from_secs(5);
 
