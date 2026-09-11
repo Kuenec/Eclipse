@@ -5941,7 +5941,7 @@ fn warn_load_data_unavailable(widget: jlong, base: &str, reason: &str) {
     }
 }
 
-fn web_view_create_dims(widget: jlong) -> (u16, u16) {
+fn web_view_dims(widget: jlong) -> (u16, u16) {
     fn clamp_dim(v: i32) -> u16 {
         v.clamp(1, i32::from(u16::MAX)) as u16
     }
@@ -5956,6 +5956,15 @@ fn web_view_create_dims(widget: jlong) -> (u16, u16) {
         }
     }
     (1024, 768)
+}
+
+pub fn resize_active_web_view() {
+    let view = crate::webview::client::active_view();
+    if view == 0 {
+        return;
+    }
+    let (width, height) = web_view_dims(view);
+    crate::webview::client::resize_view(view, width, height);
 }
 
 extern "system" fn web_view_native_load_url<'local>(
@@ -5994,7 +6003,7 @@ extern "system" fn web_view_native_load_url<'local>(
             return Ok(());
         };
         let target = url_scheme_and_host_for_log(&full);
-        let (w, h) = web_view_create_dims(widget);
+        let (w, h) = web_view_dims(widget);
 
         match env.get_java_vm() {
             Ok(java_vm) => {
@@ -6067,7 +6076,7 @@ extern "system" fn web_view_native_load_data_with_base_url<'local>(
             warn_load_data_unavailable(widget, &log_base, "data payload null/unreadable");
             return Ok(());
         };
-        let (w, h) = web_view_create_dims(widget);
+        let (w, h) = web_view_dims(widget);
         match env.get_java_vm() {
             Ok(java_vm) => match crate::webview::client::drive_load_data(
                 java_vm, widget, base, data_s, mime_s, encoding_s, w, h,
@@ -6808,6 +6817,10 @@ const ECLIPSE_BRIDGE_PROBE_CLASS: &JNIStr = jni_str!("android/webkit/EclipseBrid
 
 fn object_field_sig() -> FieldSignature<'static> {
     unsafe { FieldSignature::from_raw_parts(jni_str!("Ljava/lang/Object;"), JavaType::Object) }
+}
+
+fn int_field_sig() -> FieldSignature<'static> {
+    unsafe { FieldSignature::from_raw_parts(jni_str!("I"), JavaType::Primitive(Primitive::Int)) }
 }
 
 pub fn webview_evaluate(vm: &Vm, widget: jlong, script: &str) -> Result<(), FrameworkError> {
@@ -12005,6 +12018,43 @@ pub fn pass_hardware_key_to_engine(
 
 const RBX_SURFACE_VIEW_CLASS: &str = "com.roblox.client.RBXSurfaceView";
 
+const DISPLAY_CLASS: &JNIStr = jni_str!("android/view/Display");
+const DISPLAY_WINDOW_WIDTH_FIELD: &JNIStr = jni_str!("window_width");
+const DISPLAY_WINDOW_HEIGHT_FIELD: &JNIStr = jni_str!("window_height");
+
+pub fn publish_window_size(vm: &Vm, width: i32, height: i32) -> Result<(), FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), FrameworkError> {
+            let class = checked(env, "find Display", |env| env.find_class(DISPLAY_CLASS))?;
+            checked(env, "Display.window_width", |env| {
+                env.set_static_field(
+                    &class,
+                    DISPLAY_WINDOW_WIDTH_FIELD,
+                    int_field_sig(),
+                    JValue::Int(width),
+                )
+            })?;
+            checked(env, "Display.window_height", |env| {
+                env.set_static_field(
+                    &class,
+                    DISPLAY_WINDOW_HEIGHT_FIELD,
+                    int_field_sig(),
+                    JValue::Int(height),
+                )
+            })
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
 pub fn publish_engine_display_refresh_rates(
     vm: &Vm,
     current_hz: Option<f32>,
@@ -12124,8 +12174,27 @@ fn surface_callback_ready(env: &mut Env) -> Result<bool, FrameworkError> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceLifecycle {
+    CreatedAndChanged,
+    Changed,
+}
+
 pub fn dispatch_surface_lifecycle(
     vm: &Vm,
+    width: i32,
+    height: i32,
+) -> Result<bool, FrameworkError> {
+    dispatch_surface_event(vm, SurfaceLifecycle::CreatedAndChanged, width, height)
+}
+
+pub fn dispatch_surface_changed(vm: &Vm, width: i32, height: i32) -> Result<bool, FrameworkError> {
+    dispatch_surface_event(vm, SurfaceLifecycle::Changed, width, height)
+}
+
+fn dispatch_surface_event(
+    vm: &Vm,
+    event: SurfaceLifecycle,
     width: i32,
     height: i32,
 ) -> Result<bool, FrameworkError> {
@@ -12136,14 +12205,21 @@ pub fn dispatch_surface_lifecycle(
 
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| surface_lifecycle(env, width, height))) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            surface_lifecycle(env, event, width, height)
+        })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
         }
     })
 }
 
-fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, FrameworkError> {
+fn surface_lifecycle(
+    env: &mut Env,
+    event: SurfaceLifecycle,
+    width: i32,
+    height: i32,
+) -> Result<bool, FrameworkError> {
     let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
         return Ok(false);
     };
@@ -12155,15 +12231,17 @@ fn surface_lifecycle(env: &mut Env, width: i32, height: i32) -> Result<bool, Fra
             return Ok(false);
         }
 
-        checked(env, "SurfaceView.surfaceCreated", |env| {
-            env.call_method(
-                surface_view,
-                jni_str!("surfaceCreated"),
-                jni_sig!("()V"),
-                &[],
-            )?
-            .v()
-        })?;
+        if event == SurfaceLifecycle::CreatedAndChanged {
+            checked(env, "SurfaceView.surfaceCreated", |env| {
+                env.call_method(
+                    surface_view,
+                    jni_str!("surfaceCreated"),
+                    jni_sig!("()V"),
+                    &[],
+                )?
+                .v()
+            })?;
+        }
         checked(env, "SurfaceView.surfaceChanged", |env| {
             env.call_method(
                 surface_view,

@@ -54,6 +54,8 @@ struct GameWindow<'vm> {
 
     handed_off: bool,
 
+    published_window_size: Option<(i32, i32)>,
+
     engine_tap_downtime: Option<i64>,
 
     handoff_at: Option<std::time::Instant>,
@@ -191,6 +193,7 @@ impl ApplicationHandler for GameWindow<'_> {
                     geometry.width,
                     geometry.height,
                 );
+                self.propagate_window_resize(geometry.width, geometry.height);
                 match crate::egl_engine::EngineNativeWindow::new(handle.as_raw(), geometry) {
                     Ok(engine_window) => {
                         tracing::info!(
@@ -265,6 +268,7 @@ impl ApplicationHandler for GameWindow<'_> {
                     .as_ref()
                     .map(|w| w.as_native_window() as usize);
                 publish_engine_window_geometry(wsi_ptr, geo.width, geo.height);
+                self.propagate_window_resize(geo.width, geo.height);
 
                 self.publish_engine_display_refresh_rates();
             }
@@ -343,6 +347,12 @@ impl ApplicationHandler for GameWindow<'_> {
                                 self.engine_primary_release();
                             }
                         }
+                    }
+                } else if crate::webview::client::active_view() != 0
+                    && active_webview_button_route(button) == ActiveWebViewButtonRoute::ActivityBack
+                {
+                    if state == ElementState::Pressed {
+                        self.activity_back();
                     }
                 } else {
                     self.engine_aux_mouse_button(button, state == ElementState::Pressed);
@@ -534,6 +544,19 @@ fn active_webview_key_route(key: &winit::keyboard::Key) -> ActiveWebViewKeyRoute
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveWebViewButtonRoute {
+    ActivityBack,
+    Engine,
+}
+
+fn active_webview_button_route(button: MouseButton) -> ActiveWebViewButtonRoute {
+    match button {
+        MouseButton::Back => ActiveWebViewButtonRoute::ActivityBack,
+        _ => ActiveWebViewButtonRoute::Engine,
+    }
+}
+
 fn route_key_to_webview(view: i64, event: &winit::event::KeyEvent) {
     use winit::keyboard::{Key, NamedKey};
     if event.state != ElementState::Pressed {
@@ -580,6 +603,36 @@ impl GameWindow<'_> {
             Ok(false) => tracing::warn!("active WebView Back input has no live Android Activity"),
             Err(error) => tracing::warn!(%error, "active WebView Back dispatch failed"),
         }
+    }
+
+    fn propagate_window_resize(&mut self, width: i32, height: i32) {
+        if self.published_window_size == Some((width, height)) {
+            return;
+        }
+        self.published_window_size = Some((width, height));
+        let Some(vm) = self.vm else { return };
+        if let Err(e) = crate::framework::publish_window_size(vm, width, height) {
+            tracing::warn!(error = %e, width, height, "Display window size publish failed (ignored)");
+        }
+        if !self.handed_off {
+            return;
+        }
+        match crate::framework::dispatch_surface_changed(vm, width, height) {
+            Ok(true) => tracing::info!(
+                width,
+                height,
+                "window resize dispatched to the engine SurfaceView (surfaceChanged)"
+            ),
+            Ok(false) => tracing::debug!(
+                width,
+                height,
+                "window resize: engine SurfaceView not dispatchable"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "window resize: surfaceChanged dispatch failed (ignored)")
+            }
+        }
+        crate::framework::resize_active_web_view();
     }
 
     fn publish_engine_display_refresh_rates(&mut self) {
@@ -1196,6 +1249,7 @@ pub fn run_windowed(
         synthetic_tap_done: false,
         engine_window: None,
         handed_off: false,
+        published_window_size: None,
         engine_tap_downtime: None,
         handoff_at: None,
         engine_synthetic_tap_done: false,
@@ -5139,6 +5193,25 @@ mod tests {
             active_webview_key_route(&Key::Named(NamedKey::Escape)),
             ActiveWebViewKeyRoute::ActivityBack
         );
+    }
+
+    #[test]
+    fn mouse_back_button_bypasses_the_engine_for_activity_back_navigation() {
+        assert_eq!(
+            active_webview_button_route(MouseButton::Back),
+            ActiveWebViewButtonRoute::ActivityBack
+        );
+        for button in [
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Forward,
+            MouseButton::Other(9),
+        ] {
+            assert_eq!(
+                active_webview_button_route(button),
+                ActiveWebViewButtonRoute::Engine
+            );
+        }
     }
 
     #[test]
