@@ -170,7 +170,7 @@ The public E2E job uses Mesa software rendering under Xvfb and does not require 
 The detached WebView helper and its pinned CEF runtime are intentionally kept out of the root Cargo graph. To assemble the complete Linux payload:
 
 ```bash
-cargo install download-cef --version 2.3.2 --locked
+cargo install export-cef-dir --version 149.3.0 --locked
 ./tools/webview-dist/package-webview.sh
 ```
 
