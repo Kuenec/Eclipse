@@ -203,7 +203,7 @@ fn register_log_natives(env: &mut Env) -> Result<(), FrameworkError> {
 
 pub const CONNECTIVITY_MANAGER_CLASS: &JNIStr = jni_str!("android/net/ConnectivityManager");
 
-const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("nativeRegisterNetworkCallback");
+const CM_REGISTER_NETWORK_CALLBACK_NAME: &JNIStr = jni_str!("registerNetworkCallback");
 const CM_REGISTER_NETWORK_CALLBACK_SIG: &JNIStr =
     jni_str!("(Landroid/net/NetworkRequest;Landroid/net/ConnectivityManager$NetworkCallback;)V");
 const CM_IS_ACTIVE_NETWORK_METERED_NAME: &JNIStr = jni_str!("isActiveNetworkMetered");
@@ -266,7 +266,7 @@ fn register_connectivity_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/net/ConnectivityManager",
-        "registered Eclipse's non-GTK backing for nativeRegisterNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
+        "registered Eclipse's non-GTK backing for registerNetworkCallback (no-op) + isActiveNetworkMetered (false) + nativeGetNetworkAvailable (true)"
     );
     Ok(())
 }
@@ -10389,8 +10389,6 @@ const WINDOW_SET_WIDGET_AS_ROOT_SIG: &JNIStr = jni_str!("(JJ)V");
 
 const WINDOW_REMOVE_GTK_BACKGROUND_NAME: &JNIStr = jni_str!("remove_gtk_background");
 const WINDOW_REMOVE_GTK_BACKGROUND_SIG: &JNIStr = jni_str!("(J)V");
-const WINDOW_INSTALL_THEME_CSS_NAME: &JNIStr = jni_str!("native_install_theme_css");
-const WINDOW_INSTALL_THEME_CSS_SIG: &JNIStr = jni_str!("(JLjava/lang/String;)V");
 const WINDOW_SET_SCREEN_BRIGHTNESS_NAME: &JNIStr = jni_str!("set_screen_brightness");
 const WINDOW_SET_SCREEN_BRIGHTNESS_SIG: &JNIStr = jni_str!("(F)V");
 const WINDOW_TAKE_INPUT_QUEUE_NAME: &JNIStr = jni_str!("take_input_queue");
@@ -10514,38 +10512,6 @@ extern "system" fn window_remove_gtk_background<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
-extern "system" fn window_install_theme_css<'local>(
-    mut env: EnvUnowned<'local>,
-    _this: JObject<'local>,
-    native_window: jlong,
-    css: JString<'local>,
-) {
-    env.with_env(|env| -> jni::errors::Result<()> {
-        let css_len = if css.is_null() {
-            0
-        } else {
-            css.try_to_string(env)?.len()
-        };
-        if let Err(e) = window_registry::with_window(native_window, |_w| ()) {
-            tracing::debug!(
-                target: "android.view.Window",
-                native_window,
-                error = %e,
-                "Window.native_install_theme_css: invalid window handle (ignored)"
-            );
-        } else {
-            tracing::trace!(
-                target: "android.view.Window",
-                native_window,
-                css_len,
-                "Window.native_install_theme_css: validated handle, no-op (non-GTK window)"
-            );
-        }
-        Ok(())
-    })
-    .resolve::<LogErrorAndDefault>()
-}
-
 extern "system" fn window_set_screen_brightness<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
@@ -10662,13 +10628,6 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
         },
         unsafe {
             NativeMethod::from_raw_parts(
-                WINDOW_INSTALL_THEME_CSS_NAME,
-                WINDOW_INSTALL_THEME_CSS_SIG,
-                window_install_theme_css as *mut std::ffi::c_void,
-            )
-        },
-        unsafe {
-            NativeMethod::from_raw_parts(
                 WINDOW_SET_SCREEN_BRIGHTNESS_NAME,
                 WINDOW_SET_SCREEN_BRIGHTNESS_SIG,
                 window_set_screen_brightness as *mut std::ffi::c_void,
@@ -10686,7 +10645,7 @@ fn register_window_natives(env: &mut Env) -> Result<(), FrameworkError> {
     unsafe { env.register_native_methods(&class, &methods) }?;
     tracing::info!(
         class = "android/view/Window",
-        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root + remove_gtk_background + native_install_theme_css + set_screen_brightness + take_input_queue"
+        "registered Eclipse's non-GTK backing for Window.set_jobject + set_title + set_layout + set_widget_as_root + remove_gtk_background + set_screen_brightness + take_input_queue"
     );
     Ok(())
 }
@@ -14808,14 +14767,6 @@ mod tests {
         );
         assert_eq!(WINDOW_REMOVE_GTK_BACKGROUND_SIG.to_str(), "(J)V");
         assert_eq!(
-            WINDOW_INSTALL_THEME_CSS_NAME.to_str(),
-            "native_install_theme_css"
-        );
-        assert_eq!(
-            WINDOW_INSTALL_THEME_CSS_SIG.to_str(),
-            "(JLjava/lang/String;)V"
-        );
-        assert_eq!(
             WINDOW_SET_SCREEN_BRIGHTNESS_NAME.to_str(),
             "set_screen_brightness"
         );
@@ -15812,5 +15763,82 @@ mod tests {
             reused,
             "resource resolution must borrow one cached table instead of cloning megabytes per attribute"
         );
+    }
+
+    #[test]
+    fn installed_framework_declares_strictly_registered_natives() {
+        let framework = match crate::runtime::find_framework() {
+            Ok(paths) => paths,
+            Err(error) => {
+                eprintln!("SKIP: Android framework jar unavailable on this host ({error})");
+                return;
+            }
+        };
+        let mut jar = crate::apk::Apk::open(&framework.api_impl_jar)
+            .unwrap_or_else(|e| panic!("cannot open {}: {e}", framework.api_impl_jar.display()));
+        let mut dex_files = Vec::new();
+        for index in 1.. {
+            let entry = if index == 1 {
+                "classes.dex".to_string()
+            } else {
+                format!("classes{index}.dex")
+            };
+            match jar.read_entry(&entry) {
+                Ok(bytes) => dex_files.push(bytes),
+                Err(crate::apk::ApkError::EntryMissing(_)) => break,
+                Err(e) => panic!("cannot read {entry}: {e}"),
+            }
+        }
+        assert!(
+            !dex_files.is_empty(),
+            "{} has no classes.dex",
+            framework.api_impl_jar.display()
+        );
+        let strictly_registered: [(&JNIStr, &[&JNIStr]); 2] = [
+            (
+                CONNECTIVITY_MANAGER_CLASS,
+                &[
+                    CM_REGISTER_NETWORK_CALLBACK_NAME,
+                    CM_IS_ACTIVE_NETWORK_METERED_NAME,
+                    CM_NATIVE_GET_NETWORK_AVAILABLE_NAME,
+                ],
+            ),
+            (
+                WINDOW_CLASS,
+                &[
+                    WINDOW_SET_JOBJECT_NAME,
+                    WINDOW_SET_TITLE_NAME,
+                    WINDOW_SET_LAYOUT_NAME,
+                    WINDOW_SET_WIDGET_AS_ROOT_NAME,
+                    WINDOW_REMOVE_GTK_BACKGROUND_NAME,
+                    WINDOW_SET_SCREEN_BRIGHTNESS_NAME,
+                    WINDOW_TAKE_INPUT_QUEUE_NAME,
+                ],
+            ),
+        ];
+        for (class, names) in strictly_registered {
+            for name in names {
+                let name = name.to_str();
+                assert!(
+                    dex_files.iter().any(|dex| dex_declares_string(dex, &name)),
+                    "{} native {name:?} is registered strictly by Eclipse but not declared by {} \
+                     (RegisterNatives would abort the framework lifecycle)",
+                    class.to_str(),
+                    framework.api_impl_jar.display()
+                );
+            }
+        }
+    }
+
+    fn dex_declares_string(dex: &[u8], name: &str) -> bool {
+        assert!(
+            name.is_ascii() && name.len() < 0x80,
+            "dex string check supports short ASCII names only: {name:?}"
+        );
+        let mut item = Vec::with_capacity(name.len() + 2);
+        item.push(name.len() as u8);
+        item.extend_from_slice(name.as_bytes());
+        item.push(0);
+        dex.windows(item.len()).any(|window| window == item)
     }
 }
