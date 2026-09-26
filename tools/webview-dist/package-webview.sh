@@ -131,7 +131,7 @@ echo "# extracting the ship set from the verified tarball (~1.5 GB under \$TMPDI
 members=()
 for m in "${SHIP_MEMBERS[@]}"; do members+=("$prefix/$m"); done
 mkdir -p "$work/verified"
-"$TAR" -xjf "$tarball" -C "$work/verified" --strip-components=1 --wildcards \
+"$TAR" -xjf "$tarball" -C "$work/verified" --strip-components=1 --no-same-owner --wildcards \
     "$prefix/Resources/locales/en-US*.pak" "${members[@]}" \
     || fail "extraction from $tarball failed (a CEF bump renamed/dropped a SHIP_MEMBERS entry? update SHIP_MEMBERS deliberately; archive: $PIN_ARCHIVE, CDN: $CEF_CDN)"
 for m in "${SHIP_MEMBERS[@]}"; do
@@ -200,5 +200,5 @@ echo "# packaged-layout smoke OK (exit 2 at the handshake stage; \$ORIGIN resolv
 total_bytes="$("$DU" -sb "$OUT" | cut -f1)"
 echo "# per-file sizes (bytes):"
 "$DU" -sb "$OUT"/* | sort -rn | sed 's/^/#   /'
-echo "PACKAGED PAYLOAD: $total_bytes bytes ($("$DU" -sh "$OUT" | cut -f1)) — record in AGENTS.md §6 (plan §7 #5 evidence)"
+echo "PACKAGED PAYLOAD: $total_bytes bytes ($("$DU" -sh "$OUT" | cut -f1))"
 echo "OK: shippable payload assembled at $OUT"
