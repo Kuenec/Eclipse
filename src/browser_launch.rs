@@ -26,7 +26,57 @@ fn parse_place_id(input: &str) -> Option<u64> {
     }
 
     let (scheme, payload) = input.split_once(':')?;
-    if !scheme.eq_ignore_ascii_case("roblox-player") || payload.starts_with("//") {
+    if scheme.eq_ignore_ascii_case("roblox-player") {
+        parse_player_protocol(payload)
+    } else if scheme.eq_ignore_ascii_case("roblox") {
+        parse_deep_link(payload)
+    } else {
+        None
+    }
+}
+
+fn parse_deep_link(payload: &str) -> Option<u64> {
+    let target = payload.strip_prefix("//")?;
+    let query = match target.split_once('?') {
+        Some(("experiences/start", query)) => query,
+        Some(_) => return None,
+        None => target,
+    };
+
+    let mut place_id = None;
+    let mut saw_join_attempt_id = false;
+    let mut saw_join_attempt_origin = false;
+    let mut saw_browser_tracker = false;
+    let mut saw_referring_player = false;
+    let mut saw_referral_page = false;
+
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=')?;
+        match name {
+            "placeId" if place_id.is_none() => place_id = Some(decimal(value, false)?),
+            "joinAttemptId" if !saw_join_attempt_id && identifier(value, 64, false) => {
+                saw_join_attempt_id = true;
+            }
+            "joinAttemptOrigin" if !saw_join_attempt_origin && identifier(value, 64, false) => {
+                saw_join_attempt_origin = true;
+            }
+            "browserTrackerId" if !saw_browser_tracker && decimal(value, true).is_some() => {
+                saw_browser_tracker = true;
+            }
+            "referredByPlayerId" if !saw_referring_player && decimal(value, true).is_some() => {
+                saw_referring_player = true;
+            }
+            "referralPage" if !saw_referral_page && identifier(value, 64, false) => {
+                saw_referral_page = true;
+            }
+            _ => return None,
+        }
+    }
+    place_id
+}
+
+fn parse_player_protocol(payload: &str) -> Option<u64> {
+    if payload.starts_with("//") {
         return None;
     }
 
@@ -270,6 +320,54 @@ mod tests {
         );
         assert!(place_id(&duplicate).is_err());
         assert!(place_id(&server).is_err());
+    }
+
+    #[test]
+    fn extracts_only_the_place_id_from_roblox_deep_links() {
+        let accepted = [
+            "roblox://placeId=90441122676618".to_string(),
+            "ROBLOX://placeId=90441122676618".to_string(),
+            "roblox://experiences/start?placeId=90441122676618".to_string(),
+            "roblox://experiences/start?placeId=90441122676618&joinAttemptId=3a5e0cf4-3e23-46a0-9dc7-887dad37e760&joinAttemptOrigin=PlayButton&browserTrackerId=216042055264&referredByPlayerId=0&referralPage=GameDetail".to_string(),
+            "roblox://joinAttemptOrigin=ShareLink&placeId=90441122676618".to_string(),
+        ];
+        for link in accepted {
+            assert_eq!(place_id(&link), Ok(PLACE_ID), "{link}");
+        }
+    }
+
+    #[test]
+    fn rejects_deep_links_that_name_more_than_a_place() {
+        let base = "roblox://experiences/start?placeId=90441122676618";
+        let invalid = [
+            "roblox://placeId=0".to_string(),
+            "roblox://placeId=090441122676618".to_string(),
+            "roblox://placeId=%39".to_string(),
+            "roblox://placeId=".to_string(),
+            "roblox://userId=1".to_string(),
+            "roblox://experiences/start".to_string(),
+            "roblox://experiences/start?".to_string(),
+            "roblox://?placeId=90441122676618".to_string(),
+            "roblox://experiences/start/?placeId=90441122676618".to_string(),
+            "roblox://navigation/home?placeId=90441122676618".to_string(),
+            "roblox:placeId=90441122676618".to_string(),
+            "robloxmobile://placeId=90441122676618".to_string(),
+            format!("{base}&placeId=1"),
+            format!("{base}&gameInstanceId=3a5e0cf4-3e23-46a0-9dc7-887dad37e760"),
+            format!("{base}&accessCode=abc"),
+            format!("{base}&linkCode=123"),
+            format!("{base}&reservedServerAccessCode=abc"),
+            format!("{base}&launchData=%7B%22roomId%22%3A2%7D"),
+            format!("{base}&userId=1"),
+            format!("{base}&joinAttemptOrigin=a&joinAttemptOrigin=b"),
+            format!("{base}&browserTrackerId=x"),
+            format!("{base}#fragment"),
+            format!("{base}&"),
+            format!("{base}\n"),
+        ];
+        for link in invalid {
+            assert!(place_id(&link).is_err(), "accepted {link:?}");
+        }
     }
 
     #[test]
