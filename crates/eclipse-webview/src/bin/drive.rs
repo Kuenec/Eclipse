@@ -262,8 +262,8 @@ impl Drive {
             .slice(offset, buf.slot_bytes as usize)
             .ok_or_else(|| DriveError::Fail("slot out of mapping bounds".into()))?;
         let mut distinct: HashSet<u32> = HashSet::new();
-        for px in bytes.chunks_exact(4) {
-            distinct.insert(u32::from_ne_bytes([px[0], px[1], px[2], px[3]]));
+        for px in bytes.as_chunks::<4>().0 {
+            distinct.insert(u32::from_ne_bytes(*px));
         }
         Ok(distinct.len())
     }
