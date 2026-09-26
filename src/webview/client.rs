@@ -629,6 +629,23 @@ fn resolve_helper_from(
     Err(ClientError::HelperNotFound { probed })
 }
 
+const CLIENT_SETTINGS_SHIM_FILE_NAME: &str = "libeclipse_client_settings_path.so";
+
+fn helper_ld_preload(inherited: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let kept: Vec<&[u8]> = inherited
+        .as_bytes()
+        .split(|byte| matches!(byte, b':' | b' '))
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            Path::new(std::ffi::OsStr::from_bytes(entry)).file_name()
+                != Some(std::ffi::OsStr::new(CLIENT_SETTINGS_SHIM_FILE_NAME))
+        })
+        .collect();
+    (!kept.is_empty()).then(|| std::ffi::OsString::from_vec(kept.join(&b':')))
+}
+
 fn resolve_helper() -> Result<PathBuf, ClientError> {
     let config_path = crate::config::Config::load()
         .ok()
@@ -706,6 +723,13 @@ fn spawn_helper_process() -> Result<(UnixStream, Child, hostprobe::ProbeOutcome)
     cmd.arg("--ipc-fd=3");
 
     cmd.env("ECLIPSE_WEBVIEW_DATA_DIR", &webview_data_root);
+
+    if let Some(inherited) = std::env::var_os("LD_PRELOAD") {
+        match helper_ld_preload(&inherited) {
+            Some(preload) => cmd.env("LD_PRELOAD", preload),
+            None => cmd.env_remove("LD_PRELOAD"),
+        };
+    }
 
     if crate::config::Config::load()
         .map(|c| c.webview_allow_unsandboxed)
@@ -2618,6 +2642,39 @@ mod tests {
 
     fn touch(path: &Path) {
         std::fs::write(path, b"x").expect("touch");
+    }
+
+    #[test]
+    fn helper_spawn_drops_only_the_client_settings_preload() {
+        use std::ffi::{OsStr, OsString};
+
+        assert_eq!(
+            helper_ld_preload(OsStr::new(
+                "/home/u/.local/share/eclipse/app-data/runtime/libeclipse_client_settings_path.so"
+            )),
+            None,
+            "the Android client-settings shim alone must leave the helper without LD_PRELOAD"
+        );
+        assert_eq!(
+            helper_ld_preload(OsStr::new(
+                "/data/runtime/libeclipse_client_settings_path.so:/usr/lib/libgamemodeauto.so.0"
+            )),
+            Some(OsString::from("/usr/lib/libgamemodeauto.so.0"))
+        );
+        assert_eq!(
+            helper_ld_preload(OsStr::new(
+                "/a/libone.so /data/runtime/libeclipse_client_settings_path.so::/b/libtwo.so"
+            )),
+            Some(OsString::from("/a/libone.so:/b/libtwo.so"))
+        );
+        assert_eq!(
+            helper_ld_preload(OsStr::new("/opt/libeclipse_client_settings_path.so.bak")),
+            Some(OsString::from(
+                "/opt/libeclipse_client_settings_path.so.bak"
+            )),
+            "only the exact shim file name is Eclipse's"
+        );
+        assert_eq!(helper_ld_preload(OsStr::new("")), None);
     }
 
     #[test]
