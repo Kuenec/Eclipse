@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use zip::result::ZipError;
@@ -14,12 +15,15 @@ use super::{
 
 const STORE_DIR: &str = "roblox";
 const CURRENT_FILE: &str = "current.json";
-const CURRENT_TEMP_FILE: &str = "current.json.tmp";
+const LAST_CHECK_FILE: &str = "last-update-check.json";
+const TEMP_SUFFIX: &str = ".tmp";
 const LOCK_FILE: &str = "install.lock";
 const STAGING_DIR: &str = "incoming.partial";
 const PARTIAL_SUFFIX: &str = ".partial";
 const BUNDLE_EXTENSIONS: [&str; 3] = ["apks", "xapk", "apkm"];
 const XAPK_NATIVE_SPLIT: &str = "config.x86_64.apk";
+
+pub const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledVersion {
@@ -44,6 +48,28 @@ impl fmt::Display for InstalledVersion {
             None => write!(f, "versionCode {}", self.version_code),
         }
     }
+}
+
+pub enum UpdateOutcome {
+    UpToDate {
+        installed: InstalledVersion,
+    },
+    Updated {
+        previous: Option<InstalledVersion>,
+        set: Box<ApkSet>,
+    },
+}
+
+pub fn update_due(last_check: Option<SystemTime>, now: SystemTime) -> bool {
+    last_check.is_none_or(|last| match now.duration_since(last) {
+        Ok(elapsed) => elapsed >= UPDATE_INTERVAL,
+        Err(_) => true,
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+struct LastCheck {
+    checked_at_unix: u64,
 }
 
 pub struct Store {
@@ -108,6 +134,26 @@ impl Store {
         }
     }
 
+    pub fn last_check(&self) -> Result<Option<SystemTime>, StoreError> {
+        let path = self.root.join(LAST_CHECK_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(StoreError::Io { path, source }),
+        };
+        let Ok(record) = serde_json::from_slice::<LastCheck>(&bytes) else {
+            return Ok(None);
+        };
+        Ok(UNIX_EPOCH.checked_add(Duration::from_secs(record.checked_at_unix)))
+    }
+
+    pub fn record_check(&self, at: SystemTime) -> Result<(), StoreError> {
+        let checked_at_unix = at
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        self.replace_json(LAST_CHECK_FILE, &LastCheck { checked_at_unix })
+    }
+
     pub fn install(&self, sources: &[PathBuf]) -> Result<InstalledVersion, StoreError> {
         let staging = self.begin()?;
         for source in sources {
@@ -153,22 +199,21 @@ impl Store {
             Err(error) => return Err(error),
         };
 
-        let temp = self.root.join(CURRENT_TEMP_FILE);
-        let mut json =
-            serde_json::to_vec_pretty(installed).expect("an install record always serializes");
-        json.push(b'\n');
-        write_synced(&temp, &json)?;
-        let current = self.root.join(CURRENT_FILE);
-        fs::rename(&temp, &current).map_err(|source| StoreError::Io {
-            path: current,
-            source,
-        })?;
-        sync_dir(&self.root)?;
-
+        self.replace_json(CURRENT_FILE, installed)?;
         match previous {
             Some(previous) if previous.version_code == installed.version_code => Ok(()),
             previous => self.prune(installed, previous.map(|p| p.version_code)),
         }
+    }
+
+    fn replace_json(&self, name: &str, record: &impl Serialize) -> Result<(), StoreError> {
+        let temp = self.root.join(format!("{name}{TEMP_SUFFIX}"));
+        let mut json = serde_json::to_vec_pretty(record).expect("store records always serialize");
+        json.push(b'\n');
+        write_synced(&temp, &json)?;
+        let path = self.root.join(name);
+        fs::rename(&temp, &path).map_err(|source| StoreError::Io { path, source })?;
+        sync_dir(&self.root)
     }
 
     fn prune(
@@ -839,6 +884,50 @@ mod tests {
         let err = store.current().unwrap_err();
         assert!(matches!(err, StoreError::Corrupt { .. }), "{err:?}");
         assert!(err.to_string().contains("eclipse install"), "{err}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn update_checks_are_due_every_six_hours() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(update_due(None, now));
+        assert!(!update_due(Some(now - Duration::from_secs(60)), now));
+        assert!(!update_due(
+            Some(now - UPDATE_INTERVAL + Duration::from_secs(1)),
+            now
+        ));
+        assert!(update_due(Some(now - UPDATE_INTERVAL), now));
+        assert!(
+            update_due(Some(now + Duration::from_secs(60)), now),
+            "a check recorded in the future is treated as stale"
+        );
+
+        let root = temp_root("last-check");
+        let store = Store::at(root.clone());
+        assert_eq!(store.last_check().unwrap(), None);
+        store.record_check(now).unwrap();
+        assert_eq!(store.last_check().unwrap(), Some(now));
+        assert_eq!(entries(&root), [LAST_CHECK_FILE]);
+
+        let record = root.join(LAST_CHECK_FILE);
+        for damaged in [&b"{"[..], b"{\"checked_at_unix\": 18446744073709551615}"] {
+            fs::write(&record, damaged).unwrap();
+            assert_eq!(
+                store.last_check().unwrap(),
+                None,
+                "a damaged last-check record makes the update due"
+            );
+        }
+        store.record_check(now).unwrap();
+        assert_eq!(store.last_check().unwrap(), Some(now));
+
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        let err = store.last_check().unwrap_err();
+        assert!(
+            matches!(err, StoreError::Io { .. }),
+            "an unreadable last-check record is an error: {err:?}"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
