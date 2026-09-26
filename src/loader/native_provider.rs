@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_long, c_void};
@@ -429,6 +430,34 @@ const ANDROID_LOG_WARN: c_int = 5;
 const ANDROID_LOG_ERROR: c_int = 6;
 const ANDROID_LOG_FATAL: c_int = 7;
 
+fn liblog_enabled(priority: c_int) -> bool {
+    match priority {
+        ANDROID_LOG_VERBOSE => {
+            tracing::enabled!(target: "liblog", tracing::Level::TRACE, tag, message)
+        }
+        ANDROID_LOG_DEBUG => {
+            tracing::enabled!(target: "liblog", tracing::Level::DEBUG, tag, message)
+        }
+        ANDROID_LOG_INFO => tracing::enabled!(target: "liblog", tracing::Level::INFO, tag, message),
+        ANDROID_LOG_WARN => tracing::enabled!(target: "liblog", tracing::Level::WARN, tag, message),
+        ANDROID_LOG_ERROR | ANDROID_LOG_FATAL => {
+            tracing::enabled!(target: "liblog", tracing::Level::ERROR, tag, message)
+        }
+        _ => tracing::enabled!(
+            target: "liblog",
+            tracing::Level::INFO,
+            tag,
+            priority,
+            message
+        ),
+    }
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn eclipse_liblog_enabled(prio: c_int) -> c_int {
+    c_int::from(liblog_enabled(prio))
+}
+
 fn emit_log(priority: c_int, tag: &str, msg: &str) {
     #[cfg(test)]
     if tests::capture_emit(priority, tag, msg) {
@@ -444,13 +473,13 @@ fn emit_log(priority: c_int, tag: &str, msg: &str) {
     }
 }
 
-unsafe fn cstr_opt(p: *const c_char) -> Option<String> {
+unsafe fn cstr_opt<'a>(p: *const c_char) -> Option<Cow<'a, str>> {
     if p.is_null() {
         return None;
     }
 
     let s = unsafe { std::ffi::CStr::from_ptr(p) };
-    Some(s.to_string_lossy().into_owned())
+    Some(s.to_string_lossy())
 }
 
 unsafe extern "C" fn eclipse_android_log_write(
@@ -458,6 +487,9 @@ unsafe extern "C" fn eclipse_android_log_write(
     tag: *const c_char,
     text: *const c_char,
 ) -> c_int {
+    if !liblog_enabled(prio) {
+        return -libc::EPERM;
+    }
     let tag = unsafe { cstr_opt(tag) }.unwrap_or_default();
     let text = unsafe { cstr_opt(text) }.unwrap_or_default();
     let n = text.len();
@@ -2758,8 +2790,19 @@ mod tests {
     }
 
     fn with_capture(body: impl FnOnce()) -> Vec<(c_int, String, String)> {
+        with_capture_filtered("trace", body)
+    }
+
+    fn with_capture_filtered(
+        directives: &str,
+        body: impl FnOnce(),
+    ) -> Vec<(c_int, String, String)> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(directives));
         EMIT_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
-        body();
+        tracing::subscriber::with_default(subscriber, body);
         EMIT_CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
     }
 
@@ -3023,6 +3066,98 @@ mod tests {
         assert_eq!(*prio, ANDROID_LOG_WARN);
         assert_eq!(got_tag, "", "a null tag becomes an empty string");
         assert_eq!(got_msg, "plain");
+    }
+
+    #[test]
+    fn liblog_gate_agrees_with_the_event_filter() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct CountEvents(Arc<AtomicUsize>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountEvents {
+            fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for directives in ["liblog=warn", "liblog=trace", "info", "off"] {
+            let events = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(directives))
+                .with(CountEvents(Arc::clone(&events)));
+            tracing::subscriber::with_default(subscriber, || {
+                for priority in [
+                    ANDROID_LOG_VERBOSE,
+                    ANDROID_LOG_DEBUG,
+                    ANDROID_LOG_INFO,
+                    ANDROID_LOG_WARN,
+                    ANDROID_LOG_ERROR,
+                    ANDROID_LOG_FATAL,
+                    9,
+                ] {
+                    let before = events.load(Ordering::SeqCst);
+                    emit_log(priority, "EclipseTag", "message");
+                    let emitted = events.load(Ordering::SeqCst) > before;
+                    assert_eq!(
+                        liblog_enabled(priority),
+                        emitted,
+                        "filter {directives:?}, priority {priority}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn filtered_liblog_priorities_are_dropped_before_formatting() {
+        use std::ffi::CString;
+
+        let tag = CString::new("EclipseTag").unwrap();
+        let fmt = CString::new("n=%d").unwrap();
+        let text = CString::new("plain").unwrap();
+        let mut returns = Vec::new();
+        let emits = with_capture_filtered("liblog=warn", || unsafe {
+            returns.push(__android_log_print(
+                ANDROID_LOG_INFO,
+                tag.as_ptr(),
+                fmt.as_ptr(),
+                1_i32,
+            ));
+            returns.push(eclipse_android_log_write(
+                ANDROID_LOG_DEBUG,
+                tag.as_ptr(),
+                text.as_ptr(),
+            ));
+            returns.push(__android_log_print(
+                ANDROID_LOG_WARN,
+                tag.as_ptr(),
+                fmt.as_ptr(),
+                2_i32,
+            ));
+            returns.push(eclipse_android_log_write(
+                ANDROID_LOG_ERROR,
+                tag.as_ptr(),
+                text.as_ptr(),
+            ));
+        });
+
+        assert_eq!(returns, [-libc::EPERM, -libc::EPERM, 3, 5]);
+        assert_eq!(
+            emits,
+            [
+                (
+                    ANDROID_LOG_WARN,
+                    "EclipseTag".to_string(),
+                    "n=2".to_string()
+                ),
+                (
+                    ANDROID_LOG_ERROR,
+                    "EclipseTag".to_string(),
+                    "plain".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
