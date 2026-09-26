@@ -13,8 +13,8 @@ use std::os::fd::OwnedFd;
 use std::os::raw::c_int;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -283,47 +283,104 @@ pub fn classify_render_path(
 pub enum Out {
     Msg(HelperMsg),
     MsgWithFd(HelperMsg, OwnedFd),
+    Stop,
+}
+
+#[derive(Clone, Copy)]
+enum Delivery {
+    Required,
+    Droppable,
 }
 
 #[derive(Clone)]
 pub struct Outbox {
     tx: SyncSender<Out>,
+    depth: Arc<AtomicUsize>,
+    droppable_limit: usize,
+    dropped: Arc<AtomicUsize>,
     dead: Arc<AtomicBool>,
 }
 
+pub struct OutQueue {
+    rx: Receiver<Out>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl OutQueue {
+    pub fn recv(&self) -> Option<Out> {
+        let out = self.rx.recv().ok()?;
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+        Some(out)
+    }
+}
+
 impl Outbox {
-    pub fn new(tx: SyncSender<Out>) -> Self {
-        Self {
+    pub fn channel(capacity: usize) -> (Outbox, OutQueue) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let depth = Arc::new(AtomicUsize::new(0));
+        let outbox = Outbox {
             tx,
+            depth: Arc::clone(&depth),
+            droppable_limit: capacity / 2,
+            dropped: Arc::new(AtomicUsize::new(0)),
             dead: Arc::new(AtomicBool::new(false)),
-        }
+        };
+        (outbox, OutQueue { rx, depth })
     }
 
-    fn push(&self, out: Out) {
+    fn push(&self, out: Out, delivery: Delivery) {
         if self.dead.load(Ordering::Relaxed) {
             return;
         }
-        match self.tx.try_send(out) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
+        if matches!(delivery, Delivery::Droppable)
+            && self.depth.load(Ordering::Relaxed) >= self.droppable_limit
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.depth.fetch_add(1, Ordering::Relaxed);
+        let Err(err) = self.tx.try_send(out) else {
+            return;
+        };
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+        match (err, delivery) {
+            (TrySendError::Full(_), Delivery::Droppable) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            (TrySendError::Full(_), Delivery::Required) => {
                 logging::error(
                     COMPONENT,
                     "outbound queue hit its high-water mark — treating the consumer as dead",
                 );
                 self.dead.store(true, Ordering::Relaxed);
             }
-            Err(TrySendError::Disconnected(_)) => {
+            (TrySendError::Disconnected(_), _) => {
                 self.dead.store(true, Ordering::Relaxed);
             }
         }
     }
 
     pub fn send(&self, msg: HelperMsg) {
-        self.push(Out::Msg(msg));
+        self.push(Out::Msg(msg), Delivery::Required);
+    }
+
+    pub fn send_droppable(&self, msg: HelperMsg) {
+        self.push(Out::Msg(msg), Delivery::Droppable);
     }
 
     pub fn send_with_fd(&self, msg: HelperMsg, fd: OwnedFd) {
-        self.push(Out::MsgWithFd(msg, fd));
+        self.push(Out::MsgWithFd(msg, fd), Delivery::Required);
+    }
+
+    pub fn stop(&self) {
+        self.depth.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send(Out::Stop).is_err() {
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn take_dropped(&self) -> usize {
+        self.dropped.swap(0, Ordering::Relaxed)
     }
 
     pub fn is_dead(&self) -> bool {
@@ -756,9 +813,7 @@ impl Engine {
             });
             return;
         };
-        let expires = Basetime {
-            val: (expires_epoch_s + 11_644_473_600) * 1_000_000,
-        };
+        let expires = cef_expires_from_epoch_s(expires_epoch_s);
         let cookie = Cookie {
             name: CefString::from(name),
             value: CefString::from(value),
@@ -793,31 +848,35 @@ impl Engine {
     }
 
     pub fn begin_shutdown(&self, exit_code: i32) {
-        let mut st = lock(&self.state);
-        if st.closing_all {
-            if exit_code != 0 && st.exit_code == 0 {
-                st.exit_code = exit_code;
+        let hosts: Vec<BrowserHost> = {
+            let mut st = lock(&self.state);
+            if st.closing_all {
+                if exit_code != 0 && st.exit_code == 0 {
+                    st.exit_code = exit_code;
+                }
+                return;
             }
-            return;
-        }
-        st.closing_all = true;
-        st.exit_code = exit_code;
-        st.close_deadline = Some(Instant::now() + CLOSE_ALL_DEADLINE);
+            st.closing_all = true;
+            st.exit_code = exit_code;
+            st.close_deadline = Some(Instant::now() + CLOSE_ALL_DEADLINE);
 
-        let no_browser: Vec<i64> = st
-            .views
-            .iter()
-            .filter(|(_, v)| v.browser.is_none())
-            .map(|(k, _)| *k)
-            .collect();
-        for view in no_browser {
-            st.views.remove(&view);
-            self.out.send(HelperMsg::ViewClosed { view });
-        }
-        for v in st.views.values() {
-            if let Some(host) = v.browser.as_ref().and_then(|b| b.host()) {
-                host.close_browser(1);
+            let no_browser: Vec<i64> = st
+                .views
+                .iter()
+                .filter(|(_, v)| v.browser.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            for view in no_browser {
+                st.views.remove(&view);
+                self.out.send(HelperMsg::ViewClosed { view });
             }
+            st.views
+                .values()
+                .filter_map(|v| v.browser.as_ref().and_then(|b| b.host()))
+                .collect()
+        };
+        for host in hosts {
+            host.close_browser(1);
         }
     }
 
@@ -836,6 +895,16 @@ impl Engine {
     }
 
     pub fn poll(&self) {
+        let dropped = self.out.take_dropped();
+        if dropped > 0 {
+            logging::warn(
+                COMPONENT,
+                &format!(
+                    "dropped {dropped} page console message(s): the outbound queue was over half \
+                     full"
+                ),
+            );
+        }
         let mut due: Vec<(u32, Vec<CookieEntry>, bool)> = Vec::new();
         let mut clear_due: Vec<(u32, bool, bool)> = Vec::new();
         {
@@ -1165,17 +1234,49 @@ impl Engine {
                     COMPONENT,
                     &logging::format_load_data_event(view, &mime, &base),
                 );
-                if let Ok(mut slot) = pending.lock() {
-                    *slot = Some(PendingData {
-                        base_url: base_url.clone(),
-                        data,
-                        mime,
-                    });
-                }
+                let target = match about_base_data_url(&base_url, &data, &mime) {
+                    Some(data_url) => {
+                        if !mime.is_empty() && !is_mime_type(&mime) {
+                            logging::warn(
+                                COMPONENT,
+                                &format!(
+                                    "load data-with-base-url view={view}: mime type is not \
+                                     type/subtype; serving the data as text/html"
+                                ),
+                            );
+                        }
+                        if data_url.len() > MAX_URL_CHARS {
+                            logging::error(
+                                COMPONENT,
+                                &format!(
+                                    "load data-with-base-url view={view}: the {}-byte data: URL \
+                                     for an about: base exceeds Chromium's {MAX_URL_CHARS}-byte \
+                                     URL limit; not loaded",
+                                    data_url.len()
+                                ),
+                            );
+                            return;
+                        }
+                        if let Ok(mut slot) = pending.lock() {
+                            *slot = None;
+                        }
+                        data_url
+                    }
+                    None => {
+                        if let Ok(mut slot) = pending.lock() {
+                            *slot = Some(PendingData {
+                                base_url: base_url.clone(),
+                                data,
+                                mime,
+                            });
+                        }
+                        base_url
+                    }
+                };
                 if let Some(v) = lock(&self.state).views.get_mut(&view) {
-                    v.driven_url = Some(base_url.clone());
+                    v.driven_url = Some(target.clone());
                 }
-                frame.load_url(Some(&CefString::from(base_url.as_str())));
+                frame.load_url(Some(&CefString::from(target.as_str())));
             }
             None => logging::warn(
                 COMPONENT,
@@ -1201,9 +1302,7 @@ impl Engine {
             return;
         };
 
-        let expires = Basetime {
-            val: (expires_epoch_s + 11_644_473_600) * 1_000_000,
-        };
+        let expires = cef_expires_from_epoch_s(expires_epoch_s);
         let cookie = Cookie {
             name: CefString::from(name),
             value: CefString::from(value),
@@ -1333,6 +1432,18 @@ impl Engine {
                 ok: false,
             });
         }
+    }
+}
+
+const WINDOWS_TO_UNIX_EPOCH_S: i64 = 11_644_473_600;
+
+const MICROS_PER_SECOND: i64 = 1_000_000;
+
+fn cef_expires_from_epoch_s(expires_epoch_s: i64) -> Basetime {
+    Basetime {
+        val: expires_epoch_s
+            .saturating_add(WINDOWS_TO_UNIX_EPOCH_S)
+            .saturating_mul(MICROS_PER_SECOND),
     }
 }
 
@@ -1606,7 +1717,7 @@ wrap_display_handler! {
                 );
             }
 
-            self.out.send(HelperMsg::Console {
+            self.out.send_droppable(HelperMsg::Console {
                 view: self.view,
                 console: Console::from_raw(severity_u8, &source, line_u32, &message),
             });
@@ -1711,6 +1822,54 @@ wrap_request_handler! {
     }
 }
 
+const MAX_URL_CHARS: usize = 2 * 1024 * 1024;
+
+const DEFAULT_DATA_MIME: &str = "text/html";
+
+fn is_mime_type(mime: &str) -> bool {
+    let restricted_name = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#' | b'$' | b'&' | b'-' | b'^' | b'_' | b'.' | b'+'
+                    )
+            })
+    };
+    mime.split_once('/')
+        .is_some_and(|(kind, subtype)| restricted_name(kind) && restricted_name(subtype))
+}
+
+fn about_base_data_url(base_url: &str, data: &str, mime: &str) -> Option<String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let is_about = base_url
+        .get(..6)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("about:"));
+    if !is_about {
+        return None;
+    }
+    let mime = if is_mime_type(mime) {
+        mime
+    } else {
+        DEFAULT_DATA_MIME
+    };
+    let mut url = String::with_capacity(32 + mime.len() + data.len() * 3);
+    url.push_str("data:");
+    url.push_str(mime);
+    url.push_str(";charset=utf-8,");
+    for byte in data.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            url.push(char::from(byte));
+        } else {
+            url.push('%');
+            url.push(char::from(HEX[usize::from(byte >> 4)]));
+            url.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    Some(url)
+}
+
 fn urls_equivalent(a: &str, b: &str) -> bool {
     a == b || a.strip_suffix('/').unwrap_or(a) == b.strip_suffix('/').unwrap_or(b)
 }
@@ -1752,8 +1911,8 @@ wrap_cookie_visitor! {
         fn visit(
             &self,
             cookie: Option<&Cookie>,
-            count: ::std::os::raw::c_int,
-            total: ::std::os::raw::c_int,
+            _count: ::std::os::raw::c_int,
+            _total: ::std::os::raw::c_int,
             _delete_cookie: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             if let (Some(cookie), Ok(mut acc)) = (cookie, self.acc.lock()) {
@@ -1765,12 +1924,19 @@ wrap_cookie_visitor! {
                     secure: cookie.secure != 0,
                     http_only: cookie.httponly != 0,
                 });
-                if count + 1 >= total {
-                    acc.finished = true;
-                }
             }
             1
         }
+    }
+}
+
+impl Drop for ListCookieVisitor {
+    fn drop(&mut self) {
+        let mut acc = match self.acc.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        acc.finished = true;
     }
 }
 
@@ -1787,8 +1953,8 @@ wrap_cookie_visitor! {
         fn visit(
             &self,
             cookie: Option<&Cookie>,
-            count: ::std::os::raw::c_int,
-            total: ::std::os::raw::c_int,
+            _count: ::std::os::raw::c_int,
+            _total: ::std::os::raw::c_int,
             delete_cookie: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             let mut acc = match self.acc.lock() {
@@ -1801,11 +1967,18 @@ wrap_cookie_visitor! {
                     acc.deleted = acc.deleted.saturating_add(1);
                 }
             }
-            if count.saturating_add(1) >= total {
-                acc.finished = true;
-            }
             1
         }
+    }
+}
+
+impl Drop for SessionCookieClearVisitor {
+    fn drop(&mut self) {
+        let mut acc = match self.acc.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        acc.finished = true;
     }
 }
 
@@ -2249,10 +2422,128 @@ mod tests {
     }
 
     #[test]
+    fn console_flood_is_dropped_before_it_can_mark_the_consumer_dead() {
+        let (out, queue) = Outbox::channel(8);
+        for _ in 0..100 {
+            out.send_droppable(HelperMsg::Console {
+                view: 1,
+                console: Console::from_raw(1, "https://x.test/a", 1, "m"),
+            });
+        }
+        assert!(!out.is_dead());
+        let load_state = HelperMsg::LoadState {
+            view: 1,
+            state: 0,
+            http_status: 0,
+        };
+        out.send(load_state.clone());
+        assert!(!out.is_dead());
+        let dropped = out.take_dropped();
+        drop(out);
+
+        let mut consoles = 0usize;
+        let mut last = None;
+        while let Some(item) = queue.recv() {
+            match item {
+                Out::Msg(HelperMsg::Console { .. }) => consoles += 1,
+                Out::Msg(msg) => last = Some(msg),
+                Out::MsgWithFd(..) | Out::Stop => panic!("unexpected outbound item"),
+            }
+        }
+        assert_eq!(consoles, 4);
+        assert_eq!(last, Some(load_state));
+        assert_eq!(dropped, 100 - consoles);
+    }
+
+    #[test]
+    fn a_full_queue_still_marks_the_consumer_dead_for_required_messages() {
+        let (out, _queue) = Outbox::channel(2);
+        out.send(HelperMsg::ViewClosed { view: 1 });
+        out.send(HelperMsg::ViewClosed { view: 2 });
+        assert!(!out.is_dead());
+        out.send(HelperMsg::ViewClosed { view: 3 });
+        assert!(out.is_dead());
+    }
+
+    #[test]
+    fn cookie_get_with_no_cookies_finishes_when_cef_releases_the_visitor() {
+        let acc: Arc<Mutex<CookieAcc>> = Arc::default();
+        let visitor = ListCookieVisitor::new(acc.clone());
+        let held_by_cef = visitor.clone();
+        drop(visitor);
+        assert!(!acc.lock().unwrap().finished);
+        drop(held_by_cef);
+        let acc = acc.lock().unwrap();
+        assert!(acc.finished);
+        assert!(acc.cookies.is_empty());
+    }
+
+    #[test]
+    fn session_cookie_clear_on_an_empty_jar_finishes_when_cef_releases_the_visitor() {
+        let acc: Arc<Mutex<SessionCookieClearAcc>> = Arc::default();
+        let visitor = SessionCookieClearVisitor::new(acc.clone());
+        let held_by_cef = visitor.clone();
+        drop(visitor);
+        assert!(!acc.lock().unwrap().finished);
+        drop(held_by_cef);
+        let acc = acc.lock().unwrap();
+        assert!(acc.finished);
+        assert_eq!(acc.deleted, 0);
+    }
+
+    #[test]
+    fn cookie_expiry_conversion_saturates_instead_of_overflowing() {
+        assert_eq!(
+            cef_expires_from_epoch_s(1_800_000_000).val,
+            (1_800_000_000 + 11_644_473_600) * 1_000_000
+        );
+        assert_eq!(cef_expires_from_epoch_s(10_000_000_000_000).val, i64::MAX);
+        assert_eq!(cef_expires_from_epoch_s(-10_000_000_000_000).val, i64::MIN);
+        assert_eq!(cef_expires_from_epoch_s(i64::MAX).val, i64::MAX);
+    }
+
+    #[test]
     fn remove_session_cookies_deletes_only_cookies_without_an_expiry() {
         assert!(session_cookie_should_delete(0));
         assert!(!session_cookie_should_delete(1));
         assert!(!session_cookie_should_delete(-1));
+    }
+
+    #[test]
+    fn about_base_data_is_loaded_as_a_percent_encoded_data_url() {
+        assert_eq!(
+            about_base_data_url("about:blank", "<p>#1 50%</p>", "text/html").as_deref(),
+            Some("data:text/html;charset=utf-8,%3Cp%3E%231%2050%25%3C%2Fp%3E")
+        );
+        assert_eq!(
+            about_base_data_url("ABOUT:srcdoc", "\u{e9}", "text/plain").as_deref(),
+            Some("data:text/plain;charset=utf-8,%C3%A9")
+        );
+        assert_eq!(
+            about_base_data_url("about:blank", "a-b.c_d~", "").as_deref(),
+            Some("data:text/html;charset=utf-8,a-b.c_d~")
+        );
+        assert_eq!(
+            about_base_data_url("about:blank", "x", "text/html,x").as_deref(),
+            Some("data:text/html;charset=utf-8,x")
+        );
+        assert_eq!(
+            about_base_data_url("https://example.com/", "x", "text/html"),
+            None
+        );
+        assert_eq!(about_base_data_url("abou", "x", "text/html"), None);
+    }
+
+    #[test]
+    fn mime_type_check_accepts_only_restricted_type_and_subtype_names() {
+        assert!(is_mime_type("text/html"));
+        assert!(is_mime_type("application/xhtml+xml"));
+        assert!(!is_mime_type(""));
+        assert!(!is_mime_type("text"));
+        assert!(!is_mime_type("text/"));
+        assert!(!is_mime_type("/html"));
+        assert!(!is_mime_type("text/html;charset=utf-8"));
+        assert!(!is_mime_type("text/html,x"));
     }
 
     #[test]
