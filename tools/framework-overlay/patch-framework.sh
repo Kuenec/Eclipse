@@ -269,50 +269,20 @@ unzip -p "$ORIG_FW/api-impl.jar" classes.dex > "$work/stock-classes.dex"
 
 crsm="$work/smali/android/content/ContentResolver.smali"
 [ -f "$crsm" ] || fail "ContentResolver.smali not found after baksmali of the installed framework"
+open_typed_asset_file='openTypedAssetFile(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;'
+! grep -qF "$open_typed_asset_file" "$crsm" \
+    || fail "ContentResolver.smali already declares $open_typed_asset_file — installed framework drifted; update patch-framework.sh"
 for cr_method in \
     'acquireContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
     'acquireContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
     'acquireUnstableContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
-    'acquireUnstableContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
-    'openTypedAssetFile(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;'
+    'acquireUnstableContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;'
 do
-    ! grep -qF "$cr_method" "$crsm" \
-        || fail "ContentResolver.smali already declares $cr_method — installed framework drifted; update patch-framework.sh"
+    grep -qF "$cr_method" "$crsm" \
+        || fail "ContentResolver.smali lost upstream $cr_method — installed framework drifted; update patch-framework.sh"
 done
 cat >> "$crsm" <<'ECLIPSE_CONTENT_RESOLVER_METHODS'
 
-
-.method public final acquireContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;
-    .registers 2
-
-    const/4 v0, 0x0
-
-    return-object v0
-.end method
-
-.method public final acquireContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;
-    .registers 2
-
-    const/4 v0, 0x0
-
-    return-object v0
-.end method
-
-.method public final acquireUnstableContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;
-    .registers 2
-
-    const/4 v0, 0x0
-
-    return-object v0
-.end method
-
-.method public final acquireUnstableContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;
-    .registers 2
-
-    const/4 v0, 0x0
-
-    return-object v0
-.end method
 
 .method public openTypedAssetFile(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;
     .registers 5
@@ -324,15 +294,7 @@ cat >> "$crsm" <<'ECLIPSE_CONTENT_RESOLVER_METHODS'
     return-object v0
 .end method
 ECLIPSE_CONTENT_RESOLVER_METHODS
-for cr_method in \
-    'acquireContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
-    'acquireContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
-    'acquireUnstableContentProviderClient(Landroid/net/Uri;)Landroid/content/ContentProviderClient;' \
-    'acquireUnstableContentProviderClient(Ljava/lang/String;)Landroid/content/ContentProviderClient;' \
-    'openTypedAssetFile(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;'
-do
-    grep -qF "$cr_method" "$crsm" || fail "ContentResolver $cr_method insert failed"
-done
+grep -qF "$open_typed_asset_file" "$crsm" || fail "ContentResolver $open_typed_asset_file insert failed"
 grep -qF -- '->openTypedAssetFileDescriptor(Landroid/net/Uri;Ljava/lang/String;Landroid/os/Bundle;Landroid/os/CancellationSignal;)Landroid/content/res/AssetFileDescriptor;' "$crsm" \
     || fail "ContentResolver openTypedAssetFile bridge body insert failed"
 
@@ -558,7 +520,10 @@ perl -0pi -e 's{(value = \{\n)(        Landroid/view/View\$DeclaredOnClickListen
 grep -qF "setOnCapturedPointerListener(Landroid/view/View\$OnCapturedPointerListener;)V" "$vsm" || fail "View.smali setter insert failed (drift?)"
 grep -qF "mCapturedPointerListener:Landroid/view/View\$OnCapturedPointerListener;" "$vsm" || fail "View.smali field insert failed (drift?)"
 
-perl -0pi -e 's{(\.method public setOnCapturedPointerListener\(Landroid/view/View\$OnCapturedPointerListener;\)V.*?\.end method\n)}{$1.method public setAutofillHints([Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method\n\n.method public setImportantForAutofill(I)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$vsm"
+n="$(grep -cF '.method public setImportantForAutofill(I)V' "$vsm")" || true
+[ "$n" = "1" ] || fail "View.smali upstream setImportantForAutofill count = $n (expected 1) — installed View drifted; update patch-framework.sh"
+! grep -qF 'setAutofillHints([Ljava/lang/String;)V' "$vsm" || fail "View.smali already declares setAutofillHints — installed View drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.method public setOnCapturedPointerListener\(Landroid/view/View\$OnCapturedPointerListener;\)V.*?\.end method\n)}{$1.method public setAutofillHints([Ljava/lang/String;)V\n    .registers 2\n\n    return-void\n.end method\n}s' "$vsm"
 grep -qF 'setAutofillHints([Ljava/lang/String;)V' "$vsm" || fail "View.smali setAutofillHints insert failed (drift?)"
 grep -qF 'setImportantForAutofill(I)V' "$vsm" || fail "View.smali setImportantForAutofill insert failed (drift?)"
 
@@ -571,9 +536,13 @@ grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali getSupport
 
 n="$(grep -cF '.method public getWidth()I' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali getWidth anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-! grep -qF "getMode()Landroid/view/Display\$Mode;" "$dsm" || fail "Display.smali already declares getMode — installed Display drifted; update patch-framework.sh"
+UPSTREAM_GET_MODE=$'.method public getMode()Landroid/view/Display$Mode;\n    .registers 2\n\n    new-instance v0, Landroid/view/Display$Mode;\n\n    invoke-direct {v0}, Landroid/view/Display$Mode;-><init>()V\n\n    return-object v0\n.end method\n'
+UPSTREAM_GET_MODE="$UPSTREAM_GET_MODE" perl -0777 -ne 'exit((index($_, $ENV{UPSTREAM_GET_MODE}) >= 0) ? 0 : 1)' "$dsm" || fail "Display.smali getMode body is not the upstream no-arg Display\$Mode shape — installed Display drifted; update patch-framework.sh"
+UPSTREAM_GET_MODE="$UPSTREAM_GET_MODE" perl -0777 -pi -e 's{\Q$ENV{UPSTREAM_GET_MODE}\E}{}' "$dsm"
+! grep -qF ".method public getMode()Landroid/view/Display\$Mode;" "$dsm" || fail "Display.smali upstream getMode removal failed"
 perl -0pi -e 's{(\.method public getWidth\(\)I.*?\.end method\n)}{$1.method public getMode()Landroid/view/Display\$Mode;\n    .locals 5\n\n    new-instance v0, Landroid/view/Display\$Mode;\n\n    const/4 v1, 0x0\n\n    sget v2, Landroid/view/Display;->window_width:I\n\n    sget v3, Landroid/view/Display;->window_height:I\n\n    const/high16 v4, 0x42700000\n\n    invoke-direct {v0, v1, v2, v3, v4}, Landroid/view/Display\$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n}s' "$dsm"
-grep -qF "getMode()Landroid/view/Display\$Mode;" "$dsm" || fail "Display.smali getMode insert failed (drift?)"
+n="$(grep -cF ".method public getMode()Landroid/view/Display\$Mode;" "$dsm")" || true
+[ "$n" = "1" ] || fail "Display.smali getMode insert failed (found $n declarations, expected 1)"
 
 fsm="$work/smali/android/app/Fragment.smali"
 [ -f "$fsm" ] || fail "Fragment.smali not found after baksmali"
@@ -610,9 +579,8 @@ vibsm="$work/smali/android/os/Vibrator.smali"
 [ -f "$vibsm" ] || fail "Vibrator.smali not found after baksmali"
 n="$(grep -cF '.method public vibrate(J)V' "$vibsm")" || true
 [ "$n" = "1" ] || fail "Vibrator.smali vibrate(J)V anchor not unique (found $n, expected 1) — installed Vibrator drifted; update patch-framework.sh"
-! grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali already declares cancel — installed Vibrator drifted; update patch-framework.sh"
-perl -0pi -e 's{(\.method public vibrate\(J\)V.*?\.end method\n)}{$1.method public cancel()V\n    .registers 1\n\n    return-void\n.end method\n}s' "$vibsm"
-grep -qF '.method public cancel()V' "$vibsm" || fail "Vibrator.smali cancel insert failed (drift?)"
+n="$(grep -cF '.method public cancel()V' "$vibsm")" || true
+[ "$n" = "1" ] || fail "Vibrator.smali upstream cancel count = $n (expected 1) — installed Vibrator drifted; update patch-framework.sh"
 
 afm="$work/smali/android/view/autofill/AutofillManager.smali"
 [ -f "$afm" ] || fail "AutofillManager.smali not found after baksmali"
