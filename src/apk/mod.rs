@@ -45,6 +45,41 @@ const READ_ENTRY_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
 
 const EXTRACTED_ENTRY_HASH_BUFFER_SIZE: usize = 64 * 1024;
 
+fn decode_modified_utf8(data: &[u8]) -> Option<String> {
+    if let Ok(text) = std::str::from_utf8(data) {
+        return Some(text.to_owned());
+    }
+    let mut units = Vec::with_capacity(data.len());
+    let mut rest = data;
+    while let Some((&lead, tail)) = rest.split_first() {
+        let (continuation_len, initial, minimum) = match lead {
+            0x00..=0x7F => (0, u32::from(lead), 0),
+            0xC0..=0xDF => (1, u32::from(lead & 0x1F), 0x80),
+            0xE0..=0xEF => (2, u32::from(lead & 0x0F), 0x800),
+            0xF0..=0xF7 => (3, u32::from(lead & 0x07), 0x1_0000),
+            _ => return None,
+        };
+        let (continuation, next) = tail.split_at_checked(continuation_len)?;
+        let mut code = initial;
+        for &byte in continuation {
+            if byte & 0xC0 != 0x80 {
+                return None;
+            }
+            code = (code << 6) | u32::from(byte & 0x3F);
+        }
+        let encoded_nul = continuation_len == 1 && code == 0;
+        if code < minimum && !encoded_nul {
+            return None;
+        }
+        match char::from_u32(code) {
+            Some(character) => units.extend_from_slice(character.encode_utf16(&mut [0; 2])),
+            None => units.push(u16::try_from(code).ok()?),
+        }
+        rest = next;
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
 fn extracted_entry_matches(path: &Path, size: u64, crc32: u32) -> io::Result<bool> {
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -772,6 +807,46 @@ mod tests {
         let path = temp_file(tag, bytes);
         let apk = Apk::open(&path).expect("open apk");
         (apk, path)
+    }
+
+    #[test]
+    fn modified_utf8_decodes_utf8_cesu8_pairs_and_encoded_nul() {
+        assert_eq!(decode_modified_utf8(b"plain").as_deref(), Some("plain"));
+        assert_eq!(
+            decode_modified_utf8("Jump back in \u{1F504}".as_bytes()).as_deref(),
+            Some("Jump back in \u{1F504}")
+        );
+        assert_eq!(
+            decode_modified_utf8(b"Popular right now \xED\xA0\xBD\xED\xB4\xA5").as_deref(),
+            Some("Popular right now \u{1F525}")
+        );
+        assert_eq!(decode_modified_utf8(&[0xC0, 0x80]).as_deref(), Some("\0"));
+        assert_eq!(
+            decode_modified_utf8(&[0xED, 0xA0, 0xBD, b'x']).as_deref(),
+            Some("\u{FFFD}x")
+        );
+    }
+
+    #[test]
+    fn modified_utf8_rejects_bad_leads_truncation_and_out_of_range_code_points() {
+        assert_eq!(decode_modified_utf8(&[0xFF]), None);
+        assert_eq!(decode_modified_utf8(&[0x80]), None);
+        assert_eq!(decode_modified_utf8(&[0xE2, 0x82]), None);
+        assert_eq!(decode_modified_utf8(&[0xE2, 0x28, 0xA1]), None);
+        assert_eq!(decode_modified_utf8(&[0xF4, 0x90, 0x80, 0x80]), None);
+    }
+
+    #[test]
+    fn modified_utf8_rejects_overlong_forms_other_than_the_encoded_nul() {
+        assert_eq!(decode_modified_utf8(&[0xC0, 0xAF]), None);
+        assert_eq!(decode_modified_utf8(&[0xC1, 0x81]), None);
+        assert_eq!(decode_modified_utf8(&[0xE0, 0x80, 0xAF]), None);
+        assert_eq!(decode_modified_utf8(&[0xE0, 0x80, 0x80]), None);
+        assert_eq!(decode_modified_utf8(&[0xF0, 0x8F, 0xBF, 0xBF]), None);
+        assert_eq!(
+            decode_modified_utf8(&[b'a', 0xC0, 0x80]).as_deref(),
+            Some("a\0")
+        );
     }
 
     #[test]

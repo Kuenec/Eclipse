@@ -560,9 +560,7 @@ fn decode_utf8(buf: &[u8], start: usize) -> Result<String, ArscError> {
     let (byte_len, after_len) = read_var_len_u8(buf, after_char)?;
     let end = after_len.checked_add(byte_len).ok_or(ArscError::Overflow)?;
     let data = buf.get(after_len..end).ok_or(ArscError::BadStringPool)?;
-    std::str::from_utf8(data)
-        .map(str::to_owned)
-        .map_err(|_| ArscError::BadStringPool)
+    super::decode_modified_utf8(data).ok_or(ArscError::BadStringPool)
 }
 
 fn decode_utf16(buf: &[u8], start: usize) -> Result<String, ArscError> {
@@ -1343,6 +1341,47 @@ mod tests {
             StringPool::parse(&not_a_pool),
             Err(ArscError::BadStringPool)
         ));
+    }
+
+    #[test]
+    fn utf8_pool_decodes_the_cesu8_surrogate_pairs_aapt2_writes_for_emoji() {
+        let data = [0x02, 0x06, 0xED, 0xA0, 0xBD, 0xED, 0xB4, 0x84, 0x00];
+        let mut chunk = Vec::new();
+        push_u16(&mut chunk, RES_STRING_POOL_TYPE);
+        push_u16(&mut chunk, 28);
+        push_u32(&mut chunk, (32 + data.len()) as u32);
+        push_u32(&mut chunk, 1);
+        push_u32(&mut chunk, 0);
+        push_u32(&mut chunk, UTF8_FLAG);
+        push_u32(&mut chunk, 32);
+        push_u32(&mut chunk, 0);
+        push_u32(&mut chunk, 0);
+        chunk.extend_from_slice(&data);
+
+        let pool = StringPool::parse(&chunk).expect("one-string UTF-8 pool");
+        assert_eq!(pool.get(0).unwrap().as_deref(), Some("\u{1F504}"));
+    }
+
+    #[test]
+    fn every_value_string_of_the_official_roblox_resources_decodes() {
+        let Some(paths) = crate::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK usable")
+        else {
+            eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to decode the official resources.arsc");
+            return;
+        };
+        let bytes = Apk::open(&paths.base)
+            .and_then(|mut apk| apk.read_entry("resources.arsc"))
+            .expect("read the official resources.arsc");
+        let table = parse_arsc(&bytes).expect("parse the official resources.arsc");
+        let mut decoded = 0_u32;
+        loop {
+            match table.value_string(decoded) {
+                Ok(_) => decoded += 1,
+                Err(ArscError::StringIndexOutOfRange) => break,
+                Err(error) => panic!("value string {decoded} does not decode: {error}"),
+            }
+        }
+        assert!(decoded > 0, "the official value pool holds strings");
     }
 
     #[test]
