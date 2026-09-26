@@ -15,9 +15,13 @@ pub(crate) const HEAP_MIB: u32 = 768;
 
 const LIBART_DEFAULT: &str = "/usr/lib/art/libart.so";
 
-const BOOT_IMAGE_DEFAULT: &str = "/usr/lib/java/dex/art/oat/boot.art";
+const ART_SUBDIR: &str = "art";
 
-const ART_DATA_DIR_DEFAULT: &str = "/usr/lib/java/dex/art";
+const STOCK_FRAMEWORK_SUBDIR: &str = "android_translation_layer";
+
+const BUNDLED_FRAMEWORK_DIR: &str = "framework";
+
+const API_IMPL_JAR: &str = "api-impl.jar";
 
 const ART_OVERLAY_MARKER: &str = ".eclipse-art-overlay-v1";
 const ART_OVERLAY_MARKER_CONTENT: &str = "eclipse-art-overlay-v1\n";
@@ -156,13 +160,59 @@ impl BootPlan {
     }
 }
 
-pub fn find_libart() -> Result<PathBuf, RuntimeError> {
-    let path = env_path("ECLIPSE_LIBART").unwrap_or_else(|| PathBuf::from(LIBART_DEFAULT));
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallLayout {
+    exe: PathBuf,
+}
+
+impl InstallLayout {
+    fn current() -> Result<Self, RuntimeError> {
+        std::env::current_exe()
+            .map(|exe| Self { exe })
+            .map_err(RuntimeError::CurrentExe)
+    }
+
+    fn bundled_libart(&self) -> Option<PathBuf> {
+        let prefix = self.exe.parent()?.parent()?;
+        Some(prefix.join(ART_SUBDIR).join("libart.so"))
+    }
+
+    fn bundled_framework_dir(&self) -> Option<PathBuf> {
+        self.exe
+            .parent()
+            .map(|exe_dir| exe_dir.join(BUNDLED_FRAMEWORK_DIR))
+    }
+}
+
+fn resolve_libart(explicit: Option<PathBuf>, bundled: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or(bundled)
+        .unwrap_or_else(|| PathBuf::from(LIBART_DEFAULT))
+}
+
+fn libart_location(layout: &InstallLayout) -> PathBuf {
+    resolve_libart(
+        env_path("ECLIPSE_LIBART"),
+        layout.bundled_libart().filter(|path| path.is_file()),
+    )
+}
+
+fn libart_path(layout: &InstallLayout) -> Result<PathBuf, RuntimeError> {
+    let path = libart_location(layout);
     if path.exists() {
         Ok(path)
     } else {
         Err(RuntimeError::LibartNotFound(path))
     }
+}
+
+pub fn find_libart() -> Result<PathBuf, RuntimeError> {
+    libart_path(&InstallLayout::current()?)
+}
+
+fn stock_dex_root(libart: &Path) -> Option<PathBuf> {
+    let lib_dir = libart.parent()?.parent()?;
+    Some(lib_dir.join("java").join("dex"))
 }
 
 const LIBCORE_PRIMARY_JAR: &str = "core-oj-hostdex.jar";
@@ -193,10 +243,50 @@ fn boot_class_path_for(art_dir: &Path) -> Result<OsString, RuntimeError> {
         .map_err(RuntimeError::BootClassPathJoin)
 }
 
-fn overlay_art_dir() -> Option<PathBuf> {
-    env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR")
-        .or_else(patched_overlay_dir)
-        .map(|dir| dir.join("art"))
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FrameworkOverlay {
+    Explicit(PathBuf),
+
+    Bundled(PathBuf),
+
+    DevCache(PathBuf),
+}
+
+impl FrameworkOverlay {
+    fn dir(&self) -> &Path {
+        match self {
+            Self::Explicit(dir) | Self::Bundled(dir) | Self::DevCache(dir) => dir,
+        }
+    }
+}
+
+fn resolve_framework_overlay(
+    explicit: Option<PathBuf>,
+    bundled: Option<PathBuf>,
+    dev_cache: Option<PathBuf>,
+) -> Option<FrameworkOverlay> {
+    explicit
+        .map(FrameworkOverlay::Explicit)
+        .or_else(|| bundled.map(FrameworkOverlay::Bundled))
+        .or_else(|| dev_cache.map(FrameworkOverlay::DevCache))
+}
+
+fn bundled_overlay_is_present(dir: &Path) -> bool {
+    dir.join(API_IMPL_JAR).is_file() && dir.join(ART_SUBDIR).join(ART_OVERLAY_MARKER).is_file()
+}
+
+fn framework_overlay(layout: &InstallLayout) -> Option<FrameworkOverlay> {
+    resolve_framework_overlay(
+        env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR"),
+        layout
+            .bundled_framework_dir()
+            .filter(|dir| bundled_overlay_is_present(dir)),
+        patched_overlay_dir(),
+    )
+}
+
+fn overlay_art_dir(layout: &InstallLayout) -> Option<PathBuf> {
+    framework_overlay(layout).map(|overlay| overlay.dir().join(ART_SUBDIR))
 }
 
 fn overlay_is_ready(art_dir: &Path) -> Result<bool, RuntimeError> {
@@ -209,23 +299,30 @@ fn overlay_is_ready(art_dir: &Path) -> Result<bool, RuntimeError> {
     }
 }
 
+fn boot_image_in(art_dir: &Path) -> PathBuf {
+    art_dir.join("oat").join("boot.art")
+}
+
 fn resolve_boot_image_location(
     explicit: Option<PathBuf>,
     overlay_art: Option<PathBuf>,
     overlay_ready: bool,
-) -> PathBuf {
+    stock_art_dir: Option<&Path>,
+) -> Option<PathBuf> {
     if let Some(path) = explicit {
-        path
+        Some(path)
     } else if let Some(art_dir) = overlay_art.filter(|_| overlay_ready) {
-        art_dir.join("oat").join("boot.art")
+        Some(boot_image_in(&art_dir))
     } else {
-        PathBuf::from(BOOT_IMAGE_DEFAULT)
+        stock_art_dir.map(boot_image_in)
     }
 }
 
-fn find_art_boot_paths() -> Result<ArtBootPaths, RuntimeError> {
+fn find_art_boot_paths(layout: &InstallLayout) -> Result<ArtBootPaths, RuntimeError> {
+    let libart = libart_location(layout);
+    let stock_art_dir = stock_dex_root(&libart).map(|root| root.join(ART_SUBDIR));
     let explicit = env_path("ECLIPSE_ART_BOOT_IMAGE");
-    let overlay_art = overlay_art_dir();
+    let overlay_art = overlay_art_dir(layout);
     let overlay_ready = if explicit.is_none() {
         overlay_art
             .as_deref()
@@ -235,8 +332,13 @@ fn find_art_boot_paths() -> Result<ArtBootPaths, RuntimeError> {
     } else {
         false
     };
-    let image_location =
-        resolve_boot_image_location(explicit.clone(), overlay_art.clone(), overlay_ready);
+    let image_location = resolve_boot_image_location(
+        explicit,
+        overlay_art,
+        overlay_ready,
+        stock_art_dir.as_deref(),
+    )
+    .ok_or(RuntimeError::StockDexRootUnresolved(libart))?;
     let art_dir = art_dir_from_image(&image_location)
         .ok_or_else(|| RuntimeError::BootImageNotFound(image_location.clone()))?;
 
@@ -248,8 +350,8 @@ fn find_art_boot_paths() -> Result<ArtBootPaths, RuntimeError> {
         return Err(RuntimeError::BootImageNotFound(image_location));
     }
 
-    let self_contained =
-        art_dir != Path::new(ART_DATA_DIR_DEFAULT) && first_missing_art_jar(&art_dir).is_none();
+    let self_contained = stock_art_dir.as_deref() != Some(art_dir.as_path())
+        && first_missing_art_jar(&art_dir).is_none();
     let boot_class_path = self_contained
         .then(|| boot_class_path_for(&art_dir))
         .transpose()?;
@@ -261,7 +363,7 @@ fn find_art_boot_paths() -> Result<ArtBootPaths, RuntimeError> {
 }
 
 pub fn prepare_art_boot_environment() -> Result<(), RuntimeError> {
-    let paths = find_art_boot_paths()?;
+    let paths = find_art_boot_paths(&InstallLayout::current()?)?;
     if let Some(boot_class_path) = paths.boot_class_path {
         if std::env::var_os("BOOTCLASSPATH").as_ref() != Some(&boot_class_path) {
             unsafe { std::env::set_var("BOOTCLASSPATH", boot_class_path) };
@@ -271,7 +373,7 @@ pub fn prepare_art_boot_environment() -> Result<(), RuntimeError> {
 }
 
 pub fn find_boot_image() -> Result<PathBuf, RuntimeError> {
-    find_art_boot_paths().map(|paths| paths.image_location)
+    find_art_boot_paths(&InstallLayout::current()?).map(|paths| paths.image_location)
 }
 
 fn env_path(var: &str) -> Option<PathBuf> {
@@ -293,8 +395,6 @@ fn vm_options_from_env(raw: Option<&std::ffi::OsStr>) -> Vec<String> {
     .unwrap_or_default()
 }
 
-const FRAMEWORK_DIR_DEFAULT: &str = "/usr/lib/java/dex/android_translation_layer";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameworkPaths {
     pub api_impl_jar: PathBuf,
@@ -308,44 +408,35 @@ fn patched_overlay_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", "eclipse").map(|d| d.cache_dir().join("framework-patched"))
 }
 
-fn resolve_framework_dir(
-    env_override: Option<PathBuf>,
-    overlay_dir: Option<PathBuf>,
-    overlay_present: bool,
-) -> PathBuf {
-    if let Some(dir) = env_override {
-        return dir;
+fn overlay_framework_dir(overlay: Option<FrameworkOverlay>) -> Option<PathBuf> {
+    match overlay? {
+        FrameworkOverlay::Explicit(dir) | FrameworkOverlay::Bundled(dir) => Some(dir),
+        FrameworkOverlay::DevCache(dir) => dir.join(API_IMPL_JAR).exists().then_some(dir),
     }
-    if overlay_present {
-        if let Some(dir) = overlay_dir {
-            return dir;
-        }
-    }
-    PathBuf::from(FRAMEWORK_DIR_DEFAULT)
 }
 
-fn framework_dir() -> PathBuf {
-    let env_override = env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR");
-    let overlay = patched_overlay_dir();
-    let overlay_present = overlay
-        .as_ref()
-        .is_some_and(|d| d.join("api-impl.jar").exists());
-    let dir = resolve_framework_dir(env_override.clone(), overlay, overlay_present);
-    if env_override.is_none() && !overlay_present {
-        tracing::warn!(
-            framework_dir = %dir.display(),
-            "no patched framework overlay found; using the stock ATL framework, which lacks \
-             Roblox-required android.* classes/fields (boot will fail in \
-             RobloxApplication.onCreate). Run tools/framework-overlay/patch-framework.sh or set \
-             ECLIPSE_ANDROID_FRAMEWORK_DIR."
-        );
+fn framework_dir(layout: &InstallLayout) -> Result<PathBuf, RuntimeError> {
+    if let Some(dir) = overlay_framework_dir(framework_overlay(layout)) {
+        return Ok(dir);
     }
-    dir
+    let libart = libart_location(layout);
+    let Some(stock_root) = stock_dex_root(&libart) else {
+        return Err(RuntimeError::StockDexRootUnresolved(libart));
+    };
+    let dir = stock_root.join(STOCK_FRAMEWORK_SUBDIR);
+    tracing::warn!(
+        framework_dir = %dir.display(),
+        "no patched framework overlay found (bundled beside the executable or in the dev \
+         cache); using the stock ATL framework, which lacks Roblox-required android.* \
+         classes/fields (boot will fail in RobloxApplication.onCreate). Run \
+         tools/framework-overlay/patch-framework.sh or set ECLIPSE_ANDROID_FRAMEWORK_DIR."
+    );
+    Ok(dir)
 }
 
-pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
-    let dir = framework_dir();
-    let api_impl_jar = dir.join("api-impl.jar");
+fn find_framework_in(layout: &InstallLayout) -> Result<FrameworkPaths, RuntimeError> {
+    let dir = framework_dir(layout)?;
+    let api_impl_jar = dir.join(API_IMPL_JAR);
     if !api_impl_jar.exists() {
         return Err(RuntimeError::FrameworkNotFound(api_impl_jar));
     }
@@ -354,6 +445,10 @@ pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
         natives_dir: dir.join("natives"),
         api_impl_jar,
     })
+}
+
+pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
+    find_framework_in(&InstallLayout::current()?)
 }
 
 pub fn native_lib_cache_dir() -> Result<PathBuf, RuntimeError> {
@@ -434,7 +529,7 @@ const BIONIC_BARE_SONAMES: &[BareSoname] = &[];
 
 const ECLIPSE_LIBM_SONAME: &str = "libm.so";
 
-const ECLIPSE_LIBM_SHIM_SO: &str = env!("ECLIPSE_LIBM_SHIM_SO");
+const ECLIPSE_LIBM_SHIM: &[u8] = include_bytes!(env!("ECLIPSE_LIBM_SHIM_SO"));
 
 const HOST_LIB_DIRS: &[&str] = &[
     "/usr/lib",
@@ -459,28 +554,17 @@ pub fn provision_bionic_sonames(dir: &Path) -> Result<(), RuntimeError> {
 }
 
 fn provision_eclipse_libm(dir: &Path) -> Result<(), RuntimeError> {
-    let shim = Path::new(ECLIPSE_LIBM_SHIM_SO);
-    let link = dir.join(ECLIPSE_LIBM_SONAME);
-    let shim_len = match std::fs::metadata(shim) {
-        Ok(m) => m.len(),
+    use std::os::unix::fs::PermissionsExt as _;
 
-        Err(_) => {
-            return Err(RuntimeError::HostLibNotFound {
-                soname: ECLIPSE_LIBM_SONAME,
-                candidates: &[],
-            })
-        }
-    };
-
-    if let Ok(meta) = std::fs::symlink_metadata(&link) {
-        if meta.file_type().is_file() && meta.len() == shim_len {
-            return Ok(());
-        }
-
-        std::fs::remove_file(&link).map_err(|e| RuntimeError::ProvisionSoname(link.clone(), e))?;
+    let target = dir.join(ECLIPSE_LIBM_SONAME);
+    if std::fs::read(&target).is_ok_and(|bytes| bytes == ECLIPSE_LIBM_SHIM) {
+        return Ok(());
     }
-    std::fs::copy(shim, &link).map_err(|e| RuntimeError::ProvisionSoname(link.clone(), e))?;
-    Ok(())
+    let temporary = dir.join(format!(".{ECLIPSE_LIBM_SONAME}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, ECLIPSE_LIBM_SHIM)
+        .and_then(|()| std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755)))
+        .map_err(|e| RuntimeError::ProvisionSoname(temporary.clone(), e))?;
+    std::fs::rename(&temporary, &target).map_err(|e| RuntimeError::ProvisionSoname(target, e))
 }
 
 fn find_host_lib(entry: &BareSoname) -> Result<PathBuf, RuntimeError> {
@@ -566,8 +650,9 @@ pub fn boot(
     apk_path: Option<&Path>,
     app_lib_dir: Option<&Path>,
 ) -> Result<Vm, RuntimeError> {
-    let libart = find_libart()?;
-    let art_boot = find_art_boot_paths()?;
+    let layout = InstallLayout::current()?;
+    let libart = libart_path(&layout)?;
+    let art_boot = find_art_boot_paths(&layout)?;
     let boot_image = &art_boot.image_location;
 
     let mut option_strings: Vec<CString> = Vec::new();
@@ -601,7 +686,7 @@ pub fn boot(
     }
 
     if let Some(apk) = apk_path {
-        let fw = find_framework()?;
+        let fw = find_framework_in(&layout)?;
         option_strings.push(make_cstring(class_path_option(&fw, apk))?);
         option_strings.push(make_cstring(library_path_option(&fw, app_lib_dir))?);
     }
@@ -679,7 +764,11 @@ fn make_os_option(prefix: &str, value: &OsStr) -> Result<CString, RuntimeError> 
 
 #[derive(Debug)]
 pub enum RuntimeError {
+    CurrentExe(std::io::Error),
+
     LibartNotFound(PathBuf),
+
+    StockDexRootUnresolved(PathBuf),
 
     BootImageNotFound(PathBuf),
 
@@ -727,6 +816,11 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CurrentExe(e) => write!(
+                f,
+                "cannot resolve the Eclipse executable path to locate bundled ART and framework \
+                 files: {e}"
+            ),
             Self::LibartNotFound(p) => {
                 write!(
                     f,
@@ -734,6 +828,13 @@ impl fmt::Display for RuntimeError {
                     p.display()
                 )
             }
+            Self::StockDexRootUnresolved(p) => write!(
+                f,
+                "cannot derive the stock ART/ATL dex directory from libart path {} (expected \
+                 <libdir>/art/libart.so with the jars under <libdir>/java/dex; set \
+                 ECLIPSE_LIBART to such an absolute path)",
+                p.display()
+            ),
             Self::BootImageNotFound(p) => {
                 write!(
                     f,
@@ -796,11 +897,7 @@ impl fmt::Display for RuntimeError {
                  dirs); install the host package that provides one of these (e.g. glibc)"
             ),
             Self::ProvisionSoname(p, e) => {
-                write!(
-                    f,
-                    "failed to provision a bionic-soname symlink at {}: {e}",
-                    p.display()
-                )
+                write!(f, "failed to provision bionic soname {}: {e}", p.display())
             }
             Self::OptionHasNul => f.write_str("an ART VM option contained an interior NUL byte"),
             Self::CreateVm(rc) => write!(f, "JNI_CreateJavaVM failed (status {rc})"),
@@ -817,8 +914,9 @@ impl std::error::Error for RuntimeError {
             | Self::OpenGlobalScope(e)
             | Self::ResolveDlParse(e) => Some(e),
             Self::BootClassPathJoin(e) => Some(e),
-            Self::ArtOverlayMarkerRead(_, e) => Some(e),
-            Self::ProvisionSoname(_, e) => Some(e),
+            Self::CurrentExe(e)
+            | Self::ArtOverlayMarkerRead(_, e)
+            | Self::ProvisionSoname(_, e) => Some(e),
             _ => None,
         }
     }
@@ -862,26 +960,152 @@ mod tests {
     #[test]
     fn art_boot_image_precedence_is_explicit_then_ready_overlay_then_stock() {
         let overlay = PathBuf::from("/cache/eclipse/framework-patched/art");
+        let stock = Path::new("/usr/lib/java/dex/art");
         assert_eq!(
             resolve_boot_image_location(
                 Some(PathBuf::from("/custom/art/oat/boot.art")),
                 Some(overlay.clone()),
                 true,
+                Some(stock),
             ),
-            PathBuf::from("/custom/art/oat/boot.art")
+            Some(PathBuf::from("/custom/art/oat/boot.art"))
         );
         assert_eq!(
-            resolve_boot_image_location(None, Some(overlay.clone()), true),
-            overlay.join("oat/boot.art")
+            resolve_boot_image_location(None, Some(overlay.clone()), true, Some(stock)),
+            Some(overlay.join("oat/boot.art"))
         );
         assert_eq!(
-            resolve_boot_image_location(None, Some(overlay), false),
-            PathBuf::from(BOOT_IMAGE_DEFAULT)
+            resolve_boot_image_location(None, Some(overlay.clone()), false, Some(stock)),
+            Some(PathBuf::from("/usr/lib/java/dex/art/oat/boot.art"))
         );
         assert_eq!(
-            resolve_boot_image_location(None, None, true),
-            PathBuf::from(BOOT_IMAGE_DEFAULT),
+            resolve_boot_image_location(None, None, true, Some(stock)),
+            Some(PathBuf::from("/usr/lib/java/dex/art/oat/boot.art")),
             "an impossible ready-without-directory state must degrade to stock without panicking"
+        );
+        assert_eq!(
+            resolve_boot_image_location(None, Some(overlay), false, None),
+            None,
+            "an unresolvable stock directory must surface instead of inventing a path"
+        );
+    }
+
+    #[test]
+    fn stock_dex_root_follows_the_atl_and_art_rule_relative_to_libart() {
+        assert_eq!(
+            stock_dex_root(Path::new(LIBART_DEFAULT)),
+            Some(PathBuf::from("/usr/lib/java/dex")),
+            "the system libart must keep resolving to today's /usr/lib/java/dex paths"
+        );
+        assert_eq!(
+            stock_dex_root(Path::new("/app/lib/art/libart.so")),
+            Some(PathBuf::from("/app/lib/java/dex"))
+        );
+        assert_eq!(
+            stock_dex_root(Path::new("/usr/lib64/art/libart.so")),
+            Some(PathBuf::from("/usr/lib64/java/dex"))
+        );
+        assert_eq!(stock_dex_root(Path::new("libart.so")), None);
+    }
+
+    #[test]
+    fn libart_precedence_is_explicit_then_bundled_then_system() {
+        let explicit = PathBuf::from("/opt/art/lib/art/libart.so");
+        let bundled = PathBuf::from("/app/lib/art/libart.so");
+        assert_eq!(
+            resolve_libart(Some(explicit.clone()), Some(bundled.clone())),
+            explicit
+        );
+        assert_eq!(resolve_libart(None, Some(bundled.clone())), bundled);
+        assert_eq!(resolve_libart(None, None), PathBuf::from(LIBART_DEFAULT));
+    }
+
+    #[test]
+    fn install_layout_derives_bundled_paths_from_the_executable() {
+        let layout = InstallLayout {
+            exe: PathBuf::from("/app/lib/eclipse/eclipse"),
+        };
+        assert_eq!(
+            layout.bundled_libart(),
+            Some(PathBuf::from("/app/lib/art/libart.so"))
+        );
+        assert_eq!(
+            layout.bundled_framework_dir(),
+            Some(PathBuf::from("/app/lib/eclipse/framework"))
+        );
+    }
+
+    fn temp_tree(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-runtime-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create temp tree");
+        dir
+    }
+
+    #[test]
+    fn bundled_install_is_detected_and_a_dev_build_falls_through() {
+        let root = temp_tree("layout");
+        let bundle_exe = root.join("bundle/lib/eclipse/eclipse");
+        let framework = root.join("bundle/lib/eclipse/framework");
+        std::fs::create_dir_all(framework.join("art")).expect("create framework");
+        std::fs::create_dir_all(root.join("bundle/lib/art")).expect("create art dir");
+        std::fs::write(&bundle_exe, b"").expect("write exe");
+        std::fs::write(root.join("bundle/lib/art/libart.so"), b"").expect("write libart");
+        std::fs::write(framework.join(API_IMPL_JAR), b"").expect("write api-impl");
+
+        let bundle = InstallLayout { exe: bundle_exe };
+        assert!(
+            !bundled_overlay_is_present(&framework),
+            "a bundled overlay without the ART readiness marker must not be selected"
+        );
+        std::fs::write(
+            framework.join(ART_SUBDIR).join(ART_OVERLAY_MARKER),
+            ART_OVERLAY_MARKER_CONTENT,
+        )
+        .expect("write marker");
+        assert!(bundled_overlay_is_present(&framework));
+        assert!(bundle.bundled_libart().is_some_and(|path| path.is_file()));
+
+        let dev = InstallLayout {
+            exe: root.join("repo/target/release/eclipse"),
+        };
+        assert!(dev.bundled_libart().is_some_and(|path| !path.exists()));
+        assert!(dev
+            .bundled_framework_dir()
+            .is_some_and(|dir| !bundled_overlay_is_present(&dir)));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn framework_overlay_precedence_is_explicit_then_bundled_then_dev_cache() {
+        let explicit = PathBuf::from("/custom/fw");
+        let bundled = PathBuf::from("/app/lib/eclipse/framework");
+        let cache = PathBuf::from("/cache/eclipse/framework-patched");
+        assert_eq!(
+            resolve_framework_overlay(
+                Some(explicit.clone()),
+                Some(bundled.clone()),
+                Some(cache.clone())
+            ),
+            Some(FrameworkOverlay::Explicit(explicit))
+        );
+        assert_eq!(
+            resolve_framework_overlay(None, Some(bundled.clone()), Some(cache.clone())),
+            Some(FrameworkOverlay::Bundled(bundled.clone()))
+        );
+        assert_eq!(
+            resolve_framework_overlay(None, None, Some(cache.clone())),
+            Some(FrameworkOverlay::DevCache(cache.clone()))
+        );
+        assert_eq!(resolve_framework_overlay(None, None, None), None);
+        assert_eq!(
+            FrameworkOverlay::Bundled(bundled.clone())
+                .dir()
+                .join(ART_SUBDIR),
+            bundled.join("art"),
+            "the ART overlay lives in the selected overlay's art directory"
         );
     }
 
@@ -1059,27 +1283,33 @@ mod tests {
     }
 
     #[test]
-    fn framework_dir_precedence_prefers_overlay_over_stock() {
-        let overlay = PathBuf::from("/cache/eclipse/framework-patched");
-        let stock = PathBuf::from(FRAMEWORK_DIR_DEFAULT);
-
+    fn framework_dir_prefers_overlays_and_needs_api_impl_only_in_the_dev_cache() {
         assert_eq!(
-            resolve_framework_dir(
-                Some(PathBuf::from("/custom/fw")),
-                Some(overlay.clone()),
-                true
-            ),
-            PathBuf::from("/custom/fw")
+            overlay_framework_dir(Some(FrameworkOverlay::Explicit(PathBuf::from(
+                "/custom/fw"
+            )))),
+            Some(PathBuf::from("/custom/fw"))
         );
-
         assert_eq!(
-            resolve_framework_dir(None, Some(overlay.clone()), true),
-            overlay
+            overlay_framework_dir(Some(FrameworkOverlay::Bundled(PathBuf::from(
+                "/app/lib/eclipse/framework"
+            )))),
+            Some(PathBuf::from("/app/lib/eclipse/framework"))
         );
+        assert_eq!(overlay_framework_dir(None), None);
 
-        assert_eq!(resolve_framework_dir(None, Some(overlay), false), stock);
-
-        assert_eq!(resolve_framework_dir(None, None, false), stock.clone());
+        let cache = temp_tree("dev-cache");
+        assert_eq!(
+            overlay_framework_dir(Some(FrameworkOverlay::DevCache(cache.clone()))),
+            None,
+            "a dev cache without api-impl.jar must fall back to the stock framework"
+        );
+        std::fs::write(cache.join(API_IMPL_JAR), b"").expect("write api-impl");
+        assert_eq!(
+            overlay_framework_dir(Some(FrameworkOverlay::DevCache(cache.clone()))),
+            Some(cache.clone())
+        );
+        std::fs::remove_dir_all(&cache).ok();
     }
 
     #[test]
@@ -1267,19 +1497,14 @@ mod tests {
 
     #[test]
     fn eclipse_libm_shim_is_apkenv_loadable_and_provisions_libm_so() {
-        let shim = Path::new(ECLIPSE_LIBM_SHIM_SO);
-        let bytes = std::fs::read(shim).expect("the build.rs-built libm shim .so must exist");
+        let bytes = ECLIPSE_LIBM_SHIM;
         assert_eq!(
             &bytes[..4],
             b"\x7fELF",
             "the shim must be a real ELF object"
         );
-        assert!(
-            is_real_elf(shim),
-            "the shim must pass the apkenv real-ELF gate"
-        );
 
-        let img = crate::loader::elf::ElfImage::parse(&bytes).expect("decode shim ELF");
+        let img = crate::loader::elf::ElfImage::parse(bytes).expect("decode shim ELF");
         for rela in img.relocations().expect("decode shim relocations") {
             assert_ne!(
                 rela.r_type,
@@ -1293,14 +1518,17 @@ mod tests {
             "the libm shim must have no RELR (packed) relocations — the apkenv linker cannot apply them"
         );
 
-        let dir = std::env::temp_dir().join(format!("eclipse-libm-prov-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        let dir = temp_tree("libm-prov");
         provision_eclipse_libm(&dir).expect("provision libm shim");
         let provisioned = dir.join("libm.so");
         let copied = std::fs::read(&provisioned).expect("provisioned libm.so must exist");
         assert_eq!(
             copied, bytes,
             "provisioned libm.so must be the shim's bytes"
+        );
+        assert!(
+            is_real_elf(&provisioned),
+            "the provisioned shim must pass the apkenv real-ELF gate"
         );
 
         provision_eclipse_libm(&dir).expect("provision libm shim (idempotent)");
@@ -1309,10 +1537,49 @@ mod tests {
     }
 
     #[test]
+    fn eclipse_libm_provisioning_replaces_stale_same_size_copies_and_symlinks() {
+        let dir = temp_tree("libm-stale");
+        let provisioned = dir.join(ECLIPSE_LIBM_SONAME);
+
+        let mut stale = ECLIPSE_LIBM_SHIM.to_vec();
+        let last = stale.len() - 1;
+        stale[last] ^= 0xff;
+        std::fs::write(&provisioned, &stale).expect("write stale shim");
+        provision_eclipse_libm(&dir).expect("replace the stale shim");
+        assert_eq!(
+            std::fs::read(&provisioned).expect("read provisioned shim"),
+            ECLIPSE_LIBM_SHIM,
+            "a stale shim of the same size from an older Eclipse must be replaced"
+        );
+
+        let host_lib = dir.join("libm.so.6");
+        std::fs::write(&host_lib, b"\x7fELF-host").expect("write host lib");
+        std::fs::remove_file(&provisioned).expect("remove shim");
+        std::os::unix::fs::symlink(&host_lib, &provisioned).expect("link host lib");
+        provision_eclipse_libm(&dir).expect("replace the host symlink");
+        assert!(
+            std::fs::symlink_metadata(&provisioned)
+                .expect("stat provisioned shim")
+                .file_type()
+                .is_file(),
+            "the soname must become Eclipse's own file, not a link to the host libm"
+        );
+        assert_eq!(
+            std::fs::read(&host_lib).expect("read host lib"),
+            b"\x7fELF-host",
+            "the host library behind the old link must stay untouched"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn eclipse_libm_shim_math_values_are_correct() {
         use core::ffi::c_int;
-        let lib = unsafe { libloading::Library::new(ECLIPSE_LIBM_SHIM_SO) }
-            .expect("dlopen the built libm shim");
+        let dir = temp_tree("libm-math");
+        provision_eclipse_libm(&dir).expect("provision libm shim");
+        let lib = unsafe { libloading::Library::new(dir.join(ECLIPSE_LIBM_SONAME)) }
+            .expect("dlopen the provisioned libm shim");
         const EPS: f64 = 1e-12;
         const EPSF: f32 = 1e-6;
         unsafe {
@@ -1370,5 +1637,7 @@ mod tests {
                 "frexp(8)=(0.5, 4), got ({m}, {e})"
             );
         }
+        drop(lib);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
