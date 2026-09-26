@@ -15,19 +15,24 @@ USAGE:
     eclipse <COMMAND>
 
 COMMANDS:
-    run [APK]  Parse the APK, boot the ART VM (Roblox on the classpath), open the window.
-               With no APK and `auto_fetch_missing`+`apk_url` set (or ECLIPSE_APK_URL),
-               auto-downloads from your configured source first.
-    install-url-handler [APK]
-               Register Eclipse for browser Play clicks and remember the Roblox APK.
-    fetch      Report the latest upstream Roblox version + download the APK from your
-               configured source (config `apk_url` / ECLIPSE_APK_URL) into the cache.
-    config     Show effective configuration and its path
-    help       Show this help
-    --version  Show version
+    run [PATH]  Verify the Roblox client, boot the ART VM (Roblox on the classpath) and open
+                the window. With no PATH, runs the installed client; when signed in to Google
+                Play, it first checks for a Roblox update (at most every 6 hours). PATH may be
+                an APK file or a directory holding base.apk and split_config.x86_64.apk.
+    install <PATH>...
+                Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
+                a directory holding them, or an .apks/.xapk/.apkm bundle.
+    play-login  Sign in to Google Play with your own Google account (once).
+    update      Download and install the newest Roblox client from Google Play.
+    install-url-handler
+                Register Eclipse for browser Play clicks (they run the installed client).
+    config      Show effective configuration and its path
+    help        Show this help
+    --version   Show version
 
-NOTE: Eclipse never hosts or hard-codes a Roblox APK source. You supply your own APK (path
-    or a download URL you configure); auto-fetch is opt-in. Eclipse does not redistribute Roblox.
+NOTE: Eclipse runs only the official, unmodified Roblox client signed by Roblox Corporation.
+    It never hosts, mirrors or modifies it; `eclipse update` downloads it from Google Play
+    with your own account.
 
 STATUS:
     `run` parses the manifest, prints the ART boot plan, boots the vendored ART VM with
@@ -52,7 +57,6 @@ fn main() -> ExitCode {
             eprintln!("eclipse Android settings setup: {error}");
             return ExitCode::FAILURE;
         }
-        unreachable!("a successful settings-path handoff replaces this process");
     }
     if is_android_run_command(args.first().map(String::as_str))
         || matches!(args.first().map(String::as_str), Some("__webview-test"))
@@ -76,8 +80,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("run") => {
-            let status = match parse_run_apk_path(&args[1..])
-                .and_then(|apk_path| run_apk(apk_path, None).map_err(|error| error.to_string()))
+            let status = match parse_run_path(&args[1..])
+                .and_then(|path| run_apk(path, None).map_err(|error| error.to_string()))
             {
                 Ok(()) => 0,
                 Err(e) => {
@@ -106,17 +110,31 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("install") => match install_command(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("eclipse install: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("play-login") => match play_login_command(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("eclipse play-login: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("update") => match update_command(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("eclipse update: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some("config") => match show_config() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("eclipse config: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Some("fetch") => match fetch_apk_command() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("eclipse fetch: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -241,6 +259,9 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
     use std::os::unix::process::CommandExt as _;
 
     let config = eclipse::config::Config::load()?;
+    let Some(json) = config.client_app_settings_json()? else {
+        return Ok(());
+    };
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(
         "cannot resolve Eclipse's app-data directory; set HOME, XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR",
     )?;
@@ -252,8 +273,6 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
         ".ClientAppSettings.json.{}.tmp",
         std::process::id()
     ));
-    let mut json = serde_json::to_vec_pretty(&config.roblox_client_app_settings())?;
-    json.push(b'\n');
     std::fs::write(&temporary_path, json)?;
     std::fs::rename(&temporary_path, &settings_path)?;
 
@@ -319,39 +338,60 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
     Ok(())
 }
 
-fn configured_apk_url(config: &eclipse::config::Config) -> Option<String> {
-    std::env::var("ECLIPSE_APK_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| config.apk_url.clone())
+const NOT_INSTALLED: &str = "Roblox is not installed; sign in with `eclipse play-login` and run \
+     `eclipse update`, or install the APKs with `eclipse install <PATH>`";
+
+const PLAY_LOGIN_STEPS: &str = "\
+Sign in to Google Play with your own Google account.
+
+Risk: Eclipse talks to Google Play the way an Android device does and adds a device to the
+account. Google's terms do not allow unofficial clients, so Google may restrict an account
+that uses one. Use a secondary Google account, not your main one.
+
+1. Open https://accounts.google.com/EmbeddedSetup in a web browser.
+2. Sign in and accept the prompts until the page stops changing.
+3. Open the browser's developer tools, find the accounts.google.com cookie named
+   oauth_token (Storage or Application, then Cookies) and copy its value. It starts with
+   oauth2_4/ and works only once.
+";
+
+fn parse_run_path(arguments: &[String]) -> Result<Option<&std::path::Path>, String> {
+    match arguments {
+        [] => Ok(None),
+        [path] => Ok(Some(std::path::Path::new(path))),
+        _ => Err("usage: eclipse run [APK | DIRECTORY]".to_string()),
+    }
 }
 
-fn fetch_apk_command() -> Result<(), Box<dyn std::error::Error>> {
-    match eclipse::apk::fetch::latest_roblox_version() {
-        Ok(v) => {
-            let android_major = v.split('.').nth(1).unwrap_or("?");
-            println!(
-                "# Latest upstream Roblox version (oracle): {v}  (≈ Android 2.{android_major}.x)"
-            );
-        }
-        Err(e) => eprintln!("# version oracle unavailable (non-fatal): {e}"),
+fn install_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.is_empty() {
+        return Err("usage: eclipse install <APK | DIRECTORY | BUNDLE>...".into());
     }
-    let config = eclipse::config::Config::load()?;
-    let url = configured_apk_url(&config).ok_or(
-        "no APK source configured — set config `apk_url` or ECLIPSE_APK_URL (Eclipse never hard-codes one)",
-    )?;
-    println!("# Fetching APK from your configured source: {url}");
-    let path = eclipse::apk::fetch::fetch_apk(&url, config.apk_sha256.as_deref())?;
-    println!("fetched APK: {} ✓", path.display());
+    let sources: Vec<std::path::PathBuf> = arguments.iter().map(std::path::PathBuf::from).collect();
+    println!("# Verifying and installing the Roblox client…");
+    let installed = eclipse::apk::store::Store::open()?.install(&sources)?;
+    println!("installed Roblox {installed}");
     Ok(())
 }
 
-fn parse_run_apk_path(arguments: &[String]) -> Result<Option<&str>, String> {
-    match arguments {
-        [] => Ok(None),
-        [apk_path] => Ok(Some(apk_path)),
-        _ => Err("usage: eclipse run [APK]".to_string()),
+fn play_login_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !arguments.is_empty() {
+        return Err("usage: eclipse play-login".into());
     }
+    let account = eclipse::apk::play::Account::open()?;
+    print!("{PLAY_LOGIN_STEPS}");
+    let email = prompt_line("\nGoogle account email: ")?;
+    let oauth_token = eclipse::apk::play::Secret::new(prompt_line("oauth_token value: ")?);
+    println!("# Signing in and registering the device profile with Google Play…");
+    let credentials = eclipse::apk::play::sign_in(&email, &oauth_token)?;
+    account.save(&credentials)?;
+    println!(
+        "signed in to Google Play as {}; credentials saved to {} (readable only by you)",
+        credentials.email,
+        account.credentials_path().display()
+    );
+    println!("run `eclipse update` to download Roblox");
+    Ok(())
 }
 
 fn parse_libroblox_init_lib_dir(arguments: &[String]) -> Result<&std::path::Path, String> {
@@ -361,118 +401,172 @@ fn parse_libroblox_init_lib_dir(arguments: &[String]) -> Result<&std::path::Path
     }
 }
 
-fn last_apk_path_file() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    Ok(eclipse::config::Config::config_path()?.with_file_name("last-apk.json"))
-}
+fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Write as _;
 
-fn remember_apk_path(
-    path: &std::path::Path,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let path = path.canonicalize()?;
-    if !path.is_file() {
-        return Err(format!("Roblox APK is not a file: {}", path.display()).into());
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Err("standard input closed before an answer was entered".into());
     }
-    let setting = last_apk_path_file()?;
-    let parent = setting
-        .parent()
-        .ok_or("the remembered APK setting has no parent directory")?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".last-apk.{}.tmp", std::process::id()));
-    let text = path
-        .to_str()
-        .ok_or("the Roblox APK path is not valid UTF-8")?;
-    std::fs::write(&temporary, serde_json::to_vec(text)?)?;
-    std::fs::rename(&temporary, &setting)?;
-    Ok(path)
+    Ok(line.trim().to_owned())
 }
 
-fn remembered_apk_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let setting = last_apk_path_file()?;
-    let bytes = std::fs::read(&setting).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            std::io::Error::new(
-                error.kind(),
-                "no Roblox APK is remembered; run `eclipse install-url-handler /path/to/roblox.apk`",
-            )
-        } else {
-            error
+fn update_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !arguments.is_empty() {
+        return Err("usage: eclipse update".into());
+    }
+    let account = eclipse::apk::play::Account::open()?;
+    let credentials = account
+        .credentials()?
+        .ok_or("not signed in to Google Play; run `eclipse play-login` first")?;
+    let store = eclipse::apk::store::Store::open()?;
+    update_from_play(&account, &credentials, &store)
+}
+
+fn update_from_play(
+    account: &eclipse::apk::play::Account,
+    credentials: &eclipse::apk::play::Credentials,
+    store: &eclipse::apk::store::Store,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use eclipse::apk::play::UpdateOutcome;
+
+    println!("# Checking Google Play for the newest Roblox client…");
+    let outcome = eclipse::apk::play::update(credentials, store)?;
+    account.record_check(std::time::SystemTime::now())?;
+    match outcome {
+        UpdateOutcome::UpToDate { installed } => println!("Roblox {installed} is up to date"),
+        UpdateOutcome::Updated {
+            previous: Some(previous),
+            installed,
+        } => println!("updated Roblox from {previous} to {installed}"),
+        UpdateOutcome::Updated {
+            previous: None,
+            installed,
+        } => println!("installed Roblox {installed}"),
+    }
+    Ok(())
+}
+
+fn update_if_due(store: &eclipse::apk::store::Store) -> Result<(), Box<dyn std::error::Error>> {
+    let account = eclipse::apk::play::Account::open()?;
+    let Some(credentials) = account.credentials()? else {
+        return Ok(());
+    };
+    if !eclipse::apk::play::update_due(account.last_check()?, std::time::SystemTime::now()) {
+        return Ok(());
+    }
+    update_from_play(&account, &credentials, store)
+}
+
+fn installed_apk_set(
+    check_for_update: bool,
+) -> Result<eclipse::apk::ApkSetPaths, Box<dyn std::error::Error>> {
+    let store = eclipse::apk::store::Store::open()?;
+    if check_for_update {
+        if let Err(error) = update_if_due(&store) {
+            eprintln!("# WARNING: could not update Roblox from Google Play: {error}");
         }
-    })?;
-    let text: String = serde_json::from_slice(&bytes)?;
-    let path = std::path::PathBuf::from(text);
-    if !path.is_file() {
-        return Err(format!(
-            "the remembered Roblox APK no longer exists: {}",
-            path.display()
-        )
-        .into());
     }
-    Ok(path)
+    let (installed, paths) = store.current_set()?.ok_or(NOT_INSTALLED)?;
+    println!("# Launching the installed Roblox {installed}");
+    Ok(paths)
 }
 
 fn install_url_handler_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let apk_path = match arguments {
-        [] => remembered_apk_path()?,
-        [apk_path] => {
-            let mut apk = eclipse::apk::Apk::open(std::path::Path::new(apk_path))?;
-            apk.manifest()?;
-            remember_apk_path(std::path::Path::new(apk_path))?
-        }
-        _ => return Err("usage: eclipse install-url-handler [APK]".into()),
-    };
+    if !arguments.is_empty() {
+        return Err("usage: eclipse install-url-handler".into());
+    }
     let desktop_path = desktop_integration::install_url_handler()?;
     println!(
-        "Roblox browser Play handler installed: {} (APK: {}) ✓",
-        desktop_path.display(),
-        apk_path.display()
+        "Roblox browser Play handler installed: {}",
+        desktop_path.display()
     );
+    if eclipse::apk::store::Store::open()?.current()?.is_none() {
+        println!("note: {NOT_INSTALLED}");
+    }
+    Ok(())
+}
+
+fn native_lib_dir(
+    version: eclipse::apk::VersionCode,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let root = eclipse::runtime::native_lib_cache_dir()?;
+    remove_other_native_lib_versions(&root, version)?;
+    Ok(root.join(version.to_string()))
+}
+
+fn remove_other_native_lib_versions(
+    root: &std::path::Path,
+    keep: eclipse::apk::VersionCode,
+) -> Result<(), String> {
+    let list_error = |error: std::io::Error| {
+        format!(
+            "cannot list the native-lib cache {}: {error}",
+            root.display()
+        )
+    };
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(list_error(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(list_error)?;
+        let other_version = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_some_and(|code| code != keep.0);
+        if !other_version {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|error| {
+                format!(
+                    "cannot remove the old native libs in {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
 fn run_apk(
-    apk_path: Option<&str>,
+    path: Option<&std::path::Path>,
     browser_place_id: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resolved: String = match apk_path {
-        Some(p) => p.to_string(),
-        None if browser_place_id.is_some() => remembered_apk_path()?.to_string_lossy().into_owned(),
-        None => {
-            let config = eclipse::config::Config::load()?;
-            let env_url = std::env::var_os("ECLIPSE_APK_URL").is_some();
-            match configured_apk_url(&config) {
-                Some(url) if config.auto_fetch_missing || env_url => {
-                    println!("# No APK supplied — auto-fetching from your configured source: {url}");
-                    let path = eclipse::apk::fetch::fetch_apk(&url, config.apk_sha256.as_deref())?;
-                    println!("fetched APK: {} ✓", path.display());
-                    path.to_string_lossy().into_owned()
-                }
-                _ => {
-                    return Err("missing APK path (usage: eclipse run <APK>); or set config `apk_url` + \
-                                `auto_fetch_missing` (or ECLIPSE_APK_URL) to auto-download — `eclipse fetch`"
-                        .into())
-                }
-            }
-        }
+    let paths = match path {
+        Some(path) => eclipse::apk::ApkSetPaths::locate(path)?,
+        None => installed_apk_set(browser_place_id.is_none())?,
     };
-    let apk_path = resolved.as_str();
+    println!("# Verifying the Roblox client's signature…");
+    let mut apks = eclipse::apk::ApkSet::open(paths)?;
+    let base_path = apks.base_path().to_path_buf();
+    let apk_path = base_path
+        .to_str()
+        .ok_or("the Roblox APK path is not valid UTF-8")?
+        .to_owned();
 
-    let mut apk = eclipse::apk::Apk::open(std::path::Path::new(apk_path))?;
-
-    eclipse::loader::ndk_registry::set_apk_path(std::path::PathBuf::from(apk_path));
-    let manifest = apk.manifest()?;
-    remember_apk_path(std::path::Path::new(apk_path))?;
+    eclipse::loader::ndk_registry::set_apk_path(base_path.clone());
+    let manifest = apks.manifest().clone();
     let config = eclipse::config::Config::load()?;
-    let has_native_engine = apk
-        .native_abis()
-        .iter()
-        .any(|abi| abi.name == TARGET_ABI && abi.has_engine);
-    if has_native_engine {
-        eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
-    }
+    eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
     let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
 
     println!("# ART boot plan (dry run) for {apk_path}");
     println!("package:            {}", manifest.package);
+    println!(
+        "version:            {} (versionCode {})",
+        apks.version_name().unwrap_or("unnamed"),
+        apks.version_code()
+    );
     println!("launcher_activity:  {}", plan.launcher_activity);
     println!("sdk_int:            {}", plan.sdk_int);
     println!(
@@ -491,12 +585,14 @@ fn run_apk(
         println!("    {opt}");
     }
 
-    let app_lib_dir = eclipse::runtime::native_lib_cache_dir()?;
+    let app_lib_dir = native_lib_dir(apks.version_code())?;
     println!(
         "\n# Extracting native libs (lib/x86_64/) to {}…",
         app_lib_dir.display()
     );
-    let extracted = apk.extract_native_libs("x86_64", &app_lib_dir)?;
+    let extracted = apks
+        .native_libs_mut()
+        .extract_native_libs(eclipse::apk::TARGET_ABI, &app_lib_dir)?;
     println!("extracted {} native lib(s) ✓", extracted.len());
 
     let assets_dir = eclipse::framework::app_data_dir()
@@ -513,23 +609,12 @@ fn run_apk(
         "\n# Extracting Roblox bundled assets (assets/ → files/assets/) to {}…",
         assets_dir.display()
     );
-    let asset_count = apk.extract_assets(&assets_dir)?;
+    let asset_count = apks.base_mut().extract_assets(&assets_dir)?;
     println!("extracted {asset_count} asset file(s) ✓");
-
-    let cursor_asset_count = eclipse::system_cursor::install(&assets_dir, config.touch_mode)?;
-    if config.touch_mode == eclipse::config::TouchMode::Off {
-        println!(
-            "desktop system cursor active (suppressed {cursor_asset_count} extracted Roblox cursor texture(s)) ✓"
-        );
-    }
 
     println!("\n# Booting the ART VM with Roblox on the classpath…");
 
-    let vm = eclipse::runtime::boot(
-        &plan,
-        Some(std::path::Path::new(apk_path)),
-        Some(&app_lib_dir),
-    )?;
+    let vm = eclipse::runtime::boot(&plan, Some(&base_path), Some(&app_lib_dir))?;
     println!("ART VM booted with Roblox's Java on the classpath ✓");
 
     println!("# Provisioning bionic sonames (libm.so → Eclipse apkenv-loadable shim) …");
@@ -545,13 +630,13 @@ fn run_apk(
     eclipse::framework::register_engine_preload_natives(&vm)?;
     println!("engine-preload framework natives registered ✓");
 
-    let _preloaded_libs = preload_app_native_libs(&mut apk, &app_lib_dir, &vm)?;
+    let _preloaded_libs = preload_app_native_libs(apks.native_libs(), &app_lib_dir, &vm)?;
 
     println!("# Driving the framework lifecycle (JNI; steps 1–7 to Activity.onResume / RESUMED)…");
     let android_deep_link = browser_place_id.map(|place_id| format!("roblox://placeId={place_id}"));
     let progress = eclipse::framework::drive_application_lifecycle(
         &vm,
-        apk_path,
+        &apk_path,
         &plan.launcher_activity,
         android_deep_link.as_deref(),
     )?;
@@ -577,45 +662,31 @@ fn run_apk(
     Ok(())
 }
 
-const TARGET_ABI: &str = "x86_64";
-const ENGINE_FILENAME: &str = "libroblox.so";
-
 fn preload_app_native_libs(
-    apk: &mut eclipse::apk::Apk,
+    apk: &eclipse::apk::Apk,
     app_lib_dir: &std::path::Path,
     vm: &eclipse::runtime::Vm,
 ) -> Result<Vec<eclipse::loader::engine::PreloadedLib>, Box<dyn std::error::Error>> {
-    let has_engine = apk
-        .native_abis()
-        .iter()
-        .any(|abi| abi.name == TARGET_ABI && abi.has_engine);
-    if !has_engine {
-        println!("# No lib/x86_64/libroblox.so in APK — skipping the Rust engine loader (framework-only path).");
-        return Ok(Vec::new());
-    }
+    use eclipse::apk::{ENGINE_LIB, TARGET_ABI};
 
     let mut log = std::io::stdout();
     let java_vm = unsafe { jni::vm::JavaVM::from_raw(vm.as_raw()) };
     let mut loaded: Vec<eclipse::loader::engine::PreloadedLib> = Vec::new();
 
     println!("# Pre-loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…");
-    let engine = eclipse::loader::engine::load_app_native_lib(
-        app_lib_dir,
-        ENGINE_FILENAME,
-        &java_vm,
-        &mut log,
-    )?
-    .ok_or("libroblox.so unexpectedly deduped on first load")?;
+    let engine =
+        eclipse::loader::engine::load_app_native_lib(app_lib_dir, ENGINE_LIB, &java_vm, &mut log)?
+            .ok_or("libroblox.so unexpectedly deduped on first load")?;
     report_preloaded(&engine);
     loaded.push(engine);
 
     let filenames = apk.native_lib_filenames(TARGET_ABI);
     println!(
         "# Pre-loading {} other x86_64 JNI lib(s) via the Rust loader (tolerant of per-lib failure)…",
-        filenames.iter().filter(|f| *f != ENGINE_FILENAME).count()
+        filenames.iter().filter(|f| *f != ENGINE_LIB).count()
     );
     for filename in &filenames {
-        if filename == ENGINE_FILENAME {
+        if filename == ENGINE_LIB {
             continue;
         }
         match eclipse::loader::engine::load_app_native_lib(
@@ -748,20 +819,24 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
     let target_url = format!("http://127.0.0.1:{port}/");
     println!("# __webview-test: loopback page serving at {target_url}");
 
-    let apk_path = eclipse::loader::init_run::find_roblox_apk().ok_or(
-        "no Roblox APK (set ECLIPSE_ROBLOX_APK or place it at the default dev-host path) — \
-         __webview-test boots ART with the installed framework on the classpath",
-    )?;
+    let paths = eclipse::apk::ApkSetPaths::from_env()?.ok_or_else(|| {
+        format!(
+            "no Roblox APK (set {} to an APK file or to a directory holding {} and {}) — \
+             __webview-test boots ART with the installed framework on the classpath",
+            eclipse::apk::DEV_APK_ENV,
+            eclipse::apk::BASE_APK,
+            eclipse::apk::NATIVE_SPLIT_APK
+        )
+    })?;
+    let apks = eclipse::apk::ApkSet::open(paths)?;
     println!(
         "# __webview-test: booting ART from {} (framework classpath; no libroblox preload, \
          no lifecycle, no window)…",
-        apk_path.display()
+        apks.base_path().display()
     );
-    let mut apk = eclipse::apk::Apk::open(&apk_path)?;
-    let manifest = apk.manifest()?;
     let config = eclipse::config::Config::load()?;
-    let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
-    let vm = eclipse::runtime::boot(&plan, Some(apk_path.as_path()), None)?;
+    let plan = eclipse::runtime::BootPlan::new(apks.manifest(), &config);
+    let vm = eclipse::runtime::boot(&plan, Some(apks.base_path()), None)?;
 
     eclipse::framework::register_engine_preload_natives(&vm)?;
 
@@ -992,7 +1067,7 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 mod tests {
     use super::{
         finish_android_process, normalize_browser_launch, parse_libroblox_init_lib_dir,
-        parse_run_apk_path,
+        parse_run_path, remove_other_native_lib_versions,
     };
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
@@ -1002,14 +1077,50 @@ mod tests {
     }
 
     #[test]
-    fn run_accepts_at_most_one_apk_argument() {
+    fn run_accepts_at_most_one_path_argument() {
         let apk = "roblox.apk".to_string();
-        assert_eq!(parse_run_apk_path(&[]).unwrap(), None);
+        assert_eq!(parse_run_path(&[]).unwrap(), None);
         assert_eq!(
-            parse_run_apk_path(std::slice::from_ref(&apk)).unwrap(),
-            Some("roblox.apk")
+            parse_run_path(std::slice::from_ref(&apk)).unwrap(),
+            Some(std::path::Path::new("roblox.apk"))
         );
-        assert!(parse_run_apk_path(&[apk, "roblox://placeId=1".into()]).is_err());
+        assert!(parse_run_path(&[apk, "roblox://placeId=1".into()]).is_err());
+    }
+
+    #[test]
+    fn native_libs_of_other_roblox_versions_are_removed() {
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-native-lib-versions-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        for dir in ["3055", "3056", "3057", "custom"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("libroblox.so"), b"lib").unwrap();
+        }
+        std::fs::write(root.join("3054"), b"not a directory").unwrap();
+
+        remove_other_native_lib_versions(&root, eclipse::apk::VersionCode(3056)).unwrap();
+
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["3054", "3056", "custom"]);
+        std::fs::remove_dir_all(&root).ok();
+
+        remove_other_native_lib_versions(&root, eclipse::apk::VersionCode(3056))
+            .expect("a missing cache directory is not an error");
+
+        std::fs::write(&root, b"not a directory").unwrap();
+        let error = remove_other_native_lib_versions(&root, eclipse::apk::VersionCode(3056))
+            .expect_err("a cache path that is a file cannot be listed");
+        assert!(
+            error.contains("cannot list") && error.contains(&root.display().to_string()),
+            "{error}"
+        );
+        std::fs::remove_file(&root).ok();
     }
 
     #[test]

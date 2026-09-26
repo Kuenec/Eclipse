@@ -608,6 +608,7 @@ dependencies = [
  "libloading",
  "libsqlite3-sys",
  "raw-window-handle",
+ "ring",
  "rustix 1.1.4",
  "serde",
  "serde_json",

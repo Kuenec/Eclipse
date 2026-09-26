@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-pub const SETTINGS_SAVE_STATE_FLAG: &str = "FFlagGlobalBasicSettingsSaveStateReflection";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum GraphicsOptimizationMode {
@@ -65,12 +63,6 @@ pub struct Config {
 
     pub fflags: BTreeMap<String, serde_json::Value>,
 
-    pub apk_url: Option<String>,
-
-    pub apk_sha256: Option<String>,
-
-    pub auto_fetch_missing: bool,
-
     pub webview_helper_path: Option<String>,
 
     pub webview_allow_unsandboxed: bool,
@@ -92,9 +84,6 @@ impl Default for Config {
             use_console_experience: false,
             use_libsecret: false,
             fflags: BTreeMap::new(),
-            apk_url: None,
-            apk_sha256: None,
-            auto_fetch_missing: false,
             webview_helper_path: None,
             webview_allow_unsandboxed: false,
         }
@@ -129,12 +118,13 @@ impl Config {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    pub fn roblox_client_app_settings(&self) -> BTreeMap<String, serde_json::Value> {
-        let mut settings = self.fflags.clone();
-        settings
-            .entry(SETTINGS_SAVE_STATE_FLAG.to_string())
-            .or_insert(serde_json::Value::Bool(true));
-        settings
+    pub fn client_app_settings_json(&self) -> Result<Option<Vec<u8>>, ConfigError> {
+        if self.fflags.is_empty() {
+            return Ok(None);
+        }
+        let mut json = serde_json::to_vec_pretty(&self.fflags)?;
+        json.push(b'\n');
+        Ok(Some(json))
     }
 }
 
@@ -232,29 +222,23 @@ mod tests {
     }
 
     #[test]
-    fn client_app_settings_enable_persistence_and_preserve_user_fflags() {
+    fn client_app_settings_are_absent_without_user_fflags() {
+        assert_eq!(Config::default().client_app_settings_json().unwrap(), None);
+    }
+
+    #[test]
+    fn client_app_settings_contain_exactly_the_user_fflags() {
         let mut cfg = Config::default();
         cfg.fflags.insert(
             "DFIntExample".to_string(),
             serde_json::Value::Number(42.into()),
         );
-        let settings = cfg.roblox_client_app_settings();
-        assert_eq!(
-            settings.get(SETTINGS_SAVE_STATE_FLAG),
-            Some(&serde_json::Value::Bool(true))
-        );
-        assert_eq!(settings.get("DFIntExample"), Some(&serde_json::json!(42)));
-
-        cfg.fflags.insert(
-            SETTINGS_SAVE_STATE_FLAG.to_string(),
-            serde_json::Value::Bool(false),
-        );
-        assert_eq!(
-            cfg.roblox_client_app_settings()
-                .get(SETTINGS_SAVE_STATE_FLAG),
-            Some(&serde_json::Value::Bool(false)),
-            "an explicit user override must win"
-        );
+        let json = cfg
+            .client_app_settings_json()
+            .unwrap()
+            .expect("user fflags produce a settings file");
+        let settings: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(settings, serde_json::json!({"DFIntExample": 42}));
     }
 
     #[test]

@@ -81,10 +81,13 @@ impl std::error::Error for AxmlError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AxmlManifest {
     pub package: String,
-    pub launcher_activity: String,
+    pub launcher_activity: Option<String>,
     pub min_sdk: Option<u32>,
     pub target_sdk: Option<u32>,
     pub large_heap: bool,
+    pub version_code: Option<u32>,
+    pub version_name: Option<String>,
+    pub split: Option<String>,
 }
 
 pub(super) fn read_manifest(bytes: &[u8]) -> Result<AxmlManifest, AxmlError> {
@@ -597,6 +600,9 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
     let mut target_sdk: Option<u32> = None;
     let mut large_heap = false;
     let mut launcher: Option<String> = None;
+    let mut version_code: Option<u32> = None;
+    let mut version_name: Option<String> = None;
+    let mut split: Option<String> = None;
     let mut saw_manifest = false;
 
     for child in root.children() {
@@ -615,6 +621,9 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
                         if let Some(p) = attr_string(&attrs, Ns::None, "package") {
                             package = Some(p);
                         }
+                        version_code = attr_int(&attrs, Ns::Android, "versionCode");
+                        version_name = attr_string(&attrs, Ns::Android, "versionName");
+                        split = attr_string(&attrs, Ns::None, "split");
                     }
                     Some("uses-sdk") => {
                         if let Some(v) = attr_int(&attrs, Ns::Android, "minSdkVersion") {
@@ -685,14 +694,16 @@ fn walk(root: &Chunk, pool: &StringPool) -> Result<AxmlManifest, AxmlError> {
         return Err(AxmlError::NoManifestRoot);
     }
     let package = package.ok_or(AxmlError::NoPackage)?;
-    let launcher_activity = launcher.ok_or(AxmlError::NoLauncher)?;
 
     Ok(AxmlManifest {
         package,
-        launcher_activity,
+        launcher_activity: launcher,
         min_sdk,
         target_sdk,
         large_heap,
+        version_code,
+        version_name,
+        split,
     })
 }
 
@@ -817,6 +828,197 @@ fn read_u32(buf: &[u8], off: usize) -> Result<u32, AxmlError> {
     let b = buf.get(off..end).ok_or(AxmlError::Truncated)?;
     let arr: [u8; 4] = b.try_into().map_err(|_| AxmlError::Truncated)?;
     Ok(u32::from_le_bytes(arr))
+}
+
+#[cfg(test)]
+pub(super) mod fixture {
+    use super::*;
+
+    pub(in crate::apk) enum Value<'a> {
+        Str(&'a str),
+        Int(u32),
+    }
+
+    pub(in crate::apk) struct Attribute<'a> {
+        pub android: bool,
+        pub name: &'a str,
+        pub value: Value<'a>,
+    }
+
+    #[derive(Default)]
+    pub(in crate::apk) struct Document {
+        strings: Vec<String>,
+        body: Vec<u8>,
+    }
+
+    impl Document {
+        fn string(&mut self, text: &str) -> u32 {
+            let index = match self.strings.iter().position(|s| s == text) {
+                Some(index) => index,
+                None => {
+                    self.strings.push(text.to_owned());
+                    self.strings.len() - 1
+                }
+            };
+            u32::try_from(index).expect("fixture string index fits u32")
+        }
+
+        pub(in crate::apk) fn start(&mut self, name: &str, attributes: &[Attribute<'_>]) {
+            let name_ref = self.string(name);
+            let mut chunk = Vec::new();
+            chunk.extend_from_slice(&RES_XML_START_ELEMENT_TYPE.to_le_bytes());
+            chunk.extend_from_slice(&(XML_NODE_HEADER_SIZE as u16).to_le_bytes());
+            chunk.extend_from_slice(&0u32.to_le_bytes());
+            chunk.extend_from_slice(&1u32.to_le_bytes());
+            chunk.extend_from_slice(&NO_STRING.to_le_bytes());
+            chunk.extend_from_slice(&NO_STRING.to_le_bytes());
+            chunk.extend_from_slice(&name_ref.to_le_bytes());
+            chunk.extend_from_slice(&20u16.to_le_bytes());
+            chunk.extend_from_slice(&(ATTRIBUTE_MIN_SIZE as u16).to_le_bytes());
+            let count = u16::try_from(attributes.len()).expect("fixture attribute count");
+            chunk.extend_from_slice(&count.to_le_bytes());
+            chunk.extend_from_slice(&[0; 6]);
+            for attribute in attributes {
+                let ns = if attribute.android {
+                    self.string(ANDROID_NS_URI)
+                } else {
+                    NO_STRING
+                };
+                let attribute_name = self.string(attribute.name);
+                let (raw, kind, data) = match attribute.value {
+                    Value::Str(text) => {
+                        let index = self.string(text);
+                        (index, TYPE_STRING, index)
+                    }
+                    Value::Int(value) => (NO_STRING, TYPE_INT_DEC, value),
+                };
+                chunk.extend_from_slice(&ns.to_le_bytes());
+                chunk.extend_from_slice(&attribute_name.to_le_bytes());
+                chunk.extend_from_slice(&raw.to_le_bytes());
+                chunk.extend_from_slice(&8u16.to_le_bytes());
+                chunk.push(0);
+                chunk.push(kind);
+                chunk.extend_from_slice(&data.to_le_bytes());
+            }
+            let size = u32::try_from(chunk.len()).expect("fixture chunk size");
+            chunk[4..8].copy_from_slice(&size.to_le_bytes());
+            self.body.extend_from_slice(&chunk);
+        }
+
+        pub(in crate::apk) fn end(&mut self, name: &str) {
+            let name_ref = self.string(name);
+            self.body
+                .extend_from_slice(&RES_XML_END_ELEMENT_TYPE.to_le_bytes());
+            self.body
+                .extend_from_slice(&(XML_NODE_HEADER_SIZE as u16).to_le_bytes());
+            self.body.extend_from_slice(&24u32.to_le_bytes());
+            self.body.extend_from_slice(&1u32.to_le_bytes());
+            self.body.extend_from_slice(&NO_STRING.to_le_bytes());
+            self.body.extend_from_slice(&NO_STRING.to_le_bytes());
+            self.body.extend_from_slice(&name_ref.to_le_bytes());
+        }
+
+        pub(in crate::apk) fn finish(self) -> Vec<u8> {
+            let mut data = Vec::new();
+            let mut offsets = Vec::new();
+            for text in &self.strings {
+                offsets.push(u32::try_from(data.len()).expect("fixture pool offset"));
+                let len = u8::try_from(text.len()).expect("fixture strings stay short");
+                data.push(len);
+                data.push(len);
+                data.extend_from_slice(text.as_bytes());
+                data.push(0);
+            }
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+            let strings_start = STRING_POOL_HEADER_SIZE + offsets.len() * 4;
+            let pool_size = strings_start + data.len();
+            let mut pool = Vec::new();
+            pool.extend_from_slice(&RES_STRING_POOL_TYPE.to_le_bytes());
+            pool.extend_from_slice(&(STRING_POOL_HEADER_SIZE as u16).to_le_bytes());
+            pool.extend_from_slice(&(pool_size as u32).to_le_bytes());
+            pool.extend_from_slice(&(offsets.len() as u32).to_le_bytes());
+            pool.extend_from_slice(&0u32.to_le_bytes());
+            pool.extend_from_slice(&UTF8_FLAG.to_le_bytes());
+            pool.extend_from_slice(&(strings_start as u32).to_le_bytes());
+            pool.extend_from_slice(&0u32.to_le_bytes());
+            for offset in offsets {
+                pool.extend_from_slice(&offset.to_le_bytes());
+            }
+            pool.extend_from_slice(&data);
+
+            let total = CHUNK_HEADER_SIZE + pool.len() + self.body.len();
+            let mut document = Vec::new();
+            document.extend_from_slice(&RES_XML_TYPE.to_le_bytes());
+            document.extend_from_slice(&(CHUNK_HEADER_SIZE as u16).to_le_bytes());
+            document.extend_from_slice(&(total as u32).to_le_bytes());
+            document.extend_from_slice(&pool);
+            document.extend_from_slice(&self.body);
+            document
+        }
+    }
+
+    pub(in crate::apk) struct Manifest<'a> {
+        pub package: &'a str,
+        pub version_code: Option<u32>,
+        pub version_name: Option<&'a str>,
+        pub split: Option<&'a str>,
+        pub launcher: Option<&'a str>,
+    }
+
+    impl Manifest<'_> {
+        pub(in crate::apk) fn encode(&self) -> Vec<u8> {
+            let mut attributes = vec![Attribute {
+                android: false,
+                name: "package",
+                value: Value::Str(self.package),
+            }];
+            if let Some(code) = self.version_code {
+                attributes.push(Attribute {
+                    android: true,
+                    name: "versionCode",
+                    value: Value::Int(code),
+                });
+            }
+            if let Some(name) = self.version_name {
+                attributes.push(Attribute {
+                    android: true,
+                    name: "versionName",
+                    value: Value::Str(name),
+                });
+            }
+            if let Some(split) = self.split {
+                attributes.push(Attribute {
+                    android: false,
+                    name: "split",
+                    value: Value::Str(split),
+                });
+            }
+
+            let mut document = Document::default();
+            document.start("manifest", &attributes);
+            document.start("application", &[]);
+            if let Some(activity) = self.launcher {
+                let named = |name| Attribute {
+                    android: true,
+                    name: "name",
+                    value: Value::Str(name),
+                };
+                document.start("activity", &[named(activity)]);
+                document.start("intent-filter", &[]);
+                document.start("action", &[named("android.intent.action.MAIN")]);
+                document.end("action");
+                document.start("category", &[named("android.intent.category.LAUNCHER")]);
+                document.end("category");
+                document.end("intent-filter");
+                document.end("activity");
+            }
+            document.end("application");
+            document.end("manifest");
+            document.finish()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1176,5 +1378,45 @@ mod tests {
         let axml = build_axml(&[&stub, &stub, &stub]);
 
         let _ = read_manifest(&axml);
+    }
+
+    #[test]
+    fn split_manifest_reads_identity_without_requiring_a_launcher() {
+        let bytes = fixture::Manifest {
+            package: "com.roblox.client",
+            version_code: Some(3056),
+            version_name: None,
+            split: Some("config.x86_64"),
+            launcher: None,
+        }
+        .encode();
+
+        let manifest = read_manifest(&bytes).expect("split manifest parses");
+        assert_eq!(manifest.package, "com.roblox.client");
+        assert_eq!(manifest.version_code, Some(3056));
+        assert_eq!(manifest.version_name, None);
+        assert_eq!(manifest.split.as_deref(), Some("config.x86_64"));
+        assert_eq!(manifest.launcher_activity, None);
+    }
+
+    #[test]
+    fn base_manifest_reads_version_name_and_launcher() {
+        let bytes = fixture::Manifest {
+            package: "com.roblox.client",
+            version_code: Some(3056),
+            version_name: Some("2.737.1584"),
+            split: None,
+            launcher: Some("com.roblox.client.startup.ActivitySplash"),
+        }
+        .encode();
+
+        let manifest = read_manifest(&bytes).expect("base manifest parses");
+        assert_eq!(manifest.version_code, Some(3056));
+        assert_eq!(manifest.version_name.as_deref(), Some("2.737.1584"));
+        assert_eq!(manifest.split, None);
+        assert_eq!(
+            manifest.launcher_activity.as_deref(),
+            Some("com.roblox.client.startup.ActivitySplash")
+        );
     }
 }
