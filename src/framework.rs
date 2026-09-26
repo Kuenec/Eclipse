@@ -10,7 +10,7 @@ use jni::objects::{
     JByteArray, JClass, JFloatArray, JIntArray, JLongArray, JMethodID, JObject, JObjectArray,
     JString,
 };
-use jni::refs::{Global, Reference};
+use jni::refs::{Global, Reference, Weak};
 use jni::signature::{FieldSignature, JavaType, MethodSignature, Primitive};
 use jni::strings::JNIStr;
 use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
@@ -23,6 +23,8 @@ use crate::runtime::Vm;
 pub mod asset_registry;
 pub mod bitmap_registry;
 pub mod canvas_registry;
+#[cfg(test)]
+mod fake_jvm;
 pub mod matrix_registry;
 pub(crate) mod memory;
 mod message_queue;
@@ -1097,7 +1099,9 @@ fn read_asset_bytes(name: &str) -> Option<Vec<u8>> {
 }
 
 fn read_asset_bytes_from(apk_path: &str, name: &str) -> Option<Vec<u8>> {
-    let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
+    let mut apk = crate::apk::cache::APP_APK
+        .open(std::path::Path::new(apk_path))
+        .ok()?;
     asset_entry_candidates(name).find_map(|entry| apk.read_entry(&entry).ok())
 }
 
@@ -1167,8 +1171,9 @@ impl fmt::Display for AssetFdError {
 }
 
 fn asset_fd_for(apk_path: &str, name: &str) -> Result<(c_int, u64, u64), AssetFdError> {
-    let mut apk =
-        crate::apk::Apk::open(std::path::Path::new(apk_path)).map_err(AssetFdError::Apk)?;
+    let mut apk = crate::apk::cache::APP_APK
+        .open(std::path::Path::new(apk_path))
+        .map_err(AssetFdError::Apk)?;
     let mut resolved = Err(AssetFdError::Apk(crate::apk::ApkError::EntryMissing(
         name.to_owned(),
     )));
@@ -1185,7 +1190,7 @@ fn asset_fd_for(apk_path: &str, name: &str) -> Result<(c_int, u64, u64), AssetFd
     if !span.stored {
         return Err(AssetFdError::Compressed);
     }
-    let file = std::fs::File::open(std::path::Path::new(apk_path)).map_err(AssetFdError::Io)?;
+    let file = crate::apk::reopen(apk.file()).map_err(AssetFdError::Io)?;
     Ok((
         std::os::fd::IntoRawFd::into_raw_fd(file),
         span.data_start,
@@ -1504,13 +1509,17 @@ fn arsc_bytes_for(resid: u32) -> Option<&'static [u8]> {
     if (resid >> 24) as u8 == 0x01 {
         let fw = crate::runtime::find_framework().ok()?;
         cached_arsc_bytes(&FRAMEWORK_ARSC, || {
-            let mut apk = crate::apk::Apk::open(&fw.framework_res_apk).ok()?;
+            let mut apk = crate::apk::cache::FRAMEWORK_RES_APK
+                .open(&fw.framework_res_apk)
+                .ok()?;
             apk.read_entry("resources.arsc").ok()
         })
     } else {
         let apk_path = APK_PATH.get()?;
         cached_arsc_bytes(&APP_ARSC, || {
-            let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path)).ok()?;
+            let mut apk = crate::apk::cache::APP_APK
+                .open(std::path::Path::new(apk_path))
+                .ok()?;
             apk.read_entry("resources.arsc").ok()
         })
     }
@@ -1746,11 +1755,11 @@ extern "system" fn asset_manager_get_pooled_string<'local>(
 fn open_xml_block(cookie: jint, name: &str) -> Result<jlong, AssetError> {
     let bytes = if cookie == ARSC_FRAMEWORK_COOKIE {
         let fw = crate::runtime::find_framework().map_err(|_| AssetError::NoApkPath)?;
-        let mut apk = crate::apk::Apk::open(&fw.framework_res_apk)?;
+        let mut apk = crate::apk::cache::FRAMEWORK_RES_APK.open(&fw.framework_res_apk)?;
         apk.read_entry(name)?
     } else {
         let apk_path = APK_PATH.get().ok_or(AssetError::NoApkPath)?;
-        let mut apk = crate::apk::Apk::open(std::path::Path::new(apk_path))?;
+        let mut apk = crate::apk::cache::APP_APK.open(std::path::Path::new(apk_path))?;
         apk.read_entry(name)?
     };
     let doc = crate::apk::axml::parse_document(&bytes)?;
@@ -3026,9 +3035,11 @@ extern "system" fn view_native_constructor<'local>(
         match view_registry::allocate(&class_name) {
             Ok(handle) => {
 
-                match env.new_global_ref(&this) {
-                    Ok(global) => {
-                        if let Err(e) = view_registry::set_jobject(handle, global) {
+                match env.new_weak_ref(&this) {
+                    Ok(peer) => {
+                        if let Err(e) =
+                            view_registry::set_jobject(handle, view_registry::ViewObject::Peer(peer))
+                        {
                             tracing::debug!(
                                 target: "android.view.View",
                                 class = %class_name,
@@ -3043,7 +3054,7 @@ extern "system" fn view_native_constructor<'local>(
                         class = %class_name,
                         handle,
                         error = %e,
-                        "View.native_constructor: new_global_ref failed (view non-dispatchable)"
+                        "View.native_constructor: new_weak_ref failed (view non-dispatchable)"
                     ),
                 }
                 tracing::debug!(
@@ -4923,45 +4934,10 @@ extern "system" fn path_native_create_builder<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     native_path: jlong,
-    reserve: jlong,
+    builder: jlong,
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
-        let geometry = if native_path == 0 {
-            path_registry::PathGeometry::default()
-        } else {
-            match path_registry::get(native_path) {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "android.graphics.Path",
-                        native_path,
-                        error = %e,
-                        "Path.native_create_builder: source handle invalid → empty path"
-                    );
-                    path_registry::PathGeometry::default()
-                }
-            }
-        };
-        match path_registry::allocate(geometry) {
-            Ok(handle) => {
-                tracing::debug!(
-                    target: "android.graphics.Path",
-                    native_path,
-                    reserve,
-                    handle,
-                    "Path.native_create_builder: allocated non-GTK path-registry geometry handle"
-                );
-                Ok(handle)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "android.graphics.Path",
-                    error = %e,
-                    "Path.native_create_builder: path-registry allocate failed → 0 (empty path)"
-                );
-                Ok(0)
-            }
-        }
+        Ok(path_rebuild_builder(native_path, builder))
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -5084,14 +5060,17 @@ fn path_clone_handle(source: jlong, op_name: &'static str) -> jlong {
             }
         }
     };
+    path_allocate(geometry, op_name)
+}
+
+fn path_allocate(geometry: path_registry::PathGeometry, op_name: &'static str) -> jlong {
     match path_registry::allocate(geometry) {
         Ok(handle) => {
             tracing::debug!(
                 target: "android.graphics.Path",
-                source,
                 handle,
                 op = op_name,
-                "Path clone: allocated independently-owned path-registry geometry"
+                "Path: allocated independently-owned path-registry geometry"
             );
             handle
         }
@@ -5100,9 +5079,40 @@ fn path_clone_handle(source: jlong, op_name: &'static str) -> jlong {
                 target: "android.graphics.Path",
                 op = op_name,
                 error = %e,
-                "Path clone: path-registry allocate failed → 0 (empty path)"
+                "Path: path-registry allocate failed → 0 (empty path)"
             );
             0
+        }
+    }
+}
+
+fn path_rebuild_builder(native_path: jlong, builder: jlong) -> jlong {
+    let mut geometry = if native_path == 0 {
+        path_registry::PathGeometry::default()
+    } else {
+        path_registry::take(native_path).unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "android.graphics.Path",
+                native_path,
+                error = %e,
+                "Path.native_create_builder: consumed path handle invalid → empty path"
+            );
+            path_registry::PathGeometry::default()
+        })
+    };
+    if builder == 0 {
+        return path_allocate(geometry, "native_create_builder");
+    }
+    match path_registry::with_path(builder, |g| std::mem::swap(g, &mut geometry)) {
+        Ok(()) => builder,
+        Err(e) => {
+            tracing::warn!(
+                target: "android.graphics.Path",
+                builder,
+                error = %e,
+                "Path.native_create_builder: builder handle invalid → new builder"
+            );
+            path_allocate(geometry, "native_create_builder")
         }
     }
 }
@@ -6627,43 +6637,42 @@ fn fire_internal_load_changed_inner(
     state: i32,
     url: &str,
 ) -> Result<bool, FrameworkError> {
-    let local =
-        match view_registry::with_jobject(widget, |global| env.new_local_ref(global.as_obj())) {
-            Ok(Some(Ok(obj))) => obj,
-            Ok(Some(Err(_))) => {
-                if env.exception_check() {
-                    env.exception_describe();
-                    env.exception_clear();
-                }
-                tracing::warn!(
-                    target: "android.webkit.WebView",
-                    widget,
-                    state,
-                    "internalLoadChanged: local ref of the recorded WebView failed (no callback)"
-                );
-                return Ok(false);
+    let local = match view_registry::local_jobject(env, widget) {
+        Ok(Ok(Some(obj))) => obj,
+        Ok(Err(_)) => {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
             }
+            tracing::warn!(
+                target: "android.webkit.WebView",
+                widget,
+                state,
+                "internalLoadChanged: local ref of the recorded WebView failed (no callback)"
+            );
+            return Ok(false);
+        }
 
-            Ok(None) => {
-                tracing::debug!(
-                    target: "android.webkit.WebView",
-                    widget,
-                    state,
-                    "internalLoadChanged: no recorded jobject for the view (no callback fabricated)"
-                );
-                return Ok(false);
-            }
-            Err(e) => {
-                tracing::debug!(
-                    target: "android.webkit.WebView",
-                    widget,
-                    state,
-                    error = %e,
-                    "internalLoadChanged: stale/invalid view handle (no callback)"
-                );
-                return Ok(false);
-            }
-        };
+        Ok(Ok(None)) => {
+            tracing::debug!(
+                target: "android.webkit.WebView",
+                widget,
+                state,
+                "internalLoadChanged: no live jobject for the view (no callback fabricated)"
+            );
+            return Ok(false);
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "android.webkit.WebView",
+                widget,
+                state,
+                error = %e,
+                "internalLoadChanged: stale/invalid view handle (no callback)"
+            );
+            return Ok(false);
+        }
+    };
     let jurl = checked(env, "internalLoadChanged new_string", |env| {
         env.new_string(url)
     })?;
@@ -6737,8 +6746,9 @@ fn direct_webview_inner(
     let handle =
         view_registry::allocate("android.webkit.WebView").map_err(FrameworkError::ViewRegistry)?;
 
-    let global = env.new_global_ref(&webview)?;
-    view_registry::set_jobject(handle, global).map_err(FrameworkError::ViewRegistry)?;
+    let owner = env.new_global_ref(&webview)?;
+    view_registry::set_jobject(handle, view_registry::ViewObject::Owned(owner))
+        .map_err(FrameworkError::ViewRegistry)?;
 
     let long_sig = unsafe {
         FieldSignature::from_raw_parts(jni_str!("J"), JavaType::Primitive(Primitive::Long))
@@ -6848,15 +6858,14 @@ pub fn webview_evaluate(vm: &Vm, widget: jlong, script: &str) -> Result<(), Fram
             let probe = checked(env, "EclipseBridgeProbe.<init>", |env| {
                 env.new_object(&probe_class, jni_sig!("()V"), &[])
             })?;
-            let webview =
-                match view_registry::with_jobject(widget, |g| env.new_local_ref(g.as_obj())) {
-                    Ok(Some(Ok(obj))) => obj,
-                    _ => {
-                        return Err(FrameworkError::Jni(jni::errors::Error::NullPtr(
-                            "no webview object",
-                        )))
-                    }
-                };
+            let webview = match view_registry::local_jobject(env, widget) {
+                Ok(Ok(Some(obj))) => obj,
+                _ => {
+                    return Err(FrameworkError::Jni(jni::errors::Error::NullPtr(
+                        "no webview object",
+                    )))
+                }
+            };
             let jscript = env.new_string(script)?;
             checked(env, "WebView.evaluateJavascript", |env| {
                 env.call_method(
@@ -7113,13 +7122,11 @@ pub fn bump_webview_close_era() -> u64 {
     WEBVIEW_CLOSE_ERA.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
-#[allow(clippy::type_complexity)]
-fn eval_callbacks(
-) -> &'static std::sync::Mutex<std::collections::HashMap<u32, (jlong, u64, Global<JObject<'static>>)>>
-{
-    static R: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<u32, (jlong, u64, Global<JObject<'static>>)>>,
-    > = OnceLock::new();
+type EvalCallbacks =
+    std::sync::Mutex<std::collections::HashMap<u32, (jlong, u64, Global<JObject<'static>>)>>;
+
+fn eval_callbacks() -> &'static EvalCallbacks {
+    static R: OnceLock<EvalCallbacks> = OnceLock::new();
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -9681,14 +9688,55 @@ extern "system" fn drawable_native_unref<'local>(
     native_ptr: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        tracing::trace!(
-            target: "android.graphics.drawable.Drawable",
-            native_ptr,
-            "Drawable.native_unref: no-op (sentinel handle, no registry slot)"
-        );
+        release_paintable(native_ptr);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+fn is_registry_paintable(paintable: jlong) -> bool {
+    !matches!(
+        paintable,
+        0 | DRAWABLE_HANDLE_SENTINEL | DRAWABLE_CONTAINER_HANDLE_SENTINEL
+    )
+}
+
+fn retain_paintable(paintable: jlong) {
+    if !is_registry_paintable(paintable) {
+        return;
+    }
+    match bitmap_registry::retain(paintable) {
+        Ok(()) => tracing::trace!(
+            target: "android.graphics.drawable.Drawable",
+            paintable,
+            "Drawable.native_ref: retained recorded paintable"
+        ),
+        Err(e) => tracing::debug!(
+            target: "android.graphics.drawable.Drawable",
+            paintable,
+            error = %e,
+            "Drawable.native_ref: dead paintable handle (ignored)"
+        ),
+    }
+}
+
+fn release_paintable(paintable: jlong) {
+    if !is_registry_paintable(paintable) {
+        return;
+    }
+    match bitmap_registry::release(paintable) {
+        Ok(()) => tracing::trace!(
+            target: "android.graphics.drawable.Drawable",
+            paintable,
+            "Drawable.native_unref: released recorded paintable"
+        ),
+        Err(e) => tracing::debug!(
+            target: "android.graphics.drawable.Drawable",
+            paintable,
+            error = %e,
+            "Drawable.native_unref: dead paintable handle (ignored)"
+        ),
+    }
 }
 
 extern "system" fn drawable_native_invalidate<'local>(
@@ -9713,11 +9761,7 @@ extern "system" fn drawable_native_ref<'local>(
     paintable: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        tracing::trace!(
-            target: "android.graphics.drawable.Drawable",
-            paintable,
-            "Drawable.native_ref: no-op (recorded paintable; registry retains until Bitmap.recycle)"
-        );
+        retain_paintable(paintable);
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -10014,7 +10058,7 @@ fn record_bitmap_from_file(path: &str, caller: &str) -> jlong {
             (0, 0)
         }
     };
-    match bitmap_registry::store(bitmap_registry::BitmapState {
+    match bitmap_registry::store_unowned(bitmap_registry::BitmapState {
         width,
         height,
         bytes,
@@ -10678,22 +10722,50 @@ const ACTIVITY_IS_TASK_ROOT_SIG: &JNIStr = jni_str!("()Z");
 const ACTIVITY_FINISHING_FIELD_NAME: &JNIStr = jni_str!("finishing");
 const BOOLEAN_FIELD_SIG: &JNIStr = jni_str!("Z");
 
-struct TrackedActivity {
-    jobject: Global<JObject<'static>>,
+enum TrackedActivity {
+    Live(Global<JObject<'static>>),
 
-    finished: bool,
+    Finished(Weak<JObject<'static>>),
+}
+
+impl TrackedActivity {
+    fn live(&self) -> Option<&Global<JObject<'static>>> {
+        match self {
+            Self::Live(live) => Some(live),
+            Self::Finished(_) => None,
+        }
+    }
+
+    fn refers_to(&self, env: &Env, activity: &JObject) -> bool {
+        let same = match self {
+            Self::Live(live) => env.is_same_object(live, activity),
+            Self::Finished(finished) => env.is_same_object(finished, activity),
+        };
+        same.unwrap_or_else(|e| {
+            tracing::debug!(
+                target: "android.app.Activity",
+                error = %e,
+                "IsSameObject failed during finish lookup (entry skipped)"
+            );
+            false
+        })
+    }
+
+    fn is_collected(&self, env: &Env) -> bool {
+        match self {
+            Self::Live(_) => false,
+            Self::Finished(finished) => finished.is_garbage_collected(env).unwrap_or(false),
+        }
+    }
 }
 
 static TRACKED_ACTIVITIES: std::sync::Mutex<Vec<TrackedActivity>> =
     std::sync::Mutex::new(Vec::new());
 
-fn track_activity(env: &Env, activity: &JObject, finished: bool) {
+fn track_activity(env: &Env, activity: &JObject) {
     match env.new_global_ref(activity) {
         Ok(global) => match TRACKED_ACTIVITIES.lock() {
-            Ok(mut tracker) => tracker.push(TrackedActivity {
-                jobject: global,
-                finished,
-            }),
+            Ok(mut tracker) => tracker.push(TrackedActivity::Live(global)),
             Err(e) => tracing::warn!(
                 target: "android.app.Activity",
                 error = %e,
@@ -10720,25 +10792,32 @@ fn mark_activity_finished_once(env: &mut Env, activity: &JObject) -> bool {
             return true;
         }
     };
-    for entry in tracker.iter_mut() {
-        match env.is_same_object(entry.jobject.as_obj(), activity) {
-            Ok(true) => {
-                if entry.finished {
-                    return false;
-                }
-                entry.finished = true;
-                return true;
-            }
-            Ok(false) => {}
-            Err(e) => tracing::debug!(
+    tracker.retain(|entry| !entry.is_collected(env));
+    let position = tracker
+        .iter()
+        .position(|entry| entry.refers_to(env, activity));
+    if let Some(TrackedActivity::Finished(_)) = position.map(|index| &tracker[index]) {
+        return false;
+    }
+    let finished = match env.new_weak_ref(activity) {
+        Ok(weak) => Some(TrackedActivity::Finished(weak)),
+        Err(e) => {
+            tracing::warn!(
                 target: "android.app.Activity",
                 error = %e,
-                "IsSameObject failed during finish lookup (entry skipped)"
-            ),
+                "new_weak_ref failed: finish-once guard not recorded"
+            );
+            None
         }
+    };
+    match (position, finished) {
+        (Some(index), Some(entry)) => tracker[index] = entry,
+        (Some(index), None) => {
+            tracker.remove(index);
+        }
+        (None, Some(entry)) => tracker.push(entry),
+        (None, None) => {}
     }
-    drop(tracker);
-    track_activity(env, activity, true);
     true
 }
 
@@ -10762,11 +10841,11 @@ fn dispatch_back_to_latest_activity(env: &mut Env) -> Result<bool, FrameworkErro
         let tracker = TRACKED_ACTIVITIES
             .lock()
             .map_err(|_| FrameworkError::ActivityTrackerPoisoned)?;
-        let Some(entry) = tracker.iter().rev().find(|entry| !entry.finished) else {
+        let Some(live) = tracker.iter().rev().find_map(TrackedActivity::live) else {
             return Ok(false);
         };
         checked(env, "Activity Back NewLocalRef", |env| {
-            env.new_local_ref(entry.jobject.as_obj())
+            env.new_local_ref(live.as_obj())
         })?
     };
     let class_name = view_class_name(env, &activity).unwrap_or_default();
@@ -10801,7 +10880,7 @@ extern "system" fn activity_native_start_activity<'local>(
             class = %class_name,
             "Activity.nativeStartActivity: driving the started activity to RESUMED (steps 5–7)"
         );
-        track_activity(env, &activity, false);
+        track_activity(env, &activity);
 
         if call_activity_on_create(env, &activity, "nativeStartActivity Activity.onCreate").is_err()
             || call_activity_on_post_create(
@@ -10898,13 +10977,10 @@ extern "system" fn activity_native_resume_activity<'local>(
                 }
             };
             let mut found = None;
-            for entry in tracker.iter() {
-                if entry.finished {
-                    continue;
-                }
-                match env.is_instance_of(entry.jobject.as_obj(), &cls) {
+            for live in tracker.iter().filter_map(TrackedActivity::live) {
+                match env.is_instance_of(live.as_obj(), &cls) {
                     Ok(true) => {
-                        found = Some(env.new_local_ref(entry.jobject.as_obj())?);
+                        found = Some(env.new_local_ref(live.as_obj())?);
                         break;
                     }
                     Ok(false) => {}
@@ -10963,14 +11039,10 @@ extern "system" fn activity_is_task_root<'local>(
                 return Ok(false);
             }
         };
-        for entry in tracker.iter() {
-            if !entry.finished {
-                return Ok(env
-                    .is_same_object(entry.jobject.as_obj(), &this)
-                    .unwrap_or(false));
-            }
-        }
-        Ok(false)
+        Ok(tracker
+            .iter()
+            .find_map(TrackedActivity::live)
+            .is_some_and(|root| env.is_same_object(root.as_obj(), &this).unwrap_or(false)))
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -11580,28 +11652,19 @@ pub fn dispatch_click_to_view(
 }
 
 fn perform_click(env: &mut Env, handle: view_registry::ViewHandle) -> Result<bool, FrameworkError> {
-    let result = view_registry::with_jobject(handle, |global| {
-        checked(env, "View.performClick", |env| {
-            env.call_method(
-                global.as_obj(),
-                jni_str!("performClick"),
-                jni_sig!("()Z"),
-                &[],
-            )?
-            .z()
-        })
-    });
-    match result {
-        Ok(Some(Ok(clicked))) => Ok(clicked),
-        Ok(Some(Err(e))) => Err(e),
-
-        Ok(None) => Ok(false),
-
+    let view = match view_registry::local_jobject(env, handle) {
+        Ok(Ok(Some(view))) => view,
+        Ok(Ok(None)) => return Ok(false),
+        Ok(Err(e)) => return Err(FrameworkError::Jni(e)),
         Err(e) => {
             tracing::debug!(handle, error = %e, "performClick: view not dispatchable (ignored)");
-            Ok(false)
+            return Ok(false);
         }
-    }
+    };
+    checked(env, "View.performClick", |env| {
+        env.call_method(&view, jni_str!("performClick"), jni_sig!("()Z"), &[])?
+            .z()
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11667,65 +11730,61 @@ fn touch_view(
     x: f32,
     y: f32,
 ) -> Result<bool, FrameworkError> {
-    let result = view_registry::with_jobject(handle, |global| {
-        let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
-        let now = checked(env, "SystemClock.uptimeMillis", |env| {
-            env.call_static_method(
-                &system_clock,
-                jni_str!("uptimeMillis"),
-                jni_sig!("()J"),
-                &[],
-            )?
-            .j()
-        })?;
-
-        let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
-        let event = checked(env, "MotionEvent.obtain", |env| {
-            env.call_static_method(
-                &motion_event_class,
-                jni_str!("obtain"),
-                jni_sig!("(JJIFFI)Landroid/view/MotionEvent;"),
-                &[
-                    JValue::Long(now),
-                    JValue::Long(now),
-                    JValue::Int(action.code()),
-                    JValue::Float(x),
-                    JValue::Float(y),
-                    JValue::Int(0),
-                ],
-            )?
-            .l()
-        })?;
-
-        let consumed = checked(env, "View.dispatchTouchEvent", |env| {
-            env.call_method(
-                global.as_obj(),
-                jni_str!("dispatchTouchEvent"),
-                jni_sig!("(Landroid/view/MotionEvent;)Z"),
-                &[JValue::Object(&event)],
-            )?
-            .z()
-        });
-
-        if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
-            env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
-                .v()
-        }) {
-            tracing::debug!(handle, error = %e, "MotionEvent.recycle failed (ignored)");
-        }
-        consumed
-    });
-    match result {
-        Ok(Some(Ok(consumed))) => Ok(consumed),
-        Ok(Some(Err(e))) => Err(e),
-
-        Ok(None) => Ok(false),
-
+    let view = match view_registry::local_jobject(env, handle) {
+        Ok(Ok(Some(view))) => view,
+        Ok(Ok(None)) => return Ok(false),
+        Ok(Err(e)) => return Err(FrameworkError::Jni(e)),
         Err(e) => {
             tracing::debug!(handle, error = %e, "dispatchTouchEvent: view not dispatchable (ignored)");
-            Ok(false)
+            return Ok(false);
         }
+    };
+    let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
+    let now = checked(env, "SystemClock.uptimeMillis", |env| {
+        env.call_static_method(
+            &system_clock,
+            jni_str!("uptimeMillis"),
+            jni_sig!("()J"),
+            &[],
+        )?
+        .j()
+    })?;
+
+    let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
+    let event = checked(env, "MotionEvent.obtain", |env| {
+        env.call_static_method(
+            &motion_event_class,
+            jni_str!("obtain"),
+            jni_sig!("(JJIFFI)Landroid/view/MotionEvent;"),
+            &[
+                JValue::Long(now),
+                JValue::Long(now),
+                JValue::Int(action.code()),
+                JValue::Float(x),
+                JValue::Float(y),
+                JValue::Int(0),
+            ],
+        )?
+        .l()
+    })?;
+
+    let consumed = checked(env, "View.dispatchTouchEvent", |env| {
+        env.call_method(
+            &view,
+            jni_str!("dispatchTouchEvent"),
+            jni_sig!("(Landroid/view/MotionEvent;)Z"),
+            &[JValue::Object(&event)],
+        )?
+        .z()
+    });
+
+    if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
+        env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
+            .v()
+    }) {
+        tracing::debug!(handle, error = %e, "MotionEvent.recycle failed (ignored)");
     }
+    consumed
 }
 
 pub struct EngineTouchOutcome {
@@ -11985,101 +12044,96 @@ fn touch_engine_surface(
     y: f32,
     down_time_ms: Option<i64>,
 ) -> Result<EngineTouchOutcome, FrameworkError> {
+    let not_dispatched = EngineTouchOutcome {
+        consumed: false,
+        down_time_ms: down_time_ms.unwrap_or(0),
+    };
     let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
         tracing::debug!(
             ?action,
             "engine touch: RBXSurfaceView not registered yet (no-op)"
         );
-        return Ok(EngineTouchOutcome {
-            consumed: false,
-            down_time_ms: down_time_ms.unwrap_or(0),
-        });
+        return Ok(not_dispatched);
     };
-    let mut used_down_time = down_time_ms.unwrap_or(0);
-    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
-        let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
-        let now = checked(env, "SystemClock.uptimeMillis", |env| {
-            env.call_static_method(
-                &system_clock,
-                jni_str!("uptimeMillis"),
-                jni_sig!("()J"),
-                &[],
-            )?
-            .j()
-        })?;
-        let down_time = down_time_ms.unwrap_or(now);
-        used_down_time = down_time;
-
-        if down_time_ms.is_none() {
-            let w = checked(env, "View.getWidth", |env| {
-                env.call_method(global.as_obj(), jni_str!("getWidth"), jni_sig!("()I"), &[])?
-                    .i()
-            })
-            .unwrap_or(-1);
-            let h = checked(env, "View.getHeight", |env| {
-                env.call_method(global.as_obj(), jni_str!("getHeight"), jni_sig!("()I"), &[])?
-                    .i()
-            })
-            .unwrap_or(-1);
-            tracing::info!(
-                handle,
-                width = w,
-                height = h,
-                x,
-                y,
-                "engine touch DOWN: RBXSurfaceView resolved (geometry = coordinate-space check)"
-            );
-        }
-
-        let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
-        let event = checked(env, "MotionEvent.obtain", |env| {
-            env.call_static_method(
-                &motion_event_class,
-                jni_str!("obtain"),
-                jni_sig!("(JJIFFI)Landroid/view/MotionEvent;"),
-                &[
-                    JValue::Long(down_time),
-                    JValue::Long(now),
-                    JValue::Int(action.code()),
-                    JValue::Float(x),
-                    JValue::Float(y),
-                    JValue::Int(0),
-                ],
-            )?
-            .l()
-        })?;
-
-        let consumed = checked(env, "RBXSurfaceView.onTouchEventInternal", |env| {
-            env.call_method(
-                global.as_obj(),
-                jni_str!("onTouchEventInternal"),
-                jni_sig!("(Landroid/view/MotionEvent;Z)Z"),
-                &[JValue::Object(&event), JValue::Bool(false)],
-            )?
-            .z()
-        });
-
-        if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
-            env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
-                .v()
-        }) {
-            tracing::debug!(error = %e, "MotionEvent.recycle failed (ignored)");
-        }
-        consumed
-    });
-    let consumed = match result {
-        Ok(Some(Ok(c))) => c,
-        Ok(Some(Err(e))) => return Err(e),
-
-        Ok(None) => false,
+    let surface = match view_registry::local_jobject(env, handle) {
+        Ok(Ok(Some(surface))) => surface,
+        Ok(Ok(None)) => return Ok(not_dispatched),
+        Ok(Err(e)) => return Err(FrameworkError::Jni(e)),
         Err(e) => {
             tracing::debug!(error = %e, "engine touch: surface not dispatchable (ignored)");
-            false
+            return Ok(not_dispatched);
         }
     };
+    let system_clock = env.find_class(SYSTEM_CLOCK_CLASS)?;
+    let now = checked(env, "SystemClock.uptimeMillis", |env| {
+        env.call_static_method(
+            &system_clock,
+            jni_str!("uptimeMillis"),
+            jni_sig!("()J"),
+            &[],
+        )?
+        .j()
+    })?;
+    let down_time = down_time_ms.unwrap_or(now);
+
+    if down_time_ms.is_none() {
+        let w = checked(env, "View.getWidth", |env| {
+            env.call_method(&surface, jni_str!("getWidth"), jni_sig!("()I"), &[])?
+                .i()
+        })
+        .unwrap_or(-1);
+        let h = checked(env, "View.getHeight", |env| {
+            env.call_method(&surface, jni_str!("getHeight"), jni_sig!("()I"), &[])?
+                .i()
+        })
+        .unwrap_or(-1);
+        tracing::info!(
+            handle,
+            width = w,
+            height = h,
+            x,
+            y,
+            "engine touch DOWN: RBXSurfaceView resolved (geometry = coordinate-space check)"
+        );
+    }
+
+    let motion_event_class = env.find_class(MOTION_EVENT_CLASS)?;
+    let event = checked(env, "MotionEvent.obtain", |env| {
+        env.call_static_method(
+            &motion_event_class,
+            jni_str!("obtain"),
+            jni_sig!("(JJIFFI)Landroid/view/MotionEvent;"),
+            &[
+                JValue::Long(down_time),
+                JValue::Long(now),
+                JValue::Int(action.code()),
+                JValue::Float(x),
+                JValue::Float(y),
+                JValue::Int(0),
+            ],
+        )?
+        .l()
+    })?;
+
+    let consumed = checked(env, "RBXSurfaceView.onTouchEventInternal", |env| {
+        env.call_method(
+            &surface,
+            jni_str!("onTouchEventInternal"),
+            jni_sig!("(Landroid/view/MotionEvent;Z)Z"),
+            &[JValue::Object(&event), JValue::Bool(false)],
+        )?
+        .z()
+    });
+
+    if let Err(e) = checked(env, "MotionEvent.recycle", |env| {
+        env.call_method(&event, jni_str!("recycle"), jni_sig!("()V"), &[])?
+            .v()
+    }) {
+        tracing::debug!(error = %e, "MotionEvent.recycle failed (ignored)");
+    }
     Ok(EngineTouchOutcome {
-        consumed,
-        down_time_ms: used_down_time,
+        consumed: consumed?,
+        down_time_ms: down_time,
     })
 }
 
@@ -12265,19 +12319,16 @@ fn surface_callback_ready(env: &mut Env) -> Result<bool, FrameworkError> {
         return Ok(false);
     };
 
-    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
-        Ok(surface_callbacks_size(env, global.as_obj())? > 0)
-    });
-    match result {
-        Ok(Some(inner)) => inner,
-
-        Ok(None) => Ok(false),
-
+    let surface_view = match view_registry::local_jobject(env, handle) {
+        Ok(Ok(Some(surface_view))) => surface_view,
+        Ok(Ok(None)) => return Ok(false),
+        Ok(Err(e)) => return Err(FrameworkError::Jni(e)),
         Err(e) => {
             tracing::debug!(handle, error = %e, "engine_surface_callback_ready: peer not readable (retry)");
-            Ok(false)
+            return Ok(false);
         }
-    }
+    };
+    Ok(surface_callbacks_size(env, &surface_view)? > 0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12330,66 +12381,60 @@ fn surface_lifecycle(
         return Ok(false);
     };
 
-    let result = view_registry::with_jobject(handle, |global| -> Result<bool, FrameworkError> {
-        let surface_view = global.as_obj();
-
-        if surface_callbacks_size(env, surface_view)? <= 0 {
+    let surface_view = match view_registry::local_jobject(env, handle) {
+        Ok(Ok(Some(surface_view))) => surface_view,
+        Ok(Ok(None)) => return Ok(false),
+        Ok(Err(e)) => return Err(FrameworkError::Jni(e)),
+        Err(e) => {
+            tracing::debug!(handle, error = %e, "dispatch_surface_lifecycle: peer not dispatchable (retry)");
             return Ok(false);
         }
+    };
 
-        if event == SurfaceLifecycle::CreatedAndChanged {
-            checked(env, "SurfaceView.surfaceCreated", |env| {
-                env.call_method(
-                    surface_view,
-                    jni_str!("surfaceCreated"),
-                    jni_sig!("()V"),
-                    &[],
-                )?
-                .v()
-            })?;
-        }
-        checked(env, "SurfaceView.surfaceChanged", |env| {
+    if surface_callbacks_size(env, &surface_view)? <= 0 {
+        return Ok(false);
+    }
+
+    if event == SurfaceLifecycle::CreatedAndChanged {
+        checked(env, "SurfaceView.surfaceCreated", |env| {
             env.call_method(
-                surface_view,
-                jni_str!("surfaceChanged"),
-                jni_sig!("(III)V"),
-                &[
-                    JValue::Int(WINDOW_FORMAT_RGBA_8888),
-                    JValue::Int(width),
-                    JValue::Int(height),
-                ],
+                &surface_view,
+                jni_str!("surfaceCreated"),
+                jni_sig!("()V"),
+                &[],
             )?
             .v()
         })?;
-        Ok(true)
-    });
-
-    match result {
-        Ok(Some(inner)) => inner,
-
-        Ok(None) => Ok(false),
-
-        Err(e) => {
-            tracing::debug!(handle, error = %e, "dispatch_surface_lifecycle: peer not dispatchable (retry)");
-            Ok(false)
-        }
     }
+    checked(env, "SurfaceView.surfaceChanged", |env| {
+        env.call_method(
+            &surface_view,
+            jni_str!("surfaceChanged"),
+            jni_sig!("(III)V"),
+            &[
+                JValue::Int(WINDOW_FORMAT_RGBA_8888),
+                JValue::Int(width),
+                JValue::Int(height),
+            ],
+        )?
+        .v()
+    })?;
+    Ok(true)
 }
 
 fn destroy_engine_surface(env: &mut Env) -> Result<bool, FrameworkError> {
     let Some(handle) = view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS) else {
         return Ok(false);
     };
-    let surface_view =
-        match view_registry::with_jobject(handle, |global| env.new_local_ref(global.as_obj())) {
-            Ok(Some(Ok(local))) => local,
-            Ok(Some(Err(error))) => return Err(FrameworkError::Jni(error)),
-            Ok(None) => return Ok(false),
-            Err(error) => {
-                tracing::debug!(handle, error = %error, "surface destroy: peer not dispatchable");
-                return Ok(false);
-            }
-        };
+    let surface_view = match view_registry::local_jobject(env, handle) {
+        Ok(Ok(Some(local))) => local,
+        Ok(Ok(None)) => return Ok(false),
+        Ok(Err(error)) => return Err(FrameworkError::Jni(error)),
+        Err(error) => {
+            tracing::debug!(handle, error = %error, "surface destroy: peer not dispatchable");
+            return Ok(false);
+        }
+    };
     let callbacks = surface_callbacks(env, &surface_view)?;
     let snapshot_object = checked(env, "SurfaceView.mCallbacks.toArray", |env| {
         env.call_method(
@@ -12488,6 +12533,17 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
     let canvas_class = env.find_class(CANVAS_CLASS)?;
     let mut drawn = Vec::with_capacity(targets.len());
     for t in targets {
+        let view = match view_registry::local_jobject(env, t.handle) {
+            Ok(Ok(Some(view))) => view,
+            Ok(Err(e)) => {
+                tracing::debug!(view = t.handle, error = %e, "draw cascade: view local ref failed (skipped)");
+                continue;
+            }
+            Ok(Ok(None)) | Err(_) => {
+                tracing::trace!(view = t.handle, "draw cascade: view not drawable (skipped)");
+                continue;
+            }
+        };
         let canvas_handle = match canvas_registry::allocate(t.width, t.height) {
             Ok(h) => h,
             Err(e) => {
@@ -12513,19 +12569,17 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
             }
         };
 
-        let result = view_registry::with_jobject(t.handle, |global| {
-            checked(env, "View.draw(Canvas)", |env| {
-                env.call_method(
-                    global.as_obj(),
-                    jni_str!("draw"),
-                    jni_sig!("(Landroid/graphics/Canvas;)V"),
-                    &[JValue::Object(&canvas_obj)],
-                )?
-                .v()
-            })
+        let result = checked(env, "View.draw(Canvas)", |env| {
+            env.call_method(
+                &view,
+                jni_str!("draw"),
+                jni_sig!("(Landroid/graphics/Canvas;)V"),
+                &[JValue::Object(&canvas_obj)],
+            )?
+            .v()
         });
         match result {
-            Ok(Some(Ok(()))) => {
+            Ok(()) => {
                 tracing::debug!(
                     view = t.handle,
                     canvas = canvas_handle,
@@ -12538,13 +12592,8 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
                     canvas: canvas_handle,
                 });
             }
-
-            other => {
-                if let Ok(Some(Err(e))) = &other {
-                    tracing::debug!(view = t.handle, error = %e, "draw cascade: View.draw threw (skipped)");
-                } else {
-                    tracing::trace!(view = t.handle, "draw cascade: view not drawable (skipped)");
-                }
+            Err(e) => {
+                tracing::debug!(view = t.handle, error = %e, "draw cascade: View.draw threw (skipped)");
                 let _ = canvas_registry::free(canvas_handle);
             }
         }
@@ -12704,7 +12753,7 @@ fn drive_lifecycle(
         .l()
     })?;
 
-    track_activity(env, &activity, false);
+    track_activity(env, &activity);
 
     call_activity_on_create(env, &activity, "step 5 Activity.onCreate")?;
     tracing::info!(
@@ -12951,16 +13000,26 @@ fn snapshot_live_activities_for_shutdown<'local>(
     };
     let mut activities = Vec::new();
     let mut first_error = None;
-    for entry in tracker.iter_mut().rev().filter(|entry| !entry.finished) {
-        match checked(env, "host shutdown Activity NewLocalRef", |env| {
-            env.new_local_ref(entry.jobject.as_obj())
+    for entry in tracker.iter_mut().rev() {
+        let Some(live) = entry.live() else {
+            continue;
+        };
+        let activity = match checked(env, "host shutdown Activity NewLocalRef", |env| {
+            env.new_local_ref(live.as_obj())
         }) {
-            Ok(activity) => {
-                entry.finished = true;
-                activities.push(activity);
+            Ok(activity) => activity,
+            Err(error) => {
+                remember_shutdown_error(&mut first_error, Err(error));
+                continue;
             }
+        };
+        match checked(env, "host shutdown Activity NewWeakGlobalRef", |env| {
+            env.new_weak_ref(&activity)
+        }) {
+            Ok(finished) => *entry = TrackedActivity::Finished(finished),
             Err(error) => remember_shutdown_error(&mut first_error, Err(error)),
         }
+        activities.push(activity);
     }
     (activities, first_error)
 }
@@ -13746,6 +13805,50 @@ mod tests {
             0,
             "an unreadable path is the tolerated 0 (no paintable), never a panic"
         );
+    }
+
+    #[test]
+    fn file_path_paintable_is_freed_when_its_drawable_releases_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-paintable-release-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("probe.9.png");
+        std::fs::write(&path, b"not-a-png").expect("write probe file");
+        let paintable = record_bitmap_from_file(&path.to_string_lossy(), "test");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+        assert_ne!(paintable, 0, "a readable file yields a live paintable");
+
+        retain_paintable(paintable);
+        release_paintable(paintable);
+        assert_eq!(
+            bitmap_registry::with_bitmap(paintable, |_| ()),
+            Err(bitmap_registry::BitmapRegistryError::StaleHandle),
+            "the finalized Drawable's paintable no longer pins the file bytes"
+        );
+
+        let texture = bitmap_registry::store(bitmap_registry::BitmapState::default())
+            .expect("store bitmap texture");
+        retain_paintable(texture);
+        release_paintable(texture);
+        assert_eq!(
+            bitmap_registry::with_bitmap(texture, |_| ()),
+            Ok(()),
+            "a BitmapDrawable release leaves the Bitmap's texture alive"
+        );
+        bitmap_registry::free(texture).expect("recycle texture");
+
+        for sentinel in [
+            0,
+            DRAWABLE_HANDLE_SENTINEL,
+            DRAWABLE_CONTAINER_HANDLE_SENTINEL,
+        ] {
+            assert!(!is_registry_paintable(sentinel));
+            retain_paintable(sentinel);
+            release_paintable(sentinel);
+        }
     }
 
     #[test]
@@ -16024,5 +16127,186 @@ mod tests {
         item.extend_from_slice(name.as_bytes());
         item.push(0);
         dex.windows(item.len()).any(|window| window == item)
+    }
+
+    #[test]
+    fn path_builder_reused_after_draw_consumes_the_drawn_path_without_duplicating() {
+        let builder = path_registry::allocate(path_registry::PathGeometry::default())
+            .expect("allocate builder");
+        path_registry::with_path(builder, |g| {
+            g.move_to(0.0, 0.0);
+            g.line_to(1.0, 1.0);
+        })
+        .expect("record builder ops");
+        let drawn = path_clone_handle(builder, "native_create_path");
+
+        let rebuilt = path_rebuild_builder(drawn, builder);
+
+        assert_eq!(rebuilt, builder, "the live builder is reused, not replaced");
+        assert_eq!(
+            path_registry::get(drawn),
+            Err(path_registry::PathRegistryError::StaleHandle),
+            "the consumed path slot is released"
+        );
+        assert_eq!(
+            path_registry::get(builder)
+                .expect("builder still live")
+                .verbs,
+            vec![path_registry::Verb::MoveTo, path_registry::Verb::LineTo],
+            "the builder holds the path geometry exactly once"
+        );
+        path_registry::free(builder).expect("free builder");
+    }
+
+    #[test]
+    fn path_builder_from_a_copied_path_takes_its_geometry_and_releases_it() {
+        let copied = path_registry::allocate(path_registry::PathGeometry::default())
+            .expect("allocate copied path");
+        path_registry::with_path(copied, |g| g.move_to(4.0, 5.0)).expect("record path op");
+
+        let builder = path_rebuild_builder(copied, 0);
+
+        assert_ne!(builder, 0, "a fresh builder is allocated");
+        assert_ne!(builder, copied, "the builder is a new slot");
+        assert_eq!(
+            path_registry::get(copied),
+            Err(path_registry::PathRegistryError::StaleHandle),
+            "the copied path slot is released"
+        );
+        assert_eq!(
+            path_registry::get(builder).expect("builder live").points,
+            vec![4.0, 5.0]
+        );
+        path_registry::free(builder).expect("free builder");
+    }
+
+    static ACTIVITY_TRACKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn click_listener_can_reenter_view_natives_while_perform_click_runs() {
+        let (probe_result, probe) = std::sync::mpsc::channel();
+        let clicked = fake_jvm::with_env(|env| {
+            let button = fake_jvm::new_object(env);
+            let handle = view_registry::allocate("android.widget.Button").expect("allocate");
+            let peer = env.new_weak_ref(&button).expect("weak ref");
+            view_registry::set_jobject(handle, view_registry::ViewObject::Peer(peer))
+                .expect("record peer");
+            fake_jvm::on_call(&button, "performClick", move || {
+                let (reached, registry_reached) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let listener_native = view_registry::with_view(handle, |v| v.clickable = true);
+                    reached.send(listener_native.is_ok()).ok();
+                });
+                let reached_in_time =
+                    registry_reached.recv_timeout(std::time::Duration::from_secs(5));
+                probe_result.send(reached_in_time == Ok(true)).ok();
+            });
+            let clicked = perform_click(env, handle);
+            view_registry::free(handle).expect("free");
+            clicked
+        });
+        assert_eq!(clicked.ok(), Some(true), "performClick reaches Java");
+        assert_eq!(
+            probe.try_recv(),
+            Ok(true),
+            "performClick must not hold the view registry while Java runs"
+        );
+    }
+
+    #[test]
+    fn view_constructor_records_a_peer_that_does_not_pin_the_view() {
+        fake_jvm::with_env(|env| {
+            let view = fake_jvm::new_object(env);
+            let this = env.new_local_ref(&view).expect("receiver ref");
+            let handle = view_native_constructor(
+                fake_jvm::native_env(),
+                this,
+                JObject::null(),
+                JObject::null(),
+            );
+            assert_ne!(handle, 0, "the constructor allocates a peer");
+            assert_eq!(
+                fake_jvm::take_exception(),
+                None,
+                "the constructor leaves no Java exception pending"
+            );
+
+            assert_eq!(
+                fake_jvm::strong_refs(&view),
+                0,
+                "the registry keeps no strong reference to the Java view"
+            );
+            assert!(matches!(
+                view_registry::local_jobject(env, handle),
+                Ok(Ok(Some(_)))
+            ));
+            assert!(fake_jvm::collect(&view), "the view is collectable");
+            assert!(matches!(
+                view_registry::local_jobject(env, handle),
+                Ok(Ok(None))
+            ));
+            view_registry::free(handle).expect("finalizer frees the peer");
+        });
+    }
+
+    #[test]
+    fn finished_activity_is_released_and_still_finishes_once() {
+        let _lock = ACTIVITY_TRACKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fake_jvm::with_env(|env| {
+            let activity = fake_jvm::new_object(env);
+            track_activity(env, &activity);
+            assert_eq!(
+                fake_jvm::strong_refs(&activity),
+                1,
+                "a live activity is tracked"
+            );
+
+            assert!(
+                mark_activity_finished_once(env, &activity),
+                "first finish runs"
+            );
+            assert_eq!(
+                fake_jvm::strong_refs(&activity),
+                0,
+                "a finished activity is no longer pinned"
+            );
+            assert!(
+                !mark_activity_finished_once(env, &activity),
+                "a second queued finish is a no-op"
+            );
+
+            assert!(fake_jvm::collect(&activity));
+            let other = fake_jvm::new_object(env);
+            assert!(mark_activity_finished_once(env, &other));
+            let tracker = TRACKED_ACTIVITIES.lock().expect("tracker");
+            assert!(
+                !tracker.iter().any(|entry| entry.is_collected(env)),
+                "collected finished activities are pruned"
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_snapshot_marks_live_activities_finished_without_pinning_them() {
+        let _lock = ACTIVITY_TRACKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fake_jvm::with_env(|env| {
+            let activity = fake_jvm::new_object(env);
+            track_activity(env, &activity);
+
+            let (snapshot, error) = snapshot_live_activities_for_shutdown(env);
+            assert!(error.is_none());
+            assert!(snapshot
+                .iter()
+                .any(|live| env.is_same_object(live, &activity).unwrap_or(false)));
+            assert_eq!(fake_jvm::strong_refs(&activity), 0);
+            assert!(
+                !mark_activity_finished_once(env, &activity),
+                "an activity driven down by shutdown is not finished again"
+            );
+        });
     }
 }
