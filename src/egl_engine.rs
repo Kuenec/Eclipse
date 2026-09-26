@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use crate::loader::native_provider::{HOST_EGL_SONAME, HOST_GLESV2_SONAME};
 use khronos_egl as egl;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
@@ -106,8 +107,7 @@ pub struct EngineGlSurface {
 
     gl: Gles2,
 
-    #[allow(dead_code)]
-    native: EngineNativeWindow,
+    _native: EngineNativeWindow,
     geometry: WindowGeometry,
 }
 
@@ -139,7 +139,7 @@ impl EngineGlSurface {
         geometry: WindowGeometry,
     ) -> Result<Self, EglError> {
         let egl = unsafe {
-            let lib = libloading::Library::new("libEGL.so.1")
+            let lib = libloading::Library::new(HOST_EGL_SONAME)
                 .map_err(|e| EglError::LoadEgl(e.to_string()))?;
             EglInstance::load_required_from(lib).map_err(|e| EglError::LoadEgl(e.to_string()))?
         };
@@ -186,7 +186,7 @@ impl EngineGlSurface {
             context,
             surface,
             gl,
-            native,
+            _native: native,
             geometry,
         })
     }
@@ -234,7 +234,6 @@ impl Drop for EngineGlSurface {
 }
 
 pub struct EngineNativeWindow {
-    #[allow(dead_code)]
     backing: NativeWindowBacking,
 
     native_window: *mut c_void,
@@ -242,7 +241,7 @@ pub struct EngineNativeWindow {
 }
 
 enum NativeWindowBacking {
-    Wayland(#[allow(dead_code)] WaylandEglWindow),
+    Wayland(WaylandEglWindow),
 
     X11,
 
@@ -296,6 +295,14 @@ impl EngineNativeWindow {
     pub fn geometry(&self) -> WindowGeometry {
         self.geometry
     }
+
+    pub fn resize(&mut self, geometry: WindowGeometry) {
+        match &self.backing {
+            NativeWindowBacking::Wayland(wl) => wl.resize(geometry),
+            NativeWindowBacking::X11 | NativeWindowBacking::Borrowed => {}
+        }
+        self.geometry = geometry;
+    }
 }
 
 impl Drop for EngineNativeWindow {
@@ -313,6 +320,8 @@ struct WaylandEglWindow {
 
     window: *mut c_void,
 
+    resize: unsafe extern "C" fn(*mut c_void, i32, i32, i32, i32),
+
     destroy: unsafe extern "C" fn(*mut c_void),
 }
 
@@ -326,6 +335,9 @@ impl WaylandEglWindow {
             > = lib
                 .get(b"wl_egl_window_create\0")
                 .map_err(|e| EglError::WaylandEgl(e.to_string()))?;
+            let resize: libloading::Symbol<unsafe extern "C" fn(*mut c_void, i32, i32, i32, i32)> =
+                lib.get(b"wl_egl_window_resize\0")
+                    .map_err(|e| EglError::WaylandEgl(e.to_string()))?;
             let destroy: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> = lib
                 .get(b"wl_egl_window_destroy\0")
                 .map_err(|e| EglError::WaylandEgl(e.to_string()))?;
@@ -335,13 +347,19 @@ impl WaylandEglWindow {
                     "wl_egl_window_create returned NULL".into(),
                 ));
             }
+            let resize = *resize;
             let destroy = *destroy;
             Ok(Self {
                 _lib: lib,
                 window,
+                resize,
                 destroy,
             })
         }
+    }
+
+    fn resize(&self, geometry: WindowGeometry) {
+        unsafe { (self.resize)(self.window, geometry.width, geometry.height, 0, 0) }
     }
 }
 
@@ -385,35 +403,34 @@ type PfnGlDrawArrays = unsafe extern "C" fn(u32, i32, i32);
 type PfnGlDeleteShader = unsafe extern "C" fn(u32);
 type PfnGlDeleteProgram = unsafe extern "C" fn(u32);
 
-#[allow(non_snake_case)]
 pub struct Gles2 {
     _lib: libloading::Library,
-    glGetError: PfnGlGetError,
-    glClearColor: PfnGlClearColor,
-    glClear: PfnGlClear,
-    glViewport: PfnGlViewport,
-    glCreateShader: PfnGlCreateShader,
-    glShaderSource: PfnGlShaderSource,
-    glCompileShader: PfnGlCompileShader,
-    glGetShaderiv: PfnGlGetShaderiv,
-    glCreateProgram: PfnGlCreateProgram,
-    glAttachShader: PfnGlAttachShader,
-    glLinkProgram: PfnGlLinkProgram,
-    glGetProgramiv: PfnGlGetProgramiv,
-    glUseProgram: PfnGlUseProgram,
-    glGetAttribLocation: PfnGlGetAttribLocation,
-    glEnableVertexAttribArray: PfnGlEnableVertexAttribArray,
-    glVertexAttribPointer: PfnGlVertexAttribPointer,
-    glDrawArrays: PfnGlDrawArrays,
-    glDeleteShader: PfnGlDeleteShader,
-    glDeleteProgram: PfnGlDeleteProgram,
+    gl_get_error: PfnGlGetError,
+    gl_clear_color: PfnGlClearColor,
+    gl_clear: PfnGlClear,
+    gl_viewport: PfnGlViewport,
+    gl_create_shader: PfnGlCreateShader,
+    gl_shader_source: PfnGlShaderSource,
+    gl_compile_shader: PfnGlCompileShader,
+    gl_get_shaderiv: PfnGlGetShaderiv,
+    gl_create_program: PfnGlCreateProgram,
+    gl_attach_shader: PfnGlAttachShader,
+    gl_link_program: PfnGlLinkProgram,
+    gl_get_programiv: PfnGlGetProgramiv,
+    gl_use_program: PfnGlUseProgram,
+    gl_get_attrib_location: PfnGlGetAttribLocation,
+    gl_enable_vertex_attrib_array: PfnGlEnableVertexAttribArray,
+    gl_vertex_attrib_pointer: PfnGlVertexAttribPointer,
+    gl_draw_arrays: PfnGlDrawArrays,
+    gl_delete_shader: PfnGlDeleteShader,
+    gl_delete_program: PfnGlDeleteProgram,
 }
 
 impl Gles2 {
     fn load(egl: &EglInstance) -> Result<Self, EglError> {
         unsafe {
-            let lib = libloading::Library::new("libGLESv2.so.2")
-                .map_err(|e| EglError::Gl(format!("no libGLESv2.so.2: {e}")))?;
+            let lib = libloading::Library::new(HOST_GLESV2_SONAME)
+                .map_err(|e| EglError::Gl(format!("no {HOST_GLESV2_SONAME}: {e}")))?;
 
             let resolve = |name: &str| -> Result<*const c_void, EglError> {
                 if let Some(p) = egl.get_proc_address(name) {
@@ -433,35 +450,38 @@ impl Gles2 {
                 };
             }
             Ok(Self {
-                glGetError: load_fn!("glGetError", PfnGlGetError),
-                glClearColor: load_fn!("glClearColor", PfnGlClearColor),
-                glClear: load_fn!("glClear", PfnGlClear),
-                glViewport: load_fn!("glViewport", PfnGlViewport),
-                glCreateShader: load_fn!("glCreateShader", PfnGlCreateShader),
-                glShaderSource: load_fn!("glShaderSource", PfnGlShaderSource),
-                glCompileShader: load_fn!("glCompileShader", PfnGlCompileShader),
-                glGetShaderiv: load_fn!("glGetShaderiv", PfnGlGetShaderiv),
-                glCreateProgram: load_fn!("glCreateProgram", PfnGlCreateProgram),
-                glAttachShader: load_fn!("glAttachShader", PfnGlAttachShader),
-                glLinkProgram: load_fn!("glLinkProgram", PfnGlLinkProgram),
-                glGetProgramiv: load_fn!("glGetProgramiv", PfnGlGetProgramiv),
-                glUseProgram: load_fn!("glUseProgram", PfnGlUseProgram),
-                glGetAttribLocation: load_fn!("glGetAttribLocation", PfnGlGetAttribLocation),
-                glEnableVertexAttribArray: load_fn!(
+                gl_get_error: load_fn!("glGetError", PfnGlGetError),
+                gl_clear_color: load_fn!("glClearColor", PfnGlClearColor),
+                gl_clear: load_fn!("glClear", PfnGlClear),
+                gl_viewport: load_fn!("glViewport", PfnGlViewport),
+                gl_create_shader: load_fn!("glCreateShader", PfnGlCreateShader),
+                gl_shader_source: load_fn!("glShaderSource", PfnGlShaderSource),
+                gl_compile_shader: load_fn!("glCompileShader", PfnGlCompileShader),
+                gl_get_shaderiv: load_fn!("glGetShaderiv", PfnGlGetShaderiv),
+                gl_create_program: load_fn!("glCreateProgram", PfnGlCreateProgram),
+                gl_attach_shader: load_fn!("glAttachShader", PfnGlAttachShader),
+                gl_link_program: load_fn!("glLinkProgram", PfnGlLinkProgram),
+                gl_get_programiv: load_fn!("glGetProgramiv", PfnGlGetProgramiv),
+                gl_use_program: load_fn!("glUseProgram", PfnGlUseProgram),
+                gl_get_attrib_location: load_fn!("glGetAttribLocation", PfnGlGetAttribLocation),
+                gl_enable_vertex_attrib_array: load_fn!(
                     "glEnableVertexAttribArray",
                     PfnGlEnableVertexAttribArray
                 ),
-                glVertexAttribPointer: load_fn!("glVertexAttribPointer", PfnGlVertexAttribPointer),
-                glDrawArrays: load_fn!("glDrawArrays", PfnGlDrawArrays),
-                glDeleteShader: load_fn!("glDeleteShader", PfnGlDeleteShader),
-                glDeleteProgram: load_fn!("glDeleteProgram", PfnGlDeleteProgram),
+                gl_vertex_attrib_pointer: load_fn!(
+                    "glVertexAttribPointer",
+                    PfnGlVertexAttribPointer
+                ),
+                gl_draw_arrays: load_fn!("glDrawArrays", PfnGlDrawArrays),
+                gl_delete_shader: load_fn!("glDeleteShader", PfnGlDeleteShader),
+                gl_delete_program: load_fn!("glDeleteProgram", PfnGlDeleteProgram),
                 _lib: lib,
             })
         }
     }
 
     fn get_error(&self) -> u32 {
-        unsafe { (self.glGetError)() }
+        unsafe { (self.gl_get_error)() }
     }
 
     fn check(&self, op: &str) -> Result<(), EglError> {
@@ -494,27 +514,27 @@ pub fn render_test_frames(surface: &EngineGlSurface, frames: u32) -> Result<(), 
 
     unsafe {
         let program = compile_program(gl, VERT_SRC, FRAG_SRC)?;
-        let pos_loc = (gl.glGetAttribLocation)(program, c"aPos".as_ptr());
+        let pos_loc = (gl.gl_get_attrib_location)(program, c"aPos".as_ptr());
         gl.check("glGetAttribLocation")?;
         if pos_loc < 0 {
-            (gl.glDeleteProgram)(program);
+            (gl.gl_delete_program)(program);
             return Err(EglError::Gl("aPos attribute not found".into()));
         }
         let pos_loc = pos_loc as u32;
 
         let verts: [f32; 6] = [0.0, 0.5, -0.5, -0.5, 0.5, -0.5];
 
-        (gl.glViewport)(0, 0, geo.width, geo.height);
+        (gl.gl_viewport)(0, 0, geo.width, geo.height);
         gl.check("glViewport")?;
 
         for _ in 0..frames {
-            (gl.glClearColor)(0.05, 0.05, 0.08, 1.0);
-            (gl.glClear)(GL_COLOR_BUFFER_BIT);
+            (gl.gl_clear_color)(0.05, 0.05, 0.08, 1.0);
+            (gl.gl_clear)(GL_COLOR_BUFFER_BIT);
             gl.check("glClear")?;
 
-            (gl.glUseProgram)(program);
-            (gl.glEnableVertexAttribArray)(pos_loc);
-            (gl.glVertexAttribPointer)(
+            (gl.gl_use_program)(program);
+            (gl.gl_enable_vertex_attrib_array)(pos_loc);
+            (gl.gl_vertex_attrib_pointer)(
                 pos_loc,
                 2,
                 GL_FLOAT,
@@ -522,13 +542,13 @@ pub fn render_test_frames(surface: &EngineGlSurface, frames: u32) -> Result<(), 
                 0,
                 verts.as_ptr() as *const c_void,
             );
-            (gl.glDrawArrays)(GL_TRIANGLES, 0, 3);
+            (gl.gl_draw_arrays)(GL_TRIANGLES, 0, 3);
             gl.check("glDrawArrays")?;
 
             surface.swap_buffers()?;
         }
 
-        (gl.glDeleteProgram)(program);
+        (gl.gl_delete_program)(program);
         gl.check("frame loop")?;
     }
     Ok(())
@@ -540,21 +560,21 @@ unsafe fn compile_program(gl: &Gles2, vert: &[u8], frag: &[u8]) -> Result<u32, E
         let fs = match compile_shader(gl, GL_FRAGMENT_SHADER, frag) {
             Ok(fs) => fs,
             Err(e) => {
-                (gl.glDeleteShader)(vs);
+                (gl.gl_delete_shader)(vs);
                 return Err(e);
             }
         };
-        let program = (gl.glCreateProgram)();
-        (gl.glAttachShader)(program, vs);
-        (gl.glAttachShader)(program, fs);
-        (gl.glLinkProgram)(program);
+        let program = (gl.gl_create_program)();
+        (gl.gl_attach_shader)(program, vs);
+        (gl.gl_attach_shader)(program, fs);
+        (gl.gl_link_program)(program);
 
-        (gl.glDeleteShader)(vs);
-        (gl.glDeleteShader)(fs);
+        (gl.gl_delete_shader)(vs);
+        (gl.gl_delete_shader)(fs);
         let mut linked: i32 = 0;
-        (gl.glGetProgramiv)(program, GL_LINK_STATUS, &mut linked);
+        (gl.gl_get_programiv)(program, GL_LINK_STATUS, &mut linked);
         if linked == 0 {
-            (gl.glDeleteProgram)(program);
+            (gl.gl_delete_program)(program);
             return Err(EglError::Gl("program link failed".into()));
         }
         gl.check("link program")?;
@@ -564,18 +584,18 @@ unsafe fn compile_program(gl: &Gles2, vert: &[u8], frag: &[u8]) -> Result<u32, E
 
 unsafe fn compile_shader(gl: &Gles2, kind: u32, src: &[u8]) -> Result<u32, EglError> {
     unsafe {
-        let shader = (gl.glCreateShader)(kind);
+        let shader = (gl.gl_create_shader)(kind);
         if shader == 0 {
             return Err(EglError::Gl("glCreateShader returned 0".into()));
         }
         let ptr = src.as_ptr() as *const i8;
         let ptrs = [ptr];
-        (gl.glShaderSource)(shader, 1, ptrs.as_ptr(), std::ptr::null());
-        (gl.glCompileShader)(shader);
+        (gl.gl_shader_source)(shader, 1, ptrs.as_ptr(), std::ptr::null());
+        (gl.gl_compile_shader)(shader);
         let mut status: i32 = 0;
-        (gl.glGetShaderiv)(shader, GL_COMPILE_STATUS, &mut status);
+        (gl.gl_get_shaderiv)(shader, GL_COMPILE_STATUS, &mut status);
         if status == 0 {
-            (gl.glDeleteShader)(shader);
+            (gl.gl_delete_shader)(shader);
             return Err(EglError::Gl(format!(
                 "shader (kind 0x{kind:04x}) compile failed"
             )));
@@ -860,5 +880,77 @@ mod tests {
             }
         );
         assert_eq!(WindowGeometry::from_physical(800, 0).height, 1);
+    }
+
+    #[repr(C)]
+    struct WlEglWindowHead {
+        version: isize,
+        width: i32,
+        height: i32,
+    }
+
+    fn wl_egl_window_size(window: &EngineNativeWindow) -> (i32, i32) {
+        let head = unsafe { &*window.as_native_window().cast::<WlEglWindowHead>() };
+        assert!(
+            head.version >= 3,
+            "unexpected wl_egl_window ABI {}",
+            head.version
+        );
+        (head.width, head.height)
+    }
+
+    #[test]
+    fn wayland_engine_window_resize_resizes_the_wl_egl_window() {
+        let sentinel_surface = 0x1000 as *mut c_void;
+        let initial = WindowGeometry {
+            width: 800,
+            height: 600,
+        };
+        let wl = match WaylandEglWindow::new(sentinel_surface, initial) {
+            Ok(wl) => wl,
+            Err(e) => {
+                eprintln!("SKIP: libwayland-egl.so.1 unavailable ({e})");
+                return;
+            }
+        };
+        let native_window = wl.window;
+        let mut window = EngineNativeWindow {
+            backing: NativeWindowBacking::Wayland(wl),
+            native_window,
+            geometry: initial,
+        };
+        assert_eq!(wl_egl_window_size(&window), (800, 600));
+
+        let resized = WindowGeometry {
+            width: 1280,
+            height: 720,
+        };
+        window.resize(resized);
+
+        assert_eq!(
+            wl_egl_window_size(&window),
+            (1280, 720),
+            "EGL sizes Wayland window-surface buffers from the wl_egl_window, \
+             so it must follow the window"
+        );
+        assert_eq!(window.geometry(), resized);
+    }
+
+    #[test]
+    fn borrowed_engine_window_resize_only_updates_its_geometry() {
+        let mut window = EngineNativeWindow::borrowed(
+            0x2000 as egl::NativeWindowType,
+            WindowGeometry {
+                width: 640,
+                height: 480,
+            },
+        );
+        let resized = WindowGeometry {
+            width: 1024,
+            height: 768,
+        };
+        window.resize(resized);
+        assert_eq!(window.geometry(), resized);
+        assert_eq!(window.as_native_window() as usize, 0x2000);
     }
 }

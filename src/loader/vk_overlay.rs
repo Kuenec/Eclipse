@@ -1,6 +1,9 @@
 use crate::font::{RasterFont, ScaledFont};
+use crate::graphics::FrameFence;
 use ash::vk;
 use ash::vk::Handle;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -125,62 +128,76 @@ fn visible_line_end(
     (text.len(), text.len(), false)
 }
 
-fn draw_text_onto_rgba(
-    buf: &mut [u8],
-    w: u32,
-    h: u32,
-    overlay: &crate::framework::ActiveTextOverlay,
-) {
-    if overlay.text.is_empty() {
-        return;
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TextLayout {
+    scale: f32,
+    multiline: bool,
+    wrapped: bool,
+    x_alignment: i32,
+    y_alignment: i32,
+    width: u32,
+    height: u32,
+}
+
+impl TextLayout {
+    fn of(overlay: &crate::framework::ActiveTextOverlay, width: u32, height: u32) -> Self {
+        Self {
+            scale: overlay_font_size(overlay.font_size),
+            multiline: overlay.multiline,
+            wrapped: overlay.text_wrapped,
+            x_alignment: overlay.x_alignment,
+            y_alignment: overlay.y_alignment,
+            width,
+            height,
+        }
     }
-    let Some(font) = overlay_font() else {
-        return;
-    };
-    let scale = overlay_font_size(overlay.font_size);
-    let Some(mut scaled) = font.scaled(scale) else {
-        return;
-    };
+
+    fn buffer_len(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+}
+
+fn lay_out_text(
+    scaled: &mut ScaledFont,
+    text: &str,
+    layout: &TextLayout,
+    mut paint: impl FnMut(usize, f32),
+) -> Option<(f32, f32)> {
+    if text.is_empty() {
+        return None;
+    }
+    let (w, h) = (layout.width, layout.height);
+    let buf_len = layout.buffer_len();
+    let scale = layout.scale;
     let ascent = scaled.ascent();
     let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
-    let color_bytes = (overlay.text_color as u32).to_be_bytes();
-    let color = [
-        color_bytes[1],
-        color_bytes[2],
-        color_bytes[3],
-        color_bytes[0],
-    ];
     let available_width = (w as f32 - OVERLAY_TEXT_PADDING * 2.0).max(1.0);
     let available_height = (h as f32 - OVERLAY_TEXT_PADDING * 2.0).max(line_height);
-    let maximum_lines = if overlay.multiline {
+    let maximum_lines = if layout.multiline {
         (available_height / line_height).floor().max(1.0) as usize
     } else {
         1
     };
-    let first_baseline = if overlay.multiline || overlay.y_alignment == 0 {
+    let first_baseline = if layout.multiline || layout.y_alignment == 0 {
         OVERLAY_TEXT_PADDING + ascent
-    } else if overlay.y_alignment == 2 {
+    } else if layout.y_alignment == 2 {
         h as f32 - OVERLAY_TEXT_PADDING - scale + ascent
     } else {
         (h as f32 - scale) * 0.5 + ascent
     };
-    let mut remaining = overlay.text.as_str();
+    let mut remaining = text;
     let mut caret = None;
     let mut complete = false;
 
     for line_index in 0..maximum_lines {
-        let (draw_end, consumed, clipped_line) = visible_line_end(
-            remaining,
-            &mut scaled,
-            available_width,
-            overlay.text_wrapped,
-        );
+        let (draw_end, consumed, clipped_line) =
+            visible_line_end(remaining, scaled, available_width, layout.wrapped);
         let line = &remaining[..draw_end];
         let line_width = line
             .chars()
             .map(|character| scaled.advance(character))
             .sum::<f32>();
-        let mut pen_x = match overlay.x_alignment {
+        let mut pen_x = match layout.x_alignment {
             1 => (w as f32 - OVERLAY_TEXT_PADDING - line_width).max(OVERLAY_TEXT_PADDING),
             2 => ((w as f32 - line_width) * 0.5).max(OVERLAY_TEXT_PADDING),
             _ => OVERLAY_TEXT_PADDING,
@@ -204,8 +221,8 @@ fn draw_text_onto_rgba(
                                 && (pixel_y as u32) < h
                             {
                                 let index = ((pixel_y as u32 * w + pixel_x as u32) * 4) as usize;
-                                if index + 2 < buf.len() {
-                                    blend_text_pixel(buf, index, color, 1.0);
+                                if index + 2 < buf_len {
+                                    paint(index, 1.0);
                                 }
                             }
                         }
@@ -223,7 +240,7 @@ fn draw_text_onto_rgba(
                     if pixel_x >= 0 && pixel_y >= 0 && (pixel_x as u32) < w && (pixel_y as u32) < h
                     {
                         let index = ((pixel_y as u32 * w + pixel_x as u32) * 4) as usize;
-                        blend_text_pixel(buf, index, color, coverage);
+                        paint(index, coverage);
                     }
                 });
             }
@@ -246,26 +263,152 @@ fn draw_text_onto_rgba(
         }
     }
 
-    static BLINK: AtomicU64 = AtomicU64::new(0);
-    if complete && (BLINK.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
-        if let Some((pen_x, baseline_y)) = caret {
-            let cx = pen_x as i32 + 1;
-            let y0 = (baseline_y - scale * 0.72).max(0.0) as u32;
-            let y1 = ((baseline_y + scale * 0.08) as u32).min(h);
-            for cy in y0..y1 {
-                for dx in 0..2 {
-                    let px = cx + dx;
-                    if px >= 0 && (px as u32) < w {
-                        let idx = ((cy * w + px as u32) * 4) as usize;
-                        if idx + 2 < buf.len() {
-                            blend_text_pixel(buf, idx, color, 1.0);
-                        }
-                    }
+    caret.filter(|_| complete)
+}
+
+fn paint_caret(caret: (f32, f32), layout: &TextLayout, mut paint: impl FnMut(usize)) {
+    let (pen_x, baseline_y) = caret;
+    let (w, h) = (layout.width, layout.height);
+    let buf_len = layout.buffer_len();
+    let cx = pen_x as i32 + 1;
+    let y0 = (baseline_y - layout.scale * 0.72).max(0.0) as u32;
+    let y1 = ((baseline_y + layout.scale * 0.08) as u32).min(h);
+    for cy in y0..y1 {
+        for dx in 0..2 {
+            let px = cx + dx;
+            if px >= 0 && (px as u32) < w {
+                let idx = ((cy * w + px as u32) * 4) as usize;
+                if idx + 2 < buf_len {
+                    paint(idx);
                 }
             }
         }
     }
 }
+
+fn overlay_text_is_masked(input_type: i32) -> bool {
+    !matches!(input_type, 0..=4 | 7 | 8)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OverlayText {
+    Plain(String),
+    Masked { chars: usize },
+}
+
+impl OverlayText {
+    fn of(overlay: &crate::framework::ActiveTextOverlay) -> Self {
+        if overlay_text_is_masked(overlay.input_type) {
+            Self::Masked {
+                chars: overlay.text.chars().count(),
+            }
+        } else {
+            Self::Plain(overlay.text.clone())
+        }
+    }
+
+    fn shows(&self, overlay: &crate::framework::ActiveTextOverlay) -> bool {
+        match self {
+            Self::Plain(text) => {
+                !overlay_text_is_masked(overlay.input_type) && *text == overlay.text
+            }
+            Self::Masked { chars } => {
+                overlay_text_is_masked(overlay.input_type) && *chars == overlay.text.chars().count()
+            }
+        }
+    }
+
+    fn rendered(&self) -> Cow<'_, str> {
+        match self {
+            Self::Plain(text) => Cow::Borrowed(text),
+            Self::Masked { chars } => Cow::Owned("\u{2022}".repeat(*chars)),
+        }
+    }
+}
+
+struct TextLayer {
+    text: OverlayText,
+    layout: TextLayout,
+    glyphs: Vec<(usize, f32)>,
+    caret: Option<Vec<usize>>,
+}
+
+impl TextLayer {
+    fn build(scaled: &mut ScaledFont, text: OverlayText, layout: TextLayout) -> Self {
+        let mut glyphs = Vec::new();
+        let caret = lay_out_text(scaled, &text.rendered(), &layout, |index, coverage| {
+            if coverage != 0.0 {
+                glyphs.push((index, coverage));
+            }
+        })
+        .map(|position| {
+            let mut pixels = Vec::new();
+            paint_caret(position, &layout, |index| pixels.push(index));
+            pixels
+        });
+        Self {
+            text,
+            layout,
+            glyphs,
+            caret,
+        }
+    }
+
+    fn apply(&self, buf: &mut [u8], color: [u8; 4], blink: &AtomicU64) {
+        for &(index, coverage) in &self.glyphs {
+            blend_text_pixel(buf, index, color, coverage);
+        }
+        if let Some(caret) = &self.caret {
+            if (blink.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
+                for &index in caret {
+                    blend_text_pixel(buf, index, color, 1.0);
+                }
+            }
+        }
+    }
+}
+
+fn overlay_text_color(argb: i32) -> [u8; 4] {
+    let bytes = (argb as u32).to_be_bytes();
+    [bytes[1], bytes[2], bytes[3], bytes[0]]
+}
+
+#[derive(Default)]
+struct TextLayerCache {
+    font: Option<(u32, ScaledFont)>,
+    layer: Option<TextLayer>,
+}
+
+impl TextLayerCache {
+    fn layer(
+        &mut self,
+        overlay: &crate::framework::ActiveTextOverlay,
+        width: u32,
+        height: u32,
+    ) -> Option<&TextLayer> {
+        let layout = TextLayout::of(overlay, width, height);
+        let cached = self
+            .layer
+            .as_ref()
+            .is_some_and(|layer| layer.layout == layout && layer.text.shows(overlay));
+        if !cached {
+            let font = overlay_font()?;
+            let size_key = layout.scale.to_bits();
+            if self.font.as_ref().is_none_or(|(key, _)| *key != size_key) {
+                self.font = Some((size_key, font.scaled(layout.scale)?));
+            }
+            let (_, scaled) = self.font.as_mut()?;
+            self.layer = Some(TextLayer::build(scaled, OverlayText::of(overlay), layout));
+        }
+        self.layer.as_ref()
+    }
+}
+
+thread_local! {
+    static TEXT_LAYERS: RefCell<TextLayerCache> = RefCell::new(TextLayerCache::default());
+}
+
+static CARET_BLINK: AtomicU64 = AtomicU64::new(0);
 
 fn overlay_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
@@ -277,6 +420,7 @@ static HOST_CREATE_DEVICE: AtomicU64 = AtomicU64::new(0);
 static HOST_DESTROY_DEVICE: AtomicU64 = AtomicU64::new(0);
 static HOST_QUEUE_PRESENT: AtomicU64 = AtomicU64::new(0);
 static HOST_CREATE_SWAPCHAIN: AtomicU64 = AtomicU64::new(0);
+static HOST_DESTROY_SWAPCHAIN: AtomicU64 = AtomicU64::new(0);
 static HOST_GET_SWAPCHAIN_IMAGES: AtomicU64 = AtomicU64::new(0);
 static HOST_ACQUIRE_NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
 static HOST_ACQUIRE_NEXT_IMAGE2: AtomicU64 = AtomicU64::new(0);
@@ -393,6 +537,16 @@ unsafe extern "system" fn eclipse_vk_get_device_proc_addr(
         return Some(unsafe {
             std::mem::transmute::<vk::PFN_vkCreateSwapchainKHR, unsafe extern "system" fn()>(
                 eclipse_vk_create_swapchain_khr,
+            )
+        });
+    }
+    if name == c"vkDestroySwapchainKHR" {
+        let host = unsafe { host_gdpa(device, p_name) };
+        HOST_DESTROY_SWAPCHAIN.store(pfn_to_addr(host), Ordering::Relaxed);
+
+        return Some(unsafe {
+            std::mem::transmute::<vk::PFN_vkDestroySwapchainKHR, unsafe extern "system" fn()>(
+                eclipse_vk_destroy_swapchain_khr,
             )
         });
     }
@@ -548,6 +702,7 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
     let host: vk::PFN_vkCreateSwapchainKHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateSwapchainKHR>(addr) };
 
+    let _swapchain = swapchain_lock();
     let r = unsafe { host(device, p_create_info, p_allocator, p_swapchain) };
     if r == vk::Result::SUCCESS && !p_create_info.is_null() && !p_swapchain.is_null() {
         let info = unsafe { &*p_create_info };
@@ -567,6 +722,44 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         );
     }
     r
+}
+
+unsafe extern "system" fn eclipse_vk_destroy_swapchain_khr(
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+    p_allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    let Some(addr) = cached(&HOST_DESTROY_SWAPCHAIN) else {
+        tracing::error!("vk-overlay: missing host vkDestroySwapchainKHR");
+        return;
+    };
+    let host: vk::PFN_vkDestroySwapchainKHR =
+        unsafe { std::mem::transmute::<usize, vk::PFN_vkDestroySwapchainKHR>(addr) };
+
+    let _swapchain = swapchain_lock();
+    retire_swapchain(swapchain.as_raw());
+    unsafe { host(device, swapchain, p_allocator) };
+    if let Ok(mut sets) = PRESENT_SEMAPHORES.lock() {
+        sets.retain(|set| set.swapchain != swapchain.as_raw());
+    }
+}
+
+fn retire_swapchain(swapchain: u64) {
+    {
+        let mut slot = WEB_PRESENTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|p| p.swapchain == swapchain) {
+            *slot = None;
+        }
+    }
+    let mut st = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if st.swapchain == swapchain {
+        st.swapchain = 0;
+        st.images.clear();
+    }
 }
 
 unsafe extern "system" fn eclipse_vk_get_swapchain_images_khr(
@@ -685,14 +878,6 @@ fn select_text_probe_rect(
     })
 }
 
-fn mask_overlay_text(text: String, input_type: i32) -> String {
-    if matches!(input_type, 0..=4 | 7 | 8) {
-        text
-    } else {
-        "\u{2022}".repeat(text.chars().count())
-    }
-}
-
 unsafe fn locate_image_index(pi: &vk::PresentInfoKHR<'_>, our_sc: u64) -> Option<u32> {
     if our_sc == 0
         || pi.swapchain_count == 0
@@ -739,6 +924,8 @@ static WEB_COMPOSITE: Mutex<Option<Probe>> = Mutex::new(None);
 static WEB_COMPOSITE_LAST: AtomicU64 = AtomicU64::new(0);
 
 static SWAPCHAIN_LOCK: Mutex<()> = Mutex::new(());
+
+static PRESENT_SEMAPHORES: Mutex<Vec<PresentSemaphores>> = Mutex::new(Vec::new());
 
 static WEB_PRESENT_QUEUE_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -811,12 +998,15 @@ struct WebPresenter {
     images: Vec<u64>,
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+    blank_frames: Vec<vk::CommandBuffer>,
+    fence: FrameFence,
     acquire: vk::Semaphore,
     done: Vec<vk::Semaphore>,
     saved: vk::Image,
     saved_memory: vk::DeviceMemory,
     saved_valid: bool,
+    saved_ready: vk::Semaphore,
+    saved_signal_pending: bool,
     frame: vk::Buffer,
     frame_memory: vk::DeviceMemory,
     frame_mapped: *mut u8,
@@ -825,6 +1015,14 @@ struct WebPresenter {
 }
 
 unsafe impl Send for WebPresenter {}
+
+#[derive(Debug, Clone, Copy)]
+struct SavedFrameTarget {
+    image: vk::Image,
+    extent: vk::Extent2D,
+    ready: vk::Semaphore,
+    wait_ready: bool,
+}
 
 fn color_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
@@ -837,6 +1035,61 @@ fn color_layers() -> vk::ImageSubresourceLayers {
     vk::ImageSubresourceLayers::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .layer_count(1)
+}
+
+unsafe fn record_blank_frame(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+) -> ash::prelude::VkResult<()> {
+    let to_dst = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(color_range());
+    let to_present = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(color_range());
+    unsafe {
+        device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_dst],
+        );
+        device.cmd_clear_color_image(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+            &[color_range()],
+        );
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_present],
+        );
+        device.end_command_buffer(cmd)
+    }
 }
 
 unsafe fn record_save_engine_frame(
@@ -893,24 +1146,43 @@ unsafe fn record_save_engine_frame(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EngineHandles {
+    instance: u64,
+    device: u64,
+    physical_device: u64,
+    queue_family: u32,
+}
+
+impl EngineHandles {
+    fn current(device: u64) -> Self {
+        Self {
+            instance: INSTANCE.load(Ordering::Relaxed),
+            device,
+            physical_device: PHYSICAL_DEVICE.load(Ordering::Relaxed),
+            queue_family: QUEUE_FAMILY.load(Ordering::Relaxed),
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.instance != 0
+            && self.device != 0
+            && self.physical_device != 0
+            && self.queue_family != u32::MAX
+    }
+}
+
 impl WebPresenter {
-    #[allow(clippy::too_many_arguments)]
     fn build(
         entry: &ash::Entry,
-        instance_raw: u64,
-        device_raw: u64,
-        physical_raw: u64,
-        queue_family: u32,
+        engine: EngineHandles,
         queue_index: u32,
         swapchain: u64,
         extent: vk::Extent2D,
         format: vk::Format,
         images: Vec<u64>,
     ) -> Option<WebPresenter> {
-        if instance_raw == 0
-            || device_raw == 0
-            || physical_raw == 0
-            || queue_family == u32::MAX
+        if !engine.complete()
             || swapchain == 0
             || extent.width == 0
             || extent.height == 0
@@ -921,7 +1193,7 @@ impl WebPresenter {
         let host_gdpa_addr = cached(&HOST_GDPA)?;
         let host_gdpa: vk::PFN_vkGetDeviceProcAddr =
             unsafe { std::mem::transmute::<usize, vk::PFN_vkGetDeviceProcAddr>(host_gdpa_addr) };
-        let device_handle = vk::Device::from_raw(device_raw);
+        let device_handle = vk::Device::from_raw(engine.device);
         let acquire_next_image: vk::PFN_vkAcquireNextImageKHR = unsafe {
             std::mem::transmute::<vk::PFN_vkVoidFunction, Option<vk::PFN_vkAcquireNextImageKHR>>(
                 host_gdpa(device_handle, c"vkAcquireNextImageKHR".as_ptr()),
@@ -933,22 +1205,31 @@ impl WebPresenter {
             )
         }?;
 
-        let instance =
-            unsafe { ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(instance_raw)) };
+        let instance = unsafe {
+            ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(engine.instance))
+        };
         let device = unsafe { ash::Device::load(instance.fp_v1_0(), device_handle) };
         let mem_props = unsafe {
-            instance
-                .get_physical_device_memory_properties(vk::PhysicalDevice::from_raw(physical_raw))
+            instance.get_physical_device_memory_properties(vk::PhysicalDevice::from_raw(
+                engine.physical_device,
+            ))
         };
-        let queue = unsafe { device.get_device_queue(queue_family, queue_index) };
+        let queue = unsafe { device.get_device_queue(engine.queue_family, queue_index) };
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(queue_family);
+            .queue_family_index(engine.queue_family);
         let command_pool = unsafe { device.create_command_pool(&pool_info, None) }.ok()?;
+        let fence = match FrameFence::new(&device) {
+            Ok(fence) => fence,
+            Err(_) => {
+                unsafe { device.destroy_command_pool(command_pool, None) };
+                return None;
+            }
+        };
         let mut presenter = WebPresenter {
             device: device.clone(),
-            device_raw,
+            device_raw: engine.device,
             queue,
             acquire_next_image,
             queue_present,
@@ -957,12 +1238,15 @@ impl WebPresenter {
             images,
             command_pool,
             cmd: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
+            blank_frames: Vec::new(),
+            fence,
             acquire: vk::Semaphore::null(),
             done: Vec::new(),
             saved: vk::Image::null(),
             saved_memory: vk::DeviceMemory::null(),
             saved_valid: false,
+            saved_ready: vk::Semaphore::null(),
+            saved_signal_pending: false,
             frame: vk::Buffer::null(),
             frame_memory: vk::DeviceMemory::null(),
             frame_mapped: std::ptr::null_mut(),
@@ -977,14 +1261,14 @@ impl WebPresenter {
             .ok()?
             .into_iter()
             .next()?;
-        presenter.fence = unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
+        let blank_alloc = alloc.command_buffer_count(u32::try_from(presenter.images.len()).ok()?);
+        presenter.blank_frames = unsafe { device.allocate_command_buffers(&blank_alloc) }.ok()?;
+        for (&cmd, &image) in presenter.blank_frames.iter().zip(&presenter.images) {
+            unsafe { record_blank_frame(&device, cmd, vk::Image::from_raw(image)) }.ok()?;
         }
-        .ok()?;
         presenter.acquire =
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.ok()?;
+        presenter.saved_ready =
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.ok()?;
         for _ in 0..presenter.images.len() {
             let done =
@@ -1056,9 +1340,6 @@ impl WebPresenter {
 
     unsafe fn initialize_saved_layout(&mut self) -> bool {
         unsafe {
-            if self.device.reset_fences(&[self.fence]).is_err() {
-                return false;
-            }
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
@@ -1084,20 +1365,22 @@ impl WebPresenter {
             if self.device.end_command_buffer(self.cmd).is_err() {
                 return false;
             }
-            let cmds = [self.cmd];
-            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            self.device
-                .queue_submit(self.queue, &[submit], self.fence)
-                .is_ok()
-                && self
-                    .device
-                    .wait_for_fences(&[self.fence], true, u64::MAX)
-                    .is_ok()
         }
+        let cmds = [self.cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        self.fence
+            .submit(&self.device, self.queue, &[submit])
+            .is_ok()
+            && self.fence.retire(&self.device).is_ok()
     }
 
-    fn saved_target(&self, extent: vk::Extent2D) -> Option<vk::Image> {
-        (self.extent == extent).then_some(self.saved)
+    fn saved_target(&self, extent: vk::Extent2D) -> Option<SavedFrameTarget> {
+        (self.extent == extent).then_some(SavedFrameTarget {
+            image: self.saved,
+            extent,
+            ready: self.saved_ready,
+            wait_ready: self.saved_signal_pending,
+        })
     }
 
     fn matches(&self, swapchain: u64, extent: vk::Extent2D, images: &[u64]) -> bool {
@@ -1122,11 +1405,7 @@ impl WebPresenter {
         if self.frame_key == key && self.frame_rect == rect {
             return true;
         }
-        if unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .is_err()
-        } {
+        if self.fence.retire(&self.device).is_err() {
             return false;
         }
         let row_bytes = rect.extent.width as usize * 4;
@@ -1141,6 +1420,9 @@ impl WebPresenter {
     }
 
     unsafe fn present(&mut self) -> bool {
+        if self.fence.retire(&self.device).is_err() {
+            return false;
+        }
         let mut image_index = 0u32;
         let acquired = unsafe {
             (self.acquire_next_image)(
@@ -1155,24 +1437,98 @@ impl WebPresenter {
         if acquired != vk::Result::SUCCESS && acquired != vk::Result::SUBOPTIMAL_KHR {
             return false;
         }
-        let Some(&image_raw) = self.images.get(image_index as usize) else {
+        let slot = image_index as usize;
+        let (Some(&image_raw), Some(&done), Some(&blank)) = (
+            self.images.get(slot),
+            self.done.get(slot),
+            self.blank_frames.get(slot),
+        ) else {
             return false;
         };
-        let Some(&done) = self.done.get(image_index as usize) else {
+        if !unsafe { self.record_present_copy(vk::Image::from_raw(image_raw)) } {
+            unsafe { self.release_acquired(image_index, done, blank) };
             return false;
-        };
-        let image = vk::Image::from_raw(image_raw);
+        }
+        let waits = [self.acquire, self.saved_ready];
+        let wait_count = if self.saved_signal_pending { 2 } else { 1 };
+        let wait_stages = [vk::PipelineStageFlags::TRANSFER; 2];
+        let cmds = [self.cmd];
+        let signals = [done];
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&waits[..wait_count])
+            .wait_dst_stage_mask(&wait_stages[..wait_count])
+            .command_buffers(&cmds)
+            .signal_semaphores(&signals);
+        if self
+            .fence
+            .submit(&self.device, self.queue, &[submit])
+            .is_err()
+        {
+            unsafe { self.release_acquired(image_index, done, blank) };
+            return false;
+        }
+        self.saved_signal_pending = false;
+        let presented = unsafe { self.present_image(image_index, done) };
+        self.fence.retire(&self.device).is_ok()
+            && (presented == vk::Result::SUCCESS || presented == vk::Result::SUBOPTIMAL_KHR)
+    }
+
+    unsafe fn present_image(&self, image_index: u32, done: vk::Semaphore) -> vk::Result {
+        let waits = [done];
+        let swapchains = [vk::SwapchainKHR::from_raw(self.swapchain)];
+        let indices = [image_index];
+        let present = vk::PresentInfoKHR::default()
+            .wait_semaphores(&waits)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+        unsafe { (self.queue_present)(self.queue, &present) }
+    }
+
+    unsafe fn release_acquired(
+        &mut self,
+        image_index: u32,
+        done: vk::Semaphore,
+        blank: vk::CommandBuffer,
+    ) {
+        let waits = [self.acquire];
+        let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+        let cmds = [blank];
+        let signals = [done];
+        let release = vk::SubmitInfo::default()
+            .wait_semaphores(&waits)
+            .wait_dst_stage_mask(&wait_stages)
+            .command_buffers(&cmds)
+            .signal_semaphores(&signals);
+        if let Err(e) = self.fence.submit(&self.device, self.queue, &[release]) {
+            tracing::error!(
+                error = %e,
+                "vk-overlay: WebView presenter could not release an acquired swapchain image"
+            );
+            return;
+        }
+        let presented = unsafe { self.present_image(image_index, done) };
+        if presented != vk::Result::SUCCESS && presented != vk::Result::SUBOPTIMAL_KHR {
+            tracing::warn!(
+                result = ?presented,
+                "vk-overlay: presenting a released swapchain image failed"
+            );
+        }
+        if let Err(e) = self.fence.retire(&self.device) {
+            tracing::error!(error = %e, "vk-overlay: releasing a swapchain image did not finish");
+        }
+    }
+
+    unsafe fn record_present_copy(&self, image: vk::Image) -> bool {
         let full = vk::Extent3D {
             width: self.extent.width,
             height: self.extent.height,
             depth: 1,
         };
         unsafe {
-            if self.device.reset_fences(&[self.fence]).is_err()
-                || self
-                    .device
-                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                    .is_err()
+            if self
+                .device
+                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                .is_err()
             {
                 return false;
             }
@@ -1286,51 +1642,54 @@ impl WebPresenter {
                 &[],
                 &[to_present],
             );
-            if self.device.end_command_buffer(self.cmd).is_err() {
-                return false;
+            self.device.end_command_buffer(self.cmd).is_ok()
+        }
+    }
+
+    fn consume_saved_signal(&mut self) -> bool {
+        let waits = [self.saved_ready];
+        let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let consume = vk::SubmitInfo::default()
+            .wait_semaphores(&waits)
+            .wait_dst_stage_mask(&wait_stages);
+        match unsafe {
+            self.device
+                .queue_submit(self.queue, &[consume], vk::Fence::null())
+        } {
+            Ok(()) => {
+                self.saved_signal_pending = false;
+                true
             }
-            let waits = [self.acquire];
-            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
-            let cmds = [self.cmd];
-            let signals = [done];
-            let submit = vk::SubmitInfo::default()
-                .wait_semaphores(&waits)
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&cmds)
-                .signal_semaphores(&signals);
-            if self
-                .device
-                .queue_submit(self.queue, &[submit], self.fence)
-                .is_err()
-            {
-                return false;
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "vk-overlay: could not consume the saved-frame semaphore; leaking it"
+                );
+                false
             }
-            let swapchains = [vk::SwapchainKHR::from_raw(self.swapchain)];
-            let indices = [image_index];
-            let present = vk::PresentInfoKHR::default()
-                .wait_semaphores(&signals)
-                .swapchains(&swapchains)
-                .image_indices(&indices);
-            let presented = (self.queue_present)(self.queue, &present);
-            let _ = self.device.wait_for_fences(&[self.fence], true, u64::MAX);
-            presented == vk::Result::SUCCESS || presented == vk::Result::SUBOPTIMAL_KHR
         }
     }
 }
 
 impl Drop for WebPresenter {
     fn drop(&mut self) {
+        let saved_ready_idle = !self.saved_signal_pending || self.consume_saved_signal();
         unsafe {
-            let _ = self.device.device_wait_idle();
+            if let Err(e) = self.device.queue_wait_idle(self.queue) {
+                tracing::warn!(error = %e, "vk-overlay: WebView presenter queue did not drain");
+            }
             for done in self.done.drain(..) {
                 self.device.destroy_semaphore(done, None);
             }
             self.device.destroy_semaphore(self.acquire, None);
+            if saved_ready_idle {
+                self.device.destroy_semaphore(self.saved_ready, None);
+            }
             self.device.destroy_buffer(self.frame, None);
             self.device.free_memory(self.frame_memory, None);
             self.device.destroy_image(self.saved, None);
             self.device.free_memory(self.saved_memory, None);
-            self.device.destroy_fence(self.fence, None);
+            self.fence.destroy(&self.device);
             self.device.destroy_command_pool(self.command_pool, None);
         }
     }
@@ -1341,41 +1700,41 @@ fn ensure_web_presenter() -> bool {
     if queue_index == u32::MAX {
         return false;
     }
-    let (device, swapchain, extent, format, images) = match STATE.lock() {
-        Ok(st) => (
-            st.device,
-            st.swapchain,
-            vk::Extent2D {
-                width: st.width,
-                height: st.height,
-            },
-            vk::Format::from_raw(st.format),
-            st.images.clone(),
-        ),
-        Err(_) => return false,
-    };
-    if device == 0 || swapchain == 0 || images.is_empty() {
-        return false;
-    }
     let Ok(mut slot) = WEB_PRESENTER.lock() else {
         return false;
     };
-    if slot
-        .as_ref()
-        .is_some_and(|p| p.matches(swapchain, extent, &images))
-    {
-        return true;
-    }
+    let (device, swapchain, extent, format, images) = {
+        let Ok(st) = STATE.lock() else {
+            return false;
+        };
+        if st.device == 0 || st.swapchain == 0 || st.images.is_empty() {
+            return false;
+        }
+        let extent = vk::Extent2D {
+            width: st.width,
+            height: st.height,
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|p| p.matches(st.swapchain, extent, &st.images))
+        {
+            return true;
+        }
+        (
+            st.device,
+            st.swapchain,
+            extent,
+            vk::Format::from_raw(st.format),
+            st.images.clone(),
+        )
+    };
     *slot = None;
     let Some(entry) = super::vulkan_wsi::host_entry() else {
         return false;
     };
     match WebPresenter::build(
         entry,
-        INSTANCE.load(Ordering::Relaxed),
-        device,
-        PHYSICAL_DEVICE.load(Ordering::Relaxed),
-        QUEUE_FAMILY.load(Ordering::Relaxed),
+        EngineHandles::current(device),
         queue_index,
         swapchain,
         extent,
@@ -1406,7 +1765,7 @@ fn ensure_web_presenter() -> bool {
     }
 }
 
-fn engine_frame_save_target(extent: vk::Extent2D) -> Option<vk::Image> {
+fn engine_frame_save_target(extent: vk::Extent2D) -> Option<SavedFrameTarget> {
     if !ensure_web_presenter() {
         return None;
     }
@@ -1421,6 +1780,7 @@ fn mark_engine_frame_saved() {
     if let Ok(mut slot) = WEB_PRESENTER.lock() {
         if let Some(p) = slot.as_mut() {
             p.saved_valid = true;
+            p.saved_signal_pending = true;
         }
     }
 }
@@ -1513,6 +1873,9 @@ fn release_overlay_device_resources(device: vk::Device) {
             *slot = None;
         }
     }
+    if let Ok(mut sets) = PRESENT_SEMAPHORES.lock() {
+        sets.retain(|set| set.device.handle() != device);
+    }
 
     let mut state = match STATE.lock() {
         Ok(state) => state,
@@ -1537,50 +1900,207 @@ fn release_overlay_device_resources(device: vk::Device) {
     WEB_COMPOSITE_LAST.store(0, Ordering::Relaxed);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayBatch {
+    NotSubmitted,
+
+    Completed,
+
+    Queued,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentGate {
+    Engine,
+
+    Settled,
+
+    Pending,
+}
+
+impl PresentGate {
+    fn waits(self, engine_waits: &[vk::Semaphore]) -> &[vk::Semaphore] {
+        match self {
+            Self::Engine => engine_waits,
+            Self::Settled | Self::Pending => &[],
+        }
+    }
+
+    fn after(self, batch: OverlayBatch) -> Self {
+        match batch {
+            OverlayBatch::NotSubmitted => self,
+            OverlayBatch::Completed => Self::Settled,
+            OverlayBatch::Queued => Self::Pending,
+        }
+    }
+}
+
+struct PresentSemaphores {
+    device: ash::Device,
+    swapchain: u64,
+    semaphores: Vec<vk::Semaphore>,
+}
+
+impl PresentSemaphores {
+    fn create(device: ash::Device, swapchain: u64, count: usize) -> Option<Self> {
+        let mut set = Self {
+            device,
+            swapchain,
+            semaphores: Vec::with_capacity(count),
+        };
+        for _ in 0..count {
+            let semaphore = unsafe {
+                set.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            }
+            .ok()?;
+            set.semaphores.push(semaphore);
+        }
+        Some(set)
+    }
+
+    fn signal(&self, queue: vk::Queue, image_index: u32) -> Option<vk::Semaphore> {
+        let semaphore = *self.semaphores.get(image_index as usize)?;
+        let signals = [semaphore];
+        let batch = vk::SubmitInfo::default().signal_semaphores(&signals);
+        unsafe { self.device.queue_submit(queue, &[batch], vk::Fence::null()) }.ok()?;
+        Some(semaphore)
+    }
+}
+
+impl Drop for PresentSemaphores {
+    fn drop(&mut self) {
+        for semaphore in self.semaphores.drain(..) {
+            unsafe { self.device.destroy_semaphore(semaphore, None) };
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PresentTarget {
+    device: u64,
+    swapchain: u64,
+    image_index: u32,
+    image_count: usize,
+}
+
+fn engine_device(device_raw: u64) -> Option<ash::Device> {
+    let entry = super::vulkan_wsi::host_entry()?;
+    let instance_raw = INSTANCE.load(Ordering::Relaxed);
+    if instance_raw == 0 || device_raw == 0 {
+        return None;
+    }
+    let instance =
+        unsafe { ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(instance_raw)) };
+    Some(unsafe { ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(device_raw)) })
+}
+
+fn signal_present_semaphore(queue: vk::Queue, target: PresentTarget) -> Option<vk::Semaphore> {
+    let mut sets = PRESENT_SEMAPHORES.lock().ok()?;
+    let index = match sets
+        .iter()
+        .position(|set| set.swapchain == target.swapchain)
+    {
+        Some(index) => index,
+        None => {
+            let device = engine_device(target.device)?;
+            sets.push(PresentSemaphores::create(
+                device,
+                target.swapchain,
+                target.image_count,
+            )?);
+            sets.len() - 1
+        }
+    };
+    sets[index].signal(queue, target.image_index)
+}
+
+unsafe fn present_through_gate(
+    gate: PresentGate,
+    host: vk::PFN_vkQueuePresentKHR,
+    queue: vk::Queue,
+    pi: &vk::PresentInfoKHR<'_>,
+    target: PresentTarget,
+) -> vk::Result {
+    let mut info = *pi;
+    match gate {
+        PresentGate::Engine => return unsafe { host(queue, pi) },
+        PresentGate::Settled => {
+            info.wait_semaphore_count = 0;
+            info.p_wait_semaphores = std::ptr::null();
+        }
+        PresentGate::Pending => {
+            let ready = signal_present_semaphore(queue, target);
+            if let Some(ready) = ready.as_ref() {
+                info.wait_semaphore_count = 1;
+                info.p_wait_semaphores = ready;
+                return unsafe { host(queue, &info) };
+            }
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "vk-overlay: could not signal the present semaphore; waiting for the queue \
+                     on the CPU instead"
+                );
+            }
+            if let Some(device) = engine_device(target.device) {
+                if let Err(e) = unsafe { device.queue_wait_idle(queue) } {
+                    tracing::error!(
+                        error = %e,
+                        "vk-overlay: vkQueueWaitIdle before present failed"
+                    );
+                }
+            }
+            info.wait_semaphore_count = 0;
+            info.p_wait_semaphores = std::ptr::null();
+        }
+    }
+    unsafe { host(queue, &info) }
+}
+
+struct WebFrameSource<'a> {
+    bytes: &'a [u8],
+    stride: usize,
+    swizzle: bool,
+    refresh: bool,
+}
+
 struct Probe {
     device: ash::Device,
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+    fence: FrameFence,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     rect: vk::Rect2D,
+    waits: Vec<vk::Semaphore>,
+    wait_stages: Vec<vk::PipelineStageFlags>,
 }
 
 unsafe impl Send for Probe {}
 
 impl Probe {
-    fn build(
-        entry: &ash::Entry,
-        instance_raw: u64,
-        device_raw: u64,
-        physical_raw: u64,
-        queue_family: u32,
-        rect: vk::Rect2D,
-    ) -> Option<Probe> {
-        if instance_raw == 0
-            || device_raw == 0
-            || physical_raw == 0
-            || queue_family == u32::MAX
-            || rect.extent.width == 0
-            || rect.extent.height == 0
-        {
+    fn build(entry: &ash::Entry, engine: EngineHandles, rect: vk::Rect2D) -> Option<Probe> {
+        if !engine.complete() || rect.extent.width == 0 || rect.extent.height == 0 {
             return None;
         }
 
-        let instance =
-            unsafe { ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(instance_raw)) };
+        let instance = unsafe {
+            ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(engine.instance))
+        };
         let device =
-            unsafe { ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(device_raw)) };
+            unsafe { ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(engine.device)) };
 
         let mem_props = unsafe {
-            instance
-                .get_physical_device_memory_properties(vk::PhysicalDevice::from_raw(physical_raw))
+            instance.get_physical_device_memory_properties(vk::PhysicalDevice::from_raw(
+                engine.physical_device,
+            ))
         };
         let pool_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(queue_family);
+            .queue_family_index(engine.queue_family);
 
         let command_pool = unsafe { device.create_command_pool(&pool_info, None) }.ok()?;
         let cleanup_pool = |device: &ash::Device| {
@@ -1602,12 +2122,7 @@ impl Probe {
             }
         };
 
-        let fence = match unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-        } {
+        let fence = match FrameFence::new(&device) {
             Ok(f) => f,
             Err(_) => {
                 cleanup_pool(&device);
@@ -1623,7 +2138,7 @@ impl Probe {
         let buffer = match unsafe { device.create_buffer(&buf_info, None) } {
             Ok(b) => b,
             Err(_) => {
-                unsafe { device.destroy_fence(fence, None) };
+                unsafe { fence.destroy(&device) };
                 cleanup_pool(&device);
                 return None;
             }
@@ -1633,7 +2148,7 @@ impl Probe {
         let cleanup_buf = |device: &ash::Device| {
             unsafe {
                 device.destroy_buffer(buffer, None);
-                device.destroy_fence(fence, None);
+                fence.destroy(device);
             }
             cleanup_pool(device);
         };
@@ -1677,17 +2192,28 @@ impl Probe {
             memory,
             mapped,
             rect,
+            waits: Vec::new(),
+            wait_stages: Vec::new(),
         })
     }
 
+    fn gather_waits(&mut self, engine_waits: &[vk::Semaphore], extra: Option<vk::Semaphore>) {
+        self.waits.clear();
+        self.waits.extend_from_slice(engine_waits);
+        self.waits.extend(extra);
+        self.wait_stages.clear();
+        self.wait_stages
+            .resize(self.waits.len(), vk::PipelineStageFlags::TRANSFER);
+    }
+
     unsafe fn capture(
-        &self,
+        &mut self,
         queue: vk::Queue,
         image_raw: u64,
         engine_waits: &[vk::Semaphore],
-        draw_text: Option<&crate::framework::ActiveTextOverlay>,
+        text: Option<(&TextLayer, [u8; 4], &AtomicU64)>,
         write_probe: bool,
-    ) -> bool {
+    ) -> OverlayBatch {
         let image = vk::Image::from_raw(image_raw);
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1695,22 +2221,18 @@ impl Probe {
             .layer_count(1);
 
         unsafe {
-            if self
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .is_err()
-                || self.device.reset_fences(&[self.fence]).is_err()
+            if self.fence.retire(&self.device).is_err()
                 || self
                     .device
                     .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
                     .is_err()
             {
-                return false;
+                return OverlayBatch::NotSubmitted;
             }
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
-                return false;
+                return OverlayBatch::NotSubmitted;
             }
             let to_src = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
@@ -1772,41 +2294,33 @@ impl Probe {
                 &[to_present],
             );
             if self.device.end_command_buffer(self.cmd).is_err() {
-                return false;
+                return OverlayBatch::NotSubmitted;
             }
-            let wait_stages = vec![vk::PipelineStageFlags::TRANSFER; engine_waits.len()];
+            self.gather_waits(engine_waits, None);
             let cmds = [self.cmd];
             let submit = vk::SubmitInfo::default()
-                .wait_semaphores(engine_waits)
-                .wait_dst_stage_mask(&wait_stages)
+                .wait_semaphores(&self.waits)
+                .wait_dst_stage_mask(&self.wait_stages)
                 .command_buffers(&cmds);
-            if self
-                .device
-                .queue_submit(queue, &[submit], self.fence)
-                .is_err()
-            {
-                return false;
+            if self.fence.submit(&self.device, queue, &[submit]).is_err() {
+                return OverlayBatch::NotSubmitted;
             }
-            if self
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .is_err()
-            {
-                return false;
+            if self.fence.retire(&self.device).is_err() {
+                return OverlayBatch::Queued;
             }
 
-            if let Some(text) = draw_text {
+            let mut batch = OverlayBatch::Completed;
+            if let Some((layer, color, blink)) = text {
                 {
                     let size =
                         (self.rect.extent.width as usize) * (self.rect.extent.height as usize) * 4;
                     let buf = std::slice::from_raw_parts_mut(self.mapped, size);
-                    draw_text_onto_rgba(buf, self.rect.extent.width, self.rect.extent.height, text);
+                    layer.apply(buf, color, blink);
                 }
-                let recorded = self.device.reset_fences(&[self.fence]).is_ok()
-                    && self
-                        .device
-                        .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                        .is_ok()
+                let recorded = self
+                    .device
+                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                    .is_ok()
                     && self.device.begin_command_buffer(self.cmd, &begin).is_ok();
                 if recorded {
                     let to_dst = vk::ImageMemoryBarrier::default()
@@ -1856,8 +2370,9 @@ impl Probe {
                     if self.device.end_command_buffer(self.cmd).is_ok() {
                         let cmds2 = [self.cmd];
                         let submit2 = vk::SubmitInfo::default().command_buffers(&cmds2);
-                        let _ = self.device.queue_submit(queue, &[submit2], self.fence);
-                        let _ = self.device.wait_for_fences(&[self.fence], true, u64::MAX);
+                        if self.fence.submit(&self.device, queue, &[submit2]).is_ok() {
+                            batch = OverlayBatch::Queued;
+                        }
                     }
                 }
             }
@@ -1908,22 +2423,18 @@ impl Probe {
                     tracing::info!(total_ink, "vk-overlay field-probe ink |{spark}|");
                 }
             }
+            batch
         }
-        true
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn upload_bgra(
-        &self,
+        &mut self,
         queue: vk::Queue,
         image_raw: u64,
         engine_waits: &[vk::Semaphore],
-        src: &[u8],
-        src_stride: usize,
-        swizzle: bool,
-        refresh: bool,
-        save_into: Option<(vk::Image, vk::Extent2D)>,
-    ) -> bool {
+        source: &WebFrameSource<'_>,
+        save_into: Option<SavedFrameTarget>,
+    ) -> OverlayBatch {
         let image = vk::Image::from_raw(image_raw);
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1931,30 +2442,34 @@ impl Probe {
             .layer_count(1);
 
         unsafe {
-            if self
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .is_err()
-                || self.device.reset_fences(&[self.fence]).is_err()
+            if self.fence.retire(&self.device).is_err()
                 || self
                     .device
                     .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
                     .is_err()
             {
-                return false;
+                return OverlayBatch::NotSubmitted;
             }
-            if refresh {
+            if source.refresh {
                 let w = self.rect.extent.width as usize;
                 let h = self.rect.extent.height as usize;
                 let dst = std::slice::from_raw_parts_mut(self.mapped, w * h * 4);
-                if !bgra_rows_into(dst, w * 4, src, src_stride, h, w * 4, swizzle) {
-                    return false;
+                if !bgra_rows_into(
+                    dst,
+                    w * 4,
+                    source.bytes,
+                    source.stride,
+                    h,
+                    w * 4,
+                    source.swizzle,
+                ) {
+                    return OverlayBatch::NotSubmitted;
                 }
             }
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             if self.device.begin_command_buffer(self.cmd, &begin).is_err() {
-                return false;
+                return OverlayBatch::NotSubmitted;
             }
             let to_dst = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
@@ -1998,8 +2513,8 @@ impl Probe {
                 &[region],
             );
             let mut presented_from = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
-            if let Some((saved, extent)) = save_into {
-                record_save_engine_frame(&self.device, self.cmd, image, saved, extent);
+            if let Some(save) = save_into {
+                record_save_engine_frame(&self.device, self.cmd, image, save.image, save.extent);
                 presented_from = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
             }
             let back = vk::ImageMemoryBarrier::default()
@@ -2021,40 +2536,41 @@ impl Probe {
                 &[back],
             );
             if self.device.end_command_buffer(self.cmd).is_err() {
-                return false;
+                return OverlayBatch::NotSubmitted;
             }
-            let wait_stages = vec![vk::PipelineStageFlags::TRANSFER; engine_waits.len()];
+            self.gather_waits(
+                engine_waits,
+                save_into
+                    .filter(|save| save.wait_ready)
+                    .map(|save| save.ready),
+            );
             let cmds = [self.cmd];
+            let signals: &[vk::Semaphore] = match &save_into {
+                Some(save) => std::slice::from_ref(&save.ready),
+                None => &[],
+            };
             let submit = vk::SubmitInfo::default()
-                .wait_semaphores(engine_waits)
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&cmds);
-            if self
-                .device
-                .queue_submit(queue, &[submit], self.fence)
-                .is_err()
-            {
-                return false;
-            }
-            if self
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .is_err()
-            {
-                return false;
+                .wait_semaphores(&self.waits)
+                .wait_dst_stage_mask(&self.wait_stages)
+                .command_buffers(&cmds)
+                .signal_semaphores(signals);
+            match self.fence.submit(&self.device, queue, &[submit]) {
+                Ok(()) => OverlayBatch::Queued,
+                Err(_) => OverlayBatch::NotSubmitted,
             }
         }
-        true
     }
 }
 
 impl Drop for Probe {
     fn drop(&mut self) {
+        if let Err(e) = self.fence.retire(&self.device) {
+            tracing::warn!(error = %e, "vk-overlay: overlay work did not finish before teardown");
+        }
         unsafe {
-            let _ = self.device.device_wait_idle();
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.memory, None);
-            self.device.destroy_fence(self.fence, None);
+            self.fence.destroy(&self.device);
             self.device.destroy_command_pool(self.command_pool, None);
         }
     }
@@ -2081,14 +2597,7 @@ fn ensure_probe_in(slot: &'static Mutex<Option<Probe>>, rect: vk::Rect2D) -> boo
     };
 
     *guard = None;
-    if let Some(p) = Probe::build(
-        entry,
-        INSTANCE.load(Ordering::Relaxed),
-        device,
-        PHYSICAL_DEVICE.load(Ordering::Relaxed),
-        QUEUE_FAMILY.load(Ordering::Relaxed),
-        rect,
-    ) {
+    if let Some(p) = Probe::build(entry, EngineHandles::current(device), rect) {
         tracing::info!(
             x = rect.offset.x,
             y = rect.offset.y,
@@ -2164,16 +2673,10 @@ fn bgra_rows_into(
     true
 }
 
-#[allow(clippy::too_many_arguments)]
 fn clamp_webview_rect(
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    extent_w: u32,
-    extent_h: u32,
-    stage_w: u32,
-    stage_h: u32,
+    (x, y, w, h): (i32, i32, u32, u32),
+    (extent_w, extent_h): (u32, u32),
+    (stage_w, stage_h): (u32, u32),
 ) -> Option<(u32, u32, u32, u32)> {
     if extent_w == 0 || extent_h == 0 || stage_w == 0 || stage_h == 0 || w == 0 || h == 0 {
         return None;
@@ -2211,7 +2714,7 @@ pub(crate) fn resolve_webview_rect(
             )
         }
     };
-    clamp_webview_rect(x, y, w, h, extent_w, extent_h, stage_w, stage_h)
+    clamp_webview_rect((x, y, w, h), (extent_w, extent_h), (stage_w, stage_h))
 }
 
 fn composite_webview_frame(
@@ -2221,7 +2724,7 @@ fn composite_webview_frame(
     extent: vk::Extent2D,
     format_raw: i32,
     engine_waits: &[vk::Semaphore],
-) -> bool {
+) -> OverlayBatch {
     let swizzle = match classify_swapchain_format(format_raw) {
         CompositeFormat::Bgra => false,
         CompositeFormat::RgbaSwizzle => true,
@@ -2235,13 +2738,13 @@ fn composite_webview_frame(
                      (expected B8G8R8A8/R8G8B8A8 UNORM/SRGB)"
                 );
             }
-            return false;
+            return OverlayBatch::NotSubmitted;
         }
     };
 
-    let (consumed, drawn) = crate::webview::client::with_latest_frame(view, |stage| {
+    let (batch, drawn) = crate::webview::client::with_latest_frame(view, |stage| {
         if stage.bytes.is_empty() {
-            return (false, None);
+            return (OverlayBatch::NotSubmitted, None);
         }
         let Some((cx, cy, cw, ch)) = resolve_webview_rect(
             crate::webview::client::composited_rect(),
@@ -2250,7 +2753,7 @@ fn composite_webview_frame(
             stage.width,
             stage.height,
         ) else {
-            return (false, None);
+            return (OverlayBatch::NotSubmitted, None);
         };
         let rect = vk::Rect2D {
             offset: vk::Offset2D {
@@ -2264,41 +2767,117 @@ fn composite_webview_frame(
         };
         let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect);
         let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
-        let refresh = rebuilt || WEB_COMPOSITE_LAST.load(Ordering::Relaxed) != key;
-        let save_into = engine_frame_save_target(extent).map(|saved| (saved, extent));
-        let consumed = match WEB_COMPOSITE.lock() {
-            Ok(guard) => match guard.as_ref() {
-                Some(p) => unsafe {
-                    p.upload_bgra(
-                        queue,
-                        image_raw,
-                        engine_waits,
-                        stage.bytes,
-                        stage.stride as usize,
-                        swizzle,
-                        refresh,
-                        save_into,
-                    )
-                },
-                None => false,
-            },
-            Err(_) => false,
+        let source = WebFrameSource {
+            bytes: stage.bytes,
+            stride: stage.stride as usize,
+            swizzle,
+            refresh: rebuilt || WEB_COMPOSITE_LAST.load(Ordering::Relaxed) != key,
         };
+        let save_into = engine_frame_save_target(extent);
+        let batch = match WEB_COMPOSITE.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(p) => unsafe {
+                    p.upload_bgra(queue, image_raw, engine_waits, &source, save_into)
+                },
+                None => OverlayBatch::NotSubmitted,
+            },
+            Err(_) => OverlayBatch::NotSubmitted,
+        };
+        let consumed = batch != OverlayBatch::NotSubmitted;
         if consumed && save_into.is_some() {
             mark_engine_frame_saved();
         }
-        if consumed && refresh {
+        if consumed && source.refresh {
             WEB_COMPOSITE_LAST.store(key, Ordering::Relaxed);
         }
 
-        (consumed, consumed.then_some((cx as i32, cy as i32, cw, ch)))
+        (batch, consumed.then_some((cx as i32, cy as i32, cw, ch)))
     })
-    .unwrap_or((false, None));
+    .unwrap_or((OverlayBatch::NotSubmitted, None));
 
     if let Some(rect) = drawn {
         crate::webview::client::publish_composited_screen_rect(view, rect);
     }
-    consumed
+    batch
+}
+
+fn text_test_overlay(extent: vk::Extent2D) -> Option<crate::framework::ActiveTextOverlay> {
+    static TEXT: OnceLock<Option<String>> = OnceLock::new();
+    let text = TEXT
+        .get_or_init(|| std::env::var("ECLIPSE_VK_TEXT_TEST").ok())
+        .as_ref()?;
+    let rect = login_field_rect(extent);
+    Some(crate::framework::ActiveTextOverlay {
+        text: text.clone(),
+        geometry: (
+            rect.offset.x,
+            rect.offset.y,
+            rect.extent.width,
+            rect.extent.height,
+        ),
+        input_type: 0,
+        font_size: 25.0,
+        multiline: false,
+        text_wrapped: false,
+        text_color: -1,
+        x_alignment: 0,
+        y_alignment: 1,
+    })
+}
+
+struct TextPlan {
+    overlay: Option<crate::framework::ActiveTextOverlay>,
+    rect: vk::Rect2D,
+}
+
+fn text_plan(extent: vk::Extent2D, image_raw: u64) -> Option<TextPlan> {
+    if image_raw == 0 || !(probe_enabled() || overlay_enabled()) {
+        return None;
+    }
+    let live = if overlay_enabled() {
+        crate::framework::active_text_overlay().filter(|overlay| !overlay.text.is_empty())
+    } else {
+        None
+    };
+    let overlay = live.or_else(|| text_test_overlay(extent));
+    if overlay.is_none() && !probe_enabled() {
+        return None;
+    }
+    let geometry = match &overlay {
+        Some(overlay) => Some(overlay.geometry),
+        None => crate::framework::textbox_geometry(),
+    };
+    let rect = select_text_probe_rect(
+        geometry,
+        extent,
+        overlay.is_some(),
+        probe_enabled(),
+        screenshot_enabled(),
+    )?;
+    Some(TextPlan { overlay, rect })
+}
+
+fn capture_text_field(
+    queue: vk::Queue,
+    image_raw: u64,
+    engine_waits: &[vk::Semaphore],
+    overlay: Option<&crate::framework::ActiveTextOverlay>,
+) -> OverlayBatch {
+    let Ok(mut guard) = PROBE.lock() else {
+        return OverlayBatch::NotSubmitted;
+    };
+    let Some(probe) = guard.as_mut() else {
+        return OverlayBatch::NotSubmitted;
+    };
+    let (width, height) = (probe.rect.extent.width, probe.rect.extent.height);
+    TEXT_LAYERS.with_borrow_mut(|layers| {
+        let text = overlay.and_then(|overlay| {
+            layers
+                .layer(overlay, width, height)
+                .map(|layer| (layer, overlay_text_color(overlay.text_color), &CARET_BLINK))
+        });
+        unsafe { probe.capture(queue, image_raw, engine_waits, text, probe_enabled()) }
+    })
 }
 
 unsafe fn present_with_overlay(
@@ -2329,7 +2908,7 @@ unsafe fn present_with_overlay(
         return unsafe { host(queue, p_present_info) };
     };
 
-    let (extent, image_raw, format_raw) = match STATE.lock() {
+    let (extent, image_raw, format_raw, device_raw, image_count) = match STATE.lock() {
         Ok(st) => (
             vk::Extent2D {
                 width: st.width,
@@ -2337,8 +2916,10 @@ unsafe fn present_with_overlay(
             },
             st.images.get(image_index as usize).copied().unwrap_or(0),
             st.format,
+            st.device,
+            st.images.len(),
         ),
-        Err(_) => (vk::Extent2D::default(), 0, 0),
+        Err(_) => (vk::Extent2D::default(), 0, 0, 0, 0),
     };
     let engine_waits: &[vk::Semaphore] =
         if pi.wait_semaphore_count > 0 && !pi.p_wait_semaphores.is_null() {
@@ -2349,107 +2930,39 @@ unsafe fn present_with_overlay(
             &[]
         };
 
-    let mut waits_consumed = false;
+    let mut gate = PresentGate::Engine;
 
     if webview_live && image_raw != 0 {
         let view = crate::webview::client::active_view();
-        if view != 0
-            && composite_webview_frame(queue, view, image_raw, extent, format_raw, engine_waits)
-        {
-            waits_consumed = true;
+        if view != 0 {
+            gate = gate.after(composite_webview_frame(
+                queue,
+                view,
+                image_raw,
+                extent,
+                format_raw,
+                gate.waits(engine_waits),
+            ));
         }
     }
 
-    if probe_enabled() || overlay_enabled() {
-        let live = if overlay_enabled() {
-            crate::framework::active_text_overlay().filter(|overlay| !overlay.text.is_empty())
-        } else {
-            None
-        };
-        let text_test = live
-            .is_none()
-            .then(|| std::env::var("ECLIPSE_VK_TEXT_TEST").ok())
-            .flatten();
-        let (draw_text, geometry) = if let Some(mut overlay) = live {
-            overlay.text = mask_overlay_text(overlay.text, overlay.input_type);
-            let geometry = overlay.geometry;
-            (Some(overlay), Some(geometry))
-        } else if let Some(text) = text_test {
-            let rect = login_field_rect(extent);
-            (
-                Some(crate::framework::ActiveTextOverlay {
-                    text,
-                    geometry: (
-                        rect.offset.x,
-                        rect.offset.y,
-                        rect.extent.width,
-                        rect.extent.height,
-                    ),
-                    input_type: 0,
-                    font_size: 25.0,
-                    multiline: false,
-                    text_wrapped: false,
-                    text_color: -1,
-                    x_alignment: 0,
-                    y_alignment: 1,
-                }),
-                Some((
-                    rect.offset.x,
-                    rect.offset.y,
-                    rect.extent.width,
-                    rect.extent.height,
-                )),
-            )
-        } else {
-            (None, crate::framework::textbox_geometry())
-        };
-
-        let run = image_raw != 0 && (draw_text.is_some() || probe_enabled());
-        if let Some(rect) = run
-            .then(|| {
-                select_text_probe_rect(
-                    geometry,
-                    extent,
-                    draw_text.is_some(),
-                    probe_enabled(),
-                    screenshot_enabled(),
-                )
-            })
-            .flatten()
-        {
-            ensure_probe(rect);
-
-            let field_waits: &[vk::Semaphore] = if waits_consumed { &[] } else { engine_waits };
-            let consumed = match PROBE.lock() {
-                Ok(guard) => match guard.as_ref() {
-                    Some(p) => unsafe {
-                        p.capture(
-                            queue,
-                            image_raw,
-                            field_waits,
-                            draw_text.as_ref(),
-                            probe_enabled(),
-                        )
-                    },
-                    None => false,
-                },
-                Err(_) => false,
-            };
-            if consumed {
-                waits_consumed = true;
-            }
-        }
+    if let Some(plan) = text_plan(extent, image_raw) {
+        ensure_probe(plan.rect);
+        gate = gate.after(capture_text_field(
+            queue,
+            image_raw,
+            gate.waits(engine_waits),
+            plan.overlay.as_ref(),
+        ));
     }
 
-    if waits_consumed {
-        let mut info = *pi;
-        info.wait_semaphore_count = 0;
-        info.p_wait_semaphores = std::ptr::null();
-
-        return unsafe { host(queue, &info) };
-    }
-
-    unsafe { host(queue, p_present_info) }
+    let target = PresentTarget {
+        device: device_raw,
+        swapchain: our_sc,
+        image_index,
+        image_count,
+    };
+    unsafe { present_through_gate(gate, host, queue, pi, target) }
 }
 
 unsafe extern "system" fn eclipse_vk_queue_present_khr(
@@ -2515,11 +3028,13 @@ mod tests {
 
     #[test]
     fn bgra_rows_into_copies_and_swizzles_rows() {
-        #[rustfmt::skip]
-        let src: Vec<u8> = vec![
-             1, 2, 3, 4,  5, 6, 7, 8,  0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
-             9, 10, 11, 12,  13, 14, 15, 16,  0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
-        ];
+        let src: Vec<u8> = [
+            [1, 2, 3, 4, 5, 6, 7, 8].as_slice(),
+            &[0xAA; 8],
+            &[9, 10, 11, 12, 13, 14, 15, 16],
+            &[0xBB; 8],
+        ]
+        .concat();
 
         let mut dst = vec![0u8; 16];
         assert!(bgra_rows_into(&mut dst, 8, &src, 16, 2, 8, false));
@@ -2570,29 +3085,38 @@ mod tests {
     #[test]
     fn clamp_webview_rect_crops_top_left_to_surface_and_stage() {
         assert_eq!(
-            clamp_webview_rect(10, 20, 300, 200, 800, 600, 1024, 768),
+            clamp_webview_rect((10, 20, 300, 200), (800, 600), (1024, 768)),
             Some((10, 20, 300, 200))
         );
 
         assert_eq!(
-            clamp_webview_rect(10, 20, 300, 200, 800, 600, 128, 64),
+            clamp_webview_rect((10, 20, 300, 200), (800, 600), (128, 64)),
             Some((10, 20, 128, 64))
         );
 
         assert_eq!(
-            clamp_webview_rect(700, 500, 300, 200, 800, 600, 1024, 768),
+            clamp_webview_rect((700, 500, 300, 200), (800, 600), (1024, 768)),
             Some((700, 500, 100, 100))
         );
 
         assert_eq!(
-            clamp_webview_rect(-5, -7, 300, 200, 800, 600, 1024, 768),
+            clamp_webview_rect((-5, -7, 300, 200), (800, 600), (1024, 768)),
             Some((0, 0, 300, 200))
         );
 
-        assert_eq!(clamp_webview_rect(900, 0, 10, 10, 800, 600, 64, 64), None);
-        assert_eq!(clamp_webview_rect(0, 0, 0, 10, 800, 600, 64, 64), None);
-        assert_eq!(clamp_webview_rect(0, 0, 10, 10, 800, 600, 0, 64), None);
-        assert_eq!(clamp_webview_rect(0, 0, 10, 10, 0, 0, 64, 64), None);
+        assert_eq!(
+            clamp_webview_rect((900, 0, 10, 10), (800, 600), (64, 64)),
+            None
+        );
+        assert_eq!(
+            clamp_webview_rect((0, 0, 0, 10), (800, 600), (64, 64)),
+            None
+        );
+        assert_eq!(
+            clamp_webview_rect((0, 0, 10, 10), (800, 600), (0, 64)),
+            None
+        );
+        assert_eq!(clamp_webview_rect((0, 0, 10, 10), (0, 0), (64, 64)), None);
     }
 
     #[test]
@@ -2703,17 +3227,798 @@ mod tests {
         );
     }
 
+    fn text_overlay(text: &str, input_type: i32) -> crate::framework::ActiveTextOverlay {
+        crate::framework::ActiveTextOverlay {
+            text: text.to_string(),
+            geometry: (0, 0, 240, 46),
+            input_type,
+            font_size: 25.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 1,
+        }
+    }
+
+    fn masked(text: &str, input_type: i32) -> String {
+        OverlayText::of(&text_overlay(text, input_type))
+            .rendered()
+            .into_owned()
+    }
+
     #[test]
     fn overlay_text_masks_secure_and_unknown_input_types() {
         for plain in [0, 1, 2, 3, 4, 7, 8] {
-            assert_eq!(mask_overlay_text("Ab1!".to_string(), plain), "Ab1!");
+            assert_eq!(masked("Ab1!", plain), "Ab1!");
         }
         for secure in [5, 6, 9, 10] {
-            assert_eq!(mask_overlay_text("Ab1!".to_string(), secure), "••••");
+            assert_eq!(masked("Ab1!", secure), "••••");
+            assert_eq!(
+                OverlayText::of(&text_overlay("Ab1!", secure)),
+                OverlayText::Masked { chars: 4 },
+                "a secure field's cached layout keeps only its length"
+            );
         }
-        assert_eq!(mask_overlay_text("Ab1!".to_string(), 11), "••••");
-        assert_eq!(mask_overlay_text("Ab1!".to_string(), i32::MIN), "••••");
-        assert_eq!(mask_overlay_text(String::new(), i32::MIN), "");
+        assert_eq!(masked("Ab1!", 11), "••••");
+        assert_eq!(masked("Ab1!", i32::MIN), "••••");
+        assert_eq!(masked("", i32::MIN), "");
+    }
+
+    fn system_font() -> Option<&'static RasterFont> {
+        let font = overlay_font();
+        if font.is_none() {
+            eprintln!("SKIP: no system font discovered for the text overlay");
+        }
+        font
+    }
+
+    fn text_cases() -> Vec<crate::framework::ActiveTextOverlay> {
+        let mut multiline = text_overlay(
+            "The quick brown fox jumps over the lazy dog and keeps running",
+            0,
+        );
+        multiline.multiline = true;
+        multiline.text_wrapped = true;
+        let mut right = text_overlay("right 7", 0);
+        right.x_alignment = 1;
+        right.y_alignment = 2;
+        let mut centered = text_overlay("centered and far too long to fit on one line", 0);
+        centered.x_alignment = 2;
+        centered.y_alignment = 0;
+        let mut lines = text_overlay("first\nsecond\n", 0);
+        lines.multiline = true;
+        let mut tinted = text_overlay("Tinted 42", 1);
+        tinted.text_color = 0x80FF_4020u32 as i32;
+        tinted.font_size = 18.5;
+        vec![
+            text_overlay("Hello, Eclipse 42", 0),
+            text_overlay("hunter2", 6),
+            multiline,
+            right,
+            centered,
+            lines,
+            tinted,
+        ]
+    }
+
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 37 % 251) as u8).collect()
+    }
+
+    #[test]
+    fn cached_text_layers_replay_the_direct_blend_bit_for_bit() {
+        let Some(font) = system_font() else {
+            return;
+        };
+        let (width, height) = (220u32, 96u32);
+        let mut layers = TextLayerCache::default();
+        for overlay in text_cases() {
+            let color = overlay_text_color(overlay.text_color);
+            let layout = TextLayout::of(&overlay, width, height);
+            let reference_blink = AtomicU64::new(0);
+            let cached_blink = AtomicU64::new(0);
+            for frame in 0..40 {
+                let background = patterned(layout.buffer_len());
+
+                let mut expected = background.clone();
+                let mut fresh = font.scaled(layout.scale).expect("scaled font");
+                let caret = lay_out_text(
+                    &mut fresh,
+                    &OverlayText::of(&overlay).rendered(),
+                    &layout,
+                    |index, coverage| blend_text_pixel(&mut expected, index, color, coverage),
+                );
+                if let Some(position) = caret {
+                    if (reference_blink.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
+                        paint_caret(position, &layout, |index| {
+                            blend_text_pixel(&mut expected, index, color, 1.0)
+                        });
+                    }
+                }
+
+                let mut actual = background.clone();
+                layers
+                    .layer(&overlay, width, height)
+                    .expect("text layer")
+                    .apply(&mut actual, color, &cached_blink);
+
+                assert_ne!(expected, background, "{:?} draws nothing", overlay.text);
+                assert!(
+                    actual == expected,
+                    "{:?} frame {frame} differs from the direct blend",
+                    overlay.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_layer_cache_rebuilds_only_when_the_layout_or_text_changes() {
+        if system_font().is_none() {
+            return;
+        }
+        let mut layers = TextLayerCache::default();
+        let overlay = text_overlay("steady", 0);
+        let first = layers
+            .layer(&overlay, 200, 40)
+            .expect("layer")
+            .glyphs
+            .as_ptr();
+
+        let mut recoloured = text_overlay("steady", 0);
+        recoloured.text_color = 0xFF00_FF00u32 as i32;
+        let second = layers
+            .layer(&recoloured, 200, 40)
+            .expect("layer")
+            .glyphs
+            .as_ptr();
+        assert_eq!(first, second, "a colour change reuses the cached layout");
+
+        let edited = text_overlay("steady!", 0);
+        let edited_layer = layers.layer(&edited, 200, 40).expect("layer");
+        assert_eq!(edited_layer.text, OverlayText::Plain("steady!".to_string()));
+
+        let resized = layers.layer(&edited, 180, 40).expect("layer");
+        assert_eq!(resized.layout.width, 180);
+
+        let secret = layers
+            .layer(&text_overlay("abc", 6), 180, 40)
+            .expect("layer");
+        let secret_ops = secret.glyphs.clone();
+        let other_secret = layers
+            .layer(&text_overlay("xyz", 6), 180, 40)
+            .expect("layer");
+        assert_eq!(
+            other_secret.glyphs, secret_ops,
+            "masked text of the same length renders the same bullets"
+        );
+    }
+
+    #[test]
+    fn caret_blinks_every_thirty_frames_after_complete_text() {
+        if system_font().is_none() {
+            return;
+        }
+        let mut layers = TextLayerCache::default();
+        let layer = layers
+            .layer(&text_overlay("abc", 0), 200, 40)
+            .expect("layer");
+        assert!(layer.caret.as_ref().is_some_and(|c| !c.is_empty()));
+        let color = [255, 255, 255, 255];
+        let blink = AtomicU64::new(0);
+        let still = AtomicU64::new(30);
+        let mut hidden = patterned(layer.layout.buffer_len());
+        layer.apply(&mut hidden, color, &still);
+        for frame in 0..60u64 {
+            let mut buf = patterned(layer.layout.buffer_len());
+            layer.apply(&mut buf, color, &blink);
+            assert_eq!(
+                buf != hidden,
+                frame < 30,
+                "caret visibility at frame {frame}"
+            );
+        }
+    }
+
+    static HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static STUB_DESTROYED: AtomicU64 = AtomicU64::new(0);
+    static STUB_SAW_SWAPCHAIN_LOCK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "system" fn stub_function() {}
+
+    unsafe extern "system" fn stub_get_device_proc_addr(
+        _device: vk::Device,
+        _name: *const c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        Some(stub_function)
+    }
+
+    unsafe extern "system" fn stub_destroy_swapchain(
+        _device: vk::Device,
+        swapchain: vk::SwapchainKHR,
+        _allocator: *const vk::AllocationCallbacks<'_>,
+    ) {
+        STUB_DESTROYED.store(swapchain.as_raw(), Ordering::SeqCst);
+        STUB_SAW_SWAPCHAIN_LOCK.store(SWAPCHAIN_LOCK.try_lock().is_err(), Ordering::SeqCst);
+    }
+
+    unsafe extern "system" fn stub_create_swapchain(
+        _device: vk::Device,
+        _info: *const vk::SwapchainCreateInfoKHR<'_>,
+        _allocator: *const vk::AllocationCallbacks<'_>,
+        swapchain: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        STUB_SAW_SWAPCHAIN_LOCK.store(SWAPCHAIN_LOCK.try_lock().is_err(), Ordering::SeqCst);
+        unsafe { *swapchain = vk::SwapchainKHR::from_raw(0xB) };
+        vk::Result::SUCCESS
+    }
+
+    fn set_state(swapchain: u64, images: Vec<u64>) {
+        let mut st = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.swapchain = swapchain;
+        st.images = images;
+    }
+
+    fn state_swapchain() -> (u64, usize) {
+        let st = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (st.swapchain, st.images.len())
+    }
+
+    #[test]
+    fn device_proc_addr_interposes_swapchain_destruction() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = HOST_GDPA.swap(
+            stub_get_device_proc_addr as *const () as u64,
+            Ordering::SeqCst,
+        );
+        let saved_destroy = HOST_DESTROY_SWAPCHAIN.load(Ordering::SeqCst);
+        let hooked = unsafe {
+            eclipse_vk_get_device_proc_addr(vk::Device::null(), c"vkDestroySwapchainKHR".as_ptr())
+        };
+        let host = HOST_DESTROY_SWAPCHAIN.swap(saved_destroy, Ordering::SeqCst);
+        HOST_GDPA.store(saved, Ordering::SeqCst);
+
+        assert_eq!(
+            hooked.map(|f| f as usize),
+            Some(eclipse_vk_destroy_swapchain_khr as *const () as usize)
+        );
+        assert_eq!(host, stub_function as *const () as u64);
+    }
+
+    #[test]
+    fn destroying_the_tracked_swapchain_forgets_it_under_the_swapchain_lock() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = HOST_DESTROY_SWAPCHAIN
+            .swap(stub_destroy_swapchain as *const () as u64, Ordering::SeqCst);
+        set_state(0xA, vec![1, 2, 3]);
+        STUB_SAW_SWAPCHAIN_LOCK.store(false, Ordering::SeqCst);
+
+        unsafe {
+            eclipse_vk_destroy_swapchain_khr(
+                vk::Device::null(),
+                vk::SwapchainKHR::from_raw(0xA),
+                std::ptr::null(),
+            )
+        };
+        let retired = state_swapchain();
+        let destroyed = STUB_DESTROYED.load(Ordering::SeqCst);
+        let locked = STUB_SAW_SWAPCHAIN_LOCK.load(Ordering::SeqCst);
+
+        set_state(0xB, vec![4, 5]);
+        unsafe {
+            eclipse_vk_destroy_swapchain_khr(
+                vk::Device::null(),
+                vk::SwapchainKHR::from_raw(0xA),
+                std::ptr::null(),
+            )
+        };
+        let replaced = state_swapchain();
+
+        set_state(0, Vec::new());
+        HOST_DESTROY_SWAPCHAIN.store(saved, Ordering::SeqCst);
+
+        assert_eq!(
+            retired,
+            (0, 0),
+            "a destroyed swapchain is no longer a present target"
+        );
+        assert_eq!(destroyed, 0xA);
+        assert!(locked, "the host destroy runs under the swapchain lock");
+        assert_eq!(
+            replaced,
+            (0xB, 2),
+            "retiring an old swapchain keeps its replacement"
+        );
+    }
+
+    #[test]
+    fn swapchain_creation_holds_the_swapchain_lock() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved =
+            HOST_CREATE_SWAPCHAIN.swap(stub_create_swapchain as *const () as u64, Ordering::SeqCst);
+        STUB_SAW_SWAPCHAIN_LOCK.store(false, Ordering::SeqCst);
+        let info = vk::SwapchainCreateInfoKHR::default().image_extent(vk::Extent2D {
+            width: 640,
+            height: 480,
+        });
+        let mut swapchain = vk::SwapchainKHR::null();
+        let created = unsafe {
+            eclipse_vk_create_swapchain_khr(
+                vk::Device::null(),
+                &info,
+                std::ptr::null(),
+                &mut swapchain,
+            )
+        };
+        let tracked = state_swapchain();
+        let locked = STUB_SAW_SWAPCHAIN_LOCK.load(Ordering::SeqCst);
+
+        set_state(0, Vec::new());
+        HOST_CREATE_SWAPCHAIN.store(saved, Ordering::SeqCst);
+
+        assert_eq!(created, vk::Result::SUCCESS);
+        assert_eq!(tracked, (0xB, 0));
+        assert!(
+            locked,
+            "retiring oldSwapchain is serialized with the WebView presenter"
+        );
+    }
+
+    #[test]
+    fn overlay_teardown_never_waits_on_the_whole_engine_device() {
+        let source = include_str!("vk_overlay.rs");
+        let body = |header: &str| {
+            source
+                .split_once(header)
+                .unwrap_or_else(|| panic!("{header} missing"))
+                .1
+                .split_once("\n}\n")
+                .expect("drop body")
+                .0
+                .to_owned()
+        };
+        let presenter = body("impl Drop for WebPresenter {");
+        let probe = body("impl Drop for Probe {");
+        for (name, drop_body) in [("WebPresenter", &presenter), ("Probe", &probe)] {
+            assert!(
+                !drop_body.contains(concat!("device_wait", "_idle")),
+                "{name} teardown must not synchronize every queue of the engine's device"
+            );
+        }
+        assert!(presenter.contains("queue_wait_idle(self.queue)"));
+        assert!(probe.contains("self.fence.retire(&self.device)"));
+    }
+
+    fn headless_gpu() -> Option<crate::graphics::headless_vulkan::HeadlessGpu> {
+        match crate::graphics::headless_vulkan::HeadlessGpu::new() {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                eprintln!("SKIP: no headless Vulkan device ({e})");
+                None
+            }
+        }
+    }
+
+    fn image_barrier(
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        image: vk::Image,
+        from: vk::ImageLayout,
+        to: vk::ImageLayout,
+    ) {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(from)
+            .new_layout(to)
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(color_range());
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            )
+        };
+    }
+
+    fn engine_frame(
+        gpu: &crate::graphics::headless_vulkan::HeadlessGpu,
+        image: vk::Image,
+        from: vk::ImageLayout,
+    ) -> vk::Semaphore {
+        let rendered = gpu.semaphore();
+        gpu.run(&[], &[rendered], |device, cmd| unsafe {
+            image_barrier(
+                device,
+                cmd,
+                image,
+                from,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            device.cmd_clear_color_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue {
+                    float32: [0.2, 0.4, 0.6, 1.0],
+                },
+                &[color_range()],
+            );
+            image_barrier(
+                device,
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+        });
+        rendered
+    }
+
+    fn read_image(
+        gpu: &crate::graphics::headless_vulkan::HeadlessGpu,
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        extent: vk::Extent2D,
+        waits: &[vk::Semaphore],
+    ) -> Vec<u8> {
+        let len = (extent.width * extent.height * 4) as usize;
+        let (buffer, memory) = gpu.host_buffer(len as u64, vk::BufferUsageFlags::TRANSFER_DST);
+        gpu.run(waits, &[], |device, cmd| unsafe {
+            image_barrier(
+                device,
+                cmd,
+                image,
+                layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(color_layers())
+                .image_extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                });
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &[region],
+            );
+            image_barrier(
+                device,
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                layout,
+            );
+        });
+        gpu.read(memory, len)
+    }
+
+    fn build_probe(gpu: &crate::graphics::headless_vulkan::HeadlessGpu, rect: vk::Rect2D) -> Probe {
+        Probe::build(
+            &gpu.entry,
+            EngineHandles {
+                instance: gpu.instance.handle().as_raw(),
+                device: gpu.device.handle().as_raw(),
+                physical_device: gpu.physical_device.as_raw(),
+                queue_family: gpu.queue_family,
+            },
+            rect,
+        )
+        .expect("overlay probe")
+    }
+
+    fn rect_rows(pixels: &[u8], extent: vk::Extent2D, rect: vk::Rect2D) -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in 0..rect.extent.height {
+            let row = (rect.offset.y as u32 + y) * extent.width + rect.offset.x as u32;
+            let start = (row * 4) as usize;
+            out.extend_from_slice(&pixels[start..start + (rect.extent.width * 4) as usize]);
+        }
+        out
+    }
+
+    fn outside_rect_is(
+        pixels: &[u8],
+        extent: vk::Extent2D,
+        rect: vk::Rect2D,
+        background: &[u8],
+    ) -> bool {
+        (0..extent.height).all(|y| {
+            (0..extent.width).all(|x| {
+                let inside = x >= rect.offset.x as u32
+                    && x < rect.offset.x as u32 + rect.extent.width
+                    && y >= rect.offset.y as u32
+                    && y < rect.offset.y as u32 + rect.extent.height;
+                let i = ((y * extent.width + x) * 4) as usize;
+                inside || pixels[i..i + 4] == *background
+            })
+        })
+    }
+
+    static STUB_PRESENTED: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    unsafe extern "system" fn stub_acquire_next_image(
+        _device: vk::Device,
+        _swapchain: vk::SwapchainKHR,
+        _timeout: u64,
+        _semaphore: vk::Semaphore,
+        _fence: vk::Fence,
+        _image_index: *mut u32,
+    ) -> vk::Result {
+        vk::Result::NOT_READY
+    }
+
+    unsafe extern "system" fn stub_queue_present(
+        _queue: vk::Queue,
+        info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        let index = unsafe { *(*info).p_image_indices };
+        STUB_PRESENTED.store(u64::from(index), Ordering::SeqCst);
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn stub_presenter_proc_addr(
+        _device: vk::Device,
+        name: *const c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        let name = unsafe { CStr::from_ptr(name) };
+        if name == c"vkAcquireNextImageKHR" {
+            return Some(unsafe {
+                std::mem::transmute::<vk::PFN_vkAcquireNextImageKHR, unsafe extern "system" fn()>(
+                    stub_acquire_next_image,
+                )
+            });
+        }
+        if name == c"vkQueuePresentKHR" {
+            return Some(unsafe {
+                std::mem::transmute::<vk::PFN_vkQueuePresentKHR, unsafe extern "system" fn()>(
+                    stub_queue_present,
+                )
+            });
+        }
+        None
+    }
+
+    #[test]
+    fn releasing_an_acquired_image_presents_a_defined_blank_frame() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        let format = vk::Format::B8G8R8A8_UNORM;
+        let extent = vk::Extent2D {
+            width: 32,
+            height: 16,
+        };
+        let image = gpu.image(
+            format,
+            extent.width,
+            extent.height,
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+        );
+        let rendered = engine_frame(&gpu, image, vk::ImageLayout::UNDEFINED);
+        gpu.run(&[rendered], &[], |_, _| {});
+        let saved = HOST_GDPA.swap(
+            stub_presenter_proc_addr as *const () as u64,
+            Ordering::SeqCst,
+        );
+        let presenter = WebPresenter::build(
+            &gpu.entry,
+            EngineHandles {
+                instance: gpu.instance.handle().as_raw(),
+                device: gpu.device.handle().as_raw(),
+                physical_device: gpu.physical_device.as_raw(),
+                queue_family: gpu.queue_family,
+            },
+            0,
+            0x5C,
+            extent,
+            format,
+            vec![image.as_raw()],
+        );
+        HOST_GDPA.store(saved, Ordering::SeqCst);
+        let mut presenter = presenter.expect("WebView presenter");
+        STUB_PRESENTED.store(u64::MAX, Ordering::SeqCst);
+        gpu.run(&[], &[presenter.acquire], |_, _| {});
+
+        let done = presenter.done[0];
+        let blank = presenter.blank_frames[0];
+        unsafe { presenter.release_acquired(0, done, blank) };
+
+        assert_eq!(STUB_PRESENTED.load(Ordering::SeqCst), 0);
+        let pixels = read_image(
+            &gpu,
+            image,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            extent,
+            &[done],
+        );
+        drop(presenter);
+        assert!(
+            pixels.chunks(4).all(|p| p == [0, 0, 0, 255]),
+            "a released image is presented as a defined black frame, not stale engine pixels"
+        );
+    }
+
+    #[test]
+    fn text_capture_reaches_the_present_through_the_present_semaphore() {
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        if system_font().is_none() {
+            return;
+        }
+        let extent = vk::Extent2D {
+            width: 320,
+            height: 96,
+        };
+        let image = gpu.image(
+            vk::Format::B8G8R8A8_UNORM,
+            extent.width,
+            extent.height,
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+        );
+        let rendered = engine_frame(&gpu, image, vk::ImageLayout::UNDEFINED);
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 16, y: 20 },
+            extent: vk::Extent2D {
+                width: 240,
+                height: 46,
+            },
+        };
+        let mut probe = build_probe(&gpu, rect);
+        let overlay = text_overlay("Eclipse 42", 0);
+        let color = overlay_text_color(overlay.text_color);
+        let mut layers = TextLayerCache::default();
+        let layer = layers
+            .layer(&overlay, rect.extent.width, rect.extent.height)
+            .expect("text layer");
+
+        let gate = PresentGate::Engine;
+        let blink = AtomicU64::new(0);
+        let batch = unsafe {
+            probe.capture(
+                gpu.queue,
+                image.as_raw(),
+                gate.waits(&[rendered]),
+                Some((layer, color, &blink)),
+                false,
+            )
+        };
+        assert_eq!(
+            batch,
+            OverlayBatch::Queued,
+            "the composited field is still in flight"
+        );
+        let gate = gate.after(batch);
+        assert_eq!(gate, PresentGate::Pending);
+        assert!(
+            gate.waits(&[rendered]).is_empty(),
+            "the engine waits were consumed"
+        );
+
+        let presents = PresentSemaphores::create(gpu.device.clone(), 0x5C, 1).expect("semaphores");
+        let ready = presents
+            .signal(gpu.queue, 0)
+            .expect("signal the present semaphore");
+        let pixels = read_image(
+            &gpu,
+            image,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            extent,
+            &[ready],
+        );
+
+        let background = pixels[..4].to_vec();
+        let mut expected = background.repeat((rect.extent.width * rect.extent.height) as usize);
+        layer.apply(&mut expected, color, &AtomicU64::new(0));
+        assert_ne!(expected, background.repeat(expected.len() / 4));
+        assert!(rect_rows(&pixels, extent, rect) == expected);
+        assert!(outside_rect_is(&pixels, extent, rect, &background));
+    }
+
+    #[test]
+    fn webview_upload_publishes_the_saved_frame_behind_its_semaphore() {
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        let extent = vk::Extent2D {
+            width: 64,
+            height: 32,
+        };
+        let format = vk::Format::B8G8R8A8_UNORM;
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let image = gpu.image(format, extent.width, extent.height, usage);
+        let saved = gpu.image(format, extent.width, extent.height, usage);
+        gpu.run(&[], &[], |device, cmd| {
+            image_barrier(
+                device,
+                cmd,
+                saved,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+            )
+        });
+        let saved_ready = gpu.semaphore();
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 8, y: 4 },
+            extent: vk::Extent2D {
+                width: 16,
+                height: 8,
+            },
+        };
+        let mut probe = build_probe(&gpu, rect);
+        let stride = 20 * 4;
+        let frames: Vec<Vec<u8>> = (0..2u8)
+            .map(|k| {
+                (0..stride * 8)
+                    .map(|i| (i as u8).wrapping_mul(7) ^ k)
+                    .collect()
+            })
+            .collect();
+
+        let mut layout = vk::ImageLayout::UNDEFINED;
+        for (k, frame) in frames.iter().enumerate() {
+            let rendered = engine_frame(&gpu, image, layout);
+            layout = vk::ImageLayout::PRESENT_SRC_KHR;
+            let source = WebFrameSource {
+                bytes: frame,
+                stride,
+                swizzle: false,
+                refresh: true,
+            };
+            let target = SavedFrameTarget {
+                image: saved,
+                extent,
+                ready: saved_ready,
+                wait_ready: k > 0,
+            };
+            let batch = unsafe {
+                probe.upload_bgra(
+                    gpu.queue,
+                    image.as_raw(),
+                    &[rendered],
+                    &source,
+                    Some(target),
+                )
+            };
+            assert_eq!(batch, OverlayBatch::Queued);
+        }
+
+        let pixels = read_image(
+            &gpu,
+            saved,
+            vk::ImageLayout::GENERAL,
+            extent,
+            &[saved_ready],
+        );
+        let background = pixels[..4].to_vec();
+        let mut expected = Vec::new();
+        for row in 0..8 {
+            expected.extend_from_slice(&frames[1][row * stride..row * stride + 16 * 4]);
+        }
+        assert!(
+            rect_rows(&pixels, extent, rect) == expected,
+            "the saved frame holds the latest composited WebView frame"
+        );
+        assert!(outside_rect_is(&pixels, extent, rect, &background));
     }
 
     #[test]
