@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="corona" cx="64" cy="64" r="50" gradientUnits="userSpaceOnUse">
+      <stop offset="0.56" stop-color="#ffe3a3"/>
+      <stop offset="0.74" stop-color="#ff9a4a" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ff5c2b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262b52"/>
+      <stop offset="1" stop-color="#12142a"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#sky)"/>
+  <circle cx="64" cy="64" r="50" fill="url(#corona)"/>
+  <circle cx="64" cy="64" r="29" fill="#fff6dc"/>
+  <circle cx="71" cy="59" r="28" fill="#161933"/>
+  <circle cx="40" cy="84" r="3.5" fill="#fff6dc"/>
+</svg>

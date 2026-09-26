@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Eclipse
+GenericName=Android Roblox runtime
+Comment=Run the official Android Roblox client on Linux
+Exec=eclipse run
+Icon=io.github.kuenec.Eclipse
+Terminal=false
+StartupNotify=true
+Categories=Game;
+Keywords=roblox;android;game;
