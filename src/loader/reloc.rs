@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+pub const R_X86_64_NONE: u32 = 0;
+
 pub const R_X86_64_64: u32 = 1;
 
 pub const R_X86_64_GLOB_DAT: u32 = 6;

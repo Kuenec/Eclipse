@@ -435,10 +435,7 @@ impl SymbolProvider for DlopenLibProvider {
         if ptr.is_null() {
             None
         } else {
-            Some(ResolvedSym {
-                addr: ptr as u64,
-                weak: false,
-            })
+            Some(ResolvedSym { addr: ptr as u64 })
         }
     }
 }

@@ -40,8 +40,6 @@ fn is_exported_definition(sym: &DynSym) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedSym {
     pub addr: u64,
-
-    pub weak: bool,
 }
 
 pub trait SymbolProvider {
@@ -83,9 +81,8 @@ impl LoadedObjectProvider {
 
 impl SymbolProvider for LoadedObjectProvider {
     fn resolve(&self, name: &str) -> Option<ResolvedSym> {
-        self.defs.get(name).map(|&(value, weak)| ResolvedSym {
+        self.defs.get(name).map(|&(value, _)| ResolvedSym {
             addr: self.base.wrapping_add(value),
-            weak,
         })
     }
 }
@@ -100,10 +97,7 @@ impl SymbolProvider for HostDlsymProvider {
         if ptr.is_null() {
             None
         } else {
-            Some(ResolvedSym {
-                addr: ptr as u64,
-                weak: false,
-            })
+            Some(ResolvedSym { addr: ptr as u64 })
         }
     }
 }
@@ -130,17 +124,9 @@ impl Scope {
     }
 
     pub fn resolve(&self, name: &str) -> Option<ResolvedSym> {
-        let mut weak_hit: Option<ResolvedSym> = None;
-        for p in &self.providers {
-            if let Some(found) = p.resolve(name) {
-                if !found.weak {
-                    return Some(found);
-                }
-
-                weak_hit.get_or_insert(found);
-            }
-        }
-        weak_hit
+        self.providers
+            .iter()
+            .find_map(|provider| provider.resolve(name))
     }
 }
 
@@ -231,13 +217,7 @@ mod tests {
         ];
         let p = LoadedObjectProvider::new(0x1000, &syms);
 
-        assert_eq!(
-            p.resolve("exported"),
-            Some(ResolvedSym {
-                addr: 0x1100,
-                weak: false
-            })
-        );
+        assert_eq!(p.resolve("exported"), Some(ResolvedSym { addr: 0x1100 }));
 
         assert_eq!(p.resolve("private"), None);
 
@@ -247,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_provider_skips_abs_and_tracks_weak() {
+    fn loaded_provider_skips_abs_and_exports_weak() {
         let abs = DynSym {
             shndx: SHN_ABS,
             ..def("absval", 0x10)
@@ -255,13 +235,7 @@ mod tests {
         let syms = vec![abs, weak_def("w", 0x20)];
         let p = LoadedObjectProvider::new(0x1000, &syms);
         assert_eq!(p.resolve("absval"), None);
-        assert_eq!(
-            p.resolve("w"),
-            Some(ResolvedSym {
-                addr: 0x1020,
-                weak: true
-            })
-        );
+        assert_eq!(p.resolve("w"), Some(ResolvedSym { addr: 0x1020 }));
     }
 
     struct Fixed(Vec<(&'static str, ResolvedSym)>);
@@ -271,47 +245,39 @@ mod tests {
         }
     }
 
-    fn strong(addr: u64) -> ResolvedSym {
-        ResolvedSym { addr, weak: false }
-    }
-    fn weak(addr: u64) -> ResolvedSym {
-        ResolvedSym { addr, weak: true }
+    fn found(addr: u64) -> ResolvedSym {
+        ResolvedSym { addr }
     }
 
     #[test]
-    fn scope_first_strong_match_wins() {
+    fn scope_first_match_wins() {
         let mut scope = Scope::new();
         scope
-            .push(Box::new(Fixed(vec![("f", strong(0xA))])))
-            .push(Box::new(Fixed(vec![("f", strong(0xB))])));
+            .push(Box::new(Fixed(vec![("f", found(0xA))])))
+            .push(Box::new(Fixed(vec![("f", found(0xB))])));
 
-        assert_eq!(scope.resolve("f"), Some(strong(0xA)));
+        assert_eq!(scope.resolve("f"), Some(found(0xA)));
     }
 
     #[test]
-    fn scope_global_beats_earlier_weak() {
+    fn scope_earlier_weak_definition_beats_later_global_definition() {
+        let dynsyms = vec![weak_def("_Znwm", 0x40), undef("_Znwm", STB_GLOBAL)];
         let mut scope = Scope::new();
         scope
-            .push(Box::new(Fixed(vec![("f", weak(0xA))])))
-            .push(Box::new(Fixed(vec![("f", strong(0xB))])));
+            .push(Box::new(LoadedObjectProvider::new(0x1000, &dynsyms)))
+            .push(Box::new(Fixed(vec![("_Znwm", found(0x7f00_0000))])));
 
-        assert_eq!(scope.resolve("f"), Some(strong(0xB)));
-    }
-
-    #[test]
-    fn scope_only_weak_returns_first_weak() {
-        let mut scope = Scope::new();
-        scope
-            .push(Box::new(Fixed(vec![("f", weak(0xA))])))
-            .push(Box::new(Fixed(vec![("f", weak(0xB))])));
-
-        assert_eq!(scope.resolve("f"), Some(weak(0xA)));
+        assert_eq!(scope.resolve("_Znwm"), Some(found(0x1040)));
+        assert_eq!(
+            ScopedResolver::new(&scope, &dynsyms).resolve_symbol(1),
+            Some(0x1040)
+        );
     }
 
     #[test]
     fn scope_no_match_is_none() {
         let mut scope = Scope::new();
-        scope.push(Box::new(Fixed(vec![("g", strong(0xA))])));
+        scope.push(Box::new(Fixed(vec![("g", found(0xA))])));
         assert_eq!(scope.resolve("f"), None);
     }
 
@@ -346,7 +312,7 @@ mod tests {
         let dynsyms = vec![local_def("loc", 0x10)];
         let mut scope = Scope::new();
 
-        scope.push(Box::new(Fixed(vec![("loc", strong(0x99))])));
+        scope.push(Box::new(Fixed(vec![("loc", found(0x99))])));
         let r = ScopedResolver::new(&scope, &dynsyms);
         assert_eq!(r.resolve_symbol(0), None);
     }
@@ -377,7 +343,6 @@ mod tests {
         assert!(got.is_some(), "dlsym must resolve a known libc symbol");
         let got = got.unwrap();
         assert!(got.addr != 0, "resolved address must be non-null");
-        assert!(!got.weak, "host dlsym definitions are treated as strong");
 
         assert!(p.resolve("malloc").is_some_and(|s| s.addr != 0));
     }
@@ -419,7 +384,6 @@ mod tests {
             p.resolve("s"),
             Some(ResolvedSym {
                 addr: 0x1000u64.wrapping_add(u64::MAX),
-                weak: false,
             })
         );
     }

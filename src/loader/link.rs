@@ -550,6 +550,7 @@ pub(crate) mod tests {
     const RELA_OFF: u64 = 0x400;
     const SYM_OFF: u64 = 0x600;
     const STR_OFF: u64 = 0x800;
+    const HASH_OFF: u64 = 0xe00;
     const GLOB_TARGET: u64 = 0xc00;
     const IMG_SIZE: usize = 0x2000;
 
@@ -573,10 +574,18 @@ pub(crate) mod tests {
     const DT_RELAENT: i64 = 9;
     const DT_STRTAB: i64 = 5;
     const DT_STRSZ: i64 = 10;
+    const DT_HASH: i64 = 4;
     const DT_SYMTAB: i64 = 6;
     const DT_SYMENT: i64 = 11;
     const DT_SONAME: i64 = 14;
+    const DT_INIT: i64 = 12;
+    const DT_INIT_ARRAY: i64 = 25;
+    const DT_INIT_ARRAYSZ: i64 = 27;
     const RELA_ENT: u64 = 24;
+    const INIT_ARRAY_OFF: u64 = 0x1800;
+    const INIT_STUB_OFF: u64 = 0x1900;
+    const MOVABS_RAX: [u8; 2] = [0x48, 0xb8];
+    const JMP_RAX: [u8; 2] = [0xff, 0xe0];
 
     fn put_u16(buf: &mut [u8], off: usize, v: u16) {
         buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -713,6 +722,7 @@ pub(crate) mod tests {
         d(&mut buf, DT_SYMENT, SYM_SIZE as u64);
         d(&mut buf, DT_STRTAB, STR_OFF);
         d(&mut buf, DT_STRSZ, strsz);
+        d(&mut buf, DT_HASH, HASH_OFF);
         if rela_count > 0 {
             d(&mut buf, DT_RELA, RELA_OFF);
             d(&mut buf, DT_RELASZ, RELA_ENT * rela_count);
@@ -721,6 +731,54 @@ pub(crate) mod tests {
         d(&mut buf, DT_NULL, 0);
 
         assert!(SYM_OFF as usize + (sym_count as usize) * SYM_SIZE <= STR_OFF as usize);
+        put_u32(&mut buf, HASH_OFF as usize, 1);
+        put_u32(&mut buf, HASH_OFF as usize + 4, sym_count as u32);
+        buf
+    }
+
+    fn append_dynamic(buf: &mut [u8], entries: &[(i64, u64)]) {
+        let null_slot = (0..)
+            .find(|slot| {
+                let off = DYN_OFF as usize + slot * DYN_SIZE;
+                u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) == DT_NULL as u64
+            })
+            .expect("fixture dynamic table is DT_NULL-terminated");
+        for (slot, &(tag, val)) in (null_slot..).zip(entries.iter().chain(&[(DT_NULL, 0)])) {
+            let off = DYN_OFF as usize + slot * DYN_SIZE;
+            put_u64(buf, off, tag as u64);
+            put_u64(buf, off + 8, val);
+        }
+    }
+
+    pub(crate) fn build_so_with_constructors(
+        soname: &str,
+        init_target: Option<u64>,
+        init_array: &[u64],
+    ) -> Vec<u8> {
+        let mut buf = build_so(soname, &[], None, None);
+        let mut dynamic = Vec::new();
+        if let Some(target) = init_target {
+            let stub = INIT_STUB_OFF as usize;
+            buf[stub..stub + 2].copy_from_slice(&MOVABS_RAX);
+            put_u64(&mut buf, stub + 2, target);
+            buf[stub + 10..stub + 12].copy_from_slice(&JMP_RAX);
+            dynamic.push((DT_INIT, INIT_STUB_OFF));
+        }
+        for (index, &entry) in init_array.iter().enumerate() {
+            put_u64(&mut buf, INIT_ARRAY_OFF as usize + index * 8, entry);
+        }
+        dynamic.push((DT_INIT_ARRAY, INIT_ARRAY_OFF));
+        dynamic.push((DT_INIT_ARRAYSZ, 8 * init_array.len() as u64));
+        append_dynamic(&mut buf, &dynamic);
+        buf
+    }
+
+    pub(crate) fn build_so_with_unmapped_init_array(soname: &str) -> Vec<u8> {
+        let mut buf = build_so(soname, &[], None, None);
+        append_dynamic(
+            &mut buf,
+            &[(DT_INIT_ARRAY, 2 * IMG_SIZE as u64), (DT_INIT_ARRAYSZ, 8)],
+        );
         buf
     }
 
@@ -1371,11 +1429,10 @@ pub(crate) mod tests {
             .relocate_object_symbols_partial("libroblox.so", &full_scope, page)
             .expect("partial symbol relocation of libroblox");
         eprintln!(
-            "\npartial symbol apply: applied_nonnull={} applied_weak_zero={} unresolved_strong={} deferred={} (work-list names={})",
+            "\npartial symbol apply: applied_nonnull={} applied_weak_zero={} unresolved_strong={} (work-list names={})",
             stats.applied_nonnull,
             stats.applied_weak_zero,
             stats.unresolved_strong,
-            stats.deferred,
             stats.unresolved.len(),
         );
 

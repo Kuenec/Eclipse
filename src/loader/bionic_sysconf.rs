@@ -3,11 +3,13 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 const SC_ARG_MAX: c_int = 0x0000;
 
-const SC_CLK_TCK: c_int = 0x0002;
+const SC_CLK_TCK: c_int = 0x0006;
 
-const SC_NGROUPS_MAX: c_int = 0x0003;
+const SC_NGROUPS_MAX: c_int = 0x000a;
 
-const SC_OPEN_MAX: c_int = 0x0004;
+const SC_OPEN_MAX: c_int = 0x000b;
+
+const SC_IOV_MAX: c_int = 0x0026;
 
 const SC_PAGESIZE: c_int = 0x0027;
 
@@ -88,6 +90,7 @@ extern "C" fn eclipse_sysconf(name: c_int) -> c_long {
         SC_OPEN_MAX => unsafe { libc::sysconf(libc::_SC_OPEN_MAX) },
         SC_ARG_MAX => unsafe { libc::sysconf(libc::_SC_ARG_MAX) },
         SC_NGROUPS_MAX => unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) },
+        SC_IOV_MAX => unsafe { libc::sysconf(libc::_SC_IOV_MAX) },
 
         _ => -1,
     };
@@ -160,11 +163,41 @@ mod tests {
     }
 
     #[test]
-    fn sysconf_clk_tck_is_positive() {
-        let tck = eclipse_sysconf(SC_CLK_TCK);
-        assert!(
-            tck > 0,
-            "clock tick rate must be > 0 (was -1 under the bug)"
+    fn sysconf_answers_bionic_numbered_queries() {
+        assert!(eclipse_sysconf(0x6) > 0, "bionic _SC_CLK_TCK");
+        assert_eq!(eclipse_sysconf(0xa), unsafe {
+            libc::sysconf(libc::_SC_NGROUPS_MAX)
+        });
+        assert_eq!(eclipse_sysconf(0xb), unsafe {
+            libc::sysconf(libc::_SC_OPEN_MAX)
+        });
+        assert_eq!(eclipse_sysconf(0x26), unsafe {
+            libc::sysconf(libc::_SC_IOV_MAX)
+        });
+        assert_eq!(
+            eclipse_sysconf(0x2),
+            -1,
+            "bionic _SC_BC_DIM_MAX is not CLK_TCK"
+        );
+    }
+
+    #[test]
+    fn sysconf_constants_use_bionic_numbering() {
+        assert_eq!(
+            [
+                SC_ARG_MAX,
+                SC_CLK_TCK,
+                SC_NGROUPS_MAX,
+                SC_OPEN_MAX,
+                SC_IOV_MAX,
+                SC_PAGESIZE,
+                SC_PAGE_SIZE,
+                SC_NPROCESSORS_CONF,
+                SC_NPROCESSORS_ONLN,
+                SC_PHYS_PAGES,
+                SC_AVPHYS_PAGES,
+            ],
+            [0x0, 0x6, 0xa, 0xb, 0x26, 0x27, 0x28, 0x60, 0x61, 0x62, 0x63]
         );
     }
 

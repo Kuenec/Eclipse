@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::bionic_env::BionicEnv;
 use super::link::Linker;
-use super::map::host_page_size;
+use super::map::{host_page_size, MapError, MappedObject};
 use super::resolve::{LoadedObjectProvider, Scope};
 
 const INIT_ENTRY_SIZE: u64 = 8;
@@ -18,6 +18,26 @@ pub fn init_array_count(init_arraysz: u64) -> usize {
 #[must_use]
 pub fn init_array_entry_offset(init_array_vaddr: u64, index: usize) -> u64 {
     init_array_vaddr + (index as u64) * INIT_ENTRY_SIZE
+}
+
+pub fn constructor_addresses(
+    mapped: &MappedObject,
+    init: Option<u64>,
+    init_array: Option<(u64, u64)>,
+) -> Result<Vec<u64>, MapError> {
+    let mut addresses: Vec<u64> = init
+        .map(|init| mapped.load_base().wrapping_add(init))
+        .into_iter()
+        .collect();
+    if let Some((vaddr, size)) = init_array {
+        for index in 0..init_array_count(size) {
+            let offset = usize::try_from(init_array_entry_offset(vaddr, index))
+                .map_err(|_| MapError::SpanOverflow("init_array entry offset as usize"))?;
+            addresses.push(mapped.read_u64(offset)?);
+        }
+    }
+    addresses.retain(|&addr| addr != 0 && addr != u64::MAX);
+    Ok(addresses)
 }
 
 static CURRENT_INIT_INDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -130,7 +150,7 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
     }
 
     let obj = &set.objects[0];
-    let (init_array_vaddr, init_arraysz, exec_ok, exec_detail) = {
+    let (init, init_array_vaddr, init_arraysz, exec_ok, exec_detail) = {
         let img = obj.image().map_err(|e| InitRunError::Link(e.to_string()))?;
 
         let text = img
@@ -159,7 +179,7 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
             None => (false, "no PF_X segment in PT_LOAD table".to_string()),
         };
         let (va, sz) = img.dyn_info.init_array.ok_or(InitRunError::NoInitArray)?;
-        (va, sz, exec_ok, exec_detail)
+        (img.dyn_info.init, va, sz, exec_ok, exec_detail)
     };
     let _ = writeln!(log, "text PROT_EXEC: {exec_ok} ({exec_detail})");
     if !exec_ok {
@@ -177,14 +197,9 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
 
     install_crash_handler().map_err(InitRunError::Setup)?;
 
-    let mut entries: Vec<u64> = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = init_array_entry_offset(init_array_vaddr, i) as usize;
-        let addr = obj.mapped.read_u64(off).map_err(|e| {
-            InitRunError::Setup(format!("read init_array[{i}] @ off {off:#x}: {e}"))
-        })?;
-        entries.push(addr);
-    }
+    let entries = constructor_addresses(&obj.mapped, init, Some((init_array_vaddr, init_arraysz)))
+        .map_err(|e| InitRunError::Setup(format!("read constructors: {e}")))?;
+    let count = entries.len();
     let _ = writeln!(
         log,
         "calling {count} constructors (argc=1, argv=[\"libroblox\",NULL], envp=[NULL]) …"
@@ -198,16 +213,6 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
 
     let mut completed = 0usize;
     for (i, &addr) in entries.iter().enumerate() {
-        if addr == 0 {
-            let _ = writeln!(
-                log,
-                "init[{i}/{count}] @ NULL — aborting (null constructor slot)"
-            );
-            let _ = log.flush();
-            return Err(InitRunError::Setup(format!(
-                "null constructor slot at index {i}"
-            )));
-        }
         let offset = addr.wrapping_sub(base);
         let _ = writeln!(log, "init[{i}/{count}] @ base+{offset:#x} (abs {addr:#x})");
         let _ = log.flush();

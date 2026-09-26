@@ -28,6 +28,8 @@ const DYN_SIZE: usize = 16;
 
 const SYM_SIZE: usize = 24;
 
+const GNU_HASH_BLOOM_WORD_SIZE: usize = 8;
+
 const PT_LOAD: u32 = 1;
 
 const PT_DYNAMIC: u32 = 2;
@@ -586,32 +588,30 @@ impl<'a> ElfImage<'a> {
             return Ok(Vec::new());
         };
         let base = self.vaddr_to_off(sym_vaddr)?;
+        let count = self.dynsym_count()?;
+        let table_len = count.checked_mul(SYM_SIZE).ok_or(ElfError::Truncated {
+            offset: base,
+            need: usize::MAX,
+        })?;
+        if base
+            .checked_add(table_len)
+            .is_none_or(|end| end > self.bytes.len())
+        {
+            return Err(ElfError::Truncated {
+                offset: base,
+                need: table_len,
+            });
+        }
 
-        let seg_end = self
-            .loads
-            .iter()
-            .find(|s| sym_vaddr >= s.vaddr && sym_vaddr < s.vaddr.saturating_add(s.file_size))
-            .map(|s| self.vaddr_to_off(s.vaddr).map(|o| o + s.file_size as usize))
-            .transpose()?
-            .unwrap_or(self.bytes.len())
-            .min(self.bytes.len());
-
-        let cap = match self.dyn_info.strtab {
-            Some((str_vaddr, _)) if str_vaddr > sym_vaddr => {
-                self.vaddr_to_off(str_vaddr)?.min(seg_end)
-            }
-            _ => seg_end,
-        };
-
-        let mut syms = Vec::new();
-        let mut off = base;
-        while off + SYM_SIZE <= cap {
+        let mut syms = Vec::with_capacity(count);
+        for index in 0..count {
+            let off = base + index * SYM_SIZE;
             let st_name = read_u32(self.bytes, off)?;
             let st_info = self.bytes[off + 4];
             let st_shndx = read_u16(self.bytes, off + 6)?;
             let st_value = read_u64(self.bytes, off + 8)?;
             let st_size = read_u64(self.bytes, off + 16)?;
-            let name = self.str_at(st_name as u64).unwrap_or_default();
+            let name = self.str_at(st_name as u64)?;
             syms.push(DynSym {
                 name,
                 value: st_value,
@@ -620,9 +620,60 @@ impl<'a> ElfImage<'a> {
                 sym_type: st_info & 0xf,
                 shndx: st_shndx,
             });
-            off += SYM_SIZE;
         }
         Ok(syms)
+    }
+
+    fn dynsym_count(&self) -> Result<usize, ElfError> {
+        if let Some(hash) = self.dyn_info.hash {
+            let off = self.vaddr_to_off(hash)?;
+            let nchain = read_u32(self.bytes, offset_after(off, 4)?)?;
+            return Ok(nchain as usize);
+        }
+        let gnu_hash = self
+            .dyn_info
+            .gnu_hash
+            .ok_or(ElfError::MissingDynamic("DT_HASH or DT_GNU_HASH"))?;
+        let off = self.vaddr_to_off(gnu_hash)?;
+        let nbuckets = read_u32(self.bytes, off)? as usize;
+        let symoffset = read_u32(self.bytes, offset_after(off, 4)?)?;
+        let bloom_size = read_u32(self.bytes, offset_after(off, 8)?)? as usize;
+        let buckets = offset_after(
+            off,
+            bloom_size
+                .checked_mul(GNU_HASH_BLOOM_WORD_SIZE)
+                .and_then(|bloom| bloom.checked_add(16))
+                .ok_or(ElfError::Truncated {
+                    offset: off,
+                    need: usize::MAX,
+                })?,
+        )?;
+        let chains = offset_after(
+            buckets,
+            nbuckets.checked_mul(4).ok_or(ElfError::Truncated {
+                offset: buckets,
+                need: usize::MAX,
+            })?,
+        )?;
+
+        let mut last = 0u32;
+        for bucket in 0..nbuckets {
+            last = last.max(read_u32(self.bytes, offset_after(buckets, bucket * 4)?)?);
+        }
+        if last < symoffset {
+            return Ok(symoffset as usize);
+        }
+        loop {
+            let chain_index = (last - symoffset) as usize;
+            let entry = read_u32(self.bytes, offset_after(chains, chain_index * 4)?)?;
+            last = last.checked_add(1).ok_or(ElfError::Truncated {
+                offset: chains,
+                need: usize::MAX,
+            })?;
+            if entry & 1 != 0 {
+                return Ok(last as usize);
+            }
+        }
     }
 
     pub fn relocations(&self) -> Result<Vec<Rela>, ElfError> {
@@ -766,6 +817,13 @@ fn reloc_ent_size() -> u64 {
     24
 }
 
+fn offset_after(base: usize, delta: usize) -> Result<usize, ElfError> {
+    base.checked_add(delta).ok_or(ElfError::Truncated {
+        offset: base,
+        need: delta,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,6 +837,10 @@ mod tests {
     const STR_OFF: u64 = 0x700;
     const RELA_TARGET: u64 = 0x800;
     const RELR_TARGET: u64 = 0x900;
+    const HASH_OFF: u64 = 0xc00;
+    const GNU_HASH_OFF: u64 = 0xd00;
+    const FIXTURE_DYNSYMS: u32 = 2;
+    const HASH_DYN_SLOT: usize = 13;
     const IMG_SIZE: usize = 0x4000;
 
     fn put_u16(buf: &mut [u8], off: usize, v: u16) {
@@ -877,7 +939,13 @@ mod tests {
         dyn_entry(&mut buf, &mut slot, DT_NEEDED, 1);
         dyn_entry(&mut buf, &mut slot, DT_SONAME, 11);
         dyn_entry(&mut buf, &mut slot, DT_FLAGS, DF_BIND_NOW);
+        dyn_entry(&mut buf, &mut slot, DT_HASH, HASH_OFF);
         dyn_entry(&mut buf, &mut slot, DT_NULL, 0);
+        assert_eq!(slot, HASH_DYN_SLOT + 2);
+
+        put_u32(&mut buf, HASH_OFF as usize, 1);
+        put_u32(&mut buf, HASH_OFF as usize + 4, FIXTURE_DYNSYMS);
+        put_u32(&mut buf, HASH_OFF as usize + 8, 1);
 
         put_u64(&mut buf, RELA_OFF as usize, RELA_TARGET);
         put_u64(&mut buf, RELA_OFF as usize + 8, R_X86_64_RELATIVE as u64);
@@ -957,13 +1025,74 @@ mod tests {
         let buf = build_fixture();
         let img = ElfImage::parse(&buf).unwrap();
 
-        assert!(img.dynsyms.len() >= 2);
+        assert_eq!(img.dynsyms.len(), FIXTURE_DYNSYMS as usize);
         assert_eq!(img.dynsyms[0].name, "");
         assert_eq!(img.dynsyms[1].name, "sym1");
         assert_eq!(img.dynsyms[1].value, 0x2000);
         assert_eq!(img.dynsyms[1].bind, 1);
         assert_eq!(img.dynsyms[1].sym_type, 2);
         assert_eq!(img.dynsyms[1].shndx, 1);
+    }
+
+    fn gnu_hash(name: &str) -> u32 {
+        name.bytes().fold(5381u32, |h, byte| {
+            h.wrapping_mul(33).wrapping_add(u32::from(byte))
+        })
+    }
+
+    #[test]
+    fn dynsym_count_comes_from_dt_hash_not_the_gap_before_dynstr() {
+        let mut buf = build_fixture();
+        let stray = SYM_OFF as usize + FIXTURE_DYNSYMS as usize * SYM_SIZE;
+        put_u32(&mut buf, stray, 21);
+        buf[stray + 4] = (1 << 4) | 2;
+        put_u16(&mut buf, stray + 6, 1);
+        put_u64(&mut buf, stray + 8, 0x3000);
+
+        let img = ElfImage::parse(&buf).expect("fixture parses");
+
+        assert_eq!(img.dynsyms.len(), FIXTURE_DYNSYMS as usize);
+    }
+
+    #[test]
+    fn dynsym_count_comes_from_dt_gnu_hash_chains() {
+        let mut buf = build_fixture();
+        put_dyn(&mut buf, HASH_DYN_SLOT, DT_GNU_HASH, GNU_HASH_OFF);
+        let table = GNU_HASH_OFF as usize;
+        put_u32(&mut buf, table, 1);
+        put_u32(&mut buf, table + 4, 1);
+        put_u32(&mut buf, table + 8, 1);
+        put_u32(&mut buf, table + 12, 0);
+        put_u64(&mut buf, table + 16, u64::MAX);
+        put_u32(&mut buf, table + 24, 1);
+        put_u32(&mut buf, table + 28, gnu_hash("sym1") | 1);
+
+        let img = ElfImage::parse(&buf).expect("fixture parses");
+
+        assert_eq!(img.dynsyms.len(), FIXTURE_DYNSYMS as usize);
+        assert_eq!(img.dynsyms[1].name, "sym1");
+    }
+
+    #[test]
+    fn dynsyms_without_a_hash_table_are_a_typed_err() {
+        let mut buf = build_fixture();
+        put_dyn(&mut buf, HASH_DYN_SLOT, DT_NULL, 0);
+
+        assert_eq!(
+            ElfImage::parse(&buf).unwrap_err(),
+            ElfError::MissingDynamic("DT_HASH or DT_GNU_HASH")
+        );
+    }
+
+    #[test]
+    fn dynsym_name_past_dynstr_is_a_typed_err() {
+        let mut buf = build_fixture();
+        put_u32(&mut buf, SYM_OFF as usize + SYM_SIZE, 0x1000);
+
+        assert!(matches!(
+            ElfImage::parse(&buf).unwrap_err(),
+            ElfError::Truncated { .. }
+        ));
     }
 
     #[test]
@@ -1584,6 +1713,37 @@ mod tests {
         );
     }
 
+    fn dynsym_section_count(bytes: &[u8]) -> usize {
+        const SHT_DYNSYM: u32 = 11;
+        let shoff = read_u64(bytes, 0x28).expect("e_shoff") as usize;
+        let shentsize = read_u16(bytes, 0x3a).expect("e_shentsize") as usize;
+        let shnum = read_u16(bytes, 0x3c).expect("e_shnum") as usize;
+        (0..shnum)
+            .map(|index| shoff + index * shentsize)
+            .find(|&header| read_u32(bytes, header + 4).expect("sh_type") == SHT_DYNSYM)
+            .map(|header| read_u64(bytes, header + 0x20).expect("sh_size") as usize / SYM_SIZE)
+            .expect("a .dynsym section header")
+    }
+
+    #[test]
+    fn real_apk_dynsym_counts_match_the_dynsym_section() {
+        let Some(apk_path) = std::env::var_os("ECLIPSE_ROBLOX_APK")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+        else {
+            eprintln!("real_apk_dynsym_counts_match_the_dynsym_section: no Roblox APK; skipping");
+            return;
+        };
+        let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
+        for name in ["libroblox.so", "libbacktrace-native.so"] {
+            let bytes = apk
+                .read_entry(&format!("lib/x86_64/{name}"))
+                .unwrap_or_else(|e| panic!("read {name} from the APK: {e}"));
+            let img = ElfImage::parse(&bytes).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+            assert_eq!(img.dynsyms.len(), dynsym_section_count(&bytes), "{name}");
+        }
+    }
+
     fn header_only(e_phoff: u64, e_phnum: u16, e_phentsize: u16) -> Vec<u8> {
         let mut buf = vec![0u8; EHDR_SIZE];
         buf[0..4].copy_from_slice(&ELF_MAGIC);
@@ -1668,8 +1828,7 @@ mod tests {
         {
             *b = b'X';
         }
-        let img = ElfImage::parse(&buf).expect("parse tolerates corrupt symbol names");
-        let err = img.soname().unwrap_err();
+        let err = ElfImage::parse(&buf).unwrap_err();
         assert!(
             matches!(err, ElfError::Truncated { .. }),
             "expected Truncated (no NUL in strtab), got {err:?}"

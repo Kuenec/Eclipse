@@ -115,6 +115,56 @@ pub fn register_preloaded_natives(
 
 const ACC_NATIVE: i32 = 0x0100;
 
+struct ExportedNative {
+    method: String,
+    overload_args: Option<String>,
+    addr: u64,
+}
+
+fn exported_native(symbol: &str, addr: u64) -> Option<(String, ExportedNative)> {
+    let demangled = demangle(symbol)?;
+    Some((
+        demangled.class,
+        ExportedNative {
+            method: demangled.method,
+            overload_args: demangled.overload_args,
+            addr,
+        },
+    ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NativeBinding<'a> {
+    name: &'a str,
+    sig: &'a str,
+    addr: u64,
+}
+
+fn select_bindings<'a>(
+    declared: &'a [(String, String)],
+    exports: &[ExportedNative],
+) -> Vec<NativeBinding<'a>> {
+    declared
+        .iter()
+        .filter_map(|(name, sig)| {
+            let params = sig.strip_prefix('(')?.split_once(')')?.0;
+            exports
+                .iter()
+                .find(|e| e.method == *name && e.overload_args.is_none())
+                .or_else(|| {
+                    exports
+                        .iter()
+                        .find(|e| e.method == *name && e.overload_args.as_deref() == Some(params))
+                })
+                .map(|e| NativeBinding {
+                    name,
+                    sig,
+                    addr: e.addr,
+                })
+        })
+        .collect()
+}
+
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn register_all_preloaded_natives(
     java_vm: *mut RawJavaVM,
@@ -126,10 +176,10 @@ pub fn register_all_preloaded_natives(
         return 0;
     }
 
-    let mut by_class: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+    let mut by_class: BTreeMap<String, Vec<ExportedNative>> = BTreeMap::new();
     for (sym, addr) in exports {
-        if let Some(d) = demangle(sym) {
-            by_class.entry(d.class).or_default().push((d.method, *addr));
+        if let Some((class, native)) = exported_native(sym, *addr) {
+            by_class.entry(class).or_default().push(native);
         }
     }
     if by_class.is_empty() {
@@ -150,14 +200,18 @@ pub fn register_all_preloaded_natives(
                             return Ok(0);
                         }
                     };
-                    let sigs = match reflect_native_signatures(env, &cls) {
+                    let declared = match reflect_native_signatures(env, &cls) {
                         Ok(s) => s,
                         Err(_) => {
                             clear_exception(env);
                             return Ok(0);
                         }
                     };
-                    Ok(register_class_natives(env, &cls, methods, &sigs))
+                    Ok(register_class_natives(
+                        env,
+                        &cls,
+                        &select_bindings(&declared, methods),
+                    ))
                 })
                 .unwrap_or(0);
             total_bound += bound;
@@ -178,21 +232,14 @@ pub fn register_all_preloaded_natives(
     total_bound
 }
 
-fn register_class_natives(
-    env: &mut Env,
-    cls: &JClass,
-    methods: &[(String, u64)],
-    sigs: &BTreeMap<String, String>,
-) -> usize {
+fn register_class_natives(env: &mut Env, cls: &JClass, bindings: &[NativeBinding<'_>]) -> usize {
     let mut bound = 0;
-    for (method, addr) in methods {
-        let Some(sig) = sigs.get(method) else {
-            continue;
-        };
-        let name_s = JNIString::from(method.as_str());
-        let sig_s = JNIString::from(sig.as_str());
+    for binding in bindings {
+        let name_s = JNIString::from(binding.name);
+        let sig_s = JNIString::from(binding.sig);
 
-        let nm = unsafe { NativeMethod::from_raw_parts(&name_s, &sig_s, *addr as *mut c_void) };
+        let nm =
+            unsafe { NativeMethod::from_raw_parts(&name_s, &sig_s, binding.addr as *mut c_void) };
 
         match unsafe { env.register_native_methods(cls, std::slice::from_ref(&nm)) } {
             Ok(()) => bound += 1,
@@ -205,7 +252,7 @@ fn register_class_natives(
 fn reflect_native_signatures(
     env: &mut Env,
     cls: &JClass,
-) -> jni::errors::Result<BTreeMap<String, String>> {
+) -> jni::errors::Result<Vec<(String, String)>> {
     let arr_obj = env
         .call_method(
             cls,
@@ -216,7 +263,7 @@ fn reflect_native_signatures(
         .l()?;
     let methods: JObjectArray = env.cast_local::<JObjectArray>(arr_obj)?;
     let n = methods.len(env)?;
-    let mut out = BTreeMap::new();
+    let mut out = Vec::new();
     for i in 0..n {
         let entry: Option<(String, String)> =
             env.with_local_frame(16, |env| -> jni::errors::Result<Option<(String, String)>> {
@@ -264,9 +311,7 @@ fn reflect_native_signatures(
                 sig.push_str(&class_descriptor(env, ret)?);
                 Ok(Some((name, sig)))
             })?;
-        if let Some((name, sig)) = entry {
-            out.insert(name, sig);
-        }
+        out.extend(entry);
     }
     Ok(out)
 }
@@ -308,5 +353,94 @@ fn jobject_to_string(env: &mut Env, obj: JObject) -> jni::errors::Result<String>
 fn clear_exception(env: &mut Env) {
     if env.exception_check() {
         env.exception_clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REPORT_RECEIVED: &str = concat!(
+        "Java_com_roblox_universalapp_linking_JNILinkingProtocol_",
+        "nativeReportReceived__Ljava_lang_String_2Ljava_lang_String_2"
+    );
+
+    fn exports(symbols: &[(String, u64)]) -> Vec<ExportedNative> {
+        symbols
+            .iter()
+            .map(|(symbol, addr)| exported_native(symbol, *addr).expect("demangles").1)
+            .collect()
+    }
+
+    fn declared(methods: &[(&str, &str)]) -> Vec<(String, String)> {
+        methods
+            .iter()
+            .map(|(name, sig)| (name.to_string(), sig.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn overloaded_natives_bind_each_long_form_export_to_its_own_signature() {
+        let two_args = "(Ljava/lang/String;Ljava/lang/String;)V";
+        let with_flag = "(Ljava/lang/String;Ljava/lang/String;Z)V";
+        let mut methods = declared(&[
+            ("nativeReportReceived", two_args),
+            ("nativeReportReceived", with_flag),
+        ]);
+        let mut symbols = vec![
+            (REPORT_RECEIVED.to_string(), 0x2e45df8),
+            (format!("{REPORT_RECEIVED}Z"), 0x2e45f01),
+        ];
+        let expected = [
+            NativeBinding {
+                name: "nativeReportReceived",
+                sig: two_args,
+                addr: 0x2e45df8,
+            },
+            NativeBinding {
+                name: "nativeReportReceived",
+                sig: with_flag,
+                addr: 0x2e45f01,
+            },
+        ];
+
+        assert_eq!(select_bindings(&methods, &exports(&symbols)), expected);
+
+        symbols.reverse();
+        assert_eq!(select_bindings(&methods, &exports(&symbols)), expected);
+
+        methods.reverse();
+        let mut bindings = select_bindings(&methods, &exports(&symbols));
+        bindings.reverse();
+        assert_eq!(bindings, expected);
+    }
+
+    #[test]
+    fn short_form_export_binds_its_single_declared_signature() {
+        let methods = declared(&[("initNative", "(Landroid/content/res/AssetManager;)V")]);
+        let symbols = [(
+            "Java_com_roblox_client_JNIAAssetManagerSetup_initNative".to_string(),
+            0x1000,
+        )];
+
+        assert_eq!(
+            select_bindings(&methods, &exports(&symbols)),
+            [NativeBinding {
+                name: "initNative",
+                sig: "(Landroid/content/res/AssetManager;)V",
+                addr: 0x1000,
+            }]
+        );
+    }
+
+    #[test]
+    fn long_form_export_without_a_matching_declaration_is_not_bound() {
+        let methods = declared(&[(
+            "nativeReportReceived",
+            "(Ljava/lang/String;Ljava/lang/String;Z)V",
+        )]);
+        let symbols = [(REPORT_RECEIVED.to_string(), 0x2e45df8)];
+
+        assert!(select_bindings(&methods, &exports(&symbols)).is_empty());
     }
 }
