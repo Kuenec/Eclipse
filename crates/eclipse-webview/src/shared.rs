@@ -9,4 +9,4 @@ pub mod shm;
 #[path = "../../../src/webview/slots.rs"]
 pub mod slots;
 
-pub const PROTO_VERSION: u16 = 4;
+pub const PROTO_VERSION: u16 = 5;

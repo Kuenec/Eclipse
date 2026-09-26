@@ -4,7 +4,7 @@ use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -104,6 +104,8 @@ struct Client {
     reader: Option<JoinHandle<()>>,
 
     upcall: Option<JoinHandle<()>>,
+
+    replaced: Arc<AtomicBool>,
 }
 
 static CLIENT: Mutex<ClientSlot> = Mutex::new(ClientSlot::Unspawned(EarlyCookies::new()));
@@ -451,7 +453,21 @@ pub struct Stage {
     pub seq: u32,
 }
 
+enum ViewPhase {
+    Open,
+
+    Closing { redrive: Option<Redrive> },
+}
+
+struct Redrive {
+    target: DriveTarget,
+    width: u16,
+    height: u16,
+}
+
 struct ViewShared {
+    phase: ViewPhase,
+
     driven_url: String,
 
     log_target: String,
@@ -720,30 +736,11 @@ fn perform_handshake(stream: &UnixStream, timeout: Duration) -> Result<String, C
 
         Ok(other) => Err(ClientError::Handshake(format!(
             "expected HelloAck, got {}",
-            helper_msg_name(&other)
+            other.name()
         ))),
         Err(e) => Err(ClientError::Handshake(format!(
             "protocol error before HelloAck: {e}"
         ))),
-    }
-}
-
-fn helper_msg_name(msg: &HelperMsg) -> &'static str {
-    match msg {
-        HelperMsg::HelloAck { .. } => "HelloAck",
-        HelperMsg::LoadState { .. } => "LoadState",
-        HelperMsg::FrameBufferNew { .. } => "FrameBufferNew",
-        HelperMsg::FrameReady { .. } => "FrameReady",
-        HelperMsg::Console { .. } => "Console",
-        HelperMsg::Crash { .. } => "Crash",
-        HelperMsg::CookieList { .. } => "CookieList",
-        HelperMsg::ViewClosed { .. } => "ViewClosed",
-        HelperMsg::BridgeCall { .. } => "BridgeCall",
-        HelperMsg::EvaluateJsResult { .. } => "EvaluateJsResult",
-        HelperMsg::CookieSetResult { .. } => "CookieSetResult",
-        HelperMsg::CookieFlushDone { .. } => "CookieFlushDone",
-        HelperMsg::CookiesClearDone { .. } => "CookiesClearDone",
-        HelperMsg::NavigationState { .. } => "NavigationState",
     }
 }
 
@@ -755,11 +752,12 @@ fn spawn_client(java_vm: jni::vm::JavaVM) -> Result<Client, ClientError> {
         .spawn(move || io_thread_main(&tx, &shared, java_vm))
         .map_err(|e| ClientError::Spawn(format!("io-thread spawn failed: {e}")))?;
     match rx.recv_timeout(SPAWN_RESULT_TIMEOUT) {
-        Ok(Ok((writer, child, upcall))) => Ok(Client {
-            child,
-            writer,
+        Ok(Ok(spawned)) => Ok(Client {
+            child: spawned.child,
+            writer: spawned.writer,
             reader: Some(handle),
-            upcall: Some(upcall),
+            upcall: Some(spawned.upcall),
+            replaced: spawned.replaced,
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
@@ -918,10 +916,7 @@ fn maybe_respawn_for_app_ua() -> bool {
             }
             RespawnVerdict::Respawn => {}
         }
-        let ClientSlot::Live(old, log) = std::mem::replace(
-            &mut *slot,
-            ClientSlot::Failed(RESPAWN_IN_PROGRESS.to_string()),
-        ) else {
+        let Some((old, log)) = take_for_replacement(&mut slot) else {
             return false;
         };
 
@@ -954,6 +949,16 @@ fn maybe_respawn_for_app_ua() -> bool {
         );
     }
     false
+}
+
+fn take_for_replacement(slot: &mut ClientSlot) -> Option<(Client, EarlyCookies)> {
+    let ClientSlot::Live(old, log) =
+        std::mem::replace(slot, ClientSlot::Failed(RESPAWN_IN_PROGRESS.to_string()))
+    else {
+        return None;
+    };
+    old.replaced.store(true, Ordering::Release);
+    Some((old, log))
 }
 
 fn teardown_replaced_helper(mut old: Client) {
@@ -1002,7 +1007,14 @@ fn teardown_replaced_helper(mut old: Client) {
     }
 }
 
-type SpawnVerdict = Result<(UnixStream, Child, JoinHandle<()>), ClientError>;
+struct SpawnedHelper {
+    writer: UnixStream,
+    child: Child,
+    upcall: JoinHandle<()>,
+    replaced: Arc<AtomicBool>,
+}
+
+type SpawnVerdict = Result<SpawnedHelper, ClientError>;
 
 static IO_THREAD_ID: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
@@ -1046,9 +1058,11 @@ fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm
 
     let (up_tx, up_rx) = mpsc::channel::<UpcallEvent>();
     let upcall_shared = Arc::clone(shared);
+    let replaced = Arc::new(AtomicBool::new(false));
+    let upcall_replaced = Arc::clone(&replaced);
     let upcall_handle = match std::thread::Builder::new()
         .name("eclipse-webview-upcall".into())
-        .spawn(move || upcall_thread_main(&up_rx, &upcall_shared, &java_vm))
+        .spawn(move || upcall_thread_main(&up_rx, &upcall_shared, &java_vm, &upcall_replaced))
     {
         Ok(h) => h,
         Err(e) => {
@@ -1060,10 +1074,15 @@ fn io_thread_main(tx: &mpsc::Sender<SpawnVerdict>, shared: &Arc<Shared>, java_vm
             return;
         }
     };
-    if let Err(mpsc::SendError(returned)) = tx.send(Ok((writer, child, upcall_handle))) {
-        if let Ok((_w, mut c, _h)) = returned {
-            let _ = c.kill();
-            let _ = c.wait();
+    if let Err(mpsc::SendError(returned)) = tx.send(Ok(SpawnedHelper {
+        writer,
+        child,
+        upcall: upcall_handle,
+        replaced,
+    })) {
+        if let Ok(mut spawned) = returned {
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
         }
         return;
     }
@@ -1087,6 +1106,8 @@ struct DispatchOut {
     staged_view: Option<i64>,
 
     closed: Vec<i64>,
+
+    redrives: Vec<(i64, Redrive)>,
 
     bridge_calls: Vec<(i64, u32, String)>,
 
@@ -1200,8 +1221,14 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
             });
         }
         HelperMsg::ViewClosed { view } => {
-            if views.remove(&view).is_some() {
+            if let Some(vs) = views.remove(&view) {
                 out.closed.push(view);
+                if let ViewPhase::Closing {
+                    redrive: Some(redrive),
+                } = vs.phase
+                {
+                    out.redrives.push((view, redrive));
+                }
             }
         }
 
@@ -1237,7 +1264,7 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
 
         other @ (HelperMsg::HelloAck { .. } | HelperMsg::FrameBufferNew { .. }) => {
             tracing::debug!(
-                msg = helper_msg_name(&other),
+                msg = other.name(),
                 "webview client: ignoring out-of-phase helper message"
             );
         }
@@ -1284,6 +1311,7 @@ fn upcall_thread_main(
     rx: &mpsc::Receiver<UpcallEvent>,
     shared: &Arc<Shared>,
     java_vm: &jni::vm::JavaVM,
+    replaced: &AtomicBool,
 ) {
     while let Ok(event) = rx.recv() {
         match event {
@@ -1306,12 +1334,10 @@ fn upcall_thread_main(
             } => {
                 let (ok, result_json) =
                     crate::framework::fire_bridge_call(java_vm, view, call_id, &payload_json);
-                if !send_reply_if_live(&ConsumerMsg::BridgeResult {
-                    call_id,
-                    ok,
-                    result_json,
-                }) {
-                    reader_fatal("control-socket write failed (BridgeResult)");
+                match bridge_result_frame(call_id, ok, result_json) {
+                    Ok(frame) if write_frame_if_live(&frame) => {}
+                    Ok(_) => reader_fatal("control-socket write failed (BridgeResult)"),
+                    Err(e) => reader_fatal(&format!("BridgeResult encode failed: {e}")),
                 }
             }
             UpcallEvent::EvalResult {
@@ -1338,6 +1364,13 @@ fn upcall_thread_main(
         }
     }
 
+    if replaced.load(Ordering::Acquire) {
+        tracing::info!(
+            "webview client: the replaced helper's upcall thread exits without draining — every \
+             outstanding ValueCallback belongs to the replacement helper"
+        );
+        return;
+    }
     crate::framework::drain_all_webview_callbacks(java_vm, "web engine helper connection closed");
 }
 
@@ -1424,7 +1457,14 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender
             }
         };
         for reply in &out.replies {
-            if !send_reply_if_live(reply) {
+            let frame = match reply.encode() {
+                Ok(frame) => frame,
+                Err(e) => {
+                    reader_fatal(&format!("FrameAck encode failed: {e}"));
+                    return;
+                }
+            };
+            if !write_frame_if_live(&frame) {
                 reader_fatal("control-socket write failed (FrameAck)");
                 return;
             }
@@ -1499,6 +1539,16 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender
             });
             tracing::info!(view = closed, "webview helper confirmed ViewClosed");
         }
+        for (widget, redrive) in out.redrives {
+            if let Err(e) = redrive_after_close(widget, redrive) {
+                tracing::warn!(
+                    view = widget,
+                    error = %e,
+                    "webview client: the load deferred behind the detached view's close could not \
+                     be replayed"
+                );
+            }
+        }
         if out.fatal {
             let reason = out
                 .fatal_reason
@@ -1531,13 +1581,43 @@ fn reader_fatal(reason: &str) {
     }
 }
 
-fn send_reply_if_live(msg: &ConsumerMsg) -> bool {
-    let Ok(bytes) = msg.encode() else {
-        return true;
-    };
+const BRIDGE_RESULT_OVER_CAP: &str = "\"eclipse: bridge result exceeds the frame cap\"";
+
+fn bridge_result_frame(
+    call_id: u32,
+    ok: bool,
+    result_json: String,
+) -> Result<Vec<u8>, proto::ProtoError> {
+    let result_len = result_json.len();
+    match (ConsumerMsg::BridgeResult {
+        call_id,
+        ok,
+        result_json,
+    })
+    .encode()
+    {
+        Err(proto::ProtoError::Oversized { .. }) => {
+            tracing::warn!(
+                call_id,
+                result_len,
+                "webview client: the bridge result exceeds the frame cap — failing the page's \
+                 call instead of dropping it"
+            );
+            ConsumerMsg::BridgeResult {
+                call_id,
+                ok: false,
+                result_json: BRIDGE_RESULT_OVER_CAP.to_string(),
+            }
+            .encode()
+        }
+        encoded => encoded,
+    }
+}
+
+fn write_frame_if_live(frame: &[u8]) -> bool {
     match CLIENT.lock() {
         Ok(slot) => match &*slot {
-            ClientSlot::Live(c, _) => (&mut &c.writer).write_all(&bytes).is_ok(),
+            ClientSlot::Live(c, _) => (&mut &c.writer).write_all(frame).is_ok(),
             _ => true,
         },
         Err(_) => false,
@@ -1565,6 +1645,7 @@ fn record_view(views: &mut HashMap<i64, ViewShared>, widget: i64, driven_url: St
         }
         std::collections::hash_map::Entry::Vacant(e) => {
             e.insert(ViewShared {
+                phase: ViewPhase::Open,
                 driven_url,
                 log_target,
                 mapping: None,
@@ -1640,6 +1721,80 @@ fn drive(
         },
     )?;
 
+    let deferred = {
+        let mut views = shared()
+            .views
+            .lock()
+            .map_err(|_| ClientError::Internal("views lock poisoned"))?;
+        defer_while_closing(&mut views, widget, target, width, height)
+    };
+    let Some(target) = deferred else {
+        tracing::info!(
+            view = widget,
+            "webview client: load held until the detached view's ViewClosed, then replayed into a \
+             fresh browser"
+        );
+        return Ok(());
+    };
+    send_drive(&mut slot, widget, target, width, height)
+}
+
+fn defer_while_closing(
+    views: &mut HashMap<i64, ViewShared>,
+    widget: i64,
+    target: DriveTarget,
+    width: u16,
+    height: u16,
+) -> Option<DriveTarget> {
+    match views.get_mut(&widget).map(|vs| &mut vs.phase) {
+        Some(ViewPhase::Closing { redrive }) => {
+            *redrive = Some(Redrive {
+                target,
+                width,
+                height,
+            });
+            None
+        }
+        Some(ViewPhase::Open) | None => Some(target),
+    }
+}
+
+fn mark_closing(views: &mut HashMap<i64, ViewShared>, widget: i64) {
+    if let Some(vs) = views.get_mut(&widget) {
+        vs.phase = ViewPhase::Closing { redrive: None };
+    }
+}
+
+fn redrive_after_close(widget: i64, redrive: Redrive) -> Result<(), ClientError> {
+    let mut slot = CLIENT
+        .lock()
+        .map_err(|_| ClientError::Internal("client lock poisoned"))?;
+    if let Some(e) = latched_error(&slot) {
+        return Err(e);
+    }
+    if view_is_tracked(widget) {
+        tracing::debug!(
+            view = widget,
+            "webview client: a newer load already re-created the view; the deferred load is stale"
+        );
+        return Ok(());
+    }
+    send_drive(
+        &mut slot,
+        widget,
+        redrive.target,
+        redrive.width,
+        redrive.height,
+    )
+}
+
+fn send_drive(
+    slot: &mut ClientSlot,
+    widget: i64,
+    target: DriveTarget,
+    width: u16,
+    height: u16,
+) -> Result<(), ClientError> {
     let driven_url = match &target {
         DriveTarget::Url(url) => url.clone(),
         DriveTarget::Data { base_url, .. } => base_url
@@ -1665,7 +1820,7 @@ fn drive(
     ACTIVE_VIEW.store(widget, Ordering::Relaxed);
     if is_new {
         send_locked(
-            &mut slot,
+            slot,
             &ConsumerMsg::CreateView {
                 view: widget,
                 width,
@@ -1675,7 +1830,7 @@ fn drive(
 
         for (name, methods) in drain_pending_bridges(widget) {
             send_locked(
-                &mut slot,
+                slot,
                 &ConsumerMsg::BridgeRegister {
                     view: widget,
                     name,
@@ -1701,7 +1856,7 @@ fn drive(
             history_url: String::new(),
         },
     };
-    send_locked(&mut slot, &load_msg)
+    send_locked(slot, &load_msg)
 }
 
 pub fn drive_load_url(
@@ -2193,6 +2348,9 @@ pub fn notify_view_detached(widget: i64) {
     );
     if let Ok(mut slot) = CLIENT.lock() {
         if matches!(&*slot, ClientSlot::Live(_, _)) {
+            if let Ok(mut views) = shared().views.lock() {
+                mark_closing(&mut views, widget);
+            }
             let _ = send_locked(&mut slot, &ConsumerMsg::CloseView { view: widget });
         }
     }
@@ -2913,6 +3071,30 @@ mod tests {
     }
 
     #[test]
+    fn an_over_cap_bridge_result_is_answered_with_a_failure_frame() {
+        let frame =
+            bridge_result_frame(5, true, "x".repeat(8 * 1024 * 1024)).expect("fallback frame");
+        assert_eq!(
+            proto::read_consumer_msg(&mut frame.as_slice()),
+            Ok(ConsumerMsg::BridgeResult {
+                call_id: 5,
+                ok: false,
+                result_json: BRIDGE_RESULT_OVER_CAP.to_string(),
+            })
+        );
+
+        let frame = bridge_result_frame(6, true, "{\"a\":1}".to_string()).expect("frame");
+        assert_eq!(
+            proto::read_consumer_msg(&mut frame.as_slice()),
+            Ok(ConsumerMsg::BridgeResult {
+                call_id: 6,
+                ok: true,
+                result_json: "{\"a\":1}".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn normalize_app_user_agent_treats_null_and_empty_as_a_reset_to_the_default() {
         assert_eq!(normalize_app_user_agent(None), None);
         assert_eq!(normalize_app_user_agent(Some(String::new())), None);
@@ -3317,6 +3499,29 @@ mod tests {
     }
 
     #[test]
+    fn taking_a_helper_for_replacement_marks_it_so_its_upcall_thread_skips_the_drain() {
+        let (writer, _helper_end) = UnixStream::pair().expect("socketpair");
+        let replaced = Arc::new(AtomicBool::new(false));
+        let mut slot = ClientSlot::Live(
+            Client {
+                child: std::process::Command::new("true")
+                    .spawn()
+                    .expect("spawn a stand-in helper"),
+                writer,
+                reader: None,
+                upcall: None,
+                replaced: Arc::clone(&replaced),
+            },
+            EarlyCookies::new(),
+        );
+        let (mut old, _log) = take_for_replacement(&mut slot).expect("a live helper");
+        assert!(replaced.load(Ordering::Acquire));
+        assert!(matches!(&slot, ClientSlot::Failed(r) if r == RESPAWN_IN_PROGRESS));
+        assert!(take_for_replacement(&mut slot).is_none());
+        let _ = old.child.wait();
+    }
+
+    #[test]
     fn next_request_id_is_monotonic_and_skips_zero() {
         let a = next_request_id();
         let b = next_request_id();
@@ -3394,6 +3599,35 @@ mod tests {
         notify_view_detached(active);
         assert_eq!(ACTIVE_VIEW.load(Ordering::Relaxed), 0);
         ACTIVE_VIEW.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_load_issued_while_a_detached_view_closes_is_replayed_after_view_closed() {
+        let mut views: HashMap<i64, ViewShared> = HashMap::new();
+        let widget = 0x00C0_0003_0000_0000_i64;
+        assert!(record_view(&mut views, widget, "https://a.example/".into()));
+        mark_closing(&mut views, widget);
+
+        let first = DriveTarget::Url("https://b.example/".into());
+        assert!(defer_while_closing(&mut views, widget, first, 640, 480).is_none());
+        let latest = DriveTarget::Url("https://c.example/".into());
+        assert!(defer_while_closing(&mut views, widget, latest, 800, 600).is_none());
+
+        let out = dispatch(HelperMsg::ViewClosed { view: widget }, &mut views);
+        assert_eq!(out.closed, vec![widget]);
+        assert!(!views.contains_key(&widget));
+        assert_eq!(out.redrives.len(), 1);
+        let (redriven, redrive) = &out.redrives[0];
+        assert_eq!(*redriven, widget);
+        assert!(matches!(&redrive.target, DriveTarget::Url(url) if url == "https://c.example/"));
+        assert_eq!((redrive.width, redrive.height), (800, 600));
+
+        assert!(record_view(&mut views, widget, "https://c.example/".into()));
+        let open = DriveTarget::Url("https://d.example/".into());
+        assert!(defer_while_closing(&mut views, widget, open, 1, 1).is_some());
+        let out = dispatch(HelperMsg::ViewClosed { view: widget }, &mut views);
+        assert_eq!(out.closed, vec![widget]);
+        assert!(out.redrives.is_empty());
     }
 
     #[test]

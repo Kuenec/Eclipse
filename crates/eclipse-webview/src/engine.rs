@@ -2133,6 +2133,8 @@ fn send_bridge_register_message(frame: &Frame, name: &str, methods: &[BridgeMeth
     frame.send_process_message(ProcessId::RENDERER, Some(&mut msg));
 }
 
+const BRIDGE_PAYLOAD_OVER_CAP: &str = "eclipse: bridge payload exceeds the frame cap";
+
 struct BridgeHandler {
     state: Shared,
     out: Outbox,
@@ -2160,14 +2162,25 @@ impl BrowserSideHandler for BridgeHandler {
         if call_id == 0 {
             call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         }
-        lock(&self.state)
-            .pending_bridge_calls
-            .insert(call_id, callback);
-        self.out.send(HelperMsg::BridgeCall {
+        let call = HelperMsg::BridgeCall {
             view,
             call_id,
             payload_json: request.to_string(),
-        });
+        };
+        if let Err(e) = call.encode() {
+            logging::warn(
+                COMPONENT,
+                &format!("bridge call view={view} call_id={call_id} rejected: {e}"),
+            );
+            if let Ok(guard) = callback.lock() {
+                guard.failure(-1, BRIDGE_PAYLOAD_OVER_CAP);
+            }
+            return true;
+        }
+        lock(&self.state)
+            .pending_bridge_calls
+            .insert(call_id, callback);
+        self.out.send(call);
         true
     }
 }
