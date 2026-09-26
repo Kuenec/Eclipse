@@ -15,8 +15,9 @@
       mouse input.
     </p>
     <p>
-      Eclipse does not include or redistribute Roblox. You supply the official Roblox APK yourself;
-      Eclipse can read APK files from your Downloads folder.
+      Eclipse does not include or redistribute Roblox. On first launch it downloads Roblox's own
+      release files and installs them only when Roblox Corporation's signature verifies, then keeps
+      the client updated. It can also install official APK files from your Downloads folder.
     </p>
   </description>
   <launchable type="desktop-id">io.github.kuenec.Eclipse.desktop</launchable>
@@ -33,6 +34,9 @@
   <provides>
     <binary>eclipse</binary>
   </provides>
+  <releases>
+    <release version="0.1.0" date="2026-09-26"/>
+  </releases>
   <content_rating type="oars-1.1">
     <content_attribute id="social-chat">intense</content_attribute>
     <content_attribute id="social-audio">intense</content_attribute>
