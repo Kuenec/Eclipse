@@ -469,12 +469,6 @@ impl ApplicationHandler for GameWindow<'_> {
                     let (w, h) =
                         crate::loader::ndk_registry::engine_window_geometry().unwrap_or((1, 1));
 
-                    let runtime_overrides = crate::loader::engine::reapply_host_bool_overrides();
-                    tracing::info!(
-                        runtime_overrides,
-                        "re-applied host runtime overrides before SurfaceView lifecycle"
-                    );
-
                     self.renderer = None;
 
                     if let Err(e) = crate::framework::dispatch_surface_lifecycle(vm, w, h) {
