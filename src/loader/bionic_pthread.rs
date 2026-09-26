@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
-use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 const EBUSY: c_int = 16;
 
@@ -17,6 +17,10 @@ const EINTR: c_int = 4;
 
 const EAGAIN: c_int = 11;
 
+const ESRCH: c_int = 3;
+
+const EOVERFLOW: c_int = 75;
+
 const PTHREAD_MUTEX_NORMAL: c_int = 0;
 
 const PTHREAD_MUTEX_RECURSIVE: c_int = 1;
@@ -28,7 +32,6 @@ const CLOCK_MONOTONIC: c_int = 1;
 const MUTEX_INIT_MAGIC: i32 = 0x6d75_7831u32 as i32;
 
 const COND_INIT_MAGIC: i32 = 0x636e_6431u32 as i32;
-const RWLOCK_INIT_MAGIC: i32 = 0x7277_6c31u32 as i32;
 
 const ONCE_NOT_STARTED: i32 = 0;
 const ONCE_IN_PROGRESS: i32 = 1;
@@ -51,8 +54,34 @@ const SYS_TGKILL: c_long = 234;
 
 const SYS_GETPID: c_long = 39;
 
+thread_local! {
+    static CACHED_TID: Cell<i32> = const { Cell::new(0) };
+}
+
 fn gettid() -> i32 {
-    unsafe { libc::syscall(SYS_GETTID) as i32 }
+    match CACHED_TID.get() {
+        0 => cache_current_tid(),
+        tid => tid,
+    }
+}
+
+#[cold]
+fn cache_current_tid() -> i32 {
+    static FORGET_TID_IN_FORK_CHILD: Once = Once::new();
+    FORGET_TID_IN_FORK_CHILD.call_once(|| {
+        let rc = unsafe { libc::pthread_atfork(None, None, Some(forget_cached_tid)) };
+        assert_eq!(
+            rc, 0,
+            "pthread_atfork failed; a cached thread id would survive fork"
+        );
+    });
+    let tid = unsafe { libc::syscall(SYS_GETTID) as i32 };
+    CACHED_TID.set(tid);
+    tid
+}
+
+unsafe extern "C" fn forget_cached_tid() {
+    CACHED_TID.set(0);
 }
 
 fn futex_wait(addr: &AtomicI32, expected: i32) {
@@ -136,9 +165,10 @@ const MUTEX_DEPTH: usize = 4;
 unsafe fn mutex_ensure_init(p: *mut c_void) {
     unsafe {
         if let Some(magic) = word(p, MUTEX_MAGIC, MUTEX_WORDS) {
-            if magic
-                .compare_exchange(0, MUTEX_INIT_MAGIC, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+            if magic.load(Ordering::Acquire) == 0
+                && magic
+                    .compare_exchange(0, MUTEX_INIT_MAGIC, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
             {
                 if let Some(ty) = word(p, MUTEX_TYPE, MUTEX_WORDS) {
                     ty.store(PTHREAD_MUTEX_NORMAL, Ordering::Release);
@@ -209,9 +239,10 @@ unsafe fn mutex_lock_impl(m: *mut c_void, blocking: bool) -> c_int {
         let ty = word(m, MUTEX_TYPE, MUTEX_WORDS)
             .map(|t| t.load(Ordering::Relaxed))
             .unwrap_or(PTHREAD_MUTEX_NORMAL);
-        let tid = gettid();
+        let owned = ty == PTHREAD_MUTEX_RECURSIVE || ty == PTHREAD_MUTEX_ERRORCHECK;
+        let tid = if owned { gettid() } else { 0 };
 
-        if ty == PTHREAD_MUTEX_RECURSIVE || ty == PTHREAD_MUTEX_ERRORCHECK {
+        if owned {
             let owner = word(m, MUTEX_OWNER, MUTEX_WORDS).unwrap();
             if owner.load(Ordering::Acquire) == tid {
                 if ty == PTHREAD_MUTEX_RECURSIVE {
@@ -232,7 +263,7 @@ unsafe fn mutex_lock_impl(m: *mut c_void, blocking: bool) -> c_int {
             return EBUSY;
         }
 
-        if ty == PTHREAD_MUTEX_RECURSIVE || ty == PTHREAD_MUTEX_ERRORCHECK {
+        if owned {
             word(m, MUTEX_OWNER, MUTEX_WORDS)
                 .unwrap()
                 .store(tid, Ordering::Release);
@@ -344,7 +375,10 @@ const COND_CLOCK: usize = 2;
 unsafe fn cond_ensure_init(c: *mut c_void) {
     unsafe {
         if let Some(magic) = word(c, COND_MAGIC, COND_WORDS) {
-            let _ = magic.compare_exchange(0, COND_INIT_MAGIC, Ordering::AcqRel, Ordering::Acquire);
+            if magic.load(Ordering::Acquire) == 0 {
+                let _ =
+                    magic.compare_exchange(0, COND_INIT_MAGIC, Ordering::AcqRel, Ordering::Acquire);
+            }
         }
     }
 }
@@ -520,119 +554,148 @@ unsafe extern "C" fn eclipse_pthread_condattr_destroy(a: *mut c_void) -> c_int {
 }
 
 const RW_STATE: usize = 0;
-const RW_MAGIC: usize = 1;
-const RW_READERS: usize = 2;
 const RW_WRITER: usize = 3;
 
-unsafe fn rwlock_ensure_init(r: *mut c_void) {
+const RW_WRITE_LOCKED: i32 = 1 << 30;
+const RW_HAS_WAITERS: i32 = 1 << 29;
+const RW_READER_MASK: i32 = RW_HAS_WAITERS - 1;
+
+unsafe fn rwlock_words<'a>(r: *mut c_void) -> Option<(&'a AtomicI32, &'a AtomicI32)> {
     unsafe {
-        if let Some(magic) = word(r, RW_MAGIC, RWLOCK_WORDS) {
-            let _ =
-                magic.compare_exchange(0, RWLOCK_INIT_MAGIC, Ordering::AcqRel, Ordering::Acquire);
-        }
+        Some((
+            word(r, RW_STATE, RWLOCK_WORDS)?,
+            word(r, RW_WRITER, RWLOCK_WORDS)?,
+        ))
+    }
+}
+
+fn rwlock_park(state: &AtomicI32, current: i32) {
+    let flagged = current | RW_HAS_WAITERS;
+    if current == flagged
+        || state
+            .compare_exchange(current, flagged, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        futex_wait(state, flagged);
     }
 }
 
 unsafe extern "C" fn eclipse_pthread_rwlock_init(r: *mut c_void, _attr: *const c_void) -> c_int {
-    if r.is_null() {
+    let Some((state, writer)) = (unsafe { rwlock_words(r) }) else {
         return EINVAL;
-    }
-
-    unsafe {
-        for &i in &[RW_STATE, RW_READERS, RW_WRITER] {
-            if let Some(w) = word(r, i, RWLOCK_WORDS) {
-                w.store(0, Ordering::Relaxed);
-            }
-        }
-        if let Some(w) = word(r, RW_MAGIC, RWLOCK_WORDS) {
-            w.store(RWLOCK_INIT_MAGIC, Ordering::Release);
-        }
-    }
+    };
+    state.store(0, Ordering::Relaxed);
+    writer.store(0, Ordering::Release);
     0
 }
 
 unsafe extern "C" fn eclipse_pthread_rwlock_rdlock(r: *mut c_void) -> c_int {
-    if r.is_null() {
+    let Some((state, writer)) = (unsafe { rwlock_words(r) }) else {
         return EINVAL;
+    };
+    let current = state.load(Ordering::Relaxed);
+    if current & (RW_WRITE_LOCKED | RW_READER_MASK) < RW_READER_MASK
+        && state
+            .compare_exchange_weak(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    {
+        return 0;
     }
-
-    unsafe {
-        rwlock_ensure_init(r);
-        loop {
-            let state = word(r, RW_STATE, RWLOCK_WORDS).unwrap();
-            futex_lock_acquire(state);
-            let writer = word(r, RW_WRITER, RWLOCK_WORDS).unwrap();
-            if writer.load(Ordering::Acquire) == 0 {
-                word(r, RW_READERS, RWLOCK_WORDS)
-                    .unwrap()
-                    .fetch_add(1, Ordering::AcqRel);
-                futex_lock_release(state);
-                return 0;
-            }
-
-            futex_lock_release(state);
-            futex_wait(state, 0);
+    if writer.load(Ordering::Relaxed) == gettid() {
+        return EDEADLK;
+    }
+    loop {
+        let current = state.load(Ordering::Relaxed);
+        if current & RW_WRITE_LOCKED != 0 {
+            rwlock_park(state, current);
+            continue;
+        }
+        if current & RW_READER_MASK == RW_READER_MASK {
+            return EAGAIN;
+        }
+        if state
+            .compare_exchange_weak(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return 0;
         }
     }
 }
 
 unsafe extern "C" fn eclipse_pthread_rwlock_wrlock(r: *mut c_void) -> c_int {
-    if r.is_null() {
+    let Some((state, writer)) = (unsafe { rwlock_words(r) }) else {
         return EINVAL;
-    }
-
-    unsafe {
-        rwlock_ensure_init(r);
+    };
+    let tid = gettid();
+    if state
+        .compare_exchange(0, RW_WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        if writer.load(Ordering::Relaxed) == tid {
+            return EDEADLK;
+        }
         loop {
-            let state = word(r, RW_STATE, RWLOCK_WORDS).unwrap();
-            futex_lock_acquire(state);
-            let readers = word(r, RW_READERS, RWLOCK_WORDS).unwrap();
-            let writer = word(r, RW_WRITER, RWLOCK_WORDS).unwrap();
-            if readers.load(Ordering::Acquire) == 0 && writer.load(Ordering::Acquire) == 0 {
-                writer.store(gettid(), Ordering::Release);
-                futex_lock_release(state);
-                return 0;
+            let current = state.load(Ordering::Relaxed);
+            if current & (RW_WRITE_LOCKED | RW_READER_MASK) != 0 {
+                rwlock_park(state, current);
+                continue;
             }
-            futex_lock_release(state);
-            futex_wait(state, 0);
-        }
-    }
-}
-
-unsafe extern "C" fn eclipse_pthread_rwlock_unlock(r: *mut c_void) -> c_int {
-    if r.is_null() {
-        return EINVAL;
-    }
-
-    unsafe {
-        rwlock_ensure_init(r);
-        let state = word(r, RW_STATE, RWLOCK_WORDS).unwrap();
-        futex_lock_acquire(state);
-        let writer = word(r, RW_WRITER, RWLOCK_WORDS).unwrap();
-        if writer.load(Ordering::Acquire) == gettid() {
-            writer.store(0, Ordering::Release);
-        } else {
-            let readers = word(r, RW_READERS, RWLOCK_WORDS).unwrap();
-            if readers.load(Ordering::Acquire) > 0 {
-                readers.fetch_sub(1, Ordering::AcqRel);
+            if state
+                .compare_exchange_weak(
+                    current,
+                    current | RW_WRITE_LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
             }
         }
-        futex_lock_release(state);
-
-        futex_wake(state, c_int::MAX);
     }
+    writer.store(tid, Ordering::Relaxed);
     0
 }
 
-unsafe extern "C" fn eclipse_pthread_rwlock_destroy(r: *mut c_void) -> c_int {
-    if r.is_null() {
+unsafe extern "C" fn eclipse_pthread_rwlock_unlock(r: *mut c_void) -> c_int {
+    let Some((state, writer)) = (unsafe { rwlock_words(r) }) else {
         return EINVAL;
-    }
-
-    unsafe {
-        if let Some(magic) = word(r, RW_MAGIC, RWLOCK_WORDS) {
-            magic.store(0, Ordering::Release);
+    };
+    let mut current = state.load(Ordering::Relaxed);
+    if current & RW_WRITE_LOCKED != 0 {
+        if writer.load(Ordering::Relaxed) != gettid() {
+            return EPERM;
         }
+        writer.store(0, Ordering::Relaxed);
+        if state.swap(0, Ordering::Release) & RW_HAS_WAITERS != 0 {
+            futex_wake(state, c_int::MAX);
+        }
+        return 0;
+    }
+    loop {
+        let readers = current & RW_READER_MASK;
+        if readers == 0 {
+            return EPERM;
+        }
+        let next = if readers == 1 { 0 } else { current - 1 };
+        match state.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => {
+                if next == 0 && current & RW_HAS_WAITERS != 0 {
+                    futex_wake(state, c_int::MAX);
+                }
+                return 0;
+            }
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+unsafe extern "C" fn eclipse_pthread_rwlock_destroy(r: *mut c_void) -> c_int {
+    let Some((state, _)) = (unsafe { rwlock_words(r) }) else {
+        return EINVAL;
+    };
+    if state.load(Ordering::Acquire) != 0 {
+        return EBUSY;
     }
     0
 }
@@ -985,13 +1048,13 @@ const PR_SET_NAME: c_int = 15;
 const PTHREAD_CREATE_JOINABLE: c_int = 0;
 const PTHREAD_CREATE_DETACHED: c_int = 1;
 
-struct ThreadEntry {
-    host_handle: libc::pthread_t,
+static THREAD_REGISTRY: Mutex<Vec<(i32, libc::pthread_t)>> = Mutex::new(Vec::new());
 
-    detached: bool,
+fn take_host_handle(tid: i32) -> Option<libc::pthread_t> {
+    let mut registry = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let index = registry.iter().position(|(t, _)| *t == tid)?;
+    Some(registry.swap_remove(index).1)
 }
-
-static THREAD_REGISTRY: Mutex<Vec<(i32, ThreadEntry)>> = Mutex::new(Vec::new());
 
 struct SpawnArgs {
     start: extern "C-unwind" fn(*mut c_void) -> *mut c_void,
@@ -1122,13 +1185,7 @@ unsafe extern "C" fn eclipse_pthread_create(
         unsafe { libc::pthread_detach(host_handle) };
     } else {
         let mut reg = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        reg.push((
-            tid,
-            ThreadEntry {
-                host_handle,
-                detached: false,
-            },
-        ));
+        reg.push((tid, host_handle));
     }
 
     if !thread.is_null() {
@@ -1139,17 +1196,8 @@ unsafe extern "C" fn eclipse_pthread_create(
 
 unsafe extern "C" fn eclipse_pthread_join(thread: usize, retval: *mut *mut c_void) -> c_int {
     let tid = thread as i32;
-    let host_handle = {
-        let mut reg = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        match reg.iter().position(|(t, _)| *t == tid) {
-            Some(i) => {
-                if reg[i].1.detached {
-                    return EINVAL;
-                }
-                reg.swap_remove(i).1.host_handle
-            }
-            None => return 3,
-        }
+    let Some(host_handle) = take_host_handle(tid) else {
+        return ESRCH;
     };
     if trace_threads() {
         trace_line("pthread_join tid=", tid as i64);
@@ -1160,18 +1208,8 @@ unsafe extern "C" fn eclipse_pthread_join(thread: usize, retval: *mut *mut c_voi
 
 unsafe extern "C" fn eclipse_pthread_detach(thread: usize) -> c_int {
     let tid = thread as i32;
-    let host_handle = {
-        let mut reg = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        match reg.iter_mut().find(|(t, _)| *t == tid) {
-            Some((_, entry)) => {
-                if entry.detached {
-                    return 0;
-                }
-                entry.detached = true;
-                entry.host_handle
-            }
-            None => return 3,
-        }
+    let Some(host_handle) = take_host_handle(tid) else {
+        return ESRCH;
     };
     if trace_threads() {
         trace_line("pthread_detach tid=", tid as i64);
@@ -1479,62 +1517,79 @@ pub fn register_natives(mut register: impl FnMut(&'static str, u64)) {
 const SEM_WORDS: usize = 4;
 const SEM_COUNT: usize = 0;
 
-unsafe extern "C" fn eclipse_sem_init(s: *mut c_void, _pshared: c_int, value: c_int) -> c_int {
-    if s.is_null() {
-        return EINVAL;
-    }
+const SEM_VALUE_MAX: i32 = 0x3FFF_FFFF;
 
-    unsafe {
-        if let Some(c) = word(s, SEM_COUNT, SEM_WORDS) {
-            c.store(value, Ordering::Release);
+fn fail_with_errno(code: c_int) -> c_int {
+    unsafe { *libc::__errno_location() = code };
+    -1
+}
+
+unsafe extern "C" fn eclipse_sem_init(s: *mut c_void, _pshared: c_int, value: c_uint) -> c_int {
+    let Some(value) = i32::try_from(value)
+        .ok()
+        .filter(|&value| value <= SEM_VALUE_MAX)
+    else {
+        return fail_with_errno(EINVAL);
+    };
+    let Some(count) = (unsafe { word(s, SEM_COUNT, SEM_WORDS) }) else {
+        return fail_with_errno(EINVAL);
+    };
+    count.store(value, Ordering::Release);
+    0
+}
+
+const SEM_CONTENDED: i32 = -1;
+
+fn sem_take(count: &AtomicI32) -> i32 {
+    let mut current = count.load(Ordering::Relaxed);
+    while current >= 0 {
+        match count.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
         }
+    }
+    current
+}
+
+unsafe extern "C" fn eclipse_sem_wait(s: *mut c_void) -> c_int {
+    let Some(count) = (unsafe { word(s, SEM_COUNT, SEM_WORDS) }) else {
+        return fail_with_errno(EINVAL);
+    };
+    while sem_take(count) <= 0 {
+        futex_wait(count, SEM_CONTENDED);
     }
     0
 }
 
-unsafe extern "C" fn eclipse_sem_wait(s: *mut c_void) -> c_int {
-    if s.is_null() {
-        return EINVAL;
-    }
-
-    unsafe {
-        let count = match word(s, SEM_COUNT, SEM_WORDS) {
-            Some(c) => c,
-            None => return EINVAL,
-        };
-        loop {
-            let cur = count.load(Ordering::Acquire);
-            if cur > 0 {
-                if count
-                    .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return 0;
-                }
-            } else {
-                futex_wait(count, 0);
-            }
-        }
-    }
-}
-
 unsafe extern "C" fn eclipse_sem_post(s: *mut c_void) -> c_int {
-    if s.is_null() {
-        return EINVAL;
-    }
-
-    unsafe {
-        if let Some(count) = word(s, SEM_COUNT, SEM_WORDS) {
-            count.fetch_add(1, Ordering::Release);
-            futex_wake(count, 1);
+    let Some(count) = (unsafe { word(s, SEM_COUNT, SEM_WORDS) }) else {
+        return fail_with_errno(EINVAL);
+    };
+    let mut current = count.load(Ordering::Relaxed);
+    loop {
+        if current >= SEM_VALUE_MAX {
+            return fail_with_errno(EOVERFLOW);
         }
+        let next = current.max(0) + 1;
+        match count.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+    if current < 0 {
+        futex_wake(count, c_int::MAX);
     }
     0
 }
 
 unsafe extern "C" fn eclipse_sem_destroy(s: *mut c_void) -> c_int {
     if s.is_null() {
-        EINVAL
+        fail_with_errno(EINVAL)
     } else {
         0
     }
@@ -2145,7 +2200,6 @@ mod tests {
             assert_eq!(eclipse_pthread_rwlock_rdlock(n), EINVAL);
             assert_eq!(eclipse_pthread_rwlock_wrlock(n), EINVAL);
             assert_eq!(eclipse_pthread_once(n, None), EINVAL);
-            assert_eq!(eclipse_sem_wait(n), EINVAL);
             assert_eq!(eclipse_pthread_key_create(n, None), EINVAL);
         }
     }
@@ -2337,5 +2391,296 @@ mod tests {
                 "unknown TID → ESRCH"
             );
         }
+    }
+
+    fn wait_until_parked_in_futex(tid: i32) {
+        let path = format!("/proc/self/task/{tid}/syscall");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match std::fs::read_to_string(&path) {
+                Ok(syscall) if syscall.starts_with(&format!("{SYS_FUTEX} ")) => return,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    return;
+                }
+            }
+        }
+        panic!("thread {tid} never parked in futex");
+    }
+
+    fn leaked_rwlock() -> usize {
+        Box::leak(zeroed_words(RWLOCK_WORDS)).as_mut_ptr() as usize
+    }
+
+    #[test]
+    fn rwlock_parked_reader_wakes_when_the_writer_unlocks() {
+        use std::sync::mpsc;
+        let r = leaked_rwlock();
+        unsafe { assert_eq!(eclipse_pthread_rwlock_wrlock(r as *mut c_void), 0) };
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tid_tx.send(gettid()).unwrap();
+            let rc = unsafe { eclipse_pthread_rwlock_rdlock(r as *mut c_void) };
+            done_tx.send(rc).unwrap();
+            unsafe { eclipse_pthread_rwlock_unlock(r as *mut c_void) };
+        });
+        wait_until_parked_in_futex(tid_rx.recv().unwrap());
+        unsafe { assert_eq!(eclipse_pthread_rwlock_unlock(r as *mut c_void), 0) };
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(0),
+            "the parked reader must acquire after the only unlock"
+        );
+    }
+
+    #[test]
+    fn rwlock_parked_writer_wakes_when_the_last_reader_unlocks() {
+        use std::sync::mpsc;
+        let r = leaked_rwlock();
+        unsafe {
+            assert_eq!(eclipse_pthread_rwlock_rdlock(r as *mut c_void), 0);
+            assert_eq!(eclipse_pthread_rwlock_rdlock(r as *mut c_void), 0);
+        }
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tid_tx.send(gettid()).unwrap();
+            let rc = unsafe { eclipse_pthread_rwlock_wrlock(r as *mut c_void) };
+            done_tx.send(rc).unwrap();
+            unsafe { eclipse_pthread_rwlock_unlock(r as *mut c_void) };
+        });
+        wait_until_parked_in_futex(tid_rx.recv().unwrap());
+        unsafe { assert_eq!(eclipse_pthread_rwlock_unlock(r as *mut c_void), 0) };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "one reader still holds the lock"
+        );
+        unsafe { assert_eq!(eclipse_pthread_rwlock_unlock(r as *mut c_void), 0) };
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn rwlock_reader_never_misses_the_writer_unlock_under_stress() {
+        use std::sync::atomic::AtomicUsize;
+        const ROUNDS: usize = 100_000;
+        let r = leaked_rwlock();
+        let go = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let reader = {
+            let (go, ready, done) = (Arc::clone(&go), Arc::clone(&ready), Arc::clone(&done));
+            std::thread::spawn(move || {
+                for round in 1..=ROUNDS {
+                    while go.load(Ordering::Acquire) < round {
+                        std::hint::spin_loop();
+                    }
+                    ready.store(round, Ordering::Release);
+                    unsafe {
+                        assert_eq!(eclipse_pthread_rwlock_rdlock(r as *mut c_void), 0);
+                        assert_eq!(eclipse_pthread_rwlock_unlock(r as *mut c_void), 0);
+                    }
+                    done.store(round, Ordering::Release);
+                }
+            })
+        };
+        for round in 1..=ROUNDS {
+            unsafe { assert_eq!(eclipse_pthread_rwlock_wrlock(r as *mut c_void), 0) };
+            go.store(round, Ordering::Release);
+            while ready.load(Ordering::Acquire) < round {
+                std::hint::spin_loop();
+            }
+            for _ in 0..round % 24 {
+                std::hint::spin_loop();
+            }
+            unsafe { assert_eq!(eclipse_pthread_rwlock_unlock(r as *mut c_void), 0) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while done.load(Ordering::Acquire) < round {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "round {round}: the reader slept through the only unlock"
+                );
+                std::thread::yield_now();
+            }
+        }
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn rwlock_misuse_reports_bionic_errors() {
+        let r = leaked_rwlock();
+        let rp = r as *mut c_void;
+        unsafe {
+            assert_eq!(eclipse_pthread_rwlock_init(rp, std::ptr::null()), 0);
+            assert_eq!(eclipse_pthread_rwlock_unlock(rp), EPERM, "not held");
+            assert_eq!(eclipse_pthread_rwlock_wrlock(rp), 0);
+            assert_eq!(eclipse_pthread_rwlock_wrlock(rp), EDEADLK);
+            assert_eq!(eclipse_pthread_rwlock_rdlock(rp), EDEADLK);
+            assert_eq!(eclipse_pthread_rwlock_destroy(rp), EBUSY);
+        }
+        let foreign_unlock =
+            std::thread::spawn(move || unsafe { eclipse_pthread_rwlock_unlock(r as *mut c_void) })
+                .join()
+                .unwrap();
+        assert_eq!(foreign_unlock, EPERM, "only the writer may unlock");
+        unsafe {
+            assert_eq!(eclipse_pthread_rwlock_unlock(rp), 0);
+            assert_eq!(eclipse_pthread_rwlock_rdlock(rp), 0);
+            assert_eq!(eclipse_pthread_rwlock_rdlock(rp), 0, "readers share");
+            assert_eq!(eclipse_pthread_rwlock_unlock(rp), 0);
+            assert_eq!(eclipse_pthread_rwlock_unlock(rp), 0);
+            assert_eq!(eclipse_pthread_rwlock_destroy(rp), 0);
+        }
+    }
+
+    #[test]
+    fn detach_of_joinable_thread_removes_its_registry_entry() {
+        extern "C" fn start(_a: *mut c_void) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        let mut tid: usize = 0;
+        let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+        assert_eq!(
+            unsafe {
+                eclipse_pthread_create(tp, std::ptr::null(), Some(start), std::ptr::null_mut())
+            },
+            0
+        );
+        assert_eq!(unsafe { eclipse_pthread_detach(tid) }, 0);
+        let registered = THREAD_REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(t, _)| *t == tid as i32);
+        assert!(!registered, "detach must drop the registry entry");
+        assert_eq!(
+            unsafe { eclipse_pthread_join(tid, std::ptr::null_mut()) },
+            ESRCH,
+            "a detached thread is not joinable"
+        );
+        assert_eq!(
+            unsafe { eclipse_pthread_detach(tid) },
+            ESRCH,
+            "a second detach finds nothing"
+        );
+    }
+
+    #[test]
+    fn sem_marks_contention_and_post_wakes_a_parked_waiter() {
+        use std::sync::mpsc;
+        let s: &'static mut [i32] = Box::leak(zeroed_words(SEM_WORDS));
+        let sp = s.as_mut_ptr() as usize;
+        let count = unsafe { word(sp as *mut c_void, SEM_COUNT, SEM_WORDS).unwrap() };
+        unsafe {
+            assert_eq!(eclipse_sem_init(sp as *mut c_void, 0, 0), 0);
+            assert_eq!(eclipse_sem_post(sp as *mut c_void), 0);
+        }
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            1,
+            "an uncontended post just counts"
+        );
+        unsafe { assert_eq!(eclipse_sem_wait(sp as *mut c_void), 0) };
+        assert_eq!(count.load(Ordering::Acquire), 0);
+
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tid_tx.send(gettid()).unwrap();
+            done_tx
+                .send(unsafe { eclipse_sem_wait(sp as *mut c_void) })
+                .unwrap();
+        });
+        wait_until_parked_in_futex(tid_rx.recv().unwrap());
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            SEM_CONTENDED,
+            "a parked waiter marks the semaphore contended"
+        );
+        unsafe { assert_eq!(eclipse_sem_post(sp as *mut c_void), 0) };
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(0)
+        );
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn sem_failures_return_minus_one_and_set_errno_like_bionic() {
+        let mut s = zeroed_words(SEM_WORDS);
+        let sp = s.as_mut_ptr() as *mut c_void;
+        let n = std::ptr::null_mut::<c_void>();
+        let failure = |call: &dyn Fn() -> c_int| {
+            unsafe { *libc::__errno_location() = 0 };
+            (call(), eclipse_errno_value())
+        };
+        unsafe {
+            assert_eq!(
+                failure(&|| eclipse_sem_init(sp, 0, 0x4000_0000)),
+                (-1, EINVAL)
+            );
+            assert_eq!(failure(&|| eclipse_sem_init(n, 0, 0)), (-1, EINVAL));
+            assert_eq!(failure(&|| eclipse_sem_wait(n)), (-1, EINVAL));
+            assert_eq!(failure(&|| eclipse_sem_post(n)), (-1, EINVAL));
+            assert_eq!(failure(&|| eclipse_sem_destroy(n)), (-1, EINVAL));
+
+            assert_eq!(eclipse_sem_init(sp, 0, 0x3FFF_FFFF), 0);
+            assert_eq!(failure(&|| eclipse_sem_post(sp)), (-1, EOVERFLOW));
+            assert_eq!(
+                word(sp, SEM_COUNT, SEM_WORDS)
+                    .unwrap()
+                    .load(Ordering::Acquire),
+                0x3FFF_FFFF,
+                "an overflowing post leaves the value unchanged"
+            );
+            assert_eq!(eclipse_sem_wait(sp), 0);
+            assert_eq!(eclipse_sem_post(sp), 0);
+        }
+    }
+
+    #[test]
+    fn cached_thread_ids_match_the_kernel_in_every_thread() {
+        let kernel_tid = || unsafe { libc::syscall(SYS_GETTID) as i32 };
+        unsafe {
+            assert_eq!(eclipse_gettid(), kernel_tid());
+            assert_eq!(eclipse_pthread_self(), kernel_tid() as usize);
+        }
+        let others: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || unsafe {
+                    (eclipse_gettid(), eclipse_pthread_self(), kernel_tid())
+                })
+            })
+            .collect();
+        for other in others {
+            let (cached, self_id, kernel) = other.join().unwrap();
+            assert_eq!(cached, kernel);
+            assert_eq!(self_id, kernel as usize);
+        }
+    }
+
+    #[test]
+    fn fork_child_sees_its_own_thread_id() {
+        assert_ne!(gettid(), 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let fresh = unsafe { eclipse_gettid() } == unsafe { libc::syscall(SYS_GETTID) as i32 };
+            unsafe { libc::_exit(if fresh { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the child recomputed its thread id"
+        );
     }
 }
