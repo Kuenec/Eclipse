@@ -149,6 +149,10 @@ impl PendingPointerMotion {
     }
 }
 
+fn flushes_pending_motion(input: Option<crate::loader::native_provider::HostInputKind>) -> bool {
+    input != Some(crate::loader::native_provider::HostInputKind::Pointer)
+}
+
 fn next_wake(deadlines: impl IntoIterator<Item = Option<std::time::Instant>>) -> ControlFlow {
     deadlines
         .into_iter()
@@ -322,10 +326,11 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         use crate::loader::native_provider::{classify_winit_event, host_input_should_wake};
 
-        if self.handed_off && host_input_should_wake(classify_winit_event(&event)) {
+        let input = classify_winit_event(&event);
+        if self.handed_off && host_input_should_wake(input) {
             self.loopers_need_wake = true;
         }
-        if !matches!(event, WindowEvent::CursorMoved { .. }) {
+        if flushes_pending_motion(input) {
             self.flush_pointer_motion();
         }
         match event {
@@ -6388,6 +6393,22 @@ mod tests {
             Some(std::time::Duration::from_nanos(6_944_637))
         );
         assert_eq!(profile(None).frame(), None);
+    }
+
+    #[test]
+    fn pending_motion_is_flushed_before_any_other_event_is_handled() {
+        use crate::loader::native_provider::HostInputKind;
+
+        assert!(!flushes_pending_motion(Some(HostInputKind::Pointer)));
+        for input in [
+            Some(HostInputKind::MouseButton),
+            Some(HostInputKind::Scroll),
+            Some(HostInputKind::Key),
+            Some(HostInputKind::Touch),
+            None,
+        ] {
+            assert!(flushes_pending_motion(input), "{input:?}");
+        }
     }
 
     #[test]

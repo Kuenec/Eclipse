@@ -1849,8 +1849,8 @@ pub(crate) fn present_staged_webview_frame(view: i64) {
     });
 }
 
-fn release_idle_web_gpu() {
-    if !WEB_GPU_HELD.swap(false, Ordering::AcqRel) {
+fn release_idle_web_gpu(active_view: i64) {
+    if active_view != 0 || !WEB_GPU_HELD.swap(false, Ordering::AcqRel) {
         return;
     }
     *WEB_COMPOSITE
@@ -2630,6 +2630,14 @@ fn ensure_probe(rect: vk::Rect2D) {
     let _ = ensure_probe_in(&PROBE, rect);
 }
 
+fn ensure_web_composite(rect: vk::Rect2D) -> bool {
+    let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect);
+    if rebuilt {
+        WEB_GPU_HELD.store(true, Ordering::Release);
+    }
+    rebuilt
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompositeFormat {
     Bgra,
@@ -2780,10 +2788,7 @@ fn composite_webview_frame(
                 height: ch,
             },
         };
-        let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect);
-        if rebuilt {
-            WEB_GPU_HELD.store(true, Ordering::Release);
-        }
+        let rebuilt = ensure_web_composite(rect);
         let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
         let source = WebFrameSource {
             bytes: stage.bytes,
@@ -2902,11 +2907,10 @@ unsafe fn present_with_overlay(
     host: vk::PFN_vkQueuePresentKHR,
     queue: vk::Queue,
     p_present_info: *const vk::PresentInfoKHR<'_>,
+    active_view: i64,
 ) -> vk::Result {
-    let webview_live = crate::webview::client::active_view() != 0;
-    if !webview_live {
-        release_idle_web_gpu();
-    }
+    release_idle_web_gpu(active_view);
+    let webview_live = active_view != 0;
     if p_present_info.is_null() {
         return unsafe { host(queue, p_present_info) };
     }
@@ -3031,7 +3035,14 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
 
     note_engine_present();
     let _swapchain = swapchain_lock();
-    unsafe { present_with_overlay(host, queue, p_present_info) }
+    unsafe {
+        present_with_overlay(
+            host,
+            queue,
+            p_present_info,
+            crate::webview::client::active_view(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3795,6 +3806,13 @@ mod tests {
         vk::Result::SUCCESS
     }
 
+    unsafe extern "system" fn stub_present_without_info(
+        _queue: vk::Queue,
+        _info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        vk::Result::SUCCESS
+    }
+
     unsafe extern "system" fn stub_presenter_proc_addr(
         _device: vk::Device,
         name: *const c_char,
@@ -3878,8 +3896,20 @@ mod tests {
         );
     }
 
+    fn web_gpu_held() -> (bool, bool, bool) {
+        let composite = WEB_COMPOSITE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        let presenter = WEB_PRESENTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        (composite, presenter, WEB_GPU_HELD.load(Ordering::SeqCst))
+    }
+
     #[test]
-    fn idle_webview_gpu_resources_are_released() {
+    fn webview_gpu_resources_live_only_while_a_webview_is_shown() {
         let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(gpu) = headless_gpu() else {
             return;
@@ -3895,25 +3925,24 @@ mod tests {
             extent.height,
             vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
         );
-        let saved = HOST_GDPA.swap(
+        let saved_gdpa = HOST_GDPA.swap(
             stub_presenter_proc_addr as *const () as u64,
             Ordering::SeqCst,
         );
-        let presenter = WebPresenter::build(
-            &gpu.entry,
-            EngineHandles {
-                instance: gpu.instance.handle().as_raw(),
-                device: gpu.device.handle().as_raw(),
-                physical_device: gpu.physical_device.as_raw(),
-                queue_family: gpu.queue_family,
-            },
-            0,
-            0x5D,
-            extent,
-            format,
-            vec![image.as_raw()],
-        );
-        HOST_GDPA.store(saved, Ordering::SeqCst);
+        let saved_instance = INSTANCE.swap(gpu.instance.handle().as_raw(), Ordering::SeqCst);
+        let saved_physical = PHYSICAL_DEVICE.swap(gpu.physical_device.as_raw(), Ordering::SeqCst);
+        let saved_family = QUEUE_FAMILY.swap(gpu.queue_family, Ordering::SeqCst);
+        let saved_queue = WEB_PRESENT_QUEUE_INDEX.swap(0, Ordering::SeqCst);
+        *STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = OverlayState {
+            device: gpu.device.handle().as_raw(),
+            swapchain: 0x5D,
+            format: format.as_raw(),
+            width: extent.width,
+            height: extent.height,
+            images: vec![image.as_raw()],
+        };
         let rect = vk::Rect2D {
             offset: vk::Offset2D { x: 4, y: 2 },
             extent: vk::Extent2D {
@@ -3921,28 +3950,71 @@ mod tests {
                 height: 4,
             },
         };
+
+        let present = |active_view| unsafe {
+            present_with_overlay(
+                stub_present_without_info,
+                vk::Queue::null(),
+                std::ptr::null(),
+                active_view,
+            )
+        };
+
+        let composite_built = ensure_web_composite(rect);
+        let composite_only = web_gpu_held();
+        let first_close = present(0);
+        let composite_freed = web_gpu_held();
+        let presenter_built = ensure_web_presenter();
+        let presenter_only = web_gpu_held();
+        let composite_rebuilt = ensure_web_composite(rect);
+        let shown = present(0x5D);
+        let while_shown = web_gpu_held();
+        let second_close = present(0);
+        let after_close = web_gpu_held();
+
         *WEB_COMPOSITE
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(build_probe(&gpu, rect));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *WEB_PRESENTER
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(presenter.expect("WebView presenter"));
-        WEB_GPU_HELD.store(true, Ordering::SeqCst);
-
-        release_idle_web_gpu();
-
-        let composite_held = WEB_COMPOSITE
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        WEB_GPU_HELD.store(false, Ordering::SeqCst);
+        *STATE
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-        let presenter_held = WEB_PRESENTER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-        assert!(!composite_held, "the WebView composite buffer is freed");
-        assert!(!presenter_held, "the WebView presenter images are freed");
-        assert!(!WEB_GPU_HELD.load(Ordering::SeqCst));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = OverlayState::default();
+        WEB_PRESENT_QUEUE_INDEX.store(saved_queue, Ordering::SeqCst);
+        QUEUE_FAMILY.store(saved_family, Ordering::SeqCst);
+        PHYSICAL_DEVICE.store(saved_physical, Ordering::SeqCst);
+        INSTANCE.store(saved_instance, Ordering::SeqCst);
+        HOST_GDPA.store(saved_gdpa, Ordering::SeqCst);
+
+        assert_eq!(
+            composite_only,
+            (true, false, true),
+            "building the composite buffer marks WebView GPU memory as held"
+        );
+        assert_eq!(
+            composite_freed,
+            (false, false, false),
+            "a present without a WebView frees the composite buffer"
+        );
+        assert_eq!(
+            presenter_only,
+            (false, true, true),
+            "building the presenter marks WebView GPU memory as held"
+        );
+        assert_eq!(
+            while_shown,
+            (true, true, true),
+            "presenting with a WebView shown keeps its GPU resources"
+        );
+        assert_eq!(
+            after_close,
+            (false, false, false),
+            "the first present without a WebView frees its GPU resources"
+        );
+        assert!(composite_built && composite_rebuilt && presenter_built);
+        assert_eq!([first_close, shown, second_close], [vk::Result::SUCCESS; 3]);
     }
 
     #[test]
