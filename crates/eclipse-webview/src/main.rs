@@ -755,23 +755,22 @@ fn main() -> ExitCode {
     }
 
     let allow_unsandboxed = std::env::args().any(|a| a == "--allow-unsandboxed");
-    let (sandbox_host, suid_path) = if engine::zypak_sandbox_available(
+    let sandbox_host = if engine::zypak_sandbox_available(
         Path::new(FLATPAK_INFO).exists(),
         std::env::var_os("ZYPAK_BIN").as_deref(),
         std::env::var_os("ZYPAK_LIB").as_deref(),
     ) {
-        (engine::SandboxHost::FlatpakZypak, None)
+        engine::SandboxHost::FlatpakZypak
     } else {
-        let suid_path = std::env::current_exe()
+        let suid_sandbox = std::env::current_exe()
             .ok()
             .as_deref()
             .and_then(Path::parent)
             .and_then(probe_suid_sandbox);
-        let host = engine::SandboxHost::Native {
+        engine::SandboxHost::Native {
             userns_ok: probe_userns(),
-            suid_ok: suid_path.is_some(),
-        };
-        (host, suid_path)
+            suid_sandbox,
+        }
     };
     let sandbox_mode = match engine::select_sandbox_mode(sandbox_host, allow_unsandboxed) {
         Ok(mode) => mode,
@@ -799,9 +798,7 @@ fn main() -> ExitCode {
             "sandbox mode selected: userns (unprivileged user namespaces verified USABLE by a \
              live unshare + in-namespace capability probe)",
         ),
-        engine::SandboxMode::Suid => {
-            let path = suid_path.as_deref().unwrap_or(Path::new("chrome-sandbox"));
-
+        engine::SandboxMode::Suid(path) => {
             std::env::set_var("CHROME_DEVEL_SANDBOX", path);
             log::info(
                 COMPONENT,

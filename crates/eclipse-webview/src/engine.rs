@@ -144,16 +144,19 @@ pub enum SandboxMode {
 
     Userns,
 
-    Suid,
+    Suid(PathBuf),
 
     Degraded,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxHost {
     FlatpakZypak,
 
-    Native { userns_ok: bool, suid_ok: bool },
+    Native {
+        userns_ok: bool,
+        suid_sandbox: Option<PathBuf>,
+    },
 }
 
 pub fn zypak_sandbox_available(
@@ -193,7 +196,10 @@ pub fn select_sandbox_mode(
         SandboxHost::Native {
             userns_ok: true, ..
         } => Ok(SandboxMode::Userns),
-        SandboxHost::Native { suid_ok: true, .. } => Ok(SandboxMode::Suid),
+        SandboxHost::Native {
+            suid_sandbox: Some(path),
+            ..
+        } => Ok(SandboxMode::Suid(path)),
         SandboxHost::Native { .. } if allow_unsandboxed => Ok(SandboxMode::Degraded),
         SandboxHost::Native { .. } => Err(SandboxUnavailable),
     }
@@ -2273,13 +2279,23 @@ mod tests {
     #[test]
     fn sandbox_mode_selection_prefers_userns_then_suid_then_policy() {
         use SandboxMode::*;
-        let native = |userns_ok, suid_ok| SandboxHost::Native { userns_ok, suid_ok };
+        let sandbox = PathBuf::from("/opt/eclipse/chrome-sandbox");
+        let native = |userns_ok, suid_ok: bool| SandboxHost::Native {
+            userns_ok,
+            suid_sandbox: suid_ok.then(|| sandbox.clone()),
+        };
         assert_eq!(select_sandbox_mode(native(true, true), true), Ok(Userns));
         assert_eq!(select_sandbox_mode(native(true, true), false), Ok(Userns));
         assert_eq!(select_sandbox_mode(native(true, false), true), Ok(Userns));
         assert_eq!(select_sandbox_mode(native(true, false), false), Ok(Userns));
-        assert_eq!(select_sandbox_mode(native(false, true), true), Ok(Suid));
-        assert_eq!(select_sandbox_mode(native(false, true), false), Ok(Suid));
+        assert_eq!(
+            select_sandbox_mode(native(false, true), true),
+            Ok(Suid(sandbox.clone()))
+        );
+        assert_eq!(
+            select_sandbox_mode(native(false, true), false),
+            Ok(Suid(sandbox.clone()))
+        );
         assert_eq!(
             select_sandbox_mode(native(false, false), true),
             Ok(Degraded)
@@ -2333,7 +2349,10 @@ mod tests {
         for (mode, expected) in [
             (SandboxMode::Zypak, 0),
             (SandboxMode::Userns, 0),
-            (SandboxMode::Suid, 0),
+            (
+                SandboxMode::Suid(PathBuf::from("/opt/eclipse/chrome-sandbox")),
+                0,
+            ),
             (SandboxMode::Degraded, 1),
         ] {
             let mut settings = build_settings_with_ua(ECLIPSE_USER_AGENT);
