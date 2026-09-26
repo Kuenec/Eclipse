@@ -109,6 +109,89 @@ jobs:
       - name: Check every target against the MSRV
         run: cargo check --all-targets --locked
 
+  webview:
+    name: WebView helper
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: crates/eclipse-webview
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install CEF runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev libgbm1 libgtk-3-dev libnss3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: webview
+          workspaces: crates/eclipse-webview -> target
+
+      - name: Require Cargo.lock to use the pinned CEF archive
+        id: cef
+        run: |
+          pin() { sed -n "s/^$1=\"\(.*\)\"$/\1/p" ../../tools/webview-dist/package-webview.sh; }
+          archive="$(pin PIN_ARCHIVE)"
+          version="${archive#cef_binary_}"
+          version="${version%%+*}"
+          locked="$(sed -n '/^name = "cef-dll-sys"$/{n;s/^version = ".*+\(.*\)"$/\1/p}' Cargo.lock)"
+          if [ "$locked" != "$version" ]; then
+            echo "::error::cef-dll-sys in Cargo.lock builds against CEF $locked, not the pinned $version; move the pins in tools/webview-dist/package-webview.sh with the cef crate"
+            exit 1
+          fi
+          {
+            echo "archive=$archive"
+            echo "sha1=$(pin PIN_SHA1)"
+            echo "dir=$RUNNER_TEMP/cef/$version/cef_linux_x86_64"
+          } >> "$GITHUB_OUTPUT"
+          echo "CEF_PATH=$RUNNER_TEMP/cef" >> "$GITHUB_ENV"
+
+      - name: Restore the CEF distribution
+        id: cef-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.cef.outputs.dir }}
+          key: cef-${{ steps.cef.outputs.archive }}
+
+      - name: Build the helper and its tests
+        run: cargo build --all-targets --locked
+
+      - name: Require the pinned CEF distribution
+        env:
+          CEF_DIR: ${{ steps.cef.outputs.dir }}
+          PIN_ARCHIVE: ${{ steps.cef.outputs.archive }}
+          PIN_SHA1: ${{ steps.cef.outputs.sha1 }}
+        run: |
+          fail() { echo "::error::$1; move the pins in tools/webview-dist/package-webview.sh with the cef crate"; exit 1; }
+          field() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CEF_DIR/archive.json"; }
+          [ -f "$CEF_DIR/archive.json" ] || fail "the helper did not build against $PIN_ARCHIVE"
+          [ "$(field name)" = "$PIN_ARCHIVE" ] || fail "$CEF_DIR holds $(field name), not $PIN_ARCHIVE"
+          [ "$(field sha1)" = "$PIN_SHA1" ] || fail "$CEF_DIR has sha1 $(field sha1), not $PIN_SHA1"
+
+      - name: Save the CEF distribution
+        if: steps.cef-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.cef.outputs.dir }}
+          key: cef-${{ steps.cef.outputs.archive }}
+
+      - name: Lint the WebView helper
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test the WebView helper
+        env:
+          LD_LIBRARY_PATH: ${{ steps.cef.outputs.dir }}
+        run: cargo test --all-targets --locked
+
   release-build:
     name: Release build
     runs-on: ubuntu-latest
@@ -155,7 +238,7 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [quality, test, msrv, release-build]
+    needs: [quality, test, msrv, webview, release-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require every CI job
@@ -163,9 +246,11 @@ jobs:
           QUALITY_RESULT: ${{ needs.quality.result }}
           TEST_RESULT: ${{ needs.test.result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
+          WEBVIEW_RESULT: ${{ needs.webview.result }}
           BUILD_RESULT: ${{ needs.release-build.result }}
         run: |
           test "$QUALITY_RESULT" = success
           test "$TEST_RESULT" = success
           test "$MSRV_RESULT" = success
+          test "$WEBVIEW_RESULT" = success
           test "$BUILD_RESULT" = success
