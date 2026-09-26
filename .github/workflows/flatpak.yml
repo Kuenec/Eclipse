@@ -1,0 +1,177 @@
+name: Flatpak
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: flatpak
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FLATPAK_ID: io.github.kuenec.Eclipse
+  FLATPAK_BRANCH: stable
+  FLATPAK_BUNDLE: eclipse-x86_64.flatpak
+  FLATHUB_REPO: https://dl.flathub.org/repo/flathub.flatpakrepo
+
+jobs:
+  build:
+    name: Build Flatpak
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      pages: read
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Resolve the GitHub Pages URL (Settings, Pages, Source must be GitHub Actions)
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Import the repository signing key from the FLATPAK_GPG_PRIVATE_KEY secret
+        id: gpg
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$FLATPAK_GPG_PRIVATE_KEY" ]; then
+            echo "::error::Store an ASCII-armored GPG private key without a passphrase as the repository secret FLATPAK_GPG_PRIVATE_KEY"
+            exit 1
+          fi
+          printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          if [ -z "$fingerprint" ]; then
+            echo "::error::FLATPAK_GPG_PRIVATE_KEY does not contain a secret key"
+            exit 1
+          fi
+          gpg --batch --export "$fingerprint" > "$RUNNER_TEMP/flatpak-signing-key.gpg"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the published OSTree repository
+        env:
+          PAGES_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          ostree --repo=repo init --mode=archive-z2
+          status="$(curl --silent --location --output /dev/null --write-out '%{http_code}' "$PAGES_URL/repo/config")"
+          case "$status" in
+            200)
+              ostree --repo=repo remote add --gpg-import="$RUNNER_TEMP/flatpak-signing-key.gpg" published "$PAGES_URL/repo"
+              ostree --repo=repo pull --mirror --depth=0 published "app/$FLATPAK_ID/x86_64/$FLATPAK_BRANCH"
+              ostree --repo=repo remote delete published
+              ;;
+            404)
+              echo "No OSTree repository is published at $PAGES_URL/repo yet; starting a new one"
+              ;;
+            *)
+              echo "::error::GitHub Pages answered HTTP $status for $PAGES_URL/repo/config"
+              exit 1
+              ;;
+          esac
+
+      - name: Build and sign the Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6.8
+        with:
+          manifest-path: packaging/flatpak/io.github.kuenec.Eclipse.yml
+          branch: ${{ env.FLATPAK_BRANCH }}
+          build-bundle: false
+          repo-dir: repo
+          cache-key: flatpak-builder-${{ hashFiles('packaging/flatpak/**') }}
+          gpg-sign: ${{ steps.gpg.outputs.fingerprint }}
+
+      - name: Prune the repository and create the bundle and repository descriptions
+        env:
+          PAGES_URL: ${{ steps.pages.outputs.base_url }}
+          GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+        run: |
+          flatpak build-update-repo --prune --prune-depth=1 --gpg-sign="$GPG_FINGERPRINT" \
+            --title=Eclipse --default-branch="$FLATPAK_BRANCH" \
+            --homepage="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" repo
+          flatpak build-bundle --arch=x86_64 --repo-url="$PAGES_URL/repo/" \
+            --runtime-repo="$FLATHUB_REPO" --gpg-keys="$RUNNER_TEMP/flatpak-signing-key.gpg" \
+            repo "$FLATPAK_BUNDLE" "$FLATPAK_ID" "$FLATPAK_BRANCH"
+          gpg_key="$(base64 --wrap=0 "$RUNNER_TEMP/flatpak-signing-key.gpg")"
+          mkdir site
+          mv repo site/repo
+          cp "packaging/flatpak/$FLATPAK_ID.svg" "site/$FLATPAK_ID.svg"
+          cat > "site/$FLATPAK_ID.flatpakrepo" <<EOF
+          [Flatpak Repo]
+          Title=Eclipse
+          Url=$PAGES_URL/repo/
+          Homepage=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+          Comment=Run the Android Roblox client on Linux
+          Icon=$PAGES_URL/$FLATPAK_ID.svg
+          GPGKey=$gpg_key
+          EOF
+          cat > "site/$FLATPAK_ID.flatpakref" <<EOF
+          [Flatpak Ref]
+          Name=$FLATPAK_ID
+          Branch=$FLATPAK_BRANCH
+          Title=Eclipse
+          Url=$PAGES_URL/repo/
+          SuggestRemoteName=eclipse
+          RuntimeRepo=$FLATHUB_REPO
+          IsRuntime=false
+          GPGKey=$gpg_key
+          EOF
+
+      - name: Upload the Flatpak bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.FLATPAK_BUNDLE }}
+          path: ${{ env.FLATPAK_BUNDLE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the OSTree repository for GitHub Pages
+        if: github.ref_type == 'tag'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  pages:
+    name: Publish the OSTree repository
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  release:
+    name: Attach the bundle to the GitHub release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the Flatpak bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.FLATPAK_BUNDLE }}
+
+      - name: Attach the bundle to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+              --title "Eclipse $GITHUB_REF_NAME" --verify-tag \
+            || gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" "$FLATPAK_BUNDLE" --repo "$GITHUB_REPOSITORY" --clobber
