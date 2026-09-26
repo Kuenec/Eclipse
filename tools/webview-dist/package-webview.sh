@@ -70,8 +70,7 @@ guard_out() {
     [ -d "$OUT" ] || fail "OUT ($OUT) exists and is not a directory"
     [ -z "$(ls -A "$OUT")" ] && return 0
     [ -f "$OUT/.eclipse-webview-payload" ] && return 0
-    { [ -f "$OUT/eclipse-webview" ] && [ -f "$OUT/libcef.so" ]; } && return 0
-    fail "OUT ($OUT) exists, is non-empty, and is not a previous run's payload (no .eclipse-webview-payload stamp, no eclipse-webview+libcef.so pair) — refusing to wipe a directory this script did not create (point OUT at a new/empty directory)"
+    fail "OUT ($OUT) exists, is non-empty, and is not a previous run's payload (no .eclipse-webview-payload stamp) — refusing to wipe a directory this script did not create (point OUT at a new/empty directory)"
 }
 guard_out
 
