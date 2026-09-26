@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
 use std::io::Write;
 use std::mem::ManuallyDrop;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use jni_sys::{
@@ -11,14 +11,12 @@ use jni_sys::{
 };
 
 use super::bionic_env::BionicEnv;
-use super::elf::{DynSym, PF_X};
-use super::link::Linker;
-use super::map::host_page_size;
+use super::elf::{DynSym, ElfImage, PF_X};
+use super::link::{Linker, LoadedObject};
+use super::map::{host_page_size, MappedObject};
 use super::resolve::{LoadedObjectProvider, Scope, SymbolProvider};
 
 use super::init_run::{init_array_count, init_array_entry_offset};
-
-const LIB_X86_64_DIR: &str = "lib/x86_64";
 
 const LIBROBLOX_FILENAME: &str = "libroblox.so";
 
@@ -44,9 +42,9 @@ pub fn is_preloaded(name: &str) -> bool {
 const JNI_ONLOAD_SYMBOL: &str = "JNI_OnLoad";
 
 pub struct LoadedEngine {
-    set: super::link::LoadedImageSet,
+    mapped: MappedObject,
 
-    base: u64,
+    soname: String,
 
     dynsyms: Vec<DynSym>,
 
@@ -58,7 +56,7 @@ pub struct LoadedEngine {
 impl LoadedEngine {
     #[must_use]
     pub fn load_base(&self) -> u64 {
-        self.base
+        self.mapped.load_base()
     }
 
     #[must_use]
@@ -68,7 +66,7 @@ impl LoadedEngine {
 
     #[must_use]
     pub fn jni_onload_addr(&self) -> Option<u64> {
-        let provider = LoadedObjectProvider::new(self.base, &self.dynsyms);
+        let provider = LoadedObjectProvider::new(self.load_base(), &self.dynsyms);
         provider
             .resolve(JNI_ONLOAD_SYMBOL)
             .map(|resolved| resolved.addr)
@@ -76,7 +74,7 @@ impl LoadedEngine {
 
     #[must_use]
     pub fn resolve_export(&self, name: &str) -> Option<u64> {
-        LoadedObjectProvider::new(self.base, &self.dynsyms)
+        LoadedObjectProvider::new(self.load_base(), &self.dynsyms)
             .resolve(name)
             .map(|resolved| resolved.addr)
     }
@@ -93,17 +91,13 @@ impl LoadedEngine {
                     && (s.bind == STB_GLOBAL || s.bind == STB_WEAK)
                     && s.name.starts_with("Java_")
             })
-            .map(|s| (s.name.clone(), self.base.wrapping_add(s.value)))
+            .map(|s| (s.name.clone(), self.load_base().wrapping_add(s.value)))
             .collect()
     }
 }
 
 #[derive(Debug)]
 pub enum EngineLoadError {
-    Apk(String, String),
-
-    Stage(String),
-
     Link(String),
 
     UnresolvedImports(usize, Vec<String>),
@@ -122,9 +116,7 @@ pub enum EngineLoadError {
 impl std::fmt::Display for EngineLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Apk(entry, e) => write!(f, "read {entry} from APK: {e}"),
-            Self::Stage(e) => write!(f, "stage libroblox.so: {e}"),
-            Self::Link(e) => write!(f, "map/relocate/resolve libroblox.so: {e}"),
+            Self::Link(e) => write!(f, "map/relocate/resolve {e}"),
             Self::UnresolvedImports(n, names) => {
                 write!(
                     f,
@@ -146,47 +138,19 @@ impl std::fmt::Display for EngineLoadError {
 
 impl std::error::Error for EngineLoadError {}
 
-pub fn load_libroblox(
-    apk_path: &Path,
-    log: &mut impl Write,
-) -> Result<LoadedEngine, EngineLoadError> {
-    let engine = map_resolve_app_lib(apk_path, LIBROBLOX_FILENAME, None, log)?;
-
-    if engine.init_array.is_none() {
-        return Err(EngineLoadError::NoInitArray);
-    }
-    Ok(engine)
-}
-
 fn map_resolve_app_lib(
-    apk_path: &Path,
+    lib_dir: &Path,
     filename: &str,
-    search_dir: Option<&Path>,
     log: &mut impl Write,
 ) -> Result<LoadedEngine, EngineLoadError> {
-    let entry = format!("{LIB_X86_64_DIR}/{filename}");
+    let so_path = lib_dir.join(filename);
     let _ = writeln!(
         log,
-        "engine-load: routing {entry} through Eclipse's Rust loader"
+        "engine-load: routing {} through Eclipse's Rust loader",
+        so_path.display()
     );
 
-    super::ndk_registry::set_apk_path(apk_path.to_path_buf());
-    let mut apk = crate::apk::Apk::open(apk_path)
-        .map_err(|e| EngineLoadError::Apk(entry.clone(), e.to_string()))?;
-    let so_bytes = apk
-        .read_entry(&entry)
-        .map_err(|e| EngineLoadError::Apk(entry.clone(), e.to_string()))?;
-    let _ = writeln!(log, "engine-load: {filename} = {} bytes", so_bytes.len());
-
-    let dir = std::env::temp_dir().join(format!("eclipse-engine-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| EngineLoadError::Stage(e.to_string()))?;
-    let so_path = dir.join(filename);
-    std::fs::write(&so_path, &so_bytes).map_err(|e| EngineLoadError::Stage(e.to_string()))?;
-
-    let search_paths: Vec<std::path::PathBuf> = search_dir
-        .map(|d| vec![d.to_path_buf()])
-        .unwrap_or_default();
-    let linker = Linker::new(search_paths)
+    let linker = Linker::new(Vec::<PathBuf>::new())
         .with_host_fallback(false)
         .with_tolerate_missing_deps(true);
     let mut set = linker
@@ -195,28 +159,30 @@ fn map_resolve_app_lib(
     let page = host_page_size();
     let _ = writeln!(
         log,
-        "engine-load: mapped objects={} RELATIVE_applied={} RELRO_applied={}",
-        set.objects.len(),
-        set.stats.relative_applied,
-        set.relro_applied
+        "engine-load: mapped {filename} RELATIVE_applied={} RELRO_applied={}",
+        set.stats.relative_applied, set.relro_applied
     );
 
-    let base = set.objects[0].load_base();
-    let soname = set.objects[0].soname.clone();
-    let dynsyms = {
-        let img = set.objects[0]
-            .image()
-            .map_err(|e| EngineLoadError::Link(e.to_string()))?;
-        img.dynsyms.clone()
-    };
+    let LoadedObject {
+        soname,
+        path,
+        bytes,
+        mut mapped,
+        ..
+    } = set.objects.swap_remove(0);
+    let link_error = |e: &dyn std::fmt::Display| EngineLoadError::Link(format!("{soname}: {e}"));
+    let img = ElfImage::parse(&bytes).map_err(|e| link_error(&e))?;
     let mut scope = Scope::new();
-    scope.push(Box::new(LoadedObjectProvider::new(base, &dynsyms)));
+    scope.push(Box::new(LoadedObjectProvider::new(
+        mapped.load_base(),
+        &img.dynsyms,
+    )));
     for p in BionicEnv::with_host_baseline(true, true).into_providers() {
         scope.push(p);
     }
-    let sym_stats = set
-        .relocate_object_symbols_partial(&soname, &scope, page)
-        .map_err(|e| EngineLoadError::Link(e.to_string()))?;
+    let sym_stats = mapped
+        .relocate_symbols_partial(&img, &scope, page)
+        .map_err(|e| link_error(&e))?;
     let _ = writeln!(
         log,
         "engine-load: symbol relocs applied_nonnull={} weak_zero={} unresolved_strong={}",
@@ -229,18 +195,12 @@ fn map_resolve_app_lib(
         ));
     }
 
-    let init_array = {
-        let img = set.objects[0]
-            .image()
-            .map_err(|e| EngineLoadError::Link(e.to_string()))?;
-
-        if !img.loads.iter().any(|s| s.flags & PF_X != 0) {
-            return Err(EngineLoadError::TextNotExecutable(
-                "no PF_X segment in PT_LOAD table".to_string(),
-            ));
-        }
-        img.dyn_info.init_array
-    };
+    if !img.loads.iter().any(|s| s.flags & PF_X != 0) {
+        return Err(EngineLoadError::TextNotExecutable(
+            "no PF_X segment in PT_LOAD table".to_string(),
+        ));
+    }
+    let init_array = img.dyn_info.init_array;
     match init_array {
         Some((vaddr, size)) => {
             let count = init_array_count(size);
@@ -258,48 +218,38 @@ fn map_resolve_app_lib(
     }
     let _ = log.flush();
 
-    for obj in &set.objects {
-        let obj_dynsyms = if obj.load_base() == base {
-            dynsyms.clone()
-        } else {
-            obj.image()
-                .map(|img| img.dynsyms.clone())
-                .unwrap_or_default()
-        };
-        match super::module_registry::ModuleRecord::for_image(
-            &obj.path,
-            &obj.bytes,
-            &obj_dynsyms,
-            obj.load_base(),
-            obj.mapped.span() as u64,
-        ) {
-            Ok(rec) => super::module_registry::register_module(rec),
+    let engine = LoadedEngine {
+        mapped,
+        soname,
+        dynsyms: img.dynsyms,
+        init_array,
+        constructors_run: 0,
+    };
+    match super::module_registry::ModuleRecord::for_image(
+        &path,
+        &bytes,
+        &engine.dynsyms,
+        engine.load_base(),
+        engine.mapped.span() as u64,
+    ) {
+        Ok(rec) => super::module_registry::register_module(rec),
 
-            Err(e) => {
-                let _ = writeln!(
-                    log,
-                    "engine-load: WARNING: module-registry record for {} failed ({e}) — \
-                     its PCs stay invisible to dl_iterate_phdr/dladdr",
-                    obj.soname
-                );
-            }
+        Err(e) => {
+            let _ = writeln!(
+                log,
+                "engine-load: WARNING: module-registry record for {} failed ({e}) — \
+                 its PCs stay invisible to dl_iterate_phdr/dladdr",
+                engine.soname
+            );
         }
     }
 
-    Ok(LoadedEngine {
-        set,
-        base,
-        dynsyms,
-        init_array,
-        constructors_run: 0,
-    })
+    Ok(engine)
 }
 
 impl Drop for LoadedEngine {
     fn drop(&mut self) {
-        for obj in &self.set.objects {
-            let _ = super::module_registry::unregister_module(obj.load_base());
-        }
+        let _ = super::module_registry::unregister_module(self.load_base());
     }
 }
 
@@ -308,12 +258,11 @@ impl LoadedEngine {
         let (init_array_vaddr, init_arraysz) =
             self.init_array.ok_or(EngineLoadError::NoInitArray)?;
         let count = init_array_count(init_arraysz);
-        let obj = &self.set.objects[0];
 
         let mut entries: Vec<u64> = Vec::with_capacity(count);
         for i in 0..count {
             let off = init_array_entry_offset(init_array_vaddr, i) as usize;
-            let addr = obj
+            let addr = self
                 .mapped
                 .read_u64(off)
                 .map_err(|e| EngineLoadError::ReadInitArray(e.to_string()))?;
@@ -361,7 +310,7 @@ pub fn call_jni_onload(
     let _ = writeln!(
         log,
         "engine-load: calling JNI_OnLoad @ base+{:#x} (abs {:#x}) with the ART JavaVM…",
-        addr.wrapping_sub(engine.base),
+        addr.wrapping_sub(engine.load_base()),
         addr
     );
     let _ = log.flush();
@@ -403,10 +352,9 @@ pub struct PreloadedLib {
 }
 
 pub fn load_app_native_lib(
-    apk_path: &Path,
+    lib_dir: &Path,
     filename: &str,
     java_vm: *mut JavaVM,
-    search_dir: &Path,
     log: &mut impl Write,
 ) -> Result<Option<PreloadedLib>, EngineLoadError> {
     static EARLY_FAULT_TAP: std::sync::Once = std::sync::Once::new();
@@ -427,13 +375,13 @@ pub fn load_app_native_lib(
         return Ok(None);
     }
 
-    let mut engine = map_resolve_app_lib(apk_path, filename, Some(search_dir), log)?;
-    let soname = engine.set.objects[0].soname.clone();
+    let mut engine = map_resolve_app_lib(lib_dir, filename, log)?;
+    let soname = engine.soname.clone();
 
     if filename == LIBROBLOX_FILENAME {
         super::native_provider::publish_engine_text_range(
-            engine.base,
-            engine.set.objects[0].mapped.span() as u64,
+            engine.load_base(),
+            engine.mapped.span() as u64,
         );
     }
 
@@ -504,6 +452,67 @@ fn describe_jni_version(version: jint) -> &'static str {
 mod tests {
     use super::*;
 
+    use super::super::link::tests::{build_so, temp_dir, write_so};
+    use super::super::module_registry::walk_support::collect_registered;
+
+    fn registered_module_paths() -> Vec<PathBuf> {
+        collect_registered()
+            .into_iter()
+            .map(|module| PathBuf::from(module.name))
+            .collect()
+    }
+
+    #[test]
+    fn app_lib_is_mapped_from_the_lib_dir_without_temp_staging() {
+        let filename = "libengine-test-stagecheck.so";
+        let lib_dir = temp_dir("engine-stagecheck");
+        write_so(&lib_dir, filename, &build_so(filename, &[], None, None));
+        let sentinel = lib_dir.join("sentinel");
+        std::fs::write(&sentinel, b"sentinel").expect("write sentinel");
+        let predictable_stage =
+            std::env::temp_dir().join(format!("eclipse-engine-{}", std::process::id()));
+        std::fs::create_dir_all(&predictable_stage).expect("plant stage dir");
+        std::os::unix::fs::symlink(&sentinel, predictable_stage.join(filename))
+            .expect("plant stage symlink");
+
+        let engine = map_resolve_app_lib(&lib_dir, filename, &mut std::io::sink())
+            .expect("map the lib from the lib dir");
+
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read sentinel"),
+            b"sentinel"
+        );
+        let registered = collect_registered()
+            .into_iter()
+            .find(|module| module.addr == engine.load_base())
+            .expect("the mapped lib is registered for dl_iterate_phdr/dladdr");
+        assert_eq!(PathBuf::from(registered.name), lib_dir.join(filename));
+
+        drop(engine);
+        std::fs::remove_dir_all(&predictable_stage).ok();
+        std::fs::remove_dir_all(&lib_dir).ok();
+    }
+
+    #[test]
+    fn app_lib_dependencies_in_the_lib_dir_are_not_mapped() {
+        let root = "libengine-test-root.so";
+        let dep = "libengine-test-dep.so";
+        let lib_dir = temp_dir("engine-deps");
+        write_so(&lib_dir, root, &build_so(root, &[dep], None, None));
+        write_so(&lib_dir, dep, &build_so(dep, &[], Some("dep_export"), None));
+
+        let engine =
+            map_resolve_app_lib(&lib_dir, root, &mut std::io::sink()).expect("map the root lib");
+
+        let registered = registered_module_paths();
+        assert!(registered.contains(&lib_dir.join(root)));
+        assert!(!registered.contains(&lib_dir.join(dep)));
+
+        drop(engine);
+        assert!(!registered_module_paths().contains(&lib_dir.join(root)));
+        std::fs::remove_dir_all(&lib_dir).ok();
+    }
+
     #[test]
     fn jni_onload_symbol_name_is_the_jni_export() {
         assert_eq!(JNI_ONLOAD_SYMBOL, "JNI_OnLoad");
@@ -512,16 +521,6 @@ mod tests {
     #[test]
     fn initialized_native_images_cannot_be_unmapped_by_scope_teardown() {
         assert!(!std::mem::needs_drop::<ProcessLifetimeEngine>());
-    }
-
-    #[test]
-    fn libroblox_entry_is_the_x86_64_engine_path() {
-        assert_eq!(LIB_X86_64_DIR, "lib/x86_64");
-        assert_eq!(LIBROBLOX_FILENAME, "libroblox.so");
-        assert_eq!(
-            format!("{LIB_X86_64_DIR}/{LIBROBLOX_FILENAME}"),
-            "lib/x86_64/libroblox.so"
-        );
     }
 
     #[test]
