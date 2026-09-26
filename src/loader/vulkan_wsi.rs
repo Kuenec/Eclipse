@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -65,29 +65,6 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capa
         }
         r
     }
-}
-
-pub(crate) unsafe extern "C" fn eclipse_dlsym(
-    handle: *mut c_void,
-    symbol: *const c_char,
-) -> *mut c_void {
-    if !symbol.is_null() {
-        let name = unsafe { CStr::from_ptr(symbol) };
-        let shim: Option<*mut c_void> = if name == c"vkGetInstanceProcAddr" {
-            Some(eclipse_vk_get_instance_proc_addr as *const () as *mut c_void)
-        } else if name == c"vkCreateInstance" {
-            Some(eclipse_vk_create_instance as *const () as *mut c_void)
-        } else if name == c"vkCreateAndroidSurfaceKHR" {
-            Some(eclipse_vk_create_android_surface_khr as *const () as *mut c_void)
-        } else {
-            None
-        };
-        if let Some(p) = shim {
-            return p;
-        }
-    }
-
-    unsafe { libc::dlsym(handle, symbol) }
 }
 
 pub(crate) fn host_entry() -> Option<&'static ash::Entry> {

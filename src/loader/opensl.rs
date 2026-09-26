@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -146,7 +147,13 @@ struct BufferQueueCallback {
 unsafe impl Send for BufferQueueCallback {}
 
 struct PcmRing {
+    format: PcmFormat,
+
     queue: VecDeque<Vec<f32>>,
+
+    spare: Vec<Vec<f32>>,
+
+    max_buffers: usize,
 
     front_pos: usize,
 
@@ -167,9 +174,12 @@ struct PcmRing {
 }
 
 impl PcmRing {
-    fn new() -> Self {
+    fn new(format: PcmFormat, max_buffers: usize) -> Self {
         Self {
-            queue: VecDeque::new(),
+            format,
+            queue: VecDeque::with_capacity(max_buffers),
+            spare: Vec::with_capacity(max_buffers),
+            max_buffers,
             front_pos: 0,
             play_state: SL_PLAYSTATE_STOPPED,
             callback: None,
@@ -186,13 +196,33 @@ impl PcmRing {
         let total: usize = self.queue.iter().map(Vec::len).sum();
         total - self.front_pos
     }
+
+    fn enqueue(&mut self, bytes: &[u8]) -> u32 {
+        if self.queue.len() >= self.max_buffers {
+            return SL_RESULT_BUFFER_INSUFFICIENT;
+        }
+        let mut decoded = self.spare.pop().unwrap_or_default();
+        decoded.clear();
+        pcm_to_f32(bytes, self.format.bits_per_sample, &mut decoded);
+        if decoded.is_empty() {
+            self.spare.push(decoded);
+            return SL_RESULT_PARAMETER_INVALID;
+        }
+        self.queue.push_back(decoded);
+        SL_RESULT_SUCCESS
+    }
+
+    fn clear(&mut self) {
+        self.spare.extend(self.queue.drain(..));
+        self.front_pos = 0;
+    }
 }
 
-fn fill_output(ring: &mut PcmRing, out: &mut [f32]) -> Vec<BufferQueueCallback> {
-    let mut to_fire: Vec<BufferQueueCallback> = Vec::new();
+fn fill_output(ring: &mut PcmRing, out: &mut [f32]) -> u32 {
+    let mut fires = 0;
     if ring.play_state != SL_PLAYSTATE_PLAYING {
         out.fill(0.0);
-        return to_fire;
+        return fires;
     }
     let mut written = 0usize;
     while written < out.len() {
@@ -201,12 +231,14 @@ fn fill_output(ring: &mut PcmRing, out: &mut [f32]) -> Vec<BufferQueueCallback> 
             break;
         };
         if ring.front_pos >= front.len() {
-            ring.queue.pop_front();
+            if let Some(drained) = ring.queue.pop_front() {
+                ring.spare.push(drained);
+            }
             ring.front_pos = 0;
             ring.drained_buffers += 1;
-            if let Some(cb) = ring.callback {
+            if ring.callback.is_some() {
                 ring.callback_fires += 1;
-                to_fire.push(cb);
+                fires += 1;
             }
             continue;
         }
@@ -224,7 +256,7 @@ fn fill_output(ring: &mut PcmRing, out: &mut [f32]) -> Vec<BufferQueueCallback> 
     if gain != 1.0 {
         out.iter_mut().for_each(|sample| *sample *= gain);
     }
-    to_fire
+    fires
 }
 
 enum ObjectKind {
@@ -236,7 +268,6 @@ enum ObjectKind {
 }
 
 struct PlayerState {
-    format: PcmFormat,
     ring: Arc<Mutex<PcmRing>>,
 
     stream: Option<cpal::Stream>,
@@ -248,8 +279,6 @@ struct PlayerState {
 #[repr(C)]
 struct ObjectState {
     object_vtable: *const ObjectItfVtable,
-
-    id: u64,
 
     engine_itf: *const EngineItfVtable,
     play_itf: *const PlayItfVtable,
@@ -263,11 +292,6 @@ struct ObjectState {
 }
 
 unsafe impl Send for ObjectState {}
-
-struct ObjectSlot {
-    generation: u32,
-    state: Option<Box<ObjectState>>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectError {
@@ -286,7 +310,7 @@ impl<T> From<PoisonError<T>> for ObjectError {
 
 #[derive(Default)]
 struct ObjectRegistry {
-    slots: Vec<ObjectSlot>,
+    slots: Vec<Option<Box<ObjectState>>>,
 }
 
 fn registry() -> &'static Mutex<ObjectRegistry> {
@@ -295,28 +319,20 @@ fn registry() -> &'static Mutex<ObjectRegistry> {
 }
 
 impl ObjectRegistry {
-    fn insert(&mut self, mut state: Box<ObjectState>, id: u64) -> u64 {
-        state.id = id;
-        let idx = (id & 0xFFFF_FFFF) as usize;
-        if idx < self.slots.len() {
-            self.slots[idx].state = Some(state);
-        } else {
-            self.slots.push(ObjectSlot {
-                generation: (id >> 32) as u32,
-                state: Some(state),
-            });
+    fn insert(&mut self, state: Box<ObjectState>) -> *mut c_void {
+        let handle = std::ptr::from_ref(state.as_ref()).cast_mut().cast();
+        match self.slots.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some(state),
+            None => self.slots.push(Some(state)),
         }
-        id
+        handle
     }
 
-    fn next_id(&mut self) -> u64 {
-        if let Some(idx) = self.slots.iter().position(|s| s.state.is_none()) {
-            let gen = self.slots[idx].generation;
-            return ((gen as u64) << 32) | idx as u64;
-        }
-        let idx = self.slots.len() as u64;
-
-        (1u64 << 32) | idx
+    fn live_slot(&self, obj: *const ObjectState) -> Result<usize, ObjectError> {
+        self.slots
+            .iter()
+            .position(|slot| slot.as_deref().is_some_and(|st| std::ptr::eq(st, obj)))
+            .ok_or(ObjectError::Stale)
     }
 }
 
@@ -453,8 +469,11 @@ struct SlBufferQueueState {
     index: u32,
 }
 
-unsafe fn object_from_itf_field(field_self: *mut c_void, field_offset: usize) -> *mut ObjectState {
-    unsafe { (field_self as *mut u8).sub(field_offset) as *mut ObjectState }
+fn object_from_itf_field(field_self: *mut c_void, field_offset: usize) -> *mut ObjectState {
+    field_self
+        .cast::<u8>()
+        .wrapping_sub(field_offset)
+        .cast::<ObjectState>()
 }
 
 static ITF_OFFSETS: OnceLock<ItfOffsets> = OnceLock::new();
@@ -472,7 +491,6 @@ fn itf_offsets() -> ItfOffsets {
     *ITF_OFFSETS.get_or_init(|| {
         let sample = ObjectState {
             object_vtable: std::ptr::null(),
-            id: 0,
             engine_itf: std::ptr::null(),
             play_itf: std::ptr::null(),
             bufferqueue_itf: std::ptr::null(),
@@ -612,18 +630,12 @@ fn with_object<R>(
         return Err(ObjectError::OutOfRange);
     }
     let mut reg = registry().lock()?;
-
-    let id = unsafe { (*(obj as *const ObjectState)).id };
-    let idx = (id & 0xFFFF_FFFF) as usize;
-    let gen = (id >> 32) as u32;
-    let slot = reg.slots.get(idx).ok_or(ObjectError::OutOfRange)?;
-    if slot.generation != gen || slot.state.is_none() {
-        return Err(ObjectError::Stale);
-    }
-
-    let mut state = reg.slots[idx].state.take().expect("checked Some above");
+    let idx = reg.live_slot(obj.cast())?;
+    let mut state = reg.slots[idx]
+        .take()
+        .expect("live_slot found a live object");
     let r = f(&mut state, &mut reg);
-    reg.slots[idx].state = Some(state);
+    reg.slots[idx] = Some(state);
     Ok(r)
 }
 
@@ -718,17 +730,12 @@ fn with_object_destroy(obj: SlObjectItf) -> Result<(), ObjectError> {
     if obj.is_null() {
         return Err(ObjectError::OutOfRange);
     }
-    let mut reg = registry().lock()?;
-
-    let id = unsafe { (*(obj as *const ObjectState)).id };
-    let idx = (id & 0xFFFF_FFFF) as usize;
-    let gen = (id >> 32) as u32;
-    let slot = reg.slots.get_mut(idx).ok_or(ObjectError::OutOfRange)?;
-    if slot.generation != gen || slot.state.is_none() {
-        return Err(ObjectError::Stale);
-    }
-    slot.state = None;
-    slot.generation = slot.generation.wrapping_add(1).max(1);
+    let doomed = {
+        let mut reg = registry().lock()?;
+        let idx = reg.live_slot(obj.cast())?;
+        reg.slots[idx].take()
+    };
+    drop(doomed);
     Ok(())
 }
 
@@ -761,15 +768,12 @@ extern "C" fn obj_request_state_change(
     SL_RESULT_SUCCESS
 }
 
-fn engine_self_id(self_itf: *mut c_void) -> Option<u64> {
+fn validate_engine(self_itf: *mut c_void) -> Result<(), ObjectError> {
     if self_itf.is_null() {
-        return None;
+        return Err(ObjectError::OutOfRange);
     }
-    let off = itf_offsets();
-
-    let obj = unsafe { object_from_itf_field(self_itf, off.engine) };
-
-    Some(unsafe { (*obj).id })
+    let engine = object_from_itf_field(self_itf, itf_offsets().engine);
+    registry().lock()?.live_slot(engine).map(|_| ())
 }
 
 extern "C" fn eng_create_output_mix(
@@ -779,15 +783,8 @@ extern "C" fn eng_create_output_mix(
     _p_interface_ids: *const c_void,
     _p_interface_required: *const c_void,
 ) -> u32 {
-    if p_mix.is_null() {
+    if p_mix.is_null() || validate_engine(self_itf).is_err() {
         return SL_RESULT_PARAMETER_INVALID;
-    }
-    let Some(eng_id) = engine_self_id(self_itf) else {
-        return SL_RESULT_PARAMETER_INVALID;
-    };
-    match validate_object_id(eng_id) {
-        Ok(()) => {}
-        Err(_) => return SL_RESULT_PARAMETER_INVALID,
     }
     let obj_ptr = match mint_object(ObjectKind::OutputMix) {
         Ok(p) => p,
@@ -808,13 +805,11 @@ extern "C" fn eng_create_audio_player(
     _p_interface_ids: *const c_void,
     _p_interface_required: *const c_void,
 ) -> u32 {
-    if p_player.is_null() || p_audio_src.is_null() || p_audio_snk.is_null() {
-        return SL_RESULT_PARAMETER_INVALID;
-    }
-    let Some(eng_id) = engine_self_id(self_itf) else {
-        return SL_RESULT_PARAMETER_INVALID;
-    };
-    if validate_object_id(eng_id).is_err() {
+    if p_player.is_null()
+        || p_audio_src.is_null()
+        || p_audio_snk.is_null()
+        || validate_engine(self_itf).is_err()
+    {
         return SL_RESULT_PARAMETER_INVALID;
     }
 
@@ -834,7 +829,9 @@ extern "C" fn eng_create_audio_player(
     }
 
     let bq_loc = unsafe { &*(src.p_locator as *const SlDataLocatorBufferQueue) };
-    let _num_buffers = bq_loc.num_buffers;
+    let Ok(max_buffers @ 1..) = usize::try_from(bq_loc.num_buffers) else {
+        return SL_RESULT_PARAMETER_INVALID;
+    };
 
     let fmt_type = unsafe { *(src.p_format as *const u32) };
     if fmt_type != SL_DATAFORMAT_PCM {
@@ -868,16 +865,25 @@ extern "C" fn eng_create_audio_player(
 
     let _ = unsafe { &*(snk.p_locator as *const SlDataLocatorOutputMix) };
 
-    let ring = Arc::new(Mutex::new(PcmRing::new()));
+    let ring = Arc::new(Mutex::new(PcmRing::new(format, max_buffers)));
 
-    let stream_result = start_host_stream(&ring, format);
-    let host_stream_live = stream_result.is_ok();
-    if let Err(error) = stream_result {
-        tracing::warn!(?error, "OpenSL: host output stream unavailable");
-    }
-    let stream = stream_result.ok();
+    let stream = match start_host_stream(&ring, format) {
+        Ok(stream) => Some(stream),
+        Err(AudioHostError::UnsupportedFormat) => {
+            tracing::warn!(
+                channels = format.channels,
+                sample_rate = format.sample_rate,
+                "OpenSL: host output device cannot play the source format"
+            );
+            return SL_RESULT_FEATURE_UNSUPPORTED;
+        }
+        Err(error) => {
+            tracing::warn!(?error, "OpenSL: host output stream unavailable");
+            None
+        }
+    };
+    let host_stream_live = stream.is_some();
     let player = Box::new(PlayerState {
-        format,
         ring,
         stream,
         stream_type: SL_ANDROID_STREAM_MEDIA,
@@ -989,39 +995,65 @@ extern "C" fn eng_is_extension_supported(
     SL_RESULT_SUCCESS
 }
 
+#[derive(Clone, Copy)]
+struct FiringPlayer {
+    object: *const ObjectState,
+    ring: *const Mutex<PcmRing>,
+}
+
+thread_local! {
+    static FIRING_PLAYER: Cell<Option<FiringPlayer>> = const { Cell::new(None) };
+}
+
+fn fire_buffer_callbacks(ring: &Arc<Mutex<PcmRing>>, callback: BufferQueueCallback, fires: u32) {
+    let object = object_from_itf_field(callback.caller as *mut c_void, itf_offsets().bufferqueue);
+    let previous = FIRING_PLAYER.replace(Some(FiringPlayer {
+        object,
+        ring: Arc::as_ptr(ring),
+    }));
+    for _ in 0..fires {
+        (callback.func)(
+            callback.caller as *mut c_void,
+            callback.context as *mut c_void,
+        );
+    }
+    FIRING_PLAYER.set(previous);
+}
+
 fn with_player_ring<R>(
     self_itf: *mut c_void,
     field_off: usize,
-    f: impl FnOnce(&mut PcmRing, PcmFormat) -> R,
+    f: impl FnOnce(&mut PcmRing) -> R,
 ) -> Result<R, ObjectError> {
     if self_itf.is_null() {
         return Err(ObjectError::OutOfRange);
     }
+    let obj = object_from_itf_field(self_itf, field_off);
 
-    let obj = unsafe { object_from_itf_field(self_itf, field_off) };
+    if let Some(firing) = FIRING_PLAYER.get().filter(|firing| firing.object == obj) {
+        let ring = unsafe { &*firing.ring };
+        let mut ring_guard = ring.lock()?;
+        return Ok(f(&mut ring_guard));
+    }
 
-    let id = unsafe { (*obj).id };
-    let (ring, format) = {
+    let ring = {
         let reg = registry().lock()?;
-        let idx = (id & 0xFFFF_FFFF) as usize;
-        let gen = (id >> 32) as u32;
-        let slot = reg.slots.get(idx).ok_or(ObjectError::OutOfRange)?;
-        if slot.generation != gen || slot.state.is_none() {
-            return Err(ObjectError::Stale);
-        }
-        let state = reg.slots[idx].state.as_ref().expect("checked Some");
+        let idx = reg.live_slot(obj)?;
+        let state = reg.slots[idx]
+            .as_ref()
+            .expect("live_slot found a live object");
         let ObjectKind::Player(player) = &state.kind else {
             return Err(ObjectError::OutOfRange);
         };
-        (Arc::clone(&player.ring), player.format)
+        Arc::clone(&player.ring)
     };
     let mut ring_guard = ring.lock()?;
-    Ok(f(&mut ring_guard, format))
+    Ok(f(&mut ring_guard))
 }
 
 extern "C" fn play_set_play_state(self_itf: *mut c_void, state: u32) -> u32 {
     let off = itf_offsets().play;
-    match with_player_ring(self_itf, off, |ring, _| {
+    match with_player_ring(self_itf, off, |ring| {
         if state == SL_PLAYSTATE_STOPPED
             || state == SL_PLAYSTATE_PAUSED
             || state == SL_PLAYSTATE_PLAYING
@@ -1042,7 +1074,7 @@ extern "C" fn play_get_play_state(self_itf: *mut c_void, p_state: *mut u32) -> u
         return SL_RESULT_PARAMETER_INVALID;
     }
     let off = itf_offsets().play;
-    match with_player_ring(self_itf, off, |ring, _| ring.play_state) {
+    match with_player_ring(self_itf, off, |ring| ring.play_state) {
         Ok(s) => {
             unsafe { *p_state = s };
             SL_RESULT_SUCCESS
@@ -1063,7 +1095,7 @@ extern "C" fn play_get_position(self_itf: *mut c_void, p_msec: *mut u32) -> u32 
         return SL_RESULT_PARAMETER_INVALID;
     }
     let off = itf_offsets().play;
-    match with_player_ring(self_itf, off, |ring, _fmt| ring.drained_buffers) {
+    match with_player_ring(self_itf, off, |ring| ring.drained_buffers) {
         Ok(_n) => {
             unsafe { *p_msec = 0 };
             SL_RESULT_SUCCESS
@@ -1124,16 +1156,7 @@ extern "C" fn bq_enqueue(self_itf: *mut c_void, buffer: *const c_void, size: u32
     let off = itf_offsets().bufferqueue;
 
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buffer as *const u8, size as usize) };
-    let r = with_player_ring(self_itf, off, |ring, fmt| {
-        let mut decoded: Vec<f32> = Vec::new();
-        pcm_to_f32(bytes, fmt.bits_per_sample, &mut decoded);
-        if decoded.is_empty() {
-            return SL_RESULT_PARAMETER_INVALID;
-        }
-        ring.queue.push_back(decoded);
-        SL_RESULT_SUCCESS
-    });
-    match r {
+    match with_player_ring(self_itf, off, |ring| ring.enqueue(bytes)) {
         Ok(code) => code,
         Err(_) => SL_RESULT_PARAMETER_INVALID,
     }
@@ -1141,9 +1164,8 @@ extern "C" fn bq_enqueue(self_itf: *mut c_void, buffer: *const c_void, size: u32
 
 extern "C" fn bq_clear(self_itf: *mut c_void) -> u32 {
     let off = itf_offsets().bufferqueue;
-    match with_player_ring(self_itf, off, |ring, _| {
-        ring.queue.clear();
-        ring.front_pos = 0;
+    match with_player_ring(self_itf, off, |ring| {
+        ring.clear();
         SL_RESULT_SUCCESS
     }) {
         Ok(code) => code,
@@ -1156,7 +1178,7 @@ extern "C" fn bq_get_state(self_itf: *mut c_void, p_state: *mut SlBufferQueueSta
         return SL_RESULT_PARAMETER_INVALID;
     }
     let off = itf_offsets().bufferqueue;
-    match with_player_ring(self_itf, off, |ring, _| {
+    match with_player_ring(self_itf, off, |ring| {
         (ring.queue.len() as u32, ring.drained_buffers as u32)
     }) {
         Ok((count, index)) => {
@@ -1175,7 +1197,7 @@ extern "C" fn bq_register_callback(
     let off = itf_offsets().bufferqueue;
 
     let caller = self_itf as usize;
-    match with_player_ring(self_itf, off, |ring, _| {
+    match with_player_ring(self_itf, off, |ring| {
         if cb.is_null() {
             ring.callback = None;
         } else {
@@ -1198,7 +1220,7 @@ extern "C" fn volume_set_level(self_itf: *mut c_void, level: i16) -> u32 {
     if level > 0 {
         return SL_RESULT_PARAMETER_INVALID;
     }
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| {
         ring.volume_level_mb = level;
     }) {
         Ok(()) => SL_RESULT_SUCCESS,
@@ -1210,9 +1232,7 @@ extern "C" fn volume_get_level(self_itf: *mut c_void, p_level: *mut i16) -> u32 
     if p_level.is_null() {
         return SL_RESULT_PARAMETER_INVALID;
     }
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
-        ring.volume_level_mb
-    }) {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| ring.volume_level_mb) {
         Ok(level) => {
             unsafe { *p_level = level };
             SL_RESULT_SUCCESS
@@ -1231,7 +1251,7 @@ extern "C" fn volume_get_max_level(_self_itf: *mut c_void, p_level: *mut i16) ->
 }
 
 extern "C" fn volume_set_mute(self_itf: *mut c_void, mute: u32) -> u32 {
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| {
         ring.muted = mute != SL_BOOLEAN_FALSE;
     }) {
         Ok(()) => SL_RESULT_SUCCESS,
@@ -1243,7 +1263,7 @@ extern "C" fn volume_get_mute(self_itf: *mut c_void, p_mute: *mut u32) -> u32 {
     if p_mute.is_null() {
         return SL_RESULT_PARAMETER_INVALID;
     }
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| ring.muted) {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| ring.muted) {
         Ok(muted) => {
             unsafe {
                 *p_mute = if muted {
@@ -1259,7 +1279,7 @@ extern "C" fn volume_get_mute(self_itf: *mut c_void, p_mute: *mut u32) -> u32 {
 }
 
 extern "C" fn volume_enable_stereo_position(self_itf: *mut c_void, enable: u32) -> u32 {
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| {
         ring.stereo_position_enabled = enable != SL_BOOLEAN_FALSE;
     }) {
         Ok(()) => SL_RESULT_SUCCESS,
@@ -1271,7 +1291,7 @@ extern "C" fn volume_is_stereo_position_enabled(self_itf: *mut c_void, p_enabled
     if p_enabled.is_null() {
         return SL_RESULT_PARAMETER_INVALID;
     }
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| {
         ring.stereo_position_enabled
     }) {
         Ok(enabled) => {
@@ -1292,7 +1312,7 @@ extern "C" fn volume_set_stereo_position(self_itf: *mut c_void, position: i16) -
     if !(-1000..=1000).contains(&position) {
         return SL_RESULT_PARAMETER_INVALID;
     }
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| {
         ring.stereo_position = position;
     }) {
         Ok(()) => SL_RESULT_SUCCESS,
@@ -1304,9 +1324,7 @@ extern "C" fn volume_get_stereo_position(self_itf: *mut c_void, p_position: *mut
     if p_position.is_null() {
         return SL_RESULT_PARAMETER_INVALID;
     }
-    match with_player_ring(self_itf, itf_offsets().volume, |ring, _| {
-        ring.stereo_position
-    }) {
+    match with_player_ring(self_itf, itf_offsets().volume, |ring| ring.stereo_position) {
         Ok(position) => {
             unsafe { *p_position = position };
             SL_RESULT_SUCCESS
@@ -1324,7 +1342,7 @@ fn with_player_config_state<R>(
         return Err(ObjectError::OutOfRange);
     }
 
-    let obj = unsafe { object_from_itf_field(self_itf, field_off) };
+    let obj = object_from_itf_field(self_itf, field_off);
     with_object(obj.cast(), |state, _| {
         let ObjectKind::Player(player) = &mut state.kind else {
             return Err(ObjectError::OutOfRange);
@@ -1426,25 +1444,12 @@ extern "C" fn android_config_release_java_proxy(_self_itf: *mut c_void, _proxy_t
     SL_RESULT_FEATURE_UNSUPPORTED
 }
 
-fn validate_object_id(id: u64) -> Result<(), ObjectError> {
-    let reg = registry().lock()?;
-    let idx = (id & 0xFFFF_FFFF) as usize;
-    let gen = (id >> 32) as u32;
-    let slot = reg.slots.get(idx).ok_or(ObjectError::OutOfRange)?;
-    if slot.generation != gen || slot.state.is_none() {
-        return Err(ObjectError::Stale);
-    }
-    Ok(())
-}
-
 fn mint_object(kind: ObjectKind) -> Result<*mut c_void, ObjectError> {
     let mut reg = registry().lock()?;
-    let id = reg.next_id();
 
     let _ = itf_offsets();
     let state = Box::new(ObjectState {
         object_vtable: object_vtable(),
-        id,
         engine_itf: match &kind {
             ObjectKind::Engine => engine_vtable(),
             _ => std::ptr::null(),
@@ -1468,14 +1473,7 @@ fn mint_object(kind: ObjectKind) -> Result<*mut c_void, ObjectError> {
         state: SL_OBJECT_STATE_UNREALIZED,
         kind,
     });
-    reg.insert(state, id);
-
-    let ptr = reg.slots[(id & 0xFFFF_FFFF) as usize]
-        .state
-        .as_ref()
-        .map(|b| (b.as_ref() as *const ObjectState) as *mut c_void)
-        .ok_or(ObjectError::OutOfRange)?;
-    Ok(ptr)
+    Ok(reg.insert(state))
 }
 
 fn start_host_stream(
@@ -1486,13 +1484,15 @@ fn start_host_stream(
     let device = host
         .default_output_device()
         .ok_or(AudioHostError::NoDevice)?;
-    let supported = device
-        .default_output_config()
-        .map_err(|_| AudioHostError::NoConfig)?;
+    let supported = host_stream_config(
+        format,
+        device
+            .supported_output_configs()
+            .map_err(|_| AudioHostError::NoConfig)?,
+    )?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let ring = Arc::clone(ring);
-    let _ = format;
 
     let err_fn = |e| tracing::warn!(target: "eclipse::audio", "cpal output stream error: {e}");
 
@@ -1507,6 +1507,71 @@ fn start_host_stream(
     Ok(stream)
 }
 
+fn host_stream_config(
+    format: PcmFormat,
+    ranges: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+) -> Result<cpal::SupportedStreamConfig, AudioHostError> {
+    let channels = u16::try_from(format.channels).map_err(|_| AudioHostError::UnsupportedFormat)?;
+    ranges
+        .filter(|range| range.channels() == channels)
+        .filter_map(|range| range.try_with_sample_rate(format.sample_rate))
+        .filter_map(|config| {
+            let rank = match config.sample_format() {
+                cpal::SampleFormat::F32 => 3,
+                cpal::SampleFormat::I16 => 2,
+                cpal::SampleFormat::U16 => 1,
+                _ => return None,
+            };
+            Some((rank, config))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, config)| config)
+        .ok_or(AudioHostError::UnsupportedFormat)
+}
+
+const RENDER_CHUNK_SAMPLES: usize = 4096;
+
+struct RingRenderer {
+    ring: Arc<Mutex<PcmRing>>,
+    scratch: Box<[f32]>,
+}
+
+impl RingRenderer {
+    fn new(ring: Arc<Mutex<PcmRing>>) -> Self {
+        Self {
+            ring,
+            scratch: vec![0.0; RENDER_CHUNK_SAMPLES].into_boxed_slice(),
+        }
+    }
+
+    fn render<T>(&mut self, data: &mut [T])
+    where
+        T: cpal::SizedSample + cpal::FromSample<f32>,
+    {
+        let (fires, callback) = match self.ring.lock() {
+            Ok(mut guard) => {
+                let mut fires = 0;
+                for chunk in data.chunks_mut(self.scratch.len()) {
+                    let scratch = &mut self.scratch[..chunk.len()];
+                    fires += fill_output(&mut guard, scratch);
+                    for (o, s) in chunk.iter_mut().zip(scratch.iter()) {
+                        *o = T::from_sample(*s);
+                    }
+                }
+                (fires, guard.callback)
+            }
+            Err(_) => {
+                data.iter_mut().for_each(|s| *s = T::from_sample(0.0));
+                return;
+            }
+        };
+
+        if let Some(callback) = callback.filter(|_| fires > 0) {
+            fire_buffer_callbacks(&self.ring, callback, fires);
+        }
+    }
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -1516,28 +1581,10 @@ fn build_stream<T>(
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
-    let mut scratch: Vec<f32> = Vec::new();
+    let mut renderer = RingRenderer::new(ring);
     device.build_output_stream(
         config,
-        move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
-            scratch.clear();
-            scratch.resize(data.len(), 0.0);
-
-            let to_fire = match ring.lock() {
-                Ok(mut guard) => fill_output(&mut guard, &mut scratch),
-                Err(_) => {
-                    data.iter_mut().for_each(|s| *s = T::from_sample(0.0));
-                    return;
-                }
-            };
-            for (o, s) in data.iter_mut().zip(scratch.iter()) {
-                *o = T::from_sample(*s);
-            }
-
-            for cb in to_fire {
-                (cb.func)(cb.caller as *mut c_void, cb.context as *mut c_void);
-            }
-        },
+        move |data: &mut [T], _info: &cpal::OutputCallbackInfo| renderer.render(data),
         err_fn,
         None,
     )
@@ -1550,6 +1597,8 @@ pub enum AudioHostError {
     NoConfig,
 
     UnsupportedSampleFormat,
+
+    UnsupportedFormat,
 
     BuildFailed,
 
@@ -1838,19 +1887,9 @@ fn player_drained_buffers(player: *mut c_void) -> Option<u64> {
 }
 
 fn with_player_state<R>(player: *mut c_void, f: impl FnOnce(&PlayerState) -> R) -> Option<R> {
-    if player.is_null() {
-        return None;
-    }
-
-    let id = unsafe { (*(player as *const ObjectState)).id };
     let reg = registry().lock().ok()?;
-    let idx = (id & 0xFFFF_FFFF) as usize;
-    let gen = (id >> 32) as u32;
-    let slot = reg.slots.get(idx)?;
-    if slot.generation != gen {
-        return None;
-    }
-    let state = slot.state.as_ref()?;
+    let idx = reg.live_slot(player.cast()).ok()?;
+    let state = reg.slots[idx].as_ref()?;
     if let ObjectKind::Player(p) = &state.kind {
         Some(f(p))
     } else {

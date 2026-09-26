@@ -243,10 +243,9 @@ impl EclipseNativeProvider {
             super::vulkan_wsi::eclipse_vk_create_android_surface_khr as *const () as u64,
         );
 
-        p.register(
-            "dlsym",
-            super::vulkan_wsi::eclipse_dlsym as *const () as u64,
-        );
+        p.register("dlopen", super::dlfcn::eclipse_dlopen as *const () as u64);
+        p.register("dlsym", super::dlfcn::eclipse_dlsym as *const () as u64);
+        p.register("dlclose", super::dlfcn::eclipse_dlclose as *const () as u64);
 
         p.register(
             "ANativeWindow_fromSurface",
@@ -393,6 +392,10 @@ impl EclipseNativeProvider {
         p.register("SL_IID_PLAY", sl_iid_addr(4));
         p.register("SL_IID_RECORD", sl_iid_addr(5));
         p.register("SL_IID_VOLUME", sl_iid_addr(6));
+
+        super::aaudio::register_natives(|name, addr| {
+            p.register(name, addr);
+        });
 
         super::bionic_pthread::register_natives(|name, addr| {
             p.register(name, addr);
@@ -1553,25 +1556,24 @@ unsafe extern "C" fn eclipse_ungetc(c: c_int, stream: *mut libc::FILE) -> c_int 
     unsafe { libc::ungetc(c, eclipse_sf_translate_stream(stream)) }
 }
 
-#[allow(non_camel_case_types)]
-type wint_t = std::ffi::c_uint;
+type WideInt = std::ffi::c_uint;
 
 extern "C" {
 
-    fn fputwc(wc: libc::wchar_t, stream: *mut libc::FILE) -> wint_t;
-    fn getwc(stream: *mut libc::FILE) -> wint_t;
-    fn ungetwc(wc: wint_t, stream: *mut libc::FILE) -> wint_t;
+    fn fputwc(wc: libc::wchar_t, stream: *mut libc::FILE) -> WideInt;
+    fn getwc(stream: *mut libc::FILE) -> WideInt;
+    fn ungetwc(wc: WideInt, stream: *mut libc::FILE) -> WideInt;
 }
 
-unsafe extern "C" fn eclipse_fputwc(wc: libc::wchar_t, stream: *mut libc::FILE) -> wint_t {
+unsafe extern "C" fn eclipse_fputwc(wc: libc::wchar_t, stream: *mut libc::FILE) -> WideInt {
     unsafe { fputwc(wc, eclipse_sf_translate_stream(stream)) }
 }
 
-unsafe extern "C" fn eclipse_getwc(stream: *mut libc::FILE) -> wint_t {
+unsafe extern "C" fn eclipse_getwc(stream: *mut libc::FILE) -> WideInt {
     unsafe { getwc(eclipse_sf_translate_stream(stream)) }
 }
 
-unsafe extern "C" fn eclipse_ungetwc(wc: wint_t, stream: *mut libc::FILE) -> wint_t {
+unsafe extern "C" fn eclipse_ungetwc(wc: WideInt, stream: *mut libc::FILE) -> WideInt {
     unsafe { ungetwc(wc, eclipse_sf_translate_stream(stream)) }
 }
 
@@ -2843,12 +2845,13 @@ mod tests {
 
         assert_eq!(
             p.len(),
-            134 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
-                + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT,
+            136 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+                + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT
+                + super::super::aaudio::AAUDIO_NATIVE_COUNT,
             "6 liblog + 16 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
-             introspection + 4 netdb resolver-ABI + 1 EGL display interception + 4 Vulkan WSI \
-             interception + 28 ndk-android + 33 media-ndk + 8 audio + 53 pthread + 5 sysconf \
-             system-query natives registered"
+             introspection + 4 netdb resolver-ABI + 1 EGL display interception + 3 Vulkan WSI \
+             interception + 3 dlfcn + 28 ndk-android + 33 media-ndk + 8 OpenSL ES + 26 AAudio + \
+             53 pthread + 5 sysconf system-query natives registered"
         );
         for name in [
             "__android_log_write",
@@ -2915,6 +2918,9 @@ mod tests {
             "vkGetInstanceProcAddr",
             "vkCreateInstance",
             "vkCreateAndroidSurfaceKHR",
+            "dlopen",
+            "dlsym",
+            "dlclose",
             "AAssetManager_fromJava",
             "AAssetManager_open",
             "AAsset_close",
@@ -2984,6 +2990,8 @@ mod tests {
             "SL_IID_PLAY",
             "SL_IID_RECORD",
             "SL_IID_VOLUME",
+            "AAudio_createStreamBuilder",
+            "AAudioStream_requestStart",
             "pthread_mutex_lock",
             "pthread_mutex_unlock",
             "pthread_once",
