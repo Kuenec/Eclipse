@@ -1,7 +1,6 @@
 package android.webkit;
 
-@SuppressWarnings({"rawtypes", "unchecked"})
-public class EclipseBridgeProbe implements ValueCallback {
+public class EclipseBridgeProbe implements ValueCallback<Object> {
   public static volatile String last;
 
   public static volatile Object lastValue;
