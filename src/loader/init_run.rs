@@ -64,7 +64,10 @@ impl std::fmt::Display for InitRunError {
         match self {
             Self::NoApk => write!(
                 f,
-                "no Roblox APK (set ECLIPSE_ROBLOX_APK or place it at the default dev-host path)"
+                "no Roblox APK (set {} to an APK file or to a directory holding {} and {})",
+                crate::apk::DEV_APK_ENV,
+                crate::apk::BASE_APK,
+                crate::apk::NATIVE_SPLIT_APK
             ),
             Self::Apk(e) => write!(f, "APK read: {e}"),
             Self::Extract(dir, e) => write!(f, "extract native libs into {}: {e}", dir.display()),
@@ -77,16 +80,6 @@ impl std::fmt::Display for InitRunError {
 
 impl std::error::Error for InitRunError {}
 
-pub fn find_roblox_apk() -> Option<std::path::PathBuf> {
-    std::env::var_os("ECLIPSE_ROBLOX_APK")
-        .map(std::path::PathBuf::from)
-        .into_iter()
-        .chain(std::env::var_os("HOME").map(|home| {
-            Path::new(&home).join("eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk")
-        }))
-        .find(|p| p.exists())
-}
-
 pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
     let mut log = std::io::stderr();
     let _ = writeln!(
@@ -94,12 +87,20 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
         "eclipse __run-libroblox-init: isolated DT_INIT_ARRAY execution harness (dev-host)"
     );
 
-    let apk_path = find_roblox_apk().ok_or(InitRunError::NoApk)?;
-    let _ = writeln!(log, "APK: {}", apk_path.display());
+    let paths = crate::apk::ApkSetPaths::from_env()
+        .map_err(|e| InitRunError::Apk(e.to_string()))?
+        .ok_or(InitRunError::NoApk)?;
+    let mut apks = crate::apk::ApkSet::open(paths).map_err(|e| InitRunError::Apk(e.to_string()))?;
+    let _ = writeln!(
+        log,
+        "APK: {} (native libs: {})",
+        apks.base_path().display(),
+        apks.native_libs_path().display()
+    );
 
-    super::ndk_registry::set_apk_path(apk_path.clone());
+    super::ndk_registry::set_apk_path(apks.base_path().to_path_buf());
 
-    let so_path = extract_engine(&apk_path, lib_dir)?;
+    let so_path = extract_engine(apks.native_libs_mut(), lib_dir)?;
     let _ = writeln!(log, "libroblox.so: {}", so_path.display());
 
     let linker = Linker::new(Vec::<std::path::PathBuf>::new())
@@ -238,8 +239,7 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
     unsafe { libc::_exit(0) };
 }
 
-fn extract_engine(apk_path: &Path, lib_dir: &Path) -> Result<PathBuf, InitRunError> {
-    let mut apk = crate::apk::Apk::open(apk_path).map_err(|e| InitRunError::Apk(e.to_string()))?;
+fn extract_engine(apk: &mut crate::apk::Apk, lib_dir: &Path) -> Result<PathBuf, InitRunError> {
     apk.extract_native_libs("x86_64", lib_dir)
         .map_err(|e| InitRunError::Extract(lib_dir.to_path_buf(), e.to_string()))?;
     Ok(lib_dir.join("libroblox.so"))
@@ -383,7 +383,8 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").expect("write the blocking file");
         let lib_dir = blocker.join("native-libs");
 
-        let err = extract_engine(&apk_path, &lib_dir).expect_err("the lib dir is not creatable");
+        let mut apk = crate::apk::Apk::open(&apk_path).expect("open the fixture APK");
+        let err = extract_engine(&mut apk, &lib_dir).expect_err("the lib dir is not creatable");
 
         assert!(
             matches!(&err, InitRunError::Extract(dir, _) if *dir == lib_dir),

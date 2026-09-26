@@ -696,17 +696,9 @@ mod tests {
     use super::*;
     use crate::apk::Apk;
 
-    fn demo_apk_path() -> std::path::PathBuf {
-        if let Ok(p) = std::env::var("ECLIPSE_DEMO_APK") {
-            return std::path::PathBuf::from(p);
-        }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        std::path::Path::new(&home).join("eclipse-m0/atl_test_apks/demo_app.apk")
-    }
-
     fn demo_arsc() -> Option<Vec<u8>> {
-        let path = demo_apk_path();
-        let mut apk = Apk::open(&path).ok()?;
+        let path = std::env::var_os("ECLIPSE_DEMO_APK")?;
+        let mut apk = Apk::open(std::path::Path::new(&path)).ok()?;
 
         apk.read_entry("resources.arsc").ok()
     }

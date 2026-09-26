@@ -2,26 +2,39 @@
 
 pub mod arsc;
 pub mod axml;
-pub mod fetch;
+pub mod play;
+pub mod signature;
+pub mod store;
 
-use std::collections::BTreeMap;
 use std::fmt;
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher as Crc32;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use zip::{CompressionMethod, ZipArchive};
 
 use axml::AxmlError;
+use signature::SignatureError;
 
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
 
-const ENGINE_LIB: &str = "libroblox.so";
+pub const ENGINE_LIB: &str = "libroblox.so";
 
-const TARGET_ABI: &str = "x86_64";
+pub const TARGET_ABI: &str = "x86_64";
+
+pub const ROBLOX_PACKAGE: &str = "com.roblox.client";
+
+pub const BASE_APK: &str = "base.apk";
+
+pub const NATIVE_SPLIT_APK: &str = "split_config.x86_64.apk";
+
+pub const DEV_APK_ENV: &str = "ECLIPSE_ROBLOX_APK";
+
+const NATIVE_SPLIT_NAME: &str = "config.x86_64";
+
+const MAX_APK_BYTES: u64 = 1024 * 1024 * 1024;
 
 const READ_ENTRY_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
 
@@ -67,11 +80,25 @@ pub struct Manifest {
     pub large_heap: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NativeAbi {
-    pub name: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VersionCode(pub u32);
 
-    pub has_engine: bool,
+impl fmt::Display for VersionCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageInfo {
+    pub package: String,
+
+    pub version_code: Option<VersionCode>,
+
+    pub version_name: Option<String>,
+
+    pub split: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,33 +125,22 @@ impl Apk {
         let parsed = axml::read_manifest(&bytes)?;
         Ok(Manifest {
             package: parsed.package,
-            launcher_activity: parsed.launcher_activity,
+            launcher_activity: parsed.launcher_activity.ok_or(AxmlError::NoLauncher)?,
             min_sdk: parsed.min_sdk,
             target_sdk: parsed.target_sdk,
             large_heap: parsed.large_heap,
         })
     }
 
-    pub fn native_abis(&self) -> Vec<NativeAbi> {
-        let mut abis: BTreeMap<String, bool> = BTreeMap::new();
-        for name in self.archive.file_names() {
-            let Some(rest) = name.strip_prefix("lib/") else {
-                continue;
-            };
-            let Some((abi, file)) = rest.split_once('/') else {
-                continue;
-            };
-            if abi.is_empty() {
-                continue;
-            }
-            let has_engine = abis.entry(abi.to_owned()).or_insert(false);
-            if file == ENGINE_LIB {
-                *has_engine = true;
-            }
-        }
-        abis.into_iter()
-            .map(|(name, has_engine)| NativeAbi { name, has_engine })
-            .collect()
+    pub fn package_info(&mut self) -> Result<PackageInfo, ApkError> {
+        let bytes = self.read_entry(MANIFEST_ENTRY)?;
+        let parsed = axml::read_manifest(&bytes)?;
+        Ok(PackageInfo {
+            package: parsed.package,
+            version_code: parsed.version_code.map(VersionCode),
+            version_name: parsed.version_name,
+            split: parsed.split,
+        })
     }
 
     pub fn native_lib_filenames(&self, abi: &str) -> Vec<String> {
@@ -250,10 +266,6 @@ impl Apk {
             Err(e) => return Err(ApkError::Zip(e)),
         };
 
-        if let Some(replacement) = crate::system_cursor::replacement_apk_entry(name) {
-            return Ok(replacement.to_vec());
-        }
-
         let cap = entry.size().min(READ_ENTRY_PREALLOC_CAP) as usize;
         let mut buf = Vec::with_capacity(cap);
         entry.read_to_end(&mut buf)?;
@@ -285,32 +297,194 @@ pub struct EntrySpan {
     pub stored: bool,
 }
 
-pub fn verify_integrity(path: &Path, expected_hex: &str) -> Result<(), ApkError> {
-    if expected_hex.len() != 64 || !expected_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(ApkError::InvalidDigest(expected_hex.to_owned()));
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApkSetPaths {
+    pub base: PathBuf,
+
+    pub native_split: Option<PathBuf>,
+}
+
+impl ApkSetPaths {
+    pub fn locate(path: &Path) -> Result<Self, ApkSetError> {
+        let metadata = std::fs::metadata(path).map_err(|source| ApkSetError::Locate {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !metadata.is_dir() {
+            return Ok(Self {
+                base: path.to_path_buf(),
+                native_split: None,
+            });
+        }
+        let base = path.join(BASE_APK);
+        if !regular_file_exists(&base)? {
+            return Err(ApkSetError::MissingBase(path.to_path_buf()));
+        }
+        let split = path.join(NATIVE_SPLIT_APK);
+        let native_split = regular_file_exists(&split)?.then_some(split);
+        Ok(Self { base, native_split })
     }
-    let actual = sha256_hex(path)?;
-    if actual.eq_ignore_ascii_case(expected_hex) {
-        Ok(())
-    } else {
-        Err(ApkError::Integrity {
-            expected: expected_hex.to_ascii_lowercase(),
-            actual,
-        })
+
+    pub fn from_env() -> Result<Option<Self>, ApkSetError> {
+        std::env::var_os(DEV_APK_ENV)
+            .filter(|value| !value.is_empty())
+            .map(|value| Self::locate(Path::new(&value)))
+            .transpose()
+    }
+
+    pub fn native_libs(&self) -> &Path {
+        self.native_split.as_deref().unwrap_or(&self.base)
     }
 }
 
-fn sha256_hex(path: &Path) -> Result<String, ApkError> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-
-    io::copy(&mut file, &mut hasher)?;
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
+fn regular_file_exists(path: &Path) -> Result<bool, ApkSetError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ApkSetError::Locate {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
-    Ok(hex)
+}
+
+pub struct ApkSet {
+    paths: ApkSetPaths,
+    base: Apk,
+    native_split: Option<Apk>,
+    manifest: Manifest,
+    version_code: VersionCode,
+    version_name: Option<String>,
+}
+
+impl ApkSet {
+    pub fn open(paths: ApkSetPaths) -> Result<Self, ApkSetError> {
+        verify_signature(&paths.base)?;
+        if let Some(split) = &paths.native_split {
+            verify_signature(split)?;
+        }
+        Self::open_verified(paths)
+    }
+
+    fn open_verified(paths: ApkSetPaths) -> Result<Self, ApkSetError> {
+        let mut base = open_member(&paths.base)?;
+        let base_info = member_info(&mut base, &paths.base)?;
+        if let Some(split) = base_info.split {
+            return Err(ApkSetError::BaseIsSplit {
+                path: paths.base.clone(),
+                split,
+            });
+        }
+        let version_code = base_info
+            .version_code
+            .ok_or_else(|| ApkSetError::MissingVersionCode(paths.base.clone()))?;
+        let manifest = base.manifest().map_err(|source| ApkSetError::Open {
+            path: paths.base.clone(),
+            source,
+        })?;
+
+        let native_split = match &paths.native_split {
+            None => None,
+            Some(path) => {
+                let mut split = open_member(path)?;
+                let info = member_info(&mut split, path)?;
+                if info.split.as_deref() != Some(NATIVE_SPLIT_NAME) {
+                    return Err(ApkSetError::NotNativeSplit {
+                        path: path.clone(),
+                        split: info.split,
+                    });
+                }
+                if info.version_code != Some(version_code) {
+                    return Err(ApkSetError::VersionMismatch {
+                        path: path.clone(),
+                        base: version_code,
+                        split: info.version_code,
+                    });
+                }
+                Some(split)
+            }
+        };
+
+        let mut set = Self {
+            paths,
+            base,
+            native_split,
+            manifest,
+            version_code,
+            version_name: base_info.version_name,
+        };
+        match set.native_libs_mut().x86_64_engine() {
+            Ok(_) => Ok(set),
+            Err(ApkError::EngineMissing) => Err(ApkSetError::EngineMissing {
+                path: set.native_libs_path().to_path_buf(),
+                has_native_split: set.paths.native_split.is_some(),
+            }),
+            Err(source) => Err(ApkSetError::Open {
+                path: set.native_libs_path().to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    pub fn base_path(&self) -> &Path {
+        &self.paths.base
+    }
+
+    pub fn native_libs_path(&self) -> &Path {
+        self.paths.native_libs()
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn version_code(&self) -> VersionCode {
+        self.version_code
+    }
+
+    pub fn version_name(&self) -> Option<&str> {
+        self.version_name.as_deref()
+    }
+
+    pub fn base_mut(&mut self) -> &mut Apk {
+        &mut self.base
+    }
+
+    pub fn native_libs(&self) -> &Apk {
+        self.native_split.as_ref().unwrap_or(&self.base)
+    }
+
+    pub fn native_libs_mut(&mut self) -> &mut Apk {
+        self.native_split.as_mut().unwrap_or(&mut self.base)
+    }
+}
+
+fn verify_signature(path: &Path) -> Result<(), ApkSetError> {
+    signature::verify_roblox_signature(path).map_err(|source| ApkSetError::Signature {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn open_member(path: &Path) -> Result<Apk, ApkSetError> {
+    Apk::open(path).map_err(|source| ApkSetError::Open {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn member_info(apk: &mut Apk, path: &Path) -> Result<PackageInfo, ApkSetError> {
+    let info = apk.package_info().map_err(|source| ApkSetError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if info.package != ROBLOX_PACKAGE {
+        return Err(ApkSetError::WrongPackage {
+            path: path.to_path_buf(),
+            package: info.package,
+        });
+    }
+    Ok(info)
 }
 
 #[derive(Debug)]
@@ -324,10 +498,6 @@ pub enum ApkError {
     EntryMissing(String),
 
     EngineMissing,
-
-    InvalidDigest(String),
-
-    Integrity { expected: String, actual: String },
 }
 
 impl fmt::Display for ApkError {
@@ -343,15 +513,6 @@ impl fmt::Display for ApkError {
                     "APK has no x86_64 engine library (lib/{TARGET_ABI}/{ENGINE_LIB})"
                 )
             }
-            Self::InvalidDigest(s) => {
-                write!(f, "expected digest is not 64 hex characters: {s:?}")
-            }
-            Self::Integrity { expected, actual } => {
-                write!(
-                    f,
-                    "APK integrity check failed: expected {expected}, got {actual}"
-                )
-            }
         }
     }
 }
@@ -362,10 +523,7 @@ impl std::error::Error for ApkError {
             Self::Io(e) => Some(e),
             Self::Zip(e) => Some(e),
             Self::Axml(e) => Some(e),
-            Self::EntryMissing(_)
-            | Self::EngineMissing
-            | Self::InvalidDigest(_)
-            | Self::Integrity { .. } => None,
+            Self::EntryMissing(_) | Self::EngineMissing => None,
         }
     }
 }
@@ -385,6 +543,142 @@ impl From<zip::result::ZipError> for ApkError {
 impl From<AxmlError> for ApkError {
     fn from(e: AxmlError) -> Self {
         Self::Axml(e)
+    }
+}
+
+#[derive(Debug)]
+pub enum ApkSetError {
+    Locate {
+        path: PathBuf,
+        source: io::Error,
+    },
+
+    MissingBase(PathBuf),
+
+    Open {
+        path: PathBuf,
+        source: ApkError,
+    },
+
+    Signature {
+        path: PathBuf,
+        source: SignatureError,
+    },
+
+    WrongPackage {
+        path: PathBuf,
+        package: String,
+    },
+
+    BaseIsSplit {
+        path: PathBuf,
+        split: String,
+    },
+
+    NotNativeSplit {
+        path: PathBuf,
+        split: Option<String>,
+    },
+
+    MissingVersionCode(PathBuf),
+
+    VersionMismatch {
+        path: PathBuf,
+        base: VersionCode,
+        split: Option<VersionCode>,
+    },
+
+    EngineMissing {
+        path: PathBuf,
+        has_native_split: bool,
+    },
+}
+
+impl fmt::Display for ApkSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Locate { path, source } => write!(f, "cannot read {}: {source}", path.display()),
+            Self::MissingBase(dir) => write!(
+                f,
+                "{} has no {BASE_APK}; pass an APK file or a directory holding {BASE_APK} and \
+                 {NATIVE_SPLIT_APK}",
+                dir.display()
+            ),
+            Self::Open { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Signature { path, source } => write!(
+                f,
+                "{} is not the official, unmodified Roblox client ({source}); Eclipse only runs \
+                 APKs signed by Roblox Corporation, so get them from Google Play with `eclipse \
+                 update` or `eclipse install` the files Google Play delivered",
+                path.display()
+            ),
+            Self::WrongPackage { path, package } => write!(
+                f,
+                "{} is the app {package}, not {ROBLOX_PACKAGE}",
+                path.display()
+            ),
+            Self::BaseIsSplit { path, split } => write!(
+                f,
+                "{} is the split APK {split}, not a base APK; pass the directory that holds \
+                 {BASE_APK} and {NATIVE_SPLIT_APK}",
+                path.display()
+            ),
+            Self::NotNativeSplit { path, split } => match split {
+                Some(split) => write!(
+                    f,
+                    "{} is the split {split}, not the {NATIVE_SPLIT_NAME} split",
+                    path.display()
+                ),
+                None => write!(
+                    f,
+                    "{} is a base APK, not the {NATIVE_SPLIT_NAME} split",
+                    path.display()
+                ),
+            },
+            Self::MissingVersionCode(path) => {
+                write!(f, "{} declares no versionCode", path.display())
+            }
+            Self::VersionMismatch { path, base, split } => {
+                let split = split.map_or_else(|| "no versionCode".to_owned(), |v| v.to_string());
+                write!(
+                    f,
+                    "{} has versionCode {split} but {BASE_APK} has {base}; both files must come \
+                     from the same Roblox release",
+                    path.display()
+                )
+            }
+            Self::EngineMissing {
+                path,
+                has_native_split: true,
+            } => write!(f, "{} has no lib/{TARGET_ABI}/{ENGINE_LIB}", path.display()),
+            Self::EngineMissing {
+                path,
+                has_native_split: false,
+            } => write!(
+                f,
+                "{} has no lib/{TARGET_ABI}/{ENGINE_LIB}; Roblox ships its x86_64 code in \
+                 {NATIVE_SPLIT_APK}, so put {BASE_APK} and {NATIVE_SPLIT_APK} in one directory \
+                 and pass that directory",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApkSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Locate { source, .. } => Some(source),
+            Self::Open { source, .. } => Some(source),
+            Self::Signature { source, .. } => Some(source),
+            Self::MissingBase(_)
+            | Self::WrongPackage { .. }
+            | Self::BaseIsSplit { .. }
+            | Self::NotNativeSplit { .. }
+            | Self::MissingVersionCode(_)
+            | Self::VersionMismatch { .. }
+            | Self::EngineMissing { .. } => None,
+        }
     }
 }
 
@@ -602,38 +896,6 @@ mod tests {
     }
 
     #[test]
-    fn native_abis_detect_x86_64_with_engine() {
-        let bytes = build_apk(&[
-            ("lib/x86_64/libroblox.so", b"engine"),
-            ("lib/arm64-v8a/libroblox.so", b"engine"),
-            ("lib/x86_64/libother.so", b"other"),
-            ("lib/armeabi-v7a/libfoo.so", b"foo"),
-            ("classes.dex", b"dex"),
-        ]);
-        let (apk, path) = open_apk(&bytes, "abis");
-        let abis = apk.native_abis();
-        std::fs::remove_file(&path).ok();
-
-        let names: Vec<&str> = abis.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["arm64-v8a", "armeabi-v7a", "x86_64"]);
-
-        assert!(abis.iter().find(|a| a.name == "x86_64").unwrap().has_engine);
-        assert!(
-            abis.iter()
-                .find(|a| a.name == "arm64-v8a")
-                .unwrap()
-                .has_engine
-        );
-        assert!(
-            !abis
-                .iter()
-                .find(|a| a.name == "armeabi-v7a")
-                .unwrap()
-                .has_engine
-        );
-    }
-
-    #[test]
     fn native_lib_filenames_lists_flat_so_files_for_the_abi_sorted() {
         let bytes = build_apk(&[
             ("lib/x86_64/libroblox.so", b"engine"),
@@ -663,12 +925,9 @@ mod tests {
     }
 
     #[test]
-    fn native_abis_negative_case_no_x86_64() {
+    fn x86_64_engine_is_missing_from_an_arm_only_apk() {
         let bytes = build_apk(&[("lib/arm64-v8a/libroblox.so", b"engine")]);
         let (mut apk, path) = open_apk(&bytes, "armonly");
-        let abis = apk.native_abis();
-        assert!(!abis.iter().any(|a| a.name == TARGET_ABI));
-
         let err = apk.x86_64_engine().expect_err("no x86_64 engine");
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, ApkError::EngineMissing), "got {err:?}");
@@ -890,42 +1149,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_integrity_matches_correct_digest() {
-        let path = temp_file("sha-ok", b"abc");
-        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        let result = verify_integrity(&path, expected);
-        std::fs::remove_file(&path).ok();
-        result.expect("digest must match");
-    }
-
-    #[test]
-    fn verify_integrity_is_case_insensitive() {
-        let path = temp_file("sha-case", b"abc");
-        let expected = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
-        let result = verify_integrity(&path, expected);
-        std::fs::remove_file(&path).ok();
-        result.expect("uppercase digest must still match");
-    }
-
-    #[test]
-    fn verify_integrity_rejects_wrong_digest() {
-        let path = temp_file("sha-bad", b"abc");
-        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
-        let err = verify_integrity(&path, wrong).expect_err("must mismatch");
-        std::fs::remove_file(&path).ok();
-        match err {
-            ApkError::Integrity { expected, actual } => {
-                assert_eq!(expected, wrong);
-                assert_eq!(
-                    actual,
-                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-                );
-            }
-            other => panic!("expected Integrity, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn open_missing_file_is_io_error() {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -947,15 +1170,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_integrity_rejects_malformed_expected() {
-        let path = temp_file("sha-malformed", b"abc");
-
-        let err = verify_integrity(&path, "not-a-digest").expect_err("must reject");
-        std::fs::remove_file(&path).ok();
-        assert!(matches!(err, ApkError::InvalidDigest(_)), "got {err:?}");
-    }
-
-    #[test]
     fn open_truncated_zip_at_every_boundary_is_typed_error_never_panic() {
         let bytes = build_apk(&[
             (MANIFEST_ENTRY, FIXTURE_MANIFEST),
@@ -968,7 +1182,7 @@ mod tests {
             if let Ok(mut apk) = Apk::open(&path) {
                 let _ = apk.read_entry(MANIFEST_ENTRY);
                 let _ = apk.x86_64_engine();
-                let _ = apk.native_abis();
+                let _ = apk.native_lib_filenames(TARGET_ABI);
             }
             std::fs::remove_file(&path).ok();
         }
@@ -1052,5 +1266,322 @@ mod tests {
             matches!(err, ApkError::Zip(_) | ApkError::Io(_)),
             "got {err:?}"
         );
+    }
+
+    fn roblox_manifest(version_code: u32, split: Option<&str>) -> Vec<u8> {
+        axml::fixture::Manifest {
+            package: ROBLOX_PACKAGE,
+            version_code: Some(version_code),
+            version_name: split.is_none().then_some("2.737.1584"),
+            split,
+            launcher: split
+                .is_none()
+                .then_some("com.roblox.client.startup.ActivitySplash"),
+        }
+        .encode()
+    }
+
+    fn temp_set_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-apk-set-test-{tag}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create temp set dir");
+        dir
+    }
+
+    fn write_set(tag: &str, base: &[u8], split: Option<&[u8]>) -> (PathBuf, ApkSetPaths) {
+        let dir = temp_set_dir(tag);
+        std::fs::write(dir.join(BASE_APK), base).expect("write base.apk");
+        if let Some(split) = split {
+            std::fs::write(dir.join(NATIVE_SPLIT_APK), split).expect("write split");
+        }
+        let paths = ApkSetPaths::locate(&dir).expect("locate synthetic set");
+        (dir, paths)
+    }
+
+    #[test]
+    fn package_info_reads_version_name_and_split() {
+        let bytes = build_apk(&[(MANIFEST_ENTRY, &roblox_manifest(3056, None))]);
+        let (mut apk, path) = open_apk(&bytes, "package-info-base");
+        let info = apk.package_info().expect("base package info");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(info.package, ROBLOX_PACKAGE);
+        assert_eq!(info.version_code, Some(VersionCode(3056)));
+        assert_eq!(info.version_name.as_deref(), Some("2.737.1584"));
+        assert_eq!(info.split, None);
+    }
+
+    #[test]
+    fn split_manifest_has_package_info_but_no_launcher_manifest() {
+        let bytes = build_apk(&[(
+            MANIFEST_ENTRY,
+            &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+        )]);
+        let (mut apk, path) = open_apk(&bytes, "package-info-split");
+        let info = apk.package_info().expect("split package info");
+        let manifest = apk.manifest();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(info.split.as_deref(), Some(NATIVE_SPLIT_NAME));
+        assert_eq!(info.version_code, Some(VersionCode(3056)));
+        assert!(
+            matches!(manifest, Err(ApkError::Axml(AxmlError::NoLauncher))),
+            "got {manifest:?}"
+        );
+    }
+
+    #[test]
+    fn locate_accepts_a_file_or_a_directory_with_an_optional_split() {
+        let dir = temp_set_dir("locate");
+        let file = dir.join("roblox.apk");
+        std::fs::write(&file, b"apk").unwrap();
+        assert_eq!(
+            ApkSetPaths::locate(&file).unwrap(),
+            ApkSetPaths {
+                base: file.clone(),
+                native_split: None
+            }
+        );
+
+        let err = ApkSetPaths::locate(&dir).expect_err("directory without base.apk");
+        assert!(matches!(err, ApkSetError::MissingBase(_)), "got {err:?}");
+
+        std::fs::write(dir.join(BASE_APK), b"base").unwrap();
+        let base_only = ApkSetPaths::locate(&dir).unwrap();
+        assert_eq!(base_only.native_split, None);
+        assert_eq!(base_only.native_libs(), dir.join(BASE_APK));
+
+        std::fs::write(dir.join(NATIVE_SPLIT_APK), b"split").unwrap();
+        let with_split = ApkSetPaths::locate(&dir).unwrap();
+        assert_eq!(with_split.base, dir.join(BASE_APK));
+        assert_eq!(with_split.native_libs(), dir.join(NATIVE_SPLIT_APK));
+
+        let err = ApkSetPaths::locate(&dir.join("absent")).expect_err("missing path");
+        assert!(matches!(err, ApkSetError::Locate { .. }), "got {err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unsigned_sets_are_refused_before_their_contents_are_trusted() {
+        let base = build_apk(&[
+            (MANIFEST_ENTRY, &roblox_manifest(3056, None)),
+            ("lib/x86_64/libroblox.so", b"engine"),
+        ]);
+        let (dir, paths) = write_set("unsigned", &base, None);
+        let err = ApkSet::open(paths).err().expect("unsigned APK must fail");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            matches!(
+                err,
+                ApkSetError::Signature {
+                    source: SignatureError::MissingV2Signature,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("signed by Roblox Corporation"));
+    }
+
+    #[test]
+    fn split_set_takes_manifest_from_base_and_native_libs_from_split() {
+        let base = build_apk(&[
+            (MANIFEST_ENTRY, &roblox_manifest(3056, None)),
+            ("classes.dex", b"dex"),
+        ]);
+        let split = build_apk(&[
+            (
+                MANIFEST_ENTRY,
+                &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+            ),
+            ("lib/x86_64/libroblox.so", b"engine"),
+        ]);
+        let (dir, paths) = write_set("split-set", &base, Some(&split));
+        let mut set = ApkSet::open_verified(paths).expect("consistent split set");
+        assert_eq!(set.version_code(), VersionCode(3056));
+        assert_eq!(set.version_name(), Some("2.737.1584"));
+        assert_eq!(
+            set.manifest().launcher_activity,
+            "com.roblox.client.startup.ActivitySplash"
+        );
+        assert_eq!(set.base_path(), dir.join(BASE_APK));
+        assert_eq!(set.native_libs_path(), dir.join(NATIVE_SPLIT_APK));
+        assert_eq!(
+            set.native_libs_mut().native_lib_filenames(TARGET_ABI),
+            vec![ENGINE_LIB.to_string()]
+        );
+        assert!(set.base_mut().native_lib_filenames(TARGET_ABI).is_empty());
+        drop(set);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn universal_base_provides_its_own_native_libs() {
+        let base = build_apk(&[
+            (MANIFEST_ENTRY, &roblox_manifest(3056, None)),
+            ("lib/x86_64/libroblox.so", b"engine"),
+        ]);
+        let (dir, paths) = write_set("universal", &base, None);
+        let set = ApkSet::open_verified(paths).expect("universal APK");
+        assert_eq!(set.native_libs_path(), dir.join(BASE_APK));
+        drop(set);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inconsistent_sets_are_typed_errors() {
+        let engine = ("lib/x86_64/libroblox.so", b"engine".as_slice());
+        let base = build_apk(&[(MANIFEST_ENTRY, &roblox_manifest(3056, None))]);
+
+        let other_app = axml::fixture::Manifest {
+            package: "com.example.app",
+            version_code: Some(3056),
+            version_name: None,
+            split: None,
+            launcher: Some(".Main"),
+        }
+        .encode();
+        let (dir, paths) = write_set(
+            "wrong-package",
+            &build_apk(&[(MANIFEST_ENTRY, &other_app), engine]),
+            None,
+        );
+        let err = ApkSet::open_verified(paths).err().unwrap();
+        assert!(matches!(err, ApkSetError::WrongPackage { .. }), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let split_as_base = build_apk(&[
+            (
+                MANIFEST_ENTRY,
+                &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+            ),
+            engine,
+        ]);
+        let (dir, paths) = write_set("split-as-base", &split_as_base, None);
+        let err = ApkSet::open_verified(paths).err().unwrap();
+        assert!(matches!(err, ApkSetError::BaseIsSplit { .. }), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let density_split = build_apk(&[
+            (
+                MANIFEST_ENTRY,
+                &roblox_manifest(3056, Some("config.xxhdpi")),
+            ),
+            engine,
+        ]);
+        let (dir, paths) = write_set("density-split", &base, Some(&density_split));
+        let err = ApkSet::open_verified(paths).err().unwrap();
+        assert!(matches!(err, ApkSetError::NotNativeSplit { .. }), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let older_split = build_apk(&[
+            (
+                MANIFEST_ENTRY,
+                &roblox_manifest(3055, Some(NATIVE_SPLIT_NAME)),
+            ),
+            engine,
+        ]);
+        let (dir, paths) = write_set("version-mismatch", &base, Some(&older_split));
+        let err = ApkSet::open_verified(paths).err().unwrap();
+        assert!(
+            matches!(
+                err,
+                ApkSetError::VersionMismatch {
+                    base: VersionCode(3056),
+                    split: Some(VersionCode(3055)),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let empty_split = build_apk(&[(
+            MANIFEST_ENTRY,
+            &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+        )]);
+        let (dir, paths) = write_set("split-without-engine", &base, Some(&empty_split));
+        let err = ApkSet::open_verified(paths).err().unwrap();
+        assert!(
+            matches!(
+                err,
+                ApkSetError::EngineMissing {
+                    has_native_split: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (dir, paths) = write_set("base-without-split", &base, None);
+        let err = ApkSet::open_verified(paths).err().unwrap();
+        assert!(
+            matches!(
+                err,
+                ApkSetError::EngineMissing {
+                    has_native_split: false,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(NATIVE_SPLIT_APK), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let unversioned = axml::fixture::Manifest {
+            package: ROBLOX_PACKAGE,
+            version_code: None,
+            version_name: None,
+            split: None,
+            launcher: Some(".Main"),
+        }
+        .encode();
+        let (dir, paths) = write_set(
+            "unversioned",
+            &build_apk(&[(MANIFEST_ENTRY, &unversioned), engine]),
+            None,
+        );
+        let err = ApkSet::open_verified(paths).err().unwrap();
+        assert!(matches!(err, ApkSetError::MissingVersionCode(_)), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn official_roblox_set_opens_and_its_base_alone_is_refused() {
+        let Some(paths) = ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
+        else {
+            eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to verify the official Roblox APK set");
+            return;
+        };
+
+        let mut set = ApkSet::open(paths.clone()).expect("the official Roblox set verifies");
+        assert_eq!(set.manifest().package, ROBLOX_PACKAGE);
+        assert!(set.version_code().0 > 0);
+        assert!(set
+            .native_libs_mut()
+            .native_lib_filenames(TARGET_ABI)
+            .iter()
+            .any(|name| name == ENGINE_LIB));
+
+        if paths.native_split.is_some() {
+            let err = ApkSet::open(ApkSetPaths {
+                base: paths.base.clone(),
+                native_split: None,
+            })
+            .err()
+            .expect("the base alone lacks the engine");
+            assert!(
+                matches!(
+                    err,
+                    ApkSetError::EngineMissing {
+                        has_native_split: false,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
     }
 }

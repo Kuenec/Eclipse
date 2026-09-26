@@ -19,6 +19,7 @@ directories = "6"
 
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+ring = "0.17"
 
 crc32fast = "1"
 
