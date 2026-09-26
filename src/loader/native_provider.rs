@@ -763,7 +763,15 @@ unsafe extern "C" fn eclipse_sigaction(
 ) -> c_int {
     let tapped = TAPPED_SIGNAL.load(Ordering::Acquire);
     if tapped != 0 && signum == tapped {
-        return unsafe { tap_chain_register(act, oldact) };
+        return unsafe {
+            tap_chain_register(
+                &TAP_CHAIN_POOL,
+                &TAP_CHAIN_POOL_NEXT,
+                &TAP_CHAIN,
+                act,
+                oldact,
+            )
+        };
     }
     let g_act = if act.is_null() {
         None
@@ -971,9 +979,15 @@ static ENGINE_RANGE_SPAN: AtomicU64 = AtomicU64::new(0);
 const SEGV_MAPERR: c_int = 1;
 const SEGV_ACCERR: c_int = 2;
 
-unsafe fn tap_chain_register(act: *const BionicSigaction, oldact: *mut BionicSigaction) -> c_int {
+unsafe fn tap_chain_register(
+    pool: &TapChainPool,
+    next: &AtomicUsize,
+    slot: &AtomicPtr<BionicSigaction>,
+    act: *const BionicSigaction,
+    oldact: *mut BionicSigaction,
+) -> c_int {
     if !oldact.is_null() {
-        let prev = TAP_CHAIN.load(Ordering::Acquire);
+        let prev = slot.load(Ordering::Acquire);
         let out = if prev.is_null() {
             BionicSigaction {
                 sa_flags: 0,
@@ -993,7 +1007,10 @@ unsafe fn tap_chain_register(act: *const BionicSigaction, oldact: *mut BionicSig
         b.sa_flags &= !SA_RESTORER_FLAG;
         b.sa_restorer = 0;
 
-        let _ = tap_chain_store(b);
+        if !tap_chain_publish(pool, next, slot, b) {
+            unsafe { *libc::__errno_location() = libc::ENOMEM };
+            return -1;
+        }
     }
     0
 }
@@ -2454,19 +2471,49 @@ fn resolve_egl_display_target(display_id: usize, wsi: Option<usize>) -> usize {
     }
 }
 
+pub(crate) const HOST_EGL_SONAME: &str = "libEGL.so.1";
+
+pub(crate) const HOST_GLESV2_SONAME: &str = "libGLESv2.so.2";
+
+pub(crate) fn last_dl_error() -> String {
+    let message = unsafe { libc::dlerror() };
+    if message.is_null() {
+        return "no dlerror message".to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn host_library_symbol(soname: &str, symbol: &std::ffi::CStr) -> Result<usize, String> {
+    let cname = std::ffi::CString::new(soname).map_err(|e| format!("dlopen({soname}): {e}"))?;
+    let handle = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        return Err(format!("dlopen({soname}) failed: {}", last_dl_error()));
+    }
+    let sym = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+    if sym.is_null() {
+        return Err(format!(
+            "dlsym({soname}, {}) failed: {}",
+            symbol.to_string_lossy(),
+            last_dl_error()
+        ));
+    }
+    Ok(sym as usize)
+}
+
 fn host_egl_get_display() -> Option<usize> {
     static HOST_EGL_GET_DISPLAY: OnceLock<Option<usize>> = OnceLock::new();
     *HOST_EGL_GET_DISPLAY.get_or_init(|| {
-        let handle =
-            unsafe { libc::dlopen(c"libEGL.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        if handle.is_null() {
-            return None;
-        }
-        let sym = unsafe { libc::dlsym(handle, c"eglGetDisplay".as_ptr()) };
-        if sym.is_null() {
-            None
-        } else {
-            Some(sym as usize)
+        match host_library_symbol(HOST_EGL_SONAME, c"eglGetDisplay") {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "host eglGetDisplay unavailable; eglGetDisplay returns EGL_NO_DISPLAY"
+                );
+                None
+            }
         }
     })
 }
@@ -3813,6 +3860,38 @@ mod tests {
     }
 
     #[test]
+    fn tap_chain_register_reports_enomem_when_the_pool_is_exhausted() {
+        let pool = TapChainPool::new();
+        let next = AtomicUsize::new(0);
+        let slot: AtomicPtr<BionicSigaction> = AtomicPtr::new(std::ptr::null_mut());
+        let mk = |handler: usize| BionicSigaction {
+            sa_flags: libc::SA_SIGINFO,
+            handler,
+            sa_mask: 0,
+            sa_restorer: 0,
+        };
+
+        for k in 0..TAP_CHAIN_POOL_LEN {
+            let act = mk(0x1000 + k);
+            let ret =
+                unsafe { tap_chain_register(&pool, &next, &slot, &act, std::ptr::null_mut()) };
+            assert_eq!(ret, 0, "registration {k} fits in the pool");
+        }
+        let last = slot.load(Ordering::Acquire);
+
+        let act = mk(0xdead);
+        let mut old = mk(0);
+        unsafe { *libc::__errno_location() = 0 };
+        let ret = unsafe { tap_chain_register(&pool, &next, &slot, &act, &mut old) };
+
+        assert_eq!(ret, -1, "a dropped registration must not report success");
+        assert_eq!(unsafe { *libc::__errno_location() }, libc::ENOMEM);
+        assert_eq!(old.handler, 0x1000 + TAP_CHAIN_POOL_LEN - 1);
+        assert_eq!(slot.load(Ordering::Acquire), last);
+        assert_eq!(unsafe { (*last).handler }, 0x1000 + TAP_CHAIN_POOL_LEN - 1);
+    }
+
+    #[test]
     fn tap_entry_claim_is_tid_scoped_not_process_global() {
         let latch = AtomicI64::new(0);
 
@@ -4537,6 +4616,29 @@ mod tests {
             resolve_egl_display_target(0xABCD, None),
             0xABCD,
             "a non-default display_id is never rewritten (X11/other)"
+        );
+    }
+
+    #[test]
+    fn host_egl_get_display_loads_the_egl_runtime_soname() {
+        if let Err(e) = host_library_symbol(HOST_EGL_SONAME, c"eglGetDisplay") {
+            eprintln!("SKIP: host {HOST_EGL_SONAME} is not installed ({e})");
+            return;
+        }
+        assert!(
+            host_egl_get_display().is_some(),
+            "eglGetDisplay must resolve whenever {HOST_EGL_SONAME} is installed"
+        );
+    }
+
+    #[test]
+    fn host_library_symbol_names_the_library_and_the_loader_cause() {
+        let Err(e) = host_library_symbol("libeclipse_no_such_egl_7c1d.so", c"eglGetDisplay") else {
+            panic!("an absent library must not resolve");
+        };
+        assert!(
+            e.contains("libeclipse_no_such_egl_7c1d.so") && e.contains("cannot open shared object"),
+            "{e}"
         );
     }
 
