@@ -637,6 +637,7 @@ fn run_apk(
     let progress = eclipse::framework::drive_application_lifecycle(
         &vm,
         &apk_path,
+        apks.signing_certificate_history(),
         &plan.launcher_activity,
         android_deep_link.as_deref(),
     )?;

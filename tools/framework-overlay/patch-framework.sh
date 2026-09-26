@@ -174,6 +174,13 @@ grep -qF 'listenerThread.post(new Runnable()' "$pc_src" || fail "PixelCopy.java 
 grep -qF 'listener.onPixelCopyFinished(ERROR_SOURCE_NO_DATA);' "$pc_src" || fail "PixelCopy.java no longer reports the honest ERROR_SOURCE_NO_DATA result"
 ! grep -qF 'listener.onPixelCopyFinished(SUCCESS);' "$pc_src" || fail "PixelCopy.java fabricates SUCCESS without a pixel-copy backend"
 
+si_src="$here/src/android/content/pm/SigningInfo.java"
+[ -f "$si_src" ] || fail "SigningInfo implementation missing at $si_src"
+grep -qF 'return pastSigningCertificates;' "$si_src" || fail "SigningInfo.java no longer reports the rotation history — the AOSP getSigningCertificateHistory contract regressed"
+sc_src="$here/src/android/content/pm/SigningCertificates.java"
+[ -f "$sc_src" ] || fail "host signing-certificate bridge missing at $sc_src"
+grep -qF 'private static native byte[][] native_signingCertificateHistory();' "$sc_src" || fail "SigningCertificates.java lost its host-verified certificate native"
+
 r_src="$ATL_SRC/com/android/internal/R.java"
 [ -f "$r_src" ] || fail "vendored com/android/internal/R.java not found at $r_src (set ATL_SRC)"
 grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+id[[:space:]]*=[[:space:]]*0x010100d0;' "$r_src" || fail "vendored internal R.attr.id != 0x010100d0 — ATL source drifted; re-verify the overlay's inlined constants"
@@ -194,9 +201,11 @@ grep -qE 'public[[:space:]]+static[[:space:]]+final[[:space:]]+int[[:space:]]+th
     "$here/src/android/app/KeyguardManager.java" \
     "$kgps_src" \
     "$pc_src" \
+    "$si_src" \
+    "$sc_src" \
     "$r_src"
 
-for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class'; do
+for pattern in 'android/os/Build*.class' 'android/os/PowerManager*.class' 'android/net/NetworkRequest*.class' 'android/app/ActivityManager*.class' 'android/view/LayoutInflater*.class' 'android/view/PixelCopy*.class' 'android/webkit/ValueCallback*.class' 'android/webkit/JavascriptInterface*.class' 'android/webkit/EclipseBridgeProbe*.class' 'android/webkit/EclipseWebViewClientProbe*.class' 'android/app/KeyguardManager*.class' 'android/security/keystore/KeyGenParameterSpec*.class' 'android/content/pm/SigningInfo*.class' 'android/content/pm/SigningCertificates*.class'; do
     dir="${pattern%/*}"
     mkdir -p "$work/stage/$dir"
     mapfile -t class_files < <(compgen -G "$work/classes/$pattern")
@@ -210,6 +219,10 @@ for forbidden in 'android/webkit/WebView.class' 'android/webkit/WebViewClient.cl
                  'android/atl/ATLLoadedApp.class' \
                  'android/atl/EarlyPackageParser.class' \
                  'android/content/pm/PackageParser.class' \
+                 "android/content/pm/PackageParser\$Package.class" \
+                 'android/content/pm/PackageInfo.class' \
+                 'android/content/pm/PackageManager.class' \
+                 'android/content/pm/Signature.class' \
                  'android/util/DisplayMetrics.class'; do
     [ ! -e "$work/stage/$forbidden" ] || fail "compile-only stub $forbidden was staged into classes.dex — it would SHADOW the real class (first-dex-wins); fix the step-3 stage whitelist"
 done
@@ -243,6 +256,12 @@ grep -qF "request(Landroid/view/SurfaceView;Landroid/graphics/Bitmap;Landroid/vi
 grep -qF 'Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z' "$pcsm" || fail "dexed PixelCopy no longer posts completion through Handler"
 grep -qF "Landroid/view/PixelCopy\$OnPixelCopyFinishedListener;->onPixelCopyFinished(I)V" "$pcrsm" || fail "dexed PixelCopy Runnable no longer invokes its listener"
 grep -qE 'const/4 v[0-9]+, 0x3' "$pcrsm" || fail "dexed PixelCopy Runnable no longer reports ERROR_SOURCE_NO_DATA (3)"
+
+scsm="$work/smali-check/android/content/pm/SigningCertificates.smali"
+[ -f "$scsm" ] || fail "SigningCertificates.smali not in the built classes.dex"
+[ -f "$work/smali-check/android/content/pm/SigningInfo.smali" ] || fail "SigningInfo.smali not in the built classes.dex — the stock stub would answer null"
+grep -qF '.method private static native native_signingCertificateHistory()[[B' "$scsm" || fail "dexed SigningCertificates lost its host-verified certificate native"
+grep -qF '0x8000000' "$scsm" || fail "dexed SigningCertificates lost the inlined GET_SIGNING_CERTIFICATES constant (0x08000000)"
 
 kgpssm="$work/smali-check/android/security/keystore/KeyGenParameterSpec.smali"
 kgpsbsm="$work/smali-check/android/security/keystore/KeyGenParameterSpec\$Builder.smali"
@@ -812,7 +831,38 @@ grep -qF '"android.hardware.type.pc"' "$pmsm" || fail "PackageManager.smali lost
 grep -qF '"android.hardware.touchscreen"' "$pmsm" || fail "PackageManager.smali lost the exact touchscreen feature literal"
 grep -qF '"android.hardware.audio.low_latency"' "$pmsm" || fail "PackageManager.smali lost the exact low-latency feature literal"
 
-mkdir -p "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
+grep -qxF '.field public static final GET_SIGNATURES:I = 0x40' "$pmsm" || fail "PackageManager.smali GET_SIGNATURES is no longer 0x40 — the overlay stub constant would disagree with the framework"
+! grep -qF 'GET_SIGNING_CERTIFICATES' "$pmsm" || fail "PackageManager.smali already declares GET_SIGNING_CERTIFICATES — installed framework drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.field public static final GET_SIGNATURES:I = 0x40\n)}{$1\n.field public static final GET_SIGNING_CERTIFICATES:I = 0x8000000\n}' "$pmsm"
+grep -qxF '.field public static final GET_SIGNING_CERTIFICATES:I = 0x8000000' "$pmsm" || fail "PackageManager.smali GET_SIGNING_CERTIFICATES insert failed (drift?)"
+
+ppkg_sm="$work/smali/android/content/pm/PackageParser\$Package.smali"
+[ -f "$ppkg_sm" ] || fail "PackageParser\$Package.smali not found after baksmali"
+n="$(grep -cxF '.field public mSignatures:[Landroid/content/pm/Signature;' "$ppkg_sm")" || true
+[ "$n" = "1" ] || fail "PackageParser\$Package.smali mSignatures anchor not unique (found $n, expected 1) — installed PackageParser drifted; update patch-framework.sh"
+! grep -qF 'mPastSigningCertificates' "$ppkg_sm" || fail "PackageParser\$Package.smali already declares mPastSigningCertificates — installed PackageParser drifted; update patch-framework.sh"
+perl -0pi -e 's{(\.field public mSignatures:\[Landroid/content/pm/Signature;\n)}{$1\n.field public mPastSigningCertificates:[Landroid/content/pm/Signature;\n}' "$ppkg_sm"
+grep -qxF '.field public mPastSigningCertificates:[Landroid/content/pm/Signature;' "$ppkg_sm" || fail "PackageParser\$Package.smali mPastSigningCertificates insert failed (drift?)"
+
+ppsm="$work/smali/android/content/pm/PackageParser.smali"
+[ -f "$ppsm" ] || fail "PackageParser.smali not found after baksmali"
+ANCHOR_GPI_SIGNATURES=$'    :cond_319\n    and-int/lit8 v14, p2, 0x40\n\n    if-eqz v14, :cond_b\n\n    move-object/from16 v0, p0\n\n    iget-object v14, v0, Landroid/content/pm/PackageParser$Package;->mSignatures:[Landroid/content/pm/Signature;\n\n    if-eqz v14, :cond_342\n\n    move-object/from16 v0, p0\n\n    iget-object v14, v0, Landroid/content/pm/PackageParser$Package;->mSignatures:[Landroid/content/pm/Signature;\n\n    array-length v4, v14\n\n    :goto_328\n    if-lez v4, :cond_b\n\n    new-array v14, v4, [Landroid/content/pm/Signature;\n\n    iput-object v14, v11, Landroid/content/pm/PackageInfo;->signatures:[Landroid/content/pm/Signature;\n\n    move-object/from16 v0, p0\n\n    iget-object v14, v0, Landroid/content/pm/PackageParser$Package;->mSignatures:[Landroid/content/pm/Signature;\n\n    const/4 v15, 0x0\n\n    iget-object v0, v11, Landroid/content/pm/PackageInfo;->signatures:[Landroid/content/pm/Signature;\n\n    move-object/from16 v16, v0\n\n    const/16 v17, 0x0\n\n    move-object/from16 v0, v16\n\n    move/from16 v1, v17\n\n    invoke-static {v14, v15, v0, v1, v4}, Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V\n\n    goto/16 :goto_b\n\n    :cond_342\n    const/4 v4, 0x0\n\n    goto :goto_328\n'
+FILL_GPI_SIGNATURES=$'    :cond_319\n    move-object/from16 v0, p0\n\n    move/from16 v1, p2\n\n    invoke-static {v0, v1, v11}, Landroid/content/pm/SigningCertificates;->fillPackageInfo(Landroid/content/pm/PackageParser$Package;ILandroid/content/pm/PackageInfo;)V\n\n    goto/16 :goto_b\n'
+n="$(ANCHOR="$ANCHOR_GPI_SIGNATURES" perl -0777 -ne 'print scalar(() = /\Q$ENV{ANCHOR}\E/g)' "$ppsm")"
+[ "$n" = "1" ] || fail "PackageParser.generatePackageInfo GET_SIGNATURES block found $n times (expected 1) — installed PackageParser drifted; update patch-framework.sh"
+ANCHOR="$ANCHOR_GPI_SIGNATURES" FILL="$FILL_GPI_SIGNATURES" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{FILL}}' "$ppsm"
+grep -qF -- "->fillPackageInfo(Landroid/content/pm/PackageParser\$Package;ILandroid/content/pm/PackageInfo;)V" "$ppsm" || fail "PackageParser.generatePackageInfo signing-certificate insert failed (drift?)"
+
+atlsm="$work/smali/android/atl/ATLLoadedApp.smali"
+[ -f "$atlsm" ] || fail "ATLLoadedApp.smali not found after baksmali"
+ANCHOR_SYSTEM_CERTIFICATES=$'    move-result-object v3\n\n    invoke-virtual {v2, v3, v8}, Landroid/content/pm/PackageParser;->collectCertificates(Landroid/content/pm/PackageParser$Package;I)Z\n\n    new-instance v5, Landroid/atl/ATLLoadedApp;\n'
+HOST_SYSTEM_CERTIFICATES=$'    move-result-object v3\n\n    invoke-static {v3}, Landroid/content/pm/SigningCertificates;->collectHostVerified(Landroid/content/pm/PackageParser$Package;)V\n\n    new-instance v5, Landroid/atl/ATLLoadedApp;\n'
+n="$(ANCHOR="$ANCHOR_SYSTEM_CERTIFICATES" perl -0777 -ne 'print scalar(() = /\Q$ENV{ANCHOR}\E/g)' "$atlsm")"
+[ "$n" = "1" ] || fail "ATLLoadedApp.getSystemApplication collectCertificates call found $n times (expected 1) — installed ATLLoadedApp drifted; update patch-framework.sh"
+ANCHOR="$ANCHOR_SYSTEM_CERTIFICATES" HOST="$HOST_SYSTEM_CERTIFICATES" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{HOST}}' "$atlsm"
+perl -0777 -ne 'exit(/\.method public static getSystemApplication\(\)(?:(?!\.end method).)*SigningCertificates;->collectHostVerified\(Landroid\/content\/pm\/PackageParser\$Package;\)V/s ? 0 : 1)' "$atlsm" || fail "ATLLoadedApp.getSystemApplication host-verified certificate insert failed (drift?)"
+
+mkdir -p "$work/smali-view/android/atl" "$work/smali-view/android/view" "$work/smali-view/android/app" "$work/smali-view/android/location" "$work/smali-view/android/os" "$work/smali-view/android/content" "$work/smali-view/android/content/pm" "$work/smali-view/android/net" "$work/smali-view/android/view/autofill" "$work/smali-view/android/webkit" "$work/smali-view/android/app/job" "$work/smali-view/android/graphics"
 cp "$crsm" "$work/smali-view/android/content/ContentResolver.smali"
 cp "$connectivity_sm" "$work/smali-view/android/net/ConnectivityManager.smali"
 cp "$here/smali/android/net/LinkProperties.smali" "$work/smali-view/android/net/"
@@ -827,6 +877,9 @@ cp "$lmsm" "$work/smali-view/android/location/LocationManager.smali"
 cp "$vibsm" "$work/smali-view/android/os/Vibrator.smali"
 cp "$spsm" "$work/smali-view/android/os/SystemProperties.smali"
 cp "$pmsm" "$work/smali-view/android/content/pm/PackageManager.smali"
+cp "$ppsm" "$work/smali-view/android/content/pm/PackageParser.smali"
+cp "$ppkg_sm" "$work/smali-view/android/content/pm/PackageParser\$Package.smali"
+cp "$atlsm" "$work/smali-view/android/atl/ATLLoadedApp.smali"
 cp "$shortcut_sm" "$work/smali-view/android/content/pm/ShortcutManager.smali"
 cp "$afm" "$work/smali-view/android/view/autofill/AutofillManager.smali"
 cp "$csm" "$work/smali-view/android/webkit/CookieManager.smali"
@@ -973,6 +1026,15 @@ keygen_output="$("$JAVA" -cp "$work/classes:$work/keygen-probe/classes" KeyGenPa
 [ "$keygen_output" = 'keygen-parameter-spec-ok' ] \
     || fail "key-generation regression probe returned '$keygen_output'"
 
+signing_probe="$here/tests/SigningCertificatesProbe.java"
+[ -f "$signing_probe" ] || fail "signing-certificate regression probe missing at $signing_probe"
+mkdir -p "$work/signing-probe/classes"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -cp "$work/classes" \
+    -d "$work/signing-probe/classes" "$signing_probe"
+signing_output="$("$JAVA" -cp "$work/classes:$work/signing-probe/classes" android.content.pm.SigningCertificatesProbe)"
+[ "$signing_output" = 'signing-certificates-ok' ] \
+    || fail "signing-certificate regression probe returned '$signing_output'"
+
 mkdir -p "$OUT"
 cp "$work/jar/api-impl.jar" "$OUT/api-impl.jar"
 ln -sfn "$ORIG_FW/framework-res.apk" "$OUT/framework-res.apk"
@@ -991,5 +1053,5 @@ classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
 classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
 classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
 echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
-echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, date-time, and wolfSSL contracts verified"
+echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""
