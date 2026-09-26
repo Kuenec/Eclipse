@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 
 use super::elf::DynSym;
-use super::native_provider::EclipseNativeProvider;
+use super::native_provider::{
+    last_dl_error, EclipseNativeProvider, HOST_EGL_SONAME, HOST_GLESV2_SONAME,
+};
 use super::reloc::{self, Rela};
 use super::resolve::{HostDlsymProvider, ResolvedSym, Scope, SymbolProvider};
 
@@ -339,17 +341,17 @@ impl BionicEnv {
         }
 
         if try_host_gl {
-            for soname in ["libEGL.so", "libGLESv2.so"] {
-                match DlopenLibProvider::open(soname) {
-                    Some(p) => {
+            for opened in open_host_gl_libraries() {
+                match opened {
+                    Ok(p) => {
                         scope.push(Box::new(p));
                     }
-                    None => missing_gl.push(soname.to_string()),
+                    Err(e) => missing_gl.push(e),
                 }
             }
         } else {
-            missing_gl.push("libEGL.so".to_string());
-            missing_gl.push("libGLESv2.so".to_string());
+            missing_gl.push(HOST_EGL_SONAME.to_string());
+            missing_gl.push(HOST_GLESV2_SONAME.to_string());
         }
 
         scope.push(Box::new(HostDlsymProvider));
@@ -365,7 +367,7 @@ impl BionicEnv {
     pub fn empty() -> Self {
         Self {
             scope: Scope::new(),
-            missing_gl: vec!["libEGL.so".to_string(), "libGLESv2.so".to_string()],
+            missing_gl: vec![HOST_EGL_SONAME.to_string(), HOST_GLESV2_SONAME.to_string()],
             host_libc_present: false,
             eclipse_natives_present: false,
         }
@@ -396,6 +398,10 @@ impl BionicEnv {
     }
 }
 
+fn open_host_gl_libraries() -> [Result<DlopenLibProvider, String>; 2] {
+    [HOST_EGL_SONAME, HOST_GLESV2_SONAME].map(DlopenLibProvider::open)
+}
+
 pub struct DlopenLibProvider {
     handle: HostLibHandle,
 
@@ -409,14 +415,14 @@ unsafe impl Send for HostLibHandle {}
 unsafe impl Sync for HostLibHandle {}
 
 impl DlopenLibProvider {
-    pub fn open(soname: &str) -> Option<Self> {
-        let cname = CString::new(soname).ok()?;
+    pub fn open(soname: &str) -> Result<Self, String> {
+        let cname = CString::new(soname).map_err(|e| format!("dlopen({soname}): {e}"))?;
 
         let handle = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
-            return None;
+            return Err(format!("dlopen({soname}) failed: {}", last_dl_error()));
         }
-        Some(Self {
+        Ok(Self {
             handle: HostLibHandle(handle),
             soname: soname.to_string(),
         })
@@ -663,9 +669,12 @@ mod tests {
 
     #[test]
     fn dlopen_provider_resolves_from_libc() {
-        let Some(p) = DlopenLibProvider::open("libc.so.6") else {
-            eprintln!("dlopen_provider_resolves_from_libc: no libc.so.6; skipping");
-            return;
+        let p = match DlopenLibProvider::open("libc.so.6") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("dlopen_provider_resolves_from_libc: {e}; skipping");
+                return;
+            }
         };
         assert_eq!(p.soname(), "libc.so.6");
         assert!(p.resolve("memcpy").is_some_and(|r| r.addr != 0));
@@ -675,7 +684,72 @@ mod tests {
     }
 
     #[test]
-    fn dlopen_provider_absent_lib_is_none() {
-        assert!(DlopenLibProvider::open("libeclipse_definitely_no_such_lib_4f2a.so").is_none());
+    fn dlopen_provider_absent_lib_reports_the_dlerror_cause() {
+        let Err(e) = DlopenLibProvider::open("libeclipse_definitely_no_such_lib_4f2a.so") else {
+            panic!("an absent library must not open");
+        };
+        assert!(
+            e.contains("libeclipse_definitely_no_such_lib_4f2a.so")
+                && e.contains("cannot open shared object file"),
+            "the error must name the library and the loader's cause: {e}"
+        );
+    }
+
+    #[test]
+    fn host_gl_libraries_open_by_their_runtime_sonames() {
+        for (soname, symbol) in [
+            (HOST_EGL_SONAME, "eglGetDisplay"),
+            (HOST_GLESV2_SONAME, "glDrawArrays"),
+        ] {
+            let provider = match DlopenLibProvider::open(soname) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("SKIP: host {soname} is not installed ({e})");
+                    continue;
+                }
+            };
+            let addr = provider
+                .resolve(symbol)
+                .unwrap_or_else(|| panic!("{soname} must export {symbol}"))
+                .addr;
+            let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+            assert_ne!(
+                unsafe { libc::dladdr(addr as *const libc::c_void, &mut info) },
+                0,
+                "dladdr must find the object that defines {symbol}"
+            );
+            let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }
+                .to_string_lossy()
+                .into_owned();
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let image = crate::loader::elf::ElfImage::parse(&bytes)
+                .unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
+            assert_eq!(
+                image.soname().expect("DT_SONAME decode").as_deref(),
+                Some(soname),
+                "{path} is the runtime library, so its DT_SONAME must be the name Eclipse opens"
+            );
+        }
+        let env = BionicEnv::with_host_baseline(true, false);
+        for missing in env.missing_gl() {
+            assert!(
+                missing.contains("cannot open shared object file"),
+                "a host GL library that exists must load: {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_baseline_opens_gl_by_exactly_the_runtime_sonames() {
+        let [egl, gles] = open_host_gl_libraries();
+        for (opened, soname) in [(egl, HOST_EGL_SONAME), (gles, HOST_GLESV2_SONAME)] {
+            match opened {
+                Ok(provider) => assert_eq!(provider.soname(), soname),
+                Err(e) => assert!(
+                    e.starts_with(&format!("dlopen({soname}) failed")),
+                    "a host GL library that fails to open must be the runtime soname: {e}"
+                ),
+            }
+        }
     }
 }
