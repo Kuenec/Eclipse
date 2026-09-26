@@ -508,15 +508,27 @@ fn install_url_handler_command(arguments: &[String]) -> Result<(), Box<dyn std::
     if !arguments.is_empty() {
         return Err("usage: eclipse install-url-handler".into());
     }
-    let desktop_path = desktop_integration::install_url_handler()?;
-    println!(
-        "Roblox browser Play handler installed: {}",
-        desktop_path.display()
-    );
+    let outcome = desktop_integration::install_url_handler()?;
+    println!("{}", url_handler_message(&outcome));
     if eclipse::apk::store::Store::open()?.current()?.is_none() {
         println!("note: {NOT_INSTALLED}");
     }
     Ok(())
+}
+
+fn url_handler_message(outcome: &desktop_integration::UrlHandlerInstall) -> String {
+    use desktop_integration::UrlHandlerInstall;
+
+    match outcome {
+        UrlHandlerInstall::Registered { desktop_path } => format!(
+            "Roblox browser Play handler installed: {}",
+            desktop_path.display()
+        ),
+        UrlHandlerInstall::FlatpakExport {
+            app_id,
+            desktop_path,
+        } => desktop_integration::flatpak_handler_notice(app_id, desktop_path),
+    }
 }
 
 fn native_lib_dir(
@@ -1098,7 +1110,7 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 mod tests {
     use super::{
         finish_android_process, normalize_browser_launch, parse_libroblox_init_lib_dir,
-        parse_run_path, remove_other_native_lib_versions,
+        parse_run_path, remove_other_native_lib_versions, url_handler_message,
     };
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
@@ -1163,6 +1175,29 @@ mod tests {
             std::path::Path::new("harness-libs")
         );
         assert!(parse_libroblox_init_lib_dir(&[lib_dir.clone(), lib_dir]).is_err());
+    }
+
+    #[test]
+    fn url_handler_message_claims_an_install_only_when_one_was_written() {
+        use super::desktop_integration::UrlHandlerInstall;
+
+        let registered = url_handler_message(&UrlHandlerInstall::Registered {
+            desktop_path: "/home/u/.local/share/applications/dev.eclipse.RobloxPlayer.desktop"
+                .into(),
+        });
+        assert_eq!(
+            registered,
+            "Roblox browser Play handler installed: \
+             /home/u/.local/share/applications/dev.eclipse.RobloxPlayer.desktop"
+        );
+
+        let flatpak = url_handler_message(&UrlHandlerInstall::FlatpakExport {
+            app_id: "io.github.kuenec.Eclipse".to_owned(),
+            desktop_path: "/app/share/applications/io.github.kuenec.Eclipse.UrlHandler.desktop"
+                .into(),
+        });
+        assert!(flatpak.contains("nothing was written"), "{flatpak}");
+        assert!(!flatpak.contains("handler installed"), "{flatpak}");
     }
 
     #[test]
