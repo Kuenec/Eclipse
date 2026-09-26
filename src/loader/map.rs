@@ -22,6 +22,8 @@ pub enum MapError {
     Os(rustix::io::Errno),
 
     Reloc(RelocError),
+
+    UnsupportedRelocation { r_type: u32, offset: u64 },
 }
 
 impl std::fmt::Display for MapError {
@@ -40,6 +42,10 @@ impl std::fmt::Display for MapError {
             }
             Self::Os(e) => write!(f, "memory-mapping syscall failed: {e}"),
             Self::Reloc(e) => write!(f, "base relocation failed: {e}"),
+            Self::UnsupportedRelocation { r_type, offset } => write!(
+                f,
+                "relocation type {r_type} at {offset:#x} is not supported by the engine loader"
+            ),
         }
     }
 }
@@ -98,8 +104,6 @@ pub struct PartialSymbolStats {
     pub applied_weak_zero: usize,
 
     pub unresolved_strong: usize,
-
-    pub deferred: usize,
 
     pub unresolved: Vec<String>,
 }
@@ -330,9 +334,7 @@ impl MappedObject {
         };
         stats.resolved_nonnull = resolved_nonnull;
 
-        for seg in &img.loads {
-            self.protect_segment(seg, region_start, page_size)?;
-        }
+        self.restore_protection(img, region_start, page_size)?;
 
         Ok(stats)
     }
@@ -385,9 +387,13 @@ impl MappedObject {
                         }
                     }
                 }
-                reloc::R_X86_64_TPOFF64 | R_X86_64_IRELATIVE => stats.deferred += 1,
-
-                _ => {}
+                reloc::R_X86_64_NONE | reloc::R_X86_64_RELATIVE => {}
+                other => {
+                    return Err(MapError::UnsupportedRelocation {
+                        r_type: other,
+                        offset: r.offset,
+                    })
+                }
             }
         }
         stats.unresolved = unresolved_names.into_iter().collect();
@@ -410,9 +416,7 @@ impl MappedObject {
                 reloc::apply_one(&mut image, &resolver, r)?;
             }
         }
-        for seg in &img.loads {
-            self.protect_segment(seg, region_start, page_size)?;
-        }
+        self.restore_protection(img, region_start, page_size)?;
 
         Ok(stats)
     }
@@ -472,9 +476,7 @@ impl MappedObject {
             reloc::apply_rela(&mut image, &resolver, &tls_relas)?;
         }
 
-        for seg in &img.loads {
-            self.protect_segment(seg, region_start, page_size)?;
-        }
+        self.restore_protection(img, region_start, page_size)?;
 
         Ok(stats)
     }
@@ -536,6 +538,21 @@ impl MappedObject {
             std::slice::from_raw_parts_mut(self.base.as_ptr().add(seg_off), filesz)
         };
         dst.copy_from_slice(src);
+        Ok(())
+    }
+
+    fn restore_protection(
+        &self,
+        img: &ElfImage<'_>,
+        region_start: u64,
+        page_size: u64,
+    ) -> Result<(), MapError> {
+        for seg in &img.loads {
+            self.protect_segment(seg, region_start, page_size)?;
+        }
+        if let Some(relro) = img.relro {
+            self.apply_relro(&relro, page_size)?;
+        }
         Ok(())
     }
 
@@ -700,7 +717,8 @@ mod tests {
     const PAGE: u64 = 0x1000;
     const PH_OFF: usize = 0x40;
     const DYN_OFF: u64 = 0x200;
-    const SYM_OFF: u64 = 0x280;
+    const SYM_OFF: u64 = 0x3d0;
+    const HASH_OFF: u64 = 0x3f0;
     const RELA_OFF: u64 = 0x300;
     const RELR_OFF: u64 = 0x380;
     const STR_OFF: u64 = 0x3c0;
@@ -734,6 +752,7 @@ mod tests {
     const DT_RELRENT: i64 = 37;
     const DT_STRTAB: i64 = 5;
     const DT_STRSZ: i64 = 10;
+    const DT_HASH: i64 = 4;
     const DT_SYMTAB: i64 = 6;
     const DT_SYMENT: i64 = 11;
     const SYM_ENT: u64 = 24;
@@ -838,7 +857,11 @@ mod tests {
         d(&mut buf, DT_SYMENT, SYM_ENT);
         d(&mut buf, DT_STRTAB, STR_OFF);
         d(&mut buf, DT_STRSZ, 1);
+        d(&mut buf, DT_HASH, HASH_OFF);
         d(&mut buf, DT_NULL, 0);
+
+        put_u32(&mut buf, HASH_OFF as usize, 1);
+        put_u32(&mut buf, HASH_OFF as usize + 4, 1);
 
         put_u64(&mut buf, RELA_OFF as usize, RELA_TARGET);
         put_u64(&mut buf, RELA_OFF as usize + 8, R_X86_64_RELATIVE as u64);
@@ -985,6 +1008,92 @@ mod tests {
         assert_eq!(read_word(&mut obj, RELA_TARGET), base + RELA_ADDEND as u64);
 
         assert_eq!(read_word(&mut obj, RELR_TARGET), RELR_SEED + base);
+    }
+
+    fn page_permissions(addr: u64) -> String {
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("read /proc/self/maps");
+        maps.lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (start, end) = fields.next()?.split_once('-')?;
+                let start = u64::from_str_radix(start, 16).ok()?;
+                let end = u64::from_str_radix(end, 16).ok()?;
+                let perms = fields.next()?;
+                (start..end).contains(&addr).then(|| perms[..3].to_owned())
+            })
+            .expect("address is mapped")
+    }
+
+    #[test]
+    fn later_symbol_relocation_passes_keep_relro_read_only() {
+        let buf = build_relro_fixture();
+        let img = ElfImage::parse(&buf).expect("relro fixture parses");
+        let relro = img.relro.expect("fixture declares PT_GNU_RELRO");
+        let (mut obj, _) = MappedObject::map_and_relocate(&img, &buf, PAGE).expect("map");
+        obj.apply_relro(&relro, PAGE).expect("apply_relro");
+        let relro_page = obj.load_base() + relro.vaddr;
+        assert_eq!(page_permissions(relro_page), "r--");
+
+        obj.relocate_symbols_partial(&img, &Scope::new(), PAGE)
+            .expect("partial symbol relocation");
+        assert_eq!(page_permissions(relro_page), "r--");
+
+        obj.relocate_symbols(&img, &Scope::new(), PAGE)
+            .expect("symbol relocation");
+        assert_eq!(page_permissions(relro_page), "r--");
+    }
+
+    fn fixture_with_relocation_type(r_type: u32) -> Vec<u8> {
+        let mut buf = build_two_segment_fixture();
+        put_u64(&mut buf, RELA_OFF as usize + 8, u64::from(r_type));
+        buf
+    }
+
+    #[test]
+    fn partial_symbol_relocation_rejects_relocation_types_it_does_not_apply() {
+        const R_X86_64_COPY: u32 = 5;
+        const R_X86_64_DTPMOD64: u32 = 16;
+        const R_X86_64_DTPOFF64: u32 = 17;
+        const R_X86_64_TLSDESC: u32 = 36;
+        const R_X86_64_PC64: u32 = 24;
+        for r_type in [
+            R_X86_64_COPY,
+            R_X86_64_DTPMOD64,
+            R_X86_64_DTPOFF64,
+            reloc::R_X86_64_TPOFF64,
+            R_X86_64_TLSDESC,
+            R_X86_64_IRELATIVE,
+            R_X86_64_PC64,
+        ] {
+            let buf = fixture_with_relocation_type(r_type);
+            let img = ElfImage::parse(&buf).expect("fixture parses");
+            let (mut obj, stats) = MappedObject::map_and_relocate(&img, &buf, PAGE).expect("map");
+            assert_eq!(stats.skipped_by_type, 1);
+
+            let err = obj
+                .relocate_symbols_partial(&img, &Scope::new(), PAGE)
+                .expect_err("unsupported relocation must fail the load");
+
+            let MapError::UnsupportedRelocation {
+                r_type: rejected,
+                offset,
+            } = err
+            else {
+                panic!("type {r_type}: unexpected error {err}");
+            };
+            assert_eq!((rejected, offset), (r_type, RELA_TARGET));
+            assert_eq!(read_word(&mut obj, RELA_TARGET), 0);
+        }
+    }
+
+    #[test]
+    fn partial_symbol_relocation_accepts_none_relocations() {
+        let buf = fixture_with_relocation_type(reloc::R_X86_64_NONE);
+        let img = ElfImage::parse(&buf).expect("fixture parses");
+        let (mut obj, _) = MappedObject::map_and_relocate(&img, &buf, PAGE).expect("map");
+
+        obj.relocate_symbols_partial(&img, &Scope::new(), PAGE)
+            .expect("R_X86_64_NONE is a no-op");
     }
 
     #[test]
@@ -1143,7 +1252,6 @@ mod tests {
 
                     if let Some(off_in_obj) = LoadedObjectProvider::new(base, &img.dynsyms)
                         .resolve(&sym.name)
-                        .filter(|s| !s.weak || scope_hit == Some(*s))
                         .map(|s| s.addr)
                     {
                         if off_in_obj == word {

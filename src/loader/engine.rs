@@ -16,7 +16,7 @@ use super::link::{Linker, LoadedObject};
 use super::map::{host_page_size, MappedObject};
 use super::resolve::{LoadedObjectProvider, Scope, SymbolProvider};
 
-use super::init_run::{init_array_count, init_array_entry_offset};
+use super::init_run::{constructor_addresses, init_array_count};
 
 const LIBROBLOX_FILENAME: &str = "libroblox.so";
 
@@ -47,6 +47,8 @@ pub struct LoadedEngine {
     soname: String,
 
     dynsyms: Vec<DynSym>,
+
+    init: Option<u64>,
 
     init_array: Option<(u64, u64)>,
 
@@ -104,13 +106,7 @@ pub enum EngineLoadError {
 
     TextNotExecutable(String),
 
-    NoInitArray,
-
-    NullConstructor(usize),
-
     ReadInitArray(String),
-
-    NoJniOnLoad,
 }
 
 impl std::fmt::Display for EngineLoadError {
@@ -126,12 +122,7 @@ impl std::fmt::Display for EngineLoadError {
                 )
             }
             Self::TextNotExecutable(d) => write!(f, "engine text segment not executable: {d}"),
-            Self::NoInitArray => write!(f, "mapped libroblox.so has no DT_INIT_ARRAY"),
-            Self::NullConstructor(i) => {
-                write!(f, "null DT_INIT_ARRAY constructor slot at index {i}")
-            }
             Self::ReadInitArray(e) => write!(f, "read DT_INIT_ARRAY entry: {e}"),
-            Self::NoJniOnLoad => write!(f, "libroblox.so does not export JNI_OnLoad"),
         }
     }
 }
@@ -222,6 +213,7 @@ fn map_resolve_app_lib(
         mapped,
         soname,
         dynsyms: img.dynsyms,
+        init: img.dyn_info.init,
         init_array,
         constructors_run: 0,
     };
@@ -254,27 +246,17 @@ impl Drop for LoadedEngine {
 }
 
 impl LoadedEngine {
-    pub fn run_init_array(&mut self, log: &mut impl Write) -> Result<usize, EngineLoadError> {
-        let (init_array_vaddr, init_arraysz) =
-            self.init_array.ok_or(EngineLoadError::NoInitArray)?;
-        let count = init_array_count(init_arraysz);
+    fn constructor_addresses(&self) -> Result<Vec<u64>, EngineLoadError> {
+        constructor_addresses(&self.mapped, self.init, self.init_array)
+            .map_err(|e| EngineLoadError::ReadInitArray(e.to_string()))
+    }
 
-        let mut entries: Vec<u64> = Vec::with_capacity(count);
-        for i in 0..count {
-            let off = init_array_entry_offset(init_array_vaddr, i) as usize;
-            let addr = self
-                .mapped
-                .read_u64(off)
-                .map_err(|e| EngineLoadError::ReadInitArray(e.to_string()))?;
-            if addr == 0 {
-                return Err(EngineLoadError::NullConstructor(i));
-            }
-            entries.push(addr);
+    fn run_constructors(&mut self, constructors: &[u64], log: &mut impl Write) -> usize {
+        if constructors.is_empty() {
+            return 0;
         }
-        let _ = writeln!(
-            log,
-            "engine-load: running {count} DT_INIT_ARRAY constructors…"
-        );
+        let count = constructors.len();
+        let _ = writeln!(log, "engine-load: running {count} constructors…");
         let _ = log.flush();
 
         let arg0 = b"libroblox\0";
@@ -283,7 +265,7 @@ impl LoadedEngine {
         let argc: c_int = 1;
 
         let mut completed = 0usize;
-        for &addr in &entries {
+        for &addr in constructors {
             let ctor: extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char) =
                 unsafe { std::mem::transmute::<u64, _>(addr) };
             ctor(argc, argv.as_mut_ptr(), envp.as_mut_ptr());
@@ -295,18 +277,16 @@ impl LoadedEngine {
             "engine-load: {completed}/{count} constructors completed ✓"
         );
         let _ = log.flush();
-        Ok(completed)
+        completed
     }
 }
 
-pub fn call_jni_onload(
+fn call_jni_onload(
     engine: &LoadedEngine,
+    addr: u64,
     java_vm: *mut JavaVM,
     log: &mut impl Write,
-) -> Result<jint, EngineLoadError> {
-    let addr = engine
-        .jni_onload_addr()
-        .ok_or(EngineLoadError::NoJniOnLoad)?;
+) -> jint {
     let _ = writeln!(
         log,
         "engine-load: calling JNI_OnLoad @ base+{:#x} (abs {:#x}) with the ART JavaVM…",
@@ -325,7 +305,7 @@ pub fn call_jni_onload(
         describe_jni_version(version)
     );
     let _ = log.flush();
-    Ok(version)
+    version
 }
 
 struct ProcessLifetimeEngine {
@@ -366,7 +346,15 @@ pub fn load_app_native_lib(
             );
         }
     });
+    link_and_initialize(lib_dir, filename, java_vm, log)
+}
 
+fn link_and_initialize(
+    lib_dir: &Path,
+    filename: &str,
+    java_vm: *mut JavaVM,
+    log: &mut impl Write,
+) -> Result<Option<PreloadedLib>, EngineLoadError> {
     if soname_is_loaded(filename) {
         let _ = writeln!(
             log,
@@ -376,14 +364,9 @@ pub fn load_app_native_lib(
     }
 
     let mut engine = map_resolve_app_lib(lib_dir, filename, log)?;
+    let constructors = engine.constructor_addresses()?;
+    let jni_onload = engine.jni_onload_addr();
     let soname = engine.soname.clone();
-
-    if filename == LIBROBLOX_FILENAME {
-        super::native_provider::publish_engine_text_range(
-            engine.load_base(),
-            engine.mapped.span() as u64,
-        );
-    }
 
     if !register_soname(&soname) {
         let _ = writeln!(
@@ -397,14 +380,17 @@ pub fn load_app_native_lib(
         let _ = register_soname(filename);
     }
 
-    let constructors_run = if engine.init_array.is_some() {
-        engine.run_init_array(log)?
-    } else {
-        0
-    };
+    if filename == LIBROBLOX_FILENAME {
+        super::native_provider::publish_engine_text_range(
+            engine.load_base(),
+            engine.mapped.span() as u64,
+        );
+    }
 
-    let jni_onload_version = if engine.jni_onload_addr().is_some() {
-        Some(call_jni_onload(&engine, java_vm, log)?)
+    let constructors_run = engine.run_constructors(&constructors, log);
+
+    let jni_onload_version = if let Some(addr) = jni_onload {
+        Some(call_jni_onload(&engine, addr, java_vm, log))
     } else {
         let _ = writeln!(
             log,
@@ -452,7 +438,9 @@ fn describe_jni_version(version: jint) -> &'static str {
 mod tests {
     use super::*;
 
-    use super::super::link::tests::{build_so, temp_dir, write_so};
+    use super::super::link::tests::{
+        build_so, build_so_with_constructors, build_so_with_unmapped_init_array, temp_dir, write_so,
+    };
     use super::super::module_registry::walk_support::collect_registered;
 
     fn registered_module_paths() -> Vec<PathBuf> {
@@ -510,6 +498,75 @@ mod tests {
 
         drop(engine);
         assert!(!registered_module_paths().contains(&lib_dir.join(root)));
+        std::fs::remove_dir_all(&lib_dir).ok();
+    }
+
+    static CONSTRUCTOR_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    extern "C" fn record_dt_init() {
+        CONSTRUCTOR_ORDER.lock().unwrap().push("DT_INIT");
+    }
+
+    extern "C" fn record_first(_: c_int, _: *mut *mut c_char, _: *mut *mut c_char) {
+        CONSTRUCTOR_ORDER.lock().unwrap().push("first");
+    }
+
+    extern "C" fn record_second(_: c_int, _: *mut *mut c_char, _: *mut *mut c_char) {
+        CONSTRUCTOR_ORDER.lock().unwrap().push("second");
+    }
+
+    #[test]
+    fn constructors_run_dt_init_first_and_skip_null_and_minus_one_slots() {
+        let filename = "libengine-test-ctor-order.so";
+        let lib_dir = temp_dir("engine-ctor-order");
+        let so = build_so_with_constructors(
+            filename,
+            Some(record_dt_init as *const () as u64),
+            &[
+                0,
+                u64::MAX,
+                record_first as *const () as u64,
+                record_second as *const () as u64,
+            ],
+        );
+        write_so(&lib_dir, filename, &so);
+
+        let lib = link_and_initialize(
+            &lib_dir,
+            filename,
+            std::ptr::null_mut(),
+            &mut std::io::sink(),
+        )
+        .expect("load the constructor fixture")
+        .expect("first load is not deduped");
+
+        assert_eq!(lib.constructors_run, 3);
+        assert_eq!(
+            *CONSTRUCTOR_ORDER.lock().unwrap(),
+            ["DT_INIT", "first", "second"]
+        );
+        std::fs::remove_dir_all(&lib_dir).ok();
+    }
+
+    #[test]
+    fn failed_constructor_lookup_leaves_the_soname_unregistered() {
+        let filename = "libengine-test-unmapped-init-array.so";
+        let lib_dir = temp_dir("engine-unmapped-init-array");
+        write_so(
+            &lib_dir,
+            filename,
+            &build_so_with_unmapped_init_array(filename),
+        );
+
+        let result = link_and_initialize(
+            &lib_dir,
+            filename,
+            std::ptr::null_mut(),
+            &mut std::io::sink(),
+        );
+
+        assert!(matches!(result, Err(EngineLoadError::ReadInitArray(_))));
+        assert!(!is_preloaded(filename));
         std::fs::remove_dir_all(&lib_dir).ok();
     }
 

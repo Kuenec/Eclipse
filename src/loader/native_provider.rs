@@ -407,9 +407,7 @@ impl EclipseNativeProvider {
 
 impl SymbolProvider for EclipseNativeProvider {
     fn resolve(&self, name: &str) -> Option<ResolvedSym> {
-        self.natives
-            .get(name)
-            .map(|&addr| ResolvedSym { addr, weak: false })
+        self.natives.get(name).map(|&addr| ResolvedSym { addr })
     }
 }
 
@@ -2773,7 +2771,6 @@ mod tests {
         assert!(got.is_some(), "__android_log_write must be registered");
         let got = got.unwrap();
         assert!(got.addr != 0, "registered native address must be non-null");
-        assert!(!got.weak, "Eclipse natives are strong definitions");
 
         assert!(p.resolve("__memcpy_chk").is_none());
         assert!(p.resolve("__strlen_chk").is_some_and(|r| r.addr != 0));
