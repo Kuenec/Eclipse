@@ -140,11 +140,29 @@ pub fn select_ozone(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxMode {
+    Zypak,
+
     Userns,
 
     Suid,
 
     Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxHost {
+    FlatpakZypak,
+
+    Native { userns_ok: bool, suid_ok: bool },
+}
+
+pub fn zypak_sandbox_available(
+    flatpak_info_present: bool,
+    zypak_bin: Option<&std::ffi::OsStr>,
+    zypak_lib: Option<&std::ffi::OsStr>,
+) -> bool {
+    let set = |value: Option<&std::ffi::OsStr>| value.is_some_and(|v| !v.is_empty());
+    flatpak_info_present && set(zypak_bin) && set(zypak_lib)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,20 +185,18 @@ impl std::fmt::Display for SandboxUnavailable {
 impl std::error::Error for SandboxUnavailable {}
 
 pub fn select_sandbox_mode(
-    userns_ok: bool,
-    suid_ok: bool,
+    host: SandboxHost,
     allow_unsandboxed: bool,
 ) -> Result<SandboxMode, SandboxUnavailable> {
-    if userns_ok {
-        return Ok(SandboxMode::Userns);
+    match host {
+        SandboxHost::FlatpakZypak => Ok(SandboxMode::Zypak),
+        SandboxHost::Native {
+            userns_ok: true, ..
+        } => Ok(SandboxMode::Userns),
+        SandboxHost::Native { suid_ok: true, .. } => Ok(SandboxMode::Suid),
+        SandboxHost::Native { .. } if allow_unsandboxed => Ok(SandboxMode::Degraded),
+        SandboxHost::Native { .. } => Err(SandboxUnavailable),
     }
-    if suid_ok {
-        return Ok(SandboxMode::Suid);
-    }
-    if allow_unsandboxed {
-        return Ok(SandboxMode::Degraded);
-    }
-    Err(SandboxUnavailable)
 }
 
 pub fn apply_sandbox_mode(settings: &mut Settings, mode: &SandboxMode) {
@@ -2257,14 +2273,18 @@ mod tests {
     #[test]
     fn sandbox_mode_selection_prefers_userns_then_suid_then_policy() {
         use SandboxMode::*;
-        assert_eq!(select_sandbox_mode(true, true, true), Ok(Userns));
-        assert_eq!(select_sandbox_mode(true, true, false), Ok(Userns));
-        assert_eq!(select_sandbox_mode(true, false, true), Ok(Userns));
-        assert_eq!(select_sandbox_mode(true, false, false), Ok(Userns));
-        assert_eq!(select_sandbox_mode(false, true, true), Ok(Suid));
-        assert_eq!(select_sandbox_mode(false, true, false), Ok(Suid));
-        assert_eq!(select_sandbox_mode(false, false, true), Ok(Degraded));
-        let err = select_sandbox_mode(false, false, false).expect_err("policy refusal");
+        let native = |userns_ok, suid_ok| SandboxHost::Native { userns_ok, suid_ok };
+        assert_eq!(select_sandbox_mode(native(true, true), true), Ok(Userns));
+        assert_eq!(select_sandbox_mode(native(true, true), false), Ok(Userns));
+        assert_eq!(select_sandbox_mode(native(true, false), true), Ok(Userns));
+        assert_eq!(select_sandbox_mode(native(true, false), false), Ok(Userns));
+        assert_eq!(select_sandbox_mode(native(false, true), true), Ok(Suid));
+        assert_eq!(select_sandbox_mode(native(false, true), false), Ok(Suid));
+        assert_eq!(
+            select_sandbox_mode(native(false, false), true),
+            Ok(Degraded)
+        );
+        let err = select_sandbox_mode(native(false, false), false).expect_err("policy refusal");
         let text = err.to_string();
         assert!(
             text.starts_with("sandbox unavailable"),
@@ -2282,8 +2302,36 @@ mod tests {
     }
 
     #[test]
+    fn zypak_is_selected_inside_flatpak_before_any_host_probe_or_policy() {
+        assert_eq!(
+            select_sandbox_mode(SandboxHost::FlatpakZypak, false),
+            Ok(SandboxMode::Zypak),
+            "the Flatpak must run sandboxed without the unsandboxed opt-in"
+        );
+        assert_eq!(
+            select_sandbox_mode(SandboxHost::FlatpakZypak, true),
+            Ok(SandboxMode::Zypak),
+            "an available zypak sandbox must win over the unsandboxed opt-in"
+        );
+    }
+
+    #[test]
+    fn zypak_requires_the_flatpak_info_file_and_both_wrapper_variables() {
+        use std::ffi::OsStr;
+        let bin = Some(OsStr::new("/app/bin"));
+        let lib = Some(OsStr::new("/app/lib"));
+        assert!(zypak_sandbox_available(true, bin, lib));
+        assert!(!zypak_sandbox_available(false, bin, lib));
+        assert!(!zypak_sandbox_available(true, None, lib));
+        assert!(!zypak_sandbox_available(true, bin, None));
+        assert!(!zypak_sandbox_available(true, Some(OsStr::new("")), lib));
+        assert!(!zypak_sandbox_available(true, bin, Some(OsStr::new(""))));
+    }
+
+    #[test]
     fn apply_sandbox_mode_flips_no_sandbox_only_for_degraded() {
         for (mode, expected) in [
+            (SandboxMode::Zypak, 0),
             (SandboxMode::Userns, 0),
             (SandboxMode::Suid, 0),
             (SandboxMode::Degraded, 1),
