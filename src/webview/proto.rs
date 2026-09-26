@@ -1526,7 +1526,7 @@ mod tests {
         vec![
             HelperMsg::HelloAck {
                 version: super::super::PROTO_VERSION,
-                engine: "cef/149.0.6+g0d0eeb6+chromium-149.0.7827.201".to_string(),
+                engine: "cef/152.0.6+g708dc14+chromium-152.0.7977.83".to_string(),
             },
             HelperMsg::LoadState {
                 view: 42,

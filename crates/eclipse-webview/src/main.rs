@@ -161,6 +161,11 @@ wrap_app! {
                 }
             }
 
+            let first_run_key = CefString::from(engine::SKIP_FIRST_RUN_SWITCH);
+            if cmd.has_switch(Some(&first_run_key)) != 1 {
+                cmd.append_switch(Some(&first_run_key));
+            }
+
             let ozone_key = CefString::from("ozone-platform");
             if cmd.has_switch(Some(&ozone_key)) != 1 {
                 let selected = self.ozone.lock().ok().and_then(|s| s.clone());
@@ -1147,6 +1152,32 @@ mod tests {
             Err(ProtoError::Eof)
         );
         writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn only_the_browser_process_skips_the_first_run_eula() {
+        let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
+        let app = HelperApp::new(
+            Arc::default(),
+            HelperRenderProcessHandler::new(
+                RendererSideRouter::new(MessageRouterConfig::default()),
+                Arc::default(),
+                None,
+            ),
+            Arc::default(),
+            HelperBrowserProcessHandler::new(Arc::default()),
+        );
+        let switch = CefString::from(engine::SKIP_FIRST_RUN_SWITCH);
+        for (process_type, expected) in [(None, 1), (Some(""), 1), (Some("renderer"), 0)] {
+            let mut cmd = command_line_create().expect("command line");
+            let process_type = process_type.map(CefString::from);
+            app.on_before_command_line_processing(process_type.as_ref(), Some(&mut cmd));
+            assert_eq!(
+                cmd.has_switch(Some(&switch)),
+                expected,
+                "process type {process_type:?}"
+            );
+        }
     }
 
     #[test]

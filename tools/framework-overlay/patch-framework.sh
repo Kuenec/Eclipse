@@ -699,12 +699,12 @@ cat >> "$wvsm" <<'ECLIPSE_WV_NATIVES'
 ECLIPSE_WV_NATIVES
 
 grep -qF 'const-string v0, "GDPR VIOLATION"' "$wssm" || fail "WebSettings.smali no longer returns \"GDPR VIOLATION\" (installed shape drifted; update patch-framework.sh)"
-ECLIPSE_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6'
+ECLIPSE_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Eclipse-WebView/152.0.6'
 
 ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public getUserAgentString\(\)Ljava/lang/String;.*?\.end method\n}{".method public getUserAgentString()Ljava/lang/String;\n    .registers 2\n\n    invoke-direct {p0}, Landroid/webkit/WebSettings;->native_getUserAgentString()Ljava/lang/String;\n\n    move-result-object v0\n\n    if-nez v0, :cond_eclipse_ua_app\n\n    const-string v0, \"$ua\"\n\n    :cond_eclipse_ua_app\n    return-object v0\n.end method\n"}se' "$wssm"
 grep -qF -- '->native_getUserAgentString()Ljava/lang/String;' "$wssm" || fail "WebSettings getUserAgentString native-body insert failed (drift?)"
 ECLIPSE_UA="$ECLIPSE_UA" perl -0pi -e 'my $ua=$ENV{ECLIPSE_UA}; s{\.method public static getDefaultUserAgent\(Landroid/content/Context;\)Ljava/lang/String;.*?\.end method\n}{".method public static getDefaultUserAgent(Landroid/content/Context;)Ljava/lang/String;\n    .registers 2\n\n    const-string v0, \"$ua\"\n\n    return-object v0\n.end method\n"}se' "$wssm"
-grep -qF 'Eclipse-WebView/149.0.6' "$wssm" || fail "WebSettings honest-UA insert failed (drift?)"
+grep -qF 'Eclipse-WebView/152.0.6' "$wssm" || fail "WebSettings honest-UA insert failed (drift?)"
 ! grep -qF 'GDPR VIOLATION' "$wssm" || fail "WebSettings still returns \"GDPR VIOLATION\" (honest-UA fix incomplete)"
 
 ! grep -qF 'native_setUserAgentString' "$wssm" || fail "WebSettings.smali already carries native_setUserAgentString — drifted; update patch-framework.sh"

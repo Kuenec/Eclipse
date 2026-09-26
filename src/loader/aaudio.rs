@@ -171,24 +171,40 @@ impl SampleFormat {
         }
     }
 
-    fn cpal(self) -> cpal::SampleFormat {
-        match self {
-            Self::I16 => cpal::SampleFormat::I16,
-            Self::Float => cpal::SampleFormat::F32,
-        }
-    }
-
-    fn other(self) -> Self {
-        match self {
-            Self::I16 => Self::Float,
-            Self::Float => Self::I16,
-        }
-    }
-
     fn raw(self) -> i32 {
         match self {
             Self::I16 => AAUDIO_FORMAT_PCM_I16,
             Self::Float => AAUDIO_FORMAT_PCM_FLOAT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceFormat {
+    I16,
+    I24,
+    I32,
+    Float,
+}
+
+impl DeviceFormat {
+    const BY_PRECISION: [Self; 4] = [Self::Float, Self::I32, Self::I24, Self::I16];
+
+    fn cpal(self) -> cpal::SampleFormat {
+        match self {
+            Self::I16 => cpal::SampleFormat::I16,
+            Self::I24 => cpal::SampleFormat::I24,
+            Self::I32 => cpal::SampleFormat::I32,
+            Self::Float => cpal::SampleFormat::F32,
+        }
+    }
+}
+
+impl From<SampleFormat> for DeviceFormat {
+    fn from(format: SampleFormat) -> Self {
+        match format {
+            SampleFormat::I16 => Self::I16,
+            SampleFormat::Float => Self::Float,
         }
     }
 }
@@ -298,7 +314,7 @@ struct StreamFormat {
     channels: u16,
     sample_rate: u32,
     app: SampleFormat,
-    device: SampleFormat,
+    device: DeviceFormat,
 }
 
 fn negotiate_format(
@@ -317,8 +333,8 @@ fn negotiate_format(
     let app = requested
         .or_else(|| SampleFormat::from_cpal(device_default.sample_format()))
         .unwrap_or(SampleFormat::Float);
-    let device = [app, app.other()]
-        .into_iter()
+    let device = std::iter::once(DeviceFormat::from(app))
+        .chain(DeviceFormat::BY_PRECISION)
         .find(|format| usable.contains(&format.cpal()))
         .ok_or(AAUDIO_ERROR_UNAVAILABLE)?;
     Ok(StreamFormat {
@@ -541,12 +557,12 @@ struct ErrorReporter {
 }
 
 impl ErrorReporter {
-    fn report(&self, error: cpal::StreamError) {
-        match error {
-            cpal::StreamError::BufferUnderrun => {
+    fn report(&self, error: cpal::Error) {
+        match error.kind() {
+            cpal::ErrorKind::Xrun => {
                 self.shared.xrun_count.fetch_add(1, Ordering::Relaxed);
             }
-            cpal::StreamError::DeviceNotAvailable | cpal::StreamError::StreamInvalidated => {
+            cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => {
                 if self.shared.state.swap(StreamState::Disconnected) == StreamState::Disconnected {
                     return;
                 }
@@ -561,8 +577,8 @@ impl ErrorReporter {
                     };
                 }
             }
-            cpal::StreamError::BackendSpecific { err } => {
-                tracing::warn!(target: "eclipse::audio", error = %err, "AAudio: host stream error");
+            _ => {
+                tracing::warn!(target: "eclipse::audio", %error, "AAudio: host stream error");
             }
         }
     }
@@ -581,7 +597,7 @@ fn build_host_stream(
     data_callback: DataCallbackTarget,
     shared: &Arc<StreamShared>,
     stream: NdkHandle,
-) -> Result<cpal::Stream, cpal::BuildStreamError> {
+) -> Result<cpal::Stream, cpal::Error> {
     let reporter = ErrorReporter {
         shared: Arc::clone(shared),
         callback: params.error_callback,
@@ -609,34 +625,55 @@ fn build_for_app<A>(
     plan: &HostStreamPlan,
     renderer: Renderer<A>,
     reporter: ErrorReporter,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<cpal::Stream, cpal::Error>
 where
-    A: cpal::SizedSample + cpal::FromSample<i16> + cpal::FromSample<f32> + Send + 'static,
+    A: cpal::SizedSample
+        + cpal::FromSample<i16>
+        + cpal::FromSample<cpal::I24>
+        + cpal::FromSample<i32>
+        + cpal::FromSample<f32>
+        + Send
+        + 'static,
     i16: cpal::FromSample<A>,
+    cpal::I24: cpal::FromSample<A>,
+    i32: cpal::FromSample<A>,
     f32: cpal::FromSample<A>,
 {
+    let config = plan.config;
     match (plan.direction, plan.format.device) {
-        (Direction::Output, SampleFormat::I16) => {
-            build_output::<i16, A>(device, &plan.config, renderer, reporter)
+        (Direction::Output, DeviceFormat::I16) => {
+            build_output::<i16, A>(device, config, renderer, reporter)
         }
-        (Direction::Output, SampleFormat::Float) => {
-            build_output::<f32, A>(device, &plan.config, renderer, reporter)
+        (Direction::Output, DeviceFormat::I24) => {
+            build_output::<cpal::I24, A>(device, config, renderer, reporter)
         }
-        (Direction::Input, SampleFormat::I16) => {
-            build_input::<i16, A>(device, &plan.config, renderer, reporter)
+        (Direction::Output, DeviceFormat::I32) => {
+            build_output::<i32, A>(device, config, renderer, reporter)
         }
-        (Direction::Input, SampleFormat::Float) => {
-            build_input::<f32, A>(device, &plan.config, renderer, reporter)
+        (Direction::Output, DeviceFormat::Float) => {
+            build_output::<f32, A>(device, config, renderer, reporter)
+        }
+        (Direction::Input, DeviceFormat::I16) => {
+            build_input::<i16, A>(device, config, renderer, reporter)
+        }
+        (Direction::Input, DeviceFormat::I24) => {
+            build_input::<cpal::I24, A>(device, config, renderer, reporter)
+        }
+        (Direction::Input, DeviceFormat::I32) => {
+            build_input::<i32, A>(device, config, renderer, reporter)
+        }
+        (Direction::Input, DeviceFormat::Float) => {
+            build_input::<f32, A>(device, config, renderer, reporter)
         }
     }
 }
 
 fn build_output<T, A>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
     mut renderer: Renderer<A>,
     reporter: ErrorReporter,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample + cpal::FromSample<A>,
     A: cpal::SizedSample + Send + 'static,
@@ -651,10 +688,10 @@ where
 
 fn build_input<T, A>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
     mut renderer: Renderer<A>,
     reporter: ErrorReporter,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample,
     A: cpal::SizedSample + cpal::FromSample<T> + Send + 'static,
@@ -764,9 +801,6 @@ fn attach_host_stream(
             return Err(AAUDIO_ERROR_UNAVAILABLE);
         }
     };
-    if let Err(error) = host_stream.pause() {
-        tracing::debug!(target: "eclipse::audio", %error, "AAudio: new host stream renders silence until started");
-    }
     streams()
         .with(handle, |entry| entry.host = Some(host_stream))
         .map_err(|_| AAUDIO_ERROR_INVALID_HANDLE)

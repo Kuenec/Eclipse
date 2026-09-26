@@ -27,6 +27,8 @@ const CLOSE_ALL_DEADLINE: Duration = Duration::from_secs(10);
 
 pub const FORBIDDEN_PASSTHROUGH_SWITCHES: &[&str] = &["enable-logging", "no-sandbox"];
 
+pub const SKIP_FIRST_RUN_SWITCH: &str = "no-first-run";
+
 pub fn console_text_diag_enabled(v: Option<&str>) -> bool {
     v == Some("1")
 }
@@ -54,7 +56,7 @@ pub fn engine_id() -> String {
     format!("cef/{text}")
 }
 
-pub const ECLIPSE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Eclipse-WebView/149.0.6";
+pub const ECLIPSE_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Eclipse-WebView/152.0.6";
 
 pub fn effective_user_agent<'a>(diag: Option<&'a str>, app: Option<&'a str>) -> &'a str {
     match (diag, app) {
@@ -2417,7 +2419,7 @@ mod tests {
 
     #[test]
     fn build_settings_sets_the_eclipse_fallback_user_agent() {
-        assert!(ECLIPSE_USER_AGENT.contains("Chrome/149"));
+        assert!(ECLIPSE_USER_AGENT.contains("Chrome/152"));
         assert!(ECLIPSE_USER_AGENT.contains("Eclipse-WebView"));
         assert!(ECLIPSE_USER_AGENT.contains("X11; Linux x86_64"));
         assert!(!ECLIPSE_USER_AGENT.contains("GDPR VIOLATION"));
@@ -2439,7 +2441,7 @@ mod tests {
         assert!(app_ua.to_lowercase().contains("android"));
 
         let android_ua = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) \
-                          Version/4.0 Chrome/149.0.0.0 Mobile Safari/537.36";
+                          Version/4.0 Chrome/152.0.0.0 Mobile Safari/537.36";
         assert_eq!(effective_user_agent(Some(android_ua), None), android_ua);
         assert_eq!(
             effective_user_agent(Some(android_ua), Some(app_ua)),
