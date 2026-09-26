@@ -1,4 +1,4 @@
-use crate::shared::redact;
+use eclipse_webview::redact;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct RedactedTarget(String);

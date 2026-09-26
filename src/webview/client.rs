@@ -1976,9 +1976,10 @@ pub fn drive_load_data(
     )
 }
 
-#[allow(clippy::type_complexity)]
-fn pending_bridges() -> &'static Mutex<HashMap<i64, HashMap<String, Vec<BridgeMethod>>>> {
-    static P: OnceLock<Mutex<HashMap<i64, HashMap<String, Vec<BridgeMethod>>>>> = OnceLock::new();
+type BridgeInventory = HashMap<String, Vec<BridgeMethod>>;
+
+fn pending_bridges() -> &'static Mutex<HashMap<i64, BridgeInventory>> {
+    static P: OnceLock<Mutex<HashMap<i64, BridgeInventory>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

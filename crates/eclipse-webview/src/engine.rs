@@ -1,12 +1,13 @@
 use crate::logging::{self, RedactedTarget};
-use crate::shared::proto::{BridgeMethod, Console, ConsumerMsg, CookieEntry, HelperMsg};
-use crate::shared::shm::{self, FrameWriter};
-use crate::shared::slots::{SlotTracker, SLOT_COUNT};
 use cef::wrapper::message_router::{
     BrowserSideCallback, BrowserSideHandler, BrowserSideRouter, MessageRouterBrowserSide,
     MessageRouterBrowserSideHandlerCallbacks, MessageRouterConfig,
 };
 use cef::{rc::Rc as _, sys, *};
+use eclipse_webview::proto::{BridgeMethod, Console, ConsumerMsg, CookieEntry, HelperMsg};
+use eclipse_webview::redact;
+use eclipse_webview::shm::{self, FrameWriter};
+use eclipse_webview::slots::{SlotTracker, SLOT_COUNT};
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::raw::c_int;
@@ -61,11 +62,6 @@ pub fn effective_user_agent<'a>(diag: Option<&'a str>, app: Option<&'a str>) -> 
         (_, Some(ua)) if !ua.is_empty() => ua,
         _ => ECLIPSE_USER_AGENT,
     }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn build_settings() -> Settings {
-    build_settings_with_ua(ECLIPSE_USER_AGENT)
 }
 
 pub fn build_settings_with_ua(ua: &str) -> Settings {
@@ -211,8 +207,8 @@ pub fn classify_cookie_set_rejection(
 ) -> &'static str {
     let is_ctrl = |c: char| (c as u32) < 0x20;
 
-    let redacted = crate::shared::redact::url_scheme_and_host_for_log(url);
-    if redacted == crate::shared::redact::NON_URL {
+    let redacted = redact::url_scheme_and_host_for_log(url);
+    if redacted == redact::NON_URL {
         return "url is not a valid http(s) URL";
     }
     let Some((scheme, host)) = redacted.split_once("://") else {
@@ -642,16 +638,16 @@ impl Engine {
                 secure,
                 http_only,
                 expires_epoch_s,
-            } => self.cookie_set(
-                &url,
-                &name,
-                &value,
-                &domain,
-                &path,
+            } => self.cookie_set(&CookieWrite {
+                url: &url,
+                name: &name,
+                value: &value,
+                domain: &domain,
+                path: &path,
                 secure,
                 http_only,
                 expires_epoch_s,
-            ),
+            }),
             ConsumerMsg::CookieGet { request_id, url } => self.cookie_get(request_id, &url),
             ConsumerMsg::CookiesClear { request_id } => self.cookies_clear_all(request_id),
             ConsumerMsg::FrameAck {
@@ -703,14 +699,16 @@ impl Engine {
                 expires_epoch_s,
             } => self.cookie_set_for_result(
                 request_id,
-                &url,
-                &name,
-                &value,
-                &domain,
-                &path,
-                secure,
-                http_only,
-                expires_epoch_s,
+                &CookieWrite {
+                    url: &url,
+                    name: &name,
+                    value: &value,
+                    domain: &domain,
+                    path: &path,
+                    secure,
+                    http_only,
+                    expires_epoch_s,
+                },
             ),
             ConsumerMsg::CookieFlush { request_id } => self.cookie_flush(request_id),
             ConsumerMsg::CookiesClearSession { request_id } => {
@@ -788,19 +786,7 @@ impl Engine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn cookie_set_for_result(
-        &self,
-        request_id: u32,
-        url: &str,
-        name: &str,
-        value: &str,
-        domain: &str,
-        path: &str,
-        secure: bool,
-        http_only: bool,
-        expires_epoch_s: i64,
-    ) {
+    fn cookie_set_for_result(&self, request_id: u32, write: &CookieWrite<'_>) {
         let Some(manager) = self.persistent_cookie_manager() else {
             self.out.send(HelperMsg::CookieSetResult {
                 request_id,
@@ -808,33 +794,10 @@ impl Engine {
             });
             return;
         };
-        let expires = cef_expires_from_epoch_s(expires_epoch_s);
-        let cookie = Cookie {
-            name: CefString::from(name),
-            value: CefString::from(value),
-            domain: CefString::from(domain),
-            path: CefString::from(path),
-            secure: c_int::from(secure),
-            httponly: c_int::from(http_only),
-            has_expires: c_int::from(expires_epoch_s != 0),
-            expires,
-            ..Default::default()
-        };
-        let url_cef = CefString::from(url);
+        let url_cef = CefString::from(write.url);
         let mut callback = SetCookieResultCallback::new(request_id, self.out.clone());
-        if manager.set_cookie(Some(&url_cef), Some(&cookie), Some(&mut callback)) != 1 {
-            let predicate = classify_cookie_set_rejection(url, name, value, domain, path, secure);
-            logging::warn(
-                COMPONENT,
-                &format!(
-                    "cookie_set: rejected by the cookie manager — {predicate} (url={} domain={} \
-                     name_len={} value_len={})",
-                    RedactedTarget::from_raw_url(url).as_str(),
-                    domain,
-                    name.len(),
-                    value.len()
-                ),
-            );
+        if manager.set_cookie(Some(&url_cef), Some(&write.to_cef()), Some(&mut callback)) != 1 {
+            write.log_rejection();
             self.out.send(HelperMsg::CookieSetResult {
                 request_id,
                 ok: false,
@@ -1259,56 +1222,22 @@ impl Engine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn cookie_set(
-        &self,
-        url: &str,
-        name: &str,
-        value: &str,
-        domain: &str,
-        path: &str,
-        secure: bool,
-        http_only: bool,
-        expires_epoch_s: i64,
-    ) {
+    fn cookie_set(&self, write: &CookieWrite<'_>) {
         let Some(manager) = self.persistent_cookie_manager() else {
             logging::error(COMPONENT, "cookie_set: no persistent cookie manager");
             return;
         };
 
-        let expires = cef_expires_from_epoch_s(expires_epoch_s);
-        let cookie = Cookie {
-            name: CefString::from(name),
-            value: CefString::from(value),
-            domain: CefString::from(domain),
-            path: CefString::from(path),
-            secure: c_int::from(secure),
-            httponly: c_int::from(http_only),
-            has_expires: c_int::from(expires_epoch_s != 0),
-            expires,
-            ..Default::default()
-        };
-        let url_cef = CefString::from(url);
+        let url_cef = CefString::from(write.url);
 
         let mut callback = LogOnlySetCookieCallback::new(
-            RedactedTarget::from_raw_url(url).as_str().to_string(),
-            domain.to_string(),
-            name.len(),
-            value.len(),
+            RedactedTarget::from_raw_url(write.url).as_str().to_string(),
+            write.domain.to_string(),
+            write.name.len(),
+            write.value.len(),
         );
-        if manager.set_cookie(Some(&url_cef), Some(&cookie), Some(&mut callback)) != 1 {
-            let predicate = classify_cookie_set_rejection(url, name, value, domain, path, secure);
-            logging::warn(
-                COMPONENT,
-                &format!(
-                    "cookie_set: rejected by the cookie manager — {predicate} (url={} domain={} \
-                     name_len={} value_len={})",
-                    RedactedTarget::from_raw_url(url).as_str(),
-                    domain,
-                    name.len(),
-                    value.len()
-                ),
-            );
+        if manager.set_cookie(Some(&url_cef), Some(&write.to_cef()), Some(&mut callback)) != 1 {
+            write.log_rejection();
         }
     }
 
@@ -1406,6 +1335,55 @@ impl Engine {
                 ok: false,
             });
         }
+    }
+}
+
+struct CookieWrite<'a> {
+    url: &'a str,
+    name: &'a str,
+    value: &'a str,
+    domain: &'a str,
+    path: &'a str,
+    secure: bool,
+    http_only: bool,
+    expires_epoch_s: i64,
+}
+
+impl CookieWrite<'_> {
+    fn to_cef(&self) -> Cookie {
+        Cookie {
+            name: CefString::from(self.name),
+            value: CefString::from(self.value),
+            domain: CefString::from(self.domain),
+            path: CefString::from(self.path),
+            secure: c_int::from(self.secure),
+            httponly: c_int::from(self.http_only),
+            has_expires: c_int::from(self.expires_epoch_s != 0),
+            expires: cef_expires_from_epoch_s(self.expires_epoch_s),
+            ..Default::default()
+        }
+    }
+
+    fn log_rejection(&self) {
+        let predicate = classify_cookie_set_rejection(
+            self.url,
+            self.name,
+            self.value,
+            self.domain,
+            self.path,
+            self.secure,
+        );
+        logging::warn(
+            COMPONENT,
+            &format!(
+                "cookie_set: rejected by the cookie manager — {predicate} (url={} domain={} \
+                 name_len={} value_len={})",
+                RedactedTarget::from_raw_url(self.url).as_str(),
+                self.domain,
+                self.name.len(),
+                self.value.len()
+            ),
+        );
     }
 }
 
@@ -2271,7 +2249,7 @@ mod tests {
             (SandboxMode::Suid, 0),
             (SandboxMode::Degraded, 1),
         ] {
-            let mut settings = build_settings();
+            let mut settings = build_settings_with_ua(ECLIPSE_USER_AGENT);
             apply_sandbox_mode(&mut settings, &mode);
             assert_eq!(settings.no_sandbox, expected, "mode {mode:?}");
         }
@@ -2317,7 +2295,7 @@ mod tests {
 
     #[test]
     fn engine_settings_keep_engine_logging_disabled() {
-        let settings = build_settings();
+        let settings = build_settings_with_ua(ECLIPSE_USER_AGENT);
         assert_eq!(settings.log_severity, LogSeverity::DISABLE);
         assert_eq!(settings.no_sandbox, 0, "the sandbox must stay ON");
         assert_eq!(settings.windowless_rendering_enabled, 1);
@@ -2338,7 +2316,7 @@ mod tests {
         assert!(ECLIPSE_USER_AGENT.contains("X11; Linux x86_64"));
         assert!(!ECLIPSE_USER_AGENT.contains("GDPR VIOLATION"));
 
-        let settings = build_settings();
+        let settings = build_settings_with_ua(ECLIPSE_USER_AGENT);
         assert_eq!(settings.user_agent.to_string(), ECLIPSE_USER_AGENT);
     }
 
@@ -2366,7 +2344,7 @@ mod tests {
 
         let settings = build_settings_with_ua(android_ua);
         assert_eq!(settings.user_agent.to_string(), android_ua);
-        let default = build_settings();
+        let default = build_settings_with_ua(ECLIPSE_USER_AGENT);
         assert_eq!(
             settings.windowless_rendering_enabled,
             default.windowless_rendering_enabled
