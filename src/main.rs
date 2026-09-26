@@ -5,6 +5,7 @@ mod desktop_integration;
 
 const CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV: &str = "ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE";
 const CLIENT_SETTINGS_PATH_ENV: &str = "ECLIPSE_CLIENT_APP_SETTINGS_PATH";
+const ANDROID_CLIENT_SETTINGS_PATH: &str = "/data/local/tmp/ClientAppSettings.json";
 const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
     include_bytes!(env!("ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO"));
 
@@ -50,10 +51,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if is_android_run_command(args.first().map(String::as_str))
-        && std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV).is_none()
-    {
-        if let Err(error) = install_client_settings_and_reexec(&args) {
+    if is_android_run_command(args.first().map(String::as_str)) {
+        let settings = match std::env::var_os(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV) {
+            None => install_client_settings_and_reexec(&args),
+            Some(_) => verify_client_settings_redirect().map_err(Into::into),
+        };
+        if let Err(error) = settings {
             eprintln!("eclipse Android settings setup: {error}");
             return ExitCode::FAILURE;
         }
@@ -255,7 +258,21 @@ fn parse_internal_place_id(arguments: &[String]) -> Result<u64, String> {
     Ok(place_id)
 }
 
+fn verify_client_settings_redirect() -> Result<(), String> {
+    std::fs::File::open(ANDROID_CLIENT_SETTINGS_PATH)
+        .map(drop)
+        .map_err(|error| {
+            format!(
+                "the Android client-settings bridge did not load into the restarted Eclipse \
+                 ({ANDROID_CLIENT_SETTINGS_PATH} is not readable: {error}); see the ld.so \
+                 message above, and keep Eclipse's app-data directory off noexec mounts or set \
+                 ECLIPSE_APP_DATA_DIR to one that allows executable files"
+            )
+        })
+}
+
 fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::process::CommandExt as _;
 
     let config = eclipse::config::Config::load()?;
@@ -290,9 +307,22 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
 
     let settings_path = settings_path.canonicalize()?;
     let shim_path = shim_path.canonicalize()?;
+    if shim_path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b' ' | b':'))
+    {
+        return Err(format!(
+            "the Android client-settings bridge {} contains a space or colon, which LD_PRELOAD \
+             cannot carry; set ECLIPSE_APP_DATA_DIR to a directory without spaces or colons",
+            shim_path.display()
+        )
+        .into());
+    }
 
     println!(
-        "# Roblox Fast Flags staged at {} (Android /data/local/tmp/ClientAppSettings.json)",
+        "# Roblox Fast Flags staged at {} (Android {ANDROID_CLIENT_SETTINGS_PATH})",
         settings_path.display()
     );
 
@@ -1155,7 +1185,7 @@ mod tests {
         const SETTINGS: &[u8] = b"{\"FFlagEclipseTest\":true}";
 
         if std::env::var_os(CHILD).is_some() {
-            let android_path = c"/data/local/tmp/ClientAppSettings.json";
+            let android_path = std::ffi::CString::new(super::ANDROID_CLIENT_SETTINGS_PATH).unwrap();
             let mut status: libc::stat64 = unsafe { std::mem::zeroed() };
             assert_eq!(
                 unsafe { libc::stat64(android_path.as_ptr(), &mut status) },
@@ -1172,9 +1202,11 @@ mod tests {
             assert!(fd >= 0, "open reached the next interposer");
             unsafe { libc::close(fd) };
             assert_eq!(
-                std::fs::read("/data/local/tmp/ClientAppSettings.json").unwrap(),
+                std::fs::read(super::ANDROID_CLIENT_SETTINGS_PATH).unwrap(),
                 SETTINGS
             );
+            super::verify_client_settings_redirect()
+                .expect("the restarted process sees the redirected settings");
             return;
         }
 
