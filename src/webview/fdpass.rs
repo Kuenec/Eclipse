@@ -143,6 +143,7 @@ pub fn recv_fd_after_sentinel(stream: &UnixStream) -> Result<OwnedFd, FdPassErro
 mod tests {
     use super::super::proto::{read_helper_msg, HelperMsg};
     use super::super::shm;
+    use super::super::slots::SLOT_COUNT;
     use super::*;
     use std::fs::File;
     use std::io::Write;
@@ -154,7 +155,7 @@ mod tests {
         let (helper_end, consumer_end) = UnixStream::pair().expect("socketpair");
 
         let (memfd, slot_bytes) =
-            shm::create_sealed_frame_memfd(4, 2, 2).expect("create sealed memfd");
+            shm::create_sealed_frame_memfd(4, 2, SLOT_COUNT).expect("create sealed memfd");
         assert_eq!(slot_bytes, 4 * 2 * 4);
         let payload: Vec<u8> = (0..slot_bytes as usize)
             .map(|i| (i * 7 + 3) as u8)
@@ -169,7 +170,7 @@ mod tests {
             height: 2,
             stride: 16,
             slot_bytes,
-            slot_count: 2,
+            slot_count: SLOT_COUNT,
         };
         let frame_bytes = announce.encode().expect("encode");
         (&helper_end)

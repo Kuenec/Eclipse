@@ -1,17 +1,15 @@
 use crate::logging::{self, RedactedTarget};
 use crate::shared::proto::{BridgeMethod, Console, ConsumerMsg, CookieEntry, HelperMsg};
-use crate::shared::shm;
-use crate::shared::slots::SlotTracker;
+use crate::shared::shm::{self, FrameWriter};
+use crate::shared::slots::{SlotTracker, SLOT_COUNT};
 use cef::wrapper::message_router::{
     BrowserSideCallback, BrowserSideHandler, BrowserSideRouter, MessageRouterBrowserSide,
     MessageRouterBrowserSideHandlerCallbacks, MessageRouterConfig,
 };
 use cef::{rc::Rc as _, sys, *};
 use std::collections::HashMap;
-use std::fs::File;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::raw::c_int;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -19,8 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const COMPONENT: &str = "engine";
-
-const SLOT_COUNT: u8 = 2;
 
 const WINDOWLESS_FPS: c_int = 60;
 
@@ -401,8 +397,7 @@ struct ViewState {
     generation: u32,
     tracker: SlotTracker,
 
-    frame_file: Option<File>,
-    slot_bytes: u32,
+    frame: FrameWriter,
 
     pending_data: Arc<Mutex<Option<PendingData>>>,
 
@@ -1001,10 +996,10 @@ impl Engine {
         }
 
         let generation = 1u32;
-        let (memfd, slot_bytes) = match shm::create_sealed_frame_memfd(width, height, SLOT_COUNT) {
-            Ok(pair) => pair,
+        let (memfd, slot_bytes, frame) = match new_frame_buffer(width, height) {
+            Ok(buffer) => buffer,
             Err(e) => {
-                logging::error(COMPONENT, &format!("create_view view={view}: memfd: {e}"));
+                logging::error(COMPONENT, &format!("create_view view={view}: {e}"));
                 self.out.send(HelperMsg::Crash {
                     view,
                     kind: 2,
@@ -1013,18 +1008,6 @@ impl Engine {
                 return;
             }
         };
-        let frame_file = File::from(match memfd.try_clone() {
-            Ok(dup) => dup,
-            Err(e) => {
-                logging::error(COMPONENT, &format!("create_view view={view}: dup: {e}"));
-                self.out.send(HelperMsg::Crash {
-                    view,
-                    kind: 2,
-                    code: 0,
-                });
-                return;
-            }
-        });
         let pending_data: Arc<Mutex<Option<PendingData>>> = Arc::new(Mutex::new(None));
         lock(&self.state).views.insert(
             view,
@@ -1034,8 +1017,7 @@ impl Engine {
                 height,
                 generation,
                 tracker: SlotTracker::new(generation),
-                frame_file: Some(frame_file),
-                slot_bytes,
+                frame,
                 pending_data: pending_data.clone(),
                 driven_url: None,
             },
@@ -1124,22 +1106,15 @@ impl Engine {
     }
 
     fn resize_view(&self, view: i64, width: u16, height: u16) {
-        let (memfd, slot_bytes) = match shm::create_sealed_frame_memfd(width, height, SLOT_COUNT) {
-            Ok(pair) => pair,
+        let (memfd, slot_bytes, frame) = match new_frame_buffer(width, height) {
+            Ok(buffer) => buffer,
             Err(e) => {
-                logging::error(COMPONENT, &format!("resize_view view={view}: memfd: {e}"));
+                logging::error(COMPONENT, &format!("resize_view view={view}: {e}"));
                 self.out.send(HelperMsg::Crash {
                     view,
                     kind: 2,
                     code: 0,
                 });
-                return;
-            }
-        };
-        let frame_file = match memfd.try_clone() {
-            Ok(dup) => File::from(dup),
-            Err(e) => {
-                logging::error(COMPONENT, &format!("resize_view view={view}: dup: {e}"));
                 return;
             }
         };
@@ -1153,8 +1128,7 @@ impl Engine {
         v.generation += 1;
         let generation = v.generation;
         v.tracker.reset(generation);
-        v.frame_file = Some(frame_file);
-        v.slot_bytes = slot_bytes;
+        v.frame = frame;
         let browser = v.browser.clone();
         drop(st);
         self.out.send_with_fd(
@@ -1447,6 +1421,14 @@ fn cef_expires_from_epoch_s(expires_epoch_s: i64) -> Basetime {
     }
 }
 
+fn new_frame_buffer(width: u16, height: u16) -> Result<(OwnedFd, u32, FrameWriter), String> {
+    let (memfd, slot_bytes) = shm::create_sealed_frame_memfd(width, height, SLOT_COUNT)
+        .map_err(|e| format!("memfd: {e}"))?;
+    let frame = shm::map_frame_writer(memfd.as_fd(), slot_bytes, SLOT_COUNT)
+        .map_err(|e| format!("frame mapping: {e}"))?;
+    Ok((memfd, slot_bytes, frame))
+}
+
 fn suppress_load_state(driven_url: Option<&str>, frame_url: &str) -> bool {
     match driven_url {
         None => true,
@@ -1654,20 +1636,15 @@ wrap_render_handler! {
                 return;
             }
             let (slot, publish) = v.tracker.on_paint();
-            let offset = u64::from(v.slot_bytes) * u64::from(slot);
-            let len = v.slot_bytes as usize;
-            let Some(file) = v.frame_file.as_ref() else {
+            let Some(dst) = v.frame.slot_mut(slot) else {
+                logging::error(
+                    COMPONENT,
+                    &format!("on_paint view={}: frame slot {slot} is out of range", self.view),
+                );
                 return;
             };
 
-            let pixels = unsafe { std::slice::from_raw_parts(buffer, len) };
-            if let Err(e) = file.write_all_at(pixels, offset) {
-                logging::error(
-                    COMPONENT,
-                    &format!("on_paint view={}: memfd write failed: {e}", self.view),
-                );
-                return;
-            }
+            dst.copy_from_slice(unsafe { std::slice::from_raw_parts(buffer, dst.len()) });
             if let Some(p) = publish {
                 let view = self.view;
                 drop(st);

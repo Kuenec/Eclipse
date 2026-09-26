@@ -46,6 +46,7 @@ struct Drive {
     helper_path: std::path::PathBuf,
     start: Instant,
     buffer: Option<Buffer>,
+    held: Option<(u32, u32)>,
     consoles_seen: u32,
     data_url_consoles: u32,
 }
@@ -274,12 +275,17 @@ impl Drive {
         Ok(distinct.len())
     }
 
-    fn ack(&self, generation: u32, seq: u32) -> DResult<()> {
-        self.send(&ConsumerMsg::FrameAck {
-            view: VIEW,
-            generation,
-            seq,
-        })
+    fn hold(&mut self, generation: u32, seq: u32) -> DResult<()> {
+        match self.held.replace((generation, seq)) {
+            Some((held_generation, held_seq)) if held_generation == generation => {
+                self.send(&ConsumerMsg::FrameAck {
+                    view: VIEW,
+                    generation,
+                    seq: held_seq,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -294,6 +300,7 @@ fn run() -> DResult<String> {
         helper_path,
         start,
         buffer: None,
+        held: None,
         consoles_seen: 0,
         data_url_consoles: 0,
     };
@@ -372,7 +379,7 @@ fn await_view_closed(d: &mut Drive, phase: &str) -> DResult<()> {
                     .as_ref()
                     .is_some_and(|b| b.generation == generation)
                 {
-                    d.ack(generation, seq)?;
+                    d.hold(generation, seq)?;
                 }
             }
             other => println!(
@@ -402,7 +409,7 @@ fn run_shutdown_with_open_view(d: &mut Drive) -> DResult<String> {
                 slot: _,
                 seq,
             } if view == VIEW => {
-                d.ack(generation, seq)?;
+                d.hold(generation, seq)?;
                 break;
             }
             other => println!(
@@ -480,7 +487,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                     .as_ref()
                     .is_some_and(|b| b.generation == generation)
                 {
-                    d.ack(generation, seq)?;
+                    d.hold(generation, seq)?;
                 }
             }
             other => println!(
@@ -510,7 +517,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                 }
 
                 let count = d.census(generation, slot)?;
-                d.ack(generation, seq)?;
+                d.hold(generation, seq)?;
                 if count > 1 {
                     println!(
                         "[{} ms] frame-ready slot={slot} distinct_pixels={count}",
@@ -591,7 +598,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                     .as_ref()
                     .is_some_and(|b| b.generation == generation)
                 {
-                    d.ack(generation, seq)?;
+                    d.hold(generation, seq)?;
                 }
             }
             other => println!(
@@ -652,7 +659,7 @@ fn load_data_with_about_blank_base(d: &mut Drive) -> DResult<u32> {
                     .as_ref()
                     .is_some_and(|b| b.generation == generation)
                 {
-                    d.ack(generation, seq)?;
+                    d.hold(generation, seq)?;
                 }
             }
             other => println!(

@@ -1311,10 +1311,10 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
                     what: "slot_bytes (must be stride*height)",
                 });
             }
-            if slot_count != 2 {
+            if slot_count != super::slots::SLOT_COUNT {
                 return Err(ProtoError::BadValue {
                     type_byte: t,
-                    what: "slot_count (v1 fixes 2)",
+                    what: "slot_count (must equal the tracker's SLOT_COUNT)",
                 });
             }
             HelperMsg::FrameBufferNew {
@@ -1332,10 +1332,10 @@ pub fn read_helper_msg<R: Read>(r: &mut R) -> Result<HelperMsg, ProtoError> {
             let generation = b.u32()?;
             let slot = b.u8()?;
             let seq = b.u32()?;
-            if slot > 1 {
+            if slot >= super::slots::SLOT_COUNT {
                 return Err(ProtoError::BadValue {
                     type_byte: t,
-                    what: "slot index (v1 has slots 0/1)",
+                    what: "slot index (must be below the tracker's SLOT_COUNT)",
                 });
             }
             HelperMsg::FrameReady {
@@ -1540,12 +1540,12 @@ mod tests {
                 height: 768,
                 stride: 4096,
                 slot_bytes: 4096 * 768,
-                slot_count: 2,
+                slot_count: super::super::slots::SLOT_COUNT,
             },
             HelperMsg::FrameReady {
                 view: 42,
                 generation: 3,
-                slot: 1,
+                slot: super::super::slots::SLOT_COUNT - 1,
                 seq: 99,
             },
             HelperMsg::Console {
@@ -1980,6 +1980,46 @@ mod tests {
             read_helper_msg(&mut bytes.as_slice()).expect("decode helper v4"),
             helper
         );
+    }
+
+    #[test]
+    fn frame_messages_reject_slot_counts_and_indices_outside_the_tracker() {
+        let slots = super::super::slots::SLOT_COUNT;
+        let announce = |slot_count| {
+            HelperMsg::FrameBufferNew {
+                view: 1,
+                generation: 1,
+                width: 4,
+                height: 2,
+                stride: 16,
+                slot_bytes: 32,
+                slot_count,
+            }
+            .encode()
+            .expect("encode")
+        };
+        assert!(read_helper_msg(&mut announce(slots).as_slice()).is_ok());
+        for bad in [slots - 1, slots + 1] {
+            assert!(matches!(
+                read_helper_msg(&mut announce(bad).as_slice()),
+                Err(ProtoError::BadValue { .. })
+            ));
+        }
+        let ready = |slot| {
+            HelperMsg::FrameReady {
+                view: 1,
+                generation: 1,
+                slot,
+                seq: 1,
+            }
+            .encode()
+            .expect("encode")
+        };
+        assert!(read_helper_msg(&mut ready(slots - 1).as_slice()).is_ok());
+        assert!(matches!(
+            read_helper_msg(&mut ready(slots).as_slice()),
+            Err(ProtoError::BadValue { .. })
+        ));
     }
 
     #[test]
