@@ -1149,6 +1149,77 @@ mod tests {
     }
 
     #[test]
+    fn settings_shim_redirects_through_the_next_interposer() {
+        const CHILD: &str = "ECLIPSE_TEST_SETTINGS_SHIM_CHILD";
+        const FIXTURE_PATH: &std::ffi::CStr = c"/eclipse-fixture/next-interposer";
+        const SETTINGS: &[u8] = b"{\"FFlagEclipseTest\":true}";
+
+        if std::env::var_os(CHILD).is_some() {
+            let android_path = c"/data/local/tmp/ClientAppSettings.json";
+            let mut status: libc::stat64 = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::stat64(android_path.as_ptr(), &mut status) },
+                0,
+                "stat64 of the Android settings path is redirected"
+            );
+            assert_eq!(status.st_uid, 4242, "stat64 reached the next interposer");
+            assert_eq!(
+                unsafe { libc::access(FIXTURE_PATH.as_ptr(), libc::F_OK) },
+                0,
+                "access reached the next interposer"
+            );
+            let fd = unsafe { libc::open(FIXTURE_PATH.as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0, "open reached the next interposer");
+            unsafe { libc::close(fd) };
+            assert_eq!(
+                std::fs::read("/data/local/tmp/ClientAppSettings.json").unwrap(),
+                SETTINGS
+            );
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-settings-shim-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("libeclipse_client_settings_path.so");
+        std::fs::write(&shim, super::CLIENT_SETTINGS_PATH_SHIM).unwrap();
+        let settings = dir.join("ClientAppSettings.json");
+        std::fs::write(&settings, SETTINGS).unwrap();
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test harness executable must have a path"),
+        )
+        .args([
+            "--exact",
+            "tests::settings_shim_redirects_through_the_next_interposer",
+        ])
+        .env(CHILD, "1")
+        .env(super::CLIENT_SETTINGS_PATH_ENV, &settings)
+        .env(
+            "LD_PRELOAD",
+            format!(
+                "{}:{}",
+                shim.display(),
+                env!("ECLIPSE_NEXT_INTERPOSER_FIXTURE_SO")
+            ),
+        )
+        .output()
+        .expect("the preloaded child must start");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            output.status.success(),
+            "the preloaded child failed: status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn android_process_exit_skips_unsafe_foreign_atexit_handlers() {
         if std::env::var_os(RAW_EXIT_CHILD).is_some() {
             let registered = unsafe { libc::atexit(abort_if_atexit_runs) };

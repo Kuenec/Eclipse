@@ -4,7 +4,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/loader/native_load_shim.cpp");
     println!("cargo:rerun-if-changed=src/loader/stdio_shim.c");
     println!("cargo:rerun-if-changed=src/loader/sigaltstack_shim.c");
-    println!("cargo:rerun-if-changed=src/client_settings_path_shim.c");
 
     cc::Build::new()
         .file("src/loader/liblog_shim.c")
@@ -28,35 +27,40 @@ fn main() {
         .compile("eclipse_native_load_shim");
 
     build_libm_shim();
-    build_client_settings_path_shim();
+    build_preload_library(
+        "src/client_settings_path_shim.c",
+        "libeclipse_client_settings_path.so",
+        "ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO",
+    );
+    build_preload_library(
+        "tests/fixtures/next_interposer.c",
+        "libeclipse_next_interposer_fixture.so",
+        "ECLIPSE_NEXT_INTERPOSER_FIXTURE_SO",
+    );
 }
 
-fn build_client_settings_path_shim() {
+fn build_preload_library(source: &str, library: &str, env_var: &str) {
     use std::path::Path;
     use std::process::Command;
 
+    println!("cargo:rerun-if-changed={source}");
     let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR set by cargo");
-    let output = Path::new(&out_dir).join("libeclipse_client_settings_path.so");
+    let output = Path::new(&out_dir).join(library);
     let compiler = cc::Build::new().get_compiler();
     let mut command = Command::new(compiler.path());
     command
         .args(compiler.args())
         .args(["-shared", "-fPIC", "-O2"])
-        .arg("src/client_settings_path_shim.c")
+        .arg(source)
+        .arg("-ldl")
         .arg("-Wl,-z,relro,-z,now")
         .arg("-o")
         .arg(&output);
     let status = command
         .status()
-        .expect("failed to spawn the C compiler for the client-settings path shim");
-    assert!(
-        status.success(),
-        "building src/client_settings_path_shim.c failed"
-    );
-    println!(
-        "cargo:rustc-env=ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO={}",
-        output.display()
-    );
+        .unwrap_or_else(|error| panic!("failed to spawn the C compiler for {source}: {error}"));
+    assert!(status.success(), "building {source} failed");
+    println!("cargo:rustc-env={env_var}={}", output.display());
 }
 
 fn build_libm_shim() {
