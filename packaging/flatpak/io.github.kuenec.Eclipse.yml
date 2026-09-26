@@ -16,14 +16,17 @@ finish-args:
   - --filesystem=xdg-download:ro
 cleanup:
   - /include
+  - /bin/dx
   - '*.a'
   - '*.la'
   - /lib/libopenxr_loader.so*
   - /lib/libportal-*
   - /lib/cmake
   - /lib/girepository-1.0
+  - /lib/java/core-all_classes.jar
   - /lib/java/core-junit_classes.jar
   - /lib/java/junit-runner_classes.jar
+  - /lib/java/dx.jar
   - /lib/pkgconfig
   - /share/doc
   - /share/gir-1.0
@@ -221,11 +224,15 @@ modules:
         path: ../..
         skip:
           - .git
+          - .claude
+          - build
           - target
           - dist
           - vendor
           - repo
           - crates/eclipse-webview/target
+          - crates/eclipse-webview-spike/cef-dist
+          - crates/eclipse-webview-spike/target
           - crates/libm-shim/target
       - cargo-sources.json
       - type: archive
