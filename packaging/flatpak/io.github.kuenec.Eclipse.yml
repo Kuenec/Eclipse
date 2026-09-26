@@ -1,0 +1,264 @@
+id: io.github.kuenec.Eclipse
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.openjdk17
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: eclipse
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  - --filesystem=xdg-download:ro
+cleanup:
+  - /include
+  - '*.a'
+  - '*.la'
+  - /lib/libopenxr_loader.so*
+  - /lib/libportal-*
+  - /lib/cmake
+  - /lib/girepository-1.0
+  - /lib/java/core-junit_classes.jar
+  - /lib/java/junit-runner_classes.jar
+  - /lib/pkgconfig
+  - /share/doc
+  - /share/gir-1.0
+  - /share/man
+  - /share/vala
+  - /etc/ssl/certs/java/cacerts.bks
+modules:
+  - name: libmd
+    buildsystem: autotools
+    sources:
+      - type: archive
+        url: https://libbsd.freedesktop.org/releases/libmd-1.2.0.tar.xz
+        sha256: ac15ffb8430502fbaccdec66c5a82ee0eab0b0f36220df56710feadfeb13d0a0
+        x-checker-data:
+          type: anitya
+          project-id: 15525
+          stable-only: true
+          url-template: https://libbsd.freedesktop.org/releases/libmd-$version.tar.xz
+
+  - name: libbsd
+    sources:
+      - type: archive
+        url: https://libbsd.freedesktop.org/releases/libbsd-0.12.2.tar.xz
+        sha256: b88cc9163d0c652aaf39a99991d974ddba1c3a9711db8f1b5838af2a14731014
+        x-checker-data:
+          type: anitya
+          project-id: 1567
+          stable-only: true
+          url-template: https://libbsd.freedesktop.org/releases/libbsd-$version.tar.xz
+
+  - name: libportal
+    buildsystem: meson
+    sources:
+      - type: archive
+        url: https://github.com/flatpak/libportal/archive/0.11.0.tar.gz
+        sha256: 71482afa68b3373268e7df7feaf96ce99eb1a6701f60ff43a0d1b2594605eae8
+        x-checker-data:
+          type: anitya
+          project-id: 230124
+          stable-only: true
+          url-template: https://github.com/flatpak/libportal/archive/$version.tar.gz
+
+  - name: openxr
+    buildsystem: cmake-ninja
+    sources:
+      - type: git
+        url: https://github.com/KhronosGroup/OpenXR-SDK.git
+        tag: release-1.1.63
+        commit: f2448a8797c85814aa892efc1ab8707900fbcc78
+    config-opts:
+      - -DCMAKE_INSTALL_LIBDIR=lib
+
+  - name: wolfssl
+    buildsystem: autotools
+    config-opts:
+      - --enable-shared
+      - --disable-opensslall
+      - --disable-opensslextra
+      - --enable-aescbc-length-checks
+      - --enable-curve25519
+      - --enable-ed25519
+      - --enable-ed25519-stream
+      - --enable-oldtls
+      - --enable-base64encode
+      - --enable-tlsx
+      - --enable-scrypt
+      - --disable-examples
+      - --enable-crl
+      - --enable-jni
+      - --enable-sessioncerts
+    sources:
+      - type: git
+        url: https://github.com/wolfSSL/wolfssl.git
+        tag: v5.9.2-stable
+        commit: ac01707f552c611fbd135cc723b2682b3e7f80f2
+
+  - name: bionic_translation
+    buildsystem: meson
+    sources:
+      - type: git
+        url: https://gitlab.com/android_translation_layer/bionic_translation.git
+        commit: b36c17db296fcd252c89d650b2f9d4d3a51b1f3a
+        disable-submodules: true
+
+  - name: art_standalone
+    no-autogen: true
+    build-options:
+      make-args:
+        - ____PREFIX=/app
+        - ____LIBDIR=lib
+      make-install-args:
+        - ____PREFIX=/app
+        - ____LIBDIR=lib
+        - ____INSTALL_ETC=/app/etc
+      append-path: /usr/lib/sdk/openjdk17/bin
+      env:
+        JAVA_HOME: /usr/lib/sdk/openjdk17/jvm/openjdk-17
+        LIBRARY_PATH: /app/lib
+    sources:
+      - type: git
+        url: https://gitlab.com/android_translation_layer/art_standalone.git
+        commit: 66a5d9079b159e9c5819bfeef4a6fff6a5f32719
+
+  - name: android-translation-layer
+    buildsystem: meson
+    build-options:
+      append-path: /usr/lib/sdk/openjdk17/bin
+      env:
+        JAVA_HOME: /usr/lib/sdk/openjdk17/jvm/openjdk-17
+    sources:
+      - type: git
+        url: https://gitlab.com/android_translation_layer/android_translation_layer.git
+        commit: b4bd403810122a9d8dbe3674cd0550b1e7767b4c
+
+  - name: cacerts
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/share/java_home/lib/security
+      - install -D /usr/lib/sdk/openjdk17/jvm/openjdk-17/lib/security/cacerts /app/share/ssl/certs/java/cacerts
+
+  - name: libopensles-standalone
+    buildsystem: meson
+    build-options:
+      append-path: /usr/lib/sdk/openjdk17/bin
+      env:
+        JAVA_HOME: /usr/lib/sdk/openjdk17/jvm/openjdk-17
+    sources:
+      - type: git
+        url: https://gitlab.com/android_translation_layer/libopensles-standalone
+        commit: bdb857a4baadbc8c036db85a5da26c5269a751c5
+
+  - name: zypak
+    sources:
+      - type: git
+        url: https://github.com/refi64/zypak
+        tag: v2025.09
+        commit: 693a71c5ffa80ec9c9ce2ae03b1ccc493c698e53
+
+  - name: eclipse-framework-overlay
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/openjdk17/bin
+      append-ld-library-path: /app/lib/art:/app/lib
+      env:
+        JAVA_HOME: /usr/lib/sdk/openjdk17/jvm/openjdk-17
+    sources:
+      - type: dir
+        path: ../../tools/framework-overlay
+        dest: tools/framework-overlay
+      - type: git
+        url: https://gitlab.com/android_translation_layer/android_translation_layer.git
+        commit: b4bd403810122a9d8dbe3674cd0550b1e7767b4c
+        dest: vendor/atl
+      - type: file
+        url: https://gitlab.com/android_translation_layer/art_standalone/-/raw/66a5d9079b159e9c5819bfeef4a6fff6a5f32719/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java
+        sha256: dd062b845acca5acb6746116d082f920fe2560cd781adfae2e830f3e0e5062f1
+        dest: vendor/wolfssljni
+      - type: file
+        url: https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.13.23/r8-8.13.23.jar
+        sha256: e3cdcb003d9beca956209ad6b9e9df31f26b732bfaed9c7c8674e903ca9f3b81
+        dest: vendor/toolchain/r8
+      - type: file
+        url: https://bitbucket.org/JesusFreke/smali/downloads/smali-2.5.2.jar
+        sha256: 9544299578b16f771d8aa8eaefe0d3718ca03478c16f3c356f2fcf1366bfb116
+        dest: vendor/toolchain/smali
+      - type: file
+        url: https://bitbucket.org/JesusFreke/smali/downloads/baksmali-2.5.2.jar
+        sha256: d3116248cce4f82ec5a31eb7f95ee75daff42ddf6eed0ab573973dc53fbad2e5
+        dest: vendor/toolchain/smali
+    build-commands:
+      - ORIG_FW=/app/lib/java/dex/android_translation_layer ART_DIR=/app/lib/java/dex/art
+        WOLFSSL_SOURCE="$PWD/vendor/wolfssljni/WolfSSLImplementSSLSession.java"
+        OUT=/app/lib/eclipse/framework tools/framework-overlay/patch-framework.sh
+      - mkdir -p /app/lib/eclipse/framework/art/oat/x86_64
+      - >-
+        art=/app/lib/eclipse/framework/art;
+        set --;
+        for jar in core-oj-hostdex.jar apachehttp-hostdex.jar apache-xml-hostdex.jar
+        bouncycastle-hostdex.jar core-junit-hostdex.jar core-libart-hostdex.jar
+        hamcrest-hostdex.jar junit-runner-hostdex.jar okhttp-hostdex.jar wolfssljni-hostdex.jar;
+        do set -- "$@" "--dex-file=$art/$jar" "--dex-location=$art/$jar"; done;
+        dex2oat -j1 "$@" --image="$art/oat/x86_64/boot.art" --oat-file="$art/oat/x86_64/boot.oat"
+        --base=0x60cf8000 --host
+      - chmod +x /app/lib/eclipse/framework/art/oat/x86_64/boot.oat
+
+  - name: eclipse
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/eclipse/cargo
+        CARGO_NET_OFFLINE: 'true'
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - target
+          - dist
+          - vendor
+          - repo
+          - crates/eclipse-webview/target
+          - crates/libm-shim/target
+      - cargo-sources.json
+      - type: archive
+        url: https://cef-builds.spotifycdn.com/cef_binary_149.0.6%2Bg0d0eeb6%2Bchromium-149.0.7827.201_linux64_minimal.tar.bz2
+        sha256: f90dec4c5c42a7bbd4f2bd80a7a77e0ac6aacfc6627bb43572d803e77f26dfbc
+        dest: vendor/cef/linux-x86_64
+      - type: file
+        url: https://cef-builds.spotifycdn.com/cef_binary_149.0.6%2Bg0d0eeb6%2Bchromium-149.0.7827.201_linux64_minimal.tar.bz2
+        sha256: f90dec4c5c42a7bbd4f2bd80a7a77e0ac6aacfc6627bb43572d803e77f26dfbc
+        dest: vendor/cef
+        dest-filename: cef_binary_149.0.6+g0d0eeb6+chromium-149.0.7827.201_linux64_minimal.tar.bz2
+      - type: inline
+        dest: vendor/cef/linux-x86_64
+        dest-filename: archive.json
+        contents: '{"type":"minimal","name":"cef_binary_149.0.6+g0d0eeb6+chromium-149.0.7827.201_linux64_minimal.tar.bz2","sha1":"d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72"}'
+      - type: shell
+        commands:
+          - mv vendor/cef/linux-x86_64/Release/* vendor/cef/linux-x86_64/Resources/* vendor/cef/linux-x86_64/
+          - rmdir vendor/cef/linux-x86_64/Release vendor/cef/linux-x86_64/Resources
+      - type: script
+        dest-filename: eclipse-webview-zypak
+        commands:
+          - export ZYPAK_CEF_LIBRARY_PATH=/app/lib/eclipse/libcef.so
+          - exec zypak-wrapper /app/lib/eclipse/eclipse-webview-bin "$@"
+    build-commands:
+      - OUT="$PWD/dist/eclipse" tools/webview-dist/package-webview.sh
+      - install -d /app/lib/eclipse /app/bin
+      - cp -a dist/eclipse/. /app/lib/eclipse/
+      - rm /app/lib/eclipse/.eclipse-webview-payload
+      - mv /app/lib/eclipse/eclipse-webview /app/lib/eclipse/eclipse-webview-bin
+      - install -Dm755 eclipse-webview-zypak /app/lib/eclipse/eclipse-webview
+      - ln -s ../lib/eclipse/eclipse /app/bin/eclipse
+      - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.desktop /app/share/applications/io.github.kuenec.Eclipse.desktop
+      - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.UrlHandler.desktop /app/share/applications/io.github.kuenec.Eclipse.UrlHandler.desktop
+      - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.metainfo.xml /app/share/metainfo/io.github.kuenec.Eclipse.metainfo.xml
+      - install -Dm644 packaging/flatpak/io.github.kuenec.Eclipse.svg /app/share/icons/hicolor/scalable/apps/io.github.kuenec.Eclipse.svg

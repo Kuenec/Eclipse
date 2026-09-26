@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.kuenec.Eclipse</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Eclipse</name>
+  <summary>Run the Android Roblox client on Linux</summary>
+  <developer id="io.github.kuenec">
+    <name>Kuenec</name>
+  </developer>
+  <description>
+    <p>
+      Eclipse is an open-source runtime, written in Rust, that runs the official and unmodified
+      Android x86-64 Roblox client on Linux with native Vulkan graphics, audio, and keyboard and
+      mouse input.
+    </p>
+    <p>
+      Eclipse does not include or redistribute Roblox. You supply the official Roblox APK yourself;
+      Eclipse can read APK files from your Downloads folder.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.kuenec.Eclipse.desktop</launchable>
+  <url type="homepage">https://github.com/Kuenec/Eclipse</url>
+  <url type="bugtracker">https://github.com/Kuenec/Eclipse/issues</url>
+  <url type="vcs-browser">https://github.com/Kuenec/Eclipse</url>
+  <categories>
+    <category>Game</category>
+  </categories>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <provides>
+    <binary>eclipse</binary>
+  </provides>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-audio">intense</content_attribute>
+    <content_attribute id="social-info">moderate</content_attribute>
+    <content_attribute id="money-purchasing">intense</content_attribute>
+  </content_rating>
+</component>

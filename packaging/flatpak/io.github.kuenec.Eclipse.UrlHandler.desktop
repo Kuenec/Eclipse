@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Eclipse Roblox Player
+Comment=Launch Roblox experiences through Eclipse
+Exec=eclipse __handle-roblox-player-url %u
+Icon=io.github.kuenec.Eclipse
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+MimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;
