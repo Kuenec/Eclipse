@@ -4,10 +4,11 @@ use std::fmt;
 use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
-use winit::error::{EventLoopError, OsError};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::dpi::PhysicalPosition;
+use winit::error::{EventLoopError, ExternalError, OsError};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
 
@@ -25,6 +26,8 @@ const MAX_COMPOSITE_VIEWS: usize = 16;
 const ENGINE_MAIN_LOOP_TICK: std::time::Duration = std::time::Duration::from_millis(4);
 
 const DISPLAY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+const POINTER_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 const TEXT_PX: f32 = 28.0;
 const TEXT_COLOR: [f32; 4] = [0.08, 0.09, 0.12, 1.0];
@@ -91,6 +94,20 @@ struct GameWindow<'vm> {
     published_display_refresh_profile: Option<DisplayRefreshProfile>,
 
     next_display_refresh_poll: std::time::Instant,
+
+    focused: bool,
+
+    host_cursor: HostCursor,
+
+    pointer_lock_reasons: PointerLockReasons,
+
+    pointer_lock: PointerLock,
+
+    engine_right_button: EngineRightButton,
+
+    relative_motion_units: RelativeMotionUnits,
+
+    engine_center_query_failed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,6 +242,7 @@ impl ApplicationHandler for GameWindow<'_> {
             Ok(dh) => match dh.as_raw() {
                 RawDisplayHandle::Wayland(d) => {
                     crate::loader::ndk_registry::set_wsi_display(Some(d.display.as_ptr() as usize));
+                    self.relative_motion_units = RelativeMotionUnits::SurfaceLogical;
                 }
                 _ => crate::loader::ndk_registry::set_wsi_display(None),
             },
@@ -289,7 +307,20 @@ impl ApplicationHandler for GameWindow<'_> {
                 self.maybe_synthetic_tap();
             }
 
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.release_pointer_lock_for_focus_loss();
+                }
+            }
+
             WindowEvent::CursorMoved { position, .. } => {
+                if let PointerLock::Held { anchor, grab } = self.pointer_lock {
+                    if confined_cursor_needs_warp(grab, (position.x, position.y), anchor) {
+                        self.return_cursor_to(anchor);
+                    }
+                    return;
+                }
                 let previous = self.cursor;
                 self.cursor = Some((position.x as f32, position.y as f32));
                 let (dx, dy) = previous.map_or((0.0, 0.0), |(old_x, old_y)| {
@@ -356,6 +387,13 @@ impl ApplicationHandler for GameWindow<'_> {
                     }
                 } else {
                     self.engine_aux_mouse_button(button, state == ElementState::Pressed);
+                    let reasons = self.pointer_lock_reasons.after_mouse_button(
+                        button,
+                        state,
+                        self.touch_mode,
+                        crate::webview::client::active_view() != 0,
+                    );
+                    self.update_pointer_lock(reasons);
                 }
             }
             WindowEvent::MouseInput {
@@ -476,6 +514,10 @@ impl ApplicationHandler for GameWindow<'_> {
         if self.handed_off && crate::webview::client::active_view() != 0 {
             crate::webview::client::update_composited_rect();
         }
+        if self.handed_off {
+            self.poll_pointer_lock();
+        }
+        self.sync_host_cursor();
         let now = std::time::Instant::now();
         if now >= self.next_display_refresh_poll {
             self.publish_engine_display_refresh_rates();
@@ -485,6 +527,30 @@ impl ApplicationHandler for GameWindow<'_> {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 std::time::Instant::now() + ENGINE_MAIN_LOOP_TICK,
             ));
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        let DeviceEvent::MouseMotion { delta } = event else {
+            return;
+        };
+        let PointerLock::Held { anchor, .. } = self.pointer_lock else {
+            return;
+        };
+        let (Some(vm), Some(window)) = (self.vm, self.window.as_ref()) else {
+            return;
+        };
+        let (dx, dy) = self
+            .relative_motion_units
+            .engine_delta(delta, window.scale_factor());
+        crate::loader::ndk_registry::wake_all_loopers();
+        if let Err(e) = crate::framework::dispatch_mouse_move(vm, anchor.0, anchor.1, dx, dy) {
+            tracing::warn!(error = %e, "engine locked mouse-move dispatch failed (ignored)");
         }
     }
 
@@ -554,6 +620,158 @@ fn active_webview_button_route(button: MouseButton) -> ActiveWebViewButtonRoute 
     match button {
         MouseButton::Back => ActiveWebViewButtonRoute::ActivityBack,
         _ => ActiveWebViewButtonRoute::Engine,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostCursor {
+    Shown,
+    Hidden,
+}
+
+fn host_cursor(
+    handed_off: bool,
+    touch_mode: crate::config::TouchMode,
+    over_webview: bool,
+) -> HostCursor {
+    if handed_off && touch_mode == crate::config::TouchMode::Off && !over_webview {
+        HostCursor::Hidden
+    } else {
+        HostCursor::Shown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PointerLockReasons {
+    right_drag: bool,
+    engine_center: bool,
+}
+
+impl PointerLockReasons {
+    fn any(self) -> bool {
+        self.right_drag || self.engine_center
+    }
+
+    fn after_mouse_button(
+        self,
+        button: MouseButton,
+        state: ElementState,
+        touch_mode: crate::config::TouchMode,
+        webview_active: bool,
+    ) -> Self {
+        let right_drag = match (button, state) {
+            (MouseButton::Right, ElementState::Pressed) => {
+                self.right_drag || (touch_mode == crate::config::TouchMode::Off && !webview_active)
+            }
+            (MouseButton::Right, ElementState::Released) => false,
+            _ => self.right_drag,
+        };
+        Self { right_drag, ..self }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineRightButton {
+    Up,
+    Down,
+}
+
+impl EngineRightButton {
+    fn after_dispatch(self, button: MouseButton, pressed: bool) -> Self {
+        match (button, pressed) {
+            (MouseButton::Right, true) => Self::Down,
+            (MouseButton::Right, false) => Self::Up,
+            _ => self,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelativeMotionUnits {
+    SurfaceLogical,
+    DeviceCounts,
+}
+
+impl RelativeMotionUnits {
+    fn engine_delta(self, delta: (f64, f64), scale_factor: f64) -> (f32, f32) {
+        let scale = match self {
+            Self::SurfaceLogical => scale_factor,
+            Self::DeviceCounts => 1.0,
+        };
+        ((delta.0 * scale) as f32, (delta.1 * scale) as f32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerGrab {
+    Locked,
+    ConfinedWithWarp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PointerLock {
+    Free,
+    Held {
+        anchor: (f32, f32),
+        grab: PointerGrab,
+    },
+    Refused {
+        at: std::time::Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerLockStep {
+    Acquire,
+    Release,
+    Keep,
+}
+
+fn pointer_lock_step(
+    lock: PointerLock,
+    reasons: PointerLockReasons,
+    now: std::time::Instant,
+) -> PointerLockStep {
+    match (lock, reasons.any()) {
+        (PointerLock::Free, true) => PointerLockStep::Acquire,
+        (PointerLock::Refused { at }, true)
+            if now.saturating_duration_since(at) >= POINTER_LOCK_RETRY_DELAY =>
+        {
+            PointerLockStep::Acquire
+        }
+        (PointerLock::Held { .. } | PointerLock::Refused { .. }, false) => PointerLockStep::Release,
+        _ => PointerLockStep::Keep,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusLossRelease {
+    RightButtonAndPointerLock,
+    PointerLock,
+}
+
+fn focus_loss_release(right_button: EngineRightButton) -> FocusLossRelease {
+    if right_button == EngineRightButton::Down {
+        FocusLossRelease::RightButtonAndPointerLock
+    } else {
+        FocusLossRelease::PointerLock
+    }
+}
+
+fn confined_cursor_needs_warp(grab: PointerGrab, position: (f64, f64), anchor: (f32, f32)) -> bool {
+    grab == PointerGrab::ConfinedWithWarp
+        && (position.0.round() as i32, position.1.round() as i32)
+            != (anchor.0.round() as i32, anchor.1.round() as i32)
+}
+
+fn grab_host_pointer(window: &Window) -> Result<PointerGrab, ExternalError> {
+    match window.set_cursor_grab(CursorGrabMode::Locked) {
+        Ok(()) => Ok(PointerGrab::Locked),
+        Err(ExternalError::NotSupported(_)) => {
+            window.set_cursor_grab(CursorGrabMode::Confined)?;
+            Ok(PointerGrab::ConfinedWithWarp)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -871,14 +1089,130 @@ impl GameWindow<'_> {
         if self.touch_mode != crate::config::TouchMode::Off {
             return;
         }
-        let Some(button) = desktop_mouse_button(button) else {
+        let Some(android_button) = desktop_mouse_button(button) else {
             return;
         };
         let Some(vm) = self.vm else { return };
         let Some((px, py)) = self.cursor else { return };
-        if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, pressed, button) {
+        if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, pressed, android_button)
+        {
             tracing::warn!(error = %e, "engine auxiliary mouse-button dispatch failed (ignored)");
         }
+        self.engine_right_button = self.engine_right_button.after_dispatch(button, pressed);
+    }
+
+    fn poll_pointer_lock(&mut self) {
+        let reasons = if crate::webview::client::active_view() != 0 {
+            PointerLockReasons::default()
+        } else {
+            PointerLockReasons {
+                engine_center: self.query_engine_center(),
+                ..self.pointer_lock_reasons
+            }
+        };
+        self.update_pointer_lock(reasons);
+    }
+
+    fn query_engine_center(&mut self) -> bool {
+        if !self.focused
+            || self.touch_mode != crate::config::TouchMode::Off
+            || self.engine_center_query_failed
+        {
+            return false;
+        }
+        let Some(vm) = self.vm else { return false };
+        match crate::framework::engine_mouse_locked_center(vm) {
+            Ok(locked) => locked,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "engine mouse-lock query failed; shift-lock and first person keep a free host cursor"
+                );
+                self.engine_center_query_failed = true;
+                false
+            }
+        }
+    }
+
+    fn update_pointer_lock(&mut self, reasons: PointerLockReasons) {
+        self.pointer_lock_reasons = reasons;
+        match pointer_lock_step(self.pointer_lock, reasons, std::time::Instant::now()) {
+            PointerLockStep::Acquire => self.acquire_pointer_lock(),
+            PointerLockStep::Release => self.release_pointer_lock(),
+            PointerLockStep::Keep => {}
+        }
+    }
+
+    fn acquire_pointer_lock(&mut self) {
+        let (Some(window), Some(anchor)) = (self.window.as_ref(), self.cursor) else {
+            return;
+        };
+        self.pointer_lock = match grab_host_pointer(window) {
+            Ok(grab) => PointerLock::Held { anchor, grab },
+            Err(error) => {
+                if !matches!(self.pointer_lock, PointerLock::Refused { .. }) {
+                    tracing::warn!(
+                        %error,
+                        "host pointer lock failed; retrying while the lock reason holds"
+                    );
+                }
+                PointerLock::Refused {
+                    at: std::time::Instant::now(),
+                }
+            }
+        };
+    }
+
+    fn release_pointer_lock(&mut self) {
+        let PointerLock::Held { anchor, .. } =
+            std::mem::replace(&mut self.pointer_lock, PointerLock::Free)
+        else {
+            return;
+        };
+        self.return_cursor_to(anchor);
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+            tracing::warn!(%error, "host pointer unlock failed");
+        }
+    }
+
+    fn return_cursor_to(&self, anchor: (f32, f32)) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let position = PhysicalPosition::new(f64::from(anchor.0), f64::from(anchor.1));
+        if let Err(error) = window.set_cursor_position(position) {
+            tracing::warn!(%error, "host cursor could not return to its lock anchor");
+        }
+    }
+
+    fn release_pointer_lock_for_focus_loss(&mut self) {
+        if focus_loss_release(self.engine_right_button)
+            == FocusLossRelease::RightButtonAndPointerLock
+        {
+            self.engine_aux_mouse_button(MouseButton::Right, false);
+        }
+        self.update_pointer_lock(PointerLockReasons::default());
+    }
+
+    fn sync_host_cursor(&mut self) {
+        let webview = crate::webview::client::active_view();
+        let over_webview = webview != 0
+            && self
+                .cursor
+                .and_then(|(px, py)| webview_relative_point(webview, f64::from(px), f64::from(py)))
+                .is_some_and(|(_, _, inside)| inside);
+        let cursor = host_cursor(self.handed_off, self.touch_mode, over_webview);
+        if cursor == self.host_cursor {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        window.set_cursor_visible(cursor == HostCursor::Shown);
+        self.host_cursor = cursor;
     }
 
     fn engine_key(&mut self, event: &winit::event::KeyEvent) {
@@ -1268,6 +1602,13 @@ pub fn run_windowed(
         modifiers: winit::keyboard::ModifiersState::default(),
         published_display_refresh_profile: None,
         next_display_refresh_poll: std::time::Instant::now(),
+        focused: false,
+        host_cursor: HostCursor::Shown,
+        pointer_lock_reasons: PointerLockReasons::default(),
+        pointer_lock: PointerLock::Free,
+        engine_right_button: EngineRightButton::Up,
+        relative_motion_units: RelativeMotionUnits::DeviceCounts,
+        engine_center_query_failed: false,
     };
     let run = event_loop.run_app(&mut app);
 
@@ -5211,6 +5552,274 @@ mod tests {
                 active_webview_button_route(button),
                 ActiveWebViewButtonRoute::Engine
             );
+        }
+    }
+
+    const HELD_AT_ANCHOR: PointerLock = PointerLock::Held {
+        anchor: (320.0, 240.0),
+        grab: PointerGrab::Locked,
+    };
+
+    const RIGHT_DRAG: PointerLockReasons = PointerLockReasons {
+        right_drag: true,
+        engine_center: false,
+    };
+
+    const ENGINE_CENTER: PointerLockReasons = PointerLockReasons {
+        right_drag: false,
+        engine_center: true,
+    };
+
+    #[test]
+    fn right_press_locks_only_on_the_engine_surface_in_touch_off() {
+        use crate::config::TouchMode;
+
+        let now = std::time::Instant::now();
+        let pressed = PointerLockReasons::default().after_mouse_button(
+            MouseButton::Right,
+            ElementState::Pressed,
+            TouchMode::Off,
+            false,
+        );
+        assert_eq!(pressed, RIGHT_DRAG);
+        assert_eq!(
+            pointer_lock_step(PointerLock::Free, pressed, now),
+            PointerLockStep::Acquire
+        );
+
+        for (touch_mode, webview_active) in [
+            (TouchMode::Off, true),
+            (TouchMode::On, false),
+            (TouchMode::FakeOff, false),
+        ] {
+            let reasons = PointerLockReasons::default().after_mouse_button(
+                MouseButton::Right,
+                ElementState::Pressed,
+                touch_mode,
+                webview_active,
+            );
+            assert_eq!(reasons, PointerLockReasons::default());
+            assert_eq!(
+                pointer_lock_step(PointerLock::Free, reasons, now),
+                PointerLockStep::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn other_mouse_buttons_never_change_the_right_drag_reason() {
+        use crate::config::TouchMode;
+
+        for reasons in [PointerLockReasons::default(), RIGHT_DRAG] {
+            for button in [
+                MouseButton::Left,
+                MouseButton::Middle,
+                MouseButton::Back,
+                MouseButton::Forward,
+                MouseButton::Other(9),
+            ] {
+                for state in [ElementState::Pressed, ElementState::Released] {
+                    assert_eq!(
+                        reasons.after_mouse_button(button, state, TouchMode::Off, false),
+                        reasons
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn right_release_unlocks_unless_the_engine_still_locks_the_center() {
+        use crate::config::TouchMode;
+
+        let now = std::time::Instant::now();
+        let released = RIGHT_DRAG.after_mouse_button(
+            MouseButton::Right,
+            ElementState::Released,
+            TouchMode::Off,
+            true,
+        );
+        assert_eq!(released, PointerLockReasons::default());
+        assert_eq!(
+            pointer_lock_step(HELD_AT_ANCHOR, released, now),
+            PointerLockStep::Release
+        );
+
+        let both = PointerLockReasons {
+            right_drag: true,
+            engine_center: true,
+        };
+        let released = both.after_mouse_button(
+            MouseButton::Right,
+            ElementState::Released,
+            TouchMode::Off,
+            false,
+        );
+        assert_eq!(released, ENGINE_CENTER);
+        assert_eq!(
+            pointer_lock_step(HELD_AT_ANCHOR, released, now),
+            PointerLockStep::Keep
+        );
+    }
+
+    #[test]
+    fn engine_center_alone_locks_and_its_end_unlocks() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            pointer_lock_step(PointerLock::Free, ENGINE_CENTER, now),
+            PointerLockStep::Acquire
+        );
+        assert_eq!(
+            pointer_lock_step(HELD_AT_ANCHOR, ENGINE_CENTER, now),
+            PointerLockStep::Keep
+        );
+        assert_eq!(
+            pointer_lock_step(HELD_AT_ANCHOR, PointerLockReasons::default(), now),
+            PointerLockStep::Release
+        );
+        assert_eq!(
+            pointer_lock_step(PointerLock::Free, PointerLockReasons::default(), now),
+            PointerLockStep::Keep
+        );
+    }
+
+    #[test]
+    fn a_refused_lock_retries_after_the_delay_while_a_reason_holds() {
+        let refused_at = std::time::Instant::now();
+        let refused = PointerLock::Refused { at: refused_at };
+        let before_retry = refused_at + POINTER_LOCK_RETRY_DELAY / 2;
+        let retry_due = refused_at + POINTER_LOCK_RETRY_DELAY;
+
+        for reasons in [ENGINE_CENTER, RIGHT_DRAG] {
+            assert_eq!(
+                pointer_lock_step(refused, reasons, refused_at),
+                PointerLockStep::Keep
+            );
+            assert_eq!(
+                pointer_lock_step(refused, reasons, before_retry),
+                PointerLockStep::Keep
+            );
+            assert_eq!(
+                pointer_lock_step(refused, reasons, retry_due),
+                PointerLockStep::Acquire
+            );
+        }
+        assert_eq!(
+            pointer_lock_step(refused, PointerLockReasons::default(), refused_at),
+            PointerLockStep::Release
+        );
+        assert_eq!(
+            pointer_lock_step(refused, PointerLockReasons::default(), retry_due),
+            PointerLockStep::Release
+        );
+    }
+
+    #[test]
+    fn focus_loss_releases_the_engine_right_button_only_while_it_is_down() {
+        let pressed = EngineRightButton::Up.after_dispatch(MouseButton::Right, true);
+        assert_eq!(pressed, EngineRightButton::Down);
+        assert_eq!(
+            focus_loss_release(pressed),
+            FocusLossRelease::RightButtonAndPointerLock
+        );
+
+        let released = pressed.after_dispatch(MouseButton::Right, false);
+        assert_eq!(released, EngineRightButton::Up);
+        assert_eq!(focus_loss_release(released), FocusLossRelease::PointerLock);
+
+        for held in [EngineRightButton::Up, EngineRightButton::Down] {
+            for button in [
+                MouseButton::Left,
+                MouseButton::Middle,
+                MouseButton::Back,
+                MouseButton::Forward,
+            ] {
+                for pressed in [true, false] {
+                    assert_eq!(held.after_dispatch(button, pressed), held);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_right_press_over_an_active_webview_still_needs_a_focus_loss_release() {
+        use crate::config::TouchMode;
+
+        assert_eq!(
+            active_webview_button_route(MouseButton::Right),
+            ActiveWebViewButtonRoute::Engine
+        );
+        let reasons = PointerLockReasons::default().after_mouse_button(
+            MouseButton::Right,
+            ElementState::Pressed,
+            TouchMode::Off,
+            true,
+        );
+        assert_eq!(reasons, PointerLockReasons::default());
+        let right_button = EngineRightButton::Up.after_dispatch(MouseButton::Right, true);
+        assert_eq!(
+            focus_loss_release(right_button),
+            FocusLossRelease::RightButtonAndPointerLock
+        );
+    }
+
+    #[test]
+    fn locked_motion_reaches_the_engine_in_physical_pixels() {
+        assert_eq!(
+            RelativeMotionUnits::SurfaceLogical.engine_delta((3.0, -2.0), 2.0),
+            (6.0, -4.0)
+        );
+        assert_eq!(
+            RelativeMotionUnits::SurfaceLogical.engine_delta((4.0, -2.0), 1.5),
+            (6.0, -3.0)
+        );
+        assert_eq!(
+            RelativeMotionUnits::DeviceCounts.engine_delta((3.0, -2.0), 2.0),
+            (3.0, -2.0)
+        );
+    }
+
+    #[test]
+    fn only_a_confined_grab_warps_and_only_off_the_anchor() {
+        let anchor = (320.0, 240.0);
+
+        assert!(!confined_cursor_needs_warp(
+            PointerGrab::Locked,
+            (500.0, 100.0),
+            anchor
+        ));
+        assert!(!confined_cursor_needs_warp(
+            PointerGrab::ConfinedWithWarp,
+            (320.0, 240.0),
+            anchor
+        ));
+        assert!(!confined_cursor_needs_warp(
+            PointerGrab::ConfinedWithWarp,
+            (320.4, 239.6),
+            anchor
+        ));
+        assert!(confined_cursor_needs_warp(
+            PointerGrab::ConfinedWithWarp,
+            (321.0, 240.0),
+            anchor
+        ));
+        assert!(confined_cursor_needs_warp(
+            PointerGrab::ConfinedWithWarp,
+            (320.0, 238.0),
+            anchor
+        ));
+    }
+
+    #[test]
+    fn host_cursor_hides_over_the_engine_surface_like_the_null_pointer_icon() {
+        use crate::config::TouchMode;
+
+        assert_eq!(host_cursor(true, TouchMode::Off, false), HostCursor::Hidden);
+        assert_eq!(host_cursor(true, TouchMode::Off, true), HostCursor::Shown);
+        assert_eq!(host_cursor(false, TouchMode::Off, false), HostCursor::Shown);
+        for touch_mode in [TouchMode::On, TouchMode::FakeOff] {
+            assert_eq!(host_cursor(true, touch_mode, false), HostCursor::Shown);
+            assert_eq!(host_cursor(true, touch_mode, true), HostCursor::Shown);
         }
     }
 
