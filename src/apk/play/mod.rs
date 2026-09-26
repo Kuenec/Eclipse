@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
 
-use super::store::{InstalledVersion, Store, StoreError};
+use super::store::{InstalledVersion, Store, StoreError, UpdateOutcome};
 use super::{
     ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME,
     ROBLOX_PACKAGE,
@@ -24,8 +24,6 @@ use proto::{
     bytes_field, fixed64_field, message_at, repeated_bytes, string_field, varint_field, Encoder,
     ProtoError,
 };
-
-pub const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 const AUTH_URL: &str = "https://android.clients.google.com/auth";
 const CHECKIN_URL: &str = "https://android.clients.google.com/checkin";
@@ -40,7 +38,6 @@ const OAUTH_TOKEN_PREFIX: &str = "oauth2_4/";
 const FREE_OFFER: &str = "1";
 const DELIVERY_OK: u64 = 1;
 const CREDENTIALS_FILE: &str = "google-play.json";
-const LAST_CHECK_FILE: &str = "google-play-last-check.json";
 const TEMP_SUFFIX: &str = ".tmp";
 const API_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -116,35 +113,6 @@ impl Account {
     pub fn save(&self, credentials: &Credentials) -> Result<(), PlayError> {
         write_private_json(&self.dir, CREDENTIALS_FILE, credentials)
     }
-
-    pub fn last_check(&self) -> Result<Option<SystemTime>, PlayError> {
-        let record = match read_json::<LastCheck>(&self.dir.join(LAST_CHECK_FILE)) {
-            Ok(record) => record,
-            Err(PlayError::StateFile { .. }) => None,
-            Err(error) => return Err(error),
-        };
-        Ok(record
-            .and_then(|record| UNIX_EPOCH.checked_add(Duration::from_secs(record.checked_at_unix))))
-    }
-
-    pub fn record_check(&self, at: SystemTime) -> Result<(), PlayError> {
-        let checked_at_unix = at
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        write_private_json(&self.dir, LAST_CHECK_FILE, &LastCheck { checked_at_unix })
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct LastCheck {
-    checked_at_unix: u64,
-}
-
-pub fn update_due(last_check: Option<SystemTime>, now: SystemTime) -> bool {
-    last_check.is_none_or(|last| match now.duration_since(last) {
-        Ok(elapsed) => elapsed >= UPDATE_INTERVAL,
-        Err(_) => true,
-    })
 }
 
 pub fn sign_in(email: &str, oauth_token: &Secret) -> Result<Credentials, PlayError> {
@@ -198,16 +166,6 @@ pub fn sign_in(email: &str, oauth_token: &Secret) -> Result<Credentials, PlayErr
         device_config_token,
         checkin_consistency_token,
     })
-}
-
-pub enum UpdateOutcome {
-    UpToDate {
-        installed: InstalledVersion,
-    },
-    Updated {
-        previous: Option<InstalledVersion>,
-        set: Box<ApkSet>,
-    },
 }
 
 pub fn update(
@@ -1188,41 +1146,6 @@ mod tests {
         let err = account.credentials().unwrap_err();
         assert!(matches!(err, PlayError::StateFile { .. }), "{err:?}");
         assert!(err.to_string().contains("eclipse play-login"));
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn update_checks_are_due_every_six_hours() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        assert!(update_due(None, now));
-        assert!(!update_due(Some(now - Duration::from_secs(60)), now));
-        assert!(!update_due(
-            Some(now - UPDATE_INTERVAL + Duration::from_secs(1)),
-            now
-        ));
-        assert!(update_due(Some(now - UPDATE_INTERVAL), now));
-        assert!(
-            update_due(Some(now + Duration::from_secs(60)), now),
-            "a check recorded in the future is treated as stale"
-        );
-
-        let dir = temp_dir("last-check");
-        let account = Account::at(dir.clone());
-        assert_eq!(account.last_check().unwrap(), None);
-        account.record_check(now).unwrap();
-        assert_eq!(account.last_check().unwrap(), Some(now));
-
-        let record = dir.join(LAST_CHECK_FILE);
-        for damaged in [&b"{"[..], b"{\"checked_at_unix\": 18446744073709551615}"] {
-            fs::write(&record, damaged).unwrap();
-            assert_eq!(
-                account.last_check().unwrap(),
-                None,
-                "a damaged last-check record makes the update due"
-            );
-        }
-        account.record_check(now).unwrap();
-        assert_eq!(account.last_check().unwrap(), Some(now));
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -455,21 +455,19 @@ fn update_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
         .ok_or("not signed in to Google Play; run `eclipse play-login` first")?;
     let store = eclipse::apk::store::Store::open()?;
     let current = store.usable_current()?;
-    update_from_play(&account, &credentials, &store, current.as_ref()).map(drop)
+    update_from_play(&credentials, &store, current.as_ref()).map(drop)
 }
 
 fn update_from_play(
-    account: &eclipse::apk::play::Account,
     credentials: &eclipse::apk::play::Credentials,
     store: &eclipse::apk::store::Store,
     current: Option<&eclipse::apk::ApkSet>,
 ) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
-    use eclipse::apk::play::UpdateOutcome;
-    use eclipse::apk::store::InstalledVersion;
+    use eclipse::apk::store::{InstalledVersion, UpdateOutcome};
 
     println!("# Checking Google Play for the newest Roblox client…");
     let outcome = eclipse::apk::play::update(credentials, store, current)?;
-    account.record_check(std::time::SystemTime::now())?;
+    store.record_check(std::time::SystemTime::now())?;
     match outcome {
         UpdateOutcome::UpToDate { installed } => {
             println!("Roblox {installed} is up to date");
@@ -503,10 +501,10 @@ fn update_if_due(
     let Some(credentials) = account.credentials()? else {
         return Ok(None);
     };
-    if !eclipse::apk::play::update_due(account.last_check()?, std::time::SystemTime::now()) {
+    if !eclipse::apk::store::update_due(store.last_check()?, std::time::SystemTime::now()) {
         return Ok(None);
     }
-    update_from_play(&account, &credentials, store, current)
+    update_from_play(&credentials, store, current)
 }
 
 fn installed_apk_set(
