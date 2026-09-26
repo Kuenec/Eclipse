@@ -17,8 +17,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6"
 
-zip = { version = "2", default-features = false, features = ["deflate"] }
-sha2 = "0.10"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+sha2 = "0.11"
 ring = "0.17"
 
 crc32fast = "1"
@@ -43,7 +43,7 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 
 freetype-rs = "0.36"
 
-cpal = "0.17"
+cpal = "0.18"
 
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
