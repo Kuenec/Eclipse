@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DESKTOP_FILE_ID: &str = "dev.eclipse.RobloxPlayer.desktop";
-const URL_HANDLER_MIME: &str = "x-scheme-handler/roblox-player";
+const URL_HANDLER_MIMES: [&str; 2] = ["x-scheme-handler/roblox-player", "x-scheme-handler/roblox"];
 pub(super) const BROWSER_HANDLER_COMMAND: &str = "__handle-roblox-player-url";
 
 const FLATPAK_INFO: &str = "/.flatpak-info";
@@ -36,14 +36,14 @@ impl KdeConfigWriter {
         }
     }
 
-    fn default_application_args(self) -> Vec<&'static str> {
+    fn default_application_args(self, mime: &'static str) -> Vec<&'static str> {
         let mut args = vec![
             "--file",
             "mimeapps.list",
             "--group",
             "Default Applications",
             "--key",
-            URL_HANDLER_MIME,
+            mime,
         ];
         match self {
             Self::Plasma6 => args.push("--notify"),
@@ -112,11 +112,12 @@ fn flatpak_handler_notice(app_id: &str, desktop_path: &Path) -> String {
         .map(OsStr::to_string_lossy)
         .unwrap_or_default();
     format!(
-        "Eclipse is running inside the {app_id} Flatpak, which installed its own {URL_HANDLER_MIME} \
-         handler ({}) together with the app, so nothing was written to the sandbox's private data \
-         directory. If another app is the default handler, run this on the host: xdg-mime default \
-         {desktop_id} {URL_HANDLER_MIME}",
-        desktop_path.display()
+        "Eclipse is running inside the {app_id} Flatpak, which installed its own {} handler ({}) \
+         together with the app, so nothing was written to the sandbox's private data directory. If \
+         another app is the default handler, run this on the host: xdg-mime default {desktop_id} {}",
+        URL_HANDLER_MIMES.join(" and "),
+        desktop_path.display(),
+        URL_HANDLER_MIMES.join(" ")
     )
 }
 
@@ -153,7 +154,7 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let xdg_mime = find_on_path("xdg-mime").ok_or_else(|| {
         io::Error::new(
             ErrorKind::NotFound,
-            "xdg-mime is required to register the roblox-player URL handler",
+            "xdg-mime is required to register the Roblox URL handlers",
         )
     })?;
     if kde_session() {
@@ -164,10 +165,12 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
                  URL handler in this KDE session",
             )
         })?;
-        run_checked(
-            Command::new(kwriteconfig).args(writer.default_application_args()),
-            "set the KDE roblox-player URL handler",
-        )?;
+        for mime in URL_HANDLER_MIMES {
+            run_checked(
+                Command::new(&kwriteconfig).args(writer.default_application_args(mime)),
+                "set the KDE Roblox URL handler",
+            )?;
+        }
         if let Some(cache_builder) = find_on_path(writer.cache_builder()) {
             run_checked(
                 Command::new(cache_builder).arg("--noincremental"),
@@ -179,21 +182,25 @@ fn install_host_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
             Command::new(&xdg_mime)
                 .arg("default")
                 .arg(DESKTOP_FILE_ID)
-                .arg(URL_HANDLER_MIME),
-            "set the roblox-player URL handler",
+                .args(URL_HANDLER_MIMES),
+            "set the Roblox URL handlers",
         )?;
     }
 
-    let query = Command::new(xdg_mime)
-        .arg("query")
-        .arg("default")
-        .arg(URL_HANDLER_MIME)
-        .output()?;
-    if !query.status.success() || String::from_utf8_lossy(&query.stdout).trim() != DESKTOP_FILE_ID {
-        return Err(io::Error::other(
-            "the desktop environment did not retain Eclipse as the roblox-player handler",
-        )
-        .into());
+    for mime in URL_HANDLER_MIMES {
+        let query = Command::new(&xdg_mime)
+            .arg("query")
+            .arg("default")
+            .arg(mime)
+            .output()?;
+        if !query.status.success()
+            || String::from_utf8_lossy(&query.stdout).trim() != DESKTOP_FILE_ID
+        {
+            return Err(io::Error::other(format!(
+                "the desktop environment did not retain Eclipse as the {mime} handler"
+            ))
+            .into());
+        }
     }
 
     Ok(desktop_path)
@@ -209,6 +216,10 @@ fn select_kde_config_writer(
 
 fn desktop_entry(handler: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let handler = desktop_exec_argument(handler.as_os_str())?;
+    let mime_types: String = URL_HANDLER_MIMES
+        .iter()
+        .map(|mime| format!("{mime};"))
+        .collect();
     Ok(format!(
         "[Desktop Entry]\n\
          Version=1.5\n\
@@ -219,7 +230,7 @@ fn desktop_entry(handler: &Path) -> Result<String, Box<dyn std::error::Error>> {
          Terminal=false\n\
          StartupNotify=false\n\
          Exec={handler} {BROWSER_HANDLER_COMMAND} %u\n\
-         MimeType={URL_HANDLER_MIME};\n"
+         MimeType={mime_types}\n"
     ))
 }
 
@@ -302,22 +313,29 @@ mod tests {
     }
 
     #[test]
-    fn desktop_entry_claims_only_the_scheme_the_browser_launch_parser_accepts() {
+    fn desktop_entries_claim_exactly_the_schemes_the_browser_launch_parser_accepts() {
+        let mime_line = "\nMimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;\n";
         let entry = desktop_entry(Path::new("/usr/bin/eclipse")).unwrap();
-        assert!(
-            entry.contains("\nMimeType=x-scheme-handler/roblox-player;\n"),
-            "{entry}"
-        );
-        let scheme = URL_HANDLER_MIME.strip_prefix("x-scheme-handler/").unwrap();
-        let launch = format!(
-            "{scheme}:1+launchmode:play+gameinfo:TICKET+placelauncherurl:https%3A%2F%2F\
-             assetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx%3Frequest%3DRequestGame%26\
-             placeId%3D90441122676618"
-        );
-        assert_eq!(
-            crate::browser_launch::place_id(&launch),
-            Ok(90_441_122_676_618)
-        );
+        assert!(entry.contains(mime_line), "{entry}");
+        let exported =
+            include_str!("../packaging/flatpak/io.github.kuenec.Eclipse.UrlHandler.desktop");
+        assert!(exported.contains(mime_line), "{exported}");
+
+        let player_launch = "roblox-player:1+launchmode:play+gameinfo:TICKET+placelauncherurl:\
+                             https%3A%2F%2Fassetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx%3F\
+                             request%3DRequestGame%26placeId%3D90441122676618";
+        for mime in URL_HANDLER_MIMES {
+            let launch = match mime.strip_prefix("x-scheme-handler/").unwrap() {
+                "roblox-player" => player_launch,
+                "roblox" => "roblox://experiences/start?placeId=90441122676618",
+                other => panic!("no launch sample for the {other} scheme"),
+            };
+            assert_eq!(
+                crate::browser_launch::place_id(launch),
+                Ok(90_441_122_676_618),
+                "{mime}"
+            );
+        }
     }
 
     #[test]
@@ -365,7 +383,7 @@ mod tests {
                 "--group",
                 "Default Applications",
                 "--key",
-                "x-scheme-handler/roblox-player",
+                "x-scheme-handler/roblox",
             ];
             if notify {
                 args.push("--notify");
@@ -374,11 +392,11 @@ mod tests {
             args
         };
         assert_eq!(
-            KdeConfigWriter::Plasma6.default_application_args(),
+            KdeConfigWriter::Plasma6.default_application_args("x-scheme-handler/roblox"),
             expected(true)
         );
         assert_eq!(
-            KdeConfigWriter::Plasma5.default_application_args(),
+            KdeConfigWriter::Plasma5.default_application_args("x-scheme-handler/roblox"),
             expected(false)
         );
     }
@@ -413,9 +431,9 @@ mod tests {
         );
         assert!(
             notice.contains(
-                "installed its own x-scheme-handler/roblox-player handler \
-                 (/app/share/applications/io.github.kuenec.Eclipse.UrlHandler.desktop) together \
-                 with the app"
+                "installed its own x-scheme-handler/roblox-player and x-scheme-handler/roblox \
+                 handler (/app/share/applications/io.github.kuenec.Eclipse.UrlHandler.desktop) \
+                 together with the app"
             ),
             "{notice}"
         );
@@ -423,7 +441,7 @@ mod tests {
         assert!(
             notice.ends_with(
                 "xdg-mime default io.github.kuenec.Eclipse.UrlHandler.desktop \
-                 x-scheme-handler/roblox-player"
+                 x-scheme-handler/roblox-player x-scheme-handler/roblox"
             ),
             "{notice}"
         );

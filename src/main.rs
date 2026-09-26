@@ -235,7 +235,7 @@ fn normalize_browser_launch(mut arguments: Vec<String>) -> Result<Vec<String>, S
         return Ok(arguments);
     }
     if arguments.len() != 2 {
-        return Err("the roblox-player handler requires exactly one URL".to_string());
+        return Err("the Roblox URL handler requires exactly one URL".to_string());
     }
 
     let place_id = browser_launch::place_id(&arguments[1]).map_err(|error| error.to_string())?;

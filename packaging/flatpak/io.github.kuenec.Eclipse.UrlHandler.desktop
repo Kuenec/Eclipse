@@ -8,4 +8,4 @@ Icon=io.github.kuenec.Eclipse
 Terminal=false
 NoDisplay=true
 StartupNotify=false
-MimeType=x-scheme-handler/roblox-player;
+MimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;
