@@ -5,7 +5,7 @@ use ash::vk::Handle;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 fn overlay_font() -> Option<&'static RasterFont> {
@@ -933,6 +933,8 @@ static LAST_ENGINE_PRESENT: Mutex<Option<std::time::Instant>> = Mutex::new(None)
 
 static WEB_PRESENTER: Mutex<Option<WebPresenter>> = Mutex::new(None);
 
+static WEB_GPU_HELD: AtomicBool = AtomicBool::new(false);
+
 const WEB_PRESENT_ENGINE_GAP: std::time::Duration = std::time::Duration::from_millis(12);
 
 fn swapchain_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1749,6 +1751,7 @@ fn ensure_web_presenter() -> bool {
                 "vk-overlay: independent WebView presenter armed on Eclipse's reserved queue"
             );
             *slot = Some(presenter);
+            WEB_GPU_HELD.store(true, Ordering::Release);
             true
         }
         None => {
@@ -1844,6 +1847,18 @@ pub(crate) fn present_staged_webview_frame(view: i64) {
             unsafe { presenter.present() };
         }
     });
+}
+
+fn release_idle_web_gpu() {
+    if !WEB_GPU_HELD.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    *WEB_COMPOSITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *WEB_PRESENTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Device) {
@@ -2766,6 +2781,9 @@ fn composite_webview_frame(
             },
         };
         let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect);
+        if rebuilt {
+            WEB_GPU_HELD.store(true, Ordering::Release);
+        }
         let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
         let source = WebFrameSource {
             bytes: stage.bytes,
@@ -2885,11 +2903,14 @@ unsafe fn present_with_overlay(
     queue: vk::Queue,
     p_present_info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
+    let webview_live = crate::webview::client::active_view() != 0;
+    if !webview_live {
+        release_idle_web_gpu();
+    }
     if p_present_info.is_null() {
         return unsafe { host(queue, p_present_info) };
     }
 
-    let webview_live = crate::webview::client::active_view() != 0;
     if !overlay_enabled() && !probe_enabled() && !webview_live {
         return unsafe { host(queue, p_present_info) };
     }
@@ -3855,6 +3876,73 @@ mod tests {
             pixels.chunks(4).all(|p| p == [0, 0, 0, 255]),
             "a released image is presented as a defined black frame, not stale engine pixels"
         );
+    }
+
+    #[test]
+    fn idle_webview_gpu_resources_are_released() {
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        let format = vk::Format::B8G8R8A8_UNORM;
+        let extent = vk::Extent2D {
+            width: 32,
+            height: 16,
+        };
+        let image = gpu.image(
+            format,
+            extent.width,
+            extent.height,
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+        );
+        let saved = HOST_GDPA.swap(
+            stub_presenter_proc_addr as *const () as u64,
+            Ordering::SeqCst,
+        );
+        let presenter = WebPresenter::build(
+            &gpu.entry,
+            EngineHandles {
+                instance: gpu.instance.handle().as_raw(),
+                device: gpu.device.handle().as_raw(),
+                physical_device: gpu.physical_device.as_raw(),
+                queue_family: gpu.queue_family,
+            },
+            0,
+            0x5D,
+            extent,
+            format,
+            vec![image.as_raw()],
+        );
+        HOST_GDPA.store(saved, Ordering::SeqCst);
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 4, y: 2 },
+            extent: vk::Extent2D {
+                width: 8,
+                height: 4,
+            },
+        };
+        *WEB_COMPOSITE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(build_probe(&gpu, rect));
+        *WEB_PRESENTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(presenter.expect("WebView presenter"));
+        WEB_GPU_HELD.store(true, Ordering::SeqCst);
+
+        release_idle_web_gpu();
+
+        let composite_held = WEB_COMPOSITE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        let presenter_held = WEB_PRESENTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        assert!(!composite_held, "the WebView composite buffer is freed");
+        assert!(!presenter_held, "the WebView presenter images are freed");
+        assert!(!WEB_GPU_HELD.load(Ordering::SeqCst));
     }
 
     #[test]
