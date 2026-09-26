@@ -482,10 +482,7 @@ fn decode_utf8(buf: &[u8], start: usize) -> Result<String, AxmlError> {
     let (byte_len, after_len) = read_var_len_u8(buf, after_char)?;
     let end = after_len.checked_add(byte_len).ok_or(AxmlError::Overflow)?;
     let data = buf.get(after_len..end).ok_or(AxmlError::BadString)?;
-
-    std::str::from_utf8(data)
-        .map(str::to_owned)
-        .map_err(|_| AxmlError::BadString)
+    super::decode_modified_utf8(data).ok_or(AxmlError::BadString)
 }
 
 fn decode_utf16(buf: &[u8], start: usize) -> Result<String, AxmlError> {
@@ -1033,11 +1030,15 @@ mod tests {
     }
 
     fn build_utf8_string_pool(strings: &[&str]) -> Vec<u8> {
+        let encoded: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        build_encoded_utf8_string_pool(&encoded)
+    }
+
+    fn build_encoded_utf8_string_pool(strings: &[&[u8]]) -> Vec<u8> {
         let mut data = Vec::new();
         let mut offsets = Vec::new();
-        for s in strings {
+        for bytes in strings {
             offsets.push(data.len() as u32);
-            let bytes = s.as_bytes();
             data.push(bytes.len() as u8);
             data.push(bytes.len() as u8);
             data.extend_from_slice(bytes);
@@ -1158,6 +1159,23 @@ mod tests {
         );
         assert_eq!(name_attr.value_type, TYPE_STRING);
         assert_eq!(name_attr.value_string.as_deref(), Some("MyActivity"));
+    }
+
+    #[test]
+    fn parse_document_decodes_cesu8_surrogate_pairs_in_utf8_pools() {
+        let pool = build_encoded_utf8_string_pool(&[
+            b"activity",
+            b"label",
+            &[0xED, 0xA0, 0xBD, 0xED, 0xB4, 0x84],
+        ]);
+        let elem = build_start_element(0, 1, TYPE_STRING, 2);
+        let axml = build_axml(&[&pool, &elem]);
+
+        let doc = parse_document(&axml).expect("an emoji in a UTF-8 pool is valid binary XML");
+        assert_eq!(
+            doc.elements[0].attributes[0].value_string.as_deref(),
+            Some("\u{1F504}")
+        );
     }
 
     #[test]
