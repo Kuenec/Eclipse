@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use jni::errors::LogErrorAndDefault;
+use jni::ids::JStaticMethodID;
 use jni::objects::{
     JByteArray, JClass, JFloatArray, JIntArray, JLongArray, JMethodID, JObject, JObjectArray,
     JString,
@@ -11737,6 +11738,73 @@ pub fn engine_surface_view_handle() -> Option<view_registry::ViewHandle> {
     view_registry::find_by_class(RBX_SURFACE_VIEW_CLASS)
 }
 
+const NATIVE_INPUT_INTERFACE_CLASS: &JNIStr =
+    jni_str!("com/roblox/engine/jni/NativeInputInterface");
+
+struct NativeInputJniCache {
+    class: Global<JClass<'static>>,
+    pass_mouse_wheel: JStaticMethodID,
+    pass_mouse_button: JStaticMethodID,
+    pass_mouse_move: JStaticMethodID,
+}
+
+static NATIVE_INPUT_JNI_CACHE: OnceLock<NativeInputJniCache> = OnceLock::new();
+
+static MAIN_WINDOW_IS_MOUSE_LOCKED_CENTER: OnceLock<JStaticMethodID> = OnceLock::new();
+
+fn native_input_jni_cache(env: &mut Env) -> Result<&'static NativeInputJniCache, FrameworkError> {
+    if let Some(cache) = NATIVE_INPUT_JNI_CACHE.get() {
+        return Ok(cache);
+    }
+    let cache = checked(
+        env,
+        "NativeInputInterface class and static method IDs",
+        |env| {
+            let class = env.find_class(NATIVE_INPUT_INTERFACE_CLASS)?;
+            Ok(NativeInputJniCache {
+                pass_mouse_wheel: env.get_static_method_id(
+                    &class,
+                    jni_str!("nativePassMouseWheel"),
+                    jni_sig!("(FFF)V"),
+                )?,
+                pass_mouse_button: env.get_static_method_id(
+                    &class,
+                    jni_str!("nativePassMouseButton"),
+                    jni_sig!("(FFZI)V"),
+                )?,
+                pass_mouse_move: env.get_static_method_id(
+                    &class,
+                    jni_str!("nativePassMouseMove"),
+                    jni_sig!("(FFFF)V"),
+                )?,
+                class: env.new_global_ref(&class)?,
+            })
+        },
+    )?;
+    Ok(NATIVE_INPUT_JNI_CACHE.get_or_init(|| cache))
+}
+
+fn main_window_is_mouse_locked_center_method(
+    env: &mut Env,
+    class: &Global<JClass<'static>>,
+) -> Result<JStaticMethodID, FrameworkError> {
+    if let Some(method) = MAIN_WINDOW_IS_MOUSE_LOCKED_CENTER.get() {
+        return Ok(*method);
+    }
+    let method = checked(
+        env,
+        "NativeInputInterface.nativeGetMainWindowIsMouseLockedCenter static method ID",
+        |env| {
+            env.get_static_method_id(
+                class,
+                jni_str!("nativeGetMainWindowIsMouseLockedCenter"),
+                jni_sig!("()Z"),
+            )
+        },
+    )?;
+    Ok(*MAIN_WINDOW_IS_MOUSE_LOCKED_CENTER.get_or_init(|| method))
+}
+
 pub fn dispatch_scroll(vm: &Vm, x: f32, y: f32, delta: f32) {
     let raw = vm.as_raw();
     if raw.is_null() {
@@ -11746,20 +11814,23 @@ pub fn dispatch_scroll(vm: &Vm, x: f32, y: f32, delta: f32) {
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let cls = match env.find_class(jni_str!("com/roblox/engine/jni/NativeInputInterface")) {
-                Ok(c) => c,
-                Err(_) => {
-                    env.exception_clear();
-                    return;
-                }
+            let Ok(cache) = native_input_jni_cache(env) else {
+                return;
             };
+            let args = [
+                JValue::Float(x).as_jni(),
+                JValue::Float(y).as_jni(),
+                JValue::Float(delta).as_jni(),
+            ];
             if let Err(e) = checked(env, "NativeInputInterface.nativePassMouseWheel", |env| {
-                env.call_static_method(
-                    &cls,
-                    jni_str!("nativePassMouseWheel"),
-                    jni_sig!("(FFF)V"),
-                    &[JValue::Float(x), JValue::Float(y), JValue::Float(delta)],
-                )?
+                unsafe {
+                    env.call_static_method_unchecked(
+                        &cache.class,
+                        cache.pass_mouse_wheel,
+                        JavaType::Primitive(Primitive::Void),
+                        &args,
+                    )
+                }?
                 .v()
             }) {
                 tracing::debug!(error = %e, "nativePassMouseWheel threw (cleared)");
@@ -11784,21 +11855,22 @@ pub fn dispatch_mouse_button(
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let class = checked(env, "NativeInputInterface class for mouse button", |env| {
-                env.find_class(jni_str!("com/roblox/engine/jni/NativeInputInterface"))
-            })?;
+            let cache = native_input_jni_cache(env)?;
+            let args = [
+                JValue::Float(x).as_jni(),
+                JValue::Float(y).as_jni(),
+                JValue::Bool(down).as_jni(),
+                JValue::Int(button).as_jni(),
+            ];
             checked(env, "NativeInputInterface.nativePassMouseButton", |env| {
-                env.call_static_method(
-                    &class,
-                    jni_str!("nativePassMouseButton"),
-                    jni_sig!("(FFZI)V"),
-                    &[
-                        JValue::Float(x),
-                        JValue::Float(y),
-                        JValue::Bool(down),
-                        JValue::Int(button),
-                    ],
-                )?
+                unsafe {
+                    env.call_static_method_unchecked(
+                        &cache.class,
+                        cache.pass_mouse_button,
+                        JavaType::Primitive(Primitive::Void),
+                        &args,
+                    )
+                }?
                 .v()
             })?;
             Ok(())
@@ -11824,24 +11896,58 @@ pub fn dispatch_mouse_move(
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let class = checked(env, "NativeInputInterface class for mouse move", |env| {
-                env.find_class(jni_str!("com/roblox/engine/jni/NativeInputInterface"))
-            })?;
+            let cache = native_input_jni_cache(env)?;
+            let args = [
+                JValue::Float(x).as_jni(),
+                JValue::Float(y).as_jni(),
+                JValue::Float(dx).as_jni(),
+                JValue::Float(dy).as_jni(),
+            ];
             checked(env, "NativeInputInterface.nativePassMouseMove", |env| {
-                env.call_static_method(
-                    &class,
-                    jni_str!("nativePassMouseMove"),
-                    jni_sig!("(FFFF)V"),
-                    &[
-                        JValue::Float(x),
-                        JValue::Float(y),
-                        JValue::Float(dx),
-                        JValue::Float(dy),
-                    ],
-                )?
+                unsafe {
+                    env.call_static_method_unchecked(
+                        &cache.class,
+                        cache.pass_mouse_move,
+                        JavaType::Primitive(Primitive::Void),
+                        &args,
+                    )
+                }?
                 .v()
             })?;
             Ok(())
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+pub fn engine_mouse_locked_center(vm: &Vm) -> Result<bool, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let cache = native_input_jni_cache(env)?;
+            let method = main_window_is_mouse_locked_center_method(env, &cache.class)?;
+            checked(
+                env,
+                "NativeInputInterface.nativeGetMainWindowIsMouseLockedCenter",
+                |env| {
+                    unsafe {
+                        env.call_static_method_unchecked(
+                            &cache.class,
+                            method,
+                            JavaType::Primitive(Primitive::Boolean),
+                            &[],
+                        )
+                    }?
+                    .z()
+                },
+            )
         })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
