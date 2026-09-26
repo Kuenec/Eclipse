@@ -21,7 +21,7 @@ use zip::{CompressionMethod, ZipArchive};
 
 use axml::AxmlError;
 use file_reader::ApkFileReader;
-use signature::SignatureError;
+use signature::{SignatureError, SigningCertificateHistory};
 
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
 
@@ -380,18 +380,26 @@ pub struct ApkSet {
     manifest: Manifest,
     version_code: VersionCode,
     version_name: Option<String>,
+    signing_certificate_history: SigningCertificateHistory,
 }
 
 impl ApkSet {
     pub fn open(paths: ApkSetPaths) -> Result<Self, ApkSetError> {
-        verify_signature(&paths.base)?;
+        let signing_certificate_history = signature::verify_roblox_signing_history(&paths.base)
+            .map_err(|source| ApkSetError::Signature {
+                path: paths.base.clone(),
+                source,
+            })?;
         if let Some(split) = &paths.native_split {
             verify_signature(split)?;
         }
-        Self::open_verified(paths)
+        Self::open_verified(paths, signing_certificate_history)
     }
 
-    fn open_verified(paths: ApkSetPaths) -> Result<Self, ApkSetError> {
+    fn open_verified(
+        paths: ApkSetPaths,
+        signing_certificate_history: SigningCertificateHistory,
+    ) -> Result<Self, ApkSetError> {
         let mut base = open_member(&paths.base)?;
         let base_info = member_info(&mut base, &paths.base)?;
         if let Some(split) = base_info.split {
@@ -437,6 +445,7 @@ impl ApkSet {
             manifest,
             version_code,
             version_name: base_info.version_name,
+            signing_certificate_history,
         };
         match set.native_libs_mut().x86_64_engine() {
             Ok(_) => Ok(set),
@@ -469,6 +478,10 @@ impl ApkSet {
 
     pub fn version_name(&self) -> Option<&str> {
         self.version_name.as_deref()
+    }
+
+    pub fn signing_certificate_history(&self) -> &SigningCertificateHistory {
+        &self.signing_certificate_history
     }
 
     pub fn base_mut(&mut self) -> &mut Apk {
@@ -1298,6 +1311,13 @@ mod tests {
         );
     }
 
+    fn open_unsigned_set(paths: ApkSetPaths) -> Result<ApkSet, ApkSetError> {
+        ApkSet::open_verified(
+            paths,
+            SigningCertificateHistory::unverified(vec![b"test certificate".to_vec()]),
+        )
+    }
+
     fn roblox_manifest(version_code: u32, split: Option<&str>) -> Vec<u8> {
         axml::fixture::Manifest {
             package: ROBLOX_PACKAGE,
@@ -1428,7 +1448,7 @@ mod tests {
             ("lib/x86_64/libroblox.so", b"engine"),
         ]);
         let (dir, paths) = write_set("split-set", &base, Some(&split));
-        let mut set = ApkSet::open_verified(paths).expect("consistent split set");
+        let mut set = open_unsigned_set(paths).expect("consistent split set");
         assert_eq!(set.version_code(), VersionCode(3056));
         assert_eq!(set.version_name(), Some("2.737.1584"));
         assert_eq!(
@@ -1453,7 +1473,7 @@ mod tests {
             ("lib/x86_64/libroblox.so", b"engine"),
         ]);
         let (dir, paths) = write_set("universal", &base, None);
-        let set = ApkSet::open_verified(paths).expect("universal APK");
+        let set = open_unsigned_set(paths).expect("universal APK");
         assert_eq!(set.native_libs_path(), dir.join(BASE_APK));
         drop(set);
         std::fs::remove_dir_all(&dir).ok();
@@ -1477,7 +1497,7 @@ mod tests {
             &build_apk(&[(MANIFEST_ENTRY, &other_app), engine]),
             None,
         );
-        let err = ApkSet::open_verified(paths).err().unwrap();
+        let err = open_unsigned_set(paths).err().unwrap();
         assert!(matches!(err, ApkSetError::WrongPackage { .. }), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
 
@@ -1489,7 +1509,7 @@ mod tests {
             engine,
         ]);
         let (dir, paths) = write_set("split-as-base", &split_as_base, None);
-        let err = ApkSet::open_verified(paths).err().unwrap();
+        let err = open_unsigned_set(paths).err().unwrap();
         assert!(matches!(err, ApkSetError::BaseIsSplit { .. }), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
 
@@ -1501,7 +1521,7 @@ mod tests {
             engine,
         ]);
         let (dir, paths) = write_set("density-split", &base, Some(&density_split));
-        let err = ApkSet::open_verified(paths).err().unwrap();
+        let err = open_unsigned_set(paths).err().unwrap();
         assert!(matches!(err, ApkSetError::NotNativeSplit { .. }), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
 
@@ -1513,7 +1533,7 @@ mod tests {
             engine,
         ]);
         let (dir, paths) = write_set("version-mismatch", &base, Some(&older_split));
-        let err = ApkSet::open_verified(paths).err().unwrap();
+        let err = open_unsigned_set(paths).err().unwrap();
         assert!(
             matches!(
                 err,
@@ -1532,7 +1552,7 @@ mod tests {
             &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
         )]);
         let (dir, paths) = write_set("split-without-engine", &base, Some(&empty_split));
-        let err = ApkSet::open_verified(paths).err().unwrap();
+        let err = open_unsigned_set(paths).err().unwrap();
         assert!(
             matches!(
                 err,
@@ -1546,7 +1566,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         let (dir, paths) = write_set("base-without-split", &base, None);
-        let err = ApkSet::open_verified(paths).err().unwrap();
+        let err = open_unsigned_set(paths).err().unwrap();
         assert!(
             matches!(
                 err,
@@ -1573,7 +1593,7 @@ mod tests {
             &build_apk(&[(MANIFEST_ENTRY, &unversioned), engine]),
             None,
         );
-        let err = ApkSet::open_verified(paths).err().unwrap();
+        let err = open_unsigned_set(paths).err().unwrap();
         assert!(matches!(err, ApkSetError::MissingVersionCode(_)), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1588,6 +1608,11 @@ mod tests {
 
         let mut set = ApkSet::open(paths.clone()).expect("the official Roblox set verifies");
         assert_eq!(set.manifest().package, ROBLOX_PACKAGE);
+        assert_eq!(
+            set.signing_certificate_history(),
+            &signature::verify_roblox_signing_history(&paths.base)
+                .expect("the official base verifies")
+        );
         assert!(set.version_code().0 > 0);
         assert!(set
             .native_libs_mut()

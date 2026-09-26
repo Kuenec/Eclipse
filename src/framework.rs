@@ -17,6 +17,7 @@ use jni::sys::{jboolean, jfloat, jint, jlong, jshort};
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
+use crate::apk::signature::SigningCertificateHistory;
 use crate::font::RasterFont;
 use crate::runtime::Vm;
 
@@ -30,6 +31,7 @@ pub(crate) mod memory;
 mod message_queue;
 pub mod paint_registry;
 pub mod path_registry;
+mod signing_certificates;
 pub mod sqlite;
 pub mod theme_registry;
 pub mod view_registry;
@@ -11317,6 +11319,7 @@ fn register_runtime_native_load_natives(env: &mut Env) -> Result<(), FrameworkEr
 pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
+    signing_certificate_history: &SigningCertificateHistory,
     launcher_activity: &str,
     android_deep_link: Option<&str>,
 ) -> Result<LifecycleProgress, FrameworkError> {
@@ -11328,7 +11331,13 @@ pub fn drive_application_lifecycle(
 
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            drive_lifecycle(env, apk_path, launcher_activity, android_deep_link)
+            drive_lifecycle(
+                env,
+                apk_path,
+                signing_certificate_history,
+                launcher_activity,
+                android_deep_link,
+            )
         })) {
             Ok(result) => result,
             Err(_) => Err(FrameworkError::Panicked),
@@ -12604,10 +12613,13 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
 fn drive_lifecycle(
     env: &mut Env,
     apk_path: &str,
+    signing_certificate_history: &SigningCertificateHistory,
     launcher_activity: &str,
     android_deep_link: Option<&str>,
 ) -> Result<LifecycleProgress, FrameworkError> {
     register_context_natives(env, apk_path)?;
+
+    signing_certificates::register_natives(env, signing_certificate_history)?;
 
     register_log_natives(env)?;
 
@@ -13064,6 +13076,10 @@ pub enum FrameworkError {
     WindowRegistry(window_registry::WindowRegistryError),
 
     ViewRegistry(view_registry::ViewRegistryError),
+
+    SigningCertificateHistoryConflict,
+
+    OverlayPredatesSigningCertificates(jni::errors::Error),
 }
 
 impl fmt::Display for FrameworkError {
@@ -13082,6 +13098,14 @@ impl fmt::Display for FrameworkError {
             }
             Self::WindowRegistry(e) => write!(f, "window-registry handle allocation failed: {e}"),
             Self::ViewRegistry(e) => write!(f, "view-registry operation failed: {e}"),
+            Self::SigningCertificateHistoryConflict => {
+                f.write_str("a different signing certificate history is already registered")
+            }
+            Self::OverlayPredatesSigningCertificates(e) => write!(
+                f,
+                "the Android framework overlay predates host-verified signing certificates \
+                 ({e}); rebuild it with tools/framework-overlay/patch-framework.sh"
+            ),
         }
     }
 }
@@ -13089,13 +13113,14 @@ impl fmt::Display for FrameworkError {
 impl std::error::Error for FrameworkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Jni(e) => Some(e),
+            Self::Jni(e) | Self::OverlayPredatesSigningCertificates(e) => Some(e),
             Self::WindowRegistry(e) => Some(e),
             Self::ViewRegistry(e) => Some(e),
             Self::NullVm
             | Self::ActivityTrackerPoisoned
             | Self::GlobalLayoutObserverRegistryPoisoned
-            | Self::Panicked => None,
+            | Self::Panicked
+            | Self::SigningCertificateHistoryConflict => None,
         }
     }
 }
