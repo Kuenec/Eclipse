@@ -8,13 +8,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ureq::http::Uri;
 
+use super::https::{self, DownloadError, Host};
 use super::store::{InstalledVersion, Store, StoreError, UpdateOutcome};
 use super::{
     ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME,
@@ -39,15 +39,12 @@ const FREE_OFFER: &str = "1";
 const DELIVERY_OK: u64 = 1;
 const CREDENTIALS_FILE: &str = "google-play.json";
 const TEMP_SUFFIX: &str = ".tmp";
-const API_TIMEOUT: Duration = Duration::from_secs(60);
-const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-const DOWNLOAD_BODY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_API_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_REDIRECTS: usize = 5;
-const DOWNLOAD_HOST_SUFFIXES: [&str; 2] = [".googleapis.com", ".gvt1.com"];
+const DOWNLOAD_HOSTS: &[Host] = &[
+    Host::SubdomainOf("googleapis.com"),
+    Host::SubdomainOf("gvt1.com"),
+];
 const ACQUIRE_NONCE_BYTES: usize = 256;
-const DOWNLOAD_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -124,7 +121,7 @@ pub fn sign_in(email: &str, oauth_token: &Secret) -> Result<Credentials, PlayErr
         return Err(PlayError::InvalidOauthToken);
     }
 
-    let agent = api_agent();
+    let agent = https::request_agent();
     let sdk = device::SDK_INT.to_string();
     let services = device::PLAY_SERVICES_VERSION.to_string();
     let reply = auth_request(
@@ -192,7 +189,7 @@ pub fn update(
     let delivery = session.delivery(latest, &delivery_token)?;
 
     let staging = store.begin()?;
-    let downloads = download_agent();
+    let downloads = https::download_agent();
     download(&downloads, &delivery.base, &staging.dir().join(BASE_APK))?;
     download(
         &downloads,
@@ -211,7 +208,7 @@ struct Session<'a> {
 
 impl<'a> Session<'a> {
     fn start(credentials: &'a Credentials) -> Result<Self, PlayError> {
-        let agent = api_agent();
+        let agent = https::request_agent();
         let gsf = credentials.gsf_id.hex();
         let sdk = device::SDK_INT.to_string();
         let services = device::PLAY_SERVICES_VERSION.to_string();
@@ -342,28 +339,6 @@ impl<'a> Session<'a> {
         let body = api_body(STEP, response)?;
         parse_delivery(&body)
     }
-}
-
-fn api_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .https_only(true)
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(API_TIMEOUT))
-        .build()
-        .into()
-}
-
-fn download_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .https_only(true)
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(DOWNLOAD_RESPONSE_TIMEOUT))
-        .timeout_recv_body(Some(DOWNLOAD_BODY_TIMEOUT))
-        .build()
-        .into()
 }
 
 fn store_headers<B>(
@@ -602,85 +577,30 @@ fn artifact(
     })
 }
 
-fn allowed_download_uri(file: &'static str, url: &str) -> Result<Uri, PlayError> {
-    let uri = Uri::try_from(url).map_err(|_| PlayError::UntrustedDownload { file })?;
-    let authority = uri
-        .authority()
-        .ok_or(PlayError::UntrustedDownload { file })?;
-    let host = authority.host().to_ascii_lowercase();
-    let trusted = uri.scheme_str() == Some("https")
-        && !authority.as_str().contains('@')
-        && authority.port_u16().is_none_or(|port| port == 443)
-        && DOWNLOAD_HOST_SUFFIXES
-            .iter()
-            .any(|suffix| host.ends_with(suffix));
-    if trusted {
-        Ok(uri)
-    } else {
-        Err(PlayError::UntrustedDownload { file })
-    }
-}
-
 fn download(agent: &ureq::Agent, artifact: &Artifact, dest: &Path) -> Result<(), PlayError> {
     let file = artifact.file;
-    let mut url = artifact.url.clone();
-    let mut redirects = 0;
-    let response = loop {
-        let uri = allowed_download_uri(file, &url)?;
-        let response = agent
-            .get(uri)
-            .call()
-            .map_err(|error| PlayError::download(file, error))?;
-        let status = response.status().as_u16();
-        if !(300..400).contains(&status) {
-            if !(200..300).contains(&status) {
-                return Err(PlayError::DownloadStatus { file, status });
-            }
-            break response;
-        }
-        redirects += 1;
-        if redirects > MAX_REDIRECTS {
-            return Err(PlayError::TooManyRedirects { file });
-        }
-        url = response
-            .headers()
-            .get("location")
-            .and_then(|location| location.to_str().ok())
-            .ok_or(PlayError::UntrustedDownload { file })?
-            .to_owned();
-    };
-    save_verified(response.into_body().into_reader(), artifact, dest)
+    let download = https::open_download(agent, &artifact.url, DOWNLOAD_HOSTS)
+        .map_err(|source| PlayError::Download { file, source })?;
+    save_verified(
+        download.body.into_reader(),
+        download.content_length,
+        artifact,
+        dest,
+    )
 }
 
-fn save_verified(body: impl Read, artifact: &Artifact, dest: &Path) -> Result<(), PlayError> {
+fn save_verified(
+    body: impl Read,
+    content_length: Option<u64>,
+    artifact: &Artifact,
+    dest: &Path,
+) -> Result<(), PlayError> {
     let file = artifact.file;
-    let mut reader = body.take(MAX_APK_BYTES + 1);
-    let io_error = |source| PlayError::Io {
-        path: dest.to_path_buf(),
-        source,
-    };
-    let mut output = File::create(dest).map_err(io_error)?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; DOWNLOAD_BUFFER_BYTES];
-    let mut total = 0u64;
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|source| PlayError::Download {
-                file,
-                detail: source.to_string(),
-            })?;
-        if read == 0 {
-            break;
-        }
-        total += read as u64;
-        if total > MAX_APK_BYTES {
-            return Err(PlayError::TooLarge { file });
-        }
-        hasher.update(&buffer[..read]);
-        output.write_all(&buffer[..read]).map_err(io_error)?;
-    }
-    output.sync_all().map_err(io_error)?;
+    let total = https::save_download(body, content_length, MAX_APK_BYTES, dest, |chunk| {
+        hasher.update(chunk)
+    })
+    .map_err(|source| PlayError::Download { file, source })?;
     if let Some(expected) = artifact.size.filter(|&size| size != total) {
         return Err(PlayError::SizeMismatch {
             file,
@@ -836,22 +756,9 @@ pub enum PlayError {
         file: &'static str,
     },
 
-    UntrustedDownload {
-        file: &'static str,
-    },
-
     Download {
         file: &'static str,
-        detail: String,
-    },
-
-    TooManyRedirects {
-        file: &'static str,
-    },
-
-    DownloadStatus {
-        file: &'static str,
-        status: u16,
+        source: DownloadError,
     },
 
     TooLarge {
@@ -875,22 +782,8 @@ impl PlayError {
     fn http(step: &'static str, error: ureq::Error) -> Self {
         Self::Http {
             step,
-            detail: redacted(error),
+            detail: https::redacted(error),
         }
-    }
-
-    fn download(file: &'static str, error: ureq::Error) -> Self {
-        Self::Download {
-            file,
-            detail: redacted(error),
-        }
-    }
-}
-
-fn redacted(error: ureq::Error) -> String {
-    match error {
-        ureq::Error::BadUri(_) => "the URL is invalid".to_owned(),
-        other => other.to_string(),
     }
 }
 
@@ -966,19 +859,8 @@ impl fmt::Display for PlayError {
             Self::BadHash { file } => {
                 write!(f, "Google Play sent an invalid SHA-256 for {file}")
             }
-            Self::UntrustedDownload { file } => write!(
-                f,
-                "Google Play pointed the {file} download at a host other than \
-                 *.googleapis.com or *.gvt1.com over HTTPS"
-            ),
-            Self::Download { file, detail } => {
-                write!(f, "the {file} download failed: {detail}")
-            }
-            Self::TooManyRedirects { file } => {
-                write!(f, "the {file} download redirected too many times")
-            }
-            Self::DownloadStatus { file, status } => {
-                write!(f, "the {file} download failed with HTTP {status}")
+            Self::Download { file, source } => {
+                write!(f, "the {file} download from Google Play failed: {source}")
             }
             Self::TooLarge { file } => {
                 write!(f, "{file} is larger than {MAX_APK_BYTES} bytes")
@@ -1006,6 +888,7 @@ impl std::error::Error for PlayError {
             Self::StateFile { source, .. } => Some(source),
             Self::Response { source, .. } => Some(source),
             Self::Store(error) => Some(error),
+            Self::Download { source, .. } => Some(source),
             Self::NoDataDir
             | Self::InvalidEmail
             | Self::InvalidOauthToken
@@ -1020,10 +903,6 @@ impl std::error::Error for PlayError {
             | Self::Encrypted
             | Self::MissingNativeSplit { .. }
             | Self::BadHash { .. }
-            | Self::UntrustedDownload { .. }
-            | Self::Download { .. }
-            | Self::TooManyRedirects { .. }
-            | Self::DownloadStatus { .. }
             | Self::TooLarge { .. }
             | Self::SizeMismatch { .. }
             | Self::HashMismatch { .. } => None,
@@ -1283,21 +1162,27 @@ mod tests {
             "https://r1---sn-abc.gvt1.com/edgedl/x.apk",
             "https://PLAY.GOOGLEAPIS.COM:443/x",
         ] {
-            assert!(allowed_download_uri(BASE_APK, url).is_ok(), "{url}");
+            assert!(https::trusted_uri(url, DOWNLOAD_HOSTS).is_ok(), "{url}");
         }
         for url in [
             "http://play.googleapis.com/x",
+            "https://googleapis.com/x",
             "https://googleapis.com.evil.example/x",
             "https://evilgoogleapis.com/x",
-            "https://user@play.googleapis.com/x",
-            "https://play.googleapis.com:8443/x",
-            "/relative/redirect",
-            "not a url",
+            "https://r2.cloudflarestorage.com/x",
         ] {
-            let err = allowed_download_uri(BASE_APK, url).unwrap_err();
-            assert!(matches!(err, PlayError::UntrustedDownload { .. }), "{url}");
-            assert!(!err.to_string().contains(url), "{err}");
+            let err = https::trusted_uri(url, DOWNLOAD_HOSTS).unwrap_err();
+            assert!(matches!(err, DownloadError::Untrusted { .. }), "{url}");
         }
+        let err = PlayError::Download {
+            file: BASE_APK,
+            source: https::trusted_uri("http://x", DOWNLOAD_HOSTS).unwrap_err(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "the base.apk download from Google Play failed: the download link is not an HTTPS \
+             URL on *.googleapis.com or *.gvt1.com"
+        );
     }
 
     struct FailingBody;
@@ -1325,12 +1210,12 @@ mod tests {
         let body = b"official Roblox base.apk bytes";
         let size = Some(body.len() as u64);
 
-        save_verified(&body[..], &announced(body, size), &dest).unwrap();
+        save_verified(&body[..], size, &announced(body, size), &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
-        save_verified(&body[..], &announced(body, None), &dest).unwrap();
+        save_verified(&body[..], None, &announced(body, None), &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
 
-        let err = save_verified(&body[1..], &announced(body, size), &dest).unwrap_err();
+        let err = save_verified(&body[1..], None, &announced(body, size), &dest).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1340,20 +1225,37 @@ mod tests {
             "{err:?}"
         );
         let longer = [&body[..], b"!"].concat();
-        let err = save_verified(&longer[..], &announced(body, size), &dest).unwrap_err();
+        let err = save_verified(&longer[..], None, &announced(body, size), &dest).unwrap_err();
         assert!(matches!(err, PlayError::SizeMismatch { .. }), "{err:?}");
 
         let mut tampered = body.to_vec();
         tampered[0] ^= 1;
-        let err = save_verified(&tampered[..], &announced(body, size), &dest).unwrap_err();
+        let err = save_verified(&tampered[..], size, &announced(body, size), &dest).unwrap_err();
         assert!(
             matches!(err, PlayError::HashMismatch { file: BASE_APK }),
             "{err:?}"
         );
 
-        let err = save_verified(FailingBody, &announced(body, None), &dest).unwrap_err();
+        let err = save_verified(FailingBody, None, &announced(body, None), &dest).unwrap_err();
         assert!(
-            matches!(err, PlayError::Download { file: BASE_APK, .. }),
+            matches!(
+                err,
+                PlayError::Download {
+                    file: BASE_APK,
+                    source: DownloadError::Interrupted(_)
+                }
+            ),
+            "{err:?}"
+        );
+        let err = save_verified(&body[1..], size, &announced(body, size), &dest).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PlayError::Download {
+                    file: BASE_APK,
+                    source: DownloadError::LengthMismatch { .. }
+                }
+            ),
             "{err:?}"
         );
         fs::remove_dir_all(&dir).ok();
@@ -1379,9 +1281,9 @@ mod tests {
 
     #[test]
     fn transport_errors_never_echo_urls() {
-        let err = PlayError::download(
-            BASE_APK,
-            ureq::Error::BadUri("https://play.googleapis.com/?token=secret".to_owned()),
+        let err = PlayError::http(
+            "the Roblox details request",
+            ureq::Error::BadUri("https://android.clients.google.com/?token=secret".to_owned()),
         );
         assert!(!err.to_string().contains("token=secret"), "{err}");
     }

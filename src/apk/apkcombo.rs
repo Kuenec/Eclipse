@@ -1,0 +1,1509 @@
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN};
+use ureq::http::header::USER_AGENT;
+use ureq::http::{Request, Response, Uri};
+
+use super::https::{self, DownloadError, Host};
+use super::store::{
+    InstalledVersion, Release, Staging, Store, StoreError, UpdateCheck, UpdateOutcome,
+};
+use super::{ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI};
+
+const PAGE_URL: &str = "https://apkcombo.com/roblox/com.roblox.client/download/apk";
+const DOWNLOAD_HOSTS: &[Host] = &[Host::Exact(
+    "apks.39b7cb94d40914bac590886981b0ed6e.r2.cloudflarestorage.com",
+)];
+const VARIANT_LINK: &str = "href=\"/r2?u=";
+const ABI_LIST_OPEN: &str = "<code>";
+const ABI_LIST_CLOSE: &str = "</code>";
+const BUNDLE_FILE: &str = "apkcombo.xapk";
+const MAX_PAGE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_SIZE_DECIMALS: u32 = 3;
+const MEBIBYTE: u64 = 1024 * 1024;
+const HASH_BUFFER_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Packaging {
+    Apk,
+    Xapk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvertisedSize {
+    bytes: u64,
+    tolerance: u64,
+}
+
+impl AdvertisedSize {
+    fn parse(text: &str) -> Option<Self> {
+        let mut words = text.split_whitespace();
+        let (number, unit) = (words.next()?, words.next()?);
+        if words.next().is_some() {
+            return None;
+        }
+        let unit_bytes: u64 = match unit {
+            "KB" => 1024,
+            "MB" => MEBIBYTE,
+            "GB" => 1024 * MEBIBYTE,
+            _ => return None,
+        };
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        let decimals = u32::try_from(fraction.len()).ok()?;
+        let all_digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+        if whole.is_empty() || !all_digits(whole) || !all_digits(fraction) {
+            return None;
+        }
+        if decimals > MAX_SIZE_DECIMALS || (number.contains('.') && fraction.is_empty()) {
+            return None;
+        }
+        let mantissa: u64 = format!("{whole}{fraction}").parse().ok()?;
+        let scale = 10u64.pow(decimals);
+        Some(Self {
+            bytes: mantissa.checked_mul(unit_bytes)? / scale,
+            tolerance: unit_bytes / scale,
+        })
+    }
+
+    fn admits(self, bytes: u64) -> bool {
+        bytes.abs_diff(self.bytes) <= self.tolerance
+    }
+
+    fn download_limit(self) -> u64 {
+        self.bytes.saturating_add(self.tolerance).min(MAX_APK_BYTES)
+    }
+}
+
+impl fmt::Display for AdvertisedSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "about {} MiB", self.bytes.div_ceil(MEBIBYTE))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    version_name: String,
+    version_code: VersionCode,
+    packaging: Packaging,
+    size: AdvertisedSize,
+    base_sha1: [u8; SHA1_OUTPUT_LEN],
+    url: Uri,
+}
+
+impl Offer {
+    fn release(&self) -> Release {
+        Release {
+            version_code: self.version_code,
+            base_sha1: self.base_sha1,
+        }
+    }
+}
+
+impl fmt::Display for Offer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let packaging = match self.packaging {
+            Packaging::Apk => "APK",
+            Packaging::Xapk => "XAPK",
+        };
+        write!(
+            f,
+            "Roblox {} (versionCode {}, {packaging}, {})",
+            self.version_name, self.version_code, self.size
+        )
+    }
+}
+
+pub fn newest_offer() -> Result<Offer, ApkComboError> {
+    let response = https::request_agent()
+        .run(page_request())
+        .map_err(ApkComboError::page)?;
+    parse_offer(&page_text(response)?)
+}
+
+pub fn update(
+    offer: &Offer,
+    store: &Store,
+    current: Option<&ApkSet>,
+    rejected: Option<Release>,
+) -> Result<UpdateOutcome, ApkComboError> {
+    update_with(offer, store, current, rejected, |offer| {
+        let download = https::open_download(
+            &https::download_agent(),
+            &offer.url.to_string(),
+            DOWNLOAD_HOSTS,
+        )
+        .map_err(ApkComboError::Download)?;
+        Ok((download.body.into_reader(), download.content_length))
+    })
+}
+
+fn update_with<R: Read>(
+    offer: &Offer,
+    store: &Store,
+    current: Option<&ApkSet>,
+    rejected: Option<Release>,
+    open: impl FnOnce(&Offer) -> Result<(R, Option<u64>), ApkComboError>,
+) -> Result<UpdateOutcome, ApkComboError> {
+    let previous = current.map(InstalledVersion::from);
+    let staging = store.begin()?;
+    let recorded = match store.current() {
+        Ok(recorded) => recorded,
+        Err(error) if error.is_unusable_install() => None,
+        Err(error) => return Err(error.into()),
+    };
+    let unchanged = recorded.as_ref().map(|installed| installed.version_code)
+        == previous.as_ref().map(|installed| installed.version_code);
+    let (verified, refreshed) = if unchanged {
+        (previous.clone(), None)
+    } else {
+        let set = store.usable_current()?;
+        (set.as_ref().map(InstalledVersion::from), set)
+    };
+    match plan(offer, verified.as_ref(), recorded.as_ref(), rejected)? {
+        Plan::UpToDate(installed) => Ok(match refreshed {
+            Some(set) => UpdateOutcome::Updated {
+                previous,
+                set: Box::new(set),
+            },
+            None => UpdateOutcome::UpToDate { installed },
+        }),
+        Plan::Skip => Err(remember_rejection(
+            store,
+            offer,
+            ApkComboError::RejectedBefore {
+                offered: offer.to_string(),
+            },
+        )),
+        Plan::Download => {
+            let installed = open(offer)
+                .and_then(|(body, content_length)| install(offer, staging, body, content_length));
+            match installed {
+                Ok(set) => Ok(UpdateOutcome::Updated {
+                    previous,
+                    set: Box::new(set),
+                }),
+                Err(error) if error.rejects_offer() => Err(remember_rejection(store, offer, error)),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn remember_rejection(store: &Store, offer: &Offer, rejection: ApkComboError) -> ApkComboError {
+    let check = UpdateCheck {
+        at: SystemTime::now(),
+        rejected: Some(offer.release()),
+    };
+    match store.record_check(&check) {
+        Ok(()) => rejection,
+        Err(source) => ApkComboError::NotRemembered {
+            rejection: Box::new(rejection),
+            source,
+        },
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    UpToDate(InstalledVersion),
+    Skip,
+    Download,
+}
+
+fn plan(
+    offer: &Offer,
+    verified: Option<&InstalledVersion>,
+    recorded: Option<&InstalledVersion>,
+    rejected: Option<Release>,
+) -> Result<Plan, ApkComboError> {
+    if let Some(installed) =
+        verified.filter(|installed| installed.version_code >= offer.version_code)
+    {
+        return Ok(Plan::UpToDate(installed.clone()));
+    }
+    if let Some(installed) =
+        recorded.filter(|installed| installed.version_code > offer.version_code)
+    {
+        return Err(ApkComboError::Older {
+            offered: offer.to_string(),
+            installed: installed.clone(),
+        });
+    }
+    if rejected == Some(offer.release()) {
+        return Ok(Plan::Skip);
+    }
+    Ok(Plan::Download)
+}
+
+fn install(
+    offer: &Offer,
+    staging: Staging<'_>,
+    body: impl Read,
+    content_length: Option<u64>,
+) -> Result<ApkSet, ApkComboError> {
+    let base = staging.dir().join(BASE_APK);
+    match offer.packaging {
+        Packaging::Apk => save_download(body, content_length, offer.size, &base)?,
+        Packaging::Xapk => {
+            let bundle = staging.dir().join(BUNDLE_FILE);
+            save_download(body, content_length, offer.size, &bundle)?;
+            staging.add_source(&bundle).map_err(store_failure)?;
+            fs::remove_file(&bundle).map_err(|source| ApkComboError::Io {
+                path: bundle,
+                source,
+            })?;
+        }
+    }
+    if file_sha1(&base)? != offer.base_sha1 {
+        return Err(ApkComboError::BaseHashMismatch);
+    }
+    staging
+        .commit(Some(offer.version_code))
+        .map_err(store_failure)
+}
+
+fn store_failure(error: StoreError) -> ApkComboError {
+    match error {
+        StoreError::NoDataDir
+        | StoreError::Io { .. }
+        | StoreError::Corrupt { .. }
+        | StoreError::MissingInstall { .. }
+        | StoreError::Prune { .. } => ApkComboError::Store(error),
+        StoreError::Set(_)
+        | StoreError::Apk { .. }
+        | StoreError::UnneededSplit { .. }
+        | StoreError::Duplicate { .. }
+        | StoreError::NoBaseGiven
+        | StoreError::NoNativeSplitGiven
+        | StoreError::TooLarge { .. }
+        | StoreError::UnreadableBundle { .. }
+        | StoreError::EncryptedBundle(_)
+        | StoreError::BundleMissingBase(_)
+        | StoreError::UnexpectedVersion { .. } => ApkComboError::Rejected(error),
+    }
+}
+
+fn page_request() -> Request<()> {
+    Request::get(PAGE_URL)
+        .header(USER_AGENT, format!("Eclipse/{}", crate::VERSION))
+        .body(())
+        .expect("a GET of a static URL with an ASCII User-Agent is a valid request")
+}
+
+fn page_text(response: Response<ureq::Body>) -> Result<String, ApkComboError> {
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(ApkComboError::PageStatus(status));
+    }
+    let body = response
+        .into_body()
+        .into_with_config()
+        .limit(MAX_PAGE_BYTES)
+        .read_to_vec()
+        .map_err(ApkComboError::page)?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+struct VariantLink<'a> {
+    abis: &'a str,
+    anchor: &'a str,
+}
+
+impl VariantLink<'_> {
+    fn has_target_abi(&self) -> bool {
+        self.abis.split(',').any(|abi| abi.trim() == TARGET_ABI)
+    }
+}
+
+fn parse_offer(page: &str) -> Result<Offer, ApkComboError> {
+    let links = variant_links(page)?;
+    if links.is_empty() {
+        return Err(ApkComboError::PageLayout("it has no download links"));
+    }
+    let mut offers = Vec::new();
+    let mut offered = Vec::new();
+    for link in links {
+        if link.has_target_abi() {
+            offers.push(parse_variant(link.anchor)?);
+        } else if !offered.iter().any(|abis| abis == link.abis.trim()) {
+            offered.push(link.abis.trim().to_owned());
+        }
+    }
+    offers
+        .into_iter()
+        .max_by_key(|offer| (offer.version_code, offer.packaging == Packaging::Xapk))
+        .ok_or(ApkComboError::NoX86_64 { offered })
+}
+
+fn variant_links(page: &str) -> Result<Vec<VariantLink<'_>>, ApkComboError> {
+    let mut pieces = page.split(VARIANT_LINK);
+    let mut abis = pieces.next().and_then(last_abi_list);
+    let mut links = Vec::new();
+    for piece in pieces {
+        let (anchor, rest) = piece
+            .split_once("</a>")
+            .ok_or(ApkComboError::PageLayout("a download link is not closed"))?;
+        links.push(VariantLink {
+            abis: abis.ok_or(ApkComboError::PageLayout("a download link has no ABI list"))?,
+            anchor,
+        });
+        abis = last_abi_list(rest).or(abis);
+    }
+    Ok(links)
+}
+
+fn last_abi_list(html: &str) -> Option<&str> {
+    let start = html.rfind(ABI_LIST_OPEN)? + ABI_LIST_OPEN.len();
+    let length = html[start..].find(ABI_LIST_CLOSE)?;
+    Some(&html[start..start + length])
+}
+
+fn parse_variant(anchor: &str) -> Result<Offer, ApkComboError> {
+    let (href, body) = anchor
+        .split_once('"')
+        .ok_or(ApkComboError::PageLayout("a download link is not quoted"))?;
+    let href = href.replace("&amp;", "&");
+    let encoded = href
+        .split_once('&')
+        .map_or(href.as_str(), |(value, _)| value);
+    let url = percent_decode(encoded).ok_or(ApkComboError::PageLayout(
+        "a download link is not percent-encoded",
+    ))?;
+    let url = https::trusted_uri(&url, DOWNLOAD_HOSTS).map_err(ApkComboError::Download)?;
+    let key = ObjectKey::parse(url.path()).ok_or(ApkComboError::UnexpectedLink)?;
+
+    let version_name = element_text(body, "vername")
+        .and_then(|text| text.split_whitespace().last())
+        .ok_or(ApkComboError::PageLayout("a download has no version name"))?;
+    let version_code = element_text(body, "vercode")
+        .and_then(|text| text.strip_prefix('(')?.strip_suffix(')')?.parse().ok())
+        .map(VersionCode)
+        .ok_or(ApkComboError::PageLayout("a download has no versionCode"))?;
+    let packaging = if body.contains("class=\"type-xapk\"") {
+        Packaging::Xapk
+    } else if body.contains("class=\"type-apk\"") {
+        Packaging::Apk
+    } else {
+        return Err(ApkComboError::PageLayout(
+            "a download is neither an APK nor an XAPK",
+        ));
+    };
+    let size = element_text(body, "spec ltr")
+        .and_then(AdvertisedSize::parse)
+        .ok_or(ApkComboError::PageLayout("a download has no size"))?;
+
+    if key.version_name != version_name || key.version_code != version_code {
+        return Err(ApkComboError::Inconsistent {
+            listed: format!("{version_name} (versionCode {version_code})"),
+            linked: format!("{} (versionCode {})", key.version_name, key.version_code),
+        });
+    }
+    Ok(Offer {
+        version_name: version_name.to_owned(),
+        version_code,
+        packaging,
+        size,
+        base_sha1: key.base_sha1,
+        url,
+    })
+}
+
+fn element_text<'a>(html: &'a str, class: &str) -> Option<&'a str> {
+    let marker = format!("class=\"{class}\">");
+    let start = html.find(&marker)? + marker.len();
+    let length = html[start..].find('<')?;
+    Some(html[start..start + length].trim())
+}
+
+struct ObjectKey<'a> {
+    version_name: &'a str,
+    version_code: VersionCode,
+    base_sha1: [u8; SHA1_OUTPUT_LEN],
+}
+
+impl<'a> ObjectKey<'a> {
+    fn parse(path: &'a str) -> Option<Self> {
+        let mut segments = path.strip_prefix('/')?.split('/');
+        let (package, version_name, file) = (segments.next()?, segments.next()?, segments.next()?);
+        if package != ROBLOX_PACKAGE || version_name.is_empty() || segments.next().is_some() {
+            return None;
+        }
+        let mut parts = file.split('.');
+        let (code, sha1, extension) = (parts.next()?, parts.next()?, parts.next()?);
+        if extension.is_empty() || parts.next().is_some() {
+            return None;
+        }
+        if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        Some(Self {
+            version_name,
+            version_code: VersionCode(code.parse().ok()?),
+            base_sha1: parse_sha1(sha1)?,
+        })
+    }
+}
+
+fn hex_byte(high: u8, low: u8) -> Option<u8> {
+    let high = char::from(high).to_digit(16)?;
+    let low = char::from(low).to_digit(16)?;
+    u8::try_from(high * 16 + low).ok()
+}
+
+fn parse_sha1(hex: &str) -> Option<[u8; SHA1_OUTPUT_LEN]> {
+    let pairs = hex.as_bytes().as_chunks::<2>();
+    if !pairs.1.is_empty() || pairs.0.len() != SHA1_OUTPUT_LEN {
+        return None;
+    }
+    let mut digest = [0u8; SHA1_OUTPUT_LEN];
+    for (byte, pair) in digest.iter_mut().zip(pairs.0) {
+        *byte = hex_byte(pair[0], pair[1])?;
+    }
+    Some(digest)
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'%' {
+            decoded.push(hex_byte(*bytes.get(index + 1)?, *bytes.get(index + 2)?)?);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn save_download(
+    body: impl Read,
+    content_length: Option<u64>,
+    advertised: AdvertisedSize,
+    dest: &Path,
+) -> Result<(), ApkComboError> {
+    if let Some(actual) = content_length.filter(|&length| !advertised.admits(length)) {
+        return Err(ApkComboError::SizeMismatch { advertised, actual });
+    }
+    let actual = https::save_download(
+        body,
+        content_length,
+        advertised.download_limit(),
+        dest,
+        |_| {},
+    )
+    .map_err(ApkComboError::Download)?;
+    if !advertised.admits(actual) {
+        return Err(ApkComboError::SizeMismatch { advertised, actual });
+    }
+    Ok(())
+}
+
+fn file_sha1(path: &Path) -> Result<[u8; SHA1_OUTPUT_LEN], ApkComboError> {
+    let io_error = |source| ApkComboError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = File::open(path).map_err(io_error)?;
+    let mut context = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    Ok(context
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-1 digests are 20 bytes"))
+}
+
+#[derive(Debug)]
+pub enum ApkComboError {
+    Page {
+        detail: String,
+    },
+
+    PageStatus(u16),
+
+    PageLayout(&'static str),
+
+    NoX86_64 {
+        offered: Vec<String>,
+    },
+
+    Inconsistent {
+        listed: String,
+        linked: String,
+    },
+
+    UnexpectedLink,
+
+    Download(DownloadError),
+
+    SizeMismatch {
+        advertised: AdvertisedSize,
+        actual: u64,
+    },
+
+    BaseHashMismatch,
+
+    Older {
+        offered: String,
+        installed: InstalledVersion,
+    },
+
+    RejectedBefore {
+        offered: String,
+    },
+
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+
+    Rejected(StoreError),
+
+    Store(StoreError),
+
+    NotRemembered {
+        rejection: Box<ApkComboError>,
+        source: StoreError,
+    },
+}
+
+impl ApkComboError {
+    fn page(error: ureq::Error) -> Self {
+        Self::Page {
+            detail: https::redacted(error),
+        }
+    }
+
+    fn rejects_offer(&self) -> bool {
+        matches!(
+            self,
+            Self::Download(DownloadError::TooLarge { .. })
+                | Self::SizeMismatch { .. }
+                | Self::BaseHashMismatch
+                | Self::Rejected(_)
+        )
+    }
+}
+
+impl fmt::Display for ApkComboError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Page { detail } => {
+                write!(f, "cannot load APKCombo's Roblox download page: {detail}")
+            }
+            Self::PageStatus(status @ (403 | 429 | 503)) => write!(
+                f,
+                "APKCombo's Roblox download page answered HTTP {status}; it may be refusing \
+                 automated requests right now, so try again later or install the APKs with \
+                 `eclipse install <PATH>`"
+            ),
+            Self::PageStatus(status) => {
+                write!(f, "APKCombo's Roblox download page answered HTTP {status}")
+            }
+            Self::PageLayout(problem) => write!(
+                f,
+                "APKCombo's Roblox download page has an unexpected layout ({problem}); install \
+                 the APKs with `eclipse install <PATH>` until Eclipse supports the new layout"
+            ),
+            Self::NoX86_64 { offered } => write!(
+                f,
+                "APKCombo offers no {TARGET_ABI} build of the newest Roblox (it offers: {}); try \
+                 again later",
+                offered.join("; ")
+            ),
+            Self::Inconsistent { listed, linked } => write!(
+                f,
+                "APKCombo lists Roblox {listed} but its download link names {linked}"
+            ),
+            Self::UnexpectedLink => write!(
+                f,
+                "APKCombo's download link does not name a {ROBLOX_PACKAGE} release file"
+            ),
+            Self::Download(error) => {
+                write!(f, "the Roblox download from APKCombo failed: {error}")
+            }
+            Self::SizeMismatch { advertised, actual } => write!(
+                f,
+                "the Roblox download from APKCombo has {actual} bytes but the page advertised \
+                 {advertised}; it was discarded"
+            ),
+            Self::BaseHashMismatch => write!(
+                f,
+                "the downloaded {BASE_APK} does not match the SHA-1 in APKCombo's download link; \
+                 it was discarded"
+            ),
+            Self::Older { offered, installed } => write!(
+                f,
+                "APKCombo offers {offered}, which is older than the installed Roblox \
+                 {installed}; Eclipse never installs an older Roblox"
+            ),
+            Self::RejectedBefore { offered } => write!(
+                f,
+                "APKCombo still offers {offered}, which Eclipse downloaded and rejected before, \
+                 so it is not downloaded again automatically; run `eclipse update` to retry it, \
+                 or wait for a newer Roblox"
+            ),
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Rejected(error) => write!(
+                f,
+                "the Roblox download from APKCombo failed verification and was discarded: \
+                 {error}"
+            ),
+            Self::Store(error) => error.fmt(f),
+            Self::NotRemembered { rejection, source } => write!(
+                f,
+                "{rejection} (Eclipse could not record the rejection, so it may download the \
+                 same file again: {source})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApkComboError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Download(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
+            Self::Rejected(error)
+            | Self::Store(error)
+            | Self::NotRemembered { source: error, .. } => Some(error),
+            Self::Page { .. }
+            | Self::PageStatus(_)
+            | Self::PageLayout(_)
+            | Self::NoX86_64 { .. }
+            | Self::Inconsistent { .. }
+            | Self::UnexpectedLink
+            | Self::SizeMismatch { .. }
+            | Self::BaseHashMismatch
+            | Self::Older { .. }
+            | Self::RejectedBefore { .. } => None,
+        }
+    }
+}
+
+impl From<StoreError> for ApkComboError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apk::{ApkSetError, ApkSetPaths, NATIVE_SPLIT_APK};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    const LATEST_PAGE: &str = include_str!("../../tests/fixtures/apkcombo-2.740.931.html");
+    const MIXED_PAGE: &str = include_str!("../../tests/fixtures/apkcombo-2.738.1397.html");
+    const LATEST_BASE_SHA1: &str = "4000331cf5d800c02fc213cc6a51dc823df6ea7c";
+    const UNIVERSAL_APK_SHA1: &str = "4ab4e3ce235bd53755d77f4c81939c6c3353f87f";
+    const R2_HOST: &str = "apks.39b7cb94d40914bac590886981b0ed6e.r2.cloudflarestorage.com";
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-apkcombo-test-{tag}-{:?}",
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("create the test directory");
+        dir
+    }
+
+    fn hex(digest: &[u8]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn installed(code: u32) -> InstalledVersion {
+        InstalledVersion {
+            version_code: VersionCode(code),
+            version_name: Some(format!("2.{code}.0")),
+        }
+    }
+
+    fn page_response(status: u16, body: impl Into<Vec<u8>>) -> Response<ureq::Body> {
+        Response::builder()
+            .status(status)
+            .body(ureq::Body::builder().data(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn page_request_is_an_anonymous_https_get_with_an_honest_user_agent() {
+        let request = page_request();
+        assert_eq!(request.method(), "GET");
+        assert_eq!(request.uri().to_string(), PAGE_URL);
+        assert_eq!(request.uri().scheme_str(), Some("https"));
+        assert_eq!(
+            request.headers()[USER_AGENT],
+            format!("Eclipse/{}", crate::VERSION)
+        );
+        assert_eq!(
+            request.headers().len(),
+            1,
+            "no cookies, credentials or other headers: {:?}",
+            request.headers()
+        );
+    }
+
+    #[test]
+    fn the_page_is_read_only_from_a_success_status_and_below_four_mebibytes() {
+        assert_eq!(
+            page_text(page_response(200, LATEST_PAGE)).unwrap(),
+            LATEST_PAGE
+        );
+        let largest = MAX_PAGE_BYTES as usize - 1;
+        assert_eq!(
+            page_text(page_response(200, vec![b'a'; largest]))
+                .unwrap()
+                .len(),
+            largest
+        );
+
+        let err = page_text(page_response(200, vec![b'a'; largest + 1])).unwrap_err();
+        assert!(matches!(err, ApkComboError::Page { .. }), "{err:?}");
+        for status in [403, 429, 503] {
+            let err = page_text(page_response(status, "Just a moment...")).unwrap_err();
+            assert!(
+                matches!(err, ApkComboError::PageStatus(code) if code == status),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("eclipse install"), "{err}");
+        }
+        let err = page_text(page_response(404, "")).unwrap_err();
+        assert!(matches!(err, ApkComboError::PageStatus(404)), "{err:?}");
+    }
+
+    #[test]
+    fn the_newest_release_page_offers_the_x86_64_xapk() {
+        let offer = parse_offer(LATEST_PAGE).unwrap();
+        assert_eq!(offer.version_name, "2.740.931");
+        assert_eq!(offer.version_code, VersionCode(3170));
+        assert_eq!(offer.packaging, Packaging::Xapk);
+        assert_eq!(
+            offer.size,
+            AdvertisedSize {
+                bytes: 234 * MEBIBYTE,
+                tolerance: MEBIBYTE
+            }
+        );
+        assert!(offer.size.admits(245_807_054));
+        assert_eq!(hex(&offer.base_sha1), LATEST_BASE_SHA1);
+        assert_eq!(offer.url.host(), Some(R2_HOST));
+        assert_eq!(
+            offer.url.path(),
+            "/com.roblox.client/2.740.931/3170.4000331cf5d800c02fc213cc6a51dc823df6ea7c.apks"
+        );
+        let query = offer.url.query().expect("a presigned link has a query");
+        assert!(query.contains("X-Amz-Expires=14400"), "{query}");
+        assert!(
+            query.contains("filename%3D%22Roblox_2.740.931_apkcombo.com.xapk%22"),
+            "the link is percent-decoded exactly once: {query}"
+        );
+        assert_eq!(
+            offer.to_string(),
+            "Roblox 2.740.931 (versionCode 3170, XAPK, about 234 MiB)"
+        );
+        assert_eq!(
+            offer.release(),
+            Release {
+                version_code: VersionCode(3170),
+                base_sha1: parse_sha1(LATEST_BASE_SHA1).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn a_universal_apk_is_chosen_when_the_xapk_has_no_x86_64_split() {
+        let offer = parse_offer(MIXED_PAGE).unwrap();
+        assert_eq!(offer.version_code, VersionCode(3092));
+        assert_eq!(offer.version_name, "2.738.1397");
+        assert_eq!(offer.packaging, Packaging::Apk);
+        assert_eq!(hex(&offer.base_sha1), UNIVERSAL_APK_SHA1);
+        assert!(offer.size.admits(229_466_269));
+    }
+
+    #[test]
+    fn an_xapk_is_preferred_over_a_universal_apk_of_the_same_release() {
+        let page = MIXED_PAGE.replace(
+            "<code>arm64-v8a, armeabi-v7a</code>",
+            "<code>arm64-v8a, armeabi-v7a, x86_64</code>",
+        );
+        let offer = parse_offer(&page).unwrap();
+        assert_eq!(offer.packaging, Packaging::Xapk);
+        assert_eq!(offer.version_code, VersionCode(3092));
+    }
+
+    #[test]
+    fn pages_without_an_x86_64_build_are_refused() {
+        let page = LATEST_PAGE.replace("armeabi-v7a, x86_64</code>", "armeabi-v7a</code>");
+        let err = parse_offer(&page).unwrap_err();
+        assert!(
+            matches!(&err, ApkComboError::NoX86_64 { offered } if offered == &["arm64-v8a, armeabi-v7a"]),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("no x86_64 build"), "{err}");
+
+        let page = MIXED_PAGE.replace(", x86_64</code>", "</code>");
+        let err = parse_offer(&page).unwrap_err();
+        assert!(
+            matches!(&err, ApkComboError::NoX86_64 { offered } if offered.len() == 1),
+            "each offered ABI list is reported once: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pages_with_an_unexpected_layout_are_refused() {
+        let pages = [
+            "<html><title>Just a moment...</title></html>".to_owned(),
+            String::new(),
+            LATEST_PAGE.replace("</a>", "</span>"),
+            LATEST_PAGE.replace("<code>", "<kbd>"),
+            LATEST_PAGE.replace("234 MB", "big"),
+            LATEST_PAGE.replace("type-xapk", "type-zip"),
+            LATEST_PAGE.replace("(3170)", "3170"),
+            LATEST_PAGE.replace("class=\"vername\"", "class=\"title\""),
+            LATEST_PAGE.replace("https%3A%2F", "https%zz%2F"),
+        ];
+        for page in pages {
+            let err = parse_offer(&page).unwrap_err();
+            assert!(matches!(err, ApkComboError::PageLayout(_)), "{err:?}");
+            assert!(err.to_string().contains("eclipse install"), "{err}");
+        }
+    }
+
+    #[test]
+    fn listed_and_linked_releases_must_agree() {
+        for page in [
+            LATEST_PAGE.replace("(3170)", "(3171)"),
+            LATEST_PAGE.replace("Roblox 2.740.931<", "Roblox 2.740.932<"),
+        ] {
+            let err = parse_offer(&page).unwrap_err();
+            assert!(matches!(err, ApkComboError::Inconsistent { .. }), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn download_links_must_name_a_roblox_release_file_in_apkcombos_bucket() {
+        for page in [
+            LATEST_PAGE.replace("https%3A%2F%2Fapks.", "http%3A%2F%2Fapks."),
+            LATEST_PAGE.replace(".r2.cloudflarestorage.com", ".evil.example"),
+            LATEST_PAGE.replace("%2F%2Fapks.39b7cb94", "%2F%2Fother.39b7cb94"),
+        ] {
+            let err = parse_offer(&page).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ApkComboError::Download(DownloadError::Untrusted { .. })
+                ),
+                "{err:?}"
+            );
+        }
+        for page in [
+            LATEST_PAGE.replace("%2Fcom.roblox.client%2F", "%2Fcom.evil.client%2F"),
+            LATEST_PAGE.replace("3170.4000331c", "3170.zz00331c"),
+            LATEST_PAGE.replace("3170.4000331c", "+3170.4000331c"),
+            LATEST_PAGE.replace(
+                "3170.4000331cf5d800c02fc213cc6a51dc823df6ea7c.apks",
+                "3170.apks",
+            ),
+        ] {
+            let err = parse_offer(&page).unwrap_err();
+            assert!(matches!(err, ApkComboError::UnexpectedLink), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn downloads_are_limited_to_apkcombos_r2_bucket_over_https() {
+        for url in [
+            format!("https://{R2_HOST}/com.roblox.client/2.740.931/3170.x.apks?X-Amz-Expires=1"),
+            format!("https://{}:443/x", R2_HOST.to_ascii_uppercase()),
+        ] {
+            assert!(https::trusted_uri(&url, DOWNLOAD_HOSTS).is_ok(), "{url}");
+        }
+        for url in [
+            format!("http://{R2_HOST}/x"),
+            format!("https://evil.{R2_HOST}/x"),
+            "https://apks.example.r2.cloudflarestorage.com/x".to_owned(),
+            "https://apkcombo.com/r2?u=x".to_owned(),
+        ] {
+            let err = https::trusted_uri(&url, DOWNLOAD_HOSTS).unwrap_err();
+            assert!(matches!(err, DownloadError::Untrusted { .. }), "{url}");
+        }
+    }
+
+    #[test]
+    fn advertised_sizes_are_read_at_their_display_precision() {
+        let size = AdvertisedSize::parse(" 234 MB").unwrap();
+        assert_eq!(
+            size,
+            AdvertisedSize {
+                bytes: 234 * MEBIBYTE,
+                tolerance: MEBIBYTE
+            }
+        );
+        assert!(size.admits(245_807_054));
+        assert!(!size.admits(236 * MEBIBYTE));
+        assert!(!size.admits(232 * MEBIBYTE));
+        assert_eq!(size.download_limit(), 235 * MEBIBYTE);
+
+        assert_eq!(
+            AdvertisedSize::parse("1.25 GB"),
+            Some(AdvertisedSize {
+                bytes: 1280 * MEBIBYTE,
+                tolerance: 1024 * MEBIBYTE / 100
+            })
+        );
+        assert_eq!(
+            AdvertisedSize::parse("850 KB"),
+            Some(AdvertisedSize {
+                bytes: 850 * 1024,
+                tolerance: 1024
+            })
+        );
+        assert_eq!(
+            AdvertisedSize::parse("5 GB").unwrap().download_limit(),
+            MAX_APK_BYTES
+        );
+        for text in [
+            "",
+            "234",
+            "234 TB",
+            "2.3.4 MB",
+            "234. MB",
+            ".5 MB",
+            "-1 MB",
+            "+1 MB",
+            "1.2345 GB",
+            "234 MB extra",
+            "99999999999999999999 GB",
+        ] {
+            assert_eq!(AdvertisedSize::parse(text), None, "{text:?}");
+        }
+    }
+
+    struct FailingBody;
+
+    impl Read for FailingBody {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: RecvBody"))
+        }
+    }
+
+    const SMALL: AdvertisedSize = AdvertisedSize {
+        bytes: 100,
+        tolerance: 10,
+    };
+
+    #[test]
+    fn downloads_are_kept_only_within_the_advertised_size() {
+        let dir = temp_dir("save");
+        let dest = dir.join("download");
+        let body = [7u8; 100];
+
+        save_download(&body[..], Some(100), SMALL, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        save_download(&body[..95], None, SMALL, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), &body[..95]);
+
+        for (length, actual) in [(Some(111), 111), (Some(89), 89), (None, 80)] {
+            let err =
+                save_download(&[0u8; 111][..actual as usize], length, SMALL, &dest).unwrap_err();
+            assert!(
+                matches!(err, ApkComboError::SizeMismatch { actual: got, .. } if got == actual),
+                "{length:?}: {err:?}"
+            );
+            assert!(err.rejects_offer(), "{err:?}");
+        }
+        let err = save_download(&[0u8; 111][..], None, SMALL, &dest).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Download(DownloadError::TooLarge { limit: 110 })
+            ),
+            "{err:?}"
+        );
+        assert!(err.rejects_offer(), "{err:?}");
+        let huge = AdvertisedSize::parse("5 GB").unwrap();
+        let err = save_download(&body[..], Some(huge.bytes), huge, &dest).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Download(DownloadError::TooLarge {
+                    limit: MAX_APK_BYTES
+                })
+            ),
+            "{err:?}"
+        );
+
+        let err = save_download(&body[..95], Some(100), SMALL, &dest).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Download(DownloadError::LengthMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(!err.rejects_offer(), "{err:?}");
+        let err = save_download(FailingBody, None, SMALL, &dest).unwrap_err();
+        assert!(
+            matches!(err, ApkComboError::Download(DownloadError::Interrupted(_))),
+            "{err:?}"
+        );
+        assert!(!err.rejects_offer(), "{err:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sha1_digests_match_the_standard_test_vector_and_parse_from_hex() {
+        let dir = temp_dir("sha1");
+        let path = dir.join("abc");
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            hex(&file_sha1(&path).unwrap()),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            parse_sha1(LATEST_BASE_SHA1).map(|digest| hex(&digest)),
+            Some(LATEST_BASE_SHA1.to_owned())
+        );
+        let too_long = format!("{LATEST_BASE_SHA1}00");
+        for text in ["", "4000331c", &LATEST_BASE_SHA1[1..], &too_long] {
+            assert_eq!(parse_sha1(text), None, "{text}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_a_newer_release_is_downloaded_and_roblox_is_never_downgraded() {
+        let offer = parse_offer(LATEST_PAGE).unwrap();
+        assert_eq!(plan(&offer, None, None, None).unwrap(), Plan::Download);
+        assert_eq!(
+            plan(&offer, Some(&installed(3056)), Some(&installed(3056)), None).unwrap(),
+            Plan::Download
+        );
+        for code in [3170, 3200] {
+            assert_eq!(
+                plan(&offer, Some(&installed(code)), Some(&installed(code)), None).unwrap(),
+                Plan::UpToDate(installed(code))
+            );
+        }
+        assert_eq!(
+            plan(&offer, None, Some(&installed(3170)), None).unwrap(),
+            Plan::Download,
+            "a damaged install of the offered release is repaired"
+        );
+        let err = plan(&offer, None, Some(&installed(3200)), None).unwrap_err();
+        assert!(matches!(err, ApkComboError::Older { .. }), "{err:?}");
+        assert!(err.to_string().contains("never installs an older"), "{err}");
+    }
+
+    #[test]
+    fn a_rejected_release_is_skipped_but_an_installed_or_other_one_is_not() {
+        let offer = parse_offer(LATEST_PAGE).unwrap();
+        let rejected = Some(offer.release());
+        assert_eq!(
+            plan(
+                &offer,
+                Some(&installed(3056)),
+                Some(&installed(3056)),
+                rejected
+            )
+            .unwrap(),
+            Plan::Skip
+        );
+        assert_eq!(plan(&offer, None, None, rejected).unwrap(), Plan::Skip);
+        assert_eq!(
+            plan(
+                &offer,
+                Some(&installed(3170)),
+                Some(&installed(3170)),
+                rejected
+            )
+            .unwrap(),
+            Plan::UpToDate(installed(3170)),
+            "an installed release is up to date whatever was rejected"
+        );
+        let mut other_file = offer.release();
+        other_file.base_sha1[0] ^= 1;
+        let mut older = offer.release();
+        older.version_code = VersionCode(3120);
+        for other in [other_file, older] {
+            assert_eq!(
+                plan(&offer, None, None, Some(other)).unwrap(),
+                Plan::Download
+            );
+        }
+    }
+
+    fn small_offer() -> Offer {
+        Offer {
+            size: SMALL,
+            ..parse_offer(LATEST_PAGE).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_rejected_release_is_not_downloaded_again_by_the_next_scheduled_check() {
+        let dir = temp_dir("rejected");
+        let store = Store::at(dir.join("store"));
+        let offer = small_offer();
+
+        let err = update_with(&offer, &store, None, None, |_| {
+            Ok((&[0u8; 150][..], Some(150)))
+        })
+        .err()
+        .expect("a download of another size is rejected");
+        assert!(
+            matches!(err, ApkComboError::SizeMismatch { actual: 150, .. }),
+            "{err:?}"
+        );
+        let check = store
+            .last_check()
+            .unwrap()
+            .expect("the rejection completes the check");
+        assert_eq!(check.rejected, Some(offer.release()));
+
+        let mut opened = false;
+        let err = update_with(&offer, &store, None, check.rejected, |_| {
+            opened = true;
+            Ok((&[][..], None))
+        })
+        .err()
+        .expect("the rejected release is not installed");
+        assert!(!opened, "the rejected release is not downloaded again");
+        assert!(
+            matches!(err, ApkComboError::RejectedBefore { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("eclipse update"), "{err}");
+        let skipped = store.last_check().unwrap().unwrap();
+        assert_eq!(skipped.rejected, Some(offer.release()));
+        assert!(skipped.at >= check.at, "skipping completes the check too");
+
+        let mut newer = small_offer();
+        newer.version_code = VersionCode(3171);
+        for (offer, rejected) in [(&newer, check.rejected), (&offer, None)] {
+            let mut opened = false;
+            let err = update_with(offer, &store, None, rejected, |_| {
+                opened = true;
+                Ok((&[0u8; 150][..], Some(150)))
+            })
+            .err()
+            .expect("the download is rejected");
+            assert!(
+                opened,
+                "a newer release, or an explicit update, downloads again: {err:?}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_rejection_that_cannot_be_recorded_still_says_why_it_was_rejected() {
+        let dir = temp_dir("unrecorded");
+        let root = dir.join("store");
+        fs::create_dir_all(root.join("last-update-check.json").join("taken")).unwrap();
+        let store = Store::at(root);
+
+        let err = update_with(&small_offer(), &store, None, None, |_| {
+            Ok((&[0u8; 150][..], Some(150)))
+        })
+        .err()
+        .expect("a download of another size is rejected");
+        let ApkComboError::NotRemembered { rejection, source } = &err else {
+            panic!("the failed record is reported: {err:?}");
+        };
+        assert!(
+            matches!(**rejection, ApkComboError::SizeMismatch { actual: 150, .. }),
+            "{err:?}"
+        );
+        assert!(matches!(source, StoreError::Io { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("has 150 bytes") && text.contains("could not record the rejection"),
+            "{text}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_transfer_is_retried_at_the_next_check() {
+        let dir = temp_dir("transfer");
+        let store = Store::at(dir.join("store"));
+        let offer = small_offer();
+
+        let err = update_with(&offer, &store, None, None, |_| Ok((FailingBody, None)))
+            .err()
+            .expect("an interrupted download fails");
+        assert!(
+            matches!(err, ApkComboError::Download(DownloadError::Interrupted(_))),
+            "{err:?}"
+        );
+        let err = update_with(&offer, &store, None, None, |_| {
+            Ok((&[0u8; 95][..], Some(100)))
+        })
+        .err()
+        .expect("a short download fails");
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Download(DownloadError::LengthMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        let err = update_with(&offer, &store, None, None, |_| -> Result<(&[u8], _), _> {
+            Err(ApkComboError::Download(DownloadError::Status(403)))
+        })
+        .err()
+        .expect("a refused download fails");
+        assert!(
+            matches!(err, ApkComboError::Download(DownloadError::Status(403))),
+            "{err:?}"
+        );
+        assert_eq!(
+            store.last_check().unwrap(),
+            None,
+            "nothing is recorded, so the next launch tries again"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_failures_after_verification_are_not_called_discarded() {
+        let prune = store_failure(StoreError::Prune {
+            installed: installed(3170),
+            path: PathBuf::from("/store/3056"),
+            source: io::Error::other("busy"),
+        });
+        assert!(matches!(prune, ApkComboError::Store(_)), "{prune:?}");
+        assert!(!prune.to_string().contains("discarded"), "{prune}");
+        assert!(!prune.rejects_offer());
+
+        let rejected = store_failure(StoreError::UnexpectedVersion {
+            expected: VersionCode(3170),
+            found: VersionCode(3120),
+        });
+        assert!(
+            matches!(rejected, ApkComboError::Rejected(_)),
+            "{rejected:?}"
+        );
+        assert!(rejected.to_string().contains("discarded"), "{rejected}");
+        assert!(rejected.rejects_offer());
+    }
+
+    fn write_bundle(path: &Path, members: &[(&str, &Path)]) {
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut writer = ZipWriter::new(File::create(path).unwrap());
+        writer.start_file("manifest.json", stored).unwrap();
+        writer
+            .write_all(b"{\"package_name\":\"com.roblox.client\"}")
+            .unwrap();
+        for (name, source) in members {
+            writer.start_file(*name, stored).unwrap();
+            io::copy(&mut File::open(source).unwrap(), &mut writer).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn local_offer(set: &ApkSet, packaging: Packaging, download: &Path, base: &Path) -> Offer {
+        let version_name = set.version_name().expect("Roblox names its versions");
+        let base_sha1 = file_sha1(base).unwrap();
+        let url = format!(
+            "https://{R2_HOST}/{ROBLOX_PACKAGE}/{version_name}/{}.{}.apks",
+            set.version_code(),
+            hex(&base_sha1)
+        );
+        Offer {
+            version_name: version_name.to_owned(),
+            version_code: set.version_code(),
+            packaging,
+            size: AdvertisedSize {
+                bytes: fs::metadata(download).unwrap().len(),
+                tolerance: MEBIBYTE,
+            },
+            base_sha1,
+            url: https::trusted_uri(&url, DOWNLOAD_HOSTS).unwrap(),
+        }
+    }
+
+    fn install_file(
+        offer: &Offer,
+        store: &Store,
+        download: &Path,
+    ) -> Result<ApkSet, ApkComboError> {
+        let length = fs::metadata(download).unwrap().len();
+        install(
+            offer,
+            store.begin().unwrap(),
+            File::open(download).unwrap(),
+            Some(length),
+        )
+    }
+
+    fn store_entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name != "install.lock")
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn official_release_installs_from_an_apkcombo_bundle_and_nothing_else_does() {
+        let Some(paths) = ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
+        else {
+            eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to install the official Roblox APK set");
+            return;
+        };
+        let Some(split) = paths.native_split.clone() else {
+            eprintln!("SKIP: ECLIPSE_ROBLOX_APK is a single APK, not a split set");
+            return;
+        };
+        let official = ApkSet::open(paths.clone()).expect("the official set verifies");
+        let dir = temp_dir("official");
+        let root = dir.join("store");
+        let store = Store::at(root.clone());
+        let bundle = dir.join("Roblox.xapk");
+        write_bundle(
+            &bundle,
+            &[
+                ("com.roblox.client.apk", &paths.base),
+                ("config.x86_64.apk", &split),
+            ],
+        );
+        let offer = local_offer(&official, Packaging::Xapk, &bundle, &paths.base);
+
+        let mut wrong_hash = offer.clone();
+        wrong_hash.base_sha1[0] ^= 1;
+        let err = install_file(&wrong_hash, &store, &bundle)
+            .err()
+            .expect("a base APK with another SHA-1 is refused");
+        assert!(matches!(err, ApkComboError::BaseHashMismatch), "{err:?}");
+
+        let mut wrong_version = offer.clone();
+        wrong_version.version_code = VersionCode(offer.version_code.0 + 1);
+        let err = install_file(&wrong_version, &store, &bundle)
+            .err()
+            .expect("a release with another versionCode is refused");
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Rejected(StoreError::UnexpectedVersion { .. })
+            ),
+            "{err:?}"
+        );
+
+        let tampered_base = dir.join("tampered-base.apk");
+        let mut bytes = fs::read(&paths.base).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 1;
+        fs::write(&tampered_base, bytes).unwrap();
+        let tampered = dir.join("tampered.xapk");
+        write_bundle(
+            &tampered,
+            &[
+                ("com.roblox.client.apk", &tampered_base),
+                ("config.x86_64.apk", &split),
+            ],
+        );
+        let tampered_offer = local_offer(&official, Packaging::Xapk, &tampered, &tampered_base);
+        let err = install_file(&tampered_offer, &store, &tampered)
+            .err()
+            .expect("a modified base APK is refused");
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Rejected(StoreError::Set(ApkSetError::Signature { .. }))
+            ),
+            "a matching SHA-1 never stands in for Roblox's signature: {err:?}"
+        );
+        assert!(err.to_string().contains("discarded"), "{err}");
+        assert!(err.rejects_offer());
+
+        let base_only = local_offer(&official, Packaging::Apk, &paths.base, &paths.base);
+        let err = install_file(&base_only, &store, &paths.base)
+            .err()
+            .expect("a base APK without x86_64 code is refused");
+        assert!(
+            matches!(err, ApkComboError::Rejected(StoreError::NoNativeSplitGiven)),
+            "{err:?}"
+        );
+
+        assert_eq!(store.current().unwrap(), None);
+        assert!(
+            store_entries(&root).is_empty(),
+            "{:?}",
+            store_entries(&root)
+        );
+
+        let set = install_file(&offer, &store, &bundle).expect("the official bundle installs");
+        let version_dir = root.join(offer.version_code.to_string());
+        assert_eq!(set.version_code(), official.version_code());
+        assert_eq!(set.base_path(), version_dir.join(BASE_APK));
+        assert_eq!(set.native_libs_path(), version_dir.join(NATIVE_SPLIT_APK));
+        assert_eq!(
+            store.current().unwrap(),
+            Some(InstalledVersion::from(&official))
+        );
+        assert_eq!(store_entries(&version_dir), [BASE_APK, NATIVE_SPLIT_APK]);
+        assert_eq!(
+            plan(
+                &offer,
+                Some(&InstalledVersion::from(&set)),
+                store.current().unwrap().as_ref(),
+                None
+            )
+            .unwrap(),
+            Plan::UpToDate(InstalledVersion::from(&official))
+        );
+
+        let outcome = update_with(
+            &offer,
+            &store,
+            Some(&set),
+            None,
+            |_| -> Result<(&[u8], _), _> {
+                panic!("an up-to-date install is not downloaded again")
+            },
+        )
+        .expect("the installed release is up to date");
+        assert!(
+            matches!(&outcome, UpdateOutcome::UpToDate { installed } if installed.version_code == offer.version_code)
+        );
+        drop(set);
+
+        let outcome = update_with(&offer, &store, None, None, |_| -> Result<(&[u8], _), _> {
+            panic!("a release another launch installed meanwhile is not downloaded again")
+        })
+        .expect("the release another launch installed is used");
+        let UpdateOutcome::Updated {
+            previous: None,
+            set,
+        } = outcome
+        else {
+            panic!("the release installed meanwhile is handed back as the update");
+        };
+        assert_eq!(set.version_code(), offer.version_code);
+        assert_eq!(set.base_path(), version_dir.join(BASE_APK));
+        drop(set);
+        fs::remove_dir_all(&dir).ok();
+    }
+}

@@ -17,14 +17,17 @@ USAGE:
 
 COMMANDS:
     run [PATH]  Verify the Roblox client, boot the ART VM (Roblox on the classpath) and open
-                the window. With no PATH, runs the installed client; when signed in to Google
-                Play, it first checks for a Roblox update (at most every 6 hours). PATH may be
-                an APK file or a directory holding base.apk and split_config.x86_64.apk.
+                the window. With no PATH, runs the installed client: the first run downloads
+                Roblox, and later runs check for a Roblox update at most every 6 hours. PATH
+                may be an APK file or a directory holding base.apk and split_config.x86_64.apk.
     install <PATH>...
                 Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
                 a directory holding them, or an .apks/.xapk/.apkm bundle.
-    play-login  Sign in to Google Play with your own Google account (once).
-    update      Download and install the newest Roblox client from Google Play.
+    update [--play]
+                Download and install the newest Roblox client from APKCombo, without any
+                account. With --play, download it from Google Play with the account saved by
+                play-login instead.
+    play-login  Sign in to Google Play with your own Google account (once, for update --play).
     install-url-handler
                 Register Eclipse for browser Play clicks (they run the installed client).
     config      Show effective configuration and its path
@@ -32,8 +35,9 @@ COMMANDS:
     --version   Show version
 
 NOTE: Eclipse runs only the official, unmodified Roblox client signed by Roblox Corporation.
-    It never hosts, mirrors or modifies it; `eclipse update` downloads it from Google Play
-    with your own account.
+    It never hosts or modifies it. `eclipse update` downloads Roblox's own release files from
+    APKCombo (or Google Play with --play) and installs them only when Roblox's signature
+    verifies; anything else is discarded.
 
 STATUS:
     `run` parses the manifest, prints the ART boot plan, boots the vendored ART VM with
@@ -368,8 +372,8 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
     Ok(())
 }
 
-const NOT_INSTALLED: &str = "Roblox is not installed; sign in with `eclipse play-login` and run \
-     `eclipse update`, or install the APKs with `eclipse install <PATH>`";
+const NOT_INSTALLED: &str = "Roblox is not installed; run `eclipse update` to download it, or \
+     install the APKs with `eclipse install <PATH>`";
 
 const VERIFYING_SIGNATURE: &str = "# Verifying the Roblox client's signature…";
 
@@ -422,7 +426,7 @@ fn play_login_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
         credentials.email,
         account.credentials_path().display()
     );
-    println!("run `eclipse update` to download Roblox");
+    println!("run `eclipse update --play` to download Roblox from Google Play");
     Ok(())
 }
 
@@ -445,29 +449,65 @@ fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(line.trim().to_owned())
 }
 
-fn update_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if !arguments.is_empty() {
-        return Err("usage: eclipse update".into());
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateSource {
+    ApkCombo,
+    GooglePlay,
+}
+
+fn parse_update_source(arguments: &[String]) -> Result<UpdateSource, String> {
+    match arguments {
+        [] => Ok(UpdateSource::ApkCombo),
+        [flag] if flag == "--play" => Ok(UpdateSource::GooglePlay),
+        _ => Err("usage: eclipse update [--play]".to_string()),
     }
-    let account = eclipse::apk::play::Account::open()?;
-    let credentials = account
-        .credentials()?
-        .ok_or("not signed in to Google Play; run `eclipse play-login` first")?;
+}
+
+fn update_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let source = parse_update_source(arguments)?;
     let store = eclipse::apk::store::Store::open()?;
     let current = store.usable_current()?;
-    update_from_play(&credentials, &store, current.as_ref()).map(drop)
+    match source {
+        UpdateSource::ApkCombo => update_from_apkcombo(&store, current.as_ref(), None),
+        UpdateSource::GooglePlay => update_from_play(&store, current.as_ref()),
+    }
+    .map(drop)
+}
+
+fn update_from_apkcombo(
+    store: &eclipse::apk::store::Store,
+    current: Option<&eclipse::apk::ApkSet>,
+    rejected: Option<eclipse::apk::store::Release>,
+) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
+    println!("# Checking APKCombo for the newest Roblox client…");
+    let offer = eclipse::apk::apkcombo::newest_offer()?;
+    println!("# APKCombo offers {offer}");
+    let outcome = eclipse::apk::apkcombo::update(&offer, store, current, rejected)?;
+    finish_update(store, outcome)
 }
 
 fn update_from_play(
-    credentials: &eclipse::apk::play::Credentials,
     store: &eclipse::apk::store::Store,
     current: Option<&eclipse::apk::ApkSet>,
 ) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
-    use eclipse::apk::store::{InstalledVersion, UpdateOutcome};
-
+    let credentials = eclipse::apk::play::Account::open()?
+        .credentials()?
+        .ok_or("not signed in to Google Play; run `eclipse play-login` first")?;
     println!("# Checking Google Play for the newest Roblox client…");
-    let outcome = eclipse::apk::play::update(credentials, store, current)?;
-    store.record_check(std::time::SystemTime::now())?;
+    let outcome = eclipse::apk::play::update(&credentials, store, current)?;
+    finish_update(store, outcome)
+}
+
+fn finish_update(
+    store: &eclipse::apk::store::Store,
+    outcome: eclipse::apk::store::UpdateOutcome,
+) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
+    use eclipse::apk::store::{InstalledVersion, UpdateCheck, UpdateOutcome};
+
+    store.record_check(&UpdateCheck {
+        at: std::time::SystemTime::now(),
+        rejected: None,
+    })?;
     match outcome {
         UpdateOutcome::UpToDate { installed } => {
             println!("Roblox {installed} is up to date");
@@ -497,14 +537,16 @@ fn update_if_due(
     store: &eclipse::apk::store::Store,
     current: Option<&eclipse::apk::ApkSet>,
 ) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
-    let account = eclipse::apk::play::Account::open()?;
-    let Some(credentials) = account.credentials()? else {
-        return Ok(None);
-    };
-    if !eclipse::apk::store::update_due(store.last_check()?, std::time::SystemTime::now()) {
+    let last_check = store.last_check()?;
+    let due = eclipse::apk::store::update_due(
+        current.map(eclipse::apk::ApkSet::version_code),
+        last_check.map(|check| check.at),
+        std::time::SystemTime::now(),
+    );
+    if !due {
         return Ok(None);
     }
-    update_from_play(&credentials, store, current)
+    update_from_apkcombo(store, current, last_check.and_then(|check| check.rejected))
 }
 
 fn installed_apk_set(
@@ -536,20 +578,28 @@ fn installed_or_updated_set(
     };
     let verified = current.as_ref().ok().and_then(Option::as_ref);
     let verified_version = verified.map(eclipse::apk::ApkSet::version_code);
-    let set = match update(verified) {
-        Ok(Some(updated)) => Some(updated),
-        Ok(None) => current?,
-        Err(error) => {
-            eprintln!("# WARNING: could not update Roblox from Google Play: {error}");
-            let recorded = store.current()?.map(|installed| installed.version_code);
-            if recorded == verified_version {
-                current?
-            } else {
-                store.verified_current()?
-            }
-        }
+    let error = match update(verified) {
+        Ok(Some(updated)) => return Ok(updated),
+        Ok(None) => return Ok(current?.ok_or(NOT_INSTALLED)?),
+        Err(error) => error,
     };
-    Ok(set.ok_or(NOT_INSTALLED)?)
+    let recorded = store.current()?.map(|installed| installed.version_code);
+    let fallback = if recorded == verified_version {
+        current
+    } else {
+        store.verified_current()
+    };
+    match fallback {
+        Ok(Some(installed)) => {
+            eprintln!("# WARNING: could not update Roblox: {error}");
+            Ok(installed)
+        }
+        Ok(None) => Err(format!("could not download Roblox: {error}").into()),
+        Err(install) if install.is_unusable_install() => {
+            Err(format!("{install}, and downloading Roblox failed: {error}").into())
+        }
+        Err(install) => Err(install.into()),
+    }
 }
 
 fn install_url_handler_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1160,8 +1210,8 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 mod tests {
     use super::{
         finish_android_process, installed_or_updated_set, normalize_browser_launch,
-        parse_libroblox_init_lib_dir, parse_run_path, remove_other_native_lib_versions,
-        url_handler_message,
+        parse_libroblox_init_lib_dir, parse_run_path, parse_update_source,
+        remove_other_native_lib_versions, url_handler_message, UpdateSource,
     };
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
@@ -1179,6 +1229,24 @@ mod tests {
             Some(std::path::Path::new("roblox.apk"))
         );
         assert!(parse_run_path(&[apk, "roblox://placeId=1".into()]).is_err());
+    }
+
+    #[test]
+    fn update_uses_apkcombo_unless_google_play_is_asked_for() {
+        assert_eq!(parse_update_source(&[]).unwrap(), UpdateSource::ApkCombo);
+        assert_eq!(
+            parse_update_source(&["--play".to_string()]).unwrap(),
+            UpdateSource::GooglePlay
+        );
+        for arguments in [
+            vec!["play".to_string()],
+            vec!["--play".to_string(), "--play".to_string()],
+        ] {
+            assert_eq!(
+                parse_update_source(&arguments).unwrap_err(),
+                "usage: eclipse update [--play]"
+            );
+        }
     }
 
     #[test]
@@ -1275,6 +1343,43 @@ mod tests {
                 Some(eclipse::apk::store::StoreError::Io { .. })
             ),
             "{error}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_failed_first_download_is_reported_as_a_failed_download() {
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-failed-first-download-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let store = eclipse::apk::store::Store::at(root.clone());
+
+        let error = installed_or_updated_set(&store, |current| {
+            assert!(current.is_none(), "nothing is installed yet");
+            Err("cannot load APKCombo's Roblox download page: timed out".into())
+        })
+        .err()
+        .expect("nothing can be launched");
+        assert_eq!(
+            error.to_string(),
+            "could not download Roblox: cannot load APKCombo's Roblox download page: timed out"
+        );
+
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("current.json"), b"{\"version_code\": 3056}").unwrap();
+        let error = installed_or_updated_set(&store, |current| {
+            assert!(current.is_none(), "the recorded install is missing");
+            Err("APKCombo is unreachable".into())
+        })
+        .err()
+        .expect("a missing install cannot be launched");
+        let text = error.to_string();
+        assert!(
+            text.contains("is missing")
+                && text.ends_with("downloading Roblox failed: APKCombo is unreachable"),
+            "{text}"
         );
         std::fs::remove_dir_all(&root).ok();
     }

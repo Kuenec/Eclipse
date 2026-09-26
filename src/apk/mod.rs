@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+pub mod apkcombo;
 pub mod arsc;
 pub mod axml;
 pub mod cache;
 mod file_reader;
+pub mod https;
 pub mod play;
 pub mod signature;
 pub mod store;
