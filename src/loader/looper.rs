@@ -11,6 +11,38 @@ pub const ALOOPER_POLL_ERROR: i32 = -4;
 
 pub const ALOOPER_EVENT_INPUT: i32 = 1;
 
+pub const ALOOPER_EVENT_OUTPUT: i32 = 2;
+
+pub const ALOOPER_EVENT_ERROR: i32 = 4;
+
+pub const ALOOPER_EVENT_HANGUP: i32 = 8;
+
+pub const ALOOPER_EVENT_INVALID: i32 = 16;
+
+fn poll_request(events: i32) -> libc::c_short {
+    let mut request = 0;
+    if events & ALOOPER_EVENT_INPUT != 0 {
+        request |= libc::POLLIN;
+    }
+    if events & ALOOPER_EVENT_OUTPUT != 0 {
+        request |= libc::POLLOUT;
+    }
+    request
+}
+
+fn alooper_events(revents: libc::c_short) -> i32 {
+    [
+        (libc::POLLIN, ALOOPER_EVENT_INPUT),
+        (libc::POLLOUT, ALOOPER_EVENT_OUTPUT),
+        (libc::POLLERR, ALOOPER_EVENT_ERROR),
+        (libc::POLLHUP, ALOOPER_EVENT_HANGUP),
+        (libc::POLLNVAL, ALOOPER_EVENT_INVALID),
+    ]
+    .into_iter()
+    .filter(|(poll_bit, _)| revents & poll_bit != 0)
+    .fold(0, |events, (_, alooper_bit)| events | alooper_bit)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PollFd {
     fd: i32,
@@ -107,8 +139,7 @@ impl PollSnapshot {
         for p in &self.fds {
             pfds.push(libc::pollfd {
                 fd: p.fd,
-
-                events: (p.events & i32::from(u16::MAX)) as libc::c_short,
+                events: poll_request(p.events),
                 revents: 0,
             });
         }
@@ -142,7 +173,7 @@ impl PollSnapshot {
                 return PollResult::Fd {
                     ident: p.ident,
                     fd: p.fd,
-                    events: i32::from(slot.revents),
+                    events: alooper_events(slot.revents),
                 };
             }
         }
@@ -306,6 +337,42 @@ mod tests {
         pipe.signal();
 
         assert_eq!(looper.snapshot().poll_once(10), PollResult::Timeout);
+    }
+
+    fn poll_events(looper: &Looper) -> i32 {
+        match looper.snapshot().poll_once(100) {
+            PollResult::Fd { events, .. } => events,
+            other => panic!("expected Fd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_registration_reports_writability() {
+        let mut looper = Looper::new().expect("eventfd");
+        let pipe = TestPipe::new();
+        looper.add_fd(pipe.write.as_raw_fd(), 4, ALOOPER_EVENT_OUTPUT);
+        assert_eq!(poll_events(&looper), ALOOPER_EVENT_OUTPUT);
+    }
+
+    #[test]
+    fn writer_close_reports_hangup() {
+        let mut looper = Looper::new().expect("eventfd");
+        let TestPipe { read, write } = TestPipe::new();
+        looper.add_fd(read.as_raw_fd(), 5, ALOOPER_EVENT_INPUT);
+        drop(write);
+        let events = poll_events(&looper);
+        assert!(events & ALOOPER_EVENT_HANGUP != 0, "events {events:#x}");
+        assert_eq!(events & ALOOPER_EVENT_INVALID, 0, "events {events:#x}");
+    }
+
+    #[test]
+    fn reader_close_reports_error() {
+        let mut looper = Looper::new().expect("eventfd");
+        let TestPipe { read, write } = TestPipe::new();
+        looper.add_fd(write.as_raw_fd(), 6, ALOOPER_EVENT_OUTPUT);
+        drop(read);
+        let events = poll_events(&looper);
+        assert!(events & ALOOPER_EVENT_ERROR != 0, "events {events:#x}");
     }
 
     #[test]
