@@ -353,6 +353,47 @@ fn host_stream_config_honours_the_source_rate_and_channels() {
 }
 
 #[test]
+fn host_stream_config_opens_i32_and_i24_only_devices() {
+    let stereo_48k = PcmFormat {
+        channels: 2,
+        sample_rate: 48_000,
+        bits_per_sample: 16,
+    };
+    for format in [cpal::SampleFormat::I32, cpal::SampleFormat::I24] {
+        let only = cpal::SupportedStreamConfigRange::new(
+            2,
+            8_000,
+            96_000,
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        );
+        let config = host_stream_config(stereo_48k, [only].into_iter()).unwrap();
+        assert_eq!(config.sample_format(), format);
+        assert_eq!((config.channels(), config.sample_rate()), (2, 48_000));
+    }
+}
+
+#[test]
+fn render_converts_the_ring_to_i32_and_i24_device_samples() {
+    let ring = Arc::new(Mutex::new(PcmRing::new(MONO_16, 2)));
+    {
+        let mut guard = ring.lock().unwrap();
+        guard.play_state = SL_PLAYSTATE_PLAYING;
+        guard.enqueue(&[0x00, 0x40, 0x00, 0xC0]);
+        guard.enqueue(&[0x00, 0x40, 0x00, 0xC0]);
+    }
+    let mut renderer = RingRenderer::new(ring);
+
+    let mut wide = [9_i32; 2];
+    renderer.render(&mut wide);
+    assert_eq!(wide, [1 << 30, -(1 << 30)]);
+
+    let mut packed = [<cpal::I24 as cpal::Sample>::EQUILIBRIUM; 2];
+    renderer.render(&mut packed);
+    assert_eq!(packed.map(|sample| sample.inner()), [1 << 22, -(1 << 22)]);
+}
+
+#[test]
 fn enqueue_respects_the_queue_depth_and_recycles_drained_buffers() {
     let mut ring = PcmRing::new(MONO_16, 2);
     let pcm = [0u8, 0, 0, 0x40, 0, 0xC0];

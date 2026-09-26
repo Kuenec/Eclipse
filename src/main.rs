@@ -938,7 +938,7 @@ fn run_webview_test() -> Result<WebViewTestReport, Box<dyn std::error::Error>> {
 
     let ua = eval_and_wait("navigator.userAgent")
         .ok_or("evaluateJavascript(navigator.userAgent) produced no result within 15 s")?;
-    if !(ua.contains("Eclipse-WebView") && ua.contains("Chrome/149"))
+    if !(ua.contains("Eclipse-WebView") && ua.contains("Chrome/152"))
         || ua.contains("GDPR VIOLATION")
     {
         return Err(

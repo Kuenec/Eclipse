@@ -292,8 +292,11 @@ impl Apk {
             }
             Err(e) => return Err(ApkError::Zip(e)),
         };
+        let data_start = entry
+            .data_start()
+            .ok_or_else(|| ApkError::EntryOffsetUnknown(name.to_owned()))?;
         Ok(EntrySpan {
-            data_start: entry.data_start(),
+            data_start,
             uncompressed_size: entry.size(),
             stored: entry.compression() == CompressionMethod::Stored,
         })
@@ -519,6 +522,8 @@ pub enum ApkError {
 
     EntryMissing(String),
 
+    EntryOffsetUnknown(String),
+
     EngineMissing,
 }
 
@@ -529,6 +534,9 @@ impl fmt::Display for ApkError {
             Self::Zip(e) => write!(f, "APK zip error: {e}"),
             Self::Axml(e) => write!(f, "AndroidManifest.xml parse error: {e}"),
             Self::EntryMissing(name) => write!(f, "APK is missing required entry: {name}"),
+            Self::EntryOffsetUnknown(name) => {
+                write!(f, "APK entry {name} has no resolved data offset")
+            }
             Self::EngineMissing => {
                 write!(
                     f,
@@ -545,7 +553,7 @@ impl std::error::Error for ApkError {
             Self::Io(e) => Some(e),
             Self::Zip(e) => Some(e),
             Self::Axml(e) => Some(e),
-            Self::EntryMissing(_) | Self::EngineMissing => None,
+            Self::EntryMissing(_) | Self::EntryOffsetUnknown(_) | Self::EngineMissing => None,
         }
     }
 }

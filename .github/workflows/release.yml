@@ -54,7 +54,7 @@ jobs:
             crates/eclipse-webview -> target
 
       - name: Install pinned CEF exporter
-        run: cargo install export-cef-dir --version 149.3.0 --locked
+        run: cargo install export-cef-dir --version 152.2.0 --locked
 
       - name: Build and verify the complete CEF payload
         run: tools/webview-dist/package-webview.sh

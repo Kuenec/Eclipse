@@ -1497,9 +1497,11 @@ fn start_host_stream(
     let err_fn = |e| tracing::warn!(target: "eclipse::audio", "cpal output stream error: {e}");
 
     let stream = match sample_format {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, ring, err_fn),
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, ring, err_fn),
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, ring, err_fn),
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, config, ring, err_fn),
+        cpal::SampleFormat::I32 => build_stream::<i32>(&device, config, ring, err_fn),
+        cpal::SampleFormat::I24 => build_stream::<cpal::I24>(&device, config, ring, err_fn),
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, config, ring, err_fn),
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, config, ring, err_fn),
         _ => return Err(AudioHostError::UnsupportedSampleFormat),
     }
     .map_err(|_| AudioHostError::BuildFailed)?;
@@ -1517,7 +1519,9 @@ fn host_stream_config(
         .filter_map(|range| range.try_with_sample_rate(format.sample_rate))
         .filter_map(|config| {
             let rank = match config.sample_format() {
-                cpal::SampleFormat::F32 => 3,
+                cpal::SampleFormat::F32 => 5,
+                cpal::SampleFormat::I32 => 4,
+                cpal::SampleFormat::I24 => 3,
                 cpal::SampleFormat::I16 => 2,
                 cpal::SampleFormat::U16 => 1,
                 _ => return None,
@@ -1574,10 +1578,10 @@ impl RingRenderer {
 
 fn build_stream<T>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
     ring: Arc<Mutex<PcmRing>>,
-    err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+    err_fn: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {

@@ -1017,7 +1017,7 @@ mod tests {
             sources.join("locked.apks"),
             zip_of(
                 &[(BASE_APK, &base)],
-                stored().with_deprecated_encryption(b"secret"),
+                stored().with_deprecated_encryption(b"secret").unwrap(),
             ),
         )
         .unwrap();

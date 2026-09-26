@@ -51,7 +51,7 @@ fn detached_stream_with(
                 channels: 2,
                 sample_rate: 48_000,
                 app: SampleFormat::Float,
-                device: SampleFormat::Float,
+                device: DeviceFormat::Float,
             },
             host: None,
         })
@@ -160,7 +160,7 @@ fn renderer<A: cpal::SizedSample>(
             channels: 2,
             sample_rate: 48_000,
             app: SampleFormat::I16,
-            device: SampleFormat::Float,
+            device: DeviceFormat::Float,
         },
     )
 }
@@ -195,7 +195,7 @@ fn unspecified_format_reports_the_device_default_rate_channels_and_format() {
             channels: 2,
             sample_rate: 48_000,
             app: SampleFormat::Float,
-            device: SampleFormat::Float,
+            device: DeviceFormat::Float,
         })
     );
 }
@@ -213,7 +213,7 @@ fn requested_i16_is_honoured_natively_when_the_device_supports_it() {
     .unwrap();
     assert_eq!(
         (format.app, format.device),
-        (SampleFormat::I16, SampleFormat::I16)
+        (SampleFormat::I16, DeviceFormat::I16)
     );
     assert_eq!((format.channels, format.sample_rate), (2, 44_100));
 }
@@ -233,7 +233,7 @@ fn requested_format_is_converted_when_the_device_lacks_it() {
     );
     assert_eq!(
         format.device,
-        SampleFormat::Float,
+        DeviceFormat::Float,
         "the device gets what it supports"
     );
 }
@@ -252,13 +252,44 @@ fn i16_only_device_defaults_the_app_to_i16() {
             channels: 1,
             sample_rate: 22_050,
             app: SampleFormat::I16,
-            device: SampleFormat::I16,
+            device: DeviceFormat::I16,
         }
     );
 }
 
 #[test]
-fn device_without_i16_or_float_at_its_default_config_is_unavailable() {
+fn i32_default_device_gets_float_app_samples_at_full_precision() {
+    let format = negotiate_format(
+        None,
+        &device_default(2, 48_000, cpal::SampleFormat::I32),
+        [
+            range(2, cpal::SampleFormat::I32),
+            range(2, cpal::SampleFormat::I16),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        (format.app, format.device),
+        (SampleFormat::Float, DeviceFormat::I32)
+    );
+}
+
+#[test]
+fn i24_only_device_converts_the_requested_app_format() {
+    let format = negotiate_format(
+        Some(SampleFormat::I16),
+        &device_default(2, 48_000, cpal::SampleFormat::I24),
+        [range(2, cpal::SampleFormat::I24)],
+    )
+    .unwrap();
+    assert_eq!(
+        (format.app, format.device),
+        (SampleFormat::I16, DeviceFormat::I24)
+    );
+}
+
+#[test]
+fn device_without_a_convertible_format_at_its_default_config_is_unavailable() {
     let at_other_rate = cpal::SupportedStreamConfigRange::new(
         2,
         8_000,
@@ -269,8 +300,8 @@ fn device_without_i16_or_float_at_its_default_config_is_unavailable() {
     assert_eq!(
         negotiate_format(
             None,
-            &device_default(2, 48_000, cpal::SampleFormat::I32),
-            [range(2, cpal::SampleFormat::I32), at_other_rate],
+            &device_default(2, 48_000, cpal::SampleFormat::U8),
+            [range(2, cpal::SampleFormat::U8), at_other_rate],
         ),
         Err(AAUDIO_ERROR_UNAVAILABLE)
     );
@@ -703,13 +734,17 @@ fn host_errors_count_xruns_and_disconnect_once() {
         stream: 0x10,
     };
 
-    reporter.report(cpal::StreamError::BufferUnderrun);
-    reporter.report(cpal::StreamError::BufferUnderrun);
+    reporter.report(cpal::ErrorKind::Xrun.into());
+    reporter.report(cpal::ErrorKind::Xrun.into());
+    reporter.report(cpal::Error::with_message(
+        cpal::ErrorKind::BackendError,
+        "snd_pcm_recover failed",
+    ));
     assert_eq!(shared.xrun_count.load(Ordering::Relaxed), 2);
     assert_eq!(shared.state.load(), StreamState::Started);
 
-    reporter.report(cpal::StreamError::DeviceNotAvailable);
-    reporter.report(cpal::StreamError::StreamInvalidated);
+    reporter.report(cpal::ErrorKind::DeviceNotAvailable.into());
+    reporter.report(cpal::ErrorKind::StreamInvalidated.into());
     assert_eq!(shared.state.load(), StreamState::Disconnected);
     assert_eq!(*probe.errors.lock().unwrap(), [AAUDIO_ERROR_DISCONNECTED]);
 }

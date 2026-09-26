@@ -5,9 +5,9 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 
-PIN_ARCHIVE="cef_binary_149.0.6+g0d0eeb6+chromium-149.0.7827.201_linux64_minimal.tar.bz2"
-PIN_SHA1="d46ec0d5723771bd1c9678c429e1cdb1f1ef0a72"
-PIN_SHA256="f90dec4c5c42a7bbd4f2bd80a7a77e0ac6aacfc6627bb43572d803e77f26dfbc"
+PIN_ARCHIVE="cef_binary_152.0.6+g708dc14+chromium-152.0.7977.83_linux64_minimal.tar.bz2"
+PIN_SHA1="9711b86c105fb590da576fe5a829802f1a79d520"
+PIN_SHA256="daf8c2b6e63787d6a91d666205a8a4521419937eabaf47723738c86aea7135bd"
 CEF_CDN="https://cef-builds.spotifycdn.com/"
 
 usage() {
@@ -147,9 +147,9 @@ verified_libcef_sha="$("$SHA256SUM" "$work/verified/Release/libcef.so" | cut -d'
 echo "# build-input libcef.so matches the verified tarball"
 
 echo "# building eclipse (release) …"
-( cd "$repo" && "$CARGO" build --release )
+( cd "$repo" && "$CARGO" build --release --locked )
 echo "# building eclipse-webview (release, CEF_PATH=$CEF_DIST) …"
-( cd "$repo/crates/eclipse-webview" && CEF_PATH="$CEF_DIST" "$CARGO" build --release )
+( cd "$repo/crates/eclipse-webview" && CEF_PATH="$CEF_DIST" "$CARGO" build --release --locked )
 [ -f "$repo/target/release/eclipse" ] || fail "missing $repo/target/release/eclipse after the build"
 [ -f "$repo/crates/eclipse-webview/target/release/eclipse-webview" ] || fail "missing the built eclipse-webview helper"
 
@@ -172,7 +172,7 @@ echo "# stripping libcef.so ($(stat -c%s "$work/verified/Release/libcef.so") byt
 stripped_size="$(stat -c%s "$OUT/libcef.so")"
 
 if [ "$stripped_size" -lt 200000000 ] || [ "$stripped_size" -gt 300000000 ]; then
-    fail "stripped libcef.so is $stripped_size bytes — outside the 200–300 MB sanity envelope (M1 reference 256,322,688)"
+    fail "stripped libcef.so is $stripped_size bytes — outside the 200–300 MB sanity envelope (CEF 152.0.6 reference 267,902,104)"
 fi
 echo "# libcef.so stripped to $stripped_size bytes"
 
