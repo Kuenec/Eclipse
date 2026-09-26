@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+pub const SLOT_COUNT: u8 = 3;
+
+const MAX_UNRELEASED: usize = SLOT_COUNT as usize - 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Publish {
     pub generation: u32,
@@ -12,11 +16,11 @@ pub struct SlotTracker {
     generation: u32,
     next_seq: u32,
 
-    published: Option<(u8, u32)>,
-
-    spare_dirty: bool,
+    unreleased: [Option<u32>; SLOT_COUNT as usize],
 
     write_slot: u8,
+
+    write_dirty: bool,
 }
 
 impl SlotTracker {
@@ -24,9 +28,9 @@ impl SlotTracker {
         Self {
             generation,
             next_seq: 0,
-            published: None,
-            spare_dirty: false,
+            unreleased: [None; SLOT_COUNT as usize],
             write_slot: 0,
+            write_dirty: false,
         }
     }
 
@@ -38,59 +42,51 @@ impl SlotTracker {
         *self = Self::new(generation);
     }
 
-    pub fn on_paint(&mut self) -> (u8, Option<Publish>) {
-        match self.published {
-            Some((published_slot, _)) => {
-                let spare = 1 - published_slot;
-                self.spare_dirty = true;
-                (spare, None)
-            }
-            None => {
-                let slot = self.write_slot;
-                self.next_seq = self.next_seq.wrapping_add(1);
-                let seq = self.next_seq;
-                self.published = Some((slot, seq));
-                self.write_slot = 1 - slot;
-                (
-                    slot,
-                    Some(Publish {
-                        generation: self.generation,
-                        slot,
-                        seq,
-                    }),
-                )
-            }
+    fn unreleased_count(&self) -> usize {
+        self.unreleased.iter().flatten().count()
+    }
+
+    fn publish_write_slot(&mut self) -> Publish {
+        let slot = self.write_slot;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.next_seq;
+        self.unreleased[usize::from(slot)] = Some(seq);
+        self.write_dirty = false;
+        self.write_slot = (0..SLOT_COUNT)
+            .find(|s| self.unreleased[usize::from(*s)].is_none())
+            .expect("MAX_UNRELEASED leaves at least one slot free to write");
+        Publish {
+            generation: self.generation,
+            slot,
+            seq,
         }
+    }
+
+    pub fn on_paint(&mut self) -> (u8, Option<Publish>) {
+        let slot = self.write_slot;
+        if self.unreleased_count() < MAX_UNRELEASED {
+            return (slot, Some(self.publish_write_slot()));
+        }
+        self.write_dirty = true;
+        (slot, None)
     }
 
     pub fn on_ack(&mut self, generation: u32, seq: u32) -> Option<Publish> {
         if generation != self.generation {
             return None;
         }
-        let (published_slot, published_seq) = self.published?;
-        if published_seq != seq {
-            return None;
-        }
-        self.published = None;
-
-        self.write_slot = published_slot;
-        if self.spare_dirty {
-            self.spare_dirty = false;
-            let spare = 1 - published_slot;
-            self.next_seq = self.next_seq.wrapping_add(1);
-            let new_seq = self.next_seq;
-            self.published = Some((spare, new_seq));
-            return Some(Publish {
-                generation: self.generation,
-                slot: spare,
-                seq: new_seq,
-            });
+        let released = self.unreleased.iter_mut().find(|s| **s == Some(seq))?;
+        *released = None;
+        if self.write_dirty && self.unreleased_count() < MAX_UNRELEASED {
+            return Some(self.publish_write_slot());
         }
         None
     }
 
-    pub fn outstanding(&self) -> Option<(u8, u32)> {
-        self.published
+    pub fn unreleased(&self) -> Vec<(u8, u32)> {
+        (0..SLOT_COUNT)
+            .filter_map(|s| self.unreleased[usize::from(s)].map(|seq| (s, seq)))
+            .collect()
     }
 }
 
@@ -110,15 +106,20 @@ mod tests {
         }
     }
 
+    fn sorted(mut v: Vec<(u8, u32)>) -> Vec<(u8, u32)> {
+        v.sort_unstable();
+        v
+    }
+
     #[test]
-    fn frame_slots_never_write_a_published_unacked_slot() {
+    fn frame_slots_never_write_an_unreleased_slot() {
         let mut rng = XorShift(0x00E0_C11B_5E00_2026);
         let mut tracker = SlotTracker::new(1);
 
         let mut stamp: u64 = 0;
-        let mut slot_stamp = [0u64; 2];
+        let mut slot_stamp = [0u64; SLOT_COUNT as usize];
         let mut newest_stamp = 0u64;
-        let mut outstanding: Option<Publish> = None;
+        let mut unreleased: Vec<Publish> = Vec::new();
         let mut old_generation_acks: Vec<(u32, u32)> = Vec::new();
 
         for step in 0..50_000u32 {
@@ -126,90 +127,101 @@ mod tests {
                 0..=5 => {
                     let (write_slot, publish) = tracker.on_paint();
 
-                    if let Some(p) = outstanding {
-                        assert_ne!(
-                            write_slot, p.slot,
-                            "step {step}: paint handed out the published-unacked slot"
-                        );
-                    }
+                    assert!(
+                        unreleased.iter().all(|p| p.slot != write_slot),
+                        "step {step}: paint handed out an unreleased slot"
+                    );
                     stamp += 1;
                     slot_stamp[usize::from(write_slot)] = stamp;
                     newest_stamp = stamp;
                     if let Some(p) = publish {
                         assert!(
-                            outstanding.is_none(),
-                            "step {step}: second FrameReady while one is in flight"
+                            unreleased.len() < MAX_UNRELEASED,
+                            "step {step}: a publish would leave no slot free to write"
                         );
                         assert_eq!(p.slot, write_slot);
                         assert_eq!(p.generation, tracker.generation());
-                        outstanding = Some(p);
+                        unreleased.push(p);
                     }
                 }
 
                 6 | 7 => {
-                    if let Some(p) = outstanding.take() {
-                        let next = tracker.on_ack(p.generation, p.seq);
-                        if let Some(n) = next {
-                            assert_ne!(n.slot, p.slot, "swap must publish the other slot");
+                    if !unreleased.is_empty() {
+                        let pick = (rng.next() % unreleased.len() as u64) as usize;
+                        let p = unreleased.remove(pick);
+                        if let Some(n) = tracker.on_ack(p.generation, p.seq) {
+                            assert!(
+                                unreleased.iter().all(|u| u.slot != n.slot),
+                                "step {step}: published a slot that is still unreleased"
+                            );
                             assert_eq!(
                                 slot_stamp[usize::from(n.slot)],
                                 newest_stamp,
-                                "step {step}: published spare is not the newest frame"
+                                "step {step}: published slot is not the newest frame"
                             );
                             assert_eq!(n.generation, tracker.generation());
-                            outstanding = Some(n);
+                            unreleased.push(n);
                         }
                     }
                 }
 
                 8 => {
-                    let before = tracker.outstanding();
+                    let before = tracker.unreleased();
                     let bogus_seq = rng.next() as u32 | 0x8000_0000;
                     assert_eq!(tracker.on_ack(tracker.generation(), bogus_seq), None);
                     if let Some((g, s)) = old_generation_acks.last().copied() {
                         assert_eq!(tracker.on_ack(g, s), None);
                     }
-                    assert_eq!(tracker.outstanding(), before, "ignored ack mutated state");
+                    assert_eq!(tracker.unreleased(), before, "ignored ack mutated state");
                 }
 
                 _ => {
-                    if let Some(p) = outstanding.take() {
+                    for p in unreleased.drain(..) {
                         old_generation_acks.push((p.generation, p.seq));
                     }
                     let new_generation = tracker.generation() + 1;
                     tracker.reset(new_generation);
-                    slot_stamp = [0; 2];
+                    slot_stamp = [0; SLOT_COUNT as usize];
                     newest_stamp = 0;
-                    assert_eq!(tracker.outstanding(), None);
+                    assert!(tracker.unreleased().is_empty());
                 }
             }
 
             assert_eq!(
-                tracker.outstanding(),
-                outstanding.map(|p| (p.slot, p.seq)),
+                tracker.unreleased(),
+                sorted(unreleased.iter().map(|p| (p.slot, p.seq)).collect()),
                 "step {step}: tracker/model divergence"
             );
         }
+    }
 
+    #[test]
+    fn a_consumer_holding_its_latest_frame_still_receives_newer_ones() {
         let mut t = SlotTracker::new(7);
         let (s0, p0) = t.on_paint();
-        let p0 = p0.expect("first paint publishes");
-        assert_eq!(p0.slot, s0);
-        let (s1a, none1) = t.on_paint();
-        let (s1b, none2) = t.on_paint();
-        let (s1c, none3) = t.on_paint();
-        assert!(none1.is_none() && none2.is_none() && none3.is_none());
-        assert_eq!(s1a, 1 - s0);
-        assert_eq!(s1b, s1a, "coalescing writes must reuse the same spare slot");
-        assert_eq!(s1c, s1a);
-        let swapped = t
-            .on_ack(7, p0.seq)
-            .expect("ack must publish the dirty spare");
-        assert_eq!(swapped.slot, s1a);
-        assert_eq!(swapped.generation, 7);
-        assert!(
-            t.on_ack(7, p0.seq).is_none(),
-            "re-acked seq must be ignored"
-        );
+        let held = p0.expect("first paint publishes");
+        assert_eq!(held.slot, s0);
+
+        let (s1, p1) = t.on_paint();
+        let next = p1.expect("one held frame still leaves room to publish");
+        assert_ne!(s1, held.slot);
+
+        let (s2a, none_a) = t.on_paint();
+        let (s2b, none_b) = t.on_paint();
+        assert!(none_a.is_none() && none_b.is_none());
+        assert_eq!(s2a, s2b, "coalescing paints reuse the one free slot");
+        assert!(s2a != held.slot && s2a != next.slot);
+
+        let newest = t
+            .on_ack(7, held.seq)
+            .expect("releasing the held frame publishes the coalesced one");
+        assert_eq!(newest.slot, s2a);
+        assert!(t.on_ack(7, held.seq).is_none(), "a re-acked seq is ignored");
+
+        assert!(t.on_ack(7, next.seq).is_none());
+        assert_eq!(t.unreleased(), vec![(newest.slot, newest.seq)]);
+        let (s3, p3) = t.on_paint();
+        assert_ne!(s3, newest.slot);
+        assert!(p3.is_some(), "a single held frame never blocks a publish");
     }
 }

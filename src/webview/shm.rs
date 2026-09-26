@@ -98,31 +98,60 @@ pub fn create_sealed_frame_memfd(
 }
 
 #[derive(Debug)]
-pub struct FrameMapping {
+struct SharedMap {
     ptr: std::ptr::NonNull<u8>,
     len: usize,
 }
 
-impl FrameMapping {
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(len)?;
-        if end > self.len {
-            return None;
+impl SharedMap {
+    fn new(fd: BorrowedFd<'_>, expected_len: usize, prot: libc::c_int) -> Result<Self, ShmError> {
+        if expected_len == 0 {
+            return Err(ShmError::ZeroSized);
         }
 
-        Some(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) })
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(ShmError::Stat(last_os_error()));
+        }
+        let actual = u64::try_from(st.st_size).unwrap_or(0);
+        if actual != expected_len as u64 {
+            return Err(ShmError::WrongSize {
+                actual,
+                expected: expected_len as u64,
+            });
+        }
+
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(ShmError::SealCtl(last_os_error()));
+        }
+        if seals & libc::F_SEAL_SHRINK == 0 {
+            return Err(ShmError::NotSealed { seals });
+        }
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                expected_len,
+                prot,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(ShmError::Map(last_os_error()));
+        }
+        let ptr = std::ptr::NonNull::new(ptr.cast::<u8>())
+            .ok_or(ShmError::Map(std::io::ErrorKind::Other))?;
+        Ok(Self {
+            ptr,
+            len: expected_len,
+        })
     }
 }
 
-impl Drop for FrameMapping {
+impl Drop for SharedMap {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.ptr.as_ptr().cast(), self.len);
@@ -130,49 +159,69 @@ impl Drop for FrameMapping {
     }
 }
 
+#[derive(Debug)]
+pub struct FrameMapping(SharedMap);
+
+unsafe impl Send for FrameMapping {}
+
+impl FrameMapping {
+    pub fn len(&self) -> usize {
+        self.0.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.len == 0
+    }
+
+    pub fn slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
+        if end > self.0.len {
+            return None;
+        }
+
+        Some(unsafe { std::slice::from_raw_parts(self.0.ptr.as_ptr().add(offset), len) })
+    }
+}
+
 pub fn map_frame_buffer(fd: BorrowedFd<'_>, expected_len: usize) -> Result<FrameMapping, ShmError> {
-    if expected_len == 0 {
-        return Err(ShmError::ZeroSized);
-    }
+    SharedMap::new(fd, expected_len, libc::PROT_READ).map(FrameMapping)
+}
 
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-        return Err(ShmError::Stat(last_os_error()));
-    }
-    let actual = u64::try_from(st.st_size).unwrap_or(0);
-    if actual != expected_len as u64 {
-        return Err(ShmError::WrongSize {
-            actual,
-            expected: expected_len as u64,
-        });
-    }
+#[derive(Debug)]
+pub struct FrameWriter {
+    map: SharedMap,
+    slot_bytes: usize,
+    slots: u8,
+}
 
-    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
-    if seals < 0 {
-        return Err(ShmError::SealCtl(last_os_error()));
-    }
-    if seals & libc::F_SEAL_SHRINK == 0 {
-        return Err(ShmError::NotSealed { seals });
-    }
+unsafe impl Send for FrameWriter {}
 
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            expected_len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        return Err(ShmError::Map(last_os_error()));
+impl FrameWriter {
+    pub fn slot_mut(&mut self, slot: u8) -> Option<&mut [u8]> {
+        if slot >= self.slots {
+            return None;
+        }
+        let offset = self.slot_bytes * usize::from(slot);
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(self.map.ptr.as_ptr().add(offset), self.slot_bytes)
+        })
     }
-    let ptr =
-        std::ptr::NonNull::new(ptr.cast::<u8>()).ok_or(ShmError::Map(std::io::ErrorKind::Other))?;
-    Ok(FrameMapping {
-        ptr,
-        len: expected_len,
+}
+
+pub fn map_frame_writer(
+    fd: BorrowedFd<'_>,
+    slot_bytes: u32,
+    slots: u8,
+) -> Result<FrameWriter, ShmError> {
+    let slot_bytes = usize::try_from(slot_bytes).map_err(|_| ShmError::TooLarge)?;
+    let len = slot_bytes
+        .checked_mul(usize::from(slots))
+        .ok_or(ShmError::TooLarge)?;
+    let map = SharedMap::new(fd, len, libc::PROT_READ | libc::PROT_WRITE)?;
+    Ok(FrameWriter {
+        map,
+        slot_bytes,
+        slots,
     })
 }
 
@@ -221,5 +270,33 @@ mod tests {
 
         assert!(mapping.slice(total, 1).is_none());
         assert!(mapping.slice(usize::MAX, 2).is_none());
+    }
+
+    #[test]
+    fn frame_writer_slots_land_in_the_shared_memfd_without_touching_their_neighbours() {
+        let (memfd, slot_bytes) = create_sealed_frame_memfd(4, 2, 3).expect("create");
+        let slot_len = slot_bytes as usize;
+        let mut writer = map_frame_writer(memfd.as_fd(), slot_bytes, 3).expect("map writer");
+        let reader = map_frame_buffer(memfd.as_fd(), slot_len * 3).expect("map reader");
+
+        let pixels: Vec<u8> = (0..slot_len).map(|i| (i * 3 + 1) as u8).collect();
+        writer.slot_mut(1).expect("slot 1").copy_from_slice(&pixels);
+        assert_eq!(reader.slice(slot_len, slot_len), Some(pixels.as_slice()));
+        assert!(reader
+            .slice(0, slot_len)
+            .expect("slot 0")
+            .iter()
+            .all(|b| *b == 0));
+        assert!(reader
+            .slice(2 * slot_len, slot_len)
+            .expect("slot 2")
+            .iter()
+            .all(|b| *b == 0));
+        assert!(writer.slot_mut(3).is_none());
+
+        match map_frame_writer(memfd.as_fd(), slot_bytes, 4) {
+            Err(ShmError::WrongSize { .. }) => {}
+            other => panic!("missized writer mapping must be refused, got {other:?}"),
+        }
     }
 }

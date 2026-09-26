@@ -1480,7 +1480,7 @@ pub(crate) fn present_staged_webview_frame(view: i64) {
             },
         };
         let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
-        unsafe { presenter.fill(key, rect, &stage.bytes, stage.stride as usize, swizzle) }
+        unsafe { presenter.fill(key, rect, stage.bytes, stage.stride as usize, swizzle) }
     })
     .unwrap_or(false);
     if filled {
@@ -2275,7 +2275,7 @@ fn composite_webview_frame(
                         queue,
                         image_raw,
                         engine_waits,
-                        &stage.bytes,
+                        stage.bytes,
                         stage.stride as usize,
                         swizzle,
                         refresh,

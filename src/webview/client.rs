@@ -428,12 +428,8 @@ fn shared() -> &'static Arc<Shared> {
     })
 }
 
-struct SendMapping(shm::FrameMapping);
-
-unsafe impl Send for SendMapping {}
-
-struct FrameMap {
-    mapping: SendMapping,
+struct FrameBuffer {
+    mapping: shm::FrameMapping,
     generation: u32,
     width: u16,
     height: u16,
@@ -441,9 +437,104 @@ struct FrameMap {
     slot_bytes: u32,
 }
 
-#[derive(Default)]
-pub struct Stage {
-    pub bytes: Vec<u8>,
+impl FrameBuffer {
+    fn slot(&self, slot: u8) -> Option<&[u8]> {
+        let slot_bytes = self.slot_bytes as usize;
+        self.mapping
+            .slice(slot_bytes.checked_mul(usize::from(slot))?, slot_bytes)
+    }
+}
+
+struct HeldFrame {
+    slot: u8,
+    seq: u32,
+}
+
+enum FrameSource {
+    Empty,
+
+    Announced(FrameBuffer),
+
+    Holding {
+        buffer: FrameBuffer,
+        held: HeldFrame,
+    },
+
+    Resizing {
+        buffer: FrameBuffer,
+        held: HeldFrame,
+        next: FrameBuffer,
+    },
+}
+
+enum FrameReadyOutcome {
+    Ignored,
+
+    Held { released: Option<u32> },
+}
+
+impl FrameSource {
+    fn announce(&mut self, next: FrameBuffer) {
+        *self = match std::mem::replace(self, Self::Empty) {
+            Self::Empty | Self::Announced(_) => Self::Announced(next),
+            Self::Holding { buffer, held } | Self::Resizing { buffer, held, .. } => {
+                Self::Resizing { buffer, held, next }
+            }
+        };
+    }
+
+    fn on_frame_ready(&mut self, generation: u32, slot: u8, seq: u32) -> FrameReadyOutcome {
+        let incoming = HeldFrame { slot, seq };
+        let accepts =
+            |buffer: &FrameBuffer| buffer.generation == generation && buffer.slot(slot).is_some();
+        let (next, outcome) = match std::mem::replace(self, Self::Empty) {
+            Self::Announced(buffer) if accepts(&buffer) => (
+                Self::Holding {
+                    buffer,
+                    held: incoming,
+                },
+                FrameReadyOutcome::Held { released: None },
+            ),
+            Self::Holding { buffer, held } if accepts(&buffer) => (
+                Self::Holding {
+                    buffer,
+                    held: incoming,
+                },
+                FrameReadyOutcome::Held {
+                    released: Some(held.seq),
+                },
+            ),
+            Self::Resizing { next, .. } if accepts(&next) => (
+                Self::Holding {
+                    buffer: next,
+                    held: incoming,
+                },
+                FrameReadyOutcome::Held { released: None },
+            ),
+            unchanged => (unchanged, FrameReadyOutcome::Ignored),
+        };
+        *self = next;
+        outcome
+    }
+
+    fn latest(&self) -> Option<Stage<'_>> {
+        let (buffer, held) = match self {
+            Self::Holding { buffer, held } | Self::Resizing { buffer, held, .. } => (buffer, held),
+            Self::Empty | Self::Announced(_) => return None,
+        };
+        Some(Stage {
+            bytes: buffer.slot(held.slot)?,
+            width: u32::from(buffer.width),
+            height: u32::from(buffer.height),
+            stride: buffer.stride,
+            generation: buffer.generation,
+            seq: held.seq,
+        })
+    }
+}
+
+pub struct Stage<'a> {
+    pub bytes: &'a [u8],
     pub width: u32,
     pub height: u32,
 
@@ -471,8 +562,7 @@ struct ViewShared {
     driven_url: String,
 
     log_target: String,
-    mapping: Option<FrameMap>,
-    stage: Stage,
+    frames: FrameSource,
     started: bool,
     finished_http: Option<i32>,
     can_go_back: bool,
@@ -1161,18 +1251,10 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
             seq,
         } => {
             if let Some(vs) = views.get_mut(&view) {
-                if let Some(map) = vs.mapping.as_ref() {
-                    if map.generation == generation {
-                        let offset = map.slot_bytes as usize * usize::from(slot);
-                        if let Some(src) = map.mapping.0.slice(offset, map.slot_bytes as usize) {
-                            vs.stage.bytes.clear();
-                            vs.stage.bytes.extend_from_slice(src);
-                            vs.stage.width = u32::from(map.width);
-                            vs.stage.height = u32::from(map.height);
-                            vs.stage.stride = map.stride;
-                            vs.stage.generation = generation;
-                            vs.stage.seq = seq;
-                            out.staged_view = Some(view);
+                match vs.frames.on_frame_ready(generation, slot, seq) {
+                    FrameReadyOutcome::Held { released } => {
+                        out.staged_view = Some(view);
+                        if let Some(seq) = released {
                             out.replies.push(ConsumerMsg::FrameAck {
                                 view,
                                 generation,
@@ -1180,6 +1262,7 @@ fn dispatch(msg: HelperMsg, views: &mut HashMap<i64, ViewShared>) -> DispatchOut
                             });
                         }
                     }
+                    FrameReadyOutcome::Ignored => {}
                 }
             }
         }
@@ -1416,8 +1499,8 @@ fn reader_loop(stream: &UnixStream, shared: &Arc<Shared>, upcalls: &mpsc::Sender
             match shared.views.lock() {
                 Ok(mut views) => match views.get_mut(&view) {
                     Some(vs) => {
-                        vs.mapping = Some(FrameMap {
-                            mapping: SendMapping(mapping),
+                        vs.frames.announce(FrameBuffer {
+                            mapping,
                             generation,
                             width,
                             height,
@@ -1648,8 +1731,7 @@ fn record_view(views: &mut HashMap<i64, ViewShared>, widget: i64, driven_url: St
                 phase: ViewPhase::Open,
                 driven_url,
                 log_target,
-                mapping: None,
-                stage: Stage::default(),
+                frames: FrameSource::Empty,
                 started: false,
                 finished_http: None,
                 can_go_back: false,
@@ -2220,13 +2302,10 @@ pub fn update_composited_rect() {
     }
 }
 
-pub fn with_latest_frame<R>(view: i64, f: impl FnOnce(&Stage) -> R) -> Option<R> {
-    let views = shared().views.try_lock().ok()?;
-    let vs = views.get(&view)?;
-    if vs.stage.seq == 0 {
-        return None;
-    }
-    Some(f(&vs.stage))
+pub fn with_latest_frame<R>(view: i64, f: impl FnOnce(&Stage<'_>) -> R) -> Option<R> {
+    let views = shared().views.lock().ok()?;
+    let stage = views.get(&view)?.frames.latest()?;
+    Some(f(&stage))
 }
 
 fn send_input(msg: &ConsumerMsg) {
@@ -2691,36 +2770,60 @@ mod tests {
         }
     }
 
+    fn announce_frame_buffer(
+        views: &mut HashMap<i64, ViewShared>,
+        widget: i64,
+        generation: u32,
+        width: u16,
+    ) -> [Vec<u8>; 3] {
+        let (memfd, slot_bytes) = shm::create_sealed_frame_memfd(width, 2, 3).expect("memfd");
+        let slot_len = slot_bytes as usize;
+        let payloads: [Vec<u8>; 3] = std::array::from_fn(|slot| {
+            (0..slot_len)
+                .map(|i| (i * 5 + slot * 7 + usize::from(width)) as u8)
+                .collect()
+        });
+        let file = File::from(memfd.try_clone().expect("dup"));
+        for (slot, payload) in payloads.iter().enumerate() {
+            file.write_at(payload, (slot * slot_len) as u64)
+                .expect("write slot");
+        }
+        let mapping = shm::map_frame_buffer(memfd.as_fd(), slot_len * 3).expect("map");
+        views
+            .get_mut(&widget)
+            .expect("tracked")
+            .frames
+            .announce(FrameBuffer {
+                mapping,
+                generation,
+                width,
+                height: 2,
+                stride: 4 * u32::from(width),
+                slot_bytes,
+            });
+        payloads
+    }
+
     fn tracked_view_with_mapping(
         views: &mut HashMap<i64, ViewShared>,
         widget: i64,
         driven_url: &str,
         generation: u32,
-    ) -> Vec<u8> {
+    ) -> [Vec<u8>; 3] {
         assert!(record_view(views, widget, driven_url.to_string()));
-        let (memfd, slot_bytes) = shm::create_sealed_frame_memfd(4, 2, 2).expect("memfd");
-        let payload: Vec<u8> = (0..slot_bytes as usize)
-            .map(|i| (i * 5 + 1) as u8)
-            .collect();
-        let file = File::from(memfd.try_clone().expect("dup"));
-        file.write_at(&payload, 0).expect("write slot 0");
-        let mapping = shm::map_frame_buffer(memfd.as_fd(), slot_bytes as usize * 2).expect("map");
-        views.get_mut(&widget).expect("tracked").mapping = Some(FrameMap {
-            mapping: SendMapping(mapping),
-            generation,
-            width: 4,
-            height: 2,
-            stride: 16,
-            slot_bytes,
-        });
-        payload
+        announce_frame_buffer(views, widget, generation, 4)
+    }
+
+    fn latest_of(views: &HashMap<i64, ViewShared>, widget: i64) -> Option<(Vec<u8>, u32, u32)> {
+        let stage = views.get(&widget)?.frames.latest()?;
+        Some((stage.bytes.to_vec(), stage.generation, stage.seq))
     }
 
     #[test]
     fn webview_reader_never_fabricates_upcalls_and_acks_only_matching_generations() {
         let mut views: HashMap<i64, ViewShared> = HashMap::new();
         let widget = 0x0000_0001_0000_0000_i64;
-        let payload = tracked_view_with_mapping(
+        let payloads = tracked_view_with_mapping(
             &mut views,
             widget,
             "https://apps.roblox.com/challenge?t=x",
@@ -2781,8 +2884,8 @@ mod tests {
             },
             &mut views,
         );
-        assert!(out.replies.is_empty());
-        assert_eq!(views.get(&widget).unwrap().stage.seq, 0);
+        assert!(out.replies.is_empty() && out.staged_view.is_none());
+        assert!(latest_of(&views, widget).is_none());
 
         let out = dispatch(
             HelperMsg::FrameReady {
@@ -2790,6 +2893,29 @@ mod tests {
                 generation: 7,
                 slot: 0,
                 seq: 2,
+            },
+            &mut views,
+        );
+        assert!(
+            out.replies.is_empty(),
+            "the newest frame stays held until a newer one replaces it"
+        );
+        assert_eq!(out.staged_view, Some(widget));
+        assert_eq!(latest_of(&views, widget), Some((payloads[0].clone(), 7, 2)));
+        let stage = views
+            .get(&widget)
+            .unwrap()
+            .frames
+            .latest()
+            .expect("held frame");
+        assert_eq!((stage.width, stage.height, stage.stride), (4, 2, 16));
+
+        let out = dispatch(
+            HelperMsg::FrameReady {
+                view: widget,
+                generation: 7,
+                slot: 1,
+                seq: 3,
             },
             &mut views,
         );
@@ -2801,13 +2927,19 @@ mod tests {
                 seq: 2,
             }]
         );
-        let vs = views.get(&widget).unwrap();
-        assert_eq!(vs.stage.bytes, payload);
-        assert_eq!(
-            (vs.stage.width, vs.stage.height, vs.stage.stride),
-            (4, 2, 16)
+        assert_eq!(latest_of(&views, widget), Some((payloads[1].clone(), 7, 3)));
+
+        let out = dispatch(
+            HelperMsg::FrameReady {
+                view: widget,
+                generation: 7,
+                slot: 3,
+                seq: 4,
+            },
+            &mut views,
         );
-        assert_eq!((vs.stage.generation, vs.stage.seq), (7, 2));
+        assert!(out.replies.is_empty() && out.staged_view.is_none());
+        assert_eq!(latest_of(&views, widget), Some((payloads[1].clone(), 7, 3)));
 
         let out = dispatch(
             HelperMsg::Crash {
@@ -2824,6 +2956,60 @@ mod tests {
         let out = dispatch(HelperMsg::ViewClosed { view: widget }, &mut views);
         assert_eq!(out.closed, vec![widget]);
         assert!(!views.contains_key(&widget));
+    }
+
+    #[test]
+    fn a_resize_keeps_presenting_the_held_frame_until_the_new_generation_paints() {
+        let mut views: HashMap<i64, ViewShared> = HashMap::new();
+        let widget = 0x0000_0002_0000_0000_i64;
+        let old = tracked_view_with_mapping(&mut views, widget, "https://host/", 1);
+        let out = dispatch(
+            HelperMsg::FrameReady {
+                view: widget,
+                generation: 1,
+                slot: 2,
+                seq: 1,
+            },
+            &mut views,
+        );
+        assert!(out.replies.is_empty());
+
+        let new = announce_frame_buffer(&mut views, widget, 2, 8);
+        assert_eq!(latest_of(&views, widget), Some((old[2].clone(), 1, 1)));
+        let stale = dispatch(
+            HelperMsg::FrameReady {
+                view: widget,
+                generation: 1,
+                slot: 0,
+                seq: 2,
+            },
+            &mut views,
+        );
+        assert!(stale.replies.is_empty() && stale.staged_view.is_none());
+        assert_eq!(latest_of(&views, widget), Some((old[2].clone(), 1, 1)));
+
+        let out = dispatch(
+            HelperMsg::FrameReady {
+                view: widget,
+                generation: 2,
+                slot: 0,
+                seq: 1,
+            },
+            &mut views,
+        );
+        assert!(
+            out.replies.is_empty(),
+            "the abandoned generation's frame is never acked"
+        );
+        assert_eq!(out.staged_view, Some(widget));
+        assert_eq!(latest_of(&views, widget), Some((new[0].clone(), 2, 1)));
+        let stage = views
+            .get(&widget)
+            .unwrap()
+            .frames
+            .latest()
+            .expect("held frame");
+        assert_eq!((stage.width, stage.stride), (8, 32));
     }
 
     #[test]
