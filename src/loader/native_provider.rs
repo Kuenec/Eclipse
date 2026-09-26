@@ -2360,14 +2360,6 @@ pub fn host_input_should_wake(kind: Option<HostInputKind>) -> bool {
     kind.is_some()
 }
 
-pub fn feed_winit_input_to_loopers(event: &winit::event::WindowEvent) -> usize {
-    if host_input_should_wake(classify_winit_event(event)) {
-        ndk_registry::wake_all_loopers()
-    } else {
-        0
-    }
-}
-
 pub fn run_input_test() -> Result<String, String> {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

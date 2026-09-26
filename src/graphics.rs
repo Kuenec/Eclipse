@@ -108,6 +108,45 @@ struct GameWindow<'vm> {
     relative_motion_units: RelativeMotionUnits,
 
     engine_center_query_failed: bool,
+
+    pending_pointer_motion: Option<PendingPointerMotion>,
+
+    loopers_need_wake: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PointerMotion {
+    position: (f32, f32),
+    dx: f32,
+    dy: f32,
+}
+
+impl PointerMotion {
+    fn then(self, next: Self) -> Self {
+        Self {
+            position: next.position,
+            dx: self.dx + next.dx,
+            dy: self.dy + next.dy,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PendingPointerMotion {
+    Free(PointerMotion),
+    Locked(PointerMotion),
+}
+
+impl PendingPointerMotion {
+    fn coalesce(self, next: Self) -> Option<Self> {
+        match (self, next) {
+            (Self::Free(held), Self::Free(next)) => Some(Self::Free(held.then(next))),
+            (Self::Locked(held), Self::Locked(next)) if held.position == next.position => {
+                Some(Self::Locked(held.then(next)))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn next_wake(deadlines: impl IntoIterator<Item = Option<std::time::Instant>>) -> ControlFlow {
@@ -281,8 +320,13 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if self.handed_off {
-            crate::loader::native_provider::feed_winit_input_to_loopers(&event);
+        use crate::loader::native_provider::{classify_winit_event, host_input_should_wake};
+
+        if self.handed_off && host_input_should_wake(classify_winit_event(&event)) {
+            self.loopers_need_wake = true;
+        }
+        if !matches!(event, WindowEvent::CursorMoved { .. }) {
+            self.flush_pointer_motion();
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -337,9 +381,10 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                     return;
                 }
                 let previous = self.cursor;
-                self.cursor = Some((position.x as f32, position.y as f32));
+                let cursor = (position.x as f32, position.y as f32);
+                self.cursor = Some(cursor);
                 let (dx, dy) = previous.map_or((0.0, 0.0), |(old_x, old_y)| {
-                    (position.x as f32 - old_x, position.y as f32 - old_y)
+                    (cursor.0 - old_x, cursor.1 - old_y)
                 });
 
                 if self.handed_off {
@@ -353,7 +398,11 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                             _ => false,
                         };
                     if !routed {
-                        self.engine_pointer_move(dx, dy);
+                        self.queue_pointer_motion(PendingPointerMotion::Free(PointerMotion {
+                            position: cursor,
+                            dx,
+                            dy,
+                        }));
                     }
                 }
             }
@@ -473,6 +522,10 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.flush_pointer_motion();
+        if std::mem::take(&mut self.loopers_need_wake) {
+            crate::loader::ndk_registry::wake_all_loopers();
+        }
         let Some(vm) = self.vm else { return };
         let main_looper = match crate::framework::pump_main_looper(vm) {
             Ok(due) => due,
@@ -566,16 +619,21 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
         let PointerLock::Held { anchor, .. } = self.pointer_lock else {
             return;
         };
-        let (Some(vm), Some(window)) = (self.vm, self.window.as_ref()) else {
+        if self.vm.is_none() {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
             return;
         };
         let (dx, dy) = self
             .relative_motion_units
             .engine_delta(delta, window.scale_factor());
-        crate::loader::ndk_registry::wake_all_loopers();
-        if let Err(e) = crate::framework::dispatch_mouse_move(vm, anchor.0, anchor.1, dx, dy) {
-            tracing::warn!(error = %e, "engine locked mouse-move dispatch failed (ignored)");
-        }
+        self.loopers_need_wake = true;
+        self.queue_pointer_motion(PendingPointerMotion::Locked(PointerMotion {
+            position: anchor,
+            dx,
+            dy,
+        }));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1099,11 +1157,40 @@ impl GameWindow<'_> {
         }
     }
 
-    fn engine_pointer_move(&mut self, dx: f32, dy: f32) {
+    fn queue_pointer_motion(&mut self, motion: PendingPointerMotion) {
+        if let Some(merged) = self
+            .pending_pointer_motion
+            .and_then(|pending| pending.coalesce(motion))
+        {
+            self.pending_pointer_motion = Some(merged);
+            return;
+        }
+        self.flush_pointer_motion();
+        self.pending_pointer_motion = Some(motion);
+    }
+
+    fn flush_pointer_motion(&mut self) {
+        match self.pending_pointer_motion.take() {
+            None => {}
+            Some(PendingPointerMotion::Free(motion)) => self.engine_pointer_move(motion),
+            Some(PendingPointerMotion::Locked(motion)) => self.engine_locked_pointer_move(motion),
+        }
+    }
+
+    fn engine_locked_pointer_move(&self, motion: PointerMotion) {
+        let Some(vm) = self.vm else { return };
+        let (px, py) = motion.position;
+        if let Err(e) = crate::framework::dispatch_mouse_move(vm, px, py, motion.dx, motion.dy) {
+            tracing::warn!(error = %e, "engine locked mouse-move dispatch failed (ignored)");
+        }
+    }
+
+    fn engine_pointer_move(&mut self, motion: PointerMotion) {
+        let (px, py) = motion.position;
         if self.touch_mode == crate::config::TouchMode::Off {
             let Some(vm) = self.vm else { return };
-            let Some((px, py)) = self.cursor else { return };
-            if let Err(e) = crate::framework::dispatch_mouse_move(vm, px, py, dx, dy) {
+            if let Err(e) = crate::framework::dispatch_mouse_move(vm, px, py, motion.dx, motion.dy)
+            {
                 tracing::warn!(error = %e, "engine desktop mouse-move dispatch failed (ignored)");
             }
             return;
@@ -1112,7 +1199,6 @@ impl GameWindow<'_> {
             return;
         };
         let Some(vm) = self.vm else { return };
-        let Some((px, py)) = self.cursor else { return };
         if let Err(e) = crate::framework::dispatch_touch_to_engine_surface(
             vm,
             crate::framework::MotionAction::Move,
@@ -1661,6 +1747,8 @@ pub fn run_windowed(
         engine_right_button: EngineRightButton::Up,
         relative_motion_units: RelativeMotionUnits::DeviceCounts,
         engine_center_query_failed: false,
+        pending_pointer_motion: None,
+        loopers_need_wake: false,
     };
     let run = event_loop.run_app(&mut app);
 
@@ -6201,6 +6289,40 @@ mod tests {
             RelativeMotionUnits::DeviceCounts.engine_delta((3.0, -2.0), 2.0),
             (3.0, -2.0)
         );
+    }
+
+    #[test]
+    fn free_motion_coalesces_to_the_latest_position_and_the_summed_delta() {
+        let free =
+            |position, dx, dy| PendingPointerMotion::Free(PointerMotion { position, dx, dy });
+
+        assert_eq!(
+            free((10.0, 20.0), 1.0, -2.0).coalesce(free((13.0, 19.0), 3.0, -1.0)),
+            Some(free((13.0, 19.0), 4.0, -3.0))
+        );
+    }
+
+    #[test]
+    fn locked_motion_coalesces_only_around_one_anchor() {
+        let anchor = (320.0, 240.0);
+        let locked =
+            |position, dx, dy| PendingPointerMotion::Locked(PointerMotion { position, dx, dy });
+        let free = PendingPointerMotion::Free(PointerMotion {
+            position: anchor,
+            dx: 1.0,
+            dy: 1.0,
+        });
+
+        assert_eq!(
+            locked(anchor, 2.0, 1.0).coalesce(locked(anchor, -5.0, 4.0)),
+            Some(locked(anchor, -3.0, 5.0))
+        );
+        assert_eq!(
+            locked(anchor, 2.0, 1.0).coalesce(locked((10.0, 10.0), 1.0, 1.0)),
+            None
+        );
+        assert_eq!(free.coalesce(locked(anchor, 1.0, 1.0)), None);
+        assert_eq!(locked(anchor, 1.0, 1.0).coalesce(free), None);
     }
 
     #[test]
