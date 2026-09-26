@@ -711,6 +711,7 @@ pub fn host_page_size() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loader::elf::tests::{put_phdr, ProgramHeader};
     use crate::loader::elf::{ElfImage, PF_R, PF_W, PF_X};
     use crate::loader::reloc::R_X86_64_RELATIVE;
 
@@ -768,29 +769,6 @@ mod tests {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn put_phdr(
-        buf: &mut [u8],
-        idx: usize,
-        p_type: u32,
-        p_flags: u32,
-        p_offset: u64,
-        p_vaddr: u64,
-        p_filesz: u64,
-        p_memsz: u64,
-        p_align: u64,
-    ) {
-        let ph = PH_OFF + idx * PHDR_SIZE;
-        put_u32(buf, ph, p_type);
-        put_u32(buf, ph + 4, p_flags);
-        put_u64(buf, ph + 8, p_offset);
-        put_u64(buf, ph + 16, p_vaddr);
-        put_u64(buf, ph + 24, p_vaddr);
-        put_u64(buf, ph + 32, p_filesz);
-        put_u64(buf, ph + 40, p_memsz);
-        put_u64(buf, ph + 48, p_align);
-    }
-
     fn put_dyn(buf: &mut [u8], slot: usize, tag: i64, val: u64) {
         let off = DYN_OFF as usize + slot * DYN_SIZE;
         put_u64(buf, off, tag as u64);
@@ -818,28 +796,44 @@ mod tests {
         put_u16(&mut buf, 54, PHDR_SIZE as u16);
         put_u16(&mut buf, 56, 3);
 
-        put_phdr(&mut buf, 0, PT_LOAD, PF_R | PF_X, 0, 0, PAGE, PAGE, PAGE);
+        put_phdr(
+            &mut buf,
+            0,
+            &ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: PF_R | PF_X,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_filesz: PAGE,
+                p_memsz: PAGE,
+                p_align: PAGE,
+            },
+        );
         put_phdr(
             &mut buf,
             1,
-            PT_LOAD,
-            PF_R | PF_W,
-            DATA_FILE_OFF,
-            0x1000,
-            DATA_FILESZ,
-            DATA_MEMSZ,
-            PAGE,
+            &ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: PF_R | PF_W,
+                p_offset: DATA_FILE_OFF,
+                p_vaddr: 0x1000,
+                p_filesz: DATA_FILESZ,
+                p_memsz: DATA_MEMSZ,
+                p_align: PAGE,
+            },
         );
         put_phdr(
             &mut buf,
             2,
-            PT_DYNAMIC,
-            PF_R | PF_W,
-            DYN_OFF,
-            DYN_OFF,
-            0x100,
-            0x100,
-            8,
+            &ProgramHeader {
+                p_type: PT_DYNAMIC,
+                p_flags: PF_R | PF_W,
+                p_offset: DYN_OFF,
+                p_vaddr: DYN_OFF,
+                p_filesz: 0x100,
+                p_memsz: 0x100,
+                p_align: 8,
+            },
         );
 
         let mut slot = 0;
@@ -885,13 +879,15 @@ mod tests {
         put_phdr(
             &mut buf,
             3,
-            PT_GNU_RELRO,
-            PF_R,
-            0x1000,
-            0x1000,
-            PAGE,
-            PAGE,
-            1,
+            &ProgramHeader {
+                p_type: PT_GNU_RELRO,
+                p_flags: PF_R,
+                p_offset: 0x1000,
+                p_vaddr: 0x1000,
+                p_filesz: PAGE,
+                p_memsz: PAGE,
+                p_align: 1,
+            },
         );
         buf
     }
