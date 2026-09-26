@@ -2522,10 +2522,15 @@ extern "system" fn message_queue_native_init<'local>(
 ) -> jlong {
     env.with_env(|_env| -> jni::errors::Result<jlong> {
         let current_thread = std::thread::current().id();
-        let is_main = ANDROID_MAIN_THREAD_ID
+        let role = if ANDROID_MAIN_THREAD_ID
             .get()
-            .is_none_or(|main_thread| *main_thread == current_thread);
-        let Some(handle) = message_queue::create(is_main) else {
+            .is_none_or(|main_thread| *main_thread == current_thread)
+        {
+            message_queue::QueueRole::Main
+        } else {
+            message_queue::QueueRole::Worker
+        };
+        let Some(handle) = message_queue::create(role) else {
             tracing::error!(
                 target: "android.os.MessageQueue",
                 "MessageQueue.nativeInit: host handle allocation failed"
@@ -2535,7 +2540,7 @@ extern "system" fn message_queue_native_init<'local>(
         tracing::debug!(
             target: "android.os.MessageQueue",
             handle,
-            is_main,
+            ?role,
             "MessageQueue.nativeInit: allocated host queue handle"
         );
         Ok(handle)
@@ -2593,12 +2598,14 @@ extern "system" fn message_queue_native_wake<'local>(
     ptr: jlong,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        if !message_queue::wake(ptr) {
-            tracing::debug!(
+        match message_queue::wake(ptr) {
+            Some(message_queue::QueueRole::Main) => wake_main_looper(),
+            Some(message_queue::QueueRole::Worker) => {}
+            None => tracing::debug!(
                 target: "android.os.MessageQueue",
                 handle = ptr,
                 "MessageQueue.nativeWake: ignored stale queue handle"
-            );
+            ),
         }
         Ok(())
     })
@@ -4061,6 +4068,12 @@ fn mark_global_layout_pending() {
             "global-layout observer registry poisoned while scheduling layout"
         ),
     }
+}
+
+pub fn global_layout_pending() -> bool {
+    GLOBAL_LAYOUT_OBSERVERS
+        .lock()
+        .is_ok_and(|observers| observers.iter().any(|observer| observer.pending))
 }
 
 fn dispatch_pending_global_layout(env: &mut Env) -> Result<(), FrameworkError> {
@@ -6525,6 +6538,7 @@ fn dispatch_webview_callback_on_main<R: Send + 'static>(
         return rx.recv().ok();
     }
 
+    wake_main_looper();
     match rx.recv_timeout(MAIN_DISPATCH_DEADLINE) {
         Ok(r) => Some(r),
         Err(_) => match MAIN_DISPATCH.lock().ok().and_then(|mut s| s.job.take()) {
@@ -6557,8 +6571,7 @@ fn warn_main_dispatch_degraded(what: &'static str, gate: MainDispatchGate) {
             "app-facing WebView callback could NOT be delivered on the main/UI thread — running it \
              on this Looper-less thread instead (the pre-2026-07-16 delivery: the app's own \
              new Handler() will throw). Never dropped; logged once. Outside process teardown this \
-             means the main Looper pump is not running — a main-queue MessageQueue.nativeWake \
-             cannot wake winit without an EventLoopProxy; that host wake is the durable follow-up."
+             means the main Looper pump is not running."
         );
     }
 }
@@ -8702,6 +8715,11 @@ fn has_live_textbox_session(widget: i64) -> bool {
         .ok()
         .and_then(|session| *session)
         .is_some_and(|session| textbox_session_matches_active(session, widget))
+}
+
+pub fn textbox_geometry_pending() -> bool {
+    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
+    widget != 0 && !has_live_textbox_session(widget)
 }
 
 fn record_textbox_session(session: Option<TextboxSession>) {
@@ -11457,7 +11475,50 @@ pub fn prepare_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-pub fn pump_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
+pub struct MainLooperWake;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainLooperDue {
+    Now,
+    At(Instant),
+    WhenWoken,
+}
+
+impl MainLooperDue {
+    pub fn deadline(self, now: Instant) -> Option<Instant> {
+        match self {
+            Self::Now => Some(now),
+            Self::At(at) => Some(at),
+            Self::WhenWoken => None,
+        }
+    }
+}
+
+static MAIN_LOOPER_WAKER: OnceLock<winit::event_loop::EventLoopProxy<MainLooperWake>> =
+    OnceLock::new();
+
+static MAIN_LOOPER_WAKE_SENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn install_main_looper_waker(proxy: winit::event_loop::EventLoopProxy<MainLooperWake>) {
+    if MAIN_LOOPER_WAKER.set(proxy).is_err() {
+        tracing::warn!("main Looper waker already installed; keeping the first event loop's proxy");
+    }
+}
+
+fn wake_main_looper() {
+    let Some(proxy) = MAIN_LOOPER_WAKER.get() else {
+        return;
+    };
+    if MAIN_LOOPER_WAKE_SENT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    if proxy.send_event(MainLooperWake).is_err() {
+        tracing::debug!("main Looper wake dropped: the host event loop has exited");
+    }
+}
+
+pub fn pump_main_looper(vm: &Vm) -> Result<MainLooperDue, FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
@@ -11472,19 +11533,20 @@ pub fn pump_main_looper(vm: &Vm) -> Result<(), FrameworkError> {
     })
 }
 
-fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
+fn run_main_looper_once(env: &mut Env) -> Result<MainLooperDue, FrameworkError> {
     let already = MAIN_LOOPER_PUMP_IN_PROGRESS
         .try_with(|f| f.replace(true))
         .unwrap_or(true);
     if already {
-        return Ok(());
+        return Ok(MainLooperDue::Now);
     }
 
+    MAIN_LOOPER_WAKE_SENT.swap(false, std::sync::atomic::Ordering::AcqRel);
     run_pending_main_upcall(env);
     let result = drive_main_messages(env);
     let layout_result = dispatch_pending_global_layout(env);
     let _ = MAIN_LOOPER_PUMP_IN_PROGRESS.try_with(|f| f.set(false));
-    result?;
+    let due = result?;
     layout_result?;
 
     if !MAIN_LOOPER_PUMP_ACTIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -11492,12 +11554,19 @@ fn run_main_looper_once(env: &mut Env) -> Result<(), FrameworkError> {
             "main Looper pump active: dispatching main-thread messages from the winit loop"
         );
     }
-    Ok(())
+    Ok(due)
 }
 
 const MAIN_LOOPER_MESSAGE_BUDGET: usize = 512;
 
-fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
+fn main_looper_due_after_drain() -> MainLooperDue {
+    match message_queue::take_main_yield_deadline() {
+        Some(at) => MainLooperDue::At(at),
+        None => MainLooperDue::WhenWoken,
+    }
+}
+
+fn drive_main_messages(env: &mut Env) -> Result<MainLooperDue, FrameworkError> {
     if let Some(cache) = MAIN_LOOPER_JNI_CACHE.get() {
         return drive_main_messages_cached(env, cache);
     }
@@ -11561,16 +11630,16 @@ fn drive_main_messages(env: &mut Env) -> Result<(), FrameworkError> {
             Ok(true)
         })?;
         if !processed {
-            break;
+            return Ok(main_looper_due_after_drain());
         }
     }
-    Ok(())
+    Ok(MainLooperDue::Now)
 }
 
 fn drive_main_messages_cached(
     env: &mut Env,
     cache: &MainLooperJniCache,
-) -> Result<(), FrameworkError> {
+) -> Result<MainLooperDue, FrameworkError> {
     for _ in 0..MAIN_LOOPER_MESSAGE_BUDGET {
         let processed = env.with_local_frame(16, |env| -> Result<bool, FrameworkError> {
             let msg = checked(env, "MessageQueue.next (cached)", |env| {
@@ -11636,10 +11705,10 @@ fn drive_main_messages_cached(
             Ok(true)
         })?;
         if !processed {
-            break;
+            return Ok(main_looper_due_after_drain());
         }
     }
-    Ok(())
+    Ok(MainLooperDue::Now)
 }
 
 pub fn dispatch_click_to_view(
@@ -14722,6 +14791,16 @@ mod tests {
             main_looper_poll_should_yield(i32::MAX),
             "large delay must yield"
         );
+    }
+
+    #[test]
+    fn main_looper_due_maps_to_a_wake_deadline() {
+        let now = Instant::now();
+        let frame = now + std::time::Duration::from_millis(16);
+
+        assert_eq!(MainLooperDue::Now.deadline(now), Some(now));
+        assert_eq!(MainLooperDue::At(frame).deadline(now), Some(frame));
+        assert_eq!(MainLooperDue::WhenWoken.deadline(now), None);
     }
 
     #[test]
