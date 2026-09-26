@@ -1,6 +1,6 @@
 use std::ffi::{c_char, c_int};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::bionic_env::BionicEnv;
@@ -50,6 +50,8 @@ pub enum InitRunError {
 
     Apk(String),
 
+    Extract(PathBuf, String),
+
     Link(String),
 
     NoInitArray,
@@ -65,6 +67,7 @@ impl std::fmt::Display for InitRunError {
                 "no Roblox APK (set ECLIPSE_ROBLOX_APK or place it at the default dev-host path)"
             ),
             Self::Apk(e) => write!(f, "APK read: {e}"),
+            Self::Extract(dir, e) => write!(f, "extract native libs into {}: {e}", dir.display()),
             Self::Link(e) => write!(f, "map/relocate/resolve: {e}"),
             Self::NoInitArray => write!(f, "mapped libroblox.so has no DT_INIT_ARRAY"),
             Self::Setup(e) => write!(f, "harness setup: {e}"),
@@ -96,10 +99,7 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
 
     super::ndk_registry::set_apk_path(apk_path.clone());
 
-    let mut apk = crate::apk::Apk::open(&apk_path).map_err(|e| InitRunError::Apk(e.to_string()))?;
-    apk.extract_native_libs("x86_64", lib_dir)
-        .map_err(|e| InitRunError::Apk(e.to_string()))?;
-    let so_path = lib_dir.join("libroblox.so");
+    let so_path = extract_engine(&apk_path, lib_dir)?;
     let _ = writeln!(log, "libroblox.so: {}", so_path.display());
 
     let linker = Linker::new(Vec::<std::path::PathBuf>::new())
@@ -238,6 +238,13 @@ pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
     unsafe { libc::_exit(0) };
 }
 
+fn extract_engine(apk_path: &Path, lib_dir: &Path) -> Result<PathBuf, InitRunError> {
+    let mut apk = crate::apk::Apk::open(apk_path).map_err(|e| InitRunError::Apk(e.to_string()))?;
+    apk.extract_native_libs("x86_64", lib_dir)
+        .map_err(|e| InitRunError::Extract(lib_dir.to_path_buf(), e.to_string()))?;
+    Ok(lib_dir.join("libroblox.so"))
+}
+
 fn proc_maps_is_exec(addr: u64) -> Option<bool> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     for line in maps.lines() {
@@ -351,6 +358,43 @@ pub(super) fn write_hex(buf: &mut [u8], n: &mut usize, val: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::Cursor;
+
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    use super::super::link::tests::temp_dir;
+
+    #[test]
+    fn extraction_failure_names_the_destination_lib_dir() {
+        let root = temp_dir("init-extract-failure");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("lib/x86_64/libroblox.so", SimpleFileOptions::default())
+            .expect("start the engine entry");
+        writer
+            .write_all(b"\x7fELF")
+            .expect("write the engine entry");
+        let apk_path = root.join("fixture.apk");
+        std::fs::write(&apk_path, writer.finish().expect("finish").into_inner())
+            .expect("write the fixture APK");
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write the blocking file");
+        let lib_dir = blocker.join("native-libs");
+
+        let err = extract_engine(&apk_path, &lib_dir).expect_err("the lib dir is not creatable");
+
+        assert!(
+            matches!(&err, InitRunError::Extract(dir, _) if *dir == lib_dir),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&lib_dir.display().to_string()),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn init_array_count_divides_by_entry_size() {

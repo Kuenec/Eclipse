@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -21,9 +22,10 @@ fn display_available() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
 }
 
-fn run_eclipse(subcommand: &str) -> Output {
+fn run_eclipse(subcommand: &str, args: &[&OsStr]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_eclipse"))
         .arg(subcommand)
+        .args(args)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn eclipse {subcommand}: {e}"))
 }
@@ -51,7 +53,11 @@ fn run_libroblox_init_runs_all_3427_constructors() {
         return;
     }
 
-    let out = run_eclipse("__run-libroblox-init");
+    let lib_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("run-libroblox-init-{}", std::process::id()));
+    std::fs::create_dir_all(&lib_dir).expect("create the harness lib dir");
+    let out = run_eclipse("__run-libroblox-init", &[lib_dir.as_os_str()]);
+    std::fs::remove_dir_all(&lib_dir).expect("remove the harness lib dir");
     let text = combined(&out);
 
     assert!(
@@ -75,7 +81,7 @@ fn gl_test_renders_engine_surface_with_zero_gl_errors() {
         return;
     }
 
-    let out = run_eclipse("__gl-test");
+    let out = run_eclipse("__gl-test", &[]);
     let text = combined(&out);
 
     if !out.status.success() && gl_env_unavailable(&text) {
@@ -104,7 +110,7 @@ fn gl_test_anw_binds_real_wsi_handle() {
         return;
     }
 
-    let out = run_eclipse("__gl-test-anw");
+    let out = run_eclipse("__gl-test-anw", &[]);
     let text = combined(&out);
 
     if !out.status.success() && gl_env_unavailable(&text) {
@@ -142,7 +148,7 @@ fn webview_test_fires_load_upcalls_and_stages_frames() {
         return;
     }
 
-    let out = run_eclipse("__webview-test");
+    let out = run_eclipse("__webview-test", &[]);
     let text = combined(&out);
 
     if !out.status.success()
@@ -450,7 +456,7 @@ fn framework_overlay_preserves_activity_manager_memory_contract() {
 
 #[test]
 fn input_test_delivers_ident_then_looper_wake() {
-    let out = run_eclipse("__input-test");
+    let out = run_eclipse("__input-test", &[]);
     let text = combined(&out);
 
     assert!(

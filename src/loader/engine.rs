@@ -5,8 +5,9 @@ use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use jni::vm::JavaVM;
 use jni_sys::{
-    jint, JavaVM, JNI_VERSION_10, JNI_VERSION_1_2, JNI_VERSION_1_4, JNI_VERSION_1_6,
+    jint, JavaVM as RawJavaVM, JNI_VERSION_10, JNI_VERSION_1_2, JNI_VERSION_1_4, JNI_VERSION_1_6,
     JNI_VERSION_1_8, JNI_VERSION_9,
 };
 
@@ -41,7 +42,7 @@ pub fn is_preloaded(name: &str) -> bool {
 
 const JNI_ONLOAD_SYMBOL: &str = "JNI_OnLoad";
 
-pub struct LoadedEngine {
+struct LoadedEngine {
     mapped: MappedObject,
 
     soname: String,
@@ -51,23 +52,16 @@ pub struct LoadedEngine {
     init: Option<u64>,
 
     init_array: Option<(u64, u64)>,
-
-    constructors_run: usize,
 }
 
 impl LoadedEngine {
     #[must_use]
-    pub fn load_base(&self) -> u64 {
+    fn load_base(&self) -> u64 {
         self.mapped.load_base()
     }
 
     #[must_use]
-    pub fn constructors_run(&self) -> usize {
-        self.constructors_run
-    }
-
-    #[must_use]
-    pub fn jni_onload_addr(&self) -> Option<u64> {
+    fn jni_onload_addr(&self) -> Option<u64> {
         let provider = LoadedObjectProvider::new(self.load_base(), &self.dynsyms);
         provider
             .resolve(JNI_ONLOAD_SYMBOL)
@@ -75,14 +69,14 @@ impl LoadedEngine {
     }
 
     #[must_use]
-    pub fn resolve_export(&self, name: &str) -> Option<u64> {
+    fn resolve_export(&self, name: &str) -> Option<u64> {
         LoadedObjectProvider::new(self.load_base(), &self.dynsyms)
             .resolve(name)
             .map(|resolved| resolved.addr)
     }
 
     #[must_use]
-    pub fn java_native_exports(&self) -> Vec<(String, u64)> {
+    fn java_native_exports(&self) -> Vec<(String, u64)> {
         const SHN_UNDEF: u16 = 0;
         const STB_GLOBAL: u8 = 1;
         const STB_WEAK: u8 = 2;
@@ -215,7 +209,6 @@ fn map_resolve_app_lib(
         dynsyms: img.dynsyms,
         init: img.dyn_info.init,
         init_array,
-        constructors_run: 0,
     };
     match super::module_registry::ModuleRecord::for_image(
         &path,
@@ -250,41 +243,40 @@ impl LoadedEngine {
         constructor_addresses(&self.mapped, self.init, self.init_array)
             .map_err(|e| EngineLoadError::ReadInitArray(e.to_string()))
     }
+}
 
-    fn run_constructors(&mut self, constructors: &[u64], log: &mut impl Write) -> usize {
-        if constructors.is_empty() {
-            return 0;
-        }
-        let count = constructors.len();
-        let _ = writeln!(log, "engine-load: running {count} constructors…");
-        let _ = log.flush();
-
-        let arg0 = b"libroblox\0";
-        let mut argv: [*mut c_char; 2] = [arg0.as_ptr() as *mut c_char, std::ptr::null_mut()];
-        let mut envp: [*mut c_char; 1] = [std::ptr::null_mut()];
-        let argc: c_int = 1;
-
-        let mut completed = 0usize;
-        for &addr in constructors {
-            let ctor: extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char) =
-                unsafe { std::mem::transmute::<u64, _>(addr) };
-            ctor(argc, argv.as_mut_ptr(), envp.as_mut_ptr());
-            completed += 1;
-        }
-        self.constructors_run = completed;
-        let _ = writeln!(
-            log,
-            "engine-load: {completed}/{count} constructors completed ✓"
-        );
-        let _ = log.flush();
-        completed
+fn run_constructors(constructors: &[u64], log: &mut impl Write) -> usize {
+    if constructors.is_empty() {
+        return 0;
     }
+    let count = constructors.len();
+    let _ = writeln!(log, "engine-load: running {count} constructors…");
+    let _ = log.flush();
+
+    let arg0 = b"libroblox\0";
+    let mut argv: [*mut c_char; 2] = [arg0.as_ptr() as *mut c_char, std::ptr::null_mut()];
+    let mut envp: [*mut c_char; 1] = [std::ptr::null_mut()];
+    let argc: c_int = 1;
+
+    let mut completed = 0usize;
+    for &addr in constructors {
+        let ctor: extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char) =
+            unsafe { std::mem::transmute::<u64, _>(addr) };
+        ctor(argc, argv.as_mut_ptr(), envp.as_mut_ptr());
+        completed += 1;
+    }
+    let _ = writeln!(
+        log,
+        "engine-load: {completed}/{count} constructors completed ✓"
+    );
+    let _ = log.flush();
+    completed
 }
 
 fn call_jni_onload(
     engine: &LoadedEngine,
     addr: u64,
-    java_vm: *mut JavaVM,
+    java_vm: &JavaVM,
     log: &mut impl Write,
 ) -> jint {
     let _ = writeln!(
@@ -295,9 +287,9 @@ fn call_jni_onload(
     );
     let _ = log.flush();
 
-    let onload: extern "C" fn(*mut JavaVM, *mut c_void) -> jint =
+    let onload: extern "C" fn(*mut RawJavaVM, *mut c_void) -> jint =
         unsafe { std::mem::transmute::<u64, _>(addr) };
-    let version = onload(java_vm, std::ptr::null_mut());
+    let version = onload(java_vm.get_raw(), std::ptr::null_mut());
 
     let _ = writeln!(
         log,
@@ -334,7 +326,7 @@ pub struct PreloadedLib {
 pub fn load_app_native_lib(
     lib_dir: &Path,
     filename: &str,
-    java_vm: *mut JavaVM,
+    java_vm: &JavaVM,
     log: &mut impl Write,
 ) -> Result<Option<PreloadedLib>, EngineLoadError> {
     static EARLY_FAULT_TAP: std::sync::Once = std::sync::Once::new();
@@ -346,15 +338,48 @@ pub fn load_app_native_lib(
             );
         }
     });
-    link_and_initialize(lib_dir, filename, java_vm, log)
+    let Some((engine, constructors_run)) = link_and_construct(lib_dir, filename, log)? else {
+        return Ok(None);
+    };
+
+    let jni_onload_version = if let Some(addr) = engine.jni_onload_addr() {
+        Some(call_jni_onload(&engine, addr, java_vm, log))
+    } else {
+        let _ = writeln!(
+            log,
+            "engine-load: {} exports no JNI_OnLoad (lazy-native lib — ART binds Java_* on demand)",
+            engine.soname
+        );
+        None
+    };
+
+    let bound = super::jni_register::register_all_preloaded_natives(
+        java_vm,
+        &engine.java_native_exports(),
+        &engine.soname,
+        log,
+    );
+    if bound == 0 {
+        super::jni_register::register_preloaded_natives(
+            java_vm,
+            |name| engine.resolve_export(name),
+            log,
+        );
+    }
+
+    Ok(Some(PreloadedLib {
+        soname: engine.soname.clone(),
+        constructors_run,
+        jni_onload_version,
+        _engine: ProcessLifetimeEngine::new(engine),
+    }))
 }
 
-fn link_and_initialize(
+fn link_and_construct(
     lib_dir: &Path,
     filename: &str,
-    java_vm: *mut JavaVM,
     log: &mut impl Write,
-) -> Result<Option<PreloadedLib>, EngineLoadError> {
+) -> Result<Option<(LoadedEngine, usize)>, EngineLoadError> {
     if soname_is_loaded(filename) {
         let _ = writeln!(
             log,
@@ -363,12 +388,11 @@ fn link_and_initialize(
         return Ok(None);
     }
 
-    let mut engine = map_resolve_app_lib(lib_dir, filename, log)?;
+    let engine = map_resolve_app_lib(lib_dir, filename, log)?;
     let constructors = engine.constructor_addresses()?;
-    let jni_onload = engine.jni_onload_addr();
-    let soname = engine.soname.clone();
+    let soname = engine.soname.as_str();
 
-    if !register_soname(&soname) {
+    if !register_soname(soname) {
         let _ = writeln!(
             log,
             "engine-load: {soname} already loaded (deduped by soname) — skipping"
@@ -387,38 +411,8 @@ fn link_and_initialize(
         );
     }
 
-    let constructors_run = engine.run_constructors(&constructors, log);
-
-    let jni_onload_version = if let Some(addr) = jni_onload {
-        Some(call_jni_onload(&engine, addr, java_vm, log))
-    } else {
-        let _ = writeln!(
-            log,
-            "engine-load: {soname} exports no JNI_OnLoad (lazy-native lib — ART binds Java_* on demand)"
-        );
-        None
-    };
-
-    let bound = super::jni_register::register_all_preloaded_natives(
-        java_vm,
-        &engine.java_native_exports(),
-        &soname,
-        log,
-    );
-    if bound == 0 {
-        super::jni_register::register_preloaded_natives(
-            java_vm,
-            |name| engine.resolve_export(name),
-            log,
-        );
-    }
-
-    Ok(Some(PreloadedLib {
-        soname,
-        constructors_run,
-        jni_onload_version,
-        _engine: ProcessLifetimeEngine::new(engine),
-    }))
+    let constructors_run = run_constructors(&constructors, log);
+    Ok(Some((engine, constructors_run)))
 }
 
 fn describe_jni_version(version: jint) -> &'static str {
@@ -503,7 +497,7 @@ mod tests {
 
     static CONSTRUCTOR_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
-    extern "C" fn record_dt_init() {
+    extern "C" fn record_dt_init(_: c_int, _: *mut *mut c_char, _: *mut *mut c_char) {
         CONSTRUCTOR_ORDER.lock().unwrap().push("DT_INIT");
     }
 
@@ -531,16 +525,12 @@ mod tests {
         );
         write_so(&lib_dir, filename, &so);
 
-        let lib = link_and_initialize(
-            &lib_dir,
-            filename,
-            std::ptr::null_mut(),
-            &mut std::io::sink(),
-        )
-        .expect("load the constructor fixture")
-        .expect("first load is not deduped");
+        let (_engine, constructors_run) =
+            link_and_construct(&lib_dir, filename, &mut std::io::sink())
+                .expect("load the constructor fixture")
+                .expect("first load is not deduped");
 
-        assert_eq!(lib.constructors_run, 3);
+        assert_eq!(constructors_run, 3);
         assert_eq!(
             *CONSTRUCTOR_ORDER.lock().unwrap(),
             ["DT_INIT", "first", "second"]
@@ -558,12 +548,7 @@ mod tests {
             &build_so_with_unmapped_init_array(filename),
         );
 
-        let result = link_and_initialize(
-            &lib_dir,
-            filename,
-            std::ptr::null_mut(),
-            &mut std::io::sink(),
-        );
+        let result = link_and_construct(&lib_dir, filename, &mut std::io::sink());
 
         assert!(matches!(result, Err(EngineLoadError::ReadInitArray(_))));
         assert!(!is_preloaded(filename));
