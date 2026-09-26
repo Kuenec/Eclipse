@@ -28,6 +28,15 @@ pub struct InstalledVersion {
     pub version_name: Option<String>,
 }
 
+impl From<&ApkSet> for InstalledVersion {
+    fn from(set: &ApkSet) -> Self {
+        Self {
+            version_code: set.version_code(),
+            version_name: set.version_name().map(str::to_owned),
+        }
+    }
+}
+
 impl fmt::Display for InstalledVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.version_name {
@@ -85,13 +94,17 @@ impl Store {
         }
     }
 
-    pub fn usable_current(&self) -> Result<Option<InstalledVersion>, StoreError> {
-        match self.current_set() {
-            Ok(Some((installed, paths))) => Ok(ApkSet::open(paths).is_ok().then_some(installed)),
-            Ok(None) | Err(StoreError::Corrupt { .. } | StoreError::MissingInstall { .. }) => {
-                Ok(None)
-            }
-            Err(error) => Err(error),
+    pub fn verified_current(&self) -> Result<Option<ApkSet>, StoreError> {
+        match self.current_set()? {
+            Some((_, paths)) => Ok(Some(ApkSet::open(paths)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn usable_current(&self) -> Result<Option<ApkSet>, StoreError> {
+        match self.verified_current() {
+            Err(error) if error.is_unusable_install() => Ok(None),
+            current => current,
         }
     }
 
@@ -100,7 +113,7 @@ impl Store {
         for source in sources {
             staging.add_source(source)?;
         }
-        staging.commit(None)
+        staging.commit(None).map(|set| InstalledVersion::from(&set))
     }
 
     pub fn begin(&self) -> Result<Staging<'_>, StoreError> {
@@ -233,7 +246,7 @@ impl Staging<'_> {
         self.copy_in(source, role)
     }
 
-    pub fn commit(mut self, expected: Option<VersionCode>) -> Result<InstalledVersion, StoreError> {
+    pub fn commit(mut self, expected: Option<VersionCode>) -> Result<ApkSet, StoreError> {
         if !path_exists(&self.dir.join(BASE_APK))? {
             return Err(StoreError::NoBaseGiven);
         }
@@ -249,12 +262,8 @@ impl Staging<'_> {
         self.dir = partial;
 
         let paths = ApkSetPaths::locate(&self.dir)?;
-        let set = ApkSet::open(paths)?;
-        let installed = InstalledVersion {
-            version_code: set.version_code(),
-            version_name: set.version_name().map(str::to_owned),
-        };
-        drop(set);
+        let staged = ApkSet::open(paths)?;
+        let installed = InstalledVersion::from(&staged);
         if let Some(expected) = expected {
             if expected != installed.version_code {
                 return Err(StoreError::UnexpectedVersion {
@@ -265,20 +274,26 @@ impl Staging<'_> {
         }
 
         let target = self.store.version_dir(installed.version_code);
-        if path_exists(&target)? {
-            let existing = ApkSetPaths::locate(&target).and_then(ApkSet::open);
-            if existing.is_ok() {
+        let existing = if path_exists(&target)? {
+            ApkSetPaths::locate(&target).and_then(ApkSet::open).ok()
+        } else {
+            None
+        };
+        let set = match existing {
+            Some(existing) => {
+                drop(staged);
                 remove_dir_if_present(&self.dir)?;
-            } else {
+                existing
+            }
+            None => {
                 remove_dir_if_present(&target)?;
                 rename(&self.dir, &target)?;
+                staged.relocated(ApkSetPaths::locate(&target)?)?
             }
-        } else {
-            rename(&self.dir, &target)?;
-        }
+        };
         sync_dir(&self.store.root)?;
         self.store.activate(&installed)?;
-        Ok(installed)
+        Ok(set)
     }
 
     fn copy_in(&self, source: &Path, role: StagedFile) -> Result<(), StoreError> {
@@ -563,6 +578,15 @@ pub enum StoreError {
     },
 }
 
+impl StoreError {
+    pub fn is_unusable_install(&self) -> bool {
+        matches!(
+            self,
+            Self::Corrupt { .. } | Self::MissingInstall { .. } | Self::Set(_)
+        )
+    }
+}
+
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -818,15 +842,21 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    fn usable_version(store: &Store) -> Result<Option<InstalledVersion>, StoreError> {
+        store
+            .usable_current()
+            .map(|set| set.as_ref().map(InstalledVersion::from))
+    }
+
     #[test]
     fn only_an_install_that_still_verifies_is_usable() {
         let root = temp_root("usable");
         let store = Store::at(root.clone());
-        assert_eq!(store.usable_current().unwrap(), None, "nothing installed");
+        assert_eq!(usable_version(&store).unwrap(), None, "nothing installed");
 
         fs::write(root.join(CURRENT_FILE), b"not json").unwrap();
         assert_eq!(
-            store.usable_current().unwrap(),
+            usable_version(&store).unwrap(),
             None,
             "a corrupt install record"
         );
@@ -837,7 +867,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            store.usable_current().unwrap(),
+            usable_version(&store).unwrap(),
             None,
             "a record whose install directory is gone"
         );
@@ -851,14 +881,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            store.usable_current().unwrap(),
+            usable_version(&store).unwrap(),
             None,
             "an install that fails the Roblox signature check"
+        );
+        assert!(
+            matches!(
+                store.verified_current(),
+                Err(StoreError::Set(ApkSetError::Signature {
+                    source: SignatureError::MissingV2Signature,
+                    ..
+                }))
+            ),
+            "launching reports why the install failed verification"
         );
 
         fs::remove_file(root.join(CURRENT_FILE)).unwrap();
         fs::create_dir(root.join(CURRENT_FILE)).unwrap();
-        let err = store.usable_current().unwrap_err();
+        let err = usable_version(&store).unwrap_err();
         assert!(
             matches!(err, StoreError::Io { .. }),
             "an unreadable install record is an error: {err:?}"
@@ -908,7 +948,7 @@ mod tests {
 
         let staging = store.begin().unwrap();
         staging.add_source(&sources.join("roblox-x86.apk")).unwrap();
-        let err = staging.commit(None).unwrap_err();
+        let err = staging.commit(None).err().expect("no base APK was given");
         assert!(matches!(err, StoreError::NoBaseGiven), "{err:?}");
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&sources).ok();
@@ -1042,7 +1082,10 @@ mod tests {
 
         let staging = store.begin().unwrap();
         staging.add_source(&sources.join("arm-only.apks")).unwrap();
-        let err = staging.commit(None).unwrap_err();
+        let err = staging
+            .commit(None)
+            .err()
+            .expect("no x86_64 split was given");
         assert!(matches!(err, StoreError::NoNativeSplitGiven), "{err:?}");
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&sources).ok();
@@ -1074,16 +1117,20 @@ mod tests {
         let set = ApkSet::open(installed_paths).expect("the installed set verifies");
         assert_eq!(set.version_code(), installed.version_code);
         drop(set);
-        assert_eq!(store.usable_current().unwrap(), Some(installed.clone()));
+        assert_eq!(usable_version(&store).unwrap(), Some(installed.clone()));
 
-        fs::remove_file(
-            root.join(installed.version_code.to_string())
-                .join(NATIVE_SPLIT_APK),
-        )
-        .unwrap();
+        let version_dir = root.join(installed.version_code.to_string());
+        let staging = store.begin().unwrap();
+        staging.add_source(&sources).unwrap();
+        let kept = staging.commit(None).expect("reinstall the same version");
+        assert_eq!(kept.base_path(), version_dir.join(BASE_APK));
+        assert_eq!(kept.native_libs_path(), version_dir.join(NATIVE_SPLIT_APK));
+        drop(kept);
+
+        fs::remove_file(version_dir.join(NATIVE_SPLIT_APK)).unwrap();
         assert!(store.current_set().unwrap().is_some());
         assert_eq!(
-            store.usable_current().unwrap(),
+            usable_version(&store).unwrap(),
             None,
             "an install that lost its x86_64 split is not usable"
         );
@@ -1095,10 +1142,23 @@ mod tests {
             io::copy(&mut File::open(path).unwrap(), &mut writer).unwrap();
         }
         writer.finish().unwrap();
-        let reinstalled = store.install(&[bundle]).expect("install from a bundle");
-        assert_eq!(reinstalled, installed);
+        let staging = store.begin().unwrap();
+        staging.add_source(&bundle).unwrap();
+        let mut repaired = staging.commit(None).expect("install from a bundle");
+        assert_eq!(InstalledVersion::from(&repaired), installed);
+        assert_eq!(repaired.base_path(), version_dir.join(BASE_APK));
         assert_eq!(
-            store.usable_current().unwrap(),
+            repaired.native_libs_path(),
+            version_dir.join(NATIVE_SPLIT_APK)
+        );
+        assert!(repaired
+            .native_libs_mut()
+            .native_lib_filenames(crate::apk::TARGET_ABI)
+            .iter()
+            .any(|name| name == crate::apk::ENGINE_LIB));
+        drop(repaired);
+        assert_eq!(
+            usable_version(&store).unwrap(),
             Some(installed.clone()),
             "reinstalling repairs the damaged install"
         );

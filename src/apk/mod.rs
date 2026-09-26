@@ -702,6 +702,46 @@ impl ApkSet {
     pub fn native_libs_mut(&mut self) -> &mut Apk {
         self.native_split.as_mut().unwrap_or(&mut self.base)
     }
+
+    fn relocated(mut self, paths: ApkSetPaths) -> Result<Self, ApkSetError> {
+        claim_moved_member(&mut self.base, &paths.base)?;
+        match (self.native_split.as_mut(), paths.native_split.as_deref()) {
+            (Some(split), Some(path)) => claim_moved_member(split, path)?,
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(ApkSetError::Replaced(
+                    paths.base.with_file_name(NATIVE_SPLIT_APK),
+                ))
+            }
+            (None, Some(path)) => return Err(ApkSetError::Replaced(path.to_path_buf())),
+        }
+        self.paths = paths;
+        Ok(self)
+    }
+}
+
+fn claim_moved_member(apk: &mut Apk, path: &Path) -> Result<(), ApkSetError> {
+    let moved = match std::fs::metadata(path) {
+        Ok(moved) => moved,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ApkSetError::Replaced(path.to_path_buf()))
+        }
+        Err(source) => {
+            return Err(ApkSetError::Locate {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let verified = apk.file.metadata().map_err(|source| ApkSetError::Locate {
+        path: apk.path.clone(),
+        source,
+    })?;
+    if (moved.dev(), moved.ino()) != (verified.dev(), verified.ino()) {
+        return Err(ApkSetError::Replaced(path.to_path_buf()));
+    }
+    apk.path = path.to_path_buf();
+    Ok(())
 }
 
 fn verify_signature(path: &Path) -> Result<(), ApkSetError> {
@@ -842,6 +882,8 @@ pub enum ApkSetError {
         path: PathBuf,
         has_native_split: bool,
     },
+
+    Replaced(PathBuf),
 }
 
 impl fmt::Display for ApkSetError {
@@ -911,6 +953,12 @@ impl fmt::Display for ApkSetError {
                  and pass that directory",
                 path.display()
             ),
+            Self::Replaced(path) => write!(
+                f,
+                "{} is not the Roblox APK file that passed the signature check; it was replaced \
+                 while Eclipse installed it",
+                path.display()
+            ),
         }
     }
 }
@@ -927,7 +975,8 @@ impl std::error::Error for ApkSetError {
             | Self::NotNativeSplit { .. }
             | Self::MissingVersionCode(_)
             | Self::VersionMismatch { .. }
-            | Self::EngineMissing { .. } => None,
+            | Self::EngineMissing { .. }
+            | Self::Replaced(_) => None,
         }
     }
 }
@@ -1891,6 +1940,62 @@ mod tests {
         assert!(set.base_mut().native_lib_filenames(TARGET_ABI).is_empty());
         drop(set);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_verified_set_follows_its_own_files_to_a_new_directory_only() {
+        let base = build_apk(&[
+            (MANIFEST_ENTRY, &roblox_manifest(3056, None)),
+            ("classes.dex", b"dex"),
+        ]);
+        let split = build_apk(&[
+            (
+                MANIFEST_ENTRY,
+                &roblox_manifest(3056, Some(NATIVE_SPLIT_NAME)),
+            ),
+            ("lib/x86_64/libroblox.so", b"engine"),
+        ]);
+        let (staged, paths) = write_set("relocate-staged", &base, Some(&split));
+        let moved = staged.with_file_name(format!(
+            "eclipse-apk-set-test-relocate-moved-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&moved).ok();
+        let set = open_unsigned_set(paths).expect("consistent split set");
+        std::fs::rename(&staged, &moved).unwrap();
+        let set = set
+            .relocated(ApkSetPaths::locate(&moved).unwrap())
+            .expect("the verified files moved together");
+        assert_eq!(set.base_path(), moved.join(BASE_APK));
+        assert_eq!(set.native_libs_path(), moved.join(NATIVE_SPLIT_APK));
+        assert_eq!(set.base.path(), moved.join(BASE_APK));
+
+        let (copies, copy_paths) = write_set("relocate-copies", &base, Some(&split));
+        let err = set
+            .relocated(copy_paths)
+            .err()
+            .expect("copies are other files");
+        assert!(
+            matches!(&err, ApkSetError::Replaced(path) if *path == copies.join(BASE_APK)),
+            "{err:?}"
+        );
+
+        let set = open_unsigned_set(ApkSetPaths::locate(&moved).unwrap()).unwrap();
+        let base_only = temp_set_dir("relocate-base-only");
+        std::fs::hard_link(moved.join(BASE_APK), base_only.join(BASE_APK)).unwrap();
+        let err = set
+            .relocated(ApkSetPaths::locate(&base_only).unwrap())
+            .err()
+            .expect("the verified split is missing");
+        assert!(
+            matches!(&err, ApkSetError::Replaced(path) if *path == base_only.join(NATIVE_SPLIT_APK)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("signature check"), "{err}");
+
+        for dir in [moved, copies, base_only] {
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     #[test]

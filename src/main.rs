@@ -371,6 +371,8 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
 const NOT_INSTALLED: &str = "Roblox is not installed; sign in with `eclipse play-login` and run \
      `eclipse update`, or install the APKs with `eclipse install <PATH>`";
 
+const VERIFYING_SIGNATURE: &str = "# Verifying the Roblox client's signature…";
+
 const PLAY_LOGIN_STEPS: &str = "\
 Sign in to Google Play with your own Google account.
 
@@ -452,56 +454,104 @@ fn update_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
         .credentials()?
         .ok_or("not signed in to Google Play; run `eclipse play-login` first")?;
     let store = eclipse::apk::store::Store::open()?;
-    update_from_play(&account, &credentials, &store)
+    let current = store.usable_current()?;
+    update_from_play(&account, &credentials, &store, current.as_ref()).map(drop)
 }
 
 fn update_from_play(
     account: &eclipse::apk::play::Account,
     credentials: &eclipse::apk::play::Credentials,
     store: &eclipse::apk::store::Store,
-) -> Result<(), Box<dyn std::error::Error>> {
+    current: Option<&eclipse::apk::ApkSet>,
+) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
     use eclipse::apk::play::UpdateOutcome;
+    use eclipse::apk::store::InstalledVersion;
 
     println!("# Checking Google Play for the newest Roblox client…");
-    let outcome = eclipse::apk::play::update(credentials, store)?;
+    let outcome = eclipse::apk::play::update(credentials, store, current)?;
     account.record_check(std::time::SystemTime::now())?;
     match outcome {
-        UpdateOutcome::UpToDate { installed } => println!("Roblox {installed} is up to date"),
+        UpdateOutcome::UpToDate { installed } => {
+            println!("Roblox {installed} is up to date");
+            Ok(None)
+        }
         UpdateOutcome::Updated {
             previous: Some(previous),
-            installed,
-        } => println!("updated Roblox from {previous} to {installed}"),
+            set,
+        } => {
+            println!(
+                "updated Roblox from {previous} to {}",
+                InstalledVersion::from(&*set)
+            );
+            Ok(Some(*set))
+        }
         UpdateOutcome::Updated {
             previous: None,
-            installed,
-        } => println!("installed Roblox {installed}"),
+            set,
+        } => {
+            println!("installed Roblox {}", InstalledVersion::from(&*set));
+            Ok(Some(*set))
+        }
     }
-    Ok(())
 }
 
-fn update_if_due(store: &eclipse::apk::store::Store) -> Result<(), Box<dyn std::error::Error>> {
+fn update_if_due(
+    store: &eclipse::apk::store::Store,
+    current: Option<&eclipse::apk::ApkSet>,
+) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
     let account = eclipse::apk::play::Account::open()?;
     let Some(credentials) = account.credentials()? else {
-        return Ok(());
+        return Ok(None);
     };
     if !eclipse::apk::play::update_due(account.last_check()?, std::time::SystemTime::now()) {
-        return Ok(());
+        return Ok(None);
     }
-    update_from_play(&account, &credentials, store)
+    update_from_play(&account, &credentials, store, current)
 }
 
 fn installed_apk_set(
     check_for_update: bool,
-) -> Result<eclipse::apk::ApkSetPaths, Box<dyn std::error::Error>> {
+) -> Result<eclipse::apk::ApkSet, Box<dyn std::error::Error>> {
     let store = eclipse::apk::store::Store::open()?;
-    if check_for_update {
-        if let Err(error) = update_if_due(&store) {
+    println!("{VERIFYING_SIGNATURE}");
+    let set = if check_for_update {
+        installed_or_updated_set(&store, |current| update_if_due(&store, current))?
+    } else {
+        store.verified_current()?.ok_or(NOT_INSTALLED)?
+    };
+    println!(
+        "# Launching the installed Roblox {}",
+        eclipse::apk::store::InstalledVersion::from(&set)
+    );
+    Ok(set)
+}
+
+fn installed_or_updated_set(
+    store: &eclipse::apk::store::Store,
+    update: impl FnOnce(
+        Option<&eclipse::apk::ApkSet>,
+    ) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>>,
+) -> Result<eclipse::apk::ApkSet, Box<dyn std::error::Error>> {
+    let current = match store.verified_current() {
+        Err(error) if !error.is_unusable_install() => return Err(error.into()),
+        current => current,
+    };
+    let verified = current.as_ref().ok().and_then(Option::as_ref);
+    let verified_version = verified.map(eclipse::apk::ApkSet::version_code);
+    let set = match update(verified) {
+        Ok(Some(updated)) => Some(updated),
+        Ok(None) => current?,
+        Err(error) => {
             eprintln!("# WARNING: could not update Roblox from Google Play: {error}");
+            let recorded = store.current()?.map(|installed| installed.version_code);
+            if recorded == verified_version {
+                current?
+            } else {
+                store.verified_current()?
+            }
         }
-    }
-    let (installed, paths) = store.current_set()?.ok_or(NOT_INSTALLED)?;
-    println!("# Launching the installed Roblox {installed}");
-    Ok(paths)
+    };
+    Ok(set.ok_or(NOT_INSTALLED)?)
 }
 
 fn install_url_handler_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -584,12 +634,14 @@ fn run_apk(
     path: Option<&std::path::Path>,
     browser_place_id: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let paths = match path {
-        Some(path) => eclipse::apk::ApkSetPaths::locate(path)?,
+    let mut apks = match path {
+        Some(path) => {
+            let paths = eclipse::apk::ApkSetPaths::locate(path)?;
+            println!("{VERIFYING_SIGNATURE}");
+            eclipse::apk::ApkSet::open(paths)?
+        }
         None => installed_apk_set(browser_place_id.is_none())?,
     };
-    println!("# Verifying the Roblox client's signature…");
-    let mut apks = eclipse::apk::ApkSet::open(paths)?;
     let base_path = apks.base_path().to_path_buf();
     let apk_path = base_path
         .to_str()
@@ -1109,8 +1161,9 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_android_process, normalize_browser_launch, parse_libroblox_init_lib_dir,
-        parse_run_path, remove_other_native_lib_versions, url_handler_message,
+        finish_android_process, installed_or_updated_set, normalize_browser_launch,
+        parse_libroblox_init_lib_dir, parse_run_path, remove_other_native_lib_versions,
+        url_handler_message,
     };
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
@@ -1198,6 +1251,75 @@ mod tests {
         });
         assert!(flatpak.contains("nothing was written"), "{flatpak}");
         assert!(!flatpak.contains("handler installed"), "{flatpak}");
+    }
+
+    #[test]
+    fn an_unreadable_install_record_is_reported_without_updating() {
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-unreadable-install-record-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("current.json")).unwrap();
+        let store = eclipse::apk::store::Store::at(root.clone());
+
+        let mut updated = false;
+        let error = installed_or_updated_set(&store, |_| {
+            updated = true;
+            Ok(None)
+        })
+        .err()
+        .expect("an unreadable install record cannot be launched");
+        assert!(!updated, "an unreadable install record is not replaced");
+        assert!(
+            matches!(
+                error.downcast_ref(),
+                Some(eclipse::apk::store::StoreError::Io { .. })
+            ),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_failed_update_launches_the_client_the_store_records() {
+        let Some(paths) =
+            eclipse::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
+        else {
+            eprintln!("SKIP: set ECLIPSE_ROBLOX_APK to install the official Roblox APK set");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-failed-update-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let store = eclipse::apk::store::Store::at(root.clone());
+        let sources: Vec<std::path::PathBuf> = std::iter::once(paths.base)
+            .chain(paths.native_split)
+            .collect();
+
+        let committed = installed_or_updated_set(&store, |current| {
+            assert!(current.is_none(), "nothing is installed yet");
+            store.install(&sources)?;
+            Err("recording the update check failed".into())
+        })
+        .expect("the update committed before failing is launched");
+        let installed = store.current().unwrap().expect("the update was committed");
+        assert_eq!(committed.version_code(), installed.version_code);
+        drop(committed);
+
+        let kept = installed_or_updated_set(&store, |current| {
+            assert_eq!(
+                current.map(eclipse::apk::ApkSet::version_code),
+                Some(installed.version_code)
+            );
+            Err("Google Play is unreachable".into())
+        })
+        .expect("the verified install is launched");
+        assert_eq!(kept.version_code(), installed.version_code);
+        drop(kept);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

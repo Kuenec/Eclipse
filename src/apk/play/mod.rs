@@ -17,7 +17,8 @@ use ureq::http::Uri;
 
 use super::store::{InstalledVersion, Store, StoreError};
 use super::{
-    VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME, ROBLOX_PACKAGE,
+    ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME,
+    ROBLOX_PACKAGE,
 };
 use proto::{
     bytes_field, fixed64_field, message_at, repeated_bytes, string_field, varint_field, Encoder,
@@ -199,21 +200,24 @@ pub fn sign_in(email: &str, oauth_token: &Secret) -> Result<Credentials, PlayErr
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
     UpToDate {
         installed: InstalledVersion,
     },
     Updated {
         previous: Option<InstalledVersion>,
-        installed: InstalledVersion,
+        set: Box<ApkSet>,
     },
 }
 
-pub fn update(credentials: &Credentials, store: &Store) -> Result<UpdateOutcome, PlayError> {
+pub fn update(
+    credentials: &Credentials,
+    store: &Store,
+    current: Option<&ApkSet>,
+) -> Result<UpdateOutcome, PlayError> {
     let session = Session::start(credentials)?;
     let latest = session.latest_version()?;
-    let previous = store.usable_current()?;
+    let previous = current.map(InstalledVersion::from);
     if let Some(installed) = previous
         .as_ref()
         .filter(|installed| installed.version_code >= latest)
@@ -237,11 +241,8 @@ pub fn update(credentials: &Credentials, store: &Store) -> Result<UpdateOutcome,
         &delivery.native_split,
         &staging.dir().join(NATIVE_SPLIT_APK),
     )?;
-    let installed = staging.commit(Some(latest))?;
-    Ok(UpdateOutcome::Updated {
-        previous,
-        installed,
-    })
+    let set = Box::new(staging.commit(Some(latest))?);
+    Ok(UpdateOutcome::Updated { previous, set })
 }
 
 struct Session<'a> {
