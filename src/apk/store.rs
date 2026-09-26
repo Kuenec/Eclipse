@@ -4,6 +4,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ring::digest::SHA1_OUTPUT_LEN;
 use serde::{Deserialize, Serialize};
 use zip::result::ZipError;
 use zip::ZipArchive;
@@ -23,7 +24,7 @@ const PARTIAL_SUFFIX: &str = ".partial";
 const BUNDLE_EXTENSIONS: [&str; 3] = ["apks", "xapk", "apkm"];
 const XAPK_NATIVE_SPLIT: &str = "config.x86_64.apk";
 
-pub const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledVersion {
@@ -60,16 +61,37 @@ pub enum UpdateOutcome {
     },
 }
 
-pub fn update_due(last_check: Option<SystemTime>, now: SystemTime) -> bool {
-    last_check.is_none_or(|last| match now.duration_since(last) {
-        Ok(elapsed) => elapsed >= UPDATE_INTERVAL,
-        Err(_) => true,
-    })
+pub fn update_due(
+    installed: Option<VersionCode>,
+    last_check: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    installed.is_none()
+        || last_check.is_none_or(|last| match now.duration_since(last) {
+            Ok(elapsed) => elapsed >= UPDATE_INTERVAL,
+            Err(_) => true,
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub version_code: VersionCode,
+
+    pub base_sha1: [u8; SHA1_OUTPUT_LEN],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateCheck {
+    pub at: SystemTime,
+
+    pub rejected: Option<Release>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct LastCheck {
     checked_at_unix: u64,
+
+    rejected: Option<Release>,
 }
 
 pub struct Store {
@@ -134,7 +156,7 @@ impl Store {
         }
     }
 
-    pub fn last_check(&self) -> Result<Option<SystemTime>, StoreError> {
+    pub fn last_check(&self) -> Result<Option<UpdateCheck>, StoreError> {
         let path = self.root.join(LAST_CHECK_FILE);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -144,14 +166,26 @@ impl Store {
         let Ok(record) = serde_json::from_slice::<LastCheck>(&bytes) else {
             return Ok(None);
         };
-        Ok(UNIX_EPOCH.checked_add(Duration::from_secs(record.checked_at_unix)))
+        Ok(UNIX_EPOCH
+            .checked_add(Duration::from_secs(record.checked_at_unix))
+            .map(|at| UpdateCheck {
+                at,
+                rejected: record.rejected,
+            }))
     }
 
-    pub fn record_check(&self, at: SystemTime) -> Result<(), StoreError> {
-        let checked_at_unix = at
+    pub fn record_check(&self, check: &UpdateCheck) -> Result<(), StoreError> {
+        let checked_at_unix = check
+            .at
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
-        self.replace_json(LAST_CHECK_FILE, &LastCheck { checked_at_unix })
+        self.replace_json(
+            LAST_CHECK_FILE,
+            &LastCheck {
+                checked_at_unix,
+                rejected: check.rejected,
+            },
+        )
     }
 
     pub fn install(&self, sources: &[PathBuf]) -> Result<InstalledVersion, StoreError> {
@@ -888,26 +922,60 @@ mod tests {
     }
 
     #[test]
-    fn update_checks_are_due_every_six_hours() {
+    fn update_checks_are_due_every_six_hours_once_roblox_is_installed() {
         let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        assert!(update_due(None, now));
-        assert!(!update_due(Some(now - Duration::from_secs(60)), now));
+        let installed = Some(VersionCode(3170));
+        assert!(update_due(installed, None, now));
         assert!(!update_due(
+            installed,
+            Some(now - Duration::from_secs(60)),
+            now
+        ));
+        assert!(!update_due(
+            installed,
             Some(now - UPDATE_INTERVAL + Duration::from_secs(1)),
             now
         ));
-        assert!(update_due(Some(now - UPDATE_INTERVAL), now));
+        assert!(update_due(installed, Some(now - UPDATE_INTERVAL), now));
         assert!(
-            update_due(Some(now + Duration::from_secs(60)), now),
+            update_due(installed, Some(now + Duration::from_secs(60)), now),
             "a check recorded in the future is treated as stale"
+        );
+        assert!(
+            update_due(None, Some(now - Duration::from_secs(60)), now),
+            "without a usable install Roblox is downloaded despite a recent check"
         );
 
         let root = temp_root("last-check");
         let store = Store::at(root.clone());
         assert_eq!(store.last_check().unwrap(), None);
-        store.record_check(now).unwrap();
-        assert_eq!(store.last_check().unwrap(), Some(now));
+        let checked = UpdateCheck {
+            at: now,
+            rejected: None,
+        };
+        store.record_check(&checked).unwrap();
+        assert_eq!(store.last_check().unwrap(), Some(checked));
         assert_eq!(entries(&root), [LAST_CHECK_FILE]);
+
+        let rejected = UpdateCheck {
+            at: now,
+            rejected: Some(Release {
+                version_code: VersionCode(3170),
+                base_sha1: [0x40; SHA1_OUTPUT_LEN],
+            }),
+        };
+        store.record_check(&rejected).unwrap();
+        assert_eq!(store.last_check().unwrap(), Some(rejected));
+        fs::write(
+            root.join(LAST_CHECK_FILE),
+            b"{\"checked_at_unix\": 1800000000}",
+        )
+        .unwrap();
+        assert_eq!(
+            store.last_check().unwrap(),
+            Some(checked),
+            "a record without a rejected release rejects nothing"
+        );
 
         let record = root.join(LAST_CHECK_FILE);
         for damaged in [&b"{"[..], b"{\"checked_at_unix\": 18446744073709551615}"] {
@@ -918,8 +986,8 @@ mod tests {
                 "a damaged last-check record makes the update due"
             );
         }
-        store.record_check(now).unwrap();
-        assert_eq!(store.last_check().unwrap(), Some(now));
+        store.record_check(&checked).unwrap();
+        assert_eq!(store.last_check().unwrap(), Some(checked));
 
         fs::remove_file(&record).unwrap();
         fs::create_dir(&record).unwrap();
