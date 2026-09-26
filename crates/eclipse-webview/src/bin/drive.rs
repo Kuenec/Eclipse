@@ -351,7 +351,7 @@ fn handshake(d: &mut Drive) -> DResult<String> {
             }
             engine
         }
-        other => return fail(format!("expected HelloAck, got {}", name_of(&other))),
+        other => return fail(format!("expected HelloAck, got {}", other.name())),
     };
     println!("[{} ms] hello-ack engine={engine}", now_ms(d.start));
     Ok(engine)
@@ -378,7 +378,7 @@ fn await_view_closed(d: &mut Drive, phase: &str) -> DResult<()> {
             other => println!(
                 "[{} ms] (ignored while {phase}: {})",
                 now_ms(d.start),
-                name_of(&other)
+                other.name()
             ),
         }
     }
@@ -408,7 +408,7 @@ fn run_shutdown_with_open_view(d: &mut Drive) -> DResult<String> {
             other => println!(
                 "[{} ms] (ignored while awaiting the bootstrap frame: {})",
                 now_ms(d.start),
-                name_of(&other)
+                other.name()
             ),
         }
     }
@@ -486,7 +486,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
             other => println!(
                 "[{} ms] (ignored while loading: {})",
                 now_ms(start),
-                name_of(&other)
+                other.name()
             ),
         }
     }
@@ -526,7 +526,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
             other => println!(
                 "[{} ms] (ignored while sampling ink: {})",
                 now_ms(start),
-                name_of(&other)
+                other.name()
             ),
         }
     };
@@ -597,7 +597,7 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
             other => println!(
                 "[{} ms] (ignored while awaiting cookies: {})",
                 now_ms(start),
-                name_of(&other)
+                other.name()
             ),
         }
     };
@@ -658,7 +658,7 @@ fn load_data_with_about_blank_base(d: &mut Drive) -> DResult<u32> {
             other => println!(
                 "[{} ms] (ignored while loading data: {})",
                 now_ms(d.start),
-                name_of(&other)
+                other.name()
             ),
         }
     }
@@ -673,25 +673,6 @@ fn load_data_with_about_blank_base(d: &mut Drive) -> DResult<u32> {
         now_ms(d.start)
     );
     Ok(consoles)
-}
-
-fn name_of(msg: &HelperMsg) -> &'static str {
-    match msg {
-        HelperMsg::HelloAck { .. } => "HelloAck",
-        HelperMsg::LoadState { .. } => "LoadState",
-        HelperMsg::FrameBufferNew { .. } => "FrameBufferNew",
-        HelperMsg::FrameReady { .. } => "FrameReady",
-        HelperMsg::Console { .. } => "Console",
-        HelperMsg::Crash { .. } => "Crash",
-        HelperMsg::CookieList { .. } => "CookieList",
-        HelperMsg::ViewClosed { .. } => "ViewClosed",
-        HelperMsg::BridgeCall { .. } => "BridgeCall",
-        HelperMsg::EvaluateJsResult { .. } => "EvaluateJsResult",
-        HelperMsg::CookieSetResult { .. } => "CookieSetResult",
-        HelperMsg::CookieFlushDone { .. } => "CookieFlushDone",
-        HelperMsg::CookiesClearDone { .. } => "CookiesClearDone",
-        HelperMsg::NavigationState { .. } => "NavigationState",
-    }
 }
 
 fn reap(d: &mut Drive, expect_clean: bool) -> DResult<Option<i32>> {

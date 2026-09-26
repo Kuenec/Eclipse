@@ -528,14 +528,43 @@ enum Command {
     Dead,
 }
 
-fn write_helper_msg(stream: &UnixStream, msg: &HelperMsg) -> std::io::Result<()> {
-    match msg.encode() {
-        Ok(bytes) => (&mut &*stream).write_all(&bytes),
-        Err(e) => {
-            log::error(COMPONENT, &format!("outbound frame encode failed: {e}"));
-            Ok(())
+fn encode_helper_frame(msg: &HelperMsg) -> std::io::Result<Vec<u8>> {
+    let rejected = match msg.encode() {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
+    };
+    let fallback = match (&rejected, msg) {
+        (ProtoError::Oversized { .. }, HelperMsg::EvaluateJsResult { request_id, .. }) => {
+            log::warn(
+                COMPONENT,
+                &format!(
+                    "EvaluateJsResult request_id={request_id} exceeds the frame cap ({rejected}); \
+                     replying ok=false"
+                ),
+            );
+            HelperMsg::EvaluateJsResult {
+                request_id: *request_id,
+                ok: false,
+                value_json: "null".to_string(),
+            }
         }
-    }
+        _ => {
+            return Err(std::io::Error::other(format!(
+                "cannot encode {}: {rejected}",
+                msg.name()
+            )))
+        }
+    };
+    fallback.encode().map_err(|e| {
+        std::io::Error::other(format!(
+            "cannot encode the {} fallback: {e}",
+            fallback.name()
+        ))
+    })
+}
+
+fn write_helper_msg(stream: &UnixStream, msg: &HelperMsg) -> std::io::Result<()> {
+    (&mut &*stream).write_all(&encode_helper_frame(msg)?)
 }
 
 fn run_writer(queue: OutQueue, stream: UnixStream) {
@@ -1027,6 +1056,36 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_over_cap_evaluate_js_result_is_answered_with_a_failure() {
+        let msg = HelperMsg::EvaluateJsResult {
+            request_id: 41,
+            ok: true,
+            value_json: "x".repeat(8 * 1024 * 1024),
+        };
+        let bytes = encode_helper_frame(&msg).expect("fallback frame");
+        assert_eq!(
+            proto::read_helper_msg(&mut bytes.as_slice()),
+            Ok(HelperMsg::EvaluateJsResult {
+                request_id: 41,
+                ok: false,
+                value_json: "null".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_unencodable_message_without_a_fallback_is_an_error() {
+        let msg = HelperMsg::BridgeCall {
+            view: 1,
+            call_id: 2,
+            payload_json: "x".repeat(8 * 1024 * 1024),
+        };
+        let err = encode_helper_frame(&msg).expect_err("over-cap BridgeCall");
+        assert!(err.to_string().contains("BridgeCall"), "{err}");
+        assert!(!err.to_string().contains("xxxx"), "payload leaked: {err}");
+    }
 
     #[test]
     fn writer_exits_on_stop_while_a_cef_held_outbox_clone_is_still_alive() {

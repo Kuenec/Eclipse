@@ -473,14 +473,13 @@ fn type_cap(dir: Dir, type_byte: u8) -> Option<u32> {
             _ => None,
         },
         Dir::FromHelper => match type_byte {
-            ht::BRIDGE_CALL | ht::EVALUATE_JS_RESULT => Some(PAYLOAD_CAP),
+            ht::BRIDGE_CALL | ht::EVALUATE_JS_RESULT | ht::COOKIE_LIST => Some(PAYLOAD_CAP),
             ht::HELLO_ACK
             | ht::LOAD_STATE
             | ht::FRAME_BUFFER_NEW
             | ht::FRAME_READY
             | ht::CONSOLE
             | ht::CRASH
-            | ht::COOKIE_LIST
             | ht::VIEW_CLOSED
             | ht::COOKIE_SET_RESULT
             | ht::COOKIE_FLUSH_DONE
@@ -771,6 +770,25 @@ impl ConsumerMsg {
 }
 
 impl HelperMsg {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::HelloAck { .. } => "HelloAck",
+            Self::LoadState { .. } => "LoadState",
+            Self::FrameBufferNew { .. } => "FrameBufferNew",
+            Self::FrameReady { .. } => "FrameReady",
+            Self::Console { .. } => "Console",
+            Self::Crash { .. } => "Crash",
+            Self::CookieList { .. } => "CookieList",
+            Self::ViewClosed { .. } => "ViewClosed",
+            Self::BridgeCall { .. } => "BridgeCall",
+            Self::EvaluateJsResult { .. } => "EvaluateJsResult",
+            Self::CookieSetResult { .. } => "CookieSetResult",
+            Self::CookieFlushDone { .. } => "CookieFlushDone",
+            Self::CookiesClearDone { .. } => "CookiesClearDone",
+            Self::NavigationState { .. } => "NavigationState",
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut b = Vec::new();
         let t = match self {
@@ -1961,6 +1979,28 @@ mod tests {
         assert_eq!(
             read_helper_msg(&mut bytes.as_slice()).expect("decode helper v4"),
             helper
+        );
+    }
+
+    #[test]
+    fn cookie_list_carries_a_full_chromium_cookie_jar_for_one_url() {
+        let cookie = |i: usize| CookieEntry {
+            name: format!("n{i:03}"),
+            value: "v".repeat(4096 - 4),
+            domain: "d".repeat(1024),
+            path: "p".repeat(1024),
+            secure: i.is_multiple_of(2),
+            http_only: i.is_multiple_of(3),
+        };
+        let msg = HelperMsg::CookieList {
+            request_id: 9,
+            cookies: (0..180).map(cookie).collect(),
+        };
+        let bytes = msg.encode().expect("a 180-cookie jar fits the frame cap");
+        assert_eq!(bytes[4], ht::COOKIE_LIST);
+        assert_eq!(
+            read_helper_msg(&mut bytes.as_slice()).expect("decode the full jar"),
+            msg
         );
     }
 
