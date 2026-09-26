@@ -33,6 +33,8 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 
 const OUT_QUEUE_HIGH_WATER: usize = 1024;
 
+const FLATPAK_INFO: &str = "/.flatpak-info";
+
 fn parse_ipc_fd<I: Iterator<Item = String>>(args: I) -> Result<RawFd, String> {
     let mut found: Option<RawFd> = None;
     for arg in args {
@@ -753,28 +755,45 @@ fn main() -> ExitCode {
     }
 
     let allow_unsandboxed = std::env::args().any(|a| a == "--allow-unsandboxed");
-    let suid_path = std::env::current_exe()
-        .ok()
-        .as_deref()
-        .and_then(Path::parent)
-        .and_then(probe_suid_sandbox);
-    let sandbox_mode =
-        match engine::select_sandbox_mode(probe_userns(), suid_path.is_some(), allow_unsandboxed) {
-            Ok(mode) => mode,
-            Err(e) => {
-                log::error(COMPONENT, &e.to_string());
-                let _ = write_helper_msg(
-                    &stream,
-                    &HelperMsg::Crash {
-                        view: 0,
-                        kind: 1,
-                        code: 2,
-                    },
-                );
-                return ExitCode::FAILURE;
-            }
+    let (sandbox_host, suid_path) = if engine::zypak_sandbox_available(
+        Path::new(FLATPAK_INFO).exists(),
+        std::env::var_os("ZYPAK_BIN").as_deref(),
+        std::env::var_os("ZYPAK_LIB").as_deref(),
+    ) {
+        (engine::SandboxHost::FlatpakZypak, None)
+    } else {
+        let suid_path = std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(probe_suid_sandbox);
+        let host = engine::SandboxHost::Native {
+            userns_ok: probe_userns(),
+            suid_ok: suid_path.is_some(),
         };
+        (host, suid_path)
+    };
+    let sandbox_mode = match engine::select_sandbox_mode(sandbox_host, allow_unsandboxed) {
+        Ok(mode) => mode,
+        Err(e) => {
+            log::error(COMPONENT, &e.to_string());
+            let _ = write_helper_msg(
+                &stream,
+                &HelperMsg::Crash {
+                    view: 0,
+                    kind: 1,
+                    code: 2,
+                },
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     match &sandbox_mode {
+        engine::SandboxMode::Zypak => log::info(
+            COMPONENT,
+            "sandbox mode selected: zypak (Flatpak; zypak emulates the setuid chrome-sandbox and \
+             spawns the sandboxed Chromium children through the Flatpak portal)",
+        ),
         engine::SandboxMode::Userns => log::info(
             COMPONENT,
             "sandbox mode selected: userns (unprivileged user namespaces verified USABLE by a \
