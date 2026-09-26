@@ -54,10 +54,22 @@ impl KdeConfigWriter {
     }
 }
 
-pub(super) fn install_url_handler() -> Result<PathBuf, Box<dyn std::error::Error>> {
+#[derive(Debug)]
+pub(super) enum UrlHandlerInstall {
+    Registered {
+        desktop_path: PathBuf,
+    },
+    FlatpakExport {
+        app_id: String,
+        desktop_path: PathBuf,
+    },
+}
+
+pub(super) fn install_url_handler() -> Result<UrlHandlerInstall, Box<dyn std::error::Error>> {
     match std::fs::read_to_string(FLATPAK_INFO) {
         Ok(info) => flatpak_exported_handler(&info),
-        Err(error) if error.kind() == ErrorKind::NotFound => install_host_url_handler(),
+        Err(error) if error.kind() == ErrorKind::NotFound => install_host_url_handler()
+            .map(|desktop_path| UrlHandlerInstall::Registered { desktop_path }),
         Err(error) => Err(io::Error::new(
             error.kind(),
             format!("cannot read {FLATPAK_INFO} to detect the Flatpak sandbox: {error}"),
@@ -66,7 +78,7 @@ pub(super) fn install_url_handler() -> Result<PathBuf, Box<dyn std::error::Error
     }
 }
 
-fn flatpak_exported_handler(info: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn flatpak_exported_handler(info: &str) -> Result<UrlHandlerInstall, Box<dyn std::error::Error>> {
     let app_id = flatpak_app_id(info).ok_or_else(|| {
         io::Error::new(
             ErrorKind::InvalidData,
@@ -84,8 +96,10 @@ fn flatpak_exported_handler(info: &str) -> Result<PathBuf, Box<dyn std::error::E
         )
         .into());
     }
-    println!("{}", flatpak_handler_notice(app_id, &desktop_path));
-    Ok(desktop_path)
+    Ok(UrlHandlerInstall::FlatpakExport {
+        app_id: app_id.to_owned(),
+        desktop_path,
+    })
 }
 
 fn flatpak_app_id(info: &str) -> Option<&str> {
@@ -106,7 +120,7 @@ fn flatpak_url_handler_path(app_id: &str) -> PathBuf {
     Path::new(FLATPAK_APPLICATIONS_DIR).join(format!("{app_id}{FLATPAK_URL_HANDLER_SUFFIX}"))
 }
 
-fn flatpak_handler_notice(app_id: &str, desktop_path: &Path) -> String {
+pub(super) fn flatpak_handler_notice(app_id: &str, desktop_path: &Path) -> String {
     let desktop_id = desktop_path
         .file_name()
         .map(OsStr::to_string_lossy)
