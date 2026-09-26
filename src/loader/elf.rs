@@ -693,7 +693,7 @@ impl<'a> ElfImage<'a> {
         vaddr: u64,
         size: u64,
         out: &mut Vec<Rela>,
-    ) -> Result<(), ElfError> {
+    ) -> Result<usize, ElfError> {
         let base = self.vaddr_to_off(vaddr)?;
 
         let end = base
@@ -776,7 +776,7 @@ impl<'a> ElfImage<'a> {
             }
             produced += group_size;
         }
-        Ok(())
+        Ok(cur)
     }
 
     fn read_rela_table(&self, vaddr: u64, size: u64, out: &mut Vec<Rela>) -> Result<(), ElfError> {
@@ -1362,9 +1362,19 @@ pub(crate) mod tests {
     }
 
     fn decode_aps2(stream: &[u8]) -> Vec<Rela> {
-        let (buf, _) = build_aps2_image(stream);
+        let (buf, vaddr) = build_aps2_image(stream);
         let img = ElfImage::parse(&buf).expect("aps2 fixture parses");
-        img.relocations().expect("aps2 decodes")
+        let mut relas = Vec::new();
+        let consumed = img
+            .decode_android_packed_rela(vaddr, stream.len() as u64, &mut relas)
+            .expect("aps2 decodes");
+        assert_eq!(
+            consumed,
+            stream.len(),
+            "the decoder consumes the whole stream"
+        );
+        assert_eq!(relas, img.relocations().expect("aps2 decodes"));
+        relas
     }
 
     #[test]
@@ -1617,22 +1627,14 @@ pub(crate) mod tests {
 
     #[test]
     fn real_libroblox_engine_decodes_headline_facts() {
-        let candidates: Vec<std::path::PathBuf> = std::env::var_os("ECLIPSE_ROBLOX_APK")
-            .map(std::path::PathBuf::from)
-            .into_iter()
-            .chain(std::env::var_os("HOME").map(|home| {
-                std::path::Path::new(&home)
-                    .join("eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk")
-            }))
-            .collect();
-        let Some(apk_path) = candidates.iter().find(|p| p.exists()) else {
-            eprintln!(
-                "real_libroblox_engine_decodes_headline_facts: no Roblox APK in {candidates:?}; skipping"
-            );
+        let Some(paths) = crate::apk::ApkSetPaths::from_env()
+            .expect("ECLIPSE_ROBLOX_APK must name an APK or a directory holding base.apk")
+        else {
+            eprintln!("real_libroblox_engine_decodes_headline_facts: no Roblox APK; skipping");
             return;
         };
 
-        let mut apk = crate::apk::Apk::open(apk_path).expect("open Roblox APK");
+        let mut apk = crate::apk::Apk::open(paths.native_libs()).expect("open Roblox APK");
         let bytes = apk
             .read_entry("lib/x86_64/libroblox.so")
             .expect("read lib/x86_64/libroblox.so from APK");
@@ -1681,46 +1683,89 @@ pub(crate) mod tests {
 
         let (av, asz) = img.dyn_info.android_rela.unwrap();
         let mut packed = Vec::new();
-        img.decode_android_packed_rela(av, asz, &mut packed)
+        let consumed = img
+            .decode_android_packed_rela(av, asz, &mut packed)
             .expect("APS2 decode");
-        assert_eq!(
-            packed.len(),
-            527_297,
-            "libroblox.so: APS2 decoded reloc count"
+        let section_start = img.vaddr_to_off(av).expect("APS2 section offset");
+        let section_end = section_start + usize::try_from(asz).expect("APS2 size fits usize");
+        assert!(
+            bytes[section_start + consumed..section_end]
+                .iter()
+                .all(|&byte| byte == 0),
+            "libroblox.so: the APS2 decoder consumes the whole section apart from zero padding"
         );
+        assert!(!packed.is_empty(), "libroblox.so: APS2 carries relocations");
         let count_type = |t: u32| packed.iter().filter(|r| r.r_type == t).count();
+        let relative = count_type(R_X86_64_RELATIVE);
+        let glob_dat = count_type(reloc::R_X86_64_GLOB_DAT);
+        let abs64 = count_type(reloc::R_X86_64_64);
+        assert!(relative > 0, "libroblox.so: APS2 carries RELATIVE relocs");
+        assert!(glob_dat > 0, "libroblox.so: APS2 carries GLOB_DAT relocs");
         assert_eq!(
-            count_type(R_X86_64_RELATIVE),
-            527_208,
-            "libroblox.so: APS2 RELATIVE count"
-        );
-        assert_eq!(
-            count_type(reloc::R_X86_64_GLOB_DAT),
-            67,
-            "libroblox.so: APS2 GLOB_DAT count"
-        );
-        assert_eq!(
-            count_type(reloc::R_X86_64_64),
-            22,
-            "libroblox.so: APS2 R_X86_64_64 count"
+            relative + glob_dat + abs64,
+            packed.len(),
+            "libroblox.so: every APS2 reloc is RELATIVE, GLOB_DAT or R_X86_64_64"
         );
 
+        let (_, plt_size) = img
+            .dyn_info
+            .jmprel
+            .expect("libroblox.so: expected DT_JMPREL (.rela.plt)");
+        let plt_relocs =
+            usize::try_from(plt_size / reloc_ent_size()).expect("plt entry count fits usize");
         let relas = img.relocations().expect("relocations decode");
+        let jump_slots = relas
+            .iter()
+            .filter(|r| r.r_type == reloc::R_X86_64_JUMP_SLOT)
+            .count();
+        assert!(jump_slots > 0, "libroblox.so: .rela.plt carries JUMP_SLOTs");
         assert_eq!(
-            relas.len(),
-            527_843,
-            "libroblox.so: total relocations (APS2 + .rela.plt)"
+            jump_slots, plt_relocs,
+            "libroblox.so: every .rela.plt entry is a JUMP_SLOT"
         );
-        assert_eq!(
-            relas
-                .iter()
-                .filter(|r| r.r_type == reloc::R_X86_64_JUMP_SLOT)
-                .count(),
-            546,
-            "libroblox.so: std .rela.plt JUMP_SLOT count"
-        );
+
+        let in_writable_load = |offset: u64| {
+            img.loads.iter().any(|seg| {
+                seg.flags & PF_W != 0
+                    && offset >= seg.vaddr
+                    && offset + 8 <= seg.vaddr + seg.mem_size
+            })
+        };
+        let mut slots = std::collections::HashSet::with_capacity(relas.len());
+        for rela in &relas {
+            assert_eq!(
+                rela.offset % 8,
+                0,
+                "libroblox.so: relocation slot {:#x} is 8-byte aligned",
+                rela.offset
+            );
+            assert!(
+                slots.insert(rela.offset),
+                "libroblox.so: relocation slot {:#x} is relocated once",
+                rela.offset
+            );
+            assert!(
+                in_writable_load(rela.offset),
+                "libroblox.so: relocation slot {:#x} lies in a writable PT_LOAD",
+                rela.offset
+            );
+        }
+
+        let relro = img.relro.expect("libroblox.so: PT_GNU_RELRO");
+        for rela in relas.iter().filter(|rela| {
+            matches!(
+                rela.r_type,
+                reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT
+            )
+        }) {
+            assert!(
+                rela.offset >= relro.vaddr && rela.offset + 8 <= relro.vaddr + relro.mem_size,
+                "libroblox.so: GOT slot {:#x} lies in PT_GNU_RELRO",
+                rela.offset
+            );
+        }
         eprintln!(
-            "real_libroblox_engine_decodes_headline_facts: loads={} needed={} init_arraysz={:?} APS2_decoded={} (RELATIVE 527208 + GLOB_DAT 67 + 64×22) + std_relocs={} → total {}",
+            "real_libroblox_engine_decodes_headline_facts: loads={} needed={} init_arraysz={:?} APS2_decoded={} (RELATIVE {relative} + GLOB_DAT {glob_dat} + 64×{abs64}) + std_relocs={} → total {}",
             img.loads.len(),
             needed.len(),
             img.dyn_info.init_array.map(|(_, sz)| sz),
@@ -1744,14 +1789,13 @@ pub(crate) mod tests {
 
     #[test]
     fn real_apk_dynsym_counts_match_the_dynsym_section() {
-        let Some(apk_path) = std::env::var_os("ECLIPSE_ROBLOX_APK")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.exists())
+        let Some(paths) =
+            crate::apk::ApkSetPaths::from_env().expect("ECLIPSE_ROBLOX_APK must be usable")
         else {
             eprintln!("real_apk_dynsym_counts_match_the_dynsym_section: no Roblox APK; skipping");
             return;
         };
-        let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
+        let mut apk = crate::apk::Apk::open(paths.native_libs()).expect("open Roblox APK");
         for name in ["libroblox.so", "libbacktrace-native.so"] {
             let bytes = apk
                 .read_entry(&format!("lib/x86_64/{name}"))

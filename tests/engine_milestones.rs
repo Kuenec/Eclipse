@@ -3,19 +3,26 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn roblox_apk_present() -> bool {
-    if let Some(p) = std::env::var_os("ECLIPSE_ROBLOX_APK") {
-        if PathBuf::from(p).exists() {
-            return true;
-        }
+    eclipse::apk::ApkSetPaths::from_env()
+        .expect("ECLIPSE_ROBLOX_APK must name an APK or a directory holding base.apk")
+        .is_some()
+}
+
+fn completed_constructor_counts(output: &str) -> Option<(u64, u64)> {
+    let (_, tail) = output.split_once("ALL ")?;
+    let (counts, rest) = tail.split_once(' ')?;
+    if !rest.starts_with("constructors completed without a crash") {
+        return None;
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let default =
-            PathBuf::from(home).join("eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk");
-        if default.exists() {
-            return true;
-        }
-    }
-    false
+    let (done, total) = counts.split_once('/')?;
+    Some((done.parse().ok()?, total.parse().ok()?))
+}
+
+fn declared_constructor_count(output: &str) -> Option<u64> {
+    let (_, tail) = output.split_once("DT_INIT_ARRAY: ")?;
+    let line = tail.lines().next()?;
+    let (_, count) = line.rsplit_once("-> ")?;
+    count.strip_suffix(" constructors")?.parse().ok()
 }
 
 fn display_available() -> bool {
@@ -44,11 +51,11 @@ fn gl_env_unavailable(output: &str) -> bool {
 }
 
 #[test]
-fn run_libroblox_init_runs_all_3427_constructors() {
+fn run_libroblox_init_runs_every_constructor() {
     if !roblox_apk_present() {
         eprintln!(
-            "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK or place it at \
-             $HOME/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk)"
+            "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
+             holding base.apk and split_config.x86_64.apk)"
         );
         return;
     }
@@ -65,10 +72,19 @@ fn run_libroblox_init_runs_all_3427_constructors() {
         "__run-libroblox-init exited non-zero ({:?}); a constructor likely faulted.\n{text}",
         out.status.code()
     );
-    assert!(
-        text.contains("ALL 3427/3427 constructors completed without a crash"),
-        "missing the 'ALL 3427/3427 constructors completed' marker — fewer than 3,427 constructors \
-         ran (loader/relocation/resolve regression or a constructor crash?).\n{text}"
+    let declared = declared_constructor_count(&text)
+        .unwrap_or_else(|| panic!("missing the DT_INIT_ARRAY constructor count line.\n{text}"));
+    let (completed, total) = completed_constructor_counts(&text).unwrap_or_else(|| {
+        panic!(
+            "missing the 'ALL n/n constructors completed' marker (loader/relocation/resolve \
+             regression or a constructor crash?).\n{text}"
+        )
+    });
+    assert!(declared > 0, "libroblox declares constructors.\n{text}");
+    assert_eq!(
+        (completed, total),
+        (declared, declared),
+        "every DT_INIT_ARRAY constructor must run.\n{text}"
     );
 }
 
@@ -136,8 +152,8 @@ fn gl_test_anw_binds_real_wsi_handle() {
 fn webview_test_fires_load_upcalls_and_stages_frames() {
     if !roblox_apk_present() {
         eprintln!(
-            "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK or place it at \
-             $HOME/eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk)"
+            "SKIP: Roblox APK absent (set ECLIPSE_ROBLOX_APK to an APK file or to a directory \
+             holding base.apk and split_config.x86_64.apk)"
         );
         return;
     }
