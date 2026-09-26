@@ -83,7 +83,6 @@ impl PathGeometry {
         self.points.extend_from_slice(&[cx, cy, x, y]);
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn cubic_to(&mut self, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
         self.verbs.push(Verb::CubicTo);
         self.points.extend_from_slice(&[c1x, c1y, c2x, c2y, x, y]);
@@ -196,21 +195,25 @@ pub fn with_path<R>(
     Ok(f(geometry))
 }
 
-pub fn free(handle: PathHandle) -> Result<(), PathRegistryError> {
+pub fn take(handle: PathHandle) -> Result<PathGeometry, PathRegistryError> {
     let (index, generation) = unpack(handle);
     let mut reg = lock()?;
     let slot = reg
         .slots
         .get_mut(index as usize)
         .ok_or(PathRegistryError::OutOfRange)?;
-    if slot.generation != generation || slot.geometry.is_none() {
+    if slot.generation != generation {
         return Err(PathRegistryError::StaleHandle);
     }
-    slot.geometry = None;
+    let geometry = slot.geometry.take().ok_or(PathRegistryError::StaleHandle)?;
 
     slot.generation = slot.generation.saturating_add(1);
     reg.free.push(index);
-    Ok(())
+    Ok(geometry)
+}
+
+pub fn free(handle: PathHandle) -> Result<(), PathRegistryError> {
+    take(handle).map(drop)
 }
 
 #[cfg(test)]

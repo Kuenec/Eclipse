@@ -45,6 +45,7 @@ pub struct BitmapState {
 
 struct Slot {
     generation: u32,
+    refs: u32,
     state: Option<BitmapState>,
 }
 
@@ -71,9 +72,18 @@ fn lock() -> Result<std::sync::MutexGuard<'static, Registry>, BitmapRegistryErro
 }
 
 pub fn store(state: BitmapState) -> Result<BitmapHandle, BitmapRegistryError> {
+    insert(state, 1)
+}
+
+pub fn store_unowned(state: BitmapState) -> Result<BitmapHandle, BitmapRegistryError> {
+    insert(state, 0)
+}
+
+fn insert(state: BitmapState, refs: u32) -> Result<BitmapHandle, BitmapRegistryError> {
     let mut reg = lock()?;
     if let Some(index) = reg.free.pop() {
         let slot = &mut reg.slots[index as usize];
+        slot.refs = refs;
         slot.state = Some(state);
         return Ok(pack(index, slot.generation));
     }
@@ -84,6 +94,7 @@ pub fn store(state: BitmapState) -> Result<BitmapHandle, BitmapRegistryError> {
         .map_err(|_| BitmapRegistryError::OutOfRange)?;
     reg.slots.push(Slot {
         generation: 1,
+        refs,
         state: Some(state),
     });
     Ok(pack(index, 1))
@@ -109,9 +120,11 @@ pub fn with_bitmap<R>(
     Ok(f(state))
 }
 
-pub fn free(handle: BitmapHandle) -> Result<(), BitmapRegistryError> {
+fn live_slot(
+    reg: &mut Registry,
+    handle: BitmapHandle,
+) -> Result<(u32, &mut Slot), BitmapRegistryError> {
     let (index, generation) = unpack(handle);
-    let mut reg = lock()?;
     let slot = reg
         .slots
         .get_mut(index as usize)
@@ -119,9 +132,38 @@ pub fn free(handle: BitmapHandle) -> Result<(), BitmapRegistryError> {
     if slot.generation != generation || slot.state.is_none() {
         return Err(BitmapRegistryError::StaleHandle);
     }
+    Ok((index, slot))
+}
+
+fn release_slot(reg: &mut Registry, index: u32) {
+    let slot = &mut reg.slots[index as usize];
     slot.state = None;
+    slot.refs = 0;
     slot.generation = slot.generation.saturating_add(1);
     reg.free.push(index);
+}
+
+pub fn free(handle: BitmapHandle) -> Result<(), BitmapRegistryError> {
+    let mut reg = lock()?;
+    let (index, _) = live_slot(&mut reg, handle)?;
+    release_slot(&mut reg, index);
+    Ok(())
+}
+
+pub fn retain(handle: BitmapHandle) -> Result<(), BitmapRegistryError> {
+    let mut reg = lock()?;
+    let (_, slot) = live_slot(&mut reg, handle)?;
+    slot.refs = slot.refs.saturating_add(1);
+    Ok(())
+}
+
+pub fn release(handle: BitmapHandle) -> Result<(), BitmapRegistryError> {
+    let mut reg = lock()?;
+    let (index, slot) = live_slot(&mut reg, handle)?;
+    slot.refs = slot.refs.saturating_sub(1);
+    if slot.refs == 0 {
+        release_slot(&mut reg, index);
+    }
     Ok(())
 }
 
@@ -166,5 +208,37 @@ mod tests {
         );
         assert_eq!(free(old), Err(BitmapRegistryError::StaleHandle));
         free(new).expect("free new");
+    }
+
+    #[test]
+    fn unowned_slot_is_freed_when_its_first_owner_releases_it() {
+        let h = store_unowned(BitmapState::default()).expect("store unowned");
+        retain(h).expect("first retain takes ownership");
+        assert_eq!(with_bitmap(h, |_| ()), Ok(()), "retained slot stays live");
+        release(h).expect("release");
+        assert_eq!(
+            with_bitmap(h, |_| ()),
+            Err(BitmapRegistryError::StaleHandle),
+            "the last release frees the slot"
+        );
+    }
+
+    #[test]
+    fn bitmap_owned_slot_survives_a_retain_release_pair_until_recycled() {
+        let h = store(BitmapState::default()).expect("store owned");
+        retain(h).expect("retain");
+        release(h).expect("release");
+        assert_eq!(
+            with_bitmap(h, |_| ()),
+            Ok(()),
+            "the owning Bitmap still holds the slot"
+        );
+        free(h).expect("recycle frees immediately");
+        assert_eq!(
+            release(h),
+            Err(BitmapRegistryError::StaleHandle),
+            "a release after recycle is a stale no-op"
+        );
+        assert_eq!(retain(h), Err(BitmapRegistryError::StaleHandle));
     }
 }

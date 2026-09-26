@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use jni::objects::JObject;
-use jni::refs::Global;
+use jni::refs::{Global, Weak};
 use jni::sys::jlong;
+use jni::Env;
 
 static VIEWS: OnceLock<Mutex<Registry>> = OnceLock::new();
 
@@ -73,6 +74,13 @@ impl Default for LayoutParams {
     }
 }
 
+#[derive(Debug)]
+pub enum ViewObject {
+    Peer(Weak<JObject<'static>>),
+
+    Owned(Global<JObject<'static>>),
+}
+
 #[derive(Debug, Default)]
 pub struct ViewState {
     pub class_name: String,
@@ -85,7 +93,7 @@ pub struct ViewState {
 
     pub clickable: bool,
 
-    pub jobject: Option<Global<JObject<'static>>>,
+    pub jobject: Option<ViewObject>,
 
     pub background_color: Option<i32>,
 
@@ -200,18 +208,19 @@ pub fn set_frame(handle: ViewHandle, frame: [i32; 4]) -> Result<(), ViewRegistry
     with_view(handle, move |v| v.frame = Some(frame))
 }
 
-pub fn set_jobject(
-    handle: ViewHandle,
-    jobject: Global<JObject<'static>>,
-) -> Result<(), ViewRegistryError> {
+pub fn set_jobject(handle: ViewHandle, jobject: ViewObject) -> Result<(), ViewRegistryError> {
     with_view(handle, move |v| v.jobject = Some(jobject))
 }
 
-pub fn with_jobject<R>(
+pub fn local_jobject<'local>(
+    env: &mut Env<'local>,
     handle: ViewHandle,
-    f: impl FnOnce(&Global<JObject<'static>>) -> R,
-) -> Result<Option<R>, ViewRegistryError> {
-    with_view(handle, |v| v.jobject.as_ref().map(f))
+) -> Result<jni::errors::Result<Option<JObject<'local>>>, ViewRegistryError> {
+    with_view(handle, |v| match &v.jobject {
+        None => Ok(None),
+        Some(ViewObject::Peer(peer)) => peer.upgrade_local(env),
+        Some(ViewObject::Owned(owner)) => env.new_local_ref(owner.as_obj()).map(Some),
+    })
 }
 
 pub fn add_text_watcher(
@@ -430,6 +439,7 @@ pub fn snapshot_tree() -> Vec<RenderNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::fake_jvm;
 
     #[test]
     fn allocate_returns_distinct_nonzero_handles() {
@@ -808,16 +818,51 @@ mod tests {
     }
 
     #[test]
-    fn with_jobject_is_none_without_a_recorded_object_and_err_when_stale() {
-        let h = allocate("android.widget.ImageButton").expect("alloc");
+    fn local_jobject_is_none_without_a_recorded_object_and_err_when_stale() {
+        fake_jvm::with_env(|env| {
+            let h = allocate("android.widget.ImageButton").expect("alloc");
 
-        assert_eq!(with_jobject(h, |_| 1i32), Ok(None));
-        free(h).expect("free");
+            assert!(matches!(local_jobject(env, h), Ok(Ok(None))));
+            free(h).expect("free");
 
-        assert_eq!(
-            with_jobject(h, |_| 1i32),
-            Err(ViewRegistryError::StaleHandle)
-        );
+            assert!(matches!(
+                local_jobject(env, h),
+                Err(ViewRegistryError::StaleHandle)
+            ));
+        });
+    }
+
+    #[test]
+    fn peer_object_is_weak_and_owned_object_is_strong() {
+        fake_jvm::with_env(|env| {
+            let peer_view = fake_jvm::new_object(env);
+            let peer = allocate("android.widget.Button").expect("alloc peer");
+            let weak = env.new_weak_ref(&peer_view).expect("weak ref");
+            set_jobject(peer, ViewObject::Peer(weak)).expect("record peer");
+
+            let owned_view = fake_jvm::new_object(env);
+            let owned = allocate("android.webkit.WebView").expect("alloc owned");
+            let global = env.new_global_ref(&owned_view).expect("global ref");
+            set_jobject(owned, ViewObject::Owned(global)).expect("record owned");
+
+            assert_eq!(fake_jvm::strong_refs(&peer_view), 0);
+            assert!(matches!(local_jobject(env, peer), Ok(Ok(Some(_)))));
+            assert!(fake_jvm::collect(&peer_view), "a peer never pins its view");
+            assert!(
+                matches!(local_jobject(env, peer), Ok(Ok(None))),
+                "a collected peer reads as a stale view"
+            );
+
+            assert!(
+                !fake_jvm::collect(&owned_view),
+                "an owned view stays reachable"
+            );
+            assert!(matches!(local_jobject(env, owned), Ok(Ok(Some(_)))));
+
+            free(peer).expect("free peer");
+            free(owned).expect("free owned");
+            assert_eq!(fake_jvm::strong_refs(&owned_view), 0);
+        });
     }
 
     #[test]
