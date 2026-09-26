@@ -10,6 +10,10 @@ public class SystemProperties {
     return null;
   }
 
+  public static int getInt(String prop, int def) {
+    return 0;
+  }
+
   public static long getLong(String prop, long def) {
     return 0;
   }
