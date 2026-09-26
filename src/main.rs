@@ -38,12 +38,6 @@ NOTE: Eclipse runs only the official, unmodified Roblox client signed by Roblox 
     It never hosts or modifies it. `eclipse update` downloads Roblox's own release files from
     APKCombo (or Google Play with --play) and installs them only when Roblox's signature
     verifies; anything else is discarded.
-
-STATUS:
-    `run` parses the manifest, prints the ART boot plan, boots the vendored ART VM with
-    Roblox's Java on the classpath, then opens the host game window (winit, no GTK). The
-    framework that drives the launcher Activity to onCreate and renders the engine into the
-    window is the next phase (component-map F). See docs/.
 ";
 
 fn main() -> ExitCode {
