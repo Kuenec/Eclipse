@@ -2,12 +2,23 @@ name: Flatpak
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*.*.*"
+    paths:
+      - "**/Cargo.lock"
+      - packaging/flatpak/cargo-sources.json
+      - packaging/flatpak/check-cargo-sources.py
+  pull_request:
+    paths:
+      - "**/Cargo.lock"
+      - packaging/flatpak/cargo-sources.json
+      - packaging/flatpak/check-cargo-sources.py
   workflow_dispatch:
 
 concurrency:
-  group: flatpak
+  group: ${{ github.ref_type == 'tag' && 'flatpak-publish' || format('flatpak-{0}', github.ref) }}
   cancel-in-progress: false
 
 permissions:
@@ -20,8 +31,21 @@ env:
   FLATHUB_REPO: https://dl.flathub.org/repo/flathub.flatpakrepo
 
 jobs:
+  cargo-sources:
+    name: Check the vendored Cargo sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Check that cargo-sources.json vendors every crate in the Cargo.lock files
+        run: python3 packaging/flatpak/check-cargo-sources.py
+
   build:
     name: Build Flatpak
+    needs: cargo-sources
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
@@ -37,6 +61,15 @@ jobs:
       - name: Resolve the GitHub Pages URL (Settings, Pages, Source must be GitHub Actions)
         id: pages
         uses: actions/configure-pages@v6
+
+      - name: Build the Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6.8
+        with:
+          manifest-path: packaging/flatpak/io.github.kuenec.Eclipse.yml
+          branch: ${{ env.FLATPAK_BRANCH }}
+          build-bundle: false
+          repo-dir: build-repo
+          cache-key: flatpak-builder-x86_64-${{ hashFiles('packaging/flatpak/**') }}
 
       - name: Import the repository signing key from the FLATPAK_GPG_PRIVATE_KEY secret
         id: gpg
@@ -77,15 +110,12 @@ jobs:
               ;;
           esac
 
-      - name: Build and sign the Flatpak
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6.8
-        with:
-          manifest-path: packaging/flatpak/io.github.kuenec.Eclipse.yml
-          branch: ${{ env.FLATPAK_BRANCH }}
-          build-bundle: false
-          repo-dir: repo
-          cache-key: flatpak-builder-${{ hashFiles('packaging/flatpak/**') }}
-          gpg-sign: ${{ steps.gpg.outputs.fingerprint }}
+      - name: Sign the application build into the repository without its debug symbols
+        env:
+          GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+        run: |
+          flatpak build-commit-from --src-repo=build-repo --gpg-sign="$GPG_FINGERPRINT" \
+            --no-update-summary repo "app/$FLATPAK_ID/x86_64/$FLATPAK_BRANCH"
 
       - name: Prune the repository and create the bundle and repository descriptions
         env:
