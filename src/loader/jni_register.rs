@@ -44,8 +44,7 @@ const PRELOADED_NATIVES: &[PreloadedNative] = &[
     },
 ];
 
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn register_preloaded_natives(
+pub(crate) fn register_preloaded_natives(
     java_vm: *mut RawJavaVM,
     resolve_export: impl Fn(&str) -> Option<u64>,
     log: &mut impl Write,
@@ -165,8 +164,7 @@ fn select_bindings<'a>(
         .collect()
 }
 
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn register_all_preloaded_natives(
+pub(crate) fn register_all_preloaded_natives(
     java_vm: *mut RawJavaVM,
     exports: &[(String, u64)],
     lib_label: &str,

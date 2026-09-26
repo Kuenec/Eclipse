@@ -2,8 +2,6 @@
 
 use std::fmt;
 
-#[allow(unused_imports)]
-use super::reloc;
 use super::reloc::Rela;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -825,9 +823,9 @@ fn offset_after(base: usize, delta: usize) -> Result<usize, ElfError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::loader::reloc::{apply_rela, SliceImage, SymbolResolver, R_X86_64_RELATIVE};
+    use crate::loader::reloc::{self, apply_rela, SliceImage, SymbolResolver, R_X86_64_RELATIVE};
 
     const PH_OFF: usize = 0x40;
     const DYN_OFF: u64 = 0x200;
@@ -853,27 +851,26 @@ mod tests {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn put_phdr(
-        buf: &mut [u8],
-        idx: usize,
-        p_type: u32,
-        p_flags: u32,
-        p_offset: u64,
-        p_vaddr: u64,
-        p_filesz: u64,
-        p_memsz: u64,
-        p_align: u64,
-    ) {
+    pub(crate) struct ProgramHeader {
+        pub(crate) p_type: u32,
+        pub(crate) p_flags: u32,
+        pub(crate) p_offset: u64,
+        pub(crate) p_vaddr: u64,
+        pub(crate) p_filesz: u64,
+        pub(crate) p_memsz: u64,
+        pub(crate) p_align: u64,
+    }
+
+    pub(crate) fn put_phdr(buf: &mut [u8], idx: usize, header: &ProgramHeader) {
         let ph = PH_OFF + idx * PHDR_SIZE;
-        put_u32(buf, ph, p_type);
-        put_u32(buf, ph + 4, p_flags);
-        put_u64(buf, ph + 8, p_offset);
-        put_u64(buf, ph + 16, p_vaddr);
-        put_u64(buf, ph + 24, p_vaddr);
-        put_u64(buf, ph + 32, p_filesz);
-        put_u64(buf, ph + 40, p_memsz);
-        put_u64(buf, ph + 48, p_align);
+        put_u32(buf, ph, header.p_type);
+        put_u32(buf, ph + 4, header.p_flags);
+        put_u64(buf, ph + 8, header.p_offset);
+        put_u64(buf, ph + 16, header.p_vaddr);
+        put_u64(buf, ph + 24, header.p_vaddr);
+        put_u64(buf, ph + 32, header.p_filesz);
+        put_u64(buf, ph + 40, header.p_memsz);
+        put_u64(buf, ph + 48, header.p_align);
     }
 
     fn put_dyn(buf: &mut [u8], slot: usize, tag: i64, val: u64) {
@@ -900,26 +897,42 @@ mod tests {
         put_phdr(
             &mut buf,
             0,
-            PT_LOAD,
-            PF_R | PF_W,
-            0,
-            0,
-            IMG_SIZE as u64,
-            IMG_SIZE as u64,
-            0x1000,
+            &ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: PF_R | PF_W,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_filesz: IMG_SIZE as u64,
+                p_memsz: IMG_SIZE as u64,
+                p_align: 0x1000,
+            },
         );
         put_phdr(
             &mut buf,
             1,
-            PT_DYNAMIC,
-            PF_R | PF_W,
-            DYN_OFF,
-            DYN_OFF,
-            0x100,
-            0x100,
-            8,
+            &ProgramHeader {
+                p_type: PT_DYNAMIC,
+                p_flags: PF_R | PF_W,
+                p_offset: DYN_OFF,
+                p_vaddr: DYN_OFF,
+                p_filesz: 0x100,
+                p_memsz: 0x100,
+                p_align: 8,
+            },
         );
-        put_phdr(&mut buf, 2, PT_TLS, PF_R, 0xa00, 0xa00, 0x20, 0x40, 0x10);
+        put_phdr(
+            &mut buf,
+            2,
+            &ProgramHeader {
+                p_type: PT_TLS,
+                p_flags: PF_R,
+                p_offset: 0xa00,
+                p_vaddr: 0xa00,
+                p_filesz: 0x20,
+                p_memsz: 0x40,
+                p_align: 0x10,
+            },
+        );
 
         let mut slot = 0;
         let dyn_entry = |buf: &mut [u8], slot: &mut usize, tag: i64, val: u64| {
@@ -1307,24 +1320,28 @@ mod tests {
         put_phdr(
             &mut buf,
             0,
-            PT_LOAD,
-            PF_R | PF_W,
-            0,
-            0,
-            IMG_SIZE as u64,
-            IMG_SIZE as u64,
-            0x1000,
+            &ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: PF_R | PF_W,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_filesz: IMG_SIZE as u64,
+                p_memsz: IMG_SIZE as u64,
+                p_align: 0x1000,
+            },
         );
         put_phdr(
             &mut buf,
             1,
-            PT_DYNAMIC,
-            PF_R | PF_W,
-            DYN_OFF,
-            DYN_OFF,
-            0x100,
-            0x100,
-            8,
+            &ProgramHeader {
+                p_type: PT_DYNAMIC,
+                p_flags: PF_R | PF_W,
+                p_offset: DYN_OFF,
+                p_vaddr: DYN_OFF,
+                p_filesz: 0x100,
+                p_memsz: 0x100,
+                p_align: 8,
+            },
         );
 
         buf[APS2_VADDR as usize..APS2_VADDR as usize + aps2_stream.len()]
@@ -1920,9 +1937,31 @@ mod tests {
         put_u16(&mut buf, 56, 2);
 
         put_phdr(
-            &mut buf, 0, PT_LOAD, PF_R, 0x2000, 0x2000, 0x1000, 0x1000, 0x1000,
+            &mut buf,
+            0,
+            &ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: PF_R,
+                p_offset: 0x2000,
+                p_vaddr: 0x2000,
+                p_filesz: 0x1000,
+                p_memsz: 0x1000,
+                p_align: 0x1000,
+            },
         );
-        put_phdr(&mut buf, 1, PT_LOAD, PF_R, 0x0, 0x0, 0x1000, 0x1000, 0x1000);
+        put_phdr(
+            &mut buf,
+            1,
+            &ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: PF_R,
+                p_offset: 0x0,
+                p_vaddr: 0x0,
+                p_filesz: 0x1000,
+                p_memsz: 0x1000,
+                p_align: 0x1000,
+            },
+        );
         let img = ElfImage::parse(&buf).expect("no dynamic → header/phdr-only parse");
 
         assert_eq!(img.vaddr_to_off(0x10).unwrap(), 0x10);

@@ -253,23 +253,29 @@ pub(crate) unsafe extern "C" fn eclipse_dl_iterate_phdr(
     )
 }
 
-#[allow(clippy::type_complexity)]
-fn dladdr_lookup(
-    modules: &[ModuleRecord],
-    addr: u64,
-) -> Option<(*const c_char, u64, Option<(*const c_char, u64)>)> {
+struct DladdrHit {
+    fname: *const c_char,
+    fbase: u64,
+    symbol: Option<(*const c_char, u64)>,
+}
+
+fn dladdr_lookup(modules: &[ModuleRecord], addr: u64) -> Option<DladdrHit> {
     let m = modules
         .iter()
         .find(|m| addr >= m.base && addr - m.base < m.span)?;
     let rel = addr - m.base;
 
     let idx = m.syms.partition_point(|s| s.value <= rel);
-    let sym = m.syms[..idx]
+    let symbol = m.syms[..idx]
         .iter()
         .rev()
         .find(|s| rel < s.value + s.size)
         .map(|s| (s.name.as_ptr(), m.base + s.value));
-    Some((m.name.as_ptr(), m.base, sym))
+    Some(DladdrHit {
+        fname: m.name.as_ptr(),
+        fbase: m.base,
+        symbol,
+    })
 }
 
 pub(crate) unsafe extern "C" fn eclipse_dladdr(
@@ -280,15 +286,15 @@ pub(crate) unsafe extern "C" fn eclipse_dladdr(
         return 0;
     }
     let guard = MODULES.read().unwrap_or_else(|e| e.into_inner());
-    if let Some((fname, fbase, sym)) = dladdr_lookup(&guard, addr as u64) {
-        let (sname, saddr) = match sym {
+    if let Some(hit) = dladdr_lookup(&guard, addr as u64) {
+        let (sname, saddr) = match hit.symbol {
             Some((n, a)) => (n, a as *mut c_void),
             None => (std::ptr::null(), std::ptr::null_mut()),
         };
 
         unsafe {
-            (*info).dli_fname = fname;
-            (*info).dli_fbase = fbase as *mut c_void;
+            (*info).dli_fname = hit.fname;
+            (*info).dli_fbase = hit.fbase as *mut c_void;
             (*info).dli_sname = sname;
             (*info).dli_saddr = saddr;
         }
@@ -500,23 +506,25 @@ mod tests {
             ],
         )];
 
-        let (fname, fbase, sym) =
-            dladdr_lookup(&mods, 0x7f00_0000_0000 + 0x120).expect("module hit");
+        let hit = dladdr_lookup(&mods, 0x7f00_0000_0000 + 0x120).expect("module hit");
 
-        let fname = unsafe { std::ffi::CStr::from_ptr(fname) };
+        let fname = unsafe { std::ffi::CStr::from_ptr(hit.fname) };
         assert_eq!(fname.to_str().unwrap(), "/tmp/mod.so");
-        assert_eq!(fbase, 0x7f00_0000_0000);
-        let (sname, saddr) = sym.expect("containing symbol");
+        assert_eq!(hit.fbase, 0x7f00_0000_0000);
+        let (sname, saddr) = hit.symbol.expect("containing symbol");
 
         let sname = unsafe { std::ffi::CStr::from_ptr(sname) };
         assert_eq!(sname.to_str().unwrap(), "alpha");
         assert_eq!(saddr, 0x7f00_0000_0000 + 0x100);
 
-        let (_, _, sym) = dladdr_lookup(&mods, 0x7f00_0000_0000 + 0x150).expect("module hit");
-        assert!(sym.is_none(), "non-contained address must yield no symbol");
+        let hit = dladdr_lookup(&mods, 0x7f00_0000_0000 + 0x150).expect("module hit");
+        assert!(
+            hit.symbol.is_none(),
+            "non-contained address must yield no symbol"
+        );
 
-        let (_, _, sym) = dladdr_lookup(&mods, 0x7f00_0000_0000 + 0x300).expect("module hit");
-        assert!(sym.is_none(), "zero-size symbols never match");
+        let hit = dladdr_lookup(&mods, 0x7f00_0000_0000 + 0x300).expect("module hit");
+        assert!(hit.symbol.is_none(), "zero-size symbols never match");
 
         assert!(dladdr_lookup(&mods, 0x1000).is_none());
     }

@@ -540,6 +540,7 @@ fn tls_err_static(e: &super::tls::TlsError) -> &'static str {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::loader::elf::tests::{put_phdr, ProgramHeader};
     use crate::loader::elf::{PF_R, PF_W, PF_X};
     use crate::loader::reloc::R_X86_64_GLOB_DAT;
     use std::io::Write;
@@ -597,29 +598,6 @@ pub(crate) mod tests {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn put_phdr(
-        buf: &mut [u8],
-        idx: usize,
-        p_type: u32,
-        p_flags: u32,
-        p_offset: u64,
-        p_vaddr: u64,
-        p_filesz: u64,
-        p_memsz: u64,
-        p_align: u64,
-    ) {
-        let ph = PH_OFF + idx * PHDR_SIZE;
-        put_u32(buf, ph, p_type);
-        put_u32(buf, ph + 4, p_flags);
-        put_u64(buf, ph + 8, p_offset);
-        put_u64(buf, ph + 16, p_vaddr);
-        put_u64(buf, ph + 24, p_vaddr);
-        put_u64(buf, ph + 32, p_filesz);
-        put_u64(buf, ph + 40, p_memsz);
-        put_u64(buf, ph + 48, p_align);
-    }
-
     pub(crate) fn build_so(
         soname: &str,
         needed: &[&str],
@@ -643,24 +621,28 @@ pub(crate) mod tests {
         put_phdr(
             &mut buf,
             0,
-            PT_LOAD,
-            PF_R | PF_W | PF_X,
-            0,
-            0,
-            IMG_SIZE as u64,
-            IMG_SIZE as u64,
-            PAGE,
+            &ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: PF_R | PF_W | PF_X,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_filesz: IMG_SIZE as u64,
+                p_memsz: IMG_SIZE as u64,
+                p_align: PAGE,
+            },
         );
         put_phdr(
             &mut buf,
             1,
-            PT_DYNAMIC,
-            PF_R | PF_W,
-            DYN_OFF,
-            DYN_OFF,
-            0x100,
-            0x100,
-            8,
+            &ProgramHeader {
+                p_type: PT_DYNAMIC,
+                p_flags: PF_R | PF_W,
+                p_offset: DYN_OFF,
+                p_vaddr: DYN_OFF,
+                p_filesz: 0x100,
+                p_memsz: 0x100,
+                p_align: 8,
+            },
         );
 
         let mut strtab = vec![0u8];
