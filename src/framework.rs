@@ -6105,7 +6105,16 @@ extern "system" fn web_view_native_load_data_with_base_url<'local>(
         let (w, h) = web_view_dims(widget);
         match env.get_java_vm() {
             Ok(java_vm) => match crate::webview::client::drive_load_data(
-                java_vm, widget, base, data_s, mime_s, encoding_s, w, h,
+                java_vm,
+                widget,
+                crate::webview::client::DataLoad {
+                    base_url: base,
+                    data: data_s,
+                    mime: mime_s,
+                    encoding: encoding_s,
+                },
+                w,
+                h,
             ) {
                 Ok(()) => tracing::info!(
                     target: "android.webkit.WebView",
@@ -7519,17 +7528,7 @@ extern "system" fn web_view_cookie_manager_set_cookie<'local>(
             }
         }
         if let Ok(java_vm) = env.get_java_vm() {
-            let _ = crate::webview::client::cookie_set(
-                java_vm,
-                fixed.url,
-                c.name,
-                c.value,
-                c.domain,
-                c.path,
-                c.secure,
-                c.http_only,
-                c.expires_epoch_s,
-            );
+            let _ = crate::webview::client::cookie_set(java_vm, fixed.url, c);
         }
         Ok(())
     })
@@ -7566,19 +7565,8 @@ extern "system" fn web_view_cookie_manager_set_cookie_cb<'local>(
         }
         match env.get_java_vm() {
             Ok(java_vm) => {
-                if crate::webview::client::cookie_set_with_result(
-                    java_vm,
-                    request_id,
-                    fixed.url,
-                    c.name,
-                    c.value,
-                    c.domain,
-                    c.path,
-                    c.secure,
-                    c.http_only,
-                    c.expires_epoch_s,
-                )
-                .is_err()
+                if crate::webview::client::cookie_set_with_result(java_vm, request_id, fixed.url, c)
+                    .is_err()
                 {
                     if let Some(g) = cookie_set_callbacks()
                         .lock()
@@ -7752,18 +7740,6 @@ fn read_jstring<'local>(env: &mut Env<'local>, s: &JString<'local>) -> Option<St
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedSetCookie {
-    name: String,
-    value: String,
-    domain: String,
-    path: String,
-    secure: bool,
-    http_only: bool,
-
-    expires_epoch_s: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct CookieUrlFixup {
     url: String,
 
@@ -7824,14 +7800,14 @@ fn parse_cookie_expiry_epoch_s(value: &str) -> Option<i64> {
     Some(if epoch == 0 { -1 } else { epoch })
 }
 
-fn parse_set_cookie(value: &str) -> ParsedSetCookie {
+fn parse_set_cookie(value: &str) -> crate::webview::client::SetCookie {
     let mut parts = value.split(';');
     let first = parts.next().unwrap_or("").trim();
     let (name, val) = match first.split_once('=') {
         Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
         None => (first.to_string(), String::new()),
     };
-    let mut out = ParsedSetCookie {
+    let mut out = crate::webview::client::SetCookie {
         name,
         value: val,
         domain: String::new(),

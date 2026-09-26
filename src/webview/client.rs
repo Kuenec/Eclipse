@@ -1791,14 +1791,16 @@ fn send_locked(slot: &mut ClientSlot, msg: &ConsumerMsg) -> Result<(), ClientErr
     Ok(())
 }
 
+pub struct DataLoad {
+    pub base_url: Option<String>,
+    pub data: String,
+    pub mime: Option<String>,
+    pub encoding: Option<String>,
+}
+
 enum DriveTarget {
     Url(String),
-    Data {
-        base_url: Option<String>,
-        data: String,
-        mime: Option<String>,
-        encoding: Option<String>,
-    },
+    Data(DataLoad),
 }
 
 fn drive(
@@ -1903,7 +1905,8 @@ fn send_drive(
 ) -> Result<(), ClientError> {
     let driven_url = match &target {
         DriveTarget::Url(url) => url.clone(),
-        DriveTarget::Data { base_url, .. } => base_url
+        DriveTarget::Data(load) => load
+            .base_url
             .clone()
             .unwrap_or_else(|| "about:blank".to_string()),
     };
@@ -1947,12 +1950,12 @@ fn send_drive(
     }
     let load_msg = match target {
         DriveTarget::Url(url) => ConsumerMsg::LoadUrl { view: widget, url },
-        DriveTarget::Data {
+        DriveTarget::Data(DataLoad {
             base_url,
             data,
             mime,
             encoding,
-        } => ConsumerMsg::LoadDataWithBaseUrl {
+        }) => ConsumerMsg::LoadDataWithBaseUrl {
             view: widget,
             base_url: base_url.unwrap_or_else(|| "about:blank".to_string()),
             data,
@@ -1975,29 +1978,14 @@ pub fn drive_load_url(
     drive(java_vm, widget, DriveTarget::Url(url), width, height)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn drive_load_data(
     java_vm: jni::vm::JavaVM,
     widget: i64,
-    base_url: Option<String>,
-    data: String,
-    mime: Option<String>,
-    encoding: Option<String>,
+    load: DataLoad,
     width: u16,
     height: u16,
 ) -> Result<(), ClientError> {
-    drive(
-        java_vm,
-        widget,
-        DriveTarget::Data {
-            base_url,
-            data,
-            mime,
-            encoding,
-        },
-        width,
-        height,
-    )
+    drive(java_vm, widget, DriveTarget::Data(load), width, height)
 }
 
 type BridgeInventory = HashMap<String, Vec<BridgeMethod>>;
@@ -2120,18 +2108,31 @@ pub fn evaluate_js(
     .map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub expires_epoch_s: i64,
+}
+
 pub fn cookie_set(
     java_vm: jni::vm::JavaVM,
     url: String,
-    name: String,
-    value: String,
-    domain: String,
-    path: String,
-    secure: bool,
-    http_only: bool,
-    expires_epoch_s: i64,
+    cookie: SetCookie,
 ) -> Result<(), ClientError> {
+    let SetCookie {
+        name,
+        value,
+        domain,
+        path,
+        secure,
+        http_only,
+        expires_epoch_s,
+    } = cookie;
     send_with_lazy_spawn(
         java_vm,
         &ConsumerMsg::CookieSet {
@@ -2148,19 +2149,21 @@ pub fn cookie_set(
     .map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn cookie_set_with_result(
     java_vm: jni::vm::JavaVM,
     request_id: u32,
     url: String,
-    name: String,
-    value: String,
-    domain: String,
-    path: String,
-    secure: bool,
-    http_only: bool,
-    expires_epoch_s: i64,
+    cookie: SetCookie,
 ) -> Result<(), ClientError> {
+    let SetCookie {
+        name,
+        value,
+        domain,
+        path,
+        secure,
+        http_only,
+        expires_epoch_s,
+    } = cookie;
     send_with_lazy_spawn(
         java_vm,
         &ConsumerMsg::CookieSetForResult {
