@@ -1,9 +1,5 @@
-#[allow(dead_code)]
-#[path = "../shared.rs"]
-mod shared;
-
-use shared::proto::{self, ConsumerMsg, HelperMsg};
-use shared::{fdpass, shm};
+use eclipse_webview::proto::{self, ConsumerMsg, HelperMsg};
+use eclipse_webview::{fdpass, redact, shm};
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::fd::AsFd;
@@ -209,7 +205,7 @@ impl Drive {
             match msg {
                 HelperMsg::Console { view, console } => {
                     self.consoles_seen += 1;
-                    if console.source() == shared::redact::NON_URL {
+                    if console.source() == redact::NON_URL {
                         self.data_url_consoles += 1;
                     }
                     println!(
@@ -346,14 +342,14 @@ impl Scenario {
 
 fn handshake(d: &mut Drive) -> DResult<String> {
     d.send(&ConsumerMsg::Hello {
-        version: shared::PROTO_VERSION,
+        version: eclipse_webview::PROTO_VERSION,
     })?;
     let engine = match d.next_msg(Instant::now() + HANDSHAKE_DEADLINE)? {
         HelperMsg::HelloAck { version, engine } => {
             if !proto::hello_ack_version_supported(version) {
                 return fail(format!(
                     "protocol version mismatch: helper v{version}, drive v{}",
-                    shared::PROTO_VERSION
+                    eclipse_webview::PROTO_VERSION
                 ));
             }
             engine

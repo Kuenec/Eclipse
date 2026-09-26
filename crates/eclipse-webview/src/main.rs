@@ -1,19 +1,16 @@
 mod engine;
 mod logging;
 
-#[allow(dead_code)]
-mod shared;
-
 use cef::wrapper::message_router::{
     MessageRouterConfig, MessageRouterRendererSide, MessageRouterRendererSideHandlerCallbacks,
     RendererSideRouter,
 };
 use cef::{args::Args, sys, *};
+use eclipse_webview::fdpass;
+use eclipse_webview::proto::{self, ConsumerMsg, HelperMsg, ProtoError};
 use engine::{Engine, Out, OutQueue, Outbox};
 use logging as log;
 use logging::RedactedTarget;
-use shared::fdpass;
-use shared::proto::{self, ConsumerMsg, HelperMsg, ProtoError};
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
@@ -672,12 +669,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     match proto::read_consumer_msg(&mut &stream) {
-        Ok(ConsumerMsg::Hello { version }) if version == shared::PROTO_VERSION => {}
+        Ok(ConsumerMsg::Hello { version }) if version == eclipse_webview::PROTO_VERSION => {}
         Ok(ConsumerMsg::Hello { version }) => {
             let _ = write_helper_msg(
                 &stream,
                 &HelperMsg::HelloAck {
-                    version: shared::PROTO_VERSION,
+                    version: eclipse_webview::PROTO_VERSION,
                     engine: engine::engine_id(),
                 },
             );
@@ -685,7 +682,7 @@ fn main() -> ExitCode {
                 COMPONENT,
                 &format!(
                     "protocol version mismatch: consumer v{version}, helper v{} — closing",
-                    shared::PROTO_VERSION
+                    eclipse_webview::PROTO_VERSION
                 ),
             );
             return ExitCode::from(2);
@@ -708,7 +705,7 @@ fn main() -> ExitCode {
     if write_helper_msg(
         &stream,
         &HelperMsg::HelloAck {
-            version: shared::PROTO_VERSION,
+            version: eclipse_webview::PROTO_VERSION,
             engine: engine::engine_id(),
         },
     )
