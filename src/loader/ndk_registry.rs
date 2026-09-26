@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 pub type NdkHandle = u64;
 
@@ -143,11 +144,20 @@ pub struct AssetManagerState {
     pub apk_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct AssetFileSpan {
+    pub apk: Arc<File>,
+
+    pub offset: u64,
+}
+
 #[derive(Debug)]
 pub struct AssetState {
-    pub bytes: Box<[u8]>,
+    pub bytes: Arc<Box<[u8]>>,
 
     pub cursor: usize,
+
+    pub file_span: Option<AssetFileSpan>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -439,8 +449,9 @@ mod tests {
         let s = assets();
         let h = s
             .insert(AssetState {
-                bytes: Box::from(&b"hi"[..]),
+                bytes: Arc::new(Box::from(&b"hi"[..])),
                 cursor: 0,
+                file_span: None,
             })
             .expect("insert");
         s.remove(h).expect("first free");
@@ -569,8 +580,9 @@ mod tests {
         let s = assets();
         let h = s
             .insert(AssetState {
-                bytes: Box::from(&b"stable-bytes"[..]),
+                bytes: Arc::new(Box::from(&b"stable-bytes"[..])),
                 cursor: 0,
+                file_span: None,
             })
             .expect("insert");
         let p1 = s.with(h, |a| a.bytes.as_ptr() as usize).unwrap();
