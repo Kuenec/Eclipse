@@ -122,12 +122,9 @@ fn main() -> ExitCode {
         },
 
         Some("__run-libroblox-init") => {
-            let outcome = eclipse::runtime::native_lib_cache_dir()
-                .map_err(|e| e.to_string())
-                .and_then(|lib_dir| {
-                    eclipse::loader::init_run::run_libroblox_init(&lib_dir)
-                        .map_err(|e| e.to_string())
-                });
+            let outcome = parse_libroblox_init_lib_dir(&args[1..]).and_then(|lib_dir| {
+                eclipse::loader::init_run::run_libroblox_init(lib_dir).map_err(|e| e.to_string())
+            });
             match outcome {
                 Ok(completed) => {
                     println!("__run-libroblox-init: {completed} constructor(s) completed");
@@ -354,6 +351,13 @@ fn parse_run_apk_path(arguments: &[String]) -> Result<Option<&str>, String> {
         [] => Ok(None),
         [apk_path] => Ok(Some(apk_path)),
         _ => Err("usage: eclipse run [APK]".to_string()),
+    }
+}
+
+fn parse_libroblox_init_lib_dir(arguments: &[String]) -> Result<&std::path::Path, String> {
+    match arguments {
+        [lib_dir] => Ok(std::path::Path::new(lib_dir)),
+        _ => Err("usage: eclipse __run-libroblox-init <LIB_DIR>".to_string()),
     }
 }
 
@@ -591,14 +595,14 @@ fn preload_app_native_libs(
     }
 
     let mut log = std::io::stdout();
-    let vm_raw = vm.as_raw();
+    let java_vm = unsafe { jni::vm::JavaVM::from_raw(vm.as_raw()) };
     let mut loaded: Vec<eclipse::loader::engine::PreloadedLib> = Vec::new();
 
     println!("# Pre-loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…");
     let engine = eclipse::loader::engine::load_app_native_lib(
         app_lib_dir,
         ENGINE_FILENAME,
-        vm_raw,
+        &java_vm,
         &mut log,
     )?
     .ok_or("libroblox.so unexpectedly deduped on first load")?;
@@ -614,8 +618,12 @@ fn preload_app_native_libs(
         if filename == ENGINE_FILENAME {
             continue;
         }
-        match eclipse::loader::engine::load_app_native_lib(app_lib_dir, filename, vm_raw, &mut log)
-        {
+        match eclipse::loader::engine::load_app_native_lib(
+            app_lib_dir,
+            filename,
+            &java_vm,
+            &mut log,
+        ) {
             Ok(Some(lib)) => {
                 report_preloaded(&lib);
                 loaded.push(lib);
@@ -982,7 +990,10 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 
 #[cfg(test)]
 mod tests {
-    use super::{finish_android_process, normalize_browser_launch, parse_run_apk_path};
+    use super::{
+        finish_android_process, normalize_browser_launch, parse_libroblox_init_lib_dir,
+        parse_run_apk_path,
+    };
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
 
@@ -999,6 +1010,17 @@ mod tests {
             Some("roblox.apk")
         );
         assert!(parse_run_apk_path(&[apk, "roblox://placeId=1".into()]).is_err());
+    }
+
+    #[test]
+    fn libroblox_init_takes_exactly_one_explicit_lib_dir() {
+        let lib_dir = "harness-libs".to_string();
+        assert!(parse_libroblox_init_lib_dir(&[]).is_err());
+        assert_eq!(
+            parse_libroblox_init_lib_dir(std::slice::from_ref(&lib_dir)).unwrap(),
+            std::path::Path::new("harness-libs")
+        );
+        assert!(parse_libroblox_init_lib_dir(&[lib_dir.clone(), lib_dir]).is_err());
     }
 
     #[test]

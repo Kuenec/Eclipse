@@ -6,7 +6,6 @@ use jni::objects::{JClass, JObject, JObjectArray, JString};
 use jni::strings::JNIString;
 use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, NativeMethod};
-use jni_sys::JavaVM as RawJavaVM;
 
 use super::jni_mangle::demangle;
 
@@ -45,7 +44,7 @@ const PRELOADED_NATIVES: &[PreloadedNative] = &[
 ];
 
 pub(crate) fn register_preloaded_natives(
-    java_vm: *mut RawJavaVM,
+    java_vm: &JavaVM,
     resolve_export: impl Fn(&str) -> Option<u64>,
     log: &mut impl Write,
 ) {
@@ -56,13 +55,8 @@ pub(crate) fn register_preloaded_natives(
     if provided.is_empty() {
         return;
     }
-    if java_vm.is_null() {
-        let _ = writeln!(log, "engine-load: discovery-gap: null JavaVM — skipped");
-        return;
-    }
 
-    let vm = unsafe { JavaVM::from_raw(java_vm) };
-    let result: jni::errors::Result<()> = vm.attach_current_thread(|env: &mut Env| {
+    let result: jni::errors::Result<()> = java_vm.attach_current_thread(|env: &mut Env| {
         for (method, sig, addr, class) in &provided {
             let class_name = JNIString::from(*class);
             let cls = match env.find_class(&class_name) {
@@ -165,12 +159,12 @@ fn select_bindings<'a>(
 }
 
 pub(crate) fn register_all_preloaded_natives(
-    java_vm: *mut RawJavaVM,
+    java_vm: &JavaVM,
     exports: &[(String, u64)],
     lib_label: &str,
     log: &mut impl Write,
 ) -> usize {
-    if exports.is_empty() || java_vm.is_null() {
+    if exports.is_empty() {
         return 0;
     }
 
@@ -184,9 +178,8 @@ pub(crate) fn register_all_preloaded_natives(
         return 0;
     }
 
-    let vm = unsafe { JavaVM::from_raw(java_vm) };
     let mut total_bound = 0usize;
-    let result: jni::errors::Result<()> = vm.attach_current_thread(|env: &mut Env| {
+    let result: jni::errors::Result<()> = java_vm.attach_current_thread(|env: &mut Env| {
         for (class, methods) in &by_class {
             let bound: usize = env
                 .with_local_frame(16, |env| -> jni::errors::Result<usize> {
