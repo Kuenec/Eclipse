@@ -69,7 +69,21 @@ alias eclipse='flatpak run io.github.kuenec.Eclipse'
 
 Eclipse does not include Roblox. It installs the official Android client into its own data directory and runs only files signed by Roblox Corporation, as described in [What Eclipse checks and what it never does](#what-eclipse-checks-and-what-it-never-does).
 
+### Automatic download
+
+You do not need to do anything: the first time you start Eclipse, it downloads the newest Roblox client, verifies Roblox's signature and installs it, then launches it. No Google or other account is needed. Eclipse gets the client from [APKCombo](https://apkcombo.com/roblox/com.roblox.client/), which mirrors Roblox's own Google Play release files; Eclipse keeps only `base.apk` and `split_config.x86_64.apk` from the download and discards everything if Roblox's signature does not verify.
+
+After that, starting Eclipse checks for a newer Roblox version at most every six hours and installs it before launching. If the check fails, Eclipse starts the version you already have and prints a warning. To check right away:
+
+```bash
+eclipse update
+```
+
+Eclipse never replaces the installed client with an older version, and it keeps the previous version until the new one is installed.
+
 ### Install the client from APK files
+
+You can also install the official files yourself, for example ones you downloaded elsewhere.
 
 Eclipse needs two files from Roblox's official Android release: `base.apk` and `split_config.x86_64.apk`, which holds the x86-64 engine. `eclipse install` accepts any of these:
 
@@ -87,9 +101,9 @@ The Flatpak can read your Downloads folder, so keep the files there. To let it r
 
 Eclipse verifies the signature of every file before it installs anything. If a file is not Roblox's official, unmodified release, the install stops and the client you already have stays in place.
 
-### Keep the client updated
+### Download from Google Play instead
 
-`eclipse update` downloads the newest official Roblox client, verifies it and installs it. Today it downloads from Google Play, so it needs a one-time `eclipse play-login` with your own Google account; the command explains each step. Once you are signed in, starting Eclipse checks for a new Roblox version at most every six hours, and if that check fails, Eclipse starts the version you already have.
+`eclipse update --play` downloads the client from Google Play with your own Google account instead of APKCombo. It needs a one-time `eclipse play-login`, which explains each step. Automatic updates always use APKCombo.
 
 > [!WARNING]
 > Google's terms do not allow unofficial Play clients, and Google may restrict an account that uses one. Use a secondary Google account, not your main one.
@@ -157,7 +171,8 @@ These paths assume the default XDG base directories.
 | Settings | `config/eclipse/config.json` | `~/.config/eclipse/config.json` |
 | Installed Roblox client (current and previous version) | `data/eclipse/roblox/<versionCode>/` | `~/.local/share/eclipse/roblox/<versionCode>/` |
 | Game data, WebView profile and staged Fast Flags | `data/eclipse/app-data/` | `~/.local/share/eclipse/app-data/` |
-| Google Play sign-in, readable only by you | `data/eclipse/google-play.json` | `~/.local/share/eclipse/google-play.json` |
+| Last update check | `data/eclipse/roblox/last-update-check.json` | `~/.local/share/eclipse/roblox/last-update-check.json` |
+| Google Play sign-in (only with `play-login`), readable only by you | `data/eclipse/google-play.json` | `~/.local/share/eclipse/google-play.json` |
 | Extracted native libraries | `cache/eclipse/native-libs/` | `~/.cache/eclipse/native-libs/` |
 
 To remove Eclipse, the installed Roblox client and all of this data:
@@ -172,7 +187,8 @@ Run the second command only if you added the `eclipse` remote, either by keeping
 ## What Eclipse checks and what it never does
 
 - Every APK that Eclipse installs or runs must carry a valid APK Signature Scheme v2 signature from Roblox Corporation's certificate, whose SHA-256 digest is `44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`. If the base APK also has a v3 or v3.1 signature, its key-rotation proof must start at that certificate. A file changed after signing fails the check. Eclipse checks at install time and again at every launch.
-- Eclipse does not modify or patch the client, and it does not host, mirror or redistribute it.
+- Eclipse does not modify or patch the client, and it does not host, mirror or redistribute it. Downloads come from APKCombo's copy of Roblox's Google Play release (or Google Play itself with `--play`) over HTTPS from an allowlisted host, and must match the size and hash that the source declares before the signature check runs.
+- Eclipse never installs an older Roblox version than the one you have.
 - Eclipse sets no Fast Flags of its own. The client's `ClientAppSettings.json` comes only from the `fflags` in your settings.
 - When the client asks the Android package manager for its signing certificates, Eclipse reports the real certificates from the verified APK.
 - Browser launches hand only the place ID to the client.
@@ -180,7 +196,7 @@ Run the second command only if you added the `eclipse` remote, either by keeping
 ## Troubleshooting
 
 - Start Eclipse from a terminal to see what it is doing. For more detail, run `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`.
-- "Roblox is not installed" means Eclipse has no client yet. Install one with `eclipse install`, or with `eclipse play-login` followed by `eclipse update`.
+- If the first download fails, Eclipse prints why. Run `eclipse update` to try again, or install the files yourself with `eclipse install`.
 - A signature error means the files are not Roblox's official, unmodified release. Get a clean copy of the files and install again.
 - To report a problem, see [Contributing](#contributing) for what to include.
 
@@ -226,7 +242,9 @@ src/                             Core runtime, CLI and host bridges
 src/apk/                         Binary manifest, resource-table and native-library handling
 src/apk/signature.rs             Roblox APK signature verification (v2, v3 and v3.1 rotation)
 src/apk/store.rs                 Versioned install store behind eclipse install and update
-src/apk/play/                    Google Play client behind eclipse play-login and update
+src/apk/apkcombo.rs              Account-free download of Roblox's release files behind eclipse update
+src/apk/https.rs                 Shared HTTPS download rules: host allowlists, redirects, size limits
+src/apk/play/                    Google Play client behind eclipse play-login and update --play
 src/framework.rs, src/framework/ Android framework natives, registries and lifecycle
 src/loader/                      ELF, Bionic, JNI, NDK, audio and graphics loading
 src/webview/                     WebView IPC, shared memory and lifecycle
