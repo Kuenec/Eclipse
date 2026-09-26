@@ -546,6 +546,7 @@ pub(crate) mod tests {
     use std::io::Write;
 
     const PAGE: u64 = 0x1000;
+    const STB_WEAK: u8 = 2;
     const PH_OFF: usize = 0x40;
     const DYN_OFF: u64 = 0x200;
     const RELA_OFF: u64 = 0x400;
@@ -1106,19 +1107,22 @@ pub(crate) mod tests {
         drop(set);
     }
 
-    fn find_roblox_apk() -> Option<PathBuf> {
-        std::env::var_os("ECLIPSE_ROBLOX_APK")
-            .map(PathBuf::from)
-            .into_iter()
-            .chain(std::env::var_os("HOME").map(|home| {
-                Path::new(&home).join("eclipse-m0/apk/v2.724.735/roblox-2.724.735-merged.apk")
-            }))
-            .find(|p| p.exists())
+    fn roblox_native_libs_apk() -> Option<PathBuf> {
+        crate::apk::ApkSetPaths::from_env()
+            .expect("ECLIPSE_ROBLOX_APK must name an APK or a directory holding base.apk")
+            .map(|paths| paths.native_libs().to_path_buf())
+    }
+
+    fn is_symbol_reloc(rela: &Rela) -> bool {
+        matches!(
+            rela.r_type,
+            reloc::R_X86_64_GLOB_DAT | reloc::R_X86_64_JUMP_SLOT | reloc::R_X86_64_64
+        )
     }
 
     #[test]
     fn real_libroblox_maps_base_relocates_and_honors_relro_root_only() {
-        let Some(apk_path) = find_roblox_apk() else {
+        let Some(apk_path) = roblox_native_libs_apk() else {
             eprintln!("real_libroblox_maps_...: no Roblox APK; skipping");
             return;
         };
@@ -1147,16 +1151,27 @@ pub(crate) mod tests {
         assert_eq!(obj.soname, "libroblox.so");
 
         let img = obj.image().expect("re-parse libroblox image");
+        assert!(!img.loads.is_empty(), "libroblox has PT_LOAD segments");
         assert_eq!(
-            obj.map_stats.segments_mapped, 3,
-            "libroblox has 3 PT_LOAD segments"
+            obj.map_stats.segments_mapped,
+            img.loads.len(),
+            "every libroblox PT_LOAD segment is mapped"
         );
         let base = obj.load_base();
         let span = obj.mapped.span() as u64;
 
-        assert!(
-            (0x70a_0000..=0x70c_0000).contains(&span),
-            "libroblox mapped span ≈ 112.7 MiB, got {span:#x}"
+        let page = host_page_size();
+        let min_vaddr = img.loads.iter().map(|s| s.vaddr).min().expect("loads");
+        let max_end = img
+            .loads
+            .iter()
+            .map(|s| s.vaddr + s.mem_size)
+            .max()
+            .expect("loads");
+        assert_eq!(
+            span,
+            max_end.div_ceil(page) * page - min_vaddr / page * page,
+            "the mapping spans exactly the page-rounded PT_LOAD extent"
         );
 
         for seg in &img.loads {
@@ -1173,32 +1188,35 @@ pub(crate) mod tests {
             }
         }
 
-        assert_eq!(
-            set.stats.relative_applied, 527_208,
-            "libroblox RELATIVE relocs applied"
-        );
-        assert_eq!(
-            obj.map_stats.relative_applied, 527_208,
-            "per-object RELATIVE count matches"
-        );
-
         let relas = img.relocations().expect("decode relocations");
         let relatives: Vec<&Rela> = relas
             .iter()
             .filter(|r| r.r_type == reloc::R_X86_64_RELATIVE)
             .collect();
-        assert_eq!(relatives.len(), 527_208, "decoded RELATIVE count");
+        assert!(!relatives.is_empty(), "libroblox has RELATIVE relocations");
+        assert_eq!(
+            set.stats.relative_applied,
+            relatives.len(),
+            "every decoded RELATIVE reloc is applied"
+        );
+        assert_eq!(
+            obj.map_stats.relative_applied,
+            relatives.len(),
+            "per-object RELATIVE count matches"
+        );
+
         let mut addends_in_range = 0usize;
+        let mut offsets_in_range = 0usize;
         let mut sampled = 0usize;
         let mut sample_values_in_range = 0usize;
         for (i, r) in relatives.iter().enumerate() {
             if (r.addend as u64) < span {
                 addends_in_range += 1;
             }
-
-            if i % 64 == 0 {
-                let off = r.offset as usize;
-                if off + 8 <= set.objects[0].mapped.span() {
+            let off = r.offset as usize;
+            if off + 8 <= set.objects[0].mapped.span() {
+                offsets_in_range += 1;
+                if i % 64 == 0 {
                     let v = obj.mapped.read_u64(off).expect("read relocated slot");
                     sampled += 1;
                     if (base..base + span).contains(&v) {
@@ -1208,12 +1226,14 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(
-            addends_in_range, 527_208,
+            addends_in_range,
+            relatives.len(),
             "every RELATIVE addend points within the object [0, span)"
         );
-        assert!(
-            sampled > 8_000,
-            "expected a large RELATIVE sample, got {sampled}"
+        assert_eq!(
+            offsets_in_range,
+            relatives.len(),
+            "every RELATIVE slot lies inside the mapping"
         );
         assert_eq!(
             sample_values_in_range, sampled,
@@ -1233,10 +1253,14 @@ pub(crate) mod tests {
         let glob_dat = count_type(reloc::R_X86_64_GLOB_DAT);
         let abs64 = count_type(reloc::R_X86_64_64);
         let jump_slot = count_type(reloc::R_X86_64_JUMP_SLOT);
-        assert_eq!(glob_dat, 67, "libroblox GLOB_DAT count");
-        assert_eq!(abs64, 22, "libroblox R_X86_64_64 count");
-        assert_eq!(jump_slot, 546, "libroblox JUMP_SLOT count");
-        assert_eq!(glob_dat + abs64 + jump_slot, 635, "total symbol relocs");
+        let symbol_relocs = glob_dat + abs64 + jump_slot;
+        assert!(glob_dat > 0, "libroblox has GLOB_DAT relocs");
+        assert!(jump_slot > 0, "libroblox has JUMP_SLOT relocs");
+        assert_eq!(
+            relatives.len() + symbol_relocs,
+            relas.len(),
+            "every libroblox reloc is RELATIVE, GLOB_DAT, R_X86_64_64 or JUMP_SLOT"
+        );
 
         assert_eq!(
             set.stats.glob_dat_applied + set.stats.jump_slot_applied + set.stats.abs64_applied,
@@ -1244,55 +1268,62 @@ pub(crate) mod tests {
             "no symbol reloc applied in root-only mode (deps absent)"
         );
         assert!(
-            !set.unresolved.is_empty(),
-            "the symbol relocs are recorded as deferred/unresolved (not faked)"
+            relas.iter().filter(|r| is_symbol_reloc(r)).all(|r| img
+                .dynsyms
+                .get(r.sym_index as usize)
+                .is_some_and(|s| !s.name.is_empty())),
+            "every symbol reloc binds a decoded, named dynsym"
+        );
+        let mut strong_import_relocs: Vec<(u32, &str)> = relas
+            .iter()
+            .filter(|r| is_symbol_reloc(r))
+            .filter_map(|r| {
+                let sym = &img.dynsyms[r.sym_index as usize];
+                let strong_import = sym.shndx == 0 && sym.bind != STB_WEAK;
+                strong_import.then_some((r.sym_index, sym.name.as_str()))
+            })
+            .collect();
+        strong_import_relocs.sort_unstable();
+        assert!(
+            !strong_import_relocs.is_empty(),
+            "libroblox has strong imports"
+        );
+        let mut recorded: Vec<(u32, &str)> = set
+            .unresolved
+            .iter()
+            .map(|u| (u.sym_index, u.name.as_str()))
+            .collect();
+        recorded.sort_unstable();
+        assert_eq!(
+            recorded, strong_import_relocs,
+            "each strong-import reloc is recorded unresolved under its own symbol (not faked)"
         );
         for u in &set.unresolved {
             assert_eq!(u.object, "libroblox.so");
         }
         eprintln!(
-            "libroblox deferred symbol relocs: {} recorded unresolved (of 635: {glob_dat} GLOB_DAT + {abs64} ABS64 + {jump_slot} JUMP_SLOT)",
+            "libroblox deferred symbol relocs: {} recorded unresolved (of {symbol_relocs}: {glob_dat} GLOB_DAT + {abs64} ABS64 + {jump_slot} JUMP_SLOT)",
             set.unresolved.len()
         );
 
-        let und_imports = img
-            .dynsyms
-            .iter()
-            .filter(|s| s.shndx == 0 && !s.name.is_empty())
-            .count();
-
-        assert!(
-            und_imports >= 584,
-            "libroblox UND import surface ≥ 584 (the bionic-env symbols), got {und_imports}"
-        );
-
+        let needed = img.needed().expect("decode DT_NEEDED");
+        let mut missing: Vec<&str> = set.missing_deps.iter().map(|m| m.soname.as_str()).collect();
+        missing.sort_unstable();
+        let mut expected_missing: Vec<&str> = needed.iter().map(String::as_str).collect();
+        expected_missing.sort_unstable();
         assert_eq!(
-            set.missing_deps.len(),
-            10,
-            "all 10 bionic DT_NEEDED recorded as missing (env-provided): {:?}",
-            set.missing_deps
+            missing, expected_missing,
+            "every bionic DT_NEEDED is recorded as missing (env-provided)"
         );
-        for dep in [
-            "libc.so",
-            "libm.so",
-            "libdl.so",
-            "liblog.so",
-            "libandroid.so",
-            "libEGL.so",
-            "libGLESv2.so",
-            "libOpenSLES.so",
-            "libOpenMAXAL.so",
-            "libmediandk.so",
-        ] {
+        for dep in ["libc.so", "libm.so", "libdl.so", "liblog.so"] {
             assert!(
-                set.missing_deps.iter().any(|m| m.soname == dep),
-                "missing-dep surface must include {dep}: {:?}",
-                set.missing_deps
+                missing.contains(&dep),
+                "missing-dep surface must include {dep}: {missing:?}"
             );
         }
 
         eprintln!(
-            "real_libroblox root-only: span={span:#x} (~{} MiB) segments={} RELATIVE_applied={} (all in-range; {sampled} slots sampled) RELR_applied={} RELRO_applied={} symbol_relocs_deferred=635 unresolved_recorded={} UND_imports={und_imports} missing_deps={} reloc_wall_time={:?}",
+            "real_libroblox root-only: span={span:#x} (~{} MiB) segments={} RELATIVE_applied={} (all in-range; {sampled} slots sampled) RELR_applied={} RELRO_applied={} symbol_relocs_deferred={symbol_relocs} unresolved_recorded={} missing_deps={} reloc_wall_time={:?}",
             span / (1024 * 1024),
             obj.map_stats.segments_mapped,
             set.stats.relative_applied,
@@ -1309,9 +1340,9 @@ pub(crate) mod tests {
 
     #[test]
     fn real_libroblox_bionic_env_resolves_categorizes_and_partially_applies() {
-        use crate::loader::bionic_env::{categorize_imports, BionicEnv};
+        use crate::loader::bionic_env::{categorize_imports, BionicEnv, ImportCategory};
 
-        let Some(apk_path) = find_roblox_apk() else {
+        let Some(apk_path) = roblox_native_libs_apk() else {
             eprintln!("real_libroblox_bionic_env_...: no Roblox APK; skipping");
             return;
         };
@@ -1378,7 +1409,10 @@ pub(crate) mod tests {
             report.unresolved_count()
         );
 
-        eprintln!("\n--- Eclipse-bionic-native WORK-LIST (88 unresolved-strong, by category) ---");
+        eprintln!(
+            "\n--- Eclipse-bionic-native WORK-LIST ({} unresolved-strong, by category) ---",
+            report.unresolved_count()
+        );
         let worklist: std::collections::BTreeSet<&str> =
             report.host_unresolved.iter().map(String::as_str).collect();
         for (cat, names) in &report.by_category {
@@ -1392,10 +1426,13 @@ pub(crate) mod tests {
             }
         }
 
+        assert!(report.total > 0, "libroblox has imports");
+        let uncategorized = report
+            .by_category
+            .get(ImportCategory::Uncategorized.label());
         assert!(
-            report.total >= 584,
-            "libroblox UND import surface ≥ 584, got {}",
-            report.total
+            uncategorized.is_none(),
+            "every libroblox import falls into a known category: {uncategorized:?}"
         );
 
         for cat in ["ndk-android", "media-ndk", "audio", "liblog"] {
@@ -1488,7 +1525,7 @@ pub(crate) mod tests {
         use crate::loader::native_provider::EclipseNativeProvider;
         use crate::loader::resolve::{HostDlsymProvider, SymbolProvider};
 
-        let Some(apk_path) = find_roblox_apk() else {
+        let Some(apk_path) = roblox_native_libs_apk() else {
             eprintln!("real_libroblox_eclipse_natives_resolve_liblox_libc_ndk_media_and_audio: no Roblox APK; skipping");
             return;
         };
@@ -1535,16 +1572,15 @@ pub(crate) mod tests {
             with_eclipse.unresolved_count()
         );
 
-        assert_eq!(
-            baseline.unresolved_count(),
-            88,
-            "host-baseline work-list is the documented 88"
+        assert!(
+            baseline.unresolved_count() > 0,
+            "the host baseline leaves a non-empty bionic-only work-list"
         );
 
         assert_eq!(
             with_eclipse.unresolved_count(),
             0,
-            "Eclipse natives shrink the work-list 88 -> 0 (FULL resolution; the variadic liblog C shim closed the last 2)"
+            "Eclipse natives shrink the work-list to 0 (FULL resolution, including the variadic liblog C shim)"
         );
 
         let eclipse_only = EclipseNativeProvider::with_bionic_natives();
@@ -1562,106 +1598,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             newly_resolved.len(),
-            88,
-            "exactly 88 imports move from work-list to Eclipse-resolved (FULL resolution)"
+            baseline.unresolved_count(),
+            "every host-baseline work-list import moves to Eclipse-resolved (FULL resolution)"
         );
 
-        for variadic in ["__android_log_print", "__android_log_assert"] {
-            assert!(
-                newly_resolved.contains(variadic),
-                "{variadic} (variadic liblog) resolves to the Eclipse C-shim address"
-            );
-        }
-
-        for ndk in [
-            "AAssetManager_fromJava",
-            "AAssetManager_open",
-            "AAsset_close",
-            "AAsset_getBuffer",
-            "AAsset_getLength",
-            "AAsset_openFileDescriptor",
-            "AConfiguration_new",
-            "AConfiguration_delete",
-            "AConfiguration_fromAssetManager",
-            "AConfiguration_getCountry",
-            "AConfiguration_getLanguage",
-            "AConfiguration_getNavHidden",
-            "AConfiguration_getScreenHeightDp",
-            "AConfiguration_getScreenSize",
-            "AConfiguration_getScreenWidthDp",
-            "ALooper_prepare",
-            "ALooper_forThread",
-            "ALooper_acquire",
-            "ALooper_release",
-            "ALooper_pollOnce",
-            "ALooper_addFd",
-            "ALooper_removeFd",
-            "ANativeWindow_fromSurface",
-            "ANativeWindow_getWidth",
-            "ANativeWindow_getHeight",
-            "ANativeWindow_acquire",
-            "ANativeWindow_release",
-        ] {
-            assert!(
-                newly_resolved.contains(ndk),
-                "{ndk} (ndk-android) must resolve to Eclipse"
-            );
-        }
-
-        for media in [
-            "AMediaCodec_configure",
-            "AMediaCodec_createDecoderByType",
-            "AMediaCodec_createEncoderByType",
-            "AMediaCodec_delete",
-            "AMediaCodec_dequeueInputBuffer",
-            "AMediaCodec_dequeueOutputBuffer",
-            "AMediaCodec_flush",
-            "AMediaCodec_getInputBuffer",
-            "AMediaCodec_getOutputBuffer",
-            "AMediaCodec_getOutputFormat",
-            "AMediaCodec_queueInputBuffer",
-            "AMediaCodec_releaseOutputBuffer",
-            "AMediaCodec_start",
-            "AMediaCodec_stop",
-            "AMediaFormat_delete",
-            "AMediaFormat_getBuffer",
-            "AMediaFormat_getInt32",
-            "AMediaFormat_new",
-            "AMediaFormat_setBuffer",
-            "AMediaFormat_setFloat",
-            "AMediaFormat_setInt32",
-            "AMediaFormat_setString",
-            "AMediaFormat_toString",
-            "AMEDIAFORMAT_KEY_BIT_RATE",
-            "AMEDIAFORMAT_KEY_CHANNEL_COUNT",
-            "AMEDIAFORMAT_KEY_COLOR_FORMAT",
-            "AMEDIAFORMAT_KEY_FRAME_RATE",
-            "AMEDIAFORMAT_KEY_HEIGHT",
-            "AMEDIAFORMAT_KEY_I_FRAME_INTERVAL",
-            "AMEDIAFORMAT_KEY_MIME",
-            "AMEDIAFORMAT_KEY_SAMPLE_RATE",
-            "AMEDIAFORMAT_KEY_STRIDE",
-            "AMEDIAFORMAT_KEY_WIDTH",
-        ] {
-            assert!(
-                newly_resolved.contains(media),
-                "{media} (media-ndk) must resolve to Eclipse"
-            );
-        }
-        for audio in [
-            "slCreateEngine",
-            "SL_IID_ANDROIDCONFIGURATION",
-            "SL_IID_ANDROIDSIMPLEBUFFERQUEUE",
-            "SL_IID_BUFFERQUEUE",
-            "SL_IID_ENGINE",
-            "SL_IID_PLAY",
-            "SL_IID_RECORD",
-            "SL_IID_VOLUME",
-        ] {
-            assert!(
-                newly_resolved.contains(audio),
-                "{audio} (audio) must resolve to Eclipse"
-            );
+        for category in ["liblog", "ndk-android", "media-ndk", "audio"] {
+            for name in baseline.by_category.get(category).into_iter().flatten() {
+                let eclipse = eclipse_only
+                    .resolve(name)
+                    .unwrap_or_else(|| panic!("{name} ({category}) must resolve to Eclipse"));
+                assert_eq!(
+                    eclipse_scope.resolve(name).map(|s| s.addr),
+                    Some(eclipse.addr),
+                    "{name} ({category}) must resolve to the Eclipse-native address"
+                );
+            }
         }
         for name in &newly_resolved {
             let e = eclipse_only
@@ -1727,11 +1678,26 @@ pub(crate) mod tests {
             "no unresolved-strong symbol relocations remain"
         );
 
+        let symbol_relocs: Vec<&Rela> = all_relas.iter().filter(|r| is_symbol_reloc(r)).collect();
+        let weak_zero_relocs = symbol_relocs
+            .iter()
+            .filter(|r| {
+                let sym = &dynsyms[r.sym_index as usize];
+                match eclipse_scope.resolve(&sym.name) {
+                    Some(found) => found.addr == 0,
+                    None => sym.bind == STB_WEAK,
+                }
+            })
+            .count();
         assert_eq!(
-            stats.applied_nonnull, 623,
-            "FULL resolution fills 623 GOT/PLT slots (621 + the 2 variadic liblog shim slots)"
+            stats.applied_nonnull + stats.applied_weak_zero,
+            symbol_relocs.len(),
+            "FULL resolution fills every GOT/PLT slot"
         );
-        assert_eq!(stats.applied_weak_zero, 12, "12 legal weak-undef → 0");
+        assert_eq!(
+            stats.applied_weak_zero, weak_zero_relocs,
+            "only unresolvable weak imports are bound to zero"
+        );
 
         let obj = &set.objects[0];
         let mut checked_eclipse_slots = 0usize;
@@ -1780,7 +1746,7 @@ pub(crate) mod tests {
     fn real_boot_path_loadlibrary_libs_fully_resolve() {
         use crate::loader::bionic_env::BionicEnv;
 
-        let Some(apk_path) = find_roblox_apk() else {
+        let Some(apk_path) = roblox_native_libs_apk() else {
             eprintln!("real_boot_path_loadlibrary_libs_fully_resolve: no Roblox APK; skipping");
             return;
         };
