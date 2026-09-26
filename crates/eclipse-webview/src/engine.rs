@@ -275,6 +275,7 @@ pub fn classify_render_path(
 pub enum Out {
     Msg(HelperMsg),
     MsgWithFd(HelperMsg, OwnedFd),
+    Frame(Vec<u8>),
     Stop,
 }
 
@@ -282,6 +283,7 @@ pub enum Out {
 enum Delivery {
     Required,
     Droppable,
+    Refusable,
 }
 
 #[derive(Clone)]
@@ -320,25 +322,28 @@ impl Outbox {
         (outbox, OutQueue { rx, depth })
     }
 
-    fn push(&self, out: Out, delivery: Delivery) {
+    fn push(&self, out: Out, delivery: Delivery) -> bool {
         if self.dead.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
-        if matches!(delivery, Delivery::Droppable)
+        if !matches!(delivery, Delivery::Required)
             && self.depth.load(Ordering::Relaxed) >= self.droppable_limit
         {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+            if matches!(delivery, Delivery::Droppable) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
         }
         self.depth.fetch_add(1, Ordering::Relaxed);
         let Err(err) = self.tx.try_send(out) else {
-            return;
+            return true;
         };
         self.depth.fetch_sub(1, Ordering::Relaxed);
         match (err, delivery) {
             (TrySendError::Full(_), Delivery::Droppable) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
+            (TrySendError::Full(_), Delivery::Refusable) => {}
             (TrySendError::Full(_), Delivery::Required) => {
                 logging::error(
                     COMPONENT,
@@ -350,6 +355,7 @@ impl Outbox {
                 self.dead.store(true, Ordering::Relaxed);
             }
         }
+        false
     }
 
     pub fn send(&self, msg: HelperMsg) {
@@ -362,6 +368,11 @@ impl Outbox {
 
     pub fn send_with_fd(&self, msg: HelperMsg, fd: OwnedFd) {
         self.push(Out::MsgWithFd(msg, fd), Delivery::Required);
+    }
+
+    #[must_use]
+    pub fn send_frame_if_room(&self, frame: Vec<u8>) -> bool {
+        self.push(Out::Frame(frame), Delivery::Refusable)
     }
 
     pub fn stop(&self) {
@@ -1172,7 +1183,18 @@ impl Engine {
                     &logging::format_load_data_event(view, &mime, &base),
                 );
                 let target = match about_base_data_url(&base_url, &data, &mime) {
-                    Some(data_url) => {
+                    Some(Err(OversizedDataUrl { url_len })) => {
+                        logging::error(
+                            COMPONENT,
+                            &format!(
+                                "load data-with-base-url view={view}: the {url_len}-byte data: URL \
+                                 for an about: base exceeds Chromium's {MAX_URL_CHARS}-byte URL \
+                                 limit; not loaded"
+                            ),
+                        );
+                        return;
+                    }
+                    Some(Ok(data_url)) => {
                         if !mime.is_empty() && !is_mime_type(&mime) {
                             logging::warn(
                                 COMPONENT,
@@ -1181,18 +1203,6 @@ impl Engine {
                                      type/subtype; serving the data as text/html"
                                 ),
                             );
-                        }
-                        if data_url.len() > MAX_URL_CHARS {
-                            logging::error(
-                                COMPONENT,
-                                &format!(
-                                    "load data-with-base-url view={view}: the {}-byte data: URL \
-                                     for an about: base exceeds Chromium's {MAX_URL_CHARS}-byte \
-                                     URL limit; not loaded",
-                                    data_url.len()
-                                ),
-                            );
-                            return;
                         }
                         if let Ok(mut slot) = pending.lock() {
                             *slot = None;
@@ -1786,18 +1796,26 @@ fn is_mime_type(mime: &str) -> bool {
         !part.is_empty()
             && part.bytes().all(|b| {
                 b.is_ascii_alphanumeric()
-                    || matches!(
-                        b,
-                        b'!' | b'#' | b'$' | b'&' | b'-' | b'^' | b'_' | b'.' | b'+'
-                    )
+                    || matches!(b, b'!' | b'$' | b'&' | b'-' | b'^' | b'_' | b'.' | b'+')
             })
     };
     mime.split_once('/')
         .is_some_and(|(kind, subtype)| restricted_name(kind) && restricted_name(subtype))
 }
 
-fn about_base_data_url(base_url: &str, data: &str, mime: &str) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+struct OversizedDataUrl {
+    url_len: usize,
+}
+
+fn about_base_data_url(
+    base_url: &str,
+    data: &str,
+    mime: &str,
+) -> Option<Result<String, OversizedDataUrl>> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    const SCHEME: &str = "data:";
+    const CHARSET: &str = ";charset=utf-8,";
     let is_about = base_url
         .get(..6)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("about:"));
@@ -1809,12 +1827,22 @@ fn about_base_data_url(base_url: &str, data: &str, mime: &str) -> Option<String>
     } else {
         DEFAULT_DATA_MIME
     };
-    let mut url = String::with_capacity(32 + mime.len() + data.len() * 3);
-    url.push_str("data:");
+    let unreserved =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+    let url_len = data
+        .bytes()
+        .fold(SCHEME.len() + mime.len() + CHARSET.len(), |len, byte| {
+            len + if unreserved(byte) { 1 } else { 3 }
+        });
+    if url_len > MAX_URL_CHARS {
+        return Some(Err(OversizedDataUrl { url_len }));
+    }
+    let mut url = String::with_capacity(url_len);
+    url.push_str(SCHEME);
     url.push_str(mime);
-    url.push_str(";charset=utf-8,");
+    url.push_str(CHARSET);
     for byte in data.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+        if unreserved(byte) {
             url.push(char::from(byte));
         } else {
             url.push('%');
@@ -1822,7 +1850,7 @@ fn about_base_data_url(base_url: &str, data: &str, mime: &str) -> Option<String>
             url.push(char::from(HEX[usize::from(byte & 0x0F)]));
         }
     }
-    Some(url)
+    Some(Ok(url))
 }
 
 fn urls_equivalent(a: &str, b: &str) -> bool {
@@ -2090,6 +2118,9 @@ fn send_bridge_register_message(frame: &Frame, name: &str, methods: &[BridgeMeth
 
 const BRIDGE_PAYLOAD_OVER_CAP: &str = "eclipse: bridge payload exceeds the frame cap";
 
+const BRIDGE_QUEUE_BACKED_UP: &str =
+    "eclipse: bridge call refused: the outbound queue is backed up";
+
 struct BridgeHandler {
     state: Shared,
     out: Outbox,
@@ -2122,20 +2153,28 @@ impl BrowserSideHandler for BridgeHandler {
             call_id,
             payload_json: request.to_string(),
         };
-        if let Err(e) = call.encode() {
-            logging::warn(
-                COMPONENT,
-                &format!("bridge call view={view} call_id={call_id} rejected: {e}"),
-            );
-            if let Ok(guard) = callback.lock() {
-                guard.failure(-1, BRIDGE_PAYLOAD_OVER_CAP);
+        let frame = match call.encode() {
+            Ok(frame) => frame,
+            Err(e) => {
+                logging::warn(
+                    COMPONENT,
+                    &format!("bridge call view={view} call_id={call_id} rejected: {e}"),
+                );
+                if let Ok(guard) = callback.lock() {
+                    guard.failure(-1, BRIDGE_PAYLOAD_OVER_CAP);
+                }
+                return true;
             }
-            return true;
-        }
+        };
         lock(&self.state)
             .pending_bridge_calls
-            .insert(call_id, callback);
-        self.out.send(call);
+            .insert(call_id, Arc::clone(&callback));
+        if !self.out.send_frame_if_room(frame) {
+            lock(&self.state).pending_bridge_calls.remove(&call_id);
+            if let Ok(guard) = callback.lock() {
+                guard.failure(-1, BRIDGE_QUEUE_BACKED_UP);
+            }
+        }
         true
     }
 }
@@ -2415,12 +2454,51 @@ mod tests {
             match item {
                 Out::Msg(HelperMsg::Console { .. }) => consoles += 1,
                 Out::Msg(msg) => last = Some(msg),
-                Out::MsgWithFd(..) | Out::Stop => panic!("unexpected outbound item"),
+                Out::MsgWithFd(..) | Out::Frame(_) | Out::Stop => {
+                    panic!("unexpected outbound item")
+                }
             }
         }
         assert_eq!(consoles, 4);
         assert_eq!(last, Some(load_state));
         assert_eq!(dropped, 100 - consoles);
+    }
+
+    #[test]
+    fn a_bridge_call_flood_is_refused_before_it_can_mark_the_consumer_dead() {
+        let (out, queue) = Outbox::channel(8);
+        let frame = HelperMsg::BridgeCall {
+            view: 1,
+            call_id: 1,
+            payload_json: "{}".to_string(),
+        }
+        .encode()
+        .expect("a small bridge call encodes");
+        let accepted = (0..100)
+            .filter(|_| out.send_frame_if_room(frame.clone()))
+            .count();
+        assert_eq!(accepted, 4);
+        assert!(!out.is_dead());
+        assert_eq!(out.take_dropped(), 0);
+        let closed = HelperMsg::ViewClosed { view: 1 };
+        out.send(closed.clone());
+        assert!(!out.is_dead());
+        drop(out);
+
+        let mut frames = 0usize;
+        let mut last = None;
+        while let Some(item) = queue.recv() {
+            match item {
+                Out::Frame(bytes) => {
+                    assert_eq!(bytes, frame);
+                    frames += 1;
+                }
+                Out::Msg(msg) => last = Some(msg),
+                Out::MsgWithFd(..) | Out::Stop => panic!("unexpected outbound item"),
+            }
+        }
+        assert_eq!(frames, accepted);
+        assert_eq!(last, Some(closed));
     }
 
     #[test]
@@ -2480,19 +2558,33 @@ mod tests {
     #[test]
     fn about_base_data_is_loaded_as_a_percent_encoded_data_url() {
         assert_eq!(
-            about_base_data_url("about:blank", "<p>#1 50%</p>", "text/html").as_deref(),
+            about_base_data_url("about:blank", "<p>#1 50%</p>", "text/html")
+                .and_then(Result::ok)
+                .as_deref(),
             Some("data:text/html;charset=utf-8,%3Cp%3E%231%2050%25%3C%2Fp%3E")
         );
         assert_eq!(
-            about_base_data_url("ABOUT:srcdoc", "\u{e9}", "text/plain").as_deref(),
+            about_base_data_url("ABOUT:srcdoc", "\u{e9}", "text/plain")
+                .and_then(Result::ok)
+                .as_deref(),
             Some("data:text/plain;charset=utf-8,%C3%A9")
         );
         assert_eq!(
-            about_base_data_url("about:blank", "a-b.c_d~", "").as_deref(),
+            about_base_data_url("about:blank", "a-b.c_d~", "")
+                .and_then(Result::ok)
+                .as_deref(),
             Some("data:text/html;charset=utf-8,a-b.c_d~")
         );
         assert_eq!(
-            about_base_data_url("about:blank", "x", "text/html,x").as_deref(),
+            about_base_data_url("about:blank", "x", "text/html,x")
+                .and_then(Result::ok)
+                .as_deref(),
+            Some("data:text/html;charset=utf-8,x")
+        );
+        assert_eq!(
+            about_base_data_url("about:blank", "x", "text/x#y")
+                .and_then(Result::ok)
+                .as_deref(),
             Some("data:text/html;charset=utf-8,x")
         );
         assert_eq!(
@@ -2500,6 +2592,32 @@ mod tests {
             None
         );
         assert_eq!(about_base_data_url("abou", "x", "text/html"), None);
+    }
+
+    #[test]
+    fn about_base_data_url_over_chromiums_url_limit_is_rejected_before_it_is_built() {
+        let prefix = "data:text/html;charset=utf-8,".len();
+        let fits = "a".repeat(MAX_URL_CHARS - prefix);
+        assert_eq!(
+            about_base_data_url("about:blank", &fits, "text/html")
+                .and_then(Result::ok)
+                .map(|url| url.len()),
+            Some(MAX_URL_CHARS)
+        );
+        let one_over = "a".repeat(MAX_URL_CHARS - prefix + 1);
+        assert_eq!(
+            about_base_data_url("about:blank", &one_over, "text/html"),
+            Some(Err(OversizedDataUrl {
+                url_len: MAX_URL_CHARS + 1
+            }))
+        );
+        let escaped = " ".repeat(MAX_URL_CHARS / 3);
+        assert_eq!(
+            about_base_data_url("about:blank", &escaped, "text/html"),
+            Some(Err(OversizedDataUrl {
+                url_len: prefix + escaped.len() * 3
+            }))
+        );
     }
 
     #[test]
@@ -2512,6 +2630,7 @@ mod tests {
         assert!(!is_mime_type("/html"));
         assert!(!is_mime_type("text/html;charset=utf-8"));
         assert!(!is_mime_type("text/html,x"));
+        assert!(!is_mime_type("text/x#y"));
     }
 
     #[test]

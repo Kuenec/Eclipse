@@ -572,6 +572,7 @@ fn run_writer(queue: OutQueue, stream: UnixStream) {
                 fdpass::send_fd_with_sentinel(&stream, fd.as_fd())
                     .map_err(|e| std::io::Error::other(e.to_string()))
             }),
+            Out::Frame(frame) => (&mut &stream).write_all(&frame),
             Out::Stop => break,
         };
         if let Err(e) = result {
@@ -1106,6 +1107,30 @@ mod tests {
         );
         writer.join().expect("writer thread");
         drop(held_by_cef_client);
+    }
+
+    #[test]
+    fn writer_sends_a_pre_encoded_bridge_call_frame_verbatim() {
+        let (consumer_end, helper_end) = UnixStream::pair().expect("socketpair");
+        let (outbox, queue) = Outbox::channel(4);
+        let call = HelperMsg::BridgeCall {
+            view: 7,
+            call_id: 9,
+            payload_json: "{\"a\":1}".to_string(),
+        };
+        assert!(outbox.send_frame_if_room(call.encode().expect("bridge call encodes")));
+        outbox.stop();
+        drop(outbox);
+        let writer = std::thread::spawn(move || run_writer(queue, helper_end));
+        consumer_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        assert_eq!(proto::read_helper_msg(&mut &consumer_end), Ok(call));
+        assert_eq!(
+            proto::read_helper_msg(&mut &consumer_end),
+            Err(ProtoError::Eof)
+        );
+        writer.join().expect("writer thread");
     }
 
     #[test]

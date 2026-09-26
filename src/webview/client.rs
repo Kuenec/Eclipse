@@ -3706,6 +3706,27 @@ mod tests {
         assert!(matches!(&slot, ClientSlot::Failed(r) if r == RESPAWN_IN_PROGRESS));
         assert!(take_for_replacement(&mut slot).is_none());
         let _ = old.child.wait();
+
+        let src = include_str!("client.rs");
+        let upcall_start = src
+            .find("fn upcall_thread_main")
+            .expect("upcall_thread_main present");
+        let upcall_end = src[upcall_start..]
+            .find("fn reader_loop")
+            .expect("reader_loop follows upcall_thread_main")
+            + upcall_start;
+        let upcall_body = &src[upcall_start..upcall_end];
+        let skip = upcall_body
+            .find("if replaced.load(Ordering::Acquire)")
+            .expect("the upcall thread must check the replacement mark when its channel closes");
+        let drain = upcall_body
+            .find("drain_all_webview_callbacks")
+            .expect("the upcall thread drains callbacks when its helper connection closes");
+        assert!(
+            skip < drain && upcall_body[skip..drain].contains("return;"),
+            "a replaced helper's upcall thread must return before draining the replacement's \
+             ValueCallbacks"
+        );
     }
 
     #[test]

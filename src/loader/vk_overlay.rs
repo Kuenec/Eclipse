@@ -1450,15 +1450,9 @@ pub(crate) fn present_staged_webview_frame(view: i64) {
         CompositeFormat::RgbaSwizzle => true,
         CompositeFormat::Unsupported => return,
     };
-    let Ok(mut slot) = WEB_PRESENTER.lock() else {
-        return;
-    };
-    let Some(presenter) = slot.as_mut() else {
-        return;
-    };
-    let filled = crate::webview::client::with_latest_frame(view, |stage| {
+    crate::webview::client::with_latest_frame(view, |stage| {
         if stage.bytes.is_empty() {
-            return false;
+            return;
         }
         let Some((x, y, w, h)) = resolve_webview_rect(
             crate::webview::client::composited_rect(),
@@ -1467,7 +1461,7 @@ pub(crate) fn present_staged_webview_frame(view: i64) {
             stage.width,
             stage.height,
         ) else {
-            return false;
+            return;
         };
         let rect = vk::Rect2D {
             offset: vk::Offset2D {
@@ -1479,13 +1473,17 @@ pub(crate) fn present_staged_webview_frame(view: i64) {
                 height: h,
             },
         };
+        let Ok(mut slot) = WEB_PRESENTER.lock() else {
+            return;
+        };
+        let Some(presenter) = slot.as_mut() else {
+            return;
+        };
         let key = (u64::from(stage.generation) << 32) | u64::from(stage.seq);
-        unsafe { presenter.fill(key, rect, stage.bytes, stage.stride as usize, swizzle) }
-    })
-    .unwrap_or(false);
-    if filled {
-        unsafe { presenter.present() };
-    }
+        if unsafe { presenter.fill(key, rect, stage.bytes, stage.stride as usize, swizzle) } {
+            unsafe { presenter.present() };
+        }
+    });
 }
 
 fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Device) {

@@ -9,8 +9,10 @@ pin() { sed -n "s/^$1=\"\(.*\)\"$/\1/p" "$script"; }
 pin_archive="$(pin PIN_ARCHIVE)"
 pin_sha1="$(pin PIN_SHA1)"
 pin_sha256="$(pin PIN_SHA256)"
-[ -n "$pin_archive" ] && [ -n "$pin_sha1" ] && [ -n "$pin_sha256" ] \
-    || { echo "FAIL: cannot read the pins from $script" >&2; exit 1; }
+if [ -z "$pin_archive" ] || [ -z "$pin_sha1" ] || [ -z "$pin_sha256" ]; then
+    echo "FAIL: cannot read the pins from $script" >&2
+    exit 1
+fi
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
@@ -92,7 +94,9 @@ echo keep > "$out/logs/run.log"
 status="$(run_packager "$repo" "$out")"
 [ "$status" != 0 ] || fail "an unstamped install directory was accepted as OUT"
 grep -q "refusing to wipe" "$repo/stderr.log" || fail "no refusal message for an unstamped install directory"
-[ -f "$out/config.json" ] && [ -f "$out/logs/run.log" ] || fail "files in an unstamped install directory were deleted"
+if [ ! -f "$out/config.json" ] || [ ! -f "$out/logs/run.log" ]; then
+    fail "files in an unstamped install directory were deleted"
+fi
 echo "ok: an unstamped directory holding eclipse-webview and libcef.so is never wiped"
 
 repo="$scratch/cargo-target"
