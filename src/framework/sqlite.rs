@@ -1,5 +1,3 @@
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
 use std::ffi::{c_int, CStr, CString};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -129,7 +127,49 @@ fn stmt_get(handle: jlong) -> Option<*mut ffi::sqlite3_stmt> {
         .get(handle)
 }
 
+fn exception_class(code: c_int) -> &'static JNIStr {
+    match code & 0xff {
+        ffi::SQLITE_IOERR => jni_str!("android/database/sqlite/SQLiteDiskIOException"),
+        ffi::SQLITE_CORRUPT | ffi::SQLITE_NOTADB => {
+            jni_str!("android/database/sqlite/SQLiteDatabaseCorruptException")
+        }
+        ffi::SQLITE_CONSTRAINT => jni_str!("android/database/sqlite/SQLiteConstraintException"),
+        ffi::SQLITE_ABORT => jni_str!("android/database/sqlite/SQLiteAbortException"),
+        SQLITE_DONE => jni_str!("android/database/sqlite/SQLiteDoneException"),
+        ffi::SQLITE_FULL => jni_str!("android/database/sqlite/SQLiteFullException"),
+        ffi::SQLITE_MISUSE => jni_str!("android/database/sqlite/SQLiteMisuseException"),
+        ffi::SQLITE_PERM => jni_str!("android/database/sqlite/SQLiteAccessPermException"),
+        ffi::SQLITE_BUSY => jni_str!("android/database/sqlite/SQLiteDatabaseLockedException"),
+        ffi::SQLITE_LOCKED => jni_str!("android/database/sqlite/SQLiteTableLockedException"),
+        ffi::SQLITE_READONLY => {
+            jni_str!("android/database/sqlite/SQLiteReadOnlyDatabaseException")
+        }
+        ffi::SQLITE_CANTOPEN => {
+            jni_str!("android/database/sqlite/SQLiteCantOpenDatabaseException")
+        }
+        ffi::SQLITE_TOOBIG => jni_str!("android/database/sqlite/SQLiteBlobTooBigException"),
+        ffi::SQLITE_RANGE => {
+            jni_str!("android/database/sqlite/SQLiteBindOrColumnIndexOutOfRangeException")
+        }
+        ffi::SQLITE_NOMEM => jni_str!("android/database/sqlite/SQLiteOutOfMemoryException"),
+        ffi::SQLITE_MISMATCH => {
+            jni_str!("android/database/sqlite/SQLiteDatatypeMismatchException")
+        }
+        _ => SQLITE_EXCEPTION_CLASS,
+    }
+}
+
 fn throw_sqlite<T>(env: &mut Env, db: *mut ffi::sqlite3, default: T) -> jni::errors::Result<T> {
+    if db.is_null() {
+        throw_msg(env, "unknown error");
+        return Ok(default);
+    }
+    let code = unsafe { ffi::sqlite3_extended_errcode(db) };
+    let class = exception_class(code);
+    if code & 0xff == SQLITE_DONE {
+        let _ = env.throw_new_void(class);
+        return Ok(default);
+    }
     let msg = unsafe {
         let raw = ffi::sqlite3_errmsg(db);
         if raw.is_null() {
@@ -138,7 +178,7 @@ fn throw_sqlite<T>(env: &mut Env, db: *mut ffi::sqlite3, default: T) -> jni::err
             CStr::from_ptr(raw).to_string_lossy().into_owned()
         }
     };
-    throw_msg(env, &msg);
+    let _ = env.throw_new(class, JNIString::from(format!("{msg} (code {code})")));
     Ok(default)
 }
 
@@ -558,7 +598,7 @@ extern "system" fn native_execute_for_long<'l>(
         };
         let value = match step_then_reset(env, db, s) {
             Some(SQLITE_ROW) => unsafe { ffi::sqlite3_column_int64(s, 0) },
-            Some(_) => 0,
+            Some(_) => return throw_sqlite(env, db, 0),
             None => return Ok(0),
         };
         Ok(value)
@@ -588,7 +628,8 @@ extern "system" fn native_execute_for_string<'l>(
                     .into_owned();
                 env.new_string(text)
             }
-            _ => Ok(null_string()),
+            Some(_) => throw_sqlite(env, db, null_string()),
+            None => Ok(null_string()),
         }
     })
     .resolve::<LogErrorAndDefault>()
@@ -1020,4 +1061,176 @@ pub fn register_natives(env: &mut Env) -> Result<(), super::FrameworkError> {
         "registered Eclipse's libsqlite3-backed natives (open + statement lifecycle + executes + cursor window)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::fake_jvm;
+
+    fn open(path: &CStr) -> *mut ffi::sqlite3 {
+        let mut db: *mut ffi::sqlite3 = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_open_v2(
+                path.as_ptr(),
+                &mut db,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, SQLITE_OK, "sqlite3_open_v2({path:?})");
+        db
+    }
+
+    fn run_once(db: *mut ffi::sqlite3, sql: &CStr) -> (c_int, c_int) {
+        let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut())
+        };
+        if rc != SQLITE_OK {
+            return (rc, unsafe { ffi::sqlite3_extended_errcode(db) });
+        }
+        let rc = unsafe { ffi::sqlite3_step(stmt) };
+        let code = unsafe { ffi::sqlite3_extended_errcode(db) };
+        unsafe { ffi::sqlite3_finalize(stmt) };
+        (rc, code)
+    }
+
+    fn temp_db(tag: &str) -> (std::path::PathBuf, CString) {
+        let path = std::env::temp_dir().join(format!(
+            "eclipse-sqlite-{tag}-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let c_path = CString::new(path.to_str().expect("utf-8 temp path")).expect("no NUL");
+        (path, c_path)
+    }
+
+    #[test]
+    fn corrupt_and_foreign_files_map_to_the_corruption_exception() {
+        let (garbage, c_garbage) = temp_db("garbage");
+        std::fs::write(&garbage, vec![0xA5u8; 8192]).expect("write garbage file");
+
+        let (truncated, c_truncated) = temp_db("truncated");
+        std::fs::remove_file(&truncated).ok();
+        let db = open(&c_truncated);
+        for sql in [
+            c"CREATE TABLE t(x)",
+            c"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) INSERT INTO t SELECT randomblob(200) FROM n",
+        ] {
+            assert_eq!(run_once(db, sql).0, SQLITE_DONE, "build {sql:?}");
+        }
+        unsafe { ffi::sqlite3_close(db) };
+        let full = std::fs::read(&truncated).expect("read valid database");
+        std::fs::write(&truncated, &full[..full.len() / 3]).expect("truncate database");
+
+        for (path, c_path) in [(&garbage, &c_garbage), (&truncated, &c_truncated)] {
+            let db = open(c_path);
+            let (rc, code) = run_once(db, c"PRAGMA journal_mode");
+            unsafe { ffi::sqlite3_close(db) };
+            std::fs::remove_file(path).ok();
+            assert!(
+                rc != SQLITE_OK && rc != SQLITE_ROW,
+                "{path:?}: PRAGMA journal_mode must fail, got rc {rc}"
+            );
+            assert_eq!(
+                exception_class(code).to_str(),
+                "android/database/sqlite/SQLiteDatabaseCorruptException",
+                "{path:?}: extended code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_row_query_maps_to_the_done_exception() {
+        let db = open(c":memory:");
+        assert_eq!(run_once(db, c"CREATE TABLE t(x)").0, SQLITE_DONE);
+        let (rc, code) = run_once(db, c"SELECT x FROM t LIMIT 1");
+        unsafe { ffi::sqlite3_close(db) };
+        assert_eq!(rc, SQLITE_DONE, "a zero-row query steps straight to DONE");
+        assert_eq!(
+            exception_class(code).to_str(),
+            "android/database/sqlite/SQLiteDoneException"
+        );
+    }
+
+    #[test]
+    fn single_value_queries_throw_the_done_exception_when_no_row_matches() {
+        let db = open(c":memory:");
+        assert_eq!(run_once(db, c"CREATE TABLE t(x)").0, SQLITE_DONE);
+        let conn = connections()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(db);
+        let prepare = |sql: &CStr| {
+            let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let rc = unsafe {
+                ffi::sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut())
+            };
+            assert_eq!(rc, SQLITE_OK, "prepare {sql:?}");
+            statements()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(stmt)
+        };
+        let empty = prepare(c"SELECT x FROM t LIMIT 1");
+        let count = prepare(c"SELECT count(*) FROM t");
+
+        let value = native_execute_for_long(fake_jvm::native_env(), JClass::default(), conn, empty);
+        assert_eq!(value, 0);
+        assert_eq!(
+            fake_jvm::take_exception().as_deref(),
+            Some("android/database/sqlite/SQLiteDoneException"),
+            "executeForLong on zero rows throws SQLiteDoneException"
+        );
+
+        let text =
+            native_execute_for_string(fake_jvm::native_env(), JClass::default(), conn, empty);
+        assert!(text.is_null());
+        assert_eq!(
+            fake_jvm::take_exception().as_deref(),
+            Some("android/database/sqlite/SQLiteDoneException"),
+            "executeForString on zero rows throws SQLiteDoneException"
+        );
+
+        let rows = native_execute_for_long(fake_jvm::native_env(), JClass::default(), conn, count);
+        assert_eq!(rows, 0, "a one-row query returns its value");
+        assert_eq!(fake_jvm::take_exception(), None);
+
+        for stmt in [empty, count] {
+            let raw = statements()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(stmt)
+                .expect("statement handle");
+            unsafe { ffi::sqlite3_finalize(raw) };
+        }
+        connections()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(conn);
+        unsafe { ffi::sqlite3_close(db) };
+    }
+
+    #[test]
+    fn extended_codes_are_masked_to_their_primary_exception() {
+        let db = open(c":memory:");
+        assert_eq!(run_once(db, c"CREATE TABLE t(x UNIQUE)").0, SQLITE_DONE);
+        assert_eq!(run_once(db, c"INSERT INTO t VALUES (1)").0, SQLITE_DONE);
+        let (rc, code) = run_once(db, c"INSERT INTO t VALUES (1)");
+        let (syntax_rc, syntax_code) = run_once(db, c"SELEKT 1");
+        unsafe { ffi::sqlite3_close(db) };
+        assert_eq!(rc, ffi::SQLITE_CONSTRAINT);
+        assert_eq!(code, ffi::SQLITE_CONSTRAINT_UNIQUE);
+        assert_eq!(
+            exception_class(code).to_str(),
+            "android/database/sqlite/SQLiteConstraintException"
+        );
+        assert_eq!(syntax_rc, ffi::SQLITE_ERROR);
+        assert_eq!(
+            exception_class(syntax_code).to_str(),
+            "android/database/sqlite/SQLiteException",
+            "codes without a dedicated subclass keep the base exception"
+        );
+    }
 }
