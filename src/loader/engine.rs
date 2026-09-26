@@ -11,7 +11,7 @@ use jni_sys::{
 };
 
 use super::bionic_env::BionicEnv;
-use super::elf::{DynSym, LoadSegment, PF_W, PF_X};
+use super::elf::{DynSym, PF_X};
 use super::link::Linker;
 use super::map::host_page_size;
 use super::resolve::{LoadedObjectProvider, Scope, SymbolProvider};
@@ -21,148 +21,6 @@ use super::init_run::{init_array_count, init_array_entry_offset};
 const LIB_X86_64_DIR: &str = "lib/x86_64";
 
 const LIBROBLOX_FILENAME: &str = "libroblox.so";
-
-const FRAMERATE_CAP_ENGINE_FEATURE: &str = "GameBasicSettingsFramerateCap";
-
-const FORCE_FMOD_OPENSL_DEBUG_FLAG: &str = "DebugFmodUseAndroidOpenSl";
-
-const FMOD_AAUDIO_FALLBACK_FLAG: &str = "FmodFallbackAaudioToOpensl";
-
-const FAST_BOOL_NAMESPACE: u32 = 1;
-const DEBUG_FAST_BOOL_NAMESPACE: u32 = 2;
-
-#[derive(Clone, Copy)]
-struct HostBoolOverride {
-    name: &'static str,
-    namespace: u32,
-}
-
-const HOST_BOOL_OVERRIDES: [HostBoolOverride; 3] = [
-    HostBoolOverride {
-        name: FRAMERATE_CAP_ENGINE_FEATURE,
-        namespace: FAST_BOOL_NAMESPACE,
-    },
-    HostBoolOverride {
-        name: FORCE_FMOD_OPENSL_DEBUG_FLAG,
-        namespace: DEBUG_FAST_BOOL_NAMESPACE,
-    },
-    HostBoolOverride {
-        name: FMOD_AAUDIO_FALLBACK_FLAG,
-        namespace: FAST_BOOL_NAMESPACE,
-    },
-];
-
-static HOST_BOOL_OVERRIDE_ADDRESSES: Mutex<Vec<(&'static str, usize)>> = Mutex::new(Vec::new());
-
-fn locate_registered_bool_vaddr(
-    bytes: &[u8],
-    loads: &[LoadSegment],
-    name: &str,
-    namespace: u32,
-) -> Result<u64, String> {
-    const LEA_RSI_RIP: &[u8; 3] = b"\x48\x8d\x35";
-    const LEA_RDX_RIP: &[u8; 3] = b"\x48\x8d\x15";
-    const MOV_ECX_IMM32: u8 = 0xb9;
-    const BOOL_VALUE_KIND: &[u8; 6] = b"\x41\xb8\x04\x00\x00\x00";
-    const PATTERN_LEN: usize = 7 + 7 + 5 + BOOL_VALUE_KIND.len();
-
-    fn file_vaddr(loads: &[LoadSegment], file_offset: usize, len: usize) -> Option<u64> {
-        let file_offset = u64::try_from(file_offset).ok()?;
-        let len = u64::try_from(len).ok()?;
-        let file_end = file_offset.checked_add(len)?;
-        loads.iter().find_map(|segment| {
-            let segment_end = segment.file_offset.checked_add(segment.file_size)?;
-            (file_offset >= segment.file_offset && file_end <= segment_end)
-                .then(|| segment.vaddr + (file_offset - segment.file_offset))
-        })
-    }
-
-    fn rip_target(instruction_vaddr: u64, displacement: &[u8]) -> Option<u64> {
-        let displacement = i32::from_le_bytes(displacement.try_into().ok()?) as i64;
-        let next = instruction_vaddr.checked_add(7)?;
-        if displacement >= 0 {
-            next.checked_add(displacement as u64)
-        } else {
-            next.checked_sub(displacement.unsigned_abs())
-        }
-    }
-
-    let name_bytes = name.as_bytes();
-    let mut name_vaddrs = Vec::new();
-    for (offset, window) in bytes.windows(name_bytes.len() + 1).enumerate() {
-        if &window[..name_bytes.len()] == name_bytes && window[name_bytes.len()] == 0 {
-            if let Some(vaddr) = file_vaddr(loads, offset, name_bytes.len() + 1) {
-                name_vaddrs.push(vaddr);
-            }
-        }
-    }
-    name_vaddrs.sort_unstable();
-    name_vaddrs.dedup();
-    if name_vaddrs.is_empty() {
-        return Err(format!(
-            "registered boolean name {name:?} is absent from the ELF"
-        ));
-    }
-
-    let mut candidates = Vec::new();
-    for segment in loads.iter().filter(|segment| segment.flags & PF_X != 0) {
-        let Ok(file_start) = usize::try_from(segment.file_offset) else {
-            continue;
-        };
-        let Some(file_end_u64) = segment.file_offset.checked_add(segment.file_size) else {
-            continue;
-        };
-        let Ok(file_end) = usize::try_from(file_end_u64) else {
-            continue;
-        };
-        let Some(code) = bytes.get(file_start..file_end) else {
-            continue;
-        };
-        for local in 0..=code.len().saturating_sub(PATTERN_LEN) {
-            let thunk = &code[local..local + PATTERN_LEN];
-            if &thunk[..3] != LEA_RSI_RIP
-                || &thunk[7..10] != LEA_RDX_RIP
-                || thunk[14] != MOV_ECX_IMM32
-                || u32::from_le_bytes(thunk[15..19].try_into().expect("four-byte namespace"))
-                    != namespace
-                || &thunk[19..] != BOOL_VALUE_KIND
-            {
-                continue;
-            }
-            let Some(instruction_vaddr) = segment.vaddr.checked_add(local as u64) else {
-                continue;
-            };
-            let Some(name_vaddr) = rip_target(instruction_vaddr, &thunk[3..7]) else {
-                continue;
-            };
-            if !name_vaddrs.contains(&name_vaddr) {
-                continue;
-            }
-            let Some(object_vaddr) = rip_target(instruction_vaddr + 7, &thunk[10..14]) else {
-                continue;
-            };
-            let writable = loads.iter().any(|candidate| {
-                candidate.flags & PF_W != 0
-                    && object_vaddr >= candidate.vaddr
-                    && object_vaddr < candidate.vaddr.saturating_add(candidate.mem_size)
-            });
-            if writable {
-                candidates.push(object_vaddr);
-            }
-        }
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-    match candidates.as_slice() {
-        [vaddr] => Ok(*vaddr),
-        [] => Err(format!(
-            "registered boolean thunk for {name:?} (namespace {namespace}) was not found"
-        )),
-        _ => Err(format!(
-            "registered boolean thunk for {name:?} was ambiguous: {candidates:x?}"
-        )),
-    }
-}
 
 static LOADED_SONAMES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
@@ -238,56 +96,6 @@ impl LoadedEngine {
             .map(|s| (s.name.clone(), self.base.wrapping_add(s.value)))
             .collect()
     }
-
-    fn enable_registered_bool(
-        &mut self,
-        name: &str,
-        namespace: u32,
-    ) -> Result<(bool, usize), String> {
-        let object = self
-            .set
-            .objects
-            .first_mut()
-            .ok_or_else(|| "loaded image set has no root object".to_string())?;
-        let vaddr = {
-            let image = object.image().map_err(|error| error.to_string())?;
-            locate_registered_bool_vaddr(&object.bytes, &image.loads, name, namespace)?
-        };
-        let offset = usize::try_from(vaddr)
-            .map_err(|_| format!("registered boolean {name:?} vaddr {vaddr:#x} exceeds usize"))?;
-        if offset >= object.mapped.span() {
-            return Err(format!(
-                "registered boolean {name:?} vaddr {vaddr:#x} lies outside mapped span {:#x}",
-                object.mapped.span()
-            ));
-        }
-        let address = object
-            .mapped
-            .load_base()
-            .checked_add(vaddr)
-            .ok_or_else(|| format!("registered boolean {name:?} address overflow"))?;
-
-        let slot = address as *mut u8;
-        let previous = unsafe { slot.read() };
-        if previous > 1 {
-            return Err(format!(
-                "registered boolean {name:?} backing byte at {vaddr:#x} was {previous}, expected bool"
-            ));
-        }
-
-        unsafe { slot.write(1) };
-        Ok((previous != 0, address as usize))
-    }
-}
-
-pub fn reapply_host_bool_overrides() -> usize {
-    let addresses = HOST_BOOL_OVERRIDE_ADDRESSES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for &(_name, address) in addresses.iter() {
-        unsafe { std::ptr::write_volatile(address as *mut u8, 1) };
-    }
-    addresses.len()
 }
 
 #[derive(Debug)]
@@ -647,40 +455,6 @@ pub fn load_app_native_lib(
         0
     };
 
-    if filename == LIBROBLOX_FILENAME {
-        let mut located = Vec::with_capacity(HOST_BOOL_OVERRIDES.len());
-        for override_ in HOST_BOOL_OVERRIDES {
-            match engine.enable_registered_bool(override_.name, override_.namespace) {
-                Ok((was_enabled, address)) => {
-                    located.push((override_.name, address));
-                    let state = if was_enabled {
-                        "already enabled"
-                    } else {
-                        "enabled"
-                    };
-                    let purpose = match override_.name {
-                        FRAMERATE_CAP_ENGINE_FEATURE => "native Maximum Frame Rate setting",
-                        FORCE_FMOD_OPENSL_DEBUG_FLAG => "force FMOD onto Eclipse's OpenSL output",
-                        FMOD_AAUDIO_FALLBACK_FLAG => "fallback from unavailable AAudio to OpenSL",
-                        _ => "host runtime compatibility",
-                    };
-                    let _ = writeln!(log, "engine-load: {} {state} ({purpose}) ✓", override_.name);
-                }
-                Err(error) => {
-                    let _ = writeln!(
-                        log,
-                        "engine-load: WARNING: could not enable {} ({error})",
-                        override_.name
-                    );
-                }
-            }
-        }
-        *HOST_BOOL_OVERRIDE_ADDRESSES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = located;
-        let _ = log.flush();
-    }
-
     let jni_onload_version = if engine.jni_onload_addr().is_some() {
         Some(call_jni_onload(&engine, java_vm, log)?)
     } else {
@@ -729,99 +503,6 @@ fn describe_jni_version(version: jint) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn registered_bool_locator_fixture(
-        namespace: u32,
-        value_kind: u32,
-    ) -> (Vec<u8>, Vec<LoadSegment>, u64) {
-        let mut bytes = vec![0_u8; 0x300];
-        let feature = FRAMERATE_CAP_ENGINE_FEATURE.as_bytes();
-        bytes[0x40..0x40 + feature.len()].copy_from_slice(feature);
-        bytes[0x40 + feature.len()] = 0;
-
-        let loads = vec![
-            LoadSegment {
-                file_offset: 0,
-                vaddr: 0x1000,
-                file_size: 0x100,
-                mem_size: 0x100,
-                flags: super::super::elf::PF_R,
-                align: 0x1000,
-            },
-            LoadSegment {
-                file_offset: 0x100,
-                vaddr: 0x4000,
-                file_size: 0x100,
-                mem_size: 0x100,
-                flags: super::super::elf::PF_R | PF_X,
-                align: 0x1000,
-            },
-            LoadSegment {
-                file_offset: 0x200,
-                vaddr: 0x9000,
-                file_size: 0x80,
-                mem_size: 0x100,
-                flags: super::super::elf::PF_R | PF_W,
-                align: 0x1000,
-            },
-        ];
-        let instruction_vaddr = 0x4000_u64 + 0x20;
-        let name_vaddr = 0x1000_u64 + 0x40;
-        let bool_vaddr = 0x9050_u64;
-        let name_disp = i32::try_from(name_vaddr as i64 - (instruction_vaddr + 7) as i64)
-            .expect("name displacement");
-        let bool_disp = i32::try_from(bool_vaddr as i64 - (instruction_vaddr + 14) as i64)
-            .expect("bool displacement");
-        let code = &mut bytes[0x120..0x120 + 25];
-        code[..3].copy_from_slice(b"\x48\x8d\x35");
-        code[3..7].copy_from_slice(&name_disp.to_le_bytes());
-        code[7..10].copy_from_slice(b"\x48\x8d\x15");
-        code[10..14].copy_from_slice(&bool_disp.to_le_bytes());
-        code[14] = 0xb9;
-        code[15..19].copy_from_slice(&namespace.to_le_bytes());
-        code[19..21].copy_from_slice(b"\x41\xb8");
-        code[21..25].copy_from_slice(&value_kind.to_le_bytes());
-        (bytes, loads, bool_vaddr)
-    }
-
-    #[test]
-    fn registered_bool_locator_resolves_rip_relative_writable_bool() {
-        let (bytes, loads, expected) = registered_bool_locator_fixture(FAST_BOOL_NAMESPACE, 4);
-        assert_eq!(
-            locate_registered_bool_vaddr(
-                &bytes,
-                &loads,
-                FRAMERATE_CAP_ENGINE_FEATURE,
-                FAST_BOOL_NAMESPACE,
-            )
-            .unwrap(),
-            expected
-        );
-    }
-
-    #[test]
-    fn registered_bool_locator_rejects_wrong_namespace_or_non_bool_kind() {
-        let (wrong_namespace, loads, _) =
-            registered_bool_locator_fixture(DEBUG_FAST_BOOL_NAMESPACE, 4);
-        let error = locate_registered_bool_vaddr(
-            &wrong_namespace,
-            &loads,
-            FRAMERATE_CAP_ENGINE_FEATURE,
-            FAST_BOOL_NAMESPACE,
-        )
-        .unwrap_err();
-        assert!(error.contains("was not found"), "{error}");
-
-        let (wrong_kind, loads, _) = registered_bool_locator_fixture(FAST_BOOL_NAMESPACE, 3);
-        let error = locate_registered_bool_vaddr(
-            &wrong_kind,
-            &loads,
-            FRAMERATE_CAP_ENGINE_FEATURE,
-            FAST_BOOL_NAMESPACE,
-        )
-        .unwrap_err();
-        assert!(error.contains("was not found"), "{error}");
-    }
 
     #[test]
     fn jni_onload_symbol_name_is_the_jni_export() {
