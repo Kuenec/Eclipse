@@ -2,20 +2,25 @@
 
 pub mod arsc;
 pub mod axml;
+pub mod cache;
+mod file_reader;
 pub mod play;
 pub mod signature;
 pub mod store;
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crc32fast::Hasher as Crc32;
 use serde::{Deserialize, Serialize};
 use zip::{CompressionMethod, ZipArchive};
 
 use axml::AxmlError;
+use file_reader::ApkFileReader;
 use signature::SignatureError;
 
 const MANIFEST_ENTRY: &str = "AndroidManifest.xml";
@@ -62,9 +67,11 @@ fn extracted_entry_matches(path: &Path, size: u64, crc32: u32) -> io::Result<boo
     Ok(hasher.finalize() == crc32)
 }
 
+#[derive(Clone)]
 pub struct Apk {
     path: PathBuf,
-    archive: ZipArchive<BufReader<File>>,
+    file: Arc<File>,
+    archive: ZipArchive<ApkFileReader>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,10 +119,11 @@ pub struct X8664Engine {
 
 impl Apk {
     pub fn open(path: &Path) -> Result<Self, ApkError> {
-        let file = File::open(path)?;
-        let archive = ZipArchive::new(BufReader::new(file))?;
+        let file = Arc::new(File::open(path)?);
+        let archive = ZipArchive::new(ApkFileReader::new(Arc::clone(&file)))?;
         Ok(Self {
             path: path.to_path_buf(),
+            file,
             archive,
         })
     }
@@ -174,6 +182,10 @@ impl Apk {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn file(&self) -> &Arc<File> {
+        &self.file
     }
 
     pub fn extract_native_libs(
@@ -286,6 +298,16 @@ impl Apk {
             stored: entry.compression() == CompressionMethod::Stored,
         })
     }
+}
+
+pub fn reopen(file: &File) -> io::Result<File> {
+    let link = Path::new("/proc/self/fd").join(file.as_raw_fd().to_string());
+    File::open(&link).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("reopen APK through {}: {error}", link.display()),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

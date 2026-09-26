@@ -7,7 +7,8 @@ use std::sync::OnceLock;
 
 use super::init_run::{write_bytes, write_dec, write_hex};
 use super::ndk_registry::{
-    self, AssetManagerState, AssetState, ConfigurationState, LooperState, NativeWindowState,
+    self, AssetFileSpan, AssetManagerState, AssetState, ConfigurationState, LooperState,
+    NativeWindowState,
 };
 use super::resolve::{ResolvedSym, SymbolProvider};
 
@@ -2056,13 +2057,23 @@ unsafe extern "C" fn eclipse_aassetmanager_open(
         };
 
     let entry = format!("{ASSET_ENTRY_PREFIX}{name}");
-    let bytes = match crate::apk::Apk::open(&apk_path).and_then(|mut a| a.read_entry(&entry)) {
-        Ok(b) => b,
-        Err(_) => return std::ptr::null_mut(),
+    let Ok(mut apk) = crate::apk::cache::APP_APK.open(&apk_path) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(bytes) = apk.read_entry(&entry) else {
+        return std::ptr::null_mut();
+    };
+    let file_span = match apk.entry_span(&entry) {
+        Ok(span) if span.stored => Some(AssetFileSpan {
+            apk: std::sync::Arc::clone(apk.file()),
+            offset: span.data_start,
+        }),
+        _ => None,
     };
     let state = AssetState {
-        bytes: bytes.into_boxed_slice(),
+        bytes: std::sync::Arc::new(bytes.into_boxed_slice()),
         cursor: 0,
+        file_span,
     };
     match ndk_registry::assets().insert(state) {
         Ok(h) => handle_to_ptr(h),
@@ -2088,46 +2099,56 @@ unsafe extern "C" fn eclipse_aasset_getlength(asset: *mut c_void) -> libc::off_t
     }
 }
 
+fn asset_memfd(bytes: &[u8]) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::io::{Seek, Write};
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe { libc::memfd_create(c"eclipse-asset".as_ptr(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(bytes)?;
+    file.rewind()?;
+    Ok(file.into())
+}
+
+fn asset_descriptor(
+    bytes: &[u8],
+    file_span: Option<AssetFileSpan>,
+) -> std::io::Result<(std::os::fd::OwnedFd, u64)> {
+    match file_span {
+        Some(span) => Ok((crate::apk::reopen(&span.apk)?.into(), span.offset)),
+        None => Ok((asset_memfd(bytes)?, 0)),
+    }
+}
+
 unsafe extern "C" fn eclipse_aasset_openfiledescriptor(
     asset: *mut c_void,
     out_start: *mut libc::off_t,
     out_length: *mut libc::off_t,
 ) -> c_int {
-    let bytes = match ndk_registry::assets().with(ptr_to_handle(asset), |a| a.bytes.clone()) {
-        Ok(b) => b,
-        Err(_) => return -1,
+    let Ok((bytes, file_span)) = ndk_registry::assets().with(ptr_to_handle(asset), |a| {
+        (std::sync::Arc::clone(&a.bytes), a.file_span.clone())
+    }) else {
+        return -1;
     };
-    let len = bytes.len();
-
-    unsafe {
-        let fd = libc::memfd_create(c"eclipse-asset".as_ptr(), 0);
-        if fd < 0 {
-            return -1;
-        }
-        if len > 0 {
-            if libc::ftruncate(fd, len as libc::off_t) < 0 {
-                libc::close(fd);
-                return -1;
-            }
-            let mut off = 0usize;
-            while off < len {
-                let n = libc::write(fd, bytes.as_ptr().add(off) as *const c_void, len - off);
-                if n <= 0 {
-                    libc::close(fd);
-                    return -1;
-                }
-                off += n as usize;
-            }
-            libc::lseek(fd, 0, libc::SEEK_SET);
-        }
-        if !out_start.is_null() {
-            *out_start = 0;
-        }
-        if !out_length.is_null() {
-            *out_length = len as libc::off_t;
-        }
-        fd
+    let Ok((fd, start)) = asset_descriptor(&bytes, file_span) else {
+        return -1;
+    };
+    let (Ok(start), Ok(length)) = (
+        libc::off_t::try_from(start),
+        libc::off_t::try_from(bytes.len()),
+    ) else {
+        return -1;
+    };
+    if !out_start.is_null() {
+        unsafe { *out_start = start };
     }
+    if !out_length.is_null() {
+        unsafe { *out_length = length };
+    }
+    std::os::fd::IntoRawFd::into_raw_fd(fd)
 }
 
 extern "C" fn eclipse_aconfiguration_new() -> *mut c_void {
@@ -4302,13 +4323,15 @@ mod tests {
         );
     }
 
-    fn write_test_apk(tag: &str, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+    fn write_test_apk(
+        tag: &str,
+        entries: &[(&str, &[u8], zip::CompressionMethod)],
+    ) -> std::path::PathBuf {
         use std::io::{Cursor, Write};
         use zip::write::SimpleFileOptions;
         let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, bytes) in entries {
-            let opts =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes, method) in entries {
+            let opts = SimpleFileOptions::default().compression_method(*method);
             w.start_file(*name, opts).expect("start_file");
             w.write_all(bytes).expect("write_all");
         }
@@ -4325,7 +4348,14 @@ mod tests {
     #[test]
     fn aasset_open_getbuffer_getlength_round_trips_real_apk_bytes() {
         let payload: &[u8] = b"ECLIPSE-ASSET-CONTENTS-1234567890";
-        let apk = write_test_apk("rt", &[("assets/config/app.txt", payload)]);
+        let apk = write_test_apk(
+            "rt",
+            &[(
+                "assets/config/app.txt",
+                payload,
+                zip::CompressionMethod::Stored,
+            )],
+        );
 
         let mgr_h = ndk_registry::asset_managers()
             .insert(AssetManagerState {
@@ -4377,8 +4407,9 @@ mod tests {
         let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
         let s = ndk_registry::assets()
             .insert(AssetState {
-                bytes: payload.clone().into_boxed_slice(),
+                bytes: std::sync::Arc::new(payload.clone().into_boxed_slice()),
                 cursor: 0,
+                file_span: None,
             })
             .expect("insert asset");
         let asset = handle_to_ptr::<c_void>(s);
@@ -4414,6 +4445,120 @@ mod tests {
 
         unsafe { libc::close(fd) };
         ndk_registry::assets().remove(s).ok();
+    }
+
+    #[test]
+    fn aasset_openfiledescriptor_serves_stored_assets_from_the_apk_and_compressed_ones_from_memory()
+    {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 241) as u8).collect();
+        let apk = write_test_apk(
+            "fd",
+            &[
+                (
+                    "assets/sound/stored.bank",
+                    &payload,
+                    zip::CompressionMethod::Stored,
+                ),
+                (
+                    "assets/sound/deflated.bank",
+                    &payload,
+                    zip::CompressionMethod::Deflated,
+                ),
+            ],
+        );
+        let mgr_h = ndk_registry::asset_managers()
+            .insert(AssetManagerState {
+                apk_path: apk.clone(),
+            })
+            .expect("insert asset manager");
+        let mgr = handle_to_ptr::<c_void>(mgr_h);
+        let apk_inode = std::fs::metadata(&apk).expect("apk metadata").ino();
+
+        for (name, from_apk) in [("sound/stored.bank", true), ("sound/deflated.bank", false)] {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            let asset = unsafe { eclipse_aassetmanager_open(mgr, c_name.as_ptr(), 0) };
+            assert!(!asset.is_null(), "{name} opens");
+            let mut start: libc::off_t = -1;
+            let mut length: libc::off_t = -1;
+            let fd = unsafe { eclipse_aasset_openfiledescriptor(asset, &mut start, &mut length) };
+            assert!(fd >= 0, "{name} yields a descriptor");
+            let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+
+            assert_eq!(length as usize, payload.len(), "{name} length");
+            assert_eq!(
+                file.metadata().expect("fd metadata").ino() == apk_inode,
+                from_apk,
+                "{name}: stored assets share the APK file, compressed ones use memory"
+            );
+            assert_eq!(start > 0, from_apk, "{name}: start offset {start}");
+            let mut got = vec![0u8; payload.len()];
+            file.read_exact_at(&mut got, start as u64)
+                .expect("read asset through the descriptor");
+            assert_eq!(got, payload, "{name} bytes through the descriptor");
+            unsafe { eclipse_aasset_close(asset) };
+        }
+
+        ndk_registry::asset_managers().remove(mgr_h).ok();
+        std::fs::remove_file(&apk).ok();
+    }
+
+    #[test]
+    fn aasset_openfiledescriptor_serves_the_opened_apk_after_its_path_is_replaced() {
+        use std::os::unix::fs::FileExt;
+
+        let payload: &[u8] = b"ORIGINAL-STORED-ASSET-BYTES";
+        let apk = write_test_apk(
+            "fd-installed",
+            &[(
+                "assets/sound/stored.bank",
+                payload,
+                zip::CompressionMethod::Stored,
+            )],
+        );
+        let update = write_test_apk(
+            "fd-update",
+            &[
+                (
+                    "assets/sound/padding.bin",
+                    &[0u8; 4096],
+                    zip::CompressionMethod::Stored,
+                ),
+                (
+                    "assets/sound/stored.bank",
+                    b"UPDATED-STORED-ASSET-BYTES!",
+                    zip::CompressionMethod::Stored,
+                ),
+            ],
+        );
+        let mgr_h = ndk_registry::asset_managers()
+            .insert(AssetManagerState {
+                apk_path: apk.clone(),
+            })
+            .expect("insert asset manager");
+        let mgr = handle_to_ptr::<c_void>(mgr_h);
+        let c_name = std::ffi::CString::new("sound/stored.bank").unwrap();
+        let asset = unsafe { eclipse_aassetmanager_open(mgr, c_name.as_ptr(), 0) };
+        assert!(!asset.is_null(), "the stored asset opens");
+
+        std::fs::rename(&update, &apk).expect("install the update over the opened APK");
+        let mut start: libc::off_t = -1;
+        let mut length: libc::off_t = -1;
+        let fd = unsafe { eclipse_aasset_openfiledescriptor(asset, &mut start, &mut length) };
+        assert!(fd >= 0, "the opened asset still yields a descriptor");
+        let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let mut got = vec![0u8; length as usize];
+        file.read_exact_at(&mut got, start as u64)
+            .expect("read asset through the descriptor");
+        assert_eq!(
+            got, payload,
+            "the descriptor serves the APK the asset was opened from"
+        );
+
+        unsafe { eclipse_aasset_close(asset) };
+        ndk_registry::asset_managers().remove(mgr_h).ok();
+        std::fs::remove_file(&apk).ok();
     }
 
     #[test]
