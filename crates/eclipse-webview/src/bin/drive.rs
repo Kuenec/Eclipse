@@ -24,6 +24,8 @@ const LOAD_START_DEADLINE: Duration = Duration::from_secs(30);
 const LOAD_FINISH_DEADLINE: Duration = Duration::from_secs(90);
 
 const INK_DEADLINE: Duration = Duration::from_secs(20);
+const LOAD_DATA_DEADLINE: Duration = Duration::from_secs(15);
+const LOAD_DATA_PAGE: &str = "<script>console.log('ECLIPSE_LOADDATA_MARKER')</script>";
 const COOKIE_DEADLINE: Duration = Duration::from_secs(10);
 const CLOSE_DEADLINE: Duration = Duration::from_secs(15);
 const EXIT_DEADLINE: Duration = Duration::from_secs(15);
@@ -45,6 +47,7 @@ struct Drive {
     start: Instant,
     buffer: Option<Buffer>,
     consoles_seen: u32,
+    data_url_consoles: u32,
 }
 
 enum DriveError {
@@ -205,6 +208,9 @@ impl Drive {
             match msg {
                 HelperMsg::Console { view, console } => {
                     self.consoles_seen += 1;
+                    if console.source() == shared::redact::NON_URL {
+                        self.data_url_consoles += 1;
+                    }
                     println!(
                         "[{} ms] console view={view} severity={} source={} line={} len={}",
                         now_ms(self.start),
@@ -289,9 +295,13 @@ fn run() -> DResult<String> {
         start,
         buffer: None,
         consoles_seen: 0,
+        data_url_consoles: 0,
     };
 
-    let result = run_protocol(&mut drive);
+    let result = match Scenario::from_args() {
+        Scenario::Full => run_protocol(&mut drive),
+        Scenario::ShutdownWithOpenView => run_shutdown_with_open_view(&mut drive),
+    };
 
     let exit_status = reap(&mut drive, result.is_ok())?;
     let orphans = orphan_scan(&drive.helper_path);
@@ -312,9 +322,22 @@ fn run() -> DResult<String> {
     Ok(format!("{summary} helper_exit=0 orphans=0"))
 }
 
-fn run_protocol(d: &mut Drive) -> DResult<String> {
-    let start = d.start;
+enum Scenario {
+    Full,
+    ShutdownWithOpenView,
+}
 
+impl Scenario {
+    fn from_args() -> Self {
+        if std::env::args().any(|a| a == "--shutdown-with-open-view") {
+            Self::ShutdownWithOpenView
+        } else {
+            Self::Full
+        }
+    }
+}
+
+fn handshake(d: &mut Drive) -> DResult<String> {
     d.send(&ConsumerMsg::Hello {
         version: shared::PROTO_VERSION,
     })?;
@@ -330,7 +353,78 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         }
         other => return fail(format!("expected HelloAck, got {}", name_of(&other))),
     };
-    println!("[{} ms] hello-ack engine={engine}", now_ms(start));
+    println!("[{} ms] hello-ack engine={engine}", now_ms(d.start));
+    Ok(engine)
+}
+
+fn await_view_closed(d: &mut Drive, phase: &str) -> DResult<()> {
+    let close_deadline = Instant::now() + CLOSE_DEADLINE;
+    loop {
+        match d.next_msg(close_deadline)? {
+            HelperMsg::ViewClosed { view } if view == VIEW => break,
+            HelperMsg::FrameReady {
+                view,
+                generation,
+                slot: _,
+                seq,
+            } if view == VIEW => {
+                if d.buffer
+                    .as_ref()
+                    .is_some_and(|b| b.generation == generation)
+                {
+                    d.ack(generation, seq)?;
+                }
+            }
+            other => println!(
+                "[{} ms] (ignored while {phase}: {})",
+                now_ms(d.start),
+                name_of(&other)
+            ),
+        }
+    }
+    println!("[{} ms] view-closed", now_ms(d.start));
+    Ok(())
+}
+
+fn run_shutdown_with_open_view(d: &mut Drive) -> DResult<String> {
+    let engine = handshake(d)?;
+    d.send(&ConsumerMsg::CreateView {
+        view: VIEW,
+        width: WIDTH,
+        height: HEIGHT,
+    })?;
+    let frame_deadline = Instant::now() + INK_DEADLINE;
+    loop {
+        match d.next_msg(frame_deadline)? {
+            HelperMsg::FrameReady {
+                view,
+                generation,
+                slot: _,
+                seq,
+            } if view == VIEW => {
+                d.ack(generation, seq)?;
+                break;
+            }
+            other => println!(
+                "[{} ms] (ignored while awaiting the bootstrap frame: {})",
+                now_ms(d.start),
+                name_of(&other)
+            ),
+        }
+    }
+    println!(
+        "[{} ms] bootstrap frame painted; shutting down with the view open",
+        now_ms(d.start)
+    );
+    d.send(&ConsumerMsg::Shutdown)?;
+    await_view_closed(d, "shutting down with the view open")?;
+    Ok(format!("scenario=shutdown-with-open-view engine={engine}"))
+}
+
+fn run_protocol(d: &mut Drive) -> DResult<String> {
+    let start = d.start;
+
+    handshake(d)?;
 
     d.send(&ConsumerMsg::CreateView {
         view: VIEW,
@@ -512,11 +606,42 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
         now_ms(start)
     );
 
+    let data_url_consoles = load_data_with_about_blank_base(d)?;
+
     d.send(&ConsumerMsg::CloseView { view: VIEW })?;
-    let close_deadline = Instant::now() + CLOSE_DEADLINE;
+    await_view_closed(d, "closing")?;
+
+    d.send(&ConsumerMsg::Shutdown)?;
+
+    Ok(format!(
+        "target={TARGET_FOR_LOG} load_started_ms={started_ms} load_finished_ms={finished_ms} \
+         http_status={http_status} distinct_pixels={census} cookies={cookie_count} consoles={} \
+         load_data_consoles={data_url_consoles}",
+        d.consoles_seen
+    ))
+}
+
+fn load_data_with_about_blank_base(d: &mut Drive) -> DResult<u32> {
+    let consoles_before = d.data_url_consoles;
+    d.send(&ConsumerMsg::LoadDataWithBaseUrl {
+        view: VIEW,
+        base_url: "about:blank".to_string(),
+        data: LOAD_DATA_PAGE.to_string(),
+        mime: "text/html".to_string(),
+        encoding: String::new(),
+        history_url: String::new(),
+    })?;
+    let deadline = Instant::now() + LOAD_DATA_DEADLINE;
+    let mut started = false;
     loop {
-        match d.next_msg(close_deadline)? {
-            HelperMsg::ViewClosed { view } if view == VIEW => break,
+        match d.next_msg(deadline)? {
+            HelperMsg::LoadState { view, state, .. } if view == VIEW => {
+                if state == 0 {
+                    started = true;
+                } else if started {
+                    break;
+                }
+            }
             HelperMsg::FrameReady {
                 view,
                 generation,
@@ -531,21 +656,23 @@ fn run_protocol(d: &mut Drive) -> DResult<String> {
                 }
             }
             other => println!(
-                "[{} ms] (ignored while closing: {})",
-                now_ms(start),
+                "[{} ms] (ignored while loading data: {})",
+                now_ms(d.start),
                 name_of(&other)
             ),
         }
     }
-    println!("[{} ms] view-closed", now_ms(start));
-
-    d.send(&ConsumerMsg::Shutdown)?;
-
-    Ok(format!(
-        "target={TARGET_FOR_LOG} load_started_ms={started_ms} load_finished_ms={finished_ms} \
-         http_status={http_status} distinct_pixels={census} cookies={cookie_count} consoles={}",
-        d.consoles_seen
-    ))
+    let consoles = d.data_url_consoles - consoles_before;
+    if consoles == 0 {
+        return fail(
+            "loadDataWithBaseURL with an about:blank base finished without running its page",
+        );
+    }
+    println!(
+        "[{} ms] load-data-with-base-url about:blank finished page_consoles={consoles}",
+        now_ms(d.start)
+    );
+    Ok(consoles)
 }
 
 fn name_of(msg: &HelperMsg) -> &'static str {

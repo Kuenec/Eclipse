@@ -9,7 +9,7 @@ use cef::wrapper::message_router::{
     RendererSideRouter,
 };
 use cef::{args::Args, sys, *};
-use engine::{Engine, Out, Outbox};
+use engine::{Engine, Out, OutQueue, Outbox};
 use logging as log;
 use logging::RedactedTarget;
 use shared::fdpass;
@@ -538,6 +538,23 @@ fn write_helper_msg(stream: &UnixStream, msg: &HelperMsg) -> std::io::Result<()>
     }
 }
 
+fn run_writer(queue: OutQueue, stream: UnixStream) {
+    while let Some(out) = queue.recv() {
+        let result = match out {
+            Out::Msg(msg) => write_helper_msg(&stream, &msg),
+            Out::MsgWithFd(msg, fd) => write_helper_msg(&stream, &msg).and_then(|()| {
+                fdpass::send_fd_with_sentinel(&stream, fd.as_fd())
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            }),
+            Out::Stop => break,
+        };
+        if let Err(e) = result {
+            log::error(COMPONENT, &format!("control-socket write failed: {e}"));
+            break;
+        }
+    }
+}
+
 fn set_cloexec(stream: &UnixStream) {
     let ok = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     if ok != 0 {
@@ -912,8 +929,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (out_tx, out_rx) = mpsc::sync_channel::<Out>(OUT_QUEUE_HIGH_WATER);
-    let outbox = Outbox::new(out_tx);
+    let (outbox, out_queue) = Outbox::channel(OUT_QUEUE_HIGH_WATER);
     let writer_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -922,21 +938,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let writer = std::thread::spawn(move || {
-        for out in out_rx {
-            let result = match out {
-                Out::Msg(msg) => write_helper_msg(&writer_stream, &msg),
-                Out::MsgWithFd(msg, fd) => write_helper_msg(&writer_stream, &msg).and_then(|()| {
-                    fdpass::send_fd_with_sentinel(&writer_stream, fd.as_fd())
-                        .map_err(|e| std::io::Error::other(e.to_string()))
-                }),
-            };
-            if let Err(e) = result {
-                log::error(COMPONENT, &format!("control-socket write failed: {e}"));
-                break;
-            }
-        }
-    });
+    let writer = std::thread::spawn(move || run_writer(out_queue, writer_stream));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let reader_stream = match stream.try_clone() {
@@ -1004,6 +1006,7 @@ fn main() -> ExitCode {
         std::thread::sleep(PUMP_INTERVAL);
     };
 
+    outbox.stop();
     drop(engine);
     drop(outbox);
     let _ = writer.join();
@@ -1024,6 +1027,30 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_exits_on_stop_while_a_cef_held_outbox_clone_is_still_alive() {
+        let (consumer_end, helper_end) = UnixStream::pair().expect("socketpair");
+        let (outbox, queue) = Outbox::channel(4);
+        let held_by_cef_client = outbox.clone();
+        outbox.send(HelperMsg::ViewClosed { view: 7 });
+        outbox.stop();
+        drop(outbox);
+        let writer = std::thread::spawn(move || run_writer(queue, helper_end));
+        consumer_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        assert_eq!(
+            proto::read_helper_msg(&mut &consumer_end),
+            Ok(HelperMsg::ViewClosed { view: 7 })
+        );
+        assert_eq!(
+            proto::read_helper_msg(&mut &consumer_end),
+            Err(ProtoError::Eof)
+        );
+        writer.join().expect("writer thread");
+        drop(held_by_cef_client);
+    }
 
     #[test]
     fn ipc_fd_argument_is_required_and_validated() {
