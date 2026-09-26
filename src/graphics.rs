@@ -23,7 +23,7 @@ const COMPOSITE_FRAG_SPV: &[u8] = include_bytes!("../shaders/composite.frag.spv"
 
 const MAX_COMPOSITE_VIEWS: usize = 16;
 
-const ENGINE_MAIN_LOOP_TICK: std::time::Duration = std::time::Duration::from_millis(4);
+const MAIN_THREAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(4);
 
 const DISPLAY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -110,6 +110,14 @@ struct GameWindow<'vm> {
     engine_center_query_failed: bool,
 }
 
+fn next_wake(deadlines: impl IntoIterator<Item = Option<std::time::Instant>>) -> ControlFlow {
+    deadlines
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DisplayRefreshProfile {
     current_millihertz: Option<u32>,
@@ -126,6 +134,13 @@ impl DisplayRefreshProfile {
             .iter()
             .map(|rate| *rate as f32 / 1000.0)
             .collect()
+    }
+
+    fn frame(&self) -> Option<std::time::Duration> {
+        const NANOS_PER_MILLIHERTZ_CYCLE: u64 = 1_000_000_000_000;
+        self.current_millihertz.map(|rate| {
+            std::time::Duration::from_nanos(NANOS_PER_MILLIHERTZ_CYCLE / u64::from(rate))
+        })
     }
 }
 
@@ -166,7 +181,7 @@ fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
     )
 }
 
-impl ApplicationHandler for GameWindow<'_> {
+impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes().with_title(self.title.clone());
         let window = match event_loop.create_window(attrs) {
@@ -459,9 +474,15 @@ impl ApplicationHandler for GameWindow<'_> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(vm) = self.vm else { return };
-        if let Err(e) = crate::framework::pump_main_looper(vm) {
-            tracing::error!(error = %e, "main Looper pump failed");
-        }
+        let main_looper = match crate::framework::pump_main_looper(vm) {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::error!(error = %e, "main Looper pump failed");
+                crate::framework::MainLooperDue::At(
+                    std::time::Instant::now() + MAIN_THREAD_RETRY_DELAY,
+                )
+            }
+        };
 
         if !self.handed_off && self.engine_window.is_some() {
             match crate::framework::engine_surface_callback_ready(vm) {
@@ -518,9 +539,18 @@ impl ApplicationHandler for GameWindow<'_> {
             self.next_display_refresh_poll = now + DISPLAY_REFRESH_POLL_INTERVAL;
         }
         if self.handed_off {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                std::time::Instant::now() + ENGINE_MAIN_LOOP_TICK,
-            ));
+            let main_thread_retry = (crate::framework::textbox_geometry_pending()
+                || crate::framework::global_layout_pending())
+            .then(|| now + MAIN_THREAD_RETRY_DELAY);
+            let engine_center_poll = (crate::webview::client::active_view() == 0
+                && self.engine_center_queryable())
+            .then(|| self.display_frame());
+            event_loop.set_control_flow(next_wake([
+                main_looper.deadline(now),
+                Some(self.next_display_refresh_poll),
+                main_thread_retry,
+                pointer_lock_recheck(self.pointer_lock, engine_center_poll, now),
+            ]));
         }
     }
 
@@ -736,6 +766,21 @@ fn pointer_lock_step(
         (PointerLock::Held { .. } | PointerLock::Refused { .. }, false) => PointerLockStep::Release,
         _ => PointerLockStep::Keep,
     }
+}
+
+fn pointer_lock_recheck(
+    lock: PointerLock,
+    engine_center_poll: Option<std::time::Duration>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let retry = match lock {
+        PointerLock::Refused { at } => Some(at + POINTER_LOCK_RETRY_DELAY),
+        PointerLock::Free | PointerLock::Held { .. } => None,
+    };
+    [engine_center_poll.map(|interval| now + interval), retry]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1107,11 +1152,21 @@ impl GameWindow<'_> {
         self.update_pointer_lock(reasons);
     }
 
+    fn engine_center_queryable(&self) -> bool {
+        self.focused
+            && self.touch_mode == crate::config::TouchMode::Off
+            && !self.engine_center_query_failed
+    }
+
+    fn display_frame(&self) -> std::time::Duration {
+        self.published_display_refresh_profile
+            .as_ref()
+            .and_then(DisplayRefreshProfile::frame)
+            .unwrap_or(MAIN_THREAD_RETRY_DELAY)
+    }
+
     fn query_engine_center(&mut self) -> bool {
-        if !self.focused
-            || self.touch_mode != crate::config::TouchMode::Off
-            || self.engine_center_query_failed
-        {
+        if !self.engine_center_queryable() {
             return false;
         }
         let Some(vm) = self.vm else { return false };
@@ -1564,7 +1619,10 @@ pub fn run_windowed(
     vm: Option<&crate::runtime::Vm>,
     touch_mode: crate::config::TouchMode,
 ) -> Result<(), GraphicsError> {
-    let event_loop = EventLoop::new().map_err(GraphicsError::EventLoop)?;
+    let event_loop = EventLoop::<crate::framework::MainLooperWake>::with_user_event()
+        .build()
+        .map_err(GraphicsError::EventLoop)?;
+    crate::framework::install_main_looper_waker(event_loop.create_proxy());
     let mut app = GameWindow {
         title: title.to_owned(),
         window: None,
@@ -6143,6 +6201,71 @@ mod tests {
             RelativeMotionUnits::DeviceCounts.engine_delta((3.0, -2.0), 2.0),
             (3.0, -2.0)
         );
+    }
+
+    #[test]
+    fn the_loop_sleeps_until_the_earliest_deadline_or_a_wake() {
+        let now = std::time::Instant::now();
+        let soon = now + std::time::Duration::from_millis(3);
+        let later = now + std::time::Duration::from_millis(500);
+
+        assert_eq!(
+            next_wake([None, Some(later), Some(soon)]),
+            ControlFlow::WaitUntil(soon)
+        );
+        assert_eq!(next_wake([None, None]), ControlFlow::Wait);
+    }
+
+    #[test]
+    fn pointer_lock_is_rechecked_every_frame_while_the_engine_can_lock_it() {
+        let now = std::time::Instant::now();
+        let frame = std::time::Duration::from_micros(6_945);
+        let held = PointerLock::Held {
+            anchor: (320.0, 240.0),
+            grab: PointerGrab::Locked,
+        };
+
+        for lock in [PointerLock::Free, held] {
+            assert_eq!(
+                pointer_lock_recheck(lock, Some(frame), now),
+                Some(now + frame)
+            );
+            assert_eq!(pointer_lock_recheck(lock, None, now), None);
+        }
+    }
+
+    #[test]
+    fn a_refused_lock_wakes_the_loop_for_its_retry() {
+        let now = std::time::Instant::now();
+        let refused = PointerLock::Refused { at: now };
+        let frame = std::time::Duration::from_micros(16_667);
+
+        assert_eq!(
+            pointer_lock_recheck(refused, None, now),
+            Some(now + POINTER_LOCK_RETRY_DELAY)
+        );
+        assert_eq!(
+            pointer_lock_recheck(refused, Some(frame), now),
+            Some(now + frame)
+        );
+    }
+
+    #[test]
+    fn a_display_frame_lasts_one_refresh_period() {
+        let profile = |current_millihertz| DisplayRefreshProfile {
+            current_millihertz,
+            supported_millihertz: vec![60_000],
+        };
+
+        assert_eq!(
+            profile(Some(60_000)).frame(),
+            Some(std::time::Duration::from_nanos(16_666_666))
+        );
+        assert_eq!(
+            profile(Some(143_996)).frame(),
+            Some(std::time::Duration::from_nanos(6_944_637))
+        );
+        assert_eq!(profile(None).frame(), None);
     }
 
     #[test]

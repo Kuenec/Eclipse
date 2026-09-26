@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -5,18 +6,28 @@ use std::time::{Duration, Instant};
 
 const FIRST_HANDLE: i64 = 0x4d51_0000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueueRole {
+    Main,
+    Worker,
+}
+
+thread_local! {
+    static MAIN_YIELD_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
 #[derive(Debug)]
 struct QueueState {
-    is_main: bool,
+    role: QueueRole,
     wake_pending: Mutex<bool>,
     wake: Condvar,
     waiting: AtomicBool,
 }
 
 impl QueueState {
-    fn new(is_main: bool) -> Self {
+    fn new(role: QueueRole) -> Self {
         Self {
-            is_main,
+            role,
             wake_pending: Mutex::new(false),
             wake: Condvar::new(),
             waiting: AtomicBool::new(false),
@@ -93,7 +104,7 @@ fn state(handle: i64) -> Option<Arc<QueueState>> {
     lock_registry().get(&handle).cloned()
 }
 
-pub(super) fn create(is_main: bool) -> Option<i64> {
+pub(super) fn create(role: QueueRole) -> Option<i64> {
     static NEXT_HANDLE: AtomicI64 = AtomicI64::new(FIRST_HANDLE);
     let handle = NEXT_HANDLE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
@@ -105,7 +116,7 @@ pub(super) fn create(is_main: bool) -> Option<i64> {
     }
     match lock_registry().entry(handle) {
         std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(Arc::new(QueueState::new(is_main)));
+            entry.insert(Arc::new(QueueState::new(role)));
             Some(handle)
         }
         std::collections::hash_map::Entry::Occupied(_) => None,
@@ -116,19 +127,28 @@ pub(super) fn poll_should_yield(handle: i64, timeout_millis: i32) -> bool {
     let Some(state) = state(handle) else {
         return timeout_millis != 0;
     };
-    if state.is_main {
-        return timeout_millis != 0;
+    if state.role == QueueRole::Main {
+        if timeout_millis == 0 {
+            return false;
+        }
+        let deadline = u64::try_from(timeout_millis)
+            .ok()
+            .map(|millis| Instant::now() + Duration::from_millis(millis));
+        MAIN_YIELD_DEADLINE.set(deadline);
+        return true;
     }
     state.wait(timeout_millis);
     false
 }
 
-pub(super) fn wake(handle: i64) -> bool {
-    let Some(state) = state(handle) else {
-        return false;
-    };
+pub(super) fn take_main_yield_deadline() -> Option<Instant> {
+    MAIN_YIELD_DEADLINE.take()
+}
+
+pub(super) fn wake(handle: i64) -> Option<QueueRole> {
+    let state = state(handle)?;
     state.signal();
-    true
+    Some(state.role)
 }
 
 pub(super) fn is_idling(handle: i64) -> bool {
@@ -151,7 +171,7 @@ mod tests {
 
     #[test]
     fn main_queue_yields_instead_of_blocking() {
-        let handle = create(true).expect("test queue handle");
+        let handle = create(QueueRole::Main).expect("test queue handle");
         assert!(!poll_should_yield(handle, 0));
         assert!(poll_should_yield(handle, -1));
         assert!(poll_should_yield(handle, 25));
@@ -159,8 +179,49 @@ mod tests {
     }
 
     #[test]
+    fn main_queue_yield_records_when_the_next_message_is_due() {
+        let handle = create(QueueRole::Main).expect("test queue handle");
+        assert_eq!(take_main_yield_deadline(), None);
+
+        let before = Instant::now();
+        assert!(poll_should_yield(handle, 25));
+        let after = Instant::now();
+        let due = take_main_yield_deadline().expect("a delayed message records its due time");
+        assert!(due >= before + Duration::from_millis(25));
+        assert!(due <= after + Duration::from_millis(25));
+        assert_eq!(
+            take_main_yield_deadline(),
+            None,
+            "taking the deadline consumes it"
+        );
+
+        assert!(poll_should_yield(handle, 40));
+        assert!(poll_should_yield(handle, -1));
+        assert_eq!(
+            take_main_yield_deadline(),
+            None,
+            "an empty queue waits for nativeWake instead of a stale due time"
+        );
+
+        assert!(!poll_should_yield(handle, 0));
+        assert_eq!(take_main_yield_deadline(), None);
+        assert!(destroy(handle));
+    }
+
+    #[test]
+    fn wake_reports_the_role_of_the_woken_queue() {
+        let main = create(QueueRole::Main).expect("test queue handle");
+        let worker = create(QueueRole::Worker).expect("test queue handle");
+        assert_eq!(wake(main), Some(QueueRole::Main));
+        assert_eq!(wake(worker), Some(QueueRole::Worker));
+        assert!(destroy(main));
+        assert!(destroy(worker));
+        assert_eq!(wake(main), None);
+    }
+
+    #[test]
     fn worker_queue_blocks_until_a_durable_wake() {
-        let handle = create(false).expect("test queue handle");
+        let handle = create(QueueRole::Worker).expect("test queue handle");
         let (sent, received) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             sent.send(poll_should_yield(handle, -1))
@@ -172,7 +233,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(is_idling(handle), "worker never entered its blocking poll");
-        assert!(wake(handle));
+        assert_eq!(wake(handle), Some(QueueRole::Worker));
         assert!(!received
             .recv_timeout(Duration::from_secs(1))
             .expect("wake must release the worker"));
@@ -183,12 +244,12 @@ mod tests {
 
     #[test]
     fn worker_timed_poll_and_destroyed_handle_never_hang() {
-        let handle = create(false).expect("test queue handle");
+        let handle = create(QueueRole::Worker).expect("test queue handle");
         let started = Instant::now();
         assert!(!poll_should_yield(handle, 5));
         assert!(started.elapsed() >= Duration::from_millis(1));
         assert!(destroy(handle));
         assert!(poll_should_yield(handle, -1));
-        assert!(!wake(handle));
+        assert_eq!(wake(handle), None);
     }
 }
