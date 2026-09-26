@@ -3,6 +3,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use directories::ProjectDirs;
 
@@ -162,26 +163,38 @@ impl BootPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallLayout {
-    exe: PathBuf,
+    bundled_libart: Option<PathBuf>,
+
+    bundled_framework: Option<PathBuf>,
 }
 
 impl InstallLayout {
-    fn current() -> Result<Self, RuntimeError> {
-        std::env::current_exe()
-            .map(|exe| Self { exe })
-            .map_err(RuntimeError::CurrentExe)
+    fn current() -> Result<&'static Self, RuntimeError> {
+        static CURRENT: OnceLock<InstallLayout> = OnceLock::new();
+        if let Some(layout) = CURRENT.get() {
+            return Ok(layout);
+        }
+        let exe = std::env::current_exe().map_err(RuntimeError::CurrentExe)?;
+        Ok(CURRENT.get_or_init(|| Self::probe(&exe)))
     }
 
-    fn bundled_libart(&self) -> Option<PathBuf> {
-        let prefix = self.exe.parent()?.parent()?;
-        Some(prefix.join(ART_SUBDIR).join("libart.so"))
+    fn probe(exe: &Path) -> Self {
+        Self {
+            bundled_libart: bundled_libart_path(exe).filter(|path| path.is_file()),
+            bundled_framework: bundled_framework_dir(exe)
+                .filter(|dir| bundled_overlay_is_present(dir)),
+        }
     }
+}
 
-    fn bundled_framework_dir(&self) -> Option<PathBuf> {
-        self.exe
-            .parent()
-            .map(|exe_dir| exe_dir.join(BUNDLED_FRAMEWORK_DIR))
-    }
+fn bundled_libart_path(exe: &Path) -> Option<PathBuf> {
+    let prefix = exe.parent()?.parent()?;
+    Some(prefix.join(ART_SUBDIR).join("libart.so"))
+}
+
+fn bundled_framework_dir(exe: &Path) -> Option<PathBuf> {
+    exe.parent()
+        .map(|exe_dir| exe_dir.join(BUNDLED_FRAMEWORK_DIR))
 }
 
 fn resolve_libart(explicit: Option<PathBuf>, bundled: Option<PathBuf>) -> PathBuf {
@@ -191,10 +204,7 @@ fn resolve_libart(explicit: Option<PathBuf>, bundled: Option<PathBuf>) -> PathBu
 }
 
 fn libart_location(layout: &InstallLayout) -> PathBuf {
-    resolve_libart(
-        env_path("ECLIPSE_LIBART"),
-        layout.bundled_libart().filter(|path| path.is_file()),
-    )
+    resolve_libart(env_path("ECLIPSE_LIBART"), layout.bundled_libart.clone())
 }
 
 fn libart_path(layout: &InstallLayout) -> Result<PathBuf, RuntimeError> {
@@ -207,7 +217,7 @@ fn libart_path(layout: &InstallLayout) -> Result<PathBuf, RuntimeError> {
 }
 
 pub fn find_libart() -> Result<PathBuf, RuntimeError> {
-    libart_path(&InstallLayout::current()?)
+    libart_path(InstallLayout::current()?)
 }
 
 fn stock_dex_root(libart: &Path) -> Option<PathBuf> {
@@ -278,9 +288,7 @@ fn bundled_overlay_is_present(dir: &Path) -> bool {
 fn framework_overlay(layout: &InstallLayout) -> Option<FrameworkOverlay> {
     resolve_framework_overlay(
         env_path("ECLIPSE_ANDROID_FRAMEWORK_DIR"),
-        layout
-            .bundled_framework_dir()
-            .filter(|dir| bundled_overlay_is_present(dir)),
+        layout.bundled_framework.clone(),
         patched_overlay_dir(),
     )
 }
@@ -363,7 +371,7 @@ fn find_art_boot_paths(layout: &InstallLayout) -> Result<ArtBootPaths, RuntimeEr
 }
 
 pub fn prepare_art_boot_environment() -> Result<(), RuntimeError> {
-    let paths = find_art_boot_paths(&InstallLayout::current()?)?;
+    let paths = find_art_boot_paths(InstallLayout::current()?)?;
     if let Some(boot_class_path) = paths.boot_class_path {
         if std::env::var_os("BOOTCLASSPATH").as_ref() != Some(&boot_class_path) {
             unsafe { std::env::set_var("BOOTCLASSPATH", boot_class_path) };
@@ -373,7 +381,7 @@ pub fn prepare_art_boot_environment() -> Result<(), RuntimeError> {
 }
 
 pub fn find_boot_image() -> Result<PathBuf, RuntimeError> {
-    find_art_boot_paths(&InstallLayout::current()?).map(|paths| paths.image_location)
+    find_art_boot_paths(InstallLayout::current()?).map(|paths| paths.image_location)
 }
 
 fn env_path(var: &str) -> Option<PathBuf> {
@@ -448,7 +456,7 @@ fn find_framework_in(layout: &InstallLayout) -> Result<FrameworkPaths, RuntimeEr
 }
 
 pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
-    find_framework_in(&InstallLayout::current()?)
+    find_framework_in(InstallLayout::current()?)
 }
 
 pub fn native_lib_cache_dir() -> Result<PathBuf, RuntimeError> {
@@ -651,8 +659,8 @@ pub fn boot(
     app_lib_dir: Option<&Path>,
 ) -> Result<Vm, RuntimeError> {
     let layout = InstallLayout::current()?;
-    let libart = libart_path(&layout)?;
-    let art_boot = find_art_boot_paths(&layout)?;
+    let libart = libart_path(layout)?;
+    let art_boot = find_art_boot_paths(layout)?;
     let boot_image = &art_boot.image_location;
 
     let mut option_strings: Vec<CString> = Vec::new();
@@ -686,7 +694,7 @@ pub fn boot(
     }
 
     if let Some(apk) = apk_path {
-        let fw = find_framework_in(&layout)?;
+        let fw = find_framework_in(layout)?;
         option_strings.push(make_cstring(class_path_option(&fw, apk))?);
         option_strings.push(make_cstring(library_path_option(&fw, app_lib_dir))?);
     }
@@ -1022,15 +1030,13 @@ mod tests {
 
     #[test]
     fn install_layout_derives_bundled_paths_from_the_executable() {
-        let layout = InstallLayout {
-            exe: PathBuf::from("/app/lib/eclipse/eclipse"),
-        };
+        let exe = Path::new("/app/lib/eclipse/eclipse");
         assert_eq!(
-            layout.bundled_libart(),
+            bundled_libart_path(exe),
             Some(PathBuf::from("/app/lib/art/libart.so"))
         );
         assert_eq!(
-            layout.bundled_framework_dir(),
+            bundled_framework_dir(exe),
             Some(PathBuf::from("/app/lib/eclipse/framework"))
         );
     }
@@ -1054,9 +1060,12 @@ mod tests {
         std::fs::write(root.join("bundle/lib/art/libart.so"), b"").expect("write libart");
         std::fs::write(framework.join(API_IMPL_JAR), b"").expect("write api-impl");
 
-        let bundle = InstallLayout { exe: bundle_exe };
-        assert!(
-            !bundled_overlay_is_present(&framework),
+        assert_eq!(
+            InstallLayout::probe(&bundle_exe),
+            InstallLayout {
+                bundled_libart: Some(root.join("bundle/lib/art/libart.so")),
+                bundled_framework: None,
+            },
             "a bundled overlay without the ART readiness marker must not be selected"
         );
         std::fs::write(
@@ -1064,16 +1073,21 @@ mod tests {
             ART_OVERLAY_MARKER_CONTENT,
         )
         .expect("write marker");
-        assert!(bundled_overlay_is_present(&framework));
-        assert!(bundle.bundled_libart().is_some_and(|path| path.is_file()));
+        assert_eq!(
+            InstallLayout::probe(&bundle_exe),
+            InstallLayout {
+                bundled_libart: Some(root.join("bundle/lib/art/libart.so")),
+                bundled_framework: Some(framework.clone()),
+            }
+        );
 
-        let dev = InstallLayout {
-            exe: root.join("repo/target/release/eclipse"),
-        };
-        assert!(dev.bundled_libart().is_some_and(|path| !path.exists()));
-        assert!(dev
-            .bundled_framework_dir()
-            .is_some_and(|dir| !bundled_overlay_is_present(&dir)));
+        assert_eq!(
+            InstallLayout::probe(&root.join("repo/target/release/eclipse")),
+            InstallLayout {
+                bundled_libart: None,
+                bundled_framework: None,
+            }
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
