@@ -9,14 +9,17 @@ pub mod signature;
 pub mod store;
 
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crc32fast::Hasher as Crc32;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipArchive};
 
 use axml::AxmlError;
@@ -44,6 +47,14 @@ const MAX_APK_BYTES: u64 = 1024 * 1024 * 1024;
 const READ_ENTRY_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
 
 const EXTRACTED_ENTRY_HASH_BUFFER_SIZE: usize = 64 * 1024;
+
+const EXTRACTION_PREFIX: &str = ".eclipse-extract.";
+
+const EXTRACTION_LOCK: &str = ".eclipse-extract.lock";
+
+const EXTRACTION_STAMP: &str = ".eclipse-extract.stamp";
+
+const EXTRACTION_TEMP_SUFFIX: &str = ".partial";
 
 fn decode_modified_utf8(data: &[u8]) -> Option<String> {
     if let Ok(text) = std::str::from_utf8(data) {
@@ -80,26 +91,118 @@ fn decode_modified_utf8(data: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
+fn io_context(error: io::Error, operation: &str, path: &Path) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
+
 fn extracted_entry_matches(path: &Path, size: u64, crc32: u32) -> io::Result<bool> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
+        Err(error) => return Err(io_context(error, "open", path)),
     };
-    if file.metadata()?.len() != size {
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_context(error, "stat", path))?;
+    if metadata.len() != size {
         return Ok(false);
     }
 
     let mut hasher = Crc32::new();
     let mut buffer = [0_u8; EXTRACTED_ENTRY_HASH_BUFFER_SIZE];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| io_context(error, "read", path))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize() == crc32)
+}
+
+struct PlannedEntry {
+    name: String,
+    dest: PathBuf,
+    size: u64,
+    crc32: u32,
+}
+
+fn lock_extraction_dir(dir: &Path) -> io::Result<File> {
+    let path = dir.join(EXTRACTION_LOCK);
+    let context = |error| io_context(error, "lock", &path);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(context)?;
+    lock.lock().map_err(context)?;
+    Ok(lock)
+}
+
+fn extraction_digest(
+    source_path: &Path,
+    source: &Metadata,
+    planned: &[PlannedEntry],
+) -> io::Result<Option<Vec<u8>>> {
+    let mut digest = Sha256::new();
+    digest.update(source_path.as_os_str().as_bytes());
+    digest.update([0]);
+    hash_file_identity(&mut digest, source);
+    for entry in planned {
+        let extracted = match std::fs::metadata(&entry.dest) {
+            Ok(extracted) => extracted,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_context(error, "stat", &entry.dest)),
+        };
+        if !extracted.is_file() || extracted.len() != entry.size {
+            return Ok(None);
+        }
+        digest.update(entry.name.as_bytes());
+        digest.update([0]);
+        digest.update(entry.size.to_le_bytes());
+        digest.update(entry.crc32.to_le_bytes());
+        hash_file_identity(&mut digest, &extracted);
+    }
+    Ok(Some(digest.finalize().to_vec()))
+}
+
+fn hash_file_identity(digest: &mut Sha256, metadata: &Metadata) {
+    digest.update(metadata.dev().to_le_bytes());
+    digest.update(metadata.ino().to_le_bytes());
+    digest.update(metadata.size().to_le_bytes());
+    digest.update(metadata.mtime().to_le_bytes());
+    digest.update(metadata.mtime_nsec().to_le_bytes());
+}
+
+fn read_stamp(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(stamp) => Ok(Some(stamp)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_context(error, "read", path)),
+    }
+}
+
+fn remove_stale_temporaries(dir: &Path) -> io::Result<()> {
+    let list_error = |error| io_context(error, "list", dir);
+    for entry in std::fs::read_dir(dir).map_err(list_error)? {
+        let entry = entry.map_err(list_error)?;
+        let name = entry.file_name();
+        let stale = name.to_str().is_some_and(|name| {
+            name.starts_with(EXTRACTION_PREFIX) && name.ends_with(EXTRACTION_TEMP_SUFFIX)
+        });
+        if stale {
+            let path = entry.path();
+            std::fs::remove_file(&path)
+                .map_err(|error| io_context(error, "remove stale", &path))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -236,27 +339,21 @@ impl Apk {
             .filter(|n| n.starts_with(&prefix) && n.ends_with(".so"))
             .map(str::to_owned)
             .collect();
-        std::fs::create_dir_all(dest_dir)?;
-        let mut extracted = Vec::with_capacity(names.len());
+        let mut planned = Vec::with_capacity(names.len());
         for name in names {
             let base = name.rsplit('/').next().unwrap_or(name.as_str());
             let dest = dest_dir.join(base);
-            let mut entry = self.archive.by_name(&name)?;
-
-            if extracted_entry_matches(&dest, entry.size(), entry.crc32())? {
-                extracted.push(dest);
-                continue;
-            }
-
-            let tmp = dest_dir.join(format!("{base}.partial"));
-            let mut out = File::create(&tmp)?;
-            io::copy(&mut entry, &mut out)?;
-            out.sync_all()?;
-            drop(out);
-            std::fs::rename(&tmp, &dest)?;
-            extracted.push(dest);
+            let entry = self.archive.by_name(&name)?;
+            let (size, crc32) = (entry.size(), entry.crc32());
+            planned.push(PlannedEntry {
+                name,
+                dest,
+                size,
+                crc32,
+            });
         }
-        Ok(extracted)
+        self.extract_planned(dest_dir, &planned)?;
+        Ok(planned.into_iter().map(|entry| entry.dest).collect())
     }
 
     pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError> {
@@ -268,10 +365,9 @@ impl Apk {
             .filter(|n| n.starts_with(PREFIX) && !n.ends_with('/'))
             .map(str::to_owned)
             .collect();
-        std::fs::create_dir_all(dest_dir)?;
-        let mut written = 0usize;
+        let mut planned = Vec::with_capacity(names.len());
         for name in names {
-            let mut entry = self.archive.by_name(&name)?;
+            let entry = self.archive.by_name(&name)?;
 
             let Some(safe) = entry.enclosed_name() else {
                 continue;
@@ -282,24 +378,100 @@ impl Apk {
             if rel.as_os_str().is_empty() {
                 continue;
             }
+            let bookkeeping = rel.parent() == Some(Path::new(""))
+                && rel
+                    .to_str()
+                    .is_some_and(|file_name| file_name.starts_with(EXTRACTION_PREFIX));
+            if bookkeeping {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "APK asset {name} would overwrite Eclipse's extraction bookkeeping in {}",
+                        dest_dir.display()
+                    ),
+                )
+                .into());
+            }
             let dest = dest_dir.join(rel);
+            let (size, crc32) = (entry.size(), entry.crc32());
+            planned.push(PlannedEntry {
+                name,
+                dest,
+                size,
+                crc32,
+            });
+        }
+        self.extract_planned(dest_dir, &planned)
+    }
 
-            if extracted_entry_matches(&dest, entry.size(), entry.crc32())? {
+    fn extract_planned(
+        &mut self,
+        dest_dir: &Path,
+        planned: &[PlannedEntry],
+    ) -> Result<usize, ApkError> {
+        std::fs::create_dir_all(dest_dir).map_err(|error| io_context(error, "create", dest_dir))?;
+        let _lock = lock_extraction_dir(dest_dir)?;
+        let source = self
+            .file
+            .metadata()
+            .map_err(|error| io_context(error, "stat", &self.path))?;
+        let stamp_path = dest_dir.join(EXTRACTION_STAMP);
+        let current = extraction_digest(&self.path, &source, planned)?;
+        if current.is_some() && current == read_stamp(&stamp_path)? {
+            return Ok(0);
+        }
+
+        remove_stale_temporaries(dest_dir)?;
+        let temporary = dest_dir.join(format!(
+            "{EXTRACTION_PREFIX}{}{EXTRACTION_TEMP_SUFFIX}",
+            std::process::id()
+        ));
+        let mut written = 0usize;
+        for planned_entry in planned {
+            if extracted_entry_matches(
+                &planned_entry.dest,
+                planned_entry.size,
+                planned_entry.crc32,
+            )? {
                 continue;
             }
-
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(parent) = planned_entry.dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| io_context(error, "create", parent))?;
             }
-
-            let file_name = dest.file_name().unwrap_or(rel.as_os_str());
-            let tmp = dest.with_file_name(format!("{}.partial", file_name.to_string_lossy()));
-            let mut out = File::create(&tmp)?;
-            io::copy(&mut entry, &mut out)?;
-            out.sync_all()?;
+            let mut entry = self.archive.by_name(&planned_entry.name)?;
+            let mut out = File::create(&temporary)
+                .map_err(|error| io_context(error, "create", &temporary))?;
+            io::copy(&mut entry, &mut out).map_err(|error| {
+                io_context(
+                    error,
+                    &format!("extract {} to", planned_entry.name),
+                    &temporary,
+                )
+            })?;
+            out.sync_all()
+                .map_err(|error| io_context(error, "sync", &temporary))?;
             drop(out);
-            std::fs::rename(&tmp, &dest)?;
+            std::fs::rename(&temporary, &planned_entry.dest).map_err(|error| {
+                io_context(
+                    error,
+                    &format!("rename {} to", temporary.display()),
+                    &planned_entry.dest,
+                )
+            })?;
             written += 1;
+        }
+
+        if let Some(stamp) = extraction_digest(&self.path, &source, planned)? {
+            std::fs::write(&temporary, stamp)
+                .map_err(|error| io_context(error, "write", &temporary))?;
+            std::fs::rename(&temporary, &stamp_path).map_err(|error| {
+                io_context(
+                    error,
+                    &format!("rename {} to", temporary.display()),
+                    &stamp_path,
+                )
+            })?;
         }
         Ok(written)
     }
@@ -1264,6 +1436,186 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&old_path).ok();
         std::fs::remove_file(&new_path).ok();
+    }
+
+    fn noisy_payload(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_launches_extract_into_the_same_directories_without_failing() {
+        let engine = noisy_payload(4 * 1024 * 1024, 7);
+        let asset = noisy_payload(256 * 1024, 11);
+        let bytes = build_apk(&[
+            ("lib/x86_64/libbig.so", &engine),
+            ("assets/content/big.bin", &asset),
+            ("assets/small.txt", b"SMALL"),
+        ]);
+        let apk_path = temp_file("concurrent-extract", &bytes);
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-concurrent-extract-{:?}",
+            std::thread::current().id()
+        ));
+        for round in 0..8 {
+            std::fs::remove_dir_all(&root).ok();
+            let libs = root.join("libs");
+            let assets = root.join("assets");
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<Result<(), ApkError>> = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let mut apk = Apk::open(&apk_path).expect("open apk");
+                        let (libs, assets, barrier) = (&libs, &assets, &barrier);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            apk.extract_native_libs("x86_64", libs)?;
+                            apk.extract_assets(assets).map(drop)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("extraction thread"))
+                    .collect()
+            });
+            for result in results {
+                assert!(result.is_ok(), "round {round}: {result:?}");
+            }
+            assert_eq!(std::fs::read(libs.join("libbig.so")).unwrap(), engine);
+            assert_eq!(
+                std::fs::read(assets.join("content/big.bin")).unwrap(),
+                asset
+            );
+            assert_eq!(std::fs::read(assets.join("small.txt")).unwrap(), b"SMALL");
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn unchanged_extractions_are_trusted_from_the_stamp_without_rereading_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bytes = build_apk(&[
+            ("lib/x86_64/libroblox.so", b"ENGINE-BYTES"),
+            ("assets/content/fonts/a.ttf", b"FONT"),
+        ]);
+        let (mut apk, apk_path) = open_apk(&bytes, "extract-stamp");
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-extract-stamp-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let (libs, assets) = (root.join("libs"), root.join("assets"));
+        apk.extract_native_libs("x86_64", &libs)
+            .expect("extract libs");
+        assert_eq!(apk.extract_assets(&assets).expect("extract assets"), 1);
+
+        let unreadable = std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(libs.join("libroblox.so"), unreadable.clone()).unwrap();
+        std::fs::set_permissions(assets.join("content/fonts/a.ttf"), unreadable).unwrap();
+        let again = apk.extract_native_libs("x86_64", &libs);
+        let assets_again = apk.extract_assets(&assets);
+        let readable = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(libs.join("libroblox.so"), readable.clone()).unwrap();
+        std::fs::set_permissions(assets.join("content/fonts/a.ttf"), readable).unwrap();
+        assert_eq!(
+            again.expect("stamped libs"),
+            vec![libs.join("libroblox.so")]
+        );
+        assert_eq!(assets_again.expect("stamped assets"), 0);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn a_file_replaced_after_the_stamp_is_checked_and_rewritten() {
+        let bytes = build_apk(&[
+            ("lib/x86_64/libroblox.so", b"ENGINE-BYTES"),
+            ("assets/a.bin", b"ASSET"),
+        ]);
+        let (mut apk, apk_path) = open_apk(&bytes, "extract-replaced");
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-extract-replaced-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let (libs, assets) = (root.join("libs"), root.join("assets"));
+        apk.extract_native_libs("x86_64", &libs)
+            .expect("extract libs");
+        apk.extract_assets(&assets).expect("extract assets");
+
+        for (path, bytes) in [
+            (libs.join("libroblox.so"), b"OTHER-ENGINE".as_slice()),
+            (assets.join("a.bin"), b"OTHER".as_slice()),
+        ] {
+            let replacement = path.with_extension("replacement");
+            std::fs::write(&replacement, bytes).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+        }
+        std::fs::write(libs.join(".eclipse-extract.4242.partial"), b"stale").unwrap();
+
+        apk.extract_native_libs("x86_64", &libs)
+            .expect("re-extract libs");
+        assert_eq!(apk.extract_assets(&assets).expect("re-extract assets"), 1);
+        assert_eq!(
+            std::fs::read(libs.join("libroblox.so")).unwrap(),
+            b"ENGINE-BYTES"
+        );
+        assert_eq!(std::fs::read(assets.join("a.bin")).unwrap(), b"ASSET");
+        assert!(
+            !libs.join(".eclipse-extract.4242.partial").exists(),
+            "a temporary file left by a killed extraction is removed"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn assets_that_collide_with_extraction_bookkeeping_are_refused() {
+        let bytes = build_apk(&[("assets/.eclipse-extract.stamp", b"not a stamp")]);
+        let (mut apk, apk_path) = open_apk(&bytes, "extract-collision");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-collision-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let error = apk.extract_assets(&dir).expect_err("bookkeeping name");
+        assert!(
+            error.to_string().contains(".eclipse-extract.stamp"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&apk_path).ok();
+    }
+
+    #[test]
+    fn extraction_errors_name_the_failed_operation_and_path() {
+        let bytes = build_apk(&[("assets/content/a.bin", b"ASSET")]);
+        let (mut apk, apk_path) = open_apk(&bytes, "extract-error-context");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-extract-error-context-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("content"), b"a file where a directory belongs").unwrap();
+
+        let error = apk
+            .extract_assets(&dir)
+            .expect_err("the asset directory is blocked by a file");
+        let expected = format!("stat {}: ", dir.join("content/a.bin").display());
+        assert!(error.to_string().contains(&expected), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&apk_path).ok();
     }
 
     #[test]
