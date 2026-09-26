@@ -281,10 +281,10 @@ impl ApplicationHandler for GameWindow<'_> {
                 }
 
                 let geo = crate::egl_engine::WindowGeometry::from_physical(size.width, size.height);
-                let wsi_ptr = self
-                    .engine_window
-                    .as_ref()
-                    .map(|w| w.as_native_window() as usize);
+                let wsi_ptr = self.engine_window.as_mut().map(|w| {
+                    w.resize(geo);
+                    w.as_native_window() as usize
+                });
                 publish_engine_window_geometry(wsi_ptr, geo.width, geo.height);
                 self.propagate_window_resize(geo.width, geo.height);
 
@@ -2215,17 +2215,15 @@ fn find_device_local_memory_type(
     device_local.or_else(|| (0..props.memory_type_count).find(|&i| (type_filter & (1 << i)) != 0))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn upload_atlas_pixels(
     device: &ash::Device,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     image: vk::Image,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
+    atlas: &GlyphAtlas,
 ) -> Result<(), GraphicsError> {
+    let (width, height, pixels) = (atlas.width, atlas.height, atlas.pixels.as_slice());
     let size = (width as vk::DeviceSize) * (height as vk::DeviceSize);
 
     let buf_info = vk::BufferCreateInfo::default()
@@ -2405,196 +2403,7 @@ fn upload_atlas_pixels(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn upload_rgba_pixels(
-    device: &ash::Device,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    image: vk::Image,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> Result<(), GraphicsError> {
-    let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
-    let buf_info = vk::BufferCreateInfo::default()
-        .size(size.max(1))
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let staging = unsafe { device.create_buffer(&buf_info, None) }
-        .map_err(|e| GraphicsError::Vulkan(format!("vkCreateBuffer (rgba staging): {e}")))?;
-
-    let req = unsafe { device.get_buffer_memory_requirements(staging) };
-    let mem_type = find_host_visible_memory_type(memory_properties, req.memory_type_bits)
-        .ok_or_else(|| {
-            unsafe { device.destroy_buffer(staging, None) };
-            GraphicsError::Vulkan("no host-visible memory for the rgba staging buffer".to_owned())
-        })?;
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(req.size)
-        .memory_type_index(mem_type);
-
-    let staging_mem = match unsafe { device.allocate_memory(&alloc, None) } {
-        Ok(m) => m,
-        Err(e) => {
-            unsafe { device.destroy_buffer(staging, None) };
-            return Err(GraphicsError::Vulkan(format!(
-                "vkAllocateMemory (rgba staging): {e}"
-            )));
-        }
-    };
-    let free_staging = |device: &ash::Device| unsafe {
-        device.free_memory(staging_mem, None);
-        device.destroy_buffer(staging, None);
-    };
-
-    if let Err(e) = unsafe { device.bind_buffer_memory(staging, staging_mem, 0) } {
-        free_staging(device);
-        return Err(GraphicsError::Vulkan(format!(
-            "vkBindBufferMemory (rgba staging): {e}"
-        )));
-    }
-
-    unsafe {
-        match device.map_memory(staging_mem, 0, size.max(1), vk::MemoryMapFlags::empty()) {
-            Ok(ptr) => {
-                std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, pixels.len());
-                device.unmap_memory(staging_mem);
-            }
-            Err(e) => {
-                free_staging(device);
-                return Err(GraphicsError::Vulkan(format!(
-                    "vkMapMemory (rgba staging): {e}"
-                )));
-            }
-        }
-    }
-
-    let cb_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-
-    let cmd = match unsafe { device.allocate_command_buffers(&cb_info) } {
-        Ok(c) => c[0],
-        Err(e) => {
-            free_staging(device);
-            return Err(GraphicsError::Vulkan(format!(
-                "vkAllocateCommandBuffers (rgba upload): {e}"
-            )));
-        }
-    };
-    let free_cmd = |device: &ash::Device| {
-        unsafe { device.free_command_buffers(command_pool, &[cmd]) };
-    };
-
-    let subresource = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1);
-
-    let record = (|| -> ash::prelude::VkResult<()> {
-        unsafe {
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            device.begin_command_buffer(cmd, &begin)?;
-            let to_transfer = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(subresource)
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&to_transfer),
-            );
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
-            device.cmd_copy_buffer_to_image(
-                cmd,
-                staging,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&region),
-            );
-            let to_shader = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(subresource)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&to_shader),
-            );
-            device.end_command_buffer(cmd)
-        }
-    })();
-    if let Err(e) = record {
-        free_cmd(device);
-        free_staging(device);
-        return Err(GraphicsError::Vulkan(format!("record rgba upload: {e}")));
-    }
-
-    let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
-        Ok(f) => f,
-        Err(e) => {
-            free_cmd(device);
-            free_staging(device);
-            return Err(GraphicsError::Vulkan(format!(
-                "create rgba upload fence: {e}"
-            )));
-        }
-    };
-    let cmds = [cmd];
-    let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-
-    let submitted = unsafe { device.queue_submit(queue, &[submit], fence) };
-    let waited =
-        submitted.and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
-
-    unsafe { device.destroy_fence(fence, None) };
-    free_cmd(device);
-    free_staging(device);
-    waited.map_err(|e| GraphicsError::Vulkan(format!("submit/wait rgba upload: {e}")))?;
-    Ok(())
-}
-
-fn composite_quad_vertices(rect: &LaidOutView, extent: vk::Extent2D) -> Vec<TextVertex> {
+fn composite_quad_vertices(rect: &LaidOutView, extent: vk::Extent2D) -> [TextVertex; 6] {
     let ew = extent.width.max(1) as f32;
     let eh = extent.height.max(1) as f32;
     let to_ndc = |px: f32, py: f32| -> [f32; 2] { [2.0 * px / ew - 1.0, 2.0 * py / eh - 1.0] };
@@ -2616,75 +2425,146 @@ fn composite_quad_vertices(rect: &LaidOutView, extent: vk::Extent2D) -> Vec<Text
         uv: [1.0, 1.0],
     };
 
-    vec![tl, tr, br, tl, br, bl]
+    [tl, tr, br, tl, br, bl]
 }
 
-fn upload_composite_vertices(
+fn text_vertex_bytes(verts: &[TextVertex]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(verts.as_ptr().cast::<u8>(), std::mem::size_of_val(verts)) }
+}
+
+fn create_host_buffer(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    verts: &[TextVertex],
-) -> Result<(vk::Buffer, vk::DeviceMemory, u32), GraphicsError> {
-    let count: u32 = verts
-        .len()
-        .try_into()
-        .map_err(|_| GraphicsError::Vulkan("too many composite vertices".to_owned()))?;
-    if count == 0 {
-        return Ok((vk::Buffer::null(), vk::DeviceMemory::null(), 0));
-    }
-    let size = (count as vk::DeviceSize) * std::mem::size_of::<TextVertex>() as vk::DeviceSize;
-    let buffer_info = vk::BufferCreateInfo::default()
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory), GraphicsError> {
+    let info = vk::BufferCreateInfo::default()
         .size(size)
-        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }
-        .map_err(|e| GraphicsError::Vulkan(format!("vkCreateBuffer (composite vtx): {e}")))?;
-
+    let buffer = unsafe { device.create_buffer(&info, None) }.map_err(|e| {
+        GraphicsError::Vulkan(format!("vkCreateBuffer ({usage:?}, {size} bytes): {e}"))
+    })?;
     let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let mem_type = find_host_visible_memory_type(memory_properties, req.memory_type_bits)
-        .ok_or_else(|| {
-            unsafe { device.destroy_buffer(buffer, None) };
-            GraphicsError::Vulkan("no host-visible memory for a composite vertex buffer".to_owned())
-        })?;
-    let alloc_info = vk::MemoryAllocateInfo::default()
+    let Some(memory_type) = find_host_visible_memory_type(memory_properties, req.memory_type_bits)
+    else {
+        unsafe { device.destroy_buffer(buffer, None) };
+        return Err(GraphicsError::Vulkan(format!(
+            "no host-visible memory for a {usage:?} buffer"
+        )));
+    };
+    let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
-        .memory_type_index(mem_type);
-
-    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
-        Ok(m) => m,
+        .memory_type_index(memory_type);
+    let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(memory) => memory,
         Err(e) => {
             unsafe { device.destroy_buffer(buffer, None) };
             return Err(GraphicsError::Vulkan(format!(
-                "vkAllocateMemory (composite vtx): {e}"
+                "vkAllocateMemory ({usage:?}, {} bytes): {e}",
+                req.size
             )));
         }
     };
-
     if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
         unsafe {
             device.free_memory(memory, None);
             device.destroy_buffer(buffer, None);
         }
         return Err(GraphicsError::Vulkan(format!(
-            "vkBindBufferMemory (composite vtx): {e}"
+            "vkBindBufferMemory ({usage:?}): {e}"
         )));
     }
+    Ok((buffer, memory))
+}
 
+fn write_host_memory(
+    device: &ash::Device,
+    memory: vk::DeviceMemory,
+    bytes: &[u8],
+) -> Result<(), GraphicsError> {
     unsafe {
-        let ptr = match device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) {
-            Ok(p) => p,
-            Err(e) => {
-                device.free_memory(memory, None);
-                device.destroy_buffer(buffer, None);
-                return Err(GraphicsError::Vulkan(format!(
-                    "vkMapMemory (composite vtx): {e}"
-                )));
-            }
-        };
-        std::ptr::copy_nonoverlapping(verts.as_ptr() as *const u8, ptr as *mut u8, size as usize);
+        let ptr = device
+            .map_memory(
+                memory,
+                0,
+                bytes.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+            .map_err(|e| {
+                GraphicsError::Vulkan(format!("vkMapMemory ({} bytes): {e}", bytes.len()))
+            })?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
         device.unmap_memory(memory);
     }
-    Ok((buffer, memory, count))
+    Ok(())
+}
+
+pub(crate) struct FrameFence {
+    fence: vk::Fence,
+    pending: bool,
+}
+
+impl FrameFence {
+    pub(crate) fn new(device: &ash::Device) -> ash::prelude::VkResult<Self> {
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+        Ok(Self {
+            fence,
+            pending: false,
+        })
+    }
+
+    pub(crate) fn retire(&mut self, device: &ash::Device) -> ash::prelude::VkResult<()> {
+        if !self.pending {
+            return Ok(());
+        }
+        unsafe {
+            device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            device.reset_fences(&[self.fence])?;
+        }
+        self.pending = false;
+        Ok(())
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        batches: &[vk::SubmitInfo<'_>],
+    ) -> ash::prelude::VkResult<()> {
+        assert!(
+            !self.pending,
+            "a frame fence must be retired before it guards another submission"
+        );
+        unsafe { device.queue_submit(queue, batches, self.fence) }?;
+        self.pending = true;
+        Ok(())
+    }
+
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe { device.destroy_fence(self.fence, None) };
+    }
+}
+
+fn consume_acquire_signal(
+    device: &ash::Device,
+    queue: vk::Queue,
+    in_flight: &mut FrameFence,
+    image_available: &mut vk::Semaphore,
+) -> Result<(), GraphicsError> {
+    let waits = [*image_available];
+    let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+    let release = vk::SubmitInfo::default()
+        .wait_semaphores(&waits)
+        .wait_dst_stage_mask(&stages);
+    let Err(e) = in_flight.submit(device, queue, &[release]) else {
+        return Ok(());
+    };
+    unsafe { device.destroy_semaphore(*image_available, None) };
+    *image_available = vk::Semaphore::null();
+    Err(GraphicsError::Vulkan(format!(
+        "queue_submit (release the acquired image's semaphore): {e}"
+    )))
 }
 
 fn build_composite_pipeline(
@@ -3245,6 +3125,35 @@ struct Swapchain {
     extent: vk::Extent2D,
 }
 
+struct DeviceObjects {
+    queue: vk::Queue,
+    swapchain_loader: khr::swapchain::Device,
+    render_pass: vk::RenderPass,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    image_available: vk::Semaphore,
+    render_finished: vk::Semaphore,
+    in_flight: FrameFence,
+    swapchain: Swapchain,
+    swapchain_format: vk::Format,
+    swapchain_extent: vk::Extent2D,
+    quad_pipeline_layout: vk::PipelineLayout,
+    quad_pipeline: vk::Pipeline,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    text: Option<TextRenderer>,
+    composite: Option<CanvasCompositor>,
+}
+
+struct SwapchainTarget<'a> {
+    surface_loader: &'a khr::surface::Instance,
+    swapchain_loader: &'a khr::swapchain::Device,
+    device: &'a ash::Device,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    surface_format: vk::SurfaceFormatKHR,
+    render_pass: vk::RenderPass,
+}
+
 struct VulkanRenderer {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -3260,7 +3169,7 @@ struct VulkanRenderer {
     command_buffer: vk::CommandBuffer,
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
-    in_flight: vk::Fence,
+    in_flight: FrameFence,
 
     quad_pipeline_layout: vk::PipelineLayout,
     quad_pipeline: vk::Pipeline,
@@ -3286,10 +3195,6 @@ struct VulkanRenderer {
 
 impl VulkanRenderer {
     fn new(window: &Window) -> Result<Self, GraphicsError> {
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| {
-            GraphicsError::Vulkan(format!("no Vulkan loader (libvulkan) available: {e}"))
-        })?;
-
         let display_handle = window
             .display_handle()
             .map_err(|e| GraphicsError::Vulkan(format!("no raw display handle: {e}")))?
@@ -3298,6 +3203,17 @@ impl VulkanRenderer {
             .window_handle()
             .map_err(|e| GraphicsError::Vulkan(format!("no raw window handle: {e}")))?
             .as_raw();
+        Self::create(display_handle, window_handle, window.inner_size())
+    }
+
+    fn create(
+        display_handle: RawDisplayHandle,
+        window_handle: RawWindowHandle,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Result<Self, GraphicsError> {
+        let entry = unsafe { ash::Entry::load() }.map_err(|e| {
+            GraphicsError::Vulkan(format!("no Vulkan loader (libvulkan) available: {e}"))
+        })?;
 
         let surface_extensions = ash_window::enumerate_required_extensions(display_handle)
             .map_err(|e| {
@@ -3316,7 +3232,7 @@ impl VulkanRenderer {
         let instance = unsafe { entry.create_instance(&instance_info, None) }
             .map_err(|e| GraphicsError::Vulkan(format!("vkCreateInstance failed: {e}")))?;
 
-        match Self::build(entry, instance, display_handle, window_handle, window) {
+        match Self::build(&entry, instance, display_handle, window_handle, size) {
             Ok(renderer) => Ok(renderer),
             Err(boxed) => {
                 let (e, instance) = *boxed;
@@ -3330,16 +3246,16 @@ impl VulkanRenderer {
     }
 
     fn build(
-        entry: ash::Entry,
+        entry: &ash::Entry,
         instance: ash::Instance,
-        display_handle: raw_window_handle::RawDisplayHandle,
-        window_handle: raw_window_handle::RawWindowHandle,
-        window: &Window,
+        display_handle: RawDisplayHandle,
+        window_handle: RawWindowHandle,
+        size: winit::dpi::PhysicalSize<u32>,
     ) -> Result<Self, Box<(GraphicsError, ash::Instance)>> {
-        let surface_loader = khr::surface::Instance::new(&entry, &instance);
+        let surface_loader = khr::surface::Instance::new(entry, &instance);
 
         let surface = match unsafe {
-            ash_window::create_surface(&entry, &instance, display_handle, window_handle, None)
+            ash_window::create_surface(entry, &instance, display_handle, window_handle, None)
         } {
             Ok(s) => s,
             Err(e) => {
@@ -3380,58 +3296,40 @@ impl VulkanRenderer {
         };
 
         match Self::build_device_objects(
-            &entry,
             &instance,
             &surface_loader,
             surface,
             physical_device,
             queue_family_index,
             &device,
-            window,
+            size,
         ) {
-            Ok((
-                queue,
-                swapchain_loader,
-                render_pass,
-                command_pool,
-                command_buffer,
-                image_available,
-                render_finished,
-                in_flight,
-                swapchain,
-                swapchain_format,
-                swapchain_extent,
-                quad_pipeline_layout,
-                quad_pipeline,
-                memory_properties,
-                text,
-                composite,
-            )) => Ok(Self {
-                _entry: entry,
+            Ok(objects) => Ok(Self {
+                _entry: entry.clone(),
                 instance,
                 surface_loader,
                 surface,
                 physical_device,
                 device,
-                queue,
-                swapchain_loader,
-                render_pass,
-                command_pool,
-                command_buffer,
-                image_available,
-                render_finished,
-                in_flight,
-                swapchain,
-                swapchain_format,
-                swapchain_extent,
-                quad_pipeline_layout,
-                quad_pipeline,
+                queue: objects.queue,
+                swapchain_loader: objects.swapchain_loader,
+                render_pass: objects.render_pass,
+                command_pool: objects.command_pool,
+                command_buffer: objects.command_buffer,
+                image_available: objects.image_available,
+                render_finished: objects.render_finished,
+                in_flight: objects.in_flight,
+                swapchain: objects.swapchain,
+                swapchain_format: objects.swapchain_format,
+                swapchain_extent: objects.swapchain_extent,
+                quad_pipeline_layout: objects.quad_pipeline_layout,
+                quad_pipeline: objects.quad_pipeline,
                 quad_vertex_buffer: vk::Buffer::null(),
                 quad_vertex_memory: vk::DeviceMemory::null(),
                 quad_vertex_capacity: 0,
-                memory_properties,
-                text,
-                composite,
+                memory_properties: objects.memory_properties,
+                text: objects.text,
+                composite: objects.composite,
                 drawn_canvases: Vec::new(),
                 needs_recreate: false,
             }),
@@ -3636,37 +3534,15 @@ impl VulkanRenderer {
         Ok((pipeline_layout, pipeline))
     }
 
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn build_device_objects(
-        _entry: &ash::Entry,
         instance: &ash::Instance,
         surface_loader: &khr::surface::Instance,
         surface: vk::SurfaceKHR,
         physical_device: vk::PhysicalDevice,
         queue_family_index: u32,
         device: &ash::Device,
-        window: &Window,
-    ) -> Result<
-        (
-            vk::Queue,
-            khr::swapchain::Device,
-            vk::RenderPass,
-            vk::CommandPool,
-            vk::CommandBuffer,
-            vk::Semaphore,
-            vk::Semaphore,
-            vk::Fence,
-            Swapchain,
-            vk::Format,
-            vk::Extent2D,
-            vk::PipelineLayout,
-            vk::Pipeline,
-            vk::PhysicalDeviceMemoryProperties,
-            Option<TextRenderer>,
-            Option<CanvasCompositor>,
-        ),
-        GraphicsError,
-    > {
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Result<DeviceObjects, GraphicsError> {
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
         let memory_properties =
@@ -3710,19 +3586,16 @@ impl VulkanRenderer {
         let render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }
             .map_err(|e| GraphicsError::Vulkan(format!("vkCreateRenderPass: {e}")))?;
 
-        let size = window.inner_size();
-        let swapchain = match Self::create_swapchain(
+        let target = SwapchainTarget {
             surface_loader,
-            &swapchain_loader,
+            swapchain_loader: &swapchain_loader,
             device,
             physical_device,
             surface,
             surface_format,
             render_pass,
-            size.width,
-            size.height,
-            vk::SwapchainKHR::null(),
-        ) {
+        };
+        let swapchain = match target.create_swapchain(size, vk::SwapchainKHR::null()) {
             Ok(s) => s,
             Err(e) => {
                 unsafe { device.destroy_render_pass(render_pass, None) };
@@ -3766,12 +3639,11 @@ impl VulkanRenderer {
         let command_buffer = command_buffers[0];
 
         let sem_info = vk::SemaphoreCreateInfo::default();
-        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
 
         let sync = unsafe {
             let image_available = device.create_semaphore(&sem_info, None);
             let render_finished = device.create_semaphore(&sem_info, None);
-            let in_flight = device.create_fence(&fence_info, None);
+            let in_flight = FrameFence::new(device);
             match (image_available, render_finished, in_flight) {
                 (Ok(ia), Ok(rf), Ok(f)) => Ok((ia, rf, f)),
                 (ia, rf, f) => {
@@ -3781,8 +3653,8 @@ impl VulkanRenderer {
                     if let Ok(h) = rf {
                         device.destroy_semaphore(h, None);
                     }
-                    if let Ok(h) = f {
-                        device.destroy_fence(h, None);
+                    if let Ok(h) = &f {
+                        h.destroy(device);
                     }
                     Err(ia
                         .err()
@@ -3811,7 +3683,7 @@ impl VulkanRenderer {
                     unsafe {
                         device.destroy_semaphore(image_available, None);
                         device.destroy_semaphore(render_finished, None);
-                        device.destroy_fence(in_flight, None);
+                        in_flight.destroy(device);
                         device.destroy_command_pool(command_pool, None);
                         swapchain.destroy(device, &swapchain_loader);
                         device.destroy_render_pass(render_pass, None);
@@ -3829,7 +3701,7 @@ impl VulkanRenderer {
                         device.destroy_pipeline_layout(quad_pipeline_layout, None);
                         device.destroy_semaphore(image_available, None);
                         device.destroy_semaphore(render_finished, None);
-                        device.destroy_fence(in_flight, None);
+                        in_flight.destroy(device);
                         device.destroy_command_pool(command_pool, None);
                         swapchain.destroy(device, &swapchain_loader);
                         device.destroy_render_pass(render_pass, None);
@@ -3846,7 +3718,7 @@ impl VulkanRenderer {
             }
         };
 
-        Ok((
+        Ok(DeviceObjects {
             queue,
             swapchain_loader,
             render_pass,
@@ -3856,127 +3728,13 @@ impl VulkanRenderer {
             render_finished,
             in_flight,
             swapchain,
-            surface_format.format,
-            extent,
+            swapchain_format: surface_format.format,
+            swapchain_extent: extent,
             quad_pipeline_layout,
             quad_pipeline,
             memory_properties,
             text,
             composite,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn create_swapchain(
-        surface_loader: &khr::surface::Instance,
-        swapchain_loader: &khr::swapchain::Device,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        surface: vk::SurfaceKHR,
-        surface_format: vk::SurfaceFormatKHR,
-        render_pass: vk::RenderPass,
-        window_width: u32,
-        window_height: u32,
-        old: vk::SwapchainKHR,
-    ) -> Result<Swapchain, GraphicsError> {
-        let caps = unsafe {
-            surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
-        }
-        .map_err(|e| GraphicsError::Vulkan(format!("get surface capabilities: {e}")))?;
-        let extent = choose_swap_extent(&caps, window_width, window_height);
-        let image_count = choose_image_count(&caps);
-
-        let create_info = vk::SwapchainCreateInfoKHR::default()
-            .surface(surface)
-            .min_image_count(image_count)
-            .image_format(surface_format.format)
-            .image_color_space(surface_format.color_space)
-            .image_extent(extent)
-            .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(caps.current_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
-            .clipped(true)
-            .old_swapchain(old);
-
-        let swapchain = unsafe { swapchain_loader.create_swapchain(&create_info, None) }
-            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateSwapchainKHR: {e}")))?;
-
-        let images = match unsafe { swapchain_loader.get_swapchain_images(swapchain) } {
-            Ok(i) => i,
-            Err(e) => {
-                unsafe { swapchain_loader.destroy_swapchain(swapchain, None) };
-                return Err(GraphicsError::Vulkan(format!("get swapchain images: {e}")));
-            }
-        };
-
-        let mut image_views = Vec::with_capacity(images.len());
-        let mut framebuffers = Vec::with_capacity(images.len());
-        for &image in &images {
-            let view_info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(surface_format.format)
-                .components(vk::ComponentMapping::default())
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(0)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                );
-
-            let view = match unsafe { device.create_image_view(&view_info, None) } {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe {
-                        for &fb in &framebuffers {
-                            device.destroy_framebuffer(fb, None);
-                        }
-                        for &v in &image_views {
-                            device.destroy_image_view(v, None);
-                        }
-                        swapchain_loader.destroy_swapchain(swapchain, None);
-                    }
-                    return Err(GraphicsError::Vulkan(format!("vkCreateImageView: {e}")));
-                }
-            };
-            image_views.push(view);
-
-            let attachments = [view];
-            let fb_info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&attachments)
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
-
-            let fb = match unsafe { device.create_framebuffer(&fb_info, None) } {
-                Ok(f) => f,
-                Err(e) => {
-                    unsafe {
-                        for &fb in &framebuffers {
-                            device.destroy_framebuffer(fb, None);
-                        }
-                        for &v in &image_views {
-                            device.destroy_image_view(v, None);
-                        }
-                        swapchain_loader.destroy_swapchain(swapchain, None);
-                    }
-                    return Err(GraphicsError::Vulkan(format!("vkCreateFramebuffer: {e}")));
-                }
-            };
-            framebuffers.push(fb);
-        }
-
-        Ok(Swapchain {
-            swapchain,
-            image_views,
-            framebuffers,
-            extent,
         })
     }
 
@@ -4076,18 +3834,16 @@ impl VulkanRenderer {
             format: self.swapchain_format,
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         };
-        let new_swapchain = Self::create_swapchain(
-            &self.surface_loader,
-            &self.swapchain_loader,
-            &self.device,
-            self.physical_device,
-            self.surface,
+        let target = SwapchainTarget {
+            surface_loader: &self.surface_loader,
+            swapchain_loader: &self.swapchain_loader,
+            device: &self.device,
+            physical_device: self.physical_device,
+            surface: self.surface,
             surface_format,
-            self.render_pass,
-            size.width,
-            size.height,
-            self.swapchain.swapchain,
-        )?;
+            render_pass: self.render_pass,
+        };
+        let new_swapchain = target.create_swapchain(size, self.swapchain.swapchain)?;
 
         unsafe {
             let old = std::mem::replace(&mut self.swapchain, new_swapchain);
@@ -4106,34 +3862,9 @@ impl VulkanRenderer {
             }
         }
 
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.in_flight], true, u64::MAX)
-                .map_err(|e| GraphicsError::Vulkan(format!("wait_for_fences: {e}")))?;
-        }
-
-        let acquire = unsafe {
-            self.swapchain_loader.acquire_next_image(
-                self.swapchain.swapchain,
-                u64::MAX,
-                self.image_available,
-                vk::Fence::null(),
-            )
-        };
-        let (image_index, suboptimal) = match acquire {
-            Ok(v) => v,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.needs_recreate = true;
-                return Ok(());
-            }
-            Err(e) => return Err(GraphicsError::Vulkan(format!("acquire_next_image: {e}"))),
-        };
-
-        unsafe {
-            self.device
-                .reset_fences(&[self.in_flight])
-                .map_err(|e| GraphicsError::Vulkan(format!("reset_fences: {e}")))?;
-        }
+        self.in_flight
+            .retire(&self.device)
+            .map_err(|e| GraphicsError::Vulkan(format!("wait for the previous frame: {e}")))?;
 
         let nodes = crate::framework::view_registry::snapshot_tree();
         let extent = self.swapchain.extent;
@@ -4167,37 +3898,18 @@ impl VulkanRenderer {
             0
         };
 
-        let queue = self.queue;
-        let command_pool = self.command_pool;
-        let composite_count = if let Some(composite) = self.composite.as_mut() {
-            unsafe { composite.begin_frame(&self.device)? };
-            for d in &self.drawn_canvases {
-                let Some(rect) = views.iter().find(|v| v.handle == d.view) else {
-                    continue;
-                };
-
-                let snapshot = crate::framework::canvas_registry::with_canvas(d.canvas, |c| {
-                    let (w, h) = c.dimensions();
-                    (w, h, c.rgba())
-                });
-                let Ok((tw, th, rgba)) = snapshot else {
-                    continue;
-                };
-                composite.upload(
+        let composite_count = match self.composite.as_mut() {
+            Some(composite) => {
+                composite.prepare(
                     &self.device,
-                    queue,
-                    command_pool,
                     &mem_props,
-                    &rgba,
-                    tw,
-                    th,
-                    rect,
+                    &self.drawn_canvases,
+                    &views,
                     extent,
                 )?;
+                composite.texture_count()
             }
-            composite.texture_count()
-        } else {
-            0
+            None => 0,
         };
 
         for d in self.drawn_canvases.drain(..) {
@@ -4214,7 +3926,36 @@ impl VulkanRenderer {
             );
         }
 
-        self.record_draw(image_index as usize, vertex_count, text_vertex_count)?;
+        if self.image_available == vk::Semaphore::null() {
+            self.image_available = unsafe {
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            }
+            .map_err(|e| {
+                GraphicsError::Vulkan(format!("vkCreateSemaphore (image available): {e}"))
+            })?;
+        }
+        let acquire = unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain.swapchain,
+                u64::MAX,
+                self.image_available,
+                vk::Fence::null(),
+            )
+        };
+        let (image_index, suboptimal) = match acquire {
+            Ok(v) => v,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.needs_recreate = true;
+                return Ok(());
+            }
+            Err(e) => return Err(GraphicsError::Vulkan(format!("acquire_next_image: {e}"))),
+        };
+
+        if let Err(e) = self.record_draw(image_index as usize, vertex_count, text_vertex_count) {
+            self.abandon_acquired_image()?;
+            return Err(e);
+        }
 
         let wait_semaphores = [self.image_available];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -4226,10 +3967,12 @@ impl VulkanRenderer {
             .command_buffers(&command_buffers)
             .signal_semaphores(&signal_semaphores);
 
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &[submit], self.in_flight)
-                .map_err(|e| GraphicsError::Vulkan(format!("queue_submit: {e}")))?;
+        if let Err(e) = self.in_flight.submit(&self.device, self.queue, &[submit]) {
+            self.abandon_acquired_image()?;
+            return Err(GraphicsError::Vulkan(format!("queue_submit: {e}")));
+        }
+        if let Some(composite) = self.composite.as_mut() {
+            composite.uploads_submitted();
         }
 
         window.pre_present_notify();
@@ -4257,6 +4000,16 @@ impl VulkanRenderer {
             self.needs_recreate = true;
         }
         Ok(())
+    }
+
+    fn abandon_acquired_image(&mut self) -> Result<(), GraphicsError> {
+        self.needs_recreate = true;
+        consume_acquire_signal(
+            &self.device,
+            self.queue,
+            &mut self.in_flight,
+            &mut self.image_available,
+        )
     }
 
     fn upload_vertices(&mut self, verts: &[QuadVertex]) -> Result<u32, GraphicsError> {
@@ -4363,6 +4116,9 @@ impl VulkanRenderer {
             self.device
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| GraphicsError::Vulkan(format!("begin_command_buffer: {e}")))?;
+            if let Some(composite) = self.composite.as_ref() {
+                composite.record_uploads(&self.device, cmd);
+            }
         }
 
         let clear = [vk::ClearValue {
@@ -4458,6 +4214,123 @@ impl VulkanRenderer {
     }
 }
 
+impl SwapchainTarget<'_> {
+    fn create_swapchain(
+        &self,
+        size: winit::dpi::PhysicalSize<u32>,
+        old: vk::SwapchainKHR,
+    ) -> Result<Swapchain, GraphicsError> {
+        let Self {
+            surface_loader,
+            swapchain_loader,
+            device,
+            physical_device,
+            surface,
+            surface_format,
+            render_pass,
+        } = *self;
+        let caps = unsafe {
+            surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
+        }
+        .map_err(|e| GraphicsError::Vulkan(format!("get surface capabilities: {e}")))?;
+        let extent = choose_swap_extent(&caps, size.width, size.height);
+        let image_count = choose_image_count(&caps);
+
+        let create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_format(surface_format.format)
+            .image_color_space(surface_format.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(caps.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(vk::PresentModeKHR::FIFO)
+            .clipped(true)
+            .old_swapchain(old);
+
+        let swapchain = unsafe { swapchain_loader.create_swapchain(&create_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateSwapchainKHR: {e}")))?;
+
+        let images = match unsafe { swapchain_loader.get_swapchain_images(swapchain) } {
+            Ok(i) => i,
+            Err(e) => {
+                unsafe { swapchain_loader.destroy_swapchain(swapchain, None) };
+                return Err(GraphicsError::Vulkan(format!("get swapchain images: {e}")));
+            }
+        };
+
+        let mut image_views = Vec::with_capacity(images.len());
+        let mut framebuffers = Vec::with_capacity(images.len());
+        for &image in &images {
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(surface_format.format)
+                .components(vk::ComponentMapping::default())
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                );
+
+            let view = match unsafe { device.create_image_view(&view_info, None) } {
+                Ok(v) => v,
+                Err(e) => {
+                    unsafe {
+                        for &fb in &framebuffers {
+                            device.destroy_framebuffer(fb, None);
+                        }
+                        for &v in &image_views {
+                            device.destroy_image_view(v, None);
+                        }
+                        swapchain_loader.destroy_swapchain(swapchain, None);
+                    }
+                    return Err(GraphicsError::Vulkan(format!("vkCreateImageView: {e}")));
+                }
+            };
+            image_views.push(view);
+
+            let attachments = [view];
+            let fb_info = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass)
+                .attachments(&attachments)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+
+            let fb = match unsafe { device.create_framebuffer(&fb_info, None) } {
+                Ok(f) => f,
+                Err(e) => {
+                    unsafe {
+                        for &fb in &framebuffers {
+                            device.destroy_framebuffer(fb, None);
+                        }
+                        for &v in &image_views {
+                            device.destroy_image_view(v, None);
+                        }
+                        swapchain_loader.destroy_swapchain(swapchain, None);
+                    }
+                    return Err(GraphicsError::Vulkan(format!("vkCreateFramebuffer: {e}")));
+                }
+            };
+            framebuffers.push(fb);
+        }
+
+        Ok(Swapchain {
+            swapchain,
+            image_views,
+            framebuffers,
+            extent,
+        })
+    }
+}
+
 impl Swapchain {
     unsafe fn destroy(&self, device: &ash::Device, loader: &khr::swapchain::Device) {
         unsafe {
@@ -4540,7 +4413,6 @@ impl TextRenderer {
         .map(Some)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_gpu(
         device: &ash::Device,
         queue: vk::Queue,
@@ -4603,9 +4475,7 @@ impl TextRenderer {
             command_pool,
             memory_properties,
             atlas_image,
-            atlas.width,
-            atlas.height,
-            &atlas.pixels,
+            &atlas,
         ) {
             unsafe {
                 device.free_memory(atlas_memory, None);
@@ -4889,14 +4759,217 @@ impl TextRenderer {
 }
 
 struct CompositeTexture {
+    width: u32,
+    height: u32,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
-
-    descriptor_set: vk::DescriptorSet,
+    staging: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
-    vertex_count: u32,
+
+    pixels: Vec<u8>,
+    quad: Option<[TextVertex; 6]>,
+    upload_pending: bool,
+}
+
+impl CompositeTexture {
+    fn create(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, GraphicsError> {
+        let mut texture = Self {
+            width,
+            height,
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            staging: vk::Buffer::null(),
+            staging_memory: vk::DeviceMemory::null(),
+            vertex_buffer: vk::Buffer::null(),
+            vertex_memory: vk::DeviceMemory::null(),
+            pixels: Vec::new(),
+            quad: None,
+            upload_pending: false,
+        };
+        match texture.allocate(device, memory_properties) {
+            Ok(()) => Ok(texture),
+            Err(e) => {
+                unsafe { texture.destroy(device) };
+                Err(e)
+            }
+        }
+    }
+
+    fn allocate(
+        &mut self,
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    ) -> Result<(), GraphicsError> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width: self.width,
+                height: self.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        self.image = unsafe { device.create_image(&image_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateImage (composite): {e}")))?;
+
+        let req = unsafe { device.get_image_memory_requirements(self.image) };
+        let memory_type = find_device_local_memory_type(memory_properties, req.memory_type_bits)
+            .ok_or_else(|| {
+                GraphicsError::Vulkan("no memory type for a composite texture".to_owned())
+            })?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(memory_type);
+        self.memory = unsafe { device.allocate_memory(&alloc, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkAllocateMemory (composite): {e}")))?;
+        unsafe { device.bind_image_memory(self.image, self.memory, 0) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkBindImageMemory (composite): {e}")))?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(self.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        self.view = unsafe { device.create_image_view(&view_info, None) }
+            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateImageView (composite): {e}")))?;
+
+        let texel_bytes = u64::from(self.width) * u64::from(self.height) * 4;
+        (self.staging, self.staging_memory) = create_host_buffer(
+            device,
+            memory_properties,
+            texel_bytes,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )?;
+        (self.vertex_buffer, self.vertex_memory) = create_host_buffer(
+            device,
+            memory_properties,
+            std::mem::size_of::<[TextVertex; 6]>() as vk::DeviceSize,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
+        Ok(())
+    }
+
+    fn stage(
+        &mut self,
+        device: &ash::Device,
+        rgba: Vec<u8>,
+        quad: [TextVertex; 6],
+    ) -> Result<(), GraphicsError> {
+        if self.pixels != rgba {
+            write_host_memory(device, self.staging_memory, &rgba)?;
+            self.pixels = rgba;
+            self.upload_pending = true;
+        }
+        if self.quad != Some(quad) {
+            write_host_memory(device, self.vertex_memory, text_vertex_bytes(&quad))?;
+            self.quad = Some(quad);
+        }
+        Ok(())
+    }
+
+    unsafe fn record_upload(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        if !self.upload_pending {
+            return;
+        }
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.image)
+            .subresource_range(subresource)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: self.width,
+                height: self.height,
+                depth: 1,
+            });
+        let to_shader = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.image)
+            .subresource_range(subresource)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                self.staging,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_shader),
+            );
+        }
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_buffer(self.vertex_buffer, None);
+            device.free_memory(self.vertex_memory, None);
+            device.destroy_buffer(self.staging, None);
+            device.free_memory(self.staging_memory, None);
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
 }
 
 struct CanvasCompositor {
@@ -4904,6 +4977,7 @@ struct CanvasCompositor {
     descriptor_set_layout: vk::DescriptorSetLayout,
 
     descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 
@@ -4961,6 +5035,24 @@ impl CanvasCompositor {
             }
         };
 
+        let set_layouts = [descriptor_set_layout; MAX_COMPOSITE_VIEWS];
+        let set_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&set_layouts);
+        let descriptor_sets = match unsafe { device.allocate_descriptor_sets(&set_alloc) } {
+            Ok(sets) => sets,
+            Err(e) => {
+                unsafe {
+                    device.destroy_descriptor_pool(descriptor_pool, None);
+                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    device.destroy_sampler(sampler, None);
+                }
+                return Err(GraphicsError::Vulkan(format!(
+                    "vkAllocateDescriptorSets (composite): {e}"
+                )));
+            }
+        };
+
         let (pipeline_layout, pipeline) =
             match build_composite_pipeline(device, render_pass, descriptor_set_layout) {
                 Ok(p) => p,
@@ -4978,203 +5070,106 @@ impl CanvasCompositor {
             sampler,
             descriptor_set_layout,
             descriptor_pool,
+            descriptor_sets,
             pipeline_layout,
             pipeline,
             textures: Vec::new(),
         })
     }
 
-    unsafe fn begin_frame(&mut self, device: &ash::Device) -> Result<(), GraphicsError> {
-        unsafe {
-            for t in self.textures.drain(..) {
-                device.destroy_image_view(t.view, None);
-                device.destroy_image(t.image, None);
-                device.free_memory(t.memory, None);
-                if t.vertex_buffer != vk::Buffer::null() {
-                    device.destroy_buffer(t.vertex_buffer, None);
-                }
-                if t.vertex_memory != vk::DeviceMemory::null() {
-                    device.free_memory(t.vertex_memory, None);
-                }
+    fn prepare(
+        &mut self,
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        canvases: &[crate::framework::DrawnCanvas],
+        views: &[LaidOutView],
+        extent: vk::Extent2D,
+    ) -> Result<(), GraphicsError> {
+        let mut slot = 0;
+        for d in canvases {
+            if slot == MAX_COMPOSITE_VIEWS {
+                break;
             }
-            device
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
-                .map_err(|e| {
-                    GraphicsError::Vulkan(format!("reset_descriptor_pool (composite): {e}"))
-                })?;
+            let Some(rect) = views.iter().find(|v| v.handle == d.view) else {
+                continue;
+            };
+            let snapshot = crate::framework::canvas_registry::with_canvas(d.canvas, |c| {
+                let (w, h) = c.dimensions();
+                (w, h, c.rgba())
+            });
+            let Ok((width, height, mut rgba)) = snapshot else {
+                continue;
+            };
+            let expected = (width as usize) * (height as usize) * 4;
+            if width == 0 || height == 0 || rgba.len() < expected {
+                continue;
+            }
+            rgba.truncate(expected);
+            self.stage_slot(
+                device,
+                memory_properties,
+                slot,
+                (width, height),
+                rgba,
+                composite_quad_vertices(rect, extent),
+            )?;
+            slot += 1;
+        }
+        for texture in self.textures.drain(slot..) {
+            unsafe { texture.destroy(device) };
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn upload(
+    fn stage_slot(
         &mut self,
         device: &ash::Device,
-        queue: vk::Queue,
-        command_pool: vk::CommandPool,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        rgba: &[u8],
-        tex_w: u32,
-        tex_h: u32,
-        rect: &LaidOutView,
-        extent: vk::Extent2D,
+        slot: usize,
+        (width, height): (u32, u32),
+        rgba: Vec<u8>,
+        quad: [TextVertex; 6],
     ) -> Result<(), GraphicsError> {
-        if self.textures.len() >= MAX_COMPOSITE_VIEWS {
-            return Ok(());
+        if self
+            .textures
+            .get(slot)
+            .is_none_or(|t| t.width != width || t.height != height)
+        {
+            let texture = CompositeTexture::create(device, memory_properties, width, height)?;
+            self.bind_slot(device, slot, texture.view);
+            if slot < self.textures.len() {
+                let stale = std::mem::replace(&mut self.textures[slot], texture);
+                unsafe { stale.destroy(device) };
+            } else {
+                self.textures.push(texture);
+            }
         }
+        self.textures[slot].stage(device, rgba, quad)
+    }
 
-        let expected = (tex_w as usize) * (tex_h as usize) * 4;
-        if tex_w == 0 || tex_h == 0 || rgba.len() < expected {
-            return Ok(());
-        }
-
-        let img_extent = vk::Extent3D {
-            width: tex_w,
-            height: tex_h,
-            depth: 1,
-        };
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .extent(img_extent)
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        let image = unsafe { device.create_image(&image_info, None) }
-            .map_err(|e| GraphicsError::Vulkan(format!("vkCreateImage (composite): {e}")))?;
-
-        let req = unsafe { device.get_image_memory_requirements(image) };
-        let mem_type = find_device_local_memory_type(memory_properties, req.memory_type_bits)
-            .ok_or_else(|| {
-                unsafe { device.destroy_image(image, None) };
-                GraphicsError::Vulkan("no memory type for a composite texture".to_owned())
-            })?;
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(mem_type);
-
-        let memory = match unsafe { device.allocate_memory(&alloc, None) } {
-            Ok(m) => m,
-            Err(e) => {
-                unsafe { device.destroy_image(image, None) };
-                return Err(GraphicsError::Vulkan(format!(
-                    "vkAllocateMemory (composite): {e}"
-                )));
-            }
-        };
-
-        if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
-            unsafe {
-                device.free_memory(memory, None);
-                device.destroy_image(image, None);
-            }
-            return Err(GraphicsError::Vulkan(format!(
-                "vkBindImageMemory (composite): {e}"
-            )));
-        }
-
-        if let Err(e) = upload_rgba_pixels(
-            device,
-            queue,
-            command_pool,
-            memory_properties,
-            image,
-            tex_w,
-            tex_h,
-            &rgba[..expected],
-        ) {
-            unsafe {
-                device.free_memory(memory, None);
-                device.destroy_image(image, None);
-            }
-            return Err(e);
-        }
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            );
-
-        let view = match unsafe { device.create_image_view(&view_info, None) } {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe {
-                    device.free_memory(memory, None);
-                    device.destroy_image(image, None);
-                }
-                return Err(GraphicsError::Vulkan(format!(
-                    "vkCreateImageView (composite): {e}"
-                )));
-            }
-        };
-
-        let set_layouts = [self.descriptor_set_layout];
-        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-
-        let descriptor_set = match unsafe { device.allocate_descriptor_sets(&ds_alloc) } {
-            Ok(sets) => sets[0],
-            Err(e) => {
-                unsafe {
-                    device.destroy_image_view(view, None);
-                    device.free_memory(memory, None);
-                    device.destroy_image(image, None);
-                }
-                return Err(GraphicsError::Vulkan(format!(
-                    "vkAllocateDescriptorSets (composite): {e}"
-                )));
-            }
-        };
+    fn bind_slot(&self, device: &ash::Device, slot: usize, view: vk::ImageView) {
         let desc_image = vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
             .image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         let write = vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
+            .dst_set(self.descriptor_sets[slot])
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(std::slice::from_ref(&desc_image));
-
         unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+    }
 
-        let verts = composite_quad_vertices(rect, extent);
-        let (vertex_buffer, vertex_memory, vertex_count) =
-            match upload_composite_vertices(device, memory_properties, &verts) {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe {
-                        device.destroy_image_view(view, None);
-                        device.free_memory(memory, None);
-                        device.destroy_image(image, None);
-                    }
-                    return Err(e);
-                }
-            };
+    unsafe fn record_uploads(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
+        for texture in &self.textures {
+            unsafe { texture.record_upload(device, cmd) };
+        }
+    }
 
-        self.textures.push(CompositeTexture {
-            image,
-            memory,
-            view,
-            descriptor_set,
-            vertex_buffer,
-            vertex_memory,
-            vertex_count,
-        });
-        Ok(())
+    fn uploads_submitted(&mut self) {
+        for texture in &mut self.textures {
+            texture.upload_pending = false;
+        }
     }
 
     unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
@@ -5190,16 +5185,13 @@ impl CanvasCompositor {
             for (i, c) in opacity.iter().enumerate() {
                 bytes[i * 4..i * 4 + 4].copy_from_slice(&c.to_ne_bytes());
             }
-            for t in &self.textures {
-                if t.vertex_count == 0 {
-                    continue;
-                }
+            for (texture, &descriptor_set) in self.textures.iter().zip(&self.descriptor_sets) {
                 device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
                     0,
-                    &[t.descriptor_set],
+                    &[descriptor_set],
                     &[],
                 );
                 device.cmd_push_constants(
@@ -5209,8 +5201,8 @@ impl CanvasCompositor {
                     0,
                     &bytes,
                 );
-                device.cmd_bind_vertex_buffers(cmd, 0, &[t.vertex_buffer], &[0]);
-                device.cmd_draw(cmd, t.vertex_count, 1, 0, 0);
+                device.cmd_bind_vertex_buffers(cmd, 0, &[texture.vertex_buffer], &[0]);
+                device.cmd_draw(cmd, 6, 1, 0, 0);
             }
         }
     }
@@ -5221,16 +5213,8 @@ impl CanvasCompositor {
 
     unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
-            for t in &self.textures {
-                device.destroy_image_view(t.view, None);
-                device.destroy_image(t.image, None);
-                device.free_memory(t.memory, None);
-                if t.vertex_buffer != vk::Buffer::null() {
-                    device.destroy_buffer(t.vertex_buffer, None);
-                }
-                if t.vertex_memory != vk::DeviceMemory::null() {
-                    device.free_memory(t.vertex_memory, None);
-                }
+            for texture in &self.textures {
+                texture.destroy(device);
             }
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -5247,7 +5231,7 @@ impl Drop for VulkanRenderer {
             let _ = self.device.device_wait_idle();
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_semaphore(self.render_finished, None);
-            self.device.destroy_fence(self.in_flight, None);
+            self.in_flight.destroy(&self.device);
             self.device.destroy_command_pool(self.command_pool, None);
 
             if let Some(text) = self.text.as_ref() {
@@ -5408,6 +5392,394 @@ impl std::error::Error for GraphicsError {
 mod tests {
     use super::*;
     use crate::framework::view_registry::WRAP_CONTENT;
+
+    fn headless_gpu() -> Option<headless_vulkan::HeadlessGpu> {
+        match headless_vulkan::HeadlessGpu::new() {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                eprintln!("SKIP: no headless Vulkan device ({e})");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn frame_fence_does_not_wait_on_a_frame_that_never_submitted() {
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        let mut fence = FrameFence::new(&gpu.device).expect("create frame fence");
+        fence
+            .submit(&gpu.device, gpu.queue, &[vk::SubmitInfo::default()])
+            .expect("submit an empty frame");
+        fence
+            .retire(&gpu.device)
+            .expect("retire the submitted frame");
+
+        let device = gpu.device.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let retired = fence.retire(&device);
+            let _ = done.send((retired, fence));
+        });
+        let Ok((retired, mut fence)) = finished.recv_timeout(std::time::Duration::from_secs(10))
+        else {
+            std::mem::forget(gpu);
+            panic!("a frame that failed before submitting must not block the next frame");
+        };
+        retired.expect("retire without a pending frame");
+
+        fence
+            .submit(&gpu.device, gpu.queue, &[vk::SubmitInfo::default()])
+            .expect("the fence guards the next submission");
+        fence.retire(&gpu.device).expect("retire the next frame");
+        unsafe { fence.destroy(&gpu.device) };
+    }
+
+    #[test]
+    fn abandoning_an_acquired_image_consumes_its_acquire_signal() {
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        let mut acquired = gpu.semaphore();
+        gpu.run(&[], &[acquired], |_, _| {});
+        let mut fence = FrameFence::new(&gpu.device).expect("create frame fence");
+
+        consume_acquire_signal(&gpu.device, gpu.queue, &mut fence, &mut acquired)
+            .expect("wait out the acquire signal");
+        assert!(
+            fence.pending,
+            "the acquire signal is consumed by a batch the frame fence guards"
+        );
+
+        let device = gpu.device.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let retired = fence.retire(&device);
+            let _ = done.send((retired, fence));
+        });
+        let Ok((retired, fence)) = finished.recv_timeout(std::time::Duration::from_secs(10)) else {
+            std::mem::forget(gpu);
+            panic!("the batch that consumes the acquire signal must complete");
+        };
+        retired.expect("retire the batch that consumed the acquire signal");
+        unsafe { fence.destroy(&gpu.device) };
+    }
+
+    unsafe extern "system" fn out_of_memory_submit(
+        _queue: vk::Queue,
+        _submit_count: u32,
+        _submits: *const vk::SubmitInfo<'_>,
+        _fence: vk::Fence,
+    ) -> vk::Result {
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY
+    }
+
+    #[test]
+    fn an_acquire_signal_that_cannot_be_consumed_retires_its_semaphore() {
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        let handle = gpu.device.handle();
+        let get_device_proc_addr = gpu.instance.fp_v1_0().get_device_proc_addr;
+        let failing = unsafe {
+            ash::Device::load_with(
+                |name| {
+                    if name == c"vkQueueSubmit" {
+                        return out_of_memory_submit as *const std::ffi::c_void;
+                    }
+                    get_device_proc_addr(handle, name.as_ptr())
+                        .map_or(std::ptr::null(), |f| f as *const std::ffi::c_void)
+                },
+                handle,
+            )
+        };
+        let mut acquired = unsafe {
+            gpu.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .expect("create the acquire semaphore");
+        gpu.run(&[], &[acquired], |_, _| {});
+        let mut fence = FrameFence::new(&gpu.device).expect("create frame fence");
+
+        let result = consume_acquire_signal(&failing, gpu.queue, &mut fence, &mut acquired);
+
+        let cause = vk::Result::ERROR_OUT_OF_HOST_MEMORY.to_string();
+        assert!(
+            matches!(&result, Err(GraphicsError::Vulkan(m)) if m.contains(&cause)),
+            "the failed release is reported with its cause: {result:?}"
+        );
+        assert_eq!(
+            acquired,
+            vk::Semaphore::null(),
+            "a semaphore whose acquire signal is still pending must never be acquired with again"
+        );
+        assert!(
+            !fence.pending,
+            "nothing was submitted for the fence to guard"
+        );
+        unsafe { fence.destroy(&gpu.device) };
+    }
+
+    struct CompositeTarget {
+        render_pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+        image: vk::Image,
+        extent: vk::Extent2D,
+        readback: vk::Buffer,
+        readback_memory: vk::DeviceMemory,
+    }
+
+    fn render_composites(
+        gpu: &headless_vulkan::HeadlessGpu,
+        compositor: &mut CanvasCompositor,
+        target: &CompositeTarget,
+        canvases: &[crate::framework::DrawnCanvas],
+        views: &[LaidOutView],
+    ) -> (Vec<u8>, usize) {
+        let extent = target.extent;
+        compositor
+            .prepare(&gpu.device, &gpu.memory_properties, canvases, views, extent)
+            .expect("prepare composites");
+        let uploads = compositor
+            .textures
+            .iter()
+            .filter(|t| t.upload_pending)
+            .count();
+        gpu.run(&[], &[], |device, cmd| unsafe {
+            compositor.record_uploads(device, cmd);
+            let clear = [vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            }];
+            let begin = vk::RenderPassBeginInfo::default()
+                .render_pass(target.render_pass)
+                .framebuffer(target.framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                })
+                .clear_values(&clear);
+            device.cmd_begin_render_pass(cmd, &begin, vk::SubpassContents::INLINE);
+            let viewport = vk::Viewport::default()
+                .width(extent.width as f32)
+                .height(extent.height as f32)
+                .max_depth(1.0);
+            device.cmd_set_viewport(cmd, 0, &[viewport]);
+            device.cmd_set_scissor(
+                cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                }],
+            );
+            compositor.record(device, cmd);
+            device.cmd_end_render_pass(cmd);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                });
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                target.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                target.readback,
+                &[region],
+            );
+        });
+        compositor.uploads_submitted();
+        let len = (extent.width * extent.height * 4) as usize;
+        (gpu.read(target.readback_memory, len), uploads)
+    }
+
+    #[test]
+    fn composite_textures_persist_and_upload_only_changed_canvases() {
+        use crate::framework::{canvas_registry, DrawnCanvas};
+
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        let device = &gpu.device;
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let extent = vk::Extent2D {
+            width: 48,
+            height: 32,
+        };
+        let attachment = vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let color_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref));
+        let render_pass = unsafe {
+            device.create_render_pass(
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(std::slice::from_ref(&attachment))
+                    .subpasses(std::slice::from_ref(&subpass)),
+                None,
+            )
+        }
+        .expect("render pass");
+        let image = gpu.image(
+            format,
+            extent.width,
+            extent.height,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+        );
+        let view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )
+        }
+        .expect("image view");
+        let attachments = [view];
+        let framebuffer = unsafe {
+            device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(&attachments)
+                    .width(extent.width)
+                    .height(extent.height)
+                    .layers(1),
+                None,
+            )
+        }
+        .expect("framebuffer");
+        let (readback, readback_memory) = gpu.host_buffer(
+            u64::from(extent.width * extent.height * 4),
+            vk::BufferUsageFlags::TRANSFER_DST,
+        );
+        let mut compositor = CanvasCompositor::new(device, render_pass).expect("compositor");
+        let target = CompositeTarget {
+            render_pass,
+            framebuffer,
+            image,
+            extent,
+            readback,
+            readback_memory,
+        };
+        let pixel = |bytes: &[u8], x: u32, y: u32| {
+            let i = ((y * extent.width + x) * 4) as usize;
+            [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]
+        };
+        let black = [0, 0, 0, 255];
+
+        let canvas = canvas_registry::allocate(16, 16).expect("canvas");
+        canvas_registry::with_canvas(canvas, |c| c.draw_color(0xFF20_40C0u32 as i32))
+            .expect("draw");
+        let views = [lov(7, 8.0, 8.0, 16.0, 16.0, false)];
+        let drawn = [DrawnCanvas { view: 7, canvas }];
+
+        let (first, uploads) = render_composites(&gpu, &mut compositor, &target, &drawn, &views);
+        assert_eq!(uploads, 1, "a new canvas is uploaded");
+        assert_eq!(pixel(&first, 8, 8), [0x20, 0x40, 0xC0, 0xFF]);
+        assert_eq!(pixel(&first, 23, 23), [0x20, 0x40, 0xC0, 0xFF]);
+        assert_eq!(pixel(&first, 7, 8), black);
+        assert_eq!(pixel(&first, 24, 23), black);
+
+        let (second, uploads) = render_composites(&gpu, &mut compositor, &target, &drawn, &views);
+        assert_eq!(uploads, 0, "unchanged canvas content is not uploaded again");
+        assert_eq!(second, first, "the persistent texture renders identically");
+
+        canvas_registry::with_canvas(canvas, |c| c.draw_color(0xFFC0_4020u32 as i32))
+            .expect("redraw");
+        let (third, uploads) = render_composites(&gpu, &mut compositor, &target, &drawn, &views);
+        assert_eq!(uploads, 1, "changed canvas content is uploaded");
+        assert_eq!(pixel(&third, 8, 8), [0xC0, 0x40, 0x20, 0xFF]);
+        assert_eq!(pixel(&third, 7, 8), black);
+
+        let moved = [lov(7, 24.0, 0.0, 16.0, 16.0, false)];
+        let (fourth, uploads) = render_composites(&gpu, &mut compositor, &target, &drawn, &moved);
+        assert_eq!(uploads, 0, "moving a view reuses its texture");
+        assert_eq!(pixel(&fourth, 24, 0), [0xC0, 0x40, 0x20, 0xFF]);
+        assert_eq!(pixel(&fourth, 8, 8), black);
+
+        let (fifth, uploads) = render_composites(&gpu, &mut compositor, &target, &[], &moved);
+        assert_eq!(uploads, 0);
+        assert_eq!(
+            compositor.texture_count(),
+            0,
+            "undrawn views release their textures"
+        );
+        assert!(fifth.chunks(4).all(|p| p == black));
+
+        canvas_registry::free(canvas).expect("free canvas");
+        unsafe {
+            compositor.destroy(device);
+            device.destroy_framebuffer(framebuffer, None);
+            device.destroy_image_view(view, None);
+            device.destroy_render_pass(render_pass, None);
+        }
+    }
+
+    const LOADER_LIFETIME_CHILD: &str = "ECLIPSE_TEST_VULKAN_LOADER_LIFETIME_CHILD";
+
+    #[test]
+    fn renderer_init_failure_destroys_its_instance_while_the_loader_stays_loaded() {
+        if std::env::var_os(LOADER_LIFETIME_CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("the test harness executable must have a path"),
+            )
+            .args([
+                "--exact",
+                "graphics::tests::\
+                 renderer_init_failure_destroys_its_instance_while_the_loader_stays_loaded",
+                "--test-threads=1",
+            ])
+            .env(LOADER_LIFETIME_CHILD, "1")
+            .output()
+            .expect("the loader-lifetime child must start");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "a failed renderer init must not call into an unloaded Vulkan loader: \
+                 status={:?}, stdout={stdout}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let result = VulkanRenderer::create(
+            RawDisplayHandle::Wayland(raw_window_handle::WaylandDisplayHandle::new(
+                std::ptr::NonNull::dangling(),
+            )),
+            RawWindowHandle::Web(raw_window_handle::WebWindowHandle::new(1)),
+            winit::dpi::PhysicalSize::new(64, 64),
+        );
+        match result {
+            Ok(_) => panic!("a web window handle cannot back a Linux Vulkan surface"),
+            Err(GraphicsError::Vulkan(message)) if message.contains("vkCreate*SurfaceKHR") => {}
+            Err(e) => eprintln!("SKIP: no Vulkan instance with Wayland surface support ({e})"),
+        }
+    }
 
     fn caps(min: u32, max: u32, cur_w: u32, cur_h: u32) -> vk::SurfaceCapabilitiesKHR {
         vk::SurfaceCapabilitiesKHR {
@@ -6795,5 +7167,254 @@ mod tests {
 
     fn drawn_i32(r: (u32, u32, u32, u32)) -> (i32, i32, u32, u32) {
         (r.0 as i32, r.1 as i32, r.2, r.3)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod headless_vulkan {
+    use ash::{khr, vk};
+    use std::cell::RefCell;
+
+    pub(crate) struct HeadlessGpu {
+        pub(crate) entry: ash::Entry,
+        pub(crate) instance: ash::Instance,
+        pub(crate) physical_device: vk::PhysicalDevice,
+        pub(crate) device: ash::Device,
+        pub(crate) queue_family: u32,
+        pub(crate) queue: vk::Queue,
+        pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
+        command_pool: vk::CommandPool,
+        images: RefCell<Vec<(vk::Image, vk::DeviceMemory)>>,
+        buffers: RefCell<Vec<(vk::Buffer, vk::DeviceMemory)>>,
+        semaphores: RefCell<Vec<vk::Semaphore>>,
+    }
+
+    impl HeadlessGpu {
+        pub(crate) fn new() -> Result<Self, String> {
+            let entry =
+                unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan loader: {e}"))?;
+            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
+            let instance = unsafe {
+                entry.create_instance(
+                    &vk::InstanceCreateInfo::default().application_info(&app),
+                    None,
+                )
+            }
+            .map_err(|e| format!("vkCreateInstance: {e}"))?;
+            let (physical_device, queue_family, device) = match Self::open_device(&instance) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    unsafe { instance.destroy_instance(None) };
+                    return Err(e);
+                }
+            };
+            let queue = unsafe { device.get_device_queue(queue_family, 0) };
+            let memory_properties =
+                unsafe { instance.get_physical_device_memory_properties(physical_device) };
+            let pool_info = vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(queue_family);
+            let command_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
+                Ok(pool) => pool,
+                Err(e) => {
+                    unsafe {
+                        device.destroy_device(None);
+                        instance.destroy_instance(None);
+                    }
+                    return Err(format!("vkCreateCommandPool: {e}"));
+                }
+            };
+            Ok(Self {
+                entry,
+                instance,
+                physical_device,
+                device,
+                queue_family,
+                queue,
+                memory_properties,
+                command_pool,
+                images: RefCell::new(Vec::new()),
+                buffers: RefCell::new(Vec::new()),
+                semaphores: RefCell::new(Vec::new()),
+            })
+        }
+
+        fn open_device(
+            instance: &ash::Instance,
+        ) -> Result<(vk::PhysicalDevice, u32, ash::Device), String> {
+            let devices = unsafe { instance.enumerate_physical_devices() }
+                .map_err(|e| format!("vkEnumeratePhysicalDevices: {e}"))?;
+            for physical_device in devices {
+                let extensions =
+                    unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                        .map_err(|e| format!("vkEnumerateDeviceExtensionProperties: {e}"))?;
+                if !extensions
+                    .iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(khr::swapchain::NAME))
+                {
+                    continue;
+                }
+                let families = unsafe {
+                    instance.get_physical_device_queue_family_properties(physical_device)
+                };
+                let Some(family) = families
+                    .iter()
+                    .position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                else {
+                    continue;
+                };
+                let priorities = [1.0f32];
+                let queue_info = vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family as u32)
+                    .queue_priorities(&priorities);
+                let device_extensions = [khr::swapchain::NAME.as_ptr()];
+                let device_info = vk::DeviceCreateInfo::default()
+                    .queue_create_infos(std::slice::from_ref(&queue_info))
+                    .enabled_extension_names(&device_extensions);
+                let device = unsafe { instance.create_device(physical_device, &device_info, None) }
+                    .map_err(|e| format!("vkCreateDevice: {e}"))?;
+                return Ok((physical_device, family as u32, device));
+            }
+            Err("no physical device with a graphics queue and VK_KHR_swapchain".to_owned())
+        }
+
+        pub(crate) fn image(
+            &self,
+            format: vk::Format,
+            width: u32,
+            height: u32,
+            usage: vk::ImageUsageFlags,
+        ) -> vk::Image {
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = unsafe { self.device.create_image(&info, None) }.expect("vkCreateImage");
+            let req = unsafe { self.device.get_image_memory_requirements(image) };
+            let memory_type =
+                super::find_device_local_memory_type(&self.memory_properties, req.memory_type_bits)
+                    .expect("device-local memory type");
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(memory_type);
+            let memory =
+                unsafe { self.device.allocate_memory(&alloc, None) }.expect("vkAllocateMemory");
+            unsafe { self.device.bind_image_memory(image, memory, 0) }.expect("vkBindImageMemory");
+            self.images.borrow_mut().push((image, memory));
+            image
+        }
+
+        pub(crate) fn host_buffer(
+            &self,
+            size: vk::DeviceSize,
+            usage: vk::BufferUsageFlags,
+        ) -> (vk::Buffer, vk::DeviceMemory) {
+            let created =
+                super::create_host_buffer(&self.device, &self.memory_properties, size, usage)
+                    .expect("host-visible buffer");
+            self.buffers.borrow_mut().push(created);
+            created
+        }
+
+        pub(crate) fn semaphore(&self) -> vk::Semaphore {
+            let semaphore = unsafe {
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            }
+            .expect("vkCreateSemaphore");
+            self.semaphores.borrow_mut().push(semaphore);
+            semaphore
+        }
+
+        pub(crate) fn run(
+            &self,
+            waits: &[vk::Semaphore],
+            signals: &[vk::Semaphore],
+            record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        ) {
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = unsafe { self.device.allocate_command_buffers(&alloc) }
+                .expect("vkAllocateCommandBuffers")[0];
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe { self.device.begin_command_buffer(cmd, &begin) }.expect("vkBeginCommandBuffer");
+            record(&self.device, cmd);
+            unsafe { self.device.end_command_buffer(cmd) }.expect("vkEndCommandBuffer");
+            let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+            let cmds = [cmd];
+            let batch = vk::SubmitInfo::default()
+                .wait_semaphores(waits)
+                .wait_dst_stage_mask(&stages)
+                .command_buffers(&cmds)
+                .signal_semaphores(signals);
+            let fence = unsafe {
+                self.device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+            }
+            .expect("vkCreateFence");
+            unsafe {
+                self.device
+                    .queue_submit(self.queue, &[batch], fence)
+                    .expect("vkQueueSubmit");
+                self.device
+                    .wait_for_fences(&[fence], true, u64::MAX)
+                    .expect("vkWaitForFences");
+                self.device.destroy_fence(fence, None);
+                self.device.free_command_buffers(self.command_pool, &cmds);
+            }
+        }
+
+        pub(crate) fn read(&self, memory: vk::DeviceMemory, len: usize) -> Vec<u8> {
+            unsafe {
+                let ptr = self
+                    .device
+                    .map_memory(
+                        memory,
+                        0,
+                        len as vk::DeviceSize,
+                        vk::MemoryMapFlags::empty(),
+                    )
+                    .expect("vkMapMemory");
+                let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec();
+                self.device.unmap_memory(memory);
+                bytes
+            }
+        }
+    }
+
+    impl Drop for HeadlessGpu {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.device.device_wait_idle();
+                for semaphore in self.semaphores.borrow_mut().drain(..) {
+                    self.device.destroy_semaphore(semaphore, None);
+                }
+                for (buffer, memory) in self.buffers.borrow_mut().drain(..) {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                for (image, memory) in self.images.borrow_mut().drain(..) {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                }
+                self.device.destroy_command_pool(self.command_pool, None);
+                self.device.destroy_device(None);
+                self.instance.destroy_instance(None);
+            }
+        }
     }
 }
