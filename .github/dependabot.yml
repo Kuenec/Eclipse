@@ -12,6 +12,9 @@ updates:
     groups:
       rust-dependencies:
         patterns: ["*"]
+    ignore:
+      - dependency-name: libloading
+        versions: [">= 0.9"]
 
   - package-ecosystem: cargo
     directory: /crates/libm-shim
@@ -45,3 +48,5 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
