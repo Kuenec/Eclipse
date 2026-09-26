@@ -30,8 +30,6 @@ pub enum InitRunError {
 
     Apk(String),
 
-    Stage(String),
-
     Link(String),
 
     NoInitArray,
@@ -47,7 +45,6 @@ impl std::fmt::Display for InitRunError {
                 "no Roblox APK (set ECLIPSE_ROBLOX_APK or place it at the default dev-host path)"
             ),
             Self::Apk(e) => write!(f, "APK read: {e}"),
-            Self::Stage(e) => write!(f, "stage libroblox.so: {e}"),
             Self::Link(e) => write!(f, "map/relocate/resolve: {e}"),
             Self::NoInitArray => write!(f, "mapped libroblox.so has no DT_INIT_ARRAY"),
             Self::Setup(e) => write!(f, "harness setup: {e}"),
@@ -67,7 +64,7 @@ pub fn find_roblox_apk() -> Option<std::path::PathBuf> {
         .find(|p| p.exists())
 }
 
-pub fn run_libroblox_init() -> Result<usize, InitRunError> {
+pub fn run_libroblox_init(lib_dir: &Path) -> Result<usize, InitRunError> {
     let mut log = std::io::stderr();
     let _ = writeln!(
         log,
@@ -80,15 +77,10 @@ pub fn run_libroblox_init() -> Result<usize, InitRunError> {
     super::ndk_registry::set_apk_path(apk_path.clone());
 
     let mut apk = crate::apk::Apk::open(&apk_path).map_err(|e| InitRunError::Apk(e.to_string()))?;
-    let so_bytes = apk
-        .read_entry("lib/x86_64/libroblox.so")
+    apk.extract_native_libs("x86_64", lib_dir)
         .map_err(|e| InitRunError::Apk(e.to_string()))?;
-    let _ = writeln!(log, "libroblox.so: {} bytes read from APK", so_bytes.len());
-
-    let dir = std::env::temp_dir().join(format!("eclipse-init-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| InitRunError::Stage(e.to_string()))?;
-    let so_path = dir.join("libroblox.so");
-    std::fs::write(&so_path, &so_bytes).map_err(|e| InitRunError::Stage(e.to_string()))?;
+    let so_path = lib_dir.join("libroblox.so");
+    let _ = writeln!(log, "libroblox.so: {}", so_path.display());
 
     let linker = Linker::new(Vec::<std::path::PathBuf>::new())
         .with_host_fallback(false)
@@ -237,8 +229,6 @@ pub fn run_libroblox_init() -> Result<usize, InitRunError> {
     );
     let _ = log.flush();
     let _ = std::io::stdout().flush();
-
-    let _ = (&set, &dir);
 
     unsafe { libc::_exit(0) };
 }

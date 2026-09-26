@@ -358,6 +358,14 @@ pub(crate) mod walk_support {
         (rc, seen)
     }
 
+    pub(crate) fn collect_registered() -> Vec<PhdrSeen> {
+        let mut seen: Vec<PhdrSeen> = Vec::new();
+        unsafe {
+            super::eclipse_dl_iterate_phdr(Some(collect_cb), (&raw mut seen).cast::<c_void>());
+        }
+        seen
+    }
+
     pub(crate) fn stop_after_first(modules: &[ModuleRecord]) -> (c_int, usize) {
         let mut calls = 0usize;
         let rc = iterate_with_host(

@@ -121,16 +121,24 @@ fn main() -> ExitCode {
             }
         },
 
-        Some("__run-libroblox-init") => match eclipse::loader::init_run::run_libroblox_init() {
-            Ok(completed) => {
-                println!("__run-libroblox-init: {completed} constructor(s) completed");
-                ExitCode::SUCCESS
+        Some("__run-libroblox-init") => {
+            let outcome = eclipse::runtime::native_lib_cache_dir()
+                .map_err(|e| e.to_string())
+                .and_then(|lib_dir| {
+                    eclipse::loader::init_run::run_libroblox_init(&lib_dir)
+                        .map_err(|e| e.to_string())
+                });
+            match outcome {
+                Ok(completed) => {
+                    println!("__run-libroblox-init: {completed} constructor(s) completed");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("__run-libroblox-init: {e}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(e) => {
-                eprintln!("__run-libroblox-init: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        }
 
         Some("__gl-test") => match eclipse::egl_engine::run_gl_test() {
             Ok(report) => {
@@ -533,8 +541,7 @@ fn run_apk(
     eclipse::framework::register_engine_preload_natives(&vm)?;
     println!("engine-preload framework natives registered ✓");
 
-    let _preloaded_libs =
-        preload_app_native_libs(&mut apk, std::path::Path::new(apk_path), &app_lib_dir, &vm)?;
+    let _preloaded_libs = preload_app_native_libs(&mut apk, &app_lib_dir, &vm)?;
 
     println!("# Driving the framework lifecycle (JNI; steps 1–7 to Activity.onResume / RESUMED)…");
     let android_deep_link = browser_place_id.map(|place_id| format!("roblox://placeId={place_id}"));
@@ -571,7 +578,6 @@ const ENGINE_FILENAME: &str = "libroblox.so";
 
 fn preload_app_native_libs(
     apk: &mut eclipse::apk::Apk,
-    apk_path: &std::path::Path,
     app_lib_dir: &std::path::Path,
     vm: &eclipse::runtime::Vm,
 ) -> Result<Vec<eclipse::loader::engine::PreloadedLib>, Box<dyn std::error::Error>> {
@@ -590,10 +596,9 @@ fn preload_app_native_libs(
 
     println!("# Pre-loading the native engine via Eclipse's Rust loader (NOT the apkenv linker)…");
     let engine = eclipse::loader::engine::load_app_native_lib(
-        apk_path,
+        app_lib_dir,
         ENGINE_FILENAME,
         vm_raw,
-        app_lib_dir,
         &mut log,
     )?
     .ok_or("libroblox.so unexpectedly deduped on first load")?;
@@ -609,13 +614,8 @@ fn preload_app_native_libs(
         if filename == ENGINE_FILENAME {
             continue;
         }
-        match eclipse::loader::engine::load_app_native_lib(
-            apk_path,
-            filename,
-            vm_raw,
-            app_lib_dir,
-            &mut log,
-        ) {
+        match eclipse::loader::engine::load_app_native_lib(app_lib_dir, filename, vm_raw, &mut log)
+        {
             Ok(Some(lib)) => {
                 report_preloaded(&lib);
                 loaded.push(lib);

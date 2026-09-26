@@ -538,7 +538,7 @@ fn tls_err_static(e: &super::tls::TlsError) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::loader::elf::{PF_R, PF_W, PF_X};
     use crate::loader::reloc::R_X86_64_GLOB_DAT;
@@ -611,7 +611,7 @@ mod tests {
         put_u64(buf, ph + 48, p_align);
     }
 
-    fn build_so(
+    pub(crate) fn build_so(
         soname: &str,
         needed: &[&str],
         export: Option<&str>,
@@ -724,14 +724,14 @@ mod tests {
         buf
     }
 
-    fn write_so(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    pub(crate) fn write_so(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = dir.join(name);
         let mut f = std::fs::File::create(&path).expect("create fixture .so");
         f.write_all(bytes).expect("write fixture .so");
         path
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    pub(crate) fn temp_dir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
             "eclipse-link-test-{tag}-{}-{:?}",
