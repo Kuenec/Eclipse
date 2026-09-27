@@ -8,5 +8,6 @@ Exec=eclipse run
 Icon=io.github.kuenec.Eclipse
 Terminal=false
 StartupNotify=true
+SingleMainWindow=true
 Categories=Game;
 Keywords=roblox;android;game;

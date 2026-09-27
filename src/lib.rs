@@ -15,6 +15,8 @@ pub mod loader;
 pub mod performance;
 pub mod runtime;
 pub mod services;
+pub mod status;
+pub mod temp_file;
 mod text_layout;
 pub mod webview;
 

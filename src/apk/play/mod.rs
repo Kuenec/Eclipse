@@ -14,12 +14,13 @@ use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::https::{self, DownloadError, Host};
+use super::https::{self, Download, DownloadError, Host, Resume};
 use super::store::{InstalledVersion, Store, StoreError, UpdateOutcome};
 use super::{
     ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, NATIVE_SPLIT_APK, NATIVE_SPLIT_NAME,
     ROBLOX_PACKAGE,
 };
+use crate::status::StatusSink;
 use proto::{
     bytes_field, fixed64_field, message_at, repeated_bytes, string_field, varint_field, Encoder,
     ProtoError,
@@ -169,6 +170,7 @@ pub fn update(
     credentials: &Credentials,
     store: &Store,
     current: Option<&ApkSet>,
+    status: &StatusSink,
 ) -> Result<UpdateOutcome, PlayError> {
     let session = Session::start(credentials)?;
     let latest = session.latest_version()?;
@@ -188,16 +190,29 @@ pub fn update(
     let delivery_token = session.purchase(latest)?;
     let delivery = session.delivery(latest, &delivery_token)?;
 
-    let staging = store.begin()?;
+    let staging = store.begin(status)?;
     let downloads = https::download_agent();
-    download(&downloads, &delivery.base, &staging.dir().join(BASE_APK))?;
+    status.step(format!(
+        "Downloading Roblox versionCode {latest} from Google Play…"
+    ));
+    download(
+        &downloads,
+        &delivery.base,
+        &staging.dir().join(BASE_APK),
+        status,
+    )?;
     download(
         &downloads,
         &delivery.native_split,
         &staging.dir().join(NATIVE_SPLIT_APK),
+        status,
     )?;
-    let set = Box::new(staging.commit(Some(latest))?);
-    Ok(UpdateOutcome::Updated { previous, set })
+    status.step("Checking Roblox's signature and installing it…");
+    let committed = Box::new(staging.commit(Some(latest))?);
+    Ok(UpdateOutcome::Updated {
+        previous,
+        committed,
+    })
 }
 
 struct Session<'a> {
@@ -577,27 +592,29 @@ fn artifact(
     })
 }
 
-fn download(agent: &ureq::Agent, artifact: &Artifact, dest: &Path) -> Result<(), PlayError> {
-    let file = artifact.file;
-    let download = https::open_download(agent, &artifact.url, DOWNLOAD_HOSTS)
-        .map_err(|source| PlayError::Download { file, source })?;
+fn download(
+    agent: &ureq::Agent,
+    artifact: &Artifact,
+    dest: &Path,
+    status: &StatusSink,
+) -> Result<(), PlayError> {
     save_verified(
-        download.body.into_reader(),
-        download.content_length,
+        |resume| https::open_download(agent, &artifact.url, DOWNLOAD_HOSTS, resume),
         artifact,
         dest,
+        status,
     )
 }
 
-fn save_verified(
-    body: impl Read,
-    content_length: Option<u64>,
+fn save_verified<R: Read>(
+    open: impl FnMut(Option<&Resume>) -> Result<Download<R>, DownloadError>,
     artifact: &Artifact,
     dest: &Path,
+    status: &StatusSink,
 ) -> Result<(), PlayError> {
     let file = artifact.file;
     let mut hasher = Sha256::new();
-    let total = https::save_download(body, content_length, MAX_APK_BYTES, dest, |chunk| {
+    let total = https::save_download(open, MAX_APK_BYTES, dest, status, |chunk| {
         hasher.update(chunk)
     })
     .map_err(|source| PlayError::Download { file, source })?;
@@ -1202,6 +1219,28 @@ mod tests {
         }
     }
 
+    fn save(
+        body: impl Read,
+        length: Option<u64>,
+        artifact: &Artifact,
+        dest: &Path,
+    ) -> Result<(), PlayError> {
+        let mut body = Some(body);
+        save_verified(
+            |resume| {
+                assert_eq!(resume, None, "an uninterrupted download is not continued");
+                Ok(Download {
+                    body: body.take().expect("the download is opened once"),
+                    extent: https::Extent::Whole { length },
+                    validator: None,
+                })
+            },
+            artifact,
+            dest,
+            &StatusSink::terminal(),
+        )
+    }
+
     #[test]
     fn downloads_are_kept_only_when_size_and_sha256_match() {
         let dir = temp_dir("save");
@@ -1210,12 +1249,12 @@ mod tests {
         let body = b"official Roblox base.apk bytes";
         let size = Some(body.len() as u64);
 
-        save_verified(&body[..], size, &announced(body, size), &dest).unwrap();
+        save(&body[..], size, &announced(body, size), &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
-        save_verified(&body[..], None, &announced(body, None), &dest).unwrap();
+        save(&body[..], None, &announced(body, None), &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
 
-        let err = save_verified(&body[1..], None, &announced(body, size), &dest).unwrap_err();
+        let err = save(&body[1..], None, &announced(body, size), &dest).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1225,18 +1264,18 @@ mod tests {
             "{err:?}"
         );
         let longer = [&body[..], b"!"].concat();
-        let err = save_verified(&longer[..], None, &announced(body, size), &dest).unwrap_err();
+        let err = save(&longer[..], None, &announced(body, size), &dest).unwrap_err();
         assert!(matches!(err, PlayError::SizeMismatch { .. }), "{err:?}");
 
         let mut tampered = body.to_vec();
         tampered[0] ^= 1;
-        let err = save_verified(&tampered[..], size, &announced(body, size), &dest).unwrap_err();
+        let err = save(&tampered[..], size, &announced(body, size), &dest).unwrap_err();
         assert!(
             matches!(err, PlayError::HashMismatch { file: BASE_APK }),
             "{err:?}"
         );
 
-        let err = save_verified(FailingBody, None, &announced(body, None), &dest).unwrap_err();
+        let err = save(FailingBody, None, &announced(body, None), &dest).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1247,7 +1286,7 @@ mod tests {
             ),
             "{err:?}"
         );
-        let err = save_verified(&body[1..], size, &announced(body, size), &dest).unwrap_err();
+        let err = save(&body[1..], size, &announced(body, size), &dest).unwrap_err();
         assert!(
             matches!(
                 err,

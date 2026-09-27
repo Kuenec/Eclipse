@@ -73,7 +73,7 @@ Eclipse does not include Roblox. It installs the official Android client into it
 
 You do not need to do anything: the first time you start Eclipse, it downloads the newest Roblox client, verifies Roblox's signature and installs it, then launches it. No Google or other account is needed. Eclipse gets the client from [APKCombo](https://apkcombo.com/roblox/com.roblox.client/), which mirrors Roblox's own Google Play release files; Eclipse keeps only `base.apk` and `split_config.x86_64.apk` from the download and discards everything if Roblox's signature does not verify.
 
-After that, starting Eclipse checks for a newer Roblox version at most every six hours and installs it before launching. If the check fails, Eclipse starts the version you already have and prints a warning. To check right away:
+After that, starting Eclipse checks for a newer Roblox version at most every six hours and installs it before launching. If the check fails, Eclipse starts the version you already have, shows a warning, and checks again 30 minutes later at the earliest. A download that stalls or drops continues where it stopped. To check right away:
 
 ```bash
 eclipse update
@@ -110,7 +110,7 @@ Eclipse verifies the signature of every file before it installs anything. If a f
 
 ## Play
 
-Start **Eclipse** from your application menu. To see Eclipse's messages, start it from a terminal instead:
+Start **Eclipse** from your application menu. Its window shows the update check, the download and any error until Roblox opens, and an error names Eclipse's log of that launch (see [Where Eclipse keeps its files](#where-eclipse-keeps-its-files)). Only one Roblox client runs at a time: starting Eclipse again, or clicking Play in a browser while Roblox is open, shows a message instead of a second copy. To see all of Eclipse's messages, start it from a terminal instead:
 
 ```bash
 flatpak run io.github.kuenec.Eclipse run
@@ -182,6 +182,7 @@ These paths assume the default XDG base directories.
 | Settings | `config/eclipse/config.json` | `~/.config/eclipse/config.json` |
 | Installed Roblox client (current and previous version) | `data/eclipse/roblox/<versionCode>/` | `~/.local/share/eclipse/roblox/<versionCode>/` |
 | Game data, WebView profile and staged Fast Flags | `data/eclipse/app-data/` | `~/.local/share/eclipse/app-data/` |
+| Log of the last launch: `eclipse.log`, and in long sessions `eclipse.log.1` with the 8 MiB before it | `data/eclipse/app-data/logs/` | `~/.local/share/eclipse/app-data/logs/` |
 | Last update check | `data/eclipse/roblox/last-update-check.json` | `~/.local/share/eclipse/roblox/last-update-check.json` |
 | Google Play sign-in (only with `play-login`), readable only by you | `data/eclipse/google-play.json` | `~/.local/share/eclipse/google-play.json` |
 | Extracted native libraries | `cache/eclipse/native-libs/` | `~/.cache/eclipse/native-libs/` |
@@ -206,6 +207,7 @@ Run the second command only if you added the `eclipse` remote, either by keeping
 
 ## Troubleshooting
 
+- If Roblox closes or fails to start, read `logs/eclipse.log` in Eclipse's app-data directory (see [Where Eclipse keeps its files](#where-eclipse-keeps-its-files)). Starting Roblox again replaces it, so copy it first.
 - Start Eclipse from a terminal to see what it is doing. For more detail, run `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`.
 - If the first download fails, Eclipse prints why. Run `eclipse update` to try again, or install the files yourself with `eclipse install`.
 - A signature error means the files are not Roblox's official, unmodified release. Get a clean copy of the files and install again.
@@ -291,7 +293,7 @@ Running a source build needs the Android runtime that the Flatpak bundles: art_s
 | `ECLIPSE_ANDROID_FRAMEWORK_DIR` | The patched framework directory |
 | `ECLIPSE_ART_BOOT_IMAGE` | The ART boot image |
 | `ECLIPSE_APP_DATA_DIR` | The app data root, instead of `~/.local/share/eclipse/app-data` |
-| `ECLIPSE_NATIVE_LIB_DIR` | Where native libraries are extracted |
+| `ECLIPSE_NATIVE_LIB_DIR` | Where native libraries are extracted, into `<dir>/<versionCode>`; Eclipse never removes anything there |
 | `ECLIPSE_WEBVIEW_HELPER` | The `eclipse-webview` helper binary |
 | `ECLIPSE_ROBLOX_APK` | An official APK or split-set directory for the tests that need the real client; they skip without it |
 

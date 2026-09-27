@@ -1,9 +1,8 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::os::unix::fs::FileExt as _;
-use std::path::Path;
 
 use ring::signature::{
     RsaParameters, UnparsedPublicKey, RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY,
@@ -102,21 +101,25 @@ impl SigningCertificateHistory {
         &self.0
     }
 
+    pub(super) fn recorded(certificates: Vec<Vec<u8>>) -> Self {
+        Self(certificates)
+    }
+
     #[cfg(test)]
     pub(crate) fn unverified(certificates: Vec<Vec<u8>>) -> Self {
         Self(certificates)
     }
 }
 
-pub fn verify_roblox_signature(path: &Path) -> Result<(), SignatureError> {
-    verify_v2(&SignedApk::read(path)?)?;
+pub fn verify_roblox_signature(file: &File) -> Result<(), SignatureError> {
+    verify_v2(&SignedApk::read(file)?)?;
     Ok(())
 }
 
 pub fn verify_roblox_signing_history(
-    path: &Path,
+    file: &File,
 ) -> Result<SigningCertificateHistory, SignatureError> {
-    let apk = SignedApk::read(path)?;
+    let apk = SignedApk::read(file)?;
     let v2 = verify_v2(&apk)?;
     let v3 = match find_pair(&apk.block, V31_BLOCK_ID)? {
         Some(v31) => Some(v31),
@@ -129,7 +132,7 @@ pub fn verify_roblox_signing_history(
     let contents_match = match v3.algorithm {
         SignatureAlgorithm::RsaPkcs1Sha256 => v3.content_digest == v2.content_digest,
         SignatureAlgorithm::RsaPkcs1Sha512 => {
-            content_digest::<Sha512>(&apk.file, &apk.layout)? == v3.content_digest
+            content_digest::<Sha512>(apk.file, &apk.layout)? == v3.content_digest
         }
     };
     if !contents_match {
@@ -140,18 +143,17 @@ pub fn verify_roblox_signing_history(
     ))
 }
 
-struct SignedApk {
-    file: File,
+struct SignedApk<'a> {
+    file: &'a File,
     layout: ZipLayout,
     block: Vec<u8>,
 }
 
-impl SignedApk {
-    fn read(path: &Path) -> Result<Self, SignatureError> {
-        let mut file = File::open(path)?;
+impl<'a> SignedApk<'a> {
+    fn read(file: &'a File) -> Result<Self, SignatureError> {
         let len = file.metadata()?.len();
-        let mut layout = ZipLayout::locate(&mut file, len)?;
-        let block = read_signing_block(&mut file, &mut layout)?;
+        let mut layout = ZipLayout::locate(file, len)?;
+        let block = read_signing_block(file, &mut layout)?;
         Ok(Self {
             file,
             layout,
@@ -160,7 +162,7 @@ impl SignedApk {
     }
 }
 
-fn verify_v2(apk: &SignedApk) -> Result<V2Signer<'_>, SignatureError> {
+fn verify_v2<'a>(apk: &'a SignedApk<'_>) -> Result<V2Signer<'a>, SignatureError> {
     let v2 = find_pair(&apk.block, V2_BLOCK_ID)?.ok_or(SignatureError::MissingV2Signature)?;
     let mut signers = Cursor::new(Cursor::new(v2).prefixed("signer sequence")?);
     let signer = signers.prefixed("signer")?;
@@ -168,7 +170,7 @@ fn verify_v2(apk: &SignedApk) -> Result<V2Signer<'_>, SignatureError> {
         return Err(SignatureError::Malformed("more than one signer"));
     }
     let v2 = verify_v2_signer(signer)?;
-    if content_digest::<Sha256>(&apk.file, &apk.layout)? != v2.content_digest {
+    if content_digest::<Sha256>(apk.file, &apk.layout)? != v2.content_digest {
         return Err(SignatureError::ContentDigestMismatch);
     }
     Ok(v2)
@@ -454,12 +456,11 @@ struct ZipLayout {
 }
 
 impl ZipLayout {
-    fn locate(file: &mut File, len: u64) -> Result<Self, SignatureError> {
+    fn locate(file: &File, len: u64) -> Result<Self, SignatureError> {
         let tail_len = len.min((EOCD_MIN_LEN + EOCD_MAX_COMMENT) as u64);
         let tail_start = len - tail_len;
         let mut tail = vec![0; tail_len as usize];
-        file.seek(SeekFrom::Start(tail_start))?;
-        file.read_exact(&mut tail)?;
+        file.read_exact_at(&mut tail, tail_start)?;
 
         let eocd_start = (0..=tail.len().saturating_sub(EOCD_MIN_LEN))
             .rev()
@@ -487,14 +488,13 @@ impl ZipLayout {
     }
 }
 
-fn read_signing_block(file: &mut File, layout: &mut ZipLayout) -> Result<Vec<u8>, SignatureError> {
+fn read_signing_block(file: &File, layout: &mut ZipLayout) -> Result<Vec<u8>, SignatureError> {
     let footer_start = layout
         .central_directory_offset
         .checked_sub(SIGNING_BLOCK_FOOTER_LEN)
         .ok_or(SignatureError::MissingV2Signature)?;
     let mut footer = [0_u8; SIGNING_BLOCK_FOOTER_LEN as usize];
-    file.seek(SeekFrom::Start(footer_start))?;
-    file.read_exact(&mut footer)?;
+    file.read_exact_at(&mut footer, footer_start)?;
     if &footer[8..] != SIGNING_BLOCK_MAGIC {
         return Err(SignatureError::MissingV2Signature);
     }
@@ -507,8 +507,7 @@ fn read_signing_block(file: &mut File, layout: &mut ZipLayout) -> Result<Vec<u8>
         .checked_sub(size + 8)
         .ok_or(SignatureError::Malformed("signing block before file start"))?;
     let mut block = vec![0; (size + 8) as usize];
-    file.seek(SeekFrom::Start(start))?;
-    file.read_exact(&mut block)?;
+    file.read_exact_at(&mut block, start)?;
     if block[..8] != footer[..8] {
         return Err(SignatureError::Malformed(
             "signing block size fields differ",
@@ -676,7 +675,7 @@ fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
@@ -694,10 +693,14 @@ mod tests {
         ))
     }
 
+    fn open(path: &Path) -> File {
+        File::open(path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()))
+    }
+
     fn verify_bytes(tag: &str, bytes: &[u8]) -> Result<SigningCertificateHistory, SignatureError> {
         let path = temp_path(tag);
         std::fs::write(&path, bytes).expect("write test APK");
-        let result = verify_roblox_signing_history(&path);
+        let result = verify_roblox_signing_history(&open(&path));
         std::fs::remove_file(&path).ok();
         result
     }
@@ -799,10 +802,10 @@ mod tests {
 
     impl V31Offsets {
         fn of(apk: &Path) -> Self {
-            let mut file = File::open(apk).expect("open official APK");
+            let file = File::open(apk).expect("open official APK");
             let len = file.metadata().expect("official APK metadata").len();
-            let mut layout = ZipLayout::locate(&mut file, len).expect("official zip layout");
-            let block = read_signing_block(&mut file, &mut layout).expect("official signing block");
+            let mut layout = ZipLayout::locate(&file, len).expect("official zip layout");
+            let block = read_signing_block(&file, &mut layout).expect("official signing block");
             let pairs_start = layout.signing_block_offset as usize + 8;
             let file_offset =
                 |inner: &[u8]| pairs_start + (inner.as_ptr() as usize - block.as_ptr() as usize);
@@ -841,7 +844,7 @@ mod tests {
             return;
         };
         for apk in apks {
-            verify_roblox_signature(&apk)
+            verify_roblox_signature(&open(&apk))
                 .unwrap_or_else(|error| panic!("{} must verify: {error}", apk.display()));
         }
     }
@@ -852,7 +855,8 @@ mod tests {
             return;
         };
         for apk in apks {
-            let history = verify_roblox_signing_history(&apk).expect("official APK verifies");
+            let history =
+                verify_roblox_signing_history(&open(&apk)).expect("official APK verifies");
             let digests: Vec<String> = history
                 .certificates()
                 .iter()
@@ -913,8 +917,8 @@ mod tests {
         bytes[offsets.signer_signature_end] ^= 0x01;
         let path = temp_path("tampered-v31");
         std::fs::write(&path, &bytes).expect("write test APK");
-        let history = verify_roblox_signing_history(&path);
-        let v2 = verify_roblox_signature(&path);
+        let history = verify_roblox_signing_history(&open(&path));
+        let v2 = verify_roblox_signature(&open(&path));
         std::fs::remove_file(&path).ok();
         assert!(
             matches!(history, Err(SignatureError::BadSignature("v3 signer"))),
@@ -1088,7 +1092,7 @@ mod tests {
         };
         let mut head = vec![0; 4 * 1024 * 1024];
         File::open(&apks[0])
-            .and_then(|mut file| file.read_exact(&mut head))
+            .and_then(|file| file.read_exact_at(&mut head, 0))
             .expect("read the start of the official APK");
         let result = verify_bytes("truncated-official", &head);
         assert!(
@@ -1121,13 +1125,6 @@ mod tests {
             matches!(result, Err(SignatureError::MissingV2Signature)),
             "got {result:?}"
         );
-
-        let missing = temp_path("missing");
-        std::fs::remove_file(&missing).ok();
-        assert!(matches!(
-            verify_roblox_signature(&missing),
-            Err(SignatureError::Io(_))
-        ));
     }
 
     #[test]
