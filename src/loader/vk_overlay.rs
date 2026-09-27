@@ -699,10 +699,18 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
     let host: vk::PFN_vkCreateSwapchainKHR =
         unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateSwapchainKHR>(addr) };
 
+    let Some(requested) = (unsafe { p_create_info.as_ref() }) else {
+        let _swapchain = swapchain_lock();
+        return unsafe { host(device, p_create_info, p_allocator, p_swapchain) };
+    };
+    let info = match host_present_mode(requested) {
+        Ok(present_mode) => requested.present_mode(present_mode),
+        Err(r) => return r,
+    };
+
     let _swapchain = swapchain_lock();
-    let r = unsafe { host(device, p_create_info, p_allocator, p_swapchain) };
-    if r == vk::Result::SUCCESS && !p_create_info.is_null() && !p_swapchain.is_null() {
-        let info = unsafe { &*p_create_info };
+    let r = unsafe { host(device, &info, p_allocator, p_swapchain) };
+    if r == vk::Result::SUCCESS && !p_swapchain.is_null() {
         let swapchain = unsafe { *p_swapchain };
         if let Ok(mut st) = STATE.lock() {
             st.swapchain = swapchain.as_raw();
@@ -715,10 +723,25 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
             format = info.image_format.as_raw(),
             width = info.image_extent.width,
             height = info.image_extent.height,
+            requested_present_mode = ?requested.present_mode,
+            present_mode = ?info.present_mode,
             "vk-overlay: captured engine swapchain"
         );
     }
     r
+}
+
+fn host_present_mode(
+    info: &vk::SwapchainCreateInfoKHR<'_>,
+) -> Result<vk::PresentModeKHR, vk::Result> {
+    match PHYSICAL_DEVICE.load(Ordering::Relaxed) {
+        0 => Ok(info.present_mode),
+        physical_device => super::vulkan_wsi::swapchain_present_mode(
+            vk::PhysicalDevice::from_raw(physical_device),
+            info.surface,
+            info.present_mode,
+        ),
+    }
 }
 
 unsafe extern "system" fn eclipse_vk_destroy_swapchain_khr(
@@ -3619,6 +3642,8 @@ mod tests {
     static STUB_DESTROYED: AtomicU64 = AtomicU64::new(0);
     static STUB_SAW_SWAPCHAIN_LOCK: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static STUB_CREATED_PRESENT_MODE: AtomicU32 = AtomicU32::new(u32::MAX);
+    static STUB_CREATED_WIDTH: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "system" fn stub_function() {}
 
@@ -3640,11 +3665,14 @@ mod tests {
 
     unsafe extern "system" fn stub_create_swapchain(
         _device: vk::Device,
-        _info: *const vk::SwapchainCreateInfoKHR<'_>,
+        info: *const vk::SwapchainCreateInfoKHR<'_>,
         _allocator: *const vk::AllocationCallbacks<'_>,
         swapchain: *mut vk::SwapchainKHR,
     ) -> vk::Result {
         STUB_SAW_SWAPCHAIN_LOCK.store(SWAPCHAIN_LOCK.try_lock().is_err(), Ordering::SeqCst);
+        let info = unsafe { &*info };
+        STUB_CREATED_PRESENT_MODE.store(info.present_mode.as_raw() as u32, Ordering::SeqCst);
+        STUB_CREATED_WIDTH.store(info.image_extent.width, Ordering::SeqCst);
         unsafe { *swapchain = vk::SwapchainKHR::from_raw(0xB) };
         vk::Result::SUCCESS
     }
@@ -3737,10 +3765,12 @@ mod tests {
         let saved =
             HOST_CREATE_SWAPCHAIN.swap(stub_create_swapchain as *const () as u64, Ordering::SeqCst);
         STUB_SAW_SWAPCHAIN_LOCK.store(false, Ordering::SeqCst);
-        let info = vk::SwapchainCreateInfoKHR::default().image_extent(vk::Extent2D {
-            width: 640,
-            height: 480,
-        });
+        let info = vk::SwapchainCreateInfoKHR::default()
+            .image_extent(vk::Extent2D {
+                width: 640,
+                height: 480,
+            })
+            .present_mode(vk::PresentModeKHR::FIFO_RELAXED);
         let mut swapchain = vk::SwapchainKHR::null();
         let created = unsafe {
             eclipse_vk_create_swapchain_khr(
@@ -3752,12 +3782,21 @@ mod tests {
         };
         let tracked = state_swapchain();
         let locked = STUB_SAW_SWAPCHAIN_LOCK.load(Ordering::SeqCst);
+        let forwarded = (
+            STUB_CREATED_PRESENT_MODE.load(Ordering::SeqCst),
+            STUB_CREATED_WIDTH.load(Ordering::SeqCst),
+        );
 
         set_state(0, Vec::new());
         HOST_CREATE_SWAPCHAIN.store(saved, Ordering::SeqCst);
 
         assert_eq!(created, vk::Result::SUCCESS);
         assert_eq!(tracked, (0xB, 0));
+        assert_eq!(
+            forwarded,
+            (vk::PresentModeKHR::FIFO_RELAXED.as_raw() as u32, 640),
+            "the host receives the engine's swapchain request"
+        );
         assert!(
             locked,
             "retiring oldSwapchain is serialized with the WebView presenter"
