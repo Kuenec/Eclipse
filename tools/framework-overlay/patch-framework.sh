@@ -548,10 +548,34 @@ grep -qF 'setImportantForAutofill(I)V' "$vsm" || fail "View.smali setImportantFo
 
 dsm="$work/smali/android/view/Display.smali"
 [ -f "$dsm" ] || fail "Display.smali not found after baksmali"
-n="$(grep -cF '.method public getRefreshRate()F' "$dsm")" || true
-[ "$n" = "1" ] || fail "Display.smali getRefreshRate anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-perl -0pi -e 's{(\.method public getRefreshRate\(\)F.*?\.end method\n)}{$1.method public getSupportedRefreshRates()[F\n    .locals 3\n\n    const/4 v0, 0x1\n\n    new-array v0, v0, [F\n\n    const/4 v1, 0x0\n\n    const/high16 v2, 0x42700000\n\n    aput v2, v0, v1\n\n    return-object v0\n.end method\n}s' "$dsm"
-grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali getSupportedRefreshRates insert failed (drift?)"
+! grep -qF 'refresh_rate' "$dsm" || fail "Display.smali already declares refresh-rate state — installed Display drifted; update patch-framework.sh"
+! grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali already declares getSupportedRefreshRates — installed Display drifted; update patch-framework.sh"
+n="$(grep -cF '.field public static window_width:I' "$dsm")" || true
+[ "$n" = "1" ] || fail "Display.smali window_width field anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
+UPSTREAM_DISPLAY_CLINIT=$'.method static constructor <clinit>()V\n    .registers 1\n\n    const/16 v0, 0x3c0\n\n    sput v0, Landroid/view/Display;->window_width:I\n\n    const/16 v0, 0x21c\n\n    sput v0, Landroid/view/Display;->window_height:I\n\n    return-void\n.end method\n'
+DISPLAY_CLINIT=$'.method static constructor <clinit>()V\n    .registers 3\n\n    const/16 v0, 0x3c0\n\n    sput v0, Landroid/view/Display;->window_width:I\n\n    const/16 v0, 0x21c\n\n    sput v0, Landroid/view/Display;->window_height:I\n\n    const/high16 v0, 0x42700000\n\n    sput v0, Landroid/view/Display;->refresh_rate:F\n\n    const/4 v1, 0x1\n\n    new-array v1, v1, [F\n\n    const/4 v2, 0x0\n\n    aput v0, v1, v2\n\n    sput-object v1, Landroid/view/Display;->supported_refresh_rates:[F\n\n    return-void\n.end method\n'
+n="$(ANCHOR="$UPSTREAM_DISPLAY_CLINIT" perl -0777 -ne 'print scalar(() = /\Q$ENV{ANCHOR}\E/g)' "$dsm")"
+[ "$n" = "1" ] || fail "Display.smali <clinit> is not the upstream window-size initializer (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
+ANCHOR="$UPSTREAM_DISPLAY_CLINIT" PATCHED="$DISPLAY_CLINIT" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{PATCHED}}' "$dsm"
+perl -0pi -e 's{(\.field public static window_width:I\n)}{$1\n.field public static volatile refresh_rate:F\n\n.field public static volatile supported_refresh_rates:[F\n}' "$dsm"
+UPSTREAM_GET_REFRESH_RATE_PATTERN='\.method public getRefreshRate\(\)F\n    \.registers 2\n\n    const/high16 v0, 0x42700000[^\n]*\n\n    return v0\n\.end method\n'
+n="$(PATTERN="$UPSTREAM_GET_REFRESH_RATE_PATTERN" perl -0777 -ne 'print scalar(() = /$ENV{PATTERN}/g)' "$dsm")"
+[ "$n" = "1" ] || fail "Display.smali getRefreshRate is not the upstream constant 60 Hz body (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
+DISPLAY_REFRESH_RATE_METHODS=$'.method public getRefreshRate()F\n    .registers 2\n\n    sget v0, Landroid/view/Display;->refresh_rate:F\n\n    return v0\n.end method\n\n.method public getSupportedRefreshRates()[F\n    .registers 2\n\n    sget-object v0, Landroid/view/Display;->supported_refresh_rates:[F\n\n    invoke-virtual {v0}, [F->clone()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, [F\n\n    return-object v0\n.end method\n\n.method public static setRefreshRates(F[F)V\n    .registers 2\n\n    sput-object p1, Landroid/view/Display;->supported_refresh_rates:[F\n\n    sput p0, Landroid/view/Display;->refresh_rate:F\n\n    return-void\n.end method\n'
+PATTERN="$UPSTREAM_GET_REFRESH_RATE_PATTERN" PATCHED="$DISPLAY_REFRESH_RATE_METHODS" perl -0777 -pi -e 's{$ENV{PATTERN}}{$ENV{PATCHED}}' "$dsm"
+for display_needle in \
+    '.field public static volatile refresh_rate:F' \
+    '.field public static volatile supported_refresh_rates:[F' \
+    'sput-object v1, Landroid/view/Display;->supported_refresh_rates:[F' \
+    'sget v0, Landroid/view/Display;->refresh_rate:F' \
+    '.method public getSupportedRefreshRates()[F' \
+    '.method public static setRefreshRates(F[F)V' \
+    'sput-object p1, Landroid/view/Display;->supported_refresh_rates:[F' \
+    'sput p0, Landroid/view/Display;->refresh_rate:F'
+do
+    n="$(grep -cF -- "$display_needle" "$dsm")" || true
+    [ "$n" = "1" ] || fail "Display.smali refresh-rate insert '$display_needle' found $n times (expected 1)"
+done
 
 n="$(grep -cF '.method public getWidth()I' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali getWidth anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
@@ -559,9 +583,12 @@ UPSTREAM_GET_MODE=$'.method public getMode()Landroid/view/Display$Mode;\n    .re
 UPSTREAM_GET_MODE="$UPSTREAM_GET_MODE" perl -0777 -ne 'exit((index($_, $ENV{UPSTREAM_GET_MODE}) >= 0) ? 0 : 1)' "$dsm" || fail "Display.smali getMode body is not the upstream no-arg Display\$Mode shape — installed Display drifted; update patch-framework.sh"
 UPSTREAM_GET_MODE="$UPSTREAM_GET_MODE" perl -0777 -pi -e 's{\Q$ENV{UPSTREAM_GET_MODE}\E}{}' "$dsm"
 ! grep -qF ".method public getMode()Landroid/view/Display\$Mode;" "$dsm" || fail "Display.smali upstream getMode removal failed"
-perl -0pi -e 's{(\.method public getWidth\(\)I.*?\.end method\n)}{$1.method public getMode()Landroid/view/Display\$Mode;\n    .locals 5\n\n    new-instance v0, Landroid/view/Display\$Mode;\n\n    const/4 v1, 0x0\n\n    sget v2, Landroid/view/Display;->window_width:I\n\n    sget v3, Landroid/view/Display;->window_height:I\n\n    const/high16 v4, 0x42700000\n\n    invoke-direct {v0, v1, v2, v3, v4}, Landroid/view/Display\$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n}s' "$dsm"
+perl -0pi -e 's{(\.method public getWidth\(\)I.*?\.end method\n)}{$1.method public getMode()Landroid/view/Display\$Mode;\n    .locals 5\n\n    new-instance v0, Landroid/view/Display\$Mode;\n\n    const/4 v1, 0x0\n\n    sget v2, Landroid/view/Display;->window_width:I\n\n    sget v3, Landroid/view/Display;->window_height:I\n\n    sget v4, Landroid/view/Display;->refresh_rate:F\n\n    invoke-direct {v0, v1, v2, v3, v4}, Landroid/view/Display\$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n}s' "$dsm"
 n="$(grep -cF ".method public getMode()Landroid/view/Display\$Mode;" "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali getMode insert failed (found $n declarations, expected 1)"
+grep -qF 'sget v4, Landroid/view/Display;->refresh_rate:F' "$dsm" || fail "Display.smali getMode refresh-rate read insert failed"
+n="$(grep -cF '0x42700000' "$dsm")" || true
+[ "$n" = "1" ] || fail "Display.smali holds $n 60 Hz constants (expected only the <clinit> default)"
 
 fsm="$work/smali/android/app/Fragment.smali"
 [ -f "$fsm" ] || fail "Fragment.smali not found after baksmali"
@@ -1035,6 +1062,27 @@ signing_output="$("$JAVA" -cp "$work/classes:$work/signing-probe/classes" androi
 [ "$signing_output" = 'signing-certificates-ok' ] \
     || fail "signing-certificate regression probe returned '$signing_output'"
 
+display_probe="$here/tests/DisplayRefreshRateProbe.java"
+[ -f "$display_probe" ] || fail "display refresh-rate regression probe missing at $display_probe"
+mkdir -p "$work/display-probe/classes" "$work/display-probe/cache" "$work/display-probe/data"
+"$JAVAC" "${JAVAC_8_FLAGS[@]}" -Xlint:all -Werror -d "$work/display-probe/classes" "$display_probe"
+"$DX" --dex --output="$work/display-probe/probe.jar" "$work/display-probe/classes"
+display_boot_class_path="$boot_class_path:$work/jar/api-impl.jar:$work/display-probe/probe.jar"
+display_boot_class_path_locations="$boot_class_path_locations:/system/framework/api-impl.jar:/system/framework/probe.jar"
+display_output="$(env \
+    ANDROID_DATA="$work/display-probe/data" \
+    XDG_CACHE_HOME="$work/display-probe/cache" \
+    BOOTCLASSPATH="$display_boot_class_path" \
+    "$DALVIKVM" \
+    -Ximage:"$work/art/oat/boot.art" \
+    -Xbootclasspath:"$display_boot_class_path" \
+    -Xbootclasspath-locations:"$display_boot_class_path_locations" \
+    -Ximage-compiler-option --no-generate-debug-info \
+    -Ximage-compiler-option --no-generate-mini-debug-info \
+    DisplayRefreshRateProbe)"
+[ "$display_output" = 'display-refresh-rates-ok' ] \
+    || fail "display refresh-rate regression probe returned '$display_output'"
+
 mkdir -p "$OUT"
 cp "$work/jar/api-impl.jar" "$OUT/api-impl.jar"
 ln -sfn "$ORIG_FW/framework-res.apk" "$OUT/framework-res.apk"
@@ -1053,5 +1101,5 @@ classes_dex_size="$(stat -c '%s' "$work/jar/classes.dex")"
 classes2_dex_size="$(stat -c '%s' "$work/jar/classes2.dex")"
 classes3_dex_size="$(stat -c '%s' "$work/jar/classes3.dex")"
 echo "    classes.dex (javac-patched): $classes_dex_size bytes; classes2.dex (smali Android API gaps, including LocationManager): $classes2_dex_size bytes; classes3.dex (stock): $classes3_dex_size bytes"
-echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, and wolfSSL contracts verified"
+echo "    ART boot jars: ${#ART_BOOT_JARS[@]} copied to $OUT/art; key generation, signing certificates, date-time, display refresh-rate, and wolfSSL contracts verified"
 echo "    use it with: export ECLIPSE_ANDROID_FRAMEWORK_DIR=\"$OUT\""
