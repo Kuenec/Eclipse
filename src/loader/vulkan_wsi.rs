@@ -8,6 +8,7 @@ use super::ndk_registry;
 
 static HOST_PDSC: AtomicU64 = AtomicU64::new(0);
 static HOST_PDSC2: AtomicU64 = AtomicU64::new(0);
+static HOST_PDSPM: AtomicU64 = AtomicU64::new(0);
 
 fn fix_undefined_extent(caps: &mut vk::SurfaceCapabilitiesKHR) {
     const UNDEF: u32 = u32::MAX;
@@ -64,6 +65,124 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_capa
             fix_undefined_extent(&mut (*p_caps).surface_capabilities);
         }
         r
+    }
+}
+
+fn host_surface_present_modes_fn() -> Option<vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR> {
+    match HOST_PDSPM.load(Ordering::Relaxed) {
+        0 => None,
+        host => Some(unsafe {
+            std::mem::transmute::<usize, vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
+                host as usize,
+            )
+        }),
+    }
+}
+
+unsafe fn host_present_modes(
+    query: vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+) -> Result<Vec<vk::PresentModeKHR>, vk::Result> {
+    loop {
+        let mut count = 0;
+        let r = unsafe { query(physical_device, surface, &mut count, std::ptr::null_mut()) };
+        if r != vk::Result::SUCCESS {
+            return Err(r);
+        }
+        let mut modes = vec![vk::PresentModeKHR::FIFO; count as usize];
+        match unsafe { query(physical_device, surface, &mut count, modes.as_mut_ptr()) } {
+            vk::Result::SUCCESS => {
+                modes.truncate(count as usize);
+                return Ok(modes);
+            }
+            vk::Result::INCOMPLETE => {}
+            r => return Err(r),
+        }
+    }
+}
+
+fn presents_immediate_through_mailbox(host: &[vk::PresentModeKHR]) -> bool {
+    !host.contains(&vk::PresentModeKHR::IMMEDIATE) && host.contains(&vk::PresentModeKHR::MAILBOX)
+}
+
+fn android_surface_present_modes(mut host: Vec<vk::PresentModeKHR>) -> Vec<vk::PresentModeKHR> {
+    if presents_immediate_through_mailbox(&host) {
+        host.push(vk::PresentModeKHR::IMMEDIATE);
+    }
+    host
+}
+
+fn host_swapchain_present_mode(
+    requested: vk::PresentModeKHR,
+    host: &[vk::PresentModeKHR],
+) -> vk::PresentModeKHR {
+    if requested == vk::PresentModeKHR::IMMEDIATE && presents_immediate_through_mailbox(host) {
+        vk::PresentModeKHR::MAILBOX
+    } else {
+        requested
+    }
+}
+
+unsafe fn enumerate_android_present_modes(
+    query: vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    p_present_mode_count: *mut u32,
+    p_present_modes: *mut vk::PresentModeKHR,
+) -> vk::Result {
+    let Some(count) = (unsafe { p_present_mode_count.as_mut() }) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let modes = match unsafe { host_present_modes(query, physical_device, surface) } {
+        Ok(host) => android_surface_present_modes(host),
+        Err(r) => return r,
+    };
+    if p_present_modes.is_null() {
+        *count = modes.len() as u32;
+        return vk::Result::SUCCESS;
+    }
+    let written = modes.len().min(*count as usize);
+    unsafe { std::ptr::copy_nonoverlapping(modes.as_ptr(), p_present_modes, written) };
+    *count = written as u32;
+    if written < modes.len() {
+        vk::Result::INCOMPLETE
+    } else {
+        vk::Result::SUCCESS
+    }
+}
+
+pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_present_modes_khr(
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    p_present_mode_count: *mut u32,
+    p_present_modes: *mut vk::PresentModeKHR,
+) -> vk::Result {
+    let Some(query) = host_surface_present_modes_fn() else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    unsafe {
+        enumerate_android_present_modes(
+            query,
+            physical_device,
+            surface,
+            p_present_mode_count,
+            p_present_modes,
+        )
+    }
+}
+
+pub(crate) fn swapchain_present_mode(
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    requested: vk::PresentModeKHR,
+) -> Result<vk::PresentModeKHR, vk::Result> {
+    match host_surface_present_modes_fn() {
+        Some(query) if requested == vk::PresentModeKHR::IMMEDIATE => {
+            let host = unsafe { host_present_modes(query, physical_device, surface) }?;
+            Ok(host_swapchain_present_mode(requested, &host))
+        }
+        _ => Ok(requested),
     }
 }
 
@@ -148,6 +267,16 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_instance_proc_addr(
                 vk::PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR,
                 unsafe extern "system" fn(),
             >(eclipse_vk_get_physical_device_surface_capabilities2_khr)
+        });
+    }
+    if name == c"vkGetPhysicalDeviceSurfacePresentModesKHR" {
+        let host = unsafe { host_gipa(instance, p_name) };
+        HOST_PDSPM.store(host.map_or(0, |f| f as usize as u64), Ordering::Relaxed);
+        return Some(unsafe {
+            std::mem::transmute::<
+                vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR,
+                unsafe extern "system" fn(),
+            >(eclipse_vk_get_physical_device_surface_present_modes_khr)
         });
     }
 
@@ -354,5 +483,212 @@ mod tests {
 
         let empty = unsafe { swap_android_for_wayland_surface(&[]) };
         assert!(empty.is_empty(), "empty extension list stays empty");
+    }
+
+    const HOST_WITHOUT_TEARING: [vk::PresentModeKHR; 2] =
+        [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO];
+    const HOST_WITH_TEARING: [vk::PresentModeKHR; 3] = [
+        vk::PresentModeKHR::MAILBOX,
+        vk::PresentModeKHR::FIFO,
+        vk::PresentModeKHR::IMMEDIATE,
+    ];
+
+    unsafe fn report_host_modes(
+        modes: &[vk::PresentModeKHR],
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        let count = unsafe { &mut *count };
+        if out.is_null() {
+            *count = modes.len() as u32;
+            return vk::Result::SUCCESS;
+        }
+        let written = modes.len().min(*count as usize);
+        unsafe { std::ptr::copy_nonoverlapping(modes.as_ptr(), out, written) };
+        *count = written as u32;
+        if written < modes.len() {
+            vk::Result::INCOMPLETE
+        } else {
+            vk::Result::SUCCESS
+        }
+    }
+
+    unsafe extern "system" fn host_without_tearing(
+        _: vk::PhysicalDevice,
+        _: vk::SurfaceKHR,
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        unsafe { report_host_modes(&HOST_WITHOUT_TEARING, count, out) }
+    }
+
+    unsafe extern "system" fn host_with_tearing(
+        _: vk::PhysicalDevice,
+        _: vk::SurfaceKHR,
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        unsafe { report_host_modes(&HOST_WITH_TEARING, count, out) }
+    }
+
+    unsafe extern "system" fn host_with_fifo_only(
+        _: vk::PhysicalDevice,
+        _: vk::SurfaceKHR,
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        unsafe { report_host_modes(&[vk::PresentModeKHR::FIFO], count, out) }
+    }
+
+    static HOST_GAINED_A_MODE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "system" fn host_that_gains_a_mode_after_counting(
+        _: vk::PhysicalDevice,
+        _: vk::SurfaceKHR,
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        if out.is_null() && !HOST_GAINED_A_MODE.load(Ordering::SeqCst) {
+            unsafe { *count = HOST_WITHOUT_TEARING.len() as u32 };
+            return vk::Result::SUCCESS;
+        }
+        HOST_GAINED_A_MODE.store(true, Ordering::SeqCst);
+        unsafe { report_host_modes(&HOST_WITH_TEARING, count, out) }
+    }
+
+    unsafe extern "system" fn host_with_lost_surface(
+        _: vk::PhysicalDevice,
+        _: vk::SurfaceKHR,
+        _: *mut u32,
+        _: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        vk::Result::ERROR_SURFACE_LOST_KHR
+    }
+
+    fn android_modes(
+        query: vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR,
+    ) -> Vec<vk::PresentModeKHR> {
+        let (physical_device, surface) = (vk::PhysicalDevice::null(), vk::SurfaceKHR::null());
+        let mut count = 0;
+        let r = unsafe {
+            enumerate_android_present_modes(
+                query,
+                physical_device,
+                surface,
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(r, vk::Result::SUCCESS);
+        let mut modes = vec![vk::PresentModeKHR::FIFO_RELAXED; count as usize];
+        let r = unsafe {
+            enumerate_android_present_modes(
+                query,
+                physical_device,
+                surface,
+                &mut count,
+                modes.as_mut_ptr(),
+            )
+        };
+        assert_eq!(r, vk::Result::SUCCESS);
+        modes.truncate(count as usize);
+        modes
+    }
+
+    #[test]
+    fn a_host_that_cannot_tear_presents_immediate_swapchains_through_mailbox() {
+        assert_eq!(
+            android_modes(host_without_tearing),
+            vec![
+                vk::PresentModeKHR::MAILBOX,
+                vk::PresentModeKHR::FIFO,
+                vk::PresentModeKHR::IMMEDIATE,
+            ]
+        );
+        assert_eq!(
+            host_swapchain_present_mode(vk::PresentModeKHR::IMMEDIATE, &HOST_WITHOUT_TEARING),
+            vk::PresentModeKHR::MAILBOX
+        );
+        assert_eq!(
+            host_swapchain_present_mode(vk::PresentModeKHR::FIFO, &HOST_WITHOUT_TEARING),
+            vk::PresentModeKHR::FIFO
+        );
+        assert_eq!(
+            host_swapchain_present_mode(vk::PresentModeKHR::MAILBOX, &HOST_WITHOUT_TEARING),
+            vk::PresentModeKHR::MAILBOX
+        );
+    }
+
+    #[test]
+    fn a_host_that_can_tear_keeps_its_own_present_modes() {
+        assert_eq!(android_modes(host_with_tearing), HOST_WITH_TEARING.to_vec());
+        assert_eq!(
+            host_swapchain_present_mode(vk::PresentModeKHR::IMMEDIATE, &HOST_WITH_TEARING),
+            vk::PresentModeKHR::IMMEDIATE
+        );
+        assert_eq!(
+            android_modes(host_with_fifo_only),
+            vec![vk::PresentModeKHR::FIFO]
+        );
+        assert_eq!(
+            swapchain_present_mode(
+                vk::PhysicalDevice::null(),
+                vk::SurfaceKHR::null(),
+                vk::PresentModeKHR::IMMEDIATE
+            ),
+            Ok(vk::PresentModeKHR::IMMEDIATE),
+            "without a resolved host query the engine's choice stands"
+        );
+    }
+
+    #[test]
+    fn present_mode_enumeration_follows_the_vulkan_two_call_contract() {
+        let (physical_device, surface) = (vk::PhysicalDevice::null(), vk::SurfaceKHR::null());
+        let mut count = 2;
+        let mut modes = [vk::PresentModeKHR::FIFO_RELAXED; 2];
+        let r = unsafe {
+            enumerate_android_present_modes(
+                host_without_tearing,
+                physical_device,
+                surface,
+                &mut count,
+                modes.as_mut_ptr(),
+            )
+        };
+        assert_eq!(r, vk::Result::INCOMPLETE);
+        assert_eq!(count, 2);
+        assert_eq!(modes, HOST_WITHOUT_TEARING);
+
+        let mut count = 0;
+        let lost = unsafe {
+            enumerate_android_present_modes(
+                host_with_lost_surface,
+                physical_device,
+                surface,
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(lost, vk::Result::ERROR_SURFACE_LOST_KHR);
+
+        let missing_count = unsafe {
+            enumerate_android_present_modes(
+                host_with_tearing,
+                physical_device,
+                surface,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(missing_count, vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+
+    #[test]
+    fn a_host_mode_list_that_grows_while_being_read_is_read_again() {
+        assert_eq!(
+            android_modes(host_that_gains_a_mode_after_counting),
+            HOST_WITH_TEARING.to_vec()
+        );
     }
 }
