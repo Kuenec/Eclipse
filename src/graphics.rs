@@ -163,27 +163,27 @@ fn next_wake(deadlines: impl IntoIterator<Item = Option<std::time::Instant>>) ->
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DisplayRefreshProfile {
-    current_millihertz: Option<u32>,
-    supported_millihertz: Vec<u32>,
+    current_millihertz: std::num::NonZeroU32,
+    supported_millihertz: Vec<std::num::NonZeroU32>,
 }
 
 impl DisplayRefreshProfile {
-    fn current_hz(&self) -> Option<f32> {
-        self.current_millihertz.map(|rate| rate as f32 / 1000.0)
+    fn current_hz(&self) -> f32 {
+        self.current_millihertz.get() as f32 / 1000.0
     }
 
     fn supported_hz(&self) -> Vec<f32> {
         self.supported_millihertz
             .iter()
-            .map(|rate| *rate as f32 / 1000.0)
+            .map(|rate| rate.get() as f32 / 1000.0)
             .collect()
     }
 
-    fn frame(&self) -> Option<std::time::Duration> {
+    fn frame(&self) -> std::time::Duration {
         const NANOS_PER_MILLIHERTZ_CYCLE: u64 = 1_000_000_000_000;
-        self.current_millihertz.map(|rate| {
-            std::time::Duration::from_nanos(NANOS_PER_MILLIHERTZ_CYCLE / u64::from(rate))
-        })
+        std::time::Duration::from_nanos(
+            NANOS_PER_MILLIHERTZ_CYCLE / u64::from(self.current_millihertz.get()),
+        )
     }
 }
 
@@ -192,20 +192,26 @@ fn normalize_display_refresh_profile(
     current_size: (u32, u32),
     modes: impl IntoIterator<Item = ((u32, u32), u32)>,
 ) -> Option<DisplayRefreshProfile> {
-    let current_millihertz = current_millihertz.filter(|rate| *rate > 0);
-    let mut supported_millihertz: Vec<u32> = modes
+    let current_millihertz = current_millihertz.and_then(std::num::NonZeroU32::new)?;
+    let mut supported_millihertz: Vec<std::num::NonZeroU32> = modes
         .into_iter()
-        .filter_map(|(size, rate)| (size == current_size && rate > 0).then_some(rate))
+        .filter(|(size, _)| *size == current_size)
+        .filter_map(|(_, rate)| std::num::NonZeroU32::new(rate))
+        .chain([current_millihertz])
         .collect();
-    if let Some(current) = current_millihertz {
-        supported_millihertz.push(current);
-    }
     supported_millihertz.sort_unstable();
     supported_millihertz.dedup();
-    (!supported_millihertz.is_empty()).then_some(DisplayRefreshProfile {
+    Some(DisplayRefreshProfile {
         current_millihertz,
         supported_millihertz,
     })
+}
+
+fn refresh_profile_to_publish(
+    published: Option<&DisplayRefreshProfile>,
+    observed: Option<DisplayRefreshProfile>,
+) -> Option<DisplayRefreshProfile> {
+    observed.filter(|profile| published != Some(profile))
 }
 
 fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
@@ -956,25 +962,29 @@ impl GameWindow<'_> {
     }
 
     fn publish_engine_display_refresh_rates(&mut self) {
-        let Some(profile) = self.window.as_ref().and_then(display_refresh_profile) else {
-            tracing::debug!("host monitor refresh rates unavailable; keeping Android fallback");
+        let observed = self.window.as_ref().and_then(display_refresh_profile);
+        if observed.is_none() {
+            tracing::debug!(
+                "host monitor refresh rate unavailable; keeping the last published rates"
+            );
+        }
+        let Some(profile) =
+            refresh_profile_to_publish(self.published_display_refresh_profile.as_ref(), observed)
+        else {
             return;
         };
-        if self.published_display_refresh_profile.as_ref() == Some(&profile) {
-            return;
-        }
         let Some(vm) = self.vm else { return };
         let supported_hz = profile.supported_hz();
-        match crate::framework::publish_engine_display_refresh_rates(
+        match crate::framework::publish_display_refresh_rates(
             vm,
             profile.current_hz(),
             &supported_hz,
         ) {
             Ok(()) => {
                 tracing::info!(
-                    current_hz = ?profile.current_hz(),
+                    current_hz = profile.current_hz(),
                     supported_hz = ?supported_hz,
-                    "published host display refresh rates to Roblox"
+                    "published host display refresh rates to Android and Roblox"
                 );
                 self.published_display_refresh_profile = Some(profile);
             }
@@ -1252,8 +1262,7 @@ impl GameWindow<'_> {
     fn display_frame(&self) -> std::time::Duration {
         self.published_display_refresh_profile
             .as_ref()
-            .and_then(DisplayRefreshProfile::frame)
-            .unwrap_or(MAIN_THREAD_RETRY_DELAY)
+            .map_or(MAIN_THREAD_RETRY_DELAY, DisplayRefreshProfile::frame)
     }
 
     fn query_engine_center(&mut self) -> bool {
@@ -5952,6 +5961,19 @@ mod tests {
         }
     }
 
+    fn monitor_profile(
+        current_millihertz: u32,
+        size: (u32, u32),
+        mode_millihertz: &[u32],
+    ) -> DisplayRefreshProfile {
+        normalize_display_refresh_profile(
+            Some(current_millihertz),
+            size,
+            mode_millihertz.iter().map(|rate| (size, *rate)),
+        )
+        .expect("a monitor with a current refresh rate has a profile")
+    }
+
     #[test]
     fn display_refresh_profile_preserves_real_high_refresh_modes() {
         let profile = normalize_display_refresh_profile(
@@ -5968,15 +5990,80 @@ mod tests {
         )
         .expect("the current display has usable rates");
 
-        assert_eq!(profile.current_millihertz, Some(143_996));
-        assert_eq!(profile.supported_millihertz, vec![60_000, 120_000, 143_996]);
-        assert_eq!(profile.current_hz(), Some(143.996));
+        assert_eq!(profile.current_hz(), 143.996);
         assert_eq!(profile.supported_hz(), vec![60.0, 120.0, 143.996]);
+    }
+
+    #[test]
+    fn refresh_profiles_report_the_current_monitor_and_all_its_rates() {
+        let sixty = monitor_profile(60_000, (1920, 1080), &[60_000]);
+        assert_eq!(sixty.current_hz(), 60.0);
+        assert_eq!(sixty.supported_hz(), vec![60.0]);
+
+        let one_forty_four = monitor_profile(144_000, (2560, 1440), &[60_000, 120_000, 144_000]);
+        assert_eq!(one_forty_four.current_hz(), 144.0);
+        assert_eq!(one_forty_four.supported_hz(), vec![60.0, 120.0, 144.0]);
+
+        let three_sixty = monitor_profile(
+            360_000,
+            (2560, 1440),
+            &[360_000, 240_000, 165_000, 144_000, 59_940],
+        );
+        assert_eq!(three_sixty.current_hz(), 360.0);
+        assert_eq!(
+            three_sixty.supported_hz(),
+            vec![59.94, 144.0, 165.0, 240.0, 360.0]
+        );
+    }
+
+    #[test]
+    fn a_variable_refresh_monitor_reports_its_mode_rate_as_the_ceiling() {
+        let profile = monitor_profile(320_000, (2560, 1440), &[]);
+
+        assert_eq!(profile.current_hz(), 320.0);
+        assert_eq!(profile.supported_hz(), vec![320.0]);
+    }
+
+    #[test]
+    fn missing_refresh_data_produces_no_profile() {
+        assert_eq!(
+            normalize_display_refresh_profile(None, (1920, 1080), [((1920, 1080), 144_000)]),
+            None
+        );
+        assert_eq!(
+            normalize_display_refresh_profile(Some(0), (1920, 1080), [((1920, 1080), 144_000)]),
+            None
+        );
         assert_eq!(
             normalize_display_refresh_profile(None, (1920, 1080), [((1280, 720), 240_000)]),
             None,
             "alternate-resolution-only modes must not fabricate current display rates"
         );
+    }
+
+    #[test]
+    fn moving_to_another_monitor_republishes_and_missing_data_keeps_the_last_rates() {
+        let fast = monitor_profile(144_000, (1920, 1080), &[60_000, 144_000]);
+        let slow = monitor_profile(60_000, (1920, 1080), &[60_000]);
+
+        assert_eq!(
+            refresh_profile_to_publish(None, Some(fast.clone())),
+            Some(fast.clone())
+        );
+        assert_eq!(
+            refresh_profile_to_publish(Some(&fast), Some(slow.clone())),
+            Some(slow.clone())
+        );
+        assert_eq!(
+            refresh_profile_to_publish(Some(&slow), Some(fast.clone())),
+            Some(fast.clone())
+        );
+        assert_eq!(
+            refresh_profile_to_publish(Some(&fast), Some(fast.clone())),
+            None
+        );
+        assert_eq!(refresh_profile_to_publish(Some(&fast), None), None);
+        assert_eq!(refresh_profile_to_publish(None, None), None);
     }
 
     #[test]
@@ -6379,20 +6466,11 @@ mod tests {
 
     #[test]
     fn a_display_frame_lasts_one_refresh_period() {
-        let profile = |current_millihertz| DisplayRefreshProfile {
-            current_millihertz,
-            supported_millihertz: vec![60_000],
-        };
+        let frame = |current_millihertz| monitor_profile(current_millihertz, (1, 1), &[]).frame();
 
-        assert_eq!(
-            profile(Some(60_000)).frame(),
-            Some(std::time::Duration::from_nanos(16_666_666))
-        );
-        assert_eq!(
-            profile(Some(143_996)).frame(),
-            Some(std::time::Duration::from_nanos(6_944_637))
-        );
-        assert_eq!(profile(None).frame(), None);
+        assert_eq!(frame(60_000), std::time::Duration::from_nanos(16_666_666));
+        assert_eq!(frame(143_996), std::time::Duration::from_nanos(6_944_637));
+        assert_eq!(frame(360_000), std::time::Duration::from_nanos(2_777_777));
     }
 
     #[test]

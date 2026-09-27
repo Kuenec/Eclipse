@@ -12274,20 +12274,11 @@ pub fn publish_window_size(vm: &Vm, width: i32, height: i32) -> Result<(), Frame
     })
 }
 
-pub fn publish_engine_display_refresh_rates(
+pub fn publish_display_refresh_rates(
     vm: &Vm,
-    current_hz: Option<f32>,
-    supported_hz: &[f32],
+    current_hz: jfloat,
+    supported_hz: &[jfloat],
 ) -> Result<(), FrameworkError> {
-    let supported_hz: Vec<jfloat> = supported_hz
-        .iter()
-        .copied()
-        .filter(|rate| rate.is_finite() && *rate > 0.0)
-        .collect();
-    if supported_hz.is_empty() {
-        return Ok(());
-    }
-    let current_hz = current_hz.filter(|rate| rate.is_finite() && *rate > 0.0);
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
@@ -12296,26 +12287,34 @@ pub fn publish_engine_display_refresh_rates(
     let java_vm = unsafe { JavaVM::from_raw(raw) };
     java_vm.attach_current_thread(|env: &mut Env| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let rates = JFloatArray::new(env, supported_hz.len())?;
+            rates.set_region(env, 0, supported_hz)?;
+            let display = checked(env, "find Display", |env| env.find_class(DISPLAY_CLASS))?;
+            checked(env, "Display.setRefreshRates", |env| {
+                env.call_static_method(
+                    &display,
+                    jni_str!("setRefreshRates"),
+                    jni_sig!("(F[F)V"),
+                    &[JValue::Float(current_hz), JValue::Object(&rates)],
+                )?
+                .v()
+            })?;
             let class = checked(env, "NativeGLInterface class for display rates", |env| {
                 env.find_class(jni_str!("com/roblox/engine/jni/NativeGLInterface"))
             })?;
-            if let Some(current_hz) = current_hz {
-                checked(
-                    env,
-                    "NativeGLInterface.nativePassCurrentDisplayRefreshRate",
-                    |env| {
-                        env.call_static_method(
-                            &class,
-                            jni_str!("nativePassCurrentDisplayRefreshRate"),
-                            jni_sig!("(F)V"),
-                            &[JValue::Float(current_hz)],
-                        )?
-                        .v()
-                    },
-                )?;
-            }
-            let rates = JFloatArray::new(env, supported_hz.len())?;
-            rates.set_region(env, 0, &supported_hz)?;
+            checked(
+                env,
+                "NativeGLInterface.nativePassCurrentDisplayRefreshRate",
+                |env| {
+                    env.call_static_method(
+                        &class,
+                        jni_str!("nativePassCurrentDisplayRefreshRate"),
+                        jni_sig!("(F)V"),
+                        &[JValue::Float(current_hz)],
+                    )?
+                    .v()
+                },
+            )?;
             checked(
                 env,
                 "NativeGLInterface.nativePassSupportedRefreshRates",
