@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use ash::vk;
+use ash::vk::Handle;
 
 use super::ndk_registry;
 
 static HOST_PDSC: AtomicU64 = AtomicU64::new(0);
 static HOST_PDSC2: AtomicU64 = AtomicU64::new(0);
 static HOST_PDSPM: AtomicU64 = AtomicU64::new(0);
+static REPORTED_PHYSICAL_DEVICE: AtomicU64 = AtomicU64::new(0);
 
 fn fix_undefined_extent(caps: &mut vk::SurfaceCapabilitiesKHR) {
     const UNDEF: u32 = u32::MAX;
@@ -161,6 +163,7 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_pres
     let Some(query) = host_surface_present_modes_fn() else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
+    REPORTED_PHYSICAL_DEVICE.store(physical_device.as_raw(), Ordering::Relaxed);
     unsafe {
         enumerate_android_present_modes(
             query,
@@ -173,17 +176,29 @@ pub(crate) unsafe extern "system" fn eclipse_vk_get_physical_device_surface_pres
 }
 
 pub(crate) fn swapchain_present_mode(
-    physical_device: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     requested: vk::PresentModeKHR,
 ) -> Result<vk::PresentModeKHR, vk::Result> {
+    if requested != vk::PresentModeKHR::IMMEDIATE {
+        return Ok(requested);
+    }
+    let reported = REPORTED_PHYSICAL_DEVICE.load(Ordering::Relaxed);
     match host_surface_present_modes_fn() {
-        Some(query) if requested == vk::PresentModeKHR::IMMEDIATE => {
+        Some(query) if reported != 0 => {
+            let physical_device = vk::PhysicalDevice::from_raw(reported);
             let host = unsafe { host_present_modes(query, physical_device, surface) }?;
             Ok(host_swapchain_present_mode(requested, &host))
         }
         _ => Ok(requested),
     }
+}
+
+#[cfg(test)]
+pub(super) fn use_host_present_modes_for_test(
+    query: Option<vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>,
+) {
+    HOST_PDSPM.store(query.map_or(0, |f| f as usize as u64), Ordering::SeqCst);
+    REPORTED_PHYSICAL_DEVICE.store(0, Ordering::SeqCst);
 }
 
 pub(crate) fn host_entry() -> Option<&'static ash::Entry> {
@@ -630,15 +645,6 @@ mod tests {
         assert_eq!(
             android_modes(host_with_fifo_only),
             vec![vk::PresentModeKHR::FIFO]
-        );
-        assert_eq!(
-            swapchain_present_mode(
-                vk::PhysicalDevice::null(),
-                vk::SurfaceKHR::null(),
-                vk::PresentModeKHR::IMMEDIATE
-            ),
-            Ok(vk::PresentModeKHR::IMMEDIATE),
-            "without a resolved host query the engine's choice stands"
         );
     }
 
