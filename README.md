@@ -154,13 +154,21 @@ This applies with the default `touch_mode` of `"off"`.
 
 | Key | Default | Effect |
 |---|---|---|
-| `fflags` | `{}` | Fast Flags for the client. Eclipse writes exactly these to the client's `ClientAppSettings.json` and adds none of its own; when this is empty, it writes no such file. |
+| `fflags` | `{}` | Fast Flags for the client. Eclipse writes these to the client's `ClientAppSettings.json` together with one default of its own, `"FFlagGameBasicSettingsFramerateCap5": "True"`, which shows the client's Maximum Frame Rate setting. A value you give that flag replaces the default, so `{"FFlagGameBasicSettingsFramerateCap5": "False"}` turns it off. |
 | `graphics_optimization_mode` | `"balanced"` | `"performance"` pins Eclipse to one logical CPU per physical core on CPUs with SMT and at least eight physical cores. `"quality"` and `"balanced"` currently behave the same. |
 | `touch_mode` | `"off"` | `"off"` delivers the mouse to the game as a desktop mouse. `"on"` and `"fake-off"` deliver clicks as touch input and keep the desktop cursor visible. `"on"` also tells the client that the device has a touchscreen and is not a PC; `"off"` and `"fake-off"` report a PC without a touchscreen. |
 | `webview_allow_unsandboxed` | `false` | Outside the Flatpak only: lets the WebView helper run without Chromium's sandbox when the host cannot provide one. The Flatpak always sandboxes it. |
 | `webview_helper_path` | `null` | Overrides the path of the `eclipse-webview` helper. It is only needed for source builds where the helper is neither next to the `eclipse` binary nor in `crates/eclipse-webview/target/`. Leave it unset in the Flatpak. |
 
 `eclipse config` also lists keys such as `use_opengl`, `enable_gamemode` and `discord_rpc_enabled`. Eclipse accepts them but does not act on them yet.
+
+### Frame rate
+
+The client's own Maximum Frame Rate setting, under Settings in the in-game menu, is the only frame-rate limit Eclipse leaves in place. It offers 60, 120, 144, 160, 165, 180, 200 and 240 FPS, and Default, which is 60 FPS in the Android client. Without Eclipse's default flag the row is hidden and the client always runs at Default. Eclipse does not pace the client's frames.
+
+The client asks the graphics driver for immediate presentation, which does not wait for the monitor's refresh. Where the driver offers it, Eclipse passes that request through unchanged. Some drivers offer immediate presentation only when the compositor supports tearing control, and otherwise offer only FIFO, which waits for every refresh and would hold the game to the monitor's refresh rate, and mailbox, which does not wait. On those systems Eclipse still offers the client immediate presentation and carries it out with mailbox: the game renders up to its limit, and at each refresh the compositor shows the newest finished frame, without tearing. A frame that a newer one replaces before the next refresh is never shown.
+
+Eclipse tells the client the refresh rate of the monitor the window is on and any other refresh rates the display server lists for that monitor at the same resolution, and updates them when the window moves to another monitor or the mode changes. Some Wayland compositors, Hyprland among them, list only the current mode, and the client then sees only the current refresh rate. When the host reports no refresh rate, the client keeps Android's default of 60 Hz, or the last rate Eclipse reported. The client uses these rates for its own performance tuning but does not limit the frame rate to them, so a limit above the monitor's refresh rate still applies. On a variable refresh rate monitor, the rate reported is the top of its range, the refresh rate of its current mode.
 
 ## Where Eclipse keeps its files
 
@@ -189,7 +197,7 @@ Run the second command only if you added the `eclipse` remote, either by keeping
 - Every APK that Eclipse installs or runs must carry a valid APK Signature Scheme v2 signature from Roblox Corporation's certificate, whose SHA-256 digest is `44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`. If the base APK also has a v3 or v3.1 signature, its key-rotation proof must start at that certificate. A file changed after signing fails the check. Eclipse checks at install time and again at every launch.
 - Eclipse does not modify or patch the client, and it does not host, mirror or redistribute it. Downloads come from APKCombo's copy of Roblox's Google Play release (or Google Play itself with `--play`) over HTTPS from an allowlisted host, and must match the size and hash that the source declares before the signature check runs.
 - Eclipse never installs an older Roblox version than the one you have.
-- Eclipse sets no Fast Flags of its own. The client's `ClientAppSettings.json` comes only from the `fflags` in your settings.
+- Eclipse sets exactly one Fast Flag of its own, `FFlagGameBasicSettingsFramerateCap5` set to `True`, which makes the client show its Maximum Frame Rate setting as Roblox already does for its Windows and Mac clients. It goes through the client's own `ClientAppSettings.json` override file, and everything else in that file comes from the `fflags` in your settings; `{"FFlagGameBasicSettingsFramerateCap5": "False"}` there replaces the default and turns the setting off.
 - When the client asks the Android package manager for its signing certificates, Eclipse reports the real certificates from the verified APK.
 - Browser launches hand only the place ID to the client.
 
@@ -198,6 +206,7 @@ Run the second command only if you added the `eclipse` remote, either by keeping
 - Start Eclipse from a terminal to see what it is doing. For more detail, run `flatpak run --env=RUST_LOG=debug io.github.kuenec.Eclipse run`.
 - If the first download fails, Eclipse prints why. Run `eclipse update` to try again, or install the files yourself with `eclipse install`.
 - A signature error means the files are not Roblox's official, unmodified release. Get a clean copy of the files and install again.
+- Eclipse hands the client its `ClientAppSettings.json` through a small library that it keeps in the app-data directory and loads into itself at every start, so that directory must allow executable files and its path must not contain a colon or semicolon. If Eclipse stops with an error about this, set `ECLIPSE_APP_DATA_DIR` to a directory that meets both.
 - To report a problem, see [Contributing](#contributing) for what to include.
 
 ## For developers
