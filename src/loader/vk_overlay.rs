@@ -703,7 +703,10 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         let _swapchain = swapchain_lock();
         return unsafe { host(device, p_create_info, p_allocator, p_swapchain) };
     };
-    let info = match host_present_mode(requested) {
+    let info = match super::vulkan_wsi::swapchain_present_mode(
+        requested.surface,
+        requested.present_mode,
+    ) {
         Ok(present_mode) => requested.present_mode(present_mode),
         Err(r) => return r,
     };
@@ -729,19 +732,6 @@ unsafe extern "system" fn eclipse_vk_create_swapchain_khr(
         );
     }
     r
-}
-
-fn host_present_mode(
-    info: &vk::SwapchainCreateInfoKHR<'_>,
-) -> Result<vk::PresentModeKHR, vk::Result> {
-    match PHYSICAL_DEVICE.load(Ordering::Relaxed) {
-        0 => Ok(info.present_mode),
-        physical_device => super::vulkan_wsi::swapchain_present_mode(
-            vk::PhysicalDevice::from_raw(physical_device),
-            info.surface,
-            info.present_mode,
-        ),
-    }
 }
 
 unsafe extern "system" fn eclipse_vk_destroy_swapchain_khr(
@@ -3800,6 +3790,141 @@ mod tests {
         assert!(
             locked,
             "retiring oldSwapchain is serialized with the WebView presenter"
+        );
+    }
+
+    static STUB_QUERIED_PHYSICAL_DEVICE: AtomicU64 = AtomicU64::new(0);
+
+    unsafe fn stub_host_present_modes(
+        physical_device: vk::PhysicalDevice,
+        modes: &[vk::PresentModeKHR],
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        STUB_QUERIED_PHYSICAL_DEVICE.store(physical_device.as_raw(), Ordering::SeqCst);
+        let count = unsafe { &mut *count };
+        if out.is_null() {
+            *count = modes.len() as u32;
+            return vk::Result::SUCCESS;
+        }
+        let written = modes.len().min(*count as usize);
+        unsafe { std::ptr::copy_nonoverlapping(modes.as_ptr(), out, written) };
+        *count = written as u32;
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn stub_host_without_tearing(
+        physical_device: vk::PhysicalDevice,
+        _surface: vk::SurfaceKHR,
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        let modes = [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO];
+        unsafe { stub_host_present_modes(physical_device, &modes, count, out) }
+    }
+
+    unsafe extern "system" fn stub_host_with_tearing(
+        physical_device: vk::PhysicalDevice,
+        _surface: vk::SurfaceKHR,
+        count: *mut u32,
+        out: *mut vk::PresentModeKHR,
+    ) -> vk::Result {
+        let modes = [
+            vk::PresentModeKHR::MAILBOX,
+            vk::PresentModeKHR::FIFO,
+            vk::PresentModeKHR::IMMEDIATE,
+        ];
+        unsafe { stub_host_present_modes(physical_device, &modes, count, out) }
+    }
+
+    fn engine_present_modes(physical_device: u64) -> Vec<vk::PresentModeKHR> {
+        let physical_device = vk::PhysicalDevice::from_raw(physical_device);
+        let query =
+            super::super::vulkan_wsi::eclipse_vk_get_physical_device_surface_present_modes_khr;
+        let mut count = 0;
+        let counted = unsafe {
+            query(
+                physical_device,
+                vk::SurfaceKHR::null(),
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(counted, vk::Result::SUCCESS);
+        let mut modes = vec![vk::PresentModeKHR::FIFO_RELAXED; count as usize];
+        let listed = unsafe {
+            query(
+                physical_device,
+                vk::SurfaceKHR::null(),
+                &mut count,
+                modes.as_mut_ptr(),
+            )
+        };
+        assert_eq!(listed, vk::Result::SUCCESS);
+        modes
+    }
+
+    fn host_swapchain_mode(requested: vk::PresentModeKHR) -> vk::PresentModeKHR {
+        STUB_CREATED_PRESENT_MODE.store(u32::MAX, Ordering::SeqCst);
+        let info = vk::SwapchainCreateInfoKHR::default().present_mode(requested);
+        let mut swapchain = vk::SwapchainKHR::null();
+        let created = unsafe {
+            eclipse_vk_create_swapchain_khr(
+                vk::Device::null(),
+                &info,
+                std::ptr::null(),
+                &mut swapchain,
+            )
+        };
+        assert_eq!(created, vk::Result::SUCCESS);
+        vk::PresentModeKHR::from_raw(STUB_CREATED_PRESENT_MODE.load(Ordering::SeqCst) as i32)
+    }
+
+    #[test]
+    fn immediate_swapchains_follow_the_host_modes_of_the_device_the_engine_asked_about() {
+        use super::super::vulkan_wsi::use_host_present_modes_for_test;
+
+        let _serial = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_create =
+            HOST_CREATE_SWAPCHAIN.swap(stub_create_swapchain as *const () as u64, Ordering::SeqCst);
+        let saved_physical = PHYSICAL_DEVICE.swap(0, Ordering::SeqCst);
+
+        use_host_present_modes_for_test(Some(stub_host_without_tearing));
+        let before_asking = host_swapchain_mode(vk::PresentModeKHR::IMMEDIATE);
+        let advertised = engine_present_modes(0x5);
+        let without_tearing = host_swapchain_mode(vk::PresentModeKHR::IMMEDIATE);
+        let queried = STUB_QUERIED_PHYSICAL_DEVICE.load(Ordering::SeqCst);
+        let fifo = host_swapchain_mode(vk::PresentModeKHR::FIFO);
+
+        use_host_present_modes_for_test(Some(stub_host_with_tearing));
+        engine_present_modes(0x6);
+        let with_tearing = host_swapchain_mode(vk::PresentModeKHR::IMMEDIATE);
+
+        use_host_present_modes_for_test(None);
+        set_state(0, Vec::new());
+        PHYSICAL_DEVICE.store(saved_physical, Ordering::SeqCst);
+        HOST_CREATE_SWAPCHAIN.store(saved_create, Ordering::SeqCst);
+
+        assert_eq!(
+            before_asking,
+            vk::PresentModeKHR::IMMEDIATE,
+            "a mode the engine did not learn from Eclipse reaches the host unchanged"
+        );
+        assert!(advertised.contains(&vk::PresentModeKHR::IMMEDIATE));
+        assert_eq!(
+            without_tearing,
+            vk::PresentModeKHR::MAILBOX,
+            "the immediate mode Eclipse advertised is carried out through mailbox"
+        );
+        assert_eq!(
+            queried, 0x5,
+            "the host is asked about the device the engine asked about, not the overlay's device"
+        );
+        assert_eq!(fifo, vk::PresentModeKHR::FIFO);
+        assert_eq!(
+            with_tearing,
+            vk::PresentModeKHR::IMMEDIATE,
+            "a host that can tear receives the engine's immediate mode"
         );
     }
 
