@@ -6017,7 +6017,7 @@ mod tests {
     }
 
     #[test]
-    fn a_variable_refresh_monitor_reports_its_mode_rate_as_the_ceiling() {
+    fn a_monitor_without_a_mode_list_reports_its_current_rate() {
         let profile = monitor_profile(320_000, (2560, 1440), &[]);
 
         assert_eq!(profile.current_hz(), 320.0);
