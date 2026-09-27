@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BRIDGE_INACTIVE: &str = "client-settings bridge did not load";
-const PRELOAD_SEPARATOR: &str = "contains a space or colon";
+const SEARCH_PATH_SEPARATOR: &str = "contains a colon or semicolon";
 
 fn sandbox(tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("eclipse-settings-bridge-{tag}"));
@@ -37,15 +37,15 @@ fn run_missing_apk(root: &Path, app_data: &Path, redirect_active: bool) -> Outpu
 }
 
 #[test]
-fn app_data_paths_that_ld_preload_would_split_are_refused_before_restarting() {
-    for (tag, directory) in [("space", "My Games"), ("colon", "games:eclipse")] {
+fn app_data_paths_that_ld_library_path_would_split_are_refused_before_restarting() {
+    for (tag, directory) in [("colon", "games:eclipse"), ("semicolon", "games;eclipse")] {
         let root = sandbox(tag);
         let output = run_missing_apk(&root, &root.join(directory).join("eclipse"), false);
         let stderr = String::from_utf8_lossy(&output.stderr);
         std::fs::remove_dir_all(&root).ok();
 
         assert!(!output.status.success(), "{tag}: {stderr}");
-        assert!(stderr.contains(PRELOAD_SEPARATOR), "{tag}: {stderr}");
+        assert!(stderr.contains(SEARCH_PATH_SEPARATOR), "{tag}: {stderr}");
         assert!(stderr.contains("ECLIPSE_APP_DATA_DIR"), "{tag}: {stderr}");
         assert!(!stderr.contains("eclipse ART startup"), "{tag}: {stderr}");
     }
@@ -64,15 +64,23 @@ fn a_restarted_run_without_the_bridge_stops_before_starting_android() {
 }
 
 #[test]
-fn a_plain_app_data_path_loads_the_bridge_and_continues() {
-    let root = sandbox("plain");
-    let output = run_missing_apk(&root, &root.join("app-data"), false);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    std::fs::remove_dir_all(&root).ok();
+fn plain_and_spaced_app_data_paths_load_the_bridge_and_continue() {
+    for (tag, directory) in [("plain", "app-data"), ("space", "My Games")] {
+        let root = sandbox(tag);
+        let output = run_missing_apk(&root, &root.join(directory).join("eclipse"), false);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        std::fs::remove_dir_all(&root).ok();
 
-    assert!(stdout.contains("Roblox Fast Flags staged at"), "{stdout}");
-    assert!(!stderr.contains(PRELOAD_SEPARATOR), "{stderr}");
-    assert!(!stderr.contains(BRIDGE_INACTIVE), "{stderr}");
-    assert!(!stderr.contains("Android settings setup"), "{stderr}");
+        assert!(
+            stdout.contains("Roblox Fast Flags staged at"),
+            "{tag}: {stdout}"
+        );
+        assert!(!stderr.contains(SEARCH_PATH_SEPARATOR), "{tag}: {stderr}");
+        assert!(!stderr.contains(BRIDGE_INACTIVE), "{tag}: {stderr}");
+        assert!(
+            !stderr.contains("Android settings setup"),
+            "{tag}: {stderr}"
+        );
+    }
 }

@@ -2666,6 +2666,13 @@ mod tests {
         );
         assert_eq!(
             helper_ld_preload(OsStr::new(
+                "libeclipse_client_settings_path.so:/usr/lib/libgamemodeauto.so.0"
+            )),
+            Some(OsString::from("/usr/lib/libgamemodeauto.so.0")),
+            "the shim preloaded by name through LD_LIBRARY_PATH is Eclipse's too"
+        );
+        assert_eq!(
+            helper_ld_preload(OsStr::new(
                 "/a/libone.so /data/runtime/libeclipse_client_settings_path.so::/b/libtwo.so"
             )),
             Some(OsString::from("/a/libone.so:/b/libtwo.so"))

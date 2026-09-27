@@ -6,6 +6,7 @@ mod desktop_integration;
 const CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV: &str = "ECLIPSE_CLIENT_SETTINGS_REDIRECT_ACTIVE";
 const CLIENT_SETTINGS_PATH_ENV: &str = "ECLIPSE_CLIENT_APP_SETTINGS_PATH";
 const ANDROID_CLIENT_SETTINGS_PATH: &str = "/data/local/tmp/ClientAppSettings.json";
+const CLIENT_SETTINGS_PATH_SHIM_NAME: &str = "libeclipse_client_settings_path.so";
 const CLIENT_SETTINGS_PATH_SHIM: &[u8] =
     include_bytes!(env!("ECLIPSE_CLIENT_SETTINGS_PATH_SHIM_SO"));
 
@@ -288,12 +289,12 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
     std::fs::write(&temporary_path, json)?;
     std::fs::rename(&temporary_path, &settings_path)?;
 
-    let shim_path = runtime_dir.join("libeclipse_client_settings_path.so");
+    let shim_path = runtime_dir.join(CLIENT_SETTINGS_PATH_SHIM_NAME);
     let shim_is_current =
         std::fs::read(&shim_path).is_ok_and(|bytes| bytes.as_slice() == CLIENT_SETTINGS_PATH_SHIM);
     if !shim_is_current {
         let temporary_shim = runtime_dir.join(format!(
-            ".libeclipse_client_settings_path.so.{}.tmp",
+            ".{CLIENT_SETTINGS_PATH_SHIM_NAME}.{}.tmp",
             std::process::id()
         ));
         std::fs::write(&temporary_shim, CLIENT_SETTINGS_PATH_SHIM)?;
@@ -301,17 +302,18 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
     }
 
     let settings_path = settings_path.canonicalize()?;
-    let shim_path = shim_path.canonicalize()?;
-    if shim_path
+    let runtime_dir = runtime_dir.canonicalize()?;
+    if runtime_dir
         .as_os_str()
         .as_bytes()
         .iter()
-        .any(|byte| matches!(byte, b' ' | b':'))
+        .any(|byte| matches!(byte, b':' | b';'))
     {
         return Err(format!(
-            "the Android client-settings bridge {} contains a space or colon, which LD_PRELOAD \
-             cannot carry; set ECLIPSE_APP_DATA_DIR to a directory without spaces or colons",
-            shim_path.display()
+            "the Android client-settings bridge directory {} contains a colon or semicolon, \
+             which LD_LIBRARY_PATH cannot carry; set ECLIPSE_APP_DATA_DIR to a directory \
+             without colons or semicolons",
+            runtime_dir.display()
         )
         .into());
     }
@@ -321,15 +323,6 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
         settings_path.display()
     );
 
-    let preload = match std::env::var_os("LD_PRELOAD") {
-        Some(existing) if !existing.is_empty() => {
-            let mut value = shim_path.as_os_str().to_os_string();
-            value.push(":");
-            value.push(existing);
-            value
-        }
-        _ => shim_path.as_os_str().to_os_string(),
-    };
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
@@ -338,12 +331,34 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
         .args(args)
         .env(CLIENT_SETTINGS_REDIRECT_ACTIVE_ENV, "1")
         .env(CLIENT_SETTINGS_PATH_ENV, &settings_path)
-        .env("LD_PRELOAD", preload)
+        .env(
+            "LD_LIBRARY_PATH",
+            prepend_search_list_entry(runtime_dir.as_os_str(), std::env::var_os("LD_LIBRARY_PATH")),
+        )
+        .env(
+            "LD_PRELOAD",
+            prepend_search_list_entry(
+                std::ffi::OsStr::new(CLIENT_SETTINGS_PATH_SHIM_NAME),
+                std::env::var_os("LD_PRELOAD"),
+            ),
+        )
         .exec();
     Err(
         format!("could not restart Eclipse with the Android client-settings path bridge: {error}")
             .into(),
     )
+}
+
+fn prepend_search_list_entry(
+    entry: &std::ffi::OsStr,
+    inherited: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    let mut value = entry.to_os_string();
+    if let Some(inherited) = inherited.filter(|inherited| !inherited.is_empty()) {
+        value.push(":");
+        value.push(inherited);
+    }
+    value
 }
 
 fn finish_android_process(status: libc::c_int) -> ! {
@@ -1462,13 +1477,16 @@ mod tests {
         }
 
         let dir = std::env::temp_dir().join(format!(
-            "eclipse-settings-shim-{:?}",
+            "eclipse settings shim-{:?}",
             std::thread::current().id()
         ));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let shim = dir.join("libeclipse_client_settings_path.so");
-        std::fs::write(&shim, super::CLIENT_SETTINGS_PATH_SHIM).unwrap();
+        std::fs::write(
+            dir.join(super::CLIENT_SETTINGS_PATH_SHIM_NAME),
+            super::CLIENT_SETTINGS_PATH_SHIM,
+        )
+        .unwrap();
         let settings = dir.join("ClientAppSettings.json");
         std::fs::write(&settings, SETTINGS).unwrap();
 
@@ -1482,11 +1500,14 @@ mod tests {
         .env(CHILD, "1")
         .env(super::CLIENT_SETTINGS_PATH_ENV, &settings)
         .env(
+            "LD_LIBRARY_PATH",
+            super::prepend_search_list_entry(dir.as_os_str(), std::env::var_os("LD_LIBRARY_PATH")),
+        )
+        .env(
             "LD_PRELOAD",
-            format!(
-                "{}:{}",
-                shim.display(),
-                env!("ECLIPSE_NEXT_INTERPOSER_FIXTURE_SO")
+            super::prepend_search_list_entry(
+                std::ffi::OsStr::new(super::CLIENT_SETTINGS_PATH_SHIM_NAME),
+                Some(env!("ECLIPSE_NEXT_INTERPOSER_FIXTURE_SO").into()),
             ),
         )
         .output()
