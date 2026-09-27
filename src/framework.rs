@@ -8730,6 +8730,15 @@ fn roblox_code_font() -> Option<&'static RasterFont> {
     .as_ref()
 }
 
+pub(crate) fn text_line_origin(x_alignment: i32, width: f32, line_width: f32) -> f32 {
+    let spare = (width - line_width).max(0.0);
+    match x_alignment {
+        1 => spare,
+        2 => spare * 0.5,
+        _ => 0.0,
+    }
+}
+
 fn code_text_cursor_from_pointer(
     text: &str,
     session: TextboxSession,
@@ -8769,11 +8778,7 @@ fn code_text_cursor_from_pointer(
             .chars()
             .map(|character| scaled.advance(character))
             .sum::<f32>();
-        let line_origin = match session.x_alignment {
-            1 => (width as f32 - line_width).max(0.0),
-            2 => ((width as f32 - line_width) * 0.5).max(0.0),
-            _ => 0.0,
-        };
+        let line_origin = text_line_origin(session.x_alignment, width as f32, line_width);
         let requested_x = (relative_x - line_origin).max(0.0);
         let mut used_width = 0.0;
         let mut line_utf16 = 0usize;

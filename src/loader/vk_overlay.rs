@@ -80,7 +80,6 @@ fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-const OVERLAY_TEXT_PADDING: f32 = 10.0;
 const MAX_OVERLAY_FONT_SIZE: f32 = 100.0;
 
 fn overlay_font_size(font_size: f32) -> f32 {
@@ -171,17 +170,17 @@ fn lay_out_text(
     let scale = layout.scale;
     let ascent = scaled.ascent();
     let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
-    let available_width = (w as f32 - OVERLAY_TEXT_PADDING * 2.0).max(1.0);
-    let available_height = (h as f32 - OVERLAY_TEXT_PADDING * 2.0).max(line_height);
+    let available_width = (w as f32).max(1.0);
+    let available_height = (h as f32).max(line_height);
     let maximum_lines = if layout.multiline {
         (available_height / line_height).floor().max(1.0) as usize
     } else {
         1
     };
     let first_baseline = if layout.multiline || layout.y_alignment == 0 {
-        OVERLAY_TEXT_PADDING + ascent
+        ascent
     } else if layout.y_alignment == 2 {
-        h as f32 - OVERLAY_TEXT_PADDING - scale + ascent
+        h as f32 - scale + ascent
     } else {
         (h as f32 - scale) * 0.5 + ascent
     };
@@ -197,11 +196,8 @@ fn lay_out_text(
             .chars()
             .map(|character| scaled.advance(character))
             .sum::<f32>();
-        let mut pen_x = match layout.x_alignment {
-            1 => (w as f32 - OVERLAY_TEXT_PADDING - line_width).max(OVERLAY_TEXT_PADDING),
-            2 => ((w as f32 - line_width) * 0.5).max(OVERLAY_TEXT_PADDING),
-            _ => OVERLAY_TEXT_PADDING,
-        };
+        let mut pen_x =
+            crate::framework::text_line_origin(layout.x_alignment, w as f32, line_width);
         let baseline_y = first_baseline + line_index as f32 * line_height;
 
         for character in line.chars() {
@@ -250,17 +246,18 @@ fn lay_out_text(
         if clipped_line {
             break;
         }
+        if consumed == remaining.len() && remaining.ends_with('\n') {
+            let line_start = crate::framework::text_line_origin(layout.x_alignment, w as f32, 0.0);
+            caret = Some((line_start, baseline_y + line_height));
+            complete = line_index + 1 < maximum_lines;
+            break;
+        }
         if consumed == remaining.len() {
             caret = Some((pen_x, baseline_y));
             complete = true;
             break;
         }
         remaining = &remaining[consumed..];
-        if remaining.is_empty() {
-            caret = Some((OVERLAY_TEXT_PADDING, baseline_y + line_height));
-            complete = line_index + 1 < maximum_lines;
-            break;
-        }
     }
 
     caret.filter(|_| complete)
@@ -270,7 +267,7 @@ fn paint_caret(caret: (f32, f32), layout: &TextLayout, mut paint: impl FnMut(usi
     let (pen_x, baseline_y) = caret;
     let (w, h) = (layout.width, layout.height);
     let buf_len = layout.buffer_len();
-    let cx = pen_x as i32 + 1;
+    let cx = (pen_x as i32 + 1).min(w as i32 - 2).max(0);
     let y0 = (baseline_y - layout.scale * 0.72).max(0.0) as u32;
     let y1 = ((baseline_y + layout.scale * 0.08) as u32).min(h);
     for cy in y0..y1 {
@@ -3425,6 +3422,171 @@ mod tests {
             other_secret.glyphs, secret_ops,
             "masked text of the same length renders the same bullets"
         );
+    }
+
+    const LINE: u32 = 24;
+
+    fn aligned_glyphs(
+        text: &str,
+        x_alignment: i32,
+        y_alignment: i32,
+        width: u32,
+        height: u32,
+    ) -> Vec<(usize, f32)> {
+        let mut overlay = text_overlay(text, 0);
+        overlay.font_size = LINE as f32;
+        overlay.text_wrapped = true;
+        overlay.x_alignment = x_alignment;
+        overlay.y_alignment = y_alignment;
+        TextLayerCache::default()
+            .layer(&overlay, width, height)
+            .expect("layer")
+            .glyphs
+            .clone()
+    }
+
+    fn ink_rows(glyphs: &[(usize, f32)], width: u32) -> (usize, usize) {
+        let rows = glyphs.iter().map(|&(index, _)| index / 4 / width as usize);
+        (rows.clone().min().expect("ink"), rows.max().expect("ink"))
+    }
+
+    #[test]
+    fn vertical_alignment_puts_the_line_box_on_the_field_edge_without_clipping() {
+        if system_font().is_none() {
+            return;
+        }
+        let (width, line) = (320u32, LINE);
+        let top = aligned_glyphs("hihihi", 0, 0, width, line);
+        let unclipped = aligned_glyphs("hihihi", 0, 0, width, line * 3);
+        let (first, last) = ink_rows(&unclipped, width);
+        assert!(
+            top == unclipped,
+            "a top-aligned line in a {line}px field needs ink rows {first}..={last}"
+        );
+        let ink_centre = (first + last + 1) as f32 * 0.5;
+        assert!(
+            (ink_centre - line as f32 * 0.5).abs() <= line as f32 * 0.15,
+            "ink rows {first}..={last} sit off the centre of a {line}px field"
+        );
+        let shifted = |rows: u32| -> Vec<(usize, f32)> {
+            top.iter()
+                .map(|&(index, coverage)| (index + (rows * width * 4) as usize, coverage))
+                .collect()
+        };
+        for (y_alignment, rows) in [(1, line), (2, line * 2)] {
+            let aligned = aligned_glyphs("hihihi", 0, y_alignment, width, line * 3);
+            let (first, last) = ink_rows(&aligned, width);
+            assert!(
+                aligned == shifted(rows),
+                "y alignment {y_alignment} draws ink rows {first}..={last}, not the top line \
+                 moved down {rows} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_alignment_puts_text_on_the_field_edge() {
+        if system_font().is_none() {
+            return;
+        }
+        let (width, height) = (320u32, LINE);
+        let columns = |x_alignment: i32| -> Vec<u32> {
+            aligned_glyphs("hihihi", x_alignment, 1, width, height)
+                .iter()
+                .map(|&(index, _)| (index / 4) as u32 % width)
+                .collect()
+        };
+        let bearing = LINE as f32 * 0.2;
+        let left = *columns(0).iter().min().expect("ink");
+        assert!(
+            (left as f32) < bearing,
+            "left-aligned ink starts at column {left}"
+        );
+        let right = *columns(1).iter().max().expect("ink");
+        assert!(
+            ((width - 1 - right) as f32) < bearing,
+            "right-aligned ink ends at column {right} of {width}"
+        );
+    }
+
+    fn caret_pixels(
+        text: &str,
+        multiline: bool,
+        x_alignment: i32,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<(u32, u32)>> {
+        let mut overlay = text_overlay(text, 0);
+        overlay.font_size = LINE as f32;
+        overlay.multiline = multiline;
+        overlay.x_alignment = x_alignment;
+        overlay.y_alignment = 0;
+        TextLayerCache::default()
+            .layer(&overlay, width, height)
+            .expect("layer")
+            .caret
+            .as_ref()
+            .map(|caret| {
+                caret
+                    .iter()
+                    .map(|&index| ((index / 4) as u32 % width, (index / 4) as u32 / width))
+                    .collect()
+            })
+    }
+
+    #[test]
+    fn caret_stays_inside_the_field_on_its_right_edge() {
+        if system_font().is_none() {
+            return;
+        }
+        let width = 320u32;
+        let caret = caret_pixels("hihihi", false, 1, width, LINE * 2).expect("caret");
+        assert!(!caret.is_empty(), "the caret is clipped away");
+        for (column, _) in caret {
+            assert!(
+                column >= width - 2,
+                "caret column {column} is not on the right edge"
+            );
+        }
+    }
+
+    #[test]
+    fn caret_after_a_trailing_newline_starts_the_next_line() {
+        if system_font().is_none() {
+            return;
+        }
+        let width = 320u32;
+        for (x_alignment, edge) in [
+            (0, 1..3),
+            (1, width - 2..width),
+            (2, width / 2 + 1..width / 2 + 3),
+        ] {
+            let first_line = caret_pixels("hihihi", true, x_alignment, width, LINE * 3)
+                .expect("caret after the first line");
+            let first_line_bottom = first_line
+                .iter()
+                .map(|&(_, row)| row)
+                .max()
+                .expect("first-line caret pixels");
+            let next_line = caret_pixels("hihihi\n", true, x_alignment, width, LINE * 3)
+                .expect("caret after the trailing newline");
+            assert!(!next_line.is_empty(), "the next-line caret is clipped away");
+            for (column, row) in next_line {
+                assert!(
+                    row > first_line_bottom,
+                    "x alignment {x_alignment} caret row {row} is not below the first line"
+                );
+                assert!(
+                    edge.contains(&column),
+                    "x alignment {x_alignment} caret column {column} is not in {edge:?}"
+                );
+            }
+            assert_eq!(
+                caret_pixels("hihihi\n", true, x_alignment, width, LINE),
+                None,
+                "a one-line field has no room for the caret on the next line"
+            );
+        }
     }
 
     #[test]
