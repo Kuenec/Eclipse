@@ -4,9 +4,15 @@ use std::process::{Command, Output};
 const BRIDGE_INACTIVE: &str = "client-settings bridge did not load";
 const SEARCH_PATH_SEPARATOR: &str = "contains a colon or semicolon";
 
-fn sandbox(tag: &str) -> PathBuf {
+fn sandbox_without_config(tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("eclipse-settings-bridge-{tag}"));
     std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).expect("create the sandbox directory");
+    root
+}
+
+fn sandbox(tag: &str) -> PathBuf {
+    let root = sandbox_without_config(tag);
     let config = root.join("config").join("eclipse");
     std::fs::create_dir_all(&config).expect("create the sandbox config directory");
     std::fs::write(
@@ -83,4 +89,26 @@ fn plain_and_spaced_app_data_paths_load_the_bridge_and_continue() {
             "{tag}: {stderr}"
         );
     }
+}
+
+#[test]
+fn without_user_fflags_a_spaced_app_data_path_stages_the_default_flag_and_continues() {
+    let root = sandbox_without_config("defaults");
+    let app_data = root.join("My Games").join("eclipse");
+    let output = run_missing_apk(&root, &app_data, false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let staged = std::fs::read(app_data.join("runtime").join("ClientAppSettings.json"));
+    std::fs::remove_dir_all(&root).ok();
+
+    assert!(stdout.contains("Roblox Fast Flags staged at"), "{stdout}");
+    assert!(!stderr.contains(BRIDGE_INACTIVE), "{stderr}");
+    assert!(!stderr.contains("Android settings setup"), "{stderr}");
+    let staged: serde_json::Value =
+        serde_json::from_slice(&staged.expect("read the staged client settings"))
+            .expect("parse the staged client settings");
+    assert_eq!(
+        staged,
+        serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "True"})
+    );
 }
