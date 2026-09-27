@@ -1,6 +1,6 @@
 use std::ffi::{c_char, c_void, CString, OsStr, OsString};
 use std::fmt;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -40,23 +40,71 @@ const ART_BOOT_JARS: [&str; 10] = [
     "wolfssljni-hostdex.jar",
 ];
 
-const X86_FEATURE_TOKENS: [&str; 6] = ["ssse3", "sse4.1", "sse4.2", "avx", "avx2", "popcnt"];
+const APP_DEX_COMPILER_FILTER: &str = "verify";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostCpu {
+    ssse3: bool,
+    sse4_1: bool,
+    sse4_2: bool,
+    avx: bool,
+    avx2: bool,
+    bmi1: bool,
+    popcnt: bool,
+}
+
+impl HostCpu {
+    #[cfg(target_arch = "x86_64")]
+    fn detect() -> Self {
+        Self {
+            ssse3: is_x86_feature_detected!("ssse3"),
+            sse4_1: is_x86_feature_detected!("sse4.1"),
+            sse4_2: is_x86_feature_detected!("sse4.2"),
+            avx: is_x86_feature_detected!("avx"),
+            avx2: is_x86_feature_detected!("avx2"),
+            bmi1: is_x86_feature_detected!("bmi1"),
+            popcnt: is_x86_feature_detected!("popcnt"),
+        }
+    }
+
+    fn missing_android_x86_64_feature(self) -> Option<&'static str> {
+        [
+            ("SSSE3", self.ssse3),
+            ("SSE4.1", self.sse4_1),
+            ("SSE4.2", self.sse4_2),
+            ("POPCNT", self.popcnt),
+        ]
+        .into_iter()
+        .find_map(|(name, present)| (!present).then_some(name))
+    }
+
+    fn art_feature_string(self) -> String {
+        let features = [
+            ("ssse3", self.ssse3),
+            ("sse4.1", self.sse4_1),
+            ("sse4.2", self.sse4_2),
+            ("avx", self.avx),
+            ("avx2", self.avx2 && self.bmi1),
+            ("popcnt", self.popcnt),
+        ];
+        let mut out = String::with_capacity(64);
+        for (token, present) in features {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            if !present {
+                out.push('-');
+            }
+            out.push_str(token);
+        }
+        out
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn instruction_set_features() -> String {
-    let detected = |token: &str| -> bool {
-        match token {
-            "ssse3" => is_x86_feature_detected!("ssse3"),
-            "sse4.1" => is_x86_feature_detected!("sse4.1"),
-            "sse4.2" => is_x86_feature_detected!("sse4.2"),
-            "avx" => is_x86_feature_detected!("avx"),
-            "avx2" => is_x86_feature_detected!("avx2"),
-            "popcnt" => is_x86_feature_detected!("popcnt"),
-            _ => false,
-        }
-    };
-    format_feature_string(detected)
+    HostCpu::detect().art_feature_string()
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -64,20 +112,6 @@ compile_error!(
     "Eclipse's runtime targets the Android x86-64 Roblox engine; \
      instruction_set_features() needs an x86_64 host (no x86 ISA to detect on this arch)"
 );
-
-fn format_feature_string(present: impl Fn(&str) -> bool) -> String {
-    let mut out = String::with_capacity(64);
-    for token in X86_FEATURE_TOKENS {
-        if !out.is_empty() {
-            out.push(',');
-        }
-        if !present(token) {
-            out.push('-');
-        }
-        out.push_str(token);
-    }
-    out
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphicsBackend {
@@ -139,25 +173,24 @@ impl BootPlan {
 
     #[must_use]
     pub fn vm_options(&self) -> Vec<String> {
-        let mut opts = Vec::with_capacity(5);
+        let mut opts = Vec::with_capacity(9);
         opts.push(format!("-Xmx{}m", self.heap_mib));
         opts.push(format!("-XX:HeapGrowthLimit={}m", self.heap_mib));
         if self.disable_hspace_compact {
             opts.push("-XX:DisableHSpaceCompactForOOM".to_owned());
         }
+        opts.push("-Xcompiler-option".to_owned());
+        opts.push(format!("--compiler-filter={APP_DEX_COMPILER_FILTER}"));
+        opts.push("-Xcompiler-option".to_owned());
+        opts.push(format!(
+            "--instruction-set-features={}",
+            self.instruction_set_features
+        ));
 
         opts.push(format!("-DBuild.VERSION.SDK_INT={}", self.sdk_int.min(28)));
 
         opts.push(format!("-Declipse.touch_mode={}", self.touch_mode.as_str()));
         opts
-    }
-
-    #[must_use]
-    pub fn dex2oat_options(&self) -> Vec<String> {
-        vec![format!(
-            "--instruction-set-features={}",
-            self.instruction_set_features
-        )]
     }
 }
 
@@ -459,6 +492,32 @@ pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
     find_framework_in(InstallLayout::current()?)
 }
 
+#[must_use]
+pub fn dalvik_cache_dir() -> Option<PathBuf> {
+    dalvik_cache_dir_in(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+}
+
+fn dalvik_cache_dir_in(
+    xdg_cache_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    let root = match xdg_cache_home {
+        Some(cache) => PathBuf::from(cache).join(ART_SUBDIR),
+        None => PathBuf::from(home?).join(".cache").join(ART_SUBDIR),
+    };
+    Some(root.join("x86_64"))
+}
+
+#[must_use]
+pub fn dalvik_cache_stem(location: &Path) -> Option<OsString> {
+    let relative = location.as_os_str().as_bytes().strip_prefix(b"/")?;
+    let stem: Vec<u8> = relative
+        .iter()
+        .map(|&byte| if byte == b'/' { b'@' } else { byte })
+        .collect();
+    Some(OsString::from_vec(stem))
+}
+
 pub fn native_lib_cache_dir() -> Result<PathBuf, RuntimeError> {
     if let Some(dir) = env_path("ECLIPSE_NATIVE_LIB_DIR") {
         return Ok(dir);
@@ -658,6 +717,9 @@ pub fn boot(
     apk_path: Option<&Path>,
     app_lib_dir: Option<&Path>,
 ) -> Result<Vm, RuntimeError> {
+    if let Some(feature) = HostCpu::detect().missing_android_x86_64_feature() {
+        return Err(RuntimeError::CpuLacksFeature(feature));
+    }
     let layout = InstallLayout::current()?;
     let libart = libart_path(layout)?;
     let art_boot = find_art_boot_paths(layout)?;
@@ -772,6 +834,8 @@ fn make_os_option(prefix: &str, value: &OsStr) -> Result<CString, RuntimeError> 
 
 #[derive(Debug)]
 pub enum RuntimeError {
+    CpuLacksFeature(&'static str),
+
     CurrentExe(std::io::Error),
 
     LibartNotFound(PathBuf),
@@ -824,6 +888,11 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CpuLacksFeature(feature) => write!(
+                f,
+                "this CPU lacks {feature}; the Android x86-64 Roblox client and Eclipse's ART \
+                 need an x86-64 CPU with SSSE3, SSE4.1, SSE4.2 and POPCNT"
+            ),
             Self::CurrentExe(e) => write!(
                 f,
                 "cannot resolve the Eclipse executable path to locate bundled ART and framework \
@@ -946,23 +1015,93 @@ mod tests {
         }
     }
 
+    const ALL_FEATURES: HostCpu = HostCpu {
+        ssse3: true,
+        sse4_1: true,
+        sse4_2: true,
+        avx: true,
+        avx2: true,
+        bmi1: true,
+        popcnt: true,
+    };
+
     #[test]
     fn feature_string_format_present_absent() {
         assert_eq!(
-            format_feature_string(|_| true),
+            ALL_FEATURES.art_feature_string(),
             "ssse3,sse4.1,sse4.2,avx,avx2,popcnt"
         );
 
+        let none = HostCpu {
+            ssse3: false,
+            sse4_1: false,
+            sse4_2: false,
+            avx: false,
+            avx2: false,
+            bmi1: false,
+            popcnt: false,
+        };
         assert_eq!(
-            format_feature_string(|_| false),
+            none.art_feature_string(),
             "-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-popcnt"
         );
     }
 
     #[test]
     fn feature_string_mixed_keeps_order_and_prefix() {
-        let s = format_feature_string(|t| matches!(t, "ssse3" | "sse4.1" | "sse4.2"));
-        assert_eq!(s, "ssse3,sse4.1,sse4.2,-avx,-avx2,-popcnt");
+        let baseline = HostCpu {
+            avx: false,
+            avx2: false,
+            bmi1: false,
+            popcnt: false,
+            ..ALL_FEATURES
+        };
+        assert_eq!(
+            baseline.art_feature_string(),
+            "ssse3,sse4.1,sse4.2,-avx,-avx2,-popcnt"
+        );
+    }
+
+    #[test]
+    fn cpus_below_the_android_x86_64_baseline_are_named() {
+        assert_eq!(ALL_FEATURES.missing_android_x86_64_feature(), None);
+        let without_avx = HostCpu {
+            avx: false,
+            avx2: false,
+            bmi1: false,
+            ..ALL_FEATURES
+        };
+        assert_eq!(without_avx.missing_android_x86_64_feature(), None);
+        let without_popcnt = HostCpu {
+            popcnt: false,
+            ..ALL_FEATURES
+        };
+        assert_eq!(
+            without_popcnt.missing_android_x86_64_feature(),
+            Some("POPCNT")
+        );
+        let core2 = HostCpu {
+            sse4_1: false,
+            sse4_2: false,
+            popcnt: false,
+            ..without_avx
+        };
+        assert_eq!(core2.missing_android_x86_64_feature(), Some("SSE4.1"));
+        assert!(RuntimeError::CpuLacksFeature("SSE4.1")
+            .to_string()
+            .contains("lacks SSE4.1"));
+    }
+
+    #[test]
+    fn avx2_is_reported_only_with_bmi1_because_art_emits_bmi1_for_it() {
+        let without_bmi1 = HostCpu {
+            bmi1: false,
+            ..ALL_FEATURES
+        };
+        assert_eq!(
+            without_bmi1.art_feature_string(),
+            "ssse3,sse4.1,sse4.2,avx,-avx2,popcnt"
+        );
     }
 
     #[test]
@@ -1141,21 +1280,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn instruction_set_features_self_consistent_with_std_arch() {
-        let expected = format_feature_string(|token| match token {
-            "ssse3" => is_x86_feature_detected!("ssse3"),
-            "sse4.1" => is_x86_feature_detected!("sse4.1"),
-            "sse4.2" => is_x86_feature_detected!("sse4.2"),
-            "avx" => is_x86_feature_detected!("avx"),
-            "avx2" => is_x86_feature_detected!("avx2"),
-            "popcnt" => is_x86_feature_detected!("popcnt"),
-            _ => false,
-        });
-        assert_eq!(instruction_set_features(), expected);
-    }
-
     #[test]
     fn boot_plan_derives_fields_from_manifest_and_config() {
         let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
@@ -1186,8 +1310,15 @@ mod tests {
         assert_eq!(plan.graphics_backend, GraphicsBackend::OpenGl);
     }
 
+    fn compiler_options(vm: &[String]) -> Vec<&str> {
+        vm.windows(2)
+            .filter(|pair| pair[0] == "-Xcompiler-option")
+            .map(|pair| pair[1].as_str())
+            .collect()
+    }
+
     #[test]
-    fn vm_options_are_heap_only_no_dex2oat_flag() {
+    fn vm_options_set_the_heap_limits() {
         let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
         let vm = plan.vm_options();
         assert!(vm.contains(&"-Xmx768m".to_owned()), "{vm:?}");
@@ -1199,9 +1330,31 @@ mod tests {
             vm.contains(&"-XX:DisableHSpaceCompactForOOM".to_owned()),
             "{vm:?}"
         );
+    }
+
+    #[test]
+    fn vm_options_forward_host_isa_features_to_the_compilers() {
+        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let vm = plan.vm_options();
+        let features = format!(
+            "--instruction-set-features={}",
+            plan.instruction_set_features
+        );
+        assert!(compiler_options(&vm).contains(&features.as_str()), "{vm:?}");
+        assert_eq!(
+            vm.iter().filter(|option| **option == features).count(),
+            1,
+            "the ISA flag appears once, as a compiler option: {vm:?}"
+        );
+    }
+
+    #[test]
+    fn vm_options_select_the_verify_filter_for_app_dex_compiles() {
+        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
         assert!(
-            !vm.iter().any(|o| o.contains("instruction-set-features")),
-            "VM options must not contain the dex2oat ISA flag: {vm:?}"
+            compiler_options(&plan.vm_options()).contains(&"--compiler-filter=verify"),
+            "{:?}",
+            plan.vm_options()
         );
     }
 
@@ -1241,14 +1394,6 @@ mod tests {
             let options = BootPlan::new(&manifest_with(Some(35)), &config).vm_options();
             assert!(options.contains(&expected.to_owned()), "{options:?}");
         }
-    }
-
-    #[test]
-    fn dex2oat_options_carry_only_the_isa_flag() {
-        let plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
-        let d = plan.dex2oat_options();
-        let isa = format!("--instruction-set-features={}", instruction_set_features());
-        assert_eq!(d, vec![isa]);
     }
 
     #[test]
@@ -1324,6 +1469,28 @@ mod tests {
             Some(cache.clone())
         );
         std::fs::remove_dir_all(&cache).ok();
+    }
+
+    #[test]
+    fn dalvik_cache_follows_art_xdg_then_home_rule() {
+        assert_eq!(
+            dalvik_cache_dir_in(Some("/cache".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/cache/art/x86_64"))
+        );
+        assert_eq!(
+            dalvik_cache_dir_in(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.cache/art/x86_64"))
+        );
+        assert_eq!(dalvik_cache_dir_in(None, None), None);
+    }
+
+    #[test]
+    fn dalvik_cache_stem_mangles_absolute_locations_like_art() {
+        assert_eq!(
+            dalvik_cache_stem(Path::new("/x/data/eclipse/roblox/3170/base.apk")),
+            Some(OsString::from("x@data@eclipse@roblox@3170@base.apk"))
+        );
+        assert_eq!(dalvik_cache_stem(Path::new("roblox/base.apk")), None);
     }
 
     #[test]

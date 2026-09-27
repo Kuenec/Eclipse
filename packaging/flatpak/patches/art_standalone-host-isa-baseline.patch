@@ -1,0 +1,12 @@
+--- a/art/build/Android.common_build.mk
++++ b/art/build/Android.common_build.mk
+@@ -214,6 +214,9 @@
+ # Base set of cflags used by host build only
+ art_host_cflags := \
+   $(foreach host_arch,$(strip $(ART_HOST_CODEGEN_ARCHS)), -DART_ENABLE_CODEGEN_$(host_arch))
++ifneq (,$(filter x86 x86_64,$(HOST_ARCH)))
++  art_host_cflags += -msse4.2 -mpopcnt
++endif
+ 
+ # Base set of asflags used by all things ART.
+ art_asflags :=

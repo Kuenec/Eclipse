@@ -1113,6 +1113,23 @@ pub(crate) mod tests {
             .map(|paths| paths.native_libs().to_path_buf())
     }
 
+    fn staged_apk_library(apk: &mut crate::apk::Apk, filename: &str) -> (std::fs::File, PathBuf) {
+        use std::os::fd::AsRawFd;
+
+        let entry = format!("lib/x86_64/{filename}");
+        let bytes = apk
+            .read_entry(&entry)
+            .unwrap_or_else(|e| panic!("read {entry} from APK: {e}"));
+        let fd = rustix::fs::memfd_create(filename, rustix::fs::MemfdFlags::CLOEXEC)
+            .unwrap_or_else(|e| panic!("create a memfd for {filename}: {e}"));
+        let mut staged = std::fs::File::from(fd);
+        staged
+            .write_all(&bytes)
+            .unwrap_or_else(|e| panic!("stage {filename} in a memfd: {e}"));
+        let path = PathBuf::from(format!("/proc/self/fd/{}", staged.as_raw_fd()));
+        (staged, path)
+    }
+
     fn is_symbol_reloc(rela: &Rela) -> bool {
         matches!(
             rela.r_type,
@@ -1128,13 +1145,7 @@ pub(crate) mod tests {
         };
 
         let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
-        let so_bytes = apk
-            .read_entry("lib/x86_64/libroblox.so")
-            .expect("read lib/x86_64/libroblox.so from APK");
-
-        let dir = temp_dir("libroblox");
-        let so_path = dir.join("libroblox.so");
-        std::fs::write(&so_path, &so_bytes).expect("stage libroblox.so");
+        let (_staged, so_path) = staged_apk_library(&mut apk, "libroblox.so");
 
         let linker = Linker::new(Vec::<PathBuf>::new())
             .with_host_fallback(false)
@@ -1335,7 +1346,6 @@ pub(crate) mod tests {
         );
 
         drop(set);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1348,12 +1358,7 @@ pub(crate) mod tests {
         };
 
         let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
-        let so_bytes = apk
-            .read_entry("lib/x86_64/libroblox.so")
-            .expect("read lib/x86_64/libroblox.so from APK");
-        let dir = temp_dir("libroblox-bionic-env");
-        let so_path = dir.join("libroblox.so");
-        std::fs::write(&so_path, &so_bytes).expect("stage libroblox.so");
+        let (_staged, so_path) = staged_apk_library(&mut apk, "libroblox.so");
 
         let linker = Linker::new(Vec::<PathBuf>::new())
             .with_host_fallback(false)
@@ -1516,7 +1521,6 @@ pub(crate) mod tests {
         );
 
         drop(set);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1531,12 +1535,7 @@ pub(crate) mod tests {
         };
 
         let mut apk = crate::apk::Apk::open(&apk_path).expect("open Roblox APK");
-        let so_bytes = apk
-            .read_entry("lib/x86_64/libroblox.so")
-            .expect("read lib/x86_64/libroblox.so from APK");
-        let dir = temp_dir("libroblox-eclipse-natives");
-        let so_path = dir.join("libroblox.so");
-        std::fs::write(&so_path, &so_bytes).expect("stage libroblox.so");
+        let (_staged, so_path) = staged_apk_library(&mut apk, "libroblox.so");
 
         let linker = Linker::new(Vec::<PathBuf>::new())
             .with_host_fallback(false)
@@ -1739,7 +1738,6 @@ pub(crate) mod tests {
         );
 
         drop(set);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1768,14 +1766,8 @@ pub(crate) mod tests {
             "the APK must carry libbacktrace-native.so (the lib whose loadLibrary proved fatal)"
         );
 
-        let dir = temp_dir("boot-path-loadlibrary");
         for filename in boot_path_libs {
-            let entry = format!("lib/x86_64/{filename}");
-            let so_bytes = apk
-                .read_entry(&entry)
-                .unwrap_or_else(|e| panic!("read {entry} from APK: {e}"));
-            let so_path = dir.join(filename);
-            std::fs::write(&so_path, &so_bytes).expect("stage boot-path lib");
+            let (_staged, so_path) = staged_apk_library(&mut apk, filename);
 
             let linker = Linker::new(Vec::<PathBuf>::new())
                 .with_host_fallback(false)
@@ -1830,7 +1822,6 @@ pub(crate) mod tests {
             );
             drop(set);
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

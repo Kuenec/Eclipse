@@ -1,0 +1,76 @@
+--- a/art/runtime/oat_file_assistant.h
++++ b/art/runtime/oat_file_assistant.h
+@@ -159,7 +159,7 @@
+   // After this call, no other methods of the OatFileAssistant should be
+   // called, because access to the loaded oat file has been taken away from
+   // the OatFileAssistant object.
+-  std::unique_ptr<OatFile> GetBestOatFile();
++  std::unique_ptr<OatFile> GetBestOatFile(ClassLoaderContext* context = nullptr);
+ 
+   // Returns a human readable description of the status of the code for the
+   // dex file. The returned description is for debugging purposes only.
+--- a/art/runtime/oat_file_assistant.cc
++++ b/art/runtime/oat_file_assistant.cc
+@@ -204,10 +204,36 @@
+   return GetBestInfo().Status() == kOatUpToDate;
+ }
+ 
+-std::unique_ptr<OatFile> OatFileAssistant::GetBestOatFile() {
++static bool GetRuntimeCompilerFilterOption(CompilerFilter::Filter* filter,
++                                           std::string* error_msg) {
++  *filter = CompilerFilter::kDefaultCompilerFilter;
++  for (const std::string& option : Runtime::Current()->GetCompilerOptions()) {
++    if (android::base::StartsWith(option, "--compiler-filter=")) {
++      const char* name = option.c_str() + strlen("--compiler-filter=");
++      if (!CompilerFilter::ParseCompilerFilter(name, filter)) {
++        *error_msg = std::string("Unknown --compiler-filter value: ") + name;
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++std::unique_ptr<OatFile> OatFileAssistant::GetBestOatFile(ClassLoaderContext* context) {
+   // framework-res.apk contains no dex files.
+   bool is_framework_res = dex_location_.compare(dex_location_.size() - (sizeof("framework-res.apk")-1), sizeof("framework-res.apk")-1, "framework-res.apk") == 0;
+-  if (!IsUpToDate() && !is_framework_res) {
++  CompilerFilter::Filter filter;
++  std::string filter_error;
++  const bool profile_changed = false;
++  const bool downgrade = false;
++  if (!GetRuntimeCompilerFilterOption(&filter, &filter_error)) {
++    LOG(WARNING) << "Not compiling dex file " << dex_location_ << ": " << filter_error;
++  } else if (!is_framework_res &&
++             GetBestInfo().GetDexOptNeeded(filter,
++                                           profile_changed,
++                                           downgrade,
++                                           context,
++                                           std::vector<int>()) != kNoDexOptNeeded) {
+     // Compile the dex file.
+     std::vector<std::string> arg_vector;
+ 
+@@ -224,6 +250,12 @@
+     }
+ 
+     arg_vector.push_back(std::string("--boot-image=") + Runtime::Current()->GetImageLocation());
++    arg_vector.push_back("--compiler-filter=" + CompilerFilter::NameOfFilter(filter));
++    if (context != nullptr) {
++      const std::string base_dir;
++      arg_vector.push_back("--class-loader-context=" +
++                           context->EncodeContextForDex2oat(base_dir));
++    }
+ 
+     std::string command_line(android::base::Join(arg_vector, ' '));
+     LOG(INFO) << "Compiling dex file: " << command_line;
+--- a/art/runtime/oat_file_manager.cc
++++ b/art/runtime/oat_file_manager.cc
+@@ -478,7 +478,7 @@
+                                       only_use_system_oat_files_);
+ 
+   // Get the oat file on disk.
+-  std::unique_ptr<const OatFile> oat_file(oat_file_assistant.GetBestOatFile().release());
++  std::unique_ptr<const OatFile> oat_file(oat_file_assistant.GetBestOatFile(context.get()).release());
+   VLOG(oat) << "OatFileAssistant(" << dex_location << ").GetBestOatFile()="
+             << reinterpret_cast<uintptr_t>(oat_file.get())
+             << " (executable=" << (oat_file != nullptr ? oat_file->IsExecutable() : false) << ")";
