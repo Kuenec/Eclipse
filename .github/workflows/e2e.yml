@@ -37,7 +37,9 @@ jobs:
             libfreetype6-dev \
             libegl1 \
             libgles2 \
+            libvulkan1 \
             mesa-utils \
+            mesa-vulkan-drivers \
             pkg-config \
             xauth \
             xvfb
@@ -58,6 +60,11 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
           WINIT_UNIX_BACKEND: x11
         run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked --test engine_milestones -- --nocapture
+
+      - name: Create the engine Vulkan and EGL surfaces on an X11 window
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1280x720x24" cargo test --locked --lib loader::vulkan_wsi::tests::x11_window_backs_the_engine_vulkan_and_egl_surfaces -- --nocapture
 
       - name: Exercise native input pipeline
         run: target/debug/eclipse __input-test

@@ -5259,13 +5259,13 @@ fn register_path_natives(env: &mut Env) -> Result<(), FrameworkError> {
 pub const CANVAS_CLASS: &JNIStr = jni_str!("android/graphics/Canvas");
 
 const CANVAS_N_DRAW_COLOR_NAME: &JNIStr = jni_str!("nDrawColor");
-const CANVAS_N_DRAW_COLOR_SIG: &JNIStr = jni_str!("(JI)V");
+const CANVAS_N_DRAW_COLOR_SIG: MethodSignature<'static, 'static> = jni_sig!("(JI)V");
 const CANVAS_N_DRAW_RECT_NAME: &JNIStr = jni_str!("nDrawRect");
-const CANVAS_N_DRAW_RECT_SIG: &JNIStr = jni_str!("(JFFFFJ)V");
+const CANVAS_N_DRAW_RECT_SIG: MethodSignature<'static, 'static> = jni_sig!("(JFFFFJ)V");
 const CANVAS_N_DRAW_CIRCLE_NAME: &JNIStr = jni_str!("nDrawCircle");
-const CANVAS_N_DRAW_CIRCLE_SIG: &JNIStr = jni_str!("(JFFFJ)V");
+const CANVAS_N_DRAW_CIRCLE_SIG: MethodSignature<'static, 'static> = jni_sig!("(JFFFJ)V");
 const CANVAS_N_DRAW_PATH_NAME: &JNIStr = jni_str!("nDrawPath");
-const CANVAS_N_DRAW_PATH_SIG: &JNIStr = jni_str!("(JJJ)V");
+const CANVAS_N_DRAW_PATH_SIG: MethodSignature<'static, 'static> = jni_sig!("(JJJ)V");
 
 fn paint_config_from_handle(paint: jlong) -> canvas_registry::PaintConfig {
     paint_registry::with_paint(paint, |p| canvas_registry::PaintConfig {
@@ -5398,36 +5398,44 @@ extern "system" fn canvas_n_draw_path<'local>(
 
 fn register_canvas_natives(env: &mut Env) -> Result<(), FrameworkError> {
     let class = env.find_class(CANVAS_CLASS)?;
-    let methods = [
-        unsafe {
-            NativeMethod::from_raw_parts(
-                CANVAS_N_DRAW_COLOR_NAME,
-                CANVAS_N_DRAW_COLOR_SIG,
-                canvas_n_draw_color as *mut std::ffi::c_void,
-            )
-        },
-        unsafe {
-            NativeMethod::from_raw_parts(
-                CANVAS_N_DRAW_RECT_NAME,
-                CANVAS_N_DRAW_RECT_SIG,
-                canvas_n_draw_rect as *mut std::ffi::c_void,
-            )
-        },
-        unsafe {
-            NativeMethod::from_raw_parts(
-                CANVAS_N_DRAW_CIRCLE_NAME,
-                CANVAS_N_DRAW_CIRCLE_SIG,
-                canvas_n_draw_circle as *mut std::ffi::c_void,
-            )
-        },
-        unsafe {
-            NativeMethod::from_raw_parts(
-                CANVAS_N_DRAW_PATH_NAME,
-                CANVAS_N_DRAW_PATH_SIG,
-                canvas_n_draw_path as *mut std::ffi::c_void,
-            )
-        },
+    let natives = [
+        (
+            CANVAS_N_DRAW_COLOR_NAME,
+            CANVAS_N_DRAW_COLOR_SIG,
+            canvas_n_draw_color as *mut std::ffi::c_void,
+        ),
+        (
+            CANVAS_N_DRAW_RECT_NAME,
+            CANVAS_N_DRAW_RECT_SIG,
+            canvas_n_draw_rect as *mut std::ffi::c_void,
+        ),
+        (
+            CANVAS_N_DRAW_CIRCLE_NAME,
+            CANVAS_N_DRAW_CIRCLE_SIG,
+            canvas_n_draw_circle as *mut std::ffi::c_void,
+        ),
+        (
+            CANVAS_N_DRAW_PATH_NAME,
+            CANVAS_N_DRAW_PATH_SIG,
+            canvas_n_draw_path as *mut std::ffi::c_void,
+        ),
     ];
+    let declared = natives
+        .iter()
+        .all(|(name, sig, _)| env.get_static_method_id(&class, name, sig).is_ok());
+    if !declared {
+        if env.exception_check() {
+            env.exception_clear();
+        }
+        tracing::debug!(
+            class = "android/graphics/Canvas",
+            "the framework's Canvas declares no nDraw* natives; draw cascade disabled"
+        );
+        return Ok(());
+    }
+    let methods = natives.each_ref().map(|(name, sig, function)| unsafe {
+        NativeMethod::from_raw_parts(name, sig.sig(), *function)
+    });
 
     match unsafe { env.register_native_methods(&class, &methods) } {
         Ok(()) => {
@@ -11318,10 +11326,14 @@ fn register_runtime_native_load_natives(env: &mut Env) -> Result<(), FrameworkEr
 pub fn drive_application_lifecycle(
     vm: &Vm,
     apk_path: &str,
+    native_library_dir: &std::path::Path,
     signing_certificate_history: &SigningCertificateHistory,
     launcher_activity: &str,
     android_deep_link: Option<&str>,
 ) -> Result<LifecycleProgress, FrameworkError> {
+    let native_library_dir = native_library_dir
+        .to_str()
+        .ok_or_else(|| FrameworkError::NativeLibraryDirNotUtf8(native_library_dir.to_owned()))?;
     let raw = vm.as_raw();
     if raw.is_null() {
         return Err(FrameworkError::NullVm);
@@ -11333,6 +11345,7 @@ pub fn drive_application_lifecycle(
             drive_lifecycle(
                 env,
                 apk_path,
+                native_library_dir,
                 signing_certificate_history,
                 launcher_activity,
                 android_deep_link,
@@ -11374,6 +11387,8 @@ fn prepare_main_looper_inner(env: &mut Env) -> Result<(), FrameworkError> {
         .v()
     })?;
     initialize_main_looper_jni_cache(env, &looper_class)?;
+    crate::loader::native_provider::prepare_main_thread_looper(wake_main_looper)
+        .map_err(FrameworkError::MainThreadLooper)?;
 
     let _ = MAIN_THREAD_ID.set(std::thread::current().id());
     Ok(())
@@ -11523,6 +11538,7 @@ fn run_main_looper_once(env: &mut Env) -> Result<MainLooperDue, FrameworkError> 
     }
 
     MAIN_LOOPER_WAKE_SENT.swap(false, std::sync::atomic::Ordering::AcqRel);
+    crate::loader::native_provider::dispatch_main_thread_looper();
     run_pending_main_upcall(env);
     let result = drive_main_messages(env);
     let layout_result = dispatch_pending_global_layout(env);
@@ -12662,6 +12678,7 @@ fn draw_targets(env: &mut Env, targets: &[DrawTarget]) -> Result<Vec<DrawnCanvas
 fn drive_lifecycle(
     env: &mut Env,
     apk_path: &str,
+    native_library_dir: &str,
     signing_certificate_history: &SigningCertificateHistory,
     launcher_activity: &str,
     android_deep_link: Option<&str>,
@@ -12754,6 +12771,7 @@ fn drive_lifecycle(
 
     let window_handle = window_registry::allocate()?;
     let context = env.find_class(CONTEXT_CLASS)?;
+    publish_native_library_dir(env, &context, native_library_dir)?;
     let app = checked(env, "step 1 Context.createApplication", |env| {
         env.call_static_method(
             &context,
@@ -12832,6 +12850,57 @@ fn drive_lifecycle(
         "Activity resumed: recipe steps 1–7 driven (launcher Activity onStart + onResume)"
     );
     Ok(LifecycleProgress::ActivityResumed)
+}
+
+const ATL_LOADED_APP_CLASS: &JNIStr = jni_str!("android/atl/ATLLoadedApp");
+const PACKAGE_MANAGER_SIG: &JNIStr = jni_str!("Landroid/content/pm/PackageManager;");
+const PARSED_PACKAGE_SIG: &JNIStr = jni_str!("Landroid/content/pm/PackageParser$Package;");
+const APPLICATION_INFO_SIG: &JNIStr = jni_str!("Landroid/content/pm/ApplicationInfo;");
+const STRING_SIG: &JNIStr = jni_str!("Ljava/lang/String;");
+
+fn publish_native_library_dir(
+    env: &mut Env,
+    context: &JClass,
+    native_library_dir: &str,
+) -> Result<(), FrameworkError> {
+    let object_sig = |sig| unsafe { FieldSignature::from_raw_parts(sig, JavaType::Object) };
+    checked(env, "Context.<clinit> via Context.package_manager", |env| {
+        env.get_static_field(
+            context,
+            jni_str!("package_manager"),
+            object_sig(PACKAGE_MANAGER_SIG),
+        )
+        .map(drop)
+    })?;
+    let loaded_app_class = env.find_class(ATL_LOADED_APP_CLASS)?;
+    let application_info = checked(env, "primary ApplicationInfo", |env| {
+        let loaded_app = env
+            .call_static_method(
+                &loaded_app_class,
+                jni_str!("getPrimaryApplication"),
+                jni_sig!("()Landroid/atl/ATLLoadedApp;"),
+                &[],
+            )?
+            .l()?;
+        let package = env
+            .get_field(&loaded_app, jni_str!("pkg"), object_sig(PARSED_PACKAGE_SIG))?
+            .l()?;
+        env.get_field(
+            &package,
+            jni_str!("applicationInfo"),
+            object_sig(APPLICATION_INFO_SIG),
+        )?
+        .l()
+    })?;
+    let dir = env.new_string(native_library_dir)?;
+    checked(env, "ApplicationInfo.nativeLibraryDir", |env| {
+        env.set_field(
+            &application_info,
+            jni_str!("nativeLibraryDir"),
+            object_sig(STRING_SIG),
+            JValue::Object(&dir),
+        )
+    })
 }
 
 fn activity_start_arguments<'a>(
@@ -13129,6 +13198,10 @@ pub enum FrameworkError {
     SigningCertificateHistoryConflict,
 
     OverlayPredatesSigningCertificates(jni::errors::Error),
+
+    NativeLibraryDirNotUtf8(std::path::PathBuf),
+
+    MainThreadLooper(std::io::Error),
 }
 
 impl fmt::Display for FrameworkError {
@@ -13155,6 +13228,19 @@ impl fmt::Display for FrameworkError {
                 "the Android framework overlay predates host-verified signing certificates \
                  ({e}); rebuild it with tools/framework-overlay/patch-framework.sh"
             ),
+            Self::NativeLibraryDirNotUtf8(dir) => write!(
+                f,
+                "the native library directory {} is not valid UTF-8, so \
+                 ApplicationInfo.nativeLibraryDir cannot name it; set ECLIPSE_NATIVE_LIB_DIR \
+                 to a UTF-8 path",
+                dir.display()
+            ),
+            Self::MainThreadLooper(e) => {
+                write!(
+                    f,
+                    "creating the Android main thread's native ALooper failed: {e}"
+                )
+            }
         }
     }
 }
@@ -13165,11 +13251,13 @@ impl std::error::Error for FrameworkError {
             Self::Jni(e) | Self::OverlayPredatesSigningCertificates(e) => Some(e),
             Self::WindowRegistry(e) => Some(e),
             Self::ViewRegistry(e) => Some(e),
+            Self::MainThreadLooper(e) => Some(e),
             Self::NullVm
             | Self::ActivityTrackerPoisoned
             | Self::GlobalLayoutObserverRegistryPoisoned
             | Self::Panicked
-            | Self::SigningCertificateHistoryConflict => None,
+            | Self::SigningCertificateHistoryConflict
+            | Self::NativeLibraryDirNotUtf8(_) => None,
         }
     }
 }
@@ -15292,13 +15380,13 @@ mod tests {
     fn canvas_native_names_and_sigs() {
         assert_eq!(CANVAS_CLASS.to_str(), "android/graphics/Canvas");
         assert_eq!(CANVAS_N_DRAW_COLOR_NAME.to_str(), "nDrawColor");
-        assert_eq!(CANVAS_N_DRAW_COLOR_SIG.to_str(), "(JI)V");
+        assert_eq!(CANVAS_N_DRAW_COLOR_SIG.sig().to_str(), "(JI)V");
         assert_eq!(CANVAS_N_DRAW_RECT_NAME.to_str(), "nDrawRect");
-        assert_eq!(CANVAS_N_DRAW_RECT_SIG.to_str(), "(JFFFFJ)V");
+        assert_eq!(CANVAS_N_DRAW_RECT_SIG.sig().to_str(), "(JFFFFJ)V");
         assert_eq!(CANVAS_N_DRAW_CIRCLE_NAME.to_str(), "nDrawCircle");
-        assert_eq!(CANVAS_N_DRAW_CIRCLE_SIG.to_str(), "(JFFFJ)V");
+        assert_eq!(CANVAS_N_DRAW_CIRCLE_SIG.sig().to_str(), "(JFFFJ)V");
         assert_eq!(CANVAS_N_DRAW_PATH_NAME.to_str(), "nDrawPath");
-        assert_eq!(CANVAS_N_DRAW_PATH_SIG.to_str(), "(JJJ)V");
+        assert_eq!(CANVAS_N_DRAW_PATH_SIG.sig().to_str(), "(JJJ)V");
     }
 
     #[test]

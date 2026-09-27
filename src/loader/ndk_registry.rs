@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
+use std::ffi::c_ulong;
 use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 pub type NdkHandle = u64;
 
@@ -193,6 +196,33 @@ pub struct NativeWindowState {
     pub format: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigurationLocale {
+    pub language: [u8; 2],
+
+    pub country: [u8; 2],
+}
+
+static CONFIGURATION_LOCALE: OnceLock<ConfigurationLocale> = OnceLock::new();
+
+pub fn set_configuration_locale(locale: ConfigurationLocale) -> bool {
+    CONFIGURATION_LOCALE.set(locale).is_ok()
+}
+
+pub fn configuration_locale() -> Option<ConfigurationLocale> {
+    CONFIGURATION_LOCALE.get().copied()
+}
+
+static DEVICE_API_LEVEL: OnceLock<u32> = OnceLock::new();
+
+pub fn set_device_api_level(level: u32) -> bool {
+    DEVICE_API_LEVEL.set(level).is_ok()
+}
+
+pub fn device_api_level() -> Option<u32> {
+    DEVICE_API_LEVEL.get().copied()
+}
+
 static APK_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_apk_path(path: PathBuf) -> bool {
@@ -280,28 +310,47 @@ pub fn fallback_native_window_state(native_window: usize) -> Option<NativeWindow
     })
 }
 
-static WSI_DISPLAY: Mutex<Option<usize>> = Mutex::new(None);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsiTarget {
+    Wayland { display: usize, surface: usize },
 
-pub fn set_wsi_display(display: Option<usize>) {
-    if let Ok(mut d) = WSI_DISPLAY.lock() {
-        *d = display;
+    Xlib { display: usize, window: c_ulong },
+}
+
+impl WsiTarget {
+    #[must_use]
+    pub fn from_raw(display: RawDisplayHandle, window: RawWindowHandle) -> Option<Self> {
+        match (display, window) {
+            (RawDisplayHandle::Wayland(d), RawWindowHandle::Wayland(w)) => Some(Self::Wayland {
+                display: d.display.as_ptr() as usize,
+                surface: w.surface.as_ptr() as usize,
+            }),
+            (RawDisplayHandle::Xlib(d), RawWindowHandle::Xlib(w)) => {
+                d.display.map(|display| Self::Xlib {
+                    display: display.as_ptr() as usize,
+                    window: w.window,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn native_display(self) -> usize {
+        match self {
+            Self::Wayland { display, .. } | Self::Xlib { display, .. } => display,
+        }
     }
 }
 
-pub fn wsi_display() -> Option<usize> {
-    WSI_DISPLAY.lock().ok().and_then(|d| *d)
+static WSI_TARGET: Mutex<Option<WsiTarget>> = Mutex::new(None);
+
+pub fn set_wsi_target(target: Option<WsiTarget>) {
+    *WSI_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = target;
 }
 
-static WSI_WL_SURFACE: Mutex<Option<usize>> = Mutex::new(None);
-
-pub fn set_wsi_wl_surface(surface: Option<usize>) {
-    if let Ok(mut s) = WSI_WL_SURFACE.lock() {
-        *s = surface;
-    }
-}
-
-pub fn wsi_wl_surface() -> Option<usize> {
-    WSI_WL_SURFACE.lock().ok().and_then(|s| *s)
+pub fn wsi_target() -> Option<WsiTarget> {
+    *WSI_TARGET.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 static ENGINE_CLAIMED_SURFACE: std::sync::atomic::AtomicBool =
@@ -399,24 +448,34 @@ mod tests {
 
     #[test]
     fn freed_handle_is_stale_and_does_not_alias_reused_slot() {
+        use super::super::looper::{FdHandler, Looper, ALOOPER_EVENT_INPUT};
+        use std::os::fd::AsRawFd;
+
         let s = loopers();
         let make = || LooperState {
-            looper: super::super::looper::Looper::new().expect("eventfd"),
+            looper: Looper::new().expect("eventfd + epoll"),
         };
+        let registered = Looper::new().expect("an fd to register");
+        let fd = registered.poller().readiness_fd().as_raw_fd();
         let old = s.insert(make()).expect("insert old");
-        s.with(old, |l| l.looper.add_fd(7, 1, 1)).expect("use old");
+        s.with(old, |l| {
+            l.looper
+                .add_fd(fd, ALOOPER_EVENT_INPUT, FdHandler::Ident(1), 0)
+        })
+        .expect("use old")
+        .expect("add_fd");
         s.remove(old).expect("remove old");
 
         let new = s.insert(make()).expect("insert new");
 
         assert_eq!(
-            s.with(old, |l| l.looper.remove_fd(7)),
+            s.with(old, |l| l.looper.remove_fd(fd)),
             Err(NdkRegistryError::StaleHandle),
             "a freed handle must be StaleHandle, never alias the reused slot"
         );
 
         assert_eq!(
-            s.with(new, |l| l.looper.remove_fd(7)),
+            s.with(new, |l| l.looper.remove_fd(fd)),
             Ok(false),
             "the live handle addresses the reused (cleared) slot"
         );
@@ -540,39 +599,59 @@ mod tests {
     }
 
     #[test]
-    fn wsi_display_round_trips_set_and_get() {
-        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let p: usize = 0x5000_1000;
-        set_wsi_display(Some(p));
-        assert_eq!(
-            wsi_display(),
-            Some(p),
-            "a registered Wayland wl_display round-trips through wsi_display"
-        );
-        set_wsi_display(None);
-        assert_eq!(
-            wsi_display(),
-            None,
-            "clearing to None (X11/other) is observed by wsi_display"
-        );
-    }
+    fn wsi_target_records_the_window_system_of_the_host_window() {
+        use raw_window_handle::{
+            WaylandDisplayHandle, WaylandWindowHandle, WebWindowHandle, XlibDisplayHandle,
+            XlibWindowHandle,
+        };
+        let pointer = |address: usize| std::ptr::NonNull::new(address as *mut _).expect("non-null");
 
-    #[test]
-    fn wsi_wl_surface_round_trips_set_and_get() {
-        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let p: usize = 0x6000_2000;
-        set_wsi_wl_surface(Some(p));
-        assert_eq!(
-            wsi_wl_surface(),
-            Some(p),
-            "a registered Wayland wl_surface round-trips through wsi_wl_surface"
+        let wayland = WsiTarget::from_raw(
+            RawDisplayHandle::Wayland(WaylandDisplayHandle::new(pointer(0x5000_1000))),
+            RawWindowHandle::Wayland(WaylandWindowHandle::new(pointer(0x6000_2000))),
         );
-        set_wsi_wl_surface(None);
         assert_eq!(
-            wsi_wl_surface(),
+            wayland,
+            Some(WsiTarget::Wayland {
+                display: 0x5000_1000,
+                surface: 0x6000_2000
+            })
+        );
+
+        let xlib = WsiTarget::from_raw(
+            RawDisplayHandle::Xlib(XlibDisplayHandle::new(Some(pointer(0x7000_3000)), 0)),
+            RawWindowHandle::Xlib(XlibWindowHandle::new(0x2a0_0002)),
+        );
+        assert_eq!(
+            xlib,
+            Some(WsiTarget::Xlib {
+                display: 0x7000_3000,
+                window: 0x2a0_0002
+            })
+        );
+        assert_eq!(xlib.map(WsiTarget::native_display), Some(0x7000_3000));
+
+        assert_eq!(
+            WsiTarget::from_raw(
+                RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0)),
+                RawWindowHandle::Xlib(XlibWindowHandle::new(0x2a0_0002)),
+            ),
             None,
-            "clearing to None (X11/other) is observed by wsi_wl_surface"
+            "an Xlib handle without its Display cannot back a surface"
         );
+        assert_eq!(
+            WsiTarget::from_raw(
+                RawDisplayHandle::Wayland(WaylandDisplayHandle::new(pointer(0x5000_1000))),
+                RawWindowHandle::Web(WebWindowHandle::new(1)),
+            ),
+            None
+        );
+
+        let _g = WSI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_wsi_target(xlib);
+        assert_eq!(wsi_target(), xlib);
+        set_wsi_target(None);
+        assert_eq!(wsi_target(), None);
     }
 
     #[test]

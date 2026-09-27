@@ -1641,6 +1641,9 @@ pub(crate) mod tests {
             "freeaddrinfo",
             "gai_strerror",
             "getnameinfo",
+            "strerror_r",
+            "mallinfo",
+            "newlocale",
         ] {
             let e = eclipse_only
                 .resolve(shadowed)

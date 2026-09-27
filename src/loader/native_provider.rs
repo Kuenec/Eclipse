@@ -83,6 +83,7 @@ impl EclipseNativeProvider {
             "__gnu_strerror_r",
             eclipse_gnu_strerror_r as *const () as u64,
         );
+        p.register("strerror_r", eclipse_strerror_r as *const () as u64);
         p.register(
             "__system_property_get",
             eclipse_system_property_get as *const () as u64,
@@ -406,6 +407,10 @@ impl EclipseNativeProvider {
             p.register(name, addr);
         });
 
+        super::bionic_locale::register_natives(|name, addr| {
+            p.register(name, addr);
+        });
+
         p
     }
 }
@@ -692,14 +697,45 @@ extern "C" {
     fn gnu_strerror_r(errnum: c_int, buf: *mut c_char, buflen: usize) -> *mut c_char;
 }
 
-unsafe extern "C" fn eclipse_system_property_get(
-    _name: *const c_char,
-    value: *mut c_char,
-) -> c_int {
-    if !value.is_null() {
-        unsafe { value.write(0) };
+unsafe extern "C" fn eclipse_strerror_r(errnum: c_int, buf: *mut c_char, buflen: usize) -> c_int {
+    match unsafe { libc::strerror_r(errnum, buf, buflen) } {
+        libc::EINVAL => 0,
+        rc => rc,
     }
-    0
+}
+
+const PROP_VALUE_MAX: usize = 92;
+
+const SDK_VERSION_PROPERTY: &std::ffi::CStr = c"ro.build.version.sdk";
+
+const MANUFACTURER_PROPERTY: &std::ffi::CStr = c"ro.product.manufacturer";
+
+const FRAMEWORK_BUILD_MANUFACTURER: &str = "HTC";
+
+fn system_property_value(name: &std::ffi::CStr) -> Option<String> {
+    if name == SDK_VERSION_PROPERTY {
+        return ndk_registry::device_api_level().map(|level| level.to_string());
+    }
+    if name == MANUFACTURER_PROPERTY {
+        return Some(FRAMEWORK_BUILD_MANUFACTURER.to_owned());
+    }
+    None
+}
+
+unsafe extern "C" fn eclipse_system_property_get(name: *const c_char, value: *mut c_char) -> c_int {
+    if value.is_null() {
+        return 0;
+    }
+    let text = (!name.is_null())
+        .then(|| system_property_value(unsafe { std::ffi::CStr::from_ptr(name) }))
+        .flatten()
+        .unwrap_or_default();
+    let bytes = &text.as_bytes()[..text.len().min(PROP_VALUE_MAX - 1)];
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), value.cast::<u8>(), bytes.len());
+        value.add(bytes.len()).write(0);
+    }
+    bytes.len() as c_int
 }
 
 type BionicSigsetT = u64;
@@ -1957,8 +1993,15 @@ const DEFAULT_DISPLAY_HEIGHT_PX: i32 = 1920;
 
 const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 
+const DEFAULT_CONFIGURATION_LOCALE: ndk_registry::ConfigurationLocale =
+    ndk_registry::ConfigurationLocale {
+        language: *b"en",
+        country: *b"US",
+    };
+
 fn default_configuration() -> ConfigurationState {
     let to_dp = |px: i32| px * ACONFIGURATION_DENSITY_BASELINE / ACONFIGURATION_DENSITY_XHIGH;
+    let locale = ndk_registry::configuration_locale().unwrap_or(DEFAULT_CONFIGURATION_LOCALE);
     ConfigurationState {
         density: ACONFIGURATION_DENSITY_XHIGH,
         screen_width_dp: to_dp(DEFAULT_DISPLAY_WIDTH_PX),
@@ -1966,8 +2009,8 @@ fn default_configuration() -> ConfigurationState {
         screen_size: ACONFIGURATION_SCREENSIZE_NORMAL,
         orientation: ACONFIGURATION_ORIENTATION_PORT,
         nav_hidden: ACONFIGURATION_NAVHIDDEN_YES,
-        language: *b"en",
-        country: *b"US",
+        language: locale.language,
+        country: locale.country,
     }
 }
 
@@ -2226,7 +2269,8 @@ unsafe extern "C" fn eclipse_aconfiguration_getscreenwidthdp(config: *mut c_void
 }
 
 use crate::loader::looper::{
-    PollResult, ALOOPER_EVENT_INPUT, ALOOPER_POLL_ERROR, ALOOPER_POLL_TIMEOUT, ALOOPER_POLL_WAKE,
+    AlooperCallback, FdHandler, PollOutcome, Poller, ALOOPER_EVENT_INPUT, ALOOPER_POLL_CALLBACK,
+    ALOOPER_POLL_ERROR, ALOOPER_POLL_TIMEOUT, ALOOPER_POLL_WAKE,
 };
 
 thread_local! {
@@ -2235,25 +2279,181 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-extern "C" fn eclipse_alooper_prepare(_opts: c_int) -> *mut c_void {
-    THREAD_LOOPER.with(|tl| {
-        if let Some(h) = tl.get() {
-            return handle_to_ptr(h);
-        }
+#[derive(Clone, Copy)]
+enum LooperRole {
+    EngineThread,
 
-        let Some(looper) = crate::loader::looper::Looper::new() else {
-            return std::ptr::null_mut();
-        };
+    MainThread,
+}
 
+fn prepare_thread_looper(role: LooperRole) -> std::io::Result<ndk_registry::NdkHandle> {
+    if let Some(handle) = THREAD_LOOPER.with(std::cell::Cell::get) {
+        return Ok(handle);
+    }
+    let looper = crate::loader::looper::Looper::new()?;
+    if let LooperRole::EngineThread = role {
         ndk_registry::register_looper_waker(looper.waker());
-        match ndk_registry::loopers().insert(LooperState { looper }) {
-            Ok(h) => {
-                tl.set(Some(h));
-                handle_to_ptr(h)
-            }
-            Err(_) => std::ptr::null_mut(),
+    }
+    let handle = ndk_registry::loopers()
+        .insert(LooperState { looper })
+        .map_err(std::io::Error::other)?;
+    THREAD_LOOPER.with(|tl| tl.set(Some(handle)));
+    Ok(handle)
+}
+
+extern "C" fn eclipse_alooper_prepare(_opts: c_int) -> *mut c_void {
+    match prepare_thread_looper(LooperRole::EngineThread) {
+        Ok(handle) => handle_to_ptr(handle),
+        Err(e) => {
+            tracing::error!(error = %e, "ALooper_prepare: creating the thread's looper failed");
+            std::ptr::null_mut()
         }
-    })
+    }
+}
+
+struct MainThreadLooper {
+    handle: ndk_registry::NdkHandle,
+
+    dispatch_passes: std::sync::Mutex<u64>,
+
+    dispatched: std::sync::Condvar,
+}
+
+static MAIN_THREAD_LOOPER: OnceLock<MainThreadLooper> = OnceLock::new();
+
+pub fn prepare_main_thread_looper(wake_main_thread: fn()) -> std::io::Result<()> {
+    let handle = prepare_thread_looper(LooperRole::MainThread)?;
+    let poller = ndk_registry::loopers()
+        .with(handle, |l| l.looper.poller())
+        .map_err(std::io::Error::other)?;
+    let fresh = MAIN_THREAD_LOOPER
+        .set(MainThreadLooper {
+            handle,
+            dispatch_passes: std::sync::Mutex::new(0),
+            dispatched: std::sync::Condvar::new(),
+        })
+        .is_ok();
+    if fresh {
+        std::thread::Builder::new()
+            .name("eclipse-main-alooper".into())
+            .spawn(move || watch_main_thread_looper(&poller, wake_main_thread))?;
+    }
+    Ok(())
+}
+
+fn watch_main_thread_looper(poller: &Poller, wake_main_thread: fn()) {
+    use std::os::fd::AsRawFd;
+
+    let Some(main) = MAIN_THREAD_LOOPER.get() else {
+        return;
+    };
+    loop {
+        let passes = *main
+            .dispatch_passes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut readiness = libc::pollfd {
+            fd: poller.readiness_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut readiness, 1, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::error!(
+                error = %error,
+                "main-thread ALooper watcher stopped; its fd callbacks now run only when the \
+                 host loop wakes for other reasons"
+            );
+            return;
+        }
+        wake_main_thread();
+        let guard = main
+            .dispatch_passes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            main.dispatched
+                .wait_while(guard, |current| *current == passes)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+}
+
+pub fn dispatch_main_thread_looper() {
+    let Some(main) = MAIN_THREAD_LOOPER.get() else {
+        return;
+    };
+    if THREAD_LOOPER.with(std::cell::Cell::get) == Some(main.handle) {
+        poll_looper(main.handle, 0);
+    }
+    *main
+        .dispatch_passes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+    main.dispatched.notify_all();
+}
+
+enum PollOnce {
+    Fd {
+        ident: c_int,
+        fd: c_int,
+        events: c_int,
+        data: usize,
+    },
+
+    Result(c_int),
+}
+
+fn poll_looper(handle: ndk_registry::NdkHandle, timeout_millis: c_int) -> PollOnce {
+    let Ok(poller) = ndk_registry::loopers().with(handle, |l| l.looper.poller()) else {
+        return PollOnce::Result(ALOOPER_POLL_ERROR);
+    };
+    let ready = match poller.poll(timeout_millis) {
+        PollOutcome::Ready(ready) => ready,
+        PollOutcome::Timeout => return PollOnce::Result(ALOOPER_POLL_TIMEOUT),
+        PollOutcome::Error => return PollOnce::Result(ALOOPER_POLL_ERROR),
+    };
+    let Ok(responses) = ndk_registry::loopers().with(handle, |l| l.looper.responses(&ready)) else {
+        return PollOnce::Result(ALOOPER_POLL_ERROR);
+    };
+
+    let mut first_fd = None;
+    let mut ran_callback = false;
+    for response in responses {
+        let registration = response.registration;
+        match registration.handler {
+            FdHandler::Callback(callback) => {
+                ran_callback = true;
+                let keep = unsafe {
+                    callback(
+                        registration.fd,
+                        response.events,
+                        registration.data as *mut c_void,
+                    )
+                };
+                if keep == 0 {
+                    let _ = ndk_registry::loopers()
+                        .with(handle, |l| l.looper.remove_registration(&registration));
+                }
+            }
+            FdHandler::Ident(ident) => {
+                first_fd.get_or_insert(PollOnce::Fd {
+                    ident,
+                    fd: registration.fd,
+                    events: response.events,
+                    data: registration.data,
+                });
+            }
+        }
+    }
+    match first_fd {
+        Some(fd) => fd,
+        None if ran_callback => PollOnce::Result(ALOOPER_POLL_CALLBACK),
+        None => PollOnce::Result(ALOOPER_POLL_WAKE),
+    }
 }
 
 extern "C" fn eclipse_alooper_forthread() -> *mut c_void {
@@ -2277,17 +2477,14 @@ unsafe extern "C" fn eclipse_alooper_pollonce(
         return ALOOPER_POLL_ERROR;
     };
 
-    let snapshot = match ndk_registry::loopers().with(handle, |l| l.looper.snapshot()) {
-        Ok(s) => s,
-        Err(_) => return ALOOPER_POLL_ERROR,
-    };
-    let result = snapshot.poll_once(timeout_millis);
-
-    let (ret, fd, events) = match result {
-        PollResult::Fd { ident, fd, events } => (ident, fd, events),
-        PollResult::Wake => (ALOOPER_POLL_WAKE, 0, 0),
-        PollResult::Timeout => (ALOOPER_POLL_TIMEOUT, 0, 0),
-        PollResult::Error => (ALOOPER_POLL_ERROR, 0, 0),
+    let (ret, fd, events, data) = match poll_looper(handle, timeout_millis) {
+        PollOnce::Fd {
+            ident,
+            fd,
+            events,
+            data,
+        } => (ident, fd, events, data),
+        PollOnce::Result(result) => (result, 0, 0, 0),
     };
     if !out_fd.is_null() {
         unsafe { out_fd.write(fd) };
@@ -2296,7 +2493,7 @@ unsafe extern "C" fn eclipse_alooper_pollonce(
         unsafe { out_events.write(events) };
     }
     if !out_data.is_null() {
-        unsafe { out_data.write(std::ptr::null_mut()) };
+        unsafe { out_data.write(data as *mut c_void) };
     }
     ret
 }
@@ -2306,25 +2503,26 @@ unsafe extern "C" fn eclipse_alooper_addfd(
     fd: c_int,
     ident: c_int,
     events: c_int,
-    callback: *mut c_void,
-    _data: *mut c_void,
+    callback: Option<AlooperCallback>,
+    data: *mut c_void,
 ) -> c_int {
-    if !callback.is_null() || ident < 0 {
-        return -1;
-    }
+    let handler = match callback {
+        Some(callback) => FdHandler::Callback(callback),
+        None if ident >= 0 => FdHandler::Ident(ident),
+        None => return -1,
+    };
     match ndk_registry::loopers().with(ptr_to_handle(looper), |l| {
-        l.looper.add_fd(fd, ident, events)
+        l.looper.add_fd(fd, events, handler, data as usize)
     }) {
-        Ok(()) => 1,
-        Err(_) => -1,
+        Ok(Ok(())) => 1,
+        Ok(Err(_)) | Err(_) => -1,
     }
 }
 
 unsafe extern "C" fn eclipse_alooper_removefd(looper: *mut c_void, fd: c_int) -> c_int {
-    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| {
-        let _ = l.looper.remove_fd(fd);
-    }) {
-        Ok(()) => 1,
+    match ndk_registry::loopers().with(ptr_to_handle(looper), |l| l.looper.remove_fd(fd)) {
+        Ok(true) => 1,
+        Ok(false) => 0,
         Err(_) => -1,
     }
 }
@@ -2396,7 +2594,7 @@ pub fn run_input_test() -> Result<String, String> {
                 read_fd,
                 ENGINE_INPUT_IDENT,
                 ALOOPER_EVENT_INPUT,
-                std::ptr::null_mut(),
+                None,
                 std::ptr::null_mut(),
             )
         };
@@ -2535,7 +2733,10 @@ unsafe extern "C" fn eclipse_egl_get_display(display_id: *mut c_void) -> *mut c_
     let Some(host) = host_egl_get_display() else {
         return std::ptr::null_mut();
     };
-    let target = resolve_egl_display_target(display_id as usize, ndk_registry::wsi_display());
+    let target = resolve_egl_display_target(
+        display_id as usize,
+        ndk_registry::wsi_target().map(ndk_registry::WsiTarget::native_display),
+    );
 
     let host_fn: unsafe extern "C" fn(*mut c_void) -> *mut c_void =
         unsafe { std::mem::transmute(host) };
@@ -2905,13 +3106,14 @@ mod tests {
 
         assert_eq!(
             p.len(),
-            136 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
+            137 + super::super::bionic_pthread::PTHREAD_NATIVE_COUNT
                 + super::super::bionic_sysconf::SYSQ_NATIVE_COUNT
+                + super::super::bionic_locale::LOCALE_NATIVE_COUNT
                 + super::super::aaudio::AAUDIO_NATIVE_COUNT,
-            "6 liblog + 16 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
+            "6 liblog + 17 bionic-libc + 25 bionic-stdio + 7 bionic-signal + 2 link-map \
              introspection + 4 netdb resolver-ABI + 1 EGL display interception + 3 Vulkan WSI \
              interception + 3 dlfcn + 28 ndk-android + 33 media-ndk + 8 OpenSL ES + 26 AAudio + \
-             53 pthread + 5 sysconf system-query natives registered"
+             53 pthread + 6 sysconf system-query + 1 locale natives registered"
         );
         for name in [
             "__android_log_write",
@@ -2933,6 +3135,7 @@ mod tests {
             "__errno",
             "__assert2",
             "__gnu_strerror_r",
+            "strerror_r",
             "__system_property_get",
             "__stack_chk_guard",
             "__sF",
@@ -3285,10 +3488,64 @@ mod tests {
         assert_eq!(p, host, "__errno forwards to the glibc per-thread errno");
     }
 
+    fn call_bionic_strerror_r(errnum: c_int) -> (c_int, String) {
+        let env = crate::loader::bionic_env::BionicEnv::with_host_baseline(false, true);
+        let addr = env
+            .scope()
+            .resolve("strerror_r")
+            .expect("strerror_r resolves")
+            .addr;
+        let posix: unsafe extern "C" fn(c_int, *mut c_char, usize) -> c_int =
+            unsafe { std::mem::transmute::<u64, _>(addr) };
+        let mut buf = [0 as c_char; 1024];
+        let rc = unsafe { posix(errnum, buf.as_mut_ptr(), buf.len()) };
+        let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        (rc, text)
+    }
+
+    #[test]
+    fn bionic_strerror_r_keeps_the_posix_int_contract() {
+        assert_eq!(
+            call_bionic_strerror_r(libc::ENOENT),
+            (0, "No such file or directory".to_owned())
+        );
+        assert_eq!(
+            call_bionic_strerror_r(9999),
+            (0, "Unknown error 9999".to_owned())
+        );
+    }
+
+    #[test]
+    fn system_property_get_serves_the_device_api_level() {
+        ndk_registry::set_device_api_level(28);
+        let mut buf = [0xAAu8; PROP_VALUE_MAX];
+        let n = unsafe {
+            eclipse_system_property_get(SDK_VERSION_PROPERTY.as_ptr(), buf.as_mut_ptr().cast())
+        };
+        assert_eq!(n, 2, "bionic returns the value length");
+        assert_eq!(&buf[..3], b"28\0");
+    }
+
+    #[test]
+    fn system_property_get_serves_the_framework_build_manufacturer() {
+        let mut buf = [0xAAu8; PROP_VALUE_MAX];
+        let n = unsafe {
+            eclipse_system_property_get(MANUFACTURER_PROPERTY.as_ptr(), buf.as_mut_ptr().cast())
+        };
+        assert_eq!(n, 3, "bionic returns the value length");
+        assert_eq!(
+            &buf[..4],
+            b"HTC\0",
+            "native code sees the manufacturer android.os.Build reports"
+        );
+    }
+
     #[test]
     fn system_property_get_reports_unset() {
         let mut buf = [0xAAu8; 92];
-        let name = b"ro.build.version.sdk\0";
+        let name = b"ro.product.model\0";
 
         let n =
             unsafe { eclipse_system_property_get(name.as_ptr().cast(), buf.as_mut_ptr().cast()) };
@@ -4553,6 +4810,49 @@ mod tests {
         std::fs::remove_file(&apk).ok();
     }
 
+    const PUBLISHED_LOCALE_CHILD: &str = "ECLIPSE_TEST_PUBLISHED_LOCALE_CHILD";
+
+    #[test]
+    fn aconfiguration_reports_the_published_host_locale() {
+        if std::env::var_os(PUBLISHED_LOCALE_CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("the test harness executable must have a path"),
+            )
+            .args([
+                "--exact",
+                "loader::native_provider::tests::aconfiguration_reports_the_published_host_locale",
+                "--test-threads=1",
+            ])
+            .env(PUBLISHED_LOCALE_CHILD, "1")
+            .output()
+            .expect("the published-locale child must start");
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && report.contains("1 passed"),
+                "status={:?}, stdout={report}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(ndk_registry::set_configuration_locale(
+            ndk_registry::ConfigurationLocale {
+                language: *b"fr",
+                country: *b"FR",
+            }
+        ));
+        let cfg = eclipse_aconfiguration_new();
+        assert!(!cfg.is_null());
+        let mut language = [0u8; 2];
+        let mut country = [0u8; 2];
+        unsafe {
+            eclipse_aconfiguration_getlanguage(cfg, language.as_mut_ptr().cast());
+            eclipse_aconfiguration_getcountry(cfg, country.as_mut_ptr().cast());
+            eclipse_aconfiguration_delete(cfg);
+        }
+        assert_eq!((&language, &country), (b"fr", b"FR"));
+    }
+
     #[test]
     fn aconfiguration_getters_return_device_values() {
         let cfg = eclipse_aconfiguration_new();
@@ -4602,13 +4902,15 @@ mod tests {
             "forThread == the prepared looper"
         );
 
-        let added = unsafe {
-            eclipse_alooper_addfd(l1, 7, 1, 0, std::ptr::null_mut(), std::ptr::null_mut())
-        };
+        let pipe = NativeTestPipe::new();
+        let added =
+            unsafe { eclipse_alooper_addfd(l1, pipe.read_fd(), 1, 0, None, std::ptr::null_mut()) };
         assert_eq!(added, 1, "addFd on a valid looper returns 1");
 
-        let removed = unsafe { eclipse_alooper_removefd(l1, 7) };
-        assert_eq!(removed, 1, "removeFd on a valid looper returns 1");
+        let removed = unsafe { eclipse_alooper_removefd(l1, pipe.read_fd()) };
+        assert_eq!(removed, 1, "removeFd of a registered fd returns 1");
+        let again = unsafe { eclipse_alooper_removefd(l1, pipe.read_fd()) };
+        assert_eq!(again, 0, "removeFd of an unregistered fd returns 0");
 
         let finite = unsafe {
             eclipse_alooper_pollonce(
@@ -4625,9 +4927,7 @@ mod tests {
 
         let stale = handle_to_ptr::<c_void>(0xCAFE_0000_0000_0001);
 
-        let bad_add = unsafe {
-            eclipse_alooper_addfd(stale, 1, 1, 0, std::ptr::null_mut(), std::ptr::null_mut())
-        };
+        let bad_add = unsafe { eclipse_alooper_addfd(stale, 1, 1, 0, None, std::ptr::null_mut()) };
         assert_eq!(bad_add, -1, "addFd on a stale looper returns -1");
 
         unsafe {
@@ -4728,31 +5028,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_egl_display_target_maps_default_display_to_winit_wayland_only() {
-        let winit_wl_display: usize = 0x5000_1000;
+    fn resolve_egl_display_target_maps_default_display_to_the_recorded_window_display() {
+        let window_display: usize = 0x5000_1000;
 
         assert_eq!(
-            resolve_egl_display_target(0, Some(winit_wl_display)),
-            winit_wl_display,
-            "EGL_DEFAULT_DISPLAY on Wayland remaps to the registered winit wl_display"
+            resolve_egl_display_target(0, Some(window_display)),
+            window_display,
+            "EGL_DEFAULT_DISPLAY remaps to the recorded wl_display or Xlib Display*"
         );
 
         assert_eq!(
             resolve_egl_display_target(0, None),
             0,
-            "EGL_DEFAULT_DISPLAY on X11/other passes through unchanged"
+            "EGL_DEFAULT_DISPLAY passes through while no host window is recorded"
         );
 
         assert_eq!(
-            resolve_egl_display_target(0xABCD, Some(winit_wl_display)),
+            resolve_egl_display_target(0xABCD, Some(window_display)),
             0xABCD,
-            "a non-default display_id is never rewritten (Wayland)"
+            "a non-default display_id is never rewritten once a window is recorded"
         );
 
         assert_eq!(
             resolve_egl_display_target(0xABCD, None),
             0xABCD,
-            "a non-default display_id is never rewritten (X11/other)"
+            "a non-default display_id is never rewritten before a window is recorded"
         );
     }
 
@@ -5004,16 +5304,8 @@ mod tests {
             assert!(!looper.is_null());
             const IDENT: c_int = 42;
 
-            let added = unsafe {
-                eclipse_alooper_addfd(
-                    looper,
-                    fd,
-                    IDENT,
-                    1,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
+            let added =
+                unsafe { eclipse_alooper_addfd(looper, fd, IDENT, 1, None, std::ptr::null_mut()) };
             assert_eq!(added, 1, "addFd succeeds");
             ready_tx.send(()).expect("signal ready");
             let mut out_fd: c_int = -1;
@@ -5074,23 +5366,195 @@ mod tests {
     }
 
     #[test]
-    fn alooper_addfd_rejects_callback_and_negative_ident() {
+    fn alooper_addfd_rejects_only_a_negative_ident_without_callback() {
         std::thread::spawn(|| {
             let looper = eclipse_alooper_prepare(0);
+            let pipe = NativeTestPipe::new();
+            let fd = pipe.read_fd();
 
-            let mut sentinel: u8 = 0;
-            let cb = std::ptr::addr_of_mut!(sentinel).cast::<c_void>();
-
-            let r1 = unsafe { eclipse_alooper_addfd(looper, 3, 1, 1, cb, std::ptr::null_mut()) };
-            assert_eq!(r1, -1, "callback form rejected");
+            let r1 =
+                unsafe { eclipse_alooper_addfd(looper, fd, -1, 1, None, std::ptr::null_mut()) };
+            assert_eq!(r1, -1, "negative ident without a callback is rejected");
 
             let r2 = unsafe {
-                eclipse_alooper_addfd(looper, 3, -1, 1, std::ptr::null_mut(), std::ptr::null_mut())
+                eclipse_alooper_addfd(
+                    looper,
+                    fd,
+                    -1,
+                    1,
+                    Some(recording_callback),
+                    std::ptr::null_mut(),
+                )
             };
-            assert_eq!(r2, -1, "negative ident rejected");
+            assert_eq!(r2, 1, "a callback registration ignores the ident");
+            assert_eq!(unsafe { eclipse_alooper_removefd(looper, fd) }, 1);
         })
         .join()
         .expect("looper thread");
+    }
+
+    thread_local! {
+        static CALLBACK_CALLS: RefCell<Vec<(c_int, c_int, usize)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    const KEEP_CALLBACK: usize = 0x5eed;
+
+    unsafe extern "C" fn recording_callback(fd: c_int, events: c_int, data: *mut c_void) -> c_int {
+        let mut byte = 0u8;
+        let _ = unsafe { libc::read(fd, std::ptr::addr_of_mut!(byte).cast(), 1) };
+        CALLBACK_CALLS.with_borrow_mut(|calls| calls.push((fd, events, data as usize)));
+        c_int::from(data as usize == KEEP_CALLBACK)
+    }
+
+    fn poll_now(timeout: c_int) -> c_int {
+        unsafe {
+            eclipse_alooper_pollonce(
+                timeout,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    #[test]
+    fn alooper_callback_fd_dispatches_and_returns_poll_callback() {
+        std::thread::spawn(|| {
+            let looper = eclipse_alooper_prepare(0);
+            let mut pipe = NativeTestPipe::new();
+            let fd = pipe.read_fd();
+            let added = unsafe {
+                eclipse_alooper_addfd(
+                    looper,
+                    fd,
+                    0,
+                    ALOOPER_EVENT_INPUT,
+                    Some(recording_callback),
+                    KEEP_CALLBACK as *mut c_void,
+                )
+            };
+            assert_eq!(added, 1);
+            pipe.signal();
+            assert_eq!(poll_now(1000), ALOOPER_POLL_CALLBACK);
+            assert_eq!(
+                CALLBACK_CALLS.with_borrow(Clone::clone),
+                vec![(fd, ALOOPER_EVENT_INPUT, KEEP_CALLBACK)]
+            );
+            pipe.signal();
+            assert_eq!(
+                poll_now(1000),
+                ALOOPER_POLL_CALLBACK,
+                "a callback returning 1 stays"
+            );
+            assert_eq!(unsafe { eclipse_alooper_removefd(looper, fd) }, 1);
+        })
+        .join()
+        .expect("looper thread");
+    }
+
+    #[test]
+    fn alooper_callback_returning_zero_unregisters() {
+        std::thread::spawn(|| {
+            let looper = eclipse_alooper_prepare(0);
+            let mut pipe = NativeTestPipe::new();
+            let fd = pipe.read_fd();
+            let added = unsafe {
+                eclipse_alooper_addfd(
+                    looper,
+                    fd,
+                    0,
+                    ALOOPER_EVENT_INPUT,
+                    Some(recording_callback),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(added, 1);
+            pipe.signal();
+            assert_eq!(poll_now(1000), ALOOPER_POLL_CALLBACK);
+            pipe.signal();
+            assert_eq!(poll_now(10), ALOOPER_POLL_TIMEOUT);
+            assert_eq!(CALLBACK_CALLS.with_borrow(Vec::len), 1);
+            assert_eq!(unsafe { eclipse_alooper_removefd(looper, fd) }, 0);
+        })
+        .join()
+        .expect("looper thread");
+    }
+
+    #[test]
+    fn alooper_pollonce_reports_addfd_data() {
+        std::thread::spawn(|| {
+            let looper = eclipse_alooper_prepare(0);
+            let mut pipe = NativeTestPipe::new();
+            let fd = pipe.read_fd();
+            let added = unsafe {
+                eclipse_alooper_addfd(
+                    looper,
+                    fd,
+                    3,
+                    ALOOPER_EVENT_INPUT,
+                    None,
+                    0x1234 as *mut c_void,
+                )
+            };
+            assert_eq!(added, 1);
+            pipe.signal();
+            let mut out_fd: c_int = -1;
+            let mut out_events: c_int = -1;
+            let mut out_data: *mut c_void = std::ptr::null_mut();
+            let rc = unsafe {
+                eclipse_alooper_pollonce(1000, &mut out_fd, &mut out_events, &mut out_data)
+            };
+            assert_eq!((rc, out_fd, out_data as usize), (3, fd, 0x1234));
+            assert_ne!(out_events & ALOOPER_EVENT_INPUT, 0);
+            assert_eq!(unsafe { eclipse_alooper_removefd(looper, fd) }, 1);
+        })
+        .join()
+        .expect("looper thread");
+    }
+
+    static MAIN_THREAD_WAKES: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_main_thread_wake() {
+        MAIN_THREAD_WAKES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn main_thread_looper_wakes_the_host_loop_and_dispatches_there() {
+        std::thread::spawn(|| {
+            prepare_main_thread_looper(count_main_thread_wake).expect("main-thread looper");
+            let looper = eclipse_alooper_forthread();
+            assert!(!looper.is_null());
+            let mut pipe = NativeTestPipe::new();
+            let fd = pipe.read_fd();
+            let added = unsafe {
+                eclipse_alooper_addfd(
+                    looper,
+                    fd,
+                    0,
+                    ALOOPER_EVENT_INPUT,
+                    Some(recording_callback),
+                    KEEP_CALLBACK as *mut c_void,
+                )
+            };
+            assert_eq!(added, 1);
+            pipe.signal();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while MAIN_THREAD_WAKES.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the watcher never woke the loop"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            dispatch_main_thread_looper();
+            assert_eq!(
+                CALLBACK_CALLS.with_borrow(Clone::clone),
+                vec![(fd, ALOOPER_EVENT_INPUT, KEEP_CALLBACK)]
+            );
+            assert_eq!(unsafe { eclipse_alooper_removefd(looper, fd) }, 1);
+        })
+        .join()
+        .expect("main-thread stand-in");
     }
 
     #[test]
@@ -5114,16 +5578,7 @@ mod tests {
     fn alooper_addfd_removefd_on_stale_handle_return_minus_one() {
         let fabricated = handle_to_ptr::<c_void>(0xDEAD_0000_0001);
 
-        let add = unsafe {
-            eclipse_alooper_addfd(
-                fabricated,
-                5,
-                1,
-                1,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
+        let add = unsafe { eclipse_alooper_addfd(fabricated, 5, 1, 1, None, std::ptr::null_mut()) };
         assert_eq!(add, -1, "addFd on a fabricated handle is -1");
 
         let rem = unsafe { eclipse_alooper_removefd(fabricated, 5) };

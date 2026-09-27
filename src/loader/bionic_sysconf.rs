@@ -128,7 +128,37 @@ unsafe extern "C" fn eclipse_sysinfo(info: *mut c_void) -> c_int {
     r
 }
 
-pub const SYSQ_NATIVE_COUNT: usize = 5;
+#[repr(C)]
+struct BionicMallinfo {
+    arena: usize,
+    ordblks: usize,
+    smblks: usize,
+    hblks: usize,
+    hblkhd: usize,
+    usmblks: usize,
+    fsmblks: usize,
+    uordblks: usize,
+    fordblks: usize,
+    keepcost: usize,
+}
+
+extern "C" fn eclipse_mallinfo() -> BionicMallinfo {
+    let host = unsafe { libc::mallinfo2() };
+    BionicMallinfo {
+        arena: host.arena,
+        ordblks: host.ordblks,
+        smblks: host.smblks,
+        hblks: host.hblks,
+        hblkhd: host.hblkhd,
+        usmblks: host.arena + host.hblkhd,
+        fsmblks: host.fsmblks,
+        uordblks: host.uordblks + host.hblkhd,
+        fordblks: host.fordblks,
+        keepcost: host.keepcost,
+    }
+}
+
+pub const SYSQ_NATIVE_COUNT: usize = 6;
 
 pub fn register_natives(mut register: impl FnMut(&'static str, u64)) {
     register("sysconf", eclipse_sysconf as *const () as u64);
@@ -136,6 +166,7 @@ pub fn register_natives(mut register: impl FnMut(&'static str, u64)) {
     register("sched_getcpu", eclipse_sched_getcpu as *const () as u64);
     register("getpagesize", eclipse_getpagesize as *const () as u64);
     register("sysinfo", eclipse_sysinfo as *const () as u64);
+    register("mallinfo", eclipse_mallinfo as *const () as u64);
 }
 
 #[cfg(test)]
@@ -240,6 +271,24 @@ mod tests {
     }
 
     #[test]
+    fn mallinfo_fills_every_bionic_field_libroblox_reads() {
+        let scope =
+            super::super::bionic_env::BionicEnv::with_host_baseline(false, true).into_scope();
+        let addr = scope.resolve("mallinfo").expect("mallinfo resolves").addr;
+        let fill: unsafe extern "C" fn(*mut [usize; 10]) =
+            unsafe { std::mem::transmute(addr as usize) };
+        let live = std::hint::black_box(vec![1u8; 16 * 1024]);
+        let mut out = [usize::MAX; 10];
+        unsafe { fill(&mut out) };
+        let [_, _, _, _, _, usmblks, _, uordblks, fordblks, keepcost] = out;
+        assert_ne!(usmblks, usize::MAX);
+        assert_ne!(fordblks, usize::MAX);
+        assert_ne!(keepcost, usize::MAX);
+        assert!(uordblks >= live.len());
+        assert_eq!(usmblks, uordblks + fordblks);
+    }
+
+    #[test]
     fn registers_the_expected_system_query_natives() {
         let mut names: Vec<&'static str> = Vec::new();
         register_natives(|name, addr| {
@@ -252,6 +301,7 @@ mod tests {
             [
                 "getauxval",
                 "getpagesize",
+                "mallinfo",
                 "sched_getcpu",
                 "sysconf",
                 "sysinfo"
