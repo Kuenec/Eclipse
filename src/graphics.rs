@@ -6,9 +6,10 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::error::{EventLoopError, ExternalError, OsError};
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::platform::wayland::WindowAttributesExtWayland;
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
 
@@ -103,7 +104,7 @@ struct GameWindow<'vm> {
 
     pointer_lock: PointerLock,
 
-    engine_right_button: EngineRightButton,
+    engine_held: EngineHeldInput,
 
     relative_motion_units: RelativeMotionUnits,
 
@@ -112,6 +113,12 @@ struct GameWindow<'vm> {
     pending_pointer_motion: Option<PendingPointerMotion>,
 
     loopers_need_wake: bool,
+
+    ime: HostIme,
+
+    ime_area_support: ImeAreaSupport,
+
+    clipboard: Option<crate::clipboard::HostClipboard>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -178,13 +185,6 @@ impl DisplayRefreshProfile {
             .map(|rate| rate.get() as f32 / 1000.0)
             .collect()
     }
-
-    fn frame(&self) -> std::time::Duration {
-        const NANOS_PER_MILLIHERTZ_CYCLE: u64 = 1_000_000_000_000;
-        std::time::Duration::from_nanos(
-            NANOS_PER_MILLIHERTZ_CYCLE / u64::from(self.current_millihertz.get()),
-        )
-    }
 }
 
 fn normalize_display_refresh_profile(
@@ -232,7 +232,9 @@ fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
 
 impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes().with_title(self.title.clone());
+        let attrs = Window::default_attributes()
+            .with_title(self.title.clone())
+            .with_name(crate::APP_ID, "eclipse");
         let window = match event_loop.create_window(attrs) {
             Ok(window) => {
                 tracing::info!(title = %self.title, "host window created (winit, no GTK)");
@@ -313,8 +315,10 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             Some(crate::loader::ndk_registry::WsiTarget::Wayland { .. })
         ) {
             self.relative_motion_units = RelativeMotionUnits::SurfaceLogical;
+            self.ime_area_support = ImeAreaSupport::Rectangle;
         }
         crate::loader::ndk_registry::set_wsi_target(wsi_target);
+        self.clipboard = host_clipboard(&window);
 
         self.window = Some(window);
         self.publish_engine_display_refresh_rates();
@@ -371,7 +375,7 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 if !focused {
-                    self.release_pointer_lock_for_focus_loss();
+                    self.release_engine_input_for_focus_loss();
                 }
             }
 
@@ -473,9 +477,15 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
 
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
 
+            WindowEvent::KeyboardInput { event, .. } if is_fullscreen_key(&event.logical_key) => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    self.toggle_fullscreen();
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } if self.handed_off => {
                 let wv = crate::webview::client::active_view();
-                if wv != 0 {
+                if wv != 0 && !self.engine_holds_released_key(&event) {
                     match active_webview_key_route(&event.logical_key) {
                         ActiveWebViewKeyRoute::ActivityBack => {
                             if event.state == ElementState::Pressed {
@@ -488,6 +498,8 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
                     self.engine_key(&event);
                 }
             }
+
+            WindowEvent::Ime(ime) if self.handed_off => self.text_field_ime(ime),
 
             WindowEvent::MouseWheel { delta, .. } if self.handed_off => {
                 let wv = crate::webview::client::active_view();
@@ -575,18 +587,26 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
         }
         self.maybe_synthetic_engine_tap();
 
-        if self.handed_off && crate::framework::active_text_field() != 0 {
-            if let Some(vm) = self.vm {
-                crate::framework::query_textbox_geometry(vm);
-            }
+        let webview_active = crate::webview::client::active_view() != 0;
+        let text_box = if self.handed_off {
+            crate::framework::focused_text_box(vm)
+        } else {
+            None
+        };
+        self.sync_ime(ime_request(text_box.filter(|_| !webview_active)));
+        if let Some(text) = crate::framework::take_pending_host_clipboard_text() {
+            self.store_clipboard_text(text);
         }
 
-        if self.handed_off && crate::webview::client::active_view() != 0 {
+        if self.handed_off && webview_active {
             crate::webview::client::update_composited_rect();
         }
         if self.handed_off {
             self.poll_pointer_lock();
         }
+        crate::framework::set_engine_present_wakes_main_loop(
+            self.handed_off && !webview_active && self.engine_center_queryable(),
+        );
         self.sync_host_cursor();
         let now = std::time::Instant::now();
         if now >= self.next_display_refresh_poll {
@@ -597,14 +617,11 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             let main_thread_retry = (crate::framework::textbox_geometry_pending()
                 || crate::framework::global_layout_pending())
             .then(|| now + MAIN_THREAD_RETRY_DELAY);
-            let engine_center_poll = (crate::webview::client::active_view() == 0
-                && self.engine_center_queryable())
-            .then(|| self.display_frame());
             event_loop.set_control_flow(next_wake([
                 main_looper.deadline(now),
                 Some(self.next_display_refresh_poll),
                 main_thread_retry,
-                pointer_lock_recheck(self.pointer_lock, engine_center_poll, now),
+                pointer_lock_recheck(self.pointer_lock),
             ]));
         }
     }
@@ -640,6 +657,54 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutdown_runtime();
+        self.clipboard = None;
+    }
+}
+
+fn pass_key_to_engine(
+    vm: &crate::runtime::Vm,
+    action: crate::framework::KeyAction,
+    key: EngineKey,
+    repeat: bool,
+) -> bool {
+    match crate::framework::pass_hardware_key_to_engine(
+        vm,
+        action,
+        key.scan_code,
+        key.key_code,
+        repeat,
+    ) {
+        Ok(()) => {
+            static HARDWARE_KEY_PATH_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !HARDWARE_KEY_PATH_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("engine hardware-key input path active (keys not logged)");
+            } else {
+                tracing::trace!(?action, "engine hardware key dispatched (key not logged)");
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "engine key dispatch failed (ignored)");
+            false
+        }
+    }
+}
+
+fn host_clipboard(window: &Window) -> Option<crate::clipboard::HostClipboard> {
+    let display = match window.display_handle() {
+        Ok(display) => display.as_raw(),
+        Err(error) => {
+            tracing::warn!(%error, "no display handle; text-box copy and paste are unavailable");
+            return None;
+        }
+    };
+    match unsafe { crate::clipboard::HostClipboard::for_display_that_outlives_it(display) } {
+        Ok(clipboard) => Some(clipboard),
+        Err(error) => {
+            tracing::warn!(%error, "host clipboard unavailable; text-box copy and paste are disabled");
+            None
+        }
     }
 }
 
@@ -662,27 +727,104 @@ enum ActiveWebViewKeyRoute {
     Chromium,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EngineKeyRoute {
-    TextEdit,
-    Consume,
-    Engine,
+fn is_fullscreen_key(key: &winit::keyboard::Key) -> bool {
+    matches!(
+        key,
+        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11)
+    )
 }
 
-fn engine_key_route(
-    active_text_field: bool,
-    pressed: bool,
-    editable: bool,
-    menu_toggle: bool,
-) -> EngineKeyRoute {
-    if active_text_field && !menu_toggle {
-        if pressed && editable {
-            EngineKeyRoute::TextEdit
-        } else {
-            EngineKeyRoute::Consume
+fn next_fullscreen(current: Option<Fullscreen>) -> Option<Fullscreen> {
+    match current {
+        Some(_) => None,
+        None => Some(Fullscreen::Borderless(None)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImeRequest {
+    area: (i32, i32, u32, u32),
+}
+
+fn ime_request(text_box: Option<crate::framework::FocusedTextBox>) -> Option<ImeRequest> {
+    text_box
+        .filter(|text_box| !text_box.masked)
+        .map(|text_box| ImeRequest {
+            area: text_box.geometry,
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostIme {
+    Disallowed,
+    Allowed { sent: Option<ImeRequest> },
+}
+
+impl HostIme {
+    fn after_sending(wanted: Option<ImeRequest>) -> Self {
+        match wanted {
+            Some(request) => Self::Allowed {
+                sent: Some(request),
+            },
+            None => Self::Disallowed,
         }
-    } else {
-        EngineKeyRoute::Engine
+    }
+
+    fn after_enabled(self) -> Self {
+        match self {
+            Self::Allowed { .. } => Self::Allowed { sent: None },
+            Self::Disallowed => Self::Disallowed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImeCall {
+    Allow(bool),
+    CursorArea((i32, i32, u32, u32)),
+}
+
+fn ime_calls(host: HostIme, wanted: Option<ImeRequest>) -> impl Iterator<Item = ImeCall> {
+    let (allow, sent) = match (host, wanted) {
+        (HostIme::Disallowed, None) => (None, None),
+        (HostIme::Disallowed, Some(_)) => (Some(true), None),
+        (HostIme::Allowed { .. }, None) => (Some(false), None),
+        (HostIme::Allowed { sent }, Some(_)) => (None, sent),
+    };
+    let area = wanted
+        .filter(|request| sent != Some(*request))
+        .map(|request| ImeCall::CursorArea(request.area));
+    [allow.map(ImeCall::Allow), area].into_iter().flatten()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImeAreaSupport {
+    Rectangle,
+    TopLeftSpot,
+}
+
+fn ime_cursor_area(
+    support: ImeAreaSupport,
+    (x, y, width, height): (i32, i32, u32, u32),
+) -> ((i32, i32), (u32, u32)) {
+    match support {
+        ImeAreaSupport::Rectangle => ((x, y), (width, height)),
+        ImeAreaSupport::TopLeftSpot => ((x, y.saturating_add_unsigned(height)), (width, 0)),
+    }
+}
+
+fn engine_scan_code(physical: winit::keyboard::PhysicalKey) -> Option<i32> {
+    use winit::platform::scancode::PhysicalKeyExtScancode;
+    physical
+        .to_scancode()
+        .and_then(|code| i32::try_from(code).ok())
+}
+
+fn key_edge(event: &winit::event::KeyEvent) -> crate::input::KeyEdge {
+    match (event.state, event.repeat) {
+        (ElementState::Released, _) => crate::input::KeyEdge::Release,
+        (ElementState::Pressed, true) => crate::input::KeyEdge::Repeat,
+        (ElementState::Pressed, false) => crate::input::KeyEdge::Press,
     }
 }
 
@@ -755,18 +897,46 @@ impl PointerLockReasons {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EngineRightButton {
-    Up,
-    Down,
+struct EngineKey {
+    scan_code: i32,
+    key_code: i32,
 }
 
-impl EngineRightButton {
-    fn after_dispatch(self, button: MouseButton, pressed: bool) -> Self {
-        match (button, pressed) {
-            (MouseButton::Right, true) => Self::Down,
-            (MouseButton::Right, false) => Self::Up,
-            _ => self,
+#[derive(Debug, Default, Eq, PartialEq)]
+struct EngineHeldInput {
+    keys: Vec<EngineKey>,
+    buttons: Vec<i32>,
+}
+
+impl EngineHeldInput {
+    fn press_key(&mut self, key: EngineKey) {
+        if !self.holds_key(key.scan_code) {
+            self.keys.push(key);
         }
+    }
+
+    fn holds_key(&self, scan_code: i32) -> bool {
+        self.keys.iter().any(|held| held.scan_code == scan_code)
+    }
+
+    fn release_key(&mut self, scan_code: i32) -> Option<EngineKey> {
+        let index = self
+            .keys
+            .iter()
+            .position(|held| held.scan_code == scan_code)?;
+        Some(self.keys.swap_remove(index))
+    }
+
+    fn press_button(&mut self, button: i32) {
+        if !self.buttons.contains(&button) {
+            self.buttons.push(button);
+        }
+    }
+
+    fn release_button(&mut self, button: i32) -> bool {
+        let held = self.buttons.len();
+        self.buttons.retain(|&pressed| pressed != button);
+        self.buttons.len() != held
     }
 }
 
@@ -828,32 +998,10 @@ fn pointer_lock_step(
     }
 }
 
-fn pointer_lock_recheck(
-    lock: PointerLock,
-    engine_center_poll: Option<std::time::Duration>,
-    now: std::time::Instant,
-) -> Option<std::time::Instant> {
-    let retry = match lock {
+fn pointer_lock_recheck(lock: PointerLock) -> Option<std::time::Instant> {
+    match lock {
         PointerLock::Refused { at } => Some(at + POINTER_LOCK_RETRY_DELAY),
         PointerLock::Free | PointerLock::Held { .. } => None,
-    };
-    [engine_center_poll.map(|interval| now + interval), retry]
-        .into_iter()
-        .flatten()
-        .min()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FocusLossRelease {
-    RightButtonAndPointerLock,
-    PointerLock,
-}
-
-fn focus_loss_release(right_button: EngineRightButton) -> FocusLossRelease {
-    if right_button == EngineRightButton::Down {
-        FocusLossRelease::RightButtonAndPointerLock
-    } else {
-        FocusLossRelease::PointerLock
     }
 }
 
@@ -1105,8 +1253,11 @@ impl GameWindow<'_> {
             tracing::debug!("engine surface press queued active text field revalidation");
         }
         if self.touch_mode == crate::config::TouchMode::Off {
-            if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, true, 0) {
-                tracing::warn!(error = %e, "engine desktop mouse-button down dispatch failed (ignored)");
+            match crate::framework::dispatch_mouse_button(vm, px, py, true, 0) {
+                Ok(()) => self.engine_held.press_button(0),
+                Err(e) => {
+                    tracing::warn!(error = %e, "engine desktop mouse-button down dispatch failed (ignored)")
+                }
             }
             return;
         }
@@ -1137,6 +1288,9 @@ impl GameWindow<'_> {
         let Some(vm) = self.vm else { return };
         let Some((px, py)) = self.cursor else { return };
         if self.touch_mode == crate::config::TouchMode::Off {
+            if !self.engine_held.release_button(0) {
+                return;
+            }
             if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, false, 0) {
                 tracing::warn!(error = %e, "engine desktop mouse-button up dispatch failed (ignored)");
             }
@@ -1225,11 +1379,16 @@ impl GameWindow<'_> {
         };
         let Some(vm) = self.vm else { return };
         let Some((px, py)) = self.cursor else { return };
-        if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, pressed, android_button)
-        {
-            tracing::warn!(error = %e, "engine auxiliary mouse-button dispatch failed (ignored)");
+        if !pressed && !self.engine_held.release_button(android_button) {
+            return;
         }
-        self.engine_right_button = self.engine_right_button.after_dispatch(button, pressed);
+        match crate::framework::dispatch_mouse_button(vm, px, py, pressed, android_button) {
+            Ok(()) if pressed => self.engine_held.press_button(android_button),
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "engine auxiliary mouse-button dispatch failed (ignored)")
+            }
+        }
     }
 
     fn poll_pointer_lock(&mut self) {
@@ -1248,12 +1407,6 @@ impl GameWindow<'_> {
         self.focused
             && self.touch_mode == crate::config::TouchMode::Off
             && !self.engine_center_query_failed
-    }
-
-    fn display_frame(&self) -> std::time::Duration {
-        self.published_display_refresh_profile
-            .as_ref()
-            .map_or(MAIN_THREAD_RETRY_DELAY, DisplayRefreshProfile::frame)
     }
 
     fn query_engine_center(&mut self) -> bool {
@@ -1328,11 +1481,21 @@ impl GameWindow<'_> {
         }
     }
 
-    fn release_pointer_lock_for_focus_loss(&mut self) {
-        if focus_loss_release(self.engine_right_button)
-            == FocusLossRelease::RightButtonAndPointerLock
-        {
-            self.engine_aux_mouse_button(MouseButton::Right, false);
+    fn release_engine_input_for_focus_loss(&mut self) {
+        let held = std::mem::take(&mut self.engine_held);
+        if let Some(vm) = self.vm {
+            for key in held.keys {
+                pass_key_to_engine(vm, crate::framework::KeyAction::Up, key, false);
+            }
+            let (px, py) = self.cursor.unwrap_or((0.0, 0.0));
+            for button in held.buttons {
+                if let Err(e) = crate::framework::dispatch_mouse_button(vm, px, py, false, button) {
+                    tracing::warn!(error = %e, button, "engine focus-loss mouse-button release failed");
+                }
+            }
+        }
+        if self.engine_tap_downtime.is_some() {
+            self.engine_primary_release();
         }
         self.update_pointer_lock(PointerLockReasons::default());
     }
@@ -1355,107 +1518,173 @@ impl GameWindow<'_> {
         self.host_cursor = cursor;
     }
 
-    fn engine_key(&mut self, event: &winit::event::KeyEvent) {
-        use winit::platform::scancode::PhysicalKeyExtScancode;
+    fn engine_holds_released_key(&self, event: &winit::event::KeyEvent) -> bool {
+        event.state == ElementState::Released
+            && engine_scan_code(event.physical_key)
+                .is_some_and(|scan_code| self.engine_held.holds_key(scan_code))
+    }
 
-        let pressed = event.state == ElementState::Pressed;
-        let Some(scan_code) = event
-            .physical_key
-            .to_scancode()
-            .and_then(|code| i32::try_from(code).ok())
-        else {
+    fn engine_key(&mut self, event: &winit::event::KeyEvent) {
+        use crate::input::{KeyEdge, TextFieldKey};
+
+        let Some(vm) = self.vm else { return };
+        let Some(scan_code) = engine_scan_code(event.physical_key) else {
             return;
         };
-
-        let key_code = winit_keycode(&event.logical_key).unwrap_or(0);
-
-        let unicode = event
-            .text
-            .as_ref()
-            .and_then(|s| s.chars().next())
-            .map(|c| c as i32)
-            .unwrap_or(0);
-        let Some(vm) = self.vm else { return };
-
-        let active_text_field = crate::framework::active_text_field() != 0;
-        let select_all = active_text_field
-            && self.modifiers.control_key()
-            && matches!(
-                &event.logical_key,
-                winit::keyboard::Key::Character(character)
-                    if character.eq_ignore_ascii_case("a")
-            );
-        if pressed && select_all {
-            crate::framework::select_all_active_text_field();
-        }
-
-        let command_modifier =
-            self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
-        let backspace = key_code == 67 && !command_modifier;
-        let line_break = !command_modifier
-            && matches!(
-                event.logical_key,
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter)
-            )
-            && crate::framework::active_text_field_accepts_line_breaks();
-        let tab = !command_modifier
-            && matches!(
-                event.logical_key,
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab)
-            );
-        let printable = !command_modifier
-            && unicode != 0
-            && char::from_u32(unicode as u32).is_some_and(|c| !c.is_control());
-        let edit_unicode = if line_break {
-            '\n' as i32
-        } else if tab {
-            '\t' as i32
-        } else {
-            unicode
-        };
-        let menu_toggle = matches!(
-            event.logical_key,
-            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Insert)
-        );
-        match engine_key_route(
-            active_text_field,
-            pressed,
-            printable || backspace || line_break || tab,
-            menu_toggle,
-        ) {
-            EngineKeyRoute::TextEdit
-                if crate::framework::type_into_active_text_field(vm, edit_unicode, backspace) =>
-            {
-                tracing::debug!(pressed, "engine key → active text field (typed)");
+        let edge = key_edge(event);
+        if edge == KeyEdge::Release {
+            if let Some(key) = self.engine_held.release_key(scan_code) {
+                pass_key_to_engine(vm, crate::framework::KeyAction::Up, key, false);
                 return;
             }
-            EngineKeyRoute::Consume => return,
-            EngineKeyRoute::TextEdit | EngineKeyRoute::Engine => {}
         }
-        let action = if pressed {
-            crate::framework::KeyAction::Down
-        } else {
-            crate::framework::KeyAction::Up
+        let action = match crate::framework::focused_text_box(vm) {
+            Some(text_box) => crate::input::text_field_key(
+                &event.logical_key,
+                event.physical_key,
+                event.text.as_deref(),
+                self.modifiers,
+                text_box.multiline,
+                edge,
+            ),
+            None => TextFieldKey::Engine,
         };
-        match crate::framework::pass_hardware_key_to_engine(
-            vm,
-            action,
-            scan_code,
-            key_code,
-            event.repeat,
-        ) {
-            Ok(()) => {
-                static HARDWARE_KEY_PATH_LOGGED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !HARDWARE_KEY_PATH_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::info!("engine hardware-key input path active (keys not logged)");
-                } else {
-                    tracing::trace!(pressed, "engine hardware key dispatched (key not logged)");
+        match action {
+            TextFieldKey::Engine => {
+                if edge == KeyEdge::Release {
+                    return;
+                }
+                let key = EngineKey {
+                    scan_code,
+                    key_code: winit_keycode(&event.logical_key).unwrap_or(0),
+                };
+                if pass_key_to_engine(vm, crate::framework::KeyAction::Down, key, event.repeat) {
+                    self.engine_held.press_key(key);
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "engine key dispatch failed (ignored)");
+            TextFieldKey::Edit(edit) => {
+                if !crate::framework::edit_active_text_field(vm, edit) {
+                    tracing::debug!("text-field key arrived after the text box lost focus");
+                }
             }
+            TextFieldKey::Submit => {
+                if let Err(error) = crate::framework::submit_active_text_field(vm) {
+                    tracing::warn!(%error, "Enter could not submit the focused text box");
+                }
+            }
+            TextFieldKey::Dismiss => {
+                if let Err(error) = crate::framework::release_active_text_field(vm) {
+                    tracing::warn!(%error, "Escape could not release the focused text box");
+                }
+            }
+            TextFieldKey::SelectAll => {
+                crate::framework::select_all_active_text_field();
+            }
+            TextFieldKey::Clipboard(shortcut) => self.clipboard_shortcut(vm, shortcut),
+            TextFieldKey::Ignore => {}
+        }
+    }
+
+    fn clipboard_shortcut(
+        &mut self,
+        vm: &crate::runtime::Vm,
+        shortcut: crate::input::ClipboardShortcut,
+    ) {
+        use crate::framework::SelectionTransfer;
+        use crate::input::ClipboardShortcut;
+
+        let transfer = match shortcut {
+            ClipboardShortcut::Copy => SelectionTransfer::Copy,
+            ClipboardShortcut::Cut => SelectionTransfer::Cut,
+            ClipboardShortcut::Paste => {
+                self.paste_into_text_field(vm);
+                return;
+            }
+        };
+        let Some(selected) = crate::framework::active_text_field_selection(vm, transfer) else {
+            return;
+        };
+        if self.store_clipboard_text(selected) && transfer == SelectionTransfer::Cut {
+            crate::framework::edit_active_text_field(
+                vm,
+                crate::framework::TextEdit::Backspace(crate::framework::TextUnit::Character),
+            );
+        }
+    }
+
+    fn paste_into_text_field(&mut self, vm: &crate::runtime::Vm) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            tracing::warn!("paste ignored: no host clipboard is available");
+            return;
+        };
+        match clipboard.load() {
+            Ok(text) => {
+                crate::framework::edit_active_text_field(
+                    vm,
+                    crate::framework::TextEdit::Paste(&text),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "paste ignored: reading the host clipboard failed")
+            }
+        }
+    }
+
+    fn store_clipboard_text(&self, text: String) -> bool {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            tracing::warn!("copy ignored: no host clipboard is available");
+            return false;
+        };
+        match clipboard.store(text) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "copy ignored: writing the host clipboard failed");
+                false
+            }
+        }
+    }
+
+    fn text_field_ime(&mut self, ime: Ime) {
+        let Some(vm) = self.vm else { return };
+        let edit = match &ime {
+            Ime::Enabled => {
+                self.ime = self.ime.after_enabled();
+                return;
+            }
+            Ime::Preedit(text, cursor) => crate::framework::TextEdit::Compose {
+                text,
+                cursor: cursor.map(|(start, _)| start),
+            },
+            Ime::Commit(text) => crate::framework::TextEdit::Type(text),
+            Ime::Disabled => crate::framework::TextEdit::FinishComposing,
+        };
+        if !crate::framework::edit_active_text_field(vm, edit) {
+            tracing::debug!("IME input arrived without a focused text box");
+        }
+    }
+
+    fn sync_ime(&mut self, wanted: Option<ImeRequest>) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        for call in ime_calls(self.ime, wanted) {
+            match call {
+                ImeCall::Allow(allowed) => window.set_ime_allowed(allowed),
+                ImeCall::CursorArea(area) => {
+                    let ((x, y), (width, height)) = ime_cursor_area(self.ime_area_support, area);
+                    window.set_ime_cursor_area(
+                        PhysicalPosition::new(x, y),
+                        winit::dpi::PhysicalSize::new(width, height),
+                    );
+                }
+            }
+        }
+        self.ime = HostIme::after_sending(wanted);
+    }
+
+    fn toggle_fullscreen(&self) {
+        if let Some(window) = self.window.as_ref() {
+            window.set_fullscreen(next_fullscreen(window.fullscreen()));
         }
     }
 
@@ -1584,11 +1813,11 @@ impl GameWindow<'_> {
                         "synthetic TYPE (stage 2): field focused — typing into the active text field"
                     );
                     if let Some(vm) = self.vm {
-                        for ch in text.chars() {
-                            let handled =
-                                crate::framework::type_into_active_text_field(vm, ch as i32, false);
-                            tracing::info!(handled, "synthetic TYPE char → active text field");
-                        }
+                        let handled = crate::framework::edit_active_text_field(
+                            vm,
+                            crate::framework::TextEdit::Type(&text),
+                        );
+                        tracing::info!(handled, "synthetic TYPE text → active text field");
                     }
 
                     crate::loader::ndk_registry::wake_all_loopers();
@@ -1670,11 +1899,11 @@ impl GameWindow<'_> {
                         "synthetic TYPE2 (stage 4): typing into the field focused after Next (password)"
                     );
                     if let Some(vm) = self.vm {
-                        for ch in text.chars() {
-                            let handled =
-                                crate::framework::type_into_active_text_field(vm, ch as i32, false);
-                            tracing::info!(handled, "synthetic TYPE2 char → active text field");
-                        }
+                        let handled = crate::framework::edit_active_text_field(
+                            vm,
+                            crate::framework::TextEdit::Type(&text),
+                        );
+                        tracing::info!(handled, "synthetic TYPE2 text → active text field");
                     }
                     crate::loader::ndk_registry::wake_all_loopers();
                 }
@@ -1749,11 +1978,14 @@ pub fn run_windowed(
         host_cursor: HostCursor::Shown,
         pointer_lock_reasons: PointerLockReasons::default(),
         pointer_lock: PointerLock::Free,
-        engine_right_button: EngineRightButton::Up,
+        engine_held: EngineHeldInput::default(),
         relative_motion_units: RelativeMotionUnits::DeviceCounts,
         engine_center_query_failed: false,
         pending_pointer_motion: None,
         loopers_need_wake: false,
+        ime: HostIme::Disallowed,
+        ime_area_support: ImeAreaSupport::TopLeftSpot,
+        clipboard: None,
     };
     let run = event_loop.run_app(&mut app);
 
@@ -6310,30 +6542,45 @@ mod tests {
     }
 
     #[test]
-    fn focus_loss_releases_the_engine_right_button_only_while_it_is_down() {
-        let pressed = EngineRightButton::Up.after_dispatch(MouseButton::Right, true);
-        assert_eq!(pressed, EngineRightButton::Down);
+    fn focus_loss_releases_every_key_and_button_the_engine_holds() {
+        let w = EngineKey {
+            scan_code: 17,
+            key_code: 51,
+        };
+        let shift = EngineKey {
+            scan_code: 42,
+            key_code: 0,
+        };
+        let mut held = EngineHeldInput::default();
+        held.press_key(w);
+        held.press_key(w);
+        held.press_key(shift);
+        assert_eq!(held.release_key(shift.scan_code), Some(shift));
+        held.press_button(0);
+        held.press_button(1);
+        assert!(held.release_button(1));
+        assert!(!held.release_button(3));
+
         assert_eq!(
-            focus_loss_release(pressed),
-            FocusLossRelease::RightButtonAndPointerLock
-        );
-
-        let released = pressed.after_dispatch(MouseButton::Right, false);
-        assert_eq!(released, EngineRightButton::Up);
-        assert_eq!(focus_loss_release(released), FocusLossRelease::PointerLock);
-
-        for held in [EngineRightButton::Up, EngineRightButton::Down] {
-            for button in [
-                MouseButton::Left,
-                MouseButton::Middle,
-                MouseButton::Back,
-                MouseButton::Forward,
-            ] {
-                for pressed in [true, false] {
-                    assert_eq!(held.after_dispatch(button, pressed), held);
-                }
+            std::mem::take(&mut held),
+            EngineHeldInput {
+                keys: vec![w],
+                buttons: vec![0],
             }
-        }
+        );
+        assert_eq!(held, EngineHeldInput::default());
+    }
+
+    #[test]
+    fn a_key_release_reuses_the_key_code_sent_with_its_press() {
+        let slash = EngineKey {
+            scan_code: 53,
+            key_code: 76,
+        };
+        let mut held = EngineHeldInput::default();
+        held.press_key(slash);
+        assert_eq!(held.release_key(53), Some(slash));
+        assert_eq!(held.release_key(53), None);
     }
 
     #[test]
@@ -6351,11 +6598,9 @@ mod tests {
             true,
         );
         assert_eq!(reasons, PointerLockReasons::default());
-        let right_button = EngineRightButton::Up.after_dispatch(MouseButton::Right, true);
-        assert_eq!(
-            focus_loss_release(right_button),
-            FocusLossRelease::RightButtonAndPointerLock
-        );
+        let mut held = EngineHeldInput::default();
+        held.press_button(desktop_mouse_button(MouseButton::Right).expect("right button"));
+        assert_eq!(held.buttons, vec![1]);
     }
 
     #[test]
@@ -6422,20 +6667,14 @@ mod tests {
     }
 
     #[test]
-    fn pointer_lock_is_rechecked_every_frame_while_the_engine_can_lock_it() {
-        let now = std::time::Instant::now();
-        let frame = std::time::Duration::from_micros(6_945);
+    fn a_free_or_held_pointer_lock_sets_no_display_rate_timer() {
         let held = PointerLock::Held {
             anchor: (320.0, 240.0),
             grab: PointerGrab::Locked,
         };
 
         for lock in [PointerLock::Free, held] {
-            assert_eq!(
-                pointer_lock_recheck(lock, Some(frame), now),
-                Some(now + frame)
-            );
-            assert_eq!(pointer_lock_recheck(lock, None, now), None);
+            assert_eq!(pointer_lock_recheck(lock), None);
         }
     }
 
@@ -6443,25 +6682,11 @@ mod tests {
     fn a_refused_lock_wakes_the_loop_for_its_retry() {
         let now = std::time::Instant::now();
         let refused = PointerLock::Refused { at: now };
-        let frame = std::time::Duration::from_micros(16_667);
 
         assert_eq!(
-            pointer_lock_recheck(refused, None, now),
+            pointer_lock_recheck(refused),
             Some(now + POINTER_LOCK_RETRY_DELAY)
         );
-        assert_eq!(
-            pointer_lock_recheck(refused, Some(frame), now),
-            Some(now + frame)
-        );
-    }
-
-    #[test]
-    fn a_display_frame_lasts_one_refresh_period() {
-        let frame = |current_millihertz| monitor_profile(current_millihertz, (1, 1), &[]).frame();
-
-        assert_eq!(frame(60_000), std::time::Duration::from_nanos(16_666_666));
-        assert_eq!(frame(143_996), std::time::Duration::from_nanos(6_944_637));
-        assert_eq!(frame(360_000), std::time::Duration::from_nanos(2_777_777));
     }
 
     #[test]
@@ -6525,26 +6750,76 @@ mod tests {
     }
 
     #[test]
-    fn focused_text_field_consumes_both_key_edges_and_non_text_keys() {
+    fn f11_toggles_borderless_fullscreen_and_no_other_key_does() {
+        use winit::keyboard::{Key, NamedKey};
+
+        assert!(is_fullscreen_key(&Key::Named(NamedKey::F11)));
+        assert!(!is_fullscreen_key(&Key::Named(NamedKey::F10)));
+        assert!(!is_fullscreen_key(&Key::Character("f".into())));
+        assert_eq!(next_fullscreen(None), Some(Fullscreen::Borderless(None)));
+        assert_eq!(next_fullscreen(Some(Fullscreen::Borderless(None))), None);
+    }
+
+    #[test]
+    fn the_ime_is_requested_only_for_a_focused_text_box() {
+        let text_box = |masked| crate::framework::FocusedTextBox {
+            geometry: (181, 149, 438, 46),
+            multiline: false,
+            masked,
+        };
+
+        assert_eq!(ime_request(None), None);
         assert_eq!(
-            engine_key_route(true, true, true, false),
-            EngineKeyRoute::TextEdit
+            ime_request(Some(text_box(false))),
+            Some(ImeRequest {
+                area: (181, 149, 438, 46),
+            })
+        );
+        assert_eq!(ime_request(Some(text_box(true))), None);
+    }
+
+    #[test]
+    fn the_ime_is_allowed_before_its_cursor_area_which_is_resent_after_every_enable() {
+        let calls =
+            |host: HostIme, wanted: Option<ImeRequest>| ime_calls(host, wanted).collect::<Vec<_>>();
+        let box_area = (181, 149, 438, 46);
+        let focused = Some(ImeRequest { area: box_area });
+
+        assert_eq!(
+            calls(HostIme::Disallowed, focused),
+            [ImeCall::Allow(true), ImeCall::CursorArea(box_area)]
+        );
+        let sent = HostIme::after_sending(focused);
+        assert_eq!(calls(sent, focused), []);
+        assert_eq!(
+            calls(sent.after_enabled(), focused),
+            [ImeCall::CursorArea(box_area)]
+        );
+        let moved = (181, 300, 438, 46);
+        assert_eq!(
+            calls(sent, Some(ImeRequest { area: moved })),
+            [ImeCall::CursorArea(moved)]
+        );
+        assert_eq!(calls(sent, None), [ImeCall::Allow(false)]);
+        assert_eq!(calls(HostIme::Disallowed, None), []);
+        assert_eq!(HostIme::Disallowed.after_enabled(), HostIme::Disallowed);
+    }
+
+    #[test]
+    fn the_ime_candidate_window_keeps_clear_of_the_text_box() {
+        let box_area = (181, 149, 438, 46);
+
+        assert_eq!(
+            ime_cursor_area(ImeAreaSupport::Rectangle, box_area),
+            ((181, 149), (438, 46))
         );
         assert_eq!(
-            engine_key_route(true, false, true, false),
-            EngineKeyRoute::Consume
+            ime_cursor_area(ImeAreaSupport::TopLeftSpot, box_area),
+            ((181, 195), (438, 0))
         );
         assert_eq!(
-            engine_key_route(true, true, false, false),
-            EngineKeyRoute::Consume
-        );
-        assert_eq!(
-            engine_key_route(true, true, false, true),
-            EngineKeyRoute::Engine
-        );
-        assert_eq!(
-            engine_key_route(false, true, true, false),
-            EngineKeyRoute::Engine
+            ime_cursor_area(ImeAreaSupport::TopLeftSpot, (0, i32::MAX - 1, 10, 46)),
+            ((0, i32::MAX), (10, 0))
         );
     }
 

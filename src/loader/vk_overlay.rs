@@ -283,10 +283,6 @@ fn paint_caret(caret: (f32, f32), layout: &TextLayout, mut paint: impl FnMut(usi
     }
 }
 
-fn overlay_text_is_masked(input_type: i32) -> bool {
-    !matches!(input_type, 0..=4 | 7 | 8)
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum OverlayText {
     Plain(String),
@@ -295,7 +291,7 @@ enum OverlayText {
 
 impl OverlayText {
     fn of(overlay: &crate::framework::ActiveTextOverlay) -> Self {
-        if overlay_text_is_masked(overlay.input_type) {
+        if crate::framework::text_input_type_masks_text(overlay.input_type) {
             Self::Masked {
                 chars: overlay.text.chars().count(),
             }
@@ -307,10 +303,12 @@ impl OverlayText {
     fn shows(&self, overlay: &crate::framework::ActiveTextOverlay) -> bool {
         match self {
             Self::Plain(text) => {
-                !overlay_text_is_masked(overlay.input_type) && *text == overlay.text
+                !crate::framework::text_input_type_masks_text(overlay.input_type)
+                    && *text == overlay.text
             }
             Self::Masked { chars } => {
-                overlay_text_is_masked(overlay.input_type) && *chars == overlay.text.chars().count()
+                crate::framework::text_input_type_masks_text(overlay.input_type)
+                    && *chars == overlay.text.chars().count()
             }
         }
     }
@@ -3044,6 +3042,7 @@ unsafe extern "system" fn eclipse_vk_queue_present_khr(
         unsafe { std::mem::transmute::<usize, vk::PFN_vkQueuePresentKHR>(addr) };
 
     note_engine_present();
+    crate::framework::engine_presented();
     let _swapchain = swapchain_lock();
     unsafe {
         present_with_overlay(

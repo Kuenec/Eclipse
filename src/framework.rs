@@ -3156,11 +3156,14 @@ extern "system" fn view_native_set_layout_params<'local>(
             v.layout.weight = weight;
             v.layout.margins = [left_margin, top_margin, right_margin, bottom_margin];
         }) {
-            Ok(()) => tracing::trace!(
-                target: "android.view.View",
-                widget, width, height, gravity, weight,
-                "View.native_setLayoutParams: recorded layout params on view peer"
-            ),
+            Ok(()) => {
+                tracing::trace!(
+                    target: "android.view.View",
+                    widget, width, height, gravity, weight,
+                    "View.native_setLayoutParams: recorded layout params on view peer"
+                );
+                request_textbox_refresh(widget);
+            }
             Err(e) => tracing::debug!(
                 target: "android.view.View",
                 widget,
@@ -3250,6 +3253,7 @@ extern "system" fn view_native_set_visibility<'local>(
                 sensitive,
                 "View.native_setVisibility: validated handle, visibility retained by Java view state"
             );
+            text_field_visibility_changed(widget, visibility);
         }
         Ok(())
     })
@@ -8538,6 +8542,18 @@ static ACTIVE_TEXT_SELECTION_ALL: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 static ACTIVE_TEXT_CURSOR_UTF16: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
+static ACTIVE_TEXT_COMPOSING: std::sync::Mutex<Option<ComposingRegion>> =
+    std::sync::Mutex::new(None);
+static TEXTBOX_REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const VIEW_VISIBLE: jint = 0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComposingRegion {
+    widget: i64,
+    start_utf16: jint,
+    end_utf16: jint,
+}
 
 const ROBLOX_CODE_FONT: i32 = 10;
 const ROBLOX_CODE_FONT_RATIO: f32 = 0.953_288_85;
@@ -8558,13 +8574,35 @@ pub fn active_text_field() -> i64 {
 
 pub fn clear_active_text_field() -> bool {
     let widget = ACTIVE_TEXT_FIELD.swap(0, std::sync::atomic::Ordering::AcqRel);
+    reset_text_field_state();
+    widget != 0
+}
+
+fn reset_text_field_state() {
+    TEXTBOX_REFRESH.store(false, std::sync::atomic::Ordering::Release);
     ACTIVE_TEXT_SELECTION_ALL.store(0, std::sync::atomic::Ordering::Release);
     ACTIVE_TEXT_CURSOR_UTF16.store(0, std::sync::atomic::Ordering::Release);
+    if let Ok(mut composing) = ACTIVE_TEXT_COMPOSING.lock() {
+        *composing = None;
+    }
     if let Ok(mut pending) = PENDING_TEXT_POINTER.lock() {
         *pending = None;
     }
     record_textbox_session(None);
-    widget != 0
+}
+
+fn request_textbox_refresh(widget: i64) {
+    if widget != 0 && widget == active_text_field() {
+        TEXTBOX_REFRESH.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn text_field_visibility_changed(widget: i64, visibility: jint) {
+    if visibility == VIEW_VISIBLE {
+        request_textbox_refresh(widget);
+    } else {
+        clear_active_text_field_if(widget);
+    }
 }
 
 pub(crate) fn invalidate_active_text_field_session() -> bool {
@@ -8573,6 +8611,9 @@ pub(crate) fn invalidate_active_text_field_session() -> bool {
         return false;
     }
     ACTIVE_TEXT_SELECTION_ALL.store(0, std::sync::atomic::Ordering::Release);
+    if let Ok(mut composing) = ACTIVE_TEXT_COMPOSING.lock() {
+        *composing = None;
+    }
     record_textbox_session(None);
     true
 }
@@ -8597,12 +8638,7 @@ fn clear_active_text_field_if(widget: i64) {
             )
             .is_ok()
     {
-        ACTIVE_TEXT_SELECTION_ALL.store(0, std::sync::atomic::Ordering::Release);
-        ACTIVE_TEXT_CURSOR_UTF16.store(0, std::sync::atomic::Ordering::Release);
-        if let Ok(mut pending) = PENDING_TEXT_POINTER.lock() {
-            *pending = None;
-        }
-        record_textbox_session(None);
+        reset_text_field_state();
     }
 }
 
@@ -8618,6 +8654,32 @@ struct TextboxSession {
     text_color: i32,
     x_alignment: i32,
     y_alignment: i32,
+    editable: bool,
+}
+
+impl TextboxSession {
+    fn accepts_input(&self) -> bool {
+        self.geometry.2 > 0 && self.geometry.3 > 0
+    }
+
+    fn focus(&self) -> FocusedTextBox {
+        FocusedTextBox {
+            geometry: self.geometry,
+            multiline: self.multiline,
+            masked: text_input_type_masks_text(self.input_type),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusedTextBox {
+    pub(crate) geometry: (i32, i32, u32, u32),
+    pub(crate) multiline: bool,
+    pub(crate) masked: bool,
+}
+
+pub(crate) fn text_input_type_masks_text(input_type: i32) -> bool {
+    !matches!(input_type, 0..=4 | 7 | 8)
 }
 
 static TEXTBOX_SESSION: std::sync::Mutex<Option<TextboxSession>> = std::sync::Mutex::new(None);
@@ -8637,13 +8699,19 @@ pub fn textbox_input_type() -> i32 {
         .unwrap_or(i32::MIN)
 }
 
-pub fn active_text_field_accepts_line_breaks() -> bool {
+pub(crate) fn focused_text_box(vm: &Vm) -> Option<FocusedTextBox> {
+    refreshed_text_box_session(vm).map(|session| session.focus())
+}
+
+fn live_text_box_session() -> Option<TextboxSession> {
     let active = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
     TEXTBOX_SESSION
         .lock()
         .ok()
         .and_then(|session| *session)
-        .is_some_and(|session| textbox_session_matches_active(session, active) && session.multiline)
+        .filter(|session| {
+            textbox_session_matches_active(*session, active) && session.accepts_input()
+        })
 }
 
 pub(crate) struct ActiveTextOverlay {
@@ -8659,11 +8727,9 @@ pub(crate) struct ActiveTextOverlay {
 }
 
 pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
-    let session = TEXTBOX_SESSION.lock().ok().and_then(|session| *session)?;
-    if !textbox_session_matches_active(
-        session,
-        ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire),
-    ) || (session.text_color as u32 >> 24) == 0
+    let session = live_text_box_session()?;
+    if (session.text_color as u32 >> 24) == 0
+        || !(session.font_size.is_finite() && session.font_size > 0.0)
     {
         return None;
     }
@@ -8703,7 +8769,9 @@ fn has_live_textbox_session(widget: i64) -> bool {
 
 pub fn textbox_geometry_pending() -> bool {
     let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire);
-    widget != 0 && !has_live_textbox_session(widget)
+    widget != 0
+        && (TEXTBOX_REFRESH.load(std::sync::atomic::Ordering::Acquire)
+            || !has_live_textbox_session(widget))
 }
 
 fn record_textbox_session(session: Option<TextboxSession>) {
@@ -8850,7 +8918,8 @@ pub fn query_textbox_geometry(vm: &Vm) {
         record_textbox_session(None);
         return;
     }
-    if has_live_textbox_session(widget) {
+    let refresh = TEXTBOX_REFRESH.swap(false, std::sync::atomic::Ordering::AcqRel);
+    if !refresh && has_live_textbox_session(widget) {
         return;
     }
     let _ = java_vm.attach_current_thread(|env: &mut Env| -> Result<(), FrameworkError> {
@@ -8920,6 +8989,7 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 Some(text_color),
                 Some(x_alignment),
                 Some(y_alignment),
+                Some(editable),
             ) = (
                 read_float(env, jni_str!("x")),
                 read_float(env, jni_str!("y")),
@@ -8933,28 +9003,29 @@ pub fn query_textbox_geometry(vm: &Vm) {
                 read_int(env, jni_str!("textColor")),
                 read_int(env, jni_str!("xAlignment")),
                 read_int(env, jni_str!("yAlignment")),
+                read_bool(env, jni_str!("editable")),
             )
             else {
                 record_textbox_session(None);
                 return;
             };
 
-            match w > 0.0 && h > 0.0 && font_size.is_finite() && font_size > 0.0 {
-                true if ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire) == widget => {
-                    record_textbox_session(Some(TextboxSession {
-                        widget,
-                        geometry: (x as i32, y as i32, w as u32, h as u32),
-                        input_type,
-                        font,
-                        font_size,
-                        multiline,
-                        text_wrapped,
-                        text_color,
-                        x_alignment,
-                        y_alignment,
-                    }));
-                }
-                _ => record_textbox_session(None),
+            if ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire) == widget {
+                record_textbox_session(Some(TextboxSession {
+                    widget,
+                    geometry: (x as i32, y as i32, w as u32, h as u32),
+                    input_type,
+                    font,
+                    font_size,
+                    multiline,
+                    text_wrapped,
+                    text_color,
+                    x_alignment,
+                    y_alignment,
+                    editable,
+                }));
+            } else {
+                record_textbox_session(None);
             }
         }));
         Ok(())
@@ -8983,7 +9054,11 @@ extern "system" fn widget_native_set_text<'local>(
                     let cursor = java_cursor_position(value.as_deref().unwrap_or_default());
                     ACTIVE_TEXT_CURSOR_UTF16
                         .store(i64::from(cursor), std::sync::atomic::Ordering::Release);
+                    if let Ok(mut composing) = ACTIVE_TEXT_COMPOSING.lock() {
+                        *composing = None;
+                    }
                 }
+                request_textbox_refresh(widget);
                 tracing::debug!(
                 target: "android.widget",
                 widget,
@@ -9050,87 +9125,404 @@ fn utf16_cursor_byte_offset(text: &str, requested: jint) -> (usize, jint) {
     )
 }
 
-fn apply_text_edit_at_utf16(
-    old: &str,
-    cursor: jint,
-    unicode: i32,
-    backspace: bool,
-    replace_all: bool,
-) -> (String, jint) {
-    let inserted = char::from_u32(unicode as u32)
-        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'));
-    if replace_all {
-        if backspace {
-            return (String::new(), 0);
-        }
-        if let Some(character) = inserted {
-            return (
-                character.to_string(),
-                jint::try_from(character.len_utf16()).unwrap_or(jint::MAX),
-            );
-        }
-        return (old.to_string(), cursor.clamp(0, java_cursor_position(old)));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextUnit {
+    Character,
+    Word,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextMotion {
+    Left(TextUnit),
+    Right(TextUnit),
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+    TextStart,
+    TextEnd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextEdit<'a> {
+    Type(&'a str),
+    Paste(&'a str),
+    Backspace(TextUnit),
+    ForwardDelete(TextUnit),
+    Move(TextMotion),
+    Compose {
+        text: &'a str,
+        cursor: Option<usize>,
+    },
+    FinishComposing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextFieldRules {
+    multiline: bool,
+    editable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TextFieldState {
+    text: String,
+    cursor: usize,
+    select_all: bool,
+    composing: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CharClass {
+    Space,
+    Word,
+    Punctuation,
+}
+
+fn char_class(character: char) -> CharClass {
+    if character.is_whitespace() {
+        CharClass::Space
+    } else if character.is_alphanumeric() || character == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Punctuation
     }
-    let (cursor_byte, cursor) = utf16_cursor_byte_offset(old, cursor);
-    if backspace {
-        let Some((previous_byte, previous)) = old[..cursor_byte].char_indices().next_back() else {
-            return (old.to_string(), 0);
+}
+
+fn skip_word(
+    chars: &mut std::iter::Peekable<impl Iterator<Item = (usize, char)>>,
+    boundary: impl Fn(usize, char) -> usize,
+    mut edge: usize,
+) -> usize {
+    while let Some(&(offset, character)) = chars.peek() {
+        if char_class(character) != CharClass::Space {
+            break;
+        }
+        edge = boundary(offset, character);
+        chars.next();
+    }
+    let Some(&(_, first)) = chars.peek() else {
+        return edge;
+    };
+    let class = char_class(first);
+    while let Some(&(offset, character)) = chars.peek() {
+        if char_class(character) != class {
+            break;
+        }
+        edge = boundary(offset, character);
+        chars.next();
+    }
+    edge
+}
+
+fn word_start_before(text: &str, cursor: usize) -> usize {
+    let mut chars = text[..cursor].char_indices().rev().peekable();
+    skip_word(&mut chars, |offset, _| offset, cursor)
+}
+
+fn word_end_after(text: &str, cursor: usize) -> usize {
+    let mut chars = text[cursor..]
+        .char_indices()
+        .map(|(offset, character)| (cursor + offset, character))
+        .peekable();
+    skip_word(
+        &mut chars,
+        |offset, character| offset + character.len_utf8(),
+        cursor,
+    )
+}
+
+fn previous_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(offset, _)| offset)
+}
+
+fn next_boundary(text: &str, cursor: usize) -> usize {
+    text[cursor..]
+        .chars()
+        .next()
+        .map_or(cursor, |character| cursor + character.len_utf8())
+}
+
+fn line_start(text: &str, cursor: usize) -> usize {
+    text[..cursor].rfind('\n').map_or(0, |newline| newline + 1)
+}
+
+fn line_end(text: &str, cursor: usize) -> usize {
+    text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |newline| cursor + newline)
+}
+
+fn column_in_line(text: &str, start: usize, column: usize) -> usize {
+    let end = line_end(text, start);
+    text[start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(offset, _)| start + offset)
+}
+
+fn column(text: &str, cursor: usize) -> usize {
+    text[line_start(text, cursor)..cursor].chars().count()
+}
+
+fn line_above(text: &str, cursor: usize) -> usize {
+    match line_start(text, cursor) {
+        0 => 0,
+        start => column_in_line(text, line_start(text, start - 1), column(text, cursor)),
+    }
+}
+
+fn line_below(text: &str, cursor: usize) -> usize {
+    match text[cursor..].find('\n') {
+        Some(newline) => column_in_line(text, cursor + newline + 1, column(text, cursor)),
+        None => text.len(),
+    }
+}
+
+fn moved_cursor(text: &str, cursor: usize, motion: TextMotion) -> usize {
+    match motion {
+        TextMotion::Left(TextUnit::Character) => previous_boundary(text, cursor),
+        TextMotion::Right(TextUnit::Character) => next_boundary(text, cursor),
+        TextMotion::Left(TextUnit::Word) => word_start_before(text, cursor),
+        TextMotion::Right(TextUnit::Word) => word_end_after(text, cursor),
+        TextMotion::Up => line_above(text, cursor),
+        TextMotion::Down => line_below(text, cursor),
+        TextMotion::LineStart => line_start(text, cursor),
+        TextMotion::LineEnd => line_end(text, cursor),
+        TextMotion::TextStart => 0,
+        TextMotion::TextEnd => text.len(),
+    }
+}
+
+fn collapses_to_start(motion: TextMotion) -> bool {
+    matches!(
+        motion,
+        TextMotion::Left(_) | TextMotion::Up | TextMotion::LineStart | TextMotion::TextStart
+    )
+}
+
+const ROBLOX_TEXT_BOX_MAX_UTF16: usize = 64_000;
+
+fn insertable_text(text: &str, multiline: bool) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .map(|character| if character == '\r' { '\n' } else { character })
+        .filter(|character| {
+            !character.is_control() || (multiline && matches!(character, '\n' | '\t'))
+        })
+        .collect()
+}
+
+fn within_text_box_limit(inserted: &str, kept_utf16: usize) -> &str {
+    let mut room = ROBLOX_TEXT_BOX_MAX_UTF16.saturating_sub(kept_utf16);
+    let end = inserted
+        .char_indices()
+        .find(
+            |&(_, character)| match room.checked_sub(character.len_utf16()) {
+                Some(left) => {
+                    room = left;
+                    false
+                }
+                None => true,
+            },
+        )
+        .map_or(inserted.len(), |(offset, _)| offset);
+    &inserted[..end]
+}
+
+fn insert_text(state: TextFieldState, inserted: &str) -> TextFieldState {
+    let kept_utf16 = if state.select_all {
+        0
+    } else {
+        state.text.encode_utf16().count()
+    };
+    let inserted = within_text_box_limit(inserted, kept_utf16);
+    if inserted.is_empty() {
+        return state;
+    }
+    let (mut text, at) = if state.select_all {
+        (String::new(), 0)
+    } else {
+        (state.text, state.cursor)
+    };
+    text.insert_str(at, inserted);
+    TextFieldState {
+        text,
+        cursor: at + inserted.len(),
+        select_all: false,
+        composing: None,
+    }
+}
+
+fn delete_toward(state: TextFieldState, motion: TextMotion) -> TextFieldState {
+    if state.select_all {
+        return TextFieldState {
+            text: String::new(),
+            cursor: 0,
+            select_all: false,
+            composing: None,
         };
-        let mut edited = String::with_capacity(old.len() - previous.len_utf8());
-        edited.push_str(&old[..previous_byte]);
-        edited.push_str(&old[cursor_byte..]);
-        let cursor = cursor.saturating_sub(previous.len_utf16() as jint);
-        return (edited, cursor);
     }
-    if let Some(character) = inserted {
-        let mut edited = String::with_capacity(old.len() + character.len_utf8());
-        edited.push_str(&old[..cursor_byte]);
-        edited.push(character);
-        edited.push_str(&old[cursor_byte..]);
-        let cursor = cursor.saturating_add(character.len_utf16() as jint);
-        return (edited, cursor);
+    let edge = moved_cursor(&state.text, state.cursor, motion);
+    let range = state.cursor.min(edge)..state.cursor.max(edge);
+    let mut text = state.text;
+    text.replace_range(range.clone(), "");
+    TextFieldState {
+        text,
+        cursor: range.start,
+        select_all: false,
+        composing: None,
     }
-    (old.to_string(), cursor)
+}
+
+fn compose_text(
+    state: TextFieldState,
+    preedit: &str,
+    preedit_cursor: Option<usize>,
+    multiline: bool,
+) -> TextFieldState {
+    let (mut text, at) = match (state.select_all, state.composing) {
+        (true, _) => (String::new(), 0),
+        (false, Some(region)) => {
+            let mut text = state.text;
+            text.replace_range(region.clone(), "");
+            (text, region.start)
+        }
+        (false, None) => (state.text, state.cursor),
+    };
+    let insertable = insertable_text(preedit, multiline);
+    let inserted = within_text_box_limit(&insertable, text.encode_utf16().count());
+    text.insert_str(at, inserted);
+    let caret = preedit_cursor
+        .filter(|&caret| inserted == preedit && inserted.is_char_boundary(caret))
+        .unwrap_or(inserted.len());
+    TextFieldState {
+        text,
+        cursor: at + caret,
+        select_all: false,
+        composing: (!inserted.is_empty()).then_some(at..at + inserted.len()),
+    }
+}
+
+fn apply_text_edit(
+    state: TextFieldState,
+    edit: TextEdit<'_>,
+    rules: TextFieldRules,
+) -> TextFieldState {
+    if let TextEdit::Compose { text, cursor } = edit {
+        return compose_text(state, text, cursor, rules.multiline);
+    }
+    let state = TextFieldState {
+        composing: None,
+        ..state
+    };
+    match edit {
+        TextEdit::Type(typed) => insert_text(state, &insertable_text(typed, rules.multiline)),
+        TextEdit::Paste(_) if !rules.editable => state,
+        TextEdit::Paste(pasted) => insert_text(state, &insertable_text(pasted, rules.multiline)),
+        TextEdit::Backspace(unit) => delete_toward(state, TextMotion::Left(unit)),
+        TextEdit::ForwardDelete(unit) => delete_toward(state, TextMotion::Right(unit)),
+        TextEdit::Move(motion) => {
+            let cursor = match (state.select_all, collapses_to_start(motion)) {
+                (true, true) => 0,
+                (true, false) => state.text.len(),
+                (false, _) => moved_cursor(&state.text, state.cursor, motion),
+            };
+            TextFieldState {
+                cursor,
+                select_all: false,
+                ..state
+            }
+        }
+        TextEdit::Compose { .. } | TextEdit::FinishComposing => state,
+    }
+}
+
+fn selected_text(state: &TextFieldState, masked: bool) -> Option<&str> {
+    (state.select_all && !masked && !state.text.is_empty()).then_some(state.text.as_str())
 }
 
 fn java_cursor_position(text: &str) -> jint {
     jint::try_from(text.encode_utf16().count()).unwrap_or(jint::MAX)
 }
 
-pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bool {
-    let widget = ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Relaxed);
-    if widget == 0 {
-        return false;
-    }
+fn utf16_range_byte_offsets(text: &str, start: jint, end: jint) -> Option<std::ops::Range<usize>> {
+    let (start_byte, start_utf16) = utf16_cursor_byte_offset(text, start);
+    let (end_byte, end_utf16) = utf16_cursor_byte_offset(text, end);
+    (start_utf16 == start && end_utf16 == end && start_byte <= end_byte)
+        .then_some(start_byte..end_byte)
+}
 
-    if !has_live_textbox_session(widget) {
+fn active_cursor_utf16() -> jint {
+    ACTIVE_TEXT_CURSOR_UTF16
+        .load(std::sync::atomic::Ordering::Acquire)
+        .clamp(0, i64::from(jint::MAX)) as jint
+}
+
+fn load_text_field_state(widget: i64, text: String) -> TextFieldState {
+    let (cursor, _) = utf16_cursor_byte_offset(&text, active_cursor_utf16());
+    let composing = ACTIVE_TEXT_COMPOSING
+        .lock()
+        .ok()
+        .and_then(|composing| *composing)
+        .filter(|region| region.widget == widget)
+        .and_then(|region| utf16_range_byte_offsets(&text, region.start_utf16, region.end_utf16));
+    TextFieldState {
+        select_all: ACTIVE_TEXT_SELECTION_ALL.load(std::sync::atomic::Ordering::Acquire) == widget,
+        text,
+        cursor,
+        composing,
+    }
+}
+
+fn store_text_field_state(widget: i64, state: &TextFieldState) -> jint {
+    let cursor = java_cursor_position(&state.text[..state.cursor]);
+    ACTIVE_TEXT_CURSOR_UTF16.store(i64::from(cursor), std::sync::atomic::Ordering::Release);
+    ACTIVE_TEXT_SELECTION_ALL.store(
+        if state.select_all { widget } else { 0 },
+        std::sync::atomic::Ordering::Release,
+    );
+    if let Ok(mut composing) = ACTIVE_TEXT_COMPOSING.lock() {
+        *composing = state.composing.as_ref().map(|region| ComposingRegion {
+            widget,
+            start_utf16: java_cursor_position(&state.text[..region.start]),
+            end_utf16: java_cursor_position(&state.text[..region.end]),
+        });
+    }
+    cursor
+}
+
+fn refreshed_text_box_session(vm: &Vm) -> Option<TextboxSession> {
+    if textbox_geometry_pending() {
         query_textbox_geometry(vm);
     }
-    if !has_live_textbox_session(widget) {
-        return false;
-    }
+    live_text_box_session()
+}
 
-    let edited = view_registry::with_view(widget, |v| {
-        let old = v.text.clone().unwrap_or_default();
-        let cursor = ACTIVE_TEXT_CURSOR_UTF16
-            .load(std::sync::atomic::Ordering::Acquire)
-            .clamp(0, i64::from(jint::MAX)) as jint;
-        let replace_all = ACTIVE_TEXT_SELECTION_ALL
-            .compare_exchange(
-                widget,
-                0,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok();
-        let (new, cursor) = apply_text_edit_at_utf16(&old, cursor, unicode, backspace, replace_all);
-        v.text = Some(new.clone());
-        (new, cursor)
+pub(crate) fn edit_active_text_field(vm: &Vm, edit: TextEdit<'_>) -> bool {
+    let Some(session) = refreshed_text_box_session(vm) else {
+        return false;
+    };
+    let widget = session.widget;
+    let rules = TextFieldRules {
+        multiline: session.multiline,
+        editable: session.editable,
+    };
+    let edited = view_registry::with_view(widget, |view| {
+        let before = load_text_field_state(widget, view.text.clone().unwrap_or_default());
+        let after = apply_text_edit(before.clone(), edit, rules);
+        let cursor = store_text_field_state(widget, &after);
+        view.text = Some(after.text.clone());
+        let changed = before != after;
+        (after.text, cursor, changed)
     });
     match edited {
-        Ok((new_text, cursor)) => {
-            ACTIVE_TEXT_CURSOR_UTF16.store(i64::from(cursor), std::sync::atomic::Ordering::Release);
-            sync_engine_textbox(vm, &new_text, cursor);
+        Ok((text, cursor, changed)) => {
+            if changed {
+                sync_engine_textbox(vm, &text, cursor);
+            }
             true
         }
         Err(_) => {
@@ -9138,6 +9530,148 @@ pub fn type_into_active_text_field(vm: &Vm, unicode: i32, backspace: bool) -> bo
             false
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionTransfer {
+    Copy,
+    Cut,
+}
+
+pub(crate) fn active_text_field_selection(vm: &Vm, transfer: SelectionTransfer) -> Option<String> {
+    let session = refreshed_text_box_session(vm)?;
+    if transfer == SelectionTransfer::Cut && !session.editable {
+        return None;
+    }
+    let widget = session.widget;
+    let text =
+        view_registry::with_view(widget, |view| view.text.clone().unwrap_or_default()).ok()?;
+    let state = load_text_field_state(widget, text);
+    selected_text(&state, text_input_type_masks_text(session.input_type)).map(str::to_owned)
+}
+
+const KEYCODE_BACK: jint = 4;
+const KEYCODE_ENTER: jint = 66;
+const EDITOR_INFO_IME_NULL: jint = 0;
+
+pub(crate) fn submit_active_text_field(vm: &Vm) -> Result<(), FrameworkError> {
+    let Some(session) = refreshed_text_box_session(vm) else {
+        return Ok(());
+    };
+    let widget = session.widget;
+    with_attached_env(vm, |env| run_editor_action(env, widget))?;
+    if active_text_field() != widget {
+        return Ok(());
+    }
+    let text = view_registry::with_view(widget, |view| view.text.clone().unwrap_or_default())
+        .map_err(FrameworkError::ViewRegistry)?;
+    let (_, cursor) = utf16_cursor_byte_offset(&text, active_cursor_utf16());
+    sync_engine_textbox(vm, &text, cursor);
+    Ok(())
+}
+
+pub(crate) fn release_active_text_field(vm: &Vm) -> Result<(), FrameworkError> {
+    let widget = active_text_field();
+    if widget == 0 {
+        return Ok(());
+    }
+    with_attached_env(vm, |env| release_back_on_text_field(env, widget))?;
+    clear_active_text_field_if(widget);
+    Ok(())
+}
+
+fn release_back_on_text_field(env: &mut Env, widget: i64) -> Result<bool, FrameworkError> {
+    let view = text_field_view(env, widget)?;
+    let back = key_event(env, KeyAction::Up, KEYCODE_BACK)?;
+    checked(env, "RbxKeyboard.onKeyPreIme(BACK)", |env| {
+        env.call_method(
+            &view,
+            jni_str!("onKeyPreIme"),
+            jni_sig!("(ILandroid/view/KeyEvent;)Z"),
+            &[JValue::Int(KEYCODE_BACK), JValue::Object(&back)],
+        )?
+        .z()
+    })
+}
+
+fn with_attached_env<T>(
+    vm: &Vm,
+    operation: impl FnOnce(&mut Env) -> Result<T, FrameworkError>,
+) -> Result<T, FrameworkError> {
+    let raw = vm.as_raw();
+    if raw.is_null() {
+        return Err(FrameworkError::NullVm);
+    }
+    let java_vm = unsafe { JavaVM::from_raw(raw) };
+    java_vm.attach_current_thread(|env: &mut Env| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| operation(env))) {
+            Ok(result) => result,
+            Err(_) => Err(FrameworkError::Panicked),
+        }
+    })
+}
+
+fn text_field_view<'local>(
+    env: &mut Env<'local>,
+    widget: i64,
+) -> Result<JObject<'local>, FrameworkError> {
+    view_registry::local_jobject(env, widget)
+        .map_err(FrameworkError::ViewRegistry)??
+        .ok_or(FrameworkError::Jni(jni::errors::Error::NullPtr(
+            "text field view has no live Java peer",
+        )))
+}
+
+fn key_event<'local>(
+    env: &mut Env<'local>,
+    action: KeyAction,
+    key_code: jint,
+) -> Result<JObject<'local>, FrameworkError> {
+    let class = checked(env, "KeyEvent class", |env| env.find_class(KEY_EVENT_CLASS))?;
+    checked(env, "KeyEvent(action, code)", |env| {
+        env.new_object(
+            &class,
+            jni_sig!("(II)V"),
+            &[JValue::Int(action.code()), JValue::Int(key_code)],
+        )
+    })
+}
+
+fn run_editor_action(env: &mut Env, widget: i64) -> Result<(), FrameworkError> {
+    let view = text_field_view(env, widget)?;
+    let listener = view_registry::with_view(widget, |view| {
+        view.editor_action_listener
+            .as_ref()
+            .map(|listener| env.new_local_ref(listener.as_obj()))
+    })
+    .map_err(FrameworkError::ViewRegistry)?
+    .transpose()?;
+    let Some(listener) = listener else {
+        tracing::debug!(
+            widget,
+            "Enter in a single-line text field: no editor-action listener to run"
+        );
+        return Ok(());
+    };
+    let enter = key_event(env, KeyAction::Down, KEYCODE_ENTER)?;
+    checked(
+        env,
+        "TextView.OnEditorActionListener.onEditorAction",
+        |env| {
+            env.call_method(
+                &listener,
+                jni_str!("onEditorAction"),
+                jni_sig!("(Landroid/widget/TextView;ILandroid/view/KeyEvent;)Z"),
+                &[
+                    JValue::Object(&view),
+                    JValue::Int(EDITOR_INFO_IME_NULL),
+                    JValue::Object(&enter),
+                ],
+            )?
+            .z()
+        },
+    )?;
+    Ok(())
 }
 
 fn sync_engine_textbox(vm: &Vm, text: &str, cursor: jint) {
@@ -11514,6 +12048,69 @@ fn wake_main_looper() {
     }
 }
 
+static ENGINE_PRESENT_WAKES_MAIN_LOOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_engine_present_wakes_main_loop(wake: bool) {
+    ENGINE_PRESENT_WAKES_MAIN_LOOP.store(wake, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn engine_presented() {
+    wake_when_armed(&ENGINE_PRESENT_WAKES_MAIN_LOOP, wake_main_looper);
+}
+
+fn wake_when_armed(armed: &std::sync::atomic::AtomicBool, wake: impl FnOnce()) {
+    if armed.load(std::sync::atomic::Ordering::Relaxed) {
+        wake();
+    }
+}
+
+static PENDING_HOST_CLIPBOARD_TEXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn take_pending_host_clipboard_text() -> Option<String> {
+    PENDING_HOST_CLIPBOARD_TEXT
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+}
+
+const CLIPBOARD_MANAGER_CLASS: &JNIStr = jni_str!("android/content/ClipboardManager");
+const CLIPBOARD_MANAGER_SET_CLIPBOARD_NAME: &JNIStr = jni_str!("native_set_clipboard");
+const CLIPBOARD_MANAGER_SET_CLIPBOARD_SIG: &JNIStr = jni_str!("(Ljava/lang/String;)V");
+
+extern "system" fn clipboard_manager_native_set_clipboard<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if text.is_null() {
+            tracing::debug!(
+                target: "android.content.ClipboardManager",
+                "ClipboardManager.native_set_clipboard: clip without text (ignored)"
+            );
+            return Ok(());
+        }
+        let value = text.try_to_string(env)?;
+        if let Ok(mut pending) = PENDING_HOST_CLIPBOARD_TEXT.lock() {
+            *pending = Some(value);
+        }
+        wake_main_looper();
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+fn register_clipboard_manager_natives(env: &mut Env) -> Result<(), FrameworkError> {
+    let bindings: [NativeBinding; 1] = [(
+        CLIPBOARD_MANAGER_SET_CLIPBOARD_NAME,
+        CLIPBOARD_MANAGER_SET_CLIPBOARD_SIG,
+        clipboard_manager_native_set_clipboard as *mut c_void,
+    )];
+    register_class_natives_best_effort(env, CLIPBOARD_MANAGER_CLASS, &bindings)?;
+    Ok(())
+}
+
 pub fn pump_main_looper(vm: &Vm) -> Result<MainLooperDue, FrameworkError> {
     let raw = vm.as_raw();
     if raw.is_null() {
@@ -12721,6 +13318,8 @@ fn drive_lifecycle(
 
     register_input_method_manager_natives(env)?;
 
+    register_clipboard_manager_natives(env)?;
+
     register_dialog_natives(env)?;
 
     register_window_natives(env)?;
@@ -13322,6 +13921,7 @@ mod tests {
             text_color: -1,
             x_alignment: 0,
             y_alignment: 1,
+            editable: true,
         }));
         assert_eq!(textbox_geometry(), Some((10, 20, 300, 40)));
         assert_eq!(textbox_input_type(), 5);
@@ -13345,6 +13945,7 @@ mod tests {
             text_color: -1,
             x_alignment: 0,
             y_alignment: 1,
+            editable: true,
         }));
         assert_eq!(textbox_input_type(), 7);
         record_textbox_session(None);
@@ -13362,6 +13963,7 @@ mod tests {
             text_color: -1,
             x_alignment: 0,
             y_alignment: 1,
+            editable: true,
         };
         assert!(textbox_session_matches_active(username, 42));
         assert!(!textbox_session_matches_active(username, 43));
@@ -13385,6 +13987,7 @@ mod tests {
             text_color: -1,
             x_alignment: 0,
             y_alignment: 1,
+            editable: true,
         };
         ACTIVE_TEXT_FIELD.store(43, std::sync::atomic::Ordering::Release);
         record_textbox_session(Some(password));
@@ -13408,6 +14011,7 @@ mod tests {
             text_color: -1,
             x_alignment: 0,
             y_alignment: 0,
+            editable: true,
         };
         ACTIVE_TEXT_FIELD.store(44, std::sync::atomic::Ordering::Release);
         record_textbox_session(Some(session));
@@ -13538,83 +14142,522 @@ mod tests {
         assert_eq!(INT_SIG.to_str(), "I");
     }
 
+    const SINGLE_LINE: TextFieldRules = TextFieldRules {
+        multiline: false,
+        editable: true,
+    };
+
+    const MULTILINE: TextFieldRules = TextFieldRules {
+        multiline: true,
+        editable: true,
+    };
+
+    fn field(text: &str, cursor: usize) -> TextFieldState {
+        TextFieldState {
+            text: text.to_owned(),
+            cursor,
+            select_all: false,
+            composing: None,
+        }
+    }
+
+    fn selected(text: &str) -> TextFieldState {
+        TextFieldState {
+            select_all: true,
+            ..field(text, 0)
+        }
+    }
+
+    fn apply_all(
+        state: TextFieldState,
+        edits: &[TextEdit<'_>],
+        rules: TextFieldRules,
+    ) -> TextFieldState {
+        edits
+            .iter()
+            .fold(state, |state, &edit| apply_text_edit(state, edit, rules))
+    }
+
+    fn text_and_cursor(state: TextFieldState) -> (String, usize) {
+        (state.text, state.cursor)
+    }
+
     #[test]
-    fn host_text_edit_handles_end_cursor_and_invalid_characters() {
+    fn typing_inserts_whole_key_text_at_the_cursor_and_drops_control_characters() {
+        let typed = |text: &str, cursor, typed| {
+            text_and_cursor(apply_text_edit(
+                field(text, cursor),
+                TextEdit::Type(typed),
+                SINGLE_LINE,
+            ))
+        };
+        assert_eq!(typed("", 0, "a"), ("a".to_owned(), 1));
+        assert_eq!(typed("ro", 2, "b"), ("rob".to_owned(), 3));
+        assert_eq!(typed("ro", 2, "\u{1b}"), ("ro".to_owned(), 2));
+        assert_eq!(typed("é", 2, "x"), ("éx".to_owned(), 3));
+        assert_eq!(typed("print()", 5, "x"), ("printx()".to_owned(), 6));
         assert_eq!(
-            apply_text_edit_at_utf16("", 0, 'a' as i32, false, false),
-            ("a".to_string(), 1)
+            typed("ab", 1, "J\u{301}"),
+            ("aJ\u{301}b".to_owned(), 1 + "J\u{301}".len())
         );
+        assert_eq!(typed("ab", 1, "中文"), ("a中文b".to_owned(), 7));
+    }
 
+    #[test]
+    fn backspace_and_delete_remove_one_character_or_one_word() {
+        let edit = |text: &str, cursor, edit| {
+            text_and_cursor(apply_text_edit(field(text, cursor), edit, SINGLE_LINE))
+        };
+        let back = TextEdit::Backspace(TextUnit::Character);
+        let delete = TextEdit::ForwardDelete(TextUnit::Character);
+        assert_eq!(edit("rob", 3, back), ("ro".to_owned(), 2));
+        assert_eq!(edit("", 0, back), (String::new(), 0));
+        assert_eq!(edit("a💫b", 5, back), ("ab".to_owned(), 1));
+        assert_eq!(edit("abc", 0, delete), ("bc".to_owned(), 0));
+        assert_eq!(edit("abc", 3, delete), ("abc".to_owned(), 3));
+        assert_eq!(edit("a💫b", 1, delete), ("ab".to_owned(), 1));
         assert_eq!(
-            apply_text_edit_at_utf16("ro", 2, 'b' as i32, false, false),
-            ("rob".to_string(), 3)
+            edit("hello world", 11, TextEdit::Backspace(TextUnit::Word)),
+            ("hello ".to_owned(), 6)
         );
-
         assert_eq!(
-            apply_text_edit_at_utf16("rob", 3, 0, true, false),
-            ("ro".to_string(), 2)
+            edit("hello world", 0, TextEdit::ForwardDelete(TextUnit::Word)),
+            (" world".to_owned(), 0)
         );
-
         assert_eq!(
-            apply_text_edit_at_utf16("", 0, 0, true, false),
-            (String::new(), 0)
-        );
-
-        assert_eq!(
-            apply_text_edit_at_utf16("ro", 2, 0x1b, false, false),
-            ("ro".to_string(), 2)
-        );
-
-        assert_eq!(
-            apply_text_edit_at_utf16("é", 1, 'x' as i32, false, false),
-            ("éx".to_string(), 2)
+            edit("foo.bar baz", 7, TextEdit::Backspace(TextUnit::Word)),
+            ("foo. baz".to_owned(), 4)
         );
     }
 
     #[test]
-    fn host_text_edit_uses_the_selected_utf16_cursor() {
+    fn arrow_keys_move_the_caret_so_typing_fixes_a_typo_mid_text() {
+        let left = TextEdit::Move(TextMotion::Left(TextUnit::Character));
+        let edits: Vec<_> = std::iter::repeat_n(left, 7)
+            .chain([TextEdit::Type("l")])
+            .collect();
+        let fixed = apply_all(field("helo world", 10), &edits, SINGLE_LINE);
+        assert_eq!(text_and_cursor(fixed), ("hello world".to_owned(), 4));
+    }
+
+    #[test]
+    fn the_caret_moves_by_whole_characters_words_and_lines() {
+        let moved = |text: &str, cursor, motion| {
+            apply_text_edit(field(text, cursor), TextEdit::Move(motion), MULTILINE).cursor
+        };
+        assert_eq!(moved("a💫b", 5, TextMotion::Left(TextUnit::Character)), 1);
+        assert_eq!(moved("a💫b", 1, TextMotion::Right(TextUnit::Character)), 5);
+        assert_eq!(moved("a💫b", 0, TextMotion::Left(TextUnit::Character)), 0);
+        assert_eq!(moved("a💫b", 6, TextMotion::Right(TextUnit::Character)), 6);
+        assert_eq!(moved("a💫b", 5, TextMotion::TextStart), 0);
+        assert_eq!(moved("a💫b", 1, TextMotion::TextEnd), 6);
         assert_eq!(
-            apply_text_edit_at_utf16("print()", 5, 'x' as i32, false, false),
-            ("printx()".to_string(), 6)
+            moved("hello world", 11, TextMotion::Left(TextUnit::Word)),
+            6
         );
         assert_eq!(
-            apply_text_edit_at_utf16("print()", 5, 0, true, false),
-            ("prin()".to_string(), 4)
+            moved("hello world", 0, TextMotion::Right(TextUnit::Word)),
+            5
+        );
+        assert_eq!(moved("ab\ncd", 4, TextMotion::LineStart), 3);
+        assert_eq!(moved("ab\ncd", 1, TextMotion::LineEnd), 2);
+        assert_eq!(moved("ab\ncd", 4, TextMotion::Up), 1);
+        assert_eq!(moved("ab\ncd", 1, TextMotion::Down), 4);
+        assert_eq!(moved("abc\nd", 3, TextMotion::Down), 5);
+        assert_eq!(moved("ab\ncd", 1, TextMotion::Up), 0);
+        assert_eq!(moved("ab\ncd", 4, TextMotion::Down), 5);
+    }
+
+    #[test]
+    fn navigation_collapses_select_all_instead_of_replacing_the_text() {
+        let right = TextEdit::Move(TextMotion::Right(TextUnit::Character));
+        let appended = apply_all(
+            selected("hello world"),
+            &[right, TextEdit::Type("x")],
+            SINGLE_LINE,
+        );
+        assert_eq!(text_and_cursor(appended), ("hello worldx".to_owned(), 12));
+
+        let home = apply_text_edit(
+            selected("hello"),
+            TextEdit::Move(TextMotion::Left(TextUnit::Character)),
+            SINGLE_LINE,
+        );
+        assert_eq!((home.cursor, home.select_all), (0, false));
+
+        let replaced = apply_text_edit(selected("print('old')"), TextEdit::Type("x"), SINGLE_LINE);
+        assert_eq!(text_and_cursor(replaced), ("x".to_owned(), 1));
+        let cleared = apply_text_edit(
+            selected("éx"),
+            TextEdit::ForwardDelete(TextUnit::Character),
+            SINGLE_LINE,
+        );
+        assert_eq!(text_and_cursor(cleared), (String::new(), 0));
+    }
+
+    #[test]
+    fn ime_preedit_is_shown_inline_and_replaced_by_the_commit() {
+        let composing = apply_text_edit(
+            field("ab", 1),
+            TextEdit::Compose {
+                text: "に",
+                cursor: None,
+            },
+            SINGLE_LINE,
+        );
+        assert_eq!(composing.text, "aにb");
+        assert_eq!(composing.composing, Some(1..4));
+        assert_eq!(composing.cursor, 4);
+
+        let converted = apply_text_edit(
+            composing,
+            TextEdit::Compose {
+                text: "日本",
+                cursor: Some(3),
+            },
+            SINGLE_LINE,
+        );
+        assert_eq!(converted.text, "a日本b");
+        assert_eq!(converted.composing, Some(1..7));
+        assert_eq!(converted.cursor, 4);
+
+        let committed = apply_all(
+            converted,
+            &[
+                TextEdit::Compose {
+                    text: "",
+                    cursor: None,
+                },
+                TextEdit::Type("日本"),
+            ],
+            SINGLE_LINE,
+        );
+        assert_eq!(text_and_cursor(committed.clone()), ("a日本b".to_owned(), 7));
+        assert_eq!(committed.composing, None);
+
+        let kept = apply_all(
+            field("ab", 1),
+            &[
+                TextEdit::Compose {
+                    text: "x",
+                    cursor: None,
+                },
+                TextEdit::FinishComposing,
+            ],
+            SINGLE_LINE,
+        );
+        assert_eq!(text_and_cursor(kept.clone()), ("axb".to_owned(), 2));
+        assert_eq!(kept.composing, None);
+    }
+
+    #[test]
+    fn paste_keeps_line_breaks_only_in_multiline_boxes_and_respects_read_only_boxes() {
+        let pasted = |rules| {
+            apply_text_edit(field("", 0), TextEdit::Paste("hi\r\nyou\tthere\rok"), rules).text
+        };
+        assert_eq!(pasted(SINGLE_LINE), "hiyouthereok");
+        assert_eq!(pasted(MULTILINE), "hi\nyou\tthere\nok");
+
+        let read_only = TextFieldRules {
+            multiline: false,
+            editable: false,
+        };
+        assert_eq!(
+            apply_text_edit(field("code", 4), TextEdit::Paste("x"), read_only).text,
+            "code"
         );
         assert_eq!(
-            apply_text_edit_at_utf16("a💫b", 3, 'x' as i32, false, false),
-            ("a💫xb".to_string(), 4)
-        );
-        assert_eq!(
-            apply_text_edit_at_utf16("a💫b", 3, 0, true, false),
-            ("ab".to_string(), 1)
+            apply_text_edit(field("code", 4), TextEdit::Type("x"), read_only).text,
+            "codex"
         );
     }
 
     #[test]
-    fn select_all_replacement_sets_the_new_utf16_cursor() {
+    fn engine_presents_wake_the_main_loop_only_while_armed() {
+        let armed = std::sync::atomic::AtomicBool::new(false);
+        let wakes = std::cell::Cell::new(0);
+        let present = || wake_when_armed(&armed, || wakes.set(wakes.get() + 1));
+
+        present();
+        assert_eq!(wakes.get(), 0);
+        armed.store(true, std::sync::atomic::Ordering::Relaxed);
+        present();
+        present();
+        assert_eq!(wakes.get(), 2);
+        armed.store(false, std::sync::atomic::Ordering::Relaxed);
+        present();
+        assert_eq!(wakes.get(), 2);
+    }
+
+    #[test]
+    fn edits_stop_at_the_64000_utf16_unit_length_filter_of_the_apk_keyboard() {
+        let utf16 = |state: &TextFieldState| state.text.encode_utf16().count();
+        let huge = "ab".repeat(ROBLOX_TEXT_BOX_MAX_UTF16);
+
+        let pasted = apply_text_edit(field("xy", 1), TextEdit::Paste(&huge), SINGLE_LINE);
+        assert_eq!(utf16(&pasted), ROBLOX_TEXT_BOX_MAX_UTF16);
+        assert!(pasted.text.starts_with("xab") && pasted.text.ends_with("y"));
+        assert_eq!(pasted.cursor, ROBLOX_TEXT_BOX_MAX_UTF16 - 1);
+
+        let replaced = apply_text_edit(selected(&huge[..10]), TextEdit::Paste(&huge), SINGLE_LINE);
+        assert_eq!(utf16(&replaced), ROBLOX_TEXT_BOX_MAX_UTF16);
+
+        let full = field(&huge[..ROBLOX_TEXT_BOX_MAX_UTF16], 3);
         assert_eq!(
-            apply_text_edit_at_utf16("print('old')", 4, 'x' as i32, false, true),
-            ("x".to_string(), 1)
+            apply_text_edit(full.clone(), TextEdit::Type("z"), SINGLE_LINE),
+            full
+        );
+
+        let one_left = field(&huge[..ROBLOX_TEXT_BOX_MAX_UTF16 - 1], 0);
+        assert_eq!(
+            apply_text_edit(one_left.clone(), TextEdit::Type("😀"), SINGLE_LINE),
+            one_left
         );
         assert_eq!(
-            apply_text_edit_at_utf16("éx", 1, 0, true, true),
-            (String::new(), 0)
+            utf16(&apply_text_edit(
+                one_left.clone(),
+                TextEdit::Type("é😀"),
+                SINGLE_LINE
+            )),
+            ROBLOX_TEXT_BOX_MAX_UTF16
         );
+
+        let composing = apply_all(
+            one_left,
+            &[
+                TextEdit::Compose {
+                    text: "に",
+                    cursor: None,
+                },
+                TextEdit::Compose {
+                    text: "日本",
+                    cursor: Some(3),
+                },
+            ],
+            SINGLE_LINE,
+        );
+        assert!(composing.text.starts_with("日a"));
+        assert_eq!(utf16(&composing), ROBLOX_TEXT_BOX_MAX_UTF16);
+        assert_eq!(composing.composing, Some(0..3));
+        assert_eq!(composing.cursor, 3);
+    }
+
+    #[test]
+    fn copy_takes_only_a_visible_non_empty_selection() {
+        assert_eq!(selected_text(&selected("hunter2"), false), Some("hunter2"));
+        assert_eq!(selected_text(&selected("hunter2"), true), None);
+        assert_eq!(selected_text(&field("hunter2", 7), false), None);
+        assert_eq!(selected_text(&selected(""), false), None);
+        assert!(text_input_type_masks_text(5));
+        assert!(!text_input_type_masks_text(7));
+    }
+
+    fn chat_bar_session(widget: i64) -> TextboxSession {
+        TextboxSession {
+            widget,
+            geometry: (181, 155, 438, 46),
+            input_type: 0,
+            font: 39,
+            font_size: 20.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 1,
+            editable: true,
+        }
+    }
+
+    fn with_focused_text_field<T>(test: impl FnOnce(&mut Env, i64) -> T) -> T {
+        let _textbox_test_guard = TEXTBOX_TEST_LOCK.lock().expect("textbox test lock");
+        fake_jvm::with_env(|env| {
+            let handle = view_registry::allocate("android.widget.EditText").expect("allocate");
+            ACTIVE_TEXT_FIELD.store(handle, std::sync::atomic::Ordering::Release);
+            record_textbox_session(Some(chat_bar_session(handle)));
+            let result = test(env, handle);
+            clear_active_text_field();
+            view_registry::free(handle).expect("free");
+            result
+        })
+    }
+
+    #[test]
+    fn roblox_hiding_its_keyboard_view_ends_the_focus_session() {
+        with_focused_text_field(|_env, handle| {
+            view_native_set_visibility(
+                fake_jvm::native_env(),
+                JObject::null(),
+                handle,
+                8,
+                1.0,
+                true,
+            );
+
+            assert_eq!(active_text_field(), 0);
+            assert_eq!(textbox_geometry(), None);
+            assert!(active_text_overlay().is_none());
+        });
+    }
+
+    #[test]
+    fn showing_the_keyboard_view_again_requeries_the_text_box_without_dropping_it() {
+        with_focused_text_field(|_env, handle| {
+            assert!(!textbox_geometry_pending());
+            view_native_set_visibility(
+                fake_jvm::native_env(),
+                JObject::null(),
+                handle,
+                0,
+                1.0,
+                true,
+            );
+
+            assert!(textbox_geometry_pending());
+            assert_eq!(active_text_field(), handle);
+            assert_eq!(textbox_geometry(), Some((181, 155, 438, 46)));
+        });
+    }
+
+    #[test]
+    fn a_relayout_of_the_keyboard_view_requeries_the_text_box() {
+        with_focused_text_field(|_env, handle| {
+            view_native_set_layout_params(
+                fake_jvm::native_env(),
+                JObject::null(),
+                handle,
+                438,
+                46,
+                -1,
+                0.0,
+                381,
+                155,
+                0,
+                0,
+            );
+
+            assert!(textbox_geometry_pending());
+            assert_eq!(textbox_geometry(), Some((181, 155, 438, 46)));
+        });
+    }
+
+    #[test]
+    fn show_keyboard_for_another_box_with_the_same_text_requeries_the_text_box() {
+        with_focused_text_field(|env, handle| {
+            let empty = env.new_string("").expect("text");
+            widget_native_set_text(fake_jvm::native_env(), JObject::null(), handle, empty);
+
+            assert!(textbox_geometry_pending());
+            assert_eq!(active_text_field(), handle);
+        });
+    }
+
+    #[test]
+    fn a_zero_size_text_box_neither_polls_nor_takes_keys() {
+        let _textbox_test_guard = TEXTBOX_TEST_LOCK.lock().expect("textbox test lock");
+        ACTIVE_TEXT_FIELD.store(46, std::sync::atomic::Ordering::Release);
+        record_textbox_session(Some(TextboxSession {
+            geometry: (10, 20, 0, 0),
+            ..chat_bar_session(46)
+        }));
+
+        assert!(!textbox_geometry_pending());
+        assert_eq!(live_text_box_session(), None);
+        assert!(active_text_overlay().is_none());
+        assert!(clear_active_text_field());
+    }
+
+    #[test]
+    fn enter_runs_the_retained_editor_action_listener_outside_the_view_registry() {
+        let (probe_result, probe) = std::sync::mpsc::channel();
+        let released = with_focused_text_field(|env, handle| {
+            let view = fake_jvm::new_object(env);
+            let peer = env.new_weak_ref(&view).expect("weak ref");
+            view_registry::set_jobject(handle, view_registry::ViewObject::Peer(peer))
+                .expect("record peer");
+            let listener = fake_jvm::new_object(env);
+            let retained = env.new_global_ref(&listener).expect("global ref");
+            view_registry::set_editor_action_listener(handle, Some(retained))
+                .expect("retain listener");
+            fake_jvm::on_call(&listener, "onEditorAction", move || {
+                let (reached, registry_reached) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    reached
+                        .send(view_registry::with_view(handle, |_| ()).is_ok())
+                        .ok();
+                });
+                let reached_in_time =
+                    registry_reached.recv_timeout(std::time::Duration::from_secs(5));
+                probe_result.send(reached_in_time == Ok(true)).ok();
+                view_native_set_visibility(
+                    fake_jvm::native_env(),
+                    JObject::null(),
+                    handle,
+                    8,
+                    1.0,
+                    true,
+                );
+            });
+
+            let outcome = run_editor_action(env, handle);
+            (outcome.is_ok(), active_text_field())
+        });
+        assert_eq!(released, (true, 0), "the listener ran and released the box");
+        assert_eq!(
+            probe.try_recv(),
+            Ok(true),
+            "onEditorAction must not run while the view registry is locked"
+        );
+    }
+
+    #[test]
+    fn roblox_clipboard_writes_are_queued_for_the_host_clipboard() {
+        fake_jvm::with_env(|env| {
+            let copied = env.new_string("roblox.com/share").expect("text");
+            clipboard_manager_native_set_clipboard(fake_jvm::native_env(), JClass::null(), copied);
+        });
+        assert_eq!(
+            take_pending_host_clipboard_text().as_deref(),
+            Some("roblox.com/share")
+        );
+        assert_eq!(take_pending_host_clipboard_text(), None);
+    }
+
+    #[test]
+    fn escape_releases_the_text_box_through_the_back_key_pre_ime_path() {
+        let released = with_focused_text_field(|env, handle| {
+            let view = fake_jvm::new_object(env);
+            let peer = env.new_weak_ref(&view).expect("weak ref");
+            view_registry::set_jobject(handle, view_registry::ViewObject::Peer(peer))
+                .expect("record peer");
+            fake_jvm::on_call(&view, "onKeyPreIme", move || {
+                view_native_set_visibility(
+                    fake_jvm::native_env(),
+                    JObject::null(),
+                    handle,
+                    8,
+                    1.0,
+                    true,
+                );
+            });
+
+            let outcome = release_back_on_text_field(env, handle);
+            (outcome.ok(), active_text_field())
+        });
+        assert_eq!(released, (Some(true), 0));
     }
 
     #[test]
     fn host_text_input_uses_the_apk_non_composing_synchronization_route() {
         let src = include_str!("framework.rs");
         let input_start = src
-            .find("pub fn type_into_active_text_field")
+            .find("pub(crate) fn edit_active_text_field")
             .expect("host text-input entry point");
         let input_end = src[input_start..]
             .find("\nfn sync_engine_textbox")
             .map(|offset| input_start + offset)
             .expect("engine textbox synchronization helper");
         let input = &src[input_start..input_end];
-        assert!(input.contains("sync_engine_textbox(vm, &new_text, cursor)"));
+        assert!(input.contains("sync_engine_textbox(vm, &text, cursor)"));
         assert!(!input.contains("fire_text_watchers"));
 
         let sync_start = input_end;
@@ -13629,7 +14672,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_textbox_geometry_is_read_once_without_reflection_marshalling() {
+    fn focused_textbox_geometry_is_read_without_reflection_marshalling() {
         let source = include_str!("framework.rs");
         let start = source
             .find("pub fn query_textbox_geometry")
@@ -13639,7 +14682,7 @@ mod tests {
             .map(|offset| start + offset)
             .expect("textbox geometry query boundary");
         let query = &source[start..end];
-        assert!(query.contains("if has_live_textbox_session(widget)"));
+        assert!(query.contains("if !refresh && has_live_textbox_session(widget)"));
         assert!(query.contains("env.get_field"));
         assert!(!query.contains("getDeclaredField"));
         assert!(!query.contains("setAccessible"));
