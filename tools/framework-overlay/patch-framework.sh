@@ -552,41 +552,45 @@ dsm="$work/smali/android/view/Display.smali"
 ! grep -qF 'getSupportedRefreshRates()[F' "$dsm" || fail "Display.smali already declares getSupportedRefreshRates — installed Display drifted; update patch-framework.sh"
 n="$(grep -cF '.field public static window_width:I' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali window_width field anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
+display_count() {
+    NEEDLE="$1" perl -0777 -ne 'print scalar(() = /\Q$ENV{NEEDLE}\E/g)' "$dsm"
+}
+replace_upstream_display_method() {
+    local upstream="$1" patched="$2" method="$3" n
+    n="$(display_count "$upstream")"
+    [ "$n" = "1" ] || fail "Display.smali $method is not the upstream body (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
+    ANCHOR="$upstream" PATCHED="$patched" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{PATCHED}}' "$dsm"
+    n="$(display_count "$patched")"
+    [ "$n" = "1" ] || fail "Display.smali $method insert found $n times (expected 1)"
+}
 UPSTREAM_DISPLAY_CLINIT=$'.method static constructor <clinit>()V\n    .registers 1\n\n    const/16 v0, 0x3c0\n\n    sput v0, Landroid/view/Display;->window_width:I\n\n    const/16 v0, 0x21c\n\n    sput v0, Landroid/view/Display;->window_height:I\n\n    return-void\n.end method\n'
-DISPLAY_CLINIT=$'.method static constructor <clinit>()V\n    .registers 3\n\n    const/16 v0, 0x3c0\n\n    sput v0, Landroid/view/Display;->window_width:I\n\n    const/16 v0, 0x21c\n\n    sput v0, Landroid/view/Display;->window_height:I\n\n    const/high16 v0, 0x42700000\n\n    sput v0, Landroid/view/Display;->refresh_rate:F\n\n    const/4 v1, 0x1\n\n    new-array v1, v1, [F\n\n    const/4 v2, 0x0\n\n    aput v0, v1, v2\n\n    sput-object v1, Landroid/view/Display;->supported_refresh_rates:[F\n\n    return-void\n.end method\n'
-n="$(ANCHOR="$UPSTREAM_DISPLAY_CLINIT" perl -0777 -ne 'print scalar(() = /\Q$ENV{ANCHOR}\E/g)' "$dsm")"
-[ "$n" = "1" ] || fail "Display.smali <clinit> is not the upstream window-size initializer (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-ANCHOR="$UPSTREAM_DISPLAY_CLINIT" PATCHED="$DISPLAY_CLINIT" perl -0777 -pi -e 's{\Q$ENV{ANCHOR}\E}{$ENV{PATCHED}}' "$dsm"
-perl -0pi -e 's{(\.field public static window_width:I\n)}{$1\n.field public static volatile refresh_rate:F\n\n.field public static volatile supported_refresh_rates:[F\n}' "$dsm"
+DISPLAY_CLINIT=$'.method static constructor <clinit>()V\n    .registers 4\n\n    const/16 v0, 0x3c0\n\n    sput v0, Landroid/view/Display;->window_width:I\n\n    const/16 v0, 0x21c\n\n    sput v0, Landroid/view/Display;->window_height:I\n\n    const/4 v0, 0x2\n\n    new-array v0, v0, [F\n\n    const/high16 v1, 0x42700000\n\n    const/4 v2, 0x0\n\n    aput v1, v0, v2\n\n    const/4 v3, 0x1\n\n    aput v1, v0, v3\n\n    sput-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    return-void\n.end method\n'
+replace_upstream_display_method "$UPSTREAM_DISPLAY_CLINIT" "$DISPLAY_CLINIT" '<clinit> window-size initializer'
+perl -0pi -e 's{(\.field public static window_width:I\n)}{$1\n.field public static volatile refresh_rates:[F\n}' "$dsm"
 UPSTREAM_GET_REFRESH_RATE_PATTERN='\.method public getRefreshRate\(\)F\n    \.registers 2\n\n    const/high16 v0, 0x42700000[^\n]*\n\n    return v0\n\.end method\n'
 n="$(PATTERN="$UPSTREAM_GET_REFRESH_RATE_PATTERN" perl -0777 -ne 'print scalar(() = /$ENV{PATTERN}/g)' "$dsm")"
 [ "$n" = "1" ] || fail "Display.smali getRefreshRate is not the upstream constant 60 Hz body (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-DISPLAY_REFRESH_RATE_METHODS=$'.method public getRefreshRate()F\n    .registers 2\n\n    sget v0, Landroid/view/Display;->refresh_rate:F\n\n    return v0\n.end method\n\n.method public getSupportedRefreshRates()[F\n    .registers 2\n\n    sget-object v0, Landroid/view/Display;->supported_refresh_rates:[F\n\n    invoke-virtual {v0}, [F->clone()Ljava/lang/Object;\n\n    move-result-object v0\n\n    check-cast v0, [F\n\n    return-object v0\n.end method\n\n.method public static setRefreshRates(F[F)V\n    .registers 2\n\n    sput-object p1, Landroid/view/Display;->supported_refresh_rates:[F\n\n    sput p0, Landroid/view/Display;->refresh_rate:F\n\n    return-void\n.end method\n'
+DISPLAY_REFRESH_RATE_METHODS=$'.method public getRefreshRate()F\n    .registers 3\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    const/4 v1, 0x0\n\n    aget v0, v0, v1\n\n    return v0\n.end method\n\n.method public getSupportedRefreshRates()[F\n    .registers 4\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    const/4 v1, 0x1\n\n    array-length v2, v0\n\n    invoke-static {v0, v1, v2}, Ljava/util/Arrays;->copyOfRange([FII)[F\n\n    move-result-object v0\n\n    return-object v0\n.end method\n\n.method public static setRefreshRates(F[F)V\n    .registers 6\n\n    array-length v0, p1\n\n    add-int/lit8 v1, v0, 0x1\n\n    new-array v1, v1, [F\n\n    const/4 v2, 0x0\n\n    aput p0, v1, v2\n\n    const/4 v3, 0x1\n\n    invoke-static {p1, v2, v1, v3, v0}, Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V\n\n    sput-object v1, Landroid/view/Display;->refresh_rates:[F\n\n    return-void\n.end method\n'
 PATTERN="$UPSTREAM_GET_REFRESH_RATE_PATTERN" PATCHED="$DISPLAY_REFRESH_RATE_METHODS" perl -0777 -pi -e 's{$ENV{PATTERN}}{$ENV{PATCHED}}' "$dsm"
+n="$(display_count "$DISPLAY_REFRESH_RATE_METHODS")"
+[ "$n" = "1" ] || fail "Display.smali refresh-rate methods insert found $n times (expected 1)"
+UPSTREAM_GET_MODE=$'.method public getMode()Landroid/view/Display$Mode;\n    .registers 2\n\n    new-instance v0, Landroid/view/Display$Mode;\n\n    invoke-direct {v0}, Landroid/view/Display$Mode;-><init>()V\n\n    return-object v0\n.end method\n'
+DISPLAY_GET_MODE=$'.method public getMode()Landroid/view/Display$Mode;\n    .registers 7\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    array-length v1, v0\n\n    const/4 v2, 0x0\n\n    aget v3, v0, v2\n\n    const/4 v2, 0x1\n\n    :find_current_mode\n    if-ge v2, v1, :current_mode_found\n\n    aget v4, v0, v2\n\n    cmpl-float v5, v4, v3\n\n    if-eqz v5, :current_mode_found\n\n    add-int/lit8 v2, v2, 0x1\n\n    goto :find_current_mode\n\n    :current_mode_found\n    new-instance v0, Landroid/view/Display$Mode;\n\n    sget v1, Landroid/view/Display;->window_width:I\n\n    sget v4, Landroid/view/Display;->window_height:I\n\n    invoke-direct {v0, v2, v1, v4, v3}, Landroid/view/Display$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n'
+replace_upstream_display_method "$UPSTREAM_GET_MODE" "$DISPLAY_GET_MODE" 'getMode'
+UPSTREAM_GET_SUPPORTED_MODES=$'.method public getSupportedModes()[Landroid/view/Display$Mode;\n    .registers 4\n\n    const/4 v0, 0x1\n\n    new-array v0, v0, [Landroid/view/Display$Mode;\n\n    const/4 v1, 0x0\n\n    invoke-virtual {p0}, Landroid/view/Display;->getMode()Landroid/view/Display$Mode;\n\n    move-result-object v2\n\n    aput-object v2, v0, v1\n\n    return-object v0\n.end method\n'
+DISPLAY_GET_SUPPORTED_MODES=$'.method public getSupportedModes()[Landroid/view/Display$Mode;\n    .registers 10\n\n    sget-object v0, Landroid/view/Display;->refresh_rates:[F\n\n    array-length v1, v0\n\n    add-int/lit8 v2, v1, -0x1\n\n    new-array v2, v2, [Landroid/view/Display$Mode;\n\n    sget v3, Landroid/view/Display;->window_width:I\n\n    sget v4, Landroid/view/Display;->window_height:I\n\n    const/4 v5, 0x1\n\n    :next_supported_mode\n    if-ge v5, v1, :supported_modes_done\n\n    aget v6, v0, v5\n\n    new-instance v7, Landroid/view/Display$Mode;\n\n    invoke-direct {v7, v5, v3, v4, v6}, Landroid/view/Display$Mode;-><init>(IIIF)V\n\n    add-int/lit8 v8, v5, -0x1\n\n    aput-object v7, v2, v8\n\n    add-int/lit8 v5, v5, 0x1\n\n    goto :next_supported_mode\n\n    :supported_modes_done\n    return-object v2\n.end method\n'
+replace_upstream_display_method "$UPSTREAM_GET_SUPPORTED_MODES" "$DISPLAY_GET_SUPPORTED_MODES" 'getSupportedModes'
 for display_needle in \
-    '.field public static volatile refresh_rate:F' \
-    '.field public static volatile supported_refresh_rates:[F' \
-    'sput-object v1, Landroid/view/Display;->supported_refresh_rates:[F' \
-    'sget v0, Landroid/view/Display;->refresh_rate:F' \
+    '.field public static volatile refresh_rates:[F' \
+    '.method public getRefreshRate()F' \
     '.method public getSupportedRefreshRates()[F' \
     '.method public static setRefreshRates(F[F)V' \
-    'sput-object p1, Landroid/view/Display;->supported_refresh_rates:[F' \
-    'sput p0, Landroid/view/Display;->refresh_rate:F'
+    ".method public getMode()Landroid/view/Display\$Mode;" \
+    ".method public getSupportedModes()[Landroid/view/Display\$Mode;"
 do
     n="$(grep -cF -- "$display_needle" "$dsm")" || true
-    [ "$n" = "1" ] || fail "Display.smali refresh-rate insert '$display_needle' found $n times (expected 1)"
+    [ "$n" = "1" ] || fail "Display.smali refresh-rate declaration '$display_needle' found $n times (expected 1)"
 done
-
-n="$(grep -cF '.method public getWidth()I' "$dsm")" || true
-[ "$n" = "1" ] || fail "Display.smali getWidth anchor not unique (found $n, expected 1) — installed Display drifted; update patch-framework.sh"
-UPSTREAM_GET_MODE=$'.method public getMode()Landroid/view/Display$Mode;\n    .registers 2\n\n    new-instance v0, Landroid/view/Display$Mode;\n\n    invoke-direct {v0}, Landroid/view/Display$Mode;-><init>()V\n\n    return-object v0\n.end method\n'
-UPSTREAM_GET_MODE="$UPSTREAM_GET_MODE" perl -0777 -ne 'exit((index($_, $ENV{UPSTREAM_GET_MODE}) >= 0) ? 0 : 1)' "$dsm" || fail "Display.smali getMode body is not the upstream no-arg Display\$Mode shape — installed Display drifted; update patch-framework.sh"
-UPSTREAM_GET_MODE="$UPSTREAM_GET_MODE" perl -0777 -pi -e 's{\Q$ENV{UPSTREAM_GET_MODE}\E}{}' "$dsm"
-! grep -qF ".method public getMode()Landroid/view/Display\$Mode;" "$dsm" || fail "Display.smali upstream getMode removal failed"
-perl -0pi -e 's{(\.method public getWidth\(\)I.*?\.end method\n)}{$1.method public getMode()Landroid/view/Display\$Mode;\n    .locals 5\n\n    new-instance v0, Landroid/view/Display\$Mode;\n\n    const/4 v1, 0x0\n\n    sget v2, Landroid/view/Display;->window_width:I\n\n    sget v3, Landroid/view/Display;->window_height:I\n\n    sget v4, Landroid/view/Display;->refresh_rate:F\n\n    invoke-direct {v0, v1, v2, v3, v4}, Landroid/view/Display\$Mode;-><init>(IIIF)V\n\n    return-object v0\n.end method\n}s' "$dsm"
-n="$(grep -cF ".method public getMode()Landroid/view/Display\$Mode;" "$dsm")" || true
-[ "$n" = "1" ] || fail "Display.smali getMode insert failed (found $n declarations, expected 1)"
-grep -qF 'sget v4, Landroid/view/Display;->refresh_rate:F' "$dsm" || fail "Display.smali getMode refresh-rate read insert failed"
 n="$(grep -cF '0x42700000' "$dsm")" || true
 [ "$n" = "1" ] || fail "Display.smali holds $n 60 Hz constants (expected only the <clinit> default)"
 
