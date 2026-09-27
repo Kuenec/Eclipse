@@ -565,11 +565,76 @@ fn installed_apk_set(
     } else {
         store.verified_current()?.ok_or(NOT_INSTALLED)?
     };
+    if let Some(cache) = eclipse::runtime::dalvik_cache_dir() {
+        remove_other_version_oats(&cache, store.root(), set.base_path(), set.version_code())?;
+    }
     println!(
         "# Launching the installed Roblox {}",
         eclipse::apk::store::InstalledVersion::from(&set)
     );
     Ok(set)
+}
+
+fn remove_other_version_oats(
+    cache: &std::path::Path,
+    store_root: &std::path::Path,
+    apk: &std::path::Path,
+    keep: eclipse::apk::VersionCode,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let (Some(mut prefix), Some(mut kept), Some(apk_name)) = (
+        eclipse::runtime::dalvik_cache_stem(store_root),
+        eclipse::runtime::dalvik_cache_stem(apk),
+        apk.file_name(),
+    ) else {
+        return Err(format!(
+            "the Roblox store {} and its APK {} must be absolute paths",
+            store_root.display(),
+            apk.display()
+        ));
+    };
+    prefix.push("@");
+    kept.push("@classes.dex");
+    let mut artefact = apk_name.to_os_string();
+    artefact.push("@classes.");
+    let version_of = |name: &[u8]| -> Option<u32> {
+        let rest = name.strip_prefix(prefix.as_bytes())?;
+        let split = rest.iter().position(|&byte| byte == b'@')?;
+        let (code, file) = (&rest[..split], &rest[split + 1..]);
+        if !file.starts_with(artefact.as_bytes()) {
+            return None;
+        }
+        std::str::from_utf8(code).ok()?.parse().ok()
+    };
+    if version_of(kept.as_bytes()) != Some(keep.0) {
+        return Err(format!(
+            "the installed Roblox APK {} is not in the version {} directory of the store {}",
+            apk.display(),
+            keep.0,
+            store_root.display()
+        ));
+    }
+    let list_error =
+        |error: std::io::Error| format!("cannot list the ART cache {}: {error}", cache.display());
+    let entries = match std::fs::read_dir(cache) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(list_error(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(list_error)?;
+        if version_of(entry.file_name().as_bytes()).is_some_and(|code| code != keep.0) {
+            let path = entry.path();
+            std::fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "cannot remove the old Roblox ART code {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn installed_or_updated_set(
@@ -726,10 +791,6 @@ fn run_apk(
 
     println!("\n# VM options (-> JNI_CreateJavaVM):");
     for opt in plan.vm_options() {
-        println!("    {opt}");
-    }
-    println!("# dex2oat options (-> dex2oat AOT compiler):");
-    for opt in plan.dex2oat_options() {
         println!("    {opt}");
     }
 
@@ -1217,7 +1278,8 @@ mod tests {
     use super::{
         finish_android_process, installed_or_updated_set, normalize_browser_launch,
         parse_libroblox_init_lib_dir, parse_run_path, parse_update_source,
-        remove_other_native_lib_versions, url_handler_message, UpdateSource,
+        remove_other_native_lib_versions, remove_other_version_oats, url_handler_message,
+        UpdateSource,
     };
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
@@ -1289,6 +1351,76 @@ mod tests {
             "{error}"
         );
         std::fs::remove_file(&root).ok();
+    }
+
+    #[test]
+    fn art_code_of_other_roblox_versions_is_removed() {
+        let cache = std::env::temp_dir().join(format!(
+            "eclipse-art-cache-versions-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&cache).ok();
+        std::fs::create_dir_all(&cache).unwrap();
+        let names = [
+            "x@data@eclipse@roblox@3056@base.apk@classes.dex",
+            "x@data@eclipse@roblox@3056@base.apk@classes.vdex",
+            "x@data@eclipse@roblox@3170@base.apk@classes.dex",
+            "x@data@eclipse@roblox@3170@base.apk@classes.vdex",
+            "x@data@eclipse@roblox@3056@other.apk@classes.dex",
+            "x@data@eclipse@roblox@custom@base.apk@classes.dex",
+            "x@data@eclipse@roblox-old@3056@base.apk@classes.dex",
+            "app@lib@eclipse@framework@api-impl.jar@classes.dex",
+            "home@u@Projects@verified@base.apk@classes.dex",
+        ];
+        for name in names {
+            std::fs::write(cache.join(name), b"oat").unwrap();
+        }
+        let store = std::path::Path::new("/x/data/eclipse/roblox");
+        let apk = std::path::Path::new("/x/data/eclipse/roblox/3170/base.apk");
+        let keep = eclipse::apk::VersionCode(3170);
+
+        remove_other_version_oats(&cache, store, apk, keep).unwrap();
+
+        let mut left: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected: Vec<String> = names[2..].iter().map(|name| name.to_string()).collect();
+        expected.sort();
+        assert_eq!(left, expected);
+        std::fs::remove_dir_all(&cache).ok();
+
+        remove_other_version_oats(&cache, store, apk, keep)
+            .expect("a missing ART cache is not an error");
+
+        std::fs::write(&cache, b"not a directory").unwrap();
+        let error = remove_other_version_oats(&cache, store, apk, keep)
+            .expect_err("an ART cache path that is a file cannot be listed");
+        assert!(
+            error.contains("cannot list") && error.contains(&cache.display().to_string()),
+            "{error}"
+        );
+        std::fs::remove_file(&cache).ok();
+    }
+
+    #[test]
+    fn art_code_pruning_fails_when_the_apk_is_outside_its_store_version_directory() {
+        let cache = std::path::Path::new("/nonexistent/eclipse-art-cache");
+        let store = std::path::Path::new("/x/data/eclipse/roblox");
+        let keep = eclipse::apk::VersionCode(3170);
+        for apk in [
+            "/x/data/eclipse/roblox/versions/3170/base.apk",
+            "/x/data/eclipse/roblox/3056/base.apk",
+            "/x/data/eclipse/other/3170/base.apk",
+        ] {
+            let error = remove_other_version_oats(cache, store, std::path::Path::new(apk), keep)
+                .expect_err("an APK outside <store>/<version>/ breaks the cache pattern");
+            assert!(
+                error.contains(apk) && error.contains("version 3170 directory"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

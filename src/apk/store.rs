@@ -109,6 +109,10 @@ impl Store {
         Self { root }
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn current(&self) -> Result<Option<InstalledVersion>, StoreError> {
         let path = self.root.join(CURRENT_FILE);
         let bytes = match fs::read(&path) {

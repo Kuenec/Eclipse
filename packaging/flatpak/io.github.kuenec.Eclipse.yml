@@ -129,6 +129,10 @@ modules:
       - type: git
         url: https://gitlab.com/android_translation_layer/art_standalone.git
         commit: 66a5d9079b159e9c5819bfeef4a6fff6a5f32719
+      - type: patch
+        path: patches/art_standalone-class-loader-context.patch
+      - type: patch
+        path: patches/art_standalone-host-isa-baseline.patch
 
   - name: android-translation-layer
     buildsystem: meson
@@ -200,17 +204,26 @@ modules:
       - ORIG_FW=/app/lib/java/dex/android_translation_layer ART_DIR=/app/lib/java/dex/art
         WOLFSSL_SOURCE="$PWD/vendor/wolfssljni/WolfSSLImplementSSLSession.java"
         OUT=/app/lib/eclipse/framework tools/framework-overlay/patch-framework.sh
-      - mkdir -p /app/lib/eclipse/framework/art/oat/x86_64
+      - mkdir -p /app/lib/eclipse/framework/art/oat/x86_64 /app/lib/eclipse/framework/oat/x86_64
       - >-
-        art=/app/lib/eclipse/framework/art;
+        root=/app/lib/eclipse;
+        fw=$root/framework;
+        art=$fw/art;
+        isa=ssse3,sse4.1,sse4.2,popcnt;
         set --;
+        bcp=;
         for jar in core-oj-hostdex.jar apachehttp-hostdex.jar apache-xml-hostdex.jar
         bouncycastle-hostdex.jar core-junit-hostdex.jar core-libart-hostdex.jar
         hamcrest-hostdex.jar junit-runner-hostdex.jar okhttp-hostdex.jar wolfssljni-hostdex.jar;
-        do set -- "$@" "--dex-file=$art/$jar" "--dex-location=$art/$jar"; done;
-        dex2oat -j1 "$@" --image="$art/oat/x86_64/boot.art" --oat-file="$art/oat/x86_64/boot.oat"
-        --base=0x60cf8000 --host
-      - chmod +x /app/lib/eclipse/framework/art/oat/x86_64/boot.oat
+        do set -- "$@" "--dex-file=$art/$jar" "--dex-location=$art/$jar"; bcp="${bcp:+$bcp:}$art/$jar"; done;
+        ANDROID_ROOT="$root" dex2oat -j1 "$@" --image="$art/oat/x86_64/boot.art"
+        --oat-file="$art/oat/x86_64/boot.oat" --base=0x60cf8000 --host
+        --instruction-set-features="$isa" &&
+        ANDROID_ROOT="$root" BOOTCLASSPATH="$bcp" dex2oat -j1 --dex-file="$fw/api-impl.jar"
+        --oat-file="$fw/oat/x86_64/api-impl.odex" --class-loader-context='PCL[]'
+        --boot-image="$art/oat/boot.art" --host --instruction-set-features="$isa" &&
+        chmod +x "$art/oat/x86_64/boot.oat" &&
+        BOOTCLASSPATH="$bcp" FRAMEWORK="$fw" tools/framework-overlay/probe-app-dexopt.sh
 
   - name: eclipse
     buildsystem: simple
