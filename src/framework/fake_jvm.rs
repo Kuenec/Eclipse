@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::mem::{offset_of, size_of};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
@@ -131,6 +131,28 @@ unsafe extern "system" fn new_string_utf(_env: *mut JNIEnv, utf: *const c_char) 
     heap().new_local(Some(text))
 }
 
+unsafe extern "system" fn get_string_utf_chars(
+    _env: *mut JNIEnv,
+    string: jstring,
+    is_copy: *mut jboolean,
+) -> *const c_char {
+    if !is_copy.is_null() {
+        unsafe { *is_copy = true };
+    }
+    let text = heap().text(string).unwrap_or_default();
+    CString::new(text).map_or(std::ptr::null(), |chars| chars.into_raw().cast_const())
+}
+
+unsafe extern "system" fn release_string_utf_chars(
+    _env: *mut JNIEnv,
+    _string: jstring,
+    chars: *const c_char,
+) {
+    if !chars.is_null() {
+        drop(unsafe { CString::from_raw(chars.cast_mut()) });
+    }
+}
+
 unsafe extern "system" fn is_assignable_from(
     _env: *mut JNIEnv,
     _class: jclass,
@@ -252,6 +274,15 @@ unsafe extern "system" fn call_void_method_a(
     run_hook(obj, method);
 }
 
+unsafe extern "system" fn new_object_a(
+    _env: *mut JNIEnv,
+    _class: jclass,
+    _constructor: jmethodID,
+    _args: *const jvalue,
+) -> jobject {
+    heap().new_local(None)
+}
+
 unsafe extern "system" fn get_static_method_id(
     _env: *mut JNIEnv,
     _class: jclass,
@@ -363,6 +394,7 @@ fn env_ptr() -> *mut JNIEnv {
                 offset_of!(Table, CallVoidMethodA),
                 call_void_method_a as *const (),
             ),
+            (offset_of!(Table, NewObjectA), new_object_a as *const ()),
             (
                 offset_of!(Table, GetStaticMethodID),
                 get_static_method_id as *const (),
@@ -372,6 +404,14 @@ fn env_ptr() -> *mut JNIEnv {
                 call_static_object_method_a as *const (),
             ),
             (offset_of!(Table, NewStringUTF), new_string_utf as *const ()),
+            (
+                offset_of!(Table, GetStringUTFChars),
+                get_string_utf_chars as *const (),
+            ),
+            (
+                offset_of!(Table, ReleaseStringUTFChars),
+                release_string_utf_chars as *const (),
+            ),
             (offset_of!(Table, GetJavaVM), get_java_vm as *const ()),
         ];
         for (offset, function) in functions {

@@ -136,9 +136,12 @@ Eclipse reads only the place ID from the link. It discards the launch ticket tha
 - Hold the right mouse button to turn the camera. The cursor stays where it is while you drag and is at the same spot when you release the button.
 - When the game locks the mouse, as in shift lock and first person, Eclipse locks the pointer too.
 - On Wayland, Eclipse uses the compositor's pointer lock. On X11, which has no pointer lock, it confines the cursor to the window and moves it back to where the lock began.
-- Switching to another window releases the lock.
+- Switching to another window releases the lock and every key and mouse button the game still holds.
+- F11 toggles fullscreen.
 
 This applies with the default `touch_mode` of `"off"`.
+
+In a Roblox text box, Enter submits a single-line box and starts a new line in a multi-line box, and Escape leaves the box, as on Android. The arrow keys, Home, End, Delete and Ctrl+Backspace edit as usual, and Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V use the desktop clipboard on Wayland and X11. Input methods such as fcitx5 and IBus work while a text box has focus. Password boxes take keys directly, without the input method, so it cannot show or learn what you type.
 
 ## Settings
 

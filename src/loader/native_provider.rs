@@ -2549,7 +2549,7 @@ pub fn classify_winit_event(event: &winit::event::WindowEvent) -> Option<HostInp
         W::MouseInput { .. } => Some(HostInputKind::MouseButton),
         W::MouseWheel { .. } => Some(HostInputKind::Scroll),
         W::Touch(_) => Some(HostInputKind::Touch),
-        W::KeyboardInput { .. } => Some(HostInputKind::Key),
+        W::KeyboardInput { .. } | W::Ime(_) => Some(HostInputKind::Key),
         _ => None,
     }
 }

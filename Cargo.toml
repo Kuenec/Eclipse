@@ -30,6 +30,8 @@ jni-sys = "0.4"
 jni = "0.22"
 
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-crossfont"] }
+smithay-clipboard = "=0.7.2"
+x11-clipboard = "0.9.3"
 
 rustix = { version = "1", default-features = false, features = ["mm", "param"] }
 
