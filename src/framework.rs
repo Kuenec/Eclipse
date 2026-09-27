@@ -18,7 +18,6 @@ use jni::vm::JavaVM;
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JValue, NativeMethod};
 
 use crate::apk::signature::SigningCertificateHistory;
-use crate::font::RasterFont;
 use crate::runtime::Vm;
 
 pub mod asset_registry;
@@ -31,6 +30,7 @@ pub(crate) mod memory;
 mod message_queue;
 pub mod paint_registry;
 pub mod path_registry;
+pub(crate) mod roblox_fonts;
 mod signing_certificates;
 pub mod sqlite;
 pub mod theme_registry;
@@ -8555,8 +8555,6 @@ struct ComposingRegion {
     end_utf16: jint,
 }
 
-const ROBLOX_CODE_FONT: i32 = 10;
-const ROBLOX_CODE_FONT_RATIO: f32 = 0.953_288_85;
 const TEXT_POINTER_LIFETIME: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
@@ -8679,7 +8677,15 @@ pub(crate) struct FocusedTextBox {
 }
 
 pub(crate) fn text_input_type_masks_text(input_type: i32) -> bool {
-    !matches!(input_type, 0..=4 | 7 | 8)
+    !matches!(input_type, 0..=4 | 6..=8 | 10)
+}
+
+pub(crate) fn displayed_text_box_text(text: &str, input_type: i32) -> std::borrow::Cow<'_, str> {
+    if text_input_type_masks_text(input_type) {
+        std::borrow::Cow::Owned("\u{2022}".repeat(text.chars().count()))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 static TEXTBOX_SESSION: std::sync::Mutex<Option<TextboxSession>> = std::sync::Mutex::new(None);
@@ -8714,10 +8720,19 @@ fn live_text_box_session() -> Option<TextboxSession> {
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextSelection {
+    Cursor(usize),
+    All,
+}
+
 pub(crate) struct ActiveTextOverlay {
+    pub(crate) widget: i64,
     pub(crate) text: String,
+    pub(crate) selection: TextSelection,
     pub(crate) geometry: (i32, i32, u32, u32),
     pub(crate) input_type: i32,
+    pub(crate) font: i32,
     pub(crate) font_size: f32,
     pub(crate) multiline: bool,
     pub(crate) text_wrapped: bool,
@@ -8733,19 +8748,33 @@ pub(crate) fn active_text_overlay() -> Option<ActiveTextOverlay> {
     {
         return None;
     }
-    let text = view_registry::with_view(session.widget, |view| view.text.clone())
-        .ok()
-        .flatten()?;
+    let (text, cursor) = view_registry::with_view(session.widget, |view| {
+        (
+            view.text.clone(),
+            ACTIVE_TEXT_CURSOR_UTF16.load(std::sync::atomic::Ordering::Acquire),
+        )
+    })
+    .ok()?;
+    let text = text?;
     if !textbox_session_matches_active(
         session,
         ACTIVE_TEXT_FIELD.load(std::sync::atomic::Ordering::Acquire),
     ) {
         return None;
     }
+    let selection =
+        if ACTIVE_TEXT_SELECTION_ALL.load(std::sync::atomic::Ordering::Acquire) == session.widget {
+            TextSelection::All
+        } else {
+            TextSelection::Cursor(usize::try_from(cursor).unwrap_or(0))
+        };
     Some(ActiveTextOverlay {
+        widget: session.widget,
         text,
+        selection,
         geometry: session.geometry,
         input_type: session.input_type,
+        font: session.font,
         font_size: session.font_size,
         multiline: session.multiline,
         text_wrapped: session.text_wrapped,
@@ -8798,31 +8827,29 @@ fn record_textbox_session(session: Option<TextboxSession>) {
     }
 }
 
-fn roblox_code_font() -> Option<&'static RasterFont> {
-    static FONT: OnceLock<Option<RasterFont>> = OnceLock::new();
-    FONT.get_or_init(|| {
-        RasterFont::try_from_vec(read_asset_bytes("content/fonts/Inconsolata-Regular.ttf")?).ok()
-    })
-    .as_ref()
+static ACTIVE_TEXT_SCROLL: std::sync::Mutex<Option<(i64, crate::text_layout::Scroll)>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn record_text_scroll(widget: i64, scroll: crate::text_layout::Scroll) {
+    *ACTIVE_TEXT_SCROLL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((widget, scroll));
 }
 
-pub(crate) fn text_line_origin(x_alignment: i32, width: f32, line_width: f32) -> f32 {
-    let spare = (width - line_width).max(0.0);
-    match x_alignment {
-        1 => spare,
-        2 => spare * 0.5,
-        _ => 0.0,
-    }
+fn recorded_text_scroll(widget: i64) -> crate::text_layout::Scroll {
+    ACTIVE_TEXT_SCROLL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .filter(|(scrolled, _)| *scrolled == widget)
+        .map_or_else(crate::text_layout::Scroll::default, |(_, scroll)| scroll)
 }
 
-fn code_text_cursor_from_pointer(
+fn text_cursor_from_pointer(
     text: &str,
+    cursor_utf16: usize,
     session: TextboxSession,
     position: (f32, f32),
 ) -> Option<jint> {
-    if session.font != ROBLOX_CODE_FONT || session.text_wrapped {
-        return None;
-    }
     let (x, y, width, height) = session.geometry;
     let relative_x = position.0 - x as f32;
     let relative_y = position.1 - y as f32;
@@ -8833,42 +8860,26 @@ fn code_text_cursor_from_pointer(
     {
         return None;
     }
-    let font = roblox_code_font()?;
-    let scale = session.font_size * ROBLOX_CODE_FONT_RATIO;
-    let mut scaled = font.scaled(scale)?;
-    let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
-    let requested_line = if session.multiline {
-        (relative_y / line_height).floor().max(0.0) as usize
-    } else {
-        0
-    };
-    let mut utf16_before_line = 0usize;
-    for (line_index, line) in text.split('\n').enumerate() {
-        if line_index != requested_line {
-            utf16_before_line = utf16_before_line
-                .saturating_add(line.encode_utf16().count())
-                .saturating_add(1);
-            continue;
-        }
-        let line_width = line
-            .chars()
-            .map(|character| scaled.advance(character))
-            .sum::<f32>();
-        let line_origin = text_line_origin(session.x_alignment, width as f32, line_width);
-        let requested_x = (relative_x - line_origin).max(0.0);
-        let mut used_width = 0.0;
-        let mut line_utf16 = 0usize;
-        for character in line.chars() {
-            let advance = scaled.advance(character);
-            if requested_x < used_width + advance * 0.5 {
-                return jint::try_from(utf16_before_line.saturating_add(line_utf16)).ok();
-            }
-            used_width += advance;
-            line_utf16 = line_utf16.saturating_add(character.len_utf16());
-        }
-        return jint::try_from(utf16_before_line.saturating_add(line_utf16)).ok();
-    }
-    jint::try_from(text.encode_utf16().count()).ok()
+    let chain = roblox_fonts::face_chain(session.font)?;
+    let displayed = displayed_text_box_text(text, session.input_type);
+    let style = crate::text_layout::FieldStyle::of_text_box(
+        session.font_size,
+        (width, height),
+        session.multiline,
+        session.text_wrapped,
+        session.x_alignment,
+        session.y_alignment,
+    );
+    let caret = crate::text_layout::char_index_at_utf16(text, cursor_utf16);
+    let layout = crate::text_layout::lay_out(
+        &displayed,
+        crate::text_layout::Selection::Caret(caret),
+        &style,
+        chain,
+        recorded_text_scroll(session.widget),
+    );
+    let index = layout.hit_test(relative_x, relative_y);
+    jint::try_from(text.chars().take(index).map(char::len_utf16).sum::<usize>()).ok()
 }
 
 fn update_active_text_cursor_from_pointer(session: TextboxSession, position: (f32, f32)) -> bool {
@@ -8880,7 +8891,10 @@ fn update_active_text_cursor_from_pointer(session: TextboxSession, position: (f3
     let Ok(text) = text else {
         return false;
     };
-    let Some(cursor) = code_text_cursor_from_pointer(&text, session, position) else {
+    let current =
+        usize::try_from(ACTIVE_TEXT_CURSOR_UTF16.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+    let Some(cursor) = text_cursor_from_pointer(&text, current, session, position) else {
         return false;
     };
     ACTIVE_TEXT_CURSOR_UTF16.store(i64::from(cursor), std::sync::atomic::Ordering::Release);
@@ -9044,20 +9058,8 @@ extern "system" fn widget_native_set_text<'local>(
         } else {
             Some(text.try_to_string(env)?)
         };
-        match view_registry::with_view(widget, |view| {
-            let changed = view.text != value;
-            view.text = value.clone();
-            changed
-        }) {
-            Ok(changed) => {
-                if changed && active_text_field() == widget {
-                    let cursor = java_cursor_position(value.as_deref().unwrap_or_default());
-                    ACTIVE_TEXT_CURSOR_UTF16
-                        .store(i64::from(cursor), std::sync::atomic::Ordering::Release);
-                    if let Ok(mut composing) = ACTIVE_TEXT_COMPOSING.lock() {
-                        *composing = None;
-                    }
-                }
+        match record_widget_text(widget, value.clone()) {
+            Ok(()) => {
                 request_textbox_refresh(widget);
                 tracing::debug!(
                 target: "android.widget",
@@ -9076,6 +9078,22 @@ extern "system" fn widget_native_set_text<'local>(
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+fn record_widget_text(
+    widget: i64,
+    value: Option<String>,
+) -> Result<(), view_registry::ViewRegistryError> {
+    view_registry::with_view(widget, |view| {
+        if view.text != value && active_text_field() == widget {
+            let cursor = java_cursor_position(value.as_deref().unwrap_or_default());
+            ACTIVE_TEXT_CURSOR_UTF16.store(i64::from(cursor), std::sync::atomic::Ordering::Release);
+            if let Ok(mut composing) = ACTIVE_TEXT_COMPOSING.lock() {
+                *composing = None;
+            }
+        }
+        view.text = value;
+    })
 }
 
 extern "system" fn edit_text_native_get_text<'local>(
@@ -14004,7 +14022,7 @@ mod tests {
             widget: 44,
             geometry: (54, 10, 720, 280),
             input_type: 0,
-            font: ROBLOX_CODE_FONT,
+            font: 10,
             font_size: 14.0,
             multiline: true,
             text_wrapped: false,
@@ -14020,6 +14038,107 @@ mod tests {
         assert_eq!(active_text_field(), 44);
         assert!(!has_live_textbox_session(44));
         assert!(clear_active_text_field());
+    }
+
+    #[test]
+    fn the_overlay_never_pairs_new_text_with_the_previous_cursor() {
+        let _textbox_test_guard = TEXTBOX_TEST_LOCK.lock().expect("textbox test lock");
+        let widget = view_registry::allocate("android.widget.EditText").expect("view");
+        ACTIVE_TEXT_FIELD.store(widget, std::sync::atomic::Ordering::Release);
+        record_textbox_session(Some(TextboxSession {
+            widget,
+            geometry: (0, 0, 300, 40),
+            input_type: 0,
+            font: 46,
+            font_size: 18.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 0,
+            editable: true,
+        }));
+        let texts = ["a".repeat(20_000), "\u{E9}".repeat(40_000)];
+        let written = std::sync::atomic::AtomicBool::new(false);
+        let mut snapshots = 0;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..200 {
+                    record_widget_text(widget, Some(texts[round % 2].clone())).expect("set text");
+                }
+                written.store(true, std::sync::atomic::Ordering::Release);
+            });
+            while !written.load(std::sync::atomic::Ordering::Acquire) {
+                let Some(overlay) = active_text_overlay() else {
+                    continue;
+                };
+                snapshots += 1;
+                assert_eq!(
+                    overlay.selection,
+                    TextSelection::Cursor(overlay.text.encode_utf16().count()),
+                    "snapshot {snapshots} pairs the text with another text's cursor"
+                );
+            }
+        });
+        assert!(clear_active_text_field());
+        view_registry::free(widget).expect("free view");
+    }
+
+    #[test]
+    fn password_shown_input_types_render_in_clear() {
+        for shown in [0, 1, 2, 3, 4, 6, 7, 8, 10] {
+            assert_eq!(
+                displayed_text_box_text("Ab1!", shown),
+                "Ab1!",
+                "input type {shown}"
+            );
+        }
+        for secret in [5, 9, 11, -1, i32::MIN] {
+            assert_eq!(
+                displayed_text_box_text("Ab1!", secret),
+                "\u{2022}\u{2022}\u{2022}\u{2022}",
+                "input type {secret}"
+            );
+        }
+        assert_eq!(displayed_text_box_text("", 5), "");
+    }
+
+    #[test]
+    fn clicks_in_any_focused_text_box_use_the_layout_the_overlay_draws() {
+        if crate::host_fonts::system_font().is_none() {
+            eprintln!("SKIP: no host font for the text layout");
+            return;
+        }
+        let session = TextboxSession {
+            widget: 46,
+            geometry: (100, 50, 400, 40),
+            input_type: 0,
+            font: 46,
+            font_size: 20.0,
+            multiline: false,
+            text_wrapped: false,
+            text_color: -1,
+            x_alignment: 0,
+            y_alignment: 1,
+            editable: true,
+        };
+        let text = "hello world";
+        let end = text.encode_utf16().count();
+        assert_eq!(
+            text_cursor_from_pointer(text, end, session, (101.0, 70.0)),
+            Some(0)
+        );
+        assert_eq!(
+            text_cursor_from_pointer(text, end, session, (499.0, 70.0)),
+            jint::try_from(end).ok()
+        );
+        let middle = text_cursor_from_pointer(text, end, session, (140.0, 70.0))
+            .expect("a click inside the text lands on it");
+        assert!(0 < middle && (middle as usize) < end);
+        assert_eq!(
+            text_cursor_from_pointer(text, end, session, (99.0, 70.0)),
+            None
+        );
     }
 
     #[test]

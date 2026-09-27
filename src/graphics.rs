@@ -2014,8 +2014,10 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::Surface
         .iter()
         .copied()
         .find(|f| {
-            f.format == vk::Format::B8G8R8A8_SRGB
-                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+            matches!(
+                f.format,
+                vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM
+            ) && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
         })
         .or_else(|| formats.first().copied())
 }
@@ -2169,7 +2171,7 @@ impl TextMeasure<'_> {
     fn width(&self, text: &str) -> f32 {
         let advances: f32 = text
             .chars()
-            .map(|ch| self.atlas.glyphs.get(&ch).map_or(0.0, |g| g.advance))
+            .map(|ch| self.atlas.glyph(ch).map_or(0.0, |g| g.advance))
             .sum();
         advances + 2.0 * TEXT_PAD_X
     }
@@ -3262,59 +3264,22 @@ struct GlyphAtlas {
     line_height: f32,
 }
 
-const ATLAS_CHARS: std::ops::RangeInclusive<u8> = 32..=126;
+const ATLAS_CHARS: [std::ops::RangeInclusive<char>; 5] = [
+    ' '..='~',
+    '\u{A0}'..='\u{17F}',
+    '\u{2010}'..='\u{2027}',
+    '\u{20AC}'..='\u{20AC}',
+    REPLACEMENT_CHARACTER..=REPLACEMENT_CHARACTER,
+];
 
-pub(crate) fn discover_font_path() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("ECLIPSE_FONT") {
-        let path = std::path::PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
-        }
+const REPLACEMENT_CHARACTER: char = '\u{FFFD}';
+
+impl GlyphAtlas {
+    fn glyph(&self, character: char) -> Option<&GlyphInfo> {
+        self.glyphs
+            .get(&character)
+            .or_else(|| self.glyphs.get(&REPLACEMENT_CHARACTER))
     }
-
-    if let Ok(out) = std::process::Command::new("fc-match")
-        .args(["--format=%{file}", "sans-serif"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            let path = std::path::PathBuf::from(s.trim());
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-
-    const FONT_DIRS: [&str; 4] = [
-        "/usr/share/fonts",
-        "/usr/local/share/fonts",
-        "/usr/share/fonts/truetype",
-        "/run/host/fonts",
-    ];
-    for dir in FONT_DIRS {
-        if let Some(p) = first_font_in_dir(std::path::Path::new(dir)) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn first_font_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            subdirs.push(path);
-        } else if let Some(ext) = path.extension() {
-            let ext = ext.to_ascii_lowercase();
-            if ext == "ttf" || ext == "otf" {
-                return Some(path);
-            }
-        }
-    }
-
-    subdirs.into_iter().find_map(|d| first_font_in_dir(&d))
 }
 
 fn build_glyph_atlas(font: &RasterFont, max_width: u32) -> Option<GlyphAtlas> {
@@ -3334,8 +3299,7 @@ fn build_glyph_atlas(font: &RasterFont, max_width: u32) -> Option<GlyphAtlas> {
         advance: f32,
     }
     let mut rasters: Vec<Raster> = Vec::new();
-    for byte in ATLAS_CHARS {
-        let ch = byte as char;
+    for ch in ATLAS_CHARS.into_iter().flatten() {
         let advance = scaled.advance(ch);
         if let Some(glyph) = scaled.glyph(ch) {
             let placement = glyph.placement();
@@ -3465,7 +3429,7 @@ fn build_text_vertices(
         let mut pen_x = v.x + TEXT_PAD_X;
         let baseline_y = v.y + (v.h - atlas.line_height).max(0.0) * 0.5 + atlas.ascent;
         for ch in text.chars() {
-            let Some(g) = atlas.glyphs.get(&ch) else {
+            let Some(g) = atlas.glyph(ch) else {
                 continue;
             };
             if g.aw > 0 && g.ah > 0 {
@@ -4754,35 +4718,18 @@ impl TextRenderer {
         render_pass: vk::RenderPass,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
     ) -> Result<Option<Self>, GraphicsError> {
-        let Some(font_path) = discover_font_path() else {
-            tracing::warn!("no system font found (fc-match / font dirs); text drawing disabled");
+        let Some(font) = crate::host_fonts::system_font() else {
             return Ok(None);
         };
-        let bytes = match std::fs::read(&font_path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(path = %font_path.display(), error = %e, "font read failed; text disabled");
-                return Ok(None);
-            }
-        };
-        let font = match RasterFont::try_from_vec(bytes) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(path = %font_path.display(), error = %e, "font parse failed; text disabled");
-                return Ok(None);
-            }
-        };
-
-        let Some(atlas) = build_glyph_atlas(&font, 1024) else {
+        let Some(atlas) = build_glyph_atlas(font, 1024) else {
             tracing::warn!("glyph atlas came out empty; text disabled");
             return Ok(None);
         };
         tracing::info!(
-            font = %font_path.display(),
             atlas_w = atlas.width,
             atlas_h = atlas.height,
             glyphs = atlas.glyphs.len(),
-            "text: discovered system font + built R8 glyph atlas"
+            "text: built R8 glyph atlas from the host font"
         );
 
         Self::build_gpu(
@@ -6290,19 +6237,19 @@ mod tests {
     }
 
     #[test]
-    fn surface_format_prefers_bgra8_srgb() {
+    fn surface_format_prefers_unorm_so_srgb_encoded_colours_pass_through() {
         let formats = [
-            vk::SurfaceFormatKHR {
-                format: vk::Format::R8G8B8A8_UNORM,
-                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-            },
             vk::SurfaceFormatKHR {
                 format: vk::Format::B8G8R8A8_SRGB,
                 color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
             },
+            vk::SurfaceFormatKHR {
+                format: vk::Format::B8G8R8A8_UNORM,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            },
         ];
         let chosen = choose_surface_format(&formats).expect("a format exists");
-        assert_eq!(chosen.format, vk::Format::B8G8R8A8_SRGB);
+        assert_eq!(chosen.format, vk::Format::B8G8R8A8_UNORM);
         assert_eq!(chosen.color_space, vk::ColorSpaceKHR::SRGB_NONLINEAR);
     }
 
@@ -7493,22 +7440,51 @@ mod tests {
 
     #[test]
     fn glyph_atlas_builds_from_discovered_font_when_present() {
-        let Some(path) = discover_font_path() else {
+        let Some(font) = crate::host_fonts::system_font() else {
             return;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
-        };
-        let Ok(font) = RasterFont::try_from_vec(bytes) else {
-            return;
-        };
-        let atlas = build_glyph_atlas(&font, 1024).expect("atlas builds from a real font");
+        let atlas = build_glyph_atlas(font, 1024).expect("atlas builds from a real font");
         assert!(atlas.width > 0 && atlas.height > 0);
         assert_eq!(atlas.pixels.len(), (atlas.width * atlas.height) as usize);
 
         let a = atlas.glyphs.get(&'A').expect("'A' in atlas");
         assert!(a.advance > 0.0);
         assert!(a.aw > 0 && a.ah > 0, "'A' has a non-empty bitmap");
+        for accented in ['é', '’', '…'] {
+            let glyph = atlas
+                .glyphs
+                .get(&accented)
+                .expect("common non-ASCII text is in the atlas");
+            assert!(glyph.advance > 0.0 && glyph.aw > 0, "{accented:?} draws");
+        }
+    }
+
+    #[test]
+    fn text_without_an_atlas_glyph_draws_the_replacement_character() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let mut atlas = synthetic_atlas();
+        let replacement = *atlas.glyphs.get(&'A').expect("synthetic 'A'");
+        atlas.glyphs.insert(REPLACEMENT_CHARACTER, replacement);
+        let view = |text: &str| LaidOutView {
+            handle: 0,
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 64.0,
+            clickable: false,
+            color: [1.0; 4],
+            text: Some(text.to_owned()),
+        };
+        let unknown = build_text_vertices(&[view("\u{4F60}A")], &atlas, extent);
+        let known = build_text_vertices(&[view("AA")], &atlas, extent);
+        assert_eq!(unknown, known);
+        assert_eq!(
+            TextMeasure { atlas: &atlas }.width("\u{4F60}A"),
+            TextMeasure { atlas: &atlas }.width("AA")
+        );
     }
 
     #[test]

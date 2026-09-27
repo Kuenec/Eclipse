@@ -1,22 +1,12 @@
-use crate::font::{RasterFont, ScaledFont};
+use crate::framework::{ActiveTextOverlay, TextSelection};
 use crate::graphics::FrameFence;
+use crate::text_layout::{FieldStyle, PixelRect, Scroll, Selection, Viewport};
 use ash::vk;
 use ash::vk::Handle;
-use std::borrow::Cow;
-use std::cell::RefCell;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-fn overlay_font() -> Option<&'static RasterFont> {
-    static FONT: OnceLock<Option<RasterFont>> = OnceLock::new();
-    FONT.get_or_init(|| {
-        let path = crate::graphics::discover_font_path()?;
-        let bytes = std::fs::read(path).ok()?;
-        RasterFont::try_from_vec(bytes).ok()
-    })
-    .as_ref()
-}
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     fn crc32(buf: &[u8]) -> u32 {
@@ -80,330 +70,227 @@ fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-const MAX_OVERLAY_FONT_SIZE: f32 = 100.0;
+const CARET_BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
+const SELECTION_HIGHLIGHT_ALPHA: u8 = 0x66;
+const TEXT_TEST_FONT: i32 = 46;
 
-fn overlay_font_size(font_size: f32) -> f32 {
-    if font_size.is_finite() && font_size > 0.0 {
-        font_size.min(MAX_OVERLAY_FONT_SIZE)
-    } else {
-        14.0
+fn caret_visible(since_change: Duration) -> bool {
+    (since_change.as_millis() / CARET_BLINK_HALF_PERIOD.as_millis()).is_multiple_of(2)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteOrder {
+    Rgba,
+    Bgra,
+}
+
+impl ByteOrder {
+    fn of_swapchain(format_raw: i32) -> Option<Self> {
+        match classify_swapchain_format(format_raw) {
+            CompositeFormat::Bgra => Some(Self::Bgra),
+            CompositeFormat::RgbaSwizzle => Some(Self::Rgba),
+            CompositeFormat::Unsupported => None,
+        }
+    }
+
+    fn arrange(self, [r, g, b, a]: [u8; 4]) -> [u8; 4] {
+        match self {
+            Self::Rgba => [r, g, b, a],
+            Self::Bgra => [b, g, r, a],
+        }
     }
 }
 
-fn blend_text_pixel(buf: &mut [u8], index: usize, color: [u8; 4], coverage: f32) {
-    let alpha = coverage.clamp(0.0, 1.0) * f32::from(color[3]) / 255.0;
-    for channel in 0..3 {
-        let background = f32::from(buf[index + channel]);
-        buf[index + channel] =
-            (f32::from(color[channel]) * alpha + background * (1.0 - alpha)) as u8;
-    }
-}
-
-fn visible_line_end(
-    text: &str,
-    scaled: &mut ScaledFont,
-    width: f32,
-    wrapped: bool,
-) -> (usize, usize, bool) {
-    let mut line_width = 0.0;
-    for (index, character) in text.char_indices() {
-        if character == '\n' {
-            return (index, index + character.len_utf8(), false);
-        }
-        let advance = scaled.advance(character);
-        if line_width + advance > width {
-            if wrapped {
-                let end = if index == 0 {
-                    character.len_utf8()
-                } else {
-                    index
-                };
-                return (end, end, false);
-            }
-            return (index, index, true);
-        }
-        line_width += advance;
-    }
-    (text.len(), text.len(), false)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct TextLayout {
-    scale: f32,
-    multiline: bool,
-    wrapped: bool,
-    x_alignment: i32,
-    y_alignment: i32,
-    width: u32,
-    height: u32,
-}
-
-impl TextLayout {
-    fn of(overlay: &crate::framework::ActiveTextOverlay, width: u32, height: u32) -> Self {
-        Self {
-            scale: overlay_font_size(overlay.font_size),
-            multiline: overlay.multiline,
-            wrapped: overlay.text_wrapped,
-            x_alignment: overlay.x_alignment,
-            y_alignment: overlay.y_alignment,
-            width,
-            height,
-        }
-    }
-
-    fn buffer_len(&self) -> usize {
-        self.width as usize * self.height as usize * 4
-    }
-}
-
-fn lay_out_text(
-    scaled: &mut ScaledFont,
-    text: &str,
-    layout: &TextLayout,
-    mut paint: impl FnMut(usize, f32),
-) -> Option<(f32, f32)> {
-    if text.is_empty() {
-        return None;
-    }
-    let (w, h) = (layout.width, layout.height);
-    let buf_len = layout.buffer_len();
-    let scale = layout.scale;
-    let ascent = scaled.ascent();
-    let line_height = (scaled.height() + scaled.line_gap().max(0.0)).max(scale);
-    let available_width = (w as f32).max(1.0);
-    let available_height = (h as f32).max(line_height);
-    let maximum_lines = if layout.multiline {
-        (available_height / line_height).floor().max(1.0) as usize
-    } else {
-        1
-    };
-    let first_baseline = if layout.multiline || layout.y_alignment == 0 {
-        ascent
-    } else if layout.y_alignment == 2 {
-        h as f32 - scale + ascent
-    } else {
-        (h as f32 - scale) * 0.5 + ascent
-    };
-    let mut remaining = text;
-    let mut caret = None;
-    let mut complete = false;
-
-    for line_index in 0..maximum_lines {
-        let (draw_end, consumed, clipped_line) =
-            visible_line_end(remaining, scaled, available_width, layout.wrapped);
-        let line = &remaining[..draw_end];
-        let line_width = line
-            .chars()
-            .map(|character| scaled.advance(character))
-            .sum::<f32>();
-        let mut pen_x =
-            crate::framework::text_line_origin(layout.x_alignment, w as f32, line_width);
-        let baseline_y = first_baseline + line_index as f32 * line_height;
-
-        for character in line.chars() {
-            if character == '\u{2022}' {
-                let radius = (scale * 0.13).max(2.0);
-                let center_x = (pen_x + radius) as i32;
-                let center_y = (baseline_y - ascent + scale * 0.5) as i32;
-                let integer_radius = radius as i32;
-                for delta_y in -integer_radius..=integer_radius {
-                    for delta_x in -integer_radius..=integer_radius {
-                        if (delta_x * delta_x + delta_y * delta_y) as f32 <= radius * radius {
-                            let pixel_x = center_x + delta_x;
-                            let pixel_y = center_y + delta_y;
-                            if pixel_x >= 0
-                                && pixel_y >= 0
-                                && (pixel_x as u32) < w
-                                && (pixel_y as u32) < h
-                            {
-                                let index = ((pixel_y as u32 * w + pixel_x as u32) * 4) as usize;
-                                if index + 2 < buf_len {
-                                    paint(index, 1.0);
-                                }
-                            }
-                        }
-                    }
-                }
-                pen_x += radius * 3.0;
-                continue;
-            }
-            let advance = scaled.advance(character);
-            if let Some(glyph) = scaled.glyph_at(character, pen_x, baseline_y) {
-                let placement = glyph.placement();
-                glyph.draw(|glyph_x, glyph_y, coverage| {
-                    let pixel_x = placement.left + glyph_x as i32;
-                    let pixel_y = placement.top + glyph_y as i32;
-                    if pixel_x >= 0 && pixel_y >= 0 && (pixel_x as u32) < w && (pixel_y as u32) < h
-                    {
-                        let index = ((pixel_y as u32 * w + pixel_x as u32) * 4) as usize;
-                        paint(index, coverage);
-                    }
-                });
-            }
-            pen_x += advance;
-        }
-
-        if clipped_line {
-            break;
-        }
-        if consumed == remaining.len() && remaining.ends_with('\n') {
-            let line_start = crate::framework::text_line_origin(layout.x_alignment, w as f32, 0.0);
-            caret = Some((line_start, baseline_y + line_height));
-            complete = line_index + 1 < maximum_lines;
-            break;
-        }
-        if consumed == remaining.len() {
-            caret = Some((pen_x, baseline_y));
-            complete = true;
-            break;
-        }
-        remaining = &remaining[consumed..];
-    }
-
-    caret.filter(|_| complete)
-}
-
-fn paint_caret(caret: (f32, f32), layout: &TextLayout, mut paint: impl FnMut(usize)) {
-    let (pen_x, baseline_y) = caret;
-    let (w, h) = (layout.width, layout.height);
-    let buf_len = layout.buffer_len();
-    let cx = (pen_x as i32 + 1).min(w as i32 - 2).max(0);
-    let y0 = (baseline_y - layout.scale * 0.72).max(0.0) as u32;
-    let y1 = ((baseline_y + layout.scale * 0.08) as u32).min(h);
-    for cy in y0..y1 {
-        for dx in 0..2 {
-            let px = cx + dx;
-            if px >= 0 && (px as u32) < w {
-                let idx = ((cy * w + px as u32) * 4) as usize;
-                if idx + 2 < buf_len {
-                    paint(idx);
-                }
-            }
-        }
-    }
+fn text_rgba(argb: i32) -> [u8; 4] {
+    let [a, r, g, b] = (argb as u32).to_be_bytes();
+    [r, g, b, a]
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum OverlayText {
-    Plain(String),
-    Masked { chars: usize },
+struct TextRequest {
+    widget: i64,
+    text: String,
+    selection: Selection,
+    font: i32,
+    style: FieldStyle,
+    viewport: Viewport,
+    text_color: i32,
+    order: ByteOrder,
 }
 
-impl OverlayText {
-    fn of(overlay: &crate::framework::ActiveTextOverlay) -> Self {
-        if crate::framework::text_input_type_masks_text(overlay.input_type) {
-            Self::Masked {
-                chars: overlay.text.chars().count(),
-            }
-        } else {
-            Self::Plain(overlay.text.clone())
-        }
-    }
-
-    fn shows(&self, overlay: &crate::framework::ActiveTextOverlay) -> bool {
-        match self {
-            Self::Plain(text) => {
-                !crate::framework::text_input_type_masks_text(overlay.input_type)
-                    && *text == overlay.text
-            }
-            Self::Masked { chars } => {
-                crate::framework::text_input_type_masks_text(overlay.input_type)
-                    && *chars == overlay.text.chars().count()
-            }
-        }
-    }
-
-    fn rendered(&self) -> Cow<'_, str> {
-        match self {
-            Self::Plain(text) => Cow::Borrowed(text),
-            Self::Masked { chars } => Cow::Owned("\u{2022}".repeat(*chars)),
+impl TextRequest {
+    fn of(overlay: &ActiveTextOverlay, rect: vk::Rect2D, order: ByteOrder) -> Self {
+        let (field_x, field_y, width, height) = overlay.geometry;
+        Self {
+            widget: overlay.widget,
+            text: crate::framework::displayed_text_box_text(&overlay.text, overlay.input_type)
+                .into_owned(),
+            selection: match overlay.selection {
+                TextSelection::All => Selection::All,
+                TextSelection::Cursor(utf16) => Selection::Caret(
+                    crate::text_layout::char_index_at_utf16(&overlay.text, utf16),
+                ),
+            },
+            font: overlay.font,
+            style: FieldStyle::of_text_box(
+                overlay.font_size,
+                (width, height),
+                overlay.multiline,
+                overlay.text_wrapped,
+                overlay.x_alignment,
+                overlay.y_alignment,
+            ),
+            viewport: Viewport {
+                x: rect.offset.x.saturating_sub(field_x),
+                y: rect.offset.y.saturating_sub(field_y),
+                width: rect.extent.width,
+                height: rect.extent.height,
+            },
+            text_color: overlay.text_color,
+            order,
         }
     }
 }
 
 struct TextLayer {
-    text: OverlayText,
-    layout: TextLayout,
-    glyphs: Vec<(usize, f32)>,
-    caret: Option<Vec<usize>>,
+    request: TextRequest,
+    generation: u64,
+    pixels: Vec<[u8; 4]>,
+    caret: Option<PixelRect>,
+    caret_color: [u8; 4],
 }
 
-impl TextLayer {
-    fn build(scaled: &mut ScaledFont, text: OverlayText, layout: TextLayout) -> Self {
-        let mut glyphs = Vec::new();
-        let caret = lay_out_text(scaled, &text.rendered(), &layout, |index, coverage| {
-            if coverage != 0.0 {
-                glyphs.push((index, coverage));
+fn build_text_layer(
+    request: &TextRequest,
+    generation: u64,
+    previous: Scroll,
+) -> Option<(TextLayer, Scroll)> {
+    let chain = crate::framework::roblox_fonts::face_chain(request.font)?;
+    let layout = crate::text_layout::lay_out(
+        &request.text,
+        request.selection,
+        &request.style,
+        chain,
+        previous,
+    );
+    let color = text_rgba(request.text_color);
+    let highlight = [
+        color[0],
+        color[1],
+        color[2],
+        crate::text_layout::scale_byte(color[3], SELECTION_HIGHLIGHT_ALPHA),
+    ];
+    let pixels = layout
+        .paint(request.viewport, color, highlight)
+        .into_iter()
+        .map(|pixel| request.order.arrange(pixel))
+        .collect();
+    let layer = TextLayer {
+        request: request.clone(),
+        generation,
+        pixels,
+        caret: layout.caret_pixels(request.viewport),
+        caret_color: request.order.arrange(color),
+    };
+    Some((layer, layout.scroll()))
+}
+
+struct TextWorkerState {
+    wanted: Option<TextRequest>,
+    generation: u64,
+    changed_at: Instant,
+    ready: Option<Arc<TextLayer>>,
+}
+
+struct TextWorker {
+    state: Mutex<TextWorkerState>,
+    wake: Condvar,
+}
+
+fn text_worker() -> Option<&'static TextWorker> {
+    static WORKER: OnceLock<Option<&'static TextWorker>> = OnceLock::new();
+    *WORKER.get_or_init(|| {
+        let worker: &'static TextWorker = Box::leak(Box::new(TextWorker {
+            state: Mutex::new(TextWorkerState {
+                wanted: None,
+                generation: 0,
+                changed_at: Instant::now(),
+                ready: None,
+            }),
+            wake: Condvar::new(),
+        }));
+        match std::thread::Builder::new()
+            .name("eclipse-text".to_owned())
+            .spawn(move || run_text_worker(worker))
+        {
+            Ok(_) => Some(worker),
+            Err(error) => {
+                tracing::error!(%error, "vk-overlay: could not start the text layout thread");
+                None
             }
-        })
-        .map(|position| {
-            let mut pixels = Vec::new();
-            paint_caret(position, &layout, |index| pixels.push(index));
-            pixels
+        }
+    })
+}
+
+fn run_text_worker(worker: &TextWorker) {
+    let mut built = 0;
+    let mut scroll: Option<(i64, Scroll)> = None;
+    loop {
+        let (request, generation) = {
+            let mut state = worker
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.generation == built {
+                state = worker
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            (state.wanted.clone(), state.generation)
+        };
+        built = generation;
+        let Some(request) = request else {
+            continue;
+        };
+        let previous = scroll
+            .filter(|(widget, _)| *widget == request.widget)
+            .map_or_else(Scroll::default, |(_, scroll)| scroll);
+        let layer = build_text_layer(&request, generation, previous).map(|(layer, next)| {
+            scroll = Some((request.widget, next));
+            crate::framework::record_text_scroll(request.widget, next);
+            Arc::new(layer)
         });
-        Self {
-            text,
-            layout,
-            glyphs,
-            caret,
-        }
-    }
-
-    fn apply(&self, buf: &mut [u8], color: [u8; 4], blink: &AtomicU64) {
-        for &(index, coverage) in &self.glyphs {
-            blend_text_pixel(buf, index, color, coverage);
-        }
-        if let Some(caret) = &self.caret {
-            if (blink.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
-                for &index in caret {
-                    blend_text_pixel(buf, index, color, 1.0);
-                }
-            }
-        }
+        worker
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready = layer;
     }
 }
 
-fn overlay_text_color(argb: i32) -> [u8; 4] {
-    let bytes = (argb as u32).to_be_bytes();
-    [bytes[1], bytes[2], bytes[3], bytes[0]]
-}
-
-#[derive(Default)]
-struct TextLayerCache {
-    font: Option<(u32, ScaledFont)>,
-    layer: Option<TextLayer>,
-}
-
-impl TextLayerCache {
-    fn layer(
-        &mut self,
-        overlay: &crate::framework::ActiveTextOverlay,
-        width: u32,
-        height: u32,
-    ) -> Option<&TextLayer> {
-        let layout = TextLayout::of(overlay, width, height);
-        let cached = self
-            .layer
-            .as_ref()
-            .is_some_and(|layer| layer.layout == layout && layer.text.shows(overlay));
-        if !cached {
-            let font = overlay_font()?;
-            let size_key = layout.scale.to_bits();
-            if self.font.as_ref().is_none_or(|(key, _)| *key != size_key) {
-                self.font = Some((size_key, font.scaled(layout.scale)?));
-            }
-            let (_, scaled) = self.font.as_mut()?;
-            self.layer = Some(TextLayer::build(scaled, OverlayText::of(overlay), layout));
-        }
-        self.layer.as_ref()
+fn current_text_layer(request: &TextRequest, now: Instant) -> Option<(Arc<TextLayer>, bool)> {
+    let worker = text_worker()?;
+    let mut state = worker
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.wanted.as_ref() != Some(request) {
+        state.wanted = Some(request.clone());
+        state.generation += 1;
+        state.changed_at = now;
+        worker.wake.notify_one();
     }
+    let layer = state.ready.clone().filter(|layer| {
+        layer.request.widget == request.widget
+            && layer.request.viewport == request.viewport
+            && layer.request.order == request.order
+    })?;
+    Some((
+        layer,
+        caret_visible(now.saturating_duration_since(state.changed_at)),
+    ))
 }
-
-thread_local! {
-    static TEXT_LAYERS: RefCell<TextLayerCache> = RefCell::new(TextLayerCache::default());
-}
-
-static CARET_BLINK: AtomicU64 = AtomicU64::new(0);
 
 fn overlay_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
@@ -829,22 +716,16 @@ fn resolve_field_rect(
     extent: vk::Extent2D,
 ) -> Option<vk::Rect2D> {
     let (gx, gy, gw, gh) = geom?;
-    if gw == 0 || gh == 0 {
-        return None;
-    }
-    let x = (gx.max(0) as u32).min(extent.width.saturating_sub(1));
-    let y = (gy.max(0) as u32).min(extent.height.saturating_sub(1));
-    let w = gw.min(extent.width - x).max(1);
-    let h = gh.min(extent.height - y).max(1);
+    let span = |origin: i32, length: u32, limit: u32| {
+        let start = i64::from(origin).max(0);
+        let end = (i64::from(origin) + i64::from(length)).min(i64::from(limit));
+        (start < end).then(|| (start as i32, (end - start) as u32))
+    };
+    let (x, width) = span(gx, gw, extent.width)?;
+    let (y, height) = span(gy, gh, extent.height)?;
     Some(vk::Rect2D {
-        offset: vk::Offset2D {
-            x: x as i32,
-            y: y as i32,
-        },
-        extent: vk::Extent2D {
-            width: w,
-            height: h,
-        },
+        offset: vk::Offset2D { x, y },
+        extent: vk::Extent2D { width, height },
     })
 }
 
@@ -914,15 +795,30 @@ fn fps_probe_enabled() -> bool {
     *EN.get_or_init(|| std::env::var_os("ECLIPSE_VK_FPS").is_some())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostAccess {
+    Write,
+    ReadWrite,
+}
+
 fn find_host_visible_mem_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
+    access: HostAccess,
 ) -> Option<u32> {
-    let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    (0..props.memory_type_count).find(|&i| {
-        (type_bits & (1u32 << i)) != 0
-            && props.memory_types[i as usize].property_flags.contains(want)
-    })
+    let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let find = |want: vk::MemoryPropertyFlags| {
+        (0..props.memory_type_count).find(|&i| {
+            (type_bits & (1u32 << i)) != 0
+                && props.memory_types[i as usize].property_flags.contains(want)
+        })
+    };
+    match access {
+        HostAccess::Write => find(coherent),
+        HostAccess::ReadWrite => {
+            find(coherent | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|| find(coherent))
+        }
+    }
 }
 
 static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
@@ -1032,6 +928,63 @@ struct SavedFrameTarget {
     extent: vk::Extent2D,
     ready: vk::Semaphore,
     wait_ready: bool,
+}
+
+fn rect_copy(rect: vk::Rect2D) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default()
+        .image_subresource(color_layers())
+        .image_offset(vk::Offset3D {
+            x: rect.offset.x,
+            y: rect.offset.y,
+            z: 0,
+        })
+        .image_extent(vk::Extent3D {
+            width: rect.extent.width,
+            height: rect.extent.height,
+            depth: 1,
+        })
+}
+
+fn write_field_probe(data: &[u8], w: usize, h: usize, order: ByteOrder) {
+    let png_rgba: Vec<u8> = data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&pixel| {
+            let [r, g, b, _] = order.arrange(pixel);
+            [r, g, b, 255]
+        })
+        .collect();
+    let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
+    if let Err(error) = std::fs::write("/tmp/eclipse_field_probe.png", png) {
+        tracing::warn!(%error, "vk-overlay: could not write the field probe image");
+    }
+
+    static LOG_TICK: AtomicU64 = AtomicU64::new(0);
+    if !LOG_TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
+        return;
+    }
+    const BUCKETS: usize = 64;
+    let mut col_ink = [0u32; BUCKETS];
+    let mut total_ink = 0u32;
+    let (y0, y1) = (h * 3 / 10, h * 7 / 10);
+    for y in y0..y1 {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let lum = (u32::from(data[i]) + u32::from(data[i + 1]) + u32::from(data[i + 2])) / 3;
+            if lum > 90 {
+                total_ink += 1;
+                col_ink[x * BUCKETS / w] += 1;
+            }
+        }
+    }
+    let max = col_ink.iter().copied().max().unwrap_or(1).max(1);
+    let levels = [' ', '.', ':', '-', '=', '+', '*', '#', '@'];
+    let spark: String = col_ink
+        .iter()
+        .map(|&c| levels[(c as usize * (levels.len() - 1) / max as usize).min(levels.len() - 1)])
+        .collect();
+    tracing::info!(total_ink, "vk-overlay field-probe ink |{spark}|");
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
@@ -1323,7 +1276,8 @@ impl WebPresenter {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         presenter.frame = unsafe { device.create_buffer(&buffer_info, None) }.ok()?;
         let buffer_req = unsafe { device.get_buffer_memory_requirements(presenter.frame) };
-        let buffer_mt = find_host_visible_mem_type(&mem_props, buffer_req.memory_type_bits)?;
+        let buffer_mt =
+            find_host_visible_mem_type(&mem_props, buffer_req.memory_type_bits, HostAccess::Write)?;
         presenter.frame_memory = unsafe {
             device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -1888,6 +1842,19 @@ fn release_probe_for_device(slot: &'static Mutex<Option<Probe>>, device: vk::Dev
 fn release_overlay_device_resources(device: vk::Device) {
     release_probe_for_device(&PROBE, device);
     release_probe_for_device(&WEB_COMPOSITE, device);
+    {
+        let mut compositor = TEXT_COMPOSITOR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owned = match &*compositor {
+            TextCompositorSlot::Built(built) => built.device.handle() == device,
+            TextCompositorSlot::Unavailable(built_for, _) => *built_for == device.as_raw(),
+            TextCompositorSlot::Empty => false,
+        };
+        if owned {
+            *compositor = TextCompositorSlot::Empty;
+        }
+    }
     if let Ok(mut slot) = WEB_PRESENTER.lock() {
         if slot
             .as_ref()
@@ -2105,7 +2072,12 @@ struct Probe {
 unsafe impl Send for Probe {}
 
 impl Probe {
-    fn build(entry: &ash::Entry, engine: EngineHandles, rect: vk::Rect2D) -> Option<Probe> {
+    fn build(
+        entry: &ash::Entry,
+        engine: EngineHandles,
+        rect: vk::Rect2D,
+        access: HostAccess,
+    ) -> Option<Probe> {
         if !engine.complete() || rect.extent.width == 0 || rect.extent.height == 0 {
             return None;
         }
@@ -2175,7 +2147,7 @@ impl Probe {
             }
             cleanup_pool(device);
         };
-        let Some(mt) = find_host_visible_mem_type(&mem_props, req.memory_type_bits) else {
+        let Some(mt) = find_host_visible_mem_type(&mem_props, req.memory_type_bits, access) else {
             cleanup_buf(&device);
             return None;
         };
@@ -2229,19 +2201,15 @@ impl Probe {
             .resize(self.waits.len(), vk::PipelineStageFlags::TRANSFER);
     }
 
-    unsafe fn capture(
+    unsafe fn snapshot(
         &mut self,
         queue: vk::Queue,
         image_raw: u64,
         engine_waits: &[vk::Semaphore],
-        text: Option<(&TextLayer, [u8; 4], &AtomicU64)>,
-        write_probe: bool,
+        order: ByteOrder,
     ) -> OverlayBatch {
         let image = vk::Image::from_raw(image_raw);
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
+        let range = color_range();
 
         unsafe {
             if self.fence.retire(&self.device).is_err()
@@ -2275,29 +2243,20 @@ impl Probe {
                 &[],
                 &[to_src],
             );
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D {
-                    x: self.rect.offset.x,
-                    y: self.rect.offset.y,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: self.rect.extent.width,
-                    height: self.rect.extent.height,
-                    depth: 1,
-                });
             self.device.cmd_copy_image_to_buffer(
                 self.cmd,
                 image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 self.buffer,
-                &[region],
+                &[rect_copy(self.rect)],
             );
+            let readable = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.buffer)
+                .size(vk::WHOLE_SIZE);
             let to_present = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
@@ -2310,10 +2269,10 @@ impl Probe {
             self.device.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[],
-                &[],
+                &[readable],
                 &[to_present],
             );
             if self.device.end_command_buffer(self.cmd).is_err() {
@@ -2331,122 +2290,11 @@ impl Probe {
             if self.fence.retire(&self.device).is_err() {
                 return OverlayBatch::Queued;
             }
-
-            let mut batch = OverlayBatch::Completed;
-            if let Some((layer, color, blink)) = text {
-                {
-                    let size =
-                        (self.rect.extent.width as usize) * (self.rect.extent.height as usize) * 4;
-                    let buf = std::slice::from_raw_parts_mut(self.mapped, size);
-                    layer.apply(buf, color, blink);
-                }
-                let recorded = self
-                    .device
-                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                    .is_ok()
-                    && self.device.begin_command_buffer(self.cmd, &begin).is_ok();
-                if recorded {
-                    let to_dst = vk::ImageMemoryBarrier::default()
-                        .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .src_access_mask(vk::AccessFlags::MEMORY_READ)
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(image)
-                        .subresource_range(range);
-                    self.device.cmd_pipeline_barrier(
-                        self.cmd,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[to_dst],
-                    );
-
-                    self.device.cmd_copy_buffer_to_image(
-                        self.cmd,
-                        self.buffer,
-                        image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &[region],
-                    );
-                    let back = vk::ImageMemoryBarrier::default()
-                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                        .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(image)
-                        .subresource_range(range);
-                    self.device.cmd_pipeline_barrier(
-                        self.cmd,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[back],
-                    );
-                    if self.device.end_command_buffer(self.cmd).is_ok() {
-                        let cmds2 = [self.cmd];
-                        let submit2 = vk::SubmitInfo::default().command_buffers(&cmds2);
-                        if self.fence.submit(&self.device, queue, &[submit2]).is_ok() {
-                            batch = OverlayBatch::Queued;
-                        }
-                    }
-                }
-            }
-            if write_probe {
-                let w = self.rect.extent.width as usize;
-                let h = self.rect.extent.height as usize;
-                let size = w * h * 4;
-
-                {
-                    let data = std::slice::from_raw_parts(self.mapped, size);
-                    let mut png_rgba = data.to_vec();
-                    for px in png_rgba.as_chunks_mut::<4>().0 {
-                        px[3] = 255;
-                    }
-                    let png = encode_png_rgba(&png_rgba, w as u32, h as u32);
-                    let _ = std::fs::write("/tmp/eclipse_field_probe.png", png);
-                }
-
-                static LOG_TICK: AtomicU64 = AtomicU64::new(0);
-                if LOG_TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
-                    let data = std::slice::from_raw_parts(self.mapped, size);
-                    const BUCKETS: usize = 64;
-                    let mut col_ink = [0u32; BUCKETS];
-                    let mut total_ink = 0u32;
-                    let (y0, y1) = (h * 3 / 10, h * 7 / 10);
-                    for y in y0..y1 {
-                        for x in 0..w {
-                            let i = (y * w + x) * 4;
-                            let lum = (u32::from(data[i])
-                                + u32::from(data[i + 1])
-                                + u32::from(data[i + 2]))
-                                / 3;
-                            if lum > 90 {
-                                total_ink += 1;
-                                col_ink[x * BUCKETS / w] += 1;
-                            }
-                        }
-                    }
-                    let max = col_ink.iter().copied().max().unwrap_or(1).max(1);
-                    let levels = [' ', '.', ':', '-', '=', '+', '*', '#', '@'];
-                    let spark: String = col_ink
-                        .iter()
-                        .map(|&c| {
-                            levels[(c as usize * (levels.len() - 1) / max as usize)
-                                .min(levels.len() - 1)]
-                        })
-                        .collect();
-                    tracing::info!(total_ink, "vk-overlay field-probe ink |{spark}|");
-                }
-            }
-            batch
+            let w = self.rect.extent.width as usize;
+            let h = self.rect.extent.height as usize;
+            let data = std::slice::from_raw_parts(self.mapped, w * h * 4);
+            write_field_probe(data, w, h, order);
+            OverlayBatch::Completed
         }
     }
 
@@ -2599,7 +2447,11 @@ impl Drop for Probe {
     }
 }
 
-fn ensure_probe_in(slot: &'static Mutex<Option<Probe>>, rect: vk::Rect2D) -> bool {
+fn ensure_probe_in(
+    slot: &'static Mutex<Option<Probe>>,
+    rect: vk::Rect2D,
+    access: HostAccess,
+) -> bool {
     let Ok(mut guard) = slot.lock() else {
         return false;
     };
@@ -2620,7 +2472,7 @@ fn ensure_probe_in(slot: &'static Mutex<Option<Probe>>, rect: vk::Rect2D) -> boo
     };
 
     *guard = None;
-    if let Some(p) = Probe::build(entry, EngineHandles::current(device), rect) {
+    if let Some(p) = Probe::build(entry, EngineHandles::current(device), rect, access) {
         tracing::info!(
             x = rect.offset.x,
             y = rect.offset.y,
@@ -2635,11 +2487,11 @@ fn ensure_probe_in(slot: &'static Mutex<Option<Probe>>, rect: vk::Rect2D) -> boo
 }
 
 fn ensure_probe(rect: vk::Rect2D) {
-    let _ = ensure_probe_in(&PROBE, rect);
+    let _ = ensure_probe_in(&PROBE, rect, HostAccess::ReadWrite);
 }
 
 fn ensure_web_composite(rect: vk::Rect2D) -> bool {
-    let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect);
+    let rebuilt = ensure_probe_in(&WEB_COMPOSITE, rect, HostAccess::Write);
     if rebuilt {
         WEB_GPU_HELD.store(true, Ordering::Release);
     }
@@ -2832,14 +2684,597 @@ fn composite_webview_frame(
     batch
 }
 
-fn text_test_overlay(extent: vk::Extent2D) -> Option<crate::framework::ActiveTextOverlay> {
+const TEXT_BLEND_SPV: &[u8] = include_bytes!("../../shaders/text_blend.comp.spv");
+const TEXT_SLOTS: usize = 3;
+const TEXT_BLEND_GROUP_SIZE: u32 = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BlendConstants {
+    width: u32,
+    height: u32,
+    caret_color: u32,
+    caret_on: u32,
+    caret_rect: [u32; 4],
+}
+
+impl BlendConstants {
+    fn bytes(&self) -> [u8; 32] {
+        let words = [
+            self.width,
+            self.height,
+            self.caret_color,
+            self.caret_on,
+            self.caret_rect[0],
+            self.caret_rect[1],
+            self.caret_rect[2],
+            self.caret_rect[3],
+        ];
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+            *chunk = word.to_ne_bytes();
+        }
+        bytes
+    }
+}
+
+struct TextSlot {
+    cmd: vk::CommandBuffer,
+    fence: FrameFence,
+    layer: vk::Buffer,
+    layer_memory: vk::DeviceMemory,
+    layer_mapped: *mut u8,
+    descriptor_set: vk::DescriptorSet,
+    generation: Option<u64>,
+}
+
+struct TextCompositor {
+    device: ash::Device,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    rect: vk::Rect2D,
+    capacity: u64,
+    command_pool: vk::CommandPool,
+    set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pixels: vk::Buffer,
+    pixels_memory: vk::DeviceMemory,
+    slots: Vec<TextSlot>,
+    next_slot: usize,
+    waits: Vec<vk::Semaphore>,
+    wait_stages: Vec<vk::PipelineStageFlags>,
+}
+
+unsafe impl Send for TextCompositor {}
+
+enum TextCompositorSlot {
+    Empty,
+    Built(Box<TextCompositor>),
+    Unavailable(u64, vk::Rect2D),
+}
+
+static TEXT_COMPOSITOR: Mutex<TextCompositorSlot> = Mutex::new(TextCompositorSlot::Empty);
+
+fn allocate_buffer(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    memory: impl Fn(&vk::PhysicalDeviceMemoryProperties, u32) -> Option<u32>,
+) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+    let info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let allocated = memory(memory_properties, requirements.memory_type_bits).and_then(|index| {
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(index);
+        let memory = unsafe { device.allocate_memory(&alloc, None) }.ok()?;
+        if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+            unsafe { device.free_memory(memory, None) };
+            return None;
+        }
+        Some(memory)
+    });
+    match allocated {
+        Some(memory) => Some((buffer, memory)),
+        None => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            None
+        }
+    }
+}
+
+impl TextCompositor {
+    fn build(entry: &ash::Entry, engine: EngineHandles, rect: vk::Rect2D) -> Option<Self> {
+        if !engine.complete() || rect.extent.width == 0 || rect.extent.height == 0 {
+            return None;
+        }
+        let instance = unsafe {
+            ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(engine.instance))
+        };
+        let physical_device = vk::PhysicalDevice::from_raw(engine.physical_device);
+        let families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        if !families
+            .get(engine.queue_family as usize)
+            .is_some_and(|family| family.queue_flags.contains(vk::QueueFlags::COMPUTE))
+        {
+            tracing::warn!(
+                queue_family = engine.queue_family,
+                "vk-overlay: the engine's queue family has no compute support; focused text \
+                 is not drawn"
+            );
+            return None;
+        }
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let device =
+            unsafe { ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(engine.device)) };
+        let mut compositor = TextCompositor {
+            device,
+            memory_properties,
+            rect,
+            capacity: 0,
+            command_pool: vk::CommandPool::null(),
+            set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            pixels: vk::Buffer::null(),
+            pixels_memory: vk::DeviceMemory::null(),
+            slots: Vec::with_capacity(TEXT_SLOTS),
+            next_slot: 0,
+            waits: Vec::new(),
+            wait_stages: Vec::new(),
+        };
+        match unsafe { compositor.create_objects(engine.queue_family) } {
+            Ok(()) => Some(compositor),
+            Err(error) => {
+                tracing::warn!(%error, "vk-overlay: the focused-text compositor could not be built");
+                None
+            }
+        }
+    }
+
+    unsafe fn create_objects(&mut self, queue_family: u32) -> Result<(), String> {
+        let device = self.device.clone();
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(queue_family);
+        self.command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .map_err(|e| format!("vkCreateCommandPool: {e}"))?;
+        let bindings = [0, 1].map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
+        self.set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .map_err(|e| format!("vkCreateDescriptorSetLayout: {e}"))?;
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(std::mem::size_of::<BlendConstants>() as u32)];
+        let set_layouts = [self.set_layout];
+        self.pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&set_layouts)
+                    .push_constant_ranges(&push_ranges),
+                None,
+            )
+        }
+        .map_err(|e| format!("vkCreatePipelineLayout: {e}"))?;
+        let code = ash::util::read_spv(&mut std::io::Cursor::new(TEXT_BLEND_SPV))
+            .map_err(|e| format!("text blend SPIR-V: {e}"))?;
+        let module = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+        }
+        .map_err(|e| format!("vkCreateShaderModule: {e}"))?;
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(c"main");
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(self.pipeline_layout);
+        let pipelines = unsafe {
+            device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        unsafe { device.destroy_shader_module(module, None) };
+        self.pipeline = pipelines
+            .map_err(|(_, e)| format!("vkCreateComputePipelines: {e}"))?
+            .into_iter()
+            .next()
+            .ok_or("vkCreateComputePipelines returned no pipeline")?;
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(2 * TEXT_SLOTS as u32)];
+        self.descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(TEXT_SLOTS as u32)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }
+        .map_err(|e| format!("vkCreateDescriptorPool: {e}"))?;
+        let command_buffers = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(TEXT_SLOTS as u32),
+            )
+        }
+        .map_err(|e| format!("vkAllocateCommandBuffers: {e}"))?;
+        let layouts = [self.set_layout; TEXT_SLOTS];
+        let sets = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(|e| format!("vkAllocateDescriptorSets: {e}"))?;
+        for (cmd, descriptor_set) in command_buffers.into_iter().zip(sets) {
+            let fence = FrameFence::new(&device).map_err(|e| format!("vkCreateFence: {e}"))?;
+            self.slots.push(TextSlot {
+                cmd,
+                fence,
+                layer: vk::Buffer::null(),
+                layer_memory: vk::DeviceMemory::null(),
+                layer_mapped: std::ptr::null_mut(),
+                descriptor_set,
+                generation: None,
+            });
+        }
+        unsafe { self.allocate_field(self.layer_bytes() as u64) }
+    }
+
+    unsafe fn fit(&mut self, rect: vk::Rect2D) -> Result<(), String> {
+        let needed = field_bytes(rect);
+        if needed > self.capacity {
+            let grown = needed.max(self.capacity.saturating_mul(2));
+            for slot in &mut self.slots {
+                slot.fence
+                    .retire(&self.device)
+                    .map_err(|e| format!("vkWaitForFences: {e}"))?;
+            }
+            unsafe {
+                self.release_field();
+                self.allocate_field(grown)?;
+            }
+        }
+        self.rect = rect;
+        Ok(())
+    }
+
+    unsafe fn allocate_field(&mut self, capacity: u64) -> Result<(), String> {
+        let device = self.device.clone();
+        (self.pixels, self.pixels_memory) = allocate_buffer(
+            &device,
+            &self.memory_properties,
+            capacity,
+            vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::STORAGE_BUFFER,
+            find_device_local_mem_type,
+        )
+        .ok_or("no memory for the field pixel buffer")?;
+        for slot in &mut self.slots {
+            (slot.layer, slot.layer_memory) = allocate_buffer(
+                &device,
+                &self.memory_properties,
+                capacity,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                |properties, bits| find_host_visible_mem_type(properties, bits, HostAccess::Write),
+            )
+            .ok_or("no host-visible memory for the text layer")?;
+            slot.layer_mapped = unsafe {
+                device.map_memory(slot.layer_memory, 0, capacity, vk::MemoryMapFlags::empty())
+            }
+            .map_err(|e| format!("vkMapMemory: {e}"))?
+            .cast::<u8>();
+            slot.generation = None;
+            let pixels_info = [vk::DescriptorBufferInfo::default()
+                .buffer(self.pixels)
+                .range(vk::WHOLE_SIZE)];
+            let layer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(slot.layer)
+                .range(vk::WHOLE_SIZE)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(slot.descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&pixels_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(slot.descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&layer_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+        self.capacity = capacity;
+        Ok(())
+    }
+
+    unsafe fn release_field(&mut self) {
+        self.capacity = 0;
+        unsafe {
+            for slot in &mut self.slots {
+                self.device.destroy_buffer(slot.layer, None);
+                self.device.free_memory(slot.layer_memory, None);
+                slot.layer = vk::Buffer::null();
+                slot.layer_memory = vk::DeviceMemory::null();
+                slot.layer_mapped = std::ptr::null_mut();
+            }
+            self.device.destroy_buffer(self.pixels, None);
+            self.device.free_memory(self.pixels_memory, None);
+        }
+        self.pixels = vk::Buffer::null();
+        self.pixels_memory = vk::DeviceMemory::null();
+    }
+
+    fn layer_bytes(&self) -> usize {
+        field_bytes(self.rect) as usize
+    }
+
+    unsafe fn draw(
+        &mut self,
+        queue: vk::Queue,
+        image_raw: u64,
+        engine_waits: &[vk::Semaphore],
+        layer: &TextLayer,
+        caret_on: bool,
+    ) -> OverlayBatch {
+        let bytes = self.layer_bytes();
+        if layer.pixels.len() * 4 != bytes || self.slots.is_empty() {
+            return OverlayBatch::NotSubmitted;
+        }
+        let index = self.next_slot;
+        self.next_slot = (index + 1) % self.slots.len();
+        let slot = &mut self.slots[index];
+        if slot.fence.retire(&self.device).is_err() {
+            return OverlayBatch::NotSubmitted;
+        }
+        if slot.generation != Some(layer.generation) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    layer.pixels.as_ptr().cast::<u8>(),
+                    slot.layer_mapped,
+                    bytes,
+                )
+            };
+            slot.generation = Some(layer.generation);
+        }
+        let caret = layer.caret.filter(|_| caret_on);
+        let constants = BlendConstants {
+            width: self.rect.extent.width,
+            height: self.rect.extent.height,
+            caret_color: u32::from_ne_bytes(layer.caret_color),
+            caret_on: u32::from(caret.is_some()),
+            caret_rect: caret.map_or([0; 4], |rect| [rect.x0, rect.y0, rect.x1, rect.y1]),
+        };
+        let (cmd, descriptor_set) = (slot.cmd, slot.descriptor_set);
+        if unsafe {
+            self.record(
+                cmd,
+                descriptor_set,
+                vk::Image::from_raw(image_raw),
+                &constants,
+            )
+        }
+        .is_err()
+        {
+            return OverlayBatch::NotSubmitted;
+        }
+        self.waits.clear();
+        self.waits.extend_from_slice(engine_waits);
+        self.wait_stages.clear();
+        self.wait_stages
+            .resize(self.waits.len(), vk::PipelineStageFlags::TRANSFER);
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&self.waits)
+            .wait_dst_stage_mask(&self.wait_stages)
+            .command_buffers(&cmds);
+        match self.slots[index]
+            .fence
+            .submit(&self.device, queue, &[submit])
+        {
+            Ok(()) => OverlayBatch::Queued,
+            Err(_) => OverlayBatch::NotSubmitted,
+        }
+    }
+
+    unsafe fn record(
+        &self,
+        cmd: vk::CommandBuffer,
+        descriptor_set: vk::DescriptorSet,
+        image: vk::Image,
+        constants: &BlendConstants,
+    ) -> ash::prelude::VkResult<()> {
+        let device = &self.device;
+        let image_barrier = |from, to, src_access, dst_access| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(from)
+                .new_layout(to)
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_range())
+        };
+        let pixels_barrier = |src_access, dst_access| {
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.pixels)
+                .size(vk::WHOLE_SIZE)
+        };
+        let region = rect_copy(self.rect);
+        unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[pixels_barrier(
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                )],
+                &[image_barrier(
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::MEMORY_READ,
+                    vk::AccessFlags::TRANSFER_READ,
+                )],
+            );
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.pixels,
+                &[region],
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[pixels_barrier(
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                )],
+                &[],
+            );
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                &constants.bytes(),
+            );
+            device.cmd_dispatch(
+                cmd,
+                constants.width.div_ceil(TEXT_BLEND_GROUP_SIZE),
+                constants.height.div_ceil(TEXT_BLEND_GROUP_SIZE),
+                1,
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[pixels_barrier(
+                    vk::AccessFlags::SHADER_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                )],
+                &[image_barrier(
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                )],
+            );
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                self.pixels,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[image_barrier(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::MEMORY_READ,
+                )],
+            );
+            device.end_command_buffer(cmd)
+        }
+    }
+}
+
+impl Drop for TextCompositor {
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            if let Err(e) = slot.fence.retire(&self.device) {
+                tracing::warn!(error = %e, "vk-overlay: focused-text work did not finish before teardown");
+            }
+        }
+        unsafe {
+            self.release_field();
+            for slot in self.slots.drain(..) {
+                slot.fence.destroy(&self.device);
+            }
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.set_layout, None);
+            self.device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+fn field_bytes(rect: vk::Rect2D) -> u64 {
+    u64::from(rect.extent.width) * u64::from(rect.extent.height) * 4
+}
+
+fn text_test_overlay(extent: vk::Extent2D) -> Option<ActiveTextOverlay> {
     static TEXT: OnceLock<Option<String>> = OnceLock::new();
     let text = TEXT
         .get_or_init(|| std::env::var("ECLIPSE_VK_TEXT_TEST").ok())
         .as_ref()?;
     let rect = login_field_rect(extent);
-    Some(crate::framework::ActiveTextOverlay {
+    Some(ActiveTextOverlay {
+        widget: 0,
         text: text.clone(),
+        selection: TextSelection::Cursor(text.encode_utf16().count()),
         geometry: (
             rect.offset.x,
             rect.offset.y,
@@ -2847,6 +3282,7 @@ fn text_test_overlay(extent: vk::Extent2D) -> Option<crate::framework::ActiveTex
             rect.extent.height,
         ),
         input_type: 0,
+        font: TEXT_TEST_FONT,
         font_size: 25.0,
         multiline: false,
         text_wrapped: false,
@@ -2857,16 +3293,28 @@ fn text_test_overlay(extent: vk::Extent2D) -> Option<crate::framework::ActiveTex
 }
 
 struct TextPlan {
-    overlay: Option<crate::framework::ActiveTextOverlay>,
+    overlay: Option<ActiveTextOverlay>,
     rect: vk::Rect2D,
+    order: ByteOrder,
 }
 
-fn text_plan(extent: vk::Extent2D, image_raw: u64) -> Option<TextPlan> {
+fn text_plan(extent: vk::Extent2D, image_raw: u64, format_raw: i32) -> Option<TextPlan> {
     if image_raw == 0 || !(probe_enabled() || overlay_enabled()) {
         return None;
     }
+    let Some(order) = ByteOrder::of_swapchain(format_raw) else {
+        static FORMAT_WARNED: AtomicBool = AtomicBool::new(false);
+        if !FORMAT_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                format = format_raw,
+                "vk-overlay: focused text is not drawn on this swapchain format \
+                 (expected B8G8R8A8/R8G8B8A8 UNORM/SRGB)"
+            );
+        }
+        return None;
+    };
     let live = if overlay_enabled() {
-        crate::framework::active_text_overlay().filter(|overlay| !overlay.text.is_empty())
+        crate::framework::active_text_overlay()
     } else {
         None
     };
@@ -2885,30 +3333,87 @@ fn text_plan(extent: vk::Extent2D, image_raw: u64) -> Option<TextPlan> {
         probe_enabled(),
         screenshot_enabled(),
     )?;
-    Some(TextPlan { overlay, rect })
+    Some(TextPlan {
+        overlay,
+        rect,
+        order,
+    })
 }
 
-fn capture_text_field(
+fn draw_text_field(
     queue: vk::Queue,
     image_raw: u64,
     engine_waits: &[vk::Semaphore],
-    overlay: Option<&crate::framework::ActiveTextOverlay>,
+    plan: &TextPlan,
+    overlay: &ActiveTextOverlay,
 ) -> OverlayBatch {
+    let request = TextRequest::of(overlay, plan.rect, plan.order);
+    let Some((layer, caret_on)) = current_text_layer(&request, Instant::now()) else {
+        return OverlayBatch::NotSubmitted;
+    };
+    let mut slot = TEXT_COMPOSITOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let device = STATE.lock().map(|state| state.device).unwrap_or(0);
+    let Some(compositor) = fitted_compositor(&mut slot, device, plan.rect, || {
+        super::vulkan_wsi::host_entry().and_then(|entry| {
+            TextCompositor::build(entry, EngineHandles::current(device), plan.rect)
+        })
+    }) else {
+        return OverlayBatch::NotSubmitted;
+    };
+    unsafe { compositor.draw(queue, image_raw, engine_waits, &layer, caret_on) }
+}
+
+fn fitted_compositor(
+    slot: &mut TextCompositorSlot,
+    device: u64,
+    rect: vk::Rect2D,
+    build: impl FnOnce() -> Option<TextCompositor>,
+) -> Option<&mut TextCompositor> {
+    let current = match &*slot {
+        TextCompositorSlot::Built(compositor) => compositor.device.handle().as_raw() == device,
+        TextCompositorSlot::Unavailable(built_for, failed_rect) => {
+            *built_for == device && *failed_rect == rect
+        }
+        TextCompositorSlot::Empty => false,
+    };
+    if !current {
+        *slot = TextCompositorSlot::Empty;
+        *slot = match build() {
+            Some(compositor) => TextCompositorSlot::Built(Box::new(compositor)),
+            None => TextCompositorSlot::Unavailable(device, rect),
+        };
+    }
+    let fitted = match slot {
+        TextCompositorSlot::Built(compositor) => unsafe { compositor.fit(rect) },
+        TextCompositorSlot::Unavailable(..) | TextCompositorSlot::Empty => return None,
+    };
+    if let Err(error) = fitted {
+        tracing::warn!(%error, "vk-overlay: the focused-text buffers could not grow");
+        *slot = TextCompositorSlot::Unavailable(device, rect);
+        return None;
+    }
+    match slot {
+        TextCompositorSlot::Built(compositor) => Some(compositor),
+        TextCompositorSlot::Unavailable(..) | TextCompositorSlot::Empty => None,
+    }
+}
+
+fn snapshot_field(
+    queue: vk::Queue,
+    image_raw: u64,
+    engine_waits: &[vk::Semaphore],
+    plan: &TextPlan,
+) -> OverlayBatch {
+    ensure_probe(plan.rect);
     let Ok(mut guard) = PROBE.lock() else {
         return OverlayBatch::NotSubmitted;
     };
-    let Some(probe) = guard.as_mut() else {
-        return OverlayBatch::NotSubmitted;
-    };
-    let (width, height) = (probe.rect.extent.width, probe.rect.extent.height);
-    TEXT_LAYERS.with_borrow_mut(|layers| {
-        let text = overlay.and_then(|overlay| {
-            layers
-                .layer(overlay, width, height)
-                .map(|layer| (layer, overlay_text_color(overlay.text_color), &CARET_BLINK))
-        });
-        unsafe { probe.capture(queue, image_raw, engine_waits, text, probe_enabled()) }
-    })
+    match guard.as_mut() {
+        Some(probe) => unsafe { probe.snapshot(queue, image_raw, engine_waits, plan.order) },
+        None => OverlayBatch::NotSubmitted,
+    }
 }
 
 unsafe fn present_with_overlay(
@@ -2979,14 +3484,24 @@ unsafe fn present_with_overlay(
         }
     }
 
-    if let Some(plan) = text_plan(extent, image_raw) {
-        ensure_probe(plan.rect);
-        gate = gate.after(capture_text_field(
-            queue,
-            image_raw,
-            gate.waits(engine_waits),
-            plan.overlay.as_ref(),
-        ));
+    if let Some(plan) = text_plan(extent, image_raw, format_raw) {
+        if let Some(overlay) = &plan.overlay {
+            gate = gate.after(draw_text_field(
+                queue,
+                image_raw,
+                gate.waits(engine_waits),
+                &plan,
+                overlay,
+            ));
+        }
+        if probe_enabled() {
+            gate = gate.after(snapshot_field(
+                queue,
+                image_raw,
+                gate.waits(engine_waits),
+                &plan,
+            ));
+        }
     }
 
     let target = PresentTarget {
@@ -3237,7 +3752,11 @@ mod tests {
 
         assert_eq!(
             as_tuple(resolve_field_rect(Some((-5, -7, 300, 40)), extent)),
-            Some((0, 0, 300, 40))
+            Some((0, 0, 295, 33))
+        );
+        assert_eq!(
+            as_tuple(resolve_field_rect(Some((900, 0, 10, 10)), extent)),
+            None
         );
     }
 
@@ -3268,11 +3787,14 @@ mod tests {
         );
     }
 
-    fn text_overlay(text: &str, input_type: i32) -> crate::framework::ActiveTextOverlay {
-        crate::framework::ActiveTextOverlay {
+    fn text_overlay(text: &str, input_type: i32) -> ActiveTextOverlay {
+        ActiveTextOverlay {
+            widget: 7,
             text: text.to_string(),
+            selection: TextSelection::Cursor(text.encode_utf16().count()),
             geometry: (0, 0, 240, 46),
             input_type,
+            font: TEXT_TEST_FONT,
             font_size: 25.0,
             multiline: false,
             text_wrapped: false,
@@ -3282,349 +3804,463 @@ mod tests {
         }
     }
 
-    fn masked(text: &str, input_type: i32) -> String {
-        OverlayText::of(&text_overlay(text, input_type))
-            .rendered()
-            .into_owned()
-    }
-
-    #[test]
-    fn overlay_text_masks_secure_and_unknown_input_types() {
-        for plain in [0, 1, 2, 3, 4, 7, 8] {
-            assert_eq!(masked("Ab1!", plain), "Ab1!");
+    fn host_font_available() -> bool {
+        let available = crate::host_fonts::system_font().is_some();
+        if !available {
+            eprintln!("SKIP: no host font for the text overlay");
         }
-        for secure in [5, 6, 9, 10] {
-            assert_eq!(masked("Ab1!", secure), "••••");
-            assert_eq!(
-                OverlayText::of(&text_overlay("Ab1!", secure)),
-                OverlayText::Masked { chars: 4 },
-                "a secure field's cached layout keeps only its length"
-            );
-        }
-        assert_eq!(masked("Ab1!", 11), "••••");
-        assert_eq!(masked("Ab1!", i32::MIN), "••••");
-        assert_eq!(masked("", i32::MIN), "");
+        available
     }
 
-    fn system_font() -> Option<&'static RasterFont> {
-        let font = overlay_font();
-        if font.is_none() {
-            eprintln!("SKIP: no system font discovered for the text overlay");
-        }
-        font
+    fn field_rect(overlay: &ActiveTextOverlay, extent: vk::Extent2D) -> vk::Rect2D {
+        resolve_field_rect(Some(overlay.geometry), extent).expect("field on screen")
     }
 
-    fn text_cases() -> Vec<crate::framework::ActiveTextOverlay> {
-        let mut multiline = text_overlay(
-            "The quick brown fox jumps over the lazy dog and keeps running",
-            0,
-        );
-        multiline.multiline = true;
-        multiline.text_wrapped = true;
-        let mut right = text_overlay("right 7", 0);
-        right.x_alignment = 1;
-        right.y_alignment = 2;
-        let mut centered = text_overlay("centered and far too long to fit on one line", 0);
-        centered.x_alignment = 2;
-        centered.y_alignment = 0;
-        let mut lines = text_overlay("first\nsecond\n", 0);
-        lines.multiline = true;
-        let mut tinted = text_overlay("Tinted 42", 1);
-        tinted.text_color = 0x80FF_4020u32 as i32;
-        tinted.font_size = 18.5;
-        vec![
-            text_overlay("Hello, Eclipse 42", 0),
-            text_overlay("hunter2", 6),
-            multiline,
-            right,
-            centered,
-            lines,
-            tinted,
-        ]
+    fn text_layer(overlay: &ActiveTextOverlay, rect: vk::Rect2D, order: ByteOrder) -> TextLayer {
+        let request = TextRequest::of(overlay, rect, order);
+        build_text_layer(&request, 1, Scroll::default())
+            .expect("text layer")
+            .0
     }
 
-    fn patterned(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i * 37 % 251) as u8).collect()
-    }
-
-    #[test]
-    fn cached_text_layers_replay_the_direct_blend_bit_for_bit() {
-        let Some(font) = system_font() else {
-            return;
-        };
-        let (width, height) = (220u32, 96u32);
-        let mut layers = TextLayerCache::default();
-        for overlay in text_cases() {
-            let color = overlay_text_color(overlay.text_color);
-            let layout = TextLayout::of(&overlay, width, height);
-            let reference_blink = AtomicU64::new(0);
-            let cached_blink = AtomicU64::new(0);
-            for frame in 0..40 {
-                let background = patterned(layout.buffer_len());
-
-                let mut expected = background.clone();
-                let mut fresh = font.scaled(layout.scale).expect("scaled font");
-                let caret = lay_out_text(
-                    &mut fresh,
-                    &OverlayText::of(&overlay).rendered(),
-                    &layout,
-                    |index, coverage| blend_text_pixel(&mut expected, index, color, coverage),
-                );
-                if let Some(position) = caret {
-                    if (reference_blink.fetch_add(1, Ordering::Relaxed) / 30).is_multiple_of(2) {
-                        paint_caret(position, &layout, |index| {
-                            blend_text_pixel(&mut expected, index, color, 1.0)
-                        });
-                    }
-                }
-
-                let mut actual = background.clone();
-                layers
-                    .layer(&overlay, width, height)
-                    .expect("text layer")
-                    .apply(&mut actual, color, &cached_blink);
-
-                assert_ne!(expected, background, "{:?} draws nothing", overlay.text);
-                assert!(
-                    actual == expected,
-                    "{:?} frame {frame} differs from the direct blend",
-                    overlay.text
-                );
+    fn blend_reference(pixels: &mut [u8], layer: &TextLayer, width: u32, caret_on: bool) {
+        let caret = layer.caret.filter(|_| caret_on);
+        let caret_ink = crate::text_layout::premultiply(layer.caret_color);
+        for (index, (destination, ink)) in pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&layer.pixels)
+            .enumerate()
+        {
+            let (x, y) = (index as u32 % width, index as u32 / width);
+            let mut blended = crate::text_layout::over(*ink, *destination);
+            if caret.is_some_and(|rect| x >= rect.x0 && x < rect.x1 && y >= rect.y0 && y < rect.y1)
+            {
+                blended = crate::text_layout::over(caret_ink, blended);
             }
+            blended[3] = destination[3];
+            *destination = blended;
         }
     }
 
     #[test]
-    fn text_layer_cache_rebuilds_only_when_the_layout_or_text_changes() {
-        if system_font().is_none() {
-            return;
-        }
-        let mut layers = TextLayerCache::default();
-        let overlay = text_overlay("steady", 0);
-        let first = layers
-            .layer(&overlay, 200, 40)
-            .expect("layer")
-            .glyphs
-            .as_ptr();
-
-        let mut recoloured = text_overlay("steady", 0);
-        recoloured.text_color = 0xFF00_FF00u32 as i32;
-        let second = layers
-            .layer(&recoloured, 200, 40)
-            .expect("layer")
-            .glyphs
-            .as_ptr();
-        assert_eq!(first, second, "a colour change reuses the cached layout");
-
-        let edited = text_overlay("steady!", 0);
-        let edited_layer = layers.layer(&edited, 200, 40).expect("layer");
-        assert_eq!(edited_layer.text, OverlayText::Plain("steady!".to_string()));
-
-        let resized = layers.layer(&edited, 180, 40).expect("layer");
-        assert_eq!(resized.layout.width, 180);
-
-        let secret = layers
-            .layer(&text_overlay("abc", 6), 180, 40)
-            .expect("layer");
-        let secret_ops = secret.glyphs.clone();
-        let other_secret = layers
-            .layer(&text_overlay("xyz", 6), 180, 40)
-            .expect("layer");
+    fn readback_memory_prefers_host_cached_types() {
+        let mut props = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 5,
+            ..Default::default()
+        };
+        props.memory_types[1].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        props.memory_types[2].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        props.memory_types[3].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::HOST_CACHED;
+        props.memory_types[4].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL
+            | vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
         assert_eq!(
-            other_secret.glyphs, secret_ops,
-            "masked text of the same length renders the same bullets"
+            find_host_visible_mem_type(&props, 0b11111, HostAccess::ReadWrite),
+            Some(3)
         );
-    }
-
-    const LINE: u32 = 24;
-
-    fn aligned_glyphs(
-        text: &str,
-        x_alignment: i32,
-        y_alignment: i32,
-        width: u32,
-        height: u32,
-    ) -> Vec<(usize, f32)> {
-        let mut overlay = text_overlay(text, 0);
-        overlay.font_size = LINE as f32;
-        overlay.text_wrapped = true;
-        overlay.x_alignment = x_alignment;
-        overlay.y_alignment = y_alignment;
-        TextLayerCache::default()
-            .layer(&overlay, width, height)
-            .expect("layer")
-            .glyphs
-            .clone()
-    }
-
-    fn ink_rows(glyphs: &[(usize, f32)], width: u32) -> (usize, usize) {
-        let rows = glyphs.iter().map(|&(index, _)| index / 4 / width as usize);
-        (rows.clone().min().expect("ink"), rows.max().expect("ink"))
+        assert_eq!(
+            find_host_visible_mem_type(&props, 0b11111, HostAccess::Write),
+            Some(2)
+        );
+        assert_eq!(
+            find_host_visible_mem_type(&props, 0b10111, HostAccess::ReadWrite),
+            Some(2)
+        );
     }
 
     #[test]
-    fn vertical_alignment_puts_the_line_box_on_the_field_edge_without_clipping() {
-        if system_font().is_none() {
-            return;
-        }
-        let (width, line) = (320u32, LINE);
-        let top = aligned_glyphs("hihihi", 0, 0, width, line);
-        let unclipped = aligned_glyphs("hihihi", 0, 0, width, line * 3);
-        let (first, last) = ink_rows(&unclipped, width);
-        assert!(
-            top == unclipped,
-            "a top-aligned line in a {line}px field needs ink rows {first}..={last}"
-        );
-        let ink_centre = (first + last + 1) as f32 * 0.5;
-        assert!(
-            (ink_centre - line as f32 * 0.5).abs() <= line as f32 * 0.15,
-            "ink rows {first}..={last} sit off the centre of a {line}px field"
-        );
-        let shifted = |rows: u32| -> Vec<(usize, f32)> {
-            top.iter()
-                .map(|&(index, coverage)| (index + (rows * width * 4) as usize, coverage))
-                .collect()
-        };
-        for (y_alignment, rows) in [(1, line), (2, line * 2)] {
-            let aligned = aligned_glyphs("hihihi", 0, y_alignment, width, line * 3);
-            let (first, last) = ink_rows(&aligned, width);
-            assert!(
-                aligned == shifted(rows),
-                "y alignment {y_alignment} draws ink rows {first}..={last}, not the top line \
-                 moved down {rows} rows"
-            );
-        }
-    }
-
-    #[test]
-    fn horizontal_alignment_puts_text_on_the_field_edge() {
-        if system_font().is_none() {
-            return;
-        }
-        let (width, height) = (320u32, LINE);
-        let columns = |x_alignment: i32| -> Vec<u32> {
-            aligned_glyphs("hihihi", x_alignment, 1, width, height)
-                .iter()
-                .map(|&(index, _)| (index / 4) as u32 % width)
-                .collect()
-        };
-        let bearing = LINE as f32 * 0.2;
-        let left = *columns(0).iter().min().expect("ink");
-        assert!(
-            (left as f32) < bearing,
-            "left-aligned ink starts at column {left}"
-        );
-        let right = *columns(1).iter().max().expect("ink");
-        assert!(
-            ((width - 1 - right) as f32) < bearing,
-            "right-aligned ink ends at column {right} of {width}"
-        );
-    }
-
-    fn caret_pixels(
-        text: &str,
-        multiline: bool,
-        x_alignment: i32,
-        width: u32,
-        height: u32,
-    ) -> Option<Vec<(u32, u32)>> {
-        let mut overlay = text_overlay(text, 0);
-        overlay.font_size = LINE as f32;
-        overlay.multiline = multiline;
-        overlay.x_alignment = x_alignment;
-        overlay.y_alignment = 0;
-        TextLayerCache::default()
-            .layer(&overlay, width, height)
-            .expect("layer")
-            .caret
-            .as_ref()
-            .map(|caret| {
-                caret
-                    .iter()
-                    .map(|&index| ((index / 4) as u32 % width, (index / 4) as u32 / width))
-                    .collect()
-            })
-    }
-
-    #[test]
-    fn caret_stays_inside_the_field_on_its_right_edge() {
-        if system_font().is_none() {
-            return;
-        }
-        let width = 320u32;
-        let caret = caret_pixels("hihihi", false, 1, width, LINE * 2).expect("caret");
-        assert!(!caret.is_empty(), "the caret is clipped away");
-        for (column, _) in caret {
-            assert!(
-                column >= width - 2,
-                "caret column {column} is not on the right edge"
-            );
-        }
-    }
-
-    #[test]
-    fn caret_after_a_trailing_newline_starts_the_next_line() {
-        if system_font().is_none() {
-            return;
-        }
-        let width = 320u32;
-        for (x_alignment, edge) in [
-            (0, 1..3),
-            (1, width - 2..width),
-            (2, width / 2 + 1..width / 2 + 3),
+    fn caret_blinks_every_half_second_of_wall_time() {
+        for (millis, visible) in [
+            (0, true),
+            (208, true),
+            (499, true),
+            (500, false),
+            (999, false),
+            (1000, true),
+            (1500, false),
         ] {
-            let first_line = caret_pixels("hihihi", true, x_alignment, width, LINE * 3)
-                .expect("caret after the first line");
-            let first_line_bottom = first_line
-                .iter()
-                .map(|&(_, row)| row)
-                .max()
-                .expect("first-line caret pixels");
-            let next_line = caret_pixels("hihihi\n", true, x_alignment, width, LINE * 3)
-                .expect("caret after the trailing newline");
-            assert!(!next_line.is_empty(), "the next-line caret is clipped away");
-            for (column, row) in next_line {
-                assert!(
-                    row > first_line_bottom,
-                    "x alignment {x_alignment} caret row {row} is not below the first line"
-                );
-                assert!(
-                    edge.contains(&column),
-                    "x alignment {x_alignment} caret column {column} is not in {edge:?}"
+            assert_eq!(
+                caret_visible(Duration::from_millis(millis)),
+                visible,
+                "caret visibility {millis} ms after the last edit"
+            );
+        }
+    }
+
+    #[test]
+    fn text_colour_follows_the_swapchain_byte_order() {
+        let color = text_rgba(0x80FF_4020u32 as i32);
+        assert_eq!(color, [0xFF, 0x40, 0x20, 0x80]);
+        assert_eq!(ByteOrder::Rgba.arrange(color), [0xFF, 0x40, 0x20, 0x80]);
+        assert_eq!(ByteOrder::Bgra.arrange(color), [0x20, 0x40, 0xFF, 0x80]);
+        assert_eq!(
+            ByteOrder::of_swapchain(vk::Format::B8G8R8A8_SRGB.as_raw()),
+            Some(ByteOrder::Bgra)
+        );
+        assert_eq!(
+            ByteOrder::of_swapchain(vk::Format::R8G8B8A8_UNORM.as_raw()),
+            Some(ByteOrder::Rgba)
+        );
+        assert_eq!(
+            ByteOrder::of_swapchain(vk::Format::R16G16B16A16_SFLOAT.as_raw()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_box_partly_off_screen_is_laid_out_at_its_real_origin() {
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let mut overlay = text_overlay("hihihi", 0);
+        overlay.geometry = (-50, -10, 300, 40);
+        let rect = field_rect(&overlay, extent);
+        assert_eq!(
+            (
+                rect.offset.x,
+                rect.offset.y,
+                rect.extent.width,
+                rect.extent.height
+            ),
+            (0, 0, 250, 30)
+        );
+        let request = TextRequest::of(&overlay, rect, ByteOrder::Rgba);
+        assert_eq!(
+            request.viewport,
+            Viewport {
+                x: 50,
+                y: 10,
+                width: 250,
+                height: 30
+            }
+        );
+        assert_eq!(
+            request.style.width, 300.0,
+            "the layout uses the whole box, not the visible part"
+        );
+        if !host_font_available() {
+            return;
+        }
+        let whole = {
+            let mut shown = text_overlay("hihihi", 0);
+            shown.geometry = (100, 100, 300, 40);
+            text_layer(&shown, field_rect(&shown, extent), ByteOrder::Rgba)
+        };
+        let cropped = text_layer(&overlay, rect, ByteOrder::Rgba);
+        for y in 0..30usize {
+            for x in 0..250usize {
+                assert_eq!(
+                    cropped.pixels[y * 250 + x],
+                    whole.pixels[(y + 10) * 300 + x + 50],
+                    "pixel {x},{y} of the visible part"
                 );
             }
-            assert_eq!(
-                caret_pixels("hihihi\n", true, x_alignment, width, LINE),
+        }
+    }
+
+    #[test]
+    fn an_empty_focused_box_shows_a_caret() {
+        if !host_font_available() {
+            return;
+        }
+        let overlay = text_overlay("", 0);
+        let rect = field_rect(
+            &overlay,
+            vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+        );
+        let layer = text_layer(&overlay, rect, ByteOrder::Rgba);
+        let caret = layer.caret.expect("an empty focused box keeps its caret");
+        assert!(caret.x0 < 3 && caret.x1 > caret.x0 && caret.y1 > caret.y0);
+        assert!(layer.pixels.iter().all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn the_text_worker_builds_layers_off_the_present_thread_and_restarts_the_blink() {
+        if !host_font_available() {
+            return;
+        }
+        let overlay = text_overlay("worker", 0);
+        let rect = field_rect(
+            &overlay,
+            vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+        );
+        let request = TextRequest::of(&overlay, rect, ByteOrder::Rgba);
+        let edited_at = Instant::now();
+        let started = Instant::now();
+        let (layer, caret_on) = loop {
+            if let Some(ready) = current_text_layer(&request, edited_at) {
+                break ready;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the worker never published a layer"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(layer.request, request);
+        assert!(caret_on, "the caret shows right after an edit");
+        assert!(layer.pixels.iter().any(|pixel| pixel[3] != 0));
+        let blink_at = |millis: u64| {
+            current_text_layer(&request, edited_at + Duration::from_millis(millis))
+                .expect("layer")
+                .1
+        };
+        assert!(!blink_at(600), "the caret hides 500 ms after the last edit");
+        assert!(blink_at(1000), "and shows again after another 500 ms");
+        let edited = TextRequest::of(&text_overlay("worker!", 0), rect, ByteOrder::Rgba);
+        let (_, after_edit) = current_text_layer(&edited, edited_at + Duration::from_millis(1600))
+            .expect("the previous layer stays on screen while the edit is built");
+        assert!(
+            after_edit,
+            "an edit restarts the blink with the caret shown"
+        );
+    }
+
+    fn gated_engine_frame(
+        gpu: &crate::graphics::headless_vulkan::HeadlessGpu,
+        rendered: vk::Semaphore,
+    ) -> (vk::Event, vk::CommandPool, vk::Semaphore) {
+        let release = unsafe {
+            gpu.device
+                .create_event(&vk::EventCreateInfo::default(), None)
+        }
+        .expect("vkCreateEvent");
+        let engine_done = gpu.semaphore();
+        let pool = unsafe {
+            gpu.device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family),
                 None,
-                "a one-line field has no room for the caret on the next line"
+            )
+        }
+        .expect("pool");
+        let cmd = unsafe {
+            gpu.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .expect("cmd")[0];
+        unsafe {
+            gpu.device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                .expect("begin");
+            gpu.device.cmd_wait_events(
+                cmd,
+                &[release],
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)],
+                &[],
+                &[],
+            );
+            gpu.device.end_command_buffer(cmd).expect("end");
+            let waits = [rendered];
+            let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            let cmds = [cmd];
+            let signals = [engine_done];
+            gpu.device
+                .queue_submit(
+                    gpu.queue,
+                    &[vk::SubmitInfo::default()
+                        .wait_semaphores(&waits)
+                        .wait_dst_stage_mask(&stages)
+                        .command_buffers(&cmds)
+                        .signal_semaphores(&signals)],
+                    vk::Fence::null(),
+                )
+                .expect("engine submit");
+        }
+        (release, pool, engine_done)
+    }
+
+    #[test]
+    fn focused_text_is_blended_on_the_gpu_without_waiting_for_the_engine_frame() {
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        if !host_font_available() {
+            return;
+        }
+        let extent = vk::Extent2D {
+            width: 320,
+            height: 96,
+        };
+        for (format, order) in [
+            (vk::Format::R8G8B8A8_UNORM, ByteOrder::Rgba),
+            (vk::Format::B8G8R8A8_UNORM, ByteOrder::Bgra),
+        ] {
+            let image = gpu.image(
+                format,
+                extent.width,
+                extent.height,
+                vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            );
+            let rendered = engine_frame(&gpu, image, vk::ImageLayout::UNDEFINED);
+            let mut overlay = text_overlay("Eclipse 42 ffi", 0);
+            overlay.geometry = (16, 20, 240, 46);
+            overlay.text_color = 0xFF00_A2FFu32 as i32;
+            let rect = field_rect(&overlay, extent);
+            let layer = text_layer(&overlay, rect, order);
+            let mut compositor = TextCompositor::build(
+                &gpu.entry,
+                EngineHandles {
+                    instance: gpu.instance.handle().as_raw(),
+                    device: gpu.device.handle().as_raw(),
+                    physical_device: gpu.physical_device.as_raw(),
+                    queue_family: gpu.queue_family,
+                },
+                rect,
+            )
+            .expect("text compositor");
+            let (release, pool, engine_done) = gated_engine_frame(&gpu, rendered);
+            let queue = gpu.queue;
+            let image_raw = image.as_raw();
+            let (sent, received) = std::sync::mpsc::channel();
+            let (early, batch) = std::thread::scope(|scope| {
+                let compositor = &mut compositor;
+                let layer = &layer;
+                scope.spawn(move || {
+                    let batch =
+                        unsafe { compositor.draw(queue, image_raw, &[engine_done], layer, true) };
+                    sent.send(batch).expect("send");
+                });
+                let early = received.recv_timeout(Duration::from_secs(2));
+                unsafe { gpu.device.set_event(release) }.expect("vkSetEvent");
+                let batch = match &early {
+                    Ok(batch) => *batch,
+                    Err(_) => received.recv().expect("draw result"),
+                };
+                (early, batch)
+            });
+            assert!(
+                early.is_ok(),
+                "the present hook waited for the engine's GPU work"
+            );
+            assert_eq!(batch, OverlayBatch::Queued);
+            let presents =
+                PresentSemaphores::create(gpu.device.clone(), 0x5E, 1).expect("semaphores");
+            let ready = presents.signal(gpu.queue, 0).expect("present semaphore");
+            let pixels = read_image(
+                &gpu,
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                extent,
+                &[ready],
+            );
+            unsafe {
+                gpu.device.queue_wait_idle(gpu.queue).expect("idle");
+                gpu.device.destroy_command_pool(pool, None);
+                gpu.device.destroy_event(release, None);
+            }
+            drop(compositor);
+            drop(presents);
+
+            let background = pixels[..4].to_vec();
+            let mut expected = background.repeat((rect.extent.width * rect.extent.height) as usize);
+            blend_reference(&mut expected, &layer, rect.extent.width, true);
+            assert_ne!(expected, background.repeat(expected.len() / 4));
+            assert!(
+                rect_rows(&pixels, extent, rect) == expected,
+                "{format:?} differs from the CPU reference blend"
+            );
+            assert!(outside_rect_is(&pixels, extent, rect, &background));
+            let caret = layer.caret.expect("caret");
+            let at = |x: u32, y: u32| {
+                let i = (((rect.offset.y as u32 + y) * extent.width + rect.offset.x as u32 + x) * 4)
+                    as usize;
+                order.arrange([pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]])
+            };
+            let [r, g, b, _] = at(caret.x0, (caret.y0 + caret.y1) / 2);
+            assert_eq!(
+                [r, g, b],
+                [0, 162, 255],
+                "{format:?} caret keeps TextColor3's channels"
             );
         }
     }
 
     #[test]
-    fn caret_blinks_every_thirty_frames_after_complete_text() {
-        if system_font().is_none() {
+    fn a_moved_or_resized_field_keeps_its_compositor_and_blends_at_the_new_rect() {
+        let Some(gpu) = headless_gpu() else {
+            return;
+        };
+        if !host_font_available() {
             return;
         }
-        let mut layers = TextLayerCache::default();
-        let layer = layers
-            .layer(&text_overlay("abc", 0), 200, 40)
-            .expect("layer");
-        assert!(layer.caret.as_ref().is_some_and(|c| !c.is_empty()));
-        let color = [255, 255, 255, 255];
-        let blink = AtomicU64::new(0);
-        let still = AtomicU64::new(30);
-        let mut hidden = patterned(layer.layout.buffer_len());
-        layer.apply(&mut hidden, color, &still);
-        for frame in 0..60u64 {
-            let mut buf = patterned(layer.layout.buffer_len());
-            layer.apply(&mut buf, color, &blink);
-            assert_eq!(
-                buf != hidden,
-                frame < 30,
-                "caret visibility at frame {frame}"
+        let extent = vk::Extent2D {
+            width: 320,
+            height: 160,
+        };
+        let image = gpu.image(
+            vk::Format::R8G8B8A8_UNORM,
+            extent.width,
+            extent.height,
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+        );
+        let mut from = vk::ImageLayout::UNDEFINED;
+        let mut slot = TextCompositorSlot::Empty;
+        let mut builds = 0;
+        for geometry in [
+            (16, 20, 200, 40),
+            (40, 70, 200, 40),
+            (8, 12, 300, 120),
+            (30, 30, 120, 30),
+        ] {
+            let rendered = engine_frame(&gpu, image, from);
+            from = vk::ImageLayout::PRESENT_SRC_KHR;
+            let mut overlay = text_overlay("Eclipse 42", 0);
+            overlay.geometry = geometry;
+            overlay.text_color = 0xFF00_A2FFu32 as i32;
+            let rect = field_rect(&overlay, extent);
+            let layer = text_layer(&overlay, rect, ByteOrder::Rgba);
+            let compositor =
+                fitted_compositor(&mut slot, gpu.device.handle().as_raw(), rect, || {
+                    builds += 1;
+                    TextCompositor::build(
+                        &gpu.entry,
+                        EngineHandles {
+                            instance: gpu.instance.handle().as_raw(),
+                            device: gpu.device.handle().as_raw(),
+                            physical_device: gpu.physical_device.as_raw(),
+                            queue_family: gpu.queue_family,
+                        },
+                        rect,
+                    )
+                })
+                .expect("text compositor");
+            let batch =
+                unsafe { compositor.draw(gpu.queue, image.as_raw(), &[rendered], &layer, true) };
+            assert_eq!(batch, OverlayBatch::Queued);
+            let pixels = read_image(&gpu, image, vk::ImageLayout::PRESENT_SRC_KHR, extent, &[]);
+            let background = pixels[..4].to_vec();
+            let mut expected = background.repeat((rect.extent.width * rect.extent.height) as usize);
+            blend_reference(&mut expected, &layer, rect.extent.width, true);
+            assert!(
+                rect_rows(&pixels, extent, rect) == expected,
+                "the field at {geometry:?} differs from the CPU reference blend"
             );
+            assert!(outside_rect_is(&pixels, extent, rect, &background));
         }
+        assert_eq!(
+            builds, 1,
+            "moving or resizing the field rebuilt the compositor"
+        );
     }
 
     static HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -4077,6 +4713,7 @@ mod tests {
                 queue_family: gpu.queue_family,
             },
             rect,
+            HostAccess::Write,
         )
         .expect("overlay probe")
     }
@@ -4343,83 +4980,6 @@ mod tests {
     }
 
     #[test]
-    fn text_capture_reaches_the_present_through_the_present_semaphore() {
-        let Some(gpu) = headless_gpu() else {
-            return;
-        };
-        if system_font().is_none() {
-            return;
-        }
-        let extent = vk::Extent2D {
-            width: 320,
-            height: 96,
-        };
-        let image = gpu.image(
-            vk::Format::B8G8R8A8_UNORM,
-            extent.width,
-            extent.height,
-            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
-        );
-        let rendered = engine_frame(&gpu, image, vk::ImageLayout::UNDEFINED);
-        let rect = vk::Rect2D {
-            offset: vk::Offset2D { x: 16, y: 20 },
-            extent: vk::Extent2D {
-                width: 240,
-                height: 46,
-            },
-        };
-        let mut probe = build_probe(&gpu, rect);
-        let overlay = text_overlay("Eclipse 42", 0);
-        let color = overlay_text_color(overlay.text_color);
-        let mut layers = TextLayerCache::default();
-        let layer = layers
-            .layer(&overlay, rect.extent.width, rect.extent.height)
-            .expect("text layer");
-
-        let gate = PresentGate::Engine;
-        let blink = AtomicU64::new(0);
-        let batch = unsafe {
-            probe.capture(
-                gpu.queue,
-                image.as_raw(),
-                gate.waits(&[rendered]),
-                Some((layer, color, &blink)),
-                false,
-            )
-        };
-        assert_eq!(
-            batch,
-            OverlayBatch::Queued,
-            "the composited field is still in flight"
-        );
-        let gate = gate.after(batch);
-        assert_eq!(gate, PresentGate::Pending);
-        assert!(
-            gate.waits(&[rendered]).is_empty(),
-            "the engine waits were consumed"
-        );
-
-        let presents = PresentSemaphores::create(gpu.device.clone(), 0x5C, 1).expect("semaphores");
-        let ready = presents
-            .signal(gpu.queue, 0)
-            .expect("signal the present semaphore");
-        let pixels = read_image(
-            &gpu,
-            image,
-            vk::ImageLayout::PRESENT_SRC_KHR,
-            extent,
-            &[ready],
-        );
-
-        let background = pixels[..4].to_vec();
-        let mut expected = background.repeat((rect.extent.width * rect.extent.height) as usize);
-        layer.apply(&mut expected, color, &AtomicU64::new(0));
-        assert_ne!(expected, background.repeat(expected.len() / 4));
-        assert!(rect_rows(&pixels, extent, rect) == expected);
-        assert!(outside_rect_is(&pixels, extent, rect, &background));
-    }
-
-    #[test]
     fn webview_upload_publishes_the_saved_frame_behind_its_semaphore() {
         let Some(gpu) = headless_gpu() else {
             return;
@@ -4504,17 +5064,6 @@ mod tests {
             "the saved frame holds the latest composited WebView frame"
         );
         assert!(outside_rect_is(&pixels, extent, rect, &background));
-    }
-
-    #[test]
-    fn focused_text_uses_native_font_size_instead_of_field_height() {
-        let source = include_str!("vk_overlay.rs");
-
-        assert!(!source.contains(concat!("(h as f32", " * 0.55).max(8.0)")));
-        assert!(source.contains("overlay_font_size(overlay.font_size)"));
-        assert_eq!(overlay_font_size(14.0), 14.0);
-        assert_eq!(overlay_font_size(155.0), MAX_OVERLAY_FONT_SIZE);
-        assert_eq!(overlay_font_size(f32::NAN), 14.0);
     }
 
     #[test]

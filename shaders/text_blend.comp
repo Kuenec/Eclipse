@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) buffer Pixels {
+    uint pixels[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Layer {
+    uint layer[];
+};
+
+layout(push_constant) uniform Blend {
+    uint width;
+    uint height;
+    uint caret_color;
+    uint caret_on;
+    uvec4 caret_rect;
+} blend;
+
+uint channel(uint value, uint index) {
+    return (value >> (8u * index)) & 255u;
+}
+
+uint scaled(uint value, uint factor) {
+    return (value * factor + 127u) / 255u;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= blend.width || y >= blend.height) {
+        return;
+    }
+    uint index = y * blend.width + x;
+    bool caret = blend.caret_on != 0u
+        && x >= blend.caret_rect.x && x < blend.caret_rect.z
+        && y >= blend.caret_rect.y && y < blend.caret_rect.w;
+    uint ink = layer[index];
+    uint ink_alpha = channel(ink, 3u);
+    if (ink_alpha == 0u && !caret) {
+        return;
+    }
+    uint destination = pixels[index];
+    uint caret_alpha = channel(blend.caret_color, 3u);
+    uint result = destination & 0xFF000000u;
+    for (uint c = 0u; c < 3u; ++c) {
+        uint value = min(255u, channel(ink, c) + scaled(channel(destination, c), 255u - ink_alpha));
+        if (caret) {
+            value = scaled(channel(blend.caret_color, c), caret_alpha)
+                + scaled(value, 255u - caret_alpha);
+        }
+        result |= min(value, 255u) << (8u * c);
+    }
+    pixels[index] = result;
+}
