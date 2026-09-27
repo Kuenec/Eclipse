@@ -1,4 +1,13 @@
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use eclipse::apk::store::{
+    CheckOutcome, Committed, InstalledVersion, Release, Store, UpdateCheck, UpdateOutcome,
+};
+use eclipse::apk::{ApkSet, ApkSetPaths, VersionCode};
+use eclipse::graphics::launch_window::{LaunchWindow, WindowClosed};
+use eclipse::runtime::NativeLibRoot;
+use eclipse::status::{StatusSink, StatusUpdate};
 
 mod browser_launch;
 mod desktop_integration;
@@ -18,9 +27,11 @@ USAGE:
 
 COMMANDS:
     run [PATH]  Verify the Roblox client, boot the ART VM (Roblox on the classpath) and open
-                the window. With no PATH, runs the installed client: the first run downloads
-                Roblox, and later runs check for a Roblox update at most every 6 hours. PATH
-                may be an APK file or a directory holding base.apk and split_config.x86_64.apk.
+                the window. With no PATH, runs the installed client in a window that shows the
+                download and any error: the first run downloads Roblox, and later runs check
+                for a Roblox update at most every 6 hours, or 30 minutes after a failed check.
+                PATH may be an APK file or a directory holding base.apk and
+                split_config.x86_64.apk. Only one Roblox client runs at a time.
     install <PATH>...
                 Verify and install the Roblox client: base.apk plus split_config.x86_64.apk,
                 a directory holding them, or an .apks/.xapk/.apkm bundle.
@@ -47,6 +58,10 @@ fn main() -> ExitCode {
         Ok(args) => args,
         Err(error) => {
             eprintln!("eclipse browser launch: {error}");
+            show_error_window(
+                &format!("Eclipse cannot open this Roblox link: {error}"),
+                None,
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -56,7 +71,7 @@ fn main() -> ExitCode {
             Some(_) => verify_client_settings_redirect().map_err(Into::into),
         };
         if let Err(error) = settings {
-            eprintln!("eclipse Android settings setup: {error}");
+            report_setup_failure(&args, "eclipse Android settings setup", &error.to_string());
             return ExitCode::FAILURE;
         }
     }
@@ -64,7 +79,7 @@ fn main() -> ExitCode {
         || matches!(args.first().map(String::as_str), Some("__webview-test"))
     {
         if let Err(error) = eclipse::runtime::prepare_art_boot_environment() {
-            eprintln!("eclipse ART startup: {error}");
+            report_setup_failure(&args, "eclipse ART startup", &error.to_string());
             return ExitCode::FAILURE;
         }
     }
@@ -82,22 +97,19 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("run") => {
-            let status = match parse_run_path(&args[1..])
-                .and_then(|path| run_apk(path, None).map_err(|error| error.to_string()))
-            {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("eclipse run: {e}");
+            let status = match parse_run_path(&args[1..]) {
+                Ok(Some(path)) => run_file(path),
+                Ok(None) => launch_in_window(Launch::Installed),
+                Err(error) => {
+                    eprintln!("eclipse run: {error}");
                     1
                 }
             };
             finish_android_process(status)
         }
         Some("__run-browser-place") => {
-            let status = match parse_internal_place_id(&args[1..]).and_then(|place_id| {
-                run_apk(None, Some(place_id)).map_err(|error| error.to_string())
-            }) {
-                Ok(()) => 0,
+            let status = match parse_internal_place_id(&args[1..]) {
+                Ok(place_id) => launch_in_window(Launch::BrowserPlace(place_id)),
                 Err(error) => {
                     eprintln!("eclipse browser launch: {error}");
                     1
@@ -226,6 +238,21 @@ fn is_android_run_command(command: Option<&str>) -> bool {
     matches!(command, Some("run") | Some("__run-browser-place"))
 }
 
+fn launches_in_window(args: &[String]) -> bool {
+    match args {
+        [command] => command == "run",
+        [command, _] => command == "__run-browser-place",
+        _ => false,
+    }
+}
+
+fn report_setup_failure(args: &[String], context: &str, error: &str) {
+    eprintln!("{context}: {error}");
+    if launches_in_window(args) {
+        show_error_window(error, None);
+    }
+}
+
 fn normalize_browser_launch(mut arguments: Vec<String>) -> Result<Vec<String>, String> {
     if !matches!(
         arguments.first().map(String::as_str),
@@ -278,30 +305,9 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(
         "cannot resolve Eclipse's app-data directory; set HOME, XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR",
     )?;
-    let runtime_dir = app_data_dir.join("runtime");
+    let runtime_dir = app_data_dir.join(RUNTIME_DIR);
     std::fs::create_dir_all(&runtime_dir)?;
-
-    let settings_path = runtime_dir.join("ClientAppSettings.json");
-    let temporary_path = runtime_dir.join(format!(
-        ".ClientAppSettings.json.{}.tmp",
-        std::process::id()
-    ));
-    std::fs::write(&temporary_path, json)?;
-    std::fs::rename(&temporary_path, &settings_path)?;
-
-    let shim_path = runtime_dir.join(CLIENT_SETTINGS_PATH_SHIM_NAME);
-    let shim_is_current =
-        std::fs::read(&shim_path).is_ok_and(|bytes| bytes.as_slice() == CLIENT_SETTINGS_PATH_SHIM);
-    if !shim_is_current {
-        let temporary_shim = runtime_dir.join(format!(
-            ".{CLIENT_SETTINGS_PATH_SHIM_NAME}.{}.tmp",
-            std::process::id()
-        ));
-        std::fs::write(&temporary_shim, CLIENT_SETTINGS_PATH_SHIM)?;
-        std::fs::rename(temporary_shim, &shim_path)?;
-    }
-
-    let settings_path = settings_path.canonicalize()?;
+    let settings_path = stage_client_settings(&runtime_dir, &json)?.canonicalize()?;
     let runtime_dir = runtime_dir.canonicalize()?;
     if runtime_dir
         .as_os_str()
@@ -361,6 +367,29 @@ fn prepend_search_list_entry(
     value
 }
 
+fn stage_client_settings(runtime_dir: &Path, json: &[u8]) -> Result<PathBuf, String> {
+    let settings = replace_runtime_file(runtime_dir, CLIENT_SETTINGS_FILE, json)?;
+    let shim_is_current = std::fs::read(runtime_dir.join(CLIENT_SETTINGS_PATH_SHIM_NAME))
+        .is_ok_and(|bytes| bytes.as_slice() == CLIENT_SETTINGS_PATH_SHIM);
+    if !shim_is_current {
+        replace_runtime_file(
+            runtime_dir,
+            CLIENT_SETTINGS_PATH_SHIM_NAME,
+            CLIENT_SETTINGS_PATH_SHIM,
+        )?;
+    }
+    Ok(settings)
+}
+
+fn replace_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = dir.join(name);
+    let write_error = |error: std::io::Error| format!("cannot write {}: {error}", path.display());
+    let mut temp = eclipse::temp_file::TempFile::create(dir, name).map_err(write_error)?;
+    temp.write_all(bytes).map_err(write_error)?;
+    temp.persist(&path).map_err(write_error)?;
+    Ok(path)
+}
+
 fn finish_android_process(status: libc::c_int) -> ! {
     use std::io::Write as _;
 
@@ -381,7 +410,13 @@ fn show_config() -> Result<(), eclipse::config::ConfigError> {
 const NOT_INSTALLED: &str = "Roblox is not installed; run `eclipse update` to download it, or \
      install the APKs with `eclipse install <PATH>`";
 
-const VERIFYING_SIGNATURE: &str = "# Verifying the Roblox client's signature…";
+const VERIFYING_SIGNATURE: &str = "Verifying the Roblox client's signature…";
+
+const RUNTIME_DIR: &str = "runtime";
+
+const CLIENT_SETTINGS_FILE: &str = "ClientAppSettings.json";
+
+const CLIENT_LOCK_FILE: &str = "client.lock";
 
 const PLAY_LOGIN_STEPS: &str = "\
 Sign in to Google Play with your own Google account.
@@ -409,10 +444,17 @@ fn install_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     if arguments.is_empty() {
         return Err("usage: eclipse install <APK | DIRECTORY | BUNDLE>...".into());
     }
-    let sources: Vec<std::path::PathBuf> = arguments.iter().map(std::path::PathBuf::from).collect();
-    println!("# Verifying and installing the Roblox client…");
-    let installed = eclipse::apk::store::Store::open()?.install(&sources)?;
-    println!("installed Roblox {installed}");
+    let sources: Vec<PathBuf> = arguments.iter().map(PathBuf::from).collect();
+    let status = StatusSink::terminal();
+    status.step("Verifying and installing the Roblox client…");
+    let committed = Store::open()?.install(&sources, &status)?;
+    status.outcome(format!(
+        "installed Roblox {}",
+        InstalledVersion::from(&committed.set)
+    ));
+    if let Some(leftover) = committed.leftover {
+        status.warning(leftover.to_string());
+    }
     Ok(())
 }
 
@@ -471,107 +513,128 @@ fn parse_update_source(arguments: &[String]) -> Result<UpdateSource, String> {
 
 fn update_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = parse_update_source(arguments)?;
-    let store = eclipse::apk::store::Store::open()?;
+    let store = Store::open()?;
     let current = store.usable_current()?;
+    let status = StatusSink::terminal();
     match source {
-        UpdateSource::ApkCombo => update_from_apkcombo(&store, current.as_ref(), None),
-        UpdateSource::GooglePlay => update_from_play(&store, current.as_ref()),
+        UpdateSource::ApkCombo => update_from_apkcombo(&store, current.as_ref(), None, &status),
+        UpdateSource::GooglePlay => update_from_play(&store, current.as_ref(), &status),
     }
     .map(drop)
 }
 
 fn update_from_apkcombo(
-    store: &eclipse::apk::store::Store,
-    current: Option<&eclipse::apk::ApkSet>,
-    rejected: Option<eclipse::apk::store::Release>,
-) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
-    println!("# Checking APKCombo for the newest Roblox client…");
+    store: &Store,
+    current: Option<&ApkSet>,
+    rejected: Option<Release>,
+    status: &StatusSink,
+) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
+    status.step("Checking APKCombo for the newest Roblox client…");
     let offer = eclipse::apk::apkcombo::newest_offer()?;
-    println!("# APKCombo offers {offer}");
-    let outcome = eclipse::apk::apkcombo::update(&offer, store, current, rejected)?;
-    finish_update(store, outcome)
+    status.step(format!("APKCombo offers {offer}"));
+    let outcome = eclipse::apk::apkcombo::update(&offer, store, current, rejected, status)?;
+    finish_update(store, outcome, status)
 }
 
 fn update_from_play(
-    store: &eclipse::apk::store::Store,
-    current: Option<&eclipse::apk::ApkSet>,
-) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
+    store: &Store,
+    current: Option<&ApkSet>,
+    status: &StatusSink,
+) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     let credentials = eclipse::apk::play::Account::open()?
         .credentials()?
         .ok_or("not signed in to Google Play; run `eclipse play-login` first")?;
-    println!("# Checking Google Play for the newest Roblox client…");
-    let outcome = eclipse::apk::play::update(&credentials, store, current)?;
-    finish_update(store, outcome)
+    status.step("Checking Google Play for the newest Roblox client…");
+    let outcome = eclipse::apk::play::update(&credentials, store, current, status)?;
+    finish_update(store, outcome, status)
 }
 
 fn finish_update(
-    store: &eclipse::apk::store::Store,
-    outcome: eclipse::apk::store::UpdateOutcome,
-) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
-    use eclipse::apk::store::{InstalledVersion, UpdateCheck, UpdateOutcome};
-
+    store: &Store,
+    outcome: UpdateOutcome,
+    status: &StatusSink,
+) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     store.record_check(&UpdateCheck {
         at: std::time::SystemTime::now(),
         rejected: None,
+        outcome: CheckOutcome::Completed,
     })?;
-    match outcome {
+    let (previous, committed) = match outcome {
         UpdateOutcome::UpToDate { installed } => {
-            println!("Roblox {installed} is up to date");
-            Ok(None)
+            status.outcome(format!("Roblox {installed} is up to date"));
+            return Ok(None);
         }
         UpdateOutcome::Updated {
-            previous: Some(previous),
-            set,
-        } => {
-            println!(
-                "updated Roblox from {previous} to {}",
-                InstalledVersion::from(&*set)
-            );
-            Ok(Some(*set))
-        }
-        UpdateOutcome::Updated {
-            previous: None,
-            set,
-        } => {
-            println!("installed Roblox {}", InstalledVersion::from(&*set));
-            Ok(Some(*set))
-        }
+            previous,
+            committed,
+        } => (previous, committed),
+    };
+    let Committed { set, leftover } = *committed;
+    let installed = InstalledVersion::from(&set);
+    match previous {
+        Some(previous) => status.outcome(format!("updated Roblox from {previous} to {installed}")),
+        None => status.outcome(format!("installed Roblox {installed}")),
     }
+    if let Some(leftover) = leftover {
+        status.warning(leftover.to_string());
+    }
+    Ok(Some(set))
 }
 
 fn update_if_due(
-    store: &eclipse::apk::store::Store,
-    current: Option<&eclipse::apk::ApkSet>,
-) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>> {
+    store: &Store,
+    installed: Option<VersionCode>,
+    update: impl FnOnce(Option<Release>) -> Result<Option<ApkSet>, Box<dyn std::error::Error>>,
+) -> Result<Option<ApkSet>, Box<dyn std::error::Error>> {
     let last_check = store.last_check()?;
-    let due = eclipse::apk::store::update_due(
-        current.map(eclipse::apk::ApkSet::version_code),
-        last_check.map(|check| check.at),
-        std::time::SystemTime::now(),
-    );
-    if !due {
+    let now = std::time::SystemTime::now();
+    if !eclipse::apk::store::update_due(installed, last_check.as_ref(), now) {
         return Ok(None);
     }
-    update_from_apkcombo(store, current, last_check.and_then(|check| check.rejected))
+    let rejected = last_check.and_then(|check| check.rejected);
+    let error = match update(rejected) {
+        Ok(updated) => return Ok(updated),
+        Err(error) => error,
+    };
+    if store.last_check()? == last_check {
+        let failed = UpdateCheck {
+            at: now,
+            rejected,
+            outcome: CheckOutcome::Failed,
+        };
+        if let Err(record) = store.record_check(&failed) {
+            return Err(format!(
+                "{error} (Eclipse could not record the failed check, so the next launch checks \
+                 again: {record})"
+            )
+            .into());
+        }
+    }
+    Err(error)
 }
 
 fn installed_apk_set(
     check_for_update: bool,
-) -> Result<eclipse::apk::ApkSet, Box<dyn std::error::Error>> {
-    let store = eclipse::apk::store::Store::open()?;
-    println!("{VERIFYING_SIGNATURE}");
+    status: &StatusSink,
+) -> Result<ApkSet, Box<dyn std::error::Error>> {
+    let store = Store::open()?;
+    status.step(VERIFYING_SIGNATURE);
     let set = if check_for_update {
-        installed_or_updated_set(&store, |current| update_if_due(&store, current))?
+        installed_or_updated_set(&store, status, |current| {
+            update_if_due(&store, current.map(ApkSet::version_code), |rejected| {
+                update_from_apkcombo(&store, current, rejected, status)
+            })
+        })?
     } else {
         store.verified_current()?.ok_or(NOT_INSTALLED)?
     };
     if let Some(cache) = eclipse::runtime::dalvik_cache_dir() {
         remove_other_version_oats(&cache, store.root(), set.base_path(), set.version_code())?;
     }
-    println!(
-        "# Launching the installed Roblox {}",
-        eclipse::apk::store::InstalledVersion::from(&set)
-    );
+    status.step(format!(
+        "Launching the installed Roblox {}",
+        InstalledVersion::from(&set)
+    ));
     Ok(set)
 }
 
@@ -638,17 +701,16 @@ fn remove_other_version_oats(
 }
 
 fn installed_or_updated_set(
-    store: &eclipse::apk::store::Store,
-    update: impl FnOnce(
-        Option<&eclipse::apk::ApkSet>,
-    ) -> Result<Option<eclipse::apk::ApkSet>, Box<dyn std::error::Error>>,
-) -> Result<eclipse::apk::ApkSet, Box<dyn std::error::Error>> {
+    store: &Store,
+    status: &StatusSink,
+    update: impl FnOnce(Option<&ApkSet>) -> Result<Option<ApkSet>, Box<dyn std::error::Error>>,
+) -> Result<ApkSet, Box<dyn std::error::Error>> {
     let current = match store.verified_current() {
         Err(error) if !error.is_unusable_install() => return Err(error.into()),
         current => current,
     };
     let verified = current.as_ref().ok().and_then(Option::as_ref);
-    let verified_version = verified.map(eclipse::apk::ApkSet::version_code);
+    let verified_version = verified.map(ApkSet::version_code);
     let error = match update(verified) {
         Ok(Some(updated)) => return Ok(updated),
         Ok(None) => return Ok(current?.ok_or(NOT_INSTALLED)?),
@@ -662,7 +724,7 @@ fn installed_or_updated_set(
     };
     match fallback {
         Ok(Some(installed)) => {
-            eprintln!("# WARNING: could not update Roblox: {error}");
+            status.warning(format!("could not update Roblox: {error}"));
             Ok(installed)
         }
         Ok(None) => Err(format!("could not download Roblox: {error}").into()),
@@ -679,10 +741,22 @@ fn install_url_handler_command(arguments: &[String]) -> Result<(), Box<dyn std::
     }
     let outcome = desktop_integration::install_url_handler()?;
     println!("{}", url_handler_message(&outcome));
-    if eclipse::apk::store::Store::open()?.current()?.is_none() {
-        println!("note: {NOT_INSTALLED}");
+    let note = match Store::open() {
+        Ok(store) => installed_client_note(&store),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(note) = note {
+        println!("note: {note}");
     }
     Ok(())
+}
+
+fn installed_client_note(store: &Store) -> Option<String> {
+    match store.current() {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(NOT_INSTALLED.to_owned()),
+        Err(error) => Some(error.to_string()),
+    }
 }
 
 fn url_handler_message(outcome: &desktop_integration::UrlHandlerInstall) -> String {
@@ -700,11 +774,14 @@ fn url_handler_message(outcome: &desktop_integration::UrlHandlerInstall) -> Stri
     }
 }
 
-fn native_lib_dir(
-    version: eclipse::apk::VersionCode,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let root = eclipse::runtime::native_lib_cache_dir()?;
-    remove_other_native_lib_versions(&root, version)?;
+fn native_lib_dir(root: NativeLibRoot, version: VersionCode) -> Result<PathBuf, String> {
+    let root = match root {
+        NativeLibRoot::Cache(root) => {
+            remove_other_native_lib_versions(&root, version)?;
+            root
+        }
+        NativeLibRoot::Override(root) => root,
+    };
     Ok(root.join(version.to_string()))
 }
 
@@ -749,18 +826,302 @@ fn remove_other_native_lib_versions(
     Ok(())
 }
 
-fn run_apk(
-    path: Option<&std::path::Path>,
-    browser_place_id: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut apks = match path {
-        Some(path) => {
-            let paths = eclipse::apk::ApkSetPaths::locate(path)?;
-            println!("{VERIFYING_SIGNATURE}");
-            eclipse::apk::ApkSet::open(paths)?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    Installed,
+    File,
+    BrowserPlace(u64),
+}
+
+impl Launch {
+    fn context(self) -> &'static str {
+        match self {
+            Self::Installed | Self::File => "eclipse run",
+            Self::BrowserPlace(_) => "eclipse browser launch",
         }
-        None => installed_apk_set(browser_place_id.is_none())?,
+    }
+
+    fn already_running(self, lock: &Path) -> String {
+        let advice = match self {
+            Self::Installed | Self::File => {
+                "switch to its window, or close it before starting Roblox again"
+            }
+            Self::BrowserPlace(_) => {
+                "this browser Play click did not start a second copy; close Roblox in Eclipse, \
+                 then click Play again"
+            }
+        };
+        format!(
+            "Roblox is already running in Eclipse; {advice} (another Eclipse holds {})",
+            lock.display()
+        )
+    }
+
+    fn place_id(self) -> Option<u64> {
+        match self {
+            Self::BrowserPlace(place_id) => Some(place_id),
+            Self::Installed | Self::File => None,
+        }
+    }
+}
+
+fn window_title() -> String {
+    format!("Eclipse — {}", eclipse::apk::ROBLOX_PACKAGE)
+}
+
+fn show_error_window(message: &str, log: Option<&Path>) {
+    match LaunchWindow::open(&window_title()) {
+        Ok(mut window) => window.show_error(message, log),
+        Err(error) => eprintln!("eclipse: cannot open a window to show this error: {error}"),
+    }
+}
+
+fn report_failure(launch: Launch, error: &str) {
+    eprintln!("{}: {error}", launch.context());
+    eclipse::diagnostics::record_status(tracing::Level::ERROR, error);
+}
+
+struct ClientRun {
+    _lock: std::fs::File,
+    log: PathBuf,
+}
+
+impl ClientRun {
+    fn start(launch: Launch) -> Result<Self, String> {
+        let app_data_dir = eclipse::framework::app_data_dir().ok_or(
+            "cannot resolve Eclipse's app-data directory; set HOME, XDG_DATA_HOME, or \
+             ECLIPSE_APP_DATA_DIR",
+        )?;
+        Self::start_in(&app_data_dir, launch)
+    }
+
+    fn start_in(app_data_dir: &Path, launch: Launch) -> Result<Self, String> {
+        let lock = lock_client_in(&app_data_dir.join(RUNTIME_DIR), launch)?;
+        let log = eclipse::diagnostics::start_run_log(app_data_dir).map_err(|error| {
+            format!(
+                "cannot write Eclipse's log under {}: {error}",
+                app_data_dir.display()
+            )
+        })?;
+        Ok(Self { _lock: lock, log })
+    }
+}
+
+fn lock_client_in(runtime_dir: &Path, launch: Launch) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(runtime_dir)
+        .map_err(|error| format!("cannot create {}: {error}", runtime_dir.display()))?;
+    let path = runtime_dir.join(CLIENT_LOCK_FILE);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => Err(launch.already_running(&path)),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(format!("cannot lock {}: {error}", path.display()))
+        }
+    }
+}
+
+fn run_file(path: &Path) -> libc::c_int {
+    let _client = match ClientRun::start(Launch::File) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{}: {error}", Launch::File.context());
+            return 1;
+        }
     };
+    match play_file(path) {
+        Ok(()) => 0,
+        Err(error) => {
+            report_failure(Launch::File, &error.to_string());
+            1
+        }
+    }
+}
+
+fn play_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let status = StatusSink::terminal();
+    let paths = ApkSetPaths::locate(path)?;
+    status.step(VERIFYING_SIGNATURE);
+    let prepared = prepare_client(ApkSet::open(paths)?, &status)?;
+    boot_and_play(
+        prepared,
+        Launch::File,
+        &mut Host {
+            status: &status,
+            window: None,
+        },
+    )
+}
+
+type Preparation = std::thread::JoinHandle<Result<PreparedClient, String>>;
+
+fn launch_in_window(launch: Launch) -> libc::c_int {
+    let client = match ClientRun::start(launch) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{}: {error}", launch.context());
+            show_error_window(&error, None);
+            return 1;
+        }
+    };
+    let (sender, updates) = std::sync::mpsc::channel();
+    let status = StatusSink::with_window(sender.clone());
+    let preparation = prepare_in_background(launch, sender);
+    let mut window = match LaunchWindow::open(&window_title()) {
+        Ok(window) => window,
+        Err(error) => {
+            report_failure(launch, &format!("cannot open the Eclipse window: {error}"));
+            return 1;
+        }
+    };
+    let played = preparation
+        .map_err(Into::into)
+        .and_then(|worker| play_in_window(&mut window, &status, &updates, worker, launch));
+    match played {
+        Ok(()) => 0,
+        Err(error) => {
+            let error = error.to_string();
+            report_failure(launch, &error);
+            window.show_error(&error, Some(&client.log));
+            1
+        }
+    }
+}
+
+fn prepare_in_background(
+    launch: Launch,
+    updates: std::sync::mpsc::Sender<StatusUpdate>,
+) -> std::io::Result<Preparation> {
+    let check_for_update = launch == Launch::Installed;
+    std::thread::Builder::new()
+        .name("eclipse-install".to_owned())
+        .spawn(move || {
+            let status = StatusSink::with_window(updates);
+            installed_apk_set(check_for_update, &status)
+                .and_then(|apks| prepare_client(apks, &status))
+                .map_err(|error| error.to_string())
+        })
+}
+
+fn play_in_window(
+    window: &mut LaunchWindow,
+    status: &StatusSink,
+    updates: &std::sync::mpsc::Receiver<StatusUpdate>,
+    worker: Preparation,
+    launch: Launch,
+) -> Result<(), Box<dyn std::error::Error>> {
+    window.wait_for(updates, &worker)?;
+    let prepared = worker
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+    boot_and_play(
+        prepared,
+        launch,
+        &mut Host {
+            status,
+            window: Some((window, updates)),
+        },
+    )
+}
+
+struct Host<'a> {
+    status: &'a StatusSink,
+    window: Option<(
+        &'a mut LaunchWindow,
+        &'a std::sync::mpsc::Receiver<StatusUpdate>,
+    )>,
+}
+
+impl Host<'_> {
+    fn step(&mut self, text: String) -> Result<(), WindowClosed> {
+        self.status.step(text);
+        self.refresh()
+    }
+
+    fn refresh(&mut self) -> Result<(), WindowClosed> {
+        match &mut self.window {
+            Some((window, updates)) => window.refresh(updates),
+            None => Ok(()),
+        }
+    }
+
+    fn run_game(
+        &mut self,
+        title: &str,
+        vm: &eclipse::runtime::Vm,
+        touch_mode: eclipse::config::TouchMode,
+    ) -> Result<(), eclipse::graphics::GraphicsError> {
+        match &mut self.window {
+            Some((window, _)) => {
+                let (event_loop, activation_token) = window.event_loop();
+                eclipse::graphics::run_windowed(
+                    event_loop,
+                    activation_token,
+                    title,
+                    Some(vm),
+                    touch_mode,
+                )
+            }
+            None => eclipse::graphics::run_windowed(
+                &mut eclipse::graphics::host_event_loop()?,
+                None,
+                title,
+                Some(vm),
+                touch_mode,
+            ),
+        }
+    }
+}
+
+struct PreparedClient {
+    apks: ApkSet,
+    app_lib_dir: PathBuf,
+}
+
+fn prepare_client(
+    mut apks: ApkSet,
+    status: &StatusSink,
+) -> Result<PreparedClient, Box<dyn std::error::Error>> {
+    let app_lib_dir = native_lib_dir(eclipse::runtime::native_lib_root()?, apks.version_code())?;
+    status.step(format!(
+        "Extracting native libs (lib/x86_64/) to {}…",
+        app_lib_dir.display()
+    ));
+    let lib_count = apks
+        .native_libs_mut()
+        .extract_native_libs(eclipse::apk::TARGET_ABI, &app_lib_dir)?;
+    println!("extracted {lib_count} native lib(s) ✓");
+
+    let assets_dir = eclipse::framework::app_data_dir()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot resolve the app data directory (no $HOME/XDG base and ECLIPSE_APP_DATA_DIR \
+                 unset); set ECLIPSE_APP_DATA_DIR to the engine content root",
+            )
+        })?
+        .join("files")
+        .join("assets");
+    status.step(format!(
+        "Extracting Roblox bundled assets (assets/ → files/assets/) to {}…",
+        assets_dir.display()
+    ));
+    let asset_count = apks.base_mut().extract_assets(&assets_dir)?;
+    println!("extracted {asset_count} asset file(s) ✓");
+    Ok(PreparedClient { apks, app_lib_dir })
+}
+
+fn boot_and_play(
+    prepared: PreparedClient,
+    launch: Launch,
+    host: &mut Host<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let PreparedClient { apks, app_lib_dir } = prepared;
     let base_path = apks.base_path().to_path_buf();
     let apk_path = base_path
         .to_str()
@@ -773,7 +1134,7 @@ fn run_apk(
     eclipse::performance::configure_engine_cpu_affinity(config.graphics_optimization_mode);
     let plan = eclipse::runtime::BootPlan::new(&manifest, &config);
 
-    println!("# ART boot plan (dry run) for {apk_path}");
+    println!("# ART boot plan for {apk_path}");
     println!("package:            {}", manifest.package);
     println!(
         "version:            {} (versionCode {})",
@@ -794,37 +1155,15 @@ fn run_apk(
         println!("    {opt}");
     }
 
-    let app_lib_dir = native_lib_dir(apks.version_code())?;
-    println!(
-        "\n# Extracting native libs (lib/x86_64/) to {}…",
-        app_lib_dir.display()
-    );
-    let extracted = apks
-        .native_libs_mut()
-        .extract_native_libs(eclipse::apk::TARGET_ABI, &app_lib_dir)?;
-    println!("extracted {} native lib(s) ✓", extracted.len());
-
-    let assets_dir = eclipse::framework::app_data_dir()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "cannot resolve the app data directory (no $HOME/XDG base and ECLIPSE_APP_DATA_DIR \
-                 unset); set ECLIPSE_APP_DATA_DIR to the engine content root",
-            )
-        })?
-        .join("files")
-        .join("assets");
-    println!(
-        "\n# Extracting Roblox bundled assets (assets/ → files/assets/) to {}…",
-        assets_dir.display()
-    );
-    let asset_count = apks.base_mut().extract_assets(&assets_dir)?;
-    println!("extracted {asset_count} asset file(s) ✓");
-
+    host.step(format!(
+        "Starting Roblox {}…",
+        apks.version_name().unwrap_or("")
+    ))?;
     println!("\n# Booting the ART VM with Roblox on the classpath…");
 
     let vm = eclipse::runtime::boot(&plan, Some(&base_path), Some(&app_lib_dir))?;
     println!("ART VM booted with Roblox's Java on the classpath ✓");
+    host.refresh()?;
 
     println!("# Provisioning bionic sonames (libm.so → Eclipse apkenv-loadable shim) …");
     eclipse::runtime::provision_bionic_sonames(&app_lib_dir)?;
@@ -840,8 +1179,10 @@ fn run_apk(
     println!("engine-preload framework natives registered ✓");
 
     let _preloaded_libs = preload_app_native_libs(apks.native_libs(), &app_lib_dir, &vm)?;
+    host.refresh()?;
 
     println!("# Driving the framework lifecycle (JNI; steps 1–7 to Activity.onResume / RESUMED)…");
+    let browser_place_id = launch.place_id();
     let android_deep_link = browser_place_id.map(|place_id| format!("roblox://placeId={place_id}"));
     let progress = eclipse::framework::drive_application_lifecycle(
         &vm,
@@ -857,6 +1198,7 @@ fn run_apk(
         plan.launcher_activity.as_str()
     };
     println!("framework lifecycle driven: {progress:?} (non-GTK Context/Window/View natives bound; launcher Activity = {activity_target}) ✓");
+    host.refresh()?;
 
     if std::env::var("ECLIPSE_WEB_LOGIN").is_ok_and(|value| value == "1") {
         println!("# Opening Roblox's official web login in Eclipse…");
@@ -865,9 +1207,9 @@ fn run_apk(
     }
 
     println!("# Opening the host window (winit; close it to exit)…");
-    eclipse::graphics::run_windowed(
+    host.run_game(
         &format!("Eclipse — {}", manifest.package),
-        Some(&vm),
+        &vm,
         config.touch_mode,
     )?;
     Ok(())
@@ -1277,11 +1619,25 @@ fn report_preloaded(lib: &eclipse::loader::engine::PreloadedLib) {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_android_process, installed_or_updated_set, normalize_browser_launch,
+        finish_android_process, installed_client_note, installed_or_updated_set,
+        launches_in_window, lock_client_in, native_lib_dir, normalize_browser_launch,
         parse_libroblox_init_lib_dir, parse_run_path, parse_update_source,
-        remove_other_native_lib_versions, remove_other_version_oats, url_handler_message,
-        UpdateSource,
+        remove_other_native_lib_versions, remove_other_version_oats, update_if_due,
+        url_handler_message, ClientRun, Launch, UpdateSource, NOT_INSTALLED,
     };
+    use eclipse::apk::store::{CheckOutcome, Release, Store, UpdateCheck};
+    use eclipse::apk::VersionCode;
+    use eclipse::runtime::NativeLibRoot;
+    use eclipse::status::StatusSink;
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-main-{tag}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        root
+    }
 
     const RAW_EXIT_CHILD: &str = "ECLIPSE_TEST_RAW_ANDROID_EXIT_CHILD";
 
@@ -1425,6 +1781,154 @@ mod tests {
     }
 
     #[test]
+    fn native_libs_in_a_chosen_directory_are_never_removed() {
+        let root = temp_root("native-lib-override");
+        for (dir, file) in [("2024", "notes.txt"), ("3055", "libroblox.so")] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join(file), b"kept").unwrap();
+        }
+
+        let dir = native_lib_dir(NativeLibRoot::Override(root.clone()), VersionCode(3056)).unwrap();
+        assert_eq!(dir, root.join("3056"));
+        assert!(root.join("2024/notes.txt").exists());
+        assert!(root.join("3055/libroblox.so").exists());
+
+        let dir = native_lib_dir(NativeLibRoot::Cache(root.clone()), VersionCode(3056)).unwrap();
+        assert_eq!(dir, root.join("3056"));
+        assert!(!root.join("2024").exists() && !root.join("3055").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_second_client_is_refused_while_the_first_one_runs() {
+        let root = temp_root("client-lock");
+        let first = ClientRun::start_in(&root, Launch::Installed).expect("the first client starts");
+        assert_eq!(first.log, root.join("logs").join("eclipse.log"));
+        eclipse::diagnostics::record_status(tracing::Level::INFO, "the first client runs");
+        let desktop = ClientRun::start_in(&root, Launch::Installed).err().unwrap();
+        assert!(desktop.contains("already running"), "{desktop}");
+        let browser = ClientRun::start_in(&root, Launch::BrowserPlace(1818))
+            .err()
+            .unwrap();
+        assert!(browser.contains("click Play again"), "{browser}");
+        let log = std::fs::read_to_string(&first.log).unwrap();
+        assert!(
+            log.contains("the first client runs"),
+            "a refused launch leaves the running client's log alone: {log}"
+        );
+        drop(first);
+        let concurrent_spawns_released_it = (0..100).find_map(|_| {
+            let lock = lock_client_in(&root.join(super::RUNTIME_DIR), Launch::File).ok();
+            if lock.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            lock
+        });
+        assert!(
+            concurrent_spawns_released_it.is_some(),
+            "a client starts once the first one exits"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn only_launches_with_a_launch_window_show_setup_failures_in_one() {
+        let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(launches_in_window(&args(&["run"])));
+        assert!(launches_in_window(&args(&["__run-browser-place", "1818"])));
+        assert!(!launches_in_window(&args(&["run", "/home/u/roblox"])));
+        assert!(!launches_in_window(&args(&["__webview-test"])));
+    }
+
+    #[test]
+    fn a_failed_check_is_not_retried_for_thirty_minutes() {
+        let root = temp_root("failed-check");
+        let store = Store::at(root.clone());
+        let rejected = Release {
+            version_code: VersionCode(3171),
+            base_sha1: [0x41; 20],
+        };
+        store
+            .record_check(&UpdateCheck {
+                at: std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 60 * 60),
+                rejected: Some(rejected),
+                outcome: CheckOutcome::Completed,
+            })
+            .unwrap();
+
+        let mut attempts = 0;
+        let failed = update_if_due(&store, Some(VersionCode(3170)), |previous| {
+            attempts += 1;
+            assert_eq!(previous, Some(rejected));
+            Err("APKCombo is unreachable".into())
+        })
+        .err()
+        .expect("the check fails");
+        assert_eq!(failed.to_string(), "APKCombo is unreachable");
+        let next_launch = update_if_due(&store, Some(VersionCode(3170)), |_| {
+            attempts += 1;
+            Ok(None)
+        });
+        assert!(matches!(next_launch, Ok(None)));
+        assert_eq!(
+            attempts, 1,
+            "the failed check is not repeated at the next launch"
+        );
+        let recorded = store.last_check().unwrap().unwrap();
+        assert_eq!(recorded.outcome, CheckOutcome::Failed);
+        assert_eq!(
+            recorded.rejected,
+            Some(rejected),
+            "a failed check keeps the release rejected before it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_rejection_recorded_by_a_failed_check_is_kept() {
+        let root = temp_root("rejected-check");
+        let store = Store::at(root.clone());
+        let rejected = Release {
+            version_code: VersionCode(3171),
+            base_sha1: [0x41; 20],
+        };
+        let recorded = UpdateCheck {
+            at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+            rejected: Some(rejected),
+            outcome: CheckOutcome::Completed,
+        };
+        let error = update_if_due(&store, Some(VersionCode(3170)), |_| {
+            store.record_check(&recorded)?;
+            Err("the download failed verification".into())
+        })
+        .err()
+        .expect("the update failed");
+        assert_eq!(error.to_string(), "the download failed verification");
+        assert_eq!(store.last_check().unwrap(), Some(recorded));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_url_handler_notes_a_missing_or_unreadable_install() {
+        let root = temp_root("handler-note");
+        let store = Store::at(root.clone());
+        assert_eq!(
+            installed_client_note(&store).as_deref(),
+            Some(NOT_INSTALLED)
+        );
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("current.json"), b"not json").unwrap();
+        let note = installed_client_note(&store).expect("a corrupt record is noted");
+        assert!(
+            note.contains("not a valid Eclipse install record"),
+            "{note}"
+        );
+        std::fs::write(root.join("current.json"), b"{\"version_code\": 3170}").unwrap();
+        assert_eq!(installed_client_note(&store), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn libroblox_init_takes_exactly_one_explicit_lib_dir() {
         let lib_dir = "harness-libs".to_string();
         assert!(parse_libroblox_init_lib_dir(&[]).is_err());
@@ -1469,7 +1973,7 @@ mod tests {
         let store = eclipse::apk::store::Store::at(root.clone());
 
         let mut updated = false;
-        let error = installed_or_updated_set(&store, |_| {
+        let error = installed_or_updated_set(&store, &StatusSink::terminal(), |_| {
             updated = true;
             Ok(None)
         })
@@ -1495,7 +1999,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         let store = eclipse::apk::store::Store::at(root.clone());
 
-        let error = installed_or_updated_set(&store, |current| {
+        let error = installed_or_updated_set(&store, &StatusSink::terminal(), |current| {
             assert!(current.is_none(), "nothing is installed yet");
             Err("cannot load APKCombo's Roblox download page: timed out".into())
         })
@@ -1508,7 +2012,7 @@ mod tests {
 
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("current.json"), b"{\"version_code\": 3056}").unwrap();
-        let error = installed_or_updated_set(&store, |current| {
+        let error = installed_or_updated_set(&store, &StatusSink::terminal(), |current| {
             assert!(current.is_none(), "the recorded install is missing");
             Err("APKCombo is unreachable".into())
         })
@@ -1541,9 +2045,9 @@ mod tests {
             .chain(paths.native_split)
             .collect();
 
-        let committed = installed_or_updated_set(&store, |current| {
+        let committed = installed_or_updated_set(&store, &StatusSink::terminal(), |current| {
             assert!(current.is_none(), "nothing is installed yet");
-            store.install(&sources)?;
+            store.install(&sources, &StatusSink::terminal())?;
             Err("recording the update check failed".into())
         })
         .expect("the update committed before failing is launched");
@@ -1551,7 +2055,7 @@ mod tests {
         assert_eq!(committed.version_code(), installed.version_code);
         drop(committed);
 
-        let kept = installed_or_updated_set(&store, |current| {
+        let kept = installed_or_updated_set(&store, &StatusSink::terminal(), |current| {
             assert_eq!(
                 current.map(eclipse::apk::ApkSet::version_code),
                 Some(installed.version_code)
@@ -1654,6 +2158,41 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn concurrent_launches_stage_complete_client_settings() {
+        const ROUNDS: usize = 1000;
+        let root = temp_root("settings-staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let contents = [
+            "{\"FFlagEclipseFirst\":true}",
+            "{\"FFlagEclipseSecond\":true}",
+        ];
+        std::thread::scope(|scope| {
+            let launches = contents.map(|json| {
+                let root = &root;
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        super::stage_client_settings(root, json.as_bytes())?;
+                        let staged =
+                            std::fs::read_to_string(root.join(super::CLIENT_SETTINGS_FILE))
+                                .map_err(|error| error.to_string())?;
+                        if !contents.contains(&staged.as_str()) {
+                            return Err(format!("a launch read incomplete settings {staged:?}"));
+                        }
+                    }
+                    Ok(())
+                })
+            });
+            for launch in launches {
+                launch
+                    .join()
+                    .unwrap()
+                    .expect("every launch stages its settings");
+            }
+        });
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

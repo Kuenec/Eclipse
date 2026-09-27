@@ -8,11 +8,13 @@ use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN};
 use ureq::http::header::USER_AGENT;
 use ureq::http::{Request, Response, Uri};
 
-use super::https::{self, DownloadError, Host};
+use super::https::{self, Download, DownloadError, Extent, Host, Resume};
 use super::store::{
-    InstalledVersion, Release, Staging, Store, StoreError, UpdateCheck, UpdateOutcome,
+    CheckOutcome, Committed, InstalledVersion, Release, Staging, Store, StoreError, UpdateCheck,
+    UpdateOutcome,
 };
 use super::{ApkSet, VersionCode, BASE_APK, MAX_APK_BYTES, ROBLOX_PACKAGE, TARGET_ABI};
+use crate::status::StatusSink;
 
 const PAGE_URL: &str = "https://apkcombo.com/roblox/com.roblox.client/download/apk";
 const DOWNLOAD_HOSTS: &[Host] = &[Host::Exact(
@@ -26,6 +28,7 @@ const MAX_PAGE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SIZE_DECIMALS: u32 = 3;
 const MEBIBYTE: u64 = 1024 * 1024;
 const HASH_BUFFER_BYTES: usize = 256 * 1024;
+const EXPIRED_LINK_STATUS: u16 = 403;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Packaging {
@@ -129,16 +132,40 @@ pub fn update(
     store: &Store,
     current: Option<&ApkSet>,
     rejected: Option<Release>,
+    status: &StatusSink,
 ) -> Result<UpdateOutcome, ApkComboError> {
-    update_with(offer, store, current, rejected, |offer| {
-        let download = https::open_download(
-            &https::download_agent(),
-            &offer.url.to_string(),
-            DOWNLOAD_HOSTS,
+    let agent = https::download_agent();
+    let mut link = offer.url.clone();
+    update_with(offer, store, current, rejected, status, |resume| {
+        open_renewing(
+            offer,
+            &mut link,
+            resume,
+            |url, resume| https::open_download(&agent, &url.to_string(), DOWNLOAD_HOSTS, resume),
+            newest_offer,
         )
-        .map_err(ApkComboError::Download)?;
-        Ok((download.body.into_reader(), download.content_length))
     })
+}
+
+fn open_renewing<R>(
+    offer: &Offer,
+    link: &mut Uri,
+    resume: Option<&Resume>,
+    mut open: impl FnMut(&Uri, Option<&Resume>) -> Result<Download<R>, DownloadError>,
+    renew: impl FnOnce() -> Result<Offer, ApkComboError>,
+) -> Result<Download<R>, ApkComboError> {
+    match open(link, resume) {
+        Err(DownloadError::Status(EXPIRED_LINK_STATUS)) if resume.is_some() => {}
+        opened => return opened.map_err(ApkComboError::Download),
+    }
+    let renewed = renew()?;
+    if renewed.url.path() != offer.url.path() {
+        return Err(ApkComboError::Superseded {
+            offered: offer.to_string(),
+        });
+    }
+    *link = renewed.url;
+    open(link, resume).map_err(ApkComboError::Download)
 }
 
 fn update_with<R: Read>(
@@ -146,10 +173,11 @@ fn update_with<R: Read>(
     store: &Store,
     current: Option<&ApkSet>,
     rejected: Option<Release>,
-    open: impl FnOnce(&Offer) -> Result<(R, Option<u64>), ApkComboError>,
+    status: &StatusSink,
+    open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkComboError>,
 ) -> Result<UpdateOutcome, ApkComboError> {
     let previous = current.map(InstalledVersion::from);
-    let staging = store.begin()?;
+    let staging = store.begin(status)?;
     let recorded = match store.current() {
         Ok(recorded) => recorded,
         Err(error) if error.is_unusable_install() => None,
@@ -167,7 +195,10 @@ fn update_with<R: Read>(
         Plan::UpToDate(installed) => Ok(match refreshed {
             Some(set) => UpdateOutcome::Updated {
                 previous,
-                set: Box::new(set),
+                committed: Box::new(Committed {
+                    set,
+                    leftover: None,
+                }),
             },
             None => UpdateOutcome::UpToDate { installed },
         }),
@@ -179,12 +210,11 @@ fn update_with<R: Read>(
             },
         )),
         Plan::Download => {
-            let installed = open(offer)
-                .and_then(|(body, content_length)| install(offer, staging, body, content_length));
-            match installed {
-                Ok(set) => Ok(UpdateOutcome::Updated {
+            status.step(format!("Downloading {offer}…"));
+            match install(offer, staging, open, status) {
+                Ok(committed) => Ok(UpdateOutcome::Updated {
                     previous,
-                    set: Box::new(set),
+                    committed: Box::new(committed),
                 }),
                 Err(error) if error.rejects_offer() => Err(remember_rejection(store, offer, error)),
                 Err(error) => Err(error),
@@ -197,6 +227,7 @@ fn remember_rejection(store: &Store, offer: &Offer, rejection: ApkComboError) ->
     let check = UpdateCheck {
         at: SystemTime::now(),
         rejected: Some(offer.release()),
+        outcome: CheckOutcome::Completed,
     };
     match store.record_check(&check) {
         Ok(()) => rejection,
@@ -239,18 +270,18 @@ fn plan(
     Ok(Plan::Download)
 }
 
-fn install(
+fn install<R: Read>(
     offer: &Offer,
     staging: Staging<'_>,
-    body: impl Read,
-    content_length: Option<u64>,
-) -> Result<ApkSet, ApkComboError> {
+    open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkComboError>,
+    status: &StatusSink,
+) -> Result<Committed, ApkComboError> {
     let base = staging.dir().join(BASE_APK);
     match offer.packaging {
-        Packaging::Apk => save_download(body, content_length, offer.size, &base)?,
+        Packaging::Apk => save_download(open, offer.size, &base, status)?,
         Packaging::Xapk => {
             let bundle = staging.dir().join(BUNDLE_FILE);
-            save_download(body, content_length, offer.size, &bundle)?;
+            save_download(open, offer.size, &bundle, status)?;
             staging.add_source(&bundle).map_err(store_failure)?;
             fs::remove_file(&bundle).map_err(|source| ApkComboError::Io {
                 path: bundle,
@@ -261,6 +292,7 @@ fn install(
     if file_sha1(&base)? != offer.base_sha1 {
         return Err(ApkComboError::BaseHashMismatch);
     }
+    status.step("Checking Roblox's signature and installing it…");
     staging
         .commit(Some(offer.version_code))
         .map_err(store_failure)
@@ -270,9 +302,9 @@ fn store_failure(error: StoreError) -> ApkComboError {
     match error {
         StoreError::NoDataDir
         | StoreError::Io { .. }
+        | StoreError::Replace { .. }
         | StoreError::Corrupt { .. }
-        | StoreError::MissingInstall { .. }
-        | StoreError::Prune { .. } => ApkComboError::Store(error),
+        | StoreError::MissingInstall { .. } => ApkComboError::Store(error),
         StoreError::Set(_)
         | StoreError::Apk { .. }
         | StoreError::UnneededSplit { .. }
@@ -482,23 +514,29 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-fn save_download(
-    body: impl Read,
-    content_length: Option<u64>,
+fn save_download<R: Read>(
+    mut open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkComboError>,
     advertised: AdvertisedSize,
     dest: &Path,
+    status: &StatusSink,
 ) -> Result<(), ApkComboError> {
-    if let Some(actual) = content_length.filter(|&length| !advertised.admits(length)) {
-        return Err(ApkComboError::SizeMismatch { advertised, actual });
-    }
     let actual = https::save_download(
-        body,
-        content_length,
+        |resume| {
+            let download = open(resume)?;
+            match download.extent {
+                Extent::Whole {
+                    length: Some(actual),
+                } if !advertised.admits(actual) => {
+                    Err(ApkComboError::SizeMismatch { advertised, actual })
+                }
+                _ => Ok(download),
+            }
+        },
         advertised.download_limit(),
         dest,
+        status,
         |_| {},
-    )
-    .map_err(ApkComboError::Download)?;
+    )?;
     if !advertised.admits(actual) {
         return Err(ApkComboError::SizeMismatch { advertised, actual });
     }
@@ -549,6 +587,10 @@ pub enum ApkComboError {
     UnexpectedLink,
 
     Download(DownloadError),
+
+    Superseded {
+        offered: String,
+    },
 
     SizeMismatch {
         advertised: AdvertisedSize,
@@ -636,6 +678,11 @@ impl fmt::Display for ApkComboError {
             Self::Download(error) => {
                 write!(f, "the Roblox download from APKCombo failed: {error}")
             }
+            Self::Superseded { offered } => write!(
+                f,
+                "APKCombo's download link for {offered} expired during the download and \
+                 APKCombo now offers a different file; the next update check downloads it"
+            ),
             Self::SizeMismatch { advertised, actual } => write!(
                 f,
                 "the Roblox download from APKCombo has {actual} bytes but the page advertised \
@@ -687,6 +734,7 @@ impl std::error::Error for ApkComboError {
             | Self::NoX86_64 { .. }
             | Self::Inconsistent { .. }
             | Self::UnexpectedLink
+            | Self::Superseded { .. }
             | Self::SizeMismatch { .. }
             | Self::BaseHashMismatch
             | Self::Older { .. }
@@ -698,6 +746,12 @@ impl std::error::Error for ApkComboError {
 impl From<StoreError> for ApkComboError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+impl From<DownloadError> for ApkComboError {
+    fn from(error: DownloadError) -> Self {
+        Self::Download(error)
     }
 }
 
@@ -1001,7 +1055,10 @@ mod tests {
 
     impl Read for FailingBody {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: RecvBody"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout: receive body",
+            ))
         }
     }
 
@@ -1010,27 +1067,57 @@ mod tests {
         tolerance: 10,
     };
 
+    fn whole<R: Read>(body: R, length: Option<u64>) -> Download<R> {
+        Download {
+            body,
+            extent: Extent::Whole { length },
+            validator: None,
+        }
+    }
+
+    fn served<R: Read>(
+        body: R,
+        length: Option<u64>,
+    ) -> impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkComboError> {
+        let mut body = Some(body);
+        move |resume| {
+            assert_eq!(resume, None, "an uninterrupted download is not continued");
+            Ok(whole(
+                body.take().expect("the download is opened once"),
+                length,
+            ))
+        }
+    }
+
+    fn save<R: Read>(
+        open: impl FnMut(Option<&Resume>) -> Result<Download<R>, ApkComboError>,
+        advertised: AdvertisedSize,
+        dest: &Path,
+    ) -> Result<(), ApkComboError> {
+        save_download(open, advertised, dest, &StatusSink::terminal())
+    }
+
     #[test]
     fn downloads_are_kept_only_within_the_advertised_size() {
         let dir = temp_dir("save");
         let dest = dir.join("download");
         let body = [7u8; 100];
 
-        save_download(&body[..], Some(100), SMALL, &dest).unwrap();
+        save(served(&body[..], Some(100)), SMALL, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
-        save_download(&body[..95], None, SMALL, &dest).unwrap();
+        save(served(&body[..95], None), SMALL, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), &body[..95]);
 
         for (length, actual) in [(Some(111), 111), (Some(89), 89), (None, 80)] {
             let err =
-                save_download(&[0u8; 111][..actual as usize], length, SMALL, &dest).unwrap_err();
+                save(served(&[0u8; 111][..actual as usize], length), SMALL, &dest).unwrap_err();
             assert!(
                 matches!(err, ApkComboError::SizeMismatch { actual: got, .. } if got == actual),
                 "{length:?}: {err:?}"
             );
             assert!(err.rejects_offer(), "{err:?}");
         }
-        let err = save_download(&[0u8; 111][..], None, SMALL, &dest).unwrap_err();
+        let err = save(served(&[0u8; 111][..], None), SMALL, &dest).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1040,7 +1127,7 @@ mod tests {
         );
         assert!(err.rejects_offer(), "{err:?}");
         let huge = AdvertisedSize::parse("5 GB").unwrap();
-        let err = save_download(&body[..], Some(huge.bytes), huge, &dest).unwrap_err();
+        let err = save(served(&body[..], Some(huge.bytes)), huge, &dest).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1051,7 +1138,7 @@ mod tests {
             "{err:?}"
         );
 
-        let err = save_download(&body[..95], Some(100), SMALL, &dest).unwrap_err();
+        let err = save(served(&body[..95], Some(100)), SMALL, &dest).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1060,13 +1147,134 @@ mod tests {
             "{err:?}"
         );
         assert!(!err.rejects_offer(), "{err:?}");
-        let err = save_download(FailingBody, None, SMALL, &dest).unwrap_err();
+        let err = save(served(FailingBody, None), SMALL, &dest).unwrap_err();
         assert!(
             matches!(err, ApkComboError::Download(DownloadError::Interrupted(_))),
             "{err:?}"
         );
         assert!(!err.rejects_offer(), "{err:?}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dropped_download_continues_from_where_it_stopped() {
+        let dir = temp_dir("resume");
+        let dest = dir.join("download");
+        let body: Vec<u8> = (0..100u8).collect();
+        let mut offsets = Vec::new();
+        save(
+            |resume: Option<&Resume>| {
+                offsets.push(resume.map(|resume| resume.offset));
+                Ok(match resume {
+                    None => whole(
+                        Box::new((&body[..60]).chain(FailingBody)) as Box<dyn Read>,
+                        Some(100),
+                    ),
+                    Some(resume) => Download {
+                        body: Box::new(&body[resume.offset as usize..]) as Box<dyn Read>,
+                        extent: Extent::Partial(https::ContentRange {
+                            start: resume.offset,
+                            total: Some(100),
+                        }),
+                        validator: None,
+                    },
+                })
+            },
+            SMALL,
+            &dest,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        assert_eq!(offsets, [None, Some(60)]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_expired_link_is_renewed_only_to_continue_the_same_file() {
+        let offer = small_offer();
+        let renewed_url = |path: &str| {
+            Uri::try_from(format!("https://{R2_HOST}{path}?X-Amz-Signature=renewed")).unwrap()
+        };
+        let resume = Resume {
+            offset: 60,
+            validator: Some("\"v1\"".to_owned()),
+        };
+        let answer = |url: &Uri| -> Result<Download<&'static [u8]>, DownloadError> {
+            if url == &offer.url {
+                return Err(DownloadError::Status(EXPIRED_LINK_STATUS));
+            }
+            Ok(Download {
+                body: &[],
+                extent: Extent::Partial(https::ContentRange {
+                    start: 60,
+                    total: Some(100),
+                }),
+                validator: None,
+            })
+        };
+
+        let mut link = offer.url.clone();
+        let mut opened = Vec::new();
+        let download = open_renewing(
+            &offer,
+            &mut link,
+            Some(&resume),
+            |url, resume| {
+                opened.push((url.clone(), resume.cloned()));
+                answer(url)
+            },
+            || {
+                Ok(Offer {
+                    url: renewed_url(offer.url.path()),
+                    ..small_offer()
+                })
+            },
+        )
+        .expect("the download continues from the renewed link");
+        assert!(matches!(download.extent, Extent::Partial(_)));
+        assert_eq!(link, renewed_url(offer.url.path()));
+        assert_eq!(
+            opened,
+            [
+                (offer.url.clone(), Some(resume.clone())),
+                (link.clone(), Some(resume.clone()))
+            ]
+        );
+
+        let mut link = offer.url.clone();
+        let err = open_renewing(
+            &offer,
+            &mut link,
+            Some(&resume),
+            |url, _| answer(url),
+            || {
+                Ok(Offer {
+                    url: renewed_url("/com.roblox.client/2.741.1/3171.aa.apks"),
+                    ..small_offer()
+                })
+            },
+        )
+        .err()
+        .expect("a different file is not appended");
+        assert!(matches!(err, ApkComboError::Superseded { .. }), "{err:?}");
+        assert_eq!(link, offer.url);
+
+        let err = open_renewing(
+            &offer,
+            &mut link,
+            None,
+            |url, _| answer(url),
+            || panic!("a refused first request is not renewed"),
+        )
+        .err()
+        .expect("the first request fails");
+        assert!(
+            matches!(
+                err,
+                ApkComboError::Download(DownloadError::Status(EXPIRED_LINK_STATUS))
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1164,9 +1372,14 @@ mod tests {
         let store = Store::at(dir.join("store"));
         let offer = small_offer();
 
-        let err = update_with(&offer, &store, None, None, |_| {
-            Ok((&[0u8; 150][..], Some(150)))
-        })
+        let err = update_with(
+            &offer,
+            &store,
+            None,
+            None,
+            &StatusSink::terminal(),
+            served(&[0u8; 150][..], Some(150)),
+        )
         .err()
         .expect("a download of another size is rejected");
         assert!(
@@ -1180,10 +1393,17 @@ mod tests {
         assert_eq!(check.rejected, Some(offer.release()));
 
         let mut opened = false;
-        let err = update_with(&offer, &store, None, check.rejected, |_| {
-            opened = true;
-            Ok((&[][..], None))
-        })
+        let err = update_with(
+            &offer,
+            &store,
+            None,
+            check.rejected,
+            &StatusSink::terminal(),
+            |_| {
+                opened = true;
+                Ok(whole(&[][..], None))
+            },
+        )
         .err()
         .expect("the rejected release is not installed");
         assert!(!opened, "the rejected release is not downloaded again");
@@ -1200,10 +1420,17 @@ mod tests {
         newer.version_code = VersionCode(3171);
         for (offer, rejected) in [(&newer, check.rejected), (&offer, None)] {
             let mut opened = false;
-            let err = update_with(offer, &store, None, rejected, |_| {
-                opened = true;
-                Ok((&[0u8; 150][..], Some(150)))
-            })
+            let err = update_with(
+                offer,
+                &store,
+                None,
+                rejected,
+                &StatusSink::terminal(),
+                |_| {
+                    opened = true;
+                    Ok(whole(&[0u8; 150][..], Some(150)))
+                },
+            )
             .err()
             .expect("the download is rejected");
             assert!(
@@ -1221,9 +1448,14 @@ mod tests {
         fs::create_dir_all(root.join("last-update-check.json").join("taken")).unwrap();
         let store = Store::at(root);
 
-        let err = update_with(&small_offer(), &store, None, None, |_| {
-            Ok((&[0u8; 150][..], Some(150)))
-        })
+        let err = update_with(
+            &small_offer(),
+            &store,
+            None,
+            None,
+            &StatusSink::terminal(),
+            served(&[0u8; 150][..], Some(150)),
+        )
         .err()
         .expect("a download of another size is rejected");
         let ApkComboError::NotRemembered { rejection, source } = &err else {
@@ -1233,7 +1465,7 @@ mod tests {
             matches!(**rejection, ApkComboError::SizeMismatch { actual: 150, .. }),
             "{err:?}"
         );
-        assert!(matches!(source, StoreError::Io { .. }), "{err:?}");
+        assert!(matches!(source, StoreError::Replace { .. }), "{err:?}");
         let text = err.to_string();
         assert!(
             text.contains("has 150 bytes") && text.contains("could not record the rejection"),
@@ -1248,16 +1480,28 @@ mod tests {
         let store = Store::at(dir.join("store"));
         let offer = small_offer();
 
-        let err = update_with(&offer, &store, None, None, |_| Ok((FailingBody, None)))
-            .err()
-            .expect("an interrupted download fails");
+        let err = update_with(
+            &offer,
+            &store,
+            None,
+            None,
+            &StatusSink::terminal(),
+            served(FailingBody, None),
+        )
+        .err()
+        .expect("an interrupted download fails");
         assert!(
             matches!(err, ApkComboError::Download(DownloadError::Interrupted(_))),
             "{err:?}"
         );
-        let err = update_with(&offer, &store, None, None, |_| {
-            Ok((&[0u8; 95][..], Some(100)))
-        })
+        let err = update_with(
+            &offer,
+            &store,
+            None,
+            None,
+            &StatusSink::terminal(),
+            served(&[0u8; 95][..], Some(100)),
+        )
         .err()
         .expect("a short download fails");
         assert!(
@@ -1267,9 +1511,16 @@ mod tests {
             ),
             "{err:?}"
         );
-        let err = update_with(&offer, &store, None, None, |_| -> Result<(&[u8], _), _> {
-            Err(ApkComboError::Download(DownloadError::Status(403)))
-        })
+        let err = update_with(
+            &offer,
+            &store,
+            None,
+            None,
+            &StatusSink::terminal(),
+            |_| -> Result<Download<&[u8]>, _> {
+                Err(ApkComboError::Download(DownloadError::Status(403)))
+            },
+        )
         .err()
         .expect("a refused download fails");
         assert!(
@@ -1286,14 +1537,14 @@ mod tests {
 
     #[test]
     fn store_failures_after_verification_are_not_called_discarded() {
-        let prune = store_failure(StoreError::Prune {
-            installed: installed(3170),
-            path: PathBuf::from("/store/3056"),
+        let replace = store_failure(StoreError::Replace {
+            temp: PathBuf::from("/store/current.json.1.tmp"),
+            path: PathBuf::from("/store/current.json"),
             source: io::Error::other("busy"),
         });
-        assert!(matches!(prune, ApkComboError::Store(_)), "{prune:?}");
-        assert!(!prune.to_string().contains("discarded"), "{prune}");
-        assert!(!prune.rejects_offer());
+        assert!(matches!(replace, ApkComboError::Store(_)), "{replace:?}");
+        assert!(!replace.to_string().contains("discarded"), "{replace}");
+        assert!(!replace.rejects_offer());
 
         let rejected = store_failure(StoreError::UnexpectedVersion {
             expected: VersionCode(3170),
@@ -1348,12 +1599,14 @@ mod tests {
         download: &Path,
     ) -> Result<ApkSet, ApkComboError> {
         let length = fs::metadata(download).unwrap().len();
+        let status = StatusSink::terminal();
         install(
             offer,
-            store.begin().unwrap(),
-            File::open(download).unwrap(),
-            Some(length),
+            store.begin(&status).unwrap(),
+            served(File::open(download).unwrap(), Some(length)),
+            &status,
         )
+        .map(|committed| committed.set)
     }
 
     fn store_entries(root: &Path) -> Vec<String> {
@@ -1463,7 +1716,10 @@ mod tests {
             store.current().unwrap(),
             Some(InstalledVersion::from(&official))
         );
-        assert_eq!(store_entries(&version_dir), [BASE_APK, NATIVE_SPLIT_APK]);
+        assert_eq!(
+            store_entries(&version_dir),
+            [BASE_APK, NATIVE_SPLIT_APK, "verified.json"]
+        );
         assert_eq!(
             plan(
                 &offer,
@@ -1480,7 +1736,8 @@ mod tests {
             &store,
             Some(&set),
             None,
-            |_| -> Result<(&[u8], _), _> {
+            &StatusSink::terminal(),
+            |_| -> Result<Download<&[u8]>, _> {
                 panic!("an up-to-date install is not downloaded again")
             },
         )
@@ -1490,17 +1747,25 @@ mod tests {
         );
         drop(set);
 
-        let outcome = update_with(&offer, &store, None, None, |_| -> Result<(&[u8], _), _> {
-            panic!("a release another launch installed meanwhile is not downloaded again")
-        })
+        let outcome = update_with(
+            &offer,
+            &store,
+            None,
+            None,
+            &StatusSink::terminal(),
+            |_| -> Result<Download<&[u8]>, _> {
+                panic!("a release another launch installed meanwhile is not downloaded again")
+            },
+        )
         .expect("the release another launch installed is used");
         let UpdateOutcome::Updated {
             previous: None,
-            set,
+            committed,
         } = outcome
         else {
             panic!("the release installed meanwhile is handed back as the update");
         };
+        let set = committed.set;
         assert_eq!(set.version_code(), offer.version_code);
         assert_eq!(set.base_path(), version_dir.join(BASE_APK));
         drop(set);

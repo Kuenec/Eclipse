@@ -7,5 +7,5 @@ Exec=eclipse __handle-roblox-player-url %u
 Icon=io.github.kuenec.Eclipse
 Terminal=false
 NoDisplay=true
-StartupNotify=false
+StartupNotify=true
 MimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;

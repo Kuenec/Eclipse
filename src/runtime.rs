@@ -532,32 +532,56 @@ pub fn dalvik_cache_stem(location: &Path) -> Option<OsString> {
     Some(OsString::from_vec(stem))
 }
 
-pub fn native_lib_cache_dir() -> Result<PathBuf, RuntimeError> {
-    if let Some(dir) = env_path("ECLIPSE_NATIVE_LIB_DIR") {
-        return Ok(dir);
-    }
-    let dirs = ProjectDirs::from("", "", "eclipse").ok_or(RuntimeError::NoCacheDir)?;
-    Ok(dirs.cache_dir().join("native-libs"))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeLibRoot {
+    Cache(PathBuf),
+
+    Override(PathBuf),
 }
 
-fn class_path_option(fw: &FrameworkPaths, apk: &Path) -> String {
-    format!(
-        "-Djava.class.path={}:{}:{}",
-        fw.api_impl_jar.display(),
-        apk.display(),
-        fw.framework_res_apk.display()
+pub fn native_lib_root() -> Result<NativeLibRoot, RuntimeError> {
+    if let Some(dir) = env_path("ECLIPSE_NATIVE_LIB_DIR") {
+        return Ok(NativeLibRoot::Override(dir));
+    }
+    let dirs = ProjectDirs::from("", "", "eclipse").ok_or(RuntimeError::NoCacheDir)?;
+    Ok(NativeLibRoot::Cache(dirs.cache_dir().join("native-libs")))
+}
+
+fn search_path(entries: &[&Path]) -> Result<OsString, RuntimeError> {
+    let mut joined = OsString::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry
+            .as_os_str()
+            .as_bytes()
+            .contains(&SEARCH_PATH_SEPARATOR)
+        {
+            return Err(RuntimeError::SearchPathEntryHasSeparator(
+                entry.to_path_buf(),
+            ));
+        }
+        if index > 0 {
+            joined.push(BIONIC_LDPATH_DELIM);
+        }
+        joined.push(entry);
+    }
+    Ok(joined)
+}
+
+fn class_path_option(fw: &FrameworkPaths, apk: &Path) -> Result<CString, RuntimeError> {
+    make_os_option(
+        "-Djava.class.path=",
+        &search_path(&[&fw.api_impl_jar, apk, &fw.framework_res_apk])?,
     )
 }
 
-fn library_path_option(fw: &FrameworkPaths, app_lib_dir: Option<&Path>) -> String {
-    match app_lib_dir {
-        Some(dir) => format!(
-            "-Djava.library.path={}:{}",
-            fw.natives_dir.display(),
-            dir.display()
-        ),
-        None => format!("-Djava.library.path={}", fw.natives_dir.display()),
-    }
+fn library_path_option(
+    fw: &FrameworkPaths,
+    app_lib_dir: Option<&Path>,
+) -> Result<CString, RuntimeError> {
+    make_os_option(
+        "-Djava.library.path=",
+        &library_search_path(fw, app_lib_dir)?,
+    )
 }
 
 type JniCreateJavaVm = unsafe extern "system" fn(
@@ -570,14 +594,15 @@ type DlParseLibraryPath = unsafe extern "C" fn(*const c_char, *const c_char);
 
 const BIONIC_LDPATH_DELIM: &str = ":";
 
-fn bionic_library_path(fw: &FrameworkPaths, app_lib_dir: Option<&Path>) -> String {
+const SEARCH_PATH_SEPARATOR: u8 = b':';
+
+fn library_search_path(
+    fw: &FrameworkPaths,
+    app_lib_dir: Option<&Path>,
+) -> Result<OsString, RuntimeError> {
     match app_lib_dir {
-        Some(dir) => format!(
-            "{}{BIONIC_LDPATH_DELIM}{}",
-            fw.natives_dir.display(),
-            dir.display()
-        ),
-        None => fw.natives_dir.display().to_string(),
+        Some(dir) => search_path(&[&fw.natives_dir, dir]),
+        None => search_path(&[&fw.natives_dir]),
     }
 }
 
@@ -585,9 +610,7 @@ pub fn whitelist_bionic_library_path(
     fw: &FrameworkPaths,
     app_lib_dir: Option<&Path>,
 ) -> Result<(), RuntimeError> {
-    let path = bionic_library_path(fw, app_lib_dir);
-
-    let path_c = make_cstring(path)?;
+    let path_c = make_os_option("", &library_search_path(fw, app_lib_dir)?)?;
     let delim_c = make_cstring(BIONIC_LDPATH_DELIM.to_owned())?;
 
     let global = unsafe { libloading::os::unix::Library::open(None::<&Path>, LIBART_DLOPEN_FLAGS) }
@@ -775,8 +798,8 @@ pub fn boot(
 
     if let Some(apk) = apk_path {
         let fw = find_framework_in(layout)?;
-        option_strings.push(make_cstring(class_path_option(&fw, apk))?);
-        option_strings.push(make_cstring(library_path_option(&fw, app_lib_dir))?);
+        option_strings.push(class_path_option(&fw, apk)?);
+        option_strings.push(library_path_option(&fw, app_lib_dir)?);
     }
     let mut options: Vec<jni_sys::JavaVMOption> = option_strings
         .iter()
@@ -898,6 +921,8 @@ pub enum RuntimeError {
 
     OptionHasNul,
 
+    SearchPathEntryHasSeparator(PathBuf),
+
     CreateVm(jni_sys::jint),
 
     NullEnv,
@@ -995,6 +1020,14 @@ impl fmt::Display for RuntimeError {
                 write!(f, "failed to provision bionic soname {}: {e}", p.display())
             }
             Self::OptionHasNul => f.write_str("an ART VM option contained an interior NUL byte"),
+            Self::SearchPathEntryHasSeparator(path) => write!(
+                f,
+                "{} contains ':', which ART and the Android linker read as a search-path \
+                 separator; use a directory without ':' (Eclipse's own files follow \
+                 XDG_DATA_HOME, XDG_CACHE_HOME, ECLIPSE_NATIVE_LIB_DIR and \
+                 ECLIPSE_ANDROID_FRAMEWORK_DIR)",
+                path.display()
+            ),
             Self::CreateVm(rc) => write!(f, "JNI_CreateJavaVM failed (status {rc})"),
             Self::NullEnv => f.write_str("JNI_CreateJavaVM returned a null JNIEnv"),
         }
@@ -1544,10 +1577,53 @@ mod tests {
             framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
             natives_dir: PathBuf::from("/fw/natives"),
         };
-        let opt = class_path_option(&fw, Path::new("/apps/roblox.apk"));
+        let opt = class_path_option(&fw, Path::new("/apps/roblox.apk")).unwrap();
         assert_eq!(
-            opt,
+            opt.to_str().unwrap(),
             "-Djava.class.path=/fw/api-impl.jar:/apps/roblox.apk:/fw/framework-res.apk"
+        );
+    }
+
+    #[test]
+    fn search_path_entries_that_contain_the_separator_are_refused() {
+        let fw = FrameworkPaths {
+            api_impl_jar: PathBuf::from("/fw/api-impl.jar"),
+            framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
+            natives_dir: PathBuf::from("/fw/natives"),
+        };
+        let apk = Path::new("/media/u/Roblox:backup/base.apk");
+        let err = class_path_option(&fw, apk).unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::SearchPathEntryHasSeparator(path) if path == apk),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Roblox:backup"), "{err}");
+
+        let app_lib_dir = Path::new("/cache/a:b");
+        for err in [
+            library_path_option(&fw, Some(app_lib_dir)).unwrap_err(),
+            library_search_path(&fw, Some(app_lib_dir)).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, RuntimeError::SearchPathEntryHasSeparator(path) if path == app_lib_dir),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_paths_keep_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = Path::new(OsStr::from_bytes(b"/cache/\xff/native-libs"));
+        let fw = FrameworkPaths {
+            api_impl_jar: PathBuf::from("/fw/api-impl.jar"),
+            framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
+            natives_dir: PathBuf::from("/fw/natives"),
+        };
+        assert_eq!(
+            library_search_path(&fw, Some(dir)).unwrap().as_bytes(),
+            b"/fw/natives:/cache/\xff/native-libs"
         );
     }
 
@@ -1560,7 +1636,7 @@ mod tests {
         };
 
         assert_eq!(
-            library_path_option(&fw, None),
+            library_path_option(&fw, None).unwrap().to_str().unwrap(),
             "-Djava.library.path=/fw/natives"
         );
     }
@@ -1572,7 +1648,8 @@ mod tests {
             framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
             natives_dir: PathBuf::from("/fw/natives"),
         };
-        let opt = library_path_option(&fw, Some(Path::new("/cache/eclipse/native-libs")));
+        let opt = library_path_option(&fw, Some(Path::new("/cache/eclipse/native-libs"))).unwrap();
+        let opt = opt.to_str().unwrap();
         assert_eq!(
             opt,
             "-Djava.library.path=/fw/natives:/cache/eclipse/native-libs"
@@ -1590,17 +1667,22 @@ mod tests {
             framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
             natives_dir: PathBuf::from("/fw/natives"),
         };
-        let path = bionic_library_path(&fw, Some(Path::new("/cache/eclipse/native-libs")));
+        let path = library_search_path(&fw, Some(Path::new("/cache/eclipse/native-libs"))).unwrap();
+        let path = path.to_str().unwrap();
         assert_eq!(path, "/fw/natives:/cache/eclipse/native-libs");
 
         assert_eq!(BIONIC_LDPATH_DELIM, ":");
         let parts: Vec<&str> = path.split(BIONIC_LDPATH_DELIM).collect();
         assert_eq!(parts, vec!["/fw/natives", "/cache/eclipse/native-libs"]);
 
-        let lib_opt = library_path_option(&fw, Some(Path::new("/cache/eclipse/native-libs")));
+        let lib_opt =
+            library_path_option(&fw, Some(Path::new("/cache/eclipse/native-libs"))).unwrap();
         assert_eq!(
-            lib_opt.strip_prefix("-Djava.library.path="),
-            Some(path.as_str())
+            lib_opt
+                .to_str()
+                .unwrap()
+                .strip_prefix("-Djava.library.path="),
+            Some(path)
         );
     }
 
@@ -1611,7 +1693,7 @@ mod tests {
             framework_res_apk: PathBuf::from("/fw/framework-res.apk"),
             natives_dir: PathBuf::from("/fw/natives"),
         };
-        assert_eq!(bionic_library_path(&fw, None), "/fw/natives");
+        assert_eq!(library_search_path(&fw, None).unwrap(), "/fw/natives");
     }
 
     #[test]

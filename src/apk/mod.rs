@@ -46,6 +46,10 @@ const NATIVE_SPLIT_NAME: &str = "config.x86_64";
 
 const MAX_APK_BYTES: u64 = 1024 * 1024 * 1024;
 
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+const BUNDLE_EXTENSIONS: [&str; 3] = ["apks", "xapk", "apkm"];
+
 const READ_ENTRY_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
 
 const EXTRACTED_ENTRY_HASH_BUFFER_SIZE: usize = 64 * 1024;
@@ -155,7 +159,7 @@ fn extraction_digest(
     let mut digest = Sha256::new();
     digest.update(source_path.as_os_str().as_bytes());
     digest.update([0]);
-    hash_file_identity(&mut digest, source);
+    FileIdentity::of(source).hash_into(&mut digest);
     for entry in planned {
         let extracted = match std::fs::metadata(&entry.dest) {
             Ok(extracted) => extracted,
@@ -169,17 +173,43 @@ fn extraction_digest(
         digest.update([0]);
         digest.update(entry.size.to_le_bytes());
         digest.update(entry.crc32.to_le_bytes());
-        hash_file_identity(&mut digest, &extracted);
+        FileIdentity::of(&extracted).hash_into(&mut digest);
     }
     Ok(Some(digest.finalize().to_vec()))
 }
 
-fn hash_file_identity(digest: &mut Sha256, metadata: &Metadata) {
-    digest.update(metadata.dev().to_le_bytes());
-    digest.update(metadata.ino().to_le_bytes());
-    digest.update(metadata.size().to_le_bytes());
-    digest.update(metadata.mtime().to_le_bytes());
-    digest.update(metadata.mtime_nsec().to_le_bytes());
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+
+    fn hash_into(&self, digest: &mut Sha256) {
+        for field in [self.dev, self.ino, self.size] {
+            digest.update(field.to_le_bytes());
+        }
+        for field in [self.mtime, self.mtime_nsec, self.ctime, self.ctime_nsec] {
+            digest.update(field.to_le_bytes());
+        }
+    }
 }
 
 fn read_stamp(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -259,7 +289,11 @@ pub struct X8664Engine {
 
 impl Apk {
     pub fn open(path: &Path) -> Result<Self, ApkError> {
-        let file = Arc::new(File::open(path)?);
+        Self::from_file(path, File::open(path)?)
+    }
+
+    fn from_file(path: &Path, file: File) -> Result<Self, ApkError> {
+        let file = Arc::new(file);
         let archive = ZipArchive::new(ApkFileReader::new(Arc::clone(&file)))?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -269,7 +303,7 @@ impl Apk {
     }
 
     pub fn manifest(&mut self) -> Result<Manifest, ApkError> {
-        let bytes = self.read_entry(MANIFEST_ENTRY)?;
+        let bytes = self.manifest_bytes()?;
         let parsed = axml::read_manifest(&bytes)?;
         Ok(Manifest {
             package: parsed.package,
@@ -281,7 +315,7 @@ impl Apk {
     }
 
     pub fn package_info(&mut self) -> Result<PackageInfo, ApkError> {
-        let bytes = self.read_entry(MANIFEST_ENTRY)?;
+        let bytes = self.manifest_bytes()?;
         let parsed = axml::read_manifest(&bytes)?;
         Ok(PackageInfo {
             package: parsed.package,
@@ -328,11 +362,7 @@ impl Apk {
         &self.file
     }
 
-    pub fn extract_native_libs(
-        &mut self,
-        abi: &str,
-        dest_dir: &Path,
-    ) -> Result<Vec<PathBuf>, ApkError> {
+    pub fn extract_native_libs(&mut self, abi: &str, dest_dir: &Path) -> Result<usize, ApkError> {
         let prefix = format!("lib/{abi}/");
 
         let names: Vec<String> = self
@@ -354,8 +384,7 @@ impl Apk {
                 crc32,
             });
         }
-        self.extract_planned(dest_dir, &planned)?;
-        Ok(planned.into_iter().map(|entry| entry.dest).collect())
+        self.extract_planned(dest_dir, &planned)
     }
 
     pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError> {
@@ -478,6 +507,26 @@ impl Apk {
         Ok(written)
     }
 
+    fn manifest_bytes(&mut self) -> Result<Vec<u8>, ApkError> {
+        let entry = match self.archive.by_name(MANIFEST_ENTRY) {
+            Ok(entry) => entry,
+            Err(zip::result::ZipError::FileNotFound) => {
+                return Err(ApkError::EntryMissing(MANIFEST_ENTRY.to_owned()));
+            }
+            Err(error) => return Err(ApkError::Zip(error)),
+        };
+        let declared = entry.size();
+        if declared > MAX_MANIFEST_BYTES {
+            return Err(ApkError::ManifestTooLarge(declared));
+        }
+        let mut bytes = Vec::with_capacity(declared as usize);
+        entry.take(declared + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > declared {
+            return Err(ApkError::ManifestLongerThanDeclared(declared));
+        }
+        Ok(bytes)
+    }
+
     pub fn read_entry(&mut self, name: &str) -> Result<Vec<u8>, ApkError> {
         let mut entry = match self.archive.by_name(name) {
             Ok(e) => e,
@@ -545,6 +594,9 @@ impl ApkSetPaths {
             source,
         })?;
         if !metadata.is_dir() {
+            if is_bundle(path) {
+                return Err(ApkSetError::Bundle(path.to_path_buf()));
+            }
             return Ok(Self {
                 base: path.to_path_buf(),
                 native_split: None,
@@ -571,6 +623,29 @@ impl ApkSetPaths {
     }
 }
 
+fn is_bundle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            BUNDLE_EXTENSIONS
+                .iter()
+                .any(|bundle| extension.eq_ignore_ascii_case(bundle))
+        })
+}
+
+fn shell_word(path: &Path) -> String {
+    const PLAIN: &[u8] = b"/._-+,:@%=";
+    let text = path.to_string_lossy();
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || PLAIN.contains(&byte));
+    if plain {
+        return text.into_owned();
+    }
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 fn regular_file_exists(path: &Path) -> Result<bool, ApkSetError> {
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file()),
@@ -592,24 +667,96 @@ pub struct ApkSet {
     signing_certificate_history: SigningCertificateHistory,
 }
 
-impl ApkSet {
-    pub fn open(paths: ApkSetPaths) -> Result<Self, ApkSetError> {
-        let signing_certificate_history = signature::verify_roblox_signing_history(&paths.base)
-            .map_err(|source| ApkSetError::Signature {
-                path: paths.base.clone(),
-                source,
-            })?;
-        if let Some(split) = &paths.native_split {
-            verify_signature(split)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SetIdentity {
+    base: FileIdentity,
+    native_split: Option<FileIdentity>,
+}
+
+struct ApkSetFiles {
+    base: Member,
+    native_split: Option<Member>,
+}
+
+struct Member {
+    path: PathBuf,
+    file: File,
+}
+
+impl Member {
+    fn open(path: PathBuf) -> Result<Self, ApkSetError> {
+        match File::open(&path) {
+            Ok(file) => Ok(Self { path, file }),
+            Err(source) => Err(ApkSetError::Open {
+                path,
+                source: ApkError::Io(source),
+            }),
         }
-        Self::open_verified(paths, signing_certificate_history)
     }
 
-    fn open_verified(
-        paths: ApkSetPaths,
+    fn identity(&self) -> Result<FileIdentity, ApkSetError> {
+        self.file
+            .metadata()
+            .map(|metadata| FileIdentity::of(&metadata))
+            .map_err(|source| ApkSetError::Locate {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    fn signature_error(&self, source: SignatureError) -> ApkSetError {
+        ApkSetError::Signature {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    fn into_apk(self) -> Result<Apk, ApkSetError> {
+        Apk::from_file(&self.path, self.file).map_err(|source| ApkSetError::Open {
+            path: self.path,
+            source,
+        })
+    }
+}
+
+impl ApkSetFiles {
+    fn open(paths: ApkSetPaths) -> Result<Self, ApkSetError> {
+        Ok(Self {
+            base: Member::open(paths.base)?,
+            native_split: paths.native_split.map(Member::open).transpose()?,
+        })
+    }
+
+    fn identity(&self) -> Result<SetIdentity, ApkSetError> {
+        Ok(SetIdentity {
+            base: self.base.identity()?,
+            native_split: self
+                .native_split
+                .as_ref()
+                .map(Member::identity)
+                .transpose()?,
+        })
+    }
+
+    fn verify(self) -> Result<ApkSet, ApkSetError> {
+        let signing_certificate_history = signature::verify_roblox_signing_history(&self.base.file)
+            .map_err(|source| self.base.signature_error(source))?;
+        if let Some(split) = &self.native_split {
+            signature::verify_roblox_signature(&split.file)
+                .map_err(|source| split.signature_error(source))?;
+        }
+        self.assemble(signing_certificate_history)
+    }
+
+    fn assemble(
+        self,
         signing_certificate_history: SigningCertificateHistory,
-    ) -> Result<Self, ApkSetError> {
-        let mut base = open_member(&paths.base)?;
+    ) -> Result<ApkSet, ApkSetError> {
+        let paths = ApkSetPaths {
+            base: self.base.path.clone(),
+            native_split: self.native_split.as_ref().map(|split| split.path.clone()),
+        };
+        let mut base = self.base.into_apk()?;
         let base_info = member_info(&mut base, &paths.base)?;
         if let Some(split) = base_info.split {
             return Err(ApkSetError::BaseIsSplit {
@@ -625,20 +772,21 @@ impl ApkSet {
             source,
         })?;
 
-        let native_split = match &paths.native_split {
+        let native_split = match self.native_split {
             None => None,
-            Some(path) => {
-                let mut split = open_member(path)?;
-                let info = member_info(&mut split, path)?;
+            Some(member) => {
+                let path = member.path.clone();
+                let mut split = member.into_apk()?;
+                let info = member_info(&mut split, &path)?;
                 if info.split.as_deref() != Some(NATIVE_SPLIT_NAME) {
                     return Err(ApkSetError::NotNativeSplit {
-                        path: path.clone(),
+                        path,
                         split: info.split,
                     });
                 }
                 if info.version_code != Some(version_code) {
                     return Err(ApkSetError::VersionMismatch {
-                        path: path.clone(),
+                        path,
                         base: version_code,
                         split: info.version_code,
                     });
@@ -647,7 +795,7 @@ impl ApkSet {
             }
         };
 
-        let mut set = Self {
+        let mut set = ApkSet {
             paths,
             base,
             native_split,
@@ -667,6 +815,12 @@ impl ApkSet {
                 source,
             }),
         }
+    }
+}
+
+impl ApkSet {
+    pub fn open(paths: ApkSetPaths) -> Result<Self, ApkSetError> {
+        ApkSetFiles::open(paths)?.verify()
     }
 
     pub fn base_path(&self) -> &Path {
@@ -746,20 +900,6 @@ fn claim_moved_member(apk: &mut Apk, path: &Path) -> Result<(), ApkSetError> {
     Ok(())
 }
 
-fn verify_signature(path: &Path) -> Result<(), ApkSetError> {
-    signature::verify_roblox_signature(path).map_err(|source| ApkSetError::Signature {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn open_member(path: &Path) -> Result<Apk, ApkSetError> {
-    Apk::open(path).map_err(|source| ApkSetError::Open {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn member_info(apk: &mut Apk, path: &Path) -> Result<PackageInfo, ApkSetError> {
     let info = apk.package_info().map_err(|source| ApkSetError::Open {
         path: path.to_path_buf(),
@@ -787,6 +927,10 @@ pub enum ApkError {
     EntryOffsetUnknown(String),
 
     EngineMissing,
+
+    ManifestTooLarge(u64),
+
+    ManifestLongerThanDeclared(u64),
 }
 
 impl fmt::Display for ApkError {
@@ -805,6 +949,15 @@ impl fmt::Display for ApkError {
                     "APK has no x86_64 engine library (lib/{TARGET_ABI}/{ENGINE_LIB})"
                 )
             }
+            Self::ManifestTooLarge(declared) => write!(
+                f,
+                "{MANIFEST_ENTRY} declares {declared} bytes, more than the {MAX_MANIFEST_BYTES} \
+                 bytes Eclipse reads from an APK"
+            ),
+            Self::ManifestLongerThanDeclared(declared) => write!(
+                f,
+                "{MANIFEST_ENTRY} inflates past the {declared} bytes its zip entry declares"
+            ),
         }
     }
 }
@@ -815,7 +968,11 @@ impl std::error::Error for ApkError {
             Self::Io(e) => Some(e),
             Self::Zip(e) => Some(e),
             Self::Axml(e) => Some(e),
-            Self::EntryMissing(_) | Self::EntryOffsetUnknown(_) | Self::EngineMissing => None,
+            Self::EntryMissing(_)
+            | Self::EntryOffsetUnknown(_)
+            | Self::EngineMissing
+            | Self::ManifestTooLarge(_)
+            | Self::ManifestLongerThanDeclared(_) => None,
         }
     }
 }
@@ -846,6 +1003,8 @@ pub enum ApkSetError {
     },
 
     MissingBase(PathBuf),
+
+    Bundle(PathBuf),
 
     Open {
         path: PathBuf,
@@ -898,12 +1057,20 @@ impl fmt::Display for ApkSetError {
                  {NATIVE_SPLIT_APK}",
                 dir.display()
             ),
+            Self::Bundle(path) => write!(
+                f,
+                "{} is an app bundle; install it with `eclipse install {}`, then start Roblox \
+                 with `eclipse run`",
+                path.display(),
+                shell_word(path)
+            ),
             Self::Open { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Signature { path, source } => write!(
                 f,
                 "{} is not the official, unmodified Roblox client ({source}); Eclipse only runs \
-                 APKs signed by Roblox Corporation, so get them from Google Play with `eclipse \
-                 update` or `eclipse install` the files Google Play delivered",
+                 APKs signed by Roblox Corporation, so download Roblox with `eclipse update` \
+                 (APKCombo) or `eclipse update --play` (Google Play), or `eclipse install` \
+                 Roblox's own release files",
                 path.display()
             ),
             Self::WrongPackage { path, package } => write!(
@@ -972,6 +1139,7 @@ impl std::error::Error for ApkSetError {
             Self::Open { source, .. } => Some(source),
             Self::Signature { source, .. } => Some(source),
             Self::MissingBase(_)
+            | Self::Bundle(_)
             | Self::WrongPackage { .. }
             | Self::BaseIsSplit { .. }
             | Self::NotNativeSplit { .. }
@@ -1357,16 +1525,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         let extracted = apk.extract_native_libs("x86_64", &dir).expect("extract");
-        let mut names: Vec<String> = extracted
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["libother.so", "libroblox.so"]);
+        assert_eq!(extracted, 2, "two x86_64 libraries written");
         assert_eq!(
             std::fs::read(dir.join("libroblox.so")).unwrap(),
             b"ENGINE-BYTES"
         );
+        assert_eq!(std::fs::read(dir.join("libother.so")).unwrap(), b"OTHER");
         assert!(
             !dir.join("libfoo.so").exists(),
             "wrong-ABI lib must not extract"
@@ -1377,7 +1541,7 @@ mod tests {
         );
 
         let again = apk.extract_native_libs("x86_64", &dir).expect("re-extract");
-        assert_eq!(again.len(), 2);
+        assert_eq!(again, 0, "an unchanged extraction writes nothing");
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();
@@ -1550,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_extractions_are_trusted_from_the_stamp_without_rereading_files() {
+    fn extraction_stamps_are_trusted_only_while_the_files_metadata_is_unchanged() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let bytes = build_apk(&[
@@ -1567,6 +1731,12 @@ mod tests {
         apk.extract_native_libs("x86_64", &libs)
             .expect("extract libs");
         assert_eq!(apk.extract_assets(&assets).expect("extract assets"), 1);
+        assert_eq!(
+            apk.extract_native_libs("x86_64", &libs)
+                .expect("stamped libs"),
+            0
+        );
+        assert_eq!(apk.extract_assets(&assets).expect("stamped assets"), 0);
 
         let unreadable = std::fs::Permissions::from_mode(0o000);
         std::fs::set_permissions(libs.join("libroblox.so"), unreadable.clone()).unwrap();
@@ -1576,11 +1746,12 @@ mod tests {
         let readable = std::fs::Permissions::from_mode(0o644);
         std::fs::set_permissions(libs.join("libroblox.so"), readable.clone()).unwrap();
         std::fs::set_permissions(assets.join("content/fonts/a.ttf"), readable).unwrap();
-        assert_eq!(
-            again.expect("stamped libs"),
-            vec![libs.join("libroblox.so")]
-        );
-        assert_eq!(assets_again.expect("stamped assets"), 0);
+        for result in [again, assets_again] {
+            assert!(
+                matches!(&result, Err(ApkError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied),
+                "a file whose metadata changed after the stamp is read again: {result:?}"
+            );
+        }
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_file(&apk_path).ok();
@@ -1613,8 +1784,11 @@ mod tests {
         }
         std::fs::write(libs.join(".eclipse-extract.4242.partial"), b"stale").unwrap();
 
-        apk.extract_native_libs("x86_64", &libs)
-            .expect("re-extract libs");
+        assert_eq!(
+            apk.extract_native_libs("x86_64", &libs)
+                .expect("re-extract libs"),
+            1
+        );
         assert_eq!(apk.extract_assets(&assets).expect("re-extract assets"), 1);
         assert_eq!(
             std::fs::read(libs.join("libroblox.so")).unwrap(),
@@ -1745,6 +1919,46 @@ mod tests {
     }
 
     #[test]
+    fn package_info_rejects_a_manifest_that_inflates_past_the_cap() {
+        let bomb = vec![0u8; (MAX_MANIFEST_BYTES + 1) as usize];
+        let bytes = build_apk_methods(&[(MANIFEST_ENTRY, &bomb, CompressionMethod::Deflated)]);
+        assert!(bytes.len() < 64 * 1024, "the fixture stays small on disk");
+        let (mut apk, path) = open_apk(&bytes, "manifest-bomb");
+        let info = apk.package_info();
+        let manifest = apk.manifest();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(info, Err(ApkError::ManifestTooLarge(size)) if size == MAX_MANIFEST_BYTES + 1),
+            "got {info:?}"
+        );
+        assert!(
+            matches!(manifest, Err(ApkError::ManifestTooLarge(_))),
+            "got {manifest:?}"
+        );
+    }
+
+    #[test]
+    fn package_info_rejects_a_manifest_longer_than_its_declared_size() {
+        const DECLARED: u32 = 16;
+        let payload = vec![0u8; 8 * 1024];
+        let mut bytes =
+            build_apk_methods(&[(MANIFEST_ENTRY, &payload, CompressionMethod::Deflated)]);
+        bytes[22..26].copy_from_slice(&DECLARED.to_le_bytes());
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("a central directory header");
+        bytes[central + 24..central + 28].copy_from_slice(&DECLARED.to_le_bytes());
+        let (mut apk, path) = open_apk(&bytes, "manifest-understated");
+        let info = apk.package_info();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(info, Err(ApkError::ManifestLongerThanDeclared(16))),
+            "got {info:?}"
+        );
+    }
+
+    #[test]
     fn read_entry_missing_is_typed_error_not_panic() {
         let bytes = build_apk(&[(MANIFEST_ENTRY, FIXTURE_MANIFEST)]);
         let (mut apk, path) = open_apk(&bytes, "read-missing");
@@ -1790,10 +2004,9 @@ mod tests {
     }
 
     fn open_unsigned_set(paths: ApkSetPaths) -> Result<ApkSet, ApkSetError> {
-        ApkSet::open_verified(
-            paths,
-            SigningCertificateHistory::unverified(vec![b"test certificate".to_vec()]),
-        )
+        ApkSetFiles::open(paths)?.assemble(SigningCertificateHistory::unverified(vec![
+            b"test certificate".to_vec(),
+        ]))
     }
 
     fn roblox_manifest(version_code: u32, split: Option<&str>) -> Vec<u8> {
@@ -1887,7 +2100,33 @@ mod tests {
 
         let err = ApkSetPaths::locate(&dir.join("absent")).expect_err("missing path");
         assert!(matches!(err, ApkSetError::Locate { .. }), "got {err:?}");
+
+        let bundle = dir.join("Roblox.XAPK");
+        std::fs::write(&bundle, b"bundle").unwrap();
+        let err = ApkSetPaths::locate(&bundle).expect_err("a bundle is not an APK");
+        assert!(
+            matches!(&err, ApkSetError::Bundle(path) if *path == bundle),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("`eclipse install "), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_bundle_install_command_quotes_paths_for_the_shell() {
+        let bundle = PathBuf::from("/home/u/My Games/Roblox's copy.xapk");
+        let message = ApkSetError::Bundle(bundle).to_string();
+        assert!(
+            message.contains(r"`eclipse install '/home/u/My Games/Roblox'\''s copy.xapk'`"),
+            "{message}"
+        );
+        let plain = ApkSetError::Bundle(PathBuf::from("/home/u/Roblox_2.740.931.xapk"));
+        assert!(
+            plain
+                .to_string()
+                .contains("`eclipse install /home/u/Roblox_2.740.931.xapk`"),
+            "{plain}"
+        );
     }
 
     #[test]
@@ -1909,7 +2148,32 @@ mod tests {
             ),
             "got {err:?}"
         );
-        assert!(err.to_string().contains("signed by Roblox Corporation"));
+        let text = err.to_string();
+        assert!(text.contains("signed by Roblox Corporation"), "{text}");
+        assert!(text.contains("`eclipse update --play`"), "{text}");
+        assert!(
+            !text.contains("from Google Play with `eclipse update`"),
+            "{text}"
+        );
+
+        let missing = temp_set_dir("missing-member");
+        let err = ApkSet::open(ApkSetPaths {
+            base: missing.join(BASE_APK),
+            native_split: None,
+        })
+        .err()
+        .expect("a missing APK cannot be opened");
+        std::fs::remove_dir_all(&missing).ok();
+        assert!(
+            matches!(
+                err,
+                ApkSetError::Open {
+                    source: ApkError::Io(_),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2144,7 +2408,7 @@ mod tests {
         assert_eq!(set.manifest().package, ROBLOX_PACKAGE);
         assert_eq!(
             set.signing_certificate_history(),
-            &signature::verify_roblox_signing_history(&paths.base)
+            &signature::verify_roblox_signing_history(&File::open(&paths.base).unwrap())
                 .expect("the official base verifies")
         );
         assert!(set.version_code().0 > 0);

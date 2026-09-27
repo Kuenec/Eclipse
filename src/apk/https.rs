@@ -4,17 +4,22 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ureq::http::header::{CONTENT_LENGTH, LOCATION};
+use ureq::http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LOCATION, RANGE};
 use ureq::http::{HeaderMap, Uri};
 
+use crate::status::{continuation_text, transfer_text, StatusSink};
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-const BODY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const REQUEST_BODY_BUDGET: Duration = Duration::from_secs(2 * 60);
+const MAX_CONTINUATIONS: u32 = 256;
 const MAX_REDIRECTS: usize = 5;
 const BUFFER_BYTES: usize = 256 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
-const MEBIBYTE: f64 = 1024.0 * 1024.0;
+const WINDOW_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const PARTIAL_CONTENT: u16 = 206;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
@@ -49,6 +54,7 @@ pub(super) fn request_agent() -> ureq::Agent {
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(Some(REQUEST_TIMEOUT))
+        .timeout_connect(Some(REQUEST_CONNECT_TIMEOUT))
         .build()
         .into()
 }
@@ -60,7 +66,7 @@ pub(super) fn download_agent() -> ureq::Agent {
         .max_redirects(0)
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_response(Some(RESPONSE_TIMEOUT))
-        .timeout_recv_body(Some(BODY_TIMEOUT))
+        .timeout_recv_body(Some(REQUEST_BODY_BUDGET))
         .build()
         .into()
 }
@@ -88,29 +94,66 @@ pub(super) fn trusted_uri(url: &str, allowed: &'static [Host]) -> Result<Uri, Do
     }
 }
 
-pub(super) struct Download {
-    pub(super) body: ureq::Body,
-    pub(super) content_length: Option<u64>,
+pub(super) struct Download<R> {
+    pub(super) body: R,
+    pub(super) extent: Extent,
+    pub(super) validator: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Extent {
+    Whole { length: Option<u64> },
+    Partial(ContentRange),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ContentRange {
+    pub(super) start: u64,
+    pub(super) total: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Resume {
+    pub(super) offset: u64,
+    pub(super) validator: Option<String>,
 }
 
 pub(super) fn open_download(
     agent: &ureq::Agent,
     url: &str,
     allowed: &'static [Host],
-) -> Result<Download, DownloadError> {
+    resume: Option<&Resume>,
+) -> Result<Download<ureq::BodyReader<'static>>, DownloadError> {
     let mut route = Route::new(allowed);
     let mut uri = trusted_uri(url, allowed)?;
     loop {
-        let response = agent
-            .get(uri)
+        let mut request = agent.get(uri);
+        if let Some(resume) = resume {
+            request = request.header(RANGE, format!("bytes={}-", resume.offset));
+            if let Some(validator) = &resume.validator {
+                request = request.header(IF_RANGE, validator.as_str());
+            }
+        }
+        let response = request
             .call()
             .map_err(|error| DownloadError::Transport(redacted(error)))?;
-        match route.next(response.status().as_u16(), response.headers())? {
+        let status = response.status().as_u16();
+        match route.next(status, response.headers())? {
             Hop::Arrived => {
+                let headers = response.headers();
+                let extent = if status == PARTIAL_CONTENT {
+                    Extent::Partial(content_range(headers)?)
+                } else {
+                    Extent::Whole {
+                        length: content_length(headers)?,
+                    }
+                };
+                let validator = strong_etag(headers);
                 return Ok(Download {
-                    content_length: content_length(response.headers())?,
-                    body: response.into_body(),
-                })
+                    body: response.into_body().into_reader(),
+                    extent,
+                    validator,
+                });
             }
             Hop::Redirect(next) => uri = next,
         }
@@ -157,6 +200,40 @@ impl Route {
     }
 }
 
+fn strong_etag(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .filter(|etag| etag.starts_with('"'))
+        .map(str::to_owned)
+}
+
+fn content_range(headers: &HeaderMap) -> Result<ContentRange, DownloadError> {
+    headers
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .ok_or(DownloadError::InvalidContentRange)
+}
+
+fn parse_content_range(value: &str) -> Option<ContentRange> {
+    let (range, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start.parse().ok()?;
+    let end: u64 = end.parse().ok()?;
+    let total = match total {
+        "*" => None,
+        total => {
+            let total: u64 = total.parse().ok()?;
+            if end >= total {
+                return None;
+            }
+            Some(total)
+        }
+    };
+    (start <= end).then_some(ContentRange { start, total })
+}
+
 fn content_length(headers: &HeaderMap) -> Result<Option<u64>, DownloadError> {
     headers
         .get(CONTENT_LENGTH)
@@ -170,82 +247,119 @@ fn content_length(headers: &HeaderMap) -> Result<Option<u64>, DownloadError> {
         .transpose()
 }
 
-pub(super) fn save_download(
-    body: impl Read,
-    content_length: Option<u64>,
+pub(super) fn save_download<R: Read, E: From<DownloadError>>(
+    mut open: impl FnMut(Option<&Resume>) -> Result<Download<R>, E>,
     limit: u64,
     dest: &Path,
+    status: &StatusSink,
     mut observe: impl FnMut(&[u8]),
-) -> Result<u64, DownloadError> {
-    if content_length.is_some_and(|length| length > limit) {
-        return Err(DownloadError::TooLarge { limit });
+) -> Result<u64, E> {
+    let first = open(None)?;
+    let Extent::Whole { length } = first.extent else {
+        return Err(DownloadError::UnrequestedRange.into());
+    };
+    if length.is_some_and(|length| length > limit) {
+        return Err(DownloadError::TooLarge { limit }.into());
     }
     let io_error = |source| DownloadError::Io {
         path: dest.to_path_buf(),
         source,
     };
     let mut output = File::create(dest).map_err(io_error)?;
-    let mut reader = body.take(limit.saturating_add(1));
     let mut buffer = vec![0u8; BUFFER_BYTES];
-    let mut progress = Progress::new(content_length);
+    let mut progress = Progress::new(length, status);
+    let mut body = first.body;
     let mut total = 0u64;
+    let mut continuations = 0u32;
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(DownloadError::Interrupted)?;
-        if read == 0 {
+        let attempt_start = total;
+        let interruption = loop {
+            let read = match body.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => break Some(error),
+            };
+            if read == 0 {
+                break None;
+            }
+            total += read as u64;
+            if total > limit {
+                return Err(DownloadError::TooLarge { limit }.into());
+            }
+            observe(&buffer[..read]);
+            output.write_all(&buffer[..read]).map_err(io_error)?;
+            progress.report(total);
+        };
+        let Some(interrupted) = interruption else {
             break;
+        };
+        let resumable = length.is_some_and(|length| total < length)
+            && total > attempt_start
+            && continuations < MAX_CONTINUATIONS;
+        if !resumable {
+            return Err(DownloadError::Interrupted(interrupted).into());
         }
-        total += read as u64;
-        if total > limit {
-            return Err(DownloadError::TooLarge { limit });
+        continuations += 1;
+        status.step(continuation_text(total));
+        let next = open(Some(&Resume {
+            offset: total,
+            validator: first.validator.clone(),
+        }))?;
+        match next.extent {
+            Extent::Partial(range) if range.start == total && range.total == length => {
+                body = next.body;
+            }
+            _ => {
+                return Err(DownloadError::ResumeRefused {
+                    offset: total,
+                    interrupted,
+                }
+                .into())
+            }
         }
-        observe(&buffer[..read]);
-        output.write_all(&buffer[..read]).map_err(io_error)?;
-        progress.report(total);
     }
     output.sync_all().map_err(io_error)?;
-    if let Some(announced) = content_length.filter(|&length| length != total) {
+    if let Some(announced) = length.filter(|&length| length != total) {
         return Err(DownloadError::LengthMismatch {
             announced,
             actual: total,
-        });
+        }
+        .into());
     }
     Ok(total)
 }
 
-struct Progress {
+struct Progress<'a> {
     total: Option<u64>,
-    last: Instant,
+    status: &'a StatusSink,
+    last_line: Instant,
+    last_update: Instant,
 }
 
-impl Progress {
-    fn new(total: Option<u64>) -> Self {
+impl<'a> Progress<'a> {
+    fn new(total: Option<u64>, status: &'a StatusSink) -> Self {
+        status.transfer(0, total);
+        let now = Instant::now();
         Self {
             total,
-            last: Instant::now(),
+            status,
+            last_line: now,
+            last_update: now,
         }
     }
 
     fn report(&mut self, done: u64) {
-        if self.last.elapsed() < PROGRESS_INTERVAL {
-            return;
+        let now = Instant::now();
+        if now.duration_since(self.last_update) >= WINDOW_PROGRESS_INTERVAL
+            || self.total == Some(done)
+        {
+            self.last_update = now;
+            self.status.transfer(done, self.total);
         }
-        self.last = Instant::now();
-        eprintln!("{}", progress_line(done, self.total));
-    }
-}
-
-fn progress_line(done: u64, total: Option<u64>) -> String {
-    let mebibytes = |bytes: u64| bytes as f64 / MEBIBYTE;
-    match total {
-        Some(total) if total > 0 => format!(
-            "# Downloaded {:.1} of {:.1} MiB ({}%)",
-            mebibytes(done),
-            mebibytes(total),
-            done.saturating_mul(100) / total
-        ),
-        _ => format!("# Downloaded {:.1} MiB", mebibytes(done)),
+        if now.duration_since(self.last_line) >= PROGRESS_INTERVAL {
+            self.last_line = now;
+            eprintln!("# {}", transfer_text(done, self.total));
+        }
     }
 }
 
@@ -261,11 +375,17 @@ pub enum DownloadError {
 
     InvalidContentLength,
 
+    InvalidContentRange,
+
+    UnrequestedRange,
+
     TooLarge { limit: u64 },
 
     LengthMismatch { announced: u64, actual: u64 },
 
     Interrupted(io::Error),
+
+    ResumeRefused { offset: u64, interrupted: io::Error },
 
     Io { path: PathBuf, source: io::Error },
 }
@@ -289,12 +409,24 @@ impl fmt::Display for DownloadError {
                 write!(f, "the server redirected more than {MAX_REDIRECTS} times")
             }
             Self::InvalidContentLength => f.write_str("the server sent an invalid Content-Length"),
+            Self::InvalidContentRange => f.write_str("the server sent an invalid Content-Range"),
+            Self::UnrequestedRange => f.write_str(
+                "the server sent part of the file although the whole file was asked for",
+            ),
             Self::TooLarge { limit } => write!(f, "the file is larger than {limit} bytes"),
             Self::LengthMismatch { announced, actual } => write!(
                 f,
                 "the server announced {announced} bytes but sent {actual}"
             ),
             Self::Interrupted(source) => source.fmt(f),
+            Self::ResumeRefused {
+                offset,
+                interrupted,
+            } => write!(
+                f,
+                "the download stopped after {offset} bytes ({interrupted}) and the server would \
+                 not continue it from there"
+            ),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }
@@ -303,12 +435,19 @@ impl fmt::Display for DownloadError {
 impl std::error::Error for DownloadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Interrupted(source) | Self::Io { source, .. } => Some(source),
+            Self::Interrupted(source)
+            | Self::ResumeRefused {
+                interrupted: source,
+                ..
+            }
+            | Self::Io { source, .. } => Some(source),
             Self::Untrusted { .. }
             | Self::Transport(_)
             | Self::Status(_)
             | Self::TooManyRedirects
             | Self::InvalidContentLength
+            | Self::InvalidContentRange
+            | Self::UnrequestedRange
             | Self::TooLarge { .. }
             | Self::LengthMismatch { .. } => None,
         }
@@ -318,6 +457,7 @@ impl std::error::Error for DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::StatusUpdate;
 
     const HOSTS: &[Host] = &[
         Host::Exact("files.example.com"),
@@ -425,44 +565,91 @@ mod tests {
         ));
     }
 
-    struct FailingBody;
+    struct Served<'a> {
+        data: &'a [u8],
+        stalls: bool,
+    }
 
-    impl Read for FailingBody {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "timeout: RecvBody"))
+    impl Read for Served<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.data.is_empty() {
+                return if self.stalls {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timeout: receive body",
+                    ))
+                } else {
+                    Ok(0)
+                };
+            }
+            let read = self.data.len().min(buf.len());
+            buf[..read].copy_from_slice(&self.data[..read]);
+            self.data = &self.data[read..];
+            Ok(read)
         }
+    }
+
+    fn served(data: &[u8], stalls: bool) -> Served<'_> {
+        Served { data, stalls }
+    }
+
+    fn whole<R: Read>(
+        body: R,
+        length: Option<u64>,
+    ) -> impl FnMut(Option<&Resume>) -> Result<Download<R>, DownloadError> {
+        let mut body = Some(body);
+        move |resume| {
+            assert_eq!(resume, None, "an uninterrupted download is not continued");
+            Ok(Download {
+                body: body.take().expect("the download is opened once"),
+                extent: Extent::Whole { length },
+                validator: None,
+            })
+        }
+    }
+
+    fn save(
+        open: impl FnMut(Option<&Resume>) -> Result<Download<Served<'static>>, DownloadError>,
+        limit: u64,
+        dest: &Path,
+    ) -> Result<u64, DownloadError> {
+        save_download(open, limit, dest, &StatusSink::terminal(), |_| {})
     }
 
     #[test]
     fn downloads_are_saved_within_the_limit_and_the_announced_length() {
+        static BODY: [u8; 100] = [7u8; 100];
         let dir = temp_dir("save");
         let dest = dir.join("download");
-        let body = [7u8; 100];
         let mut seen = Vec::new();
 
-        let total = save_download(&body[..], Some(100), 100, &dest, |chunk| {
-            seen.extend_from_slice(chunk)
-        })
+        let total = save_download(
+            whole(&BODY[..], Some(100)),
+            100,
+            &dest,
+            &StatusSink::terminal(),
+            |chunk| seen.extend_from_slice(chunk),
+        )
         .unwrap();
         assert_eq!(total, 100);
-        assert_eq!(std::fs::read(&dest).unwrap(), body);
-        assert_eq!(seen, body, "every saved byte is observed");
+        assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+        assert_eq!(seen, BODY, "every saved byte is observed");
         assert_eq!(
-            save_download(&body[..60], None, 100, &dest, |_| {}).unwrap(),
+            save(whole(served(&BODY[..60], false), None), 100, &dest).unwrap(),
             60
         );
 
-        let err = save_download(&body[..], Some(101), 100, &dest, |_| {}).unwrap_err();
+        let err = save(whole(served(&BODY, false), Some(101)), 100, &dest).unwrap_err();
         assert!(
             matches!(err, DownloadError::TooLarge { limit: 100 }),
             "{err:?}"
         );
-        let err = save_download(&body[..], None, 99, &dest, |_| {}).unwrap_err();
+        let err = save(whole(served(&BODY, false), None), 99, &dest).unwrap_err();
         assert!(
             matches!(err, DownloadError::TooLarge { limit: 99 }),
             "{err:?}"
         );
-        let err = save_download(&body[..95], Some(100), 100, &dest, |_| {}).unwrap_err();
+        let err = save(whole(served(&BODY[..95], false), Some(100)), 100, &dest).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -473,25 +660,234 @@ mod tests {
             ),
             "{err:?}"
         );
-        let err = save_download(FailingBody, None, 100, &dest, |_| {}).unwrap_err();
+        let err = save(whole(served(&[], true), None), 100, &dest).unwrap_err();
         assert!(matches!(err, DownloadError::Interrupted(_)), "{err:?}");
-        let err =
-            save_download(&body[..], None, 100, &dir.join("missing/download"), |_| {}).unwrap_err();
+        let err = save(
+            whole(served(&BODY, false), None),
+            100,
+            &dir.join("missing/download"),
+        )
+        .unwrap_err();
         assert!(matches!(err, DownloadError::Io { .. }), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    static NUMBERED: [u8; 100] = {
+        let mut bytes = [0u8; 100];
+        let mut index = 0;
+        while index < bytes.len() {
+            bytes[index] = index as u8;
+            index += 1;
+        }
+        bytes
+    };
+
     #[test]
-    fn progress_lines_report_mebibytes_and_percent() {
+    fn an_interrupted_download_continues_where_it_stopped() {
+        let dir = temp_dir("continue");
+        let dest = dir.join("download");
+        let mut requests = Vec::new();
+        let mut seen = Vec::new();
+        let (updates, shown) = std::sync::mpsc::channel();
+
+        let total = save_download(
+            |resume: Option<&Resume>| {
+                requests.push(resume.cloned());
+                Ok::<_, DownloadError>(match resume {
+                    None => Download {
+                        body: served(&NUMBERED[..60], true),
+                        extent: Extent::Whole { length: Some(100) },
+                        validator: Some("\"v1\"".to_owned()),
+                    },
+                    Some(resume) => Download {
+                        body: served(&NUMBERED[resume.offset as usize..], false),
+                        extent: Extent::Partial(ContentRange {
+                            start: resume.offset,
+                            total: Some(100),
+                        }),
+                        validator: None,
+                    },
+                })
+            },
+            100,
+            &dest,
+            &StatusSink::with_window(updates),
+            |chunk| seen.extend_from_slice(chunk),
+        )
+        .unwrap();
+        assert_eq!(total, 100);
+        assert_eq!(std::fs::read(&dest).unwrap(), NUMBERED);
+        assert_eq!(seen, NUMBERED, "every byte is observed once, in order");
         assert_eq!(
-            progress_line(120 * 1024 * 1024, Some(240 * 1024 * 1024)),
-            "# Downloaded 120.0 of 240.0 MiB (50%)"
+            requests,
+            [
+                None,
+                Some(Resume {
+                    offset: 60,
+                    validator: Some("\"v1\"".to_owned())
+                })
+            ]
+        );
+        let steps: Vec<StatusUpdate> = shown
+            .try_iter()
+            .filter(|update| matches!(update, StatusUpdate::Step(_)))
+            .collect();
+        assert_eq!(
+            steps,
+            [StatusUpdate::Step(continuation_text(60))],
+            "a continuation is announced without claiming the link failed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_download_is_continued_only_while_it_makes_progress() {
+        let dir = temp_dir("stalled");
+        let dest = dir.join("download");
+        let mut requests = 0;
+        let err = save(
+            |_| {
+                requests += 1;
+                Ok(Download {
+                    body: served(&[], true),
+                    extent: Extent::Whole { length: Some(100) },
+                    validator: None,
+                })
+            },
+            100,
+            &dest,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DownloadError::Interrupted(_)), "{err:?}");
+        assert_eq!(
+            requests, 1,
+            "a request that delivered nothing is not repeated"
+        );
+
+        let mut requests = Vec::new();
+        let err = save(
+            |resume| {
+                requests.push(resume.map(|resume| resume.offset));
+                Ok(match resume {
+                    None => Download {
+                        body: served(&NUMBERED[..60], true),
+                        extent: Extent::Whole { length: Some(100) },
+                        validator: None,
+                    },
+                    Some(resume) => Download {
+                        body: served(&[], true),
+                        extent: Extent::Partial(ContentRange {
+                            start: resume.offset,
+                            total: Some(100),
+                        }),
+                        validator: None,
+                    },
+                })
+            },
+            100,
+            &dest,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DownloadError::Interrupted(_)), "{err:?}");
+        assert_eq!(requests, [None, Some(60)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_continuation_must_resume_at_the_interruption_of_the_same_file() {
+        let dir = temp_dir("refused");
+        let dest = dir.join("download");
+        for answer in [
+            Extent::Whole { length: Some(100) },
+            Extent::Partial(ContentRange {
+                start: 0,
+                total: Some(100),
+            }),
+            Extent::Partial(ContentRange {
+                start: 60,
+                total: Some(101),
+            }),
+        ] {
+            let err = save(
+                |resume| {
+                    Ok(match resume {
+                        None => Download {
+                            body: served(&NUMBERED[..60], true),
+                            extent: Extent::Whole { length: Some(100) },
+                            validator: None,
+                        },
+                        Some(_) => Download {
+                            body: served(&NUMBERED, false),
+                            extent: answer,
+                            validator: None,
+                        },
+                    })
+                },
+                100,
+                &dest,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, DownloadError::ResumeRefused { offset: 60, .. }),
+                "{answer:?}: {err:?}"
+            );
+        }
+        let err = save(
+            |_| {
+                Ok(Download {
+                    body: served(&NUMBERED, false),
+                    extent: Extent::Partial(ContentRange {
+                        start: 0,
+                        total: Some(100),
+                    }),
+                    validator: None,
+                })
+            },
+            100,
+            &dest,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DownloadError::UnrequestedRange), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn content_ranges_and_validators_are_read_strictly() {
+        assert_eq!(
+            parse_content_range("bytes 60-99/100"),
+            Some(ContentRange {
+                start: 60,
+                total: Some(100)
+            })
         );
         assert_eq!(
-            progress_line(1024 * 1024 + 512 * 1024, None),
-            "# Downloaded 1.5 MiB"
+            parse_content_range("bytes 0-9/*"),
+            Some(ContentRange {
+                start: 0,
+                total: None
+            })
         );
-        assert_eq!(progress_line(0, Some(0)), "# Downloaded 0.0 MiB");
+        for invalid in [
+            "bytes 10-5/100",
+            "bytes 0-100/100",
+            "items 0-9/10",
+            "bytes 0-9",
+            "bytes a-9/10",
+            "bytes -9/10",
+        ] {
+            assert_eq!(parse_content_range(invalid), None, "{invalid}");
+        }
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(strong_etag(&headers), None);
+        headers.insert(ETAG, "W/\"weak\"".parse().unwrap());
+        assert_eq!(
+            strong_etag(&headers),
+            None,
+            "If-Range needs a strong validator"
+        );
+        headers.insert(ETAG, "\"55e2ac00\"".parse().unwrap());
+        assert_eq!(strong_etag(&headers).as_deref(), Some("\"55e2ac00\""));
     }
 
     #[test]

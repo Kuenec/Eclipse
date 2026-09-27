@@ -8,8 +8,12 @@ use winit::dpi::PhysicalPosition;
 use winit::error::{EventLoopError, ExternalError, OsError};
 use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
+use winit::platform::startup_notify::WindowAttributesExtStartupNotify as _;
 use winit::platform::wayland::WindowAttributesExtWayland;
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use winit::window::{ActivationToken, CursorGrabMode, Fullscreen, Window, WindowId};
+
+pub mod launch_window;
 
 const CLEAR_COLOR: [f32; 4] = [0.149, 0.408, 0.722, 1.0];
 
@@ -119,6 +123,7 @@ struct GameWindow<'vm> {
     ime_area_support: ImeAreaSupport,
 
     clipboard: Option<crate::clipboard::HostClipboard>,
+    activation_token: Option<ActivationToken>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -232,9 +237,12 @@ fn display_refresh_profile(window: &Window) -> Option<DisplayRefreshProfile> {
 
 impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(self.title.clone())
             .with_name(crate::APP_ID, "eclipse");
+        if let Some(token) = self.activation_token.take() {
+            attrs = attrs.with_activation_token(token);
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(window) => {
                 tracing::info!(title = %self.title, "host window created (winit, no GTK)");
@@ -1934,14 +1942,21 @@ impl GameWindow<'_> {
     }
 }
 
+pub type HostEventLoop = EventLoop<crate::framework::MainLooperWake>;
+
+pub fn host_event_loop() -> Result<HostEventLoop, GraphicsError> {
+    HostEventLoop::with_user_event()
+        .build()
+        .map_err(GraphicsError::EventLoop)
+}
+
 pub fn run_windowed(
+    event_loop: &mut HostEventLoop,
+    activation_token: Option<ActivationToken>,
     title: &str,
     vm: Option<&crate::runtime::Vm>,
     touch_mode: crate::config::TouchMode,
 ) -> Result<(), GraphicsError> {
-    let event_loop = EventLoop::<crate::framework::MainLooperWake>::with_user_event()
-        .build()
-        .map_err(GraphicsError::EventLoop)?;
     crate::framework::install_main_looper_waker(event_loop.create_proxy());
     let mut app = GameWindow {
         title: title.to_owned(),
@@ -1986,8 +2001,9 @@ pub fn run_windowed(
         ime: HostIme::Disallowed,
         ime_area_support: ImeAreaSupport::TopLeftSpot,
         clipboard: None,
+        activation_token,
     };
-    let run = event_loop.run_app(&mut app);
+    let run = event_loop.run_app_on_demand(&mut app);
 
     app.shutdown_runtime();
 
@@ -3282,8 +3298,8 @@ impl GlyphAtlas {
     }
 }
 
-fn build_glyph_atlas(font: &RasterFont, max_width: u32) -> Option<GlyphAtlas> {
-    let mut scaled = font.scaled(TEXT_PX)?;
+fn build_glyph_atlas(font: &RasterFont, text_px: f32, max_width: u32) -> Option<GlyphAtlas> {
+    let mut scaled = font.scaled(text_px)?;
     let ascent = scaled.ascent();
     let line_height = scaled.height() + scaled.line_gap();
 
@@ -4039,23 +4055,29 @@ impl VulkanRenderer {
                 }
             };
 
-        let text =
-            match TextRenderer::new(device, queue, command_pool, render_pass, &memory_properties) {
-                Ok(t) => t,
-                Err(e) => {
-                    unsafe {
-                        device.destroy_pipeline(quad_pipeline, None);
-                        device.destroy_pipeline_layout(quad_pipeline_layout, None);
-                        device.destroy_semaphore(image_available, None);
-                        device.destroy_semaphore(render_finished, None);
-                        in_flight.destroy(device);
-                        device.destroy_command_pool(command_pool, None);
-                        swapchain.destroy(device, &swapchain_loader);
-                        device.destroy_render_pass(render_pass, None);
-                    }
-                    return Err(e);
+        let text = match TextRenderer::new(
+            device,
+            queue,
+            command_pool,
+            render_pass,
+            &memory_properties,
+            TEXT_PX,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                unsafe {
+                    device.destroy_pipeline(quad_pipeline, None);
+                    device.destroy_pipeline_layout(quad_pipeline_layout, None);
+                    device.destroy_semaphore(image_available, None);
+                    device.destroy_semaphore(render_finished, None);
+                    in_flight.destroy(device);
+                    device.destroy_command_pool(command_pool, None);
+                    swapchain.destroy(device, &swapchain_loader);
+                    device.destroy_render_pass(render_pass, None);
                 }
-            };
+                return Err(e);
+            }
+        };
 
         let composite = match CanvasCompositor::new(device, render_pass) {
             Ok(c) => Some(c),
@@ -4201,7 +4223,29 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    fn set_text_scale(&mut self, scale: f64) -> Result<(), GraphicsError> {
+        unsafe { self.device.device_wait_idle() }.map_err(|e| {
+            GraphicsError::Vulkan(format!("wait before replacing the text atlas: {e}"))
+        })?;
+        let text = TextRenderer::new(
+            &self.device,
+            self.queue,
+            self.command_pool,
+            self.render_pass,
+            &self.memory_properties,
+            TEXT_PX * scale as f32,
+        )?;
+        if let Some(previous) = std::mem::replace(&mut self.text, text) {
+            unsafe { previous.destroy(&self.device) };
+        }
+        Ok(())
+    }
+
     fn draw_frame(&mut self, window: &Window) -> Result<(), GraphicsError> {
+        self.draw_nodes(window, &crate::framework::view_registry::snapshot_tree())
+    }
+
+    fn draw_nodes(&mut self, window: &Window, nodes: &[RenderNode]) -> Result<(), GraphicsError> {
         if self.needs_recreate {
             self.recreate_swapchain(window)?;
             if self.swapchain.framebuffers.is_empty() {
@@ -4213,11 +4257,10 @@ impl VulkanRenderer {
             .retire(&self.device)
             .map_err(|e| GraphicsError::Vulkan(format!("wait for the previous frame: {e}")))?;
 
-        let nodes = crate::framework::view_registry::snapshot_tree();
         let extent = self.swapchain.extent;
 
         let measure = self.text.as_ref().map(|t| TextMeasure { atlas: &t.atlas });
-        let views = layout_views(&nodes, extent, measure);
+        let views = layout_views(nodes, extent, measure);
 
         if !views.is_empty() {
             static LOGGED: std::sync::Once = std::sync::Once::new();
@@ -4717,11 +4760,12 @@ impl TextRenderer {
         command_pool: vk::CommandPool,
         render_pass: vk::RenderPass,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        text_px: f32,
     ) -> Result<Option<Self>, GraphicsError> {
         let Some(font) = crate::host_fonts::system_font() else {
             return Ok(None);
         };
-        let Some(atlas) = build_glyph_atlas(font, 1024) else {
+        let Some(atlas) = build_glyph_atlas(font, text_px, 1024) else {
             tracing::warn!("glyph atlas came out empty; text disabled");
             return Ok(None);
         };
@@ -7443,7 +7487,7 @@ mod tests {
         let Some(font) = crate::host_fonts::system_font() else {
             return;
         };
-        let atlas = build_glyph_atlas(font, 1024).expect("atlas builds from a real font");
+        let atlas = build_glyph_atlas(font, TEXT_PX, 1024).expect("atlas builds from a real font");
         assert!(atlas.width > 0 && atlas.height > 0);
         assert_eq!(atlas.pixels.len(), (atlas.width * atlas.height) as usize);
 

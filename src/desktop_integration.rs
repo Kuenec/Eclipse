@@ -242,7 +242,7 @@ fn desktop_entry(handler: &Path) -> Result<String, Box<dyn std::error::Error>> {
          Comment=Launch Roblox experiences through Eclipse\n\
          NoDisplay=true\n\
          Terminal=false\n\
-         StartupNotify=false\n\
+         StartupNotify=true\n\
          Exec={handler} {BROWSER_HANDLER_COMMAND} %u\n\
          MimeType={mime_types}\n"
     ))
