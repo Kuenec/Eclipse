@@ -273,10 +273,7 @@ fn install_client_settings_and_reexec(args: &[String]) -> Result<(), Box<dyn std
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::process::CommandExt as _;
 
-    let config = eclipse::config::Config::load()?;
-    let Some(json) = config.client_app_settings_json()? else {
-        return Ok(());
-    };
+    let json = eclipse::config::Config::load()?.client_app_settings_json()?;
     let app_data_dir = eclipse::framework::app_data_dir().ok_or(
         "cannot resolve Eclipse's app-data directory; set HOME, XDG_DATA_HOME, or ECLIPSE_APP_DATA_DIR",
     )?;

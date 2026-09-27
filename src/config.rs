@@ -118,15 +118,21 @@ impl Config {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    pub fn client_app_settings_json(&self) -> Result<Option<Vec<u8>>, ConfigError> {
-        if self.fflags.is_empty() {
-            return Ok(None);
-        }
-        let mut json = serde_json::to_vec_pretty(&self.fflags)?;
+    pub fn client_app_settings_json(&self) -> Result<Vec<u8>, ConfigError> {
+        let mut fflags: BTreeMap<&str, serde_json::Value> =
+            BTreeMap::from([(MAXIMUM_FRAME_RATE_ROW_FLAG, serde_json::Value::from("True"))]);
+        fflags.extend(
+            self.fflags
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone())),
+        );
+        let mut json = serde_json::to_vec_pretty(&fflags)?;
         json.push(b'\n');
-        Ok(Some(json))
+        Ok(json)
     }
 }
+
+const MAXIMUM_FRAME_RATE_ROW_FLAG: &str = "FFlagGameBasicSettingsFramerateCap5";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -221,24 +227,43 @@ mod tests {
         assert_eq!(TouchMode::FakeOff.as_str(), "fake-off");
     }
 
-    #[test]
-    fn client_app_settings_are_absent_without_user_fflags() {
-        assert_eq!(Config::default().client_app_settings_json().unwrap(), None);
+    fn client_app_settings(cfg: &Config) -> serde_json::Value {
+        serde_json::from_slice(&cfg.client_app_settings_json().unwrap()).unwrap()
     }
 
     #[test]
-    fn client_app_settings_contain_exactly_the_user_fflags() {
+    fn client_app_settings_enable_only_the_maximum_frame_rate_row_by_default() {
+        assert_eq!(
+            client_app_settings(&Config::default()),
+            serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "True"})
+        );
+    }
+
+    #[test]
+    fn client_app_settings_add_the_user_fflags_to_the_default() {
         let mut cfg = Config::default();
         cfg.fflags.insert(
             "DFIntExample".to_string(),
             serde_json::Value::Number(42.into()),
         );
-        let json = cfg
-            .client_app_settings_json()
-            .unwrap()
-            .expect("user fflags produce a settings file");
-        let settings: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        assert_eq!(settings, serde_json::json!({"DFIntExample": 42}));
+        assert_eq!(
+            client_app_settings(&cfg),
+            serde_json::json!({
+                "DFIntExample": 42,
+                "FFlagGameBasicSettingsFramerateCap5": "True",
+            })
+        );
+    }
+
+    #[test]
+    fn user_fflags_override_the_default_flag() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"fflags": {"FFlagGameBasicSettingsFramerateCap5": "False"}}"#)
+                .expect("parse");
+        assert_eq!(
+            client_app_settings(&cfg),
+            serde_json::json!({"FFlagGameBasicSettingsFramerateCap5": "False"})
+        );
     }
 
     #[test]
