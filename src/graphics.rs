@@ -302,28 +302,19 @@ impl ApplicationHandler<crate::framework::MainLooperWake> for GameWindow<'_> {
             }
         }
 
-        match window.display_handle() {
-            Ok(dh) => match dh.as_raw() {
-                RawDisplayHandle::Wayland(d) => {
-                    crate::loader::ndk_registry::set_wsi_display(Some(d.display.as_ptr() as usize));
-                    self.relative_motion_units = RelativeMotionUnits::SurfaceLogical;
-                }
-                _ => crate::loader::ndk_registry::set_wsi_display(None),
-            },
-            Err(_) => crate::loader::ndk_registry::set_wsi_display(None),
+        let wsi_target = match (window.display_handle(), window.window_handle()) {
+            (Ok(display), Ok(surface)) => {
+                crate::loader::ndk_registry::WsiTarget::from_raw(display.as_raw(), surface.as_raw())
+            }
+            _ => None,
+        };
+        if matches!(
+            wsi_target,
+            Some(crate::loader::ndk_registry::WsiTarget::Wayland { .. })
+        ) {
+            self.relative_motion_units = RelativeMotionUnits::SurfaceLogical;
         }
-
-        match window.window_handle() {
-            Ok(wh) => match wh.as_raw() {
-                RawWindowHandle::Wayland(s) => {
-                    crate::loader::ndk_registry::set_wsi_wl_surface(Some(
-                        s.surface.as_ptr() as usize
-                    ));
-                }
-                _ => crate::loader::ndk_registry::set_wsi_wl_surface(None),
-            },
-            Err(_) => crate::loader::ndk_registry::set_wsi_wl_surface(None),
-        }
+        crate::loader::ndk_registry::set_wsi_target(wsi_target);
 
         self.window = Some(window);
         self.publish_engine_display_refresh_rates();

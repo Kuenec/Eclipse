@@ -213,9 +213,24 @@ fn host_get_instance_proc_addr() -> Option<vk::PFN_vkGetInstanceProcAddr> {
     host_entry().map(|e| e.static_fn().get_instance_proc_addr)
 }
 
-unsafe fn swap_android_for_wayland_surface(names: &[*const c_char]) -> Vec<*const c_char> {
+fn host_surface_extension(target: ndk_registry::WsiTarget) -> &'static CStr {
+    match target {
+        ndk_registry::WsiTarget::Wayland { .. } => vk::KHR_WAYLAND_SURFACE_NAME,
+        ndk_registry::WsiTarget::Xlib { .. } => vk::KHR_XLIB_SURFACE_NAME,
+    }
+}
+
+unsafe fn requests_android_surface(names: &[*const c_char]) -> bool {
+    names
+        .iter()
+        .any(|&p| !p.is_null() && unsafe { CStr::from_ptr(p) } == vk::KHR_ANDROID_SURFACE_NAME)
+}
+
+unsafe fn swap_android_surface(
+    names: &[*const c_char],
+    host_surface: &'static CStr,
+) -> Vec<*const c_char> {
     let android = vk::KHR_ANDROID_SURFACE_NAME;
-    let wayland = vk::KHR_WAYLAND_SURFACE_NAME;
     names
         .iter()
         .map(|&p| {
@@ -225,7 +240,7 @@ unsafe fn swap_android_for_wayland_surface(names: &[*const c_char]) -> Vec<*cons
 
             let s = unsafe { CStr::from_ptr(p) };
             if s == android {
-                wayland.as_ptr()
+                host_surface.as_ptr()
             } else {
                 p
             }
@@ -324,7 +339,18 @@ pub(crate) unsafe extern "system" fn eclipse_vk_create_instance(
             }
         };
 
-    let rewritten = unsafe { swap_android_for_wayland_surface(names) };
+    let rewritten = match ndk_registry::wsi_target() {
+        Some(target) => unsafe { swap_android_surface(names, host_surface_extension(target)) },
+        None if unsafe { requests_android_surface(names) } => {
+            tracing::error!(
+                "vkCreateInstance asked for VK_KHR_android_surface before the host window \
+                 recorded a Wayland or X11 surface target; Eclipse needs a Wayland or X11 \
+                 session (WAYLAND_DISPLAY or DISPLAY)"
+            );
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        None => names.to_vec(),
+    };
 
     let mut patched = ci;
     patched.enabled_extension_count = rewritten.len() as u32;
@@ -346,27 +372,38 @@ pub(crate) unsafe extern "system" fn eclipse_vk_create_android_surface_khr(
     p_allocator: *const vk::AllocationCallbacks<'_>,
     p_surface: *mut vk::SurfaceKHR,
 ) -> vk::Result {
-    let (Some(display), Some(surface)) =
-        (ndk_registry::wsi_display(), ndk_registry::wsi_wl_surface())
-    else {
+    let Some(target) = ndk_registry::wsi_target() else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let Some(host_gipa) = host_get_instance_proc_addr() else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
 
-    let pfn = unsafe { host_gipa(instance, c"vkCreateWaylandSurfaceKHR".as_ptr()) };
-    let Some(pfn) = pfn else {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
-    };
-
-    let create_wayland: vk::PFN_vkCreateWaylandSurfaceKHR = unsafe { std::mem::transmute(pfn) };
-
-    let create_info = vk::WaylandSurfaceCreateInfoKHR::default()
-        .display(display as *mut vk::wl_display)
-        .surface(surface as *mut vk::wl_surface);
-
-    unsafe { create_wayland(instance, &create_info, p_allocator, p_surface) }
+    match target {
+        ndk_registry::WsiTarget::Wayland { display, surface } => {
+            let pfn = unsafe { host_gipa(instance, c"vkCreateWaylandSurfaceKHR".as_ptr()) };
+            let Some(pfn) = pfn else {
+                return vk::Result::ERROR_INITIALIZATION_FAILED;
+            };
+            let create_wayland: vk::PFN_vkCreateWaylandSurfaceKHR =
+                unsafe { std::mem::transmute(pfn) };
+            let create_info = vk::WaylandSurfaceCreateInfoKHR::default()
+                .display(display as *mut vk::wl_display)
+                .surface(surface as *mut vk::wl_surface);
+            unsafe { create_wayland(instance, &create_info, p_allocator, p_surface) }
+        }
+        ndk_registry::WsiTarget::Xlib { display, window } => {
+            let pfn = unsafe { host_gipa(instance, c"vkCreateXlibSurfaceKHR".as_ptr()) };
+            let Some(pfn) = pfn else {
+                return vk::Result::ERROR_INITIALIZATION_FAILED;
+            };
+            let create_xlib: vk::PFN_vkCreateXlibSurfaceKHR = unsafe { std::mem::transmute(pfn) };
+            let create_info = vk::XlibSurfaceCreateInfoKHR::default()
+                .dpy(display as *mut vk::Display)
+                .window(window);
+            unsafe { create_xlib(instance, &create_info, p_allocator, p_surface) }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn swap_android_for_wayland_surface_replaces_only_android_and_preserves_order() {
+    fn swap_android_surface_replaces_only_android_and_preserves_order() {
         let surface = vk::KHR_SURFACE_NAME;
         let pdp2 = c"VK_KHR_get_physical_device_properties2";
         let android = vk::KHR_ANDROID_SURFACE_NAME;
@@ -454,7 +491,7 @@ mod tests {
 
         let input: [*const c_char; 3] = [surface.as_ptr(), pdp2.as_ptr(), android.as_ptr()];
 
-        let out = unsafe { swap_android_for_wayland_surface(&input) };
+        let out = unsafe { swap_android_surface(&input, vk::KHR_WAYLAND_SURFACE_NAME) };
         assert_eq!(out.len(), 3, "length is preserved");
 
         let as_cstr = |p: *const c_char| {
@@ -485,18 +522,18 @@ mod tests {
     }
 
     #[test]
-    fn swap_android_for_wayland_surface_is_identity_without_android() {
+    fn swap_android_surface_is_identity_without_android() {
         let surface = vk::KHR_SURFACE_NAME;
         let wayland = vk::KHR_WAYLAND_SURFACE_NAME;
         let input: [*const c_char; 2] = [surface.as_ptr(), wayland.as_ptr()];
 
-        let out = unsafe { swap_android_for_wayland_surface(&input) };
+        let out = unsafe { swap_android_surface(&input, vk::KHR_WAYLAND_SURFACE_NAME) };
         assert_eq!(out.len(), 2);
 
         assert_eq!(unsafe { CStr::from_ptr(out[0]) }, surface);
         assert_eq!(unsafe { CStr::from_ptr(out[1]) }, wayland);
 
-        let empty = unsafe { swap_android_for_wayland_surface(&[]) };
+        let empty = unsafe { swap_android_surface(&[], vk::KHR_WAYLAND_SURFACE_NAME) };
         assert!(empty.is_empty(), "empty extension list stays empty");
     }
 
@@ -696,5 +733,264 @@ mod tests {
             android_modes(host_that_gains_a_mode_after_counting),
             HOST_WITH_TEARING.to_vec()
         );
+    }
+
+    #[test]
+    fn android_surface_becomes_the_host_window_system_surface() {
+        let xlib = ndk_registry::WsiTarget::Xlib {
+            display: 0x1000,
+            window: 0x2a0_0002,
+        };
+        let wayland = ndk_registry::WsiTarget::Wayland {
+            display: 0x1000,
+            surface: 0x2000,
+        };
+        assert_eq!(host_surface_extension(xlib), vk::KHR_XLIB_SURFACE_NAME);
+        assert_eq!(
+            host_surface_extension(wayland),
+            vk::KHR_WAYLAND_SURFACE_NAME
+        );
+
+        let input = [
+            vk::KHR_SURFACE_NAME.as_ptr(),
+            vk::KHR_ANDROID_SURFACE_NAME.as_ptr(),
+        ];
+        let out = unsafe { swap_android_surface(&input, host_surface_extension(xlib)) };
+        assert_eq!(unsafe { CStr::from_ptr(out[0]) }, vk::KHR_SURFACE_NAME);
+        assert_eq!(unsafe { CStr::from_ptr(out[1]) }, vk::KHR_XLIB_SURFACE_NAME);
+        assert!(unsafe { requests_android_surface(&input) });
+        assert!(!unsafe { requests_android_surface(&out) });
+    }
+
+    const X11_SURFACE_CHILD: &str = "ECLIPSE_TEST_X11_SURFACE_CHILD";
+
+    type XOpenDisplay = unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void;
+    type XDefaultRootWindow = unsafe extern "C" fn(*mut std::ffi::c_void) -> std::ffi::c_ulong;
+    type XCreateSimpleWindow = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        std::ffi::c_ulong,
+        std::ffi::c_int,
+        std::ffi::c_int,
+        std::ffi::c_uint,
+        std::ffi::c_uint,
+        std::ffi::c_uint,
+        std::ffi::c_ulong,
+        std::ffi::c_ulong,
+    ) -> std::ffi::c_ulong;
+    type XSync = unsafe extern "C" fn(*mut std::ffi::c_void, std::ffi::c_int) -> std::ffi::c_int;
+    type XDefaultScreen = unsafe extern "C" fn(*mut std::ffi::c_void) -> std::ffi::c_int;
+    type XDefaultVisual =
+        unsafe extern "C" fn(*mut std::ffi::c_void, std::ffi::c_int) -> *mut std::ffi::c_void;
+    type XVisualIDFromVisual = unsafe extern "C" fn(*mut std::ffi::c_void) -> std::ffi::c_ulong;
+    type XDestroyWindow =
+        unsafe extern "C" fn(*mut std::ffi::c_void, std::ffi::c_ulong) -> std::ffi::c_int;
+    type XCloseDisplay = unsafe extern "C" fn(*mut std::ffi::c_void) -> std::ffi::c_int;
+
+    struct UnmappedXlibWindow {
+        display: *mut std::ffi::c_void,
+        window: std::ffi::c_ulong,
+        visual_id: std::ffi::c_ulong,
+        destroy_window: XDestroyWindow,
+        close_display: XCloseDisplay,
+        _lib: libloading::Library,
+    }
+
+    impl UnmappedXlibWindow {
+        fn open() -> Result<Self, String> {
+            let lib =
+                unsafe { libloading::Library::new("libX11.so.6") }.map_err(|e| e.to_string())?;
+            let symbol = |name: &[u8]| -> Result<*const (), String> {
+                unsafe { lib.get::<*const ()>(name) }
+                    .map(|s| *s)
+                    .map_err(|e| e.to_string())
+            };
+            let (open_display, default_root, create_window, sync, destroy_window, close_display) = unsafe {
+                (
+                    std::mem::transmute::<*const (), XOpenDisplay>(symbol(b"XOpenDisplay\0")?),
+                    std::mem::transmute::<*const (), XDefaultRootWindow>(symbol(
+                        b"XDefaultRootWindow\0",
+                    )?),
+                    std::mem::transmute::<*const (), XCreateSimpleWindow>(symbol(
+                        b"XCreateSimpleWindow\0",
+                    )?),
+                    std::mem::transmute::<*const (), XSync>(symbol(b"XSync\0")?),
+                    std::mem::transmute::<*const (), XDestroyWindow>(symbol(b"XDestroyWindow\0")?),
+                    std::mem::transmute::<*const (), XCloseDisplay>(symbol(b"XCloseDisplay\0")?),
+                )
+            };
+            let (default_screen, default_visual, visual_id_of) = unsafe {
+                (
+                    std::mem::transmute::<*const (), XDefaultScreen>(symbol(b"XDefaultScreen\0")?),
+                    std::mem::transmute::<*const (), XDefaultVisual>(symbol(b"XDefaultVisual\0")?),
+                    std::mem::transmute::<*const (), XVisualIDFromVisual>(symbol(
+                        b"XVisualIDFromVisual\0",
+                    )?),
+                )
+            };
+            let display = unsafe { open_display(std::ptr::null()) };
+            if display.is_null() {
+                return Err("XOpenDisplay(NULL) failed".into());
+            }
+            let (window, visual_id) = unsafe {
+                let window = create_window(display, default_root(display), 0, 0, 64, 64, 0, 0, 0);
+                sync(display, 0);
+                (
+                    window,
+                    visual_id_of(default_visual(display, default_screen(display))),
+                )
+            };
+            Ok(Self {
+                display,
+                window,
+                visual_id,
+                destroy_window,
+                close_display,
+                _lib: lib,
+            })
+        }
+    }
+
+    impl Drop for UnmappedXlibWindow {
+        fn drop(&mut self) {
+            unsafe {
+                (self.destroy_window)(self.display, self.window);
+                (self.close_display)(self.display);
+            }
+        }
+    }
+
+    fn bionic_native(name: &str) -> u64 {
+        use super::super::resolve::SymbolProvider;
+        super::super::native_provider::EclipseNativeProvider::with_bionic_natives()
+            .resolve(name)
+            .unwrap_or_else(|| panic!("{name} is an Eclipse native"))
+            .addr
+    }
+
+    fn engine_vulkan_surface_on(window: &UnmappedXlibWindow) {
+        let create_instance: vk::PFN_vkCreateInstance =
+            unsafe { std::mem::transmute(bionic_native("vkCreateInstance") as usize) };
+        let create_android_surface: vk::PFN_vkCreateAndroidSurfaceKHR =
+            unsafe { std::mem::transmute(bionic_native("vkCreateAndroidSurfaceKHR") as usize) };
+        let extensions = [
+            vk::KHR_SURFACE_NAME.as_ptr(),
+            vk::KHR_ANDROID_SURFACE_NAME.as_ptr(),
+        ];
+        let create_info = vk::InstanceCreateInfo::default().enabled_extension_names(&extensions);
+        let mut instance = vk::Instance::null();
+        let created = unsafe { create_instance(&create_info, std::ptr::null(), &mut instance) };
+        if created != vk::Result::SUCCESS {
+            eprintln!("SKIP: no Vulkan driver offers VK_KHR_xlib_surface ({created:?})");
+            return;
+        }
+        let entry = host_entry().expect("vkCreateInstance succeeded through the host loader");
+        let instance = unsafe { ash::Instance::load(entry.static_fn(), instance) };
+        let mut surface = vk::SurfaceKHR::null();
+        let result = unsafe {
+            create_android_surface(
+                instance.handle(),
+                &vk::AndroidSurfaceCreateInfoKHR::default(),
+                std::ptr::null(),
+                &mut surface,
+            )
+        };
+        let surfaces = ash::khr::surface::Instance::new(entry, &instance);
+        unsafe {
+            if result == vk::Result::SUCCESS {
+                surfaces.destroy_surface(surface, None);
+            }
+            instance.destroy_instance(None);
+        }
+        assert_eq!(result, vk::Result::SUCCESS, "window {:#x}", window.window);
+        assert_ne!(surface, vk::SurfaceKHR::null());
+    }
+
+    fn engine_egl_surface_on(window: &UnmappedXlibWindow) {
+        use khronos_egl as egl;
+        let get_display: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
+            unsafe { std::mem::transmute(bionic_native("eglGetDisplay") as usize) };
+        let lib =
+            unsafe { libloading::Library::new(super::super::native_provider::HOST_EGL_SONAME) }
+                .expect("host libEGL");
+        let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }
+            .expect("EGL 1.4 entry points");
+        let raw = unsafe { get_display(std::ptr::null_mut()) };
+        assert!(!raw.is_null(), "eglGetDisplay(EGL_DEFAULT_DISPLAY) on X11");
+        let display = unsafe { egl::Display::from_ptr(raw) };
+        egl.initialize(display).expect("eglInitialize");
+        let attribs = [
+            egl::SURFACE_TYPE,
+            egl::WINDOW_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES2_BIT,
+            egl::NONE,
+        ];
+        let mut configs = Vec::with_capacity(256);
+        egl.choose_config(display, &attribs, &mut configs)
+            .expect("eglChooseConfig");
+        let config = configs
+            .into_iter()
+            .find(|&config| {
+                egl.get_config_attrib(display, config, egl::NATIVE_VISUAL_ID)
+                    .is_ok_and(|id| id as std::ffi::c_ulong == window.visual_id)
+            })
+            .expect("a GLES2 window config for the window's visual");
+        let surface = unsafe {
+            egl.create_window_surface(
+                display,
+                config,
+                window.window as egl::NativeWindowType,
+                None,
+            )
+        }
+        .expect("eglCreateWindowSurface on the X11 window");
+        egl.destroy_surface(display, surface)
+            .expect("eglDestroySurface");
+        egl.terminate(display).expect("eglTerminate");
+    }
+
+    #[test]
+    fn x11_window_backs_the_engine_vulkan_and_egl_surfaces() {
+        if std::env::var_os(X11_SURFACE_CHILD).is_none() {
+            if std::env::var_os("DISPLAY").is_none() {
+                eprintln!("SKIP: no X11 display (DISPLAY unset)");
+                return;
+            }
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("the test harness executable must have a path"),
+            )
+            .args([
+                "--exact",
+                "loader::vulkan_wsi::tests::x11_window_backs_the_engine_vulkan_and_egl_surfaces",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(X11_SURFACE_CHILD, "1")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET")
+            .output()
+            .expect("the X11 surface child must start");
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && report.contains("1 passed"),
+                "status={:?}, stdout={report}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let window = match UnmappedXlibWindow::open() {
+            Ok(window) => window,
+            Err(e) => {
+                eprintln!("SKIP: no usable X11 display ({e})");
+                return;
+            }
+        };
+        ndk_registry::set_wsi_target(Some(ndk_registry::WsiTarget::Xlib {
+            display: window.display as usize,
+            window: window.window,
+        }));
+        engine_vulkan_surface_on(&window);
+        engine_egl_surface_on(&window);
     }
 }

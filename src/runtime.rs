@@ -9,8 +9,11 @@ use directories::ProjectDirs;
 
 use crate::apk::Manifest;
 use crate::config::{Config, TouchMode};
+use crate::host_locale::HostLocale;
 
 const DEFAULT_SDK_INT: u32 = 33;
+
+const JAVA_SDK_INT_CEILING: u32 = 28;
 
 pub(crate) const HEAP_MIB: u32 = 768;
 
@@ -145,6 +148,8 @@ pub struct BootPlan {
     pub graphics_backend: GraphicsBackend,
 
     pub touch_mode: TouchMode,
+
+    pub(crate) host_locale: Option<HostLocale>,
 }
 
 impl BootPlan {
@@ -162,6 +167,7 @@ impl BootPlan {
                 GraphicsBackend::Vulkan
             },
             touch_mode: config.touch_mode,
+            host_locale: HostLocale::from_env(|name| std::env::var_os(name)),
         }
     }
 
@@ -172,8 +178,13 @@ impl BootPlan {
     }
 
     #[must_use]
+    pub fn java_sdk_int(&self) -> u32 {
+        self.sdk_int.min(JAVA_SDK_INT_CEILING)
+    }
+
+    #[must_use]
     pub fn vm_options(&self) -> Vec<String> {
-        let mut opts = Vec::with_capacity(9);
+        let mut opts = Vec::with_capacity(10);
         opts.push(format!("-Xmx{}m", self.heap_mib));
         opts.push(format!("-XX:HeapGrowthLimit={}m", self.heap_mib));
         if self.disable_hspace_compact {
@@ -187,9 +198,12 @@ impl BootPlan {
             self.instruction_set_features
         ));
 
-        opts.push(format!("-DBuild.VERSION.SDK_INT={}", self.sdk_int.min(28)));
+        opts.push(format!("-DBuild.VERSION.SDK_INT={}", self.java_sdk_int()));
 
         opts.push(format!("-Declipse.touch_mode={}", self.touch_mode.as_str()));
+        if let Some(locale) = &self.host_locale {
+            opts.push(format!("-Duser.locale={}", locale.language_tag()));
+        }
         opts
     }
 }
@@ -744,6 +758,10 @@ pub fn boot(
     }
     for opt in plan.vm_options() {
         option_strings.push(make_cstring(opt)?);
+    }
+    crate::loader::ndk_registry::set_device_api_level(plan.java_sdk_int());
+    if let Some(locale) = &plan.host_locale {
+        crate::loader::ndk_registry::set_configuration_locale(locale.configuration_locale());
     }
 
     for opt in vm_options_from_env(std::env::var_os("ECLIPSE_VM_OPTIONS").as_deref()) {
@@ -1377,6 +1395,32 @@ mod tests {
             low.vm_options()
                 .contains(&"-DBuild.VERSION.SDK_INT=21".to_owned()),
             "a sub-28 target is propagated verbatim"
+        );
+        assert_eq!(plan.java_sdk_int(), 28);
+        assert_eq!(low.java_sdk_int(), 21);
+    }
+
+    #[test]
+    fn vm_options_publish_the_host_locale_as_the_java_default_locale() {
+        let mut plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        plan.host_locale = HostLocale::from_env(|name| {
+            (name == "LANG").then(|| std::ffi::OsString::from("fr_FR.UTF-8"))
+        });
+        assert!(
+            plan.vm_options()
+                .contains(&"-Duser.locale=fr-FR".to_owned()),
+            "{:?}",
+            plan.vm_options()
+        );
+
+        plan.host_locale = None;
+        assert!(
+            !plan
+                .vm_options()
+                .iter()
+                .any(|o| o.starts_with("-Duser.locale")),
+            "without a host locale libcore keeps its en-US default: {:?}",
+            plan.vm_options()
         );
     }
 

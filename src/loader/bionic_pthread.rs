@@ -1023,6 +1023,7 @@ unsafe extern "C" fn eclipse_gettid() -> c_int {
 unsafe extern "C-unwind" fn eclipse_pthread_exit(_retval: *mut c_void) -> ! {
     run_cxa_thread_dtors();
     run_thread_key_destructors();
+    hold_tid_until_joined_or_detached();
 
     unsafe {
         let sym = libc::dlsym(libc::RTLD_DEFAULT, c"pthread_exit".as_ptr());
@@ -1048,12 +1049,34 @@ const PR_SET_NAME: c_int = 15;
 const PTHREAD_CREATE_JOINABLE: c_int = 0;
 const PTHREAD_CREATE_DETACHED: c_int = 1;
 
-static THREAD_REGISTRY: Mutex<Vec<(i32, libc::pthread_t)>> = Mutex::new(Vec::new());
+struct JoinableThread {
+    tid: i32,
+    host: libc::pthread_t,
+    released: Arc<AtomicU32>,
+}
+
+static THREAD_REGISTRY: Mutex<Vec<JoinableThread>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static TID_RELEASE: RefCell<Option<Arc<AtomicU32>>> = const { RefCell::new(None) };
+}
 
 fn take_host_handle(tid: i32) -> Option<libc::pthread_t> {
     let mut registry = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    let index = registry.iter().position(|(t, _)| *t == tid)?;
-    Some(registry.swap_remove(index).1)
+    let index = registry.iter().position(|thread| thread.tid == tid)?;
+    let thread = registry.swap_remove(index);
+    thread.released.store(1, Ordering::Release);
+    futex_wake_u32(&thread.released, 1);
+    Some(thread.host)
+}
+
+fn hold_tid_until_joined_or_detached() {
+    let Some(released) = TID_RELEASE.with_borrow_mut(Option::take) else {
+        return;
+    };
+    while released.load(Ordering::Acquire) == 0 {
+        futex_wait_u32(&released, 0);
+    }
 }
 
 struct SpawnArgs {
@@ -1061,11 +1084,22 @@ struct SpawnArgs {
     arg: *mut c_void,
 
     child_tid: Arc<AtomicU32>,
+
+    released: Option<Arc<AtomicU32>>,
 }
 
 extern "C-unwind" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
     let boxed = unsafe { Box::from_raw(raw as *mut SpawnArgs) };
     let tid = gettid();
+    if let Some(released) = &boxed.released {
+        let mut registry = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        registry.push(JoinableThread {
+            tid,
+            host: unsafe { libc::pthread_self() },
+            released: Arc::clone(released),
+        });
+    }
+    TID_RELEASE.set(boxed.released.clone());
 
     boxed.child_tid.store(tid as u32, Ordering::Release);
     futex_wake_u32(&boxed.child_tid, 1);
@@ -1080,6 +1114,7 @@ extern "C-unwind" fn thread_trampoline(raw: *mut c_void) -> *mut c_void {
     let ret = start(arg);
     run_cxa_thread_dtors();
     run_thread_key_destructors();
+    hold_tid_until_joined_or_detached();
     ret
 }
 
@@ -1151,6 +1186,7 @@ unsafe extern "C" fn eclipse_pthread_create(
         start,
         arg,
         child_tid: Arc::clone(&child_tid),
+        released: (!detached).then(|| Arc::new(AtomicU32::new(0))),
     });
 
     let spawn_ptr = Box::into_raw(spawn);
@@ -1183,9 +1219,6 @@ unsafe extern "C" fn eclipse_pthread_create(
 
     if detached {
         unsafe { libc::pthread_detach(host_handle) };
-    } else {
-        let mut reg = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        reg.push((tid, host_handle));
     }
 
     if !thread.is_null() {
@@ -2539,6 +2572,93 @@ mod tests {
         }
     }
 
+    fn wait_until_exited_or_parked(tid: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let parked = format!("{SYS_FUTEX} ");
+        while std::time::Instant::now() < deadline {
+            match std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")) {
+                Err(_) => return,
+                Ok(syscall) if syscall.starts_with(&parked) => return,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        panic!("thread {tid} neither exited nor parked");
+    }
+
+    #[test]
+    fn finished_joinable_thread_keeps_its_tid_until_joined() {
+        static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        extern "C" fn finishes_at_once(_a: *mut c_void) -> *mut c_void {
+            STARTED.store(true, Ordering::Release);
+            0xA as *mut c_void
+        }
+        let mut tid: usize = 0;
+        let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+        assert_eq!(
+            unsafe {
+                eclipse_pthread_create(
+                    tp,
+                    std::ptr::null(),
+                    Some(finishes_at_once),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        while !STARTED.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        wait_until_exited_or_parked(tid);
+        assert!(
+            std::path::Path::new(&format!("/proc/self/task/{tid}")).exists(),
+            "an unjoined thread keeps its TID, so no new thread can reuse its pthread_t"
+        );
+        let mut ret: *mut c_void = std::ptr::null_mut();
+        assert_eq!(unsafe { eclipse_pthread_join(tid, &mut ret) }, 0);
+        assert_eq!(ret as usize, 0xA);
+    }
+
+    #[test]
+    fn a_thread_can_detach_itself_as_soon_as_it_starts() {
+        static FAILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn detach_self(_a: *mut c_void) -> *mut c_void {
+            if unsafe { eclipse_pthread_detach(eclipse_pthread_self()) } != 0 {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+            std::ptr::null_mut()
+        }
+        let mut tids = Vec::new();
+        for _ in 0..200 {
+            let mut tid: usize = 0;
+            let tp = std::ptr::addr_of_mut!(tid) as *mut c_void;
+            assert_eq!(
+                unsafe {
+                    eclipse_pthread_create(
+                        tp,
+                        std::ptr::null(),
+                        Some(detach_self),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            tids.push(tid as i32);
+        }
+        for &tid in &tids {
+            wait_until_exited_or_parked(tid as usize);
+        }
+        assert_eq!(
+            FAILED.load(Ordering::Relaxed),
+            0,
+            "self-detach found no entry"
+        );
+        let registry = THREAD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !registry.iter().any(|thread| tids.contains(&thread.tid)),
+            "a self-detached thread leaves no registry entry"
+        );
+    }
+
     #[test]
     fn detach_of_joinable_thread_removes_its_registry_entry() {
         extern "C" fn start(_a: *mut c_void) -> *mut c_void {
@@ -2557,7 +2677,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|(t, _)| *t == tid as i32);
+            .any(|thread| thread.tid == tid as i32);
         assert!(!registered, "detach must drop the registry entry");
         assert_eq!(
             unsafe { eclipse_pthread_join(tid, std::ptr::null_mut()) },

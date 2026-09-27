@@ -1,5 +1,6 @@
 pub mod aaudio;
 pub mod bionic_env;
+pub mod bionic_locale;
 pub mod bionic_pthread;
 pub mod bionic_sysconf;
 pub mod dlfcn;

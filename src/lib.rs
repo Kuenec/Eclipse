@@ -7,6 +7,7 @@ pub mod egl_engine;
 mod font;
 pub mod framework;
 pub mod graphics;
+mod host_locale;
 pub mod input;
 pub mod loader;
 pub mod performance;
