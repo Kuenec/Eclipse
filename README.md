@@ -71,7 +71,7 @@ Eclipse does not include Roblox. It installs the official Android client into it
 
 ### Automatic download
 
-You do not need to do anything: the first time you start Eclipse, it downloads the newest Roblox client, verifies Roblox's signature and installs it, then launches it. No Google or other account is needed. Eclipse gets the client from [APKCombo](https://apkcombo.com/roblox/com.roblox.client/), which mirrors Roblox's own Google Play release files; Eclipse keeps only `base.apk` and `split_config.x86_64.apk` from the download and discards everything if Roblox's signature does not verify.
+You do not need to do anything: the first time you start Eclipse, it downloads the newest Roblox client that has an x86-64 build, which APKCombo often adds some time after a new release, verifies Roblox's signature and installs it, then launches it. No Google or other account is needed. Eclipse gets the client from [APKCombo](https://apkcombo.com/roblox/com.roblox.client/), which mirrors Roblox's own Google Play release files; Eclipse keeps only `base.apk` and `split_config.x86_64.apk` from the download and discards everything if Roblox's signature does not verify.
 
 After that, starting Eclipse checks for a newer Roblox version at most every six hours and installs it before launching. If the check fails, Eclipse starts the version you already have, shows a warning, and checks again 30 minutes later at the earliest. A download that stalls or drops continues where it stopped. To check right away:
 
