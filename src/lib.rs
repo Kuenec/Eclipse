@@ -10,6 +10,7 @@ pub mod framework;
 pub mod graphics;
 mod host_fonts;
 mod host_locale;
+mod host_time_zone;
 pub mod input;
 pub mod loader;
 pub mod performance;

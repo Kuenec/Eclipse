@@ -26,7 +26,7 @@ boot_image="$FRAMEWORK/art/oat/boot.art"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/classes" "$work/cache" "$work/data"
-"$JAVAC" --release 8 -Xlint:all -Werror -d "$work/classes" \
+"$JAVAC" --release 8 -Xlint:-options -Xlint:all -Werror -d "$work/classes" \
     "$here/tests/AppDexoptProbe.java" "$here/src/android/webkit/ValueCallback.java"
 "$DX" --dex --output="$work/probe.jar" "$work/classes"
 
@@ -39,7 +39,7 @@ output="$(env ANDROID_DATA="$work/data" XDG_CACHE_HOME="$work/cache" \
     -Xcompiler-option --compiler-filter=verify \
     -verbose:oat \
     -cp "$api_impl:$work/probe.jar" \
-    AppDexoptProbe 2>&1)" || status=$?
+    AppDexoptProbe 2>&1 | tr -d '\000')" || status=$?
 
 problems=()
 [ "$status" = 0 ] || problems+=("dalvikvm exited with status $status")

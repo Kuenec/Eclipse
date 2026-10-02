@@ -1,4 +1,3 @@
-
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
 
@@ -7,7 +6,6 @@ use core::ffi::{c_char, c_int, c_long, c_longlong};
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }
 
@@ -84,7 +82,6 @@ pub extern "C" fn ldexpf(x: f32, n: c_int) -> f32 {
 pub unsafe extern "C" fn frexp(x: f64, exp: *mut c_int) -> f64 {
     let (m, e) = libm::frexp(x);
     if !exp.is_null() {
-
         unsafe { *exp = e as c_int };
     }
     m
@@ -94,7 +91,6 @@ pub unsafe extern "C" fn frexp(x: f64, exp: *mut c_int) -> f64 {
 pub unsafe extern "C" fn frexpf(x: f32, exp: *mut c_int) -> f32 {
     let (m, e) = libm::frexpf(x);
     if !exp.is_null() {
-
         unsafe { *exp = e as c_int };
     }
     m
@@ -102,10 +98,8 @@ pub unsafe extern "C" fn frexpf(x: f32, exp: *mut c_int) -> f32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn modf(x: f64, iptr: *mut f64) -> f64 {
-
     let (frac, int) = libm::modf(x);
     if !iptr.is_null() {
-
         unsafe { *iptr = int };
     }
     frac
@@ -115,7 +109,6 @@ pub unsafe extern "C" fn modf(x: f64, iptr: *mut f64) -> f64 {
 pub unsafe extern "C" fn modff(x: f32, iptr: *mut f32) -> f32 {
     let (frac, int) = libm::modff(x);
     if !iptr.is_null() {
-
         unsafe { *iptr = int };
     }
     frac
@@ -125,11 +118,9 @@ pub unsafe extern "C" fn modff(x: f32, iptr: *mut f32) -> f32 {
 pub unsafe extern "C" fn sincos(x: f64, s: *mut f64, c: *mut f64) {
     let (sin, cos) = libm::sincos(x);
     if !s.is_null() {
-
         unsafe { *s = sin };
     }
     if !c.is_null() {
-
         unsafe { *c = cos };
     }
 }
@@ -138,11 +129,9 @@ pub unsafe extern "C" fn sincos(x: f64, s: *mut f64, c: *mut f64) {
 pub unsafe extern "C" fn sincosf(x: f32, s: *mut f32, c: *mut f32) {
     let (sin, cos) = libm::sincosf(x);
     if !s.is_null() {
-
         unsafe { *s = sin };
     }
     if !c.is_null() {
-
         unsafe { *c = cos };
     }
 }
@@ -151,7 +140,6 @@ pub unsafe extern "C" fn sincosf(x: f32, s: *mut f32, c: *mut f32) {
 pub unsafe extern "C" fn remquof(x: f32, y: f32, quo: *mut c_int) -> f32 {
     let (rem, q) = libm::remquof(x, y);
     if !quo.is_null() {
-
         unsafe { *quo = q as c_int };
     }
     rem

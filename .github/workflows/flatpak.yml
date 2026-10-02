@@ -20,6 +20,7 @@ on:
 concurrency:
   group: ${{ github.ref_type == 'tag' && 'flatpak-publish' || format('flatpak-{0}', github.ref) }}
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read

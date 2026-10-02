@@ -10,6 +10,7 @@ use directories::ProjectDirs;
 use crate::apk::Manifest;
 use crate::config::{Config, TouchMode};
 use crate::host_locale::HostLocale;
+use crate::host_time_zone::HostTimeZone;
 
 const DEFAULT_SDK_INT: u32 = 33;
 
@@ -26,6 +27,8 @@ const STOCK_FRAMEWORK_SUBDIR: &str = "android_translation_layer";
 const BUNDLED_FRAMEWORK_DIR: &str = "framework";
 
 const API_IMPL_JAR: &str = "api-impl.jar";
+
+const ZONEINFO_SUBDIR: &str = "zoneinfo";
 
 const ART_OVERLAY_MARKER: &str = ".eclipse-art-overlay-v1";
 const ART_OVERLAY_MARKER_CONTENT: &str = "eclipse-art-overlay-v1\n";
@@ -150,6 +153,8 @@ pub struct BootPlan {
     pub touch_mode: TouchMode,
 
     pub(crate) host_locale: Option<HostLocale>,
+
+    pub(crate) host_time_zone: Option<HostTimeZone>,
 }
 
 impl BootPlan {
@@ -168,6 +173,7 @@ impl BootPlan {
             },
             touch_mode: config.touch_mode,
             host_locale: HostLocale::from_env(|name| std::env::var_os(name)),
+            host_time_zone: HostTimeZone::detect(),
         }
     }
 
@@ -203,6 +209,9 @@ impl BootPlan {
         opts.push(format!("-Declipse.touch_mode={}", self.touch_mode.as_str()));
         if let Some(locale) = &self.host_locale {
             opts.push(format!("-Duser.locale={}", locale.language_tag()));
+        }
+        if let Some(zone) = &self.host_time_zone {
+            opts.push(format!("-Duser.timezone={}", zone.id()));
         }
         opts
     }
@@ -279,6 +288,8 @@ struct ArtBootPaths {
     image_location: PathBuf,
 
     boot_class_path: Option<OsString>,
+
+    art_dir: PathBuf,
 }
 
 fn art_dir_from_image(image_location: &Path) -> Option<PathBuf> {
@@ -414,6 +425,7 @@ fn find_art_boot_paths(layout: &InstallLayout) -> Result<ArtBootPaths, RuntimeEr
     Ok(ArtBootPaths {
         image_location,
         boot_class_path,
+        art_dir,
     })
 }
 
@@ -778,6 +790,7 @@ pub fn boot(
             "-Xbootclasspath-locations:",
             boot_class_path,
         )?);
+        option_strings.push(zoneinfo_dir_option(&art_boot.art_dir)?);
     }
     for opt in plan.vm_options() {
         option_strings.push(make_cstring(opt)?);
@@ -864,6 +877,13 @@ pub fn boot(
 
 fn make_cstring(s: String) -> Result<CString, RuntimeError> {
     CString::new(s).map_err(|_| RuntimeError::OptionHasNul)
+}
+
+fn zoneinfo_dir_option(art_dir: &Path) -> Result<CString, RuntimeError> {
+    make_os_option(
+        "-Declipse.zoneinfo_dir=",
+        art_dir.join(ZONEINFO_SUBDIR).as_os_str(),
+    )
 }
 
 fn make_os_option(prefix: &str, value: &OsStr) -> Result<CString, RuntimeError> {
@@ -1454,6 +1474,45 @@ mod tests {
                 .any(|o| o.starts_with("-Duser.locale")),
             "without a host locale libcore keeps its en-US default: {:?}",
             plan.vm_options()
+        );
+    }
+
+    #[test]
+    fn vm_options_publish_the_host_time_zone_as_the_java_default_time_zone() {
+        let mut plan = BootPlan::new(&manifest_with(Some(35)), &Config::default());
+        let zoneinfo = crate::host_time_zone::tests::zoneinfo_with("vm-options", &["Europe/Paris"]);
+        plan.host_time_zone = HostTimeZone::from_sources(
+            &zoneinfo,
+            Some(std::ffi::OsString::from("Europe/Paris")),
+            None,
+            None,
+        );
+        std::fs::remove_dir_all(&zoneinfo).ok();
+        assert!(
+            plan.vm_options()
+                .contains(&"-Duser.timezone=Europe/Paris".to_owned()),
+            "{:?}",
+            plan.vm_options()
+        );
+
+        plan.host_time_zone = None;
+        assert!(
+            !plan
+                .vm_options()
+                .iter()
+                .any(|o| o.starts_with("-Duser.timezone")),
+            "without a host time zone libcore keeps its own default: {:?}",
+            plan.vm_options()
+        );
+    }
+
+    #[test]
+    fn zoneinfo_dir_option_points_libcore_at_the_overlay_tzdata() {
+        let option = zoneinfo_dir_option(Path::new("/app/lib/eclipse/framework/art"))
+            .expect("no NUL in test path");
+        assert_eq!(
+            option.as_bytes(),
+            b"-Declipse.zoneinfo_dir=/app/lib/eclipse/framework/art/zoneinfo"
         );
     }
 

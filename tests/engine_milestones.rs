@@ -484,6 +484,69 @@ fn framework_overlay_preserves_activity_manager_memory_contract() {
 }
 
 #[test]
+fn framework_overlay_answers_activity_permission_requests() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "invoke-static {p0, p1, p2}, Landroid/app/PermissionResultDelivery;->post(Landroid/app/Activity;[Ljava/lang/String;I)V",
+        ".method public onRequestPermissionsResult(I[Ljava/lang/String;[I)V",
+        "smali/android/app/PermissionResultDelivery.smali",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost Activity permission-request fragment {needle:?}; Roblox's \
+             permission requests would never be answered"
+        );
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let delivery_path =
+        root.join("tools/framework-overlay/smali/android/app/PermissionResultDelivery.smali");
+    let delivery = std::fs::read_to_string(&delivery_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", delivery_path.display()));
+    for needle in [
+        ".implements Ljava/lang/Runnable;",
+        "Ljava/lang/IllegalArgumentException;",
+        "Landroid/app/Activity;->checkSelfPermission(Ljava/lang/String;)I",
+        "Landroid/os/Looper;->getMainLooper()Landroid/os/Looper;",
+        "Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z",
+        "Landroid/app/Activity;->onRequestPermissionsResult(I[Ljava/lang/String;[I)V",
+    ] {
+        assert!(
+            delivery.contains(needle),
+            "PermissionResultDelivery lost fragment {needle:?}; requestPermissions would no \
+             longer answer on the main looper with the current grant results"
+        );
+    }
+}
+
+#[test]
+fn framework_overlay_ships_tzdata_and_the_host_default_time_zone() {
+    let generator = include_str!("../tools/framework-overlay/patch-framework.sh");
+    for needle in [
+        "TzdataCompactor \"$ZONEINFO_DIR\" \"$work/art/zoneinfo/tzdata\"",
+        "cp \"$work/art/zoneinfo/tzdata\" \"$OUT/art/zoneinfo/tzdata\"",
+        "const-string v1, \"eclipse.zoneinfo_dir\"",
+        "Lorg/apache/harmony/luni/internal/util/UserTimezoneGetter;-><init>()V",
+        "-Declipse.zoneinfo_dir=\"$work/art/zoneinfo\"",
+        "-Duser.timezone=America/Los_Angeles",
+        "time-zone-ok",
+    ] {
+        assert!(
+            generator.contains(needle),
+            "framework overlay lost time-zone fragment {needle:?}; Java would again report GMT \
+             for every zone"
+        );
+    }
+    let getter = include_str!(
+        "../tools/framework-overlay/smali/org/apache/harmony/luni/internal/util/UserTimezoneGetter.smali"
+    );
+    assert!(
+        getter.contains("const-string v0, \"user.timezone\""),
+        "the libcore TimezoneGetter must answer with the user.timezone Eclipse publishes"
+    );
+}
+
+#[test]
 fn input_test_delivers_ident_then_looper_wake() {
     let out = run_eclipse("__input-test", &[]);
     let text = combined(&out);

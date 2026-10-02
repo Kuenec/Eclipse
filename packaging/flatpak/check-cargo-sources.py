@@ -33,9 +33,7 @@ def locked_crates(problems):
     return crates
 
 
-def vendored_crates():
-    with open(REPO / SOURCES, encoding="utf-8") as handle:
-        sources = json.load(handle)
+def vendored_crates(sources):
     archives = {}
     checksum_files = {}
     for source in sources:
@@ -53,7 +51,16 @@ def vendored_crates():
 def main():
     problems = []
     crates = locked_crates(problems)
-    archives, checksum_files = vendored_crates()
+    with open(REPO / SOURCES, encoding="utf-8") as handle:
+        sources = json.load(handle)
+    archives, checksum_files = vendored_crates(sources)
+    cargo_files = [
+        source.get("dest-filename")
+        for source in sources
+        if source.get("dest") == "cargo"
+    ]
+    if cargo_files != ["config.toml"]:
+        problems.append(f"cargo/ receives {cargo_files}, not only config.toml")
     for crate, checksum in sorted(crates.items()):
         if archives.get(crate) != checksum:
             problems.append(
