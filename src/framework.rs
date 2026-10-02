@@ -1508,15 +1508,22 @@ fn cached_arsc_bytes(
     cache.get_or_init(load).as_deref()
 }
 
+fn framework_arsc_bytes<'a>(
+    cache: &'a OnceLock<Option<Vec<u8>>>,
+    framework_res_apk: &std::path::Path,
+) -> Option<&'a [u8]> {
+    cached_arsc_bytes(cache, || {
+        let mut apk = crate::apk::cache::FRAMEWORK_RES_APK
+            .open(framework_res_apk)
+            .ok()?;
+        apk.read_entry("resources.arsc").ok()
+    })
+}
+
 fn arsc_bytes_for(resid: u32) -> Option<&'static [u8]> {
     if (resid >> 24) as u8 == 0x01 {
         let fw = crate::runtime::find_framework().ok()?;
-        cached_arsc_bytes(&FRAMEWORK_ARSC, || {
-            let mut apk = crate::apk::cache::FRAMEWORK_RES_APK
-                .open(&fw.framework_res_apk)
-                .ok()?;
-            apk.read_entry("resources.arsc").ok()
-        })
+        framework_arsc_bytes(&FRAMEWORK_ARSC, &fw.framework_res_apk)
     } else {
         let apk_path = APK_PATH.get()?;
         cached_arsc_bytes(&APP_ARSC, || {
@@ -17941,7 +17948,7 @@ mod tests {
     }
 
     #[test]
-    fn arsc_bytes_for_routes_framework_package_to_framework_res_apk() {
+    fn framework_arsc_bytes_serve_the_framework_res_apk_table() {
         use std::io::Write;
 
         let dir = std::env::temp_dir().join(format!(
@@ -17950,7 +17957,6 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).expect("create temp framework dir");
-        std::fs::write(dir.join("api-impl.jar"), b"dummy").expect("write api-impl.jar");
 
         let arsc = build_arsc_package(0x01);
         let apk_bytes = {
@@ -17961,13 +17967,12 @@ mod tests {
             zw.write_all(&arsc).expect("write arsc");
             zw.finish().expect("finish zip").into_inner()
         };
-        std::fs::write(dir.join("framework-res.apk"), &apk_bytes).expect("write framework-res.apk");
+        let framework_res_apk = dir.join("framework-res.apk");
+        std::fs::write(&framework_res_apk, &apk_bytes).expect("write framework-res.apk");
 
-        unsafe {
-            std::env::set_var("ECLIPSE_ANDROID_FRAMEWORK_DIR", &dir);
-        }
-
-        let bytes = arsc_bytes_for(0x0101_0000).expect("framework id routes to a loadable table");
+        let cache = OnceLock::new();
+        let bytes =
+            framework_arsc_bytes(&cache, &framework_res_apk).expect("the framework table loads");
         let table = crate::apk::arsc::parse_arsc(bytes).expect("framework arsc parses");
         assert_eq!(
             table.package_ids(),
@@ -17982,12 +17987,10 @@ mod tests {
             "resolved from the framework table, not the app table"
         );
 
-        let repeated = arsc_bytes_for(0x0101_0000).expect("framework table remains available");
+        let repeated = framework_arsc_bytes(&cache, &framework_res_apk)
+            .expect("framework table remains available");
         let reused = std::ptr::eq(bytes.as_ptr(), repeated.as_ptr());
 
-        unsafe {
-            std::env::remove_var("ECLIPSE_ANDROID_FRAMEWORK_DIR");
-        }
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(

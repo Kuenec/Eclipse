@@ -10,6 +10,7 @@ pub mod play;
 pub mod signature;
 pub mod store;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read};
@@ -163,7 +164,14 @@ fn extraction_digest(
     for entry in planned {
         let extracted = match std::fs::metadata(&entry.dest) {
             Ok(extracted) => extracted,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None)
+            }
             Err(error) => return Err(io_context(error, "stat", &entry.dest)),
         };
         if !extracted.is_file() || extracted.len() != entry.size {
@@ -232,6 +240,56 @@ fn remove_stale_temporaries(dir: &Path) -> io::Result<()> {
             let path = entry.path();
             std::fs::remove_file(&path)
                 .map_err(|error| io_context(error, "remove stale", &path))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum UnplannedEntries {
+    Keep,
+    Remove,
+}
+
+fn remove_unplanned_entries(dir: &Path, planned: &[PlannedEntry]) -> io::Result<()> {
+    let bookkeeping = [dir.join(EXTRACTION_LOCK), dir.join(EXTRACTION_STAMP)];
+    let files: HashSet<&Path> = planned
+        .iter()
+        .map(|entry| entry.dest.as_path())
+        .chain(bookkeeping.iter().map(PathBuf::as_path))
+        .collect();
+    let directories: HashSet<&Path> = planned
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .dest
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| *ancestor != dir)
+        })
+        .collect();
+    remove_unplanned_in(dir, &files, &directories)
+}
+
+fn remove_unplanned_in(
+    dir: &Path,
+    files: &HashSet<&Path>,
+    directories: &HashSet<&Path>,
+) -> io::Result<()> {
+    let list_error = |error| io_context(error, "list", dir);
+    for entry in std::fs::read_dir(dir).map_err(list_error)? {
+        let entry = entry.map_err(list_error)?;
+        let path = entry.path();
+        let remove_error = |error| io_context(error, "remove stale", &path);
+        let file_type = entry
+            .file_type()
+            .map_err(|error| io_context(error, "stat", &path))?;
+        if file_type.is_dir() && directories.contains(path.as_path()) {
+            remove_unplanned_in(&path, files, directories)?;
+        } else if file_type.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(remove_error)?;
+        } else if !files.contains(path.as_path()) {
+            std::fs::remove_file(&path).map_err(remove_error)?;
         }
     }
     Ok(())
@@ -384,7 +442,7 @@ impl Apk {
                 crc32,
             });
         }
-        self.extract_planned(dest_dir, &planned)
+        self.extract_planned(dest_dir, &planned, UnplannedEntries::Keep)
     }
 
     pub fn extract_assets(&mut self, dest_dir: &Path) -> Result<usize, ApkError> {
@@ -432,13 +490,14 @@ impl Apk {
                 crc32,
             });
         }
-        self.extract_planned(dest_dir, &planned)
+        self.extract_planned(dest_dir, &planned, UnplannedEntries::Remove)
     }
 
     fn extract_planned(
         &mut self,
         dest_dir: &Path,
         planned: &[PlannedEntry],
+        unplanned: UnplannedEntries,
     ) -> Result<usize, ApkError> {
         std::fs::create_dir_all(dest_dir).map_err(|error| io_context(error, "create", dest_dir))?;
         let _lock = lock_extraction_dir(dest_dir)?;
@@ -452,7 +511,10 @@ impl Apk {
             return Ok(0);
         }
 
-        remove_stale_temporaries(dest_dir)?;
+        match unplanned {
+            UnplannedEntries::Keep => remove_stale_temporaries(dest_dir)?,
+            UnplannedEntries::Remove => remove_unplanned_entries(dest_dir, planned)?,
+        }
         let temporary = dest_dir.join(format!(
             "{EXTRACTION_PREFIX}{}{EXTRACTION_TEMP_SUFFIX}",
             std::process::id()
@@ -687,10 +749,7 @@ impl Member {
     fn open(path: PathBuf) -> Result<Self, ApkSetError> {
         match File::open(&path) {
             Ok(file) => Ok(Self { path, file }),
-            Err(source) => Err(ApkSetError::Open {
-                path,
-                source: ApkError::Io(source),
-            }),
+            Err(source) => Err(ApkSetError::Locate { path, source }),
         }
     }
 
@@ -705,9 +764,10 @@ impl Member {
     }
 
     fn signature_error(&self, source: SignatureError) -> ApkSetError {
-        ApkSetError::Signature {
-            path: self.path.clone(),
-            source,
+        let path = self.path.clone();
+        match source {
+            SignatureError::Io(source) => ApkSetError::Locate { path, source },
+            source => ApkSetError::Signature { path, source },
         }
     }
 
@@ -1653,6 +1713,72 @@ mod tests {
         std::fs::remove_file(&new_path).ok();
     }
 
+    fn extracted_tree(dir: &Path) -> Vec<String> {
+        let mut tree = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let mut name = path.strip_prefix(dir).unwrap().display().to_string();
+                if entry.file_type().unwrap().is_dir() {
+                    name.push('/');
+                    pending.push(path);
+                }
+                tree.push(name);
+            }
+        }
+        tree.sort();
+        tree
+    }
+
+    #[test]
+    fn an_apk_upgrade_removes_dropped_assets_and_survives_file_directory_swaps() {
+        let old_bytes = build_apk(&[
+            ("assets/a/x", b"OLD-X"),
+            ("assets/b", b"OLD-B"),
+            ("assets/old.bin", b"OLD"),
+        ]);
+        let new_bytes = build_apk(&[("assets/a", b"NEW-A"), ("assets/b/y", b"NEW-Y")]);
+        let (mut old_apk, old_path) = open_apk(&old_bytes, "asset-prune-old");
+        let (mut new_apk, new_path) = open_apk(&new_bytes, "asset-prune-new");
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-asset-prune-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".eclipse-extract.4242.partial"), b"stale").unwrap();
+        let bookkeeping = [".eclipse-extract.lock", ".eclipse-extract.stamp"];
+
+        assert_eq!(old_apk.extract_assets(&dir).expect("extract old APK"), 3);
+        assert_eq!(
+            new_apk.extract_assets(&dir).expect("extract upgraded APK"),
+            2
+        );
+        let mut upgraded = vec!["a", "b/", "b/y"];
+        upgraded.extend(bookkeeping);
+        upgraded.sort();
+        assert_eq!(extracted_tree(&dir), upgraded);
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"NEW-A");
+
+        assert_eq!(
+            old_apk
+                .extract_assets(&dir)
+                .expect("extract downgraded APK"),
+            3
+        );
+        let mut downgraded = vec!["a/", "a/x", "b", "old.bin"];
+        downgraded.extend(bookkeeping);
+        downgraded.sort();
+        assert_eq!(extracted_tree(&dir), downgraded);
+        assert_eq!(std::fs::read(dir.join("b")).unwrap(), b"OLD-B");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&old_path).ok();
+        std::fs::remove_file(&new_path).ok();
+    }
+
     fn noisy_payload(len: usize, seed: u32) -> Vec<u8> {
         let mut state = seed;
         (0..len)
@@ -1824,6 +1950,8 @@ mod tests {
 
     #[test]
     fn extraction_errors_name_the_failed_operation_and_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let bytes = build_apk(&[("assets/content/a.bin", b"ASSET")]);
         let (mut apk, apk_path) = open_apk(&bytes, "extract-error-context");
         let dir = std::env::temp_dir().join(format!(
@@ -1831,16 +1959,18 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("content"), b"a file where a directory belongs").unwrap();
+        let unreadable = dir.join("content/a.bin");
+        std::fs::create_dir_all(unreadable.parent().unwrap()).unwrap();
+        std::fs::write(&unreadable, b"OTHER").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let error = apk
             .extract_assets(&dir)
-            .expect_err("the asset directory is blocked by a file");
-        let expected = format!("stat {}: ", dir.join("content/a.bin").display());
-        assert!(error.to_string().contains(&expected), "{error}");
+            .expect_err("the extracted asset cannot be read");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&apk_path).ok();
+        let expected = format!("open {}: ", unreadable.display());
+        assert!(error.to_string().contains(&expected), "{error}");
     }
 
     #[test]
@@ -2164,16 +2294,39 @@ mod tests {
         .err()
         .expect("a missing APK cannot be opened");
         std::fs::remove_dir_all(&missing).ok();
-        assert!(
-            matches!(
-                err,
-                ApkSetError::Open {
-                    source: ApkError::Io(_),
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
+        assert!(matches!(err, ApkSetError::Locate { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn apks_that_cannot_be_read_are_not_called_unofficial() {
+        let dir = temp_set_dir("unreadable-member");
+        let missing = dir.join(BASE_APK);
+        let unopened = ApkSet::open(ApkSetPaths {
+            base: missing.clone(),
+            native_split: None,
+        });
+        let write_only = dir.join("write-only.apk");
+        std::fs::write(&write_only, b"apk").unwrap();
+        let file = OpenOptions::new().write(true).open(&write_only).unwrap();
+        let unread = ApkSetFiles {
+            base: Member {
+                path: write_only.clone(),
+                file,
+            },
+            native_split: None,
+        }
+        .verify();
+        std::fs::remove_dir_all(&dir).ok();
+        for (base, opened) in [(missing, unopened), (write_only, unread)] {
+            let err = opened
+                .err()
+                .expect("an APK that cannot be read cannot be opened");
+            assert!(
+                matches!(&err, ApkSetError::Locate { path, .. } if *path == base),
+                "got {err:?}"
+            );
+            assert!(!err.to_string().contains("not the official"), "{err}");
+        }
     }
 
     #[test]

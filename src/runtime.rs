@@ -11,6 +11,7 @@ use crate::apk::Manifest;
 use crate::config::{Config, TouchMode};
 use crate::host_locale::HostLocale;
 use crate::host_time_zone::HostTimeZone;
+use crate::temp_file::TempFile;
 
 const DEFAULT_SDK_INT: u32 = 33;
 
@@ -263,8 +264,7 @@ fn libart_location(layout: &InstallLayout) -> PathBuf {
     resolve_libart(env_path("ECLIPSE_LIBART"), layout.bundled_libart.clone())
 }
 
-fn libart_path(layout: &InstallLayout) -> Result<PathBuf, RuntimeError> {
-    let path = libart_location(layout);
+fn libart_path(path: PathBuf) -> Result<PathBuf, RuntimeError> {
     if path.exists() {
         Ok(path)
     } else {
@@ -273,7 +273,7 @@ fn libart_path(layout: &InstallLayout) -> Result<PathBuf, RuntimeError> {
 }
 
 pub fn find_libart() -> Result<PathBuf, RuntimeError> {
-    libart_path(InstallLayout::current()?)
+    libart_path(libart_location(InstallLayout::current()?))
 }
 
 fn stock_dex_root(libart: &Path) -> Option<PathBuf> {
@@ -501,8 +501,7 @@ fn framework_dir(layout: &InstallLayout) -> Result<PathBuf, RuntimeError> {
     Ok(dir)
 }
 
-fn find_framework_in(layout: &InstallLayout) -> Result<FrameworkPaths, RuntimeError> {
-    let dir = framework_dir(layout)?;
+fn find_framework_in(dir: PathBuf) -> Result<FrameworkPaths, RuntimeError> {
     let api_impl_jar = dir.join(API_IMPL_JAR);
     if !api_impl_jar.exists() {
         return Err(RuntimeError::FrameworkNotFound(api_impl_jar));
@@ -515,7 +514,7 @@ fn find_framework_in(layout: &InstallLayout) -> Result<FrameworkPaths, RuntimeEr
 }
 
 pub fn find_framework() -> Result<FrameworkPaths, RuntimeError> {
-    find_framework_in(InstallLayout::current()?)
+    find_framework_in(framework_dir(InstallLayout::current()?)?)
 }
 
 #[must_use]
@@ -676,11 +675,17 @@ fn provision_eclipse_libm(dir: &Path) -> Result<(), RuntimeError> {
     if std::fs::read(&target).is_ok_and(|bytes| bytes == ECLIPSE_LIBM_SHIM) {
         return Ok(());
     }
-    let temporary = dir.join(format!(".{ECLIPSE_LIBM_SONAME}.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, ECLIPSE_LIBM_SHIM)
-        .and_then(|()| std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755)))
-        .map_err(|e| RuntimeError::ProvisionSoname(temporary.clone(), e))?;
-    std::fs::rename(&temporary, &target).map_err(|e| RuntimeError::ProvisionSoname(target, e))
+    let mut temporary = TempFile::create(dir, ECLIPSE_LIBM_SONAME)
+        .map_err(|e| RuntimeError::ProvisionSoname(dir.to_owned(), e))?;
+    temporary
+        .write_all(ECLIPSE_LIBM_SHIM)
+        .and_then(|()| {
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o755))
+        })
+        .map_err(|e| RuntimeError::ProvisionSoname(temporary.path().to_owned(), e))?;
+    temporary
+        .persist(&target)
+        .map_err(|e| RuntimeError::ProvisionSoname(target, e))
 }
 
 fn find_host_lib(entry: &BareSoname) -> Result<PathBuf, RuntimeError> {
@@ -770,7 +775,7 @@ pub fn boot(
         return Err(RuntimeError::CpuLacksFeature(feature));
     }
     let layout = InstallLayout::current()?;
-    let libart = libart_path(layout)?;
+    let libart = libart_path(libart_location(layout))?;
     let art_boot = find_art_boot_paths(layout)?;
     let boot_image = &art_boot.image_location;
 
@@ -810,7 +815,7 @@ pub fn boot(
     }
 
     if let Some(apk) = apk_path {
-        let fw = find_framework_in(layout)?;
+        let fw = find_framework_in(framework_dir(layout)?)?;
         option_strings.push(class_path_option(&fw, apk)?);
         option_strings.push(library_path_option(&fw, app_lib_dir)?);
     }
@@ -1559,18 +1564,14 @@ mod tests {
     }
 
     #[test]
-    fn find_libart_reports_typed_error_for_missing_override() {
-        unsafe { std::env::set_var("ECLIPSE_LIBART", "/nonexistent/eclipse/libart.so") };
-        let r = find_libart();
-        unsafe { std::env::remove_var("ECLIPSE_LIBART") };
+    fn a_missing_libart_is_a_typed_error() {
+        let r = libart_path(PathBuf::from("/nonexistent/eclipse/libart.so"));
         assert!(matches!(r, Err(RuntimeError::LibartNotFound(_))), "{r:?}");
     }
 
     #[test]
-    fn find_framework_reports_typed_error_for_missing_override() {
-        unsafe { std::env::set_var("ECLIPSE_ANDROID_FRAMEWORK_DIR", "/nonexistent/eclipse/fw") };
-        let r = find_framework();
-        unsafe { std::env::remove_var("ECLIPSE_ANDROID_FRAMEWORK_DIR") };
+    fn a_missing_framework_is_a_typed_error() {
+        let r = find_framework_in(PathBuf::from("/nonexistent/eclipse/fw"));
         assert!(
             matches!(r, Err(RuntimeError::FrameworkNotFound(_))),
             "{r:?}"
@@ -1937,6 +1938,24 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_libm_shim_that_cannot_be_installed_leaves_no_temporary() {
+        let dir = temp_tree("libm-blocked");
+        std::fs::create_dir(dir.join(ECLIPSE_LIBM_SONAME)).expect("block the soname");
+
+        let result = provision_eclipse_libm(&dir);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list the lib dir")
+            .map(|entry| entry.expect("lib dir entry").file_name())
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            matches!(&result, Err(RuntimeError::ProvisionSoname(path, _)) if path.ends_with(ECLIPSE_LIBM_SONAME)),
+            "{result:?}"
+        );
+        assert_eq!(left, [ECLIPSE_LIBM_SONAME]);
     }
 
     #[test]
