@@ -1,9 +1,16 @@
 use freetype::bitmap::PixelMode;
 use freetype::face::LoadFlag;
 use freetype::{Face, Library, Matrix, Vector};
-use std::sync::Arc;
+use harfrust::{Shaper, ShaperData};
+use read_fonts::tables::cmap::{CmapSubtable, EncodingRecord, PlatformId};
+use read_fonts::tables::os2::SelectionFlags;
+use read_fonts::{FontRef, ReadError, TableProvider};
+use std::sync::{Arc, OnceLock};
 
 const MAX_GLYPH_DIMENSION: u32 = 4096;
+const WINDOWS_UNICODE_BMP_ENCODING: u16 = 1;
+const WINDOWS_UNICODE_FULL_ENCODING: u16 = 10;
+const TYPO_METRICS_OS2_VERSION: u16 = 4;
 const LOAD_METRICS: LoadFlag = LoadFlag::from_bits_retain(
     LoadFlag::NO_HINTING.bits() | LoadFlag::NO_BITMAP.bits() | LoadFlag::TARGET_NORMAL.bits(),
 );
@@ -37,6 +44,7 @@ pub(crate) struct RasterFont {
     ppem_per_height: f32,
     ascent_per_height: f32,
     line_gap_per_height: f32,
+    shaping: OnceLock<ShaperData>,
 }
 
 impl RasterFont {
@@ -57,15 +65,13 @@ impl RasterFont {
                 f32::from(face.em_size()),
             ),
             GlyphSource::ColorStrikes => {
-                let table = rustybuzz::ttf_parser::Face::parse(&data, index)
+                let (units_per_em, metrics) = strike_font_metrics(&data, index)
                     .map_err(|error| format!("colour bitmap font tables: {error}"))?;
-                let ascent = f32::from(table.ascender());
-                let descent = f32::from(table.descender());
                 (
-                    ascent,
-                    descent,
-                    ascent - descent + f32::from(table.line_gap()),
-                    f32::from(table.units_per_em()),
+                    metrics.ascent,
+                    metrics.descent,
+                    metrics.ascent - metrics.descent + metrics.line_gap,
+                    units_per_em,
                 )
             }
         };
@@ -84,6 +90,7 @@ impl RasterFont {
             ppem_per_height: em_size / height,
             ascent_per_height: ascent / height,
             line_gap_per_height: (line_height - height) / height,
+            shaping: OnceLock::new(),
         })
     }
 
@@ -117,6 +124,16 @@ impl RasterFont {
 
     pub(crate) fn em_per_height(&self) -> f32 {
         self.ppem_per_height
+    }
+
+    pub(crate) fn shaper(&self) -> Option<Shaper<'_>> {
+        let font = FontRef::from_index(&self.data, self.index).ok()?;
+        let shaping = self.shaping.get_or_init(|| ShaperData::new(&font));
+        Some(shaping.shaper(&font).build())
+    }
+
+    pub(crate) fn glyph_index(&self, character: char) -> Option<u32> {
+        nominal_glyph(&self.data, self.index, character)
     }
 
     pub(crate) fn scaled(&self, height: f32) -> Option<ScaledFont> {
@@ -164,6 +181,89 @@ impl RasterFont {
             line_gap: height * self.line_gap_per_height,
         })
     }
+}
+
+fn nominal_glyph(data: &[u8], index: u32, character: char) -> Option<u32> {
+    let font = FontRef::from_index(data, index).ok()?;
+    let cmap = font.cmap().ok()?;
+    let subtables = cmap.offset_data();
+    cmap.encoding_records()
+        .iter()
+        .filter_map(|record| {
+            let subtable = record.subtable(subtables).ok()?;
+            maps_unicode(record, &subtable).then_some(subtable)
+        })
+        .find_map(|subtable| {
+            subtable
+                .map_codepoint(character)
+                .map(|glyph| glyph.to_u32())
+                .filter(|&glyph| glyph != 0)
+        })
+}
+
+fn maps_unicode(record: &EncodingRecord, subtable: &CmapSubtable<'_>) -> bool {
+    match (record.platform_id(), record.encoding_id()) {
+        (PlatformId::Unicode, _) | (PlatformId::Windows, WINDOWS_UNICODE_BMP_ENCODING) => true,
+        (PlatformId::Windows, WINDOWS_UNICODE_FULL_ENCODING) => matches!(
+            subtable,
+            CmapSubtable::Format12(_) | CmapSubtable::Format13(_)
+        ),
+        _ => false,
+    }
+}
+
+struct VerticalMetrics {
+    ascent: f32,
+    descent: f32,
+    line_gap: f32,
+}
+
+fn strike_font_metrics(data: &[u8], index: u32) -> Result<(f32, VerticalMetrics), ReadError> {
+    let font = FontRef::from_index(data, index)?;
+    let units_per_em = f32::from(font.head()?.units_per_em());
+    Ok((units_per_em, vertical_metrics(&font)?))
+}
+
+fn vertical_metrics(font: &FontRef<'_>) -> Result<VerticalMetrics, ReadError> {
+    let hhea = font.hhea()?;
+    let hhea = VerticalMetrics {
+        ascent: f32::from(hhea.ascender().to_i16()),
+        descent: f32::from(hhea.descender().to_i16()),
+        line_gap: f32::from(hhea.line_gap().to_i16()),
+    };
+    let Ok(os2) = font.os2() else {
+        return Ok(hhea);
+    };
+    let typo = VerticalMetrics {
+        ascent: f32::from(os2.s_typo_ascender()),
+        descent: f32::from(os2.s_typo_descender()),
+        line_gap: f32::from(os2.s_typo_line_gap()),
+    };
+    if os2.version() >= TYPO_METRICS_OS2_VERSION
+        && os2
+            .fs_selection()
+            .contains(SelectionFlags::USE_TYPO_METRICS)
+    {
+        return Ok(typo);
+    }
+    let nonzero_or = |value: f32, fallback: f32| if value == 0.0 { fallback } else { value };
+    Ok(VerticalMetrics {
+        ascent: nonzero_or(
+            hhea.ascent,
+            nonzero_or(typo.ascent, f32::from(os2.us_win_ascent())),
+        ),
+        descent: nonzero_or(
+            hhea.descent,
+            nonzero_or(typo.descent, -f32::from(os2.us_win_descent())),
+        ),
+        line_gap: if hhea.ascent != 0.0 && hhea.descent != 0.0 {
+            hhea.line_gap
+        } else if typo.ascent != 0.0 || typo.descent != 0.0 {
+            typo.line_gap
+        } else {
+            0.0
+        },
+    })
 }
 
 fn nearest_strike(face: &MemoryFace, ppem: f32) -> Option<(i32, f32)> {
@@ -499,5 +599,146 @@ impl RasterGlyph<'_> {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sfnt(mut tables: Vec<(&[u8; 4], Vec<u8>)>) -> Vec<u8> {
+        tables.sort_by_key(|(tag, _)| **tag);
+        let count = tables.len() as u16;
+        let mut font = 0x0001_0000u32.to_be_bytes().to_vec();
+        font.extend(count.to_be_bytes());
+        font.extend([0u8; 6]);
+        let mut offset = font.len() + tables.len() * 16;
+        for (tag, table) in &tables {
+            font.extend_from_slice(*tag);
+            font.extend(0u32.to_be_bytes());
+            font.extend((offset as u32).to_be_bytes());
+            font.extend((table.len() as u32).to_be_bytes());
+            offset += table.len();
+        }
+        for (_, table) in tables {
+            font.extend(table);
+        }
+        font
+    }
+
+    fn words(values: &[i32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&value| (value as u16).to_be_bytes())
+            .collect()
+    }
+
+    fn head(units_per_em: i32) -> Vec<u8> {
+        let mut table = words(&[1, 0, 0, 0, 0, 0, 0x5F0F, 0x3CF5, 0, units_per_em]);
+        table.resize(54, 0);
+        table
+    }
+
+    fn hhea([ascent, descent, line_gap]: [i32; 3]) -> Vec<u8> {
+        let mut table = words(&[1, 0, ascent, descent, line_gap]);
+        table.resize(36, 0);
+        table
+    }
+
+    fn os2(fs_selection: u16, typo: [i32; 3], win: [i32; 2]) -> Vec<u8> {
+        let mut table = words(&[4]);
+        table.resize(62, 0);
+        table.extend(fs_selection.to_be_bytes());
+        table.extend(words(&[0, 0, typo[0], typo[1], typo[2], win[0], win[1]]));
+        table.resize(96, 0);
+        table
+    }
+
+    fn metrics(tables: Vec<(&[u8; 4], Vec<u8>)>) -> (f32, f32, f32) {
+        let (units_per_em, metrics) =
+            strike_font_metrics(&sfnt(tables), 0).expect("metrics tables parse");
+        assert_eq!(units_per_em, 2048.0);
+        (metrics.ascent, metrics.descent, metrics.line_gap)
+    }
+
+    #[test]
+    fn colour_strike_metrics_fall_back_from_hhea_to_typo_to_win_like_freetype() {
+        let font = |hhea_metrics: [i32; 3], selection: Option<u16>| {
+            let mut tables = vec![(b"head", head(2048)), (b"hhea", hhea(hhea_metrics))];
+            if let Some(selection) = selection {
+                tables.push((b"OS/2", os2(selection, [700, -300, 50], [900, 250])));
+            }
+            metrics(tables)
+        };
+        assert_eq!(font([800, -200, 90], None), (800.0, -200.0, 90.0));
+        assert_eq!(font([800, -200, 90], Some(0)), (800.0, -200.0, 90.0));
+        assert_eq!(
+            font(
+                [800, -200, 90],
+                Some(SelectionFlags::USE_TYPO_METRICS.bits())
+            ),
+            (700.0, -300.0, 50.0)
+        );
+        assert_eq!(font([0, 0, 90], Some(0)), (700.0, -300.0, 50.0));
+        assert_eq!(
+            metrics(vec![
+                (b"head", head(2048)),
+                (b"hhea", hhea([0, 0, 90])),
+                (b"OS/2", os2(0, [0, 0, 50], [900, 250])),
+            ]),
+            (900.0, -250.0, 0.0)
+        );
+    }
+
+    fn format4(mappings: &[(u16, u16)]) -> Vec<u8> {
+        let mut segments: Vec<(u16, u16)> = mappings.to_vec();
+        segments.push((0xFFFF, 0));
+        let count = segments.len() as i32;
+        let mut table = words(&[4, 16 + count * 8, 0, count * 2, 0, 0, 0]);
+        table.extend(segments.iter().flat_map(|&(code, _)| code.to_be_bytes()));
+        table.extend([0, 0]);
+        table.extend(segments.iter().flat_map(|&(code, _)| code.to_be_bytes()));
+        table.extend(
+            segments
+                .iter()
+                .flat_map(|&(code, glyph)| glyph.wrapping_sub(code).to_be_bytes()),
+        );
+        table.extend(segments.iter().flat_map(|_| [0, 0]));
+        table
+    }
+
+    fn format0(mappings: &[(u8, u8)]) -> Vec<u8> {
+        let mut table = words(&[0, 262, 0]);
+        let mut glyphs = [0u8; 256];
+        for &(code, glyph) in mappings {
+            glyphs[usize::from(code)] = glyph;
+        }
+        table.extend(glyphs);
+        table
+    }
+
+    #[test]
+    fn only_unicode_cmap_subtables_map_characters_and_notdef_maps_nothing() {
+        let subtables = [
+            (1, 0, format0(&[(b'B', 7)])),
+            (3, 1, format4(&[(0x0000, 0), (u16::from(b'A'), 5)])),
+            (3, 10, format4(&[(u16::from(b'C'), 9)])),
+        ];
+        let mut cmap = words(&[0, subtables.len() as i32]);
+        let mut offset = 4 + subtables.len() * 8;
+        for (platform, encoding, subtable) in &subtables {
+            cmap.extend(words(&[*platform, *encoding]));
+            cmap.extend((offset as u32).to_be_bytes());
+            offset += subtable.len();
+        }
+        for (_, _, subtable) in subtables {
+            cmap.extend(subtable);
+        }
+        let font = sfnt(vec![(b"cmap", cmap)]);
+        assert_eq!(nominal_glyph(&font, 0, 'A'), Some(5));
+        assert_eq!(nominal_glyph(&font, 0, '\0'), None);
+        assert_eq!(nominal_glyph(&font, 0, 'B'), None);
+        assert_eq!(nominal_glyph(&font, 0, 'C'), None);
+        assert_eq!(nominal_glyph(&font, 1, 'A'), None);
     }
 }

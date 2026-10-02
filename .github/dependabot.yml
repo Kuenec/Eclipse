@@ -17,6 +17,10 @@ updates:
         versions: [">= 0.9"]
       - dependency-name: smithay-clipboard
         versions: [">= 0.7.3"]
+      - dependency-name: harfrust
+        versions: [">= 0.14"]
+      - dependency-name: read-fonts
+        versions: [">= 0.44"]
 
   - package-ecosystem: cargo
     directory: /crates/libm-shim

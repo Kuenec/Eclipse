@@ -45,7 +45,8 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 
 freetype-rs = "0.36"
 yeslogic-fontconfig-sys = "5"
-rustybuzz = "0.20"
+harfrust = "0.13"
+read-fonts = "0.43"
 unicode-bidi = "0.3"
 unicode-segmentation = "1"
 unicode-properties = "0.1"
