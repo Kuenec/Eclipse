@@ -461,13 +461,7 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors_no_device() {
     );
     assert_eq!(obj_realize(engine, 0), SL_RESULT_SUCCESS);
 
-    let iid_engine = iid_value(3);
-    let mut eng_itf: *mut c_void = std::ptr::null_mut();
-    assert_eq!(
-        obj_get_interface(engine, iid_engine, std::ptr::addr_of_mut!(eng_itf).cast()),
-        SL_RESULT_SUCCESS
-    );
-    assert!(!eng_itf.is_null());
+    let eng_itf = interface(engine, 3);
 
     let mut mix: *mut c_void = std::ptr::null_mut();
 
@@ -530,15 +524,7 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors_no_device() {
     assert_eq!(r, SL_RESULT_SUCCESS);
     assert!(!player.is_null());
 
-    let mut config_itf: *mut c_void = std::ptr::null_mut();
-    assert_eq!(
-        obj_get_interface(
-            player,
-            iid_value(0),
-            std::ptr::addr_of_mut!(config_itf).cast()
-        ),
-        SL_RESULT_SUCCESS
-    );
+    let config_itf = interface(player, 0);
     let performance_key = b"androidPerformanceMode\0";
     let requested_mode = 0u32;
 
@@ -564,29 +550,9 @@ fn full_engine_path_builds_and_enqueues_with_zero_sl_errors_no_device() {
     );
     assert_eq!(obj_realize(player, 0), SL_RESULT_SUCCESS);
 
-    let mut play_itf: *mut c_void = std::ptr::null_mut();
-    assert_eq!(
-        obj_get_interface(
-            player,
-            iid_value(4),
-            std::ptr::addr_of_mut!(play_itf).cast()
-        ),
-        SL_RESULT_SUCCESS
-    );
-    let mut bq_itf: *mut c_void = std::ptr::null_mut();
-    assert_eq!(
-        obj_get_interface(player, iid_value(1), std::ptr::addr_of_mut!(bq_itf).cast()),
-        SL_RESULT_SUCCESS
-    );
-    let mut volume_itf: *mut c_void = std::ptr::null_mut();
-    assert_eq!(
-        obj_get_interface(
-            player,
-            iid_value(6),
-            std::ptr::addr_of_mut!(volume_itf).cast()
-        ),
-        SL_RESULT_SUCCESS
-    );
+    let play_itf = interface(player, 4);
+    let bq_itf = interface(player, 1);
+    let volume_itf = interface(player, 6);
 
     let mut level = -1i16;
 
