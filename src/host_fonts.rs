@@ -106,10 +106,6 @@ pub(crate) fn load_first_font(
     })
 }
 
-fn ttf_parser_face(font: &RasterFont) -> Option<rustybuzz::ttf_parser::Face<'_>> {
-    rustybuzz::ttf_parser::Face::parse(font.data(), font.index()).ok()
-}
-
 fn font_files_in(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -220,7 +216,7 @@ fn drawing_face(
 }
 
 fn draws(font: &RasterFont, character: char, presentation: Presentation) -> bool {
-    let Some(glyph) = ttf_parser_face(font).and_then(|face| face.glyph_index(character)) else {
+    let Some(glyph) = font.glyph_index(character) else {
         return false;
     };
     if presentation == Presentation::Emoji && !font.has_color() {
@@ -230,7 +226,7 @@ fn draws(font: &RasterFont, character: char, presentation: Presentation) -> bool
         return true;
     }
     font.at_em(INK_PROBE_PPEM)
-        .and_then(|mut scaled| scaled.render(u32::from(glyph.0), 0.0, INK_PROBE_PPEM))
+        .and_then(|mut scaled| scaled.render(glyph, 0.0, INK_PROBE_PPEM))
         .is_some_and(|image| match image.pixels {
             crate::font::GlyphPixels::Coverage(values) => values.iter().any(|&value| value != 0),
             crate::font::GlyphPixels::Color(values) => values.iter().any(|value| value[3] != 0),

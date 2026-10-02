@@ -1,6 +1,7 @@
 use crate::font::{GlyphPixels, GlyphSource, RasterFont, ScaledFont};
 use crate::host_fonts::{self, Presentation};
-use rustybuzz::{Direction, UnicodeBuffer};
+use harfrust::{Direction, GlyphBuffer, ShapeOptions, Shaper, UnicodeBuffer};
+use read_fonts::{FontRef, TableProvider};
 use std::collections::HashMap;
 use std::ops::Range;
 use unicode_bidi::{BidiInfo, Level};
@@ -200,7 +201,7 @@ struct Paragraph<'t> {
 struct FaceSet<'a> {
     chain: FaceChain<'a>,
     faces: Vec<&'a RasterFont>,
-    shapers: Vec<Option<rustybuzz::Face<'a>>>,
+    shapers: Vec<Option<Shaper<'a>>>,
     choices: HashMap<String, usize>,
 }
 
@@ -225,8 +226,7 @@ impl<'a> FaceSet<'a> {
             return index;
         }
         self.faces.push(font);
-        self.shapers
-            .push(rustybuzz::Face::from_slice(font.data(), font.index()));
+        self.shapers.push(font.shaper());
         self.faces.len() - 1
     }
 
@@ -267,13 +267,10 @@ fn host_face(cluster: &str, presentation: Presentation) -> Option<&'static Raste
 }
 
 fn covers(font: &RasterFont, cluster: &str) -> bool {
-    let Ok(face) = rustybuzz::ttf_parser::Face::parse(font.data(), font.index()) else {
-        return false;
-    };
     cluster
         .chars()
         .filter(|&character| !is_ignorable(character))
-        .all(|character| face.glyph_index(shaping_char(character)).is_some())
+        .all(|character| font.glyph_index(shaping_char(character)).is_some())
 }
 
 fn presentation_of(cluster: &str) -> Presentation {
@@ -337,10 +334,10 @@ fn next_tab_stop(x: f32) -> f32 {
 }
 
 fn shape(
-    face: &rustybuzz::Face<'_>,
+    shaper: &Shaper<'_>,
     characters: impl Iterator<Item = (usize, char)>,
     rtl: bool,
-) -> rustybuzz::GlyphBuffer {
+) -> GlyphBuffer {
     let mut buffer = UnicodeBuffer::new();
     for (index, character) in characters {
         buffer.add(shaping_char(character), index as u32);
@@ -350,7 +347,8 @@ fn shape(
     } else {
         Direction::LeftToRight
     });
-    rustybuzz::shape(face, &[], buffer)
+    buffer.guess_segment_properties();
+    shaper.shape(buffer, ShapeOptions::new())
 }
 
 fn break_lines(clusters: &mut [Cluster], max_width: f32) -> Vec<LineSpan> {
@@ -935,15 +933,16 @@ fn ink_reach(font: &RasterFont, ppem: f32) -> Option<FieldRect> {
     if font.glyph_source() == GlyphSource::ColorStrikes {
         return None;
     }
-    let bounds = rustybuzz::ttf_parser::Face::parse(font.data(), font.index())
+    let bounds = FontRef::from_index(font.data(), font.index())
         .ok()?
-        .global_bounding_box();
+        .head()
+        .ok()?;
     let scale = ppem / font.units_per_em();
     Some(FieldRect {
-        left: f32::from(bounds.x_min) * scale - INK_MARGIN,
-        top: -f32::from(bounds.y_max) * scale - INK_MARGIN,
-        right: f32::from(bounds.x_max) * scale + INK_MARGIN,
-        bottom: -f32::from(bounds.y_min) * scale + INK_MARGIN,
+        left: f32::from(bounds.x_min()) * scale - INK_MARGIN,
+        top: -f32::from(bounds.y_max()) * scale - INK_MARGIN,
+        right: f32::from(bounds.x_max()) * scale + INK_MARGIN,
+        bottom: -f32::from(bounds.y_min()) * scale + INK_MARGIN,
     })
 }
 
@@ -1391,6 +1390,31 @@ mod tests {
     }
 
     #[test]
+    fn right_to_left_text_draws_greater_or_equal_as_its_mirrored_glyph() {
+        let Some(chain) = host_chain() else {
+            return;
+        };
+        let (Some(less_or_equal), Some(greater_or_equal)) = (
+            chain.primary.glyph_index('\u{2264}'),
+            chain.primary.glyph_index('\u{2265}'),
+        ) else {
+            eprintln!("SKIP: the host font lacks \u{2264} or \u{2265}");
+            return;
+        };
+        let text = "\u{200F}\u{2265}";
+        let field = style(200, 40, LineMode::Single);
+        let layout = lay_out(text, at_end(text), &field, chain, Scroll::default());
+        assert!(layout.lines[0].rtl);
+        let drawn: Vec<u32> = layout
+            .glyphs
+            .iter()
+            .filter(|glyph| glyph.glyph == less_or_equal || glyph.glyph == greater_or_equal)
+            .map(|glyph| glyph.glyph)
+            .collect();
+        assert_eq!(drawn, [less_or_equal]);
+    }
+
+    #[test]
     fn invisible_format_characters_draw_nothing() {
         for character in [
             '\u{00AD}',
@@ -1451,13 +1475,14 @@ mod tests {
         let digits = "0123456789";
         let layout = lay_out(digits, at_end(digits), &field, chain, Scroll::default());
         assert_eq!(layout.ppem, SIZE * ratio);
-        let face = rustybuzz::ttf_parser::Face::parse(primary.data(), primary.index())
-            .expect("primary parses");
+        let metrics = FontRef::from_index(primary.data(), primary.index())
+            .and_then(|font| font.hmtx())
+            .expect("primary has horizontal metrics");
         let advances: f32 = digits
             .chars()
             .map(|digit| {
-                let glyph = face.glyph_index(digit).expect("digit glyph");
-                f32::from(face.glyph_hor_advance(glyph).expect("advance"))
+                let glyph = primary.glyph_index(digit).expect("digit glyph");
+                f32::from(metrics.advance(glyph.into()).expect("advance"))
             })
             .sum();
         let expected = advances * SIZE * ratio / primary.units_per_em();
